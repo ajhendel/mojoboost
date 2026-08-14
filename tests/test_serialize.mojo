@@ -218,5 +218,137 @@ def test_load_rejects_truncated() raises:
     remove(_TMP_PATH)
 
 
+
+# A model file is untrusted input: it may have been written by another tool,
+# edited, or truncated in transit. These build malformed files by hand and
+# require the loader to raise rather than read past an array, spin forever,
+# or decode a wrapped integer into an arbitrary value. The round-trip tests
+# above cannot reach any of it, because they only ever load what this
+# library just wrote.
+
+def _bits(x: Float64) -> String:
+    return String(x.to_bits())
+
+
+def _write(content: String) raises:
+    with open(_TMP_PATH, "w") as f:
+        f.write(content)
+
+
+def _v1_prefix() -> String:
+    """A well-formed v1 header, up to but not including the mapper."""
+    var s = String("mojoboost v1\nobjective 0\n")
+    s += "learning_rate " + _bits(0.1) + "\n"
+    s += "base_score " + _bits(0.0) + "\n"
+    return s^
+
+
+def test_loads_v1_file() raises:
+    """Version-1 files stay readable: no missing routing, no categories."""
+    var s = String("mojoboost v1\nobjective 0\n")
+    s += "learning_rate " + _bits(0.5) + "\n"
+    s += "base_score " + _bits(1.0) + "\n"
+    s += "mapper 1 4 1\n"
+    s += _bits(2.0) + "\n"
+    s += "0 1\n"
+    s += "trees 1\n"
+    s += "tree 3 2\n"
+    s += "0 -1 -1\n"
+    s += "0 -1 -1\n"
+    s += "1 -1 -1\n"
+    s += "2 -1 -1\n"
+    s += _bits(0.0) + " " + _bits(10.0) + " " + _bits(20.0) + "\n"
+    _write(s)
+    var m = load_model(_TMP_PATH)
+    remove(_TMP_PATH)
+
+    assert_equal(m.mapper.n_features, 1)
+    assert_equal(m.booster.trees[0].missing_bin[0], -1)
+    # Values <= 2.0 take the left leaf, above it the right one, each scaled
+    # by the learning rate on top of the base score.
+    var low: List[Float64] = [1.0]
+    var high: List[Float64] = [3.0]
+    assert_equal(m.predict(low), 1.0 + 0.5 * 10.0)
+    assert_equal(m.predict(high), 1.0 + 0.5 * 20.0)
+
+
+def test_load_rejects_unknown_version() raises:
+    _write(String("mojoboost v99\nobjective 0\n"))
+    with assert_raises():
+        _ = load_model(_TMP_PATH)
+    remove(_TMP_PATH)
+
+
+def test_load_rejects_edge_offset_out_of_range() raises:
+    """`BinMapper.bin_value` binary-searches the edge slice with no bounds
+    check, so an offset past the edge array would read out of bounds."""
+    var s = _v1_prefix()
+    s += "mapper 2 4 2\n"
+    s += _bits(1.0) + " " + _bits(2.0) + "\n"
+    s += "0 1000000 2\n"
+    s += "trees 0\n"
+    _write(s)
+    with assert_raises():
+        _ = load_model(_TMP_PATH)
+    remove(_TMP_PATH)
+
+
+def test_load_rejects_descending_edge_offsets() raises:
+    var s = _v1_prefix()
+    s += "mapper 2 4 2\n"
+    s += _bits(1.0) + " " + _bits(2.0) + "\n"
+    s += "0 2 1\n"
+    s += "trees 0\n"
+    _write(s)
+    with assert_raises():
+        _ = load_model(_TMP_PATH)
+    remove(_TMP_PATH)
+
+
+def test_load_rejects_cyclic_child() raises:
+    """A node pointing at itself would spin `predict_row` forever, so the
+    loader requires children to point strictly forward."""
+    var s = _v1_prefix()
+    s += "mapper 1 4 1\n"
+    s += _bits(1.0) + "\n"
+    s += "0 1\n"
+    s += "trees 1\n"
+    s += "tree 3 2\n"
+    s += "0 -1 -1\n"
+    s += "0 -1 -1\n"
+    s += "0 -1 -1\n"
+    s += "2 -1 -1\n"
+    s += _bits(0.0) + " " + _bits(1.0) + " " + _bits(2.0) + "\n"
+    _write(s)
+    with assert_raises():
+        _ = load_model(_TMP_PATH)
+    remove(_TMP_PATH)
+
+
+def test_load_rejects_bad_bin_count() raises:
+    var s = _v1_prefix()
+    s += "mapper 1 -5 1\n"
+    s += _bits(1.0) + "\n"
+    s += "0 1\n"
+    s += "trees 0\n"
+    _write(s)
+    with assert_raises():
+        _ = load_model(_TMP_PATH)
+    remove(_TMP_PATH)
+
+
+def test_load_rejects_oversized_integer_token() raises:
+    """A digit run that would wrap the 64-bit accumulator has to raise, not
+    decode to an arbitrary value."""
+    var s = _v1_prefix()
+    s += "mapper 1 4 1\n"
+    s += "999999999999999999999999 \n"
+    s += "0 1\n"
+    s += "trees 0\n"
+    _write(s)
+    with assert_raises():
+        _ = load_model(_TMP_PATH)
+    remove(_TMP_PATH)
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

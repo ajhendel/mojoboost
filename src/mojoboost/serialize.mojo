@@ -121,13 +121,28 @@ def _f64_to_token(x: Float64) -> String:
 
 
 def _parse_u64(token: String) raises -> UInt64:
+    """A u64 from a decimal token, refusing anything that would not fit.
+
+    Every float in the file is stored as its u64 bit pattern, so the whole
+    unsigned range is legitimate and the check has to be exact rather than a
+    conservative digit cap. Without it a long digit run wraps the
+    accumulator silently and `_parse_f64` turns the wrapped value into an
+    arbitrary Float64: a corrupt file would load as a valid-looking model
+    rather than as an error.
+    """
     if token.byte_length() == 0:
         raise Error("empty token where integer expected")
+    comptime _U64_MAX = ~UInt64(0)
     var out: UInt64 = 0
     for b in token.as_bytes():
         if b < 48 or b > 57:
             raise Error("invalid digit in integer token")
-        out = out * 10 + UInt64(Int(b) - 48)
+        var digit = UInt64(Int(b) - 48)
+        if out > (_U64_MAX - digit) // 10:
+            raise Error(
+                "integer token does not fit in 64 bits: " + String(token)
+            )
+        out = out * 10 + digit
     return out
 
 
@@ -790,6 +805,17 @@ def _read_trees(
                 or right[i] >= n_nodes
             ):
                 raise Error("corrupt tree: child index out of range")
+            # Children must point strictly forward. In range is not enough:
+            # a node naming itself, or an earlier node, is in range and
+            # would send `predict_row` round a cycle forever rather than
+            # down to a leaf. Every tree this library writes grows by
+            # appending, so a child always sits after its parent, which
+            # makes this an invariant of the format and not just a
+            # heuristic against corruption.
+            if feature[i] >= 0 and (left[i] <= i or right[i] <= i):
+                raise Error(
+                    "corrupt tree: child index does not point forward"
+                )
         trees.append(
             Tree(
                 feature^, threshold^, left^, right^, value^, split_gain^,

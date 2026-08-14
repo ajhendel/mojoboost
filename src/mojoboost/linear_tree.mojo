@@ -2099,11 +2099,22 @@ def _f64_token(x: Float64) -> String:
 def _parse_u64_token(token: String) raises -> UInt64:
     if token.byte_length() == 0:
         raise Error("linear section: empty token where integer expected")
+    comptime _U64_MAX = ~UInt64(0)
     var out: UInt64 = 0
     for b in token.as_bytes():
         if b < 48 or b > 57:
             raise Error("linear section: invalid digit in integer token")
-        out = out * 10 + UInt64(Int(b) - 48)
+        # Coefficients arrive as float bit patterns, so every u64 is a legal
+        # value and the overflow check has to be exact rather than a digit
+        # cap. Without it a long digit run wraps into an arbitrary
+        # coefficient instead of raising.
+        var digit = UInt64(Int(b) - 48)
+        if out > (_U64_MAX - digit) // 10:
+            raise Error(
+                "linear section: integer token does not fit in 64 bits: "
+                + String(token)
+            )
+        out = out * 10 + digit
     return out
 
 

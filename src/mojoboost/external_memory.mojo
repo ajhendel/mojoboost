@@ -198,11 +198,20 @@ def _parse_u64(token: String) raises -> UInt64:
     a file this lane does not own."""
     if token.byte_length() == 0:
         raise Error("empty token where an integer was expected")
+    comptime _U64_MAX = ~UInt64(0)
     var out: UInt64 = 0
     for b in token.as_bytes():
         if b < 48 or b > 57:
             raise Error("invalid digit in an integer token")
-        out = out * 10 + UInt64(Int(b) - 48)
+        # Floats are stored as bit patterns, so the whole unsigned range is
+        # legitimate and this has to be exact. Without it a long digit run
+        # wraps and a corrupt cache reads back as plausible numbers.
+        var digit = UInt64(Int(b) - 48)
+        if out > (_U64_MAX - digit) // 10:
+            raise Error(
+                "integer token does not fit in 64 bits: " + String(token)
+            )
+        out = out * 10 + digit
     return out
 
 
