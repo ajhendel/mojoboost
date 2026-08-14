@@ -6,6 +6,7 @@ both backends and must match exactly. Skips (passing) when no accelerator is
 present so the suite stays green on CPU-only machines.
 """
 
+from std.os import setenv
 from std.sys import has_accelerator
 from std.testing import assert_equal, assert_true, TestSuite
 
@@ -15,7 +16,9 @@ from mojoboost.boosting import (
     SQUARED_ERROR,
     BoosterParams,
     IterationRange,
+    train,
 )
+from mojoboost.train_gpu import train_gpu
 from mojoboost.device import CPU_DEVICE, GPU_DEVICE
 from mojoboost.histogram_gpu import GpuHistogramBuilder
 from mojoboost.model import fit, fit_multiclass
@@ -163,6 +166,73 @@ def test_model_predict_batch_matches_across_devices() raises:
             for k in range(3):
                 total += proba[r * 3 + k]
             assert_true(abs(total - 1.0) <= 1e-5)
+
+
+def test_device_split_search_trains_a_close_deterministic_model() raises:
+    """Device-side split selection (MOJOBOOST_GPU_SPLIT_STRATEGY=device)
+    scores gains in Float32, so split decisions can differ from the host
+    scan on near-ties and tree shapes are deliberately NOT asserted
+    identical. What must hold: the trained model is bit-deterministic run
+    to run, and it fits the training data about as well as the CPU model,
+    measured in aggregate rather than per row."""
+    comptime if not has_accelerator():
+        print("skipped: no accelerator")
+    else:
+        var n_rows = 3_000
+        var n_features = 6
+        var features = List[Float64](capacity=n_rows * n_features)
+        for k in range(n_rows * n_features):
+            features.append(_uniform(UInt64(k)))
+        var target = List[Float64](capacity=n_rows)
+        for r in range(n_rows):
+            var x0 = features[0 * n_rows + r]
+            var x1 = features[1 * n_rows + r]
+            var x2 = features[2 * n_rows + r]
+            target.append(3.0 * x0 - 2.0 * x1 + x2 * x2)
+        var data = bin_equal_width(features, n_rows, n_features, 64)
+        var params = BoosterParams(20, 0.1, TreeParams(15, 20, 1.0, 1e-3))
+
+        var cpu = train(data, target, SQUARED_ERROR, params)
+        _ = setenv("MOJOBOOST_GPU_SPLIT_STRATEGY", "device")
+        var gpu_a = train_gpu(data, target, SQUARED_ERROR, params)
+        var gpu_b = train_gpu(data, target, SQUARED_ERROR, params)
+        _ = setenv("MOJOBOOST_GPU_SPLIT_STRATEGY", "")
+
+        # Bit-deterministic run to run: identical structure and values.
+        assert_equal(len(gpu_a.trees), len(cpu.trees))
+        assert_equal(len(gpu_a.trees), len(gpu_b.trees))
+        for t in range(len(gpu_a.trees)):
+            assert_equal(
+                len(gpu_a.trees[t].value), len(gpu_b.trees[t].value)
+            )
+            for i in range(len(gpu_a.trees[t].value)):
+                assert_equal(
+                    gpu_a.trees[t].feature[i], gpu_b.trees[t].feature[i]
+                )
+                assert_equal(
+                    gpu_a.trees[t].value[i], gpu_b.trees[t].value[i]
+                )
+
+        var mse_cpu = 0.0
+        var mse_gpu = 0.0
+        var diff = 0.0
+        var bins = List[Int](capacity=n_features)
+        for r in range(n_rows):
+            bins.clear()
+            for f in range(n_features):
+                bins.append(Int(data.bins[f * n_rows + r]))
+            var p_cpu = cpu.predict_bins(bins)
+            var p_gpu = gpu_a.predict_bins(bins)
+            mse_cpu += (p_cpu - target[r]) * (p_cpu - target[r])
+            mse_gpu += (p_gpu - target[r]) * (p_gpu - target[r])
+            diff += abs(p_cpu - p_gpu)
+        mse_cpu /= Float64(n_rows)
+        mse_gpu /= Float64(n_rows)
+        # The two models minimize the same loss over the same bins; a
+        # Float32 near-tie can reroute rows, so the claim is aggregate fit,
+        # not per-row agreement.
+        assert_true(mse_gpu <= mse_cpu * 1.10 + 1e-6)
+        assert_true(diff / Float64(n_rows) <= 0.05)
 
 
 def main() raises:

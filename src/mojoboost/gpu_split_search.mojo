@@ -1040,7 +1040,28 @@ struct GpuSplitSearcher(Movable):
     ) raises:
         """Size every buffer and upload the per-feature tables that do not
         change during training: the missing-bin table and the category
-        counts."""
+        counts.
+
+        Opens a private `DeviceContext`. A searcher reading another owner's
+        device buffer (the trainer integration reads the histogram
+        builder's) must share that owner's context instead, so the two
+        enqueue into one in-order queue; see the context overload below."""
+        var ctx = DeviceContext()
+        self = Self(ctx, n_features, n_bins, missing_bins, cats, max_records)
+
+    def __init__(
+        out self,
+        ctx: DeviceContext,
+        n_features: Int,
+        n_bins: Int,
+        missing_bins: List[Int] = [],
+        cats: CategoricalSpec = CategoricalSpec.none(),
+        max_records: Int = 1,
+    ) raises:
+        """Build on a caller-supplied context; the private-context form
+        above lands here. Sharing the histogram builder's context is what
+        makes `enqueue` over the builder's own buffer safe without a fence:
+        one queue orders the histogram kernels before the scan."""
         if n_features < 1:
             raise Error("split search requires at least one feature")
         if n_bins < 1:
@@ -1059,7 +1080,7 @@ struct GpuSplitSearcher(Movable):
                     "categorical feature has more categories than bins"
                 )
 
-        self.ctx = DeviceContext()
+        self.ctx = ctx
         self.n_features = n_features
         self.n_bins = n_bins
         self.max_records = max_records

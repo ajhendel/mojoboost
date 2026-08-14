@@ -186,8 +186,17 @@ from .gpu_predict import (
     predict_raw_multiclass_gpu,
     response_for_objective,
 )
+from .gpu_split_search import (
+    GpuSplitParams,
+    GpuSplitRecord,
+    GpuSplitSearcher,
+)
 from .train_gpu import (
+    SPLIT_SEARCH_AUTO,
+    SPLIT_SEARCH_DEVICE,
+    SPLIT_SEARCH_HOST,
     grow_tree_gpu,
+    resolve_split_search,
     train_custom_gpu,
     train_gpu,
     train_multiclass_gpu,

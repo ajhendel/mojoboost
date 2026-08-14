@@ -15,10 +15,14 @@ benchmarking and for tests that must force one path:
   (conventionally items * rows touched).
 
 The GPU backend adds its own variables, documented where they are read:
-`MOJOBOOST_GPU_HIST_STRATEGY` (gpu_tiling.mojo) and
-`MOJOBOOST_GPU_VERIFY_ROWS` (gpu_active_rows.mojo; `1` makes every device
-row partition verify its left count against the grower's histogram count,
-one host synchronization per split, off by default).
+`MOJOBOOST_GPU_HIST_STRATEGY` (gpu_tiling.mojo),
+`MOJOBOOST_GPU_SPLIT_STRATEGY` (train_gpu.mojo; `device` moves per-node
+split selection onto the accelerator, `host`, unset, or unrecognized keeps
+the host scan), `MOJOBOOST_GPU_VERIFY_ROWS` (gpu_active_rows.mojo; `1`
+makes every device row partition verify its left count against the
+grower's histogram count, one host synchronization per split, off by
+default), `MOJOBOOST_GPU_TRACE` and `MOJOBOOST_GPU_STAGING_SLOTS`
+(gpu_runtime.mojo).
 
 Two dispatch shapes are provided. Both keep every floating-point summation
 order independent of the task count, so every result is bit-identical to the
