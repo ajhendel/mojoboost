@@ -340,5 +340,104 @@ def test_training_needs_a_label() raises:
         _ = train_dataset(ds, SQUARED_ERROR, _params(5))
 
 
+def test_the_two_subsets_differ_in_where_the_bins_came_from() raises:
+    """`subset` refits the binning, `subset_shared_binning` reuses it.
+
+    The difference is the whole reason both exist. `subset` fits edges over
+    the rows it keeps, so the rows left out had no say in them, which is what
+    a fold or a held-out split needs. `subset_shared_binning` is LightGBM's
+    `Dataset.subset`, binning the part as the whole was so that a bin index
+    means the same thing in both and a model trained on the whole can score
+    the part.
+    """
+    var n_rows = 120
+    var n_features = 4
+    var features = _features(n_rows, n_features)
+    var label = _target(features, n_rows)
+    var ds = Dataset(
+        features,
+        n_rows,
+        n_features,
+        label.copy(),
+        max_bin=16,
+        keep_raw=True,
+    )
+
+    var rows = List[Int]()
+    for r in range(30):
+        rows.append(r)
+
+    var own = ds.subset(rows)
+    assert_equal(own.num_data(), len(rows))
+    assert_equal(own.num_feature(), n_features)
+    for i in range(len(rows)):
+        assert_equal(own.label[i], label[rows[i]])
+    # Quantiles over 30 rows are not the quantiles over 120, so refitting is
+    # observable rather than merely claimed.
+    assert_true(not own.matches_binning(ds))
+
+    var shared = ds.subset_shared_binning(rows)
+    assert_equal(shared.num_data(), len(rows))
+    assert_true(shared.matches_binning(ds))
+    for i in range(len(rows)):
+        for f in range(n_features):
+            assert_equal(
+                shared.data.bins[f * shared.n_rows + i],
+                ds.data.bins[f * n_rows + rows[i]],
+            )
+
+
+def test_subset_refuses_what_it_cannot_honor() raises:
+    var n_rows = 60
+    var n_features = 3
+    var features = _features(n_rows, n_features)
+
+    var dropped = Dataset(
+        features, n_rows, n_features, _target(features, n_rows)
+    )
+    with assert_raises():
+        # No raw matrix to select from, and bins cannot be refitted from
+        # bins, so this raises instead of returning something plausible.
+        _ = dropped.subset([0, 1, 2])
+
+    var kept = Dataset(
+        features,
+        n_rows,
+        n_features,
+        _target(features, n_rows),
+        keep_raw=True,
+    )
+    with assert_raises():
+        _ = kept.subset([2, 1, 0])  # not strictly ascending
+    with assert_raises():
+        _ = kept.subset([0, n_rows])  # off the end
+
+
+def test_a_ranking_subset_takes_whole_queries() raises:
+    var n_rows = 60
+    var n_features = 3
+    var features = _features(n_rows, n_features)
+    var ranked = Dataset(
+        features,
+        n_rows,
+        n_features,
+        _target(features, n_rows),
+        group=[20, 20, 20],
+        keep_raw=True,
+    )
+
+    var second = List[Int]()
+    for r in range(20, 40):
+        second.append(r)
+    var whole = ranked.subset(second)
+    assert_equal(len(whole.group), 1)
+    assert_equal(whole.group[0], 20)
+
+    with assert_raises():
+        # Part of a query is refused rather than repaired: a query is the
+        # atom the ordering is learned and scored over.
+        _ = ranked.subset([20, 21, 22])
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()
