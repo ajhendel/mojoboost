@@ -151,13 +151,13 @@ dask = ["dask[distributed]"]
 all = ["mojoboost[numpy,pandas,scipy,scikit-learn,dask]"]
 
 [project.urls]
-Homepage = "https://github.com/ajhendel/mojoboost"
-Repository = "https://github.com/ajhendel/mojoboost"
-Issues = "https://github.com/ajhendel/mojoboost/issues"
+Homepage = "https://github.com/mojoboost-ml/mojoboost"
+Repository = "https://github.com/mojoboost-ml/mojoboost"
+Issues = "https://github.com/mojoboost-ml/mojoboost/issues"
 # The docs are in the repository, not on a docs site, and this points at
 # them rather than at a host that does not exist. No Changelog entry:
 # there is no CHANGELOG file to point at yet.
-Documentation = "https://github.com/ajhendel/mojoboost/tree/main/docs"
+Documentation = "https://github.com/mojoboost-ml/mojoboost/tree/main/docs"
 Creator = "https://github.com/ajhendel"
 
 [tool.setuptools]

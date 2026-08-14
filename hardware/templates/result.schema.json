@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/ajhendel/mojoboost/blob/main/hardware/templates/result.schema.json",
+  "$id": "https://github.com/mojoboost-ml/mojoboost/blob/main/hardware/templates/result.schema.json",
   "title": "mojoboost outside hardware validation record",
   "description": "One file per device per session, written by an outside contributor and reviewed by a maintainer before anything in the repository changes. A record describes what was run, on what, and what happened. Every quantity that was not measured is null and carries a reason. Absence of a number is a fact the record states, never a zero and never an estimate. The procedures these fields come from are docs/GPU_VALIDATION.md and, for Apple timing and energy, docs/APPLE_GPU_BENCHMARK_PROTOCOL.md. The contributor protocol is docs/HARDWARE_CONTRIBUTORS.md. Nothing has ever been validated against this schema; it is a specification, not a tested program.",
   "type": "object",

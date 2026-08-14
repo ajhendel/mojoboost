@@ -6,6 +6,6 @@ The project combines a LightGBM-familiar Python API with native CPU and GPU trai
 
 It is an experimental public alpha, not yet a production replacement for LightGBM or XGBoost. I am looking for contributors and testers interested in Mojo, Apple GPU optimization, tree algorithms, Python packaging, and validation on Apple, NVIDIA, and AMD hardware.
 
-Repository: https://github.com/ajhendel/mojoboost
+Repository: https://github.com/mojoboost-ml/mojoboost
 
 The immediate technical priorities are active-row compaction, device-side split selection and objectives, persistent GPU execution, trustworthy end-to-end benchmarks, and easy macOS installation.

@@ -20,8 +20,8 @@ That design commitment is worth exactly as much as the evidence behind it, and t
 
 If you have a GPU and an hour, you can change that. There is a read-only environment capture script, a record template, and a procedure that says exactly what to run and what counts as a result. Correctness only is a complete contribution and takes about thirty minutes, most of it the build. A machine where it fails to build is the single most useful thing anyone could send right now, and nobody has sent one.
 
-Protocol: https://github.com/ajhendel/mojoboost/blob/main/docs/HARDWARE_CONTRIBUTORS.md
-Repository: https://github.com/ajhendel/mojoboost
+Protocol: https://github.com/mojoboost-ml/mojoboost/blob/main/docs/HARDWARE_CONTRIBUTORS.md
+Repository: https://github.com/mojoboost-ml/mojoboost
 
 Experimental public alpha. Attribution for every accepted record, and that is the whole of what is on offer.
 
@@ -39,9 +39,9 @@ The rules that make a record worth having, in case they tell you whether this is
 
 Everything is Apache 2.0, attribution is automatic and is the only thing on offer, and a withdrawal request is honored.
 
-Contributor protocol: https://github.com/ajhendel/mojoboost/blob/main/docs/HARDWARE_CONTRIBUTORS.md
-Validation procedure: https://github.com/ajhendel/mojoboost/blob/main/docs/GPU_VALIDATION.md
-Repository: https://github.com/ajhendel/mojoboost
+Contributor protocol: https://github.com/mojoboost-ml/mojoboost/blob/main/docs/HARDWARE_CONTRIBUTORS.md
+Validation procedure: https://github.com/mojoboost-ml/mojoboost/blob/main/docs/GPU_VALIDATION.md
+Repository: https://github.com/mojoboost-ml/mojoboost
 
 This is an experimental public alpha, not a production or performance claim.
 
@@ -53,7 +53,7 @@ The honest status is that it has run on exactly one GPU, an Apple M4. Nothing NV
 
 What I am asking for is validation from people who own the hardware I do not. There is a written procedure, a read-only capture script that installs nothing and uploads nothing, a record template, and a review process that will not turn your one board into a claim about a vendor. Correctness only is about thirty minutes and counts as a complete contribution. A machine where the build fails is the most useful record anyone could file and nobody has filed one yet.
 
-Protocol and what an hour actually involves: https://github.com/ajhendel/mojoboost/blob/main/docs/HARDWARE_CONTRIBUTORS.md
+Protocol and what an hour actually involves: https://github.com/mojoboost-ml/mojoboost/blob/main/docs/HARDWARE_CONTRIBUTORS.md
 
 Experimental alpha. Apache 2.0. Attribution for accepted records, which is the entire compensation on offer, and I would rather say that plainly than dress it up.
 
@@ -71,7 +71,7 @@ What I would ask, if you are willing, is about thirty minutes: clone, `pixi inst
 
 The one thing I would like to be clear about up front: I will not turn your result into a claim about your vendor. A record about a <device> becomes a statement about that board and nothing wider. You are credited by name or handle, the record and its raw output are published under Apache 2.0 alongside the code, and I will remove it on request.
 
-The protocol, which says exactly what the hour involves: https://github.com/ajhendel/mojoboost/blob/main/docs/HARDWARE_CONTRIBUTORS.md
+The protocol, which says exactly what the hour involves: https://github.com/mojoboost-ml/mojoboost/blob/main/docs/HARDWARE_CONTRIBUTORS.md
 
 No obligation, and no follow-up if this is not a good use of your time.
 

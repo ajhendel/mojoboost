@@ -63,7 +63,7 @@ repeated here, because a copy would drift.
 **1. Get the code.** A clean tree at a commit you can name.
 
 ```sh
-git clone https://github.com/ajhendel/mojoboost && cd mojoboost
+git clone https://github.com/mojoboost-ml/mojoboost && cd mojoboost
 curl -fsSL https://pixi.sh/install.sh | sh
 pixi install
 git rev-parse HEAD
@@ -96,10 +96,10 @@ terminal scrollback into one. Do not summarize it, do not round a number, do not
 retype a figure from memory.
 
 **6. Submit.** Open the
-[hardware result issue](https://github.com/ajhendel/mojoboost/issues/new?template=hardware_result.yml),
+[hardware result issue](https://github.com/mojoboost-ml/mojoboost/issues/new?template=hardware_result.yml),
 paste the record, and attach the raw output files by dragging them into the
 issue. If you would rather write prose than JSON, the older
-[accelerator validation report](https://github.com/ajhendel/mojoboost/issues/new?template=hardware_validation.yml)
+[accelerator validation report](https://github.com/mojoboost-ml/mojoboost/issues/new?template=hardware_validation.yml)
 form is still there and still accepted; the machine-readable form exists because
 it makes conflicting results comparable, not because prose is unwelcome.
 

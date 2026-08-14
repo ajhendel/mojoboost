@@ -82,7 +82,7 @@ Identical on both vendors. Only the driver-reporting command differs, because
 `nvidia-smi` and `rocm-smi` are different programs.
 
 ```sh
-git clone https://github.com/ajhendel/mojoboost && cd mojoboost
+git clone https://github.com/mojoboost-ml/mojoboost && cd mojoboost
 curl -fsSL https://pixi.sh/install.sh | sh
 pixi install
 ```
@@ -404,7 +404,7 @@ machine with a working driver:
 mkdir actions-runner && cd actions-runner
 curl -o actions-runner.tar.gz -L <url from that page>
 tar xzf actions-runner.tar.gz
-./config.sh --url https://github.com/ajhendel/mojoboost \
+./config.sh --url https://github.com/mojoboost-ml/mojoboost \
             --token <token from that page> \
             --labels self-hosted,linux,gpu,cuda   # or ...,gpu,rocm
 ./run.sh

@@ -13,9 +13,9 @@ bit-exact model save/load.
 > **Experimental public alpha.** The feature surface is broad and training
 > works end to end, but this is not yet a production replacement for
 > LightGBM or XGBoost. Treat every capability according to the evidence in
-> [docs/LIGHTGBM_PARITY.md](https://github.com/ajhendel/mojoboost/blob/main/docs/LIGHTGBM_PARITY.md)
+> [docs/LIGHTGBM_PARITY.md](https://github.com/mojoboost-ml/mojoboost/blob/main/docs/LIGHTGBM_PARITY.md)
 > and
-> [docs/GPU_VALIDATION.md](https://github.com/ajhendel/mojoboost/blob/main/docs/GPU_VALIDATION.md),
+> [docs/GPU_VALIDATION.md](https://github.com/mojoboost-ml/mojoboost/blob/main/docs/GPU_VALIDATION.md),
 > report failures, and do not rely on unvalidated hardware or parameter
 > combinations in production. The parity contract scores each capability on
 > seven independent axes rather than one, because several things in the
@@ -41,7 +41,7 @@ exists today.
 | Source checkout with pixi | `git clone`, `pixi install`, `pixi run build-python` | **Works today** |
 
 ```sh
-git clone https://github.com/ajhendel/mojoboost.git
+git clone https://github.com/mojoboost-ml/mojoboost.git
 cd mojoboost
 pixi install
 pixi run build-python
@@ -59,7 +59,7 @@ refuses with "no matching distribution found".
 
 The whole picture, with the wheel filename per platform, the first five
 minutes step by step, and every error an install can produce, is in
-[docs/INSTALLATION.md](https://github.com/ajhendel/mojoboost/blob/main/docs/INSTALLATION.md).
+[docs/INSTALLATION.md](https://github.com/mojoboost-ml/mojoboost/blob/main/docs/INSTALLATION.md).
 
 ## The first five minutes
 
@@ -321,7 +321,7 @@ hist = mb.get_split_value_histogram(model, "age", bins=10)
 `Booster.model_to_string()` produces, so a model read back from a file can
 be inspected without refitting. `feature_names=` names the features of a
 model that carries none. Every key of the dump is documented in
-[docs/MODEL_INSPECTION_SCHEMA.md](https://github.com/ajhendel/mojoboost/blob/main/docs/MODEL_INSPECTION_SCHEMA.md);
+[docs/MODEL_INSPECTION_SCHEMA.md](https://github.com/mojoboost-ml/mojoboost/blob/main/docs/MODEL_INSPECTION_SCHEMA.md);
 the two to branch on are `has_split_gain` and `has_node_count`.
 
 One thing worth knowing before you build on it. A model this version wrote
@@ -334,7 +334,7 @@ wrote carries none, and every node reports `split_gain: None` with
 measured gain was zero. `trees_to_dataframe` and `trees_to_records` inherit
 whichever of the two the dump was built from. The state of the native dump
 seam is in
-[docs/INTEGRATION_INVENTORY.md](https://github.com/ajhendel/mojoboost/blob/main/docs/INTEGRATION_INVENTORY.md).
+[docs/INTEGRATION_INVENTORY.md](https://github.com/mojoboost-ml/mojoboost/blob/main/docs/INTEGRATION_INVENTORY.md).
 
 ## Cross-validation
 
@@ -441,14 +441,14 @@ The declared interpreter is CPython 3.14, which is the only one anything has
 run on rather than a toolchain requirement; 3.13 is expected but unproven and
 3.12 and earlier are blocked by an entry point added in 3.13, all worked
 through in
-[docs/PYTHON_SUPPORT.md](https://github.com/ajhendel/mojoboost/blob/main/docs/PYTHON_SUPPORT.md).
+[docs/PYTHON_SUPPORT.md](https://github.com/mojoboost-ml/mojoboost/blob/main/docs/PYTHON_SUPPORT.md).
 The Linux platform tag is likewise unsettled: the default `linux_x86_64` and
 `linux_aarch64` tags are rejected by every index, and a `manylinux` tag needs
 a measured glibc floor first.
 
 None of that has been published or validated yet. Every target, its expected
 artifact name, and the evidence behind its status is in
-[docs/PLATFORM_MATRIX.md](https://github.com/ajhendel/mojoboost/blob/main/docs/PLATFORM_MATRIX.md),
+[docs/PLATFORM_MATRIX.md](https://github.com/mojoboost-ml/mojoboost/blob/main/docs/PLATFORM_MATRIX.md),
 where the rule is that a platform counts as validated when hardware ran the
 artifact and somebody wrote down what happened.
 
@@ -470,25 +470,25 @@ instructions above.
 | `device="auto"` chose the CPU and said nothing | Expected. The crossover table is empty, so `auto` keeps the CPU everywhere |
 
 Each case, with the full message and what to do about it, is in
-[docs/INSTALLATION.md](https://github.com/ajhendel/mojoboost/blob/main/docs/INSTALLATION.md#when-something-goes-wrong).
+[docs/INSTALLATION.md](https://github.com/mojoboost-ml/mojoboost/blob/main/docs/INSTALLATION.md#when-something-goes-wrong).
 Installation problems are in scope for the
-[bug report template](https://github.com/ajhendel/mojoboost/issues/new?template=bug_report.yml);
+[bug report template](https://github.com/mojoboost-ml/mojoboost/issues/new?template=bug_report.yml);
 accelerator results belong in the
-[hardware validation template](https://github.com/ajhendel/mojoboost/issues/new?template=hardware_validation.yml).
+[hardware validation template](https://github.com/mojoboost-ml/mojoboost/issues/new?template=hardware_validation.yml).
 
 ## Links
 
 - Source, benchmarks against LightGBM, and the native Mojo API:
-  [github.com/ajhendel/mojoboost](https://github.com/ajhendel/mojoboost)
-- [Installation](https://github.com/ajhendel/mojoboost/blob/main/docs/INSTALLATION.md)
-- [LightGBM parity contract](https://github.com/ajhendel/mojoboost/blob/main/docs/LIGHTGBM_PARITY.md)
-- [Capability levels](https://github.com/ajhendel/mojoboost/blob/main/docs/CAPABILITY_LEVELS.md),
+  [github.com/mojoboost-ml/mojoboost](https://github.com/mojoboost-ml/mojoboost)
+- [Installation](https://github.com/mojoboost-ml/mojoboost/blob/main/docs/INSTALLATION.md)
+- [LightGBM parity contract](https://github.com/mojoboost-ml/mojoboost/blob/main/docs/LIGHTGBM_PARITY.md)
+- [Capability levels](https://github.com/mojoboost-ml/mojoboost/blob/main/docs/CAPABILITY_LEVELS.md),
   the seven words the parity contract scores against
-- [Integration inventory](https://github.com/ajhendel/mojoboost/blob/main/docs/INTEGRATION_INVENTORY.md),
+- [Integration inventory](https://github.com/mojoboost-ml/mojoboost/blob/main/docs/INTEGRATION_INVENTORY.md),
   what is written here and reachable by nobody
-- [GPU validation record](https://github.com/ajhendel/mojoboost/blob/main/docs/GPU_VALIDATION.md)
-- [Device selection policy](https://github.com/ajhendel/mojoboost/blob/main/docs/DEVICE_SELECTION.md)
-- [Contributing](https://github.com/ajhendel/mojoboost/blob/main/CONTRIBUTING.md)
+- [GPU validation record](https://github.com/mojoboost-ml/mojoboost/blob/main/docs/GPU_VALIDATION.md)
+- [Device selection policy](https://github.com/mojoboost-ml/mojoboost/blob/main/docs/DEVICE_SELECTION.md)
+- [Contributing](https://github.com/mojoboost-ml/mojoboost/blob/main/CONTRIBUTING.md)
 
 ## License
 

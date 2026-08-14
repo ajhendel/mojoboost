@@ -229,7 +229,7 @@ the C ABI, the CLI, the tests, and the benchmarks. You do not need to install
 Mojo or MAX separately; Pixi resolves the exact versions this repository pins.
 
 ```sh
-git clone https://github.com/ajhendel/mojoboost.git
+git clone https://github.com/mojoboost-ml/mojoboost.git
 cd mojoboost
 pixi install
 pixi run build-python
@@ -638,12 +638,12 @@ crossover benchmark that would justify a shipped default. It is device
 independent on purpose; there are no per vendor or per chip special cases
 anywhere in the policy. If you run that benchmark, the result belongs in an
 issue, filed with the
-[accelerator validation template](https://github.com/ajhendel/mojoboost/issues/new?template=hardware_validation.yml).
+[accelerator validation template](https://github.com/mojoboost-ml/mojoboost/issues/new?template=hardware_validation.yml).
 
 ### Anything else
 
 Open a bug report with the
-[bug template](https://github.com/ajhendel/mojoboost/issues/new?template=bug_report.yml)
+[bug template](https://github.com/mojoboost-ml/mojoboost/issues/new?template=bug_report.yml)
 and include the output of `mojoboost.show_versions()`, the complete error
 text, and the device you requested. Installation problems are explicitly in scope for that
 template. An alpha with quiet failures is worse than one with loud ones, so a
@@ -666,9 +666,9 @@ report about a confusing install is useful, not noise.
 
 Issue templates.
 
-- [Bug report](https://github.com/ajhendel/mojoboost/issues/new?template=bug_report.yml),
+- [Bug report](https://github.com/mojoboost-ml/mojoboost/issues/new?template=bug_report.yml),
   including installation problems.
-- [Accelerator validation report](https://github.com/ajhendel/mojoboost/issues/new?template=hardware_validation.yml),
+- [Accelerator validation report](https://github.com/mojoboost-ml/mojoboost/issues/new?template=hardware_validation.yml),
   for correctness, determinism, or performance evidence from real hardware.
   Failures are useful evidence too.
 

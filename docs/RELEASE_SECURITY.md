@@ -103,7 +103,7 @@ One person, named, with a named alternate when one exists.
 
 | Role | Today | Responsibility |
 |---|---|---|
-| Release owner | The repository owner, `ajhendel` | Approves the environment gate, and is accountable for what got published |
+| Release owner | Andrew Hendel (`ajhendel`), an owner of `mojoboost-ml` | Approves the environment gate, and is accountable for what got published |
 | Backup owner | None | Nobody else can publish, and nobody else can revoke |
 | Security contact | The same person | Triage under SECURITY.md |
 
@@ -183,7 +183,7 @@ rather than a manual upload that establishes the project.
 
 | Field | Value |
 |---|---|
-| Owner | `ajhendel` |
+| Owner | `mojoboost-ml` |
 | Repository | `mojoboost` |
 | Workflow | `release-provenance.yml` |
 | Environment | `pypi` |
@@ -688,12 +688,12 @@ bash packaging/security/verify_release.sh ./mojoboost-0.1.0-cp314-cp314-macosx_2
 # Provenance on its own. --signer-workflow is not optional: without it, any
 # workflow in the repository satisfies the check
 gh attestation verify ./mojoboost-0.1.0-cp314-cp314-macosx_26_0_arm64.whl \
-    --repo ajhendel/mojoboost \
-    --signer-workflow ajhendel/mojoboost/.github/workflows/release-provenance.yml
+    --repo mojoboost-ml/mojoboost \
+    --signer-workflow mojoboost-ml/mojoboost/.github/workflows/release-provenance.yml
 
 # The attested SBOM, as JSON
 gh attestation verify ./mojoboost-0.1.0-cp314-cp314-macosx_26_0_arm64.whl \
-    --repo ajhendel/mojoboost \
+    --repo mojoboost-ml/mojoboost \
     --predicate-type https://cyclonedx.org/bom \
     --format json
 
@@ -705,13 +705,13 @@ Incident side:
 
 ```sh
 # What was published, and when
-gh api /repos/ajhendel/mojoboost/actions/workflows/release-provenance.yml/runs \
+gh api /repos/mojoboost-ml/mojoboost/actions/workflows/release-provenance.yml/runs \
     --jq '.workflow_runs[] | {id, created_at, event, actor: .actor.login, conclusion}'
 
 # Every attestation this repository holds for a digest
-gh api /repos/ajhendel/mojoboost/attestations/sha256:<digest>
+gh api /repos/mojoboost-ml/mojoboost/attestations/sha256:<digest>
 
 # Confirm no publishing secret exists. Expected: an empty list
-gh secret list --repo ajhendel/mojoboost
-gh secret list --repo ajhendel/mojoboost --env pypi
+gh secret list --repo mojoboost-ml/mojoboost
+gh secret list --repo mojoboost-ml/mojoboost --env pypi
 ```

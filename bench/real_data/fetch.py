@@ -37,7 +37,7 @@ import urllib.request
 import loaders
 
 CHUNK = 1 << 20
-USER_AGENT = "mojoboost-bench/0.1 (+https://github.com/ajhendel/mojoboost)"
+USER_AGENT = "mojoboost-bench/0.1 (+https://github.com/mojoboost-ml/mojoboost)"
 
 
 def _sha256_and_size(path):

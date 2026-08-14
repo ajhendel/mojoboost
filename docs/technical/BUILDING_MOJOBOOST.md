@@ -156,7 +156,7 @@ hardware.
 ## Follow the evidence
 
 The live project is available at
-[github.com/ajhendel/mojoboost](https://github.com/ajhendel/mojoboost).
+[github.com/mojoboost-ml/mojoboost](https://github.com/mojoboost-ml/mojoboost).
 Architecture, parity, hardware records, and benchmark methodology live in the
 repository. The software is Apache-2.0 and experimental; contributions and
 independent hardware results are welcome.

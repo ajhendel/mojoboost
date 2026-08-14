@@ -9,6 +9,6 @@ The repository includes dense and sparse leaf-wise training, numerical and categ
 
 This is an experimental public alpha rather than a claim of production parity with LightGBM or XGBoost. The repository publishes its known gaps and hardware evidence. Apple M4 Metal correctness has been exercised; NVIDIA and AMD remain unvalidated.
 
-Repository: https://github.com/ajhendel/mojoboost
+Repository: https://github.com/mojoboost-ml/mojoboost
 
 I would appreciate feedback on the architecture, reproducibility, packaging, and which real tabular workloads would make the most useful Apple CPU-versus-GPU crossover benchmark.

@@ -57,8 +57,8 @@ mojoboost was created by Andrew Hendel and is developed publicly under the Apach
 
 LINKS
 
-Project: https://github.com/ajhendel/mojoboost
+Project: https://github.com/mojoboost-ml/mojoboost
 Creator: https://github.com/ajhendel
-Architecture: https://github.com/ajhendel/mojoboost/blob/main/docs/ARCHITECTURE.md
-Project origin: https://github.com/ajhendel/mojoboost/blob/main/docs/PROJECT_ORIGIN.md
-Technical article: https://github.com/ajhendel/mojoboost/blob/main/docs/technical/BUILDING_MOJOBOOST.md
+Architecture: https://github.com/mojoboost-ml/mojoboost/blob/main/docs/ARCHITECTURE.md
+Project origin: https://github.com/mojoboost-ml/mojoboost/blob/main/docs/PROJECT_ORIGIN.md
+Technical article: https://github.com/mojoboost-ml/mojoboost/blob/main/docs/technical/BUILDING_MOJOBOOST.md

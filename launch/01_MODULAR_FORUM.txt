@@ -11,8 +11,8 @@ This is a substantial public alpha, not a production replacement for LightGBM. F
 
 I am particularly looking for contributors interested in Mojo GPU programming, Apple Silicon profiling, gradient-boosted tree algorithms, Python packaging, differential testing against LightGBM, and validation on real NVIDIA or AMD hardware.
 
-Repository: https://github.com/ajhendel/mojoboost
-Parity contract: https://github.com/ajhendel/mojoboost/blob/main/docs/LIGHTGBM_PARITY.md
-GPU validation status and procedure: https://github.com/ajhendel/mojoboost/blob/main/docs/GPU_VALIDATION.md
+Repository: https://github.com/mojoboost-ml/mojoboost
+Parity contract: https://github.com/mojoboost-ml/mojoboost/blob/main/docs/LIGHTGBM_PARITY.md
+GPU validation status and procedure: https://github.com/mojoboost-ml/mojoboost/blob/main/docs/GPU_VALIDATION.md
 
 I would especially value feedback on the GPU architecture, API boundaries, and the shortest path to a reliable Apple Silicon benchmark story.

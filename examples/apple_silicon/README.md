@@ -74,7 +74,7 @@ this is a placeholder for a release asset that does not exist yet.
 ### Works today, from source
 
 ```sh
-git clone https://github.com/ajhendel/mojoboost.git
+git clone https://github.com/mojoboost-ml/mojoboost.git
 cd mojoboost
 pixi install
 pixi run build-python

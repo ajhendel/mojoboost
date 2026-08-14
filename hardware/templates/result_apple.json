@@ -76,7 +76,7 @@
   },
 
   "source": {
-    "repo_url": "https://github.com/ajhendel/mojoboost",
+    "repo_url": "https://github.com/mojoboost-ml/mojoboost",
     "commit": "",
     "branch": null,
     "dirty": null,

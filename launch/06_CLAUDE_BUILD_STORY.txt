@@ -11,6 +11,6 @@ I now require each workstream to run only its smallest focused test and a whites
 
 The project is an experimental public alpha and I am not presenting AI-generated volume as proof of correctness. The repository has explicit parity and GPU-validation documents so claims can be tied to tests and hardware evidence.
 
-Repository: https://github.com/ajhendel/mojoboost
+Repository: https://github.com/mojoboost-ml/mojoboost
 
 I would be interested in hearing from others who have managed genuinely parallel coding agents on one evolving systems project, especially around merge boundaries, test budgeting, and independent verification.

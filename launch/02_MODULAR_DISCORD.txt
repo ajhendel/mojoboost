@@ -8,6 +8,6 @@ It already includes end-to-end dense and sparse training, numerical and categori
 
 I am looking for technical feedback and contributors, especially around active-row compaction, device-side split selection and objectives, persistent GPU state, Apple tuning, packaging, and cross-device validation.
 
-https://github.com/ajhendel/mojoboost
+https://github.com/mojoboost-ml/mojoboost
 
 This is an experimental public alpha, not a production or performance-parity claim.

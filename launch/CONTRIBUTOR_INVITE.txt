@@ -2,7 +2,7 @@ PURPOSE: Copy-and-paste invitations for individual people. Six variants, each pl
 
 HOW TO USE: Pick one variant, copy the text under it, replace every <PLACEHOLDER>, and delete the USE WHEN and CHANNEL lines before sending. Send these to people individually. The broadcast announcements are the six posts in this directory; these are the messages that actually recruit somebody, and they only work because they are addressed to a person and reference something that person did.
 
-BEFORE SENDING: every link points at github.com/mojoboost-ml, which is live only after the transfer described in ORG_MIGRATION_CHECKLIST.txt. If the transfer has not happened, either wait or substitute github.com/ajhendel/mojoboost.
+BEFORE SENDING: every link points at github.com/mojoboost-ml, which is live only after the transfer described in ORG_MIGRATION_CHECKLIST.txt. If the transfer has not happened, either wait or substitute github.com/mojoboost-ml/mojoboost.
 
 WHAT NOT TO DO: do not send more than one of these to the same person, do not send a cold invite to somebody who has never expressed interest in Mojo or in gradient boosting, and do not describe mojoboost as anything other than an experimental alpha. The project's whole credibility rests on not overstating, and a recruiting message is the easiest place to lose that.
 

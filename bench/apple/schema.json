@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/ajhendel/mojoboost/blob/main/bench/apple/schema.json",
+  "$id": "https://github.com/mojoboost-ml/mojoboost/blob/main/bench/apple/schema.json",
   "title": "mojoboost Apple silicon benchmark run record",
   "description": "One file per run of bench/apple/suite.py on one machine. A record is a complete description of what was measured, under what conditions, with every quantity that was not measured explicitly null and carrying a reason. Absence of a number is a fact the record must state, never a zero. The protocol these fields come from is docs/APPLE_GPU_BENCHMARK_PROTOCOL.md.",
   "type": "object",

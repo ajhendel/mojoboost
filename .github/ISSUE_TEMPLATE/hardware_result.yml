@@ -7,7 +7,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Read [docs/HARDWARE_CONTRIBUTORS.md](https://github.com/ajhendel/mojoboost/blob/main/docs/HARDWARE_CONTRIBUTORS.md) first. It is the protocol; [docs/GPU_VALIDATION.md](https://github.com/ajhendel/mojoboost/blob/main/docs/GPU_VALIDATION.md) is the procedure, and [docs/APPLE_GPU_BENCHMARK_PROTOCOL.md](https://github.com/ajhendel/mojoboost/blob/main/docs/APPLE_GPU_BENCHMARK_PROTOCOL.md) is the one for quotable Apple timings.
+        Read [docs/HARDWARE_CONTRIBUTORS.md](https://github.com/mojoboost-ml/mojoboost/blob/main/docs/HARDWARE_CONTRIBUTORS.md) first. It is the protocol; [docs/GPU_VALIDATION.md](https://github.com/mojoboost-ml/mojoboost/blob/main/docs/GPU_VALIDATION.md) is the procedure, and [docs/APPLE_GPU_BENCHMARK_PROTOCOL.md](https://github.com/mojoboost-ml/mojoboost/blob/main/docs/APPLE_GPU_BENCHMARK_PROTOCOL.md) is the one for quotable Apple timings.
 
         Three things worth knowing before you fill this in.
 
@@ -15,7 +15,7 @@ body:
 
         A failure is a result. A build that does not compile, a card the installed ROCm refuses, a Mac with no Metal compiler: all of these are worth filing, and none of them has been filed yet.
 
-        Prefer prose to JSON? Use the [accelerator validation report](https://github.com/ajhendel/mojoboost/issues/new?template=hardware_validation.yml) form instead. It is still accepted.
+        Prefer prose to JSON? Use the [accelerator validation report](https://github.com/mojoboost-ml/mojoboost/issues/new?template=hardware_validation.yml) form instead. It is still accepted.
 
   - type: dropdown
     id: vendor

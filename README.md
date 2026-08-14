@@ -1,6 +1,6 @@
 # mojoboost
 
-[![CI](https://github.com/ajhendel/mojoboost/actions/workflows/ci.yml/badge.svg)](https://github.com/ajhendel/mojoboost/actions/workflows/ci.yml)
+[![CI](https://github.com/mojoboost-ml/mojoboost/actions/workflows/ci.yml/badge.svg)](https://github.com/mojoboost-ml/mojoboost/actions/workflows/ci.yml)
 
 Native gradient-boosted trees accelerated by the GPU already inside Apple
 Silicon Macs, written in [Mojo](https://www.modular.com/mojo).
@@ -70,7 +70,7 @@ A Mojo or MAX installation is not required separately; pixi resolves the
 versions pinned by this repository.
 
 ```sh
-git clone https://github.com/ajhendel/mojoboost.git
+git clone https://github.com/mojoboost-ml/mojoboost.git
 cd mojoboost
 pixi install
 pixi run build-python
@@ -118,7 +118,7 @@ evidence establishes a trustworthy threshold. Read
 [Device selection](#device-selection) before using it.
 
 If any of this fails, open a
-[bug report](https://github.com/ajhendel/mojoboost/issues/new?template=bug_report.yml),
+[bug report](https://github.com/mojoboost-ml/mojoboost/issues/new?template=bug_report.yml),
 which covers installation problems, and paste the output of
 `mojoboost.show_versions()` plus, from a source checkout,
 `pixi run mojo --version`. `show_versions()` reports what this install is,

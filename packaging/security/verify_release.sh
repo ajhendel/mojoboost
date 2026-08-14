@@ -14,7 +14,7 @@
 #      truncated download and an accidental substitution, and no attacker.
 #
 #   2. Provenance. Did this exact file come out of a run of
-#      .github/workflows/release-provenance.yml in github.com/ajhendel/mojoboost?
+#      .github/workflows/release-provenance.yml in github.com/mojoboost-ml/mojoboost?
 #      That is what `gh attestation verify` checks, against a certificate issued
 #      to that workflow's OIDC identity and logged in a public transparency log.
 #      This is the question worth asking, and it is the one an attacker with
@@ -30,7 +30,7 @@
 # log, unless you pass `--bundle` with a bundle you downloaded earlier.
 set -euo pipefail
 
-REPO=ajhendel/mojoboost
+REPO=mojoboost-ml/mojoboost
 WORKFLOW=.github/workflows/release-provenance.yml
 
 WHEEL=${1:-}

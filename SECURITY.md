@@ -27,7 +27,7 @@ vulnerability.**
 
 Use GitHub private vulnerability reporting, which is the preferred channel:
 
-1. Go to <https://github.com/ajhendel/mojoboost/security/advisories/new>
+1. Go to <https://github.com/mojoboost-ml/mojoboost/security/advisories/new>
 2. Or from the repository, Security, Advisories, Report a vulnerability
 
 That form creates a private draft advisory visible only to you and the

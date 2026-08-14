@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/ajhendel/mojoboost/blob/main/bench/apple/thermal_schema.json",
+  "$id": "https://github.com/mojoboost-ml/mojoboost/blob/main/bench/apple/thermal_schema.json",
   "title": "mojoboost Apple silicon thermal, energy, and sustained-performance record",
   "description": "One file per run of the thermal protocol in docs/APPLE_THERMAL_ENERGY.md on one machine under one condition set. A record ties a thermal and energy observation to the exact commit, chip variant, memory size, OS build, toolchain, workload, quality result, and benchmark record it came from, so that nothing in it has to be reconstructed later from memory. Every measured quantity is nullable and every null carries a reason. Absence of a number is a fact the record states; it is never a zero and never an estimate. This schema is a sibling of bench/apple/schema.json, not a replacement for it: that one records comparative timings, this one records the state of the machine that produced them.",
   "type": "object",

@@ -1,4 +1,4 @@
-PURPOSE: Exact manual steps to move mojoboost from github.com/ajhendel/mojoboost to github.com/mojoboost-ml/mojoboost and configure the organization.
+PURPOSE: Exact manual steps to move mojoboost from github.com/mojoboost-ml/mojoboost to github.com/mojoboost-ml/mojoboost and configure the organization.
 
 NOTHING IN THIS FILE HAS BEEN PERFORMED. Every step below is a manual action for a human with administrative access. No organization was created, no repository was transferred, no GitHub setting was changed, and no network call was made while writing this checklist. handoffs/release_12_organization.md lists the same settings as an explicit not-performed inventory.
 
@@ -53,11 +53,11 @@ C4. When the profile text changes later, change it in the mojoboost repository f
 
 D. TRANSFER THE REPOSITORY
 
-D1. In https://github.com/ajhendel/mojoboost, open Settings, scroll to the Danger Zone, choose "Transfer ownership".
+D1. In https://github.com/mojoboost-ml/mojoboost, open Settings, scroll to the Danger Zone, choose "Transfer ownership".
 
 D2. Enter mojoboost-ml as the new owner, type the repository name to confirm, and complete the transfer. It takes effect immediately.
 
-D3. Confirm https://github.com/mojoboost-ml/mojoboost loads and that https://github.com/ajhendel/mojoboost redirects to it.
+D3. Confirm https://github.com/mojoboost-ml/mojoboost loads and that https://github.com/mojoboost-ml/mojoboost redirects to it.
 
 D4. Issues, pull requests, stars, watchers, releases, tags, and git history move with the repository, and open issue and pull request numbers are preserved. Forks stay attached to the repository in its new location.
 
@@ -101,16 +101,16 @@ The old owner name is hard-coded in dozens of places across more than two dozen 
 
 THIS LANE DID NOT EDIT ANY OF THOSE FILES. They belong to other lanes, and editing them here would have overwritten concurrent work. Do this in one pass after the parallel lanes land, rather than from a list that was already stale when it was written. The authority is the command, not an inventory:
 
-    grep -rn "ajhendel/mojoboost" . --exclude-dir=.git --exclude-dir=.pixi --exclude=pixi.lock
+    grep -rn "mojoboost-ml/mojoboost" . --exclude-dir=.git --exclude-dir=.pixi --exclude=pixi.lock
 
 G1. Most hits are plain repository, blob, and issue-template links and can be replaced mechanically once the tree is quiet:
 
-    grep -rl "ajhendel/mojoboost" . --exclude-dir=.git --exclude-dir=.pixi --exclude=pixi.lock \
-      | xargs sed -i '' 's|ajhendel/mojoboost|mojoboost-ml/mojoboost|g'
+    grep -rl "mojoboost-ml/mojoboost" . --exclude-dir=.git --exclude-dir=.pixi --exclude=pixi.lock \
+      | xargs sed -i '' 's|mojoboost-ml/mojoboost|mojoboost-ml/mojoboost|g'
 
     That is the BSD sed on macOS, hence the empty -i argument. Review the diff before committing, because the five cases below need judgment and a blanket substitution gets some of them wrong.
 
-G2. Two occurrences in GOVERNANCE.md and CODE_OF_CONDUCT.md are the maintainer's own identity, github.com/ajhendel and an email address, not repository links. Leave those alone. The command above does not match them, which is why it matches on ajhendel/mojoboost rather than on ajhendel.
+G2. Two occurrences in GOVERNANCE.md and CODE_OF_CONDUCT.md are the maintainer's own identity, github.com/ajhendel and an email address, not repository links. Leave those alone. The command above does not match them, which is why it matches on mojoboost-ml/mojoboost rather than on ajhendel.
 
 G3. JSON Schema $id values, in bench/apple/schema.json, bench/apple/thermal_schema.json, bench/real_data/schema.json, and hardware/templates/result.schema.json, deserve care. A schema identifier is not merely a link, and changing it changes the identity of the schema for anything that resolved it. At this stage nothing external has, so change them; if that stops being true, leave them and record the new location separately. Any already-emitted result file that carries the old $id keeps it.
 

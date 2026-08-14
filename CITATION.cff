@@ -8,8 +8,8 @@ authors:
     alias: ajhendel
 version: 0.1.0
 license: Apache-2.0
-repository-code: "https://github.com/ajhendel/mojoboost"
-url: "https://github.com/ajhendel/mojoboost"
+repository-code: "https://github.com/mojoboost-ml/mojoboost"
+url: "https://github.com/mojoboost-ml/mojoboost"
 abstract: >-
   mojoboost is an experimental gradient-boosted decision-tree library written
   in Mojo, with a LightGBM-familiar Python interface and a focus on native CPU

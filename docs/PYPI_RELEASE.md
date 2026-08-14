@@ -119,7 +119,7 @@ Do this on **TestPyPI first**, then PyPI, with identical values.
    | Field | Value |
    |---|---|
    | PyPI Project Name | `mojoboost` |
-   | Owner | `ajhendel` |
+   | Owner | `mojoboost-ml` |
    | Repository name | `mojoboost` |
    | Workflow name | `release-provenance.yml` |
    | Environment name | `pypi` on PyPI, `testpypi` on TestPyPI |

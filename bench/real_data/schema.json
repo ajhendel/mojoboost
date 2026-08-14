@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/ajhendel/mojoboost/bench/real_data/schema.json",
+  "$id": "https://github.com/mojoboost-ml/mojoboost/bench/real_data/schema.json",
   "title": "mojoboost real-data differential result record",
   "description": "One record per measured run. run.py writes one file per run under records/ and concatenates them into records.json; records.csv is a flat projection of the same records and is derived, never authoritative. Two conventions run through the schema. A measurement that could not be taken is an object with a null value and an unavailable_reason, never an omitted field and never an estimate. And a timing is always a list of samples or a single measured phase, never a pre-averaged number, so the reader can see the spread that produced it.",
   "type": "object",
