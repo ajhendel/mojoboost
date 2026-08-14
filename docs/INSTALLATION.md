@@ -363,32 +363,77 @@ has the whole policy.
 
 ### 6. Print the diagnostics
 
-Six lines, and they answer most of the questions an installation bug report
-would otherwise need a conversation to establish.
+One call, and it answers most of what an installation bug report would
+otherwise need a conversation to establish.
 
 ```python
-import platform, sys
 import mojoboost
 
-print("mojoboost     ", mojoboost.__version__)
-print("package path  ", mojoboost.__file__)
-print("python        ", sys.version.split()[0], sys.executable)
-print("platform      ", platform.platform(), platform.machine())
-print("gpu_available ", mojoboost.gpu_available())
-print("extension     ", mojoboost._mojoboost.__file__)
+mojoboost.show_versions()
 ```
 
-Add the environment variables when a device question is involved, since both
-of them change what the library reports.
+```text
+mojoboost 0.1.0
+  package                /.../site-packages/mojoboost/__init__.py
+  install                wheel
+  extension              /.../site-packages/mojoboost/_mojoboost.so
+  bundled runtime        4 in /.../site-packages/mojoboost/.dylibs
+  gpu path compiled in   yes
+  gpu_available()        True
 
-```python
-import os
-print("MOJOBOOST_DISABLE_GPU   ", os.environ.get("MOJOBOOST_DISABLE_GPU", "<unset>"))
-print("MOJOBOOST_AUTO_MIN_CELLS", os.environ.get("MOJOBOOST_AUTO_MIN_CELLS", "<unset>"))
+python 3.14.0 (CPython)
+  executable             /.../bin/python
+  platform               macOS-26.0-arm64-arm-64bit
+  machine                arm64
+
+optional dependencies
+  numpy                  2.3.1
+  pandas                 not installed
+  ...
+
+environment
+  (none set)             MOJOBOOST_* and MODULAR_* are unset
 ```
+
+`mojoboost.build_info()` returns the same facts as a JSON-serializable dict
+when you want to attach them to something rather than read them.
+
+Three of those rows are worth knowing how to read.
+
+**`gpu path compiled in`** is the one that cannot be recovered any other way.
+Whether an accelerator is usable is decided when the extension is compiled,
+not on the machine that runs it, so one wheel carries one answer to every
+user who installs it. `gpu_available()` alone cannot tell you which answer
+yours has, because it returns `False` both for a build with no GPU path and
+for a perfectly good GPU build with `MOJOBOOST_DISABLE_GPU=1` set. This row
+separates them, and prints `unknown` rather than guessing when the variable
+is masking the answer. A `no` here means `device="gpu"` will raise on every
+machine this wheel is installed on, including machines with a working
+accelerator, and that is a property of the artifact rather than a fault on
+your side.
+
+**`install`** is `wheel`, `source`, or `absent`, read off the filesystem. A
+`source` install resolves its runtime libraries through an absolute path into
+the Pixi environment that built it; a `wheel` carries them inside the package.
+
+**`environment`** lists every `MOJOBOOST_*` and `MODULAR_*` variable that is
+set, discovered by scanning rather than from a fixed list, so a knob added
+after this page was written still shows up in your report.
+
+A `build` block appears above it when the artifact recorded its own
+provenance, which is where the Mojo and MAX versions, the git tag, the build
+host, and the Metal toolchain would show. No build writes that file yet, so
+today the report says so instead, and a source install asks you for
+`pixi run mojo --version` in its place.
+
+`show_versions()` adds a short note at the end whenever there is something to
+say: a missing runtime library, an installed distribution whose version
+disagrees with the imported package (a checkout shadowing a wheel, which is
+the most common reason a fix appears not to take effect), or a masked GPU
+answer. A clean install prints no notes rather than a row of reassurances.
 
 In a source checkout, add the toolchain version, which the extension does not
-carry.
+carry and `show_versions()` therefore asks you for.
 
 ```sh
 pixi run mojo --version
@@ -504,7 +549,8 @@ RuntimeError: device 'gpu' requested but no accelerator is available; use device
 ```
 
 The build has no accelerator path in it, or `MOJOBOOST_DISABLE_GPU=1` is set.
-Check with `mojoboost.gpu_available()`.
+`mojoboost.show_versions()` tells you which, on the `gpu path compiled in`
+row; `gpu_available()` alone cannot, because it returns `False` for both.
 
 The part that surprises people is that availability is a property of the
 build and not of the machine. Mojo resolves `has_accelerator()` at compile
@@ -585,8 +631,8 @@ issue, filed with the
 
 Open a bug report with the
 [bug template](https://github.com/ajhendel/mojoboost/issues/new?template=bug_report.yml)
-and include the diagnostics from step 6, the complete error text, and the
-device you requested. Installation problems are explicitly in scope for that
+and include the output of `mojoboost.show_versions()`, the complete error
+text, and the device you requested. Installation problems are explicitly in scope for that
 template. An alpha with quiet failures is worse than one with loud ones, so a
 report about a confusing install is useful, not noise.
 

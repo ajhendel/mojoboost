@@ -665,7 +665,8 @@ def train_with_callbacks[
         var tree = grow_tree(data, grad, hess, current.tree, bag, i)
         if renews:
             _renew_leaf_values(
-                tree, data, target, raw, renew_w, renew_a, bag, signs
+                tree, data, target, raw, renew_w, renew_a, bag, signs,
+                current.tree.extra,
             )
         # Under bagging or GOSS a degenerate tree indicts the sample, not
         # the run, exactly as in train_with_valid. Tested before any

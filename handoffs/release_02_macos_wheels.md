@@ -54,11 +54,13 @@ workflow_dispatch(ref=v0.1.0)  or  push of the tag
         |
         v
   packaging/macos/build_release_wheel.sh
-        |-- pixi run -e pkg build-wheel        (the existing builder, unmodified)
+        |-- SOURCE_DATE_EPOCH from the commit
+        |-- pixi run -e pkg test-wheel         (the existing builder, then the
+        |                                       existing two-venv wheel test)
         |-- packaging/macos/provenance.sh      (sidecar + accelerator/Metal gate)
-        |-- packaging/matrix/validate_matrix.py
-        |-- packaging/matrix/validate_artifact.py
-        |-- packaging/macos/inspect_wheel.py   (C1..C13)
+        |-- packaging/matrix/validate_matrix.py     \
+        |-- packaging/matrix/validate_artifact.py    > all three run; the exit
+        |-- packaging/macos/inspect_wheel.py  (C1..C13)  status is collected
         |-- otool record
         `-- packaging/macos/hash_artifacts.sh  (SHA256SUMS)
         |
@@ -66,7 +68,10 @@ workflow_dispatch(ref=v0.1.0)  or  push of the tag
   clean install, outside pixi        packaging/matrix/smoke/clean_install_macos.sh
         |
         v
-  two artifacts, 90 day retention    wheel alone; evidence separately
+  re-hash, so the manifest covers the clean install record
+        |
+        v
+  two artifacts, 90 day retention    `wheel` alone; `release-metadata` separately
         |
         v
 [publish job, only if publish_testpypi was ticked]
@@ -79,10 +84,30 @@ There is no PyPI job. Not a disabled one, not a commented one.
 ## Decisions, and why
 
 **One builder, not two.** `packaging/build_wheel.sh` stays the builder.
-`build_release_wheel.sh` calls it through `pixi run -e pkg build-wheel` and adds
-only what a release adds. Two builders that can produce a file with the same
-name and different contents is the exact failure `packaging/matrix/` was written
-to prevent, and it would have been the easy thing to do here.
+`build_release_wheel.sh` reaches it through `pixi run -e pkg test-wheel`, which
+depends on `build-wheel`, so the release also runs `packaging/test_wheel.sh`
+rather than skipping it. That split matters: `test_wheel.sh` answers "does this
+wheel work", the three checkers answer "does it say true things about itself",
+and the clean-install fixture answers "does it work without the toolchain". A
+release that runs only the middle one has checked the label and not the
+contents. Two builders that can produce a file with the same name and different
+contents is the exact failure `packaging/matrix/` was written to prevent, and it
+would have been the easy thing to do here.
+
+**All three checkers run, and the exit status is collected.** Aborting on the
+first failure would leave the artifact directory with less evidence in it than a
+passing run produces, which is backwards: a failing release is exactly when the
+inspection report, the otool dump, and the hashes are worth having. The script
+still exits non-zero, so the workflow still fails.
+
+**`SOURCE_DATE_EPOCH` is set from the commit.** Zip entry timestamps otherwise
+come from the wall clock, so two builds of one commit differ in every member
+header and therefore in the wheel's digest. `docs/PYPI_RELEASE.md` names this
+file as the place that gap lives, and `packaging/linux/build_wheel_linux.sh`
+already does the same thing. It removes one source of nondeterminism and not all
+of them: whether the Mojo compiler emits a byte-identical extension across two
+builds of one commit is untested, so the macOS wheel still must not be described
+as reproducible, and two matching digests still prove nothing.
 
 **"Bundle only what is required" is enforced as a check, not as a discovery
 step.** The builder bundles a hardcoded list of four MAX dylibs.
@@ -133,6 +158,84 @@ to anything that can upload.
 A fabricated hash would look right and be wrong; `@REPLACE_WITH_SHA` fails
 loudly. It is the spelling `.github/workflows/release-provenance.yml` (lane 10)
 already uses, so one pass fills in both files.
+
+## Cross-lane reconciliation
+
+Read this before integrating the round. `.github/workflows/release-provenance.yml`
+(lane 10) landed in the same round and overlaps this lane substantially. Both
+files were read at the time of writing; neither lane could edit the other.
+
+**The overlap, item by item.**
+
+| This lane | Lane 10 | Same thing? |
+|---|---|---|
+| `release-macos.yml` build job, `[self-hosted, macos, arm64, metal]` | `release-provenance.yml` build job, same labels | Yes. Two jobs competing for one runner that does not exist yet |
+| `packaging/macos/hash_artifacts.sh` | `packaging/security/hash_manifest.py` | Yes. Both write `python/dist/SHA256SUMS` |
+| `packaging/macos/check_action_pins.py` | `packaging/security/check_action_pins.py` | Yes, including the `@REPLACE_WITH_SHA` convention |
+| `packaging/macos/provenance.sh` writes the sidecar | Lane 10's build job requires the sidecar to already exist | No. These are complementary, and see the defect below |
+| TestPyPI publish job, environment `testpypi` | TestPyPI **and** PyPI publish jobs, environment from an input | Overlapping, and mutually exclusive in practice |
+| SBOM and attestations | `provenance` job | Lane 10 only. Nothing here duplicates it |
+
+**The defect this lane found in lane 10's workflow.** Its build job runs
+`pixi run -e pkg test-wheel` and then has a step asserting that
+`<wheel>.provenance.json` exists, with a message pointing at
+`handoffs/task18_platform.md` edit 4. That edit has not been applied:
+`packaging/build_wheel.sh` does not write a sidecar, and nothing else in that
+job does either. As committed, lane 10's build job fails at that step on every
+run. The one-line fix, in lane 10's file, is to call the script that does write
+it:
+
+```yaml
+      - name: Provenance sidecar
+        run: packaging/macos/provenance.sh "$(ls python/dist/mojoboost-*.whl)"
+```
+
+Which also picks up the accelerator and Metal consistency gate, which that job
+otherwise approximates with `xcrun --find metal` alone. Not applied here:
+`.github/workflows/` outside `release-macos.yml` is not this lane's.
+
+**The publishing conflict, which has to be decided before either file
+publishes.** A PyPI or TestPyPI trusted publisher is bound to a repository, a
+workflow *filename*, and an environment name. Two workflows with publish jobs
+are two publisher identities. `docs/PYPI_RELEASE.md` (lane 01) tells the owner
+to register the one belonging to `release-provenance.yml`. So today, dispatching
+this lane's workflow with `publish_testpypi` ticked would fail at upload with a
+token TestPyPI does not accept, and registering both would widen the publishing
+surface for no gain.
+
+**Recommended resolution, and what each choice costs.** Keep *this* lane's build
+job and *lane 10's* attestation and publish chain. That is not lane loyalty: the
+build job here does strictly more (tag and version agreement, Rosetta and PATH
+preflight, `SOURCE_DATE_EPOCH`, the release-only inspection rules, the otool
+record), and lane 10's `provenance` and `publish` jobs do things this lane has
+nothing equivalent to (SBOM, build provenance attestation, a `pypi` path with an
+environment gate). Concretely:
+
+1. Delete the `build` job from `release-provenance.yml` and have its
+   `provenance` job take `needs: []` with a `workflow_run` or dispatch input
+   naming the run to attest. Or, simpler and probably better first: delete the
+   `publish-testpypi` job from `release-macos.yml` and let this file be the
+   builder and verifier only, with lane 10's file owning every upload.
+   **This lane's artifact names were already changed to `wheel` and
+   `release-metadata` to match what lane 10's jobs download**, so either
+   direction is a deletion rather than a rewrite.
+2. Keep one action-pin checker. `packaging/security/check_action_pins.py` is the
+   better home, because pin policy is a security concern and lane 10's checklist
+   already cites it. Then the guard step here becomes
+   `python3 packaging/security/check_action_pins.py .github/workflows/release-macos.yml`
+   and `packaging/macos/check_action_pins.py` is deleted.
+3. Keep one hash manifest writer. `hash_manifest.py` covers the wheel and the
+   sidecar; `hash_artifacts.sh` also covers the inspection report, the otool
+   dump, and the clean-install record. Either extend the Python one to take a
+   directory or keep the shell one; do not run both, because the second to run
+   silently rewrites `SHA256SUMS` with a different file list.
+4. Whichever workflow keeps the publish job, its filename and environment names
+   are what the owner registers with the index. Changing the filename afterwards
+   breaks publishing until the publisher is re-registered, which
+   `docs/PYPI_RELEASE.md` already says.
+
+None of the above is applied. Every file named in it except this lane's three
+belongs to another lane.
 
 ## Required edits outside this lane
 
@@ -281,7 +384,12 @@ None of these are files, so none of them are in this lane's diff.
    environment name `testpypi`. The exact procedure, and the separation between
    reserving the name and making a production release, is lane 01's
    `docs/PYPI_RELEASE.md`.
-5. **Decide whether release tags must be signed.** The workflow prints the tag
+5. **Decide which workflow holds the publisher identity**, before registering
+   anything. See "Cross-lane reconciliation" above: `release-macos.yml` and
+   `release-provenance.yml` both have publish jobs, an index binds a publisher to
+   one workflow filename and one environment name, and `docs/PYPI_RELEASE.md`
+   currently names the other file. Registering both is not the fix.
+6. **Decide whether release tags must be signed.** The workflow prints the tag
    object and does not require a signature, because that is a security-posture
    decision belonging to `docs/RELEASE_SECURITY.md` (lane 10) rather than one
    this lane should invent.
@@ -295,11 +403,23 @@ environment. Substitute the real filename for `$WHEEL`.
 
 ### Verify what you were given, before installing it
 
+The run produces two artifacts, `wheel` and `release-metadata`, and `SHA256SUMS`
+is in the second one while the file it describes is in the first. Put them in one
+directory before checking, or `shasum -c` reports every line as missing:
+
 ```sh
-cd /path/to/downloaded/artifacts
+cd /path/to/downloads
+unzip -o wheel.zip -d artifacts
+unzip -o release-metadata.zip -d artifacts
+cd artifacts
 shasum -a 256 -c SHA256SUMS
 cat mojoboost-0.1.0-*.whl.provenance.json
 ```
+
+`clean-install.txt` is listed in the manifest only when the release re-hashed
+after the smoke step. A file absent from `SHA256SUMS` is not a failure: `-c`
+checks the lines it is given and says nothing about files it was never told
+about.
 
 Expected: `OK` per file, and a sidecar whose `git_commit` is the tagged commit and
 whose `has_accelerator_at_build` is `true` or `false` rather than `unknown`.
@@ -486,7 +606,15 @@ Ordered by what would cost the most to discover late.
    version pinned here, and is that wanted for a TestPyPI run?** Lane 10 owns
    attestations (`.github/workflows/release-provenance.yml`). If both workflows
    attest the same artifact, decide which one does it before the first publish.
-9. **Is the `.dylibs` directory name right for a non-delocated wheel?** It is the
+9. **Does the Mojo compiler emit a byte-identical extension across two builds of
+   one commit?** `SOURCE_DATE_EPOCH` now fixes the zip's timestamps, which was
+   the known source of digest drift, but nobody has built the same commit twice
+   and compared the `.so`. Until someone has, "reproducible" is not a word this
+   project may use about the macOS wheel, and the TestPyPI-to-PyPI digest
+   comparison stays invalid as `docs/PYPI_RELEASE.md` says. The test is two
+   runs of `packaging/macos/build_release_wheel.sh` on one commit and
+   `shasum -a 256` on both wheels and both extensions.
+10. **Is the `.dylibs` directory name right for a non-delocated wheel?** It is the
    convention delocate uses and the existing builder follows it, so pip and the
    RECORD handle it as ordinary package data. Nothing checks that auditing tools
    outside this repository interpret it the same way.

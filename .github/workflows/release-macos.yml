@@ -36,6 +36,17 @@
 # What this workflow does not do: publish to PyPI. There is no production
 # publish job, not a disabled one. Promoting the identical artifact from
 # TestPyPI to PyPI is an owner procedure and it belongs to docs/PYPI_RELEASE.md.
+#
+# UNRESOLVED, AND IT HAS TO BE RESOLVED BEFORE EITHER WORKFLOW PUBLISHES.
+# .github/workflows/release-provenance.yml, added in the same round, contains a
+# macOS build job with the same runner labels and its own publish jobs for both
+# TestPyPI and PyPI. A trusted publisher is bound to a workflow filename and an
+# environment name, so the two files are two publisher identities, and
+# docs/PYPI_RELEASE.md currently tells the owner to register the one belonging
+# to that file. Configuring both widens the publishing surface for no gain;
+# configuring one and dispatching the other fails at upload with a token the
+# index will not accept. The choice, and what to delete either way, is in
+# "Cross-lane reconciliation" in handoffs/release_02_macos_wheels.md.
 
 name: Release macOS wheel
 
@@ -71,8 +82,12 @@ on:
 # the TestPyPI job gets an OIDC token.
 permissions: {}
 
+# One release per tag at a time. `github.ref_name` rather than `github.ref` so a
+# dispatch (which passes `v0.1.0`) and a tag push (whose ref is
+# `refs/tags/v0.1.0`) land in the same group instead of running side by side and
+# racing on the artifact names.
 concurrency:
-  group: release-macos-${{ inputs.ref || github.ref }}
+  group: release-macos-${{ inputs.ref || github.ref_name }}
   cancel-in-progress: false
 
 defaults:
@@ -165,9 +180,11 @@ jobs:
           shasum -a 256 pixi.lock
 
       # One script, so that a release run and a run on a laptop are the same
-      # thing. It builds through `pixi run -e pkg build-wheel`, writes the
-      # provenance sidecar, and then runs three checkers: the matrix contract,
-      # the artifact against the matrix, and the release-only rules.
+      # thing. It builds and tests through `pixi run -e pkg test-wheel`, writes
+      # the provenance sidecar, and then runs three checkers: the matrix
+      # contract, the artifact against the matrix, and the release-only rules.
+      # All three run even when one fails, so a failing release still uploads
+      # the reports that say why.
       - name: Build, verify, and hash
         env:
           MOJOBOOST_MACOS_TARGET: ${{ inputs.macos_deployment_target }}
@@ -207,12 +224,30 @@ jobs:
               "$(ls python/dist/mojoboost-*.whl)" \
               "$PWD/python/dist/clean-install.txt"
 
+      # The manifest is written by the build script, before the clean-install
+      # step exists to be hashed. Re-running it here covers the record too, and
+      # leaves the wheel's line byte-identical, which is what the publish job
+      # greps for.
+      - name: Re-hash, including the clean install record
+        if: always()
+        run: |
+          test -d python/dist || { echo "no python/dist, nothing to hash"; exit 0; }
+          packaging/macos/hash_artifacts.sh python/dist
+
       # Two artifacts, because the publish job must receive the wheel and only
       # the wheel: twine uploads everything in the directory it is given.
+      #
+      # The names `wheel` and `release-metadata` are not descriptive by
+      # accident. They are the names .github/workflows/release-provenance.yml
+      # (lane 10) downloads, so its attestation and publish jobs can consume
+      # this build without an edit if the integrator keeps one macOS build job
+      # rather than two. See "Cross-lane reconciliation" in
+      # handoffs/release_02_macos_wheels.md, which is where that decision
+      # belongs.
       - name: Upload the wheel
         uses: actions/upload-artifact@REPLACE_WITH_SHA # v4.4.3
         with:
-          name: mojoboost-macos-arm64-wheel
+          name: wheel
           path: python/dist/*.whl
           if-no-files-found: error
           retention-days: 90
@@ -221,7 +256,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@REPLACE_WITH_SHA # v4.4.3
         with:
-          name: mojoboost-macos-arm64-evidence
+          name: release-metadata
           path: |
             python/dist/*.provenance.json
             python/dist/SHA256SUMS
@@ -256,13 +291,13 @@ jobs:
       - name: Download the wheel
         uses: actions/download-artifact@REPLACE_WITH_SHA # v4.1.8
         with:
-          name: mojoboost-macos-arm64-wheel
+          name: wheel
           path: dist
 
       - name: Download the evidence
         uses: actions/download-artifact@REPLACE_WITH_SHA # v4.1.8
         with:
-          name: mojoboost-macos-arm64-evidence
+          name: release-metadata
           path: evidence
 
       # The artifact that arrives here is not, by construction, the artifact

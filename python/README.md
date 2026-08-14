@@ -69,18 +69,21 @@ python examples/install_smoke.py                     # installed package
 PYTHONPATH=python python examples/install_smoke.py   # source checkout
 ```
 
-The diagnostics it prints first are what an installation bug report needs.
+The diagnostics it prints first are what an installation bug report needs,
+and they are one call on their own.
 
 ```python
-import platform, sys
 import mojoboost
 
-print("mojoboost     ", mojoboost.__version__)
-print("package path  ", mojoboost.__file__)
-print("python        ", sys.version.split()[0], sys.executable)
-print("platform      ", platform.platform(), platform.machine())
-print("gpu_available ", mojoboost.gpu_available())
+mojoboost.show_versions()      # or build_info() for the same facts as a dict
 ```
+
+That includes the one thing no other call can tell you: whether a GPU path
+was compiled into this build. Availability is decided when the extension is
+compiled rather than on the machine that runs it, so one wheel carries one
+answer to everybody who installs it, and `gpu_available()` alone returns
+`False` both for a build without a GPU path and for a GPU build with
+`MOJOBOOST_DISABLE_GPU=1` set.
 
 ## Usage
 

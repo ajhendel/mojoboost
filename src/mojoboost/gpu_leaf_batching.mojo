@@ -295,6 +295,7 @@ def _batch_hist_partial_kernel(
     n_items: Int32,
     n_slots: Int32,
     n_bins: Int32,
+    feat_stride: Int32,
 ):
     """One (feature slot, packed tile) partial histogram, written to its own
     slot of the global partial buffer.
@@ -362,7 +363,7 @@ def _batch_hist_partial_kernel(
     var t = Int(meta[unsafe_offset=4][0])
     var plane_base = Int(meta[unsafe_offset=5][0]) * nr
 
-    var f = Int(feat_ids[unsafe_offset = k * ns + slot][0])
+    var f = Int(feat_ids[unsafe_offset = k * Int(feat_stride) + slot][0])
     var g_scale = scales[unsafe_offset = k * SCALE_WORDS + SCALE_G][0]
     var h_scale = scales[unsafe_offset = k * SCALE_WORDS + SCALE_H][0]
 
@@ -410,6 +411,7 @@ def _batch_hist_atomic_kernel(
     n_slots: Int32,
     n_bins: Int32,
     hist_size: Int32,
+    feat_stride: Int32,
 ):
     """The same batched accumulation, folding each partial straight into its
     item's output slice with global integer atomics.
@@ -425,7 +427,6 @@ def _batch_hist_atomic_kernel(
     var tid = thread_idx.x
     var nb = Int(n_bins)
     var nr = Int(n_rows)
-    var ns = Int(n_slots)
     var hs = Int(hist_size)
     var slot = Int(block_idx.x)
     var g_tile = Int(block_idx.y)
@@ -474,7 +475,7 @@ def _batch_hist_atomic_kernel(
     var plane_base = Int(meta[unsafe_offset=5][0]) * nr
     var out_slot = Int(meta[unsafe_offset=6][0])
 
-    var f = Int(feat_ids[unsafe_offset = k * ns + slot][0])
+    var f = Int(feat_ids[unsafe_offset = k * Int(feat_stride) + slot][0])
     var g_scale = scales[unsafe_offset = k * SCALE_WORDS + SCALE_G][0]
     var h_scale = scales[unsafe_offset = k * SCALE_WORDS + SCALE_H][0]
 
@@ -523,6 +524,7 @@ def _batch_reduce_kernel(
     n_slots: Int32,
     n_bins: Int32,
     hist_size: Int32,
+    feat_stride: Int32,
 ):
     """Sum each item's own tiles into its own output slice.
 
@@ -553,7 +555,7 @@ def _batch_reduce_kernel(
     var tile_begin = Int(items[unsafe_offset = base + ITEM_TILE_BEGIN][0])
     var n_tiles = Int(items[unsafe_offset = base + ITEM_TILES][0])
     var out_slot = Int(items[unsafe_offset = base + ITEM_OUT][0])
-    var f = Int(feat_ids[unsafe_offset = k * ns + slot][0])
+    var f = Int(feat_ids[unsafe_offset = k * Int(feat_stride) + slot][0])
 
     var acc = Int32(0)
     var off = tile_begin * per_item + p * plane + slot * nb + b
@@ -1187,8 +1189,10 @@ struct GpuLeafBatcher(Movable):
     var items_dev: DeviceBuffer[DType.int32]
     # Per-item fixed-point scales, gradient then hessian.
     var scales_dev: DeviceBuffer[DType.float32]
-    # Global feature ids per (item, slot). Replicated across items when the
-    # batch shares one feature set, which is the trainer's case.
+    # Global feature ids per (item, slot), strided by `n_features` rather
+    # than by the batch's `n_slots`, so narrowing the feature set never moves
+    # an item's row. The kernels are told the stride. Replicated across items
+    # when the batch shares one feature set, which is the trainer's case.
     var feat_dev: DeviceBuffer[DType.int32]
     # `pool.capacity` full-width histograms, in the builder's layout.
     var out_dev: DeviceBuffer[DType.int32]
@@ -1292,9 +1296,18 @@ struct GpuLeafBatcher(Movable):
     def slot_cells(self) -> Int:
         return N_PLANES * self.n_features * self.n_bins
 
-    def max_tiles(self) -> Int:
-        """Tiles the partial buffer can hold at `n_slots` active features."""
-        return self.partial_capacity
+    def max_tiles(self, n_slots: Int) raises -> Int:
+        """Row tiles the partial buffer holds at `n_slots` active features.
+
+        The capacity is in cells, and one tile costs `n_slots * n_bins` of
+        them, so the tile budget moves with the feature set. This is the
+        number to hand `plan_batch` as `max_partial_cells / hist_cells`
+        reasoning, and the one that decides whether a wide batch has to fall
+        back to the atomic strategy.
+        """
+        if n_slots < 1:
+            raise Error("tile budget needs at least one active feature")
+        return self.partial_capacity // (n_slots * self.n_bins)
 
     def set_shared_features(mut self, features: List[Int]) raises:
         """One feature set for every item in the next batch.
@@ -1475,6 +1488,7 @@ struct GpuLeafBatcher(Movable):
                 Int32(n_items),
                 Int32(plan.n_slots),
                 Int32(self.n_bins),
+                Int32(self.n_features),
                 grid_dim=(plan.n_slots, plan.total_tiles),
                 block_dim=threads,
             )
@@ -1488,6 +1502,7 @@ struct GpuLeafBatcher(Movable):
                 Int32(plan.n_slots),
                 Int32(self.n_bins),
                 Int32(hs),
+                Int32(self.n_features),
                 grid_dim=_ceil_div(cells, threads),
                 block_dim=threads,
             )
@@ -1506,6 +1521,7 @@ struct GpuLeafBatcher(Movable):
                 Int32(plan.n_slots),
                 Int32(self.n_bins),
                 Int32(hs),
+                Int32(self.n_features),
                 grid_dim=(plan.n_slots, plan.total_tiles),
                 block_dim=threads,
             )

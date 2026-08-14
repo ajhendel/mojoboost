@@ -219,6 +219,7 @@ from max.gpu.host import (
 from mojoboost.unified_memory_policy import (
     DEFAULT_ROUTE,
     ENABLE_LEVEL,
+    N_ROLES,
     N_ROUTES,
     ROUTE_COPY_DIRECT,
     ROUTE_COPY_STAGED,
@@ -230,7 +231,10 @@ from mojoboost.unified_memory_policy import (
     STATUS_UNSUPPORTED,
     STATUS_WRONG,
     EvidenceLedger,
+    block_reason_name,
     evidence_name,
+    explain_route,
+    role_name,
     route_name,
     status_name,
 )
@@ -901,6 +905,12 @@ def _run_copy_route(
         if checksum != expected:
             break
 
+    # Host side: the n-byte staging buffer this route used, the one-byte
+    # placeholder for the one it did not, and the four-byte accumulator.
+    # Device side: the payload buffer and the four-byte accumulator. The
+    # placeholder is counted rather than rounded away, because both copy
+    # routes allocate one and a byte count that quietly drops an allocation
+    # is the kind of number this driver exists to not produce.
     return _finish(
         scope,
         route,
@@ -909,7 +919,7 @@ def _run_copy_route(
         alloc_ns,
         first,
         retouch,
-        n + 4,
+        n + 1 + 4,
         n + 4,
         copy_bytes,
         consumer.drains_per_round(),
@@ -1057,6 +1067,12 @@ def _run_host_direct(
         payload[0] = plan.tag(rnd)
         expected = _expected_after_tag(base_sum, orig0, payload[0])
 
+        # Every write below goes into memory a kernel read last round, and it
+        # is safe only because that round ended in a drain: the allocation
+        # window for round 0, `Consumer.run`'s synchronize for the rest. This
+        # is the whole `RETIRE_ON_KERNEL` obligation in miniature, and a
+        # trainer on this route owes it for every node's kernel rather than
+        # for one copy. See unified_memory_policy.SyncContract.
         var t0 = perf_counter_ns()
         var dst = shared.unsafe_ptr()
         var src = payload.unsafe_ptr()
@@ -1201,7 +1217,12 @@ def _report(result: RouteResult, n_bytes: Int):
     # no copy; it does not mean no copy happened, and nothing in this file
     # can tell the difference. See the module docstring.
     print(p + "copy_bytes_issued_total:", result.copy_bytes_total)
-    print(p + "issues_copy:", 1 if result.copy_bytes_total > 0 else 0)
+    # Narrower than it looks, which is why it is not called `issues_copy`.
+    # `map_write` reports 0 here because leaving a mapped block is not an
+    # `enqueue_copy` call, and that block exit may still be a full upload.
+    # The policy module's `publishes_by_copy` is the wider question and
+    # answers True for `map_write`; the two are named apart on purpose.
+    print(p + "enqueues_copy:", 1 if result.copy_bytes_total > 0 else 0)
     # Queue drains the route owed per round. Routes owing different numbers
     # bought different guarantees; the difference is reported, never netted
     # out of a comparison.
@@ -1261,6 +1282,22 @@ def _report_policy():
                 String("um.policy.evidence.") + route_name(route) + ":",
                 "unreadable",
             )
+    # Per role, what would block the one route that issues no copy, asked
+    # with unified memory assumed so the answer isolates data ownership and
+    # evidence from the platform. This is the part of the experiment's
+    # subject that no run can change, and printing it beside the timings
+    # keeps a reader from concluding that a fast route is an available one.
+    for role in range(N_ROLES):
+        var key = (
+            String("um.policy.role.") + role_name(role) + ".host_direct:"
+        )
+        try:
+            var decision = explain_route(
+                role, ROUTE_HOST_DIRECT, True, ledger
+            )
+            print(key, block_reason_name(decision.reason))
+        except:
+            print(key, "unreadable")
 
 
 def _report_not_probed(scope: String, detail: String):
@@ -1290,6 +1327,14 @@ def _ladder(
     Only the three input routes are laddered, not the output route: doubling
     the payload does not change the four-byte accumulator, so an output route
     would contribute a flat line and cost machine pressure to produce it.
+
+    The per-byte metric means different things in the two modes and the two
+    ladders must not be compared with each other. In `rewrite` mode the round
+    it divides is a host write plus a publish plus a kernel scan; in
+    `resident` mode the steady rounds write and publish nothing, so it is a
+    kernel scan alone. Both scale with the payload, which is what makes each
+    a usable regression signal on its own, and `um.ladder.mode` says which one
+    a given ladder produced.
 
     This is the memory-pressure mode. Run it on an idle machine with the
     doc's `vm_stat` capture bracketing it, or its answer is about whatever

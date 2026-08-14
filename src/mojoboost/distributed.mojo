@@ -71,6 +71,7 @@ from .histogram import (
 from .interaction import extend_branch
 from .split import SplitInfo, find_best_split, soft_threshold_l1
 from .tree import Tree, TreeParams
+from .tree_parameters_extra import finish_leaf_output
 
 # Bit positions in the unsupported-configuration mask agreed across ranks.
 #
@@ -507,6 +508,13 @@ def _grow_tree_distributed[
     var n_bins = shards[0].data.n_bins
     var n_local = len(shards)
 
+    # The parts of the bundle this grower does honor are validated the way the
+    # single-node grower validates them, against this dataset. Every rank runs
+    # the same check on the same numbers, so it raises everywhere or nowhere;
+    # the parts it does not honor were already refused by `_unsupported_mask`.
+    params.extra.check_scalars(params.min_data_in_leaf)
+    params.extra.penalties.check_features(n_features)
+
     var tree = Tree(
         List[Int](), List[Int](), List[Int](), List[Int](),
         List[Float64](), List[Float64](), 0,
@@ -526,19 +534,34 @@ def _grow_tree_distributed[
         )
     allreduce_histogram(comm, root_hist)
 
+    var max_delta_step = params.extra.max_delta_step
+    var path_smooth = params.extra.path_smooth
+
     var root_count = _total_count(root_hist)
     var root_branch = List[Int]()
+    # Covers are the global counts every rank agreed on, so the tree carries
+    # the same node covers on every rank. The value is computed before the
+    # search because path smoothing makes a candidate's children shrink toward
+    # it, exactly as in `tree.grow_tree`; the root has no parent and so smooths
+    # toward 0.0.
+    var root = tree._add_node(
+        _leaf_value(
+            root_hist,
+            params.lambda_reg,
+            params.lambda_l1,
+            root_count,
+            0.0,
+            max_delta_step,
+            path_smooth,
+        ),
+        Float64(root_count),
+    )
     var root_split = _search(
         root_hist,
         root_count,
         params,
         params.constraints.allowed_features(root_branch),
-    )
-    # Covers are the global counts every rank agreed on, so the tree carries
-    # the same node covers on every rank.
-    var root = tree._add_node(
-        _leaf_value(root_hist, params.lambda_reg, params.lambda_l1),
-        Float64(root_count),
+        tree.value[root],
     )
 
     var frontier = List[_DistLeaf]()
@@ -612,12 +635,32 @@ def _grow_tree_distributed[
             allreduce_histogram(comm, right_hist)
             left_hist = subtract_histogram(frontier[best_i].hist, right_hist)
 
+        # Both children smooth toward the value the parent already emits, and
+        # the row counts are the global ones every rank read off the reduced
+        # parent histogram, so the two ranks cannot value a leaf differently.
+        var parent_output = tree.value[parent_node]
         var left_node = tree._add_node(
-            _leaf_value(left_hist, params.lambda_reg, params.lambda_l1),
+            _leaf_value(
+                left_hist,
+                params.lambda_reg,
+                params.lambda_l1,
+                n_left,
+                parent_output,
+                max_delta_step,
+                path_smooth,
+            ),
             Float64(n_left),
         )
         var right_node = tree._add_node(
-            _leaf_value(right_hist, params.lambda_reg, params.lambda_l1),
+            _leaf_value(
+                right_hist,
+                params.lambda_reg,
+                params.lambda_l1,
+                n_right,
+                parent_output,
+                max_delta_step,
+                path_smooth,
+            ),
             Float64(n_right),
         )
         tree.feature[parent_node] = split.feature
@@ -628,8 +671,12 @@ def _grow_tree_distributed[
 
         var branch = extend_branch(frontier[best_i].branch, split.feature)
         var allowed = params.constraints.allowed_features(branch)
-        var left_split = _search(left_hist, n_left, params, allowed)
-        var right_split = _search(right_hist, n_right, params, allowed)
+        var left_split = _search(
+            left_hist, n_left, params, allowed, tree.value[left_node]
+        )
+        var right_split = _search(
+            right_hist, n_right, params, allowed, tree.value[right_node]
+        )
 
         frontier[best_i] = _DistLeaf(
             left_node,

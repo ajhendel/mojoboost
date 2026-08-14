@@ -83,15 +83,33 @@ Today's duplication, recorded in the policy module:
 
 | Path | Copies of the matrix held | Where |
 |---|---|---|
-| Training | 2 | caller's `List[UInt8]`, `bins_dev` |
-| Scoring | 3 | caller's `List[UInt8]`, pinned `stage_bins`, `bins_dev` |
+| Training (`ROLE_BINS`) | 2 | caller's `List[UInt8]`, `bins_dev` |
+| Resident validation (`ROLE_VALID_BINS`) | 2 | caller's `List[UInt8]`, `valid_bins_dev` |
+| Batch scoring (`ROLE_BATCH_BINS`) | 3 | caller's `List[UInt8]`, pinned `stage_bins`, `bins_dev` |
 
-The scoring path's third copy (`gpu_predict.mojo` stages the caller's bins
-through a pinned host buffer before uploading) is the clearest duplication in
-the system and it is removable without any unified-memory question at all: the
-upload could read the caller's list directly, exactly as the training path
-already does. That is a one-line change in someone else's file and it is worth
-more than most of what a route win would buy.
+The first two are the same shape: both `GpuHistogramBuilder.__init__` and
+`GpuPredictor.upload_validation` allocate a buffer sized exactly to their matrix
+and copy straight out of the caller's list, with no pinned staging copy. They
+are separate rows because they are resident *at the same time*: a fit that
+scores a held-out set holds four copies of two matrices, which is what
+`MOJOBOOST_UM_HOLD_MIB` models in the driver.
+
+The batch-scoring path's third copy needs care, and my first reading of it was
+wrong. `GpuPredictor.upload_bins` stages the batch into a pinned `stage_bins`
+before uploading, and it is tempting to call that redundant and delete it. It is
+not: `bins_dev` is sized to the **high-water batch** rather than to this batch,
+and `enqueue_copy(dst_buf=..., src_ptr=...)` moves the whole destination buffer,
+so copying from the caller's exactly-sized list would read past its end.
+`_check_matrix` guarantees the source is exactly `n_rows * n_features`, so this
+is a real out-of-bounds read, not a theoretical one.
+
+Removing that copy therefore needs one of three things: a sub-range copy API (no
+such API is verified here), an exact-size reallocation of `bins_dev` per batch
+(trading the copy for an allocation), or a shared route. Which makes
+`ROLE_BATCH_BINS` the one bins-shaped role where a shared route is structurally
+available today, because unlike the other two its bytes already sit in a runtime
+allocation the session owns. It is still gated on the same evidence as
+everything else.
 
 ### 3. The shipped default gradient path already transfers nothing
 
@@ -133,10 +151,12 @@ result worth having.
 copy reading it has retired, which happens early in a round. On a shared route
 there is no copy: the slot is read by *every histogram kernel of the whole
 tree*, so it is not free until the round drains. A two-slot ring then buys
-nothing and, worse, would report an overlap that is not there.
+nothing and, worse, would report an overlap that is not there. On `map_write`
+the ring does not apply at all, because there is no staging buffer to rotate:
+the host writes through the device buffer's own mapping.
 
-`SyncContract.staging_ring_applies` is False on the shared routes for this
-reason, and `note_read_on_each_launch` is True there instead of
+`SyncContract.staging_ring_applies` is False on every route but the two copy
+ones for this reason, and `note_read_on_each_launch` is True there instead of
 `note_read_on_publish`. Whoever implements a shared route must move the
 `note_device_read(RES_STAGE)` call from publish time to launch time, or the
 dependency model will say the host may overwrite a buffer the device is still
@@ -148,8 +168,12 @@ reading.
 `ctx.synchronize()` at the top of `stage_gradients` exists because the host is
 about to overwrite memory the device may still be reading, and a route change
 only moves *which event* the wait is for (`RETIRE_ON_COPY` to
-`RETIRE_ON_KERNEL`), always later, never earlier. Lane A5's proposal to elide
-synchronizations and any shared route interact here and must be reviewed
+`RETIRE_ON_KERNEL`), always later, never earlier. Every route except the two
+copy ones retires on the kernel, `map_write` included: its publish may cost a
+transfer and its next write still waits for the kernels, which is why
+`sync_contract` branches per route family rather than deriving everything from
+whether the route publishes by copy. Lane A5's proposal to elide
+synchronizations and any non-default route interact here and must be reviewed
 together, not merged independently.
 
 ## The integration seam, precisely
@@ -233,7 +257,8 @@ the session.**
 | `out_dev` | builder constructor | builder | none (device written) | the download copy | builder drop |
 | `host_out` | builder constructor | builder | none | copy route: the download. shared route: every kernel that accumulated into it | builder drop |
 | `stage_rows` | `GpuActiveRows` | rows | caller's `bag` list, borrowed during staging | copy route: the enqueued copy. shared route: every partition and histogram launch of the tree | rows drop |
-| `stage_bins` (scoring) | `GpuPredictor` | predictor | caller's `data.bins` | the upload copy | predictor drop |
+| `stage_bins` (batch scoring) | `GpuPredictor` | predictor | caller's `data.bins` | copy route: the upload copy. shared route: every predict launch over the batch | predictor drop |
+| `valid_bins_dev` | `GpuPredictor` | predictor | caller's `data.bins`, borrowed during `upload_validation` | every validation scoring launch | predictor drop or the next `upload_validation` |
 
 Three lifetime hazards a shared route introduces, none of which exist today:
 
@@ -373,11 +398,13 @@ What a future integration would need, by owner:
 4. Make the drain in `GpuSession.close` unconditional rather than conditional on
    `any_pending()` before any shared route ships, and make a `POOL_GROW` free
    wait on kernel retirement rather than copy retirement.
-5. Independently of all of the above and worth doing on its own merits: drop
-   the `stage_bins` pinned staging copy in `gpu_predict.mojo` and upload
-   straight from the caller's `data.bins`, as the training path already does.
-   That removes one full copy of a scored matrix and needs no unified-memory
-   evidence at all.
+5. The batch-scoring staging copy in `gpu_predict.mojo` is the one place a
+   shared route would pay off structurally rather than only possibly. Do
+   **not** simply delete the copy and upload from `data.bins`: `bins_dev` is
+   high-water sized and `enqueue_copy` moves the whole destination, so that
+   change reads past the end of the caller's list. The options are a sub-range
+   copy if the API supports one (unverified), an exact-size reallocation per
+   batch, or `ROLE_BATCH_BINS` on a shared route once the evidence exists.
 
 **Task 13 (`binning.mojo`)**
 
@@ -392,9 +419,10 @@ What a future integration would need, by owner:
 
 7. Extend the Apple benchmark schema for the additive grammar changes:
    `um.mode`, `um.hold_bytes`, the `um.policy.*` scope, the
-   `um.out_host_direct` and `um.out_wrapped_host_buffer` scopes, and the
+   `um.out_host_direct` and `um.out_wrapped_host_buffer` scopes, the
+   `um.policy.role.<role>.host_direct` lines, and the
    per-route keys `input_route`, `out_route`, `mode`,
-   `copy_bytes_issued_total`, `issues_copy`, `drains_per_round`, and the five
+   `copy_bytes_issued_total`, `enqueues_copy`, `drains_per_round`, and the five
    `retouch_*` keys. Every previously emitted key is unchanged in name and
    meaning, so an existing parser still works and simply sees fewer keys than
    exist. `docs/APPLE_UNIFIED_MEMORY.md`, "Output grammar", is the source of
@@ -450,15 +478,33 @@ covering, all of which are pure host arithmetic and need no accelerator:
 - `structural_support` refuses `host_direct` for `ROLE_BINS` and
   `ROLE_VALID_BINS`, and refuses every shared route for `ROLE_HIST_OUT`,
   regardless of evidence;
+- `structural_support` *allows* `host_direct` for `ROLE_BATCH_BINS`, which is
+  the asymmetry with `ROLE_BINS` most likely to look like a bug to a reader
+  who has not read why;
 - a copy-skipping route is refused when `unified_memory` is False even with a
   full ledger;
 - `RouteEvidence.level` truncates at the first missing rung (a route with
   `no_blit_in_trace` but no `checksum_ok` scores `none`);
 - `EvidenceLedger.audit` flags a rung set with no record identifier;
-- `sync_contract` reports `RETIRE_ON_KERNEL` and `staging_ring_applies == False`
-  for exactly the routes that issue no copy;
+- `sync_contract` reports `RETIRE_ON_KERNEL` and `staging_ring_applies ==
+  False` for every route except the two copy ones, `map_write` included. That
+  last inclusion is the assertion worth having: `map_write` publishes by copy
+  and still retires on the kernel, because the buffer it writes next is the
+  one the kernels read;
+- `publishes_by_copy(ROUTE_MAP_WRITE)` is True while the driver's
+  `enqueues_copy` key is `0` for the same route. That disagreement is
+  deliberate (the block exit is not an `enqueue_copy` call but may still be a
+  full upload) and it is the single most likely thing for a later reader to
+  "fix" into agreement, so it gets an assertion and a comment rather than a
+  shared helper that would have to pick one meaning;
+- `explain_route` returns the default with the same reason `resolve_route`
+  raises on, for every (role, route) pair, which is the assertion that keeps
+  the reporting path and the acting path from drifting apart;
 - `role_footprint` counts host and device bytes separately and never sums them
-  into a saving, and `scoring_bins_duplication().total() == 3`.
+  into a saving;
+- `training_bins_duplication().total() == 2`,
+  `validation_bins_duplication().total() == 2`, and
+  `batch_scoring_bins_duplication().total() == 3`.
 
 ## Exact commands for the later validation pass
 
@@ -531,7 +577,7 @@ unambiguous.
    once. The document says so, the module docstring says so, and the protocol
    says run `rewrite` first. A `resident`-only result should not be accepted.
 4. **`copy_bytes_issued_total: 0` will be misread as zero copy.** It is
-   reported next to `issues_copy` and explained in three places for that
+   reported next to `enqueues_copy` and explained in three places for that
    reason. It is the single most likely misreading of this whole experiment.
 5. **A route win would not imply a training win.** The current M4 end-to-end GPU
    measurement is slower than the CPU trainer and is dominated by per-node

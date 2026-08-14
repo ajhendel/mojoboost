@@ -100,9 +100,12 @@ evidence establishes a trustworthy threshold. Read
 
 If any of this fails, open a
 [bug report](https://github.com/ajhendel/mojoboost/issues/new?template=bug_report.yml),
-which covers installation problems, and paste the diagnostics block
-`examples/install_smoke.py` prints first, plus `pixi run mojo --version`,
-your operating system, processor, and accelerator.
+which covers installation problems, and paste the output of
+`mojoboost.show_versions()` plus, from a source checkout,
+`pixi run mojo --version`. `show_versions()` reports what this install is,
+which environment variables are in effect, and whether a GPU path was
+compiled into the build, which is decided on the build machine and cannot be
+recovered from anything else.
 
 ## Why Mojo
 

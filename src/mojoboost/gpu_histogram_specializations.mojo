@@ -63,6 +63,12 @@ function here divides by it, and none should: `WARP_GRANULARITY` in
 `gpu_tiling.mojo` is a launch-rounding granularity chosen to be a multiple of
 every supported backend's width, not a claim about any device's width.
 
+No unsourced grid bound either, for the same reason. `MAX_GRID_DIM_Y` in
+`gpu_tiling.mojo` is 65535 because CUDA caps `grid.y` there and the other
+backends allow more; there is no comparable figure for `grid.z` in this
+project, so nothing here carries one. An earlier draft did, by analogy, and
+that was the same mistake as assuming a subgroup width.
+
 No policy. Which specialization to use for which device and shape is
 `apple_histogram_policy.mojo`, which is also where the default-off gate
 lives. Nothing here selects anything.

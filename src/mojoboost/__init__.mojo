@@ -204,6 +204,7 @@ from .train_gpu import (
     VALID_SCORE_DEVICE,
     VALID_SCORE_HOST,
     device_gradients,
+    device_loss_metric,
     grow_tree_gpu,
     resolve_objective_source,
     resolve_split_search,

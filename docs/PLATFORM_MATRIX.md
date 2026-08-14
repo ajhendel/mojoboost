@@ -61,23 +61,33 @@ no host provenance, and no recorded output, so the row stays `designed`.
 
 ## Interpreters
 
-One, and it is not a simplification.
+One build target, five runnable. Those are different questions and this table
+used to answer only the first.
+
+The extension links no libpython. It resolves CPython entry points by name out
+of the running interpreter at load time, so the interpreter that *compiles* it
+does not determine the interpreters it *runs* on. What the build interpreter
+does determine is the wheel's tag, because setuptools tags a wheel for
+whichever interpreter ran the build.
 
 | Tag | Status | Why |
 |---|---|---|
-| `cp314` | build target | `max 26.5.0` ships as a 3.14 build and depends on `python 3.14.*`. The extension is compiled inside that environment, so the interpreter the wheel targets is the interpreter MAX pins |
-| `cp314t` | `unsupported` | `max 26.5.0` depends on `python-gil`, which the free-threaded build does not provide. The environment cannot resolve, so no extension can be built |
-| `cp313` and earlier | `unsupported` | No MAX build for them in the pinned channel |
-| `abi3` | `unsupported` | The extension is not built against the limited API. Do not tag a wheel `abi3` to widen its reach |
+| `cp314` | `tested`, build target | The interpreter the pixi environment resolved to, so the one the Mojo toolchain compiles against and the one the wheel is tagged for. A consequence of `pixi.toml` pinning no python, not of a toolchain requirement |
+| `cp313`, `cp312`, `cp311`, `cp310` | `tested` | The cp314-built extension imports and passes `python/test_python_api.py` on each, unmodified, on osx-arm64. No wheel has been built by any of these environments, so no artifact carries their tag |
+| `cp39` and earlier | `unsupported` | The extension aborts at load with `symbol not found: Py_NewRef`, a CPython 3.10 addition. Also below the toolchain's own floor, so there is nothing to build with either |
+| free-threaded, any version | `unsupported` | `max 26.5.0` depends on `python-gil`, which no free-threaded build provides. The environment cannot resolve, so no extension can be built. The one row here nobody has measured |
+| `abi3` | `unsupported` | Not a lever this project has: there is no C source and no compile step where `Py_LIMITED_API` could be set. Also not the lever it would need, since the binary links no libpython. Do not tag a wheel `abi3` to widen its reach |
 
-All four facts come from `pixi.lock`, which is the only place the toolchain is
-pinned, and `validate_matrix.py` re-derives them from the lock on every run. If
-Modular moves the pin, that check fails and this table gets rewritten rather
-than quietly outliving its evidence.
+The toolchain facts come from `pixi.lock`, and `validate_matrix.py` re-derives
+them on every run. **The lock records the variant that was solved, not the
+variants that exist**, and reading it as the latter is what previously put
+"No MAX build for them in the pinned channel" in this table. It was false:
+`max 26.5.0` is published for 3.10 through 3.14 on all three platforms.
 
-`python/pyproject.toml` already says `requires-python = ">=3.14"`, so pip
-refuses the install on an older interpreter instead of letting it fail at
-import.
+The `tested` rows are measured on osx-arm64 against a source install, and are
+recorded in [docs/PYTHON_SUPPORT.md](PYTHON_SUPPORT.md) section 10. Linux is
+not measured, and a floor is not a promise that a wheel exists for every
+version above it.
 
 ## The easy macOS wheel path
 
@@ -284,8 +294,9 @@ mistake is, loudly, rather than somewhere convenient and quietly.
 |---|---|---|
 | macOS wheel on an older macOS than the tag | pip: "not a supported wheel on this platform". Nothing installs | platform tag |
 | macOS wheel on an Intel Mac | Same tag mismatch | platform tag, `arm64` |
-| Any wheel on Python 3.13 or older | Same tag mismatch, and `requires-python` refuses it too | `cp314` tag |
-| Any wheel on free-threaded 3.14t | Same tag mismatch. The ABI tags differ | `cp314` vs `cp314t` |
+| The cp314 wheel on Python 3.10 to 3.13 | Tag mismatch, so pip declines. The code would have run: this is a missing artifact, not an incompatibility, and the fix is to build a wheel per interpreter | `cp314` tag |
+| Any wheel on Python 3.9 or older | Tag mismatch, and `requires-python = ">=3.10"` refuses it too. Here the code genuinely would not run: the extension aborts on `Py_NewRef` | `cp3XX` tag, and the floor |
+| Any wheel on a free-threaded interpreter | Same tag mismatch. The ABI tags differ | `cp314` vs `cp314t` |
 | `pip install mojoboost` on Linux, today | "no matching distribution found". No sdist is published, so pip cannot fall back to a source build that would fail with a compiler error instead | no sdist |
 | `device="gpu"` with no accelerator in the build | Raises. It never falls back to the CPU silently | `src/mojoboost/device.mojo` |
 | `device="gpu"` on a redistributed build whose host has no usable device | Raises when the device is opened, later than the resolve | `has_accelerator()` is compile time |

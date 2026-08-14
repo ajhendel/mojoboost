@@ -12,12 +12,14 @@ to produce the output shown next to it.
 | `docs/INSTALLATION.md` | New. The full installation contract: three states, the first five minutes, diagnostics, and every error message with what it means |
 | `README.md` | `## Five-minute start` replaced by `## Installation`, which leads with `pip install mojoboost` and says plainly that it does not work yet. Added the first-five-minutes pointer and a devices paragraph. Corrected the tiny example to `min_data_in_leaf=1`. Updated the wheel paragraph in `### Tests and wheels` to stop implying a published macOS wheel. `## Python API` now names `pixi run build-python` |
 | `python/README.md` | The PyPI long description. Added the alpha warning, an `## Installing` section with the three states, `## The first five minutes`, and `## When something goes wrong` with a message table. Rewrote `## Platform support` to stop claiming wheels exist. Fixed a stale multiclass-is-CPU-only claim in `## Device selection`. Expanded `## Links` |
-| `examples/install_smoke.py` | New. Standard-library-only script that walks the same seven steps, prints the diagnostics block a bug report needs, and names the common import failures in its own error handling |
+| `examples/install_smoke.py` | New. Standard-library-only script that walks the same steps, calls `show_versions()`, and names the common import failures in its own error handling |
+| `python/mojoboost/__init__.py` | **Outside this lane's ownership, added on the owner's explicit instruction.** Additive: `show_versions()`, `build_info()`, four private helpers, two `__all__` entries, and one paragraph in the module docstring. See the section below |
 
 Not touched, by ownership rule: `python/pyproject.toml`, `python/setup.py`,
 `packaging/`, `.github/workflows/`, `.github/ISSUE_TEMPLATE/`, anything under
-`src/`, `bindings/`, or `python/mojoboost/`, and
-`examples/apple_silicon/`.
+`src/` or `bindings/`, every other module in `python/mojoboost/` (including
+`diagnostics.py` and `device_selection.py`, which are composed rather than
+edited), and `examples/apple_silicon/`.
 
 ## Claims that depend on another lane before they can be published
 
@@ -90,30 +92,111 @@ release procedure and do not belong in an installation guide. The one
 exception is a single naming reference in state 2, so a reader who wonders
 where a future wheel comes from is not left guessing.
 
-## Code changes this lane could not make
+## Code change made outside this lane's ownership, on explicit instruction
+
+Item 1 below was originally recorded rather than made. The repository owner
+then asked for it to be implemented, so it was, and this section records the
+exception rather than hiding it.
+
+**File edited: `python/mojoboost/__init__.py`.** Additive only, two regions:
+seven names appended near `gpu_available()` and two entries added to
+`__all__`. Nothing existing was modified or moved, so it should merge with a
+concurrent lane's edits to the same file rather than collide with them.
+
+**What was added.**
+
+| Name | What it does |
+|---|---|
+| `show_versions(file=None)` | Prints what this installation is, in the shape a bug report needs |
+| `build_info()` | The same facts as a JSON-serializable dict |
+| `_build_provenance()` | Reads `_build_info.json` from the package directory when a build wrote one. Returns None today, see below |
+| `_distribution_version()`, `_optional_dependency_versions()`, `_install_layout()`, `_OPTIONAL_DEPENDENCIES`, `_BUILD_INFO_FILE` | Private helpers |
+
+**The substantive part is `gpu_path_compiled_in`,** which answers the
+question that motivated the request: an installed wheel could not say whether
+a GPU path was compiled into it, and that changes what the artifact does on
+every machine it reaches. It needed no Mojo change and no build-time
+provenance, because the existing `gpu_available()` already carries the fact;
+it just conflates two cases. `gpu_available()` returns `False` both for a
+build with no GPU path and for a GPU build with `MOJOBOOST_DISABLE_GPU=1`
+set, so the two are separated by reading the variable alongside it, and the
+masked case is reported as `unknown` rather than guessed.
+
+**Three deliberate design choices**, each of which cost a line and are worth
+keeping through review.
+
+1. **It composes rather than duplicates.** Install kind, extension path, and
+   bundled runtime libraries come from `mojoboost.diagnostics`
+   (`describe_install()`), which another lane built to answer exactly that
+   without importing the extension. Device policy is left entirely to
+   `mojoboost.device_selection`. A second opinion on either would be a second
+   place for the answer to live and a first place for it to be wrong.
+2. **Every import is inside a function body.** `platform`, `sys`, and
+   `importlib.metadata` are imported when called, not at package import, so
+   this adds nothing to import latency, which is a lane of its own.
+   Dependency versions come from distribution metadata rather than by
+   importing numpy, scipy, or scikit-learn to ask them.
+3. **Environment variables are discovered, not listed.** It scans
+   `os.environ` for the `MOJOBOOST_` and `MODULAR_` prefixes. The repository
+   has over thirty such variables and `diagnostics.WATCHED_ENV` names
+   seventeen, so any fixed list is stale on arrival; a scan reports a knob
+   added after this was written.
+
+`_install_layout()` wraps its call in `try`/`except` and degrades to
+`install: unknown`. That is not defensiveness for its own sake:
+`diagnostics.py` was being actively rewritten by another lane while this was
+written, and `show_versions()` is precisely the function people reach for
+when something is already broken. It must not be the thing that raises.
+
+**The remaining gap is now one line, in `packaging/`, and the reader for it
+is already here.** `show_versions()` still cannot say which Mojo built the
+extension, which OS it was built on, or whether a Metal toolchain was
+present, because the artifact does not carry any of it.
+
+Task 02's `packaging/macos/provenance.sh` landed during this lane and already
+collects exactly those fields, plus `has_accelerator()` at build time, into a
+`<wheel>.provenance.json`. It writes that file **beside the wheel**, where an
+installed package cannot reach it, which is why an install still cannot
+answer the question.
+
+So `build_info()` now reads `_build_info.json` from inside the package
+directory and reports it under a `build` key, or `None` when absent, which is
+the answer today. `show_versions()` prints a `build` block when it is there
+and a note saying it is missing when it is not, distinguishing a source build
+(where it asks for `pixi run mojo --version`) from a wheel that shipped
+without provenance (where it says the gap is in the packaging).
+
+**What closes it:** have the wheel builder copy or emit that JSON to
+`python/mojoboost/_build_info.json` before `python -m build` runs, so it
+ships as package data. That is a packaging change, in a packaging-owned file,
+and needs no further edit to `__init__.py`, which is the reason the reader
+was written now rather than left as a note. Two things to check when doing
+it: `python/pyproject.toml` `[tool.setuptools.package-data]` currently lists
+`*.so` and `.dylibs/*.dylib`, so the JSON needs adding there (Task 01), and
+the generated file should be git-ignored. `docs/PLATFORM_MATRIX.md` rule R7
+specifies the field set.
+
+## Other code changes this lane could not make
 
 Recorded rather than made, per the ownership rule. Each names the file that
 would change and who plausibly owns it.
 
-1. **There is no `mojoboost.show_versions()`.** The diagnostics block in
-   `docs/INSTALLATION.md` step 6 and in `examples/install_smoke.py` is seven
-   lines of hand-assembled `platform`, `sys`, and `os.environ` reads, which
-   is exactly the thing every library eventually ships as one function.
-   `python/mojoboost/__init__.py` would gain `show_versions()` printing the
-   package version, the extension path, the interpreter, the platform,
-   `gpu_available()`, and the two `MOJOBOOST_*` environment variables. Both
-   documents would then say "run `mojoboost.show_versions()`" and the bug
-   report template would ask for its output.
-2. **The extension carries no build provenance.** `bindings/_mojoboost.mojo`
-   exports no version or build-info function, so an installed wheel cannot
-   say which Mojo built it, which OS it was built on, or, critically,
-   whether an accelerator was visible at compile time. That last one changes
-   what the artifact does on the user's machine
-   (`docs/PLATFORM_MATRIX.md` calls it `has_accelerator_at_build`), and it
-   is currently only recoverable from a provenance sidecar next to the
-   release. A `build_info()` in the bindings, surfaced by `show_versions()`,
-   would make "is this wheel GPU-enabled" answerable from the installed
-   package. Owner: bindings plus whoever writes the provenance sidecar.
+1. ~~**There is no `mojoboost.show_versions()`.**~~ **Done**, see the section
+   above. `docs/INSTALLATION.md` step 6, `python/README.md`, `README.md`, and
+   `examples/install_smoke.py` all call it now. The example keeps a
+   hand-assembled fallback behind `hasattr`, so it still works against a
+   wheel built before this landed.
+2. **The extension still carries no build provenance.** Partially closed. The
+   part that changes what the artifact *does*, whether an accelerator was
+   visible at compile time (`has_accelerator_at_build` in
+   `docs/PLATFORM_MATRIX.md`), is now reported as `gpu_path_compiled_in`
+   without any binding change, because `gpu_available()` already carried it.
+   What remains needs a build-time write: which Mojo compiled the extension,
+   which OS it was built on, and whether a Metal toolchain was present.
+   `bindings/_mojoboost.mojo` exports no such function, so the cheap route is
+   a small file written next to the extension by the build script and read by
+   `build_info()`. Owner: `packaging/` (Tasks 02 and 03) for the writer, plus
+   whoever owns the bindings if it should be compiled in instead.
 3. **`gpu_supports()` in `src/mojoboost/device.mojo` returns
    `n_outputs >= 1`, which is always true**, so the
    `device 'gpu' does not support multiclass training` error at line 150 is
@@ -142,9 +225,11 @@ would change and who plausibly owns it.
    and that file is not in this lane's ownership.
 6. **`.github/ISSUE_TEMPLATE/bug_report.yml` asks for
    `pixi run mojo --version`** in its Environment field, which a user who
-   installed a wheel cannot run and does not have. Once wheels ship, that
-   field should ask for `mojoboost.show_versions()` output, or for both with
-   the pixi one marked source-checkout-only.
+   installed a wheel cannot run and does not have. Now that
+   `show_versions()` exists this is a concrete one-line edit rather than a
+   someday: the Environment field should ask for `mojoboost.show_versions()`
+   output, with `pixi run mojo --version` kept and marked
+   source-checkout-only. That file is owned by the community lane.
 
 ## Exact commands a later coordinated validation pass should run
 
@@ -153,10 +238,48 @@ None of these has been run. Grouped by what they would establish.
 Static checks on what this lane wrote, safe on any machine:
 
 ```sh
-python3 -m py_compile examples/install_smoke.py
+python3 -m py_compile examples/install_smoke.py python/mojoboost/__init__.py
 python3 -m pyflakes examples/install_smoke.py          # if pyflakes is present
 git diff --check
 ```
+
+**`show_versions()` has never been executed.** It was written against
+`python/mojoboost/__init__.py` and `python/mojoboost/diagnostics.py` as read,
+not as run, and `diagnostics.py` was being edited by another lane at the
+time. It is the highest-priority thing in this handoff to run once:
+
+```sh
+pixi run build-python
+PYTHONPATH=python python -c "import mojoboost; mojoboost.show_versions()"
+PYTHONPATH=python python -c "import json, mojoboost; print(json.dumps(mojoboost.build_info(), indent=2))"
+```
+
+The second command is not decoration. `build_info()` claims to be
+JSON-serializable, and `json.dumps` is the one-line proof; if
+`describe_install()` ever returns something exotic, that is where it shows.
+
+Then the three branches of the GPU row, which is the reason the function
+exists. On a machine whose build has a GPU path:
+
+```sh
+# expect: gpu path compiled in   yes
+PYTHONPATH=python python -c "import mojoboost; mojoboost.show_versions()"
+
+# expect: gpu path compiled in   unknown, and a note saying the variable is masking it
+MOJOBOOST_DISABLE_GPU=1 PYTHONPATH=python python -c "import mojoboost; mojoboost.show_versions()"
+```
+
+The `no` branch needs a build made where no accelerator was visible, which is
+exactly the wheel-provenance case, so it is most cheaply checked on a Linux
+CI runner rather than locally.
+
+Worth confirming while running the above, because each was reasoned rather
+than observed: the environment scan picks up a variable that
+`diagnostics.WATCHED_ENV` omits (set `MOJOBOOST_CPU_CORE_POOL=2` and look for
+it); the shadowing note fires when a source checkout on `PYTHONPATH` sits in
+front of an installed wheel of a different version; and the source-install
+note asks for `pixi run mojo --version` from a checkout and stays quiet from
+a wheel.
 
 The example script, source checkout, which is the only currently possible way
 to run it:
@@ -271,6 +394,11 @@ intentionally not linked.
   an interpreter. It is written against the estimator API as it reads in
   `python/mojoboost/__init__.py` and the idioms in
   `examples/apple_silicon/five_minute_tour.py`, both read statically.
+- `show_versions()` and `build_info()` were never run, imported, or
+  syntax-checked either. Every attribute they touch was verified by reading
+  the source: `_mojoboost.gpu_available()` in `bindings/_mojoboost.mojo`,
+  the `to_dict()` keys of `diagnostics.InstallDescription`, and the `_os`
+  alias in `__init__.py`. None of that is a substitute for running it once.
 - No wheel was built, downloaded, installed, inspected, or uninstalled.
 - No error message was reproduced. The verbatim ones were read out of
   `src/mojoboost/device.mojo` and `python/mojoboost/__init__.py`, the import

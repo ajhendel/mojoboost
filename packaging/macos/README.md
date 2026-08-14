@@ -37,8 +37,7 @@ copy them.
 
 | Reused | Where it comes from | What it answers |
 |---|---|---|
-| `pixi run -e pkg build-wheel` | `packaging/build_wheel.sh` | builds the extension, bundles the MAX runtime, rewrites the rpath, re-signs, builds the wheel |
-| `pixi run -e pkg test-wheel` | `packaging/test_wheel.sh` | does the wheel work, in two clean venvs |
+| `pixi run -e pkg test-wheel` | `packaging/test_wheel.sh`, which depends on `packaging/build_wheel.sh` | builds the extension, bundles the MAX runtime, rewrites the rpath, re-signs, builds the wheel, then installs it into two clean venvs and runs the suites there |
 | `validate_matrix.py` | `packaging/matrix/` | does the release matrix still agree with the repository |
 | `validate_artifact.py` | `packaging/matrix/` | does the wheel match the target the matrix declares |
 | `smoke/clean_install_macos.sh` | `packaging/matrix/` | does the wheel install and run on a machine with no toolchain |
@@ -47,6 +46,19 @@ copy them.
 There is deliberately no second wheel builder here. Two builders producing
 artifacts with the same filename is the failure this whole packaging tree exists
 to prevent.
+
+## Overlap with packaging/security
+
+`packaging/security/` arrived in the same round and contains two programs that
+do what two of the programs here do: `hash_manifest.py` against
+`hash_artifacts.sh`, and `check_action_pins.py` against `check_action_pins.py`.
+Neither lane could edit the other's directory, so both exist and both work.
+
+They should not both survive integration. The recommendation, and the one line
+of workflow change each choice costs, is in the "Cross-lane reconciliation"
+section of `handoffs/release_02_macos_wheels.md`. Nothing here depends on which
+way it goes: this directory calls its own copies through relative paths, and a
+release that runs both checkers is redundant rather than wrong.
 
 ## What `inspect_wheel.py` adds over `validate_artifact.py`
 

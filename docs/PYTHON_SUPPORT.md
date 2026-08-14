@@ -5,15 +5,26 @@ is real, and what would have to run before it could honestly be lowered.
 
 ## Status of this document
 
-Nothing in this document has been executed. No extension was built, no
-interpreter other than the pinned 3.14 was installed, no wheel was produced,
-and no import was attempted. Every claim below is a reading of files that are
-already in the repository or of build artifacts already on disk, and each one
-names where it came from so it can be re-checked when the toolchain moves.
+**The floor is measured, and it is CPython 3.10.** The compiled extension
+imports and passes the full Python API suite on 3.10, 3.11, 3.12, 3.13, and
+3.14. On 3.9 it does not fail, it aborts, naming the symbol it wanted. The
+verbatim runs are in section 10.
 
-This document does not change `requires-python`. It says what the evidence
-supports, what it does not, and which single experiment separates the two.
-Until that experiment runs, `>=3.14` stays.
+This document still does not change `requires-python`. Applying the value to
+`python/pyproject.toml` is Task 01's step and is written out in
+[`handoffs/release_05_python_versions.md`](../handoffs/release_05_python_versions.md).
+
+What has been run, in full: the existing built extension was imported under
+five interpreters and `python/test_python_api.py` was run against it under
+each. Nothing was rebuilt, no wheel was produced, no Mojo compiled, no CI
+invoked, and no benchmark run. The measurement is one platform only,
+osx-arm64, which is stated again in every row that depends on it.
+
+Everything in sections 3 through 8 is static inspection of files already in
+the repository or of build artifacts already on disk, and each claim names
+where it came from so it can be re-checked when the toolchain moves. Those
+sections are what predicted where to look. Section 9.1 records where they
+predicted wrong.
 
 ## Which vocabulary this is
 
@@ -270,42 +281,61 @@ Status vocabulary, which is this document's and applies to interpreters only:
 | `blocked` | A specific named thing prevents it. The thing is named, and so is the test that would clear it. |
 | `unsupported` | Deliberately out of scope. Not a gap to be closed. |
 
+Every row below is `proven` on **osx-arm64 only**, against a source checkout
+with the extension built. Linux is a separate measurement that has not been
+made, and no wheel has been produced for any interpreter but 3.14.
+
 | Interpreter | Status | Basis | Evidence, or what is missing |
 |---|---|---|---|
-| CPython 3.14 | `proven` | The only interpreter anything has ever run on | `.github/workflows/ci.yml`, `python` job on `ubuntu-latest` and `ubuntu-24.04-arm`, every push. The wheel and the `.so` in this working copy are `cp314`. macOS is local only, per section 10.2 of the compatibility policy |
-| CPython 3.13 | `expected` | `max-26.5.0-3.13release` is published on all three platforms. No entry point in the extension's table postdates 3.13 | Nothing has run. Needs M1, then M2 and M3 |
-| CPython 3.12 | `blocked` | `Py_GetConstantBorrowed`, added in CPython 3.13, is in the extension's entry point table and carries no conditional-resolution diagnostic | M1 clears or confirms this in one command |
-| CPython 3.11 | `blocked` | Same as 3.12 | Same as 3.12 |
-| CPython 3.10 | `blocked` | Same as 3.12. This is the lowest the toolchain could ever reach: `mojo 1.0.0` and `mojo-python 1.0.0` both require `python >=3.10` | Same as 3.12 |
-| CPython 3.9 and earlier | `unsupported` | Below the toolchain's own floor of `python >=3.10`, and no `max 26.5.0` variant exists for them | Nothing would change this short of a different toolchain |
-| CPython 3.15 and later | `expected` | Nothing in the source, the metadata, or the extension caps an upper bound, and `requires-python` is deliberately uncapped | Needs a `max` variant to exist, then M1 through M4 |
-| Free-threaded, any version | `blocked` | Every `max 26.5.0` variant depends on `python-gil` | Only Modular can change this. Do not work around it |
+| CPython 3.14 | `proven` | Imports, fits, predicts, round-trips, and passes `test_python_api.py` | Section 10, run M1a. Also `.github/workflows/ci.yml`, `python` job on `ubuntu-latest` and `ubuntu-24.04-arm`, every push, which is the only Linux evidence any row has |
+| CPython 3.13 | `proven` | Same suite, same artifact | Section 10, run M1a. osx-arm64 only |
+| CPython 3.12 | `proven` | Same suite, same artifact | Section 10, run M1a. osx-arm64 only |
+| CPython 3.11 | `proven` | Same suite, same artifact | Section 10, run M1a. osx-arm64 only |
+| CPython 3.10 | `proven` | Same suite, same artifact. This is the floor, and two independent constraints put it here: the extension aborts below it, and `mojo 1.0.0` and `mojo-python 1.0.0` both require `python >=3.10` | Section 10, run M1a. osx-arm64 only |
+| CPython 3.9 and earlier | `blocked` | The extension aborts at load with `symbol not found: Py_NewRef`, which CPython added in 3.10. Also below the toolchain's own floor | Section 10, run M1b. Nothing short of a different toolchain changes this |
+| CPython 3.15 and later | `expected` | Nothing in the source, the metadata, or the extension caps an upper bound, and `requires-python` is deliberately uncapped | Needs a `max` variant to exist, then M2 through M4 |
+| Free-threaded, any version | `blocked` | Every `max 26.5.0` variant depends on `python-gil` | Not measured, because there is no artifact to measure. Only Modular can change it. Do not work around it |
 | PyPy, GraalPy, any non-CPython | `unsupported` | The runtime resolves CPython C entry points by name out of libpython | Out of scope |
 | One abi3 wheel for many interpreters | `unsupported` | Section 7. Not a lever this repository has, and not the mechanism it would need | Ship one wheel per interpreter instead |
 
-### 9.1 The one thing standing between `blocked` and `expected`
+### 9.1 Where the static audit predicted wrong, and why that matters
 
-`Py_GetConstantBorrowed` was added in CPython 3.13. It is present in the
-extension's entry point table, at the head of it, adjacent to
-`_Py_NoneStruct` and `Py_Is`, which is what a constants group with a modern
-path and a legacy fallback would look like. That reading is a guess.
+Before anything ran, this document put 3.10, 3.11, and 3.12 at `blocked`, on
+the following reasoning. `Py_GetConstantBorrowed` was added in CPython 3.13.
+It is in the extension's entry point table. The Mojo runtime demonstrably
+resolves *some* entry points conditionally, because the binary contains
+exactly two diagnostics of the form `<name> is not available in this Python
+version`, for `PyErr_GetRaisedException` (3.12) and `PyType_GetName` (3.11).
+`Py_GetConstantBorrowed` has no such string, so it looked required.
 
-What is not a guess is that the Mojo runtime resolves some entry points
-conditionally and says so. The binary contains exactly two diagnostics of the
-form `<name> is not available in this Python version`, for
-`PyErr_GetRaisedException` (CPython 3.12) and `PyType_GetName` (CPython
-3.11). `Py_GetConstantBorrowed` has no such string.
+**That was wrong.** 3.12 runs the whole suite. The diagnostic string is not
+the only mechanism the runtime has for tolerating a missing entry point, and
+its absence proves nothing.
 
-Two readings fit that:
+The prediction failed in the safe direction, which is worth naming: a byte
+scan can establish that a symbol is *present* in a table and can never
+establish that it is *needed*. Every floor this repository states about the
+extension has to come from an interpreter that ran, and
+`tools/audit_python_compat.py` now carries a `MEASURED_LAZY` table whose
+entries each cite the run that put them there, rather than inferring from the
+absence of a string.
 
-- the runtime requires it unconditionally, and the extension has a hard floor
-  of CPython 3.13 on every build, or
-- it is resolved lazily and falls back, and the floor is CPython 3.10.
+The real floor is set by a different symbol entirely, and the runtime names
+it on the way down:
 
-A byte scan cannot tell these apart, and `tools/audit_python_compat.py` says
-so in its own output rather than picking one. Experiment M1 in section 10
-settles it in a single command, and it is the highest-value thing anybody can
-do to this question.
+```
+ABORT: oss/modular/mojo/stdlib/std/ffi/__init__.mojo:762:18:
+symbol not found: Py_NewRef
+```
+
+`Py_NewRef` is a CPython 3.10 addition. Three other 3.10 additions sit in the
+same table (`Py_Is`, `PyModule_AddObjectRef`, and `Py_NewRef` itself), so
+3.10 is where the extension stops regardless of which one is reached first.
+
+That failure mode is the reason `python/mojoboost/_compat.py` checks the
+interpreter *before* importing the extension rather than catching around it.
+`ABORT` ends the process. There is no exception to catch, and buffered stdout
+is lost with it.
 
 ### 9.2 Optional dependencies
 
@@ -331,55 +361,114 @@ is not an argument for or against any floor in the matrix. What it does
 change is which *version* of each a user gets, and section 10 makes recording
 that per interpreter experiment M5.
 
-### 9.3 The highest-value realistic range for a first release
+### 9.3 The range for a first release
 
-**`>=3.13`.**
+**`requires-python = ">=3.10"`.**
 
-It is one command away. M1 either clears `Py_GetConstantBorrowed` or confirms
-it, and if it confirms it, 3.13 is still reachable because no entry point in
-the table postdates 3.13. It costs no source change, because section 3 found
-nothing in the Python to change and section 4 found nothing in the extension
-to rebuild differently. It costs one more wheel per platform, built by an
-environment solved against `python==3.13.*`, using the build script that
-already exists.
+It is the floor the artifact actually has, measured on five interpreters, and
+it is simultaneously the floor the toolchain imposes from the other side:
+`mojo 1.0.0` and `mojo-python 1.0.0` both require `python >=3.10`, and the
+channel publishes no `max 26.5.0` variant below 3.10. Two independent
+constraints landing on the same number is the strongest form this answer
+could have taken, and there is nothing below it to argue about.
 
-`>=3.10` is the larger prize and it is not this project's to take. It needs
-Modular to guard one more entry point, and section 7 explains why mojoboost
-cannot route around that with the limited API. Ask for it upstream; do not
-engineer around it.
+It costs no source change. Section 3 found nothing in the Python to change
+and section 4 found nothing in the extension to rebuild differently: the
+artifact that shipped these runs is the one already in the working copy,
+built by a 3.14, and it served 3.10 unmodified.
 
-`>=3.14` is defensible only as the current state of the evidence, and only
-until M1 runs. It should not be defended on the grounds that the toolchain
-requires it, because section 5 shows it does not.
+What it does cost is **one wheel per interpreter per platform**, because the
+wheel tag is per-interpreter (section 6) and abi3 is not available (section
+7). That is five macOS wheels instead of one. Whoever owns the release
+decides whether to publish all five or a subset; `requires-python` is a floor
+and does not oblige a wheel to exist for every version above it. Publishing
+fewer wheels than `requires-python` admits is normal and is what
+`packaging/matrix/platform_matrix.toml` is for.
 
-## 10. What evidence would be needed, per interpreter and per platform
+`>=3.14` is no longer defensible on any grounds. It is not what the toolchain
+requires (section 5), not what the extension requires (section 9.1), and not
+what the language requires (section 3).
 
-Nothing below has been run. Each experiment says what it settles and what to
-record. Record failures verbatim; a traceback naming a missing C symbol is
-the most informative result any of these can produce.
+## 10. The evidence
+
+M1 has run and is recorded below. M2 through M6 have not, and each says what
+it would settle. Record failures verbatim; a diagnostic naming a missing C
+symbol is the most informative result any of these can produce, and it is
+exactly what M1b returned.
 
 ### M1. Import the existing extension under another interpreter
 
 The decisive one, and the cheapest. It needs no rebuild, because section 4
 established that the entry point table does not vary with the interpreter the
-build ran under.
+build ran under. The interpreter must not be the pixi one, and it needs the
+four MAX runtime dylibs reachable, which they are when
+`python/mojoboost/.dylibs/` is populated.
+
+**Host.** Apple M4, macOS 26, osx-arm64. Artifact:
+`python/mojoboost/_mojoboost.so` as built by `bindings/build.sh` under
+CPython 3.14.6, 1453392 bytes, unmodified between runs. Interpreters:
+homebrew for 3.12, 3.13, and 3.14; `pixi exec` cached environments for 3.9,
+3.10, and 3.11.
+
+#### M1a. Supported interpreters
 
 ```
-# From a checkout with python/mojoboost/_mojoboost.so already built.
 cd python
-/path/to/python3.13 -c "import mojoboost; print(mojoboost.__version__)"
-/path/to/python3.12 -c "import mojoboost; print(mojoboost.__version__)"
-/path/to/python3.10 -c "import mojoboost; print(mojoboost.__version__)"
+python3.14 test_python_api.py
+python3.13 test_python_api.py
+python3.12 test_python_api.py
+pixi exec --spec "python==3.11.*" --spec numpy -- python test_python_api.py
+pixi exec --spec "python==3.10.*" --spec numpy -- python test_python_api.py
 ```
 
-The interpreter must not be the pixi one, and it needs the four MAX runtime
-dylibs reachable, which they are when `python/mojoboost/.dylibs/` is
-populated by `packaging/build_wheel.sh`.
+All five ended with the suite's own last line and exit status 0:
 
-Settles: whether `Py_GetConstantBorrowed` is a hard floor. Record the exact
-output or the exact traceback for each, per platform.
+```
+all python API tests passed
+```
+
+A fit, a predict, `gpu_available()`, `num_trees()`, and a
+`model_to_string()` round trip were also run standalone on 3.10 through 3.13
+before the suite, and all four behaved identically across them.
+`gpu_available()` returned `True` on every interpreter, so the Metal path is
+reached from all of them and is not 3.14-specific either.
+
+#### M1b. The floor
+
+```
+pixi exec --spec "python==3.9.*" -- python -c "import mojoboost"
+```
+
+```
+ABORT: oss/modular/mojo/stdlib/std/ffi/__init__.mojo:762:18:
+symbol not found: Py_NewRef
+```
+
+Not an exception. The process aborts during module initialization and
+buffered stdout is discarded with it, which is why the guard in
+`python/mojoboost/_compat.py` runs in front of the import rather than around
+it. `Py_NewRef` is a CPython 3.10 addition.
+
+#### M1c. A failure that is not about interpreter version
+
+`python/test_python_api.py` fails on any interpreter with no numpy
+installed:
+
+```
+TypeError: X is a sparse matrix, which needs numpy; install numpy or pass a
+dense sequence
+```
+
+raised from `_arrays.py` `check_X_sparse`. This was confirmed to be
+version-orthogonal by running it on CPython 3.14 in a `venv --without-pip`,
+where it fails at the identical line. It is a real gap and it is not this
+document's to fix; see section 12, item 4.
 
 ### M2. Toolchain resolution per interpreter
+
+Not run. M1 measured what the built artifact tolerates, which is a different
+question from what the toolchain will build for. Both matter: a wheel for
+3.11 has to be built by a 3.11 environment to carry a `cp311` tag.
 
 ```
 for v in 3.10 3.11 3.12 3.13 3.14; do
@@ -418,6 +507,10 @@ Settles: whether the build succeeds, and whether the entry point table is
 identical to the 3.14 build. Diff the audit tool's symbol lines between the
 two builds; section 4 predicts they are the same, and a difference would
 invalidate M1's shortcut and is the more interesting outcome.
+
+Not run. M1 makes this less urgent than it looked, because the artifact that
+served all five interpreters was built once by a 3.14. What M3 still decides
+is the wheel tag, not whether the code works.
 
 ### M4. The suite, then the wheel, per interpreter
 
@@ -469,23 +562,28 @@ runs first on a machine where nothing else can.
 
 ### What a row needs before it moves
 
-To move an interpreter from `expected` to `proven`, on one platform:
+The five `proven` rows are proven for a **source install on osx-arm64** and
+for nothing else. To extend any of them to a shipped wheel, on one platform:
 
-1. M2 resolves.
+1. M2 resolves for that interpreter.
 2. M3 builds, and the audit tool reports no contradiction.
 3. M4's suites pass and the wheel carries the expected tag.
-4. The output of all three is written to a file in the repository and named
-   in this document's Evidence column.
+4. The output of all three is written into this document's section 10 and
+   named in the Evidence column.
 
-`blocked` moves to `expected` when M1 or M3 shows the named blocker does not
-apply. `blocked` never moves on reasoning alone, and neither does anything
-else here.
+To extend them to Linux, M1 is enough and is the same three commands against
+a Linux-built extension.
+
+`blocked` moves only on a run that shows the named blocker does not apply,
+never on reasoning. Section 9.1 is the worked example of why.
 
 ## 11. What must not be done
 
-- Do not lower `requires-python` before M1 has run. The evidence in this
-  document is sufficient to make 3.14 look accidental and insufficient to
-  make anything else look safe.
+- Do not raise `requires-python` back above 3.10 without a run that shows
+  3.10 failing. The current value rests on five interpreters that passed and
+  one that aborted, not on inference.
+- Do not treat the absence of a `is not available in this Python version`
+  string as evidence that an entry point is required. Section 9.1.
 - Do not tag a wheel `abi3` to widen its reach. Section 7.
 - Do not remove `python-gil` from consideration or try to force a
   free-threaded build. Section 8.
@@ -495,8 +593,8 @@ else here.
 - Do not add shims to `python/mojoboost/_compat.py` for constructs the source
   does not use. Section 3 found none, and the module's docstring says what
   would justify a new one.
-- Do not claim an interpreter is supported because the toolchain publishes a
-  variant for it. Publication is `expected`. Running is `proven`.
+- Do not read the five `proven` rows as claims about Linux or about wheels.
+  They are one platform and one source install.
 
 ## 12. Corrections owed to other documents
 
@@ -514,10 +612,25 @@ replacement in
    mojoboost builds against". It is the variant the solver chose with no pin
    present, not a constraint the toolchain imposes.
 3. `docs/COMPATIBILITY_POLICY.md` section 6.1: "`requires-python = ">=3.14"`
-   today, and that is a hard floor rather than a preference." The same
-   paragraph's own next clause, that the extension links no libpython, is
-   what makes the first clause doubtful.
+   today, and that is a hard floor rather than a preference." It is not a
+   hard floor. The extension runs on 3.10.
+4. `pixi.toml`'s comment on `test-python`, that it "stays dependency-free on
+   purpose, so it also runs against a bare wheel install". It does not.
+   `python/test_python_api.py` needs numpy for its sparse cases and raises
+   `TypeError` without it, on every interpreter including 3.14. It passes
+   under `pixi run test-python` only because the default pixi environment has
+   numpy, which arrives as a dependency of `max` rather than by anyone asking
+   for it. The consequence is that the `bare install (no numpy)` step of
+   `packaging/test_wheel.sh` would fail on its first run, and that step has
+   evidently never run. This is a real bug in a path the project believes is
+   covered, and it is the most load-bearing thing this audit found that was
+   not about interpreter versions.
 
 The `abi3` row in the platform matrix reaches a conclusion this document
 agrees with, by reasoning it does not. Its conclusion should stay and its
 reasoning should be replaced.
+
+Corrections 1, 2, and the `abi3` row have been applied to
+`packaging/matrix/platform_matrix.toml` and `validate_matrix.py`. Corrections
+3 and 4, and the prose restatements, are written out in
+[`handoffs/release_05_python_versions.md`](../handoffs/release_05_python_versions.md).

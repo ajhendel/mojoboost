@@ -38,11 +38,43 @@ The three things that make this decidable at all
    every leaf (`DECLINE_NO_HOST_PARENT`).
 3. **Only the row ids are device-owned.** Gradients and hessians are host
    lists on the `upload_gradients` path. What a host build needs and does not
-   have is the node's slice of the active-row permutation, which is
-   `4 * node_rows` bytes device-to-host. On the device-objective path
-   (`fill_gradients_device`) the gradients never exist on the host at all,
-   and pulling them back per round would undo that path's whole purpose, so
-   this module declines there too (`DECLINE_GRADIENTS_ON_DEVICE`).
+   have is the node's slice of the active-row permutation. On the
+   device-objective path (`fill_gradients_device`) the gradients never exist
+   on the host at all, and pulling them back per round would undo that path's
+   whole purpose, so this module declines there too
+   (`DECLINE_GRADIENTS_ON_DEVICE`).
+
+How the host gets the rows
+--------------------------
+The obvious answer -- read back this node's `4 * node_rows` bytes -- is not
+available. `DeviceContext.enqueue_copy` copies the *whole* source buffer, so
+a sub-range readback needs either a device buffer allocated per call or an
+API this project does not have; `download_rows` therefore moves `4 * n_rows`
+whatever the node's size, which would make a per-node readback cost more than
+the download it was meant to avoid.
+
+So the design does not use one. The host takes **one whole-permutation
+snapshot per tree** (`snapshot_nanos`) and maintains it itself:
+
+- Every node alive when the snapshot was taken has its rows at
+  `snapshot[begin : end]`, for free -- the ranges are already host-tracked in
+  `LeafRangeTable`.
+- A split re-partitions `rows_dev[parent.begin : parent.end]` and provably
+  touches nothing outside it (gpu_active_rows.mojo states this invariant), so
+  the host keeps the snapshot valid by mirroring that one partition on its own
+  copy with `partition_range_host` -- the same stable, buffer-order rule, which
+  agrees with the device index for index. Cost: one partition over the
+  parent's rows (`host_materialize_nanos`), and it materializes *both*
+  children at once.
+- The root needs no snapshot at all: unbagged its rows are the identity
+  permutation, bagged they are the host's own bag.
+
+The snapshot is charged to the one leaf that first elects to use it, in full
+(`DECLINE_SNAPSHOT_NOT_PAID` when that leaf's saving cannot cover it). Every
+later host leaf in the tree reads it for nothing. That is deliberately
+conservative -- it can never make a tree slower than the pure-device path,
+whereas amortizing over an expected leaf count would be a guess about a
+distribution nobody has measured.
 
 Substitutability: what a host build has to reproduce
 ----------------------------------------------------
@@ -79,11 +111,14 @@ Determinism
 -----------
 Two rules, both structural rather than advisory:
 
-- **Placement is a pure function of shape.** `place_leaf` reads node row
-  counts, dataset shape, active feature count, launch counts, and the cost
-  coefficients. It reads no clock, no queue depth, and no completion signal.
-  Two runs on one machine, and a run with the host build racing the device
-  against one where it does not, place every leaf identically.
+- **Placement is a pure function of its arguments.** `place_leaf` reads node
+  row counts, dataset shape, active feature count, launch counts, the
+  snapshot flag, and the cost coefficients. It reads no clock, no queue
+  depth, and no completion signal. The snapshot flag is the only argument
+  that is tree state rather than tree shape, and it advances with the
+  grower's own deterministic node order. Two runs on one machine, and a run
+  with the host build racing the device against one where it does not, place
+  every leaf identically.
 - **Completion order is not consumption order.** `WaveBarrier` is the
   bookkeeping that enforces it: the grower announces the nodes of a wave in
   the order it will consume them, the builds complete in whatever order the
@@ -206,7 +241,8 @@ comptime DECLINE_NO_HOST_BINS = 6
 comptime DECLINE_EMPTY_NODE = 7
 comptime DECLINE_TRANSFER_DOMINATES = 8
 comptime DECLINE_SLOWER_ON_HOST = 9
-comptime N_DECLINE_REASONS = 10
+comptime DECLINE_SNAPSHOT_NOT_PAID = 10
+comptime N_DECLINE_REASONS = 11
 
 
 def decline_name(reason: Int) -> String:
@@ -230,6 +266,8 @@ def decline_name(reason: Int) -> String:
         return String("state-transfer-costs-more-than-the-histogram")
     if reason == DECLINE_SLOWER_ON_HOST:
         return String("modelled-slower-on-the-host")
+    if reason == DECLINE_SNAPSHOT_NOT_PAID:
+        return String("first-host-leaf-cannot-pay-for-the-snapshot")
     return String("unknown")
 
 
@@ -238,8 +276,9 @@ def decline_name(reason: Int) -> String:
 comptime ROWS_HOST_IDENTITY = 0
 comptime ROWS_HOST_BAG = 1
 comptime ROWS_HOST_MIRROR = 2
-comptime ROWS_DEVICE_COPY = 3
-comptime N_ROW_SOURCES = 4
+comptime ROWS_HOST_SNAPSHOT = 3
+comptime ROWS_DEVICE_COPY = 4
+comptime N_ROW_SOURCES = 5
 
 
 def row_source_name(source: Int) -> String:
@@ -249,22 +288,32 @@ def row_source_name(source: Int) -> String:
         return String("host-bag")
     if source == ROWS_HOST_MIRROR:
         return String("host-mirror")
+    if source == ROWS_HOST_SNAPSHOT:
+        return String("host-snapshot")
     return String("device-copy")
 
 
 def row_source_is_host(source: Int) -> Bool:
     """Whether the host already holds this node's row ids, so a host build
-    moves nothing.
+    moves nothing *for this node*.
 
-    Three cases do. The unbagged root's rows are the identity permutation,
+    Four cases do. The unbagged root's rows are the identity permutation,
     which `begin_tree` writes with a kernel and the host can reproduce
     without reading anything. A bagged root's rows are the bag, which the
-    host drew and handed to `begin_tree` in that order. And a node whose
-    ancestor was already built on the host can have its rows derived on the
-    host by re-running the same stable partition
-    (`partition_range_host` in gpu_active_rows.mojo is that reference model,
-    index for index), which is the `ROWS_HOST_MIRROR` case: the transfer is
-    paid once at the root of a host-owned subtree and never again inside it.
+    host drew and handed to `begin_tree` in that order. A node whose
+    ancestor is already host-materialized has its rows derived by re-running
+    the same stable partition (`partition_range_host` in
+    gpu_active_rows.mojo is that reference model, index for index), which is
+    `ROWS_HOST_MIRROR`. And `ROWS_HOST_SNAPSHOT` reads a whole-permutation
+    snapshot the host already took, which costs this node nothing because
+    the snapshot is a per-tree cost (see `snapshot_nanos`).
+
+    `ROWS_DEVICE_COPY` is the only source that charges a transfer to the
+    node itself, and §7.1 of the handoff records why it is not currently
+    expressible: `enqueue_copy` copies the whole source buffer, so a
+    per-range readback needs either a new buffer per call or an API this
+    project does not have. The snapshot exists so the design does not depend
+    on it.
     """
     return source != ROWS_DEVICE_COPY
 
@@ -336,6 +385,12 @@ struct HybridCosts(Copyable, Movable):
     """Host accumulation, per thousand (row, active-feature) pairs: the
     scattered-add inner loop of `_accumulate_subset`."""
 
+    var host_partition_nanos_per_krow: Int
+    """Host mirror of one split's stable partition, per thousand rows of the
+    node being partitioned. This is what materializing a node's rows costs
+    once a snapshot exists: `partition_range_host`'s flag/prefix/scatter over
+    the parent's own range, and nothing else."""
+
     var host_zero_nanos_per_kcell: Int
     """Host zeroing pass, per thousand histogram cells. Paid by every host
     build (`Histogram.reset`) and independent of the node's rows, which is
@@ -367,6 +422,7 @@ struct HybridCosts(Copyable, Movable):
         self.transfer_nanos_per_kib = _NANOS_UNMEASURED
         self.device_nanos_per_krow_slot = _NANOS_UNMEASURED
         self.host_nanos_per_krow_slot = _NANOS_UNMEASURED
+        self.host_partition_nanos_per_krow = _NANOS_UNMEASURED
         self.host_zero_nanos_per_kcell = _NANOS_UNMEASURED
         self.convert_nanos_per_kcell = _NANOS_UNMEASURED
         self.measured = False
@@ -380,6 +436,7 @@ struct HybridCosts(Copyable, Movable):
         transfer_nanos_per_kib: Int,
         device_nanos_per_krow_slot: Int,
         host_nanos_per_krow_slot: Int,
+        host_partition_nanos_per_krow: Int,
         host_zero_nanos_per_kcell: Int,
         convert_nanos_per_kcell: Int,
         var evidence_id: String,
@@ -396,6 +453,7 @@ struct HybridCosts(Copyable, Movable):
             or transfer_nanos_per_kib < 0
             or device_nanos_per_krow_slot < 0
             or host_nanos_per_krow_slot < 0
+            or host_partition_nanos_per_krow < 0
             or host_zero_nanos_per_kcell < 0
             or convert_nanos_per_kcell < 0
         ):
@@ -405,6 +463,7 @@ struct HybridCosts(Copyable, Movable):
         self.transfer_nanos_per_kib = transfer_nanos_per_kib
         self.device_nanos_per_krow_slot = device_nanos_per_krow_slot
         self.host_nanos_per_krow_slot = host_nanos_per_krow_slot
+        self.host_partition_nanos_per_krow = host_partition_nanos_per_krow
         self.host_zero_nanos_per_kcell = host_zero_nanos_per_kcell
         self.convert_nanos_per_kcell = convert_nanos_per_kcell
         self.measured = True
@@ -458,6 +517,20 @@ struct LeafWork(Copyable, Movable):
     a fitted cost model may need it."""
 
     var row_source: Int
+
+    var materialize_rows: Int
+    """Rows the host must re-partition to bring this node's row ids into
+    existence on its own copy of the permutation, or 0 when they are already
+    there.
+
+    Zero for a node that was alive when the snapshot was taken (its rows are
+    `snapshot[begin : end]` already) and for the root under either host-known
+    seeding. Non-zero for a node created by a split the host has not yet
+    mirrored, where the cost is one `partition_range_host` over the *parent's*
+    row count — so this field carries the parent's rows, not this node's. See
+    `host_materialize_nanos`.
+    """
+
     var gpu_launches: Int
     """Kernel launches the device path would issue for this node: one for
     the atomic strategy, two for the tiled one (partial accumulate, then
@@ -472,11 +545,12 @@ struct LeafWork(Copyable, Movable):
         n_features: Int,
         n_bins: Int,
         dataset_rows: Int,
-        row_source: Int = ROWS_DEVICE_COPY,
+        row_source: Int = ROWS_HOST_SNAPSHOT,
         gpu_launches: Int = 1,
+        materialize_rows: Int = 0,
     ) raises -> LeafWork:
-        """A node whose rows must be copied back for a host build, which is
-        every node until the caller establishes otherwise."""
+        """A node backed by the tree's active-row snapshot, which is every
+        node but the root; see `tree_row_source`."""
         if node < 0:
             raise Error("node id must be nonnegative")
         if node_rows < 0:
@@ -489,6 +563,13 @@ struct LeafWork(Copyable, Movable):
             raise Error("unknown row source")
         if gpu_launches < 1:
             raise Error("a device build issues at least one launch")
+        if materialize_rows < 0:
+            raise Error("materialization row count must be nonnegative")
+        if materialize_rows > 0 and not row_source_is_host(row_source):
+            raise Error(
+                "only a host row source materializes rows by partitioning;"
+                " a device copy delivers them whole"
+            )
         _ = histogram_cells(n_features, n_bins)
         return LeafWork(
             node,
@@ -498,6 +579,7 @@ struct LeafWork(Copyable, Movable):
             n_bins,
             dataset_rows,
             row_source,
+            materialize_rows,
             gpu_launches,
         )
 
@@ -558,6 +640,28 @@ struct HybridContext(Copyable, Movable):
     it is competing against a device path that also transfers; this guard
     says that is not a trade worth making on a first integration, and a
     benchmark that disagrees can clear the flag rather than edit the model.
+
+    Inert under the snapshot design, and kept for that reason rather than in
+    spite of it: every source `tree_row_source` produces charges the node no
+    transfer at all, so the guard can only bite on `ROWS_DEVICE_COPY`, which
+    is the per-range readback that is not currently expressible. It is the
+    check that would have to hold if that mechanism ever arrives.
+    """
+
+    var n_active_rows: Int
+    """Rows this tree grows on: the bag, or the dataset. Fixed for the whole
+    tree by `begin_tree`, and the only input `snapshot_nanos` needs."""
+
+    var snapshot_taken: Bool
+    """Whether the host already holds a snapshot of this tree's active-row
+    permutation.
+
+    This is the one piece of *tree state* a placement depends on, and it is
+    passed in rather than remembered so `place_leaf` stays a pure function of
+    its arguments. It advances deterministically with the grower's node
+    order: false until the first accepted host leaf pays for the snapshot,
+    true for the rest of the tree, and false again at the next `begin_tree`.
+    Nothing about it depends on timing or on which device finished first.
     """
 
     var costs: HybridCosts
@@ -567,7 +671,15 @@ struct HybridContext(Copyable, Movable):
         """The shipped configuration: hybrid scheduling off, no cost model.
         Every `place_leaf` returns `PLACE_GPU`."""
         return HybridContext(
-            MODE_OFF, False, True, True, False, True, HybridCosts.unmeasured()
+            MODE_OFF,
+            False,
+            True,
+            True,
+            False,
+            True,
+            1,
+            False,
+            HybridCosts.unmeasured(),
         )
 
     @staticmethod
@@ -575,6 +687,7 @@ struct HybridContext(Copyable, Movable):
         device_split_search: Bool,
         gradients_host_resident: Bool,
         bins_host_resident: Bool,
+        n_active_rows: Int = 1,
     ) -> HybridContext:
         """The environment's mode over the run's facts, still with no cost
         model: `MOJOBOOST_HYBRID_LEAVES=replica` selects the mode and is
@@ -589,7 +702,26 @@ struct HybridContext(Copyable, Movable):
             bins_host_resident,
             False,
             True,
+            n_active_rows,
+            False,
             HybridCosts.unmeasured(),
+        )
+
+    def with_snapshot(self, taken: Bool) -> HybridContext:
+        """This context with the snapshot flag set, which is how a grower
+        advances the one bit of tree state a placement reads. Returns a new
+        value rather than mutating, so a context handed to `place_leaf`
+        cannot change underneath it."""
+        return HybridContext(
+            self.mode,
+            self.device_split_search,
+            self.gradients_host_resident,
+            self.bins_host_resident,
+            self.quantized_replica_verified,
+            self.guard_transfer_dominates,
+            self.n_active_rows,
+            taken,
+            self.costs.copy(),
         )
 
 
@@ -632,6 +764,51 @@ def host_transfer_nanos(work: LeafWork, costs: HybridCosts) raises -> Int:
     )
 
 
+def snapshot_nanos(n_active_rows: Int, costs: HybridCosts) raises -> Int:
+    """Modelled cost of taking the host's snapshot of this tree's active-row
+    permutation: one whole-buffer `download_rows` and its synchronization.
+
+    `4 * n_active_rows` bytes, once per tree, and thereafter every node alive
+    at that moment has its rows for free (`snapshot[begin : end]`) and every
+    node created after it costs one host partition of its parent's range
+    (`host_materialize_nanos`).
+
+    This is what makes the design implementable against the row API that
+    exists. `enqueue_copy` copies the whole source buffer, so there is no
+    per-range readback to be had without a per-call allocation; the snapshot
+    pays the whole-buffer price *once per tree* instead of per node, which is
+    strictly better than the per-node readback would have been from the
+    second host leaf onward.
+    """
+    if n_active_rows < 1:
+        raise Error("a tree must grow on at least one row")
+    if not costs.measured:
+        return 0
+    return (
+        _ceil_div(4 * n_active_rows, 1024) * costs.transfer_nanos_per_kib
+        + costs.sync_nanos
+    )
+
+
+def host_materialize_nanos(work: LeafWork, costs: HybridCosts) -> Int:
+    """Modelled cost of bringing this node's row ids into existence on the
+    host's own copy: one `partition_range_host` over the parent's range, or
+    zero when the snapshot already holds them.
+
+    The partition is stable in buffer order and so reproduces the device's
+    result index for index, which is what lets the host keep its snapshot
+    valid without re-reading it. It rewrites `snapshot[parent.begin :
+    parent.end]` in place, so after it runs *both* children are materialized
+    and neither pays again.
+    """
+    if not costs.measured:
+        return 0
+    return (
+        _ceil_div(work.materialize_rows, 1000)
+        * costs.host_partition_nanos_per_krow
+    )
+
+
 def host_build_nanos(work: LeafWork, costs: HybridCosts) raises -> Int:
     """Modelled cost of the host accumulation itself, transfer excluded: the
     zeroing pass over every cell plus the scattered adds over the node's own
@@ -646,9 +823,18 @@ def host_build_nanos(work: LeafWork, costs: HybridCosts) raises -> Int:
 
 def host_leaf_nanos(work: LeafWork, costs: HybridCosts) raises -> Int:
     """Modelled cost of building this node's histogram on the host, end to
-    end. No download and no conversion: the histogram is produced where it
-    will be read."""
-    return host_transfer_nanos(work, costs) + host_build_nanos(work, costs)
+    end, *excluding* any once-per-tree snapshot.
+
+    Three terms: getting the rows (a device readback, or nothing),
+    materializing them on the host's copy if a split created them after the
+    snapshot, and the accumulation. No download and no conversion: the
+    histogram is produced where it will be read.
+    """
+    return (
+        host_transfer_nanos(work, costs)
+        + host_materialize_nanos(work, costs)
+        + host_build_nanos(work, costs)
+    )
 
 
 # --- The decision ---------------------------------------------------------
@@ -675,6 +861,13 @@ struct Placement(Copyable, Movable):
     """The provenance a build under this placement will carry, for
     `HistogramCache.admit`. `ORIGIN_GPU_FIXED` whenever the device's
     histogram is the one consumed, which includes `MODE_MIRROR`."""
+
+    var takes_snapshot: Bool
+    """True when accepting this placement requires the host to take the
+    tree's active-row snapshot first, which is the case for exactly one leaf
+    per tree: the first one that could pay for it. The caller does the
+    `download_rows` and then passes `ctx.with_snapshot(True)` for the rest of
+    the tree."""
 
     def is_host(self) -> Bool:
         return self.device == PLACE_CPU
@@ -717,21 +910,43 @@ def decline_reason(ctx: HybridContext, work: LeafWork) raises -> Int:
     var transfer = host_transfer_nanos(work, ctx.costs)
     if ctx.guard_transfer_dominates and transfer > build:
         return DECLINE_TRANSFER_DOMINATES
-    if build + transfer >= device_leaf_nanos(work, ctx.costs):
+    var host = host_leaf_nanos(work, ctx.costs)
+    var device = device_leaf_nanos(work, ctx.costs)
+    if host >= device:
         # `>=` rather than `>`: a modelled tie stays on the device, which is
         # the path that would have run without this module. A cost model
         # that cannot separate two paths must not move work.
         return DECLINE_SLOWER_ON_HOST
+    if work.row_source == ROWS_HOST_SNAPSHOT and not ctx.snapshot_taken:
+        # This node wants to read a snapshot that does not exist yet, so it
+        # is the leaf that would pay for taking it. It may do so only if its
+        # own saving covers the whole snapshot; every later host leaf in this
+        # tree then reads the snapshot for free.
+        #
+        # Conservative on purpose. Charging the first leaf the full price
+        # cannot make a tree slower than the pure-device path, whereas
+        # amortizing over an *expected* leaf count would be a guess about a
+        # distribution nobody has measured. It does mean a tree whose savings
+        # are spread thinly across many leaves never snapshots at all; E4 and
+        # E6 in docs/design/HYBRID_TRAINING.md are the experiments that would
+        # say whether that matters.
+        if device - host < snapshot_nanos(ctx.n_active_rows, ctx.costs):
+            return DECLINE_SNAPSHOT_NOT_PAID
     return ACCEPTED
 
 
 def place_leaf(ctx: HybridContext, work: LeafWork) raises -> Placement:
     """Decide where one node's histogram is built.
 
-    Pure: node counts, dataset shape, run configuration, and cost
-    coefficients in; a placement out. No clock is read, no queue is polled,
-    and no earlier placement is consulted, so replaying a tree's nodes in
-    any order reproduces every placement.
+    Pure: node counts, dataset shape, run configuration, snapshot state, and
+    cost coefficients in; a placement out. No clock is read, no queue is
+    polled, and no completion signal is consulted.
+
+    `ctx.snapshot_taken` is the one input that is tree *state* rather than
+    tree shape, and it is an argument rather than a remembered field for
+    exactly that reason: two calls with the same arguments give the same
+    answer, and the state advances only with the grower's own deterministic
+    node order. Which device finished first cannot reach it.
 
     `MODE_MIRROR` is the one mode whose accepted placement is `PLACE_BOTH`:
     the host build runs, its output is compared, and the device's histogram
@@ -740,26 +955,31 @@ def place_leaf(ctx: HybridContext, work: LeafWork) raises -> Placement:
     """
     var why = decline_reason(ctx, work)
     var device_nanos = device_leaf_nanos(work, ctx.costs)
-    var host_build = host_build_nanos(work, ctx.costs)
+    var host_nanos = host_leaf_nanos(work, ctx.costs)
     var transfer = host_transfer_nanos(work, ctx.costs)
     var place = PLACE_GPU
     var origin = ORIGIN_GPU_FIXED
+    var takes_snapshot = False
     if why == ACCEPTED:
         if mode_substitutes(ctx.mode):
             place = PLACE_CPU
             origin = host_origin_for(ctx.mode)
         else:
             place = PLACE_BOTH
+        takes_snapshot = (
+            work.row_source == ROWS_HOST_SNAPSHOT and not ctx.snapshot_taken
+        )
     return Placement(
         work.node,
         place,
         why,
         device_nanos,
-        host_build + transfer,
+        host_nanos,
         transfer,
         work.transfer_bytes(),
         work.download_bytes(),
         origin,
+        takes_snapshot,
     )
 
 
@@ -797,9 +1017,10 @@ def plan_split(
     n_features: Int,
     n_bins: Int,
     dataset_rows: Int,
-    left_row_source: Int = ROWS_DEVICE_COPY,
-    right_row_source: Int = ROWS_DEVICE_COPY,
+    left_row_source: Int = ROWS_HOST_SNAPSHOT,
+    right_row_source: Int = ROWS_HOST_SNAPSHOT,
     gpu_launches: Int = 1,
+    parent_materialized: Bool = True,
 ) raises -> SplitPlan:
     """Plan the one histogram build a committed split needs.
 
@@ -807,6 +1028,12 @@ def plan_split(
     the grower has before the partition runs, so this plans without waiting
     for any device work to finish. That is what lets a host build of the
     small child overlap the device partition rather than follow it.
+
+    `parent_materialized` is False when the parent's range has not yet been
+    partitioned on the host's copy of the permutation, in which case the
+    direct child charges one host partition over the parent's rows
+    (`n_left + n_right`). That partition materializes *both* children at
+    once, so the sibling never charges it again.
     """
     if n_left < 0 or n_right < 0:
         raise Error("child row counts must be nonnegative")
@@ -828,6 +1055,9 @@ def plan_split(
         other_node = left_node
         other_rows = n_left
         source = right_row_source
+    var materialize = 0
+    if row_source_is_host(source) and not parent_materialized:
+        materialize = n_left + n_right
     var work = LeafWork.node_of(
         direct_node,
         direct_rows,
@@ -837,6 +1067,7 @@ def plan_split(
         dataset_rows,
         source,
         gpu_launches,
+        materialize,
     )
     return SplitPlan(
         direct_node,
@@ -854,18 +1085,40 @@ def child_row_source(parent_source: Int) -> Int:
     A child of a node whose rows the host already holds also has host rows:
     the host partitions the parent's list with the same stable rule the
     device applies to the same range, so the two agree index for index
-    (`partition_range_host` is that reference model). This is what makes a
-    host-owned subtree pay its readback once, at the subtree's root, rather
-    than at every node inside it.
+    (`partition_range_host` is that reference model). Whether the parent's
+    rows came from the identity seeding, the bag, an earlier mirror, or the
+    tree's snapshot makes no difference to the child, which is why all four
+    collapse to `ROWS_HOST_MIRROR` here.
 
     A child of a device-owned node is device-owned. Nothing here promotes a
-    node to host ownership; only an accepted `place_leaf` does that, and it
-    is the caller that records the promotion by passing
-    `ROWS_HOST_MIRROR` for that node's children.
+    node to host ownership; only the snapshot does that, tree-wide, and after
+    it is taken every node alive at that moment becomes
+    `ROWS_HOST_SNAPSHOT`.
     """
     if row_source_is_host(parent_source):
         return ROWS_HOST_MIRROR
     return ROWS_DEVICE_COPY
+
+
+def tree_row_source(is_root: Bool, bagged: Bool) -> Int:
+    """The row source a node gets from the tree's shape alone.
+
+    The root is host-known either way: the identity permutation unbagged, the
+    host's own bag otherwise. Every other node is snapshot-backed, whether or
+    not the snapshot has been taken yet -- taking it is a cost
+    (`DECLINE_SNAPSHOT_NOT_PAID` decides whether a leaf can afford it), not a
+    different source.
+
+    `ROWS_DEVICE_COPY` is therefore never produced here. It stays in the
+    vocabulary for the alternative design -- a genuine per-range readback --
+    which is not expressible against today's `enqueue_copy` and is recorded in
+    the handoff as an optimization rather than a dependency.
+    """
+    if is_root:
+        if bagged:
+            return ROWS_HOST_BAG
+        return ROWS_HOST_IDENTITY
+    return ROWS_HOST_SNAPSHOT
 
 
 # --- Deterministic commitment ---------------------------------------------
@@ -1005,6 +1258,8 @@ def describe_placement(placement: Placement) -> String:
         placement.download_bytes,
         "B origin=",
         origin_name(placement.origin),
+        " takes_snapshot=",
+        _yes_no(placement.takes_snapshot),
     )
 
 
@@ -1024,6 +1279,10 @@ def describe_context(ctx: HybridContext) -> String:
         _yes_no(ctx.device_split_search),
         " replica_verified=",
         _yes_no(ctx.quantized_replica_verified),
+        " active_rows=",
+        ctx.n_active_rows,
+        " snapshot=",
+        _yes_no(ctx.snapshot_taken),
         " costs=",
         ctx.costs.cite(),
     )

@@ -126,7 +126,8 @@
     "device_capabilities": {
       "subgroup_width": null,
       "subgroup_width_absent_because": "Metal rejects the WARP_SIZE attribute and no code here assumes a width. Nothing in the policy divides by it.",
-      "max_grid_dim_z": 65535,
+      "max_grid_dim_z": null,
+      "max_grid_dim_z_absent_because": "No third grid dimension is used or bounded anywhere in this project. An earlier draft of the policy carried a portable grid.z bound of 65535 for a batched leaf launch; that number was never established across Metal, CUDA, and HIP, and the batched path that survives (gpu_leaf_batching.mojo) packs its tiles onto grid.y instead, whose portable bound is known. The field was removed rather than left as an unsupported constant.",
       "wide_byte_loads": false,
       "wide_byte_loads_absent_because": "No measurement compares one aligned four-byte bin load against four one-byte loads on any device, so the portable four-load implementation is the one that runs."
     },
@@ -240,7 +241,7 @@
 
   "not_in_this_table": {
     "packed_bin_loads": "No shape here declares its rows a contiguous run, so no plan reaches the packed level and the window arithmetic is untested by this table. Add rows with rows_are_contiguous_run = true and a dataset_rows that is a multiple of 4 to exercise it.",
-    "batched_leaves": "Batching is a decision across a frontier of leaves and takes a list of row counts, which this table's one-node-at-a-time shape cannot express. It needs its own table keyed on a frontier.",
+    "batched_leaves": "Batching is a decision across a frontier of leaves and takes a list of row counts, which this table's one-node-at-a-time shape cannot express. It needs its own table keyed on a frontier, and it belongs next to gpu_leaf_batching.plan_batch, which owns the batched launch geometry and its cost model. The policy layer contributes only batching_declined_reason, the question of whether a frontier leaves the device underfilled.",
     "feature_subsampling": "Every plan uses all 32 features. The re-derive-against-an-allocated-buffer path (max_partial_cells > 0) is not exercised.",
     "small_nodes": "Every node here has more rows than one threadgroup can feed, so the row-bounded threadgroup width never binds. A node of 40 rows is the case that separates the two levels' block_threads, and it is missing."
   }

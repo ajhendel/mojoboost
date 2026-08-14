@@ -123,6 +123,21 @@ echo "version: $VERSION"
 # comparing the tag against the binary.
 
 say "build"
+
+# Zip entry timestamps otherwise come from the wall clock, so two builds of one
+# commit differ in every member's header and therefore in the wheel's digest.
+# `wheel` reads SOURCE_DATE_EPOCH and stamps entries from it instead, which
+# removes that source of difference. Taken from the commit, so it is a property
+# of what is being built rather than of when the build ran.
+#
+# This is one source of nondeterminism, not all of them. Whether the Mojo
+# compiler emits a byte-identical extension across two builds of the same commit
+# has not been tested, and until it has, do not describe the macOS wheel as
+# reproducible or treat two matching digests as proof of anything. The Linux
+# builder (packaging/linux/build_wheel_linux.sh) sets this for the same reason.
+export SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-$(git log -1 --pretty=%ct HEAD)}
+echo "SOURCE_DATE_EPOCH: $SOURCE_DATE_EPOCH"
+
 if [ -n "${MOJOBOOST_MACOS_TARGET:-}" ]; then
     echo "requested deployment target: $MOJOBOOST_MACOS_TARGET"
     echo "(a request. C1 below checks what the compiler actually emitted.)"

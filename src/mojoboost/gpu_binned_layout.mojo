@@ -81,8 +81,9 @@ otherwise.
 Blocking removes the other twelve bytes instead. A block of `G` features
 loads the row index, the gradient, and the hessian once and accumulates `G`
 histograms from them, so the per-(row, feature) cost becomes
-`w/8 + 12/G` bytes. At `G = 4` that is a little over 3 bytes against 13. The
-two levers compose, and compression helps blocking twice over:
+`w/8 + 12/G` bytes. At `G = 4` that is 4 bytes against 13, and 3.5 with
+4-bit bins. The two levers compose, and compression helps blocking twice
+over:
 
 - a narrower width puts more of a block's row into one memory sector, which
   is what makes a wide block coalesce at all;
@@ -657,16 +658,16 @@ struct BinLayoutPlan(Copyable, Movable):
         """`byte(f, r)`: the byte the decode window starts at, which is the
         only byte it reads at width 8 and the first of two below it. The
         formula a kernel evaluates, checked."""
-        var b = self.block_of[feature]
         var idx = self.element_index(feature, row)
+        var b = self.block_of[feature]
         return self.block_offset[b] + element_byte_offset(
             idx, self.block_width[b]
         )
 
     def shift_of(self, feature: Int, row: Int) raises -> Int:
         """`shift(f, r)`, in `[0, 7]`."""
-        var b = self.block_of[feature]
         var idx = self.element_index(feature, row)
+        var b = self.block_of[feature]
         return element_bit_shift(idx, self.block_width[b])
 
     def bytes(self) -> Int:
@@ -1003,8 +1004,10 @@ struct PackedBinMatrix(Copyable, Movable):
 
     def bin_at(self, row: Int, feature: Int) raises -> Int:
         """The bin of (row, feature), decoded exactly as a kernel would."""
-        var b = self.plan.block_of[feature]
+        # `element_index` is what bounds-checks both indices, so it runs
+        # before anything indexes a plan table with them.
         var idx = self.plan.element_index(feature, row)
+        var b = self.plan.block_of[feature]
         return unpack_value(
             self.bytes,
             self.plan.block_offset[b],
@@ -1466,14 +1469,20 @@ def candidate_plans(
     """The layout family for one dataset, in a fixed order, for a benchmark
     to walk.
 
-    Order matches `bench/apple/bin_layout_plan.json`'s `variants` array:
-    feature-major u8 (the baseline), feature-major packed, feature-blocked
-    u8, feature-blocked packed, row-major u8, row-major packed. Blocks are
-    capped by `max_block_for_shared` as well as by `target_block`, so a
-    returned plan always fits the device's threadgroup memory.
+    Order follows `bench/apple/bin_layout_plan.json`'s `variants` grouping:
+    feature-major u8 (the baseline, and a passthrough plan), feature-major
+    packed, feature-blocked u8, feature-blocked packed, row-major u8,
+    row-major packed. One blocked plan per kind, at this call's
+    `target_block`; the plan file sweeps several block widths, which is
+    several calls rather than a longer list from one.
 
-    No plan is marked preferred and none is filtered out on a guess: the
-    point of the list is that a benchmark measures all of them.
+    Blocks are capped by `max_block_for_shared` as well as by
+    `target_block`, so a returned plan always fits the device's threadgroup
+    memory, and the two row-major plans appear only when a single block of
+    every feature fits it (usually it does not, which is itself the answer
+    for the training path). No plan is marked preferred and none is filtered
+    out on a guess: the point of the list is that a benchmark measures all
+    of them.
     """
     if len(bin_counts) != data.n_features:
         raise Error("bin count table must be one entry per feature")

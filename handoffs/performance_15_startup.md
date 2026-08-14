@@ -198,9 +198,16 @@ path. `StartupTrace.clock()` already returns 0 when disabled; keep the
 
 - `GpuHistogramBuilder` has three constructors and the `(ctx, caps, data,
   strategy)` one is where the other two land, so it is the only place to
-  edit. The `enqueue_create_buffer` calls in it are `PHASE_FIRST_ALLOC`;
-  the binned-matrix upload and the `ctx.synchronize()` after it are
+  edit. The `enqueue_create_buffer` and `enqueue_create_host_buffer` calls
+  in it are `PHASE_FIRST_ALLOC` (6 device, 3 pinned host); the
+  `GpuActiveRows` it constructs allocates 5 more device and 3 more pinned
+  host, so recording only the builder's own undercounts by nearly half.
+  The binned-matrix upload and the `ctx.synchronize()` after it are
   `PHASE_FIRST_TRANSFER`.
+- **The `gpu_runtime.mojo` module docstring is stale here too.** It says
+  the builder "allocates seven device buffers and three pinned host
+  buffers", which was true before the active-row compaction landed. Fix it
+  in the same pass as the `KernelRegistry` docstring.
 - Only the `GpuSession`-borrowing constructor has a trace to record into.
   The `(data, strategy)` form opens its own `DeviceContext` and therefore
   pays `context_create` again; that is exactly the waste worth measuring,
@@ -441,9 +448,11 @@ Every one of these is load-bearing and unchecked.
    just documentation.
 6. **`DeviceContext()` cost is unmeasured** and may be dominated by driver
    context creation that no session reuse avoids on the first one.
-7. **`kernel_create` = 5 and `first_alloc` = 7** are read off `N_KERNELS`
-   and the `GpuHistogramBuilder` constructor. The real kernel count is
-   almost certainly higher (see integration point 3).
+7. **`first_alloc` = 17 was counted from constructors, not observed**, and
+   `kernel_create` has no expected value at all: `N_KERNELS` = 5 is the
+   registry's inventory, not the number of kernels the path launches (24
+   launch sites and growing). Extending that inventory is a prerequisite
+   for the count to mean anything, not a follow-up.
 8. **No non-Apple device has ever run this code**, so every statement about
    context creation, kernel creation, and driver behavior is a statement
    about Metal on one M4.

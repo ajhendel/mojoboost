@@ -26,23 +26,37 @@ in "Required external edits" below, unapplied.
 
 ## The one thing to check first
 
-None of this has been through a compiler. The dialect risks, in the order I
-would hit them:
+None of this has been through a compiler, so every construct it uses was
+checked against a construct this repository already ships. Two could not be,
+and they are the only dialect risks left:
 
 1. `comptime TARGET_HAS_NEON = CompilationTarget.has_neon()` and
    `comptime ASSUMED_CACHE_LINE_BYTES = ... if ... else ...` at module scope
-   in `apple_cpu_policy.mojo`. If a target query is not foldable there, move
-   both inside `CpuProfile.detect` and mark `detect`, `cpu_profile`,
-   `max_auto_tasks`, `plan_tasks`, and `plan_row_blocks` `raises`. That
-   cascade is why they are `comptime` in the first place.
+   in `apple_cpu_policy.mojo`. The nearest precedent is
+   `comptime SIMD_LANES = 4 * simd_width_of[DType.float64]()` in
+   `histogram.mojo`, which folds a target query at module scope; a static
+   method on `CompilationTarget` is the same class of query but not the same
+   spelling. If it is not foldable there, move both inside
+   `CpuProfile.detect` and mark `detect`, `cpu_profile`, `max_auto_tasks`,
+   `plan_tasks`, and `plan_row_blocks` `raises`. That cascade is why they are
+   `comptime` in the first place, and the blast radius of getting it wrong is
+   small either way: both values are report-only (`has_neon` and
+   `cache_line_bytes` are printed by `describe` and read by no decision).
 2. `num_logical_cores()` and `num_performance_cores()` are called from
-   non-raising functions. `num_physical_cores()` already was (the old
-   `plan_tasks` body), so the other two in the same module are the assumption.
-3. `comptime TASKS_PER_CORE = DEFAULT_TASKS_PER_CORE` in `parallel.mojo`:
-   a module-scope `comptime` bound to an imported one. `split.mojo` already
-   does the function-scope version of this with `comptime W = SIMD_LANES`.
-4. `col.resize(0, 0.0)` in `fit_bins`, used to empty a `List` while keeping
-   its capacity. If two-argument `resize` rejects a shrink, use `col.clear()`.
+   non-raising functions. `num_physical_cores()` already was, in the old
+   `plan_tasks` body; the assumption is that its two neighbours in
+   `std.sys.info` have the same signature. If not, mark `detect` and its
+   callers `raises` as in (1), or drop `logical_cores` (report-only) and read
+   `performance_cores` only under the `performance` pool.
+
+Retired after checking the repository, recorded so nobody re-raises them:
+`comptime TASKS_PER_CORE = DEFAULT_TASKS_PER_CORE` (a module-scope `comptime`
+bound to an imported one) is exactly what `device.mojo:54-56` and
+`gpu_sparse.mojo:170` already do; and the per-task sort buffer in `fit_bins`
+is emptied with `col.clear()`, the idiom `boosting.fill_grad_hess`,
+`objective.mojo`, and `bagging.mojo` already rely on for capacity-preserving
+reuse. An earlier draft used `resize(0, 0.0)`, which nothing else in the
+repository does.
 
 The equivalence tests in "Commands" are the gate for all of it, and they are
 the first thing to run.

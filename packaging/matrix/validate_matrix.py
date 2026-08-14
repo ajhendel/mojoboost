@@ -15,7 +15,9 @@ ones a script can check, so that a status cannot quietly become false:
    steps to pass
 4. expected wheel filenames agree with their own tags, and the tags agree with
    the target's os, arch, and interpreter
-5. exactly one interpreter is a build target, and it is the one pixi.lock pins
+5. exactly one interpreter is the build target and it is the one pixi.lock
+   pins, every runnable interpreter is at or above the toolchain floor, and
+   none of them claims to work without the GIL
 6. docs/PLATFORM_MATRIX.md names every target in the metadata, so the prose
    cannot drift away from the data
 
@@ -113,6 +115,8 @@ def check_target_evidence(targets: list[dict]) -> None:
 def check_tags(targets: list[dict], pythons: list[dict], matrix: dict) -> None:
     """A tag is a promise about where pip will install the artifact. Check that
     the promise matches the row that makes it."""
+    # Interpreters the project claims the code runs on. A wheel tag naming
+    # anything else is a promise the matrix does not back.
     build_targets = {p["tag"] for p in pythons if p["status"] != "unsupported"}
     for t in targets:
         tid = t.get("id", "?")
@@ -156,21 +160,57 @@ def check_tags(targets: list[dict], pythons: list[dict], matrix: dict) -> None:
                  f"expected {expected!r}")
 
 
+def _minor(version: str) -> tuple[int, int] | None:
+    """(major, minor) from a row's `version`, or None when it is prose.
+
+    Rows like "3.9 and earlier" and "any" are deliberately not parsed to a
+    number: they describe a range or a mechanism, not one interpreter.
+    """
+    m = re.fullmatch(r"(\d+)\.(\d+)", version.strip())
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
 def check_python_rows(pythons: list[dict], toolchain: dict) -> None:
-    supported = [p for p in pythons if p["status"] != "unsupported"]
-    if len(supported) != 1:
-        fail("python", f"expected exactly one build interpreter, found "
-                       f"{[p['tag'] for p in supported]}. The toolchain pins one; "
-                       "a second row means the pin moved or the matrix is wrong.")
-    if supported:
-        row = supported[0]
+    """Two separate invariants, which this check used to conflate.
+
+    Exactly one interpreter BUILDS the extension, because setuptools tags a
+    wheel for whichever interpreter ran the build and the toolchain pin picks
+    that one. Any number of interpreters may RUN the result, because the
+    extension links no libpython and resolves CPython entry points by name at
+    runtime. Requiring one row of each kind, as an earlier version of this
+    function did, made a true matrix fail: 3.10 through 3.14 all run the
+    suite. See docs/PYTHON_SUPPORT.md.
+    """
+    runnable = [p for p in pythons if p["status"] != "unsupported"]
+    if not runnable:
+        fail("python", "no interpreter row is anything but `unsupported`, so "
+                       "the matrix says nothing runs at all")
+
+    builders = [p for p in pythons if p.get("build_target")]
+    if len(builders) != 1:
+        fail("python", f"expected exactly one row with `build_target = true`, "
+                       f"found {[p['tag'] for p in builders]}. The toolchain pin "
+                       "selects one interpreter to compile against, and the wheel "
+                       "carries its tag.")
+    for row in builders:
         pin = toolchain.get("python_pin", "")
         if not pin.startswith(row["version"]):
-            fail("python", f"supported interpreter {row['version']} does not match "
-                           f"the toolchain pin {pin!r}")
+            fail("python", f"build target {row['version']} does not match the "
+                           f"toolchain pin {pin!r}")
+        if row["status"] == "unsupported":
+            fail("python", f"build target {row['tag']} is marked unsupported")
+
+    floor = _minor(toolchain.get("python_toolchain_floor", ""))
+    for row in runnable:
         if row.get("gil") != "required" or not toolchain.get("requires_gil"):
-            fail("python", "the toolchain depends on python-gil, so the supported "
-                           "interpreter row must say the GIL is required")
+            fail("python", f"the toolchain depends on python-gil, so runnable "
+                           f"interpreter {row['tag']} must say the GIL is required")
+        version = _minor(row.get("version", ""))
+        if floor and version and version < floor:
+            fail("python", f"interpreter {row['tag']} is runnable at "
+                           f"{row['version']}, below the toolchain floor "
+                           f"{toolchain['python_toolchain_floor']}. One of the two "
+                           "is wrong and neither may be guessed at.")
 
 
 def check_lock(toolchain: dict) -> None:

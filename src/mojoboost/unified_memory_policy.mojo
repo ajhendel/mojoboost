@@ -329,21 +329,30 @@ def block_reason_name(reason: Int) -> String:
     return String("unknown")
 
 
-def issues_copy(route: Int) raises -> Bool:
-    """Whether mojoboost enqueues a copy of the payload on this route.
+def publishes_by_copy(route: Int) raises -> Bool:
+    """Whether this route has a publish step that moves the payload.
 
-    False is a statement about what *this library* issued and nothing more.
-    The runtime remains free to migrate pages or run a blit of its own, which
-    is why `EVIDENCE_NO_COPY_ISSUED` is a low rung on the ladder rather than
-    the answer.
+    Deliberately *not* the same question as the driver's
+    `copy_bytes_issued_total`, and the two are named differently so they are
+    never read as the same fact:
+
+    - the driver counts bytes handed to `enqueue_copy`, so `map_write` counts
+      zero there, because leaving a mapped block is not a call this library
+      makes;
+    - this function counts `map_write` as publishing by copy anyway, because
+      that block exit may be a full upload and its cost is unknown. Assuming
+      it is free is exactly the error this module exists to prevent.
+
+    False here means the route has no publish step at all, which is true of
+    `host_direct` and the unprobed wrapped route and of nothing else. Even
+    then it is a statement about what *this library* does. The runtime remains
+    free to migrate pages or run a blit of its own, which is why
+    `EVIDENCE_NO_COPY_ISSUED` is a low rung on the ladder rather than the
+    answer.
     """
     if route == ROUTE_COPY_STAGED or route == ROUTE_COPY_DIRECT:
         return True
     if route == ROUTE_MAP_WRITE:
-        # Leaving the mapped block is a publish step whose cost is unknown
-        # and may be a full upload. It is not a copy this library enqueued,
-        # but treating it as free would be exactly the error this module
-        # exists to prevent, so it counts as issuing one.
         return True
     if route == ROUTE_HOST_DIRECT or route == ROUTE_WRAPPED_HOST:
         return False
@@ -659,56 +668,92 @@ struct SyncContract(Copyable, Movable):
     nothing to do on this route."""
 
     var retire_event: Int
-    """What the host must wait for before overwriting the host-side buffer."""
+    """What the host must wait for before writing the buffer it fills next.
+
+    This is *not* the same question as `publish_is_copy`, and collapsing the
+    two is the modeling error this struct exists to avoid. A copy route fills
+    a staging buffer whose only device reader is the copy, so it is free again
+    as soon as that copy retires, early in the round, even while kernels are
+    still running. Every other route fills a buffer the *kernels* read, so it
+    is not free until those retire, at the end of the round. `map_write` is
+    the case that proves they are different questions: its publish may well
+    cost a transfer, and its next write still has to wait for the kernels."""
 
     var host_rewrite_needs_drain: Bool
-    """Whether refilling the host buffer requires a queue drain when device
-    work is outstanding. True on every route: the existing
-    `ctx.synchronize()` at the top of `stage_gradients` is not removable by a
-    route change, and on a shared route it becomes stronger, not weaker."""
+    """Whether refilling that buffer requires a queue drain when device work
+    is outstanding. True on every route: the existing `ctx.synchronize()` at
+    the top of `stage_gradients` is not removable by a route change, and on
+    every route but the copy ones it becomes stronger, not weaker."""
 
     var note_read_on_publish: Bool
-    """Record a device read of the host buffer when the copy is enqueued."""
+    """Record a device read of the host staging buffer when the copy that
+    reads it is enqueued. True only on the copy routes, which are the only
+    ones where a copy reads a host buffer of ours."""
 
     var note_read_on_each_launch: Bool
-    """Record a device read of the host buffer at every kernel launch that
-    takes its pointer. This is the flag that changes the dependency model: on
-    a shared route the gradient staging buffer is read by every node's
-    histogram kernel, not once per round by one copy."""
+    """Record a device read at every kernel launch that takes the buffer's
+    pointer. This is the flag that changes the dependency model: on a shared
+    route the gradient buffer is read by every node's histogram kernel, not
+    once per round by one copy, and on `map_write` the mapped device buffer is
+    likewise read by every launch between one mapping and the next."""
 
     var staging_ring_applies: Bool
     """Whether `StagingRing`'s overlap argument still holds.
 
-    False on the shared routes, and this is the finding most likely to be
+    True only on the copy routes, and this is the finding most likely to be
     missed. The ring assumes a slot is free once the copy reading it has
-    retired, which happens early in a round. With no copy, the slot is read
-    by every histogram kernel in the tree and is not free until the round
-    drains, so a two-slot ring buys nothing and, worse, would report an
-    overlap that is not there.
+    retired, which happens early in a round. On a shared route there is no
+    copy and the slot is read by every histogram kernel in the tree, so it is
+    not free until the round drains: a two-slot ring buys nothing and, worse,
+    would report an overlap that is not there. On `map_write` there is no
+    staging slot to rotate at all, since the host writes through the device
+    buffer's own mapping.
     """
 
 
 def sync_contract(route: Int) raises -> SyncContract:
     """The obligations `route` imposes.
 
+    Written as an explicit branch per route family rather than derived from
+    one boolean. An earlier version of this function computed all five answers
+    from `publishes_by_copy`, which put `map_write` in the copy routes'
+    retirement class: its publish may cost a transfer, so that boolean is
+    True, but the buffer it writes next is the one the *kernels* read, so its
+    wait is a kernel wait. Two different questions had been collapsed onto one
+    flag, which is the same error as calling the driver's `enqueues_copy` and
+    this module's `publishes_by_copy` the same fact.
+
     Note that `host_rewrite_needs_drain` is True on every route including the
     default. A route change cannot remove a synchronization that exists
     because the host is about to overwrite memory the device may still be
     reading; it can only change *which event* the wait is for, which is what
     `retire_event` carries. Lane A5's proposal to elide synchronizations and
-    a shared route interact here and must be reviewed together.
+    any non-default route interact here and must be reviewed together.
     """
     if route < 0 or route >= N_ROUTES:
         raise Error("unknown transfer route ", route)
-    var copies = issues_copy(route)
+
+    if route == ROUTE_COPY_STAGED or route == ROUTE_COPY_DIRECT:
+        # Host fills a staging buffer; the only device reader of it is the
+        # copy, so the slot frees early and the staging ring's overlap is
+        # real.
+        return SyncContract(
+            route, True, RETIRE_ON_COPY, True, True, False, True
+        )
+
+    if route == ROUTE_MAP_WRITE:
+        # Host writes through the device buffer's own mapping. There is no
+        # staging buffer to rotate, the publish may still cost a transfer,
+        # and the next mapping has to wait for every kernel that read that
+        # buffer.
+        return SyncContract(
+            route, True, RETIRE_ON_KERNEL, True, False, True, False
+        )
+
+    # host_direct and the unprobed wrapped route: no publish at all, and the
+    # kernels read the host buffer directly, so it is live until they retire.
     return SyncContract(
-        route,
-        copies,
-        RETIRE_ON_COPY if copies else RETIRE_ON_KERNEL,
-        True,
-        copies,
-        not copies,
-        copies,
+        route, False, RETIRE_ON_KERNEL, True, False, True, False
     )
 
 
@@ -733,15 +778,19 @@ struct Footprint(Copyable, Movable):
     var route: Int
     var host_bytes: Int
     var device_bytes: Int
-    var copy_bytes_per_use: Int
+    var published_bytes_per_use: Int
     var uses_per_session: Int
     var resident_bytes_unknown: Bool
 
     def requested_bytes(self) -> Int:
         return self.host_bytes + self.device_bytes
 
-    def issued_copy_bytes(self) -> Int:
-        return self.copy_bytes_per_use * self.uses_per_session
+    def published_bytes(self) -> Int:
+        """Bytes this role publishes over a session, by whatever mechanism
+        the route uses. Not the same as the driver's
+        `copy_bytes_issued_total`, which counts only `enqueue_copy` bytes and
+        therefore counts zero for `map_write`. See `publishes_by_copy`."""
+        return self.published_bytes_per_use * self.uses_per_session
 
 
 def role_element_bytes(role: Int) raises -> Int:
@@ -831,7 +880,7 @@ def role_footprint(
     var width = role_element_bytes(role)
     var bytes = elems * width
     var uses = role_uses(role, n_rounds, n_nodes_per_round)
-    var copies = issues_copy(route)
+    var copies = publishes_by_copy(route)
 
     var host_bytes = bytes
     var device_bytes = bytes
@@ -843,13 +892,13 @@ def role_footprint(
         # One runtime host allocation, handed to the kernel directly.
         device_bytes = 0
 
-    var copy_bytes = bytes if copies else 0
+    var published = bytes if copies else 0
     return Footprint(
         role,
         route,
         host_bytes,
         device_bytes,
-        copy_bytes,
+        published,
         uses,
         True,
     )
@@ -948,14 +997,18 @@ struct RouteDecision(Copyable, Movable):
         return self.selected == DEFAULT_ROUTE
 
 
-def resolve_route(
+def route_block_reason(
     role: Int,
     requested: Int,
     unified_memory: Bool,
     evidence: EvidenceLedger,
     ack_unproven: Bool = False,
-) raises -> RouteDecision:
-    """Resolve one role's route.
+) raises -> Int:
+    """Why `role` may not use `requested`, or `ELIGIBLE` when it may.
+
+    The single place the gate is decided. `explain_route` reports this answer
+    and `resolve_route` raises on it, so the two cannot disagree about what is
+    allowed, which two independent copies of the rules eventually would.
 
     Order of questions, each of which can only narrow the answer:
 
@@ -966,72 +1019,127 @@ def resolve_route(
        can change that answer.
     3. Platform. A copy-skipping route is refused on a device that does not
        report unified memory.
-    4. Evidence. Below `ENABLE_LEVEL`, the request is refused unless
+    4. Evidence. Below `ENABLE_LEVEL` the request is refused unless
        `ack_unproven` is set.
 
-    A refused *explicit* request raises rather than quietly returning the
-    default, following `device.mojo`, where `device='gpu'` on a machine
-    without one raises instead of silently training on the CPU. A caller that
-    wants the survivable behavior asks for the default.
+    Raises only on an unknown role or route, which is a programming error
+    rather than a policy answer.
     """
     if role < 0 or role >= N_ROLES:
         raise Error("unknown buffer role ", role)
     if requested < 0 or requested >= N_ROUTES:
         raise Error("unknown transfer route ", requested)
-
-    var level = evidence.level_of(requested)
-
     if requested == DEFAULT_ROUTE:
+        return ELIGIBLE
+
+    var support = structural_support(role, requested)
+    if support != ELIGIBLE:
+        return support
+
+    if not unified_memory and not publishes_by_copy(requested):
+        return BLOCK_NOT_UNIFIED_MEMORY
+
+    if evidence.level_of(requested) < ENABLE_LEVEL and not ack_unproven:
+        return BLOCK_NO_EVIDENCE
+
+    return ELIGIBLE
+
+
+def explain_route(
+    role: Int,
+    requested: Int,
+    unified_memory: Bool,
+    evidence: EvidenceLedger,
+    ack_unproven: Bool = False,
+) raises -> RouteDecision:
+    """The decision `resolve_route` would make, without raising on a refusal.
+
+    A refused request comes back as the default with `reason` set to why, so a
+    diagnostic, a trace line, or a benchmark header can report the gate
+    without catching an exception and without a second copy of the rules.
+
+    Nothing that allocates should use this. A call site that asked for a route
+    and silently got a different one is the failure `resolve_route` exists to
+    prevent; this is for the code that only wants to say what the gate would
+    do.
+    """
+    var level = evidence.level_of(requested)
+    var reason = route_block_reason(
+        role, requested, unified_memory, evidence, ack_unproven
+    )
+    if reason != ELIGIBLE:
         return RouteDecision(
             role,
             requested,
             DEFAULT_ROUTE,
-            ELIGIBLE,
+            reason,
             False,
             level,
             sync_contract(DEFAULT_ROUTE),
         )
+    return RouteDecision(
+        role,
+        requested,
+        requested,
+        ELIGIBLE,
+        requested != DEFAULT_ROUTE and level < ENABLE_LEVEL,
+        level,
+        sync_contract(requested),
+    )
 
-    var support = structural_support(role, requested)
-    if support != ELIGIBLE:
+
+def resolve_route(
+    role: Int,
+    requested: Int,
+    unified_memory: Bool,
+    evidence: EvidenceLedger,
+    ack_unproven: Bool = False,
+) raises -> RouteDecision:
+    """Resolve one role's route, raising when the request cannot be honored.
+
+    The gate itself is `route_block_reason`; this adds the message and the
+    refusal. A refused *explicit* request raises rather than quietly returning
+    the default, following `device.mojo`, where `device='gpu'` on a machine
+    without an accelerator raises instead of silently training on the CPU. A
+    caller that wants the survivable behavior asks for the default; a caller
+    that only wants to report the gate calls `explain_route`.
+
+    Each refusal names what would have to change, because "route refused" with
+    no reason is the kind of message that gets worked around rather than read.
+    """
+    var reason = route_block_reason(
+        role, requested, unified_memory, evidence, ack_unproven
+    )
+    if reason == BLOCK_NO_EVIDENCE:
         raise Error(
             "transfer route '",
             route_name(requested),
-            "' cannot serve the '",
-            role_name(role),
-            "' buffer: ",
-            block_reason_name(support),
-            "; see docs/APPLE_UNIFIED_MEMORY.md",
+            "' has evidence at '",
+            evidence_name(evidence.level_of(requested)),
+            "' and needs '",
+            evidence_name(ENABLE_LEVEL),
+            "'; set MOJOBOOST_GPU_TRANSFER_UNPROVEN=1 to run it anyway and"
+            " report that flag with any number it produces",
         )
-
-    if not unified_memory and not issues_copy(requested):
+    if reason == BLOCK_NOT_UNIFIED_MEMORY:
         raise Error(
             "transfer route '",
             route_name(requested),
             "' skips the copy, but this device does not report unified"
             " memory; use 'staged'",
         )
-
-    if level < ENABLE_LEVEL and not ack_unproven:
+    if reason != ELIGIBLE:
         raise Error(
             "transfer route '",
             route_name(requested),
-            "' has evidence at '",
-            evidence_name(level),
-            "' and needs '",
-            evidence_name(ENABLE_LEVEL),
-            "'; set MOJOBOOST_GPU_TRANSFER_UNPROVEN=1 to run it anyway and"
-            " report that flag with any number it produces",
+            "' cannot serve the '",
+            role_name(role),
+            "' buffer: ",
+            block_reason_name(reason),
+            "; see docs/APPLE_UNIFIED_MEMORY.md",
         )
-
-    return RouteDecision(
-        role,
-        requested,
-        requested,
-        ELIGIBLE,
-        level < ENABLE_LEVEL,
-        level,
-        sync_contract(requested),
+    return explain_route(
+        role, requested, unified_memory, evidence, ack_unproven
     )
 
 
@@ -1071,9 +1179,12 @@ def resolve_from_env(role: Int, unified_memory: Bool) raises -> RouteDecision:
 
 
 def describe_decision(decision: RouteDecision) -> String:
-    """One line for a trace or a bug report. Names the acknowledgment
-    explicitly, because a decision taken under it is not a measurement of a
-    supported configuration."""
+    """One line for a trace or a bug report.
+
+    Names the refusal reason and the acknowledgment explicitly. A decision
+    taken under the acknowledgment is not a measurement of a supported
+    configuration, and a decision that fell back to the default for a reason
+    is not the same event as one that was asked for."""
     var out = String(
         "role=",
         role_name(decision.role),
@@ -1086,6 +1197,8 @@ def describe_decision(decision: RouteDecision) -> String:
         " retire_on=",
         retire_event_name(decision.contract.retire_event),
     )
+    if decision.reason != ELIGIBLE:
+        out += " blocked=" + block_reason_name(decision.reason)
     if decision.ack_unproven:
         out += " ack_unproven=1"
     return out

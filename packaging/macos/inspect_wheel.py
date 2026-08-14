@@ -556,7 +556,6 @@ def inspect(path: Path, rep: Report) -> dict:
                   ["This is a screen and not a proof. It finds a credential that",
                    "was packaged by accident; it does not certify that none was."])
 
-    data["checks"] = rep.checks
     return data
 
 
@@ -589,6 +588,10 @@ def main(argv: list[str]) -> int:
 
     rep = Report()
     data = inspect(args.wheel, rep)
+    # Attached here rather than inside inspect(), so that a wheel that fails
+    # early (an unreadable name, a platform tag from another operating system)
+    # still writes a JSON report containing the check that rejected it.
+    data["checks"] = rep.checks
 
     passed = sum(1 for c in rep.checks if c["ok"])
     print(f"\n{passed}/{len(rep.checks)} release checks passed"

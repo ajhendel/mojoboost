@@ -128,7 +128,12 @@ from .monotone import (
     midpoint,
     monotone_sign,
 )
-from .sampling import select_node_features, select_tree_features
+from .sampling import (
+    check_feature_fractions,
+    select_node_features,
+    select_split_features,
+    select_tree_features,
+)
 from .split import SplitInfo
 from .tree import Tree, TreeParams, _leaf_value, _search
 
@@ -384,6 +389,39 @@ def _search_leaf_device(
     return rec^
 
 
+def _check_device_search_supported(params: TreeParams) raises:
+    """Refuse a configuration the device split kernel cannot score.
+
+    The kernel reads `GpuSplitParams`, which carries the two lambdas, the two
+    child floors, and the categorical parameters. Everything in
+    `TreeParams.extra`, and the per-level feature draw, would have to move
+    into the kernel or into the record it returns. Until one of those
+    happens, asking for them under `SPLIT_SEARCH_DEVICE` is an error, not a
+    silently different tree. The host scan (the default) honors all of them.
+
+    The range checks run first, so an out-of-range value is reported as the
+    bad number it is rather than as an unsupported strategy. `is_active` tests
+    for a value that would change a fit, which a negative one would not.
+    """
+    params.extra.check_scalars(params.min_data_in_leaf)
+    if params.extra.is_active():
+        raise Error(
+            "the device split search does not implement min_gain_to_split,"
+            " max_delta_step, path_smooth, extra_trees, monotone_penalty,"
+            " feature_contri, or the CEGB costs; the kernel scores from"
+            " GpuSplitParams alone. Use the host split scan, which is the"
+            " default (MOJOBOOST_GPU_SPLIT_STRATEGY=host, or"
+            " split_search=SPLIT_SEARCH_HOST)"
+        )
+    if params.feature_fraction_bylevel != 1.0:
+        raise Error(
+            "the device split search does not implement"
+            " feature_fraction_bylevel; the per-node draw it stages is taken"
+            " from the tree's feature set directly. Use the host split scan,"
+            " which is the default"
+        )
+
+
 def _grow_tree_gpu_device_search(
     mut builder: GpuHistogramBuilder,
     params: TreeParams,
@@ -406,7 +444,18 @@ def _grow_tree_gpu_device_search(
     exact integers either way. Selection is still bit-deterministic run to
     run. Shape rules (depth limit, minimum rows), monotone clamping with
     the midpoint collapse, interaction masks, and per-node feature
-    subsampling all stay identical to the host path."""
+    subsampling all stay identical to the host path.
+
+    What this path does *not* implement is the `params.extra` bundle and the
+    per-level feature draw. `GpuSplitParams` carries lambda_l1, lambda_l2, the
+    two child floors, and the categorical parameters, and the kernel scores
+    from those alone: there is nowhere in it to charge a gain floor, a
+    per-feature multiplier, a CEGB cost, a monotone penalty, a drawn
+    threshold, or a capped and smoothed child output. Rather than return
+    trees that quietly ignore what the caller asked for, an active setting is
+    refused here and the caller is pointed at the host scan, which honors all
+    of it. `_check_device_search_supported` is that refusal."""
+    _check_device_search_supported(params)
     params.constraints.check_features(builder.n_features)
     params.monotone.check_features(builder.n_features)
     var signs = params.monotone.active_signs()
@@ -624,6 +673,21 @@ def grow_tree_gpu(
         return _grow_tree_gpu_device_search(builder, params, bag, tree_index)
     params.constraints.check_features(builder.n_features)
     params.monotone.check_features(builder.n_features)
+    check_feature_fractions(
+        params.feature_fraction,
+        params.feature_fraction_bynode,
+        params.feature_fraction_bylevel,
+    )
+    # This grower applies the whole `extra` bundle, so it validates it against
+    # this dataset before the first histogram, as the CPU grower does.
+    params.extra.check(
+        builder.n_features,
+        params.num_leaves,
+        params.max_depth,
+        params.min_data_in_leaf,
+    )
+    var max_delta_step = params.extra.max_delta_step
+    var path_smooth = params.extra.path_smooth
     var signs = params.monotone.active_signs()
     var tree_features = select_tree_features(
         builder.n_features,
@@ -643,8 +707,17 @@ def grow_tree_gpu(
     var n_root = len(bag) if len(bag) > 0 else builder.n_rows
     var root = tree._add_node(0.0, Float64(n_root))
     var root_hist = builder.build_leaf(root)
+    # Valued before the search, because path smoothing makes a candidate's
+    # children shrink toward this value; the root smooths toward 0.0.
     tree.value[root] = _leaf_value(
-        root_hist, params.lambda_reg, params.lambda_l1, value_feature
+        root_hist,
+        params.lambda_reg,
+        params.lambda_l1,
+        value_feature,
+        n_root,
+        0.0,
+        max_delta_step,
+        path_smooth,
     )
     var root_branch = List[Int]()
     var root_split = _search(
@@ -652,17 +725,23 @@ def grow_tree_gpu(
         n_root,
         params,
         params.constraints.allowed_features(root_branch),
-        select_node_features(
+        select_split_features(
             tree_features,
+            params.feature_fraction_bylevel,
             params.feature_fraction_bynode,
             params.feature_fraction_seed,
             tree_index,
+            0,
             root,
         ),
         depth=0,
         missing_bins=builder.missing_bin,
         monotone=signs,
         cats=builder.cats,
+        node=root,
+        tree_index=tree_index,
+        parent_output=tree.value[root],
+        grower_applies_extra=True,
     )
 
     var frontier = List[_GpuLeafState]()
@@ -723,16 +802,34 @@ def grow_tree_gpu(
             left_hist = subtract_histogram(frontier[best_i].hist, right_hist)
 
         # Same clamp-and-divide as the CPU grower: no-ops when unconstrained.
+        # The cap and the smoothing come first and the interval is enforced on
+        # the result, the order the candidate was scored with, and both
+        # children smooth toward the value the parent already emits.
         var parent_bounds = frontier[best_i].bounds.copy()
         var split_sign = monotone_sign(signs, split.feature)
+        var parent_output = tree.value[parent_node]
         var left_value = parent_bounds.clamp(
             _leaf_value(
-                left_hist, params.lambda_reg, params.lambda_l1, value_feature
+                left_hist,
+                params.lambda_reg,
+                params.lambda_l1,
+                value_feature,
+                n_left,
+                parent_output,
+                max_delta_step,
+                path_smooth,
             )
         )
         var right_value = parent_bounds.clamp(
             _leaf_value(
-                right_hist, params.lambda_reg, params.lambda_l1, value_feature
+                right_hist,
+                params.lambda_reg,
+                params.lambda_l1,
+                value_feature,
+                n_right,
+                parent_output,
+                max_delta_step,
+                path_smooth,
             )
         )
         if split_sign != MONOTONE_FREE and left_value > right_value:
@@ -763,11 +860,13 @@ def grow_tree_gpu(
             n_left,
             params,
             allowed,
-            select_node_features(
+            select_split_features(
                 tree_features,
+                params.feature_fraction_bylevel,
                 params.feature_fraction_bynode,
                 params.feature_fraction_seed,
                 tree_index,
+                child_depth,
                 left_node,
             ),
             depth=child_depth,
@@ -775,17 +874,23 @@ def grow_tree_gpu(
             monotone=signs,
             cats=builder.cats,
             bounds=children.left,
+            node=left_node,
+            tree_index=tree_index,
+            parent_output=left_value,
+            grower_applies_extra=True,
         )
         var right_split = _search(
             right_hist,
             n_right,
             params,
             allowed,
-            select_node_features(
+            select_split_features(
                 tree_features,
+                params.feature_fraction_bylevel,
                 params.feature_fraction_bynode,
                 params.feature_fraction_seed,
                 tree_index,
+                child_depth,
                 right_node,
             ),
             depth=child_depth,
@@ -793,6 +898,10 @@ def grow_tree_gpu(
             monotone=signs,
             cats=builder.cats,
             bounds=children.right,
+            node=right_node,
+            tree_index=tree_index,
+            parent_output=right_value,
+            grower_applies_extra=True,
         )
 
         frontier[best_i] = _GpuLeafState(
@@ -907,7 +1016,8 @@ def _train_gpu_rounds[
                     # the device path's documented precision.
                     var raw = state.download_raw(builder.ctx)
                     _renew_leaf_values(
-                        tree, data, target, raw, renew_w, renew_a, [], signs
+                        tree, data, target, raw, renew_w, renew_a, [], signs,
+                        params.tree.extra,
                     )
                 if tree.n_leaves == 1 and abs(tree.value[0]) < 1e-12:
                     life.end_round()
@@ -949,7 +1059,8 @@ def _train_gpu_rounds[
             life.end_tree()
             if renews:
                 _renew_leaf_values(
-                    tree, data, target, raw, renew_w, renew_a, bag, signs
+                    tree, data, target, raw, renew_w, renew_a, bag, signs,
+                    params.tree.extra,
                 )
 
             # A single-leaf tree with a near-zero value means the objective
@@ -1653,15 +1764,21 @@ struct _DeviceValidScorer(GpuValidScorer, Movable):
     training kernels in the same in-order queue and need no fence between
     them.
 
-    Two deliberate limits. The loss itself is computed on the host, from the
-    downloaded raw scores, through the same `_mean_loss` the CPU trainer and
-    the host scorer use: gpu_predict.mojo can reduce a metric on the device,
-    but its metric set is not the objective loss set `_mean_loss` covers, and
-    a stopping decision made from a different loss definition is not the same
-    run. The raw scores themselves accumulate in Float32 (Apple GPUs have no
-    Float64), so two rounds within Float32 noise of each other can order
-    differently than they would on the host path and pick a different
-    `best_iteration`. That is why this is not the default.
+    The loss is reduced wherever its definition is the run's own.
+    `device_loss_metric` answers that per objective: squared error and L1
+    reduce on the device, so a round moves `n_valid / REDUCE_BLOCK` floats
+    home instead of `n_valid`, and every other objective downloads the raw
+    scores and is scored by the same `_mean_loss` the CPU trainer stops on.
+    The device's metric set is smaller than the objective loss set, and a
+    stopping decision made from a different loss definition is a different
+    run, not a faster one, so the fallback is the rule rather than the
+    exception.
+
+    The one limit that no dispatch removes: the raw scores accumulate in
+    Float32, since Apple GPUs have no Float64. Two rounds within Float32
+    noise of each other can therefore order differently than they would on
+    the host path and pick a different `best_iteration`. That is why this
+    scorer is not the default.
     """
 
     var predictor: GpuPredictor
@@ -1786,7 +1903,8 @@ def _train_gpu_valid_rounds[
             )
             if renews:
                 _renew_leaf_values(
-                    tree, data, target, raw, renew_w, renew_a, bag, signs
+                    tree, data, target, raw, renew_w, renew_a, bag, signs,
+                    params.tree.extra,
                 )
 
             # Under bagging or GOSS a degenerate tree indicts the sample, not

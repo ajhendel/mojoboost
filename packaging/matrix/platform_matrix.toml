@@ -35,11 +35,22 @@ unsupported = "Deliberately out of scope. The failure behavior is specified in d
 mojo = "1.0.0"
 max = "26.5.0"
 max_build_string = "3.14release"
-# max 26.5.0 depends on `python 3.14.*` and on `python-gil`. That pair, not a
-# policy decision here, is what makes cp314 the only interpreter mojoboost
-# builds against and what excludes the free-threaded build.
+# max 26.5.0 depends on `python-gil`, which is a real toolchain requirement and
+# is what excludes every free-threaded build.
+#
+# The `python 3.14.*` pin beside it is NOT a toolchain requirement, and reading
+# it as one was this block's bug. max 26.5.0 is published as five
+# per-interpreter variants, 3.10release through 3.14release, on all three
+# platforms, and pixi.toml pins no python, so the solver took the newest. cp314
+# is the interpreter this project happens to build with, not the only one it
+# could, and not the only one the result runs on. See docs/PYTHON_SUPPORT.md.
 python_pin = "3.14.*"
 requires_gil = true
+# The lowest interpreter anything can reach, from two directions that agree:
+# mojo 1.0.0 and mojo-python 1.0.0 both depend on `python >=3.10`, and the
+# built extension aborts on 3.9 with `symbol not found: Py_NewRef`, a CPython
+# 3.10 addition. Measured, docs/PYTHON_SUPPORT.md section 10.
+python_toolchain_floor = "3.10"
 pixi_platforms = ["osx-arm64", "linux-64", "linux-aarch64"]
 # pixi.lock's solved virtual packages. The Linux floor comes from here; it is
 # what the environment was resolved against, and it is NOT a measurement of the
@@ -51,7 +62,19 @@ source = "pixi.lock"
 # ---------------------------------------------------------------------------
 # Interpreters
 #
-# One row, because the toolchain permits one. This is not a simplification.
+# Two different questions live in this table and they used to be conflated.
+#
+#   build_target   which interpreter compiles the extension and therefore
+#                  decides the wheel's tag. Exactly one, from the toolchain
+#                  pin, because setuptools tags a wheel for the interpreter
+#                  that ran the build.
+#   status         whether the *result* runs there. Many, because the
+#                  extension links no libpython and resolves CPython entry
+#                  points by name at runtime.
+#
+# The five cp310..cp314 rows below are `tested`, not `validated`: the source
+# was exercised on each, on osx-arm64, but no wheel was built for any of them
+# except cp314 and none was installed from. See docs/PYTHON_SUPPORT.md.
 # ---------------------------------------------------------------------------
 [[python]]
 tag = "cp314"
@@ -59,12 +82,82 @@ abi = "cp314"
 version = "3.14"
 status = "tested"
 gil = "required"
+build_target = true
 reason = """
-max 26.5.0 ships as a 3.14 build and depends on `python 3.14.*`. The extension
-is compiled by the Mojo toolchain inside that environment, so the interpreter
-the wheel targets is the interpreter MAX pins.
+The interpreter the pixi environment resolved to, and therefore the one the
+Mojo toolchain compiles against and the one setuptools tags the wheel for. That
+is a consequence of pixi.toml pinning no python, not of a toolchain
+requirement: max 26.5.0 is published for 3.10 through 3.14.
 """
-evidence = ""
+evidence = "docs/PYTHON_SUPPORT.md"
+
+[[python]]
+tag = "cp313"
+abi = "cp313"
+version = "3.13"
+status = "tested"
+gil = "required"
+reason = """
+The cp314-built extension imports and passes python/test_python_api.py here
+unmodified. No wheel has been built by a 3.13 environment, so there is no
+cp313 artifact; that is what keeps this row at `tested`.
+"""
+evidence = "docs/PYTHON_SUPPORT.md"
+
+[[python]]
+tag = "cp312"
+abi = "cp312"
+version = "3.12"
+status = "tested"
+gil = "required"
+reason = """
+Same run, same result. This row is also what refuted the earlier reading that
+Py_GetConstantBorrowed (CPython 3.13) was a hard floor: it is in the
+extension's entry point table and 3.12 runs the whole suite regardless.
+"""
+evidence = "docs/PYTHON_SUPPORT.md"
+
+[[python]]
+tag = "cp311"
+abi = "cp311"
+version = "3.11"
+status = "tested"
+gil = "required"
+reason = """
+Same run, same result.
+"""
+evidence = "docs/PYTHON_SUPPORT.md"
+
+[[python]]
+tag = "cp310"
+abi = "cp310"
+version = "3.10"
+status = "tested"
+gil = "required"
+reason = """
+Same run, same result, and this is the floor. Two independent constraints put
+it here: mojo 1.0.0 and mojo-python 1.0.0 require `python >=3.10`, and the
+extension aborts below it.
+"""
+evidence = "docs/PYTHON_SUPPORT.md"
+
+[[python]]
+tag = "cp39"
+abi = "cp39"
+version = "3.9 and earlier"
+status = "unsupported"
+gil = "required"
+reason = """
+The extension does not fail here, it aborts during module initialization:
+
+    ABORT: .../std/ffi/__init__.mojo:762:18: symbol not found: Py_NewRef
+
+Py_NewRef is a CPython 3.10 addition, and three other 3.10 additions sit in the
+same entry point table. Below the toolchain's own floor as well, so there is
+nothing to build with either. python/mojoboost/_compat.py refuses in front of
+the import, because an abort cannot be caught.
+"""
+evidence = "docs/PYTHON_SUPPORT.md"
 
 [[python]]
 tag = "cp314t"
@@ -74,22 +167,11 @@ status = "unsupported"
 gil = "absent"
 reason = """
 max 26.5.0 depends on `python-gil`, which the free-threaded build does not
-provide. A cp314t interpreter cannot resolve the environment, so no extension
-can be built for it. pip refuses the cp314 wheel on a cp314t interpreter by tag
-mismatch, which is the correct failure and needs no code.
-"""
-evidence = ""
-
-[[python]]
-tag = "cp313"
-abi = "cp313"
-version = "3.13 and earlier"
-status = "unsupported"
-gil = "required"
-reason = """
-No MAX build for these interpreters in the pinned channel. `requires-python`
-in python/pyproject.toml already says >=3.14, and the wheel's cp314 tag makes
-pip refuse the install rather than let it fail at import.
+provide. A free-threaded interpreter cannot resolve the environment, so no
+extension can be built for it. pip refuses the cp314 wheel on a cp314t
+interpreter by tag mismatch, which is the correct failure and needs no code.
+Unlike every row above, this one has not been measured, because there is no
+artifact to measure.
 """
 evidence = ""
 
@@ -100,9 +182,17 @@ version = "any"
 status = "unsupported"
 gil = "required"
 reason = """
-The extension is not built against the limited API, so there is no abi3 wheel
-to ship and one interpreter series per wheel is the shape of this project until
-that changes. Do not tag a wheel abi3 to widen its reach.
+Py_LIMITED_API is a C macro set before including Python.h, and this project has
+no C source, no Python.h, and no compile step where it could be set: the
+extension is emitted by `mojo build --emit shared-lib` and its CPython glue
+comes from Modular's std.mojoc. setup.py has no Extension() to pass
+py_limited_api to. abi3 is not a lever this repository has.
+
+It is also not the lever it would need. abi3 exists so a binary linked against
+libpython can serve several interpreters; this binary links no libpython and
+already serves 3.10 through 3.14. What stands between that and one wheel is the
+tag, not the ABI. Ship one wheel per interpreter. Do not tag a wheel abi3 to
+widen its reach.
 """
 evidence = ""
 

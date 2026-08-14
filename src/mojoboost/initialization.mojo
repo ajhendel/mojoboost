@@ -396,11 +396,20 @@ struct StartupTrace(Copyable, Movable):
         """`first_fit - warm_fit`: the part of the first fit that a warm
         fit does not repeat, and therefore the part worth attacking.
 
-        Clamped at zero. A negative difference is real (a warm fit can be
-        slower than the first one, from a different bagging draw or plain
-        noise) but it is not an overhead, and reporting a negative
-        overhead invites somebody to subtract it from a total.
+        `-1` when there is nothing to subtract, which is any run that
+        fitted once. Returning the first fit's own duration in that case
+        would report the entire fit as overhead, which is the single most
+        misleading number this module could produce.
+
+        Otherwise clamped at zero. A negative difference is real (a warm
+        fit can be slower than the first, from a different bagging draw or
+        plain noise) but it is not an overhead, and reporting a negative
+        one invites somebody to subtract it from a total.
         """
+        if self.calls[PHASE_WARM_FIT] < 1:
+            return -1
+        if self.calls[PHASE_FIRST_FIT] < 1:
+            return -1
         var d = self.first_nanos[PHASE_FIRST_FIT] - self.warm_nanos()
         if d < 0:
             return 0
@@ -410,9 +419,13 @@ struct StartupTrace(Copyable, Movable):
         """Fold another owner's trace into this one.
 
         The explicit alternative to a process-wide singleton: a caller
-        that wants one number across several estimators asks for it. First
-        occurrences take the earliest non-zero value, since the first time
-        a process paid a phase is the first time *any* owner paid it.
+        that wants one number across several estimators asks for it.
+
+        A phase's first occurrence is taken from whichever trace has a
+        non-zero one, `self` winning a tie. That is merge order, not
+        chronological order: nothing here records wall-clock timestamps,
+        so which owner genuinely went first is not knowable, and a caller
+        that needs it has to merge in the order the owners ran.
         """
         for p in range(N_STARTUP_PHASES):
             self.calls[p] += other.calls[p]
@@ -590,10 +603,15 @@ struct WarmupPlan(Copyable, Movable):
                 return i
         return -1
 
-    def include(mut self, kernel_id: Int) raises -> Bool:
+    def include(mut self, kernel_id: Int) -> Bool:
         """Add `kernel_id` to the plan. True when it was not already in
         it, so a caller can assemble a plan from overlapping sets without
-        checking first."""
+        checking first.
+
+        Does not raise: a duplicate is the normal case this returns False
+        for, and there is no other way to be wrong. A caller building a
+        plan from several overlapping sets should not need a `try`.
+        """
         if self._index_of(kernel_id) >= 0:
             return False
         self.kernel_ids.append(kernel_id)

@@ -14,6 +14,19 @@ What this session did, in the nine files it owns, and nothing else.
 | `src/mojoboost/efb.mojo` | `check_bundling_supported`, `check_bundling_params`, docstring stating why bundling is still not reachable |
 | `handoffs/integration_08_algorithms.md` | this file |
 
+Five more files were edited on a follow-up instruction, to close the backends
+that would otherwise have ignored an active setting without saying so. They
+were outside the lane's original ownership, and `train_gpu.mojo` in particular
+is another lane's file in this round, so re-read these five before merging.
+
+| File | Change |
+|---|---|
+| `src/mojoboost/tree_sparse.mojo` | opts in to the whole bundle and to the per-level feature draw |
+| `src/mojoboost/train_gpu.mojo` | host scan opts in; the device scan refuses what its kernel cannot score; leaf renewal forwards the bundle |
+| `src/mojoboost/distributed.mojo` | its private `_search` and `_leaf_value` honor the bundle; two new bits in the existing unsupported mask refuse the rest |
+| `src/mojoboost/boosting_sparse.mojo` | `_renew_leaf_values_sparse` honors the cap and the smoothing |
+| `src/mojoboost/custom_metric.mojo` | forwards the bundle to leaf renewal |
+
 No test was written or run, nothing was executed, nothing was committed by this
 session. Static reasoning only, as the brief required, so every claim below is
 a reading of the code and not a measurement.
@@ -34,8 +47,7 @@ see two of the nine files in the wrong place.
 That is `tree.grow_tree` (dense CPU), `tree_sparse.grow_tree_sparse`, and
 `train_gpu.grow_tree_gpu` on its host split scan, which is the default. Each of
 these rules is a function of the histogram, the node's row count, and the
-node's depth, all of which every caller already passes, so they needed no
-change on the caller's side.
+node's depth, all of which every caller already passes.
 
 | LightGBM name | Aliases accepted | Where it acts |
 |---|---|---|
@@ -52,7 +64,7 @@ once per candidate. A categorical feature's winning partition goes through the
 same acceptance, so a category split and a threshold split still compete on
 equal footing.
 
-### 1.2 Live in `tree.grow_tree` alone
+### 1.2 Live in the growers that opt in
 
 | LightGBM name | Aliases accepted | Where it acts |
 |---|---|---|
@@ -61,12 +73,15 @@ equal footing.
 | `path_smooth` | none | same three places |
 
 `extra_trees` needs the node id and the tree index, and the two leaf-output
-rules need a leaf's row count and its parent's finished output. No other grower
-passes those. Rather than let a default 0 stand in for a node id, or let a
-backend emit uncapped leaves for a caller who asked for a cap, `tree._search`
-refuses an active value from a caller that has not set
-`grower_applies_extra`. `tree.grow_tree` sets it; nothing else does. The gate
-is `ExtraTreeParams.needs_grower_support()`.
+rules need a leaf's row count and its parent's finished output. A grower has to
+pass those, so it declares that it does by setting `grower_applies_extra` on
+`tree._search`; the gate is `ExtraTreeParams.needs_grower_support()`, and a
+caller that has not set it gets an error rather than a tree that draws every
+threshold from node 0's stream or emits uncapped leaves.
+
+All three growers that share `tree._search` now set it: `tree.grow_tree`,
+`tree_sparse.grow_tree_sparse`, and `train_gpu.grow_tree_gpu`. The gate stays
+in place because it is what keeps the next grower honest.
 
 Three details worth keeping.
 
@@ -209,21 +224,36 @@ categoricals exhaustively while every numerical feature gets a single draw
 would be neither LightGBM's behavior nor an honest approximation of it, so the
 combination raises in `find_best_split`.
 
-### 2.6 Two growers honor none of this
+### 2.6 The two growers that do not share `tree._search`
+
+Both used to drop an active setting on the floor. Neither does now.
 
 - **`distributed.grow_tree_distributed`** keeps private copies of `_search`
-  (distributed.mojo:271) and `_leaf_value` (distributed.mojo:258) and calls
-  `find_best_split` directly. It therefore ignores the whole bundle,
-  including the tier that every other backend gets for free, and it cannot be
-  gated from the files owned here because it never calls anything that sees
-  both the parameters and the backend. This is the one place where an active
-  setting is silently dropped, and closing it is two forwarded arguments
-  (section 3.6).
-- **`train_gpu._grow_tree_gpu_device_search`** scores candidates in a kernel
-  and never calls `tree._search`. It is opt-in (`SPLIT_SEARCH_DEVICE`, or
-  `MOJOBOOST_GPU_SPLIT_STRATEGY=device`) and already documented as differing
-  from the host scan on near-ties, but it now also ignores the bundle and the
-  per-level feature draw.
+  and `_leaf_value` and calls `find_best_split` directly. Those two copies
+  now forward `params.extra`, the node's global row count, and the parent's
+  output, so section 1.1 and the two leaf-output rules are live there as
+  well. Every input they read is global (the reduced histogram and the exact
+  integer row count), so no rank can score a candidate or value a leaf
+  differently from another and no extra message is needed. Two things it
+  still cannot do are refused through the mechanism this grower already had
+  for exactly this purpose, `_unsupported_mask` and `_raise_unsupported`:
+  `extra_trees`, whose draw is keyed by a tree index this grower is never
+  given, and `feature_fraction_bylevel`, alongside the two feature fractions
+  it already refused. `monotone_penalty` needs no depth here, because the
+  grower refuses monotone constraints outright, so no feature carries a sign
+  and the penalty is the identity by definition.
+- **`train_gpu._grow_tree_gpu_device_search`** scores candidates in a kernel,
+  from `GpuSplitParams`, which carries the two lambdas, the two child floors,
+  and the categorical parameters and has nowhere to put a gain floor, a
+  multiplier, a cost, a drawn threshold, or a finished child output. It now
+  refuses an active bundle and an active `feature_fraction_bylevel`, through
+  `_check_device_search_supported`, and the error points at the host scan,
+  which is the default and honors all of it. This path remains opt-in
+  (`SPLIT_SEARCH_DEVICE`, or `MOJOBOOST_GPU_SPLIT_STRATEGY=device`) and
+  remains documented as differing from the host scan on near-ties.
+
+Moving the bundle into the device kernel is the real follow-up. Refusing it is
+what keeps the choice of split-search strategy from quietly changing the model.
 
 ### 2.7 Still without a caller
 
@@ -345,49 +375,30 @@ EFB is the exception and is not integrated. Its v4 section, and
 described in `handoffs/task13_efb.md` sections 10 and 11 and are unchanged by
 this session.
 
-### 3.6 The other growers
+### 3.6 The other growers, done
 
-Each is a small, mechanical opt-in.
+Not deferred. `tree_sparse.mojo`, `train_gpu.mojo`, and `distributed.mojo` were
+edited in this session so that no backend drops a setting silently. What each
+one now does is section 1.2 and section 2.6. Nothing is left here.
 
-- `src/mojoboost/distributed.mojo`. Its `_search` (line 271) should forward
-  `params.extra`, `n_rows`, and `depth` to `find_best_split`, and its
-  `_leaf_value` (line 258) should take the same four arguments
-  `tree._leaf_value` now takes. Until then the distributed grower ignores
-  every control in section 1 without saying so, which is the one silent gap
-  this integration could not close from inside its own files.
-- `src/mojoboost/tree_sparse.mojo` and `src/mojoboost/train_gpu.mojo`. Both
-  already get section 1.1 for free. To get section 1.2 they need to pass
-  `node=`, `tree_index=`, `parent_output=`, and `grower_applies_extra=True` to
-  `_search`, and the four leaf-output arguments to `_leaf_value`, exactly as
-  `tree.grow_tree` does. Both should also switch their three
-  `select_node_features` calls to `select_split_features` so
-  `feature_fraction_bylevel` is not silently dropped; at 1.0 the two are the
-  same call.
-- `src/mojoboost/train_gpu.mojo`, device split search. `_search_leaf_device`
-  and `_grow_tree_gpu_device_search` should either honor the bundle or refuse
-  an active one. Refusing is the right first move, since the kernel scores in
-  Float32 and the penalties would need to move into it.
+### 3.7 Leaf renewal, done
 
-### 3.7 Leaf renewal on the other trainers
-
-`boosting._renew_leaf_values` gained a trailing `extra` argument that defaults
-to inactive, so these compile and behave as before, and they drop the cap and
-the smoothing if a caller sets one.
-
-- `src/mojoboost/custom_metric.mojo:667`, pass `current.tree.extra`.
-- `src/mojoboost/train_gpu.mojo`, both `_renew_leaf_values` call sites, pass
-  `params.tree.extra`.
-- `src/mojoboost/boosting_sparse.mojo` has its own
-  `_renew_leaf_values_sparse` (line 62, called at 190 and 279) and needs the
-  same treatment written into it.
+`boosting._renew_leaf_values` and `boosting_sparse._renew_leaf_values_sparse`
+both take the bundle, and all eight call sites forward it:
+`boosting.mojo` (2), `train_gpu.mojo` (3), `boosting_sparse.mojo` (2), and
+`custom_metric.mojo` (1). The argument still defaults to inactive, so a
+future caller that forgets it renews exactly as before rather than failing to
+compile, which is why the list above is worth keeping.
 
 ### 3.8 Docs and the parity checker
 
 Not owned here, so nothing was flipped. What is now true:
 
 - `min_split_gain`, `min_gain_to_split`, `max_delta_step`, `path_smooth`,
-  `extra_trees`/`extra_seed`, `monotone_penalty`, and `feature_contri` are
-  implemented, with the backend caveat in section 2.6.
+  `monotone_penalty`, and `feature_contri` are implemented on the dense CPU,
+  sparse, GPU host-scan, and distributed growers. `extra_trees`/`extra_seed`
+  are implemented on the first three and refused by name on the last, which
+  is not given a tree index. The GPU device split search refuses all of them.
 - `monotone_constraints_method` stays `different` and can now cite an
   explicit rejection rather than silence.
 - `forcedsplits_filename` moves to `partial`; the document is parsed and
@@ -526,11 +537,13 @@ The two samplers class bagging is now exclusive with.
 ```
 ... pixi run mojo run -I src tests/test_sparse.mojo
 ... pixi run mojo run -I src tests/test_distributed.mojo
+... pixi run mojo run -I src tests/test_gpu_strategies.mojo
 ```
-The two growers that call into `tree.mojo` without opting in. Both should be
-unchanged; they are here because a default-argument mistake in `_search` or
-`_leaf_value` would show up first as a sparse or distributed tree that no
-longer matches the dense one.
+The three other growers. All three assert that they reproduce the dense tree
+(`test_world_size_one_matches_grow_tree`, the sparse and dense comparisons in
+`test_sparse.mojo`, and the host/device comparison in
+`test_gpu_strategies.mojo`), which is exactly the property the opt-in edits
+must not break. Run these before believing any of section 1.2.
 
 ```
 python3 tools/check_parity.py

@@ -55,8 +55,13 @@ What the lane does deliver, in order of how much it is worth:
 2. A policy layer whose every input is a reported device property or a
    workload shape, with no branch on a model string, an architecture string,
    or an M-series generation anywhere in it.
-3. Conservative primitives for three specializations, each behind an
-   explicit capability boundary with a portable implementation beside it.
+3. Conservative primitives for two specializations (bin capacity classes and
+   packed bin loads), each behind an explicit capability boundary with a
+   portable implementation beside it, plus the policy-side decision for a
+   third (batched leaves) whose kernels and plan belong to
+   `gpu_leaf_batching.mojo`. This lane's own batched leaf planner was
+   written and then deleted; section 15 says why, and it is the part of this
+   handoff most worth reading before extending any of it.
 4. A plan table (`bench/apple/histogram_plan.json`) showing what the policy
    selects for fourteen (device, shape) pairs, hand derived and marked as
    such, with the exact emitter that must confirm it.
@@ -94,9 +99,14 @@ The capability boundary. `portable()` answers no to everything.
 | field | meaning | portable value |
 | --- | --- | --- |
 | `subgroup_width` | lanes in lockstep | **0, meaning unknown**. Nothing divides by it. Metal rejects `WARP_SIZE`, and `WARP_GRANULARITY` in `gpu_tiling.mojo` is a launch rounding chosen to be a multiple of every backend's width, not a claim about any device's width |
-| `max_grid_dim_z` | bound on a batched launch's third dimension | 65535, the smallest portable bound |
 | `wide_byte_loads` | one aligned four byte bin load has been **shown** to beat four one byte loads | false |
 | `unified_memory` | budget shared with the host | false |
+
+There is no grid-dimension field, and its absence was a correction. A first
+draft carried `max_grid_dim_z = 65535` as "the smallest portable bound",
+which this project has never established on Metal, CUDA, and HIP alike, and
+which is exactly the kind of unfounded portability constant the lane brief
+forbids. See section 15.
 
 ### 2.3 `features: gpu_histogram_specializations.KernelFeatures`
 
@@ -178,17 +188,13 @@ baseline" checkable rather than asserted, it lets a benchmark report both
 without re-deriving, and it gives a call site somewhere to fall back to if a
 specialization misbehaves in the field.
 
-Batching outputs are separate, because batching is a decision across nodes
-and a `HistogramPlan` is about one node: `plan_batched_leaves(...)` returns
-`List[LeafBatch]`, empty meaning launch exactly as today, and
-`batching_declined_reason(...)` says why. Each `LeafBatch` carries `first`,
-`n_leaves`, `rows_per_tile`, `n_tiles`, `min_rows`, `max_rows`, `blocks`, and
-`wasted_blocks`.
-
-`wasted_blocks` is reported rather than hidden. Every leaf in a batch shares
-one `grid.y`, sized for the largest, so a small batch mate contributes
-threadgroups that exit immediately. That is the cost side of batching and it
-is the number a benchmark has to weigh the saved launches against.
+Batching output is one number, because batching is a decision across nodes
+and a `HistogramPlan` is about one node: `batching_declined_reason(...)`
+returns `REASON_AS_REQUESTED` when a frontier leaves the device underfilled
+and wants batching, and otherwise which check refused. **It does not plan the
+batch.** `gpu_leaf_batching.plan_batch` does, and it owns the tile sharing,
+the partial buffer bound, the kernels, and the cost model. See section 15 for
+why this lane's own batch planner was removed rather than kept beside it.
 
 ---
 
@@ -308,23 +314,28 @@ and that `n_tiles * rows_per_tile >= node_rows` with
 `tests/test_gpu_tiling.mojo::_assert_covers_rows` already pins for the
 baseline and which any new level must satisfy identically.
 
-### 5.4 Batched launches
+### 5.4 Batched launches, which this lane does not compute
+
+`gpu_leaf_batching.plan_batch` owns this arithmetic. The one bound worth
+repeating here, because it is easy to miss and it is what a policy layer
+would be tempted to duplicate, is the partial buffer: a batched tiled launch
+needs one partial histogram per (item, tile), so the budget that bounded
+`n_tiles` for one node now has to cover the batch's `total_tiles`. That
+module's `plan_batch` takes `max_partial_cells` and scales the per item tile
+shares down proportionally when the budget is smaller, with one tile per item
+as the floor. This lane's `batching_declined_reason` deliberately does not
+recompute any of it.
+
+The decision this lane does make is one comparison per leaf:
 
 ```
-batch blocks       = n_leaves * n_slots * n_tiles
-batch partial cells= n_leaves * n_tiles * hist_cells
-max_batch_leaves   = min(32, max_grid_dim_z,
-                         partial_cell_limit / partial_cells)   [tiled]
-                   = min(32, max_grid_dim_z)                   [atomic]
+target = core_count * resident_blocks_per_core
+leaf fills the device  <=>  n_slots * ceil(rows / rows_per_tile) >= target
 ```
 
-The partial buffer bound is the one that is easy to miss. A batched tiled
-launch needs one partial histogram per (leaf, tile), so the budget that
-bounded `n_tiles` now has to cover `n_leaves * n_tiles` of them. At the plan
-table's largest tiled shape (24576 partial cells) the limit of 5592405 allows
-227 leaves, so 32 binds first, but a wider dataset flips that and
-`batching_declined_reason` returns `REASON_PARTIAL_BUDGET` when fewer than
-two leaves fit.
+A frontier wants batching when at least one leaf fails that. A frontier where
+every leaf passes has nothing to gain and would only pay the packed tile
+axis's per threadgroup binary search.
 
 ---
 
@@ -353,7 +364,7 @@ Two consequences worth stating because they are easy to get wrong.
 
 - `level_applied` is contiguous, so `SPEC_LEVEL_BATCHED` is only reported
   when the packed level was also reached **for that node**. Batching itself
-  does not depend on that: `plan_batched_leaves` gates on `level_requested`
+  does not depend on that: `batching_declined_reason` gates on `level_requested`
   and `KernelFeatures`, so a frontier does not lose its batching because one
   node's rows happened not to be contiguous.
 - The stride check is a whole launch property, not a per feature one. Column
@@ -410,20 +421,27 @@ pass must produce, not as what anyone expects it to find.
 
 ### 7.3 Batched small leaves (`batched_leaf_kernel`)
 
+The kernels and the plan belong to `gpu_leaf_batching.mojo`, so most of this
+gate is that lane's. What this lane's flag must not be set without:
+
 1. **Bit exactness** between a batched frontier and the same frontier
    launched one leaf at a time, per leaf.
 2. **A frontier size distribution from a real training run.** The whole
    payoff depends on how many nodes are too small to fill the device, and
    nobody has measured that. Record the row count of every node at every
-   depth for a representative dataset, then compute how many launches the
-   batch plan would save and how many wasted blocks it would create. Both
-   numbers come out of `plan_leaf_batches` without any device.
-3. **Launch overhead per node**, measured, so the saved launches can be
+   depth for a representative dataset, then run it through
+   `gpu_leaf_batching.plan_batch` and `batch_cost` and compare against the
+   serial plan. Both are pure host arithmetic and need no device.
+   `batching_declined_reason` is the cheap predicate that says whether such
+   a frontier is even a candidate.
+3. **A grower that produces more than one leaf at a time.** That module's own
+   docstring records that on the default path `grow_tree_gpu` commits one
+   leaf per step and derives the sibling by subtraction, so a batch of one is
+   all there is and the whole path is a no-op. `gpu_frontier.mojo` is the
+   lane that changes that, and until it lands there is nothing to batch.
+4. **Launch overhead per node**, measured, so the saved launches can be
    priced. `bench/bench_histogram.mojo` already times `enqueue_leaf`
    separately, which is the right place.
-4. **The partial buffer growth accounted for** (section 5.4), including the
-   reallocation policy, since `GpuHistogramBuilder.part_capacity` is fixed at
-   construction and a batched tiled launch wants `n_leaves` times more.
 
 ---
 
@@ -440,11 +458,9 @@ none of them changes behavior until the last one is explicitly asked for.
 from .gpu_histogram_specializations import (
     DeviceHistogramCapabilities,
     KernelFeatures,
-    LeafBatch,
     PackedLoadWindow,
     bin_capacity_for,
     kernel_shared_bytes,
-    plan_leaf_batches,
     plan_packed_window,
 )
 from .apple_histogram_policy import (
@@ -454,9 +470,9 @@ from .apple_histogram_policy import (
     SPEC_LEVEL_SHAPE,
     HistogramPlan,
     HistogramWorkload,
+    batching_declined_reason,
     derive_histogram_plan,
     describe_plan,
-    plan_batched_leaves,
     profile_from_caps,
 )
 ```
@@ -565,15 +581,26 @@ flag maintained by `begin_tree` and `partition`:
 Until then, pass `False` and let the packed level decline with
 `REASON_ROWS_NOT_A_RUN`. That is the correct answer, not a limitation.
 
-### 8.4 Batching, last
+### 8.4 Batching, last, and mostly not this lane's
 
-`plan_batched_leaves` takes the frontier's row counts in launch order and
-returns the batches. The grower would call it once per depth, after the
-splits at that depth are applied and before the next round of
-`enqueue_leaf` calls. An empty list means launch as today. The kernel side is
-a `grid.z` dimension and a per leaf `(begin, count, out_offset)` descriptor
-buffer; nothing else in the accumulation changes, which is what keeps the
-batched result bit identical.
+The launch belongs to `gpu_leaf_batching.plan_batch` and the frontier that
+feeds it to `gpu_frontier.mojo`. This lane contributes one call, which is
+cheap enough to make before deciding whether to plan anything:
+
+```mojo
+var wants = batching_declined_reason(
+    plan, self.profile, self.features, row_counts, n_slots
+)
+if wants == REASON_AS_REQUESTED:
+    var batch = plan_batch(self.caps, items, scales, n_slots, self.n_bins, ...)
+```
+
+Order matters only in that the predicate is a handful of integer divisions
+and `plan_batch` walks the frontier three times, so asking first is free.
+Neither is a device call. If the two ever disagree about whether a frontier
+is worth batching, `plan_batch`'s verdict wins: it is the one that knows the
+tile shares it actually handed out, and this predicate is a screening
+question, not a second opinion.
 
 ---
 
@@ -623,12 +650,15 @@ performance.
    {0, 1, 2, 3} and counts spanning the `MIN_PACKED_BODY_QUADS` boundary must
    satisfy `window.covered() == count` in every case, usable or not. This is
    the property that keeps a caller from dropping rows.
-6. **Batch plan coverage.** `plan_leaf_batches` must cover every input leaf
-   exactly once, in order, with `sum(n_leaves) == len(row_counts)`, for
-   frontiers including zero counts, single leaves, and counts spanning more
-   than `BATCH_ROW_SPREAD`.
-7. **Batch bounds.** No batch may exceed `max_batch_leaves`, and on the tiled
-   strategy `n_leaves * partial_cells` must not exceed `partial_cell_limit`.
+6. **The batching predicate agrees with the batch planner.** For a sweep of
+   frontiers, `batching_declined_reason` returning `REASON_AS_REQUESTED` must
+   not contradict `gpu_leaf_batching.plan_batch`'s verdict of
+   `VERDICT_SINGLE_FILLS`. They are computed independently from the same
+   inputs, so a disagreement means one of the two occupancy targets drifted.
+7. **The batching predicate is monotone in frontier size.** Adding a leaf to
+   a frontier can never turn `REASON_AS_REQUESTED` into
+   `REASON_SINGLE_LEAF_FILLS_DEVICE`, since the check is an existential over
+   the leaves.
 8. **Default equals baseline.** With no environment variable and
    `SPEC_LEVEL_UNSET`, `derive_histogram_plan(...).matches_baseline()` must be
    true for every profile and shape in a sweep. This is the test that keeps
@@ -754,9 +784,23 @@ On CUDA (Nsight Compute) and HIP (rocprof), the same five, plus:
 - **Task 16 (sparse and categorical GPU).** The categorical routing in
   `RowRouting` reads a bitset rather than a threshold, but the histogram
   kernels do not branch on it: they accumulate by bin either way. Nothing in
-  this lane's specializations interacts with categorical splits. A sparse bin
-  representation would change the gather and would invalidate the packed
-  window arithmetic, which assumes one byte per (row, feature).
+  this lane's specializations interacts with categorical splits.
+- **`gpu_leaf_batching.mojo` and `gpu_frontier.mojo`** (landed mid round, in
+  `b04b5f0`). These supersede this lane's batched leaf primitives outright.
+  See section 15.
+- **`gpu_bin_packing.mojo` and `gpu_binned_layout.mojo`** (same commit).
+  These describe sub-byte bin widths on the device. **They invalidate the
+  packed window arithmetic if adopted for the training path**, and not merely
+  as a caveat: `plan_packed_window` treats an element index as a byte offset
+  and a four row group as four bytes, both of which are false at a bin width
+  below 8. `PackedLoadWindow`'s docstring now names the two functions
+  (`element_byte_offset`, `element_bit_shift`) the window would have to be
+  re-derived against. Whoever adopts a packed layout must either re-derive it
+  or leave `packed_bin_loads` false, and the second is the safe default it
+  already has.
+- **`gpu_output_planes.mojo`** cross references
+  `gpu_histogram_specializations.mojo` in a comment for the bin capacity
+  subject and imports nothing from it. No coupling.
 
 ---
 
@@ -783,3 +827,65 @@ A new test file for this lane's two modules is required and was not written.
 It needs no accelerator and belongs in the plain `test` task rather than
 `test-gpu`, next to A6's, whose `tests/parallel/` directory is still not
 referenced by any pixi task (A6 section 5).
+
+---
+
+## 15. What this lane removed after re-reading the tree, and why
+
+A second pass over the working tree, after concurrent lanes had landed,
+found that two pieces of this lane's first draft should not exist. Both were
+deleted rather than kept and documented, because a duplicate that disagrees
+is worse than no duplicate, and an unfounded constant is worse than a missing
+one.
+
+### 15.1 The batched leaf planner, superseded
+
+Deleted from `gpu_histogram_specializations.mojo`: `LeafBatch`,
+`plan_leaf_batches`, `batch_blocks`, `total_wasted_blocks`,
+`MIN_BATCH_LEAVES`, `MAX_BATCH_LEAVES`, `BATCH_ROW_SPREAD`. Deleted from
+`apple_histogram_policy.mojo`: `plan_batched_leaves`, `max_batch_leaves`,
+`REASON_PARTIAL_BUDGET`.
+
+`gpu_leaf_batching.mojo` landed in the same round with the kernels, the plan,
+a verdict enum, and a symbolic cost model, and its design is better than the
+one deleted here on the exact axis this lane had identified as the cost:
+
+- **It has no wasted threadgroups at all.** This lane's plan gave every leaf
+  in a batch the largest leaf's tile count on a `grid.z` axis and reported the
+  threadgroups that would launch only to exit, in a `wasted_blocks` field.
+  That module concatenates each item's own tiles onto one flat `grid.y` axis
+  and binary searches it per threadgroup, so a frontier of one huge leaf and
+  thirty tiny ones costs exactly the tiles those thirty one leaves need. On
+  leaf-wise growth, where unbalanced frontiers are the normal case rather
+  than a corner, that is the difference between the two designs and it goes
+  entirely one way.
+- **It needs no third grid dimension**, and says so for the reason given in
+  15.2 below.
+
+Keeping both would have left two planners computing tile counts from the same
+`DeviceCaps` and the same amortization constants, free to drift by a tile
+with nothing to catch it. What survives on this side is
+`batching_declined_reason`, which answers a different question (does this
+frontier leave the device underfilled) and computes no geometry.
+
+### 15.2 The portable `grid.z` bound, unfounded
+
+`DeviceHistogramCapabilities.max_grid_dim_z` was 65535, documented as "the
+smallest bound across the supported backends". **This project has never
+established that.** `MAX_GRID_DIM_Y` in `gpu_tiling.mojo` is sourced (CUDA
+caps `grid.y` at 65535 and the others allow more); the `grid.z` figure was
+carried across by analogy, which is exactly the assumption the lane brief
+forbids alongside assuming a subgroup width. A grep confirms this module was
+the only place in the tree that referred to a third grid dimension at all,
+and `gpu_leaf_batching.mojo` explicitly declines to use one on the grounds
+that its portable limit is unestablished. The field is gone rather than
+corrected, since nothing needs it.
+
+### 15.3 What was not removed, and why
+
+The bin capacity classes and the packed load primitives stay. Neither is
+duplicated anywhere in the tree: `gpu_bin_packing.mojo` packs several bins
+into fewer bits, which is the opposite problem from reading four one-byte
+bins in one word, and nothing else derives a threadgroup residency from the
+footprint a compiled kernel actually has. Section 4 remains this lane's
+finding.

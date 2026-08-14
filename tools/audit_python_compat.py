@@ -156,6 +156,19 @@ SYMBOL_FLOORS = {
 # difference between a hard floor and a soft one. The pattern is read out of
 # the binary rather than hardcoded, so a toolchain that guards one more symbol
 # moves this report without anybody editing it.
+# Entry points that are in the table, carry no diagnostic string, and are
+# nonetheless not required, because an interpreter that lacks them has been
+# run and worked. A byte scan cannot discover this; only an import can, so
+# every row cites the run that put it here. Removing a row makes the reported
+# floor rise, which is the safe direction, so a stale row is a caught error
+# rather than a silent one.
+MEASURED_LAZY = {
+    "Py_GetConstantBorrowed": (
+        "CPython 3.12 imported and exercised the full python API suite, "
+        "docs/PYTHON_SUPPORT.md section 10"
+    ),
+}
+
 GUARD_STRING = re.compile(
     rb"([A-Za-z_][A-Za-z0-9_]*) is not available in this Python version"
 )
@@ -632,17 +645,25 @@ def scan_extension(res, path, declared):
         )
 
     hard = (3, 0)
+    scanned = (3, 0)
     for symbol in entry_points:
         version = SYMBOL_FLOORS[symbol]
-        state = "guarded" if symbol in guarded else "unguarded"
-        res.info("%s needs CPython %s (%s)" % (symbol, vstr(version), state))
-        if symbol not in guarded:
+        scanned = max(scanned, version)
+        if symbol in guarded:
+            state = "guarded by the runtime"
+        elif symbol in MEASURED_LAZY:
+            state = "not required: %s" % MEASURED_LAZY[symbol]
+        else:
+            state = "required"
             hard = max(hard, version)
+        res.info("%s needs CPython %s (%s)" % (symbol, vstr(version), state))
 
     if hard > (3, 0):
         res.ok(
             "extension",
-            "highest unguarded entry point needs CPython %s" % vstr(hard),
+            "required entry points need CPython %s. Byte scan alone would "
+            "have said %s; the difference is what an import measured"
+            % (vstr(hard), vstr(scanned)),
         )
         if declared is not None and hard > declared:
             res.fail(
@@ -653,11 +674,10 @@ def scan_extension(res, path, declared):
         elif declared is not None and hard < declared:
             res.note(
                 "extension",
-                "the extension's own floor is %s, below the declared %s. "
-                "Whether that gap is real depends on whether these names are "
-                "resolved eagerly at module init or lazily on first use, "
-                "which a byte scan cannot tell. docs/PYTHON_SUPPORT.md names "
-                "the experiment that can" % (vstr(hard), vstr(declared)),
+                "the extension runs on %s but requires-python says %s, so "
+                "the package declares a narrower floor than its own binary "
+                "imposes. That is a decision to make, not a defect. See "
+                "docs/PYTHON_SUPPORT.md" % (vstr(hard), vstr(declared)),
             )
 
     if b"libpython" in blob:

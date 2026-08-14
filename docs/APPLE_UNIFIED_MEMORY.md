@@ -271,7 +271,7 @@ is the contract the Apple benchmark schema should be written against.
 | `round_mean_ns`, `round_min_ns` | steady-state round cost |
 | `host_alloc_bytes`, `device_alloc_bytes`, `allocated_bytes` | what the route asked for on each side, and their sum |
 | `copy_bytes_issued_total` | bytes this driver handed to `enqueue_copy` over the whole run |
-| `issues_copy` | `1` when that total is nonzero. Claim 1.5, not Claim 2 |
+| `enqueues_copy` | `1` when that total is nonzero. Claim 1.5, not Claim 2. Narrower than it sounds: `map_write` reports `0` because leaving a mapped block is not an `enqueue_copy` call, though that block exit may still be a full upload. The policy module's `publishes_by_copy` is the wider question and answers True for `map_write` |
 | `drains_per_round` | queue drains the route owed each round |
 | `retouch_round`, `retouch_write_ns`, `retouch_publish_ns`, `retouch_total_ns`, `retouch_over_steady` | `resident` mode only: the CPU-writes-after-GPU-reads round, alone |
 | `checksum`, `expected` | the correctness gate |
@@ -322,10 +322,19 @@ so no route here writes memory the device might still be reading. **A trainer
 integration does not get that for free.** On a shared route the kernel itself
 reads the host buffer, so the host may not refill it until every kernel that
 read it has retired, which is later than "until the copy retired" and is the
-whole tree rather than the start of the round. That obligation is written down
-in `src/mojoboost/unified_memory_policy.mojo` as `SyncContract`, it is returned
-with every route decision so the two cannot be separated, and the consequences
-for `StagingRing` are in the handoff.
+whole tree rather than the start of the round.
+
+`map_write` lands on the same side of that line, which is not obvious and is
+worth stating: it publishes by something that may well be a copy, and the
+buffer it writes next is still the one the kernels read, so its next mapping
+waits for the kernels too. "Does the publish move bytes" and "what retires the
+buffer I write next" are two questions, and `sync_contract` answers them
+per route family rather than deriving both from one flag.
+
+Those obligations are written down in
+`src/mojoboost/unified_memory_policy.mojo` as `SyncContract`, returned with
+every route decision so the two cannot be separated, and the consequences for
+`StagingRing` are in the handoff.
 
 ### The correctness gate
 
@@ -529,6 +538,15 @@ default.
 | `MOJOBOOST_GPU_TRANSFER` | `staged` (default), `direct`, `mapped`, `host_direct`, `wrapped`. An unparsable value raises rather than falling back, as `device.mojo` does for an impossible `gpu` request |
 | `MOJOBOOST_GPU_TRANSFER_UNPROVEN=1` | run a route that has not earned `ENABLE_LEVEL`, and mark every decision it produces |
 
+Two entry points, deliberately different. `resolve_route` (and
+`resolve_from_env`) is for code that is about to allocate: it raises when the
+request cannot be honored, because a call site that asked for one route and
+silently got another is the failure the module exists to prevent.
+`explain_route` is for code that only reports: it returns the default with a
+reason instead of raising. Both are decided by one function,
+`route_block_reason`, so they cannot drift into disagreeing about what is
+allowed.
+
 Nothing reads these yet. They are the contract an integration would implement,
 and the handoff names the exact call sites.
 
@@ -538,16 +556,25 @@ Every line is `um.<scope>.<key>: <value>`, one metric per line, so a run can
 be parsed with a line filter and no state. Scopes are `um.<input_route>` for
 the four implemented input routes, `um.out_host_direct` for the output route,
 `um.wrapped_host_buffer` and `um.out_wrapped_host_buffer` for the unprobed
-ones, `um.policy` for the shipped default and the installed evidence,
+ones, `um.policy` for the shipped default, the installed evidence, and the
+per-role structural map,
 `um.device` for device attributes, `um.marker` for the external-capture
 brackets, `um.ladder` for the size ladder, and bare `um.` for run-level fields.
 Status values are exactly `ok`, `unsupported`, `wrong`, `not_probed`. Times are
 integer nanoseconds, sizes are integer bytes, ratios are Float64.
 
+The `um.policy.*` scope carries three things: `default_route` and
+`enable_level`, one `evidence.<route>` line per route, and one
+`role.<role>.host_direct` line per buffer role giving what would block the one
+route that issues no copy, asked with unified memory assumed so the answer
+isolates data ownership and evidence from the platform. Those last lines are
+the part of the subject no run can change, and they are printed beside the
+timings so a reader does not conclude that a fast route is an available one.
+
 The additions relative to the first version of this document are `um.mode`,
 `um.hold_bytes`, the whole `um.policy.*` scope, the `um.out_host_direct` and
 `um.out_wrapped_host_buffer` scopes, and the per-route keys `input_route`,
-`out_route`, `mode`, `copy_bytes_issued_total`, `issues_copy`,
+`out_route`, `mode`, `copy_bytes_issued_total`, `enqueues_copy`,
 `drains_per_round`, and the five `retouch_*` keys. Every previously emitted key
 is still emitted with the same name and meaning, so a parser written against
 the old grammar still works and sees fewer keys than exist. Whoever owns the

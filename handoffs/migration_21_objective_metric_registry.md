@@ -624,9 +624,13 @@ resolvers rather than one.
 
 ## 7. Validation, in the order it should run
 
-7.1 and 7.2 **have been run and pass**; their sources are in the appendix,
-ready to be promoted into a repository test. 7.3 through 7.5 have not been
-run: they need a build of the Python extension, which this lane did not do.
+7.1, 7.2, and the differential in 7.3 **have been run and pass**; their
+sources are in the appendix, ready to be promoted into repository tests.
+Everything else, the pytest suites in 7.3 and all of 7.4 and 7.5, needs a
+build of the Python extension, which this lane did not do. It was left
+undone on purpose: twenty other lanes are mutating this checkout, so a
+failure in the estimator suite today would say more about them than about
+this change, and the differential below already pins `_eval` exactly.
 
 ### 7.1 Does it compile (RUN, passes)
 
@@ -866,3 +870,415 @@ either rename `objective_backends` to say "a trainer exists for this
 objective on this backend", or split it into per-entry-point answers. Do
 not resolve it by making one of them agree with the other: they are
 answering different questions and a caller needs both.
+
+---
+
+## Appendix. The probes that were run
+
+Three files, none of them in the repository. They were run from the
+repository root and are reproduced whole because they are the evidence
+behind section 7 and because promoting A and B into
+`tests/parallel/test_objective_registry.mojo` is most of that test already
+written. Rewrite the `raise Error` checks as `std.testing.assert_*` and add
+the duplicate-name check named at the end of 7.2.
+
+### Appendix A. Registry self-check
+
+```
+pixi run mojo run -I src probe_registry.mojo
+registry probe ok: 24 objective names, 39 metric names, 14 codes
+```
+
+```mojo
+from mojoboost.objective_registry import (
+    CUSTOM,
+    LAMBDARANK,
+    METRIC_L2,
+    METRIC_NDCG,
+    MULTICLASS,
+    N_BUILTIN_METRICS,
+    SQUARED_ERROR,
+    TWEEDIE,
+    all_objective_codes,
+    check_objective_param,
+    metric_alias_names,
+    metric_canonical_name,
+    metric_code_from_name,
+    metric_codes_for_task,
+    metric_names_for_task,
+    metric_spec,
+    objective_alias_names,
+    objective_canonical_name,
+    objective_code_from_name,
+    objective_default_metric,
+    objective_name_status,
+    objective_spec,
+    task_name,
+    unimplemented_objective_alias_names,
+)
+
+
+def main() raises:
+    # Every objective name resolves, and every code names itself back.
+    var onames = objective_alias_names()
+    for i in range(len(onames)):
+        _ = objective_code_from_name(onames[i])
+    var codes = all_objective_codes()
+    for i in range(len(codes)):
+        var c = codes[i]
+        if objective_code_from_name(objective_canonical_name(c)) != c:
+            raise Error("objective round trip failed for ", c)
+        var spec = objective_spec(c)
+        if spec.code != c:
+            raise Error("spec code mismatch for ", c)
+
+    # Every metric name resolves, and every code names itself back.
+    var mnames = metric_alias_names()
+    for i in range(len(mnames)):
+        _ = metric_code_from_name(mnames[i])
+    for c in range(N_BUILTIN_METRICS):
+        if metric_code_from_name(metric_canonical_name(c)) != c:
+            raise Error("metric round trip failed for ", c)
+        var mspec = metric_spec(c)
+        if mspec.code != c:
+            raise Error("metric spec code mismatch for ", c)
+
+    # Unimplemented names are still reported as unimplemented.
+    var unimpl = unimplemented_objective_alias_names()
+    for i in range(len(unimpl)):
+        if objective_name_status(unimpl[i]) != 1:
+            raise Error("expected unimplemented status")
+    if objective_name_status("nonsense") != 2:
+        raise Error("expected unknown status")
+    if objective_name_status("regression") != 0:
+        raise Error("expected supported status")
+
+    # Task names, per-task metric lists, defaults, and parameter checks.
+    for t in range(4):
+        var names = metric_names_for_task(t)
+        var per_task = metric_codes_for_task(t)
+        var joined = String("")
+        for i in range(len(per_task)):
+            if i > 0:
+                joined += ", "
+            joined += metric_canonical_name(per_task[i])
+        if joined != names:
+            raise Error("task ", t, ": '", joined, "' != '", names, "'")
+        _ = task_name(t)
+
+    if objective_default_metric(SQUARED_ERROR) != METRIC_L2:
+        raise Error("wrong default for squared error")
+    if objective_default_metric(LAMBDARANK) != METRIC_NDCG:
+        raise Error("wrong default for lambdarank")
+    var custom_raised = False
+    try:
+        _ = objective_default_metric(CUSTOM)
+    except:
+        custom_raised = True
+    if not custom_raised:
+        raise Error("custom should have no default metric")
+
+    var tweedie_raised = False
+    try:
+        check_objective_param(TWEEDIE, 2.5)
+    except:
+        tweedie_raised = True
+    if not tweedie_raised:
+        raise Error("tweedie 2.5 should be rejected")
+    check_objective_param(TWEEDIE, 1.5)
+    check_objective_param(MULTICLASS, 0.9)
+
+    print("registry probe ok:", len(onames), "objective names,",
+          len(mnames), "metric names,", len(codes), "codes")
+```
+
+### Appendix B. Mirrors against their sources
+
+This is the one that authorizes the deletions in section 3 and the merge in
+section 9. The three constant comparisons are reported by the compiler as
+unreachable branches, which is a stronger result than passing: they cannot
+differ.
+
+```
+pixi run mojo run -I src probe_mirrors.mojo
+warning: 'if' condition always evaluates to 'False' (x3, the constant mirrors)
+mirror probe ok: 14 codes, 24 names
+```
+
+```mojo
+"""Does every fact the registry mirrors still equal its source?
+
+This is the check that authorizes the deletions in the lane 21 handoff:
+if any line here fails, a delegation would change behavior.
+"""
+
+from std.math import exp
+
+from mojoboost.boosting import Booster, MonotoneConstraints
+from mojoboost.custom_metric import response_scale
+from mojoboost.device_policy import (
+    gpu_objective_is_device_resident,
+    is_builtin_objective,
+)
+from mojoboost.device_policy import LAMBDARANK as POLICY_LAMBDARANK
+from mojoboost.gpu_objectives_native import supports_device_objective
+from mojoboost.gpu_predict import (
+    RESPONSE_EXP,
+    RESPONSE_IDENTITY,
+    RESPONSE_SIGMOID,
+    response_for_objective,
+)
+from mojoboost.objective_registry import (
+    CUSTOM,
+    LAMBDARANK,
+    LINK_EXP,
+    LINK_IDENTITY,
+    LINK_SIGMOID,
+    LINK_SOFTMAX,
+    MULTICLASS,
+    all_objective_codes,
+    objective_alias_names,
+    objective_canonical_name,
+    objective_code_from_name,
+    objective_default_param,
+    objective_gradients_on_device,
+    objective_is_builtin,
+    objective_link,
+)
+from mojoboost.params import MULTICLASS as PARAMS_MULTICLASS
+from mojoboost.params import (
+    objective_default_alpha,
+    objective_display_name,
+    objective_from_name,
+)
+from mojoboost.ranking import LAMBDARANK as RANKING_LAMBDARANK
+from mojoboost.tree import Tree
+
+
+def main() raises:
+    # 1. Mirrored constants.
+    if MULTICLASS != PARAMS_MULTICLASS:
+        raise Error("MULTICLASS mirror differs")
+    if LAMBDARANK != RANKING_LAMBDARANK:
+        raise Error("LAMBDARANK mirror differs from ranking.mojo")
+    if LAMBDARANK != POLICY_LAMBDARANK:
+        raise Error("LAMBDARANK mirror differs from device_policy.mojo")
+
+    var codes = all_objective_codes()
+    for i in range(len(codes)):
+        var c = codes[i]
+
+        # 2. Device-kernel membership, three ways.
+        if objective_gradients_on_device(c) != supports_device_objective(c):
+            raise Error("gradients_on_device differs at code ", c)
+        if objective_is_builtin(c) != is_builtin_objective(c):
+            raise Error("is_builtin differs from device_policy at ", c)
+        if objective_gradients_on_device(c) != (
+            gpu_objective_is_device_resident(c)
+        ):
+            raise Error("device residency differs from policy at ", c)
+
+        # 3. The scalar parameter default.
+        if objective_default_param(c) != objective_default_alpha(c):
+            raise Error("default param differs at code ", c)
+
+        # 4. The link, against both places that decide it independently.
+        var link = objective_link(c)
+        if c != MULTICLASS:
+            var booster = Booster(
+                List[Tree](), 0.0, 0.1, c, MonotoneConstraints()
+            )
+            var raw = 0.75
+            var expected: Float64
+            if link == LINK_SIGMOID:
+                expected = 1.0 / (1.0 + exp(-raw))
+            elif link == LINK_EXP:
+                expected = exp(raw)
+            else:
+                expected = raw
+            if booster.response(raw) != expected:
+                raise Error("Booster.response disagrees at code ", c)
+            var scaled = response_scale(c, [raw])
+            if scaled[0] != expected:
+                raise Error("response_scale disagrees at code ", c)
+
+            var device_code = response_for_objective(c)
+            var expected_device: Int
+            if link == LINK_SIGMOID:
+                expected_device = RESPONSE_SIGMOID
+            elif link == LINK_EXP:
+                expected_device = RESPONSE_EXP
+            else:
+                expected_device = RESPONSE_IDENTITY
+            if device_code != expected_device:
+                raise Error("response_for_objective disagrees at ", c)
+
+        # 5. The canonical name, against params' display name.
+        if c != LAMBDARANK and c != CUSTOM:
+            if objective_canonical_name(c) != objective_display_name(c):
+                raise Error("canonical name differs at code ", c)
+
+    # 6. Name resolution against params, for the names params accepts.
+    var names = objective_alias_names()
+    for i in range(len(names)):
+        var name = names[i]
+        if name == "lambdarank" or name == "custom":
+            continue
+        if objective_code_from_name(name) != objective_from_name(name):
+            raise Error("name resolution differs for '", name, "'")
+
+    # 7. The two names params refuses on purpose still raise there.
+    for i in range(len(names)):
+        var name = names[i]
+        if name != "lambdarank" and name != "custom":
+            continue
+        var raised = False
+        try:
+            _ = objective_from_name(name)
+        except:
+            raised = True
+        if not raised:
+            raise Error("params should still refuse '", name, "'")
+
+    print("mirror probe ok:", len(codes), "codes,", len(names), "names")
+```
+
+### Appendix C. `_eval.py` before against after
+
+Needs no build and no extension module: it loads both versions by path. The
+two path constants at the top were absolute to the session that ran it and
+need adjusting before a rerun.
+
+```
+git show ab25ad1:python/mojoboost/_eval.py > eval_before.py
+python3 diff_eval.py
+compared 408 cases
+PASS: no behavioral difference
+```
+
+```python
+"""Behavioral diff of _eval.py before and after the lane 21 rewrite.
+
+Loads both modules by path (no package import, no extension module) and
+compares every public answer, exception type, and exception message.
+"""
+
+import importlib.util
+import sys
+
+SCRATCH = (
+    "/private/tmp/claude-501/-Users-andrewhendel-CascadeProjects/"
+    "b1d30541-647a-4a5f-b760-48b9e5e30c1e/scratchpad"
+)
+AFTER_PATH = (
+    "/Users/andrewhendel/CascadeProjects/mojoboost/python/mojoboost/_eval.py"
+)
+
+
+def load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+before = load("eval_before", SCRATCH + "/eval_before.py")
+after = load("eval_after", AFTER_PATH)
+
+failures = []
+
+
+def cmp(label, fn_before, fn_after):
+    try:
+        a = ("ok", fn_before())
+    except Exception as exc:
+        a = (type(exc).__name__, str(exc))
+    try:
+        b = ("ok", fn_after())
+    except Exception as exc:
+        b = (type(exc).__name__, str(exc))
+    if a != b:
+        failures.append(f"{label}\n    before: {a!r}\n    after:  {b!r}")
+
+
+# 1. module constants
+CONSTS = [
+    "L2", "RMSE", "L1", "QUANTILE", "HUBER", "BINARY_LOGLOSS",
+    "BINARY_ERROR", "AUC", "MULTI_LOGLOSS", "MULTI_ERROR", "NDCG", "MAPE",
+    "FAIR", "POISSON", "GAMMA", "GAMMA_DEVIANCE", "TWEEDIE",
+    "CROSS_ENTROPY", "KLDIV", "AVERAGE_PRECISION", "MAP",
+    "REGRESSION", "BINARY", "MULTICLASS", "RANKING",
+]
+for name in CONSTS:
+    cmp(f"const {name}",
+        lambda n=name: getattr(before, n),
+        lambda n=name: getattr(after, n))
+
+# every public name the old module exported must still exist
+missing = [
+    n for n in dir(before)
+    if not n.startswith("__") and not hasattr(after, n)
+]
+if missing:
+    failures.append(f"public names dropped: {missing}")
+
+TASKS = [before.REGRESSION, before.BINARY, before.MULTICLASS, before.RANKING,
+         "not_a_task"]
+
+# 2. task_metrics
+for task in TASKS:
+    cmp(f"task_metrics({task!r})",
+        lambda t=task: before.task_metrics(t),
+        lambda t=task: after.task_metrics(t))
+
+# 3. resolve, over every canonical name, every alias, and junk, x every task
+NAMES = sorted(set(before._METRICS) | set(before._ALIASES)) + [
+    "AUC", "  rmse  ", "L2_Root", "nonsense", "", "ndcg ", 7, None,
+]
+for name in NAMES:
+    for task in TASKS:
+        cmp(f"resolve({name!r}, {task!r})",
+            lambda n=name, t=task: before.resolve(n, t),
+            lambda n=name, t=task: after.resolve(n, t))
+
+# 4. default_metric, over every objective spelling the regressor accepts
+OBJECTIVES = [
+    "regression", "regression_l2", "l2", "mean_squared_error", "mse",
+    "huber", "quantile", "mae", "regression_l1", "l1",
+    "mean_absolute_error", "poisson", "gamma", "tweedie", "mape",
+    "mean_absolute_percentage_error", "fair", "cross_entropy", "xentropy",
+    "lambdarank", "binary", "multiclass", "nonsense", "", None, 0,
+]
+
+
+def a_callable(raw, y):
+    return raw, y
+
+
+for task in TASKS:
+    for obj in OBJECTIVES + [a_callable]:
+        cmp(f"default_metric({task!r}, {obj!r})",
+            lambda t=task, o=obj: before.default_metric(t, o),
+            lambda t=task, o=obj: after.default_metric(t, o))
+    cmp(f"default_metric({task!r}) no objective",
+        lambda t=task: before.default_metric(t),
+        lambda t=task: after.default_metric(t))
+
+# 5. the mirrored tables themselves must be identical
+for table in ("_METRICS", "_ALIASES", "_DEFAULTS"):
+    cmp(f"table {table}",
+        lambda t=table: getattr(before, t),
+        lambda t=table: getattr(after, t))
+
+total = len(CONSTS) + len(TASKS) + len(NAMES) * len(TASKS) + len(TASKS) * (
+    len(OBJECTIVES) + 2
+) + 3
+print(f"compared {total} cases")
+if failures:
+    print(f"FAIL: {len(failures)} difference(s)")
+    for f in failures:
+        print("  " + f)
+    sys.exit(1)
+print("PASS: no behavioral difference")
+```

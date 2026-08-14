@@ -52,6 +52,7 @@ from .boosting import (
 from .goss import GossParams, goss_round
 from .sparse import SparseBinnedMatrix, SparseBinnedRows
 from .tree import Tree, node_bounds
+from .tree_parameters_extra import ExtraTreeParams, finish_leaf_output
 from .tree_sparse import (
     grow_tree_sparse,
     predict_row_sparse,
@@ -67,6 +68,7 @@ def _renew_leaf_values_sparse(
     weights: List[Float64],
     alpha: Float64,
     monotone: List[Int] = [],
+    extra: ExtraTreeParams = ExtraTreeParams(),
 ) raises:
     """LightGBM's RenewTreeOutput over the assignment `grow_tree_sparse`
     already produced: replace each leaf's Newton value with the
@@ -77,9 +79,26 @@ def _renew_leaf_values_sparse(
     A non-empty `monotone` clamps every renewed value back into its leaf's
     monotone interval, exactly as `_renew_leaf_values` does on the dense
     path: renewal without the clamp would discard the constraint the tree
-    was grown under (see monotone.mojo)."""
+    was grown under (see monotone.mojo).
+
+    `extra` carries `max_delta_step` and `path_smooth`, applied to a renewed
+    value as they are to a grown one and in the same order (cap and smooth
+    first, monotone interval on the result). Without this the three renewing
+    objectives would be the only ones to escape the cap the caller asked for.
+    An internal node still holds the finished value it was grown with, since
+    renewal rewrites leaves only, so it is the parent output its children
+    smooth toward."""
     var n_nodes = len(tree.feature)
     var bounds = node_bounds(tree, monotone)
+    var finish = extra.needs_leaf_finish()
+    var parent_output = List[Float64]()
+    if finish:
+        parent_output.resize(n_nodes, 0.0)
+        for node in range(n_nodes):
+            if tree.feature[node] < 0:
+                continue
+            parent_output[tree.left[node]] = tree.value[node]
+            parent_output[tree.right[node]] = tree.value[node]
     var leaf_residuals = List[List[Float64]]()
     var leaf_weights = List[List[Float64]]()
     for _ in range(n_nodes):
@@ -102,6 +121,14 @@ def _renew_leaf_values_sparse(
             )
         else:
             renewed = _percentile(leaf_residuals[node], alpha)
+        if finish:
+            renewed = finish_leaf_output(
+                renewed,
+                extra.max_delta_step,
+                extra.path_smooth,
+                len(leaf_residuals[node]),
+                parent_output[node],
+            )
         if len(bounds) > 0:
             renewed = bounds[node].clamp(renewed)
         tree.value[node] = renewed
@@ -195,6 +222,7 @@ def train_sparse(
                 renew_w,
                 renew_a,
                 signs,
+                params.tree.extra,
             )
 
         if grown.tree.n_leaves == 1 and abs(grown.tree.value[0]) < 1e-12:
@@ -284,6 +312,7 @@ def train_sparse_with_valid(
                 renew_w,
                 renew_a,
                 signs,
+                params.tree.extra,
             )
         if grown.tree.n_leaves == 1 and abs(grown.tree.value[0]) < 1e-12:
             if bagging_enabled(bagging) or goss.enabled:

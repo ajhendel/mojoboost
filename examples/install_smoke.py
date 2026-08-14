@@ -136,30 +136,32 @@ def rmse(y_true, y_pred):
 
 def diagnostics():
     rule("1. Diagnostics")
-    print(f"mojoboost                {mojoboost.__version__}")
-    print(f"package path             {mojoboost.__file__}")
-    print(f"extension                {mojoboost._mojoboost.__file__}")
-    print(f"python                   {sys.version.split()[0]}")
-    print(f"executable               {sys.executable}")
-    print(f"platform                 {platform.platform()}")
-    print(f"machine                  {platform.machine()}")
-    print(f"gpu_available()          {gpu_available()}")
-    for name in ("MOJOBOOST_DISABLE_GPU", "MOJOBOOST_AUTO_MIN_CELLS",
-                 "MOJOBOOST_NUM_WORKERS", "MOJOBOOST_PARALLEL_MIN_OPS"):
-        print(f"{name:<24} {os.environ.get(name, '<unset>')}")
-
-    if "site-packages" in mojoboost.__file__:
-        print("\nThis is an installed package.")
+    if hasattr(mojoboost, "show_versions"):
+        mojoboost.show_versions()
     else:
+        # Installs from before show_versions() existed. Same facts, by
+        # hand, so this script stays useful against an older wheel.
+        print(f"mojoboost                {mojoboost.__version__}")
+        print(f"package path             {mojoboost.__file__}")
+        print(f"extension                {mojoboost._mojoboost.__file__}")
+        print(f"python                   {sys.version.split()[0]}")
+        print(f"executable               {sys.executable}")
+        print(f"platform                 {platform.platform()}")
+        print(f"machine                  {platform.machine()}")
+        print(f"gpu_available()          {gpu_available()}")
+        for name in sorted(os.environ):
+            if name.startswith(("MOJOBOOST_", "MODULAR_")):
+                print(f"{name:<24} {os.environ[name]}")
         print(
-            "\nThis is a source checkout rather than an installed package,\n"
-            "so it shadows any wheel installed in the same environment.\n"
-            "Add `pixi run mojo --version` to a bug report from here."
+            "\nThis install predates mojoboost.show_versions(), so it cannot\n"
+            "say whether a GPU path was compiled into it. Upgrade to answer\n"
+            "that question."
         )
     print(
         "\nWhether an accelerator is available is a property of the build\n"
         "and not of this machine: Mojo resolves has_accelerator() at\n"
-        "compile time. See docs/DEVICE_SELECTION.md."
+        "compile time, so one wheel carries one answer to everybody who\n"
+        "installs it. See docs/DEVICE_SELECTION.md."
     )
 
 

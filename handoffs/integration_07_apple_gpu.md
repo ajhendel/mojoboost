@@ -200,14 +200,31 @@ vector once, and per round uploads only the tree that round grew (kilobytes)
 and folds it in with one kernel. Scoring round `i` costs one tree walk per
 row instead of `i` of them. It downloads the raw scores for the loss.
 
-**Deliberately not done here, and this is the A4 decision made explicitly.**
-The loss is computed on the host from `validation_raw()`, not with
-`validation_metric` on the device. A4 offered both and called host scoring
-the conservative default; it also removes the per-round tree walk, which is
-the expensive part. The device metric set (`METRIC_L2`, the log losses, the
-error rates) is not the objective loss set `_mean_loss` covers (huber,
-quantile, tweedie, fair, mape, gamma, poisson), and a stopping decision made
-from a different loss definition is a different run, not a faster one.
+**Where the loss is computed, which is the A4 decision made explicitly.**
+A4 offered two options, device metric reduction or host scoring from
+`validation_raw()`, and called host scoring the conservative default. Taking
+either one wholesale is wrong, so `device_loss_metric(objective)` decides
+per objective and the rule is exact agreement, not availability:
+
+| objective | loss reduced | why |
+| --- | --- | --- |
+| `SQUARED_ERROR` | device, `METRIC_L2` + `RESPONSE_IDENTITY` | `_mean_loss` sums `(raw - y)^2 / n`; the kernel sums `w*d*d` and divides by `check_metric_weight([], n)`, which is `n`. Term for term the same. |
+| `L1` | device, `METRIC_L1` + `RESPONSE_IDENTITY` | same correspondence. |
+| `BINARY_LOGISTIC` | host | `METRIC_BINARY_LOG_LOSS` exists and looks like a match. It is not: `_clamp_prob` floors at 1e-15 and `_clamp32` at 1e-7, because Float32 cannot hold `1 - 1e-15` apart from 1. A confidently wrong row is worth `-log(1e-15)` to the host and saturates at `-log(1e-7)` on the device, and confidently wrong rows are what a log-loss stopping decision turns on. |
+| the other eight | host | no device kernel for cross entropy, gamma, tweedie, mape, fair, poisson, huber, or quantile. |
+
+On the two device rows a round moves `n_valid / REDUCE_BLOCK` floats home
+instead of `n_valid`, and two host passes over the validation rows and one
+allocation per round go away. On every other row the run stops on exactly
+the loss definition the CPU trainer stops on, which is the property worth
+more than the transfer. The residual difference on the device rows is the
+one this whole path already carries: Float32 terms over Float32 labels, so
+the value agrees to Float32 tolerance rather than bit for bit.
+
+Anyone extending `device_loss_metric` should be able to put the host
+expression and the kernel expression side by side and see them agree,
+clamps included. That test is written into its docstring because the next
+reader will otherwise add binary log loss to it.
 
 **Escape hatch.** `valid_scoring=VALID_SCORE_HOST` (the default) or
 `MOJOBOOST_GPU_VALID_SCORING=host`. On that setting `train_gpu_with_valid`
@@ -439,7 +456,12 @@ so use a problem whose stopping round is not on a knife edge). Two,
 per-round losses are separated well beyond Float32 noise. Three, the device
 scorer's `validation_raw()` after round `i` matches a host-computed running
 raw vector to `atol=1e-4`, which is the tolerance
-`tests/parallel/test_gpu_predict.mojo` already uses.
+`tests/parallel/test_gpu_predict.mojo` already uses. Four, the dispatch in
+`device_loss_metric`: on a `SQUARED_ERROR` run the device-reduced loss and
+`_mean_loss` over that round's `validation_raw()` agree to Float32
+tolerance, and on a `BINARY_LOGISTIC` run `device_loss_metric` returns -1,
+so the clamp difference cannot reach a stopping decision. That fourth
+assertion is the one that fails loudest if someone widens the mapping.
 
 ```
 MOJOBOOST_NUM_WORKERS=1 nice -n 19 tools/with_build_lock.sh \
@@ -516,8 +538,9 @@ this task the entry should read
   "OBJECTIVE_SOURCE_AUTO", "OBJECTIVE_SOURCE_DEVICE", "OBJECTIVE_SOURCE_HOST",
   "SPLIT_SEARCH_AUTO", "SPLIT_SEARCH_DEVICE", "SPLIT_SEARCH_HOST",
   "VALID_SCORE_AUTO", "VALID_SCORE_DEVICE", "VALID_SCORE_HOST",
-  "device_gradients", "grow_tree_gpu", "resolve_objective_source",
-  "resolve_split_search", "resolve_valid_scoring", "train_custom_gpu",
+  "device_gradients", "device_loss_metric", "grow_tree_gpu",
+  "resolve_objective_source", "resolve_split_search",
+  "resolve_valid_scoring", "train_custom_gpu",
   "train_gpu", "train_gpu_with_valid", "train_multiclass_gpu"
 ]
 ```

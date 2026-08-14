@@ -79,7 +79,6 @@ testable, on a machine with no accelerator. The device half is
 produces.
 """
 
-from .categorical import CatBitset, cat_empty
 from .interaction import extend_branch
 from .monotone import (
     MONOTONE_FREE,
@@ -565,7 +564,7 @@ struct LeafFrontier(Movable):
             leaf.depth + 1,
             subtraction_builds_left(cand.n_left, cand.n_right),
             extend_branch(leaf.branch, split.feature),
-            bounds,
+            bounds^,
             split^,
         )
 

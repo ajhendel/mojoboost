@@ -67,8 +67,10 @@ import platform
 import sys
 
 __all__ = [
+    "BUNDLED_RUNTIME_LIBS",
     "PHASES",
     "PHASE_NAMES",
+    "WATCHED_ENV",
     "InstallDescription",
     "PhaseTiming",
     "StartupReport",
@@ -206,8 +208,12 @@ WATCHED_ENV = (
 
 #: The four MAX runtime libraries the extension links, in the order
 #: `packaging/build_wheel.sh` bundles them. Named here so a report can say
-#: which of them a wheel is missing, which is the failure that turns into
-#: an unexplained ImportError.
+#: which of them a macOS wheel is missing, which is the failure that turns
+#: into an unexplained ImportError.
+#:
+#: macOS only. The Linux builder stages an ELF closure by soname rather
+#: than this fixed set, so `missing_runtime_libs` applies this list to the
+#: `dylibs` layout and to nothing else.
 BUNDLED_RUNTIME_LIBS = (
     "libKGENCompilerRTShared",
     "libAsyncRTMojoBindings",

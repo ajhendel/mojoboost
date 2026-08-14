@@ -117,6 +117,7 @@ status word, and the row in the sections below is the whole story.
 | Split gains in a dump | deferred | yes | no | no | no | n/a | n/a | no | `src/mojoboost/serialize.mojo` does not write split gains (see the comment at the leaf reader), so every dumped node carries `split_gain: None` and `has_split_gain: False`. `python/mojoboost/inspection.py` picks gains up automatically once a binding exposes `_mojoboost.split_gains`; `bindings/_mojoboost.mojo` defines no such function today |
 | Dask adapter (`mojoboost.dask`) | deferred | yes | no | no | yes | n/a | n/a | yes | `python/mojoboost/dask.py` validates partition metadata, plans ranks, negotiates capabilities, and predicts from model bytes, all against a fake backend in `python/tests/parallel/test_dask_contract.py`. No backend is registered by default, so `fit` raises `DistributedNotAvailable` before touching a cluster. `DaskRuntime` has never run against a live cluster |
 | Explainable device selection (`mojoboost.device_selection`) | deferred | yes | no | no | yes | n/a | n/a | yes | `python/mojoboost/device_selection.py` with 54 tests in `python/tests/parallel/test_device_selection.py`. The estimators do not call it: `_Base._resolve_device` calls `_mojoboost.resolve_device`, so `src/mojoboost/device.mojo` remains the only policy that decides anything. Its `CROSSOVER_RULES` table is empty by design |
+| Startup diagnostics (`mojoboost.diagnostics`) | deferred | yes | no | no | no | n/a | n/a | yes | `python/mojoboost/diagnostics.py` formats phase durations that something else measured, over the ten-phase contract in `src/mojoboost/initialization.mojo`. Not a LightGBM capability, so it has no parity row of its own. Landed after this audit's main pass and integrated nowhere: nothing imports either file, `mojoboost.__all__` does not carry it, and neither `python/tests/` nor `tests/` has a suite for it |
 | Exclusive feature bundling | deferred | yes | no | no | yes | n/a | n/a | n/a | `src/mojoboost/efb.mojo` with `tests/parallel/test_efb.mojo` in `pixi run test`. No module in `src/mojoboost/` imports it, it is not exported from `src/mojoboost/__init__.mojo`, and no parameter turns it on |
 | Distributed transport | deferred | yes | no | no | yes | n/a | n/a | n/a | `src/mojoboost/distributed_transport.mojo` with `tests/parallel/test_distributed_transport.mojo` in `pixi run test`. `src/mojoboost/distributed.mojo` does not import it and it is not exported. No process has connected to another |
 | LightGBM model file interop | deferred | yes | no | no | yes | no | n/a | n/a | `src/mojoboost/lgbm_model_io.mojo` with `tests/parallel/test_lgbm_model_io.mojo` in `pixi run test`. No caller, no export, and no test reads a file LightGBM actually wrote |
@@ -609,13 +610,18 @@ quietly fixed, because each is somebody's in-flight work:
    export from `src/mojoboost/__init__.mojo`. Their suites run in
    `pixi run test`, which makes them look supported from the test output
    alone. Section 0 scores each one.
-5. **Four Python modules are reachable only by an import the compatibility
-   policy calls private.** `python/mojoboost/cv.py`, `python/mojoboost/inspection.py`, `python/mojoboost/dask.py`, and
-   `python/mojoboost/device_selection.py` work when imported by path, and section 2 of
-   `docs/COMPATIBILITY_POLICY.md` says importing a `mojoboost` submodule
-   other than `basic` is not public. Either the names move into
+5. **Five Python modules are reachable only by an import the compatibility
+   policy calls private.** `python/mojoboost/cv.py`,
+   `python/mojoboost/inspection.py`, `python/mojoboost/dask.py`,
+   `python/mojoboost/device_selection.py`, and
+   `python/mojoboost/diagnostics.py` work when imported by path, and
+   section 2 of `docs/COMPATIBILITY_POLICY.md` says importing a `mojoboost`
+   submodule other than `basic` is not public. Either the names move into
    `mojoboost.__all__` or the policy grows an exception; until one of those
    happens their rows stay `partial` or `deferred`.
+   `python/mojoboost/_public_api_plan.py` is a lane's written proposal for
+   that export block. It is data, nothing imports it, and no name has moved
+   yet, which is why the rows above still read as they do.
 6. **Two docstrings outrank their code and are wrong.** The module
    docstring of `src/mojoboost/device.mojo` says multiclass is CPU only,
    which `gpu_supports` in the same file contradicts. The

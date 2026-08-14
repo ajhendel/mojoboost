@@ -44,7 +44,11 @@ from .monotone import (
     midpoint,
     monotone_sign,
 )
-from .sampling import select_node_features, select_tree_features
+from .sampling import (
+    check_feature_fractions,
+    select_split_features,
+    select_tree_features,
+)
 from .sparse import SparseBinnedMatrix, SparseBinnedRows
 from .split import SplitInfo
 from .tree import Tree, TreeParams, _leaf_value, _search
@@ -171,6 +175,21 @@ def grow_tree_sparse(
         raise Error("gradient/hessian length must equal n_rows")
     params.constraints.check_features(data.n_features)
     params.monotone.check_features(data.n_features)
+    check_feature_fractions(
+        params.feature_fraction,
+        params.feature_fraction_bynode,
+        params.feature_fraction_bylevel,
+    )
+    # This grower applies the whole `extra` bundle, so it validates it the way
+    # the dense grower does: against this dataset, before the first histogram.
+    params.extra.check(
+        data.n_features,
+        params.num_leaves,
+        params.max_depth,
+        params.min_data_in_leaf,
+    )
+    var max_delta_step = params.extra.max_delta_step
+    var path_smooth = params.extra.path_smooth
     var signs = params.monotone.active_signs()
     var tree_features = select_tree_features(
         data.n_features,
@@ -211,28 +230,44 @@ def grow_tree_sparse(
         data, grad, hess, order, root_entries, root_totals, tree_features
     )
     var root_branch = List[Int]()
+    # The root's value comes before its search, because path smoothing makes a
+    # candidate's children shrink toward it; the root has no parent and so
+    # smooths toward 0.0. Same ordering as `tree.grow_tree`.
+    var root = tree._add_node(
+        _leaf_value(
+            root_hist,
+            params.lambda_reg,
+            params.lambda_l1,
+            value_feature,
+            len(root_rows),
+            0.0,
+            max_delta_step,
+            path_smooth,
+        ),
+        Float64(len(root_rows)),
+    )
     var root_split = _search(
         root_hist,
         len(root_rows),
         params,
         params.constraints.allowed_features(root_branch),
-        select_node_features(
+        select_split_features(
             tree_features,
+            params.feature_fraction_bylevel,
             params.feature_fraction_bynode,
             params.feature_fraction_seed,
             tree_index,
+            0,
             0,
         ),
         depth=0,
         missing_bins=data.missing_bin,
         monotone=signs,
         cats=data.cats,
-    )
-    var root = tree._add_node(
-        _leaf_value(
-            root_hist, params.lambda_reg, params.lambda_l1, value_feature
-        ),
-        Float64(len(root_rows)),
+        node=root,
+        tree_index=tree_index,
+        parent_output=tree.value[root],
+        grower_applies_extra=True,
     )
 
     var frontier = List[_SparseLeafState]()
@@ -335,14 +370,32 @@ def grow_tree_sparse(
 
         var parent_bounds = frontier[best_i].bounds.copy()
         var split_sign = monotone_sign(signs, split.feature)
+        # Cap and smoothing first, monotone interval on the result, the order
+        # the candidate was scored with. Both children smooth toward the value
+        # the parent already emits.
+        var parent_output = tree.value[parent_node]
         var left_value = parent_bounds.clamp(
             _leaf_value(
-                left_hist, params.lambda_reg, params.lambda_l1, value_feature
+                left_hist,
+                params.lambda_reg,
+                params.lambda_l1,
+                value_feature,
+                len(left_rows),
+                parent_output,
+                max_delta_step,
+                path_smooth,
             )
         )
         var right_value = parent_bounds.clamp(
             _leaf_value(
-                right_hist, params.lambda_reg, params.lambda_l1, value_feature
+                right_hist,
+                params.lambda_reg,
+                params.lambda_l1,
+                value_feature,
+                len(right_rows),
+                parent_output,
+                max_delta_step,
+                path_smooth,
             )
         )
         if split_sign != MONOTONE_FREE and left_value > right_value:
@@ -368,11 +421,13 @@ def grow_tree_sparse(
             len(left_rows),
             params,
             allowed,
-            select_node_features(
+            select_split_features(
                 tree_features,
+                params.feature_fraction_bylevel,
                 params.feature_fraction_bynode,
                 params.feature_fraction_seed,
                 tree_index,
+                child_depth,
                 left_node,
             ),
             depth=child_depth,
@@ -380,17 +435,23 @@ def grow_tree_sparse(
             monotone=signs,
             bounds=children.left.copy(),
             cats=data.cats,
+            node=left_node,
+            tree_index=tree_index,
+            parent_output=left_value,
+            grower_applies_extra=True,
         )
         var right_split = _search(
             right_hist,
             len(right_rows),
             params,
             allowed,
-            select_node_features(
+            select_split_features(
                 tree_features,
+                params.feature_fraction_bylevel,
                 params.feature_fraction_bynode,
                 params.feature_fraction_seed,
                 tree_index,
+                child_depth,
                 right_node,
             ),
             depth=child_depth,
@@ -398,6 +459,10 @@ def grow_tree_sparse(
             monotone=signs,
             bounds=children.right.copy(),
             cats=data.cats,
+            node=right_node,
+            tree_index=tree_index,
+            parent_output=right_value,
+            grower_applies_extra=True,
         )
 
         frontier[best_i] = _SparseLeafState(

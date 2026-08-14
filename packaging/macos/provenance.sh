@@ -77,6 +77,11 @@ esac
 # variable becomes visible instead of confusing.
 REQUESTED_TARGET=${MOJOBOOST_MACOS_TARGET:-sdk-default}
 
+# What the wheel's zip entries were stamped from. Recorded because it is the
+# one input a later rebuild has to match before its digest can be compared with
+# this one, and because "unset" is the answer that explains a mismatch.
+SDE=${SOURCE_DATE_EPOCH:-unset}
+
 {
     printf '{\n'
     printf '  "schema": 1,\n'
@@ -96,6 +101,7 @@ REQUESTED_TARGET=${MOJOBOOST_MACOS_TARGET:-sdk-default}
     field metal_toolchain "$METAL"
     field metal_version "${METAL_VERSION:-unknown}"
     field requested_deployment_target "$REQUESTED_TARGET"
+    field source_date_epoch "$SDE"
     printf '  "has_accelerator_at_build": "%s"\n' "$ACCEL"
     printf '}\n'
 } >"$OUT"

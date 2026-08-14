@@ -27,14 +27,17 @@ A host build of the same node costs:
 | --- | --- |
 | `Histogram.reset`: `n_features * n_bins` cells zeroed | nothing |
 | `_accumulate_subset`: scattered adds over the node's rows | `node_rows * n_slots` |
-| row-id readback: `4 * node_rows` bytes, plus one `synchronize()` | `node_rows` |
+| materializing the node's rows on the host's permutation copy | the *parent's* rows, and only once per split |
+| the tree's active-row snapshot | `n_active`, **once per tree** (§3) |
 
 The host has a fixed term too — the zeroing pass — so a tiny leaf is *not*
 free on the host, and that is the first thing a reader should take from this
 note. What the host does not pay is the launch, the 306 KB download, and the
-conversion; what it pays instead is a readback proportional to the node and a
-slower per-row accumulation. Whether that trade wins is an empirical question
-about four machine constants, and the answer is not in this repository.
+conversion; what it pays instead is a slower per-row accumulation, a cheap
+per-split partition mirror, and one whole-permutation readback per tree that
+every host leaf in that tree shares. Whether that trade wins is an empirical
+question about eight machine constants, and the answer is not in this
+repository.
 
 Deep in a leaf-wise tree most nodes are small. `num_leaves` defaults to 31,
 and the leaves that survive to the frontier late in a tree are the ones that
@@ -111,33 +114,59 @@ Two invariants follow, and both are checkable:
 
 ### Where a host build gets its rows
 
-`row_source_is_host` names three cases where the host already has them and
-one where it does not:
+The obvious mechanism is not available, and this is the design's sharpest
+constraint.
 
-- `ROWS_HOST_IDENTITY` — the unbagged root. `begin_tree` seeds the identity
-  permutation with a kernel; the host can reproduce `0..n_active` without
-  reading anything.
-- `ROWS_HOST_BAG` — the bagged root. The bag is the host's own list, in the
-  order it handed to `begin_tree`.
-- `ROWS_HOST_MIRROR` — any descendant of a node whose rows the host already
-  holds. The host re-runs the same stable partition on its own list;
-  `partition_range_host` in `gpu_active_rows.mojo` is that reference model,
-  and it agrees with the device index for index by construction (both are
-  stable in *buffer* order, not row-id order).
-- `ROWS_DEVICE_COPY` — everything else. `4 * node_rows` bytes and one
-  synchronization.
+**A per-range readback is not expressible.** `DeviceContext.enqueue_copy`
+copies the whole source buffer — confirmed by `download_grad_hess` in
+`gpu_objectives_native.mojo`, which copies an `n_rows` buffer into an
+`n_rows * n_classes` host buffer and gets `n_rows` elements. So
+`download_rows` moves `4 * n_rows` bytes whatever the node's size, and a
+"read back just this node's rows" call needs either a device buffer allocated
+per call (an allocation per elected leaf) or a sub-buffer / offset-and-count
+API this project does not have. A per-node readback of `4 * n_rows` would
+cost *more* than the `12 * F * B` download it was meant to avoid on any
+dataset with more rows than `3 * F * B`.
 
-`child_row_source` encodes the consequence: **a host-owned subtree pays its
-readback once, at the subtree's root.** That matters more than it looks. A
-leaf elected for a host build is small by hypothesis, so its whole subtree is
-small, and the readback that admitted it also admits every node beneath it.
-The transfer is amortized over the subtree, not over one node.
+**So the design does not use one.** The host takes one whole-permutation
+snapshot per tree and maintains it itself:
 
-A full host mirror of the permutation was considered and rejected: maintaining
-it for every node costs a host partition per split over the parent's rows,
-which is the dominant cost of CPU tree growth and would be paid on the large
-leaves the GPU is there to handle. The mirror is lazy, per subtree, and only
-where a placement was accepted.
+- `snapshot_nanos(n_active, costs)` — one `download_rows` and one sync,
+  `4 * n_active` bytes, **once per tree**.
+- Every node alive at snapshot time reads `snapshot[begin : end]` for free;
+  the ranges are already host-tracked in `LeafRangeTable`.
+- A split re-partitions `rows_dev[parent.begin : parent.end]` and provably
+  touches nothing outside it (`gpu_active_rows.mojo` states that invariant
+  explicitly). The host keeps the snapshot valid by mirroring that one
+  partition on its own copy with `partition_range_host` — the same stable,
+  buffer-order rule, agreeing with the device index for index. Cost is one
+  partition over the *parent's* rows (`host_materialize_nanos`), and it
+  materializes **both** children at once, so the sibling never pays again.
+- The root needs no snapshot at all: `ROWS_HOST_IDENTITY` unbagged (the host
+  reproduces `0..n_active` without reading anything), `ROWS_HOST_BAG`
+  otherwise (it is the host's own list, in the order it handed to
+  `begin_tree`).
+
+The snapshot is charged **in full to the one leaf that first elects to use
+it** (`DECLINE_SNAPSHOT_NOT_PAID` when that leaf's own saving cannot cover
+it); every later host leaf in the tree reads it for nothing. Deliberately
+conservative: charging the first leaf the whole price cannot make a tree
+slower than the pure-device path, whereas amortizing over an *expected* number
+of host leaves would be a guess about a distribution nobody has measured. The
+cost of that conservatism is that a tree whose savings are spread thinly
+across many leaves never snapshots at all — E4 and E6 in §9 are what would say
+whether that matters.
+
+`ROWS_DEVICE_COPY` stays in the vocabulary, and `row_transfer_bytes` still
+prices it, so that if a per-range copy ever becomes expressible the model can
+compare the two. Nothing in the design depends on it.
+
+A *full* host mirror — mirroring every split from the root down, with no
+snapshot — was considered and rejected: it costs a host partition per split
+over the parent's rows, which is the dominant cost of CPU tree growth and
+would be paid on exactly the large leaves the GPU is there to handle. The
+mirroring here is lazy: only along the paths to elected leaves, and only after
+the snapshot has made the ancestors cheap.
 
 ## 4. Substitutability: the arithmetic that has to match
 
@@ -249,12 +278,20 @@ this. It changes which device accumulated a buffer, not how many are live.
 Four clauses. The first two are enforced by the module's structure; the third
 and fourth are obligations on the integration.
 
-1. **Placement is a pure function of shape.** `place_leaf` reads node row
-   counts, dataset shape, active feature count, launch count, run
-   configuration, and cost coefficients. It reads no clock, no queue depth,
-   and no completion signal. Two runs on one machine place every leaf
-   identically, and a run where the host build happens to overlap the device
-   places them the same as one where it does not.
+1. **Placement is a pure function of its arguments.** `place_leaf` reads node
+   row counts, dataset shape, active feature count, launch count, run
+   configuration, the snapshot flag, and cost coefficients. It reads no
+   clock, no queue depth, and no completion signal. Two runs on one machine
+   place every leaf identically, and a run where the host build happens to
+   overlap the device places them the same as one where it does not.
+
+   The snapshot flag is the one argument that is tree *state* rather than
+   tree shape, which is why it is passed in (`HybridContext.with_snapshot`)
+   rather than remembered inside the scheduler. It advances exactly once per
+   tree, at the grower's own deterministic node order, and nothing about when
+   a build finished can reach it. Placement is thus a pure function of
+   (shape, configuration, snapshot state), and the snapshot state is itself a
+   deterministic function of the tree traversal.
 
 2. **Completion order is not consumption order.** `WaveBarrier` holds the
    announcement order (the order the grower will consume the results) and the
@@ -315,21 +352,26 @@ trainer does.
 Nothing below is implemented in this lane. Each item names the file it would
 touch and what it needs.
 
-### 8.1 `gpu_active_rows.mojo` — a per-range row download
+### 8.1 `gpu_active_rows.mojo` — nothing required
 
-Today `download_rows` copies the whole `n_rows` buffer and synchronizes, and
-`download_range` calls it and slices. A host build of a small leaf needs
-`4 * node_rows` bytes, not `4 * n_rows`:
+`download_rows` as it exists today is the snapshot. The integration calls it
+once per tree, at the first leaf that can pay for it, and maintains the result
+with `partition_range_host`, which also already exists and is already the
+tested reference model for the device partition.
 
-```
-def download_range_only(mut self, node: Int) raises -> List[Int]:
-    # enqueue_copy of rows_dev[window.begin : window.end] into a host buffer
-    # sized by the window, then synchronize.
-```
+An optional optimization, not a dependency: a genuine per-range readback would
+let a single elected leaf skip the whole-buffer cost. It is not expressible
+against today's `enqueue_copy` (§3), so it would need one of
 
-Without it, the readback term in the cost model is `4 * n_rows` for every
-node and the model will decline almost everything. This is the single change
-that decides whether hybrid scheduling is worth integrating.
+1. a `node_rows`-sized `DeviceBuffer` allocated per call, then a compaction
+   kernel in the shape of the existing `_copy_back_kernel` — portable, needs
+   no new API, costs an allocation per elected leaf (poolable by rounding the
+   size up to a power of two);
+2. `enqueue_copy` gaining an element-count or offset parameter; or
+3. a `create_sub_buffer`-style view on `DeviceBuffer`.
+
+Option 1 is the only one available without upstream changes, and it is worth
+doing only if E6 shows the per-tree snapshot is what limits the design.
 
 ### 8.2 `histogram.mojo` — the fixed-point replica builder
 
@@ -353,18 +395,25 @@ path.
 
 ### 8.3 `train_gpu.mojo` — the call sites
 
-Four, in `grow_tree_gpu`'s host-search path only:
+Five, in `grow_tree_gpu`'s host-search path only:
 
 1. After `builder.set_features(tree_features)`, construct the
-   `HybridContext` once per tree and the `CacheEpochs` once per session.
-2. At the root, `place_leaf` with `ROWS_HOST_IDENTITY` or `ROWS_HOST_BAG`.
+   `HybridContext` once per tree (with `n_active_rows` and
+   `snapshot_taken=False`) and the `CacheEpochs` once per session.
+2. At the root, `place_leaf` with `tree_row_source(is_root=True, bagged)`.
    The root is the one node whose rows are free on the host, and also the
    largest, so it will be declined on cost — but it is where a mirror mode
    gets its first comparison for free.
 3. Replacing the `if n_left <= n_right` block: call `plan_split`, then either
    `builder.build_leaf(direct_node)` or the host builder, then
    `subtract_histogram` exactly as today.
-4. Around the frontier scan: `barrier.open()` / `expect` / `complete` /
+4. When a placement comes back with `takes_snapshot`, call
+   `builder.rows.download_rows()` once, keep the result as the tree's host
+   permutation, and replace the context with `ctx.with_snapshot(True)` for
+   the rest of the tree. Every later split mirrors its own partition into
+   that array with `partition_range_host`, which keeps it valid without
+   re-reading it. `begin_tree` drops it.
+5. Around the frontier scan: `barrier.open()` / `expect` / `complete` /
    `require_ready()`.
 
 The `_GpuLeafState` frontier is untouched, the subtraction is untouched, the
@@ -388,12 +437,13 @@ variable.
 In order. Each one can kill the design, and the first two do not require any
 of the integration above.
 
-**E1 — Calibrate the seven coefficients.** A microbenchmark over
+**E1 — Calibrate the eight coefficients.** A microbenchmark over
 `node_rows ∈ {4, 16, 64, 256, 1k, 4k, 16k, 64k}` × `n_features ∈ {10, 100,
 1000}` × `n_bins ∈ {16, 64, 255}`, timing `enqueue_leaf`, `download_raw`,
-`histogram_from_host`, `build_histogram_subset_into`, `Histogram.reset`, and a
-range readback separately. Fills `HybridCosts` and produces the `evidence_id`
-its constructor demands. Until this runs, every placement is
+`histogram_from_host`, `build_histogram_subset_into`, `Histogram.reset`,
+`partition_range_host`, and `download_rows` separately. Fills `HybridCosts`
+and produces the `evidence_id` its constructor demands. Until this runs,
+every placement is
 `DECLINE_COSTS_UNMEASURED`.
 
 **E2 — The bitwise replica claim.** Build the same node's histogram both ways
@@ -420,13 +470,19 @@ legitimate result and should be recorded as one.
 **E5 — Overlap.** The model in §1 assumes the host build and the device work
 are serial. They need not be: the host can accumulate the small child while
 the device partitions and while the *other* subtree's kernels run. Measure the
-achieved overlap before claiming it; a `synchronize()` in the row readback
-serializes more than it looks.
+achieved overlap before claiming it; the `synchronize()` inside the snapshot
+serializes more than it looks, though it is paid once per tree rather than per
+node.
 
-**E6 — The subtree amortization.** Measure how much of the win comes from
-`ROWS_HOST_MIRROR` (one readback per host-owned subtree) versus per-node
-readbacks. If the subtree rule carries the design, the row-source bookkeeping
-is the important part of this lane and the cost model is secondary.
+**E6 — Is the snapshot the limit?** Two questions, and they decide where the
+next effort goes. First: how often does the first candidate leaf fail
+`DECLINE_SNAPSHOT_NOT_PAID` — that is, how often does a tree have savings
+worth having but no single leaf big enough to buy the snapshot? Second: once a
+snapshot is taken, what fraction of host-build time goes to
+`partition_range_host` materialization versus accumulation? If the first
+number is large, the per-range readback of §8.1 option 1 becomes worth
+building; if the second is large, the lazy mirroring is the wrong shape and
+the snapshot should be retaken instead of maintained.
 
 ## 10. Status
 

@@ -25,15 +25,42 @@ No implementation, test, README, packaging file, or workflow was touched.
 
 ## What was run, and what was not
 
-**Nothing was executed.** No Python, no Mojo, no pixi, no pytest, no build,
-no benchmark, and in particular **`tools/check_parity.py` was not run**, so
-this lane cannot claim the script passes. It was verified statically
-instead, with `grep`, `sed`, and `awk` over the two files it reads:
+**Run: `python3 tools/check_parity.py`, and nothing else.** No Mojo, no
+pixi, no pytest, no build, no benchmark. The checker is standard library
+only, reads two files, and writes nothing, and a checker nobody has run is
+not evidence of anything, so it was run:
 
-- every one of the 99 repository paths the contract cites resolves to a file
+```
+checking the LightGBM parity contract
+  (live import checked)
+  131 rows marked supported
+  20 capabilities scored against the levels
+  ok
+```
+
+`(live import checked)` means the built `_mojoboost.so` in
+`python/mojoboost/` imported, so check 4 ran against the live package and
+not only against the parsed source.
+
+**The new checks were also shown to fail when they should**, against
+mutated copies of the contract held in memory. A check that only ever
+passes is decoration. All of these produced the intended message: a level
+cell that is not `yes`/`no`/`n/a`; a `deferred` row marked publicly
+reachable; a row marked integrated but not implemented; an empty evidence
+cell; a `REQUIRED_SUPPORTED` row downgraded; a watched `deferred` row whose
+probe resolves; a watch naming a row that does not exist; a missing level
+table; a level renamed in `docs/CAPABILITY_LEVELS.md` but not in the
+contract; and a missing `docs/CAPABILITY_LEVELS.md`. Every one of the six
+probe kinds was checked against a symbol that exists and one that does not,
+and an unknown probe kind raises rather than resolving to False.
+
+Before running it, the same facts were checked statically with `grep`,
+`sed`, and `awk` over the two files it reads:
+
+- every one of the 102 repository paths the contract cites resolves to a file
   that exists
 - every status cell in the contract is one of the five vocabulary words
-  (142 `supported`, 61 `deferred`, 45 `different`, 37 `partial`, 17
+  (142 `supported`, 62 `deferred`, 45 `different`, 37 `partial`, 17
   `unsupported`)
 - all 104 names in `REQUIRED_SUPPORTED` appear as a `supported` row
 - all 36 keys in `STALE_DEFERRED_WATCHES` appear as a row, and every one of
@@ -45,8 +72,10 @@ instead, with `grep`, `sed`, and `awk` over the two files it reads:
   `REQUIRED_PREDICT_ARGS` exists in the file the script parses
 - every cited `tests/*.mojo` suite is named in a `pixi.toml` task
 
-The first thing the integration owner should do is run
-`python3 tools/check_parity.py`.
+The integration owner should run it again after assembling the round. This
+tree moves under a reader: `python/mojoboost/diagnostics.py`, `_compat.py`,
+and `_public_api_plan.py` all appeared after this lane's main audit pass
+and are accounted for in the second pass (section 0 and known gap 5).
 
 ## What the audit read
 
@@ -231,7 +260,13 @@ Ranked by how much a wrong call costs.
 5. **`cv`, `CVBooster`, and the inspection rows at `partial`.** The whole
    argument is section 2 of `docs/COMPATIBILITY_POLICY.md`. If the policy's
    author intended that clause to cover only the private helpers, these
-   rows are `supported` today and should be moved.
+   rows are `supported` today and should be moved. There is now a concrete
+   trigger to watch: `python/mojoboost/_public_api_plan.py`, a proposal for
+   the export block that lane 06 (`prompts/06_PUBLIC_PYTHON_API_INTEGRATION.txt`)
+   is expected to apply to `python/mojoboost/__init__.py`. **The day
+   `cv` enters `mojoboost.__all__`, these rows become `supported` and the
+   `Dask adapter` watch in `tools/check_parity.py` fires on its own.** That
+   is the check working, not a failure: re-audit the row and update it.
 6. **Sparse at `partial` rather than `supported`.** Two independent
    reasons, either of which alone would keep it there: the feature gaps
    listed in the row, and the untested-in-CI problem from section 3. The
@@ -293,7 +328,10 @@ ranker; `REQUIRED_BASIC_METHODS` gained `Dataset.feature_name` and
 
 ## 6. What this lane did not do
 
-- It did not run anything, so no claim here is a test result.
+- It ran `tools/check_parity.py` and nothing else. No suite was run, so no
+  status word above is backed by a test result: where a row cites a test as
+  evidence, the claim is that the suite exists and that a pixi task runs
+  it, not that this lane watched it pass.
 - It did not upgrade any row on the strength of a parallel handoff. The
   handoffs in `handoffs/` were read for context only; every status word
   above cites a file in the tree.

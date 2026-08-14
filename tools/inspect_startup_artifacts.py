@@ -88,6 +88,10 @@ DEFAULT_PACKAGE_DIR = ROOT / "python" / "mojoboost"
 # The four MAX runtime libraries packaging/build_wheel.sh bundles. Keep in
 # sync with the LIBS array there and with BUNDLED_RUNTIME_LIBS in
 # python/mojoboost/diagnostics.py.
+#
+# macOS only, and checked only against the `.dylibs` layout. The Linux
+# builder stages an ELF closure by soname, so this fixed set of four would
+# fail every correct Linux wheel.
 BUNDLED_RUNTIME_LIBS = (
     "libKGENCompilerRTShared",
     "libAsyncRTMojoBindings",
@@ -523,21 +527,35 @@ def check(result: dict) -> list:
             )
 
         if kind == "wheel":
+            rewrite = (
+                "packaging/build_wheel.sh"
+                if result["runtime_layout"] == "dylibs"
+                else "packaging/linux/build_wheel_linux.sh"
+            )
             for entry in record["search_paths"]:
-                if entry.startswith(("@loader_path", "@executable_path")):
+                # The three package-relative spellings, one per loader.
+                # None of them is absolute, so the guard below would let
+                # them through anyway; skipping them first keeps abspath
+                # from inventing a cwd-relative path for a token.
+                if entry.startswith(
+                    ("@loader_path", "@executable_path", "$ORIGIN", "${ORIGIN}")
+                ):
                     continue
-                inside = os.path.abspath(entry).startswith(
-                    package_dir + os.sep
-                ) or os.path.abspath(entry) == package_dir
-                if os.path.isabs(entry) and not inside:
+                if not os.path.isabs(entry):
+                    continue
+                resolved = os.path.abspath(entry)
+                inside = (
+                    resolved == package_dir
+                    or resolved.startswith(package_dir + os.sep)
+                )
+                if not inside:
                     problems.append(
                         (
                             "error",
                             "%s searches %s, which is outside the package;"
-                            " the rpath rewrite in"
-                            " packaging/build_wheel.sh did not take, and"
-                            " this artifact only loads on the machine that"
-                            " built it" % (name, entry),
+                            " the rpath rewrite in %s did not take, and this"
+                            " artifact only loads on the machine that built"
+                            " it" % (name, entry, rewrite),
                         )
                     )
 
