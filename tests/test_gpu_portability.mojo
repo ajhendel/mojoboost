@@ -235,7 +235,10 @@ def test_the_shipping_gate_admits_the_weakest_device() raises:
             tiling,
             shapes[i + 1],
             MAX_BINS,
-            _COMPILED_VARIANTS,
+            # `KernelFeatures` is `Copyable, Movable` and not
+            # `ImplicitlyCopyable`, so a comptime value of it cannot cross
+            # into a runtime argument on its own.
+            materialize[_COMPILED_VARIANTS](),
         )
         i += 2
 
