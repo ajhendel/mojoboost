@@ -67,6 +67,26 @@ BUILD_HOST_MARKERS = (
     b"conda-bld",
 )
 
+# These two MAX runtime libraries contain Modular's fixed Homebrew config
+# fallback. It is product data in the upstream binary, not a path captured from
+# the machine that assembled this wheel. Keep the exception exact: another
+# /opt/homebrew path, or the same path in any other member, still fails R6.
+VENDORED_RUNTIME_LITERALS = {
+    "libAsyncRTMojoBindings.dylib": (b"/opt/homebrew/etc/modular",),
+    "libKGENCompilerRTShared.dylib": (b"/opt/homebrew/etc/modular",),
+}
+
+
+def build_host_hits(member_name: str, blob: bytes,
+                    extra_markers: tuple[bytes, ...] = ()) -> list[str]:
+    """Return build-host markers after removing exact upstream literals."""
+    screened = blob
+    basename = member_name.rsplit("/", 1)[-1]
+    for literal in VENDORED_RUNTIME_LITERALS.get(basename, ()):
+        screened = screened.replace(literal, b"")
+    return [mark.decode() for mark in BUILD_HOST_MARKERS + extra_markers
+            if mark in screened]
+
 # Members that have no business in a distribution.
 FORBIDDEN_MEMBERS = re.compile(
     r"(^|/)(__pycache__/|\.pytest_cache/|build/|dist/|tests?/|\.DS_Store$|.*\.pyc$)"
@@ -319,7 +339,7 @@ def _check_macho(zf, names, pkg, target, res) -> None:
 
         # R6. Nothing from the build machine anywhere in the bytes, not only in
         # the load commands. Debug paths and embedded strings count.
-        hits = [mark.decode() for mark in BUILD_HOST_MARKERS if mark in blob]
+        hits = build_host_hits(name, blob)
         res.rule("R6", not hits, f"{short}: build host strings {hits or 'none'}")
 
 
@@ -335,7 +355,7 @@ def _check_elf(zf, names, pkg, res) -> None:
         if blob[:4] != b"\x7fELF":
             res.rule("R5", False, f"{short}: not an ELF object")
             continue
-        hits = [mark.decode() for mark in BUILD_HOST_MARKERS if mark in blob]
+        hits = build_host_hits(name, blob)
         res.rule("R6", not hits, f"{short}: build host strings {hits or 'none'}")
         glibc = sorted({v.decode() for v in re.findall(rb"GLIBC_2\.\d+", blob)},
                        key=lambda s: int(s.rsplit(".", 1)[1]))

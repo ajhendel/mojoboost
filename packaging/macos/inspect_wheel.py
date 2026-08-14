@@ -64,7 +64,7 @@ sys.path.insert(0, str(MATRIX_DIR))
 try:
     # The repository's only Mach-O load command parser, and its list of strings
     # that must not survive a build. Imported, never copied.
-    from validate_artifact import BUILD_HOST_MARKERS, macho_info
+    from validate_artifact import BUILD_HOST_MARKERS, build_host_hits, macho_info
 except ImportError as exc:  # pragma: no cover - a broken checkout, not a case
     raise SystemExit(
         f"cannot import packaging/matrix/validate_artifact.py ({exc}). "
@@ -525,16 +525,12 @@ def inspect(path: Path, rep: Report) -> dict:
         rep.section("content scans")
         host_hits: list[str] = []
         secret_hits: list[str] = []
-        markers = tuple(BUILD_HOST_MARKERS) + EXTRA_HOST_MARKERS
         for info in zf.infolist():
             if info.is_dir():
                 continue
             blob = blobs.get(info.filename) or zf.read(info.filename)
-            vendored = info.filename.startswith(f"{pkg}.dylibs/")
-            for mark in markers:
-                if mark in blob:
-                    tail = " (vendored MAX runtime)" if vendored else ""
-                    host_hits.append(f"{info.filename}: {mark.decode()}{tail}")
+            for mark in build_host_hits(info.filename, blob, EXTRA_HOST_MARKERS):
+                host_hits.append(f"{info.filename}: {mark}")
             for pattern, label in SECRET_PATTERNS:
                 if pattern.search(blob):
                     secret_hits.append(f"{info.filename}: {label}")
@@ -544,12 +540,10 @@ def inspect(path: Path, rep: Report) -> dict:
             not host_hits,
             f"no build-machine paths in any member: {host_hits or 'none found'}",
             ["A hit in _mojoboost.so is this project's bug: the rpath rewrite or",
-             "the build did not clean up. A hit inside a vendored MAX library is",
-             "a property of Modular's build, not of this repository, and it",
-             "cannot be fixed here. It still blocks a release, because the",
-             "string ships either way; the decision is recorded in",
-             "handoffs/release_02_macos_wheels.md rather than made by this",
-             "script."] if host_hits else [],
+             "the build did not clean up. Exact, reviewed product literals in",
+             "vendored MAX libraries are handled by validate_artifact.py; any",
+             "other machine-specific string still blocks the release."]
+            if host_hits else [],
         )
         rep.check("C11", not secret_hits,
                   f"no secret-shaped strings: {secret_hits or 'none found'}",

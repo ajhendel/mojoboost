@@ -64,6 +64,7 @@ python-build = "*"
 setuptools = ">=77"
 wheel = "*"
 pip = "*"
+twine = "*"
 
 [feature.pkg.tasks]
 build-wheel = "packaging/build_wheel.sh"

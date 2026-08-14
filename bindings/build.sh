@@ -15,6 +15,6 @@
 # place the flags are written.
 set -e
 cd "$(dirname "$0")/.."
-pixi run mojo build --emit shared-lib -I src -I bindings \
+pixi run mojo build --emit shared-lib -strip-file-prefix "$PWD/" -I src -I bindings \
     bindings/_mojoboost.mojo -o python/mojoboost/_mojoboost.so
 echo "built python/mojoboost/_mojoboost.so"
