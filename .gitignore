@@ -1,0 +1,9 @@
+# pixi environments
+.pixi/
+
+# Mojo build artifacts
+*.mojopkg
+build/
+
+# macOS
+.DS_Store

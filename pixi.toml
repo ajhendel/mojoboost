@@ -1,0 +1,12 @@
+[workspace]
+authors = ["Andrew Hendel <ajhendel@gmail.com>"]
+channels = ["https://conda.modular.com/max", "conda-forge"]
+name = "mojoboost"
+platforms = ["osx-arm64", "linux-64", "linux-aarch64"]
+version = "0.1.0"
+
+[tasks]
+test = "mojo run -I src tests/test_mojoboost.mojo"
+
+[dependencies]
+mojo = ">=1.0.0,<2"
