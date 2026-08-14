@@ -6,18 +6,19 @@ repository preparation and read-only verification can be automated.
 
 ## Status
 
-As of 2026-08-14, pending trusted publishers for `mojoboost` are configured
-on TestPyPI and PyPI for `mojoboost-ml/mojoboost`, workflow
-`release-provenance.yml`, and environments `testpypi` and `pypi`
-respectively. The matching GitHub environments exist, are restricted by
-deployment branch policy, and the production `pypi` environment requires an
-approval from `ajhendel`. No API token is used.
+As of 2026-08-14, the matching GitHub environments `testpypi` and `pypi`
+exist and are restricted to the `main` branch. Neither environment requires
+a reviewer. Pending trusted publishers still need to be configured on
+TestPyPI and PyPI for `mojoboost-ml/mojoboost`, workflow
+`release-provenance.yml`, and the corresponding environment. No API token is
+needed.
 
 The release workflow exists at `.github/workflows/release-provenance.yml`,
 all third-party actions are pinned, and its self-hosted Apple-silicon Metal
 runner is registered. The normal CI run for the setup commit passed on both
-x86-64 and ARM Linux. The pending publishers have not been exercised yet, so
-neither index has a `mojoboost` project created by this repository.
+x86-64 and ARM Linux. The pending publishers have not been configured or
+exercised yet, so neither index has a `mojoboost` project created by this
+repository.
 
 The version in the repository is 0.1.0 and no artifact of it has been
 published anywhere.
@@ -72,10 +73,11 @@ The order matters, and the two claims are deliberately separated.
 4. [Cut a production release](#5-the-production-release) only after the
    section 12 release gate passes.
 
-Step 1 is complete. Steps 2 and 3 are now mechanically available, but each is
-an external publication and must be started deliberately. Step 4 remains
-gated by the compatibility policy and by target validation in the platform
-matrix.
+The repository-side preparation for step 1 is complete, but the owner must
+still register the two pending publishers on the package indexes. Steps 2 and
+3 are mechanically available after that account-side setup, but each is an
+external publication and must be started deliberately. Step 4 remains gated
+by the compatibility policy and by target validation in the platform matrix.
 
 ## 1. Bind the name: pending trusted publishers
 
