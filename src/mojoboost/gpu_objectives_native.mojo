@@ -38,7 +38,10 @@ Python or Mojo code over host-side `List[Float64]`, there is no device image
 of it, and `train_custom_gpu`'s contract (one call per round over the whole
 row set, then `check_custom_grad_hess`) is unchanged by anything here. The
 host path is preserved, not replaced; `supports_device_objective` is the one
-place that says which objective goes which way.
+place that says which objective goes which way, and it now answers from
+`objective_gradients_on_device` in objective_registry.mojo rather than from a
+second if-chain over the same codes, so the capability table has one
+definition and the GPU module is the dependent side of it.
 
 Precision. Apple GPUs have no Float64, so the device carries raw scores,
 labels, weights, gradients, and hessians as Float32, where the CPU trainer
@@ -84,12 +87,12 @@ from .boosting import (
     MAPE,
     POISSON,
     QUANTILE,
-    SQUARED_ERROR,
     TWEEDIE,
     _POISSON_MAX_DELTA_STEP,
 )
 from .gpu_active_rows import GpuActiveRows
 from .gpu_tiling import derive_block_threads, query_device_caps
+from .objective_registry import objective_gradients_on_device
 
 # Clamp on every `exp` argument. exp(60) is 1.1e26, four orders of magnitude
 # inside the Float32 maximum, so the poisson hessian's extra
@@ -126,20 +129,26 @@ comptime UNROUTED_LEAF = Int32(-1)
 def supports_device_objective(objective: Int) -> Bool:
     """Whether `objective` has a closed-form per-row derivative these kernels
     implement. False for CUSTOM, whose callback lives on the host, and for
-    any code the built-in trainer does not define."""
-    return (
-        objective == SQUARED_ERROR
-        or objective == BINARY_LOGISTIC
-        or objective == CROSS_ENTROPY
-        or objective == POISSON
-        or objective == GAMMA
-        or objective == TWEEDIE
-        or objective == HUBER
-        or objective == QUANTILE
-        or objective == L1
-        or objective == MAPE
-        or objective == FAIR
-    )
+    any code the built-in trainer does not define.
+
+    The answer comes from `objective_gradients_on_device` in
+    objective_registry.mojo, which is the one table of objective facts; this
+    function is the name the GPU modules already import and stays as the
+    device-side spelling of that question. The two used to be independent
+    if-chains over the same eleven codes, which is a capability table
+    maintained twice: the registry's docstring named this file as the
+    mirror to delete, and this delegation is that deletion, in the
+    direction the registry asked for (the GPU module depends on the
+    metadata module, never the reverse, so nothing drags `max.gpu.*` into
+    params.mojo or the CLI).
+
+    The set is unchanged, value for value: `objective_gradients_on_device`
+    returns `objective_is_builtin`, whose eleven codes are exactly the arms
+    the chain here enumerated, and softmax multiclass is still absent from
+    both because it is served by `refresh_softmax` and
+    `fill_softmax_grad_hess` rather than by `_grad_hess_kernel`.
+    """
+    return objective_gradients_on_device(objective)
 
 
 def device_fixed_scale(total: Float64) raises -> Float32:
@@ -291,6 +300,9 @@ def _grad_hess_kernel(
         grad[unsafe_offset=r] = w * _dev_sign(raw_r - y)
         hess[unsafe_offset=r] = w
     else:
+        # Squared error, and the only arm an unlisted code could reach.
+        # `fill_grad_hess` refuses every code `supports_device_objective`
+        # rejects before the launch, so nothing else arrives here.
         grad[unsafe_offset=r] = w * (raw_r - y)
         hess[unsafe_offset=r] = w
 
@@ -513,6 +525,54 @@ struct GradMagnitudes(Copyable, Movable):
 
     var grad: Float64
     var hess: Float64
+
+
+def enqueue_abs_sum(
+    ctx: DeviceContext,
+    mut grad_dev: DeviceBuffer[DType.float32],
+    mut hess_dev: DeviceBuffer[DType.float32],
+    mut part_dev: DeviceBuffer[DType.float32],
+    n_rows: Int,
+) raises:
+    """Enqueue `_abs_sum_kernel` over `n_rows` rows into a caller-owned
+    partial buffer of `2 * SUM_BLOCKS` Float32. Does not copy and does not
+    synchronize.
+
+    Split out of `magnitude_sums` so that the staged round driver
+    (`MagnitudeReader` in gpu_fused_round.mojo) can enqueue the reduction,
+    enqueue work that does not depend on the scale, and only then wait. It
+    is the same launch with the same fixed grid and block counts, so both
+    callers produce bit-identical partials.
+    """
+    ctx.enqueue_function[_abs_sum_kernel](
+        grad_dev.unsafe_ptr(),
+        hess_dev.unsafe_ptr(),
+        part_dev.unsafe_ptr(),
+        Int32(n_rows),
+        grid_dim=SUM_BLOCKS,
+        block_dim=SUM_THREADS,
+    )
+
+
+def sum_abs_partials(
+    partials: MutPointer[Float32, MutAnyOrigin],
+) raises -> GradMagnitudes:
+    """Fold a downloaded partial buffer into the two totals.
+
+    Ascending block index, gradient plane then hessian plane, accumulated in
+    Float64. Every caller sums in this one order over partials the one
+    kernel produced, so the totals, the scales derived from them, and every
+    histogram quantized with those scales agree bit for bit whichever driver
+    enqueued the reduction.
+    """
+    var g_total = 0.0
+    var h_total = 0.0
+    for i in range(SUM_BLOCKS):
+        g_total += Float64(partials.unsafe_load(i))
+        h_total += Float64(partials.unsafe_load(SUM_BLOCKS + i))
+    if not isfinite(g_total) or not isfinite(h_total):
+        raise Error("gradients and hessians must be finite")
+    return GradMagnitudes(g_total, h_total)
 
 
 struct GpuObjectiveState(Movable):
@@ -909,28 +969,20 @@ struct GpuObjectiveState(Movable):
         total is more accurate than a Float32 device-side final reduction
         would be, and the readback is the round's only device-to-host
         transfer.
+
+        The kernel launch and the host-side fold are `enqueue_abs_sum` and
+        `sum_abs_partials`, so a caller that needs the reduction split
+        across a wait (`MagnitudeReader`) runs the same two halves this
+        method runs back to back rather than a second copy of them.
         """
-        ctx.enqueue_function[_abs_sum_kernel](
-            grad_dev.unsafe_ptr(),
-            hess_dev.unsafe_ptr(),
-            self.part_dev.unsafe_ptr(),
-            Int32(self.n_rows),
-            grid_dim=SUM_BLOCKS,
-            block_dim=SUM_THREADS,
+        enqueue_abs_sum(
+            ctx, grad_dev, hess_dev, self.part_dev, self.n_rows
         )
         ctx.enqueue_copy(
             dst_ptr=self.host_part.unsafe_ptr(), src_buf=self.part_dev
         )
         ctx.synchronize()
-        var src = self.host_part.unsafe_ptr()
-        var g_total = 0.0
-        var h_total = 0.0
-        for i in range(SUM_BLOCKS):
-            g_total += Float64(src.unsafe_load(i))
-            h_total += Float64(src.unsafe_load(SUM_BLOCKS + i))
-        if not isfinite(g_total) or not isfinite(h_total):
-            raise Error("gradients and hessians must be finite")
-        return GradMagnitudes(g_total, h_total)
+        return sum_abs_partials(self.host_part.unsafe_ptr())
 
     def download_raw(mut self, ctx: DeviceContext) raises -> List[Float64]:
         """The current raw scores, row-major, as Float64.

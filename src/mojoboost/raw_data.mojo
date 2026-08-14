@@ -12,14 +12,25 @@ The two binning paths agree bit for bit on the same logical matrix (see
 sparse.mojo), so which one a caller took is not observable in the fitted
 bins, and a model trained either way predicts identically.
 
-What this type does not do yet is pick a trainer. `transform_dense` and
-`transform_sparse` return different types, because the dense grower reads a
-`BinnedMatrix` and the sparse one a `SparseBinnedMatrix`, so a caller still
-branches once on `is_sparse` after binning. Folding the two into a single
-binned representation, so that `dataset.Dataset`, boosting, ranking,
-multiclass, and the prediction paths take sparse input without knowing it,
-is the remaining step; until it lands, sparse input reaches training only
-through the sparse-only entry points, and `Dataset` stays dense.
+Who consumes this
+-----------------
+`trainset.Dataset` is the consumer. `Dataset.from_raw` takes a `RawData` by
+value, bins it through the two methods below, and owns the result; the
+sparse constructors (`Dataset.from_csc`, `Dataset.from_csr`) and every
+dataset that retains its input (`keep_raw=True`, which is what `subset` and
+reference binning need) go through it. The one path that does not build a
+`RawData` is the dense `Dataset(features, ...)` constructor, which is handed
+a borrowed matrix it must not copy; it bins that matrix in place with the
+same `binning.fit_bins` this type dispatches to, so the two agree by
+construction rather than by duplication.
+
+`transform_dense` and `transform_sparse` still return different types,
+because the dense grower reads a `BinnedMatrix` and the sparse one a
+`SparseBinnedMatrix`. The branch has moved rather than vanished: `Dataset`
+takes it once, at construction, and holds whichever matrix binning produced,
+so callers of `train_dataset` and its counterparts no longer see it. Folding
+the two into a single binned representation is still the step that would
+remove it outright.
 """
 
 from .binning import BinMapper, BinnedMatrix, fit_bins
@@ -98,6 +109,24 @@ struct RawData(Copyable, Movable):
         histogram builders need. O(nnz + n_features), no densification."""
         return RawData.from_csc(csr.to_csc())
 
+    @staticmethod
+    def none() -> RawData:
+        """A `RawData` holding nothing, for a field that must exist whether
+        or not the input was retained.
+
+        `Dataset` keeps its raw matrix only when it was built with
+        `keep_raw=True`, and a struct field cannot be absent, so a dataset
+        that dropped its input holds this. `is_empty` is what distinguishes
+        it from real data; every accessor that would read the matrix checks
+        first and raises rather than reading a zero-sized one.
+        """
+        return RawData(List[Float64](), _empty_csc(0, 0), 0, 0, False)
+
+    def is_empty(self) -> Bool:
+        """Whether this holds no matrix at all, as `RawData.none()` does. A
+        real matrix has positive dimensions, which the constructors check."""
+        return self.n_rows < 1 or self.n_features < 1
+
     def nnz(self) -> Int:
         """Stored entries for a sparse matrix, every cell for a dense one."""
         if self.is_sparse:
@@ -115,6 +144,82 @@ struct RawData(Copyable, Movable):
         for f in range(self.n_features):
             out.append(self.values[f * self.n_rows + r])
         return out^
+
+    def check_rows(self, rows: List[Int]) raises:
+        """The row-selection contract `subset` enforces, on its own so a
+        caller can check a selection before building anything from it.
+
+        Rows must be strictly ascending, in range, and there must be at
+        least one. Ascending is not tidiness: a CSC column stores its row
+        indices in ascending order, so a selection that reordered or
+        repeated rows would either produce a matrix that violates that
+        invariant or need a sort per column to repair it. Rejecting the
+        selection says so once, where the caller can fix it, instead of
+        making every later reader pay for the repair.
+        """
+        if len(rows) < 1:
+            raise Error("a subset needs at least one row")
+        for i in range(len(rows)):
+            if rows[i] < 0 or rows[i] >= self.n_rows:
+                raise Error("subset row index out of range")
+            if i > 0 and rows[i] <= rows[i - 1]:
+                raise Error("subset rows must be strictly ascending")
+
+    def subset(self, rows: List[Int]) raises -> RawData:
+        """The named rows, in the same representation, as their own matrix.
+
+        This is row selection on the *raw* input, before any binning, which
+        is what makes it safe to bin the result on its own: the rows that
+        were left out had no say in the edges the subset fits. Selecting
+        rows out of an already binned matrix would carry the whole matrix's
+        quantiles into the part, which is the leak `trainset.Dataset.subset`
+        exists to avoid.
+
+        Sparse input stays sparse: the entries of the rows that were not
+        taken are dropped and the survivors are renumbered, so the result
+        costs O(nnz) and never allocates a dense cell.
+        """
+        self.check_rows(rows)
+        var n = len(rows)
+        if not self.is_sparse:
+            var out = List[Float64](capacity=n * self.n_features)
+            out.resize(n * self.n_features, 0.0)
+            for f in range(self.n_features):
+                var src = f * self.n_rows
+                var dst = f * n
+                for i in range(n):
+                    out[dst + i] = self.values[src + rows[i]]
+            return RawData(
+                out^, _empty_csc(n, self.n_features), n, self.n_features, False
+            )
+
+        # Old row -> its position in the subset, -1 for a row not taken.
+        var position = List[Int](capacity=self.n_rows)
+        position.resize(self.n_rows, -1)
+        for i in range(n):
+            position[rows[i]] = i
+        var row_index = List[Int]()
+        var values = List[Float64]()
+        var offsets = List[Int](capacity=self.n_features + 1)
+        offsets.append(0)
+        for f in range(self.n_features):
+            var start = self.csc.col_offsets[f]
+            var end = self.csc.col_offsets[f + 1]
+            for e in range(start, end):
+                var p = position[self.csc.row_index[e]]
+                if p >= 0:
+                    # `rows` ascends, so `p` does too within the column and
+                    # the result is canonical CSC without a sort.
+                    row_index.append(p)
+                    values.append(self.csc.values[e])
+            offsets.append(len(values))
+        return RawData(
+            List[Float64](),
+            CscMatrix(row_index^, values^, offsets^, n, self.n_features),
+            n,
+            self.n_features,
+            True,
+        )
 
     def fit_mapper(
         self,

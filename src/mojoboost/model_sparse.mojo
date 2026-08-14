@@ -12,6 +12,15 @@ is row-oriented, and it never materializes a dense row: at each node it looks
 up that one feature in the row's own entries by binary search, falling back
 to the feature's zero bin when the entry is absent. Cost per row is
 O(depth * log nnz_in_row), against O(n_features) to densify a row.
+
+Categorical features are carried end to end, not excluded: `fit_csc` fits
+their tables with `fit_categorical_spec_csc`, the grower searches category
+partitions through the matrix's own `cats`, and `predict_csr` resolves a
+stored code through `BinMapper.bin_value` (so an unseen code takes the
+unknown bin) and an absent entry through the feature's zero bin, which for a
+categorical column is category code 0's bin -- or the unknown bin when code 0
+was not kept. `sparse.absent_is_unknown` is how a caller finds out which of
+the two a fitted column got.
 """
 
 from std.math import exp
@@ -29,6 +38,7 @@ from .boosting import (
 from .bagging import BaggingParams
 from .boosting_sparse import train_multiclass_sparse, train_sparse
 from .goss import GossParams
+from .sampling import ClassBaggingParams
 from .model import Model, MulticlassModel
 from .sparse import (
     CscMatrix,
@@ -52,16 +62,33 @@ def fit_csc(
     goss: GossParams = GossParams.disabled(),
     use_missing: Bool = True,
     categorical_features: List[Int] = [],
+    init_score: List[Float64] = [],
+    class_bagging: ClassBaggingParams = ClassBaggingParams.disabled(),
 ) raises -> Model:
     """Fit on a sparse matrix without densifying it. Same arguments and
     semantics as `fit`; the implicit zeros are numerical zeros (see
-    sparse.mojo)."""
+    sparse.mojo).
+
+    `categorical_features` names the columns to bin as category tables rather
+    than quantiles, exactly as in `fit`: `fit_categorical_spec_csc` counts an
+    absent entry as category code 0, which is what it is, and the fitted
+    tables, tie-breaking, and unknown-category bin are the dense ones.
+    `init_score` and `class_bagging` carry their `train_sparse` meanings."""
     var mapper = fit_bins_csc(
         csc, max_bins, categorical_features, use_missing
     )
     var data = transform_csc(mapper, csc)
     var booster = train_sparse(
-        data, target, objective, params, sample_weight, alpha, bagging, goss
+        data,
+        target,
+        objective,
+        params,
+        sample_weight,
+        alpha,
+        bagging,
+        goss,
+        init_score,
+        class_bagging,
     )
     return Model(mapper^, booster^)
 
@@ -76,15 +103,17 @@ def fit_multiclass_csc(
     bagging: BaggingParams = BaggingParams.disabled(),
     use_missing: Bool = True,
     categorical_features: List[Int] = [],
+    goss: GossParams = GossParams.disabled(),
 ) raises -> MulticlassModel:
     """Fit a softmax multiclass model on a sparse matrix, labels in
-    0..n_classes-1."""
+    0..n_classes-1. `goss` draws one gradient-based sample per round, shared
+    by every class's tree in that round, as in `fit_multiclass`."""
     var mapper = fit_bins_csc(
         csc, max_bins, categorical_features, use_missing
     )
     var data = transform_csc(mapper, csc)
     var booster = train_multiclass_sparse(
-        data, labels, n_classes, params, sample_weight, bagging
+        data, labels, n_classes, params, sample_weight, bagging, goss
     )
     return MulticlassModel(mapper^, booster^)
 

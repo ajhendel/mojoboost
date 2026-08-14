@@ -36,14 +36,24 @@ which is the one automated defense against this document aging into marketing.
 
 ## Targets
 
-| Target id | Artifact | Expected filename | Status |
-|---|---|---|---|
-| `macos-arm64-cp314` | wheel | `mojoboost-0.1.0-cp314-cp314-macosx_26_0_arm64.whl` | `designed` |
-| `macos-arm64-cp314-lowered` | wheel | `mojoboost-0.1.0-cp314-cp314-macosx_12_0_arm64.whl` | `designed` |
-| `linux-x86_64-cp314` | wheel | `mojoboost-0.1.0-cp314-cp314-manylinux_2_28_x86_64.whl` | `designed` |
-| `linux-aarch64-cp314` | wheel | `mojoboost-0.1.0-cp314-cp314-manylinux_2_28_aarch64.whl` | `designed` |
-| `macos-x86_64` | none | none | `unsupported` |
-| `sdist` | none | none | `unsupported` |
+| Target id | Artifact | Expected filename | Status | Index-publishable |
+|---|---|---|---|---|
+| `macos-arm64-cp314` | wheel | `mojoboost-0.1.0-cp314-cp314-macosx_26_0_arm64.whl` | `designed` | yes |
+| `macos-arm64-cp314-lowered` | wheel | `mojoboost-0.1.0-cp314-cp314-macosx_12_0_arm64.whl` | `designed` | yes |
+| `linux-x86_64-cp314` | wheel | `mojoboost-0.1.0-cp314-cp314-linux_x86_64.whl` | `designed` | no |
+| `linux-aarch64-cp314` | wheel | `mojoboost-0.1.0-cp314-cp314-linux_aarch64.whl` | `designed` | no |
+| `linux-x86_64-cp314-manylinux` | wheel | `mojoboost-0.1.0-cp314-cp314-manylinux_2_28_x86_64.whl` | `designed` | yes, once measured |
+| `linux-aarch64-cp314-manylinux` | wheel | `mojoboost-0.1.0-cp314-cp314-manylinux_2_28_aarch64.whl` | `designed` | yes, once measured |
+| `macos-x86_64` | none | none | `unsupported` | n/a |
+| `sdist` | none | none | `unsupported` | n/a |
+
+The last column is the `publishable` field, and it is the one that stops a
+plausible mistake. The two plain Linux rows are the wheels the builder produces
+when every input is left at its default. Their tags promise nothing about glibc
+and every index rejects them, so they are honest artifacts that ship as files
+and never as an upload. The two `-manylinux` rows are the same builder run with
+`tag_policy=manylinux`, and they are reached by measuring a floor, never by
+renaming a file.
 
 And the source install, which is how every current user actually installs
 mojoboost:
@@ -192,28 +202,46 @@ number.
 
 ## Linux
 
-No Linux wheel builder exists, and porting the macOS one is not a matter of
-flags. `packaging/build_wheel.sh` calls `install_name_tool` and `codesign`,
-neither of which has a Linux counterpart. The ELF equivalent, `patchelf` with
-an `$ORIGIN` RUNPATH plus an `auditwheel repair`, is a different program with
-different failure modes.
+A Linux wheel builder exists. `packaging/linux/build_wheel_linux.sh` is a
+separate program from the macOS one rather than a port of it, which is what the
+platforms require: `packaging/build_wheel.sh` calls `install_name_tool` and
+`codesign`, neither of which has a Linux counterpart, and the ELF side instead
+walks the extension's `DT_NEEDED` closure, stages it into `mojoboost/.libs`, and
+sets an `$ORIGIN` RUNPATH. `.github/workflows/release-linux.yml` runs it on a
+runner per architecture, with a clean-install job in a container that is
+deliberately not the build image.
 
-Two numbers have to be measured before either Linux tag is published:
+What that builder does **not** do is decide the tag for you. It reads
+`MOJOBOOST_TAG_POLICY`, defaults to `plain`, and emits `linux_<arch>`. The
+workflow's `tag_policy` input defaults to `plain` for the same reason. This is
+the point of the split rows in the table above, and it was worth writing down
+because this document previously claimed the opposite in both directions: it
+said no builder existed, and it named a `manylinux_2_28` file that no default
+build has ever produced.
 
-- **The glibc floor.** `manylinux_2_28` in the target rows is the floor
-  `pixi.lock` was solved against, which is a statement about the build
-  environment, not a measurement of the shipped objects. The real floor is the
-  highest `GLIBC_` symbol version any bundled object references.
+Two numbers still have to be measured before either `-manylinux` row is
+published:
+
+- **The glibc floor.** `manylinux_2_28` in those rows is the floor `pixi.lock`
+  was solved against, which is a statement about the build environment, not a
+  measurement of the shipped objects. The real floor is the highest `GLIBC_`
+  symbol version any bundled object references. `validate_artifact.py` rule R5f
+  reads it from the wheel, and
   `packaging/matrix/smoke/clean_install_linux.sh` reads it with `readelf` on
-  the target.
+  the target. The plain rows say `unmeasured` for their installer floor rather
+  than repeating the solved number as though it were a result.
 - **The bundled library set.** The four names in the Linux rows are the macOS
   set with a different extension. The Linux runtime layout has not been
   inspected, so treat that list as a guess until `readelf -d` on a real build
-  says otherwise.
+  says otherwise. Nothing currently catches an error in it:
+  `validate_artifact.py` rule R2b compares `bundled_dylibs` on macOS only, so
+  on Linux that list is documentation rather than a checked contract.
 
 Both Linux platforms already run the full test suite in CI on every push, on
-`ubuntu-latest` and `ubuntu-24.04-arm`. The source install is `tested`; only the
-artifact is missing.
+`ubuntu-latest` and `ubuntu-24.04-arm`, so the source install is `tested`. What
+is missing on Linux is no longer the builder or the workflow. It is a build that
+has actually been run: every Linux row is `designed`, no wheel has been produced
+by either tag policy, and no clean install has happened.
 
 ## Artifact classes this matrix does not cover
 
@@ -224,7 +252,7 @@ document read as more complete than it is.
 
 | Artifact | Built by | Covered here |
 |---|---|---|
-| Python wheel | `packaging/build_wheel.sh` | yes, the whole document |
+| Python wheel | `packaging/build_wheel.sh` (macOS), `packaging/linux/build_wheel_linux.sh` (Linux) | yes, the whole document |
 | C ABI shared library | `capi/build.sh` | no |
 | Command line tool | `cli/build.sh` | no |
 
@@ -320,7 +348,7 @@ neither delocate nor auditwheel nor an install of the thing it inspects.
 | Rule | Checks |
 |---|---|
 | R1 | The filename's tag matches a declared target, and the name and version match the matrix |
-| R2 | Exactly one extension module, and exactly the declared bundled runtime libraries |
+| R2 | Exactly one extension module (R2a), and exactly the declared bundled runtime libraries (R2b, macOS only) |
 | R3 | No `__pycache__`, test, or build directory members |
 | R4 | `Requires-Python` matches the target's interpreter, and a license file ships |
 | R5a | One architecture, the one on the label. No fat binaries |

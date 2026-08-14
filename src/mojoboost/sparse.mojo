@@ -43,6 +43,16 @@ of bounds or quietly binning the wrong rows.
 Index widths are the caller's problem only at the boundary: indices are
 `Int` here, so a producer holding 32-bit index arrays widens them on the way
 in. `validate` bounds every index against the matrix shape either way.
+
+Validation, once, at one place
+------------------------------
+`CscMatrix.validate` and `CsrMatrix.validate` check the raw form;
+`SparseBinnedMatrix.validate` checks the binned one, including the
+categorical rules stated at the bottom of this module. Every consumer
+assumes all of it, so the check lives here rather than being re-derived by
+each of them: the CPU trainers call it once per fit, and the device builder
+calls it before uploading. `check_sparse_categorical_semantics` is the same
+check with its findings returned instead of discarded.
 """
 
 from std.math import isnan
@@ -55,6 +65,7 @@ from .binning import (
     no_missing_bins,
 )
 from .categorical import (
+    UNKNOWN_BIN,
     CategoricalSpec,
     _MAX_CATEGORY,
     _keep_most_frequent,
@@ -644,6 +655,72 @@ struct SparseBinnedMatrix(Copyable, Movable):
     def nnz(self) -> Int:
         return len(self.bin)
 
+    def validate(self) raises:
+        """Structural and categorical validation of the binned form.
+
+        The counterpart of `CscMatrix.validate` one level down, and the one
+        authoritative statement of what a `SparseBinnedMatrix` must be. Every
+        consumer of this structure -- the CPU grower, the entry partition,
+        the device upload -- assumes all of it, and each of them used to
+        assume a different subset: the device builder checked row and bin
+        ranges inline, the accumulators checked nothing, and the categorical
+        rules were stated only in the GPU categorical module, where a CPU
+        caller could not reach them without pulling in a device dependency.
+        Callers now check once, here, at the point a matrix enters training.
+
+        Costs one pass over the stored entries, so it belongs once per fit
+        and not once per tree.
+        """
+        var nnz = len(self.bin)
+        if self.n_rows < 1 or self.n_features < 1:
+            raise Error("binned sparse matrix must have positive dimensions")
+        if self.n_bins < 1 or self.n_bins > 256:
+            raise Error("binned sparse matrix must have 1 to 256 bins")
+        if len(self.row_index) != nnz:
+            raise Error("row_index and bin must have equal length")
+        if len(self.col_offsets) != self.n_features + 1:
+            raise Error("col_offsets must have length n_features + 1")
+        if self.col_offsets[0] != 0:
+            raise Error("col_offsets must start at 0")
+        if self.col_offsets[self.n_features] != nnz:
+            raise Error("col_offsets must end at nnz")
+        if len(self.default_bin) != self.n_features:
+            raise Error("default_bin must have one entry per feature")
+        if len(self.missing_bin) != self.n_features:
+            raise Error("missing_bin must have one entry per feature")
+        for f in range(self.n_features):
+            var lo = self.col_offsets[f]
+            var hi = self.col_offsets[f + 1]
+            if hi < lo:
+                raise Error("col_offsets must be non-decreasing")
+            if Int(self.default_bin[f]) >= self.n_bins:
+                raise Error("default bin out of range")
+            if self.missing_bin[f] < -1 or self.missing_bin[f] >= self.n_bins:
+                raise Error("missing bin out of range")
+            # The default bin holds the implicit zeros and the missing bin
+            # holds `NaN`; a feature whose two coincided would make an absent
+            # entry indistinguishable from a missing one, which is the single
+            # distinction this whole representation is built on.
+            if self.missing_bin[f] == Int(self.default_bin[f]):
+                raise Error(
+                    "a feature's missing bin must not be its default bin"
+                )
+            for i in range(lo, hi):
+                var r = self.row_index[i]
+                if r < 0 or r >= self.n_rows:
+                    raise Error("stored entry row index out of range")
+                # Ascending row order per column is what `bin_at`'s binary
+                # search and the stable entry partition both read.
+                if i > lo and r <= self.row_index[i - 1]:
+                    raise Error(
+                        "row indices must be strictly ascending within each"
+                        " column"
+                    )
+                if Int(self.bin[i]) >= self.n_bins:
+                    raise Error("stored entry bin out of range")
+        var flagged = List[Int]()
+        _check_categorical_columns(self, flagged)
+
     def bin_at(self, row: Int, feature: Int) -> Int:
         """Bin of (row, feature), by binary search over the feature's stored
         entries. O(log nnz_f); the training path never uses it."""
@@ -849,3 +926,95 @@ def transform_csc(
         mapper.cats.copy(),
         mapper.missing_bin.copy(),
     )
+
+
+# --- Categorical semantics of a sparse column -----------------------------
+#
+# These three used to live in `gpu_categorical.mojo`, which made them
+# unreachable from the CPU sparse path without importing a device module.
+# They are statements about this representation, not about a device, so they
+# belong here: `gpu_categorical.mojo` and `gpu_sparse_layout.mojo` import
+# them, and so does `boosting_sparse.mojo`. One implementation, three
+# consumers, no device dependency for any of them.
+
+
+def default_category_bin(cats: CategoricalSpec, feature: Int) raises -> Int:
+    """The bin an absent entry of a categorical feature falls in.
+
+    Identical to `default_bins(mapper)[feature]` for a categorical column,
+    computed from the category table alone so a caller holding a
+    `SparseBinnedMatrix` and no mapper can check the matrix against it.
+    """
+    if not cats.is_cat(feature):
+        raise Error("feature is not categorical")
+    return cats.bin_of(feature, 0.0)
+
+
+def absent_is_unknown(cats: CategoricalSpec, feature: Int) raises -> Bool:
+    """Whether absent entries of `feature` land in the unknown bin.
+
+    An absent entry of a categorical column is the value 0.0, which is
+    *category code 0*, so it takes category 0's own bin when the fitted table
+    kept that code. When the table did not keep it (the column never held it,
+    or it was dropped as too rare for `max_bins - 1`) the default bin is
+    `UNKNOWN_BIN`, and bin 0 is never a member of a split's category set, so
+    every absent row then routes right at every categorical node of this
+    feature, together with the missing, unseen, and dropped rows.
+
+    Both are correct and the second is the trap: a one-hot-ish column whose
+    zeros mean "not this category" behaves completely differently depending
+    on whether 0 survived the table, and nothing in the numbers says so. This
+    is a modelling fact, reportable before a model is fitted rather than
+    discovered inside one.
+    """
+    return default_category_bin(cats, feature) == UNKNOWN_BIN
+
+
+def _check_categorical_columns(
+    data: SparseBinnedMatrix, mut flagged: List[Int]
+) raises:
+    """Check every categorical column and append the ascending feature ids
+    for which `absent_is_unknown` holds.
+
+    Three things must hold, all of them properties a malformed producer could
+    break without any individual number looking wrong:
+
+    - the column's `default_bin` must be the bin of category code 0, because
+      an absent entry is the value 0.0 and nothing else;
+    - the column must reserve no missing bin: a categorical feature routes
+      missing values to `UNKNOWN_BIN` by construction, and a reserved bin
+      would give it a second, contradictory missing route;
+    - every stored bin must be inside `[0, n_categories]`, since a bin past
+      the table indexes a category that was never fitted.
+    """
+    for f in range(data.n_features):
+        if not data.cats.is_cat(f):
+            continue
+        var expected = default_category_bin(data.cats, f)
+        if Int(data.default_bin[f]) != expected:
+            raise Error(
+                "categorical column's default bin is not the bin of"
+                " category code 0"
+            )
+        if data.missing_bin[f] >= 0:
+            raise Error("categorical feature must not reserve a missing bin")
+        var n_cat = data.cats.n_categories(f)
+        for i in range(data.col_offsets[f], data.col_offsets[f + 1]):
+            if Int(data.bin[i]) > n_cat:
+                raise Error("stored bin is past the fitted category table")
+        if expected == UNKNOWN_BIN:
+            flagged.append(f)
+
+
+def check_sparse_categorical_semantics(
+    data: SparseBinnedMatrix,
+) raises -> List[Int]:
+    """Check a binned sparse matrix against the categorical rules, and report
+    which categorical features send their absent rows to the unknown bin.
+
+    The reporting half of `SparseBinnedMatrix.validate`, for a caller that
+    wants the flagged features rather than only the guarantee.
+    """
+    var flagged = List[Int]()
+    _check_categorical_columns(data, flagged)
+    return flagged^

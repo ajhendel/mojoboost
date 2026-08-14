@@ -98,7 +98,12 @@ from .boosting import (
     renewal_weights,
 )
 from .goss import GossParams, GossSelection, apply_goss_scaling, goss_round
-from .gpu_objectives_native import supports_device_objective
+from .gpu_fused_round import (
+    ROUND_OK,
+    GpuTreeRouter,
+    round_eligibility,
+    round_eligibility_reason,
+)
 from .gpu_predict import (
     METRIC_L1,
     METRIC_L2,
@@ -269,45 +274,67 @@ def resolve_objective_source(source: Int) -> Int:
     return OBJECTIVE_SOURCE_AUTO
 
 
+# Softmax has no id in the objective registry: boosting.mojo numbers the
+# single-output objectives and a multiclass run is selected by `n_classes`
+# rather than by an objective code. `round_eligibility` reaches the
+# device-kernel question only at `n_classes == 1`, so the multiclass entry
+# points name this placeholder instead of borrowing a regression code at the
+# call site and leaving a reader to work out that it is never read.
+comptime _SOFTMAX_OBJECTIVE = SQUARED_ERROR
+
+
 def device_gradients(
-    supported: Bool,
+    objective: Int,
+    n_classes: Int,
     source: Int,
     bagging: BaggingParams,
     goss: GossParams,
+    routes_all_rows: Bool = False,
 ) raises -> Bool:
     """Whether this run generates its gradients on the device.
 
-    Two things can rule the device path out, and a caller that asked for it
-    explicitly is told which one rather than being quietly downgraded: an
-    objective with no device kernel (`supported` comes from
-    `supports_device_objective`, and softmax passes True since
-    `fill_softmax_gradients_device` covers it), and row sampling, whose
-    sample is ranked and drawn on the host, so its gradients have to exist
-    there to be scaled and uploaded. Under AUTO either one falls back
-    silently, which is what the shipped trainers already do."""
+    The question itself belongs to `gpu_fused_round.round_eligibility`,
+    which is the package's one answer to which configurations every per-row
+    stage of a round can serve, and this is the trainer's binding of it: the
+    caller's `objective_source` decides whether the answer is consulted at
+    all, and a caller that asked for the device path explicitly is raised at
+    with that module's own reason rather than being quietly downgraded.
+    There is deliberately no second list of blockers here; a blocker added
+    there reaches this trainer without an edit.
+
+    `routes_all_rows` is the trainer stating that it advances the raw scores
+    with `GpuTreeRouter.update_all_rows`, which covers the rows a bag left
+    out and is the one thing that keeps a bagged run off the device round.
+    The trainers below pass it only under an explicit
+    `OBJECTIVE_SOURCE_DEVICE`, so AUTO keeps bagging on the host path and
+    its Float64 raw scores.
+
+    GOSS stays blocked either way: its sample is a ranking of
+    `|grad * hess|`, and ranking Float32 device scores can put a different
+    row across the threshold, so `allow_device_ranking` is left False and
+    both backends keep sampling identically.
+    """
     var s = resolve_objective_source(source)
     if s == OBJECTIVE_SOURCE_HOST:
         return False
-    if not supported:
-        if s == OBJECTIVE_SOURCE_DEVICE:
-            raise Error(
-                "this objective has no device gradient kernel; train it with"
-                " objective_source=OBJECTIVE_SOURCE_HOST (or"
-                " MOJOBOOST_GPU_OBJECTIVE=host), which uploads host-computed"
-                " gradients and grows the trees on the device exactly as"
-                " before"
-            )
-        return False
-    if bagging_enabled(bagging) or goss.enabled:
-        if s == OBJECTIVE_SOURCE_DEVICE:
-            raise Error(
-                "row sampling draws its sample from host-side gradients, so"
-                " bagging and GOSS cannot take the device objective path;"
-                " use objective_source=OBJECTIVE_SOURCE_AUTO or"
-                " OBJECTIVE_SOURCE_HOST"
-            )
-        return False
-    return True
+    var code = round_eligibility(
+        objective,
+        n_classes,
+        bagging_enabled(bagging),
+        goss.enabled,
+        False,
+        routes_all_rows,
+    )
+    if code == ROUND_OK:
+        return True
+    if s == OBJECTIVE_SOURCE_DEVICE:
+        raise Error(
+            round_eligibility_reason(code),
+            ". Use objective_source=OBJECTIVE_SOURCE_HOST (or",
+            " MOJOBOOST_GPU_OBJECTIVE=host), which uploads host-computed",
+            " gradients and grows the trees on the device exactly as before",
+        )
+    return False
 
 
 struct _GpuRecordLeafState(Movable):
@@ -968,9 +995,17 @@ def _train_gpu_rounds[
     goss: GossParams,
     device_grads: Bool,
     split_search: Int,
+    route_all_rows: Bool = False,
 ) raises -> Booster:
     """The boosting loop both `train_gpu` entry points run, over a builder
     the caller already constructed and a lifecycle it already chose.
+
+    `route_all_rows` is the bagged device round: the bag comes from the same
+    sampler and the same schedule as on the host, and the tree's contribution
+    reaches every row's device raw score through `GpuTreeRouter`, in bag or
+    not, which is what the leaf-range update cannot do. It is set only when
+    the caller asked for `OBJECTIVE_SOURCE_DEVICE` explicitly, so the shipped
+    AUTO behavior for a bagged run is unchanged.
 
     `life` is `NoLifecycle` for the session-free entry point, which makes
     every hook below two integer increments and no device work, so this loop
@@ -1001,12 +1036,28 @@ def _train_gpu_rounds[
                 target, sample_weight, 1, 2 * params.tree.num_leaves
             )
             state.init_raw(builder.ctx, [base_score])
+            # One router per fit, never per tree: it holds the flattened
+            # tree tables and one leaf ordinal per row, all sized by the
+            # largest tree this run can grow. Empty on the unbagged path,
+            # where the leaf ranges already cover every row and are cheaper.
+            var router = List[GpuTreeRouter]()
+            if route_all_rows:
+                router.append(
+                    GpuTreeRouter(
+                        builder.ctx, n, 2 * params.tree.num_leaves
+                    )
+                )
+            var dev_bag = List[Int]()
             for i in range(params.n_estimators):
                 life.begin_round()
+                # Same sampler, same schedule, same seed as the host path
+                # and as the CPU trainer, so round i grows on identical
+                # rows whichever path produced its gradients.
+                refresh_bag(dev_bag, bagging, n, i)
                 builder.fill_gradients_device(state, objective, alpha)
                 life.begin_tree()
                 var tree = grow_tree_gpu(
-                    builder, params.tree, [], i, split_search
+                    builder, params.tree, dev_bag, i, split_search
                 )
                 life.end_tree()
                 if renews:
@@ -1016,15 +1067,31 @@ def _train_gpu_rounds[
                     # the device path's documented precision.
                     var raw = state.download_raw(builder.ctx)
                     _renew_leaf_values(
-                        tree, data, target, raw, renew_w, renew_a, [], signs,
-                        params.tree.extra,
+                        tree, data, target, raw, renew_w, renew_a, dev_bag,
+                        signs, params.tree.extra,
                     )
                 if tree.n_leaves == 1 and abs(tree.value[0]) < 1e-12:
                     life.end_round()
+                    # Under bagging a degenerate tree indicts this sample,
+                    # not the run, exactly as on the host path.
+                    if bagging_enabled(bagging):
+                        continue
                     break
-                builder.update_raw_device(
-                    state, tree.value, params.learning_rate
-                )
+                if len(router) > 0:
+                    # Every row, in bag or not. Never both this and the
+                    # range update for one tree: each adds a full
+                    # `learning_rate * value` step.
+                    router[0].update_all_rows(
+                        builder.ctx,
+                        state,
+                        tree,
+                        builder.bins_dev,
+                        params.learning_rate,
+                    )
+                else:
+                    builder.update_raw_device(
+                        state, tree.value, params.learning_rate
+                    )
                 trees.append(tree^)
                 life.end_round()
             return Booster(
@@ -1125,11 +1192,15 @@ def train_gpu(
             bagging,
             goss,
         )
+        # Only an explicit device request routes every row through
+        # `GpuTreeRouter`; AUTO keeps a bagged run on the host path and its
+        # Float64 raw scores.
+        var routes_all = (
+            resolve_objective_source(objective_source)
+            == OBJECTIVE_SOURCE_DEVICE
+        )
         var device_grads = device_gradients(
-            supports_device_objective(objective),
-            objective_source,
-            bagging,
-            goss,
+            objective, 1, objective_source, bagging, goss, routes_all
         )
         var builder = GpuHistogramBuilder(data)
         var life = NoLifecycle()
@@ -1183,11 +1254,12 @@ def train_gpu(
             bagging,
             goss,
         )
+        var routes_all = (
+            resolve_objective_source(objective_source)
+            == OBJECTIVE_SOURCE_DEVICE
+        )
         var device_grads = device_gradients(
-            supports_device_objective(objective),
-            objective_source,
-            bagging,
-            goss,
+            objective, 1, objective_source, bagging, goss, routes_all
         )
         var builder = GpuHistogramBuilder(session, data)
         return _train_gpu_rounds(
@@ -1538,7 +1610,7 @@ def train_multiclass_gpu(
             labels, n_classes, sample_weight
         )
         var device_grads = device_gradients(
-            True, objective_source, bagging, goss
+            _SOFTMAX_OBJECTIVE, n_classes, objective_source, bagging, goss
         )
         var builder = GpuHistogramBuilder(data)
         var life = NoLifecycle()
@@ -1587,7 +1659,7 @@ def train_multiclass_gpu(
             labels, n_classes, sample_weight
         )
         var device_grads = device_gradients(
-            True, objective_source, bagging, goss
+            _SOFTMAX_OBJECTIVE, n_classes, objective_source, bagging, goss
         )
         var builder = GpuHistogramBuilder(session, data)
         return _train_multiclass_gpu_rounds(

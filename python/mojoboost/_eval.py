@@ -64,27 +64,48 @@ go with them (links, scalar parameters, leaf renewal, backend support), so
 that a metric added to metrics.mojo cannot be invisible from Python and a
 direction cannot disagree with the code that computes the number.
 
-This module is on its way to being a facade over that registry. Until the
-binding exists, the tables below are a *mirror* of it, isolated in one
-clearly marked block so that wiring is a deletion rather than a rewrite:
-everything public here already goes through `_TABLE`, whose five methods
-are one-for-one with registry queries. `_CompatTable` answers them from the
-mirrored dicts today; `_NativeTable` will answer them from
-`_mojoboost.objective_registry_*` and the dicts go away. The mapping is:
+This module is a facade over that registry, with two implementations
+behind one indirection, `_TABLE`, whose six methods are one-for-one with
+registry queries:
 
     _TABLE.metric_code(name)         metric_code_from_name
+    _TABLE.canonical_name(name)      (the alias half of the same query)
     _TABLE.metric_task(code)         metric_task
     _TABLE.higher_is_better(code)    metric_higher_is_better
     _TABLE.names_for_task(task)      metric_names_for_task
     _TABLE.default_metric(task, o)   objective_default_metric
 
-What stays in Python after that: turning a Python callable into a metric
+`_NativeTable` answers them from one snapshot of the native registry,
+taken once at import through `_mojoboost.registry_metrics`,
+`registry_metric_aliases`, `registry_objectives`, and
+`registry_objective_aliases` (the binding API in
+handoffs/migration_21_objective_metric_registry.md §4). `_CompatTable`
+answers them from the mirrored dicts in the marked block below, and is
+what runs on a build that does not expose those four functions -- which
+is every build today, because the binding has not landed. `_selected()`
+picks the native one when the whole snapshot is available and internally
+consistent, and falls back to the mirror otherwise rather than answering
+half from each. `registry_source()` reports which one is live.
+
+When the binding lands and the native table has been validated, the
+deletion is the marked block plus `_CompatTable` plus the fallback branch
+of `_selected()`; nothing public moves.
+
+One deliberate difference between the two, and the reason the switch is
+not silent: `_DEFAULTS` below is keyed on the objective *name the user
+typed*, so an objective alias missing from it has no default metric even
+though the objective does. The registry keys the same rule on the
+objective code and so has no such hole, and `_NativeTable` closes it.
+`registry_source()` is how a test tells which behavior it is looking at.
+
+What stays in Python either way: turning a Python callable into a metric
 spec (python/mojoboost/__init__.py), and formatting the ValueErrors below.
 Both are presentation, not semantics.
 
 handoffs/migration_21_objective_metric_registry.md carries the binding API
 this needs, the lines that get deleted, and the disagreements found between
 this file, the Mojo tables, the README, and docs/LIGHTGBM_PARITY.md.
+handoffs/connect_07_python_public.md carries the switch.
 """
 
 # ===========================================================================
@@ -215,6 +236,9 @@ class _CompatTable:
     raising for an unknown name because the caller builds the message.
     """
 
+    #: Which of the two implementations answered. See `registry_source`.
+    source = "compat"
+
     def metric_code(self, canonical):
         spec = _METRICS.get(canonical)
         return None if spec is None else spec[0]
@@ -253,9 +277,203 @@ class _CompatTable:
         return _DEFAULTS.get(objective)
 
 
-#: The one indirection. Swapping this for a `_NativeTable()` is the whole
-#: of the Python side of the migration.
-_TABLE = _CompatTable()
+# ===========================================================================
+# The native table. Reads the registry, holds no facts of its own.
+# ===========================================================================
+
+#: The four registry entry points, in the spelling
+#: handoffs/migration_21_objective_metric_registry.md §4 specifies. All four
+#: are needed: answering half the queries natively and half from the mirror
+#: is exactly the drift this module exists to prevent.
+_REGISTRY_HOOKS = (
+    "registry_metrics",
+    "registry_metric_aliases",
+    "registry_objectives",
+    "registry_objective_aliases",
+)
+
+#: Field positions in the registry tuples, so a reader can check them
+#: against §4 without counting.
+_METRIC_CODE, _METRIC_NAME, _METRIC_TASK, _METRIC_HIGHER = 0, 1, 2, 3
+_OBJECTIVE_CODE, _OBJECTIVE_TASK, _OBJECTIVE_DEFAULT = 0, 2, 12
+
+#: `default_metric_code` for the one objective that has no default.
+_NO_DEFAULT_METRIC = -1
+
+
+class _NativeTable:
+    """The registry queries, answered from one snapshot of the registry.
+
+    A snapshot is not a second table: it is derived at import from the
+    native tuples, never edited, and nothing that could disagree with the
+    registry can reach it. Taking it once is deliberate -- `resolve()` runs
+    inside `fit`, and a call per lookup would put the boundary in the
+    training loop.
+    """
+
+    source = "native"
+
+    def __init__(self, metrics, aliases, task_defaults, objective_defaults):
+        #: canonical name -> (code, higher_is_better, task)
+        self._metrics = metrics
+        #: alias -> canonical name (a canonical name maps to itself)
+        self._aliases = aliases
+        #: task -> canonical metric name, for the tasks whose default does
+        #: not depend on which objective spelling reached them
+        self._task_defaults = task_defaults
+        #: objective name or alias -> canonical metric name
+        self._objective_defaults = objective_defaults
+        self._by_code = {
+            spec[0]: (name, spec[1], spec[2])
+            for name, spec in metrics.items()
+        }
+
+    def metric_code(self, canonical):
+        spec = self._metrics.get(canonical)
+        return None if spec is None else spec[0]
+
+    def canonical_name(self, name):
+        return self._aliases.get(name, name)
+
+    def metric_task(self, code):
+        record = self._by_code.get(code)
+        if record is None:
+            raise ValueError(f"unknown metric code {code!r}")
+        return record[2]
+
+    def higher_is_better(self, code):
+        record = self._by_code.get(code)
+        if record is None:
+            raise ValueError(f"unknown metric code {code!r}")
+        return record[1]
+
+    def names_for_task(self, task):
+        return sorted(
+            name for name, spec in self._metrics.items() if spec[2] == task
+        )
+
+    def default_metric(self, task, objective):
+        by_task = self._task_defaults.get(task)
+        if by_task is not None:
+            return by_task
+        if callable(objective):
+            return None
+        return self._objective_defaults.get(objective)
+
+
+def _native_snapshot():
+    """The registry as the three dicts `_NativeTable` needs, or None when
+    this build cannot answer all four queries or answers them
+    inconsistently.
+
+    None is the normal answer today: no build binds the registry. Every
+    failure here is a fallback to the mirror rather than an exception,
+    because a registry that cannot be read is not a reason for `import
+    mojoboost` to fail.
+    """
+    try:
+        from . import _mojoboost
+    except Exception:  # pragma: no cover - the extension is required above
+        return None
+    hooks = {}
+    for name in _REGISTRY_HOOKS:
+        hook = getattr(_mojoboost, name, None)
+        if hook is None:
+            return None
+        hooks[name] = hook
+    try:
+        metric_records = list(hooks["registry_metrics"]())
+        metric_aliases = list(hooks["registry_metric_aliases"]())
+        objective_records = list(hooks["registry_objectives"]())
+        objective_aliases = list(hooks["registry_objective_aliases"]())
+    except Exception:
+        return None
+
+    metrics = {}
+    name_of_code = {}
+    for record in metric_records:
+        code = int(record[_METRIC_CODE])
+        name = str(record[_METRIC_NAME])
+        metrics[name] = (
+            code,
+            bool(record[_METRIC_HIGHER]),
+            str(record[_METRIC_TASK]),
+        )
+        name_of_code[code] = name
+    if not metrics:
+        return None
+
+    aliases = {name: name for name in metrics}
+    for alias, code in metric_aliases:
+        canonical = name_of_code.get(int(code))
+        if canonical is None:
+            return None  # an alias for a metric the registry did not list
+        aliases[str(alias)] = canonical
+
+    # The per-task default, derived rather than mirrored: every builtin
+    # objective of a task carries the same `default_metric_code` for the
+    # three tasks whose default does not depend on the objective spelling,
+    # so "the one all of them agree on" is the registry's own answer. A
+    # task whose objectives disagree gets no task default and falls through
+    # to the per-objective lookup, which is what the mirror does too.
+    per_task = {}
+    for record in objective_records:
+        task = str(record[_OBJECTIVE_TASK])
+        if task == REGRESSION:
+            continue
+        code = int(record[_OBJECTIVE_DEFAULT])
+        if code == _NO_DEFAULT_METRIC:
+            continue
+        per_task.setdefault(task, set()).add(code)
+    task_defaults = {}
+    for task, codes in per_task.items():
+        if len(codes) != 1:
+            continue
+        canonical = name_of_code.get(next(iter(codes)))
+        if canonical is not None:
+            task_defaults[task] = canonical
+
+    default_of_objective = {}
+    for record in objective_records:
+        code = int(record[_OBJECTIVE_DEFAULT])
+        if code != _NO_DEFAULT_METRIC:
+            default_of_objective[int(record[_OBJECTIVE_CODE])] = code
+    objective_defaults = {}
+    for alias, code in objective_aliases:
+        metric_code = default_of_objective.get(int(code))
+        if metric_code is None:
+            continue
+        canonical = name_of_code.get(metric_code)
+        if canonical is not None:
+            objective_defaults[str(alias)] = canonical
+
+    return _NativeTable(metrics, aliases, task_defaults, objective_defaults)
+
+
+def _selected():
+    """The live table: native when the whole registry is readable, the
+    mirror otherwise. Never a mixture of the two."""
+    try:
+        native = _native_snapshot()
+    except Exception:
+        native = None
+    return _CompatTable() if native is None else native
+
+
+#: The one indirection. Deleting the mirrored block above means deleting
+#: `_CompatTable` and the fallback branch of `_selected()` with it.
+_TABLE = _selected()
+
+
+def registry_source():
+    """`"native"` when the metric facts come from the compiled registry and
+    `"compat"` when they come from the mirrored block above.
+
+    A diagnostic, and the assertion a test uses to say which of the two
+    behaviors documented in the module docstring it is looking at.
+    """
+    return _TABLE.source
+
 
 # ===========================================================================
 # Facade. Everything below is presentation: normalizing what a user typed

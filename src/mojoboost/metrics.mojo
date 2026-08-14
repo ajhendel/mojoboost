@@ -30,9 +30,68 @@ for a validation set that carries weights. Weighted AUC is the weighted
 rank statistic: a tie between a positive and a negative row contributes half
 of the product of their weights, which is what the unweighted average-rank
 formula does when every weight is 1.
+
+Metric codes, and why they live here
+------------------------------------
+`METRIC_L2` ... `METRIC_MAP` below are the twenty-one built-in metric codes.
+A code names a *function*, and nineteen of those functions are in this file,
+so this is where the numbering lives; `objective_registry.mojo` re-exports
+every one of them and owns everything a code *means* (its canonical name and
+aliases, the task it scores, which direction is better, what it needs beyond
+predictions and labels, and which transform predictions must have been
+through). Two codes name functions in ranking.mojo (`METRIC_NDCG`,
+`METRIC_MAP`) and two need a class count (`METRIC_MULTI_LOGLOSS`,
+`METRIC_MULTI_ERROR`); `eval_metric_by_code` rejects all four by name and
+points at the entry point that does handle them.
+
+The values are fixed by `bindings/_mojoboost.mojo` and
+`python/mojoboost/_eval.py` and must not be renumbered: a code crosses the
+Python boundary as an integer.
+
+This module deliberately does **not** import `objective_registry`. It cannot:
+boosting.mojo imports `_argsort` from here, the registry imports boosting,
+and the three would form a cycle. That constraint is also the right layering.
+Nothing here decides what a metric means, only what it computes, so a metric
+never applies a transform, never chooses a direction, and never rejects a
+metric that does not suit a model's task. Those are registry questions, and
+`eval_builtin_metric` in custom_metric.mojo is the one call path that asks
+them and then lands here.
 """
 
 from std.math import exp, isfinite, log, sqrt
+
+# ---------------------------------------------------------------------------
+# Metric codes
+# ---------------------------------------------------------------------------
+
+comptime METRIC_L2 = 0
+comptime METRIC_RMSE = 1
+comptime METRIC_L1 = 2
+comptime METRIC_QUANTILE = 3
+comptime METRIC_HUBER = 4
+comptime METRIC_BINARY_LOGLOSS = 5
+comptime METRIC_BINARY_ERROR = 6
+comptime METRIC_AUC = 7
+comptime METRIC_MULTI_LOGLOSS = 8
+comptime METRIC_MULTI_ERROR = 9
+comptime METRIC_NDCG = 10
+comptime METRIC_MAPE = 11
+comptime METRIC_FAIR = 12
+comptime METRIC_POISSON = 13
+comptime METRIC_GAMMA = 14
+comptime METRIC_GAMMA_DEVIANCE = 15
+comptime METRIC_TWEEDIE = 16
+comptime METRIC_CROSS_ENTROPY = 17
+comptime METRIC_KLDIV = 18
+comptime METRIC_AVERAGE_PRECISION = 19
+comptime METRIC_MAP = 20
+
+comptime N_BUILTIN_METRICS = 21
+
+# The default threshold `binary_error` scores at, LightGBM's. Named because
+# `eval_metric_by_code` has to pass one and a caller reading the dispatch
+# should see which one rather than a bare 0.5.
+comptime DEFAULT_BINARY_THRESHOLD = 0.5
 
 
 def _clamp(p: Float64) -> Float64:
@@ -598,3 +657,95 @@ def average_precision(
         i = j - 1
 
     return total
+
+
+# ---------------------------------------------------------------------------
+# Code dispatch
+# ---------------------------------------------------------------------------
+
+
+def eval_metric_by_code(
+    metric: Int,
+    pred: List[Float64],
+    target: List[Float64],
+    weight: List[Float64] = [],
+    param: Float64 = 0.0,
+) raises -> Float64:
+    """One of the nineteen single-output built-in metrics, selected by code.
+
+    This is the code-to-call map, the one thing the registry does not do:
+    the registry says a code is `METRIC_TWEEDIE` and that it needs the
+    objective's scalar parameter, and this turns that into a call to
+    `tweedie_loss`. It is the only such map in Mojo, so a metric added here
+    becomes reachable from every caller at once rather than from whichever
+    ones remembered to grow a branch.
+
+    `pred` must already be on the scale the metric reads, which for every
+    code here is the *objective's* response scale (`metric_transform` returns
+    `TRANSFORM_OBJECTIVE_LINK` for all nineteen). Applying the link is the
+    caller's job because only the caller knows the objective;
+    `eval_builtin_metric` in custom_metric.mojo is the caller that does it.
+
+    `param` is the objective's scalar parameter and is read only by the four
+    codes whose loss is a family rather than a single function: `quantile`
+    and `huber` read it as `alpha`, `fair` as `fair_c`, and `tweedie` as
+    `tweedie_variance_power`. Those four validate their own domains. The
+    other fifteen ignore it, so passing the objective's parameter
+    unconditionally is safe and is what the dispatcher does.
+
+    The four codes this does not compute raise rather than return a wrong
+    number: the two multiclass metrics need a class count and row-major
+    probabilities, and the two ranking metrics need the validation set's own
+    query groups and a cutoff. `eval_builtin_metric` routes all four; nothing
+    else should special-case them.
+    """
+    if metric == METRIC_L2:
+        return l2(pred, target, weight)
+    if metric == METRIC_RMSE:
+        return rmse(pred, target, weight)
+    if metric == METRIC_L1:
+        return l1(pred, target, weight)
+    if metric == METRIC_QUANTILE:
+        return quantile_loss(pred, target, param, weight)
+    if metric == METRIC_HUBER:
+        return huber_loss(pred, target, param, weight)
+    if metric == METRIC_MAPE:
+        return mape(pred, target, weight)
+    if metric == METRIC_FAIR:
+        return fair_loss(pred, target, param, weight)
+    if metric == METRIC_POISSON:
+        return poisson_loss(pred, target, weight)
+    if metric == METRIC_GAMMA:
+        return gamma_loss(pred, target, weight)
+    if metric == METRIC_GAMMA_DEVIANCE:
+        return gamma_deviance(pred, target, weight)
+    if metric == METRIC_TWEEDIE:
+        return tweedie_loss(pred, target, param, weight)
+    if metric == METRIC_CROSS_ENTROPY:
+        return cross_entropy_loss(pred, target, weight)
+    if metric == METRIC_KLDIV:
+        return kullback_leibler(pred, target, weight)
+    if metric == METRIC_BINARY_LOGLOSS:
+        return binary_log_loss(pred, target, weight)
+    if metric == METRIC_BINARY_ERROR:
+        return binary_error(pred, target, DEFAULT_BINARY_THRESHOLD, weight)
+    if metric == METRIC_AUC:
+        # AUC and average precision read only the order of the scores, which
+        # every link the objectives use preserves, so whether the caller
+        # applied the transform cannot change either number.
+        return binary_auc(pred, target, weight)
+    if metric == METRIC_AVERAGE_PRECISION:
+        return average_precision(pred, target, weight)
+    if metric == METRIC_MULTI_LOGLOSS or metric == METRIC_MULTI_ERROR:
+        raise Error(
+            "the multiclass metrics need a class count and row-major"
+            " probabilities; call multiclass_log_loss / multiclass_error, or"
+            " eval_builtin_metric, which routes them"
+        )
+    if metric == METRIC_NDCG or metric == METRIC_MAP:
+        raise Error(
+            "the ranking metrics need the validation set's query groups and"
+            " a cutoff; call ndcg / mean_average_precision in ranking.mojo,"
+            " or eval_builtin_metric, which routes them"
+        )
+    raise Error(String("unknown metric code ", metric))

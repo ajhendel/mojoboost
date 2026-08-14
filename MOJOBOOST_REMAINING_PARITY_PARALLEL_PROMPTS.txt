@@ -1,0 +1,298 @@
+MOJOBOOST REMAINING LIGHTGBM PARITY AND MATURITY PARALLEL ROUND
+
+COPYING INSTRUCTIONS
+
+Every TASK section below is a complete standalone Claude Code prompt. Copy one entire TASK section into one session. Tasks may run simultaneously when their ownership does not overlap an active session. If the named conflict from MOJOBOOST_CONNECT_EVERYTHING_PARALLEL_PROMPTS.txt is already running, give this task to that same session as a follow-up after its current work, or wait for that single conflicting lane. Do not run two sessions that own the same file. Everything else can run in parallel immediately.
+
+
+======================================================================
+TASK 01: COMPLETE DART BOOSTING
+
+MANDATORY FINAL PHASE: At the end, integrate this work to the maximum safe extent possible inside your owned files. Fuse duplicate implementations, connect real owned callers, parameters, state, errors, fallbacks, cleanup, serialization requirements, bindings, and thin Python seams. Do not stop at scaffolding or an isolated module. For every connection blocked by ownership, put a mechanically actionable READY-TO-APPLY INTEGRATION PATCH in the handoff with target file/symbol, signature, call site, state flow, errors, ownership, fallback, serialization effect, public API effect, dependency, and minimal later validation marked UNRUN. Do not cross lane boundaries or run tests/builds/programs/benchmarks.
+CONFLICT: CONNECT_EVERYTHING TASK 17
+======================================================================
+
+THIS IS A COMPLETE STANDALONE PROMPT. Work in the live shared mojoboost repository. Inspect git status, existing DART fragments, parameters, trainers, serialization, prediction, and handoffs before editing. Preserve all concurrent work. Your exclusive ownership is src/mojoboost/boosting_dart.mojo, docs/DART.md, and handoffs/remaining_01_dart.md. Do not edit central trainers, Tree, parameters, serialization, bindings, Python, tests, or other files. If CONNECT_EVERYTHING Task 17 owns boosting_dart.mojo now, do not run this as a second session; give it to that owner as a follow-up.
+
+DO NOT RUN OR WRITE TESTS. Do not run Mojo, Python, Pixi, pip, builds, benchmarks, profilers, CI, formatters, linters, network commands, loops, watchers, or background processes. Static inspection only. Do not commit.
+
+Fuse every existing DART fragment into one authoritative non-public algorithm core. Implement dropout selection with deterministic seeds, skip_drop, drop_rate, max_drop, uniform_drop, xgboost_dart_mode where semantically justified, tree-weight normalization, prediction-cache updates, early-stopping interaction, continued training state, multiclass ordering, and model-state requirements. Do not create a second trainer or placeholder API. Reject incompatible ranking, GPU, or constraint combinations until their semantics are sound.
+
+Connect everything possible inside ownership. Produce exact central trainer, parameter, serialization, binding, and Python patch requests. The handoff must distinguish implemented core from public/integrated/validated behavior and list minimal later checks as UNRUN.
+
+
+======================================================================
+TASK 02: COMPLETE RANDOM-FOREST BOOSTING MODE
+
+MANDATORY FINAL PHASE: At the end, integrate this work to the maximum safe extent possible inside your owned files. Fuse duplicate implementations, connect real owned callers, parameters, state, errors, fallbacks, cleanup, serialization requirements, bindings, and thin Python seams. Do not stop at scaffolding or an isolated module. For every connection blocked by ownership, put a mechanically actionable READY-TO-APPLY INTEGRATION PATCH in the handoff with target file/symbol, signature, call site, state flow, errors, ownership, fallback, serialization effect, public API effect, dependency, and minimal later validation marked UNRUN. Do not cross lane boundaries or run tests/builds/programs/benchmarks.
+CONFLICT: CONNECT_EVERYTHING TASK 17
+======================================================================
+
+THIS IS A COMPLETE STANDALONE PROMPT. Work in the shared repository. Inspect existing RF/bagging code and handoffs first. Preserve concurrent work. Your exclusive ownership is src/mojoboost/boosting_rf.mojo, docs/RANDOM_FOREST_MODE.md, and handoffs/remaining_02_rf.md. Do not edit production boosting, bagging, Tree, params, serialization, bindings, Python, tests, or other files. If CONNECT_EVERYTHING Task 17 is active, assign this to that same owner later.
+
+DO NOT RUN OR WRITE TESTS, BUILDS, PROGRAMS, BENCHMARKS, OR CPU-HEAVY COMMANDS. Static inspection only. Do not commit.
+
+Fuse existing random-forest-mode fragments into one authoritative core matching high-value LightGBM rf semantics: bagging frequency and fractions, feature sampling, independent deterministic seeds, constant learning-rate interpretation, aggregation, multiclass behavior, validation, and continued training. Define required constraints such as bagging being enabled. Do not confuse ordinary row bagging in GBDT with random-forest boosting mode.
+
+Connect what is safe inside ownership and provide exact production, parameter, serialization, binding, and Python requests. Do not expose an inert boosting_type.
+
+
+======================================================================
+TASK 03: IMPLEMENT A SOUND LINEAR-TREE MODEL REPRESENTATION
+
+MANDATORY FINAL PHASE: At the end, integrate this work to the maximum safe extent possible inside your owned files. Fuse duplicate implementations, connect real owned callers, parameters, state, errors, fallbacks, cleanup, serialization requirements, bindings, and thin Python seams. Do not stop at scaffolding or an isolated module. For every connection blocked by ownership, put a mechanically actionable READY-TO-APPLY INTEGRATION PATCH in the handoff with target file/symbol, signature, call site, state flow, errors, ownership, fallback, serialization effect, public API effect, dependency, and minimal later validation marked UNRUN. Do not cross lane boundaries or run tests/builds/programs/benchmarks.
+CONFLICT: CONNECT_EVERYTHING TASK 17 AND TASK 11
+======================================================================
+
+THIS IS A COMPLETE STANDALONE PROMPT. Inspect existing linear-tree work, Tree representation, model format, objectives, constraints, and handoffs. Preserve concurrent work. Your exclusive ownership is src/mojoboost/linear_tree.mojo, docs/LINEAR_TREES.md, and handoffs/remaining_03_linear_trees.md. Do not edit Tree, serialization, trainers, parameters, bindings, Python, tests, or other files. If a conflicting connection task is active, give this prompt to its existing owner as a follow-up.
+
+DO NOT RUN OR WRITE TESTS OR EXECUTE PROJECT CODE. No builds or benchmarks. Static inspection only. Do not commit.
+
+Design and implement the authoritative linear-leaf algorithm core: sufficient statistics, regularized coefficient solving, intercepts, leaf feature selection, numerical stability, missing and categorical restrictions, monotonic-constraint implications, prediction representation, multiclass behavior, and continued training. Do not pretend the current constant-leaf Tree can store linear coefficients if it cannot. Define the smallest model-representation extension and versioned serialization requirements.
+
+Connect everything possible within linear_tree.mojo. Put exact Tree, trainer, serialization, inspection, binding, and Python changes in the handoff. Keep the feature unavailable publicly until the representation is real.
+
+
+======================================================================
+TASK 04: COMPLETE CEGB COST PENALTIES
+
+MANDATORY FINAL PHASE: At the end, integrate this work to the maximum safe extent possible inside your owned files. Fuse duplicate implementations, connect real owned callers, parameters, state, errors, fallbacks, cleanup, serialization requirements, bindings, and thin Python seams. Do not stop at scaffolding or an isolated module. For every connection blocked by ownership, put a mechanically actionable READY-TO-APPLY INTEGRATION PATCH in the handoff with target file/symbol, signature, call site, state flow, errors, ownership, fallback, serialization effect, public API effect, dependency, and minimal later validation marked UNRUN. Do not cross lane boundaries or run tests/builds/programs/benchmarks.
+CONFLICT: CONNECT_EVERYTHING TASK 17 AND TASK 09
+======================================================================
+
+THIS IS A COMPLETE STANDALONE PROMPT. Inspect existing CEGB and feature-penalty code before editing. Preserve concurrent work. Your exclusive ownership is src/mojoboost/cegb.mojo, docs/CEGB.md, and handoffs/remaining_04_cegb.md. Do not edit split, tree, parameters, trainers, bindings, Python, tests, or other files. If a conflicting connection lane is active, use its same owner later.
+
+DO NOT RUN OR WRITE TESTS, BUILDS, PROGRAMS, OR BENCHMARKS. Static inspection only. Do not commit.
+
+Fuse existing cost-penalty fragments into one authoritative CEGB implementation covering tradeoff, split penalty, coupled feature penalty, lazy per-row first-use penalty, feature indexing, active-row accounting, bagging/GOSS interaction, categorical/EFB feature recovery, deterministic behavior, and unsupported GPU/distributed combinations. Make the gain adjustment mathematically explicit and avoid double-applying ordinary feature_contri penalties.
+
+Connect safe internal calls and provide exact split/grower, parameter, serialization, binding, and Python requests. Do not expose CEGB settings until real split decisions consume them.
+
+
+======================================================================
+TASK 05: CLOSE RANKING AND UNBIASED LAMBDARANK GAPS
+
+MANDATORY FINAL PHASE: At the end, integrate this work to the maximum safe extent possible inside your owned files. Fuse duplicate implementations, connect real owned callers, parameters, state, errors, fallbacks, cleanup, serialization requirements, bindings, and thin Python seams. Do not stop at scaffolding or an isolated module. For every connection blocked by ownership, put a mechanically actionable READY-TO-APPLY INTEGRATION PATCH in the handoff with target file/symbol, signature, call site, state flow, errors, ownership, fallback, serialization effect, public API effect, dependency, and minimal later validation marked UNRUN. Do not cross lane boundaries or run tests/builds/programs/benchmarks.
+NO DIRECT CONNECTION-ROUND FILE CONFLICT
+======================================================================
+
+THIS IS A COMPLETE STANDALONE PROMPT. Work in the shared repository. Inspect ranking, metrics, Dataset group handling, distributed partitioning, and parity handoffs. Preserve concurrent changes. Your exclusive ownership is src/mojoboost/ranking_advanced.mojo, docs/RANKING_ADVANCED.md, and handoffs/remaining_05_ranking.md. Create ranking_advanced.mojo only if no equivalent existing module exists; if one exists, use that authoritative file and document the ownership decision. Do not edit ranking.mojo, objectives, metrics, trainers, Dataset, bindings, Python, tests, or other files.
+
+DO NOT RUN OR WRITE TESTS OR EXECUTE ANY PROJECT CODE. No builds or benchmarks. Static inspection only. Do not commit.
+
+Implement the missing advanced ranking core without duplicating existing LambdaRank: unbiased position-bias correction and regularization, truncation levels, label gains, evaluation positions, query weighting, deterministic pair sampling, zero/one-document queries, tied labels, invalid group handling, and MAP/NDCG aggregation metadata. Define group-safe bagging, cross-validation, and distributed partition contracts.
+
+Connect only through narrow interfaces inside ownership. Provide exact ranking.mojo, trainer, Dataset, distributed, binding, and Python requests. Do not claim unbiased LambdaRank until later differential evidence exists.
+
+
+======================================================================
+TASK 06: QUANTIZED GRADIENT TRAINING AND NUMERICAL POLICY
+
+MANDATORY FINAL PHASE: At the end, integrate this work to the maximum safe extent possible inside your owned files. Fuse duplicate implementations, connect real owned callers, parameters, state, errors, fallbacks, cleanup, serialization requirements, bindings, and thin Python seams. Do not stop at scaffolding or an isolated module. For every connection blocked by ownership, put a mechanically actionable READY-TO-APPLY INTEGRATION PATCH in the handoff with target file/symbol, signature, call site, state flow, errors, ownership, fallback, serialization effect, public API effect, dependency, and minimal later validation marked UNRUN. Do not cross lane boundaries or run tests/builds/programs/benchmarks.
+NO DIRECT CONNECTION-ROUND FILE CONFLICT
+======================================================================
+
+THIS IS A COMPLETE STANDALONE PROMPT. Inspect histogram accumulation, gradient storage, deterministic integer GPU accumulation, objectives, and existing quantization fragments. Preserve concurrent work. Your exclusive ownership is src/mojoboost/quantized_gradient.mojo, docs/QUANTIZED_GRADIENTS.md, and handoffs/remaining_06_quantized_gradients.md. Do not edit trainers, histograms, objectives, params, GPU kernels, bindings, Python, tests, or other files.
+
+DO NOT RUN OR WRITE TESTS, BUILDS, PROGRAMS, BENCHMARKS, OR PROFILERS. Static inspection only. Do not commit.
+
+Implement one authoritative quantized-gradient policy for num_grad_quant_bins, stochastic rounding, deterministic seeds, gradient/Hessian scale selection, overflow bounds, histogram representation, split-gain reconstruction, leaf renewal, multiclass, weights, GOSS, CPU/GPU portability, and fallback to floating accumulation. Reuse deterministic integer machinery where structurally compatible rather than duplicating it.
+
+Keep it disabled and non-public until connected and validated. Supply exact trainer, histogram, parameter, GPU, binding, and Python patch requests.
+
+
+======================================================================
+TASK 07: EXTERNAL-MEMORY AND STREAMING DATASET CORE
+
+MANDATORY FINAL PHASE: At the end, integrate this work to the maximum safe extent possible inside your owned files. Fuse duplicate implementations, connect real owned callers, parameters, state, errors, fallbacks, cleanup, serialization requirements, bindings, and thin Python seams. Do not stop at scaffolding or an isolated module. For every connection blocked by ownership, put a mechanically actionable READY-TO-APPLY INTEGRATION PATCH in the handoff with target file/symbol, signature, call site, state flow, errors, ownership, fallback, serialization effect, public API effect, dependency, and minimal later validation marked UNRUN. Do not cross lane boundaries or run tests/builds/programs/benchmarks.
+CONFLICT: CONNECT_EVERYTHING TASK 12
+======================================================================
+
+THIS IS A COMPLETE STANDALONE PROMPT. Inspect raw_data, trainset, sparse input, binning, Dataset APIs, and prepared-data plans. Preserve concurrent work. Your exclusive ownership is src/mojoboost/external_memory.mojo, src/mojoboost/sequence.mojo, docs/EXTERNAL_MEMORY.md, and handoffs/remaining_07_external_memory.md. Do not edit trainset.mojo, raw_data.mojo, binning, trainers, Python, bindings, serialization, tests, or other files. If CONNECT_EVERYTHING Task 12 is active and owns adjacent design decisions, provide this to that owner as a follow-up or run only after its interface is stable.
+
+DO NOT RUN OR WRITE TESTS OR EXECUTE PROJECT CODE. No builds, downloads, or benchmarks. Static inspection only. Do not commit.
+
+Implement a bounded-memory batch/Sequence and external-memory core: schema negotiation, deterministic multi-pass bin construction, chunk iteration, row identifiers, dense and sparse chunks, labels/weights/groups/init scores, categorical dictionaries, checksums, cache files, cancellation, cleanup, and repeatable iteration. Avoid silently loading the whole dataset. Define what objectives, ranking groups, EFB, bagging, GPU transfer, and continued training can support.
+
+Keep parsing and preprocessing in Mojo. Provide exact Dataset, trainer, prepared-table serialization, binding, and Python adapter requests. Do not expose source-file parameters merely to mimic LightGBM config syntax.
+
+
+======================================================================
+TASK 08: ADVANCED BOOSTER REFIT, ROLLBACK, EDITING, AND BOUNDS
+
+MANDATORY FINAL PHASE: At the end, integrate this work to the maximum safe extent possible inside your owned files. Fuse duplicate implementations, connect real owned callers, parameters, state, errors, fallbacks, cleanup, serialization requirements, bindings, and thin Python seams. Do not stop at scaffolding or an isolated module. For every connection blocked by ownership, put a mechanically actionable READY-TO-APPLY INTEGRATION PATCH in the handoff with target file/symbol, signature, call site, state flow, errors, ownership, fallback, serialization effect, public API effect, dependency, and minimal later validation marked UNRUN. Do not cross lane boundaries or run tests/builds/programs/benchmarks.
+CONFLICT: CONNECT_EVERYTHING TASK 11
+======================================================================
+
+THIS IS A COMPLETE STANDALONE PROMPT. Inspect Booster, Tree, serialization, inspection, prediction slicing, and existing editing fragments. Preserve concurrent work. Your exclusive ownership is src/mojoboost/model_editing.mojo, docs/MODEL_EDITING.md, and handoffs/remaining_08_model_editing.md. Do not edit Tree, Booster Python, serialization, trainers, bindings, tests, or other files. If CONNECT_EVERYTHING Task 11 is active, give this prompt to that owner as a follow-up.
+
+DO NOT RUN OR WRITE TESTS, BUILDS, PROGRAMS, OR BENCHMARKS. Static inspection only. Do not commit.
+
+Implement safe native cores for rollback_one_iter, lower_bound, upper_bound, get_leaf_output, set_leaf_output, model shuffling where meaningful, and refit with decay. Define invariants for tree/class ordering, base scores, feature importances, split gains, objective transforms, early-stop metadata, continued training, serialization, and invalid mutations. Do not expose editing that can create an unloadable or internally inconsistent model.
+
+Connect what is safe inside ownership and provide exact Tree, serialization, inspection, binding, and Python requests. Explicitly reject unsafe operations.
+
+
+======================================================================
+TASK 09: FEATURE-PARALLEL, VOTING-PARALLEL, AND DISTRIBUTED GPU CONTRACTS
+
+MANDATORY FINAL PHASE: At the end, integrate this work to the maximum safe extent possible inside your owned files. Fuse duplicate implementations, connect real owned callers, parameters, state, errors, fallbacks, cleanup, serialization requirements, bindings, and thin Python seams. Do not stop at scaffolding or an isolated module. For every connection blocked by ownership, put a mechanically actionable READY-TO-APPLY INTEGRATION PATCH in the handoff with target file/symbol, signature, call site, state flow, errors, ownership, fallback, serialization effect, public API effect, dependency, and minimal later validation marked UNRUN. Do not cross lane boundaries or run tests/builds/programs/benchmarks.
+CONFLICT: CONNECT_EVERYTHING TASK 13
+======================================================================
+
+THIS IS A COMPLETE STANDALONE PROMPT. Inspect distributed transport, collectives, histogram ownership, device contexts, and existing distributed handoffs. Preserve concurrent work. Your exclusive ownership is src/mojoboost/distributed_strategies.mojo, src/mojoboost/distributed_gpu.mojo, docs/DISTRIBUTED_STRATEGIES.md, and handoffs/remaining_09_distributed_strategies.md. Do not edit distributed.mojo, transport, trainers, GPU kernels, bindings, Dask, tests, workflows, or other files. Coordinate with CONNECT_EVERYTHING Task 13 if active; do not duplicate its files or transport.
+
+DO NOT RUN OR WRITE TESTS OR START PROCESSES. No networking, builds, benchmarks, MPI, or GPU execution. Static inspection only. Do not commit.
+
+Implement narrow strategy cores for feature-parallel split ownership, voting/top-k candidate exchange, and future distributed GPU histogram collectives. Define deterministic global agreement, feature partitions, categorical and monotonic constraints, failure semantics, rank/world capabilities, CPU staging versus device collectives, NCCL-like abstraction boundaries without binding to unavailable libraries, and explicit unsupported states.
+
+Do not call these operational until real multi-process and hardware validation exists. Supply exact distributed trainer, transport, GPU trainer, binding, and Dask requests.
+
+
+======================================================================
+TASK 10: DATASET ECOSYSTEM ADAPTERS - ARROW, POLARS, AND BATCHED INPUT
+
+MANDATORY FINAL PHASE: At the end, integrate this work to the maximum safe extent possible inside your owned files. Fuse duplicate implementations, connect real owned callers, parameters, state, errors, fallbacks, cleanup, serialization requirements, bindings, and thin Python seams. Do not stop at scaffolding or an isolated module. For every connection blocked by ownership, put a mechanically actionable READY-TO-APPLY INTEGRATION PATCH in the handoff with target file/symbol, signature, call site, state flow, errors, ownership, fallback, serialization effect, public API effect, dependency, and minimal later validation marked UNRUN. Do not cross lane boundaries or run tests/builds/programs/benchmarks.
+NO DIRECT CONNECTION-ROUND FILE CONFLICT IF RESTRICTED TO ADAPTER FILES
+======================================================================
+
+THIS IS A COMPLETE STANDALONE PROMPT. Inspect Python array conversion and Dataset ownership before editing. Preserve concurrent work. Your exclusive ownership is python/mojoboost/_arrow.py, python/mojoboost/_polars.py, python/mojoboost/_sequence.py, docs/ECOSYSTEM_INPUTS.md, and handoffs/remaining_10_ecosystem_inputs.md. Do not edit _arrays.py, Dataset, estimators, bindings, native source, public exports, tests, packaging, or other files.
+
+DO NOT RUN OR WRITE TESTS OR IMPORT OPTIONAL DEPENDENCIES. No Python execution, builds, downloads, or benchmarks. Static inspection only. Do not commit.
+
+Create thin, optional, import-safe adapters for Arrow Tables/Arrays, Polars frames, and caller-provided batches. Preserve zero-copy opportunities only as buffer-description contracts; never claim zero-copy. Handle null masks, chunked arrays, categorical/dictionary columns, feature names, numeric dtype conversion, sparse-like representations, labels, weights, groups, and ownership lifetimes.
+
+Do not implement binning or training in Python. Provide exact native binding, Dataset, estimator, and public-export requests. Unsupported dtypes must fail clearly rather than convert silently.
+
+
+======================================================================
+TASK 11: PORTABLE GPU KERNEL SPECIALIZATIONS FOR NVIDIA AND AMD
+
+MANDATORY FINAL PHASE: At the end, integrate this work to the maximum safe extent possible inside your owned files. Fuse duplicate implementations, connect real owned callers, parameters, state, errors, fallbacks, cleanup, serialization requirements, bindings, and thin Python seams. Do not stop at scaffolding or an isolated module. For every connection blocked by ownership, put a mechanically actionable READY-TO-APPLY INTEGRATION PATCH in the handoff with target file/symbol, signature, call site, state flow, errors, ownership, fallback, serialization effect, public API effect, dependency, and minimal later validation marked UNRUN. Do not cross lane boundaries or run tests/builds/programs/benchmarks.
+CONFLICT: CONNECT_EVERYTHING TASK 20
+======================================================================
+
+THIS IS A COMPLETE STANDALONE PROMPT. Inspect shared GPU kernels and the portability contract before editing. Preserve concurrent work. Your exclusive ownership is src/mojoboost/gpu_cuda_policy.mojo, src/mojoboost/gpu_amd_policy.mojo, docs/GPU_BACKEND_SPECIALIZATIONS.md, and handoffs/remaining_11_gpu_backends.md. Do not edit shared kernels, Apple policies, trainer, packaging, bindings, tests, or other files. Coordinate with CONNECT_EVERYTHING Task 20 if active.
+
+DO NOT RUN OR WRITE TESTS, BUILDS, GPU PROGRAMS, BENCHMARKS, OR HARDWARE QUERIES. Static inspection only. Do not commit.
+
+Implement backend policy and specialization descriptors for NVIDIA and AMD where supported by actual Mojo abstractions: subgroup width, thread-block geometry, shared memory, atomics, occupancy bounds, partial histogram strategy, packed-bin alignment, allocation, streams, synchronization, and capability errors. Do not fork the entire algorithm or copy Apple-specific code blindly.
+
+Do not claim hardware validation. Provide exact shared-kernel, trainer, device-policy, packaging, and validation requests.
+
+
+======================================================================
+TASK 12: HARDEN EDGE CASES AND RESOURCE LIMITS IN A CENTRAL VALIDATION LAYER
+
+MANDATORY FINAL PHASE: At the end, integrate this work to the maximum safe extent possible inside your owned files. Fuse duplicate implementations, connect real owned callers, parameters, state, errors, fallbacks, cleanup, serialization requirements, bindings, and thin Python seams. Do not stop at scaffolding or an isolated module. For every connection blocked by ownership, put a mechanically actionable READY-TO-APPLY INTEGRATION PATCH in the handoff with target file/symbol, signature, call site, state flow, errors, ownership, fallback, serialization effect, public API effect, dependency, and minimal later validation marked UNRUN. Do not cross lane boundaries or run tests/builds/programs/benchmarks.
+NO DIRECT CONNECTION-ROUND IMPLEMENTATION CONFLICT
+======================================================================
+
+THIS IS A COMPLETE STANDALONE PROMPT. Inspect current parameter, data, model-load, and boundary validation. Preserve concurrent work. Your exclusive ownership is src/mojoboost/validation.mojo, python/mojoboost/_validation.py if it exists or is needed, docs/VALIDATION_CONTRACT.md, and handoffs/remaining_12_validation.md. Do not edit trainers, objectives, Dataset, serialization, estimators, bindings, tests, or other files.
+
+DO NOT RUN OR WRITE TESTS OR EXECUTE PROJECT CODE. No builds, fuzzers, or benchmarks. Static inspection only. Do not commit.
+
+Fuse existing validation fragments into narrow authoritative native checks for dimensions, empty data, constant/all-missing features, NaN/infinity domains, labels, weights, Hessians, class counts, ranking groups, sparse indices, categorical values, allocation arithmetic overflow, node/tree/model size limits, recursion/depth, iteration counts, and cancellation/resource cleanup. Python should only validate ecosystem-object structure before crossing the binding.
+
+Avoid duplicating semantic checks already owned by objectives or serializers. Provide exact Dataset, trainer, serialization, binding, and estimator call requests. Errors must be specific and deterministic.
+
+
+======================================================================
+TASK 13: BACKWARD-COMPATIBILITY FIXTURE AND DEPRECATION INFRASTRUCTURE
+
+MANDATORY FINAL PHASE: At the end, integrate this work to the maximum safe extent possible inside your owned files. Fuse duplicate implementations, connect real owned callers, parameters, state, errors, fallbacks, cleanup, serialization requirements, bindings, and thin Python seams. Do not stop at scaffolding or an isolated module. For every connection blocked by ownership, put a mechanically actionable READY-TO-APPLY INTEGRATION PATCH in the handoff with target file/symbol, signature, call site, state flow, errors, ownership, fallback, serialization effect, public API effect, dependency, and minimal later validation marked UNRUN. Do not cross lane boundaries or run tests/builds/programs/benchmarks.
+NO DIRECT CONNECTION-ROUND FILE CONFLICT
+======================================================================
+
+THIS IS A COMPLETE STANDALONE PROMPT. Inspect compatibility policy, model versions, public API plans, and release metadata. Preserve concurrent work. Your exclusive ownership is compatibility/, docs/DEPRECATION_POLICY.md, tools/api_snapshot.py, tools/model_fixture_manifest.py, and handoffs/remaining_13_compatibility.md. Do not edit implementation, tests, packaging, workflows, public APIs, or model files outside compatibility/. Author tools but do not run them.
+
+DO NOT RUN OR WRITE TESTS OR EXECUTE TOOLS. No Python, builds, or network activity. Static editing only. Do not commit.
+
+Create infrastructure specifications and static tools for public Python/Mojo/C ABI snapshots, parameter defaults and aliases, fitted attributes, callback environment, model-format fixtures, inspection schemas, ABI versions, and deprecation windows. Define fixture provenance and checksums without fabricating generated artifacts. Require at least one release of overlap for ordinary deprecations and explicit migration rules for model formats.
+
+Keep pre-1.0 flexibility honest while preventing accidental breakage. Produce exact CI and release-gate requests.
+
+
+======================================================================
+TASK 14: TARGETED VALIDATION ORCHESTRATOR WITHOUT RUNNING IT
+
+MANDATORY FINAL PHASE: At the end, integrate this work to the maximum safe extent possible inside your owned files. Fuse duplicate implementations, connect real owned callers, parameters, state, errors, fallbacks, cleanup, serialization requirements, bindings, and thin Python seams. Do not stop at scaffolding or an isolated module. For every connection blocked by ownership, put a mechanically actionable READY-TO-APPLY INTEGRATION PATCH in the handoff with target file/symbol, signature, call site, state flow, errors, ownership, fallback, serialization effect, public API effect, dependency, and minimal later validation marked UNRUN. Do not cross lane boundaries or run tests/builds/programs/benchmarks.
+NO IMPLEMENTATION CONFLICT
+======================================================================
+
+THIS IS A COMPLETE STANDALONE PROMPT. Inspect existing test entry points, benchmark scripts, handoffs, and CI without executing anything. Preserve concurrent work. Your exclusive ownership is tools/validation_plan.py, docs/FOCUSED_VALIDATION_PLAN.md, validation/manifests/, and handoffs/remaining_14_validation_plan.md. Do not edit tests, source, Python package, packaging, workflows, benchmarks, or other files. Author the orchestrator but do not run it.
+
+DO NOT RUN TESTS, PROGRAMS, BUILDS, BENCHMARKS, CI, OR THE NEW ORCHESTRATOR. Static inspection only. Do not commit.
+
+Create a manifest-driven coordinator that maps changed subsystems and handoffs to the smallest relevant later commands. It must default to listing commands, never executing them. Separate static checks, tiny smoke checks, focused native checks, Python estimator checks, CPU/GPU differential checks, clean-wheel checks, distributed two-process checks, hardware validation, and deliberately scheduled broad suites.
+
+Add resource budgets, thread limits, time limits, explicit opt-in flags, and mutual exclusion for CPU/GPU-heavy jobs. Prevent accidental full-suite execution. This task prepares evidence collection without consuming the user's machine now.
+
+
+======================================================================
+TASK 15: FINAL REMAINING-PARITY INVENTORY AND POST-INTEGRATION RELEASE GATE
+
+MANDATORY FINAL PHASE: At the end, integrate this work to the maximum safe extent possible inside your owned files. Fuse duplicate implementations, connect real owned callers, parameters, state, errors, fallbacks, cleanup, serialization requirements, bindings, and thin Python seams. Do not stop at scaffolding or an isolated module. For every connection blocked by ownership, put a mechanically actionable READY-TO-APPLY INTEGRATION PATCH in the handoff with target file/symbol, signature, call site, state flow, errors, ownership, fallback, serialization effect, public API effect, dependency, and minimal later validation marked UNRUN. Do not cross lane boundaries or run tests/builds/programs/benchmarks.
+NO IMPLEMENTATION CONFLICT
+======================================================================
+
+THIS IS A COMPLETE STANDALONE PROMPT. Inspect the live parity, capability, architecture, and handoff documents. Preserve concurrent work. Your exclusive ownership is docs/POST_INTEGRATION_GAPS.md, docs/V1_RELEASE_GATE.md, tools/remaining_gaps.py, and handoffs/remaining_15_release_gate.md. Do not edit implementation, existing parity files, tests, packaging, workflows, README, or other files. Author the tool but do not execute it.
+
+DO NOT RUN TESTS, BUILDS, PROGRAMS, OR BENCHMARKS. Static inspection only. Do not commit.
+
+Inventory every LightGBM capability still absent after accounting for the connection and remaining-parity work. Weight common single-machine estimator workflows separately from distributed, language, legacy config, plotting, and obscure modes. Distinguish missing implementation, disconnected implementation, missing binding, missing public export, missing serialization, missing tests, missing hardware evidence, and missing release artifact.
+
+Define a v1 release gate centered on clean installation, core estimator correctness, model compatibility, Apple CPU/GPU evidence, honest platform support, resource safety, and documentation. Do not require deprecated LightGBM configuration behavior merely for a percentage. Produce an exact post-round coordinator checklist.
+
+
+======================================================================
+PARALLEL EXECUTION NOTES
+======================================================================
+
+Tasks 05, 06, 10, 12, 13, 14, and 15 can run immediately together because their owned files are distinct from one another and from most connection lanes.
+
+Tasks 01 through 04, 07 through 09, and 11 intentionally identify connection-lane conflicts. Do not start a second writer on those files. Give the prompt to the already-active owner as a follow-up, or start it only if that conflicting connection task has not been launched.
+
+Completion of these sessions still does not prove support. After all coding and connection sessions stop, one coordinator must reconcile their handoffs, apply central patches, and then perform resource-limited focused validation. Do not run the full suite automatically.
+
+
+======================================================================
+MANDATORY END-OF-TASK SAFE INTEGRATION PHASE FOR EVERY PROMPT
+======================================================================
+
+This section applies to every TASK in this file. Include it whenever copying a TASK into Claude Code.
+
+After completing the task's primary implementation, do not stop at an isolated module or design. Perform a final safe-integration pass to the maximum extent possible inside your exclusive ownership.
+
+During that final pass:
+
+- Re-read the live production and public call paths relevant to your lane.
+- Fuse overlapping implementations inside your owned files into one authoritative implementation.
+- Connect the authoritative implementation to every real caller located inside your ownership.
+- Ensure existing parameters and state actually flow into it and its results affect real behavior.
+- Connect capability checks, explicit unsupported errors, fallback behavior, resource ownership, and cleanup.
+- Connect model state to serialization requirements or keep the feature disabled if correct persistence is impossible.
+- Connect native behavior to an existing binding seam when that seam is inside your ownership.
+- Connect Python APIs only as thin wrappers around native Mojo behavior.
+- Update owned documentation and handoffs so they describe actual reachability rather than merely code existence.
+- Remove obsolete duplicate glue inside your ownership only when no live caller requires it. Otherwise quarantine and document it.
+- Preserve conservative defaults and established fallback paths for every unvalidated implementation.
+- Do not cross ownership boundaries, overwrite concurrent work, or make speculative central edits.
+- Do not run or write tests, execute programs, build artifacts, run benchmarks, or perform hardware validation.
+
+If complete integration requires files outside your ownership, add an exact READY-TO-APPLY INTEGRATION PATCH section to your handoff. For every required patch specify:
+
+1. Target file and symbol.
+2. Required import or export.
+3. Exact function or type signature.
+4. Call location and control flow.
+5. Parameters and state passed in.
+6. Return values and errors handled.
+7. Lifetime and resource ownership.
+8. Fallback and default behavior.
+9. Serialization and model-format effect.
+10. Public API and documentation effect.
+11. Conflict or dependency on another lane.
+12. Minimal later focused validation command marked UNRUN.
+
+The task is not considered handed off until it has integrated everything safely possible within its lane and made every remaining cross-lane connection mechanically actionable. Do not claim the capability is supported, validated, performant, or release-ready merely because this integration pass is complete.

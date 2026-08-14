@@ -9,30 +9,63 @@ losing nothing: within a bundle every original feature keeps its own
 contiguous range of bin ids, so an original (feature, bin) pair is always
 recoverable from the bundled bin.
 
-This module is the EFB core only: conflict measurement, plan construction,
-encoding, decoding, and the bundled matrix. Nothing here is wired into
-training, and nothing enables it: `fit_bundles` is only called when a caller
-asks for it, and it reports its own `use_bundling` verdict, which the caller
-is free to ignore. See `handoffs/task13_efb.md` for the integration a
-training path needs.
+This module holds the EFB core -- conflict measurement, plan construction,
+encoding, decoding, and the bundled matrix -- and the dense CPU integration
+that makes it reachable.
 
-Why it is still not reachable
------------------------------
-A bundling plan is a function of the mapper *and* the training matrix, and
-prediction cannot re-derive it, because a scoring matrix has a different
-sparsity pattern. So a bundled model is only a model once the plan travels
-with it: a `FeatureBundling` field on `Model`/`MulticlassModel`, a new
-serialized section behind a v4 format bump, and the matching reader in
-`python/mojoboost/inspection.py`, which re-implements the model text reader
-and refuses an unknown version. Bundling also has to be applied at
-`model_sparse.fit_csc`, where the mapper and the CSC matrix meet, and undone
-in every prediction path.
+Where it is live, and how it avoids the model entirely
+------------------------------------------------------
+`enable_bundle` is off by default (`DEFAULT_ENABLE_BUNDLE`) and, when it is
+set, it applies to the **dense CPU trainers in boosting.mojo** and to nothing
+else. `BoosterParams.bundling` carries the switch, `prepare_bundling` fits the
+plan once per training call, and `tree.grow_tree` takes the resulting
+`BundledMatrix`.
 
-None of those files belong to this integration, and a bundling that trains
-but cannot be saved or scored is worse than none, so `enable_bundle` is
-refused rather than half-wired: see `check_bundling_supported`, which
-`params.parse_params` calls. The core below is unchanged and stays ready for
-the lane that owns those files.
+The integration rests on one decision: **a bundle is a histogram layout and
+never leaves the grower**. Concretely, inside `grow_tree`:
+
+- histograms are accumulated over the *bundled* matrix, which is the whole
+  point: O(#bundles) column scans instead of O(#features);
+- split search unbundles each member's own histogram
+  (`unbundle_histogram`) and scores it in the member's own local bin ids, so
+  a `SplitInfo` always names an **original** feature and an **original**
+  local bin;
+- row partitioning reads the *original* matrix, because the split it routes
+  by is expressed in original terms.
+
+So a `Tree` grown with bundling is indistinguishable from one grown without
+it: same feature ids, same threshold bins, same missing routing, same
+categorical sets. `Model`, `Booster.predict_*`, `serialize.mojo`,
+`importance.mojo`, and `contrib.mojo` therefore need **no change at all**, no
+plan travels with the model, and there is no v4 format bump. That is a
+deliberate trade: the plan is rebuilt from the training matrix on every
+training call and is never used to score, which costs one extra dense matrix
+and one pass over it and buys a fit that no downstream consumer can tell
+apart.
+
+The sparse path is a different question. `bundle_csc` and the sparse plan
+below still exist for it, and a sparse integration that bundles the *stored*
+matrix would face exactly the model-plumbing problem
+`handoffs/task13_efb.md` sections 4, 6, and 10 describe (a `FeatureBundling`
+on `Model`, a v4 section, the reader in `python/mojoboost/inspection.py`),
+because the sparse predictors route rows by column. Nothing here does that
+and nothing here enables it.
+
+What the dense path does not do
+-------------------------------
+- `max_conflict_rate` above 0.0 is still refused (`check_bundling_params`).
+  Lossy bundling drops training values, and the loss lands in the trees where
+  no metric reports it; the plan counts collisions exactly
+  (`FeatureBundling.is_lossless`), so this is a policy decision waiting on a
+  benchmark, not a missing capability.
+- Nothing enables bundling automatically. `EfbParams.min_reduction` and the
+  `use_bundling` verdict decide only whether an *already requested* bundling
+  is worth applying; when the verdict is negative the trainer falls back to
+  the unbundled matrix, which is the same fit.
+- The sparse, GPU, distributed, ranking, custom-objective, and custom-metric
+  trainers do not honor the switch. They are not in this lane's ownership;
+  `check_bundling_honored` is the one-line refusal they need so that an
+  ignored setting is reported rather than silently dropped.
 
 What "exclusive" means here
 ---------------------------
@@ -106,10 +139,20 @@ A member's reserved missing bin encodes like any other non-default bin, and
 `missing_bins` reports the bundle bins that hold missing values. But a
 multi-member bundle can then hold several of them, and the binned matrix
 carries one `missing_bin` per column, while the split search learns one
-`default_left` per node. Until that is generalized, `EfbParams.bundle_missing`
-defaults to False and a feature reserving a missing bin is left as a
-singleton, which is always correct. Setting it True produces a valid plan and
-a valid bundled matrix, and it is the caller's job to consume `missing_bins`.
+`default_left` per node. On the **sparse** plan (`fit_bundles`), which is
+built for a consumer that routes rows by bundle column, that is why
+`EfbParams.bundle_missing` defaults to False and a feature reserving a
+missing bin is left a singleton.
+
+The **dense** plan (`fit_bundles_dense`) is free of that restriction and
+ignores `bundle_missing`, because the dense integration never routes a row
+by a bundle column: `grow_tree` partitions on the original matrix and reads
+the original `BinnedMatrix.missing_bin` table, and the split search reads a
+member's local histogram, in which the missing bin is at its original local
+index. A missing value is simply one more non-default bin there, recovered
+exactly. The dense plan therefore records `slot_missing = -1` on every slot,
+which says "this plan makes no claim about routing missing values", and a
+dense caller must not read `missing_bins` off it.
 
 Categorical features
 --------------------
@@ -145,7 +188,7 @@ Differences from LightGBM
   implementation does not, for the reason above.
 """
 
-from .binning import BinMapper
+from .binning import BinMapper, BinnedMatrix
 from .metrics import _argsort
 from .categorical import CategoricalSpec
 from .sparse import SparseBinnedMatrix
@@ -171,46 +214,68 @@ comptime _BYTES_PER_BIN = 1
 comptime DEFAULT_ENABLE_BUNDLE = False
 
 
-def check_bundling_supported(enable_bundle: Bool) raises:
-    """Accept `enable_bundle=false`, refuse `enable_bundle=true` by name.
+def check_bundling_supported(enable_bundle: Bool, cpu: Bool = True) raises:
+    """Accept a bundling request the dense CPU trainers can actually honor.
 
-    The repository's rule for a real LightGBM feature that is not reachable
-    is to say so rather than ignore the request, and bundling is the case
-    where ignoring it would be least visible: a silently unbundled fit is a
-    correct model, just not the one that was asked for, and nothing in the
-    metrics would show it.
-
-    Accepting `false` matters: it is LightGBM's own default spelled out, so a
-    configuration copied from LightGBM that turns bundling off must not fail
-    on a parameter it agrees with.
+    `enable_bundle=false` is LightGBM's own default spelled out and is always
+    accepted. `enable_bundle=true` is accepted for a CPU run, which is where
+    `boosting.mojo` applies it; asking for it on another device is refused by
+    name rather than ignored, because a silently unbundled fit is a correct
+    model, just not the one that was asked for, and nothing in the metrics
+    would show it.
     """
     if not enable_bundle:
         return
+    if cpu:
+        return
     raise Error(
-        "'enable_bundle' is not reachable yet; the exclusive-feature-bundling"
-        " core exists (src/mojoboost/efb.mojo) but a bundling plan has to"
-        " travel with the model to be scored, which needs a FeatureBundling"
-        " field on Model, a v4 serialized section, the matching reader in"
-        " python/mojoboost/inspection.py, and the plan applied at"
-        " model_sparse.fit_csc. See handoffs/task13_efb.md"
+        "'enable_bundle' is implemented for the dense CPU trainers only; the"
+        " GPU trainer builds its histograms from the dense BinnedMatrix"
+        " directly and never sees a bundled column. Set device=cpu, or leave"
+        " enable_bundle at its default of false"
     )
 
 
 def check_bundling_params(max_conflict_rate: Float64) raises:
     """Refuse a conflict rate that asks for lossy bundling.
 
-    `max_conflict_rate` only means anything with bundling on, and it is the
-    one bundling knob whose cost is invisible: a collision drops a value from
-    the training matrix, so the model is an approximation of the unbundled
-    one and no metric says so. Until bundling is reachable and benchmarked,
-    only LightGBM's own default of 0.0 is accepted.
+    `max_conflict_rate` is the one bundling knob whose cost is invisible: a
+    collision drops a value from the training matrix, so the model is an
+    approximation of the unbundled one and no metric says so. The plan counts
+    those drops exactly (`FeatureBundling.collisions`,
+    `FeatureBundling.is_lossless`), so this is a policy decision waiting on a
+    benchmark rather than a missing capability, and until that benchmark
+    exists only LightGBM's own default of 0.0 is accepted.
     """
     if max_conflict_rate == 0.0:
         return
     raise Error(
-        "'max_conflict_rate' above 0.0 trades exactness for columns and is"
-        " only meaningful with 'enable_bundle', which is not reachable yet;"
-        " see handoffs/task13_efb.md"
+        "'max_conflict_rate' above 0.0 trades exactness for columns: a"
+        " collision drops a training value, and the loss lands in the trees"
+        " where no metric reports it. Bundling itself is available"
+        " ('enable_bundle'); only the lossy mode is withheld pending a"
+        " benchmark. See handoffs/connect_09_algorithms.md"
+    )
+
+
+def check_bundling_honored(settings: EfbSettings, trainer: String) raises:
+    """Refuse an active bundling request in a trainer that does not apply it.
+
+    `boosting.mojo`'s dense trainers honor `BoosterParams.bundling`; the
+    sparse, GPU, distributed, ranking, custom-objective, and custom-metric
+    trainers do not. Each of those should call this on entry so that a caller
+    who set the switch is told which trainer dropped it, rather than getting
+    an unbundled fit that looks exactly like a bundled one.
+    """
+    if not settings.enabled:
+        return
+    raise Error(
+        "'enable_bundle' is applied by the dense CPU trainers in"
+        " boosting.mojo (train, train_more, train_with_valid,"
+        " train_multiclass*); ",
+        trainer,
+        " builds its histograms another way and would ignore it. Leave"
+        " enable_bundle at its default of false for this trainer",
     )
 
 

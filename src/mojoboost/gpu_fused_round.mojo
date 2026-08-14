@@ -93,23 +93,20 @@ precision caveat, since a bag depends on no gradient and the walk decides
 on integer bins.
 """
 
-from std.gpu import block_idx, thread_idx
-from std.math import isfinite
-from std.memory import stack_allocation
 from max.gpu.host import DeviceBuffer, DeviceContext, HostBuffer
-from max.gpu.memory import AddressSpace
-from max.gpu.sync import barrier
 
 from .boosting import CUSTOM
 from .categorical import CAT_BITSET_WORDS
+from .gpu_active_rows import GpuActiveRows
 from .gpu_gradient_stream import GpuRowSelection
 from .gpu_objectives_native import (
     DEFAULT_MAX_NODES,
     SUM_BLOCKS,
-    SUM_THREADS,
     GpuObjectiveState,
     GradMagnitudes,
     device_fixed_scale,
+    enqueue_abs_sum,
+    sum_abs_partials,
     supports_device_objective,
 )
 from .gpu_predict import NODE_STRIDE, _append_tree, _leaf_kernel
@@ -126,66 +123,6 @@ comptime BYTES_U8 = 1
 # Bytes of gradient plane per row: one Float32 gradient, one Float32
 # hessian.
 comptime GRAD_PLANE_BYTES = 2 * BYTES_F32
-
-
-def _magnitude_partials_kernel(
-    grad: MutPointer[Float32, MutAnyOrigin],
-    hess: MutPointer[Float32, MutAnyOrigin],
-    partials: MutPointer[Float32, MutAnyOrigin],
-    n_rows: Int32,
-):
-    """Per-threadgroup magnitude sums of the gradients and hessians, laid
-    out `[grad partials | hess partials]`.
-
-    This is `_abs_sum_kernel` from gpu_objectives_native.mojo, expression
-    for expression and in the same grid-stride and tree-reduction order,
-    so its partials are bit-identical to that kernel's. It exists here
-    only so that the reduction can be enqueued without the copy and the
-    synchronization that `magnitude_sums` performs in the same call.
-    Integration should delete one of the two definitions rather than keep
-    them in step by hand; the handoff says which and why, and the
-    duplication is the same one gpu_active_rows.mojo carries for
-    `_range_reduce_kernel`.
-    """
-    var tid = thread_idx.x
-    var sg = stack_allocation[
-        SUM_THREADS, Scalar[DType.float32], address_space = AddressSpace.SHARED
-    ]()
-    var sh = stack_allocation[
-        SUM_THREADS, Scalar[DType.float32], address_space = AddressSpace.SHARED
-    ]()
-
-    var acc_g = Float32(0.0)
-    var acc_h = Float32(0.0)
-    var nr = Int(n_rows)
-    var r = Int(block_idx.x) * SUM_THREADS + tid
-    var stride = SUM_BLOCKS * SUM_THREADS
-    while r < nr:
-        acc_g += abs(grad[unsafe_offset=r][0])
-        acc_h += abs(hess[unsafe_offset=r][0])
-        r += stride
-    sg[unsafe_offset=tid] = acc_g
-    sh[unsafe_offset=tid] = acc_h
-    barrier()
-
-    # Uniform trip count across the threadgroup, so every thread reaches
-    # every barrier.
-    var active = SUM_THREADS // 2
-    while active > 0:
-        if tid < active:
-            sg[unsafe_offset=tid] = (
-                sg[unsafe_offset=tid][0] + sg[unsafe_offset = tid + active][0]
-            )
-            sh[unsafe_offset=tid] = (
-                sh[unsafe_offset=tid][0] + sh[unsafe_offset = tid + active][0]
-            )
-        barrier()
-        active //= 2
-
-    if tid == 0:
-        var slot = Int(block_idx.x)
-        partials[unsafe_offset=slot] = sg[unsafe_offset=0][0]
-        partials[unsafe_offset = SUM_BLOCKS + slot] = sh[unsafe_offset=0][0]
 
 
 @fieldwise_init
@@ -245,19 +182,19 @@ struct MagnitudeReader(Movable):
         immediately behind its kernel in the queue and the host's later
         wait covers both. Everything the caller enqueues between this and
         `read` executes while the host is blocked.
+
+        The launch is `enqueue_abs_sum`, the same entry point
+        `GpuObjectiveState.magnitude_sums` uses, so the partials this
+        reader waits on are the ones the unsplit call would have produced,
+        not a second kernel kept in step by hand.
         """
         if self.pending:
             raise Error(
                 "a previous magnitude reduction has not been read; the"
                 " readback buffer cannot be reused until it has"
             )
-        ctx.enqueue_function[_magnitude_partials_kernel](
-            grad_dev.unsafe_ptr(),
-            hess_dev.unsafe_ptr(),
-            self.part_dev.unsafe_ptr(),
-            Int32(self.n_rows),
-            grid_dim=SUM_BLOCKS,
-            block_dim=SUM_THREADS,
+        enqueue_abs_sum(
+            ctx, grad_dev, hess_dev, self.part_dev, self.n_rows
         )
         ctx.enqueue_copy(
             dst_ptr=self.host_part.unsafe_ptr(), src_buf=self.part_dev
@@ -268,23 +205,15 @@ struct MagnitudeReader(Movable):
         """Wait for the enqueued reduction and sum its partials.
 
         Ascending block index, gradient plane then hessian plane, in
-        Float64. That is the order `magnitude_sums` sums in, over partials
-        this kernel produced in the same order, so the totals agree bit
-        for bit.
+        Float64. That is `sum_abs_partials`, the same fold
+        `magnitude_sums` performs over partials the same kernel produced,
+        so the totals agree bit for bit.
         """
         if not self.pending:
             raise Error("call enqueue before read")
         ctx.synchronize()
         self.pending = False
-        var src = self.host_part.unsafe_ptr()
-        var g_total = 0.0
-        var h_total = 0.0
-        for i in range(SUM_BLOCKS):
-            g_total += Float64(src.unsafe_load(i))
-            h_total += Float64(src.unsafe_load(SUM_BLOCKS + i))
-        if not isfinite(g_total) or not isfinite(h_total):
-            raise Error("gradients and hessians must be finite")
-        return GradMagnitudes(g_total, h_total)
+        return sum_abs_partials(self.host_part.unsafe_ptr())
 
     def read_scales(mut self, ctx: DeviceContext) raises -> RoundScales:
         """`read`, converted into the two fixed-point scales a histogram
@@ -721,6 +650,400 @@ def round_eligibility_reason(code: Int) -> String:
             " the threshold; pass allow_device_ranking=True to accept that"
         )
     return String("unknown round eligibility code")
+
+
+def device_round_supported(
+    objective: Int,
+    n_classes: Int,
+    bagging_on: Bool,
+    goss_on: Bool,
+    allow_device_ranking: Bool = False,
+    routes_all_rows: Bool = False,
+) raises -> Bool:
+    """`round_eligibility` as the yes/no a trainer's strategy switch wants.
+
+    This is the conservative fallback seam: a trainer asks this once per
+    run and takes `GpuDeviceRound` when it answers True and its established
+    host-gradient path when it answers False. A caller that asked for the
+    device round explicitly should call `round_eligibility` instead and
+    raise `round_eligibility_reason` of the code it gets back, so an
+    explicit request is refused with its reason rather than downgraded in
+    silence.
+    """
+    return (
+        round_eligibility(
+            objective,
+            n_classes,
+            bagging_on,
+            goss_on,
+            allow_device_ranking,
+            routes_all_rows,
+        )
+        == ROUND_OK
+    )
+
+
+# --- The staged round ----------------------------------------------------
+#
+# The stages a round passes through, in the one order that is correct under
+# sampling. A round moves forward through them; the guards below reject the
+# orders that would be wrong rather than producing a quietly different
+# fixed-point scale.
+
+comptime ROUND_STAGE_CLOSED = 0
+comptime ROUND_STAGE_OPEN = 1
+comptime ROUND_STAGE_GRADIENTS = 2
+comptime ROUND_STAGE_RANKED = 3
+comptime ROUND_STAGE_MAGNITUDES = 4
+comptime ROUND_STAGE_SCALED = 5
+
+
+def round_stage_name(stage: Int) -> String:
+    if stage == ROUND_STAGE_CLOSED:
+        return String("closed")
+    if stage == ROUND_STAGE_OPEN:
+        return String("open")
+    if stage == ROUND_STAGE_GRADIENTS:
+        return String("gradients")
+    if stage == ROUND_STAGE_RANKED:
+        return String("ranked")
+    if stage == ROUND_STAGE_MAGNITUDES:
+        return String("magnitudes")
+    if stage == ROUND_STAGE_SCALED:
+        return String("scaled")
+    return String("unknown round stage")
+
+
+struct GpuDeviceRound(Movable):
+    """One boosting round's device-resident start, as a staged interface a
+    trainer can drive without holding any of the pieces itself.
+
+    This is the production seam for everything above: the derivative
+    kernels in gpu_objectives_native.mojo, the row sample and its
+    compensation in gpu_gradient_stream.mojo, the split magnitude reduction
+    and the tree router in this module. Every method delegates to those;
+    nothing here computes a derivative, a multiplier, a scale, or a leaf
+    value a second time.
+
+    What it owns and what it borrows. It owns the two things that are
+    per-session and belong to no other component: the magnitude reader and
+    (when the caller routes every row) the tree router. It borrows
+    everything that is trainer state: the `GpuObjectiveState` holding the
+    labels and raw scores, the `GpuRowSelection` holding this round's
+    sample, the histogram builder's gradient and hessian buffers, the
+    binned matrix, and the active-row ranges. That is deliberate, so this
+    struct cannot become a second trainer: it sequences a round, it does
+    not own one.
+
+    The stage order, and why it is checked. A sampled round has exactly one
+    correct order (gradients, then ranking if the sampler needs one, then
+    compensation, then magnitudes, then scales), because the fixed-point
+    scale has to bound the values the histograms will read. Reducing before
+    compensating produces a scale too large by up to the GOSS multiplier
+    and quietly weakens the Int32 overflow bound rather than failing, so
+    the order is enforced here instead of documented and hoped for.
+
+    Correspondence with `RoundLifecycle` in gpu_runtime.mojo: `open_round`
+    is that trait's `begin_round`, `end_round` is its `end_round`, and the
+    stages in between are what happens inside one tree. A trainer that
+    already announces its boundaries through a `GpuSession` calls both, in
+    that order; the two do not know about each other, and this one owns no
+    counters.
+
+    Eligibility is settled at construction. `round_eligibility` decides
+    whether the device round can serve a configuration at all, and the
+    constructor refuses the configurations it rejects, with the reason.
+    Nothing below silently falls back: a trainer picks the path with
+    `device_round_supported` before it constructs this, and keeps its host
+    path for everything else (custom objectives above all, whose callback
+    has no device image at all).
+    """
+
+    var mags: MagnitudeReader
+    var router: GpuTreeRouter
+    """Sized for the dataset when `routes_all_rows` is set and to one row
+    otherwise, so an unbagged session pays a handful of elements for a
+    router it never launches. `advance_scores` raises rather than using an
+    unsized router."""
+    var n_rows: Int
+    var objective: Int
+    var alpha: Float64
+    var n_classes: Int
+    var routes_all_rows: Bool
+    var allow_device_ranking: Bool
+    var scales: RoundScales
+    """The scales the last `read_scales` produced. A caller hands these to
+    `GpuHistogramBuilder`; they are kept so a callback or a counter can
+    report them without a second reduction."""
+    var stage: Int
+
+    def __init__(
+        out self,
+        ctx: DeviceContext,
+        n_rows: Int,
+        objective: Int,
+        alpha: Float64 = 0.0,
+        n_classes: Int = 1,
+        bagging_on: Bool = False,
+        goss_on: Bool = False,
+        routes_all_rows: Bool = False,
+        allow_device_ranking: Bool = False,
+        max_nodes: Int = DEFAULT_MAX_NODES,
+    ) raises:
+        """Allocate the round's own buffers and settle its eligibility.
+
+        Construct once per training run, on the histogram builder's
+        context, so every launch this issues queues behind that builder's
+        in the one in-order queue. `alpha` is the objective's scalar
+        parameter (`TreeParams`-level, constant for the run), and
+        `n_classes` is 1 for every single-output objective and the class
+        count for softmax.
+
+        Raises for a configuration `round_eligibility` rejects, quoting the
+        reason. A trainer that wants the fallback instead of the error asks
+        `device_round_supported` first.
+        """
+        var code = round_eligibility(
+            objective,
+            n_classes,
+            bagging_on,
+            goss_on,
+            allow_device_ranking,
+            routes_all_rows,
+        )
+        if code != ROUND_OK:
+            raise Error(round_eligibility_reason(code))
+        if n_rows < 1:
+            raise Error("a device round requires at least one row")
+
+        self.n_rows = n_rows
+        self.objective = objective
+        self.alpha = alpha
+        self.n_classes = n_classes
+        self.routes_all_rows = routes_all_rows
+        self.allow_device_ranking = allow_device_ranking
+        self.scales = RoundScales(0.0, 0.0, 0.0, 0.0)
+        self.stage = ROUND_STAGE_CLOSED
+        self.mags = MagnitudeReader(ctx, n_rows)
+        self.router = GpuTreeRouter(
+            ctx,
+            n_rows if routes_all_rows else 1,
+            max_nodes if routes_all_rows else 1,
+        )
+
+    def _require(self, stage: Int, what: String) raises:
+        if self.stage != stage:
+            raise Error(
+                String("a device round must be ")
+                + round_stage_name(stage)
+                + String(" before ")
+                + what
+                + String("; it is ")
+                + round_stage_name(self.stage)
+            )
+
+    def _check_state(self, state: GpuObjectiveState) raises:
+        if state.n_rows != self.n_rows:
+            raise Error(
+                "the objective state and the round disagree on the row count"
+            )
+        if state.n_classes != self.n_classes:
+            raise Error(
+                "the objective state and the round disagree on the class"
+                " count"
+            )
+
+    def open_round(
+        mut self, ctx: DeviceContext, mut state: GpuObjectiveState
+    ) raises:
+        """Start a round. For softmax this is where the probabilities are
+        recomputed, once, from the raw scores every class of the round
+        shares; the per-class gradient kernels then read them.
+
+        Refreshing per class would not merely cost `n_classes` times the
+        exponentials: by the time class `k + 1` ran, trees grown earlier in
+        the same round would already have advanced the raw scores, so the
+        classes of one round would no longer be derived from one shared
+        state, which is not what the host trainer does.
+        """
+        if self.stage != ROUND_STAGE_CLOSED and (
+            self.stage != ROUND_STAGE_SCALED
+        ):
+            raise Error(
+                String("the previous device round is still ")
+                + round_stage_name(self.stage)
+                + String("; finish it with end_round before opening another")
+            )
+        self._check_state(state)
+        if self.n_classes > 1:
+            state.refresh_softmax(ctx)
+        self.stage = ROUND_STAGE_OPEN
+
+    def fill_gradients(
+        mut self,
+        ctx: DeviceContext,
+        mut state: GpuObjectiveState,
+        mut grad_dev: DeviceBuffer[DType.float32],
+        mut hess_dev: DeviceBuffer[DType.float32],
+        k: Int = 0,
+    ) raises:
+        """This round's uncompensated derivatives, straight into the
+        histogram builder's own gradient and hessian buffers.
+
+        Single output when the round has one class, and class `k`'s
+        one-vs-rest pair when it has more. Both delegate to the kernels in
+        gpu_objectives_native.mojo; nothing per row crosses to the host.
+
+        Enqueued, not synchronized. A multiclass round calls this once per
+        class, and every class of the round reads the probabilities
+        `open_round` computed.
+        """
+        if self.stage != ROUND_STAGE_OPEN and (
+            self.stage != ROUND_STAGE_SCALED
+        ):
+            raise Error(
+                "a device round fills its gradients at the start of a tree,"
+                " after open_round and after the previous tree's scales have"
+                " been read"
+            )
+        self._check_state(state)
+        if self.n_classes > 1:
+            enqueue_softmax_gradients(ctx, state, k, grad_dev, hess_dev)
+        else:
+            if k != 0:
+                raise Error(
+                    "a single-output round has one class; k must be 0"
+                )
+            enqueue_gradients(
+                ctx, state, self.objective, self.alpha, grad_dev, hess_dev
+            )
+        self.stage = ROUND_STAGE_GRADIENTS
+
+    def read_ranking(
+        mut self,
+        ctx: DeviceContext,
+        mut selection: GpuRowSelection,
+        mut grad_dev: DeviceBuffer[DType.float32],
+        mut hess_dev: DeviceBuffer[DType.float32],
+    ) raises -> List[Float64]:
+        """The GOSS ranking score `|grad * hess|` per row, host side, from
+        the derivatives just filled.
+
+        The one stage of a GOSS round that has to reach the host: the
+        selection is a ranking over the whole row set and a partial-order
+        pass, which `goss_select` in goss.mojo owns and this does not
+        duplicate. It costs one `n_rows` Float32 download and one
+        synchronization, and it replaces a full host-side objective
+        evaluation rather than adding to one.
+
+        The scores are Float32, so a sample drawn from them can differ from
+        the CPU trainer's on rows that tie to within Float32; that is
+        exactly what `allow_device_ranking` accepts, and a round
+        constructed without it cannot reach this method.
+        """
+        self._require(ROUND_STAGE_GRADIENTS, String("ranking its rows"))
+        if not self.allow_device_ranking:
+            raise Error(
+                "this round was constructed without allow_device_ranking, so"
+                " its sample must be drawn from host-side gradients"
+            )
+        selection.enqueue_importance(ctx, grad_dev, hess_dev)
+        var scores = selection.download_importance(ctx)
+        self.stage = ROUND_STAGE_RANKED
+        return scores^
+
+    def reduce_magnitudes(
+        mut self,
+        ctx: DeviceContext,
+        mut selection: GpuRowSelection,
+        mut grad_dev: DeviceBuffer[DType.float32],
+        mut hess_dev: DeviceBuffer[DType.float32],
+    ) raises:
+        """Apply this round's compensation and enqueue the magnitude
+        reduction over the compensated values. Does not synchronize.
+
+        Everything the caller enqueues between this and `read_scales`
+        executes while the host is blocked on the readback, which is the
+        whole reason the reduction is split. The trainer's candidate is
+        seeding the root's active-row permutation, which depends on the
+        sample and not on the scale.
+        """
+        if self.stage != ROUND_STAGE_GRADIENTS and (
+            self.stage != ROUND_STAGE_RANKED
+        ):
+            raise Error(
+                "a device round reduces its magnitudes after its gradients"
+                " are filled and, under GOSS, after its sample is set"
+            )
+        enqueue_magnitudes(
+            ctx, selection, self.mags, grad_dev, hess_dev
+        )
+        self.stage = ROUND_STAGE_MAGNITUDES
+
+    def read_scales(mut self, ctx: DeviceContext) raises -> RoundScales:
+        """Wait for the reduction and return this round's two fixed-point
+        scales. The round's one device-to-host wait, and 2 KB whatever the
+        row count."""
+        self._require(ROUND_STAGE_MAGNITUDES, String("reading its scales"))
+        self.scales = self.mags.read_scales(ctx)
+        self.stage = ROUND_STAGE_SCALED
+        return self.scales.copy()
+
+    def advance_scores(
+        mut self,
+        ctx: DeviceContext,
+        mut state: GpuObjectiveState,
+        mut rows: GpuActiveRows,
+        tree: Tree,
+        mut bins_dev: DeviceBuffer[DType.uint8],
+        learning_rate: Float64,
+        k: Int = 0,
+    ) raises:
+        """Advance every row's raw score by the tree just grown, on the
+        device, and never twice.
+
+        Two updates exist and exactly one is correct for a given run.
+        Without row bagging the grown tree's leaf ranges already cover
+        every row, and `update_raw_ranges` is one small launch per leaf
+        over exactly those rows. With bagging the ranges cover only the
+        in-bag rows, so the out-of-bag rows would keep stale scores and
+        carry stale derivatives into later rounds; `routes_all_rows` is the
+        caller having asked for `GpuTreeRouter.update_all_rows` instead,
+        which routes every row through the tree with shipped kernels and
+        then applies the same `learning_rate * value[leaf]` step.
+
+        Choosing between them here is what stops both from running: each
+        adds a full step, so a caller that called both would advance the
+        in-bag rows twice. Call this once per grown tree, after the tree is
+        finished and before the next tree's `begin_tree` resets the ranges.
+        """
+        self._require(ROUND_STAGE_SCALED, String("advancing its raw scores"))
+        self._check_state(state)
+        if self.routes_all_rows:
+            self.router.update_all_rows(
+                ctx, state, tree, bins_dev, learning_rate, k
+            )
+        else:
+            state.update_raw_ranges(
+                ctx, rows, tree.value, learning_rate, k
+            )
+
+    def end_round(mut self) raises:
+        """Close the round. Enqueues nothing; it exists so the next
+        `open_round` starts from a known stage and so a round abandoned
+        halfway is reported as such rather than silently continued."""
+        if self.stage == ROUND_STAGE_CLOSED:
+            raise Error("this device round is already closed")
+        if self.stage != ROUND_STAGE_SCALED:
+            raise Error(
+                String("a device round left ")
+                + round_stage_name(self.stage)
+                + String(
+                    " has an enqueued stage no one consumed; read its scales"
+                    " before closing it"
+                )
+            )
+        self.stage = ROUND_STAGE_CLOSED
 
 
 @fieldwise_init

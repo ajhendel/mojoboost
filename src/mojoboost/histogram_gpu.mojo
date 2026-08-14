@@ -79,18 +79,77 @@ the phases separately timeable, which is what `bench/bench_histogram.mojo`
 reports: `stage_gradients` (Float64 to Float32 conversion), `upload_staged`
 (host to device), `enqueue_leaf` (kernels), `download_raw` (device to host),
 and `histogram_from_host` (fixed-point to Float64 conversion).
+
+Which transfer route the binned matrix takes is resolved once per builder
+through `unified_memory_policy.resolve_from_env`, so `MOJOBOOST_GPU_TRANSFER`
+is answered by the one route policy in the package rather than ignored here.
+Every route but the staged copy is structurally blocked or unproven today, so
+the resolver returns `ROUTE_COPY_STAGED` unless a caller asked for something
+else, and an explicit request it cannot honor raises there rather than being
+quietly downgraded. The upload below is that route; a second route would be a
+second branch here, not a second builder.
+
+Several leaves in one launch
+----------------------------
+`build_leaf` builds one node per launch, which is right for the root and
+wastes the device on the tail of a tree (see gpu_leaf_batching.mojo).
+`build_leaves` is the multi-leaf entry: it turns the caller's node ids into
+`LeafWorkItem`s off the device-resident row ranges `GpuActiveRows` already
+maintains, plans one packed launch with `gpu_leaf_batching.plan_batch`, and
+decodes each leaf's slot with the same fixed-point arithmetic
+`histogram_from_host` uses. No second row model and no second decoder: the
+ranges are the ones the partition kernel wrote, so a batched histogram covers
+exactly the rows the single-leaf build would have covered.
+
+Batching is off unless it is asked for and the launch policy agrees, and
+both halves of that are existing code rather than a new switch.
+`MOJOBOOST_GPU_HIST_SPECIALIZATION=batched` (`apple_histogram_policy`) is the
+request, and `apple_histogram_policy.batching_declined_reason` is the
+decision, which declines a frontier whose every leaf already fills the device
+and a batch of fewer than two leaves. Declined or unrequested, `build_leaves`
+falls back to a `build_leaf` per node, which is byte for byte the path that
+shipped. Nothing here defaults to a claim no benchmark has made.
 """
 
 from std.math import isfinite
 from max.gpu.host import DeviceBuffer, DeviceContext, HostBuffer
 
+from .apple_histogram_policy import (
+    REASON_AS_REQUESTED,
+    REASON_NOT_REQUESTED,
+    SPEC_LEVEL_BATCHED,
+    HistogramPlan,
+    HistogramWorkload,
+    batching_declined_reason,
+    derive_histogram_plan,
+    env_specialization_level,
+    profile_from_caps,
+)
 from .binning import BinnedMatrix
 from .categorical import CatBitset, CategoricalSpec, cat_empty
-from .gpu_active_rows import GpuActiveRows, RowRouting
+from .gpu_active_rows import GpuActiveRows, LeafRange, RowRouting
+from .gpu_frontier import LeafWorkItem
+from .gpu_histogram_specializations import (
+    DeviceHistogramCapabilities,
+    KernelFeatures,
+)
+from .gpu_leaf_batching import (
+    DEFAULT_MAX_ITEMS,
+    GpuLeafBatcher,
+    plan_batch,
+    slots_for_budget,
+)
 from .gpu_objectives_native import (
     DEFAULT_MAX_NODES,
     GpuObjectiveState,
     device_fixed_scale,
+)
+from .parallel import _env_int
+from .unified_memory_policy import (
+    ROLE_BINS,
+    ROUTE_COPY_STAGED,
+    describe_decision,
+    resolve_from_env,
 )
 from .gpu_tiling import (
     STRATEGY_ATOMIC,
@@ -124,6 +183,43 @@ comptime MAX_BINS = 256
 comptime MAX_ROWS = Int(Int32.MAX)
 
 comptime _FIXED_ONE = Float64(1 << 30)
+
+# Histogram slots the batched path may hold at once, and the byte budget it
+# is capped against. A slot is a full-width `3 * n_features * n_bins` Int32
+# histogram, so the budget is what keeps a wide dataset from asking for
+# hundreds of megabytes to hold a frontier; see
+# `gpu_leaf_batching.slots_for_budget`.
+comptime DEFAULT_BATCH_SLOTS = 4
+comptime MAX_BATCH_SLOTS = 64
+comptime BATCH_POOL_BUDGET_BYTES = 64 * 1024 * 1024
+
+
+def env_batch_slots() -> Int:
+    """`MOJOBOOST_GPU_BATCH_SLOTS`, the histogram slot pool depth, clamped to
+    a usable range. Only read when batching was requested at all, so the
+    default path never consults it."""
+    var n = _env_int("MOJOBOOST_GPU_BATCH_SLOTS", DEFAULT_BATCH_SLOTS)
+    if n < 2:
+        return 2
+    if n > MAX_BATCH_SLOTS:
+        return MAX_BATCH_SLOTS
+    return n
+
+
+def build_kernel_features() -> KernelFeatures:
+    """Which specialized histogram kernel variants this build compiles in.
+
+    `batched_leaf_kernel` is true because `build_leaves` below instantiates
+    `gpu_leaf_batching`'s kernels, so on any build that links this module
+    they exist. That is a fact about compilation and nothing more: no
+    benchmark and no hardware run has compared a batched launch against the
+    single-leaf one here, which is exactly why the level that selects it
+    (`SPEC_LEVEL_BATCHED`) has to be asked for and never resolves from
+    `auto`. The other two variants do not exist: the shipping kernels
+    allocate the `MAX_BINS` threadgroup width at every bin count and read one
+    bin per load.
+    """
+    return KernelFeatures(False, False, True)
 
 
 def _fixed_scale(values: List[Float64]) raises -> Float32:
@@ -188,6 +284,25 @@ struct GpuHistogramBuilder(Movable):
     var g_scale: Float64
     var h_scale: Float64
     var has_gradients: Bool
+    # The batched multi-leaf launcher, held as a zero-or-one list so a
+    # builder that never batches allocates none of its buffers. `List` is
+    # what holds a move-only value here; there is no second batcher and no
+    # second output pool anywhere.
+    var batcher: List[GpuLeafBatcher]
+    # The specialization level asked for, from
+    # `MOJOBOOST_GPU_HIST_SPECIALIZATION`. `SPEC_LEVEL_BASELINE` is the
+    # default and means every launch below is the one that shipped.
+    var spec_level: Int
+    # The transfer route `unified_memory_policy` resolved for the binned
+    # matrix. `ROUTE_COPY_STAGED` today; carried so the upload site and a
+    # trace name the same route.
+    var bins_route: Int
+    # Monotonic; changes exactly when the scales or the active feature set
+    # do, which is what a histogram slot's stamp has to encode.
+    var batch_stamp: Int
+    # The `batch_stamp` the batcher's feature table was last staged at, or
+    # -1 when it has never been staged.
+    var batch_feat_stamp: Int
 
     def __init__(
         out self, data: BinnedMatrix, strategy: Int = STRATEGY_AUTO
@@ -272,6 +387,26 @@ struct GpuHistogramBuilder(Movable):
         if len(data.bins) != data.n_rows * data.n_features:
             raise Error("binned matrix size must equal n_rows * n_features")
 
+        # The one route policy in the package answers for the binned
+        # matrix's upload. Every route but the staged copy is blocked or
+        # unproven today, so this returns the staged copy unless a caller
+        # set `MOJOBOOST_GPU_TRANSFER`, and an explicit request it cannot
+        # honor raises here rather than silently taking the default.
+        # `unified_memory` is False because a `DeviceCaps` does not report
+        # it, which is the same conservative answer `profile_from_caps`
+        # gives from the same three attributes. It can only widen what the
+        # resolver allows, so answering False cannot enable a route on a
+        # device that has not been shown to support it.
+        var route = resolve_from_env(ROLE_BINS, False)
+        if route.selected != ROUTE_COPY_STAGED:
+            raise Error(
+                "the GPU histogram builder implements the staged copy only,"
+                " and this run resolved to a different transfer route: ",
+                describe_decision(route),
+            )
+        self.bins_route = route.selected
+        self.spec_level = env_specialization_level()
+
         self.ctx = ctx
         self.n_rows = data.n_rows
         self.n_features = data.n_features
@@ -279,6 +414,7 @@ struct GpuHistogramBuilder(Movable):
         self.missing_bin = data.missing_bin.copy()
         self.cats = data.cats.copy()
         self.caps = caps.copy()
+        self.batcher = List[GpuLeafBatcher]()
         self.tiling = derive_tiling(
             self.caps, data.n_rows, data.n_features, data.n_bins, strategy
         )
@@ -289,6 +425,12 @@ struct GpuHistogramBuilder(Movable):
         self.g_scale = 1.0
         self.h_scale = 1.0
         self.has_gradients = False
+        # Bumped whenever the fixed-point scales or the active feature set
+        # change, which is exactly the pair `HistogramSlotPool` refuses to
+        # subtract across. Two slots carrying the same stamp were built under
+        # the same scales and the same features.
+        self.batch_stamp = 0
+        self.batch_feat_stamp = -1
         self.active = List[Int](capacity=data.n_features)
         for f in range(data.n_features):
             self.active.append(f)
@@ -326,9 +468,10 @@ struct GpuHistogramBuilder(Movable):
             3 * hist_size
         )
 
-        # Upload the binned matrix once; it is reused every call. The copy
-        # reads host memory owned by the caller's `data`, so it has to
-        # complete before the constructor returns.
+        # Upload the binned matrix once; it is reused every call. This is
+        # `ROUTE_COPY_STAGED`, the route resolved above, and the only one
+        # implemented here. The copy reads host memory owned by the caller's
+        # `data`, so it has to complete before the constructor returns.
         self.ctx.enqueue_copy(
             dst_buf=self.bins_dev, src_ptr=data.bins.unsafe_ptr()
         )
@@ -347,6 +490,18 @@ struct GpuHistogramBuilder(Movable):
     def synchronize(self) raises:
         """Block until every enqueued device operation has completed."""
         self.ctx.synchronize()
+
+    def range_of(self, node: Int) raises -> LeafRange:
+        """The half-open window of the device-resident active-row
+        permutation `node` currently owns.
+
+        The grower needs this to describe a leaf to a batched launch, and it
+        is the same table the partition kernel maintains rather than a second
+        host-side model of it, so a batch cannot disagree with the device
+        about which rows a node holds. `count()` is the node's row count and
+        equals the count the parent histogram's integer bins sum to.
+        """
+        return self.rows.range_of(node)
 
     def set_features(mut self, features: List[Int]) raises:
         """Restrict later `build_leaf` calls to `features` (global feature
@@ -370,6 +525,7 @@ struct GpuHistogramBuilder(Movable):
             return
 
         self.active = features.copy()
+        self.batch_stamp += 1
         # Fewer features in grid.x means fewer threadgroups, so the row
         # tiling is re-derived for the narrowed grid. The partial buffer is
         # never reallocated: its construction-time capacity is the cap.
@@ -404,6 +560,7 @@ struct GpuHistogramBuilder(Movable):
         var h_scale = _fixed_scale(hess)
         self.g_scale = Float64(g_scale)
         self.h_scale = Float64(h_scale)
+        self.batch_stamp += 1
 
         # Any copy still reading the staging buffers has to finish before
         # they are overwritten.
@@ -468,6 +625,7 @@ struct GpuHistogramBuilder(Movable):
         self.g_scale = Float64(device_fixed_scale(sums.grad))
         self.h_scale = Float64(device_fixed_scale(sums.hess))
         self.has_gradients = True
+        self.batch_stamp += 1
 
     def fill_softmax_gradients_device(
         mut self, mut state: GpuObjectiveState, k: Int
@@ -483,6 +641,7 @@ struct GpuHistogramBuilder(Movable):
         self.g_scale = Float64(device_fixed_scale(sums.grad))
         self.h_scale = Float64(device_fixed_scale(sums.hess))
         self.has_gradients = True
+        self.batch_stamp += 1
 
     def update_raw_device(
         mut self,
@@ -640,6 +799,240 @@ struct GpuHistogramBuilder(Movable):
         self.enqueue_leaf(leaf)
         self.download_raw()
         return self.histogram_from_host()
+
+    # -- batched multi-leaf construction ----------------------------------
+
+    def batching_live(self) -> Bool:
+        """Whether this builder holds a batched launcher."""
+        return len(self.batcher) > 0
+
+    def histogram_plan(self, node_rows: Int) raises -> HistogramPlan:
+        """The launch policy's plan for a node of `node_rows` rows on this
+        device, at the level this run asked for.
+
+        The one bridge from the builder's state to
+        `apple_histogram_policy`: the profile is this builder's own
+        `DeviceCaps`, the workload is this builder's dataset shape and active
+        feature count, and the partial budget is the buffer this builder
+        already allocated. Nothing is opened, allocated, or enqueued.
+
+        `DeviceHistogramCapabilities.portable()` is the honest answer for a
+        device that has reported nothing beyond being launchable, which is
+        every device here: `query_device_caps` reads three attributes and
+        neither a subgroup width nor a wide-load result is among them.
+        """
+        return derive_histogram_plan(
+            profile_from_caps(self.caps),
+            DeviceHistogramCapabilities.portable(),
+            build_kernel_features(),
+            HistogramWorkload.node(
+                self.n_rows, node_rows, len(self.active), self.n_bins
+            ),
+            self.tiling.strategy,
+            self.spec_level,
+            self.part_capacity,
+        )
+
+    def open_batching(mut self, pool_slots: Int = 0) raises -> Bool:
+        """Allocate the batched launcher, at most once per builder.
+
+        Returns True when a batcher is live afterwards. Refuses to allocate
+        anything unless `MOJOBOOST_GPU_HIST_SPECIALIZATION=batched` asked for
+        the batched level, so the default path pays neither the histogram
+        slot pool nor the second partial buffer.
+
+        The pool depth is `MOJOBOOST_GPU_BATCH_SLOTS` capped by what
+        `BATCH_POOL_BUDGET_BYTES` buys at this dataset's shape: a slot is a
+        full-width `3 * n_features * n_bins` Int32 histogram, so a wide
+        dataset gets fewer slots rather than a surprise allocation. A budget
+        that does not buy two slots leaves batching off, because a batch of
+        one is what the single-leaf path already does.
+        """
+        if self.spec_level < SPEC_LEVEL_BATCHED:
+            return False
+        if len(self.batcher) > 0:
+            return True
+        var want = pool_slots if pool_slots > 0 else env_batch_slots()
+        var affordable = slots_for_budget(
+            BATCH_POOL_BUDGET_BYTES, self.n_features, self.n_bins
+        )
+        var slots = want if want < affordable else affordable
+        if slots < 2:
+            return False
+        self.batcher.append(
+            GpuLeafBatcher(
+                self.ctx,
+                self.caps,
+                self.n_rows,
+                self.n_features,
+                self.n_bins,
+                slots,
+                self.part_capacity,
+                DEFAULT_MAX_ITEMS,
+                1,
+            )
+        )
+        self.batch_feat_stamp = -1
+        return True
+
+    def _histogram_from_words(self, words: List[Int32]) raises -> Histogram:
+        """One slot's fixed-point words as the Float64 `Histogram`.
+
+        The same arithmetic and the same current scales as
+        `histogram_from_host`, over a list instead of the pinned output
+        buffer, so a batched leaf and a single-leaf one decode identically.
+        """
+        var hist_size = self.n_features * self.n_bins
+        if len(words) != 3 * hist_size:
+            raise Error(
+                "a histogram slot must hold 3 * n_features * n_bins words"
+            )
+        var g = _zeroed_f64(hist_size)
+        var h = _zeroed_f64(hist_size)
+        var c = _zeroed_int(hist_size)
+        var g_inv = 1.0 / self.g_scale
+        var h_inv = 1.0 / self.h_scale
+        var gp = g.unsafe_ptr()
+        var hp = h.unsafe_ptr()
+        var cp = c.unsafe_ptr()
+        var src = words.unsafe_ptr()
+        for i in range(hist_size):
+            gp.unsafe_store(i, Float64(src.unsafe_load(i)) * g_inv)
+            hp.unsafe_store(i, Float64(src.unsafe_load(hist_size + i)) * h_inv)
+            cp.unsafe_store(i, Int(src.unsafe_load(2 * hist_size + i)))
+        return Histogram(g^, h^, c^, self.n_features, self.n_bins)
+
+    def _build_leaves_batched(
+        mut self, nodes: List[Int], counts: List[Int]
+    ) raises -> List[Histogram]:
+        """Every node's histogram, several leaves per launch.
+
+        Chunked at the smaller of the batcher's item bound and its slot pool,
+        so a frontier larger than either is served by several launches rather
+        than refused. Each chunk stages its plan, launches, and downloads,
+        which is also what upholds `_stage_plan`'s ordering contract: a
+        chunk's copies have retired before the next chunk stages over the
+        pinned tables.
+        """
+        if not self.has_gradients:
+            raise Error("call upload_gradients before build_leaves")
+        var n = len(nodes)
+        var out = List[Histogram](capacity=n)
+        var g32 = Float32(self.g_scale)
+        var h32 = Float32(self.h_scale)
+        var chunk = self.batcher[0].max_items
+        var pool_cap = self.batcher[0].pool.capacity
+        if pool_cap < chunk:
+            chunk = pool_cap
+        if chunk < 1:
+            raise Error("the batched launcher holds no usable slots")
+
+        # The active feature set reaches the batch through its own per-item
+        # table, so it is staged when it (or the round's scales) last moved
+        # rather than once per launch.
+        if self.batch_feat_stamp != self.batch_stamp:
+            self.batcher[0].set_shared_features(self.active)
+            self.batch_feat_stamp = self.batch_stamp
+
+        var taken = 0
+        while taken < n:
+            var take = n - taken
+            if take > chunk:
+                take = chunk
+            var items = List[LeafWorkItem](capacity=take)
+            var scales = List[Float32](capacity=2 * take)
+            for j in range(take):
+                var node = nodes[taken + j]
+                var r = self.rows.range_of(node)
+                var slot = self.batcher[0].pool.acquire(node, self.batch_stamp)
+                if slot < 0:
+                    raise Error(
+                        "the batched histogram slot pool is full; raise"
+                        " MOJOBOOST_GPU_BATCH_SLOTS or build fewer leaves at"
+                        " once"
+                    )
+                items.append(
+                    LeafWorkItem(taken + j, node, r.begin, r.count(), slot, 0)
+                )
+                scales.append(g32)
+                scales.append(h32)
+            var plan = plan_batch(
+                self.caps,
+                items,
+                scales,
+                len(self.active),
+                self.n_bins,
+                self.tiling.strategy,
+                self.part_capacity,
+                self.batcher[0].max_items,
+            )
+            self.batcher[0].enqueue_batch(
+                plan,
+                self.bins_dev.unsafe_ptr(),
+                self.rows.rows_dev.unsafe_ptr(),
+                self.grad_dev.unsafe_ptr(),
+                self.hess_dev.unsafe_ptr(),
+            )
+            for j in range(take):
+                var slot = items[j].out_slot
+                out.append(
+                    self._histogram_from_words(
+                        self.batcher[0].download_slot(slot)
+                    )
+                )
+                self.batcher[0].pool.release(slot)
+            taken += take
+        _ = counts
+        return out^
+
+    def build_leaves(mut self, nodes: List[Int]) raises -> List[Histogram]:
+        """Every node's histogram, in `nodes` order.
+
+        The multi-leaf entry point, and the one a grower with more than one
+        pending leaf should call. Whether it batches is not this method's
+        decision and not a new switch: the level comes from
+        `MOJOBOOST_GPU_HIST_SPECIALIZATION` and the verdict from
+        `apple_histogram_policy.batching_declined_reason`, which declines a
+        batch of fewer than two leaves and a frontier whose every leaf
+        already fills the device. Declined, unrequested, or unaffordable,
+        each node goes through `build_leaf` exactly as before, so a caller
+        may always call this and never has to branch on the policy itself.
+
+        The plan the verdict is read off belongs to the batch's *largest*
+        node, which is the leaf with the best chance of filling the device
+        alone: if even its geometry leaves the device short, no smaller leaf
+        in the batch fills it either.
+        """
+        if len(nodes) < 1:
+            raise Error("build_leaves needs at least one node")
+        var counts = List[Int](capacity=len(nodes))
+        var widest = 0
+        for i in range(len(nodes)):
+            for k in range(i):
+                if nodes[k] == nodes[i]:
+                    raise Error("build_leaves may not hold a node twice")
+            var rows = self.rows.range_of(nodes[i]).count()
+            counts.append(rows)
+            if rows > widest:
+                widest = rows
+
+        var verdict = REASON_NOT_REQUESTED
+        if self.spec_level >= SPEC_LEVEL_BATCHED and len(nodes) >= 2:
+            if self.open_batching():
+                verdict = batching_declined_reason(
+                    self.histogram_plan(widest),
+                    profile_from_caps(self.caps),
+                    build_kernel_features(),
+                    counts,
+                    len(self.active),
+                )
+        if verdict == REASON_AS_REQUESTED:
+            return self._build_leaves_batched(nodes, counts)
+
+        var out = List[Histogram](capacity=len(nodes))
+        for i in range(len(nodes)):
+            out.append(self.build_leaf(nodes[i]))
+        return out^
 
     def build(
         mut self, grad: List[Float64], hess: List[Float64]

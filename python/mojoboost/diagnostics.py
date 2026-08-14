@@ -74,11 +74,13 @@ __all__ = [
     "InstallDescription",
     "PhaseTiming",
     "StartupReport",
+    "WarmupSummary",
     "describe_install",
     "environment_snapshot",
     "extension_loaded",
     "format_duration",
     "parse_trace",
+    "parse_warmup",
     "report_from_trace",
     "report_from_values",
 ]
@@ -188,7 +190,10 @@ _BY_NAME = {phase.name: phase for phase in PHASES}
 #: `src/mojoboost/parallel.mojo`.
 WATCHED_ENV = (
     "MOJOBOOST_STARTUP_TRACE",
+    "MOJOBOOST_STARTUP_REPORT_FD",
     "MOJOBOOST_GPU_WARMUP",
+    "MOJOBOOST_GPU_TRANSFER",
+    "MOJOBOOST_GPU_TRANSFER_UNPROVEN",
     "MOJOBOOST_GPU_TRACE",
     "MOJOBOOST_GPU_STAGING_SLOTS",
     "MOJOBOOST_GPU_HIST_STRATEGY",
@@ -527,16 +532,165 @@ def parse_trace(text):
     return timings
 
 
+class WarmupSummary:
+    """What a run front-loaded before its first fit, and what that cost.
+
+    The other half of what `src/mojoboost/initialization.mojo` emits.
+    `WarmupPlan.report()` has been writing these lines since the module was
+    written and nothing parsed them, so a run with `MOJOBOOST_GPU_WARMUP=train`
+    produced a record that no report could show. This is the parser.
+
+    `planned` and `created` differ when the run did not reach every kernel it
+    intended to create, which is the case a reader wants: a plan of six with
+    two created is not a warm-up, it is a warm-up that was interrupted.
+
+    `total_ns` is zero on an untraced run even when kernels were created,
+    because `WarmupPlan.note_created` records a duration only when the owning
+    trace is enabled. Creation is tracked by the flag, never by a nonzero
+    duration, and this class keeps that distinction.
+    """
+
+    __slots__ = ("level", "planned", "created", "total_ns", "kernels")
+
+    def __init__(self, level="off", planned=0, created=0, total_ns=0, kernels=()):
+        self.level = level
+        self.planned = int(planned)
+        self.created = int(created)
+        self.total_ns = int(total_ns)
+        #: `(kernel_id, created, nanos)` per planned kernel, in plan order.
+        self.kernels = tuple(kernels)
+
+    @property
+    def pending(self):
+        """Kernels planned but never created."""
+        return max(0, self.planned - self.created)
+
+    @property
+    def is_off(self):
+        """True for a run that front-loaded nothing, which is the default
+        and reproduces the behavior where every kernel is created on the
+        launch that first needs it."""
+        return self.level == "off" and self.planned == 0
+
+    def slowest_kernel(self):
+        """`(kernel_id, nanos)` for the costliest creation, or None when
+        nothing was created or nothing was timed. Whether warm-up is worth
+        doing at all is dominated by this one."""
+        best = None
+        for kernel_id, created, nanos in self.kernels:
+            if not created or nanos <= 0:
+                continue
+            if best is None or nanos > best[1]:
+                best = (kernel_id, nanos)
+        return best
+
+    def to_dict(self):
+        return {
+            "level": self.level,
+            "planned": self.planned,
+            "created": self.created,
+            "pending": self.pending,
+            "total_ns": self.total_ns,
+            "kernels": [
+                {"id": k, "created": c, "nanos": n} for k, c, n in self.kernels
+            ],
+        }
+
+    def describe(self):
+        if self.is_off:
+            return (
+                "off: every kernel is created on the launch that first needs"
+                " it"
+            )
+        text = "%s: %d of %d kernels created" % (
+            self.level,
+            self.created,
+            self.planned,
+        )
+        if self.total_ns > 0:
+            text += " in %s" % format_duration(self.total_ns)
+            slowest = self.slowest_kernel()
+            if slowest is not None:
+                text += " (slowest kernel %d, %s)" % (
+                    slowest[0],
+                    format_duration(slowest[1]),
+                )
+        else:
+            text += " (untimed; set MOJOBOOST_STARTUP_TRACE=1 for durations)"
+        if self.pending:
+            text += "; %d planned kernel(s) never created" % self.pending
+        return text
+
+    def __repr__(self):
+        return "<WarmupSummary %s %d/%d>" % (
+            self.level,
+            self.created,
+            self.planned,
+        )
+
+
+def parse_warmup(text):
+    """Parse `WarmupPlan.report()` output into a `WarmupSummary`.
+
+    The wire format, four scalar lines and one line per planned kernel:
+
+        warmup.level <off|train|all>
+        warmup.planned <n>
+        warmup.created <n>
+        warmup.total_ns <n>
+        warmup.kernel <id> <created> <ns>
+
+    Lines that are not `warmup.` prefixed are ignored, so a plan report and
+    a startup trace can be pasted in together, which is how they are emitted.
+    A text with no `warmup.` lines yields the default off summary rather than
+    raising: a run that front-loaded nothing has nothing to report, and that
+    is not a schema error.
+
+    Raises `ValueError` on a malformed `warmup.kernel` line, for the same
+    reason `parse_trace` does: a schema that has drifted should be loud.
+    """
+    level = "off"
+    planned = 0
+    created = 0
+    total_ns = 0
+    kernels = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line.startswith("warmup."):
+            continue
+        parts = line.split()
+        key = parts[0][len("warmup.") :]
+        if key == "kernel":
+            if len(parts) != 4:
+                raise ValueError(
+                    "warmup.kernel has %d fields, expected 4" % len(parts)
+                )
+            kernels.append((int(parts[1]), parts[2] == "1", int(parts[3])))
+        elif key == "level" and len(parts) == 2:
+            level = parts[1]
+        elif key == "planned" and len(parts) == 2:
+            planned = int(parts[1])
+        elif key == "created" and len(parts) == 2:
+            created = int(parts[1])
+        elif key == "total_ns" and len(parts) == 2:
+            total_ns = int(parts[1])
+    return WarmupSummary(level, planned, created, total_ns, kernels)
+
+
 class StartupReport:
     """A startup measurement, formatted.
 
-    Holds one `PhaseTiming` per phase in `PHASES`, an environment
-    snapshot, and any notes the caller wants carried along. Phases the
-    source did not mention are present and unobserved, so a consumer can
-    iterate `PHASES` and always find an entry.
+    Holds one `PhaseTiming` per phase in `PHASES`, a `WarmupSummary`, an
+    environment snapshot, and any notes the caller wants carried along.
+    Phases the source did not mention are present and unobserved, so a
+    consumer can iterate `PHASES` and always find an entry.
+
+    `warmup` defaults to the off summary rather than to None, for the same
+    reason: a report that front-loaded nothing has an answer, and it is
+    "nothing", not "unknown".
     """
 
-    def __init__(self, timings, environment=None, notes=None):
+    def __init__(self, timings, environment=None, notes=None, warmup=None):
         self.timings = {}
         for phase in PHASES:
             supplied = timings.get(phase.name)
@@ -545,6 +699,7 @@ class StartupReport:
             self.timings[phase.name] = supplied
         self.environment = environment or {}
         self.notes = list(notes or ())
+        self.warmup = WarmupSummary() if warmup is None else warmup
 
     # -- derived numbers --------------------------------------------------
 
@@ -667,6 +822,7 @@ class StartupReport:
                 "supplied by the harness, not timed by this process: %s"
                 % ", ".join(sorted(supplied))
             )
+        parts.append("kernel warm-up: %s" % self.warmup.describe())
         missing = [p.name for p in PHASES if not self.timings[p.name].observed]
         if missing:
             parts.append(
@@ -706,6 +862,7 @@ class StartupReport:
             "warm_ns": self.warm_ns,
             "overhead_ns": self.overhead_ns,
             "has_timings": self.has_timings,
+            "warmup": self.warmup.to_dict(),
             "environment": self.environment,
             "notes": list(self.notes),
         }
@@ -723,16 +880,20 @@ class StartupReport:
 def report_from_trace(text, environment=None, notes=None):
     """A report from `StartupTrace.report()` output.
 
+    `text` may also carry the `warmup.` lines `WarmupPlan.report()` emits;
+    they are picked up when present and ignored when not, so the two reports
+    can be concatenated by whatever emits them and pasted in together.
+
     `environment` defaults to `environment_snapshot()`. Pass one captured
     in the measured process instead when the trace came from elsewhere:
     the snapshot describes whichever process calls it, and describing the
     wrong one is worse than describing none.
     """
     env = environment_snapshot() if environment is None else environment
-    return StartupReport(parse_trace(text), env, notes)
+    return StartupReport(parse_trace(text), env, notes, parse_warmup(text))
 
 
-def report_from_values(values, environment=None, notes=None):
+def report_from_values(values, environment=None, notes=None, warmup=None):
     """A report from phase durations measured by a harness.
 
     `values` maps phase names to either an integer nanosecond duration or
@@ -767,4 +928,4 @@ def report_from_values(values, environment=None, notes=None):
                 name, calls=1, total_ns=nanos, first_ns=nanos, observed=True
             )
     env = environment_snapshot() if environment is None else environment
-    return StartupReport(timings, env, notes)
+    return StartupReport(timings, env, notes, warmup)

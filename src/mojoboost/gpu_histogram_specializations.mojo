@@ -1,10 +1,10 @@
 """Primitives for specializing the GPU histogram path.
 
 The pieces a specialized histogram kernel would be built out of, and nothing
-that launches one. Every function here is arithmetic over Ints and Bools: no
-`DeviceContext`, no allocation, no kernel, no environment read. That is
-deliberate, and it is what lets the whole specialization story be reasoned
-about (and later tested) on a machine with no accelerator.
+that launches one. Every function here is arithmetic over Ints and Bools: none
+of them opens a `DeviceContext`, allocates, launches a kernel, or reads the
+environment. That is deliberate, and it is what lets the whole specialization
+story be reasoned about (and later tested) on a machine with no accelerator.
 
 Three specializations are described here, in increasing order of how much
 they demand of the kernel side:
@@ -31,6 +31,10 @@ they demand of the kernel side:
    assumed. `plan_packed_window` computes the aligned span of such a run, and
    `pack4_bins`/`unpack_bin` are the portable pack and extract. See the
    capability boundary below for what a wide load would have to prove first.
+   The window arithmetic is only valid on a one-byte-per-cell, one-feature-
+   per-block matrix, so `plan_packed_window_for` takes a
+   `BinStorageDescriptor` and refuses every other layout outright rather than
+   planning a window that would read the wrong bytes.
 
 3. **Batched small leaves, planned elsewhere.** A node whose histogram
    launches fewer threadgroups than the device can hold leaves the device
@@ -73,24 +77,35 @@ No policy. Which specialization to use for which device and shape is
 `apple_histogram_policy.mojo`, which is also where the default-off gate
 lives. Nothing here selects anything.
 
-Two constants are mirrored from `gpu_tiling.mojo` so this module stands alone
-while it lands alongside concurrent work on that file, following the pattern
-`apple_gpu_policy.mojo` established. They are marked, and
-handoffs/performance_14_gpu_histogram.md records that they collapse into
-imports at integration.
+The storage descriptor
+----------------------
+`BinStorageDescriptor` is this lane's single answer to "what does one
+(row, feature) cell of the device-resident bin matrix actually cost to read".
+It is produced by `gpu_binned_layout.BinLayoutPlan.storage_descriptor` (the
+one module allowed to *choose* a storage width) and consumed here, so a
+specialization never re-derives a width, a byte offset, or a shared-memory
+footprint from a bin count it happened to be handed. `plan_packed_window`
+below used to assume one byte per cell silently; `plan_packed_window_for`
+takes the descriptor and refuses every layout that assumption is false for.
+
+Two constants used to be mirrored from `gpu_tiling.mojo` so this module could
+stand alone while it landed alongside concurrent work on that file. That was
+the pre-integration arrangement handoffs/performance_14_gpu_histogram.md
+recorded; `BYTES_PER_PARTIAL_CELL` is now imported from `gpu_tiling.mojo`
+rather than copied. `MAX_BINS` stays defined here because this is the lowest
+module of the GPU dataflow lane, and `gpu_active_rows.mojo`,
+`gpu_leaf_batching.mojo`, and `gpu_binned_layout.mojo` now import it from
+here instead of each declaring their own 256.
 """
 
+from .gpu_tiling import BYTES_PER_PARTIAL_CELL
 
-# --- Mirrors of gpu_tiling.mojo. ---
 
 # The bin ceiling the GPU backend enforces, and the width the shipping
-# kernels allocate in threadgroup memory unconditionally.
+# kernels allocate in threadgroup memory unconditionally. This is the lane's
+# single definition; `gpu_active_rows`, `gpu_leaf_batching`, and
+# `gpu_binned_layout` import it from here.
 comptime MAX_BINS = 256
-
-# Int32 gradient + Int32 hessian + Int32 count per (tile, feature, bin).
-comptime BYTES_PER_PARTIAL_CELL = 12
-
-# --- End mirrors. ---
 
 
 # A histogram is three planes (gradient, hessian, count), each one Int32 per
@@ -115,10 +130,6 @@ comptime PACK_LANES = 4
 # An aligned body shorter than this is not worth a separate code path: the
 # head and tail loops would dominate whatever the body saved.
 comptime MIN_PACKED_BODY_QUADS = 4
-
-
-def _ceil_div(a: Int, b: Int) -> Int:
-    return (a + b - 1) // b
 
 
 # --- Bin capacity classes ---
@@ -259,6 +270,258 @@ def layout_for(capacity: Int) raises -> SharedHistogramLayout:
         PLANES_PER_HISTOGRAM * capacity,
         kernel_shared_bytes(capacity),
     )
+
+
+# --- Bin storage descriptor ---
+#
+# The one description of the device-resident bin matrix every specialization
+# in this lane reads. `gpu_binned_layout.mojo` is the only module allowed to
+# choose the storage; this module only reports what a chosen storage costs and
+# refuses the specializations it invalidates.
+
+comptime BIN_STORAGE_PACKED = 0
+"""Sub-byte packing, 1 through 7 bits per cell. A cell is *not* a byte, so
+every byte-index assumption elsewhere (`bins[f * n_rows + r]`, the four-lane
+packed window) is wrong for it and has to go through
+`gpu_bin_packing.element_byte_offset` and `element_bit_shift` instead."""
+
+comptime BIN_STORAGE_U8 = 1
+"""One `UInt8` per cell. What `GpuHistogramBuilder` uploads today, and the
+only storage the shipping kernels index."""
+
+comptime BIN_STORAGE_U16 = 2
+"""Two bytes per cell. Reachable only by a dataset with more than 256 bins,
+which `binning.fit_bins` and `BinnedMatrix.bins: List[UInt8]` cannot express,
+so no plan in this repository resolves to it. Named rather than omitted so a
+descriptor can report the truth instead of silently claiming `UInt8`."""
+
+comptime BIN_STORAGE_WIDER = 3
+"""Four or more bytes per cell. Same status as `BIN_STORAGE_U16`."""
+
+
+def bin_storage_name(storage: Int) -> String:
+    if storage == BIN_STORAGE_PACKED:
+        return String("packed-subbyte")
+    if storage == BIN_STORAGE_U8:
+        return String("u8")
+    if storage == BIN_STORAGE_U16:
+        return String("u16")
+    if storage == BIN_STORAGE_WIDER:
+        return String("wider")
+    return String("unknown")
+
+
+def storage_for_width(element_bits: Int) raises -> Int:
+    """The storage class a per-cell bit width lands in.
+
+    Truthful in both directions: a width of 8 is `BIN_STORAGE_U8` and nothing
+    else, a width below 8 is packed and must not be read as bytes, and a width
+    above 8 is reported as the wide storage it is rather than rounded down.
+    Widths at or below zero are a caller error, not a storage class.
+    """
+    if element_bits < 1:
+        raise Error("a bin cell must be at least one bit wide")
+    if element_bits < 8:
+        return BIN_STORAGE_PACKED
+    if element_bits == 8:
+        return BIN_STORAGE_U8
+    if element_bits <= 16:
+        return BIN_STORAGE_U16
+    return BIN_STORAGE_WIDER
+
+
+def storage_bytes_per_element(storage: Int) raises -> Int:
+    """Whole bytes one cell occupies, or 0 for the sub-byte storage, whose
+    cells do not occupy a whole number of bytes at all."""
+    if storage == BIN_STORAGE_PACKED:
+        return 0
+    if storage == BIN_STORAGE_U8:
+        return 1
+    if storage == BIN_STORAGE_U16:
+        return 2
+    if storage == BIN_STORAGE_WIDER:
+        return 4
+    raise Error("unknown bin storage class")
+
+
+def storage_is_byte_addressable(storage: Int) -> Bool:
+    """Whether cell `i` of a stream starts at byte `i * bytes_per_element`.
+    False for the packed storage, whose cells start at bit offsets."""
+    return storage != BIN_STORAGE_PACKED
+
+
+def storage_is_shipping(storage: Int) -> Bool:
+    """Whether the kernels compiled into this build can read this storage.
+
+    Exactly one storage class is: the `UInt8` matrix every shipping kernel
+    indexes as `bins[f * n_rows + r]`. Everything else needs a kernel that
+    does not exist yet, which is why `BinStorageDescriptor.check_shipping`
+    refuses rather than letting a caller upload bytes no kernel can decode.
+    """
+    return storage == BIN_STORAGE_U8
+
+
+@fieldwise_init
+struct BinStorageDescriptor(Copyable, Movable):
+    """How one dataset's bins are stored on the device, and what that costs.
+
+    Small on purpose: everything a histogram kernel needs to know about the
+    bin matrix, and nothing about how the layout was chosen. `block_features`
+    is the blocking factor `G` (1 for the feature-major matrix in use today),
+    which is what decides whether a row's cells are contiguous and how much
+    threadgroup memory one block's partial histograms need.
+
+    The two marker flags are not decoration. Packing never renumbers a bin
+    (`gpu_bin_packing` refuses to), so the missing bin keeps its id and a
+    categorical bin keeps its position in the 256-bit `CatBitset` *provided
+    the chosen width can represent it*. A width too narrow for a feature's
+    missing bin or its highest category bin would drop the marker silently,
+    which is the one way this lane could train on a different dataset than the
+    caller binned. `gpu_binned_layout.check_markers_preserved` is what sets
+    these, and `check` refuses a descriptor that admits either loss.
+    """
+
+    var storage: Int
+    var element_bits: Int
+    """Bits one (row, feature) cell occupies. 8 for the shipping matrix."""
+
+    var dataset_rows: Int
+    var n_features: Int
+    var n_bins: Int
+    var block_features: Int
+    """`G`: features stored together, row-major inside the block. 1 for the
+    feature-major matrix, `n_features` for a fully row-major one."""
+
+    var passthrough: Bool
+    """Whether the device buffer *is* `BinnedMatrix.bins`: byte `f * n_rows + r`
+    holds cell (r, f), no packing pass ran, and no decode instruction
+    executes."""
+
+    var missing_marker_preserved: Bool
+    var categorical_marker_preserved: Bool
+
+    @staticmethod
+    def dense_u8(
+        dataset_rows: Int, n_features: Int, n_bins: Int
+    ) raises -> BinStorageDescriptor:
+        """The matrix `GpuHistogramBuilder` uploads today.
+
+        This is the conservative descriptor: a caller that has made no layout
+        decision passes it and gets exactly the behaviour the shipping kernels
+        already have, with the markers preserved because width 8 holds every
+        id a `UInt8` bin matrix can contain.
+        """
+        var d = BinStorageDescriptor(
+            BIN_STORAGE_U8,
+            8,
+            dataset_rows,
+            n_features,
+            n_bins,
+            1,
+            True,
+            True,
+            True,
+        )
+        d.check()
+        return d^
+
+    def check(self) raises:
+        """Refuse a descriptor that is internally inconsistent or that admits
+        a lost marker. Cheap, and called by every producer here."""
+        if self.dataset_rows < 1:
+            raise Error("a bin storage descriptor needs at least one row")
+        if self.n_features < 1:
+            raise Error("a bin storage descriptor needs at least one feature")
+        if self.n_bins < 1 or self.n_bins > MAX_BINS:
+            raise Error("the GPU backend supports 1 to 256 bins")
+        if self.block_features < 1 or self.block_features > self.n_features:
+            raise Error("block feature count out of range")
+        if self.storage != storage_for_width(self.element_bits):
+            raise Error(
+                "bin storage class does not match its element width"
+            )
+        if not self.missing_marker_preserved:
+            raise Error(
+                "the chosen bin width cannot represent a feature's missing"
+                " bin; widen the feature or keep the 8-bit layout"
+            )
+        if not self.categorical_marker_preserved:
+            raise Error(
+                "the chosen bin width cannot represent a categorical"
+                " feature's highest category bin; widen the feature or keep"
+                " the 8-bit layout"
+            )
+        if self.passthrough and not self.is_dense_feature_major_u8():
+            raise Error(
+                "only a one-feature-per-block 8-bit layout is a passthrough"
+            )
+
+    def check_shipping(self) raises:
+        """Refuse a storage no kernel in this build can read.
+
+        The explicit failure the integration contract asks for: a caller that
+        resolves to a packed or wide layout is told that the kernels index
+        `UInt8` cells, rather than uploading a buffer the kernels would
+        misread as bytes and train on.
+        """
+        self.check()
+        if not storage_is_shipping(self.storage):
+            raise Error(
+                "the GPU histogram kernels read one UInt8 per (row, feature)"
+                " cell; this dataset resolved to "
+                + bin_storage_name(self.storage)
+                + " storage, which needs a decoding kernel that is not"
+                " compiled in. Keep the 8-bit feature-major layout"
+            )
+        if self.block_features != 1:
+            raise Error(
+                "the GPU histogram kernels index bins[f * n_rows + r], which"
+                " is a one-feature-per-block layout; a blocked layout needs a"
+                " kernel that is not compiled in"
+            )
+
+    def is_dense_feature_major_u8(self) -> Bool:
+        """Whether cell (r, f) is byte `f * dataset_rows + r`, which is the
+        assumption every byte-index formula in this module rests on."""
+        return self.storage == BIN_STORAGE_U8 and self.block_features == 1
+
+    def bytes_per_element(self) raises -> Int:
+        return storage_bytes_per_element(self.storage)
+
+    def row_bits_per_block(self) -> Int:
+        """Bits one row of one block occupies: `G * element_bits`. What
+        decides whether a block's row lands inside one memory sector."""
+        return self.block_features * self.element_bits
+
+    def dense_bytes(self) -> Int:
+        """What the same matrix costs as the `UInt8` buffer in use today."""
+        return self.dataset_rows * self.n_features
+
+    def bin_capacity(self) raises -> Int:
+        """The specialization capacity a kernel reading this descriptor is
+        instantiated at.
+
+        Bounded by the descriptor's *storage* as well as by `n_bins`: a cell
+        of `w` bits can only produce ids `0 .. 2^w - 1`, so a 4-bit feature
+        never needs a 256-wide partial histogram however large `n_bins` is.
+        """
+        var reachable = self.n_bins
+        if self.element_bits < 8:
+            var by_width = 1 << self.element_bits
+            if by_width < reachable:
+                reachable = by_width
+        return bin_capacity_for(reachable)
+
+    def kernel_shared_bytes_per_block(self) raises -> Int:
+        """Threadgroup memory one block of a *specialized* kernel needs to
+        hold one partial histogram per feature of the storage block."""
+        return self.block_features * kernel_shared_bytes(self.bin_capacity())
+
+    def shipping_shared_bytes_per_block(self) -> Int:
+        """Threadgroup memory one block of the kernels compiled in today
+        occupies, which does not depend on the descriptor at all: three
+        `MAX_BINS`-wide Int32 planes."""
+        return unspecialized_kernel_shared_bytes()
 
 
 # --- The capability boundary ---
@@ -432,6 +695,10 @@ comptime WINDOW_OK = 0
 comptime WINDOW_NOT_A_RUN = 1
 comptime WINDOW_STRIDE_UNALIGNED = 2
 comptime WINDOW_TOO_SHORT = 3
+comptime WINDOW_STORAGE_NOT_BYTES = 4
+"""The bin matrix is not one `UInt8` per cell, so an element index is not a
+byte offset and a four-row group is not four bytes. Reported rather than
+silently mis-planned; see `plan_packed_window_for`."""
 
 
 def window_reason_name(reason: Int) -> String:
@@ -443,6 +710,8 @@ def window_reason_name(reason: Int) -> String:
         return String("column_stride_unaligned")
     if reason == WINDOW_TOO_SHORT:
         return String("body_too_short")
+    if reason == WINDOW_STORAGE_NOT_BYTES:
+        return String("storage_is_not_one_byte_per_cell")
     return String("unknown")
 
 
@@ -486,3 +755,53 @@ def plan_packed_window(
     if body_quads < MIN_PACKED_BODY_QUADS:
         return PackedLoadWindow(False, count, 0, 0, WINDOW_TOO_SHORT)
     return PackedLoadWindow(True, head, body_quads, tail, WINDOW_OK)
+
+
+def plan_packed_window_for(
+    storage: BinStorageDescriptor,
+    first_row: Int,
+    count: Int,
+    rows_are_contiguous_run: Bool,
+) raises -> PackedLoadWindow:
+    """`plan_packed_window` against a storage descriptor instead of against a
+    bare row count.
+
+    This is the form a caller should use, and the reason it exists is stated
+    in `PackedLoadWindow`'s own docstring: the four-lane window arithmetic is
+    only correct when one cell is one byte and one column starts at
+    `f * dataset_rows`. Handing it a packed or blocked layout does not make it
+    slower, it makes it read the wrong bytes. So the descriptor decides, and a
+    layout the window cannot describe comes back unusable with
+    `WINDOW_STORAGE_NOT_BYTES` rather than as a plan.
+
+    `dataset_rows` comes from the descriptor rather than from the caller, so a
+    window can never be planned against a row count the matrix does not have.
+    """
+    storage.check()
+    if not storage.is_dense_feature_major_u8():
+        return PackedLoadWindow(False, count, 0, 0, WINDOW_STORAGE_NOT_BYTES)
+    return plan_packed_window(
+        storage.dataset_rows, first_row, count, rows_are_contiguous_run
+    )
+
+
+def features_admit(
+    features: KernelFeatures,
+    device: DeviceHistogramCapabilities,
+    storage: BinStorageDescriptor,
+) raises -> Bool:
+    """Whether the packed-load specialization may run at all for this build,
+    device, and storage.
+
+    All three have to agree, and the storage is the one a caller is most
+    likely to forget: a build with `packed_bin_loads` compiled in, on a device
+    that reports `wide_byte_loads`, still may not use it on a sub-byte or
+    blocked matrix. Reported as a Bool because selection is
+    `apple_histogram_policy`'s job, not this module's.
+    """
+    storage.check()
+    if not features.packed_bin_loads:
+        return False
+    if not device.wide_byte_loads:
+        return False
+    return storage.is_dense_feature_major_u8()

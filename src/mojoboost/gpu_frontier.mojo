@@ -130,6 +130,56 @@ def candidate_state_name(state: Int) -> String:
     return String("invalid")
 
 
+@fieldwise_init
+struct LeafStats(Copyable, Movable):
+    """One leaf's gradient sum, hessian sum, and row count.
+
+    The statistics the frontier owns, alongside the offsets and lengths. They
+    are what a leaf's output value is computed from and what the sibling
+    subtraction operates on, and holding them here is what lets a grower
+    derive a sibling without either downloading a histogram or asking the
+    device for a second one.
+
+    `count` is exact. The two sums are whatever precision produced them: the
+    host split scan sums a downloaded Float64 histogram, the device search
+    returns Float32 child statistics. Both are recorded as Float64 and neither
+    is claimed to equal the other, which is the same honesty
+    `_grow_tree_gpu_device_search` already states about its gains.
+
+    Under bagging or GOSS these are sums over the *bag*, because the frontier
+    only ever sees the rows the active-row permutation made live, and under
+    GOSS they are sums of already-scaled gradients, because GOSS scaling is
+    applied to the gradients before they are uploaded. Nothing here rescales
+    anything; see `LeafFrontier`'s row-weight note.
+    """
+
+    var sum_grad: Float64
+    var sum_hess: Float64
+    var count: Int
+
+    @staticmethod
+    def zero() -> LeafStats:
+        return LeafStats(0.0, 0.0, 0)
+
+    def subtract(self, child: LeafStats) -> LeafStats:
+        """`self - child`: the sibling's statistics.
+
+        The host mirror of `gpu_leaf_batching.enqueue_subtract`, and subject
+        to the same condition: the two must have been accumulated over the
+        same rows-partition (parent = left + right) for the difference to mean
+        anything. The count comes out exact; the sums come out to the
+        precision of their inputs.
+        """
+        return LeafStats(
+            self.sum_grad - child.sum_grad,
+            self.sum_hess - child.sum_hess,
+            self.count - child.count,
+        )
+
+    def is_empty(self) -> Bool:
+        return self.count <= 0
+
+
 struct LeafCandidate(Copyable, Movable):
     """One leaf's best split and everything a commit needs from it.
 
@@ -248,6 +298,12 @@ struct FrontierLeaf(Copyable, Movable):
     var hist_slot: Int
     var partitioned: Bool
     var candidate: LeafCandidate
+    var stats: LeafStats
+    """This leaf's gradient sum, hessian sum, and row count. `count` is
+    maintained by the frontier itself and always equals `row_count`; the two
+    sums are `stats_known` only once a search or a subtraction filed them."""
+
+    var stats_known: Bool
 
     def __init__(
         out self,
@@ -267,6 +323,8 @@ struct FrontierLeaf(Copyable, Movable):
         self.hist_slot = NO_SLOT
         self.partitioned = False
         self.candidate = LeafCandidate()
+        self.stats = LeafStats(0.0, 0.0, row_count)
+        self.stats_known = False
 
     def row_end(self) -> Int:
         return self.row_begin + self.row_count
@@ -350,6 +408,16 @@ struct CommitPlan(Copyable, Movable):
     var branch: List[Int]
     var bounds: ChildBounds
     var split: SplitInfo
+    var missing_bin: Int
+    """The split feature's missing bin, or -1 when it has none.
+
+    Carried on the plan because the routing rule needs it and the frontier is
+    the last place that knows which feature was split. It is what lets
+    `GpuActiveRows.apply_commit` build the `RowRouting` itself, so a caller
+    partitions a leaf without restating the missing/categorical rule for a
+    fourth time. A categorical split ignores it, exactly as
+    `RowRouting.from_split` does.
+    """
 
     def smaller_child_node(self) -> Int:
         return self.left_node if self.build_left else self.right_node
@@ -360,12 +428,57 @@ struct CommitPlan(Copyable, Movable):
     def smaller_child_rows(self) -> Int:
         return self.left_count if self.build_left else self.right_count
 
+    def smaller_child_slot_is_left(self) -> Bool:
+        """Whether the child whose histogram is built occupies the parent's
+        frontier slot. The left child always does (see `apply_commit`), so
+        this is `build_left` under another name and is spelled out because a
+        caller routing a batched result back needs the slot, not the node."""
+        return self.build_left
+
 
 def subtraction_builds_left(n_left: Int, n_right: Int) -> Bool:
     """Which child the histogram is built for, the other coming from the
     subtraction. Ties go to the left child, matching `grow_tree` and
     `grow_tree_gpu`, both of which test `n_left <= n_right`."""
     return n_left <= n_right
+
+
+# --- Completion -----------------------------------------------------------
+#
+# Why a tree stopped growing, as a state the frontier owns rather than as the
+# shape of a `while` loop in the trainer. Both growers in `train_gpu.mojo`
+# leave the same tree for the two reasons below and record neither, so a
+# caller cannot tell a tree that ran out of budget from one that ran out of
+# splits. It is the difference between "raise num_leaves" and "nothing left to
+# find".
+
+comptime FRONTIER_GROWING = 0
+"""At least one leaf holds a ready candidate and the budget is not spent."""
+
+comptime FRONTIER_BUDGET_SPENT = 1
+"""`max_leaves` reached. Splittable leaves may well remain."""
+
+comptime FRONTIER_NO_CANDIDATE = 2
+"""No leaf holds a ready candidate: every search that ran admitted no split,
+under the gain floor, the child floors, the depth limit, the monotone test, or
+the interaction mask."""
+
+comptime FRONTIER_WORK_PENDING = 3
+"""Growth cannot proceed *yet*: some leaf's candidate has never been computed
+or is still in flight, so `select_best` may not be believed. A caller sees
+this exactly when it has enqueued work it has not consumed."""
+
+
+def frontier_status_name(status: Int) -> String:
+    if status == FRONTIER_GROWING:
+        return String("growing")
+    if status == FRONTIER_BUDGET_SPENT:
+        return String("budget_spent")
+    if status == FRONTIER_NO_CANDIDATE:
+        return String("no_candidate")
+    if status == FRONTIER_WORK_PENDING:
+        return String("work_pending")
+    return String("unknown")
 
 
 # --- The frontier ---------------------------------------------------------
@@ -387,23 +500,63 @@ struct LeafFrontier(Movable):
     var n_active: Int
     var next_node: Int
     var n_leaves: Int
+    var max_leaves: Int
+    """The `num_leaves` budget this tree grows under, or 0 for unbounded.
+    Owned here so `status()` can tell a tree that spent its budget from one
+    that ran out of splits; `select_best` does not consult it, because
+    stopping is the caller's decision and this is the caller's fact."""
+
+    var plane: Int
+    """Which gradient plane this tree's leaves read: the class index in a
+    multiclass round, 0 in a single-tree one.
+
+    Multiclass indexing lives here because it is a property of the tree being
+    grown, not of any leaf in it: a K-class round grows K trees per boosting
+    iteration, one per class, each over the same row permutation and each
+    reading its own plane of a `K * n_rows` gradient buffer.
+    `work_items` stamps it onto every batch entry, which is what
+    `gpu_leaf_batching.ITEM_PLANE` multiplies by `n_rows` in the kernels, so a
+    batch may span classes without the kernels branching on one.
+
+    Row weights are deliberately *not* here. Bagging and GOSS reach the
+    frontier only through `n_active` (the bag is the live prefix of the row
+    permutation) and through the gradients themselves (GOSS scaling is applied
+    before upload). Nothing in this module multiplies a per-row weight, and
+    nothing should: two places that scale gradients is one place too many.
+    """
 
     def __init__(out self):
         self.leaves = List[FrontierLeaf]()
         self.n_active = 0
         self.next_node = 0
         self.n_leaves = 0
+        self.max_leaves = 0
+        self.plane = 0
 
-    def begin_tree(mut self, n_active: Int) raises:
+    def begin_tree(
+        mut self, n_active: Int, max_leaves: Int = 0, plane: Int = 0
+    ) raises:
         """Start a tree whose root owns `[0, n_active)`, which is the bag
-        when bagging is on and every row when it is not."""
+        when bagging is on and every row when it is not.
+
+        `max_leaves` is the `num_leaves` budget, 0 meaning unbounded, and
+        `plane` the class index of a multiclass round. Both default to what a
+        single-tree unbounded run wants, so an existing caller's
+        `begin_tree(n)` is unchanged.
+        """
         if n_active < 0:
             raise Error("active row count must be nonnegative")
+        if max_leaves < 0:
+            raise Error("leaf budget must be nonnegative")
+        if plane < 0:
+            raise Error("gradient plane must be nonnegative")
         self.leaves.clear()
         self.leaves.append(FrontierLeaf(0, 0, n_active, depth=0))
         self.n_active = n_active
         self.next_node = 1
         self.n_leaves = 1
+        self.max_leaves = max_leaves
+        self.plane = plane
 
     def size(self) -> Int:
         return len(self.leaves)
@@ -448,6 +601,102 @@ struct LeafFrontier(Movable):
             raise Error("frontier slot out of range")
         self.leaves[slot].partitioned = True
 
+    # --- Statistics -------------------------------------------------------
+
+    def set_stats(mut self, slot: Int, stats: LeafStats) raises:
+        """File the gradient and hessian sums a search (or a subtraction)
+        produced for `slot`.
+
+        Refuses a record whose count disagrees with the leaf's own rows, for
+        the same reason `set_candidate` refuses a mismatched child sum: it is
+        the cheapest available check that the statistics came from the leaf
+        they are being filed under, and a silently misfiled parent would make
+        every sibling derived from it wrong.
+        """
+        if slot < 0 or slot >= len(self.leaves):
+            raise Error("frontier slot out of range")
+        if stats.count != self.leaves[slot].row_count:
+            raise Error(
+                "leaf statistics do not cover the leaf's rows"
+            )
+        self.leaves[slot].stats = stats.copy()
+        self.leaves[slot].stats_known = True
+
+    def stats_of(self, slot: Int) raises -> LeafStats:
+        if slot < 0 or slot >= len(self.leaves):
+            raise Error("frontier slot out of range")
+        return self.leaves[slot].stats.copy()
+
+    def stats_known(self, slot: Int) raises -> Bool:
+        if slot < 0 or slot >= len(self.leaves):
+            raise Error("frontier slot out of range")
+        return self.leaves[slot].stats_known
+
+    def set_sibling_stats(
+        mut self, parent_stats: LeafStats, built_slot: Int, derived_slot: Int
+    ) raises:
+        """Derive one child's statistics from the parent's and the other
+        child's, host side.
+
+        The bookkeeping half of the subtraction trick, kept next to the
+        histogram half in `gpu_leaf_batching.enqueue_subtract` so the two
+        cannot drift: whichever child was built, the other's sums are the
+        parent's minus it. The count is checked rather than subtracted blind,
+        which catches a parent filed against the wrong leaf.
+        """
+        var built = self.stats_of(built_slot)
+        if not self.leaves[built_slot].stats_known:
+            raise Error(
+                "the built child's statistics must be known before its"
+                " sibling is derived from them"
+            )
+        var derived = parent_stats.subtract(built)
+        self.set_stats(derived_slot, derived)
+
+    def slot_of_node(self, node: Int) -> Int:
+        """The frontier slot holding `node`, or -1. Node ids are unique across
+        a frontier (`check_invariants` holds it), so the answer is unique."""
+        for i in range(len(self.leaves)):
+            if self.leaves[i].node == node:
+                return i
+        return -1
+
+    # --- Completion -------------------------------------------------------
+
+    def budget_left(self) -> Int:
+        """Leaves this tree may still create, or -1 when unbounded."""
+        if self.max_leaves <= 0:
+            return -1
+        var left = self.max_leaves - self.n_leaves
+        if left < 0:
+            return 0
+        return left
+
+    def status(self) -> Int:
+        """Why this frontier can or cannot take another commit.
+
+        The order of the tests is the order a grower's loop asks them in:
+        the budget first (a spent budget stops growth whatever the candidates
+        say), then work in flight (a pending candidate makes `select_best`
+        premature), then whether any candidate is ready at all.
+        """
+        if self.max_leaves > 0 and self.n_leaves >= self.max_leaves:
+            return FRONTIER_BUDGET_SPENT
+        for i in range(len(self.leaves)):
+            if self.leaves[i].candidate.needs_work():
+                return FRONTIER_WORK_PENDING
+            if self.leaves[i].candidate.is_pending():
+                return FRONTIER_WORK_PENDING
+        if self.select_best() < 0:
+            return FRONTIER_NO_CANDIDATE
+        return FRONTIER_GROWING
+
+    def is_complete(self) -> Bool:
+        """Whether this tree is finished: no budget left, or nothing left to
+        split. Work still in flight is not completion."""
+        var s = self.status()
+        return s == FRONTIER_BUDGET_SPENT or s == FRONTIER_NO_CANDIDATE
+
     def select_best(self) -> Int:
         """The leaf that may be committed next, or -1 when none may be.
 
@@ -489,16 +738,48 @@ struct LeafFrontier(Movable):
                 out.append(i)
         return out^
 
+    def batch_slots(self, max_items: Int) raises -> List[Int]:
+        """The first `max_items` slots a batch may cover, ascending.
+
+        `pending()` capped at what one launch holds, and the cap is taken from
+        the front rather than by any ranking, so the batch a frontier offers
+        is a function of the frontier alone and two runs of the same tree
+        offer the same batch. A grower that wants the *best* leaves in a
+        bounded batch ranks them with `speculative_order` and passes that
+        list to `work_items` itself; this is the plain, order-free answer.
+        """
+        if max_items < 1:
+            raise Error("a batch holds at least one item")
+        var out = List[Int]()
+        for i in range(len(self.leaves)):
+            if len(out) >= max_items:
+                break
+            if self.leaves[i].candidate.needs_work():
+                out.append(i)
+        return out^
+
     def work_items(
-        self, slots: List[Int], plane: Int = 0
+        self, slots: List[Int], plane: Int = -1
     ) raises -> List[LeafWorkItem]:
         """Turn frontier slots into batch entries, in the given order.
 
         `out_slot` is left as the leaf's current `hist_slot`; a caller that
-        allocates slots from a pool overwrites it before launching. Refuses a
-        slot list with a repeat, since two entries writing one output slice
-        is the one way a batch could corrupt a histogram.
+        allocates slots from a pool overwrites it before launching, which
+        `gpu_leaf_batching.assign_batch_slots` is the one way to do without
+        restating the pool's rules. A leaf still holding `NO_SLOT` therefore
+        produces an item with `out_slot == NO_SLOT`, which `plan_batch`
+        refuses outright rather than launching a write to slot -1.
+
+        `plane` defaults to -1, meaning this frontier's own `plane`, which is
+        the class index in a multiclass round. Passing one explicitly is for a
+        caller assembling a batch that spans classes.
+
+        Refuses a slot list with a repeat, since two entries writing one
+        output slice is the one way a batch could corrupt a histogram.
         """
+        var p = plane
+        if p < 0:
+            p = self.plane
         var out = List[LeafWorkItem](capacity=len(slots))
         for i in range(len(slots)):
             var s = slots[i]
@@ -514,13 +795,16 @@ struct LeafFrontier(Movable):
                     self.leaves[s].row_begin,
                     self.leaves[s].row_count,
                     self.leaves[s].hist_slot,
-                    plane,
+                    p,
                 )
             )
         return out^
 
     def plan_commit(
-        self, slot: Int, monotone_signs: List[Int] = []
+        self,
+        slot: Int,
+        monotone_signs: List[Int] = [],
+        missing_bin: Int = -1,
     ) raises -> CommitPlan:
         """Everything committing `slot` implies, without mutating anything.
 
@@ -530,6 +814,13 @@ struct LeafFrontier(Movable):
         rounding inverted them, collapsed to their midpoint. That is the same
         clamp-and-divide both growers apply, reproduced here so a batched
         grower cannot drift from them.
+
+        `missing_bin` is the split feature's missing bin, which the caller
+        reads out of `BinnedMatrix.missing_bin` (or
+        `GpuHistogramBuilder.missing_bin`) and which a categorical split
+        ignores. It rides on the plan so the device partition can build its
+        own `RowRouting` from it; -1, the default, is the "this feature has no
+        missing bin" value every other routing site already uses.
         """
         if slot < 0 or slot >= len(self.leaves):
             raise Error("frontier slot out of range")
@@ -566,6 +857,7 @@ struct LeafFrontier(Movable):
             extend_branch(leaf.branch, split.feature),
             bounds^,
             split^,
+            -1 if cand.split.is_categorical else missing_bin,
         )
 
     def apply_commit(mut self, plan: CommitPlan) raises:
@@ -652,6 +944,10 @@ struct LeafFrontier(Movable):
         for i in range(len(self.leaves)):
             if self.leaves[i].row_count < 0:
                 raise Error("a leaf holds a negative row count")
+            if self.leaves[i].stats.count != self.leaves[i].row_count:
+                raise Error(
+                    "a leaf's statistics do not cover its rows"
+                )
             if (
                 self.leaves[i].row_begin < 0
                 or self.leaves[i].row_end() > self.n_active

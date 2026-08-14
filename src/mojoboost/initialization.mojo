@@ -80,11 +80,21 @@ What this module does not do
 ----------------------------
 
 It opens no device, queries no capability, and decides nothing about where
-training runs. Device policy is src/mojoboost/device.mojo and the tiling
-policy is src/mojoboost/gpu_tiling.mojo; duplicating either here would
-give the two layers a way to disagree. Everything here is a plain value
-type with no device dependency, so the whole contract is exercisable on a
-machine with no accelerator.
+training runs. Device policy is src/mojoboost/device_policy.mojo and the
+tiling policy is src/mojoboost/gpu_tiling.mojo; duplicating either here
+would give the two layers a way to disagree. Everything here is a plain
+value type with no device dependency, so the whole contract is exercisable
+on a machine with no accelerator.
+
+The one thing this module *hands* the device policy is `SessionState`: two
+booleans and a warm-up level saying how much of the one-time cost a process
+has already paid. It travels as data because `decide_device` is pure by
+contract, and the dependency runs one way only, device_policy importing this
+module and never the reverse, so this file stays a leaf that imports nothing
+but the standard library. What the policy is allowed to do with it is
+bounded at the struct: report it, and warn on a cold session. Selecting a
+backend on it would be a performance rule, and there is no measurement here
+to put behind one.
 
 It also does not cache compiled kernels, and nothing in this repository
 does. See `BuildIdentity` for what such a cache would have to key on and
@@ -559,6 +569,104 @@ def warmup_level_name(level: Int) -> String:
     if level == WARMUP_ALL:
         return String("all")
     return String("unknown")
+
+
+# ---------------------------------------------------------------------------
+# What a device decision needs to know about startup
+# ---------------------------------------------------------------------------
+
+
+@fieldwise_init
+struct SessionState(Copyable, Movable):
+    """How much of the one-time cost this process has already paid.
+
+    The one thing the device policy needs from this module, and the reason
+    it is a value rather than a probe: `device_policy.decide_device` is pure
+    by contract, so anything it accounts for has to arrive as data a caller
+    could have serialized.
+
+    Why the policy cares. Two of the ten phases above (`context_create` and
+    `kernel_create`) are paid by whichever run first reaches the device, so
+    the *same* workload costs a cold process strictly more than a warm one.
+    A decision report that does not say which of the two it is describing
+    invites a reader to compare a cold GPU run against a warm CPU one.
+
+    What the policy may do with it is deliberately bounded: report it, and
+    warn on a cold session. It may not select the GPU because a session is
+    warm, and it may not refuse the GPU because one is cold. Either would be
+    a performance rule, and a performance rule needs a measurement behind it
+    (`crossover_rules()` in device_policy.mojo, which is empty).
+
+    - `context_open`: a `DeviceContext` is already open and will be reused,
+      so `context_create` is already paid. `GpuSession` in gpu_runtime.mojo
+      is the owner that can answer this truthfully.
+    - `kernels_ready`: the kernels this run will launch have already been
+      created, so `kernel_create` is already paid.
+    - `warmup_level`: the `WARMUP_*` level in effect, which is what decides
+      whether kernel creation lands in `kernel_create` or inside the first
+      round's `first_fit`.
+    """
+
+    var context_open: Bool
+    var kernels_ready: Bool
+    var warmup_level: Int
+
+    @staticmethod
+    def cold() -> SessionState:
+        """A process that has not opened a device. The conservative answer,
+        and the correct one for any caller that does not own a session."""
+        return SessionState(False, False, WARMUP_OFF)
+
+    @staticmethod
+    def from_env() -> SessionState:
+        """Cold, with the warm-up level the environment asks for.
+
+        Still cold: `MOJOBOOST_GPU_WARMUP` says what a caller *intends* to
+        front-load, not what it has already done, and reading an intention as
+        an accomplishment is how `kernel_create` gets reported as paid on a
+        process that never opened a device.
+        """
+        return SessionState(False, False, env_warmup_level())
+
+    def is_cold(self) -> Bool:
+        return not self.context_open
+
+    def paid_nothing(self) -> Bool:
+        return not self.context_open and not self.kernels_ready
+
+    def describe(self) -> String:
+        var out = String("context_open=")
+        if self.context_open:
+            out += "true"
+        else:
+            out += "false"
+        out += " kernels_ready="
+        if self.kernels_ready:
+            out += "true"
+        else:
+            out += "false"
+        out += " warmup=" + warmup_level_name(self.warmup_level)
+        return out^
+
+
+def session_state_from_trace(
+    trace: StartupTrace, warmup_level: Int = WARMUP_OFF
+) -> SessionState:
+    """Read a `SessionState` off what a trace has actually observed.
+
+    `context_create` and `kernel_create` are counted whether or not timing is
+    on (see `StartupTrace.record`), so this answers correctly on an untraced
+    run too, which is the run a device decision is usually being made on.
+
+    Counts, not durations. A phase that was observed in zero measurable time
+    still happened, and `observed` is the field that carries that distinction
+    through the whole contract.
+    """
+    return SessionState(
+        trace.observed(PHASE_CONTEXT_CREATE),
+        trace.observed(PHASE_KERNEL_CREATE),
+        warmup_level,
+    )
 
 
 struct WarmupPlan(Copyable, Movable):

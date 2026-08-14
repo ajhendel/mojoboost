@@ -45,8 +45,8 @@ LOCK = ROOT / "pixi.lock"
 
 TARGET_KEYS = {
     "id", "os", "arch", "python", "artifact", "wheel_tag", "filename",
-    "status", "build_host", "builder", "installer_floor", "bundled_dylibs",
-    "smoke", "evidence",
+    "status", "build_host", "builder", "builder_script", "workflow",
+    "publishable", "installer_floor", "bundled_dylibs", "smoke", "evidence",
 }
 DEVICE_KEYS = {
     "id", "vendor", "chip", "api", "status", "correctness", "determinism",
@@ -56,7 +56,15 @@ STEPS = ("correctness", "determinism", "phase_timings", "profiler")
 STEP_WORDS = {"pass", "fail", "partial", "not-run"}
 
 # Fields whose value is a repository path when it is not empty.
-PATH_FIELDS = ("smoke", "evidence", "record", "template")
+#
+# `builder_script` and `workflow` are here for a reason this file learned the
+# hard way. Both Linux rows carried `builder = "does not exist yet"` long after
+# packaging/linux/build_wheel_linux.sh was written and wired into
+# .github/workflows/release-linux.yml, because `builder` is prose and prose is
+# never checked. The two fields below are paths, so the same drift now fails
+# here instead of being read by somebody as a statement of fact.
+PATH_FIELDS = ("smoke", "evidence", "record", "template", "builder_script",
+               "workflow")
 
 failures: list[str] = []
 
@@ -106,6 +114,20 @@ def check_target_evidence(targets: list[dict]) -> None:
             for field in ("wheel_tag", "filename", "smoke"):
                 if not t.get(field, "").strip():
                     fail(f"target:{tid}", f"artifact is a wheel but {field} is empty")
+            # A wheel nobody can build is a plan, not a target. Naming the
+            # script and the workflow makes the row falsifiable: check_paths
+            # then refuses a row that points at something not in the tree.
+            for field in ("builder_script", "workflow"):
+                if not t.get(field, "").strip():
+                    fail(f"target:{tid}",
+                         f"artifact is a wheel but {field} is empty. Name the "
+                         "file that produces it, or say the row is a plan by "
+                         "leaving `artifact` as something other than `wheel`.")
+            if not isinstance(t.get("publishable"), bool):
+                fail(f"target:{tid}",
+                     "artifact is a wheel but `publishable` is not true or "
+                     "false. Whether an index will accept the tag is a fact "
+                     "about the artifact, not something to leave unsaid.")
         else:
             if t.get("wheel_tag") or t.get("filename"):
                 fail(f"target:{tid}",
@@ -147,11 +169,39 @@ def check_tags(targets: list[dict], pythons: list[dict], matrix: dict) -> None:
         os_name = t.get("os")
         if os_name == "macos" and not plat.startswith("macosx_"):
             fail(f"target:{tid}", f"macOS target with platform tag {plat!r}")
-        if os_name == "linux" and not plat.startswith("manylinux_"):
-            fail(f"target:{tid}",
-                 f"linux target with platform tag {plat!r}; publish manylinux, "
-                 "not a bare linux_ tag, which PyPI rejects and which promises "
-                 "nothing about glibc")
+        # Linux tags, and the distinction this rule used to get wrong.
+        #
+        # It required every Linux row to carry a `manylinux_` tag. That sounds
+        # strict and is the opposite: it made the honest artifact
+        # unrepresentable. packaging/linux/build_wheel_linux.sh defaults to
+        # MOJOBOOST_TAG_POLICY=plain and emits `linux_<arch>`, and the release
+        # workflow defaults to `plain` too, so the wheel that actually gets
+        # built had no row to match and validate_artifact.py failed R1 on it.
+        # The rule forced the matrix to name a manylinux file nobody builds.
+        #
+        # What is true: a bare `linux_` tag promises nothing about glibc and no
+        # index accepts it. That makes it unpublishable, not untrue. So the tag
+        # is checked against what the row claims about itself instead.
+        publishable = t.get("publishable")
+        if os_name == "linux":
+            if plat.startswith("manylinux_"):
+                if publishable is False:
+                    fail(f"target:{tid}",
+                         "a manylinux tag is a glibc promise, so a row carrying "
+                         "one may not also declare itself unpublishable. Either "
+                         "measure the floor and publish, or use the plain tag.")
+            elif plat.startswith("linux_"):
+                if publishable is not False:
+                    fail(f"target:{tid}",
+                         f"platform tag {plat!r} promises nothing about glibc "
+                         "and every index rejects it, so this row must set "
+                         "`publishable = false`. A Linux wheel becomes "
+                         "publishable by being repaired into a manylinux tag "
+                         "after its floor is measured, not by being renamed.")
+            else:
+                fail(f"target:{tid}",
+                     f"linux target with platform tag {plat!r}, which is "
+                     "neither manylinux_ nor linux_")
 
         expected = f"{matrix['project']}-{matrix['version']}-{tag}.whl"
         if t.get("filename") != expected:

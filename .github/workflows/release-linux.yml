@@ -203,6 +203,23 @@ jobs:
           python3 packaging/linux/inspect_wheel.py python/dist/*.whl \
             | tee inspect-${{ matrix.arch }}.txt
 
+      # The step this job was missing. `validate_matrix.py` above asks whether
+      # the matrix agrees with the repository; this asks the other half of the
+      # question, whether the wheel on disk is the artifact the matrix declared.
+      # Its first rule is the one that matters here: a wheel whose tag matches
+      # no target is refused, which is what catches a tag_policy that produced
+      # something nobody wrote down. The macOS lane has run this since it was
+      # written, through packaging/macos/build_release_wheel.sh; Linux built
+      # wheels and never compared them to anything.
+      #
+      # Not `if: always()`. A failed build leaves no wheel and the glob would
+      # fail for an unrelated reason.
+      - name: Validate the artifact against the matrix
+        run: |
+          set -euo pipefail
+          python3 packaging/matrix/validate_artifact.py python/dist/*.whl \
+            | tee validate-${{ matrix.arch }}.txt
+
       # Flat, because the downloading job verifies the manifest by running
       # sha256sum -c next to the files. Uploading python/dist/* alongside a
       # file at the repository root would preserve the directory structure and
@@ -213,6 +230,7 @@ jobs:
           mkdir -p artifact
           cp python/dist/*.whl python/dist/*.provenance.json artifact/
           cp inspect-${{ matrix.arch }}.txt artifact/
+          cp validate-${{ matrix.arch }}.txt artifact/
           cd artifact
           sha256sum *.whl *.provenance.json > SHA256SUMS-${{ matrix.arch }}.txt
           cat SHA256SUMS-${{ matrix.arch }}.txt

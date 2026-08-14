@@ -50,7 +50,15 @@ a transport.
 from std.memory import bitcast
 from std.time import perf_counter_ns
 
-from .collective import Collective, zeros_f64, zeros_int
+from .collective import (
+    Collective,
+    LocalCollective,
+    add_into_f64,
+    add_into_int,
+    max_into_int,
+    zeros_f64,
+    zeros_int,
+)
 
 # ---------------------------------------------------------------------------
 # Status codes
@@ -74,6 +82,7 @@ comptime TRANSPORT_CANCELLED = 8
 comptime TRANSPORT_PROTOCOL_STATE = 9
 comptime TRANSPORT_CONFIG_INVALID = 10
 comptime TRANSPORT_SPLIT_DISAGREEMENT = 11
+comptime TRANSPORT_UNAVAILABLE = 12
 
 
 def transport_status_message(code: Int) -> String:
@@ -109,6 +118,8 @@ def transport_status_message(code: Int) -> String:
         return "the transport configuration is invalid"
     if code == TRANSPORT_SPLIT_DISAGREEMENT:
         return "ranks chose different splits for the same node"
+    if code == TRANSPORT_UNAVAILABLE:
+        return "this build cannot reach another process"
     return "unrecognized transport failure code"
 
 
@@ -227,6 +238,18 @@ def digest_ints(values: List[Int]) -> UInt64:
             h = h * 0x0000_0100_0000_01B3
             z = z // _BYTE
     return h
+
+
+def digest_halves(digest: UInt64) -> List[Int]:
+    """Split a 64-bit digest into two non-negative `Int` halves.
+
+    The only reduction every `Collective` offers is over `Int`, and a digest
+    does not fit in one portably. Two halves do, and both are non-negative, so
+    `agree_equal_ints` can compare them the same way it compares a feature
+    count: a digest the ranks disagree about shows up as a disagreement about
+    one of its halves, which is enough to fail the run and name the field.
+    """
+    return [Int(digest % 0x1_0000_0000), Int(digest // 0x1_0000_0000)]
 
 
 def f64_bits(value: Float64) -> UInt64:
@@ -1136,26 +1159,34 @@ struct TransportSession(Movable):
 
 
 def reduce_into_f64(mut acc: List[Float64], src: List[Float64]) raises:
+    """Fold one contribution into the root's accumulator.
+
+    The arithmetic is `collective.add_into_f64`, not a second copy of it: a
+    buffer combined across processes and a buffer combined across the local
+    ranks of one process go through the same loop, which is what makes the
+    ascending-rank-order requirement one claim rather than two. What this adds
+    is the transport's error shape, so a length disagreement between two
+    processes is reported as a schema mismatch with a rank attached instead of
+    as a bare accumulator error.
+    """
     if len(acc) != len(src):
         raise transport_error(
             TRANSPORT_SCHEMA_MISMATCH, -1, "reduction operands differ in length"
         )
-    for i in range(len(acc)):
-        acc[i] += src[i]
+    add_into_f64(acc, src)
 
 
 def reduce_into_int(mut acc: List[Int], src: List[Int], op: Int) raises:
+    """The integer reductions, dispatched by op code to the same two loops
+    `agree_status` and the local-rank accumulation use."""
     if len(acc) != len(src):
         raise transport_error(
             TRANSPORT_SCHEMA_MISMATCH, -1, "reduction operands differ in length"
         )
     if op == OP_SUM_INT:
-        for i in range(len(acc)):
-            acc[i] += src[i]
+        add_into_int(acc, src)
     elif op == OP_MAX_INT:
-        for i in range(len(acc)):
-            if src[i] > acc[i]:
-                acc[i] = src[i]
+        max_into_int(acc, src)
     else:
         raise transport_error(
             TRANSPORT_FRAME_CORRUPT, -1, "not an integer reduction op"
@@ -1584,6 +1615,55 @@ struct TransportCollective[E: ByteEndpoint & Copyable & Deinitable](
 
     def allreduce_max_int(mut self, mut buf: List[Int]) raises:
         self._allreduce_int(buf, OP_MAX_INT)
+
+    def request_cancel(mut self, detail: String):
+        """Stop this rank's session on purpose.
+
+        Sticky and local: the next collective this rank enters raises
+        `TRANSPORT_CANCELLED` instead of sending, and the peers waiting on it
+        then fail with a lost peer or a deadline rather than hanging. That is
+        cancellation, not a cancellation broadcast, and the difference matters:
+        nothing here tells the other ranks *why* they lost this one. A run that
+        wants every rank to stop for the same stated reason at the same round
+        agrees a control code at a round boundary instead, which is what
+        `train_distributed_run` does with a callback's return value.
+        """
+        self.session.cancel(detail)
+
+    def checkpoint_boundary(mut self) raises:
+        """Close one checkpoint epoch and open the next.
+
+        The barrier first, so the epoch advances only from a point every rank
+        has reached; the sequence numbering then restarts inside the new epoch,
+        which is what makes a frame from before the checkpoint impossible to
+        confuse with one from after it.
+        """
+        self.barrier()
+        self.session.next_epoch()
+
+    def shutdown(mut self) raises:
+        """Close every endpoint and the session.
+
+        Called on the way out of a run whether or not it succeeded. It does not
+        raise on an already-broken session: a rank that is shutting down
+        because a peer vanished must still release its own endpoints.
+        """
+        for i in range(len(self.peers)):
+            try:
+                self.peers[i].close()
+            except:
+                pass
+        self.session.close()
+
+    def failure_code(self) -> Int:
+        """The transport status this session died of, or `TRANSPORT_OK`."""
+        return self.session.failure_code
+
+    def collectives_completed(self) -> Int:
+        return self.session.collectives_completed
+
+    def elements_reduced(self) -> Int:
+        return self.session.elements_reduced
 
     def barrier(mut self) raises:
         """Same gather and broadcast with an empty payload. Deliberately not

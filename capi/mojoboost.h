@@ -42,8 +42,15 @@
  * - There is no separate dataset handle. Training takes the matrix
  *   directly, which is all a dense trainer needs.
  *
+ * Nothing here reimplements mojoboost. Every call forwards to the same Mojo
+ * implementation the Python package and the command line tool use, so the
+ * trainer, the tree walk, the file format, and the device policy are shared
+ * rather than mirrored.
+ *
  * Build: capi/build.sh, which produces capi/libmojoboost.{dylib,so}.
- * See capi/README.md for the parameter string and worked examples.
+ * See capi/README.md for the parameter string and worked examples,
+ * docs/C_API.md for the reference, and packaging/native/ for how the
+ * header and library are laid out in a release.
  *
  * Copyright the mojoboost authors. Apache-2.0.
  */
@@ -57,10 +64,23 @@
 extern "C" {
 #endif
 
-/* Version of this ABI. Incremented only for a breaking change to the
- * declarations in this header. Check it with mojoboost_abi_version() when
- * loading the library dynamically. */
-#define MOJOBOOST_ABI_VERSION 1
+/* Version of this ABI, incremented whenever these declarations change.
+ * Check it with mojoboost_abi_version() when loading the library
+ * dynamically.
+ *
+ * Versions are cumulative: every version adds declarations and removes or
+ * changes none, so a caller built against version N works unchanged against
+ * any library reporting >= N. Test for the version that introduced the
+ * newest symbol you call, not for equality. A breaking change, if one ever
+ * becomes necessary, would come with a renamed library rather than a
+ * silently incompatible version number.
+ *
+ *   1  train, predict, save, load, accessors, errors.
+ *   2  mojoboost_predict_ex (iteration ranges and device selection),
+ *      mojoboost_model_num_iterations, mojoboost_gpu_available,
+ *      mojoboost_model_dump_json, mojoboost_string_free.
+ */
+#define MOJOBOOST_ABI_VERSION 2
 
 /* Status codes. Success is 0; every failure is negative. */
 #define MOJOBOOST_OK 0
@@ -68,6 +88,24 @@ extern "C" {
 #define MOJOBOOST_ERROR_TRAINING (-2)
 #define MOJOBOOST_ERROR_IO (-3)
 #define MOJOBOOST_ERROR_UNSUPPORTED (-4)
+
+/* Where a call runs. The same three values the Mojo API and the `device`
+ * parameter use, so "cpu", "gpu", and "auto" mean one thing across every
+ * front end. CPU is the dependable path. GPU fails with
+ * MOJOBOOST_ERROR_UNSUPPORTED, carrying the reason, when no accelerator is
+ * present or the workload is outside what the accelerated path covers; it
+ * never silently falls back. AUTO picks the accelerator only when it is
+ * available, covers the workload, and evidence selects it, and otherwise
+ * runs on the CPU. Since ABI version 2. */
+#define MOJOBOOST_DEVICE_CPU 0
+#define MOJOBOOST_DEVICE_GPU 1
+#define MOJOBOOST_DEVICE_AUTO 2
+
+/* Flags for mojoboost_predict_ex. Undefined bits are rejected rather than
+ * ignored, so a flag a newer mojoboost understands cannot be silently
+ * dropped by an older one. Since ABI version 2. */
+#define MOJOBOOST_PREDICT_RESPONSE 0
+#define MOJOBOOST_PREDICT_RAW 1
 
 /* A trained or loaded model. Opaque: the layout is a mojoboost internal. */
 typedef struct MojoBoostModel MojoBoostModel;
@@ -83,6 +121,17 @@ int32_t mojoboost_abi_version(void);
 /* The library version. Any of the three out pointers may be NULL. */
 void mojoboost_library_version(int32_t *major, int32_t *minor,
                                int32_t *patch);
+
+/* 1 when MOJOBOOST_DEVICE_GPU can be honored by this build on this machine,
+ * 0 otherwise. Accelerator support is a property of the build as well as of
+ * the hardware, so a library built without one returns 0 on a machine that
+ * has one.
+ *
+ * A 1 means a GPU request is worth making, not that every GPU request
+ * succeeds: whether a particular workload is covered is decided per call,
+ * and an uncovered one is MOJOBOOST_ERROR_UNSUPPORTED with the reason in
+ * the error object. Since ABI version 2. */
+int32_t mojoboost_gpu_available(void);
 
 /* ------------------------------------------------------------------ error */
 
@@ -150,6 +199,31 @@ int32_t mojoboost_predict_raw(const MojoBoostModel *model,
                               int64_t n_features, double *out_values,
                               int64_t out_len, MojoBoostError *error);
 
+/* Predict with the whole prediction surface exposed. The two calls above
+ * are this one with the ensemble, the CPU, and one flag fixed, so they keep
+ * behaving exactly as they always have and everything new is opt-in.
+ *
+ *   start_iteration  first boosting iteration to score with. Clamped to the
+ *                    ensemble; negative means 0.
+ *   num_iteration    how many iterations from there, or <= 0 for all the
+ *                    remaining ones. This is LightGBM's convention.
+ *   flags            MOJOBOOST_PREDICT_RESPONSE or MOJOBOOST_PREDICT_RAW.
+ *                    Any other value is MOJOBOOST_ERROR_INVALID_ARGUMENT.
+ *   device           a MOJOBOOST_DEVICE_* value.
+ *
+ * The base score belongs to iteration 0, so a range starting at 0 includes
+ * it and a later range does not, and [0, k) and [k, n) sum to the full raw
+ * score. For a multiclass model an iteration is one tree per class, and the
+ * softmax is taken over the sliced scores, so response-scale output from a
+ * range is the truncated model's probabilities rather than a slice of the
+ * full model's. Since ABI version 2. */
+int32_t mojoboost_predict_ex(const MojoBoostModel *model, const double *data,
+                             int64_t n_rows, int64_t n_features,
+                             int64_t start_iteration, int64_t num_iteration,
+                             int32_t flags, int32_t device,
+                             double *out_values, int64_t out_len,
+                             MojoBoostError *error);
+
 /* ----------------------------------------------------------- save / load */
 
 /* Write the model to `path` in the versioned mojoboost text format. */
@@ -181,7 +255,36 @@ int32_t mojoboost_model_num_trees(const MojoBoostModel *model,
                                   int64_t *out_value,
                                   MojoBoostError *error);
 
+/* Number of boosting iterations, which is the tree count for a
+ * single-output model and trees / num_class for a multiclass one. This, not
+ * the tree count, is the unit mojoboost_predict_ex slices in. Since ABI
+ * version 2. */
+int32_t mojoboost_model_num_iterations(const MojoBoostModel *model,
+                                       int64_t *out_value,
+                                       MojoBoostError *error);
+
+/* --------------------------------------------------------------- inspect */
+
+/* The model as JSON in the mojoboost inspection schema: the ensemble's
+ * trees, split thresholds, leaf values, and the bin mapper's view of each
+ * feature. See docs/MODEL_INSPECTION_SCHEMA.md for the schema, which is
+ * versioned independently of this ABI.
+ *
+ * On success *out_text is a NUL terminated UTF-8 string the caller owns and
+ * must release with mojoboost_string_free. On failure *out_text is
+ * untouched. A model carries no feature names, so the dump names features
+ * Column_0, Column_1, ... as LightGBM does. Since ABI version 2. */
+int32_t mojoboost_model_dump_json(const MojoBoostModel *model,
+                                  char **out_text, MojoBoostError *error);
+
 /* --------------------------------------------------------------- destroy */
+
+/* Free a string the library allocated, such as one from
+ * mojoboost_model_dump_json. NULL is accepted and does nothing. Do not pass
+ * it a mojoboost_error_message pointer: that one is owned by the error
+ * object. Do not release it with free() either, since the library may not
+ * share the caller's allocator. Since ABI version 2. */
+void mojoboost_string_free(char *text);
 
 /* Free a model handle. NULL is accepted and does nothing. Using a handle
  * after freeing it, or freeing it twice, is undefined behavior, as it is

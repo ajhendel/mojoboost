@@ -16,6 +16,12 @@ bearing enough to repeat:
   exactly representable dataset produce the same model distributed as on
   one node
 
+The element-wise reductions themselves (`add_into_f64`, `add_into_int`,
+`max_into_int`) also live here rather than in whichever transport happens to
+need them, so a buffer is folded by the same three loops whether it is being
+combined across local ranks or across processes. `hosts_whole_world` is the
+one predicate a caller uses to decide whether a value needs reducing at all.
+
 `n_local_ranks` and `local_rank` exist so one implementation can host
 several ranks in a single process. A real transport returns 1 and its own
 rank; `LocalCollective` returns the whole world. The growth code loops over
@@ -39,6 +45,9 @@ comptime STATUS_INVALID_WEIGHT = 3
 comptime STATUS_UNSUPPORTED = 4
 comptime STATUS_LAYOUT_MISMATCH = 5
 comptime STATUS_INVALID_PARAM = 6
+comptime STATUS_PARTITION_MISMATCH = 7
+comptime STATUS_RANKING_GROUPS = 8
+comptime STATUS_CANCELLED = 9
 
 
 def status_message(code: Int) -> String:
@@ -59,6 +68,12 @@ def status_message(code: Int) -> String:
         return "shards disagree about the binned feature layout"
     if code == STATUS_INVALID_PARAM:
         return "the training parameters are invalid"
+    if code == STATUS_PARTITION_MISMATCH:
+        return "the shards do not cover the global row order exactly once"
+    if code == STATUS_RANKING_GROUPS:
+        return "a ranking query group is split across two ranks"
+    if code == STATUS_CANCELLED:
+        return "the run was cancelled"
     return "unrecognized failure code"
 
 
@@ -184,6 +199,41 @@ def add_into_int(mut acc: List[Int], src: List[Int]) raises:
         raise Error("contribution length must match the accumulator")
     for i in range(len(acc)):
         acc[i] += src[i]
+
+
+def max_into_int(mut acc: List[Int], src: List[Int]) raises:
+    """Element-wise maximum, the reduction `agree_status` and
+    `agree_equal_ints` are built on.
+
+    It lives beside `add_into_int` rather than inside a transport so that
+    there is exactly one definition of each element-wise reduction in the
+    repository: `distributed_transport.reduce_into_int` dispatches an op code
+    to these two rather than carrying its own loops. Order is irrelevant for a
+    maximum, which is why this one needs no ascending-rank argument.
+    """
+    if len(acc) != len(src):
+        raise Error("contribution length must match the accumulator")
+    for i in range(len(acc)):
+        if src[i] > acc[i]:
+            acc[i] = src[i]
+
+
+def hosts_whole_world[C: Collective](comm: C) -> Bool:
+    """Whether this process holds every rank of the world.
+
+    The one predicate that distinguishes a world hosted in a single process
+    from one spread over several, and the gate every negotiation collective in
+    `distributed.mojo` is behind. When it is true, a value the ranks would
+    otherwise have to agree on was computed by this process for all of them,
+    so reducing it would consume a round trip to confirm what is already
+    identical by construction; when it is false, nothing may be assumed and
+    every such value is reduced.
+
+    `LocalCollective` returns True at any world size and `TransportCollective`
+    returns True only at world size 1, which is exactly the case where a
+    reduction has no peer to reach.
+    """
+    return comm.n_local_ranks() == comm.world_size()
 
 
 def agree_status[C: Collective](mut comm: C, statuses: List[Int]) raises:

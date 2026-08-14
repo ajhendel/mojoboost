@@ -435,7 +435,9 @@ def command_train(args: List[String]) raises -> String:
             n_features,
             " features, ",
             table.n_rows,
-            " rows -> ",
+            " rows, device ",
+            device_name(config.device),
+            " -> ",
             options.model,
         )
     return summary^

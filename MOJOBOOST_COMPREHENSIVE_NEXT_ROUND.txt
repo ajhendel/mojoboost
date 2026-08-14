@@ -427,3 +427,45 @@ The later validation schedule should begin with static checks and tiny focused c
 6. Only after those pass, a deliberately scheduled broader validation run on controlled hardware or CI.
 
 No performance, parity, platform, distributed, or packaging claim should be promoted from planned to supported until its corresponding evidence exists.
+
+
+======================================================================
+MANDATORY SAFE-INTEGRATION UPDATE FOR EVERY TASK
+======================================================================
+
+This update applies to every TASK in this file and is part of every prompt, even when copied separately. Append this section to the TASK text when giving it to Claude Code.
+
+Do not stop after designing, documenting, scaffolding, or implementing another isolated module. Within your exclusive file ownership, connect every capability you work on into the real production, packaging, documentation, or public call path whenever that connection can be made safely and honestly by static reasoning.
+
+For each existing or newly completed capability in your lane:
+
+- Locate the current production caller, public entry point, binding seam, configuration path, serializer, and documentation claim.
+- Reuse the existing implementation instead of creating a duplicate implementation, duplicate registry, duplicate policy engine, alternate trainer, or parallel model representation.
+- If the production caller is inside your owned files, wire the capability into that caller now.
+- If the required caller is outside your ownership, do not edit it. Put an exact integration patch request in your handoff: file, symbol, signature, call location, required imports, state ownership, errors, fallbacks, and serialization effects.
+- An import or export alone is not integration. Real integration means the live path calls the implementation, passes real user or trainer state, observes its output, handles unsupported cases, and preserves required state across prediction and serialization.
+- Public parameters must affect the intended algorithm. If a parameter remains inert, keep it private or rejected and record the missing call site.
+- Public Python APIs must reach native Mojo behavior. Do not reproduce training, prediction, objective, metric, tree, serialization, or device-policy logic in Python.
+- Native capabilities that need bindings must expose the smallest safe structured interface. Never expose unsafe device pointers or internal ownership to Python.
+- New model state must be serialized or explicitly marked ephemeral. Do not enable a training feature whose fitted model cannot be loaded and predicted correctly.
+- CPU and GPU behavior must retain clear capability checks. Explicit device="gpu" must either use the connected GPU path or fail clearly; it must never silently execute on CPU while reporting GPU.
+- Preserve the established path behind a feature flag, strategy selection, or conservative fallback when the connected path has not yet been validated.
+- Do not enable experimental automatic behavior, EFB heuristics, unified-memory strategies, device-side split selection, hybrid scheduling, alternate boosting modes, or device="auto" GPU selection by default without evidence.
+- Remove obsolete duplicate glue inside your owned files only when one authoritative path is clear and no external caller depends on it. Otherwise quarantine and document the duplicate rather than deleting it blindly.
+- Keep experimental capabilities explicitly experimental. Safe connection does not authorize unsupported claims.
+- Continue to obey the no-execution rule: do not run tests, builds, programs, benchmarks, profilers, or broad validation while integrating.
+
+Before finishing, add a SAFE INTEGRATION ACCOUNTING section to your handoff containing:
+
+1. EXISTING IMPLEMENTATIONS FOUND
+2. PRODUCTION OR PUBLIC CALL PATH BEFORE THIS TASK
+3. CONNECTIONS COMPLETED INSIDE OWNERSHIP
+4. CAPABILITIES STILL DISCONNECTED
+5. EXACT CROSS-LANE PATCH REQUESTS
+6. FALLBACKS AND DEFAULTS PRESERVED
+7. DUPLICATES REMOVED OR QUARANTINED
+8. SERIALIZATION AND MODEL-STATE EFFECTS
+9. PUBLIC API AND ERROR-BEHAVIOR EFFECTS
+10. UNRUN FOCUSED VALIDATION COMMANDS
+
+The goal is that this parallel round produces connected product capability, not another collection of impressive but unreachable files. Integrate everything you safely can inside your lane, make every remaining connection request exact, and never cross ownership boundaries merely to claim completion.

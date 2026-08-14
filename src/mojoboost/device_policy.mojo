@@ -17,12 +17,35 @@ So this module owns all of it:
 - how detected hardware capabilities are turned into a plan,
 - the crossover evidence table and the rule that reads it,
 - the fallback semantics for unknown hardware,
-- the refusal an explicit `gpu` request gets when it cannot run.
+- the refusal an explicit `gpu` request gets when it cannot run,
+- which transfer route each device buffer is on, by carrying the plan
+  unified_memory_policy.mojo resolves,
+- how much of the one-time startup cost the process has already paid, by
+  carrying the `SessionState` initialization.mojo defines.
+
+The last two are carried, not decided. A route is chosen by
+unified_memory_policy.mojo against its own evidence ladder and a session
+state is observed by initialization.mojo; this module folds both into the
+decision so that one report answers "where does this run, on what hardware,
+moving bytes how, having already paid what". Neither one may select a
+backend: a transfer route and a warm session are performance facts, and
+`crossover_rules()` is the only place a performance fact is allowed to
+change a device.
 
 `device.mojo` is a thin compatibility facade over this module.
 `python/mojoboost/device_selection.py` is reduced to extracting plain
 workload metadata from `X` and `y` and formatting the decision this module
 returns. Neither one decides anything.
+
+Callers that are not Mojo
+-------------------------
+`decide_device` takes structs, which no CPython binding, C API, or CLI can
+construct. `decide_device_report` and `decide_device_report_reported` are
+the flat forms of the same call: plain scalars in, the serialized decision
+out. They are marshallers and nothing else, and they exist so that each of
+those callers does not grow its own. `resolve_device_full` is the raising
+form for a trainer that knows its whole workload, as against `resolve_device`,
+which knows only the shape and says so.
 
 The contract
 ------------
@@ -130,17 +153,41 @@ from .boosting import (
     SQUARED_ERROR,
     TWEEDIE,
 )
+from .initialization import SessionState, warmup_level_name
+
+# Aliased on the way in. unified_memory_policy.mojo has its own
+# `block_reason_name` and its own `EVIDENCE_NONE`, and both mean something
+# different here: a transfer-route block is not a device block, and its
+# evidence ladder is not the crossover evidence identifier. Importing them
+# under their own names would shadow this module's, which is how a report
+# ends up naming a route refusal as the reason a GPU request was denied.
+from .unified_memory_policy import (
+    N_ROLES as N_TRANSFER_ROLES,
+    RouteDecision,
+    SessionMemoryPlan,
+    block_reason_name as transfer_block_name,
+    evidence_name as transfer_evidence_name,
+    plan_session_routes,
+    retire_event_name,
+    role_name as transfer_role_name,
+    route_name as transfer_route_name,
+)
 
 
-# --- Mirrors. Pinned by tests/parallel/test_device_policy.mojo. ---
+# --- Mirrors. NOT pinned by any test in this repository. ---
 #
 # Copied rather than imported because importing their home modules would
 # close an import cycle through this one: `ranking.mojo` imports
 # `model.mojo`, which imports `device.mojo`, which imports this module, and
 # `histogram_gpu.mojo` pulls the whole GPU kernel stack into a layer that
 # has to stay compilable and testable on a machine with no accelerator.
-# The handoff records the pinning test that asserts each mirror still
-# equals its source.
+#
+# There is no `tests/parallel/test_device_policy.mojo`. Nothing asserts that
+# any mirror below still equals its source, so each one is a copy that can
+# drift silently, and a drifted `MAX_GPU_ROWS` or `MAX_GPU_BINS` admits a
+# workload the kernels cannot index. handoffs/connect_05_device_policy.md
+# specifies that test; it is unwritten and unrun, and this comment says so
+# rather than claiming a guarantee that does not exist.
 
 # `LAMBDARANK` in ranking.mojo: objective code 7, which continues the
 # registry in boosting.mojo but whose gradients come from query groups.
@@ -294,6 +341,9 @@ comptime WARN_EXPLICIT_GPU_UNMEASURED = 6
 comptime WARN_ENV_THRESHOLD_UNVALIDATED = 7
 comptime WARN_HOST_GRADIENT_PATH = 8
 comptime WARN_MEMORY_BUDGET_UNKNOWN = 9
+comptime WARN_COLD_SESSION = 10
+comptime WARN_UNPROVEN_TRANSFER_ROUTE = 11
+comptime WARN_KERNEL_RETIREMENT_ROUTE = 12
 
 
 def warning_name(code: Int) -> String:
@@ -315,6 +365,12 @@ def warning_name(code: Int) -> String:
         return String("host-gradient-path")
     if code == WARN_MEMORY_BUDGET_UNKNOWN:
         return String("memory-budget-unknown")
+    if code == WARN_COLD_SESSION:
+        return String("cold-session")
+    if code == WARN_UNPROVEN_TRANSFER_ROUTE:
+        return String("unproven-transfer-route")
+    if code == WARN_KERNEL_RETIREMENT_ROUTE:
+        return String("kernel-retirement-route")
     return String("unknown-warning")
 
 
@@ -669,6 +725,17 @@ struct DeviceCapabilities(Copyable, Movable):
       Fields rather than constants so a build that widens one can say so.
     - `auto_min_cells`: the `MOJOBOOST_AUTO_MIN_CELLS` value in effect.
       Negative means the heuristic is off.
+    - `session`: how much of the one-time startup cost this process has
+      already paid, from initialization.mojo. Reported and warned on, never
+      selected on: see `SessionState`.
+    - `transfer`: the per-role transfer routes in effect, from
+      unified_memory_policy.mojo. The staged copy for every role in every
+      context this repository controls.
+
+    The last two are why the environment is read *here* and not in
+    `decide_device`: both of them fold an environment variable into a value,
+    and keeping every such read on this side of the boundary is what lets
+    `decide_device` stay pure and injectable.
     """
 
     var gpu_available: Bool
@@ -680,6 +747,8 @@ struct DeviceCapabilities(Copyable, Movable):
     var min_bins: Int
     var max_bins: Int
     var auto_min_cells: Int
+    var session: SessionState
+    var transfer: SessionMemoryPlan
 
     def __init__(
         out self,
@@ -689,6 +758,8 @@ struct DeviceCapabilities(Copyable, Movable):
         var profile: GpuProfile,
         profile_source: Int,
         auto_min_cells: Int,
+        var session: SessionState,
+        var transfer: SessionMemoryPlan,
         max_rows: Int = MAX_GPU_ROWS,
         min_bins: Int = MIN_GPU_BINS,
         max_bins: Int = MAX_GPU_BINS,
@@ -702,9 +773,13 @@ struct DeviceCapabilities(Copyable, Movable):
         self.min_bins = min_bins
         self.max_bins = max_bins
         self.auto_min_cells = auto_min_cells
+        self.session = session^
+        self.transfer = transfer^
 
     @staticmethod
-    def detect() -> DeviceCapabilities:
+    def detect(
+        var session: SessionState = SessionState.cold(),
+    ) raises -> DeviceCapabilities:
         """Capabilities for the build and process running right now.
 
         Opens no device. The hardware profile is therefore the portable
@@ -712,7 +787,12 @@ struct DeviceCapabilities(Copyable, Movable):
         operator named the API through `MOJOBOOST_GPU_BACKEND`. A caller
         that already has a `DeviceContext` open should read its attributes
         and call `from_profile` instead, which is the only way to reach
-        `PROFILE_REPORTED`.
+        `PROFILE_REPORTED`, and should hand its own `SessionState` rather
+        than taking the cold default.
+
+        Raises for an unparsable `MOJOBOOST_GPU_TRANSFER`, which is
+        `plan_session_routes`' rule and the same one this module applies to
+        `device`: a misspelled knob must not resolve to a different path.
         """
         var built = build_has_accelerator()
         var disabled = gpu_disabled_by_env()
@@ -734,6 +814,7 @@ struct DeviceCapabilities(Copyable, Movable):
                     profile.unified_memory,
                     profile.synthetic,
                 )
+        var transfer = plan_session_routes(profile.unified_memory)
         return DeviceCapabilities(
             available,
             built,
@@ -741,21 +822,33 @@ struct DeviceCapabilities(Copyable, Movable):
             profile^,
             source,
             env_auto_min_cells(),
+            session^,
+            transfer^,
         )
 
     @staticmethod
     def from_profile(
-        var profile: GpuProfile, profile_source: Int = PROFILE_REPORTED
-    ) -> DeviceCapabilities:
+        var profile: GpuProfile,
+        profile_source: Int = PROFILE_REPORTED,
+        var session: SessionState = SessionState.cold(),
+    ) raises -> DeviceCapabilities:
         """Capabilities carrying a profile a caller already has.
 
         `PROFILE_REPORTED` is the default because the intended caller is
         one that read the attributes off an open `DeviceContext`. Pass
         `PROFILE_SYNTHETIC` for a fixture; the source is recorded and
         surfaces as `WARN_SYNTHETIC_CAPABILITIES`, and it never changes a
-        gate."""
+        gate.
+
+        That same caller is the one that can answer `session` truthfully: it
+        holds the context, so `context_open` is True for it and cold for
+        everybody else. The default stays cold because guessing warm on
+        behalf of a caller that did not say so reports a paid cost that was
+        not paid.
+        """
         var built = build_has_accelerator()
         var disabled = gpu_disabled_by_env()
+        var transfer = plan_session_routes(profile.unified_memory)
         return DeviceCapabilities(
             built and not disabled,
             built,
@@ -763,12 +856,19 @@ struct DeviceCapabilities(Copyable, Movable):
             profile^,
             profile_source,
             env_auto_min_cells(),
+            session^,
+            transfer^,
         )
 
     @staticmethod
-    def unavailable() -> DeviceCapabilities:
+    def unavailable() raises -> DeviceCapabilities:
         """A machine with no accelerator. The conservative answer, and the
-        one an injected fixture wants when it is testing the CPU path."""
+        one an injected fixture wants when it is testing the CPU path.
+
+        Reads no environment at all, including the transfer knob: a fixture
+        asking what the CPU path does should not be affected by a variable
+        about device buffers.
+        """
         return DeviceCapabilities(
             False,
             False,
@@ -776,6 +876,8 @@ struct DeviceCapabilities(Copyable, Movable):
             GpuProfile.generic(),
             PROFILE_NONE,
             AUTO_MIN_CELLS,
+            SessionState.cold(),
+            SessionMemoryPlan.staged(),
         )
 
     def memory_budget_known(self) -> Bool:
@@ -802,7 +904,10 @@ struct MemoryEstimate(Copyable, Movable):
     plus, on the host, two pinned float32 staging planes of `n_rows` and
     one pinned copy of the histogram buffer.
 
-    Invariants, which the pinning test in the handoff asserts:
+    Invariants. No test asserts them today; the handoff specifies the one
+    that should, and marks it unwritten. They are stated here because the
+    memory gate below compares this estimate against a device budget, and
+    invariant 4 in particular is what makes that comparison sound:
 
     1. Every term is nonnegative.
     2. `device_bytes()` is the sum of the six device terms and nothing
@@ -1253,6 +1358,47 @@ def _collect_warnings(
             ),
         )
 
+    if caps.session.paid_nothing():
+        warnings.add(
+            WARN_COLD_SESSION,
+            String(
+                "no device context or kernel has been created in this"
+                " process, so a GPU run here also pays context creation and"
+                " first-launch kernel creation; that cost is startup, not"
+                " training, and comparing it against a warm CPU run measures"
+                " the wrong thing (warm-up level ",
+                warmup_level_name(caps.session.warmup_level),
+                ")",
+            ),
+        )
+
+    # The transfer plan never blocks. A role that cannot take the requested
+    # route falls back to the staged copy inside unified_memory_policy.mojo,
+    # and the allocation site is what refuses; what belongs in a device
+    # decision is that the run is not on the shipped route.
+    if caps.transfer.any_unproven():
+        warnings.add(
+            WARN_UNPROVEN_TRANSFER_ROUTE,
+            String(
+                "MOJOBOOST_GPU_TRANSFER_UNPROVEN=1 put at least one buffer on"
+                " transfer route '",
+                transfer_route_name(caps.transfer.requested),
+                "', which has no installed evidence; any number measured"
+                " under this must be reported with the flag",
+            ),
+        )
+    if caps.transfer.needs_kernel_retirement():
+        warnings.add(
+            WARN_KERNEL_RETIREMENT_ROUTE,
+            String(
+                "at least one buffer is on a route the kernels read directly,"
+                " so the host cannot refill it until every kernel that read"
+                " it has retired and the staging ring's overlap does not"
+                " apply; this is a synchronization change, not only an"
+                " allocation one",
+            ),
+        )
+
     return warnings^
 
 
@@ -1430,6 +1576,66 @@ struct DeviceDecision(Copyable, Movable):
         out += String(
             "auto_min_cells=", self.capabilities.auto_min_cells, "\n"
         )
+
+        out += String(
+            "session_context_open=",
+            _bool_text(self.capabilities.session.context_open),
+            "\n",
+        )
+        out += String(
+            "session_kernels_ready=",
+            _bool_text(self.capabilities.session.kernels_ready),
+            "\n",
+        )
+        out += String(
+            "session_warmup_level=",
+            warmup_level_name(self.capabilities.session.warmup_level),
+            "\n",
+        )
+
+        out += String(
+            "transfer_requested=",
+            transfer_route_name(self.capabilities.transfer.requested),
+            "\n",
+        )
+        out += String(
+            "transfer_all_default=",
+            _bool_text(self.capabilities.transfer.all_default()),
+            "\n",
+        )
+        out += String(
+            "transfer_ack_unproven=",
+            _bool_text(self.capabilities.transfer.any_unproven()),
+            "\n",
+        )
+        out += String(
+            "transfer_unified_memory=",
+            _bool_text(self.capabilities.transfer.unified_memory),
+            "\n",
+        )
+        # One `transfer` line per buffer role, in role order, always all
+        # present, rendered `<role>:<requested>:<selected>:<reason>:<evidence>
+        # :<retire_on>`. A repeated key is a list in order, the same
+        # convention `block` and `warning` use below, so a consumer that only
+        # wants the headline reads `transfer_all_default` and one that wants
+        # to explain a per-role fallback reads these.
+        for i in range(len(self.capabilities.transfer.decisions)):
+            var d = self.capabilities.transfer.decisions[i]
+            out += String(
+                "transfer=",
+                transfer_role_name(d.role),
+                ":",
+                transfer_route_name(d.requested),
+                ":",
+                transfer_route_name(d.selected),
+                ":",
+                transfer_block_name(d.reason),
+                ":",
+                transfer_evidence_name(d.evidence_level),
+                ":",
+                retire_event_name(d.contract.retire_event),
+                "\n",
+            )
 
         out += String(
             "memory_device_bytes=", self.memory.device_bytes(), "\n"
@@ -1674,6 +1880,238 @@ def resolve_device(
     return decision.selected_device
 
 
+# --- Flat entry points ------------------------------------------------
+#
+# `decide_device` takes structs, which is right for a Mojo caller and wrong
+# for every other caller this policy has. A CPython binding builds arguments
+# out of `PythonObject`s and cannot construct a `DeviceRequest`; a C API and
+# a CLI are in the same position. Without a flat seam each of them grows its
+# own argument marshalling, and the one that gets it slightly wrong is a
+# second policy nobody meant to write.
+#
+# So the flat forms live here, beside the engine, and every one of them is a
+# marshaller: it normalizes sentinels, builds the two structs, and calls
+# `decide_device`. None of them decides anything, and none of them may.
+
+
+def _normalized_bins(n_bins: Int) -> Int:
+    """A bin count off a flat boundary, with "undeclared" normalized.
+
+    Anything nonpositive is undeclared. The boundary carries plain ints, so
+    an undeclared value needs a value, and Python sends `-1`
+    (`_BINS_UNSPECIFIED` in python/mojoboost/device_selection.py). Zero
+    arrives from a caller that left a field default. Neither is a bin count
+    the binner would accept, and treating either as one would put a fabricated
+    number into the memory estimate.
+    """
+    if n_bins <= 0:
+        return BINS_UNSPECIFIED
+    return n_bins
+
+
+def _normalized_objective(objective: Int) -> Int:
+    """An objective code off a flat boundary, with "undeclared" normalized.
+
+    Below `-1` is undeclared. `-1` is deliberately excluded: it is the
+    multiclass marker and a real code, so folding it into the undeclared
+    sentinel would silently skip the objective gate for every multiclass run.
+    """
+    if objective < -1:
+        return OBJECTIVE_UNSPECIFIED
+    return objective
+
+
+def capabilities_from_reported(
+    reported_api: String,
+    reported_arch: String,
+    core_count: Int,
+    max_threads_per_block: Int,
+    max_shared_memory_per_block: Int,
+    memory_budget_bytes: Int = 0,
+    context_open: Bool = True,
+    kernels_ready: Bool = False,
+    warmup_level: Int = 0,
+) raises -> DeviceCapabilities:
+    """Capabilities from attributes a caller read off an open `DeviceContext`.
+
+    The call site apple_gpu_policy.mojo's `GpuProfile.from_reported`
+    docstring promises and this module's `PROFILE_REPORTED` describes, in one
+    function, so an owner of a `DeviceContext` needs no knowledge of how the
+    two layers fit together: query the attributes, pass them here, hand the
+    result to `decide_device`.
+
+    `context_open` defaults True because a caller with attributes to report
+    has a context open by construction. `kernels_ready` defaults False
+    because having a context says nothing about whether any kernel has been
+    created, and reporting an unpaid cost as paid is the failure
+    `SessionState` exists to prevent.
+    """
+    var profile = GpuProfile.from_reported(
+        reported_api,
+        reported_arch,
+        core_count,
+        max_threads_per_block,
+        max_shared_memory_per_block,
+        memory_budget_bytes,
+    )
+    return DeviceCapabilities.from_profile(
+        profile^,
+        PROFILE_REPORTED,
+        SessionState(context_open, kernels_ready, warmup_level),
+    )
+
+
+def decide_device_report(
+    device: String,
+    n_rows: Int,
+    n_features: Int,
+    n_outputs: Int = 1,
+    n_bins: Int = BINS_UNSPECIFIED,
+    objective: Int = OBJECTIVE_UNSPECIFIED,
+    sparse: Bool = False,
+    categorical: Bool = False,
+    has_missing: Bool = False,
+    uses_validation: Bool = False,
+) raises -> String:
+    """The whole contract across a flat boundary: workload in, serialized
+    decision out.
+
+    This is the entry point `python/mojoboost/device_selection.py` calls
+    `decide_device` and the one that moves it off its `"narrow"` contract.
+    The exact binding is in handoffs/connect_05_device_policy.md.
+
+    Never raises for a workload it refuses. A refusal is `blocked=true` in the
+    returned lines with `message=` saying why, so a caller can ask "what would
+    `device='gpu'` do here" without handling an exception, and the caller that
+    wants the exception calls `resolve_device_full` instead. It raises only
+    for a device name outside the vocabulary, a shape with no rows or no
+    features, and an unparsable `MOJOBOOST_GPU_TRANSFER`: caller and operator
+    errors, not policy outcomes.
+
+    Capabilities are detected, so the hardware profile is the portable
+    fallback and the decision says so through `profile_source=fallback`. A
+    caller holding an open `DeviceContext` should use
+    `decide_device_report_reported`, which is the same function over
+    attributes it actually read.
+    """
+    var request = DeviceRequest(
+        parse_device(device),
+        n_rows,
+        n_features,
+        n_outputs,
+        _normalized_bins(n_bins),
+        _normalized_objective(objective),
+        sparse,
+        categorical,
+        has_missing,
+        uses_validation,
+    )
+    var caps = DeviceCapabilities.detect(SessionState.from_env())
+    return decide_device(request, caps).serialize()
+
+
+def decide_device_report_reported(
+    device: String,
+    n_rows: Int,
+    n_features: Int,
+    n_outputs: Int,
+    n_bins: Int,
+    objective: Int,
+    sparse: Bool,
+    categorical: Bool,
+    has_missing: Bool,
+    uses_validation: Bool,
+    reported_api: String,
+    reported_arch: String,
+    core_count: Int,
+    max_threads_per_block: Int,
+    max_shared_memory_per_block: Int,
+    memory_budget_bytes: Int = 0,
+    context_open: Bool = True,
+    kernels_ready: Bool = False,
+    warmup_level: Int = 0,
+) raises -> String:
+    """`decide_device_report` for a caller that has read the device.
+
+    The same engine over `PROFILE_REPORTED` capabilities instead of the
+    portable fallback, which is what makes the memory gate, the unified-memory
+    warning, and any future hardware-scoped crossover rule mean anything. The
+    decision it returns carries `profile_source=reported`, so a report from
+    this entry point can be told from one that guessed.
+    """
+    var request = DeviceRequest(
+        parse_device(device),
+        n_rows,
+        n_features,
+        n_outputs,
+        _normalized_bins(n_bins),
+        _normalized_objective(objective),
+        sparse,
+        categorical,
+        has_missing,
+        uses_validation,
+    )
+    var caps = capabilities_from_reported(
+        reported_api,
+        reported_arch,
+        core_count,
+        max_threads_per_block,
+        max_shared_memory_per_block,
+        memory_budget_bytes,
+        context_open,
+        kernels_ready,
+        warmup_level,
+    )
+    return decide_device(request, caps).serialize()
+
+
+def resolve_device_full(
+    device: Int,
+    n_rows: Int,
+    n_features: Int,
+    n_outputs: Int = 1,
+    n_bins: Int = BINS_UNSPECIFIED,
+    objective: Int = OBJECTIVE_UNSPECIFIED,
+    sparse: Bool = False,
+    categorical: Bool = False,
+    has_missing: Bool = False,
+    uses_validation: Bool = False,
+) raises -> Int:
+    """Resolve a fully described workload to `CPU_DEVICE` or `GPU_DEVICE`,
+    raising the refusal when it cannot run.
+
+    What `resolve_device` should have been, and what a trainer that knows its
+    own objective, bin count, and input flags should call. `resolve_device`
+    describes only the shape, so it skips the objective gate, the bin-limit
+    gate, the sparse and validation blocks, and the memory gate, and the
+    decision it produces carries `WARN_INCOMPLETE_REQUEST` saying so. That is
+    not a second policy, it is the same engine asked a smaller question, but
+    the smaller question is one an explicit `device='gpu'` can pass and then
+    fail deeper in, which is precisely the outcome the refusal exists to
+    prevent.
+
+    The exact call-site edits for `model.mojo` and `trainset.mojo` are in
+    handoffs/connect_05_device_policy.md. They are one lane over, so they are
+    a patch request rather than an edit.
+    """
+    var request = DeviceRequest(
+        device,
+        n_rows,
+        n_features,
+        n_outputs,
+        _normalized_bins(n_bins),
+        _normalized_objective(objective),
+        sparse,
+        categorical,
+        has_missing,
+        uses_validation,
+    )
+    var caps = DeviceCapabilities.detect(SessionState.from_env())
+    var decision = decide_device(request, caps)
+    decision.raise_if_blocked()
+    return decision.selected_device
+
+
 def describe_decision(decision: DeviceDecision) raises -> String:
     """One line for benchmark output and bug reports.
 
@@ -1699,7 +2137,16 @@ def describe_decision(decision: DeviceDecision) raises -> String:
         api_name(decision.capabilities.profile.api),
         " profile=",
         profile_source_name(decision.capabilities.profile_source),
+        " session=",
+        decision.capabilities.session.describe(),
     )
+    if not decision.capabilities.transfer.all_default():
+        out += String(
+            " transfer=",
+            transfer_route_name(decision.capabilities.transfer.requested),
+        )
+    if decision.capabilities.transfer.any_unproven():
+        out += String(" ack_unproven=1")
     if not decision.blocking_reasons.is_empty():
         out += String(
             " blocked_by=",

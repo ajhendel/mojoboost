@@ -272,18 +272,24 @@ _np = _arrays.np
 __version__ = "0.1.0"
 
 __all__ = [
+    # The model, and the two doors to it.
     "Booster",
     "Dataset",
+    "train",
+    "cv",
+    "CVBooster",
     "MojoBoostRegressor",
     "MojoBoostClassifier",
     "MojoBoostRanker",
     "NotFittedError",
-    "train",
+    # What this installation can say about itself.
     "build_info",
     "gpu_available",
+    "show_versions",
+    "explain_device_choice",
+    # Ranking helpers.
     "group_from_query_ids",
     "ndcg_score",
-    "show_versions",
     # Callbacks, re-exported at the top level the way LightGBM exports
     # them, and also importable from mojoboost.callback.
     "CallbackEnv",
@@ -293,6 +299,14 @@ __all__ = [
     "log_evaluation",
     "record_evaluation",
     "reset_parameter",
+    # Structured model inspection. The whole schema is in
+    # mojoboost.inspection; these are the four entry points LightGBM has a
+    # spelling for, and each resolves the submodule on first access rather
+    # than at import.
+    "dump_model",
+    "trees_to_dataframe",
+    "trees_to_records",
+    "get_split_value_histogram",
 ]
 
 from .callback import (  # noqa: E402 - after __all__ for readability
@@ -316,6 +330,23 @@ _IMPORTANCE_TYPES = {"split": 0, "gain": 1}
 
 _DEVICES = ("cpu", "gpu", "auto")
 _BOOSTING_TYPES = ("gbdt", "goss")
+
+#: What to say when a caller asks a prediction to run somewhere and this
+#: build has no entry point that can. The alternative -- running on the CPU
+#: and reporting the device -- is the one outcome an explicit `device=` must
+#: never produce, so this is an error and not a warning.
+#:
+#: The two entry points are `predict_range_device` and
+#: `predict_proba_range_device`, specified in
+#: handoffs/apple_a4_gpu_predict.md section 4 and built by the bindings
+#: lane. `_Base._predict_batch` uses them the moment they exist; nothing
+#: here changes when they land.
+_NO_DEVICE_PREDICT = (
+    "this build predicts on the CPU only: the extension does not expose "
+    "%s, so device=%r cannot be honored without silently predicting "
+    "somewhere else. Rebuild with the device prediction bindings, or pass "
+    "device='cpu' (or leave device unset)."
+)
 
 _SQUARED_ERROR = 0
 _BINARY_LOGISTIC = 1
@@ -1552,13 +1583,48 @@ class _Base(_ParamsMixin):
             "min_data_per_group": int(self.min_data_per_group),
         }
 
-    def _resolve_device(self, n_rows, n_features, n_outputs):
+    def _resolve_device(
+        self, n_rows, n_features, n_outputs, device=None, workload=None
+    ):
         """The backend that will actually run, "cpu" or "gpu". Names are
         case-insensitive, as LightGBM treats `device_type`. Raises
         ValueError for an unknown `device` and RuntimeError when "gpu" is
         requested but unavailable or unsupported; "gpu" never falls back to
-        the CPU."""
-        device = self._resolve_alias("device", "device_type", "cpu")
+        the CPU.
+
+        `device` overrides the estimator's own `device` / `device_type`
+        pair. It is what `predict(device=...)` passes, because a prediction
+        device is a property of the call and not of the fit that produced
+        the model.
+
+        `workload` is a `mojoboost.device_selection.Workload` carrying what
+        the native policy gates on beyond the shape (the objective, the bin
+        count, the sparse / categorical / missing / eval-set flags). The
+        shape-only workload built here is what the narrow native entry
+        point could carry anyway; a caller with more to declare passes it,
+        and the extra gates run once `decide_device` is bound.
+
+        No decision is made in Python. `mojoboost.device_selection` is the
+        one Python door to the native policy and holds no policy of its
+        own; the direct `_mojoboost.resolve_device` call below reaches the
+        same engine without the report and is the fallback for a build
+        whose `device_selection` module cannot be imported at all.
+        """
+        if device is None:
+            device = self._resolve_alias("device", "device_type", "cpu")
+        try:
+            from . import device_selection as _policy
+        except Exception:
+            _policy = None
+        if _policy is not None:
+            if workload is None:
+                workload = _policy.Workload(
+                    n_rows, n_features, n_classes=n_outputs
+                )
+            # DeviceUnavailableError is a RuntimeError subclass carrying the
+            # native refusal text, so it propagates as what this method has
+            # always raised, with the report attached.
+            return _policy.select_device(device, workload).resolved
         if not isinstance(device, str) or device.lower() not in _DEVICES:
             raise ValueError(
                 f"unknown device {device!r}; expected one of "
@@ -2177,6 +2243,85 @@ class _Base(_ParamsMixin):
                 "shapes); pass at most one. Contributions always explain the "
                 "raw score, so raw_score=True is redundant with them."
             )
+
+    # -- where one prediction call runs ------------------------------------
+
+    def _predict_device(self, device, n_rows, n_outputs, unsupported=None):
+        """The backend one prediction call runs on, "cpu" or "gpu".
+
+        `device=None` is the established path and stays exactly that: the
+        CPU, with no policy consulted and nothing new on the call, so a
+        prediction that does not ask for a device is unchanged.
+
+        A name goes through the same native policy a fit goes through, so
+        `"gpu"` raises where no accelerator can run it and `"auto"`
+        resolves the way the policy resolves it. The fitted model is the
+        same object either way: mojoboost stores one ensemble, so a model
+        fitted on the CPU can be predicted on the GPU and the reverse.
+
+        `unsupported` names a prediction mode with no device kernel. An
+        explicit request for the pair is refused here rather than run on
+        the CPU and reported as having run on the device.
+        """
+        if device is None:
+            return "cpu"
+        self._require_fitted()
+        resolved = self._resolve_device(
+            n_rows, self.n_features_in_, n_outputs, device=device
+        )
+        if resolved != "cpu" and unsupported is not None:
+            raise RuntimeError(
+                f"{unsupported} is computed on the CPU; there is no "
+                f"accelerator kernel for it. Pass device='cpu' (or leave "
+                f"device unset) to predict it, or drop the flag to predict "
+                f"scores on {resolved}."
+            )
+        return resolved
+
+    def _predict_batch(
+        self, Xb, n_rows, start, stop, raw, out, device, proba=False
+    ):
+        """One dense batch prediction into `out`, on `device`.
+
+        The two entry points take the same arguments in the same order and
+        differ only in the model kind, so `proba` picks the softmax one.
+
+        When the extension exposes the device-aware entry point, every
+        call goes through it, including `device="cpu"`, so that there is
+        one prediction path rather than a device path beside a legacy one.
+        When it does not, `device="cpu"` uses the entry point that has
+        always been there and anything else raises: predicting on the CPU
+        while reporting an accelerator is the one outcome this must not
+        have.
+        """
+        name = "predict_proba_range" if proba else "predict_range"
+        hook = getattr(_mojoboost, name + "_device", None)
+        if hook is not None:
+            hook(
+                self._model,
+                _addr(Xb),
+                n_rows,
+                self.n_features_in_,
+                start,
+                stop,
+                raw,
+                device,
+                _addr(out),
+            )
+            return out
+        if device != "cpu":
+            raise RuntimeError(_NO_DEVICE_PREDICT % (name + "_device", device))
+        getattr(_mojoboost, name)(
+            self._model,
+            _addr(Xb),
+            n_rows,
+            self.n_features_in_,
+            start,
+            stop,
+            raw,
+            _addr(out),
+        )
+        return out
 
     def _iteration_slice(self, start_iteration, num_iteration):
         """Resolve LightGBM's `(start_iteration, num_iteration)` pair into
@@ -2805,6 +2950,7 @@ class MojoBoostRegressor(_Base):
         pred_leaf=False,
         pred_contrib=False,
         validate_features=False,
+        device=None,
     ):
         """Predictions for `X`, one per row.
 
@@ -2828,9 +2974,23 @@ class MojoBoostRegressor(_Base):
         `validate_features` turns a missing set of feature names on either
         side into an error rather than a warning.
 
+        `device` chooses where this one call runs, independently of the
+        `device` the model was fitted with: `None` (the default) predicts
+        on the CPU, `"gpu"` raises rather than falling back, and `"auto"`
+        resolves through the same native policy a fit resolves through. The
+        ensemble is the same object either way. Leaf ordinals,
+        contributions, and sparse input have no accelerator kernel and say
+        so instead of quietly running on the CPU.
+
         `raw_score` and `pred_leaf` cannot be combined."""
         self._check_predict_flags(raw_score, pred_leaf, pred_contrib)
         if _arrays.is_sparse(X):
+            if self._predict_device(device, 0, 1) != "cpu":
+                raise RuntimeError(
+                    "sparse input predicts on the CPU; there is no sparse "
+                    "accelerator kernel. Pass device='cpu' (or leave device "
+                    "unset), or densify with .toarray()."
+                )
             out, n_rows = self._sparse_scores(
                 X, raw_score, start_iteration, num_iteration, pred_leaf,
                 pred_contrib, validate_features,
@@ -2839,19 +2999,20 @@ class MojoBoostRegressor(_Base):
         Xb, n_rows = self._check_predict_X(X, validate_features)
         start, stop = self._iteration_slice(start_iteration, num_iteration)
         if pred_leaf:
+            self._predict_device(device, n_rows, 1, "pred_leaf=True")
             return self._predict_leaf(Xb, n_rows, start, stop)
         if pred_contrib:
+            self._predict_device(device, n_rows, 1, "pred_contrib=True")
             return self._predict_contrib(Xb, n_rows, start, stop)
         out = _out_buffer(n_rows)
-        _mojoboost.predict_range(
-            self._model,
-            _addr(Xb),
+        self._predict_batch(
+            Xb,
             n_rows,
-            self.n_features_in_,
             start,
             stop,
             int(bool(raw_score)),
-            _addr(out),
+            out,
+            self._predict_device(device, n_rows, 1),
         )
         return _finish(out)
 
@@ -3768,3 +3929,80 @@ class MojoBoostRanker(_Base):
         est.n_iter_ = est.best_iteration_
         est._restore_categorical()
         return est
+
+
+# =========================================================================
+# The public surface, assembled last
+# =========================================================================
+#
+# Everything below runs after the estimators exist, which is the constraint
+# that decides eager from lazy: `mojoboost.cv` and `mojoboost.dask` both
+# reach back into this module, so neither can be imported from the top of
+# it. `cv` is cheap and unconditional, so it is imported here; the rest are
+# resolved on first access by `__getattr__`, so that `import mojoboost`
+# costs the extension and nothing else.
+#
+# `python/mojoboost/_public_api_plan.py` is the same decisions as data,
+# with the alternatives that were not taken.
+
+# `mojoboost.cv` is the *function*, as `lightgbm.cv` is, and the module of
+# that name is shadowed by it. `from mojoboost.cv import cv, CVBooster`
+# still works, because that form resolves the submodule through sys.modules
+# rather than through this attribute; `import mojoboost.cv as m` binds the
+# function, so use `from mojoboost import cv` instead. The collision is
+# written down in `_public_api_plan.NAME_COLLISIONS` with the rename that
+# would remove it.
+from .cv import CVBooster, cv  # noqa: E402 - the estimators must exist first
+
+#: Submodules the package answers for without importing them. Each is
+#: reachable as `mojoboost.<name>` after a plain `import mojoboost`, and
+#: none is imported until it is asked for.
+#:
+#: - `dask` is experimental and cannot train: no transport ships, so every
+#:   `fit` raises `DistributedNotAvailable`. It is the client-side contract
+#:   for a backend, not a feature, which is why neither it nor its
+#:   estimators are in `__all__`. Importing it does not import dask.
+#: - `inspection`, `device_selection`, and `diagnostics` are pure mojoboost
+#:   and are lazy only to keep this import cheap. `inspection` reaches
+#:   pandas from `trees_to_dataframe` alone, and never at import.
+_LAZY_SUBMODULES = ("dask", "device_selection", "diagnostics", "inspection")
+
+#: Top-level names that live in a lazy submodule, and the submodule each
+#: comes from. They are in `__all__`: the module they come from is an
+#: implementation detail of where the code sits, not of what the package
+#: offers.
+_LAZY_ATTRS = {
+    "explain_device_choice": "device_selection",
+    "dump_model": "inspection",
+    "trees_to_dataframe": "inspection",
+    "trees_to_records": "inspection",
+    "get_split_value_histogram": "inspection",
+}
+
+
+def __getattr__(name):
+    """PEP 562 resolution for the lazy half of the surface.
+
+    Whatever is resolved is written into the module globals, so the cost is
+    paid once and every later access is an ordinary attribute lookup.
+    """
+    import importlib
+
+    if name in _LAZY_SUBMODULES:
+        module = importlib.import_module(f".{name}", __name__)
+        globals()[name] = module
+        return module
+    origin = _LAZY_ATTRS.get(name)
+    if origin is not None:
+        value = getattr(
+            importlib.import_module(f".{origin}", __name__), name
+        )
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    return sorted(
+        set(globals()) | set(_LAZY_SUBMODULES) | set(_LAZY_ATTRS)
+    )

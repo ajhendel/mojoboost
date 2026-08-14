@@ -67,11 +67,22 @@ from mojoboost.trainset import (
     update_dataset as mojo_update_dataset,
     update_dataset_multiclass as mojo_update_dataset_multiclass,
 )
+from mojoboost.binning import BinnedMatrix
 from mojoboost.device import (
+    CPU_DEVICE,
+    GPU_DEVICE,
     device_name as mojo_device_name,
     gpu_available as mojo_gpu_available,
     parse_device,
     resolve_device as mojo_resolve_device,
+)
+from mojoboost.gpu_predict import (
+    GpuPredictor,
+    accumulate_booster_rounds,
+    accumulate_multiclass_rounds,
+    gpu_predict_support,
+    leaf_indices_gpu,
+    leaf_indices_multiclass_gpu,
 )
 from mojoboost.goss import GossParams
 from mojoboost.importance import gain_importance, split_importance

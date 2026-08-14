@@ -1,11 +1,28 @@
 """LightGBM text model interop: read and write LightGBM's own model format.
 
-This module is self-contained. It converts between LightGBM's line-oriented
-text model (the string `Booster.save_model` writes and `Booster.model_str`
-returns) and mojoboost's `Model` / `MulticlassModel`. It reads
-`model.mojo`, `serialize.mojo`, and `tree.mojo` but changes nothing in them:
-everything here is expressed in terms of the public `BinMapper`, `Tree`,
-`Booster`, and `MulticlassBooster` structures.
+EXPERIMENTAL. Everything public here is quarantined behind that word until
+differential fixtures against a real LightGBM build have been run; see
+`LGBM_INTEROP_STATUS` and the "Experimental status" section below. Nothing
+in this module has been checked against a file LightGBM actually wrote.
+
+**This is not mojoboost's model format.** `serialize.mojo` owns persistence:
+its versioned text stores floats as raw bit patterns, so a native round trip
+is bit-exact and lossless, and it is the only format `save_model` /
+`load_model` speak. LightGBM's format is a decimal text interchange with
+strictly less in it (no split gains in the shapes mojoboost keeps, no
+hessian sums, no category-to-bin table), so it is an *import and export*
+path and never a persistence one. `import_lgbm_file` therefore lands its
+result in the native format: the conversion's product is a mojoboost model
+file, not a LightGBM one.
+
+This module converts between LightGBM's line-oriented text model (the string
+`Booster.save_model` writes and `Booster.model_str` returns) and mojoboost's
+`Model` / `MulticlassModel`. It reads `binning.mojo`, `categorical.mojo`,
+`model.mojo`, `objective_registry.mojo`, `serialize.mojo`, and `tree.mojo`
+but changes nothing in them: everything here is expressed in terms of the
+public `BinMapper`, `CategoricalSpec`, `Tree`, `Booster`, and
+`MulticlassBooster` structures, and every objective fact comes from the
+registry rather than from a second table kept here.
 
 Why a bin mapper has to be synthesized
 --------------------------------------
@@ -65,21 +82,62 @@ exact only once the rate has been folded in.
 
 What is rejected, and why
 -------------------------
-- Categorical splits (`decision_type` bit 0, `num_cat > 0`). LightGBM keeps
-  category sets over raw codes in `cat_threshold`; mojoboost keeps 256-bit
-  sets over bins plus a fitted code table (see categorical.mojo) that a model
-  file does not carry. Until that table can be reconstructed, converting
-  would silently change which categories go left.
 - Linear trees (`is_linear=1`, `leaf_const`, `leaf_coeff`). mojoboost leaves
   hold a constant.
-- `missing_type = Zero`, as above.
+- `missing_type = Zero` on a numerical split, as above.
+- A feature split numerically in one node and by category set in another.
+  mojoboost's `is_categorical` is a property of the feature.
+- A feature needing more than 256 bins, or more than
+  `CAT_MAX_BINS - 1` categories: mojoboost bins are a byte and its category
+  sets are 256 bits.
 - `average_output` (random forest boosting). mojoboost sums trees.
 - Objectives mojoboost does not implement, `multiclassova` and friends, a
   `binary` objective with a non-unit `sigmoid`, and files written under a
-  custom objective (whose link mojoboost cannot know).
+  custom objective (whose link mojoboost cannot know). Which names those are,
+  and the reason each is refused, comes from `objective_registry.mojo`; this
+  module holds no second list of them.
 
 Every rejection raises with the construct named. Nothing is silently
 approximated.
+
+Categorical splits
+------------------
+These convert exactly, in both directions, and the reason is worth stating
+because a model file does not carry LightGBM's fitted category-to-bin table.
+It does not have to. LightGBM's `cat_threshold` is a bitset over *raw*
+category codes (`Tree::CategoricalDecision` tests `static_cast<int>(fval)`
+against it directly), and its routing rule is: a code whose bit is set goes
+left, and everything else -- an unset bit, a negative value, a NaN, a code
+past the bitset -- goes right. mojoboost's rule is: bin 0 of a categorical
+feature is never a set member, and `CategoricalSpec.bin_of` sends every
+missing, unseen, or untabulated value to bin 0, so those rows go right.
+
+So the table only has to contain the codes some split mentions. Take the
+union of every code appearing in any categorical split on a feature, sort it,
+and let it be that feature's `CategoricalSpec` table; map each split's code
+set to the corresponding bins. A code in the table lands in the same branch
+it did in LightGBM by construction, and a code outside the table has its bit
+unset in *every* split (that is what being outside the union means), so
+LightGBM sent it right and bin 0 sends it right too. The two agree on every
+possible input, not merely on the training data.
+
+The union is then widened with whatever `feature_infos` lists for that
+feature, when the header carries a category list there and the widened table
+still fits in `CAT_MAX_BINS - 1` entries. That is LightGBM's own fitted
+category list, so the widened table is the one LightGBM fit rather than a
+projection of it; widening cannot change any routing decision, because the
+codes it adds are exactly the ones no split mentions. `LgbmImportReport`
+records which of the two tables each conversion used.
+
+Experimental status
+-------------------
+`LGBM_INTEROP_STATUS` is the one place that says how far this has been
+checked, and the answer today is: hand-written fixtures only. No file
+LightGBM wrote has been read, and no file this writer produced has been fed
+to LightGBM. Until that changes, this is an experiment with a narrow surface
+(`import_lgbm_file`, `export_lgbm_file`, `lgbm_unsupported_reason`, and the
+lower-level parse/dump pairs they are built from), and the public Python and
+C surfaces are expected to carry the same word.
 
 Node vocabulary
 ---------------
@@ -132,10 +190,27 @@ from .boosting import (
     Booster,
     MulticlassBooster,
 )
-from .categorical import CategoricalSpec
+from .categorical import (
+    CAT_BITSET_WORDS,
+    CAT_MAX_BINS,
+    UNKNOWN_BIN,
+    CategoricalSpec,
+)
 from .model import Model, MulticlassModel
-from .params import MULTICLASS, objective_from_name
+from .objective_registry import (
+    objective_canonical_name,
+    objective_code_from_name,
+    objective_param_name,
+)
+from .params import MULTICLASS
 from .ranking import LAMBDARANK
+from .serialize import (
+    load_model,
+    load_multiclass_model,
+    model_file_kind,
+    save_model,
+    save_multiclass_model,
+)
 from .tree import Tree
 
 # LightGBM's `decision_type` bitfield (see its `Tree::GetDecisionType`).
@@ -158,6 +233,28 @@ comptime _MAX_BINS = 256
 # they differ only in fields this converter either writes explicitly or
 # rejects.
 comptime _WRITE_VERSION = "v4"
+
+# LightGBM packs a categorical split's code set into 32-bit words.
+comptime _CAT_WORD_BITS = 32
+
+# The widest code set this writer will emit, in 32-bit words. LightGBM's
+# bitset is as wide as the largest code plus one, so a model whose categories
+# are sparse integers in the billions would otherwise render a file of
+# hundreds of megabytes for a single split. Two million codes is far past any
+# real categorical feature and keeps the refusal a message rather than a
+# disk-filling surprise.
+comptime _MAX_CAT_WORDS = 1 << 16
+
+# How far this interop has actually been checked. Read by
+# `lgbm_interop_status`, which the bindings and the Python facade are asked
+# to surface verbatim rather than paraphrase (see
+# handoffs/connect_16_lgbm_interop.md).
+comptime LGBM_INTEROP_STATUS = String(
+    "experimental: converted against hand-written fixtures only. No file"
+    " written by a real LightGBM build has been read, and no file produced"
+    " here has been read back by LightGBM. mojoboost's own format"
+    " (serialize.mojo) remains the only supported persistence format."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -349,6 +446,13 @@ struct _LgbmTree(Copyable, Movable):
     The split arrays have `num_leaves - 1` entries and the leaf arrays
     `num_leaves`, which is LightGBM's own invariant; a single-leaf tree has
     empty split arrays and one leaf value.
+
+    `cat_boundaries` has `num_cat + 1` entries and slices `cat_threshold`
+    into one code bitset per categorical split; a categorical node's
+    `threshold` is its index into `cat_boundaries` rather than a real
+    threshold. Every entry of `cat_threshold` is one 32-bit word, so bit `b`
+    of word `w` of a split's slice stands for category code
+    `32 * w + b`.
     """
 
     var num_leaves: Int
@@ -362,6 +466,9 @@ struct _LgbmTree(Copyable, Movable):
     var internal_count: List[Float64]
     var leaf_value: List[Float64]
     var leaf_count: List[Float64]
+    var num_cat: Int
+    var cat_boundaries: List[Int]
+    var cat_threshold: List[Int]
 
     def __init__(
         out self,
@@ -376,6 +483,9 @@ struct _LgbmTree(Copyable, Movable):
         var internal_count: List[Float64],
         var leaf_value: List[Float64],
         var leaf_count: List[Float64],
+        num_cat: Int,
+        var cat_boundaries: List[Int],
+        var cat_threshold: List[Int],
     ):
         self.num_leaves = num_leaves
         self.split_feature = split_feature^
@@ -388,6 +498,64 @@ struct _LgbmTree(Copyable, Movable):
         self.internal_count = internal_count^
         self.leaf_value = leaf_value^
         self.leaf_count = leaf_count^
+        self.num_cat = num_cat
+        self.cat_boundaries = cat_boundaries^
+        self.cat_threshold = cat_threshold^
+
+    def is_categorical(self, node: Int) -> Bool:
+        """Whether LightGBM internal node `node` routes by category set."""
+        return self.decision_type[node] & _CATEGORICAL_MASK != 0
+
+    def cat_index(self, node: Int, where: String) raises -> Int:
+        """The `cat_boundaries` slot a categorical node's `threshold` names.
+
+        LightGBM stores the index as a double, so a file whose value is not a
+        whole number in range is malformed rather than merely unsupported.
+        """
+        var raw = self.threshold[node]
+        var index = Int(raw)
+        if Float64(index) != raw or index < 0 or index >= self.num_cat:
+            raise Error(
+                "LightGBM ",
+                where,
+                " node ",
+                node,
+                " is a categorical split whose threshold (",
+                raw,
+                ") is not one of its ",
+                self.num_cat,
+                " category sets",
+            )
+        return index
+
+    def cat_codes(self, node: Int, where: String) raises -> List[Int]:
+        """The raw category codes a categorical node sends left, ascending.
+
+        This is the decode half of LightGBM's `Common::FindInBitset`: the set
+        is a run of 32-bit words, and code `32 * w + b` is a member exactly
+        when bit `b` of word `w` is set.
+        """
+        var index = self.cat_index(node, where)
+        var lo = self.cat_boundaries[index]
+        var hi = self.cat_boundaries[index + 1]
+        var out = List[Int]()
+        for w in range(lo, hi):
+            var word = self.cat_threshold[w]
+            if word == 0:
+                continue
+            for b in range(_CAT_WORD_BITS):
+                if (word >> b) & 1 != 0:
+                    out.append((w - lo) * _CAT_WORD_BITS + b)
+        if len(out) == 0:
+            raise Error(
+                "LightGBM ",
+                where,
+                " node ",
+                node,
+                " is a categorical split with an empty category set, which"
+                " sends every row right and cannot have been a split",
+            )
+        return out^
 
 
 struct _LgbmText(Copyable, Movable):
@@ -420,17 +588,56 @@ def _finish_tree(block: _KeyVals, index: Int) raises -> _LgbmTree:
             " constant, so a linear model cannot be converted",
         )
     var num_cat = block.int_or("num_cat", where, 0)
-    if num_cat != 0 or block.has("cat_threshold") or block.has(
-        "cat_boundaries"
-    ):
-        raise Error(
-            "LightGBM ",
-            where,
-            " has categorical splits (num_cat=",
-            num_cat,
-            "); a model file does not carry the fitted category-to-bin table"
-            " mojoboost routes them with, so they are not convertible yet",
+    if num_cat < 0:
+        raise Error("LightGBM ", where, " declares num_cat=", num_cat)
+    var cat_boundaries = List[Int]()
+    var cat_threshold = List[Int]()
+    if num_cat > 0:
+        cat_boundaries = _parse_ints(
+            block.require("cat_boundaries", where),
+            num_cat + 1,
+            where + " cat_boundaries",
         )
+        cat_threshold = _parse_ints(
+            block.get("cat_threshold", ""), -1, where + " cat_threshold"
+        )
+        if cat_boundaries[0] != 0:
+            raise Error(
+                "LightGBM ",
+                where,
+                " has cat_boundaries starting at ",
+                cat_boundaries[0],
+                " rather than 0",
+            )
+        for c in range(num_cat):
+            if cat_boundaries[c + 1] <= cat_boundaries[c]:
+                raise Error(
+                    "LightGBM ",
+                    where,
+                    " category set ",
+                    c,
+                    " spans no words; cat_boundaries must ascend",
+                )
+        if cat_boundaries[num_cat] != len(cat_threshold):
+            raise Error(
+                "LightGBM ",
+                where,
+                " declares ",
+                cat_boundaries[num_cat],
+                " cat_threshold words but carries ",
+                len(cat_threshold),
+            )
+        for w in range(len(cat_threshold)):
+            if cat_threshold[w] < 0 or cat_threshold[w] > 0xFFFFFFFF:
+                raise Error(
+                    "LightGBM ",
+                    where,
+                    " cat_threshold word ",
+                    w,
+                    " (",
+                    cat_threshold[w],
+                    ") is not a 32-bit bitset word",
+                )
 
     var num_leaves = block.require_int("num_leaves", where)
     if num_leaves < 1:
@@ -480,20 +687,25 @@ def _finish_tree(block: _KeyVals, index: Int) raises -> _LgbmTree:
         where + " leaf_count",
     )
 
+    var saw_categorical = False
     for j in range(n_split):
-        if decision_type[j] & _CATEGORICAL_MASK != 0:
-            raise Error(
-                "LightGBM ",
-                where,
-                " node ",
-                j,
-                " is a categorical split; a model file does not carry the"
-                " fitted category-to-bin table mojoboost routes them with, so"
-                " it is not convertible yet",
-            )
         var missing = (
             decision_type[j] >> _MISSING_TYPE_SHIFT
         ) & _MISSING_TYPE_MASK
+        if missing != _MISSING_NONE and missing != _MISSING_NAN and (
+            missing != _MISSING_ZERO
+        ):
+            raise Error(
+                "LightGBM ", where, " node ", j, " has an unknown missing_type"
+            )
+        if decision_type[j] & _CATEGORICAL_MASK != 0:
+            # `Tree::CategoricalDecision` never reads missing_type or
+            # default_left: a code with its bit set goes left and everything
+            # else, missing included, goes right. So both bits are ignored
+            # here rather than rejected, which is also why 'Zero' is not an
+            # error on a categorical node the way it is on a numerical one.
+            saw_categorical = True
+            continue
         if missing == _MISSING_ZERO:
             raise Error(
                 "LightGBM ",
@@ -504,10 +716,6 @@ def _finish_tree(block: _KeyVals, index: Int) raises -> _LgbmTree:
                 " as missing; mojoboost routes missing values by a reserved"
                 " bin and cannot express that",
             )
-        if missing != _MISSING_NONE and missing != _MISSING_NAN:
-            raise Error(
-                "LightGBM ", where, " node ", j, " has an unknown missing_type"
-            )
         if not isfinite(threshold[j]):
             raise Error(
                 "LightGBM ",
@@ -517,7 +725,15 @@ def _finish_tree(block: _KeyVals, index: Int) raises -> _LgbmTree:
                 " has a non-finite threshold",
             )
 
-    return _LgbmTree(
+    if saw_categorical and num_cat == 0:
+        raise Error(
+            "LightGBM ",
+            where,
+            " has a node marked categorical but declares num_cat=0, so its"
+            " category sets are missing",
+        )
+
+    var tree = _LgbmTree(
         num_leaves,
         split_feature^,
         threshold^,
@@ -529,7 +745,17 @@ def _finish_tree(block: _KeyVals, index: Int) raises -> _LgbmTree:
         internal_count^,
         leaf_value^,
         leaf_count^,
+        num_cat,
+        cat_boundaries^,
+        cat_threshold^,
     )
+    # Decoding every set once here means a malformed `cat_boundaries` index or
+    # an empty set is reported against the tree it came from, before any
+    # feature-wide table is built out of it.
+    for j in range(n_split):
+        if tree.is_categorical(j):
+            _ = tree.cat_codes(j, where)
+    return tree^
 
 
 def _repeat_zero(n: Int) -> String:
@@ -758,20 +984,15 @@ def lgbm_objective_name(objective: Int) raises -> String:
 # ---------------------------------------------------------------------------
 
 
-def _collect_edges(
-    trees: List[_LgbmTree],
-    n_features: Int,
-    mut edges: List[Float64],
-    mut offsets: List[Int],
+def _check_feature_indices(
+    trees: List[_LgbmTree], n_features: Int
 ) raises:
-    """Every distinct threshold used on each feature, ascending, in
-    `BinMapper` layout: feature f's edges are `edges[offsets[f]:offsets[f+1]]`.
+    """Every split's feature index is one this model declares.
 
-    Bucketed by feature with a counting pass so a large model costs one sort
-    per feature rather than a scan per feature over every node.
+    Run before anything buckets by feature, so an out-of-range index is
+    reported as the malformed file it is rather than as an out-of-bounds
+    access inside a counting pass.
     """
-    var counts = List[Int](capacity=n_features)
-    counts.resize(n_features, 0)
     for t in range(len(trees)):
         ref tree = trees[t]
         for j in range(len(tree.split_feature)):
@@ -788,7 +1009,32 @@ def _collect_edges(
                     n_features,
                     " features",
                 )
-            counts[f] += 1
+
+
+def _collect_edges(
+    trees: List[_LgbmTree],
+    n_features: Int,
+    mut edges: List[Float64],
+    mut offsets: List[Int],
+) raises:
+    """Every distinct threshold used on each feature, ascending, in
+    `BinMapper` layout: feature f's edges are `edges[offsets[f]:offsets[f+1]]`.
+
+    Categorical nodes contribute nothing: their `threshold` is a
+    `cat_boundaries` index, not a value, and a categorical feature carries no
+    edges at all (see `BinMapper`).
+
+    Bucketed by feature with a counting pass so a large model costs one sort
+    per feature rather than a scan per feature over every node.
+    """
+    var counts = List[Int](capacity=n_features)
+    counts.resize(n_features, 0)
+    for t in range(len(trees)):
+        ref tree = trees[t]
+        for j in range(len(tree.split_feature)):
+            if tree.is_categorical(j):
+                continue
+            counts[tree.split_feature[j]] += 1
 
     var starts = List[Int](capacity=n_features + 1)
     starts.append(0)
@@ -805,6 +1051,8 @@ def _collect_edges(
     for t in range(len(trees)):
         ref tree = trees[t]
         for j in range(len(tree.split_feature)):
+            if tree.is_categorical(j):
+                continue
             var f = tree.split_feature[j]
             flat[cursor[f]] = tree.threshold[j]
             cursor[f] += 1
@@ -839,6 +1087,11 @@ def _collect_missing_bins(
     for t in range(len(trees)):
         ref tree = trees[t]
         for j in range(len(tree.split_feature)):
+            if tree.is_categorical(j):
+                # A categorical feature's missing rows land in bin 0, which is
+                # never a set member, so it reserves nothing and its nodes'
+                # missing_type bits carry no meaning to agree about.
+                continue
             var f = tree.split_feature[j]
             var missing = (
                 tree.decision_type[j] >> _MISSING_TYPE_SHIFT
@@ -863,14 +1116,24 @@ def _collect_missing_bins(
     return missing_bin^
 
 
-def _bins_needed(offsets: List[Int], missing_bin: List[Int]) raises -> Int:
+def _bins_needed(
+    offsets: List[Int], missing_bin: List[Int], cats: CategoricalSpec
+) raises -> Int:
+    """The `n_bins` a converted mapper needs: the widest feature wins.
+
+    A categorical feature uses one bin per kept category plus bin 0, which
+    `CategoricalSpec` reserves for missing, unseen, and dropped codes.
+    """
     var n_features = len(missing_bin)
     var needed = 1
     for f in range(n_features):
-        var n_edges = offsets[f + 1] - offsets[f]
-        var here = n_edges + 1
-        if missing_bin[f] >= 0:
-            here += 1
+        var here: Int
+        if cats.is_cat(f):
+            here = cats.n_categories(f) + 1
+        else:
+            here = offsets[f + 1] - offsets[f] + 1
+            if missing_bin[f] >= 0:
+                here += 1
         if here > needed:
             needed = here
     if needed > _MAX_BINS:

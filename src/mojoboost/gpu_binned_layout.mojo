@@ -3,9 +3,10 @@
 Pure host arithmetic. Nothing here opens a `DeviceContext`, allocates a
 device buffer, or launches a kernel, so every layout decision is reasonable
 about without a GPU, the way `gpu_tiling.mojo` and `gpu_sparse_layout.mojo`
-are. This module consumes `gpu_bin_packing.mojo` (bit primitives) and reads
-`binning.mojo` and `categorical.mojo`; none of them consume it, and it edits
-nothing they own.
+are. This module consumes `gpu_bin_packing.mojo` (bit primitives), reads
+`binning.mojo` and `categorical.mojo`, and produces the
+`BinStorageDescriptor` declared in `gpu_histogram_specializations.mojo`; none
+of them consume it, and it edits nothing they own.
 
 What is on the device today
 ---------------------------
@@ -151,9 +152,41 @@ Bin ids are stored, never renumbered (see `gpu_bin_packing`). So:
 - `n_bins` still sizes every histogram. Width is a *storage* property of a
   feature, not a change to how many bins it has.
 
+Preserving an id is not the same as being able to *store* it, and that is the
+one way a width choice could change what a model means. A width narrower than
+a feature's missing bin, or than a categorical feature's highest category bin,
+would truncate the marker: missing rows would route by the threshold instead
+of by `default_left`, and a category would fall out of its split set, both
+without any bounds violation. `check_markers_preserved` is the refusal, it
+runs inside every descriptor this module produces, and it is never falled back
+from.
+
 Host binning is untouched: `fit_bins` and `BinMapper.transform` produce the
 same `BinnedMatrix` they always did, and packing runs after them as a pure
 reformatting of bytes that already exist.
+
+What the rest of the lane consumes
+----------------------------------
+A `BinLayoutPlan` is the layout *decision*; `BinStorageDescriptor` (defined in
+`gpu_histogram_specializations.mojo`) is the small thing the histogram
+kernels, the specialization planner, and the trainer read. This module is the
+only one that produces one, through `BinLayoutPlan.storage_descriptor`, so
+nothing downstream re-derives an element width or a block factor from a bin
+count. Three entry points matter to a caller:
+
+    baseline_descriptor(data)          the UInt8 matrix uploaded today
+    plan.storage_descriptor(mb, cats)  what a candidate plan really is
+    resolve_storage(data, plan)        the descriptor to actually train on
+
+`resolve_storage` is the conservative switch: a plan the shipping kernels
+cannot read falls back to the baseline rather than being uploaded, because
+every kernel in this repository indexes `bins[f * n_rows + r]` as one byte.
+Storage classes wider than a byte (`BIN_STORAGE_U16`, `BIN_STORAGE_WIDER`) are
+named so a descriptor can report them truthfully, and are unreachable from
+this repository's data representation: `binning.fit_bins` caps `max_bins` at
+256 and `BinnedMatrix.bins` is a `List[UInt8]`, so no plan resolves above 8
+bits and `BinStorageDescriptor.check_shipping` says so in as many words rather
+than pretending otherwise.
 """
 
 from .binning import BinMapper, BinnedMatrix
@@ -174,14 +207,23 @@ from .gpu_bin_packing import (
     width_for_bins,
     writable_footprint_end,
 )
-from .gpu_tiling import DeviceCaps
+from .gpu_histogram_specializations import (
+    MAX_BINS,
+    BinStorageDescriptor,
+    bin_storage_name,
+    storage_for_width,
+    storage_is_shipping,
+)
+from .gpu_tiling import BYTES_PER_PARTIAL_CELL, DeviceCaps
 
 # Byte offsets into the packed buffer cross into kernels as Int32, the same
 # bound `histogram_gpu.MAX_ROWS` already imposes on row ids.
 comptime LAYOUT_MAX_INDEX = Int(Int32.MAX)
 
-# The widest histogram the GPU backend accepts.
-comptime LAYOUT_MAX_BINS = 256
+# The widest histogram the GPU backend accepts. One definition for the whole
+# GPU dataflow lane, in `gpu_histogram_specializations.mojo`; the name below
+# is kept because this module's support codes read in its terms.
+comptime LAYOUT_MAX_BINS = MAX_BINS
 
 # Every block starts at a multiple of this. Sixteen bytes is the coarsest
 # natural alignment on the three backends and is a multiple of every load
@@ -189,9 +231,10 @@ comptime LAYOUT_MAX_BINS = 256
 # load and never depends on the width of the block before it.
 comptime BLOCK_ALIGN_BYTES = 16
 
-# Int32 gradient + Int32 hessian + Int32 count per shared histogram slot,
-# matching `gpu_tiling.BYTES_PER_PARTIAL_CELL`.
-comptime BYTES_PER_HIST_SLOT = 12
+# Int32 gradient + Int32 hessian + Int32 count per shared histogram slot.
+# Imported rather than restated: it is the same cell `gpu_tiling` and the
+# batched kernels size their partial buffers with.
+comptime BYTES_PER_HIST_SLOT = BYTES_PER_PARTIAL_CELL
 
 # The *row side* of a histogram build: the Int32 active-row index, the
 # Float32 gradient, and the Float32 hessian. Today all three are re-read once
@@ -450,6 +493,82 @@ def check_categorical_widths(
             raise Error(
                 "categorical feature's width cannot hold its category bins"
             )
+
+
+def missing_markers_preserved(
+    widths: List[Int], missing_bin: List[Int]
+) raises -> Bool:
+    """Whether every feature's missing bin id still fits the width it is
+    stored at.
+
+    Packing never renumbers a bin, so a missing row is still found by the same
+    equality test `BinnedMatrix.missing_bin[f]` drives, *provided the id is
+    representable at all*. A width narrower than the missing bin would store a
+    truncated id, and rows that were missing would silently route by the
+    threshold instead of by `default_left`. That is a wrong answer with no
+    bounds violation anywhere, so it is a check rather than a comment.
+
+    A feature with no missing bin passes -1, which nothing can fail.
+    """
+    if len(widths) != len(missing_bin):
+        raise Error("width and missing-bin tables must be the same length")
+    for f in range(len(widths)):
+        var mb = missing_bin[f]
+        if mb < 0:
+            continue
+        if mb >= bins_representable(widths[f]):
+            return False
+    return True
+
+
+def categorical_markers_preserved(
+    cats: CategoricalSpec, widths: List[Int], n_bins: Int
+) -> Bool:
+    """Non-raising form of `check_categorical_widths`.
+
+    Same question, as a Bool, because `BinStorageDescriptor` carries the
+    answer as a flag and a descriptor producer should not have to catch to
+    fill it in.
+    """
+    for f in range(len(widths)):
+        if not cats.is_cat(f):
+            continue
+        var n_cat = cats.n_categories(f)
+        if n_cat >= n_bins:
+            return False
+        if n_cat + 1 > CAT_MAX_BINS:
+            return False
+        if n_cat + 1 > bins_representable(widths[f]):
+            return False
+    return True
+
+
+def check_markers_preserved(
+    widths: List[Int],
+    missing_bin: List[Int],
+    cats: CategoricalSpec,
+    n_bins: Int,
+) raises:
+    """Raising form of both marker checks, named for what it protects.
+
+    The one condition under which a width choice changes what a model means:
+    the missing sentinel and the categorical set membership are both bin ids,
+    and both are lost by a width too narrow to hold them. Every descriptor
+    producer below runs this before it reports a storage class.
+    """
+    if not missing_markers_preserved(widths, missing_bin):
+        raise Error(
+            "binned layout does not support this dataset: "
+            + layout_support_name(LAYOUT_WIDTH_TOO_NARROW)
+            + " (a feature's missing bin does not fit its storage width)"
+        )
+    if not categorical_markers_preserved(cats, widths, n_bins):
+        raise Error(
+            "binned layout does not support this dataset: "
+            + layout_support_name(LAYOUT_CATEGORIES_EXCEED_BINS)
+            + " (a categorical feature's highest category bin does not fit"
+            " its storage width)"
+        )
 
 
 # --- The plan -------------------------------------------------------------
@@ -829,6 +948,130 @@ struct BinLayoutPlan(Copyable, Movable):
                     self.block_width[b],
                 ):
                     raise Error("two blocks share a writable byte")
+
+    # --- The storage descriptor -------------------------------------------
+    #
+    # What this plan looks like to a histogram kernel. The plan is where the
+    # storage *choice* is made; `BinStorageDescriptor` is the small thing the
+    # kernels and the specialization module read, so nothing downstream
+    # re-derives a width or a block factor from a bin count.
+
+    def uniform_width(self) -> Int:
+        """The width every block shares, or -1 when they differ.
+
+        A mixed-width plan is legal (a `plan_feature_blocked` with `promote`
+        false cuts blocks at width changes), and it is exactly the plan that
+        has no single element width to report, so the descriptor refuses it
+        rather than reporting one block's width as the matrix's.
+        """
+        if self.n_blocks() < 1:
+            return -1
+        var w = self.block_width[0]
+        for b in range(1, self.n_blocks()):
+            if self.block_width[b] != w:
+                return -1
+        return w
+
+    def uniform_block_size(self) -> Int:
+        """`G`, when every block holds the same number of features, else -1.
+
+        The last block of a blocked plan is short whenever `target_block` does
+        not divide `n_features`, so this is -1 more often than not; that is
+        the honest answer, because a kernel addressing `r * G + lane` needs one
+        `G` for the whole matrix.
+        """
+        if self.n_blocks() < 1:
+            return -1
+        var g = self.block_size[0]
+        for b in range(1, self.n_blocks()):
+            if self.block_size[b] != g:
+                return -1
+        return g
+
+    def storage_class(self) raises -> Int:
+        """The `BIN_STORAGE_*` class this plan resolves to.
+
+        Derived from the element width and nothing else, so a plan that packs
+        at 4 bits reports packed storage even though its buffer is still a
+        `List[UInt8]`: the class describes what a *cell* costs, not what the
+        allocation's element type happens to be. A mixed-width plan has no
+        class and raises.
+        """
+        var w = self.uniform_width()
+        if w < 0:
+            raise Error(
+                "a mixed-width layout has no single storage class; promote"
+                " the widths first (see promote_widths_uniform) or plan"
+                " feature-major"
+            )
+        return storage_for_width(w)
+
+    def storage_descriptor(
+        self, missing_bin: List[Int], cats: CategoricalSpec
+    ) raises -> BinStorageDescriptor:
+        """This plan as the descriptor the histogram lane consumes.
+
+        Refuses before it reports, in this order: a mixed-width or mixed-block
+        plan has nothing truthful to say; a width that cannot hold a feature's
+        missing bin or a categorical feature's highest category bin would lose
+        the marker, which `check_markers_preserved` turns into an error rather
+        than into a flag a caller might ignore. What comes back is therefore
+        either a descriptor whose marker flags are both true, or an error
+        naming the feature class that could not be represented.
+
+        Reporting a class is not the same as claiming a kernel can read it.
+        `BinStorageDescriptor.check_shipping` is that question, and only the
+        8-bit one-feature-per-block plan answers it yes today.
+        """
+        var width = self.uniform_width()
+        if width < 0:
+            raise Error(
+                "a mixed-width layout has no single storage descriptor;"
+                " promote the widths first (see promote_widths_uniform)"
+            )
+        var block = self.uniform_block_size()
+        if block < 0:
+            raise Error(
+                "a layout whose blocks hold different feature counts has no"
+                " single storage descriptor; a kernel addressing"
+                " r * G + lane needs one G for the whole matrix"
+            )
+        if len(missing_bin) != self.n_features:
+            raise Error("missing-bin table must be one entry per feature")
+        check_markers_preserved(
+            self.width, missing_bin, cats, self.n_bins
+        )
+        var desc = BinStorageDescriptor(
+            storage_for_width(width),
+            width,
+            self.n_rows,
+            self.n_features,
+            self.n_bins,
+            block,
+            self.is_passthrough(),
+            True,
+            True,
+        )
+        desc.check()
+        return desc^
+
+    def check_storage_shipping(
+        self, missing_bin: List[Int], cats: CategoricalSpec
+    ) raises:
+        """Refuse this plan unless the kernels compiled into this build can
+        read it.
+
+        The gate the trainer wants before it uploads anything: a packed or
+        blocked plan is a legal *description* and an illegal *upload*, because
+        every shipping kernel indexes `bins[f * n_rows + r]` as one byte.
+        Failing here names the storage class; failing later would mean
+        training on bytes read as the wrong cells.
+        """
+        var desc = self.storage_descriptor(missing_bin, cats)
+        desc.check_shipping()
+
+    def storage_name(self) raises -> String:
+        return bin_storage_name(self.storage_class())
 
 
 # --- Plan builders --------------------------------------------------------
@@ -1460,6 +1703,49 @@ def baseline_plan(data: BinnedMatrix) raises -> BinLayoutPlan:
     )
 
 
+def baseline_descriptor(data: BinnedMatrix) raises -> BinStorageDescriptor:
+    """The storage the GPU backend uploads today, as a descriptor.
+
+    The conservative answer, and the one a caller that has made no layout
+    decision should pass: one `UInt8` per cell, one feature per block,
+    passthrough, markers intact at width 8 by construction. It goes through
+    the same `storage_descriptor` path every candidate does, so the baseline
+    is described by the same code that describes the candidates rather than by
+    a hand-written constant that could drift from them.
+    """
+    return baseline_plan(data).storage_descriptor(
+        data.missing_bin, data.cats
+    )
+
+
+def resolve_storage(
+    data: BinnedMatrix,
+    var preferred: BinLayoutPlan,
+    allow_fallback: Bool = True,
+) raises -> BinStorageDescriptor:
+    """The descriptor to actually train on, given a preferred plan.
+
+    The internal strategy switch this lane offers the trainer. A preferred
+    plan the shipping kernels can read is returned as itself. One they cannot
+    is *not* silently uploaded: with `allow_fallback` true (the default) the
+    dense 8-bit baseline is returned instead, which is the established path
+    and is byte-identical to what `GpuHistogramBuilder` already uploads; with
+    it false the storage class that could not be served is raised.
+
+    Marker loss is never falled back from. A plan whose widths would drop a
+    missing bin or a category bin raises out of `storage_descriptor` before
+    this function can choose anything, because "quietly train on a different
+    dataset" is not a fallback, it is a wrong answer.
+    """
+    var desc = preferred.storage_descriptor(data.missing_bin, data.cats)
+    if storage_is_shipping(desc.storage) and desc.block_features == 1:
+        return desc^
+    if not allow_fallback:
+        desc.check_shipping()
+        return desc^
+    return baseline_descriptor(data)
+
+
 def candidate_plans(
     data: BinnedMatrix,
     bin_counts: List[Int],
@@ -1489,7 +1775,12 @@ def candidate_plans(
 
     var packed_widths = widths_from_bin_counts(bin_counts, True)
     var flat_widths = widths_from_bin_counts(bin_counts, False)
-    check_categorical_widths(data.cats, packed_widths, data.n_bins)
+    # Both marker classes, not just the categorical one: a packed width that
+    # cannot hold a feature's missing bin is exactly as wrong as one that
+    # cannot hold its category bins, and neither may reach a benchmark.
+    check_markers_preserved(
+        packed_widths, data.missing_bin, data.cats, data.n_bins
+    )
 
     var out = List[BinLayoutPlan]()
 

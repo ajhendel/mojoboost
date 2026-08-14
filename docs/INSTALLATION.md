@@ -144,8 +144,8 @@ it. There is one wheel per row, and no row is a near enough match for another.
 | Your machine | The wheel | Where that stands |
 |---|---|---|
 | Apple silicon Mac, Python 3.14 | `mojoboost-0.1.0-cp314-cp314-macosx_26_0_arm64.whl` | The first target. Tag not yet produced by a release run |
-| Linux x86_64, Python 3.14 | `mojoboost-0.1.0-cp314-cp314-linux_x86_64.whl` | Tag not settled. See below |
-| Linux aarch64, Python 3.14 | `mojoboost-0.1.0-cp314-cp314-linux_aarch64.whl` | Tag not settled. See below |
+| Linux x86_64, Python 3.14 | `mojoboost-0.1.0-cp314-cp314-linux_x86_64.whl` | Matrix row `linux-x86_64-cp314`, not index-publishable. See below |
+| Linux aarch64, Python 3.14 | `mojoboost-0.1.0-cp314-cp314-linux_aarch64.whl` | Matrix row `linux-aarch64-cp314`, not index-publishable. See below |
 | Intel Mac | none, and there will not be one | The pinned channel ships no Intel macOS toolchain |
 | Windows | none | No toolchain in the pinned channel |
 | Free-threaded Python (`3.14t`) | none | A different ABI tag; the extension cannot load |
@@ -173,13 +173,26 @@ shipped objects actually reference, not inheriting the floor Pixi happened to
 solve against. Until that measurement exists, treat the Linux rows above as
 artifact names rather than as an install anyone should be pointed at.
 
+That decision is now written down rather than left implicit. The plain wheels
+are matrix rows `linux-x86_64-cp314` and `linux-aarch64-cp314`, both carrying
+`publishable = false`; the promoted wheels are the separate rows
+`linux-x86_64-cp314-manylinux` and `linux-aarch64-cp314-manylinux`, which the
+same builder produces under `tag_policy=manylinux`. The workflow's TestPyPI job
+refuses to run on a plain tag, so the rule above is enforced rather than merely
+recommended.
+
 ### Install it
 
 ```sh
-# 1. Verify the download against the checksum the release run published.
-#    macOS emits a SHA256SUMS manifest; Linux emits a .sha256 per wheel.
-shasum -a 256 mojoboost-0.1.0-cp314-cp314-macosx_26_0_arm64.whl   # macOS
-sha256sum   mojoboost-0.1.0-cp314-cp314-linux_x86_64.whl          # Linux
+# 1. Verify the download against the checksum manifest the release run
+#    published. Both platforms publish a manifest rather than a bare digest,
+#    so check it with -c and let the tool compare, instead of reading two
+#    hex strings side by side.
+#    macOS:  SHA256SUMS, from packaging/macos/hash_artifacts.sh
+#    Linux:  SHA256SUMS-x86_64.txt or SHA256SUMS-aarch64.txt, one per
+#            architecture, written next to the wheels by release-linux.yml
+shasum -a 256 -c SHA256SUMS                    # macOS
+sha256sum -c SHA256SUMS-x86_64.txt             # Linux x86_64
 
 # 2. Install into a fresh virtual environment, from the file itself.
 python3.14 -m venv .venv

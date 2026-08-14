@@ -73,7 +73,7 @@ from .gpu_tiling import (
     shared_bytes_for,
 )
 from .histogram_sparse import SparseNodeEntries
-from .sparse import SparseBinnedMatrix
+from .sparse import SparseBinnedMatrix, check_sparse_categorical_semantics
 
 # Entry ids, row ids, offsets, and node ids all cross into the kernels as
 # Int32, so every one of them is bounded by the same limit the dense GPU
@@ -157,6 +157,7 @@ comptime SPARSE_SHARED_MEMORY = 5
 comptime SPARSE_EMPTY = 6
 comptime SPARSE_CATEGORIES_EXCEED_BINS = 7
 comptime SPARSE_BUNDLED_CATEGORICAL = 8
+comptime SPARSE_CATEGORY_SET_OVERFLOW = 9
 
 
 def sparse_support_name(reason: Int) -> String:
@@ -182,6 +183,11 @@ def sparse_support_name(reason: Int) -> String:
         return String("categorical feature has more categories than bins")
     if reason == SPARSE_BUNDLED_CATEGORICAL:
         return String("categorical feature inside a multi-member bundle")
+    if reason == SPARSE_CATEGORY_SET_OVERFLOW:
+        return String(
+            "categorical feature has more categories than the 256-bit split"
+            " set holds"
+        )
     return String("unknown")
 
 
@@ -230,10 +236,10 @@ def check_sparse_support(
         )
 
 
-def check_categorical_support(
+def categorical_support(
     cats: CategoricalSpec, n_features: Int, n_bins: Int
-) raises:
-    """The categorical half of the support check.
+) -> Int:
+    """The categorical half of the support check, as a code.
 
     A categorical feature needs one bin per kept category plus the reserved
     unknown bin, and the split search's category set is a 256-bit mask
@@ -241,20 +247,32 @@ def check_categorical_support(
     device work starts. This mirrors the check `gpu_split_search` already
     makes on the dense path; it is repeated here so a sparse caller fails at
     layout time rather than at launch time.
+
+    Non-raising, like `sparse_support`, so the capability record below can
+    report the reason rather than catch it. `check_categorical_support` is
+    the raising form.
     """
     for f in range(n_features):
         if not cats.is_cat(f):
             continue
         var n_cat = cats.n_categories(f)
         if n_cat >= n_bins:
-            raise Error(
-                "categorical feature has more categories than bins"
-            )
+            return SPARSE_CATEGORIES_EXCEED_BINS
         if n_cat + 1 > CAT_MAX_BINS:
-            raise Error(
-                "categorical feature has more categories than the 256-bit"
-                " split set holds"
-            )
+            return SPARSE_CATEGORY_SET_OVERFLOW
+    return SPARSE_OK
+
+
+def check_categorical_support(
+    cats: CategoricalSpec, n_features: Int, n_bins: Int
+) raises:
+    """Raising form of `categorical_support`."""
+    var reason = categorical_support(cats, n_features, n_bins)
+    if reason != SPARSE_OK:
+        raise Error(
+            "sparse GPU path does not support this dataset: "
+            + sparse_support_name(reason)
+        )
 
 
 # --- Device buffer accounting --------------------------------------------

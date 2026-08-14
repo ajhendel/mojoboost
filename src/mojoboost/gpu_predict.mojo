@@ -87,6 +87,22 @@ from .boosting import (
     MulticlassBooster,
 )
 from .categorical import CAT_BITSET_WORDS
+from .device_policy import (
+    BINS_UNSPECIFIED,
+    BLOCK_BIN_LIMIT,
+    BLOCK_GPU_DISABLED_ENV,
+    BLOCK_NO_ACCELERATOR,
+    BLOCK_OUTPUT_LIMIT,
+    BLOCK_ROW_LIMIT,
+    BLOCK_SPARSE_INPUT,
+    MAX_GPU_BINS,
+    MAX_GPU_ROWS,
+    MIN_GPU_BINS,
+    block_reason_name,
+    build_has_accelerator,
+    gpu_disabled_by_env,
+    gpu_supports_outputs,
+)
 from .gpu_runtime import (
     PHASE_ALLOC,
     ROLE_VALID,
@@ -453,6 +469,167 @@ def response_for_objective(objective: Int) -> Int:
     if objective == POISSON or objective == GAMMA or objective == TWEEDIE:
         return RESPONSE_EXP
     return RESPONSE_IDENTITY
+
+
+# --- What GPU prediction covers ---------------------------------------
+#
+# A caller that is about to ask for `device="gpu"` prediction needs the
+# answer before the call, not as an exception from four frames down, and
+# it needs the reason in a form it can match on rather than parse. That is
+# what `gpu_predict_support` returns.
+#
+# The vocabulary is device_policy.mojo's, not a second one: the block codes
+# below are that module's `BLOCK_*` codes and the names come from its
+# `block_reason_name`, so a consumer that already matches on a training
+# refusal matches a prediction refusal with the same table. What this
+# function adds is only which of those gates *prediction* is subject to,
+# which is a shorter list than training's: the kernels here walk trees
+# rather than build histograms, so no objective can block them and no
+# gradient path is involved. What is left is availability, the dense
+# requirement, and the three indexing limits the kernels carry.
+#
+# It decides nothing about *which* device runs. `resolve_device` in
+# device.mojo is still the only thing that chooses, and this record is what
+# a caller consults to know whether choosing the GPU is even open to it.
+
+comptime PREDICT_BLOCK_NONE = 0
+"""`GpuPredictSupport.block_code` when nothing blocks the request. Zero is
+outside device_policy.mojo's block numbering, which starts at 1."""
+
+
+struct GpuPredictSupport(Copyable, Movable):
+    """Whether the GPU prediction path covers one request, and if not, why.
+
+    `block_code` is a device_policy.mojo `BLOCK_*` code, or
+    `PREDICT_BLOCK_NONE` when `supported` is True. `message` is the prose
+    for the first thing that blocks, which is the one worth putting in a
+    refusal; the record reports one reason rather than all of them because
+    availability short-circuits the rest, exactly as `_collect_blocks`
+    does.
+    """
+
+    var supported: Bool
+    var block_code: Int
+    var message: String
+
+    def __init__(
+        out self, supported: Bool, block_code: Int, var message: String
+    ):
+        self.supported = supported
+        self.block_code = block_code
+        self.message = message^
+
+    @staticmethod
+    def ok() -> GpuPredictSupport:
+        return GpuPredictSupport(True, PREDICT_BLOCK_NONE, String(""))
+
+    @staticmethod
+    def blocked(code: Int, var message: String) -> GpuPredictSupport:
+        return GpuPredictSupport(False, code, message^)
+
+    def reason_name(self) -> String:
+        """The stable name of the blocking reason, or "none"."""
+        if self.supported:
+            return String("none")
+        return block_reason_name(self.block_code)
+
+    def raise_if_blocked(self) raises:
+        """Raise the refusal, for a caller that asked for the GPU
+        explicitly. An explicit request is never quietly served by the CPU:
+        this is the same rule `resolve_device` follows for training."""
+        if not self.supported:
+            raise Error(self.message.copy())
+
+
+def gpu_predict_support(
+    n_rows: Int,
+    n_features: Int,
+    n_outputs: Int,
+    n_bins: Int = BINS_UNSPECIFIED,
+    sparse: Bool = False,
+) -> GpuPredictSupport:
+    """Whether the GPU prediction path covers a request of this shape.
+
+    `n_outputs` is 1 for a single-output ensemble and the class count for a
+    softmax one. `n_bins` is the binner's reserved bin count; leave it
+    `BINS_UNSPECIFIED` when the caller does not know it, and the bin gate is
+    skipped rather than guessed at. `sparse` reports the input's layout, not
+    a preference.
+
+    Ordered cheapest and most fundamental first, so the first block found is
+    the one reported. Two things deliberately stay out of this record:
+
+    - The feature count. It is taken so callers describe the whole shape in
+      one place (and so a later memory gate has it), but nothing here gates
+      on it: `GpuPredictor.__init__` raises for a matrix with no features,
+      and a request that degenerate is a caller error rather than a device
+      limit.
+    - The ensemble's size. The node-count ceiling in `_append_tree` is a
+      property of the model, not of the request, and it is checked where the
+      trees are flattened, which is the only place the count is known.
+    """
+    if not build_has_accelerator():
+        if gpu_disabled_by_env():
+            return GpuPredictSupport.blocked(
+                BLOCK_GPU_DISABLED_ENV,
+                String(
+                    "MOJOBOOST_DISABLE_GPU=1 pins this process to the CPU"
+                    " backend, so GPU prediction is unavailable"
+                ),
+            )
+        return GpuPredictSupport.blocked(
+            BLOCK_NO_ACCELERATOR,
+            String("no accelerator is available to this build"),
+        )
+    if gpu_disabled_by_env():
+        return GpuPredictSupport.blocked(
+            BLOCK_GPU_DISABLED_ENV,
+            String(
+                "MOJOBOOST_DISABLE_GPU=1 pins this process to the CPU"
+                " backend, so GPU prediction is unavailable"
+            ),
+        )
+    if sparse:
+        return GpuPredictSupport.blocked(
+            BLOCK_SPARSE_INPUT,
+            String(
+                "GPU prediction reads a dense binned matrix; there is no"
+                " sparse prediction kernel, so densify the input or predict"
+                " on the CPU"
+            ),
+        )
+    if n_rows < 1:
+        return GpuPredictSupport.blocked(
+            BLOCK_ROW_LIMIT,
+            String("GPU prediction requires at least one row"),
+        )
+    if n_rows > MAX_GPU_ROWS:
+        return GpuPredictSupport.blocked(
+            BLOCK_ROW_LIMIT,
+            String(
+                "GPU prediction indexes rows as Int32, so it supports at"
+                " most 2^31 - 1 rows"
+            ),
+        )
+    if n_bins != BINS_UNSPECIFIED and (
+        n_bins < MIN_GPU_BINS or n_bins > MAX_GPU_BINS
+    ):
+        return GpuPredictSupport.blocked(
+            BLOCK_BIN_LIMIT,
+            String(
+                "GPU prediction reads bins as UInt8, so a binning must"
+                " reserve between 2 and 256 bins"
+            ),
+        )
+    if not gpu_supports_outputs(n_outputs):
+        return GpuPredictSupport.blocked(
+            BLOCK_OUTPUT_LIMIT,
+            String(
+                "the GPU prediction path does not cover this many trees per"
+                " boosting round"
+            ),
+        )
+    return GpuPredictSupport.ok()
 
 
 struct FlatEnsemble(Copyable, Movable):
@@ -1339,3 +1516,101 @@ def predict_raw_multiclass_gpu(
     var predictor = GpuPredictor(data.n_features, booster.n_classes)
     predictor.upload_ensemble(flatten_multiclass(booster))
     return predictor.raw_scores(data, rng)
+
+
+def leaf_indices_gpu(
+    booster: Booster, data: BinnedMatrix, rng: IterationRange
+) raises -> List[Int]:
+    """One-shot per-tree leaf ordinals for a single-output ensemble,
+    row-major `[r * n_iterations + i]`.
+
+    The batched form of `Booster.leaf_indices_bins`, with the same ordinal
+    numbering: `_append_tree` assigns a leaf its rank among the tree's
+    leaves in node order, which is what `Tree.leaf_ordinals` counts. An
+    empty range returns an empty list, the same shape the host path reports
+    for it.
+    """
+    var predictor = GpuPredictor(data.n_features, 1)
+    predictor.upload_ensemble(flatten_booster(booster))
+    return predictor.leaf_indices(data, rng)
+
+
+def leaf_indices_multiclass_gpu(
+    booster: MulticlassBooster, data: BinnedMatrix, rng: IterationRange
+) raises -> List[Int]:
+    """One-shot per-tree leaf ordinals for a softmax ensemble, row-major and
+    round-major within a row:
+    `[r * n_iterations * n_classes + i * n_classes + k]`, which is what
+    `MulticlassBooster.leaf_indices_bins` returns for a single example."""
+    var predictor = GpuPredictor(data.n_features, booster.n_classes)
+    predictor.upload_ensemble(flatten_multiclass(booster))
+    return predictor.leaf_indices(data, rng)
+
+
+# --- Folding rounds into a resident validation set ---------------------
+#
+# `GpuPredictor` already keeps a validation matrix, its labels, and its
+# running raw scores on the device across a whole run; what a caller
+# driving that from outside Mojo still has to do is turn "the iterations
+# this model gained since I last looked" into uploads and accumulations.
+# These three helpers are that step, so a bridge does not reimplement the
+# round-major tree indexing or the zero-base-score rule per language.
+
+
+def accumulate_rounds(
+    mut predictor: GpuPredictor,
+    trees: List[Tree],
+    n_outputs: Int,
+    learning_rate: Float64,
+) raises:
+    """Add whole iterations of `trees` into the resident validation scores.
+
+    `trees` is round-major and holds `n_outputs` trees per iteration, the
+    layout `flatten_trees` documents. The base scores are zero because
+    `reset_validation` already put the ensemble's base score into the
+    resident vector once, which is where `IterationRange` puts it too; a
+    second copy here would double it.
+
+    The whole slice is uploaded once and then accumulated one iteration at
+    a time, since `accumulate_round` folds in a single iteration per launch.
+    An empty slice does nothing rather than raising, so a caller can hand
+    over "the rounds since last time" without special-casing a round that
+    added none.
+    """
+    if len(trees) == 0:
+        return
+    var zero = List[Float64](capacity=n_outputs)
+    for _ in range(n_outputs):
+        zero.append(0.0)
+    predictor.upload_ensemble(
+        flatten_trees(trees, zero, n_outputs, learning_rate)
+    )
+    for i in range(len(trees) // n_outputs):
+        predictor.accumulate_round(i)
+
+
+def accumulate_booster_rounds(
+    mut predictor: GpuPredictor, booster: Booster, rng: IterationRange
+) raises:
+    """Fold the single-output ensemble's iterations in `rng` into the
+    resident validation scores."""
+    var trees = List[Tree](capacity=rng.n_iterations())
+    for i in range(rng.start, rng.stop):
+        trees.append(booster.trees[i].copy())
+    accumulate_rounds(predictor, trees, 1, booster.learning_rate)
+
+
+def accumulate_multiclass_rounds(
+    mut predictor: GpuPredictor,
+    booster: MulticlassBooster,
+    rng: IterationRange,
+) raises:
+    """Fold the softmax ensemble's iterations in `rng` into the resident
+    validation scores. One iteration is `n_classes` trees, stored
+    round-major, so the slice is taken in whole rounds."""
+    var k = booster.n_classes
+    var trees = List[Tree](capacity=rng.n_iterations() * k)
+    for i in range(rng.start, rng.stop):
+        for c in range(k):
+            trees.append(booster.trees[i * k + c].copy())
+    accumulate_rounds(predictor, trees, k, booster.learning_rate)

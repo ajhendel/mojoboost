@@ -15,11 +15,31 @@ Two sparse-specific shortcuts:
   Rows outside a bag come back as -1 and fall back to a walk.
 - leaf renewal groups residuals by that same assignment.
 
-Not available on the sparse path: categorical features (rejected when the
-data is binned, see sparse.mojo), custom objectives (`objective.mojo` takes
-a `BinnedMatrix`), and the GPU backend. Everything else the dense trainer
-accepts -- every built-in objective, sample weights, early stopping,
-bagging, GOSS, and every `TreeParams` field -- behaves the same here.
+What the sparse path does and does not accept
+---------------------------------------------
+Available and shared with the dense path: every built-in objective, sample
+weights, early stopping, uniform bagging, LightGBM's balanced
+(class-conditional) bagging, GOSS in both the single-output and the softmax
+form, categorical features (`fit_categorical_spec_csc` and `transform_csc`
+fit and bin them, and `tree._search` searches them through `data.cats`, so a
+sparse-grown categorical split is the dense one), missing values, monotonic
+and interaction constraints, feature subsampling, and every `TreeParams`
+field including the whole `extra` bundle -- `min_gain_to_split`,
+`max_delta_step`, `path_smooth`, `extra_trees`, the monotone penalty, and the
+feature penalties all reach `grow_tree_sparse`, which opts into
+`grower_applies_extra` and applies the leaf-finishing half itself, renewal
+included.
+
+Not available: custom objectives (`objective.mojo` takes a `BinnedMatrix`)
+and the GPU backend. The sparse GPU primitives exist -- see `gpu_sparse.mojo`
+and `gpu_categorical.mojo` -- but no training path is wired to them, and
+`gpu_sparse_layout.sparse_gpu_capability` is the record that says so rather
+than a trainer that silently falls back.
+
+Every entry point here validates its matrix once, through
+`SparseBinnedMatrix.validate`, before the first histogram: a structurally
+broken matrix or a categorical column whose default bin is not category 0's
+would otherwise produce a fitted model rather than an error.
 """
 
 from std.math import exp, log
@@ -35,12 +55,15 @@ from .boosting import (
     BoosterParams,
     MulticlassBooster,
     _base_score,
+    _check_class_bagging,
     _check_goss,
     _check_objective,
     _check_sample_weight,
     _clamp_prob,
     _fill_grad_hess,
+    _fill_softmax_grad_hess,
     _mean_loss,
+    _multiclass_goss_select,
     _multiclass_mean_loss,
     _percentile,
     _softmax_inplace,
@@ -49,7 +72,12 @@ from .boosting import (
     renewal_alpha,
     renewal_weights,
 )
-from .goss import GossParams, goss_round
+from .goss import GossParams, GossSelection, apply_goss_scaling, goss_round
+from .sampling import (
+    ClassBaggingParams,
+    has_positive_rows,
+    refresh_class_bag,
+)
 from .sparse import SparseBinnedMatrix, SparseBinnedRows
 from .tree import Tree, node_bounds
 from .tree_parameters_extra import ExtraTreeParams, finish_leaf_output
@@ -168,6 +196,7 @@ def train_sparse(
     bagging: BaggingParams = BaggingParams.disabled(),
     goss: GossParams = GossParams.disabled(),
     init_score: List[Float64] = [],
+    class_bagging: ClassBaggingParams = ClassBaggingParams.disabled(),
 ) raises -> Booster:
     """Sparse counterpart of `train`, with identical arguments and
     semantics. The returned `Booster` is an ordinary one: it serializes,
@@ -176,13 +205,22 @@ def train_sparse(
 
     A non-empty `init_score` starts boosting from those raw scores instead
     of from the objective's own base score, exactly as in `train`: the
-    returned ensemble has a base score of 0 and predicts the trees alone."""
+    returned ensemble has a base score of 0 and predicts the trees alone.
+
+    `class_bagging` is LightGBM's balanced bagging, as in `train`: it
+    replaces the uniform bag with one drawn per label class, produces the
+    same shape (one ascending, duplicate-free row list), and so reaches
+    `grow_tree_sparse` exactly as a uniform bag does. `_check_class_bagging`
+    is what makes it exclusive with `bagging` and with `goss`, and what
+    restricts it to binary classification."""
     if len(target) != data.n_rows:
         raise Error("target length must equal n_rows")
+    data.validate()
     _check_objective(objective, target, alpha)
     _check_sample_weight(sample_weight, data.n_rows)
     check_bagging(bagging)
     _check_goss(goss, bagging)
+    _check_class_bagging(class_bagging, bagging, goss, objective)
     params.tree.monotone.check_features(data.n_features)
     if len(init_score) != 0 and len(init_score) != data.n_rows:
         raise Error("init_score length must equal n_rows")
@@ -206,8 +244,16 @@ def train_sparse(
     var grad = List[Float64](capacity=n)
     var hess = List[Float64](capacity=n)
     var bag = List[Int]()
+    # LightGBM turns balanced bagging on only when the dataset holds a
+    # positive row, and falls back to plain `bagging_fraction` when it does
+    # not. One label sweep, hoisted out of the round loop, exactly as in
+    # `boosting._boost_rounds`.
+    var balanced = class_bagging.enabled() and has_positive_rows(target)
     for i in range(params.n_estimators):
-        refresh_bag(bag, bagging, n, i)
+        if balanced:
+            refresh_class_bag(bag, class_bagging, target, i)
+        else:
+            refresh_bag(bag, bagging, n, i)
         _fill_grad_hess(
             raw, target, objective, sample_weight, alpha, grad, hess
         )
@@ -226,7 +272,7 @@ def train_sparse(
             )
 
         if grown.tree.n_leaves == 1 and abs(grown.tree.value[0]) < 1e-12:
-            if bagging_enabled(bagging) or goss.enabled:
+            if bagging_enabled(bagging) or goss.enabled or balanced:
                 continue
             break
 
@@ -257,22 +303,31 @@ def train_sparse_with_valid(
     alpha: Float64 = 0.9,
     bagging: BaggingParams = BaggingParams.disabled(),
     goss: GossParams = GossParams.disabled(),
+    class_bagging: ClassBaggingParams = ClassBaggingParams.disabled(),
 ) raises -> Booster:
     """Sparse counterpart of `train_with_valid`. The validation matrix is
     turned into a row view once, so scoring it each round costs one binary
-    search per node over that row's own entries."""
+    search per node over that row's own entries.
+
+    `class_bagging` carries the meaning it has in `train_sparse`; the
+    validation loss is untouched by it, exactly as on the dense path."""
     if len(target) != data.n_rows:
         raise Error("target length must equal n_rows")
     if len(valid_target) != valid_data.n_rows:
         raise Error("valid_target length must equal valid n_rows")
     if valid_data.n_features != data.n_features:
         raise Error("valid_data must have the same features")
+    if valid_data.n_bins != data.n_bins:
+        raise Error("valid_data must be binned with the same bin count")
+    data.validate()
+    valid_data.validate()
     _check_objective(objective, target, alpha)
     if early_stopping_rounds < 1:
         raise Error("early_stopping_rounds must be positive")
     _check_sample_weight(sample_weight, data.n_rows)
     check_bagging(bagging)
     _check_goss(goss, bagging)
+    _check_class_bagging(class_bagging, bagging, goss, objective)
     params.tree.monotone.check_features(data.n_features)
 
     var n = data.n_rows
@@ -296,8 +351,12 @@ def train_sparse_with_valid(
     var best_loss = _mean_loss(valid_raw, valid_target, objective, alpha)
     var best_n_trees = 0
     var bag = List[Int]()
+    var balanced = class_bagging.enabled() and has_positive_rows(target)
     for i in range(params.n_estimators):
-        refresh_bag(bag, bagging, n, i)
+        if balanced:
+            refresh_class_bag(bag, class_bagging, target, i)
+        else:
+            refresh_bag(bag, bagging, n, i)
         _fill_grad_hess(
             raw, target, objective, sample_weight, alpha, grad, hess
         )
@@ -315,7 +374,7 @@ def train_sparse_with_valid(
                 params.tree.extra,
             )
         if grown.tree.n_leaves == 1 and abs(grown.tree.value[0]) < 1e-12:
-            if bagging_enabled(bagging) or goss.enabled:
+            if bagging_enabled(bagging) or goss.enabled or balanced:
                 continue
             break
 
@@ -354,15 +413,24 @@ def train_multiclass_sparse(
     params: BoosterParams,
     sample_weight: List[Float64] = [],
     bagging: BaggingParams = BaggingParams.disabled(),
+    goss: GossParams = GossParams.disabled(),
 ) raises -> MulticlassBooster:
     """Sparse counterpart of `train_multiclass`, with identical arguments
-    and semantics."""
+    and semantics.
+
+    `goss` draws one gradient-based sample per round, shared by every class's
+    tree in that round, through the same `_multiclass_goss_select` and
+    `apply_goss_scaling` the dense multiclass loop uses -- so the sample, the
+    scaling, and the round-skipping rule are one implementation, not two."""
     if len(labels) != data.n_rows:
         raise Error("labels length must equal n_rows")
     if n_classes < 2:
         raise Error("n_classes must be at least 2")
+    data.validate()
     _check_sample_weight(sample_weight, data.n_rows)
     check_bagging(bagging)
+    _check_goss(goss, bagging)
+    params.tree.monotone.check_features(data.n_features)
     var n = data.n_rows
 
     var class_w = List[Float64](capacity=n_classes)
@@ -400,19 +468,21 @@ def train_multiclass_sparse(
                 prob[r * n_classes + k] = raw[r * n_classes + k]
             _softmax_inplace(prob, r * n_classes, n_classes)
 
+        # One shared sample for the whole round, drawn before any class's
+        # tree so that every class is grown on the same rows.
+        var selection = GossSelection.all_rows()
+        if goss.active(i, params.learning_rate):
+            selection = _multiclass_goss_select(
+                prob, labels, n_classes, sample_weight, goss, i
+            )
+            bag = selection.rows.copy()
+
         var made_progress = False
         for k in range(n_classes):
-            grad.clear()
-            hess.clear()
-            for r in range(n):
-                var p = prob[r * n_classes + k]
-                var y = 1.0 if labels[r] == k else 0.0
-                var w = sample_weight[r] if len(sample_weight) > 0 else 1.0
-                grad.append(w * (p - y))
-                var h = 2.0 * p * (1.0 - p)
-                if h < 1e-16:
-                    h = 1e-16
-                hess.append(w * h)
+            _fill_softmax_grad_hess(
+                prob, labels, k, n_classes, sample_weight, grad, hess
+            )
+            apply_goss_scaling(selection, grad, hess)
             var grown = grow_tree_sparse(
                 data, grad, hess, params.tree, bag, i * n_classes + k
             )
@@ -432,10 +502,19 @@ def train_multiclass_sparse(
         if not made_progress:
             for _ in range(n_classes):
                 _ = trees.pop()
-            if bagging_enabled(bagging):
+            if bagging_enabled(bagging) or goss.enabled:
                 continue
             break
 
+    # The constraints every per-class tree was grown under travel with the
+    # ensemble, as they do on the dense path: a sparse-trained multiclass
+    # model that dropped them would serialize as an unconstrained one and
+    # `train_multiclass_more` would then accept a different constraint
+    # vector for its continued rounds.
     return MulticlassBooster(
-        trees^, base_scores^, n_classes, params.learning_rate
+        trees^,
+        base_scores^,
+        n_classes,
+        params.learning_rate,
+        params.tree.monotone.copy(),
     )

@@ -1,8 +1,8 @@
 # packaging/linux
 
-The Linux wheel plan: what a redistributable Linux artifact would have to be,
-what would build it, and what has to be measured before its filename is allowed
-to make a promise.
+The Linux wheel: what a redistributable Linux artifact has to be, the builder
+that produces it, and what has to be measured before its filename is allowed to
+make a promise.
 
 **Nothing in this directory has been executed.** No Linux wheel exists, none has
 been built by the change that added these files, and no command below has been
@@ -11,7 +11,7 @@ because it is.
 
 ```
 README.md                  this file: the plan and the contract
-build_wheel_linux.sh       the builder that does not exist yet, written down
+build_wheel_linux.sh       the builder, run by release-linux.yml. Never executed
 check_metadata_ready.py    static preflight: is the repo's Python metadata Linux-ready
 inspect_wheel.py           stdlib wheel and ELF inspector, no binutils required
 inspect_elf.sh             binutils inspection of installed objects, on the target
@@ -23,7 +23,7 @@ Related, and owned elsewhere:
 
 | File | What it does |
 | --- | --- |
-| [`packaging/matrix/platform_matrix.toml`](../matrix/platform_matrix.toml) | The two Linux target rows, both `designed`, both with `builder = "does not exist yet"` |
+| [`packaging/matrix/platform_matrix.toml`](../matrix/platform_matrix.toml) | Four Linux target rows, all `designed`: `linux-{x86_64,aarch64}-cp314` are the plain-tag wheels this builder produces by default and are `publishable = false`; the two `-manylinux` rows are the same builder with `MOJOBOOST_TAG_POLICY=manylinux` and are gated on a measured glibc floor |
 | [`packaging/matrix/smoke/clean_install_linux.sh`](../matrix/smoke/clean_install_linux.sh) | The clean-install acceptance fixture. This directory produces the wheel it is waiting for |
 | [`packaging/matrix/validate_artifact.py`](../matrix/validate_artifact.py) | Matrix conformance for a built wheel. Its ELF branch is a byte scan and says so; `inspect_wheel.py` here is the dynamic-section parse it defers to |
 | [`packaging/build_wheel.sh`](../build_wheel.sh) | The macOS builder. Not portable, see below |

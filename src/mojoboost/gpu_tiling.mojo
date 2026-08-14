@@ -45,6 +45,32 @@ device properties and a node's shape, and its own default is to call
 `derive_tiling` and hand back exactly what it returned. Nothing there is on
 unless a caller asks for it by level or by
 `MOJOBOOST_GPU_HIST_SPECIALIZATION`, because nothing there has been measured.
+
+Where this module sits in the scheduling layer
+----------------------------------------------
+This is the bottom of it, and the only place its geometry rules are written
+down:
+
+    gpu_tiling.mojo             the tile arithmetic, the block-width rule,
+                                the partial-buffer budget, and the launch
+                                count each strategy costs
+        ^
+    apple_histogram_policy.mojo the same arithmetic re-run against reported
+                                device properties and a node's shape, plus
+                                the specialization ladder and the multiclass
+                                schedule
+        ^                                   ^
+    gpu_multiclass_batch.mojo       hybrid_leaf_scheduler.mojo
+    (per-round class batching)      (per-leaf placement; charges a node the
+                                     launches `launches_for_strategy` says
+                                     its resolved strategy costs)
+
+`resolve_tiling` below is the one function that decides a tile count. Both
+the portable geometry (`derive_tiling`) and the shape-derived one
+(`apple_histogram_policy.derive_histogram_plan` at `SPEC_LEVEL_SHAPE`) call
+it with different bounds rather than restating the rule, so the two can
+disagree about how many threadgroups a device wants but never about what
+follows from that answer.
 """
 
 from std.os import getenv
@@ -95,6 +121,33 @@ comptime FALLBACK_SM_COUNT = 16
 comptime FALLBACK_MAX_THREADS_PER_BLOCK = 1024
 comptime FALLBACK_SHARED_MEMORY_PER_BLOCK = 16384
 
+# Kernel launches each strategy costs for one node. The atomic path folds
+# its partials into the output as it goes, so it is one launch; the tiled
+# path writes them to a buffer and reduces them in a second kernel.
+comptime LAUNCHES_ATOMIC = 1
+comptime LAUNCHES_TILED = 2
+
+
+def launches_for_strategy(strategy: Int) raises -> Int:
+    """Kernel launches one node's histogram costs under this strategy.
+
+    The one place that number is written down. `hybrid_leaf_scheduler.mojo`
+    charges a node `launch_nanos * gpu_launches`, and deriving that count
+    from the resolved strategy rather than defaulting it keeps the cost model
+    and the launch it models from drifting apart.
+
+    `STRATEGY_AUTO` has no launch count: it is a request, not a resolution,
+    and a caller holding one has not yet planned a launch.
+    """
+    if strategy == STRATEGY_ATOMIC:
+        return LAUNCHES_ATOMIC
+    if strategy == STRATEGY_TILED:
+        return LAUNCHES_TILED
+    raise Error(
+        "an unresolved strategy has no launch count; resolve it with"
+        " derive_tiling first"
+    )
+
 
 @fieldwise_init
 struct DeviceCaps(Copyable, Movable):
@@ -126,6 +179,12 @@ struct HistogramTiling(Copyable, Movable):
     """`n_tiles * n_features * n_bins`: one (tile, feature, bin) cell, which
     carries all three Int32 planes, so the buffer holds `3 * partial_cells`
     Int32. Zero when the resolved strategy needs no partial buffer."""
+
+    def launches(self) raises -> Int:
+        """Kernel launches a node built with this geometry costs. See
+        `launches_for_strategy`; carried as a method so a scheduler that
+        holds a tiling never has to know the rule."""
+        return launches_for_strategy(self.strategy)
 
 
 def _attribute_or(
@@ -201,56 +260,96 @@ def _ceil_div(a: Int, b: Int) -> Int:
     return (a + b - 1) // b
 
 
+def clamp_block_threads(threads: Int, max_threads_per_block: Int) -> Int:
+    """A threadgroup width the device can actually launch: clamped to the
+    device maximum, rounded down to a warp multiple, never below one warp.
+
+    The rule, separated from the choice of what to clamp.
+    `derive_block_threads` clamps the portable target and
+    `apple_histogram_policy._shape_block_threads` clamps a row-bounded one;
+    both land here, so a width that one layer would refuse is not a width
+    the other quietly launches.
+    """
+    var out = threads
+    if out > max_threads_per_block:
+        out = max_threads_per_block
+    out = (out // WARP_GRANULARITY) * WARP_GRANULARITY
+    if out < WARP_GRANULARITY:
+        out = WARP_GRANULARITY
+    return out
+
+
+def partial_cell_limit_for(max_partial_cells: Int) -> Int:
+    """Partial-histogram cells the tiled strategy may plan against: an
+    already-allocated buffer when the caller has one, and otherwise the
+    portable byte ceiling converted to cells.
+
+    One (tile, feature, bin) cell carries all three Int32 planes, which is
+    what `BYTES_PER_PARTIAL_CELL` counts, so this is the budget in the unit
+    `HistogramTiling.partial_cells` reports.
+    """
+    if max_partial_cells > 0:
+        return max_partial_cells
+    return PARTIAL_BUDGET_BYTES // BYTES_PER_PARTIAL_CELL
+
+
 def derive_block_threads(caps: DeviceCaps) -> Int:
     """Threads per threadgroup: the target, clamped to the device maximum,
     rounded down to a warp multiple, never below one warp."""
     var requested = _env_int("MOJOBOOST_GPU_BLOCK_THREADS", 0)
     var threads = requested if requested > 0 else TARGET_BLOCK_THREADS
-    if threads > caps.max_threads_per_block:
-        threads = caps.max_threads_per_block
-    threads = (threads // WARP_GRANULARITY) * WARP_GRANULARITY
-    if threads < WARP_GRANULARITY:
-        threads = WARP_GRANULARITY
-    return threads
+    return clamp_block_threads(threads, caps.max_threads_per_block)
 
 
-def derive_tiling(
-    caps: DeviceCaps,
+def resolve_tiling(
     n_rows: Int,
-    n_features: Int,
+    n_slots: Int,
     n_bins: Int,
+    block_threads: Int,
+    amortize_bins: Int,
+    target_blocks: Int,
+    partial_cell_limit: Int,
     requested_strategy: Int = STRATEGY_AUTO,
-    max_partial_cells: Int = 0,
 ) raises -> HistogramTiling:
-    """Resolve the launch geometry for one (rows, features, bins) shape.
+    """Resolve a tile count, a row tile, and a strategy from bounds the
+    caller has already decided.
 
-    Pure host-side arithmetic so the policy is testable without a device.
+    The tile arithmetic itself, factored out of `derive_tiling` so the
+    shape-derived policy in `apple_histogram_policy.mojo` can run the same
+    rules against different bounds instead of restating them. What a caller
+    supplies is where the two layers legitimately differ:
 
-    Row tiles per feature come from three bounds, whichever is tightest:
-    enough threadgroups to fill the device (`TARGET_BLOCKS_PER_SM` per
-    multiprocessor, spread across the features already in `grid.x`), enough
-    rows per tile to amortize the partial histogram, and the memory the
-    partial buffer may use.
+    - `block_threads`: the portable target, or a row-bounded width.
+    - `amortize_bins`: the bin width a threadgroup's partial histogram really
+      occupies, which is `n_bins` for the shipping kernels and the kernel's
+      bin capacity for the specialized ones.
+    - `target_blocks`: threadgroups wanted device-wide, which is
+      `sm_count * TARGET_BLOCKS_PER_SM` portably and `core_count * resident`
+      when residency was derived from the reported threadgroup memory.
+    - `partial_cell_limit`: cells the partial buffer may use, from
+      `partial_cell_limit_for` or from a reported memory budget.
 
-    `max_partial_cells` caps that last bound at an already allocated buffer
-    instead of at `PARTIAL_BUDGET_BYTES`. Feature subsampling re-derives the
-    tiling for a narrower `grid.x` without reallocating, so it passes the
-    capacity it has.
+    Everything after that is one rule, applied once: tiles from the tightest
+    of the occupancy, row-amortization, and memory bounds; the
+    `MOJOBOOST_GPU_ROW_TILE` override; the grid bound; a re-derivation so the
+    last tile is never empty; and the `STRATEGY_AUTO` resolution.
     """
-    if n_rows < 1 or n_features < 1 or n_bins < 1:
+    if n_rows < 1 or n_slots < 1 or n_bins < 1:
         raise Error("tiling needs positive rows, features, and bins")
-    if shared_bytes_for(n_bins) > caps.max_shared_memory_per_block:
-        raise Error(
-            "device shared memory too small for a per-threadgroup histogram"
-        )
+    if block_threads < 1:
+        raise Error("a threadgroup needs a positive width")
+    if amortize_bins < 1:
+        raise Error("a partial histogram covers a positive number of bins")
+    if target_blocks < 1:
+        raise Error("a device wants a positive number of threadgroups")
+    if partial_cell_limit < 1:
+        raise Error("the partial buffer budget must admit at least one cell")
 
     var strategy = requested_strategy
     if strategy == STRATEGY_AUTO:
         strategy = env_strategy()
 
-    var block_threads = derive_block_threads(caps)
-
-    var min_rows_per_tile = MIN_ROWS_PER_TILE_BIN_FACTOR * n_bins
+    var min_rows_per_tile = MIN_ROWS_PER_TILE_BIN_FACTOR * amortize_bins
     var by_threads = MIN_ROWS_PER_TILE_THREAD_FACTOR * block_threads
     if by_threads > min_rows_per_tile:
         min_rows_per_tile = by_threads
@@ -258,8 +357,7 @@ def derive_tiling(
     if tiles_by_rows < 1:
         tiles_by_rows = 1
 
-    var target_blocks = caps.sm_count * TARGET_BLOCKS_PER_SM
-    var tiles_by_occupancy = _ceil_div(target_blocks, n_features)
+    var tiles_by_occupancy = _ceil_div(target_blocks, n_slots)
     if tiles_by_occupancy < 1:
         tiles_by_occupancy = 1
 
@@ -267,14 +365,8 @@ def derive_tiling(
     if tiles_by_rows < wanted:
         wanted = tiles_by_rows
 
-    var hist_cells = n_features * n_bins
-    var tiles_by_memory: Int
-    if max_partial_cells > 0:
-        tiles_by_memory = max_partial_cells // hist_cells
-    else:
-        tiles_by_memory = PARTIAL_BUDGET_BYTES // (
-            hist_cells * BYTES_PER_PARTIAL_CELL
-        )
+    var hist_cells = n_slots * n_bins
+    var tiles_by_memory = partial_cell_limit // hist_cells
     if tiles_by_memory < 1:
         tiles_by_memory = 1
     if tiles_by_memory > MAX_GRID_DIM_Y:
@@ -318,6 +410,50 @@ def derive_tiling(
 
     return HistogramTiling(
         strategy, block_threads, n_tiles, rows_per_tile, partial_cells
+    )
+
+
+def derive_tiling(
+    caps: DeviceCaps,
+    n_rows: Int,
+    n_features: Int,
+    n_bins: Int,
+    requested_strategy: Int = STRATEGY_AUTO,
+    max_partial_cells: Int = 0,
+) raises -> HistogramTiling:
+    """Resolve the launch geometry for one (rows, features, bins) shape.
+
+    Pure host-side arithmetic so the policy is testable without a device.
+
+    Row tiles per feature come from three bounds, whichever is tightest:
+    enough threadgroups to fill the device (`TARGET_BLOCKS_PER_SM` per
+    multiprocessor, spread across the features already in `grid.x`), enough
+    rows per tile to amortize the partial histogram, and the memory the
+    partial buffer may use.
+
+    `max_partial_cells` caps that last bound at an already allocated buffer
+    instead of at `PARTIAL_BUDGET_BYTES`. Feature subsampling re-derives the
+    tiling for a narrower `grid.x` without reallocating, so it passes the
+    capacity it has.
+
+    The bounds are this module's; the arithmetic over them is
+    `resolve_tiling`'s, which is also what the shape-derived policy runs.
+    """
+    if n_rows < 1 or n_features < 1 or n_bins < 1:
+        raise Error("tiling needs positive rows, features, and bins")
+    if shared_bytes_for(n_bins) > caps.max_shared_memory_per_block:
+        raise Error(
+            "device shared memory too small for a per-threadgroup histogram"
+        )
+    return resolve_tiling(
+        n_rows,
+        n_features,
+        n_bins,
+        derive_block_threads(caps),
+        n_bins,
+        caps.sm_count * TARGET_BLOCKS_PER_SM,
+        partial_cell_limit_for(max_partial_cells),
+        requested_strategy,
     )
 
 

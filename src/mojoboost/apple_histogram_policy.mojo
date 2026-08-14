@@ -61,6 +61,30 @@ decision across nodes, so `batching_declined_reason` gates on
 otherwise a frontier would lose its batching because one node in it happened
 not to be contiguous.
 
+What else is planned here
+-------------------------
+Two decisions join the ladder because they need the same resolved geometry
+and must not re-derive it:
+
+- `plan_class_schedule` groups a softmax round's classes. How many classes
+  may be resident depends on the tile count and on the device's threadgroup
+  memory, which is what a plan already resolved, so the class grouping
+  (`gpu_output_planes.plan_class_batches`) is run from the plan rather than
+  from a second guess at the geometry. Its default is the sequential path:
+  one class at a time, exactly what the trainer does today, unless a caller
+  or `MOJOBOOST_GPU_CLASS_BATCH` asks for more.
+- `plan_from_caps` is the bridge for a caller holding only the three
+  attributes `gpu_tiling.query_device_caps` reads, which is every GPU call
+  site in this repository today. It plans with no compiled specializations
+  and no proven device capability, so its geometry is `derive_tiling`'s
+  unless a level is requested.
+
+`HistogramPlan.tiling()` projects a plan back to the `HistogramTiling` every
+launch site already accepts, and `HistogramPlan.gpu_launches()` reports what
+`hybrid_leaf_scheduler.mojo` must charge a node for the launches this plan
+will actually issue. Between them a caller can adopt a plan without learning
+the ladder, and a caller that does not want one never sees it.
+
 What this module will not decide
 --------------------------------
 It does not branch on a model string, a part number, or an Apple generation.
@@ -111,20 +135,23 @@ from .gpu_histogram_specializations import (
     plan_packed_window,
     unspecialized_kernel_shared_bytes,
 )
+from .gpu_output_planes import (
+    BatchEligibility,
+    ClassBatchPlan,
+    env_class_batch,
+    plan_class_batches,
+)
 from .gpu_tiling import (
     BYTES_PER_PARTIAL_CELL,
-    MAX_GRID_DIM_Y,
-    MIN_ROWS_PER_TILE_BIN_FACTOR,
-    MIN_ROWS_PER_TILE_THREAD_FACTOR,
-    PARTIAL_BUDGET_BYTES,
-    STRATEGY_ATOMIC,
     STRATEGY_AUTO,
-    STRATEGY_TILED,
     TARGET_BLOCKS_PER_SM,
-    WARP_GRANULARITY,
     DeviceCaps,
     HistogramTiling,
+    clamp_block_threads,
     derive_tiling,
+    launches_for_strategy,
+    partial_cell_limit_for,
+    resolve_tiling,
     strategy_name,
 )
 from .parallel import _env_int
@@ -305,6 +332,30 @@ struct HistogramPlan(Copyable, Movable):
             and self.rows_per_tile == self.baseline.rows_per_tile
         )
 
+    def tiling(self) -> HistogramTiling:
+        """This plan's geometry as the `HistogramTiling` every launch site
+        already takes.
+
+        The projection that makes the ladder consumable without teaching a
+        call site about it: `gpu_active_rows` and the batched paths accept a
+        tiling, and a caller that has planned one hands over this instead of
+        re-deriving a second geometry. At `SPEC_LEVEL_BASELINE` it is
+        `self.baseline` field for field.
+        """
+        return HistogramTiling(
+            self.strategy,
+            self.block_threads,
+            self.n_tiles,
+            self.rows_per_tile,
+            self.partial_cells,
+        )
+
+    def gpu_launches(self) raises -> Int:
+        """Kernel launches this plan's node costs on the device, from the
+        resolved strategy. The number `hybrid_leaf_scheduler.LeafWork` needs
+        and must not guess."""
+        return launches_for_strategy(self.strategy)
+
 
 def caps_from_profile(profile: GpuProfile) -> DeviceCaps:
     """The three attributes `gpu_tiling.mojo` plans from, taken off a
@@ -388,10 +439,10 @@ def resident_blocks_per_core(
 def baseline_partial_cell_limit(max_partial_cells: Int) -> Int:
     """Partial-histogram cells `derive_tiling` plans against: the flat
     portable ceiling, or an already-allocated buffer when the caller has
-    one."""
-    if max_partial_cells > 0:
-        return max_partial_cells
-    return PARTIAL_BUDGET_BYTES // BYTES_PER_PARTIAL_CELL
+    one. `gpu_tiling.partial_cell_limit_for` is that rule; this name is kept
+    so a plan reads as reporting the baseline's budget alongside the
+    shape-derived one below."""
+    return partial_cell_limit_for(max_partial_cells)
 
 
 def shape_partial_cell_limit(
@@ -423,13 +474,7 @@ def _shape_block_threads(profile: GpuProfile, node_rows: Int) -> Int:
     var requested = _env_int("MOJOBOOST_GPU_BLOCK_THREADS", 0)
     if requested < 1:
         return derive_block_threads(profile, node_rows)
-    var threads = requested
-    if threads > profile.max_threads_per_block:
-        threads = profile.max_threads_per_block
-    threads = (threads // WARP_GRANULARITY) * WARP_GRANULARITY
-    if threads < WARP_GRANULARITY:
-        threads = WARP_GRANULARITY
-    return threads
+    return clamp_block_threads(requested, profile.max_threads_per_block)
 
 
 def derive_histogram_plan(
@@ -534,69 +579,35 @@ def derive_histogram_plan(
         resident = resident_blocks_per_core(profile, features, capacity)
         block_bytes = kernel_block_bytes(features, capacity)
 
-        # Enough threadgroups to fill the device. The active features are
-        # already spread across grid.x, so only what is left needs tiles.
-        var tiles_by_occupancy = _ceil_div(
-            profile.core_count * resident, work.n_slots
+        # The same tile arithmetic the baseline runs, over the three bounds
+        # this level derives differently, and `gpu_tiling.resolve_tiling` is
+        # where that arithmetic lives so the two can never drift:
+        #
+        # - threadgroups wanted device-wide is `core_count * resident`, with
+        #   residency derived from the threadgroup memory a block really
+        #   occupies rather than assumed;
+        # - a tile amortizes the kernel's bin *capacity*, not the bin count,
+        #   which is the same substitution the shared footprint above makes;
+        # - the partial buffer is bounded by the reported device budget as
+        #   well as by any buffer already allocated.
+        #
+        # The `MOJOBOOST_GPU_ROW_TILE` and `MOJOBOOST_GPU_HIST_STRATEGY`
+        # overrides therefore reach this level too, which they did not when
+        # the arithmetic was restated here.
+        var shaped = resolve_tiling(
+            rows,
+            work.n_slots,
+            work.n_bins,
+            block_threads,
+            capacity,
+            profile.core_count * resident,
+            partial_cell_limit,
+            requested_strategy,
         )
-        if tiles_by_occupancy < 1:
-            tiles_by_occupancy = 1
-
-        # Enough rows per tile to pay for zeroing and flushing the block's
-        # partial histogram. That cost is set by the kernel's bin capacity,
-        # not by the bin count, which is the same substitution the shared
-        # footprint above makes.
-        var min_rows_per_tile = MIN_ROWS_PER_TILE_BIN_FACTOR * capacity
-        var by_threads = MIN_ROWS_PER_TILE_THREAD_FACTOR * block_threads
-        if by_threads > min_rows_per_tile:
-            min_rows_per_tile = by_threads
-        var tiles_by_rows = _ceil_div(rows, min_rows_per_tile)
-        if tiles_by_rows < 1:
-            tiles_by_rows = 1
-
-        var wanted = tiles_by_occupancy
-        if tiles_by_rows < wanted:
-            wanted = tiles_by_rows
-
-        var hist_cells = work.n_slots * work.n_bins
-        var tiles_by_memory = partial_cell_limit // hist_cells
-        if tiles_by_memory < 1:
-            tiles_by_memory = 1
-        if tiles_by_memory > MAX_GRID_DIM_Y:
-            tiles_by_memory = MAX_GRID_DIM_Y
-
-        n_tiles = wanted
-        var forced_rows = _env_int("MOJOBOOST_GPU_ROW_TILE", 0)
-        if forced_rows > 0:
-            n_tiles = _ceil_div(rows, forced_rows)
-        strategy = requested_strategy
-        # The atomic path allocates no partial buffer, so the memory bound is
-        # not its bound; under AUTO it still applies, because AUTO may
-        # resolve to the tiled path below.
-        if strategy != STRATEGY_ATOMIC and n_tiles > tiles_by_memory:
-            n_tiles = tiles_by_memory
-        if n_tiles > MAX_GRID_DIM_Y:
-            n_tiles = MAX_GRID_DIM_Y
-        if n_tiles < 1:
-            n_tiles = 1
-
-        rows_per_tile = _ceil_div(rows, n_tiles)
-        n_tiles = _ceil_div(rows, rows_per_tile)
-
-        if strategy == STRATEGY_AUTO:
-            # The same rule `gpu_tiling.mojo` ships, deliberately unchanged:
-            # reduce when there is more than one partial to reduce, use
-            # atomics when there is not. No measurement on any device
-            # supports diverging from it, on Apple silicon least of all,
-            # where none has been taken.
-            if n_tiles > 1:
-                strategy = STRATEGY_TILED
-            else:
-                strategy = STRATEGY_ATOMIC
-
-        partial_cells = 0
-        if strategy == STRATEGY_TILED:
-            partial_cells = n_tiles * hist_cells
+        strategy = shaped.strategy
+        n_tiles = shaped.n_tiles
+        rows_per_tile = shaped.rows_per_tile
+        partial_cells = shaped.partial_cells
 
     # --- Level 2: packed bin loads ---
 
@@ -702,6 +713,167 @@ def batching_declined_reason(
     return REASON_SINGLE_LEAF_FILLS_DEVICE
 
 
+def plan_from_caps(
+    caps: DeviceCaps,
+    work: HistogramWorkload,
+    requested_strategy: Int = STRATEGY_AUTO,
+    requested_level: Int = SPEC_LEVEL_UNSET,
+    max_partial_cells: Int = 0,
+) raises -> HistogramPlan:
+    """One node's plan for a caller that queried a `DeviceCaps` and nothing
+    else, which is every GPU call site in this repository today.
+
+    The bridge, and deliberately the conservative one: with no compiled
+    specialized kernels (`KernelFeatures.none()`) and no device that has
+    demonstrated wide byte loads (`DeviceHistogramCapabilities.portable()`),
+    the packed and batched rungs cannot be reached whatever is requested, and
+    the plan's geometry at the default level is `derive_tiling`'s field for
+    field. A caller that has built the specialized kernels, or that holds a
+    real `GpuProfile` with a memory budget, calls `derive_histogram_plan`
+    directly with what it knows rather than through this.
+    """
+    return derive_histogram_plan(
+        profile_from_caps(caps),
+        DeviceHistogramCapabilities.portable(),
+        KernelFeatures.none(),
+        work,
+        requested_strategy,
+        requested_level,
+        max_partial_cells,
+    )
+
+
+@fieldwise_init
+struct ClassSchedule(Copyable, Movable):
+    """How one softmax round's classes are grouped, and the launch geometry
+    each group runs at.
+
+    The join between the two halves of the multiclass decision, which are
+    otherwise planned by modules that cannot see each other:
+    `gpu_output_planes.plan_class_batches` needs a tile count and the
+    device's threadgroup memory before it can say how many classes fit, and
+    those are exactly what a histogram plan resolves. Holding both together
+    is what lets a caller ask the one question it actually has -- how many
+    classes may I make resident, and how many of them share a bin read --
+    without planning a geometry twice.
+
+    It groups classes; it does not reorder them. The batches are contiguous
+    ascending runs and slot `s` of batch `b` is class
+    `b * batch_size + s` (`ClassBatchPlan.class_at`), so a round still grows
+    one tree per class and still stores it at `round * n_classes + k`.
+    """
+
+    var plan: HistogramPlan
+    var batches: ClassBatchPlan
+    var eligibility: BatchEligibility
+
+    def shared_group_size(self) -> Int:
+        """Classes one threadgroup serves from a single bin read.
+
+        `ClassBatchPlan.per_block`, which is 1 whenever the classes do not
+        share both their rows and their features, and otherwise the number
+        that fits in threadgroup memory, capped at the batched kernel's
+        static `SHARED_CLASS_CAP`. A batch wider than this is histogrammed in
+        `ceil(batch / per_block)` shared launches, which is what
+        `ClassBatchPlan.bin_passes_per_round` counts.
+        """
+        return self.batches.per_block
+
+    def shares_bin_reads(self) -> Bool:
+        """Whether any bin read is shared at all. False for a sequential
+        plan and for any node below a round's root."""
+        return (
+            self.eligibility.bin_reads_shared() and self.batches.per_block > 1
+        )
+
+    def is_sequential(self) -> Bool:
+        """True when the schedule degenerates to the shipped one-class-at-a-
+        time loop, which is the default: `plan_class_schedule` asks for a
+        batch of one unless a caller or `MOJOBOOST_GPU_CLASS_BATCH` asks for
+        more."""
+        return self.batches.is_sequential()
+
+    def bin_passes_per_round(self) -> Int:
+        """Times a round reads the binned matrix at this level.
+        `n_classes` sequentially, fewer only where bin reads are shared."""
+        return self.batches.bin_passes_per_round()
+
+
+def plan_class_schedule(
+    profile: GpuProfile,
+    device: DeviceHistogramCapabilities,
+    features: KernelFeatures,
+    work: HistogramWorkload,
+    n_features: Int,
+    n_classes: Int,
+    eligibility: BatchEligibility,
+    requested_strategy: Int = STRATEGY_AUTO,
+    requested_level: Int = SPEC_LEVEL_UNSET,
+    max_partial_cells: Int = 0,
+    budget_bytes: Int = 0,
+    requested_batch: Int = 0,
+) raises -> ClassSchedule:
+    """Plan one softmax round's class grouping and its launch geometry.
+
+    Pure host arithmetic, like everything else here: no device is opened and
+    nothing is allocated, so a caller can ask what a round would cost before
+    committing to it.
+
+    `work.n_slots` is the active feature count, which is `grid.x` and what
+    the geometry is derived from; `n_features` is the dataset's full feature
+    count, which is what the batch's output planes are allocated at and so
+    what the memory budget must cover. They differ under feature subsampling
+    and the distinction is load-bearing, which is why both are arguments.
+
+    **The default is the sequential path.** A `requested_batch` of zero
+    consults `MOJOBOOST_GPU_CLASS_BATCH` and then asks for a batch of one,
+    rather than for the widest batch the budget admits. Batching changes no
+    number a round produces -- the fixed-point scales are per class and
+    integer accumulation is associative, which is what
+    `gpu_multiclass_batch.mojo` is built around -- but it does change the
+    memory a fit holds and the order work reaches the queue in, and nothing
+    in this repository has measured either against the sequential loop. So it
+    is opt-in, on the same grounds as the specialization ladder above.
+
+    An explicitly requested batch that does not fit the budget raises rather
+    than silently shrinking, because a benchmark that asked for a geometry
+    must not be handed a different one; that refusal is
+    `plan_class_batches`'s and is left to it.
+    """
+    if n_features < work.n_slots:
+        raise Error(
+            "the active feature count cannot exceed the dataset's feature"
+            " count"
+        )
+    var plan = derive_histogram_plan(
+        profile,
+        device,
+        features,
+        work,
+        requested_strategy,
+        requested_level,
+        max_partial_cells,
+    )
+    var requested = requested_batch
+    if requested <= 0:
+        requested = env_class_batch()
+    if requested <= 0:
+        # Default off. One class at a time is what the trainer does today.
+        requested = 1
+    var batches = plan_class_batches(
+        n_classes,
+        work.dataset_rows,
+        n_features,
+        work.n_bins,
+        plan.n_tiles,
+        profile.max_shared_memory_per_block,
+        eligibility,
+        budget_bytes,
+        requested,
+    )
+    return ClassSchedule(plan, batches, eligibility)
+
+
 def _yes_no(value: Bool) -> String:
     if value:
         return String("yes")
@@ -742,4 +914,31 @@ def describe_plan(plan: HistogramPlan) -> String:
         _yes_no(plan.packed_loads),
         " baseline=",
         _yes_no(plan.matches_baseline()),
+    )
+
+
+def describe_schedule(schedule: ClassSchedule) -> String:
+    """One line for a trace: how the round's classes were grouped, whether
+    any bin read is shared, and what a group's launch looks like."""
+    return String(
+        "classes=",
+        schedule.batches.n_classes,
+        " batch=",
+        schedule.batches.batch_size,
+        " per_block=",
+        schedule.batches.per_block,
+        " batches=",
+        schedule.batches.n_batches(),
+        " bin_passes=",
+        schedule.bin_passes_per_round(),
+        " shared_rows=",
+        _yes_no(schedule.batches.shared_rows),
+        " shared_counts=",
+        _yes_no(schedule.batches.shared_counts),
+        " shares_bin_reads=",
+        _yes_no(schedule.shares_bin_reads()),
+        " bytes=",
+        schedule.batches.bytes_per_batch,
+        " | ",
+        describe_plan(schedule.plan),
     )

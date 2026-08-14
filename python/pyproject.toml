@@ -74,10 +74,19 @@ classifiers = [
     "Intended Audience :: Developers",
     # macOS on Apple silicon is the only platform with a distributable
     # artifact. Linux is a tier 1 tested *source* install (CI runs the
-    # suite on ubuntu-latest and ubuntu-24.04-arm) but no manylinux wheel
-    # builder exists, so no Linux operating-system classifier is claimed
-    # here. See packaging/matrix/platform_matrix.toml, targets
-    # `linux-x86_64-cp314` and `linux-aarch64-cp314`, both `designed`.
+    # suite on ubuntu-latest and ubuntu-24.04-arm), and a Linux wheel
+    # builder does now exist: packaging/linux/build_wheel_linux.sh, run by
+    # .github/workflows/release-linux.yml. No Linux classifier is claimed
+    # here anyway, and the reason changed rather than went away.
+    #
+    # That builder defaults to a plain `linux_<arch>` tag, which no index
+    # accepts, and the `manylinux_2_28` rows that an index would accept are
+    # gated on a glibc floor nobody has measured. A classifier is a claim
+    # made to an index about a wheel that index can serve, so it waits for
+    # the wheel, not for the builder. See the four Linux targets in
+    # packaging/matrix/platform_matrix.toml: `linux-x86_64-cp314` and
+    # `linux-aarch64-cp314` are `publishable = false`, and the two
+    # `-manylinux` rows are `designed` with empty evidence.
     "Operating System :: MacOS :: MacOS X",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.14",

@@ -42,10 +42,13 @@ The native boundary
 decision arrives. It has two modes, and `DeviceReport.contract` says which
 one produced a given report:
 
-- `"full"`: `_mojoboost.decide_device(...)` was available. The whole
-  contract crossed, and the report carries the blocking reasons, the
-  warnings, the memory estimate, the policy version, and the evidence
-  identifier the native layer produced.
+- `"full"`: `_mojoboost.decide_device(...)` was available. That binding is
+  `decide_device_report` in `src/mojoboost/device_policy.mojo`, whose ten
+  parameters are exactly the ten this module sends. The whole contract
+  crossed, and the report carries the blocking reasons, the warnings, the
+  memory estimate, the transfer route each device buffer is on, how much
+  of the one-time startup cost the process has paid, the policy version,
+  and the evidence identifier the native layer produced.
 - `"narrow"`: only the older `_mojoboost.resolve_device(...)` was
   available. That entry point runs the *same* native engine, so the
   selected backend is still the native answer and never a Python one; it
@@ -83,6 +86,7 @@ __all__ = [
     "DeviceUnavailableError",
     "NativePolicyUnavailable",
     "Reason",
+    "TransferRoute",
     "Workload",
     "explain_device_choice",
     "native_contract",
@@ -143,6 +147,83 @@ class Reason:
 
     def __hash__(self):
         return hash((self.code, self.message))
+
+
+class TransferRoute:
+    """Which route one device buffer is on, as the native layer reported it.
+
+    Every field is a stable name from
+    `src/mojoboost/unified_memory_policy.mojo`, and nothing here decides or
+    infers: whether a buffer may skip a copy is a statement about pointer
+    lifetime and device queue ordering, which Python cannot see, so Python
+    is not the layer that answers it.
+
+    - `role`: which buffer, e.g. `bins`, `grad`, `hist_out`.
+    - `requested`: what `MOJOBOOST_GPU_TRANSFER` asked for.
+    - `selected`: what this role actually got. Different from `requested`
+      means the request was refused for this role and the default was used.
+    - `reason`: `eligible` when the request was honored, otherwise why not.
+    - `evidence`: the rung of the evidence ladder the selected route sits
+      on. `none` for every route in this repository today.
+    - `retire_on`: `copy` when the host may refill the buffer once the
+      upload retires, `kernel` when it must wait for every kernel that read
+      it. This is the field that changes what a caller must *do*, not only
+      what it allocates.
+
+    A `selected` of `copy_staged` on every role is the shipped state and the
+    only state any measurement in this repository was taken under.
+    """
+
+    __slots__ = (
+        "role",
+        "requested",
+        "selected",
+        "reason",
+        "evidence",
+        "retire_on",
+    )
+
+    def __init__(
+        self,
+        role,
+        requested="",
+        selected="",
+        reason="",
+        evidence="",
+        retire_on="",
+    ):
+        self.role = role
+        self.requested = requested
+        self.selected = selected
+        self.reason = reason
+        self.evidence = evidence
+        self.retire_on = retire_on
+
+    @property
+    def honored(self):
+        """Whether this role got the route that was asked for."""
+        return self.reason == "eligible"
+
+    def to_dict(self):
+        return {
+            "role": self.role,
+            "requested": self.requested,
+            "selected": self.selected,
+            "reason": self.reason,
+            "evidence": self.evidence,
+            "retire_on": self.retire_on,
+        }
+
+    def __repr__(self):
+        return "TransferRoute(%r, selected=%r)" % (self.role, self.selected)
+
+    def __eq__(self, other):
+        if not isinstance(other, TransferRoute):
+            return NotImplemented
+        return self.to_dict() == other.to_dict()
+
+    def __hash__(self):
+        return hash(tuple(sorted(self.to_dict().items())))
 
 
 # ---------------------------------------------------------------------
@@ -428,15 +509,16 @@ def _extension():
 def _parse_decision(text):
     """The native `key=value` lines as a dict.
 
-    Repeated keys are lists in order, which is how `block` and `warning`
-    arrive; every other key appears once. Values are left as strings here
-    and coerced by the accessors that know their types, so an unrecognized
-    key from a newer native layer survives into `to_dict()` instead of
-    being dropped.
+    Repeated keys are lists in order, which is how `block`, `warning`, and
+    `transfer` arrive; every other key appears once. Values are left as
+    strings here and coerced by the accessors that know their types, so an
+    unrecognized key from a newer native layer survives into `to_dict()`
+    instead of being dropped.
     """
     fields = {}
     blocks = []
     warnings = []
+    transfers = []
     for line in text.splitlines():
         if not line:
             continue
@@ -447,10 +529,13 @@ def _parse_decision(text):
             blocks.append(_split_reason(value))
         elif key == "warning":
             warnings.append(_split_reason(value))
+        elif key == "transfer":
+            transfers.append(_split_transfer(value))
         else:
             fields[key] = value
     fields["_blocks"] = blocks
     fields["_warnings"] = warnings
+    fields["_transfers"] = transfers
     return fields
 
 
@@ -463,12 +548,32 @@ def _split_reason(value):
     return Reason("unknown", value)
 
 
+def _split_transfer(value):
+    """`<role>:<requested>:<selected>:<reason>:<evidence>:<retire_on>` as a
+    `TransferRoute`.
+
+    A short line with no free text in it, so unlike `_split_reason` there is
+    nothing to keep un-split. A line with the wrong field count is kept as a
+    role-only entry rather than dropped: a newer native layer that adds a
+    field should degrade the report, not empty it.
+    """
+    parts = value.split(":")
+    if len(parts) == 6:
+        return TransferRoute(*parts)
+    return TransferRoute(parts[0] if parts else "unknown")
+
+
 class _FullNativePolicy:
     """The intended path: the whole contract crosses in one call.
 
-    `decide_device` never raises for a workload it refuses; the refusal is
-    `blocked=true` in the returned lines, and `select_device` is what turns
-    that into an exception.
+    The binding is `decide_device_report` in
+    `src/mojoboost/device_policy.mojo`, exposed as `decide_device`. It never
+    raises for a workload it refuses; the refusal is `blocked=true` in the
+    returned lines, and `select_device` is what turns that into an exception.
+    It does raise for a device name outside the vocabulary, a shape with no
+    rows or features, and an unparsable `MOJOBOOST_GPU_TRANSFER`, all of
+    which are caller or operator errors rather than policy outcomes, and all
+    of which reach the user as-is rather than being reinterpreted here.
     """
 
     contract = CONTRACT_FULL
@@ -612,6 +717,9 @@ class DeviceReport:
         }
         self.reasons = tuple(fields.get("_blocks", ()))
         self.warnings = tuple(fields.get("_warnings", ()))
+        #: One `TransferRoute` per device buffer role, in native role order.
+        #: Empty on the `"narrow"` contract, which carries no such key.
+        self.transfer_routes = tuple(fields.get("_transfers", ()))
         selected = fields.get("selected", "none")
         self.would_raise = fields.get("blocked", "false") == "true"
         self.resolved = None if self.would_raise else selected
@@ -663,6 +771,8 @@ class DeviceReport:
         lines.append("Workload    %s" % self.workload.describe())
         lines.append("Device      %s" % self._device_line())
         lines.append("Memory      %s" % self._memory_line())
+        lines.append("Transfer    %s" % self._transfer_line())
+        lines.append("Startup     %s" % self._session_line())
         lines.append("Policy      %s" % self._policy_line())
         if self.message:
             lines.append("")
@@ -715,6 +825,68 @@ class DeviceReport:
             text += " (estimate)"
         return text
 
+    def _transfer_line(self):
+        """Which transfer routes the device buffers are on.
+
+        Reports the shipped all-default case in one phrase and names the
+        exceptions individually, because a plan where seven roles are staged
+        and one is not is exactly the state a summary would hide. Says
+        nothing about copies avoided or memory saved: whether two allocations
+        are the same physical pages is not visible from inside the process,
+        and `src/mojoboost/unified_memory_policy.mojo` is where that is
+        argued out.
+        """
+        if not self.transfer_routes:
+            if self.contract != CONTRACT_FULL:
+                return "not reported by this build's native contract"
+            return "not reported"
+        if self.native.get("transfer_all_default") == "true":
+            text = "copy_staged for all %d buffer roles (the shipped route)" % len(
+                self.transfer_routes
+            )
+        else:
+            changed = [
+                "%s=%s" % (r.role, r.selected)
+                for r in self.transfer_routes
+                if r.selected != "copy_staged"
+            ]
+            text = "copy_staged except %s" % ", ".join(changed)
+        refused = [r.role for r in self.transfer_routes if not r.honored]
+        if refused:
+            text += "; request refused for %s" % ", ".join(refused)
+        if self.native.get("transfer_ack_unproven") == "true":
+            text += (
+                "; running on MOJOBOOST_GPU_TRANSFER_UNPROVEN=1, so no"
+                " evidence is behind it"
+            )
+        return text
+
+    def _session_line(self):
+        """How much of the one-time startup cost this process has paid.
+
+        The number a first-fit timing has to be read against. It is reported
+        and never acted on: nothing about a warm session selects a backend,
+        for the same reason nothing about a cell count does without a
+        measurement behind it.
+        """
+        open_ = self.native.get("session_context_open")
+        if open_ is None:
+            if self.contract != CONTRACT_FULL:
+                return "not reported by this build's native contract"
+            return "not reported"
+        if open_ != "true":
+            text = "cold: no device context open in this process"
+        else:
+            text = "warm: a device context is already open"
+        if self.native.get("session_kernels_ready") == "true":
+            text += ", kernels already created"
+        else:
+            text += ", kernels not yet created"
+        level = self.native.get("session_warmup_level")
+        if level:
+            text += " (MOJOBOOST_GPU_WARMUP=%s)" % level
+        return text
+
     def _policy_line(self):
         version = self.policy_version or "unreported"
         evidence = self.evidence_id or "unreported"
@@ -748,6 +920,7 @@ class DeviceReport:
             "evidence_id": self.evidence_id,
             "reasons": [r.to_dict() for r in self.reasons],
             "warnings": [w.to_dict() for w in self.warnings],
+            "transfer_routes": [t.to_dict() for t in self.transfer_routes],
             "workload": self.workload.to_dict(),
             "native": dict(self.native),
         }

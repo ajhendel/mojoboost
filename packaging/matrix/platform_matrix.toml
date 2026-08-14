@@ -215,6 +215,9 @@ filename = "mojoboost-0.1.0-cp314-cp314-macosx_26_0_arm64.whl"
 status = "designed"
 build_host = "Apple silicon Mac with the pinned pixi environment"
 builder = "packaging/build_wheel.sh"
+builder_script = "packaging/macos/build_release_wheel.sh"
+workflow = ".github/workflows/release-macos.yml"
+publishable = true
 installer_floor = "macOS 26.0"
 # The floor above is the Mojo compile step's deployment target, not a property
 # of the runtime that ships inside the wheel. See `macos_floor` below and
@@ -245,6 +248,9 @@ filename = "mojoboost-0.1.0-cp314-cp314-macosx_12_0_arm64.whl"
 status = "designed"
 build_host = "Apple silicon Mac with the pinned pixi environment"
 builder = "packaging/build_wheel.sh with a lowered deployment target"
+builder_script = "packaging/macos/build_release_wheel.sh"
+workflow = ".github/workflows/release-macos.yml"
+publishable = true
 installer_floor = "macOS 12.0"
 bundled_dylibs = [
     "libKGENCompilerRTShared",
@@ -275,6 +281,9 @@ filename = ""
 status = "unsupported"
 build_host = ""
 builder = ""
+builder_script = ""
+workflow = ""
+publishable = false
 installer_floor = ""
 bundled_dylibs = []
 smoke = ""
@@ -292,12 +301,15 @@ os = "linux"
 arch = "x86_64"
 python = "cp314"
 artifact = "wheel"
-wheel_tag = "cp314-cp314-manylinux_2_28_x86_64"
-filename = "mojoboost-0.1.0-cp314-cp314-manylinux_2_28_x86_64.whl"
+wheel_tag = "cp314-cp314-linux_x86_64"
+filename = "mojoboost-0.1.0-cp314-cp314-linux_x86_64.whl"
 status = "designed"
-build_host = "manylinux_2_28 image, or a glibc 2.28 host with the pinned pixi environment"
-builder = "does not exist yet"
-installer_floor = "glibc 2.28"
+build_host = "glibc 2.28 or newer x86_64 host with the pinned pixi environment"
+builder = "packaging/linux/build_wheel_linux.sh, default MOJOBOOST_TAG_POLICY=plain"
+builder_script = "packaging/linux/build_wheel_linux.sh"
+workflow = ".github/workflows/release-linux.yml"
+publishable = false
+installer_floor = "unmeasured; see notes"
 bundled_dylibs = [
     "libKGENCompilerRTShared",
     "libAsyncRTMojoBindings",
@@ -307,12 +319,71 @@ bundled_dylibs = [
 smoke = "packaging/matrix/smoke/clean_install_linux.sh"
 evidence = ""
 notes = """
-No Linux wheel builder exists. packaging/build_wheel.sh is macOS only: it calls
-install_name_tool and codesign, neither of which has a Linux equivalent, and the
-ELF equivalent (patchelf plus an auditwheel repair, or a hand-rolled $ORIGIN
-rpath) is a different program, not a flag. The glibc floor above is the floor
-pixi.lock was solved against; the floor the shipped ELF objects actually impose
-has not been measured. Measure it before publishing this tag.
+This row is the wheel that actually gets built. The builder defaults to
+MOJOBOOST_TAG_POLICY=plain and the release workflow's `tag_policy` input
+defaults to `plain`, so a dispatch that accepts every default produces exactly
+this filename.
+
+It used to say `manylinux_2_28` and `builder = "does not exist yet"`, and both
+were false in a way that mattered rather than a way that was merely untidy. The
+builder had been written and wired into the workflow, and the manylinux tag
+named a file no default build has ever produced, so validate_artifact.py failed
+R1 against the real artifact: the tag matched no declared target. The matrix was
+the last file still describing a Linux story the rest of the repository had
+moved past. docs/INSTALLATION.md already documented this plain filename.
+
+`publishable = false` is the honest status and not a defect. A bare linux_ tag
+promises nothing about glibc and every index rejects it, which is why the
+TestPyPI job in the workflow refuses to run on it. The wheel installs fine from
+a file, which is what docs/INSTALLATION.md tells a user to do.
+
+installer_floor is `unmeasured` rather than "glibc 2.28" on purpose. 2.28 is the
+floor pixi.lock was solved against, which is a fact about the build environment
+and not a measurement of the shipped ELF objects. The real floor is the highest
+GLIBC_ symbol version any bundled object references; validate_artifact.py rule
+R5f reads it and clean_install_linux.sh reads it on the target. Measuring it is
+what promotes this row to linux-x86_64-cp314-manylinux.
+"""
+
+[[target]]
+id = "linux-x86_64-cp314-manylinux"
+os = "linux"
+arch = "x86_64"
+python = "cp314"
+artifact = "wheel"
+wheel_tag = "cp314-cp314-manylinux_2_28_x86_64"
+filename = "mojoboost-0.1.0-cp314-cp314-manylinux_2_28_x86_64.whl"
+status = "designed"
+build_host = "manylinux_2_28 image, or a glibc 2.28 host with the pinned pixi environment"
+builder = "packaging/linux/build_wheel_linux.sh with MOJOBOOST_TAG_POLICY=manylinux"
+builder_script = "packaging/linux/build_wheel_linux.sh"
+workflow = ".github/workflows/release-linux.yml"
+publishable = true
+installer_floor = "glibc 2.28, CLAIMED AND NOT YET MEASURED"
+bundled_dylibs = [
+    "libKGENCompilerRTShared",
+    "libAsyncRTMojoBindings",
+    "libMSupportGlobals",
+    "libAsyncRTRuntimeGlobals",
+]
+smoke = "packaging/matrix/smoke/clean_install_linux.sh"
+evidence = ""
+notes = """
+The publishable row, and the only Linux row an index will accept. It is reached
+by dispatching the workflow with tag_policy=manylinux, never by renaming the
+file the plain build produced.
+
+Nothing here has been measured. The tag is a promise that this file works on any
+glibc 2.28 system, and the evidence for that promise is empty. Do not dispatch
+this policy, and do not publish the result, until the GLIBC_ floor from
+validate_artifact.py R5f and a clean_install_linux.sh run on a 2.28 image both
+say 2.28 or lower. The builder prints a warning when this policy is selected for
+the same reason.
+
+The bundled library list is inherited from the macOS rows with a different
+extension and has NOT been confirmed against a Linux build. validate_artifact.py
+compares bundled_dylibs on macOS only, so nothing currently catches an error in
+this list; `readelf -d` on a real build is what settles it.
 """
 
 [[target]]
@@ -321,12 +392,15 @@ os = "linux"
 arch = "aarch64"
 python = "cp314"
 artifact = "wheel"
-wheel_tag = "cp314-cp314-manylinux_2_28_aarch64"
-filename = "mojoboost-0.1.0-cp314-cp314-manylinux_2_28_aarch64.whl"
+wheel_tag = "cp314-cp314-linux_aarch64"
+filename = "mojoboost-0.1.0-cp314-cp314-linux_aarch64.whl"
 status = "designed"
-build_host = "manylinux_2_28 aarch64 image, or a glibc 2.28 ARM64 host"
-builder = "does not exist yet"
-installer_floor = "glibc 2.28"
+build_host = "glibc 2.28 or newer ARM64 host with the pinned pixi environment"
+builder = "packaging/linux/build_wheel_linux.sh, default MOJOBOOST_TAG_POLICY=plain"
+builder_script = "packaging/linux/build_wheel_linux.sh"
+workflow = ".github/workflows/release-linux.yml"
+publishable = false
+installer_floor = "unmeasured; see notes"
 bundled_dylibs = [
     "libKGENCompilerRTShared",
     "libAsyncRTMojoBindings",
@@ -336,10 +410,40 @@ bundled_dylibs = [
 smoke = "packaging/matrix/smoke/clean_install_linux.sh"
 evidence = ""
 notes = """
-Same builder gap as x86_64, and the same unmeasured glibc floor. The bundled
-library names are the macOS set with .so extensions; confirm the ELF set on the
-target before trusting the list, because the Linux runtime layout has not been
-inspected.
+The aarch64 half of the default build, produced by the same script on the
+workflow's aarch64 runner. Everything in the linux-x86_64-cp314 notes applies
+here unchanged: plain tag, unpublishable by design, glibc floor unmeasured, and
+the same builder that the matrix previously said did not exist.
+"""
+
+[[target]]
+id = "linux-aarch64-cp314-manylinux"
+os = "linux"
+arch = "aarch64"
+python = "cp314"
+artifact = "wheel"
+wheel_tag = "cp314-cp314-manylinux_2_28_aarch64"
+filename = "mojoboost-0.1.0-cp314-cp314-manylinux_2_28_aarch64.whl"
+status = "designed"
+build_host = "manylinux_2_28 aarch64 image, or a glibc 2.28 ARM64 host"
+builder = "packaging/linux/build_wheel_linux.sh with MOJOBOOST_TAG_POLICY=manylinux"
+builder_script = "packaging/linux/build_wheel_linux.sh"
+workflow = ".github/workflows/release-linux.yml"
+publishable = true
+installer_floor = "glibc 2.28, CLAIMED AND NOT YET MEASURED"
+bundled_dylibs = [
+    "libKGENCompilerRTShared",
+    "libAsyncRTMojoBindings",
+    "libMSupportGlobals",
+    "libAsyncRTRuntimeGlobals",
+]
+smoke = "packaging/matrix/smoke/clean_install_linux.sh"
+evidence = ""
+notes = """
+The publishable aarch64 row, with the same unmeasured promise and the same gate
+as linux-x86_64-cp314-manylinux. The bundled library list is equally unconfirmed
+here, and aarch64 has the additional wrinkle that its runtime layout has never
+been inspected at all, on either tag policy.
 """
 
 [[target]]
@@ -353,6 +457,9 @@ filename = ""
 status = "unsupported"
 build_host = ""
 builder = ""
+builder_script = ""
+workflow = ""
+publishable = false
 installer_floor = ""
 bundled_dylibs = []
 smoke = ""

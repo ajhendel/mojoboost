@@ -16,10 +16,27 @@ everything: a Mojo error must never unwind into C, so each body is one
 try/except that turns an error into a status code and a message. Second,
 pointers are checked before use, including the ones C code is most likely
 to get wrong, so a NULL is a status code rather than a crash.
+
+A third rule keeps it honest: nothing here reimplements mojoboost. Training
+goes to `fit`/`fit_multiclass`, prediction to `Model.predict_batch`,
+inspection to `dump_model`, the device decision to `resolve_device`, and
+the file format to serialize.mojo. This file only translates C arguments
+into those calls and their failures into status codes, which is why a
+change to how mojoboost bins, walks trees, or picks a device reaches C
+callers without anyone editing the ABI.
 """
 
 from std.memory.alloc import unsafe_alloc
 
+from mojoboost.boosting import IterationRange
+from mojoboost.device import (
+    AUTO_DEVICE,
+    CPU_DEVICE,
+    GPU_DEVICE,
+    gpu_available,
+    resolve_device,
+)
+from mojoboost.inspection import dump_model, dump_multiclass_model
 from mojoboost.model import Model, MulticlassModel, fit, fit_multiclass
 from mojoboost.params import (
     TrainConfig,
@@ -34,8 +51,10 @@ from mojoboost.serialize import (
     save_multiclass_model,
 )
 
-# Keep in sync with MOJOBOOST_ABI_VERSION in capi/mojoboost.h.
-comptime ABI_VERSION: Int32 = 1
+# Keep in sync with MOJOBOOST_ABI_VERSION in capi/mojoboost.h. Version 2 is a
+# strict superset of version 1: it only adds declarations, so a caller
+# compiled against version 1 keeps working unchanged.
+comptime ABI_VERSION: Int32 = 2
 
 # Keep in sync with python/pyproject.toml and pixi.toml.
 comptime VERSION_MAJOR: Int32 = 0
@@ -47,6 +66,19 @@ comptime ERROR_INVALID_ARGUMENT: Int32 = -1
 comptime ERROR_TRAINING: Int32 = -2
 comptime ERROR_IO: Int32 = -3
 comptime ERROR_UNSUPPORTED: Int32 = -4
+
+# The C spelling of the device vocabulary. These are defined from the codes
+# in device.mojo rather than written out, so the ABI cannot drift from the
+# policy module that owns the meaning of each value.
+comptime DEVICE_CPU: Int32 = CPU_DEVICE
+comptime DEVICE_GPU: Int32 = GPU_DEVICE
+comptime DEVICE_AUTO: Int32 = AUTO_DEVICE
+
+# Prediction flags. Only one bit is defined; anything else is rejected, so a
+# caller cannot silently get response-scale output by setting a flag this
+# build does not know about.
+comptime PREDICT_RESPONSE: Int32 = 0
+comptime PREDICT_RAW: Int32 = 1
 
 comptime _SINGLE = 0
 comptime _MULTICLASS = 1
@@ -119,10 +151,51 @@ struct _ModelBox(Movable):
             return len(self.multi.value().booster.trees)
         return len(self.single.value().booster.trees)
 
+    def n_iterations(self) raises -> Int:
+        """Boosting iterations, which is the tree count for a single-output
+        model and the tree count over the class count for a multiclass one.
+        This, not the tree count, is what an iteration range is expressed
+        in."""
+        if self.kind == _MULTICLASS:
+            return self.multi.value().booster.n_iterations()
+        return self.single.value().booster.n_iterations()
+
+    def predict_batch(
+        self,
+        features: List[Float64],
+        n_rows: Int,
+        rng: IterationRange,
+        raw: Bool,
+        device: Int,
+    ) raises -> List[Float64]:
+        """Row-major `[r * num_classes + k]` predictions for a raw
+        column-major matrix, straight from the model's own batched
+        prediction path (model.mojo). Going through `predict_batch` rather
+        than looping over the per-row `predict` is what puts the C ABI on
+        the same code as the Mojo and Python front ends: one binning pass
+        for the whole matrix, iteration ranges, and the device dispatch."""
+        if self.kind == _MULTICLASS:
+            return self.multi.value().predict_batch(
+                features, n_rows, rng, raw, device
+            )
+        return self.single.value().predict_batch(
+            features, n_rows, rng, raw, device
+        )
+
+    def dump_json(self) raises -> String:
+        """The model in the inspection schema (docs/MODEL_INSPECTION_SCHEMA.md),
+        from the one implementation in inspection.mojo. A model carries no
+        feature names, so the dump uses the default `Column_0`, `Column_1`,
+        ... names."""
+        if self.kind == _MULTICLASS:
+            return dump_multiclass_model(self.multi.value())
+        return dump_model(self.single.value())
+
 
 comptime _ModelPtr = Pointer[_ModelBox, MutUntrackedOrigin]
 comptime _ErrorPtr = Pointer[_ErrorBox, MutUntrackedOrigin]
 comptime _ModelOutPtr = Pointer[_ModelPtr, MutUntrackedOrigin]
+comptime _CharOutPtr = Pointer[_CharPtr, MutUntrackedOrigin]
 
 
 def _is_null[T: AnyType, //](p: Pointer[T, MutUntrackedOrigin]) -> Bool:
@@ -168,17 +241,6 @@ def _copy_f64(p: _F64Ptr, n: Int) -> List[Float64]:
     return out^
 
 
-def _row(
-    features: List[Float64], n_rows: Int, n_features: Int, r: Int
-) -> List[Float64]:
-    """Row `r` of a column-major matrix, which is what `Model.predict`
-    takes."""
-    var row = List[Float64](capacity=n_features)
-    for f in range(n_features):
-        row.append(features[f * n_rows + r])
-    return row^
-
-
 def _check_matrix(
     error: _ErrorPtr, data: _F64Ptr, n_rows: Int64, n_features: Int64
 ) -> Int32:
@@ -206,6 +268,21 @@ def _new_handle[T: Movable, //](var box: T) -> Pointer[T, MutUntrackedOrigin]:
     return p
 
 
+def _new_c_string(text: String) -> _CharPtr:
+    """A freshly allocated, NUL terminated copy of `text`, to be released by
+    `mojoboost_string_free`. This is the ABI's second ownership class: a
+    plain `char *` rather than an opaque handle, because a caller wants to
+    read it with ordinary string functions."""
+    var n = text.byte_length()
+    var p = unsafe_alloc[UInt8](n + 1)
+    var i = 0
+    for b in text.as_bytes():
+        p.unsafe_store(i, b)
+        i += 1
+    p.unsafe_store(n, 0)
+    return p
+
+
 # ------------------------------------------------------------------ version
 
 
@@ -224,6 +301,20 @@ def mojoboost_library_version(
         minor[] = VERSION_MINOR
     if not _is_null(patch):
         patch[] = VERSION_PATCH
+
+
+@export
+def mojoboost_gpu_available() abi("C") -> Int32:
+    """1 when `MOJOBOOST_DEVICE_GPU` can be honored by this build on this
+    machine, 0 otherwise. It answers exactly what `gpu_available()` in
+    device.mojo answers, so the C ABI and the Mojo API agree on whether a
+    request is worth making at all; whether a *particular* workload is
+    covered is still decided per call by the policy (device_policy.mojo),
+    which is why a 1 here is not a promise that every GPU request
+    succeeds."""
+    if gpu_available():
+        return 1
+    return 0
 
 
 # -------------------------------------------------------------------- error
@@ -355,14 +446,23 @@ def _predict_into(
     data: _F64Ptr,
     n_rows: Int64,
     n_features: Int64,
+    start_iteration: Int64,
+    num_iteration: Int64,
+    flags: Int32,
+    device: Int32,
     out_values: _F64Ptr,
     out_len: Int64,
     error: _ErrorPtr,
-    raw: Bool,
 ) -> Int32:
-    """The body shared by `mojoboost_predict` and `mojoboost_predict_raw`.
-    Predictions are computed in full before anything is written, so a
-    failure leaves the caller's buffer untouched."""
+    """The body behind all three prediction entry points.
+
+    Everything the model knows how to do is reached from here through
+    `_ModelBox.predict_batch`, which is `Model.predict_batch` in model.mojo:
+    the ABI does not walk trees, slice iterations, or choose a device
+    itself, it translates C arguments into that call. Predictions are
+    computed in full before anything is written, so a failure leaves the
+    caller's buffer untouched.
+    """
     _clear(error)
     try:
         if _is_null(model):
@@ -372,6 +472,29 @@ def _predict_into(
             return bad
         if _is_null(out_values):
             return _invalid(error, String("out_values must not be NULL"))
+        if flags != PREDICT_RESPONSE and flags != PREDICT_RAW:
+            return _invalid(
+                error,
+                String(
+                    "flags is ",
+                    flags,
+                    " but only 0 (response scale) and 1 (raw score) are"
+                    " defined",
+                ),
+            )
+        if (
+            device != DEVICE_CPU
+            and device != DEVICE_GPU
+            and device != DEVICE_AUTO
+        ):
+            return _invalid(
+                error,
+                String(
+                    "device is ",
+                    device,
+                    " but only 0 (cpu), 1 (gpu), and 2 (auto) are defined",
+                ),
+            )
 
         var expected = model[].n_features()
         if Int(n_features) != expected:
@@ -399,28 +522,38 @@ def _predict_into(
             )
 
         var n = Int(n_rows)
-        var features = _copy_f64(data, n * Int(n_features))
-        var values = List[Float64](capacity=needed)
-        if model[].kind == _MULTICLASS:
-            ref multi = model[].multi.value()
-            for r in range(n):
-                var row = _row(features, n, expected, r)
-                var scores: List[Float64]
-                if raw:
-                    scores = multi.predict_raw(row)
-                else:
-                    scores = multi.predict_proba(row)
-                for k in range(width):
-                    values.append(scores[k])
-        else:
-            ref single = model[].single.value()
-            for r in range(n):
-                var row = _row(features, n, expected, r)
-                if raw:
-                    values.append(single.predict_raw(row))
-                else:
-                    values.append(single.predict(row))
+        # Resolve the device before predicting, so a request the policy
+        # refuses comes back as MOJOBOOST_ERROR_UNSUPPORTED carrying the
+        # policy's own reason, rather than as a generic invalid argument.
+        # What comes back is CPU_DEVICE or GPU_DEVICE, never AUTO_DEVICE.
+        var resolved: Int
+        try:
+            resolved = resolve_device(Int(device), n, expected, width)
+        except e:
+            return _fail(error, ERROR_UNSUPPORTED, String(e))
 
+        # LightGBM's (start_iteration, num_iteration) convention, clamped by
+        # the ensemble: a nonpositive num_iteration means every remaining
+        # iteration, which is what the two legacy entry points pass.
+        var rng = IterationRange.clamp(
+            model[].n_iterations(), Int(start_iteration), Int(num_iteration)
+        )
+
+        var features = _copy_f64(data, n * expected)
+        var values = model[].predict_batch(
+            features, n, rng, flags == PREDICT_RAW, resolved
+        )
+        if len(values) != needed:
+            return _invalid(
+                error,
+                String(
+                    "internal error: prediction produced ",
+                    len(values),
+                    " values but ",
+                    needed,
+                    " were expected",
+                ),
+            )
         for i in range(needed):
             out_values.unsafe_store(i, values[i])
         return OK
@@ -439,7 +572,17 @@ def mojoboost_predict(
     error: _ErrorPtr,
 ) abi("C") -> Int32:
     return _predict_into(
-        model, data, n_rows, n_features, out_values, out_len, error, False
+        model,
+        data,
+        n_rows,
+        n_features,
+        0,
+        0,
+        PREDICT_RESPONSE,
+        DEVICE_CPU,
+        out_values,
+        out_len,
+        error,
     )
 
 
@@ -454,7 +597,51 @@ def mojoboost_predict_raw(
     error: _ErrorPtr,
 ) abi("C") -> Int32:
     return _predict_into(
-        model, data, n_rows, n_features, out_values, out_len, error, True
+        model,
+        data,
+        n_rows,
+        n_features,
+        0,
+        0,
+        PREDICT_RAW,
+        DEVICE_CPU,
+        out_values,
+        out_len,
+        error,
+    )
+
+
+@export
+def mojoboost_predict_ex(
+    model: _ModelPtr,
+    data: _F64Ptr,
+    n_rows: Int64,
+    n_features: Int64,
+    start_iteration: Int64,
+    num_iteration: Int64,
+    flags: Int32,
+    device: Int32,
+    out_values: _F64Ptr,
+    out_len: Int64,
+    error: _ErrorPtr,
+) abi("C") -> Int32:
+    """The full prediction surface: `mojoboost_predict` and
+    `mojoboost_predict_raw` are this call with the whole ensemble, the CPU,
+    and one flag fixed. Those two keep the established behavior exactly, so
+    reaching the iteration range or the accelerator is an explicit choice a
+    caller makes rather than something a rebuild changes underneath it."""
+    return _predict_into(
+        model,
+        data,
+        n_rows,
+        n_features,
+        start_iteration,
+        num_iteration,
+        flags,
+        device,
+        out_values,
+        out_len,
+        error,
     )
 
 
@@ -525,8 +712,10 @@ def _accessor(
             out_value[] = Int64(model[].n_features())
         elif which == 1:
             out_value[] = Int64(model[].n_classes())
-        else:
+        elif which == 2:
             out_value[] = Int64(model[].n_trees())
+        else:
+            out_value[] = Int64(model[].n_iterations())
         return OK
     except e:
         return _invalid(error, String(e))
@@ -553,7 +742,44 @@ def mojoboost_model_num_trees(
     return _accessor(model, out_value, error, 2)
 
 
+@export
+def mojoboost_model_num_iterations(
+    model: _ModelPtr, out_value: _I64Ptr, error: _ErrorPtr
+) abi("C") -> Int32:
+    return _accessor(model, out_value, error, 3)
+
+
+# ----------------------------------------------------------------- inspect
+
+
+@export
+def mojoboost_model_dump_json(
+    model: _ModelPtr, out_text: _CharOutPtr, error: _ErrorPtr
+) abi("C") -> Int32:
+    """The model as inspection-schema JSON, allocated here and released with
+    `mojoboost_string_free`. `out_text` is untouched on failure."""
+    _clear(error)
+    if _is_null(model):
+        return _invalid(error, String("model must not be NULL"))
+    if _is_null(out_text):
+        return _invalid(error, String("out_text must not be NULL"))
+    var text: String
+    try:
+        text = model[].dump_json()
+    except e:
+        return _fail(error, ERROR_INVALID_ARGUMENT, String(e))
+    out_text[] = _new_c_string(text)
+    return OK
+
+
 # ------------------------------------------------------------------ destroy
+
+
+@export
+def mojoboost_string_free(text: _CharPtr) abi("C"):
+    if _is_null(text):
+        return
+    text.unsafe_free()
 
 
 @export

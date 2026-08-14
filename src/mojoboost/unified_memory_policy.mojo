@@ -1178,6 +1178,217 @@ def resolve_from_env(role: Int, unified_memory: Bool) raises -> RouteDecision:
     )
 
 
+# ---------------------------------------------------------------------------
+# The session plan: one resolved route per role, as one value
+# ---------------------------------------------------------------------------
+
+
+struct SessionMemoryPlan(Copyable, Movable):
+    """Every role's route for one session, resolved once and carried as data.
+
+    This is the shape the rest of the system consumes. `resolve_from_env` and
+    `resolve_route` answer for one role, which is what an allocation site
+    needs; a *decision report* needs all of them at once, because "which
+    transfer strategy is this run using" has eight answers and printing one of
+    them is how a reader concludes the wrong thing about the other seven.
+
+    Built with `explain_route`, not `resolve_route`, and the difference is
+    deliberate. A plan is a description: a role that cannot honor the
+    environment request appears here as the default with `reason` saying why,
+    so one structurally-blocked role does not erase the plan for the other
+    seven. The refusal still happens, at the allocation site, where
+    `resolve_from_env` raises. A report that explains and an allocator that
+    refuses are not two policies: `route_block_reason` is the single gate and
+    both go through it.
+
+    `unified_memory` is carried because it is an input to every one of those
+    answers and because a reader looking at a plan of all-`copy_staged` needs
+    to know whether that is the platform's doing or the ledger's.
+    """
+
+    var unified_memory: Bool
+    var requested: Int
+    """The route `MOJOBOOST_GPU_TRANSFER` asked for, honored or not."""
+
+    var ack_unproven: Bool
+    """`MOJOBOOST_GPU_TRANSFER_UNPROVEN=1` was set."""
+
+    var decisions: List[RouteDecision]
+    """One entry per role, indexed by the `ROLE_*` code."""
+
+    def __init__(
+        out self,
+        unified_memory: Bool,
+        requested: Int,
+        ack_unproven: Bool,
+        var decisions: List[RouteDecision],
+    ):
+        self.unified_memory = unified_memory
+        self.requested = requested
+        self.ack_unproven = ack_unproven
+        self.decisions = decisions^
+
+    @staticmethod
+    def staged(unified_memory: Bool = False) raises -> SessionMemoryPlan:
+        """The shipped plan: the staged copy for every role.
+
+        Reads no environment, so it is the conservative value a caller uses
+        when it has nothing to resolve against. It is also what
+        `plan_session_routes` returns in every context this repository
+        controls, because `EvidenceLedger.installed()` is empty and
+        `MOJOBOOST_GPU_TRANSFER` is unset.
+
+        The obligations come from `sync_contract`, not from a literal repeated
+        here: two spellings of the staged contract is exactly the drift this
+        module was written to prevent.
+        """
+        var contract = sync_contract(DEFAULT_ROUTE)
+        var decisions = List[RouteDecision](capacity=N_ROLES)
+        for role in range(N_ROLES):
+            decisions.append(
+                RouteDecision(
+                    role,
+                    DEFAULT_ROUTE,
+                    DEFAULT_ROUTE,
+                    ELIGIBLE,
+                    False,
+                    EVIDENCE_NONE,
+                    contract.copy(),
+                )
+            )
+        return SessionMemoryPlan(
+            unified_memory, DEFAULT_ROUTE, False, decisions^
+        )
+
+    def for_role(self, role: Int) raises -> RouteDecision:
+        if role < 0 or role >= len(self.decisions):
+            raise Error("unknown buffer role ", role)
+        return self.decisions[role].copy()
+
+    def all_default(self) -> Bool:
+        """True when every role resolved to `copy_staged`, which is the state
+        this repository ships in and the only state any measurement in it was
+        taken under."""
+        for i in range(len(self.decisions)):
+            if not self.decisions[i].is_default():
+                return False
+        return True
+
+    def honored_count(self) -> Int:
+        """Roles that got the route the environment asked for."""
+        var n = 0
+        for i in range(len(self.decisions)):
+            if self.decisions[i].reason == ELIGIBLE:
+                n += 1
+        return n
+
+    def any_unproven(self) -> Bool:
+        """True when any role's route rests on the acknowledgment rather than
+        on evidence. Any number measured under this must be reported with
+        it."""
+        for i in range(len(self.decisions)):
+            if self.decisions[i].ack_unproven:
+                return True
+        return False
+
+    def needs_kernel_retirement(self) -> Bool:
+        """True when any role's buffer is live until the kernels that read it
+        retire, rather than until a copy retires.
+
+        The one field of the plan that changes what a *caller* must do rather
+        than what it allocates: on a kernel-retirement route the staging ring's
+        overlap argument does not hold and the host's next write to that buffer
+        has to wait for the round, not for the upload. See `SyncContract`.
+        """
+        for i in range(len(self.decisions)):
+            if self.decisions[i].contract.retire_event == RETIRE_ON_KERNEL:
+                return True
+        return False
+
+    def report(self) raises -> String:
+        """The plan as lines, one per role:
+
+        ```
+        transfer.<role> <requested> <selected> <reason> <evidence> <retire_on> <ack>
+        ```
+
+        Seven space-separated fields, roles always in declaration order and
+        always all present, so a consumer can index rather than search. The
+        shape `StartupTrace.report()` uses, for the same reason.
+        """
+        var out = String("")
+        for role in range(len(self.decisions)):
+            var d = self.decisions[role]
+            out += "transfer." + role_name(d.role)
+            out += " " + route_name(d.requested)
+            out += " " + route_name(d.selected)
+            out += " " + block_reason_name(d.reason)
+            out += " " + evidence_name(d.evidence_level)
+            out += " " + retire_event_name(d.contract.retire_event)
+            if d.ack_unproven:
+                out += " 1\n"
+            else:
+                out += " 0\n"
+        out += "transfer.unified_memory "
+        if self.unified_memory:
+            out += "1\n"
+        else:
+            out += "0\n"
+        out += "transfer.requested " + route_name(self.requested) + "\n"
+        out += "transfer.honored " + String(self.honored_count()) + "\n"
+        out += "transfer.roles " + String(len(self.decisions)) + "\n"
+        return out^
+
+
+def plan_session_routes(unified_memory: Bool) raises -> SessionMemoryPlan:
+    """Resolve every role's route for one session, from the environment
+    request against the installed evidence.
+
+    Raises only for an unparsable `MOJOBOOST_GPU_TRANSFER`, which is
+    `env_requested_route`'s rule and not a per-role one: a misspelled
+    performance knob must not resolve to a different performance path, and it
+    must not resolve to eight of them either.
+
+    Returns the all-`copy_staged` plan in every context this repository
+    controls, because `EvidenceLedger.installed()` is empty and the variable
+    is unset.
+    """
+    var requested = env_requested_route()
+    var ack = env_ack_unproven()
+    var ledger = EvidenceLedger.installed()
+    var decisions = List[RouteDecision](capacity=N_ROLES)
+    for role in range(N_ROLES):
+        decisions.append(
+            explain_route(role, requested, unified_memory, ledger, ack)
+        )
+    return SessionMemoryPlan(unified_memory, requested, ack, decisions^)
+
+
+def describe_session_plan(plan: SessionMemoryPlan) raises -> String:
+    """One line for a trace or a bug report, in the shape
+    `describe_decision` uses for a single role."""
+    var out = String(
+        "transfer requested=",
+        route_name(plan.requested),
+        " honored=",
+        plan.honored_count(),
+        "/",
+        len(plan.decisions),
+        " unified_memory=",
+    )
+    if plan.unified_memory:
+        out += "true"
+    else:
+        out += "false"
+    if plan.all_default():
+        out += " all_default=true"
+    else:
+        out += " all_default=false"
+    if plan.any_unproven():
+        out += " ack_unproven=1"
+    return out^
+
+
 def describe_decision(decision: RouteDecision) -> String:
     """One line for a trace or a bug report.
 

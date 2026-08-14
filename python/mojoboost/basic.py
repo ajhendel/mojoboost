@@ -52,9 +52,16 @@ Differences from LightGBM, all deliberate
   the returned booster for `eval_valid()`, but there is no per-round
   history and no early stopping here yet: those live on the estimators'
   `fit(eval_set=..., early_stopping_rounds=...)`.
-- **No `dump_model` / `trees_to_dataframe`.** Structured model inspection is
-  its own piece of work; `model_to_string()` gives the whole model in
-  mojoboost's versioned text format meanwhile.
+- **`dump_model` and `trees_to_dataframe` report what mojoboost records.**
+  Both are here, and both delegate to `mojoboost.inspection`, which is the
+  one implementation of the schema. Two columns cannot be filled the way
+  LightGBM fills them: `split_gain` is absent from a model read back from a
+  file or a pickle, because gains are recorded during growth and
+  deliberately not serialized, and `weight` is always None, because
+  mojoboost records a node's training row cover (in `count`) and not the
+  hessian sum LightGBM calls weight. `docs/MODEL_INSPECTION_SCHEMA.md` has
+  the rest; `model_to_string()` still gives the whole model in mojoboost's
+  versioned text format.
 
 See docs/LIGHTGBM_PARITY.md for the full row-by-row statement.
 """
@@ -1044,6 +1051,62 @@ class Booster:
         )
         return _finish(out)
 
+    # -- structured inspection -------------------------------------------
+    #
+    # One implementation, in `mojoboost.inspection`, reached from the model
+    # object the way LightGBM reaches it. The import is inside each method
+    # rather than at the top of this file for two reasons: `inspection`
+    # imports nothing from here but is imported *by* the estimators, and
+    # `Booster` is the object it inspects, so a top-level import would put
+    # a cycle between two modules that do not otherwise need each other.
+    # It costs one `sys.modules` lookup per call.
+
+    def dump_model(self, feature_names=None):
+        """The model as the documented inspection schema, a plain dict.
+
+        LightGBM's `Booster.dump_model()`. `feature_names` overrides the
+        names the model carries, which is how a model read back from a file
+        (those carry none) gets named. Every key is in
+        `docs/MODEL_INSPECTION_SCHEMA.md`; the two to branch on are
+        `has_split_gain` and `has_node_count`.
+        """
+        from . import inspection
+
+        return inspection.dump_model(self, feature_names=feature_names)
+
+    def trees_to_dataframe(self):
+        """The ensemble as a pandas DataFrame, one row per node.
+
+        LightGBM's `Booster.trees_to_dataframe()`, with LightGBM's column
+        names and the two deliberate gaps the module docstring lists.
+        pandas is not a dependency of mojoboost: `trees_to_records()`
+        returns the same rows as plain dicts and needs nothing installed.
+        """
+        from . import inspection
+
+        return inspection.trees_to_dataframe(self)
+
+    def trees_to_records(self):
+        """`trees_to_dataframe` without pandas: one dict per node, in the
+        same column order and the same depth-first per-tree row order."""
+        from . import inspection
+
+        return inspection.trees_to_records(self)
+
+    def get_split_value_histogram(self, feature, bins=None, as_frame=False):
+        """How the ensemble's splits on one feature are distributed.
+
+        The data behind LightGBM's `plot_split_value_histogram`, and
+        nothing else: no plotting dependency is introduced by asking.
+        Returns `(counts, bin_edges)`, or a pandas DataFrame with
+        `as_frame=True`.
+        """
+        from . import inspection
+
+        return inspection.get_split_value_histogram(
+            self, feature, bins=bins, as_frame=as_frame
+        )
+
     # -- model IO --------------------------------------------------------
 
     def save_model(self, filename):
@@ -1161,6 +1224,9 @@ def train(
     valid_sets=None,
     valid_names=None,
     init_model=None,
+    *,
+    feval=None,
+    callbacks=None,
 ):
     """Train a model and return the `Booster` that holds it.
 
@@ -1184,9 +1250,27 @@ def train(
     `num_boost_round` more rounds from where they left off. The dataset
     must be the one that model was trained on, which is checked by
     comparing the binning rather than taken on trust.
+
+    `feval` and `callbacks` are LightGBM's per-round hooks. They are named
+    in the signature only so that passing one is refused by name instead of
+    as an unexpected keyword: the round loop that scores metrics and runs
+    callbacks is the estimators' `fit(eval_set=...)` and `mojoboost.cv`,
+    and accepting either here would let it look as though it ran.
     """
     if not isinstance(train_set, Dataset):
         raise TypeError("train_set must be a mojoboost.Dataset")
+    if feval is not None:
+        raise ValueError(
+            "train() does not score per-round metrics, so feval would never "
+            "be called; fit an estimator with eval_set= and eval_metric=, "
+            "or use mojoboost.cv(feval=...)"
+        )
+    if callbacks:
+        raise ValueError(
+            "train() has no per-round callback loop, so a callback would "
+            "never be called; fit an estimator with eval_set= and "
+            "callbacks=, or use mojoboost.cv(callbacks=...)"
+        )
     config = _Config(params, num_boost_round)
     config.check_dataset(train_set)
 
