@@ -152,6 +152,113 @@ def test_strategies_agree_on_leaf_filtered_builds() raises:
             assert_equal(cpu_right.count[i], t_right.count[i])
 
 
+def _subtraction_paths_agree(strategy: Int) raises:
+    """The sibling subtraction folded into the build and the standalone
+    subtraction kernel leave the resident pool holding the same words.
+
+    `_device_search_resident` derives one child of every split instead of
+    building it, and it now does that inside the histogram kernel rather than
+    in a second launch. That saves a launch and a pass over two whole slots
+    per split, and it is only allowed to save them: the pool afterwards must
+    hold what `enqueue_resident_subtract` would have left. Both operands are
+    fixed-point Int32 under one scale, so the comparison is bit for bit and
+    not to a tolerance.
+
+    The fused form covers fewer cells than the standalone one on purpose --
+    inactive features' slices, and bins the built child put no rows in, are
+    cells whose subtrahend is zero -- so this is exactly the claim that has
+    to be checked rather than argued, and it has to be checked under both
+    accumulation strategies, since each folds the subtraction into a
+    different kernel.
+
+    This is also the only caller left of `enqueue_resident_subtract`. The
+    grower stopped using it when the fusion landed, and a device kernel with
+    no caller is a kernel nobody notices breaking; keeping it as the
+    reference this asserts against is what it is still for.
+    """
+    var n_rows = 50_000
+    var n_features = 5
+    var n_bins = 64
+    var data = _make_data(n_rows, n_features, n_bins)
+    var gh = _make_grad_hess(n_rows, UInt64(11_000_000))
+    var hist_size = n_features * n_bins
+    var cells = 3 * hist_size
+
+    # Two builders under the same strategy, differing only in how the
+    # sibling is derived, so nothing else can explain a difference.
+    var fused = GpuHistogramBuilder(data, strategy)
+    var separate = GpuHistogramBuilder(data, strategy)
+    fused.upload_gradients(gh[0], gh[1])
+    separate.upload_gradients(gh[0], gh[1])
+    assert_true(fused.open_resident(4))
+    assert_true(separate.open_resident(4))
+    fused.begin_tree()
+    separate.begin_tree()
+
+    # The root's histogram into a slot, then the split that turns it into a
+    # parent, exactly the order the grower uses.
+    var f_parent = fused.acquire_resident(0)
+    var s_parent = separate.acquire_resident(0)
+    assert_true(f_parent >= 0 and s_parent >= 0)
+    fused.enqueue_resident_leaf(0, f_parent)
+    separate.enqueue_resident_leaf(0, s_parent)
+    fused.apply_split(0, 31, 0, 1, 2)
+    separate.apply_split(0, 31, 0, 1, 2)
+
+    var f_child = fused.acquire_resident(1)
+    var s_child = separate.acquire_resident(1)
+    assert_true(f_child >= 0 and s_child >= 0)
+    # One launch that builds the left child and derives the right in place.
+    fused.enqueue_resident_leaf_subtracting(1, f_child, f_parent)
+    # The two launches it replaces.
+    separate.enqueue_resident_leaf(1, s_child)
+    separate.enqueue_resident_subtract(s_parent, s_child, s_parent)
+
+    var f_slots = List[Int](capacity=2)
+    f_slots.append(f_parent)
+    f_slots.append(f_child)
+    var s_slots = List[Int](capacity=2)
+    s_slots.append(s_parent)
+    s_slots.append(s_child)
+    var f_words = fused.batcher[0].download_slots(f_slots)
+    var s_words = separate.batcher[0].download_slots(s_slots)
+    assert_equal(len(f_words), 2 * cells)
+    assert_equal(len(s_words), 2 * cells)
+    for i in range(2 * cells):
+        assert_equal(Int(f_words[i]), Int(s_words[i]))
+
+    # And the derived slot is the sibling's histogram, not merely the same
+    # wrong thing on both paths: its counts are the CPU builder's counts over
+    # the rows the split sent right.
+    var right_rows = List[Int]()
+    for r in range(n_rows):
+        if data.bin_at(r, 0) > 31:
+            right_rows.append(r)
+    assert_true(len(right_rows) > 0)
+    var cpu_right = build_histogram_subset(data, gh[0], gh[1], right_rows)
+    # Slot layout is [grad | hess | count], `hist_size` words apiece, and the
+    # derived sibling is the first slot of the download.
+    for i in range(hist_size):
+        assert_equal(Int(f_words[2 * hist_size + i]), cpu_right.count[i])
+
+    fused.release_resident_all()
+    separate.release_resident_all()
+
+
+def test_fused_and_standalone_subtraction_agree_atomic() raises:
+    comptime if not has_accelerator():
+        print("skipped: no accelerator")
+    else:
+        _subtraction_paths_agree(STRATEGY_ATOMIC)
+
+
+def test_fused_and_standalone_subtraction_agree_tiled() raises:
+    comptime if not has_accelerator():
+        print("skipped: no accelerator")
+    else:
+        _subtraction_paths_agree(STRATEGY_TILED)
+
+
 def test_tiled_matches_the_cpu_builder() raises:
     """Float32 fixed point, so tolerance against the Float64 CPU sums;
     counts are integer on both sides and must match exactly."""

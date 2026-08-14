@@ -207,6 +207,35 @@ which is what would confirm or move `TARGET_BLOCKS_PER_SM` in
 only 2 tiles and 100 threadgroups at 1,000,000 x 50 on this device, and
 whether more tiles would help there is an open question, not a settled one.
 
+## What a launch and a wait cost
+
+`bench_launch_cost.mojo` measures the two fixed costs the GPU trainer pays
+per split, with an empty kernel so the work is excluded: submitting one
+kernel, and one round trip to the device and back. Read it before proposing
+any change whose whole benefit is fewer kernel launches or fewer
+synchronizations, because those two numbers set the price of the change and
+they are a property of the device, not of this repository.
+
+```sh
+pixi run bench-launch-cost             # 200 launches per sample, 5 trials
+pixi run bench-launch-cost 500 5
+```
+
+Both arms alternate inside one process, as `bench_train_gpu.mojo` does, and
+both are warmed first: an unwarmed round-trip arm reads about 60% high. The
+summary prices a device-resident split (eight launches and one wait) against
+the result, and states what one launch removed is worth over a default
+100-round, 31-leaf run.
+
+On an Apple M4 that is roughly 20us to submit a launch and 126us for the
+wait, so about 280us a split, or 0.85s of a 3.05s run at 50,000 x 100 --
+about a third of the device path is fixed cost, and one launch removed is
+worth near 2%, which is inside `bench_train_gpu.mojo`'s noise floor. The
+consequence is recorded in `_device_search_resident` in `train_gpu.mojo`: a
+kernel fusion here has to justify itself as strictly less work for a
+bit-identical result, not by a measured speedup. Numbers from one GPU family
+say nothing about another; rerun this before quoting it elsewhere.
+
 ## Per-device GPU validation report
 
 `bench_gpu_validation.mojo` is the cross-vendor driver. It prints device
