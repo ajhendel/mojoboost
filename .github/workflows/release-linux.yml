@@ -84,7 +84,7 @@ jobs:
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
-      - uses: actions/checkout@v4 # TODO(pin): full commit SHA before enabling
+      - uses: actions/checkout@v7 # TODO(pin): full commit SHA before enabling
         with:
           ref: ${{ inputs.ref }}
           fetch-depth: 0
@@ -154,7 +154,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4 # TODO(pin): full commit SHA before enabling
+      - uses: actions/checkout@v7 # TODO(pin): full commit SHA before enabling
         with:
           ref: ${{ inputs.ref }}
           persist-credentials: false
@@ -235,7 +235,7 @@ jobs:
           sha256sum *.whl *.provenance.json > SHA256SUMS-${{ matrix.arch }}.txt
           cat SHA256SUMS-${{ matrix.arch }}.txt
 
-      - uses: actions/upload-artifact@v4 # TODO(pin): full commit SHA
+      - uses: actions/upload-artifact@v7 # TODO(pin): full commit SHA
         if: always()
         with:
           name: wheel-linux-${{ matrix.arch }}
@@ -264,12 +264,12 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4 # TODO(pin): full commit SHA
+      - uses: actions/checkout@v7 # TODO(pin): full commit SHA
         with:
           ref: ${{ inputs.ref }}
           persist-credentials: false
 
-      - uses: actions/download-artifact@v4 # TODO(pin): full commit SHA
+      - uses: actions/download-artifact@v8 # TODO(pin): full commit SHA
         with:
           name: wheel-linux-${{ matrix.arch }}
           path: dist
@@ -324,7 +324,7 @@ jobs:
             packaging/linux/container_elf_report.sh \
               "$(ls dist/*.whl)" /io/elf-${{ matrix.arch }}.txt
 
-      - uses: actions/upload-artifact@v4 # TODO(pin): full commit SHA
+      - uses: actions/upload-artifact@v7 # TODO(pin): full commit SHA
         if: always()
         with:
           name: clean-install-linux-${{ matrix.arch }}
@@ -361,7 +361,7 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4 # TODO(pin): full commit SHA
+      - uses: actions/download-artifact@v8 # TODO(pin): full commit SHA
         with:
           pattern: wheel-linux-*
           path: staging
