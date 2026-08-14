@@ -23,6 +23,9 @@ set -euo pipefail
 WHEEL=${1:?usage: clean_install_macos.sh <wheel> [record file]}
 LOG=${2:-/dev/null}
 WHEEL=$(cd "$(dirname "$WHEEL")" && pwd)/$(basename "$WHEEL")
+if [ "$LOG" != /dev/null ]; then
+    LOG=$(mkdir -p "$(dirname "$LOG")" && cd "$(dirname "$LOG")" && pwd)/$(basename "$LOG")
+fi
 HERE=$(cd "$(dirname "$0")" && pwd)
 
 say() { printf '%s\n' "$*" | tee -a "$LOG"; }
