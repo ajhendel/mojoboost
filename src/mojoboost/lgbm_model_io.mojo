@@ -1914,7 +1914,7 @@ def parse_lgbm_model(text: String) raises -> Model:
     the report of what the conversion had to synthesize.
     """
     var imported = import_lgbm_model(text)
-    return imported.model^
+    return imported.model.copy()
 
 
 def import_lgbm_model(text: String) raises -> LgbmImport:
@@ -1973,7 +1973,7 @@ def parse_lgbm_multiclass_model(text: String) raises -> MulticlassModel:
     together with the report of what the conversion had to synthesize.
     """
     var imported = import_lgbm_multiclass_model(text)
-    return imported.model^
+    return imported.model.copy()
 
 
 def import_lgbm_multiclass_model(
@@ -2613,7 +2613,7 @@ def dump_lgbm_model(
     the report of what the conversion left behind.
     """
     var exported = export_lgbm_model(model, feature_names)
-    return exported.text^
+    return exported.text.copy()
 
 
 def export_lgbm_model(
@@ -2669,7 +2669,7 @@ def dump_lgbm_multiclass_model(
     together with the report of what the conversion left behind.
     """
     var exported = export_lgbm_multiclass_model(model, feature_names)
-    return exported.text^
+    return exported.text.copy()
 
 
 def export_lgbm_multiclass_model(
