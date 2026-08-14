@@ -29,3 +29,4 @@ from .metrics import (
     rmse,
 )
 from .model import Model, fit
+from .serialize import load_model, save_model
