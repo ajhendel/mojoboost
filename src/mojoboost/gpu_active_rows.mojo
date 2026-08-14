@@ -582,6 +582,18 @@ def _range_hist_atomic_g2_kernel(
     kernel runs only when a caller or `MOJOBOOST_GPU_FEATURE_GROUP` asks for
     it.
 
+    Measured on an Apple M4 with `pixi run bench-hist 100000 100 20`, which
+    interleaves the two arms inside one process because this machine's
+    device timings drift several-fold between time windows: one root build
+    takes 0.620 ms at group 1 and 0.531 ms at group 2, a 1.17x difference
+    against a 3.2% band, reproduced across four runs at two shapes. The same
+    bench on a shape that resolves to the tiled strategy comes out flat, as
+    it must, since that path has no paired kernel. The default stays 1
+    anyway: one device is not a device family, and the shared-memory
+    doubling is exactly the kind of change that can invert on a backend
+    with a different threadgroup budget. A CUDA or HIP measurement is what
+    would move the default, not another Apple one.
+
     The result is bit-identical to the one-feature kernel and not merely
     close. Accumulation stays fixed-point Int32 in both, integer addition is
     associative and commutative, and every atomic here adds the same
