@@ -1750,6 +1750,13 @@ def train_distributed[
 
     `train_distributed_run` with the default options and no callback, kept as
     the plain entry point for a caller that wants a model and nothing else.
+
+    The model comes out as a copy, not a transfer. Moving one field out of a
+    live struct is a partial move, which this compiler rejects outright: the
+    outcome still owns its report, so it still has to be destroyed as a whole.
+    The copy is the same one the bindings already take out of a training
+    result, and it is a copy of a finished ensemble taken once at the end of a
+    whole distributed run, so it costs nothing next to the training itself.
     """
     var outcome = train_distributed_run(
         shards,
@@ -1760,7 +1767,7 @@ def train_distributed[
         no_callback,
         alpha,
     )
-    return outcome.model^
+    return outcome.model.copy()
 
 
 def run_distributed[
