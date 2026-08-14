@@ -598,6 +598,20 @@ tweedie, MAPE, fair, cross entropy),
 through one device-resident builder. Quantile, L1, and MAPE renew their leaf
 values on the host after the tree is grown, exactly as on the CPU.
 
+For the built-in objectives without row sampling, gradients are generated on
+the device from device-resident labels and raw scores, and each grown tree
+advances those raw scores from its leaf ranges, so nothing per-row crosses
+the host/device boundary in a plain round; bagging and GOSS rank their
+samples host-side and keep the host gradient path. Per-node split selection
+runs on the host over downloaded histograms by default, which is what keeps
+CPU and GPU split decisions identical; `MOJOBOOST_GPU_SPLIT_STRATEGY=device`
+moves the scan onto the device (one 136-byte record per node instead of the
+histogram, Float32 gains that can flip near-tie decisions, bit-deterministic
+run to run). Neither path is claimed faster; no benchmark has compared them.
+Batched prediction can also run on the device through
+`Model.predict_batch(..., device=GPU_DEVICE)`; binning stays host-side, so
+both devices route every row to the same leaf.
+
 One intentional difference in where training stops. Both trainers end early
 when a round produces a single leaf whose value is under 1e-12, meaning the
 objective has converged. The CPU sums gradients in Float64 and hits exactly
