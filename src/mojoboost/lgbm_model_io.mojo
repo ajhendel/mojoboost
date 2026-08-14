@@ -47,10 +47,21 @@ keeps them separate as `base_score` and `learning_rate`. So a model read from
 a LightGBM file gets `learning_rate = 1.0` and `base_score = 0.0` with the
 leaf values taken verbatim, and a model written to one gets every leaf value
 multiplied by `learning_rate`, with `base_score` added into the first
-iteration's trees the way LightGBM's `Tree::AddBias` does. Predictions are
-identical either way, term for term and rounding for rounding, but the round
-trip is not the identity on the `(base_score, learning_rate, leaf value)`
-triple, only on what it predicts.
+iteration's trees the way LightGBM's `Tree::AddBias` does.
+
+How exact that is depends on the learning rate. A model with
+`learning_rate = 1.0` and `base_score = 0.0`, which is exactly what reading a
+LightGBM file produces, round-trips bit-exactly: written out and read back it
+predicts the identical `Float64` for every row, and re-dumping reproduces the
+file byte for byte. Under any other learning rate the two agree to a few
+units in the last place instead. Prediction accumulates
+`score += learning_rate * leaf_value`, which the compiler may fuse into a
+single rounded multiply-add, while the file forces `learning_rate *
+leaf_value` to be rounded on its own before it can be stored. No text format
+avoids that, because the leaf value is the only place the shrinkage can go.
+So the round trip is not the identity on the
+`(base_score, learning_rate, leaf value)` triple, and on predictions it is
+exact only once the rate has been folded in.
 
 What is rejected, and why
 -------------------------
@@ -942,6 +953,48 @@ struct _NodeArrays(Copyable, Movable):
         self.count.append(0.0)
         return node
 
+    def into_tree(mut self, n_leaves: Int) raises -> Tree:
+        """Hand the accumulated arrays to a `Tree`, leaving this builder
+        empty.
+
+        Swapped out rather than transferred field by field: the ownership
+        checker will not let a struct it still has to destroy be emptied one
+        field at a time, and this is the same move `Tree.take_hist` makes for
+        the same reason.
+        """
+        var feature = List[Int]()
+        var threshold_bin = List[Int]()
+        var left = List[Int]()
+        var right = List[Int]()
+        var value = List[Float64]()
+        var split_gain = List[Float64]()
+        var default_left = List[Bool]()
+        var missing_bin = List[Int]()
+        var count = List[Float64]()
+        swap(feature, self.feature)
+        swap(threshold_bin, self.threshold_bin)
+        swap(left, self.left)
+        swap(right, self.right)
+        swap(value, self.value)
+        swap(split_gain, self.split_gain)
+        swap(default_left, self.default_left)
+        swap(missing_bin, self.missing_bin)
+        swap(count, self.count)
+        return Tree(
+            feature^,
+            threshold_bin^,
+            left^,
+            right^,
+            value^,
+            split_gain^,
+            n_leaves,
+            default_left^,
+            missing_bin^,
+            List[Int](),
+            List[UInt64](),
+            count^,
+        )
+
 
 def _emit_node(
     mut arrays: _NodeArrays,
@@ -1064,20 +1117,7 @@ def _convert_tree(
                 leaf,
                 "; its child links do not form a tree",
             )
-    return Tree(
-        arrays.feature^,
-        arrays.threshold_bin^,
-        arrays.left^,
-        arrays.right^,
-        arrays.value^,
-        arrays.split_gain^,
-        src.num_leaves,
-        arrays.default_left^,
-        arrays.missing_bin^,
-        List[Int](),
-        List[UInt64](),
-        arrays.count^,
-    )
+    return arrays.into_tree(src.num_leaves)
 
 
 def _synthesize_mapper(
@@ -1502,9 +1542,10 @@ def dump_lgbm_model(model: Model) raises -> String:
     """Render a single-output `Model` as a LightGBM model string.
 
     Leaf values are multiplied by the learning rate and the base score is
-    folded into tree 0, so the file predicts exactly what the model does; the
-    module docstring spells out why the round trip is faithful in predictions
-    rather than in fields. Raises for a categorical or custom-objective
+    folded into tree 0, so the file predicts what the model does: exactly,
+    when the learning rate is already 1.0, and otherwise to within a few
+    units in the last place. The module docstring explains why that last
+    rounding is unavoidable. Raises for a categorical or custom-objective
     model.
     """
     var objective_line = lgbm_objective_name(model.booster.objective)

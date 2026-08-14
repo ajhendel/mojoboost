@@ -54,6 +54,7 @@ Class-conditional row bagging
 
 - `comptime DEFAULT_POS_BAGGING_FRACTION = 1.0`, `comptime DEFAULT_NEG_BAGGING_FRACTION = 1.0`
 - `struct ClassBaggingParams(Copyable, Movable)` with fields `pos_fraction`, `neg_fraction`, `freq`, `seed`, plus `disabled()`, `enabled()`, `validate()`
+- `has_positive_rows(labels) -> Bool`, the label half of LightGBM's enable condition
 - `sample_rows_by_class(params, labels, bag_index, mut rows) raises`
 - `refresh_class_bag(mut bag, params, labels, iteration) raises`
 
@@ -85,16 +86,19 @@ unless the row says otherwise.
 | `other_rate` | none | 0.1 | already implemented in `goss.mojo` |
 | `data_sample_strategy` | none | `bagging` | values `bagging` and `goss` |
 
-Verification. Every row of this table was diffed against a LightGBM 4.7
-checkout found on this machine at
-`/private/tmp/lightgbm-cloc.y8ASwY/LightGBM`, specifically the alias map at
-`src/io/config_auto.cpp` lines 72 to 86 and 826 to 852, and the defaults in
-`include/LightGBM/config.h`. The table matched except for two aliases this
+Verification. Every row of this table was diffed against a LightGBM checkout
+found on this machine at `/private/tmp/lightgbm-cloc.y8ASwY/LightGBM`,
+`VERSION.txt` 4.7.0.99, which is master after the 4.7.0 release rather than
+the 4.7.0 tag the parity doc audits against. The sources read were the alias
+map at `src/io/config_auto.cpp` lines 72 to 86 and 826 to 852 and the defaults
+in `include/LightGBM/config.h`. The table matched except for two aliases this
 lane had missed, `pos_bagging` and `neg_bagging`, which are now accepted and
 tested. No spelling in the table is absent from LightGBM, and `bagging_freq`
-correctly takes only `subsample_freq`. Confirm the checkout is 4.7 before
-relying on this, since it sits in a temporary directory that this lane did not
-create and cannot vouch for.
+correctly takes only `subsample_freq`. Two cautions. That checkout sits in a
+temporary directory this lane did not create, and 4.7.0.99 is not the 4.7.0
+tag, so a spelling added on master after 4.7.0 would look accepted here.
+Neither of the two additions is new in that window, but the diff is worth
+repeating against the tag if the parity doc's version claim has to be exact.
 
 ## 4. Central integration, exact edits
 
@@ -193,7 +197,11 @@ binary-classification parameter in LightGBM and should be rejected elsewhere.
 Import.
 
 ```mojo
-from .sampling import ClassBaggingParams, refresh_class_bag
+from .sampling import (
+    ClassBaggingParams,
+    has_positive_rows,
+    refresh_class_bag,
+)
 ```
 
 Trainer signature, alongside the existing `bagging` and `goss` arguments at
@@ -214,11 +222,20 @@ Validation, next to `check_bagging(bagging)` and `_check_goss(goss, bagging)`.
             raise Error("pos/neg bagging applies to binary classification only")
 ```
 
+Enable gate, hoisted above the round loop. LightGBM requires a positive row to
+exist before balanced bagging applies, and falls back to plain
+`bagging_fraction` when none does, so the gate is both halves and the label
+pass runs once.
+
+```mojo
+    var balanced = class_bagging.enabled() and has_positive_rows(labels)
+```
+
 Round loop, at each `refresh_bag(bag, bagging, n, round)` call (lines 881,
 1135, 1407, and the two in `train_gpu.mojo` at 423 and its sibling).
 
 ```mojo
-        if class_bagging.enabled():
+        if balanced:
             refresh_class_bag(bag, class_bagging, labels, round)
         else:
             refresh_bag(bag, bagging, n, round)
@@ -226,12 +243,20 @@ Round loop, at each `refresh_bag(bag, bagging, n, round)` call (lines 881,
 
 `labels` is the raw target vector the trainer already holds. Rows are positive
 when the label is above zero, so 0/1 and -1/+1 encodings both work, and the
-class rates apply to the raw labels rather than to any transformed score.
+class rates apply to the raw labels rather than to any transformed score. The
+else branch is not dead under an all-negative dataset, it is LightGBM's own
+fallback.
 
 The degenerate-tree guard that checks `bagging_enabled(bagging) or
-goss.enabled` at lines 898, 1148, and 443 must also accept
-`class_bagging.enabled()`, or a round that produces a stump under class
-bagging will be read as convergence.
+goss.enabled` at lines 898, 1148, and 443 must also accept `balanced`, or a
+round that produces a stump under class bagging will be read as convergence.
+
+Semantics confirmed against LightGBM's `BalancedBaggingHelper` in
+`src/boosting/bagging.hpp`. One draw per row whichever class it belongs to,
+compared against that class's fraction, `label > 0` as the class test, and the
+enable condition `(pos < 1.0 || neg < 1.0) && num_pos_data > 0 && freq > 0`.
+mojoboost reproduces all of it apart from the RNG substitution and the
+never-empty guard already documented for uniform bagging.
 
 Nothing else changes. A class bag is an ascending row-index list exactly like a
 uniform bag, so tree growth, `min_data_in_leaf`, leaf values, score updates,
@@ -432,20 +457,24 @@ MOJOBOOST_NUM_WORKERS=1 nice -n 19 tools/with_build_lock.sh \
   pixi run mojo run -I src tests/parallel/test_sampling.mojo
 ```
 
-Result. 20 tests run, 20 passed, 0 failed, 0 skipped.
+Result. 21 tests run, 21 passed, 0 failed, 0 skipped. The suite was run twice,
+once at 20 tests and again after the LightGBM source diff in section 3 added
+two aliases, the `has_positive_rows` gate, and the test that covers them. The
+21-test run is the one reported here.
 
-What the 20 cover. Per-level ordering, subset containment, determinism across
+What the 21 cover. Per-level ordering, subset containment, determinism across
 depth, tree, and seed, and the drop-in equality of `select_split_features` with
 `select_node_features` at a bylevel fraction of 1.0. Fraction accounting across
 all three stages, including that the counts round stage by stage rather than
 once on the product, 100 to 50 to 30 to 15. The alias table, canonical names
-resolving to themselves, and rejection of unknown names. Class bagging
+resolving to themselves, that `bagging`, `pos_bagging`, and `neg_bagging` stay
+three separate parameters, and rejection of unknown names. Class bagging
 reproducing a uniform bag at equal rates, holding each class near its own rate,
 staying ascending and deterministic, never emptying a present class, never
-inventing an absent one, and following the `bagging_freq` schedule. Row-set
-validation, range and mask agreement, and GOSS amplification through
-`expand_row_scale` including that the amplified weight sums back to the full
-row count.
+inventing an absent one, following the `bagging_freq` schedule, and the
+positive-row gate that decides whether it applies at all. Row-set validation,
+range and mask agreement, and GOSS amplification through `expand_row_scale`
+including that the amplified weight sums back to the full row count.
 
 Not run, and therefore not claimed. `pixi run test`, `pixi run test-python`,
 the GPU suites, and `tools/check_parity.py`. No integration edit above has been
@@ -453,8 +482,9 @@ compiled. Nothing in this lane has been benchmarked.
 
 ## 8. Risks
 
-1. The alias spellings are from documentation recall, not from a LightGBM
-   source diff. Section 3 says what to check.
+1. The alias spellings are diffed against a LightGBM checkout, but that
+   checkout is 4.7.0.99 rather than the 4.7.0 tag the parity doc cites, and it
+   lives in a temporary directory. Section 3 says what to repeat and why.
 2. Adding a `TreeParams` field touches a struct many call sites construct. The
    append-at-the-end instruction in 4.1 keeps positional callers working, but
    check `src/mojoboost/serialize.mojo` and the C API for anything that depends

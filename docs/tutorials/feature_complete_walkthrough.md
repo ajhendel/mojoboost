@@ -247,14 +247,38 @@ text = booster.model_to_string()    # the whole model, in mojoboost's format
 `booster_` is the same model object the functional API returns, so there
 is one model type in this package rather than one per door.
 
-**Not available.** There is no `dump_model` and no `trees_to_dataframe`.
-Structured inspection is its own piece of work and has not been done.
-Until it is, `model_to_string()` gives you the entire model in mojoboost's
-versioned text format, which is documented in `src/mojoboost/serialize.mojo`
-and is parseable, but it is a serialization format and not an inspection
-schema. Do not build a dashboard on it and expect the field names to be an
-API; see section 8.1 of the compatibility policy for what will be stable
-when structured inspection arrives.
+Structured inspection lives in its own module.
+
+```python
+from mojoboost.inspection import dump_model, trees_to_dataframe
+
+dump = dump_model(model)             # the schema, as a dict
+frame = trees_to_dataframe(model)    # one row per node, LightGBM's columns
+```
+
+`dump_model` gives you LightGBM's `Booster.dump_model()` shape, and the
+module also carries `trees_to_records` (the same rows without pandas),
+`split_values`, `get_split_value_histogram`, `leaf_index_of`,
+`raw_scores`, `parse_model_string`, and `booster_of`. What the dump
+contains is stated normatively in
+[docs/MODEL_INSPECTION_SCHEMA.md](../MODEL_INSPECTION_SCHEMA.md), which is
+what a consumer should read rather than either implementation.
+
+Two version numbers travel in the dump and they answer different
+questions. `dump_format_version` says what the dump's keys mean, and
+`model_format_version` says which optional facts a model of that vintage
+can carry at all. Branch on the capability flags rather than assuming: a
+dump built by parsing a model file reports `has_split_gain: false`,
+because split gains are recorded during growth and deliberately not
+serialized, and a v1 or v2 model reports `has_node_count: false`.
+
+**Two caveats.** `trees_to_dataframe` needs pandas, which mojoboost does
+not depend on; `trees_to_records` is the dependency-free form. And as of
+this writing the inspection names are not re-exported from the package
+top level, so `mojoboost.inspection` is a submodule import rather than one
+of the guaranteed import paths. Section 8.1 of the compatibility policy
+carries that as an open question for the first release, not as a
+statement that the module is unstable.
 
 ## 6. Saving, loading, and pickling
 
@@ -578,7 +602,8 @@ mojoboost should not have to assemble this list from thirteen sections.
 
 | Missing | Where it bites | Workaround |
 |---|---|---|
-| Structured model inspection (`dump_model`, `trees_to_dataframe`) | Any tooling that reads tree structure | `model_to_string()`, which is a serialization format and not a schema |
+| Inspection names at the package top level | `import mojoboost; mojoboost.dump_model` | `from mojoboost.inspection import dump_model`, which works today |
+| `trees_to_dataframe` without pandas | Dependency-free environments | `trees_to_records`, the same rows as dicts |
 | Continued training from an estimator | `fit` has no `init_model` | The functional API, `Dataset` plus `train(init_model=...)` |
 | Early stopping in the functional API | `train()` keeps no per-round history | The estimators' `fit` |
 | Continued training for ranking | LambdaRank state is not in the ensemble | None; retrain |

@@ -119,11 +119,15 @@ python -m compileall -q examples/apple_silicon
   it wins where the two disagree. No edit needed if that file lands under
   that name. If it lands under a different name, fix the reference in
   `TIMINGS.md`.
+- `docs/GPU_VALIDATION.md` is linked from the example's unsupported hardware
+  section as the record of what has actually been exercised on which device.
+  That link is live today and needs nothing from anyone.
 - `docs/LIGHTGBM_PARITY.md` is referenced from the example README as the
   authority on what matches LightGBM. If `tools/check_parity.py` grows a
   check that cited paths exist, note that this example cites
   `src/mojoboost/device.mojo`, `src/mojoboost/metrics.mojo`,
-  `bench/bench_train_gpu.mojo`, and `python/setup.py`.
+  `src/mojoboost/parallel.mojo`, `bench/bench_train_gpu.mojo`,
+  `docs/GPU_VALIDATION.md`, and `python/setup.py`.
 
 ### 6. Follow up edits the other lanes force
 

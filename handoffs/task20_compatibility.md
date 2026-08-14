@@ -241,6 +241,48 @@ These were found in files this lane may not edit. None was changed.
    prose can cite a script that is known to work. That is a build lane's
    job, not a doc lane's.
 
+## Collisions with lanes that landed mid-round
+
+Two peer lanes landed documents that overlap sections of the policy while
+it was being written. Both are now cross-referenced rather than
+duplicated, because two documents claiming the same authority is worse
+than one document with a pointer.
+
+1. **`docs/MODEL_INSPECTION_SCHEMA.md`, plus
+   `python/mojoboost/inspection.py` and `src/mojoboost/inspection.mojo`.**
+   The policy's first draft said there was no `dump_model` and no
+   `trees_to_dataframe`. Both exist now, with a versioned schema. Three
+   things changed as a result. Section 1.4 gained a `DUMP_FORMAT_VERSION`
+   row, section 8.1 was rewritten to point at the schema document as the
+   authority for the dump's contents, and the walkthrough's inspection
+   section now shows the real calls.
+
+   **The open question this created, which needs an owner.**
+   `inspection` is a submodule with its own `__all__` and nothing in it
+   is re-exported from `python/mojoboost/__init__.py`. Policy section 6.1
+   says no submodule other than `mojoboost.callback` is a supported
+   import path, so as the tree stands `mojoboost.inspection.dump_model`
+   is real, documented, and formally outside the public surface. Either
+   re-export the names at the top level the way the callback names are,
+   or add `mojoboost.inspection` to the supported import paths. It is
+   release gate item C5. This lane cannot do either, because both live in
+   files it may not edit.
+
+2. **`docs/PLATFORM_MATRIX.md` and `packaging/matrix/`.** That lane owns
+   installable targets and has a machine-readable half plus a validator.
+   Section 10 now opens by saying which document answers which question:
+   the matrix is authoritative for artifacts, and section 10 is about
+   what a release promises and what evidence a tier demands. The two
+   vocabularies were deliberately not merged. Section 10.3 was also
+   corrected: the macOS wheel was built locally once, which under the
+   matrix's own rule is `designed` and not `validated`, and the policy
+   now says so in those words. `validate_matrix.py` was added to the
+   release gate as item A7.
+
+If either lane's owner disagrees with how the boundary was drawn, this
+document is the one that should move. Both of those documents are closer
+to their subject than this one is.
+
 ## What this lane deliberately did not do
 
 - Did not touch `docs/LIGHTGBM_PARITY.md`. No parity status was set,

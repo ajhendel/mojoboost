@@ -260,7 +260,19 @@ def check_differential(ok, config, verdict, skip_scenarios):
 
 
 def check_baseline(ok, config, verdict):
+    # One check per cell rather than per repeat. Repeats of a deterministic
+    # trainer score identically, and three copies of the same line makes a
+    # verdict harder to read for no information.
+    cells = {}
     for record in ok:
+        key = (
+            record["scenario"], record["engine"],
+            record.get("device_used") or record.get("device_requested"),
+            record["threads"],
+        )
+        cells.setdefault(key, record)
+
+    for record in cells.values():
         rules = scenario_rules(config, record)
         rule = rules.get("baseline")
         if not rule:

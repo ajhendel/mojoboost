@@ -54,23 +54,6 @@ OVERFIT = {
 }
 
 
-#: The same, for a classifier, so the higher-is-better direction has
-#: something to stop on too.
-BIN_OVERFIT = {
-    "objective": "binary",
-    "num_leaves": 15,
-    "learning_rate": 0.3,
-    "min_data_in_leaf": 2,
-}
-
-
-def _weak_binary(n_rows=120, seed=17):
-    gen = np.random.default_rng(seed)
-    X = gen.random((n_rows, 4))
-    score = 0.5 * X[:, 0] + gen.standard_normal(n_rows)
-    return X, (score > np.median(score)).astype(np.int64)
-
-
 def _imbalanced(n_rows=120, seed=5):
     gen = np.random.default_rng(seed)
     X = gen.random((n_rows, 3))
@@ -562,24 +545,46 @@ def test_early_stopping_can_watch_the_first_metric_only():
     assert len(results["valid l1-mean"]) == len(results["valid l2-mean"])
 
 
-def test_early_stopping_reads_a_higher_is_better_metric_the_right_way():
-    """`auc` improves upward, and the rule has to know it.
+def test_early_stopping_reads_a_higher_is_better_metric_the_right_way(
+    regression,
+):
+    """A metric that improves upward, on a curve chosen rather than hoped for.
 
-    A direction the stopping rule reads backwards stops on the first round
-    every time and still looks plausible, so the metric that goes the other
-    way is worth its own test.
+    A direction the rule reads backwards stops on the first round every time
+    and still looks plausible, and a real metric that happens to peak on
+    round 1 cannot tell the two apart. So the curve here is scripted: it
+    rises to a peak on round 3 and falls after, and patience of 2 puts the
+    stop on round 5 with round 3 the winner. Read backwards, the same run
+    would stop on round 3 and keep round 1.
     """
-    X, y = _weak_binary()
+    X, y = regression
+    curve = [0.1, 0.4, 0.9, 0.5, 0.4, 0.3, 0.2, 0.1]
+    calls = []
+
+    def scripted(y_true, y_pred):
+        value = curve[len(calls) // 2]  # two folds, so two calls per round
+        calls.append(value)
+        return value
+
     results = cv(
-        BIN_OVERFIT,
+        REG,
         Dataset(X, label=y),
-        num_boost_round=40,
-        nfold=3,
-        metrics="auc",
-        early_stopping_rounds=3,
+        num_boost_round=8,
+        nfold=2,
+        metrics=("scripted", scripted, True),
+        early_stopping_rounds=2,
     )
-    assert 1 < len(results["valid auc-mean"]) < 40
-    assert results["valid auc-mean"][-1] == max(results["valid auc-mean"])
+    assert results["iterations"] == [1, 2, 3]
+    assert results["valid scripted-mean"] == [0.1, 0.4, 0.9]
+
+
+def test_a_higher_is_better_metric_is_reported(binary):
+    X, y = binary
+    results = cv(BIN, Dataset(X, label=y), num_boost_round=3, nfold=3,
+                 metrics="auc")
+    history = results["valid auc-mean"]
+    assert len(history) == 3
+    assert all(0.0 <= value <= 1.0 for value in history)
 
 
 def test_min_delta_raises_the_bar_an_improvement_must_clear(regression):

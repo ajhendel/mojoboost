@@ -128,7 +128,38 @@ module today (`_mojoboost` currently exports `fit`, `fit_multiclass`,
   existing `load` / `load_multiclass`, so a new format would break
   `to_local`, pickling, and distributed prediction at once.
 
-### 3. Capability declarations
+### 3. Mapping a `WorldPlan` onto `TransportConfig`
+
+Read from `src/mojoboost/distributed_transport.mojo` as it stood on
+2026-08-14, while that lane was still working, so check it before relying on
+any of this.
+
+`TransportConfig.addresses` is indexed by rank, and rank `r` is whoever
+listens at `addresses[r]`. That is the same convention `WorldPlan.ranks`
+uses, so the two line up positionally with no reordering. Three mismatches
+have to be resolved by the backend, not by the adapter:
+
+- **A dask worker address is not a transport address.** `plan.workers[r]` is
+  something like `tcp://10.0.0.4:38921`, the worker's own port. `RankAddress`
+  wants the `host:port` a mojoboost rank listens on, which does not exist
+  until something opens it. The backend has to pick or be given a port per
+  rank and build the list; the host is the one in the dask address.
+- **`plan.addresses_unique` is False when two ranks share a worker**, which
+  is legal under `one_rank_per_worker=False`. `TransportConfig.validate`
+  rejects duplicate addresses, so those ranks need distinct ports on the
+  same host. Check the flag rather than assuming.
+- **`job_id` is the backend's to generate.** `TrainingJob` has no such
+  field on purpose: a transport job id is a property of the launch, not of
+  the training request, and the client has no way to make one that every
+  rank agrees on. Whatever generates it has to give every rank the same
+  value.
+
+`TrainingJob.timeout` is seconds as a float and `TransportConfig` takes
+nanoseconds in two separate deadlines (`connect_timeout_ns`,
+`collective_timeout_ns`). The adapter has one number and no opinion about
+how it splits; deciding that is part of writing the backend.
+
+### 4. Capability declarations
 
 `CAPABILITIES` in `python/mojoboost/dask.py` is the vocabulary:
 `regression`, `binary`, `multiclass`, `ranking`, `categorical`, `weights`,
@@ -145,7 +176,7 @@ fit fail with a message naming what is missing.
 Add a capability name here only by editing `CAPABILITIES`; an undeclared
 name is rejected at registration so a typo cannot read as a missing feature.
 
-### 4. Error and lifecycle semantics the adapter assumes
+### 5. Error and lifecycle semantics the adapter assumes
 
 - `train` raises on failure. Any exception propagates to the caller of
   `fit`, and the estimator is left unfitted (`fit` calls `_reset_fitted`
@@ -159,7 +190,7 @@ name is rejected at registration so a typo cannot read as a missing feature.
   run, `train` has to handle it, and the adapter needs a follow-up.
 - The adapter never retries. Nothing here is a retry loop.
 
-### 5. Integration edits this lane did not make
+### 6. Integration edits this lane did not make
 
 Each of these is in a central or shared file and was left alone on purpose:
 

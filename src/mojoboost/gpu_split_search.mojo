@@ -19,7 +19,7 @@ instead of a histogram.
 Nothing here is wired into the trainer yet; `handoffs/apple_a2_split_search.md`
 carries the exact integration. The module is standalone and testable on its
 own: it owns a histogram buffer that a caller can upload to directly, and
-`enqueue` also accepts an external device pointer for the zero-copy path.
+`enqueue` also accepts an external device buffer for the zero-copy path.
 
 Semantics
 ---------
@@ -108,7 +108,6 @@ from .monotone import (
     MONOTONE_DECREASING,
     MONOTONE_FREE,
     MONOTONE_INCREASING,
-    NO_BOUND,
     OutputBounds,
 )
 from .split import SplitInfo
@@ -268,7 +267,9 @@ def gpu_split_gain(
             + right_g * right_g / (right_h + lambda_l2)
             - parent_score
         )
-    var left_out = gpu_clamp(-left_g / (left_h + lambda_l2), bound_lo, bound_hi)
+    var left_out = gpu_clamp(
+        -left_g / (left_h + lambda_l2), bound_lo, bound_hi
+    )
     var right_out = gpu_clamp(
         -right_g / (right_h + lambda_l2), bound_lo, bound_hi
     )
@@ -927,6 +928,67 @@ def _bitset_from_words(words: List[Int32], offset: Int) -> CatBitset:
 # --- Host-side searcher ---------------------------------------------------
 
 
+def _launch_search(
+    mut ctx: DeviceContext,
+    mut hist: DeviceBuffer[DType.int32],
+    mut feat: DeviceBuffer[DType.int32],
+    mut allow: DeviceBuffer[DType.int32],
+    mut missing: DeviceBuffer[DType.int32],
+    mut catn: DeviceBuffer[DType.int32],
+    mut mono: DeviceBuffer[DType.int32],
+    mut fparam: DeviceBuffer[DType.float32],
+    mut slot_i: DeviceBuffer[DType.int32],
+    mut slot_f: DeviceBuffer[DType.float32],
+    mut rec_i: DeviceBuffer[DType.int32],
+    mut rec_f: DeviceBuffer[DType.float32],
+    n_bins: Int,
+    hist_size: Int,
+    n_slots: Int,
+    min_data_in_leaf: Int,
+    constrained: Bool,
+    cat_onehot_max: Int,
+    cat_max_threshold: Int,
+    cat_min_group: Int,
+    record: Int,
+) raises:
+    """Enqueue the two kernels of one node's search.
+
+    A free function over the context and the buffers rather than a method, so
+    the histogram buffer is an ordinary argument whether it belongs to this
+    searcher or to the histogram builder next to it."""
+    ctx.enqueue_function[_scan_slot_kernel](
+        hist.unsafe_ptr(),
+        feat.unsafe_ptr(),
+        allow.unsafe_ptr(),
+        missing.unsafe_ptr(),
+        catn.unsafe_ptr(),
+        mono.unsafe_ptr(),
+        fparam.unsafe_ptr(),
+        slot_i.unsafe_ptr(),
+        slot_f.unsafe_ptr(),
+        Int32(n_bins),
+        Int32(hist_size),
+        Int32(min_data_in_leaf),
+        Int32(1) if constrained else Int32(0),
+        Int32(cat_onehot_max),
+        Int32(cat_max_threshold),
+        Int32(cat_min_group),
+        grid_dim=n_slots,
+        block_dim=1,
+    )
+    ctx.enqueue_function[_reduce_slots_kernel](
+        slot_i.unsafe_ptr(),
+        slot_f.unsafe_ptr(),
+        rec_i.unsafe_ptr(),
+        rec_f.unsafe_ptr(),
+        fparam.unsafe_ptr(),
+        Int32(n_slots),
+        Int32(record),
+        grid_dim=1,
+        block_dim=1,
+    )
+
+
 struct GpuSplitSearcher(Movable):
     """Device-resident split search for one dataset shape.
 
@@ -1187,7 +1249,7 @@ struct GpuSplitSearcher(Movable):
 
     def enqueue(
         mut self,
-        hist: MutPointer[Int32, MutAnyOrigin],
+        mut hist: DeviceBuffer[DType.int32],
         params: GpuSplitParams,
         g_scale: Float64,
         h_scale: Float64,
@@ -1197,7 +1259,7 @@ struct GpuSplitSearcher(Movable):
         """Enqueue the scan and reduction over `hist`, writing record slot
         `record`. Does not transfer or synchronize.
 
-        `hist` is a device pointer to `3 * n_features * n_bins` Int32 words in
+        `hist` is a device buffer of `3 * n_features * n_bins` Int32 words in
         `GpuHistogramBuilder`'s `[grad | hess | count]` layout, and `g_scale`
         / `h_scale` are the fixed-point scales that histogram was accumulated
         with (`builder.g_scale`, `builder.h_scale`).
@@ -1212,37 +1274,28 @@ struct GpuSplitSearcher(Movable):
         if record < 0 or record >= self.max_records:
             raise Error("record index out of range")
         self._upload_params(params, g_scale, h_scale, bounds)
-        var n_slots = len(self.active)
-        self.ctx.enqueue_function[_scan_slot_kernel](
+        _launch_search(
+            self.ctx,
             hist,
-            self.feat_dev.unsafe_ptr(),
-            self.allow_dev.unsafe_ptr(),
-            self.missing_dev.unsafe_ptr(),
-            self.catn_dev.unsafe_ptr(),
-            self.mono_dev.unsafe_ptr(),
-            self.fparam_dev.unsafe_ptr(),
-            self.slot_i_dev.unsafe_ptr(),
-            self.slot_f_dev.unsafe_ptr(),
-            Int32(self.n_bins),
-            Int32(self.n_features * self.n_bins),
-            Int32(params.min_data_in_leaf),
-            Int32(1) if self.constrained else Int32(0),
-            Int32(params.cat.max_cat_to_onehot),
-            Int32(params.cat.max_cat_threshold),
-            Int32(params.cat.min_data_per_group),
-            grid_dim=n_slots,
-            block_dim=1,
-        )
-        self.ctx.enqueue_function[_reduce_slots_kernel](
-            self.slot_i_dev.unsafe_ptr(),
-            self.slot_f_dev.unsafe_ptr(),
-            self.rec_i_dev.unsafe_ptr(),
-            self.rec_f_dev.unsafe_ptr(),
-            self.fparam_dev.unsafe_ptr(),
-            Int32(n_slots),
-            Int32(record),
-            grid_dim=1,
-            block_dim=1,
+            self.feat_dev,
+            self.allow_dev,
+            self.missing_dev,
+            self.catn_dev,
+            self.mono_dev,
+            self.fparam_dev,
+            self.slot_i_dev,
+            self.slot_f_dev,
+            self.rec_i_dev,
+            self.rec_f_dev,
+            self.n_bins,
+            self.n_features * self.n_bins,
+            len(self.active),
+            params.min_data_in_leaf,
+            self.constrained,
+            params.cat.max_cat_to_onehot,
+            params.cat.max_cat_threshold,
+            params.cat.min_data_per_group,
+            record,
         )
 
     def enqueue_pick_best(
@@ -1311,8 +1364,32 @@ struct GpuSplitSearcher(Movable):
     ) raises -> GpuSplitRecord:
         """Search the histogram staged by `upload_histogram` and return its
         record."""
-        var hist = self.hist_dev.unsafe_ptr()
-        self.enqueue(hist, params, g_scale, h_scale, bounds, record)
+        if record < 0 or record >= self.max_records:
+            raise Error("record index out of range")
+        self._upload_params(params, g_scale, h_scale, bounds)
+        _launch_search(
+            self.ctx,
+            self.hist_dev,
+            self.feat_dev,
+            self.allow_dev,
+            self.missing_dev,
+            self.catn_dev,
+            self.mono_dev,
+            self.fparam_dev,
+            self.slot_i_dev,
+            self.slot_f_dev,
+            self.rec_i_dev,
+            self.rec_f_dev,
+            self.n_bins,
+            self.n_features * self.n_bins,
+            len(self.active),
+            params.min_data_in_leaf,
+            self.constrained,
+            params.cat.max_cat_to_onehot,
+            params.cat.max_cat_threshold,
+            params.cat.min_data_per_group,
+            record,
+        )
         return self.download(record)
 
 

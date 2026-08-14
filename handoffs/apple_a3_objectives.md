@@ -204,9 +204,22 @@ from .gpu_objectives_native import (
         state.update_raw(self.ctx, self.leaf_dev, values, learning_rate, k)
 ```
 
-A multiclass round adds `state.refresh_softmax(self.ctx)` once and
-`state.fill_softmax_grad_hess(self.ctx, k, self.grad_dev, self.hess_dev)` per
-class, with the same two scale lines after each.
+A multiclass round in `train_multiclass_gpu` is the same shape with three
+differences, all of them easy to get wrong:
+
+- `refresh_softmax` runs **once per round**, before the class loop, not once
+  per class. Every class's gradients read the one probability pass, which is
+  what the host trainer does too.
+- `update_raw_device` takes the class index: `builder.update_raw_device(
+  state, tree.value, params.learning_rate, k)`, inside the class loop, after
+  that class's `grow_tree_gpu`. Omitting `k` silently advances class 0 for
+  every class.
+- The host `prob` list stops being maintained, and `_multiclass_goss_select`
+  reads it. So multiclass GOSS has to stay on the host path, for the same
+  reason single-output GOSS does.
+
+The base scores are already a `List[Float64]` of log priors, so
+`state.init_raw(builder.ctx, base_scores)` takes them unchanged.
 
 Then `train_gpu` (train_gpu.mojo, lines 417 to 449) becomes:
 
@@ -238,6 +251,15 @@ Then `train_gpu` (train_gpu.mojo, lines 417 to 449) becomes:
 `_fill_grad_hess`, the `grad`/`hess` host lists, and the per-row `raw[r] +=
 learning_rate * tree.predict_row(data, r)` loop all disappear from the round.
 `raw` is only materialized where something host-side still reads it.
+
+One behavior change to expect from that, for quantile and L1 only: the raw
+scores `_renew_leaf_values` sees now come back through Float32, where before
+they were the host's Float64 running sum. The residuals feeding the weighted
+percentile therefore carry Float32 precision, which can move a renewed leaf
+value when two residuals sit within a Float32 ulp of each other. Everything
+else about renewal is unchanged. `tests/test_gpu_objectives.mojo` compares
+GPU against CPU training with a mean-absolute tolerance and a separate loss
+assertion, so it is the right place to see whether this is visible at all.
 
 Deduplicating the scale, one edit in histogram_gpu.mojo so there is a single
 definition rather than two that have to stay in step:

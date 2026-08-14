@@ -318,7 +318,12 @@ struct RouteResult(Copyable, Movable):
 
 @fieldwise_init
 struct Phase(Copyable, Movable):
-    """Accumulator for the per-round phase timings of one route."""
+    """Accumulator for the per-round phase timings of one route.
+
+    The six phases are disjoint and sum to the round, `contend_ns`
+    included: the contention work runs on this thread, so it is round time
+    like any other. Leaving it out of the total would make a contended run
+    look cheaper than an uncontended one, which is backwards."""
 
     var write_ns: Int
     var publish_ns: Int
@@ -344,7 +349,12 @@ struct Phase(Copyable, Movable):
         contend_ns: Int,
     ):
         var total = (
-            write_ns + publish_ns + kernel_ns + sync_ns + readback_ns
+            write_ns
+            + publish_ns
+            + kernel_ns
+            + contend_ns
+            + sync_ns
+            + readback_ns
         )
         self.write_ns += write_ns
         self.publish_ns += publish_ns

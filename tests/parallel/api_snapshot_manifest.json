@@ -43,15 +43,17 @@
       "python.estimators.*.objective_names",
       "mojo.objective_codes, mojo.internal_frozen_helpers",
       "parameter_string.supported_keys",
-      "cli, model_format.sections, inspection, environment_variables",
+      "cli, model_format.sections, environment_variables",
       "platforms tiers above tier 1, artifacts, numerical_contracts"
     ],
-    "note": "the checked list is a fact about the tree at the time of the check, not a substitute for tools/api_snapshot.py. Nothing re-runs it."
+    "note": "the checked list is a fact about the tree at the time of the check, not a substitute for tools/api_snapshot.py. Nothing re-runs it.",
+    "amended_after_the_check": "the inspection block was rewritten after mojoboost.inspection landed mid-round; its all list and dump_format_version were read from python/mojoboost/inspection.py directly rather than by the cross-check script"
   },
   "versions": {
     "library": "0.1.0",
     "c_abi": 1,
     "model_format": "v3",
+    "dump_format": 1,
     "snapshot_schema": 1,
     "python_wheel_tag": "cp314-cp314-macosx_26_0_arm64",
     "requires_python": ">=3.14",
@@ -595,8 +597,28 @@
     "absent_by_design": ["num_leaves", "regularization", "interaction constraints", "subsampling", "split gains", "feature names", "training device"]
   },
   "inspection": {
-    "structured_dump": null,
-    "structured_dump_note": "no dump_model and no trees_to_dataframe; when added, it gets its own schema version",
+    "module": "mojoboost.inspection",
+    "dump_format_version": 1,
+    "schema_document": "docs/MODEL_INSPECTION_SCHEMA.md",
+    "implementations": ["python/mojoboost/inspection.py", "src/mojoboost/inspection.mojo"],
+    "all": [
+      "DUMP_FORMAT_VERSION",
+      "SUPPORTED_MODEL_FORMAT_VERSIONS",
+      "OBJECTIVE_NAMES",
+      "dump_model",
+      "parse_model_string",
+      "trees_to_records",
+      "trees_to_dataframe",
+      "split_values",
+      "get_split_value_histogram",
+      "leaf_index_of",
+      "raw_scores",
+      "booster_of"
+    ],
+    "reexported_at_top_level": false,
+    "open_question": "not in mojoboost.__all__ and not a supported import path under compatibility policy section 6.1; release gate item C5",
+    "pandas_required_for": ["trees_to_dataframe"],
+    "capability_flags": ["has_split_gain", "has_node_count"],
     "available": [
       "Booster.model_to_string",
       "feature_importances_",

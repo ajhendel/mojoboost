@@ -15,6 +15,7 @@ from std.os import remove
 from std.testing import assert_equal, assert_raises, assert_true, TestSuite
 
 from mojoboost.boosting import (
+    BINARY_LOGISTIC,
     CUSTOM,
     SQUARED_ERROR,
     Booster,
@@ -130,9 +131,9 @@ def _regression_text() -> String:
 
 def _stump_text(
     decision_type: String,
-    threshold: String = "-1",
-    header_extra: String = "",
-    tree_extra: String = "",
+    threshold: String = String("-1"),
+    header_extra: String = String(""),
+    tree_extra: String = String(""),
 ) -> String:
     """One feature, one stump: `x <= threshold` gives 1.0, otherwise -1.0.
 
@@ -389,8 +390,8 @@ def test_reads_multiclass_model() raises:
 
 
 def test_kind_dispatch_and_cross_loader_errors() raises:
-    assert_equal(lgbm_text_kind(_regression_text()), "objective")
-    assert_equal(lgbm_text_kind(_multiclass_text()), "multiclass")
+    assert_equal(lgbm_text_kind(_regression_text()), String("objective"))
+    assert_equal(lgbm_text_kind(_multiclass_text()), String("multiclass"))
     with assert_raises():
         _ = parse_lgbm_model(_multiclass_text())
     with assert_raises():
@@ -400,7 +401,7 @@ def test_kind_dispatch_and_cross_loader_errors() raises:
 def test_file_roundtrip_on_disk() raises:
     var model = parse_lgbm_model(_regression_text())
     save_lgbm_model(model, _TMP_PATH)
-    assert_equal(lgbm_model_file_kind(_TMP_PATH), "objective")
+    assert_equal(lgbm_model_file_kind(_TMP_PATH), String("objective"))
     var loaded = load_lgbm_model(_TMP_PATH)
     var row: List[Float64] = [1.0, 9.0]
     assert_equal(loaded.predict(row), model.predict(row))
@@ -542,7 +543,9 @@ def test_rejects_text_that_is_not_a_lgbm_model() raises:
 
 def test_objective_mapping_and_its_rejections() raises:
     assert_equal(lgbm_objective_code(String("regression")), SQUARED_ERROR)
-    assert_equal(lgbm_objective_code(String("binary sigmoid:1")), 1)
+    assert_equal(
+        lgbm_objective_code(String("binary sigmoid:1")), BINARY_LOGISTIC
+    )
     # A non-unit sigmoid would change every probability.
     with assert_raises():
         _ = lgbm_objective_code(String("binary sigmoid:2"))
@@ -678,7 +681,16 @@ def _make_dataset(
         target.append(3.0 * x1 + (0.0 if r % 7 == 0 else 2.0 * x0 * x1))
 
 
-def test_trained_model_survives_the_round_trip_bit_exactly() raises:
+def test_trained_model_survives_the_round_trip() raises:
+    """A shrunk model round-trips to within a few ULP, and the model that
+    comes back round-trips bit-exactly from then on.
+
+    The first hop cannot be exact: the predictor accumulates
+    `score += learning_rate * leaf_value`, which fuses into one rounded
+    multiply-add, while the file has to store `learning_rate * leaf_value`
+    already rounded. Once the rate is folded in (`learning_rate == 1.0`) the
+    multiply is exact and every later hop is bit-for-bit.
+    """
     var n_rows = 240
     var features = List[Float64]()
     var target = List[Float64]()
@@ -699,16 +711,29 @@ def test_trained_model_survives_the_round_trip_bit_exactly() raises:
     assert_equal(back.booster.base_score, 0.0)
     assert_equal(back.n_iterations(), model.n_iterations())
 
+    # Reading `back` back out again starts from learning_rate 1.0, so from
+    # here the conversion is exact.
+    var again = parse_lgbm_model(dump_lgbm_model(back))
+
     for r in range(n_rows):
         var row: List[Float64] = [features[r], features[n_rows + r]]
-        assert_equal(back.predict(row), model.predict(row))
+        var want = model.predict(row)
+        var got = back.predict(row)
+        var scale = abs(want) if abs(want) > 1.0 else 1.0
+        assert_true(
+            abs(got - want) <= 1e-12 * scale,
+            String("row ", r, ": ", got, " vs ", want),
+        )
+        assert_equal(again.predict(row), got)
 
     # Values the model never saw, including a missing first feature, which
     # only routes the same way if the reserved missing bin survived.
     var unseen: List[Float64] = [_nan(), 0.5]
-    assert_equal(back.predict(unseen), model.predict(unseen))
+    assert_true(abs(back.predict(unseen) - model.predict(unseen)) < 1e-12)
+    assert_equal(again.predict(unseen), back.predict(unseen))
     var extreme: List[Float64] = [1e300, -1e300]
-    assert_equal(back.predict(extreme), model.predict(extreme))
+    assert_true(abs(back.predict(extreme) - model.predict(extreme)) < 1e-12)
+    assert_equal(again.predict(extreme), back.predict(extreme))
 
 
 def main() raises:

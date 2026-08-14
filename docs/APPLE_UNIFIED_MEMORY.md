@@ -166,7 +166,7 @@ is the contract lane A8's schema should be written against.
 | `kernel_ns` | memset plus kernel enqueue, mean |
 | `sync_ns` | the synchronize that follows, mean |
 | `readback_ns` | reading the checksum back, mean |
-| `contend_ns` | host time spent inside the launch window, when contention mode is on |
+| `contend_ns` | host work inside the launch window, when contention mode is on; disjoint from `sync_ns` and part of the round |
 | `round_mean_ns`, `round_min_ns` | steady-state round cost |
 | `host_alloc_bytes`, `device_alloc_bytes`, `allocated_bytes` | what the route allocated on each side, and their sum |
 | `checksum`, `expected` | the correctness gate |
@@ -187,11 +187,20 @@ Round 0 is always reported separately from the steady state. A mean that folds
 first touch into the recurring cost hides the single number this whole
 experiment is about. Page migration, if it happens, happens once.
 
-`contend_ns` is host time and it overlaps `sync_ns` by construction; it is not
-an addend of the round. The device-side cost of that contention is visible as
-a longer `sync_ns` in the same round, which is why the contention comparison
-has to be run as two whole runs, one with `MOJOBOOST_UM_CONTEND=1` and one
-without, rather than read out of a single run.
+`contend_ns` and `sync_ns` are disjoint, and both are round time. The
+contention work runs on the same thread that later waits, so it is serialized
+before the wait rather than overlapped with it; timing the two together would
+book host time as device wait and manufacture a contention effect that is not
+there. What overlaps is the device work, which has a consequence worth knowing
+before reading a contended run: if the host work outlasts the kernel, `sync_ns`
+collapses toward zero and the contention shows up in `contend_ns` and in the
+round total instead. A near-zero `sync_ns` under contention is therefore not
+evidence that the device was unaffected.
+
+Because of that, the contention question can only be answered by comparing two
+whole runs, one with `MOJOBOOST_UM_CONTEND=1` and one without, on the same
+payload size. Read `round_mean_ns` and `kernel_ns + sync_ns` across the pair.
+Never read contention out of a single run.
 
 ### The correctness gate
 

@@ -50,6 +50,36 @@ therefore has two distinct negative statuses, `unsupported` (raised at runtime)
 and `not_probed` (never compiled), and the doc's promotion procedure treats a
 compile failure as a recordable result rather than a blocker.
 
+## Two methodology decisions a reviewer should check
+
+Neither is obvious from reading the driver quickly, and both are places where
+the easy version of the code produces a number that means something other than
+what it is labelled.
+
+1. **`copy_direct` performs a full-size host write, it does not skip one.**
+   The tempting version copies straight from the caller's `List` and does no
+   staging write at all. That varies two things at once against `copy_staged`
+   (pinned versus unpinned staging, *and* write versus no write), so the
+   resulting difference cannot be attributed to either. It also would not model
+   the trainer, whose `stage_gradients` must write its Float64-to-Float32
+   conversion into some buffer regardless. So `copy_direct` stages into a plain
+   heap `List` of the same size and the single variable is pinning. The
+   round-0 comparison between these two routes is still not clean, because the
+   heap `List` is faulted in by its own construction while the pinned buffer's
+   residency is the runtime's business; that caveat is stated in both the
+   driver and the doc, and the steady-state comparison is the one to read.
+
+2. **Contention time is timed separately from the synchronize, and is counted
+   in the round.** The host contention work runs on the same thread that then
+   waits, so wrapping both in one span would book host time as device wait and
+   manufacture a contention effect out of nothing. `contend_ns` and `sync_ns`
+   are therefore disjoint. They are both in the round total, because host work
+   on the round's own thread is round time; excluding it would make a contended
+   run look cheaper than an uncontended one. The consequence to know before
+   reading a contended run is that if the host work outlasts the kernel,
+   `sync_ns` collapses toward zero, and that is not evidence the device was
+   unaffected. Contention is only answerable by comparing two whole runs.
+
 ## Proposed API changes
 
 **All of these are contingent on evidence that does not exist yet.** Nothing

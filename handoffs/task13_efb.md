@@ -15,6 +15,14 @@ Delivered in this lane, and nothing else:
 Everything below is work for other lanes or a later change. None of it was
 touched here, because every item is a central or shared file.
 
+Every cross-file claim below was checked against the working tree, not
+recalled. Note that several of the files cited — `python/mojoboost/inspection.py`,
+`src/mojoboost/inspection.mojo`, `docs/COMPATIBILITY_POLICY.md`,
+`tests/parallel/api_snapshot_manifest.json` — are themselves new and
+uncommitted from concurrent lanes in this round. They exist in the tree now;
+they will not be found in an older commit. If a lane reverts one, re-check
+the section that cites it (§10, §11, §12 are the affected ones).
+
 ---
 
 ## 1. What the core actually guarantees

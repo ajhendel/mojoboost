@@ -282,7 +282,14 @@ synchronization claims come from.
   syntax and API fixes on first build. The device-bound half (`GpuSession`)
   is the riskiest: it uses `DeviceContext()`, `query_device_caps`, and
   `ctx.synchronize()`, mirroring `histogram_gpu.mojo`, but it has not been
-  checked against the toolchain.
+  checked against the toolchain. Every construct in the file was matched
+  against an existing use in this repository rather than written from
+  memory (`raises` placement, `comptime` constants, `@fieldwise_init` with
+  field docstrings, `String` accumulation and return, `mut` free-function
+  arguments, `_ =` discards, `List` mutation in a non-raising `def`), and
+  `UInt64` equality is always taken through an `if` rather than combined
+  into a `Bool` expression, since a one-lane mask is not a `Bool`. That
+  narrows the failure surface; it does not close it.
 - **`KernelRegistry` does not hold device function handles.** The task asked
   for precompiled kernel handles. Binding real handles needs a
   `DeviceContext` compile API that this lane could not verify against the

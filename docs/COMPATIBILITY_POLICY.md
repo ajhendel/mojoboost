@@ -57,11 +57,11 @@ that voluntarily. While the major version is 0:
   the migration, in the format of section 3.4
 
 The narrowing is a discipline, not a guarantee, and it is the reason the
-snapshot manifest of section 10 exists before 1.0 rather than after.
+snapshot manifest of section 11 exists before 1.0 rather than after.
 
 ### 1.4 Version numbers that move independently
 
-Four numbers version four different things. Bumping one does not bump the
+Five numbers version five different things. Bumping one does not bump the
 others, and a release note that changes any of them says so explicitly.
 
 | Number | Where | Current | Bumps when |
@@ -69,7 +69,13 @@ others, and a release note that changes any of them says so explicitly.
 | Library version | `pixi.toml`, `pyproject.toml`, `__version__` | 0.1.0 | Any release |
 | C ABI version | `MOJOBOOST_ABI_VERSION` in `capi/mojoboost.h` | 1 | A declaration in the header changes incompatibly |
 | Model format version | `_VERSION` in `src/mojoboost/serialize.mojo` | v3 | The file format gains or changes a section |
+| Dump schema version | `DUMP_FORMAT_VERSION` in `python/mojoboost/inspection.py` | 1 | A dump key is removed, retyped, or given a new meaning |
 | Snapshot schema version | `schema_version` in `tests/parallel/api_snapshot_manifest.json` | 1 | The manifest's own shape changes |
+
+The model format version and the dump schema version are independent and
+both appear in a dump, which is deliberate. `model_format_version` says
+which optional facts a model of that vintage can carry at all, and
+`dump_format_version` says what the dump's own keys mean.
 
 ## 2. What is public
 
@@ -279,8 +285,9 @@ of every validation set's every metric; the equivalent grid lives in
 This is a real divergence from LightGBM's scikit-learn API and it is not
 settled. Changing the type of `best_score_` to a dict would be a breaking
 change under section 5.2, so it has to happen before the first tagged
-release or wait for a major one. It is on the release gate of section 11
-as a decision that must be made, not as a decision that has been made.
+release or wait for a major one. It is on the release gate of section 12
+as item C4, a decision that must be made rather than one that has been
+made.
 
 ## 6. Language bindings
 
@@ -306,6 +313,7 @@ The policy from the first release onward:
 **Import surface.** `import mojoboost` gives the names in `__all__`, and
 `mojoboost.callback` gives the callback factories under their own module,
 as LightGBM does. No other submodule is a supported import path.
+`mojoboost.inspection` is the open case; see section 8.1.
 
 **numpy.** Optional. Every documented path works with plain Python
 sequences, and this stays true. numpy is never a hard dependency.
@@ -459,9 +467,33 @@ Adding one of these to the format later is a format change under section
 
 ### 8.1 What structured inspection exists
 
-There is no `dump_model` and no `trees_to_dataframe`. That is a stated
-gap, not an oversight; structured inspection is its own piece of work.
-What exists today, and what it guarantees:
+Structured inspection landed while this document was being written, as
+`python/mojoboost/inspection.py` and `src/mojoboost/inspection.mojo`,
+with `dump_model`, `trees_to_dataframe`, `trees_to_records`,
+`split_values`, `get_split_value_histogram`, `leaf_index_of`,
+`raw_scores`, and `booster_of`. Its normative schema is
+[docs/MODEL_INSPECTION_SCHEMA.md](MODEL_INSPECTION_SCHEMA.md), and that
+document, not either implementation, is what a consumer reads.
+
+It arrived with the version this policy asked for. `DUMP_FORMAT_VERSION`
+is 1, it bumps only for a key removed, retyped, or given a new meaning,
+and adding an optional key does not bump it, so a consumer must ignore
+keys it does not know. That is the rule, and it is the schema doc's to
+keep rather than this one's.
+
+**One thing is unresolved, and it is a section 2 question.** `inspection`
+is a submodule with its own `__all__`. Nothing in it is re-exported from
+`python/mojoboost/__init__.py`, and section 6.1 says no submodule except
+`mojoboost.callback` is a supported import path. So as the tree stands,
+`mojoboost.inspection.dump_model` is real, documented, and formally
+outside the public surface. Two ways to close that, and one of them has
+to happen before the first tagged release: re-export the inspection names
+at the top level the way the callback names are, or add
+`mojoboost.inspection` to the supported import paths in section 6.1. The
+release gate carries it as item C5.
+
+The rest of what a fitted model will tell you, and what each part
+guarantees:
 
 | Surface | Shape | Stability |
 |---|---|---|
@@ -473,9 +505,10 @@ What exists today, and what it guarantees:
 | `booster_` accessors | `current_iteration`, `num_trees`, `num_model_per_iteration`, `num_feature`, `feature_name` | Stable |
 | `Dataset` accessors | `num_data`, `num_feature`, `num_bin`, `feature_name`, `categorical_feature`, `get_label`, `get_weight`, `get_group`, `get_init_score`, `get_data`, `get_field` | Stable |
 
-When structured inspection is added it gets a schema version of its own,
-in the manner of section 1.4, and that version is what this policy will
-cover. A JSON blob without a version is not a contract.
+Every one of those is covered by this policy on the terms of section 1.2.
+The dump's contents are covered by its own schema document and its own
+version, which is the arrangement section 1.4 describes. A JSON blob
+without a version is not a contract; this one has a version.
 
 ### 8.2 Leaf identifiers
 
@@ -615,6 +648,23 @@ so it changes results within the documented tolerance.
 
 ## 10. Supported platforms
 
+### 10.0 Which document is authoritative
+
+Two documents describe platforms and they answer different questions.
+[docs/PLATFORM_MATRIX.md](PLATFORM_MATRIX.md), with its machine-readable
+half `packaging/matrix/platform_matrix.toml` and the
+`validate_matrix.py` that checks the two against each other, is the
+authority on **installable targets**: which artifact exists for a place,
+what it is called, which interpreter it targets, and what evidence backs
+the claim. Where that matrix and this section disagree about an artifact,
+the matrix wins and this section is the bug.
+
+This section answers a different question, which is **what a release
+promises about a platform** and what has to be true before the promise
+can be made. The two vocabularies are not the same and should not be
+merged. The matrix's `validated`, `tested`, `designed`, and `unsupported`
+describe an artifact; the tiers below describe test evidence.
+
 ### 10.1 Tiers
 
 | Tier | Meaning |
@@ -650,11 +700,17 @@ tier 3 row has to produce to move.
 
 ### 10.3 Distribution
 
-The only artifact that has been built is a macOS arm64 wheel, tag
-`cp314-cp314`, platform `macosx_26_0_arm64`, bundling the four MAX runtime
-dylibs the extension links through `@rpath`. It has not been published;
-there is no PyPI release. A release note names every artifact it ships and
-its exact tag, and says plainly which platforms have no artifact.
+One wheel has been produced locally, `packaging/build_wheel.sh` on macOS
+arm64, tag `cp314-cp314`, platform `macosx_26_0_arm64`, bundling the four
+MAX runtime dylibs the extension links through `@rpath`. Nothing has been
+published and there is no PyPI release, so under the matrix's vocabulary
+every target including that one is `designed` rather than `validated`: a
+wheel that was built once on the machine that wrote it is not evidence
+that the target works.
+
+`packaging/matrix/platform_matrix.toml` is the list of targets and their
+expected filenames. A release note names every artifact it ships and its
+exact tag, and says plainly which platforms have no artifact.
 
 ### 10.4 Changing the table
 
@@ -675,10 +731,15 @@ section 2 in a machine-readable form so that a diff between two releases
 answers "what changed for a caller" without anybody having to remember.
 
 **It is a proposal in its current state.** The file was written by hand
-from a reading of the source, it has not been generated by tooling, and it
-has not been verified against a running build. Until the generator of
-section 11.3 exists and its output replaces the file, treat it as a draft
-of the shape rather than as an authority on the contents.
+from a reading of the source and has not been generated by tooling. It
+was then cross-checked mechanically against the working tree, by an `ast`
+and `re` pass that imported nothing and built nothing, and every block
+that pass could reach agreed with the tree; the manifest's `verification`
+block lists what was checked and what was not. That is one agreement at
+one moment, not a generated artifact and not a thing that re-runs. Until
+the generator of section 11.3 exists and its output replaces the file,
+treat it as a draft of the shape rather than as an authority on the
+contents.
 
 ### 11.2 How a diff is read
 
@@ -694,6 +755,8 @@ of the shape rather than as an authority on the contents.
 | `RESETTABLE` order changes | Breaking, and silently wrong, section 9.3 |
 | A C ABI declaration changes | Breaking, and requires an ABI version bump |
 | The model format version changes | Section 7, and the read-back matrix must be extended |
+| `DUMP_FORMAT_VERSION` changes | A dump key was removed, retyped, or redefined; breaking for a consumer |
+| A dump key appears | Additive, minor, and does not bump the dump version |
 | A platform tier drops | Breaking, section 10.4 |
 
 An additive diff is recorded by regenerating the manifest in the same
@@ -713,54 +776,68 @@ currently expose them.
 Every item is a hard gate. A release with an unchecked item is not cut.
 None of these items changes a parity status.
 
+Items are numbered within their letter, so an item can be inserted
+without renumbering a reference somewhere else in this document.
+
 **A. Tests and contracts**
 
-1. CI green on `ubuntu-latest` and `ubuntu-24.04-arm`, for `test`,
-   `python`, and `parity`.
-2. `pixi run test` green on osx-arm64 locally, the tier 2 CPU platform.
-3. `pixi run test-gpu` green on osx-arm64 locally, the tier 2 GPU
-   platform, or the GPU rows of section 10.2 demoted in the release notes.
-4. `pixi run check-parity` green, with `KNOWN_UNWIRED_TESTS` still empty.
-5. `pixi run -e pytest test-estimators` green.
-6. `pixi run test-c` green, or explicitly recorded as skipped for want of
-   a C compiler.
+- **A1.** CI green on `ubuntu-latest` and `ubuntu-24.04-arm`, for `test`,
+  `python`, and `parity`.
+- **A2.** `pixi run test` green on osx-arm64 locally, the tier 2 CPU
+  platform.
+- **A3.** `pixi run test-gpu` green on osx-arm64 locally, the tier 2 GPU
+  platform, or the GPU rows of section 10.2 demoted in the release notes.
+- **A4.** `pixi run check-parity` green, with `KNOWN_UNWIRED_TESTS` still
+  empty.
+- **A5.** `pixi run -e pytest test-estimators` green.
+- **A6.** `pixi run test-c` green, or explicitly recorded as skipped for
+  want of a C compiler.
+- **A7.** `python3 packaging/matrix/validate_matrix.py` green, so no row
+  of `docs/PLATFORM_MATRIX.md` claims `validated` without the evidence
+  file it names.
 
 **B. Versions**
 
-7. The three library version locations of section 1.1 agree.
-8. `MOJOBOOST_ABI_VERSION` bumped if and only if a header declaration
-   changed incompatibly.
-9. The model format `_VERSION` bumped if and only if the format changed,
-   with section 7.2's read-back matrix extended and a test that loads a
-   file of every earlier version.
-10. The snapshot manifest regenerated and its diff classified under
-    section 11.2.
+- **B1.** The three library version locations of section 1.1 agree.
+- **B2.** `MOJOBOOST_ABI_VERSION` bumped if and only if a header
+  declaration changed incompatibly.
+- **B3.** The model format `_VERSION` bumped if and only if the format
+  changed, with section 7.2's read-back matrix extended and a test that
+  loads a file of every earlier version.
+- **B4.** `DUMP_FORMAT_VERSION` bumped if and only if a dump key was
+  removed, retyped, or redefined.
+- **B5.** The snapshot manifest regenerated and its diff classified under
+  section 11.2.
 
 **C. Surface**
 
-11. `RESETTABLE` in `python/mojoboost/callback.py` checked against the
-    bridge: its length equals `RESET_SLOTS` in `bindings/_mojoboost.mojo`,
-    and its order matches the slot order of `_write_reset` and
-    `_read_reset` there, entry by entry.
-12. Every deprecation whose period has elapsed either removed with a break
-    note or explicitly extended.
-13. No new public name that lacks a docstring stating what it guarantees.
-14. `best_score_` resolved for this release, either as the scalar this
-    policy documents or as the LightGBM-shaped dict, with the decision in
-    the release notes. Section 5.4.
+- **C1.** `RESETTABLE` in `python/mojoboost/callback.py` checked against
+  the bridge: its length equals `RESET_SLOTS` in
+  `bindings/_mojoboost.mojo`, and its order matches the slot order of
+  `_write_reset` and `_read_reset` there, entry by entry.
+- **C2.** Every deprecation whose period has elapsed either removed with a
+  break note or explicitly extended.
+- **C3.** No new public name that lacks a docstring stating what it
+  guarantees.
+- **C4.** `best_score_` resolved for this release, either as the scalar
+  this policy documents or as the LightGBM-shaped dict, with the decision
+  in the release notes. Section 5.4.
+- **C5.** `mojoboost.inspection` resolved for this release, either
+  re-exported at the top level or added to the supported import paths of
+  section 6.1. Section 8.1.
 
 **D. Honesty**
 
-15. Every platform in section 10.2 carries the tier its evidence supports,
-    and any row whose evidence has gone stale is demoted before the
-    release rather than after.
-16. The release note names every artifact shipped, with its exact tag, and
-    names the platforms that get none.
-17. No document in the repository claims a benchmark result, a backend
-    validation, or a compliance suite pass that is not reproducible from
-    the repository.
-18. Any surface documented as unavailable still raises rather than
-    silently doing something approximate.
+- **D1.** Every platform in section 10.2 carries the tier its evidence
+  supports, and any row whose evidence has gone stale is demoted before
+  the release rather than after.
+- **D2.** The release note names every artifact shipped, with its exact
+  tag, and names the platforms that get none.
+- **D3.** No document in the repository claims a benchmark result, a
+  backend validation, or a compliance suite pass that is not reproducible
+  from the repository.
+- **D4.** Any surface documented as unavailable still raises rather than
+  silently doing something approximate.
 
 **E. Not on the gate**
 

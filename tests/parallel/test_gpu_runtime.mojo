@@ -668,6 +668,14 @@ def test_residency_rejects_unknown_roles_and_empty_matrices() raises:
     assert_true(not ledger.is_resident(N_ROLES, MatrixIdentity.empty()))
 
 
+def _same_fingerprint(a: UInt64, b: UInt64) -> Bool:
+    """UInt64 equality as a plain Bool, so the assertions below take a Bool
+    rather than a one-lane mask."""
+    if a == b:
+        return True
+    return False
+
+
 def test_fingerprint_covers_every_cell_and_the_shape() raises:
     """A sampled fingerprint would let a matrix that differs outside the
     sample reuse another one's device copy, so this checks a single changed
@@ -677,13 +685,13 @@ def test_fingerprint_covers_every_cell_and_the_shape() raises:
         bins.append(UInt8(i % 5))
 
     var base = bins_fingerprint(bins, 8, 8, 5)
-    assert_true(bins_fingerprint(bins, 8, 8, 5) == base)
-    assert_true(bins_fingerprint(bins, 4, 16, 5) != base)
-    assert_true(bins_fingerprint(bins, 8, 8, 6) != base)
+    assert_true(_same_fingerprint(bins_fingerprint(bins, 8, 8, 5), base))
+    assert_true(not _same_fingerprint(bins_fingerprint(bins, 4, 16, 5), base))
+    assert_true(not _same_fingerprint(bins_fingerprint(bins, 8, 8, 6), base))
 
     # The last cell, which a strided sample is most likely to miss.
     bins[63] = bins[63] + UInt8(1)
-    assert_true(bins_fingerprint(bins, 8, 8, 5) != base)
+    assert_true(not _same_fingerprint(bins_fingerprint(bins, 8, 8, 5), base))
 
 
 # ---------------------------------------------------------------------------

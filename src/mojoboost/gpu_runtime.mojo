@@ -3,7 +3,8 @@ model that says which host synchronizations are actually required.
 
 Today every GPU entry point in train_gpu.mojo constructs a fresh
 `GpuHistogramBuilder`, and that constructor opens a `DeviceContext`,
-allocates nine buffers, uploads the binned matrix, and blocks on
+allocates seven device buffers and three pinned host buffers, uploads the
+binned matrix, and blocks on
 `ctx.synchronize()`. An estimator that fits twice, that fits and then scores
 a validation matrix, or that runs a small grid search pays all of that again
 each time, on a dataset the device already holds. This module is the state
@@ -960,9 +961,13 @@ def model_upload_gradients(
     """
     var waited = False
     if staging.pending(hazards.required()):
-        staging.note_wait()
-        _ = hazards.sync_for_host_write(RES_STAGE)
-        waited = True
+        # A slot that has not retired always has an outstanding device read
+        # against it, so this drain is the same event the ring is waiting
+        # for. Counting the wait off the drain rather than off `pending`
+        # keeps the two from ever disagreeing.
+        if hazards.sync_for_host_write(RES_STAGE):
+            staging.note_wait()
+            waited = True
     else:
         hazards.elided += 1
     var slot = staging.acquire()
@@ -1202,8 +1207,8 @@ struct GpuSession(Movable):
         retired. This is the overlap: the host converts round i+1's
         gradients into another slot while round i's copy is still queued."""
         if self.staging.pending(self.hazards.required()):
-            self.staging.note_wait()
-            _ = self.sync_for_host_write(RES_STAGE)
+            if self.sync_for_host_write(RES_STAGE):
+                self.staging.note_wait()
         else:
             self.hazards.elided += 1
         return self.staging.acquire()
