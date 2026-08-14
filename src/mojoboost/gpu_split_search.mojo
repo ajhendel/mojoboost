@@ -115,16 +115,44 @@ Toward a device-side queue
 `enqueue_pick_best` reduces a set of them to the single best-gain leaf,
 tie-broken by ascending record index. The staircase this module was built
 for is: the host downloads one record per node (the incremental loop); the
-host downloads one record per *tree level* (`enqueue_frontier` plus
-`download_frontier`, which is now here); the frontier itself lives in
-`rec_i_dev`/`rec_f_dev` and the host only reads the finished tree.
+host downloads the records for a whole split at once (`enqueue_frontier`
+plus `download_frontier`, which is now here, and which the resident grower
+in `train_gpu` uses to pay one wait per split rather than two); the
+frontier itself lives in `rec_i_dev`/`rec_f_dev` and the host only reads
+the finished tree.
 
-The last step is the only one still missing, and what it needs is not in
-this module: a device-side row partition and leaf-value commit, so that a
-split can be applied without the host deciding it. Nothing in the record
-layout has to change for it, which is why the record carries child
-statistics and leaf values rather than making the host recompute them from
-a histogram it no longer has.
+Note what the middle step does *not* become under leaf-wise growth: one
+download per tree level. Leaf-wise splitting picks the best-gain leaf in
+the whole frontier, so only the two new children need searching after each
+split, and there is no level of siblings to batch. A level-wise grower is
+what would turn `enqueue_frontier` into one wait per level; for the grower
+we ship, one wait per split is the floor while the host is still deciding.
+
+`enqueue_pick_best` is the piece that would lift that floor, and it is
+built and tested but unused, because the rest of the last step is not in
+this module and is larger than it looks. The device-side row partition it
+was waiting on now exists: `GpuHistogramBuilder.apply_split` partitions a
+parent's row range entirely on the device and stays fully enqueued when the
+caller passes the left count it already has from the parent histogram. What
+remains is everything else the host still does per split, none of which is
+about finding a split: the leaf-value commit, the monotone output bounds
+threaded down each branch, the `min_data_in_leaf` and `max_depth` shape
+rules, per-node feature subsampling, and writing the tree itself. Those are
+also what the CPU/GPU equivalence tests pin, so moving them is a
+correctness project and not a latency patch.
+
+Nothing in the record layout has to change for any of it, which is why the
+record carries child statistics and leaf values rather than making the host
+recompute them from a histogram it no longer has.
+
+On where the device path's remaining cost actually is: it is not the scan
+kernel's shape. Packing feature slots a SIMD group at a time instead of one
+threadgroup each, and moving the categorical sort scratch out of
+threadgroup memory to lift the occupancy that allocation caps, were both
+measured on an M4 at 50000 x 100 and both came back inside noise of the
+one-thread-per-threadgroup launch this module still uses. Whatever the
+per-split overhead is, parallelizing the scan does not touch it, so the
+next attempt on it should start from a profile and not from this shape.
 """
 
 from std.gpu import block_idx
