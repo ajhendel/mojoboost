@@ -65,9 +65,15 @@ where this list and it disagree.
   categorical feature serialize to exactly the bytes they did before. See
   [Categorical features](#categorical-features)
 - objectives: squared error, binary logistic, poisson, huber, quantile,
-  L1 (mean absolute error), and multiclass softmax; quantile and L1
-  renew leaf values with residual percentiles the way LightGBM does, and
-  `alpha` follows LightGBM's meaning for huber and quantile
+  L1 (mean absolute error), gamma, tweedie, MAPE, fair, cross entropy
+  (labels anywhere in [0, 1]), and multiclass softmax. Quantile, L1, and
+  MAPE renew leaf values with residual percentiles the way LightGBM does,
+  MAPE under its own `1 / max(1, |y|)` label weights. One trainer slot
+  carries each objective's scalar parameter under LightGBM's name for it:
+  `alpha` for huber and quantile, `fair_c` for fair,
+  `tweedie_variance_power` for tweedie. LightGBM objectives that are *not*
+  implemented (`cross_entropy_lambda`, `multiclassova`, `rank_xendcg`) are
+  reported by name, with what to use instead, rather than as unknown
 - custom objectives (`train_custom`) through a compile-time callable, so
   the boosting loop stays direct-call; validated gradients and hessians,
   framework-applied sample weights, and a Python callback path with a
@@ -88,8 +94,17 @@ where this list and it disagree.
   validation sets, and an explicit primary metric picks the round the
   ensemble is truncated to (see
   [Custom validation metrics](#custom-validation-metrics))
-- evaluation metrics: RMSE, log loss, accuracy, and ROC AUC with
-  sklearn-matching tie handling
+- evaluation metrics: L2/RMSE, L1, quantile, huber, MAPE, fair, the
+  poisson, gamma, and tweedie deviances, binary and multiclass log loss,
+  cross entropy and KL divergence for soft labels, accuracy and error
+  rates, ROC AUC and average precision with sklearn-matching tie handling,
+  and NDCG and MAP per query. Selectable by LightGBM's names from Python
+  (`eval_metric="auc"`) and callable directly from Mojo
+- class weighting: `class_weight="balanced"` or a per-class dict on the
+  Python classifier, and LightGBM's `scale_pos_weight` / `is_unbalance`
+  under their own names in `src/mojoboost/class_weight.mojo`. Each is
+  folded into the row weights before training, so there is one weighting
+  mechanism rather than two
 - sample weights for every objective, LightGBM semantics (weighted
   gradients, hessians, and base scores; zero-weight rows are ignored)
 - seeded row bagging (`bagging_fraction`, `bagging_freq`, `bagging_seed`)
@@ -253,9 +268,13 @@ proba = clf.predict_proba(X)
 `fit` accepts `sample_weight`, hyperparameters mirror the Mojo defaults,
 and saved models round-trip bit-exactly. numpy is optional; plain Python
 sequences work without it. The regressor takes LightGBM objective names
-(`objective="regression"`, `"huber"`, `"quantile"`, or `"mae"`) with
-`alpha` as the quantile level or huber transition point, or a callable for
-a custom objective (see [Custom objectives](#custom-objectives)). Both
+(`objective="regression"`, `"huber"`, `"quantile"`, `"mae"`, `"poisson"`,
+`"gamma"`, `"tweedie"`, `"mape"`, `"fair"`, or `"cross_entropy"`) with
+`alpha` as the quantile level or huber transition point, `fair_c` and
+`tweedie_variance_power` for the two objectives that take them, or a
+callable for a custom objective (see
+[Custom objectives](#custom-objectives)). The classifier takes
+`class_weight`, `"balanced"` or a `{label: weight}` dict. Both
 estimators take `device` and record the backend that ran on `device_`; see
 [Device selection](#device-selection).
 
@@ -526,10 +545,11 @@ and in Python (`MojoBoostRegressor(device="cpu")`):
 
 The GPU trainers cover every objective that shares the per-row
 gradient/hessian interface. `train_gpu` handles single-output training
-(squared error, binary logistic, poisson, huber, quantile, L1),
+(squared error, binary logistic, poisson, huber, quantile, L1, gamma,
+tweedie, MAPE, fair, cross entropy),
 `train_custom_gpu` a caller-supplied gradient callback, and
 `train_multiclass_gpu` softmax, growing one tree per class per round
-through one device-resident builder. Quantile and L1 renew their leaf
+through one device-resident builder. Quantile, L1, and MAPE renew their leaf
 values on the host after the tree is grown, exactly as on the CPU.
 
 One intentional difference in where training stops. Both trainers end early
@@ -1456,6 +1476,69 @@ group array per validation set, and rejects `eval_sample_weight` because
 NDCG has no weighted LightGBM definition to match. Combining a Python
 *objective* callback with validation is not wired up yet; the Mojo API pairs
 them with `train_custom_with_metrics`.
+
+### Training callbacks
+
+`fit(..., callbacks=[...])` runs code around every boosting round, with
+LightGBM's contract, so a callback list written for LightGBM runs here:
+
+```python
+from mojoboost import MojoBoostRegressor
+from mojoboost.callback import (
+    early_stopping, log_evaluation, record_evaluation, reset_parameter,
+)
+
+history = {}
+model = MojoBoostRegressor(n_estimators=500).fit(
+    X, y,
+    eval_set=[(X_valid, y_valid)],
+    eval_metric="l2",
+    callbacks=[
+        reset_parameter(learning_rate=lambda i: 0.1 * 0.995 ** i),
+        log_evaluation(period=25),
+        record_evaluation(history),
+        early_stopping(20),
+    ],
+)
+```
+
+A callback is any callable taking one `CallbackEnv`, the same namedtuple
+LightGBM passes: `model`, `params`, `iteration`, `begin_iteration`,
+`end_iteration`, and `evaluation_result_list`. Callbacks with a truthy
+`before_iteration` attribute run before the round's tree is grown, the rest
+after it is grown and scored, and within each group they run in ascending
+`order`, ties in the order you listed them.
+
+Callbacks need an `eval_set`: the hook lives in the trainer that scores
+validation metrics. They run for the regressor and the binary classifier;
+the softmax and LambdaRank trainers have no hook yet and refuse a callback
+list rather than accepting it and doing nothing. `early_stopping_rounds=`
+works for every task either way.
+
+`reset_parameter` schedules the nine hyperparameters the loop re-reads each
+round (`mojoboost.callback.RESETTABLE`); anything else raises, rather than
+being ignored the way LightGBM ignores it. A learning-rate schedule cannot
+be represented by the single rate `Booster` applies at predict time, so the
+shrinkage is baked into the leaf values instead and the stored rate becomes
+1.0, which is what LightGBM does for every model. That switch happens only
+once a schedule actually moves the rate: without one, the model is
+bit-identical to the same fit with no callbacks.
+
+`early_stopping()` configures the trainer's own stopper rather than
+reimplementing the rule in Python, so it agrees with
+`fit(early_stopping_rounds=...)` exactly; passing both raises. A callback
+can also stop a run by raising `EarlyStopException`, which rolls the
+ensemble back to the best round as LightGBM does. Any other exception
+propagates with its own type, and the estimator is left unfitted rather than
+half-updated.
+
+The training loop is Mojo, so a callback costs one crossing of the Python
+boundary per phase per round and nothing per row;
+`bench/bench_callbacks.py` measures that and asserts the crossing count.
+With no callbacks the bridge does not cross the boundary at all. See
+`python/mojoboost/callback.py` for the full contract and
+`src/mojoboost/callback.mojo` for the loop's side of it, including
+`train_with_callbacks` for native callers.
 
 ### Learning to rank
 

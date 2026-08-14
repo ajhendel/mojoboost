@@ -8,6 +8,14 @@ next to this file). numpy is used when available; plain Python sequences
     model = MojoBoostRegressor().fit(X, y)
     pred = model.predict(X)
 
+LightGBM's functional API is the other door, in `mojoboost.basic`:
+`Dataset` owns the training data and its binning, `train()` fits a
+`Booster`, and the estimators hold that same `Booster` on `booster_`, so
+there is one model object here rather than one per API.
+
+    train_set = mojoboost.Dataset(X, label=y)
+    booster = mojoboost.train({"objective": "regression"}, train_set, 100)
+
 scikit-learn conventions
 ------------------------
 The estimators implement `get_params`, `set_params`, `fit`, `predict`,
@@ -186,6 +194,23 @@ LightGBM, is in src/mojoboost/custom_metric.mojo. There are no built-in
 validation metrics in the Python API yet, and a Python objective callback
 cannot be combined with them yet (the Mojo API pairs them with
 `train_custom_with_metrics`).
+
+`fit(..., callbacks=[...])` runs callbacks around every boosting round, with
+LightGBM's contract: a callable taking one `CallbackEnv`, split into
+before-iteration and after-iteration groups by a `before_iteration`
+attribute and run in ascending `order` within each. The four factories
+LightGBM ships are in `mojoboost.callback` and re-exported here:
+`early_stopping`, `log_evaluation`, `record_evaluation`, and
+`reset_parameter`. Callbacks need an `eval_set`, because the hook lives in
+the trainer that scores validation metrics; they run for the regressor and
+the binary classifier, and the softmax and LambdaRank trainers refuse a
+callback list rather than ignoring it. A callback costs one crossing of the
+Python boundary per phase per round and nothing per row
+(bench/bench_callbacks.py); with no callbacks the bridge does not cross the
+boundary at all, and the model is unchanged to the bit. An exception from a
+callback propagates with its own type and leaves the estimator unfitted.
+See python/mojoboost/callback.py for the environment and the differences
+from LightGBM, and src/mojoboost/callback.mojo for the loop contract.
 
 Estimators take `device="cpu"` (the default and the dependable backend),
 `device="gpu"`, or `device="auto"`. `"gpu"` raises when no accelerator is
@@ -1547,19 +1572,31 @@ class _Base(_ParamsMixin):
             for v in range(len(rows))
         ]
 
+        # A Python exception cannot cross the Mojo boundary as itself: it
+        # arrives on the other side as a message-shaped Exception, losing
+        # the type the caller wants to catch. Both callback kinds therefore
+        # keep the object here and let `fit` re-raise it; see the same
+        # pattern for iteration callbacks in python/mojoboost/callback.py.
+        metric_failure = []
+
         def bridge(metric_index, valid_index):
-            code = codes[metric_index]
-            if code is not None:
-                return float(
-                    _mojoboost.eval_metric(code, eval_params[valid_index])
+            try:
+                code = codes[metric_index]
+                if code is not None:
+                    return float(
+                        _mojoboost.eval_metric(code, eval_params[valid_index])
+                    )
+                value = funcs[metric_index](
+                    targets[valid_index], pred[: rows[valid_index] * width]
                 )
-            value = funcs[metric_index](
-                targets[valid_index], pred[: rows[valid_index] * width]
-            )
-            if isinstance(value, tuple):
-                # LightGBM's feval returns (name, value, is_higher_better).
-                value = value[1]
-            return float(value)
+                if isinstance(value, tuple):
+                    # LightGBM's feval returns
+                    # (name, value, is_higher_better).
+                    value = value[1]
+                return float(value)
+            except BaseException as exc:
+                metric_failure.append(exc)
+                raise
 
         params["pred_addr"] = _addr(pred)
         params["valid_sets"] = valid_specs
@@ -1635,6 +1672,8 @@ class _Base(_ParamsMixin):
             # a control code. Re-raise the original: the caller should catch
             # its own exception type, not a message-shaped RuntimeError.
             # `_reset_fitted` already ran, so the estimator stays unfitted.
+            if metric_failure:
+                raise metric_failure[0] from None
             if runner is not None and runner.error is not None:
                 raise runner.error from None
             raise

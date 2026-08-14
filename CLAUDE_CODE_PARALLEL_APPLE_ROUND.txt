@@ -4,8 +4,8 @@ MOJOBOOST IMMEDIATE PARALLEL DEVELOPMENT ROUND
 Purpose
 -------
 
-This file defines an IMMEDIATE parallel development round. Start every task
-at the same time, including while current sessions are wrapping up. Task 11
+This file defines the NEXT parallel development round. It launches only
+after the PRE-ROUND STABILIZATION GATE below is complete. Task 11
 (objective, metric, and weighting coverage) is already in progress and is
 therefore not duplicated here.
 
@@ -16,13 +16,58 @@ wheel builds, and release validation wait; coding and focused validation do
 not wait.
 
 
+PRE-ROUND STABILIZATION GATE (ONE SESSION ONLY, DO FIRST)
+=========================================================
+
+Run this gate in a single session before any round task starts.
+
+1. Wait until every currently active session has stopped and no Mojo, pixi,
+   or pytest process is running on the machine.
+2. Repo hygiene. Delete the stray root file `sparse_model_roundtrip.mbst`
+   and add a root-level ignore for stray `*.mbst` scratch files. Keep
+   `CLAUDE_CODE_*.txt` planning files out of future commits and consider
+   `git rm --cached` for the two already tracked, since this is a public
+   repository.
+3. Create `tools/with_build_lock.sh` (mode 755), the machine-wide build
+   serializer used by every lane in this round. macOS has no flock(1), so
+   it uses Python fcntl and blocks without polling.
+
+   #!/bin/sh
+   # Serialize heavy builds/tests across parallel sessions.
+   exec /usr/bin/python3 -c '
+   import fcntl, subprocess, sys
+   f = open("/tmp/mojoboost-build.lock", "w")
+   fcntl.flock(f, fcntl.LOCK_EX)
+   sys.exit(subprocess.call(sys.argv[1:]))
+   ' "$@"
+
+4. Run `pixi run test` and `pixi run test-python` ONCE each over the
+   combined tree. Fix only integration drift between the lanes that landed
+   uncommitted work. Do not refactor.
+5. Commit the working tree by explicit path, grouped by subsystem (sparse
+   lane, callbacks lane, eval lane, trainset/dataset, class_weight, bench,
+   docs). Push and confirm CI green.
+6. Only then start the parallel round below.
+
+
 GLOBAL PARALLELISM CONTRACT
 ===========================
 
 Every task repeats this contract so it can be copied independently.
 
-- Start immediately. Do not wait for other sessions, stabilization, a commit,
-  or another task.
+- Start as soon as the PRE-ROUND STABILIZATION GATE is complete. Do not wait
+  for other round tasks.
+- CPU THROTTLE (machine-wide, mandatory): wrap EVERY Mojo compile, Mojo test
+  run, build script, and pytest invocation as
+  `nice -n 19 tools/with_build_lock.sh <command>` so at most one heavy
+  build or test runs at a time no matter how many lanes are live. Waiting
+  on the lock is expected and silent; never poll, retry, or bypass it.
+- Run focused Mojo tests with MOJOBOOST_NUM_WORKERS=1 so the test process
+  itself stays on one core.
+- Documentation and design lanes (18, 19, 20, A5, A7, A8) never compile and
+  may start any time. If launching many compile-heavy lanes at once, prefer
+  two soft waves. Wave 1 is A1, A2, A3, A4, 12, 13. Wave 2 is 14, 16, 21,
+  22, A6 plus the Python lanes 15, 17, A9, A10.
 - Inspect current code and `git status` read-only before editing.
 - Preserve all concurrent work.
 - Edit ONLY the paths explicitly assigned to your task.
@@ -283,6 +328,64 @@ CPU/GPU selection, marking unavailable pieces honestly. Define the release
 gate without changing parity statuses.
 
 
+PARALLEL TASK 21: ROW AND FEATURE SAMPLING (BAGGING, GOSS, FEATURE FRACTION)
+==========================================================================
+
+Work in the `mojoboost` repository, in parallel with every other lane, after
+the stabilization gate. This task is one lane in a simultaneous parallel
+round. Preserve concurrent work and edit ONLY:
+`src/mojoboost/sampling.mojo`, `tests/parallel/test_sampling.mojo`, and
+`handoffs/task21_sampling.md`. Do not edit central/shared files. Put all
+required central imports, parameter fields, Python aliases, binding calls,
+and call-site edits in the handoff. Do not commit or stage. Run only your
+assigned focused test once, under the CPU throttle with
+MOJOBOOST_NUM_WORKERS=1. Do not run unrelated Mojo, Pixi, pytest, builds,
+wheels, benchmarks, profilers, retry loops, polling loops, background
+commands, or parallel shell commands. After that focused test, run
+`git diff --check --` on assigned paths. Never claim unrun code passes.
+
+Implement isolated, deterministic row and feature sampling primitives that
+LightGBM parity still lacks: bagging (bagging_fraction, bagging_freq,
+bagging_seed), GOSS (top_rate/other_rate selection with small-gradient
+amplification, matching LightGBM boosting=goss semantics), and feature
+fraction at bytree/bylevel/bynode granularity including the
+colsample_bytree/colsample_bynode alias mapping flagged missing in the
+parity audit. Use counter-based deterministic randomness consistent with
+the existing splitmix64 approach so repeat training is bit-identical. Write
+analytical tests for selection determinism, fraction accounting, and GOSS
+weight amplification. The handoff must map LightGBM names/defaults, give
+exact grow_tree/boosting integration points, and state how sampled row sets
+compose with Apple Task A1 active-row ranges on the GPU.
+
+
+PARALLEL TASK 22: LIGHTGBM MODEL FILE INTEROP
+=============================================
+
+Work in the `mojoboost` repository, in parallel with every other lane, after
+the stabilization gate. This task is one lane in a simultaneous parallel
+round. Preserve concurrent work and edit ONLY:
+`src/mojoboost/lgbm_model_io.mojo`, `tests/parallel/test_lgbm_model_io.mojo`,
+and `handoffs/task22_lgbm_io.md`. Read but never edit model.mojo,
+serialize.mojo, and tree.mojo. Put required exports, bindings, and Python
+API wiring in the handoff. Do not commit or stage. Run only your assigned
+focused test once, under the CPU throttle with MOJOBOOST_NUM_WORKERS=1. Do
+not run unrelated Mojo, Pixi, pytest, builds, wheels, benchmarks, profilers,
+retry loops, polling loops, background commands, or parallel shell commands.
+After that focused test, run `git diff --check --` on assigned paths. Never
+claim unrun code passes or that arbitrary LightGBM models load.
+
+Implement an isolated reader and writer for the LightGBM text model format
+that converts to and from the current Model/MulticlassModel structures:
+header metadata, per-tree arrays (split_feature, threshold, decision_type,
+missing direction, left/right children, leaf values, counts), objective
+mapping, and explicit rejection with clear errors for unsupported constructs
+(linear trees, categorical thresholds until supported, unknown objectives).
+Round-trip tests use hand-written miniature model files checked into the
+test file as string literals, not downloads. Coordinate conceptually with
+Task 14's dump schema; both handoffs must state the shared node vocabulary
+so integration reconciles them once.
+
+
 PARALLEL APPLE TASK A1: DEVICE-SIDE ACTIVE-ROW COMPACTION
 =======================================================
 
@@ -532,8 +635,9 @@ After every parallel session has stopped:
    edit the same paths simultaneously.
 4. Wire one subsystem at a time in dependency order:
    active rows -> split search -> GPU objectives/runtime -> GPU prediction ->
-   Apple policy/device UX; independently EFB/tree parameters/inspection;
-   then CV/distributed/Dask; finally packaging/docs.
+   Apple policy/device UX; independently EFB/tree parameters/sampling/
+   inspection/LightGBM model interop; then CV/distributed/Dask; finally
+   packaging/docs.
 5. During integration, run one focused test at a time. Never run multiple
    Mojo compilers concurrently.
 6. Run the full suite only once, on explicit user request, after focused

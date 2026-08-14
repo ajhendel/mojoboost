@@ -194,9 +194,15 @@ model.stopped_early_
 ```
 
 `eval_metric` takes LightGBM's metric names (`l2`, `rmse`, `l1`,
-`quantile`, `huber`, `binary_logloss`, `binary_error`, `auc`,
-`multi_logloss`, `multi_error`, `ndcg`, and their aliases), callables, or
-both, and defaults to the objective's own loss. A name is computed by
+`quantile`, `huber`, `mape`, `fair`, `poisson`, `gamma`, `gamma_deviance`,
+`tweedie`, `cross_entropy`, `kullback_leibler`, `binary_logloss`,
+`binary_error`, `auc`, `average_precision`, `multi_logloss`, `multi_error`,
+`ndcg`, `map`, and their aliases), callables, or both, and defaults to the
+objective's own loss. A name has to make sense for the model being fitted:
+the regressor takes the regression metrics, the classifier the binary or
+multiclass ones, the ranker `ndcg` and `map`. Predictions reach a built-in
+metric through the objective's own inverse link, so `l2` on a poisson model
+scores expected counts and `binary_logloss` scores probabilities. A name is computed by
 `src/mojoboost/metrics.mojo`, so it agrees with the Mojo API by
 construction, and `eval_sample_weight` weights it. A callable is
 `f(y_true, y_pred) -> float`, called once per metric per validation set per

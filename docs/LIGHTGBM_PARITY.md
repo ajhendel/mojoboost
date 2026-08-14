@@ -98,12 +98,12 @@ package.
 | `train` | supported | `mojoboost.train(params, train_set, num_boost_round, valid_sets, valid_names, init_model)`. Trains the same trees the estimators train, which `python/tests/test_basic.py` asserts bit for bit. No per-round history or early stopping here yet; those are on the estimators' `fit` | `python/mojoboost/basic.py` |
 | `cv` | deferred | Needs `Dataset` and the callback system first. v1 work, task 15 | — |
 | `CVBooster` | deferred | With `cv`, task 15 | — |
-| `early_stopping` | partial | Early stopping exists, as `fit(early_stopping_rounds=..., min_delta=...)` rather than as a callback object. `first_metric_only` has no equivalent; every metric flagged for early stopping is watched | `python/mojoboost/__init__.py`, `src/mojoboost/custom_metric.mojo` |
-| `log_evaluation` | deferred | Needs the callback system, task 3. mojoboost prints nothing during training today | — |
-| `record_evaluation` | partial | `evals_result_` is populated by `fit` directly, without a callback | `python/mojoboost/__init__.py` |
-| `reset_parameter` | deferred | Per-iteration parameter schedules need the callback system, task 3 | — |
-| `EarlyStopException` | deferred | Part of the callback contract, task 3 | — |
-| `EvalResult` | deferred | Part of the callback contract, task 3 | — |
+| `early_stopping` | supported | `fit(callbacks=[early_stopping(rounds, first_metric_only=, verbose=, min_delta=)])`, and the `fit(early_stopping_rounds=, min_delta=)` spelling. The callback configures the trainer's own stopper rather than reimplementing the rule; passing both spellings raises. Differs in which round survives: the primary metric's best on the first validation set, not the pair that ran out of patience first | `python/mojoboost/callback.py`, `src/mojoboost/callback.mojo`, `src/mojoboost/custom_metric.mojo` |
+| `log_evaluation` | supported | `log_evaluation(period=, show_stdv=)`. `period<=0` is silent. `show_stdv` is accepted and inert: it formats a cross-validation fold's spread, and there is no `cv` yet | `python/mojoboost/callback.py`, `src/mojoboost/callback.mojo` |
+| `record_evaluation` | supported | `record_evaluation(dict)` fills the dict in place. `evals_result_` is still populated directly too; it starts one round earlier, at the base-score-only model | `python/mojoboost/callback.py`, `src/mojoboost/callback.mojo`, `python/mojoboost/__init__.py` |
+| `reset_parameter` | partial | `reset_parameter(**schedules)` with lists or callables, for the nine hyperparameters the loop re-reads each round (`callback.RESETTABLE`). A key outside that set raises rather than being ignored, which LightGBM does not do. A learning-rate schedule bakes shrinkage into the leaf values | `python/mojoboost/callback.py`, `src/mojoboost/callback.mojo` |
+| `EarlyStopException` | supported | Raised by a callback to stop the run; rolls the ensemble back to the best round as LightGBM does | `python/mojoboost/callback.py`, `src/mojoboost/callback.mojo` |
+| `EvalResult` | different | The 4-tuple `(data_name, metric_name, value, is_higher_better)` is what `env.evaluation_result_list` holds, matching LightGBM's shape; there is no named type for it | `python/mojoboost/callback.py`, `src/mojoboost/callback.mojo` |
 | `register_logger` | unsupported | mojoboost has no logging layer to redirect. Training is silent by design; adding a logger to redirect is not a goal | — |
 | `plot_importance` | unsupported | Plotting belongs in the caller's plotting library. `feature_importances_` is the data; matplotlib is not a dependency mojoboost will take | — |
 | `plot_metric` | unsupported | Same reason. `evals_result_` is the data | — |
@@ -166,7 +166,7 @@ that silently trains a different model is worse than a failed call.
 | `fit(eval_metric=)` | partial | Caller-supplied callables, tuples, or dicts. LightGBM's built-in metric **names** (`"auc"`, `"rmse"`, ...) are not accepted as strings yet, though the Mojo library implements several of them; wiring the built-in names through is a v1 gap. The direction (`higher_is_better`) is declared up front rather than returned per call, because early stopping needs it before the first evaluation |
 | `fit(feature_name=)` | partial | Feature names are read from a pandas frame's columns into `feature_names_in_` and checked at predict time. An explicit `feature_name=` argument, and carrying names into the model file, are not there |
 | `fit(categorical_feature=)` | supported | Accepted as `categorical_feature` on the constructor (LightGBM's name) rather than on `fit`, because scikit-learn's clone contract keeps hyperparameters on the estimator. Indices, column names, or `"auto"` (the default, meaning every pandas `category` column). One difference: a `category` column left out of an explicit list raises, where LightGBM quietly feeds its codes to the numerical scan |
-| `fit(callbacks=)` | deferred | The callback system is task 3 |
+| `fit(callbacks=)` | partial | Supported for the regressor and the binary classifier, which train through `train_with_callbacks`. The softmax and LambdaRank loops have no hook yet and refuse a callback list rather than ignoring it. Needs an `eval_set` |
 | `fit(init_model=)` | deferred | Continued training is task 6 |
 | `predict(X)` | supported | Response scale, matching LightGBM's default |
 | `predict(raw_score=)` | supported | Scores on the link scale. The objectives without a link (squared error, huber, quantile, L1) predict raw either way |
@@ -456,12 +456,12 @@ inverse link exactly once before any metric sees them.
 
 | LightGBM callback | Status | Notes |
 |---|---|---|
-| callback protocol (`CallbackEnv`, ordering, `before_iteration`) | deferred | Task 3. Nothing accepts a callback today |
-| `early_stopping` | partial | As `fit` arguments, section 1 |
-| `log_evaluation` | deferred | Task 3 |
-| `record_evaluation` | partial | `evals_result_` without a callback |
-| `reset_parameter` | deferred | Task 3 |
-| `EarlyStopException` | deferred | Task 3 |
+| callback protocol (`CallbackEnv`, ordering, `before_iteration`) | supported | Same namedtuple fields, same `order`/`before_iteration` attributes, same two-phase split. One boundary crossing per phase per round, benchmarked in `bench/bench_callbacks.py` |
+| `early_stopping` | supported | As a callback and as `fit` arguments, section 1 |
+| `log_evaluation` | supported | `period<=0` silences it |
+| `record_evaluation` | supported | Also `evals_result_` without a callback |
+| `reset_parameter` | partial | The nine hyperparameters the loop re-reads each round; see section 1 |
+| `EarlyStopException` | supported | Stops the run and rolls back to the best round |
 
 ## 11. Distributed modes
 
