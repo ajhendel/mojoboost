@@ -88,6 +88,7 @@ from .boosting import (
     TWEEDIE,
     _POISSON_MAX_DELTA_STEP,
 )
+from .gpu_active_rows import GpuActiveRows
 from .gpu_tiling import derive_block_threads, query_device_caps
 
 # Clamp on every `exp` argument. exp(60) is 1.1e26, four orders of magnitude
@@ -117,8 +118,8 @@ comptime FIXED_ONE = Float64(1 << 30)
 # caller having to think about it.
 comptime DEFAULT_MAX_NODES = 2048
 
-# Leaf id of a row tree growth never routed (histogram_gpu.OUT_OF_BAG, and
-# any id past the tree's node count). `update_raw` leaves those rows alone.
+# Leaf id of a row tree growth never routed (any negative id, and any id
+# past the tree's node count). `update_raw` leaves those rows alone.
 comptime UNROUTED_LEAF = Int32(-1)
 
 
@@ -415,6 +416,38 @@ def _update_raw_kernel(
         raw[unsafe_offset=i][0]
         + learning_rate * values[unsafe_offset = Int(node)][0]
     )
+
+
+def _range_add_raw_kernel(
+    rows: MutPointer[Int32, MutAnyOrigin],
+    raw: MutPointer[Float32, MutAnyOrigin],
+    values: MutPointer[Float32, MutAnyOrigin],
+    begin: Int32,
+    count: Int32,
+    node: Int32,
+    n_classes: Int32,
+    k: Int32,
+    learning_rate: Float32,
+):
+    """`_update_raw_kernel` for one leaf of a compacted tree: every row in
+    the leaf's contiguous slice of the active-row permutation advances by
+    `learning_rate * value[node]`.
+
+    Under active-row compaction (gpu_active_rows.mojo) there is no per-row
+    leaf-assignment array to look a value up in; instead each live leaf owns
+    a range of the permutation, so the update is one launch per leaf over
+    exactly that leaf's rows. A row outside every range (out of bag) is
+    never touched, the same contract `_update_raw_kernel` has for unrouted
+    rows.
+    """
+    var j = global_idx.x
+    if j < Int(count):
+        var r = Int(rows[unsafe_offset = Int(begin) + j][0])
+        var i = r * Int(n_classes) + Int(k)
+        raw[unsafe_offset=i] = (
+            raw[unsafe_offset=i][0]
+            + learning_rate * values[unsafe_offset = Int(node)][0]
+        )
 
 
 def _abs_sum_kernel(
@@ -798,6 +831,68 @@ struct GpuObjectiveState(Movable):
             grid_dim=self._row_blocks(),
             block_dim=self.block_threads,
         )
+
+    def update_raw_ranges(
+        mut self,
+        ctx: DeviceContext,
+        mut rows: GpuActiveRows,
+        values: List[Float64],
+        learning_rate: Float64,
+        k: Int = 0,
+    ) raises:
+        """`update_raw` for a compacted tree: advance the raw scores from
+        the leaf ranges the grown tree left in `rows` instead of a per-row
+        leaf-assignment array.
+
+        Call after `grow_tree_gpu` returns and before the next tree's
+        `begin_tree`, which is what resets the ranges. Every live range
+        belongs to a leaf of the finished tree, so the update is one small
+        launch per leaf over exactly that leaf's rows; rows outside every
+        range (out of bag) keep their old scores, the same contract
+        `update_raw` has for unrouted rows."""
+        if len(values) < 1:
+            raise Error("node values must not be empty")
+        if len(values) > self.max_nodes:
+            raise Error(
+                "tree has more nodes than the node-value table holds;"
+                " construct with a larger max_nodes"
+            )
+        if k < 0 or k >= self.n_classes:
+            raise Error("class index out of range")
+        if not self.has_raw:
+            raise Error("call init_raw before updating raw scores")
+        if not isfinite(learning_rate):
+            raise Error("learning_rate must be finite")
+        for i in range(len(values)):
+            if not isfinite(values[i]):
+                raise Error("node values must be finite")
+        with self.value_dev.map_to_host() as host:
+            var dst = host.unsafe_ptr()
+            for i in range(len(values)):
+                dst.unsafe_store(i, Float32(values[i]))
+        for node in range(rows.ranges.n_nodes()):
+            if node >= len(values):
+                break
+            var window = rows.ranges.get(node)
+            var n = window.count()
+            if n <= 0:
+                continue
+            var blocks = (
+                n + self.block_threads - 1
+            ) // self.block_threads
+            ctx.enqueue_function[_range_add_raw_kernel](
+                rows.rows_dev.unsafe_ptr(),
+                self.raw_dev.unsafe_ptr(),
+                self.value_dev.unsafe_ptr(),
+                Int32(window.begin),
+                Int32(n),
+                Int32(node),
+                Int32(self.n_classes),
+                Int32(k),
+                Float32(learning_rate),
+                grid_dim=blocks,
+                block_dim=self.block_threads,
+            )
 
     def magnitude_sums(
         mut self,

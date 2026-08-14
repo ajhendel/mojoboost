@@ -4,13 +4,18 @@
 GPU backend: one persistent `GpuHistogramBuilder` holds the binned matrix,
 gradients/hessians, and a device-resident active-row permutation in which
 every live leaf owns a contiguous row range (see gpu_active_rows.mojo).
-Per boosting round, the host uploads gradients once; per split, the device
-stably partitions the parent's range and builds the smaller child's
-histogram over exactly that child's rows (the sibling comes from the
-subtraction trick on the host, where histograms are small:
-n_features * n_bins). The grower hands the partition its exact left count
-from the parent histogram's integer counts, so a split enqueues without a
-host synchronization.
+For the built-in objectives without row sampling, the round's gradients are
+generated on the device from device-resident labels and raw scores, and
+each grown tree advances those raw scores from its leaf ranges (see
+gpu_objectives_native.mojo), so nothing per-row crosses the host/device
+boundary in a plain round. Under bagging or GOSS the host generates and
+uploads the gradients instead, because the row sample is ranked and drawn
+host-side. Per split, the device stably partitions the parent's range and
+builds the smaller child's histogram over exactly that child's rows (the
+sibling comes from the subtraction trick on the host, where histograms are
+small: n_features * n_bins). The grower hands the partition its exact left
+count from the parent histogram's integer counts, so a split enqueues
+without a host synchronization.
 
 Division of labor:
   CPU  boosting coordination, split selection over downloaded histograms,
@@ -63,6 +68,7 @@ from .boosting import (
     renewal_weights,
 )
 from .goss import GossParams, GossSelection, apply_goss_scaling, goss_round
+from .gpu_objectives_native import supports_device_objective
 from .histogram import Histogram, subtract_histogram
 from .histogram_gpu import GpuHistogramBuilder
 from .objective import (
@@ -411,9 +417,6 @@ def train_gpu(
 
         var n = data.n_rows
         var base_score = _base_score(target, objective, sample_weight, alpha)
-        var raw = List[Float64](capacity=n)
-        for _ in range(n):
-            raw.append(base_score)
 
         var signs = params.tree.monotone.active_signs()
         var renews = objective_renews_leaves(objective)
@@ -421,6 +424,49 @@ def train_gpu(
         var renew_a = renewal_alpha(objective, alpha)
         var builder = GpuHistogramBuilder(data)
         var trees = List[Tree]()
+
+        # Built-in objectives without row sampling generate their gradients
+        # on the device and advance the raw scores there too, so a round
+        # uploads nothing per row: labels and weights cross once at state
+        # construction, and only the tree's node-value table (a few hundred
+        # bytes) crosses per tree. Bagging and GOSS stay on the host path,
+        # which needs the gradients host-side to rank and sample rows.
+        if not bagging_enabled(bagging) and not goss.enabled and (
+            supports_device_objective(objective)
+        ):
+            var state = builder.objective_state(
+                target, sample_weight, 1, 2 * params.tree.num_leaves
+            )
+            state.init_raw(builder.ctx, [base_score])
+            for i in range(params.n_estimators):
+                builder.fill_gradients_device(state, objective, alpha)
+                var tree = grow_tree_gpu(builder, params.tree, [], i)
+                if renews:
+                    # Renewal is a host-side weighted percentile, so the
+                    # renewing objectives pay one raw-score download per
+                    # tree; the scores come back through Float32, which is
+                    # the device path's documented precision.
+                    var raw = state.download_raw(builder.ctx)
+                    _renew_leaf_values(
+                        tree, data, target, raw, renew_w, renew_a, [], signs
+                    )
+                if tree.n_leaves == 1 and abs(tree.value[0]) < 1e-12:
+                    break
+                builder.update_raw_device(
+                    state, tree.value, params.learning_rate
+                )
+                trees.append(tree^)
+            return Booster(
+                trees^,
+                base_score,
+                params.learning_rate,
+                objective,
+                params.tree.monotone.copy(),
+            )
+
+        var raw = List[Float64](capacity=n)
+        for _ in range(n):
+            raw.append(base_score)
         var grad = List[Float64](capacity=n)
         var hess = List[Float64](capacity=n)
         var bag = List[Int]()
@@ -569,6 +615,45 @@ def train_multiclass_gpu(
         for k in range(n_classes):
             base_scores.append(log(_clamp_prob(class_w[k] / total_w)))
 
+        var builder = GpuHistogramBuilder(data)
+        var trees = List[Tree]()
+
+        # Softmax without row sampling runs the whole objective on the
+        # device: probabilities refresh once per round, each class's
+        # gradients land straight in the histogram buffers, and each class's
+        # tree advances the device raw scores from its leaf ranges. Bagging
+        # and GOSS keep the host path, which owns the row sample.
+        if not bagging_enabled(bagging) and not goss.enabled:
+            var labels_f = List[Float64](capacity=n)
+            for r in range(n):
+                labels_f.append(Float64(labels[r]))
+            var state = builder.objective_state(
+                labels_f, sample_weight, n_classes, 2 * params.tree.num_leaves
+            )
+            state.init_raw(builder.ctx, base_scores)
+            for i in range(params.n_estimators):
+                state.refresh_softmax(builder.ctx)
+                var made_progress = False
+                for k in range(n_classes):
+                    builder.fill_softmax_gradients_device(state, k)
+                    var tree = grow_tree_gpu(
+                        builder, params.tree, [], i * n_classes + k
+                    )
+                    if tree.n_leaves > 1 or abs(tree.value[0]) >= 1e-12:
+                        made_progress = True
+                    # Before the next class's begin_tree resets the ranges.
+                    builder.update_raw_device(
+                        state, tree.value, params.learning_rate, k
+                    )
+                    trees.append(tree^)
+                if not made_progress:
+                    for _ in range(n_classes):
+                        _ = trees.pop()
+                    break
+            return MulticlassBooster(
+                trees^, base_scores^, n_classes, params.learning_rate
+            )
+
         # Row-major raw scores and softmax scratch: raw[r * n_classes + k].
         var raw = List[Float64](capacity=n * n_classes)
         for _ in range(n):
@@ -577,9 +662,6 @@ def train_multiclass_gpu(
         var prob = List[Float64](capacity=n * n_classes)
         for _ in range(n * n_classes):
             prob.append(0.0)
-
-        var builder = GpuHistogramBuilder(data)
-        var trees = List[Tree]()
         var grad = List[Float64](capacity=n)
         var hess = List[Float64](capacity=n)
         var bag = List[Int]()

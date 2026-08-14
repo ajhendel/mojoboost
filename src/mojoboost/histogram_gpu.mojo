@@ -87,6 +87,11 @@ from max.gpu.host import DeviceBuffer, DeviceContext, HostBuffer
 from .binning import BinnedMatrix
 from .categorical import CatBitset, CategoricalSpec, cat_empty
 from .gpu_active_rows import GpuActiveRows, RowRouting
+from .gpu_objectives_native import (
+    DEFAULT_MAX_NODES,
+    GpuObjectiveState,
+    device_fixed_scale,
+)
 from .gpu_tiling import (
     STRATEGY_ATOMIC,
     STRATEGY_AUTO,
@@ -353,6 +358,69 @@ struct GpuHistogramBuilder(Movable):
         boosting round, not per node)."""
         self.stage_gradients(grad, hess)
         self.upload_staged()
+
+    def objective_state(
+        mut self,
+        target: List[Float64],
+        sample_weight: List[Float64] = [],
+        n_classes: Int = 1,
+        max_nodes: Int = DEFAULT_MAX_NODES,
+    ) raises -> GpuObjectiveState:
+        """A device objective state on this builder's context, so its
+        gradients land in this builder's buffers. See
+        gpu_objectives_native.mojo."""
+        return GpuObjectiveState(
+            self.ctx, target, sample_weight, n_classes, max_nodes
+        )
+
+    def fill_gradients_device(
+        mut self,
+        mut state: GpuObjectiveState,
+        objective: Int,
+        alpha: Float64,
+    ) raises:
+        """This round's gradients, computed on the device straight into the
+        histogram buffers. Replaces `upload_gradients` for the built-in
+        objectives; the fixed-point scales come from a device reduction
+        instead of a host pass, and nothing per-row crosses to the device."""
+        state.fill_grad_hess(
+            self.ctx, objective, alpha, self.grad_dev, self.hess_dev
+        )
+        var sums = state.magnitude_sums(
+            self.ctx, self.grad_dev, self.hess_dev
+        )
+        self.g_scale = Float64(device_fixed_scale(sums.grad))
+        self.h_scale = Float64(device_fixed_scale(sums.hess))
+        self.has_gradients = True
+
+    def fill_softmax_gradients_device(
+        mut self, mut state: GpuObjectiveState, k: Int
+    ) raises:
+        """Class `k`'s softmax gradients into the histogram buffers; call
+        `state.refresh_softmax` once per round first."""
+        state.fill_softmax_grad_hess(
+            self.ctx, k, self.grad_dev, self.hess_dev
+        )
+        var sums = state.magnitude_sums(
+            self.ctx, self.grad_dev, self.hess_dev
+        )
+        self.g_scale = Float64(device_fixed_scale(sums.grad))
+        self.h_scale = Float64(device_fixed_scale(sums.hess))
+        self.has_gradients = True
+
+    def update_raw_device(
+        mut self,
+        mut state: GpuObjectiveState,
+        values: List[Float64],
+        learning_rate: Float64,
+        k: Int = 0,
+    ) raises:
+        """Advance the device raw scores by the tree just grown, from the
+        leaf ranges it left behind. Call after `grow_tree_gpu` returns and
+        before the next `begin_tree`."""
+        state.update_raw_ranges(
+            self.ctx, self.rows, values, learning_rate, k
+        )
 
     def begin_tree(mut self, bag: List[Int] = []) raises:
         """Seed the tree's active rows and make the root (node 0) own all of
