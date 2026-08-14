@@ -163,6 +163,18 @@ from .custom_metric import (
     train_with_metrics,
 )
 from .histogram_gpu import GpuHistogramBuilder, build_histogram_gpu
+from .gpu_runtime import (
+    GpuSession,
+    HazardTracker,
+    MatrixIdentity,
+    PhaseCounters,
+    PoolLedger,
+    ResidencyLedger,
+    SessionLifecycle,
+    StagingRing,
+    audit_round,
+    bins_fingerprint,
+)
 from .gpu_predict import (
     GpuPredictor,
     flatten_booster,

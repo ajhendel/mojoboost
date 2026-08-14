@@ -16,7 +16,12 @@ anything or asserts that any code is faster.
 """
 
 from std.os import setenv
+from std.sys import has_accelerator
 from std.testing import assert_equal, assert_true, TestSuite
+
+from mojoboost.binning import bin_equal_width
+from mojoboost.gpu_runtime import GpuSession
+from mojoboost.histogram_gpu import GpuHistogramBuilder
 
 from mojoboost.gpu_runtime import (
     DEFAULT_STAGING_SLOTS,
@@ -834,6 +839,45 @@ def test_env_overrides() raises:
     _ = setenv("MOJOBOOST_GPU_TRACE", "")
     var untraced = PhaseCounters.from_env()
     assert_true(not untraced.enabled)
+
+
+def test_session_builder_matches_private_context_builder() raises:
+    """The one device-bound test in this file: a builder borrowing a
+    session's context produces the bit-identical fixed-point histogram a
+    private-context builder does, and the session's ledgers record the
+    construction. Skips (passing) without an accelerator, so the rest of
+    the suite stays device-free."""
+    comptime if not has_accelerator():
+        print("skipped: no accelerator")
+    else:
+        var n_rows = 2_000
+        var n_features = 4
+        var features = List[Float64](capacity=n_rows * n_features)
+        for k in range(n_rows * n_features):
+            features.append(Float64((k * 2654435761) % 1000) / 1000.0)
+        var data = bin_equal_width(features, n_rows, n_features, 32)
+        var grad = List[Float64](capacity=n_rows)
+        var hess = List[Float64](capacity=n_rows)
+        for r in range(n_rows):
+            grad.append(Float64((r * 40503) % 997) / 997.0 - 0.5)
+            hess.append(1.0)
+
+        var session = GpuSession()
+        var shared = GpuHistogramBuilder(session, data)
+        var a = shared.build(grad, hess)
+        var private = GpuHistogramBuilder(data)
+        var b = private.build(grad, hess)
+        for i in range(a.n_features * a.n_bins):
+            assert_equal(a.grad[i], b.grad[i])
+            assert_equal(a.hess[i], b.hess[i])
+            assert_equal(a.count[i], b.count[i])
+
+        # The ledgers saw the construction: one training matrix admitted,
+        # one allocation per pool slot the builder fills.
+        assert_equal(session.residency.uploads, 1)
+        assert_equal(session.pool.allocations, 8)
+        session.close()
+        assert_true(session.life.is_closed())
 
 
 def main() raises:

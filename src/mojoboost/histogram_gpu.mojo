@@ -101,6 +101,21 @@ from .gpu_tiling import (
     derive_tiling,
     query_device_caps,
 )
+from .gpu_runtime import (
+    PHASE_ALLOC,
+    ROLE_TRAIN,
+    SLOT_BINS,
+    SLOT_FEAT,
+    SLOT_GRAD,
+    SLOT_HESS,
+    SLOT_HOST_OUT,
+    SLOT_OUT,
+    SLOT_PART,
+    SLOT_STAGE,
+    GpuSession,
+    MatrixIdentity,
+    bins_fingerprint,
+)
 from .histogram import Histogram, _zeroed_f64, _zeroed_int
 
 comptime MAX_BINS = 256
@@ -182,7 +197,68 @@ struct GpuHistogramBuilder(Movable):
         `strategy` forces `STRATEGY_ATOMIC` or `STRATEGY_TILED`; the default
         `STRATEGY_AUTO` lets `MOJOBOOST_GPU_HIST_STRATEGY` and then the
         device-capability policy in `gpu_tiling.mojo` decide.
+
+        Opens a private `DeviceContext`. A builder that should share one
+        context (and one queue) with other device work takes a `GpuSession`
+        instead; see the session overload below.
         """
+        var ctx = DeviceContext()
+        var caps = query_device_caps(ctx)
+        self = Self(ctx, caps, data, strategy)
+
+    def __init__(
+        out self,
+        mut session: GpuSession,
+        data: BinnedMatrix,
+        strategy: Int = STRATEGY_AUTO,
+    ) raises:
+        """Build on `session`'s context instead of opening a private one, so
+        every buffer this builder creates shares the session's in-order
+        queue, and record the construction in the session's ledgers.
+
+        Bookkeeping only, no behavior change: the binned matrix is uploaded
+        and drained exactly as the private-context form does, and the
+        residency and pool entries record what a pooled path could later
+        skip (a second builder on the same session and matrix still
+        re-uploads today, because the buffers live in the builder rather
+        than the session). Construction is charged to `PHASE_ALLOC`, which
+        `session.trace()` reports under `MOJOBOOST_GPU_TRACE=1`.
+        """
+        var started = session.clock()
+        self = Self(session.ctx, session.caps, data, strategy)
+        _ = session.admit_matrix(
+            ROLE_TRAIN,
+            MatrixIdentity(
+                data.n_rows,
+                data.n_features,
+                data.n_bins,
+                bins_fingerprint(
+                    data.bins, data.n_rows, data.n_features, data.n_bins
+                ),
+            ),
+        )
+        var hist_cells = 3 * data.n_features * data.n_bins
+        _ = session.request_buffer(
+            SLOT_BINS, data.n_rows * data.n_features, 1
+        )
+        _ = session.request_buffer(SLOT_GRAD, data.n_rows, 4)
+        _ = session.request_buffer(SLOT_HESS, data.n_rows, 4)
+        _ = session.request_buffer(SLOT_FEAT, data.n_features, 4)
+        _ = session.request_buffer(SLOT_OUT, hist_cells, 4)
+        _ = session.request_buffer(SLOT_PART, 3 * self.part_capacity, 4)
+        _ = session.request_buffer(SLOT_STAGE, 2 * data.n_rows, 4)
+        _ = session.request_buffer(SLOT_HOST_OUT, hist_cells, 4)
+        session.record(PHASE_ALLOC, started)
+
+    def __init__(
+        out self,
+        ctx: DeviceContext,
+        caps: DeviceCaps,
+        data: BinnedMatrix,
+        strategy: Int = STRATEGY_AUTO,
+    ) raises:
+        """Build on a caller-supplied context and its queried capabilities;
+        the two public forms above both land here."""
         if data.n_rows < 1:
             raise Error("GPU backend requires at least one row")
         if data.n_features < 1:
@@ -196,13 +272,13 @@ struct GpuHistogramBuilder(Movable):
         if len(data.bins) != data.n_rows * data.n_features:
             raise Error("binned matrix size must equal n_rows * n_features")
 
-        self.ctx = DeviceContext()
+        self.ctx = ctx
         self.n_rows = data.n_rows
         self.n_features = data.n_features
         self.n_bins = data.n_bins
         self.missing_bin = data.missing_bin.copy()
         self.cats = data.cats.copy()
-        self.caps = query_device_caps(self.ctx)
+        self.caps = caps.copy()
         self.tiling = derive_tiling(
             self.caps, data.n_rows, data.n_features, data.n_bins, strategy
         )
