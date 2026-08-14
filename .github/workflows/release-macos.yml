@@ -74,10 +74,6 @@ on:
         required: false
         type: boolean
         default: false
-  push:
-    tags:
-      - "v*.*.*"
-
 # Least privilege by default. Each job re-grants only what it needs, and only
 # the TestPyPI job gets an OIDC token.
 permissions: {}
