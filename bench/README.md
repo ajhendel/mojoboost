@@ -12,8 +12,10 @@ Parameters match on both sides (mojoboost defaults): 100 boosting rounds,
 `num_leaves=31`, `learning_rate=0.1`, `min_data_in_leaf=20`,
 `min_sum_hessian_in_leaf=1e-3`, `lambda_l2=1.0`, `max_bin=255`. LightGBM
 additionally runs with `enable_bundle=false` (mojoboost has no EFB yet) and
-`force_row_wise=true`. mojoboost is single-threaded, so the 1-thread
-LightGBM column is the apples-to-apples one.
+`force_row_wise=true`. The table below records the original single-threaded
+mojoboost baseline. The current implementation parallelizes histogram
+accumulation across features, so new runs should record available CPU cores
+and compare against both 1-thread and machine-wide LightGBM.
 
 ## Running
 
@@ -21,6 +23,7 @@ LightGBM column is the apples-to-apples one.
 pixi run bench                 # mojoboost, defaults: 100000 rows x 100 features, reg
 pixi run bench 100000 100 binary
 pixi run -e bench bench-lgbm --rows 100000 --features 100 --objective reg --threads 1
+pixi run bench-hist
 ```
 
 ## Results
@@ -38,9 +41,19 @@ separately; loss is on the training set).
 | Binary: training | 3.50 | 2.32 | |
 | Binary: train logloss | 0.267034 | 0.267168 | |
 
-Headline: a from-scratch Mojo GBDT is within 1.5x of single-threaded
-LightGBM on training, faster at binning, and matches its accuracy, with no
-multithreading, GOSS, or EFB yet.
+Headline for this original baseline: a from-scratch Mojo GBDT is within 1.5x
+of single-threaded LightGBM on training, faster at binning, and matches its
+accuracy, before multicore histogram accumulation and without GOSS or EFB.
+
+## CPU/GPU histogram microbenchmark
+
+`bench_histogram.mojo` compares the multicore CPU implementation with the
+experimental portable GPU kernel. It separates first-use setup from repeated
+device-resident builds. This is not an end-to-end GPU-training benchmark.
+
+Results from one GPU family must not be presented as representative of other
+devices. Record the accelerator, Mojo/MAX version, dataset dimensions, and
+repetition count with every result.
 
 ## Caveats
 

@@ -3,8 +3,9 @@
 Gradient boosted decision trees in [Mojo](https://www.modular.com/mojo).
 
 mojoboost is a from-scratch GBDT library in the LightGBM family. It uses
-histogram-based split finding and leaf-wise (best-first) tree growth, and it
-matches LightGBM's default hyperparameters so results are directly comparable.
+histogram-based split finding and leaf-wise (best-first) tree growth. Its
+benchmark configuration aligns important parameters with LightGBM for
+reproducible comparisons.
 
 ## Why Mojo
 
@@ -41,10 +42,16 @@ with tests
   two importance types
 - SIMD histogram kernels (pointer-based scatter accumulation, vectorized
   sibling subtraction and split scans)
+- multicore CPU histogram accumulation across independent features
+- experimental portable GPU histogram accumulation, tested for correctness
+  on Apple Metal; CUDA and HIP validation is still required
 - model serialization: `save_model`/`load_model` with a versioned text
   format that stores floats as raw bit patterns, so loaded models predict
   bit-exactly; multiclass models via `save_multiclass_model` and
   `load_multiclass_model`
+- scikit-learn style Python API (`MojoBoostRegressor`,
+  `MojoBoostClassifier`) backed by a CPython extension module built from
+  the same Mojo code, with sample weights and exact save/load
 - multiclass end to end on raw data: `fit_multiclass` returns a
   `MulticlassModel` with `predict_proba` and `predict_class`
 
@@ -62,12 +69,35 @@ def main() raises:
 Lower-level entry points `train`, `train_with_valid`, and
 `train_multiclass` operate on pre-binned matrices.
 
+## Python API
+
+Build the extension once with `bindings/build.sh`, then use the
+scikit-learn style estimators in `python/mojoboost`:
+
+```python
+from mojoboost import MojoBoostRegressor, MojoBoostClassifier
+
+model = MojoBoostRegressor(num_leaves=31, n_estimators=100).fit(X, y)
+pred = model.predict(X)          # numpy in/out when numpy is available
+model.save("model.mbst")
+model = MojoBoostRegressor.load("model.mbst")
+
+clf = MojoBoostClassifier().fit(X, labels)   # binary or multiclass by labels
+proba = clf.predict_proba(X)
+```
+
+`fit` accepts `sample_weight`, hyperparameters mirror the Mojo defaults,
+and saved models round-trip bit-exactly. numpy is optional; plain Python
+sequences work without it.
+
 ## Roadmap
 
-1. Multicore training (feature-parallel histogram accumulation)
-2. scikit-learn style `fit`/`predict` Python API via Mojo interop
-3. Broader benchmark suite (XGBoost, real datasets)
-4. GPU training
+1. Integrate the GPU histogram backend into end-to-end training while keeping
+   intermediate state device-resident
+2. Scale GPU histograms beyond one threadgroup per feature and validate on
+   Apple, NVIDIA, and AMD hardware
+3. Package the Python API for distribution (wheels, PyPI)
+4. Broader benchmark suite (XGBoost and real datasets)
 
 ## Defaults
 
@@ -91,12 +121,17 @@ pixi install
 pixi run test
 ```
 
+The test command includes CPU/GPU equivalence checks. They run when a
+supported accelerator is present and skip cleanly on CPU-only machines.
+
 ## Benchmarks
 
 Reproducible from `bench/` (methodology, exact parameters, and caveats in
 [bench/README.md](bench/README.md)). Both drivers generate bit-identical
 synthetic data from the same splitmix64 stream and train with matched
-parameters. 100,000 rows x 100 features, 100 rounds, Apple M4:
+parameters. The table below preserves the original single-thread baseline;
+rerun the commands for current multicore results. 100,000 rows x 100
+features, 100 rounds, Apple M4:
 
 | | mojoboost (1 thread) | LightGBM (1 thread) |
 |---|---|---|
@@ -106,13 +141,17 @@ parameters. 100,000 rows x 100 features, 100 rounds, Apple M4:
 | Binary: training | 3.50 s | 2.32 s |
 | Binary: train logloss | 0.267034 | 0.267168 |
 
-Within 1.5x of single-threaded LightGBM on training and faster at binning,
-with no multithreading, GOSS, or EFB yet.
+The original implementation was within 1.5x of single-threaded LightGBM on
+training and faster at binning, before multicore histogram accumulation.
 
 ```sh
 pixi run bench                 # mojoboost
 pixi run -e bench bench-lgbm --threads 1
+pixi run bench-hist            # CPU/GPU histogram microbenchmark
 ```
+
+The GPU microbenchmark separates first-use setup from repeated builds. It is
+a kernel-development measurement, not an end-to-end GPU-training claim.
 
 ## License
 

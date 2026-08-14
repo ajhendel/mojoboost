@@ -8,13 +8,21 @@ The accumulation loops are scatter-bound (bin indices collide), so they use
 pointer-based scalar stores; the elementwise kernels (sibling subtraction)
 are SIMD-vectorized. `SIMD_LANES` is sized above the hardware width so the
 compiler can keep several vector operations in flight.
+
+Accumulation parallelizes across features: each feature owns the
+`[f * n_bins, (f + 1) * n_bins)` slice of the output, so per-feature workers
+never write the same location and need no atomics. Nodes too small to amortize
+task-scheduling overhead take the serial path.
 """
 
+from max.algorithm import sync_parallelize
 from std.sys.info import simd_width_of
 
 from .binning import BinnedMatrix
 
 comptime SIMD_LANES = 4 * simd_width_of[DType.float64]()
+
+comptime PARALLEL_MIN_OPS = 1 << 17
 
 
 @fieldwise_init
@@ -57,14 +65,24 @@ def build_histogram(
     var cp = c.unsafe_ptr()
     var grad_p = grad.unsafe_ptr()
     var hess_p = hess.unsafe_ptr()
-    for f in range(data.n_features):
-        var bins_p = data.bins.unsafe_ptr().unsafe_offset(f * data.n_rows)
-        var base = f * data.n_bins
-        for r in range(data.n_rows):
-            var b = base + Int(bins_p.unsafe_load(r))
+    var bins_p = data.bins.unsafe_ptr()
+    var n_rows = data.n_rows
+    var n_bins = data.n_bins
+
+    def do_feature(f: Int) {imm}:
+        var col = bins_p.unsafe_offset(f * n_rows)
+        var base = f * n_bins
+        for r in range(n_rows):
+            var b = base + Int(col.unsafe_load(r))
             gp.unsafe_store(b, gp.unsafe_load(b) + grad_p.unsafe_load(r))
             hp.unsafe_store(b, hp.unsafe_load(b) + hess_p.unsafe_load(r))
             cp.unsafe_store(b, cp.unsafe_load(b) + 1)
+
+    if data.n_features > 1 and data.n_features * n_rows >= PARALLEL_MIN_OPS:
+        sync_parallelize(do_feature, data.n_features)
+    else:
+        for f in range(data.n_features):
+            do_feature(f)
 
     return Histogram(g^, h^, c^, data.n_features, data.n_bins)
 
@@ -90,16 +108,26 @@ def build_histogram_subset(
     var grad_p = grad.unsafe_ptr()
     var hess_p = hess.unsafe_ptr()
     var rows_p = rows.unsafe_ptr()
+    var bins_all_p = data.bins.unsafe_ptr()
+    var n_rows = data.n_rows
+    var n_bins = data.n_bins
     var n_sub = len(rows)
-    for f in range(data.n_features):
-        var bins_p = data.bins.unsafe_ptr().unsafe_offset(f * data.n_rows)
-        var base = f * data.n_bins
+
+    def do_feature(f: Int) {imm}:
+        var col = bins_all_p.unsafe_offset(f * n_rows)
+        var base = f * n_bins
         for i in range(n_sub):
             var r = rows_p.unsafe_load(i)
-            var b = base + Int(bins_p.unsafe_load(r))
+            var b = base + Int(col.unsafe_load(r))
             gp.unsafe_store(b, gp.unsafe_load(b) + grad_p.unsafe_load(r))
             hp.unsafe_store(b, hp.unsafe_load(b) + hess_p.unsafe_load(r))
             cp.unsafe_store(b, cp.unsafe_load(b) + 1)
+
+    if data.n_features > 1 and data.n_features * n_sub >= PARALLEL_MIN_OPS:
+        sync_parallelize(do_feature, data.n_features)
+    else:
+        for f in range(data.n_features):
+            do_feature(f)
 
     return Histogram(g^, h^, c^, data.n_features, data.n_bins)
 
