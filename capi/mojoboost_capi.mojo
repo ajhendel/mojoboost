@@ -36,9 +36,11 @@ from mojoboost.device import (
     gpu_available,
     resolve_device,
 )
+from mojoboost.importance import gain_importance, split_importance
 from mojoboost.inspection import dump_model, dump_multiclass_model
 from mojoboost.model import Model, MulticlassModel, fit, fit_multiclass
 from mojoboost.params import (
+    SUPPORTED_KEYS,
     TrainConfig,
     params_names_mojo_api_only,
     parse_params,
@@ -51,10 +53,14 @@ from mojoboost.serialize import (
     save_multiclass_model,
 )
 
-# Keep in sync with MOJOBOOST_ABI_VERSION in capi/mojoboost.h. Version 2 is a
-# strict superset of version 1: it only adds declarations, so a caller
-# compiled against version 1 keeps working unchanged.
-comptime ABI_VERSION: Int32 = 2
+# Keep in sync with MOJOBOOST_ABI_VERSION in capi/mojoboost.h. Each version is
+# a strict superset of the one before: they only add declarations, so a caller
+# compiled against any earlier version keeps working unchanged.
+comptime ABI_VERSION: Int32 = 3
+
+# Importance types, matching MOJOBOOST_IMPORTANCE_* in capi/mojoboost.h.
+comptime IMPORTANCE_SPLIT: Int32 = 0
+comptime IMPORTANCE_GAIN: Int32 = 1
 
 # Keep in sync with python/pyproject.toml and pixi.toml.
 comptime VERSION_MAJOR: Int32 = 0
@@ -190,6 +196,35 @@ struct _ModelBox(Movable):
         if self.kind == _MULTICLASS:
             return dump_multiclass_model(self.multi.value())
         return dump_model(self.single.value())
+
+    def importance(self, kind: Int32) raises -> List[Float64]:
+        """Per-feature importance, from the one implementation in
+        importance.mojo rather than a count kept here.
+
+        Both importance functions take a flat tree list and neither cares
+        which class a tree belongs to, so the multiclass sum over classes
+        falls out of passing the whole ensemble instead of needing a second
+        code path. Split counts come back as integers and are widened here,
+        which is what lets one C signature serve both types."""
+        var n = self.n_features()
+        if self.kind == _MULTICLASS:
+            if kind == IMPORTANCE_GAIN:
+                return gain_importance(self.multi.value().booster.trees, n)
+            return _widen(
+                split_importance(self.multi.value().booster.trees, n)
+            )
+        if kind == IMPORTANCE_GAIN:
+            return gain_importance(self.single.value().booster.trees, n)
+        return _widen(split_importance(self.single.value().booster.trees, n))
+
+
+def _widen(var counts: List[Int]) -> List[Float64]:
+    """Split counts as doubles, so one C signature serves both importance
+    types."""
+    var out = List[Float64](capacity=len(counts))
+    for i in range(len(counts)):
+        out.append(Float64(counts[i]))
+    return out^
 
 
 comptime _ModelPtr = Pointer[_ModelBox, MutUntrackedOrigin]
@@ -769,6 +804,69 @@ def mojoboost_model_dump_json(
     except e:
         return _fail(error, ERROR_INVALID_ARGUMENT, String(e))
     out_text[] = _new_c_string(text)
+    return OK
+
+
+@export
+def mojoboost_feature_importance(
+    model: _ModelPtr,
+    importance_type: Int32,
+    out_values: _F64Ptr,
+    out_len: Int64,
+    error: _ErrorPtr,
+) abi("C") -> Int32:
+    """Per-feature importance into a caller-owned buffer.
+
+    The buffer is filled only after the whole computation has succeeded, so
+    a failure leaves whatever the caller had there untouched rather than
+    half-written."""
+    _clear(error)
+    if _is_null(model):
+        return _invalid(error, String("model must not be NULL"))
+    if _is_null(out_values):
+        return _invalid(error, String("out_values must not be NULL"))
+    if (
+        importance_type != IMPORTANCE_SPLIT
+        and importance_type != IMPORTANCE_GAIN
+    ):
+        return _invalid(
+            error,
+            String(
+                "importance_type must be MOJOBOOST_IMPORTANCE_SPLIT (0) or"
+                " MOJOBOOST_IMPORTANCE_GAIN (1), got ",
+                importance_type,
+            ),
+        )
+    var values: List[Float64]
+    try:
+        values = model[].importance(importance_type)
+    except e:
+        return _invalid(error, String(e))
+    if out_len < Int64(len(values)):
+        return _invalid(
+            error,
+            String(
+                "out_len is ",
+                out_len,
+                " but this model has ",
+                len(values),
+                " features",
+            ),
+        )
+    for i in range(len(values)):
+        out_values.unsafe_store(i, values[i])
+    return OK
+
+
+@export
+def mojoboost_parameter_keys(
+    out_text: _CharOutPtr, error: _ErrorPtr
+) abi("C") -> Int32:
+    """The parser's own key list, so a binding never keeps a second copy."""
+    _clear(error)
+    if _is_null(out_text):
+        return _invalid(error, String("out_text must not be NULL"))
+    out_text[] = _new_c_string(SUPPORTED_KEYS)
     return OK
 
 

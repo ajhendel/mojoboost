@@ -1,0 +1,23 @@
+Package: mojoboost
+Type: Package
+Title: Gradient Boosting with the mojoboost Engine
+Version: 0.1.0
+Authors@R: person("Andrew", "Hendel", email = "ajhendel@gmail.com",
+                  role = c("aut", "cre"))
+Author: Andrew Hendel [aut, cre]
+Maintainer: Andrew Hendel <ajhendel@gmail.com>
+Description: R bindings for mojoboost, a gradient boosting decision tree
+    library written in Mojo. The package wraps mojoboost's stable C ABI and
+    follows the syntax of the 'lightgbm' R package: mb.Dataset(), mb.train(),
+    a predict() method, mb.save()/mb.load(), and mb.importance(). Dense
+    matrices are supported; sparse input is not yet, because the engine has
+    no sparse boosting loop.
+License: MIT + file LICENSE
+Encoding: UTF-8
+SystemRequirements: mojoboost C ABI >= 3 (build it with capi/build.sh)
+Depends: R (>= 3.5.0)
+Imports: stats
+Suggests: testthat (>= 3.0.0)
+Config/testthat/edition: 3
+NeedsCompilation: yes
+Config/roxygen2/version: 8.1.0

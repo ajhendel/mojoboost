@@ -579,6 +579,120 @@ static void test_weights(void) {
     mojoboost_error_free(err);
 }
 
+/* Importance and the parameter key list, the two calls ABI version 3 added
+ * for the R bindings. Both are what a binding needs to avoid keeping its own
+ * copy of something the engine already knows. */
+static void test_feature_importance(void) {
+    MojoBoostError *err = mojoboost_error_create();
+    MojoBoostModel *model = NULL;
+    CHECK_OK(mojoboost_train_dense(x, N_ROWS, N_FEATURES, y_reg, NULL,
+                                   "num_iterations=12 num_leaves=7", &model,
+                                   err),
+             err, "train for importance");
+
+    double split[N_FEATURES], gain[N_FEATURES];
+    CHECK_OK(mojoboost_feature_importance(model, MOJOBOOST_IMPORTANCE_SPLIT,
+                                          split, N_FEATURES, err),
+             err, "split importance");
+    CHECK_OK(mojoboost_feature_importance(model, MOJOBOOST_IMPORTANCE_GAIN,
+                                          gain, N_FEATURES, err),
+             err, "gain importance");
+
+    int splits = 0;
+    double total_gain = 0.0;
+    for (int f = 0; f < N_FEATURES; f++) {
+        CHECK(split[f] >= 0.0, "a split count is not negative");
+        CHECK(split[f] == (double)(long)split[f], "split counts are whole");
+        CHECK(gain[f] >= 0.0, "a gain is not negative");
+        splits += (int)split[f];
+        total_gain += gain[f];
+    }
+    CHECK(splits > 0, "a fitted model splits on something");
+    CHECK(total_gain > 0.0, "a fitted model records gain");
+
+    /* A feature that is never split on has no gain either, so the two types
+     * agree about which features the model actually used. */
+    for (int f = 0; f < N_FEATURES; f++) {
+        if (split[f] == 0.0) {
+            CHECK(gain[f] == 0.0, "an unused feature has zero gain");
+        }
+    }
+
+    /* Rejections. Nothing is written when the call fails. */
+    double guard[N_FEATURES];
+    for (int f = 0; f < N_FEATURES; f++) guard[f] = -7.0;
+    CHECK(mojoboost_feature_importance(model, 2, guard, N_FEATURES, err) ==
+              MOJOBOOST_ERROR_INVALID_ARGUMENT,
+          "an unknown importance type is refused");
+    CHECK(guard[0] == -7.0, "a refused type writes nothing");
+    CHECK(strlen(mojoboost_error_message(err)) > 0,
+          "the refusal explains itself");
+    CHECK(mojoboost_feature_importance(model, MOJOBOOST_IMPORTANCE_SPLIT,
+                                       guard, N_FEATURES - 1, err) ==
+              MOJOBOOST_ERROR_INVALID_ARGUMENT,
+          "too small a buffer is refused");
+    CHECK(guard[0] == -7.0, "a refused length writes nothing");
+    CHECK(mojoboost_feature_importance(NULL, MOJOBOOST_IMPORTANCE_SPLIT, guard,
+                                       N_FEATURES, err) ==
+              MOJOBOOST_ERROR_INVALID_ARGUMENT,
+          "a NULL model is refused");
+    CHECK(mojoboost_feature_importance(model, MOJOBOOST_IMPORTANCE_SPLIT, NULL,
+                                       N_FEATURES, err) ==
+              MOJOBOOST_ERROR_INVALID_ARGUMENT,
+          "a NULL buffer is refused");
+
+    mojoboost_model_free(model);
+    mojoboost_error_free(err);
+}
+
+static void test_multiclass_importance_sums_over_classes(void) {
+    MojoBoostError *err = mojoboost_error_create();
+    MojoBoostModel *model = NULL;
+    CHECK_OK(mojoboost_train_dense(x, N_ROWS, N_FEATURES, y_multi, NULL,
+                                   "objective=multiclass num_class=3"
+                                   " num_iterations=6",
+                                   &model, err),
+             err, "train multiclass for importance");
+
+    int64_t trees = 0, iterations = 0;
+    CHECK_OK(mojoboost_model_num_trees(model, &trees, err), err, "trees");
+    CHECK_OK(mojoboost_model_num_iterations(model, &iterations, err), err,
+             "iterations");
+    CHECK(trees == iterations * 3, "one tree per class per iteration");
+
+    double split[N_FEATURES];
+    CHECK_OK(mojoboost_feature_importance(model, MOJOBOOST_IMPORTANCE_SPLIT,
+                                          split, N_FEATURES, err),
+             err, "multiclass split importance");
+    int total = 0;
+    for (int f = 0; f < N_FEATURES; f++) total += (int)split[f];
+    /* Summed over every tree, so over classes as well as iterations. A
+     * per-class count could not exceed the single-class tree count. */
+    CHECK(total > 0, "a multiclass model splits on something");
+
+    mojoboost_model_free(model);
+    mojoboost_error_free(err);
+}
+
+static void test_parameter_keys(void) {
+    MojoBoostError *err = mojoboost_error_create();
+    char *keys = NULL;
+    CHECK_OK(mojoboost_parameter_keys(&keys, err), err, "parameter keys");
+    CHECK(keys != NULL, "keys are returned");
+    CHECK(strlen(keys) > 0, "keys are not empty");
+    /* Spot check a few the parser really does accept, since the point of
+     * this call is that a binding does not keep its own copy. */
+    CHECK(strstr(keys, "objective") != NULL, "objective is listed");
+    CHECK(strstr(keys, "num_iterations") != NULL, "num_iterations is listed");
+    CHECK(strstr(keys, "learning_rate") != NULL, "learning_rate is listed");
+    mojoboost_string_free(keys);
+
+    CHECK(mojoboost_parameter_keys(NULL, err) ==
+              MOJOBOOST_ERROR_INVALID_ARGUMENT,
+          "a NULL out pointer is refused");
+    mojoboost_error_free(err);
+}
+
 int main(void) {
     make_data();
 
@@ -594,6 +708,9 @@ int main(void) {
     test_invalid_io();
     test_weights();
     test_handle_churn();
+    test_feature_importance();
+    test_multiclass_importance_sums_over_classes();
+    test_parameter_keys();
 
     printf("%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;

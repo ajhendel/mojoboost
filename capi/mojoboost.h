@@ -79,8 +79,9 @@ extern "C" {
  *   2  mojoboost_predict_ex (iteration ranges and device selection),
  *      mojoboost_model_num_iterations, mojoboost_gpu_available,
  *      mojoboost_model_dump_json, mojoboost_string_free.
+ *   3  mojoboost_feature_importance, mojoboost_parameter_keys.
  */
-#define MOJOBOOST_ABI_VERSION 2
+#define MOJOBOOST_ABI_VERSION 3
 
 /* Status codes. Success is 0; every failure is negative. */
 #define MOJOBOOST_OK 0
@@ -106,6 +107,13 @@ extern "C" {
  * dropped by an older one. Since ABI version 2. */
 #define MOJOBOOST_PREDICT_RESPONSE 0
 #define MOJOBOOST_PREDICT_RAW 1
+
+/* What mojoboost_feature_importance measures. SPLIT counts how many splits
+ * each feature is used by; GAIN sums the recorded gain of those splits.
+ * These are LightGBM's two importance types under its own names. Since ABI
+ * version 3. */
+#define MOJOBOOST_IMPORTANCE_SPLIT 0
+#define MOJOBOOST_IMPORTANCE_GAIN 1
 
 /* A trained or loaded model. Opaque: the layout is a mojoboost internal. */
 typedef struct MojoBoostModel MojoBoostModel;
@@ -276,6 +284,40 @@ int32_t mojoboost_model_num_iterations(const MojoBoostModel *model,
  * Column_0, Column_1, ... as LightGBM does. Since ABI version 2. */
 int32_t mojoboost_model_dump_json(const MojoBoostModel *model,
                                   char **out_text, MojoBoostError *error);
+
+/* Per-feature importance, one double per feature in feature order.
+ *
+ *   importance_type  MOJOBOOST_IMPORTANCE_SPLIT or MOJOBOOST_IMPORTANCE_GAIN.
+ *                    Any other value is MOJOBOOST_ERROR_INVALID_ARGUMENT.
+ *   out_values       receives mojoboost_model_num_features(model) doubles.
+ *   out_len          capacity of out_values; must be at least that many.
+ *
+ * Split counts are whole numbers returned as doubles, so one call shape
+ * serves both types. A multiclass model sums over every tree, which is
+ * across classes as well as iterations, exactly as LightGBM does.
+ *
+ * Gain importance is all zeros for a model read from a file written before
+ * format v4, because those files carry no split gains. That is an absence
+ * rather than a measurement; mojoboost_model_dump_json reports
+ * has_split_gain, which tells the two apart. Nothing is written unless the
+ * whole call succeeds. Since ABI version 3. */
+int32_t mojoboost_feature_importance(const MojoBoostModel *model,
+                                     int32_t importance_type,
+                                     double *out_values, int64_t out_len,
+                                     MojoBoostError *error);
+
+/* Every key a parameter string accepts, comma separated, primary names only.
+ *
+ * This is the same list the parser validates against, so a binding can offer
+ * completion or reject a typo without hardcoding a copy that drifts. Aliases
+ * are not included, and neither are parameters that name a real feature this
+ * parser cannot carry in a string; those are reported per call as
+ * MOJOBOOST_ERROR_UNSUPPORTED when a caller tries one.
+ *
+ * On success *out_text is a NUL terminated UTF-8 string the caller owns and
+ * must release with mojoboost_string_free. On failure *out_text is
+ * untouched. Since ABI version 3. */
+int32_t mojoboost_parameter_keys(char **out_text, MojoBoostError *error);
 
 /* --------------------------------------------------------------- destroy */
 

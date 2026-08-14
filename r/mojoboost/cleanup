@@ -1,0 +1,6 @@
+#!/bin/sh
+# Undo what ./configure and the build leave behind, so the source tree goes
+# back to what is checked in. R runs this after R CMD build and on
+# R CMD INSTALL --preclean.
+rm -f src/Makevars
+rm -f src/*.o src/*.so src/*.dll

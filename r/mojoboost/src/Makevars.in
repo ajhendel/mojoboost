@@ -1,0 +1,5 @@
+# Generated from Makevars.in by ./configure. MOJOBOOST_HOME points at the
+# mojoboost checkout holding capi/mojoboost.h and the built C ABI library.
+PKG_CPPFLAGS = -I@MOJOBOOST_HOME@/capi
+PKG_LIBS = -L@MOJOBOOST_HOME@/capi -lmojoboost \
+           -Wl,-rpath,@MOJOBOOST_HOME@/capi

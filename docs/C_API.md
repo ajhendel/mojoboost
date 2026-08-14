@@ -26,6 +26,8 @@ the command line tool use:
 | `mojoboost_predict`, `mojoboost_predict_raw`, `mojoboost_predict_ex` | `Model.predict_batch` / `MulticlassModel.predict_batch` (`model.mojo`) |
 | `mojoboost_save_model`, `mojoboost_load_model` | `serialize.mojo` |
 | `mojoboost_model_dump_json` | `dump_model` / `dump_multiclass_model` (`inspection.mojo`) |
+| `mojoboost_feature_importance` | `split_importance` / `gain_importance` (`importance.mojo`) |
+| `mojoboost_parameter_keys` | `SUPPORTED_KEYS` (`params.mojo`) |
 | the `device` argument | `resolve_device` (`device.mojo`, over `device_policy.mojo`) |
 | `parameters` | `parse_params` (`params.mojo`) |
 | `mojoboost_gpu_available` | `gpu_available` (`device.mojo`) |
@@ -51,6 +53,7 @@ changes.
 |---|---|
 | 1 | train, predict, save, load, accessors, errors |
 | 2 | `mojoboost_predict_ex`, `mojoboost_model_num_iterations`, `mojoboost_gpu_available`, `mojoboost_model_dump_json`, `mojoboost_string_free`, `MOJOBOOST_DEVICE_*`, `MOJOBOOST_PREDICT_*` |
+| 3 | `mojoboost_feature_importance`, `mojoboost_parameter_keys`, `MOJOBOOST_IMPORTANCE_*` |
 
 A caller built against version N works unchanged against any library
 reporting at least N. Test accordingly:
@@ -100,6 +103,7 @@ type without breaking a compiled caller. Two consequences:
 | `MojoBoostError *` | library | `mojoboost_error_free` |
 | `mojoboost_error_message` result | the error object | nothing |
 | `mojoboost_model_dump_json` result | caller | `mojoboost_string_free` |
+| `mojoboost_parameter_keys` result | caller | `mojoboost_string_free` |
 
 The library copies whatever it needs during a call and retains nothing
 afterward. Every free function accepts `NULL`.
@@ -219,6 +223,16 @@ each thread passes its own error object and its own output buffer.
   source.
 - Do not parse error messages. They are for humans; branch on the status
   code.
+- `r/mojoboost` is the first in-tree consumer of this ABI and the worked
+  example of the paragraphs above: `r/mojoboost/src/mojoboost_r.c` sizes its
+  buffers from the accessors, creates one error object per call, and copies
+  the message out before raising, because R's error mechanism is a long
+  jump. `r/mojoboost/configure` shows how to fail at configure time on an
+  ABI older than a binding needs.
+- Keep a binding's parameter list from drifting by reading
+  `mojoboost_parameter_keys` rather than hardcoding one. The list is primary
+  names only; aliases are accepted by `parse_params` but not reported, so a
+  binding that checks membership before calling must allow for them.
 - The shared library needs the Mojo runtime on its search path. In a
   development checkout that is the pixi environment's `lib` directory, and
   `capi/run_c_tests.sh` shows the `-rpath` flags. For a distributed
