@@ -372,10 +372,17 @@ def test_routing_mirrors_the_split_it_came_from() raises:
 def _upload_bins(
     mut ctx: DeviceContext, data: BinnedMatrix
 ) raises -> DeviceBuffer[DType.uint8]:
-    var buf = ctx.enqueue_create_buffer[DType.uint8](len(data.bins))
-    ctx.enqueue_copy(dst_buf=buf, src_ptr=data.bins.unsafe_ptr())
-    ctx.synchronize()
-    return buf^
+    # The comptime guard keeps the device instantiation out of CPU-only
+    # builds: module-level helpers compile unconditionally, so without it a
+    # machine with no accelerator fails the arch constraint at compile time
+    # even though only guarded tests ever call this.
+    comptime if not has_accelerator():
+        raise Error("no accelerator")
+    else:
+        var buf = ctx.enqueue_create_buffer[DType.uint8](len(data.bins))
+        ctx.enqueue_copy(dst_buf=buf, src_ptr=data.bins.unsafe_ptr())
+        ctx.synchronize()
+        return buf^
 
 
 def _assert_device_matches_host(
@@ -391,18 +398,21 @@ def _assert_device_matches_host(
 ) raises:
     """Run one split on both the device and the reference model and require
     the whole buffer to agree, not just the partitioned window."""
-    var window = rows.range_of(parent)
-    var want_left = partition_range_host(
-        host_rows, scratch, data, window, routing
-    )
-    var got_left = rows.partition(
-        bins.unsafe_ptr(), parent, left, right, routing
-    )
-    assert_equal(got_left, want_left)
-    var got = rows.download_rows()
-    for j in range(len(host_rows)):
-        assert_equal(Int(got[j]), Int(host_rows[j]))
-    rows.ranges.check_invariants()
+    comptime if not has_accelerator():
+        raise Error("no accelerator")
+    else:
+        var window = rows.range_of(parent)
+        var want_left = partition_range_host(
+            host_rows, scratch, data, window, routing
+        )
+        var got_left = rows.partition(
+            bins.unsafe_ptr(), parent, left, right, routing
+        )
+        assert_equal(got_left, want_left)
+        var got = rows.download_rows()
+        for j in range(len(host_rows)):
+            assert_equal(Int(got[j]), Int(host_rows[j]))
+        rows.ranges.check_invariants()
 
 
 def test_device_partition_matches_the_host_reference() raises:
@@ -592,95 +602,104 @@ def _fixed_scale(values: List[Float64]) -> Float32:
 
 
 def _range_histogram_case(strategy: Int) raises:
-    var n_rows = 2048
-    var n_features = 3
-    var n_bins = 16
-    var data = _make_data(n_rows, n_features, n_bins)
-    var grad = List[Float64](capacity=n_rows)
-    var hess = List[Float64](capacity=n_rows)
-    for r in range(n_rows):
-        grad.append(
-            Float64(Int(_splitmix64(UInt64(r) + 7) % 2000)) * 0.001 - 1.0
+    comptime if not has_accelerator():
+        raise Error("no accelerator")
+    else:
+        var n_rows = 2048
+        var n_features = 3
+        var n_bins = 16
+        var data = _make_data(n_rows, n_features, n_bins)
+        var grad = List[Float64](capacity=n_rows)
+        var hess = List[Float64](capacity=n_rows)
+        for r in range(n_rows):
+            grad.append(
+                Float64(Int(_splitmix64(UInt64(r) + 7) % 2000)) * 0.001 - 1.0
+            )
+            hess.append(
+                Float64(Int(_splitmix64(UInt64(r) + 991) % 1000)) * 0.001
+                + 0.25
+            )
+
+        var ctx = DeviceContext()
+        var caps = query_device_caps(ctx)
+        var bins = _upload_bins(ctx, data)
+        var rows = GpuActiveRows(ctx, n_rows, n_features, n_bins, caps)
+        rows.begin_tree()
+
+        var g_scale = _fixed_scale(grad)
+        var h_scale = _fixed_scale(hess)
+        var grad32 = ctx.enqueue_create_host_buffer[DType.float32](n_rows)
+        var hess32 = ctx.enqueue_create_host_buffer[DType.float32](n_rows)
+        for r in range(n_rows):
+            grad32.unsafe_ptr().unsafe_store(r, Float32(grad[r]))
+            hess32.unsafe_ptr().unsafe_store(r, Float32(hess[r]))
+        var grad_dev = ctx.enqueue_create_buffer[DType.float32](n_rows)
+        var hess_dev = ctx.enqueue_create_buffer[DType.float32](n_rows)
+        ctx.enqueue_copy(dst_buf=grad_dev, src_ptr=grad32.unsafe_ptr())
+        ctx.enqueue_copy(dst_buf=hess_dev, src_ptr=hess32.unsafe_ptr())
+
+        var feat_dev = ctx.enqueue_create_buffer[DType.int32](n_features)
+        with feat_dev.map_to_host() as host:
+            for f in range(n_features):
+                host.unsafe_ptr().unsafe_store(f, Int32(f))
+
+        var hist_size = n_features * n_bins
+        var out_dev = ctx.enqueue_create_buffer[DType.int32](3 * hist_size)
+        var host_out = ctx.enqueue_create_host_buffer[DType.int32](
+            3 * hist_size
         )
-        hess.append(
-            Float64(Int(_splitmix64(UInt64(r) + 991) % 1000)) * 0.001 + 0.25
+
+        # Split once so the histogram is built over a proper sub-range that
+        # does not start at 0, which is the case the leaf-id filter never
+        # exercised.
+        var routing = RowRouting.numerical(0, 6)
+        _ = rows.partition(bins.unsafe_ptr(), 0, 1, 2, routing)
+        var node = 2
+        var node_rows = rows.download_range(node)
+        assert_true(len(node_rows) > 0)
+
+        var tiling = rows.range_tiling(
+            caps, node, n_features, strategy, 1 << 20
         )
+        assert_equal(tiling.strategy, strategy)
+        var part_cells = tiling.partial_cells
+        if part_cells < 1:
+            part_cells = 1
+        var part_dev = ctx.enqueue_create_buffer[DType.int32](3 * part_cells)
 
-    var ctx = DeviceContext()
-    var caps = query_device_caps(ctx)
-    var bins = _upload_bins(ctx, data)
-    var rows = GpuActiveRows(ctx, n_rows, n_features, n_bins, caps)
-    rows.begin_tree()
+        rows.enqueue_range_histogram(
+            tiling,
+            node,
+            bins.unsafe_ptr(),
+            grad_dev.unsafe_ptr(),
+            hess_dev.unsafe_ptr(),
+            feat_dev.unsafe_ptr(),
+            out_dev.unsafe_ptr(),
+            part_dev.unsafe_ptr(),
+            n_features,
+            g_scale,
+            h_scale,
+        )
+        ctx.enqueue_copy(dst_ptr=host_out.unsafe_ptr(), src_buf=out_dev)
+        ctx.synchronize()
 
-    var g_scale = _fixed_scale(grad)
-    var h_scale = _fixed_scale(hess)
-    var grad32 = ctx.enqueue_create_host_buffer[DType.float32](n_rows)
-    var hess32 = ctx.enqueue_create_host_buffer[DType.float32](n_rows)
-    for r in range(n_rows):
-        grad32.unsafe_ptr().unsafe_store(r, Float32(grad[r]))
-        hess32.unsafe_ptr().unsafe_store(r, Float32(hess[r]))
-    var grad_dev = ctx.enqueue_create_buffer[DType.float32](n_rows)
-    var hess_dev = ctx.enqueue_create_buffer[DType.float32](n_rows)
-    ctx.enqueue_copy(dst_buf=grad_dev, src_ptr=grad32.unsafe_ptr())
-    ctx.enqueue_copy(dst_buf=hess_dev, src_ptr=hess32.unsafe_ptr())
-
-    var feat_dev = ctx.enqueue_create_buffer[DType.int32](n_features)
-    with feat_dev.map_to_host() as host:
-        for f in range(n_features):
-            host.unsafe_ptr().unsafe_store(f, Int32(f))
-
-    var hist_size = n_features * n_bins
-    var out_dev = ctx.enqueue_create_buffer[DType.int32](3 * hist_size)
-    var host_out = ctx.enqueue_create_host_buffer[DType.int32](3 * hist_size)
-
-    # Split once so the histogram is built over a proper sub-range that does
-    # not start at 0, which is the case the leaf-id filter never exercised.
-    var routing = RowRouting.numerical(0, 6)
-    _ = rows.partition(bins.unsafe_ptr(), 0, 1, 2, routing)
-    var node = 2
-    var node_rows = rows.download_range(node)
-    assert_true(len(node_rows) > 0)
-
-    var tiling = rows.range_tiling(
-        caps, node, n_features, strategy, 1 << 20
-    )
-    assert_equal(tiling.strategy, strategy)
-    var part_cells = tiling.partial_cells
-    if part_cells < 1:
-        part_cells = 1
-    var part_dev = ctx.enqueue_create_buffer[DType.int32](3 * part_cells)
-
-    rows.enqueue_range_histogram(
-        tiling,
-        node,
-        bins.unsafe_ptr(),
-        grad_dev.unsafe_ptr(),
-        hess_dev.unsafe_ptr(),
-        feat_dev.unsafe_ptr(),
-        out_dev.unsafe_ptr(),
-        part_dev.unsafe_ptr(),
-        n_features,
-        g_scale,
-        h_scale,
-    )
-    ctx.enqueue_copy(dst_ptr=host_out.unsafe_ptr(), src_buf=out_dev)
-    ctx.synchronize()
-
-    var want = build_histogram_subset(data, grad, hess, node_rows)
-    var src = host_out.unsafe_ptr()
-    var g_inv = 1.0 / Float64(g_scale)
-    var h_inv = 1.0 / Float64(h_scale)
-    var total_count = 0
-    for i in range(hist_size):
-        # Counts are exact integers on both sides.
-        assert_equal(Int(src.unsafe_load(2 * hist_size + i)), want.count[i])
-        total_count += want.count[i]
-        var got_g = Float64(src.unsafe_load(i)) * g_inv
-        var got_h = Float64(src.unsafe_load(hist_size + i)) * h_inv
-        assert_true(abs(got_g - want.grad[i]) < 1e-3)
-        assert_true(abs(got_h - want.hess[i]) < 1e-3)
-    # Every row of the node landed in exactly one bin of every feature.
-    assert_equal(total_count, len(node_rows) * n_features)
+        var want = build_histogram_subset(data, grad, hess, node_rows)
+        var src = host_out.unsafe_ptr()
+        var g_inv = 1.0 / Float64(g_scale)
+        var h_inv = 1.0 / Float64(h_scale)
+        var total_count = 0
+        for i in range(hist_size):
+            # Counts are exact integers on both sides.
+            assert_equal(
+                Int(src.unsafe_load(2 * hist_size + i)), want.count[i]
+            )
+            total_count += want.count[i]
+            var got_g = Float64(src.unsafe_load(i)) * g_inv
+            var got_h = Float64(src.unsafe_load(hist_size + i)) * h_inv
+            assert_true(abs(got_g - want.grad[i]) < 1e-3)
+            assert_true(abs(got_h - want.hess[i]) < 1e-3)
+        # Every row of the node landed in exactly one bin of every feature.
+        assert_equal(total_count, len(node_rows) * n_features)
 
 
 def test_range_histogram_matches_the_cpu_subset_atomic() raises:

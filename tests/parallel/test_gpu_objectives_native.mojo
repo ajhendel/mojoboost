@@ -197,14 +197,18 @@ def _device_grad_hess(
     alpha: Float64,
 ) raises -> List[Float64]:
     """One round of device-side derivatives, downloaded: gradients first,
-    then hessians."""
-    var n = len(target)
-    var state = GpuObjectiveState(ctx, target, weights)
-    state.set_raw(ctx, raw)
-    var grad_dev = ctx.enqueue_create_buffer[DType.float32](n)
-    var hess_dev = ctx.enqueue_create_buffer[DType.float32](n)
-    state.fill_grad_hess(ctx, objective, alpha, grad_dev, hess_dev)
-    return state.download_grad_hess(ctx, grad_dev, hess_dev)
+    then hessians. The comptime guard keeps the device instantiation out of
+    CPU-only builds; only guarded tests call this."""
+    comptime if not has_accelerator():
+        raise Error("no accelerator")
+    else:
+        var n = len(target)
+        var state = GpuObjectiveState(ctx, target, weights)
+        state.set_raw(ctx, raw)
+        var grad_dev = ctx.enqueue_create_buffer[DType.float32](n)
+        var hess_dev = ctx.enqueue_create_buffer[DType.float32](n)
+        state.fill_grad_hess(ctx, objective, alpha, grad_dev, hess_dev)
+        return state.download_grad_hess(ctx, grad_dev, hess_dev)
 
 
 def _row_loss(
