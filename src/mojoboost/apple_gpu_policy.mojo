@@ -41,12 +41,20 @@ What this module deliberately does NOT encode:
   here is the same one `gpu_tiling.mojo` already ships: reduce when there is
   more than one tile to reduce, use atomics when there is not.
 - No crossover threshold. `CrossoverInputs.min_cells` is
-  `CROSSOVER_DISABLED`, matching `device.mojo`, where `auto` resolves to the
-  CPU because the only end-to-end GPU training measurement taken (M4,
-  bench/bench_train_gpu.mojo) is slower than the CPU trainer. This module
-  reports the inputs such a rule would key on so the benchmark that would
-  justify a threshold has somewhere to put its answer; it does not invent
-  the answer.
+  `CROSSOVER_DISABLED`, because the only end-to-end GPU training
+  measurement taken (M4, bench/bench_train_gpu.mojo) is slower than the CPU
+  trainer. This module reports the inputs such a rule would key on so the
+  benchmark that would justify a threshold has somewhere to put its answer;
+  it does not invent the answer, and it does not decide anything with it.
+  `device_policy.mojo` is where the crossover evidence table lives and
+  where `auto` is resolved; it imports `CROSSOVER_DISABLED` from here so
+  the disabled sentinel has one definition rather than two.
+
+Where this module sits. It is the leaf of the device layer: it imports
+nothing, opens nothing, and is imported by `device_policy.mojo`, which
+turns a `GpuProfile` into the hardware half of a device decision. Keeping
+the dependency in that direction is what lets the whole policy stack be
+exercised on a machine with no accelerator.
 
 The synthetic fixtures. `apple_synthetic()` returns a deliberately
 conservative capability profile per M-series generation, and every one of
@@ -131,7 +139,10 @@ comptime UNIFIED_PARTIAL_BUDGET_DIVISOR = 32
 comptime DISCRETE_PARTIAL_BUDGET_DIVISOR = 16
 
 # `CrossoverInputs.min_cells` when no measurement supports a threshold,
-# which is every case today. Negative disables, as in device.mojo.
+# which is every case today. Negative disables. The one definition of the
+# disabled sentinel: device_policy.mojo imports it rather than restating
+# it, so the two layers cannot drift into disagreeing about what "no
+# crossover" means.
 comptime CROSSOVER_DISABLED = -1
 
 # Threadgroup memory the synthetic Apple fixtures claim: the portable Apple
@@ -469,8 +480,12 @@ struct CrossoverInputs(Copyable, Movable):
     Reported so a crossover benchmark has a defined set of inputs to regress
     against and a defined place to put its answer. `min_cells` is
     `CROSSOVER_DISABLED` in every case this module can construct, because no
-    such benchmark has run: see the module docstring, and `device.mojo`,
-    which resolves `auto` to the CPU for the same reason.
+    such benchmark has run: see the module docstring, and
+    `crossover_rules()` in device_policy.mojo, which is empty for the same
+    reason and which is where a measured rule is installed.
+
+    Reporting only. Nothing reads `min_cells` off this value to decide a
+    device; `decide_device` consults the evidence table instead.
     """
 
     var api: Int

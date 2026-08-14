@@ -27,10 +27,10 @@
 #     `@v0.10.1` refs below are readable placeholders, and a tag is mutable.
 #     Task 10 (release security) owns the pinning policy; this file has to be
 #     updated when that lands.
-#   * Two blockers in python/pyproject.toml and python/setup.py have to be
-#     fixed first. The preflight step below fails loudly while they stand, and
-#     handoffs/release_03_linux_wheels.md has the exact edits.
 #   * pixi.toml has to provide patchelf on Linux, or the build step fails.
+#     The preflight step below reports it, along with the two metadata
+#     settings Task 01 fixed during this round and which have to survive it.
+#     handoffs/release_03_linux_wheels.md has all three as exact edits.
 
 name: Release wheels (Linux)
 
@@ -176,9 +176,12 @@ jobs:
           command -v nvidia-smi || echo "  no nvidia-smi"
           command -v rocm-smi || echo "  no rocm-smi"
 
-      # Fails while python/setup.py hard-codes a macOS platform tag and
-      # python/pyproject.toml's package-data cannot carry the bundled runtime.
-      # Both are Task 01's files and both are quiet failures if ignored.
+      # Fails while no pixi environment provides patchelf, and fails again if
+      # the macOS-only platform tag or the .libs package-data patterns in
+      # Task 01's files ever regress. All three are quiet failures if ignored:
+      # a wheel tagged for the wrong operating system, or one missing the
+      # runtime it needs, is produced without an error and breaks on a user's
+      # machine instead.
       - name: Metadata preflight
         run: python3 packaging/linux/check_metadata_ready.py
 

@@ -21,6 +21,14 @@ Intentional differences from LightGBM
   GOSS, monotone, interaction, and categorical settings, and custom
   objectives, are reachable from the Mojo API only; naming one of those
   keys reports that it is unsupported here rather than ignoring it.
+- A key that names a real LightGBM feature mojoboost has not implemented
+  gets its own error saying what it would take, never "unknown parameter"
+  and never silence. `objective=` values go through
+  `_raise_if_unimplemented_objective`, tree options through
+  `tree_parameters_extra.check_extra_option_supported` (`linear_tree`,
+  `linear_lambda`, `cegb_penalty_feature_lazy`,
+  `cegb_penalty_feature_coupled`, `forcedsplits_filename`), and
+  `enable_bundle` through `efb.check_bundling_supported`.
 """
 
 from .boosting import (
@@ -40,7 +48,13 @@ from .boosting import (
     TWEEDIE,
 )
 from .device import CPU_DEVICE, parse_device
+from .efb import check_bundling_params, check_bundling_supported
+from .sampling import canonical_data_sample_strategy
 from .tree import TreeParams
+from .tree_parameters_extra import (
+    check_extra_option_supported,
+    parse_monotone_method,
+)
 
 # `TrainConfig.objective` when the parameter string selects softmax
 # multiclass, which `fit_multiclass` handles instead of `fit`. Multiclass is
@@ -53,21 +67,32 @@ comptime SUPPORTED_KEYS = String(
     "objective, num_class, num_iterations, learning_rate, num_leaves,"
     " min_data_in_leaf, min_sum_hessian_in_leaf, lambda_l1, lambda_l2,"
     " max_depth, feature_fraction, feature_fraction_bynode,"
-    " feature_fraction_seed, max_bin, alpha, fair_c,"
+    " feature_fraction_bylevel, feature_fraction_seed, min_gain_to_split,"
+    " max_delta_step, path_smooth, extra_trees, extra_seed,"
+    " monotone_penalty, monotone_constraints_method, cegb_tradeoff,"
+    " cegb_penalty_split, enable_bundle, max_conflict_rate,"
+    " data_sample_strategy, max_bin, alpha, fair_c,"
     " tweedie_variance_power, device, use_missing"
 )
 
 # Parameters that name a real LightGBM feature this parser does not cover,
 # reported as unsupported instead of as unknown so the message can say why.
+#
+# `feature_contri` and `cegb_penalty_feature_coupled` are per-feature vectors,
+# which a whitespace-separated parameter string cannot carry any more than it
+# can carry `monotone_constraints`; the first is reachable through
+# `TreeParams.extra.penalties` in the Mojo API and the second is refused
+# outright (see `tree_parameters_extra.check_extra_option_supported`).
 comptime _MOJO_API_ONLY = String(
     "bagging_fraction bagging_freq bagging_seed pos_bagging_fraction"
     " neg_bagging_fraction top_rate other_rate boosting boosting_type"
-    " data_sample_strategy monotone_constraints interaction_constraints"
+    " monotone_constraints interaction_constraints"
     " categorical_feature cat_smooth cat_l2 max_cat_threshold"
     " max_cat_to_onehot min_data_per_group early_stopping_round"
     " early_stopping_rounds first_metric_only lambdarank_truncation_level"
     " label_gain sigmoid eval_at ndcg_eval_at class_weight is_unbalance"
-    " unbalance unbalanced_sets scale_pos_weight"
+    " unbalance unbalanced_sets scale_pos_weight feature_contri"
+    " feature_contrib fc fp feature_penalty"
 )
 
 
@@ -374,6 +399,17 @@ def _validate(config: TrainConfig, saw_num_class: Bool) raises:
         or config.booster.tree.feature_fraction_bynode > 1.0
     ):
         raise Error("feature_fraction_bynode must be in (0, 1]")
+    if (
+        config.booster.tree.feature_fraction_bylevel <= 0.0
+        or config.booster.tree.feature_fraction_bylevel > 1.0
+    ):
+        raise Error("feature_fraction_bylevel must be in (0, 1]")
+    # The data-independent half of the remaining tree controls. The per-
+    # feature vectors are checked against the dataset later, in
+    # `tree.grow_tree`, because a parameter string cannot carry one.
+    config.booster.tree.extra.check_scalars(
+        config.booster.tree.min_data_in_leaf
+    )
     if config.max_bin < 2:
         raise Error("max_bin must be at least 2")
 
@@ -474,8 +510,73 @@ def parse_params(spec: String) raises -> TrainConfig:
             config.booster.tree.feature_fraction_bynode = _parse_f64(
                 key, value
             )
+        elif (
+            key == "feature_fraction_bylevel" or key == "colsample_bylevel"
+        ):
+            # XGBoost's name; LightGBM has no per-level fraction at all, so
+            # this is an extension rather than a parity row (sampling.mojo).
+            config.booster.tree.feature_fraction_bylevel = _parse_f64(
+                key, value
+            )
         elif key == "feature_fraction_seed":
             config.booster.tree.feature_fraction_seed = _parse_int(key, value)
+        elif key == "min_gain_to_split" or key == "min_split_gain":
+            config.booster.tree.extra.min_gain_to_split = _parse_f64(
+                key, value
+            )
+        elif (
+            key == "max_delta_step"
+            or key == "max_tree_output"
+            or key == "max_leaf_output"
+        ):
+            config.booster.tree.extra.max_delta_step = _parse_f64(key, value)
+        elif key == "path_smooth":
+            config.booster.tree.extra.path_smooth = _parse_f64(key, value)
+        elif key == "extra_trees" or key == "extra_tree":
+            config.booster.tree.extra.extra_trees = _parse_bool(key, value)
+        elif key == "extra_seed":
+            config.booster.tree.extra.extra_seed = _parse_int(key, value)
+        elif (
+            key == "monotone_penalty"
+            or key == "monotone_splits_penalty"
+            or key == "ms_penalty"
+            or key == "mc_penalty"
+        ):
+            config.booster.tree.extra.monotone_penalty = _parse_f64(
+                key, value
+            )
+        elif (
+            key == "monotone_constraints_method"
+            or key == "monotone_constraining_method"
+            or key == "mc_method"
+        ):
+            # Only `basic` exists here; the other two are named LightGBM
+            # methods and are rejected by name rather than downgraded.
+            config.booster.tree.extra.monotone_method = parse_monotone_method(
+                value
+            )
+        elif key == "cegb_tradeoff":
+            config.booster.tree.extra.penalties.cegb_tradeoff = _parse_f64(
+                key, value
+            )
+        elif key == "cegb_penalty_split":
+            config.booster.tree.extra.penalties.cegb_penalty_split = (
+                _parse_f64(key, value)
+            )
+        elif key == "enable_bundle":
+            # Accepted only as LightGBM's own "off"; see efb.mojo.
+            check_bundling_supported(_parse_bool(key, value))
+        elif key == "max_conflict_rate":
+            check_bundling_params(_parse_f64(key, value))
+        elif key == "data_sample_strategy":
+            # The spelling is resolved here so a typo is named, but selecting
+            # GOSS needs `GossParams`, which a parameter string cannot carry.
+            if canonical_data_sample_strategy(value) != "bagging":
+                raise Error(
+                    "data_sample_strategy '",
+                    value,
+                    "' is supported by the Mojo API only, through GossParams",
+                )
         elif key == "max_bin":
             config.max_bin = _parse_int(key, value)
         elif (
@@ -509,6 +610,10 @@ def parse_params(spec: String) raises -> TrainConfig:
                 " strings",
             )
         else:
+            # A real LightGBM tree option that mojoboost does not implement
+            # gets its own message saying what it would take, before the
+            # unknown-key branch turns it into a typo.
+            check_extra_option_supported(key)
             raise Error(
                 "unknown parameter '", key, "'; supported: ", SUPPORTED_KEYS
             )

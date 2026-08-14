@@ -16,6 +16,24 @@ asks for it, and it reports its own `use_bundling` verdict, which the caller
 is free to ignore. See `handoffs/task13_efb.md` for the integration a
 training path needs.
 
+Why it is still not reachable
+-----------------------------
+A bundling plan is a function of the mapper *and* the training matrix, and
+prediction cannot re-derive it, because a scoring matrix has a different
+sparsity pattern. So a bundled model is only a model once the plan travels
+with it: a `FeatureBundling` field on `Model`/`MulticlassModel`, a new
+serialized section behind a v4 format bump, and the matching reader in
+`python/mojoboost/inspection.py`, which re-implements the model text reader
+and refuses an unknown version. Bundling also has to be applied at
+`model_sparse.fit_csc`, where the mapper and the CSC matrix meet, and undone
+in every prediction path.
+
+None of those files belong to this integration, and a bundling that trains
+but cannot be saved or scored is worse than none, so `enable_bundle` is
+refused rather than half-wired: see `check_bundling_supported`, which
+`params.parse_params` calls. The core below is unchanged and stays ready for
+the lane that owns those files.
+
 What "exclusive" means here
 ---------------------------
 A feature's *default bin* is the bin holding the value 0.0
@@ -146,6 +164,54 @@ comptime EFB_MAX_BINS = 256
 # bin, and each column costs one Int offset plus one UInt8 default bin.
 comptime _BYTES_PER_INDEX = 8
 comptime _BYTES_PER_BIN = 1
+
+# LightGBM defaults `enable_bundle` to true. mojoboost defaults it to false
+# and, until the model plumbing named in the module docstring exists, accepts
+# nothing else.
+comptime DEFAULT_ENABLE_BUNDLE = False
+
+
+def check_bundling_supported(enable_bundle: Bool) raises:
+    """Accept `enable_bundle=false`, refuse `enable_bundle=true` by name.
+
+    The repository's rule for a real LightGBM feature that is not reachable
+    is to say so rather than ignore the request, and bundling is the case
+    where ignoring it would be least visible: a silently unbundled fit is a
+    correct model, just not the one that was asked for, and nothing in the
+    metrics would show it.
+
+    Accepting `false` matters: it is LightGBM's own default spelled out, so a
+    configuration copied from LightGBM that turns bundling off must not fail
+    on a parameter it agrees with.
+    """
+    if not enable_bundle:
+        return
+    raise Error(
+        "'enable_bundle' is not reachable yet; the exclusive-feature-bundling"
+        " core exists (src/mojoboost/efb.mojo) but a bundling plan has to"
+        " travel with the model to be scored, which needs a FeatureBundling"
+        " field on Model, a v4 serialized section, the matching reader in"
+        " python/mojoboost/inspection.py, and the plan applied at"
+        " model_sparse.fit_csc. See handoffs/task13_efb.md"
+    )
+
+
+def check_bundling_params(max_conflict_rate: Float64) raises:
+    """Refuse a conflict rate that asks for lossy bundling.
+
+    `max_conflict_rate` only means anything with bundling on, and it is the
+    one bundling knob whose cost is invisible: a collision drops a value from
+    the training matrix, so the model is an approximation of the unbundled
+    one and no metric says so. Until bundling is reachable and benchmarked,
+    only LightGBM's own default of 0.0 is accepted.
+    """
+    if max_conflict_rate == 0.0:
+        return
+    raise Error(
+        "'max_conflict_rate' above 0.0 trades exactness for columns and is"
+        " only meaningful with 'enable_bundle', which is not reachable yet;"
+        " see handoffs/task13_efb.md"
+    )
 
 
 @fieldwise_init

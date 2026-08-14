@@ -129,10 +129,14 @@ the missing field.
   if it was rented. A shared cloud host and a desk machine are different
   measurement conditions and a reader cannot tell from the numbers.
 
-The capture script prints all of this except the Mojo and MAX versions, which it
-deliberately does not read, because getting them means running `pixi run`, which
-installs the environment on first use, and a capture script must not install
-anything.
+The capture script prints most of this for you. Two gaps it cannot close, both
+on purpose. It reads a Mojo version only if `mojo` is already on your `PATH`, and
+it never reads the MAX version at all, because getting either reliably means
+running `pixi run`, which solves and installs the environment on first use, and a
+capture script must not install anything. Take both from your own
+`pixi run mojo --version` and `pixi list` in the validation session. And it does
+not know whether the machine is a laptop, a desk, or a rented instance; only you
+do, and it changes how every timing should be read.
 
 ## A skipped test is not a pass
 

@@ -26,9 +26,11 @@ section is the authority and this line is the bug.
       `pixi update`, the `pixi.lock` diff read for `mojo`, `max`, `python`, and
       anything that ends up inside the wheel, and the suite re-run. Nothing
       will alert you to this, ever. Section 6.3.
-- [ ] **F4.** No credential shaped string is in the tree.
-      `grep -rInE 'PYPI_API_TOKEN|TWINE_PASSWORD|pypi-AgEIcHlwaS5vcmc' --exclude-dir=.git --exclude-dir=.pixi .`
-      returns nothing. Section 4.1.
+- [ ] **F4.** No credential shaped string is in anything that executes. Run the
+      grep in section 12 of `docs/RELEASE_SECURITY.md` as written, with the
+      `--include` filters, and read every match rather than counting them. A
+      detection pattern inside a secret scanner is expected and fine; an
+      assignment, a workflow input, or a value is the finding. Section 4.1.
 - [ ] **F5.** `gh secret list --repo ajhendel/mojoboost` and the same for the
       `pypi` environment are both empty. A publishing secret existing at all is
       a finding, not a convenience. Section 4.1.

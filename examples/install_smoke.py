@@ -8,11 +8,11 @@ or against a source checkout, which needs `pixi run build-python` first
 
     PYTHONPATH=python python examples/install_smoke.py
 
-It walks the seven steps in docs/INSTALLATION.md, in order, printing what
-each one produced: diagnostics, a tiny regression, a validation set with
-early stopping, a bit-exact save and load, and what each of the three
-device values does on this machine. Nothing here is a benchmark and no
-step prints a speed.
+It covers the same ground as "The first five minutes" in
+docs/INSTALLATION.md, printing what each step produced: diagnostics, a
+tiny regression, a validation set with early stopping, a bit-exact save
+and load, and what each of the three device values does on this machine.
+Nothing here is a benchmark and no step prints a speed.
 
 Standard library only, so it runs in the default pixi environment where
 numpy is not installed. numpy arrays, pandas frames, polars frames, and
@@ -38,7 +38,21 @@ try:
     import mojoboost
     from mojoboost import MojoBoostRegressor, gpu_available
 except ModuleNotFoundError as exc:
-    if exc.name == "mojoboost._mojoboost":
+    if exc.name == "mojoboost":
+        sys.exit(
+            "mojoboost is not importable at all. Either install a wheel,\n"
+            "or from a source checkout run `pixi run build-python` and\n"
+            "rerun this with PYTHONPATH=python. See docs/INSTALLATION.md."
+        )
+    sys.exit(f"a module mojoboost needs is missing:\n\n    {exc}")
+except ImportError as exc:
+    # Two very different failures arrive here as the same exception type.
+    # A missing `_mojoboost.so` is swallowed as a ModuleNotFoundError by
+    # the import machinery's fromlist handling and comes back out of
+    # `from . import ... _mojoboost ...` as "cannot import name"; a .so
+    # that exists but cannot resolve its MAX runtime libraries fails in
+    # dlopen and keeps the loader's own message.
+    if "cannot import name '_mojoboost'" in str(exc):
         sys.exit(
             "the mojoboost package imported but its compiled extension is\n"
             "missing. In a source checkout, build it with\n"
@@ -46,12 +60,6 @@ except ModuleNotFoundError as exc:
             "and rerun this script with PYTHONPATH=python. See\n"
             "docs/INSTALLATION.md, state 3."
         )
-    sys.exit(
-        "mojoboost is not importable. Either install a wheel, or from a\n"
-        "source checkout run `pixi run build-python` and rerun this with\n"
-        "PYTHONPATH=python. See docs/INSTALLATION.md."
-    )
-except ImportError as exc:
     sys.exit(
         "the mojoboost extension is present but failed to load, which\n"
         "usually means its bundled MAX runtime libraries were not found:\n"
@@ -170,7 +178,7 @@ def tiny_regression():
     )
     model.fit(X, y)
     preds = [round(float(p), 4) for p in model.predict([[1.5], [4.5]])]
-    print(f"six rows, one feature, y = x**2")
+    print("six rows, one feature, y = x**2")
     print(f"predict([[1.5], [4.5]])  {preds}")
     print(f"model.device_            {model.device_}")
     print(f"n_features_in_           {model.n_features_in_}")
@@ -291,10 +299,8 @@ def device_selection():
             print(f"device='gpu'     ran on {gpu_model.device_}")
 
     threshold = os.environ.get("MOJOBOOST_AUTO_MIN_CELLS")
-    print(
-        f"\nauto threshold   "
-        f"{threshold if threshold else 'disabled (the default)'}"
-    )
+    shown = threshold if threshold else "disabled (the default)"
+    print(f"\nauto threshold   {shown}")
     print(
         "\ndevice='auto' resolves to the CPU on every machine and every\n"
         "workload unless MOJOBOOST_AUTO_MIN_CELLS is set. The crossover\n"
@@ -313,8 +319,8 @@ def main():
     print("mojoboost installation smoke test")
     print("=" * 33)
     print(
-        "\nSeven steps from docs/INSTALLATION.md. Nothing here is a\n"
-        "benchmark and no step prints a speed."
+        "\nThe first five minutes from docs/INSTALLATION.md, in five steps.\n"
+        "Nothing here is a benchmark and no step prints a speed."
     )
 
     diagnostics()

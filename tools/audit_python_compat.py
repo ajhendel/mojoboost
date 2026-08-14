@@ -159,7 +159,12 @@ SYMBOL_FLOORS = {
 GUARD_STRING = re.compile(
     rb"([A-Za-z_][A-Za-z0-9_]*) is not available in this Python version"
 )
-SYMBOL_TOKEN = re.compile(rb"_?Py[A-Za-z0-9_]{2,62}")
+# Whole identifiers only. Without the boundaries this also matches inside
+# names like `KGEN_CompilerRT_Python_SetPythonPath`, which inflates the count
+# with things that are not entry points at all.
+SYMBOL_TOKEN = re.compile(
+    rb"(?<![A-Za-z0-9_])_?Py[A-Za-z0-9_]{2,62}(?![A-Za-z0-9_])"
+)
 
 MIN_TOOL_PYTHON = (3, 8)
 
@@ -205,11 +210,9 @@ class FeatureScan(ast.NodeVisitor):
     Without the future import it imposes 3.9 or 3.10 respectively.
     """
 
-    def __init__(self, path, lazy_annotations):
-        self.path = path
+    def __init__(self, lazy_annotations):
         self.lazy = lazy_annotations
         self.found = []  # (version, description, lineno)
-        self._in_annotation = 0
 
     def record(self, version, what, node):
         self.found.append((version, what, getattr(node, "lineno", 0)))
@@ -367,7 +370,7 @@ def scan_source(res):
                 ),
             )
             continue
-        scan = FeatureScan(path, _has_future_annotations(tree))
+        scan = FeatureScan(_has_future_annotations(tree))
         scan.visit(tree)
         if scan.found:
             highest = max(scan.found)[0]
@@ -379,6 +382,18 @@ def scan_source(res):
                 )
 
     if unparsed:
+        return None
+    if floor == (3, 0):
+        res.ok(
+            "source",
+            "%d modules scanned, no version-gated construct found"
+            % len(paths),
+        )
+        res.info(
+            "this scan is a denylist of known constructs. Finding nothing "
+            "means the source uses nothing on the list, not that it would "
+            "run on any interpreter"
+        )
         return None
     res.ok(
         "source",
@@ -419,12 +434,16 @@ def scan_metadata(res, source_floor):
         return None
     declared = (int(bound.group(1)), int(bound.group(2)))
     cap = UPPER_BOUND.search(spec)
-    res.ok("metadata", "requires-python = %r, floor %s" % (spec, vstr(declared)))
+    res.ok(
+        "metadata",
+        "requires-python = %r, floor %s" % (spec, vstr(declared)),
+    )
     if cap:
+        capped = (int(cap.group(1)), int(cap.group(2)))
         res.note(
             "metadata",
-            "requires-python is capped at %s. A cap has to be edited on every "
-            "release the toolchain permits" % vstr((int(cap.group(1)), int(cap.group(2)))),
+            "requires-python is capped at %s. A cap has to be edited on "
+            "every release the toolchain permits" % vstr(capped),
         )
 
     claimed = sorted(
@@ -515,7 +534,8 @@ def scan_toolchain(res, declared):
         if PY_GIL.match(line):
             packages[name]["gil"] = True
 
-    for key in ("mojo", "mojo-compiler", "mojo-python", "max", "max-core"):
+    toolchain = ("mojo", "mojo-compiler", "mojo-python", "max", "max-core")
+    for key in toolchain:
         info = packages.get(key)
         if not info:
             res.note("toolchain", "%s not found in the lock" % key)
@@ -536,12 +556,16 @@ def scan_toolchain(res, declared):
             bits.append("requires python-gil")
         res.ok("toolchain", "; ".join(bits))
 
+    # Toolchain packages only. Every conda-forge package built for a given
+    # interpreter carries its own `python >=` line, and folding those in
+    # would answer a different question than the one this section asks.
     solved = set()
-    for info in packages.values():
-        solved |= info["python"]
     floors = set()
-    for info in packages.values():
-        floors |= info["floor"]
+    for key in toolchain:
+        info = packages.get(key)
+        if info:
+            solved |= info["python"]
+            floors |= info["floor"]
 
     if solved and declared is not None:
         if max(solved) != declared:
@@ -591,8 +615,8 @@ def scan_extension(res, path, declared):
 
     res.ok(
         "extension",
-        "%d bytes, %d CPython entry point names found, %d of them with a "
-        "floor above 3.9" % (len(blob), len(names), len(entry_points)),
+        "%d bytes, %d candidate CPython names, %d of them entry points with "
+        "a floor above 3.9" % (len(blob), len(names), len(entry_points)),
     )
     if guarded:
         res.ok(
@@ -660,8 +684,11 @@ def scan_extension(res, path, declared):
 def scan_interpreter(res, declared):
     print("\ninterpreter: the one running this script")
     version = sys.version_info[:2]
-    res.ok("interpreter", "CPython %s (%s)" % (vstr(version), sys.executable))
-    res.info("implementation: %s" % sys.implementation.name)
+    res.ok(
+        "interpreter",
+        "%s %s (%s)"
+        % (sys.implementation.name, vstr(version), sys.executable),
+    )
     res.info("platform tag:   %s" % sysconfig.get_platform())
     res.info("EXT_SUFFIX:     %s" % sysconfig.get_config_var("EXT_SUFFIX"))
     free_threaded = bool(sysconfig.get_config_var("Py_GIL_DISABLED"))

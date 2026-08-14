@@ -265,9 +265,17 @@ comptime BLOCK_LIFETIME_NOT_OWNED = 2
 this session does not control."""
 
 comptime BLOCK_DEVICE_WRITTEN_ATOMICS = 3
-"""The device writes this buffer with global integer atomics. Whether those
-are coherent against host-visible memory is unverified on every backend here,
-and a wrong answer is a silently wrong histogram."""
+"""The device may write this buffer with global integer atomics, and whether
+those are coherent against host-visible memory is unverified on every backend
+here. A wrong answer is a silently wrong histogram rather than a raise.
+
+"May" is exact and is why the block is unconditional. `STRATEGY_ATOMIC` folds
+every threadgroup's partial into the histogram with `Atomic.fetch_add` on the
+output buffer; `STRATEGY_TILED` writes partials without atomics and reduces
+them with plain stores. Which one runs is decided per node from that node's
+row count (`GpuActiveRows.range_tiling`), so a buffer that is safe under one
+strategy and unsafe under the other cannot be given a route that is resolved
+once per session."""
 
 comptime BLOCK_NOT_UNIFIED_MEMORY = 4
 """A route that skips the copy on the assumption that both processors reach
@@ -344,11 +352,12 @@ def structural_support(role: Int, route: Int) raises -> Int:
       `binning.mojo` to bin *into* a device-visible allocation. That is a
       change to another module's data ownership, not a flag.
 
-    - `ROLE_HIST_OUT` is written by global integer atomics. Whether those are
-      coherent against host-visible memory is unverified on Metal, CUDA, and
-      HIP alike here, and the failure mode is a wrong histogram rather than a
-      raise, so it is `not_probed` until the driver's readback routes answer
-      it.
+    - `ROLE_HIST_OUT` is written by global integer atomics under one of the
+      two shipped accumulation strategies, and which strategy runs is a
+      per-node decision. Whether such an atomic is coherent against
+      host-visible memory is unverified on Metal, CUDA, and HIP alike here,
+      and the failure mode is a wrong histogram rather than a raise, so the
+      role is blocked until the driver's `out_host_direct` route answers it.
 
     - `ROLE_VALID_BINS` inherits `ROLE_BINS`'s ownership problem and adds one
       of its own: the scoring path in `gpu_predict.mojo` stages the caller's

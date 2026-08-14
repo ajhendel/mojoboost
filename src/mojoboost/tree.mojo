@@ -24,10 +24,18 @@ the branch sets stay empty and the allow masks stay empty, so the
 unconstrained path is unchanged.
 
 Feature subsampling (see sampling.mojo) draws one feature set per tree from
-`tree_index` and the seed, and optionally a further set per node. Only the
-tree's set is ever accumulated into histograms, so excluded features cost
-nothing and sibling subtraction stays exact; the per-node set narrows the
-split search on top of that.
+`tree_index` and the seed, then optionally a set per depth and a set per
+node, in that order. Only the tree's set is ever accumulated into histograms,
+so excluded features cost nothing and sibling subtraction stays exact; the
+per-depth and per-node sets narrow the split search on top of that. Both
+inner fractions default to 1.0, which passes the tree's set through untouched.
+
+The remaining LightGBM tree controls ride on `TreeParams.extra` (see
+tree_parameters_extra.mojo). The split-side rules reach the scan through
+`_search`; `max_delta_step` and `path_smooth` are applied here, in
+`_leaf_value`, because they need a leaf's row count and its parent's finished
+output. A leaf is therefore valued before its own split search runs, since
+its value is what its candidates' children smooth toward.
 
 Under monotonic constraints (see monotone.mojo) each frontier leaf also
 carries the interval its output must lie in. Leaf values are clamped into it,
@@ -66,11 +74,14 @@ from .monotone import (
     monotone_sign,
 )
 from .sampling import (
+    DEFAULT_FEATURE_FRACTION_BYLEVEL,
     DEFAULT_FEATURE_FRACTION_SEED,
-    select_node_features,
+    check_feature_fractions,
+    select_split_features,
     select_tree_features,
 )
 from .split import SplitInfo, find_best_split, soft_threshold_l1
+from .tree_parameters_extra import ExtraTreeParams, finish_leaf_output
 
 
 struct TreeParams(Copyable, Movable):
@@ -88,7 +99,22 @@ struct TreeParams(Copyable, Movable):
     unconstrained. `cat` holds LightGBM's categorical hyperparameters (see
     categorical.mojo) and defaults to LightGBM's own defaults; which features
     are categorical is a property of the binned matrix, not of these
-    parameters."""
+    parameters.
+
+    `feature_fraction_bylevel` is XGBoost's `colsample_bylevel`, a third
+    subsampling stage between the tree's set and the node's (see
+    sampling.mojo). LightGBM has no equivalent, so it is an extension rather
+    than a parity row; 1.0, the default, passes the tree's set through and
+    leaves every existing selection bit-identical.
+
+    `extra` is the remaining LightGBM tree controls
+    (tree_parameters_extra.mojo): the gain floor, the leaf-output cap and
+    smoothing, the extra-trees threshold draw, the monotone penalty, and the
+    per-feature gain multipliers and split costs. Its default is inactive, and
+    `ExtraTreeParams.is_active()` is what the grower and the split search test
+    once per node rather than multiplying by 1.0 per candidate. The two fields
+    are appended so that every positional caller of this constructor keeps
+    working unchanged."""
 
     var num_leaves: Int
     var min_data_in_leaf: Int
@@ -102,6 +128,8 @@ struct TreeParams(Copyable, Movable):
     var max_depth: Int
     var monotone: MonotoneConstraints
     var cat: CategoricalParams
+    var feature_fraction_bylevel: Float64
+    var extra: ExtraTreeParams
 
     def __init__(
         out self,
@@ -117,6 +145,8 @@ struct TreeParams(Copyable, Movable):
         max_depth: Int = -1,
         var monotone: MonotoneConstraints = MonotoneConstraints(),
         var cat: CategoricalParams = CategoricalParams.default(),
+        feature_fraction_bylevel: Float64 = DEFAULT_FEATURE_FRACTION_BYLEVEL,
+        var extra: ExtraTreeParams = ExtraTreeParams(),
     ):
         self.num_leaves = num_leaves
         self.min_data_in_leaf = min_data_in_leaf
@@ -130,6 +160,8 @@ struct TreeParams(Copyable, Movable):
         self.max_depth = max_depth
         self.monotone = monotone^
         self.cat = cat^
+        self.feature_fraction_bylevel = feature_fraction_bylevel
+        self.extra = extra^
 
     @staticmethod
     def default() -> TreeParams:
@@ -613,7 +645,20 @@ def _leaf_value(
     lambda_reg: Float64,
     lambda_l1: Float64 = 0.0,
     feature: Int = 0,
+    n_data: Int = 0,
+    parent_output: Float64 = 0.0,
+    max_delta_step: Float64 = 0.0,
+    path_smooth: Float64 = 0.0,
 ) -> Float64:
+    """The value one leaf emits, from its histogram.
+
+    The Newton step `-T(G) / (H + lambda_l2)`, then LightGBM's
+    `max_delta_step` cap and `path_smooth` shrinkage toward the parent's
+    finished output. Both default to off, in which case this returns the
+    Newton step alone and every existing caller is unchanged; `n_data` is the
+    leaf's row count, which is what makes the smoothing fade as a leaf grows,
+    and `parent_output` is 0.0 at the root.
+    """
     # Totals over one feature's bins: every feature the histogram accumulated
     # has the same bin totals. `feature` must be one of them, which under
     # feature subsampling means a selected feature, since the excluded
@@ -624,7 +669,12 @@ def _leaf_value(
     for b in range(hist.n_bins):
         g += hist.grad[base + b]
         h += hist.hess[base + b]
-    return -soft_threshold_l1(g, lambda_l1) / (h + lambda_reg)
+    var value = -soft_threshold_l1(g, lambda_l1) / (h + lambda_reg)
+    if max_delta_step <= 0.0 and path_smooth <= 0.0:
+        return value
+    return finish_leaf_output(
+        value, max_delta_step, path_smooth, n_data, parent_output
+    )
 
 
 def _search(
@@ -638,6 +688,10 @@ def _search(
     monotone: List[Int] = [],
     bounds: OutputBounds = OutputBounds.unbounded(),
     cats: CategoricalSpec = CategoricalSpec.none(),
+    node: Int = 0,
+    tree_index: Int = 0,
+    parent_output: Float64 = 0.0,
+    grower_applies_extra: Bool = False,
 ) raises -> SplitInfo:
     """Best split for one node. `allowed` is the node's interaction-constraint
     allow mask and `features` its subsampled feature ids; empty means every
@@ -650,7 +704,29 @@ def _search(
     candidates are category partitions rather than thresholds. Both the CPU
     and the GPU grower go through here, so the two enforce constraints,
     subsampling, the depth limit, missing-value routing, and categorical
-    partitioning identically."""
+    partitioning identically.
+
+    `params.extra` (tree_parameters_extra.mojo) travels with the parameters,
+    so the rules that are a function of the histogram, the node's row count,
+    and its depth -- `min_gain_to_split`, `monotone_penalty`,
+    `feature_contri`, and the CEGB split cost -- are live for every caller
+    here with no change on its side.
+
+    The rest of the bundle cannot be: `extra_trees` is keyed by the node id
+    and the tree index, and `max_delta_step`/`path_smooth` need the leaf's row
+    count and its parent's finished output. A caller that supplies those sets
+    `grower_applies_extra`; `tree.grow_tree` does. Any other caller leaves it
+    False and an active value is refused here rather than silently drawing
+    every node's threshold from node 0's stream, or growing a tree whose
+    leaves ignore the cap the caller asked for.
+    """
+    if params.extra.needs_grower_support() and not grower_applies_extra:
+        raise Error(
+            "extra_trees, max_delta_step, and path_smooth are applied by"
+            " tree.grow_tree; this grower does not pass the node id, the"
+            " leaf row count, or the parent output that they read. Train on"
+            " the dense CPU grower, or leave them at their defaults"
+        )
     # A leaf at the depth limit yields no split, which is what stops growth
     # beneath it; leaf-wise selection is otherwise untouched.
     if params.max_depth > 0 and depth >= params.max_depth:
@@ -670,6 +746,12 @@ def _search(
         bounds=bounds,
         cats=cats,
         cat_params=params.cat,
+        extra=params.extra,
+        n_rows=n_rows,
+        depth=depth,
+        node=node,
+        tree_index=tree_index,
+        parent_output=parent_output,
     )
 
 
@@ -699,9 +781,32 @@ def grow_tree(
     `params.feature_fraction_seed` it fixes which features the tree and its
     nodes may split on, so growing the same tree again selects the same
     features no matter what else has been trained.
+
+    `params.extra` carries the remaining LightGBM tree controls. This grower
+    is the one that applies all of them: the split-side rules go down through
+    `_search`, and the leaf-side ones (`max_delta_step`, `path_smooth`) are
+    applied here, where a leaf's row count and its parent's finished output
+    are both in hand. An inactive bundle, which is the default, leaves every
+    decision below exactly as it was.
     """
     params.constraints.check_features(data.n_features)
     params.monotone.check_features(data.n_features)
+    check_feature_fractions(
+        params.feature_fraction,
+        params.feature_fraction_bynode,
+        params.feature_fraction_bylevel,
+    )
+    # Rejected before the first histogram rather than part way down a tree,
+    # and against this dataset, so a per-feature vector of the wrong length is
+    # named here rather than read past its end.
+    params.extra.check(
+        data.n_features,
+        params.num_leaves,
+        params.max_depth,
+        params.min_data_in_leaf,
+    )
+    var max_delta_step = params.extra.max_delta_step
+    var path_smooth = params.extra.path_smooth
     # Empty unless a feature is actually constrained, which keeps split search
     # on its unconstrained path and the fit bit-identical.
     var signs = params.monotone.active_signs()
@@ -742,32 +847,51 @@ def grow_tree(
             root_hist, data, grad, hess, bag, 0, len(bag), tree_features
         )
 
+    # The root's own value is computed before its split search, because path
+    # smoothing makes a candidate's children shrink toward it: it is the
+    # `parent_output` every candidate at the root is scored with. The root
+    # itself has no parent, so it smooths toward 0.0.
+    var root = tree._add_node(
+        _leaf_value(
+            root_hist,
+            params.lambda_reg,
+            params.lambda_l1,
+            value_feature,
+            len(root_rows),
+            0.0,
+            max_delta_step,
+            path_smooth,
+        ),
+        Float64(len(root_rows)),
+    )
+
     # The root's branch is empty, so its allow mask is the union of every
     # configured group (empty, meaning all features, when unconstrained). The
-    # root is always node 0, so its per-node feature draw is fixed too.
+    # root is always node 0, so its per-level and per-node feature draws are
+    # fixed too.
     var root_branch = List[Int]()
     var root_split = _search(
         root_hist,
         len(root_rows),
         params,
         params.constraints.allowed_features(root_branch),
-        select_node_features(
+        select_split_features(
             tree_features,
+            params.feature_fraction_bylevel,
             params.feature_fraction_bynode,
             params.feature_fraction_seed,
             tree_index,
+            0,
             0,
         ),
         depth=0,
         missing_bins=data.missing_bin,
         monotone=signs,
         cats=data.cats,
-    )
-    var root = tree._add_node(
-        _leaf_value(
-            root_hist, params.lambda_reg, params.lambda_l1, value_feature
-        ),
-        Float64(len(root_rows)),
+        node=root,
+        tree_index=tree_index,
+        parent_output=tree.value[root],
+        grower_applies_extra=True,
     )
 
     var frontier = List[_LeafState]()
@@ -843,14 +967,33 @@ def grow_tree(
         # parent's unchanged.
         var parent_bounds = frontier[best_i].bounds.copy()
         var split_sign = monotone_sign(signs, split.feature)
+        # The cap and the smoothing are applied to the Newton step first and
+        # the monotone interval is enforced on the result, which is the order
+        # the candidate was scored with (see `split._split_gain`). Both
+        # children smooth toward the value the parent already emits.
+        var parent_output = tree.value[parent_node]
         var left_value = parent_bounds.clamp(
             _leaf_value(
-                left_hist, params.lambda_reg, params.lambda_l1, value_feature
+                left_hist,
+                params.lambda_reg,
+                params.lambda_l1,
+                value_feature,
+                len(left_rows),
+                parent_output,
+                max_delta_step,
+                path_smooth,
             )
         )
         var right_value = parent_bounds.clamp(
             _leaf_value(
-                right_hist, params.lambda_reg, params.lambda_l1, value_feature
+                right_hist,
+                params.lambda_reg,
+                params.lambda_l1,
+                value_feature,
+                len(right_rows),
+                parent_output,
+                max_delta_step,
+                path_smooth,
             )
         )
         if split_sign != MONOTONE_FREE and left_value > right_value:
@@ -877,17 +1020,20 @@ def grow_tree(
         var branch = extend_branch(frontier[best_i].branch, split.feature)
         var allowed = params.constraints.allowed_features(branch)
         var child_depth = frontier[best_i].depth + 1
-        # Each child draws its own per-node feature set from its node id.
+        # Each child draws its own per-node feature set from its node id, out
+        # of the set its depth drew from the tree's.
         var left_split = _search(
             left_hist,
             len(left_rows),
             params,
             allowed,
-            select_node_features(
+            select_split_features(
                 tree_features,
+                params.feature_fraction_bylevel,
                 params.feature_fraction_bynode,
                 params.feature_fraction_seed,
                 tree_index,
+                child_depth,
                 left_node,
             ),
             depth=child_depth,
@@ -895,17 +1041,23 @@ def grow_tree(
             monotone=signs,
             cats=data.cats,
             bounds=children.left,
+            node=left_node,
+            tree_index=tree_index,
+            parent_output=left_value,
+            grower_applies_extra=True,
         )
         var right_split = _search(
             right_hist,
             len(right_rows),
             params,
             allowed,
-            select_node_features(
+            select_split_features(
                 tree_features,
+                params.feature_fraction_bylevel,
                 params.feature_fraction_bynode,
                 params.feature_fraction_seed,
                 tree_index,
+                child_depth,
                 right_node,
             ),
             depth=child_depth,
@@ -913,6 +1065,10 @@ def grow_tree(
             monotone=signs,
             cats=data.cats,
             bounds=children.right,
+            node=right_node,
+            tree_index=tree_index,
+            parent_output=right_value,
+            grower_applies_extra=True,
         )
 
         frontier[best_i] = _LeafState(

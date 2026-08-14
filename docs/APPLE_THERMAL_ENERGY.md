@@ -303,7 +303,7 @@ What a given number in a record is permitted to be about.
 | Mean power over a window | The whole machine during that window | mojoboost |
 | Energy above idle | The workload plus whatever else was running, bounded by what the idle gate saw | A process |
 | Energy impact score | Which process dominated the window | Joules, watts, or any comparison across machines |
-| Cold minus warm | One-time cost paid in this process on this machine, including compilation and device setup | A breakdown of that cost, which needs the native phase counters described in `docs/STARTUP_LATENCY.md` and `handoffs/apple_a8_benchmarks.md` |
+| Cold minus warm | One-time cost paid in this process on this machine, including compilation and device setup | A breakdown of that cost, which needs the native phase counters described in `handoffs/apple_a8_benchmarks.md` and separately specified by the startup-latency lane |
 
 A throughput decline is attributed to thermal state only when all three hold.
 The thermal series showed a limit change, the idle gate stayed clean through
@@ -414,6 +414,7 @@ so that this can be checked before anything is collected rather than after.
   them there.
 
 Contributed records from outside the project are covered by
+`docs/HARDWARE_CONTRIBUTORS.md`, which is the authoritative paperwork, and by
 `launch/APPLE_BENCHMARK_REQUEST.txt`, which repeats these rules in the form a
 contributor sees before running anything.
 
@@ -425,14 +426,22 @@ Nothing in this version takes a sample. The script is a planner.
 bash bench/apple/thermal_capture.sh --list-phases
 bash bench/apple/thermal_capture.sh --self-check
 bash bench/apple/thermal_capture.sh --phase cold_fit --phase warm_fit
-bash bench/apple/thermal_capture.sh --phase sustained --duration 1200 --energy
-bash bench/apple/thermal_capture.sh --print-plan --phase sustained > plan.json
+bash bench/apple/thermal_capture.sh --phase idle_baseline --phase sustained \
+    --duration 1200 --energy
+bash bench/apple/thermal_capture.sh --print-plan --all-phases > plan.json
 ```
 
 Each of those prints the exact commands a run would use, shell-quoted, in
-order, with the privileged ones marked. `--execute` is parsed and refused, with
-an exit code and a message, because a script that can be talked into running
+protocol order regardless of the order the phases were typed, with the
+privileged ones marked. `--execute` is parsed and refused, with an exit code
+and a message, because a script that can be talked into running
 `sudo powermetrics` by a typo is a script that will eventually do it.
+
+Combinations that cannot produce a usable record are refused at plan time
+rather than discovered after an afternoon of sampling. `--energy` without the
+`idle_baseline` phase is one, since it yields absolute joules with nothing to
+subtract. A closed lid on battery is another, since that is a sleeping machine
+rather than a condition.
 
 What a human may deliberately run later, once the measurement path exists and
 has been reviewed, is listed with exact command lines in

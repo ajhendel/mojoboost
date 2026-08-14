@@ -252,7 +252,6 @@ comptime BLOCK_ROW_LIMIT = 8
 comptime BLOCK_BIN_LIMIT = 9
 comptime BLOCK_OUTPUT_LIMIT = 10
 comptime BLOCK_MEMORY_BUDGET = 11
-comptime BLOCK_INVALID_SHAPE = 12
 
 
 def block_reason_name(code: Int) -> String:
@@ -278,8 +277,6 @@ def block_reason_name(code: Int) -> String:
         return String("output-limit")
     if code == BLOCK_MEMORY_BUDGET:
         return String("memory-budget")
-    if code == BLOCK_INVALID_SHAPE:
-        return String("invalid-shape")
     return String("unknown-block")
 
 
@@ -522,13 +519,14 @@ def env_declared_api() -> Int:
     return parse_api(s)
 
 
-# --- Reason lists -----------------------------------------------------
-
-
 def _bool_text(value: Bool) -> String:
+    """How a Bool is spelled in the serialized decision."""
     if value:
         return String("true")
     return String("false")
+
+
+# --- Reason lists -----------------------------------------------------
 
 
 struct ReasonList(Copyable, Movable):
@@ -715,7 +713,7 @@ struct DeviceCapabilities(Copyable, Movable):
         var available = built and not disabled
         var declared = env_declared_api()
         var profile = GpuProfile.generic()
-        var source = PROFILE_NONE
+        var source: Int = PROFILE_NONE
         if available:
             source = PROFILE_FALLBACK
             if declared != API_UNKNOWN:
@@ -873,8 +871,8 @@ def estimate_gpu_memory(
     var planes = request.n_outputs
     if planes < 1:
         planes = 1
-    var histogram_bytes = 0
-    var readback_bytes = 0
+    var histogram_bytes: Int = 0
+    var readback_bytes: Int = 0
     if request.bins_known():
         var cells = request.n_features * request.n_bins
         histogram_bytes = cells * BYTES_PER_PARTIAL_CELL
@@ -1028,18 +1026,10 @@ def _collect_blocks(
             )
         return blocks^
 
-    if request.n_rows < 1 or request.n_features < 1:
-        blocks.add(
-            BLOCK_INVALID_SHAPE,
-            String(
-                "a workload needs at least one row and one feature; got",
-                " n_rows=",
-                request.n_rows,
-                ", n_features=",
-                request.n_features,
-            ),
-        )
-        return blocks^
+    # An impossible shape is not a block. `estimate_gpu_memory` raises for
+    # it before this function is reached, because a workload with no rows
+    # or no features is a caller error and not something the CPU path
+    # would have run either.
 
     if request.sparse:
         blocks.add(
@@ -1147,7 +1137,14 @@ def _collect_warnings(
     request: DeviceRequest, caps: DeviceCapabilities
 ) raises -> ReasonList:
     """Everything a reader should know about how much this decision is
-    worth. Nothing here changes the selected backend."""
+    worth. Nothing here changes the selected backend.
+
+    Everything below the availability check is about the accelerator, so
+    an explicit `cpu` request collects none of it: a machine that happens
+    to have a GPU should not narrate its capabilities at every CPU run.
+    The incomplete-request warning is the exception, because a caller that
+    under-described its workload wants to know that whatever device it got.
+    """
     var warnings = ReasonList()
 
     if not request.is_complete():
@@ -1168,7 +1165,7 @@ def _collect_warnings(
             ),
         )
 
-    if not caps.gpu_available:
+    if not caps.gpu_available or request.requested_device == CPU_DEVICE:
         return warnings^
 
     if caps.built_with_accelerator:
@@ -1513,11 +1510,11 @@ def decide_device(
     # constructor at the end. One construction site rather than nine keeps
     # the ownership transfers of `blocks`, `warnings`, and `memory` in one
     # place, where they can be read against the fields they land in.
-    var selected = CPU_DEVICE
-    var blocked = False
-    var code = DECISION_EXPLICIT_CPU
+    var selected: Int = CPU_DEVICE
+    var blocked: Bool = False
+    var code: Int = DECISION_EXPLICIT_CPU
     var message = String("")
-    var evidence = EVIDENCE_NONE
+    var evidence: String = EVIDENCE_NONE
 
     if request.requested_device == CPU_DEVICE:
         message = String(

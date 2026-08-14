@@ -139,10 +139,22 @@ def check_feature_fraction(fraction: Float64, name: String) raises:
 
 
 def check_feature_fractions(
-    feature_fraction: Float64, feature_fraction_bynode: Float64
+    feature_fraction: Float64,
+    feature_fraction_bynode: Float64,
+    feature_fraction_bylevel: Float64 = DEFAULT_FEATURE_FRACTION_BYLEVEL,
 ) raises:
+    """Validate every stage's fraction before growth starts.
+
+    `select_level_features` validates its own fraction too, so the third
+    argument is about failing before the first histogram rather than part way
+    down a tree. It defaults to 1.0 so the two-argument callers that predate
+    the per-level draw keep working unchanged.
+    """
     check_feature_fraction(feature_fraction, "feature_fraction")
     check_feature_fraction(feature_fraction_bynode, "feature_fraction_bynode")
+    check_feature_fraction(
+        feature_fraction_bylevel, "feature_fraction_bylevel"
+    )
 
 
 def selection_count(total: Int, fraction: Float64) -> Int:

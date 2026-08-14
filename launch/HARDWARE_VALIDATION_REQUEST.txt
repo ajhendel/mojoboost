@@ -9,6 +9,7 @@ Do not claim performance leadership, production readiness, or feature parity wit
 Do not promise anything in exchange for a result other than attribution, which is automatic.
 Check the current self-promotion rules of any subreddit or forum before posting, and prefer answering an existing thread to starting one.
 Link the contributor protocol, not the repository root. Somebody deciding whether to spend an hour needs to see what the hour involves.
+Do not post this into the same channel as launch/APPLE_BENCHMARK_REQUEST.txt in the same week. That post asks Apple owners for benchmark and thermal runs, this one asks every vendor for validation records, and the audiences overlap. Space them, and send Apple owners to the benchmark request when the ask is timings, because it is the more specific protocol.
 If somebody reports a failure, thank them for it in public. Failure records are the ones nobody files, and the tone of the first response decides whether a second one arrives.
 
 --- SHORT VERSION: Modular Discord, chat channels, and anywhere a long post would be rude ---

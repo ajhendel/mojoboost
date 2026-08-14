@@ -30,11 +30,15 @@ published anywhere.
 | Which artifacts exist, for which platform, with which exact filename | `packaging/matrix/platform_matrix.toml` and [PLATFORM_MATRIX.md](PLATFORM_MATRIX.md) |
 | What a release promises, and what has to be true before one is cut | [COMPATIBILITY_POLICY.md](COMPATIBILITY_POLICY.md), especially the release gate in section 12 |
 | What the package says about itself | `python/pyproject.toml` |
+| Which CPython versions are supported, and whether the floor is real | [PYTHON_SUPPORT.md](PYTHON_SUPPORT.md) |
+| Repository and workflow security posture, and the full owner setup list | [RELEASE_SECURITY.md](RELEASE_SECURITY.md) and `handoffs/release_10_security.md` |
 
 Where this document and the platform matrix disagree about an artifact,
-the matrix wins. Where this document and the compatibility policy disagree
-about whether a release may be cut, the policy wins. This document only
-covers getting a decided release onto an index and off it again.
+the matrix wins. Where it and the compatibility policy disagree about
+whether a release may be cut, the policy wins. Where it and
+`docs/RELEASE_SECURITY.md` disagree about a security decision, that
+document wins. This one covers getting a decided release onto an index and
+off it again, and nothing else.
 
 ## The rule that governs everything below
 
@@ -94,6 +98,13 @@ still take `mojoboost` and your pending publisher becomes inert. What it
 buys is that when you do claim the name, you claim it through OIDC with no
 token in existence, and there is never a window in which a long-lived
 credential could have published as you.
+
+This is step 6 of the owner-action list in
+`handoffs/release_10_security.md`, which is the complete sequence and the
+one to work through. Repeated here because the reasoning below is about
+claiming a name rather than about security posture, and because getting
+the workflow filename wrong is the one mistake that produces a publisher
+which silently never matches.
 
 Do this on **TestPyPI first**, then PyPI, with identical values.
 
@@ -388,6 +399,12 @@ are the only thing a user has that does not depend on trusting the
 index.
 
 ## Yanking a bad release
+
+Section 10 of [RELEASE_SECURITY.md](RELEASE_SECURITY.md) is the authority
+on choosing between yanking, deleting, and revoking, and it covers the
+compromised-release case this section does not. What follows is the
+operational short form for the ordinary case, a release that is wrong but
+not dangerous.
 
 **Never delete. Yank.**
 

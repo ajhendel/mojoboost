@@ -860,52 +860,105 @@ def _train_gpu_rounds[
     issues exactly the sequence it issued before the session seam existed.
     A `GpuSession` in its place moves the session's state machine and gives
     `MOJOBOOST_GPU_TRACE=1` its per-round and per-tree counts."""
-    var n = data.n_rows
-    var base_score = _base_score(target, objective, sample_weight, alpha)
+    comptime if not has_accelerator():
+        raise Error("GPU training requires an accelerator")
+    else:
+        var n = data.n_rows
+        var base_score = _base_score(target, objective, sample_weight, alpha)
 
-    var signs = params.tree.monotone.active_signs()
-    var renews = objective_renews_leaves(objective)
-    var renew_w = renewal_weights(objective, target, sample_weight)
-    var renew_a = renewal_alpha(objective, alpha)
-    var trees = List[Tree]()
+        var signs = params.tree.monotone.active_signs()
+        var renews = objective_renews_leaves(objective)
+        var renew_w = renewal_weights(objective, target, sample_weight)
+        var renew_a = renewal_alpha(objective, alpha)
+        var trees = List[Tree]()
 
-    # Built-in objectives without row sampling generate their gradients
-    # on the device and advance the raw scores there too, so a round
-    # uploads nothing per row: labels and weights cross once at state
-    # construction, and only the tree's node-value table (a few hundred
-    # bytes) crosses per tree. Bagging and GOSS stay on the host path,
-    # which needs the gradients host-side to rank and sample rows, and so
-    # does an explicit `objective_source=OBJECTIVE_SOURCE_HOST`.
-    if device_grads:
-        var state = builder.objective_state(
-            target, sample_weight, 1, 2 * params.tree.num_leaves
-        )
-        state.init_raw(builder.ctx, [base_score])
+        # Built-in objectives without row sampling generate their gradients
+        # on the device and advance the raw scores there too, so a round
+        # uploads nothing per row: labels and weights cross once at state
+        # construction, and only the tree's node-value table (a few hundred
+        # bytes) crosses per tree. Bagging and GOSS stay on the host path,
+        # which needs the gradients host-side to rank and sample rows, and so
+        # does an explicit `objective_source=OBJECTIVE_SOURCE_HOST`.
+        if device_grads:
+            var state = builder.objective_state(
+                target, sample_weight, 1, 2 * params.tree.num_leaves
+            )
+            state.init_raw(builder.ctx, [base_score])
+            for i in range(params.n_estimators):
+                life.begin_round()
+                builder.fill_gradients_device(state, objective, alpha)
+                life.begin_tree()
+                var tree = grow_tree_gpu(
+                    builder, params.tree, [], i, split_search
+                )
+                life.end_tree()
+                if renews:
+                    # Renewal is a host-side weighted percentile, so the
+                    # renewing objectives pay one raw-score download per
+                    # tree; the scores come back through Float32, which is
+                    # the device path's documented precision.
+                    var raw = state.download_raw(builder.ctx)
+                    _renew_leaf_values(
+                        tree, data, target, raw, renew_w, renew_a, [], signs
+                    )
+                if tree.n_leaves == 1 and abs(tree.value[0]) < 1e-12:
+                    life.end_round()
+                    break
+                builder.update_raw_device(
+                    state, tree.value, params.learning_rate
+                )
+                trees.append(tree^)
+                life.end_round()
+            return Booster(
+                trees^,
+                base_score,
+                params.learning_rate,
+                objective,
+                params.tree.monotone.copy(),
+            )
+
+        var raw = List[Float64](capacity=n)
+        for _ in range(n):
+            raw.append(base_score)
+        var grad = List[Float64](capacity=n)
+        var hess = List[Float64](capacity=n)
+        var bag = List[Int]()
         for i in range(params.n_estimators):
             life.begin_round()
-            builder.fill_gradients_device(state, objective, alpha)
+            refresh_bag(bag, bagging, n, i)
+            _fill_grad_hess(
+                raw, target, objective, sample_weight, alpha, grad, hess
+            )
+            # GOSS rescales the sampled rows' gradients before they are
+            # uploaded, so the device histograms already carry the
+            # compensation multiplier.
+            goss_round(bag, grad, hess, goss, i, params.learning_rate)
+            builder.upload_gradients(grad, hess)
             life.begin_tree()
             var tree = grow_tree_gpu(
-                builder, params.tree, [], i, split_search
+                builder, params.tree, bag, i, split_search
             )
             life.end_tree()
             if renews:
-                # Renewal is a host-side weighted percentile, so the
-                # renewing objectives pay one raw-score download per
-                # tree; the scores come back through Float32, which is
-                # the device path's documented precision.
-                var raw = state.download_raw(builder.ctx)
                 _renew_leaf_values(
-                    tree, data, target, raw, renew_w, renew_a, [], signs
+                    tree, data, target, raw, renew_w, renew_a, bag, signs
                 )
+
+            # A single-leaf tree with a near-zero value means the objective
+            # has converged; further rounds cannot make progress. Under
+            # bagging or GOSS it only means this sample had nothing to give,
+            # so the round is skipped and the next sample gets its turn.
             if tree.n_leaves == 1 and abs(tree.value[0]) < 1e-12:
                 life.end_round()
+                if bagging_enabled(bagging) or goss.enabled:
+                    continue
                 break
-            builder.update_raw_device(
-                state, tree.value, params.learning_rate
-            )
+
+            for r in range(n):
+                raw[r] += params.learning_rate * tree.predict_row(data, r)
             trees.append(tree^)
             life.end_round()
+
         return Booster(
             trees^,
             base_score,
@@ -913,54 +966,6 @@ def _train_gpu_rounds[
             objective,
             params.tree.monotone.copy(),
         )
-
-    var raw = List[Float64](capacity=n)
-    for _ in range(n):
-        raw.append(base_score)
-    var grad = List[Float64](capacity=n)
-    var hess = List[Float64](capacity=n)
-    var bag = List[Int]()
-    for i in range(params.n_estimators):
-        life.begin_round()
-        refresh_bag(bag, bagging, n, i)
-        _fill_grad_hess(
-            raw, target, objective, sample_weight, alpha, grad, hess
-        )
-        # GOSS rescales the sampled rows' gradients before they are
-        # uploaded, so the device histograms already carry the
-        # compensation multiplier.
-        goss_round(bag, grad, hess, goss, i, params.learning_rate)
-        builder.upload_gradients(grad, hess)
-        life.begin_tree()
-        var tree = grow_tree_gpu(builder, params.tree, bag, i, split_search)
-        life.end_tree()
-        if renews:
-            _renew_leaf_values(
-                tree, data, target, raw, renew_w, renew_a, bag, signs
-            )
-
-        # A single-leaf tree with a near-zero value means the objective
-        # has converged; further rounds cannot make progress. Under
-        # bagging or GOSS it only means this sample had nothing to give,
-        # so the round is skipped and the next sample gets its turn.
-        if tree.n_leaves == 1 and abs(tree.value[0]) < 1e-12:
-            life.end_round()
-            if bagging_enabled(bagging) or goss.enabled:
-                continue
-            break
-
-        for r in range(n):
-            raw[r] += params.learning_rate * tree.predict_row(data, r)
-        trees.append(tree^)
-        life.end_round()
-
-    return Booster(
-        trees^,
-        base_score,
-        params.learning_rate,
-        objective,
-        params.tree.monotone.copy(),
-    )
 
 
 def train_gpu(
@@ -1098,42 +1103,45 @@ def _train_custom_gpu_rounds[
     """The custom-objective loop both `train_custom_gpu` entry points run.
     There is no device-gradient branch here by construction: the callback
     lives on the host, which is where the raw scores it reads live."""
-    var n = data.n_rows
-    var raw = List[Float64](capacity=n)
-    for _ in range(n):
-        raw.append(base_score)
+    comptime if not has_accelerator():
+        raise Error("GPU training requires an accelerator")
+    else:
+        var n = data.n_rows
+        var raw = List[Float64](capacity=n)
+        for _ in range(n):
+            raw.append(base_score)
 
-    var trees = List[Tree]()
-    var grad = List[Float64](capacity=n)
-    var hess = List[Float64](capacity=n)
-    for i in range(params.n_estimators):
-        life.begin_round()
-        grad_hess(raw, target, grad, hess)
-        check_custom_grad_hess(grad, hess, n)
-        _apply_sample_weight(grad, hess, sample_weight)
-        builder.upload_gradients(grad, hess)
-        life.begin_tree()
-        var tree = grow_tree_gpu(builder, params.tree, [], i, split_search)
-        life.end_tree()
+        var trees = List[Tree]()
+        var grad = List[Float64](capacity=n)
+        var hess = List[Float64](capacity=n)
+        for i in range(params.n_estimators):
+            life.begin_round()
+            grad_hess(raw, target, grad, hess)
+            check_custom_grad_hess(grad, hess, n)
+            _apply_sample_weight(grad, hess, sample_weight)
+            builder.upload_gradients(grad, hess)
+            life.begin_tree()
+            var tree = grow_tree_gpu(builder, params.tree, [], i, split_search)
+            life.end_tree()
 
-        # A single-leaf tree with a near-zero value means the objective
-        # has converged; further rounds cannot make progress.
-        if tree.n_leaves == 1 and abs(tree.value[0]) < 1e-12:
+            # A single-leaf tree with a near-zero value means the objective
+            # has converged; further rounds cannot make progress.
+            if tree.n_leaves == 1 and abs(tree.value[0]) < 1e-12:
+                life.end_round()
+                break
+
+            for r in range(n):
+                raw[r] += params.learning_rate * tree.predict_row(data, r)
+            trees.append(tree^)
             life.end_round()
-            break
 
-        for r in range(n):
-            raw[r] += params.learning_rate * tree.predict_row(data, r)
-        trees.append(tree^)
-        life.end_round()
-
-    return Booster(
-        trees^,
-        base_score,
-        params.learning_rate,
-        CUSTOM,
-        params.tree.monotone.copy(),
-    )
+        return Booster(
+            trees^,
+            base_score,
+            params.learning_rate,
+            CUSTOM,
+            params.tree.monotone.copy(),
+        )
 
 
 def train_custom_gpu[F: GradHessFn](
@@ -1254,119 +1262,122 @@ def _train_multiclass_gpu_rounds[
     round opens once and each class's tree inside it opens and closes, which
     is the tree-to-tree transition `SessionLifecycle` allows without an
     intervening round boundary."""
-    var n = data.n_rows
-    var trees = List[Tree]()
+    comptime if not has_accelerator():
+        raise Error("GPU training requires an accelerator")
+    else:
+        var n = data.n_rows
+        var trees = List[Tree]()
 
-    # Softmax without row sampling runs the whole objective on the
-    # device: probabilities refresh once per round, each class's
-    # gradients land straight in the histogram buffers, and each class's
-    # tree advances the device raw scores from its leaf ranges. Bagging
-    # and GOSS keep the host path, which owns the row sample.
-    if device_grads:
-        var labels_f = List[Float64](capacity=n)
-        for r in range(n):
-            labels_f.append(Float64(labels[r]))
-        var state = builder.objective_state(
-            labels_f, sample_weight, n_classes, 2 * params.tree.num_leaves
-        )
-        state.init_raw(builder.ctx, base_scores)
+        # Softmax without row sampling runs the whole objective on the
+        # device: probabilities refresh once per round, each class's
+        # gradients land straight in the histogram buffers, and each class's
+        # tree advances the device raw scores from its leaf ranges. Bagging
+        # and GOSS keep the host path, which owns the row sample.
+        if device_grads:
+            var labels_f = List[Float64](capacity=n)
+            for r in range(n):
+                labels_f.append(Float64(labels[r]))
+            var state = builder.objective_state(
+                labels_f, sample_weight, n_classes, 2 * params.tree.num_leaves
+            )
+            state.init_raw(builder.ctx, base_scores)
+            for i in range(params.n_estimators):
+                life.begin_round()
+                state.refresh_softmax(builder.ctx)
+                var made_progress = False
+                for k in range(n_classes):
+                    builder.fill_softmax_gradients_device(state, k)
+                    life.begin_tree()
+                    var tree = grow_tree_gpu(
+                        builder,
+                        params.tree,
+                        [],
+                        i * n_classes + k,
+                        split_search,
+                    )
+                    life.end_tree()
+                    if tree.n_leaves > 1 or abs(tree.value[0]) >= 1e-12:
+                        made_progress = True
+                    # Before the next class's begin_tree resets the ranges.
+                    builder.update_raw_device(
+                        state, tree.value, params.learning_rate, k
+                    )
+                    trees.append(tree^)
+                life.end_round()
+                if not made_progress:
+                    for _ in range(n_classes):
+                        _ = trees.pop()
+                    break
+            return MulticlassBooster(
+                trees^, base_scores^, n_classes, params.learning_rate
+            )
+
+        # Row-major raw scores and softmax scratch: raw[r * n_classes + k].
+        var raw = List[Float64](capacity=n * n_classes)
+        for _ in range(n):
+            for k in range(n_classes):
+                raw.append(base_scores[k])
+        var prob = List[Float64](capacity=n * n_classes)
+        for _ in range(n * n_classes):
+            prob.append(0.0)
+        var grad = List[Float64](capacity=n)
+        var hess = List[Float64](capacity=n)
+        var bag = List[Int]()
         for i in range(params.n_estimators):
             life.begin_round()
-            state.refresh_softmax(builder.ctx)
+            refresh_bag(bag, bagging, n, i)
+            for r in range(n):
+                for k in range(n_classes):
+                    prob[r * n_classes + k] = raw[r * n_classes + k]
+                _softmax_inplace(prob, r * n_classes, n_classes)
+
+            # One shared sample for the whole round, drawn before any class's
+            # tree, exactly as on the CPU.
+            var selection = GossSelection.all_rows()
+            if goss.active(i, params.learning_rate):
+                selection = _multiclass_goss_select(
+                    prob, labels, n_classes, sample_weight, goss, i
+                )
+                bag = selection.rows.copy()
+
             var made_progress = False
             for k in range(n_classes):
-                builder.fill_softmax_gradients_device(state, k)
+                _fill_softmax_grad_hess(
+                    prob, labels, k, n_classes, sample_weight, grad, hess
+                )
+                apply_goss_scaling(selection, grad, hess)
+                builder.upload_gradients(grad, hess)
+                # Feature subsampling draws once per tree, so each class's
+                # tree in a round gets its own feature set; the same index
+                # the CPU grower uses keeps the two backends on identical
+                # feature sets.
                 life.begin_tree()
                 var tree = grow_tree_gpu(
-                    builder,
-                    params.tree,
-                    [],
-                    i * n_classes + k,
-                    split_search,
+                    builder, params.tree, bag, i * n_classes + k, split_search
                 )
                 life.end_tree()
                 if tree.n_leaves > 1 or abs(tree.value[0]) >= 1e-12:
                     made_progress = True
-                # Before the next class's begin_tree resets the ranges.
-                builder.update_raw_device(
-                    state, tree.value, params.learning_rate, k
-                )
+                for r in range(n):
+                    raw[r * n_classes + k] += (
+                        params.learning_rate * tree.predict_row(data, r)
+                    )
                 trees.append(tree^)
             life.end_round()
+
+            # No class made progress: with bagging or GOSS that is a
+            # statement about this sample, so the round is dropped and the
+            # next sample gets its turn.
             if not made_progress:
                 for _ in range(n_classes):
                     _ = trees.pop()
+                if bagging_enabled(bagging) or goss.enabled:
+                    continue
                 break
+
         return MulticlassBooster(
             trees^, base_scores^, n_classes, params.learning_rate
         )
-
-    # Row-major raw scores and softmax scratch: raw[r * n_classes + k].
-    var raw = List[Float64](capacity=n * n_classes)
-    for _ in range(n):
-        for k in range(n_classes):
-            raw.append(base_scores[k])
-    var prob = List[Float64](capacity=n * n_classes)
-    for _ in range(n * n_classes):
-        prob.append(0.0)
-    var grad = List[Float64](capacity=n)
-    var hess = List[Float64](capacity=n)
-    var bag = List[Int]()
-    for i in range(params.n_estimators):
-        life.begin_round()
-        refresh_bag(bag, bagging, n, i)
-        for r in range(n):
-            for k in range(n_classes):
-                prob[r * n_classes + k] = raw[r * n_classes + k]
-            _softmax_inplace(prob, r * n_classes, n_classes)
-
-        # One shared sample for the whole round, drawn before any class's
-        # tree, exactly as on the CPU.
-        var selection = GossSelection.all_rows()
-        if goss.active(i, params.learning_rate):
-            selection = _multiclass_goss_select(
-                prob, labels, n_classes, sample_weight, goss, i
-            )
-            bag = selection.rows.copy()
-
-        var made_progress = False
-        for k in range(n_classes):
-            _fill_softmax_grad_hess(
-                prob, labels, k, n_classes, sample_weight, grad, hess
-            )
-            apply_goss_scaling(selection, grad, hess)
-            builder.upload_gradients(grad, hess)
-            # Feature subsampling draws once per tree, so each class's
-            # tree in a round gets its own feature set; the same index
-            # the CPU grower uses keeps the two backends on identical
-            # feature sets.
-            life.begin_tree()
-            var tree = grow_tree_gpu(
-                builder, params.tree, bag, i * n_classes + k, split_search
-            )
-            life.end_tree()
-            if tree.n_leaves > 1 or abs(tree.value[0]) >= 1e-12:
-                made_progress = True
-            for r in range(n):
-                raw[r * n_classes + k] += (
-                    params.learning_rate * tree.predict_row(data, r)
-                )
-            trees.append(tree^)
-        life.end_round()
-
-        # No class made progress: with bagging or GOSS that is a
-        # statement about this sample, so the round is dropped and the
-        # next sample gets its turn.
-        if not made_progress:
-            for _ in range(n_classes):
-                _ = trees.pop()
-            if bagging_enabled(bagging) or goss.enabled:
-                continue
-            break
-
-    return MulticlassBooster(
-        trees^, base_scores^, n_classes, params.learning_rate
-    )
 
 
 def train_multiclass_gpu(
@@ -1572,6 +1583,25 @@ struct _HostValidScorer(GpuValidScorer, Movable):
         return _mean_loss(self.raw, target, objective, alpha)
 
 
+def _open_valid_predictor(
+    ctx: DeviceContext,
+    caps: DeviceCaps,
+    data: BinnedMatrix,
+    target: List[Float64],
+) raises -> GpuPredictor:
+    """A single-output predictor on `ctx`, with `data` and `target` made
+    resident. The comptime guard keeps the device instantiation out of
+    CPU-only builds, the same shape the guarded device helpers in
+    tests/parallel use; only a caller that resolved to VALID_SCORE_DEVICE
+    reaches it."""
+    comptime if not has_accelerator():
+        raise Error("GPU validation scoring requires an accelerator")
+    else:
+        var predictor = GpuPredictor(ctx, caps, data.n_features, 1)
+        predictor.set_validation(data, target)
+        return predictor^
+
+
 struct _DeviceValidScorer(GpuValidScorer, Movable):
     """Validation scores kept on the training context.
 
@@ -1603,35 +1633,44 @@ struct _DeviceValidScorer(GpuValidScorer, Movable):
         data: BinnedMatrix,
         target: List[Float64],
     ) raises:
-        self.predictor = GpuPredictor(ctx, caps, data.n_features, 1)
-        self.predictor.set_validation(data, target)
+        self.predictor = _open_valid_predictor(ctx, caps, data, target)
 
     def start(mut self, base_score: Float64) raises:
-        var base: List[Float64] = [base_score]
-        self.predictor.reset_validation(base)
+        comptime if not has_accelerator():
+            raise Error("GPU validation scoring requires an accelerator")
+        else:
+            var base: List[Float64] = [base_score]
+            self.predictor.reset_validation(base)
 
     def observe(
         mut self, tree: Tree, data: BinnedMatrix, learning_rate: Float64
     ) raises:
-        # `data` is already device-resident from `set_validation`, so the
-        # host matrix is not read here; the argument keeps one trait
-        # signature for both scorers.
-        var round_trees = List[Tree]()
-        round_trees.append(tree.copy())
-        # Base scores of zero: `start` put the ensemble's base score into the
-        # resident vector once, which is where `IterationRange` puts it too,
-        # and `accumulate_round` never adds it again.
-        var zero: List[Float64] = [0.0]
-        self.predictor.upload_ensemble(
-            flatten_trees(round_trees, zero, 1, learning_rate)
-        )
-        self.predictor.accumulate_round(0)
+        comptime if not has_accelerator():
+            raise Error("GPU validation scoring requires an accelerator")
+        else:
+            # `data` is already device-resident from `set_validation`, so
+            # the host matrix is not read here; the argument keeps one trait
+            # signature for both scorers.
+            var round_trees = List[Tree]()
+            round_trees.append(tree.copy())
+            # Base scores of zero: `start` put the ensemble's base score
+            # into the resident vector once, which is where
+            # `IterationRange` puts it too, and `accumulate_round` never
+            # adds it again.
+            var zero: List[Float64] = [0.0]
+            self.predictor.upload_ensemble(
+                flatten_trees(round_trees, zero, 1, learning_rate)
+            )
+            self.predictor.accumulate_round(0)
 
     def loss(
         mut self, target: List[Float64], objective: Int, alpha: Float64
     ) raises -> Float64:
-        var raw = self.predictor.validation_raw()
-        return _mean_loss(raw, target, objective, alpha)
+        comptime if not has_accelerator():
+            raise Error("GPU validation scoring requires an accelerator")
+        else:
+            var raw = self.predictor.validation_raw()
+            return _mean_loss(raw, target, objective, alpha)
 
 
 def _train_gpu_valid_rounds[
@@ -1662,67 +1701,73 @@ def _train_gpu_valid_rounds[
     same `min_delta`. Only the histograms the splits are chosen from carry
     the GPU's Float32 precision, plus the validation raw scores when the
     device scorer is selected."""
-    var n = data.n_rows
-    var base_score = _base_score(target, objective, sample_weight, alpha)
-    var raw = List[Float64](capacity=n)
-    for _ in range(n):
-        raw.append(base_score)
-    scorer.start(base_score)
+    comptime if not has_accelerator():
+        raise Error("GPU training requires an accelerator")
+    else:
+        var n = data.n_rows
+        var base_score = _base_score(target, objective, sample_weight, alpha)
+        var raw = List[Float64](capacity=n)
+        for _ in range(n):
+            raw.append(base_score)
+        scorer.start(base_score)
 
-    var signs = params.tree.monotone.active_signs()
-    var renews = objective_renews_leaves(objective)
-    var renew_w = renewal_weights(objective, target, sample_weight)
-    var renew_a = renewal_alpha(objective, alpha)
-    var trees = List[Tree]()
-    var grad = List[Float64](capacity=n)
-    var hess = List[Float64](capacity=n)
-    # The base-score-only model is the run's incumbent, exactly as it is on
-    # the CPU: a run whose first round does not beat it keeps no trees.
-    var best_loss = scorer.loss(valid_target, objective, alpha)
-    var best_n_trees = 0
-    var bag = List[Int]()
-    for i in range(params.n_estimators):
-        refresh_bag(bag, bagging, n, i)
-        _fill_grad_hess(
-            raw, target, objective, sample_weight, alpha, grad, hess
-        )
-        goss_round(bag, grad, hess, goss, i, params.learning_rate)
-        builder.upload_gradients(grad, hess)
-        var tree = grow_tree_gpu(builder, params.tree, bag, i, split_search)
-        if renews:
-            _renew_leaf_values(
-                tree, data, target, raw, renew_w, renew_a, bag, signs
+        var signs = params.tree.monotone.active_signs()
+        var renews = objective_renews_leaves(objective)
+        var renew_w = renewal_weights(objective, target, sample_weight)
+        var renew_a = renewal_alpha(objective, alpha)
+        var trees = List[Tree]()
+        var grad = List[Float64](capacity=n)
+        var hess = List[Float64](capacity=n)
+        # The base-score-only model is the run's incumbent, exactly as it is on
+        # the CPU: a run whose first round does not beat it keeps no trees.
+        var best_loss = scorer.loss(valid_target, objective, alpha)
+        var best_n_trees = 0
+        var bag = List[Int]()
+        for i in range(params.n_estimators):
+            refresh_bag(bag, bagging, n, i)
+            _fill_grad_hess(
+                raw, target, objective, sample_weight, alpha, grad, hess
             )
+            goss_round(bag, grad, hess, goss, i, params.learning_rate)
+            builder.upload_gradients(grad, hess)
+            var tree = grow_tree_gpu(
+                builder, params.tree, bag, i, split_search
+            )
+            if renews:
+                _renew_leaf_values(
+                    tree, data, target, raw, renew_w, renew_a, bag, signs
+                )
 
-        # Under bagging or GOSS a degenerate tree indicts the sample, not
-        # the run.
-        if tree.n_leaves == 1 and abs(tree.value[0]) < 1e-12:
-            if bagging_enabled(bagging) or goss.enabled:
-                continue
-            break
+            # Under bagging or GOSS a degenerate tree indicts the sample, not
+            # the run.
+            if tree.n_leaves == 1 and abs(tree.value[0]) < 1e-12:
+                if bagging_enabled(bagging) or goss.enabled:
+                    continue
+                break
 
-        for r in range(n):
-            raw[r] += params.learning_rate * tree.predict_row(data, r)
-        # After renewal, which rewrites the leaf values the scorer folds in.
-        scorer.observe(tree, valid_data, params.learning_rate)
-        trees.append(tree^)
+            for r in range(n):
+                raw[r] += params.learning_rate * tree.predict_row(data, r)
+            # After renewal, which rewrote the leaf values the scorer
+            # folds in.
+            scorer.observe(tree, valid_data, params.learning_rate)
+            trees.append(tree^)
 
-        var loss = scorer.loss(valid_target, objective, alpha)
-        if loss < best_loss - min_delta:
-            best_loss = loss
-            best_n_trees = len(trees)
-        elif len(trees) - best_n_trees >= early_stopping_rounds:
-            break
+            var loss = scorer.loss(valid_target, objective, alpha)
+            if loss < best_loss - min_delta:
+                best_loss = loss
+                best_n_trees = len(trees)
+            elif len(trees) - best_n_trees >= early_stopping_rounds:
+                break
 
-    while len(trees) > best_n_trees:
-        _ = trees.pop()
-    return Booster(
-        trees^,
-        base_score,
-        params.learning_rate,
-        objective,
-        params.tree.monotone.copy(),
-    )
+        while len(trees) > best_n_trees:
+            _ = trees.pop()
+        return Booster(
+            trees^,
+            base_score,
+            params.learning_rate,
+            objective,
+            params.tree.monotone.copy(),
+        )
 
 
 def train_gpu_with_valid(

@@ -358,8 +358,16 @@ time.
 The first wheel target is macOS on Apple silicon, with Linux x86_64 and
 aarch64 after it. A wheel bundles the Mojo runtime libraries it needs, so no
 Mojo or MAX installation is required at runtime. Intel Macs, Windows, and
-free-threaded Python are out of scope, and the pinned toolchain currently
-fixes the interpreter at CPython 3.14.
+free-threaded Python are out of scope.
+
+The declared interpreter is CPython 3.14, which is the only one anything has
+run on rather than a toolchain requirement; 3.13 is expected but unproven and
+3.12 and earlier are blocked by an entry point added in 3.13, all worked
+through in
+[docs/PYTHON_SUPPORT.md](https://github.com/ajhendel/mojoboost/blob/main/docs/PYTHON_SUPPORT.md).
+The Linux platform tag is likewise unsettled: the default `linux_x86_64` and
+`linux_aarch64` tags are rejected by every index, and a `manylinux` tag needs
+a measured glibc floor first.
 
 None of that has been published or validated yet. Every target, its expected
 artifact name, and the evidence behind its status is in
@@ -377,7 +385,7 @@ instructions above.
 | `No matching distribution found for mojoboost` | The package is not on PyPI yet. Build from source |
 | `Requires-Python >=3.14` in pip's output | Your interpreter is older than the declared floor |
 | `... is not a supported wheel on this platform` | The wheel's tags do not describe your machine. Do not force it |
-| `ModuleNotFoundError: No module named 'mojoboost._mojoboost'` | Source checkout without a built extension. Run `pixi run build-python` |
+| `ImportError: cannot import name '_mojoboost' from 'mojoboost'` | Source checkout without a built extension. Run `pixi run build-python` |
 | `ImportError: ... Library not loaded: @rpath/libKGENCompilerRTShared.dylib` | The MAX runtime libraries were not found. Run through `pixi run`, or install a self-contained wheel |
 | `RuntimeError: device 'gpu' requested but no accelerator is available` | This build has no GPU path. Availability is fixed when the extension is compiled, not at runtime |
 | `RuntimeError: validation metrics are scored on the CPU` | An `eval_set` with `device="gpu"`. Use `device="cpu"` or `"auto"` |

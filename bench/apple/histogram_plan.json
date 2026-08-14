@@ -1,0 +1,247 @@
+{
+  "kind": "histogram_plan_table",
+  "version": "0.1.0",
+  "title": "mojoboost GPU histogram launch plans by device profile and workload shape",
+  "description": "What src/mojoboost/apple_histogram_policy.mojo selects for a set of device profiles and dataset shapes. This is a table of DECISIONS, not of measurements. It contains no timing, no throughput, and no comparison between plans, because none has been taken: every specialization in the table is default-off for exactly that reason. Do not merge, plot, or quote this file alongside a bench/apple/suite.py run record; it is a different artifact with a different schema and it carries no results.",
+
+  "provenance": {
+    "hand_derived": true,
+    "executed": false,
+    "note": "Every number below was derived by reading the policy source, not by running it. The lane that wrote this file was not permitted to run Mojo, Pixi, Python, builds, benchmarks, or profilers. Treat each plan as a claim about what the policy computes, to be confirmed by the emitter named under `verification` before anything is built on it.",
+    "policy_source": "src/mojoboost/apple_histogram_policy.mojo",
+    "primitives_source": "src/mojoboost/gpu_histogram_specializations.mojo",
+    "baseline_source": "src/mojoboost/gpu_tiling.mojo",
+    "handoff": "handoffs/performance_14_gpu_histogram.md"
+  },
+
+  "verification": {
+    "status": "not_run",
+    "emitter": "bench/apple/histogram_plan.mojo",
+    "emitter_exists": false,
+    "instructions": "Write an emitter that calls derive_histogram_plan once per (profile, shape, level) below and writes this file, then diff the result against this hand-derived version. A difference is a bug in one of the two and must be resolved before either is trusted. The emitter belongs in Mojo: the policy is Mojo, and a Python reimplementation of it would be a second policy.",
+    "per_row_call": "derive_histogram_plan(profile, DeviceHistogramCapabilities.portable(), features, HistogramWorkload.node(dataset_rows, node_rows, n_slots, n_bins), STRATEGY_AUTO, level, 0)"
+  },
+
+  "measurements": null,
+  "measurements_absent_because": "No specialized histogram kernel has been compiled or timed on any device, Apple or otherwise. The one end-to-end GPU training measurement this repository holds (M4, bench/bench_train_gpu.mojo) is of the unspecialized path and is slower than the CPU trainer, which is why device.mojo still resolves `auto` to the CPU. Until a measurement exists, every plan below at a level above `baseline` is a hypothesis.",
+
+  "profiles": [
+    {
+      "id": "portable_fallback",
+      "description": "A device that reported nothing useful, on any of Metal, CUDA, or HIP. apple_gpu_policy.GpuProfile.generic().",
+      "core_count": 16,
+      "max_threads_per_block": 1024,
+      "max_shared_memory_per_block": 16384,
+      "memory_budget_bytes": null,
+      "memory_budget_absent_because": "No DeviceContext total-memory accessor is used anywhere in this repository, so no profile reports a budget and partial_budget_bytes falls back to the portable 64 MiB ceiling.",
+      "unified_memory": false,
+      "synthetic": true
+    },
+    {
+      "id": "unified_10core_32k",
+      "description": "The one Apple capability triple this repository has read off hardware (apple_gpu_policy.apple_m4_observed). Named here by the triple it reports, not by the part it came from: no code path in the policy branches on a model string, an architecture string, or an M-series generation.",
+      "core_count": 10,
+      "max_threads_per_block": 1024,
+      "max_shared_memory_per_block": 32768,
+      "memory_budget_bytes": null,
+      "memory_budget_absent_because": "Not read. Same accessor gap as above.",
+      "unified_memory": true,
+      "synthetic": false
+    }
+  ],
+
+  "bin_classes": {
+    "description": "The five capacities a specialized histogram kernel would be instantiated at, and what each costs in threadgroup memory. `max_bin` is the user-facing parameter the class is named after; a dataset binned with max_bin = 255 has 256 bins, one of which is the missing bin.",
+    "unspecialized_shared_bytes_per_block": 3072,
+    "unspecialized_note": "Three MAX_BINS-wide Int32 planes. The shipping kernels allocate this at every bin count, which is why the narrow classes save nothing until the kernels take a capacity parameter.",
+    "classes": [
+      {
+        "max_bin": 15,
+        "n_bins": 16,
+        "capacity": 16,
+        "specialized_shared_bytes_per_block": 192,
+        "unmodeled_bytes_today": 2880,
+        "resident_blocks_per_core": {
+          "portable_fallback": { "specialized": 8, "unspecialized": 5 },
+          "unified_10core_32k": { "specialized": 8, "unspecialized": 8 }
+        }
+      },
+      {
+        "max_bin": 31,
+        "n_bins": 32,
+        "capacity": 32,
+        "specialized_shared_bytes_per_block": 384,
+        "unmodeled_bytes_today": 2688,
+        "resident_blocks_per_core": {
+          "portable_fallback": { "specialized": 8, "unspecialized": 5 },
+          "unified_10core_32k": { "specialized": 8, "unspecialized": 8 }
+        }
+      },
+      {
+        "max_bin": 63,
+        "n_bins": 64,
+        "capacity": 64,
+        "specialized_shared_bytes_per_block": 768,
+        "unmodeled_bytes_today": 2304,
+        "resident_blocks_per_core": {
+          "portable_fallback": { "specialized": 8, "unspecialized": 5 },
+          "unified_10core_32k": { "specialized": 8, "unspecialized": 8 }
+        }
+      },
+      {
+        "max_bin": 127,
+        "n_bins": 128,
+        "capacity": 128,
+        "specialized_shared_bytes_per_block": 1536,
+        "unmodeled_bytes_today": 1536,
+        "resident_blocks_per_core": {
+          "portable_fallback": { "specialized": 8, "unspecialized": 5 },
+          "unified_10core_32k": { "specialized": 8, "unspecialized": 8 }
+        }
+      },
+      {
+        "max_bin": 255,
+        "n_bins": 256,
+        "capacity": 256,
+        "specialized_shared_bytes_per_block": 3072,
+        "unmodeled_bytes_today": 0,
+        "resident_blocks_per_core": {
+          "portable_fallback": { "specialized": 5, "unspecialized": 5 },
+          "unified_10core_32k": { "specialized": 8, "unspecialized": 8 }
+        }
+      }
+    ],
+    "residency_cap": 8,
+    "residency_cap_note": "MAX_RESIDENT_BLOCKS_PER_CORE. Every specialized figure above except capacity 256 on the 16 KiB device is at the cap, so the narrow classes buy residency only on a device whose threadgroup memory is small enough for the cap to bind."
+  },
+
+  "specialization_availability": {
+    "description": "What a plan can select in this build, before any shape is considered.",
+    "kernel_features": {
+      "specialized_bin_kernels": false,
+      "packed_bin_loads": false,
+      "batched_leaf_kernel": false,
+      "note": "KernelFeatures.none(). No specialized kernel variant is compiled into this repository; the primitives module describes them and gpu_active_rows.mojo still holds the only histogram kernels that exist."
+    },
+    "device_capabilities": {
+      "subgroup_width": null,
+      "subgroup_width_absent_because": "Metal rejects the WARP_SIZE attribute and no code here assumes a width. Nothing in the policy divides by it.",
+      "max_grid_dim_z": 65535,
+      "wide_byte_loads": false,
+      "wide_byte_loads_absent_because": "No measurement compares one aligned four-byte bin load against four one-byte loads on any device, so the portable four-load implementation is the one that runs."
+    },
+    "consequence": "Every plan below at level `packed` would come back with level_applied = shape and reason = kernel_variant_not_compiled, and plan_batched_leaves would return an empty list for the same reason. The `shape` column is therefore the highest level this build can actually reach, and it is still off by default."
+  },
+
+  "shape_constants": {
+    "n_slots": 32,
+    "n_slots_note": "Active features, which is grid.x. Every plan in the table uses the same feature count so that the bin count and the row count are the only variables.",
+    "partial_cell_limit": 5592405,
+    "partial_cell_limit_note": "64 MiB / 12 bytes per (tile, feature, bin) cell. Identical at both levels on every profile here, because no profile reports a memory budget for the unified-memory fraction to apply to.",
+    "block_threads": 256,
+    "block_threads_note": "Every shape in the table has more rows than the 256-thread target, so the row bound in the shape-level rule never binds and both levels choose 256. A node with fewer rows than that is where the two diverge, and there is no such node in this table."
+  },
+
+  "plans": [
+    {
+      "profile": "unified_10core_32k", "node_rows": 262144, "n_bins": 16,
+      "baseline":            { "strategy": "tiled", "block_threads": 256, "n_tiles": 3, "rows_per_tile": 87382, "rows_per_thread": 342, "shared_bytes_per_block": 3072, "resident_blocks_per_core": 8, "partial_cells": 1536 },
+      "shape_unspecialized": { "strategy": "tiled", "block_threads": 256, "n_tiles": 3, "rows_per_tile": 87382, "rows_per_thread": 342, "shared_bytes_per_block": 3072, "resident_blocks_per_core": 8, "partial_cells": 1536, "matches_baseline": true },
+      "shape_specialized":   { "strategy": "tiled", "block_threads": 256, "n_tiles": 3, "rows_per_tile": 87382, "rows_per_thread": 342, "shared_bytes_per_block": 192,  "resident_blocks_per_core": 8, "partial_cells": 1536, "matches_baseline": true }
+    },
+    {
+      "profile": "unified_10core_32k", "node_rows": 262144, "n_bins": 32,
+      "baseline":            { "strategy": "tiled", "block_threads": 256, "n_tiles": 3, "rows_per_tile": 87382, "rows_per_thread": 342, "shared_bytes_per_block": 3072, "resident_blocks_per_core": 8, "partial_cells": 3072 },
+      "shape_unspecialized": { "strategy": "tiled", "block_threads": 256, "n_tiles": 3, "rows_per_tile": 87382, "rows_per_thread": 342, "shared_bytes_per_block": 3072, "resident_blocks_per_core": 8, "partial_cells": 3072, "matches_baseline": true },
+      "shape_specialized":   { "strategy": "tiled", "block_threads": 256, "n_tiles": 3, "rows_per_tile": 87382, "rows_per_thread": 342, "shared_bytes_per_block": 384,  "resident_blocks_per_core": 8, "partial_cells": 3072, "matches_baseline": true }
+    },
+    {
+      "profile": "unified_10core_32k", "node_rows": 262144, "n_bins": 64,
+      "baseline":            { "strategy": "tiled", "block_threads": 256, "n_tiles": 3, "rows_per_tile": 87382, "rows_per_thread": 342, "shared_bytes_per_block": 3072, "resident_blocks_per_core": 8, "partial_cells": 6144 },
+      "shape_unspecialized": { "strategy": "tiled", "block_threads": 256, "n_tiles": 3, "rows_per_tile": 87382, "rows_per_thread": 342, "shared_bytes_per_block": 3072, "resident_blocks_per_core": 8, "partial_cells": 6144, "matches_baseline": true },
+      "shape_specialized":   { "strategy": "tiled", "block_threads": 256, "n_tiles": 3, "rows_per_tile": 87382, "rows_per_thread": 342, "shared_bytes_per_block": 768,  "resident_blocks_per_core": 8, "partial_cells": 6144, "matches_baseline": true }
+    },
+    {
+      "profile": "unified_10core_32k", "node_rows": 262144, "n_bins": 128,
+      "baseline":            { "strategy": "tiled", "block_threads": 256, "n_tiles": 3, "rows_per_tile": 87382, "rows_per_thread": 342, "shared_bytes_per_block": 3072, "resident_blocks_per_core": 8, "partial_cells": 12288 },
+      "shape_unspecialized": { "strategy": "tiled", "block_threads": 256, "n_tiles": 3, "rows_per_tile": 87382, "rows_per_thread": 342, "shared_bytes_per_block": 3072, "resident_blocks_per_core": 8, "partial_cells": 12288, "matches_baseline": true },
+      "shape_specialized":   { "strategy": "tiled", "block_threads": 256, "n_tiles": 3, "rows_per_tile": 87382, "rows_per_thread": 342, "shared_bytes_per_block": 1536, "resident_blocks_per_core": 8, "partial_cells": 12288, "matches_baseline": true }
+    },
+    {
+      "profile": "unified_10core_32k", "node_rows": 262144, "n_bins": 256,
+      "baseline":            { "strategy": "tiled", "block_threads": 256, "n_tiles": 3, "rows_per_tile": 87382, "rows_per_thread": 342, "shared_bytes_per_block": 3072, "resident_blocks_per_core": 8, "partial_cells": 24576 },
+      "shape_unspecialized": { "strategy": "tiled", "block_threads": 256, "n_tiles": 3, "rows_per_tile": 87382, "rows_per_thread": 342, "shared_bytes_per_block": 3072, "resident_blocks_per_core": 8, "partial_cells": 24576, "matches_baseline": true },
+      "shape_specialized":   { "strategy": "tiled", "block_threads": 256, "n_tiles": 3, "rows_per_tile": 87382, "rows_per_thread": 342, "shared_bytes_per_block": 3072, "resident_blocks_per_core": 8, "partial_cells": 24576, "matches_baseline": true }
+    },
+
+    {
+      "profile": "portable_fallback", "node_rows": 262144, "n_bins": 16,
+      "baseline":            { "strategy": "tiled", "block_threads": 256, "n_tiles": 4, "rows_per_tile": 65536, "rows_per_thread": 256, "shared_bytes_per_block": 3072, "resident_blocks_per_core": 8, "partial_cells": 2048 },
+      "shape_unspecialized": { "strategy": "tiled", "block_threads": 256, "n_tiles": 3, "rows_per_tile": 87382, "rows_per_thread": 342, "shared_bytes_per_block": 3072, "resident_blocks_per_core": 5, "partial_cells": 1536, "matches_baseline": false },
+      "shape_specialized":   { "strategy": "tiled", "block_threads": 256, "n_tiles": 4, "rows_per_tile": 65536, "rows_per_thread": 256, "shared_bytes_per_block": 192,  "resident_blocks_per_core": 8, "partial_cells": 2048, "matches_baseline": true }
+    },
+    {
+      "profile": "portable_fallback", "node_rows": 262144, "n_bins": 32,
+      "baseline":            { "strategy": "tiled", "block_threads": 256, "n_tiles": 4, "rows_per_tile": 65536, "rows_per_thread": 256, "shared_bytes_per_block": 3072, "resident_blocks_per_core": 8, "partial_cells": 4096 },
+      "shape_unspecialized": { "strategy": "tiled", "block_threads": 256, "n_tiles": 3, "rows_per_tile": 87382, "rows_per_thread": 342, "shared_bytes_per_block": 3072, "resident_blocks_per_core": 5, "partial_cells": 3072, "matches_baseline": false },
+      "shape_specialized":   { "strategy": "tiled", "block_threads": 256, "n_tiles": 4, "rows_per_tile": 65536, "rows_per_thread": 256, "shared_bytes_per_block": 384,  "resident_blocks_per_core": 8, "partial_cells": 4096, "matches_baseline": true }
+    },
+    {
+      "profile": "portable_fallback", "node_rows": 262144, "n_bins": 64,
+      "baseline":            { "strategy": "tiled", "block_threads": 256, "n_tiles": 4, "rows_per_tile": 65536, "rows_per_thread": 256, "shared_bytes_per_block": 3072, "resident_blocks_per_core": 8, "partial_cells": 8192 },
+      "shape_unspecialized": { "strategy": "tiled", "block_threads": 256, "n_tiles": 3, "rows_per_tile": 87382, "rows_per_thread": 342, "shared_bytes_per_block": 3072, "resident_blocks_per_core": 5, "partial_cells": 6144, "matches_baseline": false },
+      "shape_specialized":   { "strategy": "tiled", "block_threads": 256, "n_tiles": 4, "rows_per_tile": 65536, "rows_per_thread": 256, "shared_bytes_per_block": 768,  "resident_blocks_per_core": 8, "partial_cells": 8192, "matches_baseline": true }
+    },
+    {
+      "profile": "portable_fallback", "node_rows": 262144, "n_bins": 128,
+      "baseline":            { "strategy": "tiled", "block_threads": 256, "n_tiles": 4, "rows_per_tile": 65536, "rows_per_thread": 256, "shared_bytes_per_block": 3072, "resident_blocks_per_core": 8, "partial_cells": 16384 },
+      "shape_unspecialized": { "strategy": "tiled", "block_threads": 256, "n_tiles": 3, "rows_per_tile": 87382, "rows_per_thread": 342, "shared_bytes_per_block": 3072, "resident_blocks_per_core": 5, "partial_cells": 12288, "matches_baseline": false },
+      "shape_specialized":   { "strategy": "tiled", "block_threads": 256, "n_tiles": 4, "rows_per_tile": 65536, "rows_per_thread": 256, "shared_bytes_per_block": 1536, "resident_blocks_per_core": 8, "partial_cells": 16384, "matches_baseline": true }
+    },
+    {
+      "profile": "portable_fallback", "node_rows": 262144, "n_bins": 256,
+      "baseline":            { "strategy": "tiled", "block_threads": 256, "n_tiles": 4, "rows_per_tile": 65536, "rows_per_thread": 256, "shared_bytes_per_block": 3072, "resident_blocks_per_core": 8, "partial_cells": 32768 },
+      "shape_unspecialized": { "strategy": "tiled", "block_threads": 256, "n_tiles": 3, "rows_per_tile": 87382, "rows_per_thread": 342, "shared_bytes_per_block": 3072, "resident_blocks_per_core": 5, "partial_cells": 24576, "matches_baseline": false },
+      "shape_specialized":   { "strategy": "tiled", "block_threads": 256, "n_tiles": 3, "rows_per_tile": 87382, "rows_per_thread": 342, "shared_bytes_per_block": 3072, "resident_blocks_per_core": 5, "partial_cells": 24576, "matches_baseline": false }
+    },
+
+    {
+      "profile": "unified_10core_32k", "node_rows": 4096, "n_bins": 16,
+      "baseline":            { "strategy": "tiled", "block_threads": 256, "n_tiles": 3, "rows_per_tile": 1366, "rows_per_thread": 6, "shared_bytes_per_block": 3072, "resident_blocks_per_core": 8, "partial_cells": 1536 },
+      "shape_unspecialized": { "strategy": "tiled", "block_threads": 256, "n_tiles": 3, "rows_per_tile": 1366, "rows_per_thread": 6, "shared_bytes_per_block": 3072, "resident_blocks_per_core": 8, "partial_cells": 1536, "matches_baseline": true },
+      "shape_specialized":   { "strategy": "tiled", "block_threads": 256, "n_tiles": 3, "rows_per_tile": 1366, "rows_per_thread": 6, "shared_bytes_per_block": 192,  "resident_blocks_per_core": 8, "partial_cells": 1536, "matches_baseline": true }
+    },
+    {
+      "profile": "unified_10core_32k", "node_rows": 4096, "n_bins": 256,
+      "baseline":            { "strategy": "tiled", "block_threads": 256, "n_tiles": 2, "rows_per_tile": 2048, "rows_per_thread": 8, "shared_bytes_per_block": 3072, "resident_blocks_per_core": 8, "partial_cells": 16384 },
+      "shape_unspecialized": { "strategy": "tiled", "block_threads": 256, "n_tiles": 2, "rows_per_tile": 2048, "rows_per_thread": 8, "shared_bytes_per_block": 3072, "resident_blocks_per_core": 8, "partial_cells": 16384, "matches_baseline": true },
+      "shape_specialized":   { "strategy": "tiled", "block_threads": 256, "n_tiles": 2, "rows_per_tile": 2048, "rows_per_thread": 8, "shared_bytes_per_block": 3072, "resident_blocks_per_core": 8, "partial_cells": 16384, "matches_baseline": true }
+    },
+    {
+      "profile": "portable_fallback", "node_rows": 4096, "n_bins": 16,
+      "baseline":            { "strategy": "tiled", "block_threads": 256, "n_tiles": 4, "rows_per_tile": 1024, "rows_per_thread": 4, "shared_bytes_per_block": 3072, "resident_blocks_per_core": 8, "partial_cells": 2048 },
+      "shape_unspecialized": { "strategy": "tiled", "block_threads": 256, "n_tiles": 3, "rows_per_tile": 1366, "rows_per_thread": 6, "shared_bytes_per_block": 3072, "resident_blocks_per_core": 5, "partial_cells": 1536, "matches_baseline": false },
+      "shape_specialized":   { "strategy": "tiled", "block_threads": 256, "n_tiles": 4, "rows_per_tile": 1024, "rows_per_thread": 4, "shared_bytes_per_block": 192,  "resident_blocks_per_core": 8, "partial_cells": 2048, "matches_baseline": true }
+    },
+    {
+      "profile": "portable_fallback", "node_rows": 4096, "n_bins": 256,
+      "baseline":            { "strategy": "tiled", "block_threads": 256, "n_tiles": 2, "rows_per_tile": 2048, "rows_per_thread": 8, "shared_bytes_per_block": 3072, "resident_blocks_per_core": 8, "partial_cells": 16384 },
+      "shape_unspecialized": { "strategy": "tiled", "block_threads": 256, "n_tiles": 2, "rows_per_tile": 2048, "rows_per_thread": 8, "shared_bytes_per_block": 3072, "resident_blocks_per_core": 5, "partial_cells": 16384, "matches_baseline": true },
+      "shape_specialized":   { "strategy": "tiled", "block_threads": 256, "n_tiles": 2, "rows_per_tile": 2048, "rows_per_thread": 8, "shared_bytes_per_block": 3072, "resident_blocks_per_core": 5, "partial_cells": 16384, "matches_baseline": true }
+    }
+  ],
+
+  "what_the_table_shows": [
+    "On the 32 KiB unified profile, every shape in the table plans identically at every level. The residency cap of 8 is reached whether the block occupies 192 bytes or 3072, so the shape level changes nothing there except the reported footprint. A specialization that changes no launch on the one device this project has measured is the honest headline of this table.",
+    "On the 16 KiB portable profile, the unspecialized footprint costs residency: 16384 / 3072 = 5 blocks per core instead of the 8 gpu_tiling.mojo assumes, which drops the tile count from 4 to 3 at every bin count. Compiling the capacity-parameterized kernel restores 4 tiles for every class except 256, where 3072 bytes leaves 5 blocks regardless. That is the whole case for the bin-capacity specialization, stated as a launch difference rather than as a speed claim.",
+    "Two of the fourteen shapes land the shape level on a geometry the baseline never produces (portable_fallback at 262144 rows and 256 bins, and the same profile at 4096 rows and 16 bins with the unspecialized kernel). Those two are where a bit-exactness comparison has the most to catch, because they are the rows where the two paths do different work.",
+    "No row selects the atomic strategy: every shape here has more than one tile, so the AUTO rule resolves to tiled throughout. The atomic path is reached by a single-tile shape (a small node, a very wide histogram, or an explicit request), and the table does not exercise it."
+  ],
+
+  "not_in_this_table": {
+    "packed_bin_loads": "No shape here declares its rows a contiguous run, so no plan reaches the packed level and the window arithmetic is untested by this table. Add rows with rows_are_contiguous_run = true and a dataset_rows that is a multiple of 4 to exercise it.",
+    "batched_leaves": "Batching is a decision across a frontier of leaves and takes a list of row counts, which this table's one-node-at-a-time shape cannot express. It needs its own table keyed on a frontier.",
+    "feature_subsampling": "Every plan uses all 32 features. The re-derive-against-an-allocated-buffer path (max_partial_cells > 0) is not exercised.",
+    "small_nodes": "Every node here has more rows than one threadgroup can feed, so the row-bounded threadgroup width never binds. A node of 40 rows is the case that separates the two levels' block_threads, and it is missing."
+  }
+}

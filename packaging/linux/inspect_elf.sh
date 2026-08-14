@@ -57,18 +57,22 @@ if [ -n "${CONDA_PREFIX:-}" ]; then
 fi
 
 # --- Collect the objects ---------------------------------------------------
+LIST=$(mktemp)
+trap 'rm -f "$LIST"' EXIT
 if [ -d "$TARGET" ]; then
-    OBJECTS=$(find "$TARGET" -type f \( -name '*.so' -o -name '*.so.*' \) | sort)
+    find "$TARGET" -type f \( -name '*.so' -o -name '*.so.*' \) | sort > "$LIST"
 else
-    OBJECTS=$TARGET
+    printf '%s\n' "$TARGET" > "$LIST"
 fi
-[ -n "$OBJECTS" ] || { echo "inspect_elf: no ELF objects under $TARGET" >&2; exit 1; }
+[ -s "$LIST" ] || { echo "inspect_elf: no ELF objects under $TARGET" >&2; exit 1; }
 
 say ""
 say "=== objects ==="
-printf '%s\n' "$OBJECTS" | tee -a "$LOG"
+tee -a "$LOG" < "$LIST"
 
-for so in $OBJECTS; do
+# Read from a file rather than splitting a variable, so a path with a space in
+# it is one object rather than two nonexistent ones.
+while IFS= read -r so; do
     say ""
     say "================================================================"
     say "$so"
@@ -119,7 +123,7 @@ for so in $OBJECTS; do
     else
         say "(none)"
     fi
-done
+done < "$LIST"
 
 say ""
 say "=== done ==="

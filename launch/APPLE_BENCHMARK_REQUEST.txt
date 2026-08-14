@@ -73,6 +73,7 @@ WHAT WILL GET A RUN REJECTED, AND WHY THAT IS NOT PERSONAL
 A run on a machine that was doing something else. A run from a checkout with uncommitted changes, because then the commit hash does not describe what ran. A run at smoke scale. A run in a virtual machine. A run where the record's own idle gate reports it failed. Every one of these produces a file the protocol says is unquotable, and I would rather tell you that up front than accept a file I will never be able to use.
 
 Repository: https://github.com/ajhendel/mojoboost
+Contributing hardware results: https://github.com/ajhendel/mojoboost/blob/main/docs/HARDWARE_CONTRIBUTORS.md
 Benchmark protocol: https://github.com/ajhendel/mojoboost/blob/main/docs/APPLE_GPU_BENCHMARK_PROTOCOL.md
 Thermal and energy protocol: https://github.com/ajhendel/mojoboost/blob/main/docs/APPLE_THERMAL_ENERGY.md
 GPU validation status: https://github.com/ajhendel/mojoboost/blob/main/docs/GPU_VALIDATION.md

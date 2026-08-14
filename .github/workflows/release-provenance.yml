@@ -126,10 +126,10 @@ jobs:
           MOJOBOOST_MACOS_TARGET: ${{ inputs.macos_target }}
         run: pixi run -e pkg test-wheel
 
-      # The provenance sidecar is written by packaging/build_wheel.sh, which is
-      # another lane's file and does not write it yet (handoffs/task18_platform.md,
-      # edit 4). Everything downstream of here reads it, so its absence is a
-      # hard stop rather than a field left empty.
+      # The provenance sidecar is written by the build, not by this workflow
+      # (handoffs/task18_platform.md edit 4, and packaging/macos/provenance.sh).
+      # Everything downstream of here reads it, so its absence is a hard stop
+      # rather than a field left empty or invented here.
       - name: Provenance sidecar exists
         run: |
           WHEEL=$(ls python/dist/mojoboost-*.whl)

@@ -37,6 +37,14 @@ that must force one path, matching the `MOJOBOOST_` contract in
   Still clamped to the partial-buffer memory budget.
 - `MOJOBOOST_GPU_BLOCK_THREADS`: threads per threadgroup, overriding the
   derived value. Clamped to the device maximum and rounded to a warp.
+
+Specialization sits above this module, not inside it. `derive_tiling` stays
+the one geometry every caller gets by default, on every backend;
+`apple_histogram_policy.mojo` can plan a specialized launch from reported
+device properties and a node's shape, and its own default is to call
+`derive_tiling` and hand back exactly what it returned. Nothing there is on
+unless a caller asks for it by level or by
+`MOJOBOOST_GPU_HIST_SPECIALIZATION`, because nothing there has been measured.
 """
 
 from std.os import getenv
@@ -164,7 +172,28 @@ def env_strategy() -> Int:
 
 
 def shared_bytes_for(n_bins: Int) -> Int:
-    """Shared memory one threadgroup needs for its partial histogram."""
+    """Shared memory one threadgroup needs for its partial histogram.
+
+    The footprint of a kernel sized to its bin count. The kernels that
+    actually ship (`gpu_active_rows._range_hist_atomic_kernel` and
+    `_range_hist_partial_kernel`) allocate three `MAX_BINS`-wide Int32 planes
+    whatever `n_bins` is, so their real footprint is this value at 256 bins
+    and larger than it everywhere below. The difference matters only to a
+    residency estimate, and the only one this module makes is the fixed
+    `TARGET_BLOCKS_PER_SM` above, which does not consult this at all. It is
+    still the wrong number to derive residency from until the kernels take a
+    bin-capacity parameter: see `gpu_histogram_specializations.mojo`, which
+    names both footprints, and `apple_histogram_policy.mojo`, which picks
+    whichever is true of the build in hand.
+
+    The guard in `derive_tiling` inherits the same optimism: it asks whether
+    a capacity-sized histogram fits, so a device advertising less than the
+    3 KiB the shipping kernels allocate would pass the guard and then fail to
+    launch. No supported backend advertises that little, and the guard is
+    left as it is rather than tightened here, because tightening it would
+    change which shapes `derive_tiling` accepts. The policy layer checks the
+    real footprint.
+    """
     return n_bins * BYTES_PER_PARTIAL_CELL
 
 
@@ -298,3 +327,35 @@ def strategy_name(strategy: Int) -> String:
     if strategy == STRATEGY_TILED:
         return String("tiled")
     return String("auto")
+
+
+def rows_per_thread(tiling: HistogramTiling) -> Int:
+    """Rows one lane accumulates over its tile.
+
+    Derived, not chosen: `rows_per_tile` and `block_threads` are the
+    decisions and this reports what they imply. It is at least
+    `MIN_ROWS_PER_TILE_THREAD_FACTOR` whenever the row bound is what set the
+    tile count, and below it only on a node with too few rows to feed one
+    threadgroup, where no tiling can raise it. Reported so a benchmark can
+    say how much work a lane did per partial-histogram zero and flush, which
+    is the ratio the two `MIN_ROWS_PER_TILE_*` constants exist to bound.
+    """
+    return _ceil_div(tiling.rows_per_tile, tiling.block_threads)
+
+
+def describe_tiling(tiling: HistogramTiling) -> String:
+    """One line for benchmark output and bug reports."""
+    return String(
+        "strategy=",
+        strategy_name(tiling.strategy),
+        " threads=",
+        tiling.block_threads,
+        " tiles=",
+        tiling.n_tiles,
+        " rows_per_tile=",
+        tiling.rows_per_tile,
+        " rows_per_thread=",
+        rows_per_thread(tiling),
+        " partial_cells=",
+        tiling.partial_cells,
+    )

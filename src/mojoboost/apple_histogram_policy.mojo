@@ -50,6 +50,14 @@ Every step down is recorded in `HistogramPlan.reason`, so a plan that did
 less than was asked says why rather than looking like the plan that was
 asked for.
 
+`HistogramPlan.level_applied` is a contiguous position on that ladder, and
+it is a statement about **one node**: a node whose rows are not a contiguous
+run stops at `SPEC_LEVEL_SHAPE` however capable the build is. Batching is a
+decision across nodes, so `plan_batched_leaves` gates on `level_requested`
+and `KernelFeatures` rather than on `level_applied`; otherwise a frontier
+would lose its batching because one node in it happened not to be
+contiguous.
+
 What this module will not decide
 --------------------------------
 It does not branch on a model string, a part number, or an Apple generation.
@@ -82,6 +90,8 @@ and compare only the specialization.
 from std.os import getenv
 
 from .apple_gpu_policy import (
+    API_UNKNOWN,
+    APPLE_GEN_UNKNOWN,
     MAX_RESIDENT_BLOCKS_PER_CORE,
     GpuProfile,
     derive_block_threads,
@@ -111,6 +121,7 @@ from .gpu_tiling import (
     STRATEGY_ATOMIC,
     STRATEGY_AUTO,
     STRATEGY_TILED,
+    TARGET_BLOCKS_PER_SM,
     WARP_GRANULARITY,
     DeviceCaps,
     HistogramTiling,
@@ -305,6 +316,40 @@ def caps_from_profile(profile: GpuProfile) -> DeviceCaps:
     )
 
 
+def profile_from_caps(caps: DeviceCaps) -> GpuProfile:
+    """A profile from the three attributes a caller already queried.
+
+    The bridge for a call site that holds a `DeviceCaps` and has no API or
+    architecture string to hand, which is every call site in this repository
+    today. The API is `API_UNKNOWN` and the generation is unknown, which
+    costs nothing: no decision in this module or in `apple_gpu_policy.mojo`
+    branches on either.
+
+    `unified_memory` is false because a `DeviceCaps` does not say. It feeds
+    only the partial-budget fraction, and that fraction applies only to a
+    reported memory budget, which is zero here, so the plan is identical
+    either way. Once a budget accessor exists (see
+    handoffs/apple_a6_policy.md step 3), a call site that knows it is on
+    Metal should build the profile with `GpuProfile.from_reported` instead of
+    this.
+
+    `synthetic` is false because a `DeviceCaps` is normally a reading. One
+    built from `DeviceCaps.fallback()` is not, and this cannot tell the
+    difference, so a caller that knows it fell back should construct the
+    profile itself rather than mislabel a guess as a reading here.
+    """
+    return GpuProfile(
+        API_UNKNOWN,
+        APPLE_GEN_UNKNOWN,
+        caps.sm_count,
+        caps.max_threads_per_block,
+        caps.max_shared_memory_per_block,
+        0,
+        False,
+        False,
+    )
+
+
 def kernel_block_bytes(features: KernelFeatures, capacity: Int) -> Int:
     """Threadgroup memory one block occupies in the build in hand.
 
@@ -467,14 +512,15 @@ def derive_histogram_plan(
             reason = REASON_AS_REQUESTED
 
     # Baseline geometry until a level above it replaces it. The residency
-    # figure reported here is the fixed target `derive_tiling` assumes rather
-    # than a derived one, because that is what produced this geometry.
+    # reported alongside it is the fixed target `derive_tiling` assumes rather
+    # than a derived one, because that assumption is what produced this
+    # geometry.
     var block_threads = baseline.block_threads
     var n_tiles = baseline.n_tiles
     var rows_per_tile = baseline.rows_per_tile
     var strategy = baseline.strategy
     var partial_cells = baseline.partial_cells
-    var resident = MAX_RESIDENT_BLOCKS_PER_CORE
+    var resident = TARGET_BLOCKS_PER_SM
     var block_bytes = unspecialized_kernel_shared_bytes()
     var partial_cell_limit = baseline_partial_cell_limit(max_partial_cells)
 
@@ -576,10 +622,13 @@ def derive_histogram_plan(
 
     # --- Level 3: batched small leaves ---
 
-    # Batching is a decision across leaves, so a single-node plan can only
-    # record that the kernel exists. `plan_batched_leaves` below takes the
-    # frontier and returns the launches.
-    if level >= SPEC_LEVEL_BATCHED and applied >= SPEC_LEVEL_SHAPE:
+    # `level_applied` is a contiguous ladder position, so this level is only
+    # reached when the packed one was. That is a statement about this node,
+    # and batching is a decision across nodes, which is why
+    # `plan_batched_leaves` gates on `level_requested` and `KernelFeatures`
+    # instead: a frontier must not lose its batching because one node's rows
+    # happened not to be contiguous.
+    if level >= SPEC_LEVEL_BATCHED and applied >= SPEC_LEVEL_PACKED:
         if not features.batched_leaf_kernel:
             reason = REASON_KERNEL_ABSENT
         else:

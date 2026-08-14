@@ -1,8 +1,8 @@
 """Persistent GPU runtime: one session per estimator, and the dependency
 model that says which host synchronizations are actually required.
 
-Today every GPU entry point in train_gpu.mojo constructs a fresh
-`GpuHistogramBuilder`, and that constructor opens a `DeviceContext`,
+A GPU entry point in train_gpu.mojo that is not handed a session constructs
+a fresh `GpuHistogramBuilder`, and that constructor opens a `DeviceContext`,
 allocates seven device buffers and three pinned host buffers, uploads the
 binned matrix, and blocks on
 `ctx.synchronize()`. An estimator that fits twice, that fits and then scores

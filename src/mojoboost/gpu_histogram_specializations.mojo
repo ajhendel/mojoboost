@@ -263,12 +263,6 @@ def layout_for(capacity: Int) raises -> SharedHistogramLayout:
     )
 
 
-def fits_shared_memory(capacity: Int, max_shared_per_block: Int) -> Bool:
-    """Whether a block specialized at `capacity` fits the threadgroup memory
-    a device advertises."""
-    return kernel_shared_bytes(capacity) <= max_shared_per_block
-
-
 # --- The capability boundary ---
 
 
@@ -479,15 +473,6 @@ def plan_packed_window(
     if body_quads < MIN_PACKED_BODY_QUADS:
         return PackedLoadWindow(False, count, 0, 0, WINDOW_TOO_SHORT)
     return PackedLoadWindow(True, head, body_quads, tail, WINDOW_OK)
-
-
-def packed_loads_available(
-    device: DeviceHistogramCapabilities, features: KernelFeatures
-) -> Bool:
-    """Whether the packed path may be selected at all, before any shape is
-    considered: the kernel has to exist and the device has to have shown the
-    wide load pays."""
-    return features.packed_bin_loads and device.wide_byte_loads
 
 
 # --- Batched small leaves ---

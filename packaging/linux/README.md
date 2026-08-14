@@ -15,6 +15,7 @@ build_wheel_linux.sh       the builder that does not exist yet, written down
 check_metadata_ready.py    static preflight: is the repo's Python metadata Linux-ready
 inspect_wheel.py           stdlib wheel and ELF inspector, no binutils required
 inspect_elf.sh             binutils inspection of installed objects, on the target
+container_elf_report.sh    the container-side driver for inspect_elf.sh
 images.env                 container image references, digests deliberately empty
 ```
 
@@ -169,23 +170,26 @@ mojoboost bundles one proprietary runtime that nothing else on PyPI vendors, so
 the hash suffix would buy nothing and cost the ability to compare two wheels
 byte for byte. Revisit if a second package ever ships the MAX runtime.
 
-**Two metadata blockers stand in the way and neither is this lane's file to
-fix.** `check_metadata_ready.py` detects both and the builder refuses to run
-until they are gone:
+**Three things in the Python metadata and the environment have to be right
+before any of this works, and none of them is this directory's file to fix.**
+`check_metadata_ready.py` checks all three and the builder refuses to run while
+one is wrong:
 
-1. `python/setup.py` hard-codes `plat_name = "macosx_26_0_" + platform.machine()`.
-   Run on Linux as written it produces a wheel tagged for macOS, on the wrong
-   architecture, which is the most confidently wrong artifact this project could
-   produce. The builder works around it with an explicit `--plat-name` on the
-   command line, which distutils lets override the `setup()` default, and then
-   verifies the filename it got. The real fix belongs to Task 01.
-2. `python/pyproject.toml` sets `package-data = { mojoboost = ["*.so",
-   ".dylibs/*.dylib"] }`. Nothing there matches `.libs/lib*.so.1`, so the
-   bundled runtime would be silently dropped from the wheel and the failure
-   would surface as an `ImportError` on a user's machine. One line, and it is
-   Task 01's line.
+1. `python/setup.py` must not apply its macOS `plat_name` on Linux. Applied
+   unconditionally it produces a wheel tagged for macOS holding an ELF object,
+   which is the most confidently wrong artifact this project could make. Guarded
+   by `sys.platform == "darwin"` as of Task 01's work in this round. The builder
+   also passes `--plat-name` explicitly and verifies the filename it got, which
+   costs nothing and turns a regression into a caught error.
+2. `python/pyproject.toml` package-data must match what gets staged. `["*.so",
+   ".dylibs/*.dylib"]` matches nothing under `.libs/`, so the bundled runtime
+   would be dropped from the wheel silently and the failure would surface as an
+   `ImportError` on a user's machine. Both `.libs/*.so` and `.libs/*.so.*` are
+   needed, and both are there as of Task 01's work in this round.
+3. `pixi.toml` must provide `patchelf` on Linux. It does not, and this one is
+   still open: it changes `pixi.lock`, so it goes through the integration owner.
 
-Both are written out as exact edits in
+All three are written out as exact edits in
 [`handoffs/release_03_linux_wheels.md`](../../handoffs/release_03_linux_wheels.md).
 
 ## Size

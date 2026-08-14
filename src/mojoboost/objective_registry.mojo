@@ -677,9 +677,18 @@ def objective_backends(objective: Int) -> Int:
     device and calls the gradient callback on the host). LambdaRank is CPU
     only.
 
-    A GPU flag here is a claim about a *trainer*, not about the gradient
-    kernel; `objective_gradients_on_device` is the narrower question, and
-    `CUSTOM` is the objective where the two answers differ.
+    A GPU flag here is a claim about a *trainer existing*, not about the
+    gradient kernel and not about which entry point accepts the objective.
+    Two narrower questions have their own answers and deliberately differ
+    from this one on `CUSTOM` and `MULTICLASS`:
+
+    - `objective_gradients_on_device` asks whether the derivatives are
+      computed on the device, which a custom objective's never are.
+    - `gpu_trains_objective` in device_policy.mojo asks whether `train_gpu`
+      *itself* accepts the code, which it does not for either: they have
+      their own entry points, `train_custom_gpu` and `train_multiclass_gpu`.
+
+    Do not treat the three as the same predicate. See the handoff.
     """
     if objective == LAMBDARANK:
         return SUPPORTS_CPU
@@ -908,13 +917,13 @@ def metric_names_for_task(task: Int) raises -> String:
     """The metric names an estimator of this task accepts, sorted and comma
     separated, for the "expected one of ..." half of an error message."""
     if task == TASK_REGRESSION:
-        return REGRESSION_METRIC_NAMES
+        return REGRESSION_METRIC_NAMES.copy()
     if task == TASK_BINARY:
-        return BINARY_METRIC_NAMES
+        return BINARY_METRIC_NAMES.copy()
     if task == TASK_MULTICLASS:
-        return MULTICLASS_METRIC_NAMES
+        return MULTICLASS_METRIC_NAMES.copy()
     if task == TASK_RANKING:
-        return RANKING_METRIC_NAMES
+        return RANKING_METRIC_NAMES.copy()
     raise Error("unknown task code ", task)
 
 
@@ -997,6 +1006,90 @@ def objective_default_metric(objective: Int) raises -> Int:
             " author knows what it optimizes"
         )
     raise Error("unknown objective code ", objective)
+
+
+# ---------------------------------------------------------------------------
+# Enumeration
+# ---------------------------------------------------------------------------
+
+# Every spelling the two resolvers accept, and every objective code that
+# exists, so a caller can walk the registry instead of re-typing it. The
+# binding needs exactly this: without it, a Python-facing table would have
+# to spell the names a third time, which is the duplication this module
+# exists to remove.
+#
+# These lists and the `if` chains above are the one duplication inside this
+# file, and it is deliberate: the chain resolves without allocating, the
+# list enumerates once at start-up. They sit next to each other and the
+# round trip between them ("every name resolves, every code names itself")
+# is the first check the validation pass runs.
+
+comptime OBJECTIVE_ALIAS_NAMES = String(
+    "regression regression_l2 l2 mean_squared_error mse binary poisson"
+    " huber quantile mae regression_l1 l1 mean_absolute_error gamma tweedie"
+    " mape mean_absolute_percentage_error fair cross_entropy xentropy"
+    " multiclass softmax lambdarank custom"
+)
+
+comptime UNIMPLEMENTED_OBJECTIVE_ALIAS_NAMES = String(
+    "cross_entropy_lambda xentlambda multiclassova multiclass_ova ova ovr"
+    " rank_xendcg xendcg"
+)
+
+comptime METRIC_ALIAS_NAMES = String(
+    "l2 mean_squared_error mse regression_l2 regression rmse"
+    " root_mean_squared_error l2_root l1 mean_absolute_error mae"
+    " regression_l1 quantile huber mape mean_absolute_percentage_error fair"
+    " poisson gamma gamma_deviance gamma_dev tweedie cross_entropy xentropy"
+    " kullback_leibler kldiv binary_logloss binary binary_error auc"
+    " average_precision multi_logloss multiclass softmax multi_error ndcg"
+    " lambdarank map mean_average_precision"
+)
+
+
+def _split_names(names: String) -> List[String]:
+    var out = List[String]()
+    for token in names.split():
+        out.append(String(token))
+    return out^
+
+
+def objective_alias_names() -> List[String]:
+    """Every objective spelling `objective_code_from_name` resolves."""
+    return _split_names(OBJECTIVE_ALIAS_NAMES)
+
+
+def unimplemented_objective_alias_names() -> List[String]:
+    """Every spelling of a LightGBM objective mojoboost reports by name as
+    not implemented."""
+    return _split_names(UNIMPLEMENTED_OBJECTIVE_ALIAS_NAMES)
+
+
+def metric_alias_names() -> List[String]:
+    """Every metric spelling `metric_code_from_name` resolves."""
+    return _split_names(METRIC_ALIAS_NAMES)
+
+
+def all_objective_codes() -> List[Int]:
+    """Every objective code, built-ins first and then the three with their
+    own trainers. Metric codes need no such list: they are 0 through
+    `N_BUILTIN_METRICS - 1`."""
+    var out = List[Int]()
+    out.append(SQUARED_ERROR)
+    out.append(BINARY_LOGISTIC)
+    out.append(POISSON)
+    out.append(HUBER)
+    out.append(QUANTILE)
+    out.append(L1)
+    out.append(GAMMA)
+    out.append(TWEEDIE)
+    out.append(MAPE)
+    out.append(FAIR)
+    out.append(CROSS_ENTROPY)
+    out.append(MULTICLASS)
+    out.append(LAMBDARANK)
+    out.append(CUSTOM)
+    return out^
 
 
 # ---------------------------------------------------------------------------

@@ -76,15 +76,23 @@ What it will require.
 
 | Requirement | Value today | Where it is decided |
 |---|---|---|
-| Python | 3.14 | `requires-python` in `python/pyproject.toml`, which follows the interpreter the pinned MAX build targets |
+| Python | 3.14 | `requires-python` in `python/pyproject.toml`, which follows the interpreter the environment was solved against |
 | Platform | macOS on Apple silicon first, Linux x86_64 and aarch64 after that | [docs/PLATFORM_MATRIX.md](PLATFORM_MATRIX.md) |
 | numpy | optional | plain Python sequences work without it; `pip install "mojoboost[numpy]"` pulls it in |
 
 The Python floor is the most likely of these to move before the first
-release. It is an artifact of the toolchain pin rather than a language
-requirement, and whether it can be lowered honestly is being worked out in
-`docs/PYTHON_SUPPORT.md`. Treat 3.14 as the current declared value, not as a
-settled decision.
+release, and it is worth knowing why it reads the way it does.
+[docs/PYTHON_SUPPORT.md](PYTHON_SUPPORT.md) takes the question apart and
+finds that 3.14 is not a toolchain requirement at all: the pinned MAX
+publishes builds for CPython 3.10 through 3.14, and the wheel is labeled
+`cp314` because a 3.14 compiled it, not because anything in it is
+3.14-specific. What actually blocks going lower today is one entry point in
+the extension's table, `Py_GetConstantBorrowed`, added in CPython 3.13, which
+leaves 3.13 **expected but unproven** and 3.12 and earlier **blocked**.
+
+Nothing has run on any interpreter other than 3.14, so `>=3.14` stays until
+an experiment says otherwise. Treat it as the current declared value with a
+reason behind it, not as a settled decision and not as a permanent one.
 
 ### What `pip install mojoboost` does right now
 
@@ -117,30 +125,30 @@ than a silent fallback.
 
 ## State 2. A published release wheel (not available yet)
 
-When a release exists, its wheels will be attached to a GitHub release, one
-per supported platform, with a `SHA256SUMS` file next to them. This is the
-path for anyone who wants the artifact before or without PyPI, or who
-mirrors artifacts internally.
+This is the path for anyone who wants the artifact before or without PyPI,
+or who mirrors artifacts internally.
 
-**No release has been built or published.** The steps below are the contract
-the release machinery is being built against, and none of them has been
-executed. Every filename here comes from
-[docs/PLATFORM_MATRIX.md](PLATFORM_MATRIX.md), which is the authority on
-which targets are real.
+**No release has been built or published.** The release workflows exist
+(`.github/workflows/release-macos.yml` and `release-linux.yml`), and neither
+has been run. They produce a wheel, a SHA-256 manifest, and a provenance
+sidecar as workflow artifacts from a tagged commit. How those artifacts then
+reach a user, a GitHub release attachment or an index, is not decided yet, so
+do not read the steps below as a download link that exists. They are the
+contract the machinery is being built against.
 
 ### Pick the wheel for your exact platform
 
 A wheel filename is a promise about the machine it runs on, and pip enforces
 it. There is one wheel per row, and no row is a near enough match for another.
 
-| Your machine | The wheel to download |
-|---|---|
-| Apple silicon Mac, Python 3.14 | `mojoboost-0.1.0-cp314-cp314-macosx_26_0_arm64.whl` |
-| Linux x86_64, Python 3.14 | `mojoboost-0.1.0-cp314-cp314-manylinux_2_28_x86_64.whl` |
-| Linux aarch64, Python 3.14 | `mojoboost-0.1.0-cp314-cp314-manylinux_2_28_aarch64.whl` |
-| Intel Mac | none, and there will not be one |
-| Windows | none |
-| Free-threaded Python (`3.14t`) | none |
+| Your machine | The wheel | Where that stands |
+|---|---|---|
+| Apple silicon Mac, Python 3.14 | `mojoboost-0.1.0-cp314-cp314-macosx_26_0_arm64.whl` | The first target. Tag not yet produced by a release run |
+| Linux x86_64, Python 3.14 | `mojoboost-0.1.0-cp314-cp314-linux_x86_64.whl` | Tag not settled. See below |
+| Linux aarch64, Python 3.14 | `mojoboost-0.1.0-cp314-cp314-linux_aarch64.whl` | Tag not settled. See below |
+| Intel Mac | none, and there will not be one | The pinned channel ships no Intel macOS toolchain |
+| Windows | none | No toolchain in the pinned channel |
+| Free-threaded Python (`3.14t`) | none | A different ABI tag; the extension cannot load |
 
 Read the filename left to right. `cp314` is the interpreter,
 `macosx_26_0_arm64` is the operating system floor and the processor
@@ -153,12 +161,25 @@ than it should be. It comes from the SDK on the build machine rather than
 from the code, and lowering it is a known, scoped piece of work described in
 [docs/PLATFORM_MATRIX.md](PLATFORM_MATRIX.md).
 
+**The Linux tag is the open question, and it is not cosmetic.** The Linux
+release workflow defaults to a `plain` tag policy, which produces
+`linux_x86_64` and `linux_aarch64`. PyPI and TestPyPI reject those tags
+outright, so a plain wheel cannot be published to an index at all; it can
+only be handed to named testers. Worse, a musl system matches the plain tag,
+so pip there accepts the wheel and the import then fails, because the objects
+need glibc. Promoting to a `manylinux_2_28` tag is a deliberate, separate
+decision that requires measuring the highest `GLIBC_` symbol version the
+shipped objects actually reference, not inheriting the floor Pixi happened to
+solve against. Until that measurement exists, treat the Linux rows above as
+artifact names rather than as an install anyone should be pointed at.
+
 ### Install it
 
 ```sh
-# 1. Verify the download against the release's SHA256SUMS.
+# 1. Verify the download against the checksum the release run published.
+#    macOS emits a SHA256SUMS manifest; Linux emits a .sha256 per wheel.
 shasum -a 256 mojoboost-0.1.0-cp314-cp314-macosx_26_0_arm64.whl   # macOS
-sha256sum   mojoboost-0.1.0-cp314-cp314-manylinux_2_28_x86_64.whl # Linux
+sha256sum   mojoboost-0.1.0-cp314-cp314-linux_x86_64.whl          # Linux
 
 # 2. Install into a fresh virtual environment, from the file itself.
 python3.14 -m venv .venv
@@ -251,7 +272,8 @@ PYTHONPATH=python python examples/install_smoke.py   # source checkout
 
 The script uses only the standard library, so it runs in the default Pixi
 environment where numpy is not installed. Read it alongside this section; it
-does exactly what the seven steps below do.
+covers the same ground as the steps below, and its own error handling names
+the two import failures a bad install produces.
 
 ### 1. Import, and know what you imported
 
@@ -399,10 +421,12 @@ ERROR: No matching distribution found for mojoboost
 ```
 
 Your interpreter is older than the declared floor. Check with
-`python -c "import sys; print(sys.version)"`. The floor exists because the
-extension is compiled inside the environment the pinned MAX build defines,
-and that build targets one interpreter. It is not a stylistic preference, and
-it is under review rather than fixed forever.
+`python -c "import sys; print(sys.version)"`. The floor is where it is
+because 3.14 is the only interpreter anything here has ever run on, and
+because one entry point the extension uses was added in CPython 3.13. It is
+not a stylistic preference, it is not a toolchain requirement, and it is
+under review rather than fixed forever, with the evidence for each
+interpreter in [docs/PYTHON_SUPPORT.md](PYTHON_SUPPORT.md).
 
 Installing a wheel file directly on the wrong interpreter gives the tag
 mismatch below instead, because the filename carries `cp314`.
@@ -452,16 +476,26 @@ installed wheel means the wheel is broken and is worth a bug report with the
 full message.
 
 From a source checkout it means something more ordinary. Either the extension
-was never built, in which case the message is different and unambiguous,
+was never built, which produces a different message,
 
 ```text
-ModuleNotFoundError: No module named 'mojoboost._mojoboost'
+ImportError: cannot import name '_mojoboost' from 'mojoboost' (.../python/mojoboost/__init__.py)
 ```
 
 and the fix is `pixi run build-python`; or it was built and you are running
 it outside the Pixi environment that owns the runtime libraries, in which
 case run through `pixi run`, or build a self-contained wheel with
 `pixi run build-wheel` and install that instead.
+
+Those two are worth telling apart, because they arrive as the same exception
+type and mean opposite things. A missing `_mojoboost.so` is reported as
+"cannot import name", not as "no module named", because the import machinery
+swallows the underlying `ModuleNotFoundError` for a submodule named in a
+`from . import ...` list and the attribute lookup fails afterward
+(`_handle_fromlist` in `importlib/_bootstrap.py`). A `.so` that exists but
+cannot resolve its runtime libraries fails later, inside `dlopen`, and keeps
+the loader's own message. `examples/install_smoke.py` distinguishes them and
+prints the right fix for each.
 
 ### GPU requested and unavailable
 
@@ -565,6 +599,7 @@ report about a confusing install is useful, not noise.
 | [docs/LIGHTGBM_PARITY.md](LIGHTGBM_PARITY.md) | What mojoboost supports, what LightGBM has that it does not, and which differences are deliberate. Authoritative on behavior |
 | [docs/GPU_VALIDATION.md](GPU_VALIDATION.md) | Which hardware has actually run this code, and the procedure for adding a device |
 | [docs/PLATFORM_MATRIX.md](PLATFORM_MATRIX.md) | Every install target, its artifact name, and the evidence behind its status |
+| [docs/PYTHON_SUPPORT.md](PYTHON_SUPPORT.md) | Why the floor is 3.14, what each older interpreter would take, and what has actually run |
 | [docs/DEVICE_SELECTION.md](DEVICE_SELECTION.md) | The full `cpu` / `gpu` / `auto` policy and the report it produces |
 | [docs/COMPATIBILITY_POLICY.md](COMPATIBILITY_POLICY.md) | What may change between versions and what may not |
 | [CONTRIBUTING.md](../CONTRIBUTING.md) | How to build, which tests to run, and what a pull request has to say |

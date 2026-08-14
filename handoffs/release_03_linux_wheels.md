@@ -100,58 +100,45 @@ than on macOS, because GPU Linux machines are the ordinary case.
 
 ## Required edits outside this lane's ownership
 
-Three blockers. `check_metadata_ready.py` detects all three and
-`build_wheel_linux.sh` refuses to build while any of them stands.
+This lane started from a tree where three things blocked a Linux wheel. **Task 01
+fixed two of them while this lane was running**, in files this lane may not
+touch. Both were re-read in the working tree at the time of writing and both are
+correct. They are recorded here anyway, because the integration owner has to
+confirm they survive the round, and because `build_wheel_linux.sh` and
+`check_metadata_ready.py` were written against the broken state and will keep
+detecting a regression.
 
-### 1. `python/pyproject.toml`, package data (Task 01). Blocker.
+### 1. `python/pyproject.toml`, package data (Task 01). **Fixed concurrently, verify it holds.**
 
-Current:
-
-```toml
-[tool.setuptools.package-data]
-mojoboost = ["*.so", ".dylibs/*.dylib"]
-```
-
-Required:
+Was `mojoboost = ["*.so", ".dylibs/*.dylib"]`, which matches nothing this lane
+stages. Now:
 
 ```toml
 [tool.setuptools.package-data]
 mojoboost = ["*.so", ".dylibs/*.dylib", ".libs/*.so", ".libs/*.so.*"]
 ```
 
-Both `.libs` patterns are needed, because sonames carry version suffixes and
-`*.so` does not match `libfoo.so.1`. Without this the bundled runtime is
-silently dropped from the wheel and the failure appears as an `ImportError` on
-a user's machine rather than at build time.
+Both `.libs` patterns are required and neither is redundant, because sonames
+carry version suffixes and `*.so` does not match `libfoo.so.1`. Without them the
+bundled runtime is dropped from the wheel silently and the failure appears as an
+`ImportError` on a user's machine rather than at build time. Check `C1` in
+`check_metadata_ready.py` enforces it against the exact names the builder stages.
 
-### 2. `python/setup.py`, hard-coded macOS platform tag (Task 01). Blocker.
+### 2. `python/setup.py`, hard-coded macOS platform tag (Task 01). **Fixed concurrently, verify it holds.**
 
-Current:
+Was an unconditional `plat_name = "macosx_26_0_" + platform.machine().lower()`,
+which on Linux produces `mojoboost-0.1.0-cp314-cp314-macosx_26_0_x86_64.whl`: a
+macOS tag on an ELF binary, which pip on a Mac accepts and then fails to import.
+It is now guarded by `if sys.platform == "darwin"`, so on Linux the tag comes
+from `--plat-name` or the default.
 
-```python
-options={"bdist_wheel": {"plat_name": "macosx_26_0_" + platform.machine().lower()}},
-```
+`build_wheel_linux.sh` still passes `--plat-name` explicitly and still verifies
+the resulting filename before accepting the artifact. That belt-and-braces is
+deliberate: the check costs nothing and it is the difference between a caught
+error and a mislabeled file. Check `C2` fails if the unconditional form comes
+back.
 
-Run unchanged on Linux this produces `mojoboost-0.1.0-cp314-cp314-macosx_26_0_x86_64.whl`:
-a macOS tag on a Linux binary, which pip on a Mac would accept and then fail to
-import. Make it conditional:
-
-```python
-import sys
-
-options = {}
-if sys.platform == "darwin":
-    options = {"bdist_wheel": {"plat_name": "macosx_26_0_" + platform.machine().lower()}}
-
-setup(distclass=BinaryDistribution, options=options)
-```
-
-`build_wheel_linux.sh` works around this today by passing an explicit
-`--plat-name` on the command line, which distutils lets override the `setup()`
-default, and by verifying the resulting filename. That is a workaround. Anyone
-running `python -m build` by hand on Linux still gets the wrong file.
-
-### 3. `pixi.toml`, patchelf (integration owner, no lane owns this file). Blocker.
+### 3. `pixi.toml`, patchelf (integration owner, no lane owns this file). **Still a blocker.**
 
 ```toml
 [feature.pkg.target.linux-64.dependencies]
@@ -258,8 +245,10 @@ None of these has been run. They are listed in the order they must happen.
 python3 packaging/linux/check_metadata_ready.py
 ```
 
-Expected today: three blockers (C1 package-data, C2 macOS plat_name, C3 no
-patchelf), exit 1. Nothing else in this list can run honestly until it exits 0.
+Expected at the time of writing: C1 and C2 pass, because Task 01 fixed them
+during this round; C3 fails, because no pixi environment provides patchelf. Exit
+1. Nothing else in this list can run until it exits 0, and if C1 or C2 comes
+back the fix landed and was then lost in the merge.
 
 ### Step 1. Build, on a Linux host with no accelerator
 

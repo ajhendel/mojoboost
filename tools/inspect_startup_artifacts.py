@@ -24,6 +24,17 @@ toolchain, which is the point: the question "why is importing this slow,
 or why does importing it fail" has to be answerable on the machine where
 it went wrong, and that machine may have none of those.
 
+Relationship to the release tooling
+-----------------------------------
+`packaging/matrix/validate_artifact.py` asks whether a *wheel* matches a
+target that `platform_matrix.toml` declares, and it owns the repository's
+Mach-O reader. This script asks a different question, about an *installed*
+package on a machine, and it does not own a second reader: it loads
+`macho_info` from that file. There is one Mach-O parser here and one place
+to fix it. The ELF reader below is this file's own, because the existing
+Linux path (`packaging/linux/inspect_elf.sh`) needs a real loader on a real
+Linux box and cannot answer anything from a macOS checkout.
+
 What it checks with `--strict`
 ------------------------------
 Exit status is 0 unless `--strict` is given, in which case a failed
@@ -46,12 +57,15 @@ Check 4 is the one that matters for a release. A source build is *expected*
 to point at the environment that built it and is not faulted for it.
 
 Limits, stated because a report that overstates its coverage is worse than
-no report: only 64-bit Mach-O and 64-bit ELF are parsed, which covers every
-target in docs/PLATFORM_MATRIX.md and nothing else. `@executable_path` is
-reported but not resolved, since the executable is whichever interpreter
-runs later. The dependency walk follows only libraries this script can
-find on disk, so the closure it prints is a lower bound on what the loader
-will open, never an upper one.
+no report: only 64-bit little-endian Mach-O and 64-bit ELF are read, which
+covers every target in docs/PLATFORM_MATRIX.md and nothing else. Universal
+binaries are rejected, not summarized, because this project ships
+single-arch. A bundled library's own `LC_ID_DYLIB` install name is not
+reported, because the shared reader does not keep that load command.
+`@executable_path` is reported but not resolved, since the executable is
+whichever interpreter runs later. The dependency walk follows only
+libraries this script can find on disk, so the closure it prints is a lower
+bound on what the loader will open, never an upper one.
 """
 
 from __future__ import annotations
@@ -78,41 +92,18 @@ BUNDLED_RUNTIME_LIBS = (
 )
 
 # --- Mach-O ---------------------------------------------------------------
-
-MH_MAGIC_64 = 0xFEEDFACF
-MH_CIGAM_64 = 0xCFFAEDFE
-FAT_MAGIC = 0xCAFEBABE
-FAT_MAGIC_64 = 0xCAFEBABF
-
-LC_REQ_DYLD = 0x80000000
-LC_ID_DYLIB = 0x0D
-LC_LOAD_DYLIB = 0x0C
-LC_LOAD_WEAK_DYLIB = 0x18 | LC_REQ_DYLD
-LC_REEXPORT_DYLIB = 0x1F | LC_REQ_DYLD
-LC_RPATH = 0x1C | LC_REQ_DYLD
-LC_CODE_SIGNATURE = 0x1D
-LC_VERSION_MIN_MACOSX = 0x24
-LC_BUILD_VERSION = 0x32
-
-DYLIB_COMMANDS = {
-    LC_LOAD_DYLIB: "load",
-    LC_LOAD_WEAK_DYLIB: "weak",
-    LC_REEXPORT_DYLIB: "reexport",
-}
+#
+# This script does not read Mach-O itself. packaging/matrix/validate_artifact.py
+# already has a reader, and its own docstring states the rule followed here:
+# there is one such parser in the repository and one place to fix it. It is
+# loaded by path rather than imported, because packaging/ is not a package.
 
 CPU_TYPES = {
     0x0100000C: "arm64",
     0x01000007: "x86_64",
 }
 
-MACHO_PLATFORMS = {
-    1: "macos",
-    2: "ios",
-    3: "tvos",
-    4: "watchos",
-    6: "bridgeos",
-    7: "mac-catalyst",
-}
+VALIDATE_ARTIFACT = ROOT / "packaging" / "matrix" / "validate_artifact.py"
 
 # --- ELF ------------------------------------------------------------------
 
@@ -144,101 +135,66 @@ def _cstring(blob: bytes, offset: int) -> str:
     return blob[offset:end].decode("utf-8", "replace")
 
 
-def _decode_macho_version(value: int) -> str:
-    """`X.Y.Z` from Mach-O's packed nibble encoding."""
-    return "%d.%d.%d" % ((value >> 16) & 0xFFFF, (value >> 8) & 0xFF, value & 0xFF)
+def _load_macho_info():
+    """`macho_info` from packaging/matrix/validate_artifact.py, or None.
+
+    None rather than an exception: an image this script cannot describe is
+    still worth reporting the size, digest, and install kind of, and a
+    checkout where the release tooling has moved should degrade to a
+    smaller report rather than to a traceback.
+
+    That module imports only the standard library at module scope and
+    guards its `main`, so loading it here runs nothing.
+    """
+    try:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "_mojoboost_validate_artifact", VALIDATE_ARTIFACT
+        )
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return getattr(module, "macho_info", None)
+    except Exception:
+        return None
 
 
-def _parse_macho_slice(blob: bytes, base: int) -> dict:
-    (magic,) = struct.unpack_from("<I", blob, base)
-    if magic == MH_MAGIC_64:
-        endian = "<"
-    elif magic == MH_CIGAM_64:
-        endian = ">"
-    else:
-        raise ParseError("not a 64-bit Mach-O image")
-    fmt = endian + "IiiIIIII"
-    (
-        _magic,
-        cputype,
-        _cpusubtype,
-        _filetype,
-        ncmds,
-        _sizeofcmds,
-        _flags,
-        _reserved,
-    ) = struct.unpack_from(fmt, blob, base)
-
-    info = {
-        "format": "mach-o",
-        "arch": CPU_TYPES.get(cputype, "0x%08x" % (cputype & 0xFFFFFFFF)),
-        "dependencies": [],
-        "search_paths": [],
-        "install_name": None,
-        "code_signed": False,
-        "platform": None,
-        "minimum_os": None,
-    }
-
-    offset = base + struct.calcsize(fmt)
-    for _ in range(ncmds):
-        cmd, cmdsize = struct.unpack_from(endian + "II", blob, offset)
-        if cmdsize < 8:
-            raise ParseError("load command with impossible size")
-        body = blob[offset : offset + cmdsize]
-        if cmd in DYLIB_COMMANDS:
-            (name_offset,) = struct.unpack_from(endian + "I", body, 8)
-            info["dependencies"].append(
-                {
-                    "name": _cstring(body, name_offset),
-                    "kind": DYLIB_COMMANDS[cmd],
-                }
-            )
-        elif cmd == LC_ID_DYLIB:
-            (name_offset,) = struct.unpack_from(endian + "I", body, 8)
-            info["install_name"] = _cstring(body, name_offset)
-        elif cmd == LC_RPATH:
-            (path_offset,) = struct.unpack_from(endian + "I", body, 8)
-            info["search_paths"].append(_cstring(body, path_offset))
-        elif cmd == LC_CODE_SIGNATURE:
-            info["code_signed"] = True
-        elif cmd == LC_BUILD_VERSION:
-            plat, minos = struct.unpack_from(endian + "II", body, 8)
-            info["platform"] = MACHO_PLATFORMS.get(plat, str(plat))
-            info["minimum_os"] = _decode_macho_version(minos)
-        elif cmd == LC_VERSION_MIN_MACOSX:
-            (minos,) = struct.unpack_from(endian + "I", body, 8)
-            info["platform"] = "macos"
-            info["minimum_os"] = _decode_macho_version(minos)
-        offset += cmdsize
-    return info
+_MACHO_INFO = _load_macho_info()
 
 
 def _parse_macho(blob: bytes) -> dict:
-    (magic,) = struct.unpack_from(">I", blob, 0)
-    if magic not in (FAT_MAGIC, FAT_MAGIC_64):
-        return _parse_macho_slice(blob, 0)
-    # A universal binary. Every slice is reported, because "which slice
-    # will load" depends on the interpreter, and a wheel that is fat where
-    # it should be thin is itself a load-time cost worth seeing.
-    (nfat,) = struct.unpack_from(">I", blob, 4)
-    slices = []
-    wide = magic == FAT_MAGIC_64
-    entry_size = 32 if wide else 20
-    for i in range(nfat):
-        at = 8 + i * entry_size
-        if wide:
-            _cputype, _sub, off, _size = struct.unpack_from(">iiQQ", blob, at)
-        else:
-            _cputype, _sub, off, _size, _align = struct.unpack_from(
-                ">iiIII", blob, at
-            )
-        slices.append(_parse_macho_slice(blob, off))
-    if not slices:
-        raise ParseError("universal binary with no slices")
-    merged = dict(slices[0])
-    merged["universal_slices"] = [s["arch"] for s in slices]
-    return merged
+    """Adapt `macho_info`'s vocabulary to this script's record shape.
+
+    Its rejections are kept rather than worked around. A universal binary
+    is an error there because this project ships single-arch wheels, and
+    reporting one here as merely interesting would hide a packaging bug
+    that the release checks already treat as fatal.
+    """
+    if _MACHO_INFO is None:
+        raise ParseError(
+            "no Mach-O reader available: %s could not be loaded"
+            % VALIDATE_ARTIFACT
+        )
+    info = _MACHO_INFO(blob)
+    if "error" in info:
+        raise ParseError(info["error"])
+    minos = info.get("minos")
+    return {
+        "format": "mach-o",
+        "arch": CPU_TYPES.get(info["cputype"], "0x%08x" % info["cputype"]),
+        "dependencies": [
+            {"name": name, "kind": "load"} for name in info["dylibs"]
+        ],
+        "search_paths": list(info["rpaths"]),
+        # LC_ID_DYLIB is not among the load commands that reader keeps, so
+        # a bundled library's own install name is not reported here.
+        "install_name": None,
+        "code_signed": bool(info["signed"]),
+        "platform": "macos" if minos else None,
+        "minimum_os": ".".join(str(part) for part in minos) if minos else None,
+    }
 
 
 # --- ELF ------------------------------------------------------------------
@@ -603,10 +559,6 @@ def render(result: dict, problems: list) -> str:
         lines.append(
             "   format      %s %s" % (record["format"], record.get("arch"))
         )
-        if record.get("universal_slices"):
-            lines.append(
-                "   slices      %s" % ", ".join(record["universal_slices"])
-            )
         if record.get("minimum_os"):
             lines.append(
                 "   minimum os  %s %s"

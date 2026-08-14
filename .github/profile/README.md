@@ -76,7 +76,7 @@ Areas where help is most wanted right now.
 
 | Area | What it looks like |
 | --- | --- |
-| NVIDIA and AMD validation | Running the documented GPU procedure on hardware the maintainers do not own, and filing the result |
+| NVIDIA and AMD validation | Running a capture script on hardware the maintainers do not own, and filing the record. `docs/HARDWARE_CONTRIBUTORS.md` is written for people who do not want to learn Mojo |
 | Apple GPU performance | Profiling Metal kernels, order-preserving active-row compaction, split search on device |
 | Differential testing | Comparing against LightGBM on real datasets and turning the gaps into issues |
 | Packaging | Clean-install wheel testing across platforms |

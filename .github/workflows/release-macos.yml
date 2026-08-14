@@ -269,16 +269,25 @@ jobs:
       # that was built: it made a round trip through artifact storage. Compare
       # it against both the build job's output and the manifest the build
       # signed off on, before handing it to anything that can publish.
+      #
+      # The two values from the build job arrive as environment variables rather
+      # than as `${{ }}` inside the script. They are hashes and a filename this
+      # workflow computed itself, so nothing here is attacker controlled today,
+      # but a job that holds an OIDC token should not have expression results
+      # spliced into a shell at all.
       - name: The wheel is the one that was built
+        env:
+          EXPECTED_WHEEL: ${{ needs.build.outputs.wheel }}
+          EXPECTED_SHA256: ${{ needs.build.outputs.sha256 }}
         run: |
           set -euo pipefail
           count=$(find dist -type f | wc -l | tr -d ' ')
           test "$count" = 1
           wheel=$(find dist -type f -name '*.whl')
-          test "$(basename "$wheel")" = "${{ needs.build.outputs.wheel }}"
+          test "$(basename "$wheel")" = "$EXPECTED_WHEEL"
           actual=$(sha256sum "$wheel" | cut -d' ' -f1)
-          test "$actual" = "${{ needs.build.outputs.sha256 }}"
-          grep -q "$actual  ${{ needs.build.outputs.wheel }}" evidence/SHA256SUMS
+          test "$actual" = "$EXPECTED_SHA256"
+          grep -qF "$actual  $EXPECTED_WHEEL" evidence/SHA256SUMS
           echo "sha256 $actual matches the build output and SHA256SUMS"
 
       - name: Publish to TestPyPI
@@ -293,8 +302,10 @@ jobs:
           skip-existing: false
 
       - name: What to compare on the index
+        env:
+          EXPECTED_SHA256: ${{ needs.build.outputs.sha256 }}
         run: |
           echo "TestPyPI shows a sha256 for the uploaded file. It must equal:"
-          echo "  ${{ needs.build.outputs.sha256 }}"
+          echo "  $EXPECTED_SHA256"
           echo "The commands to check that from a clean machine are in"
           echo "handoffs/release_02_macos_wheels.md."

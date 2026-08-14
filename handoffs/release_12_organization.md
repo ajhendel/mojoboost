@@ -13,7 +13,22 @@ Lane files (the only ones this lane touched, all new):
 
 `README.md`, `CONTRIBUTING.md`, `SECURITY.md`, the six existing launch posts,
 `launch/README.txt`, the issue forms, the workflows, source, and packaging were
-read and not edited. Nothing was committed or staged.
+read and not edited. This lane committed and staged nothing.
+
+> **Take the working tree, not the commit.** A concurrent session committed a
+> mid-task snapshot of this lane's files in `9a9c8d1 "Prepare packaging and
+> parallel optimization work"`, bundled with many other lanes' work. That
+> snapshot is not wrong, it is early. It predates the reconciliation with the
+> hardware contributor lane, so its `SUPPORT.md` still routes hardware results
+> to the demoted `hardware_validation.yml` form, and its
+> `.github/profile/README.md` and `launch/CONTRIBUTOR_INVITE.txt` still
+> describe a generic validation procedure rather than the capture scripts that
+> now exist. Four files hold an uncommitted delta over `9a9c8d1`:
+> `SUPPORT.md`, `.github/profile/README.md`, `launch/CONTRIBUTOR_INVITE.txt`,
+> and this handoff. The other four are committed and current, and the
+> reconciliation with the security lane made it into the snapshot. Nothing from
+> any other lane was overwritten; the only files this lane wrote are the eight
+> listed above.
 
 > **No GitHub state was changed.** No organization exists, no repository was
 > transferred, no setting was touched, no team was created, no Discussion was
@@ -107,7 +122,34 @@ workflow that would remove even that, including the constraint that a
 must compute the reserved-path check itself. Whoever owns workflows should read
 that before writing it.
 
-## Reconciliation with the concurrent security lane
+## Reconciliation with concurrent lanes
+
+Two lanes landed files in the working tree while this one was writing, and both
+changed what these documents should say. Both were reconciled by editing this
+lane's files only. Nothing belonging to either lane was touched.
+
+### The hardware contributor lane
+
+`docs/HARDWARE_CONTRIBUTORS.md`, `hardware/capture/`, `hardware/templates/`,
+and a fourth issue form `hardware_result.yml` appeared after the first drafts
+were written. That form positions itself as the primary route and demotes the
+existing `hardware_validation.yml` to the prose alternative it explicitly still
+accepts.
+
+Three files here were routing people to the demoted form, so they were
+repointed. `SUPPORT.md` now sends hardware results through the protocol
+document and the machine-readable form, and says plainly that the validated set
+is one Apple M4, so "is my hardware supported" is usually a finding rather than
+a support question. `CONTRIBUTOR_INVITE.txt` variant 3 now names the capture
+script and the record template instead of describing a generic procedure, which
+matters because that variant is the highest-value ask in the file and its
+credibility rests on the work being genuinely bounded. It also warns about the
+"skipped, no accelerator" trap that the new form calls out. The profile README
+row says the protocol was written for people who do not want to learn Mojo,
+which is that document's own framing and a better recruiting line than anything
+this lane would have invented.
+
+### The security lane
 
 `SECURITY.md`, `.github/dependabot.yml`, and
 `.github/workflows/release-provenance.yml` appeared in the working tree from
@@ -247,6 +289,24 @@ before, and a required check whose name matches nothing is never satisfied and
 blocks every pull request silently. Step I4 tells the operator to copy the
 names from a completed run instead of trusting the list.
 
+**Two files this lane may not edit need a one-line change each.**
+`launch/README.txt` calls itself the index of this directory and lists six
+posts; it does not mention `ORG_MIGRATION_CHECKLIST.txt` or
+`CONTRIBUTOR_INVITE.txt`, so a person following the index will not find them.
+`.github/ISSUE_TEMPLATE/config.yml` sets `blank_issues_enabled: true` and
+carries two contact links; once Discussions exists it should route questions
+there, since `SUPPORT.md` sends people to Discussions while the issue picker
+still offers a blank issue as the path of least resistance. Adding
+`docs/HARDWARE_CONTRIBUTORS.md` as a third contact link belongs in the same
+edit. Both files are owned by other lanes and neither was touched.
+
+**`CONTRIBUTING.md` and these documents do not reference each other.** It
+covers how to make a change and which tests to run, and predates all four of
+`GOVERNANCE.md`, `SUPPORT.md`, `CODE_OF_CONDUCT.md`, and the pull request
+template. Nothing in it contradicts them, which was checked; it simply does not
+know they exist, and its pull request section would be the natural place to say
+that no approval is required. Not this lane's file.
+
 **One maintainer is the largest open risk**, and it is a governance problem
 rather than an administrative one. A single Admin means no recovery from a lost
 account, no second reader for reserved-path changes, and no route for a conduct
@@ -258,6 +318,13 @@ this explicitly rather than describing a project that does not exist yet.
 Nothing was executed. This lane read files, searched the tree for the old owner
 string, and wrote eight files. No test, no build, no benchmark, no Mojo, no
 pixi, no Python, no GitHub API call, no network request, and no commit.
+
+Three static checks were run over this lane's own output and all three pass.
+Every relative markdown link in the six markdown files resolves to a file that
+exists. Every reserved path in the `GOVERNANCE.md` table exists, with the one
+deliberate exception of `.github/actions/**`, which is reserved ahead of the
+first composite action rather than in response to one. No em dash or en dash
+appears in any of the eight files.
 
 Consequently nothing here is verified by execution. The claims that carry risk
 are the GitHub mechanics in checklist sections E, I, and J, which were written

@@ -447,13 +447,18 @@ Known limits, so nobody reads more into the file than is there:
 
 ### 8.4 The provenance sidecar
 
-`packaging/build_wheel.sh` is specified to write
-`<wheel>.provenance.json` with the toolchain versions, the `pixi.lock` digest,
-the commit, the build host, and the compile time accelerator answer
-([handoffs/task18_platform.md](../handoffs/task18_platform.md), edit 4). It
-does not write one yet. The release workflow treats its absence as a hard stop
-rather than filling the fields itself, because two lanes writing the same facts
-differently is how they end up disagreeing.
+`<wheel>.provenance.json` records the toolchain versions, the `pixi.lock`
+digest, the commit, the build host, and the compile time accelerator answer.
+None of that survives in the wheel, so it is written at build time or lost.
+`packaging/matrix/validate_artifact.py` rule R7 is the authority on which
+fields are required, and the sidecar was specified in
+[handoffs/task18_platform.md](../handoffs/task18_platform.md) edit 4.
+
+The release workflow treats its absence as a hard stop rather than filling the
+fields itself, because two places writing the same facts differently is how
+they end up disagreeing. Which script writes it is a packaging question rather
+than a security one; see the cross-lane note in
+[handoffs/release_10_security.md](../handoffs/release_10_security.md).
 
 ## 9. When a release is compromised
 
@@ -603,8 +608,10 @@ commitment to close it.
 - **Actions are not yet pinned to real SHAs.** The placeholders in the release
   workflow fail closed, and `ci.yml` and `gpu-validation.yml` are pinned by tag
   and are outside this lane's ownership.
-- **The provenance sidecar is not written yet**, so nothing downstream of it
-  can run either. Section 8.4.
+- **The provenance sidecar has never been produced by a build**, and which
+  script writes it was still being settled across lanes when this was written.
+  Everything downstream of it, meaning the SBOM supplement and rule R7, is
+  blocked on that. Section 8.4.
 - **Builds are not reproducible.** Two builds of the same commit are not
   expected to produce identical bytes, and nothing checks. That means the
   attestation is the only link between the artifact and the source, with no
@@ -634,9 +641,23 @@ python3 packaging/security/check_action_pins.py .github/workflows/release-proven
 # gpu-validation.yml pin by tag
 python3 packaging/security/check_action_pins.py .github/workflows
 
-# No credential shaped string anywhere in the tree. Expected: no matches
+# No credential shaped string in anything that executes. The include filters
+# are what keep this useful: this document and the release checklist both name
+# those strings in order to prohibit them, and a check that always matches is a
+# check nobody runs twice.
+#
+# Expected: every match is a detection pattern rather than a credential. A
+# secret scanner has to contain the string it looks for, so read each match and
+# do not merely count them. Anything that is an assignment, an input, or a
+# value is the finding.
 grep -rInE 'PYPI_API_TOKEN|TWINE_PASSWORD|pypi-AgEIcHlwaS5vcmc' \
+    --include='*.yml' --include='*.yaml' --include='*.sh' --include='*.py' \
+    --include='*.toml' --include='*.mojo' \
     --exclude-dir=.git --exclude-dir=.pixi .
+
+# No fork triggered event reaches a privileged job. Matches the trigger key
+# only, not the comments that explain why it is absent. Expected: no matches
+grep -rnE '^\s*pull_request_target\s*:' .github/workflows/
 
 # The release matrix still agrees with the repository
 python3 packaging/matrix/validate_matrix.py

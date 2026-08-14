@@ -56,9 +56,9 @@ You mentioned you have <SPECIFIC HARDWARE>. Would you be willing to run one vali
 
 mojoboost is a gradient-boosted tree library written in Mojo, with a GPU path. Its correctness has been exercised on an Apple M4 and on nothing else. NVIDIA and AMD have never been validated on real hardware, and the repository says so rather than implying otherwise. A single run from a machine I do not own is worth more to this project right now than almost anything I could write myself.
 
-The procedure is documented at https://github.com/mojoboost-ml/mojoboost/blob/main/docs/GPU_VALIDATION.md and there is an issue template that asks for exactly the fields that make a result comparable. It is a clone, a pixi install, and one command. Perhaps twenty minutes, most of it waiting.
+The protocol is https://github.com/mojoboost-ml/mojoboost/blob/main/docs/HARDWARE_CONTRIBUTORS.md and it was written for exactly this, meaning somebody who has the hardware and no interest in learning Mojo. There is a capture script for your vendor under hardware/capture/, a JSON record template it fills in, and an issue form that takes the result. A clone, a pixi install, one script. Perhaps an hour, most of it waiting.
 
-A failure is a better result than a success and I would rather have it. If it does not build, does not run, or produces the wrong numbers, that is the finding, and pasting the error into an issue is the whole contribution.
+A failure is a better result than a success and I would rather have it. If it does not build, does not run, or produces the wrong numbers, that is the finding, and pasting the unedited output into an issue is the whole contribution. Worth saying because it trips people up: a GPU suite that reports "skipped, no accelerator" on a machine that has an accelerator is not a pass, it is one of the more interesting failures you could send me.
 
 <YOUR NAME>
 

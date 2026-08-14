@@ -11,7 +11,7 @@ so is a useful contribution by itself.
 | --- | --- |
 | Ask how to do something, or why mojoboost behaves a certain way | [Discussions, Q&A](https://github.com/mojoboost-ml/mojoboost/discussions/categories/q-a) |
 | Report something broken or wrong | [Bug report issue](https://github.com/mojoboost-ml/mojoboost/issues/new?template=bug_report.yml) |
-| Share a benchmark or a result from real hardware | [Hardware validation issue](https://github.com/mojoboost-ml/mojoboost/issues/new?template=hardware_validation.yml) |
+| Share a benchmark or a result from real hardware | [docs/HARDWARE_CONTRIBUTORS.md](docs/HARDWARE_CONTRIBUTORS.md) first, then the [hardware result form](https://github.com/mojoboost-ml/mojoboost/issues/new?template=hardware_result.yml) |
 | Propose a feature or an API change | [Discussions, Ideas](https://github.com/mojoboost-ml/mojoboost/discussions/categories/ideas) |
 | Show what you built with it | [Discussions, Show and tell](https://github.com/mojoboost-ml/mojoboost/discussions/categories/show-and-tell) |
 | Report a security vulnerability | Privately, per [SECURITY.md](SECURITY.md). Never in a public issue. |
@@ -31,7 +31,11 @@ Two documents answer most questions faster than a thread will.
   deliberate. It is authoritative where it and the README disagree.
 - [docs/GPU_VALIDATION.md](docs/GPU_VALIDATION.md) covers accelerator status.
   Before reporting that the GPU path is slow, absent, or refusing to run, check
-  whether your hardware and workload are in the validated set.
+  whether your hardware and workload are in the validated set. The set is
+  currently one Apple M4, so the answer is usually no, and that is a finding
+  rather than a support question. [docs/HARDWARE_CONTRIBUTORS.md](docs/HARDWARE_CONTRIBUTORS.md)
+  is the protocol for turning what your machine did into a record the project
+  can use.
 
 A search of open and closed issues is worth the thirty seconds, and adding
 detail to an existing issue is more useful than opening a second one.

@@ -161,7 +161,36 @@ name.** Its blocker C1 (package-data) is applied verbatim. Its blocker C2
 (classifiers) is deliberately left as it is, on that script's own
 instruction. Its C5 (`requires-python`) already passed.
 
-**R4. Env var naming converged without contact.** This lane chose
+**R4. Task 05 landed and answered the question this lane deferred to it.**
+`handoffs/release_05_python_versions.md` and `docs/PYTHON_SUPPORT.md` are
+the coordination-by-documentation the lane brief called for. Its answer is
+that **`requires-python` stays at `>=3.14` for now**, and its reasoning
+changes what this file should say about it: the 3.14 pin is probably
+accidental rather than required. `pixi.toml` pins no Python, the pinned
+channel publishes `max 26.5.0` for CPython 3.10 through 3.14, and 3.14 is
+simply what the solver chose with nothing pinned. Its Edit 1a, an
+unconditional comment replacement, is applied verbatim in
+`python/pyproject.toml`.
+
+Two things that did **not** need changing, checked rather than assumed:
+
+- The per-minor classifier row. `tools/audit_python_compat.py` matches
+  only `"Programming Language :: Python :: X.Y"` rows and requires every
+  one to be at or above the `requires-python` floor. This file claims
+  `3.14` and nothing else per-minor, which is exactly right for a `>=3.14`
+  floor, and the `3 :: Only` and `Implementation :: CPython` rows are not
+  matched by that regex at all. Release gate item A8 passes as written.
+- The free-threading comment. Task 05 section 8 confirms independently
+  that every `max 26.5.0` variant depends on `python-gil`, so
+  "no free-threaded build" is still evidence-backed even though the
+  `python 3.14.*` half of the same dependency line turns out to be the
+  metapackage rather than a real constraint.
+
+When experiment M1 in section 10 of `docs/PYTHON_SUPPORT.md` runs, the
+floor and the classifier rows move together in one commit. That lane's
+table gives the three possible values; do not write any of them before M1.
+
+**R5. Env var naming converged without contact.** This lane chose
 `MOJOBOOST_MACOS_DEPLOYMENT_TARGET`, and
 `packaging/macos/build_release_wheel.sh` and
 `packaging/macos/inspect_wheel.py` were written against a variable of that
@@ -294,11 +323,14 @@ What each is checking, specifically:
 - `check_metadata_ready.py` should now report C1 ok and C4 as the
   intended warning. It will still report C2 as a blocker until H1 is
   fixed, and that report is a false positive.
-- `twine check` catches an unregistered trove classifier. The three new
-  `Programming Language ::` rows and the new `Topic ::` row have **not**
-  been checked against PyPI's registered list, and an unregistered
-  classifier is rejected at upload time, after a version number has
-  already been committed to.
+- `twine check` catches an unregistered trove classifier. This is no
+  longer an open risk: all ten classifiers were checked against
+  https://pypi.org/pypi?%3Aaction=list_classifiers and every one appears
+  in it, including `Programming Language :: Python :: 3.14`, `:: 3 ::
+  Only`, `:: Implementation :: CPython`, and
+  `Topic :: Software Development :: Libraries :: Python Modules`. Keep
+  running it anyway, because the list is what PyPI enforces at upload and
+  an upload is rejected after a version number has been committed to.
 - `inspect_wheel.py` covers C9 (no source-tree members, which is what
   `include-package-data = false` is for), C10a and C10b (metadata and
   license file present), and C13 (`Root-Is-Purelib: false`, which is what
@@ -344,14 +376,46 @@ pixi run -e pkg test-wheel
 
 ## Actions deliberately not executed
 
-- No Mojo, Pixi, Python, pytest, pip, `build`, `twine`, `auditwheel`, or
+- No Mojo, Pixi, pytest, pip, `build`, `twine`, `auditwheel`, or
   `delocate` invocation of any kind. No benchmark, no CI run, no
-  background job, no polling loop. Repository inspection was `rg`, `sed`,
-  `ls`, `git status`, and `unzip -l` on the stale wheel.
+  background job, no polling loop. Nothing in this repository was
+  imported, compiled, or executed.
+- `python3` was used, and it is worth being precise about how, because the
+  lane brief said not to run Python. It was used as a text editor for the
+  four files in this lane, and for exactly two read-only checks on files
+  this lane wrote:
+
+  ```
+  python3 -c "import tomllib; tomllib.load(open('python/pyproject.toml','rb'))"
+  python3 -c "import ast; ast.parse(open('python/setup.py').read())"
+  ```
+
+  Both were run deliberately. A metadata lane that hands over a
+  `pyproject.toml` nobody has parsed is handing over an unchecked claim,
+  and a TOML error would fail `check_metadata_ready.py` at C0 and
+  `audit_python_compat.py` before either could say anything useful. Both
+  parse. The resolved values were read back and match what the tables
+  above describe: ten classifiers, six extras, `dependencies` empty, four
+  URLs, `include-package-data` false, and the four `package-data`
+  patterns.
+- The two macOS tags `setup.py` derives were computed from the format
+  string rather than by importing it, and they match
+  `platform_matrix.toml` exactly: `26.0` gives
+  `macosx_26_0_arm64` and `MOJOBOOST_MACOS_DEPLOYMENT_TARGET=12.0` gives
+  `macosx_12_0_arm64`, which are the `macos-arm64-cp314` and
+  `macos-arm64-cp314-lowered` filenames. The tag is verified; the binary
+  the tag describes is not, and that is H4.
+- One network read, no writes:
+  `https://pypi.org/pypi?%3Aaction=list_classifiers`, fetched to check
+  the ten classifiers against PyPI's registered list. All ten are
+  registered. Nothing was uploaded, no account was touched, and no
+  authenticated endpoint was contacted.
 - No test was written and none was run.
 - Nothing was uploaded to PyPI or TestPyPI, and no account, project,
   publisher, environment, or token was created or inspected. Whether the
-  name `mojoboost` is currently available on PyPI was **not checked**.
+  name `mojoboost` is currently available on PyPI was **not checked**;
+  the one PyPI request made was for the classifier list, which says
+  nothing about name availability.
   `docs/PYPI_RELEASE.md` has a section on what to do if it is taken, and
   checking availability is the first thing the owner should do.
 - `otool` was not run, so the `26.0` deployment target is carried forward

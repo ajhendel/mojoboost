@@ -159,12 +159,14 @@ needed_of() {
 }
 
 is_system_lib() {
+    # One line per group, and no line continuations inside the pattern list:
+    # a backslash-newline there splices the next line's indentation into the
+    # pattern, and every pattern after the first silently stops matching.
     case "$1" in
-        libc.so*|libm.so*|libdl.so*|librt.so*|libpthread.so*|libresolv.so*|\
-        libutil.so*|libnsl.so*|libcrypt.so*|ld-linux*|ld64.so*|linux-vdso.so*)
-            return 0 ;;
-        libpython*)
-            return 0 ;;
+        libc.so*|libm.so*|libdl.so*|librt.so*|libpthread.so*) return 0 ;;
+        libresolv.so*|libutil.so*|libnsl.so*|libcrypt.so*) return 0 ;;
+        ld-linux*|ld64.so*|linux-vdso.so*) return 0 ;;
+        libpython*) return 0 ;;
     esac
     return 1
 }

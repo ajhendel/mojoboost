@@ -799,8 +799,12 @@ tile size are runtime values here rather than compile-time ones.
    ([procedure](docs/GPU_VALIDATION.md); neither has been run). The kernels
    already scale past one threadgroup per feature and tile themselves from
    device capabilities, but every measurement so far is Apple Metal
-4. Publish the Python API to PyPI (macOS arm64 wheels build and validate
-   today; Linux needs a manylinux build)
+4. Publish the Python API to PyPI. A self-contained macOS arm64 wheel builds
+   locally today, but no wheel has been published or clean-install validated
+   anywhere, and the Linux tag is unsettled: the release workflow's default
+   `linux_x86_64` is rejected by every index, and a `manylinux` tag needs a
+   measured glibc floor first. See [docs/INSTALLATION.md](docs/INSTALLATION.md)
+   and [docs/PLATFORM_MATRIX.md](docs/PLATFORM_MATRIX.md)
 5. Broader benchmark suite (XGBoost and real datasets)
 6. R bindings on top of the C ABI in `capi/`, which exists so that the R
    package (and any other language binding) never has to track a mojoboost

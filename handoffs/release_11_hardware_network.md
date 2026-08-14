@@ -3,9 +3,15 @@
 The paperwork that lets somebody who is not the maintainer send in hardware
 evidence, and the procedure for turning what they send into a status change.
 
-Nothing here executes. No script in this lane has been run, no record has been
-submitted, no issue form has been rendered by GitHub, and no schema has been
-validated against anything. This is a specification and a set of forms.
+Nothing here executes. No capture script has been run, no record has been
+submitted, and no issue form has been rendered by GitHub. This is a specification
+and a set of forms.
+
+What was checked, and it is only syntax: the three capture scripts parse under
+`sh -n`, the four JSON files parse under `json_pp`, both issue forms parse under
+a YAML parser, and every relative link in this lane's documents resolves to a
+file that exists. Nothing was run, nothing was built, and no schema rule has ever
+been applied to a record.
 
 ## Files this lane owns
 
@@ -146,33 +152,50 @@ and say plainly which claims the record does and does not support.
 
 `verdict` in the record uses the four step names from
 `packaging/matrix/accelerators/index.toml` on purpose, so the transfer is
-mechanical rather than interpretive.
+mechanical rather than interpretive. `validate_matrix.py` accepts exactly four
+step words, `pass`, `fail`, `partial`, and `not-run`, and takes the row `status`
+words from the `[vocabulary]` table, which is `not-run`, `partial`, `validated`,
+and `unsupported`. Every verdict this protocol can produce maps onto those
+without inventing anything.
 
-| Record verdict | Index step value | Note |
+| Record verdict | Index step | Row status it implies |
 |---|---|---|
-| `pass` | `pass` | |
-| `partial` | `partial` | The record says which part. |
-| `skipped` | `not-run` | Never `pass`. A suite that declined to test anything tested nothing. |
-| `not-run` | `not-run` | |
-| `unsupported` | see below | |
-| `fail` | see below | |
+| `pass` | `pass` | `partial`, and `validated` only once all four steps pass |
+| `partial` | `partial` | `partial` |
+| `fail` | `fail` | `partial` |
+| `skipped` | `not-run` | unchanged. A suite that declined to test anything tested nothing |
+| `not-run` | `not-run` | unchanged |
+| `unsupported` | `not-run` | `unsupported` |
 
-The index vocabulary has no word for a step that ran and failed, and this lane
-cannot add one, because `index.toml` belongs to another lane. Until it has one,
-the interim rule:
+Three checker rules govern the combinations, and they interact:
 
-- A **refusal** (the runtime or the support list declined the device, the Metal
-  compiler is absent, MAX does not support the card) sets the row `status` to
-  `unsupported` with the four steps left at `not-run` and the refusal quoted in
-  the row's `notes`.
-- A **failure** (it built, it ran, it computed the wrong answer or diverged
-  between repeats) leaves the steps at `not-run`, leaves `status` at `not-run`,
-  and requires the row's `notes` to name the record id and state the failure in
-  one sentence. A silent `not-run` row over a known failure is the worst outcome
-  this procedure can produce, and the note is the only thing preventing it.
+- **A row whose status is not `not-run` needs a `record` path that exists.**
+  Point it at the prose record, `docs/GPU_VALIDATION.md`, as the M4 row does, or
+  at the evidence itself, `hardware/results/<record_id>.json`. Both are real
+  paths; `record` is checked as one, so a row pointing at neither fails.
+- **A row at `not-run` may not carry a step result.** So a record with a failing
+  step moves the row to `partial`. A recorded failure is recorded, and a row
+  reading `not-run` over a known failure is exactly the outcome the checker
+  exists to prevent.
+- **`validated` requires all four steps `pass`.** No single record filed through
+  this protocol reaches it: it takes a profiled record on top of a full one, and
+  the contributor is told so before they start.
 
-Adding `fail` to the `[steps]` vocabulary in `index.toml` is the clean fix and is
-listed under central integration below.
+A refusal is the one case that leaves the steps alone. The runtime or the support
+list declined the device, the Metal compiler is absent, or MAX does not support
+the card: row `status` becomes `unsupported`, all four steps stay `not-run`
+because nothing ran, `record` points at the evidence, and the refusal is quoted
+in the row's `notes`. That combination is valid and reads correctly.
+
+A skipped-only record is the case where nothing moves and something still has to
+be written down. All four steps stay `not-run`, so the row status stays `not-run`
+and `record` stays empty, because the row moving would claim a run that did not
+happen. The finding goes in the row's `notes` and into the prose record: somebody
+brought this device, the build did not see it, and here is the id of the evidence.
+Without that note the next contributor with the same card repeats the afternoon.
+
+Whatever the mapping, the row's `notes` names the record id. A status word is a
+summary, and the id is how a reader gets from it back to the output.
 
 ## How conflicting results coexist
 
@@ -186,7 +209,8 @@ conditions block is where that is explained.
 separate headings rather than merging them into one summary.
 
 **The index row takes the weaker of the two.** A step one record calls `pass` and
-another calls `fail` is not `pass`. The row's `notes` names both record ids and
+another calls `fail` is not `pass`: the step becomes `fail` and the row becomes
+`partial` until the conflict closes. The row's `notes` names both record ids and
 states the disagreement in one sentence, so a reader of the metadata alone learns
 that the question is open. A row that averages a conflict away is worse than a
 row that says `not-run`.
@@ -256,9 +280,12 @@ None of this is done. Each item is an edit to a file this lane may not touch.
 4. **`docs/GPU_VALIDATION.md`** could note in its recording section that outside
    records arrive through the issue form and land in `hardware/results/` first.
    Optional, and it is the record of truth either way.
-5. **`packaging/matrix/accelerators/index.toml`** needs `fail` added to the
-   `[steps]` vocabulary, and the `[vocabulary]` block may want a word for a
-   device with a known failing record. Until then the interim rule above applies.
+5. **`docs/PLATFORM_MATRIX.md`** carries a per-vendor accelerator summary whose
+   third column is "devices with any recorded evidence", and the first outside
+   record makes that number wrong. `check_doc` in `validate_matrix.py` also
+   requires every vendor appearing in `index.toml` to be mentioned in that
+   document, so a record from a vendor outside apple, nvidia, and amd means
+   editing the prose in the same commit or the checker fails.
 6. **A GitHub label.** The new form applies `hardware-validation`, the label the
    existing form uses, so nothing breaks if no new label exists. If the two
    should be distinguishable in search, create `hardware-result` and add it to
@@ -276,6 +303,40 @@ None of this is done. Each item is an edit to a file this lane may not touch.
    `sh hardware/capture/capture_*.sh`, which works either way and is what a
    cautious contributor will type after reading the script.
 
+## Adjacent lanes, and where they collide with this one
+
+Other lanes were writing into the same tree while this one was. What follows was
+true of the working copy at the time of writing and is worth rechecking before
+any of it is posted or published, because none of it was coordinated in advance.
+
+**Three recruitment posts now exist and two of them ask the same people for
+overlapping work.** `launch/APPLE_BENCHMARK_REQUEST.txt` asks for Apple M1
+through M5 benchmark and thermal runs; `launch/HARDWARE_VALIDATION_REQUEST.txt`,
+this lane's, asks for correctness and validation records across Apple, NVIDIA,
+and AMD, which includes Apple M1 through M5. Both name the Modular Discord and
+forum. Posting both into one channel in one week reads as spam and splits the
+responses across two protocols. Pick an order, space them, and consider sending
+Apple contributors to the benchmark request, since it is the more specific ask.
+`launch/CONTRIBUTOR_INVITE.txt` also carries direct-outreach variants, which
+overlaps the fourth version in this lane's file.
+
+**Two "run this on your Mac" scripts now exist and do different jobs.**
+`bench/apple/thermal_capture.sh` prints the plan for a thermal and energy run and
+deliberately refuses to execute it. `hardware/capture/capture_apple.sh` runs
+read-only informational commands and prints their output. The names are close
+enough to confuse a contributor who has read neither header. If both survive,
+say in one sentence in each which is which.
+
+**The org migration would invalidate every URL in this lane.**
+`launch/CONTRIBUTOR_INVITE.txt` says its links point at `github.com/mojoboost-ml`
+and are live only after the transfer in `launch/ORG_MIGRATION_CHECKLIST.txt`.
+This lane hard-codes `github.com/ajhendel/mojoboost` in
+`docs/HARDWARE_CONTRIBUTORS.md`, in the issue-form links, in
+`launch/HARDWARE_VALIDATION_REQUEST.txt`, and in the `source.repo_url` field of
+all three record templates. If the transfer happens, those are a single
+find-and-replace, and the record templates are the ones most likely to be
+forgotten, because a contributor copies the URL out of them into evidence.
+
 ## Open items and risks
 
 - **Nothing has been executed.** No capture script has run on any machine,
@@ -283,12 +344,17 @@ None of this is done. Each item is an edit to a file this lane may not touch.
   construction and were chosen from the procedures already in the repository, but
   their exact output on a real machine is unknown, and the first contributor is
   also the first person to run them. Expect a version 1.0.1.
-- **The issue form has never been rendered.** GitHub validates form YAML on push
-  and rejects a malformed one. If it is rejected, the fields most likely at fault
-  are the `render:` values and the dropdown blocks.
+- **The issue form has never been rendered.** Its YAML parses, which is not the
+  same thing: GitHub validates the form against its own schema on push and
+  rejects a malformed one. If it is rejected, the fields most likely at fault are
+  the `render:` values and the `checkboxes` blocks. The seventeen body items are
+  more than any other form in the repository, and a form long enough to abandon
+  halfway is a real failure mode even if GitHub accepts it.
 - **The schema has validated nothing.** The conditional rules, on `skipped`
   requiring a reason and `pass` requiring a quality metric, are written against
-  draft 2020-12 and have not been exercised by any validator.
+  draft 2020-12 and have never been applied to a document. They are the part of
+  this lane most likely to contain an outright bug, because they are the only
+  part that is program rather than prose.
 - **Two forms may confuse contributors.** The new one asks for JSON, the existing
   one asks for prose. Both documents say prose is still accepted, but if
   submissions stall, collapsing to one form is the first thing to try.

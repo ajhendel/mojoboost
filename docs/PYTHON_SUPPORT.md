@@ -70,7 +70,7 @@ confirm it directly.
 
 ## 3. Finding: the Python source imposes no floor above 3.7
 
-An `ast` scan of all ten modules in `python/mojoboost/` finds:
+An `ast` scan of every module in `python/mojoboost/` finds:
 
 - no `match` statement, no `except*`, no PEP 695 type parameters, no walrus
   operator, and no positional-only parameters
@@ -88,17 +88,21 @@ The newest construct in the package is `@dataclass(frozen=True)` in
 `dask.py`, which is 3.7. The test suites in `python/tests/` and
 `python/test_python_api.py` scan the same way and find nothing newer.
 
-The standard library surface is `array`, `hashlib`, `importlib`, `inspect`,
-`json`, `math`, `operator`, `os`, `platform`, `random`, `struct`,
-`subprocess`, `tempfile`, and `warnings`. The newest call in it is
-`inspect.signature`, which is 3.3. `os.sysconf` in
-`device_selection.py:830` is POSIX-only and is already wrapped in a handler
-that catches `AttributeError`, so it is a platform question and not a version
-one.
+The standard library surface is `array`, `collections`, `dataclasses`,
+`hashlib`, `importlib`, `inspect`, `json`, `math`, `operator`, `os`,
+`platform`, `random`, `struct`, `subprocess`, `sys`, `sysconfig`,
+`tempfile`, and `warnings`. The newest call in it is `inspect.signature`,
+which is 3.3.
 
 **Consequence.** Nothing in `requires-python = ">=3.14"` is about the Python
-language or the standard library. `tools/audit_python_compat.py` re-derives
-this floor on demand and fails if the source ever outruns the declared value.
+language or the standard library.
+
+This section is the one part of the audit that goes stale on its own, because
+it describes a tree that changes with every commit. It is written down here
+for the argument it supports and not as a fact to be trusted later.
+`tools/audit_python_compat.py` re-derives the floor on demand and fails when
+the source outruns the declared value, which is the durable form of this
+finding. Run the tool; do not cite this paragraph.
 
 ## 4. Finding: the extension links no libpython, and resolves CPython by name
 
@@ -112,9 +116,11 @@ Modular runtime's own `AsyncRT_*` and `KGEN_CompilerRT_*` entry points plus
 libc. `otool -L` on all four bundled dylibs in `python/mojoboost/.dylibs/`
 finds no libpython either.
 
-The binary does contain the names. A byte scan finds 109 CPython entry point
-names laid out as one contiguous 16-byte-aligned table, from
-`Py_GetConstantBorrowed` at offset 828864 through `Py_GetVersion` at 831584.
+The binary does contain the names. `strings -a -t d` finds 109 of them, 107 of
+which sit in one contiguous 16-byte-aligned run from `Py_GetConstantBorrowed`
+at offset 828864 through `Py_GetVersion` at 831584. The two that do not are
+`PyExc_TypeError` and `PyExc_Exception`, which are data objects rather than
+functions and live elsewhere in the binary.
 `libKGENCompilerRTShared.dylib` carries the code that consumes it, including
 the strings `MOJO_PYTHON`, `MOJO_PYTHON_LIBRARY`, `PYTHONEXECUTABLE`,
 `Failed to load libpython from `, and the fragment

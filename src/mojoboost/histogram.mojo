@@ -5,9 +5,9 @@ hessians, and the row count. Split finding then scans these fixed-size
 histograms instead of the raw data.
 
 The accumulation loops are scatter-bound (bin indices collide), so they use
-pointer-based scalar stores; the elementwise kernels (sibling subtraction)
-are SIMD-vectorized. `SIMD_LANES` is sized above the hardware width so the
-compiler can keep several vector operations in flight.
+pointer-based scalar stores; the elementwise kernels (zeroing, sibling
+subtraction) are SIMD-vectorized. `SIMD_LANES` is sized above the hardware
+width so the compiler can keep several vector operations in flight.
 
 Accumulation parallelizes across features: each feature owns the
 `[f * n_bins, (f + 1) * n_bins)` slice of the output, so per-feature workers
@@ -17,7 +17,9 @@ task-scheduling overhead take the serial path.
 Every builder takes an optional list of feature ids (empty means all). Under
 feature subsampling only those features are accumulated; the output keeps its
 full `n_features * n_bins` shape with the excluded slices left at zero, so no
-dataset is copied or re-indexed and sibling subtraction stays exact.
+dataset is copied or re-indexed and sibling subtraction stays exact. The ids
+must be distinct: two tasks handed the same feature would write the same
+slice, which is the one thing the no-atomics argument above rules out.
 
 Each builder comes in two forms. The plain one allocates and returns a fresh
 `Histogram` and is what callers outside tree growth want. The `_into` one
@@ -25,12 +27,51 @@ writes a caller-owned buffer, so a grower that visits hundreds of nodes can
 recycle a handful of histograms instead of allocating three arrays per node
 (see `Histogram.zeroed` / `Histogram.reset`). The two forms run the same
 kernels and produce bit-identical results; only the allocation differs.
+
+Three things about the CPU shape of these kernels, all of them scheduling or
+memory traffic and none of them arithmetic (see
+`handoffs/performance_13_apple_cpu.md` for the mechanism behind each and for
+what still needs measuring):
+
+- **Zeroing is fused into the feature pass, not run before it.** A build
+  writes every one of the `n_features * n_bins` cells and then accumulates
+  into a subset of them. Done as a separate pass, the write streams a buffer
+  that at 100 features and 255 bins is around 600 KB out of cache and back
+  in; done inside each feature's task it happens on the slice that task is
+  about to accumulate into, in parallel with every other task. It is also
+  counted in the work estimate, so a small node whose accumulation is tiny
+  but whose output is large no longer runs a multi-megabyte write serially.
+- **A node's gradients and hessians are gathered once, not once per
+  feature.** Accumulating a tree node reads `grad[r]` and `hess[r]` through
+  a row id, so each feature pays two indirect loads per row over buffers far
+  larger than cache. `build_histogram_subset_into_scratch` gathers them into
+  one contiguous `(g, h)` pair buffer first, which turns those two loads per
+  feature into two sequential loads per feature and leaves one gather for
+  the whole node. The threshold and the scratch reuse are the caller's, via
+  the scratch form.
+- **Two features are accumulated in one inner loop.** Their slices are
+  disjoint, so the two read-modify-write chains are independent, and the row
+  id and the gradient pair are loaded once for both. Whether the hardware
+  actually overlaps them is a claim for a profiler, not for this comment.
+
+None of that changes a value or an order: each feature still sums its bins
+over rows in ascending order inside a single task.
 """
 
 from std.sys.info import simd_width_of
 
+from .apple_cpu_policy import (
+    AccumulationPlan,
+    cpu_profile,
+    derive_accumulation_plan,
+    subtract_ops,
+)
 from .binning import BinnedMatrix
-from .parallel import PARALLEL_MIN_OPS, dispatch_features
+from .parallel import (
+    PARALLEL_MIN_OPS,
+    dispatch_feature_ranges,
+    dispatch_rows,
+)
 
 comptime SIMD_LANES = 4 * simd_width_of[DType.float64]()
 
@@ -59,7 +100,15 @@ struct Histogram(Copyable, Movable):
     def reset(mut self):
         """Zero every bin in place, keeping the allocation. Cheaper than a
         fresh `zeroed` by exactly one malloc/free per buffer, which is what
-        tree growth spends most of its allocator time on."""
+        tree growth spends most of its allocator time on.
+
+        Serial by construction, and the builders below no longer call it:
+        they zero each feature's slice inside that feature's task instead. It
+        stays because it is the right shape for a caller that needs a zeroed
+        buffer without a build (`histogram_gpu`, `distributed`) and for any
+        caller already running inside a parallel task, where a dispatching
+        zero pass would nest one `sync_parallelize` inside another.
+        """
         var size = self.n_features * self.n_bins
         var gp = self.grad.unsafe_ptr()
         var hp = self.hess.unsafe_ptr()
@@ -81,6 +130,15 @@ struct Histogram(Copyable, Movable):
         return self.n_features == n_features and self.n_bins == n_bins
 
 
+@fieldwise_init
+struct FeatureTotals(Copyable, Movable):
+    """One feature's totals over its bins."""
+
+    var grad: Float64
+    var hess: Float64
+    var count: Int
+
+
 def _zeroed_f64(size: Int) -> List[Float64]:
     var g = List[Float64](capacity=size)
     g.resize(size, 0.0)
@@ -98,6 +156,71 @@ def _check_features(features: List[Int], n_features: Int) raises:
     for i in range(len(features)):
         if features[i] < 0 or features[i] >= n_features:
             raise Error("feature index out of range")
+
+
+def ensure_pair_capacity(mut pairs: List[Float64], n_rows: Int):
+    """Size a gradient/hessian pair buffer for a node of `n_rows` rows.
+
+    Grows only. A grower that keeps one buffer across a whole tree allocates
+    it once, at the size of the largest node it meets (the root), and every
+    later node reuses that allocation: the buffer is written before it is
+    read, so stale contents beyond the current node are never observed.
+    """
+    var wanted = 2 * n_rows
+    if len(pairs) < wanted:
+        pairs.resize(wanted, 0.0)
+
+
+def _zero_excluded(
+    mut out_grad: List[Float64],
+    mut out_hess: List[Float64],
+    mut out_count: List[Int],
+    n_features: Int,
+    n_bins: Int,
+    features: List[Int],
+    total_ops: Int,
+) raises:
+    """Zero the slices of every feature this build will not accumulate.
+
+    Only reached under feature subsampling. The active features' slices are
+    zeroed by the accumulation pass itself, on the task that is about to fill
+    them, so this covers exactly the rest.
+    """
+    if len(features) == 0 or n_features <= 0 or n_bins <= 0:
+        return
+
+    var active = List[Bool](capacity=n_features)
+    active.resize(n_features, False)
+    for i in range(len(features)):
+        active[features[i]] = True
+
+    var gp = out_grad.unsafe_ptr()
+    var hp = out_hess.unsafe_ptr()
+    var cp = out_count.unsafe_ptr()
+    var active_p = active.unsafe_ptr()
+    comptime W = SIMD_LANES
+
+    @always_inline
+    def zero_slice(base: Int) {imm}:
+        """One feature's slice, in vector stores with a scalar tail."""
+        var b = 0
+        while b + W <= n_bins:
+            gp.unsafe_store(base + b, SIMD[DType.float64, W](0.0))
+            hp.unsafe_store(base + b, SIMD[DType.float64, W](0.0))
+            cp.unsafe_store(base + b, SIMD[DType.int, W](0))
+            b += W
+        while b < n_bins:
+            gp.unsafe_store(base + b, 0.0)
+            hp.unsafe_store(base + b, 0.0)
+            cp.unsafe_store(base + b, 0)
+            b += 1
+
+    def zero_range(f_start: Int, f_end: Int) {imm}:
+        for f in range(f_start, f_end):
+            if not active_p.unsafe_load(f):
+                zero_slice(f * n_bins)
+
+    dispatch_feature_ranges(zero_range, n_features, total_ops)
 
 
 def build_histogram(
@@ -121,15 +244,16 @@ def build_histogram_into(
     hess: List[Float64],
     features: List[Int] = [],
 ) raises:
-    """`build_histogram` into a caller-owned buffer, which is zeroed first.
-    Identical results, one fewer allocation per call."""
+    """`build_histogram` into a caller-owned buffer, every cell of which is
+    written: the accumulation pass zeroes each slice before filling it, so a
+    buffer holding another node's histogram comes back holding exactly this
+    one. Identical results to the allocating form, one fewer allocation."""
     if len(grad) != data.n_rows or len(hess) != data.n_rows:
         raise Error("gradient/hessian length must equal n_rows")
     if not out.matches(data.n_features, data.n_bins):
         raise Error("output histogram shape must match the data")
     _check_features(features, data.n_features)
 
-    out.reset()
     # The three output buffers are passed as separate `mut` lists rather than
     # reached through `out`: a pointer taken from a struct field carries that
     # field's origin, which a worker closure cannot capture.
@@ -147,29 +271,92 @@ def _accumulate_full(
     hess: List[Float64],
     features: List[Int],
 ) raises:
+    var n_rows = data.n_rows
+    var n_bins = data.n_bins
+    var n_features = data.n_features
+    var use_all = len(features) == 0
+    var n_active = n_features if use_all else len(features)
+    var plan = derive_accumulation_plan(
+        cpu_profile(), n_features, n_active, n_bins, n_rows, False
+    )
+
+    _zero_excluded(
+        out_grad, out_hess, out_count,
+        n_features, n_bins, features, plan.excluded_ops,
+    )
+
     var gp = out_grad.unsafe_ptr()
     var hp = out_hess.unsafe_ptr()
     var cp = out_count.unsafe_ptr()
     var grad_p = grad.unsafe_ptr()
     var hess_p = hess.unsafe_ptr()
     var bins_p = data.bins.unsafe_ptr()
-    var n_rows = data.n_rows
-    var n_bins = data.n_bins
-    var use_all = len(features) == 0
-    var n_active = data.n_features if use_all else len(features)
     var feat_p = features.unsafe_ptr()
+    var pair_features = plan.group_width >= 2
+    comptime W = SIMD_LANES
 
-    def do_feature(i: Int) {imm}:
-        var f = i if use_all else feat_p.unsafe_load(i)
-        var col = bins_p.unsafe_offset(f * n_rows)
-        var base = f * n_bins
-        for r in range(n_rows):
-            var b = base + Int(col.unsafe_load(r))
-            gp.unsafe_store(b, gp.unsafe_load(b) + grad_p.unsafe_load(r))
-            hp.unsafe_store(b, hp.unsafe_load(b) + hess_p.unsafe_load(r))
-            cp.unsafe_store(b, cp.unsafe_load(b) + 1)
+    @always_inline
+    def zero_slice(base: Int) {imm}:
+        """One feature's slice, zeroed on the task that is about to fill
+        it rather than in a separate pass over the whole output."""
+        var b = 0
+        while b + W <= n_bins:
+            gp.unsafe_store(base + b, SIMD[DType.float64, W](0.0))
+            hp.unsafe_store(base + b, SIMD[DType.float64, W](0.0))
+            cp.unsafe_store(base + b, SIMD[DType.int, W](0))
+            b += W
+        while b < n_bins:
+            gp.unsafe_store(base + b, 0.0)
+            hp.unsafe_store(base + b, 0.0)
+            cp.unsafe_store(base + b, 0)
+            b += 1
 
-    dispatch_features(do_feature, n_active, n_active * n_rows)
+    def accumulate_range(i_start: Int, i_end: Int) {imm}:
+        var i = i_start
+        while i < i_end:
+            # Two features share one walk of the row range when the policy
+            # allows it and the task has two left. Every row of the dataset is
+            # visited in ascending order either way, which is the whole of the
+            # ordering invariant.
+            if pair_features and i + 1 < i_end:
+                var f0 = i if use_all else feat_p.unsafe_load(i)
+                var f1 = (i + 1) if use_all else feat_p.unsafe_load(i + 1)
+                var base0 = f0 * n_bins
+                var base1 = f1 * n_bins
+                zero_slice(base0)
+                zero_slice(base1)
+                var col0 = bins_p.unsafe_offset(f0 * n_rows)
+                var col1 = bins_p.unsafe_offset(f1 * n_rows)
+                for r in range(n_rows):
+                    # Contiguous: the whole dataset is one ascending walk, so
+                    # the gradients, the hessians, and both binned columns are
+                    # sequential streams.
+                    var g = grad_p.unsafe_load(r)
+                    var h = hess_p.unsafe_load(r)
+                    var b0 = base0 + Int(col0.unsafe_load(r))
+                    var b1 = base1 + Int(col1.unsafe_load(r))
+                    gp.unsafe_store(b0, gp.unsafe_load(b0) + g)
+                    hp.unsafe_store(b0, hp.unsafe_load(b0) + h)
+                    cp.unsafe_store(b0, cp.unsafe_load(b0) + 1)
+                    gp.unsafe_store(b1, gp.unsafe_load(b1) + g)
+                    hp.unsafe_store(b1, hp.unsafe_load(b1) + h)
+                    cp.unsafe_store(b1, cp.unsafe_load(b1) + 1)
+                i += 2
+            else:
+                var f = i if use_all else feat_p.unsafe_load(i)
+                var base = f * n_bins
+                zero_slice(base)
+                var col = bins_p.unsafe_offset(f * n_rows)
+                for r in range(n_rows):
+                    var g = grad_p.unsafe_load(r)
+                    var h = hess_p.unsafe_load(r)
+                    var b = base + Int(col.unsafe_load(r))
+                    gp.unsafe_store(b, gp.unsafe_load(b) + g)
+                    hp.unsafe_store(b, hp.unsafe_load(b) + h)
+                    cp.unsafe_store(b, cp.unsafe_load(b) + 1)
+                i += 1
+
+    dispatch_feature_ranges(accumulate_range, n_active, plan.active_ops)
 
 
 def build_histogram_subset(
@@ -200,11 +387,52 @@ def build_histogram_subset_into(
     features: List[Int] = [],
 ) raises:
     """`build_histogram_subset` over the window `rows[row_start :
-    row_start + row_count]`, into a caller-owned buffer that is zeroed first.
+    row_start + row_count]`, into a caller-owned buffer every cell of which
+    is written.
 
     The window lets tree growth keep every node's row ids in one shared arena
     instead of allocating a fresh `List[Int]` per node; passing
-    `(0, len(rows))` is exactly the whole-list behaviour."""
+    `(0, len(rows))` is exactly the whole-list behaviour.
+
+    This form owns the gradient/hessian pair buffer for the duration of the
+    call, which means allocating and freeing it per node. A grower visiting
+    hundreds of nodes should hold one buffer and call
+    `build_histogram_subset_into_scratch` instead; the two produce identical
+    results.
+    """
+    var pairs = List[Float64]()
+    build_histogram_subset_into_scratch(
+        out, pairs, data, grad, hess, rows, row_start, row_count, features
+    )
+
+
+def build_histogram_subset_into_scratch(
+    mut out: Histogram,
+    mut pairs: List[Float64],
+    data: BinnedMatrix,
+    grad: List[Float64],
+    hess: List[Float64],
+    rows: List[Int],
+    row_start: Int,
+    row_count: Int,
+    features: List[Int] = [],
+) raises:
+    """`build_histogram_subset_into` with a caller-owned scratch buffer.
+
+    `pairs` is the node's gradients and hessians, interleaved, and is grown
+    (never shrunk) to fit. Passing the same list across every node of a tree
+    turns a per-node allocation of `16 * row_count` bytes into one allocation
+    per tree; passing a fresh empty list is exactly
+    `build_histogram_subset_into`. Its contents on entry are irrelevant and
+    its contents on exit are unspecified, so it carries no state between
+    calls beyond its capacity.
+
+    Whether the buffer is filled at all is a policy decision
+    (`apple_cpu_policy.derive_accumulation_plan`): a node with one active
+    feature, or too few rows for the gather to pay for itself, reads the
+    gradients through the row ids as before. Both paths accumulate the same
+    values in the same order.
+    """
     if len(grad) != data.n_rows or len(hess) != data.n_rows:
         raise Error("gradient/hessian length must equal n_rows")
     if not out.matches(data.n_features, data.n_bins):
@@ -213,9 +441,8 @@ def build_histogram_subset_into(
         raise Error("row window out of range")
     _check_features(features, data.n_features)
 
-    out.reset()
     _accumulate_subset(
-        out.grad, out.hess, out.count,
+        out.grad, out.hess, out.count, pairs,
         data, grad, hess, rows, row_start, row_count, features,
     )
 
@@ -224,6 +451,7 @@ def _accumulate_subset(
     mut out_grad: List[Float64],
     mut out_hess: List[Float64],
     mut out_count: List[Int],
+    mut pairs: List[Float64],
     data: BinnedMatrix,
     grad: List[Float64],
     hess: List[Float64],
@@ -232,6 +460,23 @@ def _accumulate_subset(
     row_count: Int,
     features: List[Int],
 ) raises:
+    var n_rows = data.n_rows
+    var n_bins = data.n_bins
+    var n_features = data.n_features
+    var n_sub = row_count
+    var use_all = len(features) == 0
+    var n_active = n_features if use_all else len(features)
+    var plan = derive_accumulation_plan(
+        cpu_profile(), n_features, n_active, n_bins, n_sub, True
+    )
+
+    _zero_excluded(
+        out_grad, out_hess, out_count,
+        n_features, n_bins, features, plan.excluded_ops,
+    )
+    if plan.compact_rows:
+        ensure_pair_capacity(pairs, n_sub)
+
     var gp = out_grad.unsafe_ptr()
     var hp = out_hess.unsafe_ptr()
     var cp = out_count.unsafe_ptr()
@@ -239,25 +484,138 @@ def _accumulate_subset(
     var hess_p = hess.unsafe_ptr()
     var rows_p = rows.unsafe_ptr().unsafe_offset(row_start)
     var bins_all_p = data.bins.unsafe_ptr()
-    var n_rows = data.n_rows
-    var n_bins = data.n_bins
-    var n_sub = row_count
-    var use_all = len(features) == 0
-    var n_active = data.n_features if use_all else len(features)
+    var pairs_p = pairs.unsafe_ptr()
     var feat_p = features.unsafe_ptr()
+    var compact = plan.compact_rows
+    var pair_features = plan.group_width >= 2
+    comptime W = SIMD_LANES
 
-    def do_feature(i_feature: Int) {imm}:
-        var f = i_feature if use_all else feat_p.unsafe_load(i_feature)
-        var col = bins_all_p.unsafe_offset(f * n_rows)
-        var base = f * n_bins
-        for i in range(n_sub):
+    # One gather for the whole node instead of one per feature. Disjoint
+    # ascending blocks, elementwise, so the buffer comes out the same
+    # whatever the block count.
+    def fill_pairs(start: Int, end: Int) {imm}:
+        for i in range(start, end):
             var r = rows_p.unsafe_load(i)
-            var b = base + Int(col.unsafe_load(r))
-            gp.unsafe_store(b, gp.unsafe_load(b) + grad_p.unsafe_load(r))
-            hp.unsafe_store(b, hp.unsafe_load(b) + hess_p.unsafe_load(r))
-            cp.unsafe_store(b, cp.unsafe_load(b) + 1)
+            pairs_p.unsafe_store(2 * i, grad_p.unsafe_load(r))
+            pairs_p.unsafe_store(2 * i + 1, hess_p.unsafe_load(r))
 
-    dispatch_features(do_feature, n_active, n_active * n_sub)
+    if compact:
+        dispatch_rows(fill_pairs, n_sub, plan.gather_ops)
+
+    @always_inline
+    def zero_slice(base: Int) {imm}:
+        """One feature's slice, zeroed on the task that is about to fill
+        it rather than in a separate pass over the whole output."""
+        var b = 0
+        while b + W <= n_bins:
+            gp.unsafe_store(base + b, SIMD[DType.float64, W](0.0))
+            hp.unsafe_store(base + b, SIMD[DType.float64, W](0.0))
+            cp.unsafe_store(base + b, SIMD[DType.int, W](0))
+            b += W
+        while b < n_bins:
+            gp.unsafe_store(base + b, 0.0)
+            hp.unsafe_store(base + b, 0.0)
+            cp.unsafe_store(base + b, 0)
+            b += 1
+
+    def accumulate_range(i_start: Int, i_end: Int) {imm}:
+        var i = i_start
+        while i < i_end:
+            if compact and pair_features and i + 1 < i_end:
+                var f0 = i if use_all else feat_p.unsafe_load(i)
+                var f1 = (i + 1) if use_all else feat_p.unsafe_load(i + 1)
+                var base0 = f0 * n_bins
+                var base1 = f1 * n_bins
+                zero_slice(base0)
+                zero_slice(base1)
+                var col0 = bins_all_p.unsafe_offset(f0 * n_rows)
+                var col1 = bins_all_p.unsafe_offset(f1 * n_rows)
+                for i_row in range(n_sub):
+                    var r = rows_p.unsafe_load(i_row)
+                    # Adjacent, so one cache line carries both.
+                    var g = pairs_p.unsafe_load(2 * i_row)
+                    var h = pairs_p.unsafe_load(2 * i_row + 1)
+                    var b0 = base0 + Int(col0.unsafe_load(r))
+                    var b1 = base1 + Int(col1.unsafe_load(r))
+                    gp.unsafe_store(b0, gp.unsafe_load(b0) + g)
+                    hp.unsafe_store(b0, hp.unsafe_load(b0) + h)
+                    cp.unsafe_store(b0, cp.unsafe_load(b0) + 1)
+                    gp.unsafe_store(b1, gp.unsafe_load(b1) + g)
+                    hp.unsafe_store(b1, hp.unsafe_load(b1) + h)
+                    cp.unsafe_store(b1, cp.unsafe_load(b1) + 1)
+                i += 2
+                continue
+
+            var f = i if use_all else feat_p.unsafe_load(i)
+            var base = f * n_bins
+            zero_slice(base)
+            var col = bins_all_p.unsafe_offset(f * n_rows)
+            if compact:
+                for i_row in range(n_sub):
+                    var r = rows_p.unsafe_load(i_row)
+                    var b = base + Int(col.unsafe_load(r))
+                    gp.unsafe_store(
+                        b, gp.unsafe_load(b) + pairs_p.unsafe_load(2 * i_row)
+                    )
+                    hp.unsafe_store(
+                        b,
+                        hp.unsafe_load(b) + pairs_p.unsafe_load(2 * i_row + 1),
+                    )
+                    cp.unsafe_store(b, cp.unsafe_load(b) + 1)
+            else:
+                # Small node, or one active feature: the gather would cost a
+                # pass and save nothing, so the gradients are read through the
+                # row ids as they always were.
+                for i_row in range(n_sub):
+                    var r = rows_p.unsafe_load(i_row)
+                    var b = base + Int(col.unsafe_load(r))
+                    gp.unsafe_store(b, gp.unsafe_load(b) + grad_p.unsafe_load(r))
+                    hp.unsafe_store(b, hp.unsafe_load(b) + hess_p.unsafe_load(r))
+                    cp.unsafe_store(b, cp.unsafe_load(b) + 1)
+            i += 1
+
+    dispatch_feature_ranges(accumulate_range, n_active, plan.active_ops)
+
+
+def feature_totals(hist: Histogram, feature: Int) raises -> FeatureTotals:
+    """Totals over one feature's bins.
+
+    Split finding computes exactly this inline before it scans a feature, and
+    tree growth computes it again for the leaf value. The order here is the
+    order `split.mojo` uses today and must stay that way: `SIMD_LANES` lanes
+    accumulated in parallel over the whole vector blocks, reduced, then the
+    scalar tail added in ascending bin order. Anything else would move a
+    result, not just its cost.
+
+    Nothing calls this yet. It exists so that a split scan parallelized
+    across features has a totals pass it can hoist without changing a single
+    gain (see the handoff for the call sites).
+    """
+    if feature < 0 or feature >= hist.n_features:
+        raise Error("feature index out of range")
+    comptime W = SIMD_LANES
+    var grad_p = hist.grad.unsafe_ptr()
+    var hess_p = hist.hess.unsafe_ptr()
+    var count_p = hist.count.unsafe_ptr()
+    var base = feature * hist.n_bins
+    var vg = SIMD[DType.float64, W](0.0)
+    var vh = SIMD[DType.float64, W](0.0)
+    var vc = SIMD[DType.int, W](0)
+    var b = 0
+    while b + W <= hist.n_bins:
+        vg += grad_p.unsafe_load[width=W](base + b)
+        vh += hess_p.unsafe_load[width=W](base + b)
+        vc += count_p.unsafe_load[width=W](base + b)
+        b += W
+    var total_g = vg.reduce_add()
+    var total_h = vh.reduce_add()
+    var total_c = Int(vc.reduce_add())
+    while b < hist.n_bins:
+        total_g += grad_p.unsafe_load(base + b)
+        total_h += hess_p.unsafe_load(base + b)
+        total_c += count_p.unsafe_load(base + b)
+        b += 1
+    return FeatureTotals(total_g, total_h, total_c)
 
 
 def subtract_histogram(parent: Histogram, child: Histogram) raises -> Histogram:
@@ -273,7 +631,17 @@ def subtract_histogram_into(
 ) raises:
     """`subtract_histogram` into a caller-owned buffer. Every element is
     written, so unlike the accumulating builders this one needs no zeroing
-    pass at all."""
+    pass at all.
+
+    "For free" was always an overstatement: the pass reads two histograms and
+    writes a third, six streams over `n_features * n_bins` cells each, and at
+    the default shape that is megabytes per node against a node whose
+    accumulation the trick just avoided. It is elementwise, so it splits into
+    contiguous blocks that reproduce the serial result exactly, and the work
+    estimate counts one op per cell per stream rather than per cell (see
+    `apple_cpu_policy.subtract_ops`), which is what lets a shape this
+    memory-bound reach the parallel path at all.
+    """
     if (
         parent.n_features != child.n_features
         or parent.n_bins != child.n_bins
@@ -293,21 +661,24 @@ def subtract_histogram_into(
     var oh = out.hess.unsafe_ptr()
     var oc = out.count.unsafe_ptr()
 
-    comptime W = SIMD_LANES
-    var i = 0
-    while i + W <= size:
-        og.unsafe_store(
-            i, pg.unsafe_load[width=W](i) - cg.unsafe_load[width=W](i)
-        )
-        oh.unsafe_store(
-            i, ph.unsafe_load[width=W](i) - ch.unsafe_load[width=W](i)
-        )
-        oc.unsafe_store(
-            i, pc.unsafe_load[width=W](i) - cc.unsafe_load[width=W](i)
-        )
-        i += W
-    while i < size:
-        og.unsafe_store(i, pg.unsafe_load(i) - cg.unsafe_load(i))
-        oh.unsafe_store(i, ph.unsafe_load(i) - ch.unsafe_load(i))
-        oc.unsafe_store(i, pc.unsafe_load(i) - cc.unsafe_load(i))
-        i += 1
+    def subtract_block(start: Int, end: Int) {imm}:
+        comptime W = SIMD_LANES
+        var i = start
+        while i + W <= end:
+            og.unsafe_store(
+                i, pg.unsafe_load[width=W](i) - cg.unsafe_load[width=W](i)
+            )
+            oh.unsafe_store(
+                i, ph.unsafe_load[width=W](i) - ch.unsafe_load[width=W](i)
+            )
+            oc.unsafe_store(
+                i, pc.unsafe_load[width=W](i) - cc.unsafe_load[width=W](i)
+            )
+            i += W
+        while i < end:
+            og.unsafe_store(i, pg.unsafe_load(i) - cg.unsafe_load(i))
+            oh.unsafe_store(i, ph.unsafe_load(i) - ch.unsafe_load(i))
+            oc.unsafe_store(i, pc.unsafe_load(i) - cc.unsafe_load(i))
+            i += 1
+
+    dispatch_rows(subtract_block, size, subtract_ops(size))

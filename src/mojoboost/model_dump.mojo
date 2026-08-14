@@ -209,13 +209,15 @@ struct DumpTree(Copyable, Movable):
         self.class_id = class_id
         self.num_leaves = num_leaves
         self.shrinkage = shrinkage
-        self.num_cat = 0
-        self.max_depth = 0
+        var n_cat = 0
+        var deepest = 0
         for i in range(len(nodes)):
             if nodes[i].is_categorical:
-                self.num_cat += 1
-            if nodes[i].depth > self.max_depth:
-                self.max_depth = nodes[i].depth
+                n_cat += 1
+            if nodes[i].depth > deepest:
+                deepest = nodes[i].depth
+        self.num_cat = n_cat
+        self.max_depth = deepest
         self.nodes = nodes^
 
     def num_nodes(self) -> Int:
@@ -771,9 +773,8 @@ def dump_leaf_index(
     The numbering `predict(pred_leaf=True)` reports, arrived at from the
     dump alone, which is what makes the dump checkable against the model.
     """
-    return dump.trees[tree_index].nodes[
-        dump_leaf_node(dump, tree_index, row)
-    ].leaf_index
+    var node = dump_leaf_node(dump, tree_index, row)
+    return dump.trees[tree_index].nodes[node].leaf_index
 
 
 def dump_raw_scores(

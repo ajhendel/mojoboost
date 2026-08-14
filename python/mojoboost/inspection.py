@@ -1,11 +1,10 @@
-"""Structured model inspection: a stable, versioned dump of a fitted model.
+"""Structured model inspection: the native dump, in Python shapes.
 
 LightGBM's `Booster.dump_model()`, `Booster.trees_to_dataframe()`, and
 `Booster.get_split_value_histogram()` all answer the same question in
-different shapes: what does this ensemble actually contain? This module
-answers it once, into a documented schema, and derives the other shapes
-from that. `docs/MODEL_INSPECTION_SCHEMA.md` is the schema's normative
-statement; this module is its reference implementation.
+different shapes: what does this ensemble actually contain? mojoboost
+answers it once, in Mojo, and this module converts that answer into the
+shapes a Python consumer wants.
 
     from mojoboost import MojoBoostRegressor
     from mojoboost.inspection import dump_model, trees_to_dataframe
@@ -16,21 +15,31 @@ statement; this module is its reference implementation.
 
 Where the dump comes from
 -------------------------
-Today it is read from the model itself, through
-`Booster.model_to_string()`: that text is mojoboost's versioned save format
-(see src/mojoboost/serialize.mojo), it is exact (floats travel as IEEE-754
-bit patterns), and it needs no new native entry point, so inspection works
-against the extension module as it is built today.
+`src/mojoboost/model_dump.mojo` builds the schema from the fitted model
+itself: node depths and parents, leaf and split ordinals, the raw value a
+split bin stands for, the category codes a categorical node routes left,
+and which optional facts the model can answer at all. The bindings hand
+that over as plain Python objects, floats included, and this module nests
+the flat node tables into the documented `tree_structure`, names the
+objective its LightGBM name, and derives the records, the DataFrame, and
+the split value histogram.
 
-That source has one gap, and it is the format's, not this module's: split
-gains are not serialized, so a dump read this way carries
-`split_gain: None` on every node and reports `has_split_gain: False`.
-`src/mojoboost/inspection.mojo` builds the same schema from the in-memory
-`Model`, where the gains are still present, and exposes them on their own
-as well. When a binding exposes that smaller hook as
-`_mojoboost.split_gains`, this module picks it up automatically and
-`has_split_gain` becomes True; nothing else about the schema changes.
-`handoffs/task14_inspection.md` states the exact binding signature.
+That is the whole division of labor. Nothing here recomputes a depth,
+converts a threshold, reconstructs a category set, or decides what the
+schema contains: `docs/MODEL_INSPECTION_SCHEMA.md` is the schema and Mojo
+is where it is built.
+
+Until the native binding lands
+------------------------------
+The extension module does not expose the dump yet, so there is a fallback
+that parses `Booster.model_to_string()` and builds the same schema in
+Python. It is fenced off at the bottom of this file under one banner, it
+is what every function here falls back to when the hook is missing, and it
+has one gap that is the save format's rather than its own: split gains are
+not serialized, so a dump built that way reports `has_split_gain: False`
+and carries `split_gain: None` on every node.
+`handoffs/migration_19_model_inspection.md` names the exact binding
+functions and the exact lines to delete once they exist.
 
 Not offered
 -----------
@@ -47,6 +56,8 @@ read only.
 """
 
 import struct as _struct
+
+from . import _arrays
 
 __all__ = [
     "DUMP_FORMAT_VERSION",
@@ -71,18 +82,26 @@ __all__ = [
 #: The schema version this module emits and `docs/MODEL_INSPECTION_SCHEMA.md`
 #: describes. Bumped only for a change a consumer written against the
 #: previous version could not survive; new optional keys do not bump it.
+#: `src/mojoboost/model_dump.mojo` carries the same number, and a dump
+#: reports it under `dump_format_version` whichever side built it.
 DUMP_FORMAT_VERSION = 1
 
-#: Model file format versions (src/mojoboost/serialize.mojo) this module can
-#: read. v1 and v2 predate node covers, so a dump built from one reports
-#: `has_node_count: False`.
+#: Model file format versions (src/mojoboost/serialize.mojo) the fallback
+#: parser can read. v1 and v2 predate node covers, so a dump built from one
+#: reports `has_node_count: False`. The native dump reports the format the
+#: model would serialize to and reads nothing, so this does not bound it.
 SUPPORTED_MODEL_FORMAT_VERSIONS = (1, 2, 3)
 
-#: Objective code (as written by `save_model`) to LightGBM's canonical name
-#: for it. The codes are the trainer's, declared in
-#: src/mojoboost/boosting.mojo and mirrored by the estimators' objective
-#: tables; `test_inspection.py` checks this table against those tables so
-#: the two cannot drift apart silently.
+#: Objective code to LightGBM's canonical name for it. The codes are the
+#: trainer's, declared in src/mojoboost/boosting.mojo and mirrored by the
+#: estimators' objective tables; `test_inspection.py` checks this table
+#: against those tables so the two cannot drift apart silently.
+#:
+#: The name and not the code is what LightGBM's `objective_` attribute
+#: reports, and spelling a LightGBM parameter is this layer's job: the model
+#: holds the code, and `src/mojoboost/lgbm_model_io.mojo` spells the same
+#: codes for a LightGBM *file*, which needs different decorations (see the
+#: handoff).
 OBJECTIVE_NAMES = {
     0: "regression",
     1: "binary",
@@ -99,6 +118,630 @@ OBJECTIVE_NAMES = {
     12: "cross_entropy",
 }
 
+
+# -- the model handle ----------------------------------------------------
+
+
+def _booster(model):
+    """The `Booster` behind an estimator or a `Booster`.
+
+    `booster_` is read off the class before it is read off the instance:
+    `NotFittedError` derives from `AttributeError`, so a `getattr` with a
+    default would swallow an unfitted estimator's complaint and report it
+    as the wrong kind of mistake.
+    """
+    if callable(getattr(model, "model_to_string", None)):
+        return model
+    if getattr(type(model), "booster_", None) is None:
+        raise TypeError(
+            "model inspection takes a fitted estimator, a mojoboost.Booster, "
+            "or the text model_to_string() produces, not "
+            f"{type(model).__name__}"
+        )
+    return model.booster_
+
+
+def _hook(booster, name):
+    """The extension module's entry point called `name` for this kind of
+    model, or None when this build does not expose it.
+
+    A handle is a single-output model or a softmax one, and the extension
+    module takes one entry point per kind, as it does for every other model
+    accessor (`n_features` / `n_features_multiclass`).
+    """
+    from . import _mojoboost
+
+    if getattr(booster, "_n_classes", 0):
+        name += "_multiclass"
+    return getattr(_mojoboost, name, None)
+
+
+def _row_buffer(row):
+    """One raw example as a float64 buffer plus its address, validated the
+    way every other feature matrix crossing this boundary is. The buffer is
+    returned so the caller keeps it alive while the address is in flight."""
+    buf, _n_rows, n_features = _arrays.column_major([list(row)], name="row")
+    return buf, _arrays.addr(buf), n_features
+
+
+# -- the schema ----------------------------------------------------------
+
+
+def _resolve_override(feature_names, n_features):
+    """A caller's `feature_names`, checked against the model it names.
+
+    The native builder falls back to `Column_i` on a length mismatch rather
+    than refusing, so the mismatch is caught here, where the caller's
+    argument is still in hand.
+    """
+    if feature_names is None:
+        return None
+    names = [str(name) for name in feature_names]
+    if len(names) != n_features:
+        raise ValueError(
+            f"feature_names has {len(names)} entries for a model with "
+            f"{n_features} features"
+        )
+    return names
+
+
+def _objective_name(code, num_class):
+    """LightGBM's spelling of the objective a dump reports."""
+    if code is None or num_class > 1:
+        return "multiclass"
+    return OBJECTIVE_NAMES.get(code, f"objective_{code}")
+
+
+def _nested_node(nodes, index):
+    """One node of a native flat node table, and everything below it, as
+    the nested record the schema documents.
+
+    A leaf and an internal node are told apart by which keys they carry, so
+    this is where `value` and `count` become `leaf_value` / `leaf_count` or
+    `internal_value` / `internal_count`, and where `left` and `right` stop
+    being indices and become subtrees.
+    """
+    node = nodes[index]
+    if node["is_leaf"]:
+        return {
+            "node_index": node["node_index"],
+            "leaf_index": node["leaf_index"],
+            "leaf_value": node["value"],
+            "leaf_count": node["count"],
+            "depth": node["depth"],
+        }
+    return {
+        "node_index": node["node_index"],
+        "split_index": node["split_index"],
+        "split_feature": node["split_feature"],
+        "split_feature_name": node["split_feature_name"],
+        "decision_type": node["decision_type"],
+        "threshold": node["threshold"],
+        "threshold_bin": node["threshold_bin"],
+        "categories": node["categories"],
+        "category_bins": node["category_bins"],
+        "default_left": node["default_left"],
+        "missing_bin": node["missing_bin"],
+        "missing_type": node["missing_type"],
+        "split_gain": node["split_gain"],
+        "internal_value": node["value"],
+        "internal_count": node["count"],
+        "depth": node["depth"],
+        "left_child": _nested_node(nodes, node["left"]),
+        "right_child": _nested_node(nodes, node["right"]),
+    }
+
+
+def _schema_from_native(payload):
+    """The documented dump, from what the binding handed over.
+
+    Every fact here was computed in Mojo. This nests the flat node tables,
+    names the objective, and restates the two keys LightGBM derives from
+    others (`max_feature_idx`, `feature_names`).
+    """
+    infos = payload["feature_infos"]
+    return {
+        "dump_format_version": payload["dump_format_version"],
+        "producer": "mojoboost",
+        "model_format_version": payload["model_format_version"],
+        "source": "native",
+        "objective": _objective_name(
+            payload["objective_code"], payload["num_class"]
+        ),
+        "objective_code": payload["objective_code"],
+        "num_class": payload["num_class"],
+        "num_tree_per_iteration": payload["num_tree_per_iteration"],
+        "num_iteration": payload["num_iteration"],
+        "learning_rate": payload["learning_rate"],
+        "base_score": list(payload["base_score"]),
+        "leaf_value_is_shrunk": False,
+        "num_feature": payload["num_feature"],
+        "max_feature_idx": payload["num_feature"] - 1,
+        "num_bin": payload["num_bin"],
+        "feature_names": [info["name"] for info in infos],
+        "feature_infos": infos,
+        "monotone_constraints": payload["monotone_constraints"],
+        "has_split_gain": payload["has_split_gain"],
+        "has_node_count": payload["has_node_count"],
+        "tree_info": [
+            {
+                "tree_index": tree["tree_index"],
+                "iteration": tree["iteration"],
+                "class_id": tree["class_id"],
+                "num_leaves": tree["num_leaves"],
+                "num_nodes": tree["num_nodes"],
+                "num_cat": tree["num_cat"],
+                "max_depth": tree["max_depth"],
+                "shrinkage": tree["shrinkage"],
+                "tree_structure": _nested_node(tree["nodes"], 0),
+            }
+            for tree in payload["trees"]
+        ],
+    }
+
+
+def _native_dump(model, feature_names):
+    """The dump from the extension module, or None when this build does not
+    expose it.
+
+    The names travel with their count, the way every sequence at this
+    boundary does. An empty list is what makes the builder fall back to
+    `Column_0`, `Column_1`, ..., and `Booster.feature_name()` already
+    reports those when the model carries no names, so the override, the
+    carried names, and the fallback resolve here in that order.
+    """
+    booster = _booster(model)
+    hook = _hook(booster, "dump_model")
+    if hook is None:
+        return None
+    n_features = int(booster.num_feature())
+    names = _resolve_override(feature_names, n_features)
+    if names is None:
+        names = [str(name) for name in booster.feature_name()]
+        if len(names) != n_features:
+            names = []
+    return _schema_from_native(hook(booster._handle, names, len(names)))
+
+
+def dump_model(model, feature_names=None):
+    """The fitted model as the documented inspection schema.
+
+    `model` is a fitted estimator, a `mojoboost.Booster`, or the text
+    `Booster.model_to_string()` produces. `feature_names` overrides the
+    names the model carries, and is how a caller names the features of a
+    model read back from a file, which carries none.
+
+    See `docs/MODEL_INSPECTION_SCHEMA.md` for every key. The two a
+    consumer should branch on: `has_split_gain` says whether per node
+    gains are present, and `has_node_count` whether per node training row
+    counts are.
+    """
+    if not isinstance(model, str):
+        native = _native_dump(model, feature_names)
+        if native is not None:
+            return native
+    return _dump_from_text(model, feature_names)
+
+
+# -- derived shapes ------------------------------------------------------
+
+
+#: The columns `trees_to_dataframe` produces, in order. LightGBM's names,
+#: so a notebook written against LightGBM reads the same frame.
+TREE_FRAME_COLUMNS = (
+    "tree_index",
+    "node_depth",
+    "node_index",
+    "left_child",
+    "right_child",
+    "parent_index",
+    "split_feature",
+    "split_gain",
+    "threshold",
+    "decision_type",
+    "missing_direction",
+    "missing_type",
+    "value",
+    "weight",
+    "count",
+)
+
+
+def _node_name(tree_index, node):
+    if "leaf_index" in node:
+        return f"{tree_index}-L{node['leaf_index']}"
+    return f"{tree_index}-S{node['split_index']}"
+
+
+def trees_to_records(model, dump=None):
+    """`trees_to_dataframe` without pandas: one dict per node, in the
+    column order `TREE_FRAME_COLUMNS` names.
+
+    Rows come out in depth-first order per tree, root first, which is the
+    order LightGBM's frame uses.
+    """
+    if dump is None:
+        dump = dump_model(model)
+    rows = []
+    for tree in dump["tree_info"]:
+        index = tree["tree_index"]
+        stack = [(tree["tree_structure"], None)]
+        while stack:
+            node, parent = stack.pop()
+            leaf = "leaf_index" in node
+            row = {
+                "tree_index": index,
+                # LightGBM counts the root as depth 1; the dump counts edges
+                # from the root, so the two differ by one.
+                "node_depth": node["depth"] + 1,
+                "node_index": _node_name(index, node),
+                "left_child": None,
+                "right_child": None,
+                "parent_index": parent,
+                "split_feature": None,
+                "split_gain": None,
+                "threshold": None,
+                "decision_type": None,
+                "missing_direction": None,
+                "missing_type": None,
+                "value": node["leaf_value"] if leaf else node[
+                    "internal_value"
+                ],
+                # mojoboost records a node's training row cover, not its
+                # hessian sum, so there is no LightGBM `weight` to report.
+                "weight": None,
+                "count": node["leaf_count"] if leaf else node[
+                    "internal_count"
+                ],
+            }
+            if not leaf:
+                name = _node_name(index, node)
+                row["left_child"] = _node_name(index, node["left_child"])
+                row["right_child"] = _node_name(index, node["right_child"])
+                row["split_feature"] = node["split_feature_name"]
+                row["split_gain"] = node["split_gain"]
+                row["threshold"] = (
+                    node["categories"]
+                    if node["decision_type"] == "=="
+                    else node["threshold"]
+                )
+                row["decision_type"] = node["decision_type"]
+                row["missing_direction"] = (
+                    "left" if node["default_left"] else "right"
+                )
+                row["missing_type"] = node["missing_type"]
+                stack.append((node["right_child"], name))
+                stack.append((node["left_child"], name))
+            rows.append(row)
+    return rows
+
+
+def trees_to_dataframe(model, dump=None):
+    """The ensemble as a pandas DataFrame, one row per node.
+
+    LightGBM's `Booster.trees_to_dataframe()`, with LightGBM's column
+    names. Two columns differ in what they can hold, both because of what
+    mojoboost records rather than because of this function:
+
+    - `split_gain` is None on every row unless the dump carries gains
+      (`dump["has_split_gain"]`).
+    - `weight` is always None: mojoboost records a node's training row
+      cover, in `count`, and not the hessian sum LightGBM calls weight.
+
+    pandas is not a dependency of mojoboost. `trees_to_records` returns the
+    same rows as plain dicts and needs nothing installed.
+    """
+    try:
+        import pandas
+    except ImportError:
+        raise ImportError(
+            "trees_to_dataframe needs pandas, which mojoboost does not "
+            "depend on; trees_to_records() returns the same rows as plain "
+            "dicts"
+        ) from None
+    rows = trees_to_records(model, dump=dump)
+    return pandas.DataFrame(rows, columns=list(TREE_FRAME_COLUMNS))
+
+
+def _feature_index(dump, feature):
+    if isinstance(feature, str):
+        names = dump["feature_names"]
+        if feature not in names:
+            raise ValueError(
+                f"no feature named {feature!r}; the model has "
+                + ", ".join(repr(n) for n in names)
+            )
+        return names.index(feature)
+    index = int(feature)
+    if not 0 <= index < dump["num_feature"]:
+        raise ValueError(
+            f"feature index {index} is outside the model's "
+            f"{dump['num_feature']} features"
+        )
+    return index
+
+
+def split_values(model, feature, dump=None):
+    """Every threshold the ensemble splits `feature` at, in tree order.
+
+    `feature` is an index or a name. The values are the bins' upper edges,
+    which is the exact boundary routing uses, so the histogram they feed
+    describes where the model actually cuts. A categorical feature is
+    refused: its splits are category sets and have no value to bin, which
+    is what LightGBM refuses for the same reason.
+
+    Collected in Mojo (`model_dump.dump_split_values`) when the model is a
+    live handle, so the values are the ones the trees hold and not a
+    re-derivation of them.
+    """
+    if dump is None:
+        dump = dump_model(model)
+    index = _feature_index(dump, feature)
+    info = dump["feature_infos"][index]
+    if info["type"] == "categorical":
+        raise ValueError(
+            f"feature {info['name']!r} is categorical, so its splits are "
+            "category sets and have no value to bin; LightGBM refuses this "
+            "for the same reason"
+        )
+    if not isinstance(model, str):
+        booster = _booster(model)
+        hook = _hook(booster, "split_values")
+        if hook is not None:
+            return list(hook(booster._handle, index))
+    return _split_values_from_dump(dump, index)
+
+
+def _histogram(values, bins):
+    """An equal-width histogram with `numpy.histogram`'s conventions: bins
+    are half open except the last, which is closed, and a single distinct
+    value is given a unit-wide bin around itself.
+
+    Written out rather than delegated so the result does not depend on
+    whether numpy happens to be installed. Binning collected values into a
+    plot's buckets is presentation, which is why it is here and not in
+    Mojo; the values themselves come from the model.
+    """
+    lo = min(values)
+    hi = max(values)
+    if lo == hi:
+        lo, hi = lo - 0.5, hi + 0.5
+    width = (hi - lo) / bins
+    edges = [lo + i * width for i in range(bins)] + [hi]
+    counts = [0] * bins
+    for value in values:
+        position = int((value - lo) / width)
+        if position >= bins:
+            position = bins - 1
+        elif position < 0:
+            position = 0
+        counts[position] += 1
+    return counts, edges
+
+
+def get_split_value_histogram(
+    model, feature, bins=None, as_frame=False, dump=None
+):
+    """How the ensemble's splits on one feature are distributed.
+
+    The data behind LightGBM's `plot_split_value_histogram`, and nothing
+    else: no plotting dependency is introduced here, and none is needed to
+    use this.
+
+    `bins` is the maximum number of equal-width bins. `None`, or a number
+    above the count of distinct split values, gives one bin per distinct
+    value, as LightGBM does.
+
+    Returns `(counts, bin_edges)`, two lists with `len(bin_edges) ==
+    len(counts) + 1`. With `as_frame=True` it returns a pandas DataFrame
+    with `Count` and `SplitValue` columns instead, where `SplitValue` is
+    each bin's left edge.
+
+    This deviates from LightGBM's signature deliberately. LightGBM switches
+    its return type on whether pandas can be imported, and takes `xlabel`
+    and `ylabel` arguments that only a plot uses. The shape you get here is
+    the one you asked for.
+    """
+    if dump is None:
+        dump = dump_model(model)
+    values = split_values(model, feature, dump=dump)
+    if not values:
+        info = dump["feature_infos"][_feature_index(dump, feature)]
+        raise ValueError(
+            f"the model never splits on {info['name']!r}, so there is no "
+            "split value histogram to build"
+        )
+    distinct = len(set(values))
+    if bins is None:
+        n_bins = distinct
+    else:
+        n_bins = int(bins)
+        if n_bins < 1:
+            raise ValueError("bins must be a positive integer")
+        n_bins = min(n_bins, distinct)
+    counts, edges = _histogram(values, n_bins)
+    if not as_frame:
+        return counts, edges
+    try:
+        import pandas
+    except ImportError:
+        raise ImportError(
+            "as_frame=True needs pandas, which mojoboost does not depend "
+            "on; the default (counts, bin_edges) return needs nothing"
+        ) from None
+    return pandas.DataFrame(
+        {"Count": counts, "SplitValue": edges[:-1]},
+        columns=["Count", "SplitValue"],
+    )
+
+
+# -- routing the dump ----------------------------------------------------
+#
+# Both of these take either a live model or a dump. A live model routes in
+# Mojo, through `model_dump.dump_raw_scores` and
+# `model_dump.dump_leaf_index`, which walk the dump's own bin edges and
+# node records rather than the model's prediction path: that independence
+# is what makes "the dump describes the model that predicts" a claim that
+# can fail, and so one worth checking. A dump alone has no handle to route
+# with, so it falls through to the Python walker below.
+#
+# Both are one-row checks, not a prediction API: `Booster.predict` is what
+# scores a matrix. A model handed in on a build with no native hook has its
+# dump rebuilt per call, so a caller checking many rows should build the
+# dump once and pass that instead.
+
+
+def leaf_index_of(source, tree_index, row):
+    """The leaf ordinal one raw example reaches in a tree.
+
+    `source` is a fitted model, a `Booster`, or a dump. The same numbering
+    `predict(pred_leaf=True)` reports.
+    """
+    if not isinstance(source, dict):
+        booster = _booster(source)
+        hook = _hook(booster, "dump_leaf_index")
+        if hook is not None:
+            buf, address, n_features = _row_buffer(row)
+            index = hook(
+                booster._handle, int(tree_index), address, n_features
+            )
+            # The buffer stays referenced until the call has returned.
+            del buf
+            return int(index)
+        source = dump_model(source)
+    return _leaf_index_from_dump(source, tree_index, row)
+
+
+def raw_scores(source, row):
+    """Raw scores for one raw example: one entry for a single-output model,
+    one per class for a softmax one.
+
+    `source` is a fitted model, a `Booster`, or a dump. mojoboost stores
+    unshrunk leaf values and multiplies by the shrinkage when it predicts,
+    so the sum is
+    `base_score[k] + sum_over_trees(shrinkage * leaf_value)`.
+    """
+    if not isinstance(source, dict):
+        booster = _booster(source)
+        hook = _hook(booster, "dump_raw_scores")
+        if hook is not None:
+            buf, address, n_features = _row_buffer(row)
+            scores = list(hook(booster._handle, address, n_features))
+            del buf
+            return scores
+        source = dump_model(source)
+    return _raw_scores_from_dump(source, row)
+
+
+# -- estimator and booster attributes ------------------------------------
+#
+# The six LightGBM attributes task 14 owns. Each is a one line read here so
+# that wiring it onto `_Base` is a property that delegates, and so that a
+# `Booster` answers the same question the same way. See
+# `handoffs/migration_19_model_inspection.md` for the exact patch each one
+# needs.
+
+
+def booster_of(model):
+    """The `mojoboost.Booster` behind whatever was handed in.
+
+    `Booster` is already what LightGBM's `booster_` returns and what
+    `_Base.booster_` gives, so this only normalizes the two entry points.
+    """
+    return _booster(model)
+
+
+def feature_name_of(model):
+    """LightGBM's `feature_name_`: the training feature names, or
+    `Column_0`, `Column_1`, ... when the model carries none.
+
+    `Booster.feature_name()` already answers this, so the estimator
+    attribute is that call and not a second source of truth.
+    """
+    return list(booster_of(model).feature_name())
+
+
+def n_features_of(model):
+    """LightGBM's `n_features_`: the feature count the model was fitted on,
+    read from the model rather than from a fit-time attribute."""
+    return int(booster_of(model).num_feature())
+
+
+def n_iter_of(model):
+    """LightGBM's `n_iter_`: boosting iterations trained.
+
+    An estimator records this at fit time, because early stopping can train
+    more iterations than the model ends up holding; without that record the
+    model's own iteration count is the answer.
+    """
+    recorded = getattr(model, "n_iter_", None)
+    if recorded is not None:
+        return int(recorded)
+    return int(booster_of(model).current_iteration())
+
+
+def objective_of(model):
+    """LightGBM's `objective_`: the resolved objective name.
+
+    Resolved, not echoed: it comes from the objective code the model
+    carries, so a model read back from a file answers it too, and an
+    estimator constructed with an alias (`mae`) reports the canonical name
+    (`regression_l1`).
+    """
+    booster = booster_of(model)
+    if getattr(booster, "_n_classes", 0):
+        return "multiclass"
+    from . import _mojoboost
+
+    hook = getattr(_mojoboost, "objective_code", None)
+    if hook is not None:
+        return _objective_name(int(hook(booster._handle)), 1)
+    raw = parse_model_string(booster.model_to_string())
+    return _objective_name(raw["objective_code"], raw["n_classes"])
+
+
+def best_score_of(model):
+    """LightGBM's `best_score_`: the primary validation metric's best value.
+
+    Purely a fit-time record. A model has no validation history, so this
+    reports what `fit` recorded and raises when there was no validation
+    set, which is what `hasattr(model, "best_score_")` already means today.
+    """
+    score = getattr(model, "best_score_", None)
+    if score is None:
+        raise AttributeError(
+            "best_score_ is set by fit(eval_set=...); this model was fitted "
+            "without a validation set, so there is no metric to report"
+        )
+    return float(score)
+
+
+# ========================================================================
+# COMPATIBILITY: the schema, rebuilt in Python from the model text
+# ========================================================================
+#
+# Everything below this banner exists because the extension module does not
+# expose the native dump yet. It parses `Booster.model_to_string()` -- the
+# versioned save format in src/mojoboost/serialize.mojo -- and rebuilds the
+# same schema here, which is why inspection works against the bindings as
+# they are built today.
+#
+# It is a second implementation of facts Mojo already knows: how a tree is
+# laid out, what a split bin's upper edge means, how a category set maps
+# back to codes, and how a row routes. Every one of them is stated in
+# src/mojoboost/model_dump.mojo, and keeping two copies is the cost of
+# working today rather than after the bindings land.
+#
+# DELETION POINT. When `_mojoboost.dump_model` / `dump_model_multiclass`,
+# `split_values*`, `dump_raw_scores*`, and `dump_leaf_index*` exist, delete
+# this entire section and, with it: `parse_model_string` from `__all__`,
+# the `import struct as _struct` at the top, the `_dump_from_text` call in
+# `dump_model`, the `_split_values_from_dump` call in `split_values`, and
+# the two `source = dump_model(source)` fallbacks in `leaf_index_of` and
+# `raw_scores`. `handoffs/migration_19_model_inspection.md` lists the
+# tests that change in the same commit; nothing above this banner does.
+
+
 #: Bin 0 of a categorical feature: missing, unseen, or dropped. Never a
 #: member of a split's category set, so those rows always go right (see
 #: src/mojoboost/categorical.mojo).
@@ -111,14 +754,6 @@ _CAT_BITSET_WORDS = 4
 _CAT_MAX_BINS = 64 * _CAT_BITSET_WORDS
 
 
-# -- the model file's token stream ---------------------------------------
-#
-# A mirror of `_TokenReader` in src/mojoboost/serialize.mojo. Floats are
-# stored as decimal IEEE-754 bit patterns, so reading one back is exact:
-# a dump reports the same bits the trained model holds, not a rounded
-# decimal of them.
-
-
 def _f64_from_bits(token):
     bits = int(token)
     if bits < 0 or bits > 0xFFFFFFFFFFFFFFFF:
@@ -127,6 +762,11 @@ def _f64_from_bits(token):
 
 
 class _Reader:
+    """A mirror of `_TokenReader` in src/mojoboost/serialize.mojo. Floats
+    are stored as decimal IEEE-754 bit patterns, so reading one back is
+    exact: a dump reports the same bits the trained model holds, not a
+    rounded decimal of them."""
+
     def __init__(self, text):
         self._tokens = text.split()
         self._pos = 0
@@ -169,7 +809,8 @@ def parse_model_string(text):
 
     This is the parse step alone: arrays exactly as
     src/mojoboost/serialize.mojo writes them, with no interpretation
-    layered on. `dump_model` builds the documented schema from it.
+    layered on. Part of the compatibility path: it goes when the native
+    dump binding lands.
     """
     reader = _Reader(text)
     magic = reader.next()
@@ -324,28 +965,6 @@ def _parse_trees(reader, version):
     return trees
 
 
-# -- the schema ----------------------------------------------------------
-
-
-def _booster(model):
-    """The `Booster` behind an estimator or a `Booster`.
-
-    `booster_` is read off the class before it is read off the instance:
-    `NotFittedError` derives from `AttributeError`, so a `getattr` with a
-    default would swallow an unfitted estimator's complaint and report it
-    as the wrong kind of mistake.
-    """
-    if callable(getattr(model, "model_to_string", None)):
-        return model
-    if getattr(type(model), "booster_", None) is None:
-        raise TypeError(
-            "model inspection takes a fitted estimator, a mojoboost.Booster, "
-            "or the text model_to_string() produces, not "
-            f"{type(model).__name__}"
-        )
-    return model.booster_
-
-
 def _model_text(model):
     """The model text and the feature names for whatever was handed in: an
     estimator, a `Booster`, or the text itself."""
@@ -357,44 +976,20 @@ def _model_text(model):
 
 def _native_split_gains(model):
     """Per node split gains, one list per tree, when the extension module
-    exposes them.
+    exposes the small hook and not the whole dump.
 
     Gains are recorded during growth and are not serialized, so this is the
     one thing the model text cannot supply.
-    `handoffs/task14_inspection.md` specifies the binding. Until it exists
-    this returns None and the dump reports `has_split_gain: False`.
-
-    A handle is a single-output model or a softmax one, and the extension
-    module takes one entry point per kind, as it does for every other model
-    accessor.
     """
-    from . import _mojoboost
-
     booster = _booster(model)
-    name = (
-        "split_gains_multiclass"
-        if getattr(booster, "_n_classes", 0)
-        else "split_gains"
-    )
-    hook = getattr(_mojoboost, name, None)
+    hook = _hook(booster, "split_gains")
     if hook is None:
         return None
     return hook(booster._handle)
 
 
-def dump_model(model, feature_names=None):
-    """The fitted model as the documented inspection schema.
-
-    `model` is a fitted estimator, a `mojoboost.Booster`, or the text
-    `Booster.model_to_string()` produces. `feature_names` overrides the
-    names the model carries, and is how a caller names the features of a
-    model read back from a file, which carries none.
-
-    See `docs/MODEL_INSPECTION_SCHEMA.md` for every key. The two a
-    consumer should branch on: `has_split_gain` says whether per node
-    gains are present, and `has_node_count` whether per node training row
-    counts are.
-    """
+def _dump_from_text(model, feature_names=None):
+    """The documented schema, rebuilt from the model text."""
     text, carried_names = _model_text(model)
     raw = parse_model_string(text)
     source = "model_to_string"
@@ -440,7 +1035,7 @@ def dump_model(model, feature_names=None):
         "producer": "mojoboost",
         "model_format_version": raw["model_format_version"],
         "source": source,
-        "objective": _objective_name(raw),
+        "objective": _objective_name(raw["objective_code"], n_classes),
         "objective_code": raw["objective_code"],
         "num_class": n_classes,
         "num_tree_per_iteration": per_iteration,
@@ -462,23 +1057,10 @@ def dump_model(model, feature_names=None):
 
 def _resolve_names(override, carried, n_features):
     if override is not None:
-        names = [str(name) for name in override]
-        if len(names) != n_features:
-            raise ValueError(
-                f"feature_names has {len(names)} entries for a model with "
-                f"{n_features} features"
-            )
-        return names
+        return _resolve_override(override, n_features)
     if carried is not None and len(carried) == n_features:
         return [str(name) for name in carried]
     return [f"Column_{i}" for i in range(n_features)]
-
-
-def _objective_name(raw):
-    if raw["kind"] == "multiclass":
-        return "multiclass"
-    code = raw["objective_code"]
-    return OBJECTIVE_NAMES.get(code, f"objective_{code}")
 
 
 def _feature_infos(raw, names):
@@ -573,13 +1155,7 @@ def _category_bins(tree, node):
 
 def _threshold_value(info, threshold_bin):
     """The largest raw value node routing sends left, or None when the split
-    bin has no upper edge.
-
-    mojoboost splits on bin ids, and a value maps to the first bin whose
-    upper edge it does not exceed, so `bin <= threshold_bin` holds exactly
-    when `value <= edges[threshold_bin]`. The bin's upper edge is therefore
-    the exact real-valued boundary, not an approximation of one.
-    """
+    bin has no upper edge."""
     edges = info["bin_upper_bounds"]
     if edges is None or threshold_bin < 0 or threshold_bin >= len(edges):
         return None
@@ -650,13 +1226,10 @@ def _tree_info(tree, index, per_iteration, learning_rate, infos, gains):
     }
 
 
-# -- routing, from the dump alone ----------------------------------------
-
-
 def _bin_value(info, value):
     """The bin a raw feature value lands in. A mirror of
-    `BinMapper.bin_value` in src/mojoboost/binning.mojo, from the dump's
-    feature record rather than from the model."""
+    `BinMapper.bin_value` in src/mojoboost/binning.mojo, and of
+    `model_dump.dump_bin_value`, from the dump's feature record."""
     if info["type"] == "categorical":
         codes = info["categories"]
         if value != value or value < 0.0 or value >= float(_MAX_CATEGORY):
@@ -690,8 +1263,9 @@ def _bin_value(info, value):
 
 
 def _goes_left(node, bin_id):
-    """A mirror of `Tree.goes_left`: category membership first, then the
-    node's missing direction, then the threshold."""
+    """A mirror of `Tree.goes_left`, and of `model_dump.dump_goes_left`:
+    category membership first, then the node's missing direction, then the
+    threshold."""
     if node["category_bins"] is not None:
         return bin_id in node["category_bins"]
     if bin_id == node["missing_bin"]:
@@ -710,24 +1284,11 @@ def _walk(dump, tree_index, row):
     return node
 
 
-def leaf_index_of(dump, tree_index, row):
-    """The leaf ordinal one raw example reaches in a tree of the dump.
-
-    The same numbering `predict(pred_leaf=True)` reports, computed from the
-    dump alone, which is what makes the dump checkable against the model.
-    """
+def _leaf_index_from_dump(dump, tree_index, row):
     return _walk(dump, tree_index, row)["leaf_index"]
 
 
-def raw_scores(dump, row):
-    """Raw scores for one raw example, from the dump alone: one entry for a
-    single-output model, one per class for a softmax one.
-
-    This is where the dump's leaf values are pinned to the model's own
-    arithmetic. mojoboost stores unshrunk leaf values and multiplies by the
-    shrinkage when it predicts, so the sum is
-    `base_score[k] + sum_over_trees(shrinkage * leaf_value)`.
-    """
+def _raw_scores_from_dump(dump, row):
     scores = list(dump["base_score"])
     per_iteration = dump["num_tree_per_iteration"]
     for index, tree in enumerate(dump["tree_info"]):
@@ -738,161 +1299,10 @@ def raw_scores(dump, row):
     return scores
 
 
-# -- derived shapes ------------------------------------------------------
-
-
-#: The columns `trees_to_dataframe` produces, in order. LightGBM's names,
-#: so a notebook written against LightGBM reads the same frame.
-TREE_FRAME_COLUMNS = (
-    "tree_index",
-    "node_depth",
-    "node_index",
-    "left_child",
-    "right_child",
-    "parent_index",
-    "split_feature",
-    "split_gain",
-    "threshold",
-    "decision_type",
-    "missing_direction",
-    "missing_type",
-    "value",
-    "weight",
-    "count",
-)
-
-
-def _node_name(tree_index, node):
-    if "leaf_index" in node:
-        return f"{tree_index}-L{node['leaf_index']}"
-    return f"{tree_index}-S{node['split_index']}"
-
-
-def trees_to_records(model, dump=None):
-    """`trees_to_dataframe` without pandas: one dict per node, in the
-    column order `TREE_FRAME_COLUMNS` names.
-
-    Rows come out in depth-first order per tree, root first, which is the
-    order LightGBM's frame uses.
-    """
-    if dump is None:
-        dump = dump_model(model)
-    rows = []
-    for tree in dump["tree_info"]:
-        index = tree["tree_index"]
-        stack = [(tree["tree_structure"], None)]
-        while stack:
-            node, parent = stack.pop()
-            leaf = "leaf_index" in node
-            row = {
-                "tree_index": index,
-                # LightGBM counts the root as depth 1; the dump counts edges
-                # from the root, so the two differ by one.
-                "node_depth": node["depth"] + 1,
-                "node_index": _node_name(index, node),
-                "left_child": None,
-                "right_child": None,
-                "parent_index": parent,
-                "split_feature": None,
-                "split_gain": None,
-                "threshold": None,
-                "decision_type": None,
-                "missing_direction": None,
-                "missing_type": None,
-                "value": node["leaf_value"] if leaf else node[
-                    "internal_value"
-                ],
-                # mojoboost records a node's training row cover, not its
-                # hessian sum, so there is no LightGBM `weight` to report.
-                "weight": None,
-                "count": node["leaf_count"] if leaf else node[
-                    "internal_count"
-                ],
-            }
-            if not leaf:
-                name = _node_name(index, node)
-                row["left_child"] = _node_name(index, node["left_child"])
-                row["right_child"] = _node_name(index, node["right_child"])
-                row["split_feature"] = node["split_feature_name"]
-                row["split_gain"] = node["split_gain"]
-                row["threshold"] = (
-                    node["categories"]
-                    if node["decision_type"] == "=="
-                    else node["threshold"]
-                )
-                row["decision_type"] = node["decision_type"]
-                row["missing_direction"] = (
-                    "left" if node["default_left"] else "right"
-                )
-                row["missing_type"] = node["missing_type"]
-                stack.append((node["right_child"], name))
-                stack.append((node["left_child"], name))
-            rows.append(row)
-    return rows
-
-
-def trees_to_dataframe(model, dump=None):
-    """The ensemble as a pandas DataFrame, one row per node.
-
-    LightGBM's `Booster.trees_to_dataframe()`, with LightGBM's column
-    names. Two columns differ in what they can hold, both because of what
-    mojoboost records rather than because of this function:
-
-    - `split_gain` is None on every row unless the dump carries gains
-      (`dump["has_split_gain"]`).
-    - `weight` is always None: mojoboost records a node's training row
-      cover, in `count`, and not the hessian sum LightGBM calls weight.
-
-    pandas is not a dependency of mojoboost. `trees_to_records` returns the
-    same rows as plain dicts and needs nothing installed.
-    """
-    try:
-        import pandas
-    except ImportError:
-        raise ImportError(
-            "trees_to_dataframe needs pandas, which mojoboost does not "
-            "depend on; trees_to_records() returns the same rows as plain "
-            "dicts"
-        ) from None
-    rows = trees_to_records(model, dump=dump)
-    return pandas.DataFrame(rows, columns=list(TREE_FRAME_COLUMNS))
-
-
-def _feature_index(dump, feature):
-    if isinstance(feature, str):
-        names = dump["feature_names"]
-        if feature not in names:
-            raise ValueError(
-                f"no feature named {feature!r}; the model has "
-                + ", ".join(repr(n) for n in names)
-            )
-        return names.index(feature)
-    index = int(feature)
-    if not 0 <= index < dump["num_feature"]:
-        raise ValueError(
-            f"feature index {index} is outside the model's "
-            f"{dump['num_feature']} features"
-        )
-    return index
-
-
-def split_values(model, feature, dump=None):
-    """Every threshold the ensemble splits `feature` at, in tree order.
-
-    `feature` is an index or a name. The values are the bins' upper edges,
-    which is the exact boundary routing uses (see `_threshold_value`), so
-    the histogram they feed describes where the model actually cuts.
-    """
-    if dump is None:
-        dump = dump_model(model)
-    index = _feature_index(dump, feature)
-    info = dump["feature_infos"][index]
-    if info["type"] == "categorical":
-        raise ValueError(
-            f"feature {info['name']!r} is categorical, so its splits are "
-            "category sets and have no value to bin; LightGBM refuses this "
-            "for the same reason"
-        )
+def _split_values_from_dump(dump, index):
+    """Every threshold the ensemble splits feature `index` at, walked out of
+    the dump. `model_dump.dump_split_values` is the same walk in Mojo, in
+    the same order."""
     values = []
     for tree in dump["tree_info"]:
         stack = [tree["tree_structure"]]
@@ -906,159 +1316,3 @@ def split_values(model, feature, dump=None):
             stack.append(node["right_child"])
             stack.append(node["left_child"])
     return values
-
-
-def _histogram(values, bins):
-    """An equal-width histogram with `numpy.histogram`'s conventions: bins
-    are half open except the last, which is closed, and a single distinct
-    value is given a unit-wide bin around itself.
-
-    Written out rather than delegated so the result does not depend on
-    whether numpy happens to be installed.
-    """
-    lo = min(values)
-    hi = max(values)
-    if lo == hi:
-        lo, hi = lo - 0.5, hi + 0.5
-    width = (hi - lo) / bins
-    edges = [lo + i * width for i in range(bins)] + [hi]
-    counts = [0] * bins
-    for value in values:
-        position = int((value - lo) / width)
-        if position >= bins:
-            position = bins - 1
-        elif position < 0:
-            position = 0
-        counts[position] += 1
-    return counts, edges
-
-
-def get_split_value_histogram(
-    model, feature, bins=None, as_frame=False, dump=None
-):
-    """How the ensemble's splits on one feature are distributed.
-
-    The data behind LightGBM's `plot_split_value_histogram`, and nothing
-    else: no plotting dependency is introduced here, and none is needed to
-    use this.
-
-    `bins` is the maximum number of equal-width bins. `None`, or a number
-    above the count of distinct split values, gives one bin per distinct
-    value, as LightGBM does.
-
-    Returns `(counts, bin_edges)`, two lists with `len(bin_edges) ==
-    len(counts) + 1`. With `as_frame=True` it returns a pandas DataFrame
-    with `Count` and `SplitValue` columns instead, where `SplitValue` is
-    each bin's left edge.
-
-    This deviates from LightGBM's signature deliberately. LightGBM switches
-    its return type on whether pandas can be imported, and takes `xlabel`
-    and `ylabel` arguments that only a plot uses. The shape you get here is
-    the one you asked for.
-    """
-    if dump is None:
-        dump = dump_model(model)
-    values = split_values(model, feature, dump=dump)
-    if not values:
-        info = dump["feature_infos"][_feature_index(dump, feature)]
-        raise ValueError(
-            f"the model never splits on {info['name']!r}, so there is no "
-            "split value histogram to build"
-        )
-    distinct = len(set(values))
-    if bins is None:
-        n_bins = distinct
-    else:
-        n_bins = int(bins)
-        if n_bins < 1:
-            raise ValueError("bins must be a positive integer")
-        n_bins = min(n_bins, distinct)
-    counts, edges = _histogram(values, n_bins)
-    if not as_frame:
-        return counts, edges
-    try:
-        import pandas
-    except ImportError:
-        raise ImportError(
-            "as_frame=True needs pandas, which mojoboost does not depend "
-            "on; the default (counts, bin_edges) return needs nothing"
-        ) from None
-    return pandas.DataFrame(
-        {"Count": counts, "SplitValue": edges[:-1]},
-        columns=["Count", "SplitValue"],
-    )
-
-
-# -- estimator and booster attributes ------------------------------------
-#
-# The six LightGBM attributes task 14 owns. Each is a one line read here so
-# that wiring it onto `_Base` is a property that delegates, and so that a
-# `Booster` answers the same question the same way. See
-# `handoffs/task14_inspection.md` for the exact patch each one needs.
-
-
-def booster_of(model):
-    """The `mojoboost.Booster` behind whatever was handed in.
-
-    `Booster` is already what LightGBM's `booster_` returns and what
-    `_Base.booster_` gives, so this only normalizes the two entry points.
-    """
-    return _booster(model)
-
-
-def feature_name_of(model):
-    """LightGBM's `feature_name_`: the training feature names, or
-    `Column_0`, `Column_1`, ... when the model carries none.
-
-    `Booster.feature_name()` already answers this, so the estimator
-    attribute is that call and not a second source of truth.
-    """
-    return list(booster_of(model).feature_name())
-
-
-def n_features_of(model):
-    """LightGBM's `n_features_`: the feature count the model was fitted on,
-    read from the model rather than from a fit-time attribute."""
-    return int(booster_of(model).num_feature())
-
-
-def n_iter_of(model):
-    """LightGBM's `n_iter_`: boosting iterations trained.
-
-    An estimator records this at fit time, because early stopping can train
-    more iterations than the model ends up holding; without that record the
-    model's own iteration count is the answer.
-    """
-    recorded = getattr(model, "n_iter_", None)
-    if recorded is not None:
-        return int(recorded)
-    return int(booster_of(model).current_iteration())
-
-
-def objective_of(model):
-    """LightGBM's `objective_`: the resolved objective name.
-
-    Resolved, not echoed: it comes from the objective code the model
-    carries, so a model read back from a file answers it too, and an
-    estimator constructed with an alias (`mae`) reports the canonical name
-    (`regression_l1`).
-    """
-    booster = booster_of(model)
-    text, _ = _model_text(booster)
-    return _objective_name(parse_model_string(text))
-
-
-def best_score_of(model):
-    """LightGBM's `best_score_`: the primary validation metric's best value.
-
-    Purely a fit-time record. A model has no validation history, so this
-    reports what `fit` recorded and raises when there was no validation
-    set, which is what `hasattr(model, "best_score_")` already means today.
-    """
-    score = getattr(model, "best_score_", None)
-    if score is None:
-        raise AttributeError(
-            "best_score_ is set by fit(eval_set=...); this model was fitted "
-            "without a validation set, so there is no metric to report"
-        )
-    return float(score)

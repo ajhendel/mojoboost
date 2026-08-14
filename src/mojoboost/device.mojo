@@ -1,4 +1,4 @@
-"""Training device selection.
+"""Training device selection: the public vocabulary.
 
 One vocabulary for choosing where training runs, shared by the Mojo API,
 the CPython bindings, and the Python estimators:
@@ -8,40 +8,29 @@ the CPython bindings, and the Python estimators:
 - `gpu`: device-resident tree growth (`train_gpu` in train_gpu.mojo). It
   raises when no accelerator is present, or when the workload is outside
   what the GPU path covers. It never silently falls back to the CPU.
-- `auto`: the GPU when the complete GPU path covers the workload and a
-  conservative size heuristic selects it, the CPU otherwise.
+- `auto`: the GPU when the complete GPU path covers the workload and
+  evidence selects it, the CPU otherwise.
 
-What the GPU path covers today is single-output training: squared error,
-binary logistic, poisson, huber, quantile, and L1. Multiclass grows one
-tree per class per round on the CPU only, so `gpu` raises for it and
-`auto` chooses the CPU.
+**This module decides nothing.** It is the compatibility facade over
+`device_policy.mojo`, which is the one authoritative implementation of
+what the GPU path supports, what a training session is estimated to
+allocate, how detected hardware capabilities are read, what evidence a
+GPU selection rests on, and what an explicit `gpu` request is refused
+for. Everything below is a thin wrapper that forwards to it.
 
-`auto`'s size heuristic is disabled by default, so `auto` currently always
-resolves to the CPU. The only end-to-end GPU training measurement we have
-(Apple M4, bench/bench_train_gpu.mojo) is slower than the CPU trainer, and
-no benchmark on any device has established a workload size where the GPU
-wins, so shipping a crossover threshold would be a performance claim
-without evidence behind it. `MOJOBOOST_AUTO_MIN_CELLS` enables the
-heuristic: an integer number of cells (n_rows * n_features) at or above
-which `auto` chooses the GPU, with `0` meaning "whenever the GPU path
-covers the workload". It is the knob for running the crossover benchmark
-that would justify a default, and it is deliberately device independent:
-no per vendor or per chip special cases live here.
+The wrappers are wrappers and not re-exports so the symbols this module
+has always exported keep being defined here, whatever an importer's view
+of a re-exported name is. Callers that want more than "cpu or gpu" should
+skip this module: build a `DeviceRequest`, call `decide_device`, and read
+the `DeviceDecision` it returns, which carries the blocking reasons, the
+warnings, the memory estimate, the policy version, and the evidence
+identifier that a bare device code cannot.
 
-`MOJOBOOST_DISABLE_GPU=1` makes this module report that no accelerator is
-present: `gpu` raises and `auto` chooses the CPU on a machine that does
-have one. It exists to exercise the unavailable-GPU path in tests and to
-pin a mixed fleet to the CPU backend.
-
-Availability is a property of the build, not of the running machine: Mojo
-resolves `has_accelerator()` at compile time. A binary built where an
-accelerator was present reports one as available, so on a redistributed
-build (a wheel, say) a `gpu` request fails when the device is actually
-opened rather than when it is resolved. That gap is invisible today
-because `auto` never selects the GPU on its own; enabling
-`MOJOBOOST_AUTO_MIN_CELLS` on a redistributed build is what would expose
-it, and `MOJOBOOST_DISABLE_GPU=1` is the way to pin such a build to the
-CPU.
+Why `auto` is the CPU today, what `MOJOBOOST_AUTO_MIN_CELLS` and
+`MOJOBOOST_DISABLE_GPU` do, and why accelerator availability is a
+property of the build rather than of the running machine are all
+documented in device_policy.mojo, where the rules that implement them
+live.
 
 LightGBM difference: LightGBM spells this `device_type` and takes `cpu`,
 `gpu`, or `cuda`, with no `auto`. mojoboost has a single portable GPU
@@ -49,38 +38,40 @@ backend rather than separate OpenCL and CUDA ones, so the value is `gpu`
 for every accelerator, and `auto` is an addition.
 """
 
-from std.os import getenv
-from std.sys import has_accelerator
+from .device_policy import (
+    AUTO_DEVICE as _AUTO_DEVICE,
+    AUTO_MIN_CELLS as _AUTO_MIN_CELLS,
+    CPU_DEVICE as _CPU_DEVICE,
+    GPU_DEVICE as _GPU_DEVICE,
+    device_name as _device_name,
+    env_auto_min_cells as _env_auto_min_cells,
+    gpu_available as _gpu_available,
+    gpu_supports_outputs,
+    parse_device as _parse_device,
+    resolve_device as _resolve_device,
+)
 
-comptime CPU_DEVICE = 0
-comptime GPU_DEVICE = 1
-comptime AUTO_DEVICE = 2
+comptime CPU_DEVICE = _CPU_DEVICE
+comptime GPU_DEVICE = _GPU_DEVICE
+comptime AUTO_DEVICE = _AUTO_DEVICE
 
 # Cells (n_rows * n_features) at or above which `auto` chooses the GPU.
-# Negative disables the heuristic, which is the default: see the module
-# docstring for why there is no measured crossover to ship.
-comptime AUTO_MIN_CELLS = -1
+# Negative disables the heuristic, which is the default: see
+# device_policy.mojo for why there is no measured crossover to ship.
+comptime AUTO_MIN_CELLS = _AUTO_MIN_CELLS
 
 
 def gpu_available() -> Bool:
     """True when training can run on an accelerator: one was present when
     this build was compiled and `MOJOBOOST_DISABLE_GPU=1` is not set."""
-    comptime if not has_accelerator():
-        return False
-    else:
-        return getenv("MOJOBOOST_DISABLE_GPU") != "1"
+    return _gpu_available()
 
 
 def env_auto_min_cells() -> Int:
     """The `auto` size threshold in cells. Unset, negative, or unparsable
-    means disabled, in which case `auto` always chooses the CPU."""
-    var s = getenv("MOJOBOOST_AUTO_MIN_CELLS")
-    if s.byte_length() == 0:
-        return AUTO_MIN_CELLS
-    try:
-        return Int(s)
-    except:
-        return AUTO_MIN_CELLS
+    means disabled, in which case `auto` never selects the GPU on size
+    alone."""
+    return _env_auto_min_cells()
 
 
 def parse_device(name: String) raises -> Int:
@@ -89,26 +80,12 @@ def parse_device(name: String) raises -> Int:
     Names are canonical lowercase here. The Python wrapper lowercases what
     the user passes before calling in, which is how LightGBM treats
     `device_type`."""
-    if name == "cpu":
-        return CPU_DEVICE
-    if name == "gpu":
-        return GPU_DEVICE
-    if name == "auto":
-        return AUTO_DEVICE
-    raise Error(
-        "unknown device '", name, "'; expected 'cpu', 'gpu', or 'auto'"
-    )
+    return _parse_device(name)
 
 
 def device_name(device: Int) raises -> String:
     """Public device name for a device code."""
-    if device == CPU_DEVICE:
-        return "cpu"
-    if device == GPU_DEVICE:
-        return "gpu"
-    if device == AUTO_DEVICE:
-        return "auto"
-    raise Error("unknown device code ", device)
+    return _device_name(device)
 
 
 def gpu_supports(n_outputs: Int) -> Bool:
@@ -116,14 +93,11 @@ def gpu_supports(n_outputs: Int) -> Bool:
     `n_outputs` is 1 for single-output training and the class count for
     multiclass.
 
-    Every workload the device vocabulary routes is now covered: multiclass
-    grows one tree per class per round through `train_multiclass_gpu`, on the
-    same device-resident builder the single-output trainer uses, so it is no
-    longer the exception it was when this guard was written. The check stays
-    as the one place to reject a future workload the GPU path does not
-    implement, which is why `resolve_device` still consults it rather than
-    assuming coverage."""
-    return n_outputs >= 1
+    The former name of `gpu_supports_outputs` in device_policy.mojo, kept
+    so callers written against it keep compiling. New code should use the
+    policy module's name, which says which of a workload's several
+    dimensions it is answering for."""
+    return gpu_supports_outputs(n_outputs)
 
 
 def resolve_device(
@@ -135,32 +109,11 @@ def resolve_device(
     CPU_DEVICE resolves to itself. GPU_DEVICE raises when no accelerator is
     available or when the GPU path does not cover the workload, rather than
     falling back. AUTO_DEVICE chooses the GPU only when it is available,
-    covers the workload, and the size heuristic selects it.
+    covers the workload, and evidence or the size heuristic selects it.
+
+    The shape is all this signature carries, so the gates that need an
+    objective, a bin count, or the input flags are skipped here and the
+    decision records that they were. Callers that know the whole workload
+    should call `decide_device` in device_policy.mojo instead.
     """
-    if device == CPU_DEVICE:
-        return CPU_DEVICE
-
-    if device == GPU_DEVICE:
-        if not gpu_available():
-            raise Error(
-                "device 'gpu' requested but no accelerator is available;"
-                " use device 'cpu' or 'auto'"
-            )
-        if not gpu_supports(n_outputs):
-            raise Error(
-                "device 'gpu' does not support multiclass training;"
-                " use device 'cpu' or 'auto'"
-            )
-        return GPU_DEVICE
-
-    if device == AUTO_DEVICE:
-        if not gpu_available() or not gpu_supports(n_outputs):
-            return CPU_DEVICE
-        var min_cells = env_auto_min_cells()
-        if min_cells < 0:
-            return CPU_DEVICE
-        if n_rows * n_features < min_cells:
-            return CPU_DEVICE
-        return GPU_DEVICE
-
-    raise Error("unknown device code ", device)
+    return _resolve_device(device, n_rows, n_features, n_outputs)

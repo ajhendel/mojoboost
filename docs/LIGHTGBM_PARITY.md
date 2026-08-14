@@ -8,7 +8,7 @@ Audited: 2026-08-14, mojoboost at commit `ab25ad1` plus the working tree of
 that day
 
 What version 2 re-derived: mojoboost's side of every row, by reading the
-live entry points (`python/mojoboost/__init__.py`, `basic.py`, `_eval.py`,
+live entry points (`python/mojoboost/__init__.py`, `python/mojoboost/basic.py`, `python/mojoboost/_eval.py`,
 `bindings/_mojoboost.mojo`, `src/mojoboost/__init__.mojo`, `capi/mojoboost.h`,
 `pixi.toml`, `.github/workflows/ci.yml`) rather than by trusting version 1's
 prose. What it did not re-derive: LightGBM's own inventories in sections 7,
@@ -114,7 +114,7 @@ status word, and the row in the sections below is the whole story.
 | Exact TreeSHAP contributions | supported | yes | yes | yes | yes | yes | n/a | yes | `src/mojoboost/contrib.mojo`, reached by `predict(pred_contrib=True)` on all three estimators. `tests/test_contrib.mojo` checks against Shapley values enumerated over all 2^M subsets, which is an independent implementation, and runs in `pixi run test` |
 | Cross-validation (`mojoboost.cv`) | partial | yes | yes | no | yes | no | n/a | yes | `python/mojoboost/cv.py`, orchestration over `Dataset`, `Booster`, and `Booster.eval`, so a fold model is what `train()` would have built. `python/tests/parallel/test_cv.py` runs under `pixi run -e pytest test-estimators`. Not in `mojoboost.__all__`, and section 2 of `docs/COMPATIBILITY_POLICY.md` says importing a submodule other than `mojoboost.basic` is not public |
 | Model inspection and dump (`mojoboost.inspection`) | partial | yes | yes | no | yes | no | n/a | yes | `python/mojoboost/inspection.py` parses `Booster.model_to_string()`, so it works against the extension as built. `python/tests/parallel/test_inspection.py`. Same reachability caveat as `cv`. `src/mojoboost/inspection.mojo` is the native producer and has no caller and no export |
-| Split gains in a dump | deferred | yes | no | no | no | n/a | n/a | no | `src/mojoboost/serialize.mojo` does not write split gains (see the comment at the leaf reader), so every dumped node carries `split_gain: None` and `has_split_gain: False`. `inspection.py` picks gains up automatically once a binding exposes `_mojoboost.split_gains`; `bindings/_mojoboost.mojo` defines no such function today |
+| Split gains in a dump | deferred | yes | no | no | no | n/a | n/a | no | `src/mojoboost/serialize.mojo` does not write split gains (see the comment at the leaf reader), so every dumped node carries `split_gain: None` and `has_split_gain: False`. `python/mojoboost/inspection.py` picks gains up automatically once a binding exposes `_mojoboost.split_gains`; `bindings/_mojoboost.mojo` defines no such function today |
 | Dask adapter (`mojoboost.dask`) | deferred | yes | no | no | yes | n/a | n/a | yes | `python/mojoboost/dask.py` validates partition metadata, plans ranks, negotiates capabilities, and predicts from model bytes, all against a fake backend in `python/tests/parallel/test_dask_contract.py`. No backend is registered by default, so `fit` raises `DistributedNotAvailable` before touching a cluster. `DaskRuntime` has never run against a live cluster |
 | Explainable device selection (`mojoboost.device_selection`) | deferred | yes | no | no | yes | n/a | n/a | yes | `python/mojoboost/device_selection.py` with 54 tests in `python/tests/parallel/test_device_selection.py`. The estimators do not call it: `_Base._resolve_device` calls `_mojoboost.resolve_device`, so `src/mojoboost/device.mojo` remains the only policy that decides anything. Its `CROSSOVER_RULES` table is empty by design |
 | Exclusive feature bundling | deferred | yes | no | no | yes | n/a | n/a | n/a | `src/mojoboost/efb.mojo` with `tests/parallel/test_efb.mojo` in `pixi run test`. No module in `src/mojoboost/` imports it, it is not exported from `src/mojoboost/__init__.mojo`, and no parameter turns it on |
@@ -128,7 +128,7 @@ status word, and the row in the sections below is the whole story.
 | GPU prediction | partial | yes | yes | yes | yes | yes | yes | yes | `src/mojoboost/gpu_predict.mojo`, reached from `Model.predict_batch(device=)` in the Mojo API. The Python `predict` binding takes no device (`bindings/_mojoboost.mojo`), so the estimators always predict on the CPU |
 | C ABI | partial | yes | yes | yes | yes | n/a | n/a | no | `capi/mojoboost.h` declares twelve functions with a version query; `capi/mojoboost_capi.mojo` implements them. `tests/test_capi.mojo` runs in `pixi run test`, hence in CI. `capi/run_c_tests.sh` (`pixi run test-c`) compiles the C caller and is not in any CI job, and no wheel or release artifact carries the shared library |
 | Command line tool | different | yes | yes | yes | yes | n/a | n/a | no | `cli/mojoboost_cli.mojo` with `tests/test_cli.mojo` in `pixi run test`. It is mojoboost's own CSV tool over the Mojo API, not LightGBM's config-file surface, which stays `unsupported` in section 7 |
-| macOS arm64 wheel artifact | partial | yes | yes | yes | no | n/a | n/a | yes | `packaging/build_wheel.sh` bundles the four MAX runtime dylibs with an `@loader_path` rpath and re-signs, and `packaging/test_wheel.sh` installs and smoke-tests it. No CI job runs either (`.github/workflows/ci.yml` has no wheel job), and `docs/PLATFORM_MATRIX.md` records the target as `designed` with no clean-install run behind it |
+| macOS arm64 wheel artifact | partial | yes | yes | yes | no | n/a | n/a | yes | `packaging/build_wheel.sh` bundles the four MAX runtime dylibs with an `@loader_path` rpath and re-signs, `packaging/test_wheel.sh` installs and smoke-tests it, and `packaging/macos/build_release_wheel.sh` is driven by a release workflow that builds, verifies, clean-installs, and hashes on a tag or a manual dispatch. `focused-tested` is `no` because no per-change job guards any of that: the everyday CI workflow has no wheel job, and `docs/PLATFORM_MATRIX.md` still records the target as `designed` |
 
 ---
 
@@ -154,12 +154,12 @@ package during the version 1 audit.
 | `reset_parameter` | partial | `reset_parameter(**schedules)` with lists or callables, for the nine hyperparameters the loop re-reads each round (`callback.RESETTABLE`). A key outside that set raises rather than being ignored, which LightGBM does not do. A learning-rate schedule bakes shrinkage into the leaf values | `python/mojoboost/callback.py`, `src/mojoboost/callback.mojo` |
 | `EarlyStopException` | supported | Raised by a callback to stop the run; rolls the ensemble back to the best round as LightGBM does | `python/mojoboost/callback.py`, `src/mojoboost/callback.mojo` |
 | `EvalResult` | different | The 4-tuple `(data_name, metric_name, value, is_higher_better)` is what `env.evaluation_result_list` holds, matching LightGBM's shape; there is no named type for it | `python/mojoboost/callback.py`, `src/mojoboost/callback.mojo` |
-| `register_logger` | unsupported | mojoboost has no logging layer to redirect. Training is silent by design; adding a logger to redirect is not a goal | — |
-| `plot_importance` | unsupported | Plotting belongs in the caller's plotting library. `feature_importances_` is the data; matplotlib is not a dependency mojoboost will take | — |
-| `plot_metric` | unsupported | Same reason. `evals_result_` is the data | — |
+| `register_logger` | unsupported | mojoboost has no logging layer to redirect. Training is silent by design; adding a logger to redirect is not a goal | none |
+| `plot_importance` | unsupported | Plotting belongs in the caller's plotting library. `feature_importances_` is the data; matplotlib is not a dependency mojoboost will take | none |
+| `plot_metric` | unsupported | Same reason. `evals_result_` is the data | none |
 | `plot_split_value_histogram` | unsupported | The plot is out of scope for the same reason as the other two. The data it renders now exists: `mojoboost.inspection.get_split_value_histogram(model, feature)` returns it, section 5 | `python/mojoboost/inspection.py` |
 | `plot_tree` / `create_tree_digraph` | unsupported | The graphviz rendering is out of scope; graphviz is not a dependency mojoboost will take. The structured tree it renders now exists as `mojoboost.inspection.dump_model`, section 5 | `python/mojoboost/inspection.py` |
-| `Sequence` | deferred | The incremental-data protocol is part of the `Dataset` work, tasks 7 and 10. Nothing in the tree implements it | — |
+| `Sequence` | deferred | The incremental-data protocol is part of the `Dataset` work, tasks 7 and 10. Nothing in the tree implements it | none |
 | `DaskLGBMRegressor` / `DaskLGBMClassifier` / `DaskLGBMRanker` | deferred | `python/mojoboost/dask.py` has the three classes and the client-side contract, and they raise `DistributedNotAvailable` on `fit` because no backend is registered and no transport is wired up. Building them on the in-process prototype would be a distribution claim with nothing behind it. Section 0, and task 17 after task 16 | `python/mojoboost/dask.py`, `docs/distributed.md` |
 
 ## 2. Estimator constructor parameters
@@ -357,11 +357,11 @@ Aliases are omitted; section 2 lists the aliases mojoboost accepts.
 | `early_stopping_round` | supported | `fit(early_stopping_rounds=)`, and `train_with_valid` / `train_with_metrics` in Mojo |
 | `early_stopping_min_delta` | supported | `fit(min_delta=)`. Same strict-improvement rule as LightGBM |
 | `first_metric_only` | different | Every metric flagged for early stopping is watched, and the ensemble is truncated to the best round of the **primary** metric on the **first** validation set. LightGBM truncates to the best iteration of whichever pair ran out of patience first, which makes the kept model depend on scheduling. `mojoboost.cv` does take a `first_metric_only` argument, because a fold history has no primary-metric truncation to fall back on |
-| `max_delta_step` | partial | Fixed at LightGBM's Poisson value (`poisson_max_delta_step`, 0.7) inside the Poisson objective. Not a user parameter for other objectives; the general rule exists unintegrated in `tree_parameters_extra.mojo` |
+| `max_delta_step` | partial | Fixed at LightGBM's Poisson value (`poisson_max_delta_step`, 0.7) inside the Poisson objective. Not a user parameter for other objectives; the general rule exists unintegrated in `src/mojoboost/tree_parameters_extra.mojo` |
 | `lambda_l1` | supported | LightGBM's `ThresholdL1` soft thresholding, applied to split gains and leaf values |
 | `lambda_l2` | supported | Default differs (1.0 here, 0.0 in LightGBM); documented in the README |
 | `linear_lambda` | unsupported | Only meaningful with `linear_tree` |
-| `min_gain_to_split` | unsupported | A caller who sets it gets nothing, which is why this is `unsupported` rather than `deferred`. The gain floor exists as a pure rule in `tree_parameters_extra.mojo` and no grower consults it. Section 0, task 12 |
+| `min_gain_to_split` | unsupported | A caller who sets it gets nothing, which is why this is `unsupported` rather than `deferred`. The gain floor exists as a pure rule in `src/mojoboost/tree_parameters_extra.mojo` and no grower consults it. Section 0, task 12 |
 | `drop_rate` / `max_drop` / `skip_drop` / `xgboost_dart_mode` / `uniform_drop` / `drop_seed` | deferred | DART parameters. DART itself is deferred, see `boosting` |
 | `top_rate` / `other_rate` | supported | GOSS. Same defaults, same `\|grad * hess\|` importance, same warmup rule, with `goss_warmup_rounds` exposing the warmup count |
 | `min_data_per_group` | supported | Categorical |
@@ -371,13 +371,13 @@ Aliases are omitted; section 2 lists the aliases mojoboost accepts.
 | `max_cat_to_onehot` | supported | Categorical |
 | `top_k` | deferred | Voting-parallel only; with task 16 |
 | `monotone_constraints` | supported | Per-feature -1/0/1. The guarantee holds at any feature value, not only on the training data |
-| `monotone_constraints_method` | different | One method. LightGBM's `basic`/`intermediate`/`advanced` choice is an artifact of three implementations; mojoboost's bounds propagation is the exact one. `tree_parameters_extra.mojo` parses the parameter name for a future caller and nothing reads it |
-| `monotone_penalty` | deferred | Depth-scaled penalty on constrained splits. The rule exists in `tree_parameters_extra.mojo`, unintegrated. Low value relative to the constraint itself |
-| `feature_contri` | deferred | Per-feature gain multipliers. The rule exists in `tree_parameters_extra.mojo`, unintegrated. Section 0, task 12 |
-| `forcedsplits_filename` | unsupported | File-based configuration surface. `tree_parameters_extra.mojo` can parse the file's contents into a validated forced-split tree, but reading a file is not something mojoboost does |
+| `monotone_constraints_method` | different | One method. LightGBM's `basic`/`intermediate`/`advanced` choice is an artifact of three implementations; mojoboost's bounds propagation is the exact one. `src/mojoboost/tree_parameters_extra.mojo` parses the parameter name for a future caller and nothing reads it |
+| `monotone_penalty` | deferred | Depth-scaled penalty on constrained splits. The rule exists in `src/mojoboost/tree_parameters_extra.mojo`, unintegrated. Low value relative to the constraint itself |
+| `feature_contri` | deferred | Per-feature gain multipliers. The rule exists in `src/mojoboost/tree_parameters_extra.mojo`, unintegrated. Section 0, task 12 |
+| `forcedsplits_filename` | unsupported | File-based configuration surface. `src/mojoboost/tree_parameters_extra.mojo` can parse the file's contents into a validated forced-split tree, but reading a file is not something mojoboost does |
 | `refit_decay_rate` | deferred | With `refit`, task 14 |
-| `cegb_tradeoff` / `cegb_penalty_split` / `cegb_penalty_feature_lazy` / `cegb_penalty_feature_coupled` | deferred | Cost-effective gradient boosting. The two computable split penalties exist in `tree_parameters_extra.mojo`, unintegrated; the lazy per-feature penalty needs per-row state no grower carries |
-| `path_smooth` | deferred | Leaf-value smoothing toward the parent. The rule exists in `tree_parameters_extra.mojo`, unintegrated. Section 0, task 12 |
+| `cegb_tradeoff` / `cegb_penalty_split` / `cegb_penalty_feature_lazy` / `cegb_penalty_feature_coupled` | deferred | Cost-effective gradient boosting. The two computable split penalties exist in `src/mojoboost/tree_parameters_extra.mojo`, unintegrated; the lazy per-feature penalty needs per-row state no grower carries |
+| `path_smooth` | deferred | Leaf-value smoothing toward the parent. The rule exists in `src/mojoboost/tree_parameters_extra.mojo`, unintegrated. Section 0, task 12 |
 | `interaction_constraints` | supported | LightGBM's per-branch allowed-feature rule, including the sharp edge that a feature in no group is never split on |
 | `verbosity` | different | Training is silent. There is no logging layer to turn up |
 | `input_model` / `output_model` / `saved_feature_importance_type` / `snapshot_freq` | unsupported | File-based configuration surface. `save()`/`load()` cover the model itself, and `cli/mojoboost` has its own `--model` flag |
@@ -536,7 +536,7 @@ before any metric sees them.
 | data parallel | partial | Designed and prototyped: row partitioning, local histograms, all-reduce, globally consistent splits, identical trees on every rank, deterministic failure agreement. Every rank runs in one process (`LocalCollective`), so nothing has crossed a network. `src/mojoboost/distributed.mojo`, `src/mojoboost/collective.mojo`, `tests/test_distributed.mojo`, `docs/distributed.md` |
 | feature parallel | deferred | Section 2 of `docs/distributed.md` explains why data parallel comes first |
 | voting parallel | deferred | Same |
-| a real transport (MPI, sockets, gRPC) | deferred | `src/mojoboost/distributed_transport.mojo` implements a session state machine and its own suite, and nothing imports it: `distributed.mojo` still takes a `Collective`, and `src/mojoboost/__init__.mojo` does not export the transport. Section 0, task 16. **No distributed performance or scaling claim is made anywhere** |
+| a real transport (MPI, sockets, gRPC) | deferred | `src/mojoboost/distributed_transport.mojo` implements a session state machine and its own suite, and nothing imports it: `src/mojoboost/distributed.mojo` still takes a `Collective`, and `src/mojoboost/__init__.mojo` does not export the transport. Section 0, task 16. **No distributed performance or scaling claim is made anywhere** |
 | Dask integration | deferred | `python/mojoboost/dask.py` is the client-side contract and cannot train; section 0, task 17 |
 | distributed GPU | deferred | Out of v1 |
 
@@ -554,7 +554,7 @@ HIP, and no NVIDIA or AMD device has run this code.
 | GPU split selection | supported | Off by default. `MOJOBOOST_GPU_SPLIT_STRATEGY=device` (or `grow_tree_gpu(split_search=SPLIT_SEARCH_DEVICE)`) searches each node's histogram on the device and downloads one 136-byte record instead of the histogram. Float32 gains can flip near-tie split decisions versus the host scan, so `SPLIT_SEARCH_AUTO` resolves to the host scan; no benchmark has compared the two. `src/mojoboost/gpu_split_search.mojo` |
 | GPU multiclass | supported | `fit_multiclass` resolves the device and calls `train_multiclass_gpu`, and `gpu_supports` admits every output count, so `MojoBoostClassifier(device="gpu")` trains one tree per class per round on the accelerator. `src/mojoboost/model.mojo`, `tests/test_device.mojo`, `tests/test_gpu_objectives.mojo` |
 | GPU prediction | partial | `Model.predict_batch` and `MulticlassModel.predict_batch` take a `device` and walk the trees on the accelerator; binning stays host-side, so both devices route every row to the same leaf. Mojo API only: the `predict` binding takes no device, so the Python estimators always predict on the CPU. Not a LightGBM capability (`device_type` covers training only), so this is a mojoboost addition. `src/mojoboost/gpu_predict.mojo`, `tests/parallel/test_gpu_predict.mojo` |
-| Persistent GPU session and scheduling | partial | `src/mojoboost/gpu_runtime.mojo` is exported and `histogram_gpu.mojo` borrows a `GpuSession`'s device context. The residency ledger, staging ring, and phase counters around it are exercised by `tests/parallel/test_gpu_runtime.mojo` rather than by a trainer |
+| Persistent GPU session and scheduling | partial | `src/mojoboost/gpu_runtime.mojo` is exported and `src/mojoboost/histogram_gpu.mojo` borrows a `GpuSession`'s device context. The residency ledger, staging ring, and phase counters around it are exercised by `tests/parallel/test_gpu_runtime.mojo` rather than by a trainer |
 | Apple-specific tiling policy | deferred | `src/mojoboost/apple_gpu_policy.mojo` is implemented and tested and nothing reads it; `src/mojoboost/gpu_tiling.mojo` remains the policy in force. Section 0 |
 | Sparse input on the GPU | unsupported | There is no sparse GPU kernel, and `_sparse_fit_params` raises for `device="gpu"` rather than densifying |
 | CUDA (NVIDIA) validation | deferred | The source targets it and `tests/test_gpu_portability.mojo` pins the launch limits CUDA imposes, but **no NVIDIA device has run this code**. `.github/workflows/gpu-validation.yml` is the manual job that would produce a record |
@@ -565,10 +565,11 @@ HIP, and no NVIDIA or AMD device has run this code.
 
 | LightGBM property | Status | Notes |
 |---|---|---|
-| PyPI wheels | deferred | Nothing has been uploaded |
-| macOS arm64 wheel | partial | `packaging/build_wheel.sh` bundles the four MAX runtime dylibs with an `@loader_path` rpath and re-signs them, and `packaging/test_wheel.sh` installs and smoke-tests the result. No CI job runs either, and `docs/PLATFORM_MATRIX.md` records the target as `designed`, with an explicit note that a wheel found on a disk is not a record. Downgraded from `supported` in contract version 2 for that reason; restoring it needs a CI job or a recorded clean-install run, not a rewording |
+| PyPI wheels | deferred | Nothing has been uploaded to PyPI. The release workflows can publish to TestPyPI, behind a manual dispatch input and a repository variable, which is a rehearsal rather than a release |
+| macOS arm64 wheel | partial | `packaging/build_wheel.sh` bundles the four MAX runtime dylibs with an `@loader_path` rpath and re-signs them, `packaging/test_wheel.sh` installs and smoke-tests the result, and `packaging/macos/build_release_wheel.sh` runs under a tag-triggered release workflow that also clean-installs and hashes the artifact. Nothing guards any of it on an ordinary change: the everyday CI workflow has no wheel job, and `docs/PLATFORM_MATRIX.md` records the target as `designed`, with an explicit note that a wheel found on a disk is not a record. Downgraded from `supported` in contract version 2 for that reason; restoring it needs a per-change job or a recorded clean-install run cited from the matrix, not a rewording |
 | macOS x86-64 wheel | unsupported | `docs/PLATFORM_MATRIX.md` lists `macos-x86_64` as out of scope |
-| manylinux wheel | deferred | Task 18. The Mojo toolchain runs on Linux in CI, so this is packaging work rather than a port |
+| Linux wheel, x86-64 and ARM64 | partial | `packaging/linux/build_wheel_linux.sh` builds both, with ELF inspection and a wheel-metadata check, under a release workflow with a runner per architecture. The default tag policy is plain `linux_x86_64` / `linux_aarch64`. Same gap as the macOS row: no per-change job, and `docs/PLATFORM_MATRIX.md` still says `designed` |
+| manylinux wheel | deferred | The manylinux tag is a glibc promise, and the Linux release workflow makes promoting to it a deliberate input with a floor you have to have measured, rather than the default. Nothing has measured it |
 | Windows wheel | deferred | Task 18 |
 | Python version range | different | `requires-python = ">=3.14"`, one interpreter, because MAX 26.5.0 ships as a 3.14 build and pins `python 3.14.*`. LightGBM ships 3.9 through 3.13 |
 | conda package | deferred | Task 18 |
@@ -602,15 +603,15 @@ quietly fixed, because each is somebody's in-flight work:
    even though the rest of the scikit-learn spellings are. Re-confirmed
    against `_Base.__init__` in this audit.
 4. **Six modules are implemented, individually tested, and wired to
-   nothing.** `efb.mojo`, `inspection.mojo`, `lgbm_model_io.mojo`,
-   `distributed_transport.mojo`, `apple_gpu_policy.mojo`, and
-   `tree_parameters_extra.mojo` have no importer in `src/mojoboost/` and no
+   nothing.** `src/mojoboost/efb.mojo`, `src/mojoboost/inspection.mojo`, `src/mojoboost/lgbm_model_io.mojo`,
+   `src/mojoboost/distributed_transport.mojo`, `src/mojoboost/apple_gpu_policy.mojo`, and
+   `src/mojoboost/tree_parameters_extra.mojo` have no importer in `src/mojoboost/` and no
    export from `src/mojoboost/__init__.mojo`. Their suites run in
    `pixi run test`, which makes them look supported from the test output
    alone. Section 0 scores each one.
 5. **Four Python modules are reachable only by an import the compatibility
-   policy calls private.** `cv.py`, `inspection.py`, `dask.py`, and
-   `device_selection.py` work when imported by path, and section 2 of
+   policy calls private.** `python/mojoboost/cv.py`, `python/mojoboost/inspection.py`, `python/mojoboost/dask.py`, and
+   `python/mojoboost/device_selection.py` work when imported by path, and section 2 of
    `docs/COMPATIBILITY_POLICY.md` says importing a `mojoboost` submodule
    other than `basic` is not public. Either the names move into
    `mojoboost.__all__` or the policy grows an exception; until one of those

@@ -87,11 +87,12 @@ opposite direction:
                     `um.copy_staged` baseline is the output route.
 
 This direction has a failure mode the input direction does not: the kernel
-writes its accumulator with a global integer atomic, exactly as the real
-histogram kernels do, and whether a global atomic is coherent against
-host-visible memory is unverified on every backend here. A wrong answer would
-be a silently wrong histogram rather than a raise, so the checksum gate is
-load-bearing on this route in a way it is not elsewhere.
+writes its accumulator with a global integer atomic, as the atomic-strategy
+histogram kernel does with the real histogram buffer, and whether a global
+atomic is coherent against host-visible memory is unverified on every backend
+here. A wrong answer would be a silently wrong histogram rather than a raise,
+so the checksum gate is load-bearing on this route in a way it is not
+elsewhere.
 
 Modes: what the payload's lifetime looks like
 ---------------------------------------------
@@ -148,7 +149,7 @@ obligation is written down.
 Copies issued, versus copies that happened
 ------------------------------------------
 
-`copy_bytes_issued_per_round` counts the bytes *this driver* handed to
+`copy_bytes_issued_total` counts the bytes *this driver* handed to
 `enqueue_copy`. Zero there means mojoboost issued no copy. It does not mean
 no copy happened: the runtime remains free to migrate pages, blit behind the
 enqueue, or hold a second physical copy, and none of that is visible from
@@ -456,7 +457,7 @@ struct RouteResult(Copyable, Movable):
     var round_min_ns: Int
     var host_bytes: Int
     var device_bytes: Int
-    var copy_bytes_per_round: Int
+    var copy_bytes_total: Int
     var drains_per_round: Int
     var checksum: Int
     var expected: Int
@@ -487,7 +488,7 @@ struct RouteResult(Copyable, Movable):
             0,  # round_min_ns
             0,  # host_bytes
             0,  # device_bytes
-            0,  # copy_bytes_per_round
+            0,  # copy_bytes_total
             0,  # drains_per_round
             0,  # checksum
             0,  # expected
@@ -727,7 +728,7 @@ def _finish(
     retouch: FirstTouch,
     host_bytes: Int,
     device_bytes: Int,
-    copy_bytes_per_round: Int,
+    copy_bytes_total: Int,
     drains_per_round: Int,
     checksum: Int32,
     expected: Int32,
@@ -757,7 +758,7 @@ def _finish(
         phase.min_total_ns,
         host_bytes,
         device_bytes,
-        copy_bytes_per_round,
+        copy_bytes_total,
         drains_per_round,
         Int(checksum),
         Int(expected),
@@ -833,15 +834,28 @@ def _run_copy_route(
         expected = _expected_after_tag(base_sum, orig0, payload[0])
 
         var t0 = perf_counter_ns()
-        var dst = pinned.unsafe_ptr() if staged else unpinned.unsafe_ptr()
         var src = payload.unsafe_ptr()
-        if full:
-            for i in range(n):
-                dst.unsafe_store(i, src.unsafe_load(i))
-        elif touch:
-            # The whole point of the retouch round: one host byte written
-            # into memory the device has been reading for several rounds.
-            dst.unsafe_store(0, src.unsafe_load(0))
+        # The two buffers are written through their own pointers rather than
+        # through one shared local: a pinned host buffer's pointer and a
+        # heap list's pointer are different types, and the branch keeps that
+        # explicit instead of relying on them coercing.
+        if staged:
+            var dst = pinned.unsafe_ptr()
+            if full:
+                for i in range(n):
+                    dst.unsafe_store(i, src.unsafe_load(i))
+            elif touch:
+                # The whole point of the retouch round: one host byte
+                # written into memory the device has been reading for
+                # several rounds.
+                dst.unsafe_store(0, src.unsafe_load(0))
+        else:
+            var dst = unpinned.unsafe_ptr()
+            if full:
+                for i in range(n):
+                    dst.unsafe_store(i, src.unsafe_load(i))
+            elif touch:
+                dst.unsafe_store(0, src.unsafe_load(0))
         var t1 = perf_counter_ns()
 
         # A round that wrote nothing publishes nothing: on this route the
@@ -849,8 +863,11 @@ def _run_copy_route(
         # shape. A retouch round republishes, because a copy route's device
         # copy is only as fresh as its last copy.
         if full or touch:
-            ctx.enqueue_copy(dst_buf=dev, src_ptr=dst)
-            copy_bytes = n
+            if staged:
+                ctx.enqueue_copy(dst_buf=dev, src_ptr=pinned.unsafe_ptr())
+            else:
+                ctx.enqueue_copy(dst_buf=dev, src_ptr=unpinned.unsafe_ptr())
+            copy_bytes += n
         # The copy is enqueued here, not completed here. What guarantees the
         # device has the bytes is the synchronize inside `Consumer.run`, so
         # `publish_ns` on this route is enqueue cost and `sync_ns` carries
@@ -878,8 +895,6 @@ def _run_copy_route(
         if checksum != expected:
             break
 
-    var out_host = 4
-    var out_dev_bytes = 4
     return _finish(
         scope,
         route,
@@ -888,8 +903,8 @@ def _run_copy_route(
         alloc_ns,
         first,
         retouch,
-        n + out_host,
-        n + out_dev_bytes,
+        n + 4,
+        n + 4,
         copy_bytes,
         consumer.drains_per_round(),
         checksum,
@@ -1051,7 +1066,9 @@ def _run_host_direct(
         # transfer was free". Read `sync_ns` and the external capture.
         var t2 = t1
 
-        var tail = consumer.run(ctx, shared.unsafe_ptr(), scratch, plan.contend)
+        var tail = consumer.run(
+            ctx, shared.unsafe_ptr(), scratch, plan.contend
+        )
         checksum = tail.checksum
 
         if rnd == 0:
@@ -1141,9 +1158,11 @@ def _report(result: RouteResult, n_bytes: Int):
     print(p + "status:", status_name(result.status))
     if result.detail.byte_length() != 0:
         print(p + "detail:", result.detail)
-    if result.status == STATUS_UNSUPPORTED or result.status == (
-        STATUS_NOT_PROBED
-    ):
+    var measured = result.status == STATUS_OK or result.status == STATUS_WRONG
+    if not measured:
+        # `unsupported` and `not_probed` produced no measurements, so they
+        # print their status and their reason and nothing that could be
+        # mistaken for a timing.
         return
     # A `wrong` route still prints its timings, because knowing how a
     # broken route behaved is useful, but it is flagged uncomparable so no
@@ -1151,10 +1170,10 @@ def _report(result: RouteResult, n_bytes: Int):
     # comparison. A route that never published would win on every timing.
     print(p + "comparable:", 1 if result.status == STATUS_OK else 0)
     print(p + "input_route:", route_name(result.route))
-    print(
-        p + "out_route:",
-        "host_direct" if result.plan.out_shared else "copy",
-    )
+    var out_route = String("copy")
+    if result.plan.out_shared:
+        out_route = String("host_direct")
+    print(p + "out_route:", out_route)
     print(p + "mode:", _mode_name(result.plan.mode))
     print(p + "payload_bytes:", n_bytes)
     print(p + "alloc_ns:", result.alloc_ns)
@@ -1175,8 +1194,8 @@ def _report(result: RouteResult, n_bytes: Int):
     # Bytes this driver handed to enqueue_copy. Zero means mojoboost issued
     # no copy; it does not mean no copy happened, and nothing in this file
     # can tell the difference. See the module docstring.
-    print(p + "copy_bytes_issued_per_round:", result.copy_bytes_per_round)
-    print(p + "issues_copy:", 1 if result.copy_bytes_per_round > 0 else 0)
+    print(p + "copy_bytes_issued_total:", result.copy_bytes_total)
+    print(p + "issues_copy:", 1 if result.copy_bytes_total > 0 else 0)
     # Queue drains the route owed per round. Routes owing different numbers
     # bought different guarantees; the difference is reported, never netted
     # out of a comparison.
@@ -1387,7 +1406,7 @@ def main() raises:
         # every route is unavailable and says so rather than printing zeros
         # that could be mistaken for measurements.
         print("um.accelerator: absent")
-        for route in range(N_ROUTES):
+        for route in range(ROUTE_COPY_STAGED, ROUTE_WRAPPED_HOST):
             print(
                 String("um.") + route_name(route) + ".status:",
                 status_name(STATUS_UNSUPPORTED),
@@ -1396,11 +1415,18 @@ def main() raises:
                 String("um.") + route_name(route) + ".detail:",
                 "no accelerator in this build",
             )
-        print(
-            "um.out_host_direct.status:", status_name(STATUS_UNSUPPORTED)
+        print("um.out_host_direct.status:", status_name(STATUS_UNSUPPORTED))
+        print("um.out_host_direct.detail:", "no accelerator in this build")
+        # The unprobed routes stay unprobed here rather than becoming
+        # unsupported: the build having no accelerator says nothing about
+        # whether their API exists.
+        _report_not_probed(
+            String("um.") + route_name(ROUTE_WRAPPED_HOST),
+            "not compiled in this driver",
         )
-        print(
-            "um.out_host_direct.detail:", "no accelerator in this build"
+        _report_not_probed(
+            String("um.out_wrapped_host_buffer"),
+            "not compiled in this driver",
         )
         print("um.marker.end_ns:", perf_counter_ns())
     else:
@@ -1511,8 +1537,12 @@ def main() raises:
         else:
             print("um.ladder.enabled: 0")
 
-        # Kept alive to here on purpose: freeing the held buffer before the
-        # last measurement would mean the run's later routes saw a different
-        # memory state than its earlier ones.
-        _ = hold
+        # A real use of the held buffer, after the last measurement, and it
+        # is here for a reason rather than as a formality: Mojo destroys a
+        # value at its last use, so without a use down here the held buffer
+        # would be freed right after the memset that created it and the run's
+        # later routes would see a different memory state than its earlier
+        # ones, which is the opposite of what holding it is for.
+        ctx.enqueue_memset(hold, UInt8(0))
+        ctx.synchronize()
         print("um.marker.end_ns:", perf_counter_ns())

@@ -56,6 +56,17 @@ keywords = [
 # interpreter by tag before `requires-python` is consulted. A capped
 # `<3.15` would add nothing and would have to be edited on every release
 # the toolchain permits.
+#
+# The value itself is under review and is not settled. docs/PYTHON_SUPPORT.md
+# is the authority: it finds that the pinned toolchain publishes builds for
+# CPython 3.10 through 3.14 and that this project pinned none of them, so
+# 3.14 is the interpreter the solver chose rather than one the toolchain
+# requires. It stays here until the experiment in section 10 of that
+# document has run. Do not lower it on the strength of the audit alone.
+#
+# The per-minor classifier rows below move with it. Every minor version at
+# or above the floor gets a row and no excluded version gets one;
+# tools/audit_python_compat.py fails on a mismatch in either direction.
 
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -78,7 +89,16 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
-# Not claimed, and why:
+# Every classifier above was checked against PyPI's registered list at
+# https://pypi.org/pypi?%3Aaction=list_classifiers and all ten appear in
+# it. This matters more than it looks: PyPI rejects an unregistered
+# classifier at upload time, which is after a version number has been
+# committed to and can never be reused. `twine check` in the preflight of
+# docs/PYPI_RELEASE.md is what re-checks it before every release.
+#
+# Not claimed, and why. All four exist as registered classifiers, so each
+# is a decision not to make a claim rather than an option that was
+# unavailable:
 #   License :: ...            PEP 639 forbids a license classifier
 #                             alongside the `license` expression above,
 #                             and setuptools>=77 rejects the combination.

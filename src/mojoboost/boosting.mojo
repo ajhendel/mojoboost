@@ -50,7 +50,13 @@ from .goss import (
     goss_select,
 )
 from .monotone import MonotoneConstraints
+from .sampling import (
+    ClassBaggingParams,
+    has_positive_rows,
+    refresh_class_bag,
+)
 from .tree import Tree, TreeParams, grow_tree, node_bounds
+from .tree_parameters_extra import ExtraTreeParams, finish_leaf_output
 
 comptime SQUARED_ERROR = 0
 comptime BINARY_LOGISTIC = 1
@@ -254,6 +260,43 @@ def _check_goss(goss: GossParams, bagging: BaggingParams) raises:
     goss.validate()
     if goss.enabled and bagging_enabled(bagging):
         raise Error("goss and bagging cannot both be enabled")
+
+
+def _check_class_bagging(
+    class_bagging: ClassBaggingParams,
+    bagging: BaggingParams,
+    goss: GossParams,
+    objective: Int,
+) raises:
+    """Validate class-conditional bagging and reject it where LightGBM does
+    not apply it.
+
+    LightGBM's balanced bagging is a binary-classification feature and its
+    `pos_bagging_fraction`/`neg_bagging_fraction` are read only there; it also
+    owns the row list a tree is grown on, so it cannot share a run with
+    uniform bagging or with GOSS. LightGBM ignores the settings in those
+    cases. mojoboost raises instead, on the same reasoning as `_check_goss`:
+    a configuration that would quietly drop half of itself is reported.
+    """
+    class_bagging.validate()
+    if not class_bagging.enabled():
+        return
+    if bagging_enabled(bagging):
+        raise Error(
+            "pos_bagging_fraction/neg_bagging_fraction and bagging_fraction"
+            " cannot both be enabled; both own the row list a tree is grown"
+            " on"
+        )
+    if goss.enabled:
+        raise Error(
+            "pos_bagging_fraction/neg_bagging_fraction and goss cannot both"
+            " be enabled; both own the row list a tree is grown on"
+        )
+    if objective != BINARY_LOGISTIC:
+        raise Error(
+            "pos_bagging_fraction/neg_bagging_fraction apply to binary"
+            " classification only, as in LightGBM"
+        )
 
 
 def objective_renews_leaves(objective: Int) -> Bool:
@@ -590,6 +633,7 @@ def _renew_leaf_values(
     alpha: Float64,
     bag: List[Int] = [],
     monotone: List[Int] = [],
+    extra: ExtraTreeParams = ExtraTreeParams(),
 ) raises:
     """LightGBM's RenewTreeOutput for QUANTILE and L1: replace each leaf's
     Newton value with the alpha-percentile of the residuals
@@ -601,9 +645,29 @@ def _renew_leaf_values(
 
     A non-empty `monotone` clamps every renewed value back into its leaf's
     monotone interval, without which renewal would discard the constraint the
-    tree was grown under (see monotone.mojo)."""
+    tree was grown under (see monotone.mojo).
+
+    `extra` carries `max_delta_step` and `path_smooth`, which apply to a
+    renewed value as they do to a grown one: renewal replaces the Newton step
+    with a percentile, and without this the two objectives that renew would
+    be the only ones to escape the cap and the smoothing the caller asked
+    for. The parent's output is the value its node still carries -- renewal
+    rewrites leaves only, so an internal node holds the finished value it was
+    grown with. The bundle defaults to inactive, so a caller that does not
+    pass one renews exactly as before."""
     var n_nodes = len(tree.feature)
     var bounds = node_bounds(tree, monotone)
+    var finish = extra.needs_leaf_finish()
+    # Built before any leaf is rewritten, though renewal touches leaves only
+    # and every parent is internal, so the two orders agree.
+    var parent_output = List[Float64](capacity=n_nodes)
+    parent_output.resize(n_nodes, 0.0)
+    if finish:
+        for node in range(n_nodes):
+            if tree.feature[node] < 0:
+                continue
+            parent_output[tree.left[node]] = tree.value[node]
+            parent_output[tree.right[node]] = tree.value[node]
     var leaf_residuals = List[List[Float64]]()
     var leaf_weights = List[List[Float64]]()
     for _ in range(n_nodes):
@@ -626,6 +690,14 @@ def _renew_leaf_values(
             )
         else:
             renewed = _percentile(leaf_residuals[node], alpha)
+        if finish:
+            renewed = finish_leaf_output(
+                renewed,
+                extra.max_delta_step,
+                extra.path_smooth,
+                len(leaf_residuals[node]),
+                parent_output[node],
+            )
         if len(bounds) > 0:
             renewed = bounds[node].clamp(renewed)
         tree.value[node] = renewed
@@ -856,6 +928,7 @@ def _boost_rounds(
     round_offset: Int,
     mut raw: List[Float64],
     mut trees: List[Tree],
+    class_bagging: ClassBaggingParams = ClassBaggingParams.disabled(),
 ) raises:
     """Grow `params.n_estimators` trees, appending them to `trees` and
     keeping `raw` (the raw score of every training row) in step.
@@ -867,6 +940,14 @@ def _boost_rounds(
     so continued rounds draw what they would have drawn had the whole run
     been one call. `learning_rate` is passed rather than read from `params`
     because a continued run shrinks with the ensemble's rate.
+
+    `class_bagging` replaces the uniform bag with LightGBM's balanced one
+    (see sampling.mojo). It produces the same shape -- one ascending,
+    duplicate-free row list per bag -- so nothing downstream of the draw
+    changes: the same histograms, `min_data_in_leaf` counts, leaf values, and
+    score updates follow. The caller validates it with
+    `_check_class_bagging`, which is also what makes it exclusive with the
+    other two samplers.
     """
     var n = data.n_rows
     var signs = params.tree.monotone.active_signs()
@@ -876,9 +957,17 @@ def _boost_rounds(
     var grad = List[Float64](capacity=n)
     var hess = List[Float64](capacity=n)
     var bag = List[Int]()
+    # LightGBM turns balanced bagging on only when the dataset holds a
+    # positive row, and falls back to plain `bagging_fraction` when it does
+    # not. The label pass is one sweep and the labels do not change, so the
+    # gate is hoisted out of the round loop.
+    var balanced = class_bagging.enabled() and has_positive_rows(target)
     for i in range(params.n_estimators):
         var round = round_offset + i
-        refresh_bag(bag, bagging, n, round)
+        if balanced:
+            refresh_class_bag(bag, class_bagging, target, round)
+        else:
+            refresh_bag(bag, bagging, n, round)
         _fill_grad_hess(
             raw, target, objective, sample_weight, alpha, grad, hess
         )
@@ -886,16 +975,17 @@ def _boost_rounds(
         var tree = grow_tree(data, grad, hess, params.tree, bag, round)
         if renews:
             _renew_leaf_values(
-                tree, data, target, raw, renew_w, renew_a, bag, signs
+                tree, data, target, raw, renew_w, renew_a, bag, signs,
+                params.tree.extra,
             )
 
         # A single-leaf tree with a near-zero value means the objective has
-        # converged; further rounds cannot make progress. Under bagging or
-        # GOSS one such tree only says this sample had nothing to give
+        # converged; further rounds cannot make progress. Under any row
+        # sampler one such tree only says this sample had nothing to give
         # (every sampled row zero-weight, say), so the round is skipped and
         # the next sample gets its turn.
         if tree.n_leaves == 1 and abs(tree.value[0]) < 1e-12:
-            if bagging_enabled(bagging) or goss.enabled:
+            if bagging_enabled(bagging) or goss.enabled or balanced:
                 continue
             break
 
@@ -914,6 +1004,7 @@ def train(
     bagging: BaggingParams = BaggingParams.disabled(),
     goss: GossParams = GossParams.disabled(),
     init_score: List[Float64] = [],
+    class_bagging: ClassBaggingParams = ClassBaggingParams.disabled(),
 ) raises -> Booster:
     """Train a boosted ensemble. `target` is the regression target for
     SQUARED_ERROR, HUBER, QUANTILE, and L1, {0, 1} labels for
@@ -927,6 +1018,10 @@ def train(
     on a gradient-based sample instead (see goss.mojo), which the same row
     list carries; the two samplers are mutually exclusive.
 
+    `class_bagging` is LightGBM's balanced bagging: positive and negative
+    rows are kept at their own rates (see sampling.mojo). It applies to
+    BINARY_LOGISTIC alone and is exclusive with the other two samplers.
+
     A non-empty `init_score` starts boosting from those raw scores instead
     of from the objective's own base score, LightGBM's `init_score`. The
     offset is training state, not model state: the returned ensemble has a
@@ -938,6 +1033,7 @@ def train(
     _check_sample_weight(sample_weight, data.n_rows)
     check_bagging(bagging)
     _check_goss(goss, bagging)
+    _check_class_bagging(class_bagging, bagging, goss, objective)
     params.tree.monotone.check_features(data.n_features)
     if len(init_score) != 0 and len(init_score) != data.n_rows:
         raise Error("init_score length must equal n_rows")
@@ -967,6 +1063,7 @@ def train(
         0,
         raw,
         trees,
+        class_bagging,
     )
 
     return Booster(
@@ -988,6 +1085,7 @@ def train_more(
     bagging: BaggingParams = BaggingParams.disabled(),
     goss: GossParams = GossParams.disabled(),
     init_score: List[Float64] = [],
+    class_bagging: ClassBaggingParams = ClassBaggingParams.disabled(),
 ) raises -> Int:
     """Append `params.n_estimators` more trees to a fitted ensemble and
     return how many were actually added.
@@ -1034,6 +1132,7 @@ def train_more(
     _check_sample_weight(sample_weight, data.n_rows)
     check_bagging(bagging)
     _check_goss(goss, bagging)
+    _check_class_bagging(class_bagging, bagging, goss, booster.objective)
     params.tree.monotone.check_features(data.n_features)
 
     var n = data.n_rows
@@ -1068,6 +1167,7 @@ def train_more(
         len(booster.trees),
         raw,
         grown,
+        class_bagging,
     )
     var added = len(grown)
     for i in range(added):
@@ -1088,6 +1188,7 @@ def train_with_valid(
     alpha: Float64 = 0.9,
     bagging: BaggingParams = BaggingParams.disabled(),
     goss: GossParams = GossParams.disabled(),
+    class_bagging: ClassBaggingParams = ClassBaggingParams.disabled(),
 ) raises -> Booster:
     """Train with validation-set early stopping. Stops when the validation
     loss (MSE / log loss / huber / pinball / MAE) has not improved by more
@@ -1097,7 +1198,9 @@ def train_with_valid(
     samples training rows per tree (see bagging.mojo); validation rows are
     never bagged, so the early-stopping signal stays out of sample. `goss`
     samples training rows by gradient magnitude instead (see goss.mojo) and
-    leaves the validation loss untouched in the same way."""
+    leaves the validation loss untouched in the same way. `class_bagging`
+    (see sampling.mojo) is a third, exclusive training-row sampler and is
+    likewise never applied to the validation rows."""
     if len(target) != data.n_rows:
         raise Error("target length must equal n_rows")
     if len(valid_target) != valid_data.n_rows:
@@ -1110,6 +1213,7 @@ def train_with_valid(
     _check_sample_weight(sample_weight, data.n_rows)
     check_bagging(bagging)
     _check_goss(goss, bagging)
+    _check_class_bagging(class_bagging, bagging, goss, objective)
     params.tree.monotone.check_features(data.n_features)
 
     var n = data.n_rows
@@ -1131,8 +1235,12 @@ def train_with_valid(
     var best_loss = _mean_loss(valid_raw, valid_target, objective, alpha)
     var best_n_trees = 0
     var bag = List[Int]()
+    var balanced = class_bagging.enabled() and has_positive_rows(target)
     for i in range(params.n_estimators):
-        refresh_bag(bag, bagging, n, i)
+        if balanced:
+            refresh_class_bag(bag, class_bagging, target, i)
+        else:
+            refresh_bag(bag, bagging, n, i)
         _fill_grad_hess(
             raw, target, objective, sample_weight, alpha, grad, hess
         )
@@ -1140,12 +1248,13 @@ def train_with_valid(
         var tree = grow_tree(data, grad, hess, params.tree, bag, i)
         if renews:
             _renew_leaf_values(
-                tree, data, target, raw, renew_w, renew_a, bag, signs
+                tree, data, target, raw, renew_w, renew_a, bag, signs,
+                params.tree.extra,
             )
-        # Under bagging or GOSS a degenerate tree indicts the sample, not
+        # Under any row sampler a degenerate tree indicts the sample, not
         # the run.
         if tree.n_leaves == 1 and abs(tree.value[0]) < 1e-12:
-            if bagging_enabled(bagging) or goss.enabled:
+            if bagging_enabled(bagging) or goss.enabled or balanced:
                 continue
             break
 

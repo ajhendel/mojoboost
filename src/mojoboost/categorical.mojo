@@ -48,6 +48,11 @@ Partition search
   as they are there.
 - L1 regularization soft-thresholds every gradient sum here exactly as it
   does in the numerical scan; both go through `gain.mojo`.
+- The gain floor (`min_gain_to_split`), the per-feature gain multipliers
+  (`feature_contri`), and the CEGB split cost are *not* applied here. They
+  are charged once per feature by `split.find_best_split`, on the winning
+  partition's gain exactly as on a numerical candidate's, so the two kinds of
+  candidate still compete on equal footing.
 
 Intentional differences from LightGBM
 -------------------------------------
@@ -75,7 +80,6 @@ from .metrics import _argsort
 # asks for exactly this substitution, and no parameter moves with it -- this
 # module still owns every categorical hyperparameter.
 from .tree_parameters_extra import (
-    cat_effective_l2,
     cat_enters_search,
     cat_partition_gain,
     cat_side_cap,
@@ -421,7 +425,8 @@ def _sorted_search(
     for i in range(used):
         sorted_bins.append(candidates[order[i]])
 
-    var l2 = cat_effective_l2(lambda_reg, cat.cat_l2)
+    # The children's L2 term is `cat_effective_l2(lambda_reg, cat.cat_l2)`,
+    # applied inside `cat_partition_gain` below.
     var max_num_cat = cat_side_cap(used, cat.max_cat_threshold)
 
     for d in range(2):
@@ -454,10 +459,15 @@ def _sorted_search(
             cnt_cur_group = 0
 
             var right_g = total_g - left_g
-            var gain = (
-                leaf_score(left_g, left_h, lambda_l1, l2)
-                + leaf_score(right_g, right_h, lambda_l1, l2)
-                - parent_score
+            var gain = cat_partition_gain(
+                left_g,
+                left_h,
+                right_g,
+                right_h,
+                lambda_l1,
+                lambda_reg,
+                cat.cat_l2,
+                parent_score,
             )
             if gain > best.gain:
                 var bitset = cat_empty()

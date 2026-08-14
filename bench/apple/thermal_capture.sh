@@ -77,6 +77,8 @@ OUT_DIR="${HERE}/thermal_results"
 RUN_ID=""
 INTERVAL_MS=200
 DURATION_OVERRIDE=""
+BASELINE_OVERRIDE=""
+COOLDOWN_CEILING_OVERRIDE=""
 WORKLOAD="w2_medium_dense"
 DEVICE="cpu"
 THREADS=""
@@ -106,10 +108,14 @@ usage() {
 # Shell-quote a command so the printed plan can be copied without a reader
 # having to guess where a word ends.
 quote_cmd() {
-    local out="" arg quoted
+    local out="" arg esc
     for arg in "$@"; do
-        printf -v quoted '%q' "$arg"
-        out+="${quoted} "
+        if [[ "$arg" =~ ^[A-Za-z0-9_@%+=:,./-]+$ ]]; then
+            out+="${arg} "
+        else
+            esc="${arg//\'/\'\\\'\'}"
+            out+="'${esc}' "
+        fi
     done
     printf '%s' "${out% }"
 }
@@ -135,14 +141,36 @@ phase_index() {
     return 1
 }
 
+# The window a phase would run for. --duration applies to the load phases
+# only. Widening the idle baseline or the cooldown ceiling with the same flag
+# would silently change what the baseline is a baseline of, so those have
+# their own options.
 phase_window() {
     local idx
     idx="$(phase_index "$1")" || return 1
-    if [[ -n "$DURATION_OVERRIDE" && "${PHASE_WINDOWS[$idx]}" != "0" ]]; then
-        printf '%s' "$DURATION_OVERRIDE"
-    else
-        printf '%s' "${PHASE_WINDOWS[$idx]}"
-    fi
+    case "$1" in
+        sustained|throttle_probe)
+            printf '%s' "${DURATION_OVERRIDE:-${PHASE_WINDOWS[$idx]}}" ;;
+        idle_baseline)
+            printf '%s' "${BASELINE_OVERRIDE:-${PHASE_WINDOWS[$idx]}}" ;;
+        cooldown_recovery)
+            printf '%s' "${COOLDOWN_CEILING_OVERRIDE:-${PHASE_WINDOWS[$idx]}}" ;;
+        *)
+            printf '%s' "${PHASE_WINDOWS[$idx]}" ;;
+    esac
+}
+
+# Selected phases, in the protocol's order rather than the order they were
+# typed. The order matters: an idle baseline taken after the workload is a
+# baseline of a machine the run just heated, which is the defect this
+# repository's benchmark lane already had to fix once.
+canonical_order() {
+    local id
+    for id in "${PHASE_IDS[@]}"; do
+        if in_list "$id" "${SELECTED_PHASES[@]:-}"; then
+            printf '%s\n' "$id"
+        fi
+    done
 }
 
 need_value() {
@@ -178,6 +206,18 @@ while [[ $# -gt 0 ]]; do
             [[ "$2" -ge 60 ]] || die "--duration below 60 s cannot fill one $BUCKET_SECONDS s bucket"
             [[ "$2" -le 14400 ]] || die "--duration above 14400 s is refused; split the run instead"
             DURATION_OVERRIDE="$2"; shift 2 ;;
+        --baseline-seconds)
+            need_value "$1" "${2:-}"
+            is_uint "$2" || die "--baseline-seconds must be a whole number of seconds"
+            [[ "$2" -ge 10 ]] || die "--baseline-seconds below 10 is too few samples to be a baseline"
+            [[ "$2" -le 1800 ]] || die "--baseline-seconds above 1800 is refused"
+            BASELINE_OVERRIDE="$2"; shift 2 ;;
+        --cooldown-ceiling)
+            need_value "$1" "${2:-}"
+            is_uint "$2" || die "--cooldown-ceiling must be a whole number of seconds"
+            [[ "$2" -ge 60 ]] || die "--cooldown-ceiling below 60 s cannot observe a recovery"
+            [[ "$2" -le 7200 ]] || die "--cooldown-ceiling above 7200 s is refused"
+            COOLDOWN_CEILING_OVERRIDE="$2"; shift 2 ;;
         --interval-ms)
             need_value "$1" "${2:-}"
             is_uint "$2" || die "--interval-ms must be a whole number of milliseconds"
@@ -325,11 +365,18 @@ if [[ "$SELF_CHECK" -eq 1 ]]; then
         note "jq not installed; schema was not parsed, only searched"
     fi
 
-    # 6. This script has no path that runs a privileged command.
-    if grep -nE '^[^#]*\bsudo\b' "${BASH_SOURCE[0]}" | grep -qv 'quote_cmd'; then
-        fail "a sudo invocation reachable outside quote_cmd exists in this script"
+    # 6. This script has no path that runs a privileged or sampling command.
+    #    The patterns look for a command position, meaning the start of a line
+    #    or immediately after a separator, so that the word appearing inside a
+    #    string, a comment, or an emit_priv argument is not a hit. Anything
+    #    this script prints goes through emit_cmd or emit_priv and can never
+    #    be in command position.
+    priv_pattern='(^|[;&|(`]|\$\()[[:space:]]*(sudo|powermetrics|pmset|caffeinate|yes)[[:space:]]'
+    if grep -nE "$priv_pattern" "${BASH_SOURCE[0]}" | grep -v '^[0-9]*: *#' | grep -q .; then
+        fail "a privileged or sampling command appears in command position:"
+        grep -nE "$priv_pattern" "${BASH_SOURCE[0]}" | grep -v '^[0-9]*: *#' || true
     else
-        note "no reachable sudo invocation; privileged commands are printed only"
+        note "no sampler or privileged command in command position; they are printed only"
     fi
 
     printf '\n'
@@ -347,6 +394,12 @@ fi
 if [[ "${#SELECTED_PHASES[@]}" -eq 0 ]]; then
     SELECTED_PHASES=(idle_baseline cold_fit warm_fit repeat_series sustained background_control)
 fi
+
+ORDERED_PHASES=()
+while IFS= read -r ordered_id; do
+    ORDERED_PHASES+=("$ordered_id")
+done < <(canonical_order)
+SELECTED_PHASES=("${ORDERED_PHASES[@]}")
 
 # Cross-argument validation. These are the combinations that produce a record
 # nobody can use, and they are refused at plan time rather than discovered
@@ -533,11 +586,15 @@ for p in "${SELECTED_PHASES[@]}"; do
             emit "    recover before the ceiling is a result, recorded in stopping_rule."
             ;;
         background_control)
-            emit "    deliberate competing load, declared in the record:"
-            emit_cmd sh -c 'yes > /dev/null &'
+            emit "    deliberate competing load, declared in the record. One busy core"
+            emit "    is enough to move a histogram timing, and this form is stoppable"
+            emit "    by pid rather than by a pattern match over every process on the"
+            emit "    machine, which is why it is written this way:"
+            emit_cmd sh -c 'yes > /dev/null & echo $! > /tmp/mojoboost_thermal_load.pid'
             emit "    then re-run the idle gate. It MUST fail. A gate that passes here"
             emit "    proves nothing about any other phase in this record."
-            emit_cmd pkill -f 'yes'
+            emit_cmd sh -c 'kill "$(cat /tmp/mojoboost_thermal_load.pid)"'
+            emit_cmd rm -f /tmp/mojoboost_thermal_load.pid
             ;;
         cold_fit|warm_fit|repeat_series|sustained|throttle_probe)
             case "$p" in

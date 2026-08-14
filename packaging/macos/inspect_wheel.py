@@ -423,9 +423,18 @@ def inspect(path: Path, rep: Report) -> dict:
                         required.add(base)
                     else:
                         unresolved.append(f"{name[len(pkg):]} needs {dep}")
-        rep.check("C4", not unresolved,
-                  f"every @rpath or @loader_path dependency is bundled: "
-                  f"{unresolved or 'yes'}")
+        rep.check(
+            "C4",
+            not unresolved,
+            f"every @rpath or @loader_path dependency is bundled: "
+            f"{unresolved or 'yes'}",
+            ["One dependency must never be resolved by bundling it: libpython.",
+             "A CPython extension resolves the interpreter's symbols from the",
+             "running process, and shipping a second copy of libpython in the",
+             "wheel gives the process two of them. If libpython appears here,",
+             "the fix is at the link step, not in the .dylibs directory."]
+            if any("python" in u.lower() for u in unresolved) else [],
+        )
 
         unused = sorted(set(bundled) - required)
         rep.check(
@@ -465,9 +474,19 @@ def inspect(path: Path, rep: Report) -> dict:
             print("  dyld's search order and it has not been verified for this")
             print("  wheel; the clean-install fixture is what settles it.")
 
-        # C7. Install names.
+        # C7. Install names, for the bundled libraries only. The extension is
+        # loaded by dlopen and nothing resolves it through its own LC_ID_DYLIB,
+        # so an absolute id there is a leaked path rather than a broken load;
+        # C8 is what catches it. For a dylib the id is what every dependent
+        # object recorded, so an absolute one is a load failure waiting for a
+        # different machine.
         bad_ids = []
         for name, info in parsed.items():
+            if name == ext_name:
+                iname = info["install_name"]
+                if iname:
+                    print(f"\n  note: the extension declares an install name: {iname}")
+                continue
             iname = info["install_name"]
             if iname and (iname.startswith("/") or any(
                     m.decode() in iname for m in BUILD_HOST_MARKERS)):
