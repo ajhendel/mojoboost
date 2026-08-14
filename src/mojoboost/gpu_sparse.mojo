@@ -151,6 +151,8 @@ from .gpu_objectives_native import device_fixed_scale
 from .gpu_sparse_layout import (
     DEFAULT_MAX_NODES,
     SPARSE_MAX_BINS,
+    SPARSE_REDUCE_MAX_THREADS,
+    SPARSE_SCAN_MAX_THREADS,
     SparseDeviceLayout,
     SparseRangeTable,
     check_categorical_support,
@@ -169,20 +171,25 @@ from .sparse import SparseBinnedMatrix
 
 comptime MAX_BINS = SPARSE_MAX_BINS
 
-# The scan buffers hold one Int32 per thread, so the block size the
-# segmented partition can be launched with is bounded by the allocation
-# rather than by the device maximum, exactly as in `gpu_active_rows.mojo`.
-# One Int32 per thread is 4 KB at this bound, which every backend holds.
-comptime SCAN_MAX_THREADS = 1024
-
+# The scan buffers hold one Int32 per thread, so the block size the segmented
+# partition can be launched with is bounded by the allocation rather than by
+# the device maximum, exactly as in `gpu_active_rows.mojo`. One Int32 per
+# thread is 4 KB at this bound, the widest request this module makes.
+#
 # The two reducing kernels (node totals, default-bin completion) keep *three*
 # Int32 planes per thread, so the same 1024 bound would ask for 12 KB of
 # shared memory per threadgroup. That is most of the 16 KB a conservatively
 # reported device offers (`gpu_tiling.FALLBACK_SHARED_MEMORY_PER_BLOCK`), and
 # it would throttle occupancy everywhere else for no gain: both kernels are
-# launched at the derived block size, which targets 256. Bounding the
+# launched at the derived block size, which targets 256. Bounding their
 # allocation at 256 costs nothing and keeps the request at 3 KB.
-comptime REDUCE_MAX_THREADS = 256
+#
+# Both bounds are defined in `gpu_sparse_layout.mojo` and only aliased here,
+# so `sparse_kernel_shared_bytes` -- the figure `sparse_support` clears a
+# device against -- is computed from the same numbers these kernels allocate
+# with. A local redefinition is exactly how that check would rot.
+comptime SCAN_MAX_THREADS = SPARSE_SCAN_MAX_THREADS
+comptime REDUCE_MAX_THREADS = SPARSE_REDUCE_MAX_THREADS
 
 # Threadgroups per multiprocessor the node-total reduction is capped at.
 # Enough waves to saturate the device, few enough that the three output cells

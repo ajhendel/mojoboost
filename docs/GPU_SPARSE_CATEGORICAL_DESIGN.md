@@ -150,6 +150,38 @@ by far (the default one) is never touched by the accumulation at all. It is
 filled once, in a separate reducing kernel. A partial-buffer variant is
 a measurement away, not a design change.
 
+### Launch geometry constraints
+
+Three constraints the kernels impose on their launchers, all enforced by
+`GpuSparseHistogramBuilder` and all easy to get wrong from a second caller.
+
+* The two reducing kernels (node totals, default-bin completion) keep three
+  Int32 planes per thread in shared memory and are sized for
+  `REDUCE_MAX_THREADS = 256`. At the 1024 the partition uses, the request
+  would be 12 KB per threadgroup, which is most of what a conservatively
+  reported device offers, so both are clamped.
+* A device is cleared against `sparse_kernel_shared_bytes`, the largest
+  request any of the four kernels makes, **not** against
+  `gpu_tiling.shared_bytes_for(n_bins)`. The latter is the wrong figure twice
+  over: a `stack_allocation` takes a compile-time extent, so the accumulation
+  kernel asks for `3 * 256` Int32 whatever `n_bins` is (192 bytes claimed
+  against 3072 actual at `n_bins = 16`), and the entry partition asks for
+  more than any of them with a size that does not depend on `n_bins` at all.
+  Both bounds are defined in `gpu_sparse_layout.mojo` and aliased into
+  `gpu_sparse.mojo`, so the check and the allocations cannot read different
+  numbers.
+* The totals kernel writes three cells and nothing else, so its block count
+  *is* the atomic contention on those cells. It is capped at a few waves
+  (`TOTALS_BLOCKS_PER_SM`) and each thread walks the row range with a grid
+  stride, which is exact whatever order it covers rows in. The kernel takes
+  the block count as an argument for that reason and must be launched with
+  exactly that many blocks.
+* The default-bin completion runs one threadgroup per active slot, not one
+  thread. A thread-per-feature version issues every one of its
+  `n_slots * 3 * n_bins` loads from a single thread at a stride of `n_bins`,
+  entirely uncoalesced, and on the wide data this path exists for that can
+  cost more than the accumulation it completes.
+
 ### Known weakness: uneven columns
 
 `grid.y` is uniform across `grid.x`, so the tile count is derived from the
@@ -157,6 +189,13 @@ largest active feature's entry window
 (`SparseRangeTable.max_entries`). A feature with far fewer entries leaves its
 tail tiles with nothing to do. The waste is proportional to how uneven the
 column occupancies are and it is the first thing to profile on real data.
+
+The entry partition has the matching weakness: it launches one threadgroup
+per feature at every split, including the many features with no entries in
+that node at all, which read two Int32 and write five. Both are the price of
+a uniform per-feature grid and both are fixable by the same change, an
+entry-major grid with a feature lookup, which is not measured and so is not
+made.
 
 ## 5. Applying a split
 
@@ -366,8 +405,17 @@ The measurements a policy needs, in order:
    case.
 5. **Whole-training wall clock**, not per-node, because the once-per-session
    upload and the per-split partitions are not in the per-node number.
+6. **The geometry constants this lane picked without measuring.**
+   `TOTALS_BLOCKS_PER_SM` (the node-total reduction's block cap) and
+   `REDUCE_MAX_THREADS` (the reducing kernels' block size) were chosen to
+   match the conventions already in `gpu_tiling.mojo`, not from a
+   measurement. Neither can change a result, so neither is urgent, but both
+   are knobs and should be swept once there is a harness to sweep them with.
+   The rest of the launch geometry is not in this category: coalescing the
+   default-bin read and capping the totals grid have no crossover to find,
+   which is why they were changed without a measurement.
 
-Only after 1 through 5 does a threshold belong anywhere, and it belongs in a
+Only after 1 through 6 does a threshold belong anywhere, and it belongs in a
 policy module with the measurements cited, not in these primitives.
 
 ## 11. Unsupported combinations, explicitly
@@ -379,7 +427,7 @@ drops a feature.
 | --- | --- |
 | more than 256 bins | `sparse_support` |
 | more rows, features, or entries than an Int32 index holds | `sparse_support` |
-| device shared memory too small for one `n_bins` histogram | `sparse_support` |
+| device shared memory too small for this module's widest kernel | `sparse_support` |
 | a categorical feature with at least `n_bins` categories | `check_categorical_support` |
 | a categorical feature with more than 255 categories | `check_categorical_support` |
 | a categorical feature reserving a missing bin | `check_sparse_categorical_semantics` |

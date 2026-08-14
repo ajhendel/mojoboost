@@ -95,6 +95,52 @@ comptime BYTES_SIDE = 1
 comptime DEFAULT_MAX_NODES = 2048
 
 
+# --- Kernel block sizes and their shared-memory cost ----------------------
+#
+# The bounds live here rather than in `gpu_sparse.mojo` because they are what
+# the support check has to reason about, and a support check that reads
+# different numbers from the kernels it is clearing would be worse than no
+# check at all. `gpu_sparse.mojo` defines its local names from these.
+
+# The segmented entry partition keeps one Int32 per thread.
+comptime SPARSE_SCAN_MAX_THREADS = 1024
+
+# The two reducing kernels (node totals, default-bin completion) keep three
+# Int32 planes per thread, so the same 1024 bound would ask for 12 KB per
+# threadgroup. See `sparse_kernel_shared_bytes`.
+comptime SPARSE_REDUCE_MAX_THREADS = 256
+
+
+def sparse_kernel_shared_bytes(n_bins: Int) -> Int:
+    """The largest shared-memory request any kernel in this module makes.
+
+    Not `gpu_tiling.shared_bytes_for(n_bins)`, which is what the dense tiling
+    policy uses, and which is the wrong figure here for two reasons:
+
+    - it scales with `n_bins`, but a `stack_allocation` takes a *compile-time*
+      extent, so the accumulation kernel asks for `3 * SPARSE_MAX_BINS`
+      Int32 whatever `n_bins` turns out to be. At `n_bins = 16` the policy
+      figure is 192 bytes and the real request is 3072;
+    - it describes the accumulation kernel only, and the entry partition asks
+      for more than any of them (`SPARSE_SCAN_MAX_THREADS` Int32), with a
+      size that does not depend on `n_bins` at all.
+
+    Taking the maximum at runtime rather than folding it into a `comptime`
+    keeps it honest if any one of the three bounds is later changed alone.
+    """
+    var most = shared_bytes_for(n_bins)
+    var accumulation = 3 * SPARSE_MAX_BINS * BYTES_INDEX
+    if accumulation > most:
+        most = accumulation
+    var reduction = 3 * SPARSE_REDUCE_MAX_THREADS * BYTES_INDEX
+    if reduction > most:
+        most = reduction
+    var partition = SPARSE_SCAN_MAX_THREADS * BYTES_INDEX
+    if partition > most:
+        most = partition
+    return most
+
+
 # --- Hard support limits --------------------------------------------------
 #
 # These are the combinations the device path cannot express at all, as
@@ -127,7 +173,9 @@ def sparse_support_name(reason: Int) -> String:
     if reason == SPARSE_TOO_MANY_FEATURES:
         return String("more features than an Int32 index holds")
     if reason == SPARSE_SHARED_MEMORY:
-        return String("device shared memory too small for one histogram")
+        return String(
+            "device shared memory too small for this module's widest kernel"
+        )
     if reason == SPARSE_EMPTY:
         return String("empty matrix")
     if reason == SPARSE_CATEGORIES_EXCEED_BINS:
@@ -161,7 +209,7 @@ def sparse_support(
     # is an Int32 like every other offset.
     if nnz < 0 or nnz >= SPARSE_MAX_INDEX:
         return SPARSE_TOO_MANY_ENTRIES
-    if shared_bytes_for(n_bins) > caps.max_shared_memory_per_block:
+    if sparse_kernel_shared_bytes(n_bins) > caps.max_shared_memory_per_block:
         return SPARSE_SHARED_MEMORY
     return SPARSE_OK
 

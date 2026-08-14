@@ -29,14 +29,45 @@ these three files first for that reason.
 Every cross-file claim below was checked against the working tree rather than
 recalled. Line numbers are from the tree as of this lane.
 
-One checkout note. This round shares a checkout across lanes, and a
-concurrent integration commit (`b04b5f0`) picked up
-`gpu_sparse_layout.mojo`, `gpu_sparse.mojo`, `gpu_categorical.mojo`, and
-`docs/GPU_SPARSE_CATEGORICAL_DESIGN.md` at an intermediate state. The final
-state of this lane is the working tree, which carries a small uncommitted
-diff on the first two files (a borrow-safety refactor of the zeroing helper
-and of two `self.method(self.field)` call sites). Read the working tree, not
-`b04b5f0`.
+One checkout note. This round shares a checkout across lanes, so these files
+were swept into two concurrent integration commits while the lane was still
+working: `b04b5f0` captured them at an intermediate state and `ca4692e`
+captured the finished one. **Read `ca4692e` or later, never `b04b5f0`.** What
+landed between the two is not cosmetic; it is six fixes found in review after
+the first commit:
+
+1. borrow safety: the zeroing helper became a free function and two
+   `self.method(self.field)` call sites were split, since both borrow `self`
+   twice;
+2. the two reducing kernels were bounded at `REDUCE_MAX_THREADS = 256`
+   instead of 1024. At 1024 they asked for 12 KB of shared memory per
+   threadgroup, most of what a conservatively reported device offers. The
+   follow-through matters as much as the clamp: `sparse_support` was clearing
+   devices against `gpu_tiling.shared_bytes_for(n_bins)`, which is neither
+   the right kernel nor the right size (a `stack_allocation` extent is
+   compile-time, so the accumulation kernel wants `3 * 256` Int32 at every
+   `n_bins`, and the entry partition wants more still). A device with under
+   4 KB of shared memory passed the check and would have failed at launch.
+   `sparse_kernel_shared_bytes` now takes the max over all four kernels, and
+   the two block-size bounds moved into `gpu_sparse_layout.mojo` so the check
+   and the allocations read the same constants. The dense path has the same
+   bug and was left alone because it is another lane's file; section 4.6 is
+   the write-up;
+3. the default-bin completion became one threadgroup per active slot instead
+   of one thread, which turns `n_slots * 3 * n_bins` single-thread strided
+   loads into coalesced block reductions. On wide sparse data that was
+   plausibly the dominant cost of the whole histogram;
+4. the node-total reduction became a grid-stride loop with a capped block
+   count. Its entire output is three cells, so one element per thread put
+   `ceil(node_rows / 256)` blocks in contention on three words;
+5. `set_features` now rejects a duplicated feature id, which would have
+   accumulated one feature twice *and* folded the leftover into its default
+   bin twice, producing counts above the node's row count;
+6. `enqueue_leaf` now rejects the reserved node id explicitly, and an
+   unreachable support code was removed.
+
+Items 2 through 4 are performance, items 1, 5, and 6 are correctness or
+compilation. All six are static-review findings, not measurements.
 
 ---
 
@@ -227,6 +258,66 @@ lane and is not implied by anything here.
 
 `efb.mojo` itself needs no change.
 
+### 4.6 The dense path's shared-memory gate is wrong the same way
+
+Found while fixing the sparse one (see the checkout note, item 2), verified
+against the tree, and **not touched here** because `gpu_tiling.mojo` and
+`gpu_active_rows.mojo` are outside this lane. It is a live latent bug on the
+dense GPU path, not a sparse concern, and it wants an owner.
+
+`gpu_tiling.derive_tiling:242` is the only shared-memory gate anywhere on the
+GPU path:
+
+```mojo
+if shared_bytes_for(n_bins) > caps.max_shared_memory_per_block:
+    raise Error(...)
+```
+
+with `shared_bytes_for(n_bins) = n_bins * BYTES_PER_PARTIAL_CELL`, i.e.
+`n_bins * 12`. Both halves of that are wrong.
+
+**It scales with `n_bins`, but the allocations do not.** `stack_allocation`
+takes a *compile-time* extent, so the two dense accumulation kernels,
+`gpu_active_rows._range_hist_atomic_kernel:429` and
+`_range_hist_partial_kernel:511`, each allocate `3 * MAX_BINS` Int32 = 3072
+bytes whatever `n_bins` turns out to be. The gate agrees with reality only at
+`n_bins = 256`, where `256 * 12 = 3072` by coincidence. At `max_bin = 16`,
+which is an ordinary setting, the gate clears 192 bytes against a 3072-byte
+request; at `max_bin = 2` it clears 24.
+
+**It only describes the accumulation kernels.** Three other kernels allocate
+shared memory and none is covered:
+
+| Kernel | Request |
+| --- | --- |
+| `gpu_active_rows._flag_scan_kernel:216` | `SCAN_MAX_THREADS` Int32 = 4096 B |
+| `gpu_active_rows._scan_block_sums_kernel:279` | 4096 B |
+| `gpu_split_search._scan_slot_kernel:317,322` | `MAX_SPLIT_BINS` Float32 + Int32 = 2048 B |
+
+So the true maximum on the dense path is **4096 bytes**, from the partition
+scans, and it is constant. The gate never sees it at any `n_bins`.
+
+Consequence: a device reporting under 4 KB of shared memory passes
+`derive_tiling` and then fails at launch, with the failure landing in a
+kernel the gate never considered. Nothing in CI catches it because every
+device anyone has run on reports far more, and
+`FALLBACK_SHARED_MEMORY_PER_BLOCK` is 16384, so the fallback path hides it
+too.
+
+The fix is the one this lane already applied on its own side: compute the
+maximum request over every kernel in the module and gate on that.
+`gpu_sparse_layout.sparse_kernel_shared_bytes` is the worked example, and it
+deliberately takes the max at runtime rather than folding it into a
+`comptime` so that changing one bound alone cannot desync it. The dense
+equivalent belongs in `gpu_tiling.mojo` next to `shared_bytes_for`, which
+should either be renamed to say it describes one kernel's partial histogram
+or be replaced outright.
+
+Scope note for whoever takes it: `shared_bytes_for` is also used by
+`gpu_sparse_layout.sparse_kernel_shared_bytes` as one of the four inputs it
+maxes over, so fixing it in place is compatible with this lane rather than a
+conflict with it.
+
 ## 5. Serialization and binding changes
 
 **Model format: none, and none proposed.** These primitives produce a
@@ -407,9 +498,15 @@ category statistics against `category_stats_host`. Cases 8 through 11 and 19.
 **Stage 3, bit identity.** Case 12, the sharpest test available, plus 13 and
 14. If stage 3 passes, the accumulation is correct.
 
-**Stage 4, measure.** Design doc section 10, all five measurements. Publish
+**Stage 4, measure.** Design doc section 10, all six measurements. Publish
 them in this handoff before anything consumes `decide_sparse`. Until then
 `decide_sparse` returns `SPARSE_UNDECIDED` and every caller must handle it.
+
+Measurement 6 is bookkeeping on this lane rather than on the workload:
+`TOTALS_BLOCKS_PER_SM` and `REDUCE_MAX_THREADS` are constants chosen to match
+`gpu_tiling.mojo`'s conventions, not measured. Neither can change a result,
+so neither blocks anything, but they are unswept knobs and this is where that
+is written down.
 
 **Stage 5, a trainer.** Section 4.3, behind an explicit opt-in with no
 default change. Compare a whole fitted model against the CPU sparse path's
