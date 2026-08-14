@@ -16,6 +16,12 @@ the top of the hour had one by the end of it, and `bindings/` went from one
 Mojo file to seven. Treat every count below as a reading, not a constant.
 Re-run the script before acting on any single row.
 
+**Second pass, 2026-08-14, evening.** Four of the findings below were then
+fixed, three of them in this lane, and each is marked *Closed* where it was
+first stated rather than deleted, because a finding and its fix are more
+useful together than either alone. Section 12 lists the four in one place.
+Everything not marked *Closed* is still the mid-afternoon reading.
+
 ```
 python3 tools/connectivity_audit.py                 # full report
 python3 tools/connectivity_audit.py --section binding-modules
@@ -107,6 +113,17 @@ are still not in the table.
 One edit in one file closes most of this, and that file belongs to lane 06.
 See the patch queue in `handoffs/connect_22_audit.md`.
 
+> **Closed, by lane 06, the same evening.** `bindings/_mojoboost.mojo` now
+> imports all five capability modules (`dataset_bindings`, `basic_bindings`,
+> `distributed_bindings`, `inspection_bindings`, `objective_bindings`) and
+> the registration table is at 116 entries, up from the 63 counted above.
+> All four names in the table above are registered:
+> `decide_device_workload` under the name `decide_device`, plus `dump_model`,
+> `objective_code`, and `registry_metrics`. The `# DELETION POINT` block in
+> `python/mojoboost/inspection.py` is now a fallback with a live native path
+> in front of it rather than the only implementation; deleting it is lane
+> 07's call and is not this audit's to make.
+
 ---
 
 ## 3. The mirror: a GPU surface with no Python caller
@@ -153,7 +170,18 @@ which is why they are grouped.
 | `gpu_multiclass_batch` | (`gpu_output_planes` is also reached via `apple_histogram_policy`) | 04 | multiclass GPU training is still per-class |
 | `hybrid_leaf_scheduler` | `histogram_cache_policy` | 04 | no trainer consults per-leaf CPU/GPU placement |
 | `gpu_categorical` | `gpu_sparse`, `gpu_sparse_layout` | 10 | the GPU trainer refuses categoricals, so its category kernels are unused |
-| `gpu_portability` | `gpu_backend_policy` | 20 | `tests/test_gpu_portability.mojo` imports `gpu_tiling` and `histogram_gpu`, not this module - the test named for it does not exercise it |
+| `gpu_portability` | `gpu_backend_policy` | 20 | **Closed.** `tests/test_gpu_portability.mojo` imported `gpu_tiling` and `histogram_gpu`, not this module - the test named for it did not exercise it |
+
+> **`gpu_portability` closed in the second pass.**
+> `src/mojoboost/histogram_gpu.mojo` imports it, holds a `BackendContract`
+> field, and calls `require_bins_supported` once before binning and
+> `require_histogram_launchable` at each of the three launch sites. The
+> contract is the thing being connected, not the import: the launch bound
+> the kernel was written against is now checked against the device that will
+> run it, rather than assumed. `gpu_backend_policy` is reached through it.
+> `tests/test_gpu_portability.mojo` imports the module it is named for.
+>
+> The other six clusters are unchanged, so six clusters, not seven.
 
 Two more are reachable from tests only, and one of them is fine that way:
 
@@ -207,6 +235,38 @@ mismatch. Whichever way it is resolved - route the bindings through
 them - the resolution is a cross-lane edit, because lane 09 owns
 `params.mojo`, lane 06 owns the extension, and lane 07 owns the estimators.
 
+> **Closed in the second pass**, the second way: the parameters are on the
+> estimator and threaded through, and `params.mojo` stays the parameter-string
+> parser it was rather than becoming the boundary's parser too.
+>
+> `_Base.__init__` takes `min_gain_to_split` (alias `min_split_gain`),
+> `max_delta_step`, `path_smooth`, `extra_trees`, `extra_seed`,
+> `monotone_penalty` (alias `monotone_constraints_penalty`),
+> `monotone_constraints_method`, `feature_contri`, `cegb_tradeoff`,
+> `cegb_penalty_split`, and `forced_splits`. `_params()` sends each of them
+> on every fit, inactive defaults included, because the native parser
+> subscripts the mapping rather than testing for a key.
+>
+> `bindings/basic_bindings.mojo` grew `extra_params_from_mapping`, and
+> `_parse_params` in `bindings/_mojoboost.mojo` calls it and folds the result
+> into `TreeParams.extra`. It is the same function `extra_params_check`
+> validates with, which is the point: one parser over one mapping, so what a
+> caller can ask about and what a fit is trained with cannot come apart.
+>
+> No range check was added in Python. `ExtraTreeParams.check` runs inside
+> `tree.grow_tree` and is what the C ABI and the CLI already reach through
+> `params.mojo`, so there is one authority for what these values may be
+> rather than a Python copy of it to drift from. Python validates the one
+> thing native cannot: the `feature_contri` buffer's length and dtype, where
+> `n_features` is known.
+>
+> Two of the eleven still refuse rather than train, natively and by name, and
+> the refusal is the same one the CLI gets: `forced_splits` needs its raw
+> thresholds mapped onto a fitted binning, which `binning.map_forced_splits`
+> can do and no entry point calls; and `cegb_penalty_feature_coupled` needs a
+> per-model feature-use ledger no trainer keeps, so the key is sent as 0 and
+> there is no estimator parameter that can set it.
+
 ### EFB is a guard with no engine behind it
 
 `src/mojoboost/efb.mojo` is reachable, through `params.mojo` and
@@ -220,6 +280,40 @@ So `enable_bundle=true` is correctly refused rather than silently ignored,
 which is the right failure. But the module reads as connected in an import
 graph and is not connected in any behavioral sense. This is the pattern the
 audit exists to separate, and EFB is its clearest instance.
+
+> **Closed in the second pass, in two halves, and the first half was already
+> done when the fix pass started.** The engine had gained production callers
+> in the native tree between the snapshot and the fix: `prepare_bundling` in
+> `boosting.mojo` fits a plan once per training call for each of the four
+> dense trainers, and `prepare_bundling_csc` in `boosting_sparse.mojo` does
+> the same for `fit_csc` and `fit_multiclass_csc`, calling `fit_bundles` and
+> `bundle_csc`. So the sentence above was true when written and had stopped
+> being true by the evening, which is the argument for the script over the
+> document once more.
+>
+> The half that was still open was the Python route, and it was the same
+> shape as the parameter split above: `_parse_params` built its
+> `BoosterParams` with three arguments and never the fourth, so
+> `BoosterParams.bundling` took its disabled default on every fit that came
+> through Python. `enable_bundle` was reachable from `params.mojo` - the CLI
+> and the C ABI - and from nowhere else.
+>
+> `bindings/basic_bindings.mojo` grew `efb_settings_from_mapping` on the
+> `extra_params_from_mapping` pattern, `efb_check` was rewritten to use it,
+> and `_parse_params` passes the result as `BoosterParams.bundling`.
+> `_Base.__init__` takes `enable_bundle` and the six knobs it governs.
+>
+> Which trainers may honor the switch is decided at the boundary, because
+> that is the last place that knows which trainer runs next. `_parse_params`
+> takes two new arguments for it: `cpu`, which the dense entry points set
+> from the device they resolved, and `unbundled`, which names the entry point
+> when its trainer applies no plan at all. An entry point that names itself
+> gets `efb.check_bundling_honored`, which refuses an active switch by name;
+> the rest get `efb.check_bundling_supported`, which is the check
+> `params.mojo` makes for a parameter string. So `enable_bundle=True` trains
+> on a dense CPU fit, on a sparse fit, and on continued training, and raises
+> with the trainer's name on `device="gpu"`, on a custom objective, on a
+> custom metric or an eval set, and on the ranker. Nothing silently drops it.
 
 ---
 
@@ -244,6 +338,14 @@ audit exists to separate, and EFB is its clearest instance.
   `from . import _arrays, _eval, _mojoboost, ...` with no guard ahead of it.
   A user on an unsupported interpreter gets `ABORT: symbol not found:
   Py_NewRef` instead of the message this module was written to print.
+
+  **Closed in the second pass.** `python/mojoboost/__init__.py` now does
+  `from . import _compat` and binds the extension with
+  `_mojoboost = _compat.import_extension()`, which is the only import of it
+  in the package, so the guard runs in front of the load it guards. The
+  ordering is the whole fix and it is fragile by nature: any later edit that
+  imports `_mojoboost` directly, above that line, restores the abort. The
+  comment above the call says so, which is the cheapest defense there is.
 
 `python/build/lib.macosx-11.0-arm64-cpython-314/mojoboost/__init__.py` is a
 stale copy of the package from an earlier build. It is not an orphan so much
@@ -350,6 +452,13 @@ Nothing in this repository is currently classified `DEAD`. That is a real
 result and not a soft one: the unreachable code here is not abandoned, it is
 unconnected, and the two call for opposite responses.
 
+The second pass is the evidence for it. Every one of the four findings it
+closed was closed by *connecting* something - an import, a parser, a
+parameter list, a line ordering - and not one of them by deleting anything.
+The modules were finished; what was missing was the edit in the file the
+lane did not own. A `DEAD` finding would have called for the opposite
+response, and there was nothing to make one about.
+
 The classification lives in one table, `CLASSIFICATION` in
 `tools/connectivity_audit.py`. Everything else in that script is mechanical.
 An unclassified finding defaults to `PENDING`, which is the conservative
@@ -374,3 +483,37 @@ a module is the precondition for all of it, and the only thing measured here.
 
 The cross-lane patch queue, with an owner for every `PENDING` finding above,
 is in `handoffs/connect_22_audit.md`.
+
+---
+
+## 12. What the second pass closed
+
+Four findings, in one place. Each is stated in full where it was first
+reported; this is the index.
+
+| Finding | Section | Closed by | Files |
+| --- | --- | --- | --- |
+| The five binding modules the extension did not import | 2 | lane 06 | `bindings/_mojoboost.mojo` |
+| `gpu_portability` unreachable, and its own test aimed elsewhere | 4 | this lane | `src/mojoboost/histogram_gpu.mojo`, `tests/test_gpu_portability.mojo` |
+| Nine `ExtraTreeParams` fields settable from C and the CLI and not from Python, and `enable_bundle` with them | 5 | this lane | `python/mojoboost/__init__.py`, `python/mojoboost/basic.py`, `bindings/basic_bindings.mojo`, `bindings/_mojoboost.mojo` |
+| `_compat.py`'s interpreter guard never running | 6 | this lane | `python/mojoboost/__init__.py` |
+
+Two things are worth carrying forward from how they were fixed.
+
+**One parser, two callers.** Both parameter fixes took the same shape: a
+`*_from_mapping` function in `bindings/basic_bindings.mojo`, called by the
+checker a user can ask with *and* by the `_parse_params` a fit runs through.
+The alternative - a parser at the boundary and a second one behind the
+checker - is section 8's duplicate-registry problem in a new place, and it
+would fail in the worst available way, by validating something other than
+what gets trained.
+
+**No range check crossed into Python.** Every value added to the estimator
+signature is checked natively, by the same code the C ABI and the CLI reach.
+A Python-side copy of a bound would be the thing the next audit finds.
+
+**Not done here.** `docs/LIGHTGBM_PARITY.md` carries roughly a dozen rows
+that say some variant of "no Python estimator parameter reaches it", and
+those rows are now false. That file belongs to the parity lane and is gated
+by `tools/check_parity.py`, so the exact replacement text is a patch request
+in §7 of `handoffs/connect_22_audit.md` rather than an edit made here.

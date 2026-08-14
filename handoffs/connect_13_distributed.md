@@ -447,7 +447,25 @@ that `distributed.mojo` imports the transport's *non-byte* parts (schema digest,
 histogram plan, split digest, checkpoint record, `RuntimeSpec`) while still
 naming no socket, no frame, and no rank outside the `Collective` trait. Add a
 section 14 for the runtime interface listed in section 4 above, and note that
-`transport_available()` is the single availability fact.
+`transport_available()` is the single availability fact and
+`transport_validated()` the single evidence fact.
+
+Section 7 opens with "This is the one piece that is not written", which is no
+longer true and is the single most misleading sentence in the docs now. What
+was written follows that section's prescription closely: `socket`,
+`SO_REUSEADDR`, `bind`, `listen`, `accept` on the root, `connect` with retry
+elsewhere, `SO_RCVTIMEO`/`SO_SNDTIMEO` recomputed from the absolute deadline
+before every syscall, `TCP_NODELAY`, loops around short reads and writes,
+`EINTR` retried, `close` on both paths. Three things that section does not
+mention and that the code now fixes in one direction: the root relays every
+rank's handshake record (nothing else can, in a star), hostnames are not
+resolved, and only macOS and Linux are supported. The "until that test exists
+and passes, no statement about multi-process operation belongs in this
+repository" sentence at the end of section 7 stands exactly as written and
+should not be softened just because code now exists. Section 1 ("What is
+implemented and what is not") needs the same split this handoff's section 6a
+uses: implemented and tested, implemented and never run, and therefore not
+claimed.
 
 **D. `docs/distributed.md`** — section 3 should name `ShardPlan` as the
 partition's definition and cross-reference `RankAssignment` in

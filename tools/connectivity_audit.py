@@ -311,6 +311,47 @@ CLASSIFICATION = {
         "the package imports it; importing it would be the bug.",
     ),
     # -- binding table entries with no Python caller ------------------------
+    #
+    # The ask-before-a-fit family first. These five answer a question about a
+    # configuration rather than doing anything to one, and no Python code
+    # asks: the estimators send the same keys into a fit, where the same
+    # native code checks them, so nothing they cover goes unchecked. What
+    # has no Python route is asking *early* -- before the data is read, or
+    # without a dataset at all. EXPERIMENTAL rather than PENDING because
+    # nothing is blocked: a Python caller is a decision about the public API
+    # (`docs/COMPATIBILITY_POLICY.md`), not an edit some other lane owes.
+    "efb_check": (
+        EXPERIMENTAL,
+        "connect_22",
+        "Validates a bundling configuration against the device that would "
+        "honor it. A fit validates the same settings through the same "
+        "parser (efb_settings_from_mapping), so this is the early answer.",
+    ),
+    "efb_defaults": (
+        EXPERIMENTAL,
+        "connect_22",
+        "The bundling defaults, so nobody restates LightGBM's numbers in "
+        "Python. The estimator restates them in its signature instead, "
+        "which is what a scikit-learn signature has to do.",
+    ),
+    "extra_params_check": (
+        EXPERIMENTAL,
+        "connect_22",
+        "Validates the extra tree bundle and reports what honoring it "
+        "needs. A fit runs the same check inside tree.grow_tree.",
+    ),
+    "extra_option_supported": (
+        EXPERIMENTAL,
+        "connect_22",
+        "Names a LightGBM tree option this build parses but cannot apply. "
+        "A fit raises the same message when one is actually set.",
+    ),
+    "forced_splits_check": (
+        EXPERIMENTAL,
+        "connect_22",
+        "Validates a forced-splits document on its own, which is worth "
+        "doing long before a fit since the file is written long before one.",
+    ),
     "dataset_num_data": (
         PENDING,
         "connect_07",

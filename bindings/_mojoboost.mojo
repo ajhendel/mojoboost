@@ -559,7 +559,7 @@ def _parse_params(
     var bundling = efb_settings_from_mapping(params)
     # Reachability first, then ranges: the order params.mojo checks a
     # parameter string in. The ranges run whether or not the switch is on.
-    if len(unbundled) > 0:
+    if unbundled.byte_length() > 0:
         check_bundling_honored(bundling, unbundled)
     else:
         check_bundling_supported(bundling.enabled, cpu)

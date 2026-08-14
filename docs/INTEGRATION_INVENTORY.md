@@ -1,7 +1,9 @@
 # Integration inventory
 
-Snapshot: 2026-08-14, tree at commit `9c1e771`, closure unchanged since
-`63aad82`.
+Snapshot: 2026-08-14, tree at commit `29d76e4`. The import closure was
+re-derived at `63aad82` and re-checked at `9c1e771` and `29d76e4`; it is
+unchanged across all three, so every table below is a reading of that
+closure.
 Checked by: `python3 tools/audit_integration.py`
 
 What is written in this repository but not reachable from any entry point,

@@ -4,10 +4,11 @@ Contract version: 3
 Audited against: **LightGBM 4.7.0** (the version pinned in the `bench` pixi
 environment; `lightgbm.__version__` reported `4.7.0` when version 1 of this
 file was written)
-Audited: 2026-08-14, mojoboost at commit `9c1e771` plus the working tree of
-that day. The import closure was re-derived at `9c1e771` and is unchanged
-from `63aad82`: the only new edges since that commit are internal to modules
-already reachable, or into modules that were already orphans
+Audited: 2026-08-14, mojoboost at commit `29d76e4` plus the working tree of
+that day. The import closure was re-derived at `63aad82` and re-checked at
+`9c1e771` and `29d76e4`; it is unchanged across all three, because every
+edge added in between either sits inside a module that was already
+reachable or points into one that was already an orphan
 
 What version 3 re-derived: reachability. Every `integrated` and `publicly
 reachable` cell was recomputed by tracing imports from the four shipping
@@ -731,8 +732,9 @@ different angles.
   `docs/ARCHITECTURE.md`, `docs/INTEGRATION_INVENTORY.md`, and
   `tools/audit_integration.py`, and a check that section 0's `publicly
   reachable` cells cannot rot the way those three did. Re-derived a second
-  time against `9c1e771` before publishing, because seventy-odd files
-  landed while version 3 was being written, and the closure had moved
+  time against `63aad82` and its successors before publishing, because
+  seventy-odd files landed while version 3 was being written, and the
+  closure had moved
   underneath four of the rows the same pass had just added. Model
   inspection and explainable device selection stopped being blocked by
   unregistered bindings; `bindings/_mojoboost.mojo` now registers the
