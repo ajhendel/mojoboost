@@ -1175,6 +1175,15 @@ class _Base(_ParamsMixin):
         bagging_freq = self._resolve_alias(
             "bagging_freq", "subsample_freq", 0
         )
+        # Same ranges src/mojoboost/params.mojo and callback.mojo enforce,
+        # so an estimator cannot construct a configuration the trainer
+        # rejects (or, worse, quietly degenerates on).
+        if int(self.num_leaves) < 2:
+            raise ValueError("num_leaves must be at least 2")
+        if float(self.learning_rate) <= 0.0:
+            raise ValueError("learning_rate must be positive")
+        if int(self.max_bin) < 2:
+            raise ValueError("max_bin must be at least 2")
         if float(lambda_l1) < 0.0:
             raise ValueError("lambda_l1 must be nonnegative")
         if float(lambda_l2) < 0.0:
@@ -2191,9 +2200,11 @@ class _Base(_ParamsMixin):
 
 
 class MojoBoostRegressor(_Base):
-    """Objective names follow LightGBM: "regression" (squared error),
-    "huber", "quantile", "mae" (alias "regression_l1"), "poisson",
-    "gamma", "tweedie", "mape", "fair", and "cross_entropy" (alias
+    """Objective names follow LightGBM: "regression" (squared error;
+    aliases "regression_l2", "l2", "mse", "mean_squared_error"), "huber",
+    "quantile", "mae" (aliases "regression_l1", "l1",
+    "mean_absolute_error"), "poisson", "gamma", "tweedie", "mape" (alias
+    "mean_absolute_percentage_error"), "fair", and "cross_entropy" (alias
     "xentropy").
 
     Each objective's scalar parameter keeps LightGBM's name:
@@ -2241,16 +2252,25 @@ class MojoBoostRegressor(_Base):
     # __sklearn_tags__ below. Both are cheap, so both are here.
     _estimator_type = "regressor"
 
+    # The alias set matches src/mojoboost/params.mojo exactly, so a name the
+    # CLI accepts is a name the estimator accepts.
     _OBJECTIVES = {
         "regression": _SQUARED_ERROR,
+        "regression_l2": _SQUARED_ERROR,
+        "l2": _SQUARED_ERROR,
+        "mean_squared_error": _SQUARED_ERROR,
+        "mse": _SQUARED_ERROR,
         "huber": _HUBER,
         "quantile": _QUANTILE,
         "mae": _L1,
         "regression_l1": _L1,
+        "l1": _L1,
+        "mean_absolute_error": _L1,
         "poisson": _POISSON,
         "gamma": _GAMMA,
         "tweedie": _TWEEDIE,
         "mape": _MAPE,
+        "mean_absolute_percentage_error": _MAPE,
         "fair": _FAIR,
         "cross_entropy": _CROSS_ENTROPY,
         "xentropy": _CROSS_ENTROPY,
@@ -2621,6 +2641,9 @@ class MojoBoostRegressor(_Base):
         est._model = _mojoboost.load(str(path))
         est.n_features_in_ = int(_mojoboost.n_features(est._model))
         est.best_iteration_ = est._num_iterations()
+        # The file holds exactly the trees that survived training, so the
+        # loaded model has as many iterations as it has rounds on disk.
+        est.n_iter_ = est.best_iteration_
         est._restore_categorical()
         return est
 
@@ -3133,6 +3156,7 @@ class MojoBoostClassifier(_Base):
             else list(range(est.n_classes_))
         )
         est.best_iteration_ = est._num_iterations()
+        est.n_iter_ = est.best_iteration_
         est._restore_categorical()
         return est
 
@@ -3470,5 +3494,6 @@ class MojoBoostRanker(_Base):
         est._model = _mojoboost.load(str(path))
         est.n_features_in_ = int(_mojoboost.n_features(est._model))
         est.best_iteration_ = est._num_iterations()
+        est.n_iter_ = est.best_iteration_
         est._restore_categorical()
         return est

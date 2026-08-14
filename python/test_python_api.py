@@ -1030,12 +1030,15 @@ def test_input_validation():
     except ValueError:
         pass
     for bad in (
-        dict(objective="l2"),
+        dict(objective="not_an_objective"),
         dict(objective="huber", alpha=0.0),
         dict(objective="quantile", alpha=1.5),
         dict(lambda_l1=-1.0),
         dict(reg_alpha=-1.0),
         dict(reg_lambda=-1.0),
+        dict(num_leaves=1),
+        dict(learning_rate=0.0),
+        dict(max_bin=1),
     ):
         try:
             MojoBoostRegressor(**bad).fit([[1.0], [2.0]], [1.0, 2.0])
@@ -1049,6 +1052,20 @@ def test_input_validation():
         raise AssertionError("all-zero sample_weight should raise")
     except ValueError:
         pass
+    # Every objective alias the CLI accepts works here too, so the two
+    # tables cannot drift apart again.
+    for ok in (
+        "l2",
+        "mse",
+        "regression_l2",
+        "mean_squared_error",
+        "l1",
+        "mean_absolute_error",
+        "mean_absolute_percentage_error",
+    ):
+        MojoBoostRegressor(
+            objective=ok, n_estimators=2, min_data_in_leaf=1
+        ).fit([[1.0], [2.0], [3.0]], [1.0, 2.0, 3.0])
     print("validation ok")
 
 
