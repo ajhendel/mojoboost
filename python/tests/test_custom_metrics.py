@@ -183,8 +183,11 @@ def test_validation_errors(regression, multiclass):
 
     with pytest.raises(ValueError, match="eval_metric needs an eval_set"):
         reg.fit(X, y, eval_metric=mse)
-    with pytest.raises(ValueError, match="requires eval_metric"):
-        reg.fit(X, y, eval_set=[(Xv, yv)])
+    # An eval_set with no eval_metric falls back to the objective's own
+    # loss (python/tests/test_eval_set.py covers the built-in names).
+    assert list(
+        reg.fit(X, y, eval_set=[(Xv, yv)]).evals_result_["valid_0"]
+    ) == ["l2"]
     with pytest.raises(ValueError, match="must not be empty"):
         reg.fit(X, y, eval_set=[], eval_metric=mse)
     with pytest.raises(ValueError, match="names must be unique"):
@@ -224,9 +227,11 @@ def test_validation_errors(regression, multiclass):
             X, y, eval_set=[(Xv, yv)], eval_metric=mse
         )
 
-    # Multiclass has no custom-metric path.
+    # Multiclass has its own trainer, and its metrics see one block of
+    # raw scores per row rather than one number, so a single-output
+    # callable like `mse` cannot score it.
     Xm, ym = multiclass
-    with pytest.raises(ValueError, match="single-output only"):
-        MojoBoostClassifier(n_estimators=5).fit(
-            Xm, ym, eval_set=[(Xm, ym)], eval_metric=mse
-        )
+    scored = MojoBoostClassifier(n_estimators=5).fit(
+        Xm, ym, eval_set=[(Xm, ym)], eval_metric="multi_logloss"
+    )
+    assert len(scored.evals_result_["valid_0"]["multi_logloss"]) == 6

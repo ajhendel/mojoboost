@@ -6,12 +6,20 @@ from mojoboost import (
     BoosterParams,
     Tree,
     TreeParams,
+    balanced_class_weights,
+    balanced_sample_weight,
     bin_equal_width,
+    binary_labels_to_codes,
+    check_class_balance_params,
+    class_weight_rows,
     gain_importance,
     grow_tree,
+    scale_pos_weight_rows,
     split_importance,
     train,
     train_multiclass,
+    unbalance_scale,
+    unbalanced_sample_weight,
 )
 
 
@@ -175,6 +183,157 @@ def test_gain_importance_ensemble() raises:
     var gains = gain_importance(model.trees, 2)
     assert_true(gains[0] > 0.0)
     assert_true(gains[1] == 0.0)
+
+
+def test_balanced_class_weights_equalize_class_totals() raises:
+    # scikit-learn's rule: total / (n_classes * count_k). With 6 rows in
+    # class 0 and 2 in class 1, the weights are 8/(2*6) and 8/(2*2).
+    var labels: List[Int] = [0, 0, 0, 0, 0, 0, 1, 1]
+    var weights = balanced_class_weights(labels, 2)
+    assert_true(abs(weights[0] - 8.0 / 12.0) < 1e-12)
+    assert_true(abs(weights[1] - 2.0) < 1e-12)
+
+    # Every class ends up with the same total weight, and the mean row
+    # weight stays 1: that is what distinguishes `balanced` from
+    # `scale_pos_weight`.
+    var rows = balanced_sample_weight(labels, 2)
+    var totals: List[Float64] = [0.0, 0.0]
+    var total = 0.0
+    for r in range(len(labels)):
+        totals[labels[r]] += rows[r]
+        total += rows[r]
+    assert_true(abs(totals[0] - totals[1]) < 1e-12)
+    assert_true(abs(total - 8.0) < 1e-12)
+
+
+def test_balanced_class_weights_use_weighted_counts() raises:
+    # With sample weights the counts are weighted counts, so balancing runs
+    # on the sample the model actually sees.
+    var labels: List[Int] = [0, 0, 1]
+    var sample_weight: List[Float64] = [1.0, 1.0, 2.0]
+    var weights = balanced_class_weights(labels, 2, sample_weight)
+    # Class totals are 2 and 2 already, so both weights are 4/(2*2) = 1.
+    assert_true(abs(weights[0] - 1.0) < 1e-12)
+    assert_true(abs(weights[1] - 1.0) < 1e-12)
+
+
+def test_class_weight_rows_multiply_the_sample_weight() raises:
+    var labels: List[Int] = [0, 1, 1]
+    var class_weights: List[Float64] = [1.0, 3.0]
+    var sample_weight: List[Float64] = [2.0, 2.0, 0.5]
+    var rows = class_weight_rows(labels, 2, class_weights, sample_weight)
+    assert_true(abs(rows[0] - 2.0) < 1e-12)
+    assert_true(abs(rows[1] - 6.0) < 1e-12)
+    assert_true(abs(rows[2] - 1.5) < 1e-12)
+
+
+def test_class_weighting_is_ordinary_row_weighting() raises:
+    # The whole mechanism: a class-weighted fit is the same model as the
+    # fit with those row weights passed by hand, tree for tree.
+    var features: List[Float64] = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
+    var target: List[Float64] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0]
+    var labels: List[Int] = [0, 0, 0, 0, 0, 0, 1, 1]
+    var data = bin_equal_width(features, n_rows=8, n_features=1, n_bins=8)
+    var params = BoosterParams(10, 0.3, small_tree_params())
+
+    var rows = balanced_sample_weight(labels, 2)
+    var by_class = train(data, target, BINARY_LOGISTIC, params, rows)
+    var by_hand_weights: List[Float64] = [
+        8.0 / 12.0,
+        8.0 / 12.0,
+        8.0 / 12.0,
+        8.0 / 12.0,
+        8.0 / 12.0,
+        8.0 / 12.0,
+        2.0,
+        2.0,
+    ]
+    var by_hand = train(
+        data, target, BINARY_LOGISTIC, params, by_hand_weights
+    )
+    assert_equal(len(by_class.trees), len(by_hand.trees))
+    assert_true(abs(by_class.base_score - by_hand.base_score) < 1e-15)
+    for r in range(8):
+        assert_true(
+            abs(
+                by_class.predict_row(data, r) - by_hand.predict_row(data, r)
+            )
+            < 1e-15
+        )
+
+
+def test_scale_pos_weight_lifts_only_the_positives() raises:
+    var labels: List[Float64] = [0.0, 0.0, 1.0]
+    var rows = scale_pos_weight_rows(labels, 4.0)
+    assert_true(abs(rows[0] - 1.0) < 1e-12)
+    assert_true(abs(rows[1] - 1.0) < 1e-12)
+    assert_true(abs(rows[2] - 4.0) < 1e-12)
+
+
+def test_unbalance_scale_is_the_negative_to_positive_ratio() raises:
+    var labels: List[Float64] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0]
+    assert_true(abs(unbalance_scale(labels) - 3.0) < 1e-12)
+    var rows = unbalanced_sample_weight(labels)
+    assert_true(abs(rows[0] - 1.0) < 1e-12)
+    assert_true(abs(rows[6] - 3.0) < 1e-12)
+
+
+def test_class_weight_validation() raises:
+    var labels: List[Int] = [0, 1, 1]
+
+    # A weight per class, nonnegative, not all zero.
+    var wrong_length: List[Float64] = [1.0]
+    var raised = False
+    try:
+        _ = class_weight_rows(labels, 2, wrong_length)
+    except:
+        raised = True
+    assert_true(raised)
+
+    var negative: List[Float64] = [1.0, -1.0]
+    raised = False
+    try:
+        _ = class_weight_rows(labels, 2, negative)
+    except:
+        raised = True
+    assert_true(raised)
+
+    var all_zero: List[Float64] = [0.0, 0.0]
+    raised = False
+    try:
+        _ = class_weight_rows(labels, 2, all_zero)
+    except:
+        raised = True
+    assert_true(raised)
+
+    # A class with no rows cannot be balanced against.
+    var one_class: List[Int] = [0, 0, 0]
+    raised = False
+    try:
+        _ = balanced_class_weights(one_class, 2)
+    except:
+        raised = True
+    assert_true(raised)
+
+    # is_unbalance and scale_pos_weight are two ways to set one number.
+    raised = False
+    try:
+        check_class_balance_params(True, 4.0)
+    except:
+        raised = True
+    assert_true(raised)
+    # Either alone is fine.
+    check_class_balance_params(True, 1.0)
+    check_class_balance_params(False, 4.0)
+
+    # A soft label has no class to weight.
+    var soft: List[Float64] = [0.0, 0.5, 1.0]
+    raised = False
+    try:
+        _ = binary_labels_to_codes(soft)
+    except:
+        raised = True
+    assert_true(raised)
 
 
 def main() raises:

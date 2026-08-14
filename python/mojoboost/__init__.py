@@ -29,7 +29,25 @@ style" and not a compliance claim. Two known deviations:
 Validation follows LightGBM's scikit-learn wrapper, which validates with
 `force_all_finite="allow-nan"`: `X` may hold NaN, mojoboost's missing-value
 marker, but not infinities, and `y` and `sample_weight` must be finite.
-Sparse input is rejected rather than densified silently.
+
+SciPy sparse input
+------------------
+`fit` and `predict` accept any SciPy sparse matrix or array and keep it
+sparse: nothing is densified, at any point. Whatever format you pass is
+converted to the one that side of the boundary wants (CSC to fit, because
+histogram accumulation is feature-oriented; CSR to predict, because
+prediction is row-oriented), and a non-canonical matrix is copied before its
+indices are sorted, so your matrix is never mutated.
+
+An implicit zero is the numerical value 0.0, not a missing value, which
+matches LightGBM's default `zero_as_missing=false`: a sparse fit equals the
+dense fit of the same matrix with the gaps filled with zeros. Explicitly
+stored zeros mean the same thing as the gaps. NaN is still the missing
+marker, wherever it is stored.
+
+Not available for sparse input: `device="gpu"` (there is no sparse GPU
+kernel), a Python objective callback, `eval_set` and early stopping, and
+ranking. Each raises rather than densifying behind your back.
 
 `best_iteration_` is the boosting iteration the model is used at, and
 `n_iter_` the number that were trained. They differ only when a validation
@@ -207,9 +225,14 @@ import os as _os
 import tempfile as _tempfile
 import warnings as _warnings
 
-from . import _arrays, _eval, _mojoboost
+from . import _arrays, _eval, _mojoboost, callback as _callback
 from ._sklearn import NotFittedError, ParamsMixin as _ParamsMixin
 from ._sklearn import estimator_tags as _estimator_tags
+
+# The functional API. `basic` reaches back into this module for the
+# estimators that hold the parameter definitions, but only from inside its
+# functions, so importing it here and it importing this is not a cycle.
+from .basic import Booster, Dataset, train
 
 _np = _arrays.np
 
@@ -217,14 +240,35 @@ _np = _arrays.np
 __version__ = "0.1.0"
 
 __all__ = [
+    "Booster",
+    "Dataset",
     "MojoBoostRegressor",
     "MojoBoostClassifier",
     "MojoBoostRanker",
     "NotFittedError",
+    "train",
     "gpu_available",
     "group_from_query_ids",
     "ndcg_score",
+    # Callbacks, re-exported at the top level the way LightGBM exports
+    # them, and also importable from mojoboost.callback.
+    "CallbackEnv",
+    "EarlyStopException",
+    "callback",
+    "early_stopping",
+    "log_evaluation",
+    "record_evaluation",
+    "reset_parameter",
 ]
+
+from .callback import (  # noqa: E402 - after __all__ for readability
+    CallbackEnv,
+    EarlyStopException,
+    early_stopping,
+    log_evaluation,
+    record_evaluation,
+    reset_parameter,
+)
 
 # Buffer plumbing and input validation live in _arrays; these names are the
 # spellings the estimator code below has always used.
@@ -241,11 +285,61 @@ _BOOSTING_TYPES = ("gbdt", "goss")
 
 _SQUARED_ERROR = 0
 _BINARY_LOGISTIC = 1
+_POISSON = 2
 _HUBER = 3
 _QUANTILE = 4
 _L1 = 5
 _CUSTOM = 6
 _LAMBDARANK = 7
+_GAMMA = 8
+_TWEEDIE = 9
+_MAPE = 10
+_FAIR = 11
+_CROSS_ENTROPY = 12
+
+#: LightGBM objectives mojoboost does not implement, and what to say about
+#: each. They are named rather than lumped into "unknown objective": a user
+#: who asks for one has asked for a real thing. docs/LIGHTGBM_PARITY.md
+#: carries the same list.
+_UNIMPLEMENTED_OBJECTIVES = {
+    "cross_entropy_lambda": (
+        "it parameterizes the rate through log1p(exp(raw)) rather than the "
+        "logistic, so it is a separate link, not an alias of cross_entropy"
+    ),
+    "xentlambda": (
+        "it parameterizes the rate through log1p(exp(raw)) rather than the "
+        "logistic, so it is a separate link, not an alias of cross_entropy"
+    ),
+    "multiclassova": (
+        "one-vs-rest needs an independent binary model per class, which is "
+        "a different trainer from the shared-softmax multiclass one "
+        "MojoBoostClassifier uses"
+    ),
+    "multiclass_ova": (
+        "one-vs-rest needs an independent binary model per class, which is "
+        "a different trainer from the shared-softmax multiclass one "
+        "MojoBoostClassifier uses"
+    ),
+    "ova": "use MojoBoostClassifier, which trains a shared softmax model",
+    "ovr": "use MojoBoostClassifier, which trains a shared softmax model",
+    "rank_xendcg": "lambdarank is the ranking objective mojoboost provides",
+    "xendcg": "lambdarank is the ranking objective mojoboost provides",
+    "lambdarank": "use MojoBoostRanker, which takes the query groups",
+    "multiclass": "use MojoBoostClassifier, which derives the task from y",
+    "softmax": "use MojoBoostClassifier, which derives the task from y",
+    "binary": "use MojoBoostClassifier, which derives the task from y",
+}
+
+
+def _unimplemented_objective_note(objective):
+    """The trailing half of an unknown-objective message when the name is a
+    LightGBM objective mojoboost does not implement here; empty otherwise."""
+    if not isinstance(objective, str):
+        return ""
+    reason = _UNIMPLEMENTED_OBJECTIVES.get(objective.strip().lower())
+    if reason is None:
+        return ""
+    return f". {objective!r} is not available here: {reason}"
 
 # Defaults of the two regularization parameters, named so the constructor
 # signature and the alias resolution in `_params` cannot drift apart.
@@ -480,7 +574,11 @@ def _early_stopping_rounds(value):
 
 
 def _check_eval_arguments(
-    eval_set, eval_metric, eval_sample_weight, early_stopping_rounds
+    eval_set,
+    eval_metric,
+    eval_sample_weight,
+    early_stopping_rounds,
+    callbacks=None,
 ):
     """Reject the arguments that only mean something with validation data.
 
@@ -498,6 +596,12 @@ def _check_eval_arguments(
     if _early_stopping_rounds(early_stopping_rounds) > 0:
         raise ValueError(
             "early_stopping_rounds needs an eval_set to stop on; pass "
+            "eval_set=[(X_valid, y_valid)]"
+        )
+    if callbacks:
+        raise ValueError(
+            "callbacks need an eval_set: the per-iteration hook lives in the "
+            "trainer that scores validation metrics; pass "
             "eval_set=[(X_valid, y_valid)]"
         )
 
@@ -776,7 +880,7 @@ class _Base(_ParamsMixin):
     #: src/mojoboost/categorical.mojo.
     _CATEGORY_LIMIT = 1 << 31
 
-    def _categorical_names(self, spec, names):
+    def _categorical_positions(self, spec, names):
         """Declared categorical features resolved to column positions.
 
         Entries are feature names or column indices, in any mix; names need
@@ -857,7 +961,7 @@ class _Base(_ParamsMixin):
                 )
             indices = sorted(dtype_categories)
         else:
-            indices = self._categorical_names(
+            indices = self._categorical_positions(
                 () if spec is None else spec, names
             )
             dropped = sorted(set(dtype_categories) - set(indices))
@@ -1107,7 +1211,9 @@ class _Base(_ParamsMixin):
             # int, not bool: the binding reads it as an integer.
             "use_missing": int(bool(self.use_missing)),
             "sample_weight_addr": int(sample_weight_addr),
-            "alpha": float(getattr(self, "alpha", 0.9)),
+            # The objective's scalar parameter, whichever of alpha, fair_c,
+            # and tweedie_variance_power it is: one trainer slot holds it.
+            "alpha": float(self._alpha_slot()),
             "device": device,
             "bagging_fraction": float(bagging_fraction),
             "bagging_freq": int(bagging_freq),
@@ -1168,6 +1274,36 @@ class _Base(_ParamsMixin):
             return None, 0
         wb = _arrays.check_sample_weight(sample_weight, n_rows)
         return wb, _addr(wb)
+
+    def _alpha_slot(self):
+        """The number the trainer's one objective-parameter slot carries.
+
+        The regressor resolves it from the objective (`alpha`, `fair_c`, or
+        `tweedie_variance_power`); the classifier and the ranker have no
+        such parameter and pass LightGBM's default through, which their
+        objectives ignore.
+        """
+        resolve = getattr(self, "_objective_param", None)
+        if resolve is None:
+            return float(getattr(self, "alpha", 0.9))
+        return float(resolve())
+
+    def _metric_objective(self, task):
+        """The objective code whose inverse link the built-in metrics apply
+        to the raw validation scores.
+
+        The multiclass trainer's metrics take the softmax themselves, so the
+        code is unread there; ranking and custom objectives have no link,
+        which is the identity this returns for them.
+        """
+        if task == _eval.MULTICLASS:
+            return _SQUARED_ERROR
+        if task == _eval.RANKING:
+            return _LAMBDARANK
+        if task == _eval.BINARY:
+            return _BINARY_LOGISTIC
+        resolve = getattr(self, "_objective_code", None)
+        return _SQUARED_ERROR if resolve is None else int(resolve())
 
     # -- validation sets and custom metrics -------------------------------
 
@@ -1256,6 +1392,38 @@ class _Base(_ParamsMixin):
             groups.append(gb)
         return keep, specs, targets, rows, weights, groups
 
+    def _callback_params(self):
+        """The resettable hyperparameters as a callback first sees them.
+
+        Only the names in `callback.RESETTABLE` appear: `env.params` is the
+        set a before-iteration callback may schedule, so listing anything
+        else would invite a reset that cannot be honored. Aliases are
+        resolved here, once, the way `_params` resolves them.
+        """
+        return {
+            "learning_rate": float(self.learning_rate),
+            "num_leaves": int(self.num_leaves),
+            "max_depth": int(self.max_depth),
+            "min_data_in_leaf": int(
+                self._resolve_alias(
+                    "min_data_in_leaf", "min_child_samples", 20
+                )
+            ),
+            # The environment uses LightGBM's name for this one; the
+            # estimator's own spelling of it is `min_child_hess`.
+            "min_sum_hessian_in_leaf": float(
+                self._resolve_alias("min_child_hess", "min_child_weight", 1e-3)
+            ),
+            "lambda_l1": float(
+                self._resolve_alias("lambda_l1", "reg_alpha", _LAMBDA_L1)
+            ),
+            "lambda_l2": float(
+                self._resolve_alias("lambda_l2", "reg_lambda", _LAMBDA_L2)
+            ),
+            "feature_fraction": float(self.feature_fraction),
+            "feature_fraction_bynode": float(self.feature_fraction_bynode),
+        }
+
     def _fit_with_metrics(
         self,
         Xb,
@@ -1276,6 +1444,7 @@ class _Base(_ParamsMixin):
         task=_eval.REGRESSION,
         n_classes=0,
         encode=None,
+        callbacks=None,
     ):
         """Train while metrics score the validation sets.
 
@@ -1309,7 +1478,9 @@ class _Base(_ParamsMixin):
                 "validation metrics are scored on the CPU; use device='cpu' "
                 "or device='auto'"
             )
-        specs = _metric_specs(eval_metric, task, getattr(self, "objective", None))
+        specs = _metric_specs(
+            eval_metric, task, getattr(self, "objective", None)
+        )
         keep, valid_specs, targets, rows, weights, groups = self._eval_sets(
             eval_set,
             eval_names,
@@ -1319,6 +1490,25 @@ class _Base(_ParamsMixin):
             encode,
         )
         primary = _primary_index(primary_metric, specs)
+        callbacks = list(callbacks or ())
+        (
+            early_stopping_rounds,
+            min_delta,
+            first_metric_only,
+            stopper,
+        ) = _callback.resolve_early_stopping(
+            callbacks, early_stopping_rounds, min_delta
+        )
+        # The per-iteration hook lives in the single-output trainer
+        # (train_with_callbacks). The softmax and LambdaRank loops score
+        # metrics but have no hook yet, so a callback list there is refused
+        # rather than accepted and ignored.
+        if callbacks and task in (_eval.MULTICLASS, _eval.RANKING):
+            raise NotImplementedError(
+                "callbacks are not wired into the multiclass and ranking "
+                "trainers yet; they run for regression and binary "
+                "classification. early_stopping_rounds= works for every task."
+            )
         rounds = _early_stopping_rounds(early_stopping_rounds)
         if float(min_delta) < 0.0:
             raise ValueError("min_delta must not be negative")
@@ -1348,7 +1538,11 @@ class _Base(_ParamsMixin):
                 "group_addr": 0 if groups[v] is None else _addr(groups[v]),
                 "n_groups": 0 if groups[v] is None else len(groups[v]),
                 "ndcg_at": int(getattr(self, "ndcg_eval_at", 5)),
-                "alpha": float(getattr(self, "alpha", 0.9)),
+                "alpha": float(self._alpha_slot()),
+                # The metric applies the objective's inverse link, so it
+                # scores what predict() would return; see eval_metric in
+                # bindings/_mojoboost.mojo.
+                "objective": int(self._metric_objective(task)),
             }
             for v in range(len(rows))
         ]
@@ -1372,37 +1566,78 @@ class _Base(_ParamsMixin):
         params["n_valid"] = len(valid_specs)
         params["metrics"] = [
             # ints, not bools: the binding reads the flags as integers.
-            (spec[0], int(spec[2]), int(spec[3]))
-            for spec in specs
+            # first_metric_only narrows the watch to eval_metric's first
+            # entry, which is what LightGBM's flag of that name does.
+            (
+                spec[0],
+                int(spec[2]),
+                int(spec[3] and (m == 0 or not first_metric_only)),
+            )
+            for m, spec in enumerate(specs)
         ]
         params["n_metrics"] = len(specs)
         params["primary_metric"] = primary
         params["early_stopping_rounds"] = rounds
         params["min_delta"] = float(min_delta)
-        if task == _eval.MULTICLASS:
-            result = _mojoboost.fit_multiclass_with_metrics(
-                _addr(Xb),
-                n_rows,
-                n_features,
-                _addr(yb),
-                int(n_classes),
-                bridge,
-                params,
+
+        # Two small buffers carry the per-iteration traffic: the round's
+        # resettable hyperparameters out and back, and the round's metric
+        # values in. Both are allocated even with no callbacks so the bridge
+        # never sees a null address; `has_callback` is what keeps a run
+        # without callbacks from crossing the boundary at all.
+        reset_buf = _out_buffer(len(_callback.RESETTABLE))
+        evals_buf = _out_buffer(max(len(valid_specs) * len(specs), 1))
+        runner = None
+        if callbacks:
+            runner = _callback.CallbackRunner(
+                callbacks,
+                self,
+                self._callback_params(),
+                [spec[0] for spec in valid_specs],
+                [spec[0] for spec in specs],
+                [bool(spec[2]) for spec in specs],
+                reset_buf,
+                evals_buf,
             )
-        elif task == _eval.RANKING:
-            result = _mojoboost.fit_ranker_with_metrics(
-                _addr(Xb), n_rows, n_features, _addr(yb), bridge, params
-            )
-        else:
-            result = _mojoboost.fit_with_metrics(
-                _addr(Xb),
-                n_rows,
-                n_features,
-                _addr(yb),
-                objective,
-                bridge,
-                params,
-            )
+            runner.end_iteration = int(self.n_estimators)
+        params["callback"] = runner
+        params["has_callback"] = int(runner is not None)
+        params["reset_addr"] = _addr(reset_buf)
+        params["evals_addr"] = _addr(evals_buf)
+        try:
+            if task == _eval.MULTICLASS:
+                result = _mojoboost.fit_multiclass_with_metrics(
+                    _addr(Xb),
+                    n_rows,
+                    n_features,
+                    _addr(yb),
+                    int(n_classes),
+                    bridge,
+                    params,
+                )
+            elif task == _eval.RANKING:
+                result = _mojoboost.fit_ranker_with_metrics(
+                    _addr(Xb), n_rows, n_features, _addr(yb), bridge, params
+                )
+            else:
+                result = _mojoboost.fit_with_metrics(
+                    _addr(Xb),
+                    n_rows,
+                    n_features,
+                    _addr(yb),
+                    objective,
+                    bridge,
+                    params,
+                )
+        except BaseException:
+            # A callback's exception cannot cross the Mojo boundary as
+            # itself, so the runner kept the object and the boundary carried
+            # a control code. Re-raise the original: the caller should catch
+            # its own exception type, not a message-shaped RuntimeError.
+            # `_reset_fitted` already ran, so the estimator stays unfitted.
+            if runner is not None and runner.error is not None:
+                raise runner.error from None
+            raise
         self._model = result[0]
         values = result[1]
         n_rounds = int(result[2])
@@ -1424,10 +1659,58 @@ class _Base(_ParamsMixin):
             }
             for v in range(n_valid)
         }
+        if stopper is not None and self.stopped_early_:
+            # The trainer, not the callback, decided which round won, so the
+            # callback reports only once that is known.
+            stopper.report(
+                self._metric_best_iteration,
+                self.best_score_,
+                specs[primary][0],
+                valid_specs[0][0],
+            )
         # The validation buffers had to outlive the call above.
         del keep
 
     # -- fitted state ----------------------------------------------------
+
+    # -- the fitted model ------------------------------------------------
+    #
+    # There is one model object in this package, `mojoboost.Booster`, and an
+    # estimator holds one rather than a second abstraction of its own: the
+    # opaque handle the extension module returns lives in that Booster and
+    # nowhere else. `_model` stays the spelling the estimator code uses for
+    # the handle, so assigning a freshly trained one wraps it and reading it
+    # unwraps it.
+
+    @property
+    def _model(self):
+        booster = self.__dict__.get("_booster")
+        return None if booster is None else booster._handle
+
+    @_model.setter
+    def _model(self, handle):
+        self.__dict__["_booster"] = (
+            None if handle is None else Booster._from_estimator(handle, self)
+        )
+
+    @property
+    def booster_(self):
+        """The fitted model, as the `Booster` the functional API returns.
+
+        LightGBM's `booster_`. Everything a model can answer for itself is
+        on it: `predict`, `eval`, `feature_importance`, `save_model`,
+        `model_to_string`, `current_iteration`, `num_trees`. What it cannot
+        do is continue training, because an estimator bins its own training
+        matrix and does not keep the `Dataset` that `update()` would grow
+        on; `mojoboost.train()` keeps one.
+        """
+        self._require_fitted()
+        booster = self.__dict__["_booster"]
+        # `fit` records the feature names after it has the model, so they
+        # are copied across on the way out rather than at wrap time.
+        names = getattr(self, "feature_names_in_", None)
+        booster._names = None if names is None else [str(n) for n in names]
+        return booster
 
     def _reset_fitted(self):
         """Drop everything a previous fit left behind. Called by `__init__`
@@ -1685,6 +1968,95 @@ class _Base(_ParamsMixin):
             for r in range(n_rows)
         ]
 
+    def _check_predict_X_sparse(self, X, validate_features=False):
+        """`_check_predict_X` for SciPy sparse input, as CSR."""
+        self._require_fitted()
+        buffers, n_rows, n_features, names = _arrays.check_X_sparse(X, "csr")
+        self._check_n_features(n_features)
+        self._check_feature_names(names, validate_features)
+        return buffers, n_rows
+
+    def _sparse_scores(
+        self, X, raw_score, start_iteration, num_iteration, pred_leaf,
+        pred_contrib, validate_features,
+    ):
+        """One score per row for sparse input, response scale or raw.
+
+        The prediction options that slice or decompose the ensemble read a
+        dense binned matrix, so they are refused here instead of quietly
+        densifying. Plain prediction is the sparse walk: one binary search
+        per node over that row's own stored entries.
+        """
+        if pred_leaf or pred_contrib:
+            raise ValueError(
+                "pred_leaf and pred_contrib do not take sparse input yet; "
+                "densify with .toarray()"
+            )
+        if start_iteration != 0 or num_iteration is not None:
+            raise ValueError(
+                "iteration slicing does not take sparse input yet; densify "
+                "with .toarray()"
+            )
+        buffers, n_rows = self._check_predict_X_sparse(X, validate_features)
+        out = _out_buffer(n_rows)
+        query = (
+            _mojoboost.predict_raw_csr
+            if raw_score
+            else _mojoboost.predict_csr
+        )
+        query(self._model, buffers.params(), _addr(out))
+        return out, n_rows
+
+    def _sparse_fit_params(self, X, sample_weight):
+        """Everything a sparse fit needs: the CSC buffers, the shape, the
+        column names, the params dict with the buffers folded in, and a
+        tuple to keep every referenced buffer alive across the call.
+
+        Sparse training runs on the CPU. The GPU histogram kernels take a
+        dense binned matrix, so rather than densify behind the caller's
+        back, `device="gpu"` is refused and `device="auto"` resolves to the
+        CPU, which is what it would pick anyway.
+        """
+        if self.device == "gpu":
+            raise RuntimeError(
+                "sparse input trains on the CPU; there is no sparse GPU "
+                "kernel yet. Use device='cpu' or device='auto', or densify "
+                "with .toarray() to train on the GPU."
+            )
+        buffers, n_rows, n_features, names = _arrays.check_X_sparse(X, "csc")
+        wb, w_addr = self._weight_buffer(sample_weight, n_rows)
+        ic_flat, ic_offsets = self._interaction_buffers(n_features)
+        mono_buf, mono_addr = self._monotone_buffer(n_features)
+        cat_buf = self._sparse_categorical_buffer(X, names, n_features)
+        params = self._params(
+            w_addr, "cpu", ic_flat, ic_offsets, mono_addr, cat_buf
+        )
+        params.update(buffers.params())
+        keep = (buffers, wb, ic_flat, ic_offsets, mono_buf, cat_buf)
+        return buffers, n_rows, n_features, names, params, keep
+
+    def _sparse_categorical_buffer(self, X, names, n_features):
+        """Categorical columns for a sparse fit.
+
+        A SciPy matrix carries no dtypes, so only explicitly named indices
+        can be categorical here; a frame's `category` dtypes have no sparse
+        equivalent to read.
+        """
+        indices, encoders = self._resolve_categorical(names, {})
+        self._cat_indices = list(indices)
+        self._cat_encoders = encoders
+        self.categorical_feature_ = list(indices)
+        return self._categorical_buffer(indices, n_features)
+
+    @staticmethod
+    def _reject_sparse_eval_set(eval_set):
+        if eval_set is not None:
+            raise ValueError(
+                "validation sets are not wired through the sparse path yet; "
+                "the Mojo API has train_sparse_with_valid. Fit without "
+                "eval_set, or densify with .toarray()."
+            )
+
     # -- fitted attributes -----------------------------------------------
 
     def _num_iterations(self):
@@ -1763,8 +2135,13 @@ class _Base(_ParamsMixin):
         versioned text format `save()` writes; everything else is ordinary
         Python state and pickles as it is."""
         state = self.__dict__.copy()
-        model = state.pop("_model", None)
-        state["_model_blob"] = None if model is None else self._model_bytes()
+        # The handle lives inside the Booster on `_booster`, and neither a
+        # Mojo handle nor the Booster's link to a training set pickles; the
+        # model itself travels as text and `_model` rebuilds the Booster.
+        booster = state.pop("_booster", None)
+        state["_model_blob"] = (
+            None if booster is None else self._model_bytes()
+        )
         return state
 
     def __setstate__(self, state):
@@ -1776,9 +2153,39 @@ class _Base(_ParamsMixin):
 
 class MojoBoostRegressor(_Base):
     """Objective names follow LightGBM: "regression" (squared error),
-    "huber", "quantile", and "mae" (alias "regression_l1"). `alpha` is the
-    quantile level for "quantile" and the transition point for "huber";
-    the other objectives ignore it.
+    "huber", "quantile", "mae" (alias "regression_l1"), "poisson",
+    "gamma", "tweedie", "mape", "fair", and "cross_entropy" (alias
+    "xentropy").
+
+    Each objective's scalar parameter keeps LightGBM's name:
+
+    - `alpha` is the quantile level for "quantile" and the transition point
+      for "huber" (default 0.9).
+    - `fair_c` is the fair loss's `c` (default 1.0).
+    - `tweedie_variance_power` is tweedie's rho, in (1, 2) (default 1.5).
+
+    An objective reads only its own, and setting one that belongs to a
+    different objective is an error rather than a value that quietly does
+    nothing.
+
+    Link and label range, which differ by objective and are worth knowing
+    before reading `predict`:
+
+    - "poisson", "gamma", "tweedie" predict expected values through an
+      exponential link and need nonnegative labels ("gamma" strictly
+      positive).
+    - "cross_entropy" predicts a probability through the logistic link and
+      takes labels anywhere in [0, 1]. It is a regressor objective because
+      its labels are soft targets rather than classes; for {0, 1} labels use
+      MojoBoostClassifier.
+    - "mape" and "fair" are identity-link regression losses. MAPE weights
+      each row by `1 / max(1, |y|)`, so it measures relative error.
+
+    LightGBM objectives mojoboost does not implement, deliberately:
+    "cross_entropy_lambda" (a different link, not an alias of
+    "cross_entropy"), "multiclassova" (one-vs-rest needs a separate
+    trainer), and "rank_xendcg" (use "lambdarank" through
+    MojoBoostRanker). Each is listed in docs/LIGHTGBM_PARITY.md.
 
     `objective` may instead be a callable `f(raw, y) -> (grad, hess)`, called
     once per boosting round with the current raw predictions and the labels.
@@ -1801,14 +2208,39 @@ class MojoBoostRegressor(_Base):
         "quantile": _QUANTILE,
         "mae": _L1,
         "regression_l1": _L1,
+        "poisson": _POISSON,
+        "gamma": _GAMMA,
+        "tweedie": _TWEEDIE,
+        "mape": _MAPE,
+        "fair": _FAIR,
+        "cross_entropy": _CROSS_ENTROPY,
+        "xentropy": _CROSS_ENTROPY,
+    }
+
+    #: objective code -> (parameter name, default). The trainer takes one
+    #: scalar per objective (see src/mojoboost/boosting.mojo); these are the
+    #: LightGBM names for it, and the objectives not listed here take none.
+    _OBJECTIVE_PARAM = {
+        _HUBER: ("alpha", 0.9),
+        _QUANTILE: ("alpha", 0.9),
+        _FAIR: ("fair_c", 1.0),
+        _TWEEDIE: ("tweedie_variance_power", 1.5),
     }
 
     def __init__(
-        self, objective="regression", alpha=0.9, base_score=0.0, **kwargs
+        self,
+        objective="regression",
+        alpha=0.9,
+        fair_c=1.0,
+        tweedie_variance_power=1.5,
+        base_score=0.0,
+        **kwargs,
     ):
         super().__init__(**kwargs)
         self.objective = objective
         self.alpha = alpha
+        self.fair_c = fair_c
+        self.tweedie_variance_power = tweedie_variance_power
         self.base_score = base_score
 
     def _objective_code(self):
@@ -1819,13 +2251,56 @@ class MojoBoostRegressor(_Base):
             raise ValueError(
                 f"unknown objective {self.objective!r}; expected one of "
                 + ", ".join(sorted(self._OBJECTIVES))
+                + _unimplemented_objective_note(self.objective)
             )
-        alpha = float(self.alpha)
-        if code == _HUBER and alpha <= 0.0:
-            raise ValueError("huber requires alpha > 0")
-        if code == _QUANTILE and not 0.0 < alpha < 1.0:
-            raise ValueError("quantile requires 0 < alpha < 1")
+        self._objective_param(code)
         return code
+
+    def _objective_param(self, code=None):
+        """The objective's scalar parameter, validated.
+
+        One trainer slot holds it whatever it is called. `fair_c` and
+        `tweedie_variance_power` name exactly one objective each, so setting
+        one away from its default for a different objective is rejected: it
+        states an intention the model cannot carry out. `alpha` is lenient,
+        as in LightGBM, because it is the shared default name that several
+        objectives ignore and passing it alongside any objective is
+        long-standing usage.
+        """
+        if code is None:
+            code = self._objective_code()
+        name, default = self._OBJECTIVE_PARAM.get(code, (None, 0.9))
+        for other_name, other_default in (
+            ("fair_c", 1.0),
+            ("tweedie_variance_power", 1.5),
+        ):
+            if other_name == name:
+                continue
+            value = float(getattr(self, other_name, other_default))
+            if value != other_default:
+                raise ValueError(
+                    f"{other_name}={value!r} does not apply to objective "
+                    f"{self.objective!r}"
+                    + (
+                        f"; it takes {name}"
+                        if name is not None
+                        else "; that objective takes no scalar parameter"
+                    )
+                )
+        if name is None:
+            return default
+        value = float(getattr(self, name, default))
+        if code == _HUBER and value <= 0.0:
+            raise ValueError("huber requires alpha > 0")
+        if code == _QUANTILE and not 0.0 < value < 1.0:
+            raise ValueError("quantile requires 0 < alpha < 1")
+        if code == _FAIR and value <= 0.0:
+            raise ValueError("fair requires fair_c > 0")
+        if code == _TWEEDIE and not 1.0 < value < 2.0:
+            raise ValueError(
+                "tweedie requires 1 < tweedie_variance_power < 2"
+            )
+        return value
 
     def fit(
         self,
@@ -1841,6 +2316,7 @@ class MojoBoostRegressor(_Base):
         eval_sample_weight=None,
         eval_X=None,
         eval_y=None,
+        callbacks=None,
     ):
         """Fit on `X` (n_samples, n_features) and a numeric target `y`.
 
@@ -1863,9 +2339,28 @@ class MojoBoostRegressor(_Base):
         objective = self._objective_code()
         eval_set = _eval_pairs(eval_set, eval_X, eval_y)
         _check_eval_arguments(
-            eval_set, eval_metric, eval_sample_weight, early_stopping_rounds
+            eval_set,
+            eval_metric,
+            eval_sample_weight,
+            early_stopping_rounds,
+            callbacks,
         )
         self._reset_fitted()
+        if _arrays.is_sparse(X):
+            if objective == _CUSTOM:
+                raise TypeError(
+                    "a Python objective callback does not take sparse input "
+                    "yet; densify with .toarray() or use a built-in objective"
+                )
+            self._reject_sparse_eval_set(eval_set)
+            buffers, n_rows, n_features, names, params, keep = (
+                self._sparse_fit_params(X, sample_weight)
+            )
+            yb = _arrays.check_target(y, n_rows)
+            self._model = _mojoboost.fit_csc(_addr(yb), objective, params)
+            self._record_fit(n_features, names, "cpu")
+            del keep
+            return self
         Xb, n_rows, n_features, names, cat_buf = self._fit_X(X)
         yb = _arrays.check_target(y, n_rows)
         wb, w_addr = self._weight_buffer(sample_weight, n_rows)
@@ -1897,6 +2392,7 @@ class MojoBoostRegressor(_Base):
                 min_delta,
                 primary_metric,
                 eval_sample_weight,
+                callbacks=callbacks,
             )
         elif objective == _CUSTOM:
             self._fit_custom(Xb, yb, n_rows, n_features, params, device)
@@ -2004,6 +2500,12 @@ class MojoBoostRegressor(_Base):
 
         `raw_score` and `pred_leaf` cannot be combined."""
         self._check_predict_flags(raw_score, pred_leaf, pred_contrib)
+        if _arrays.is_sparse(X):
+            out, n_rows = self._sparse_scores(
+                X, raw_score, start_iteration, num_iteration, pred_leaf,
+                pred_contrib, validate_features,
+            )
+            return _finish(out)
         Xb, n_rows = self._check_predict_X(X, validate_features)
         start, stop = self._iteration_slice(start_iteration, num_iteration)
         if pred_leaf:
@@ -2102,14 +2604,96 @@ class MojoBoostClassifier(_Base):
     The classifier takes no `objective`: custom objectives are single-output
     only, so pass yours to `MojoBoostRegressor` and apply your own link to
     its raw predictions. `objective=` is accepted here solely to raise that
-    message rather than a bare TypeError."""
+    message rather than a bare TypeError.
+
+    `class_weight` weights the classes, scikit-learn's parameter and
+    LightGBM's:
+
+    - `None`, the default, weights every row equally.
+    - `"balanced"` gives class k the weight `n_samples / (n_classes *
+      count_k)`, so every class contributes the same total weight. The
+      counts are row counts, not weighted counts, which is scikit-learn's
+      rule; a `sample_weight` you pass is then multiplied on top.
+    - a dict maps a label from `classes_` to its weight. A class the dict
+      does not mention keeps weight 1.0, and a key that is not one of the
+      training labels is an error rather than a line with no effect.
+
+    LightGBM's binary-only `scale_pos_weight` is `class_weight={1: w}` here,
+    and its `is_unbalance` is `class_weight="balanced"` up to a constant
+    factor (`balanced` keeps the mean weight at 1; `is_unbalance` leaves the
+    negatives at 1 and lifts the positives). src/mojoboost/class_weight.mojo
+    has both under their LightGBM names for the Mojo API.
+
+    Weighting is not calibration. A class-weighted model's probabilities are
+    probabilities under the reweighted sample, so `"balanced"` on a rare
+    positive class predicts far above the base rate by design."""
 
     # See the note on MojoBoostRegressor._estimator_type.
     _estimator_type = "classifier"
 
-    def __init__(self, objective=None, **kwargs):
+    def __init__(self, objective=None, class_weight=None, **kwargs):
         super().__init__(**kwargs)
         self.objective = objective
+        self.class_weight = class_weight
+
+    def _class_weight_rows(self, codes, n_rows, classes, sample_weight):
+        """`sample_weight` with `class_weight` folded in, or it unchanged
+        when there is no class weighting.
+
+        `codes` holds the encoded labels (0..n_classes-1) the trainer sees,
+        so the lookup is by position and the dict form is translated through
+        `classes` first.
+        """
+        class_weight = self.class_weight
+        if class_weight is None:
+            return sample_weight
+        n_classes = len(classes)
+        if isinstance(class_weight, str):
+            if class_weight != "balanced":
+                raise ValueError(
+                    f"unknown class_weight {class_weight!r}; expected "
+                    "'balanced', a dict, or None"
+                )
+            counts = [0] * n_classes
+            for r in range(n_rows):
+                counts[int(codes[r])] += 1
+            per_class = []
+            for k in range(n_classes):
+                if counts[k] == 0:
+                    raise ValueError(
+                        f"class {classes[k]!r} has no training rows, so "
+                        "class_weight='balanced' has nothing to balance"
+                    )
+                per_class.append(n_rows / (n_classes * counts[k]))
+        elif isinstance(class_weight, dict):
+            index = {label: k for k, label in enumerate(classes)}
+            per_class = [1.0] * n_classes
+            for label, weight in class_weight.items():
+                if label not in index:
+                    raise ValueError(
+                        f"class_weight names {label!r}, which is not one of "
+                        f"the training labels {list(classes)!r}"
+                    )
+                value = float(weight)
+                if value < 0.0 or value != value:
+                    raise ValueError(
+                        "class_weight values must be finite and nonnegative"
+                    )
+                per_class[index[label]] = value
+            if not any(per_class):
+                raise ValueError(
+                    "class_weight zeroes every class, leaving nothing to fit"
+                )
+        else:
+            raise TypeError(
+                "class_weight must be 'balanced', a dict, or None; got "
+                f"{type(class_weight).__name__}"
+            )
+        rows = [per_class[int(codes[r])] for r in range(n_rows)]
+        if sample_weight is None:
+            return rows
+        given = _arrays.check_sample_weight(sample_weight, n_rows)
+        return [rows[r] * float(given[r]) for r in range(n_rows)]
 
     def fit(
         self,
@@ -2125,6 +2709,7 @@ class MojoBoostClassifier(_Base):
         eval_sample_weight=None,
         eval_X=None,
         eval_y=None,
+        callbacks=None,
     ):
         """Fit on `X` (n_samples, n_features) and labels `y`.
 
@@ -2152,12 +2737,24 @@ class MojoBoostClassifier(_Base):
             )
         eval_set = _eval_pairs(eval_set, eval_X, eval_y)
         _check_eval_arguments(
-            eval_set, eval_metric, eval_sample_weight, early_stopping_rounds
+            eval_set,
+            eval_metric,
+            eval_sample_weight,
+            early_stopping_rounds,
+            callbacks,
         )
         self._reset_fitted()
+        if _arrays.is_sparse(X):
+            self._reject_sparse_eval_set(eval_set)
+            return self._fit_sparse(X, y, sample_weight)
         Xb, n_rows, n_features, names, cat_buf = self._fit_X(X)
         yb, classes = _arrays.encode_labels(y, n_rows)
         n_classes = len(classes)
+        # class_weight becomes ordinary row weights before anything else
+        # sees it, so the trainer has one weighting mechanism, not two.
+        sample_weight = self._class_weight_rows(
+            yb, n_rows, classes, sample_weight
+        )
         wb, w_addr = self._weight_buffer(sample_weight, n_rows)
         ic_flat, ic_offsets = self._interaction_buffers(n_features)
         mono_buf, mono_addr = self._monotone_buffer(n_features)
@@ -2199,6 +2796,7 @@ class MojoBoostClassifier(_Base):
                 ),
                 n_classes=n_classes,
                 encode=encode,
+                callbacks=callbacks,
             )
         elif n_classes == 2:
             self._model = _mojoboost.fit(
@@ -2239,6 +2837,79 @@ class MojoBoostClassifier(_Base):
         self._record_fit(n_features, names, device)
         return self
 
+    def _fit_sparse(self, X, y, sample_weight):
+        """`fit` for SciPy sparse input. Same model, same semantics; the
+        matrix is never densified."""
+        # The labels are encoded before the buffers are built, because
+        # class_weight has to reach the weight buffer the params carry.
+        yb, classes = _arrays.encode_labels(y, X.shape[0])
+        n_classes = len(classes)
+        sample_weight = self._class_weight_rows(
+            yb, X.shape[0], classes, sample_weight
+        )
+        buffers, n_rows, n_features, names, params, keep = (
+            self._sparse_fit_params(X, sample_weight)
+        )
+        if n_rows != len(yb):
+            raise ValueError("X and y must have the same number of rows")
+        self._multiclass = n_classes > 2
+        if n_classes == 2:
+            self._model = _mojoboost.fit_csc(
+                _addr(yb), _BINARY_LOGISTIC, params
+            )
+        else:
+            self._model = _mojoboost.fit_multiclass_csc(
+                _addr(yb), n_classes, params
+            )
+        self.classes_ = (
+            _np.asarray(classes) if _np is not None else list(classes)
+        )
+        self.n_classes_ = n_classes
+        self._record_fit(n_features, names, "cpu")
+        del keep
+        return self
+
+    def _predict_proba_sparse(
+        self, X, raw_score, start_iteration, num_iteration, pred_leaf,
+        pred_contrib, validate_features,
+    ):
+        """`predict_proba` for sparse input. Binary goes through the shared
+        single-output path; multiclass has its own row-major buffer."""
+        if self.n_classes_ == 2:
+            out, n_rows = self._sparse_scores(
+                X, raw_score, start_iteration, num_iteration, pred_leaf,
+                pred_contrib, validate_features,
+            )
+            if raw_score:
+                return _finish(out)
+            if _np is not None:
+                return _np.column_stack([1.0 - out, out])
+            return [[1.0 - p, p] for p in out]
+        if pred_leaf or pred_contrib:
+            raise ValueError(
+                "pred_leaf and pred_contrib do not take sparse input yet; "
+                "densify with .toarray()"
+            )
+        if start_iteration != 0 or num_iteration is not None:
+            raise ValueError(
+                "iteration slicing does not take sparse input yet; densify "
+                "with .toarray()"
+            )
+        if raw_score:
+            raise ValueError(
+                "raw_score does not take sparse multiclass input yet; "
+                "densify with .toarray()"
+            )
+        buffers, n_rows = self._check_predict_X_sparse(X, validate_features)
+        out = _out_buffer(n_rows * self.n_classes_)
+        _mojoboost.predict_proba_csr(
+            self._model, buffers.params(), _addr(out)
+        )
+        if _np is not None:
+            return out.reshape(n_rows, self.n_classes_)
+        k = self.n_classes_
+        return [list(out[r * k : (r + 1) * k]) for r in range(n_rows)]
+
     def predict_proba(
         self,
         X,
@@ -2274,6 +2945,11 @@ class MojoBoostClassifier(_Base):
         `validate_features` and the `raw_score`/`pred_leaf` exclusion are
         also as documented there."""
         self._check_predict_flags(raw_score, pred_leaf, pred_contrib)
+        if _arrays.is_sparse(X):
+            return self._predict_proba_sparse(
+                X, raw_score, start_iteration, num_iteration, pred_leaf,
+                pred_contrib, validate_features,
+            )
         Xb, n_rows = self._check_predict_X(X, validate_features)
         n_features = self.n_features_in_
         start, stop = self._iteration_slice(start_iteration, num_iteration)
@@ -2605,6 +3281,7 @@ class MojoBoostRanker(_Base):
         eval_sample_weight=None,
         eval_X=None,
         eval_y=None,
+        callbacks=None,
     ):
         """Fit on `X` (n_samples, n_features), relevance labels `y`, and
         `group`, the row count of each query in row order.
@@ -2620,7 +3297,11 @@ class MojoBoostRanker(_Base):
         """
         eval_set = _eval_pairs(eval_set, eval_X, eval_y)
         _check_eval_arguments(
-            eval_set, eval_metric, eval_sample_weight, early_stopping_rounds
+            eval_set,
+            eval_metric,
+            eval_sample_weight,
+            early_stopping_rounds,
+            callbacks,
         )
         if eval_set is not None:
             if eval_group is None:
@@ -2679,6 +3360,7 @@ class MojoBoostRanker(_Base):
                 eval_group=eval_group,
                 task=_eval.RANKING,
                 encode=check_grades,
+                callbacks=callbacks,
             )
         else:
             self._model = _mojoboost.fit_ranker(

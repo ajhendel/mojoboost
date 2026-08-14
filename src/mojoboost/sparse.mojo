@@ -3,33 +3,62 @@
 MojoBoost's histogram work is feature-oriented, so the internal
 representation is compressed sparse column (CSC): every feature owns one
 contiguous run of (row index, value) pairs. CSR input is transposed to CSC
-once on the way in, and back to a row view for prediction.
+once on the way in, and back to a row view for prediction. Neither direction
+materializes a dense matrix: every routine here costs O(nnz + n_rows) or
+O(nnz + n_features) memory, and the only functions that allocate
+`n_rows * n_features` are the `to_dense` test helpers, which say so.
 
-Implicit-zero semantics
------------------------
-An entry absent from the sparse structure is the numerical value `0.0`, not
-a missing value. A sparse matrix is therefore exactly equivalent to the
-dense matrix obtained by filling the gaps with zeros: implicit zeros
-participate in the quantile bin edges like any other value, land in whatever
-bin contains 0.0, and route through splits accordingly. Explicitly stored
-zeros (which SciPy keeps until `eliminate_zeros()` is called) are treated
-identically to implicit ones.
+Absent entries, explicit zeros, and NaN
+--------------------------------------
+The three are specified independently:
+
+- An **absent** entry, one the compressed structure does not store, is the
+  numerical value `0.0`. A sparse matrix is therefore exactly equivalent to
+  the dense matrix obtained by filling its gaps with zeros: absent entries
+  participate in the quantile bin edges like any other value, land in
+  whatever bin contains 0.0, and route through splits accordingly.
+- An **explicitly stored zero** (SciPy keeps those until `eliminate_zeros()`
+  is called) is treated identically to an absent one. Storing it or dropping
+  it changes nothing about the fitted bins, the histograms, or the trees.
+- A stored **NaN** is a missing value, exactly as on the dense path
+  (see binning.mojo): it is excluded from the quantile computation, the
+  feature reserves a bin for it when `use_missing` is set, and it routes by
+  the node's learned default direction. NaN is the only missing marker;
+  absence is not missingness. There is no way to express a missing value by
+  leaving an entry out, which is the point of specifying the two separately.
 
 This matches LightGBM's default `zero_as_missing=false`. LightGBM's
-`zero_as_missing=true` mode is not implemented, and neither is missing-value
-handling in general (NaN routed to a learned default child): MojoBoost has no
-missing-value support on the dense path either, and NaN inputs are
-unsupported on both.
+`zero_as_missing=true`, which reinterprets both absent entries and stored
+zeros as missing, is not implemented, and no alias accepts it.
 
 Canonical form
 --------------
 CSC requires strictly ascending row indices within each column, and CSR
 strictly ascending column indices within each row. That is SciPy's canonical
 form (`sum_duplicates()` then `sort_indices()`), and it also rules out
-duplicate entries. `validate` enforces it.
+duplicate entries. `validate` enforces it and is called by every routine
+that reads a matrix, so a malformed structure raises rather than reading out
+of bounds or quietly binning the wrong rows.
+
+Index widths are the caller's problem only at the boundary: indices are
+`Int` here, so a producer holding 32-bit index arrays widens them on the way
+in. `validate` bounds every index against the matrix shape either way.
 """
 
-from .binning import BinMapper, BinnedMatrix
+from std.math import isnan
+
+from .binning import (
+    BinMapper,
+    BinnedMatrix,
+    _avoid_inf,
+    _sized_missing_bins,
+    no_missing_bins,
+)
+from .categorical import (
+    CategoricalSpec,
+    _MAX_CATEGORY,
+    _keep_most_frequent,
+)
 from .parallel import dispatch_features
 
 
@@ -99,6 +128,32 @@ struct CscMatrix(Copyable, Movable):
             col_index^, values^, row_offsets^, self.n_rows, self.n_features
         )
 
+    def lookup(self, row: Int, feature: Int) -> Float64:
+        """Value at (row, feature), 0.0 when the entry is absent. O(log
+        nnz_f) by binary search over the feature's stored rows."""
+        var lo = self.col_offsets[feature]
+        var hi = self.col_offsets[feature + 1]
+        var end = hi
+        while lo < hi:
+            var mid = (lo + hi) // 2
+            if self.row_index[mid] < row:
+                lo = mid + 1
+            else:
+                hi = mid
+        if lo < end and self.row_index[lo] == row:
+            return self.values[lo]
+        return 0.0
+
+    def row(self, r: Int) -> List[Float64]:
+        """One row as `n_features` raw values, absent entries filled with
+        0.0. Costs O(n_features + nnz_r) and allocates one row, not a
+        matrix: this is the prediction-side accessor."""
+        var out = List[Float64](capacity=self.n_features)
+        out.resize(self.n_features, 0.0)
+        for f in range(self.n_features):
+            out[f] = self.lookup(r, f)
+        return out^
+
     def to_dense(self) raises -> List[Float64]:
         """Densify to a column-major matrix. Test and benchmark helper only:
         allocating n_rows * n_features floats is exactly what the sparse path
@@ -158,6 +213,15 @@ struct CsrMatrix(Copyable, Movable):
             return self.values[lo]
         return 0.0
 
+    def row(self, r: Int) -> List[Float64]:
+        """One row as `n_features` raw values, absent entries filled with
+        0.0. O(n_features + nnz_r), one row's worth of memory."""
+        var out = List[Float64](capacity=self.n_features)
+        out.resize(self.n_features, 0.0)
+        for i in range(self.row_offsets[r], self.row_offsets[r + 1]):
+            out[self.col_index[i]] = self.values[i]
+        return out^
+
     def to_csc(self) raises -> CscMatrix:
         """Transpose to the feature-oriented layout. O(nnz + n_features)."""
         self.validate()
@@ -210,7 +274,14 @@ def _check_compressed(
     inner: String,
 ) raises:
     """Shared CSC/CSR structural validation. `outer` is the compressed axis
-    (columns for CSC, rows for CSR) and `inner` the indexed one."""
+    (columns for CSC, rows for CSR) and `inner` the indexed one.
+
+    Every failure a malformed producer can hand over is caught here, before
+    any index is dereferenced: wrong dimensions, a wrong-length or
+    non-monotone offset array, an offset array that does not start at 0 or
+    end at nnz, mismatched index and value arrays, an out-of-range index, and
+    unsorted or duplicated indices within one outer slice.
+    """
     if n_outer < 1 or n_inner < 1:
         raise Error(kind + " matrix must have positive dimensions")
     if len(offsets) != n_outer + 1:
@@ -244,7 +315,8 @@ def csc_from_dense(
 ) raises -> CscMatrix:
     """Build a CSC matrix from a column-major dense matrix, dropping zeros.
     Test and benchmark helper: real callers should never materialize the
-    dense matrix in the first place."""
+    dense matrix in the first place. `NaN` is stored, since it is a missing
+    value and not an absent entry (see the module docstring)."""
     if len(features) != n_rows * n_features:
         raise Error("features length must equal n_rows * n_features")
     var row_index = List[Int]()
@@ -259,6 +331,27 @@ def csc_from_dense(
                 values.append(v)
         col_offsets.append(len(values))
     return CscMatrix(row_index^, values^, col_offsets^, n_rows, n_features)
+
+
+def csr_from_dense(
+    features: List[Float64], n_rows: Int, n_features: Int
+) raises -> CsrMatrix:
+    """`csc_from_dense`'s row-oriented twin, from the same column-major dense
+    matrix. Test and benchmark helper."""
+    if len(features) != n_rows * n_features:
+        raise Error("features length must equal n_rows * n_features")
+    var col_index = List[Int]()
+    var values = List[Float64]()
+    var row_offsets = List[Int](capacity=n_rows + 1)
+    row_offsets.append(0)
+    for r in range(n_rows):
+        for f in range(n_features):
+            var v = features[f * n_rows + r]
+            if v != 0.0:
+                col_index.append(f)
+                values.append(v)
+        row_offsets.append(len(values))
+    return CsrMatrix(col_index^, values^, row_offsets^, n_rows, n_features)
 
 
 def _sorted_column_at(
@@ -278,17 +371,127 @@ def _sorted_column_at(
     return stored[i - n_implicit]
 
 
-def fit_bins_csc(csc: CscMatrix, max_bins: Int = 255) raises -> BinMapper:
+def _distinct_codes_and_counts_csc(
+    csc: CscMatrix,
+    feature: Int,
+    mut codes: List[Int],
+    mut counts: List[Int],
+) raises:
+    """Ascending distinct non-missing category codes of one sparse column,
+    with their row counts, absent entries folded in as code 0.
+
+    The dense counterpart is `categorical._distinct_codes_and_counts`; this
+    one produces the same table for the same logical column without
+    materializing it. Negative values and NaN are missing and excluded, as
+    they are there.
+    """
+    var lo = csc.col_offsets[feature]
+    var hi = csc.col_offsets[feature + 1]
+    var present = List[Int]()
+    for i in range(lo, hi):
+        var v = csc.values[i]
+        # `not (v >= 0.0)` also rejects NaN, matching `CategoricalSpec.bin_of`.
+        if not (v >= 0.0):
+            continue
+        if v >= Float64(_MAX_CATEGORY):
+            raise Error(
+                "categorical feature values must be below 2^31; use smaller"
+                " integer codes"
+            )
+        present.append(Int(v))
+    sort(present)
+
+    # Absent entries are the value 0.0, which is category code 0.
+    var n_implicit = csc.n_rows - (hi - lo)
+    var emitted_zero = False
+    var i = 0
+    while i < len(present):
+        var j = i
+        while j + 1 < len(present) and present[j + 1] == present[i]:
+            j += 1
+        var count = j - i + 1
+        if present[i] == 0:
+            count += n_implicit
+            emitted_zero = True
+        elif not emitted_zero and n_implicit > 0:
+            # Codes are ascending, so 0 comes first when it is present at
+            # all; reaching a larger code means it was not stored.
+            codes.append(0)
+            counts.append(n_implicit)
+            emitted_zero = True
+        codes.append(present[i])
+        counts.append(count)
+        i = j + 1
+    if not emitted_zero and n_implicit > 0:
+        codes.append(0)
+        counts.append(n_implicit)
+
+
+def fit_categorical_spec_csc(
+    csc: CscMatrix,
+    categorical_features: List[Int],
+    max_bins: Int,
+) raises -> CategoricalSpec:
+    """`categorical.fit_categorical_spec` on a sparse matrix.
+
+    Same tables, same tie-breaking, no densification: absent entries count as
+    category 0, which is what they are.
+    """
+    if max_bins < 2:
+        raise Error("max_bins must be at least 2")
+    var n_features = csc.n_features
+    var flags = List[Bool](capacity=n_features)
+    for _ in range(n_features):
+        flags.append(False)
+    for i in range(len(categorical_features)):
+        var f = categorical_features[i]
+        if f < 0 or f >= n_features:
+            raise Error("categorical feature index out of range")
+        if flags[f]:
+            raise Error("duplicate categorical feature index")
+        flags[f] = True
+
+    var codes = List[Int]()
+    var offsets = List[Int](capacity=n_features + 1)
+    offsets.append(0)
+    for f in range(n_features):
+        if flags[f]:
+            var raw_codes = List[Int]()
+            var raw_counts = List[Int]()
+            _distinct_codes_and_counts_csc(csc, f, raw_codes, raw_counts)
+            var kept = _keep_most_frequent(raw_codes, raw_counts, max_bins - 1)
+            for i in range(len(kept)):
+                codes.append(kept[i])
+        offsets.append(len(codes))
+    return CategoricalSpec(flags^, codes^, offsets^)
+
+
+def fit_bins_csc(
+    csc: CscMatrix,
+    max_bins: Int = 255,
+    categorical_features: List[Int] = [],
+    use_missing: Bool = True,
+) raises -> BinMapper:
     """Fit quantile bin edges on a sparse matrix, without densifying.
 
-    Produces bit-identical edges to `fit_bins` on the densified matrix: per
-    feature it sorts only the stored values (O(nnz_f log nnz_f)) and indexes
-    the implied dense sorted column through `_sorted_column_at` instead of
-    materializing n_rows values.
+    Produces bit-identical edges, category tables, and missing-bin
+    reservations to `binning.fit_bins` on the densified matrix. Per feature it
+    sorts only the stored values (O(nnz_f log nnz_f)) and indexes the implied
+    dense sorted column through `_sorted_column_at` instead of materializing
+    n_rows values.
+
+    `categorical_features` and `use_missing` mean exactly what they mean on
+    the dense path (see binning.mojo): named features get a category table
+    and no edges, and a column holding any stored `NaN` reserves its highest
+    bin for missing values, fitting its edges over the remaining
+    `max_bins - 1` bins. Absent entries are the value 0.0 throughout, so they
+    enter the quantiles and never the missing bin.
     """
     if max_bins < 2 or max_bins > 256:
         raise Error("max_bins must be in [2, 256]")
     csc.validate()
+
+    var cats = fit_categorical_spec_csc(csc, categorical_features, max_bins)
 
     var n_rows = csc.n_rows
     var n_features = csc.n_features
@@ -297,28 +500,42 @@ def fit_bins_csc(csc: CscMatrix, max_bins: Int = 255) raises -> BinMapper:
     scratch.resize(n_features * max_edges, 0.0)
     var counts = List[Int](capacity=n_features)
     counts.resize(n_features, 0)
+    var missing_bin = no_missing_bins(n_features)
 
     var scratch_p = scratch.unsafe_ptr()
     var counts_p = counts.unsafe_ptr()
+    var missing_p = missing_bin.unsafe_ptr()
     var val_p = csc.values.unsafe_ptr()
     var off_p = csc.col_offsets.unsafe_ptr()
+    ref spec = cats
 
     def do_feature(f: Int) {imm}:
+        # Categorical columns never enter quantile binning.
+        if spec.is_cat(f):
+            counts_p.unsafe_store(f, 0)
+            return
         var lo = off_p.unsafe_load(f)
         var hi = off_p.unsafe_load(f + 1)
         var n_stored = hi - lo
+        # NaN is dropped before the sort, so it never takes part in a
+        # quantile comparison, exactly as on the dense path.
         var stored = List[Float64](capacity=n_stored)
         for i in range(lo, hi):
-            stored.append(val_p.unsafe_load(i))
+            var v = val_p.unsafe_load(i)
+            if not isnan(v):
+                stored.append(v)
         sort(stored)
 
         var n_implicit = n_rows - n_stored
+        var n_valid = len(stored) + n_implicit
+        var reserve = use_missing and n_valid < n_rows
+        var n_ordinary = max_bins - 1 if reserve else max_bins
         var n_neg = 0
-        while n_neg < n_stored and stored[n_neg] < 0.0:
+        while n_neg < len(stored) and stored[n_neg] < 0.0:
             n_neg += 1
         var n_stored_zero = 0
         while (
-            n_neg + n_stored_zero < n_stored
+            n_neg + n_stored_zero < len(stored)
             and stored[n_neg + n_stored_zero] == 0.0
         ):
             n_stored_zero += 1
@@ -326,9 +543,9 @@ def fit_bins_csc(csc: CscMatrix, max_bins: Int = 255) raises -> BinMapper:
 
         var out = scratch_p.unsafe_offset(f * max_edges)
         var n_out = 0
-        for b in range(1, max_bins):
-            var idx = b * n_rows // max_bins
-            if idx <= 0 or idx >= n_rows:
+        for b in range(1, n_ordinary):
+            var idx = b * n_valid // n_ordinary
+            if idx <= 0 or idx >= n_valid:
                 continue
             var below = _sorted_column_at(
                 stored, n_neg, n_zero, n_implicit, idx - 1
@@ -338,12 +555,17 @@ def fit_bins_csc(csc: CscMatrix, max_bins: Int = 255) raises -> BinMapper:
             )
             if above <= below:
                 continue
-            var edge = (below + above) / 2.0
+            var edge = _avoid_inf((below + above) / 2.0)
+            # Repeated quantile indices (n_valid < n_ordinary) revisit the
+            # same boundary, and clamping an infinite midpoint can repeat the
+            # previous edge; keep edges strictly increasing either way.
             if n_out > 0 and edge <= out.unsafe_load(n_out - 1):
                 continue
             out.unsafe_store(n_out, edge)
             n_out += 1
         counts_p.unsafe_store(f, n_out)
+        # k edges give ordinary bins 0..k, so the missing bin is k + 1.
+        missing_p.unsafe_store(f, n_out + 1 if reserve else -1)
 
     dispatch_features(
         do_feature, n_features, csc.nnz() + n_features * max_bins
@@ -357,10 +579,11 @@ def fit_bins_csc(csc: CscMatrix, max_bins: Int = 255) raises -> BinMapper:
         for i in range(counts[f]):
             edges.append(scratch[base + i])
         offsets.append(len(edges))
-    return BinMapper(edges^, offsets^, n_features, max_bins)
+    return BinMapper(
+        edges^, offsets^, n_features, max_bins, cats^, missing_bin^
+    )
 
 
-@fieldwise_init
 struct SparseBinnedMatrix(Copyable, Movable):
     """Binned CSC matrix.
 
@@ -369,10 +592,18 @@ struct SparseBinnedMatrix(Copyable, Movable):
     a stored entry for feature f falls in `default_bin[f]`, the bin that
     contains 0.0.
 
+    `cats` and `missing_bin` carry the same meaning as on `BinnedMatrix`: the
+    categorical features and the per-feature bin reserved for missing values
+    (-1 for a feature that reserves none). They are properties of the fitted
+    binning, so they are the mapper's, copied here for the accumulators and
+    split search that read them.
+
     Stored entries whose value happens to bin to `default_bin[f]` are kept
     rather than compacted away; the accumulator handles the coincidence
     (see `histogram_sparse.mojo`), and dropping them would cost an extra
-    pass for no change in results.
+    pass for no change in results. A stored `NaN` bins to `missing_bin[f]`,
+    which is never a default bin, so missing rows stay distinguishable from
+    absent ones.
     """
 
     var row_index: List[Int]
@@ -382,6 +613,33 @@ struct SparseBinnedMatrix(Copyable, Movable):
     var n_rows: Int
     var n_features: Int
     var n_bins: Int
+    var cats: CategoricalSpec
+    var missing_bin: List[Int]
+
+    def __init__(
+        out self,
+        var row_index: List[Int],
+        var bin: List[UInt8],
+        var col_offsets: List[Int],
+        var default_bin: List[UInt8],
+        n_rows: Int,
+        n_features: Int,
+        n_bins: Int,
+        var cats: CategoricalSpec = CategoricalSpec.none(),
+        var missing_bin: List[Int] = [],
+    ):
+        """A `missing_bin` table of the wrong length (the empty default
+        included) means no feature reserves a missing bin, matching
+        `BinnedMatrix`."""
+        self.row_index = row_index^
+        self.bin = bin^
+        self.col_offsets = col_offsets^
+        self.default_bin = default_bin^
+        self.n_rows = n_rows
+        self.n_features = n_features
+        self.n_bins = n_bins
+        self.cats = cats^
+        self.missing_bin = _sized_missing_bins(missing_bin^, n_features)
 
     def nnz(self) -> Int:
         return len(self.bin)
@@ -402,6 +660,13 @@ struct SparseBinnedMatrix(Copyable, Movable):
             return Int(self.bin[lo])
         return Int(self.default_bin[feature])
 
+    def is_missing(self, row: Int, feature: Int) -> Bool:
+        """Whether (row, feature) holds a missing value. Absent entries are
+        zeros, not missing values, so this is False for them unless the
+        feature's default bin is itself the missing bin, which cannot
+        happen."""
+        return self.bin_at(row, feature) == self.missing_bin[feature]
+
     def to_dense(self) raises -> BinnedMatrix:
         """Densify to a `BinnedMatrix`. Test and benchmark helper only."""
         var size = self.n_rows * self.n_features
@@ -413,7 +678,14 @@ struct SparseBinnedMatrix(Copyable, Movable):
                 bins[col + r] = self.default_bin[f]
             for i in range(self.col_offsets[f], self.col_offsets[f + 1]):
                 bins[col + self.row_index[i]] = self.bin[i]
-        return BinnedMatrix(bins^, self.n_rows, self.n_features, self.n_bins)
+        return BinnedMatrix(
+            bins^,
+            self.n_rows,
+            self.n_features,
+            self.n_bins,
+            self.cats.copy(),
+            self.missing_bin.copy(),
+        )
 
     def to_rows(self) raises -> SparseBinnedRows:
         """Row-oriented view for per-row tree walks. O(nnz + n_rows)."""
@@ -480,9 +752,26 @@ struct SparseBinnedRows(Copyable, Movable):
             return Int(self.bin[lo])
         return Int(self.default_bin[feature])
 
+    def bins_of_row(self, row: Int) -> List[Int]:
+        """Every feature's bin for one row, the `bin_row` of the sparse path.
+        Absent entries take their feature's default bin. O(n_features +
+        nnz_r), one row's worth of memory."""
+        var out = List[Int](capacity=self.n_features)
+        for f in range(self.n_features):
+            out.append(Int(self.default_bin[f]))
+        for i in range(self.row_offsets[row], self.row_offsets[row + 1]):
+            out[self.feature_index[i]] = Int(self.bin[i])
+        return out^
+
 
 def default_bins(mapper: BinMapper) raises -> List[UInt8]:
-    """The bin holding the implicit zero, per feature."""
+    """The bin holding the implicit zero, per feature.
+
+    For a categorical feature this is the bin of category 0, or the unknown
+    bin when 0 was not kept; for a numerical one it is whichever ordinary bin
+    contains 0.0. It is never a missing bin, because `bin_value` routes only
+    `NaN` there.
+    """
     var out = List[UInt8](capacity=mapper.n_features)
     for f in range(mapper.n_features):
         out.append(UInt8(mapper.bin_value(f, 0.0)))
@@ -496,7 +785,9 @@ def transform_csc(
 
     The result is bin-for-bin identical to `mapper.transform` on the
     densified matrix, because an absent entry bins exactly as the stored
-    value 0.0 would.
+    value 0.0 would. Categorical features route through the mapper's category
+    tables and stored `NaN` through the reserved missing bin, both exactly as
+    the dense transform does.
     """
     csc.validate()
     if csc.n_features != mapper.n_features:
@@ -511,12 +802,30 @@ def transform_csc(
     var off_p = csc.col_offsets.unsafe_ptr()
     var edges_p = mapper.edges.unsafe_ptr()
     var edge_offs_p = mapper.edge_offsets.unsafe_ptr()
+    var miss_p = mapper.missing_bin.unsafe_ptr()
+    ref cats = mapper.cats
 
     def do_feature(f: Int) {imm}:
+        var lo = off_p.unsafe_load(f)
+        var hi = off_p.unsafe_load(f + 1)
+        if cats.is_cat(f):
+            for i in range(lo, hi):
+                bins_p.unsafe_store(
+                    i, UInt8(cats.bin_of(f, val_p.unsafe_load(i)))
+                )
+            return
         var elo = edge_offs_p.unsafe_load(f)
         var ehi = edge_offs_p.unsafe_load(f + 1)
-        for i in range(off_p.unsafe_load(f), off_p.unsafe_load(f + 1)):
+        var mb = miss_p.unsafe_load(f)
+        for i in range(lo, hi):
             var v = val_p.unsafe_load(i)
+            # NaN is routed before any comparison, so it never takes part in
+            # the quantile search (see `BinMapper.bin_value`).
+            if isnan(v):
+                if mb >= 0:
+                    bins_p.unsafe_store(i, UInt8(mb))
+                    continue
+                v = 0.0
             var left = elo
             var right = ehi
             while left < right:
@@ -537,4 +846,6 @@ def transform_csc(
         csc.n_rows,
         csc.n_features,
         mapper.n_bins,
+        mapper.cats.copy(),
+        mapper.missing_bin.copy(),
     )

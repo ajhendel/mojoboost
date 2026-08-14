@@ -448,11 +448,14 @@ def test_refitting_replaces_the_mapping():
     )
     est.fit(other, y)
     assert est.categorical_feature_ == [0]
-    assert list(est.predict(other)) == list(est.predict(other))
-    with pytest.raises(ValueError, match="no category mapping"):
-        # 'a'..'f' are not categories of this model any more; the frame's
-        # own dtype cannot stand in for the ones it was fitted on.
-        est.predict(X)
+    # 'a'..'f' are not categories of this model any more, so they are unseen
+    # rather than reinterpreted through the frame's own codes: exactly the
+    # route a label the model never met takes.
+    unseen = pd.DataFrame({"color": ["zzz"] * len(codes), "x": x})
+    assert list(est.predict(X)) == list(est.predict(unseen))
+    # And the refit did learn the new labels, or everything above would be
+    # unseen and the equality would be vacuous.
+    assert not np.allclose(est.predict(other), est.predict(unseen))
 
 
 def test_refitting_without_categorical_features_clears_the_state():

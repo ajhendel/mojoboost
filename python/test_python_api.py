@@ -1185,6 +1185,253 @@ def test_ranker_validation():
     print("ranker validation ok")
 
 
+# ---------------------------------------------------------------- sparse
+#
+# The wrapper never imports scipy: it duck-types the CSC/CSR interface. So
+# these run against real scipy when it is installed and against a
+# stand-in with the same attribute surface when it is not, which exercises
+# the identical code path either way.
+
+try:
+    from scipy import sparse as _scipy_sparse
+except ImportError:
+    _scipy_sparse = None
+
+
+class _StubSparse:
+    """A CSC/CSR matrix with SciPy's attribute surface, for environments
+    without scipy. Only what the wrapper touches is implemented."""
+
+    def __init__(self, data, indices, indptr, shape, fmt, canonical=True):
+        self.data = data
+        self.indices = indices
+        self.indptr = indptr
+        self.shape = shape
+        self.format = fmt
+        self.ndim = 2
+        self.has_canonical_format = canonical
+
+    @property
+    def nnz(self):
+        return len(self.data)
+
+    def toarray(self):
+        rows, cols = self.shape
+        out = [[0.0] * cols for _ in range(rows)]
+        outer = cols if self.format == "csc" else rows
+        for k in range(outer):
+            for i in range(self.indptr[k], self.indptr[k + 1]):
+                if self.format == "csc":
+                    out[self.indices[i]][k] = self.data[i]
+                else:
+                    out[k][self.indices[i]] = self.data[i]
+        return out
+
+    def copy(self):
+        return _StubSparse(
+            list(self.data), list(self.indices), list(self.indptr),
+            self.shape, self.format, self.has_canonical_format,
+        )
+
+    def sum_duplicates(self):
+        self.has_canonical_format = True
+
+    def tocsc(self):
+        return _stub_from_dense(self.toarray(), "csc")
+
+    def tocsr(self):
+        return _stub_from_dense(self.toarray(), "csr")
+
+
+def _stub_from_dense(A, fmt):
+    n_rows = len(A)
+    n_features = len(A[0])
+    data, indices, indptr = [], [], [0]
+    outer = n_features if fmt == "csc" else n_rows
+    for k in range(outer):
+        inner = n_rows if fmt == "csc" else n_features
+        for i in range(inner):
+            v = A[i][k] if fmt == "csc" else A[k][i]
+            if v != 0.0:
+                indices.append(i)
+                data.append(float(v))
+        indptr.append(len(data))
+    if _np is not None:
+        data = _np.asarray(data, dtype=_np.float64)
+        # int32 on purpose: that is SciPy's default index width, and the
+        # wrapper has to widen it.
+        indices = _np.asarray(indices, dtype=_np.int32)
+        indptr = _np.asarray(indptr, dtype=_np.int32)
+    return _StubSparse(data, indices, indptr, (n_rows, n_features), fmt)
+
+
+def _to_sparse(A, fmt):
+    if _scipy_sparse is not None:
+        return (
+            _scipy_sparse.csc_matrix(A)
+            if fmt == "csc"
+            else _scipy_sparse.csr_matrix(A)
+        )
+    return _stub_from_dense(A, fmt)
+
+
+def _sparse_backend():
+    return "scipy" if _scipy_sparse is not None else "duck-typed stand-in"
+
+
+def make_sparse_regression(n_rows, n_features=10, density=0.2, seed=23):
+    """Dense rows that are mostly exact zeros, plus a target linear in every
+    feature with a distinct coefficient (equal coefficients make split gains
+    tie, and then which of two features wins is decided by rounding)."""
+    rng = _rand_stream(seed)
+    A = []
+    for _ in range(n_rows):
+        row = []
+        for _ in range(n_features):
+            u = next(rng)
+            row.append(4.0 * (u / density) - 2.0 if u < density else 0.0)
+        A.append(row)
+    y = [
+        sum((1.0 + 0.37 * f) * row[f] for f in range(n_features)) / 4.0
+        + 0.05 * (next(rng) - 0.5)
+        for row in A
+    ]
+    return A, y
+
+
+def _max_gap(a, b):
+    return max(abs(x - y) for x, y in zip(list(a), list(b)))
+
+
+def test_sparse_regressor_matches_dense():
+    A, y = make_sparse_regression(600)
+    csc = _to_sparse(A, "csc")
+    csr = _to_sparse(A, "csr")
+
+    dense = MojoBoostRegressor(n_estimators=25, num_leaves=10).fit(A, y)
+    sparse = MojoBoostRegressor(n_estimators=25, num_leaves=10).fit(csc, y)
+    assert sparse.n_features_in_ == 10
+    assert sparse.device_ == "cpu"
+
+    # An implicit zero is a numerical zero, so the two fits are the same fit.
+    assert _max_gap(dense.predict(A), sparse.predict(A)) < 1e-9
+    # And the sparse prediction path is exact against the dense one, because
+    # it walks the same trees over the same bins.
+    assert list(sparse.predict(csr)) == list(sparse.predict(A))
+    assert list(sparse.predict(csc)) == list(sparse.predict(csr))
+    print(f"sparse regressor ok ({_sparse_backend()})")
+
+
+def test_sparse_does_not_mutate_input():
+    A, y = make_sparse_regression(200)
+    messy = _to_sparse(A, "csc")
+    messy.has_canonical_format = False
+    before = list(messy.indices)
+    MojoBoostRegressor(n_estimators=3).fit(messy, y)
+    assert list(messy.indices) == before, "fit mutated the caller's matrix"
+    print("sparse input not mutated ok")
+
+
+def test_sparse_classifier_matches_dense():
+    A, y = make_sparse_regression(600)
+    csc = _to_sparse(A, "csc")
+    csr = _to_sparse(A, "csr")
+
+    binary = [1 if t > 0.0 else 0 for t in y]
+    dense = MojoBoostClassifier(n_estimators=20, num_leaves=8).fit(A, binary)
+    sparse = MojoBoostClassifier(n_estimators=20, num_leaves=8).fit(csc, binary)
+    assert sparse.n_classes_ == 2
+    for a, b in zip(dense.predict_proba(A), sparse.predict_proba(csr)):
+        assert _max_gap(a, b) < 1e-9
+    assert list(dense.predict(A)) == list(sparse.predict(csr))
+
+    three = [0 if t < -1.0 else (1 if t < 1.0 else 2) for t in y]
+    dense3 = MojoBoostClassifier(n_estimators=12, num_leaves=8).fit(A, three)
+    sparse3 = MojoBoostClassifier(n_estimators=12, num_leaves=8).fit(csc, three)
+    assert sparse3.n_classes_ == 3
+    for a, b in zip(dense3.predict_proba(A), sparse3.predict_proba(csr)):
+        assert _max_gap(a, b) < 1e-9
+        assert abs(sum(b) - 1.0) < 1e-9
+    print(f"sparse classifier ok ({_sparse_backend()})")
+
+
+def test_sparse_sample_weight_and_missing():
+    A, y = make_sparse_regression(400)
+    csc = _to_sparse(A, "csc")
+    csr = _to_sparse(A, "csr")
+    w = [0.5 + (i % 7) / 7.0 for i in range(len(y))]
+    dense = MojoBoostRegressor(n_estimators=15).fit(A, y, sample_weight=w)
+    sparse = MojoBoostRegressor(n_estimators=15).fit(csc, y, sample_weight=w)
+    assert _max_gap(dense.predict(A), sparse.predict(csr)) < 1e-9
+
+    # NaN is still the missing marker; the implicit zeros are not missing.
+    nan = float("nan")
+    An = [list(row) for row in A]
+    k = 0
+    for row in An:
+        for f in range(len(row)):
+            if row[f] != 0.0:
+                k += 1
+                if k % 5 == 0:
+                    row[f] = nan
+    dense_n = MojoBoostRegressor(n_estimators=15).fit(An, y)
+    sparse_n = MojoBoostRegressor(n_estimators=15).fit(
+        _to_sparse(An, "csc"), y
+    )
+    assert (
+        _max_gap(dense_n.predict(An), sparse_n.predict(_to_sparse(An, "csr")))
+        < 1e-9
+    )
+    print("sparse sample_weight and missing values ok")
+
+
+def test_sparse_save_load():
+    A, y = make_sparse_regression(300)
+    csc = _to_sparse(A, "csc")
+    csr = _to_sparse(A, "csr")
+    model = MojoBoostRegressor(n_estimators=15).fit(csc, y)
+    before = list(model.predict(csr))
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "sparse.mbst")
+        model.save(path)
+        loaded = MojoBoostRegressor.load(path)
+        after = list(loaded.predict(csr))
+    # A sparse fit produces an ordinary model: nothing about the serialized
+    # format changes, and the round trip stays bit-exact.
+    assert before == after, "round-trip not exact"
+    print("sparse save/load ok")
+
+
+def test_sparse_validation():
+    A, y = make_sparse_regression(200)
+    csc = _to_sparse(A, "csc")
+
+    # No sparse GPU kernel, and no silent densification.
+    try:
+        MojoBoostRegressor(device="gpu").fit(csc, y)
+        raise AssertionError("device='gpu' should raise for sparse input")
+    except RuntimeError as exc:
+        assert "sparse" in str(exc)
+
+    # Custom objectives are dense-only for now.
+    try:
+        MojoBoostRegressor(objective=lambda raw, t: (raw, raw)).fit(csc, y)
+        raise AssertionError("custom objective should raise for sparse input")
+    except TypeError as exc:
+        assert "sparse" in str(exc)
+
+    # Prediction still checks the feature count.
+    model = MojoBoostRegressor(n_estimators=5).fit(csc, y)
+    narrow = _to_sparse([row[:3] for row in A], "csr")
+    try:
+        model.predict(narrow)
+        raise AssertionError("wrong feature count should raise")
+    except ValueError:
+        pass
+    print("sparse validation ok")
+
+
+
 if __name__ == "__main__":
     try:
         import numpy
@@ -1224,4 +1471,10 @@ if __name__ == "__main__":
     test_ndcg_score_semantics()
     test_group_from_query_ids()
     test_ranker_validation()
+    test_sparse_regressor_matches_dense()
+    test_sparse_does_not_mutate_input()
+    test_sparse_classifier_matches_dense()
+    test_sparse_sample_weight_and_missing()
+    test_sparse_save_load()
+    test_sparse_validation()
     print("all python API tests passed")

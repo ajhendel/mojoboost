@@ -43,6 +43,35 @@ the sampled rows to compensate. `goss_seed` makes the sample reproducible,
 `int(1 / learning_rate)` full-data rounds, and GOSS cannot be combined with
 row bagging.
 
+## Dataset, Booster, and train()
+
+LightGBM's functional API is here too, over the same trainer:
+
+```python
+import mojoboost as mb
+
+train_set = mb.Dataset(X, label=y)            # binned once, reused
+booster = mb.train({"objective": "regression", "num_leaves": 31},
+                   train_set, num_boost_round=100)
+
+booster.predict(X_test)
+booster.eval(train_set, "training")
+booster.update(50)                            # 100 + 50 == the 150-round model
+booster.save_model("model.mbst")
+```
+
+A `Dataset` carries `label`, `weight`, `group`, `init_score`,
+`feature_name`, and `categorical_feature`, and is immutable once
+constructed: LightGBM's `set_*` mutators would invalidate the bin edges
+fitted from the data, so fields are constructor arguments instead. The
+estimators hold the same `Booster` on `booster_`, and a model trained
+through `train()` predicts identically to one trained through an
+estimator with the same parameters.
+
+Continued training covers the single-output objectives and softmax
+multiclass; ranking raises, because LambdaRank gradients need per-query
+state that the fitted ensemble does not carry.
+
 ## scikit-learn conventions
 
 `get_params`, `set_params`, `fit`, `predict`, `predict_proba`, and `score`
@@ -144,6 +173,52 @@ hyperparameters are forwarded through `**kwargs`, so `inspect.signature`
 does not list them (`get_params()` does), and `best_iteration_` is always
 set, where LightGBM sets it only when early stopping ran.
 
+## Validation sets and early stopping
+
+Every estimator takes them, in LightGBM's spelling:
+
+```python
+model = MojoBoostRegressor(n_estimators=500).fit(
+    X, y,
+    eval_set=[(X_valid, y_valid)],   # or (X_valid, y_valid), or eval_X/eval_y
+    eval_names=["holdout"],          # valid_0, valid_1, ... by default
+    eval_sample_weight=[w_valid],
+    eval_metric=["l2", "l1"],
+    early_stopping_rounds=20,
+)
+model.best_iteration_        # where the primary metric peaked
+model.n_iter_                # rounds actually trained
+model.best_score_            # the primary metric's best value
+model.evals_result_["holdout"]["l2"]   # index 0 is the base score alone
+model.stopped_early_
+```
+
+`eval_metric` takes LightGBM's metric names (`l2`, `rmse`, `l1`,
+`quantile`, `huber`, `binary_logloss`, `binary_error`, `auc`,
+`multi_logloss`, `multi_error`, `ndcg`, and their aliases), callables, or
+both, and defaults to the objective's own loss. A name is computed by
+`src/mojoboost/metrics.mojo`, so it agrees with the Mojo API by
+construction, and `eval_sample_weight` weights it. A callable is
+`f(y_true, y_pred) -> float`, called once per metric per validation set per
+round with raw scores in `y_pred`; declare its direction with
+`("name", f, True)`. Callables are handed unweighted predictions, so
+combining one with `eval_sample_weight` raises rather than dropping the
+weights quietly.
+
+`early_stopping_rounds` stops once a watched metric has gone that many
+rounds without improving by more than `min_delta`, and rolls the ensemble
+back to the best round of `primary_metric` on the first validation set. It
+needs an `eval_set` and says so otherwise. With `early_stopping_rounds=0`
+nothing stops and nothing is rolled back, but every value is still
+recorded.
+
+The classifier encodes validation labels through the `classes_` it
+recorded, so a label absent from training raises. The ranker takes
+`eval_group`, one group array per validation set, and rejects
+`eval_sample_weight`, since NDCG has no weighted LightGBM definition to
+match. Validation is scored on the CPU, so `device="gpu"` with an
+`eval_set` raises rather than falling back.
+
 ## Device selection
 
 ```python
@@ -164,6 +239,38 @@ training wins, so no crossover threshold ships enabled.
 The device is a training choice rather than part of the model, so saved
 models are identical either way and a loaded estimator carries no
 `device_`.
+
+## SciPy sparse input
+
+`fit` and `predict` accept any SciPy sparse matrix or array and keep it
+sparse. Nothing is densified at any point.
+
+```python
+from scipy import sparse
+from mojoboost import MojoBoostRegressor
+
+X = sparse.random(100_000, 500, density=0.01, format="csr")
+model = MojoBoostRegressor().fit(X, y)      # converted to CSC to fit
+pred = model.predict(X)                     # converted to CSR to predict
+```
+
+Whatever format you pass is converted to the one that side of the boundary
+wants, and a matrix that is not in SciPy's canonical form is copied before
+its indices are sorted, so your matrix is never mutated.
+
+An implicit zero is the numerical value 0.0, not a missing value: this is
+LightGBM's default `zero_as_missing=false`, so a sparse fit equals the dense
+fit of the same matrix with its gaps filled with zeros. Explicitly stored
+zeros mean the same thing as the gaps. `NaN` is still the missing marker
+wherever it is stored.
+
+scipy is not a dependency: the wrapper duck-types the CSC/CSR interface and
+imports nothing from scipy.
+
+Not available for sparse input, each raising rather than densifying quietly:
+`device="gpu"`, a Python objective callback, `eval_set` and early stopping,
+ranking, and `pred_leaf` / `pred_contrib` / iteration slicing at predict
+time.
 
 ## Platform support
 

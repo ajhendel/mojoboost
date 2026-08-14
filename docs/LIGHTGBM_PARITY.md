@@ -93,9 +93,9 @@ package.
 | `LGBMClassifier` | supported | `MojoBoostClassifier`. Binary and softmax multiclass, chosen from the label count | `python/mojoboost/__init__.py` |
 | `LGBMRanker` | supported | `MojoBoostRanker`, LambdaRank | `python/mojoboost/__init__.py` |
 | `LGBMModel` | different | No shared public base class. `_Base` holds the shared hyperparameters but is private, because a bare `LGBMModel` with `objective=` selecting the task is a second way to spell what the three estimators already do | `python/mojoboost/__init__.py` |
-| `Booster` | deferred | The fitted model is an opaque handle behind the estimators. A Booster-level API (`update`, `eval`, `dump_model`, iteration control) is v1 work, task 7 | `src/mojoboost/boosting.mojo` |
-| `Dataset` | partial | A Mojo `Dataset` exists (`src/mojoboost/dataset.mojo`: construction, labels, weights, groups, `train_dataset`, `update_dataset`), but it is not exported from the package and has no Python surface, so no user can reach it. Binning otherwise happens inside `fit`. v1 work, task 7 | `src/mojoboost/dataset.mojo` |
-| `train` | deferred | The functional training entry point arrives with `Booster`/`Dataset`, task 7 | — |
+| `Booster` | supported | `mojoboost.Booster`: prediction, evaluation, feature importance, model IO, iteration counts, and continued training with `update()`. The estimators hold one on `booster_`, so there is a single model object. `dump_model` is the gap, task 14 | `python/mojoboost/basic.py`, `python/tests/test_basic.py` |
+| `Dataset` | supported | `mojoboost.Dataset`, over the Mojo `Dataset` in `src/mojoboost/trainset.mojo`: data, label, weight, group, init score, feature names, categorical declaration, and binning metadata, binned once and reused. Immutable once constructed; see section 5 for the mutators mojoboost does not have | `python/mojoboost/basic.py`, `src/mojoboost/trainset.mojo`, `tests/test_trainset.mojo` |
+| `train` | supported | `mojoboost.train(params, train_set, num_boost_round, valid_sets, valid_names, init_model)`. Trains the same trees the estimators train, which `python/tests/test_basic.py` asserts bit for bit. No per-round history or early stopping here yet; those are on the estimators' `fit` | `python/mojoboost/basic.py` |
 | `cv` | deferred | Needs `Dataset` and the callback system first. v1 work, task 15 | — |
 | `CVBooster` | deferred | With `cv`, task 15 | — |
 | `early_stopping` | partial | Early stopping exists, as `fit(early_stopping_rounds=..., min_delta=...)` rather than as a callback object. `first_metric_only` has no equivalent; every metric flagged for early stopping is watched | `python/mojoboost/__init__.py`, `src/mojoboost/custom_metric.mojo` |
@@ -124,8 +124,8 @@ Every parameter of `lightgbm.LGBMModel.__init__` in 4.7.0.
 | `learning_rate` | supported | Same default (0.1) |
 | `n_estimators` | supported | Same default (100) |
 | `subsample_for_bin` | deferred | mojoboost bins from every row rather than a sample. Correct but slower on very large data; the sampled binner is a performance item, not a semantic one |
-| `objective` | partial | Regressor: `regression`, `huber`, `quantile`, `mae`/`regression_l1`, or a callable. Classifier: rejected, the task comes from the labels. Missing objectives are listed in section 8 |
-| `class_weight` | deferred | Per-class weighting is expressible today only by expanding it into `sample_weight`. v1 work, task 11 |
+| `objective` | partial | Regressor: `regression`, `huber`, `quantile`, `mae`/`regression_l1`, `poisson`, `gamma`, `tweedie`, `mape`, `fair`, `cross_entropy`, or a callable. Classifier: rejected, the task comes from the labels. The objectives that are not implemented are listed in section 8, and each is reported by name rather than as an unknown one |
+| `class_weight` | supported | `MojoBoostClassifier(class_weight=...)`: `"balanced"` or a `{label: weight}` dict, folded into the row weights before training, so there is one weighting mechanism rather than two. scikit-learn's rule for `balanced` (row counts, not weighted counts). `src/mojoboost/class_weight.mojo` |
 | `min_split_gain` | unsupported | LightGBM's `min_gain_to_split`. Not implemented; see section 7 |
 | `min_child_weight` | supported | Alias for `min_child_hess` (LightGBM's `min_sum_hessian_in_leaf`), default 1e-3 |
 | `min_child_samples` | supported | Alias for `min_data_in_leaf`, default 20 |
@@ -172,7 +172,7 @@ that silently trains a different model is worse than a failed call.
 | `predict(raw_score=)` | supported | Scores on the link scale. The objectives without a link (squared error, huber, quantile, L1) predict raw either way |
 | `predict(start_iteration=)` / `predict(num_iteration=)` | supported | A slice of the ensemble, LightGBM's pair. `num_iteration=None` means every iteration the model kept |
 | `predict(pred_leaf=)` | supported | Leaf index per tree. Combining it with `raw_score` raises, where LightGBM silently lets one win |
-| `predict(pred_contrib=)` | partial | Exact TreeSHAP contributions exist in Mojo and are exported (`predict_contrib`, `predict_contrib_multiclass`, `src/mojoboost/contrib.mojo`). No estimator argument reaches them yet |
+| `predict(pred_contrib=)` | supported | Exact TreeSHAP (path-dependent), LightGBM's shapes: `n_features + 1` columns with the expected value last, and `n_classes * (n_features + 1)` in class-major blocks for multiclass. Every row sums to its raw score. Combining it with `raw_score` or `pred_leaf` raises, where LightGBM silently lets one win; contributions explain the raw score regardless, so `raw_score` adds nothing. Needs node covers, so a model saved in format v1 or v2 raises rather than guessing (see `src/mojoboost/contrib.mojo`) |
 | `predict(validate_features=)` | supported | Same flag. A name mismatch raises either way, as scikit-learn already refuses to predict through one; the flag turns the one-sided cases from warnings into errors |
 | `score(X, y)` | supported | R^2 for the regressor, accuracy for the classifier, mean NDCG for the ranker |
 
@@ -188,39 +188,55 @@ that silently trains a different model is worse than a failed call.
 | `best_iteration_` | different | Always set, to the number of iterations kept. LightGBM sets it only when early stopping ran |
 | `best_score_` | partial | A single float, the primary metric's best value on the first validation set. LightGBM's is a nested dict over sets and metrics |
 | `evals_result_` | supported | `{valid_name: {metric_name: [values]}}`. Index 0 is the base-score-only model, so entry `i` is the score after `i` trees; LightGBM starts at the first iteration |
-| `booster_` | deferred | With the Booster API, task 7 |
+| `booster_` | supported | The `Booster` holding the fitted model, and the only place the handle lives. It cannot `update()`: an estimator bins its own matrix and keeps no `Dataset` to grow on |
 | `objective_` | deferred | The resolved objective name is not exposed; `objective` is echoed back as given |
 | `n_estimators_` / `n_iter_` | different | `best_iteration_` reports the kept iteration count. Two more names for the same number are not added |
-| `feature_name_` | deferred | With the Booster API, task 7 |
+| `feature_name_` | different | `booster_.feature_name()` reports the training feature names, or LightGBM's `Column_0`, `Column_1`, ... when there were none. A second estimator attribute alongside `feature_names_in_` is not added |
 | `device_` (mojoboost) | different | Not a LightGBM attribute. Records which backend actually ran, because `device="auto"` makes that a runtime outcome |
 | `stopped_early_` (mojoboost) | different | Not a LightGBM attribute. True when early stopping fired, which `best_iteration_ < n_estimators` alone does not distinguish from objective convergence |
 
 ## 5. Booster and Dataset APIs
 
-The whole of `lightgbm.Booster` and `lightgbm.Dataset` is `deferred` to
-task 7 except where noted. They are grouped rather than listed
-method-by-method because none of them is reachable today and the reason is
-the same for all: mojoboost's fitted model is an opaque handle and its
-dataset is built inside `fit`.
+`mojoboost.Booster` and `mojoboost.Dataset` are the functional API in
+`python/mojoboost/basic.py`, over the Mojo `Dataset` and its trainers in
+`src/mojoboost/trainset.mojo`. The estimators hold the same `Booster` on
+`booster_`, so there is one model object in the package rather than one per
+API, and `python/tests/test_basic.py` asserts that a model trained through
+`train()` and the same model trained through an estimator predict
+identically, value for value.
+
+The rows that say `different` are where a LightGBM method conflicts with
+owning data safely in Mojo rather than with a pointer into the caller's
+memory. LightGBM's post-construction mutators are the main one: bin edges
+are fitted from the data and from the categorical declaration, so changing
+either afterwards would leave the binned matrix describing data the dataset
+no longer holds. Every field is a constructor argument instead.
 
 | LightGBM API group | Status | Notes |
 |---|---|---|
-| `Booster` construction, `update`, `rollback_one_iter`, `current_iteration`, `reset_parameter` | deferred | Incremental training control, task 7 with task 6 |
-| `Booster.predict` with all prediction modes | partial | Response, raw score, leaf index, and iteration ranges are reachable through the estimators' `predict`; feature contributions are Mojo only. Section 3 has the detail. The Booster object itself is task 7 |
-| `Booster.save_model` / `model_to_string` / `model_from_string` | different | mojoboost has `save()`/`load()` and a versioned text format (`src/mojoboost/serialize.mojo`) that stores floats as raw bit patterns so a round trip predicts bit-exactly. The format is mojoboost's own and is not LightGBM-readable; a converter is not planned |
-| `Booster.dump_model` / `trees_to_dataframe` | deferred | Structured model inspection, task 14 |
-| `Booster.feature_importance` | supported | Reachable as `feature_importances_`; both `split` and `gain` |
-| `Booster.num_feature` / `num_trees` / `num_model_per_iteration` | partial | `num_trees`, `num_iterations`, `n_features` exist in the extension module (`bindings/_mojoboost.mojo`) and back `best_iteration_` and `n_features_in_`; they are not public Python methods |
-| `Booster.eval` / `eval_train` / `eval_valid` / `add_valid` | partial | Validation scoring happens inside `fit` via `eval_set`. Post-hoc evaluation on a new set needs the Booster object, task 7 |
-| `Booster.get_leaf_output` / `set_leaf_output` / `shuffle_models` / `refit` | deferred | Model editing, task 14 (`refit` also needs task 6) |
-| `Booster.get_split_value_histogram` | deferred | Model inspection, task 14 |
-| `Booster.lower_bound` / `upper_bound` | deferred | Model inspection, task 14 |
-| `Booster.free_dataset` / `set_train_data_name` | different | No user-visible dataset object to free or name |
+| `Booster(params, train_set)`, `update`, `current_iteration` | supported | A booster starts at zero iterations and `update(n)` grows it, returning LightGBM's is-finished flag. 40 rounds then 60 more are the 100-round model, bit for bit (`tests/test_trainset.mojo`, `python/tests/test_basic.py`). Ranking is the exception: LambdaRank gradients need per-query state the fitted ensemble does not carry, so a ranking booster raises rather than appending trees that would be wrong |
+| `Booster(model_file=)` / `Booster(model_str=)` | supported | Reads back a single-output or softmax model; the file says which. What a file does not carry is the parameters, the feature names, and the split gains, so a booster read back reports `Column_i` names, zero gain importance, and asks for an explicit `eval` metric |
+| `Booster.rollback_one_iter` / `reset_parameter` | deferred | Truncating an ensemble and re-parameterizing a run in flight are both reachable in principle (the ensemble is a tree list); neither is implemented. With the callback work, task 3 |
+| `Booster.predict` with all prediction modes | partial | `Booster.predict` covers response, raw score, and iteration ranges, with LightGBM's clamping rules. Leaf indices and feature contributions are on the estimators' `predict` (section 3) and not yet on the Booster |
+| `Booster.save_model` / `model_to_string` / `model_from_string` | different | Present under LightGBM's names, but the format is mojoboost's own versioned text (`src/mojoboost/serialize.mojo`), which stores floats as raw bit patterns so a round trip predicts bit-exactly. It is not LightGBM-readable and a converter is not planned. `save_model` takes no `num_iteration` or `start_iteration` |
+| `Booster.dump_model` / `trees_to_dataframe` | deferred | Structured model inspection, task 14. `model_to_string()` is the whole model meanwhile |
+| `Booster.feature_importance` | supported | Both `split` and `gain`, on the Booster and as `feature_importances_`. Gains are not in the model file, so a booster read back or unpickled reports zero gain importance |
+| `Booster.num_feature` / `num_trees` / `num_model_per_iteration` | supported | Public methods on the Booster; `num_model_per_iteration` is the class count for a softmax model and 1 otherwise |
+| `Booster.eval` / `eval_train` / `eval_valid` / `add_valid` | supported | Returns LightGBM's `(name, metric, value, is_higher_better)` tuples, weighted by the dataset's own weights. The metric defaults to the objective's own loss and the value comes from `src/mojoboost/metrics.mojo`, the same code `fit(eval_set=)` scores with, so the two APIs cannot drift |
+| `Booster.feature_name` | supported | The training set's names, or LightGBM's `Column_0`, `Column_1`, ... when it had none |
+| `Booster.get_leaf_output` / `set_leaf_output` / `shuffle_models` / `refit` | deferred | Model editing, task 14 |
+| `Booster.get_split_value_histogram` / `lower_bound` / `upper_bound` | deferred | Model inspection, task 14 |
+| `Booster.free_dataset` / `set_train_data_name` | different | A booster holds a reference to its `Dataset`, which is what keeps continued training possible; dropping it is the caller's to do by dropping the booster. The training set is named `training` in `eval_train`, as LightGBM names it, and the name is not settable |
 | `Booster.set_network` / `free_network` | deferred | Distributed training, task 16 |
-| `Dataset` construction, `construct`, `subset`, `create_valid`, `set_reference` | partial | Construction and reuse exist in Mojo (`src/mojoboost/dataset.mojo`); nothing is exported or reachable from Python. Task 7 |
-| `Dataset.set_field` / `get_field` and the typed accessors (`label`, `weight`, `group`, `init_score`, `position`) | partial | Labels, weights, and groups exist on the Mojo `Dataset`; `init_score` and `position` do not. Task 7; `init_score` also task 6, `position` also depends on unbiased LambdaRank |
-| `Dataset.save_binary` / `get_data` / `feature_num_bin` / `add_features_from` | deferred | Task 7 |
-| `Dataset.set_categorical_feature` / `set_feature_name` | partial | Both are constructor parameters on the estimators instead (`categorical_feature`; feature names come from the frame) |
+| `Dataset` construction and `construct` | supported | Binning happens on `construct()` or on the first `train()` that uses the dataset, and every later run reuses it. `free_raw_data` defaults to False here, not True: evaluation predicts through the model rather than reading an internal score buffer, so `eval_train()` needs the raw matrix |
+| `Dataset.create_valid` / `set_reference` | different | A validation set is an ordinary `Dataset`; mojoboost predicts it through the model's own mapper, so it does not need the training set's bin mappers. `reference=` is accepted and its binning parameters are checked, so a mismatched reference is reported rather than ignored |
+| `Dataset.subset` | deferred | Row subsets of a constructed dataset, which `cv` will want. Task 15 |
+| `Dataset.get_field` and the typed accessors (`label`, `weight`, `group`, `init_score`) | supported | All four are constructor arguments and all four read back. `init_score` is training state, not model state: boosting starts from it and the fitted model predicts the trees alone (`tests/test_trainset.mojo`) |
+| `Dataset.position` | deferred | Needs unbiased LambdaRank, task 12 |
+| `Dataset.set_field` / `set_label` / `set_weight` / `set_group` / `set_init_score` / `set_categorical_feature` / `set_feature_name` | different | Not offered. A dataset is immutable once constructed, because its bin edges were fitted from the data and the categorical declaration it was built with; construct another dataset to change a field |
+| `Dataset.get_data` | supported | Returns the matrix as it was passed in, or None once `free_raw_data` dropped it |
+| `Dataset.num_data` / `num_feature` / `feature_num_bin` | partial | `num_data`, `num_feature`, and `num_bin` (the binning's own bin count) are there. LightGBM's per-feature `feature_num_bin` is not |
+| `Dataset.save_binary` / `add_features_from` | deferred | A binary dataset format and column-wise dataset merging; neither is needed to train and both are real work |
 
 ## 6. Data inputs
 
@@ -271,7 +287,7 @@ aliases mojoboost accepts.
 | `min_data_in_leaf` | supported | |
 | `min_sum_hessian_in_leaf` | supported | Spelled `min_child_hess` |
 | `bagging_fraction` | supported | |
-| `pos_bagging_fraction` / `neg_bagging_fraction` | deferred | Class-conditional bagging for unbalanced binary data. v1 work with `is_unbalance`, task 11 |
+| `pos_bagging_fraction` / `neg_bagging_fraction` | deferred | Class-conditional bagging for unbalanced binary data. `class_weight` covers the common case; sampling by class does not |
 | `bagging_freq` | supported | |
 | `bagging_seed` | supported | |
 | `bagging_by_query` | different | Always on for the ranker. A half-sampled query would be normalized against a maxDCG no served ranking ever had, so mojoboost does not offer the row-sampling variant |
@@ -333,19 +349,19 @@ aliases mojoboost accepts.
 | Parameter | Status | Notes |
 |---|---|---|
 | `boost_from_average` | different | Always on for the built-in objectives, always off for custom ones (the framework does not know the link). LightGBM makes it a toggle |
-| `is_unbalance` / `scale_pos_weight` | deferred | Unbalanced-binary shortcuts. v1 work, task 11 |
+| `is_unbalance` / `scale_pos_weight` | partial | Both are in `src/mojoboost/class_weight.mojo` under their LightGBM names (`unbalanced_sample_weight`, `scale_pos_weight_rows`). Not constructor parameters on the Python classifier, where `class_weight={1: w}` is `scale_pos_weight` and `class_weight="balanced"` is `is_unbalance` up to a constant factor |
 | `sigmoid` | partial | Supported for LambdaRank. Not exposed for the binary objective, which uses the standard logistic |
 | `alpha` | supported | Huber transition point and quantile level, LightGBM's meanings |
-| `fair_c` | deferred | With the `fair` objective, task 11 |
+| `fair_c` | supported | The fair loss's `c`, default 1.0. One trainer slot holds whichever scalar parameter the objective reads, and naming one that belongs to a different objective is an error rather than a silently ignored value |
 | `poisson_max_delta_step` | different | Fixed at LightGBM's default 0.7 rather than exposed |
-| `tweedie_variance_power` | deferred | With the `tweedie` objective, task 11 |
+| `tweedie_variance_power` | supported | Tweedie's rho, in (1, 2), default 1.5. Outside that range it would no longer be the compound Poisson-gamma the objective assumes, so it is rejected rather than clamped |
 | `lambdarank_truncation_level` | supported | Default 30, and also the maxDCG cutoff, as in LightGBM |
 | `lambdarank_norm` | supported | Default on |
 | `label_gain` | different | Fixed at LightGBM's default `2^i - 1` for labels 0..30, which is also why labels outside that range are rejected. A user-supplied gain vector is deferred |
 | `lambdarank_position_bias_regularization` | deferred | Part of unbiased LambdaRank, which is out of v1 |
 | `objective_seed` | different | No objective in mojoboost draws random numbers |
 | `reg_sqrt` | deferred | `sqrt`-transformed regression. Rare |
-| `multi_error_top_k` / `auc_mu_weights` | deferred | With the `multi_error` and `auc_mu` metrics, task 11 |
+| `multi_error_top_k` / `auc_mu_weights` | deferred | With top-k multiclass error and `auc_mu`, neither of which is implemented |
 
 ### Metric
 
@@ -380,19 +396,19 @@ Every objective name accepted by LightGBM 4.7.0, verified by training a
 | `regression_l1` / `mae` | supported | `L1`, with LightGBM's `RenewTreeOutput` leaf-value replacement | `src/mojoboost/boosting.mojo`, `tests/test_objectives.mojo` |
 | `huber` | supported | `HUBER`, `alpha` is the transition point. No leaf renewal, as in LightGBM | `src/mojoboost/boosting.mojo`, `tests/test_objectives.mojo` |
 | `quantile` | supported | `QUANTILE`, `alpha` is the level, with weighted-percentile leaf renewal | `src/mojoboost/boosting.mojo`, `tests/test_objectives.mojo` |
-| `poisson` | supported | `POISSON`, exp link, log-mean base score, `poisson_max_delta_step` in the Hessian. Reachable from Mojo; the Python regressor does not list it yet, which is a v1 gap | `src/mojoboost/boosting.mojo`, `tests/test_objectives.mojo` |
+| `poisson` | supported | `POISSON`, exp link, log-mean base score, `poisson_max_delta_step` in the Hessian. Python `objective="poisson"` | `src/mojoboost/boosting.mojo`, `tests/test_objectives.mojo` |
 | `binary` | supported | `BINARY_LOGISTIC` | `src/mojoboost/boosting.mojo`, `tests/test_mojoboost.mojo` |
 | `multiclass` (softmax) | supported | `train_multiclass` / `fit_multiclass`, one tree per class per round | `src/mojoboost/boosting.mojo`, `tests/test_multiclass_model.mojo` |
 | `lambdarank` | supported | `train_ranker` / `fit_ranker` / `MojoBoostRanker` | `src/mojoboost/ranking.mojo`, `tests/test_ranking.mojo` |
 | custom (callable) | different | Single output only, weights applied by the framework, gradients validated every round, base score explicit. See the README section on custom objectives for each difference and why | `src/mojoboost/objective.mojo`, `tests/test_custom_objective.mojo` |
-| `mape` | deferred | v1 work, task 11 |  — |
-| `fair` | deferred | v1 work, task 11 | — |
-| `gamma` | deferred | v1 work, task 11 | — |
-| `tweedie` | deferred | v1 work, task 11, with `tweedie_variance_power` | — |
-| `cross_entropy` | deferred | v1 work, task 11 | — |
-| `cross_entropy_lambda` | deferred | v1 work, task 11 | — |
-| `multiclassova` | deferred | One-vs-rest multiclass. v1 work, task 11 | — |
-| `rank_xendcg` | deferred | Out of v1 with the rest of the unbiased/alternative ranking objectives | — |
+| `mape` | supported | `MAPE`, gradient scaled by LightGBM's `1 / max(1, \|y\|)` label weight, median leaf renewal under those same weights. Python `objective="mape"` | `src/mojoboost/boosting.mojo`, `tests/test_objectives.mojo` |
+| `fair` | supported | `FAIR`, with `fair_c` (the trainer's `alpha` slot). Python `objective="fair", fair_c=...` | `src/mojoboost/boosting.mojo`, `tests/test_objectives.mojo` |
+| `gamma` | supported | `GAMMA`, exp link, log-mean base score, strictly positive labels required | `src/mojoboost/boosting.mojo`, `tests/test_objectives.mojo` |
+| `tweedie` | supported | `TWEEDIE`, exp link, with `tweedie_variance_power` in (1, 2) (the trainer's `alpha` slot). Python `objective="tweedie", tweedie_variance_power=...` | `src/mojoboost/boosting.mojo`, `tests/test_objectives.mojo` |
+| `cross_entropy` | supported | `CROSS_ENTROPY` (alias `xentropy`), logistic link with labels anywhere in [0, 1]. On the regressor, since its labels are soft targets rather than classes | `src/mojoboost/boosting.mojo`, `tests/test_objectives.mojo` |
+| `cross_entropy_lambda` | different | Not implemented, and reported by name rather than as an unknown objective. It parameterizes the rate through `log1p(exp(raw))`, a different link, so it is not an alias of `cross_entropy` and cannot be reached by setting one | `src/mojoboost/params.mojo`, `python/mojoboost/__init__.py` |
+| `multiclassova` | different | Not implemented, reported by name. One-vs-rest needs an independent binary model per class, which is a different trainer from the shared-softmax `multiclass` | `src/mojoboost/params.mojo`, `python/mojoboost/__init__.py` |
+| `rank_xendcg` | different | Not implemented, reported by name. Out of v1 with the rest of the unbiased/alternative ranking objectives; `lambdarank` is the ranking objective provided | `src/mojoboost/params.mojo`, `python/mojoboost/__init__.py` |
 
 GPU coverage: `train_gpu` covers every single-output objective above that
 shares the per-row gradient/Hessian interface, `train_custom_gpu` covers
@@ -405,24 +421,36 @@ Every metric name accepted by LightGBM 4.7.0, verified the same way.
 
 | LightGBM metric | Status | Notes |
 |---|---|---|
-| `l2` | supported | Mojo `rmse` reports the root; the squared value is the training loss used for early stopping. Not selectable by name from Python |
-| `rmse` | supported | `src/mojoboost/metrics.mojo`, `tests/test_metrics.mojo`. Not selectable by name from Python |
-| `binary_logloss` | supported | Same file. Not selectable by name from Python |
-| `multi_logloss` | supported | Same file. Not selectable by name from Python |
-| `auc` | supported | Rank-based, with scikit-learn's tie handling. Not selectable by name from Python |
+| `l2` | supported | Mojo `rmse` reports the root; the squared value is the training loss used for early stopping |
+| `rmse` | supported | `src/mojoboost/metrics.mojo`, `tests/test_metrics.mojo` |
+| `l1` | supported | Same file |
+| `quantile` / `huber` | supported | Read the estimator's `alpha`, so they score the loss the objective trained on |
+| `mape` | supported | LightGBM's `\|y - p\| / max(1, \|y\|)`, the same label weight the MAPE objective trains against |
+| `fair` | supported | Reads `fair_c` |
+| `poisson` | supported | `mu - y log mu` on the response scale |
+| `gamma` / `gamma_deviance` | supported | The gamma likelihood and its deviance, which is 0 at a perfect prediction |
+| `tweedie` | supported | Reads `tweedie_variance_power`; scoring at a different rho scores a different loss |
+| `cross_entropy` / `kullback_leibler` | supported | Continuous labels in [0, 1]. KL is the cross entropy minus the labels' own entropy, so a perfect prediction scores 0 |
+| `binary_logloss` | supported | `src/mojoboost/metrics.mojo` |
+| `multi_logloss` | supported | Same file |
+| `binary_error` / `multi_error` | supported | Under LightGBM's spellings, with `binary_accuracy` and `multiclass_accuracy` as their complements |
+| `auc` | supported | Rank-based, with scikit-learn's tie handling |
+| `average_precision` | supported | Step-wise precision-recall area, scikit-learn's rule for ties (no trapezoid interpolation) |
 | `ndcg` | supported | Any cutoff, per query, averaged; `ndcg_score` from Python. An all-zero-label query counts as 1.0, as in LightGBM |
-| `binary_error` / `multi_error` | partial | `binary_accuracy` and `multiclass_accuracy` are the complements. The LightGBM spellings are not provided |
-| `l1` | deferred | Task 11 |
-| `quantile` / `mape` / `huber` / `fair` / `poisson` / `gamma` / `gamma_deviance` / `tweedie` | deferred | Task 11, with the matching objectives |
-| `map` | deferred | Task 11 |
-| `average_precision` | deferred | Task 11 |
-| `auc_mu` | deferred | Task 11 |
-| `cross_entropy` / `cross_entropy_lambda` / `kullback_leibler` | deferred | Task 11 |
+| `map` | supported | Binary relevance (any label above 0), AP@k divided by `min(k, relevant)`, and a query with nothing relevant counts as 1.0, matching this module's NDCG convention. `src/mojoboost/ranking.mojo` |
+| `cross_entropy_lambda` | deferred | With the objective of that name, which is not implemented |
+| `auc_mu` | deferred | The multiclass AUC generalization; needs the class-pair projection LightGBM builds, and no multiclass ranking metric is provided yet |
 | custom metrics (`feval`) | supported | Mojo: `MetricSuite`, several metrics with a declared direction and early-stopping flag. Python: `fit(eval_metric=...)` with callables. Differences from `feval` are listed at the top of `src/mojoboost/custom_metric.mojo` |
 
-**Selecting a built-in metric by name is the gap.** The metrics marked
-`supported` above are implemented and tested in Mojo, but from Python a user
-passes a callable. Accepting `eval_metric="auc"` is v1 work.
+Every name above is selectable from Python as `eval_metric="auc"` and
+scored by the same Mojo functions the Mojo API exposes; the table of names,
+aliases, directions, and tasks is `python/mojoboost/_eval.py`, mirrored by
+the metric codes in `bindings/_mojoboost.mojo`. Two differences from
+LightGBM are deliberate: a metric that cannot mean anything for the model
+being fitted is rejected rather than scored (the regressor takes the
+regression metrics, the classifier the binary or multiclass ones, the ranker
+`ndcg` and `map`), and predictions are transformed by the *objective's*
+inverse link exactly once before any metric sees them.
 
 ## 10. Callbacks
 
@@ -485,13 +513,20 @@ quietly fixed, because each is somebody's in-flight work:
    `src/mojoboost/tree_sparse.mojo` are not exported from
    `src/mojoboost/__init__.mojo` and no test file imports them. The sparse
    rows above are `deferred` for that reason, not `partial`.
-2. **Built-in metric names are not selectable from Python**, though the
-   metrics exist in Mojo. This is the largest single mismatch between what
-   is implemented and what a LightGBM user can reach.
+2. **Closed.** Built-in metric names are selectable from Python
+   (`eval_metric="auc"`), resolved by `python/mojoboost/_eval.py` and
+   scored by the same Mojo functions the Mojo API exposes. What remains is
+   narrower: the name table lives in two files, `python/mojoboost/_eval.py` and the metric
+   codes in `bindings/_mojoboost.mojo`, and nothing but review keeps them
+   in step.
 3. **`colsample_bytree` and `colsample_bynode` are not accepted** as aliases
    even though the rest of the scikit-learn spellings are.
-4. **`poisson` is missing from the Python regressor's objective table** even
-   though the objective is implemented and tested.
+4. **Closed.** `poisson` is in the Python regressor's objective table,
+   with `gamma`, `tweedie`, `mape`, `fair`, and `cross_entropy`. The
+   related caution is that all four scalar objective parameters (`alpha`,
+   `fair_c`, `tweedie_variance_power`) share one trainer slot, so an
+   objective added later must claim its parameter name in
+   `MojoBoostRegressor._OBJECTIVE_PARAM` or silently inherit `alpha`.
 5. **TreeSHAP and the Mojo `Dataset` are one export away from being
    reachable.** `src/mojoboost/contrib.mojo` is exported but has no Python
    argument; `src/mojoboost/dataset.mojo` is not exported at all. Both rows

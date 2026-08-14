@@ -56,8 +56,100 @@ def finish(buf):
 
 
 def _is_sparse(X):
-    """True for a scipy sparse matrix or array, which is not supported."""
+    """True for a SciPy sparse matrix or array."""
     return hasattr(X, "toarray") and hasattr(X, "shape") and hasattr(X, "nnz")
+
+
+is_sparse = _is_sparse
+
+
+class SparseBuffers:
+    """A canonical CSC or CSR matrix as float64 data with int64 indices.
+
+    Holds the three arrays so the caller can keep them referenced while
+    their addresses are in flight, exactly as the dense path keeps its
+    column-major buffer alive.
+    """
+
+    __slots__ = ("data", "indices", "indptr", "n_rows", "n_features", "layout")
+
+    def __init__(self, data, indices, indptr, n_rows, n_features, layout):
+        self.data = data
+        self.indices = indices
+        self.indptr = indptr
+        self.n_rows = n_rows
+        self.n_features = n_features
+        self.layout = layout
+
+    @property
+    def nnz(self):
+        return int(self.data.shape[0])
+
+    def params(self):
+        """The keys the extension module reads a sparse matrix from."""
+        return {
+            "sparse_data_addr": addr(self.data),
+            "sparse_indices_addr": addr(self.indices),
+            "sparse_indptr_addr": addr(self.indptr),
+            "sparse_nnz": self.nnz,
+            "n_rows": self.n_rows,
+            "n_features": self.n_features,
+        }
+
+
+def _canonical_sparse(X, layout, name):
+    """`X` as a SciPy matrix in `layout` with sorted, deduplicated indices.
+
+    Converts only when it has to, and copies before canonicalizing so a
+    caller's matrix is never mutated in place.
+    """
+    if getattr(X, "format", None) != layout:
+        X = X.tocsc() if layout == "csc" else X.tocsr()
+    if not getattr(X, "has_canonical_format", False):
+        X = X.copy()
+        # sum_duplicates sorts the indices as well.
+        X.sum_duplicates()
+    if getattr(X, "ndim", 2) != 2:
+        raise ValueError(f"{name} must be 2-dimensional")
+    return X
+
+
+def check_X_sparse(X, layout="csc", name="X"):
+    """(SparseBuffers, n_rows, n_features, names) for a SciPy sparse matrix.
+
+    Implicit zeros are numerical zeros, so this validates exactly what the
+    dense path validates: NaN is allowed and means missing, infinities are
+    not. Explicitly stored zeros are left alone, because they mean the same
+    thing as the gaps.
+    """
+    if np is None:
+        raise TypeError(
+            f"{name} is a sparse matrix, which needs numpy; install numpy or "
+            "pass a dense sequence"
+        )
+    Xs = _canonical_sparse(X, layout, name)
+    n_rows, n_features = Xs.shape
+    if n_rows == 0:
+        raise ValueError(f"{name} must have at least one row")
+    if n_features == 0:
+        raise ValueError(f"{name} must have at least one feature")
+    data = np.ascontiguousarray(Xs.data, dtype=np.float64)
+    if data.size and np.isinf(data).any():
+        raise ValueError(
+            f"{name} must not contain infinite values (NaN is allowed and "
+            "is treated as missing)"
+        )
+    buffers = SparseBuffers(
+        data,
+        np.ascontiguousarray(Xs.indices, dtype=np.int64),
+        np.ascontiguousarray(Xs.indptr, dtype=np.int64),
+        int(n_rows),
+        int(n_features),
+        layout,
+    )
+    return buffers, int(n_rows), int(n_features), feature_names(X)
+
+
 
 
 def feature_names(X):
@@ -228,8 +320,9 @@ def column_major(X, name="X", encoders=None):
     """
     if _is_sparse(X):
         raise TypeError(
-            f"{name} is a sparse matrix, which mojoboost does not support; "
-            "convert it with .toarray() first"
+            f"{name} is a sparse matrix; the sparse path takes it directly "
+            "(see check_X_sparse) and this dense entry point will not "
+            "densify it silently"
         )
     if encoders:
         X = frame_to_array(X, encoders, name)

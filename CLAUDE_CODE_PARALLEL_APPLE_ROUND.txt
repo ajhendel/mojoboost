@@ -1,0 +1,545 @@
+MOJOBOOST IMMEDIATE PARALLEL DEVELOPMENT ROUND
+==============================================
+
+Purpose
+-------
+
+This file defines an IMMEDIATE parallel development round. Start every task
+at the same time, including while current sessions are wrapping up. Task 11
+(objective, metric, and weighting coverage) is already in progress and is
+therefore not duplicated here.
+
+Every lane owns distinct primary implementation and test files. Each lane
+implements working code now, runs only its own smallest focused test, and
+writes an integration handoff. Broad suites, unrelated tests, benchmarks,
+wheel builds, and release validation wait; coding and focused validation do
+not wait.
+
+
+GLOBAL PARALLELISM CONTRACT
+===========================
+
+Every task repeats this contract so it can be copied independently.
+
+- Start immediately. Do not wait for other sessions, stabilization, a commit,
+  or another task.
+- Inspect current code and `git status` read-only before editing.
+- Preserve all concurrent work.
+- Edit ONLY the paths explicitly assigned to your task.
+- New parent directories assigned to you may be created.
+- Do not edit shared hotspots: `README.md`, `pixi.toml`, `pixi.lock`,
+  `.github/workflows/*`, `bindings/_mojoboost.mojo`,
+  `python/mojoboost/__init__.py`, `src/mojoboost/__init__.mojo`,
+  `src/mojoboost/boosting.mojo`, `src/mojoboost/tree.mojo`,
+  `src/mojoboost/model.mojo`, `src/mojoboost/serialize.mojo`,
+  `src/mojoboost/train_gpu.mojo`, `src/mojoboost/histogram_gpu.mojo`,
+  `docs/LIGHTGBM_PARITY.md`, or existing tests.
+- If central wiring is required, describe the exact imports, calls, fields,
+  ABI changes, serialization changes, and documentation changes in your
+  assigned `handoffs/*.md` file. Do not make those edits yourself.
+- Do not commit, stage, stash, switch branches, create worktrees, rebase,
+  revert, or clean files.
+- Run exactly ONE smallest focused test covering your assigned work. A Mojo
+  lane may run its one assigned new Mojo test file. A Python lane may run its
+  one assigned new pytest file. A documentation/design-only lane runs no test.
+- If the focused test cannot run until central integration, run no substitute
+  suite; explain the blocker in the handoff.
+- Do not run broad suites, existing unrelated tests, `pixi run test`,
+  `pixi run test-gpu`, the whole Python test directory, wheels, all
+  benchmarks, profilers, parity scripts, or CI.
+- Do not run retry loops, polling loops, watch commands, sleeps, background
+  commands, or multiple commands in parallel.
+- `git diff --check -- <your assigned paths>` is also required.
+- Write narrow tests in the assigned new test file and run only that file
+  when it can execute independently.
+- Never claim that unrun code compiles, passes, is faster, or reaches parity.
+- Stop after implementation plus handoff. Report assigned files changed,
+  central integration required, focused test command and result, and risks.
+
+
+PARALLEL TASK 12: REMAINING TREE-PARAMETER PRIMITIVES
+====================================================
+
+Work in the `mojoboost` repository immediately, in parallel with every other lane.
+This task is one lane in a simultaneous parallel round. Preserve concurrent
+work and edit ONLY: `src/mojoboost/tree_parameters_extra.mojo`,
+`tests/parallel/test_tree_parameters_extra.mojo`, and
+`handoffs/task12_tree_parameters.md`. Do not edit central/shared files. Put
+all required central imports, parameter fields, Python aliases, binding calls,
+serialization changes, and call-site edits in the handoff. Do not commit or
+stage. Run only your assigned focused test once. Do not run unrelated Mojo, Pixi, pytest, builds, wheels, benchmarks,
+profilers, retry loops, polling loops, background commands, or parallel shell
+commands. After that focused test, run `git diff --check --` on assigned paths.
+Never claim unrun code passes or performs well.
+
+Audit existing parameter work first. Implement isolated, reusable primitives
+for the still-missing high-value tree controls: minimum split gain, maximum
+delta step, path smoothing, per-feature split penalties, extra/random split
+candidate selection, categorical regularization/threshold calculations, and
+monotone penalty/method selection. Do not duplicate parameters that now exist.
+Preserve leaf-wise semantics and deterministic counter-based randomness.
+Represent forced splits as a validated data structure/parser if it can remain
+isolated. Treat linear trees as a separately documented deferred subsystem
+rather than a placeholder. Write analytical tests proving each primitive's
+decision rule. The handoff must map LightGBM names/defaults, identify exact
+tree/split integration points, and state CPU/GPU support or required explicit
+rejection for every option.
+
+
+PARALLEL TASK 13: EXCLUSIVE FEATURE BUNDLING CORE
+================================================
+
+Work in the `mojoboost` repository immediately, in parallel with every other lane.
+This task is one lane in a simultaneous parallel round. Preserve concurrent
+work and edit ONLY: `src/mojoboost/efb.mojo`,
+`tests/parallel/test_efb.mojo`, and `handoffs/task13_efb.md`. Do not edit
+central/shared files. Put all required central imports, parameters, sparse
+integration, bindings, serialization, and docs changes in the handoff. Do not
+commit or stage. Run only your assigned focused test once. Do not run unrelated Mojo, Pixi, pytest, builds, wheels,
+benchmarks, profilers, retry loops, polling loops, background commands, or
+parallel shell commands. After that focused test, run `git diff --check --` on assigned paths. Never claim unrun code passes or performs well.
+
+Implement a self-contained EFB core for sparse mutually exclusive features:
+conflict measurement, deterministic bundle construction, offset encoding,
+decoding original feature/bin identities, explicit-zero versus absent-entry
+semantics, missing values, memory accounting, and an unbundled fallback
+decision. Do not auto-enable it. Write adversarial collision, determinism,
+round-trip, missing/zero, and categorical-boundary tests. The handoff must
+specify integration with current CSR/CSC binning, split recovery, prediction,
+feature importance, TreeSHAP, model dumping, and serialization.
+
+
+PARALLEL TASK 14: MODEL INSPECTION AND STABLE DUMP SCHEMA
+========================================================
+
+Work in the `mojoboost` repository immediately, in parallel with every other lane.
+This task is one lane in a simultaneous parallel round. Preserve concurrent
+work and edit ONLY: `src/mojoboost/inspection.mojo`,
+`python/mojoboost/inspection.py`, `python/tests/parallel/test_inspection.py`,
+`docs/MODEL_INSPECTION_SCHEMA.md`, and `handoffs/task14_inspection.md`. Do not
+edit central/shared files. Put required exports, binding functions, model
+accessors, and serialization wiring in the handoff. Do not commit or stage.
+Run only your assigned focused test once. Do not run unrelated Mojo, Pixi, pytest, builds, wheels, benchmarks, profilers,
+retry loops, polling loops, background commands, or parallel shell commands.
+After that focused test, run `git diff --check --` on assigned paths. Never claim unrun
+code passes.
+
+Define a versioned dump schema containing model/objective metadata, feature
+names, trees, nodes, depths, numerical thresholds, category sets, missing
+directions, gains, counts, covers/weights, and leaf values. Implement isolated
+conversion helpers where current public structures permit it; otherwise make
+the Python consumer operate on the proposed schema and document exact native
+hooks. Add `trees_to_dataframe` and split-value-histogram data transformations.
+Do not add plotting dependencies. Specify `booster_`, `feature_name_`,
+`n_features_`, `n_iter_`, `objective_`, and `best_score_` wiring. Do not offer
+leaf editing unless its invariants can be stated and tested completely.
+
+
+PARALLEL TASK 15: CROSS-VALIDATION AND CVBOOSTER LAYER
+=====================================================
+
+Work in the `mojoboost` repository immediately, in parallel with every other lane.
+This task is one lane in a simultaneous parallel round. Preserve concurrent
+work and edit ONLY: `python/mojoboost/cv.py`,
+`python/tests/parallel/test_cv.py`, and `handoffs/task15_cv.md`. Do not edit
+central/shared files. Put required package exports and Dataset/Booster API
+changes in the handoff. Do not commit or stage. Run only your assigned focused test once. Do not run unrelated Mojo, Pixi,
+pytest, builds, wheels, benchmarks, profilers, retry loops, polling loops,
+background commands, or parallel shell commands. After that focused test, run `git diff --check --` on assigned paths. Never claim unrun code passes.
+
+Implement the Python orchestration for `cv()` and `CVBooster` against the
+current public or emerging Dataset/Booster interface without copying training
+logic. Support explicit folds, sklearn splitters, deterministic shuffled
+K-fold, classifier stratification, group-safe ranking folds, multiple and
+custom metrics, callback forwarding, early-stopping consensus, train metrics,
+and optional return of fitted fold boosters. Prevent preprocessing leakage.
+If a needed Booster method is absent, define a small adapter protocol and put
+the exact native/Python integration requirement in the handoff.
+
+
+PARALLEL TASK 16: REAL DISTRIBUTED TRANSPORT
+===========================================
+
+Work in the `mojoboost` repository immediately, in parallel with every other lane.
+This task is one lane in a simultaneous parallel round. Preserve concurrent
+work and edit ONLY: `src/mojoboost/distributed_transport.mojo`,
+`tests/parallel/test_distributed_transport.mojo`,
+`docs/DISTRIBUTED_TRANSPORT.md`, and `handoffs/task16_distributed.md`. Do not
+edit existing distributed or central/shared files. Put exact integration
+edits in the handoff. Do not commit or stage. Run only your assigned focused test once. Do not run unrelated Mojo, Pixi,
+pytest, builds, network services, containers, MPI jobs, wheels, benchmarks,
+profilers, retry loops, polling loops, background commands, or parallel shell
+commands. After that focused test, run `git diff --check --` on assigned paths. Never
+claim unrun code is distributed or correct.
+
+Design and implement the isolated transport/state-machine layer for a real
+multi-process and multi-host backend: rank/world configuration, message
+framing, deterministic collective ordering, histogram all-reduce contracts,
+global split agreement, timeouts, cancellation, worker loss, schema mismatch,
+checkpoint/restart metadata, and pluggable transport boundaries. Prefer the
+smallest standard-library socket transport that can later be exercised in a
+hermetic two-process test. Keep MPI/NCCL future adapters behind the interface.
+Tests should use in-memory fake endpoints to cover protocol logic without
+launching processes. Documentation must explicitly distinguish implemented
+transport logic from unvalidated multi-host operation.
+
+
+PARALLEL TASK 17: DASK ADAPTER CONTRACT
+======================================
+
+Work in the `mojoboost` repository immediately, in parallel with every other lane.
+This task is one lane in a simultaneous parallel round. Preserve concurrent
+work and edit ONLY: `python/mojoboost/dask.py`,
+`python/tests/parallel/test_dask_contract.py`, and
+`handoffs/task17_dask.md`. Do not edit central/shared files. Put required
+exports and distributed-runtime hooks in the handoff. Do not commit or stage.
+Run only your assigned focused test once. Do not run unrelated Mojo, Pixi, pytest, Dask clusters, builds, wheels,
+benchmarks, profilers, retry loops, polling loops, background commands, or
+parallel shell commands. After that focused test, run `git diff --check --` on assigned paths. Never claim unrun code passes or that distributed training works.
+
+Create optional, import-safe adapter contracts for
+`DaskMojoBoostRegressor`, `DaskMojoBoostClassifier`, and
+`DaskMojoBoostRanker`. Define lazy imports, partition metadata validation,
+worker-address/rank mapping, model-future ownership, distributed prediction,
+categorical schema handling, and ranking-group partition rules. Because the
+real transport is being built concurrently, depend on a narrow documented
+protocol and provide fake-client tests rather than claiming end-to-end Dask
+training. The handoff must list exactly what Task 16/integration must expose
+before these estimators can be marked supported.
+
+
+PARALLEL TASK 18: PLATFORM, WHEEL, AND ACCELERATOR RELEASE DESIGN
+===============================================================
+
+Work in the `mojoboost` repository immediately, in parallel with every other lane.
+This task is one lane in a simultaneous parallel round. Preserve concurrent
+work and edit ONLY: `packaging/matrix/`, `docs/PLATFORM_MATRIX.md`, and
+`handoffs/task18_platform.md`. Do not edit current workflows, Pixi files,
+build scripts, or central/shared files. Put exact future CI/build edits in the
+handoff. Do not commit or stage. Run only your assigned focused test once. Do not run unrelated Mojo, Pixi, pytest, builds,
+wheels, containers, downloads, benchmarks, profilers, retry loops, polling
+loops, background commands, or parallel shell commands. Only
+`git diff --check --` on assigned paths is permitted. Never claim artifacts
+were built or platforms validated.
+
+Design the truthful release matrix for macOS ARM64 and supported Linux x86_64
+/ ARM64 targets and Mojo-compatible Python versions. Provide declarative
+matrix metadata, expected wheel tags, clean-install smoke-test scripts or
+fixtures that are not executed, artifact validation rules, and accelerator
+record templates for Apple M1-M5, NVIDIA, and AMD. Include Metal toolchain
+requirements and unsupported-combination failure behavior. Do not label any
+platform validated without recorded hardware evidence. Include the easy
+macOS-wheel path required for the Apple product story.
+
+
+PARALLEL TASK 19: REAL-DATA DIFFERENTIAL HARNESS DESIGN
+=====================================================
+
+Work in the `mojoboost` repository immediately, in parallel with every other lane.
+This task is one lane in a simultaneous parallel round. Preserve concurrent
+work and edit ONLY: `bench/real_data/` and `handoffs/task19_real_data.md`.
+Do not edit existing benchmarks or central/shared files. Put dependency and
+task-runner wiring in the handoff. Do not commit or stage. This is a harness-
+authoring lane, so do not execute the benchmark or download datasets. Do not
+run broad tests, builds, wheels, profilers, retry loops, polling loops,
+background commands, or parallel shell commands. Run only static validation
+of the harness and `git diff --check --` on assigned paths. Never invent or
+publish benchmark results.
+
+Create a reproducible, not-yet-executed differential harness spanning dense
+regression, imbalanced binary classification, multiclass, ranking,
+categorical/missing data, and high-dimensional sparse data. Pin public
+datasets by URL/version/checksum or use deterministic generators. Align
+MojoBoost and LightGBM semantics and thread counts. Define machine-readable
+JSON/CSV output for quality, training and prediction time, binning, compile
+warmup, transfers, peak memory, model size, and environment metadata. Separate
+correctness thresholds from noisy performance reporting. Include CPU and
+Apple GPU modes, but record no fabricated numbers.
+
+
+PARALLEL TASK 20: COMPATIBILITY AND RELEASE CONTRACT
+====================================================
+
+Work in the `mojoboost` repository immediately, in parallel with every other lane.
+This task is one lane in a simultaneous parallel round. Preserve concurrent
+work and edit ONLY: `docs/COMPATIBILITY_POLICY.md`,
+`docs/tutorials/feature_complete_walkthrough.md`,
+`tests/parallel/api_snapshot_manifest.json`, and
+`handoffs/task20_compatibility.md`. Do not edit the parity matrix, README,
+public package files, or other central/shared files. Put required snapshot
+tooling and exports in the handoff. Do not commit or stage. This is a policy
+and manifest lane, so no runtime test is needed. Do not run broad tests,
+builds, wheels, benchmarks, profilers, retry loops, polling loops, background
+commands, or parallel shell commands. Run `git diff --check --` on assigned
+paths. Never claim 1.0 readiness.
+
+Define semantic versioning, deprecation periods, parameter alias/default
+stability, fitted-attribute guarantees, Python/Mojo/C ABI policy, model-format
+and inspection-schema compatibility, callback environment stability, and
+supported-platform policy. Create a proposed API snapshot manifest. Write a
+walkthrough covering validation, early stopping, inspection, save/load,
+continued training, leaves/contributions, sparse/categorical inputs, and
+CPU/GPU selection, marking unavailable pieces honestly. Define the release
+gate without changing parity statuses.
+
+
+PARALLEL APPLE TASK A1: DEVICE-SIDE ACTIVE-ROW COMPACTION
+=======================================================
+
+Work in the `mojoboost` repository immediately, in parallel with every other lane.
+This task is one lane in a simultaneous parallel round. Preserve concurrent
+work and edit ONLY: `src/mojoboost/gpu_active_rows.mojo`,
+`tests/parallel/test_gpu_active_rows.mojo`, and
+`handoffs/apple_a1_active_rows.md`. Do not edit GPU training/histogram or
+central/shared files. Put exact integration calls in the handoff. Do not
+commit or stage. Run only your assigned focused test once. Do not run unrelated Mojo, Pixi, pytest, builds, wheels,
+benchmarks, profilers, retry loops, polling loops, background commands, or
+parallel shell commands. After that focused test, run `git diff --check --` on assigned paths. Never claim unrun GPU code compiles or is faster.
+
+Implement the isolated GPU data structures and kernels for active-row
+compaction: stable partition of a leaf's row-index range, left/right counts,
+contiguous child ranges, reusable index buffers, and histogram iteration over
+only the selected range. Preserve deterministic row order, bagging semantics,
+missing/categorical routing, and bounds safety. Avoid per-leaf allocation.
+Write structural tests for stable partition and range invariants. The handoff
+must replace the current all-row leaf-ID filtering path step by step and list
+required benchmark counters without running them.
+
+
+PARALLEL APPLE TASK A2: DEVICE-SIDE SPLIT SEARCH
+===============================================
+
+Work in the `mojoboost` repository immediately, in parallel with every other lane.
+This task is one lane in a simultaneous parallel round. Preserve concurrent
+work and edit ONLY: `src/mojoboost/gpu_split_search.mojo`,
+`tests/parallel/test_gpu_split_search.mojo`, and
+`handoffs/apple_a2_split_search.md`. Do not edit central/shared files. Put
+exact GPU trainer/tree integration in the handoff. Do not commit or stage.
+Run only your assigned focused test once. Do not run unrelated Mojo, Pixi, pytest, builds, wheels, benchmarks, profilers,
+retry loops, polling loops, background commands, or parallel shell commands.
+After that focused test, run `git diff --check --` on assigned paths. Never claim unrun
+GPU code compiles or is correct.
+
+Implement isolated kernels and compact result structures for histogram
+reduction, gain scanning, numerical and categorical candidate evaluation,
+missing-direction choice, deterministic best-split reduction, child
+statistics, and leaf-value computation. Match current Float32/fixed-point GPU
+semantics and deterministic tie-breaking. Design an incremental path where
+only one best-split record returns to the CPU before a future fully device-
+side queue. Write analytical tiny-histogram tests and run only that assigned test file once.
+
+
+PARALLEL APPLE TASK A3: DEVICE-SIDE OBJECTIVES
+=============================================
+
+Work in the `mojoboost` repository immediately, in parallel with every other lane.
+This task is one lane in a simultaneous parallel round. Preserve concurrent
+work and edit ONLY: `src/mojoboost/gpu_objectives_native.mojo`,
+`tests/parallel/test_gpu_objectives_native.mojo`, and
+`handoffs/apple_a3_objectives.md`. Do not edit existing objectives or GPU
+trainer files. Put exact integration in the handoff. Do not commit or stage.
+Run only your assigned focused test once. Do not run unrelated Mojo, Pixi, pytest, builds, wheels, benchmarks, profilers,
+retry loops, polling loops, background commands, or parallel shell commands.
+After that focused test, run `git diff --check --` on assigned paths. Never claim unrun
+GPU code compiles or matches CPU.
+
+Implement device-side prediction-to-gradient/Hessian kernels for squared
+error, binary logistic, multiclass softmax, Poisson, Huber, quantile, and L1
+where the mathematical interface permits. Include weights, clipping/stability,
+objective parameters, and device-resident prediction updates. Preserve the
+host path for Python custom objectives. Write finite-difference and CPU-
+reference test definitions. The handoff must state buffer lifetimes and how
+to eliminate per-round gradient uploads.
+
+
+PARALLEL APPLE TASK A4: GPU PREDICTION AND VALIDATION SCORING
+===========================================================
+
+Work in the `mojoboost` repository immediately, in parallel with every other lane.
+This task is one lane in a simultaneous parallel round. Preserve concurrent
+work and edit ONLY: `src/mojoboost/gpu_predict.mojo`,
+`tests/parallel/test_gpu_predict.mojo`, and
+`handoffs/apple_a4_gpu_predict.md`. Do not edit bindings, estimators, model,
+or GPU trainer files. Put exact integration in the handoff. Do not commit or
+stage. Run only your assigned focused test once. Do not run unrelated Mojo, Pixi, pytest, builds, wheels, benchmarks,
+profilers, retry loops, polling loops, background commands, or parallel shell
+commands. After that focused test, run `git diff --check --` on assigned paths. Never
+claim unrun GPU code compiles or is faster.
+
+Implement batched device prediction primitives for regression, binary, and
+multiclass raw scores and response transforms, including iteration ranges,
+missing and categorical routing, and persistent prediction buffers. Design
+validation-set residency and device-side metric reductions sufficient for
+early stopping. Leaf-index and contribution prediction may be separately
+documented follow-ups if they require incompatible kernels. The handoff must
+specify Python `predict(..., device="gpu")`, `predict_proba`, and training-
+validation wiring plus CPU-equivalence tests.
+
+
+PARALLEL APPLE TASK A5: PERSISTENT GPU RUNTIME AND ASYNC SCHEDULING
+=================================================================
+
+Work in the `mojoboost` repository immediately, in parallel with every other lane.
+This task is one lane in a simultaneous parallel round. Preserve concurrent
+work and edit ONLY: `src/mojoboost/gpu_runtime.mojo`,
+`tests/parallel/test_gpu_runtime.mojo`, and
+`handoffs/apple_a5_runtime.md`. Do not edit existing GPU modules or central
+files. Put exact integration in the handoff. Do not commit or stage. DO NOT
+RUN TESTS, Mojo, Pixi, pytest, builds, wheels, benchmarks, profilers, retry
+loops, polling loops, background commands, or parallel shell commands. Only
+`git diff --check --` on assigned paths is permitted. Never claim unrun code
+reduces overhead.
+
+Design a persistent per-estimator GPU session that owns one DeviceContext,
+precompiled kernel handles, reusable buffer pools, resident training and
+validation matrices, event/synchronization boundaries, and deterministic
+cleanup. Minimize synchronization and enable safe overlap of host preparation
+with queued device work without changing results. Provide instrumentation
+hooks for compile, allocation, transfer, kernel, synchronization, and cleanup
+phases. Write mock/state-machine lifecycle tests. Document which current
+synchronizations can be removed only after dependency analysis.
+
+
+PARALLEL APPLE TASK A6: APPLE-SILICON TUNING POLICY
+==================================================
+
+Work in the `mojoboost` repository immediately, in parallel with every other lane.
+This task is one lane in a simultaneous parallel round. Preserve concurrent
+work and edit ONLY: `src/mojoboost/apple_gpu_policy.mojo`,
+`tests/parallel/test_apple_gpu_policy.mojo`, and
+`handoffs/apple_a6_policy.md`. Do not edit current device/tiling modules or
+central files. Put exact integration in the handoff. Do not commit or stage.
+Run only your assigned focused test once. Do not run unrelated Mojo, Pixi, pytest, builds, wheels, benchmarks, profilers,
+retry loops, polling loops, background commands, or parallel shell commands.
+After that focused test, run `git diff --check --` on assigned paths. Never invent M1-M5
+measurements.
+
+Implement a pure policy layer driven by reported API, architecture/generation,
+GPU core or multiprocessor count, threadgroup/shared-memory limits, dataset
+shape, bin count, and memory budget. Select threadgroup size, rows per tile,
+histogram strategy, partial-buffer limit, and future CPU/GPU crossover inputs.
+Do not hardcode the developer's M4 as universal. Supply conservative M1-M5
+capability fixtures explicitly labeled synthetic until validated. Preserve a
+portable generic fallback for Metal/CUDA/HIP.
+
+
+PARALLEL APPLE TASK A7: UNIFIED-MEMORY EXPERIMENT DESIGN
+=======================================================
+
+Work in the `mojoboost` repository immediately, in parallel with every other lane.
+This task is one lane in a simultaneous parallel round. Preserve concurrent
+work and edit ONLY: `bench/apple/unified_memory.mojo`,
+`docs/APPLE_UNIFIED_MEMORY.md`, and
+`handoffs/apple_a7_unified_memory.md`. Do not edit current GPU modules or
+central files. Put proposed API changes in the handoff. Do not commit or
+stage. Run only your assigned focused test once. Do not run unrelated Mojo, Pixi, pytest, builds, wheels, benchmarks,
+profilers, memory-pressure tools, retry loops, polling loops, background
+commands, or parallel shell commands. This lane writes the experiment but
+does not execute a potentially heavy benchmark; run `git diff --check --` on
+assigned paths. Never claim zero-copy or performance without results.
+
+Create an unexecuted experiment driver and methodology comparing explicit
+copying with any actually available safe shared/mapped-buffer route. Measure
+allocation, first touch/page migration, synchronization, repeated rounds,
+peak resident memory, compression/swap, CPU/GPU contention, and maximum
+practical dataset size. Detect unavailable APIs and report unsupported rather
+than pretending. Documentation must distinguish unified physical memory from
+proven zero-copy behavior.
+
+
+PARALLEL APPLE TASK A8: APPLE BENCHMARK AND ENERGY STORY
+=======================================================
+
+Work in the `mojoboost` repository immediately, in parallel with every other lane.
+This task is one lane in a simultaneous parallel round. Preserve concurrent
+work and edit ONLY: `bench/apple/suite.py`, `bench/apple/schema.json`,
+`docs/APPLE_GPU_BENCHMARK_PROTOCOL.md`, and
+`handoffs/apple_a8_benchmarks.md`. Do not edit existing benchmarks or central
+files. Put runner/dependency wiring in the handoff. Do not commit or stage.
+Run only your assigned focused test once. Do not run unrelated Mojo, Pixi, pytest, builds, wheels, dataset downloads,
+benchmarks, profilers, power tools, retry loops, polling loops, background
+commands, or parallel shell commands. This lane writes the benchmark suite
+but does not execute it; run lightweight static validation and
+`git diff --check --` on assigned paths. Never fabricate benchmark or energy
+data.
+
+Define the M1-M5 validation protocol and machine-readable result schema for
+small, medium, large dense, sparse, multiclass, missing/categorical, repeated-
+fit, and prediction workloads. Capture binning, compilation/warmup,
+allocation, transfers, kernels, synchronization, total training, prediction,
+quality, peak memory, energy/average power when available, thermals, OS, Mojo,
+and hardware. Compare matched-thread MojoBoost CPU, MojoBoost GPU, LightGBM,
+and XGBoost where supported. Define idle-machine and cooldown rules. Produce
+no results during this task.
+
+
+PARALLEL APPLE TASK A9: EXPLAINABLE AUTOMATIC DEVICE SELECTION
+============================================================
+
+Work in the `mojoboost` repository immediately, in parallel with every other lane.
+This task is one lane in a simultaneous parallel round. Preserve concurrent
+work and edit ONLY: `python/mojoboost/device_selection.py`,
+`python/tests/parallel/test_device_selection.py`,
+`docs/DEVICE_SELECTION.md`, and
+`handoffs/apple_a9_device_selection.md`. Do not edit estimators, bindings,
+device Mojo modules, or central files. Put exact integration in the handoff.
+Do not commit or stage. Run only your assigned focused test once. Do not run unrelated Mojo, Pixi, pytest, builds, wheels,
+benchmarks, profilers, retry loops, polling loops, background commands, or
+parallel shell commands. After that focused test, run `git diff --check --` on assigned paths. Never invent crossover thresholds.
+
+Design and implement the Python policy/report layer for `device="auto"` and
+`explain_device_choice(X)`. Inputs must include detected backend/chip,
+supported objective/data features, rows/features/bins/classes, estimated
+memory, and a versioned table of benchmark-derived crossover rules. With no
+validated rule, conservatively choose CPU and say why. Explicit GPU must
+either run or raise; never silently fall back. Return a structured report plus
+human-readable explanation. Use injected fake capabilities in tests.
+
+
+PARALLEL APPLE TASK A10: FIVE-MINUTE APPLE SILICON EXPERIENCE
+============================================================
+
+Work in the `mojoboost` repository immediately, in parallel with every other lane.
+This task is one lane in a simultaneous parallel round. Preserve concurrent
+work and edit ONLY: `examples/apple_silicon/` and
+`handoffs/apple_a10_demo.md`. Do not edit README, package, build, or central
+files. Put exact documentation/package wiring in the handoff. Do not commit
+or stage. Run only your assigned focused test once. Do not run unrelated Mojo, Pixi, pytest, builds, wheels, downloads,
+benchmarks, profilers, retry loops, polling loops, background commands, or
+parallel shell commands. After that focused test, run `git diff --check --` on assigned paths. Never claim speedups or working features without evidence.
+
+Create a polished five-minute example showing installation placeholders,
+GPU detection, `device="auto"`, validation and early stopping, prediction,
+device-choice explanation, model saving/loading, and a CPU/GPU timing table
+populated only by actual future runs. Lead with: "Native gradient-boosted
+trees accelerated by the GPU already inside every Apple Silicon Mac."
+Clearly label unavailable or not-yet-integrated calls. Include troubleshooting
+for macOS, Xcode/Metal toolchain, unsupported hardware, and CPU fallback. The
+handoff must identify the minimum release capabilities required before the
+example can be advertised.
+
+
+POST-PARALLEL INTEGRATION — DO NOT ASSIGN DURING THIS ROUND
+==========================================================
+
+After every parallel session has stopped:
+
+1. Create a preservation commit containing all isolated outputs.
+2. Review every `handoffs/*.md` file and reject duplicated or incompatible
+   designs before touching central files.
+3. Assign ONE integration owner for shared Mojo training/model/serialization
+   files and ONE integration owner for Python/bindings/docs; do not let them
+   edit the same paths simultaneously.
+4. Wire one subsystem at a time in dependency order:
+   active rows -> split search -> GPU objectives/runtime -> GPU prediction ->
+   Apple policy/device UX; independently EFB/tree parameters/inspection;
+   then CV/distributed/Dask; finally packaging/docs.
+5. During integration, run one focused test at a time. Never run multiple
+   Mojo compilers concurrently.
+6. Run the full suite only once, on explicit user request, after focused
+   integration is green and no other Claude or Mojo process is active.
+7. Benchmark only on an idle machine in a separate explicitly requested run.
+
+The parallel round creates implementation candidates and precise handoffs.
+It does not make the combined repository feature-complete until integration
+and evidence are complete.

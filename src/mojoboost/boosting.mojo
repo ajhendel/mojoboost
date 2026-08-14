@@ -987,6 +987,7 @@ def train_more(
     alpha: Float64 = 0.9,
     bagging: BaggingParams = BaggingParams.disabled(),
     goss: GossParams = GossParams.disabled(),
+    init_score: List[Float64] = [],
 ) raises -> Int:
     """Append `params.n_estimators` more trees to a fitted ensemble and
     return how many were actually added.
@@ -1004,9 +1005,14 @@ def train_more(
     monotonic constraints must match the ones already recorded on it: a
     `Booster` carries a single shrinkage factor and a single constraint
     vector for all of its trees, so neither can change part way through.
+    A non-empty `init_score` is the same offset the first call trained
+    under: it is training state that the ensemble does not carry, so a
+    continued run has to be handed it again to resume from where the first
+    one actually was.
+
     The objective is the ensemble's, and `data` must be binned by the
     mapper the ensemble was trained under (see `BinMapper.matches`), which
-    the callers in dataset.mojo check.
+    the callers in trainset.mojo check.
     """
     if len(target) != data.n_rows:
         raise Error("target length must equal n_rows")
@@ -1022,6 +1028,8 @@ def train_more(
         )
     if params.n_estimators < 0:
         raise Error("n_estimators must not be negative")
+    if len(init_score) != 0 and len(init_score) != data.n_rows:
+        raise Error("init_score length must equal n_rows")
     _check_objective(booster.objective, target, alpha)
     _check_sample_weight(sample_weight, data.n_rows)
     check_bagging(bagging)
@@ -1029,9 +1037,22 @@ def train_more(
     params.tree.monotone.check_features(data.n_features)
 
     var n = data.n_rows
+    var has_init = len(init_score) == n
     var raw = List[Float64](capacity=n)
     for r in range(n):
-        raw.append(booster.predict_raw_row(data, r))
+        # Accumulated in the order the first run accumulated it: the offset
+        # first, then the trees in sequence. Summing the ensemble separately
+        # and adding the offset afterwards is the same arithmetic in a
+        # different association, and lands one ulp away often enough to
+        # break the claim that 40 rounds plus 60 are the 100-round model.
+        var s = booster.base_score
+        if has_init:
+            s += init_score[r]
+        for i in range(len(booster.trees)):
+            s += booster.learning_rate * booster.trees[i].predict_row(
+                data, r
+            )
+        raw.append(s)
 
     var grown = List[Tree]()
     _boost_rounds(
@@ -1348,6 +1369,88 @@ struct MulticlassBooster(Copyable, Movable):
         return out^
 
 
+def _boost_rounds_multiclass(
+    data: BinnedMatrix,
+    labels: List[Int],
+    n_classes: Int,
+    params: BoosterParams,
+    sample_weight: List[Float64],
+    bagging: BaggingParams,
+    goss: GossParams,
+    learning_rate: Float64,
+    round_offset: Int,
+    mut raw: List[Float64],
+    mut trees: List[Tree],
+) raises -> Int:
+    """Grow `params.n_estimators` softmax rounds, appending one tree per
+    class per round to `trees` and keeping the row-major `raw` scores
+    (`raw[r * n_classes + k]`) in step. Returns the number of rounds grown.
+
+    The multiclass counterpart of `_boost_rounds`, shared by the
+    fit-from-scratch path and the continue-training path. `round_offset` is
+    the number of rounds already grown, so the bagging draw, the GOSS
+    schedule, and each tree's feature sample (seeded by
+    `round * n_classes + k`) read the absolute round index and a continued
+    run draws what an uninterrupted one would have drawn.
+    """
+    var n = data.n_rows
+    var prob = List[Float64](capacity=n * n_classes)
+    for _ in range(n * n_classes):
+        prob.append(0.0)
+
+    var grad = List[Float64](capacity=n)
+    var hess = List[Float64](capacity=n)
+    var bag = List[Int]()
+    var grown = 0
+    for i in range(params.n_estimators):
+        var round = round_offset + i
+        refresh_bag(bag, bagging, n, round)
+        for r in range(n):
+            for k in range(n_classes):
+                prob[r * n_classes + k] = raw[r * n_classes + k]
+            _softmax_inplace(prob, r * n_classes, n_classes)
+
+        # One shared sample for the whole round, drawn before any class's
+        # tree so that every class is grown on the same rows.
+        var selection = GossSelection.all_rows()
+        if goss.active(round, learning_rate):
+            selection = _multiclass_goss_select(
+                prob, labels, n_classes, sample_weight, goss, round
+            )
+            bag = selection.rows.copy()
+
+        var made_progress = False
+        for k in range(n_classes):
+            _fill_softmax_grad_hess(
+                prob, labels, k, n_classes, sample_weight, grad, hess
+            )
+            apply_goss_scaling(selection, grad, hess)
+            # Feature subsampling draws once per tree, so each class's tree
+            # in a round gets its own feature set.
+            var tree = grow_tree(
+                data, grad, hess, params.tree, bag, round * n_classes + k
+            )
+            if tree.n_leaves > 1 or abs(tree.value[0]) >= 1e-12:
+                made_progress = True
+            for r in range(n):
+                raw[r * n_classes + k] += (
+                    learning_rate * tree.predict_row(data, r)
+                )
+            trees.append(tree^)
+
+        # No class made progress: with bagging or GOSS that is a statement
+        # about this sample, so the round is dropped and the next sample
+        # gets its turn.
+        if not made_progress:
+            for _ in range(n_classes):
+                _ = trees.pop()
+            if bagging_enabled(bagging) or goss.enabled:
+                continue
+            break
+        grown += 1
+    return grown
+
+
 def train_multiclass(
     data: BinnedMatrix,
     labels: List[Int],
@@ -1396,58 +1499,21 @@ def train_multiclass(
     for _ in range(n):
         for k in range(n_classes):
             raw.append(base_scores[k])
-    var prob = List[Float64](capacity=n * n_classes)
-    for _ in range(n * n_classes):
-        prob.append(0.0)
 
     var trees = List[Tree]()
-    var grad = List[Float64](capacity=n)
-    var hess = List[Float64](capacity=n)
-    var bag = List[Int]()
-    for i in range(params.n_estimators):
-        refresh_bag(bag, bagging, n, i)
-        for r in range(n):
-            for k in range(n_classes):
-                prob[r * n_classes + k] = raw[r * n_classes + k]
-            _softmax_inplace(prob, r * n_classes, n_classes)
-
-        # One shared sample for the whole round, drawn before any class's
-        # tree so that every class is grown on the same rows.
-        var selection = GossSelection.all_rows()
-        if goss.active(i, params.learning_rate):
-            selection = _multiclass_goss_select(
-                prob, labels, n_classes, sample_weight, goss, i
-            )
-            bag = selection.rows.copy()
-
-        var made_progress = False
-        for k in range(n_classes):
-            _fill_softmax_grad_hess(
-                prob, labels, k, n_classes, sample_weight, grad, hess
-            )
-            apply_goss_scaling(selection, grad, hess)
-            # Feature subsampling draws once per tree, so each class's tree
-            # in a round gets its own feature set.
-            var tree = grow_tree(
-                data, grad, hess, params.tree, bag, i * n_classes + k
-            )
-            if tree.n_leaves > 1 or abs(tree.value[0]) >= 1e-12:
-                made_progress = True
-            for r in range(n):
-                raw[r * n_classes + k] += (
-                    params.learning_rate * tree.predict_row(data, r)
-                )
-            trees.append(tree^)
-
-        # No class made progress: with bagging or GOSS that is a statement
-        # about this sample, so the round is dropped and the next sample
-        # gets its turn.
-        if not made_progress:
-            for _ in range(n_classes):
-                _ = trees.pop()
-            if bagging_enabled(bagging) or goss.enabled:
-                continue
-            break
+    _ = _boost_rounds_multiclass(
+        data,
+        labels,
+        n_classes,
+        params,
+        sample_weight,
+        bagging,
+        goss,
+        params.learning_rate,
+        0,
+        raw,
+        trees,
+    )
 
     return MulticlassBooster(
         trees^,
@@ -1456,6 +1522,96 @@ def train_multiclass(
         params.learning_rate,
         params.tree.monotone.copy(),
     )
+
+
+def train_multiclass_more(
+    mut booster: MulticlassBooster,
+    data: BinnedMatrix,
+    labels: List[Int],
+    params: BoosterParams,
+    sample_weight: List[Float64] = [],
+    bagging: BaggingParams = BaggingParams.disabled(),
+    goss: GossParams = GossParams.disabled(),
+) raises -> Int:
+    """Append `params.n_estimators` more softmax rounds to a fitted
+    multiclass ensemble and return how many rounds were actually added.
+
+    The multiclass counterpart of `train_more`, with the same contract: 40
+    rounds followed by 60 more give the ensemble 100 rounds in one call
+    would have given, for the same data, labels, and tree parameters.
+    `params.n_estimators` counts NEW rounds, not total ones, and a round is
+    one tree per class, so the ensemble grows by `added * n_classes` trees.
+
+    `params.learning_rate` must equal the ensemble's own rate and the
+    monotonic constraints must match the ones recorded on it, for the reason
+    `train_more` gives: one shrinkage factor and one constraint vector
+    describe every tree in the ensemble, so neither can change part way
+    through. The class count and the base scores are the ensemble's own: the
+    base scores are the log class priors of the data it was first fitted on
+    and are deliberately not recomputed, since re-deriving them from new
+    labels would silently rewrite what every existing tree is measured
+    against.
+    """
+    if len(labels) != data.n_rows:
+        raise Error("labels length must equal n_rows")
+    if params.learning_rate != booster.learning_rate:
+        raise Error(
+            "continued training cannot change learning_rate: the ensemble"
+            " shrinks every tree by one rate"
+        )
+    if not _same_signs(params.tree.monotone.signs, booster.monotone.signs):
+        raise Error(
+            "continued training cannot change monotone_constraints: the"
+            " ensemble records the constraints all of its trees satisfy"
+        )
+    if params.n_estimators < 0:
+        raise Error("n_estimators must not be negative")
+    var n_classes = booster.n_classes
+    for r in range(len(labels)):
+        if labels[r] < 0 or labels[r] >= n_classes:
+            raise Error("label out of range")
+    _check_sample_weight(sample_weight, data.n_rows)
+    check_bagging(bagging)
+    _check_goss(goss, bagging)
+    params.tree.monotone.check_features(data.n_features)
+
+    # Rebuild the raw scores the existing rounds produce. Accumulating class
+    # by class in round order matches the order `_boost_rounds_multiclass`
+    # accumulated them in, so a continued run resumes from bitwise the same
+    # scores an uninterrupted one would hold.
+    var n = data.n_rows
+    var raw = List[Float64](capacity=n * n_classes)
+    for _ in range(n):
+        for k in range(n_classes):
+            raw.append(booster.base_scores[k])
+    var n_rounds = len(booster.trees) // n_classes
+    for i in range(n_rounds):
+        for k in range(n_classes):
+            ref tree = booster.trees[i * n_classes + k]
+            for r in range(n):
+                raw[r * n_classes + k] += (
+                    booster.learning_rate * tree.predict_row(data, r)
+                )
+
+    # Grown into a list of its own and merged only once the loop has
+    # returned, so a round that raises leaves the ensemble as it was.
+    var grown = List[Tree]()
+    var added = _boost_rounds_multiclass(
+        data,
+        labels,
+        n_classes,
+        params,
+        sample_weight,
+        bagging,
+        goss,
+        booster.learning_rate,
+        n_rounds,
+        raw,
+        grown,
+    )
+    for i in range(len(grown)):
+        booster.trees.append(grown[i].copy())
+    return added
 
 
 def train_multiclass_with_valid(

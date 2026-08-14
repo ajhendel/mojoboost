@@ -33,6 +33,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 CONTRACT = ROOT / "docs" / "LIGHTGBM_PARITY.md"
 PY_API = ROOT / "python" / "mojoboost" / "__init__.py"
+PY_BASIC = ROOT / "python" / "mojoboost" / "basic.py"
 MOJO_INIT = ROOT / "src" / "mojoboost" / "__init__.mojo"
 PIXI = ROOT / "pixi.toml"
 
@@ -46,6 +47,19 @@ FOREIGN_PATHS = {"c_api.h"}
 # downgrading it fails this check. Names are the row's first cell with
 # backticks stripped.
 REQUIRED_SUPPORTED = [
+    # the functional API
+    "Booster",
+    "Dataset",
+    "train",
+    "booster_",
+    "Booster(model_file=) / Booster(model_str=)",
+    "Booster.feature_importance",
+    "Booster.num_feature / num_trees / num_model_per_iteration",
+    "Booster.eval / eval_train / eval_valid / add_valid",
+    "Booster.feature_name",
+    "Dataset construction and construct",
+    "Dataset.get_field and the typed accessors (label, weight, group, init_score)",
+    "Dataset.get_data",
     # estimators
     "LGBMRegressor",
     "LGBMClassifier",
@@ -142,6 +156,9 @@ REQUIRED_SUPPORTED = [
 
 # Public Python names the supported rows depend on.
 REQUIRED_PY_ALL = [
+    "Booster",
+    "Dataset",
+    "train",
     "MojoBoostRegressor",
     "MojoBoostClassifier",
     "MojoBoostRanker",
@@ -245,6 +262,40 @@ REQUIRED_PREDICT_ARGS = {
     ],
 }
 
+# Public methods of the functional API, which lives in basic.py rather than
+# in the package __init__.
+REQUIRED_BASIC_METHODS = {
+    "Dataset": [
+        "construct",
+        "num_data",
+        "num_feature",
+        "num_bin",
+        "get_label",
+        "get_weight",
+        "get_group",
+        "get_init_score",
+        "get_data",
+        "get_field",
+    ],
+    "Booster": [
+        "update",
+        "predict",
+        "eval",
+        "eval_train",
+        "eval_valid",
+        "add_valid",
+        "feature_importance",
+        "save_model",
+        "model_to_string",
+        "model_from_string",
+        "current_iteration",
+        "num_trees",
+        "num_model_per_iteration",
+        "num_feature",
+        "feature_name",
+    ],
+}
+
 REQUIRED_FITTED_ATTRS = [
     "n_features_in_",
     "feature_names_in_",
@@ -276,6 +327,13 @@ REQUIRED_MOJO_EXPORTS = [
     "train_custom",
     "train_with_metrics",
     "train_ranker",
+    "Dataset",
+    "train_dataset",
+    "train_dataset_multiclass",
+    "train_dataset_ranker",
+    "update_dataset",
+    "update_dataset_multiclass",
+    "train_more",
     "train_gpu",
     "train_custom_gpu",
     "train_multiclass_gpu",
@@ -447,6 +505,37 @@ def python_api(problems):
     for name in ("gpu_available", "group_from_query_ids", "ndcg_score"):
         if name not in functions:
             fail(problems, f"python: {name}() is gone")
+
+    basic = ast.parse(PY_BASIC.read_text())
+    basic_classes = {
+        node.name: node
+        for node in basic.body
+        if isinstance(node, ast.ClassDef)
+    }
+    basic_functions = {
+        node.name for node in basic.body if isinstance(node, ast.FunctionDef)
+    }
+    if "train" not in basic_functions:
+        fail(problems, "python: basic.train() is gone")
+    for cls, methods in REQUIRED_BASIC_METHODS.items():
+        node = basic_classes.get(cls)
+        if node is None:
+            fail(problems, f"python: class {cls} is gone from basic.py")
+            continue
+        defined = {
+            m.name
+            for m in node.body
+            if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef))
+        } | {
+            target.id
+            for m in node.body
+            if isinstance(m, ast.Assign)
+            for target in m.targets
+            if isinstance(target, ast.Name)
+        }
+        for method in methods:
+            if method not in defined:
+                fail(problems, f"python: {cls}.{method} is gone")
 
     base = classes.get("_Base")
     if base is None:

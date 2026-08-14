@@ -6,7 +6,7 @@ trees. The rest covers direction, ties, min_delta, several metrics with an
 explicit primary, several validation sets, and callback failure.
 """
 
-from std.math import log
+from std.math import exp, log
 from std.os import remove
 from std.testing import assert_equal, assert_raises, assert_true, TestSuite
 
@@ -27,12 +27,17 @@ from mojoboost.custom_metric import (
     MetricSuite,
     RawValidSet,
     ValidSet,
+    fit_multiclass_with_metrics,
+    fit_ranker_with_metrics,
     fit_with_metrics,
     response_scale,
     train_custom_with_metrics,
+    train_multiclass_with_metrics,
+    train_ranker_with_metrics,
     train_with_metric,
     train_with_metrics,
 )
+from mojoboost.ranking import groups_from_counts, ndcg
 from mojoboost.objective import (
     mean_label,
     squared_error_grad_hess,
@@ -723,6 +728,278 @@ def test_mismatched_raw_validation_shape_raises() raises:
             _params(5),
             MetricSuite(metrics^, single, 0),
         )
+
+
+def _multiclass_data() raises -> BinnedMatrix:
+    var features: List[Float64] = [
+        0.0, 1.0, 2.0, 10.0, 11.0, 12.0, 20.0, 21.0, 22.0,
+    ]
+    return bin_equal_width(features, n_rows=9, n_features=1, n_bins=16)
+
+
+def _multiclass_labels() -> List[Int]:
+    return [0, 0, 0, 1, 1, 1, 2, 2, 2]
+
+
+def _multiclass_targets() -> List[Float64]:
+    return [0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0]
+
+
+def _softmax_log_loss(
+    pred: List[Float64], target: List[Float64], n_classes: Int
+) raises -> Float64:
+    """Multiclass log loss computed here rather than borrowed, so the check
+    on the trainer's own record is an independent one."""
+    var total = 0.0
+    for r in range(len(target)):
+        var top = pred[r * n_classes]
+        for k in range(1, n_classes):
+            if pred[r * n_classes + k] > top:
+                top = pred[r * n_classes + k]
+        var denom = 0.0
+        for k in range(n_classes):
+            denom += exp(pred[r * n_classes + k] - top)
+        var code = Int(target[r])
+        total -= pred[r * n_classes + code] - top - log(denom)
+    return total / Float64(len(target))
+
+
+def test_multiclass_metrics_score_the_softmax_ensemble() raises:
+    def logloss(
+        metric: Int, valid: Int, pred: List[Float64], y: List[Float64]
+    ) raises -> Float64:
+        return _softmax_log_loss(pred, y, 3)
+
+    var data = _multiclass_data()
+    var valid_sets: List[ValidSet] = [
+        ValidSet("valid", data.copy(), _multiclass_targets())
+    ]
+    var metrics: List[CustomMetric] = [CustomMetric("multi_logloss")]
+    var result = train_multiclass_with_metrics(
+        data,
+        _multiclass_labels(),
+        3,
+        valid_sets^,
+        _params(6),
+        MetricSuite(metrics^, logloss, 0),
+    )
+    # A round is one tree per class, and every value is recorded, round 0
+    # (the class priors alone) included.
+    assert_equal(result.history.n_rounds(), 7)
+    assert_equal(len(result.booster.trees), 6 * 3)
+    assert_true(result.best_iteration > 0)
+    assert_true(not result.stopped_early)
+
+    # Fitting its own labels can only help, so the record must fall.
+    var series = result.history.series(0, 0)
+    for i in range(1, len(series)):
+        assert_true(series[i] < series[i - 1])
+    assert_true(abs(series[result.best_iteration] - result.best_score) < 1e-12)
+
+
+def test_multiclass_early_stopping_truncates_whole_rounds() raises:
+    def logloss(
+        metric: Int, valid: Int, pred: List[Float64], y: List[Float64]
+    ) raises -> Float64:
+        return _softmax_log_loss(pred, y, 3)
+
+    # Validation labels rotated one class over, so every round of fitting
+    # the training labels makes the validation loss worse and the best
+    # round is the base-score-only one.
+    var rotated: List[Float64] = [
+        1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 0.0, 0.0, 0.0,
+    ]
+    var data = _multiclass_data()
+    var valid_sets: List[ValidSet] = [
+        ValidSet("valid", data.copy(), rotated^)
+    ]
+    var metrics: List[CustomMetric] = [CustomMetric("multi_logloss")]
+    var result = train_multiclass_with_metrics(
+        data,
+        _multiclass_labels(),
+        3,
+        valid_sets^,
+        _params(50),
+        MetricSuite(metrics^, logloss, 0),
+        early_stopping_rounds=3,
+    )
+    assert_true(result.stopped_early)
+    assert_equal(result.best_iteration, 0)
+    assert_equal(len(result.booster.trees), 0)
+
+
+def test_multiclass_validation_labels_are_checked() raises:
+    def logloss(
+        metric: Int, valid: Int, pred: List[Float64], y: List[Float64]
+    ) raises -> Float64:
+        return _softmax_log_loss(pred, y, 3)
+
+    var stranger: List[Float64] = [
+        0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 2.0, 2.0, 3.0,
+    ]
+    var data = _multiclass_data()
+    var valid_sets: List[ValidSet] = [
+        ValidSet("valid", data.copy(), stranger^)
+    ]
+    var metrics: List[CustomMetric] = [CustomMetric("multi_logloss")]
+    with assert_raises(contains="outside 0..n_classes-1"):
+        _ = train_multiclass_with_metrics(
+            data,
+            _multiclass_labels(),
+            3,
+            valid_sets^,
+            _params(3),
+            MetricSuite(metrics^, logloss, 0),
+        )
+
+
+def _rank_features() -> List[Float64]:
+    return [0.0, 1.0, 2.0, 3.0, 0.0, 1.0, 2.0, 3.0]
+
+
+def _rank_labels() -> List[Int]:
+    return [0, 1, 2, 3, 0, 1, 2, 3]
+
+
+def _rank_targets() -> List[Float64]:
+    return [0.0, 1.0, 2.0, 3.0, 0.0, 1.0, 2.0, 3.0]
+
+
+def test_ranker_metrics_score_ndcg() raises:
+    var groups = groups_from_counts([4, 4])
+    var valid_groups = groups_from_counts([4, 4])
+
+    def ndcg_metric(
+        metric: Int, valid: Int, pred: List[Float64], y: List[Float64]
+    ) raises {imm valid_groups} -> Float64:
+        var grades = List[Int](capacity=len(y))
+        for r in range(len(y)):
+            grades.append(Int(y[r]))
+        return ndcg(pred, grades, valid_groups, 3)
+
+    var data = bin_equal_width(
+        _rank_features(), n_rows=8, n_features=1, n_bins=8
+    )
+    var valid_sets: List[ValidSet] = [
+        ValidSet("valid", data.copy(), _rank_targets())
+    ]
+    var metrics: List[CustomMetric] = [
+        CustomMetric("ndcg", higher_is_better=True)
+    ]
+    var result = train_ranker_with_metrics(
+        data,
+        _rank_labels(),
+        groups,
+        valid_sets^,
+        _params(40),
+        MetricSuite(metrics^, ndcg_metric, 0),
+        early_stopping_rounds=3,
+    )
+    # The ensemble is truncated to the best round, so scoring what came
+    # back reproduces the value recorded there.
+    assert_equal(len(result.booster.trees), result.best_iteration)
+    var scores = List[Float64](capacity=8)
+    for r in range(8):
+        scores.append(result.booster.predict_raw_row(data, r))
+    assert_true(
+        abs(ndcg(scores, _rank_labels(), valid_groups, 3) - result.best_score)
+        < 1e-12
+    )
+    # The ranking is learnable from the one feature, so it is perfect.
+    assert_true(abs(result.best_score - 1.0) < 1e-12)
+    assert_true(result.stopped_early)
+
+
+def test_ranker_validation_relevance_is_checked() raises:
+    var groups = groups_from_counts([4, 4])
+
+    def ndcg_metric(
+        metric: Int, valid: Int, pred: List[Float64], y: List[Float64]
+    ) raises -> Float64:
+        return 0.0
+
+    var fractional: List[Float64] = [
+        0.0, 1.5, 2.0, 3.0, 0.0, 1.0, 2.0, 3.0,
+    ]
+    var data = bin_equal_width(
+        _rank_features(), n_rows=8, n_features=1, n_bins=8
+    )
+    var valid_sets: List[ValidSet] = [
+        ValidSet("valid", data.copy(), fractional^)
+    ]
+    var metrics: List[CustomMetric] = [CustomMetric("ndcg")]
+    with assert_raises(contains="non-integer relevance label"):
+        _ = train_ranker_with_metrics(
+            data,
+            _rank_labels(),
+            groups,
+            valid_sets^,
+            _params(3),
+            MetricSuite(metrics^, ndcg_metric, 0),
+        )
+
+
+def test_raw_feature_entry_points_bin_their_validation_sets() raises:
+    def logloss(
+        metric: Int, valid: Int, pred: List[Float64], y: List[Float64]
+    ) raises -> Float64:
+        return _softmax_log_loss(pred, y, 3)
+
+    var features: List[Float64] = [
+        0.0, 1.0, 2.0, 10.0, 11.0, 12.0, 20.0, 21.0, 22.0,
+    ]
+    var multi_valid: List[RawValidSet] = [
+        RawValidSet("valid", features.copy(), 9, _multiclass_targets())
+    ]
+    var metrics: List[CustomMetric] = [CustomMetric("multi_logloss")]
+    var fitted = fit_multiclass_with_metrics(
+        features,
+        9,
+        1,
+        _multiclass_labels(),
+        3,
+        multi_valid^,
+        _params(5),
+        MetricSuite(metrics^, logloss, 0),
+    )
+    assert_equal(fitted.history.n_rounds(), 6)
+    var row: List[Float64] = [11.0]
+    var probs = fitted.model.predict_proba(row)
+    assert_true(probs[1] > probs[0] and probs[1] > probs[2])
+
+    var valid_groups = groups_from_counts([4, 4])
+
+    def ndcg_metric(
+        metric: Int, valid: Int, pred: List[Float64], y: List[Float64]
+    ) raises {imm valid_groups} -> Float64:
+        var grades = List[Int](capacity=len(y))
+        for r in range(len(y)):
+            grades.append(Int(y[r]))
+        return ndcg(pred, grades, valid_groups, 3)
+
+    var rank_valid: List[RawValidSet] = [
+        RawValidSet("valid", _rank_features(), 8, _rank_targets())
+    ]
+    var rank_metrics: List[CustomMetric] = [
+        CustomMetric("ndcg", higher_is_better=True)
+    ]
+    var ranked = fit_ranker_with_metrics(
+        _rank_features(),
+        8,
+        1,
+        _rank_labels(),
+        [4, 4],
+        rank_valid^,
+        _params(20),
+        MetricSuite(rank_metrics^, ndcg_metric, 0),
+        early_stopping_rounds=3,
+    )
+    assert_true(abs(ranked.best_score - 1.0) < 1e-12)
+    var top: List[Float64] = [3.0]
+    var bottom: List[Float64] = [0.0]
+    assert_true(
+        ranked.model.predict_raw(top) > ranked.model.predict_raw(bottom)
+    )
 
 
 def main() raises:

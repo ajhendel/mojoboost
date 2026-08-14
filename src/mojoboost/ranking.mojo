@@ -376,6 +376,81 @@ def ndcg(
     return ndcg_at_cutoffs(scores, labels, groups, cutoffs)[0]
 
 
+def map_at_cutoffs(
+    scores: List[Float64],
+    labels: List[Int],
+    groups: RankGroups,
+    cutoffs: List[Int],
+) raises -> List[Float64]:
+    """Mean average precision over queries at each cutoff, LightGBM's `map`.
+
+    Relevance is binary here even though the labels are graded: any label
+    above 0 is relevant, which is what average precision is defined on. A
+    query's AP@k is the mean of the precisions measured at each relevant
+    document within the first k, divided by `min(k, relevant in query)`, so
+    a query with more relevant documents than positions is not penalized for
+    the positions it does not have.
+
+    Documents are ranked by `scores` within their own query, never across
+    queries, and ties keep their input order, as in `ndcg_at_cutoffs`. A
+    query with no relevant document counts as 1.0 at every cutoff, the same
+    convention this module's NDCG uses for a query with no attainable DCG:
+    nothing was retrievable, so nothing was missed.
+    """
+    check_groups(groups, len(scores))
+    if len(labels) != len(scores):
+        raise Error("labels length must equal scores length")
+    check_labels(labels)
+    if len(cutoffs) == 0:
+        raise Error("map needs at least one cutoff")
+    for i in range(len(cutoffs)):
+        if cutoffs[i] < 1:
+            raise Error("map cutoffs must be positive")
+
+    var totals = List[Float64](capacity=len(cutoffs))
+    for _ in range(len(cutoffs)):
+        totals.append(0.0)
+
+    for q in range(groups.n_queries()):
+        var start = groups.start(q)
+        var cnt = groups.size(q)
+        var order = _argsort_desc_range(scores, start, cnt)
+        var n_relevant = 0
+        for i in range(cnt):
+            if labels[start + i] > 0:
+                n_relevant += 1
+        for c in range(len(cutoffs)):
+            if n_relevant == 0:
+                totals[c] += 1.0
+                continue
+            var m = cutoffs[c] if cutoffs[c] < cnt else cnt
+            var hits = 0.0
+            var precision_sum = 0.0
+            for j in range(m):
+                if labels[start + order[j]] > 0:
+                    hits += 1.0
+                    precision_sum += hits / Float64(j + 1)
+            var denom = cutoffs[c] if cutoffs[c] < n_relevant else n_relevant
+            totals[c] += precision_sum / Float64(denom)
+
+    var n_queries = Float64(groups.n_queries())
+    for c in range(len(cutoffs)):
+        totals[c] /= n_queries
+    return totals^
+
+
+def mean_average_precision(
+    scores: List[Float64],
+    labels: List[Int],
+    groups: RankGroups,
+    k: Int = DEFAULT_NDCG_EVAL_AT,
+) raises -> Float64:
+    """Mean average precision at cutoff k over queries."""
+    var cutoffs = List[Int](capacity=1)
+    cutoffs.append(k)
+    return map_at_cutoffs(scores, labels, groups, cutoffs)[0]
+
+
 @fieldwise_init
 struct RankerParams(Copyable, Movable):
     """LambdaRank hyperparameters, LightGBM names in parentheses.

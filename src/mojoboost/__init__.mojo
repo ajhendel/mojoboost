@@ -56,18 +56,30 @@ from .split import SplitInfo, find_best_split, soft_threshold_l1
 from .tree import Tree, TreeParams, grow_tree, node_bounds
 from .boosting import (
     BINARY_LOGISTIC,
+    CROSS_ENTROPY,
     CUSTOM,
+    DEFAULT_FAIR_C,
+    DEFAULT_TWEEDIE_VARIANCE_POWER,
+    FAIR,
+    GAMMA,
     HUBER,
     L1,
+    MAPE,
     POISSON,
     QUANTILE,
     SQUARED_ERROR,
+    TWEEDIE,
     Booster,
     BoosterParams,
     IterationRange,
     MulticlassBooster,
+    objective_renews_leaves,
+    renewal_alpha,
+    renewal_weights,
     train,
+    train_more,
     train_multiclass,
+    train_multiclass_more,
     train_multiclass_with_valid,
     train_with_valid,
 )
@@ -78,6 +90,14 @@ from .contrib import (
     predict_contrib_bins_multiclass,
     predict_contrib_multiclass,
     tree_expected_value,
+)
+from .trainset import (
+    Dataset,
+    train_dataset,
+    train_dataset_multiclass,
+    train_dataset_ranker,
+    update_dataset,
+    update_dataset_multiclass,
 )
 from .collective import (
     STATUS_INVALID_PARAM,
@@ -150,22 +170,79 @@ from .train_gpu import (
     train_multiclass_gpu,
 )
 from .importance import gain_importance, split_importance
+from .class_weight import (
+    balanced_class_weights,
+    balanced_sample_weight,
+    binary_labels_to_codes,
+    check_class_balance_params,
+    check_class_weights,
+    class_counts,
+    class_weight_rows,
+    scale_pos_weight_rows,
+    unbalance_scale,
+    unbalanced_sample_weight,
+)
 from .metrics import (
+    average_precision,
     binary_accuracy,
     binary_auc,
     binary_error,
     binary_log_loss,
     check_metric_weight,
+    cross_entropy_loss,
+    fair_loss,
+    gamma_deviance,
+    gamma_loss,
     huber_loss,
+    kullback_leibler,
     l1,
     l2,
+    mape,
     multiclass_accuracy,
     multiclass_error,
     multiclass_log_loss,
+    poisson_loss,
     quantile_loss,
     rmse,
+    tweedie_loss,
 )
 from .model import Model, MulticlassModel, fit, fit_custom, fit_multiclass
+from .sparse import (
+    CscMatrix,
+    CsrMatrix,
+    SparseBinnedMatrix,
+    SparseBinnedRows,
+    csc_from_dense,
+    default_bins,
+    fit_bins_csc,
+    transform_csc,
+)
+from .histogram_sparse import (
+    NodeTotals,
+    SparseEntryOrder,
+    SparseNodeEntries,
+    build_histogram_sparse,
+    build_histogram_sparse_node,
+    build_histogram_sparse_subset,
+)
+from .tree_sparse import (
+    SparseTreeResult,
+    grow_tree_sparse,
+    predict_row_sparse,
+)
+from .boosting_sparse import (
+    train_multiclass_sparse,
+    train_sparse,
+    train_sparse_with_valid,
+)
+from .model_sparse import (
+    fit_csc,
+    fit_multiclass_csc,
+    predict_class_csr,
+    predict_csr,
+    predict_proba_csr,
+    predict_raw_csr,
+)
 from .ranking import (
     DEFAULT_NDCG_EVAL_AT,
     DEFAULT_SIGMOID,
@@ -182,7 +259,9 @@ from .ranking import (
     groups_from_query_ids,
     label_gain,
     lambdarank_gradients,
+    map_at_cutoffs,
     max_dcg,
+    mean_average_precision,
     ndcg,
     ndcg_at_cutoffs,
     train_ranker,
@@ -192,6 +271,7 @@ from .params import (
     MULTICLASS,
     SUPPORTED_KEYS,
     TrainConfig,
+    objective_default_alpha,
     objective_display_name,
     objective_from_name,
     params_names_mojo_api_only,

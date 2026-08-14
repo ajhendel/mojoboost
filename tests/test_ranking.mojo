@@ -24,7 +24,9 @@ from mojoboost.ranking import (
     groups_from_query_ids,
     label_gain,
     lambdarank_gradients,
+    map_at_cutoffs,
     max_dcg,
+    mean_average_precision,
     ndcg,
     ndcg_at_cutoffs,
     train_ranker,
@@ -141,6 +143,86 @@ def test_ndcg_hand_calculated() raises:
 
     assert_true(_close(max_dcg(labels, 0, 4, 4), max4, 1e-14))
     assert_true(_close(max_dcg(labels, 0, 4, 2), max2, 1e-14))
+
+
+def test_map_hand_calculated() raises:
+    # One query of four documents, scores already descending. Relevance is
+    # binary, so labels [3, 0, 1, 0] mark ranks 1 and 3 relevant.
+    #   AP@4 = (1/1 + 2/3) / min(4, 2) = (1 + 0.666...) / 2
+    #   AP@2 = (1/1) / min(2, 2)        = 0.5
+    #   AP@1 = (1/1) / min(1, 2)        = 1.0
+    var scores: List[Float64] = [0.5, 0.4, 0.3, 0.2]
+    var labels: List[Int] = [3, 0, 1, 0]
+    var g = groups_from_counts([4])
+    assert_true(
+        _close(
+            mean_average_precision(scores, labels, g, 4),
+            (1.0 + 2.0 / 3.0) / 2.0,
+            1e-14,
+        )
+    )
+    assert_true(_close(mean_average_precision(scores, labels, g, 2), 0.5))
+    assert_equal(mean_average_precision(scores, labels, g, 1), 1.0)
+
+    # A cutoff past the end of the query is the whole query.
+    assert_equal(
+        mean_average_precision(scores, labels, g, 99),
+        mean_average_precision(scores, labels, g, 4),
+    )
+
+    # Several cutoffs in one pass agree with the single-cutoff calls.
+    var cutoffs: List[Int] = [1, 2, 4]
+    var many = map_at_cutoffs(scores, labels, g, cutoffs)
+    for c in range(len(cutoffs)):
+        assert_equal(
+            many[c],
+            mean_average_precision(scores, labels, g, cutoffs[c]),
+        )
+
+
+def test_map_perfect_reversed_and_empty_query() raises:
+    var labels: List[Int] = [0, 1, 2, 3]
+    var g = groups_from_counts([4])
+    var perfect: List[Float64] = [0.0, 1.0, 2.0, 3.0]
+    assert_equal(mean_average_precision(perfect, labels, g, 4), 1.0)
+
+    # Exactly reversed: the three relevant documents land at ranks 2, 3, 4,
+    # so AP = (1/2 + 2/3 + 3/4) / 3.
+    var reversed: List[Float64] = [3.0, 2.0, 1.0, 0.0]
+    assert_true(
+        _close(
+            mean_average_precision(reversed, labels, g, 4),
+            (0.5 + 2.0 / 3.0 + 0.75) / 3.0,
+            1e-14,
+        )
+    )
+
+    # A query with nothing relevant counts as 1.0, the same convention NDCG
+    # uses for a query with no attainable DCG.
+    var none_relevant: List[Int] = [0, 0, 0, 0]
+    assert_equal(mean_average_precision(perfect, none_relevant, g, 4), 1.0)
+
+    # Two queries average, they do not pool: the perfect query and the
+    # all-irrelevant one both score 1.0.
+    var two: List[Float64] = [0.0, 1.0, 2.0, 3.0, 0.0, 1.0, 2.0, 3.0]
+    var two_labels: List[Int] = [0, 1, 2, 3, 0, 0, 0, 0]
+    var g2 = groups_from_counts([4, 4])
+    assert_equal(mean_average_precision(two, two_labels, g2, 4), 1.0)
+
+
+def test_map_validates() raises:
+    var scores: List[Float64] = [0.5, 0.4]
+    var labels: List[Int] = [1, 0]
+    var g = groups_from_counts([2])
+    var bad_cutoffs: List[Int] = [0]
+    with assert_raises():
+        _ = map_at_cutoffs(scores, labels, g, bad_cutoffs)
+    var no_cutoffs = List[Int]()
+    with assert_raises():
+        _ = map_at_cutoffs(scores, labels, g, no_cutoffs)
+    var short_labels: List[Int] = [1]
+    with assert_raises():
+        _ = mean_average_precision(scores, short_labels, g, 2)
 
 
 def test_ndcg_perfect_and_reversed() raises:

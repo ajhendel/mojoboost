@@ -246,11 +246,14 @@ struct Tree(Copyable, Movable):
         contribution attribution (contrib.mojo) divides by a node's cover at
         every internal node, so it checks this once per model rather than
         guarding each division."""
-        if len(self.count) != len(self.feature):
+        # A tree with no covers at all is the common case worth naming: it
+        # came from a v1 or v2 file. Checking it first keeps that diagnosis
+        # from being reported as a stray zero at node 0.
+        if not self.has_node_counts():
             raise Error(
                 "tree carries no node counts: it was loaded from a model file"
                 " written before they were recorded (v1 or v2). Retrain, or"
-                " re-save the model with a current version, to use feature"
+                " re-save the model from a current build, to use feature"
                 " contributions."
             )
         for i in range(len(self.count)):

@@ -14,13 +14,18 @@ Accumulation parallelizes across features exactly like the dense path: each
 feature owns the `[f * n_bins, (f + 1) * n_bins)` output slice and its own
 entry range, so workers never write the same location.
 
+Every builder takes the same optional list of feature ids the dense builders
+take (empty means all). Under feature subsampling only those features are
+accumulated and the rest of the output stays zero, so sibling subtraction
+stays exact on either representation.
+
 Numerical note: the default bin is derived by subtraction, so a sparse
 histogram is not bit-identical to the dense histogram of the same data. The
 two agree to floating-point rounding (counts agree exactly), the same
 trade-off the dense path already makes for sibling subtraction.
 """
 
-from .histogram import Histogram
+from .histogram import Histogram, _check_features
 from .parallel import dispatch_features
 from .sparse import SparseBinnedMatrix
 
@@ -126,7 +131,15 @@ struct SparseEntryOrder(Movable):
         how the work was scheduled.
         """
         _partition_ranges(
-            self.order, self.scratch, data, node, row_side, left, right
+            self.order,
+            self.scratch,
+            data,
+            node,
+            row_side,
+            left.starts,
+            left.ends,
+            right.starts,
+            right.ends,
         )
 
 
@@ -136,10 +149,19 @@ def _partition_ranges(
     data: SparseBinnedMatrix,
     node: SparseNodeEntries,
     row_side: List[UInt8],
-    mut left: SparseNodeEntries,
-    mut right: SparseNodeEntries,
+    mut left_starts: List[Int],
+    mut left_ends: List[Int],
+    mut right_starts: List[Int],
+    mut right_ends: List[Int],
 ) raises:
-    """Stable in-place partition of every per-feature range of `node`."""
+    """Stable in-place partition of every per-feature range of `node`.
+
+    The children's four range arrays are passed as separate `mut` lists
+    rather than reached through their `SparseNodeEntries`: a pointer taken
+    from a struct field carries that field's origin, which a worker closure
+    cannot capture (the dense builders in histogram.mojo pass their output
+    buffers the same way, for the same reason).
+    """
     var n_features = data.n_features
     var order_p = order.unsafe_ptr()
     var scratch_p = scratch.unsafe_ptr()
@@ -147,10 +169,10 @@ def _partition_ranges(
     var entry_row_p = data.row_index.unsafe_ptr()
     var start_p = node.starts.unsafe_ptr()
     var end_p = node.ends.unsafe_ptr()
-    var ls_p = left.starts.unsafe_ptr()
-    var le_p = left.ends.unsafe_ptr()
-    var rs_p = right.starts.unsafe_ptr()
-    var re_p = right.ends.unsafe_ptr()
+    var ls_p = left_starts.unsafe_ptr()
+    var le_p = left_ends.unsafe_ptr()
+    var rs_p = right_starts.unsafe_ptr()
+    var re_p = right_ends.unsafe_ptr()
 
     def do_feature(f: Int) {imm}:
         var lo = start_p.unsafe_load(f)
@@ -184,15 +206,18 @@ def build_histogram_sparse_node(
     order: SparseEntryOrder,
     node: SparseNodeEntries,
     totals: NodeTotals,
+    features: List[Int] = [],
 ) raises -> Histogram:
     """Histogram of one tree node from its grouped entry ranges.
 
     `totals` must be the node's summed gradient, hessian, and row count; the
     leftover after the stored entries is what lands in each feature's default
-    bin.
+    bin. With a non-empty `features`, only those features are accumulated and
+    the rest of the output stays zero.
     """
     if len(grad) != data.n_rows or len(hess) != data.n_rows:
         raise Error("gradient/hessian length must equal n_rows")
+    _check_features(features, data.n_features)
 
     var n_bins = data.n_bins
     var size = data.n_features * n_bins
@@ -217,8 +242,12 @@ def build_histogram_sparse_node(
     var total_g = totals.grad
     var total_h = totals.hess
     var total_c = totals.count
+    var use_all = len(features) == 0
+    var n_active = data.n_features if use_all else len(features)
+    var feat_p = features.unsafe_ptr()
 
-    def do_feature(f: Int) {imm}:
+    def do_feature(i_feature: Int) {imm}:
+        var f = i_feature if use_all else feat_p.unsafe_load(i_feature)
         var base = f * n_bins
         var stored_g = 0.0
         var stored_h = 0.0
@@ -244,14 +273,17 @@ def build_histogram_sparse_node(
         cp.unsafe_store(db, cp.unsafe_load(db) + (total_c - stored_c))
 
     dispatch_features(
-        do_feature, data.n_features, node.n_entries() + data.n_features
+        do_feature, n_active, node.n_entries() + data.n_features
     )
 
     return Histogram(g^, h^, c^, data.n_features, n_bins)
 
 
 def build_histogram_sparse(
-    data: SparseBinnedMatrix, grad: List[Float64], hess: List[Float64]
+    data: SparseBinnedMatrix,
+    grad: List[Float64],
+    hess: List[Float64],
+    features: List[Int] = [],
 ) raises -> Histogram:
     """Full-dataset sparse histogram."""
     var order = SparseEntryOrder(data.nnz())
@@ -262,6 +294,7 @@ def build_histogram_sparse(
         order,
         SparseNodeEntries.root(data),
         sum_all(grad, hess),
+        features,
     )
 
 
@@ -270,6 +303,7 @@ def build_histogram_sparse_subset(
     grad: List[Float64],
     hess: List[Float64],
     rows: List[Int],
+    features: List[Int] = [],
 ) raises -> Histogram:
     """Sparse histogram over an arbitrary row subset.
 
@@ -277,16 +311,24 @@ def build_histogram_sparse_subset(
     costs O(nnz) regardless of subset size. Tree growth instead keeps the
     entries grouped by node (`SparseEntryOrder`) and pays only
     O(nnz_in_node); this entry point exists for callers holding a plain row
-    list.
+    list. With a non-empty `features`, only those features are accumulated
+    and the rest of the output stays zero.
     """
     if len(grad) != data.n_rows or len(hess) != data.n_rows:
         raise Error("gradient/hessian length must equal n_rows")
+    _check_features(features, data.n_features)
 
     var member = List[UInt8](capacity=data.n_rows)
     member.resize(data.n_rows, 0)
     for i in range(len(rows)):
         if rows[i] < 0 or rows[i] >= data.n_rows:
             raise Error("row index out of range")
+        # A membership mask cannot represent a row twice, and the totals it
+        # is subtracted from would count it twice, so reject rather than
+        # accumulate a histogram that does not add up. A node's row list
+        # never holds duplicates.
+        if member[rows[i]] != 0:
+            raise Error("duplicate row index in subset")
         member[rows[i]] = 1
 
     var n_bins = data.n_bins
@@ -312,8 +354,12 @@ def build_histogram_sparse_subset(
     var total_g = totals.grad
     var total_h = totals.hess
     var total_c = totals.count
+    var use_all = len(features) == 0
+    var n_active = data.n_features if use_all else len(features)
+    var feat_p = features.unsafe_ptr()
 
-    def do_feature(f: Int) {imm}:
+    def do_feature(i_feature: Int) {imm}:
+        var f = i_feature if use_all else feat_p.unsafe_load(i_feature)
         var base = f * n_bins
         var stored_g = 0.0
         var stored_h = 0.0
@@ -337,7 +383,7 @@ def build_histogram_sparse_subset(
         cp.unsafe_store(db, cp.unsafe_load(db) + (total_c - stored_c))
 
     dispatch_features(
-        do_feature, data.n_features, data.nnz() + data.n_features
+        do_feature, n_active, data.nnz() + data.n_features
     )
 
     return Histogram(g^, h^, c^, data.n_features, n_bins)

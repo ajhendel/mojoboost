@@ -41,8 +41,6 @@ from .bagging import BaggingParams, bagging_enabled, check_bagging, refresh_bag
 from .binning import BinnedMatrix
 from .boosting import (
     CUSTOM,
-    L1,
-    QUANTILE,
     Booster,
     BoosterParams,
     MulticlassBooster,
@@ -56,6 +54,9 @@ from .boosting import (
     _fill_softmax_grad_hess,
     _multiclass_goss_select,
     _softmax_inplace,
+    objective_renews_leaves,
+    renewal_alpha,
+    renewal_weights,
 )
 from .goss import GossParams, GossSelection, apply_goss_scaling, goss_round
 from .histogram import Histogram, subtract_histogram
@@ -410,6 +411,9 @@ def train_gpu(
             raw.append(base_score)
 
         var signs = params.tree.monotone.active_signs()
+        var renews = objective_renews_leaves(objective)
+        var renew_w = renewal_weights(objective, target, sample_weight)
+        var renew_a = renewal_alpha(objective, alpha)
         var builder = GpuHistogramBuilder(data)
         var trees = List[Tree]()
         var grad = List[Float64](capacity=n)
@@ -426,13 +430,9 @@ def train_gpu(
             goss_round(bag, grad, hess, goss, i, params.learning_rate)
             builder.upload_gradients(grad, hess)
             var tree = grow_tree_gpu(builder, params.tree, bag, i)
-            if objective == QUANTILE:
+            if renews:
                 _renew_leaf_values(
-                    tree, data, target, raw, sample_weight, alpha, bag, signs
-                )
-            elif objective == L1:
-                _renew_leaf_values(
-                    tree, data, target, raw, sample_weight, 0.5, bag, signs
+                    tree, data, target, raw, renew_w, renew_a, bag, signs
                 )
 
             # A single-leaf tree with a near-zero value means the objective

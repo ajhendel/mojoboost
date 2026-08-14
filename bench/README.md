@@ -346,6 +346,55 @@ factor `H / (H + lambda_l2)`, because mojoboost defaults `lambda_l2` to 1.0
 where LightGBM defaults it to 0.0; the script prints those two rows for
 context and says so rather than counting them as disagreements.
 
+## Sparse vs dense
+
+`bench_sparse.mojo` runs both paths over the same genuinely sparse dataset,
+generated from the same counter-based splitmix64 stream, and reports the
+exact size of the arrays each path has to hold along with binning, transform,
+and training time.
+
+```sh
+pixi run bench-sparse                  # 200,000 x 500, 10 nonzeros per row
+pixi run mojo run -I src bench/bench_sparse.mojo 100000 500 5
+```
+
+The dense matrix is materialized only so the dense path has something to run
+on; a real sparse workload never builds it, which is what the memory column
+is measuring. Two configurations on an Apple M4, 50 rounds, `num_leaves=31`,
+`max_bin=255`:
+
+| | 50,000 x 300, 2.7% dense | 100,000 x 500, 1.0% dense |
+|---|---|---|
+| nonzeros | 400,000 | 500,000 |
+| dense memory (raw + bins) | 128.7 MB | 429.2 MB |
+| sparse memory (CSC + bins + growth index) | 15.6 MB | 19.6 MB |
+| sparse / dense memory | 0.12x | 0.046x |
+| dense total time | 2.73 s | 6.34 s |
+| sparse total time | 1.55 s | 3.31 s |
+| sparse speedup | 1.76x | 1.92x |
+| train MSE, both paths | 0.0023802419115210 | 0.0052833930695555 |
+
+Both paths reported the same training MSE to every printed digit in these
+runs, which is the correctness half of the benchmark: an absent entry is a
+numerical zero, so the two are fitting the same model.
+
+The memory figures are exact array sizes computed from the shapes, not a
+process-level measurement, and they include the O(nnz) entry permutation and
+scratch buffer that sparse tree growth needs and the dense path does not.
+They are deterministic: the same shapes always give the same numbers.
+
+The times are not. Each column is one run on one machine, and a repeat of
+the first column on the same machine gave 2.22 s dense against 1.28 s
+sparse, a 1.74x speedup rather than 1.76x. Treat the ratio as the
+measurement and the absolute seconds as the conditions it was taken under,
+and rerun both before quoting any of it.
+
+The speedup shrinks as density rises and reverses eventually: the sparse
+accumulator costs O(nnz_in_node) per node against the dense O(rows * features),
+so it wins while `density * n_features` stays below the dense per-row cost.
+Neither path is the right default for the other's shape, which is why both
+exist.
+
 ## Caveats
 
 - LightGBM's `min_data_in_bin=3` (its default) has no mojoboost equivalent;
@@ -355,3 +404,6 @@ context and says so rather than counting them as disagreements.
   seed-to-seed variation, not a quality claim.
 - Single machine, single run; rerun both commands back to back on an idle
   machine before quoting numbers.
+- The sparse table above was measured on synthetic data with a fixed number
+  of nonzeros per row. Real sparse datasets have skewed column densities,
+  which changes the per-feature work distribution and so the speedup.

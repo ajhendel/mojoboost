@@ -157,6 +157,15 @@ where this list and it disagree.
   migration; conflicting aliases raise instead of silently taking precedence
 - multiclass end to end on raw data: `fit_multiclass` returns a
   `MulticlassModel` with `predict_proba` and `predict_class`
+- a small stable C ABI (`capi/`) with opaque model handles, dense training,
+  prediction, save/load, error retrieval, and destruction, meant as the base
+  for bindings in other languages (see [C API](#c-api))
+- a command line tool (`cli/`) that trains and predicts from documented text
+  files, with no code to write (see [Command line tool](#command-line-tool))
+- sparse training and prediction that never densifies the matrix, in Mojo
+  (`fit_csc`, `train_sparse`, `predict_csr`) and from Python (any SciPy
+  sparse matrix passed to `fit` or `predict`), see
+  [Sparse input](#sparse-input)
 
 ```mojo
 from mojoboost import BINARY_LOGISTIC, BoosterParams, TreeParams, fit
@@ -171,6 +180,58 @@ def main() raises:
 
 Lower-level entry points `train`, `train_with_valid`, and
 `train_multiclass` operate on pre-binned matrices.
+
+## Sparse input
+
+A sparse matrix is trained on as it is, without ever materializing the dense
+one. Internally the representation is CSC, because histogram accumulation is
+feature-oriented; prediction takes CSR, because it is row-oriented, and the
+two convert into each other in O(nnz).
+
+```mojo
+from mojoboost import SQUARED_ERROR, BoosterParams, CscMatrix, fit_csc
+from mojoboost import predict_csr
+
+def main() raises:
+    # Feature f owns entries [col_offsets[f], col_offsets[f + 1]).
+    var csc = CscMatrix(row_index, values, col_offsets, n_rows, n_features)
+    var model = fit_csc(csc, target, SQUARED_ERROR, BoosterParams.default())
+    var scores = predict_csr(model, csc.to_csr())
+```
+
+An **absent entry is the numerical value 0.0**, not a missing value, which is
+LightGBM's default `zero_as_missing=false`: a sparse fit is the dense fit of
+the same matrix with its gaps filled with zeros. Zeros take part in the
+quantile bin edges like any other value, and explicitly stored zeros (which
+SciPy keeps until `eliminate_zeros()`) mean exactly what the gaps mean. `NaN`
+is still the missing marker wherever it is stored, and gets the same reserved
+bin and learned default direction it gets on the dense path. LightGBM's
+`zero_as_missing=true` is not implemented.
+
+The two paths are separate implementations rather than one abstraction over
+both: `histogram_sparse.mojo` visits only the stored entries of a node and
+assigns each feature's leftover to the bin holding 0.0, so a node costs
+O(nnz_in_node) instead of O(rows * features), and the dense kernels are
+untouched. Everything above the accumulator is shared verbatim, so the two
+agree on split search, leaf values, constraints, missing-value routing, and
+categorical partitioning.
+
+The fitted model is an ordinary `Model`: the serialization format is
+unchanged, a sparse-trained model loads and predicts like any other, and
+`Model.predict` still takes a dense row.
+
+Agreement with the dense path is to floating-point rounding, not bit-exact,
+because the sparse accumulator derives each feature's zero bin by
+subtraction. Counts and bin ids agree exactly, and bin edges are bit-exact.
+The one caveat is tied split gains: when two candidates score equal to
+within that rounding, the two paths can pick different (equally good)
+winners and their ensembles then separate. `tests/test_sparse.mojo` pins all
+of this down.
+
+Not implemented for sparse input: the GPU backend (there is no sparse
+kernel; `device="gpu"` raises), custom objectives, `eval_set` from Python,
+ranking, and `pred_leaf`/`pred_contrib`/iteration slicing at predict time.
+Each raises rather than densifying silently.
 
 ## Python API
 
@@ -197,6 +258,82 @@ sequences work without it. The regressor takes LightGBM objective names
 a custom objective (see [Custom objectives](#custom-objectives)). Both
 estimators take `device` and record the backend that ran on `device_`; see
 [Device selection](#device-selection).
+
+### Dataset, Booster, and train()
+
+The estimators are one door. The other is LightGBM's functional API, which
+gives you the model object itself:
+
+```python
+import mojoboost as mb
+
+train_set = mb.Dataset(X, label=y)
+booster = mb.train({"objective": "regression", "num_leaves": 31},
+                   train_set, num_boost_round=100)
+
+booster.predict(X_test)                  # response scale
+booster.predict(X_test, raw_score=True)  # link scale
+booster.eval(train_set, "training")      # [(name, metric, value, higher?)]
+booster.feature_importance("gain")
+booster.save_model("model.mbst")
+```
+
+A `Dataset` owns the training data and everything that describes its rows:
+`label`, `weight`, `group` for ranking, `init_score`, `feature_name`, and
+`categorical_feature`. Binning is the expensive part of starting a run, so
+it happens once, on `construct()` or on the first `train()` that uses the
+dataset, and every later run on it reuses those bins:
+
+```python
+train_set = mb.Dataset(X, label=y, weight=w, params={"max_bin": 63})
+shallow = mb.train({"objective": "regression", "num_leaves": 7}, train_set, 100)
+deep = mb.train({"objective": "regression", "num_leaves": 63}, train_set, 100)
+```
+
+A dataset is immutable once constructed. LightGBM's `set_label`,
+`set_field`, and `set_categorical_feature` are deliberately absent: bin
+edges are fitted from the data and from the categorical declaration, so
+changing either afterwards would leave the binned matrix describing data
+the dataset no longer holds. Construct another dataset instead.
+
+A `Booster` grows. It starts at zero iterations, `update(n)` adds rounds,
+and continued training resumes from where the existing trees left off, so
+40 rounds and then 60 more are the 100-round model, tree for tree:
+
+```python
+booster = mb.Booster({"objective": "regression"}, train_set)
+while not booster.update():      # returns True when the objective converges
+    pass
+
+warm = mb.train(params, train_set, 60, init_model=booster)   # copies, then grows
+```
+
+That holds for the single-output objectives and for softmax multiclass.
+Ranking is the exception: LambdaRank gradients are computed within a query
+from state the fitted ensemble does not carry, so a ranking booster raises
+rather than appending trees that would be wrong.
+
+`init_score` is training state, not model state. Boosting starts from it
+and the fitted model predicts the trees alone, so scoring new data means
+adding your own offset back, which is what LightGBM does too.
+
+The estimators hold the same object on `booster_`:
+
+```python
+model = MojoBoostRegressor(n_estimators=100).fit(X, y)
+model.booster_.num_trees()
+model.booster_.model_to_string()
+```
+
+There is one model object in the package rather than one per API, and the
+test suite asserts that a model trained through `train()` and the same
+model trained through an estimator predict identically, value for value.
+What `booster_` cannot do is `update()`: an estimator bins the matrix it
+was handed and does not keep the `Dataset` that continued training grows
+on. Train through `mb.train()` when you want that.
+
+`docs/LIGHTGBM_PARITY.md` section 5 is the row-by-row statement of what
+these two types do and do not carry over from LightGBM.
 
 ### scikit-learn conventions
 
@@ -277,10 +414,63 @@ in node order; the numbering is fixed once a tree is grown and survives
 `save`/`load` and pickling. It is mojoboost's own numbering and not
 LightGBM's leaf id.
 
+`pred_contrib` returns exact per-feature contributions: shape
+`(n_samples, n_features + 1)` for the single-output estimators and
+`(n_samples, n_classes * (n_features + 1))` in class-major blocks for the
+multiclass classifier, both LightGBM's shapes. See the next section.
+
 `validate_features` turns the feature-name checks from warnings into
-errors. `raw_score=True` and `pred_leaf=True` together raise, since they ask
-for different dtypes and shapes; LightGBM lets `pred_leaf` win silently,
-which the output does not reveal.
+errors. `raw_score=True`, `pred_leaf=True`, and `pred_contrib=True` ask for
+different dtypes and shapes, so passing more than one raises; LightGBM picks
+a winner silently, which the output does not reveal.
+
+### Feature contributions
+
+`predict(X, pred_contrib=True)` returns exact TreeSHAP values, not a
+split-gain heuristic. The last column of each row (of each class block, for
+multiclass) is the expected value, and **every row's entries sum to that
+row's raw score**, exactly:
+
+```python
+contrib = model.predict(X, pred_contrib=True)
+assert np.allclose(contrib.sum(axis=1), model.predict(X, raw_score=True))
+```
+
+That identity is not a normalization step. The numbers are the Shapley
+values of `v(S) = E[f(x) | x_S]`, so summing them is the Shapley efficiency
+property. The conditional expectation is taken over each tree's own node
+covers, which is the "path-dependent" convention LightGBM, XGBoost, and the
+reference `shap` package use for a model with no supplied background data.
+The algorithm is the polynomial-time recursion of
+[Lundberg, Erion, and Lee (2018)](https://arxiv.org/abs/1802.03888), which
+costs `O(L·D²)` per tree rather than the `O(2^M)` a subset enumeration
+would.
+
+Contributions always explain the **raw** score, whatever the objective's
+link, so `raw_score=True` cannot be combined with them. For a binary
+classifier they explain the log-odds; pushing them through the sigmoid is
+not meaningful, because the sigmoid is not additive.
+
+Missing values, categorical set splits, and features split on more than once
+along one path are all handled: the recursion asks only which child a row
+takes, which is the same routing prediction uses, and it unwinds a repeated
+feature before re-extending it. A depth-zero tree contributes to the
+expected value alone, since it says nothing about any feature.
+
+Node covers are recorded during training and travel with the model in
+format v3, because they cannot be recovered from a fitted tree. A model
+saved by an older build (v1 or v2) still loads and predicts exactly as
+before, but asking it for contributions raises rather than guessing at the
+covers; retrain or re-save from a current build.
+
+How this is checked: `tests/test_contrib.mojo` and
+`python/tests/test_contrib.py` each carry an independent implementation that
+enumerates all `2^M` feature subsets straight from the Shapley definition,
+sharing no code with the recursion (the Python one goes further and parses
+the saved model file). The two agree to `1e-9` on trained models with
+missing values, categorical splits, repeated features, iteration slices, and
+multiclass. Hand-worked tiny trees pin down the values the sum property
+alone cannot distinguish.
 
 Estimators pickle. The trained model is an opaque handle, so pickling
 serializes it with the same versioned format `save()` writes and restores
@@ -297,10 +487,12 @@ not claim `check_estimator` passes:
 
 - the estimators forward their shared hyperparameters through `**kwargs`,
   so `get_params()` lists them all but `inspect.signature` does not
-- `best_iteration_` is always set, to the number of boosting iterations
-  the fitted model kept, where LightGBM sets it only when early stopping
-  ran. Without an `eval_set` it equals `n_estimators` unless training
-  stopped early because the objective converged
+- `best_iteration_` is always set, where LightGBM sets it only when early
+  stopping ran. With validation it is the iteration the primary metric
+  peaked at, which is also the number the model kept whenever early
+  stopping was on; without an `eval_set` it is the number of iterations
+  trained, `n_estimators` unless the objective converged first. `n_iter_`
+  is always that trained count
 
 ### Tests and wheels
 
@@ -452,8 +644,10 @@ tile size are runtime values here rather than compile-time ones.
 
 1. Close the v1 gaps in the parity contract
    ([docs/LIGHTGBM_PARITY.md](docs/LIGHTGBM_PARITY.md)), the largest being
-   feature contributions, sparse input, the Booster and Dataset APIs, and
-   selecting a built-in metric by name from Python
+   feature contributions, the Booster and Dataset APIs, and selecting a
+   built-in metric by name from Python. Sparse input landed for training and
+   prediction; the gaps left there are a sparse GPU kernel, custom
+   objectives, and `eval_set` from Python
 2. Finish routing `device` through the remaining entry points: multiclass
    still resolves to the CPU in `fit_multiclass` and in the Python
    classifier, and `auto` needs a measured crossover before it may choose
@@ -465,6 +659,9 @@ tile size are runtime values here rather than compile-time ones.
 4. Publish the Python API to PyPI (macOS arm64 wheels build and validate
    today; Linux needs a manylinux build)
 5. Broader benchmark suite (XGBoost and real datasets)
+6. R bindings on top of the C ABI in `capi/`, which exists so that the R
+   package (and any other language binding) never has to track a mojoboost
+   internal layout
 
 ## Defaults
 
@@ -1208,42 +1405,57 @@ The contract, and where it intentionally differs from LightGBM:
 - **the history starts at round 0**, the base-score-only model, so
   `value(i, ...)` is the score after `i` trees. LightGBM's `evals_result_`
   starts at the first iteration
-- **single output, CPU only**, as for custom objectives: `train_multiclass`
-  has no custom-metric entry point, and there is no GPU trainer with a
-  validation loop
+- **CPU only**: there is no GPU trainer with a validation loop
 
-From Python, pass `eval_set` and `eval_metric` to `fit`. Each metric is
-`f(y_true, y_pred) -> float` (LightGBM's `(name, value, is_higher_better)`
-return is accepted, and only its value read), called once per metric per
-validation set per round:
+`train_multiclass_with_metrics` and `train_ranker_with_metrics` extend the
+same machinery to the softmax and LambdaRank trainers, with the same
+early-stopping, truncation, and history rules. A round is one tree per class
+for multiclass, and its metrics receive row-major raw scores,
+`pred[r * n_classes + k]`; a ranking metric holds its validation set's own
+query boundaries, since the trainer has no use for them.
+
+From Python, pass `eval_set` and friends to `fit`, in LightGBM's spelling:
 
 ```python
-import numpy as np
-from mojoboost import MojoBoostRegressor
-
-def mape(y_true, y_pred):
-    return float(np.mean(np.abs((y_true - y_pred) / y_true)))
-
-def neg_mse(y_true, y_pred):
-    return -float(np.mean((y_true - y_pred) ** 2))
-
 model = MojoBoostRegressor(n_estimators=500).fit(
     X, y,
-    eval_set=[(X_valid, y_valid)],
-    eval_metric=[("mape", mape), ("neg_mse", neg_mse, True)],
+    eval_set=[(X_valid, y_valid)],   # or (X_valid, y_valid), or eval_X/eval_y
+    eval_names=["holdout"],          # valid_0, valid_1, ... by default
+    eval_sample_weight=[w_valid],
+    eval_metric=["l2", "l1"],
     early_stopping_rounds=20,
-    primary_metric="mape",
 )
-model.best_iteration_        # trees kept
+model.best_iteration_        # where the primary metric peaked
+model.n_iter_                # rounds actually trained
 model.best_score_            # the primary metric's best value
-model.evals_result_["valid_0"]["mape"]   # index 0 is the base score alone
+model.evals_result_["holdout"]["l2"]   # index 0 is the base score alone
+model.stopped_early_
 ```
 
-A metric may also be a dict, `{"name": ..., "func": ..., "higher_is_better":
-..., "early_stopping": ...}`, which is how a metric is recorded without
-letting it stop training. Combining a Python *objective* callback with
-custom metrics is not wired up yet; the Mojo API pairs them with
-`train_custom_with_metrics`.
+`eval_metric` takes LightGBM's metric names, callables, or both, and
+defaults to the objective's own loss. The names are `l2`, `rmse`, `l1`,
+`quantile`, `huber`, `binary_logloss`, `binary_error`, `auc`,
+`multi_logloss`, `multi_error`, and `ndcg`, plus LightGBM's aliases
+(`mse`, `mae`, `l2_root`, `binary`, `multiclass`, ...). Each belongs to one
+task, so `auc` on a regressor is an error rather than a number nobody can
+read; their values come from `src/mojoboost/metrics.mojo`, so Python and
+Mojo cannot disagree, and `eval_sample_weight` weights them.
+
+A callable is `f(y_true, y_pred) -> float` (LightGBM's
+`(name, value, is_higher_better)` return is accepted, and only its value
+read), called once per metric per validation set per round with raw scores
+in `y_pred`. Declare its direction with `("name", f, True)`, or pass a dict,
+`{"name": ..., "func": ..., "higher_is_better": ..., "early_stopping":
+...}`, which is how a metric is recorded without letting it stop training.
+A callable is handed unweighted predictions, so combining one with
+`eval_sample_weight` raises rather than dropping the weights quietly.
+
+The classifier encodes validation labels through the `classes_` it recorded,
+so a label absent from training raises; the ranker takes `eval_group`, one
+group array per validation set, and rejects `eval_sample_weight` because
+NDCG has no weighted LightGBM definition to match. Combining a Python
+*objective* callback with validation is not wired up yet; the Mojo API pairs
+them with `train_custom_with_metrics`.
 
 ### Learning to rank
 
@@ -1298,6 +1510,61 @@ a fixed `label_gain`, query-level bagging, and no unbiased-lambdarank
 extensions). `pixi run -e bench compare-ranking` checks the NDCG metric
 against LightGBM's on identical scores and compares the two libraries'
 ranking quality on held-out queries.
+
+## C API
+
+`capi/` is a small C ABI over the same trainer, meant as the base for
+bindings in any language that speaks C. Full documentation, including the
+parameter string both it and the CLI take, is in
+[capi/README.md](capi/README.md); the header
+[capi/mojoboost.h](capi/mojoboost.h) is the contract.
+
+```c
+MojoBoostError *err = mojoboost_error_create();
+MojoBoostModel *model = NULL;
+if (mojoboost_train_dense(x, n_rows, n_features, y, NULL,
+                          "objective=binary num_iterations=200",
+                          &model, err) != MOJOBOOST_OK) {
+    fprintf(stderr, "%s\n", mojoboost_error_message(err));
+}
+mojoboost_predict(model, x, n_rows, n_features, pred, n_rows, err);
+mojoboost_save_model(model, "model.mbst", err);
+mojoboost_model_free(model);
+mojoboost_error_free(err);
+```
+
+Only C scalars, C strings, caller-owned buffers, and opaque handles cross
+the boundary, so no mojoboost type is exposed and internal layouts can
+change without breaking a compiled caller. Hyperparameters travel as a
+LightGBM style parameter string rather than a struct for the same reason.
+Errors go to an explicit error object instead of a thread-local global,
+which is a deliberate difference from LightGBM's `LGBM_GetLastError`, so
+concurrent use is well defined.
+
+```sh
+pixi run build-capi     # capi/libmojoboost.{dylib,so}
+pixi run test-capi      # Mojo tests: ABI matches the Mojo API exactly
+pixi run test-c         # C tests: lifecycle, invalid input, handle churn
+```
+
+## Command line tool
+
+`cli/` trains and predicts from text files, so a model can be fit and used
+without writing code. The data format, column roles, and exit statuses are
+documented in [cli/README.md](cli/README.md).
+
+```sh
+pixi run build-cli
+cli/mojoboost train --data train.csv --model model.mbst \
+    --params "objective=binary num_iterations=200"
+cli/mojoboost predict --model model.mbst --data test.csv --output pred.csv
+cli/mojoboost info --model model.mbst
+```
+
+Data files are comma separated numbers, one example per line, with `#`
+comments, an optional header, and an empty field or `nan`/`na`/`?` for a
+missing value. `--label` and `--weight` name column indices; everything
+else is a feature, in file order.
 
 ## Development
 

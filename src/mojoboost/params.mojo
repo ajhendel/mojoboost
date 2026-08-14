@@ -26,11 +26,18 @@ Intentional differences from LightGBM
 from .boosting import (
     BINARY_LOGISTIC,
     BoosterParams,
+    CROSS_ENTROPY,
+    DEFAULT_FAIR_C,
+    DEFAULT_TWEEDIE_VARIANCE_POWER,
+    FAIR,
+    GAMMA,
     HUBER,
     L1,
+    MAPE,
     POISSON,
     QUANTILE,
     SQUARED_ERROR,
+    TWEEDIE,
 )
 from .device import CPU_DEVICE, parse_device
 from .tree import TreeParams
@@ -46,7 +53,8 @@ comptime SUPPORTED_KEYS = String(
     "objective, num_class, num_iterations, learning_rate, num_leaves,"
     " min_data_in_leaf, min_sum_hessian_in_leaf, lambda_l1, lambda_l2,"
     " max_depth, feature_fraction, feature_fraction_bynode,"
-    " feature_fraction_seed, max_bin, alpha, device, use_missing"
+    " feature_fraction_seed, max_bin, alpha, fair_c,"
+    " tweedie_variance_power, device, use_missing"
 )
 
 # Parameters that name a real LightGBM feature this parser does not cover,
@@ -58,7 +66,8 @@ comptime _MOJO_API_ONLY = String(
     " categorical_feature cat_smooth cat_l2 max_cat_threshold"
     " max_cat_to_onehot min_data_per_group early_stopping_round"
     " early_stopping_rounds first_metric_only lambdarank_truncation_level"
-    " label_gain sigmoid eval_at ndcg_eval_at"
+    " label_gain sigmoid eval_at ndcg_eval_at class_weight is_unbalance"
+    " unbalance unbalanced_sets scale_pos_weight"
 )
 
 
@@ -98,6 +107,11 @@ def objective_from_name(name: String) raises -> Int:
 
     Accepts LightGBM's aliases for the objectives mojoboost implements.
     Names are canonical lowercase, as in `parse_device`.
+
+    The LightGBM objectives mojoboost does not implement are named
+    explicitly in `_unimplemented_objective_error` rather than falling into
+    the unknown-name message: a user who asks for `multiclassova` has asked
+    for a real thing, and being told it is unknown would be misleading.
     """
     if (
         name == "regression"
@@ -122,6 +136,16 @@ def objective_from_name(name: String) raises -> Int:
         or name == "mean_absolute_error"
     ):
         return L1
+    if name == "gamma":
+        return GAMMA
+    if name == "tweedie":
+        return TWEEDIE
+    if name == "mape" or name == "mean_absolute_percentage_error":
+        return MAPE
+    if name == "fair":
+        return FAIR
+    if name == "cross_entropy" or name == "xentropy":
+        return CROSS_ENTROPY
     if name == "multiclass" or name == "softmax":
         return MULTICLASS
     if name == "lambdarank":
@@ -134,12 +158,43 @@ def objective_from_name(name: String) raises -> Int:
             "objective 'custom' needs a gradient callback; use fit_custom in"
             " the Mojo API"
         )
+    _raise_if_unimplemented_objective(name)
     raise Error(
         "unknown objective '",
         name,
         "'; expected regression, binary, multiclass, poisson, huber,"
-        " quantile, or mae",
+        " quantile, mae, gamma, tweedie, mape, fair, or cross_entropy",
     )
+
+
+def _raise_if_unimplemented_objective(name: String) raises:
+    """Report a LightGBM objective mojoboost has not implemented as exactly
+    that, with what it would take.
+
+    These are deliberate omissions, not oversights, and each is recorded in
+    docs/LIGHTGBM_PARITY.md. Naming them here keeps the parity list and the
+    error a user actually sees in one place.
+    """
+    if name == "cross_entropy_lambda" or name == "xentlambda":
+        raise Error(
+            "objective 'cross_entropy_lambda' is not implemented; it"
+            " parameterizes the rate through log1p(exp(raw)) rather than"
+            " the logistic, so it is a separate link, not an alias of"
+            " 'cross_entropy'"
+        )
+    if name == "multiclassova" or name == "multiclass_ova" or (
+        name == "ova" or name == "ovr"
+    ):
+        raise Error(
+            "objective 'multiclassova' is not implemented; one-vs-rest"
+            " needs an independent binary model per class, which is a"
+            " different trainer from the shared-softmax 'multiclass'"
+        )
+    if name == "rank_xendcg" or name == "xendcg":
+        raise Error(
+            "objective 'rank_xendcg' is not implemented; 'lambdarank' is"
+            " the ranking objective mojoboost provides"
+        )
 
 
 def objective_display_name(objective: Int) raises -> String:
@@ -156,6 +211,16 @@ def objective_display_name(objective: Int) raises -> String:
         return "quantile"
     if objective == L1:
         return "mae"
+    if objective == GAMMA:
+        return "gamma"
+    if objective == TWEEDIE:
+        return "tweedie"
+    if objective == MAPE:
+        return "mape"
+    if objective == FAIR:
+        return "fair"
+    if objective == CROSS_ENTROPY:
+        return "cross_entropy"
     if objective == MULTICLASS:
         return "multiclass"
     raise Error("unknown objective code ", objective)
@@ -222,10 +287,69 @@ def params_names_mojo_api_only(spec: String) -> Bool:
     return False
 
 
+def objective_default_alpha(objective: Int) -> Float64:
+    """The value the objective's scalar parameter takes when the parameter
+    string does not set one: LightGBM's `fair_c` and
+    `tweedie_variance_power` defaults for those two objectives, and
+    LightGBM's `alpha` default of 0.9 for the rest (which is the one that
+    matters for huber and quantile; the others ignore it)."""
+    if objective == FAIR:
+        return DEFAULT_FAIR_C
+    if objective == TWEEDIE:
+        return DEFAULT_TWEEDIE_VARIANCE_POWER
+    return 0.9
+
+
+def _alpha_key_for(objective: Int) -> String:
+    """The parameter name that sets `alpha` for this objective, or an empty
+    string when the objective has no scalar parameter."""
+    if objective == FAIR:
+        return "fair_c"
+    if objective == TWEEDIE:
+        return "tweedie_variance_power"
+    if objective == HUBER or objective == QUANTILE:
+        return "alpha"
+    return ""
+
+
+def _check_alpha_key(config: TrainConfig, alpha_key: String) raises:
+    """Reject a scalar parameter that does not belong to the objective.
+
+    LightGBM accepts `fair_c` alongside `objective=tweedie` and silently
+    ignores it, which hides a real mistake: the number the user set is not
+    the number the model trains with. Since these three names all land in
+    the same slot here, accepting the wrong one would be worse still, so a
+    mismatch raises.
+    """
+    if len(alpha_key) == 0:
+        return
+    var expected = _alpha_key_for(config.objective)
+    if alpha_key == expected:
+        return
+    if len(expected) == 0:
+        raise Error(
+            "parameter '",
+            alpha_key,
+            "' does not apply to objective '",
+            objective_display_name(config.objective),
+            "'",
+        )
+    raise Error(
+        "parameter '",
+        alpha_key,
+        "' does not apply to objective '",
+        objective_display_name(config.objective),
+        "'; it takes '",
+        expected,
+        "'",
+    )
+
+
 def _validate(config: TrainConfig, saw_num_class: Bool) raises:
     """Range checks that do not depend on the training data. Objective
-    specific checks on `alpha` and on the label values stay in
-    boosting.mojo, which sees the labels."""
+    specific checks on the label values stay in boosting.mojo, which sees
+    the labels; the `alpha` range checks are here as well as there, so a
+    parameter string is rejected before any data is read."""
     if config.booster.n_estimators < 0:
         raise Error("num_iterations must be nonnegative")
     if config.booster.learning_rate <= 0.0:
@@ -253,6 +377,15 @@ def _validate(config: TrainConfig, saw_num_class: Bool) raises:
     if config.max_bin < 2:
         raise Error("max_bin must be at least 2")
 
+    if config.objective == HUBER and config.alpha <= 0.0:
+        raise Error("alpha must be positive for objective 'huber'")
+    if config.objective == QUANTILE and not 0.0 < config.alpha < 1.0:
+        raise Error("alpha must be in (0, 1) for objective 'quantile'")
+    if config.objective == FAIR and config.alpha <= 0.0:
+        raise Error("fair_c must be positive")
+    if config.objective == TWEEDIE and not 1.0 < config.alpha < 2.0:
+        raise Error("tweedie_variance_power must be in (1, 2)")
+
     if config.is_multiclass():
         if not saw_num_class:
             raise Error("objective 'multiclass' requires num_class")
@@ -275,6 +408,7 @@ def parse_params(spec: String) raises -> TrainConfig:
     """
     var config = TrainConfig()
     var saw_num_class = False
+    var alpha_key = String("")
 
     for token_slice in spec.split():
         var token = String(token_slice)
@@ -344,7 +478,24 @@ def parse_params(spec: String) raises -> TrainConfig:
             config.booster.tree.feature_fraction_seed = _parse_int(key, value)
         elif key == "max_bin":
             config.max_bin = _parse_int(key, value)
-        elif key == "alpha":
+        elif (
+            key == "alpha"
+            or key == "fair_c"
+            or key == "tweedie_variance_power"
+        ):
+            # Three LightGBM names for one slot: the objective's scalar
+            # parameter (see boosting.mojo). Two of them at once would be
+            # two different numbers for one slot, so that is rejected rather
+            # than resolved by order.
+            if len(alpha_key) > 0 and alpha_key != key:
+                raise Error(
+                    "parameters '",
+                    alpha_key,
+                    "' and '",
+                    key,
+                    "' set the same objective parameter; give only one",
+                )
+            alpha_key = key
             config.alpha = _parse_f64(key, value)
         elif key == "device" or key == "device_type":
             config.device = parse_device(value)
@@ -362,5 +513,12 @@ def parse_params(spec: String) raises -> TrainConfig:
                 "unknown parameter '", key, "'; supported: ", SUPPORTED_KEYS
             )
 
+    # The objective may be named after its scalar parameter in the string,
+    # so the default and the name check both wait until the whole string is
+    # parsed.
+    if len(alpha_key) == 0:
+        config.alpha = objective_default_alpha(config.objective)
+    else:
+        _check_alpha_key(config, alpha_key)
     _validate(config, saw_num_class)
     return config^

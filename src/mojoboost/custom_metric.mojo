@@ -115,12 +115,25 @@ from std.math import exp, isfinite, log
 
 from .bagging import BaggingParams, bagging_enabled, check_bagging, refresh_bag
 from .binning import BinMapper, BinnedMatrix, fit_bins
+from .callback import (
+    ABORT,
+    AFTER_ITERATION,
+    BEFORE_ITERATION,
+    CONTINUE,
+    IterationEnv,
+    IterationFn,
+    STOP,
+    check_resettable,
+    no_callback,
+    scale_tree_values,
+)
 from .boosting import (
     BINARY_LOGISTIC,
+    CROSS_ENTROPY,
     CUSTOM,
-    L1,
+    GAMMA,
     POISSON,
-    QUANTILE,
+    TWEEDIE,
     Booster,
     BoosterParams,
     MulticlassBooster,
@@ -135,6 +148,9 @@ from .boosting import (
     _renew_leaf_values,
     _sigmoid,
     _softmax_inplace,
+    objective_renews_leaves,
+    renewal_alpha,
+    renewal_weights,
 )
 from .goss import GossParams, GossSelection, apply_goss_scaling, goss_round
 from .model import Model, MulticlassModel
@@ -359,17 +375,21 @@ struct MetricFitResult(Copyable, Movable):
 
 def response_scale(objective: Int, raw: List[Float64]) -> List[Float64]:
     """Apply an objective's inverse link to raw scores: the sigmoid for
-    BINARY_LOGISTIC, exp for POISSON, identity otherwise (including CUSTOM,
-    whose link the framework does not know).
+    BINARY_LOGISTIC and CROSS_ENTROPY, exp for POISSON, GAMMA, and TWEEDIE,
+    identity otherwise (including CUSTOM, whose link the framework does not
+    know).
 
     Metrics receive raw scores; this is the one call that turns them into
-    the probabilities a log loss or a calibration metric wants.
+    the probabilities a log loss or a calibration metric wants, and the
+    expected values the poisson, gamma, and tweedie metrics want. It applies
+    the same links `Booster.response` does, so a metric sees exactly what a
+    prediction would return.
     """
     var out = List[Float64](capacity=len(raw))
-    if objective == BINARY_LOGISTIC:
+    if objective == BINARY_LOGISTIC or objective == CROSS_ENTROPY:
         for r in range(len(raw)):
             out.append(_sigmoid(raw[r]))
-    elif objective == POISSON:
+    elif objective == POISSON or objective == GAMMA or objective == TWEEDIE:
         for r in range(len(raw)):
             out.append(exp(raw[r]))
     else:
@@ -540,13 +560,16 @@ struct _StopState(Copyable, Movable):
         return False
 
 
-def train_with_metrics[F: MetricSetFn & Copyable](
+def train_with_callbacks[
+    F: MetricSetFn & Copyable, C: IterationFn & Copyable
+](
     data: BinnedMatrix,
     target: List[Float64],
     valid_sets: List[ValidSet],
     objective: Int,
     params: BoosterParams,
     metrics: MetricSuite[F],
+    callback: C,
     early_stopping_rounds: Int = 0,
     min_delta: Float64 = 0.0,
     sample_weight: List[Float64] = [],
@@ -554,14 +577,17 @@ def train_with_metrics[F: MetricSetFn & Copyable](
     bagging: BaggingParams = BaggingParams.disabled(),
     goss: GossParams = GossParams.disabled(),
 ) raises -> MetricTrainResult:
-    """Train a built-in objective while scoring caller-supplied metrics.
+    """`train_with_metrics` with a per-iteration callback.
 
-    Same training contract as `train_with_valid` (objectives, sample
-    weights, alpha, bagging, GOSS); the difference is that the validation
-    signal comes from `metrics` rather than from the objective's own loss,
-    that any number of validation sets can be scored, and that every value
-    is kept in the returned history. See the module docstring for the
-    early-stopping and truncation rules.
+    `callback` runs twice per round, before the tree is grown and after the
+    metrics are scored, and can steer the run: change the next round's
+    hyperparameters, stop training, or fail it. See callback.mojo for the
+    environment, the control codes, and how a learning-rate schedule reaches
+    prediction.
+
+    This is the one training loop for the metric path; `train_with_metrics`
+    is this function with `no_callback`, so a run without callbacks and a run
+    with inert ones take the same code and return the same model.
     """
     if len(target) != data.n_rows:
         raise Error("target length must equal n_rows")
@@ -585,41 +611,103 @@ def train_with_metrics[F: MetricSetFn & Copyable](
     _eval_round(metrics, valid_sets, valid_raw, 0, history)
     stop.observe(0, history, metrics.metrics, min_delta)
 
+    var renews = objective_renews_leaves(objective)
+    var renew_w = renewal_weights(objective, target, sample_weight)
+    var renew_a = renewal_alpha(objective, alpha)
+
+    # The rate the booster was created with. While `baked` is False every
+    # tree is shrunk by it at predict time; once a schedule moves off it the
+    # shrinkage lives in the leaf values instead. See callback.mojo.
+    var lr0 = params.learning_rate
+    var baked = False
+    var current = params.copy()
+    var env = IterationEnv(
+        params.copy(), history.valid_names.copy(), history.metric_names.copy()
+    )
+
     var trees = List[Tree]()
     var grad = List[Float64](capacity=n)
     var hess = List[Float64](capacity=n)
     var bag = List[Int]()
     var stopped_early = False
+    var callback_stopped = False
     for i in range(params.n_estimators):
+        env.iteration = i
+        env.evaluation.clear()
+        env.params = current.copy()
+        var before = callback(BEFORE_ITERATION, env)
+        if before == ABORT:
+            raise Error(
+                String(
+                    "training callback failed in the before-iteration phase"
+                    " of round ",
+                    i,
+                )
+            )
+        if before == STOP:
+            callback_stopped = True
+            break
+        check_resettable(current, env.params)
+        current = env.params.copy()
+
+        var lr = current.learning_rate
+        if not baked and lr != lr0:
+            for t in range(len(trees)):
+                scale_tree_values(trees[t], lr0)
+            baked = True
+
         refresh_bag(bag, bagging, n, i)
         _fill_grad_hess(
             raw, target, objective, sample_weight, alpha, grad, hess
         )
-        goss_round(bag, grad, hess, goss, i, params.learning_rate)
-        var tree = grow_tree(data, grad, hess, params.tree, bag, i)
-        if objective == QUANTILE:
+        goss_round(bag, grad, hess, goss, i, lr)
+        var tree = grow_tree(data, grad, hess, current.tree, bag, i)
+        if renews:
             _renew_leaf_values(
-                tree, data, target, raw, sample_weight, alpha, bag
-            )
-        elif objective == L1:
-            _renew_leaf_values(
-                tree, data, target, raw, sample_weight, 0.5, bag
+                tree, data, target, raw, renew_w, renew_a, bag
             )
         # Under bagging or GOSS a degenerate tree indicts the sample, not
-        # the run, exactly as in train_with_valid.
+        # the run, exactly as in train_with_valid. Tested before any
+        # shrinkage is baked in, so the threshold means the same thing
+        # whether or not a schedule is running.
         if tree.n_leaves == 1 and abs(tree.value[0]) < 1e-12:
             if bagging_enabled(bagging) or goss.enabled:
                 continue
             break
 
+        # A baked tree carries its own shrinkage, so the step that folds it
+        # into the running scores must not apply the rate a second time.
+        var step = lr0
+        if baked:
+            scale_tree_values(tree, lr)
+            step = 1.0
         for r in range(n):
-            raw[r] += params.learning_rate * tree.predict_row(data, r)
-        _update_valid_raw(valid_raw, valid_sets, tree, params.learning_rate)
+            raw[r] += step * tree.predict_row(data, r)
+        _update_valid_raw(valid_raw, valid_sets, tree, step)
         trees.append(tree^)
 
         var round = len(trees)
         _eval_round(metrics, valid_sets, valid_raw, round, history)
         stop.observe(round, history, metrics.metrics, min_delta)
+
+        env.iteration = i
+        env.evaluation.clear()
+        for v in range(history.n_valid()):
+            for m in range(history.n_metrics()):
+                env.evaluation.append(history.value(round, v, m))
+        var after = callback(AFTER_ITERATION, env)
+        if after == ABORT:
+            raise Error(
+                String(
+                    "training callback failed in the after-iteration phase of"
+                    " round ",
+                    i,
+                )
+            )
+        if after == STOP:
+            callback_stopped = True
+            break
+
         if early_stopping_rounds > 0 and stop.exhausted(
             round, metrics.metrics, early_stopping_rounds
         ):
@@ -628,15 +716,60 @@ def train_with_metrics[F: MetricSetFn & Copyable](
 
     var best = stop.best_round[metrics.primary]
     var best_score = stop.best_value[metrics.primary]
-    if early_stopping_rounds > 0:
+    # A callback stop rolls back like an early stop: LightGBM's
+    # EarlyStopException returns the booster at its best iteration whatever
+    # the callback's reason for raising it was.
+    if early_stopping_rounds > 0 or callback_stopped:
         while len(trees) > best:
             _ = trees.pop()
     return MetricTrainResult(
-        Booster(trees^, base_score, params.learning_rate, objective),
+        Booster(trees^, base_score, 1.0 if baked else lr0, objective),
         history^,
         best,
         best_score,
-        stopped_early,
+        stopped_early or callback_stopped,
+    )
+
+
+def train_with_metrics[F: MetricSetFn & Copyable](
+    data: BinnedMatrix,
+    target: List[Float64],
+    valid_sets: List[ValidSet],
+    objective: Int,
+    params: BoosterParams,
+    metrics: MetricSuite[F],
+    early_stopping_rounds: Int = 0,
+    min_delta: Float64 = 0.0,
+    sample_weight: List[Float64] = [],
+    alpha: Float64 = 0.9,
+    bagging: BaggingParams = BaggingParams.disabled(),
+    goss: GossParams = GossParams.disabled(),
+) raises -> MetricTrainResult:
+    """Train a built-in objective while scoring caller-supplied metrics.
+
+    Same training contract as `train_with_valid` (objectives, sample
+    weights, alpha, bagging, GOSS); the difference is that the validation
+    signal comes from `metrics` rather than from the objective's own loss,
+    that any number of validation sets can be scored, and that every value
+    is kept in the returned history. See the module docstring for the
+    early-stopping and truncation rules.
+
+    `train_with_callbacks` is the same run with a per-iteration hook.
+    """
+    return train_with_callbacks(
+        data,
+        target,
+        valid_sets,
+        objective,
+        params,
+        metrics,
+        no_callback,
+        early_stopping_rounds,
+        min_delta,
+        sample_weight,
+        alpha,
+        bagging,
+        goss,
     )
 
 
@@ -800,15 +933,70 @@ def fit_with_metrics[F: MetricSetFn & Copyable](
         use_missing=use_missing,
         categorical_features=categorical_features,
     )
+    return fit_with_callbacks(
+        features,
+        n_rows,
+        n_features,
+        target,
+        valid_sets,
+        objective,
+        params,
+        metrics,
+        no_callback,
+        early_stopping_rounds,
+        min_delta,
+        max_bins,
+        sample_weight,
+        alpha,
+        bagging,
+        goss,
+        use_missing=use_missing,
+        categorical_features=categorical_features,
+    )
+
+
+def fit_with_callbacks[
+    F: MetricSetFn & Copyable, C: IterationFn & Copyable
+](
+    features: List[Float64],
+    n_rows: Int,
+    n_features: Int,
+    target: List[Float64],
+    valid_sets: List[RawValidSet],
+    objective: Int,
+    params: BoosterParams,
+    metrics: MetricSuite[F],
+    callback: C,
+    early_stopping_rounds: Int = 0,
+    min_delta: Float64 = 0.0,
+    max_bins: Int = 255,
+    sample_weight: List[Float64] = [],
+    alpha: Float64 = 0.9,
+    bagging: BaggingParams = BaggingParams.disabled(),
+    goss: GossParams = GossParams.disabled(),
+    use_missing: Bool = True,
+    categorical_features: List[Int] = [],
+) raises -> MetricFitResult:
+    """`train_with_callbacks` on raw, column-major features: `fit_with_metrics`
+    with a per-iteration hook. See callback.mojo for the contract."""
+    var mapper = fit_bins(
+        features,
+        n_rows,
+        n_features,
+        max_bins,
+        use_missing=use_missing,
+        categorical_features=categorical_features,
+    )
     var data = mapper.transform(features, n_rows)
     var binned = _bin_valid_sets(mapper, valid_sets, n_features)
-    var result = train_with_metrics(
+    var result = train_with_callbacks(
         data,
         target,
         binned,
         objective,
         params,
         metrics,
+        callback,
         early_stopping_rounds,
         min_delta,
         sample_weight,
