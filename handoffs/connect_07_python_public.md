@@ -467,6 +467,8 @@ point, and each failure is loud.
 | `_predict_batch` | `predict_range` / `predict_proba_range` / `predict_leaf*` for `device="cpu"`; `RuntimeError` for anything else | `getattr(_mojoboost, entry, None)` |
 | `_sparse_predict_params` | no `device` key at all for `"cpu"`; `RuntimeError` for anything else on a build without `predict_batch` | `getattr(_mojoboost, "predict_batch", None)` |
 | `_resolve_device` | direct `_mojoboost.resolve_device` | `from . import device_selection` raising |
+| the full workload | `device_selection`'s own `_NarrowNativePolicy`, which drops to `resolve_device` and answers on shape alone | `native_contract()`, that is, whether `decide_device` is bound |
+| `_gpu_unsupported`, four call sites | nothing below it; it is itself the floor under the narrow contract | `device != "cpu"` after the policy has already answered |
 | `_eval._TABLE` | `_CompatTable` and the mirrored dicts | all four registry hooks present *and* the snapshot internally consistent |
 | `objective_` etc. | `inspection`'s own fallbacks | `inspection.py`'s existing `_hook` checks |
 

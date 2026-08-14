@@ -417,11 +417,16 @@ Run one at a time and stop at the first failure.
 3. `pixi run build-python`
    — only after 1 and 2. Everything below needs the rebuilt extension.
 4. `pixi run -e pytest pytest -q python/tests/test_contrib.py`
-   — the first thing v4 breaks, and the patch in §7 is what fixes it.
+   — the first thing v4 breaks. Its parser is already patched for v4, so
+   this is a check of that patch and not of the library's.
 5. `pixi run -e pytest pytest -q python/tests/parallel/test_inspection.py`
-   — with §7's three edits applied. Without them, three cases fail for the
-   documented reason, which is not a signal to revert.
+   — the four new cases in §7 are the ones that have never run: the
+   editing status, the gain-sum identity, gains surviving a save, and
+   `leaf_outputs`. Note that both files' v4 assertions **fail against the
+   prebuilt `.so`**, so step 3 is not optional before either of them.
 6. `pixi run check-parity`
-   — only if `docs/LIGHTGBM_PARITY.md` changed.
+   — `docs/LIGHTGBM_PARITY.md` changed, so this one is required rather
+   than conditional. It is its own CI job. Three status transitions and
+   one reworded path citation are what it will read.
 
 Do not run the full `pixi run test` chain for this change.

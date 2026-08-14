@@ -795,16 +795,22 @@ files imports them. `boosting.train`, `model.fit`, `params.parse_params`, the
 bindings, the C ABI, the CLI, and the Python package all behave exactly as
 before. P1 through P3 and P6 are what make the modes reachable.
 
-The seven functions P1 would expose (`train_boosting`,
+The six training entry points P1 would expose (`train_boosting`,
 `train_boosting_more`, `train_boosting_with_valid`,
 `train_boosting_multiclass`, `train_boosting_multiclass_more`,
-`train_boosting_multiclass_with_valid`, `fit_boosting`) each take every
-argument its `boosting.mojo` counterpart takes, in the same positional
-order, with `boosting: AlternateBoostingParams` inserted as the first
-defaulted argument. A caller that passes `AlternateBoostingParams()` gets
-`gbdt` and the production function verbatim, so the mode surface is a
-superset of the existing one at every entry point and P3 can route
-`model.fit` through it without changing any existing call.
+`train_boosting_multiclass_with_valid`) each take every argument its
+`boosting.mojo` counterpart takes, in the same positional order, with
+`boosting: AlternateBoostingParams` inserted as the first defaulted
+argument. A caller that passes `AlternateBoostingParams()` gets `gbdt` and
+the production function verbatim, so the mode surface is a superset of the
+existing one at every entry point.
+
+`fit_boosting` is the one exception, and deliberately: it drops `model.fit`'s
+`device` argument rather than defaulting it, because every mode it adds is
+CPU-only (`check_dart_supported` refuses a non-CPU device by name, and no GPU
+or sparse trainer offers a mode at all). P3, which moves the mode onto
+`model.fit` and deletes this wrapper, is where `device` and `boosting` have to
+meet; until then a caller who wants a device does not want a mode.
 
 ---
 

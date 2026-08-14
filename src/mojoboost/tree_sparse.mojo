@@ -30,10 +30,13 @@ Exclusive feature bundling
 --------------------------
 Optional, off by default, and a histogram layout rather than a change of
 hypothesis space (see efb.mojo). With an active plan the matrix handed to
-`grow_tree_sparse` is the *bundled* one: histograms are accumulated per
-bundle column, `tree._search` recovers each candidate feature's own
-histogram out of its bundle's block, and the split that comes back names an
-original feature and an original bin.
+`grow_tree_sparse` is the *bundled* one, and the accumulation half works
+exactly as it does on the dense path: a node's histogram is built per bundle
+column and then expanded back into one slice per original feature
+(`_node_histogram`, on top of `efb.expand_bundled_histogram`), so nothing
+below that point -- split search, leaf values, sibling subtraction, the
+`Tree` itself -- ever sees a bundle. Splits therefore name original features
+and original bins.
 
 Where the sparse path differs from the dense one is in applying that split.
 `tree.grow_tree` keeps both matrices and partitions rows on the original;
@@ -42,12 +45,11 @@ original CSC too would give back the memory bundling saves. So it routes
 rows through the bundle column and decodes each stored entry to the split
 feature's own local bin (`SparseBundling.local_bin`). A row sitting in a bin
 that belongs to another member of the column is a row where the split
-feature is at its default -- which is precisely what `unbundle_histogram`
-folded into that feature's default bin when the histogram this split was
-chosen from was recovered -- so routing and accumulation agree bin for bin.
-Since only lossless plans are currently constructible, they agree with the
-unbundled matrix too, and a bundled fit produces the tree an unbundled fit
-produces.
+feature is at its default -- which is precisely what the expansion folded
+into that feature's default bin when it recovered the histogram this split
+was chosen from -- so routing and accumulation agree bin for bin. Since only
+lossless plans are currently constructible, they agree with the unbundled
+matrix too, and a bundled fit produces the tree an unbundled fit produces.
 """
 
 from .categorical import CategoricalSpec
@@ -461,6 +463,52 @@ def _bag_entries(
         data, SparseNodeEntries.root(data), row_side, inside, outside
     )
     return inside^
+
+
+def _node_histogram(
+    data: SparseBinnedMatrix,
+    grad: List[Float64],
+    hess: List[Float64],
+    mut order: SparseEntryOrder,
+    entries: SparseNodeEntries,
+    totals: NodeTotals,
+    bundles: SparseBundling,
+    features: List[Int],
+    columns: List[Int],
+) raises -> Histogram:
+    """One node's histogram, always in the original per-feature shape.
+
+    Without bundling that is one call to the sparse accumulator over the
+    node's entry ranges. With it, the accumulation runs over the bundle
+    columns -- O(nnz_in_node) either way, but over as many columns as there
+    are bundles rather than features, which is the saving -- and the result
+    is expanded straight back into per-feature shape. That expansion is
+    where a bundle stops existing: `_leaf_value`, `_search`, and
+    `subtract_histogram` below all read the shape they always read.
+
+    Sibling subtraction survives it because the expansion is linear:
+    expanding a parent and a child and subtracting gives the numbers
+    subtracting first and expanding the difference would.
+    """
+    var raw = build_histogram_sparse_node(
+        data, grad, hess, order, entries, totals, columns
+    )
+    if not bundles.active:
+        return raw^
+    var out = Histogram.zeroed(bundles.n_features, bundles.source_bins(data))
+    expand_bundled_histogram(
+        out.grad,
+        out.hess,
+        out.count,
+        out.n_bins,
+        bundles.plan,
+        raw.grad,
+        raw.hess,
+        raw.count,
+        raw.n_bins,
+        features,
+    )
+    return out^
 
 
 def grow_tree_sparse(

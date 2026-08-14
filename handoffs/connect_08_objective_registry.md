@@ -915,32 +915,55 @@ Before, `response_scale(MULTICLASS, raw)` fell through to identity. Now it
 raises, because a softmax is not a per-row map and returning raw scores under
 the name "response scale" is a wrong answer rather than a missing one.
 
-Who could hit it:
+Every caller traced, and the answer is that **no reachable path can reach the
+raise**:
 
-- `bindings/_mojoboost.mojo:eval_metric` calls
-  `response_scale(objective, raw)` on the single-output path only; the two
-  multiclass metrics return before reaching it. A caller who asked for a
-  *single-output* metric on a *multiclass* model would have got identity and
-  now gets a raise — which is the same pair section 9.1 refuses anyway.
+- `bindings/_mojoboost.mojo:eval_metric` calls `response_scale(objective,
+  raw)` on the single-output path only; the `_METRIC_MULTI_LOGLOSS` /
+  `_METRIC_MULTI_ERROR` branch returns above it. And the `objective` it
+  passes cannot be `MULTICLASS`: `python/mojoboost/basic.py:Booster.eval`
+  builds that params dict and already substitutes `_SQUARED_ERROR` whenever
+  `task == _eval.MULTICLASS` or the Booster has no config, precisely because
+  a multiclass model's link is not a per-row map. The substitution predates
+  this lane. A caller reaching `_mojoboost.eval_metric` directly, bypassing
+  `basic.py`, could pass `MULTICLASS` and would now get a raise instead of
+  silent identity — which is the same pair 9.1 refuses anyway.
+- `custom_metric.eval_builtin_metric` handles `TRANSFORM_SOFTMAX` and
+  `TRANSFORM_RAW` above its `response_scale` call, so the multiclass and
+  ranking metrics never reach it.
+- `gpu_predict.response_for_objective` deliberately does *not* raise on
+  `LINK_SOFTMAX`; see 6.5.
 - `tests/test_custom_metrics.mojo` uses `response_scale` with
   `BINARY_LOGISTIC` and `SQUARED_ERROR` only (lines 444, 447). Unaffected.
-- No other caller found (`rg "response_scale"`).
+- No other caller found (`rg "response_scale"` over the whole tree).
 
 `response_scale`'s signature also gained an explicit `raises`. Mojo `def` is
 implicitly raising, so this is documentation rather than a signature change,
 but it is worth knowing if a caller is a `fn`.
 
-### 9.3 The metric codes moved file
+### 9.3 The metric codes moved file — RESOLVED
 
-`objective_registry.METRIC_L2` now resolves through a re-export rather than a
-local `comptime`. The values are identical and lane 21's export patch still
-works, but **whether Mojo re-exports an imported `comptime` as a module
-member is the one thing here that reading cannot settle.** The registry's
-own docstring already assumed it for `objective_renews_leaves`, so the
-assumption predates this lane. If it turns out not to hold, the fix is one
-line per code in `objective_registry.mojo`
-(`comptime METRIC_L2 = metrics.METRIC_L2`) and nothing else changes. This is
-the first thing section 10's compile check would catch.
+The first pass left one open question here: `objective_registry.METRIC_L2`
+resolved through a re-export rather than a local `comptime`, and **whether
+Mojo re-exports an imported `comptime` as a module member is not something
+reading a Mojo program can settle.**
+
+It no longer has to be settled, because the registry does not rely on it.
+Two pieces of evidence decided the approach:
+
+- `split.soft_threshold_l1` is defined in `gain.mojo`, imported into
+  `split.mojo`, and imported *from* `split.mojo` by `__init__.mojo`,
+  `tree.mojo`, and the distributed path. So a `def` does re-export.
+- `device.mojo` re-declares `device_policy.mojo`'s constants explicitly
+  (`comptime CPU_DEVICE = _CPU_DEVICE`) rather than relying on it, and says
+  in its own comment why: the symbols a module has always exported should be
+  defined in it.
+
+The second is the stronger signal, and it is what the registry now does: the
+metric codes are imported under `_`-prefixed names and re-declared, twenty-two
+lines of `comptime METRIC_X = _METRIC_X`. `boosting.mojo` does the same for
+the fourteen objective constants coming the other way (6.5). Whatever the
+answer to the original question, both modules define what they export.
 
 ### 9.4 Cost
 

@@ -2813,10 +2813,10 @@ def transport_runtime(
 ) raises -> RuntimeSpec:
     """A multi-process world, from a machine list in LightGBM's shape.
 
-    Building this succeeds even though opening it does not, which is the point:
-    a launcher can validate its machine list, its rank assignment, and its
-    timeouts long before an endpoint exists, and `open_transport_collective`
-    then refuses for one clearly stated reason rather than for a parse error.
+    Building this touches no socket, which is the point: a launcher can
+    validate its machine list, its rank assignment, and its timeouts before a
+    process is started, and `connect_world` then fails on the connection
+    rather than on a parse error thirty seconds into a rendezvous.
     """
     var config = parse_machine_list(machines, rank, job_id)
     var spec = RuntimeSpec(
