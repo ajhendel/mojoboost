@@ -33,6 +33,16 @@ present: `gpu` raises and `auto` chooses the CPU on a machine that does
 have one. It exists to exercise the unavailable-GPU path in tests and to
 pin a mixed fleet to the CPU backend.
 
+Availability is a property of the build, not of the running machine: Mojo
+resolves `has_accelerator()` at compile time. A binary built where an
+accelerator was present reports one as available, so on a redistributed
+build (a wheel, say) a `gpu` request fails when the device is actually
+opened rather than when it is resolved. That gap is invisible today
+because `auto` never selects the GPU on its own; enabling
+`MOJOBOOST_AUTO_MIN_CELLS` on a redistributed build is what would expose
+it, and `MOJOBOOST_DISABLE_GPU=1` is the way to pin such a build to the
+CPU.
+
 LightGBM difference: LightGBM spells this `device_type` and takes `cpu`,
 `gpu`, or `cuda`, with no `auto`. mojoboost has a single portable GPU
 backend rather than separate OpenCL and CUDA ones, so the value is `gpu`
@@ -74,7 +84,11 @@ def env_auto_min_cells() -> Int:
 
 
 def parse_device(name: String) raises -> Int:
-    """Device code for a public device name ("cpu", "gpu", or "auto")."""
+    """Device code for a public device name ("cpu", "gpu", or "auto").
+
+    Names are canonical lowercase here. The Python wrapper lowercases what
+    the user passes before calling in, which is how LightGBM treats
+    `device_type`."""
     if name == "cpu":
         return CPU_DEVICE
     if name == "gpu":

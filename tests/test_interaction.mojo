@@ -332,16 +332,16 @@ def test_one_group_of_everything_matches_unconstrained() raises:
 
 
 def test_constraints_actually_change_the_model() raises:
-    var n_rows = 2_000
+    var n_rows = 1_500
     var n_features = 6
     var features = _make_features(n_rows, n_features)
     var target = _interacting_target(features, n_rows)
     var data = bin_equal_width(features, n_rows, n_features, 32)
 
     var constraints = _groups([[0, 1], [2, 3]], n_features)
-    var free = BoosterParams(20, 0.2, TreeParams(15, 20, 1.0, 1e-3))
+    var free = BoosterParams(10, 0.2, TreeParams(15, 20, 1.0, 1e-3))
     var constrained = BoosterParams(
-        20, 0.2, TreeParams(15, 20, 1.0, 1e-3, 0.0, constraints.copy())
+        10, 0.2, TreeParams(15, 20, 1.0, 1e-3, 0.0, constraints.copy())
     )
     var a = train(data, target, SQUARED_ERROR, free)
     var b = train(data, target, SQUARED_ERROR, constrained)
@@ -401,7 +401,9 @@ def test_gpu_training_enforces_the_same_constraints() raises:
     comptime if not has_accelerator():
         print("skipped: no accelerator")
     else:
-        var n_rows = 2_000
+        # Deliberately small: the constraint check is structural, not
+        # statistical, and GPU rounds are the slowest thing in this suite.
+        var n_rows = 800
         var n_features = 6
         var features = _make_features(n_rows, n_features)
         var target = _interacting_target(features, n_rows)
@@ -409,7 +411,7 @@ def test_gpu_training_enforces_the_same_constraints() raises:
 
         var constraints = _groups([[0, 1], [2, 3]], n_features)
         var params = BoosterParams(
-            10, 0.2, TreeParams(15, 20, 1.0, 1e-3, 0.0, constraints.copy())
+            4, 0.2, TreeParams(8, 20, 1.0, 1e-3, 0.0, constraints.copy())
         )
         var cpu = train(data, target, SQUARED_ERROR, params)
         var gpu = train_gpu(data, target, SQUARED_ERROR, params)

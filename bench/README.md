@@ -55,6 +55,65 @@ Results from one GPU family must not be presented as representative of other
 devices. Record the accelerator, Mojo/MAX version, dataset dimensions, and
 repetition count with every result.
 
+## Per-device GPU validation report
+
+`bench_gpu_validation.mojo` is the cross-vendor driver. It prints device
+identity and capability attributes once, then per dataset shape the launch
+geometry the histogram kernel uses and a phase breakdown: binning, setup,
+gradient upload, partition kernel, per-node histogram, a same-size
+device-to-host probe, and complete training on both backends with training
+MSE for each.
+
+```sh
+pixi run gpu-validate                  # built-in four-shape sweep
+pixi run gpu-validate 20 250000 200    # rounds, then (rows, features) pairs
+```
+
+The phases are host-visible wall clock. The exact kernel-versus-transfer
+split comes from the vendor profiler, and
+[docs/GPU_VALIDATION.md](../docs/GPU_VALIDATION.md) has those commands, the
+full procedure, and the record of which devices have actually been run. As of
+this writing that record is Apple Metal only: no NVIDIA or AMD device has
+executed this code, so no CUDA or HIP number should appear anywhere.
+
+## Custom objectives
+
+Two drivers, because the two paths cost different things.
+
+`bench_custom_objective.mojo` times the native Mojo interface: the built-in
+`SQUARED_ERROR` objective, the same derivatives through `train_custom`, and
+the same again through a closure that captures state. All three grow
+identical trees (the custom runs start from the label mean), and the driver
+checks that before reporting, so what is timed is only the objective
+plumbing.
+
+```sh
+pixi run bench-custom                     # 100000 rows x 20 features, 100 rounds
+pixi run bench-custom 250000 40 100
+```
+
+`bench_custom_objective.py` times the Python callback path: the same fit
+with `objective="regression"` and with a Python callable computing the same
+derivatives. It refuses to report unless both fits produced identical
+predictions.
+
+```sh
+pixi run -e bench bench-custom-py
+pixi run -e bench bench-custom-py --rows 250000 --rounds 100 --repeat 3
+```
+
+Measured on Apple M4, Mojo 1.0.0, 100 rounds, best of 3:
+
+| rows x features | built-in | Python callback | overhead per round |
+|---|---|---|---|
+| 100,000 x 20 | 2.49 s | 3.38 s | 8.9 ms (+36%) |
+| 20,000 x 10 (30 rounds) | 0.118 s | 0.142 s | 0.81 ms (+20%) |
+
+The overhead is one Python call per round plus a copy of the raw scores out
+and the gradients and hessians back, so it scales with rows, not with tree
+work. Quote it per round rather than as a percentage: the percentage falls
+as `num_leaves`, features, or bins grow, and rises as they shrink.
+
 ## Caveats
 
 - LightGBM's `min_data_in_bin=3` (its default) has no mojoboost equivalent;

@@ -125,6 +125,58 @@ def dispatch_features[FuncType: def (Int) -> None](
     sync_parallelize(do_chunk, n_tasks)
 
 
+@fieldwise_init
+struct RowBlocks(Copyable, Movable):
+    """A split of [0, n_rows) into `n_blocks` contiguous ascending blocks.
+
+    Made explicit, rather than hidden inside a dispatch call, because a
+    two-pass parallel algorithm has to size its per-block scratch before it
+    runs the first pass: the row partitioner counts per block, prefix-sums
+    the counts, then scatters. `n_blocks == 1` is the serial plan.
+    """
+
+    var n_blocks: Int
+    var chunk: Int
+    var n_rows: Int
+
+    @always_inline
+    def start(self, b: Int) -> Int:
+        return b * self.chunk
+
+    @always_inline
+    def end(self, b: Int) -> Int:
+        var e = (b + 1) * self.chunk
+        return self.n_rows if e > self.n_rows else e
+
+
+def plan_row_blocks(n_rows: Int, total_ops: Int) -> RowBlocks:
+    """Choose the block split for a row range under the env contract."""
+    if n_rows <= 0:
+        return RowBlocks(0, 1, 0)
+    var n_tasks = plan_tasks(n_rows, total_ops)
+    if n_tasks <= 1:
+        return RowBlocks(1, n_rows, n_rows)
+    var chunk = (n_rows + n_tasks - 1) // n_tasks
+    # Ceiling division can leave trailing blocks empty (10 rows over 4 tasks
+    # gives chunk 3, and block 3 would be empty); recount from the chunk so
+    # every block has work and `n_blocks` is exact.
+    return RowBlocks((n_rows + chunk - 1) // chunk, chunk, n_rows)
+
+
+def run_row_blocks[FuncType: def (Int) -> None](
+    blocks: RowBlocks, func: FuncType
+) raises:
+    """Run `func(b)` for each block id in `blocks`, in parallel when the plan
+    has more than one block. `func` reads its own range via
+    `blocks.start(b)` / `blocks.end(b)`."""
+    if blocks.n_blocks <= 0:
+        return
+    if blocks.n_blocks == 1:
+        func(0)
+        return
+    sync_parallelize(func, blocks.n_blocks)
+
+
 def dispatch_rows[FuncType: def (Int, Int) -> None](
     func: FuncType, n_rows: Int, total_ops: Int
 ) raises:
@@ -132,26 +184,12 @@ def dispatch_rows[FuncType: def (Int, Int) -> None](
 
     Blocks are disjoint and each one walks its rows in ascending order, so
     elementwise callers get bit-identical results at every task count. The
-    serial path is a single `func(0, n_rows)` call, which is also the shape
-    a block gets, so there is only one body to test.
+    serial path is a single `func(0, n_rows)` call, which is the same shape a
+    block gets, so there is only one body to test.
     """
-    if n_rows <= 0:
-        return
-    var n_tasks = plan_tasks(n_rows, total_ops)
-    if n_tasks <= 1:
-        func(0, n_rows)
-        return
+    var blocks = plan_row_blocks(n_rows, total_ops)
 
-    var chunk = (n_rows + n_tasks - 1) // n_tasks
-    # Ceiling division can make the last tasks empty (e.g. 10 rows, 4 tasks,
-    # chunk 3 leaves task 3 with nothing); recompute so every task has work.
-    n_tasks = (n_rows + chunk - 1) // chunk
+    def do_block(b: Int) {imm}:
+        func(blocks.start(b), blocks.end(b))
 
-    def do_block(w: Int) {imm}:
-        var start = w * chunk
-        var end = start + chunk
-        if end > n_rows:
-            end = n_rows
-        func(start, end)
-
-    sync_parallelize(do_block, n_tasks)
+    run_row_blocks(blocks, do_block)

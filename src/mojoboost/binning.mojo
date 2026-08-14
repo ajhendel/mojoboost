@@ -8,6 +8,30 @@ and returns a `BinMapper` whose stored edges let a trained model bin raw,
 unseen feature values at prediction time. `bin_equal_width` remains as a
 simple mapper-free alternative for experiments.
 
+Missing values
+--------------
+`NaN` is the missing marker for numerical features. A feature whose training
+column contains at least one `NaN` reserves one extra bin, immediately above
+its ordinary bins, for missing values; `missing_bin[f]` is that bin's index,
+or -1 for a feature that reserves none. Reserving costs that feature one
+ordinary bin out of the `max_bins` budget, LightGBM style. `NaN` never
+reaches the ordinary quantile comparisons: it is routed to the reserved bin
+before the binary search runs, and it is left out of the quantile
+computation when the edges are fit.
+
+A `NaN` presented at prediction time for a feature with no reserved bin is
+binned as the value 0.0, which is what LightGBM does for a feature whose
+`missing_type` is `None`. `use_missing=False` reserves nothing for any
+feature, so every `NaN` is binned as 0.0, again matching LightGBM.
+
+`+inf` and `-inf` are ordinary finite-side extremes, not missing values: bin
+edges are clamped to +/-1e300 (LightGBM's `Common::AvoidInf`), so `+inf`
+always lands in a feature's highest ordinary bin and `-inf` in bin 0.
+
+Categorical features are not covered by any of this: they reserve no missing
+bin and keep `missing_bin[f] = -1`, because `categorical.mojo` already sends
+`NaN`, negatives, and unseen codes to its own bin 0.
+
 Features named in `categorical_features` are binned by `categorical.mojo`
 instead: they get no quantile edges at all, and their raw integer codes map
 to bins through a fitted category table. The two paths never mix, so adding
@@ -21,8 +45,40 @@ the result is bit-identical to the serial path. Inputs too small to
 amortize task-scheduling overhead stay serial.
 """
 
+from std.math import isnan
+
 from .categorical import CategoricalSpec, fit_categorical_spec
 from .parallel import dispatch_features
+
+# LightGBM's Common::kMaxDouble: bin edges are clamped here so an infinite
+# training value cannot produce an infinite (or non-increasing) edge.
+comptime MAX_EDGE = 1e300
+
+
+def _avoid_inf(x: Float64) -> Float64:
+    """LightGBM's `Common::AvoidInf`, clamping an edge into +/-1e300."""
+    if isnan(x):
+        return 0.0
+    if x >= MAX_EDGE:
+        return MAX_EDGE
+    if x <= -MAX_EDGE:
+        return -MAX_EDGE
+    return x
+
+
+def no_missing_bins(n_features: Int) -> List[Int]:
+    """A per-feature missing-bin table for data with no missing support:
+    every entry -1."""
+    var out = List[Int](capacity=n_features)
+    out.resize(n_features, -1)
+    return out^
+
+
+def _sized_missing_bins(var table: List[Int], n_features: Int) -> List[Int]:
+    """`table` when it is already per-feature, otherwise an all -1 table."""
+    if len(table) == n_features:
+        return table^
+    return no_missing_bins(n_features)
 
 
 struct BinnedMatrix(Copyable, Movable):
@@ -31,7 +87,8 @@ struct BinnedMatrix(Copyable, Movable):
     Bin for (row r, feature f) is stored at `bins[f * n_rows + r]`. `cats`
     records which features are categorical, so split finding knows to search
     category partitions rather than ordinal thresholds; an empty spec means
-    every feature is numerical.
+    every feature is numerical. `missing_bin[f]` is the bin reserved for
+    missing values of feature f, or -1 when that feature reserves none.
     """
 
     var bins: List[UInt8]
@@ -39,6 +96,7 @@ struct BinnedMatrix(Copyable, Movable):
     var n_features: Int
     var n_bins: Int
     var cats: CategoricalSpec
+    var missing_bin: List[Int]
 
     def __init__(
         out self,
@@ -52,6 +110,7 @@ struct BinnedMatrix(Copyable, Movable):
         self.n_features = n_features
         self.n_bins = n_bins
         self.cats = CategoricalSpec.none()
+        self.missing_bin = no_missing_bins(n_features)
 
     def __init__(
         out self,
@@ -60,15 +119,23 @@ struct BinnedMatrix(Copyable, Movable):
         n_features: Int,
         n_bins: Int,
         var cats: CategoricalSpec,
+        var missing_bin: List[Int] = [],
     ):
+        """A `missing_bin` table of the wrong length (the empty default
+        included) means no feature reserves a missing bin."""
         self.bins = bins^
         self.n_rows = n_rows
         self.n_features = n_features
         self.n_bins = n_bins
         self.cats = cats^
+        self.missing_bin = _sized_missing_bins(missing_bin^, n_features)
 
     def bin_at(self, row: Int, feature: Int) -> Int:
         return Int(self.bins[feature * self.n_rows + row])
+
+    def is_missing(self, row: Int, feature: Int) -> Bool:
+        """Whether (row, feature) holds a missing value."""
+        return self.bin_at(row, feature) == self.missing_bin[feature]
 
 
 struct BinMapper(Copyable, Movable):
@@ -81,6 +148,10 @@ struct BinMapper(Copyable, Movable):
 
     Categorical features carry no edges; `cats` holds their category tables
     and `bin_value` routes them through it instead.
+
+    A numerical feature with `missing_bin[f] >= 0` reserves that bin for
+    missing values, so its k edges give ordinary bins 0..k and a missing bin
+    at k + 1. `missing_bin[f] = -1` means no reservation.
     """
 
     var edges: List[Float64]
@@ -88,6 +159,7 @@ struct BinMapper(Copyable, Movable):
     var n_features: Int
     var n_bins: Int
     var cats: CategoricalSpec
+    var missing_bin: List[Int]
 
     def __init__(
         out self,
@@ -101,6 +173,7 @@ struct BinMapper(Copyable, Movable):
         self.n_features = n_features
         self.n_bins = n_bins
         self.cats = CategoricalSpec.all_numerical(n_features)
+        self.missing_bin = no_missing_bins(n_features)
 
     def __init__(
         out self,
@@ -109,22 +182,41 @@ struct BinMapper(Copyable, Movable):
         n_features: Int,
         n_bins: Int,
         var cats: CategoricalSpec,
+        var missing_bin: List[Int] = [],
     ):
+        """A `missing_bin` table of the wrong length (the empty default
+        included) means no feature reserves a missing bin."""
         self.edges = edges^
         self.edge_offsets = edge_offsets^
         self.n_features = n_features
         self.n_bins = n_bins
         self.cats = cats^
+        self.missing_bin = _sized_missing_bins(missing_bin^, n_features)
+
+    def has_missing(self) -> Bool:
+        """Whether any feature reserves a missing bin."""
+        for f in range(self.n_features):
+            if self.missing_bin[f] >= 0:
+                return True
+        return False
 
     def bin_value(self, feature: Int, v: Float64) -> Int:
         if self.cats.is_cat(feature):
             return self.cats.bin_of(feature, v)
+        var value = v
+        if isnan(value):
+            var mb = self.missing_bin[feature]
+            if mb >= 0:
+                return mb
+            # No reserved bin: LightGBM bins NaN as 0.0 for a feature whose
+            # missing_type is None.
+            value = 0.0
         var lo = self.edge_offsets[feature]
         var left = lo
         var right = self.edge_offsets[feature + 1]
         while left < right:
             var mid = (left + right) // 2
-            if v <= self.edges[mid]:
+            if value <= self.edges[mid]:
                 right = mid
             else:
                 left = mid + 1
@@ -144,6 +236,7 @@ struct BinMapper(Copyable, Movable):
         var feat_p = features.unsafe_ptr()
         var edges_p = self.edges.unsafe_ptr()
         var offs_p = self.edge_offsets.unsafe_ptr()
+        var miss_p = self.missing_bin.unsafe_ptr()
         ref cats = self.cats
 
         def do_feature(f: Int) {imm}:
@@ -157,8 +250,16 @@ struct BinMapper(Copyable, Movable):
                 return
             var lo = offs_p.unsafe_load(f)
             var hi = offs_p.unsafe_load(f + 1)
+            var mb = miss_p.unsafe_load(f)
             for r in range(n_rows):
                 var v = feat_p.unsafe_load(col + r)
+                # NaN is routed before any comparison, so it never takes part
+                # in the quantile search (see `bin_value`).
+                if isnan(v):
+                    if mb >= 0:
+                        bins_p.unsafe_store(col + r, UInt8(mb))
+                        continue
+                    v = 0.0
                 var left = lo
                 var right = hi
                 while left < right:
@@ -171,7 +272,12 @@ struct BinMapper(Copyable, Movable):
 
         dispatch_features(do_feature, n_features, n_features * n_rows)
         return BinnedMatrix(
-            bins^, n_rows, n_features, self.n_bins, self.cats.copy()
+            bins^,
+            n_rows,
+            n_features,
+            self.n_bins,
+            self.cats.copy(),
+            self.missing_bin.copy(),
         )
 
     def bin_row(self, row: List[Float64]) raises -> List[Int]:
@@ -190,6 +296,7 @@ def fit_bins(
     n_features: Int,
     max_bins: Int = 255,
     categorical_features: List[Int] = [],
+    use_missing: Bool = True,
 ) raises -> BinMapper:
     """Fit quantile (equal-frequency) bin edges on a column-major feature
     matrix. Edges are midpoints between distinct values at quantile
@@ -197,7 +304,13 @@ def fit_bins(
 
     Feature indices listed in `categorical_features` are treated as
     integer-coded categoricals: they are excluded from quantile binning
-    entirely and get a category table instead (see `categorical.mojo`)."""
+    entirely and get a category table instead (see `categorical.mojo`).
+
+    With `use_missing` (the default), a numerical feature whose column holds
+    any `NaN` reserves its highest bin for missing values and fits its edges
+    over the remaining `max_bins - 1` bins from the non-missing values alone,
+    so `NaN` never enters a quantile comparison. `use_missing=False` reserves
+    nothing and bins `NaN` as 0.0, matching LightGBM's `use_missing=false`."""
     if max_bins < 2 or max_bins > 256:
         raise Error("max_bins must be in [2, 256]")
     if n_rows < 1:
@@ -217,9 +330,11 @@ def fit_bins(
     scratch.resize(n_features * max_edges, 0.0)
     var counts = List[Int](capacity=n_features)
     counts.resize(n_features, 0)
+    var missing_bin = no_missing_bins(n_features)
 
     var scratch_p = scratch.unsafe_ptr()
     var counts_p = counts.unsafe_ptr()
+    var missing_p = missing_bin.unsafe_ptr()
     var feat_p = features.unsafe_ptr()
     ref spec = cats
 
@@ -228,28 +343,39 @@ def fit_bins(
         if spec.is_cat(f):
             counts_p.unsafe_store(f, 0)
             return
+        # NaN is dropped before the sort, so it never takes part in a
+        # quantile comparison, and a column that has any gives up one bin to
+        # hold its missing values.
         var col = List[Float64](capacity=n_rows)
         for r in range(n_rows):
-            col.append(feat_p.unsafe_load(f * n_rows + r))
+            var v = feat_p.unsafe_load(f * n_rows + r)
+            if not isnan(v):
+                col.append(v)
+        var n_valid = len(col)
+        var reserve = use_missing and n_valid < n_rows
+        var n_ordinary = max_bins - 1 if reserve else max_bins
         sort(col)
         var out = scratch_p.unsafe_offset(f * max_edges)
         var n_out = 0
-        for b in range(1, max_bins):
-            var idx = b * n_rows // max_bins
-            if idx <= 0 or idx >= n_rows:
+        for b in range(1, n_ordinary):
+            var idx = b * n_valid // n_ordinary
+            if idx <= 0 or idx >= n_valid:
                 continue
             var below = col[idx - 1]
             var above = col[idx]
             if above <= below:
                 continue
-            var edge = (below + above) / 2.0
-            # Repeated quantile indices (n_rows < max_bins) revisit the same
-            # boundary; keep edges strictly increasing.
+            var edge = _avoid_inf((below + above) / 2.0)
+            # Repeated quantile indices (n_valid < n_ordinary) revisit the
+            # same boundary, and clamping an infinite midpoint can repeat the
+            # previous edge; keep edges strictly increasing either way.
             if n_out > 0 and edge <= out.unsafe_load(n_out - 1):
                 continue
             out.unsafe_store(n_out, edge)
             n_out += 1
         counts_p.unsafe_store(f, n_out)
+        # k edges give ordinary bins 0..k, so the missing bin is k + 1.
+        missing_p.unsafe_store(f, n_out + 1 if reserve else -1)
 
     dispatch_features(do_feature, n_features, n_features * n_rows)
 
@@ -261,14 +387,17 @@ def fit_bins(
         for i in range(counts[f]):
             edges.append(scratch[base + i])
         offsets.append(len(edges))
-    return BinMapper(edges^, offsets^, n_features, max_bins, cats^)
+    return BinMapper(
+        edges^, offsets^, n_features, max_bins, cats^, missing_bin^
+    )
 
 
 def bin_equal_width(
     features: List[Float64], n_rows: Int, n_features: Int, n_bins: Int
 ) raises -> BinnedMatrix:
     """Bin a column-major feature matrix (`features[f * n_rows + r]`) into
-    equal-width bins per feature."""
+    equal-width bins per feature. This mapper-free path has no missing-value
+    support: it reserves no bin and sends `NaN` to bin 0."""
     if n_bins < 2 or n_bins > 256:
         raise Error("n_bins must be in [2, 256]")
     if len(features) != n_rows * n_features:
@@ -288,10 +417,11 @@ def bin_equal_width(
         var width = (hi - lo) / Float64(n_bins)
         for r in range(n_rows):
             var b: Int
-            if width <= 0.0:
+            var v = features[col + r]
+            if width <= 0.0 or isnan(v):
                 b = 0
             else:
-                b = Int((features[col + r] - lo) / width)
+                b = Int((v - lo) / width)
                 if b >= n_bins:
                     b = n_bins - 1
                 if b < 0:

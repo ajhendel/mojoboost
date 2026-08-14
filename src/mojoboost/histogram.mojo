@@ -18,6 +18,13 @@ Every builder takes an optional list of feature ids (empty means all). Under
 feature subsampling only those features are accumulated; the output keeps its
 full `n_features * n_bins` shape with the excluded slices left at zero, so no
 dataset is copied or re-indexed and sibling subtraction stays exact.
+
+Each builder comes in two forms. The plain one allocates and returns a fresh
+`Histogram` and is what callers outside tree growth want. The `_into` one
+writes a caller-owned buffer, so a grower that visits hundreds of nodes can
+recycle a handful of histograms instead of allocating three arrays per node
+(see `Histogram.zeroed` / `Histogram.reset`). The two forms run the same
+kernels and produce bit-identical results; only the allocation differs.
 """
 
 from std.sys.info import simd_width_of
@@ -37,6 +44,41 @@ struct Histogram(Copyable, Movable):
     var count: List[Int]
     var n_features: Int
     var n_bins: Int
+
+    @staticmethod
+    def zeroed(n_features: Int, n_bins: Int) -> Histogram:
+        """An all-zero histogram of the given shape, ready to accumulate
+        into. Callers that build many histograms of one shape allocate once
+        with this and recycle with `reset`."""
+        var size = n_features * n_bins
+        return Histogram(
+            _zeroed_f64(size), _zeroed_f64(size), _zeroed_int(size),
+            n_features, n_bins,
+        )
+
+    def reset(mut self):
+        """Zero every bin in place, keeping the allocation. Cheaper than a
+        fresh `zeroed` by exactly one malloc/free per buffer, which is what
+        tree growth spends most of its allocator time on."""
+        var size = self.n_features * self.n_bins
+        var gp = self.grad.unsafe_ptr()
+        var hp = self.hess.unsafe_ptr()
+        var cp = self.count.unsafe_ptr()
+        comptime W = SIMD_LANES
+        var i = 0
+        while i + W <= size:
+            gp.unsafe_store(i, SIMD[DType.float64, W](0.0))
+            hp.unsafe_store(i, SIMD[DType.float64, W](0.0))
+            cp.unsafe_store(i, SIMD[DType.int, W](0))
+            i += W
+        while i < size:
+            gp.unsafe_store(i, 0.0)
+            hp.unsafe_store(i, 0.0)
+            cp.unsafe_store(i, 0)
+            i += 1
+
+    def matches(self, n_features: Int, n_bins: Int) -> Bool:
+        return self.n_features == n_features and self.n_bins == n_bins
 
 
 def _zeroed_f64(size: Int) -> List[Float64]:
@@ -67,18 +109,47 @@ def build_histogram(
     """Build a full-dataset histogram from per-row gradients and hessians.
     With a non-empty `features`, only those features are accumulated and the
     rest of the output stays zero."""
+    var out = Histogram.zeroed(data.n_features, data.n_bins)
+    build_histogram_into(out, data, grad, hess, features)
+    return out^
+
+
+def build_histogram_into(
+    mut out: Histogram,
+    data: BinnedMatrix,
+    grad: List[Float64],
+    hess: List[Float64],
+    features: List[Int] = [],
+) raises:
+    """`build_histogram` into a caller-owned buffer, which is zeroed first.
+    Identical results, one fewer allocation per call."""
     if len(grad) != data.n_rows or len(hess) != data.n_rows:
         raise Error("gradient/hessian length must equal n_rows")
+    if not out.matches(data.n_features, data.n_bins):
+        raise Error("output histogram shape must match the data")
     _check_features(features, data.n_features)
 
-    var size = data.n_features * data.n_bins
-    var g = _zeroed_f64(size)
-    var h = _zeroed_f64(size)
-    var c = _zeroed_int(size)
+    out.reset()
+    # The three output buffers are passed as separate `mut` lists rather than
+    # reached through `out`: a pointer taken from a struct field carries that
+    # field's origin, which a worker closure cannot capture.
+    _accumulate_full(
+        out.grad, out.hess, out.count, data, grad, hess, features
+    )
 
-    var gp = g.unsafe_ptr()
-    var hp = h.unsafe_ptr()
-    var cp = c.unsafe_ptr()
+
+def _accumulate_full(
+    mut out_grad: List[Float64],
+    mut out_hess: List[Float64],
+    mut out_count: List[Int],
+    data: BinnedMatrix,
+    grad: List[Float64],
+    hess: List[Float64],
+    features: List[Int],
+) raises:
+    var gp = out_grad.unsafe_ptr()
+    var hp = out_hess.unsafe_ptr()
+    var cp = out_count.unsafe_ptr()
     var grad_p = grad.unsafe_ptr()
     var hess_p = hess.unsafe_ptr()
     var bins_p = data.bins.unsafe_ptr()
@@ -100,8 +171,6 @@ def build_histogram(
 
     dispatch_features(do_feature, n_active, n_active * n_rows)
 
-    return Histogram(g^, h^, c^, data.n_features, data.n_bins)
-
 
 def build_histogram_subset(
     data: BinnedMatrix,
@@ -113,25 +182,66 @@ def build_histogram_subset(
     """Build a histogram over a subset of rows (one tree node's rows). With a
     non-empty `features`, only those features are accumulated and the rest of
     the output stays zero."""
+    var out = Histogram.zeroed(data.n_features, data.n_bins)
+    build_histogram_subset_into(
+        out, data, grad, hess, rows, 0, len(rows), features
+    )
+    return out^
+
+
+def build_histogram_subset_into(
+    mut out: Histogram,
+    data: BinnedMatrix,
+    grad: List[Float64],
+    hess: List[Float64],
+    rows: List[Int],
+    row_start: Int,
+    row_count: Int,
+    features: List[Int] = [],
+) raises:
+    """`build_histogram_subset` over the window `rows[row_start :
+    row_start + row_count]`, into a caller-owned buffer that is zeroed first.
+
+    The window lets tree growth keep every node's row ids in one shared arena
+    instead of allocating a fresh `List[Int]` per node; passing
+    `(0, len(rows))` is exactly the whole-list behaviour."""
     if len(grad) != data.n_rows or len(hess) != data.n_rows:
         raise Error("gradient/hessian length must equal n_rows")
+    if not out.matches(data.n_features, data.n_bins):
+        raise Error("output histogram shape must match the data")
+    if row_start < 0 or row_count < 0 or row_start + row_count > len(rows):
+        raise Error("row window out of range")
     _check_features(features, data.n_features)
 
-    var size = data.n_features * data.n_bins
-    var g = _zeroed_f64(size)
-    var h = _zeroed_f64(size)
-    var c = _zeroed_int(size)
+    out.reset()
+    _accumulate_subset(
+        out.grad, out.hess, out.count,
+        data, grad, hess, rows, row_start, row_count, features,
+    )
 
-    var gp = g.unsafe_ptr()
-    var hp = h.unsafe_ptr()
-    var cp = c.unsafe_ptr()
+
+def _accumulate_subset(
+    mut out_grad: List[Float64],
+    mut out_hess: List[Float64],
+    mut out_count: List[Int],
+    data: BinnedMatrix,
+    grad: List[Float64],
+    hess: List[Float64],
+    rows: List[Int],
+    row_start: Int,
+    row_count: Int,
+    features: List[Int],
+) raises:
+    var gp = out_grad.unsafe_ptr()
+    var hp = out_hess.unsafe_ptr()
+    var cp = out_count.unsafe_ptr()
     var grad_p = grad.unsafe_ptr()
     var hess_p = hess.unsafe_ptr()
-    var rows_p = rows.unsafe_ptr()
+    var rows_p = rows.unsafe_ptr().unsafe_offset(row_start)
     var bins_all_p = data.bins.unsafe_ptr()
     var n_rows = data.n_rows
     var n_bins = data.n_bins
-    var n_sub = len(rows)
+    var n_sub = row_count
     var use_all = len(features) == 0
     var n_active = data.n_features if use_all else len(features)
     var feat_p = features.unsafe_ptr()
@@ -149,32 +259,39 @@ def build_histogram_subset(
 
     dispatch_features(do_feature, n_active, n_active * n_sub)
 
-    return Histogram(g^, h^, c^, data.n_features, data.n_bins)
-
 
 def subtract_histogram(parent: Histogram, child: Histogram) raises -> Histogram:
     """Sibling histogram via the subtraction trick: build the smaller child
     directly, get the larger one as parent - child for free."""
+    var out = Histogram.zeroed(parent.n_features, parent.n_bins)
+    subtract_histogram_into(out, parent, child)
+    return out^
+
+
+def subtract_histogram_into(
+    mut out: Histogram, parent: Histogram, child: Histogram
+) raises:
+    """`subtract_histogram` into a caller-owned buffer. Every element is
+    written, so unlike the accumulating builders this one needs no zeroing
+    pass at all."""
     if (
         parent.n_features != child.n_features
         or parent.n_bins != child.n_bins
     ):
         raise Error("histogram shapes must match")
+    if not out.matches(parent.n_features, parent.n_bins):
+        raise Error("output histogram shape must match the operands")
 
     var size = parent.n_features * parent.n_bins
-    var g = _zeroed_f64(size)
-    var h = _zeroed_f64(size)
-    var c = _zeroed_int(size)
-
     var pg = parent.grad.unsafe_ptr()
     var ph = parent.hess.unsafe_ptr()
     var pc = parent.count.unsafe_ptr()
     var cg = child.grad.unsafe_ptr()
     var ch = child.hess.unsafe_ptr()
     var cc = child.count.unsafe_ptr()
-    var og = g.unsafe_ptr()
-    var oh = h.unsafe_ptr()
-    var oc = c.unsafe_ptr()
+    var og = out.grad.unsafe_ptr()
+    var oh = out.hess.unsafe_ptr()
+    var oc = out.count.unsafe_ptr()
 
     comptime W = SIMD_LANES
     var i = 0
@@ -194,5 +311,3 @@ def subtract_histogram(parent: Histogram, child: Histogram) raises -> Histogram:
         oh.unsafe_store(i, ph.unsafe_load(i) - ch.unsafe_load(i))
         oc.unsafe_store(i, pc.unsafe_load(i) - cc.unsafe_load(i))
         i += 1
-
-    return Histogram(g^, h^, c^, parent.n_features, parent.n_bins)

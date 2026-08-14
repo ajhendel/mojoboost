@@ -46,8 +46,12 @@ from .boosting import (
     _clamp_prob,
     _fill_grad_hess,
     _renew_leaf_values,
+    _check_goss,
+    _fill_softmax_grad_hess,
+    _multiclass_goss_select,
     _softmax_inplace,
 )
+from .goss import GossParams, GossSelection, apply_goss_scaling, goss_round
 from .histogram import Histogram, subtract_histogram
 from .histogram_gpu import GpuHistogramBuilder
 from .objective import (
@@ -56,6 +60,13 @@ from .objective import (
     check_custom_grad_hess,
 )
 from .interaction import extend_branch
+from .monotone import (
+    MONOTONE_FREE,
+    OutputBounds,
+    child_bounds,
+    midpoint,
+    monotone_sign,
+)
 from .sampling import select_node_features, select_tree_features
 from .split import SplitInfo
 from .tree import Tree, TreeParams, _leaf_value, _search
@@ -65,7 +76,9 @@ struct _GpuLeafState(Movable):
     """A grown-but-unsplit leaf: its node id (also its device-side leaf id),
     row count, histogram, the best split available from it, the features
     split on between the root and it (empty when no interaction constraints
-    are configured), and its depth in edges from the root."""
+    are configured), its depth in edges from the root, and the interval its
+    output must lie in (unbounded when no monotonic constraint above it
+    applies)."""
 
     var node: Int
     var n_rows: Int
@@ -73,6 +86,7 @@ struct _GpuLeafState(Movable):
     var split: SplitInfo
     var branch: List[Int]
     var depth: Int
+    var bounds: OutputBounds
 
     def __init__(
         out self,
@@ -82,6 +96,7 @@ struct _GpuLeafState(Movable):
         var split: SplitInfo,
         var branch: List[Int] = [],
         depth: Int = 0,
+        var bounds: OutputBounds = OutputBounds.unbounded(),
     ):
         self.node = node
         self.n_rows = n_rows
@@ -89,15 +104,29 @@ struct _GpuLeafState(Movable):
         self.split = split^
         self.branch = branch^
         self.depth = depth
+        self.bounds = bounds^
 
 
-def _count_left(hist: Histogram, feature: Int, threshold_bin: Int) -> Int:
-    """Rows going left under (feature, threshold_bin), from the exact integer
-    counts of the node's histogram — no host-side row partitioning needed."""
+def _count_left(
+    hist: Histogram,
+    split: SplitInfo,
+    missing_bin: Int = -1,
+) -> Int:
+    """Rows going left under `split`, from the exact integer counts of the
+    node's histogram — no host-side row partitioning needed. Every bin is
+    routed by `split.goes_left`, the same rule the device partition kernel
+    and `Tree.goes_left` apply, so the three cannot disagree; rows in
+    `missing_bin` follow the split's default direction instead."""
     var total = 0
-    var base = feature * hist.n_bins
-    for b in range(threshold_bin + 1):
-        total += hist.count[base + b]
+    var base = split.feature * hist.n_bins
+    for b in range(hist.n_bins):
+        var go_left: Bool
+        if not split.is_categorical and b == missing_bin:
+            go_left = split.default_left
+        else:
+            go_left = split.goes_left(b)
+        if go_left:
+            total += hist.count[base + b]
     return total
 
 
@@ -134,8 +163,16 @@ def grow_tree_gpu(
     feature set, which is handed to the device once per tree so its
     histogram kernel accumulates exactly those features, and the per-node
     sets (drawn from the node ids, which both growers assign in the same
-    order) narrow each split search identically."""
+    order) narrow each split search identically.
+
+    Monotonic constraints go through the same `_search` and the same interval
+    bookkeeping as on the CPU. Split search, leaf clamping, and candidate
+    rejection all run host-side on downloaded histograms, so the constraint is
+    enforced identically on both backends; only the histogram sums the
+    decisions are made from carry the GPU's Float32 precision."""
     params.constraints.check_features(builder.n_features)
+    params.monotone.check_features(builder.n_features)
+    var signs = params.monotone.active_signs()
     var tree_features = select_tree_features(
         builder.n_features,
         params.feature_fraction,
@@ -171,6 +208,9 @@ def grow_tree_gpu(
             root,
         ),
         depth=0,
+        missing_bins=builder.missing_bin,
+        monotone=signs,
+        cats=builder.cats,
     )
 
     var frontier = List[_GpuLeafState]()
@@ -194,15 +234,26 @@ def grow_tree_gpu(
 
         var parent_node = frontier[best_i].node
         var split = frontier[best_i].split.copy()
+        var split_missing_bin = -1 if split.is_categorical else (
+            builder.missing_bin[split.feature]
+        )
         var n_left = _count_left(
-            frontier[best_i].hist, split.feature, split.bin
+            frontier[best_i].hist, split, split_missing_bin
         )
         var n_right = frontier[best_i].n_rows - n_left
 
         var left_node = tree._add_node(0.0)
         var right_node = tree._add_node(0.0)
         builder.apply_split(
-            split.feature, split.bin, parent_node, left_node, right_node
+            split.feature,
+            split.bin,
+            parent_node,
+            left_node,
+            right_node,
+            split_missing_bin,
+            split.default_left,
+            split.is_categorical,
+            split.cat_bitset,
         )
 
         # Histogram subtraction trick: build the smaller child directly.
@@ -215,17 +266,34 @@ def grow_tree_gpu(
             right_hist = builder.build_leaf(right_node)
             left_hist = subtract_histogram(frontier[best_i].hist, right_hist)
 
-        tree.value[left_node] = _leaf_value(
-            left_hist, params.lambda_reg, params.lambda_l1, value_feature
+        # Same clamp-and-divide as the CPU grower: no-ops when unconstrained.
+        var parent_bounds = frontier[best_i].bounds.copy()
+        var split_sign = monotone_sign(signs, split.feature)
+        var left_value = parent_bounds.clamp(
+            _leaf_value(
+                left_hist, params.lambda_reg, params.lambda_l1, value_feature
+            )
         )
-        tree.value[right_node] = _leaf_value(
-            right_hist, params.lambda_reg, params.lambda_l1, value_feature
+        var right_value = parent_bounds.clamp(
+            _leaf_value(
+                right_hist, params.lambda_reg, params.lambda_l1, value_feature
+            )
         )
-        tree.feature[parent_node] = split.feature
-        tree.threshold_bin[parent_node] = split.bin
+        if split_sign != MONOTONE_FREE and left_value > right_value:
+            # A rounding step can invert the two outputs after the candidate
+            # check; collapsing both to their midpoint keeps the ordering
+            # exact and leaves the midpoint unchanged.
+            var mid = midpoint(left_value, right_value)
+            left_value = mid
+            right_value = mid
+        var children = child_bounds(
+            parent_bounds, split_sign, left_value, right_value
+        )
+        tree.value[left_node] = left_value
+        tree.value[right_node] = right_value
         tree.left[parent_node] = left_node
         tree.right[parent_node] = right_node
-        tree.split_gain[parent_node] = split.gain
+        tree._set_split(parent_node, split, split_missing_bin)
 
         # Both children inherit the same branch feature set, so they share one
         # allow mask, and both sit one edge below the leaf that was split.
@@ -247,6 +315,10 @@ def grow_tree_gpu(
                 left_node,
             ),
             depth=child_depth,
+            missing_bins=builder.missing_bin,
+            monotone=signs,
+            cats=builder.cats,
+            bounds=children.left,
         )
         var right_split = _search(
             right_hist,
@@ -261,6 +333,10 @@ def grow_tree_gpu(
                 right_node,
             ),
             depth=child_depth,
+            missing_bins=builder.missing_bin,
+            monotone=signs,
+            cats=builder.cats,
+            bounds=children.right,
         )
 
         frontier[best_i] = _GpuLeafState(
@@ -270,6 +346,7 @@ def grow_tree_gpu(
             left_split^,
             branch.copy(),
             depth=child_depth,
+            bounds=children.left.copy(),
         )
         frontier.append(
             _GpuLeafState(
@@ -279,6 +356,7 @@ def grow_tree_gpu(
                 right_split^,
                 branch^,
                 depth=child_depth,
+                bounds=children.right.copy(),
             )
         )
         n_leaves += 1
@@ -295,12 +373,16 @@ def train_gpu(
     sample_weight: List[Float64] = [],
     alpha: Float64 = 0.9,
     bagging: BaggingParams = BaggingParams.disabled(),
+    goss: GossParams = GossParams.disabled(),
 ) raises -> Booster:
     """Train a boosted ensemble with tree growth on the GPU. Same contract
-    as `train` (objectives, sample_weight, alpha, and bagging semantics);
-    requires an accelerator at runtime and at most 256 bins. Bags come from
-    the same sampler and the same schedule as on the CPU, so both backends
-    grow round i on exactly the same rows."""
+    as `train` (objectives, sample_weight, alpha, bagging, and GOSS
+    semantics); requires an accelerator at runtime and at most 256 bins.
+    Bags come from the same sampler and the same schedule as on the CPU, so
+    both backends grow round i on exactly the same rows. GOSS ranks rows on
+    the host from the same Float64 gradients the CPU trainer uses, so its
+    sample matches the CPU sample exactly as well; only the histograms the
+    sample feeds carry the GPU's Float32 precision."""
     comptime if not has_accelerator():
         raise Error("GPU training requires an accelerator")
     else:
@@ -309,6 +391,8 @@ def train_gpu(
         _check_objective(objective, target, alpha)
         _check_sample_weight(sample_weight, data.n_rows)
         check_bagging(bagging)
+        _check_goss(goss, bagging)
+        params.tree.monotone.check_features(data.n_features)
 
         var n = data.n_rows
         var base_score = _base_score(target, objective, sample_weight, alpha)
@@ -316,6 +400,7 @@ def train_gpu(
         for _ in range(n):
             raw.append(base_score)
 
+        var signs = params.tree.monotone.active_signs()
         var builder = GpuHistogramBuilder(data)
         var trees = List[Tree]()
         var grad = List[Float64](capacity=n)
@@ -326,23 +411,27 @@ def train_gpu(
             _fill_grad_hess(
                 raw, target, objective, sample_weight, alpha, grad, hess
             )
+            # GOSS rescales the sampled rows' gradients before they are
+            # uploaded, so the device histograms already carry the
+            # compensation multiplier.
+            goss_round(bag, grad, hess, goss, i, params.learning_rate)
             builder.upload_gradients(grad, hess)
             var tree = grow_tree_gpu(builder, params.tree, bag, i)
             if objective == QUANTILE:
                 _renew_leaf_values(
-                    tree, data, target, raw, sample_weight, alpha, bag
+                    tree, data, target, raw, sample_weight, alpha, bag, signs
                 )
             elif objective == L1:
                 _renew_leaf_values(
-                    tree, data, target, raw, sample_weight, 0.5, bag
+                    tree, data, target, raw, sample_weight, 0.5, bag, signs
                 )
 
             # A single-leaf tree with a near-zero value means the objective
             # has converged; further rounds cannot make progress. Under
-            # bagging it only means this bag had nothing to give, so the
-            # round is skipped and the next bag gets its turn.
+            # bagging or GOSS it only means this sample had nothing to give,
+            # so the round is skipped and the next sample gets its turn.
             if tree.n_leaves == 1 and abs(tree.value[0]) < 1e-12:
-                if bagging_enabled(bagging):
+                if bagging_enabled(bagging) or goss.enabled:
                     continue
                 break
 
@@ -350,7 +439,13 @@ def train_gpu(
                 raw[r] += params.learning_rate * tree.predict_row(data, r)
             trees.append(tree^)
 
-        return Booster(trees^, base_score, params.learning_rate, objective)
+        return Booster(
+            trees^,
+            base_score,
+            params.learning_rate,
+            objective,
+            params.tree.monotone.copy(),
+        )
 
 
 def train_custom_gpu[F: GradHessFn](
@@ -409,6 +504,7 @@ def train_multiclass_gpu(
     params: BoosterParams,
     sample_weight: List[Float64] = [],
     bagging: BaggingParams = BaggingParams.disabled(),
+    goss: GossParams = GossParams.disabled(),
 ) raises -> MulticlassBooster:
     """`train_multiclass` with tree growth on the GPU.
 
@@ -419,8 +515,9 @@ def train_multiclass_gpu(
     for the whole ensemble and each round costs n_classes gradient uploads.
 
     Same contract as `train_multiclass` (labels in 0..n_classes-1,
-    sample_weight, bagging semantics); requires an accelerator at runtime and
-    at most 256 bins. Softmax probabilities are computed on the host, exactly
+    sample_weight, bagging, and GOSS semantics, including the one shared row
+    sample per round); requires an accelerator at runtime and at most 256
+    bins. Softmax probabilities are computed on the host, exactly
     as on the CPU, so the only backend difference remains the Float32
     histogram precision."""
     comptime if not has_accelerator():
@@ -432,6 +529,7 @@ def train_multiclass_gpu(
             raise Error("n_classes must be at least 2")
         _check_sample_weight(sample_weight, data.n_rows)
         check_bagging(bagging)
+        _check_goss(goss, bagging)
         var n = data.n_rows
 
         # Base scores are log priors (weighted when sample_weight is given).
@@ -472,23 +570,21 @@ def train_multiclass_gpu(
                     prob[r * n_classes + k] = raw[r * n_classes + k]
                 _softmax_inplace(prob, r * n_classes, n_classes)
 
+            # One shared sample for the whole round, drawn before any class's
+            # tree, exactly as on the CPU.
+            var selection = GossSelection.all_rows()
+            if goss.active(i, params.learning_rate):
+                selection = _multiclass_goss_select(
+                    prob, labels, n_classes, sample_weight, goss, i
+                )
+                bag = selection.rows.copy()
+
             var made_progress = False
             for k in range(n_classes):
-                grad.clear()
-                hess.clear()
-                for r in range(n):
-                    var p = prob[r * n_classes + k]
-                    var y = 1.0 if labels[r] == k else 0.0
-                    var w = (
-                        sample_weight[r] if len(sample_weight) > 0 else 1.0
-                    )
-                    grad.append(w * (p - y))
-                    # LightGBM/XGBoost softmax hessian: 2 * p * (1 - p),
-                    # floored.
-                    var h = 2.0 * p * (1.0 - p)
-                    if h < 1e-16:
-                        h = 1e-16
-                    hess.append(w * h)
+                _fill_softmax_grad_hess(
+                    prob, labels, k, n_classes, sample_weight, grad, hess
+                )
+                apply_goss_scaling(selection, grad, hess)
                 builder.upload_gradients(grad, hess)
                 # Feature subsampling draws once per tree, so each class's
                 # tree in a round gets its own feature set; the same index
@@ -505,13 +601,13 @@ def train_multiclass_gpu(
                     )
                 trees.append(tree^)
 
-            # No class made progress: with bagging that is a statement about
-            # this bag, so the round is dropped and the next bag gets its
-            # turn.
+            # No class made progress: with bagging or GOSS that is a
+            # statement about this sample, so the round is dropped and the
+            # next sample gets its turn.
             if not made_progress:
                 for _ in range(n_classes):
                     _ = trees.pop()
-                if bagging_enabled(bagging):
+                if bagging_enabled(bagging) or goss.enabled:
                     continue
                 break
 

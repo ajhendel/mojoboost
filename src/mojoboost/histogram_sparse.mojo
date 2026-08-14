@@ -125,43 +125,56 @@ struct SparseEntryOrder(Movable):
         preserved, so row indices stay ascending and results do not depend on
         how the work was scheduled.
         """
-        var n_features = data.n_features
-        var order_p = self.order.unsafe_ptr()
-        var scratch_p = self.scratch.unsafe_ptr()
-        var side_p = row_side.unsafe_ptr()
-        var entry_row_p = data.row_index.unsafe_ptr()
-        var start_p = node.starts.unsafe_ptr()
-        var end_p = node.ends.unsafe_ptr()
-        var ls_p = left.starts.unsafe_ptr()
-        var le_p = left.ends.unsafe_ptr()
-        var rs_p = right.starts.unsafe_ptr()
-        var re_p = right.ends.unsafe_ptr()
-
-        def do_feature(f: Int) {imm}:
-            var lo = start_p.unsafe_load(f)
-            var hi = end_p.unsafe_load(f)
-            for i in range(lo, hi):
-                scratch_p.unsafe_store(i, order_p.unsafe_load(i))
-            var w = lo
-            for i in range(lo, hi):
-                var e = scratch_p.unsafe_load(i)
-                if side_p.unsafe_load(entry_row_p.unsafe_load(e)) != 0:
-                    order_p.unsafe_store(w, e)
-                    w += 1
-            var mid = w
-            for i in range(lo, hi):
-                var e = scratch_p.unsafe_load(i)
-                if side_p.unsafe_load(entry_row_p.unsafe_load(e)) == 0:
-                    order_p.unsafe_store(w, e)
-                    w += 1
-            ls_p.unsafe_store(f, lo)
-            le_p.unsafe_store(f, mid)
-            rs_p.unsafe_store(f, mid)
-            re_p.unsafe_store(f, hi)
-
-        dispatch_features(
-            do_feature, n_features, node.n_entries() + n_features
+        _partition_ranges(
+            self.order, self.scratch, data, node, row_side, left, right
         )
+
+
+def _partition_ranges(
+    mut order: List[Int],
+    mut scratch: List[Int],
+    data: SparseBinnedMatrix,
+    node: SparseNodeEntries,
+    row_side: List[UInt8],
+    mut left: SparseNodeEntries,
+    mut right: SparseNodeEntries,
+) raises:
+    """Stable in-place partition of every per-feature range of `node`."""
+    var n_features = data.n_features
+    var order_p = order.unsafe_ptr()
+    var scratch_p = scratch.unsafe_ptr()
+    var side_p = row_side.unsafe_ptr()
+    var entry_row_p = data.row_index.unsafe_ptr()
+    var start_p = node.starts.unsafe_ptr()
+    var end_p = node.ends.unsafe_ptr()
+    var ls_p = left.starts.unsafe_ptr()
+    var le_p = left.ends.unsafe_ptr()
+    var rs_p = right.starts.unsafe_ptr()
+    var re_p = right.ends.unsafe_ptr()
+
+    def do_feature(f: Int) {imm}:
+        var lo = start_p.unsafe_load(f)
+        var hi = end_p.unsafe_load(f)
+        for i in range(lo, hi):
+            scratch_p.unsafe_store(i, order_p.unsafe_load(i))
+        var w = lo
+        for i in range(lo, hi):
+            var e = scratch_p.unsafe_load(i)
+            if side_p.unsafe_load(entry_row_p.unsafe_load(e)) != 0:
+                order_p.unsafe_store(w, e)
+                w += 1
+        var mid = w
+        for i in range(lo, hi):
+            var e = scratch_p.unsafe_load(i)
+            if side_p.unsafe_load(entry_row_p.unsafe_load(e)) == 0:
+                order_p.unsafe_store(w, e)
+                w += 1
+        ls_p.unsafe_store(f, lo)
+        le_p.unsafe_store(f, mid)
+        rs_p.unsafe_store(f, mid)
+        re_p.unsafe_store(f, hi)
+
+    dispatch_features(do_feature, n_features, node.n_entries() + n_features)
 
 
 def build_histogram_sparse_node(

@@ -106,15 +106,23 @@ def check_custom_grad_hess(
     for r in range(n_rows):
         if not isfinite(grad[r]):
             raise Error(
-                String("custom objective produced a non-finite gradient at row ", r)
+                String(
+                    "custom objective produced a non-finite gradient at row ",
+                    r,
+                )
             )
         if not isfinite(hess[r]):
             raise Error(
-                String("custom objective produced a non-finite hessian at row ", r)
+                String(
+                    "custom objective produced a non-finite hessian at row ",
+                    r,
+                )
             )
         if hess[r] < 0.0:
             raise Error(
-                String("custom objective produced a negative hessian at row ", r)
+                String(
+                    "custom objective produced a negative hessian at row ", r
+                )
             )
 
 
@@ -161,7 +169,9 @@ def squared_error_loss(
     return total / Float64(len(target))
 
 
-def mean_label(target: List[Float64], weights: List[Float64]) raises -> Float64:
+def mean_label(
+    target: List[Float64], weights: List[Float64]
+) raises -> Float64:
     """The (weighted) label mean, the base score the built-in mean-link
     objectives boost from. Useful as an explicit `base_score` when a custom
     objective should match a built-in one."""
@@ -185,6 +195,12 @@ def train_custom[F: GradHessFn](
     base_score: Float64 = 0.0,
 ) raises -> Booster:
     """Train a boosted ensemble against a custom objective.
+
+    Feature subsampling, interaction constraints, `max_depth`, and the
+    regularization parameters all live in `params.tree` and apply here
+    exactly as they do to the built-in objectives. Row-level sampling
+    (bagging, GOSS) is a `train` parameter and is not wired through this
+    entry point.
 
     `grad_hess` is called once per boosting round with the current raw
     scores and the labels and must fill `grad` and `hess` with one entry

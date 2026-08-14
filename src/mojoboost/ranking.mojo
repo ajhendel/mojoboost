@@ -761,6 +761,7 @@ def fit_ranker(
     max_bins: Int = 255,
     sample_weight: List[Float64] = [],
     bagging: BaggingParams = BaggingParams.disabled(),
+    use_missing: Bool = True,
 ) raises -> Model:
     """Fit a ranker on a column-major raw feature matrix
     (`features[f * n_rows + r]`) with LightGBM's `group` array of per-query
@@ -769,7 +770,9 @@ def fit_ranker(
     model; query boundaries are a property of the training data, not of the
     fitted model."""
     var groups = groups_from_counts(group_counts)
-    var mapper = fit_bins(features, n_rows, n_features, max_bins)
+    var mapper = fit_bins(
+        features, n_rows, n_features, max_bins, use_missing=use_missing
+    )
     var data = mapper.transform(features, n_rows)
     var booster = train_ranker(
         data, labels, groups, params, rank_params, sample_weight, bagging

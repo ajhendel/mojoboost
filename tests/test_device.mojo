@@ -7,7 +7,7 @@ heuristic so both sides of it are covered. Tests that actually train on the
 GPU skip (passing) when no accelerator is present.
 """
 
-from std.os import setenv
+from std.os import remove, setenv
 from std.sys import has_accelerator
 from std.testing import (
     assert_equal,
@@ -278,6 +278,7 @@ def test_gpu_trained_model_round_trips() raises:
         # file format is unchanged and the round trip stays bit-exact.
         save_model(model, _TMP_PATH)
         var loaded = load_model(_TMP_PATH)
+        remove(_TMP_PATH)
         assert_equal(
             len(model.booster.trees), len(loaded.booster.trees)
         )

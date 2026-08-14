@@ -14,6 +14,7 @@ from std.os import abort
 from std.python import PythonObject
 from std.python.bindings import PythonModuleBuilder
 
+from mojoboost.bagging import BaggingParams
 from mojoboost.boosting import BoosterParams
 from mojoboost.device import (
     device_name as mojo_device_name,
@@ -21,12 +22,20 @@ from mojoboost.device import (
     parse_device,
     resolve_device as mojo_resolve_device,
 )
+from mojoboost.goss import GossParams
 from mojoboost.importance import gain_importance, split_importance
 from mojoboost.interaction import InteractionConstraints
 from mojoboost.model import Model, MulticlassModel
 from mojoboost.model import fit as mojo_fit
 from mojoboost.model import fit_custom as mojo_fit_custom
 from mojoboost.model import fit_multiclass as mojo_fit_multiclass
+from mojoboost.objective import mean_label
+from mojoboost.ranking import (
+    RankerParams,
+    fit_ranker as mojo_fit_ranker,
+    groups_from_counts,
+    ndcg as mojo_ndcg,
+)
 from mojoboost.serialize import (
     load_model,
     load_multiclass_model,
@@ -45,6 +54,8 @@ def PyInit__mojoboost() abi("C") -> PythonObject:
         m.def_function[fit]("fit")
         m.def_function[fit_custom]("fit_custom")
         m.def_function[fit_multiclass]("fit_multiclass")
+        m.def_function[fit_ranker]("fit_ranker")
+        m.def_function[ndcg]("ndcg")
         m.def_function[predict]("predict")
         m.def_function[predict_raw]("predict_raw")
         m.def_function[predict_proba]("predict_proba")
@@ -128,6 +139,12 @@ def _parse_params(
         Float64(py=params["min_child_hess"]),
         Float64(py=params["lambda_l1"]),
         _parse_constraints(params, n_features),
+        feature_fraction=Float64(py=params["feature_fraction"]),
+        feature_fraction_bynode=Float64(
+            py=params["feature_fraction_bynode"]
+        ),
+        feature_fraction_seed=Int(py=params["feature_fraction_seed"]),
+        max_depth=Int(py=params["max_depth"]),
     )
     return BoosterParams(
         Int(py=params["n_estimators"]),
@@ -141,6 +158,36 @@ def _parse_device(params: PythonObject) raises -> Int:
     already resolved ("cpu" or "gpu"); the trainer resolves it again, so
     the policy in device.mojo stays the only one."""
     return parse_device(String(py=params["device"]))
+
+
+def _parse_bagging(params: PythonObject) raises -> BaggingParams:
+    """Row bagging config from the params dict. The trainer validates it
+    again, so the rules in bagging.mojo stay the only ones."""
+    return BaggingParams(
+        Float64(py=params["bagging_fraction"]),
+        Int(py=params["bagging_freq"]),
+        Int(py=params["bagging_seed"]),
+    )
+
+
+def _parse_goss(params: PythonObject) raises -> GossParams:
+    """GOSS config from the params dict. `goss` arrives as an int so the
+    boundary carries no Python bool conversion. The trainer validates the
+    rates again, so the rules in goss.mojo stay the only ones."""
+    return GossParams(
+        Int(py=params["goss"]) != 0,
+        Float64(py=params["top_rate"]),
+        Float64(py=params["other_rate"]),
+        Int(py=params["goss_seed"]),
+        Int(py=params["goss_warmup_rounds"]),
+    )
+
+
+def _parse_use_missing(params: PythonObject) raises -> Bool:
+    """LightGBM's use_missing, passed as an int so the boundary carries no
+    Python bool conversion. The binner validates nothing further; the rules
+    in binning.mojo stay the only ones."""
+    return Int(py=params["use_missing"]) != 0
 
 
 def _parse_weights(params: PythonObject, n_rows: Int) raises -> List[Float64]:
@@ -176,6 +223,88 @@ def fit(
         weights,
         Float64(py=params["alpha"]),
         _parse_device(params),
+        _parse_bagging(params),
+        _parse_goss(params),
+        use_missing=_parse_use_missing(params),
+    )
+    return PythonObject(alloc=model^)
+
+
+def fit_custom(
+    x_addr: PythonObject,
+    n_rows: PythonObject,
+    n_features: PythonObject,
+    y_addr: PythonObject,
+    bridge: PythonObject,
+    params: PythonObject,
+) raises -> PythonObject:
+    """Train a single-output model against a Python objective callback.
+
+    `bridge` is a zero-argument Python callable. Per boosting round this
+    writes the current raw scores into the caller's `raw_addr` buffer, calls
+    `bridge` once, and reads the gradients and hessians back out of the
+    caller's `grad_addr` and `hess_addr` buffers. The Python side therefore
+    sees whole arrays, once per round: no Python object crosses the boundary
+    per row, and nothing Python-side runs inside tree growth. Three float64
+    buffers of length n_rows must be alive at those addresses for the whole
+    call. The remaining contract (validation, weights, base score, raw-score
+    predictions) is the one in src/mojoboost/objective.mojo.
+    """
+    var nr = Int(py=n_rows)
+    var nf = Int(py=n_features)
+    var features = _f64_list(Int(py=x_addr), nr * nf)
+    var target = _f64_list(Int(py=y_addr), nr)
+    var bp = _parse_params(params, nf)
+    var weights = _parse_weights(params, nr)
+
+    var raw_addr = Int(py=params["raw_addr"])
+    var grad_addr = Int(py=params["grad_addr"])
+    var hess_addr = Int(py=params["hess_addr"])
+    if raw_addr == 0 or grad_addr == 0 or hess_addr == 0:
+        raise Error("invalid buffer")
+    var raw_p = Pointer[Float64, MutUntrackedOrigin](
+        unsafe_from_address=raw_addr
+    )
+    var grad_p = Pointer[Float64, MutUntrackedOrigin](
+        unsafe_from_address=grad_addr
+    )
+    var hess_p = Pointer[Float64, MutUntrackedOrigin](
+        unsafe_from_address=hess_addr
+    )
+
+    def py_grad_hess(
+        raw: List[Float64],
+        labels: List[Float64],
+        mut grad: List[Float64],
+        mut hess: List[Float64],
+    ) raises {imm bridge, imm raw_p, imm grad_p, imm hess_p, imm nr}:
+        for r in range(nr):
+            raw_p.unsafe_store(r, raw[r])
+        _ = bridge()
+        grad.clear()
+        hess.clear()
+        for r in range(nr):
+            grad.append(grad_p.unsafe_load(r))
+            hess.append(hess_p.unsafe_load(r))
+
+    # "mean" is resolved here rather than in the wrapper: the label mean has
+    # to match the built-in objectives' base score bit for bit, so it has to
+    # come from one summation order, and this is that one.
+    var base_score = Float64(py=params["base_score"])
+    if Int(py=params["base_score_mean"]) != 0:
+        base_score = mean_label(target, weights)
+
+    var model = mojo_fit_custom(
+        features,
+        nr,
+        nf,
+        target,
+        py_grad_hess,
+        bp,
+        Int(py=params["max_bin"]),
+        weights,
+        base_score,
+        use_missing=_parse_use_missing(params),
     )
     return PythonObject(alloc=model^)
 
@@ -205,8 +334,80 @@ def fit_multiclass(
         Int(py=params["max_bin"]),
         weights,
         _parse_device(params),
+        _parse_bagging(params),
+        _parse_goss(params),
+        use_missing=_parse_use_missing(params),
     )
     return PythonObject(alloc=model^)
+
+
+def _parse_rank_params(params: PythonObject) raises -> RankerParams:
+    """LambdaRank config from the params dict. `lambdarank_norm` arrives as
+    an int so the boundary carries no Python bool conversion. The trainer
+    validates again, so the rules in ranking.mojo stay the only ones."""
+    return RankerParams(
+        Int(py=params["lambdarank_truncation_level"]),
+        Float64(py=params["sigmoid"]),
+        Int(py=params["lambdarank_norm"]) != 0,
+        Int(py=params["ndcg_eval_at"]),
+    )
+
+
+def _group_counts(params: PythonObject) raises -> List[Int]:
+    """Per-query row counts (LightGBM's `group`) from the params dict. They
+    travel as float64 like every other buffer at this boundary."""
+    return _int_list_from_f64(
+        Int(py=params["group_addr"]), Int(py=params["n_groups"])
+    )
+
+
+def fit_ranker(
+    x_addr: PythonObject,
+    n_rows: PythonObject,
+    n_features: PythonObject,
+    y_addr: PythonObject,
+    params: PythonObject,
+) raises -> PythonObject:
+    """Train a LambdaRank model. Relevance labels arrive as float64
+    nonnegative integers and the query boundaries ride in the params dict,
+    so this stays within the argument count the other fits use."""
+    var nr = Int(py=n_rows)
+    var nf = Int(py=n_features)
+    var features = _f64_list(Int(py=x_addr), nr * nf)
+    var labels = _int_list_from_f64(Int(py=y_addr), nr)
+    var bp = _parse_params(params, nf)
+    var weights = _parse_weights(params, nr)
+    var model = mojo_fit_ranker(
+        features,
+        nr,
+        nf,
+        labels,
+        _group_counts(params),
+        bp,
+        _parse_rank_params(params),
+        Int(py=params["max_bin"]),
+        weights,
+        _parse_bagging(params),
+        _parse_use_missing(params),
+    )
+    return PythonObject(alloc=model^)
+
+
+def ndcg(
+    scores_addr: PythonObject,
+    y_addr: PythonObject,
+    n_rows: PythonObject,
+    k: PythonObject,
+    params: PythonObject,
+) raises -> PythonObject:
+    """Mean NDCG@k over the queries described by the params dict's group
+    counts. Exposed on its own so callers can score any set of scores, not
+    only a mojoboost model's."""
+    var nr = Int(py=n_rows)
+    var scores = _f64_list(Int(py=scores_addr), nr)
+    var labels = _int_list_from_f64(Int(py=y_addr), nr)
+    var groups = groups_from_counts(_group_counts(params))
+    return PythonObject(mojo_ndcg(scores, labels, groups, Int(py=k)))
 
 
 def predict(

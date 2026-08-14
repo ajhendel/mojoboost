@@ -9,8 +9,18 @@ regularization applied by soft-thresholding each gradient sum:
          - T(G)^2  / (H + lambda_l2)
 
 With lambda_l1 = 0 (the default) T is the identity and this is the plain
-second-order formula. A split at (feature, bin) sends rows with bin value
-<= bin to the left child.
+second-order formula. A numerical split at (feature, bin) sends rows with bin
+value <= bin to the left child.
+
+Categorical features
+--------------------
+Features marked categorical in the binned matrix are never scanned by ordinal
+threshold: their candidates are *sets* of categories, searched by
+`categorical.mojo` and scored with the same gain formula, so numerical and
+categorical candidates compete on gain in this one loop. A categorical
+feature's missing, unseen, and dropped rows live in its bin 0, which is never
+a member of a candidate set and therefore always routes right; the numerical
+missing-bin machinery below does not apply to it.
 
 The search takes an optional per-feature allow mask. Feature interaction
 constraints are enforced here and nowhere else: a feature the caller has
@@ -47,6 +57,19 @@ owes its interval no matter which feature it goes on to split. An empty
 vector keeps the original unconstrained scoring path (see monotone.mojo).
 """
 
+from .categorical import (
+    CatBitset,
+    CategoricalParams,
+    CategoricalSpec,
+    cat_contains,
+    cat_empty,
+    find_best_categorical_split,
+)
+
+# Re-exported: the L1 soft-threshold lives in gain.mojo so the numerical scan
+# here and the category partition search in categorical.mojo share one
+# definition, but `split.soft_threshold_l1` remains its public name.
+from .gain import soft_threshold_l1
 from .histogram import Histogram, SIMD_LANES
 from .monotone import (
     MONOTONE_FREE,
@@ -57,30 +80,25 @@ from .monotone import (
 )
 
 
-@always_inline
-def soft_threshold_l1(s: Float64, lambda_l1: Float64) -> Float64:
-    """LightGBM's ThresholdL1: shrink a gradient sum toward zero by
-    `lambda_l1`, clamping at zero. Returns `s` unchanged when `lambda_l1`
-    is not positive."""
-    if lambda_l1 <= 0.0:
-        return s
-    var mag = abs(s) - lambda_l1
-    if mag <= 0.0:
-        return 0.0
-    return mag if s > 0.0 else -mag
-
-
 struct SplitInfo(Copyable, Movable, Writable):
     """Best split found for a node. `found` is False when no valid split
     exists (e.g. every candidate violates min_child_hess). `default_left` is
     the direction taken by rows in the feature's missing bin; it is False and
-    unused for a feature with no missing bin."""
+    unused for a feature with no missing bin.
+
+    A numerical split uses `bin` as an inclusive left-going threshold. A
+    categorical split sets `is_categorical`, leaves `bin` at -1, and carries
+    the bins that route left in `cat_bitset`; every other bin, including the
+    missing/unseen bin 0, routes right, so `default_left` is False for it as
+    it is in LightGBM."""
 
     var feature: Int
     var bin: Int
     var gain: Float64
     var found: Bool
     var default_left: Bool
+    var is_categorical: Bool
+    var cat_bitset: CatBitset
 
     def __init__(
         out self,
@@ -90,11 +108,95 @@ struct SplitInfo(Copyable, Movable, Writable):
         found: Bool,
         default_left: Bool = False,
     ):
+        """A numerical split, or with found=False the absence of one."""
         self.feature = feature
         self.bin = bin
         self.gain = gain
         self.found = found
         self.default_left = default_left
+        self.is_categorical = False
+        self.cat_bitset = cat_empty()
+
+    @staticmethod
+    def categorical(
+        feature: Int, gain: Float64, bitset: CatBitset
+    ) -> SplitInfo:
+        """A categorical split sending `bitset`'s bins to the left child."""
+        var s = SplitInfo(feature, -1, gain, True, False)
+        s.is_categorical = True
+        s.cat_bitset = bitset
+        return s^
+
+    def goes_left(self, bin: Int) -> Bool:
+        """Whether a row whose bin for `self.feature` is `bin` routes left.
+        Growth, prediction, and GPU partitioning all route through here, so
+        the three cannot disagree."""
+        if self.is_categorical:
+            return cat_contains(self.cat_bitset, bin)
+        return bin <= self.bin
+
+    def write_to(self, mut writer: Some[Writer]):
+        if not self.found:
+            writer.write("SplitInfo(none)")
+        elif self.is_categorical:
+            writer.write(
+                "SplitInfo(feature=",
+                self.feature,
+                ", categorical, gain=",
+                self.gain,
+                ")",
+            )
+        else:
+            writer.write(
+                "SplitInfo(feature=",
+                self.feature,
+                ", bin<=",
+                self.bin,
+                ", gain=",
+                self.gain,
+                ")",
+            )
+
+    def write_repr_to(self, mut writer: Some[Writer]):
+        self.write_to(writer)
+
+
+@always_inline
+def _split_gain(
+    left_g: Float64,
+    left_h: Float64,
+    right_g: Float64,
+    right_h: Float64,
+    lambda_reg: Float64,
+    parent_score: Float64,
+    sign: Int,
+    bounds: OutputBounds,
+    constrained: Bool,
+) -> Float64:
+    """Gain of one candidate split. `left_g` and `right_g` are the child
+    gradient sums after L1 soft-thresholding.
+
+    Unconstrained, this is the plain second-order formula. Under active
+    monotonic constraints it is LightGBM's constrained form: both child
+    outputs are clamped into the node's bounds and scored at those outputs,
+    and a candidate whose outputs run against `sign` scores 0.0, which no
+    caller accepts because a split must beat a gain of 0.0 to be chosen.
+    """
+    if not constrained:
+        return (
+            left_g * left_g / (left_h + lambda_reg)
+            + right_g * right_g / (right_h + lambda_reg)
+            - parent_score
+        )
+    var left_out = bounds.clamp(-left_g / (left_h + lambda_reg))
+    var right_out = bounds.clamp(-right_g / (right_h + lambda_reg))
+    if violates(sign, left_out, right_out):
+        return 0.0
+    return (
+        output_score(left_g, left_h, lambda_reg, left_out)
+        + output_score(right_g, right_h, lambda_reg, right_out)
+        - parent_score
+    )
 
 
 def find_best_split(
@@ -106,6 +208,10 @@ def find_best_split(
     allowed: List[Bool] = [],
     features: List[Int] = [],
     missing_bins: List[Int] = [],
+    monotone: List[Int] = [],
+    bounds: OutputBounds = OutputBounds.unbounded(),
+    cats: CategoricalSpec = CategoricalSpec.none(),
+    cat_params: CategoricalParams = CategoricalParams.default(),
 ) raises -> SplitInfo:
     """Scan all (feature, bin) split candidates and return the one with the
     highest gain. `lambda_reg` is the L2 penalty on the leaf hessian sum and
@@ -126,10 +232,30 @@ def find_best_split(
     `missing_bins` is the per-feature missing-bin table of the binned matrix
     (`BinnedMatrix.missing_bin`), or empty when no feature reserves a missing
     bin. A feature whose entry is >= 0 is scanned over its ordinary bins only
-    and reports a `default_left` direction for its missing rows."""
+    and reports a `default_left` direction for its missing rows.
+
+    `monotone` is the per-feature monotonic constraint vector (`1`, `0`, or
+    `-1`) and `bounds` the interval this node's output must lie in. An empty
+    `monotone` (the default) means unconstrained and keeps the original
+    scoring path; `bounds` is then ignored.
+
+    `cats` marks which features are categorical (`BinnedMatrix.cats`) and
+    `cat_params` holds the categorical hyperparameters. A categorical feature
+    is handed to `find_best_categorical_split` instead of being scanned by
+    threshold, and its `missing_bins` entry is not consulted."""
     var best = SplitInfo(-1, -1, 0.0, False)
     if len(missing_bins) > 0 and len(missing_bins) != hist.n_features:
         raise Error("missing_bins length must equal n_features")
+    if len(monotone) > 0 and len(monotone) != hist.n_features:
+        raise Error("monotone length must equal n_features")
+    var constrained = len(monotone) > 0
+    if constrained and cats.any_categorical():
+        for f in range(hist.n_features):
+            if cats.is_cat(f) and monotone_sign(monotone, f) != MONOTONE_FREE:
+                raise Error(
+                    "monotonic constraints are not supported on categorical"
+                    " features"
+                )
     var masked = len(allowed) > 0
     var use_all = len(features) == 0
     var n_active = hist.n_features if use_all else len(features)
@@ -144,6 +270,7 @@ def find_best_split(
             continue
         if masked and (f >= len(allowed) or not allowed[f]):
             continue
+        var sign = monotone_sign(monotone, f) if constrained else MONOTONE_FREE
         var missing_bin = -1
         if len(missing_bins) > 0:
             missing_bin = missing_bins[f]
@@ -167,6 +294,35 @@ def find_best_split(
             total_h += hess_p.unsafe_load(base + b)
             total_c += count_p.unsafe_load(base + b)
             b += 1
+        # Categorical features are searched as category partitions, never as
+        # ordinal thresholds. Bin 0 (missing, unseen, dropped) is excluded
+        # from every candidate set there, so this feature's `missing_bins`
+        # entry plays no part.
+        if cats.is_cat(f):
+            var n_cat = cats.n_categories(f)
+            if n_cat >= hist.n_bins:
+                raise Error(
+                    "categorical feature has more categories than bins"
+                )
+            var cs = find_best_categorical_split(
+                hist.grad,
+                hist.hess,
+                hist.count,
+                base,
+                n_cat,
+                total_g,
+                total_h,
+                total_c,
+                lambda_reg,
+                lambda_l1,
+                min_child_hess,
+                min_data_in_leaf,
+                cat_params,
+            )
+            if cs.found and cs.gain > best.gain:
+                best = SplitInfo.categorical(f, cs.gain, cs.bitset)
+            continue
+
         var parent_g = soft_threshold_l1(total_g, lambda_l1)
         var parent_score = parent_g * parent_g / (total_h + lambda_reg)
 
@@ -211,10 +367,16 @@ def find_best_split(
                 ):
                     var tl = soft_threshold_l1(dl_left_g, lambda_l1)
                     var tr = soft_threshold_l1(dl_right_g, lambda_l1)
-                    var gain = (
-                        tl * tl / (dl_left_h + lambda_reg)
-                        + tr * tr / (dl_right_h + lambda_reg)
-                        - parent_score
+                    var gain = _split_gain(
+                        tl,
+                        dl_left_h,
+                        tr,
+                        dl_right_h,
+                        lambda_reg,
+                        parent_score,
+                        sign,
+                        bounds,
+                        constrained,
                     )
                     if gain > best.gain:
                         best = SplitInfo(f, b, gain, True, True)
@@ -233,10 +395,16 @@ def find_best_split(
                     continue
                 var tl = soft_threshold_l1(left_g, lambda_l1)
                 var tr = soft_threshold_l1(right_g, lambda_l1)
-                var gain = (
-                    tl * tl / (left_h + lambda_reg)
-                    + tr * tr / (right_h + lambda_reg)
-                    - parent_score
+                var gain = _split_gain(
+                    tl,
+                    left_h,
+                    tr,
+                    right_h,
+                    lambda_reg,
+                    parent_score,
+                    sign,
+                    bounds,
+                    constrained,
                 )
                 if gain > best.gain:
                     best = SplitInfo(f, b, gain, True, False)

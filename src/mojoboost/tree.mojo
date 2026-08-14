@@ -28,16 +28,43 @@ Feature subsampling (see sampling.mojo) draws one feature set per tree from
 tree's set is ever accumulated into histograms, so excluded features cost
 nothing and sibling subtraction stays exact; the per-node set narrows the
 split search on top of that.
+
+Under monotonic constraints (see monotone.mojo) each frontier leaf also
+carries the interval its output must lie in. Leaf values are clamped into it,
+candidate splits are scored from clamped outputs and rejected when they run
+against their feature's constraint, and a split on a constrained feature
+divides the parent's interval between its children at the midpoint of their
+values. The intervals are not stored on the tree: `node_bounds` recovers them
+from a grown tree, because an internal node keeps the value it had when it was
+created.
 """
 
 from .binning import BinnedMatrix
+from .categorical import (
+    CAT_BITSET_WORDS,
+    CategoricalParams,
+    CategoricalSpec,
+    cat_pool_contains,
+)
 from .histogram import (
     Histogram,
     build_histogram,
+    build_histogram_into,
     build_histogram_subset,
+    build_histogram_subset_into,
     subtract_histogram,
+    subtract_histogram_into,
 )
+from .parallel import plan_row_blocks, run_row_blocks
 from .interaction import InteractionConstraints, extend_branch
+from .monotone import (
+    MONOTONE_FREE,
+    MonotoneConstraints,
+    OutputBounds,
+    child_bounds,
+    midpoint,
+    monotone_sign,
+)
 from .sampling import (
     DEFAULT_FEATURE_FRACTION_SEED,
     select_node_features,
@@ -56,7 +83,12 @@ struct TreeParams(Copyable, Movable):
     (see sampling.mojo); both fractions default to 1.0, which selects every
     feature and leaves the seed with no effect. `max_depth` is LightGBM's
     max_depth: an upper bound on a leaf's depth in edges from the root, with
-    values <= 0 meaning unlimited (LightGBM's default is -1)."""
+    values <= 0 meaning unlimited (LightGBM's default is -1). `monotone` holds
+    LightGBM's monotone_constraints (see monotone.mojo) and defaults to
+    unconstrained. `cat` holds LightGBM's categorical hyperparameters (see
+    categorical.mojo) and defaults to LightGBM's own defaults; which features
+    are categorical is a property of the binned matrix, not of these
+    parameters."""
 
     var num_leaves: Int
     var min_data_in_leaf: Int
@@ -68,6 +100,8 @@ struct TreeParams(Copyable, Movable):
     var feature_fraction_bynode: Float64
     var feature_fraction_seed: Int
     var max_depth: Int
+    var monotone: MonotoneConstraints
+    var cat: CategoricalParams
 
     def __init__(
         out self,
@@ -81,6 +115,8 @@ struct TreeParams(Copyable, Movable):
         feature_fraction_bynode: Float64 = 1.0,
         feature_fraction_seed: Int = DEFAULT_FEATURE_FRACTION_SEED,
         max_depth: Int = -1,
+        var monotone: MonotoneConstraints = MonotoneConstraints(),
+        var cat: CategoricalParams = CategoricalParams.default(),
     ):
         self.num_leaves = num_leaves
         self.min_data_in_leaf = min_data_in_leaf
@@ -92,12 +128,15 @@ struct TreeParams(Copyable, Movable):
         self.feature_fraction_bynode = feature_fraction_bynode
         self.feature_fraction_seed = feature_fraction_seed
         self.max_depth = max_depth
+        self.monotone = monotone^
+        self.cat = cat^
 
     @staticmethod
     def default() -> TreeParams:
         # LightGBM defaults (min_child_hess mirrors min_sum_hessian_in_leaf,
-        # lambda_l1 defaults to 0, interaction constraints to none, both
-        # feature fractions to 1.0, and max_depth to -1, as in LightGBM).
+        # lambda_l1 defaults to 0, interaction and monotonic constraints to
+        # none, both feature fractions to 1.0, and max_depth to -1, as in
+        # LightGBM).
         return TreeParams(31, 20, 1.0, 1e-3, 0.0)
 
 
@@ -112,7 +151,15 @@ struct Tree(Copyable, Movable):
     bin of node i's split feature, or -1 when that feature reserves none, in
     which case no bin id can match and the threshold decides every row. The
     two arrays are always as long as `feature`, so a tree is self-contained:
-    prediction needs no bin mapper to route missing values."""
+    prediction needs no bin mapper to route missing values.
+
+    A node that splits a categorical feature routes by category set instead
+    of by threshold: `cat_offset[i] >= 0` is the offset of node i's 256-bit
+    set in the flat `cat_bitset` pool, and a row goes left exactly when its
+    bin is in that set. Bin 0 of a categorical feature (missing, unseen, or
+    dropped) is never in a set, so those rows always go right. `cat_offset`
+    is -1 on every numerical node, which is what the whole array holds for a
+    model with no categorical features."""
 
     var feature: List[Int]
     var threshold_bin: List[Int]
@@ -123,6 +170,8 @@ struct Tree(Copyable, Movable):
     var n_leaves: Int
     var default_left: List[Bool]
     var missing_bin: List[Int]
+    var cat_offset: List[Int]
+    var cat_bitset: List[UInt64]
 
     def __init__(
         out self,
@@ -135,11 +184,14 @@ struct Tree(Copyable, Movable):
         n_leaves: Int,
         var default_left: List[Bool] = [],
         var missing_bin: List[Int] = [],
+        var cat_offset: List[Int] = [],
+        var cat_bitset: List[UInt64] = [],
     ):
         """Omitting the missing-routing arrays (or passing ones of the wrong
         length) builds a tree that routes no missing values, which is what a
         model trained without missing support, or loaded from a v1 file,
-        needs."""
+        needs. Omitting `cat_offset` likewise builds a tree with no
+        categorical nodes."""
         var n_nodes = len(feature)
         self.feature = feature^
         self.threshold_bin = threshold_bin^
@@ -158,6 +210,12 @@ struct Tree(Copyable, Movable):
         else:
             self.missing_bin = List[Int](capacity=n_nodes)
             self.missing_bin.resize(n_nodes, -1)
+        if len(cat_offset) == n_nodes:
+            self.cat_offset = cat_offset^
+        else:
+            self.cat_offset = List[Int](capacity=n_nodes)
+            self.cat_offset.resize(n_nodes, -1)
+        self.cat_bitset = cat_bitset^
 
     def _add_node(mut self, value: Float64) -> Int:
         var node = len(self.feature)
@@ -172,14 +230,40 @@ struct Tree(Copyable, Movable):
         # Set when the node is split; a leaf routes nothing.
         self.default_left.append(False)
         self.missing_bin.append(-1)
+        self.cat_offset.append(-1)
         return node
+
+    def _set_split(mut self, node: Int, split: SplitInfo, missing_bin: Int):
+        """Record a chosen split on `node`, numerical or categorical. This is
+        the only place either grower writes split routing, so the CPU and GPU
+        trees carry identical node layouts."""
+        self.feature[node] = split.feature
+        self.split_gain[node] = split.gain
+        if split.is_categorical:
+            # A categorical node routes only by its set: no threshold, and no
+            # missing bin, since bin 0 already collects the missing rows and
+            # is never a set member.
+            self.threshold_bin[node] = -1
+            self.default_left[node] = False
+            self.missing_bin[node] = -1
+            self.cat_offset[node] = len(self.cat_bitset)
+            for w in range(CAT_BITSET_WORDS):
+                self.cat_bitset.append(split.cat_bitset[w])
+        else:
+            self.threshold_bin[node] = split.bin
+            self.default_left[node] = split.default_left
+            self.missing_bin[node] = missing_bin
 
     @always_inline
     def goes_left(self, node: Int, bin: Int) -> Bool:
         """Whether a row in `bin` of node `node`'s split feature goes to the
-        left child. The missing bin follows the node's default direction; -1
-        never matches a real bin, so unaffected nodes fall through to the
-        ordinary threshold test."""
+        left child. A categorical node routes by set membership. Otherwise the
+        missing bin follows the node's default direction; -1 never matches a
+        real bin, so unaffected nodes fall through to the ordinary threshold
+        test."""
+        var off = self.cat_offset[node]
+        if off >= 0:
+            return cat_pool_contains(self.cat_bitset, off, bin)
         if bin == self.missing_bin[node]:
             return self.default_left[node]
         return bin <= self.threshold_bin[node]
@@ -239,8 +323,9 @@ struct Tree(Copyable, Movable):
 struct _LeafState(Movable):
     """A grown-but-unsplit leaf: its node id, rows, histogram, the best split
     available from it, the features split on between the root and it (empty
-    when no interaction constraints are configured), and its depth in edges
-    from the root."""
+    when no interaction constraints are configured), its depth in edges from
+    the root, and the interval its output must lie in (unbounded when no
+    monotonic constraint above it applies)."""
 
     var node: Int
     var rows: List[Int]
@@ -248,6 +333,7 @@ struct _LeafState(Movable):
     var split: SplitInfo
     var branch: List[Int]
     var depth: Int
+    var bounds: OutputBounds
 
     def __init__(
         out self,
@@ -257,6 +343,7 @@ struct _LeafState(Movable):
         var split: SplitInfo,
         var branch: List[Int] = [],
         depth: Int = 0,
+        var bounds: OutputBounds = OutputBounds.unbounded(),
     ):
         self.node = node
         self.rows = rows^
@@ -264,6 +351,160 @@ struct _LeafState(Movable):
         self.split = split^
         self.branch = branch^
         self.depth = depth
+        self.bounds = bounds^
+
+    def take_hist(mut self) raises -> Histogram:
+        """Move this leaf's histogram out, leaving an empty one behind.
+
+        Used when a leaf is split: its histogram is dead the moment sibling
+        subtraction has read it, so the buffer goes back to the pool instead
+        of being freed with the state it hung off."""
+        var out = Histogram.zeroed(0, 0)
+        swap(out, self.hist)
+        return out^
+
+
+@fieldwise_init
+struct RowPartition(Movable):
+    """One node's rows split by a chosen split, each side in ascending row
+    order."""
+
+    var left: List[Int]
+    var right: List[Int]
+
+
+def partition_rows(
+    data: BinnedMatrix,
+    rows: List[Int],
+    split: SplitInfo,
+    missing_bin: Int,
+) raises -> RowPartition:
+    """`partition_rows_into` returning freshly allocated sides."""
+    var left = List[Int]()
+    var right = List[Int]()
+    partition_rows_into(left, right, data, rows, split, missing_bin)
+    return RowPartition(left^, right^)
+
+
+def partition_rows_into(
+    mut left: List[Int],
+    mut right: List[Int],
+    data: BinnedMatrix,
+    rows: List[Int],
+    split: SplitInfo,
+    missing_bin: Int,
+) raises:
+    """Route each of `rows` to the left or right child of `split`.
+
+    A categorical split routes by set membership; otherwise rows in the
+    feature's missing bin follow the split's default direction instead of the
+    threshold, and a feature with no missing bin (-1) has none of them.
+
+    Two passes: count per block, prefix-sum the counts, then scatter. That
+    costs one extra read of the split feature's bins and buys two things a
+    single appending pass cannot have. The output lists are allocated once at
+    their exact final size instead of doubling, and the passes parallelize
+    across row blocks. Block b's rows land at `prefix_left[b]` on the left and
+    at `start(b) - prefix_left[b]` on the right, so both sides come out in
+    ascending row order whatever the block count: the result is identical to
+    the serial single-pass partition, index for index.
+    """
+    var n = len(rows)
+    var blocks = plan_row_blocks(n, n)
+    var rows_p = rows.unsafe_ptr()
+    var bins_p = data.bins.unsafe_ptr().unsafe_offset(
+        split.feature * data.n_rows
+    )
+    var is_cat = split.is_categorical
+    var default_left = split.default_left
+    var threshold = split.bin
+
+    @always_inline
+    def goes_left(bin: Int) {imm} -> Bool:
+        if is_cat:
+            return split.goes_left(bin)
+        if bin == missing_bin:
+            return default_left
+        return bin <= threshold
+
+    var left_counts = List[Int](capacity=blocks.n_blocks)
+    left_counts.resize(blocks.n_blocks, 0)
+    var counts_p = left_counts.unsafe_ptr()
+
+    def count_block(b: Int) {imm}:
+        var c = 0
+        for i in range(blocks.start(b), blocks.end(b)):
+            if goes_left(Int(bins_p.unsafe_load(rows_p.unsafe_load(i)))):
+                c += 1
+        counts_p.unsafe_store(b, c)
+
+    run_row_blocks(blocks, count_block)
+
+    # Exclusive prefix sum over the per-block left counts, in place.
+    var total_left = 0
+    for b in range(blocks.n_blocks):
+        var c = left_counts[b]
+        left_counts[b] = total_left
+        total_left += c
+
+    # Sized exactly, so a caller that reuses its buffers across splits keeps
+    # whatever capacity it already grew and never reallocates on a smaller
+    # node.
+    left.resize(total_left, 0)
+    right.resize(n - total_left, 0)
+    var left_p = left.unsafe_ptr()
+    var right_p = right.unsafe_ptr()
+
+    def scatter_block(b: Int) {imm}:
+        var start = blocks.start(b)
+        var li = counts_p.unsafe_load(b)
+        var ri = start - li
+        for i in range(start, blocks.end(b)):
+            var r = rows_p.unsafe_load(i)
+            if goes_left(Int(bins_p.unsafe_load(r))):
+                left_p.unsafe_store(li, r)
+                li += 1
+            else:
+                right_p.unsafe_store(ri, r)
+                ri += 1
+
+    run_row_blocks(blocks, scatter_block)
+    return RowPartition(left^, right^)
+
+
+struct _HistPool(Movable):
+    """Free-list of histogram buffers of one shape.
+
+    Tree growth builds two child histograms per split and drops the parent's,
+    so at most `num_leaves + 1` are ever live at once and the buffers can be
+    recycled instead of reallocated. Each buffer is three arrays of
+    `n_features * n_bins`, which at the default 100 features and 255 bins is
+    around 600 KB per node: large enough that the allocator hands back fresh
+    pages and faults them in every time. Recycling keeps that cost to the
+    first few nodes of the first tree.
+    """
+
+    var free: List[Histogram]
+    var n_features: Int
+    var n_bins: Int
+
+    def __init__(out self, n_features: Int, n_bins: Int):
+        self.free = List[Histogram]()
+        self.n_features = n_features
+        self.n_bins = n_bins
+
+    def take(mut self) raises -> Histogram:
+        """A buffer of the pool's shape. Contents are undefined; every
+        `_into` builder writes or zeroes before reading."""
+        if len(self.free) > 0:
+            return self.free.pop()
+        return Histogram.zeroed(self.n_features, self.n_bins)
+
+    def give(mut self, var hist: Histogram):
+        """Return a buffer. Buffers of another shape are dropped, so a
+        mismatched hand-back can never corrupt a later `take`."""
+        if hist.matches(self.n_features, self.n_bins):
+            self.free.append(hist^)
 
 
 def _leaf_value(
@@ -292,14 +533,23 @@ def _search(
     allowed: List[Bool] = [],
     features: List[Int] = [],
     depth: Int = 0,
+    missing_bins: List[Int] = [],
+    monotone: List[Int] = [],
+    bounds: OutputBounds = OutputBounds.unbounded(),
+    cats: CategoricalSpec = CategoricalSpec.none(),
 ) raises -> SplitInfo:
     """Best split for one node. `allowed` is the node's interaction-constraint
     allow mask and `features` its subsampled feature ids; empty means every
     feature is a candidate. `depth` is the node's depth in edges from the
     root, checked against `params.max_depth`; both growers pass it
-    explicitly, and the 0 default means an unbounded node. Both the CPU and
-    the GPU grower go through here, so the two enforce constraints,
-    subsampling, and the depth limit identically."""
+    explicitly, and the 0 default means an unbounded node. `missing_bins` is
+    the dataset's per-feature missing-bin table. `monotone` is the active
+    monotonic constraint vector (empty when unconstrained) and `bounds` this
+    node's output interval. `cats` marks the categorical features, whose
+    candidates are category partitions rather than thresholds. Both the CPU
+    and the GPU grower go through here, so the two enforce constraints,
+    subsampling, the depth limit, missing-value routing, and categorical
+    partitioning identically."""
     # A leaf at the depth limit yields no split, which is what stops growth
     # beneath it; leaf-wise selection is otherwise untouched.
     if params.max_depth > 0 and depth >= params.max_depth:
@@ -314,6 +564,11 @@ def _search(
         lambda_l1=params.lambda_l1,
         allowed=allowed,
         features=features,
+        missing_bins=missing_bins,
+        monotone=monotone,
+        bounds=bounds,
+        cats=cats,
+        cat_params=params.cat,
     )
 
 
@@ -336,12 +591,19 @@ def grow_tree(
     `params.constraints`, when non-empty, restricts each node's split search
     to the features its branch still permits (see interaction.mojo).
 
+    `params.monotone`, when it constrains a feature, makes the grown tree
+    monotone in that feature (see monotone.mojo).
+
     `tree_index` is this tree's position in the ensemble; together with
     `params.feature_fraction_seed` it fixes which features the tree and its
     nodes may split on, so growing the same tree again selects the same
     features no matter what else has been trained.
     """
     params.constraints.check_features(data.n_features)
+    params.monotone.check_features(data.n_features)
+    # Empty unless a feature is actually constrained, which keeps split search
+    # on its unconstrained path and the fit bit-identical.
+    var signs = params.monotone.active_signs()
     var tree_features = select_tree_features(
         data.n_features,
         params.feature_fraction,
@@ -355,22 +617,28 @@ def grow_tree(
         List[Float64](), List[Float64](), 0,
     )
 
+    # Every histogram this tree builds comes from one pool and goes back to it
+    # when its leaf is split, so growth allocates a handful of buffers rather
+    # than three arrays per node.
+    var pool = _HistPool(data.n_features, data.n_bins)
+
     # The root's row list is the only thing bagging materializes; the full
     # path builds the same list over every row.
     var root_rows: List[Int]
-    var root_hist: Histogram
+    var root_hist = pool.take()
     if len(bag) == 0:
         root_rows = List[Int](capacity=data.n_rows)
+        root_rows.resize(data.n_rows, 0)
         for r in range(data.n_rows):
-            root_rows.append(r)
-        root_hist = build_histogram(data, grad, hess, tree_features)
+            root_rows[r] = r
+        build_histogram_into(root_hist, data, grad, hess, tree_features)
     else:
         for i in range(len(bag)):
             if bag[i] < 0 or bag[i] >= data.n_rows:
                 raise Error("bag row index out of range")
         root_rows = bag.copy()
-        root_hist = build_histogram_subset(
-            data, grad, hess, bag, tree_features
+        build_histogram_subset_into(
+            root_hist, data, grad, hess, bag, 0, len(bag), tree_features
         )
 
     # The root's branch is empty, so its allow mask is the union of every
@@ -390,6 +658,9 @@ def grow_tree(
             0,
         ),
         depth=0,
+        missing_bins=data.missing_bin,
+        monotone=signs,
+        cats=data.cats,
     )
     var root = tree._add_node(
         _leaf_value(
@@ -419,45 +690,81 @@ def grow_tree(
         var parent_node = frontier[best_i].node
         var split = frontier[best_i].split.copy()
 
-        # Partition the parent's rows by the chosen split.
+        # Partition the parent's rows by the chosen split. A categorical
+        # split routes by set membership; otherwise rows in the feature's
+        # missing bin follow the split's default direction instead of the
+        # threshold, and a feature with no missing bin has none of them.
+        var split_missing_bin = -1 if split.is_categorical else (
+            data.missing_bin[split.feature]
+        )
+        var parts = partition_rows(
+            data, frontier[best_i].rows, split, split_missing_bin
+        )
+        # Move both lists out with swaps so `parts` remains a valid,
+        # destructible value; moving fields out individually leaves a
+        # partially destroyed struct, which Mojo rejects.
         var left_rows = List[Int]()
         var right_rows = List[Int]()
-        for i in range(len(frontier[best_i].rows)):
-            var r = frontier[best_i].rows[i]
-            if data.bin_at(r, split.feature) <= split.bin:
-                left_rows.append(r)
-            else:
-                right_rows.append(r)
+        swap(left_rows, parts.left)
+        swap(right_rows, parts.right)
+
+        # The parent's histogram is read once more, by the subtraction below,
+        # and is dead after that; moving it out here is what lets its buffer
+        # go straight back to the pool.
+        var parent_hist = frontier[best_i].take_hist()
 
         # Histogram subtraction trick: build the smaller child directly.
-        var left_hist: Histogram
-        var right_hist: Histogram
+        var left_hist = pool.take()
+        var right_hist = pool.take()
         if len(left_rows) <= len(right_rows):
-            left_hist = build_histogram_subset(
-                data, grad, hess, left_rows, tree_features
+            build_histogram_subset_into(
+                left_hist, data, grad, hess, left_rows, 0, len(left_rows),
+                tree_features,
             )
-            right_hist = subtract_histogram(frontier[best_i].hist, left_hist)
+            subtract_histogram_into(right_hist, parent_hist, left_hist)
         else:
-            right_hist = build_histogram_subset(
-                data, grad, hess, right_rows, tree_features
+            build_histogram_subset_into(
+                right_hist, data, grad, hess, right_rows, 0, len(right_rows),
+                tree_features,
             )
-            left_hist = subtract_histogram(frontier[best_i].hist, right_hist)
+            subtract_histogram_into(left_hist, parent_hist, right_hist)
+        pool.give(parent_hist^)
 
-        var left_node = tree._add_node(
+        # Child values are clamped into the parent's interval, then the
+        # interval is divided between the children at their midpoint. Both are
+        # no-ops when unconstrained: the interval is unbounded and the split
+        # sign is 0, so the values and the children's intervals are the
+        # parent's unchanged.
+        var parent_bounds = frontier[best_i].bounds.copy()
+        var split_sign = monotone_sign(signs, split.feature)
+        var left_value = parent_bounds.clamp(
             _leaf_value(
                 left_hist, params.lambda_reg, params.lambda_l1, value_feature
             )
         )
-        var right_node = tree._add_node(
+        var right_value = parent_bounds.clamp(
             _leaf_value(
                 right_hist, params.lambda_reg, params.lambda_l1, value_feature
             )
         )
-        tree.feature[parent_node] = split.feature
-        tree.threshold_bin[parent_node] = split.bin
+        if split_sign != MONOTONE_FREE and left_value > right_value:
+            # Candidates were scored from the parent's prefix sums while these
+            # values come from the child histograms, one of which was derived
+            # by subtraction, so the two outputs can invert by a rounding step
+            # after passing the candidate check. Collapsing both to their
+            # midpoint keeps the ordering exact, and leaves the midpoint (and
+            # so both children's intervals) unchanged.
+            var mid = midpoint(left_value, right_value)
+            left_value = mid
+            right_value = mid
+        var children = child_bounds(
+            parent_bounds, split_sign, left_value, right_value
+        )
+        var left_node = tree._add_node(left_value)
+        var right_node = tree._add_node(right_value)
         tree.left[parent_node] = left_node
         tree.right[parent_node] = right_node
-        tree.split_gain[parent_node] = split.gain
+        tree._set_split(parent_node, split, split_missing_bin)
 
         # Both children inherit the same branch feature set, so they share one
         # allow mask, and both sit one edge below the leaf that was split.
@@ -478,6 +785,10 @@ def grow_tree(
                 left_node,
             ),
             depth=child_depth,
+            missing_bins=data.missing_bin,
+            monotone=signs,
+            cats=data.cats,
+            bounds=children.left,
         )
         var right_split = _search(
             right_hist,
@@ -492,6 +803,10 @@ def grow_tree(
                 right_node,
             ),
             depth=child_depth,
+            missing_bins=data.missing_bin,
+            monotone=signs,
+            cats=data.cats,
+            bounds=children.right,
         )
 
         frontier[best_i] = _LeafState(
@@ -501,6 +816,7 @@ def grow_tree(
             left_split^,
             branch.copy(),
             depth=child_depth,
+            bounds=children.left.copy(),
         )
         frontier.append(
             _LeafState(
@@ -510,9 +826,45 @@ def grow_tree(
                 right_split^,
                 branch^,
                 depth=child_depth,
+                bounds=children.right.copy(),
             )
         )
         n_leaves += 1
 
     tree.n_leaves = n_leaves
     return tree^
+
+
+def node_bounds(tree: Tree, monotone: List[Int]) -> List[OutputBounds]:
+    """Every node's monotone output interval, recovered from a grown tree.
+
+    Growth does not store the intervals, and it does not have to: an internal
+    node still holds the leaf value it carried when it was created, which is
+    exactly what its parent's interval was divided at, so one pass down the
+    tree reproduces the whole chain. Consumers that rewrite leaf values after
+    growth (quantile and L1 leaf renewal in boosting.mojo) clamp into these.
+
+    Returns an empty list when `monotone` is empty, since then no node is
+    bounded.
+    """
+    var bounds = List[OutputBounds]()
+    if len(monotone) == 0:
+        return bounds^
+    var n_nodes = len(tree.feature)
+    bounds.resize(n_nodes, OutputBounds.unbounded())
+    # Both growers append children after their parent, so node ids increase
+    # down the tree and one ascending pass propagates every interval.
+    for node in range(n_nodes):
+        if tree.feature[node] < 0:
+            continue
+        var left = tree.left[node]
+        var right = tree.right[node]
+        var children = child_bounds(
+            bounds[node],
+            monotone_sign(monotone, tree.feature[node]),
+            tree.value[left],
+            tree.value[right],
+        )
+        bounds[left] = children.left.copy()
+        bounds[right] = children.right.copy()
+    return bounds^

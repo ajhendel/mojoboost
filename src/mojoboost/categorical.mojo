@@ -46,6 +46,8 @@ Partition search
 - Either way the parent's gain shift uses `lambda_l2`, exactly as LightGBM
   does, so categorical and numerical gains are compared on the same footing
   as they are there.
+- L1 regularization soft-thresholds every gradient sum here exactly as it
+  does in the numerical scan; both go through `gain.mojo`.
 
 Intentional differences from LightGBM
 -------------------------------------
@@ -64,6 +66,7 @@ Intentional differences from LightGBM
 - LightGBM's `kEpsilon` (1e-15) Hessian nudges are omitted.
 """
 
+from .gain import leaf_score
 from .metrics import _argsort
 
 # A 256-bit set covers every bin id representable in the UInt8 binned
@@ -326,9 +329,10 @@ def _onehot_search(
     total_c: Int,
     parent_score: Float64,
     lambda_reg: Float64,
+    lambda_l1: Float64,
     min_child_hess: Float64,
     min_data_in_leaf: Int,
-) -> CatSplit:
+) raises -> CatSplit:
     """One-vs-rest over every category, LightGBM's `use_onehot` branch. The
     single category goes left."""
     var best = CatSplit.none()
@@ -346,8 +350,8 @@ def _onehot_search(
             continue
         var right_g = total_g - left_g
         var gain = (
-            left_g * left_g / (left_h + lambda_reg)
-            + right_g * right_g / (right_h + lambda_reg)
+            leaf_score(left_g, left_h, lambda_l1, lambda_reg)
+            + leaf_score(right_g, right_h, lambda_l1, lambda_reg)
             - parent_score
         )
         if gain > best.gain:
@@ -368,6 +372,7 @@ def _sorted_search(
     total_c: Int,
     parent_score: Float64,
     lambda_reg: Float64,
+    lambda_l1: Float64,
     min_child_hess: Float64,
     min_data_in_leaf: Int,
     cat: CategoricalParams,
@@ -430,8 +435,8 @@ def _sorted_search(
 
             var right_g = total_g - left_g
             var gain = (
-                left_g * left_g / (left_h + l2)
-                + right_g * right_g / (right_h + l2)
+                leaf_score(left_g, left_h, lambda_l1, l2)
+                + leaf_score(right_g, right_h, lambda_l1, l2)
                 - parent_score
             )
             if gain > best.gain:
@@ -454,6 +459,7 @@ def find_best_categorical_split(
     total_h: Float64,
     total_c: Int,
     lambda_reg: Float64,
+    lambda_l1: Float64,
     min_child_hess: Float64,
     min_data_in_leaf: Int,
     cat: CategoricalParams,
@@ -468,7 +474,10 @@ def find_best_categorical_split(
     """
     if n_categories < 2:
         return CatSplit.none()
-    var parent_score = total_g * total_g / (total_h + lambda_reg)
+    # LightGBM computes the parent's gain shift with lambda_l2 even when the
+    # children use the larger cat_l2, so this score is the same one the
+    # numerical scan subtracts.
+    var parent_score = leaf_score(total_g, total_h, lambda_l1, lambda_reg)
     if n_categories <= cat.max_cat_to_onehot:
         return _onehot_search(
             grad,
@@ -481,6 +490,7 @@ def find_best_categorical_split(
             total_c,
             parent_score,
             lambda_reg,
+            lambda_l1,
             min_child_hess,
             min_data_in_leaf,
         )
@@ -495,6 +505,7 @@ def find_best_categorical_split(
         total_c,
         parent_score,
         lambda_reg,
+        lambda_l1,
         min_child_hess,
         min_data_in_leaf,
         cat,

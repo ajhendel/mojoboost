@@ -19,6 +19,7 @@ from .boosting import (
     train_multiclass,
 )
 from .device import CPU_DEVICE, GPU_DEVICE, resolve_device
+from .goss import GossParams
 from .objective import GradHessFn, train_custom
 from .train_gpu import train_gpu
 
@@ -90,24 +91,46 @@ def fit(
     alpha: Float64 = 0.9,
     device: Int = CPU_DEVICE,
     bagging: BaggingParams = BaggingParams.disabled(),
+    goss: GossParams = GossParams.disabled(),
+    use_missing: Bool = True,
 ) raises -> Model:
     """Fit on a column-major raw feature matrix (`features[f * n_rows + r]`).
     `alpha` is the target quantile for QUANTILE and the huber transition
     point for HUBER; other objectives ignore it. `device` is CPU_DEVICE,
     GPU_DEVICE, or AUTO_DEVICE; GPU_DEVICE raises when no accelerator is
     available instead of falling back. `bagging` samples training rows per
-    tree (see bagging.mojo) and draws the same rows on either device."""
+    tree (see bagging.mojo) and draws the same rows on either device; `goss`
+    is the gradient-based alternative (see goss.mojo), likewise identical on
+    either device. `use_missing` is LightGBM's parameter of that name: with
+    it, `NaN` feature values train and predict as missing (see binning.mojo);
+    without it they are binned as 0.0."""
     var backend = resolve_device(device, n_rows, n_features, 1)
-    var mapper = fit_bins(features, n_rows, n_features, max_bins)
+    var mapper = fit_bins(
+        features, n_rows, n_features, max_bins, use_missing=use_missing
+    )
     var data = mapper.transform(features, n_rows)
     var booster: Booster
     if backend == GPU_DEVICE:
         booster = train_gpu(
-            data, target, objective, params, sample_weight, alpha, bagging
+            data,
+            target,
+            objective,
+            params,
+            sample_weight,
+            alpha,
+            bagging,
+            goss,
         )
     else:
         booster = train(
-            data, target, objective, params, sample_weight, alpha, bagging
+            data,
+            target,
+            objective,
+            params,
+            sample_weight,
+            alpha,
+            bagging,
+            goss,
         )
     return Model(mapper^, booster^)
 
@@ -123,17 +146,23 @@ def fit_multiclass(
     sample_weight: List[Float64] = [],
     device: Int = CPU_DEVICE,
     bagging: BaggingParams = BaggingParams.disabled(),
+    goss: GossParams = GossParams.disabled(),
+    use_missing: Bool = True,
 ) raises -> MulticlassModel:
     """Fit a softmax multiclass model on a column-major raw feature matrix
     (`features[f * n_rows + r]`), labels in 0..n_classes-1. Multiclass
     training is CPU-only, so GPU_DEVICE raises and AUTO_DEVICE resolves to
     the CPU. `bagging` draws one bag per round, shared by every class's
-    tree in that round."""
+    tree in that round, and `goss` draws its gradient-based sample on the
+    same once-per-round schedule. `use_missing` carries the same meaning as
+    in `fit`."""
     _ = resolve_device(device, n_rows, n_features, n_classes)
-    var mapper = fit_bins(features, n_rows, n_features, max_bins)
+    var mapper = fit_bins(
+        features, n_rows, n_features, max_bins, use_missing=use_missing
+    )
     var data = mapper.transform(features, n_rows)
     var booster = train_multiclass(
-        data, labels, n_classes, params, sample_weight, bagging
+        data, labels, n_classes, params, sample_weight, bagging, goss
     )
     return MulticlassModel(mapper^, booster^)
 
@@ -148,6 +177,7 @@ def fit_custom[F: GradHessFn](
     max_bins: Int = 255,
     sample_weight: List[Float64] = [],
     base_score: Float64 = 0.0,
+    use_missing: Bool = True,
 ) raises -> Model:
     """Fit a caller-supplied objective on a column-major raw feature matrix
     (`features[f * n_rows + r]`), the `fit` counterpart of `train_custom`
@@ -156,8 +186,10 @@ def fit_custom[F: GradHessFn](
     `Model.predict` returns the raw score for a custom-objective model,
     since the framework does not know the inverse link. CPU only: there is
     no `device` argument, use `train_custom_gpu` on a pre-binned matrix for
-    GPU tree growth."""
-    var mapper = fit_bins(features, n_rows, n_features, max_bins)
+    GPU tree growth. `use_missing` carries the same meaning as in `fit`."""
+    var mapper = fit_bins(
+        features, n_rows, n_features, max_bins, use_missing=use_missing
+    )
     var data = mapper.transform(features, n_rows)
     var booster = train_custom(
         data, target, grad_hess, params, sample_weight, base_score

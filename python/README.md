@@ -27,6 +27,13 @@ proba = clf.predict_proba(X)
 `fit` accepts `sample_weight`. numpy is optional; plain Python sequences
 work without it. Install with the `numpy` extra to pull it in.
 
+Native LightGBM names are canonical (`min_data_in_leaf`, `min_child_hess`,
+`lambda_l1`, `lambda_l2`, `bagging_fraction`, `bagging_freq`, `device`). For
+easy migration from `LGBMRegressor` and `LGBMClassifier`, their scikit-learn
+spellings are accepted too: `min_child_samples`, `min_child_weight`,
+`reg_alpha`, `reg_lambda`, `subsample`, `subsample_freq`, and `device_type`.
+Conflicting values raise instead of silently choosing one.
+
 ## Device selection
 
 ```python

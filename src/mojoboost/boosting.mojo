@@ -33,7 +33,8 @@ from .goss import (
     goss_round,
     goss_select,
 )
-from .tree import Tree, TreeParams, grow_tree
+from .monotone import MonotoneConstraints
+from .tree import Tree, TreeParams, grow_tree, node_bounds
 
 comptime SQUARED_ERROR = 0
 comptime BINARY_LOGISTIC = 1
@@ -321,6 +322,7 @@ def _renew_leaf_values(
     weights: List[Float64],
     alpha: Float64,
     bag: List[Int] = [],
+    monotone: List[Int] = [],
 ) raises:
     """LightGBM's RenewTreeOutput for QUANTILE and L1: replace each leaf's
     Newton value with the alpha-percentile of the residuals
@@ -328,8 +330,13 @@ def _renew_leaf_values(
     shrinkage, which then applies to the renewed value.
 
     A non-empty `bag` renews from bagged rows only, the rows the tree was
-    grown on; LightGBM likewise renews over its bagged partition."""
+    grown on; LightGBM likewise renews over its bagged partition.
+
+    A non-empty `monotone` clamps every renewed value back into its leaf's
+    monotone interval, without which renewal would discard the constraint the
+    tree was grown under (see monotone.mojo)."""
     var n_nodes = len(tree.feature)
+    var bounds = node_bounds(tree, monotone)
     var leaf_residuals = List[List[Float64]]()
     var leaf_weights = List[List[Float64]]()
     for _ in range(n_nodes):
@@ -345,12 +352,16 @@ def _renew_leaf_values(
     for node in range(n_nodes):
         if tree.feature[node] >= 0 or len(leaf_residuals[node]) == 0:
             continue
+        var renewed: Float64
         if len(weights) > 0:
-            tree.value[node] = _weighted_percentile(
+            renewed = _weighted_percentile(
                 leaf_residuals[node], leaf_weights[node], alpha
             )
         else:
-            tree.value[node] = _percentile(leaf_residuals[node], alpha)
+            renewed = _percentile(leaf_residuals[node], alpha)
+        if len(bounds) > 0:
+            renewed = bounds[node].clamp(renewed)
+        tree.value[node] = renewed
 
 
 @fieldwise_init
@@ -364,12 +375,35 @@ struct BoosterParams(Copyable, Movable):
         return BoosterParams(100, 0.1, TreeParams.default())
 
 
-@fieldwise_init
 struct Booster(Copyable, Movable):
+    """A fitted single-output ensemble.
+
+    `monotone` records the monotonic constraints the ensemble was trained
+    under. Unlike the other training-time restrictions it is kept with the
+    model and serialized, because it is a property the fitted model satisfies
+    rather than only a knob that shaped it: predictions are monotone in those
+    features, and a consumer cannot recover that claim from the trees.
+    """
+
     var trees: List[Tree]
     var base_score: Float64
     var learning_rate: Float64
     var objective: Int
+    var monotone: MonotoneConstraints
+
+    def __init__(
+        out self,
+        var trees: List[Tree],
+        base_score: Float64,
+        learning_rate: Float64,
+        objective: Int,
+        var monotone: MonotoneConstraints = MonotoneConstraints(),
+    ):
+        self.trees = trees^
+        self.base_score = base_score
+        self.learning_rate = learning_rate
+        self.objective = objective
+        self.monotone = monotone^
 
     def predict_raw_row(self, data: BinnedMatrix, row: Int) -> Float64:
         """Raw ensemble output (log-odds for BINARY_LOGISTIC)."""
@@ -432,6 +466,7 @@ def train(
     _check_sample_weight(sample_weight, data.n_rows)
     check_bagging(bagging)
     _check_goss(goss, bagging)
+    params.tree.monotone.check_features(data.n_features)
 
     var n = data.n_rows
     var base_score = _base_score(target, objective, sample_weight, alpha)
@@ -439,6 +474,7 @@ def train(
     for _ in range(n):
         raw.append(base_score)
 
+    var signs = params.tree.monotone.active_signs()
     var trees = List[Tree]()
     var grad = List[Float64](capacity=n)
     var hess = List[Float64](capacity=n)
@@ -452,11 +488,11 @@ def train(
         var tree = grow_tree(data, grad, hess, params.tree, bag, i)
         if objective == QUANTILE:
             _renew_leaf_values(
-                tree, data, target, raw, sample_weight, alpha, bag
+                tree, data, target, raw, sample_weight, alpha, bag, signs
             )
         elif objective == L1:
             _renew_leaf_values(
-                tree, data, target, raw, sample_weight, 0.5, bag
+                tree, data, target, raw, sample_weight, 0.5, bag, signs
             )
 
         # A single-leaf tree with a near-zero value means the objective has
@@ -473,7 +509,13 @@ def train(
             raw[r] += params.learning_rate * tree.predict_row(data, r)
         trees.append(tree^)
 
-    return Booster(trees^, base_score, params.learning_rate, objective)
+    return Booster(
+        trees^,
+        base_score,
+        params.learning_rate,
+        objective,
+        params.tree.monotone.copy(),
+    )
 
 
 def train_with_valid(
@@ -511,6 +553,7 @@ def train_with_valid(
     _check_sample_weight(sample_weight, data.n_rows)
     check_bagging(bagging)
     _check_goss(goss, bagging)
+    params.tree.monotone.check_features(data.n_features)
 
     var n = data.n_rows
     var base_score = _base_score(target, objective, sample_weight, alpha)
@@ -521,6 +564,7 @@ def train_with_valid(
     for _ in range(valid_data.n_rows):
         valid_raw.append(base_score)
 
+    var signs = params.tree.monotone.active_signs()
     var trees = List[Tree]()
     var grad = List[Float64](capacity=n)
     var hess = List[Float64](capacity=n)
@@ -536,11 +580,11 @@ def train_with_valid(
         var tree = grow_tree(data, grad, hess, params.tree, bag, i)
         if objective == QUANTILE:
             _renew_leaf_values(
-                tree, data, target, raw, sample_weight, alpha, bag
+                tree, data, target, raw, sample_weight, alpha, bag, signs
             )
         elif objective == L1:
             _renew_leaf_values(
-                tree, data, target, raw, sample_weight, 0.5, bag
+                tree, data, target, raw, sample_weight, 0.5, bag, signs
             )
         # Under bagging or GOSS a degenerate tree indicts the sample, not
         # the run.
@@ -566,7 +610,13 @@ def train_with_valid(
 
     while len(trees) > best_n_trees:
         _ = trees.pop()
-    return Booster(trees^, base_score, params.learning_rate, objective)
+    return Booster(
+        trees^,
+        base_score,
+        params.learning_rate,
+        objective,
+        params.tree.monotone.copy(),
+    )
 
 
 def _multiclass_mean_loss(
@@ -601,15 +651,87 @@ def _softmax_inplace(mut scores: List[Float64], start: Int, k: Int):
         scores[start + i] /= total
 
 
-@fieldwise_init
+def _fill_softmax_grad_hess(
+    prob: List[Float64],
+    labels: List[Int],
+    k: Int,
+    n_classes: Int,
+    weights: List[Float64],
+    mut grad: List[Float64],
+    mut hess: List[Float64],
+):
+    """One-vs-rest gradients and hessians for class `k` from row-major
+    softmax probabilities."""
+    grad.clear()
+    hess.clear()
+    for r in range(len(labels)):
+        var p = prob[r * n_classes + k]
+        var y = 1.0 if labels[r] == k else 0.0
+        var w = weights[r] if len(weights) > 0 else 1.0
+        grad.append(w * (p - y))
+        # LightGBM/XGBoost softmax hessian: 2 * p * (1 - p), floored.
+        var h = 2.0 * p * (1.0 - p)
+        if h < 1e-16:
+            h = 1e-16
+        hess.append(w * h)
+
+
+def _multiclass_goss_select(
+    prob: List[Float64],
+    labels: List[Int],
+    n_classes: Int,
+    weights: List[Float64],
+    goss: GossParams,
+    round: Int,
+) raises -> GossSelection:
+    """One row sample for a whole multiclass round. LightGBM sums the
+    per-row `|grad * hess|` over the round's trees before sampling, so every
+    class's tree is grown on the same rows and their leaf counts stay
+    comparable."""
+    var n = len(labels)
+    var importance = List[Float64](capacity=n)
+    for _ in range(n):
+        importance.append(0.0)
+    var grad = List[Float64](capacity=n)
+    var hess = List[Float64](capacity=n)
+    for k in range(n_classes):
+        _fill_softmax_grad_hess(
+            prob, labels, k, n_classes, weights, grad, hess
+        )
+        for r in range(n):
+            importance[r] += abs(grad[r] * hess[r])
+    return goss_select(importance, goss, round)
+
+
 struct MulticlassBooster(Copyable, Movable):
     """Softmax ensemble: one tree per class per round, round-major, so the
-    tree for (round i, class k) is trees[i * n_classes + k]."""
+    tree for (round i, class k) is trees[i * n_classes + k].
+
+    `monotone` records the monotonic constraints every per-class tree was
+    grown under, which makes each class's raw score monotone in the
+    constrained features. Softmax probabilities are not guaranteed monotone;
+    see monotone.mojo for the policy.
+    """
 
     var trees: List[Tree]
     var base_scores: List[Float64]
     var n_classes: Int
     var learning_rate: Float64
+    var monotone: MonotoneConstraints
+
+    def __init__(
+        out self,
+        var trees: List[Tree],
+        var base_scores: List[Float64],
+        n_classes: Int,
+        learning_rate: Float64,
+        var monotone: MonotoneConstraints = MonotoneConstraints(),
+    ):
+        self.trees = trees^
+        self.base_scores = base_scores^
+        self.n_classes = n_classes
+        self.learning_rate = learning_rate
+        self.monotone = monotone^
 
     def predict_raw_bins(self, bins: List[Int]) -> List[Float64]:
         var raw = List[Float64](capacity=self.n_classes)
@@ -636,18 +758,23 @@ def train_multiclass(
     params: BoosterParams,
     sample_weight: List[Float64] = [],
     bagging: BaggingParams = BaggingParams.disabled(),
+    goss: GossParams = GossParams.disabled(),
 ) raises -> MulticlassBooster:
     """Train a softmax multiclass ensemble on labels in 0..n_classes-1.
     A non-empty sample_weight scales each row's gradient and hessian and
     weights the class priors; a row with weight zero is ignored. `bagging`
     draws one bag per round and every class's tree in that round is grown
-    on it, so the per-class trees stay comparable."""
+    on it, so the per-class trees stay comparable. `goss` samples the round's
+    rows by summed per-class gradient magnitude instead (see goss.mojo), one
+    sample per round for the same reason."""
     if len(labels) != data.n_rows:
         raise Error("labels length must equal n_rows")
     if n_classes < 2:
         raise Error("n_classes must be at least 2")
     _check_sample_weight(sample_weight, data.n_rows)
     check_bagging(bagging)
+    _check_goss(goss, bagging)
+    params.tree.monotone.check_features(data.n_features)
     var n = data.n_rows
 
     # Base scores are log priors (weighted when sample_weight is given).
@@ -687,20 +814,21 @@ def train_multiclass(
                 prob[r * n_classes + k] = raw[r * n_classes + k]
             _softmax_inplace(prob, r * n_classes, n_classes)
 
+        # One shared sample for the whole round, drawn before any class's
+        # tree so that every class is grown on the same rows.
+        var selection = GossSelection.all_rows()
+        if goss.active(i, params.learning_rate):
+            selection = _multiclass_goss_select(
+                prob, labels, n_classes, sample_weight, goss, i
+            )
+            bag = selection.rows.copy()
+
         var made_progress = False
         for k in range(n_classes):
-            grad.clear()
-            hess.clear()
-            for r in range(n):
-                var p = prob[r * n_classes + k]
-                var y = 1.0 if labels[r] == k else 0.0
-                var w = sample_weight[r] if len(sample_weight) > 0 else 1.0
-                grad.append(w * (p - y))
-                # LightGBM/XGBoost softmax hessian: 2 * p * (1 - p), floored.
-                var h = 2.0 * p * (1.0 - p)
-                if h < 1e-16:
-                    h = 1e-16
-                hess.append(w * h)
+            _fill_softmax_grad_hess(
+                prob, labels, k, n_classes, sample_weight, grad, hess
+            )
+            apply_goss_scaling(selection, grad, hess)
             # Feature subsampling draws once per tree, so each class's tree
             # in a round gets its own feature set.
             var tree = grow_tree(
@@ -714,17 +842,22 @@ def train_multiclass(
                 )
             trees.append(tree^)
 
-        # No class made progress: with bagging that is a statement about
-        # this bag, so the round is dropped and the next bag gets its turn.
+        # No class made progress: with bagging or GOSS that is a statement
+        # about this sample, so the round is dropped and the next sample
+        # gets its turn.
         if not made_progress:
             for _ in range(n_classes):
                 _ = trees.pop()
-            if bagging_enabled(bagging):
+            if bagging_enabled(bagging) or goss.enabled:
                 continue
             break
 
     return MulticlassBooster(
-        trees^, base_scores^, n_classes, params.learning_rate
+        trees^,
+        base_scores^,
+        n_classes,
+        params.learning_rate,
+        params.tree.monotone.copy(),
     )
 
 
@@ -739,6 +872,7 @@ def train_multiclass_with_valid(
     min_delta: Float64 = 0.0,
     sample_weight: List[Float64] = [],
     bagging: BaggingParams = BaggingParams.disabled(),
+    goss: GossParams = GossParams.disabled(),
 ) raises -> MulticlassBooster:
     """Train a softmax multiclass ensemble with validation-set early
     stopping. Stops when the validation multiclass log loss has not
@@ -746,7 +880,8 @@ def train_multiclass_with_valid(
     rounds and truncates the ensemble to its best round (a round is one
     tree per class). sample_weight applies to training rows only; the
     validation loss is unweighted. `bagging` samples training rows per
-    round; validation rows are never bagged."""
+    round; validation rows are never bagged. `goss` is the gradient-based
+    alternative sampler (see goss.mojo), also drawn once per round."""
     if len(labels) != data.n_rows:
         raise Error("labels length must equal n_rows")
     if len(valid_labels) != valid_data.n_rows:
@@ -759,6 +894,8 @@ def train_multiclass_with_valid(
         raise Error("early_stopping_rounds must be positive")
     _check_sample_weight(sample_weight, data.n_rows)
     check_bagging(bagging)
+    _check_goss(goss, bagging)
+    params.tree.monotone.check_features(data.n_features)
     var n = data.n_rows
     var n_valid = valid_data.n_rows
 
@@ -810,19 +947,21 @@ def train_multiclass_with_valid(
                 prob[r * n_classes + k] = raw[r * n_classes + k]
             _softmax_inplace(prob, r * n_classes, n_classes)
 
+        # One shared sample for the whole round, drawn before any class's
+        # tree so that every class is grown on the same rows.
+        var selection = GossSelection.all_rows()
+        if goss.active(i, params.learning_rate):
+            selection = _multiclass_goss_select(
+                prob, labels, n_classes, sample_weight, goss, i
+            )
+            bag = selection.rows.copy()
+
         var made_progress = False
         for k in range(n_classes):
-            grad.clear()
-            hess.clear()
-            for r in range(n):
-                var p = prob[r * n_classes + k]
-                var y = 1.0 if labels[r] == k else 0.0
-                var w = sample_weight[r] if len(sample_weight) > 0 else 1.0
-                grad.append(w * (p - y))
-                var h = 2.0 * p * (1.0 - p)
-                if h < 1e-16:
-                    h = 1e-16
-                hess.append(w * h)
+            _fill_softmax_grad_hess(
+                prob, labels, k, n_classes, sample_weight, grad, hess
+            )
+            apply_goss_scaling(selection, grad, hess)
             # Feature subsampling draws once per tree, so each class's tree
             # in a round gets its own feature set.
             var tree = grow_tree(
@@ -841,12 +980,12 @@ def train_multiclass_with_valid(
             trees.append(tree^)
 
         # Popped trees are all single-leaf with value ~0, so the score
-        # updates above were no-ops. Under bagging the next bag still gets
-        # its turn.
+        # updates above were no-ops. Under bagging or GOSS the next sample
+        # still gets its turn.
         if not made_progress:
             for _ in range(n_classes):
                 _ = trees.pop()
-            if bagging_enabled(bagging):
+            if bagging_enabled(bagging) or goss.enabled:
                 continue
             break
         n_rounds += 1
@@ -861,5 +1000,9 @@ def train_multiclass_with_valid(
     while len(trees) > best_n_rounds * n_classes:
         _ = trees.pop()
     return MulticlassBooster(
-        trees^, base_scores^, n_classes, params.learning_rate
+        trees^,
+        base_scores^,
+        n_classes,
+        params.learning_rate,
+        params.tree.monotone.copy(),
     )

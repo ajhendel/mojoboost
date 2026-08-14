@@ -15,9 +15,33 @@ from .histogram import (
     build_histogram_subset,
     subtract_histogram,
 )
+from .goss import (
+    GossParams,
+    GossSelection,
+    apply_goss_scaling,
+    goss_importance,
+    goss_round,
+    goss_select,
+)
 from .interaction import InteractionConstraints, extend_branch
+from .monotone import (
+    MONOTONE_DECREASING,
+    MONOTONE_FREE,
+    MONOTONE_INCREASING,
+    MonotoneConstraints,
+    OutputBounds,
+)
+from .sampling import (
+    DEFAULT_FEATURE_FRACTION_SEED,
+    check_feature_fraction,
+    check_feature_fractions,
+    sample_without_replacement,
+    select_node_features,
+    select_tree_features,
+    selection_count,
+)
 from .split import SplitInfo, find_best_split, soft_threshold_l1
-from .tree import Tree, TreeParams, grow_tree
+from .tree import Tree, TreeParams, grow_tree, node_bounds
 from .boosting import (
     BINARY_LOGISTIC,
     CUSTOM,
@@ -70,6 +94,28 @@ from .metrics import (
     rmse,
 )
 from .model import Model, MulticlassModel, fit, fit_custom, fit_multiclass
+from .ranking import (
+    DEFAULT_NDCG_EVAL_AT,
+    DEFAULT_SIGMOID,
+    DEFAULT_TRUNCATION_LEVEL,
+    LAMBDARANK,
+    MAX_RELEVANCE_LABEL,
+    RankGroups,
+    RankerParams,
+    check_groups,
+    check_labels,
+    check_ranker_params,
+    fit_ranker,
+    groups_from_counts,
+    groups_from_query_ids,
+    label_gain,
+    lambdarank_gradients,
+    max_dcg,
+    ndcg,
+    ndcg_at_cutoffs,
+    train_ranker,
+    train_ranker_with_valid,
+)
 from .serialize import (
     load_model,
     load_multiclass_model,

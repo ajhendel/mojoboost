@@ -115,8 +115,9 @@ struct HistogramTiling(Copyable, Movable):
     var n_tiles: Int
     var rows_per_tile: Int
     var partial_cells: Int
-    """`n_tiles * n_features * n_bins`, the size of each partial buffer.
-    Zero when the resolved strategy needs no partial buffer."""
+    """`n_tiles * n_features * n_bins`: one (tile, feature, bin) cell, which
+    carries all three Int32 planes, so the buffer holds `3 * partial_cells`
+    Int32. Zero when the resolved strategy needs no partial buffer."""
 
 
 def _attribute_or(
@@ -190,6 +191,7 @@ def derive_tiling(
     n_features: Int,
     n_bins: Int,
     requested_strategy: Int = STRATEGY_AUTO,
+    max_partial_cells: Int = 0,
 ) raises -> HistogramTiling:
     """Resolve the launch geometry for one (rows, features, bins) shape.
 
@@ -198,8 +200,13 @@ def derive_tiling(
     Row tiles per feature come from three bounds, whichever is tightest:
     enough threadgroups to fill the device (`TARGET_BLOCKS_PER_SM` per
     multiprocessor, spread across the features already in `grid.x`), enough
-    rows per tile to amortize the partial histogram, and the memory budget
-    for the partial buffer.
+    rows per tile to amortize the partial histogram, and the memory the
+    partial buffer may use.
+
+    `max_partial_cells` caps that last bound at an already allocated buffer
+    instead of at `PARTIAL_BUDGET_BYTES`. Feature subsampling re-derives the
+    tiling for a narrower `grid.x` without reallocating, so it passes the
+    capacity it has.
     """
     if n_rows < 1 or n_features < 1 or n_bins < 1:
         raise Error("tiling needs positive rows, features, and bins")
@@ -232,9 +239,13 @@ def derive_tiling(
         wanted = tiles_by_rows
 
     var hist_cells = n_features * n_bins
-    var tiles_by_memory = PARTIAL_BUDGET_BYTES // (
-        hist_cells * BYTES_PER_PARTIAL_CELL
-    )
+    var tiles_by_memory: Int
+    if max_partial_cells > 0:
+        tiles_by_memory = max_partial_cells // hist_cells
+    else:
+        tiles_by_memory = PARTIAL_BUDGET_BYTES // (
+            hist_cells * BYTES_PER_PARTIAL_CELL
+        )
     if tiles_by_memory < 1:
         tiles_by_memory = 1
     if tiles_by_memory > MAX_GRID_DIM_Y:
@@ -257,14 +268,17 @@ def derive_tiling(
     n_tiles = _ceil_div(n_rows, rows_per_tile)
 
     if strategy == STRATEGY_AUTO:
-        # The tiled path is preferred; it drops global atomics and the
-        # output memset. Fall back to atomics only when the memory budget
-        # cannot buy any of the parallelism the device asked for, which is
-        # where the partial buffer costs memory without buying occupancy.
-        if tiles_by_memory < wanted and tiles_by_memory <= 1:
-            strategy = STRATEGY_ATOMIC
-        else:
+        # More than one tile per feature is exactly the case the tiled path
+        # exists for: partials that would otherwise contend on the same
+        # output bins reduce without atomics. At one tile there is nothing
+        # to reduce, the partial buffer is the same size as the output, and
+        # the second kernel launch buys nothing, so the preserved atomic
+        # path is the better default. That also covers a histogram too wide
+        # for the partial budget, which is clamped to one tile above.
+        if n_tiles > 1:
             strategy = STRATEGY_TILED
+        else:
+            strategy = STRATEGY_ATOMIC
 
     var partial_cells = 0
     if strategy == STRATEGY_TILED:

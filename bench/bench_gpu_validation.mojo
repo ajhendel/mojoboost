@@ -6,41 +6,50 @@ CUDA, and HIP. It measures nothing vendor-specific and takes no vendor
 branch; the whole point is that one source runs everywhere and the numbers
 are read side by side afterwards.
 
+Where `bench_histogram.mojo` times the histogram kernel in isolation, this
+driver covers a whole training session and reports the device and geometry
+facts a validation record has to carry with its numbers.
+
 What it prints, per run
 
 - device identity (`name`, `api`, `arch_name`, `compute_capability`) and the
-  capability attributes the launch geometry depends on. Attributes a backend
-  does not implement print as `unavailable` rather than failing the run.
+  capability attributes the tiling policy reads. Attributes a backend does
+  not implement print as `unavailable` rather than failing the run, and which
+  ones those are is itself a result worth recording.
 
 What it prints, per dataset shape
 
-- the launch geometry the histogram kernel will actually use, and the derived
-  occupancy, shared-memory, and atomic-traffic quantities a profiler trace
-  should be checked against (see docs/GPU_VALIDATION.md)
-- wall-clock phases, measured through the public `GpuHistogramBuilder` API:
+- the launch geometry `gpu_tiling.mojo` resolved for that shape, and the
+  occupancy, shared-memory, and atomic-traffic quantities derived from it,
+  each one a prediction a profiler trace should confirm or refute (see
+  docs/GPU_VALIDATION.md for which counter tests which line)
+- separated wall-clock phases, using the builder's own phase methods so
+  transfers, kernels, and host conversion are timed apart rather than
+  estimated:
 
-  | phase          | what it covers                                       |
-  |----------------|------------------------------------------------------|
-  | `binning`      | host-side quantile binning (no device involvement)    |
-  | `setup`        | context creation, device allocation, binned-matrix H2D|
-  | `grad_h2d`     | one round of gradient/hessian upload                  |
-  | `partition`    | one `apply_split` kernel, synchronized, no transfer   |
-  | `node_hist`    | one `build_leaf`: memset + kernel + histogram D2H     |
-  | `d2h_probe`    | a same-size device-to-host map, for scale on the above|
-  | `gpu_train`    | complete `train_gpu`, uninstrumented                  |
-  | `cpu_train`    | complete `train`, for the same shape and parameters   |
+  | phase        | what it covers                                        |
+  |--------------|-------------------------------------------------------|
+  | `binning`    | host-side quantile binning, no device involvement      |
+  | `setup`      | context, capability query, allocation, binned-matrix H2D|
+  | `stage`      | Float64 to Float32 gradient conversion, host only      |
+  | `grad_h2d`   | staged gradients and hessians copied to the device     |
+  | `hist_kernel`| `enqueue_leaf` plus synchronize: kernels, no transfer  |
+  | `hist_d2h`   | fixed-point histogram copied back to the host          |
+  | `hist_decode`| fixed-point to Float64 conversion, host only           |
+  | `partition`  | one `apply_split` plus synchronize: kernel, no transfer|
+  | `gpu_train`  | complete `train_gpu`, uninstrumented                   |
+  | `cpu_train`  | complete `train`, same shape and parameters            |
 
-`node_hist` fuses kernel and download because the builder's public API does;
-`d2h_probe` measures an identical-size map on the same context so the
-transfer share of `node_hist` has a measured scale next to it. This is a
-host-visible wall-clock decomposition and nothing more. The authoritative
-kernel-versus-transfer split comes from the vendor profiler (Nsight Compute,
-rocprof), and docs/GPU_VALIDATION.md gives those commands.
+Every phase above is measured directly. Nothing is derived by subtraction.
+The one thing the harness cannot see is where time goes *inside* a kernel,
+which is what the vendor profiler is for.
 
-Both trainers report training loss, so throughput is never read apart from
-fit quality. CPU-side threading honors MOJOBOOST_NUM_WORKERS and
+Both trainers report training MSE, so throughput is never read apart from fit
+quality. CPU-side threading honors MOJOBOOST_NUM_WORKERS and
 MOJOBOOST_PARALLEL_MIN_OPS (see parallel.mojo); pin them for reproducible
-comparisons.
+comparisons. MOJOBOOST_GPU_HIST_STRATEGY, MOJOBOOST_GPU_ROW_TILE, and
+MOJOBOOST_GPU_BLOCK_THREADS override the tiling policy, so a sweep needs no
+rebuild.
 
 Usage:
     mojo run -I src bench/bench_gpu_validation.mojo [rounds] [rows features]...
@@ -63,12 +72,8 @@ from mojoboost.boosting import (
     train,
 )
 from mojoboost.binning import BinnedMatrix
-from mojoboost.histogram_gpu import (
-    BLOCK_THREADS,
-    MAX_BINS,
-    ROWS_PER_CHUNK,
-    GpuHistogramBuilder,
-)
+from mojoboost.gpu_tiling import STRATEGY_TILED, strategy_name
+from mojoboost.histogram_gpu import MAX_BINS, GpuHistogramBuilder
 from mojoboost.train_gpu import train_gpu
 from mojoboost.tree import TreeParams
 
@@ -80,6 +85,11 @@ comptime BENCH_BINS = 255
 # finishes on a laptop-class device, high enough that per-round costs
 # dominate one-time setup.
 comptime DEFAULT_ROUNDS = 20
+
+# Bytes of shared memory the histogram kernels reserve per threadgroup: three
+# MAX_BINS-long Int32 planes, sized by the compile-time maximum rather than
+# the dataset's bin count.
+comptime SHARED_BYTES_RESERVED = 3 * MAX_BINS * 4
 
 
 def _splitmix64(state: UInt64) -> UInt64:
@@ -166,72 +176,72 @@ def _report_device(ctx: DeviceContext) raises:
             DeviceAttribute.MAX_REGISTERS_PER_BLOCK,
         )
     )
-    print(_attribute_line(ctx, "max_grid_dim_x", DeviceAttribute.MAX_GRID_DIM_X))
-    print(_attribute_line(ctx, "max_grid_dim_y", DeviceAttribute.MAX_GRID_DIM_Y))
+    print(
+        _attribute_line(ctx, "max_grid_dim_x", DeviceAttribute.MAX_GRID_DIM_X)
+    )
+    print(
+        _attribute_line(ctx, "max_grid_dim_y", DeviceAttribute.MAX_GRID_DIM_Y)
+    )
     print(_attribute_line(ctx, "clock_rate_khz", DeviceAttribute.CLOCK_RATE))
 
 
-def _report_geometry(
-    ctx: DeviceContext, n_rows: Int, n_features: Int, n_bins: Int
-) raises:
-    """Print the histogram launch geometry and the occupancy, shared-memory,
-    and atomic-traffic quantities derived from it. These are predictions from
-    host-side arithmetic; docs/GPU_VALIDATION.md pairs each with the profiler
-    counter that confirms or refutes it on real hardware."""
-    var n_chunks = (n_rows + ROWS_PER_CHUNK - 1) // ROWS_PER_CHUNK
-    if n_chunks < 1:
-        n_chunks = 1
-    var blocks = n_features * n_chunks
+def _report_geometry(builder: GpuHistogramBuilder) raises:
+    """Print the resolved launch geometry and the occupancy, shared-memory,
+    and atomic-traffic quantities that follow from it.
 
-    # The kernel's shared arrays are MAX_BINS long regardless of the dataset's
-    # bin count, so a 32-bin dataset reserves exactly as much shared memory as
-    # a 256-bin one. That gap is the first thing to check against the
-    # profiler's static shared-memory figure.
-    var shared_reserved = 3 * MAX_BINS * 4
-    var shared_used = 3 * n_bins * 4
+    These are read off the builder, not recomputed, so they are the geometry
+    the kernels will actually launch with. They are still host-side
+    predictions about the device's behavior; docs/GPU_VALIDATION.md pairs
+    each with the profiler counter that confirms it on real hardware."""
+    var tiling = builder.tiling.copy()
+    var caps = builder.caps.copy()
+    var blocks = builder.n_features * tiling.n_tiles
 
-    print("  grid_dim:", n_features, "x", n_chunks)
-    print("  block_dim:", BLOCK_THREADS)
+    print("  strategy:", strategy_name(tiling.strategy))
+    print("  grid_dim:", builder.n_features, "x", tiling.n_tiles)
+    print("  block_dim:", tiling.block_threads)
     print("  blocks_per_hist_launch:", blocks)
-    print("  rows_per_chunk:", ROWS_PER_CHUNK)
-    print("  shared_bytes_reserved_per_block:", shared_reserved)
-    print("  shared_bytes_used_per_block:", shared_used)
+    print("  rows_per_tile:", tiling.rows_per_tile)
+    print("  partial_cells:", tiling.partial_cells)
+    print("  caps_multiprocessor_count:", caps.sm_count)
+    print("  caps_max_threads_per_block:", caps.max_threads_per_block)
+    print(
+        "  caps_max_shared_memory_per_block:",
+        caps.max_shared_memory_per_block,
+    )
 
-    try:
-        var sm = ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
-        if sm > 0:
-            print(
-                "  blocks_per_sm_at_launch:",
-                Float64(blocks) / Float64(sm),
-            )
-    except:
-        print("  blocks_per_sm_at_launch: unavailable")
-
-    try:
-        var smem = ctx.get_attribute(
-            DeviceAttribute.MAX_SHARED_MEMORY_PER_BLOCK
+    # The kernels reserve three MAX_BINS-long planes regardless of the
+    # dataset's bin count, so a 64-bin dataset reserves exactly as much
+    # shared memory as a 256-bin one. That gap is the first thing to check
+    # against the profiler's static shared-memory figure.
+    print("  shared_bytes_reserved_per_block:", SHARED_BYTES_RESERVED)
+    print("  shared_bytes_used_per_block:", 3 * builder.n_bins * 4)
+    if caps.max_shared_memory_per_block > 0:
+        print(
+            "  shared_memory_resident_block_limit:",
+            caps.max_shared_memory_per_block // SHARED_BYTES_RESERVED,
         )
-        if smem > 0:
-            print(
-                "  shared_memory_resident_block_limit:",
-                smem // shared_reserved,
-            )
-    except:
-        print("  shared_memory_resident_block_limit: unavailable")
+    if caps.sm_count > 0:
+        print(
+            "  blocks_per_sm_at_launch:",
+            Float64(blocks) / Float64(caps.sm_count),
+        )
 
-    # Atomic traffic. Every in-range row issues three shared-memory atomics;
-    # every block flushes at most n_bins bins as three global atomics each.
-    # `threads_per_bin` is the contention proxy: with more threads than bins,
-    # concurrent updates to one bin serialize, and that ratio is what a
-    # bin-count or privatization change moves.
-    var rows_in_chunk = ROWS_PER_CHUNK
-    if n_rows < rows_in_chunk:
-        rows_in_chunk = n_rows
-    print("  shared_atomics_per_block_upper:", 3 * rows_in_chunk)
-    print("  global_atomics_per_launch_upper:", 3 * blocks * n_bins)
+    # Atomic traffic. Every in-range row issues three shared-memory atomics.
+    # The tiled strategy writes partials to their own slots and reduces them
+    # in a second kernel, so it issues no global atomics at all; the atomic
+    # strategy folds every block's partial into the output.
+    var rows_in_tile = tiling.rows_per_tile
+    if builder.n_rows < rows_in_tile:
+        rows_in_tile = builder.n_rows
+    print("  shared_atomics_per_block_upper:", 3 * rows_in_tile)
+    var global_atomics = 0
+    if tiling.strategy != STRATEGY_TILED:
+        global_atomics = 3 * blocks * builder.n_bins
+    print("  global_atomics_per_launch_upper:", global_atomics)
     print(
         "  threads_per_bin_contention_proxy:",
-        Float64(BLOCK_THREADS) / Float64(n_bins),
+        Float64(tiling.block_threads) / Float64(builder.n_bins),
     )
 
 
@@ -254,31 +264,6 @@ def _make_dataset(
     return features^
 
 
-def _time_d2h_probe(mut builder: GpuHistogramBuilder) raises -> Float64:
-    """Map a histogram-sized device buffer to the host and read every entry.
-
-    Deliberately the same size and the same access shape as `build_leaf`'s
-    download, on the same context, so it gives the transfer term in
-    `node_hist` a measured scale. It is a comparable quantity, not a
-    subtraction: the profiler is what separates kernel from copy exactly."""
-    var hist_size = builder.n_features * builder.n_bins
-    var probe = builder.ctx.enqueue_create_buffer[DType.int32](3 * hist_size)
-    builder.ctx.enqueue_memset(probe, 0)
-    builder.ctx.synchronize()
-
-    var t0 = perf_counter_ns()
-    var checksum = 0
-    with probe.map_to_host() as host:
-        var src = host.unsafe_ptr()
-        for i in range(3 * hist_size):
-            checksum += Int(src.unsafe_load(i))
-    var t1 = perf_counter_ns()
-    # Keep the read from being optimized away without printing noise.
-    if checksum != 0:
-        print("  d2h_probe_checksum_unexpected:", checksum)
-    return _seconds(t0, t1)
-
-
 def _run_shape(n_rows: Int, n_features: Int, rounds: Int) raises:
     print("")
     print("== shape:", n_rows, "rows x", n_features, "features ==")
@@ -294,76 +279,90 @@ def _run_shape(n_rows: Int, n_features: Int, rounds: Int) raises:
     print("  rounds:", rounds)
     print("  binning_s:", _seconds(t0, t1))
 
-    var ctx = DeviceContext()
-    _report_geometry(ctx, n_rows, n_features, data.n_bins)
-
-    # Phase: setup. Context creation, every device allocation, and the
-    # one-time binned-matrix upload, all inside the constructor.
+    # Phase: setup. Context creation, the capability query, the tiling
+    # decision, every device allocation, and the one-time binned-matrix
+    # upload, all inside the constructor.
     var t2 = perf_counter_ns()
     var builder = GpuHistogramBuilder(data)
-    builder.ctx.synchronize()
+    builder.synchronize()
     var t3 = perf_counter_ns()
     print("  setup_s:", _seconds(t2, t3))
 
-    # Phase: gradient upload. One round's worth, the recurring H2D cost.
+    _report_geometry(builder)
+
     var grad = List[Float64](capacity=n_rows)
     var hess = List[Float64](capacity=n_rows)
     for r in range(n_rows):
         grad.append(target[r] - 1.0)
         hess.append(1.0)
+
+    # Phase: staging, then the transfer. Split because the first is a host
+    # Float64-to-Float32 pass and the second is the actual copy; on a
+    # discrete GPU they scale with different things.
     var t4 = perf_counter_ns()
-    builder.upload_gradients(grad, hess)
-    builder.ctx.synchronize()
+    builder.stage_gradients(grad, hess)
     var t5 = perf_counter_ns()
-    print("  grad_h2d_s:", _seconds(t4, t5))
+    builder.upload_staged()
+    builder.synchronize()
+    var t6 = perf_counter_ns()
+    print("  stage_s:", _seconds(t4, t5))
+    print("  grad_h2d_s:", _seconds(t5, t6))
 
     builder.begin_tree()
-    builder.ctx.synchronize()
+    builder.synchronize()
 
-    # Phase: one root histogram. Memset, kernel, and download fused, which is
-    # what the public API exposes and what a boosting round actually pays.
-    var t6 = perf_counter_ns()
-    var root = builder.build_leaf(0)
+    # Phase: the root histogram, split three ways. Kernels, transfer back,
+    # and host-side decode are each measured on their own.
     var t7 = perf_counter_ns()
-    print("  node_hist_root_s:", _seconds(t6, t7))
-    print("  node_hist_root_bins:", root.n_features * root.n_bins)
-
-    # Phase: one partition kernel, synchronized. No transfer in this one, so
-    # it is the cleanest host-visible kernel time the harness can produce.
+    builder.enqueue_leaf(0)
+    builder.synchronize()
     var t8 = perf_counter_ns()
-    builder.apply_split(0, data.n_bins // 2, 0, 1, 2)
-    builder.ctx.synchronize()
+    builder.download_raw()
     var t9 = perf_counter_ns()
-    print("  partition_kernel_s:", _seconds(t8, t9))
-
-    # Phase: one child histogram, after a real split, so the leaf filter
-    # rejects roughly half the rows the way it does mid-tree.
+    var root = builder.histogram_from_host()
     var t10 = perf_counter_ns()
-    var child = builder.build_leaf(1)
+    print("  hist_kernel_root_s:", _seconds(t7, t8))
+    print("  hist_d2h_s:", _seconds(t8, t9))
+    print("  hist_decode_s:", _seconds(t9, t10))
+    print("  hist_cells:", root.n_features * root.n_bins)
+
+    # Phase: one partition kernel, synchronized. No transfer at all, so it is
+    # the cleanest kernel time the harness can produce.
     var t11 = perf_counter_ns()
-    print("  node_hist_child_s:", _seconds(t10, t11))
+    builder.apply_split(0, data.n_bins // 2, 0, 1, 2)
+    builder.synchronize()
+    var t12 = perf_counter_ns()
+    print("  partition_kernel_s:", _seconds(t11, t12))
+
+    # A child histogram after a real split, where the leaf filter rejects
+    # roughly half the rows the way it does mid-tree.
+    var t13 = perf_counter_ns()
+    builder.enqueue_leaf(1)
+    builder.synchronize()
+    var t14 = perf_counter_ns()
+    print("  hist_kernel_child_s:", _seconds(t13, t14))
+    builder.download_raw()
+    var child = builder.histogram_from_host()
     var child_rows = 0
     for b in range(child.n_bins):
         child_rows += child.count[b]
-    print("  node_hist_child_rows:", child_rows)
-
-    print("  d2h_probe_s:", _time_d2h_probe(builder))
+    print("  hist_child_rows:", child_rows)
 
     var params = BoosterParams(rounds, 0.1, TreeParams.default())
 
     # Phase: complete training, both backends, uninstrumented. No
     # synchronization the library would not do on its own.
-    var t12 = perf_counter_ns()
+    var t15 = perf_counter_ns()
     var gpu = train_gpu(data, target, SQUARED_ERROR, params)
-    var t13 = perf_counter_ns()
-    print("  gpu_train_s:", _seconds(t12, t13))
+    var t16 = perf_counter_ns()
+    print("  gpu_train_s:", _seconds(t15, t16))
     print("  gpu_n_trees:", len(gpu.trees))
     print("  gpu_train_mse:", _train_mse(gpu, data, target))
 
-    var t14 = perf_counter_ns()
+    var t17 = perf_counter_ns()
     var cpu = train(data, target, SQUARED_ERROR, params)
-    var t15 = perf_counter_ns()
-    print("  cpu_train_s:", _seconds(t14, t15))
+    var t18 = perf_counter_ns()
+    print("  cpu_train_s:", _seconds(t17, t18))
     print("  cpu_n_trees:", len(cpu.trees))
     print("  cpu_train_mse:", _train_mse(cpu, data, target))
 
@@ -387,7 +386,9 @@ def main() raises:
             shapes.append(Int(String(args[i + 1])))
             i += 2
         if i != len(args):
-            raise Error("dataset shapes must be given as (rows, features) pairs")
+            raise Error(
+                "dataset shapes must be given as (rows, features) pairs"
+            )
 
         if len(shapes) == 0:
             # Small (launch-overhead bound), square, wide, and tall. Four

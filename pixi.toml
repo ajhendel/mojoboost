@@ -6,12 +6,15 @@ platforms = ["osx-arm64", "linux-64", "linux-aarch64"]
 version = "0.1.0"
 
 [tasks]
-test = "mojo run -I src tests/test_mojoboost.mojo && mojo run -I src tests/test_metrics.mojo && mojo run -I src tests/test_weights.mojo && mojo run -I src tests/test_multiclass_model.mojo && mojo run -I src tests/test_objectives.mojo && mojo run -I src tests/test_kernels.mojo && mojo run -I src tests/test_regularization.mojo && mojo run -I src tests/test_serialize.mojo && mojo run -I src tests/test_backend_equivalence.mojo && mojo run -I src tests/test_gpu_training.mojo && mojo run -I src tests/test_histogram_reference.mojo && mojo run -I src tests/test_device.mojo"
-test-gpu = "mojo run -I src tests/test_backend_equivalence.mojo && mojo run -I src tests/test_gpu_training.mojo && mojo run -I src tests/test_device.mojo"
+test = "mojo run -I src tests/test_mojoboost.mojo && mojo run -I src tests/test_metrics.mojo && mojo run -I src tests/test_weights.mojo && mojo run -I src tests/test_multiclass_model.mojo && mojo run -I src tests/test_objectives.mojo && mojo run -I src tests/test_custom_objective.mojo && mojo run -I src tests/test_kernels.mojo && mojo run -I src tests/test_regularization.mojo && mojo run -I src tests/test_max_depth.mojo && mojo run -I src tests/test_bagging.mojo && mojo run -I src tests/test_goss.mojo && mojo run -I src tests/test_interaction.mojo && mojo run -I src tests/test_feature_sampling.mojo && mojo run -I src tests/test_ranking.mojo && mojo run -I src tests/test_serialize.mojo && mojo run -I src tests/test_backend_equivalence.mojo && mojo run -I src tests/test_gpu_training.mojo && mojo run -I src tests/test_gpu_objectives.mojo && mojo run -I src tests/test_histogram_reference.mojo && mojo run -I src tests/test_device.mojo && mojo run -I src tests/test_gpu_portability.mojo"
+test-gpu = "mojo run -I src tests/test_interaction.mojo && mojo run -I src tests/test_backend_equivalence.mojo && mojo run -I src tests/test_gpu_training.mojo && mojo run -I src tests/test_gpu_objectives.mojo && mojo run -I src tests/test_device.mojo && mojo run -I src tests/test_gpu_portability.mojo"
 bench = "mojo run -I src bench/bench_train.mojo"
 bench-hist = "mojo run -I src bench/bench_histogram.mojo"
 bench-train-gpu = "mojo run -I src bench/bench_train_gpu.mojo"
+gpu-validate = "mojo run -I src bench/bench_gpu_validation.mojo"
 bench-threshold = "mojo run -I src bench/bench_threshold.mojo"
+bench-custom = "mojo run -I src bench/bench_custom_objective.mojo"
+bench-goss = "mojo run -I src bench/bench_goss.mojo"
 build-python = "bindings/build.sh"
 test-python = { cmd = "python python/test_python_api.py", depends-on = [
     "build-python",
@@ -28,6 +31,8 @@ lightgbm = "*"
 
 [feature.bench.tasks]
 bench-lgbm = "python bench/bench_lightgbm.py"
+bench-custom-py = "python bench/bench_custom_objective.py"
+compare-ranking = "python bench/compare_ranking.py"
 
 [feature.pkg.dependencies]
 python-build = "*"

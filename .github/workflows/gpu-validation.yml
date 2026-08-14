@@ -1,0 +1,139 @@
+# Cross-vendor GPU validation.
+#
+# Runs the same GPU source on an NVIDIA CUDA runner and an AMD HIP runner and
+# collects one comparable record per device: toolchain and driver versions,
+# device capabilities, correctness and determinism suites, and phase-separated
+# timings across several dataset shapes.
+#
+# This workflow is manual (workflow_dispatch) and targets self-hosted runners,
+# because GitHub-hosted runners have no GPU. Nothing here runs on push, and no
+# job in the regular CI workflow depends on it. Until the runners below exist,
+# these jobs never execute; docs/GPU_VALIDATION.md carries the equivalent
+# commands for running the same validation by hand on a leased machine, and
+# records which devices have actually been validated.
+#
+# Runner labels expected:
+#   [self-hosted, linux, gpu, cuda]   an NVIDIA GPU with a working driver
+#   [self-hosted, linux, gpu, rocm]   an AMD GPU with a working ROCm stack
+#
+# Deliberately not here: any vendor-specific build flag, define, or source
+# path. Both jobs build and run identical code with identical commands. The
+# only difference between them is which tool reports the driver, because
+# nvidia-smi and rocm-smi are different programs. Device-specific tuning gets
+# added only after a benchmark and a profiler trace from these runs justify
+# it, and it belongs in the runtime tiling policy, not in a build matrix.
+
+name: GPU validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      rounds:
+        description: Boosting rounds per shape in the validation report
+        required: false
+        default: "20"
+
+jobs:
+  nvidia:
+    name: NVIDIA (CUDA)
+    runs-on: [self-hosted, linux, gpu, cuda]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: prefix-dev/setup-pixi@v0.10.1
+        with:
+          cache: true
+
+      - name: Toolchain versions
+        run: |
+          pixi run mojo --version
+          pixi list --environment default | grep -Ei '^(mojo|max)' || true
+
+      - name: Driver and device
+        run: |
+          nvidia-smi
+          nvidia-smi --query-gpu=name,driver_version,memory.total,compute_cap \
+            --format=csv
+          nvcc --version || echo "nvcc not installed (not required)"
+
+      - name: CPU and OS
+        run: |
+          uname -a
+          lscpu | grep -iE 'model name|architecture|^cpu\(s\)' || true
+
+      # Correctness first. A failure here stops the job before any timing is
+      # recorded, so no number is ever published from a device that does not
+      # compute the right answer.
+      - name: Full test suite
+        run: pixi run test
+
+      - name: GPU equivalence and determinism suites
+        run: pixi run test-gpu
+
+      # MOJOBOOST_DISABLE_GPU makes device.mojo report no accelerator on a
+      # machine that has one. Only a GPU runner can exercise that branch, so
+      # this is the only place the pin-to-CPU path is actually tested.
+      - name: Device selection with the accelerator disabled
+        run: pixi run test
+        env:
+          MOJOBOOST_DISABLE_GPU: "1"
+
+      - name: Validation report
+        run: pixi run gpu-validate ${{ inputs.rounds }} | tee gpu-validation.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gpu-validation-nvidia
+          path: gpu-validation.txt
+          if-no-files-found: warn
+
+  amd:
+    name: AMD (HIP)
+    runs-on: [self-hosted, linux, gpu, rocm]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: prefix-dev/setup-pixi@v0.10.1
+        with:
+          cache: true
+
+      - name: Toolchain versions
+        run: |
+          pixi run mojo --version
+          pixi list --environment default | grep -Ei '^(mojo|max)' || true
+
+      - name: Driver and device
+        run: |
+          rocm-smi
+          rocminfo | grep -iE 'name|gfx|compute unit' || true
+          hipcc --version || echo "hipcc not installed (not required)"
+          cat /opt/rocm/.info/version 2>/dev/null || true
+
+      - name: CPU and OS
+        run: |
+          uname -a
+          lscpu | grep -iE 'model name|architecture|^cpu\(s\)' || true
+
+      - name: Full test suite
+        run: pixi run test
+
+      - name: GPU equivalence and determinism suites
+        run: pixi run test-gpu
+
+      - name: Device selection with the accelerator disabled
+        run: pixi run test
+        env:
+          MOJOBOOST_DISABLE_GPU: "1"
+
+      - name: Validation report
+        run: pixi run gpu-validate ${{ inputs.rounds }} | tee gpu-validation.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gpu-validation-amd
+          path: gpu-validation.txt
+          if-no-files-found: warn
