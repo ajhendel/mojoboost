@@ -584,7 +584,7 @@ struct ResidencyLedger(Copyable, Movable):
             return False
         if self.resident[role]:
             self.evictions += 1
-        self.identity[role] = identity
+        self.identity[role] = identity.copy()
         self.resident[role] = True
         self.uploads += 1
         return True
