@@ -6,10 +6,11 @@ platforms = ["osx-arm64", "linux-64", "linux-aarch64"]
 version = "0.1.0"
 
 [tasks]
-test = "mojo run -I src tests/test_mojoboost.mojo && mojo run -I src tests/test_metrics.mojo && mojo run -I src tests/test_weights.mojo && mojo run -I src tests/test_multiclass_model.mojo && mojo run -I src tests/test_objectives.mojo && mojo run -I src tests/test_kernels.mojo && mojo run -I src tests/test_serialize.mojo && mojo run -I src tests/test_backend_equivalence.mojo"
+test = "mojo run -I src tests/test_mojoboost.mojo && mojo run -I src tests/test_metrics.mojo && mojo run -I src tests/test_weights.mojo && mojo run -I src tests/test_multiclass_model.mojo && mojo run -I src tests/test_objectives.mojo && mojo run -I src tests/test_kernels.mojo && mojo run -I src tests/test_serialize.mojo && mojo run -I src tests/test_backend_equivalence.mojo && mojo run -I src tests/test_histogram_reference.mojo"
 test-gpu = "mojo run -I src tests/test_backend_equivalence.mojo"
 bench = "mojo run -I src bench/bench_train.mojo"
 bench-hist = "mojo run -I src bench/bench_histogram.mojo"
+bench-threshold = "mojo run -I src bench/bench_threshold.mojo"
 build-python = "bindings/build.sh"
 test-python = { cmd = "python python/test_python_api.py", depends-on = [
     "build-python",
@@ -27,5 +28,16 @@ lightgbm = "*"
 [feature.bench.tasks]
 bench-lgbm = "python bench/bench_lightgbm.py"
 
+[feature.pkg.dependencies]
+python-build = "*"
+setuptools = ">=77"
+wheel = "*"
+pip = "*"
+
+[feature.pkg.tasks]
+build-wheel = "packaging/build_wheel.sh"
+test-wheel = { cmd = "packaging/test_wheel.sh", depends-on = ["build-wheel"] }
+
 [environments]
 bench = ["bench"]
+pkg = ["pkg"]

@@ -18,6 +18,9 @@ try:
 except ImportError:
     _np = None
 
+# Keep in sync with python/pyproject.toml.
+__version__ = "0.1.0"
+
 __all__ = ["MojoBoostRegressor", "MojoBoostClassifier"]
 
 _SQUARED_ERROR = 0

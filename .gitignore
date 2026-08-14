@@ -15,3 +15,8 @@ build/
 
 # Python
 __pycache__/
+
+# Wheel build artifacts (packaging/build_wheel.sh)
+python/dist/
+python/mojoboost.egg-info/
+python/LICENSE

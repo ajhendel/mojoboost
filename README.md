@@ -94,13 +94,20 @@ proba = clf.predict_proba(X)
 and saved models round-trip bit-exactly. numpy is optional; plain Python
 sequences work without it.
 
+`pixi run test-wheel` builds a self-contained wheel (`pixi run build-wheel`)
+and validates it in a clean venv. The wheel bundles the Mojo runtime
+dylibs the extension links (delocate-style, with an `@loader_path` rpath),
+so installing it requires no Mojo or MAX toolchain. Wheels currently
+target macOS on Apple silicon; Linux wheels need a manylinux build.
+
 ## Roadmap
 
 1. Integrate the GPU histogram backend into end-to-end training while keeping
    intermediate state device-resident
 2. Scale GPU histograms beyond one threadgroup per feature and validate on
    Apple, NVIDIA, and AMD hardware
-3. Package the Python API for distribution (wheels, PyPI)
+3. Publish the Python API to PyPI (macOS arm64 wheels build and validate
+   today; Linux needs a manylinux build)
 4. Broader benchmark suite (XGBoost and real datasets)
 
 ## Defaults

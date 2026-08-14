@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mojoboost"
+version = "0.1.0"
+description = "Gradient boosted decision trees in Mojo, with a scikit-learn style Python API"
+readme = "README.md"
+requires-python = ">=3.14"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Andrew Hendel" }]
+keywords = [
+    "gradient boosting",
+    "gbdt",
+    "decision trees",
+    "machine learning",
+    "mojo",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.optional-dependencies]
+numpy = ["numpy"]
+
+[project.urls]
+Homepage = "https://github.com/ajhendel/mojoboost"
+Source = "https://github.com/ajhendel/mojoboost"
+
+[tool.setuptools]
+packages = ["mojoboost"]
+
+[tool.setuptools.package-data]
+mojoboost = ["*.so", ".dylibs/*.dylib"]
