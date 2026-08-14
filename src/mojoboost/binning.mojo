@@ -53,23 +53,26 @@ answer at most `2 * (max_bins - 1)` questions; above `SELECT_MIN_ROWS`
 non-missing values `resolve_ranks` answers exactly those questions instead,
 in two linear passes over the column:
 
-1. Bucket every value by the top bits of an order-preserving 64-bit key,
+1. Count every value into a bucket of an order-preserving 64-bit key,
    rebased on the column's own key range so the buckets straddle the values
-   that are actually there rather than the whole double line.
-2. Prefix-sum the bucket counts. A bucket whose global rank range holds no
-   requested rank is dropped entirely; the rest are gathered, in bucket
-   order, into one compact buffer.
-3. Resolve each gathered bucket: a bucket whose values are all equal answers
-   its ranks immediately (this is what makes constant, binary, and other
-   low-cardinality columns free), a small one is sorted, and a large one is
+   that are actually there rather than the whole double line. The same pass
+   records whether a bucket saw one key or several.
+2. Prefix-sum the counts to give each bucket its global rank range. A bucket
+   holding no requested rank is dropped. A bucket holding one repeated key
+   answers its ranks straight from that key, which is what makes constant,
+   binary, and other low-cardinality columns cost nothing beyond the two
+   passes. Only the rest are gathered into one compact buffer.
+3. Resolve each gathered bucket: a small one is sorted, a large one is
    bucketed again on its own narrower key range, to `SELECT_MAX_DEPTH`.
 
 The result is the same value at the same rank a full sort would have put
 there, so the edges are identical; the module-level `sort` path is kept for
 small columns and as the reference the tests compare against. Sorting is
-still the worst case: a column too large for step 3's depth budget and too
-spread out for its buckets to separate ends up sorting one bucket, which is
-never more work than sorting the whole column was.
+still the worst case, in two places: a segment that reaches the depth budget,
+and a level that would have gathered more than a quarter of what it was given
+(which means its buckets separated nothing). Both sort one segment, which is
+never more work than sorting the whole column was, and the quarter rule is
+also what bounds the extra memory -- see `resolve_ranks`.
 
 `emit_quantile_edges` is the single authority on how a resolved boundary
 becomes an edge (midpoint, `_avoid_inf` clamp, strictly-increasing filter),
@@ -87,9 +90,11 @@ reaches growth.
 
 Work estimates. The threshold that decides serial from parallel is stated in
 histogram-op equivalents (see `parallel.plan_tasks`), and a row of binning is
-not one of those. Fitting sorts each column, so its estimate carries the
-comparison count; transforming binary-searches each value, so its estimate
-carries the search depth. Counting one op per (feature, row) here would have
+not one of those. Fitting orders each column, so its estimate carries a
+comparison count (the sort's, kept unchanged when the cheaper selected path
+took over, so the measured serial/parallel crossover stays where it was
+measured); transforming searches each value, so its estimate carries the
+search depth. Counting one op per (feature, row) here would have
 kept a stage that is 8 to 20 times dearer per row than a histogram
 accumulate on the serial path well past the point where it pays for a
 dispatch. None of this moves an edge or a bin: it decides only how the same
@@ -285,6 +290,30 @@ def order_key(v: Float64) -> UInt64:
     return u | 0x8000_0000_0000_0000
 
 
+comptime _KEY_EMPTY = UInt64(0)
+comptime _KEY_MIXED = UInt64(0xFFFF_FFFF_FFFF_FFFF)
+"""Two key values `order_key` cannot return, so they can mark a bucket that
+has seen nothing and one that has seen two different keys. Both would need
+their argument to be a `NaN`, which never reaches the key: `order_key(v) == 0`
+requires the bit pattern `0xFFFF...`, and `== 0xFFFF...` requires
+`0x7FFF...` or `0xFFFF...`, all three of them quiet `NaN`s."""
+
+
+def value_from_key(k: UInt64) -> Float64:
+    """The inverse of `order_key`, exact for every key it can produce.
+
+    Only used where a bucket is known to hold one repeated key, so the value
+    it rebuilds is bit for bit the value that went in: two doubles with the
+    same bit pattern are the same double.
+    """
+    var u = k
+    if (u >> 63) != 0:
+        u = u ^ 0x8000_0000_0000_0000
+    else:
+        u = u ^ 0xFFFF_FFFF_FFFF_FFFF
+    return bitcast[DType.float64, 1](SIMD[DType.uint64, 1](u))
+
+
 def _bucket_shift(span: UInt64) -> UInt64:
     """Smallest `s` with `span >> s < SELECT_BUCKETS`, so a key range of
     `span` maps onto at most `SELECT_BUCKETS` buckets."""
@@ -303,6 +332,7 @@ def resolve_ranks(
     r_lo: Int,
     r_hi: Int,
     mut counts: List[Int],
+    mut bucket_keys: List[UInt64],
     mut vals: List[Float64],
     depth: Int,
 ):
@@ -311,10 +341,21 @@ def resolve_ranks(
 
     `ranks` is ascending and every entry it is asked about lies inside
     `[rank_base, rank_base + len(seg))`. `seg` is scratch: it may be permuted
-    or sorted, and the caller refills it. `counts` is a reusable bucket table,
-    grown here on first use and not read across calls. The answer is by
-    definition the value a full sort would have left at that rank, so this is
-    an implementation of `sort`-then-index and not an approximation of it.
+    or sorted, and the caller refills it. `counts` and `bucket_keys` are
+    reusable bucket tables, grown here on first use and never read across
+    calls. The answer is by definition the value a full sort would have left
+    at that rank, so this is an implementation of `sort`-then-index and not an
+    approximation of it.
+
+    Memory. Beyond the two fixed bucket tables (`SELECT_BUCKETS` entries each,
+    allocated once per worker), the extra storage is the gather buffer and one
+    copy of the largest segment gathered into it. A bucket holding one
+    repeated key is answered from the key and never gathered at all, and a
+    level that would gather more than a quarter of what it was given sorts
+    instead, so each level gathers at most `n / 4` and the levels below it a
+    quarter of that again: the extra storage is bounded by two thirds of the
+    segment, and the whole fit stays inside a small multiple of the column
+    buffer it already had.
     """
     if r_lo >= r_hi:
         return
@@ -325,10 +366,10 @@ def resolve_ranks(
         # worker closure, so an impossible call returns rather than throws.
         return
 
-    # All equal: every rank in the segment has that value. This is the
-    # low-cardinality path -- a constant column, a binary column, or an
-    # integer column with few levels resolves entirely here, because every
-    # gathered bucket holds one repeated value.
+    # All equal: every rank in the segment has that value. A constant column
+    # ends here on its first call; a binary or few-level column ends in the
+    # equivalent per-bucket check further down, which answers a repeated key
+    # without gathering the bucket at all.
     var first = seg[0]
     var constant = True
     for i in range(1, n):
@@ -362,19 +403,35 @@ def resolve_ranks(
 
     if len(counts) < SELECT_BUCKETS:
         counts.resize(SELECT_BUCKETS, 0)
+    if len(bucket_keys) < SELECT_BUCKETS:
+        bucket_keys.resize(SELECT_BUCKETS, _KEY_EMPTY)
     var cp = counts.unsafe_ptr()
+    var kp = bucket_keys.unsafe_ptr()
     for b in range(n_buckets):
         cp.unsafe_store(b, 0)
+        kp.unsafe_store(b, _KEY_EMPTY)
+    # One pass counts each bucket and records whether it saw one key or
+    # several. The second half is what makes a low-cardinality column free:
+    # every one of its buckets holds one repeated key, so every bucket is
+    # answered from the key below and nothing is gathered, copied, or sorted.
     var sp = seg.unsafe_ptr()
     for i in range(n):
-        var b = Int((order_key(sp.unsafe_load(i)) - kmin) >> shift)
+        var k = order_key(sp.unsafe_load(i))
+        var b = Int((k - kmin) >> shift)
         cp.unsafe_store(b, cp.unsafe_load(b) + 1)
+        var seen = kp.unsafe_load(b)
+        if seen == _KEY_EMPTY:
+            kp.unsafe_store(b, k)
+        elif seen != k:
+            kp.unsafe_store(b, _KEY_MIXED)
 
     # Walk buckets and requested ranks together, both ascending. A bucket
-    # holding no requested rank is dropped; the rest get a slot in the gather
-    # buffer and keep the rank window they answer.
+    # holding no requested rank is dropped; the rest are recorded with the
+    # rank window they answer and, for the ones that need ordering, a slot in
+    # the gather buffer.
     var seg_start = List[Int]()
     var seg_len = List[Int]()
+    var seg_key = List[UInt64]()
     var seg_rank_base = List[Int]()
     var seg_r_lo = List[Int]()
     var seg_r_hi = List[Int]()
@@ -387,32 +444,56 @@ def resolve_ranks(
         var lo = ri
         while ri < r_hi and ranks[ri] - rank_base < stop:
             ri += 1
+        var key = kp.unsafe_load(b)
         if ri > lo:
-            seg_start.append(gathered)
-            seg_len.append(c)
+            seg_key.append(key)
             seg_rank_base.append(rank_base + start)
             seg_r_lo.append(lo)
             seg_r_hi.append(ri)
-            cp.unsafe_store(b, gathered)
-            gathered += c
+            if key == _KEY_MIXED:
+                seg_start.append(gathered)
+                seg_len.append(c)
+                cp.unsafe_store(b, gathered)
+                gathered += c
+            else:
+                seg_start.append(-1)
+                seg_len.append(0)
+                cp.unsafe_store(b, -1)
         else:
             cp.unsafe_store(b, -1)
         start = stop
 
+    # A level that would gather most of what it was given has not separated
+    # anything, so it sorts instead: bounded memory, and no worse than the
+    # sort this whole path exists to avoid. In practice this never fires --
+    # the requested ranks are a few hundred against `SELECT_BUCKETS` buckets.
+    if gathered * 4 >= n:
+        sort(seg)
+        for i in range(r_lo, r_hi):
+            vals[i] = seg[ranks[i] - rank_base]
+        return
+
     var hot = List[Float64](capacity=gathered)
     hot.resize(gathered, 0.0)
     var hp = hot.unsafe_ptr()
-    for i in range(n):
-        var v = sp.unsafe_load(i)
-        var b = Int((order_key(v) - kmin) >> shift)
-        var d = cp.unsafe_load(b)
-        if d >= 0:
-            hp.unsafe_store(d, v)
-            cp.unsafe_store(b, d + 1)
+    if gathered > 0:
+        for i in range(n):
+            var v = sp.unsafe_load(i)
+            var b = Int((order_key(v) - kmin) >> shift)
+            var d = cp.unsafe_load(b)
+            if d >= 0:
+                hp.unsafe_store(d, v)
+                cp.unsafe_store(b, d + 1)
 
-    # `counts` is free again from here, so the recursion reuses it rather
-    # than allocating a table per level.
-    for s in range(len(seg_start)):
+    # Both tables are free again from here, so the recursion reuses them
+    # rather than allocating a pair per level.
+    for s in range(len(seg_r_lo)):
+        if seg_key[s] != _KEY_MIXED:
+            # One repeated key: every rank in the bucket is that value.
+            var v = value_from_key(seg_key[s])
+            for i in range(seg_r_lo[s], seg_r_hi[s]):
+                vals[i] = v
+            continue
         var slen = seg_len[s]
         var sub = List[Float64](capacity=slen)
         var base = seg_start[s]
@@ -425,6 +506,7 @@ def resolve_ranks(
             seg_r_lo[s],
             seg_r_hi[s],
             counts,
+            bucket_keys,
             vals,
             depth + 1,
         )
@@ -792,8 +874,8 @@ def fit_bins(
         # already grew, so a 500-feature fit does a handful of allocations per
         # worker instead of thousands. Every feature still sees exactly the
         # column it saw before, in the same order, so the edges are unchanged.
-        # `bucket_counts` is the rank-selection table and stays empty (and
-        # unallocated) on a task that never takes that path.
+        # `bucket_counts` and `bucket_keys` are the rank-selection tables and
+        # stay empty (and unallocated) on a task that never takes that path.
         var col = List[Float64](capacity=n_rows)
         var idxs = List[Int]()
         var ranks = List[Int]()
@@ -802,6 +884,7 @@ def fit_bins(
         var above = List[Float64]()
         var edge_buf = List[Float64]()
         var bucket_counts = List[Int]()
+        var bucket_keys = List[UInt64]()
         for f in range(f_start, f_end):
             # Categorical columns never enter quantile binning.
             if spec.is_cat(f):
@@ -837,7 +920,15 @@ def fit_bins(
                 vals.clear()
                 vals.resize(len(ranks), 0.0)
                 resolve_ranks(
-                    col, 0, ranks, 0, len(ranks), bucket_counts, vals, 0
+                    col,
+                    0,
+                    ranks,
+                    0,
+                    len(ranks),
+                    bucket_counts,
+                    bucket_keys,
+                    vals,
+                    0,
                 )
                 # `idxs` and `ranks` both ascend, so one cursor walks them
                 # together instead of searching per boundary.
