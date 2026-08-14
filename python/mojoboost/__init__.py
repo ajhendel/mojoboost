@@ -25,6 +25,9 @@ __all__ = ["MojoBoostRegressor", "MojoBoostClassifier"]
 
 _SQUARED_ERROR = 0
 _BINARY_LOGISTIC = 1
+_HUBER = 3
+_QUANTILE = 4
+_L1 = 5
 
 
 def _as_column_major(X):
@@ -113,7 +116,18 @@ class _Base:
             "min_child_hess": float(self.min_child_hess),
             "max_bin": int(self.max_bin),
             "sample_weight_addr": int(sample_weight_addr),
+            "alpha": float(getattr(self, "alpha", 0.9)),
         }
+
+    def _weight_buffer(self, sample_weight, n_rows):
+        """Validated weight buffer and its address (buffer must stay
+        referenced while the address is in use); (None, 0) when absent."""
+        if sample_weight is None:
+            return None, 0
+        wb = _as_f64_vector(sample_weight, n_rows, "sample_weight")
+        if not any(wb):
+            raise ValueError("sample_weight must not be all zeros")
+        return wb, _addr(wb)
 
     def _require_fitted(self):
         if self._model is None:
@@ -121,20 +135,49 @@ class _Base:
 
 
 class MojoBoostRegressor(_Base):
+    """Objective names follow LightGBM: "regression" (squared error),
+    "huber", "quantile", and "mae" (alias "regression_l1"). `alpha` is the
+    quantile level for "quantile" and the transition point for "huber";
+    the other objectives ignore it."""
+
+    _OBJECTIVES = {
+        "regression": _SQUARED_ERROR,
+        "huber": _HUBER,
+        "quantile": _QUANTILE,
+        "mae": _L1,
+        "regression_l1": _L1,
+    }
+
+    def __init__(self, objective="regression", alpha=0.9, **kwargs):
+        super().__init__(**kwargs)
+        self.objective = objective
+        self.alpha = alpha
+
+    def _objective_code(self):
+        code = self._OBJECTIVES.get(self.objective)
+        if code is None:
+            raise ValueError(
+                f"unknown objective {self.objective!r}; expected one of "
+                + ", ".join(sorted(self._OBJECTIVES))
+            )
+        alpha = float(self.alpha)
+        if code == _HUBER and alpha <= 0.0:
+            raise ValueError("huber requires alpha > 0")
+        if code == _QUANTILE and not 0.0 < alpha < 1.0:
+            raise ValueError("quantile requires 0 < alpha < 1")
+        return code
+
     def fit(self, X, y, sample_weight=None):
+        objective = self._objective_code()
         Xb, n_rows, n_features = _as_column_major(X)
         yb = _as_f64_vector(y, n_rows)
-        wb = None
-        w_addr = 0
-        if sample_weight is not None:
-            wb = _as_f64_vector(sample_weight, n_rows, "sample_weight")
-            w_addr = _addr(wb)
+        wb, w_addr = self._weight_buffer(sample_weight, n_rows)
         self._model = _mojoboost.fit(
             _addr(Xb),
             n_rows,
             n_features,
             _addr(yb),
-            _SQUARED_ERROR,
+            objective,
             self._params(w_addr),
         )
         self.n_features_in_ = n_features
@@ -174,11 +217,7 @@ class MojoBoostClassifier(_Base):
                 "labels must be consecutive integers starting at 0, "
                 "with at least 2 classes present"
             )
-        wb = None
-        w_addr = 0
-        if sample_weight is not None:
-            wb = _as_f64_vector(sample_weight, n_rows, "sample_weight")
-            w_addr = _addr(wb)
+        wb, w_addr = self._weight_buffer(sample_weight, n_rows)
         if n_classes == 2:
             self._model = _mojoboost.fit(
                 _addr(Xb),

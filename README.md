@@ -92,7 +92,9 @@ proba = clf.predict_proba(X)
 
 `fit` accepts `sample_weight`, hyperparameters mirror the Mojo defaults,
 and saved models round-trip bit-exactly. numpy is optional; plain Python
-sequences work without it.
+sequences work without it. The regressor takes LightGBM objective names
+(`objective="regression"`, `"huber"`, `"quantile"`, or `"mae"`) with
+`alpha` as the quantile level or huber transition point.
 
 `pixi run test-wheel` builds a self-contained wheel (`pixi run build-wheel`)
 and validates it in a clean venv. The wheel bundles the Mojo runtime

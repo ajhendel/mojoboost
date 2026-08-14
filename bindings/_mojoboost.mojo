@@ -123,6 +123,7 @@ def fit(
         bp,
         Int(py=params["max_bin"]),
         weights,
+        Float64(py=params["alpha"]),
     )
     return PythonObject(alloc=model^)
 

@@ -121,6 +121,31 @@ def test_sample_weight():
     print("sample_weight ok")
 
 
+def test_regression_objectives():
+    X, y = make_regression(600)
+
+    for objective in ("huber", "mae", "regression_l1"):
+        model = MojoBoostRegressor(objective=objective, n_estimators=40)
+        pred = model.fit(X, y).predict(X)
+        mse = sum((p - t) ** 2 for p, t in zip(pred, y)) / len(y)
+        assert mse < 0.02, f"{objective} train MSE too high: {mse}"
+
+    # A 0.9-quantile fit should predict above most training targets.
+    q = MojoBoostRegressor(objective="quantile", alpha=0.9, n_estimators=40)
+    pred = q.fit(X, y).predict(X)
+    frac_below = sum(int(t <= p) for p, t in zip(pred, y)) / len(y)
+    assert 0.8 < frac_below <= 1.0, f"quantile coverage off: {frac_below}"
+
+    # Identity link, so these round-trip through the existing format.
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "quantile.mbst")
+        q.save(path)
+        loaded = MojoBoostRegressor.load(path)
+        pred2 = loaded.predict(X)
+    assert all(a == b for a, b in zip(pred, pred2)), "round-trip not exact"
+    print(f"regression objectives ok (q90 coverage {frac_below:.3f})")
+
+
 def test_input_validation():
     model = MojoBoostRegressor()
     try:
@@ -131,6 +156,23 @@ def test_input_validation():
     try:
         MojoBoostClassifier().fit([[1.0], [2.0]], [1, 3])
         raise AssertionError("gappy labels should raise")
+    except ValueError:
+        pass
+    for bad in (
+        dict(objective="l2"),
+        dict(objective="huber", alpha=0.0),
+        dict(objective="quantile", alpha=1.5),
+    ):
+        try:
+            MojoBoostRegressor(**bad).fit([[1.0], [2.0]], [1.0, 2.0])
+            raise AssertionError(f"{bad} should raise")
+        except ValueError:
+            pass
+    try:
+        MojoBoostRegressor().fit(
+            [[1.0], [2.0]], [1.0, 2.0], sample_weight=[0.0, 0.0]
+        )
+        raise AssertionError("all-zero sample_weight should raise")
     except ValueError:
         pass
     print("validation ok")
@@ -147,5 +189,6 @@ if __name__ == "__main__":
     test_binary_classifier()
     test_multiclass_classifier()
     test_sample_weight()
+    test_regression_objectives()
     test_input_validation()
     print("all python API tests passed")
