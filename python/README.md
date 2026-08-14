@@ -28,11 +28,20 @@ proba = clf.predict_proba(X)
 work without it. Install with the `numpy` extra to pull it in.
 
 Native LightGBM names are canonical (`min_data_in_leaf`, `min_child_hess`,
-`lambda_l1`, `lambda_l2`, `bagging_fraction`, `bagging_freq`, `device`). For
-easy migration from `LGBMRegressor` and `LGBMClassifier`, their scikit-learn
-spellings are accepted too: `min_child_samples`, `min_child_weight`,
-`reg_alpha`, `reg_lambda`, `subsample`, `subsample_freq`, and `device_type`.
-Conflicting values raise instead of silently choosing one.
+`lambda_l1`, `lambda_l2`, `bagging_fraction`, `bagging_freq`, `boosting`,
+`device`). For easy migration from `LGBMRegressor` and `LGBMClassifier`,
+their scikit-learn spellings are accepted too: `min_child_samples`,
+`min_child_weight`, `reg_alpha`, `reg_lambda`, `subsample`,
+`subsample_freq`, `boosting_type`, and `device_type`. Conflicting values
+raise instead of silently choosing one.
+
+`boosting="goss"` trains with Gradient-based One-Side Sampling instead of
+on every row: each round keeps the `top_rate` share of rows with the
+largest gradient magnitude, samples `other_rate` of the rest, and scales
+the sampled rows to compensate. `goss_seed` makes the sample reproducible,
+`goss_warmup_rounds` overrides LightGBM's automatic
+`int(1 / learning_rate)` full-data rounds, and GOSS cannot be combined with
+row bagging.
 
 ## Device selection
 

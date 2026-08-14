@@ -124,9 +124,7 @@ def test_requested_strategy_is_honored() raises:
     var tiled = derive_tiling(caps, 100_000, 10, 255, STRATEGY_TILED)
     assert_equal(tiled.strategy, STRATEGY_TILED)
     assert_true(tiled.partial_cells > 0)
-    assert_equal(
-        tiled.partial_cells, tiled.n_tiles * 10 * 255
-    )
+    assert_equal(tiled.partial_cells, tiled.n_tiles * 10 * 255)
 
 
 def test_shape_and_shared_memory_are_validated() raises:
@@ -169,11 +167,15 @@ def test_env_overrides() raises:
 
     _ = setenv("MOJOBOOST_GPU_HIST_STRATEGY", "atomic")
     assert_equal(env_strategy(), STRATEGY_ATOMIC)
-    assert_equal(derive_tiling(caps, 100_000, 10, 255).strategy, STRATEGY_ATOMIC)
+    assert_equal(
+        derive_tiling(caps, 100_000, 10, 255).strategy, STRATEGY_ATOMIC
+    )
 
     _ = setenv("MOJOBOOST_GPU_HIST_STRATEGY", "tiled")
     assert_equal(env_strategy(), STRATEGY_TILED)
-    assert_equal(derive_tiling(caps, 100_000, 10, 255).strategy, STRATEGY_TILED)
+    assert_equal(
+        derive_tiling(caps, 100_000, 10, 255).strategy, STRATEGY_TILED
+    )
 
     # An explicit argument outranks the environment.
     assert_equal(

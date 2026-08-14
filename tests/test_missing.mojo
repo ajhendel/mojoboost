@@ -22,8 +22,10 @@ from mojoboost.split import find_best_split
 from mojoboost.train_gpu import train_gpu
 from mojoboost.tree import TreeParams, grow_tree
 
-comptime NAN = Float64("nan")
-comptime INF = Float64("inf")
+from std.utils.numerics import inf, nan
+
+comptime NAN = nan[DType.float64]()
+comptime INF = inf[DType.float64]()
 
 
 def _params(num_leaves: Int = 4, n_estimators: Int = 30) -> BoosterParams:

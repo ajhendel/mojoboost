@@ -433,10 +433,11 @@ def test_metrics_receive_raw_scores() raises:
     var expected = log(p / (1.0 - p))
     assert_true(abs(result.history.value(0, 0, 0) - expected) < 1e-12)
 
-    # response_scale is the documented way back to probabilities.
+    # response_scale is the documented way back to probabilities. The
+    # tolerance is the accuracy of the library's exp, not of the link.
     var raw: List[Float64] = [expected, 0.0]
     var probs = response_scale(BINARY_LOGISTIC, raw)
-    assert_true(abs(probs[0] - p) < 1e-12)
+    assert_true(abs(probs[0] - p) < 1e-8)
     assert_true(abs(probs[1] - 0.5) < 1e-12)
     var identity = response_scale(SQUARED_ERROR, raw)
     assert_equal(identity[0], expected)

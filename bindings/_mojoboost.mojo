@@ -25,6 +25,7 @@ from mojoboost.device import (
 from mojoboost.goss import GossParams
 from mojoboost.importance import gain_importance, split_importance
 from mojoboost.interaction import InteractionConstraints
+from mojoboost.monotone import MonotoneConstraints
 from mojoboost.model import Model, MulticlassModel
 from mojoboost.model import fit as mojo_fit
 from mojoboost.model import fit_custom as mojo_fit_custom
@@ -129,6 +130,22 @@ def _parse_constraints(
     return InteractionConstraints.from_flat(flat, offsets, n_features)
 
 
+def _parse_monotone(
+    params: PythonObject, n_features: Int
+) raises -> MonotoneConstraints:
+    """Monotonic constraints from the params dict: one float64 entry per
+    feature (-1, 0, or 1) at `monotone_addr`, or a zero address for
+    unconstrained. The wrapper rejects fractional entries before they get
+    here, where the buffer is read as integers; the length and range checks
+    below also cover direct callers."""
+    var addr = Int(py=params["monotone_addr"])
+    if addr == 0:
+        return MonotoneConstraints()
+    return MonotoneConstraints.from_signs(
+        _int_list_from_f64(addr, n_features), n_features
+    )
+
+
 def _parse_params(
     params: PythonObject, n_features: Int
 ) raises -> BoosterParams:
@@ -145,6 +162,7 @@ def _parse_params(
         ),
         feature_fraction_seed=Int(py=params["feature_fraction_seed"]),
         max_depth=Int(py=params["max_depth"]),
+        monotone=_parse_monotone(params, n_features),
     )
     return BoosterParams(
         Int(py=params["n_estimators"]),

@@ -72,9 +72,21 @@ from .interaction import extend_branch
 from .split import SplitInfo, find_best_split, soft_threshold_l1
 from .tree import Tree, TreeParams
 
-# Bit positions in the unsupported-parameter mask agreed across ranks.
+# Bit positions in the unsupported-configuration mask agreed across ranks.
+#
+# The list is enumerated rather than derived, which is the honest weakness of
+# a second growth loop: a parameter added to TreeParams or BinnedMatrix after
+# this was written will not be in it, and will be ignored instead of refused
+# until someone adds it. The world-size-1 equivalence test catches a change
+# to default behavior but not the arrival of a new opt-in parameter. That is
+# the strongest guarantee a separate loop can give, and it is the argument
+# for the histogram-source refactor in docs/distributed.md section 11.
 comptime _UNSUPPORTED_FEATURE_FRACTION = 1
 comptime _UNSUPPORTED_FEATURE_FRACTION_BYNODE = 2
+comptime _UNSUPPORTED_MAX_DEPTH = 4
+comptime _UNSUPPORTED_MONOTONE = 8
+comptime _UNSUPPORTED_CATEGORICAL = 16
+comptime _UNSUPPORTED_MISSING_BIN = 32
 
 
 struct DataShard(Copyable, Movable):
@@ -152,9 +164,20 @@ def partition_rows(
             for i in range(rows):
                 shard_weight.append(weight[start + i])
 
+        # The categorical spec and the missing-bin table describe the
+        # columns, not the rows, so every shard carries the originals.
+        # Distributed training refuses both today, but a shard must not
+        # quietly lose the metadata that says so.
         shards.append(
             DataShard(
-                BinnedMatrix(bins^, rows, data.n_features, data.n_bins),
+                BinnedMatrix(
+                    bins^,
+                    rows,
+                    data.n_features,
+                    data.n_bins,
+                    data.cats.copy(),
+                    data.missing_bin.copy(),
+                ),
                 shard_target^,
                 shard_weight^,
             )
@@ -295,8 +318,9 @@ struct _DistLeaf(Movable):
         self.count = count
 
 
-def _unsupported_tree_params(params: TreeParams) -> Int:
-    """Bit mask of tree parameters this prototype does not implement.
+def _unsupported_mask(params: TreeParams, shards: List[DataShard]) -> Int:
+    """Bit mask of the configuration this prototype does not implement,
+    covering both tree parameters and properties of the binned data.
     Rejected rather than ignored, so an unsupported setting is an error and
     not a quietly different model."""
     var mask = 0
@@ -304,10 +328,23 @@ def _unsupported_tree_params(params: TreeParams) -> Int:
         mask |= _UNSUPPORTED_FEATURE_FRACTION
     if params.feature_fraction_bynode != 1.0:
         mask |= _UNSUPPORTED_FEATURE_FRACTION_BYNODE
+    if params.max_depth > 0:
+        mask |= _UNSUPPORTED_MAX_DEPTH
+    if params.monotone.is_active():
+        mask |= _UNSUPPORTED_MONOTONE
+    for i in range(len(shards)):
+        if shards[i].data.cats.any_categorical():
+            mask |= _UNSUPPORTED_CATEGORICAL
+        for f in range(len(shards[i].data.missing_bin)):
+            if shards[i].data.missing_bin[f] >= 0:
+                mask |= _UNSUPPORTED_MISSING_BIN
+                break
     return mask
 
 
-def _raise_unsupported_tree_params(mask: Int) raises:
+def _raise_unsupported(mask: Int) raises:
+    """Every rank reaches this with the same mask, so it raises everywhere or
+    nowhere."""
     if mask & _UNSUPPORTED_FEATURE_FRACTION != 0:
         raise Error(
             "distributed training does not support feature_fraction; the"
@@ -317,6 +354,26 @@ def _raise_unsupported_tree_params(mask: Int) raises:
         raise Error(
             "distributed training does not support feature_fraction_bynode;"
             " the draw would have to be reproduced identically on every rank"
+        )
+    if mask & _UNSUPPORTED_MAX_DEPTH != 0:
+        raise Error(
+            "distributed training does not support max_depth; the depth cap"
+            " is not implemented in the distributed grower"
+        )
+    if mask & _UNSUPPORTED_MONOTONE != 0:
+        raise Error(
+            "distributed training does not support monotone constraints; the"
+            " output bounds are not propagated by the distributed grower"
+        )
+    if mask & _UNSUPPORTED_CATEGORICAL != 0:
+        raise Error(
+            "distributed training does not support categorical features; the"
+            " distributed grower searches ordinal thresholds only"
+        )
+    if mask & _UNSUPPORTED_MISSING_BIN != 0:
+        raise Error(
+            "distributed training does not support reserved missing bins; the"
+            " distributed grower does not route missing values"
         )
 
 
@@ -556,13 +613,13 @@ def grow_tree_distributed[
     agree_status(comm, _shape_statuses(comm, shards, grad, hess))
 
     var layout = _shard_layout(shards)
-    var mask = _unsupported_tree_params(params)
+    var mask = _unsupported_mask(params, shards)
     _agree_config(
         comm,
         [layout[0], layout[1], params.num_leaves, mask],
-        ["n_features", "n_bins", "num_leaves", "the tree parameters"],
+        ["n_features", "n_bins", "num_leaves", "the configuration"],
     )
-    _raise_unsupported_tree_params(mask)
+    _raise_unsupported(mask)
     params.constraints.check_features(layout[0])
 
     return _grow_tree_distributed(shards, grad, hess, params, comm)
@@ -671,7 +728,7 @@ def train_distributed[
     with single-node training in a way no tolerance test would catch, so it
     is refused instead. Early stopping and multiclass are not implemented.
     """
-    var mask = _unsupported_tree_params(params.tree)
+    var mask = _unsupported_mask(params.tree, shards)
     var layout = _shard_layout(shards)
     _agree_config(
         comm,
@@ -689,7 +746,7 @@ def train_distributed[
             "the objective",
             "n_estimators",
             "num_leaves",
-            "the tree parameters",
+            "the configuration",
         ],
     )
 
@@ -705,7 +762,7 @@ def train_distributed[
         raise Error("unknown objective")
     if objective == HUBER and alpha <= 0.0:
         raise Error("huber requires alpha > 0")
-    _raise_unsupported_tree_params(mask)
+    _raise_unsupported(mask)
     params.tree.constraints.check_features(layout[0])
 
     agree_status(comm, _target_statuses(comm, shards, objective))

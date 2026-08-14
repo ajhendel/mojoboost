@@ -22,6 +22,15 @@ Version history
   a model trained without constraints serializes to exactly the bytes it did
   before the section existed, and a file without the section loads as
   unconstrained.
+- v2 likewise carries optional categorical sections, written only when the
+  model actually has categorical features (see categorical.mojo). A
+  `categorical` section after the mapper holds the per-feature flags and the
+  fitted category tables, without which a loaded model could not bin a raw
+  category code. Each tree that has a categorical node then carries a `cat`
+  section holding its per-node set offsets and its bitset pool. A model with
+  no categorical features writes neither section and so serializes to exactly
+  the bytes it did before they existed; a file without them loads as fully
+  numerical.
 
 Training-time knobs that only shaped which trees were grown (num_leaves,
 regularization, interaction constraints, subsampling) are deliberately absent:
@@ -33,7 +42,7 @@ trees satisfy, which a consumer may need to know and cannot recover.
 from std.memory import bitcast
 
 from .binning import BinMapper, no_missing_bins
-from .categorical import CategoricalSpec
+from .categorical import CAT_BITSET_WORDS, CategoricalSpec
 from .boosting import Booster, MulticlassBooster
 from .monotone import MonotoneConstraints
 from .model import Model, MulticlassModel
@@ -140,6 +149,40 @@ def _write_trees(mut out: String, trees: List[Tree]):
         for i in range(n_nodes):
             out += String(tree.missing_bin[i]) + " "
         out += "\n"
+        # v2: category sets, written only for a tree that has a categorical
+        # node so purely numerical trees keep their original bytes.
+        if len(tree.cat_bitset) > 0:
+            out += "cat " + String(len(tree.cat_bitset)) + "\n"
+            for i in range(n_nodes):
+                out += String(tree.cat_offset[i]) + " "
+            out += "\n"
+            for i in range(len(tree.cat_bitset)):
+                out += String(tree.cat_bitset[i]) + " "
+            out += "\n"
+
+
+def _write_categorical(mut out: String, cats: CategoricalSpec):
+    """Write the fitted category tables, or nothing at all when no feature is
+    categorical. Skipping the section keeps numerical models' files
+    unchanged."""
+    if not cats.any_categorical():
+        return
+    out += (
+        "categorical "
+        + String(len(cats.is_categorical))
+        + " "
+        + String(len(cats.codes))
+        + "\n"
+    )
+    for f in range(len(cats.is_categorical)):
+        out += ("1 " if cats.is_categorical[f] else "0 ")
+    out += "\n"
+    for i in range(len(cats.codes)):
+        out += String(cats.codes[i]) + " "
+    out += "\n"
+    for i in range(len(cats.offsets)):
+        out += String(cats.offsets[i]) + " "
+    out += "\n"
 
 
 def _write_monotone(mut out: String, monotone: MonotoneConstraints):
@@ -192,6 +235,7 @@ def save_model(model: Model, path: String) raises:
     out += "base_score " + _f64_to_token(model.booster.base_score) + "\n"
 
     _write_mapper(out, model.mapper)
+    _write_categorical(out, model.mapper.cats)
     _write_monotone(out, model.booster.monotone)
     _write_trees(out, model.booster.trees)
 
@@ -219,6 +263,7 @@ def save_multiclass_model(model: MulticlassModel, path: String) raises:
     out += "\n"
 
     _write_mapper(out, model.mapper)
+    _write_categorical(out, model.mapper.cats)
     _write_monotone(out, model.booster.monotone)
     _write_trees(out, model.booster.trees)
 
@@ -250,10 +295,49 @@ def _read_mapper(mut r: _TokenReader, version: Int) raises -> BinMapper:
             if mb < -1 or mb >= n_bins:
                 raise Error("corrupt mapper: missing bin out of range")
             missing_bin[f] = mb
+    var cats = _read_categorical(r, n_features, n_bins)
     return BinMapper(
-        edges^, offsets^, n_features, n_bins, CategoricalSpec.none(),
-        missing_bin^,
+        edges^, offsets^, n_features, n_bins, cats^, missing_bin^,
     )
+
+
+def _read_categorical(
+    mut r: _TokenReader, n_features: Int, n_bins: Int
+) raises -> CategoricalSpec:
+    """Read the optional `categorical` section. Absent (v1 files, and any
+    model with no categorical feature) means every feature is numerical."""
+    if r.peek() != "categorical":
+        return CategoricalSpec.all_numerical(n_features)
+    _ = r.next()
+    var n_flags = r.next_int()
+    var n_codes = r.next_int()
+    if n_flags != n_features or n_codes < 0:
+        raise Error("corrupt categorical header")
+    var flags = List[Bool](capacity=n_features)
+    for _ in range(n_features):
+        flags.append(r.next_int() != 0)
+    var codes = List[Int](capacity=n_codes)
+    for _ in range(n_codes):
+        codes.append(r.next_int())
+    var offsets = List[Int](capacity=n_features + 1)
+    for _ in range(n_features + 1):
+        offsets.append(r.next_int())
+    if offsets[0] != 0 or offsets[n_features] != n_codes:
+        raise Error("corrupt categorical offsets")
+    for f in range(n_features):
+        if offsets[f + 1] < offsets[f]:
+            raise Error("corrupt categorical offsets")
+        var n_cat = offsets[f + 1] - offsets[f]
+        if n_cat >= n_bins:
+            raise Error("corrupt categorical: more categories than bins")
+        if n_cat > 0 and not flags[f]:
+            raise Error("corrupt categorical: table on a numerical feature")
+        # Category codes must be ascending within a feature for `bin_of`'s
+        # binary search to be correct.
+        for i in range(offsets[f] + 1, offsets[f + 1]):
+            if codes[i] <= codes[i - 1]:
+                raise Error("corrupt categorical: codes are not ascending")
+    return CategoricalSpec(flags^, codes^, offsets^)
 
 
 def _read_trees(
@@ -301,6 +385,26 @@ def _read_trees(
         else:
             default_left.resize(n_nodes, False)
             missing_bin.resize(n_nodes, -1)
+        # v2: the optional per-tree category sets. Absent means every node of
+        # this tree splits numerically.
+        var cat_offset = List[Int](capacity=n_nodes)
+        var cat_bitset = List[UInt64]()
+        if version >= 2 and r.peek() == "cat":
+            _ = r.next()
+            var n_words = r.next_int()
+            if n_words < 0 or n_words % CAT_BITSET_WORDS != 0:
+                raise Error("corrupt tree: category bitset size")
+            for _ in range(n_nodes):
+                var off = r.next_int()
+                if off < -1 or off > n_words - CAT_BITSET_WORDS:
+                    raise Error("corrupt tree: category set offset")
+                if off >= 0 and off % CAT_BITSET_WORDS != 0:
+                    raise Error("corrupt tree: category set offset")
+                cat_offset.append(off)
+            for _ in range(n_words):
+                cat_bitset.append(_parse_u64(r.next()))
+        else:
+            cat_offset.resize(n_nodes, -1)
         for i in range(n_nodes):
             if feature[i] >= n_features:
                 raise Error("corrupt tree: feature index out of range")
@@ -319,7 +423,8 @@ def _read_trees(
         trees.append(
             Tree(
                 feature^, threshold^, left^, right^, value^, split_gain^,
-                n_leaves, default_left^, missing_bin^,
+                n_leaves, default_left^, missing_bin^, cat_offset^,
+                cat_bitset^,
             )
         )
     return trees^

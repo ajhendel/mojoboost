@@ -22,17 +22,38 @@ LightGBM semantics, matched here:
   the hessian of each sampled small-gradient row.
 - Sampling is skipped for the first `int(1 / learning_rate)` rounds
   (LightGBM's GOSS warmup); `warmup_rounds` overrides that.
-- The random stream is LightGBM's `Random`: a 32-bit LCG reseeded every round
-  with `seed + round`, so a run is reproducible and independent of thread
-  count.
+
+Coverage: `train`, `train_with_valid`, `train_multiclass`,
+`train_multiclass_with_valid`, `fit`, `fit_multiclass`, and the GPU
+trainers `train_gpu` and `train_multiclass_gpu` all take a `goss`
+parameter. `train_custom` and `train_ranker` do not, matching where row
+bagging is wired today: the custom-objective trainers grow trees on every
+row, and the ranker samples whole queries rather than rows.
+
+RNG
+---
+Counter-based splitmix64, as in bagging.mojo, not a running stream. The draw
+for row r of round i is
+
+    stream = splitmix64(seed_bits ^ (i * GOLDEN))
+    u(r)   = splitmix64(stream + r) >> 11, scaled by 2^-53   in [0, 1)
+
+so a row's draw depends only on (seed, round, row): not on how many rows
+before it were drawn, not on what earlier rounds drew, and not on thread
+count. The forward pass still walks rows in order, because the acceptance
+probability depends on how many rows have already been taken; only the
+random numbers are independent of that walk.
 
 Intentional differences from LightGBM:
 
-- LightGBM partitions rows into blocks and gives each block its own random
-  stream, so its selection depends on the block layout; mojoboost makes one
-  serial pass over all rows with a single stream. Selected counts, the
-  threshold rule, and the multiplier are the same, the individual rows drawn
-  are not.
+- LightGBM partitions rows into blocks, gives each block its own 15-bit LCG
+  seeded from `bagging_seed`, and draws sequentially within a block, so its
+  sample depends on the block layout and its per-round streams are strongly
+  correlated (consecutive round seeds start an LCG at nearby states).
+  mojoboost draws from the counter-based stream above instead. The threshold
+  rule, the sampled counts, and the multiplier are the same; the individual
+  small-gradient rows drawn are not. This is the same trade bagging.mojo
+  makes, for the same reason.
 - `top_rate + other_rate <= 0` is rejected instead of silently training on a
   single row.
 - If the running `rest_all` reaches zero while rows are still needed, the
@@ -121,22 +142,32 @@ struct GossSelection(Copyable, Movable):
         return GossSelection(List[Int](), List[Float64](), 1.0, 0, 0)
 
 
-struct _GossRandom(Movable):
-    """LightGBM's `Random`: a 32-bit linear congruential generator with the
-    MSVC constants, returning the top 15 bits of the state. `next_float`
-    therefore yields multiples of 1/32768 in [0, 1)."""
+# Counter-based splitmix64, the same scheme bagging.mojo draws its bags
+# from (and sampling.mojo its feature sets), duplicated here rather than
+# shared so each sampler owns its stream.
+comptime _GOLDEN = UInt64(0x9E3779B97F4A7C15)
+comptime _TWO_POW_NEG_53 = 1.0 / 9007199254740992.0
 
-    var state: UInt32
 
-    def __init__(out self, seed: Int):
-        self.state = UInt32(seed & 0xFFFFFFFF)
+def _splitmix64(state: UInt64) -> UInt64:
+    var z = state + _GOLDEN
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EB
+    return z ^ (z >> 31)
 
-    def next_int15(mut self) -> Int:
-        self.state = self.state * 214013 + 2531011
-        return Int((self.state >> 16) & 0x7FFF)
 
-    def next_float(mut self) -> Float64:
-        return Float64(self.next_int15()) / 32768.0
+def _uniform(counter: UInt64) -> Float64:
+    """Uniform in [0, 1) with 53 significant bits, from a counter value."""
+    return Float64(_splitmix64(counter) >> 11) * _TWO_POW_NEG_53
+
+
+def _stream(seed: Int, round: Int) -> UInt64:
+    """Start of the counter stream for one round's sample. The sign bit is
+    masked off so the arithmetic never depends on signed-to-unsigned
+    conversion."""
+    return _splitmix64(
+        UInt64(seed & 0x7FFFFFFFFFFFFFFF) ^ (UInt64(round) * _GOLDEN)
+    )
 
 
 def _median3(a: Float64, b: Float64, c: Float64) -> Float64:
@@ -199,9 +230,10 @@ def goss_importance(
 def goss_select(
     importance: List[Float64], params: GossParams, round: Int
 ) raises -> GossSelection:
-    """Choose this round's rows from per-row importance. The RNG is reseeded
-    with `seed + round`, so the selection depends only on the importance
-    values, the rates, the seed, and the round index."""
+    """Choose this round's rows from per-row importance. Every draw comes
+    from the counter stream keyed by `(seed, round, row)`, so the selection
+    depends only on the importance values, the rates, the seed, and the
+    round index."""
     params.validate()
     var n = len(importance)
     if n == 0:
@@ -223,7 +255,7 @@ def goss_select(
     if other_k > 0:
         multiplier = Float64(n - top_k) / Float64(other_k)
 
-    var rng = _GossRandom(params.seed + round)
+    var stream = _stream(params.seed, round)
     var rows = List[Int](capacity=top_k + other_k)
     var scale = List[Float64](capacity=top_k + other_k)
     var n_top = 0
@@ -242,27 +274,13 @@ def goss_select(
                 prob = 1.0 if rest_need > 0 else 0.0
             else:
                 prob = Float64(rest_need) / Float64(rest_all)
-            # Drawn unconditionally so the stream does not depend on prob.
-            if rng.next_float() < prob:
+            # One draw per row, keyed by the row index, so a row's draw does
+            # not depend on how many rows before it happened to be drawn.
+            if _uniform(stream + UInt64(r)) < prob:
                 rows.append(r)
                 scale.append(multiplier)
                 n_other += 1
     return GossSelection(rows^, scale^, multiplier, n_top, n_other)
-
-
-def goss_select_round(
-    params: GossParams,
-    round: Int,
-    learning_rate: Float64,
-    grad: List[Float64],
-    hess: List[Float64],
-) raises -> GossSelection:
-    """This round's selection for a single-output objective, or the
-    all-rows selection while GOSS is disabled or warming up."""
-    if not params.active(round, learning_rate):
-        params.validate()
-        return GossSelection.all_rows()
-    return goss_select(goss_importance(grad, hess), params, round)
 
 
 def apply_goss_scaling(

@@ -50,6 +50,13 @@ with tests
   the boosting loop stays direct-call; validated gradients and hessians,
   framework-applied sample weights, and a Python callback path with a
   measured per-round cost (see [Custom objectives](#custom-objectives))
+- learning to rank with LambdaRank (`train_ranker`, `fit_ranker`,
+  `MojoBoostRanker`): LightGBM's NDCG-weighted pairwise lambdas and
+  hessians, `lambdarank_truncation_level`, `sigmoid`, and `lambdarank_norm`;
+  query boundaries from LightGBM's `group` array or from a query id column,
+  which is rejected when a query's rows are not contiguous; NDCG at any
+  cutoff; query-aware validation and early stopping; and bagging that
+  samples whole queries rather than rows
 - validation-set early stopping with `min_delta` for every objective,
   truncating to the best round
 - evaluation metrics: RMSE, log loss, accuracy, and ROC AUC with
@@ -59,6 +66,11 @@ with tests
 - seeded row bagging (`bagging_fraction`, `bagging_freq`, `bagging_seed`)
   from a counter-based RNG, so a bag depends only on its seed and index and
   the CPU and GPU trainers grow every round on identical rows
+- Gradient-based One-Side Sampling (`boosting="goss"`, `top_rate`,
+  `other_rate`), LightGBM's rule down to the `|grad * hess|` importance and
+  the warmup rounds: high-gradient rows kept, low-gradient rows sampled and
+  compensated, on either backend and for every objective including
+  multiclass (see [GOSS](#gradient-based-one-side-sampling))
 - seeded feature subsampling (`feature_fraction`, `feature_fraction_bynode`,
   `feature_fraction_seed`), per tree and optionally per node, without
   replacement and drawn from a counter-based RNG, with excluded features
@@ -69,8 +81,14 @@ with tests
 - SIMD histogram kernels (pointer-based scatter accumulation, vectorized
   sibling subtraction and split scans)
 - multicore CPU histogram accumulation across independent features
-- experimental portable GPU histogram accumulation, tested for correctness
-  on Apple Metal only. No NVIDIA or AMD device has ever run this code.
+- experimental portable GPU histogram accumulation that scales past one
+  threadgroup per feature: a 2D grid of (feature, row tile) threadgroups,
+  a shared-memory partial histogram per threadgroup, and a choice of two
+  ways to combine them, a deterministic reduction kernel or the original
+  global integer atomics, tiled from the device's own reported capabilities
+  (see [GPU histogram scaling](#gpu-histogram-scaling)). Tested for
+  correctness on Apple Metal only. No NVIDIA or AMD device has ever run
+  this code.
   [docs/GPU_VALIDATION.md](docs/GPU_VALIDATION.md) holds the reproducible
   procedure, the CI workflow, and the record of what has and has not been
   executed; `tests/test_gpu_portability.mojo` pins the launch limits and
@@ -83,8 +101,9 @@ with tests
   bit-exactly; multiclass models via `save_multiclass_model` and
   `load_multiclass_model`
 - scikit-learn style Python API (`MojoBoostRegressor`,
-  `MojoBoostClassifier`) backed by a CPython extension module built from
-  the same Mojo code, with sample weights and exact save/load
+  `MojoBoostClassifier`, `MojoBoostRanker`) backed by a CPython extension
+  module built from the same Mojo code, with sample weights and exact
+  save/load
 - LightGBM-native parameter names as the canonical Python vocabulary, with
   the aliases used by LightGBM's scikit-learn estimators accepted for easy
   migration; conflicting aliases raise instead of silently taking precedence
@@ -158,9 +177,10 @@ values on the host after the tree is grown, exactly as on the CPU.
 
 The `device` routing above is narrower than the trainers underneath it:
 `fit_multiclass` still resolves to the CPU, so reaching GPU multiclass
-means calling `train_multiclass_gpu` directly. GOSS is likewise CPU-only,
-and `train_multiclass_gpu` takes no `goss` parameter rather than accepting
-one it would ignore.
+means calling `train_multiclass_gpu` directly. GOSS reaches both trainers
+and every objective they cover: the sample is chosen on the host from
+Float64 gradients and handed to the device as the tree's row list, so the
+two backends sample identically.
 
 `auto`'s size heuristic ships disabled, so `auto` currently always
 resolves to the CPU. No benchmark on any device has established a
@@ -184,13 +204,80 @@ and `cuda`, and has no `auto`. mojoboost has one portable GPU backend
 rather than separate OpenCL and CUDA ones, so `gpu` covers every supported
 accelerator, and `auto` is an addition.
 
+### GPU histogram scaling
+
+Histogram accumulation launches a 2D grid: `grid.x` is the active feature,
+`grid.y` a tile of rows. A device therefore gets `n_active * n_tiles`
+threadgroups rather than one per feature, which is what lets a wide GPU stay
+busy on a dataset with few features. Each threadgroup accumulates a partial
+histogram for its (feature, row tile) in shared memory, filtering rows by
+the target leaf id.
+
+Two strategies combine those partials:
+
+| Strategy | How partials combine | Cost |
+|---|---|---|
+| `tiled` | each partial written to its own global slot, then a reduction kernel sums slots in ascending tile order | one extra kernel launch, one partial buffer |
+| `atomic` | each partial folded into the output with global integer atomics | contention on hot bins, one output memset |
+
+`atomic` is the original implementation, kept as the fallback for hardware
+where the tiled path has not been validated. Both accumulate the same exact
+fixed-point Int32 values and integer addition is associative, so the two
+produce **bit-identical** histograms; `tests/test_gpu_strategies.mojo`
+asserts that directly rather than to a tolerance, on full-dataset builds,
+leaf-filtered builds, and under feature subsampling.
+
+The launch geometry is derived at runtime from the device's own reported
+capabilities (`src/mojoboost/gpu_tiling.mojo`), not fixed at compile time,
+because the same source targets Metal, CUDA, and HIP across multiprocessor
+counts spanning more than an order of magnitude. Threads per group come
+from the device maximum rounded to a warp; row tiles per feature are the
+tightest of three bounds: enough threadgroups to fill the multiprocessors,
+enough rows per tile to pay for writing the partial, and a memory budget for
+the partial buffer. A capability a backend does not implement falls back to a
+conservative portable constant rather than failing, which matters because
+Metal rejects several of the CUDA-derived attribute queries outright.
+
+The kernels themselves use only what all three backends provide: shared
+memory, `barrier()`, integer atomics on shared memory, and plain global
+loads and stores. No warp shuffles, no float atomics (Metal has none), no
+vendor intrinsics, and no per-architecture code paths. Only the tiling
+numbers differ per device.
+
+Three environment variables override the policy, for benchmarking and for
+tests that must force one path, matching the `MOJOBOOST_` contract in
+`parallel.mojo`:
+
+| Variable | Effect |
+|---|---|
+| `MOJOBOOST_GPU_HIST_STRATEGY` | `atomic` or `tiled` forces that strategy; `auto` or unset lets the policy decide |
+| `MOJOBOOST_GPU_ROW_TILE` | rows per tile, still clamped to the memory budget |
+| `MOJOBOOST_GPU_BLOCK_THREADS` | threads per threadgroup, still clamped to the device maximum and rounded to a warp |
+
+These are tuning and test knobs rather than model parameters: they change
+how a histogram is computed, never what it equals, so they are deliberately
+absent from the Python API and from the serialization format.
+
+`pixi run bench-hist-scaling` reports the two strategies side by side with
+kernel time separated from conversion, upload, download, and setup time. Every
+measurement taken so far is Apple Metal; see
+[docs/GPU_VALIDATION.md](docs/GPU_VALIDATION.md) for what has and has not
+been run.
+
+LightGBM difference: LightGBM's GPU histogram builder is written against
+specific vendor toolchains and tunes itself with vendor-specific constants.
+mojoboost has one kernel source for every backend and moves all
+device-specific choice into the tiling policy, which is why the strategy and
+tile size are runtime values here rather than compile-time ones.
+
 ## Roadmap
 
 1. Integrate the GPU histogram backend into end-to-end training while keeping
    intermediate state device-resident
-2. Scale GPU histograms beyond one threadgroup per feature, and validate the
-   same source on NVIDIA and AMD hardware
-   ([procedure](docs/GPU_VALIDATION.md); neither has been run)
+2. Validate the same GPU source on NVIDIA and AMD hardware
+   ([procedure](docs/GPU_VALIDATION.md); neither has been run). The kernels
+   already scale past one threadgroup per feature and tile themselves from
+   device capabilities, but every measurement so far is Apple Metal
 3. Publish the Python API to PyPI (macOS arm64 wheels build and validate
    today; Linux needs a manylinux build)
 4. Broader benchmark suite (XGBoost and real datasets)
@@ -212,6 +299,10 @@ Matched to LightGBM so comparisons are apples to apples.
 | `bagging_fraction` | 1.0 (LightGBM's default) |
 | `bagging_freq` | 0, meaning no bagging (LightGBM's default) |
 | `bagging_seed` | 3 (LightGBM's default) |
+| `boosting` | `gbdt` (LightGBM's default; `goss` is the other value) |
+| `top_rate` | 0.2 (LightGBM's default, GOSS only) |
+| `other_rate` | 0.1 (LightGBM's default, GOSS only) |
+| `goss_seed` | 3 (LightGBM draws GOSS from `bagging_seed`, whose default is 3) |
 | `feature_fraction` | 1.0 (LightGBM's default) |
 | `feature_fraction_bynode` | 1.0 (LightGBM's default) |
 | `feature_fraction_seed` | 2 (LightGBM's default) |
@@ -322,6 +413,65 @@ Two intentional differences from LightGBM:
 Like the other regularizers, bagging is a training parameter only: it
 changes which trees get built, not the model format.
 
+### Gradient-based One-Side Sampling
+
+`boosting="goss"` replaces uniform row bagging with LightGBM's GOSS. Each
+round keeps the `top_rate` share of rows with the largest gradient
+magnitude, samples `other_rate` of the remaining rows, and scales the
+sampled rows' gradients and hessians by `(n - top_k) / other_k` so that the
+smaller sample still estimates the full-data histogram. Ordinary GBDT
+remains the default.
+
+```python
+MojoBoostRegressor(
+    boosting="goss", top_rate=0.2, other_rate=0.1, goss_seed=3
+).fit(X, y)
+```
+
+```mojo
+var booster = train(
+    data, target, SQUARED_ERROR, params, sample_weight=[], alpha=0.9,
+    bagging=BaggingParams.disabled(),
+    goss=GossParams.enable(top_rate=0.2, other_rate=0.1),
+)
+```
+
+The sample is the row list the tree is grown on, the same list bagging
+fills, so everything downstream follows from that: histograms, row counts,
+`min_data_in_leaf`, leaf values, and quantile/L1 leaf renewal see sampled
+rows only, and the compensation multiplier reaches the histograms because
+it is applied to the gradients before they are accumulated (or uploaded, on
+the GPU). Sample weights ride in through the gradients too, so a heavy row
+is ranked by its weighted contribution and a zero-weight row ranks last and
+contributes nothing if drawn. Multiclass draws one sample per round from
+the per-row importance summed over the round's trees, so every class's tree
+is grown on the same rows. Both backends rank rows on the host from the
+same Float64 gradients, so CPU and GPU sample identically given identical
+gradients.
+
+Row importance is `|grad * hess|`, which is what LightGBM computes, not the
+`|grad|` of the GOSS paper. Sampling starts only after
+`int(1 / learning_rate)` rounds of full-data training, again LightGBM's
+behavior; `goss_warmup_rounds` overrides that count, and `-1` (the default)
+keeps LightGBM's rule.
+
+Three intentional differences from LightGBM:
+
+- LightGBM splits the rows into blocks and gives each block its own 15-bit
+  LCG, so its sample depends on the block layout and consecutive rounds
+  start their streams at nearby states. mojoboost draws from the same
+  counter-based splitmix64 scheme bagging uses, keyed by
+  `(goss_seed, round, row index)`, so a row's draw depends on nothing that
+  happened before it. The threshold rule, the sampled counts, and the
+  multiplier are the same; the individual small-gradient rows drawn are not
+- `top_rate + other_rate <= 0` is rejected. LightGBM's `max(1, top_k)`
+  would train that configuration on a single row
+- GOSS and row bagging together are rejected. LightGBM silently disables
+  bagging in that case
+
+GOSS is a training parameter only: it changes which trees get built, not
+the model format, so serialized models are unaffected.
+
 ### Feature subsampling
 
 `feature_fraction` is LightGBM's per-tree feature sampling and
@@ -382,6 +532,11 @@ Two intentional differences from LightGBM:
   split search. Split decisions are identical, and building the superset is
   what keeps histogram subtraction exact when the by-node sets differ
   between a parent and its children
+- with interaction constraints also configured, LightGBM draws the by-node
+  set from the features the branch already allows; mojoboost draws from the
+  tree's set and then applies the allow mask, so a node can end up with fewer
+  candidates than LightGBM would give it. Both restrict to the same features;
+  only how many survive the draw differs
 
 Feature importance follows the sampled sets by construction: a tree can only
 credit features its draw allowed, which is what spreads split and gain
@@ -537,6 +692,60 @@ predictions. That is a fixed per-round cost plus a per-row copy, so it
 shrinks as a fraction of a bigger fit and dominates a small one. Use the
 native Mojo interface when the objective is on a hot path.
 
+### Learning to rank
+
+LambdaRank, LightGBM's `objective="lambdarank"`. Ranking data is a row
+matrix plus query boundaries: rows of one query are the documents retrieved
+for one search, and the label is graded relevance, an integer in [0, 30]
+with 0 meaning irrelevant. Rows of a query must be contiguous.
+
+```python
+from mojoboost import MojoBoostRanker, group_from_query_ids, ndcg_score
+
+# `group` is LightGBM's: the number of rows in each query, in row order.
+model = MojoBoostRanker(n_estimators=100).fit(X, y, group=[6, 4, 9])
+scores = model.predict(X)                  # rank each query by these
+print(model.score(X, y, group=[6, 4, 9]))  # mean NDCG@5
+
+group = group_from_query_ids(qids)         # raises on a split-up query
+print(ndcg_score(scores, y, group, at=10))
+```
+
+```mojo
+from mojoboost import BoosterParams, groups_from_counts, ndcg, train_ranker
+
+var groups = groups_from_counts(group_counts)
+var booster = train_ranker(data, labels, groups, params)
+```
+
+Within a query, every pair of documents with different labels contributes a
+lambda proportional to the NDCG the ranking would gain by swapping them,
+weighted by a pairwise logistic on the score difference.
+`lambdarank_truncation_level` (30), `sigmoid` (1.0), and `lambdarank_norm`
+(on) carry LightGBM's meanings, and the truncation level is also the cutoff
+of the maxDCG the lambdas are normalized by, as in LightGBM.
+
+Nothing crosses a query boundary. Lambdas compare only documents of the
+same query, NDCG is averaged over queries after ranking each one within
+itself, `train_ranker_with_valid` early-stops on the validation set's own
+per-query NDCG, and bagging samples whole queries (LightGBM's
+`bagging_by_query=true`) because a half-sampled query would be normalized
+against a maxDCG that no served ranking ever had. Malformed groups
+(nonpositive counts, counts that do not cover every row) and noncontiguous
+query ids are rejected rather than silently reinterpreted.
+
+A ranker serializes as an ordinary single-output model, since query
+boundaries are training data and not model state. `predict` returns raw
+scores whose order is the only meaningful thing about them: they are not
+comparable between queries.
+
+`src/mojoboost/ranking.mojo` documents the intentional differences from
+LightGBM (an exactly evaluated pairwise sigmoid instead of a lookup table,
+a fixed `label_gain`, query-level bagging, and no unbiased-lambdarank
+extensions). `pixi run -e bench compare-ranking` checks the NDCG metric
+against LightGBM's on identical scores and compares the two libraries'
+ranking quality on held-out queries.
+
 ## Development
 
 Requires [pixi](https://pixi.sh).
@@ -573,6 +782,7 @@ training and faster at binning, before multicore histogram accumulation.
 pixi run bench                 # mojoboost
 pixi run -e bench bench-lgbm --threads 1
 pixi run bench-hist            # CPU/GPU histogram microbenchmark
+pixi run bench-hist-scaling    # GPU strategy and phase breakdown
 pixi run gpu-validate          # per-device GPU validation report
 ```
 

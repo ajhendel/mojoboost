@@ -19,6 +19,7 @@ objectives ignore it.
 from std.math import exp, log
 
 from .binning import BinnedMatrix
+from .parallel import dispatch_rows
 from .metrics import _argsort
 from .bagging import (
     BaggingParams,
@@ -218,6 +219,117 @@ def _base_score(
     return mean
 
 
+def fill_grad_hess(
+    raw: List[Float64],
+    target: List[Float64],
+    objective: Int,
+    weights: List[Float64],
+    alpha: Float64,
+    mut grad: List[Float64],
+    mut hess: List[Float64],
+) raises:
+    """Per-row first and second derivatives of `objective` at the current raw
+    scores, written into `grad` and `hess`.
+
+    Both buffers are resized to `len(target)` and fully overwritten, so the
+    boosting loop hands the same two lists back every round and the training
+    run allocates them once. Rows are independent, so the work splits across
+    contiguous row blocks; each row's arithmetic is unchanged and no value is
+    summed across rows, which makes the output bit-identical at every worker
+    count.
+
+    Public because it is the gradient-generation stage the CPU profiler times
+    (bench/bench_profile.mojo); training calls it through the same entry.
+    """
+    var n = len(target)
+    if len(raw) < n:
+        raise Error("raw scores must be at least as long as the target")
+    if len(weights) > 0 and len(weights) < n:
+        raise Error("sample_weight must be at least as long as the target")
+    if len(grad) != n:
+        grad.resize(n, 0.0)
+    if len(hess) != n:
+        hess.resize(n, 0.0)
+    _fill_grad_hess_into(
+        grad, hess, raw, target, objective, weights, alpha, n
+    )
+
+
+def _fill_grad_hess_into(
+    mut grad: List[Float64],
+    mut hess: List[Float64],
+    raw: List[Float64],
+    target: List[Float64],
+    objective: Int,
+    weights: List[Float64],
+    alpha: Float64,
+    n: Int,
+) raises:
+    var gp = grad.unsafe_ptr()
+    var hp = hess.unsafe_ptr()
+    var raw_p = raw.unsafe_ptr()
+    var tgt_p = target.unsafe_ptr()
+    var w_p = weights.unsafe_ptr()
+    var weighted = len(weights) > 0
+
+    # The objective test is hoisted out of the row loop, so a block runs one
+    # straight-line body rather than re-dispatching per row.
+    def block(start: Int, end: Int) {imm}:
+        if objective == BINARY_LOGISTIC:
+            for r in range(start, end):
+                var w = w_p.unsafe_load(r) if weighted else 1.0
+                var p = _sigmoid(raw_p.unsafe_load(r))
+                gp.unsafe_store(r, w * (p - tgt_p.unsafe_load(r)))
+                var h = p * (1.0 - p)
+                if h < 1e-16:
+                    h = 1e-16
+                hp.unsafe_store(r, w * h)
+        elif objective == POISSON:
+            for r in range(start, end):
+                var w = w_p.unsafe_load(r) if weighted else 1.0
+                var raw_r = raw_p.unsafe_load(r)
+                var mu = exp(raw_r)
+                gp.unsafe_store(r, w * (mu - tgt_p.unsafe_load(r)))
+                hp.unsafe_store(
+                    r, w * exp(raw_r + _POISSON_MAX_DELTA_STEP)
+                )
+        elif objective == HUBER:
+            for r in range(start, end):
+                var w = w_p.unsafe_load(r) if weighted else 1.0
+                var diff = raw_p.unsafe_load(r) - tgt_p.unsafe_load(r)
+                if abs(diff) <= alpha:
+                    gp.unsafe_store(r, w * diff)
+                else:
+                    gp.unsafe_store(r, w * _sign(diff) * alpha)
+                hp.unsafe_store(r, w)
+        elif objective == QUANTILE:
+            for r in range(start, end):
+                var w = w_p.unsafe_load(r) if weighted else 1.0
+                var diff = raw_p.unsafe_load(r) - tgt_p.unsafe_load(r)
+                if diff >= 0.0:
+                    gp.unsafe_store(r, w * (1.0 - alpha))
+                else:
+                    gp.unsafe_store(r, w * -alpha)
+                hp.unsafe_store(r, w)
+        elif objective == L1:
+            for r in range(start, end):
+                var w = w_p.unsafe_load(r) if weighted else 1.0
+                gp.unsafe_store(
+                    r,
+                    w * _sign(raw_p.unsafe_load(r) - tgt_p.unsafe_load(r)),
+                )
+                hp.unsafe_store(r, w)
+        else:
+            for r in range(start, end):
+                var w = w_p.unsafe_load(r) if weighted else 1.0
+                gp.unsafe_store(
+                    r, w * (raw_p.unsafe_load(r) - tgt_p.unsafe_load(r))
+                )
+                hp.unsafe_store(r, w)
+
+    dispatch_rows(block, n, n)
+
+
 def _fill_grad_hess(
     raw: List[Float64],
     target: List[Float64],
@@ -226,52 +338,8 @@ def _fill_grad_hess(
     alpha: Float64,
     mut grad: List[Float64],
     mut hess: List[Float64],
-):
-    grad.clear()
-    hess.clear()
-    if objective == BINARY_LOGISTIC:
-        for r in range(len(target)):
-            var w = weights[r] if len(weights) > 0 else 1.0
-            var p = _sigmoid(raw[r])
-            grad.append(w * (p - target[r]))
-            var h = p * (1.0 - p)
-            if h < 1e-16:
-                h = 1e-16
-            hess.append(w * h)
-    elif objective == POISSON:
-        for r in range(len(target)):
-            var w = weights[r] if len(weights) > 0 else 1.0
-            var mu = exp(raw[r])
-            grad.append(w * (mu - target[r]))
-            hess.append(w * exp(raw[r] + _POISSON_MAX_DELTA_STEP))
-    elif objective == HUBER:
-        for r in range(len(target)):
-            var w = weights[r] if len(weights) > 0 else 1.0
-            var diff = raw[r] - target[r]
-            if abs(diff) <= alpha:
-                grad.append(w * diff)
-            else:
-                grad.append(w * _sign(diff) * alpha)
-            hess.append(w)
-    elif objective == QUANTILE:
-        for r in range(len(target)):
-            var w = weights[r] if len(weights) > 0 else 1.0
-            var diff = raw[r] - target[r]
-            if diff >= 0.0:
-                grad.append(w * (1.0 - alpha))
-            else:
-                grad.append(w * -alpha)
-            hess.append(w)
-    elif objective == L1:
-        for r in range(len(target)):
-            var w = weights[r] if len(weights) > 0 else 1.0
-            grad.append(w * _sign(raw[r] - target[r]))
-            hess.append(w)
-    else:
-        for r in range(len(target)):
-            var w = weights[r] if len(weights) > 0 else 1.0
-            grad.append(w * (raw[r] - target[r]))
-            hess.append(w)
+) raises:
+    fill_grad_hess(raw, target, objective, weights, alpha, grad, hess)
 
 
 def _mean_loss(

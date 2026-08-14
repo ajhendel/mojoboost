@@ -14,6 +14,12 @@ Division of labor:
   GPU  binned features, gradients/hessians, leaf assignments, histogram
        accumulation, row partitioning
 
+`train_custom_gpu` is the same loop with the gradients coming from a
+caller-supplied callable instead of a built-in objective (see
+objective.mojo). The callback stays on the host, where the raw scores live,
+and only the gradients it produces cross to the device, so a custom
+objective costs no more on the GPU than a built-in one does.
+
 Row bagging is the one exception to the no-row-lists rule, and only at the
 start of a tree: the bag decides which rows sit at the root and which sit
 out of bag, so the leaf-assignment array is written once per tree instead of

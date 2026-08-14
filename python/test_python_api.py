@@ -14,8 +14,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from mojoboost import (
     MojoBoostClassifier,
+    MojoBoostRanker,
     MojoBoostRegressor,
     gpu_available,
+    group_from_query_ids,
+    ndcg_score,
 )
 
 try:
@@ -944,9 +947,16 @@ def test_input_validation():
         raise AssertionError("predict before fit should raise")
     except RuntimeError:
         pass
+    # Gappy labels are no longer an error: they are encoded to 0..k-1 and
+    # remembered on classes_, the way a scikit-learn classifier does it.
+    gappy = MojoBoostClassifier(min_data_in_leaf=1).fit(
+        [[1.0], [2.0]], [1, 3]
+    )
+    assert list(gappy.classes_) == [1, 3]
+    assert set(gappy.predict([[1.0], [2.0]])) <= {1, 3}
     try:
-        MojoBoostClassifier().fit([[1.0], [2.0]], [1, 3])
-        raise AssertionError("gappy labels should raise")
+        MojoBoostClassifier().fit([[1.0], [2.0]], [1, 1])
+        raise AssertionError("a single class should raise")
     except ValueError:
         pass
     for bad in (
@@ -970,6 +980,148 @@ def test_input_validation():
     except ValueError:
         pass
     print("validation ok")
+
+
+def make_ranking(n_queries, docs=6, n_features=4, seed=23):
+    """Queries whose relevance is a monotone function of a latent utility,
+    graded 0..3 inside each query. Rows arrive in query order but not in
+    relevance order, so an untrained model does not already rank them."""
+    rng = _rand_stream(seed)
+    X, y, group = [], [], []
+    for _ in range(n_queries):
+        rows = [[next(rng) for _ in range(n_features)] for _ in range(docs)]
+        utility = [3.0 * r[0] + 2.0 * r[1] * r[2] for r in rows]
+        order = sorted(range(docs), key=lambda i: -utility[i])
+        labels = [0] * docs
+        for rank, i in enumerate(order):
+            labels[i] = max(0, 3 - rank)
+        X.extend(rows)
+        y.extend(labels)
+        group.append(docs)
+    return X, y, group
+
+
+def test_ranker():
+    X, y, group = make_ranking(120)
+    model = MojoBoostRanker(n_estimators=40, min_data_in_leaf=5)
+    assert model.fit(X, y, group=group) is model
+    assert model.n_features_in_ == 4
+
+    trained = model.score(X, y, group=group)
+    untrained = ndcg_score([0.0] * len(y), y, group, at=5)
+    assert untrained < 0.999, f"fixture already ranked: {untrained}"
+    assert trained > untrained, f"training did not help: {trained}"
+    assert trained > 0.99, f"train NDCG@5 too low: {trained}"
+
+    # predict returns raw scores, one per row, and ranks each query.
+    pred = list(model.predict(X))
+    assert len(pred) == len(y)
+    assert ndcg_score(pred, y, group, at=1) > 0.98
+
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "rank.mbst")
+        model.save(path)
+        loaded = MojoBoostRanker.load(path)
+        pred2 = list(loaded.predict(X))
+    assert all(a == b for a, b in zip(pred, pred2)), "round-trip not exact"
+    print(f"ranker ok (train NDCG@5 {trained:.5f})")
+
+
+def test_ranker_query_bagging_and_weights():
+    X, y, group = make_ranking(80)
+
+    plain = MojoBoostRanker(n_estimators=20, min_data_in_leaf=5).fit(
+        X, y, group=group
+    )
+    ones = MojoBoostRanker(n_estimators=20, min_data_in_leaf=5).fit(
+        X, y, group=group, sample_weight=[1.0] * len(y)
+    )
+    pa = list(plain.predict(X[:40]))
+    pb = list(ones.predict(X[:40]))
+    assert all(a == b for a, b in zip(pa, pb)), "unit weights changed the fit"
+
+    # Query bagging is reproducible from the seed and still learns.
+    bagged = [
+        MojoBoostRanker(
+            n_estimators=20,
+            min_data_in_leaf=5,
+            bagging_fraction=0.5,
+            bagging_freq=1,
+            bagging_seed=5,
+        ).fit(X, y, group=group)
+        for _ in range(2)
+    ]
+    p0 = list(bagged[0].predict(X))
+    p1 = list(bagged[1].predict(X))
+    assert all(a == b for a, b in zip(p0, p1)), "bagging is not reproducible"
+    assert ndcg_score(p0, y, group, at=5) > 0.95
+    print("ranker bagging and weights ok")
+
+
+def test_ndcg_score_semantics():
+    # Hand-checked: one perfect query and one query with nothing relevant,
+    # which LightGBM counts as 1.0.
+    labels = [1, 0, 0, 0]
+    assert ndcg_score([1.0, 0.0, 0.0, 0.0], labels, [2, 2], at=2) == 1.0
+    # Reversing the first query drops it to 1/log2(3), and the all-zero
+    # query still contributes 1.0.
+    half = ndcg_score([0.0, 1.0, 0.0, 0.0], labels, [2, 2], at=2)
+    expected = (1.0 / math.log2(3.0) + 1.0) / 2.0
+    assert abs(half - expected) < 1e-8, f"{half} != {expected}"
+
+    # Never mix queries: every document of query 1 outscores query 0's.
+    assert ndcg_score([1.0, 0.0, 11.0, 10.0], [1, 0, 1, 0], [2, 2]) == 1.0
+    print("ndcg_score ok")
+
+
+def test_group_from_query_ids():
+    assert group_from_query_ids([7, 7, 3, 3, 3, 9]) == [2, 3, 1]
+    for bad in ([0, 0, 1, 1, 0], [5, 6, 5], []):
+        try:
+            group_from_query_ids(bad)
+            raise AssertionError(f"{bad} should raise")
+        except ValueError:
+            pass
+    print("group_from_query_ids ok")
+
+
+def test_ranker_validation():
+    X, y, group = make_ranking(4)
+    n_rows = len(y)
+
+    try:
+        MojoBoostRanker().fit(X, y)
+        raise AssertionError("missing group should raise")
+    except ValueError:
+        pass
+    for bad in ([n_rows - 1], [0] * 4, [2.5] * (n_rows // 2), []):
+        try:
+            MojoBoostRanker().fit(X, y, group=bad)
+            raise AssertionError(f"group {bad} should raise")
+        except ValueError:
+            pass
+    for bad_y in ([-1] + y[1:], [31] + y[1:], [0.5] + y[1:]):
+        try:
+            MojoBoostRanker().fit(X, bad_y, group=group)
+            raise AssertionError("bad relevance labels should raise")
+        except ValueError:
+            pass
+    for bad in (
+        dict(lambdarank_truncation_level=0),
+        dict(sigmoid=0.0),
+        dict(ndcg_eval_at=0),
+    ):
+        try:
+            MojoBoostRanker(**bad).fit(X, y, group=group)
+            raise AssertionError(f"{bad} should raise")
+        except ValueError:
+            pass
+    try:
+        MojoBoostRanker().predict(X)
+        raise AssertionError("predict before fit should raise")
+    except RuntimeError:
+        pass
+    print("ranker validation ok")
 
 
 if __name__ == "__main__":
@@ -1005,4 +1157,9 @@ if __name__ == "__main__":
     test_device_gpu_unavailable()
     test_device_invalid()
     test_device_serialization()
+    test_ranker()
+    test_ranker_query_bagging_and_weights()
+    test_ndcg_score_semantics()
+    test_group_from_query_ids()
+    test_ranker_validation()
     print("all python API tests passed")

@@ -137,31 +137,51 @@ def main():
         max_bin=255,
     )
 
-    booster = lgb.LGBMRanker(
-        objective="lambdarank",
-        min_sum_hessian_in_leaf=1e-3,
-        reg_lambda=1.0,
-        lambdarank_truncation_level=TRUNCATION_LEVEL,
-        sigmoid=SIGMOID,
-        lambdarank_norm=True,
+    # LightGBM's native API, not its scikit-learn one: this benchmark
+    # environment does not install scikit-learn.
+    lgb_params = {
+        "objective": "lambdarank",
+        "metric": "ndcg",
+        "eval_at": list(EVAL_AT),
+        "num_leaves": shared["num_leaves"],
+        "learning_rate": shared["learning_rate"],
+        "min_data_in_leaf": shared["min_data_in_leaf"],
+        "min_sum_hessian_in_leaf": 1e-3,
+        "lambda_l2": 1.0,
+        "max_bin": shared["max_bin"],
+        "lambdarank_truncation_level": TRUNCATION_LEVEL,
+        "sigmoid": SIGMOID,
+        "lambdarank_norm": True,
         # mojoboost has no feature bundling; keep the comparison honest.
-        enable_bundle=False,
-        force_row_wise=True,
-        verbose=-1,
-        **shared,
+        "enable_bundle": False,
+        "force_row_wise": True,
+        "num_threads": 1,
+        "verbose": -1,
+    }
+    train_set = lgb.Dataset(
+        Xt, label=yt, group=gt, params=lgb_params, free_raw_data=False
     )
-    booster.fit(
-        Xt,
-        yt,
-        group=gt,
-        eval_set=[(Xv, yv)],
-        eval_group=[gv],
-        eval_at=list(EVAL_AT),
+    valid_set = lgb.Dataset(
+        Xv,
+        label=yv,
+        group=gv,
+        reference=train_set,
+        params=lgb_params,
+        free_raw_data=False,
     )
-    lgb_pred = booster.predict(Xv)
+    evals = {}
+    lgb_booster = lgb.train(
+        lgb_params,
+        train_set,
+        num_boost_round=args.rounds,
+        valid_sets=[valid_set],
+        valid_names=["valid"],
+        callbacks=[lgb.record_evaluation(evals)],
+    )
+    lgb_pred = lgb_booster.predict(Xv)
 
     # 1. Metric cross-check on LightGBM's own predictions.
-    reported = booster.evals_result_["valid_0"]
+    reported = evals["valid"]
     print("\nmetric cross-check (same scores, both NDCG implementations)")
     print(f"{'cutoff':>8} {'lightgbm':>12} {'mojoboost':>12} {'abs diff':>10}")
     worst = 0.0
@@ -189,7 +209,7 @@ def main():
         theirs = ndcg_score(lgb_pred, yv, gv, at=k)
         ours = ndcg_score(our_pred, yv, gv, at=k)
         print(f"{k:>8} {theirs:>12.6f} {ours:>12.6f} {ours - theirs:>+10.6f}")
-    print(f"\nlightgbm trees: {booster.booster_.num_trees()}")
+    print(f"\nlightgbm trees: {lgb_booster.num_trees()}")
     print(f"mojoboost trees: {model.best_iteration_}")
 
 

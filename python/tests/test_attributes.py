@@ -71,8 +71,9 @@ def test_feature_names_in_from_a_dataframe(regression):
     frame = pd.DataFrame(X, columns=["a", "b", "c", "d"])
     est = MojoBoostRegressor(n_estimators=5).fit(frame, y)
     assert list(est.feature_names_in_) == ["a", "b", "c", "d"]
-    # Predicting on the same frame is silent and agrees with the array.
-    assert np.allclose(est.predict(frame), est.predict(X))
+    # Names are recorded, not used: the fit is the same as on the array.
+    plain = MojoBoostRegressor(n_estimators=5).fit(X, y)
+    assert np.allclose(est.predict(frame), plain.predict(X))
 
 
 def test_no_feature_names_without_string_columns(regression):

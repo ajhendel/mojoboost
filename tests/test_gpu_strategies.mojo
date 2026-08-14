@@ -15,12 +15,7 @@ from std.sys import has_accelerator
 from std.testing import assert_equal, assert_true, TestSuite
 
 from mojoboost.binning import bin_equal_width, BinnedMatrix
-from mojoboost.gpu_tiling import (
-    STRATEGY_ATOMIC,
-    STRATEGY_TILED,
-    query_device_caps,
-    strategy_name,
-)
+from mojoboost.gpu_tiling import STRATEGY_ATOMIC, STRATEGY_TILED
 from mojoboost.histogram import (
     Histogram,
     build_histogram,
@@ -220,10 +215,7 @@ def test_strategies_agree_under_feature_subsampling() raises:
         var tiled = GpuHistogramBuilder(data, STRATEGY_TILED)
         atomic.set_features(active)
         tiled.set_features(active)
-        assert_true(
-            tiled.tiling.partial_cells
-            <= tiled.part_capacity
-        )
+        assert_true(tiled.tiling.partial_cells <= tiled.part_capacity)
 
         var a = atomic.build(gh[0], gh[1])
         var t = tiled.build(gh[0], gh[1])

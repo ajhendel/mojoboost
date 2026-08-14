@@ -24,6 +24,27 @@ jobs:
       - name: Run tests
         run: pixi run test
 
+  # The Python API: the dependency-free suite in the default environment,
+  # then the estimator suite with pytest, scikit-learn, and pandas. Both
+  # build the extension module first (test-python and test-estimators
+  # depend on build-python).
+  python:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: prefix-dev/setup-pixi@v0.10.1
+        with:
+          cache: true
+          environments: default pytest
+      - name: Python API tests
+        run: pixi run test-python
+      - name: Estimator tests
+        run: pixi run -e pytest test-estimators
+
   # Manual benchmark profiles (workflow_dispatch) on x86-64 and ARM64.
   # lscpu flags show whether the x86 runner has avx2/avx512f, which is the
   # input for any future width-specific fast path.

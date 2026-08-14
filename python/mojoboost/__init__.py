@@ -51,6 +51,13 @@ with bench/bench_custom_objective.py before reaching for it, and use the
 native Mojo interface (src/mojoboost/objective.mojo) when the objective sits
 on a hot path.
 
+`monotone_constraints` takes LightGBM's parameter as one entry per feature,
+`1` for nondecreasing, `-1` for nonincreasing, `0` for unconstrained, e.g.
+`[1, 0, -1]`. Predictions are then monotone in those features at any feature
+value, not just on the training data. For a multiclass classifier the
+guarantee is on each class's raw score, not on `predict_proba`. See
+src/mojoboost/monotone.mojo for the method and its limits.
+
 `interaction_constraints` takes LightGBM's parameter as a list of
 feature-index lists, e.g. `[[0, 1], [2, 3]]`. Two features may share a
 root-to-leaf path only if one group holds both, and transitively everything
@@ -226,6 +233,7 @@ class _Base(_ParamsMixin):
         device="cpu",
         device_type=None,
         interaction_constraints=None,
+        monotone_constraints=None,
         bagging_fraction=1.0,
         subsample=None,
         bagging_freq=0,
@@ -259,6 +267,7 @@ class _Base(_ParamsMixin):
         self.device = device
         self.device_type = device_type
         self.interaction_constraints = interaction_constraints
+        self.monotone_constraints = monotone_constraints
         self.bagging_fraction = bagging_fraction
         self.subsample = subsample
         self.bagging_freq = bagging_freq
@@ -324,6 +333,40 @@ class _Base(_ParamsMixin):
             _array.array("d", [float(o) for o in offsets]),
         )
 
+    def _monotone_buffer(self, n_features):
+        """Validated float64 buffer for `monotone_constraints` and its address
+        (the buffer must stay referenced while the address is in use);
+        `(None, 0)` when unconstrained.
+
+        One entry per feature, each exactly -1, 0, or 1. Fractional values are
+        rejected here rather than truncated at the boundary, where the buffer
+        is read as integers."""
+        signs = self.monotone_constraints
+        if signs is None:
+            return None, 0
+        if isinstance(signs, (str, bytes)):
+            raise ValueError(
+                "monotone_constraints must be a sequence of -1, 0, and 1"
+                " values, not a string"
+            )
+        values = list(signs)
+        if len(values) != n_features:
+            raise ValueError(
+                f"monotone_constraints has {len(values)} entries but X has"
+                f" {n_features} features"
+            )
+        out = []
+        for f, value in enumerate(values):
+            sign = float(value)
+            if sign not in (-1.0, 0.0, 1.0):
+                raise ValueError(
+                    f"monotone_constraints[{f}] must be -1, 0, or 1, got"
+                    f" {value!r}"
+                )
+            out.append(sign)
+        buf = _array.array("d", out)
+        return buf, _addr(buf)
+
     def _resolve_boosting(self):
         """The effective boosting strategy, "gbdt" or "goss".
 
@@ -370,7 +413,12 @@ class _Base(_ParamsMixin):
         return alias_value
 
     def _params(
-        self, sample_weight_addr, device, ic_flat=None, ic_offsets=None
+        self,
+        sample_weight_addr,
+        device,
+        ic_flat=None,
+        ic_offsets=None,
+        monotone_addr=0,
     ):
         min_data_in_leaf = self._resolve_alias(
             "min_data_in_leaf", "min_child_samples", 20
@@ -459,6 +507,7 @@ class _Base(_ParamsMixin):
             "interaction_offsets_len": (
                 0 if ic_offsets is None else len(ic_offsets)
             ),
+            "monotone_addr": int(monotone_addr),
         }
 
     def _resolve_device(self, n_rows, n_features, n_outputs):
@@ -724,10 +773,11 @@ class MojoBoostRegressor(_Base):
         yb = _arrays.check_target(y, n_rows)
         wb, w_addr = self._weight_buffer(sample_weight, n_rows)
         ic_flat, ic_offsets = self._interaction_buffers(n_features)
+        mono_buf, mono_addr = self._monotone_buffer(n_features)
         device = self._resolve_device(n_rows, n_features, 1)
-        params = self._params(w_addr, device, ic_flat, ic_offsets)
+        params = self._params(w_addr, device, ic_flat, ic_offsets, mono_addr)
         if objective == _CUSTOM:
-            self._fit_custom(Xb, yb, wb, n_rows, n_features, params, device)
+            self._fit_custom(Xb, yb, n_rows, n_features, params, device)
         else:
             self._model = _mojoboost.fit(
                 _addr(Xb),
@@ -754,7 +804,7 @@ class MojoBoostRegressor(_Base):
             return 0.0, 1
         return float(self.base_score), 0
 
-    def _fit_custom(self, Xb, yb, wb, n_rows, n_features, params, device):
+    def _fit_custom(self, Xb, yb, n_rows, n_features, params, device):
         """Train against a Python objective callback.
 
         The callback is called once per boosting round with the current raw
@@ -914,6 +964,7 @@ class MojoBoostClassifier(_Base):
         n_classes = len(classes)
         wb, w_addr = self._weight_buffer(sample_weight, n_rows)
         ic_flat, ic_offsets = self._interaction_buffers(n_features)
+        mono_buf, mono_addr = self._monotone_buffer(n_features)
         # Binary is single-output (one tree per round), so it has a GPU
         # path; only the softmax ensemble is CPU-only.
         device = self._resolve_device(
@@ -927,7 +978,7 @@ class MojoBoostClassifier(_Base):
                 n_features,
                 _addr(yb),
                 _BINARY_LOGISTIC,
-                self._params(w_addr, device, ic_flat, ic_offsets),
+                self._params(w_addr, device, ic_flat, ic_offsets, mono_addr),
             )
         else:
             self._model = _mojoboost.fit_multiclass(
@@ -936,7 +987,7 @@ class MojoBoostClassifier(_Base):
                 n_features,
                 _addr(yb),
                 n_classes,
-                self._params(w_addr, device, ic_flat, ic_offsets),
+                self._params(w_addr, device, ic_flat, ic_offsets, mono_addr),
             )
         self.classes_ = (
             _np.asarray(classes) if _np is not None else list(classes)
@@ -1224,6 +1275,7 @@ class MojoBoostRanker(_Base):
         gb = _group_buffer(group, n_rows)
         wb, w_addr = self._weight_buffer(sample_weight, n_rows)
         ic_flat, ic_offsets = self._interaction_buffers(n_features)
+        mono_buf, mono_addr = self._monotone_buffer(n_features)
         device = self._resolve_device(n_rows, n_features, 1)
         if device != "cpu":
             raise RuntimeError(
@@ -1231,7 +1283,7 @@ class MojoBoostRanker(_Base):
                 "device='auto'"
             )
         params = self._rank_params(
-            self._params(w_addr, device, ic_flat, ic_offsets), gb
+            self._params(w_addr, device, ic_flat, ic_offsets, mono_addr), gb
         )
         self._model = _mojoboost.fit_ranker(
             _addr(Xb), n_rows, n_features, _addr(yb), params

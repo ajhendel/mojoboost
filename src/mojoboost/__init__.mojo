@@ -8,6 +8,18 @@ from .bagging import (
     refresh_bag,
     sample_rows,
 )
+from .categorical import (
+    CAT_BITSET_WORDS,
+    CategoricalParams,
+    CategoricalSpec,
+    cat_add,
+    cat_contains,
+    cat_empty,
+    cat_pool_contains,
+    find_best_categorical_split,
+    fit_categorical_spec,
+)
+from .gain import leaf_score
 from .binning import BinMapper, BinnedMatrix, bin_equal_width, fit_bins
 from .histogram import (
     Histogram,

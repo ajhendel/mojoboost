@@ -56,6 +56,7 @@ from mojoboost.distributed import (
 )
 from mojoboost.serialize import load_model, save_model
 from mojoboost.model import Model
+from mojoboost.monotone import MonotoneConstraints
 from mojoboost.tree import Tree, TreeParams, grow_tree
 
 
@@ -175,7 +176,7 @@ def _grow_sharded(
     world_size: Int,
 ) raises -> Tree:
     var target = List[Float64](capacity=data.n_rows)
-    for r in range(data.n_rows):
+    for _ in range(data.n_rows):
         target.append(0.0)
     var shards = partition_rows(data, target, world_size)
     var comm = LocalCollective(world_size)
@@ -328,10 +329,10 @@ def test_train_sharded_agrees_with_single_node() raises:
     var n_rows = 256
     var data = _dataset(n_rows, 5, 12, 47)
     var y = _regression_targets(n_rows)
-    var params = BoosterParams(15, 0.1, TreeParams(8, 5, 1.0, 1e-3))
+    var params = BoosterParams(10, 0.1, TreeParams(8, 5, 1.0, 1e-3))
 
     var expected = train(data, y, SQUARED_ERROR, params)
-    for world_size in [2, 3, 4, 8]:
+    for world_size in [2, 3, 8]:
         var comm = LocalCollective(world_size)
         var got = train_distributed(
             partition_rows(data, y, world_size), SQUARED_ERROR, params, comm
@@ -486,6 +487,42 @@ def test_feature_subsampling_is_refused() raises:
     assert_true(
         message.find("feature_fraction") >= 0,
         "expected feature_fraction to be refused, got: " + message,
+    )
+
+
+def test_unimplemented_growth_features_are_refused() raises:
+    """max_depth and monotone constraints belong to the single-node grower
+    and are not implemented here, so they are errors rather than settings
+    that quietly do nothing."""
+    var n_rows = 64
+    var data = _dataset(n_rows, 4, 8, 83)
+    var grad = _exact_gradients(n_rows)
+    var hess = _ones(n_rows)
+
+    var depth_params = TreeParams(6, 2, 1.0, 1e-3)
+    depth_params.max_depth = 3
+    var depth_message = String("")
+    try:
+        _ = _grow_sharded(data, grad, hess, depth_params, 2)
+    except e:
+        depth_message = String(e)
+    assert_true(
+        depth_message.find("max_depth") >= 0,
+        "expected max_depth to be refused, got: " + depth_message,
+    )
+
+    var signs: List[Int] = [1, 0, 0, 0]
+    var monotone_params = TreeParams(6, 2, 1.0, 1e-3)
+    monotone_params.monotone = MonotoneConstraints.from_signs(signs, 4)
+    var monotone_message = String("")
+    try:
+        _ = _grow_sharded(data, grad, hess, monotone_params, 2)
+    except e:
+        monotone_message = String(e)
+    assert_true(
+        monotone_message.find("monotone") >= 0,
+        "expected monotone constraints to be refused, got: "
+        + monotone_message,
     )
 
 

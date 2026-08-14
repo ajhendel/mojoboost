@@ -9,10 +9,12 @@ matters most: with GOSS disabled, training is bit-for-bit what it was
 before GOSS existed.
 """
 
+from std.os import remove
 from std.testing import assert_equal, assert_true, TestSuite
 
 from mojoboost import (
     BINARY_LOGISTIC,
+    CPU_DEVICE,
     QUANTILE,
     SQUARED_ERROR,
     BaggingParams,
@@ -23,11 +25,16 @@ from mojoboost import (
     bin_equal_width,
     build_histogram,
     build_histogram_subset,
+    fit,
     goss_importance,
     goss_select,
+    load_model,
+    save_model,
     train,
     train_multiclass,
 )
+
+comptime _TMP_PATH = "./.test_goss_roundtrip.tmp"
 
 
 def _splitmix64(state: UInt64) -> UInt64:
@@ -578,6 +585,42 @@ def test_multiclass_shares_one_sample_per_round() raises:
         for k in range(3):
             assert_equal(original[k], repeated[k])
     assert_true(Float64(correct) / Float64(n_rows) > 0.85)
+
+
+def test_sampled_model_round_trips() raises:
+    # GOSS changes which rows a tree is grown on, not what a tree is, so the
+    # model format is untouched and a sampled model must save and load
+    # bit-exactly like any other.
+    var n_rows = 400
+    var n_features = 3
+    var features = _features(n_rows, n_features)
+    var target = _regression_target(features, n_rows)
+    var params = BoosterParams(20, 0.2, TreeParams(15, 10, 1.0, 1e-3))
+
+    var model = fit(
+        features,
+        n_rows,
+        n_features,
+        target,
+        SQUARED_ERROR,
+        params,
+        64,
+        [],
+        0.9,
+        CPU_DEVICE,
+        BaggingParams.disabled(),
+        GossParams.enable(0.2, 0.1, 3, 0),
+    )
+    save_model(model, _TMP_PATH)
+    var loaded = load_model(_TMP_PATH)
+    remove(_TMP_PATH)
+
+    assert_equal(len(model.booster.trees), len(loaded.booster.trees))
+    for r in range(n_rows):
+        var row = List[Float64](capacity=n_features)
+        for f in range(n_features):
+            row.append(features[f * n_rows + r])
+        assert_equal(model.predict(row), loaded.predict(row))
 
 
 def main() raises:

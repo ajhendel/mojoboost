@@ -1,0 +1,648 @@
+MOJOBOOST LIGHTGBM FEATURE-COMPLETENESS TASKS
+============================================
+
+Purpose
+-------
+
+These are implementation prompts for closing the remaining gap between
+MojoBoost and LightGBM's public capabilities. Copy and send ONE task at a
+time, in order unless the task explicitly says it can be moved. Do not run
+these tasks concurrently: many change the estimator, model, serialization,
+training loop, or binding ABI.
+
+"Feature complete" here means the parity matrix and tests created by Task 1
+have no unsupported cells in the agreed v1 scope. It does not mean claiming
+LightGBM's maturity, performance, platform coverage, numerical identity, or
+years of compatibility. Never advertise those without evidence.
+
+Upstream references (stable LightGBM 4.7.0 when this file was written):
+
+- https://lightgbm.readthedocs.io/en/stable/Python-API.html
+- https://lightgbm.readthedocs.io/en/stable/pythonapi/lightgbm.LGBMRegressor.html
+- https://lightgbm.readthedocs.io/en/stable/pythonapi/lightgbm.Booster.html
+- https://lightgbm.readthedocs.io/en/stable/Parameters.html
+
+The first paragraph under every task is intentionally repeated so each task
+can be copied independently.
+
+
+TASK 1: CREATE AN EXECUTABLE FEATURE-PARITY CONTRACT
+====================================================
+
+Work in the `mojoboost` repository. Inspect the current implementation, open
+tasks, tests, README claims, and `git status` before editing because the
+project is evolving quickly. Preserve unrelated and concurrent work. First
+prove whether a requested capability already exists; strengthen it instead
+of duplicating it. Keep Mojo as the training implementation and the Python
+layer thin. Match current LightGBM semantics and names where users depend on
+them, retain documented MojoBoost improvements, reject conflicting aliases,
+and do not copy deprecated options merely for historical compatibility. Add
+focused unit, integration, differential, serialization, and failure tests as
+appropriate. Update bindings, docs, types, and serialization together when a
+public contract changes. Run the relevant focused tests, then the complete
+Mojo and Python suites, wheel smoke tests when Python changes, and
+`git diff --check`. Do not commit unless asked. Do not weaken or skip a test
+to obtain a pass. Do not claim correctness, performance, portability,
+distribution, or parity without reproducible evidence.
+
+Create `docs/LIGHTGBM_PARITY.md` as the authoritative, versioned contract.
+Audit LightGBM 4.7's stable Python API, estimator APIs, Booster/Dataset APIs,
+parameters, prediction options, callbacks, data inputs, objectives, metrics,
+distributed modes, model inspection, and packaging. For every public item,
+record: supported, partially supported, intentionally different, deferred
+outside v1, or unsupported; link to its tests and implementation; explain
+semantic differences. Add a small script/test that verifies named public
+symbols and prevents supported rows from silently disappearing. Correct any
+README claims contradicted by the audit. Define a realistic v1 scope, but do
+not mark difficult high-value functionality out of scope merely to make the
+matrix green.
+
+
+TASK 2: PYTHON VALIDATION SETS, METRICS, AND EARLY STOPPING
+==========================================================
+
+Work in the `mojoboost` repository. Inspect the current implementation, open
+tasks, tests, README claims, and `git status` before editing because the
+project is evolving quickly. Preserve unrelated and concurrent work. First
+prove whether a requested capability already exists; strengthen it instead
+of duplicating it. Keep Mojo as the training implementation and the Python
+layer thin. Match current LightGBM semantics and names where users depend on
+them, retain documented MojoBoost improvements, reject conflicting aliases,
+and do not copy deprecated options merely for historical compatibility. Add
+focused unit, integration, differential, serialization, and failure tests as
+appropriate. Update bindings, docs, types, and serialization together when a
+public contract changes. Run the relevant focused tests, then the complete
+Mojo and Python suites, wheel smoke tests when Python changes, and
+`git diff --check`. Do not commit unless asked. Do not weaken or skip a test
+to obtain a pass. Do not claim correctness, performance, portability,
+distribution, or parity without reproducible evidence.
+
+Expose validation end to end for regressor, classifier, and ranker. Support
+`eval_set=[(X_valid, y_valid)]` and multiple sets, `eval_names`,
+`eval_sample_weight`, `eval_metric`, and the LightGBM 4.7 `eval_X`/`eval_y`
+convenience forms. Also accept the simpler backwards-compatible
+`eval_set=(X_valid, y_valid)`. Implement `early_stopping_rounds` as a useful
+convenience even though modern LightGBM prefers its callback. Correctly choose
+metric direction, require validation data, retain or roll back to the best
+iteration, and expose `best_iteration_`, `best_score_`, `evals_result_`, and
+`n_iter_`. Cover multiclass and ranking groups. Test malformed sets, weights,
+names, multiple metrics, ties, min-delta behavior, and CPU/GPU equivalence.
+
+
+TASK 3: CALLBACK SYSTEM WITH A STABLE ITERATION ENVIRONMENT
+===========================================================
+
+Work in the `mojoboost` repository. Inspect the current implementation, open
+tasks, tests, README claims, and `git status` before editing because the
+project is evolving quickly. Preserve unrelated and concurrent work. First
+prove whether a requested capability already exists; strengthen it instead
+of duplicating it. Keep Mojo as the training implementation and the Python
+layer thin. Match current LightGBM semantics and names where users depend on
+them, retain documented MojoBoost improvements, reject conflicting aliases,
+and do not copy deprecated options merely for historical compatibility. Add
+focused unit, integration, differential, serialization, and failure tests as
+appropriate. Update bindings, docs, types, and serialization together when a
+public contract changes. Run the relevant focused tests, then the complete
+Mojo and Python suites, wheel smoke tests when Python changes, and
+`git diff --check`. Do not commit unless asked. Do not weaken or skip a test
+to obtain a pass. Do not claim correctness, performance, portability,
+distribution, or parity without reproducible evidence.
+
+Implement `callbacks=` for estimator fit and the functional training API.
+Define and document a stable callback environment with iteration, begin/end,
+parameters, model handle, and evaluation results. Provide compatible
+`early_stopping()`, `log_evaluation()`, `record_evaluation()`, and
+`reset_parameter()` factories. Honor callback ordering and before/after
+iteration phases. Propagate callback exceptions without corrupting fitted
+state. Avoid per-row Python callbacks; one boundary crossing per iteration is
+acceptable and must be benchmarked. Test ordering, parameter schedules,
+disabled logging, early stopping, custom callback mutation rules, exceptions,
+and interaction with continued training.
+
+
+TASK 4: ITERATION-RANGED, RAW-SCORE, AND LEAF-INDEX PREDICTION
+=============================================================
+
+Work in the `mojoboost` repository. Inspect the current implementation, open
+tasks, tests, README claims, and `git status` before editing because the
+project is evolving quickly. Preserve unrelated and concurrent work. First
+prove whether a requested capability already exists; strengthen it instead
+of duplicating it. Keep Mojo as the training implementation and the Python
+layer thin. Match current LightGBM semantics and names where users depend on
+them, retain documented MojoBoost improvements, reject conflicting aliases,
+and do not copy deprecated options merely for historical compatibility. Add
+focused unit, integration, differential, serialization, and failure tests as
+appropriate. Update bindings, docs, types, and serialization together when a
+public contract changes. Run the relevant focused tests, then the complete
+Mojo and Python suites, wheel smoke tests when Python changes, and
+`git diff --check`. Do not commit unless asked. Do not weaken or skip a test
+to obtain a pass. Do not claim correctness, performance, portability,
+distribution, or parity without reproducible evidence.
+
+Extend native and Python prediction with `raw_score`, `start_iteration`,
+`num_iteration`, `pred_leaf`, and `validate_features`. Use `best_iteration_`
+by default after early stopping following LightGBM semantics. Leaf prediction
+must return stable per-tree leaf indices with documented shapes for binary,
+regression, and multiclass models. Make incompatible prediction flags raise
+clear errors. Test iteration slicing by manually summing tree outputs, raw
+score transformations, feature-name validation, multiclass shapes, empty
+ranges, serialization stability, and CPU/GPU-trained models.
+
+
+TASK 5: EXACT FEATURE CONTRIBUTIONS
+===================================
+
+Work in the `mojoboost` repository. Inspect the current implementation, open
+tasks, tests, README claims, and `git status` before editing because the
+project is evolving quickly. Preserve unrelated and concurrent work. First
+prove whether a requested capability already exists; strengthen it instead
+of duplicating it. Keep Mojo as the training implementation and the Python
+layer thin. Match current LightGBM semantics and names where users depend on
+them, retain documented MojoBoost improvements, reject conflicting aliases,
+and do not copy deprecated options merely for historical compatibility. Add
+focused unit, integration, differential, serialization, and failure tests as
+appropriate. Update bindings, docs, types, and serialization together when a
+public contract changes. Run the relevant focused tests, then the complete
+Mojo and Python suites, wheel smoke tests when Python changes, and
+`git diff --check`. Do not commit unless asked. Do not weaken or skip a test
+to obtain a pass. Do not claim correctness, performance, portability,
+distribution, or parity without reproducible evidence.
+
+Implement `predict(..., pred_contrib=True)` using exact TreeSHAP or another
+exact, documented algorithm—not split-gain attribution. Return one value per
+feature plus the expected-value column, with shapes compatible with LightGBM
+for regression/binary and a clearly tested multiclass representation. Ensure
+each row's contributions sum to the raw model score within tolerance. Handle
+missing and categorical splits, repeated features, depth-zero trees,
+iteration ranges, sparse input, and multiclass. Add analytical tiny-tree
+tests plus differential tests against an independent SHAP implementation.
+
+
+TASK 6: CONTINUED TRAINING, INIT SCORES, AND MODEL MERGING
+=========================================================
+
+Work in the `mojoboost` repository. Inspect the current implementation, open
+tasks, tests, README claims, and `git status` before editing because the
+project is evolving quickly. Preserve unrelated and concurrent work. First
+prove whether a requested capability already exists; strengthen it instead
+of duplicating it. Keep Mojo as the training implementation and the Python
+layer thin. Match current LightGBM semantics and names where users depend on
+them, retain documented MojoBoost improvements, reject conflicting aliases,
+and do not copy deprecated options merely for historical compatibility. Add
+focused unit, integration, differential, serialization, and failure tests as
+appropriate. Update bindings, docs, types, and serialization together when a
+public contract changes. Run the relevant focused tests, then the complete
+Mojo and Python suites, wheel smoke tests when Python changes, and
+`git diff --check`. Do not commit unless asked. Do not weaken or skip a test
+to obtain a pass. Do not claim correctness, performance, portability,
+distribution, or parity without reproducible evidence.
+
+Support `fit(..., init_model=...)` from a fitted MojoBoost estimator, native
+model, model file, or model bytes/string, and `init_score` plus
+`eval_init_score`. Append trees without altering old trees or bin mappings.
+Validate objective, class ordering, feature schema, categorical metadata,
+device limitations, and parameter compatibility. Decide and document whether
+new data may extend categorical dictionaries or thresholds; reject unsafe
+cases. Add native model append/merge operations only where mathematically
+sound. Test one 100-round fit versus 40+60 continued rounds, early stopping,
+serialization boundaries, ranking, multiclass, and failure atomicity.
+
+
+TASK 7: DATASET AND BOOSTER-LEVEL PYTHON APIS
+============================================
+
+Work in the `mojoboost` repository. Inspect the current implementation, open
+tasks, tests, README claims, and `git status` before editing because the
+project is evolving quickly. Preserve unrelated and concurrent work. First
+prove whether a requested capability already exists; strengthen it instead
+of duplicating it. Keep Mojo as the training implementation and the Python
+layer thin. Match current LightGBM semantics and names where users depend on
+them, retain documented MojoBoost improvements, reject conflicting aliases,
+and do not copy deprecated options merely for historical compatibility. Add
+focused unit, integration, differential, serialization, and failure tests as
+appropriate. Update bindings, docs, types, and serialization together when a
+public contract changes. Run the relevant focused tests, then the complete
+Mojo and Python suites, wheel smoke tests when Python changes, and
+`git diff --check`. Do not commit unless asked. Do not weaken or skip a test
+to obtain a pass. Do not claim correctness, performance, portability,
+distribution, or parity without reproducible evidence.
+
+Add useful `Dataset`, `Booster`, and `train()` APIs with LightGBM-familiar
+names. Dataset must own or safely reference data, labels, weights, groups,
+init scores, feature names, categorical declarations, and binning metadata.
+Booster must expose prediction, evaluation, feature importance, model IO,
+tree/model inspection, current iteration, and continued updates. Do not copy
+every historical mutator if it conflicts with safe ownership in Mojo; mark
+intentional differences in the parity matrix. Make estimators wrap the same
+Booster rather than maintain a second model abstraction. Add lifecycle,
+ownership, garbage collection, pickling, and estimator/Booster equivalence
+tests.
+
+
+TASK 8: NATIVE CATEGORICAL DATA THROUGH THE PYTHON API
+======================================================
+
+Work in the `mojoboost` repository. Inspect the current implementation, open
+tasks, tests, README claims, and `git status` before editing because the
+project is evolving quickly. Preserve unrelated and concurrent work. First
+prove whether a requested capability already exists; strengthen it instead
+of duplicating it. Keep Mojo as the training implementation and the Python
+layer thin. Match current LightGBM semantics and names where users depend on
+them, retain documented MojoBoost improvements, reject conflicting aliases,
+and do not copy deprecated options merely for historical compatibility. Add
+focused unit, integration, differential, serialization, and failure tests as
+appropriate. Update bindings, docs, types, and serialization together when a
+public contract changes. Run the relevant focused tests, then the complete
+Mojo and Python suites, wheel smoke tests when Python changes, and
+`git diff --check`. Do not commit unless asked. Do not weaken or skip a test
+to obtain a pass. Do not claim correctness, performance, portability,
+distribution, or parity without reproducible evidence.
+
+Expose the existing native categorical implementation through `fit` using
+`categorical_feature="auto"`, feature names/indices, pandas categorical
+dtypes, and integer-coded NumPy inputs. Persist category metadata and enforce
+the same mapping at prediction. Define unseen, missing, negative, and very
+large category behavior. Support categorical splits on CPU and every claimed
+GPU path or raise before training. Add multiclass, ranking, serialization,
+continued-training, feature-name, and LightGBM differential tests. Never
+silently treat declared categories as ordered numerical values.
+
+
+TASK 9: SPARSE CSR/CSC INPUT WITHOUT DENSIFICATION
+==================================================
+
+Work in the `mojoboost` repository. Inspect the current implementation, open
+tasks, tests, README claims, and `git status` before editing because the
+project is evolving quickly. Preserve unrelated and concurrent work. First
+prove whether a requested capability already exists; strengthen it instead
+of duplicating it. Keep Mojo as the training implementation and the Python
+layer thin. Match current LightGBM semantics and names where users depend on
+them, retain documented MojoBoost improvements, reject conflicting aliases,
+and do not copy deprecated options merely for historical compatibility. Add
+focused unit, integration, differential, serialization, and failure tests as
+appropriate. Update bindings, docs, types, and serialization together when a
+public contract changes. Run the relevant focused tests, then the complete
+Mojo and Python suites, wheel smoke tests when Python changes, and
+`git diff --check`. Do not commit unless asked. Do not weaken or skip a test
+to obtain a pass. Do not claim correctness, performance, portability,
+distribution, or parity without reproducible evidence.
+
+Connect scipy CSR and CSC matrices to the existing native sparse path without
+dense conversion. Support training, validation, prediction, sample weights,
+ranking, iteration slicing, leaf indices, contributions, missing values, and
+serialization. Specify absent-entry semantics independently from explicit
+zero and NaN. Accept 32- and 64-bit index arrays safely. Add memory tests that
+would fail if a large sparse matrix were densified, dense/sparse equivalence
+tests, malformed-index tests, and representative LightGBM comparisons.
+
+
+TASK 10: MODERN TABLE AND SEQUENCE INPUTS
+=========================================
+
+Work in the `mojoboost` repository. Inspect the current implementation, open
+tasks, tests, README claims, and `git status` before editing because the
+project is evolving quickly. Preserve unrelated and concurrent work. First
+prove whether a requested capability already exists; strengthen it instead
+of duplicating it. Keep Mojo as the training implementation and the Python
+layer thin. Match current LightGBM semantics and names where users depend on
+them, retain documented MojoBoost improvements, reject conflicting aliases,
+and do not copy deprecated options merely for historical compatibility. Add
+focused unit, integration, differential, serialization, and failure tests as
+appropriate. Update bindings, docs, types, and serialization together when a
+public contract changes. Run the relevant focused tests, then the complete
+Mojo and Python suites, wheel smoke tests when Python changes, and
+`git diff --check`. Do not commit unless asked. Do not weaken or skip a test
+to obtain a pass. Do not claim correctness, performance, portability,
+distribution, or parity without reproducible evidence.
+
+Support pandas DataFrame/Series robustly, then PyArrow Table/ChunkedArray and
+Polars DataFrame/Series when those optional dependencies exist. Preserve
+feature names and categorical metadata, reject ambiguous mixed schemas, and
+avoid copies when a safe contiguous/buffer route exists. Keep plain Python
+sequences and NumPy dependency-optional. Add optional-dependency tests,
+chunked/null data tests, non-contiguous input tests, dtype boundary tests,
+feature reorder validation, and documentation of copy behavior.
+
+
+TASK 11: COMPLETE OBJECTIVE, METRIC, AND WEIGHTING COVERAGE
+==========================================================
+
+Work in the `mojoboost` repository. Inspect the current implementation, open
+tasks, tests, README claims, and `git status` before editing because the
+project is evolving quickly. Preserve unrelated and concurrent work. First
+prove whether a requested capability already exists; strengthen it instead
+of duplicating it. Keep Mojo as the training implementation and the Python
+layer thin. Match current LightGBM semantics and names where users depend on
+them, retain documented MojoBoost improvements, reject conflicting aliases,
+and do not copy deprecated options merely for historical compatibility. Add
+focused unit, integration, differential, serialization, and failure tests as
+appropriate. Update bindings, docs, types, and serialization together when a
+public contract changes. Run the relevant focused tests, then the complete
+Mojo and Python suites, wheel smoke tests when Python changes, and
+`git diff --check`. Do not commit unless asked. Do not weaken or skip a test
+to obtain a pass. Do not claim correctness, performance, portability,
+distribution, or parity without reproducible evidence.
+
+Audit LightGBM objectives and metrics against native MojoBoost. Implement the
+high-value missing set with correct gradients, Hessians, transforms, metric
+direction, aliases, and parameters: regression variants, binary/multiclass,
+cross entropy, Poisson, Gamma, Tweedie, quantile, Huber, fair, MAPE, ranking,
+AUC/AP, log loss/error, regression losses, and NDCG/MAP as applicable. Add
+`class_weight` including `balanced`, per-class weighting, custom evaluation
+functions, multiple metrics, and ranker evaluation groups. Use finite-
+difference objective tests and trusted-reference metric tests. Explicitly
+list lower-priority unsupported objectives rather than shipping placeholders.
+
+
+TASK 12: REMAINING TREE CONSTRAINTS AND TRAINING PARAMETERS
+==========================================================
+
+Work in the `mojoboost` repository. Inspect the current implementation, open
+tasks, tests, README claims, and `git status` before editing because the
+project is evolving quickly. Preserve unrelated and concurrent work. First
+prove whether a requested capability already exists; strengthen it instead
+of duplicating it. Keep Mojo as the training implementation and the Python
+layer thin. Match current LightGBM semantics and names where users depend on
+them, retain documented MojoBoost improvements, reject conflicting aliases,
+and do not copy deprecated options merely for historical compatibility. Add
+focused unit, integration, differential, serialization, and failure tests as
+appropriate. Update bindings, docs, types, and serialization together when a
+public contract changes. Run the relevant focused tests, then the complete
+Mojo and Python suites, wheel smoke tests when Python changes, and
+`git diff --check`. Do not commit unless asked. Do not weaken or skip a test
+to obtain a pass. Do not claim correctness, performance, portability,
+distribution, or parity without reproducible evidence.
+
+Audit and implement the remaining high-value tree parameters, including
+`min_gain_to_split`, `min_sum_hessian_in_leaf`, maximum delta step, path
+smoothness, forced splits, extra/randomized trees, per-feature penalties,
+feature pre-filter behavior, categorical regularization/threshold controls,
+linear-tree mode if feasible, and monotone penalty/method options. Preserve
+leaf-wise growth and deterministic seeds. Each parameter needs an isolated
+behavioral test proving it changes the intended decision, parameter
+validation, CPU/GPU parity or an early explicit rejection, and Python/native
+exposure. Update the parity matrix parameter by parameter.
+
+
+TASK 13: EFB AND LARGE-SPARSE-DATA SCALING
+==========================================
+
+Work in the `mojoboost` repository. Inspect the current implementation, open
+tasks, tests, README claims, and `git status` before editing because the
+project is evolving quickly. Preserve unrelated and concurrent work. First
+prove whether a requested capability already exists; strengthen it instead
+of duplicating it. Keep Mojo as the training implementation and the Python
+layer thin. Match current LightGBM semantics and names where users depend on
+them, retain documented MojoBoost improvements, reject conflicting aliases,
+and do not copy deprecated options merely for historical compatibility. Add
+focused unit, integration, differential, serialization, and failure tests as
+appropriate. Update bindings, docs, types, and serialization together when a
+public contract changes. Run the relevant focused tests, then the complete
+Mojo and Python suites, wheel smoke tests when Python changes, and
+`git diff --check`. Do not commit unless asked. Do not weaken or skip a test
+to obtain a pass. Do not claim correctness, performance, portability,
+distribution, or parity without reproducible evidence.
+
+Implement Exclusive Feature Bundling for sparse mutually exclusive features.
+Specify conflict measurement, bundle construction, offset encoding, split
+recovery, missing/zero semantics, determinism, and serialization. Keep an
+unbundled fallback. Add adversarial collision tests, categorical interaction
+tests, dense-equivalence quality tests, memory accounting, and benchmarks on
+real high-dimensional sparse datasets. Enable it automatically only after
+benchmarks establish conservative thresholds; otherwise expose an explicit
+option and report why the heuristic chose each path.
+
+
+TASK 14: MODEL INSPECTION, DUMPING, EDITING, AND VISUALIZATION DATA
+=================================================================
+
+Work in the `mojoboost` repository. Inspect the current implementation, open
+tasks, tests, README claims, and `git status` before editing because the
+project is evolving quickly. Preserve unrelated and concurrent work. First
+prove whether a requested capability already exists; strengthen it instead
+of duplicating it. Keep Mojo as the training implementation and the Python
+layer thin. Match current LightGBM semantics and names where users depend on
+them, retain documented MojoBoost improvements, reject conflicting aliases,
+and do not copy deprecated options merely for historical compatibility. Add
+focused unit, integration, differential, serialization, and failure tests as
+appropriate. Update bindings, docs, types, and serialization together when a
+public contract changes. Run the relevant focused tests, then the complete
+Mojo and Python suites, wheel smoke tests when Python changes, and
+`git diff --check`. Do not commit unless asked. Do not weaken or skip a test
+to obtain a pass. Do not claim correctness, performance, portability,
+distribution, or parity without reproducible evidence.
+
+Expose `booster_`, `feature_name_`, `n_features_`, `n_iter_`, `objective_`,
+`best_score_`, and stable model inspection. Implement `dump_model()` with
+tree/node structure, thresholds or category sets, default directions, counts,
+weights, gains, depths, leaf values, objective metadata, and feature names.
+Add `trees_to_dataframe()` and split-value histogram data. Provide plotting
+helpers only as optional thin consumers of the stable dump schema. If leaf
+editing or refit is offered, define its invariants and test it thoroughly;
+otherwise mark those Booster methods unsupported. Add schema-version and
+round-trip tests so inspection output remains usable across releases.
+
+
+TASK 15: CROSS-VALIDATION AND CVBOOSTER
+=======================================
+
+Work in the `mojoboost` repository. Inspect the current implementation, open
+tasks, tests, README claims, and `git status` before editing because the
+project is evolving quickly. Preserve unrelated and concurrent work. First
+prove whether a requested capability already exists; strengthen it instead
+of duplicating it. Keep Mojo as the training implementation and the Python
+layer thin. Match current LightGBM semantics and names where users depend on
+them, retain documented MojoBoost improvements, reject conflicting aliases,
+and do not copy deprecated options merely for historical compatibility. Add
+focused unit, integration, differential, serialization, and failure tests as
+appropriate. Update bindings, docs, types, and serialization together when a
+public contract changes. Run the relevant focused tests, then the complete
+Mojo and Python suites, wheel smoke tests when Python changes, and
+`git diff --check`. Do not commit unless asked. Do not weaken or skip a test
+to obtain a pass. Do not claim correctness, performance, portability,
+distribution, or parity without reproducible evidence.
+
+Implement `cv()` and `CVBooster` over the shared Dataset/Booster layer.
+Support explicit folds and sklearn splitters, seeded shuffled K-fold,
+stratification for classifiers, group-safe ranking folds, multiple metrics,
+custom metrics, callbacks, early stopping, training metrics, and returning
+the fitted fold boosters. Return stable mean/std metric histories using
+LightGBM-familiar names. Prevent preprocessing leakage. Test reproducibility,
+unequal fold sizes, custom folds, ranking groups, early stopping consensus,
+serialization, and agreement with manual fold loops.
+
+
+TASK 16: REAL DISTRIBUTED TRAINING BACKENDS
+===========================================
+
+Work in the `mojoboost` repository. Inspect the current implementation, open
+tasks, tests, README claims, and `git status` before editing because the
+project is evolving quickly. Preserve unrelated and concurrent work. First
+prove whether a requested capability already exists; strengthen it instead
+of duplicating it. Keep Mojo as the training implementation and the Python
+layer thin. Match current LightGBM semantics and names where users depend on
+them, retain documented MojoBoost improvements, reject conflicting aliases,
+and do not copy deprecated options merely for historical compatibility. Add
+focused unit, integration, differential, serialization, and failure tests as
+appropriate. Update bindings, docs, types, and serialization together when a
+public contract changes. Run the relevant focused tests, then the complete
+Mojo and Python suites, wheel smoke tests when Python changes, and
+`git diff --check`. Do not commit unless asked. Do not weaken or skip a test
+to obtain a pass. Do not claim correctness, performance, portability,
+distribution, or parity without reproducible evidence.
+
+Turn the current distributed interface/local prototype into at least one
+real multi-process, multi-host-capable backend. Define data-parallel histogram
+aggregation, global split agreement, deterministic reductions, rank/world
+configuration, networking/collective transport, timeouts, cancellation,
+failure propagation, and checkpoint/restart behavior. Keep collectives behind
+an interface so MPI/NCCL/other transports can follow. Start with CPU and add
+GPU collectives only when correct. Build hermetic two-process integration
+tests, partition-equivalence tests, mismatched-schema failures, worker-loss
+tests, and multi-host CI or a reproducible validation harness. Do not call a
+local mock "distributed training" in docs.
+
+
+TASK 17: DASK INTEGRATION AFTER DISTRIBUTED CORE IS REAL
+=======================================================
+
+Work in the `mojoboost` repository. Inspect the current implementation, open
+tasks, tests, README claims, and `git status` before editing because the
+project is evolving quickly. Preserve unrelated and concurrent work. First
+prove whether a requested capability already exists; strengthen it instead
+of duplicating it. Keep Mojo as the training implementation and the Python
+layer thin. Match current LightGBM semantics and names where users depend on
+them, retain documented MojoBoost improvements, reject conflicting aliases,
+and do not copy deprecated options merely for historical compatibility. Add
+focused unit, integration, differential, serialization, and failure tests as
+appropriate. Update bindings, docs, types, and serialization together when a
+public contract changes. Run the relevant focused tests, then the complete
+Mojo and Python suites, wheel smoke tests when Python changes, and
+`git diff --check`. Do not commit unless asked. Do not weaken or skip a test
+to obtain a pass. Do not claim correctness, performance, portability,
+distribution, or parity without reproducible evidence.
+
+Only after Task 16 passes real multi-process tests, add optional
+`DaskMojoBoostRegressor`, `DaskMojoBoostClassifier`, and
+`DaskMojoBoostRanker`. Accept Dask Array/DataFrame inputs, preserve partitions
+without gathering the full dataset on the client, map workers to the native
+distributed runtime, and return distributed predictions. Test local-cluster
+training/prediction, repartitioning, worker restarts, categorical metadata,
+ranking groups, early stopping, and parity with single-process models. Keep
+Dask optional and import-safe when absent.
+
+
+TASK 18: PLATFORM, ACCELERATOR, AND WHEEL MATRIX
+===============================================
+
+Work in the `mojoboost` repository. Inspect the current implementation, open
+tasks, tests, README claims, and `git status` before editing because the
+project is evolving quickly. Preserve unrelated and concurrent work. First
+prove whether a requested capability already exists; strengthen it instead
+of duplicating it. Keep Mojo as the training implementation and the Python
+layer thin. Match current LightGBM semantics and names where users depend on
+them, retain documented MojoBoost improvements, reject conflicting aliases,
+and do not copy deprecated options merely for historical compatibility. Add
+focused unit, integration, differential, serialization, and failure tests as
+appropriate. Update bindings, docs, types, and serialization together when a
+public contract changes. Run the relevant focused tests, then the complete
+Mojo and Python suites, wheel smoke tests when Python changes, and
+`git diff --check`. Do not commit unless asked. Do not weaken or skip a test
+to obtain a pass. Do not claim correctness, performance, portability,
+distribution, or parity without reproducible evidence.
+
+Build a truthful release matrix for macOS ARM64 and supported Linux x86_64 /
+ARM64 targets and Python versions permitted by Mojo. Produce self-contained
+wheels with correct platform tags; do not label a wheel portable if it embeds
+architecture-specific binaries. Add clean-container install/import/fit/
+predict/serialize smoke tests. Validate CPU on x86 and ARM, then GPU on actual
+Apple, NVIDIA, and AMD hardware where Mojo supports them. Record hardware,
+driver, compiler, pass/fail, quality equivalence, and end-to-end benchmarks in
+`docs/GPU_VALIDATION.md`. Unsupported combinations must fail clearly or be
+absent from published artifacts. Add release automation only after local
+artifacts pass the same checks.
+
+
+TASK 19: REAL-DATA DIFFERENTIAL QUALITY AND PERFORMANCE HARNESS
+==============================================================
+
+Work in the `mojoboost` repository. Inspect the current implementation, open
+tasks, tests, README claims, and `git status` before editing because the
+project is evolving quickly. Preserve unrelated and concurrent work. First
+prove whether a requested capability already exists; strengthen it instead
+of duplicating it. Keep Mojo as the training implementation and the Python
+layer thin. Match current LightGBM semantics and names where users depend on
+them, retain documented MojoBoost improvements, reject conflicting aliases,
+and do not copy deprecated options merely for historical compatibility. Add
+focused unit, integration, differential, serialization, and failure tests as
+appropriate. Update bindings, docs, types, and serialization together when a
+public contract changes. Run the relevant focused tests, then the complete
+Mojo and Python suites, wheel smoke tests when Python changes, and
+`git diff --check`. Do not commit unless asked. Do not weaken or skip a test
+to obtain a pass. Do not claim correctness, performance, portability,
+distribution, or parity without reproducible evidence.
+
+Create a reproducible benchmark and differential-quality harness spanning
+numerical dense regression, imbalanced binary classification, multiclass,
+ranking, categorical data, missing values, and high-dimensional sparse data.
+Pin datasets by URL and checksum or provide deterministic generators. Compare
+MojoBoost with LightGBM using aligned semantics and thread counts; report
+quality metrics, training time, prediction time, peak memory, model size, and
+CPU/GPU transfer/setup costs separately. Add generous regression thresholds
+to CI for correctness and keep noisy performance gating in a controlled
+benchmark job. Publish raw JSON/CSV results plus environment metadata.
+
+
+TASK 20: COMPATIBILITY, DEPRECATION, AND RELEASE CONTRACT
+=========================================================
+
+Work in the `mojoboost` repository. Inspect the current implementation, open
+tasks, tests, README claims, and `git status` before editing because the
+project is evolving quickly. Preserve unrelated and concurrent work. First
+prove whether a requested capability already exists; strengthen it instead
+of duplicating it. Keep Mojo as the training implementation and the Python
+layer thin. Match current LightGBM semantics and names where users depend on
+them, retain documented MojoBoost improvements, reject conflicting aliases,
+and do not copy deprecated options merely for historical compatibility. Add
+focused unit, integration, differential, serialization, and failure tests as
+appropriate. Update bindings, docs, types, and serialization together when a
+public contract changes. Run the relevant focused tests, then the complete
+Mojo and Python suites, wheel smoke tests when Python changes, and
+`git diff --check`. Do not commit unless asked. Do not weaken or skip a test
+to obtain a pass. Do not claim correctness, performance, portability,
+distribution, or parity without reproducible evidence.
+
+Define MojoBoost's public stability policy before calling the library 1.0.
+Inventory public Python and Mojo symbols, parameter aliases/defaults, fitted
+attributes, model formats, inspection schemas, callback environment, and ABI.
+Add API snapshot tests, backward model fixtures, and upgrade tests. Establish
+semantic versioning and a deprecation process with warnings and at least one
+release of overlap. Explicitly document where compatibility follows LightGBM
+and where MojoBoost intentionally differs. Remove false parity claims. Finish
+with a clean-install tutorial that trains, validates, early-stops, inspects,
+saves, loads, continues training, predicts leaves/contributions, uses sparse
+and categorical input, and selects CPU/GPU. The release gate is: every v1 row
+in `docs/LIGHTGBM_PARITY.md` is supported and linked to a passing test.
+
+
+RECOMMENDED EXECUTION ORDER
+===========================
+
+1. Task 1 establishes the contract.
+2. Tasks 2-4 establish training and prediction lifecycle semantics.
+3. Tasks 5-7 add explanations, continuation, and the shared public core.
+4. Tasks 8-10 expose the native data capabilities to real Python users.
+5. Tasks 11-14 close algorithm, parameter, scaling, and inspection gaps.
+6. Task 15 adds cross-validation.
+7. Tasks 16-17 add genuinely distributed operation and Dask integration.
+8. Tasks 18-19 prove portability, quality, and performance.
+9. Task 20 creates the compatibility and release contract.
+
+After every task, require Claude Code to report:
+
+- exact supported behavior and intentional differences;
+- files changed;
+- focused and full commands run, with pass/fail counts;
+- unrun checks and why they were not run;
+- parity-matrix rows changed;
+- remaining risks and the next dependency-unblocked task.

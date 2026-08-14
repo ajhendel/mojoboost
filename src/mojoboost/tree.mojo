@@ -469,7 +469,6 @@ def partition_rows_into(
                 ri += 1
 
     run_row_blocks(blocks, scatter_block)
-    return RowPartition(left^, right^)
 
 
 struct _HistPool(Movable):
@@ -697,16 +696,20 @@ def grow_tree(
         var split_missing_bin = -1 if split.is_categorical else (
             data.missing_bin[split.feature]
         )
-        var parts = partition_rows(
-            data, frontier[best_i].rows, split, split_missing_bin
-        )
-        # Move both lists out with swaps so `parts` remains a valid,
-        # destructible value; moving fields out individually leaves a
-        # partially destroyed struct, which Mojo rejects.
+        # Each child's rows are handed to its `_LeafState` below, so the two
+        # lists cannot be recycled across splits; the `_into` form is used
+        # anyway because it sizes them exactly in one shot instead of growing
+        # them by doubling.
         var left_rows = List[Int]()
         var right_rows = List[Int]()
-        swap(left_rows, parts.left)
-        swap(right_rows, parts.right)
+        partition_rows_into(
+            left_rows,
+            right_rows,
+            data,
+            frontier[best_i].rows,
+            split,
+            split_missing_bin,
+        )
 
         # The parent's histogram is read once more, by the subtraction below,
         # and is dead after that; moving it out here is what lets its buffer

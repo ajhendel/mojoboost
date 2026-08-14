@@ -66,6 +66,15 @@ INTENTIONAL DIFFERENCES FROM LightGBM
   vector reflects nothing but the order the rows were handed in.
 - Positional/unbiased-lambdarank extensions and LightGBM's `kMinScore`
   filtering of dropped documents are not implemented.
+
+Numerics
+--------
+Position discounts come from Mojo's `log2`, whose relative error is around
+1e-10, so NDCG values agree with LightGBM's to about 1e-9 rather than to
+machine precision. `bench/compare_ranking.py` measures that gap on real
+predictions. Everything else here is exact Float64 arithmetic, and the
+gain, discount, and lambda formulas are exercised against hand-derived
+values in tests/test_ranking.mojo.
 """
 
 from std.math import exp, log2
@@ -279,8 +288,15 @@ def _sorted_gains(labels: List[Int], start: Int, cnt: Int) -> List[Float64]:
     return out^
 
 
-def max_dcg(labels: List[Int], start: Int, cnt: Int, k: Int) -> Float64:
+def max_dcg(labels: List[Int], start: Int, cnt: Int, k: Int) raises -> Float64:
     """The best DCG at cutoff k attainable by this query's labels."""
+    for i in range(cnt):
+        if labels[start + i] < 0 or labels[start + i] > MAX_RELEVANCE_LABEL:
+            raise Error(
+                "relevance labels must be in [0, "
+                + String(MAX_RELEVANCE_LABEL)
+                + "]"
+            )
     var gains = _sorted_gains(labels, start, cnt)
     var m = k if k < cnt else cnt
     var discounts = _discounts(m)
@@ -292,7 +308,7 @@ def max_dcg(labels: List[Int], start: Int, cnt: Int, k: Int) -> Float64:
 
 def _inverse_max_dcgs(
     labels: List[Int], groups: RankGroups, k: Int
-) -> List[Float64]:
+) raises -> List[Float64]:
     """1 / maxDCG@k per query, or 0.0 for a query with no attainable DCG
     (every label 0), which zeroes that query's lambdas as in LightGBM."""
     var out = List[Float64](capacity=groups.n_queries())

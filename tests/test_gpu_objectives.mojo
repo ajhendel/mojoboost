@@ -452,7 +452,7 @@ def test_gpu_unsplittable_data_matches_cpu() raises:
 
 
 def test_gpu_min_data_in_leaf_blocks_every_split() raises:
-    """min_data_in_leaf above half the rows leaves the root unsplittable, so
+    """A min_data_in_leaf above half the rows leaves the root unsplittable, so
     every tree is a single leaf. Huber keeps the gradients from summing to
     zero, so training does not converge away before the case is exercised."""
     comptime if not has_accelerator():
@@ -558,7 +558,8 @@ def test_gpu_trainer_rejects_bad_inputs() raises:
         print("skipped: no accelerator")
     else:
         var n_rows = 200
-        var n_features = 3
+        # _signal reads features 0..3, so this is the minimum width.
+        var n_features = 4
         var features = _make_features(n_rows, n_features)
         var data = bin_equal_width(features, n_rows, n_features, 16)
         var target = _regression_target(features, n_rows)

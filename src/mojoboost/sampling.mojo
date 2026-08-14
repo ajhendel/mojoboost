@@ -29,6 +29,12 @@ id) instead. Selections are therefore reproducible per tree and per node
 regardless of history, thread count, or which trees were grown, at the cost
 of not reproducing LightGBM's exact subsets for a given seed. The
 distribution and the per-selection algorithm are the same.
+
+A second difference shows up only with interaction constraints: LightGBM
+draws the per-node set from the features the branch already allows, while
+these draws come from the tree's set and the allow mask is applied
+afterwards, in the split search. The candidates are drawn from the same
+pool either way; a node can simply end up with fewer of them here.
 """
 
 # LightGBM's feature_fraction_seed default.
