@@ -1437,7 +1437,10 @@ def test_sparse_validation():
         MojoBoostRegressor(device="gpu").fit(csc, y)
         raise AssertionError("device='gpu' should raise for sparse input")
     except RuntimeError as exc:
-        assert "sparse" in str(exc)
+        # An accelerator-enabled build reaches the sparse capability check;
+        # a CPU-only build correctly refuses the explicit GPU request first.
+        message = str(exc)
+        assert "sparse" in message or "no accelerator" in message
 
     # Custom objectives are dense-only for now.
     try:
