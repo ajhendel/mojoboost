@@ -323,8 +323,10 @@ def _check_compressed(
                 )
 
 
-def csc_from_dense(
-    features: List[Float64], n_rows: Int, n_features: Int
+def csc_from_dense[
+    features_origin: ImmOrigin, //
+](
+    features: Span[Float64, features_origin], n_rows: Int, n_features: Int
 ) raises -> CscMatrix:
     """Build a CSC matrix from a column-major dense matrix, dropping zeros.
     Test and benchmark helper: real callers should never materialize the
@@ -346,8 +348,10 @@ def csc_from_dense(
     return CscMatrix(row_index^, values^, col_offsets^, n_rows, n_features)
 
 
-def csr_from_dense(
-    features: List[Float64], n_rows: Int, n_features: Int
+def csr_from_dense[
+    features_origin: ImmOrigin, //
+](
+    features: Span[Float64, features_origin], n_rows: Int, n_features: Int
 ) raises -> CsrMatrix:
     """`csc_from_dense`'s row-oriented twin, from the same column-major dense
     matrix. Test and benchmark helper."""

@@ -1621,8 +1621,10 @@ def train_ranker_with_builtin_metrics(
     )
 
 
-def fit_with_metrics[F: MetricSetFn & Copyable](
-    features: List[Float64],
+def fit_with_metrics[
+    F: MetricSetFn & Copyable, features_origin: ImmOrigin, //
+](
+    features: Span[Float64, features_origin],
     n_rows: Int,
     n_features: Int,
     target: List[Float64],
@@ -1679,9 +1681,10 @@ def fit_with_metrics[F: MetricSetFn & Copyable](
 
 
 def fit_with_callbacks[
-    F: MetricSetFn & Copyable, C: IterationFn & Copyable
+    F: MetricSetFn & Copyable, C: IterationFn & Copyable,
+    features_origin: ImmOrigin, //
 ](
-    features: List[Float64],
+    features: Span[Float64, features_origin],
     n_rows: Int,
     n_features: Int,
     target: List[Float64],
@@ -2177,8 +2180,10 @@ def _bin_valid_sets(
     return binned^
 
 
-def fit_multiclass_with_metrics[F: MetricSetFn & Copyable](
-    features: List[Float64],
+def fit_multiclass_with_metrics[
+    F: MetricSetFn & Copyable, features_origin: ImmOrigin, //
+](
+    features: Span[Float64, features_origin],
     n_rows: Int,
     n_features: Int,
     labels: List[Int],
@@ -2230,8 +2235,10 @@ def fit_multiclass_with_metrics[F: MetricSetFn & Copyable](
     )
 
 
-def fit_ranker_with_metrics[F: MetricSetFn & Copyable](
-    features: List[Float64],
+def fit_ranker_with_metrics[
+    F: MetricSetFn & Copyable, features_origin: ImmOrigin, //
+](
+    features: Span[Float64, features_origin],
     n_rows: Int,
     n_features: Int,
     labels: List[Int],

@@ -1048,8 +1048,10 @@ def train_boosting_multiclass_with_valid(
     )
 
 
-def fit_boosting(
-    features: List[Float64],
+def fit_boosting[
+    features_origin: ImmOrigin, //
+](
+    features: Span[Float64, features_origin],
     n_rows: Int,
     n_features: Int,
     target: List[Float64],

@@ -226,8 +226,10 @@ struct CategoricalSpec(Copyable, Movable):
         return UNKNOWN_BIN
 
 
-def _distinct_codes_and_counts(
-    features: List[Float64],
+def _distinct_codes_and_counts[
+    features_origin: ImmOrigin, //
+](
+    features: Span[Float64, features_origin],
     n_rows: Int,
     feature: Int,
     mut codes: List[Int],
@@ -278,8 +280,10 @@ def _keep_most_frequent(
     return kept^
 
 
-def fit_categorical_spec(
-    features: List[Float64],
+def fit_categorical_spec[
+    features_origin: ImmOrigin, //
+](
+    features: Span[Float64, features_origin],
     n_rows: Int,
     n_features: Int,
     categorical_features: List[Int],

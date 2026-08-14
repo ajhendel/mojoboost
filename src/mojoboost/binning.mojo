@@ -1010,10 +1010,17 @@ struct BinMapper(Copyable, Movable):
                 left = mid + 1
         return left - lo
 
-    def transform(
-        self, features: List[Float64], n_rows: Int
+    def transform[
+        features_origin: ImmOrigin, //
+    ](
+        self, features: Span[Float64, features_origin], n_rows: Int
     ) raises -> BinnedMatrix:
-        """Bin a column-major feature matrix (`features[f * n_rows + r]`)."""
+        """Bin a column-major feature matrix (`features[f * n_rows + r]`).
+
+        `features` is a borrowed view, so a caller holding the matrix
+        somewhere other than a Mojo `List` -- the Python bindings hold
+        NumPy's own buffer -- bins it in place instead of copying it first.
+        A `List` converts implicitly, so passing one still works."""
         if len(features) != n_rows * self.n_features:
             raise Error("features length must equal n_rows * n_features")
         var n_features = self.n_features
@@ -1125,8 +1132,10 @@ struct BinMapper(Copyable, Movable):
         return out^
 
 
-def fit_bins(
-    features: List[Float64],
+def fit_bins[
+    features_origin: ImmOrigin, //
+](
+    features: Span[Float64, features_origin],
     n_rows: Int,
     n_features: Int,
     max_bins: Int = 255,
@@ -1377,8 +1386,13 @@ def map_forced_splits(
     return ForcedSplits(forced.nodes.copy(), bins^)
 
 
-def bin_equal_width(
-    features: List[Float64], n_rows: Int, n_features: Int, n_bins: Int
+def bin_equal_width[
+    features_origin: ImmOrigin, //
+](
+    features: Span[Float64, features_origin],
+    n_rows: Int,
+    n_features: Int,
+    n_bins: Int,
 ) raises -> BinnedMatrix:
     """Bin a column-major feature matrix (`features[f * n_rows + r]`) into
     equal-width bins per feature. This mapper-free path has no missing-value

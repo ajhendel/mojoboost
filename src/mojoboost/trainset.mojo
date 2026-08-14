@@ -78,6 +78,8 @@ mapper codec is the point. `Dataset.from_binned_dense` and
 read from a file carries no raw matrix, so it cannot be `subset`.
 """
 
+from std.memory import unsafe_memcpy
+
 from .bagging import BaggingParams
 from .binning import BinMapper, BinnedMatrix, fit_bins
 from .boosting import (
@@ -268,9 +270,11 @@ struct Dataset(Copyable, Movable, Writable):
     var max_bin: Int
     var use_missing: Bool
 
-    def __init__(
+    def __init__[
+        features_origin: ImmOrigin, //
+    ](
         out self,
-        features: List[Float64],
+        features: Span[Float64, features_origin],
         n_rows: Int,
         n_features: Int,
         var label: List[Float64] = [],
@@ -317,7 +321,17 @@ struct Dataset(Copyable, Movable, Writable):
         self.sparse_data = _empty_sparse_binned(n_features)
         self.is_sparse = False
         if keep_raw:
-            self.raw = RawData.dense(features.copy(), n_rows, n_features)
+            # The only copy of the raw matrix left on this path, and the one
+            # that cannot be avoided: `keep_raw` is the caller asking the
+            # dataset to outlive their buffer, so the dataset has to own it.
+            # Binning above read the borrowed view directly.
+            var owned = List[Float64](unsafe_uninit_length=len(features))
+            unsafe_memcpy(
+                dest=owned.unsafe_ptr(),
+                src=features.unsafe_ptr(),
+                count=len(features),
+            )
+            self.raw = RawData.dense(owned^, n_rows, n_features)
         else:
             self.raw = RawData.none()
         self.borrowed_binning = False

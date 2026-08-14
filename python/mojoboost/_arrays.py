@@ -7,6 +7,14 @@ matrices) that the caller keeps referenced for the duration of the call.
 numpy is used when available and `array.array` otherwise, so the estimators
 work on a plain Python install.
 
+Keeping the buffer referenced is a memory-safety requirement, not
+bookkeeping. The native side *borrows* the feature matrix rather than
+copying it (`_f64_view` in bindings/_mojoboost.mojo), which is what keeps a
+large fit from holding two copies of `X` at once, so the array a call took
+the address of has to outlive that call. Every call site here holds the
+buffer in a local for the duration; the eval-set loop, which would
+otherwise rebind its buffer each iteration, holds them all in `keep`.
+
 The second is validating what the caller passed before any of it reaches
 Mojo, which is where a bad shape or dtype would otherwise surface as an
 opaque error. The rules follow LightGBM's scikit-learn wrapper, which

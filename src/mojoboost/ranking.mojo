@@ -853,8 +853,10 @@ def train_ranker_with_valid(
     )
 
 
-def fit_ranker(
-    features: List[Float64],
+def fit_ranker[
+    features_origin: ImmOrigin, //
+](
+    features: Span[Float64, features_origin],
     n_rows: Int,
     n_features: Int,
     labels: List[Int],

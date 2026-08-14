@@ -418,6 +418,39 @@ def _f64_list(addr: Int, n: Int) raises -> List[Float64]:
     return out^
 
 
+def _f64_view(addr: Int, n: Int) raises -> Span[Float64, ImmUntrackedOrigin]:
+    """Borrow a float64 buffer (NumPy's X) instead of copying it.
+
+    The feature matrix is the one input where the copy is worth avoiding,
+    and not for the reason it looks like: `_f64_list` moves it at memory
+    speed, a low single-digit percentage of an ingest. What the copy costs
+    is *space*. It doubles the resident footprint of the matrix for as long
+    as binning runs, so a 5,000,000 x 100 fit holds 4 GB of NumPy plus 4 GB
+    of Mojo, and on a machine that can afford one of those but not both the
+    difference is not a percentage.
+
+    Borrowing is sound here because the matrix is read, never written, and
+    is dead early: `fit_bins` and `BinMapper.transform` are the only things
+    that look at it, and after transform the trainer works on the binned
+    `UInt8` matrix. It stays alive throughout because the Python wrapper
+    holds the array it took the address of (see `_arrays.column_major`,
+    whose contract is exactly that) for the whole call.
+
+    The origin is untracked because the owner is on the other side of the
+    boundary and Mojo cannot see it. That is the same contract `_f64_list`
+    already relies on for its source pointer; the difference is only how
+    long it has to hold, which is the length of one call either way.
+
+    Not every input can do this. A buffer that outlives the call must be
+    copied, so `dataset_create` still takes `_f64_list` -- a `Dataset` keeps
+    its matrix -- and so do the validation sets, which `RawValidSet` owns.
+    """
+    if addr == 0 or n < 0:
+        raise Error("invalid buffer")
+    var p = Pointer[Float64, ImmUntrackedOrigin](unsafe_from_address=addr)
+    return Span[Float64, ImmUntrackedOrigin](unsafe_ptr=p, length=n)
+
+
 def _int_list_from_f64(addr: Int, n: Int) raises -> List[Int]:
     if addr == 0 or n < 0:
         raise Error("invalid buffer")
@@ -479,8 +512,13 @@ def _csr(params: PythonObject) raises -> CsrMatrix:
     )
 
 
-def _row(
-    features: List[Float64], n_rows: Int, n_features: Int, r: Int
+def _row[
+    features_origin: ImmOrigin, //
+](
+    features: Span[Float64, features_origin],
+    n_rows: Int,
+    n_features: Int,
+    r: Int,
 ) -> List[Float64]:
     var row = List[Float64](capacity=n_features)
     for f in range(n_features):
@@ -674,7 +712,7 @@ def fit(
     """Train a single-output model. Buffers are float64; X is column-major."""
     var nr = Int(py=n_rows)
     var nf = Int(py=n_features)
-    var features = _f64_list(Int(py=x_addr), nr * nf)
+    var features = _f64_view(Int(py=x_addr), nr * nf)
     var target = _f64_list(Int(py=y_addr), nr)
     # The device is read before the parameters because bundling is applied
     # by the dense CPU trainer and not by the GPU one, so `_parse_params`
@@ -724,7 +762,7 @@ def fit_custom(
     """
     var nr = Int(py=n_rows)
     var nf = Int(py=n_features)
-    var features = _f64_list(Int(py=x_addr), nr * nf)
+    var features = _f64_view(Int(py=x_addr), nr * nf)
     var target = _f64_list(Int(py=y_addr), nr)
     var bp = _parse_params(params, nf, unbundled="fit_custom")
     var weights = _parse_weights(params, nr)
@@ -812,7 +850,7 @@ def fit_with_metrics(
     """
     var nr = Int(py=n_rows)
     var nf = Int(py=n_features)
-    var features = _f64_list(Int(py=x_addr), nr * nf)
+    var features = _f64_view(Int(py=x_addr), nr * nf)
     var target = _f64_list(Int(py=y_addr), nr)
     var bp = _parse_params(params, nf, unbundled="fit_with_metrics")
     var weights = _parse_weights(params, nr)
@@ -1047,7 +1085,7 @@ def fit_multiclass_with_metrics(
     var nr = Int(py=n_rows)
     var nf = Int(py=n_features)
     var nc = Int(py=n_classes)
-    var features = _f64_list(Int(py=x_addr), nr * nf)
+    var features = _f64_view(Int(py=x_addr), nr * nf)
     var labels = _int_list_from_f64(Int(py=y_addr), nr)
     var bp = _parse_params(params, nf, unbundled="fit_multiclass_with_metrics")
     var weights = _parse_weights(params, nr)
@@ -1111,7 +1149,7 @@ def fit_ranker_with_metrics(
     """
     var nr = Int(py=n_rows)
     var nf = Int(py=n_features)
-    var features = _f64_list(Int(py=x_addr), nr * nf)
+    var features = _f64_view(Int(py=x_addr), nr * nf)
     var labels = _int_list_from_f64(Int(py=y_addr), nr)
     var bp = _parse_params(params, nf, unbundled="fit_ranker_with_metrics")
     var weights = _parse_weights(params, nr)
@@ -1291,7 +1329,7 @@ def fit_multiclass(
     """Train a multiclass model. Labels arrive as float64 in 0..n_classes-1."""
     var nr = Int(py=n_rows)
     var nf = Int(py=n_features)
-    var features = _f64_list(Int(py=x_addr), nr * nf)
+    var features = _f64_view(Int(py=x_addr), nr * nf)
     var labels = _int_list_from_f64(Int(py=y_addr), nr)
     # Read the device first, for the reason `fit` does.
     var device = _parse_device(params)
@@ -1452,7 +1490,7 @@ def fit_ranker(
     so this stays within the argument count the other fits use."""
     var nr = Int(py=n_rows)
     var nf = Int(py=n_features)
-    var features = _f64_list(Int(py=x_addr), nr * nf)
+    var features = _f64_view(Int(py=x_addr), nr * nf)
     var labels = _int_list_from_f64(Int(py=y_addr), nr)
     var bp = _parse_params(params, nf, unbundled="fit_ranker")
     var weights = _parse_weights(params, nr)
@@ -1501,7 +1539,7 @@ def predict(
     var m = model.downcast_value_ptr[Model]()
     var nr = Int(py=n_rows)
     var nf = Int(py=n_features)
-    var features = _f64_list(Int(py=x_addr), nr * nf)
+    var features = _f64_view(Int(py=x_addr), nr * nf)
     var out = Pointer[Float64, MutUntrackedOrigin](
         unsafe_from_address=Int(py=out_addr)
     )
@@ -1521,7 +1559,7 @@ def predict_raw(
     var m = model.downcast_value_ptr[Model]()
     var nr = Int(py=n_rows)
     var nf = Int(py=n_features)
-    var features = _f64_list(Int(py=x_addr), nr * nf)
+    var features = _f64_view(Int(py=x_addr), nr * nf)
     var out = Pointer[Float64, MutUntrackedOrigin](
         unsafe_from_address=Int(py=out_addr)
     )
@@ -1542,7 +1580,7 @@ def predict_proba(
     var m = model.downcast_value_ptr[MulticlassModel]()
     var nr = Int(py=n_rows)
     var nf = Int(py=n_features)
-    var features = _f64_list(Int(py=x_addr), nr * nf)
+    var features = _f64_view(Int(py=x_addr), nr * nf)
     var out = Pointer[Float64, MutUntrackedOrigin](
         unsafe_from_address=Int(py=out_addr)
     )
@@ -1586,7 +1624,7 @@ def predict_range(
     var nf = Int(py=n_features)
     var rng = _iteration_slice(m[].n_iterations(), start, stop)
     var raw = Int(py=raw_score) != 0
-    var features = _f64_list(Int(py=x_addr), nr * nf)
+    var features = _f64_view(Int(py=x_addr), nr * nf)
     var out = Pointer[Float64, MutUntrackedOrigin](
         unsafe_from_address=Int(py=out_addr)
     )
@@ -1618,7 +1656,7 @@ def predict_proba_range(
     var nf = Int(py=n_features)
     var rng = _iteration_slice(m[].n_iterations(), start, stop)
     var raw = Int(py=raw_score) != 0
-    var features = _f64_list(Int(py=x_addr), nr * nf)
+    var features = _f64_view(Int(py=x_addr), nr * nf)
     var out = Pointer[Float64, MutUntrackedOrigin](
         unsafe_from_address=Int(py=out_addr)
     )
@@ -1635,9 +1673,11 @@ def predict_proba_range(
     return PythonObject(None)
 
 
-def _leaf_host(
+def _leaf_host[
+    features_origin: ImmOrigin, //
+](
     model: PythonObject,
-    features: List[Float64],
+    features: Span[Float64, features_origin],
     n_rows: Int,
     n_features: Int,
     rng: IterationRange,
@@ -1662,9 +1702,11 @@ def _leaf_host(
             out.unsafe_store(r * n_cols + i, Float64(tables[i][node]))
 
 
-def _leaf_multiclass_host(
+def _leaf_multiclass_host[
+    features_origin: ImmOrigin, //
+](
     model: PythonObject,
-    features: List[Float64],
+    features: Span[Float64, features_origin],
     n_rows: Int,
     n_features: Int,
     rng: IterationRange,
@@ -1712,7 +1754,7 @@ def predict_leaf(
     var rng = _iteration_slice(m[].n_iterations(), start, stop)
     if rng.n_iterations() == 0 or nr == 0:
         return PythonObject(None)
-    _leaf_host(model, _f64_list(Int(py=x_addr), nr * nf), nr, nf, rng, out_addr)
+    _leaf_host(model, _f64_view(Int(py=x_addr), nr * nf), nr, nf, rng, out_addr)
     return PythonObject(None)
 
 
@@ -1736,7 +1778,7 @@ def predict_leaf_multiclass(
     if rng.n_iterations() == 0 or nr == 0:
         return PythonObject(None)
     _leaf_multiclass_host(
-        model, _f64_list(Int(py=x_addr), nr * nf), nr, nf, rng, out_addr
+        model, _f64_view(Int(py=x_addr), nr * nf), nr, nf, rng, out_addr
     )
     return PythonObject(None)
 
@@ -1766,7 +1808,7 @@ def predict_contrib(
         return PythonObject(None)
     var explainer = ContribExplainer.for_booster(m[].booster, nf)
     var width = explainer.width()
-    var features = _f64_list(Int(py=x_addr), nr * nf)
+    var features = _f64_view(Int(py=x_addr), nr * nf)
     var out = Pointer[Float64, MutUntrackedOrigin](
         unsafe_from_address=Int(py=out_addr)
     )
@@ -1802,7 +1844,7 @@ def predict_contrib_multiclass(
         return PythonObject(None)
     var explainer = ContribExplainer.for_multiclass(m[].booster, nf)
     var width = explainer.width()
-    var features = _f64_list(Int(py=x_addr), nr * nf)
+    var features = _f64_view(Int(py=x_addr), nr * nf)
     var out = Pointer[Float64, MutUntrackedOrigin](
         unsafe_from_address=Int(py=out_addr)
     )
@@ -1965,7 +2007,7 @@ def predict_batch(
         m[].n_iterations(), params["start"], params["stop"]
     )
     var device = _predict_device(params, nr, nf, 1, m[].mapper.n_bins)
-    var features = _f64_list(Int(py=x_addr), nr * nf)
+    var features = _f64_view(Int(py=x_addr), nr * nf)
     _store(
         m[].predict_batch(
             features, nr, rng, Int(py=params["raw_score"]) != 0, device
@@ -2002,7 +2044,7 @@ def predict_proba_batch(
         m[].n_iterations(), params["start"], params["stop"]
     )
     var device = _predict_device(params, nr, nf, k, m[].mapper.n_bins)
-    var features = _f64_list(Int(py=x_addr), nr * nf)
+    var features = _f64_view(Int(py=x_addr), nr * nf)
     _store(
         m[].predict_batch(
             features, nr, rng, Int(py=params["raw_score"]) != 0, device
@@ -2040,7 +2082,7 @@ def predict_leaf_batch(
         return PythonObject(None)
     var device = _predict_device(params, nr, nf, 1, m[].mapper.n_bins)
     var name = PythonObject(mojo_device_name(device))
-    var features = _f64_list(Int(py=x_addr), nr * nf)
+    var features = _f64_view(Int(py=x_addr), nr * nf)
     if device == GPU_DEVICE:
         _store_ints(
             leaf_indices_gpu(
@@ -2076,7 +2118,7 @@ def predict_leaf_multiclass_batch(
         return PythonObject(None)
     var device = _predict_device(params, nr, nf, k, m[].mapper.n_bins)
     var name = PythonObject(mojo_device_name(device))
-    var features = _f64_list(Int(py=x_addr), nr * nf)
+    var features = _f64_view(Int(py=x_addr), nr * nf)
     if device == GPU_DEVICE:
         _store_ints(
             leaf_indices_multiclass_gpu(
@@ -2195,7 +2237,7 @@ def gpu_validation_open(
     var nf = Int(py=n_features)
     var support = gpu_predict_support(nr, nf, 1, m[].mapper.n_bins)
     support.raise_if_blocked()
-    var features = _f64_list(Int(py=x_addr), nr * nf)
+    var features = _f64_view(Int(py=x_addr), nr * nf)
     var columns = _validation_columns(params, nr)
     var handle = GpuValidation(
         m[].mapper.transform(features, nr), columns[0], columns[1], 1
@@ -2221,7 +2263,7 @@ def gpu_validation_open_multiclass(
     var k = m[].booster.n_classes
     var support = gpu_predict_support(nr, nf, k, m[].mapper.n_bins)
     support.raise_if_blocked()
-    var features = _f64_list(Int(py=x_addr), nr * nf)
+    var features = _f64_view(Int(py=x_addr), nr * nf)
     var columns = _validation_columns(params, nr)
     var handle = GpuValidation(
         m[].mapper.transform(features, nr), columns[0], columns[1], k

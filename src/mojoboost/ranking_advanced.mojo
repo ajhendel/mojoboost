@@ -2100,8 +2100,10 @@ def train_ranker_advanced(
     return TrainedAdvancedRanker(booster^, bias^)
 
 
-def fit_ranker_advanced(
-    features: List[Float64],
+def fit_ranker_advanced[
+    features_origin: ImmOrigin, //
+](
+    features: Span[Float64, features_origin],
     n_rows: Int,
     n_features: Int,
     labels: List[Int],

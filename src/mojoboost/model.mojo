@@ -78,9 +78,11 @@ struct Model(Copyable, Movable, Writable):
         and its stability guarantees."""
         return self.booster.leaf_indices_bins(self.mapper.bin_row(row), rng)
 
-    def predict_batch(
+    def predict_batch[
+        features_origin: ImmOrigin, //
+    ](
         self,
-        features: List[Float64],
+        features: Span[Float64, features_origin],
         n_rows: Int,
         rng: IterationRange,
         raw_score: Bool = False,
@@ -172,9 +174,11 @@ struct MulticlassModel(Copyable, Movable, Writable):
         range's iteration i."""
         return self.booster.leaf_indices_bins(self.mapper.bin_row(row), rng)
 
-    def predict_batch(
+    def predict_batch[
+        features_origin: ImmOrigin, //
+    ](
         self,
-        features: List[Float64],
+        features: Span[Float64, features_origin],
         n_rows: Int,
         rng: IterationRange,
         raw_score: Bool = False,
@@ -224,8 +228,10 @@ struct MulticlassModel(Copyable, Movable, Writable):
         return argmax
 
 
-def fit(
-    features: List[Float64],
+def fit[
+    features_origin: ImmOrigin, //
+](
+    features: Span[Float64, features_origin],
     n_rows: Int,
     n_features: Int,
     target: List[Float64],
@@ -289,8 +295,10 @@ def fit(
     return Model(mapper^, booster^)
 
 
-def fit_multiclass(
-    features: List[Float64],
+def fit_multiclass[
+    features_origin: ImmOrigin, //
+](
+    features: Span[Float64, features_origin],
     n_rows: Int,
     n_features: Int,
     labels: List[Int],
@@ -335,8 +343,10 @@ def fit_multiclass(
     return MulticlassModel(mapper^, booster^)
 
 
-def fit_custom[F: GradHessFn](
-    features: List[Float64],
+def fit_custom[
+    F: GradHessFn, features_origin: ImmOrigin, //
+](
+    features: Span[Float64, features_origin],
     n_rows: Int,
     n_features: Int,
     target: List[Float64],
