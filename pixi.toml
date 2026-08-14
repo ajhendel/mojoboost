@@ -6,7 +6,19 @@ platforms = ["osx-arm64", "linux-64", "linux-aarch64"]
 version = "0.1.0"
 
 [tasks]
-test = "mojo run -I src tests/test_mojoboost.mojo"
+test = "mojo run -I src tests/test_mojoboost.mojo && mojo run -I src tests/test_metrics.mojo && mojo run -I src tests/test_kernels.mojo"
+bench = "mojo run -I src bench/bench_train.mojo"
 
 [dependencies]
 mojo = ">=1.0.0,<2"
+
+[feature.bench.dependencies]
+python = ">=3.11"
+numpy = "*"
+lightgbm = "*"
+
+[feature.bench.tasks]
+bench-lgbm = "python bench/bench_lightgbm.py"
+
+[environments]
+bench = ["bench"]

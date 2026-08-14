@@ -7,7 +7,7 @@ Uses the standard second-order gain formula (XGBoost/LightGBM):
 A split at (feature, bin) sends rows with bin value <= bin to the left child.
 """
 
-from .histogram import Histogram
+from .histogram import Histogram, SIMD_LANES
 
 
 @fieldwise_init
@@ -31,15 +31,29 @@ def find_best_split(
     highest gain. Only splits with positive gain are returned as found."""
     var best = SplitInfo(-1, -1, 0.0, False)
 
+    comptime W = SIMD_LANES
+    var grad_p = hist.grad.unsafe_ptr()
+    var hess_p = hist.hess.unsafe_ptr()
+    var count_p = hist.count.unsafe_ptr()
     for f in range(hist.n_features):
         var base = f * hist.n_bins
-        var total_g = 0.0
-        var total_h = 0.0
-        var total_c = 0
-        for b in range(hist.n_bins):
-            total_g += hist.grad[base + b]
-            total_h += hist.hess[base + b]
-            total_c += hist.count[base + b]
+        var vg = SIMD[DType.float64, W](0.0)
+        var vh = SIMD[DType.float64, W](0.0)
+        var vc = SIMD[DType.int, W](0)
+        var b = 0
+        while b + W <= hist.n_bins:
+            vg += grad_p.unsafe_load[width=W](base + b)
+            vh += hess_p.unsafe_load[width=W](base + b)
+            vc += count_p.unsafe_load[width=W](base + b)
+            b += W
+        var total_g = vg.reduce_add()
+        var total_h = vh.reduce_add()
+        var total_c = Int(vc.reduce_add())
+        while b < hist.n_bins:
+            total_g += grad_p.unsafe_load(base + b)
+            total_h += hess_p.unsafe_load(base + b)
+            total_c += count_p.unsafe_load(base + b)
+            b += 1
         var parent_score = total_g * total_g / (total_h + lambda_reg)
 
         var left_g = 0.0
