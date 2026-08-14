@@ -29,5 +29,10 @@ from .metrics import (
     multiclass_log_loss,
     rmse,
 )
-from .model import Model, fit
-from .serialize import load_model, save_model
+from .model import Model, MulticlassModel, fit, fit_multiclass
+from .serialize import (
+    load_model,
+    load_multiclass_model,
+    save_model,
+    save_multiclass_model,
+)

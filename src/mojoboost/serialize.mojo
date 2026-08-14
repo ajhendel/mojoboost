@@ -1,17 +1,18 @@
 """Model serialization.
 
-Saves and loads a fitted `Model` (BinMapper + Booster) as a plain-text
-token stream. Floats are stored as their raw IEEE-754 bit patterns
-(decimal UInt64), so save/load round-trips are bit-exact and the format
-has no locale or precision pitfalls. The format is versioned; multiclass
-ensembles are not covered yet.
+Saves and loads fitted models (`Model` and `MulticlassModel`) as a
+plain-text token stream. Floats are stored as their raw IEEE-754 bit
+patterns (decimal UInt64), so save/load round-trips are bit-exact and
+the format has no locale or precision pitfalls. The format is
+versioned; the token after the version distinguishes single-output
+files ("objective") from multiclass files ("multiclass").
 """
 
 from std.memory import bitcast
 
 from .binning import BinMapper
-from .boosting import Booster
-from .model import Model
+from .boosting import Booster, MulticlassBooster
+from .model import Model, MulticlassModel
 from .tree import Tree
 
 comptime _MAGIC = "mojoboost"
@@ -63,34 +64,23 @@ struct _TokenReader:
         return _parse_f64(self.next())
 
 
-def save_model(model: Model, path: String) raises:
-    """Write a fitted model to `path` in the mojoboost v1 text format."""
-    var out = String("")
-    out += _MAGIC
-    out += " "
-    out += _VERSION
-    out += "\n"
-
-    out += "objective " + String(model.booster.objective) + "\n"
-    out += (
-        "learning_rate " + _f64_to_token(model.booster.learning_rate) + "\n"
-    )
-    out += "base_score " + _f64_to_token(model.booster.base_score) + "\n"
-
+def _write_mapper(mut out: String, mapper: BinMapper):
     out += "mapper "
-    out += String(model.mapper.n_features) + " "
-    out += String(model.mapper.n_bins) + " "
-    out += String(len(model.mapper.edges)) + "\n"
-    for i in range(len(model.mapper.edges)):
-        out += _f64_to_token(model.mapper.edges[i]) + " "
+    out += String(mapper.n_features) + " "
+    out += String(mapper.n_bins) + " "
+    out += String(len(mapper.edges)) + "\n"
+    for i in range(len(mapper.edges)):
+        out += _f64_to_token(mapper.edges[i]) + " "
     out += "\n"
-    for i in range(len(model.mapper.edge_offsets)):
-        out += String(model.mapper.edge_offsets[i]) + " "
+    for i in range(len(mapper.edge_offsets)):
+        out += String(mapper.edge_offsets[i]) + " "
     out += "\n"
 
-    out += "trees " + String(len(model.booster.trees)) + "\n"
-    for t in range(len(model.booster.trees)):
-        ref tree = model.booster.trees[t]
+
+def _write_trees(mut out: String, trees: List[Tree]):
+    out += "trees " + String(len(trees)) + "\n"
+    for t in range(len(trees)):
+        ref tree = trees[t]
         var n_nodes = len(tree.feature)
         out += "tree " + String(n_nodes) + " " + String(tree.n_leaves) + "\n"
         for i in range(n_nodes):
@@ -109,30 +99,55 @@ def save_model(model: Model, path: String) raises:
             out += _f64_to_token(tree.value[i]) + " "
         out += "\n"
 
+
+def save_model(model: Model, path: String) raises:
+    """Write a fitted model to `path` in the mojoboost v1 text format."""
+    var out = String("")
+    out += _MAGIC
+    out += " "
+    out += _VERSION
+    out += "\n"
+
+    out += "objective " + String(model.booster.objective) + "\n"
+    out += (
+        "learning_rate " + _f64_to_token(model.booster.learning_rate) + "\n"
+    )
+    out += "base_score " + _f64_to_token(model.booster.base_score) + "\n"
+
+    _write_mapper(out, model.mapper)
+    _write_trees(out, model.booster.trees)
+
     with open(path, "w") as f:
         f.write(out)
 
 
-def load_model(path: String) raises -> Model:
-    """Load a model saved by `save_model`."""
-    var content = open(path, "r").read()
-    var r = _TokenReader(content)
+def save_multiclass_model(model: MulticlassModel, path: String) raises:
+    """Write a fitted multiclass model to `path` in the mojoboost v1
+    text format. Trees keep their round-major order, one per class per
+    round."""
+    var out = String("")
+    out += _MAGIC
+    out += " "
+    out += _VERSION
+    out += "\n"
 
-    if r.next() != _MAGIC:
-        raise Error("not a mojoboost model file")
-    if r.next() != _VERSION:
-        raise Error("unsupported model format version")
+    out += "multiclass " + String(model.booster.n_classes) + "\n"
+    out += (
+        "learning_rate " + _f64_to_token(model.booster.learning_rate) + "\n"
+    )
+    out += "base_scores"
+    for k in range(model.booster.n_classes):
+        out += " " + _f64_to_token(model.booster.base_scores[k])
+    out += "\n"
 
-    if r.next() != "objective":
-        raise Error("expected 'objective'")
-    var objective = r.next_int()
-    if r.next() != "learning_rate":
-        raise Error("expected 'learning_rate'")
-    var learning_rate = r.next_f64()
-    if r.next() != "base_score":
-        raise Error("expected 'base_score'")
-    var base_score = r.next_f64()
+    _write_mapper(out, model.mapper)
+    _write_trees(out, model.booster.trees)
 
+    with open(path, "w") as f:
+        f.write(out)
+
+
+def _read_mapper(mut r: _TokenReader) raises -> BinMapper:
     if r.next() != "mapper":
         raise Error("expected 'mapper'")
     var n_features = r.next_int()
@@ -148,7 +163,10 @@ def load_model(path: String) raises -> Model:
         offsets.append(r.next_int())
     if offsets[n_features] != n_edges:
         raise Error("corrupt mapper offsets")
+    return BinMapper(edges^, offsets^, n_features, n_bins)
 
+
+def _read_trees(mut r: _TokenReader, n_features: Int) raises -> List[Tree]:
     if r.next() != "trees":
         raise Error("expected 'trees'")
     var n_trees = r.next_int()
@@ -190,7 +208,71 @@ def load_model(path: String) raises -> Model:
         trees.append(
             Tree(feature^, threshold^, left^, right^, value^, n_leaves)
         )
+    return trees^
 
-    var mapper = BinMapper(edges^, offsets^, n_features, n_bins)
+
+def _read_header(mut r: _TokenReader) raises -> String:
+    """Check magic and version, then return the kind token, either
+    "objective" or "multiclass"."""
+    if r.next() != _MAGIC:
+        raise Error("not a mojoboost model file")
+    if r.next() != _VERSION:
+        raise Error("unsupported model format version")
+    var kind = r.next()
+    if kind != "objective" and kind != "multiclass":
+        raise Error("corrupt model file: unknown model kind")
+    return kind^
+
+
+def load_model(path: String) raises -> Model:
+    """Load a model saved by `save_model`."""
+    var content = open(path, "r").read()
+    var r = _TokenReader(content)
+
+    if _read_header(r) != "objective":
+        raise Error(
+            "this is a multiclass model file; use load_multiclass_model"
+        )
+    var objective = r.next_int()
+    if r.next() != "learning_rate":
+        raise Error("expected 'learning_rate'")
+    var learning_rate = r.next_f64()
+    if r.next() != "base_score":
+        raise Error("expected 'base_score'")
+    var base_score = r.next_f64()
+
+    var mapper = _read_mapper(r)
+    var trees = _read_trees(r, mapper.n_features)
     var booster = Booster(trees^, base_score, learning_rate, objective)
     return Model(mapper^, booster^)
+
+
+def load_multiclass_model(path: String) raises -> MulticlassModel:
+    """Load a model saved by `save_multiclass_model`."""
+    var content = open(path, "r").read()
+    var r = _TokenReader(content)
+
+    if _read_header(r) != "multiclass":
+        raise Error(
+            "this is a single-output model file; use load_model"
+        )
+    var n_classes = r.next_int()
+    if n_classes < 2:
+        raise Error("corrupt model file: n_classes must be at least 2")
+    if r.next() != "learning_rate":
+        raise Error("expected 'learning_rate'")
+    var learning_rate = r.next_f64()
+    if r.next() != "base_scores":
+        raise Error("expected 'base_scores'")
+    var base_scores = List[Float64](capacity=n_classes)
+    for _ in range(n_classes):
+        base_scores.append(r.next_f64())
+
+    var mapper = _read_mapper(r)
+    var trees = _read_trees(r, mapper.n_features)
+    if len(trees) % n_classes != 0:
+        raise Error("corrupt model file: tree count not divisible by classes")
+    var booster = MulticlassBooster(
+        trees^, base_scores^, n_classes, learning_rate
+    )
+    return MulticlassModel(mapper^, booster^)
