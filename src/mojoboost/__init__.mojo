@@ -162,7 +162,15 @@ from .custom_metric import (
     train_with_metric,
     train_with_metrics,
 )
-from .histogram_gpu import GpuHistogramBuilder, build_histogram_gpu
+from .histogram_gpu import (
+    BATCH_POOL_BUDGET_BYTES,
+    DEFAULT_BATCH_SLOTS,
+    MAX_BATCH_SLOTS,
+    GpuHistogramBuilder,
+    build_histogram_gpu,
+    build_kernel_features,
+    env_batch_slots,
+)
 from .gpu_runtime import (
     GpuSession,
     HazardTracker,
@@ -192,6 +200,41 @@ from .gpu_split_search import (
     GpuSplitParams,
     GpuSplitRecord,
     GpuSplitSearcher,
+)
+# The GPU stages the trainers now reach through. Exported because they are on
+# the public call path rather than beside it: the histogram launch policy
+# decides whether a split's children are built in one launch, the round
+# eligibility rule decides which configurations `train_gpu` will serve on the
+# device, the tree router is what lets a bagged run stay there, and the
+# startup trace is what a session reports its one-time costs through.
+from .apple_histogram_policy import (
+    SPEC_LEVEL_BASELINE,
+    SPEC_LEVEL_BATCHED,
+    HistogramWorkload,
+    batching_declined_reason,
+    derive_histogram_plan,
+    env_specialization_level,
+)
+from .gpu_frontier import LeafWorkItem
+from .gpu_fused_round import (
+    ROUND_OK,
+    GpuTreeRouter,
+    round_eligibility,
+    round_eligibility_reason,
+)
+from .gpu_leaf_batching import (
+    BatchPlan,
+    GpuLeafBatcher,
+    plan_batch,
+    slots_for_budget,
+)
+from .initialization import (
+    FitLatency,
+    SessionState,
+    StartupTrace,
+    WarmupPlan,
+    env_warmup_level,
+    session_state_from_trace,
 )
 from .train_gpu import (
     OBJECTIVE_SOURCE_AUTO,

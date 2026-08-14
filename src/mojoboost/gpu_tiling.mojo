@@ -445,13 +445,21 @@ def derive_tiling(
         raise Error(
             "device shared memory too small for a per-threadgroup histogram"
         )
+    # A device reporting no multiprocessors is a device that answered
+    # nothing, and one threadgroup per feature is what this asked for before
+    # the occupancy bound existed. `query_device_caps` substitutes the
+    # portable constant for a missing attribute, so this only catches a
+    # hand-built `DeviceCaps`.
+    var target_blocks = caps.sm_count * TARGET_BLOCKS_PER_SM
+    if target_blocks < 1:
+        target_blocks = 1
     return resolve_tiling(
         n_rows,
         n_features,
         n_bins,
         derive_block_threads(caps),
         n_bins,
-        caps.sm_count * TARGET_BLOCKS_PER_SM,
+        target_blocks,
         partial_cell_limit_for(max_partial_cells),
         requested_strategy,
     )

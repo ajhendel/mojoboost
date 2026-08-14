@@ -30,6 +30,15 @@ so excluded features cost nothing and sibling subtraction stays exact; the
 per-depth and per-node sets narrow the split search on top of that. Both
 inner fractions default to 1.0, which passes the tree's set through untouched.
 
+Exclusive feature bundling (see efb.mojo) is a histogram layout and nothing
+more. `grow_tree` optionally takes a `BundledMatrix`: histograms are then
+accumulated from the bundled matrix, split search recovers each candidate
+feature's own histogram out of its bundle's, and rows are partitioned by the
+*original* matrix, because a chosen split names an original feature and an
+original bin. The tree that comes out is therefore the tree an unbundled fit
+produces, and no consumer of it -- prediction, serialization, importance,
+contributions -- needs to know a plan existed. It is off by default.
+
 The remaining LightGBM tree controls ride on `TreeParams.extra` (see
 tree_parameters_extra.mojo). The split-side rules reach the scan through
 `_search`; `max_delta_step` and `path_smooth` are applied here, in
@@ -54,6 +63,7 @@ from .categorical import (
     CategoricalSpec,
     cat_pool_contains,
 )
+from .efb import BundledMatrix, FeatureBundling, columns_for_features
 from .histogram import (
     Histogram,
     build_histogram,
@@ -77,6 +87,7 @@ from .sampling import (
     DEFAULT_FEATURE_FRACTION_BYLEVEL,
     DEFAULT_FEATURE_FRACTION_SEED,
     check_feature_fractions,
+    check_row_set,
     select_split_features,
     select_tree_features,
 )
@@ -455,8 +466,15 @@ struct _LeafState(Movable):
     """A grown-but-unsplit leaf: its node id, rows, histogram, the best split
     available from it, the features split on between the root and it (empty
     when no interaction constraints are configured), its depth in edges from
-    the root, and the interval its output must lie in (unbounded when no
-    monotonic constraint above it applies)."""
+    the root, the interval its output must lie in (unbounded when no
+    monotonic constraint above it applies), and the forced-split node it owes
+    (-1, the default, when it owes none).
+
+    `forced` is how `params.extra.forced` reaches the growth loop: a leaf
+    carrying one is split on that node's feature and threshold instead of on
+    the best split its histogram offers, and its two children inherit that
+    node's own children. Every leaf reaches -1 once the forced tree is
+    exhausted, which is where ordinary leaf-wise growth takes over."""
 
     var node: Int
     var rows: List[Int]
@@ -465,6 +483,7 @@ struct _LeafState(Movable):
     var branch: List[Int]
     var depth: Int
     var bounds: OutputBounds
+    var forced: Int
 
     def __init__(
         out self,
@@ -475,6 +494,7 @@ struct _LeafState(Movable):
         var branch: List[Int] = [],
         depth: Int = 0,
         var bounds: OutputBounds = OutputBounds.unbounded(),
+        forced: Int = -1,
     ):
         self.node = node
         self.rows = rows^
@@ -483,6 +503,7 @@ struct _LeafState(Movable):
         self.branch = branch^
         self.depth = depth
         self.bounds = bounds^
+        self.forced = forced
 
     def take_hist(mut self) raises -> Histogram:
         """Move this leaf's histogram out, leaving an empty one behind.
@@ -692,6 +713,7 @@ def _search(
     tree_index: Int = 0,
     parent_output: Float64 = 0.0,
     grower_applies_extra: Bool = False,
+    bundling: FeatureBundling = FeatureBundling.none(),
 ) raises -> SplitInfo:
     """Best split for one node. `allowed` is the node's interaction-constraint
     allow mask and `features` its subsampled feature ids; empty means every
@@ -719,6 +741,14 @@ def _search(
     False and an active value is refused here rather than silently drawing
     every node's threshold from node 0's stream, or growing a tree whose
     leaves ignore the cap the caller asked for.
+
+    `bundling` is an exclusive-feature-bundling plan (efb.mojo) and defaults
+    to none. With a plan, `hist` is a per-bundle histogram and `find_best_split`
+    unbundles each candidate feature's own statistics out of it; every other
+    argument here stays indexed by original feature, and the `SplitInfo` that
+    comes back names an original feature and an original bin. Only
+    `tree.grow_tree` passes one; every other caller leaves it empty and reads
+    `hist` as the per-feature histogram it has always been.
     """
     if params.extra.needs_grower_support() and not grower_applies_extra:
         raise Error(
@@ -752,7 +782,54 @@ def _search(
         node=node,
         tree_index=tree_index,
         parent_output=parent_output,
+        bundling=bundling,
     )
+
+
+def _hist_full(
+    mut hist: Histogram,
+    data: BinnedMatrix,
+    bundled: BundledMatrix,
+    grad: List[Float64],
+    hess: List[Float64],
+    columns: List[Int],
+) raises:
+    """Accumulate every row into `hist`, from the bundled matrix when there is
+    one and from the original otherwise.
+
+    The two calls are spelled out rather than selected through a reference,
+    because a `BinnedMatrix` chosen by a conditional would be copied. Neither
+    builder changes: a bundled matrix is an ordinary `BinnedMatrix` with fewer,
+    wider columns, which is exactly the speed-up bundling is for.
+    """
+    if bundled.active:
+        build_histogram_into(hist, bundled.data, grad, hess, columns)
+    else:
+        build_histogram_into(hist, data, grad, hess, columns)
+
+
+def _hist_subset(
+    mut hist: Histogram,
+    data: BinnedMatrix,
+    bundled: BundledMatrix,
+    grad: List[Float64],
+    hess: List[Float64],
+    rows: List[Int],
+    start: Int,
+    count: Int,
+    columns: List[Int],
+) raises:
+    """`_hist_full` for a row subset. Row ids index the original matrix and the
+    bundled one identically, because bundling rearranges columns and never
+    rows."""
+    if bundled.active:
+        build_histogram_subset_into(
+            hist, bundled.data, grad, hess, rows, start, count, columns
+        )
+    else:
+        build_histogram_subset_into(
+            hist, data, grad, hess, rows, start, count, columns
+        )
 
 
 def grow_tree(
@@ -762,6 +839,7 @@ def grow_tree(
     params: TreeParams,
     bag: List[Int] = [],
     tree_index: Int = 0,
+    bundling: BundledMatrix = BundledMatrix.none(),
 ) raises -> Tree:
     """Grow one tree, leaf-wise.
 
@@ -788,6 +866,23 @@ def grow_tree(
     applied here, where a leaf's row count and its parent's finished output
     are both in hand. An inactive bundle, which is the default, leaves every
     decision below exactly as it was.
+
+    `bundling` is an exclusive-feature-bundling plan and its matrix (efb.mojo),
+    or `BundledMatrix.none()`, which is the default and the fallback. When it
+    is active this grower reads **two** matrices and keeps them strictly
+    apart:
+
+    - `bundling.data` is what every histogram is accumulated from, which is
+      the whole point: one column scan per bundle instead of one per feature;
+    - `data`, the original matrix, is what rows are partitioned by, because a
+      chosen split names an original feature and an original bin.
+
+    Nothing else changes. Feature subsampling still draws original features
+    and `columns_for_features` maps them to the columns that must be
+    accumulated; `_search` still receives the original `missing_bin` table,
+    the original categorical spec, and the original monotone vector; and the
+    `Tree` that comes out is the tree an unbundled fit produces, so no
+    consumer of it can tell which matrix built the histograms.
     """
     params.constraints.check_features(data.n_features)
     params.monotone.check_features(data.n_features)
@@ -805,6 +900,20 @@ def grow_tree(
         params.max_depth,
         params.min_data_in_leaf,
     )
+    # A plan is fitted from one matrix and is meaningless against another, so
+    # the shapes are checked before the first histogram rather than showing up
+    # as a bin id that means the wrong feature.
+    if bundling.active:
+        if bundling.plan.n_features != data.n_features:
+            raise Error(
+                "bundling plan and matrix must agree on n_features"
+            )
+        if bundling.plan.n_rows != data.n_rows:
+            raise Error("bundling plan and matrix must agree on n_rows")
+        if bundling.data.n_rows != data.n_rows:
+            raise Error("bundled matrix must have the same rows")
+        if bundling.data.n_features != bundling.plan.n_bundles():
+            raise Error("bundled matrix must have one column per bundle")
     var max_delta_step = params.extra.max_delta_step
     var path_smooth = params.extra.path_smooth
     # Empty unless a feature is actually constrained, which keeps split search
@@ -816,8 +925,19 @@ def grow_tree(
         params.feature_fraction_seed,
         tree_index,
     )
-    # Leaf-value totals must come from a feature the histograms accumulated.
-    var value_feature = tree_features[0]
+    # The histogram columns the tree's feature sample requires: the features
+    # themselves without bundling, the bundles they sit in with it.
+    var tree_columns = tree_features.copy()
+    var hist_features = data.n_features
+    var hist_bins = data.n_bins
+    if bundling.active:
+        tree_columns = columns_for_features(bundling.plan, tree_features)
+        hist_features = bundling.data.n_features
+        hist_bins = bundling.data.n_bins
+    # Leaf-value totals must come from a column the histograms accumulated.
+    # Any column answers, bundled or not: every row occupies exactly one bin
+    # of every column, so a column's bin totals are the node's totals.
+    var value_feature = tree_columns[0]
     var tree = Tree(
         List[Int](), List[Int](), List[Int](), List[Int](),
         List[Float64](), List[Float64](), 0,
@@ -826,7 +946,7 @@ def grow_tree(
     # Every histogram this tree builds comes from one pool and goes back to it
     # when its leaf is split, so growth allocates a handful of buffers rather
     # than three arrays per node.
-    var pool = _HistPool(data.n_features, data.n_bins)
+    var pool = _HistPool(hist_features, hist_bins)
 
     # The root's row list is the only thing bagging materializes; the full
     # path builds the same list over every row.
@@ -837,14 +957,16 @@ def grow_tree(
         root_rows.resize(data.n_rows, 0)
         for r in range(data.n_rows):
             root_rows[r] = r
-        build_histogram_into(root_hist, data, grad, hess, tree_features)
+        _hist_full(root_hist, data, bundling, grad, hess, tree_columns)
     else:
-        for i in range(len(bag)):
-            if bag[i] < 0 or bag[i] >= data.n_rows:
-                raise Error("bag row index out of range")
+        # `sampling.check_row_set` is the one place this property is enforced
+        # rather than assumed, and everything downstream of the draw -- the
+        # subset accumulate, the partition, the node counts -- relies on it.
+        check_row_set(bag, data.n_rows)
         root_rows = bag.copy()
-        build_histogram_subset_into(
-            root_hist, data, grad, hess, bag, 0, len(bag), tree_features
+        _hist_subset(
+            root_hist, data, bundling, grad, hess, bag, 0, len(bag),
+            tree_columns,
         )
 
     # The root's own value is computed before its split search, because path
@@ -892,6 +1014,7 @@ def grow_tree(
         tree_index=tree_index,
         parent_output=tree.value[root],
         grower_applies_extra=True,
+        bundling=bundling.plan,
     )
 
     var frontier = List[_LeafState]()
@@ -947,15 +1070,15 @@ def grow_tree(
         var left_hist = pool.take()
         var right_hist = pool.take()
         if len(left_rows) <= len(right_rows):
-            build_histogram_subset_into(
-                left_hist, data, grad, hess, left_rows, 0, len(left_rows),
-                tree_features,
+            _hist_subset(
+                left_hist, data, bundling, grad, hess, left_rows, 0,
+                len(left_rows), tree_columns,
             )
             subtract_histogram_into(right_hist, parent_hist, left_hist)
         else:
-            build_histogram_subset_into(
-                right_hist, data, grad, hess, right_rows, 0, len(right_rows),
-                tree_features,
+            _hist_subset(
+                right_hist, data, bundling, grad, hess, right_rows, 0,
+                len(right_rows), tree_columns,
             )
             subtract_histogram_into(left_hist, parent_hist, right_hist)
         pool.give(parent_hist^)
@@ -1045,6 +1168,7 @@ def grow_tree(
             tree_index=tree_index,
             parent_output=left_value,
             grower_applies_extra=True,
+            bundling=bundling.plan,
         )
         var right_split = _search(
             right_hist,
@@ -1069,6 +1193,7 @@ def grow_tree(
             tree_index=tree_index,
             parent_output=right_value,
             grower_applies_extra=True,
+            bundling=bundling.plan,
         )
 
         frontier[best_i] = _LeafState(

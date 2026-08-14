@@ -361,7 +361,7 @@ def histogram_capabilities(
 
 
 def kernel_shared_request(
-    n_bins: Int, features: KernelFeatures
+    n_bins: Int, compiled: KernelFeatures
 ) raises -> Int:
     """Threadgroup memory one block of the kernel this build compiled really
     requests, at `n_bins` bins.
@@ -375,35 +375,45 @@ def kernel_shared_request(
 
     Which of the two is true is a property of the build, which is what
     `KernelFeatures.specialized_bin_kernels` records, so this takes the
-    features rather than assuming either.
+    build's compiled variants rather than assuming either. It is the
+    compiled set and never the selected one: an uninstantiated kernel cannot
+    be the one that allocates.
     """
-    if features.specialized_bin_kernels:
+    if compiled.specialized_bin_kernels:
         return kernel_shared_bytes(bin_capacity_for(n_bins))
     return unspecialized_kernel_shared_bytes()
 
 
 def require_specializations_allowed(
-    contract: BackendContract, features: KernelFeatures
+    contract: BackendContract, selected: KernelFeatures
 ) raises:
-    """Refuse a build's specialized kernel variants on a backend this
-    repository has never executed.
+    """Refuse a specialized kernel variant a plan *selected* on a named
+    backend this repository has never executed.
 
-    A no-op for `KernelFeatures.none()`, which is what every caller gets
-    today, so this is inert on the shipping path and becomes a gate the
-    moment a variant is compiled in. Metal passes; CUDA, HIP, and an
-    unidentified device need `MOJOBOOST_GPU_BACKEND_UNVALIDATED=1`.
+    `selected`, not compiled-in. The distinction matters and getting it
+    wrong would break the shipping path: `histogram_gpu.build_kernel_features`
+    reports `batched_leaf_kernel = True` because linking that module
+    instantiates the batched kernels, which is a fact about compilation.
+    Selecting them is a separate decision that `apple_histogram_policy` makes
+    only when `SPEC_LEVEL_BATCHED` was asked for by name, never from `auto`.
+    A caller passes what its resolved plan chose, so the gate fires on the
+    choice rather than on the link.
+
+    Metal passes. CUDA and HIP need `MOJOBOOST_GPU_BACKEND_UNVALIDATED=1`.
+    An unidentified backend is not refused, for the reason
+    `gpu_backend_policy.require_backend_exercised` documents at length.
     """
-    if not features.any():
+    if not selected.any():
         return
-    if features.specialized_bin_kernels:
+    if selected.specialized_bin_kernels:
         require_backend_exercised(
             contract.api, String("bin-capacity specialized histogram kernels")
         )
-    if features.packed_bin_loads:
+    if selected.packed_bin_loads:
         require_backend_exercised(
             contract.api, String("packed four-byte bin loads")
         )
-    if features.batched_leaf_kernel:
+    if selected.batched_leaf_kernel:
         require_backend_exercised(
             contract.api, String("batched multi-leaf histogram kernels")
         )
@@ -631,31 +641,39 @@ def require_histogram_launchable(
     tiling: HistogramTiling,
     grid_x: Int,
     n_bins: Int,
-    features: KernelFeatures,
+    compiled: KernelFeatures,
+    selected: KernelFeatures,
 ) raises:
     """The whole gate for one resolved histogram launch.
 
     Everything a caller holding a `HistogramTiling` needs to check, in one
     call: the bin count, the primitives the resolved strategy needs, the
-    build's specializations against what the backend has run, and the
+    variants the plan selected against what the backend has run, and the
     geometry against what the device reported. `grid_x` is passed rather
     than derived because the axis carries the feature count in
     `histogram_gpu.mojo`, the active feature count under feature
     subsampling, and a leaf-slot count in `gpu_leaf_batching.mojo`.
+
+    The two `KernelFeatures` are different questions and must not be the
+    same value. `compiled` is what the build instantiated, which is what
+    decides the threadgroup footprint; `selected` is what the plan chose,
+    which is what the validation gate applies to. Passing `compiled` for
+    both would refuse the shipping path, because linking `histogram_gpu`
+    instantiates the batched kernels whether or not anything selects them.
 
     Raises on the first failure, naming it. Returns nothing on success: it
     is a gate, not a plan, and the plan it gates is `tiling`.
     """
     require_bins_supported(n_bins)
     require_primitives(contract, tiling.strategy)
-    require_specializations_allowed(contract, features)
+    require_specializations_allowed(contract, selected)
     require_launch_geometry(
         contract,
         caps,
         grid_x,
         tiling.n_tiles,
         tiling.block_threads,
-        kernel_shared_request(n_bins, features),
+        kernel_shared_request(n_bins, compiled),
     )
 
 
@@ -664,10 +682,11 @@ def describe_launch(
     tiling: HistogramTiling,
     grid_x: Int,
     n_bins: Int,
-    features: KernelFeatures,
+    compiled: KernelFeatures,
 ) raises -> String:
     """One line pairing a checked launch with the backend it was checked
-    against, for benchmark output and bug reports."""
+    against, for benchmark output and bug reports. `compiled` is the build's
+    variants, because what it reports is the threadgroup footprint."""
     return String(
         describe_contract(contract),
         " strategy=",
@@ -681,7 +700,7 @@ def describe_launch(
         " bins=",
         n_bins,
         " shared=",
-        kernel_shared_request(n_bins, features),
+        kernel_shared_request(n_bins, compiled),
     )
 
 

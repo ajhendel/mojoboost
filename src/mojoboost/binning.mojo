@@ -44,6 +44,14 @@ writes only its own output range, so workers need no synchronization and
 the result is bit-identical to the serial path. Inputs too small to
 amortize task-scheduling overhead stay serial.
 
+Forced splits
+-------------
+`map_forced_splits` turns a parsed forced-split tree (see
+tree_parameters_extra.mojo) into bin space. It lives here because that is
+where the fitted binning lives: the grower is handed a `BinnedMatrix`, which
+carries bins and no edges, so a raw threshold has to be resolved before it
+reaches growth.
+
 Work estimates. The threshold that decides serial from parallel is stated in
 histogram-op equivalents (see `parallel.plan_tasks`), and a row of binning is
 not one of those. Fitting sorts each column, so its estimate carries the
@@ -59,6 +67,7 @@ from std.math import isnan
 
 from .categorical import CategoricalSpec, fit_categorical_spec
 from .parallel import dispatch_feature_ranges, dispatch_features
+from .tree_parameters_extra import ForcedSplits
 
 
 def _log2_ceil(n: Int) -> Int:
@@ -473,6 +482,65 @@ def fit_bins(
     return BinMapper(
         edges^, offsets^, n_features, max_bins, cats^, missing_bin^
     )
+
+
+def map_forced_splits(
+    mapper: BinMapper, forced: ForcedSplits
+) raises -> ForcedSplits:
+    """Turn a parsed forced-split tree's raw thresholds into bin ids.
+
+    This is the one place a raw feature value and a fitted binning meet for
+    forced splits, and it is why they live here rather than in
+    tree_parameters_extra.mojo: the grower is handed a `BinnedMatrix`, which
+    carries bins and no edges, so the mapping has to happen where the mapper
+    is. The result is the same tree with `bins` filled, which
+    `ExtraTreeParams.check_scalars` accepts and `tree.grow_tree` applies.
+
+    Semantics. A forced node sends rows with `value <= threshold` left, and a
+    tree node sends rows with `bin <= threshold_bin` left, so the bin is
+    `mapper.bin_value(feature, threshold)`. That is exact at a bin boundary
+    and snapped otherwise: a threshold strictly inside a bin's range sends
+    that whole bin left, because a binned matrix cannot separate two values
+    that share a bin. LightGBM snaps a forced threshold the same way, and the
+    same approximation is what `max_bin` already imposes on every learned
+    split.
+
+    Two refusals, both because the structure cannot express the thing asked
+    for rather than because it was not implemented:
+
+    - a categorical feature, whose split is a set of categories and not an
+      ordinal threshold (`parse_forced_splits` already refuses LightGBM's
+      `cat_threshold` key for the same reason);
+    - a `NaN` threshold, which would bin into the feature's missing bin and
+      make the forced node route by missingness rather than by value.
+
+    An empty tree maps to an empty tree, so a caller can apply this
+    unconditionally.
+    """
+    if forced.is_empty():
+        return ForcedSplits.none()
+    forced.check_features(mapper.n_features)
+    var bins = List[Int](capacity=forced.n_nodes())
+    for i in range(forced.n_nodes()):
+        var f = forced.nodes[i].feature
+        if mapper.cats.is_cat(f):
+            raise Error(
+                "forced splits: feature ",
+                f,
+                " is categorical, and a categorical split is a set of"
+                " categories rather than an ordinal threshold; forced"
+                " categorical splits are not supported",
+            )
+        var v = forced.nodes[i].threshold
+        if isnan(v):
+            raise Error(
+                "forced splits: feature ",
+                f,
+                " has a NaN threshold, which would route the node by"
+                " missingness instead of by value",
+            )
+        bins.append(mapper.bin_value(f, v))
+    return ForcedSplits(forced.nodes.copy(), bins^)
 
 
 def bin_equal_width(

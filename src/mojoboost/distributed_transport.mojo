@@ -2007,6 +2007,49 @@ def transport_unavailable_detail() -> String:
 
 
 @fieldwise_init
+struct RuntimeCapability(Copyable, Movable):
+    """What this build's distributed stack can actually do.
+
+    - `multi_process`: whether two processes can train together.
+    - `local_collective`: whether a world hosted in one process is available.
+    - `protocol_version`: the version every rank of a job must agree on.
+    - `max_world_size`: the largest world this build can form, or -1 when a
+      transport exists and the limit is the machine list's rather than this
+      module's.
+    - `reason`: empty when `multi_process` is True, and the explanation to
+      report otherwise.
+    """
+
+    var multi_process: Bool
+    var local_collective: Bool
+    var protocol_version: Int
+    var max_world_size: Int
+    var reason: String
+
+
+def distributed_runtime_capability() -> RuntimeCapability:
+    """The one native answer to "can this build train across processes".
+
+    It exists in order to say no, and to say it in one place: the Python
+    bindings, the Dask backend, and a launcher all report this rather than each
+    carrying its own copy of the fact and its own wording. A caller that
+    refuses distributed work should refuse on `multi_process` and quote
+    `reason`, and must not infer availability from this function existing.
+    """
+    if transport_available():
+        return RuntimeCapability(
+            True, True, TRANSPORT_PROTOCOL_VERSION, -1, String("")
+        )
+    return RuntimeCapability(
+        False,
+        True,
+        TRANSPORT_PROTOCOL_VERSION,
+        1,
+        transport_unavailable_detail(),
+    )
+
+
+@fieldwise_init
 struct RuntimeSpec(Copyable, Movable):
     """How one rank reaches its world, and nothing else.
 
@@ -2279,9 +2322,14 @@ def open_transport_collective[
     The endpoints are an argument because opening them is the one thing this
     module cannot do: whoever writes the socket adapter connects them and hands
     them here, and everything from the handshake onwards is this function's.
-    Until such an adapter exists the only `E` that satisfies the bound is the
-    in-memory fake, so `require_transport` refuses first and this is reachable
-    only from tests.
+
+    Until such an adapter exists this refuses, because `require_transport`
+    refuses: the only `E` that satisfies the bound is the in-memory fake, and
+    calling a fake a transport is the one thing this file will not do. A test
+    that wants to drive the blocking driver over `MemoryEndpoint` builds a
+    `TransportCollective` directly from a session and a list of endpoints,
+    which is exactly the composition this function performs and is honest about
+    what it is exercising.
     """
     require_transport(spec)
     var session = TransportSession(spec.transport_config())
@@ -2292,7 +2340,7 @@ def open_transport_collective[
 
 def session_checkpoint_meta(
     session: TransportSession, model_digest: UInt64, n_trees: Int
-) raises -> CheckpointMeta:
+) -> CheckpointMeta:
     """Stamp a checkpoint with the session that produced it.
 
     A free function rather than a method so the checkpoint record stays

@@ -34,6 +34,7 @@ and maps them here.
 from std.math import exp, log
 
 from .binning import BinnedMatrix
+from .efb import BundledMatrix, EfbSettings, prepare_bundling
 from .parallel import dispatch_rows
 from .metrics import _argsort
 from .bagging import (
@@ -704,11 +705,40 @@ def _renew_leaf_values(
         tree.value[node] = renewed
 
 
-@fieldwise_init
 struct BoosterParams(Copyable, Movable):
+    """Ensemble-level hyperparameters.
+
+    `bundling` is LightGBM's `enable_bundle` and the knobs it governs (see
+    efb.mojo). It sits here rather than on `TreeParams` because a bundling
+    plan is a property of the training matrix, fitted once per training call
+    and shared by every tree, not a per-tree control. It defaults to disabled,
+    and it is appended so that every positional caller of this constructor --
+    `bindings/_mojoboost.mojo`, `cli/`, `capi/` -- keeps working unchanged.
+
+    Only the dense CPU trainers in this file honor it: `train`, `train_more`,
+    `train_with_valid`, `train_multiclass`, `train_multiclass_more`, and
+    `train_multiclass_with_valid`. Every other trainer that takes a
+    `BoosterParams` should refuse an active setting with
+    `efb.check_bundling_honored` rather than ignore it; see
+    `handoffs/connect_09_algorithms.md`.
+    """
+
     var n_estimators: Int
     var learning_rate: Float64
     var tree: TreeParams
+    var bundling: EfbSettings
+
+    def __init__(
+        out self,
+        n_estimators: Int,
+        learning_rate: Float64,
+        var tree: TreeParams,
+        var bundling: EfbSettings = EfbSettings.disabled(),
+    ):
+        self.n_estimators = n_estimators
+        self.learning_rate = learning_rate
+        self.tree = tree^
+        self.bundling = bundling^
 
     @staticmethod
     def default() -> BoosterParams:
@@ -949,7 +979,15 @@ def _boost_rounds(
     score updates follow. The caller validates it with
     `_check_class_bagging`, which is also what makes it exclusive with the
     other two samplers.
+
+    `params.bundling` is fitted here, once, and handed to every tree. It
+    changes only how histograms are laid out (see efb.mojo): the trees, the
+    leaf renewal below, and the score update all read the original matrix,
+    so a bundled run and an unbundled one differ in cost and not in result.
+    Disabled by default, and `prepare_bundling` falls back to the unbundled
+    matrix whenever the plan would not pay for itself.
     """
+    var bundling = prepare_bundling(data, params.bundling)
     var n = data.n_rows
     var signs = params.tree.monotone.active_signs()
     var renews = objective_renews_leaves(objective)
@@ -973,7 +1011,9 @@ def _boost_rounds(
             raw, target, objective, sample_weight, alpha, grad, hess
         )
         goss_round(bag, grad, hess, goss, round, learning_rate)
-        var tree = grow_tree(data, grad, hess, params.tree, bag, round)
+        var tree = grow_tree(
+            data, grad, hess, params.tree, bag, round, bundling
+        )
         if renews:
             _renew_leaf_values(
                 tree, data, target, raw, renew_w, renew_a, bag, signs,
@@ -1217,6 +1257,9 @@ def train_with_valid(
     _check_class_bagging(class_bagging, bagging, goss, objective)
     params.tree.monotone.check_features(data.n_features)
 
+    # Fitted once, from the training matrix alone: the validation matrix is
+    # only ever scored through the trees, which name original features.
+    var bundling = prepare_bundling(data, params.bundling)
     var n = data.n_rows
     var base_score = _base_score(target, objective, sample_weight, alpha)
     var raw = List[Float64](capacity=n)
@@ -1246,7 +1289,7 @@ def train_with_valid(
             raw, target, objective, sample_weight, alpha, grad, hess
         )
         goss_round(bag, grad, hess, goss, i, params.learning_rate)
-        var tree = grow_tree(data, grad, hess, params.tree, bag, i)
+        var tree = grow_tree(data, grad, hess, params.tree, bag, i, bundling)
         if renews:
             _renew_leaf_values(
                 tree, data, target, raw, renew_w, renew_a, bag, signs,
@@ -1502,7 +1545,12 @@ def _boost_rounds_multiclass(
     schedule, and each tree's feature sample (seeded by
     `round * n_classes + k`) read the absolute round index and a continued
     run draws what an uninterrupted one would have drawn.
+
+    `params.bundling` is fitted once here and shared by every class's tree in
+    every round, which is what makes it worth fitting at all: the plan depends
+    on the matrix, not on the gradients.
     """
+    var bundling = prepare_bundling(data, params.bundling)
     var n = data.n_rows
     var prob = List[Float64](capacity=n * n_classes)
     for _ in range(n * n_classes):
@@ -1538,7 +1586,13 @@ def _boost_rounds_multiclass(
             # Feature subsampling draws once per tree, so each class's tree
             # in a round gets its own feature set.
             var tree = grow_tree(
-                data, grad, hess, params.tree, bag, round * n_classes + k
+                data,
+                grad,
+                hess,
+                params.tree,
+                bag,
+                round * n_classes + k,
+                bundling,
             )
             if tree.n_leaves > 1 or abs(tree.value[0]) >= 1e-12:
                 made_progress = True
@@ -1759,6 +1813,9 @@ def train_multiclass_with_valid(
     check_bagging(bagging)
     _check_goss(goss, bagging)
     params.tree.monotone.check_features(data.n_features)
+    # Fitted once, from the training matrix alone: the validation matrix is
+    # only ever scored through the trees, which name original features.
+    var bundling = prepare_bundling(data, params.bundling)
     var n = data.n_rows
     var n_valid = valid_data.n_rows
 
@@ -1828,7 +1885,13 @@ def train_multiclass_with_valid(
             # Feature subsampling draws once per tree, so each class's tree
             # in a round gets its own feature set.
             var tree = grow_tree(
-                data, grad, hess, params.tree, bag, i * n_classes + k
+                data,
+                grad,
+                hess,
+                params.tree,
+                bag,
+                i * n_classes + k,
+                bundling,
             )
             if tree.n_leaves > 1 or abs(tree.value[0]) >= 1e-12:
                 made_progress = True

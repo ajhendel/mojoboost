@@ -37,7 +37,13 @@ is a handle that owns a built `ModelDump`, not a faster rebuild.
 
 from std.python import Python, PythonObject
 
-from binding_support import f64_buffer, py_dict, py_f64_list, py_int_list, str_sequence
+from binding_support import (
+    f64_buffer,
+    py_dict,
+    py_f64_list,
+    py_int_list,
+    str_sequence,
+)
 
 from mojoboost.inspection import dump_json
 from mojoboost.model import Model, MulticlassModel
@@ -349,7 +355,9 @@ def dump_model_json(
     """
     var m = model.downcast_value_ptr[Model]()
     return PythonObject(
-        dump_json(build_dump(m[], str_sequence(feature_names, Int(py=n_names))))
+        dump_json(
+            build_dump(m[], str_sequence(feature_names, Int(py=n_names)))
+        )
     )
 
 

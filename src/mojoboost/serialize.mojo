@@ -308,6 +308,25 @@ def _write_mapper(mut out: String, mapper: BinMapper):
     out += "\n"
 
 
+def _has_node_covers(tree: Tree) -> Bool:
+    """Whether this tree's covers are all there and all usable.
+
+    Stricter than `Tree.has_node_counts`, which asks the root only, and
+    deliberately so: the reader refuses a nonpositive cover, so writing a
+    partial set would produce a file this module could not read back.
+    Nothing can use a partial set either, since `Tree.check_node_counts`
+    (and so contrib.mojo) requires every node's. A tree that has some but
+    not all is recorded as having none, which is what its consumers already
+    treat it as.
+    """
+    if len(tree.count) != len(tree.feature):
+        return False
+    for i in range(len(tree.count)):
+        if not tree.count[i] > 0.0:
+            return False
+    return True
+
+
 def _has_split_gains(tree: Tree) -> Bool:
     """Whether this tree carries the gains its splits earned.
 
@@ -359,7 +378,7 @@ def _write_trees(mut out: String, trees: List[Tree]):
         # the trained one. v4 puts a presence flag in front of them: a tree
         # loaded from a v1 or v2 file has none, and writing its zeros as
         # covers produced a file the reader then rejected.
-        var covers = tree.has_node_counts()
+        var covers = _has_node_covers(tree)
         out += "counts " + ("1\n" if covers else "0\n")
         if covers:
             for i in range(n_nodes):
@@ -639,13 +658,26 @@ def _read_trees(
                 raise Error("expected 'counts'")
             has_counts = r.next_int() != 0
         if has_counts:
+            var zeros = 0
             for _ in range(n_nodes):
                 var c = r.next_f64()
-                if not c > 0.0:
+                if c == 0.0:
+                    zeros += 1
+                elif not c > 0.0:
                     raise Error(
                         "corrupt tree: node cover must be positive"
                     )
                 count.append(c)
+            if zeros == n_nodes:
+                # A whole block of zeros is what v3 wrote for a tree that
+                # had no covers to write, since v3 had no way to say so:
+                # re-saving a v1 or v2 model produced exactly this, and the
+                # file then failed to load at all. Read it as the absence it
+                # is. A tree with some covers and not others is still
+                # refused, because nothing can use a partial set.
+                count = List[Float64]()
+            elif zeros > 0:
+                raise Error("corrupt tree: node cover must be positive")
         # v4: per-node split gains, behind the same kind of flag. Unlike a
         # cover a gain is not checked for sign: a leaf's is 0.0, and the
         # arithmetic that produces one can land at or just below zero. NaN

@@ -90,6 +90,46 @@ Contract, and how it differs from LightGBM
 - CPU only. There is no GPU trainer with a validation loop; the metric
   itself is host code either way.
 
+Built-in metrics, by code
+-------------------------
+Everything above is for a metric the caller writes. For one mojoboost already
+has, name it instead:
+
+    var names: List[String] = ["binary_logloss", "auc"]
+    var ctx = BuiltinMetricContext.single_output(BINARY_LOGISTIC)
+    var codes = resolve_builtin_metrics(names, BINARY_LOGISTIC)
+    var result = train_with_builtin_metrics(
+        data, y, valid_sets^, params, codes, ctx,
+        primary=1, early_stopping_rounds=10,
+    )
+
+Nothing about those two metrics is written at the call site. That `auc` is
+higher-is-better, that both score probabilities rather than log-odds, that
+neither may score a poisson model, and that `auc` is metric code 7 are all
+facts of `objective_registry.mojo`, and getting the first one wrong by hand
+produces a run that finishes and truncates to the worst round. The four
+`*_with_builtin_metrics` entry points read them from the registry:
+
+- `resolve_builtin_metrics` turns names (every LightGBM alias included) into
+  codes and refuses one that scores a different task, by name.
+- `builtin_metric_metadata` gives each code its canonical name and its
+  direction, which is what early stopping compares with.
+- `eval_builtin_metric` applies the transform the registry says the metric
+  expects and calls the one function that computes it, in metrics.mojo or
+  ranking.mojo.
+- `BuiltinMetricContext` carries what the registry says a metric needs
+  beyond predictions and labels: the objective and its scalar parameter, a
+  class count, per-validation-set query groups and a cutoff, and per-
+  validation-set weights. `ctx.check` runs the whole request before the
+  first tree.
+
+The objective is not a separate argument to those entry points; it comes
+from the context, so the metric always scores the objective the model
+trained with at the parameter it trained at. A caller who wants a built-in
+metric and a hand-written one in the same run builds a `MetricSuite` whose
+evaluator calls `eval_builtin_metric` for some indices and their own code
+for others; nothing about the two paths is exclusive.
+
 Multiclass and ranking
 ----------------------
 `train_multiclass_with_metrics` and `train_ranker_with_metrics` extend the
@@ -128,12 +168,7 @@ from .callback import (
     scale_tree_values,
 )
 from .boosting import (
-    BINARY_LOGISTIC,
-    CROSS_ENTROPY,
     CUSTOM,
-    GAMMA,
-    POISSON,
-    TWEEDIE,
     Booster,
     BoosterParams,
     MulticlassBooster,
@@ -445,7 +480,7 @@ def response_scale(objective: Int, raw: List[Float64]) raises -> List[Float64]:
     elif link == LINK_IDENTITY:
         for r in range(len(raw)):
             out.append(raw[r])
-    else:
+    elif link == LINK_SOFTMAX:
         raise Error(
             "objective '",
             objective_canonical_name(objective),
@@ -453,7 +488,352 @@ def response_scale(objective: Int, raw: List[Float64]) raises -> List[Float64]:
             " its raw scores with eval_builtin_metric, which takes the"
             " softmax of each row",
         )
+    else:
+        raise Error("unknown link code ", link)
     return out^
+
+
+# ---------------------------------------------------------------------------
+# Built-in metrics
+# ---------------------------------------------------------------------------
+#
+# Everything above takes a caller-supplied callable. Everything below takes a
+# *metric code* and looks the rest up: the name and the direction from the
+# registry, the transform from the registry, the arithmetic from metrics.mojo
+# and ranking.mojo. That is the whole point of it. A caller who wants
+# `binary_logloss` and `auc` watching an early-stopping run should not have to
+# write a dispatching closure, know that AUC is higher-is-better, or remember
+# that a binary model's metrics score probabilities rather than log-odds; each
+# of those is a fact the registry already holds, and getting one of them wrong
+# by hand produces a run that trains to completion and reports the wrong best
+# round.
+#
+# There is no second table here. `eval_builtin_metric` is a router: it asks
+# the registry which of the three shapes a code has and calls the one function
+# that computes it. Adding a metric means adding it to metrics.mojo and to the
+# registry; this file does not change.
+
+
+def _whole_number_codes(
+    target: List[Float64], n_classes: Int, what: String
+) raises -> List[Int]:
+    """Float64 labels as the Int codes a multiclass or ranking metric needs.
+
+    Labels travel in `ValidSet.target` as Float64 because one `ValidSet` type
+    serves every trainer. Only whole numbers mean anything to either metric
+    family, and anything else is rejected rather than truncated. `n_classes`
+    of 0 means "no upper bound", which is the ranking case: a relevance grade
+    is checked by `check_labels` instead.
+    """
+    var out = List[Int](capacity=len(target))
+    for r in range(len(target)):
+        var value = target[r]
+        var ok = isfinite(value)
+        var code = Int(value) if ok else 0
+        if ok:
+            ok = Float64(code) == value and code >= 0
+        if ok and n_classes > 0:
+            ok = code < n_classes
+        if not ok:
+            raise Error(String(what, " at row ", r, " is not a valid label"))
+        out.append(code)
+    return out^
+
+
+@fieldwise_init
+struct BuiltinMetricContext(Copyable, Movable):
+    """Everything a built-in metric needs beyond predictions and labels.
+
+    The registry says *what* each metric needs (`metric_needs`); this carries
+    it. One value covers a whole run, so it is built once and captured by the
+    dispatching closure rather than rebuilt per round.
+
+    - `objective` decides the transform for every single-output metric, since
+      the link belongs to the objective and not to the metric. It is also
+      what `check` validates the metric codes against.
+    - `alpha` is the objective's scalar parameter, the one the four
+      parameterized metrics score at. `metric_scoring_param` is what decides
+      whether a given metric may read it.
+    - `n_classes` is read by the two multiclass metrics and ignored
+      otherwise.
+    - `groups` holds one `RankGroups` per validation set, in the same order
+      as the validation sets, because a ranking metric ranks within *that*
+      set's queries. `cutoff` is LightGBM's `eval_at`, shared by ndcg and map.
+    - `weights` holds one weight vector per validation set, again in order,
+      and an empty outer list means every validation set is unweighted. This
+      is the only way a validation metric is ever weighted: the training
+      `sample_weight` is deliberately not reused, matching
+      `train_with_valid`, so a class weight folded into the training weights
+      cannot leak into the score and be applied a second time. The two
+      ranking metrics take no weights at all, which is LightGBM's behavior
+      and ranking.mojo's signature.
+    """
+
+    var objective: Int
+    var alpha: Float64
+    var n_classes: Int
+    var groups: List[RankGroups]
+    var cutoff: Int
+    var weights: List[List[Float64]]
+
+    @staticmethod
+    def single_output(
+        objective: Int, alpha: Float64 = 0.9
+    ) -> BuiltinMetricContext:
+        """A context for a regression, binary, cross-entropy, or
+        custom-objective run: the objective and its scalar parameter, and
+        nothing else to carry."""
+        return BuiltinMetricContext(
+            objective, alpha, 0, List[RankGroups](), 0, List[List[Float64]]()
+        )
+
+    @staticmethod
+    def multiclass(n_classes: Int) -> BuiltinMetricContext:
+        """A context for a softmax run. The objective is `MULTICLASS`, whose
+        link is the softmax, so no single-output metric can score it."""
+        return BuiltinMetricContext(
+            MULTICLASS,
+            0.9,
+            n_classes,
+            List[RankGroups](),
+            0,
+            List[List[Float64]](),
+        )
+
+    @staticmethod
+    def ranking(
+        var groups: List[RankGroups], cutoff: Int = DEFAULT_NDCG_EVAL_AT
+    ) -> BuiltinMetricContext:
+        """A context for a LambdaRank run: one query grouping per validation
+        set and the cutoff both ranking metrics truncate at."""
+        return BuiltinMetricContext(
+            LAMBDARANK, 0.9, 0, groups^, cutoff, List[List[Float64]]()
+        )
+
+    def set_weights(mut self, var weights: List[List[Float64]]):
+        """Give the context one weight vector per validation set, in the same
+        order as the validation sets. An entry may be empty, which leaves
+        that set unweighted. `ctx.check` rejects a count that does not match
+        the number of validation sets."""
+        self.weights = weights^
+
+    def weight_for(self, valid: Int) raises -> List[Float64]:
+        """This validation set's weights, empty when unweighted."""
+        if len(self.weights) == 0:
+            return List[Float64]()
+        return self.weights[valid].copy()
+
+    def groups_for(self, valid: Int) raises -> RankGroups:
+        """This validation set's query grouping."""
+        if valid < 0 or valid >= len(self.groups):
+            raise Error(
+                "a ranking metric needs one RankGroups per validation set;"
+                " BuiltinMetricContext carries ",
+                len(self.groups),
+            )
+        return self.groups[valid].copy()
+
+    def check(self, metric_codes: List[Int], n_valid: Int) raises:
+        """Validate the whole request before training starts: every code is
+        a built-in metric, every one of them scores this objective's task,
+        and everything they need is present.
+
+        Every failure here is a failure a user should see before the first
+        tree rather than at round zero, which is why it is a separate pass
+        over the codes rather than a check inside the dispatch.
+        """
+        if len(metric_codes) == 0:
+            raise Error("a built-in metric suite needs at least one metric")
+        if len(self.weights) > 0 and len(self.weights) != n_valid:
+            raise Error(
+                "BuiltinMetricContext carries ",
+                len(self.weights),
+                " weight vectors for ",
+                n_valid,
+                " validation sets",
+            )
+        var needs = 0
+        for i in range(len(metric_codes)):
+            var metric = metric_codes[i]
+            if not metric_is_builtin(metric):
+                raise Error(
+                    "metric code ",
+                    metric,
+                    " is not a built-in metric; a caller-supplied metric goes"
+                    " through MetricSuite, which carries its own name and"
+                    " direction",
+                )
+            check_objective_metric(self.objective, metric)
+            # Raises here rather than at round zero if the objective's scalar
+            # is not the one this metric reads.
+            _ = metric_scoring_param(metric, self.objective, self.alpha)
+            needs |= metric_needs(metric)
+            for other in range(i):
+                if metric_codes[other] == metric:
+                    raise Error(
+                        "metric '",
+                        metric_canonical_name(metric),
+                        "' is named twice; each metric is scored once per"
+                        " validation set per round",
+                    )
+        if (needs & NEEDS_N_CLASSES) != 0 and self.n_classes < 2:
+            raise Error(
+                "the multiclass metrics need n_classes >= 2;"
+                " BuiltinMetricContext carries ",
+                self.n_classes,
+            )
+        if (needs & NEEDS_GROUPS) != 0 and len(self.groups) != n_valid:
+            raise Error(
+                "the ranking metrics need one RankGroups per validation set;"
+                " BuiltinMetricContext carries ",
+                len(self.groups),
+                " for ",
+                n_valid,
+            )
+        if (needs & NEEDS_CUTOFF) != 0 and self.cutoff < 1:
+            raise Error("the ranking metrics need a positive cutoff")
+
+
+def builtin_metric_metadata(
+    metric_codes: List[Int],
+) raises -> List[CustomMetric]:
+    """One `CustomMetric` per code: the registry's canonical name and its
+    direction.
+
+    This is where the registry reaches early stopping. `higher_is_better`
+    decides which way `_StopState.observe` compares, so a metric registered
+    with the wrong direction would train to completion and truncate to the
+    worst round; reading it from the one place that knows is the difference
+    between that and a caller remembering. Every metric is watched for early
+    stopping, which is LightGBM's behavior when a metric is named at all.
+    """
+    var out = List[CustomMetric](capacity=len(metric_codes))
+    for i in range(len(metric_codes)):
+        var metric = metric_codes[i]
+        out.append(
+            CustomMetric(
+                metric_canonical_name(metric),
+                metric_higher_is_better(metric),
+                True,
+            )
+        )
+    return out^
+
+
+def resolve_builtin_metrics(
+    names: List[String], objective: Int
+) raises -> List[Int]:
+    """Metric names to codes, checked against the objective's task.
+
+    Names are canonical lowercase and every LightGBM alias resolves, both of
+    which are `metric_code_from_name`'s rules. A name that is not a metric
+    and a name that is a metric for a different kind of model get different
+    sentences, which is `metric_code_for_objective`'s reason for existing.
+    """
+    var out = List[Int](capacity=len(names))
+    for i in range(len(names)):
+        out.append(metric_code_for_objective(names[i], objective))
+    return out^
+
+
+def default_metric_codes(objective: Int) raises -> List[Int]:
+    """The one metric to score when the caller names none: the objective's
+    own loss, LightGBM's rule.
+
+    A custom objective has none and says so; only its author knows what it
+    optimizes, so naming a metric is not optional there.
+    """
+    var out = List[Int](capacity=1)
+    out.append(objective_default_metric(objective))
+    return out^
+
+
+def eval_builtin_metric(
+    metric: Int,
+    ctx: BuiltinMetricContext,
+    valid: Int,
+    pred: List[Float64],
+    target: List[Float64],
+) raises -> Float64:
+    """One built-in metric on one validation set's raw predictions.
+
+    The one native call path from a metric code to a number, and the only
+    place the three metric shapes are told apart. Which shape a code has is
+    `metric_transform`, so the branch below is the registry's answer rather
+    than a list of codes maintained here:
+
+    - `TRANSFORM_OBJECTIVE_LINK`, nineteen codes: apply the *objective's*
+      inverse link once and hand the result to `eval_metric_by_code`. This is
+      LightGBM's rule and the reason `l2` on a poisson model scores expected
+      counts rather than log-counts. A metric never applies a second
+      transform.
+    - `TRANSFORM_SOFTMAX`, the two multiclass codes: take the softmax of each
+      row-major block of `n_classes` raw scores, then score the class codes.
+    - `TRANSFORM_RAW`, the two ranking codes: rank within the validation
+      set's own queries. Only the order matters, so no link is applied.
+
+    `pred` is raw scores, the metric contract in this module's docstring, and
+    is left untouched: the transformed copy is local, so the caller's running
+    raw-score vector is still raw on the next round.
+    """
+    var transform = metric_transform(metric)
+    var weight = ctx.weight_for(valid)
+
+    if transform == TRANSFORM_SOFTMAX:
+        if len(pred) != len(target) * ctx.n_classes:
+            raise Error(
+                "a multiclass metric needs n_rows * n_classes raw scores;"
+                " got ",
+                len(pred),
+                " for ",
+                len(target),
+                " rows and ",
+                ctx.n_classes,
+                " classes",
+            )
+        var codes = _whole_number_codes(
+            target, ctx.n_classes, String("multiclass label")
+        )
+        var probs = pred.copy()
+        for r in range(len(target)):
+            _softmax_inplace(probs, r * ctx.n_classes, ctx.n_classes)
+        if metric == METRIC_MULTI_LOGLOSS:
+            return multiclass_log_loss(probs, codes, ctx.n_classes, weight)
+        if metric == METRIC_MULTI_ERROR:
+            return multiclass_error(probs, codes, ctx.n_classes, weight)
+        raise Error(
+            "metric '",
+            metric_canonical_name(metric),
+            "' claims the softmax transform but is not a multiclass metric",
+        )
+
+    if transform == TRANSFORM_RAW:
+        var grades = _whole_number_codes(
+            target, 0, String("relevance label")
+        )
+        check_labels(grades)
+        var groups = ctx.groups_for(valid)
+        if metric == METRIC_NDCG:
+            return ndcg(pred, grades, groups, ctx.cutoff)
+        if metric == METRIC_MAP:
+            return mean_average_precision(pred, grades, groups, ctx.cutoff)
+        raise Error(
+            "metric '",
+            metric_canonical_name(metric),
+            "' claims raw scores but is not a ranking metric",
+        )
+
+    if transform != TRANSFORM_OBJECTIVE_LINK:
+        raise Error(
+            "unknown metric transform ",
+            transform,
+            " for metric '",
+            metric_canonical_name(metric),
+            "'",
+        )
+    var scored = response_scale(ctx.objective, pred)
+    var param = metric_scoring_param(metric, ctx.objective, ctx.alpha)
+    return eval_metric_by_code(metric, scored, target, weight, param)
 
 
 def _check_valid_sets(valid_sets: List[ValidSet], n_features: Int) raises:
@@ -967,6 +1347,277 @@ def train_with_metric[G: MetricFn & Copyable](
         alpha,
         bagging,
         goss,
+    )
+
+
+def train_with_builtin_metrics(
+    data: BinnedMatrix,
+    target: List[Float64],
+    valid_sets: List[ValidSet],
+    params: BoosterParams,
+    metric_codes: List[Int],
+    ctx: BuiltinMetricContext,
+    primary: Int = 0,
+    early_stopping_rounds: Int = 0,
+    min_delta: Float64 = 0.0,
+    sample_weight: List[Float64] = [],
+    bagging: BaggingParams = BaggingParams.disabled(),
+    goss: GossParams = GossParams.disabled(),
+) raises -> MetricTrainResult:
+    """`train_with_metrics` driven by built-in metric codes instead of a
+    caller-supplied callable.
+
+    The objective and its scalar parameter come from `ctx` rather than from
+    arguments of their own, which is the point: the metric scores the same
+    objective at the same parameter the model trained with, and there is no
+    pair of arguments that could disagree. `BuiltinMetricContext.single_output`
+    builds one.
+
+    Names, directions, transforms, and compatibility all come from the
+    registry (see `eval_builtin_metric` and `builtin_metric_metadata`), so a
+    metric that cannot score this objective's task is refused here, before
+    the first tree, rather than scoring something meaningless for a full run.
+
+    `primary` indexes `metric_codes` and names the metric whose best round
+    the ensemble is truncated to. Every named metric is watched for early
+    stopping. For a caller-supplied metric, or a mix of the two, build a
+    `MetricSuite` and call `train_with_metrics`.
+    """
+    ctx.check(metric_codes, len(valid_sets))
+    var codes = metric_codes.copy()
+    var context = ctx.copy()
+
+    def dispatch(
+        metric_index: Int,
+        valid_index: Int,
+        pred: List[Float64],
+        valid_target: List[Float64],
+    ) raises {imm codes, imm context} -> Float64:
+        return eval_builtin_metric(
+            codes[metric_index], context, valid_index, pred, valid_target
+        )
+
+    var suite = MetricSuite(
+        builtin_metric_metadata(metric_codes), dispatch, primary
+    )
+    return train_with_metrics(
+        data,
+        target,
+        valid_sets,
+        ctx.objective,
+        params,
+        suite,
+        early_stopping_rounds,
+        min_delta,
+        sample_weight,
+        ctx.alpha,
+        bagging,
+        goss,
+    )
+
+
+def train_custom_with_builtin_metrics[G: GradHessFn](
+    data: BinnedMatrix,
+    target: List[Float64],
+    valid_sets: List[ValidSet],
+    grad_hess: G,
+    params: BoosterParams,
+    metric_codes: List[Int],
+    ctx: BuiltinMetricContext,
+    primary: Int = 0,
+    early_stopping_rounds: Int = 0,
+    min_delta: Float64 = 0.0,
+    sample_weight: List[Float64] = [],
+    base_score: Float64 = 0.0,
+) raises -> MetricTrainResult:
+    """`train_custom_with_metrics` driven by built-in metric codes.
+
+    A custom objective has no default metric, so `metric_codes` is not
+    optional and `default_metric_codes(CUSTOM)` raises rather than guessing.
+    What it does have is a task: `objective_task(CUSTOM)` is regression, the
+    family its single real-valued output belongs to, so the thirteen
+    regression metrics score it and the binary, multiclass, and ranking ones
+    are refused.
+
+    The predictions those metrics see are raw scores, because
+    `objective_link(CUSTOM)` is the identity: the framework does not know the
+    caller's link, so it applies none. A metric that wants probabilities
+    should be a caller-supplied one that applies its own.
+    """
+    if ctx.objective != CUSTOM:
+        raise Error(
+            "train_custom_with_builtin_metrics needs a context built for the"
+            " CUSTOM objective; got '",
+            objective_canonical_name(ctx.objective),
+            "'",
+        )
+    ctx.check(metric_codes, len(valid_sets))
+    var codes = metric_codes.copy()
+    var context = ctx.copy()
+
+    def dispatch(
+        metric_index: Int,
+        valid_index: Int,
+        pred: List[Float64],
+        valid_target: List[Float64],
+    ) raises {imm codes, imm context} -> Float64:
+        return eval_builtin_metric(
+            codes[metric_index], context, valid_index, pred, valid_target
+        )
+
+    var suite = MetricSuite(
+        builtin_metric_metadata(metric_codes), dispatch, primary
+    )
+    return train_custom_with_metrics(
+        data,
+        target,
+        valid_sets,
+        grad_hess,
+        params,
+        suite,
+        early_stopping_rounds,
+        min_delta,
+        sample_weight,
+        base_score,
+    )
+
+
+def train_multiclass_with_builtin_metrics(
+    data: BinnedMatrix,
+    labels: List[Int],
+    n_classes: Int,
+    valid_sets: List[ValidSet],
+    params: BoosterParams,
+    metric_codes: List[Int],
+    ctx: BuiltinMetricContext,
+    primary: Int = 0,
+    early_stopping_rounds: Int = 0,
+    min_delta: Float64 = 0.0,
+    sample_weight: List[Float64] = [],
+    bagging: BaggingParams = BaggingParams.disabled(),
+    goss: GossParams = GossParams.disabled(),
+) raises -> MetricMulticlassTrainResult:
+    """`train_multiclass_with_metrics` driven by built-in metric codes.
+
+    `multi_logloss` and `multi_error` are the two metrics a softmax model
+    accepts, and both take the softmax of each row-major block themselves
+    (`metric_transform` is `TRANSFORM_SOFTMAX`), so what reaches them is the
+    raw scores the trainer already holds. `BuiltinMetricContext.multiclass`
+    builds the context; its `n_classes` must be the one being trained, since
+    a metric that read a different one would be scoring a different model.
+    """
+    if ctx.n_classes != n_classes:
+        raise Error(
+            "BuiltinMetricContext carries n_classes=",
+            ctx.n_classes,
+            " but the run trains ",
+            n_classes,
+        )
+    if ctx.objective != MULTICLASS:
+        raise Error(
+            "train_multiclass_with_builtin_metrics needs a context built for"
+            " the multiclass objective; got '",
+            objective_canonical_name(ctx.objective),
+            "'",
+        )
+    ctx.check(metric_codes, len(valid_sets))
+    var codes = metric_codes.copy()
+    var context = ctx.copy()
+
+    def dispatch(
+        metric_index: Int,
+        valid_index: Int,
+        pred: List[Float64],
+        valid_target: List[Float64],
+    ) raises {imm codes, imm context} -> Float64:
+        return eval_builtin_metric(
+            codes[metric_index], context, valid_index, pred, valid_target
+        )
+
+    var suite = MetricSuite(
+        builtin_metric_metadata(metric_codes), dispatch, primary
+    )
+    return train_multiclass_with_metrics(
+        data,
+        labels,
+        n_classes,
+        valid_sets,
+        params,
+        suite,
+        early_stopping_rounds,
+        min_delta,
+        sample_weight,
+        bagging,
+        goss,
+    )
+
+
+def train_ranker_with_builtin_metrics(
+    data: BinnedMatrix,
+    labels: List[Int],
+    groups: RankGroups,
+    valid_sets: List[ValidSet],
+    params: BoosterParams,
+    metric_codes: List[Int],
+    ctx: BuiltinMetricContext,
+    primary: Int = 0,
+    early_stopping_rounds: Int = 0,
+    min_delta: Float64 = 0.0,
+    rank_params: RankerParams = RankerParams.default(),
+    sample_weight: List[Float64] = [],
+    bagging: BaggingParams = BaggingParams.disabled(),
+) raises -> MetricTrainResult:
+    """`train_ranker_with_metrics` driven by built-in metric codes.
+
+    This is the boilerplate the module docstring warns about, removed: a
+    ranking metric needs the *validation* set's own query boundaries, and
+    until now the only way to give it them was to capture them in a closure
+    by hand. `BuiltinMetricContext.ranking` carries one `RankGroups` per
+    validation set instead, in the same order, and `ctx.check` refuses a
+    count that does not match rather than letting a metric rank the wrong
+    documents together.
+
+    `ndcg` and `map` read raw scores (`metric_transform` is
+    `TRANSFORM_RAW`), since only the order within a query matters, and take
+    no weights, which is LightGBM's behavior. `groups` here is the *training*
+    grouping and is unrelated to the validation ones in `ctx`.
+    """
+    if ctx.objective != LAMBDARANK:
+        raise Error(
+            "train_ranker_with_builtin_metrics needs a context built for the"
+            " lambdarank objective; got '",
+            objective_canonical_name(ctx.objective),
+            "'",
+        )
+    ctx.check(metric_codes, len(valid_sets))
+    var codes = metric_codes.copy()
+    var context = ctx.copy()
+
+    def dispatch(
+        metric_index: Int,
+        valid_index: Int,
+        pred: List[Float64],
+        valid_target: List[Float64],
+    ) raises {imm codes, imm context} -> Float64:
+        return eval_builtin_metric(
+            codes[metric_index], context, valid_index, pred, valid_target
+        )
+
+    var suite = MetricSuite(
+        builtin_metric_metadata(metric_codes), dispatch, primary
+    )
+    return train_ranker_with_metrics(
+        data,
+        labels,
+        groups,
+        valid_sets,
+        params,
+        suite,
+        early_stopping_rounds,
+        min_delta,
+        rank_params,
+        sample_weight,
+        bagging,
     )
 
 

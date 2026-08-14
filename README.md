@@ -18,6 +18,25 @@ histogram-based split finding and leaf-wise (best-first) tree growth. Its
 benchmark configuration aligns important parameters with LightGBM for
 reproducible comparisons.
 
+## Creator and stewardship
+
+mojoboost was created by [Andrew Hendel](https://github.com/ajhendel), who
+originated the project, set its product and technical direction, and serves as
+lead maintainer. The project is developed in public under Apache-2.0 and
+welcomes contributors without transferring their copyright.
+
+Development has made extensive use of AI-assisted coding tools under human
+direction and review. Andrew remains accountable for what the project claims,
+merges, releases, and supports. The project treats reproducible evidence—not
+who or what typed a change—as the standard for correctness and performance.
+
+- [Authors and attribution](AUTHORS.md)
+- [Project origin and stewardship](docs/PROJECT_ORIGIN.md)
+- [Architecture](docs/ARCHITECTURE.md)
+- [Technical article draft](docs/technical/BUILDING_MOJOBOOST.md)
+- [How to cite mojoboost](CITATION.cff)
+- [Governance](GOVERNANCE.md)
+
 ## Installation
 
 The command this project is building toward is one line.

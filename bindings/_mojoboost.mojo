@@ -8,6 +8,15 @@ the wrapper passes float64-contiguous buffers (column-major for feature
 matrices) and keeps them alive for the duration of each call. Copies into
 Mojo Lists happen here, so no Python buffer is retained after a call
 returns. Trained models are returned as opaque handles owned by Python.
+
+Prediction comes in two shapes. The row-at-a-time entry points
+(`predict`, `predict_range`, `predict_leaf`, and their multiclass and
+sparse siblings) walk the trees on the host and are unchanged. The `_batch`
+entry points below them take a device, hand the whole matrix to
+`Model.predict_batch`, and reach the device walk in gpu_predict.mojo; they
+report which backend ran rather than leaving a caller to assume. Where a
+prediction runs is still decided in one place, `resolve_device` in
+device.mojo, and nothing here decides it.
 """
 
 from std.os import abort
@@ -76,12 +85,17 @@ from mojoboost.device import (
     resolve_device as mojo_resolve_device,
 )
 from mojoboost.gpu_predict import (
+    RESPONSE_SOFTMAX,
     GpuPredictor,
     accumulate_booster_rounds,
     accumulate_multiclass_rounds,
+    device_metric_code,
+    device_metric_matches_host,
     gpu_predict_support,
     leaf_indices_gpu,
     leaf_indices_multiclass_gpu,
+    response_for_objective,
+    validation_host_metric,
 )
 from mojoboost.goss import GossParams
 from mojoboost.importance import gain_importance, split_importance
@@ -180,6 +194,9 @@ def PyInit__mojoboost() abi("C") -> PythonObject:
             "gpu_validation_accumulate_multiclass"
         )
         m.def_function[gpu_validation_metric]("gpu_validation_metric")
+        m.def_function[gpu_validation_metric_matches_host](
+            "gpu_validation_metric_matches_host"
+        )
         m.def_function[gpu_validation_raw]("gpu_validation_raw")
         m.def_function[predict_contrib]("predict_contrib")
         m.def_function[predict_contrib_multiclass](
@@ -1696,10 +1713,16 @@ def predict_batch(
     flag. The buffer and the iteration semantics are `predict_range`'s; what
     is new is that the whole batch crosses at once, which is what the device
     walk needs, and that the backend that ran comes back as the return value.
+
+    An empty batch returns None and writes nothing: no backend is selected
+    for it, because the policy refuses to size a workload with no rows and a
+    name for a backend that did not run would be a fiction.
     """
     var m = model.downcast_value_ptr[Model]()
     var nr = Int(py=n_rows)
     var nf = Int(py=n_features)
+    if nr == 0:
+        return PythonObject(None)
     var rng = _iteration_slice(
         m[].n_iterations(), params["start"], params["stop"]
     )
@@ -1729,10 +1752,13 @@ def predict_proba_batch(
 
     The multiclass shape is the ensemble's, not this function's: the device
     path walks one tree per class per iteration and softmaxes across the row,
-    which is what `MulticlassBooster` does on the host."""
+    which is what `MulticlassBooster` does on the host. An empty batch
+    returns None, as in `predict_batch`."""
     var m = model.downcast_value_ptr[MulticlassModel]()
     var nr = Int(py=n_rows)
     var nf = Int(py=n_features)
+    if nr == 0:
+        return PythonObject(None)
     var k = m[].booster.n_classes
     var rng = _iteration_slice(
         m[].n_iterations(), params["start"], params["stop"]
@@ -1763,18 +1789,19 @@ def predict_leaf_batch(
     reports the leaf's rank among its tree's leaves in node order, which is
     what `Tree.leaf_ordinals` counts and what the host table above indexes,
     so a saved model reports the same ordinals whichever device reads it.
-    An empty iteration range writes nothing and still reports the device it
-    resolved to."""
+    An empty batch or an empty iteration range selects no tree at all, so it
+    writes nothing and returns None rather than naming a backend that did
+    not run."""
     var m = model.downcast_value_ptr[Model]()
     var nr = Int(py=n_rows)
     var nf = Int(py=n_features)
     var rng = _iteration_slice(
         m[].n_iterations(), params["start"], params["stop"]
     )
+    if nr == 0 or rng.n_iterations() == 0:
+        return PythonObject(None)
     var device = _predict_device(params, nr, nf, 1, m[].mapper.n_bins)
     var name = PythonObject(mojo_device_name(device))
-    if rng.n_iterations() == 0 or nr == 0:
-        return name^
     var features = _f64_list(Int(py=x_addr), nr * nf)
     if device == GPU_DEVICE:
         _store_ints(
@@ -1798,7 +1825,8 @@ def predict_leaf_multiclass_batch(
 ) raises -> PythonObject:
     """`predict_leaf_multiclass` for a whole dense batch, on the device the
     params dict names: row-major and round-major within a row, column
-    `i * n_classes + k`."""
+    `i * n_classes + k`. An empty batch or range returns None, as in
+    `predict_leaf_batch`."""
     var m = model.downcast_value_ptr[MulticlassModel]()
     var nr = Int(py=n_rows)
     var nf = Int(py=n_features)
@@ -1806,10 +1834,10 @@ def predict_leaf_multiclass_batch(
     var rng = _iteration_slice(
         m[].n_iterations(), params["start"], params["stop"]
     )
+    if nr == 0 or rng.n_iterations() == 0:
+        return PythonObject(None)
     var device = _predict_device(params, nr, nf, k, m[].mapper.n_bins)
     var name = PythonObject(mojo_device_name(device))
-    if rng.n_iterations() == 0 or nr == 0:
-        return name^
     var features = _f64_list(Int(py=x_addr), nr * nf)
     if device == GPU_DEVICE:
         _store_ints(
@@ -1855,6 +1883,10 @@ struct GpuValidation(Movable, Writable):
     from outside Mojo: the trainer's context is not reachable from Python, so
     sharing one is not on the table here the way it is for
     `train_gpu_with_valid`.
+
+    Lifetime is Python's. The device buffers and the context go away when
+    the last Python reference to the handle does, so a loop that drops the
+    handle releases the validation set without an explicit close.
     """
 
     var predictor: GpuPredictor
@@ -2036,25 +2068,49 @@ def gpu_validation_accumulate_multiclass(
 
 
 def gpu_validation_metric(
-    handle: PythonObject, metric: PythonObject, response: PythonObject
+    handle: PythonObject, metric: PythonObject, objective: PythonObject
 ) raises -> PythonObject:
     """Score the resident validation set on the device.
 
-    `metric` is a `METRIC_*` code and `response` a `RESPONSE_*` code from
-    gpu_predict.mojo: the inverse link to apply to the raw scores first,
-    because every metric takes predictions on the response scale. The raw
-    scores are left intact for the next accumulate.
+    `metric` is a built-in metric code, the same numbering `eval_metric`
+    takes, so a caller carries one metric vocabulary rather than a second
+    device-side one. `objective` is the model's objective code; it selects
+    the inverse link to apply to the raw scores before scoring, because
+    every metric takes predictions on the response scale. A handle opened
+    for a multiclass model softmaxes instead and ignores the objective,
+    which is what a softmax ensemble's response is.
 
-    The device metric set is smaller than the host one and its log losses
-    clamp at the Float32 floor rather than at 1e-15, so a caller whose
-    stopping rule is defined by a host metric should read the raw scores with
-    `gpu_validation_raw` and score them with `eval_metric` instead. That is
-    the same choice `train_gpu`'s device validation scorer makes per
-    objective."""
+    A metric the device has no kernel for raises and names itself. The
+    device metric set is the smaller one, and its log losses clamp at the
+    Float32 floor rather than at 1e-15, so a caller whose stopping rule is
+    defined by the host metric should read the raw scores with
+    `gpu_validation_raw` and pass them to `eval_metric` instead. That is the
+    same choice `train_gpu`'s device validation scorer makes per objective.
+    """
     var h = handle.downcast_value_ptr[GpuValidation]()
+    var response = RESPONSE_SOFTMAX
+    if h[].n_outputs == 1:
+        response = response_for_objective(Int(py=objective))
     return PythonObject(
-        h[].predictor.validation_metric(Int(py=metric), Int(py=response))
+        validation_host_metric(h[].predictor, Int(py=metric), response)
     )
+
+
+def gpu_validation_metric_matches_host(
+    metric: PythonObject,
+) raises -> PythonObject:
+    """`[has_kernel, matches_host]` for a built-in metric code.
+
+    What an estimator needs to decide where to score without hardcoding the
+    device's metric set: `has_kernel` says the device can compute it at all,
+    and `matches_host` says its definition is metrics.mojo's term for term
+    rather than merely close. Both answers come from gpu_predict.mojo, which
+    owns the kernels."""
+    var code = Int(py=metric)
+    var out = Python.list()
+    out.append(PythonObject(Int(device_metric_code(code) >= 0)))
+    out.append(PythonObject(Int(device_metric_matches_host(code))))
+    return out^
 
 
 def gpu_validation_raw(

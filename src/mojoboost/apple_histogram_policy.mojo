@@ -594,13 +594,19 @@ def derive_histogram_plan(
         # The `MOJOBOOST_GPU_ROW_TILE` and `MOJOBOOST_GPU_HIST_STRATEGY`
         # overrides therefore reach this level too, which they did not when
         # the arithmetic was restated here.
+        var target_blocks = profile.core_count * resident
+        if target_blocks < 1:
+            # A profile reporting no cores is a device that answered nothing;
+            # one threadgroup per active feature is the floor, as in
+            # `derive_tiling`.
+            target_blocks = 1
         var shaped = resolve_tiling(
             rows,
             work.n_slots,
             work.n_bins,
             block_threads,
             capacity,
-            profile.core_count * resident,
+            target_blocks,
             partial_cell_limit,
             requested_strategy,
         )

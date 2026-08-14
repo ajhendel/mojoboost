@@ -1,12 +1,12 @@
-"""The proposed public Python surface, as data.
+"""The public Python surface, as data.
 
-This module is a plan, not a mechanism. It holds what `mojoboost/__init__.py`
-is being asked to export, where each name comes from, and why. It imports
-nothing, touches no optional dependency, and changes no package state:
-reading it cannot make `mojoboost` behave differently, and nothing in the
-package imports it. The integration owner of `__init__.py` reads it (and
-handoffs/integration_06_python_api.md, which says the same things in prose)
-and writes the export block by hand.
+This module is the record of what `mojoboost/__init__.py` exports, where
+each name comes from, and why. It imports nothing, touches no optional
+dependency, and changes no package state: reading it cannot make
+`mojoboost` behave differently, and nothing in the package imports it. It
+is documentation with a shape, not a mechanism, so a test can compare it
+against the real `__all__` and a reader can find the decision behind a
+name without reading 4000 lines.
 
 Two rules it exists to keep:
 
@@ -15,27 +15,64 @@ Two rules it exists to keep:
   scikit-learn is missing. Submodules with an optional dependency, or with
   a cost, are reached through a module-level `__getattr__` (PEP 562) rather
   than imported at the top of `__init__.py`. `LAZY_SUBMODULE_SNIPPET` is
-  the code.
-- **A name means one thing.** Where a proposed export collides with a
-  submodule of the same name, the collision is written down here with the
-  decision and the alternative, rather than discovered later by whoever
-  types `import mojoboost.cv as cv`.
+  the code, and the end of `__init__.py` is where it now lives.
+- **A name means one thing.** Where an export collides with a submodule of
+  the same name, the collision is written down here with the decision and
+  the alternative, rather than discovered later by whoever types
+  `import mojoboost.cv as cv`.
 
-Owner: prompts/06_PUBLIC_PYTHON_API_INTEGRATION.txt, covering
-`mojoboost.cv` and `mojoboost.dask` only. The `inspection` and
-`device_selection` rows are placeholders held by other lanes and are marked
-as such; take their contents from their own handoffs, not from here.
+History. Version 1 was a *proposal* covering `mojoboost.cv` and
+`mojoboost.dask` only, written by the lane that owned those two modules
+(handoffs/integration_06_python_api.md) for a later owner of `__init__.py`
+to apply. Version 2 is the state after that owner applied it and finished
+the surface: `cv` and `CVBooster` are exported, the `__getattr__` is in
+place, and the `inspection` / `device_selection` placeholders have been
+replaced by what those lanes actually shipped. See
+handoffs/connect_07_python_public.md.
 """
 
-#: Bumped when a proposal below changes, so a handoff can name the plan it
-#: was written against.
-PLAN_VERSION = 1
+#: Bumped when the surface below changes, so a handoff can name the version
+#: it was written against.
+#:
+#: 1 -- proposal (cv, CVBooster, the lazy-dask snippet)
+#: 2 -- applied, plus inspection / device_selection / diagnostics
+PLAN_VERSION = 2
 
-#: `mojoboost.__all__` as it stands before any of this lands, sorted (the
-#: real one is grouped by topic). Kept so the integration owner can diff
-#: rather than retype, and so a stale plan shows up as a set mismatch
-#: against the real `__all__`.
+#: `mojoboost.__all__` as it stands, sorted (the real one is grouped by
+#: topic). A stale record shows up as a set mismatch against the real
+#: `__all__`, which is the cheapest test this module supports.
 CURRENT_TOP_LEVEL = (
+    "Booster",
+    "CVBooster",
+    "CallbackEnv",
+    "Dataset",
+    "EarlyStopException",
+    "MojoBoostClassifier",
+    "MojoBoostRanker",
+    "MojoBoostRegressor",
+    "NotFittedError",
+    "build_info",
+    "callback",
+    "cv",
+    "dump_model",
+    "early_stopping",
+    "explain_device_choice",
+    "get_split_value_histogram",
+    "gpu_available",
+    "group_from_query_ids",
+    "log_evaluation",
+    "ndcg_score",
+    "record_evaluation",
+    "reset_parameter",
+    "show_versions",
+    "train",
+    "trees_to_dataframe",
+    "trees_to_records",
+)
+
+#: The `__all__` this module was written against before version 2, kept so
+#: that "what changed" is answerable without git.
+PREVIOUS_TOP_LEVEL = (
     "Booster",
     "CallbackEnv",
     "Dataset",
@@ -44,6 +81,7 @@ CURRENT_TOP_LEVEL = (
     "MojoBoostRanker",
     "MojoBoostRegressor",
     "NotFittedError",
+    "build_info",
     "callback",
     "early_stopping",
     "gpu_available",
@@ -52,18 +90,19 @@ CURRENT_TOP_LEVEL = (
     "ndcg_score",
     "record_evaluation",
     "reset_parameter",
+    "show_versions",
     "train",
 )
 
-#: Names this lane proposes adding to the top level, with the import that
-#: would provide each. `eager` is whether the name has to exist as a real
-#: attribute at the end of `__init__.py` (as opposed to being resolved by
-#: `__getattr__` on first access).
+#: Names added to the top level in version 2, with the import that provides
+#: each. `eager` is whether the name is a real attribute at the end of
+#: `__init__.py`, as opposed to being resolved by `__getattr__` on first
+#: access.
 #:
-#: Only `cv` and `CVBooster` are proposed here. `mojoboost.dask` stays a
-#: submodule: its three estimators are contracts that cannot train (see
-#: `dask.py`), and exporting them at the top level would put names that
-#: raise `DistributedNotAvailable` next to names that fit a model.
+#: `mojoboost.dask` stays a submodule and exports nothing: its three
+#: estimators are contracts that cannot train (see `dask.py`), and
+#: exporting them at the top level would put names that raise
+#: `DistributedNotAvailable` next to names that fit a model.
 PROPOSED_ADDITIONS = (
     {
         "name": "cv",
@@ -87,6 +126,74 @@ PROPOSED_ADDITIONS = (
         "why": (
             "It is what cv(return_cvbooster=True) hands back, so isinstance "
             "checks and type annotations need it where cv() is."
+        ),
+        "collides_with": None,
+    },
+    {
+        "name": "explain_device_choice",
+        "source": "mojoboost.device_selection",
+        "kind": "function",
+        "eager": False,
+        "statement": "resolved by __getattr__ through _LAZY_ATTRS",
+        "why": (
+            "'what would device=\"gpu\" do with this data' is a question "
+            "asked before training, so the answer should be reachable "
+            "without knowing which submodule holds it. The module is a "
+            "formatter over the native policy and holds no policy of its "
+            "own, so exporting one function from it does not export a "
+            "second opinion."
+        ),
+        "collides_with": None,
+    },
+    {
+        "name": "dump_model",
+        "source": "mojoboost.inspection",
+        "kind": "function",
+        "eager": False,
+        "statement": "resolved by __getattr__ through _LAZY_ATTRS",
+        "why": (
+            "LightGBM spells it Booster.dump_model(); mojoboost has that "
+            "method too (it delegates here), and the free function is what "
+            "takes a model string or a fitted estimator as well."
+        ),
+        "collides_with": None,
+    },
+    {
+        "name": "trees_to_dataframe",
+        "source": "mojoboost.inspection",
+        "kind": "function",
+        "eager": False,
+        "statement": "resolved by __getattr__ through _LAZY_ATTRS",
+        "why": (
+            "The pandas view of the ensemble. Lazy for the same reason as "
+            "the rest: pandas is imported by this call and by nothing "
+            "else, so importing mojoboost must not reach it."
+        ),
+        "collides_with": None,
+    },
+    {
+        "name": "trees_to_records",
+        "source": "mojoboost.inspection",
+        "kind": "function",
+        "eager": False,
+        "statement": "resolved by __getattr__ through _LAZY_ATTRS",
+        "why": (
+            "The same rows without pandas installed. Exported beside "
+            "trees_to_dataframe so that the pandas-free answer is as "
+            "findable as the pandas one."
+        ),
+        "collides_with": None,
+    },
+    {
+        "name": "get_split_value_histogram",
+        "source": "mojoboost.inspection",
+        "kind": "function",
+        "eager": False,
+        "statement": "resolved by __getattr__ through _LAZY_ATTRS",
+        "why": (
+            "The data behind LightGBM's plot_split_value_histogram, which "
+            "is a top-level name there. No plotting dependency comes with "
+            "it here."
         ),
         "collides_with": None,
     },
@@ -127,49 +234,91 @@ PROPOSED_LAZY_SUBMODULES = (
     {
         "name": "inspection",
         "optional_dependency": "pandas (for the frame output only)",
-        "owner": "task 19",
-        "note": "Placeholder. Take the real entry from task 19's handoff.",
+        "owner": "handoffs/migration_19_model_inspection.md",
+        "note": (
+            "Reaches pandas from trees_to_dataframe and "
+            "get_split_value_histogram(as_frame=True) and from nowhere "
+            "else, so the module itself imports nothing optional. Lazy to "
+            "keep `import mojoboost` to the extension, and because "
+            "`Booster` (which it inspects) would otherwise be a cycle. "
+            "Four of its names are re-exported; the rest of the schema "
+            "stays here."
+        ),
     },
     {
         "name": "device_selection",
         "optional_dependency": None,
-        "owner": "task 20",
-        "note": "Placeholder. Take the real entry from task 20's handoff.",
+        "owner": "handoffs/migration_20_device_policy.md",
+        "note": (
+            "A formatter over the native policy, with no policy of its "
+            "own. `_Base._resolve_device` imports it inside the call, so a "
+            "fit reaches it whether or not anyone touched the attribute; "
+            "the lazy entry is what makes `mojoboost.device_selection` "
+            "resolve for a reader."
+        ),
+    },
+    {
+        "name": "diagnostics",
+        "optional_dependency": None,
+        "owner": (
+            "handoffs/performance_15_startup.md, "
+            "handoffs/connect_05_device_policy.md"
+        ),
+        "note": (
+            "Reads the filesystem rather than importing the extension, "
+            "which is what makes it usable from a cold interpreter. "
+            "`build_info()` already imports it inside the call; the lazy "
+            "entry is for a reader who wants describe_install() or the "
+            "startup phases."
+        ),
     },
 )
 
-#: The exact code proposed for the end of `mojoboost/__init__.py`. A string
-#: so that reading this module cannot run it. `dask` is deliberately the
-#: only entry this lane fills in; other lanes add their own names to the
-#: tuple.
+#: The shape of the code at the end of `mojoboost/__init__.py`, as a string
+#: so that reading this module cannot run it. Version 1 proposed it for
+#: `dask` alone; what landed resolves four submodules and five attributes,
+#: and the real one carries the comments explaining each. This is the
+#: mechanism, kept here so it can be read without the surrounding 4000
+#: lines -- `__init__.py` is the copy that runs.
 LAZY_SUBMODULE_SNIPPET = '''
-# Submodules the package answers for without importing them. `mojoboost.dask`
-# subclasses the estimators defined above, so it cannot be imported from the
-# top of this file; resolving it here, on first access, is what makes
-# `import mojoboost; mojoboost.dask.register_backend(...)` work while leaving
-# `import mojoboost` free of it. Importing mojoboost.dask still does not
-# import dask itself.
-_LAZY_SUBMODULES = ("dask",)
+_LAZY_SUBMODULES = ("dask", "device_selection", "diagnostics", "inspection")
+
+_LAZY_ATTRS = {
+    "explain_device_choice": "device_selection",
+    "dump_model": "inspection",
+    "trees_to_dataframe": "inspection",
+    "trees_to_records": "inspection",
+    "get_split_value_histogram": "inspection",
+}
 
 
 def __getattr__(name):
-    if name in _LAZY_SUBMODULES:
-        import importlib
+    import importlib
 
+    if name in _LAZY_SUBMODULES:
         module = importlib.import_module(f".{name}", __name__)
         globals()[name] = module  # answered directly from here on
         return module
+    origin = _LAZY_ATTRS.get(name)
+    if origin is not None:
+        value = getattr(
+            importlib.import_module(f".{origin}", __name__), name
+        )
+        globals()[name] = value
+        return value
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def __dir__():
-    return sorted(set(globals()) | set(_LAZY_SUBMODULES))
+    return sorted(
+        set(globals()) | set(_LAZY_SUBMODULES) | set(_LAZY_ATTRS)
+    )
 '''
 
-#: The one name in this proposal that two things want. Written down with
-#: the decision, because the failure mode is silent: `import mojoboost.cv
-#: as m` binds the function, and `m.CVBooster` then raises AttributeError
-#: on a line that looks like a module import.
+#: The one name two things want. Written down with the decision, because
+#: the failure mode is silent: `import mojoboost.cv as m` binds the
+#: function, and `m.CVBooster` then raises AttributeError on a line that
+#: looks like a module import. The decision is applied, not pending.
 NAME_COLLISIONS = (
     {
         "attribute": "mojoboost.cv",
@@ -203,9 +352,29 @@ NAME_COLLISIONS = (
     },
 )
 
-#: Public-looking names in the two owned modules that are deliberately NOT
-#: proposed for the top level, so that "it is missing" is answerable.
+#: Public-looking names in the reachable submodules that are deliberately
+#: NOT at the top level, so that "it is missing" is answerable.
 NOT_EXPORTED = (
+    {
+        "name": "mojoboost.inspection.parse_model_string",
+        "why": (
+            "The compatibility parser behind the DELETION POINT banner in "
+            "inspection.py: it rebuilds the schema from the model text for "
+            "builds without the native dump, and goes away with that "
+            "banner. Exporting it would make a temporary thing look "
+            "permanent. The rest of inspection's __all__ is reachable as "
+            "mojoboost.inspection.<name>."
+        ),
+    },
+    {
+        "name": "mojoboost.device_selection.select_device",
+        "why": (
+            "And Workload, DeviceReport, native_contract, and the two "
+            "exception types. explain_device_choice is the question a user "
+            "asks; the rest is the vocabulary an estimator and a bug "
+            "report use, and it stays one import away."
+        ),
+    },
     {
         "name": "mojoboost.cv.FoldModel",
         "why": (

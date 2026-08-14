@@ -95,11 +95,14 @@ Several leaves in one launch
 wastes the device on the tail of a tree (see gpu_leaf_batching.mojo).
 `build_leaves` is the multi-leaf entry: it turns the caller's node ids into
 `LeafWorkItem`s off the device-resident row ranges `GpuActiveRows` already
-maintains, plans one packed launch with `gpu_leaf_batching.plan_batch`, and
-decodes each leaf's slot with the same fixed-point arithmetic
-`histogram_from_host` uses. No second row model and no second decoder: the
-ranges are the ones the partition kernel wrote, so a batched histogram covers
-exactly the rows the single-leaf build would have covered.
+maintains, plans one packed launch with `gpu_leaf_batching.plan_batch`,
+launches it through `enqueue_frontier_batch` (which checks every item's window
+against the tree's live active prefix), and decodes each leaf's slot with the
+same fixed-point arithmetic `histogram_from_host` uses. No second row model
+and no second decoder: the ranges are the ones the partition kernel wrote, so
+a batched histogram covers exactly the rows the single-leaf build would have
+covered. The slot stamp, the per-item scale table, and the multi-slot download
+all come from `gpu_leaf_batching` rather than being written again here.
 
 Batching is off unless it is asked for and the launch policy agrees, and
 both halves of that are existing code rather than a new switch.
@@ -137,6 +140,8 @@ from .gpu_leaf_batching import (
     GpuLeafBatcher,
     plan_batch,
     slots_for_budget,
+    subtraction_stamp,
+    uniform_scales,
 )
 from .gpu_objectives_native import (
     DEFAULT_MAX_NODES,
@@ -296,11 +301,16 @@ struct GpuHistogramBuilder(Movable):
     # matrix. `ROUTE_COPY_STAGED` today; carried so the upload site and a
     # trace name the same route.
     var bins_route: Int
-    # Monotonic; changes exactly when the scales or the active feature set
-    # do, which is what a histogram slot's stamp has to encode.
-    var batch_stamp: Int
-    # The `batch_stamp` the batcher's feature table was last staged at, or
-    # -1 when it has never been staged.
+    # The two counters `gpu_leaf_batching.subtraction_stamp` folds into a
+    # histogram slot's stamp: one bumped whenever the fixed-point scales are
+    # re-derived (once per round, and once per class in a multiclass round),
+    # one whenever the active feature set moves. Kept as counters rather than
+    # as a stamp so the encoding lives in one place, next to the subtraction
+    # that depends on it.
+    var round_epoch: Int
+    var feat_epoch: Int
+    # The stamp the batcher's feature table was last staged at, or -1 when it
+    # has never been staged.
     var batch_feat_stamp: Int
 
     def __init__(
@@ -424,11 +434,8 @@ struct GpuHistogramBuilder(Movable):
         self.g_scale = 1.0
         self.h_scale = 1.0
         self.has_gradients = False
-        # Bumped whenever the fixed-point scales or the active feature set
-        # change, which is exactly the pair `HistogramSlotPool` refuses to
-        # subtract across. Two slots carrying the same stamp were built under
-        # the same scales and the same features.
-        self.batch_stamp = 0
+        self.round_epoch = 0
+        self.feat_epoch = 0
         self.batch_feat_stamp = -1
         self.active = List[Int](capacity=data.n_features)
         for f in range(data.n_features):
@@ -524,7 +531,7 @@ struct GpuHistogramBuilder(Movable):
             return
 
         self.active = features.copy()
-        self.batch_stamp += 1
+        self.feat_epoch += 1
         # Fewer features in grid.x means fewer threadgroups, so the row
         # tiling is re-derived for the narrowed grid. The partial buffer is
         # never reallocated: its construction-time capacity is the cap.
@@ -559,7 +566,7 @@ struct GpuHistogramBuilder(Movable):
         var h_scale = _fixed_scale(hess)
         self.g_scale = Float64(g_scale)
         self.h_scale = Float64(h_scale)
-        self.batch_stamp += 1
+        self.round_epoch += 1
 
         # Any copy still reading the staging buffers has to finish before
         # they are overwritten.
@@ -624,7 +631,7 @@ struct GpuHistogramBuilder(Movable):
         self.g_scale = Float64(device_fixed_scale(sums.grad))
         self.h_scale = Float64(device_fixed_scale(sums.hess))
         self.has_gradients = True
-        self.batch_stamp += 1
+        self.round_epoch += 1
 
     def fill_softmax_gradients_device(
         mut self, mut state: GpuObjectiveState, k: Int
@@ -640,7 +647,7 @@ struct GpuHistogramBuilder(Movable):
         self.g_scale = Float64(device_fixed_scale(sums.grad))
         self.h_scale = Float64(device_fixed_scale(sums.hess))
         self.has_gradients = True
-        self.batch_stamp += 1
+        self.round_epoch += 1
 
     def update_raw_device(
         mut self,
@@ -874,15 +881,19 @@ struct GpuHistogramBuilder(Movable):
         self.batch_feat_stamp = -1
         return True
 
-    def _histogram_from_words(self, words: List[Int32]) raises -> Histogram:
+    def _histogram_from_words(
+        self, words: List[Int32], offset: Int = 0
+    ) raises -> Histogram:
         """One slot's fixed-point words as the Float64 `Histogram`.
 
         The same arithmetic and the same current scales as
         `histogram_from_host`, over a list instead of the pinned output
         buffer, so a batched leaf and a single-leaf one decode identically.
+        `offset` is where this slot starts in a multi-slot download, which
+        `download_slots` returns concatenated at `slot_cells()` apiece.
         """
         var hist_size = self.n_features * self.n_bins
-        if len(words) != 3 * hist_size:
+        if offset < 0 or len(words) < offset + 3 * hist_size:
             raise Error(
                 "a histogram slot must hold 3 * n_features * n_bins words"
             )
@@ -895,14 +906,17 @@ struct GpuHistogramBuilder(Movable):
         var hp = h.unsafe_ptr()
         var cp = c.unsafe_ptr()
         var src = words.unsafe_ptr()
+        var g0 = offset
+        var h0 = offset + hist_size
+        var c0 = offset + 2 * hist_size
         for i in range(hist_size):
-            gp.unsafe_store(i, Float64(src.unsafe_load(i)) * g_inv)
-            hp.unsafe_store(i, Float64(src.unsafe_load(hist_size + i)) * h_inv)
-            cp.unsafe_store(i, Int(src.unsafe_load(2 * hist_size + i)))
+            gp.unsafe_store(i, Float64(src.unsafe_load(g0 + i)) * g_inv)
+            hp.unsafe_store(i, Float64(src.unsafe_load(h0 + i)) * h_inv)
+            cp.unsafe_store(i, Int(src.unsafe_load(c0 + i)))
         return Histogram(g^, h^, c^, self.n_features, self.n_bins)
 
     def _build_leaves_batched(
-        mut self, nodes: List[Int], counts: List[Int]
+        mut self, nodes: List[Int]
     ) raises -> List[Histogram]:
         """Every node's histogram, several leaves per launch.
 
@@ -917,6 +931,9 @@ struct GpuHistogramBuilder(Movable):
             raise Error("call upload_gradients before build_leaves")
         var n = len(nodes)
         var out = List[Histogram](capacity=n)
+        # The stamp two histograms must share to be subtractable, in the one
+        # encoding `gpu_leaf_batching` defines for it.
+        var stamp = subtraction_stamp(self.round_epoch, self.feat_epoch)
         var g32 = Float32(self.g_scale)
         var h32 = Float32(self.h_scale)
         var chunk = self.batcher[0].max_items
@@ -929,9 +946,9 @@ struct GpuHistogramBuilder(Movable):
         # The active feature set reaches the batch through its own per-item
         # table, so it is staged when it (or the round's scales) last moved
         # rather than once per launch.
-        if self.batch_feat_stamp != self.batch_stamp:
+        if self.batch_feat_stamp != stamp:
             self.batcher[0].set_shared_features(self.active)
-            self.batch_feat_stamp = self.batch_stamp
+            self.batch_feat_stamp = stamp
 
         var taken = 0
         while taken < n:
@@ -939,11 +956,10 @@ struct GpuHistogramBuilder(Movable):
             if take > chunk:
                 take = chunk
             var items = List[LeafWorkItem](capacity=take)
-            var scales = List[Float32](capacity=2 * take)
             for j in range(take):
                 var node = nodes[taken + j]
                 var r = self.rows.range_of(node)
-                var slot = self.batcher[0].pool.acquire(node, self.batch_stamp)
+                var slot = self.batcher[0].pool.acquire(node, stamp)
                 if slot < 0:
                     raise Error(
                         "the batched histogram slot pool is full; raise"
@@ -953,35 +969,40 @@ struct GpuHistogramBuilder(Movable):
                 items.append(
                     LeafWorkItem(taken + j, node, r.begin, r.count(), slot, 0)
                 )
-                scales.append(g32)
-                scales.append(h32)
             var plan = plan_batch(
                 self.caps,
                 items,
-                scales,
+                uniform_scales(take, g32, h32),
                 len(self.active),
                 self.n_bins,
                 self.tiling.strategy,
                 self.part_capacity,
                 self.batcher[0].max_items,
             )
-            self.batcher[0].enqueue_batch(
+            # Against the permutation itself rather than a raw pointer: this
+            # entry checks every item's window against the tree's live active
+            # prefix before it launches, which is the difference between a
+            # batch that reads only its leaves' rows and one that silently
+            # accumulates over rows this tree does not grow on.
+            self.batcher[0].enqueue_frontier_batch(
                 plan,
                 self.bins_dev.unsafe_ptr(),
-                self.rows.rows_dev.unsafe_ptr(),
+                self.rows,
                 self.grad_dev.unsafe_ptr(),
                 self.hess_dev.unsafe_ptr(),
             )
+            # One mapping for the whole chunk, not one per leaf: a launch
+            # that is not paid per leaf would be given straight back by a
+            # synchronization that is.
+            var slots = List[Int](capacity=take)
             for j in range(take):
-                var slot = items[j].out_slot
-                out.append(
-                    self._histogram_from_words(
-                        self.batcher[0].download_slot(slot)
-                    )
-                )
-                self.batcher[0].pool.release(slot)
+                slots.append(items[j].out_slot)
+            var words = self.batcher[0].download_slots(slots)
+            var cells = self.batcher[0].slot_cells()
+            for j in range(take):
+                out.append(self._histogram_from_words(words, j * cells))
+                self.batcher[0].pool.release(slots[j])
             taken += take
-        _ = counts
         return out^
 
     def batches(mut self, counts: List[Int]) raises -> Bool:
@@ -1052,7 +1073,7 @@ struct GpuHistogramBuilder(Movable):
                     raise Error("build_leaves may not hold a node twice")
         var counts = self.leaf_rows(nodes)
         if self.batches(counts):
-            return self._build_leaves_batched(nodes, counts)
+            return self._build_leaves_batched(nodes)
 
         var out = List[Histogram](capacity=len(nodes))
         for i in range(len(nodes)):

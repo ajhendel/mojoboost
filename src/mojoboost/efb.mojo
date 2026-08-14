@@ -1378,6 +1378,39 @@ struct BundledMatrix(Copyable, Movable):
         )
 
 
+def columns_for_features(
+    plan: FeatureBundling, features: List[Int]
+) raises -> List[Int]:
+    """The ascending, duplicate-free bundle columns a set of original features
+    occupies, or every column when `features` is empty.
+
+    Feature subsampling picks original features; histograms are accumulated by
+    column. A column has to be accumulated when *any* of its members was
+    picked, so this is where the two meet. The extra members' statistics ride
+    along in that column and are never scanned, which is exactly what the
+    unbundling in `split.find_best_split` makes safe: a member's histogram is
+    recovered from the column whatever else shares it.
+
+    The empty list is the "every feature" convention the histogram builders
+    already use, and it maps to the "every column" convention unchanged.
+    """
+    var out = List[Int]()
+    if len(features) == 0:
+        return out^
+    var n = plan.n_bundles()
+    var seen = List[Bool](capacity=n)
+    seen.resize(n, False)
+    for i in range(len(features)):
+        var f = features[i]
+        if f < 0 or f >= plan.n_features:
+            raise Error("feature index out of range for this bundling plan")
+        seen[plan.bundle_of[f]] = True
+    for b in range(n):
+        if seen[b]:
+            out.append(b)
+    return out^
+
+
 def prepare_bundling(
     data: BinnedMatrix, settings: EfbSettings
 ) raises -> BundledMatrix:
@@ -1529,7 +1562,10 @@ def bundle_csc(
     )
 
 
-def unbundle_histogram(
+def unbundle_histogram_into(
+    mut out_grad: List[Float64],
+    mut out_hess: List[Float64],
+    mut out_count: List[Int],
     plan: FeatureBundling,
     bundle: Int,
     slot_rank: Int,
@@ -1537,20 +1573,15 @@ def unbundle_histogram(
     hess: List[Float64],
     count: List[Int],
     base: Int,
-) raises -> LocalHistogram:
-    """One member's local histogram, recovered from its bundle's.
+) raises:
+    """`unbundle_histogram` writing into buffers the caller owns.
 
-    `grad`, `hess`, and `count` are a histogram whose bundle-`bundle` block
-    starts at index `base` and runs for `plan.bundle_bins[bundle]` bins;
-    `slot_rank` selects the member within the bundle, 0-based in member
-    order.
-
-    The member's own range copies straight back. Its default bin is recovered
-    by subtracting that range from the block total, because a row where this
-    member is at its default sits either in the shared bin or inside another
-    member's range. That subtraction is exact when the bundle is lossless; a
-    collision the member lost is folded into its default bin, which is the
-    approximation `max_conflict_rate` buys.
+    The split search calls this once per feature per node, so the three
+    output lists are reused across features and across nodes instead of being
+    allocated per call; they are resized to the member's local bin count and
+    fully written, so their previous contents never leak. This is the same
+    `_into` split the histogram builders and the row partitioner already make,
+    and for the same reason.
     """
     if bundle < 0 or bundle >= plan.n_bundles():
         raise Error("bundle index out of range")
@@ -1566,11 +1597,8 @@ def unbundle_histogram(
 
     var k = lo + slot_rank
     var n_local = plan.slot_bins[k]
-    var out_grad = List[Float64](capacity=n_local)
     out_grad.resize(n_local, 0.0)
-    var out_hess = List[Float64](capacity=n_local)
     out_hess.resize(n_local, 0.0)
-    var out_count = List[Int](capacity=n_local)
     out_count.resize(n_local, 0)
 
     if hi - lo == 1:
@@ -1579,7 +1607,7 @@ def unbundle_histogram(
             out_grad[b] = grad[base + b]
             out_hess[b] = hess[base + b]
             out_count[b] = count[base + b]
-        return LocalHistogram(out_grad^, out_hess^, out_count^)
+        return
 
     var total_grad = 0.0
     var total_hess = 0.0
@@ -1602,4 +1630,49 @@ def unbundle_histogram(
     out_grad[d] = total_grad
     out_hess[d] = total_hess
     out_count[d] = total_count
+
+
+def unbundle_histogram(
+    plan: FeatureBundling,
+    bundle: Int,
+    slot_rank: Int,
+    grad: List[Float64],
+    hess: List[Float64],
+    count: List[Int],
+    base: Int,
+) raises -> LocalHistogram:
+    """One member's local histogram, recovered from its bundle's.
+
+    `grad`, `hess`, and `count` are a histogram whose bundle-`bundle` block
+    starts at index `base` and runs for `plan.bundle_bins[bundle]` bins;
+    `slot_rank` selects the member within the bundle, 0-based in member
+    order.
+
+    The member's own range copies straight back. Its default bin is recovered
+    by subtracting that range from the block total, because a row where this
+    member is at its default sits either in the shared bin or inside another
+    member's range. That subtraction is exact when the bundle is lossless; a
+    collision the member lost is folded into its default bin, which is the
+    approximation `max_conflict_rate` buys.
+
+    The allocating form, kept because it is the one a caller reading a single
+    member wants. The split search uses `unbundle_histogram_into`, which is
+    the same arithmetic in the same order writing into reused buffers; the two
+    cannot drift because this one is that one.
+    """
+    var out_grad = List[Float64]()
+    var out_hess = List[Float64]()
+    var out_count = List[Int]()
+    unbundle_histogram_into(
+        out_grad,
+        out_hess,
+        out_count,
+        plan,
+        bundle,
+        slot_rank,
+        grad,
+        hess,
+        count,
+        base,
+    )
     return LocalHistogram(out_grad^, out_hess^, out_count^)

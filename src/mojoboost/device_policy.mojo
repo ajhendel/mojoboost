@@ -139,21 +139,28 @@ from .apple_gpu_policy import (
     parse_api,
     partial_budget_bytes,
 )
-from .boosting import (
-    BINARY_LOGISTIC,
-    CROSS_ENTROPY,
-    CUSTOM,
-    FAIR,
-    GAMMA,
-    HUBER,
-    L1,
-    MAPE,
-    POISSON,
-    QUANTILE,
-    SQUARED_ERROR,
-    TWEEDIE,
-)
+# `CUSTOM` only. The other objective codes were imported to spell out the
+# built-in list here, and that list now comes from objective_registry.mojo,
+# so naming them again would be re-establishing the duplicate by hand.
+# `CUSTOM` stays because `_collect_blocks` refuses it by name and gives a
+# reason specific to it.
+from .boosting import CUSTOM
 from .initialization import SessionState, warmup_level_name
+
+# The one table of objective facts. Imported rather than restated: this
+# module used to carry its own copy of the built-in objective list, its own
+# copy of which objectives have a device-side derivative kernel, and its own
+# `LAMBDARANK = 7`, which made three lists that had to be edited together and
+# nothing that would notice if they were not.
+#
+# Safe to import: objective_registry.mojo imports only `boosting` (which this
+# module already imports) and `metrics` (which imports nothing local), so it
+# reaches neither `model.mojo` nor the GPU kernel stack and closes no cycle.
+from .objective_registry import (
+    LAMBDARANK,
+    objective_gradients_on_device,
+    objective_is_builtin,
+)
 
 # Aliased on the way in. unified_memory_policy.mojo has its own
 # `block_reason_name` and its own `EVIDENCE_NONE`, and both mean something
@@ -174,22 +181,23 @@ from .unified_memory_policy import (
 
 # --- Mirrors. NOT pinned by any test in this repository. ---
 #
-# Copied rather than imported because importing their home modules would
-# close an import cycle through this one: `ranking.mojo` imports
-# `model.mojo`, which imports `device.mojo`, which imports this module, and
-# `histogram_gpu.mojo` pulls the whole GPU kernel stack into a layer that
-# has to stay compilable and testable on a machine with no accelerator.
+# Three constants, all from histogram_gpu.mojo, copied rather than imported
+# because importing that module pulls the whole `max.gpu.*` kernel stack into
+# a layer that has to stay compilable and testable on a machine with no
+# accelerator. Same reason objective_registry.mojo does not import
+# gpu_objectives_native.mojo.
+#
+# The objective mirrors that used to sit here are gone: `LAMBDARANK` and the
+# built-in objective list now come from objective_registry.mojo, which is the
+# one table of objective facts and which this module can import without
+# closing a cycle.
 #
 # There is no `tests/parallel/test_device_policy.mojo`. Nothing asserts that
-# any mirror below still equals its source, so each one is a copy that can
-# drift silently, and a drifted `MAX_GPU_ROWS` or `MAX_GPU_BINS` admits a
-# workload the kernels cannot index. handoffs/connect_05_device_policy.md
-# specifies that test; it is unwritten and unrun, and this comment says so
-# rather than claiming a guarantee that does not exist.
-
-# `LAMBDARANK` in ranking.mojo: objective code 7, which continues the
-# registry in boosting.mojo but whose gradients come from query groups.
-comptime LAMBDARANK = 7
+# the three below still equal their source, so each is a copy that can drift
+# silently, and a drifted `MAX_GPU_ROWS` or `MAX_GPU_BINS` admits a workload
+# the kernels cannot index. handoffs/connect_05_device_policy.md specifies
+# that test; it is unwritten and unrun, and this comment says so rather than
+# claiming a guarantee that does not exist.
 
 # `MAX_ROWS` in histogram_gpu.mojo: the histogram and partition kernels
 # index rows as Int32, which is also where the fixed-point accumulator
@@ -451,20 +459,15 @@ def is_builtin_objective(objective: Int) -> Bool:
     raises "unknown objective", expressed as a predicate so the device
     policy can answer without raising. `CUSTOM` is excluded (its gradients
     come from a caller-supplied callable) and so is `LAMBDARANK` (its
-    gradients come from query groups)."""
-    return (
-        objective == SQUARED_ERROR
-        or objective == BINARY_LOGISTIC
-        or objective == POISSON
-        or objective == HUBER
-        or objective == QUANTILE
-        or objective == L1
-        or objective == GAMMA
-        or objective == TWEEDIE
-        or objective == MAPE
-        or objective == FAIR
-        or objective == CROSS_ENTROPY
-    )
+    gradients come from query groups) and `MULTICLASS` (one tree per class
+    per round, through its own trainer).
+
+    Delegates to `objective_is_builtin` in objective_registry.mojo, which is
+    the one table of objective facts. Kept as a name here because it is the
+    spelling the gates below read and because a device question should not
+    have to know which module the answer lives in; it holds no list of its
+    own."""
+    return objective_is_builtin(objective)
 
 
 def gpu_trains_objective(objective: Int) -> Bool:
@@ -501,13 +504,19 @@ def gpu_objective_is_device_resident(objective: Int) -> Bool:
     slower and worth reporting; that report is `WARN_HOST_GRADIENT_PATH`,
     never a block.
 
-    This predicate is the authoritative one.
-    `gpu_objectives_native.supports_device_objective` still carries its own
-    copy of the list; the handoff specifies the one-line edit that makes it
-    delegate here, which is what collapses the duplicate."""
+    Delegates to `objective_gradients_on_device` in objective_registry.mojo,
+    which is the one table of objective facts and which
+    `gpu_objectives_native.supports_device_objective` already defers to. The
+    three predicates therefore now agree by construction rather than by
+    three lists being edited together.
+
+    `OBJECTIVE_UNSPECIFIED` answers True for the same reason
+    `gpu_trains_objective` does: a caller that did not name an objective is
+    not asserting one without a kernel, and the gap is reported through
+    `WARN_INCOMPLETE_REQUEST` rather than resolved silently either way."""
     if objective == OBJECTIVE_UNSPECIFIED:
         return True
-    return is_builtin_objective(objective)
+    return objective_gradients_on_device(objective)
 
 
 def gpu_supports_outputs(n_outputs: Int) -> Bool:

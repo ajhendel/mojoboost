@@ -1,38 +1,52 @@
-"""`Dataset` metadata and prepared-data reads.
+"""`Dataset` construction beyond the dense case, and its prepared data.
 
 A `Dataset` handle (see `src/mojoboost/trainset.mojo`) owns a binned
-feature matrix, the fitted `BinMapper` that produced it, and the columns
-that describe its rows. `bindings/_mojoboost.mojo` already exposes its
-shape (`dataset_num_data`, `dataset_num_feature`, `dataset_num_bin`); this
-module exposes the rest, so the Python `Dataset` can answer from the
-native object it constructed rather than only from what the caller handed
-it.
+feature matrix, dense or sparse, the fitted `BinMapper` that produced it,
+and the columns that describe its rows. `bindings/_mojoboost.mojo` builds
+the dense case (`dataset_create`) and exposes its shape
+(`dataset_num_data`, `dataset_num_feature`, `dataset_num_bin`); this
+module carries the three constructors that shape has no room for and the
+reads that answer from the constructed object.
 
-Why that matters: `python/mojoboost/basic.py` keeps its own copy of the
-label, the weights, the groups, the init scores, the names, and the
+Why the reads matter: `python/mojoboost/basic.py` keeps its own copy of
+the label, the weights, the groups, the init scores, the names, and the
 categorical declaration, and answers `get_field` from those. That is
 correct for a dataset built in this process and cannot be right for one
 that was not, and it says nothing about what the *binning* did with them.
-The reads here come off the constructed dataset.
 
-Nothing here bins, trains, or transforms. Every function reads state the
-`Dataset` already holds, and every buffer address travels inward: a
-column leaves as a Python list, or is written into a buffer the caller
-preallocated and sized.
+Why the constructors matter: three real capabilities land in
+`trainset.mojo` and are unreachable from Python without them. A sparse
+dataset that stays sparse; `reference=`, whose absence today means a
+validation set is silently binned over its own rows and then scored as if
+it were not; and `subset`, which is what would let cross-validation build
+folds natively. `handoffs/connect_12_dataset_cv.md` section 6.2 asked for
+exactly these, and section 6.3 has the Python half.
+
+No binning rule, no validation rule, and no fold policy is written here.
+Every constructor forwards to the `Dataset` static of the same name, and
+every buffer address travels inward: a column leaves as a Python list, or
+is written into a buffer the caller preallocated and sized.
 """
 
-from std.python import Python, PythonObject
+from std.python import PythonObject
 
 from binding_support import (
+    csc_from_params,
+    f64_buffer,
+    flag,
     index_within,
+    int_buffer,
+    int_buffer_from_f64,
     py_dict,
     py_f64_list,
     py_int_list,
     py_str_list,
+    str_sequence,
     write_f64_buffer,
 )
 
 from mojoboost.efb import feature_bin_count
+from mojoboost.raw_data import RawData
 from mojoboost.trainset import Dataset
 
 
@@ -67,24 +81,172 @@ def _field_values(d: Dataset, field: String) raises -> List[Float64]:
     )
 
 
+def _optional_column(
+    params: PythonObject, key: String, n_rows: Int
+) raises -> List[Float64]:
+    """One optional per-row column from the params mapping, empty when its
+    address is 0. The same convention `dataset_create` reads."""
+    var addr = Int(py=params[key])
+    if addr == 0:
+        return List[Float64]()
+    return f64_buffer(addr, n_rows)
+
+
+def _group_counts(params: PythonObject) raises -> List[Int]:
+    """Per-query row counts (LightGBM's `group`), empty when absent. They
+    travel as float64 like every other column at this boundary."""
+    if Int(py=params["group_addr"]) == 0:
+        return List[Int]()
+    return int_buffer_from_f64(
+        Int(py=params["group_addr"]), Int(py=params["n_groups"])
+    )
+
+
+def _categorical(params: PythonObject) raises -> List[Int]:
+    """Declared categorical feature indices, empty when absent. The binner
+    validates them again, so the rules in categorical.mojo stay the only
+    ones."""
+    var addr = Int(py=params["categorical_addr"])
+    if addr == 0:
+        return List[Int]()
+    return int_buffer_from_f64(addr, Int(py=params["categorical_len"]))
+
+
+def _feature_names(params: PythonObject) raises -> List[String]:
+    var n_names = Int(py=params["n_names"])
+    if n_names == 0:
+        return List[String]()
+    return str_sequence(params["feature_names"], n_names)
+
+
+def dataset_create_csc(params: PythonObject) raises -> PythonObject:
+    """Bin a sparse CSC matrix into a `Dataset` that stays sparse.
+
+    Reads the six sparse keys `_arrays.SparseBuffers.params()` emits, plus
+    the same optional columns and binning configuration `dataset_create`
+    reads: `label_addr`, `weight_addr`, `init_score_addr`, `group_addr`
+    with `n_groups`, `feature_names` with `n_names`, `categorical_addr`
+    with `categorical_len`, `max_bin`, `use_missing`, and `keep_raw`.
+
+    The binned matrix is a `SparseBinnedMatrix`, so training never
+    allocates `n_rows * n_features` of anything: that is the whole reason
+    a sparse dataset exists, and it is why this is a separate constructor
+    rather than a densifying branch of the dense one.
+    """
+    var n_rows = Int(py=params["n_rows"])
+    var dataset = Dataset.from_csc(
+        csc_from_params(params),
+        _optional_column(params, "label_addr", n_rows),
+        _optional_column(params, "weight_addr", n_rows),
+        _group_counts(params),
+        _optional_column(params, "init_score_addr", n_rows),
+        _feature_names(params),
+        _categorical(params),
+        Int(py=params["max_bin"]),
+        flag(params["use_missing"], "use_missing"),
+        flag(params["keep_raw"], "keep_raw"),
+    )
+    return PythonObject(alloc=dataset^)
+
+
+def dataset_create_reference(
+    reference: PythonObject,
+    x_addr: PythonObject,
+    n_rows: PythonObject,
+    params: PythonObject,
+) raises -> PythonObject:
+    """Bin a dense matrix by another dataset's mapper: LightGBM's
+    `reference=`.
+
+    The bin indices in the result mean what they mean in the reference,
+    which is what a validation set needs and what continued training
+    requires. The feature count, the binning parameters, the feature
+    names, and the categorical declaration are the reference's, because
+    they describe the columns rather than the rows, and are deliberately
+    not read from `params`; only `label_addr`, `weight_addr`,
+    `init_score_addr`, `group_addr`/`n_groups`, and `keep_raw` are.
+
+    This is the wrong constructor for a cross-validation fold, whose
+    held-out rows must not have shaped the binning. `dataset_subset` with
+    `shared_binning=0` is that one.
+    """
+    var ref_dataset = reference.downcast_value_ptr[Dataset]()
+    var nr = Int(py=n_rows)
+    var nf = ref_dataset[].num_feature()
+    var dataset = Dataset.from_reference(
+        ref_dataset[],
+        RawData.dense(f64_buffer(Int(py=x_addr), nr * nf), nr, nf),
+        _optional_column(params, "label_addr", nr),
+        _optional_column(params, "weight_addr", nr),
+        _group_counts(params),
+        _optional_column(params, "init_score_addr", nr),
+        flag(params["keep_raw"], "keep_raw"),
+    )
+    return PythonObject(alloc=dataset^)
+
+
+def dataset_subset(
+    dataset: PythonObject,
+    rows_addr: PythonObject,
+    n_rows: PythonObject,
+    shared_binning: PythonObject,
+) raises -> PythonObject:
+    """The named rows as their own dataset.
+
+    `rows_addr` is an int64 buffer of `n_rows` strictly ascending row
+    indices. `shared_binning` picks between the two constructors, and the
+    difference is not a detail:
+
+    - 0: the subset is **binned over its own rows**, so the rows left out
+      had no say in the edges. This is what a cross-validation fold or a
+      held-out split needs.
+    - 1: the subset is binned by this dataset's mapper, LightGBM's
+      `Dataset.subset`, so its bin indices mean what the whole's mean and
+      a model trained on the whole can score it.
+
+    Both need the source to have been built with `keep_raw=1`: bins cannot
+    be refitted from bins, and a dataset that dropped its raw matrix says
+    so rather than returning an empty one. The subset keeps its own raw
+    matrix when it is binned over its own rows, so a fold can be subset
+    again.
+    """
+    var d = dataset.downcast_value_ptr[Dataset]()
+    var rows = int_buffer(Int(py=rows_addr), Int(py=n_rows))
+    if flag(shared_binning, "shared_binning"):
+        var shared = d[].subset_shared_binning(rows)
+        return PythonObject(alloc=shared^)
+    var own = d[].subset(rows)
+    return PythonObject(alloc=own^)
+
+
 def dataset_metadata(dataset: PythonObject) raises -> PythonObject:
     """Everything about the constructed dataset that is a scalar, in one
     call.
 
     Keys: `num_data`, `num_feature`, `num_bin` (the effective `max_bin`
     the binning reserved), `max_bin` (the one that was requested),
-    `use_missing`, `n_groups`, `n_categorical`, `has_names`, and the
-    lengths of the four optional columns (`n_label`, `n_weight`,
-    `n_init_score`).
+    `use_missing`, `n_groups`, `n_categorical`, `has_names`, the lengths
+    of the optional columns (`n_label`, `n_weight`, `n_init_score`), and
+    the three facts about how the dataset is stored: `is_sparse`, `nnz`
+    (stored entries in the binned matrix: every cell when dense), and
+    `has_raw` (whether the raw input was retained, which is what
+    `dataset_subset` needs).
 
-    One call rather than nine, because the Python `Dataset` builds its
-    repr and its `get_field` answers from all of them at once.
+    One call rather than fourteen, because the Python `Dataset` builds its
+    repr and its `get_field` answers from all of them at once. This is
+    also the answer to §6.2(e) of `handoffs/connect_12_dataset_cv.md`,
+    which asked for `dataset_is_sparse`, `dataset_nnz`, and
+    `dataset_has_raw` as three entry points: they are three keys here
+    instead, so there is one way to ask rather than two.
     """
     var d = dataset.downcast_value_ptr[Dataset]()
     var out = py_dict()
     out["num_data"] = PythonObject(d[].num_data())
     out["num_feature"] = PythonObject(d[].num_feature())
     out["num_bin"] = PythonObject(d[].num_bin())
+    out["is_sparse"] = PythonObject(d[].is_sparse)
+    out["nnz"] = PythonObject(d[].nnz())
+    out["has_raw"] = PythonObject(d[].has_raw())
     out["max_bin"] = PythonObject(d[].max_bin)
     out["use_missing"] = PythonObject(d[].use_missing)
     out["n_groups"] = PythonObject(len(d[].group))

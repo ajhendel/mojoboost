@@ -191,6 +191,7 @@ from .categorical import (
     CAT_MAX_BINS,
     UNKNOWN_BIN,
     CategoricalSpec,
+    cat_pool_contains,
 )
 from .model import Model, MulticlassModel
 from .objective_registry import (
@@ -200,6 +201,7 @@ from .objective_registry import (
 )
 from .params import MULTICLASS
 from .serialize import (
+    load_feature_names,
     load_model,
     load_multiclass_model,
     model_file_kind,
@@ -701,9 +703,9 @@ def _finish_tree(block: _KeyVals, index: Int) raises -> _LgbmTree:
         var missing = (
             decision_type[j] >> _MISSING_TYPE_SHIFT
         ) & _MISSING_TYPE_MASK
-        if missing != _MISSING_NONE and missing != _MISSING_NAN and (
-            missing != _MISSING_ZERO
-        ):
+        # The field is two bits and LightGBM defines three values, so the
+        # fourth is a file this reader does not understand.
+        if missing > _MISSING_NAN:
             raise Error(
                 "LightGBM ", where, " node ", j, " has an unknown missing_type"
             )
@@ -1172,7 +1174,7 @@ def _feature_info_codes(token: String) -> List[Int]:
     var out = List[Int]()
     if token == "none" or token.byte_length() == 0:
         return out^
-    if token[byte=0:1] == "[":
+    if String(token[byte=0:1]) == "[":
         return out^
     for part in token.split(":"):
         var text = String(part)
@@ -1472,7 +1474,7 @@ struct _NodeArrays(Copyable, Movable):
         self.missing_bin[node] = -1
         self.cat_offset[node] = len(self.cat_bitset)
         for _ in range(CAT_BITSET_WORDS):
-            self.cat_bitset.append(0)
+            self.cat_bitset.append(UInt64(0))
         for i in range(len(bins)):
             var bin = bins[i]
             var word = self.cat_offset[node] + (bin >> 6)
@@ -1742,6 +1744,7 @@ struct LgbmImportReport(Copyable, Movable, Writable):
     var n_widened_tables: Int
     var n_edges: Int
     var n_missing_reservations: Int
+    var has_node_counts: Bool
 
     def __init__(
         out self,
@@ -1755,6 +1758,7 @@ struct LgbmImportReport(Copyable, Movable, Writable):
         n_widened_tables: Int,
         n_edges: Int,
         n_missing_reservations: Int,
+        has_node_counts: Bool,
     ):
         self.n_features = n_features
         self.n_trees = n_trees
@@ -1766,6 +1770,7 @@ struct LgbmImportReport(Copyable, Movable, Writable):
         self.n_widened_tables = n_widened_tables
         self.n_edges = n_edges
         self.n_missing_reservations = n_missing_reservations
+        self.has_node_counts = has_node_counts
 
     def mapper_is_training_binning(self) -> Bool:
         """Always False, and a method rather than a comment so a caller can
@@ -1801,6 +1806,8 @@ struct LgbmImportReport(Copyable, Movable, Writable):
             self.n_edges,
             ", missing_reservations=",
             self.n_missing_reservations,
+            ", node_counts=",
+            self.has_node_counts,
             ", training_binning=False)",
         )
 
@@ -1832,12 +1839,29 @@ struct LgbmMulticlassImport(Copyable, Movable):
         self.report = report^
 
 
+def _all_have_node_counts(trees: List[Tree]) -> Bool:
+    """Whether every converted tree carries covers.
+
+    LightGBM's `leaf_count` and `internal_count` are optional in its format,
+    and `_finish_tree` substitutes zeros for an omitted one. A model whose
+    counts are zeros predicts identically and cannot answer for feature
+    contributions (`Tree.check_node_counts` says so), which is a difference
+    worth reporting at conversion time rather than at the first
+    `predict_contrib`.
+    """
+    for t in range(len(trees)):
+        if not trees[t].has_node_counts():
+            return False
+    return True
+
+
 def _import_report(
     mapping: _Mapping,
     header: _KeyVals,
     n_trees: Int,
     n_classes: Int,
     objective: Int,
+    has_node_counts: Bool,
 ) raises -> LgbmImportReport:
     var widened = 0
     for f in range(len(mapping.cats.widened)):
@@ -1858,6 +1882,7 @@ def _import_report(
         widened,
         len(mapping.mapper.edges),
         reservations,
+        has_node_counts,
     )
 
 
@@ -1872,7 +1897,8 @@ def parse_lgbm_model(text: String) raises -> Model:
     EXPERIMENTAL; `import_lgbm_model` returns the same model together with
     the report of what the conversion had to synthesize.
     """
-    return import_lgbm_model(text).model^
+    var imported = import_lgbm_model(text)
+    return imported.model^
 
 
 def import_lgbm_model(text: String) raises -> LgbmImport:
@@ -1907,7 +1933,12 @@ def import_lgbm_model(text: String) raises -> LgbmImport:
     var trees = _convert_trees(parsed.trees, mapping.mapper)
     var n_trees = len(trees)
     var report = _import_report(
-        mapping, parsed.header, n_trees, 1, objective
+        mapping,
+        parsed.header,
+        n_trees,
+        1,
+        objective,
+        _all_have_node_counts(trees),
     )
     var booster = Booster(trees^, 0.0, 1.0, objective)
     var mapper = mapping.mapper.copy()
@@ -1925,7 +1956,8 @@ def parse_lgbm_multiclass_model(text: String) raises -> MulticlassModel:
     EXPERIMENTAL; `import_lgbm_multiclass_model` returns the same model
     together with the report of what the conversion had to synthesize.
     """
-    return import_lgbm_multiclass_model(text).model^
+    var imported = import_lgbm_multiclass_model(text)
+    return imported.model^
 
 
 def import_lgbm_multiclass_model(
@@ -1976,7 +2008,12 @@ def import_lgbm_multiclass_model(
     var trees = _convert_trees(parsed.trees, mapping.mapper)
     var n_trees = len(trees)
     var report = _import_report(
-        mapping, parsed.header, n_trees, n_classes, objective
+        mapping,
+        parsed.header,
+        n_trees,
+        n_classes,
+        objective,
+        _all_have_node_counts(trees),
     )
     var base_scores = List[Float64](capacity=n_classes)
     base_scores.resize(n_classes, 0.0)
@@ -2034,6 +2071,8 @@ struct _LgbmOut(Copyable, Movable):
     var internal_count: List[Int]
     var leaf_value: List[Float64]
     var leaf_count: List[Int]
+    var cat_boundaries: List[Int]
+    var cat_threshold: List[Int]
 
     def __init__(out self):
         self.split_feature = List[Int]()
@@ -2046,21 +2085,116 @@ struct _LgbmOut(Copyable, Movable):
         self.internal_count = List[Int]()
         self.leaf_value = List[Float64]()
         self.leaf_count = List[Int]()
+        # LightGBM's `cat_boundaries` always opens at 0 and gains one entry
+        # per category set, so `num_cat` is its length minus one.
+        self.cat_boundaries = List[Int]()
+        self.cat_boundaries.append(0)
+        self.cat_threshold = List[Int]()
+
+    def num_cat(self) -> Int:
+        return len(self.cat_boundaries) - 1
+
+    def add_category_set(mut self, codes: List[Int]) raises -> Int:
+        """Append one split's raw-code bitset and return its `cat_boundaries`
+        index, which is what LightGBM stores in that node's `threshold`.
+
+        `codes` must be ascending. The bitset runs from code 0 to the largest
+        code, because that is the width LightGBM's `FindInBitset` reads.
+        """
+        var largest = codes[len(codes) - 1]
+        var n_words = largest // _CAT_WORD_BITS + 1
+        if n_words > _MAX_CAT_WORDS:
+            raise Error(
+                "cannot write a category set containing code ",
+                largest,
+                ": LightGBM's format stores it as a bitset that wide, and"
+                " this converter stops at ",
+                _MAX_CAT_WORDS * _CAT_WORD_BITS,
+                " codes",
+            )
+        var index = self.num_cat()
+        var base = len(self.cat_threshold)
+        for _ in range(n_words):
+            self.cat_threshold.append(0)
+        for i in range(len(codes)):
+            var code = codes[i]
+            var word = base + code // _CAT_WORD_BITS
+            self.cat_threshold[word] |= 1 << (code % _CAT_WORD_BITS)
+        self.cat_boundaries.append(len(self.cat_threshold))
+        return index
 
 
-def _check_writable_tree(tree: Tree, tree_index: Int) raises:
+def _check_writable_tree(
+    tree: Tree, mapper: BinMapper, tree_index: Int
+) raises:
+    """Refuse a tree LightGBM's format cannot hold before any of it is
+    rendered, so a partial file is never written."""
     for i in range(len(tree.feature)):
-        if tree.cat_offset[i] >= 0:
+        if tree.cat_offset[i] < 0:
+            continue
+        var feature = tree.feature[i]
+        if not mapper.cats.is_cat(feature):
             raise Error(
                 "tree ",
                 tree_index,
                 " node ",
                 i,
-                " splits a categorical feature by bin set; LightGBM's format"
-                " stores category sets over raw codes, which mojoboost's"
-                " fitted table would have to be inverted to produce, so"
-                " categorical models cannot be written yet",
+                " routes feature ",
+                feature,
+                " by category set, but the model's bin mapper has no"
+                " category table for it, so its bins cannot be turned back"
+                " into the raw codes LightGBM's format stores",
             )
+
+
+def _node_category_codes(
+    tree: Tree, mapper: BinMapper, node: Int, tree_index: Int
+) raises -> List[Int]:
+    """The raw category codes a mojoboost categorical node sends left.
+
+    The inverse of the read direction: a set member is a bin, and bin `b` of
+    feature `f` is the code `cats.codes[cats.offsets[f] + b - 1]` (bin 0 is
+    the reserved unknown bin, never a member). Membership is tested with
+    `cat_pool_contains`, the same function `Tree.goes_left` routes with, so
+    what is written is what the model does rather than a second reading of
+    the bitset layout.
+    """
+    var feature = tree.feature[node]
+    var offset = tree.cat_offset[node]
+    var begin = mapper.cats.offsets[feature]
+    var n_categories = mapper.cats.n_categories(feature)
+    var codes = List[Int]()
+    for bin in range(1, CAT_MAX_BINS):
+        if not cat_pool_contains(tree.cat_bitset, offset, bin):
+            continue
+        if bin > n_categories:
+            raise Error(
+                "tree ",
+                tree_index,
+                " node ",
+                node,
+                " sends bin ",
+                bin,
+                " of feature ",
+                feature,
+                " left, but the model's category table for that feature holds"
+                " only ",
+                n_categories,
+                " categories",
+            )
+        codes.append(mapper.cats.codes[begin + bin - 1])
+    if len(codes) == 0:
+        raise Error(
+            "tree ",
+            tree_index,
+            " node ",
+            node,
+            " routes feature ",
+            tree.feature[node],
+            " by an empty category set, which sends every row right; LightGBM"
+            " has no such split",
+        )
+    return codes^
 
 
 def _emit_lgbm_node(
@@ -2086,32 +2220,42 @@ def _emit_lgbm_node(
         return -leaf - 1
 
     var feature = tree.feature[node]
-    var bin = tree.threshold_bin[node]
-    var lo = mapper.edge_offsets[feature]
-    var hi = mapper.edge_offsets[feature + 1]
-    if bin < 0 or lo + bin >= hi:
-        raise Error(
-            "tree ",
-            tree_index,
-            " node ",
-            node,
-            " splits feature ",
-            feature,
-            " at bin ",
-            bin,
-            ", which has no upper edge in the model's bin mapper, so it has"
-            " no real-valued LightGBM threshold",
-        )
-
     var decision = 0
-    if tree.default_left[node]:
-        decision |= _DEFAULT_LEFT_MASK
-    if tree.missing_bin[node] >= 0:
-        decision |= _MISSING_NAN << _MISSING_TYPE_SHIFT
+    var threshold: Float64
+
+    if tree.cat_offset[node] >= 0:
+        # A category set, written over raw codes. `default_left` and
+        # `missing_type` are left clear: LightGBM's `CategoricalDecision`
+        # reads neither, and mojoboost's categorical nodes carry neither.
+        var codes = _node_category_codes(tree, mapper, node, tree_index)
+        decision |= _CATEGORICAL_MASK
+        threshold = Float64(dst.add_category_set(codes))
+    else:
+        var bin = tree.threshold_bin[node]
+        var lo = mapper.edge_offsets[feature]
+        var hi = mapper.edge_offsets[feature + 1]
+        if bin < 0 or lo + bin >= hi:
+            raise Error(
+                "tree ",
+                tree_index,
+                " node ",
+                node,
+                " splits feature ",
+                feature,
+                " at bin ",
+                bin,
+                ", which has no upper edge in the model's bin mapper, so it"
+                " has no real-valued LightGBM threshold",
+            )
+        threshold = mapper.edges[lo + bin]
+        if tree.default_left[node]:
+            decision |= _DEFAULT_LEFT_MASK
+        if tree.missing_bin[node] >= 0:
+            decision |= _MISSING_NAN << _MISSING_TYPE_SHIFT
 
     var index = len(dst.split_feature)
     dst.split_feature.append(feature)
-    dst.threshold.append(mapper.edges[lo + bin])
+    dst.threshold.append(threshold)
     dst.decision_type.append(decision)
     dst.split_gain.append(tree.split_gain[node])
     dst.internal_value.append(scale * tree.value[node] + bias)
@@ -2144,7 +2288,7 @@ def _tree_body(
     written as zeros: mojoboost keeps node covers, not hessian sums, and
     LightGBM treats both fields as optional.
     """
-    _check_writable_tree(tree, tree_index)
+    _check_writable_tree(tree, mapper, tree_index)
     var built = _LgbmOut()
     _ = _emit_lgbm_node(built, tree, mapper, 0, scale, bias, tree_index)
 
@@ -2157,7 +2301,7 @@ def _tree_body(
     var what = String("tree ") + String(tree_index)
     var body = String("")
     body += "num_leaves=" + String(n_leaves) + "\n"
-    body += "num_cat=0\n"
+    body += "num_cat=" + String(built.num_cat()) + "\n"
     body += "split_feature=" + _join_ints(built.split_feature) + "\n"
     body += (
         "split_gain=" + _join_floats(built.split_gain, what + " split gain")
@@ -2188,6 +2332,13 @@ def _tree_body(
         + "\n"
     )
     body += "internal_count=" + _join_ints(built.internal_count) + "\n"
+    # LightGBM writes the two category arrays only for a tree that has any,
+    # and writes them here, between `internal_count` and `is_linear`.
+    if built.num_cat() > 0:
+        body += (
+            "cat_boundaries=" + _join_ints(built.cat_boundaries) + "\n"
+        )
+        body += "cat_threshold=" + _join_ints(built.cat_threshold) + "\n"
     body += "is_linear=0\n"
     # The leaf values above already carry the shrinkage, exactly as LightGBM's
     # own do; this field only records what was applied, and an
@@ -2202,12 +2353,29 @@ def _tree_body(
 
 
 def _feature_infos(mapper: BinMapper) raises -> String:
-    """LightGBM's `feature_infos`: each feature's `[min:max]`, or `none` for
-    one with no edges (never split, so never binned into the file)."""
+    """LightGBM's `feature_infos`, in LightGBM's two spellings.
+
+    A categorical feature's entry is its category codes joined by `:`, which
+    is what `BinMapper::bin_info_string` writes for a categorical bin mapper
+    and what `_feature_info_codes` reads back. A numerical feature's is
+    `[min:max]`, and one with no edges (never split, so never binned into the
+    file) is `none`.
+    """
     var out = String("")
     for f in range(mapper.n_features):
         if f > 0:
             out += " "
+        if mapper.cats.is_cat(f):
+            var begin = mapper.cats.offsets[f]
+            var end = mapper.cats.offsets[f + 1]
+            if end <= begin:
+                out += "none"
+                continue
+            for i in range(begin, end):
+                if i > begin:
+                    out += ":"
+                out += String(mapper.cats.codes[i])
+            continue
         var lo = mapper.edge_offsets[f]
         var hi = mapper.edge_offsets[f + 1]
         if hi <= lo:
@@ -2221,15 +2389,37 @@ def _feature_infos(mapper: BinMapper) raises -> String:
     return out^
 
 
-def _feature_names(n_features: Int) -> String:
-    """LightGBM's default column names. mojoboost's `Model` carries no
-    feature names, so the file gets the names LightGBM itself invents when a
-    dataset has none."""
+def _feature_names(n_features: Int, names: List[String]) raises -> String:
+    """LightGBM's `feature_names` line.
+
+    `names` are the ones a native model file carries (`serialize.mojo`'s v4
+    header, read back by `load_feature_names`); a `Model` itself holds none,
+    so they arrive as a parameter here exactly as they do in `save_model`.
+    An empty list means the model was saved without them, and the file gets
+    the `Column_0`, `Column_1`, ... names LightGBM itself invents for a
+    dataset that has none.
+
+    A name with whitespace in it is refused rather than written: the line is
+    space-separated, so writing one would silently produce a file with the
+    wrong number of names.
+    """
     var out = String("")
     for f in range(n_features):
         if f > 0:
             out += " "
-        out += "Column_" + String(f)
+        if len(names) == 0:
+            out += "Column_" + String(f)
+            continue
+        var name = names[f]
+        if name.byte_length() == 0 or len(name.split()) != 1:
+            raise Error(
+                "cannot write feature name '",
+                name,
+                "' to a LightGBM model file: its feature_names line is"
+                " space-separated, so a name cannot be empty or contain"
+                " whitespace",
+            )
+        out += name
     return out^
 
 
@@ -2239,6 +2429,7 @@ def _assemble(
     num_class: Int,
     trees_per_iteration: Int,
     blocks: List[String],
+    names: List[String],
 ) raises -> String:
     var sizes = List[Int](capacity=len(blocks))
     for i in range(len(blocks)):
@@ -2251,7 +2442,9 @@ def _assemble(
     out += "label_index=0\n"
     out += "max_feature_idx=" + String(mapper.n_features - 1) + "\n"
     out += "objective=" + objective_line + "\n"
-    out += "feature_names=" + _feature_names(mapper.n_features) + "\n"
+    out += (
+        "feature_names=" + _feature_names(mapper.n_features, names) + "\n"
+    )
     out += "feature_infos=" + _feature_infos(mapper) + "\n"
     out += "tree_sizes=" + _join_ints(sizes) + "\n"
     out += "\n"
@@ -2270,16 +2463,131 @@ def _assemble(
     return out^
 
 
-def dump_lgbm_model(model: Model) raises -> String:
+def _n_categorical(mapper: BinMapper) -> Int:
+    var n = 0
+    for f in range(mapper.n_features):
+        if mapper.cats.is_cat(f):
+            n += 1
+    return n
+
+
+struct LgbmExportReport(Copyable, Movable, Writable):
+    """What one mojoboost-to-LightGBM conversion had to leave behind.
+
+    Nothing here changes what the file predicts. It is the list of things a
+    caller would otherwise have to know from the module docstring:
+    which objective setting could not be written, whether the shrinkage and
+    the base score had to be folded into leaf values, and therefore whether
+    the file's predictions are bit-identical to the model's or merely equal
+    to within a few units in the last place.
+    """
+
+    var n_trees: Int
+    var n_classes: Int
+    var objective_line: String
+    var dropped_objective_param: String
+    var n_categorical_features: Int
+    var shrinkage_folded: Bool
+    var base_score_folded: Bool
+    var n_feature_names: Int
+
+    def __init__(
+        out self,
+        n_trees: Int,
+        n_classes: Int,
+        var objective_line: String,
+        var dropped_objective_param: String,
+        n_categorical_features: Int,
+        shrinkage_folded: Bool,
+        base_score_folded: Bool,
+        n_feature_names: Int,
+    ):
+        self.n_trees = n_trees
+        self.n_classes = n_classes
+        self.objective_line = objective_line^
+        self.dropped_objective_param = dropped_objective_param^
+        self.n_categorical_features = n_categorical_features
+        self.shrinkage_folded = shrinkage_folded
+        self.base_score_folded = base_score_folded
+        self.n_feature_names = n_feature_names
+
+    def predictions_bit_exact(self) -> Bool:
+        """Whether reading this file back reproduces the model's predictions
+        bit for bit.
+
+        True exactly when nothing had to be folded: prediction accumulates
+        `score += learning_rate * leaf_value`, which may become one rounded
+        multiply-add, while the file must round `learning_rate * leaf_value`
+        on its own before it can store it. A model already at
+        `learning_rate = 1.0` with a zero base score -- which is what reading
+        a LightGBM file produces -- has nothing to fold and round-trips
+        exactly.
+        """
+        return not self.shrinkage_folded and not self.base_score_folded
+
+    def write_to(self, mut writer: Some[Writer]):
+        writer.write(
+            "LgbmExportReport(n_trees=",
+            self.n_trees,
+            ", n_classes=",
+            self.n_classes,
+            ", objective=",
+            self.objective_line,
+            ", dropped_param=",
+            self.dropped_objective_param,
+            ", categorical_features=",
+            self.n_categorical_features,
+            ", feature_names=",
+            self.n_feature_names,
+            ", bit_exact=",
+            self.predictions_bit_exact(),
+            ")",
+        )
+
+    def write_repr_to(self, mut writer: Some[Writer]):
+        self.write_to(writer)
+
+
+struct LgbmExport(Copyable, Movable):
+    """A rendered LightGBM model string and the report of its conversion."""
+
+    var text: String
+    var report: LgbmExportReport
+
+    def __init__(out self, var text: String, var report: LgbmExportReport):
+        self.text = text^
+        self.report = report^
+
+
+def dump_lgbm_model(
+    model: Model, feature_names: List[String] = []
+) raises -> String:
     """Render a single-output `Model` as a LightGBM model string.
 
     Leaf values are multiplied by the learning rate and the base score is
     folded into tree 0, so the file predicts what the model does: exactly,
     when the learning rate is already 1.0, and otherwise to within a few
     units in the last place. The module docstring explains why that last
-    rounding is unavoidable. Raises for a categorical or custom-objective
-    model.
+    rounding is unavoidable. Raises for a custom-objective model, and for a
+    categorical node whose feature has no category table in the model's
+    mapper.
+
+    `feature_names` carries exactly what `serialize.save_model` takes under
+    that name, and for the same reason: a `Model` holds no names of its own.
+    An empty list writes LightGBM's own `Column_i` defaults.
+
+    EXPERIMENTAL; `export_lgbm_model` returns the same text together with
+    the report of what the conversion left behind.
     """
+    var exported = export_lgbm_model(model, feature_names)
+    return exported.text^
+
+
+def export_lgbm_model(
+    model: Model, feature_names: List[String] = []
+) raises -> LgbmExport:
+    """`dump_lgbm_model` with its conversion report. EXPERIMENTAL."""
+    _check_export_names(feature_names, model.mapper.n_features)
     var objective_line = lgbm_objective_name(model.booster.objective)
     ref trees = model.booster.trees
     if len(trees) == 0 and model.booster.base_score != 0.0:
@@ -2298,15 +2606,45 @@ def dump_lgbm_model(model: Model) raises -> String:
         )
         block += "\n"
         blocks.append(block^)
-    return _assemble(model.mapper, objective_line, 1, 1, blocks)
+    var text = _assemble(
+        model.mapper, objective_line, 1, 1, blocks, feature_names
+    )
+    var report = LgbmExportReport(
+        len(trees),
+        1,
+        objective_line.copy(),
+        lgbm_dropped_objective_param(model.booster.objective),
+        _n_categorical(model.mapper),
+        model.booster.learning_rate != 1.0,
+        model.booster.base_score != 0.0,
+        len(feature_names),
+    )
+    return LgbmExport(text^, report^)
 
 
-def dump_lgbm_multiclass_model(model: MulticlassModel) raises -> String:
+def dump_lgbm_multiclass_model(
+    model: MulticlassModel, feature_names: List[String] = []
+) raises -> String:
     """Render a `MulticlassModel` as a LightGBM model string.
 
     The trees keep their round-major order, which is LightGBM's own. Each
     class's base score is folded into that class's iteration-0 tree.
+
+    `feature_names` behaves exactly as it does in `dump_lgbm_model`.
+
+    EXPERIMENTAL; `export_lgbm_multiclass_model` returns the same text
+    together with the report of what the conversion left behind.
     """
+    var exported = export_lgbm_multiclass_model(model, feature_names)
+    return exported.text^
+
+
+def export_lgbm_multiclass_model(
+    model: MulticlassModel, feature_names: List[String] = []
+) raises -> LgbmExport:
+    """`dump_lgbm_multiclass_model` with its conversion report.
+    EXPERIMENTAL."""
+    _check_export_names(feature_names, model.mapper.n_features)
     var n_classes = model.booster.n_classes
     var objective_line = String("multiclass num_class:") + String(n_classes)
     ref trees = model.booster.trees
@@ -2329,9 +2667,29 @@ def dump_lgbm_multiclass_model(model: MulticlassModel) raises -> String:
         )
         block += "\n"
         blocks.append(block^)
-    return _assemble(
-        model.mapper, objective_line, n_classes, n_classes, blocks
+    var text = _assemble(
+        model.mapper,
+        objective_line,
+        n_classes,
+        n_classes,
+        blocks,
+        feature_names,
     )
+    var base_folded = False
+    for k in range(n_classes):
+        if model.booster.base_scores[k] != 0.0:
+            base_folded = True
+    var report = LgbmExportReport(
+        len(trees),
+        n_classes,
+        objective_line.copy(),
+        # Softmax reads no scalar parameter, so nothing is dropped.
+        String(""),
+        _n_categorical(model.mapper),
+        model.booster.learning_rate != 1.0,
+        base_folded,
+    )
+    return LgbmExport(text^, report^)
 
 
 def save_lgbm_model(model: Model, path: String) raises:
@@ -2346,3 +2704,119 @@ def save_lgbm_multiclass_model(model: MulticlassModel, path: String) raises:
     var text = dump_lgbm_multiclass_model(model)
     with open(path, "w") as f:
         f.write(text)
+
+
+# ---------------------------------------------------------------------------
+# The narrow experimental surface
+# ---------------------------------------------------------------------------
+#
+# Everything above converts between a LightGBM string and a live `Model`. The
+# four entry points below are what a caller outside Mojo is meant to reach
+# for, and all four are file-to-file, deliberately:
+#
+#   * they need no model handle to cross a language boundary, so the Python
+#     and C facades stay thin;
+#   * the *product* of an import is a mojoboost model file, which keeps
+#     serialize.mojo the format of record and puts the imported model through
+#     native serialization -- category tables, node covers, missing-bin
+#     reservations and all -- before anything else can use it;
+#   * an unsupported file is answered with a sentence rather than an
+#     exception, which is what a caller offering "can I load this?" needs.
+
+
+def lgbm_interop_status() -> String:
+    """How far this interop has been validated. See `LGBM_INTEROP_STATUS`.
+
+    Callers surfacing LightGBM interop are asked to show this verbatim rather
+    than paraphrase it: it is the one sentence that says the feature is an
+    experiment, and it changes when the differential fixtures run.
+    """
+    return LGBM_INTEROP_STATUS.copy()
+
+
+def lgbm_unsupported_reason(text: String) -> String:
+    """Why this LightGBM model string cannot be converted, or an empty string
+    when it can.
+
+    Never raises, which is the point: it is the query a caller makes *before*
+    committing to a conversion, and it is answered by running the conversion
+    and reporting what it said. Running it is what makes the answer
+    trustworthy -- there is no second list of supported constructs here to
+    drift out of step with the converter.
+    """
+    try:
+        var kind = lgbm_text_kind(text)
+        if kind == "multiclass":
+            _ = import_lgbm_multiclass_model(text)
+        else:
+            _ = import_lgbm_model(text)
+    except e:
+        return String(e)
+    return String("")
+
+
+def lgbm_file_unsupported_reason(path: String) -> String:
+    """`lgbm_unsupported_reason` for a file, including an unreadable one."""
+    try:
+        return lgbm_unsupported_reason(open(path, "r").read())
+    except e:
+        return String(e)
+
+
+def import_lgbm_file(
+    lgbm_path: String, model_path: String
+) raises -> LgbmImportReport:
+    """Convert a LightGBM model file into a mojoboost model file.
+
+    EXPERIMENTAL. This is the supported shape of an import: the result is
+    written in mojoboost's own versioned format (serialize.mojo), which is
+    the format `load_model` reads and the only one this project persists
+    models in. LightGBM's format is an interchange, never a substitute for
+    it.
+
+    Passing the converted model through `save_model` on the way out is not
+    incidental. It is what checks that everything the conversion produced --
+    the synthesized bin edges, the category tables, the per-node missing
+    reservations, the node covers -- is state the native format actually
+    carries, rather than something that lives only for as long as the
+    converting process does.
+
+    Which of the two loaders the file needs is decided from the file, the
+    same way `serialize.model_file_kind` decides it for a native one.
+    """
+    var text = open(lgbm_path, "r").read()
+    if lgbm_text_kind(text) == "multiclass":
+        var multi = import_lgbm_multiclass_model(text)
+        save_multiclass_model(multi.model, model_path)
+        return multi.report^
+    var single = import_lgbm_model(text)
+    save_model(single.model, model_path)
+    return single.report^
+
+
+def export_lgbm_file(
+    model_path: String, lgbm_path: String
+) raises -> LgbmExportReport:
+    """Convert a mojoboost model file into a LightGBM model file.
+
+    EXPERIMENTAL. The reverse of `import_lgbm_file`, and the reason it takes
+    a native path rather than a live model is the same: the native file is
+    where a mojoboost model lives, so an export is a conversion between two
+    files and needs nothing else. `serialize.model_file_kind` picks the
+    loader.
+
+    The returned report says what could not be carried across, including
+    whether the LightGBM file's predictions are bit-identical to the native
+    model's or equal only to within a few units in the last place.
+    """
+    if model_file_kind(model_path) == "multiclass":
+        var multi = load_multiclass_model(model_path)
+        var multi_out = export_lgbm_multiclass_model(multi)
+        with open(lgbm_path, "w") as f:
+            f.write(multi_out.text)
+        return multi_out.report^
+    var single = load_model(model_path)
+    var single_out = export_lgbm_model(single)
+    with open(lgbm_path, "w") as f:
+        f.write(single_out.text)
+    return single_out.report^

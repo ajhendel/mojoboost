@@ -33,10 +33,27 @@ The adapter protocol
 
 Task 13 owns the native runtime and Task 14 owns its bindings, and both
 were in flight while this was written. So this module does not import a
-fixed set of symbols: it resolves a *provider*, an object carrying the five
+fixed set of symbols: it resolves a *provider*, an object carrying the
 members below, and the default provider is the extension module itself.
 
-    provider.distributed_runtime_info()          -> record, see below
+The capability half already exists. `bindings/distributed_bindings.mojo`
+exports `distributed_capability()`, and this module reads exactly the
+record it documents:
+
+    provider.distributed_capability() -> {"multi_process": bool,
+        "local_collective": bool, "protocol_version": int,
+        "max_world_size": int, "reason": str}
+
+`multi_process` is False in every build today and `reason` says why, so
+that record is the authority on whether a cluster fit can run at all.
+Nothing here second-guesses it, and nothing here reads
+`local_collective` as permission to train: a single-process world is not
+a distributed fit and this module will not present it as one.
+
+The worker half does not exist yet. These are the entry points a rank
+task calls, and `handoffs/connect_15_dask.md` carries the exact request
+for them:
+
     provider.distributed_worker_open(config)     -> session handle (int)
     provider.distributed_worker_train(handle, X_addr, n_rows, n_features,
                                       y_addr, objective, params)
@@ -44,8 +61,9 @@ members below, and the default provider is the extension module itself.
     provider.distributed_worker_close(handle)    -> None, idempotent
     provider.distributed_worker_cancel(handle)   -> None, from any thread
 
-`distributed_runtime_info()` answers with a mapping (or an object with the
-same attributes) carrying at least:
+A build that grows a richer record may export `distributed_runtime_info()`
+as well, which is read in preference to `distributed_capability()` and
+adds the fields the capability record has no room for:
 
     "available"          -> truthy only when a real transport can open a
                             connection between two processes. The in-memory
@@ -103,7 +121,9 @@ from .dask import (
 
 __all__ = [
     "ADAPTER_VERSION",
+    "CAPABILITY_ENTRY_POINTS",
     "RUNTIME_ENTRY_POINTS",
+    "WORKER_ENTRY_POINTS",
     "NativeDistributedBackend",
     "NativeModelRef",
     "RuntimeStatus",
@@ -120,16 +140,29 @@ __all__ = [
 #: interpreting the same params dict two different ways.
 ADAPTER_VERSION = 1
 
-#: The five members a provider must carry. Listed once so the "what is
-#: missing" message can name them individually rather than saying that
-#: something, somewhere, is absent.
-RUNTIME_ENTRY_POINTS = (
-    "distributed_runtime_info",
+#: The entry points a rank task calls on the worker. Listed once so the
+#: "what is missing" message can name them individually rather than saying
+#: that something, somewhere, is absent. None of them exists yet; the
+#: request for them is in handoffs/connect_15_dask.md.
+WORKER_ENTRY_POINTS = (
     "distributed_worker_open",
     "distributed_worker_train",
     "distributed_worker_close",
     "distributed_worker_cancel",
 )
+
+#: The capability records this module reads, in the order it prefers them.
+#: `distributed_capability` is what bindings/distributed_bindings.mojo
+#: exports today; `distributed_runtime_info` is the richer record a build
+#: with a real transport would answer with instead.
+CAPABILITY_ENTRY_POINTS = (
+    "distributed_runtime_info",
+    "distributed_capability",
+)
+
+#: Everything a fully connected build exports. Kept for callers that want
+#: one list of the contract.
+RUNTIME_ENTRY_POINTS = CAPABILITY_ENTRY_POINTS + WORKER_ENTRY_POINTS
 
 #: First TCP port a rank listens on. Rank `r` takes `base + r`, which keeps
 #: two ranks on one host (legal under `one_rank_per_worker=False`) on
@@ -241,6 +274,7 @@ class RuntimeStatus:
     protocol_version: int = 0
     transport: str = ""
     multi_host: bool = False
+    max_world_size: int = 0
     missing: tuple = ()
 
     def require(self):
@@ -271,37 +305,43 @@ def native_runtime_status(refresh=False):
 
 
 def _status_from_provider(provider, source):
+    probe = None
+    for name in CAPABILITY_ENTRY_POINTS:
+        if hasattr(provider, name):
+            probe = name
+            break
     missing = tuple(
-        name for name in RUNTIME_ENTRY_POINTS if not hasattr(provider, name)
+        name for name in WORKER_ENTRY_POINTS if not hasattr(provider, name)
     )
-    if missing:
+    if probe is None:
+        return RuntimeStatus(
+            available=False,
+            source=source,
+            missing=CAPABILITY_ENTRY_POINTS + missing,
+            reason=(
+                f"{source} exports no distributed runtime at all: neither "
+                f"{' nor '.join(CAPABILITY_ENTRY_POINTS)} is present, so "
+                "there is nothing to ask what it can do. The transport in "
+                "src/mojoboost/distributed_transport.mojo is not finished "
+                "(it has no socket endpoint) and its bindings are not "
+                "registered in this build. See handoffs/connect_15_dask.md "
+                "for the entry points it owes"
+            ),
+        )
+    try:
+        record = getattr(provider, probe)()
+    except Exception as exc:  # the probe must not raise, ever
         return RuntimeStatus(
             available=False,
             source=source,
             missing=missing,
             reason=(
-                f"{source} exports no native distributed runtime: "
-                f"{', '.join(missing)} "
-                f"{'are' if len(missing) > 1 else 'is'} missing. The "
-                "transport in src/mojoboost/distributed_transport.mojo is "
-                "not finished (it has no socket endpoint), and its "
-                "bindings are not built, so this installation cannot train "
-                "across a cluster. See handoffs/connect_15_dask.md for the "
-                "entry points it owes"
-            ),
-        )
-    try:
-        record = provider.distributed_runtime_info()
-    except Exception as exc:  # the probe must not raise, ever
-        return RuntimeStatus(
-            available=False,
-            source=source,
-            reason=(
-                f"{source} has the distributed entry points, but "
-                f"distributed_runtime_info() failed: {exc!r}"
+                f"{source} exports {probe}, but calling it failed: {exc!r}"
             ),
         )
     get = _record_reader(record)
+    if probe == "distributed_capability":
+        return _status_from_capability(get, source, missing)
     protocol = _as_int(get("protocol_version"), 0)
     if protocol != ADAPTER_VERSION:
         return RuntimeStatus(
@@ -364,6 +404,21 @@ def _status_from_provider(provider, source):
                 "ranks declares 'regression'"
             ),
         )
+    if missing:
+        return RuntimeStatus(
+            available=False,
+            source=source,
+            protocol_version=protocol,
+            transport=transport,
+            multi_host=multi_host,
+            capabilities=frozenset(names),
+            missing=missing,
+            reason=(
+                "the native distributed runtime reports itself usable, but "
+                f"{source} is missing the entry points a rank task calls: "
+                f"{', '.join(missing)}"
+            ),
+        )
     return RuntimeStatus(
         available=True,
         source=source,
@@ -374,21 +429,123 @@ def _status_from_provider(provider, source):
     )
 
 
+def _status_from_capability(get, source, missing):
+    """A status from `distributed_capability()`, the record that exists.
+
+    Fail closed, and say so in the runtime's own words. Two answers this
+    deliberately does not give: `local_collective` being true is not
+    availability, because one process is not a cluster and calling it one
+    would be the exact misrepresentation this module exists to avoid; and
+    a build that reports a transport but exports no worker entry points is
+    not available either, because there would be nothing for a rank task
+    to call.
+    """
+    protocol = _as_int(get("protocol_version"), 0)
+    max_world = _as_int(get("max_world_size"), 0)
+    reason = str(get("reason") or "").strip()
+    if not get("multi_process"):
+        return RuntimeStatus(
+            available=False,
+            source=source,
+            protocol_version=protocol,
+            max_world_size=max_world,
+            missing=missing,
+            reason=(
+                "the native distributed transport is not finished in this "
+                "build, so mojoboost cannot train across a cluster: "
+                + (
+                    reason
+                    or "distributed_capability() reports multi_process "
+                    "false and gives no reason, which is a bindings bug"
+                )
+            ),
+        )
+    if missing:
+        return RuntimeStatus(
+            available=False,
+            source=source,
+            protocol_version=protocol,
+            max_world_size=max_world,
+            missing=missing,
+            reason=(
+                "the native transport reports itself usable, but the "
+                "worker entry points a rank task calls are missing from "
+                f"{source}: {', '.join(missing)}. The transport is "
+                "finished and its worker side is not wired to Python; see "
+                "handoffs/connect_15_dask.md"
+            ),
+        )
+    names = tuple(str(name) for name in (get("capabilities") or ()))
+    unknown = sorted(set(names) - set(CAPABILITIES))
+    if unknown:
+        return RuntimeStatus(
+            available=False,
+            source=source,
+            protocol_version=protocol,
+            max_world_size=max_world,
+            reason=(
+                f"the native distributed runtime declares capabilities "
+                f"{unknown} that mojoboost.dask does not know; the known "
+                f"names are {sorted(CAPABILITIES)}"
+            ),
+        )
+    if not names:
+        return RuntimeStatus(
+            available=False,
+            source=source,
+            protocol_version=protocol,
+            max_world_size=max_world,
+            reason=(
+                "the native distributed runtime declares no capabilities, "
+                "so every fit would be refused one at a time for a "
+                "different reason. A runtime that can train regression "
+                "across ranks declares 'regression'"
+            ),
+        )
+    if max_world and max_world < 2:
+        return RuntimeStatus(
+            available=False,
+            source=source,
+            protocol_version=protocol,
+            max_world_size=max_world,
+            capabilities=frozenset(names),
+            reason=(
+                f"the native distributed runtime reports a maximum world "
+                f"size of {max_world}, which is not a cluster. "
+                "Single-process training is what MojoBoostRegressor and "
+                "the other single-machine estimators already do"
+            ),
+        )
+    return RuntimeStatus(
+        available=True,
+        source=source,
+        capabilities=frozenset(names),
+        protocol_version=protocol,
+        max_world_size=max_world,
+        transport=str(get("transport") or "mojoboost-transport"),
+        # The capability record has no `multi_host` field today, so this is
+        # false unless a runtime adds one. It is reported, not acted on:
+        # nothing here refuses a layout for being multi-host.
+        multi_host=bool(get("multi_host")),
+    )
+
+
 def _record_reader(record):
     """A `get(name)` over either a mapping or an object with attributes, so
     a binding may answer with whichever is natural on the Mojo side."""
     if hasattr(record, "get"):
 
-        def get(name):
+        def get(name, default=None):
             try:
-                return record.get(name)
+                value = record.get(name)
             except Exception:
-                return None
+                return default
+            return default if value is None else value
 
         return get
 
-    def get(name):
-        return getattr(record, name, None)
+    def get(name, default=None):
+        return getattr(record, name, default)
 
     return get
 
@@ -612,6 +769,7 @@ class NativeModelRef:
         self._plan = plan
         self._job_id = job_id
         self._record = None
+        self._collected = False
         self.released = False
         self.owner = plan.ranks[0].worker if plan.ranks else ""
 
@@ -629,6 +787,7 @@ class NativeModelRef:
             timeout,
         )
         self._record = payloads[0] if payloads else None
+        self._collected = True
         blob = (self._record or {}).get("model") or b""
         return bytes(blob)
 
@@ -641,11 +800,19 @@ class NativeModelRef:
         return self._record
 
     def release(self):
+        """Let go of the ranks. Idempotent, and called on both paths.
+
+        After a finished fit this only drops the futures, which is what
+        tells dask the worker may free the rank results. After a failed or
+        abandoned one it also cancels, because the ranks may still be
+        sitting in a collective.
+        """
         if self.released:
             return
         self.released = True
         futures, self._futures = self._futures, ()
-        _cancel_world(self._client, self._job_id, futures, self._plan)
+        if not self._collected:
+            _cancel_world(self._client, self._job_id, futures, self._plan)
         self._backend.forget(self._job_id)
 
 
@@ -707,7 +874,11 @@ def _rank_failure(future, futures, plan):
     alone says which task object failed and not which shard of the data it
     was holding, and that is the first thing anyone asks.
     """
-    index = list(futures).index(future)
+    # By identity: `wait` hands back the future objects it was given, and
+    # `==` on a Future is not a promise this needs to rely on.
+    index = next(
+        (i for i, other in enumerate(futures) if other is future), 0
+    )
     rank = plan.ranks[index]
     try:
         future.result()
@@ -900,6 +1071,7 @@ class _RankCall:
     feature_names: tuple = None
     group: tuple = None
     eval_names: tuple = ()
+    eval_groups: tuple = ()
     eval_metrics: tuple = ()
     early_stopping_rounds: int = 0
     first_metric_only: bool = False
@@ -932,6 +1104,19 @@ def _rank_call(job, rank):
         eval_names=tuple(
             valid.name for valid in getattr(job, "validation", ())
         ),
+        # A ranker's eval set carries its own query groups, per rank, for
+        # the same reason the training data does: NDCG is computed within a
+        # query and a rank scores only its own rows.
+        eval_groups=tuple(
+            tuple(
+                count
+                for index in valid.plan.ranks[rank.rank].partitions
+                for count in (valid.plan.partitions[index].group or ())
+            )
+            for valid in getattr(job, "validation", ())
+        )
+        if job.ranking
+        else (),
         eval_metrics=tuple(getattr(job, "eval_metrics", ())),
         early_stopping_rounds=int(
             getattr(job, "early_stopping_rounds", 0) or 0
@@ -1198,7 +1383,23 @@ def _validation_arrays(valid, call, index, n_features, rank, _arrays):
         "y_addr": _arrays.addr(yb),
         "weight_addr": 0 if wb is None else _arrays.addr(wb),
         "n_rows": n_rows,
+        "name": call.eval_names[index]
+        if index < len(call.eval_names)
+        else f"valid_{index}",
     }
+    if call.ranking:
+        group = list(
+            call.eval_groups[index]
+            if index < len(call.eval_groups)
+            else ()
+        )
+        if sum(group) != n_rows:
+            raise DistributedRankError(
+                f"rank {rank} holds {n_rows} rows of eval set {index} and "
+                f"a query group summing to {sum(group)}"
+            )
+        spec["group"] = group
+        spec["n_groups"] = len(group)
     return spec, (Xb, yb, wb)
 
 

@@ -57,15 +57,33 @@ replaced, and none of them defaults to a claim no benchmark has made:
   validation     `valid_scoring` / `MOJOBOOST_GPU_VALID_SCORING`, defaulting
                  to the host tree walk; see `train_gpu_with_valid` and the
                  VALID_SCORE_* constants
+  histograms     `MOJOBOOST_GPU_HIST_SPECIALIZATION=batched` asks for
+                 several leaves per launch (gpu_leaf_batching.mojo, gated by
+                 `apple_histogram_policy`), which the leaf-wise grower can
+                 feed with a split's two children. Unset, every histogram is
+                 the single-leaf launch that shipped and the sibling still
+                 comes from the subtraction trick; see `grow_tree_gpu`.
+  bagged rounds  a bagged run reaches the device objective path only under
+                 an explicit `objective_source=OBJECTIVE_SOURCE_DEVICE`,
+                 where `GpuTreeRouter` (gpu_fused_round.mojo) advances every
+                 row's raw score, in bag or not. Under AUTO a bagged run
+                 keeps the host path and its Float64 raw scores, which is
+                 what shipped.
   session        each trainer has an overload taking a `GpuSession`
                  (gpu_runtime.mojo). Without one the trainers run on
                  `NoLifecycle` and execute exactly the device calls they did
                  before the seam existed; with one, the builder borrows the
-                 session's context and the round and tree boundaries are
-                 announced to it. The session is bookkeeping today: nothing
-                 yet owns one across two fits, which is what would let its
-                 pool and residency ledgers skip an upload rather than only
-                 record that they could have.
+                 session's context, the round and tree boundaries are
+                 announced to it, and the fit is timed against its cold/warm
+                 split. The session is bookkeeping today: nothing yet owns
+                 one across two fits, which is what would let its pool and
+                 residency ledgers skip an upload rather than only record
+                 that they could have.
+
+Which configurations the device round can serve is not decided here. That
+question has one answer in the package, `gpu_fused_round.round_eligibility`,
+and `device_gradients` below is the trainer's binding of it rather than a
+second list of blockers that could drift from it.
 """
 
 from std.math import log
@@ -465,6 +483,15 @@ def _grow_tree_gpu_device_search(
     exchange for the removed per-node transfer. That is a tradeoff, not a
     claimed speedup; no benchmark has compared the two paths yet.
 
+    Those two children are also the frontier `gpu_leaf_batching` wants, and
+    this path is the one that cannot take it yet. A batched build writes
+    into the batcher's own slot pool, and `GpuSplitSearcher.enqueue` takes a
+    whole `DeviceBuffer` with no word offset into it, so a pooled slot
+    cannot be handed to the search kernels without a change there. The
+    host-search grower above batches instead, where the histograms come home
+    anyway; see handoffs/connect_01_gpu_trainer.md for the exact provider
+    change this needs.
+
     Gains, hessian tests, and leaf values are Float32 on the device, so a
     near-tie between two candidates can resolve differently than the host
     scan and CPU/GPU tree shapes can differ there; child row counts are
@@ -695,7 +722,15 @@ def grow_tree_gpu(
     SPLIT_SEARCH_* constants above): the default resolves to this host
     scan, and SPLIT_SEARCH_DEVICE routes to the device-side scan, which
     trades the identical-split guarantee for a fixed 136-byte per-node
-    readback."""
+    readback.
+
+    Where a split's two children's histograms come from is the builder's
+    launch decision, not this grower's: `builder.batches_nodes` answers it
+    from `apple_histogram_policy`, and this loop either takes both children
+    from one batched launch or builds the smaller one and subtracts. The two
+    produce the same pair of histograms exactly, since fixed-point Int32
+    accumulation under one scale makes a parent's bins the exact integer sum
+    of its children's, so no split decision can tell which ran."""
     if resolve_split_search(split_search) == SPLIT_SEARCH_DEVICE:
         return _grow_tree_gpu_device_search(builder, params, bag, tree_index)
     params.constraints.check_features(builder.n_features)
@@ -1054,9 +1089,11 @@ def _train_gpu_rounds[
             # One router per fit, never per tree: it holds the flattened
             # tree tables and one leaf ordinal per row, all sized by the
             # largest tree this run can grow. Empty on the unbagged path,
-            # where the leaf ranges already cover every row and are cheaper.
+            # where the leaf ranges already cover every row and are cheaper,
+            # so an explicit device request on an unbagged run still takes
+            # the range update and allocates nothing extra.
             var router = List[GpuTreeRouter]()
-            if route_all_rows:
+            if route_all_rows and bagging_enabled(bagging):
                 router.append(
                     GpuTreeRouter(
                         builder.ctx, n, 2 * params.tree.num_leaves

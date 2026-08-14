@@ -1257,7 +1257,7 @@ struct GpuClassBatch(Movable):
 
     def enqueue_shared_groups[
         bins_origin: MutOrigin,
-        rows_origin: MutOrigin, //,
+        rows_origin: MutOrigin, //
     ](
         mut self,
         bins: MutPointer[UInt8, bins_origin],
@@ -1420,7 +1420,7 @@ struct GpuClassBatch(Movable):
 
     def enqueue_level_histogram[
         bins_origin: MutOrigin,
-        rows_origin: MutOrigin, //,
+        rows_origin: MutOrigin, //
     ](
         mut self,
         bins: MutPointer[UInt8, bins_origin],

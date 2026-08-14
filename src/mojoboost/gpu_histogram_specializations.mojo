@@ -393,9 +393,9 @@ struct BinStorageDescriptor(Copyable, Movable):
     feature-major matrix, `n_features` for a fully row-major one."""
 
     var passthrough: Bool
-    """Whether the device buffer *is* `BinnedMatrix.bins`: byte `f * n_rows + r`
-    holds cell (r, f), no packing pass ran, and no decode instruction
-    executes."""
+    """Whether the device buffer *is* `BinnedMatrix.bins`: cell (r, f) lives at
+    byte `f * dataset_rows + r`, no packing pass ran, and no decode
+    instruction executes."""
 
     var missing_marker_preserved: Bool
     var categorical_marker_preserved: Bool

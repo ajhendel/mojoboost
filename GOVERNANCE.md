@@ -63,13 +63,14 @@ both directions.
 ## Who decides
 
 During the alpha, mojoboost uses a benevolent maintainer model. Andrew Hendel
-([@ajhendel](https://github.com/ajhendel)) is the maintainer and holds the
-final call on technical direction, scope, and anything unresolved.
+([@ajhendel](https://github.com/ajhendel)) created mojoboost, serves as lead
+maintainer, and holds the final call on technical direction, scope, and
+anything unresolved.
 
-This is a description of the current reality, not an ambition. One person
-started the project, and pretending a committee exists would slow contributors
-down without protecting them. The model is deliberately temporary, and the
-section on evolving this document says what replaces it.
+This is a description of the current reality, not an ambition. Andrew started
+the project, and pretending a committee exists would slow contributors down
+without protecting them. The model is deliberately temporary, and the section
+on evolving this document says what replaces it.
 
 Three limits keep the model honest.
 

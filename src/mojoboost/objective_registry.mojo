@@ -934,7 +934,6 @@ def objective_class_weight_kind(objective: Int) raises -> Int:
     return CLASS_WEIGHT_NONE
 
 
-@always_inline
 def objective_supports_scale_pos_weight(objective: Int) raises -> Bool:
     """Whether LightGBM's `scale_pos_weight` and `is_unbalance` apply.
 
@@ -1067,7 +1066,7 @@ def check_objective_backend(objective: Int, backend: Int) raises:
     device_policy.mojo, which asks whether `train_gpu` itself accepts the
     code. See `objective_backends` for why the three differ.
     """
-    if objective_backends(objective) & backend == 0:
+    if (objective_backends(objective) & backend) == 0:
         raise Error(
             "objective '",
             objective_canonical_name(objective),
@@ -1501,7 +1500,7 @@ def metric_scoring_param(
 
     Metrics that read no scalar return 0.0, which the fifteen of them ignore.
     """
-    if metric_needs(metric) & NEEDS_PARAM == 0:
+    if (metric_needs(metric) & NEEDS_PARAM) == 0:
         return 0.0
     var owner = _metric_param_owner(metric)
     if objective_param_domain(owner).contains(alpha):

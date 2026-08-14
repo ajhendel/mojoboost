@@ -1,0 +1,217 @@
+# Validation tiers: the classes of evidence, cheapest first.
+#
+# A tier answers one question: what kind of machine cost does this class of
+# job impose, and what does a passing run in it actually prove? The planner
+# in tools/validation_plan.py reads this file to order a plan, to charge a
+# budget, and to decide which jobs it may print without an explicit opt-in.
+#
+# Two rules govern the whole file.
+#
+# 1. `opt_in = true` means the planner never schedules a job in this tier
+#    unless the operator names the tier on the command line. There is no
+#    setting anywhere that turns all tiers on at once. Preventing an
+#    accidental `pixi run test` on a laptop that is already compiling
+#    something is the reason this directory exists.
+#
+# 2. No number in this file or in jobs.toml is a measurement. `budget_seconds`
+#    is a scheduling guess and nothing has been timed by the lane that wrote
+#    it. See `docs/FOCUSED_VALIDATION_PLAN.md` section 6.
+
+schema = 1
+project = "mojoboost"
+
+# ---------------------------------------------------------------------------
+# Machine budget
+#
+# The planner adds jobs in tier order and stops when the running total of
+# `budget_seconds` would exceed `default_seconds`. Everything past that point
+# is printed under "over budget", with its cost, so that dropping it is a
+# decision rather than an accident.
+# ---------------------------------------------------------------------------
+[budget]
+default_seconds = 600
+max_jobs = 12
+# At most one broad suite per plan, ever. A plan with two of them is not a
+# focused plan, it is the full suite with extra steps.
+max_broad_jobs = 1
+# Threads a job may ask for when it does not say. Feeds MOJOBOOST_NUM_WORKERS
+# in the emitted script; the repository's env contract is in README.md.
+default_threads = 4
+default_timeout_seconds = 900
+
+# ---------------------------------------------------------------------------
+# Mutual exclusion
+#
+# Every job declares an `exclusive` class or an empty string. A plan is a
+# sequence and never runs two jobs at once, so these classes exist for the
+# other machine: the parallel Claude Code session, the editor's language
+# server, the benchmark someone started in another terminal.
+#
+# All three classes take the same lock today, on purpose. `tools/with_build_lock.sh`
+# owns one lock file and this lane does not own that script, so the choice was
+# between one machine-wide lock and a second copy of the same fcntl logic
+# inside the planner. One lock over-serializes; a second implementation of a
+# lock is the kind of duplicate that later disagrees with itself. The patch
+# that gives each class its own lock file is written out in
+# handoffs/remaining_14_validation_plan.md, patch P1.
+# ---------------------------------------------------------------------------
+[locks]
+wrapper = "tools/with_build_lock.sh"
+lock_file = "/tmp/mojoboost-build.lock"
+classes = ["cpu", "gpu", "build"]
+note = "One lock file for all three classes today. See patch P1."
+
+# `--measure` plans carry timings that contention would invalidate, so they
+# may contain jobs from only one exclusion class.
+[measurement]
+one_class_per_plan = true
+reason = "A timing taken while another exclusion class was running is a timing about both of them."
+
+# ---------------------------------------------------------------------------
+# The tiers
+# ---------------------------------------------------------------------------
+
+[[tier]]
+id = "static"
+order = 1
+title = "Static checks"
+opt_in = false
+exclusive = ""
+description = """
+Standard library only. Nothing here compiles, installs, imports the extension,
+downloads, or trains. Each job reads files and exits. This is the tier that can
+run on every change without a thought, and the only tier the planner schedules
+by default when nothing else matches.
+"""
+proves = "That a documented contract still matches the files it describes."
+does_not_prove = "That any code runs, or that any claim about behavior is true."
+
+[[tier]]
+id = "smoke"
+order = 2
+title = "Tiny smoke checks"
+opt_in = false
+exclusive = ""
+description = """
+One process, one small input, seconds. A smoke check answers "is this thing
+importable and does the obvious call return", and it answers it on an already
+built artifact. Nothing in this tier builds; a job that needs the extension
+declares `needs = ["extension"]` and the planner says so rather than quietly
+adding a build.
+"""
+proves = "That an existing artifact imports and its front door opens."
+does_not_prove = "Anything about training correctness, numerics, or performance."
+
+[[tier]]
+id = "native"
+order = 3
+title = "Focused native checks"
+opt_in = false
+exclusive = "cpu"
+description = """
+One Mojo suite, run on its own. This is the tier that carries the project's
+working rule: after changing a module, run the one suite that imports it, not
+the 47 suites that exist. Each `mojo run` compiles its suite first, which is
+most of the cost, so the saving from running one instead of all of them is
+close to linear.
+"""
+proves = "That the assertions in one suite hold on this machine."
+does_not_prove = "That any other suite still passes, or that the GPU path agrees with the CPU path."
+
+[[tier]]
+id = "python"
+order = 4
+title = "Python estimator checks"
+opt_in = false
+exclusive = "cpu"
+description = """
+The scikit-learn facing surface: one pytest file at a time, plus the
+dependency-free API script. Every job here needs `python/mojoboost/_mojoboost.so`
+to exist, which is a build, which is why `python:build-ext` is a job in its own
+right with its own exclusion class rather than a hidden prerequisite.
+"""
+proves = "That the Python surface behaves for the cases that file covers."
+does_not_prove = "That the same code path works from a wheel rather than from the source tree."
+
+[[tier]]
+id = "differential"
+order = 5
+title = "CPU and GPU differential checks"
+opt_in = true
+exclusive = "gpu"
+description = """
+The two backends compared against each other, and the CPU path checked with the
+accelerator disabled. These are the only jobs that can catch a GPU kernel that
+is fast and wrong, so they are also the ones most worth running deliberately
+rather than by habit. Opt-in because they wake the GPU: on Apple silicon that
+is the same power and thermal budget the CPU jobs are using.
+"""
+proves = "That two backends agree on the cases the suite covers, on this device."
+does_not_prove = "That they agree on another device, another driver, or another shape."
+
+[[tier]]
+id = "wheel"
+order = 6
+title = "Clean wheel checks"
+opt_in = true
+exclusive = "build"
+description = """
+Build an artifact, then attack it: install it somewhere that does not have the
+toolchain, import it from a directory that is not the source tree, read its
+tags, and hash it. The distinction that matters here is between
+`packaging/test_wheel.sh`, which proves the wheel works inside the pixi
+environment, and `packaging/matrix/smoke/clean_install_*.sh`, which refuses to
+run inside that environment and is therefore the only job that can prove the
+wheel is self-contained.
+"""
+proves = "That an artifact exists, is labeled honestly, and imports where it claims to."
+does_not_prove = "That it works on any machine other than the one that ran it."
+
+[[tier]]
+id = "distributed"
+order = 7
+title = "Distributed and two-process checks"
+opt_in = true
+exclusive = "cpu"
+description = """
+The collective, the wire protocol, and the Dask contract. Everything runnable
+in this tier today runs in one process: `docs/DISTRIBUTED_TRANSPORT.md` section
+1 says plainly that no byte has moved between two processes, and the job that
+would change that is listed here as blocked rather than omitted, so the gap has
+an entry rather than a silence.
+"""
+proves = "That the protocol and the state machine hold, in process."
+does_not_prove = "That two processes, or two hosts, can train together at all."
+
+[[tier]]
+id = "hardware"
+order = 8
+title = "Hardware validation"
+opt_in = true
+exclusive = "gpu"
+description = """
+Evidence collected on a specific device and filed against a record: environment
+capture, the GPU validation sweep, the Apple protocol suite. These jobs are slow
+by construction because they are measurements, and a measurement taken while
+anything else was running is not one. Every job here names the record its output
+belongs in; output that is not filed is not evidence.
+"""
+proves = "What happened on one named device, once, when the record says so."
+does_not_prove = "Anything about a device that has not run it."
+
+[[tier]]
+id = "broad"
+order = 9
+title = "Deliberately scheduled broad suites"
+opt_in = true
+exclusive = "cpu"
+description = """
+The full suites, and the benchmark sweeps. These belong to a moment that was
+chosen: before a release, after a round of parallel lanes is reconciled, on a
+machine nobody is using. They do not belong to an edit. The planner will place
+at most one of them in a plan and refuses to place any of them beside a hardware
+job, because two long jobs sharing a laptop produce one useless number and one
+long wait.
+"""
+proves = "That the whole tree passes, at one commit, on one machine."
+does_not_prove = "Which change fixed or broke anything, which is what the focused tiers are for."

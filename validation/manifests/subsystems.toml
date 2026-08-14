@@ -1,0 +1,549 @@
+# Changed paths to the smallest jobs that would notice.
+#
+# A subsystem is a set of paths that fail together. When one of its paths
+# changes, `jobs` is the smallest set of commands that would catch the failure,
+# and `escalate` is what to add when the change is one you are unsure about.
+# The planner never schedules `escalate` on its own; it prints it as the next
+# thing to consider.
+#
+# How the `jobs` lists were derived. Every Mojo suite in `tests/` was parsed for
+# its `from mojoboost.<module> import` lines, which gives, per module, the exact
+# set of suites that import it. Where that set is small, it is the job list.
+# Where it is large (`boosting.mojo` is imported by 22 suites, `tree.mojo` by
+# 20), a representative subset is listed and `escalate` carries the rest, on the
+# grounds that a list of 22 commands is not a focused plan. The derivation is
+# reproducible: see docs/FOCUSED_VALIDATION_PLAN.md section 3.
+#
+# A suite that imports a module only transitively is deliberately NOT counted.
+# `gain.mojo` is reached by 34 of the 47 suites through `boosting.mojo`, which
+# makes "everything" the answer for almost every module and makes the mapping
+# useless. Transitive reach means the module still has to compile, and a
+# compile check is what `native:compile-package` is for.
+#
+# Matching: a path entry matches literally, as an fnmatch pattern, or as a
+# directory prefix when it ends in `/`. A changed file under `tests/` or
+# `python/tests/` needs no entry here: the planner resolves it against the
+# `requires_files` of the job that runs it.
+
+schema = 1
+
+# ---------------------------------------------------------------------------
+# Native core
+# ---------------------------------------------------------------------------
+
+[[subsystem]]
+id = "core-boosting"
+title = "The boosting loop, the model, and the tree"
+paths = [
+    "src/mojoboost/boosting.mojo",
+    "src/mojoboost/model.mojo",
+    "src/mojoboost/tree.mojo",
+    "src/mojoboost/gain.mojo",
+    "src/mojoboost/initialization.mojo",
+    "src/mojoboost/params.mojo",
+    "src/mojoboost/__init__.mojo",
+]
+jobs = ["native:core", "native:objectives", "native:serialize", "native:regularization"]
+escalate = ["broad:full-suite"]
+note = "boosting.mojo is imported by 22 suites and tree.mojo by 20. A change here is the one case where the broad suite is the honest answer."
+
+[[subsystem]]
+id = "binning"
+title = "Binning and dataset construction"
+paths = [
+    "src/mojoboost/binning.mojo",
+    "src/mojoboost/trainset.mojo",
+    "src/mojoboost/raw_data.mojo",
+]
+jobs = ["native:kernels", "native:trainset", "native:histogram-reference"]
+escalate = ["native:categorical", "native:missing", "native:sparse"]
+note = "Bin boundaries move every downstream number, so the histogram reference is part of the minimum here rather than an escalation."
+
+[[subsystem]]
+id = "histogram-cpu"
+title = "CPU histogram construction and the parallel runtime"
+paths = [
+    "src/mojoboost/histogram.mojo",
+    "src/mojoboost/parallel.mojo",
+    "src/mojoboost/histogram_cache_policy.mojo",
+]
+jobs = ["native:histogram-reference", "native:cpu-parallel"]
+escalate = ["differential:threads-1", "differential:threads-max", "broad:bench-threshold"]
+note = "The two thread-count jobs are the ones that catch a race that only shows up at one worker count."
+
+[[subsystem]]
+id = "split"
+title = "Split selection and constraints"
+paths = [
+    "src/mojoboost/split.mojo",
+    "src/mojoboost/monotone.mojo",
+    "src/mojoboost/interaction.mojo",
+]
+jobs = ["native:kernels", "native:monotone", "native:interaction"]
+escalate = ["native:gpu-split-search", "differential:backend-equivalence"]
+note = "gpu_split_search.mojo reimplements this rule on the device, so a rule change here is a two-sided change."
+
+[[subsystem]]
+id = "objectives"
+title = "Objectives, metrics, and their registries"
+paths = [
+    "src/mojoboost/objective.mojo",
+    "src/mojoboost/objective_registry.mojo",
+    "src/mojoboost/custom_metric.mojo",
+    "src/mojoboost/metrics.mojo",
+    "src/mojoboost/class_weight.mojo",
+]
+jobs = ["native:objectives", "native:metrics", "native:custom-objective", "native:custom-metrics"]
+escalate = ["native:gpu-objectives-native", "differential:gpu-objectives", "python:eval-set"]
+note = "class_weight.mojo is imported by no suite. A change to it gets native:compile-package and nothing else."
+
+[[subsystem]]
+id = "sampling"
+title = "Row and column sampling"
+paths = [
+    "src/mojoboost/bagging.mojo",
+    "src/mojoboost/goss.mojo",
+    "src/mojoboost/sampling.mojo",
+    "src/mojoboost/importance.mojo",
+]
+jobs = ["native:sampling", "native:bagging", "native:goss", "native:feature-sampling"]
+escalate = ["differential:gpu-training"]
+note = "Reproducibility for a seed is the property that breaks silently here, and only the sampling suites assert it."
+
+[[subsystem]]
+id = "categorical"
+title = "Categorical features and feature bundling"
+paths = ["src/mojoboost/categorical.mojo", "src/mojoboost/efb.mojo"]
+jobs = ["native:categorical", "native:efb"]
+escalate = ["native:gpu-split-search", "broad:lightgbm-compare"]
+note = "The categorical split rule is a parity claim against LightGBM 4.7.0 and broad:lightgbm-compare is the only job that checks it."
+
+[[subsystem]]
+id = "ranking"
+title = "Ranking"
+paths = ["src/mojoboost/ranking.mojo"]
+jobs = ["native:ranking", "native:custom-metrics"]
+escalate = ["native:metrics", "broad:lightgbm-compare"]
+
+[[subsystem]]
+id = "sparse"
+title = "The sparse chain"
+paths = [
+    "src/mojoboost/sparse.mojo",
+    "src/mojoboost/boosting_sparse.mojo",
+    "src/mojoboost/histogram_sparse.mojo",
+    "src/mojoboost/model_sparse.mojo",
+    "src/mojoboost/tree_sparse.mojo",
+]
+jobs = ["native:sparse", "native:monotone"]
+escalate = ["python:validation", "python:contrib"]
+note = "The Python side of this chain is guarded by pytest.importorskip('scipy.sparse') and the pytest environment installs no scipy, so those escalations skip themselves today. See docs/FOCUSED_VALIDATION_PLAN.md section 7."
+
+[[subsystem]]
+id = "serialization"
+title = "Model persistence and inspection"
+paths = [
+    "src/mojoboost/serialize.mojo",
+    "src/mojoboost/lgbm_model_io.mojo",
+    "src/mojoboost/model_dump.mojo",
+    "src/mojoboost/inspection.mojo",
+]
+jobs = ["native:serialize", "native:lgbm-model-io"]
+escalate = ["python:inspection", "python:pickle", "native:continued"]
+note = "model_dump.mojo and inspection.mojo are imported by no suite; their reachable behavior is tested from Python instead."
+
+[[subsystem]]
+id = "contributions"
+title = "TreeSHAP contributions"
+paths = ["src/mojoboost/contrib.mojo"]
+jobs = ["native:contrib"]
+escalate = ["python:contrib", "native:serialize"]
+
+[[subsystem]]
+id = "callbacks"
+title = "Callbacks"
+paths = ["src/mojoboost/callback.mojo"]
+jobs = ["native:callbacks"]
+escalate = ["python:callbacks"]
+
+[[subsystem]]
+id = "device-policy"
+title = "Backend and device selection"
+paths = [
+    "src/mojoboost/device.mojo",
+    "src/mojoboost/device_policy.mojo",
+    "src/mojoboost/backend.mojo",
+]
+jobs = ["native:device"]
+escalate = ["differential:cpu-pinned", "differential:backend-equivalence", "python:device-selection"]
+note = "differential:cpu-pinned is the only job that exercises MOJOBOOST_DISABLE_GPU on a machine that has an accelerator, so it is the only one that can catch a broken pin-to-CPU branch."
+
+# ---------------------------------------------------------------------------
+# GPU
+# ---------------------------------------------------------------------------
+
+[[subsystem]]
+id = "gpu-histogram"
+title = "GPU histogram construction"
+paths = [
+    "src/mojoboost/histogram_gpu.mojo",
+    "src/mojoboost/gpu_tiling.mojo",
+    "src/mojoboost/gpu_histogram_specializations.mojo",
+    "src/mojoboost/gpu_bin_packing.mojo",
+    "src/mojoboost/gpu_binned_layout.mojo",
+]
+jobs = ["differential:gpu-tiling", "differential:gpu-strategies", "differential:backend-equivalence"]
+escalate = ["hardware:gpu-suites", "hardware:hist-strategy-sweep"]
+note = "gpu_bin_packing.mojo and gpu_binned_layout.mojo are imported by no suite. The tiling and strategy jobs cover the policy, not those two layouts."
+
+[[subsystem]]
+id = "gpu-training"
+title = "End-to-end GPU training"
+paths = [
+    "src/mojoboost/train_gpu.mojo",
+    "src/mojoboost/gpu_frontier.mojo",
+    "src/mojoboost/gpu_fused_round.mojo",
+    "src/mojoboost/gpu_active_rows.mojo",
+    "src/mojoboost/gpu_gradient_stream.mojo",
+    "src/mojoboost/gpu_output_planes.mojo",
+]
+jobs = ["native:gpu-active-rows", "differential:gpu-training"]
+escalate = ["differential:backend-equivalence", "differential:gpu-objectives", "hardware:gpu-validate"]
+note = "Row compaction must stay order-preserving; native:gpu-active-rows is the suite that asserts it."
+
+[[subsystem]]
+id = "gpu-split"
+title = "Device-side split selection"
+paths = ["src/mojoboost/gpu_split_search.mojo"]
+jobs = ["native:gpu-split-search"]
+escalate = ["differential:backend-equivalence", "native:monotone", "native:categorical"]
+
+[[subsystem]]
+id = "gpu-objectives"
+title = "Device-resident objectives"
+paths = ["src/mojoboost/gpu_objectives_native.mojo"]
+jobs = ["native:gpu-objectives-native"]
+escalate = ["differential:gpu-objectives"]
+
+[[subsystem]]
+id = "gpu-predict"
+title = "Device-side prediction"
+paths = ["src/mojoboost/gpu_predict.mojo"]
+jobs = ["native:gpu-predict"]
+escalate = ["differential:backend-equivalence"]
+
+[[subsystem]]
+id = "gpu-runtime"
+title = "GPU session, portability, and backend policy"
+paths = [
+    "src/mojoboost/gpu_runtime.mojo",
+    "src/mojoboost/gpu_backend_policy.mojo",
+    "src/mojoboost/gpu_portability.mojo",
+]
+jobs = ["native:gpu-runtime", "differential:gpu-portability"]
+escalate = ["hardware:gpu-suites"]
+note = "gpu_backend_policy.mojo and gpu_portability.mojo are imported by no suite; only the portability contract suite covers that ground, and it covers the kernels rather than the policy."
+
+[[subsystem]]
+id = "apple-policy"
+title = "Apple silicon policy modules"
+paths = [
+    "src/mojoboost/apple_cpu_policy.mojo",
+    "src/mojoboost/apple_gpu_policy.mojo",
+    "src/mojoboost/apple_histogram_policy.mojo",
+    "src/mojoboost/unified_memory_policy.mojo",
+]
+jobs = ["native:apple-gpu-policy"]
+escalate = ["differential:gpu-tiling", "hardware:apple-suite-smoke"]
+note = "Three of these four are imported by no suite. A policy change that only moves numbers is invisible to every correctness job in this file; hardware:apple-suite-smoke is where it would show."
+
+# ---------------------------------------------------------------------------
+# Distributed
+# ---------------------------------------------------------------------------
+
+[[subsystem]]
+id = "distributed"
+title = "Distributed training and its transport"
+paths = [
+    "src/mojoboost/distributed.mojo",
+    "src/mojoboost/collective.mojo",
+    "src/mojoboost/distributed_transport.mojo",
+]
+jobs = ["distributed:in-process", "distributed:transport"]
+escalate = ["distributed:two-process", "distributed:dask-contract"]
+note = "distributed:two-process is blocked and will print as blocked. That is the accurate answer for this subsystem today."
+
+[[subsystem]]
+id = "tree-parameters-extra"
+title = "Tree-parameter primitives no grower calls"
+paths = ["src/mojoboost/tree_parameters_extra.mojo"]
+jobs = ["native:tree-parameters-extra"]
+note = "This suite proves the primitive computes its rule. It cannot prove the parameter does anything, because no grower calls it. Wiring one up is a change to core-boosting and takes that subsystem's jobs too."
+
+# ---------------------------------------------------------------------------
+# Bindings, Python, and the other front doors
+# ---------------------------------------------------------------------------
+
+[[subsystem]]
+id = "bindings"
+title = "The CPython extension"
+paths = ["bindings/"]
+jobs = ["python:build-ext", "python:api", "python:basic"]
+escalate = ["static:startup-artifacts", "smoke:install-example", "broad:estimators"]
+note = "Every python-tier job depends on python:build-ext, so a bindings change invalidates the whole tier at once."
+
+[[subsystem]]
+id = "python-api"
+title = "The public Python API"
+paths = [
+    "python/mojoboost/__init__.py",
+    "python/mojoboost/basic.py",
+    "python/mojoboost/_compat.py",
+    "python/mojoboost/_public_api_plan.py",
+]
+jobs = ["python:basic", "python:params", "python:attributes"]
+escalate = ["static:parity", "python:api", "broad:estimators"]
+note = "static:parity is not optional here: adding a name to __all__ can fire a STALE_DEFERRED_WATCHES probe and turn a parity row false in the same commit."
+
+[[subsystem]]
+id = "python-eval"
+title = "Validation sets, metrics, and early stopping"
+paths = ["python/mojoboost/_eval.py", "python/mojoboost/callback.py"]
+jobs = ["python:eval-set", "python:custom-metrics", "python:callbacks"]
+
+[[subsystem]]
+id = "python-arrays"
+title = "Array conversion and input validation"
+paths = ["python/mojoboost/_arrays.py"]
+jobs = ["python:validation", "python:no-numpy", "python:predict"]
+escalate = ["python:categorical", "broad:estimators"]
+
+[[subsystem]]
+id = "python-sklearn"
+title = "scikit-learn compatibility"
+paths = ["python/mojoboost/_sklearn.py"]
+jobs = ["python:sklearn"]
+escalate = ["python:basic", "broad:estimators"]
+
+[[subsystem]]
+id = "python-cv"
+title = "Cross validation"
+paths = ["python/mojoboost/cv.py"]
+jobs = ["python:cv"]
+
+[[subsystem]]
+id = "python-dask"
+title = "The Dask adapter"
+paths = ["python/mojoboost/dask.py", "python/mojoboost/_dask_runtime.py"]
+jobs = ["distributed:dask-contract"]
+escalate = ["distributed:in-process"]
+
+[[subsystem]]
+id = "python-inspection"
+title = "Model inspection from Python"
+paths = ["python/mojoboost/inspection.py"]
+jobs = ["python:inspection"]
+escalate = ["native:serialize"]
+
+[[subsystem]]
+id = "python-device"
+title = "Device selection and diagnostics from Python"
+paths = ["python/mojoboost/device_selection.py", "python/mojoboost/diagnostics.py"]
+jobs = ["python:device-selection"]
+escalate = ["smoke:install-example", "native:device"]
+
+[[subsystem]]
+id = "capi"
+title = "The C ABI"
+paths = ["capi/"]
+jobs = ["native:capi"]
+escalate = ["native:c-abi-from-c"]
+note = "native:c-abi-from-c is the only job that compiles the header with a C compiler, and no CI job runs it. That absence is why the parity contract holds the C API row at partial."
+
+[[subsystem]]
+id = "cli"
+title = "The command line tool"
+paths = ["cli/"]
+jobs = ["native:cli"]
+
+# ---------------------------------------------------------------------------
+# Packaging, workflows, docs, and the harnesses
+# ---------------------------------------------------------------------------
+
+[[subsystem]]
+id = "packaging-wheel"
+title = "Wheel building and installation"
+paths = [
+    "packaging/build_wheel.sh",
+    "packaging/test_wheel.sh",
+    "packaging/smoke_test.py",
+    "packaging/macos/",
+    "packaging/linux/",
+    "python/pyproject.toml",
+    "python/setup.py",
+    "python/MANIFEST.in",
+]
+jobs = ["static:linux-metadata", "static:matrix"]
+escalate = ["wheel:build", "wheel:test", "wheel:clean-install-macos", "wheel:validate-artifact"]
+note = "The static jobs are free and catch the metadata mistakes. The wheel tier is opt-in because building an artifact is a release operation, not an edit-loop step."
+
+[[subsystem]]
+id = "packaging-matrix"
+title = "The release matrix and its records"
+paths = ["packaging/matrix/", "docs/PLATFORM_MATRIX.md"]
+jobs = ["static:matrix"]
+escalate = ["smoke:probe-platform"]
+
+[[subsystem]]
+id = "packaging-security"
+title = "Release integrity and provenance"
+paths = ["packaging/security/", "docs/RELEASE_SECURITY.md"]
+jobs = ["static:action-pins"]
+escalate = ["wheel:hash", "wheel:verify-release"]
+
+[[subsystem]]
+id = "workflows"
+title = "CI and release workflows"
+paths = [".github/workflows/"]
+jobs = ["static:action-pins", "static:parity"]
+note = "static:parity because check_parity.py asserts that every suite the contract cites is wired into a pixi task, and a workflow edit is where that stops being true."
+
+[[subsystem]]
+id = "pixi"
+title = "The environment definition"
+paths = ["pixi.toml", "pixi.lock"]
+jobs = ["smoke:toolchain", "static:parity", "static:python-compat"]
+escalate = ["static:matrix", "broad:full-suite"]
+note = "static:parity checks the task wiring; static:python-compat and static:matrix both read pixi.lock for the interpreter pin."
+
+[[subsystem]]
+id = "parity-docs"
+title = "The parity contract and the capability levels"
+paths = [
+    "docs/LIGHTGBM_PARITY.md",
+    "docs/CAPABILITY_LEVELS.md",
+    "tools/check_parity.py",
+]
+jobs = ["static:parity"]
+
+[[subsystem]]
+id = "startup-docs"
+title = "Startup latency"
+paths = ["docs/STARTUP_LATENCY.md", "tools/inspect_startup_artifacts.py"]
+jobs = ["static:startup-artifacts"]
+
+[[subsystem]]
+id = "bench-apple"
+title = "The Apple benchmark harness"
+paths = ["bench/apple/", "docs/APPLE_GPU_BENCHMARK_PROTOCOL.md", "docs/APPLE_THERMAL_ENERGY.md"]
+jobs = ["static:apple-selfcheck", "static:thermal-plan"]
+escalate = ["static:apple-plan", "hardware:apple-suite-smoke"]
+
+[[subsystem]]
+id = "bench-real-data"
+title = "The real-data harness"
+paths = ["bench/real_data/"]
+jobs = ["static:realdata-selfcheck"]
+escalate = ["broad:real-data-smoke"]
+
+[[subsystem]]
+id = "bench-native"
+title = "Mojo benchmarks"
+paths = ["bench/*.mojo"]
+jobs = []
+escalate = ["broad:bench-threshold", "broad:bench-hist-scaling", "hardware:gpu-validate"]
+note = "A benchmark has no correctness job. Editing one earns a scheduled run or nothing."
+
+[[subsystem]]
+id = "hardware-paperwork"
+title = "Hardware contribution paperwork"
+paths = ["hardware/", "docs/HARDWARE_CONTRIBUTORS.md", "docs/GPU_VALIDATION.md"]
+jobs = ["static:capture-audit"]
+escalate = ["hardware:capture-apple", "hardware:gpu-suites", "hardware:gpu-validate"]
+
+[[subsystem]]
+id = "validation-plan"
+title = "This planner and its manifests"
+paths = ["validation/", "tools/validation_plan.py", "docs/FOCUSED_VALIDATION_PLAN.md"]
+jobs = ["static:plan-selfcheck"]
+
+# ---------------------------------------------------------------------------
+# Gaps: paths with no focused job at all
+#
+# These 18 modules are imported by no Mojo suite, directly or transitively.
+# Editing one of them is not covered by anything in the native tier, and the
+# planner says so rather than falling back to a suite that would not notice.
+# `native:compile-package` is the honest floor: it proves the module still
+# type-checks and nothing more.
+#
+# A gap entry may name a path that a subsystem above also names, and several do.
+# That is not a contradiction and the planner treats it as neither: it schedules
+# the subsystem's jobs AND prints the gap warning, because "this subsystem has
+# jobs" and "none of those jobs import the file you changed" are both true and
+# the second one is the one that gets forgotten.
+#
+# This list is the same fact `tools/check_parity.py` records from the other
+# side, where six of these modules are watched by the public name an integrator
+# would have to export to reach them. A module leaving this list is a module
+# that gained a caller and a suite, which is exactly the event both files exist
+# to notice.
+# ---------------------------------------------------------------------------
+
+[[gap]]
+paths = [
+    "src/mojoboost/alternate_boosting.mojo",
+    "src/mojoboost/boosting_dart.mojo",
+    "src/mojoboost/boosting_rf.mojo",
+]
+fallback = ["native:compile-package"]
+reason = "Alternative boosting modes. No trainer calls them and no suite imports them."
+would_close_it = "A suite under tests/ that imports the module, plus a trainer that calls it. Until both exist, a passing compile is the whole of the evidence."
+
+[[gap]]
+paths = ["src/mojoboost/class_weight.mojo"]
+fallback = ["native:compile-package"]
+reason = "Class weighting. No suite imports it."
+would_close_it = "Reaching it from fit(class_weight=) and asserting the weighted gradient in tests/test_weights.mojo."
+
+[[gap]]
+paths = [
+    "src/mojoboost/gpu_bin_packing.mojo",
+    "src/mojoboost/gpu_binned_layout.mojo",
+    "src/mojoboost/gpu_categorical.mojo",
+    "src/mojoboost/gpu_sparse.mojo",
+    "src/mojoboost/gpu_sparse_layout.mojo",
+]
+fallback = ["native:compile-package"]
+reason = "GPU data layouts. No suite imports them. The sparse GPU path raises for device='gpu' today, so there is nothing to run even if a suite existed."
+would_close_it = "A layout suite that builds each layout from a fixture and compares it to the CPU layout, in the shape of tests/test_histogram_reference.mojo."
+
+[[gap]]
+paths = [
+    "src/mojoboost/gpu_leaf_batching.mojo",
+    "src/mojoboost/gpu_levelwise.mojo",
+    "src/mojoboost/gpu_multiclass_batch.mojo",
+    "src/mojoboost/hybrid_leaf_scheduler.mojo",
+    "src/mojoboost/levelwise_policy.mojo",
+    "src/mojoboost/histogram_cache_policy.mojo",
+]
+fallback = ["native:compile-package"]
+reason = "Scheduling policies. Pure arithmetic over device limits, imported by no suite."
+would_close_it = "A policy suite in the shape of tests/parallel/test_apple_gpu_policy.mojo, which is the one policy module that does have one. These are the cheapest gaps in this file to close: they need no accelerator."
+
+[[gap]]
+paths = [
+    "src/mojoboost/gpu_backend_policy.mojo",
+    "src/mojoboost/gpu_portability.mojo",
+]
+fallback = ["native:compile-package", "differential:gpu-portability"]
+reason = "Backend selection and the portability contract. No suite imports either module; tests/test_gpu_portability.mojo checks the kernels against the contract rather than the modules that state it."
+would_close_it = "Asserting the policy's choice for a table of device capability records."
+
+[[gap]]
+paths = [
+    "src/mojoboost/inspection.mojo",
+    "src/mojoboost/model_dump.mojo",
+]
+fallback = ["native:compile-package", "python:inspection"]
+reason = "No Mojo suite imports either. Their reachable behavior is covered from Python, one layer up, and split_gains has no binding at all."
+would_close_it = "A bindings function for split_gains, after which python:inspection would stop reporting has_split_gain false. Named in handoffs/integration_09_parity.md section 3 item 6."

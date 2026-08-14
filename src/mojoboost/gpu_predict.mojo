@@ -99,7 +99,7 @@ from .device_policy import (
     MAX_GPU_ROWS,
     MIN_GPU_BINS,
     block_reason_name,
-    build_has_accelerator,
+    gpu_available,
     gpu_disabled_by_env,
     gpu_supports_outputs,
 )
@@ -113,7 +113,16 @@ from .gpu_runtime import (
     bins_fingerprint,
 )
 from .gpu_tiling import DeviceCaps, derive_block_threads, query_device_caps
-from .metrics import check_metric_weight
+from .metrics import (
+    METRIC_BINARY_ERROR as HOST_METRIC_BINARY_ERROR,
+    METRIC_BINARY_LOGLOSS as HOST_METRIC_BINARY_LOGLOSS,
+    METRIC_L1 as HOST_METRIC_L1,
+    METRIC_L2 as HOST_METRIC_L2,
+    METRIC_MULTI_ERROR as HOST_METRIC_MULTI_ERROR,
+    METRIC_MULTI_LOGLOSS as HOST_METRIC_MULTI_LOGLOSS,
+    check_metric_weight,
+)
+from .objective_registry import metric_canonical_name
 from .tree import Tree
 
 
@@ -471,6 +480,74 @@ def response_for_objective(objective: Int) -> Int:
     return RESPONSE_IDENTITY
 
 
+# --- Host metric codes on the device ----------------------------------
+#
+# The METRIC_* codes above are this module's own, and nothing outside it
+# speaks them: a caller that already has a metric has metrics.mojo's code,
+# which is what `eval_metric` in the bindings, the metric suites, and the
+# registry all use. These three functions are the translation, so no caller
+# has to carry a second numbering, and they are the only place where the
+# device's metric set is compared against the host's.
+
+
+def device_metric_code(metric: Int) -> Int:
+    """The device kernel that computes metrics.mojo's `metric`, as one of
+    the METRIC_* codes above, or -1 when the device has no kernel for it.
+
+    Six of the twenty-one built-in metrics have one. The rest, the ranking
+    metrics, AUC, and every objective-parameterized loss, are scored on the
+    host from the raw scores `GpuPredictor.validation_raw` downloads, which
+    is what keeps their definition the one metrics.mojo ships.
+    """
+    if metric == HOST_METRIC_L2:
+        return METRIC_L2
+    if metric == HOST_METRIC_L1:
+        return METRIC_L1
+    if metric == HOST_METRIC_BINARY_LOGLOSS:
+        return METRIC_BINARY_LOG_LOSS
+    if metric == HOST_METRIC_MULTI_LOGLOSS:
+        return METRIC_MULTICLASS_LOG_LOSS
+    if metric == HOST_METRIC_BINARY_ERROR:
+        return METRIC_BINARY_ACCURACY
+    if metric == HOST_METRIC_MULTI_ERROR:
+        return METRIC_MULTICLASS_ACCURACY
+    return -1
+
+
+def device_metric_is_error(metric: Int) -> Bool:
+    """Whether metrics.mojo's `metric` is one of the two error rates, which
+    the device reduces as an accuracy and finishes as one minus it."""
+    return (
+        metric == HOST_METRIC_BINARY_ERROR
+        or metric == HOST_METRIC_MULTI_ERROR
+    )
+
+
+def device_metric_matches_host(metric: Int) -> Bool:
+    """Whether the device's definition of `metric` is metrics.mojo's term
+    for term, up to Float32 accumulation.
+
+    True for `l2` and `l1`, whose kernels sum the same per-row expression
+    the host does. False for the rest, and for different reasons worth
+    keeping apart:
+
+    - The log losses clamp at `_F32_PROB_FLOOR` rather than at 1e-15,
+      because Float32 cannot hold `1 - 1e-15` apart from 1. A confidently
+      wrong row saturates near 16.1 on the device where the host reports
+      34.5, and those rows are exactly the ones a log-loss stopping
+      decision turns on. This is the same reason `device_loss_metric` in
+      train_gpu.mojo leaves binary log loss off its list.
+    - The error rates share the host's definition exactly, but they are
+      discrete: a row whose probability sits within Float32 noise of 0.5,
+      or whose top two class scores are that close, can land on the other
+      side of the comparison and move the count by a whole row.
+
+    A caller whose decision has to be the host's should read the raw scores
+    and score them there; a caller reporting a metric can use the device's.
+    """
+    return metric == HOST_METRIC_L2 or metric == HOST_METRIC_L1
+
+
 # --- What GPU prediction covers ---------------------------------------
 #
 # A caller that is about to ask for `device="gpu"` prediction needs the
@@ -551,10 +628,10 @@ def gpu_predict_support(
     """Whether the GPU prediction path covers a request of this shape.
 
     `n_outputs` is 1 for a single-output ensemble and the class count for a
-    softmax one. `n_bins` is the binner's reserved bin count; leave it
-    `BINS_UNSPECIFIED` when the caller does not know it, and the bin gate is
-    skipped rather than guessed at. `sparse` reports the input's layout, not
-    a preference.
+    softmax one. `n_bins` is the binner's reserved bin count; anything
+    nonpositive (`BINS_UNSPECIFIED`, or the `-1` a flat boundary sends)
+    means the caller does not know it, and the bin gate is skipped rather
+    than guessed at. `sparse` reports the input's layout, not a preference.
 
     Ordered cheapest and most fundamental first, so the first block found is
     the one reported. Two things deliberately stay out of this record:
@@ -568,7 +645,7 @@ def gpu_predict_support(
       property of the model, not of the request, and it is checked where the
       trees are flattened, which is the only place the count is known.
     """
-    if not build_has_accelerator():
+    if not gpu_available():
         if gpu_disabled_by_env():
             return GpuPredictSupport.blocked(
                 BLOCK_GPU_DISABLED_ENV,
@@ -580,14 +657,6 @@ def gpu_predict_support(
         return GpuPredictSupport.blocked(
             BLOCK_NO_ACCELERATOR,
             String("no accelerator is available to this build"),
-        )
-    if gpu_disabled_by_env():
-        return GpuPredictSupport.blocked(
-            BLOCK_GPU_DISABLED_ENV,
-            String(
-                "MOJOBOOST_DISABLE_GPU=1 pins this process to the CPU"
-                " backend, so GPU prediction is unavailable"
-            ),
         )
     if sparse:
         return GpuPredictSupport.blocked(
@@ -611,9 +680,11 @@ def gpu_predict_support(
                 " most 2^31 - 1 rows"
             ),
         )
-    if n_bins != BINS_UNSPECIFIED and (
-        n_bins < MIN_GPU_BINS or n_bins > MAX_GPU_BINS
-    ):
+    # Nonpositive is undeclared, the rule `_normalized_bins` applies to
+    # every other flat boundary into the policy: Python sends -1 for "I do
+    # not know", a caller that left a field default sends 0, and neither is
+    # a bin count to gate on.
+    if n_bins > 0 and (n_bins < MIN_GPU_BINS or n_bins > MAX_GPU_BINS):
         return GpuPredictSupport.blocked(
             BLOCK_BIN_LIMIT,
             String(
@@ -1587,6 +1658,36 @@ def accumulate_rounds(
     )
     for i in range(len(trees) // n_outputs):
         predictor.accumulate_round(i)
+
+
+def validation_host_metric(
+    mut predictor: GpuPredictor, metric: Int, response: Int
+) raises -> Float64:
+    """Score the resident validation set with metrics.mojo's `metric` code.
+
+    The entry point for a caller that holds a host metric code and wants it
+    computed on the device where a kernel exists. A metric with no kernel
+    raises and names itself, rather than falling back to something adjacent:
+    a stopping decision made from a different loss is a different run, so
+    the choice to score on the host belongs to the caller, which does it by
+    downloading `validation_raw` and calling the metric suite.
+
+    `response` is the inverse link to apply first, `RESPONSE_SOFTMAX` for a
+    multiclass ensemble and `response_for_objective(objective)` otherwise.
+    """
+    var code = device_metric_code(metric)
+    if code < 0:
+        raise Error(
+            String(
+                "the GPU has no kernel for metric '",
+                metric_canonical_name(metric),
+                "'; download the validation raw scores and score them on",
+                " the host",
+            )
+        )
+    if device_metric_is_error(metric):
+        return predictor.validation_error(code, response)
+    return predictor.validation_metric(code, response)
 
 
 def accumulate_booster_rounds(

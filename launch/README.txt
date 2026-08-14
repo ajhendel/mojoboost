@@ -11,4 +11,9 @@ Recommended order:
 5. Post 05_SHOW_HN.txt only after a clean checkout can complete the five-minute README example and there is one reproducible end-to-end Apple GPU result.
 6. Post 06_CLAUDE_BUILD_STORY.txt separately if you want to discuss the parallel AI-assisted development process.
 
+CREATOR_BIO_AND_TALK_ABSTRACTS.txt contains short and long creator bios plus
+conference, meetup, podcast, and project-page descriptions. Use these when a
+site asks who built the project or when proposing a technical talk. They make
+the creator and maintainer role explicit without claiming unvalidated results.
+
 Do not claim near feature parity, production readiness, NVIDIA or AMD validation, or performance leadership unless the linked repository evidence has established it. The strongest current description is broad LightGBM-shaped feature surface with experimental-alpha maturity.

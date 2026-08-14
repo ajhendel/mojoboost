@@ -1,0 +1,377 @@
+"""Device explanation, run configuration checks, and startup diagnostics.
+
+The questions a caller asks *around* a fit rather than during one:
+
+- where would this run, and why (`decide_device_workload`);
+- are these tree parameters ones this build can honor
+  (`extra_params_check`, `extra_option_supported`, `forced_splits_check`);
+- is this bundling configuration reachable (`efb_check`, `efb_defaults`);
+- what does the process know about its own startup (`startup_*`).
+
+Every one of them is answered by native code that already exists. This
+module carries no policy, no threshold, no default, and no table: it
+converts a Python call into the native call and the native answer back.
+
+Argument shape. Several of these describe a workload or a parameter set
+with a dozen fields, and they cross as a Python mapping the way
+`_parse_params` in `_mojoboost.mojo` already reads one, rather than as a
+dozen positional arguments. Eight positional arguments are proven to
+register (`predict_range`); more is untested, and a mapping also lets a
+field be added without every caller's call site moving.
+`handoffs/performance_15_startup.md` states a six-argument cap on
+`def_function`, which the eight-argument entry points already in the
+module contradict; treat the number above six as unverified either way.
+
+Flags inside a mapping are 0/1 ints, and an undeclared optional is its
+documented sentinel, so the boundary converts no Python bool and carries
+no optional.
+"""
+
+from std.python import Python, PythonObject
+
+from binding_support import f64_buffer, flag, py_dict
+
+from mojoboost.device import decide_device_report
+from mojoboost.device_policy import BINS_UNSPECIFIED, OBJECTIVE_UNSPECIFIED
+from mojoboost.efb import (
+    EfbParams,
+    check_bundling_params,
+    check_bundling_supported,
+)
+from mojoboost.initialization import (
+    N_STARTUP_PHASES,
+    StartupTrace,
+    env_warmup_level,
+    origin_name,
+    phase_is_one_time,
+    phase_name,
+    phase_origin,
+    warmup_level_name,
+)
+from mojoboost.tree_parameters_extra import (
+    ExtraTreeParams,
+    FeaturePenalties,
+    check_extra_option_supported,
+    parse_forced_splits,
+    parse_monotone_method,
+)
+
+
+# -- device explanation --------------------------------------------------
+
+
+def decide_device_workload(
+    device: PythonObject, workload: PythonObject
+) raises -> PythonObject:
+    """Resolve a device request over a whole workload and return the
+    serialized decision.
+
+    **Register at most one device decision entry point.**
+    `handoffs/connect_05_device_policy.md` section 5.1 asks task 06 for a
+    ten-argument `decide_device` in `_mojoboost.mojo`, which is the shape
+    `_FullNativePolicy.decide` in device_selection.py already sends. This
+    is the same call with the workload packed into one mapping, and it
+    exists for one reason: if that ten-argument registration turns out to
+    exceed what `def_function` accepts, this is the drop-in that does not,
+    and the Python patch that goes with it is in
+    `handoffs/connect_14_bindings.md`. Eight arguments are proven in tree
+    (`predict_range`); ten are not. Register this *instead of*, never
+    alongside, the ten-argument form.
+
+    `device` is the requested name, `"cpu"`, `"gpu"`, or `"auto"`, already
+    lowercased by the caller. `workload` is a mapping with:
+
+    | key | meaning |
+    | --- | --- |
+    | `n_rows`, `n_features` | the training matrix's shape |
+    | `n_outputs` | trees per boosting round: 1, or the class count |
+    | `n_bins` | the estimator's `max_bin`, or a negative for undeclared |
+    | `objective` | a trainer objective code, or a negative for undeclared |
+    | `sparse` | the input is a sparse matrix (0/1) |
+    | `categorical` | the run declares categorical features (0/1) |
+    | `has_missing` | the run uses missing handling (0/1) |
+    | `uses_validation` | the run has an eval set (0/1) |
+
+    Returns the `key=value` lines `DeviceDecision.serialize` produces; see
+    `serialize` in device_policy.mojo for the format and
+    `python/mojoboost/device_selection.py` for the reader.
+
+    It does **not** raise for a workload the GPU path refuses: that
+    refusal is `blocked=true` with `message=` saying why, which is what
+    lets a caller ask "what would `device='gpu'` do here" without handling
+    an exception. It raises for a device name outside the vocabulary and
+    for a shape with no rows or no features, which are caller errors
+    rather than policy outcomes.
+
+    Two sentinel foldings happen here, and nowhere else:
+
+    - a negative `n_bins` becomes `BINS_UNSPECIFIED`, because the native
+      sentinel for "no bin count" is 0 and a Python caller that means
+      "undeclared" sends -1. Sending 0 would otherwise read as a bin count
+      of zero.
+    - a negative `objective` becomes `OBJECTIVE_UNSPECIFIED`. Both the
+      undeclared sentinel and the multiclass marker (-1) land there:
+      multiclass is a tree count, and `n_outputs` already carries it.
+
+    No device selection happens in this module. `decide_device_report` in
+    device.mojo forwards to the one policy engine in device_policy.mojo,
+    which detects capabilities itself.
+    """
+    var n_bins = Int(py=workload["n_bins"])
+    if n_bins < 0:
+        n_bins = BINS_UNSPECIFIED
+    var objective = Int(py=workload["objective"])
+    if objective < 0:
+        objective = OBJECTIVE_UNSPECIFIED
+    return PythonObject(
+        decide_device_report(
+            String(py=device),
+            Int(py=workload["n_rows"]),
+            Int(py=workload["n_features"]),
+            Int(py=workload["n_outputs"]),
+            n_bins,
+            objective,
+            flag(workload["sparse"], "sparse"),
+            flag(workload["categorical"], "categorical"),
+            flag(workload["has_missing"], "has_missing"),
+            flag(workload["uses_validation"], "uses_validation"),
+        )
+    )
+
+
+# -- extra tree parameters -----------------------------------------------
+
+
+def _penalties(
+    params: PythonObject, n_features: Int
+) raises -> FeaturePenalties:
+    """The per-feature costs from the params mapping.
+
+    `feature_contri` and `cegb_penalty_feature_coupled` arrive as float64
+    buffer addresses with `n_features` entries, 0 for absent, which is the
+    convention `_parse_monotone` already follows for its per-feature
+    column.
+    """
+    var out = FeaturePenalties()
+    var contri_addr = Int(py=params["feature_contri_addr"])
+    if contri_addr != 0:
+        out.contri = f64_buffer(contri_addr, n_features)
+    out.cegb_tradeoff = Float64(py=params["cegb_tradeoff"])
+    out.cegb_penalty_split = Float64(py=params["cegb_penalty_split"])
+    var coupled_addr = Int(py=params["cegb_penalty_feature_coupled_addr"])
+    if coupled_addr != 0:
+        out.cegb_penalty_feature_coupled = f64_buffer(
+            coupled_addr, n_features
+        )
+    return out^
+
+
+def _extra_params(
+    params: PythonObject, n_features: Int
+) raises -> ExtraTreeParams:
+    """The extra tree bundle from the params mapping. Reads only; every
+    range check is `ExtraTreeParams.check`'s."""
+    var out = ExtraTreeParams()
+    out.min_gain_to_split = Float64(py=params["min_gain_to_split"])
+    out.max_delta_step = Float64(py=params["max_delta_step"])
+    out.path_smooth = Float64(py=params["path_smooth"])
+    out.extra_trees = flag(params["extra_trees"], "extra_trees")
+    out.extra_seed = Int(py=params["extra_seed"])
+    out.monotone_penalty = Float64(py=params["monotone_penalty"])
+    out.monotone_method = parse_monotone_method(
+        String(py=params["monotone_constraints_method"])
+    )
+    out.penalties = _penalties(params, n_features)
+    var forced = String(py=params["forced_splits"])
+    if forced != "":
+        out.forced = parse_forced_splits(forced)
+    return out^
+
+
+def extra_params_check(
+    params: PythonObject, shape: PythonObject
+) raises -> PythonObject:
+    """Validate the extra tree parameters against the run they belong to,
+    and report what honoring them would require.
+
+    `params` carries the bundle in `src/mojoboost/tree_parameters_extra.mojo`:
+    `min_gain_to_split`, `max_delta_step`, `path_smooth`, `extra_trees`
+    (0/1), `extra_seed`, `monotone_penalty`,
+    `monotone_constraints_method` (LightGBM's name for it),
+    `cegb_tradeoff`, `cegb_penalty_split`, the two per-feature buffer
+    addresses `feature_contri_addr` and
+    `cegb_penalty_feature_coupled_addr` (0 for absent), and
+    `forced_splits`, the document's text or an empty string.
+
+    `shape` carries `n_features`, `num_leaves`, `max_depth`, and
+    `min_data_in_leaf`, because the vector lengths and the growth budget
+    are checked against the run actually being fitted.
+
+    Raises with the native message for a value out of range, for a vector
+    of the wrong length, for a forced-splits document that does not fit
+    the budget, and for the two options that are parsed but not applied
+    (`cegb_penalty_feature_coupled` and `forcedsplits_filename`), which
+    are refused by name rather than ignored.
+
+    Returns the four facts a caller needs to route the fit:
+    `is_active` (whether anything here would change it at all),
+    `needs_leaf_finish`, `needs_node_identity`, and
+    `needs_grower_support` (whether only a grower that opted in can honor
+    it). A caller holding `needs_grower_support` and a grower that has not
+    opted in should refuse rather than train something else.
+    """
+    var n_features = Int(py=shape["n_features"])
+    var extra = _extra_params(params, n_features)
+    extra.check(
+        n_features,
+        Int(py=shape["num_leaves"]),
+        Int(py=shape["max_depth"]),
+        Int(py=shape["min_data_in_leaf"]),
+    )
+    var out = py_dict()
+    out["is_active"] = PythonObject(extra.is_active())
+    out["needs_leaf_finish"] = PythonObject(extra.needs_leaf_finish())
+    out["needs_node_identity"] = PythonObject(extra.needs_node_identity())
+    out["needs_grower_support"] = PythonObject(extra.needs_grower_support())
+    return out^
+
+
+def extra_option_supported(name: PythonObject) raises -> PythonObject:
+    """Raise for a LightGBM tree option that is real but not implemented,
+    with the native message saying what it would take.
+
+    Returns None for every other name, including one this repository has
+    never heard of: "unknown parameter" is the caller's message about the
+    caller's parameter string, and is not this function's to give.
+    """
+    check_extra_option_supported(String(py=name))
+    return PythonObject(None)
+
+
+def forced_splits_check(
+    spec: PythonObject,
+    n_features: PythonObject,
+    num_leaves: PythonObject,
+    max_depth: PythonObject,
+) raises -> PythonObject:
+    """Validate a forced-splits document and report its shape.
+
+    Returns `n_nodes` and `depth`. This validates the document only:
+    applying a forced node means mapping its raw threshold to a bin, and
+    the grower is handed a `BinnedMatrix`, which carries no bin edges, so
+    `extra_params_check` refuses a run that carries one. Validating is
+    still worth doing early, because a forced-splits file is usually
+    written long before a fit.
+    """
+    var forced = parse_forced_splits(String(py=spec))
+    forced.check_features(Int(py=n_features))
+    forced.check_budget(Int(py=num_leaves), Int(py=max_depth))
+    var out = py_dict()
+    out["n_nodes"] = PythonObject(forced.n_nodes())
+    out["depth"] = PythonObject(forced.depth())
+    return out^
+
+
+# -- exclusive feature bundling ------------------------------------------
+
+
+def efb_check(
+    enable_bundle: PythonObject, params: PythonObject
+) raises -> PythonObject:
+    """Validate a bundling configuration.
+
+    `enable_bundle` is 0/1. `params` carries `max_conflict_rate`,
+    `max_bundle_bins`, `max_bundle_size`, `max_nondefault_rate`,
+    `min_reduction`, and `bundle_missing` (0/1).
+
+    The order matters and is the native order: whether bundling is
+    reachable at all, then whether the one knob whose cost is invisible
+    was touched, then the ranges. A silently unbundled fit is a correct
+    model and not the one that was asked for, and nothing in the metrics
+    would show it, so `enable_bundle=1` is refused by name with what it
+    would take. `enable_bundle=0` is accepted: it is LightGBM's own
+    default spelled out.
+    """
+    check_bundling_supported(flag(enable_bundle, "enable_bundle"))
+    check_bundling_params(Float64(py=params["max_conflict_rate"]))
+    var efb = EfbParams(
+        Float64(py=params["max_conflict_rate"]),
+        Int(py=params["max_bundle_bins"]),
+        Int(py=params["max_bundle_size"]),
+        Float64(py=params["max_nondefault_rate"]),
+        Float64(py=params["min_reduction"]),
+        flag(params["bundle_missing"], "bundle_missing"),
+    )
+    efb.check()
+    return PythonObject(None)
+
+
+def efb_defaults() raises -> PythonObject:
+    """The bundling knobs' defaults, so nobody restates LightGBM's numbers
+    in Python. Same keys `efb_check` reads."""
+    var d = EfbParams.default()
+    var out = py_dict()
+    out["max_conflict_rate"] = PythonObject(d.max_conflict_rate)
+    out["max_bundle_bins"] = PythonObject(d.max_bundle_bins)
+    out["max_bundle_size"] = PythonObject(d.max_bundle_size)
+    out["max_nondefault_rate"] = PythonObject(d.max_nondefault_rate)
+    out["min_reduction"] = PythonObject(d.min_reduction)
+    out["bundle_missing"] = PythonObject(d.bundle_missing)
+    return out^
+
+
+# -- startup diagnostics -------------------------------------------------
+
+
+def startup_phase_contract() raises -> PythonObject:
+    """The startup phases, in report order, as
+    `[index, name, origin, one_time]` records.
+
+    The names are the schema `python/mojoboost/diagnostics.py` parses and
+    docs/STARTUP_LATENCY.md documents, so this is how that table is
+    checked against the native one rather than kept in step by hand.
+    `origin` is `"supplied"` for the phases that are over before any Mojo
+    code runs and `"native"` for the rest; `one_time` is 0 for the phase a
+    second fit pays again and 1 for the phases it does not.
+    """
+    var out = Python.list()
+    for phase in range(N_STARTUP_PHASES):
+        var record = Python.list()
+        record.append(PythonObject(phase))
+        record.append(PythonObject(phase_name(phase)))
+        record.append(PythonObject(origin_name(phase_origin(phase))))
+        record.append(PythonObject(Int(phase_is_one_time(phase))))
+        out.append(record^)
+    return out^
+
+
+def startup_environment() raises -> PythonObject:
+    """What the process's environment asked of startup.
+
+    `trace_enabled` is `MOJOBOOST_STARTUP_TRACE`, and `warmup_level` is
+    `MOJOBOOST_GPU_WARMUP` as its name (`off`, `train`, or `all`), with an
+    unset or unrecognized value reading as `off` so an unknown value never
+    silently front-loads work.
+
+    This reports the request, not a measurement. No trace is collected
+    anywhere in this build: `StartupTrace` is deliberately not a
+    singleton, so there is no process-wide one to report, and a
+    `startup_report()` that returned an empty trace would say "every phase
+    took no time" when it means "nobody measured". See the handoff for
+    what an owner would have to hold for that call to exist.
+    """
+    var out = py_dict()
+    out["trace_enabled"] = PythonObject(StartupTrace.from_env().enabled)
+    out["warmup_level"] = PythonObject(warmup_level_name(env_warmup_level()))
+    return out^
+
+
+def native_clock_ns() raises -> PythonObject:
+    """The native monotonic clock, in nanoseconds.
+
+    The same clock a `StartupTrace` times phases with, read through an
+    enabled trace so it provably is that clock and not a second one. A
+    harness calls this immediately after `import mojoboost` to bound the
+    extension load it cannot measure from inside.
+    """
+    return PythonObject(StartupTrace(True).clock())

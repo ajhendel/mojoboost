@@ -70,6 +70,7 @@ from . import _arrays
 __all__ = [
     "DUMP_FORMAT_VERSION",
     "SUPPORTED_MODEL_FORMAT_VERSIONS",
+    "MODEL_EDITING_SUPPORTED",
     "OBJECTIVE_NAMES",
     "dump_model",
     "parse_model_string",
@@ -77,6 +78,9 @@ __all__ = [
     "trees_to_dataframe",
     "split_values",
     "get_split_value_histogram",
+    "feature_importance",
+    "leaf_outputs",
+    "model_editing_support",
     "leaf_index_of",
     "raw_scores",
     "booster_of",
@@ -96,9 +100,17 @@ DUMP_FORMAT_VERSION = 1
 
 #: Model file format versions (src/mojoboost/serialize.mojo) the fallback
 #: parser can read. v1 and v2 predate node covers, so a dump built from one
-#: reports `has_node_count: False`. The native dump reports the format the
-#: model would serialize to and reads nothing, so this does not bound it.
-SUPPORTED_MODEL_FORMAT_VERSIONS = (1, 2, 3)
+#: reports `has_node_count: False`; v1, v2, and v3 all predate split gains,
+#: so a dump built from one reports `has_split_gain: False`. The native
+#: dump reports the format the model would serialize to and reads nothing,
+#: so this does not bound it.
+SUPPORTED_MODEL_FORMAT_VERSIONS = (1, 2, 3, 4)
+
+#: Whether this build can edit a fitted model in place. Mirrors
+#: `MODEL_EDITING_SUPPORTED` in src/mojoboost/inspection.mojo, which is
+#: where the decision is stated; `model_editing_support()` gives the
+#: reasons. A consumer branches on this rather than on `hasattr`.
+MODEL_EDITING_SUPPORTED = False
 
 #: Objective code to LightGBM's canonical name for it. The codes are the
 #: trainer's, declared in src/mojoboost/boosting.mojo and mirrored by the
@@ -583,6 +595,93 @@ def get_split_value_histogram(
     )
 
 
+def feature_importance(model, importance_type="split"):
+    """Per-feature importance, from the same place `Booster` gets it.
+
+    `src/mojoboost/importance.mojo` is the one implementation, and this is
+    a delegation to it so that the inspection surface answers the question
+    without becoming a second answer. The per-feature sums of the dump's
+    `split_gain` equal the `"gain"` importance by construction, which is
+    the check worth writing against these two together.
+
+    A model whose gains did not survive reports zeros for `"gain"`: it was
+    read from a file written before model format v4. `dump_model(model)
+    ["has_split_gain"]` is what tells that apart from a measured zero.
+    """
+    return booster_of(model).feature_importance(importance_type)
+
+
+def leaf_outputs(model, tree_index=None, dump=None):
+    """The leaf values of one tree, or of every tree, by leaf ordinal.
+
+    Returns a list per tree, indexed by the ordinal
+    `predict(pred_leaf=True)` reports, so `outputs[t][leaf]` is the value
+    that leaf contributes. With `tree_index` it returns that one tree's
+    list. The values are unshrunk, as they are stored: what a tree
+    contributes to a raw score is `shrinkage * leaf_value` (see
+    `raw_scores`).
+
+    Read only. This is the half of LightGBM's leaf-output pair mojoboost
+    offers; `model_editing_support()` says why there is no setter.
+    """
+    if dump is None:
+        dump = dump_model(model)
+    trees = dump["tree_info"]
+    if tree_index is not None:
+        index = int(tree_index)
+        if not 0 <= index < len(trees):
+            raise ValueError(
+                f"tree {index} is outside the model's {len(trees)} trees"
+            )
+        trees = [trees[index]]
+    out = []
+    for tree in trees:
+        values = [None] * tree["num_leaves"]
+        stack = [tree["tree_structure"]]
+        while stack:
+            node = stack.pop()
+            if "leaf_index" in node:
+                values[node["leaf_index"]] = node["leaf_value"]
+                continue
+            stack.append(node["left_child"])
+            stack.append(node["right_child"])
+        out.append(values)
+    return out[0] if tree_index is not None else out
+
+
+def model_editing_support():
+    """Whether a fitted model can be edited in place, and why not.
+
+    An explicit status rather than a missing method, so a consumer asking
+    "can I set a leaf value?" gets an answer to branch on. The reasons are
+    the invariants a fitted tree records about the fit that produced it:
+    an arbitrary leaf edit falsifies each one and leaves it in place, and
+    both node covers and split gains are serialized (model format v4), so
+    the contradiction would outlive the session that made it.
+
+    `src/mojoboost/inspection.mojo` states the same status natively, in
+    `model_editing_status_json`; the two move together.
+    """
+    return {
+        "supported": MODEL_EDITING_SUPPORTED,
+        "operation": "set_leaf_output",
+        "reason": (
+            "a fitted tree records facts about the fit that produced it; "
+            "an arbitrary leaf edit falsifies them and leaves them in place"
+        ),
+        "invariants": [
+            "node covers are the training rows that reached a node, and "
+            "exact feature contributions condition on them",
+            "an internal node's value is the value it held when it was "
+            "created, not a function of its children",
+            "a split gain was computed from the gradient sums a leaf held "
+            "at growth time, which the tree no longer holds",
+        ],
+        "serialized_state": ["count", "split_gain"],
+        "read_only_alternative": "leaf_outputs",
+    }
+
+
 # -- routing the dump ----------------------------------------------------
 #
 # Both of these take either a live model or a dump. A live model routes in
@@ -838,6 +937,7 @@ def parse_model_string(text):
         )
 
     out = {"model_format_version": version}
+    out["feature_names"] = _parse_feature_names(reader)
     head = reader.next()
     if head == "multiclass":
         out["kind"] = "multiclass"
@@ -868,6 +968,63 @@ def parse_model_string(text):
     out["monotone"] = _parse_monotone(reader, n_features)
     out["trees"] = _parse_trees(reader, version)
     return out
+
+
+#: The escapes `_escape_name` in src/mojoboost/serialize.mojo writes. A
+#: feature name is one whitespace-free token in the model file, so the four
+#: whitespace characters and the backslash travel escaped.
+_NAME_ESCAPES = {
+    "s": " ",
+    "t": "\t",
+    "n": "\n",
+    "r": "\r",
+    "\\": "\\",
+}
+
+#: The token an empty feature name travels as: an empty string is not a
+#: token at all.
+_EMPTY_NAME_TOKEN = "\\e"
+
+
+def _unescape_name(token):
+    """One feature name from its token, the inverse of `_escape_name` in
+    src/mojoboost/serialize.mojo."""
+    if token == _EMPTY_NAME_TOKEN:
+        return ""
+    out = []
+    i = 0
+    while i < len(token):
+        char = token[i]
+        if char != "\\":
+            out.append(char)
+            i += 1
+            continue
+        if i + 1 >= len(token):
+            raise ValueError("corrupt feature name: token ends in an escape")
+        escape = token[i + 1]
+        if escape not in _NAME_ESCAPES:
+            raise ValueError(
+                f"corrupt feature name: unknown escape {escape!r}"
+            )
+        out.append(_NAME_ESCAPES[escape])
+        i += 2
+    return "".join(out)
+
+
+def _parse_feature_names(reader):
+    """The optional v4 `feature_names` section, or None.
+
+    None is not the same as `Column_0, Column_1, ...`: it says the file
+    names nothing, which is every file written before v4 and every model
+    saved without names.
+    """
+    if reader.peek() != "feature_names":
+        return None
+    reader.expect("feature_names")
+    n = reader.next_int()
+    if n < 1:
+        raise ValueError("corrupt feature_names section: nonpositive count")
+    return [_unescape_name(reader.next()) for _ in range(n)]
 
 
 def _parse_mapper(reader, version):
@@ -953,10 +1110,26 @@ def _parse_trees(reader, version):
         else:
             tree["default_left"] = [False] * n_nodes
             tree["missing_bin"] = [-1] * n_nodes
-        if version >= 3:
+        # v4 puts a presence flag in front of the covers, so a tree that
+        # never had any (one loaded from a v1 or v2 file and re-saved) says
+        # so instead of writing zeros that read as corrupt covers.
+        if version >= 4:
+            reader.expect("counts")
+            has_counts = reader.next_int() != 0
+        else:
+            has_counts = version >= 3
+        if has_counts:
             tree["count"] = reader.floats(n_nodes)
         else:
             tree["count"] = [0.0] * n_nodes
+        # v4: per-node split gains, behind the same kind of flag. None, and
+        # not a list of zeros, is what "this tree carries no gains" means:
+        # every earlier format dropped them.
+        tree["split_gain"] = None
+        if version >= 4:
+            reader.expect("gains")
+            if reader.next_int() != 0:
+                tree["split_gain"] = reader.floats(n_nodes)
         # The per-tree category sets, written only by a tree that has a
         # categorical node.
         if version >= 2 and reader.peek() == "cat":
@@ -975,19 +1148,29 @@ def _parse_trees(reader, version):
 
 def _model_text(model):
     """The model text and the feature names for whatever was handed in: an
-    estimator, a `Booster`, or the text itself."""
+    estimator, a `Booster`, or the text itself.
+
+    The names are the ones the `Booster` actually carries and not what
+    `feature_name()` reports, which invents `Column_0, Column_1, ...` when
+    there are none. The difference matters here: a file can carry real
+    names (v4), and invented ones must not outrank them.
+    """
     if isinstance(model, str):
         return model, None
     booster = _booster(model)
-    return booster.model_to_string(), list(booster.feature_name())
+    carried = getattr(booster, "_names", None)
+    return (
+        booster.model_to_string(),
+        None if carried is None else [str(name) for name in carried],
+    )
 
 
 def _native_split_gains(model):
     """Per node split gains, one list per tree, when the extension module
     exposes the small hook and not the whole dump.
 
-    Gains are recorded during growth and are not serialized, so this is the
-    one thing the model text cannot supply.
+    Model format v4 serializes gains, so this is only asked when the text
+    is older than that: the handle still holds what the file dropped.
     """
     booster = _booster(model)
     hook = _hook(booster, "split_gains")
@@ -996,13 +1179,35 @@ def _native_split_gains(model):
     return hook(booster._handle)
 
 
+def _text_gains(raw):
+    """Per node gains for every tree, or None when the text carries none.
+
+    A v4 file records gains per tree, and a tree that recorded none (every
+    leaf, and every tree from a model loaded out of an older file) writes
+    the flag rather than an array. Zeros stand in for those, so the shape
+    is one list per tree either way, exactly as the hook's is.
+    """
+    trees = raw["trees"]
+    if not any(tree["split_gain"] is not None for tree in trees):
+        return None
+    return [
+        tree["split_gain"]
+        if tree["split_gain"] is not None
+        else [0.0] * len(tree["feature"])
+        for tree in trees
+    ]
+
+
 def _dump_from_text(model, feature_names=None):
     """The documented schema, rebuilt from the model text."""
     text, carried_names = _model_text(model)
     raw = parse_model_string(text)
     source = "model_to_string"
-    gains = None
-    if not isinstance(model, str):
+    # The text is the first source asked, because from v4 on it carries the
+    # gains itself. The hook is what gives a model written in an older
+    # format its gains back, and only a live handle still has them.
+    gains = _text_gains(raw)
+    if gains is None and not isinstance(model, str):
         native = _native_split_gains(model)
         if native is not None:
             source = "model_to_string+split_gains"
@@ -1015,7 +1220,9 @@ def _dump_from_text(model, feature_names=None):
                 )
 
     n_features = raw["mapper"]["n_features"]
-    names = _resolve_names(feature_names, carried_names, n_features)
+    names = _resolve_names(
+        feature_names, carried_names, raw["feature_names"], n_features
+    )
     infos = _feature_infos(raw, names)
     n_classes = raw["n_classes"]
     n_trees = len(raw["trees"])
@@ -1063,11 +1270,19 @@ def _dump_from_text(model, feature_names=None):
     }
 
 
-def _resolve_names(override, carried, n_features):
+def _resolve_names(override, carried, from_file, n_features):
+    """The names to report, most authoritative first.
+
+    A caller's override wins; then the names the live `Booster` carries,
+    which are the training set's; then the names the file carries, which is
+    all a model read back from disk has (v4 and later). `Column_i` is the
+    last resort and is not a name the model claims.
+    """
     if override is not None:
         return _resolve_override(override, n_features)
-    if carried is not None and len(carried) == n_features:
-        return [str(name) for name in carried]
+    for names in (carried, from_file):
+        if names is not None and len(names) == n_features:
+            return [str(name) for name in names]
     return [f"Column_{i}" for i in range(n_features)]
 
 

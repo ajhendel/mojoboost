@@ -1,0 +1,64 @@
+MOJOBOOST CREATOR BIO AND TALK MATERIALS
+
+These are ready to copy. Select the length requested by the destination. Do not add performance numbers until the repository contains a reproducible result supporting them.
+
+
+ONE-LINE BIO
+
+Andrew Hendel is the creator and lead maintainer of mojoboost, an open-source gradient-boosted-tree library written natively in Mojo with a focus on Apple Silicon GPU acceleration.
+
+
+SHORT BIO
+
+Andrew Hendel created and maintains mojoboost, an experimental open-source gradient-boosted decision-tree library written natively in Mojo. He directs the project's architecture, product strategy, public API, accelerator work, and release standards. The project explores whether familiar Python tree models can make effective use of the GPU already inside Apple Silicon Macs while retaining a dependable CPU path. Andrew has developed mojoboost with extensive AI coding assistance and writes openly about the integration, validation, and accountability challenges of that approach.
+
+
+LONG BIO
+
+Andrew Hendel is the creator and lead maintainer of mojoboost, an Apache-2.0 gradient-boosted decision-tree library written natively in Mojo. He originated the project to investigate whether a modern native implementation could combine a LightGBM-familiar Python experience with first-class acceleration on the GPU already present in Apple Silicon Macs.
+
+Andrew directs mojoboost's product and technical strategy across tree-learning algorithms, native data structures, Python and C interfaces, serialization, CPU and GPU execution, packaging, compatibility, and public evidence standards. He has coordinated the project using extensive AI-assisted parallel development. Rather than presenting generated code volume as proof, mojoboost explicitly tracks whether each capability is implemented, connected, publicly reachable, focused-tested, differentially tested, hardware-validated, and release-packaged.
+
+The project remains an experimental alpha. Andrew's current focus is converting its broad implementation into a cleanly installable, reproducibly correct, and honestly benchmarked library.
+
+
+PROJECT-PAGE DESCRIPTION
+
+mojoboost is an experimental gradient-boosted-tree library created by Andrew Hendel and written natively in Mojo. It combines histogram-based, leaf-wise tree learning with a LightGBM-familiar Python API and native CPU and GPU execution. Its initial hardware focus is Apple Silicon: using the Metal GPU already inside a Mac without requiring CUDA or an external accelerator. The project is Apache-2.0 and publishes explicit parity, integration, and hardware-evidence records rather than treating source-code presence as proof of support.
+
+
+TALK TITLE 1
+
+Building gradient-boosted trees for the GPU already inside a Mac
+
+TALK ABSTRACT 1
+
+Gradient-boosted trees are irregular GPU workloads: each split changes the active rows, candidate leaves, and next operation. A naive implementation can spend more time scanning irrelevant rows and synchronizing with the CPU than accumulating useful histograms. This talk presents the architecture of mojoboost, a Mojo-native GBDT library created to explore Apple Silicon acceleration. It covers active-row compaction, batched leaf histograms, packed bins, device-side objectives and split selection, persistent GPU state, CPU fallbacks, and the difference between a fast kernel and a faster end-to-end Python fit. It also explains the evidence required before an experimental GPU path becomes a product claim.
+
+
+TALK TITLE 2
+
+What parallel coding agents taught me about integration debt
+
+TALK ABSTRACT 2
+
+Parallel coding agents can produce feature breadth at extraordinary speed. They can also produce duplicate registries, alternate trainers, disconnected modules, and impressive-looking code that no public path calls. Andrew Hendel describes creating mojoboost with extensive AI assistance and the engineering practices needed to keep one evolving systems project coherent: exclusive file ownership, constrained execution budgets, explicit capability levels, static reachability audits, integration rounds, conservative fallbacks, and evidence-based claims. The talk treats orchestration and accountability as engineering work and separates code generation from verified product capability.
+
+
+PODCAST OR INTERVIEW INTRODUCTION
+
+Andrew Hendel created mojoboost, an open-source gradient-boosted-tree library written in Mojo. The project is aimed at a deceptively difficult problem: making irregular tree training use the GPU inside an Apple Silicon Mac while keeping a familiar Python API and a reliable CPU fallback. Andrew has also used mojoboost as a large-scale experiment in AI-assisted software development, coordinating many parallel coding workstreams while building explicit processes for integration and validation.
+
+
+ATTRIBUTION LINE FOR ARTICLES AND SLIDES
+
+mojoboost was created by Andrew Hendel and is developed publicly under the Apache License 2.0.
+
+
+LINKS
+
+Project: https://github.com/ajhendel/mojoboost
+Creator: https://github.com/ajhendel
+Architecture: https://github.com/ajhendel/mojoboost/blob/main/docs/ARCHITECTURE.md
+Project origin: https://github.com/ajhendel/mojoboost/blob/main/docs/PROJECT_ORIGIN.md
+Technical article: https://github.com/ajhendel/mojoboost/blob/main/docs/technical/BUILDING_MOJOBOOST.md

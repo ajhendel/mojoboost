@@ -11,15 +11,44 @@ is used to compute.
 This module searches the histogram where it already lives. The kernels here
 consume the same fixed-point `[grad | hess | count]` Int32 buffer
 `GpuHistogramBuilder` produces and emit one compact **split record**: the
-winning feature, threshold or category set, gain, missing direction, both
-children's statistics, and both children's leaf values. That record is the
-only thing that crosses back to the host, so a node costs a fixed ~100 bytes
-instead of a histogram.
+winning feature, threshold or category set, gain, runner-up gain, missing
+direction, both children's statistics, and both children's leaf values. That
+record is the only thing that crosses back to the host, so a node costs a
+fixed 136 bytes instead of a histogram.
 
-Nothing here is wired into the trainer yet; `handoffs/apple_a2_split_search.md`
-carries the exact integration. The module is standalone and testable on its
+`train_gpu.mojo` drives this per node today, under
+`SPLIT_SEARCH_DEVICE`. The module is also standalone and testable on its
 own: it owns a histogram buffer that a caller can upload to directly, and
 `enqueue` also accepts an external device buffer for the zero-copy path.
+
+One node, or a whole frontier
+-----------------------------
+Every per-node table has a slot per record: the feature set, the allow
+mask, the float parameters (which carry the node's monotone bounds), and
+the histogram offset. `enqueue_frontier` stages a bounded set of leaves,
+issues one copy per table, and runs one scan and one reduction over all of
+them; `download_frontier` is the single wait that brings every decision
+back. That is one host synchronization per tree level rather than the two
+per node the incremental loop pays, and it is what the record layout was
+designed for. The batch changes nothing about a decision: each node reads
+only its own slots, the scan order inside a node is unchanged, and the
+records are the ones the same nodes searched one at a time would produce.
+
+Float32 near ties, and the host-scan fallback
+---------------------------------------------
+The scan is Float32 (point 1 below), so two candidates whose exact gains
+differ by less than a few ulps can come back in either order, and that is a
+different *tree*, not a different last bit. Every record therefore carries
+`runner_gain`, the best gain of every candidate the node scored except the
+winner, over every scanned feature, so the margin the decision was made by
+is a number the host can see. `GpuSplitRecord.is_near_tie` tests the margin
+against a relative tolerance (`SPLIT_TIE_RELATIVE`, deliberately several
+ulps wide), and `host_rescan_recommended` is the policy: a run that needs
+CPU/GPU agreement redoes exactly those nodes with the host scan, one node
+at a time, and keeps the device decision everywhere else. Tracking the
+runner-up costs one compare per candidate and cannot change which candidate
+wins. `frontier_margin` reports the same quantity one level up, where it
+decides which leaf splits next.
 
 Semantics
 ---------
@@ -64,11 +93,12 @@ Layout
 ------
 The search runs as two kernels and never allocates per node:
 
-- `_scan_slot_kernel`, one threadgroup per active feature, writes that
-  feature's best candidate into a per-slot record.
-- `_reduce_slots_kernel`, a single thread, folds the per-slot records into
-  one record in ascending slot order and fills in the child statistics,
-  child leaf values, and the parent's leaf value.
+- `_scan_slot_kernel`, one threadgroup per (node, active feature), writes
+  that feature's best candidate for that node into a per-slot record.
+- `_reduce_slots_kernel`, one thread per node, folds that node's per-slot
+  records into one record in ascending slot order and fills in the child
+  statistics, child leaf values, the parent's leaf value, and the node's
+  runner-up gain.
 
 The scan is sequential within a feature because the candidate order *is* the
 tie-breaking rule, and because a threshold scan is a prefix sum. Features are
@@ -82,14 +112,19 @@ prefix sums are exact integers.
 Toward a device-side queue
 --------------------------
 `max_records` lets one searcher hold several leaves' records at once, and
-`pick_best_record` reduces a set of them to the single best-gain leaf,
-tie-broken by ascending record index. That is the seed of a fully
-device-side leaf-wise frontier: today the host downloads one record per node
-and drives growth; next the host downloads one record per *tree level*; last
-the frontier itself lives in `rec_i_dev`/`rec_f_dev` and the host only reads
-the finished tree. Nothing in the record layout has to change for that, which
-is why the record carries child statistics and leaf values rather than making
-the host recompute them from a histogram it no longer has.
+`enqueue_pick_best` reduces a set of them to the single best-gain leaf,
+tie-broken by ascending record index. The staircase this module was built
+for is: the host downloads one record per node (the incremental loop); the
+host downloads one record per *tree level* (`enqueue_frontier` plus
+`download_frontier`, which is now here); the frontier itself lives in
+`rec_i_dev`/`rec_f_dev` and the host only reads the finished tree.
+
+The last step is the only one still missing, and what it needs is not in
+this module: a device-side row partition and leaf-value commit, so that a
+split can be applied without the host deciding it. Nothing in the record
+layout has to change for it, which is why the record carries child
+statistics and leaf values rather than making the host recompute them from
+a histogram it no longer has.
 """
 
 from std.gpu import block_idx
@@ -929,6 +964,11 @@ struct GpuSplitRecord(Copyable, Movable, Writable):
     `2 * bin` with the missing rows left, `2 * bin + 1` with them right, and
     -1 for a categorical partition or no split. Diagnostic only; the
     tie-breaking rule is the scan order itself."""
+    var runner_gain: Float64
+    """The best gain of every candidate this node scored except the winner,
+    over every scanned feature. `gain - runner_gain` is the margin the
+    decision was made by, and `is_near_tie` is the test a caller applies to
+    it."""
 
     def __init__(out self):
         """The absence of a split, with zero statistics."""
@@ -946,6 +986,44 @@ struct GpuSplitRecord(Copyable, Movable, Writable):
         self.right_value = 0.0
         self.parent_value = 0.0
         self.ordinal = -1
+        self.runner_gain = 0.0
+
+    def margin(self) -> Float64:
+        """How far ahead of the runner-up the winning candidate scored.
+
+        Zero when nothing was found and when the two best candidates scored
+        exactly alike, in which case the scan order decided, which is
+        deterministic but is a decision the host would have made on
+        Float64 gains instead.
+        """
+        if not self.found:
+            return 0.0
+        var m = self.gain - self.runner_gain
+        return m if m > 0.0 else 0.0
+
+    def is_near_tie(
+        self, relative: Float64 = SPLIT_TIE_RELATIVE
+    ) -> Bool:
+        """Whether this node's decision is inside Float32's resolution.
+
+        The device scans in Float32, so two candidates whose exact gains
+        differ by less than a few Float32 ulps can come back in either
+        order; when they do, the split chosen here can differ from the one
+        the host's Float64 scan would have chosen, and the difference is a
+        different tree, not a different last bit of a value.
+
+        This is the test, and `host_rescan_recommended` is the policy built
+        on it: a node that answers True is a node to redo with the host
+        scan when the caller needs CPU/GPU agreement. A node with no
+        runner-up (one candidate, or one feature with one admissible bin)
+        is never near a tie whatever the margin.
+        """
+        if not self.found or self.runner_gain <= 0.0:
+            return False
+        var scale = abs(self.gain)
+        if scale < abs(self.runner_gain):
+            scale = abs(self.runner_gain)
+        return self.margin() <= relative * scale
 
     def to_split_info(self) -> SplitInfo:
         """The `SplitInfo` the existing growers consume, so the device path
@@ -986,6 +1064,150 @@ struct GpuSplitRecord(Copyable, Movable, Writable):
 
     def write_repr_to(self, mut writer: Some[Writer]):
         self.write_to(writer)
+
+
+def host_rescan_recommended(
+    record: GpuSplitRecord,
+    tie_relative: Float64 = SPLIT_TIE_RELATIVE,
+    enabled: Bool = True,
+) raises -> Bool:
+    """The conservative fallback contract, in one place.
+
+    True when this node's decision should be redone by the host scan
+    because the device could not separate its two best candidates in
+    Float32. The caller's part of the contract is what it does with a True:
+    download that node's histogram (`GpuHistogramBuilder.download_raw` and
+    `histogram_from_host`, which the host-search path already calls for
+    every node) and take `_search`'s answer for that node instead of this
+    record's. Nothing else about the node changes: the row counts, the
+    child statistics, and the partition are recomputed by the host scan
+    from the same histogram.
+
+    The fallback is per node, not per tree. A tie at one node says nothing
+    about the next one, and a whole-tree fallback would give up the
+    transfer saving on every node to fix the handful that are close.
+
+    `enabled` is the caller's switch. A run that does not need CPU/GPU
+    agreement (the default posture of the device search, whose gains are
+    documented as Float32) passes False and keeps every decision on the
+    device; a parity run passes True. Left as a parameter rather than read
+    from the environment here, because the trainer already owns the split
+    strategy resolution and one place should decide it.
+
+    Raises for a nonpositive tolerance, which would silently disable the
+    check.
+    """
+    if tie_relative <= 0.0:
+        raise Error("the near-tie tolerance must be positive")
+    if not enabled:
+        return False
+    return record.is_near_tie(tie_relative)
+
+
+def frontier_margin(records: List[GpuSplitRecord]) raises -> Float64:
+    """How much better the best leaf of a frontier is than the next best.
+
+    The node-level margin's counterpart at the level above: which leaf a
+    leaf-wise grower splits next is also decided by comparing gains, so a
+    frontier whose two best leaves are within Float32 of each other can
+    grow a differently *shaped* tree than the host would, even when every
+    node's own decision is unambiguous.
+
+    Returns 0.0 when fewer than two leaves offer a split, which is the
+    case where the order cannot matter. The trainer's tie-break (lowest
+    frontier index wins) is unchanged and deterministic either way; this
+    only reports how close the call was.
+    """
+    var best = 0.0
+    var second = 0.0
+    var seen = 0
+    for i in range(len(records)):
+        if not records[i].found:
+            continue
+        var g = records[i].gain
+        seen += 1
+        if seen == 1 or g > best:
+            if seen > 1 and best > second:
+                second = best
+            best = g
+        elif g > second:
+            second = g
+    if seen < 2:
+        return 0.0
+    var m = best - second
+    return m if m > 0.0 else 0.0
+
+
+# --- Which configurations the device search can serve ---------------------
+
+comptime SEARCH_OK = 0
+comptime SEARCH_EXTRA_PARAMS = 1
+comptime SEARCH_FEATURE_BYLEVEL = 2
+comptime SEARCH_TOO_MANY_BINS = 3
+
+
+def device_search_eligibility(
+    n_bins: Int,
+    extra_active: Bool,
+    feature_fraction_bylevel_active: Bool,
+) raises -> Int:
+    """Which reason, if any, keeps a configuration off the device split
+    search.
+
+    The kernels score from `GpuSplitParams` alone: the two lambdas, the two
+    child floors, and the categorical parameters. There is nowhere in them
+    to charge a gain floor, a per-feature multiplier, a CEGB cost, a
+    monotone penalty, a drawn threshold, or a capped and smoothed child
+    output, and nowhere to draw a per-level feature subset, so a
+    configuration that asks for any of those is refused rather than served
+    a tree that quietly ignores it. The host scan honors all of them and is
+    the fallback for every code below.
+
+    Scalars rather than a `TreeParams`, so this module stays free of the
+    tree-parameter graph and the trainer can call it with
+    `params.extra.is_active()` and
+    `params.feature_fraction_bylevel != 1.0` without a new import in either
+    direction. `train_gpu._check_device_search_supported` is the caller
+    that should consume it; the handoff carries that patch.
+    """
+    if n_bins < 1:
+        raise Error("split search requires at least one bin")
+    if n_bins > MAX_SPLIT_BINS:
+        return SEARCH_TOO_MANY_BINS
+    if extra_active:
+        return SEARCH_EXTRA_PARAMS
+    if feature_fraction_bylevel_active:
+        return SEARCH_FEATURE_BYLEVEL
+    return SEARCH_OK
+
+
+def device_search_reason(code: Int) -> String:
+    """A sentence a caller can raise verbatim, worded as the trainer words
+    its own refusals today."""
+    if code == SEARCH_OK:
+        return String("the device split search can serve this configuration")
+    if code == SEARCH_EXTRA_PARAMS:
+        return String(
+            "the device split search does not implement min_gain_to_split,"
+            " max_delta_step, path_smooth, extra_trees, monotone_penalty,"
+            " feature_contri, or the CEGB costs; the kernel scores from"
+            " GpuSplitParams alone. Use the host split scan, which is the"
+            " default (MOJOBOOST_GPU_SPLIT_STRATEGY=host, or"
+            " split_search=SPLIT_SEARCH_HOST)"
+        )
+    if code == SEARCH_FEATURE_BYLEVEL:
+        return String(
+            "the device split search does not implement"
+            " feature_fraction_bylevel; the per-node draw it stages is taken"
+            " from the tree's feature set directly. Use the host split scan,"
+            " which is the default"
+        )
+    if code == SEARCH_TOO_MANY_BINS:
+        return String(
+            "the device split search supports at most 256 bins, which is the"
+            " widest histogram a threadgroup's shared scratch holds"
+        )
+    return String("unknown split search eligibility code")
 
 
 @fieldwise_init
@@ -1029,9 +1251,53 @@ def _bitset_from_words(words: List[Int32], offset: Int) -> CatBitset:
 # --- Host-side searcher ---------------------------------------------------
 
 
+struct SplitNodeRequest(Copyable, Movable):
+    """One leaf of a frontier, as a batched search takes it.
+
+    Everything here is per node; everything that is per tree or per run
+    (the two lambdas, the child floors, the categorical parameters, the
+    monotone sign vector, the missing-bin table) stays on the searcher or
+    on `GpuSplitParams`, so a batch stages only what actually varies.
+
+    The record slot a node's answer lands in is its position in the list
+    the batch was given, so a caller keeps its frontier and its records in
+    the same order and reads them back by index.
+    """
+
+    var hist_slot: Int
+    """Which histogram inside the buffer handed to the batch this node's
+    scan reads, in units of `3 * n_features * n_bins` Int32 words. Zero for
+    a single-node buffer; the pool slot for a caller holding a level's
+    histograms at once."""
+    var features: List[Int]
+    """This node's active features, global ids in scan order. Empty leaves
+    the record's current set alone, which is the tree-level set a caller
+    broadcast with `set_features`; a per-node draw
+    (`feature_fraction_bynode`) passes its own."""
+    var allowed: List[Bool]
+    """The interaction-constraint mask by global feature id, empty for
+    "every feature allowed"."""
+    var bounds: OutputBounds
+    """The node's monotone output interval, which is the one float
+    parameter that differs between the leaves of one tree."""
+
+    def __init__(
+        out self,
+        hist_slot: Int = 0,
+        var features: List[Int] = [],
+        var allowed: List[Bool] = [],
+        var bounds: OutputBounds = OutputBounds.unbounded(),
+    ):
+        self.hist_slot = hist_slot
+        self.features = features^
+        self.allowed = allowed^
+        self.bounds = bounds^
+
+
 def _launch_search(
     mut ctx: DeviceContext,
     mut hist: DeviceBuffer[DType.int32],
+    mut node: DeviceBuffer[DType.int32],
     mut feat: DeviceBuffer[DType.int32],
     mut allow: DeviceBuffer[DType.int32],
     mut missing: DeviceBuffer[DType.int32],
@@ -1044,21 +1310,33 @@ def _launch_search(
     mut rec_f: DeviceBuffer[DType.float32],
     n_bins: Int,
     hist_size: Int,
-    n_slots: Int,
+    feat_stride: Int,
+    widest_slots: Int,
+    record_base: Int,
+    n_records: Int,
     min_data_in_leaf: Int,
     constrained: Bool,
     cat_onehot_max: Int,
     cat_max_threshold: Int,
     cat_min_group: Int,
-    record: Int,
 ) raises:
-    """Enqueue the two kernels of one node's search.
+    """Enqueue the two kernels of one search, over `n_records` consecutive
+    nodes starting at `record_base`.
 
-    A free function over the context and the buffers rather than a method, so
-    the histogram buffer is an ordinary argument whether it belongs to this
-    searcher or to the histogram builder next to it."""
+    One node and a whole frontier take the same two launches; the batch is
+    the grid's second dimension. Everything that varies per node (the
+    feature set, the allow mask, the float parameters, the histogram
+    offset) is read from a per-record slot, and everything that does not
+    (the bin count, the tree's monotone vector, the categorical and
+    minimum-rows parameters) stays a kernel argument.
+
+    A free function over the context and the buffers rather than a method,
+    so the histogram buffer is an ordinary argument whether it belongs to
+    this searcher, to the histogram builder next to it, or to a multi-slot
+    batcher holding a whole level's histograms at once."""
     ctx.enqueue_function[_scan_slot_kernel](
         hist.unsafe_ptr(),
+        node.unsafe_ptr(),
         feat.unsafe_ptr(),
         allow.unsafe_ptr(),
         missing.unsafe_ptr(),
@@ -1069,12 +1347,14 @@ def _launch_search(
         slot_f.unsafe_ptr(),
         Int32(n_bins),
         Int32(hist_size),
+        Int32(record_base),
+        Int32(feat_stride),
         Int32(min_data_in_leaf),
         Int32(1) if constrained else Int32(0),
         Int32(cat_onehot_max),
         Int32(cat_max_threshold),
         Int32(cat_min_group),
-        grid_dim=n_slots,
+        grid_dim=(widest_slots, n_records),
         block_dim=1,
     )
     ctx.enqueue_function[_reduce_slots_kernel](
@@ -1082,10 +1362,11 @@ def _launch_search(
         slot_f.unsafe_ptr(),
         rec_i.unsafe_ptr(),
         rec_f.unsafe_ptr(),
+        node.unsafe_ptr(),
         fparam.unsafe_ptr(),
-        Int32(n_slots),
-        Int32(record),
-        grid_dim=1,
+        Int32(record_base),
+        Int32(feat_stride),
+        grid_dim=n_records,
         block_dim=1,
     )
 
@@ -1098,6 +1379,27 @@ struct GpuSplitSearcher(Movable):
     `search` (or `enqueue` + `download`) per node. Nothing is allocated per
     node: every buffer is sized at construction from `n_features`, `n_bins`,
     and `max_records`.
+
+    One node at a time, or a whole frontier
+    ---------------------------------------
+    Every per-node table has one slot per record: the feature set, the allow
+    mask, the float parameters (which carry the node's monotone output
+    bounds), and the histogram offset. That is what lets `enqueue_frontier`
+    stage a bounded set of leaves, launch them all, and wait once, instead
+    of waiting once per node as the node-at-a-time loop does. The two paths
+    run the same two kernels over the same slots and return the same
+    records; the batch only changes how many nodes one launch covers and
+    how often the host blocks.
+
+    The staging contract, which is what a caller has to respect:
+
+    - `enqueue_frontier` writes every record's slot first and issues one
+      copy per table, so nothing is overwritten while a copy of it is in
+      flight. `download_frontier` is the batch's single wait, and no new
+      staging may begin before it (or an explicit `synchronize`).
+    - `enqueue` and `search` stage one record and copy, which is the
+      node-at-a-time loop's existing contract: a node's `enqueue` is
+      followed by its `download` before the next node stages.
     """
 
     var ctx: DeviceContext
@@ -1108,6 +1410,11 @@ struct GpuSplitSearcher(Movable):
     # callers that stage a histogram through the host. The zero-copy path
     # passes the builder's own buffer to `enqueue` instead.
     var hist_dev: DeviceBuffer[DType.int32]
+    # Per-record tables. `feat_dev` and `allow_dev` are strided by
+    # `n_features` rather than by a batch's slot count, so narrowing one
+    # node's feature set never moves another node's row, which is the same
+    # choice `GpuLeafBatcher` makes for its item tables.
+    var node_dev: DeviceBuffer[DType.int32]
     var feat_dev: DeviceBuffer[DType.int32]
     var allow_dev: DeviceBuffer[DType.int32]
     var missing_dev: DeviceBuffer[DType.int32]
@@ -1118,15 +1425,22 @@ struct GpuSplitSearcher(Movable):
     var slot_f_dev: DeviceBuffer[DType.float32]
     var rec_i_dev: DeviceBuffer[DType.int32]
     var rec_f_dev: DeviceBuffer[DType.float32]
-    # Pinned staging for the two per-node tables, so a node's parameters
-    # upload as an ordinary asynchronous copy rather than through
-    # `map_to_host`, which synchronizes on every use. Reused every node: see
-    # the ordering contract on `enqueue`.
+    # Pinned staging for the per-node tables, so a node's parameters upload
+    # as an ordinary asynchronous copy rather than through `map_to_host`,
+    # which synchronizes on every use. One slot per record: see the staging
+    # contract above.
+    var stage_node: HostBuffer[DType.int32]
+    var stage_feat: HostBuffer[DType.int32]
     var stage_allow: HostBuffer[DType.int32]
     var stage_param: HostBuffer[DType.float32]
     var host_i: HostBuffer[DType.int32]
     var host_f: HostBuffer[DType.float32]
     var active: List[Int]
+    """The most recently broadcast feature set, and what `n_active`
+    reports. A record whose own set was narrowed by `set_features(...,
+    record=r)` carries its slot count in `active_len` instead."""
+    var active_len: List[Int]
+    """Feature slots per record, one entry per record slot."""
     var missing_bin: List[Int]
     var cat_n: List[Int]
     var constrained: Bool
@@ -1189,20 +1503,29 @@ struct GpuSplitSearcher(Movable):
         self.missing_bin = List[Int](capacity=n_features)
         self.cat_n = List[Int](capacity=n_features)
         self.active = List[Int](capacity=n_features)
+        self.active_len = List[Int](capacity=max_records)
         for f in range(n_features):
             self.missing_bin.append(
                 missing_bins[f] if len(missing_bins) > 0 else -1
             )
             self.cat_n.append(cats.n_categories(f) if cats.is_cat(f) else 0)
             self.active.append(f)
+        for _ in range(max_records):
+            self.active_len.append(n_features)
 
         var hist_size = n_features * n_bins
+        var table_cells = max_records * n_features
         self.hist_dev = self.ctx.enqueue_create_buffer[DType.int32](
             3 * hist_size
         )
-        self.feat_dev = self.ctx.enqueue_create_buffer[DType.int32](n_features)
+        self.node_dev = self.ctx.enqueue_create_buffer[DType.int32](
+            max_records * NODE_WORDS
+        )
+        self.feat_dev = self.ctx.enqueue_create_buffer[DType.int32](
+            table_cells
+        )
         self.allow_dev = self.ctx.enqueue_create_buffer[DType.int32](
-            n_features
+            table_cells
         )
         self.missing_dev = self.ctx.enqueue_create_buffer[DType.int32](
             n_features
@@ -1210,13 +1533,13 @@ struct GpuSplitSearcher(Movable):
         self.catn_dev = self.ctx.enqueue_create_buffer[DType.int32](n_features)
         self.mono_dev = self.ctx.enqueue_create_buffer[DType.int32](n_features)
         self.fparam_dev = self.ctx.enqueue_create_buffer[DType.float32](
-            PF_WORDS
+            max_records * PF_WORDS
         )
         self.slot_i_dev = self.ctx.enqueue_create_buffer[DType.int32](
-            n_features * SPLIT_IWORDS
+            table_cells * SPLIT_IWORDS
         )
         self.slot_f_dev = self.ctx.enqueue_create_buffer[DType.float32](
-            n_features * SPLIT_FWORDS
+            table_cells * SPLIT_FWORDS
         )
         self.rec_i_dev = self.ctx.enqueue_create_buffer[DType.int32](
             max_records * SPLIT_IWORDS
@@ -1224,11 +1547,17 @@ struct GpuSplitSearcher(Movable):
         self.rec_f_dev = self.ctx.enqueue_create_buffer[DType.float32](
             max_records * SPLIT_FWORDS
         )
+        self.stage_node = self.ctx.enqueue_create_host_buffer[DType.int32](
+            max_records * NODE_WORDS
+        )
+        self.stage_feat = self.ctx.enqueue_create_host_buffer[DType.int32](
+            table_cells
+        )
         self.stage_allow = self.ctx.enqueue_create_host_buffer[DType.int32](
-            n_features
+            table_cells
         )
         self.stage_param = self.ctx.enqueue_create_host_buffer[DType.float32](
-            PF_WORDS
+            max_records * PF_WORDS
         )
         self.host_i = self.ctx.enqueue_create_host_buffer[DType.int32](
             max_records * SPLIT_IWORDS
@@ -1237,14 +1566,27 @@ struct GpuSplitSearcher(Movable):
             max_records * SPLIT_FWORDS
         )
 
-        with self.feat_dev.map_to_host() as host:
-            var dst = host.unsafe_ptr()
+        # Every record starts as "every feature, all allowed, one histogram
+        # at offset zero", so a caller that never narrows a set and never
+        # batches (the node-at-a-time loop, and every existing caller) sees
+        # exactly the behavior it saw when these tables held one slot.
+        var dst_node = self.stage_node.unsafe_ptr()
+        var dst_feat = self.stage_feat.unsafe_ptr()
+        var dst_allow = self.stage_allow.unsafe_ptr()
+        var dst_param = self.stage_param.unsafe_ptr()
+        for r in range(max_records):
+            var nt = r * NODE_WORDS
+            dst_node.unsafe_store(nt + NODE_SLOTS, Int32(n_features))
+            dst_node.unsafe_store(nt + NODE_HIST_BASE, Int32(0))
             for f in range(n_features):
-                dst.unsafe_store(f, Int32(f))
-        with self.allow_dev.map_to_host() as host:
-            var dst = host.unsafe_ptr()
-            for f in range(n_features):
-                dst.unsafe_store(f, Int32(1))
+                dst_feat.unsafe_store(r * n_features + f, Int32(f))
+                dst_allow.unsafe_store(r * n_features + f, Int32(1))
+            for w in range(PF_WORDS):
+                dst_param.unsafe_store(r * PF_WORDS + w, Float32(0.0))
+        self.ctx.enqueue_copy(dst_buf=self.node_dev, src_ptr=dst_node)
+        self.ctx.enqueue_copy(dst_buf=self.feat_dev, src_ptr=dst_feat)
+        self.ctx.enqueue_copy(dst_buf=self.allow_dev, src_ptr=dst_allow)
+
         with self.missing_dev.map_to_host() as host:
             var dst = host.unsafe_ptr()
             for f in range(n_features):
@@ -1258,6 +1600,10 @@ struct GpuSplitSearcher(Movable):
             var dst = host.unsafe_ptr()
             for f in range(n_features):
                 dst.unsafe_store(f, Int32(MONOTONE_FREE))
+        # The three table copies above are asynchronous out of pinned
+        # buffers those tables reuse every node, so the session starts with
+        # them retired rather than in flight.
+        self.ctx.synchronize()
 
     def synchronize(self) raises:
         """Block until every enqueued device operation has completed."""
@@ -1267,11 +1613,76 @@ struct GpuSplitSearcher(Movable):
         """How many feature slots the next search scans."""
         return len(self.active)
 
-    def set_features(mut self, features: List[Int]) raises:
+    def _check_record(self, record: Int) raises:
+        if record < 0 or record >= self.max_records:
+            raise Error("record index out of range")
+
+    def _stage_features(
+        mut self, features: List[Int], record: Int
+    ) raises:
+        """Write one record's feature slots and slot count into the pinned
+        tables. Copies nothing: the caller decides when the tables go
+        across, which is what lets a frontier stage every node first."""
+        var dst = self.stage_feat.unsafe_ptr()
+        var base = record * self.n_features
+        for i in range(len(features)):
+            dst.unsafe_store(base + i, Int32(features[i]))
+        self.active_len[record] = len(features)
+        var node = self.stage_node.unsafe_ptr()
+        node.unsafe_store(
+            record * NODE_WORDS + NODE_SLOTS, Int32(len(features))
+        )
+
+    def _stage_allowed(
+        mut self, allowed: List[Bool], record: Int
+    ) raises:
+        """Write one record's allow mask, translated from global feature
+        ids into this record's slot order."""
+        var dst = self.stage_allow.unsafe_ptr()
+        var base = record * self.n_features
+        var n_slots = self.active_len[record]
+        var feat = self.stage_feat.unsafe_ptr()
+        for i in range(n_slots):
+            var f = Int(feat.unsafe_load(base + i))
+            var ok = True
+            if len(allowed) > 0:
+                ok = f < len(allowed) and allowed[f]
+            dst.unsafe_store(base + i, Int32(1) if ok else Int32(0))
+        for i in range(n_slots, self.n_features):
+            dst.unsafe_store(base + i, Int32(0))
+
+    def _copy_tables(mut self) raises:
+        """One copy per per-node table, covering every record slot."""
+        self.ctx.enqueue_copy(
+            dst_buf=self.node_dev, src_ptr=self.stage_node.unsafe_ptr()
+        )
+        self.ctx.enqueue_copy(
+            dst_buf=self.feat_dev, src_ptr=self.stage_feat.unsafe_ptr()
+        )
+        self.ctx.enqueue_copy(
+            dst_buf=self.allow_dev, src_ptr=self.stage_allow.unsafe_ptr()
+        )
+        self.ctx.enqueue_copy(
+            dst_buf=self.fparam_dev, src_ptr=self.stage_param.unsafe_ptr()
+        )
+
+    def set_features(
+        mut self, features: List[Int], record: Int = -1
+    ) raises:
         """Restrict later searches to `features` (global feature ids,
         ascending, one entry each), the same subsampled set
         `GpuHistogramBuilder.set_features` accumulated. Slot order is scan
-        order, so it also fixes the cross-feature tie-breaking."""
+        order, so it also fixes the cross-feature tie-breaking.
+
+        `record` of -1, the default, applies the set to every record slot,
+        which is what a tree-level or node-at-a-time caller means and what
+        this method has always done. A frontier that draws a different
+        subset per node (`feature_fraction_bynode`) passes the record it is
+        staging instead, and only that node's slots move.
+
+        Staged through pinned memory rather than a mapping, so it costs no
+        host synchronization; the copy goes out with the node's `enqueue`.
+        """
         if len(features) == 0:
             raise Error("active feature set must not be empty")
         if len(features) > self.n_features:
@@ -1279,36 +1690,42 @@ struct GpuSplitSearcher(Movable):
         for i in range(len(features)):
             if features[i] < 0 or features[i] >= self.n_features:
                 raise Error("feature index out of range")
+        if record >= 0:
+            self._check_record(record)
+            self._stage_features(features, record)
+            # The allow mask is indexed by slot, so a new slot order
+            # invalidates it; reset this record's to "every listed feature
+            # allowed" and let its `set_allowed` narrow it again.
+            self._stage_allowed(List[Bool](), record)
+            return
         self.active = features.copy()
-        with self.feat_dev.map_to_host() as host:
-            var dst = host.unsafe_ptr()
-            for i in range(len(features)):
-                dst.unsafe_store(i, Int32(features[i]))
-        # The allow mask is indexed by slot, so a new slot order invalidates
-        # it; reset it to "every listed feature allowed" and let the node's
-        # `set_allowed` narrow it again.
-        self.set_allowed()
+        for r in range(self.max_records):
+            self._stage_features(features, r)
+            self._stage_allowed(List[Bool](), r)
 
-    def set_allowed(mut self, allowed: List[Bool] = []) raises:
+    def set_allowed(
+        mut self, allowed: List[Bool] = [], record: Int = -1
+    ) raises:
         """This node's interaction-constraint allow mask, indexed by global
         feature id. Empty (the default) allows every feature; a mask shorter
         than `n_features` disallows the features past its end, exactly as
         `find_best_split` reads it.
 
         Indexed by slot on the device, so it is re-staged after every
-        `set_features`."""
-        var dst = self.stage_allow.unsafe_ptr()
-        for i in range(len(self.active)):
-            var f = self.active[i]
-            var ok = True
-            if len(allowed) > 0:
-                ok = f < len(allowed) and allowed[f]
-            dst.unsafe_store(i, Int32(1) if ok else Int32(0))
-        for i in range(len(self.active), self.n_features):
-            dst.unsafe_store(i, Int32(0))
-        self.ctx.enqueue_copy(
-            dst_buf=self.allow_dev, src_ptr=self.stage_allow.unsafe_ptr()
-        )
+        `set_features`. `record` of -1 applies the mask to every record
+        slot, as the node-at-a-time loop wants; a frontier passes the record
+        it is staging.
+
+        The copy is issued by `enqueue` or `enqueue_frontier` rather than
+        here, so a batch stages every node's mask before any of them
+        crosses.
+        """
+        if record >= 0:
+            self._check_record(record)
+            self._stage_allowed(allowed, record)
+            return
+        for r in range(self.max_records):
+            self._stage_allowed(allowed, r)
 
     def set_monotone(mut self, signs: List[Int] = []) raises:
         """This tree's active monotone constraint vector. Empty (the default)
@@ -1346,59 +1763,51 @@ struct GpuSplitSearcher(Movable):
         )
         self.ctx.synchronize()
 
-    def _upload_params(
+    def _stage_params(
         mut self,
         params: GpuSplitParams,
         g_scale: Float64,
         h_scale: Float64,
         bounds: OutputBounds,
+        record: Int,
     ) raises:
+        """Write one record's float parameter block, including its monotone
+        output bounds, which are the only per-node value in it. Copies
+        nothing; `_copy_tables` does."""
         if g_scale <= 0.0 or h_scale <= 0.0:
             raise Error("fixed-point scales must be positive")
         var dst = self.stage_param.unsafe_ptr()
-        dst.unsafe_store(PF_G_INV, Float32(1.0 / g_scale))
-        dst.unsafe_store(PF_H_INV, Float32(1.0 / h_scale))
-        dst.unsafe_store(PF_LAMBDA_L2, Float32(params.lambda_l2))
-        dst.unsafe_store(PF_LAMBDA_L1, Float32(params.lambda_l1))
-        dst.unsafe_store(PF_MIN_CHILD_HESS, Float32(params.min_child_hess))
-        dst.unsafe_store(PF_BOUND_LO, _f32_bound(bounds.lo))
-        dst.unsafe_store(PF_BOUND_HI, _f32_bound(bounds.hi))
-        dst.unsafe_store(PF_CAT_SMOOTH, Float32(params.cat.cat_smooth))
-        dst.unsafe_store(PF_CAT_L2, Float32(params.cat.cat_l2))
-        self.ctx.enqueue_copy(
-            dst_buf=self.fparam_dev, src_ptr=self.stage_param.unsafe_ptr()
+        var base = record * PF_WORDS
+        dst.unsafe_store(base + PF_G_INV, Float32(1.0 / g_scale))
+        dst.unsafe_store(base + PF_H_INV, Float32(1.0 / h_scale))
+        dst.unsafe_store(base + PF_LAMBDA_L2, Float32(params.lambda_l2))
+        dst.unsafe_store(base + PF_LAMBDA_L1, Float32(params.lambda_l1))
+        dst.unsafe_store(
+            base + PF_MIN_CHILD_HESS, Float32(params.min_child_hess)
         )
+        dst.unsafe_store(base + PF_BOUND_LO, _f32_bound(bounds.lo))
+        dst.unsafe_store(base + PF_BOUND_HI, _f32_bound(bounds.hi))
+        dst.unsafe_store(
+            base + PF_CAT_SMOOTH, Float32(params.cat.cat_smooth)
+        )
+        dst.unsafe_store(base + PF_CAT_L2, Float32(params.cat.cat_l2))
 
-    def enqueue(
+    def _launch(
         mut self,
         mut hist: DeviceBuffer[DType.int32],
         params: GpuSplitParams,
-        g_scale: Float64,
-        h_scale: Float64,
-        bounds: OutputBounds = OutputBounds.unbounded(),
-        record: Int = 0,
+        record_base: Int,
+        n_records: Int,
+        widest_slots: Int,
     ) raises:
-        """Enqueue the scan and reduction over `hist`, writing record slot
-        `record`. Does not transfer or synchronize.
-
-        `hist` is a device buffer of `3 * n_features * n_bins` Int32 words in
-        `GpuHistogramBuilder`'s `[grad | hess | count]` layout, and `g_scale`
-        / `h_scale` are the fixed-point scales that histogram was accumulated
-        with (`builder.g_scale`, `builder.h_scale`).
-
-        Ordering contract: the allow mask and the parameter block are staged
-        through one pinned buffer each, reused by every node, so a node's
-        `enqueue` must be followed by its `download` (or an explicit
-        `synchronize`) before the next node's `set_allowed`/`enqueue`
-        overwrites them. That is exactly the incremental integration's
-        one-node-at-a-time loop; a fully device-side queue needs a per-leaf
-        parameter slot instead."""
-        if record < 0 or record >= self.max_records:
-            raise Error("record index out of range")
-        self._upload_params(params, g_scale, h_scale, bounds)
+        """Copy the staged tables and launch the two kernels over
+        `n_records` consecutive record slots. The one place either entry
+        point reaches the device."""
+        self._copy_tables()
         _launch_search(
             self.ctx,
             hist,
+            self.node_dev,
             self.feat_dev,
             self.allow_dev,
             self.missing_dev,
@@ -1411,14 +1820,54 @@ struct GpuSplitSearcher(Movable):
             self.rec_f_dev,
             self.n_bins,
             self.n_features * self.n_bins,
-            len(self.active),
+            self.n_features,
+            widest_slots,
+            record_base,
+            n_records,
             params.min_data_in_leaf,
             self.constrained,
             params.cat.max_cat_to_onehot,
             params.cat.max_cat_threshold,
             params.cat.min_data_per_group,
-            record,
         )
+
+    def enqueue(
+        mut self,
+        mut hist: DeviceBuffer[DType.int32],
+        params: GpuSplitParams,
+        g_scale: Float64,
+        h_scale: Float64,
+        bounds: OutputBounds = OutputBounds.unbounded(),
+        record: Int = 0,
+        hist_slot: Int = 0,
+    ) raises:
+        """Enqueue the scan and reduction over `hist`, writing record slot
+        `record`. Does not transfer or synchronize.
+
+        `hist` is a device buffer of `3 * n_features * n_bins` Int32 words in
+        `GpuHistogramBuilder`'s `[grad | hess | count]` layout, and `g_scale`
+        / `h_scale` are the fixed-point scales that histogram was accumulated
+        with (`builder.g_scale`, `builder.h_scale`). `hist_slot` names which
+        histogram inside a multi-slot buffer to read, for a caller holding a
+        whole level's histograms at once (`GpuLeafBatcher.out_dev`, whose
+        slot stride is exactly `3 * n_features * n_bins`); it stays 0 for
+        the builder's single-node buffer.
+
+        Ordering contract: this stages one record and copies the tables, so
+        a node's `enqueue` is followed by its `download` (or an explicit
+        `synchronize`) before the next node stages. That is the
+        node-at-a-time loop, unchanged. A caller that wants a whole
+        frontier without a wait per node uses `enqueue_frontier`, which
+        stages every node before any table crosses."""
+        self._check_record(record)
+        if hist_slot < 0:
+            raise Error("histogram slot must be nonnegative")
+        self._stage_params(params, g_scale, h_scale, bounds, record)
+        self.stage_node.unsafe_ptr().unsafe_store(
+            record * NODE_WORDS + NODE_HIST_BASE,
+            Int32(hist_slot * 3 * self.n_features * self.n_bins),
+        )
+        self._launch(hist, params, record, 1, self.active_len[record])
 
     def enqueue_pick_best(
         mut self, n_records: Int, record: Int = 0
@@ -1486,33 +1935,110 @@ struct GpuSplitSearcher(Movable):
     ) raises -> GpuSplitRecord:
         """Search the histogram staged by `upload_histogram` and return its
         record."""
-        if record < 0 or record >= self.max_records:
-            raise Error("record index out of range")
-        self._upload_params(params, g_scale, h_scale, bounds)
-        _launch_search(
-            self.ctx,
-            self.hist_dev,
-            self.feat_dev,
-            self.allow_dev,
-            self.missing_dev,
-            self.catn_dev,
-            self.mono_dev,
-            self.fparam_dev,
-            self.slot_i_dev,
-            self.slot_f_dev,
-            self.rec_i_dev,
-            self.rec_f_dev,
-            self.n_bins,
-            self.n_features * self.n_bins,
-            len(self.active),
-            params.min_data_in_leaf,
-            self.constrained,
-            params.cat.max_cat_to_onehot,
-            params.cat.max_cat_threshold,
-            params.cat.min_data_per_group,
-            record,
+        self._check_record(record)
+        self._stage_params(params, g_scale, h_scale, bounds, record)
+        self.stage_node.unsafe_ptr().unsafe_store(
+            record * NODE_WORDS + NODE_HIST_BASE, Int32(0)
+        )
+        self._launch(
+            self.hist_dev, params, record, 1, self.active_len[record]
         )
         return self.download(record)
+
+    def enqueue_frontier(
+        mut self,
+        mut hist: DeviceBuffer[DType.int32],
+        nodes: List[SplitNodeRequest],
+        params: GpuSplitParams,
+        g_scale: Float64,
+        h_scale: Float64,
+    ) raises:
+        """Enqueue a whole frontier's searches in one pair of launches,
+        writing record slots `[0, len(nodes))`. Does not transfer and does
+        not synchronize.
+
+        This is the entry point that removes the wait per node. Every
+        node's feature set, allow mask, monotone bounds, and histogram slot
+        are written into their own record's staging slot first, then each
+        table crosses once, then one scan covers the whole batch and one
+        reduction writes every record. The host's next wait is
+        `download_frontier`, which is one for the level rather than one per
+        leaf.
+
+        `hist` holds every node's histogram: the builder's single-node
+        buffer when the batch has one node, and a multi-slot buffer
+        (`GpuLeafBatcher.out_dev`, slot stride `3 * n_features * n_bins`)
+        when it has more. A node's `hist_slot` names its slot, and two
+        nodes may name the same slot only if they really do share a
+        histogram.
+
+        What stays the caller's: which leaves are in the frontier at all,
+        the depth and minimum-row rules (properties of the tree, not of a
+        histogram), and the split it commits. What the batch does not
+        change: the scan order inside a node, the cross-feature
+        tie-breaking, and therefore every record it returns, which is
+        identical to what the same nodes searched one at a time would
+        return.
+        """
+        if len(nodes) < 1:
+            raise Error("a frontier batch needs at least one node")
+        if len(nodes) > self.max_records:
+            raise Error(
+                "the frontier is larger than the record capacity this"
+                " searcher was constructed with"
+            )
+        var widest = 1
+        var slot_cells = 3 * self.n_features * self.n_bins
+        for i in range(len(nodes)):
+            if nodes[i].hist_slot < 0:
+                raise Error("histogram slot must be nonnegative")
+            if len(nodes[i].features) > 0:
+                self.set_features(nodes[i].features, record=i)
+            self.set_allowed(nodes[i].allowed, record=i)
+            self._stage_params(
+                params, g_scale, h_scale, nodes[i].bounds, i
+            )
+            self.stage_node.unsafe_ptr().unsafe_store(
+                i * NODE_WORDS + NODE_HIST_BASE,
+                Int32(nodes[i].hist_slot * slot_cells),
+            )
+            if self.active_len[i] > widest:
+                widest = self.active_len[i]
+        self._launch(hist, params, 0, len(nodes), widest)
+
+    def download_frontier(
+        mut self, n_records: Int
+    ) raises -> List[GpuSplitRecord]:
+        """The batch's one wait: copy every record back and decode slots
+        `[0, n_records)`.
+
+        `max_records * 136` bytes and one synchronization, against one
+        histogram download and one synchronization per node, which is what
+        the node-at-a-time loop pays and what the whole record layout
+        exists to avoid.
+        """
+        if n_records < 1 or n_records > self.max_records:
+            raise Error("n_records out of range")
+        var words_i = List[Int32]()
+        var words_f = List[Float32]()
+        self.download_words(words_i, words_f)
+        var out = List[GpuSplitRecord](capacity=n_records)
+        for r in range(n_records):
+            out.append(decode_record(words_i, words_f, r))
+        return out^
+
+    def search_frontier(
+        mut self,
+        mut hist: DeviceBuffer[DType.int32],
+        nodes: List[SplitNodeRequest],
+        params: GpuSplitParams,
+        g_scale: Float64,
+        h_scale: Float64,
+    ) raises -> List[GpuSplitRecord]:
+        """`enqueue_frontier` followed by `download_frontier`: a bounded
+        frontier's decisions, in one launch pair and one wait."""
+        self.enqueue_frontier(hist, nodes, params, g_scale, h_scale)
+        return self.download_frontier(len(nodes))
 
 
 def decode_record(
@@ -1552,6 +2078,7 @@ def decode_record(
     out.left_value = Float64(words_f[fo + FREC_LEFT_VALUE])
     out.right_value = Float64(words_f[fo + FREC_RIGHT_VALUE])
     out.parent_value = Float64(words_f[fo + FREC_PARENT_VALUE])
+    out.runner_gain = Float64(words_f[fo + FREC_RUNNER_GAIN])
     if out.is_categorical:
         out.cat_bitset = _bitset_from_words(words_i, io)
     return out^
@@ -1618,6 +2145,7 @@ def reference_search(
     var best_gain = Float32(0.0)
     var slot_records = List[GpuSplitRecord]()
     var slot_gains = List[Float32]()
+    var slot_runners = List[Float32]()
 
     for slot in range(len(active)):
         var f = active[slot]
@@ -1645,6 +2173,7 @@ def reference_search(
         if not permitted:
             slot_records.append(rec^)
             slot_gains.append(Float32(0.0))
+            slot_runners.append(Float32(0.0))
             continue
 
         var sign = Int32(MONOTONE_FREE)
@@ -1654,6 +2183,9 @@ def reference_search(
             total_g, total_h, lambda_l1, lambda_l2
         )
         var gain_here = Float32(0.0)
+        # The same runner-up rule the kernel applies: the best gain among
+        # every candidate this feature scored except the winner.
+        var runner_here = Float32(0.0)
         var left_best_g = Int32(0)
         var left_best_h = Int32(0)
         var left_best_c = Int32(0)
@@ -1688,6 +2220,7 @@ def reference_search(
                         - parent_score
                     )
                     if gain > gain_here:
+                        runner_here = gain_here
                         gain_here = gain
                         left_best_g = lg
                         left_best_h = lh
@@ -1697,6 +2230,8 @@ def reference_search(
                         rec.feature = f
                         rec.cat_bitset = cat_empty()
                         cat_add(rec.cat_bitset, t)
+                    elif gain > runner_here:
+                        runner_here = gain
             else:
                 var keys = List[Float32]()
                 var sorted_bins = List[Int]()
@@ -1770,6 +2305,7 @@ def reference_search(
                                 - parent_score
                             )
                             if gain > gain_here:
+                                runner_here = gain_here
                                 gain_here = gain
                                 left_best_g = lg
                                 left_best_h = lh
@@ -1782,6 +2318,8 @@ def reference_search(
                                 for _ in range(i + 1):
                                     cat_add(rec.cat_bitset, sorted_bins[p])
                                     p += direction
+                            elif gain > runner_here:
+                                runner_here = gain
         else:
             var missing_bin = -1
             if len(missing_bins) > 0:
@@ -1832,6 +2370,7 @@ def reference_search(
                             constrained,
                         )
                         if gain > gain_here:
+                            runner_here = gain_here
                             gain_here = gain
                             left_best_g = dl_g
                             left_best_h = dl_h
@@ -1841,6 +2380,8 @@ def reference_search(
                             rec.bin = b
                             rec.ordinal = 2 * b
                             rec.default_left = True
+                        elif gain > runner_here:
+                            runner_here = gain
 
                 if missing_bin < 0 or miss_c > Int32(0):
                     var lhf = left_h.cast[DType.float32]() * h_inv
@@ -1867,6 +2408,7 @@ def reference_search(
                         constrained,
                     )
                     if gain > gain_here:
+                        runner_here = gain_here
                         gain_here = gain
                         left_best_g = left_g
                         left_best_h = left_h
@@ -1876,6 +2418,8 @@ def reference_search(
                         rec.bin = b
                         rec.ordinal = 2 * b + 1
                         rec.default_left = False
+                    elif gain > runner_here:
+                        runner_here = gain
 
         if rec.found:
             var lgf = left_best_g.cast[DType.float32]() * g_inv
@@ -1891,17 +2435,30 @@ def reference_search(
             )
         slot_records.append(rec^)
         slot_gains.append(gain_here)
+        slot_runners.append(runner_here)
 
+    # The same fold `_reduce_slots_kernel` performs: the winner by strictly
+    # greater gain in ascending slot order, and the node's runner-up as the
+    # better of the best losing feature and the winner's own second
+    # candidate.
+    var runner = Float32(0.0)
     for slot in range(len(slot_records)):
         if not slot_records[slot].found:
             continue
         if best_slot < 0 or slot_gains[slot] > best_gain:
+            if best_slot >= 0 and best_gain > runner:
+                runner = best_gain
             best_slot = slot
             best_gain = slot_gains[slot]
+        elif slot_gains[slot] > runner:
+            runner = slot_gains[slot]
 
     var total = slot_records[0].total.copy()
     if best_slot >= 0:
         out = slot_records[best_slot].copy()
+        if slot_runners[best_slot] > runner:
+            runner = slot_runners[best_slot]
+        out.runner_gain = Float64(runner)
     out.total = total.copy()
     out.parent_value = Float64(
         gpu_leaf_value(

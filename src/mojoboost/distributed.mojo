@@ -99,7 +99,6 @@ from .collective import (
 )
 from .distributed_transport import (
     RUNTIME_LOCAL,
-    RUNTIME_TRANSPORT,
     CheckpointMeta,
     RuntimeSpec,
     check_histogram_buffers,
@@ -702,6 +701,15 @@ def _raise_unsupported(mask: Int) raises:
             "distributed training does not support forced splits; applying"
             " one needs the bin mapper, which this grower is not given"
         )
+    if mask & _UNSUPPORTED_RANKING != 0:
+        raise Error(
+            "distributed training does not support ranking; a query group's"
+            " rows are scored against each other, and no reduction over"
+            " per-rank sums recovers a comparison. The group-to-rank"
+            " constraint is implemented in check_group_alignment, so a client"
+            " can partition correctly for a transport that grows lambdarank"
+            " trees, but this grower does not"
+        )
 
 
 def _agree_config[
@@ -758,6 +766,335 @@ def _shape_statuses[
     return statuses^
 
 
+def _push_f64(mut values: List[Int], value: Float64):
+    """Append a double to a digest input by its bits, in two halves.
+
+    By its bits because the claim a schema digest supports is that two ranks
+    were configured identically, and a learning rate that differs in the last
+    place is a different configuration. A tolerance here would hide exactly the
+    divergence the digest exists to catch.
+    """
+    var halves = digest_halves(f64_bits(value))
+    values.append(halves[0])
+    values.append(halves[1])
+
+
+def _schema_values(
+    shards: List[DataShard], params: TreeParams, world_size: Int
+) -> List[Int]:
+    """Everything about a run that every rank must have been given the same.
+
+    Enumerated, and that is the same honest weakness `_unsupported_mask` has:
+    a parameter added to `TreeParams` after this was written is not in it, so
+    two ranks given different values of that parameter would agree here and
+    disagree in the model. What the digest buys over the named field list is
+    that it is cheap to extend by one line and costs no extra message, so the
+    field list can stay short enough to produce good error messages while this
+    covers the rest.
+
+    The bin *edges* are not in it and cannot be: they are quantiles of the
+    whole dataset, fitted before the partition, and a rank does not hold them.
+    What is here is the grid they produced, which is what a reduced histogram
+    cell's meaning depends on.
+    """
+    var values: List[Int] = [world_size]
+    if len(shards) == 0:
+        values.append(-1)
+        values.append(-1)
+    else:
+        values.append(shards[0].data.n_features)
+        values.append(shards[0].data.n_bins)
+        for f in range(shards[0].data.n_features):
+            var categorical = 0
+            if (
+                f < len(shards[0].data.cats.is_categorical)
+                and shards[0].data.cats.is_categorical[f]
+            ):
+                categorical = 1
+            values.append(categorical)
+            if f < len(shards[0].data.missing_bin):
+                values.append(shards[0].data.missing_bin[f])
+            else:
+                values.append(-1)
+    values.append(params.num_leaves)
+    values.append(params.min_data_in_leaf)
+    values.append(params.feature_fraction_seed)
+    values.append(params.max_depth)
+    _push_f64(values, params.lambda_reg)
+    _push_f64(values, params.min_child_hess)
+    _push_f64(values, params.lambda_l1)
+    _push_f64(values, params.feature_fraction)
+    _push_f64(values, params.feature_fraction_bynode)
+    _push_f64(values, params.feature_fraction_bylevel)
+    _push_f64(values, params.extra.max_delta_step)
+    _push_f64(values, params.extra.path_smooth)
+    return values^
+
+
+def tree_schema_digest(
+    shards: List[DataShard], params: TreeParams, world_size: Int, mask: Int
+) -> UInt64:
+    """The digest ranks compare before growing a tree together."""
+    var values = _schema_values(shards, params, world_size)
+    values.append(mask)
+    return digest_ints(values)
+
+
+def run_schema_digest(
+    shards: List[DataShard],
+    params: BoosterParams,
+    objective: Int,
+    alpha: Float64,
+    world_size: Int,
+    mask: Int,
+) -> UInt64:
+    """The digest ranks compare before training an ensemble together.
+
+    Also what a checkpoint records as the schema it was taken under, so a
+    restart against different parameters is refused rather than resumed into a
+    model the parameters no longer describe.
+    """
+    var values = _schema_values(shards, params.tree, world_size)
+    values.append(mask)
+    values.append(objective)
+    values.append(params.n_estimators)
+    _push_f64(values, params.learning_rate)
+    _push_f64(values, alpha)
+    return digest_ints(values)
+
+
+def _agree_config_and_schema[
+    C: Collective
+](
+    mut comm: C,
+    var values: List[Int],
+    var names: List[String],
+    digest: UInt64,
+) raises:
+    """Agree the named fields and the schema digest in one reduction.
+
+    The named fields are first so a disagreement about something a person can
+    act on ("ranks disagree about n_features") is reported as that rather than
+    as a digest mismatch. The digest is the catch-all underneath, and it rides
+    in the same message, so this costs the same one collective the field list
+    already cost.
+
+    Under a world hosted in one process the digest is omitted, because this
+    process computed it for every rank and there is nobody to have computed a
+    different one. That keeps the message schedule of a local run exactly what
+    it has always been.
+    """
+    if not hosts_whole_world(comm):
+        var halves = digest_halves(digest)
+        values.append(halves[0])
+        names.append("the run schema")
+        values.append(halves[1])
+        names.append("the run schema")
+    _agree_config(comm, values, names)
+
+
+def _agree_split[
+    C: Collective
+](mut comm: C, split: SplitInfo, node: Int) raises:
+    """Check that every rank chose the same split for one node.
+
+    Unreachable in a correct run: the split is a pure function of the
+    all-reduced histogram, so agreement is structural and not negotiated. It is
+    here for a real transport, where a histogram corrupted in a way the frame
+    checksum missed would otherwise grow two different trees and raise nothing
+    at all. It costs one integer reduction per node on top of the three the
+    histogram already costs, which is why it is opt-in.
+
+    A world hosted in one process returns at once: every rank's split was
+    computed by this process from one histogram, so there is no second opinion
+    for a reduction to find, and issuing one would only spend a round trip
+    confirming a value against itself.
+    """
+    if hosts_whole_world(comm):
+        return
+    var digest = split_digest(split.feature, split.bin, split.gain, split.found)
+    var bad = agree_equal_ints(comm, digest_halves(digest))
+    if bad >= 0:
+        raise Error(
+            String(
+                "distributed training: ranks chose different splits for node ",
+                node,
+                "; the histogram they read cannot have been identical",
+            )
+        )
+
+
+struct DistributedRunOptions(Copyable, Movable):
+    """What a distributed run does beyond growing the trees.
+
+    Every field is off by default, and a default-constructed instance is what
+    `train_distributed` passes, so the option-free path issues exactly the
+    collectives it always did and produces the same model.
+
+    - `verify_splits` adds the per-node split agreement above.
+    - `metric_every` scores the global training loss every N rounds, 0 never.
+    - `early_stopping_rounds` stops when that loss has not improved by
+      `early_stopping_delta` for N consecutive rounds. It implies scoring every
+      round. The decision is a function of a reduced scalar, so it is unanimous
+      and no rank can leave the loop while another waits in a collective.
+    - `checkpoint_every` marks a checkpoint boundary every N rounds: a barrier,
+      which every rank must reach, and a `CheckpointMeta` recording what a
+      restart would have to match.
+    - `groups` is the global ranking query sizes. Supplying them refuses the
+      run, because distributed lambdarank is not implemented; they are checked
+      against the partition first so the refusal is not the only thing a
+      caller learns.
+    - `job_id` and `schema` stamp the checkpoint records. `run_distributed`
+      fills them from the `RuntimeSpec`; a caller driving the run entry point
+      itself may set them directly.
+    """
+
+    var verify_splits: Bool
+    var metric_every: Int
+    var early_stopping_rounds: Int
+    var early_stopping_delta: Float64
+    var checkpoint_every: Int
+    var groups: List[Int]
+    var job_id: UInt64
+    var schema: UInt64
+
+    def __init__(out self):
+        self.verify_splits = False
+        self.metric_every = 0
+        self.early_stopping_rounds = 0
+        self.early_stopping_delta = 0.0
+        self.checkpoint_every = 0
+        self.groups = List[Int]()
+        self.job_id = 0
+        self.schema = 0
+
+    def scores_every_round(self) -> Bool:
+        return self.early_stopping_rounds > 0
+
+    def check(self) raises:
+        if self.metric_every < 0:
+            raise Error("metric_every must not be negative")
+        if self.early_stopping_rounds < 0:
+            raise Error("early_stopping_rounds must not be negative")
+        if self.early_stopping_delta < 0.0:
+            raise Error("early_stopping_delta must not be negative")
+        if self.checkpoint_every < 0:
+            raise Error("checkpoint_every must not be negative")
+
+
+struct DistributedRunReport(Copyable, Movable):
+    """What a run did, as opposed to what it produced.
+
+    Identical on every rank, because every field is either a constant of the
+    configuration or derived from a reduced value. That is deliberate: a report
+    that differed between ranks would be the first thing to make two ranks
+    disagree about whether a run succeeded.
+    """
+
+    var world_size: Int
+    var rounds_run: Int
+    var plan: ShardPlan
+    var schema: UInt64
+    var model_digest: UInt64
+    var metric_rounds: List[Int]
+    var metric_values: List[Float64]
+    var stopped_early: Bool
+    var stopped_by_callback: Bool
+    var checkpoints: List[CheckpointMeta]
+
+    def __init__(out self, var plan: ShardPlan, schema: UInt64):
+        self.world_size = plan.world_size()
+        self.rounds_run = 0
+        self.plan = plan^
+        self.schema = schema
+        self.model_digest = 0
+        self.metric_rounds = List[Int]()
+        self.metric_values = List[Float64]()
+        self.stopped_early = False
+        self.stopped_by_callback = False
+        self.checkpoints = List[CheckpointMeta]()
+
+    def global_rows(self) -> Int:
+        return self.plan.total_rows()
+
+    def last_metric(self) raises -> Float64:
+        if len(self.metric_values) == 0:
+            raise Error("this run scored no metrics")
+        return self.metric_values[len(self.metric_values) - 1]
+
+
+struct DistributedOutcome(Movable):
+    """A trained model and the report of the run that produced it."""
+
+    var model: Booster
+    var report: DistributedRunReport
+
+    def __init__(
+        out self, var model: Booster, var report: DistributedRunReport
+    ):
+        self.model = model^
+        self.report = report^
+
+
+def distributed_metric[
+    C: Collective
+](
+    mut comm: C,
+    shards: List[DataShard],
+    raw: List[List[Float64]],
+    objective: Int,
+    alpha: Float64,
+) raises -> Float64:
+    """The global training loss, in one reduction.
+
+    The loss is `boosting._mean_loss`, the same function the single-node
+    trainer's early stopping reads, so the two stop on the same quantity rather
+    than on two definitions of it. Each rank contributes its shard's mean
+    scaled by its row count, and the reduced pair is divided at the end, which
+    makes the result the row-weighted mean over the whole dataset.
+
+    It is not bit-identical to the single-node mean: scaling a mean back up to
+    a sum is not the sum, and the shards regroup the addition anyway. It is
+    identical on every rank, which is the property a stopping decision needs.
+    Empty shards contribute nothing rather than a division by zero.
+    """
+    var sums = zeros_f64(2)
+    for i in range(len(shards)):
+        var n = shards[i].data.n_rows
+        if n > 0:
+            sums[0] += (
+                _mean_loss(raw[i], shards[i].target, objective, alpha)
+                * Float64(n)
+            )
+            sums[1] += Float64(n)
+    comm.allreduce_sum_f64(sums)
+    if sums[1] <= 0.0:
+        raise Error("the world holds no rows to score")
+    return sums[0] / sums[1]
+
+
+def model_digest(model: Booster) -> UInt64:
+    """A digest of everything about a fitted ensemble that prediction reads.
+
+    What a checkpoint record identifies. Structure and leaf values by their
+    bits, so two models that predict identically digest identically and two
+    that differ anywhere do not. Linear in the model, which is why it is
+    computed at checkpoint boundaries and not every round.
+    """
+    var values: List[Int] = [len(model.trees), model.objective]
+    _push_f64(values, model.base_score)
+    _push_f64(values, model.learning_rate)
+    for t in range(len(model.trees)):
+        values.append(model.trees[t].n_leaves)
+        for i in range(len(model.trees[t].feature)):
+            values.append(model.trees[t].feature[i])
+            values.append(model.trees[t].threshold_bin[i])
+            values.append(model.trees[t].left[i])
+            values.append(model.trees[t].right[i])
+            _push_f64(values, model.trees[t].value[i])
+    return digest_ints(values)
+
+
 def _grow_tree_distributed[
     C: Collective
 ](
@@ -766,6 +1103,7 @@ def _grow_tree_distributed[
     hess: List[List[Float64]],
     params: TreeParams,
     mut comm: C,
+    options: DistributedRunOptions = DistributedRunOptions(),
 ) raises -> Tree:
     """Grow one tree, leaf-wise, over sharded rows. Assumes the caller has
     already agreed configuration and shapes across ranks; the communication
@@ -829,6 +1167,8 @@ def _grow_tree_distributed[
         params.constraints.allowed_features(root_branch),
         tree.value[root],
     )
+    if options.verify_splits:
+        _agree_split(comm, root_split, root)
 
     var frontier = List[_DistLeaf]()
     frontier.append(
@@ -943,6 +1283,9 @@ def _grow_tree_distributed[
         var right_split = _search(
             right_hist, n_right, params, allowed, tree.value[right_node]
         )
+        if options.verify_splits:
+            _agree_split(comm, left_split, left_node)
+            _agree_split(comm, right_split, right_node)
 
         frontier[best_i] = _DistLeaf(
             left_node,
@@ -976,6 +1319,7 @@ def grow_tree_distributed[
     hess: List[List[Float64]],
     params: TreeParams,
     mut comm: C,
+    options: DistributedRunOptions = DistributedRunOptions(),
 ) raises -> Tree:
     """Grow one tree over rows partitioned across ranks.
 
@@ -987,20 +1331,27 @@ def grow_tree_distributed[
     naming the lowest-numbered failing rank. A run where one rank raises
     while the others block in a collective it will never call is the failure
     mode this ordering exists to prevent.
+
+    The named fields and the schema digest are agreed in the same reduction,
+    so a parameter the field list does not name still cannot differ between
+    ranks unnoticed. The row partition is not negotiated here: one tree is
+    grown from whatever rows the caller handed each rank, and it is
+    `train_distributed_run` that owns the partition for a whole run.
     """
     agree_status(comm, _shape_statuses(comm, shards, grad, hess))
 
     var layout = _shard_layout(shards)
     var mask = _unsupported_mask(params, shards)
-    _agree_config(
+    _agree_config_and_schema(
         comm,
         [layout[0], layout[1], params.num_leaves, mask],
         ["n_features", "n_bins", "num_leaves", "the configuration"],
+        tree_schema_digest(shards, params, comm.world_size(), mask),
     )
     _raise_unsupported(mask)
     params.constraints.check_features(layout[0])
 
-    return _grow_tree_distributed(shards, grad, hess, params, comm)
+    return _grow_tree_distributed(shards, grad, hess, params, comm, options)
 
 
 def _objective_supported(objective: Int) -> Bool:
@@ -1082,33 +1433,94 @@ def _distributed_base_score[
     return mean
 
 
-def train_distributed[
-    C: Collective
+def _agree_control[C: Collective](mut comm: C, code: Int) raises -> Int:
+    """Turn one rank's callback verdict into the world's.
+
+    A maximum, so the strictest verdict wins: `ABORT` over `STOP` over
+    `CONTINUE`. Every rank then acts on the same code, which is what keeps a
+    callback that stops on rank 2 from leaving ranks 0 and 1 waiting in a
+    histogram reduction rank 2 will never join. A world hosted in one process
+    already has one verdict and reduces nothing.
+    """
+    if hosts_whole_world(comm):
+        return code
+    var buf: List[Int] = [code]
+    comm.allreduce_max_int(buf)
+    return buf[0]
+
+
+def _check_params_unchanged(
+    before: BoosterParams, after: BoosterParams
+) raises:
+    """Refuse the parameter reset a callback may schedule.
+
+    The single-node loop honors one through `check_resettable`. This one cannot
+    yet: `num_leaves`, `n_estimators`, and the learning rate are all in the
+    configuration every rank agreed on before the first collective, and
+    changing one on some ranks and not others would desynchronize the run in a
+    way no reduction would catch. Refusing says so; ignoring the write would
+    produce a model the callback believes it shaped.
+    """
+    if (
+        before.n_estimators != after.n_estimators
+        or before.learning_rate != after.learning_rate
+        or before.tree.num_leaves != after.tree.num_leaves
+    ):
+        raise Error(
+            "distributed training does not support a callback parameter"
+            " reset: n_estimators, learning_rate, and num_leaves are part of"
+            " the configuration every rank agreed on before the first"
+            " collective, so changing one mid-run would desynchronize the"
+            " world"
+        )
+
+
+def train_distributed_run[
+    C: Collective, K: IterationFn & Copyable
 ](
     shards: List[DataShard],
     objective: Int,
     params: BoosterParams,
     mut comm: C,
+    options: DistributedRunOptions,
+    on_iteration: K,
     alpha: Float64 = 0.9,
-) raises -> Booster:
+) raises -> DistributedOutcome:
     """Train a boosted ensemble over rows partitioned across ranks.
 
+    This is the one training loop; `train_distributed` is this with default
+    options and an inert callback, so a run with options off and a run without
+    them take the same code and send the same messages.
+
     `shards` describes this process's local ranks, one per
-    `comm.n_local_ranks()`. Every rank returns the same `Booster`, which is
-    an ordinary model: it predicts and serializes exactly like one trained on
-    a single node, because sharding changes how the histograms are summed and
-    nothing about the model.
+    `comm.n_local_ranks()`. Every rank returns the same `Booster` and the same
+    report, because every value in both is either a constant of the
+    configuration or derived from a reduced quantity. The model is an ordinary
+    one: it predicts and serializes exactly like one trained on a single node,
+    because sharding changes how the histograms are summed and nothing about
+    the model.
 
     Supported objectives are squared error, binary logistic, poisson, and
-    huber. Quantile and L1 replace leaf values with a percentile of the
-    leaf's residuals, and a percentile is not a sum, so it does not
-    all-reduce; approximating it would make distributed training disagree
-    with single-node training in a way no tolerance test would catch, so it
-    is refused instead. Early stopping and multiclass are not implemented.
+    huber. Quantile and L1 replace leaf values with a percentile of the leaf's
+    residuals, and a percentile is not a sum, so it does not all-reduce;
+    approximating it would make distributed training disagree with single-node
+    training in a way no tolerance test would catch, so it is refused instead.
+    Ranking and multiclass are refused as well. Early stopping is implemented
+    here, on the global training loss, and off unless asked for.
+
+    The order of the collectives is fixed and every rank issues all of them:
+    configuration and schema, then the target statuses, then the partition,
+    then the base score, then per round the tree's reductions and whichever of
+    the metric, the callback verdict, and the checkpoint barrier are enabled.
+    Nothing is skipped on a rank with no rows.
     """
+    options.check()
+
     var mask = _unsupported_mask(params.tree, shards)
+    if len(options.groups) > 0:
+        mask |= _UNSUPPORTED_RANKING
     var layout = _shard_layout(shards)
-    _agree_config(
+    _agree_config_and_schema(
         comm,
         [
             layout[0],
@@ -1126,6 +1538,9 @@ def train_distributed[
             "num_leaves",
             "the configuration",
         ],
+        run_schema_digest(
+            shards, params, objective, alpha, comm.world_size(), mask
+        ),
     )
 
     # Every value above is now known to be the same on every rank, so these
@@ -1145,6 +1560,18 @@ def train_distributed[
 
     agree_status(comm, _target_statuses(comm, shards, objective))
 
+    # The partition, agreed rather than assumed, and then checked against the
+    # rows each rank actually holds. Both the ranking constraint and the
+    # checkpoint record are stated against it. The check is skipped, not
+    # failed, when this process hosts the whole world: the plan was built from
+    # these very shards a line earlier, so it cannot disagree with them, and
+    # the collective would confirm a value against itself.
+    var plan = resolve_partition(comm, shards)
+    if not hosts_whole_world(comm):
+        agree_status(comm, _partition_statuses(comm, shards, plan))
+    if len(options.groups) > 0:
+        check_group_alignment(plan, options.groups)
+
     var n_local = len(shards)
     var base_score = _distributed_base_score(comm, shards, objective)
 
@@ -1155,19 +1582,47 @@ def train_distributed[
             r.append(base_score)
         raw.append(r^)
 
+    var report = DistributedRunReport(plan^, options.schema)
+    # One "validation set", the training rows themselves, and one metric on it:
+    # the global loss `distributed_metric` reduces. A callback therefore reads
+    # `env.value(0, 0)` here exactly as it reads a validation metric on the
+    # single-node path, and reads nothing at all in a run that scores nothing.
+    var env = IterationEnv(params.copy(), ["training"], ["loss"])
+    var scores_metric = options.metric_every > 0 or options.scores_every_round()
+    var best_metric = 0.0
+    var best_round = 0
+    var have_best = False
+
     var trees = List[Tree]()
-    for _ in range(params.n_estimators):
+    for i in range(params.n_estimators):
+        env.iteration = i
+        env.evaluation.clear()
+        env.params = params.copy()
+        var before = _agree_control(comm, on_iteration(BEFORE_ITERATION, env))
+        if before == ABORT:
+            raise Error(
+                String(
+                    "distributed training callback failed in the"
+                    " before-iteration phase of round ",
+                    i,
+                )
+            )
+        if before == STOP:
+            report.stopped_by_callback = True
+            break
+        _check_params_unchanged(params, env.params)
+
         # Gradients and hessians are a per-row function of local state only.
         var grad = List[List[Float64]]()
         var hess = List[List[Float64]]()
-        for i in range(n_local):
+        for j in range(n_local):
             var g = List[Float64]()
             var h = List[Float64]()
             _fill_grad_hess(
-                raw[i],
-                shards[i].target,
+                raw[j],
+                shards[j].target,
                 objective,
-                shards[i].weight,
+                shards[j].weight,
                 alpha,
                 g,
                 h,
@@ -1175,7 +1630,9 @@ def train_distributed[
             grad.append(g^)
             hess.append(h^)
 
-        var tree = _grow_tree_distributed(shards, grad, hess, params.tree, comm)
+        var tree = _grow_tree_distributed(
+            shards, grad, hess, params.tree, comm, options
+        )
 
         # The tree is global, so this convergence break is unanimous: no
         # rank can leave the loop while another rank stays in it and blocks
@@ -1183,14 +1640,164 @@ def train_distributed[
         if tree.n_leaves == 1 and abs(tree.value[0]) < 1e-12:
             break
 
-        for i in range(n_local):
-            var updated = List[Float64](capacity=len(raw[i]))
-            for r in range(shards[i].data.n_rows):
+        for j in range(n_local):
+            var updated = List[Float64](capacity=len(raw[j]))
+            for r in range(shards[j].data.n_rows):
                 updated.append(
-                    raw[i][r]
-                    + params.learning_rate * tree.predict_row(shards[i].data, r)
+                    raw[j][r]
+                    + params.learning_rate * tree.predict_row(shards[j].data, r)
                 )
-            raw[i] = updated^
+            raw[j] = updated^
         trees.append(tree^)
+        report.rounds_run = len(trees)
 
-    return Booster(trees^, base_score, params.learning_rate, objective)
+        # Scoring, early stopping, and the checkpoint boundary are all
+        # decisions about a reduced scalar or an unconditional barrier, so
+        # every rank takes the same one at the same round.
+        var stop_now = False
+        var due = options.scores_every_round()
+        if not due and options.metric_every > 0:
+            due = len(trees) % options.metric_every == 0
+        if scores_metric and due:
+            var value = distributed_metric(comm, shards, raw, objective, alpha)
+            report.metric_rounds.append(len(trees))
+            report.metric_values.append(value)
+            var improved = not have_best
+            if not improved:
+                improved = value < best_metric - options.early_stopping_delta
+            if improved:
+                best_metric = value
+                best_round = len(trees)
+                have_best = True
+            if (
+                options.early_stopping_rounds > 0
+                and len(trees) - best_round >= options.early_stopping_rounds
+            ):
+                report.stopped_early = True
+                stop_now = True
+
+        if options.checkpoint_every > 0 and (
+            len(trees) % options.checkpoint_every == 0
+        ):
+            comm.barrier()
+            report.checkpoints.append(
+                CheckpointMeta(
+                    options.job_id,
+                    options.schema,
+                    model_digest(
+                        Booster(
+                            trees.copy(),
+                            base_score,
+                            params.learning_rate,
+                            objective,
+                        )
+                    ),
+                    len(report.checkpoints),
+                    0,
+                    comm.world_size(),
+                    len(trees),
+                )
+            )
+
+        env.iteration = i
+        env.evaluation.clear()
+        if len(report.metric_values) > 0:
+            env.evaluation.append(
+                report.metric_values[len(report.metric_values) - 1]
+            )
+        var after = _agree_control(comm, on_iteration(AFTER_ITERATION, env))
+        if after == ABORT:
+            raise Error(
+                String(
+                    "distributed training callback failed in the"
+                    " after-iteration phase of round ",
+                    i,
+                )
+            )
+        if after == STOP:
+            report.stopped_by_callback = True
+            break
+        if stop_now:
+            break
+
+    var model = Booster(
+        trees^, base_score, params.learning_rate, objective
+    )
+    report.model_digest = model_digest(model)
+    return DistributedOutcome(model^, report^)
+
+
+def train_distributed[
+    C: Collective
+](
+    shards: List[DataShard],
+    objective: Int,
+    params: BoosterParams,
+    mut comm: C,
+    alpha: Float64 = 0.9,
+) raises -> Booster:
+    """Train a boosted ensemble over rows partitioned across ranks.
+
+    `train_distributed_run` with the default options and no callback, kept as
+    the plain entry point for a caller that wants a model and nothing else.
+    """
+    var outcome = train_distributed_run(
+        shards,
+        objective,
+        params,
+        comm,
+        DistributedRunOptions(),
+        no_callback,
+        alpha,
+    )
+    return outcome.model^
+
+
+def run_distributed[
+    K: IterationFn & Copyable
+](
+    spec: RuntimeSpec,
+    shards: List[DataShard],
+    objective: Int,
+    params: BoosterParams,
+    options: DistributedRunOptions,
+    on_iteration: K,
+    alpha: Float64 = 0.9,
+) raises -> DistributedOutcome:
+    """Train through a runtime spec: the one entry point for bindings and Dask.
+
+    It does three things and no more. It refuses a spec this build cannot open,
+    before a row is partitioned, so a rank configured for a world it cannot
+    reach fails with the reason rather than blocking in a handshake that will
+    never complete. It opens the collective the spec names. And it stamps the
+    run with the spec's job id and schema digest, so a checkpoint records what
+    a restart would have to match.
+
+    Only `RUNTIME_LOCAL` opens today. That is not a policy choice: no
+    `ByteEndpoint` in this build can reach another process,
+    `transport_available` says so, and `require_transport` raises it. Every
+    stage above the endpoint (configuration, schema, partition, ordering,
+    deadlines, the reduction, split agreement, the checkpoint record) is
+    connected and runs on the local runtime today; the byte
+    stream underneath them is what is missing, and no multi-host behavior is
+    claimed until the two-process test in docs/DISTRIBUTED_TRANSPORT.md
+    section 7 exists and passes.
+
+    Pass `no_callback` from callback.mojo when there is nothing to observe.
+    """
+    spec.validate()
+    require_transport(spec)
+    if spec.mode != RUNTIME_LOCAL:
+        raise Error(
+            "run_distributed opens a local runtime only. A transport runtime's"
+            " endpoints are connected by whoever launched the processes, which"
+            " then calls open_transport_collective and hands the result to"
+            " train_distributed_run"
+        )
+    var comm = open_local_collective(spec)
+    var stamped = options.copy()
+    stamped.job_id = spec.job_id
+    stamped.schema = spec.schema_digest()
+    return train_distributed_run(
+        shards, objective, params, comm, stamped, on_iteration, alpha
+    )

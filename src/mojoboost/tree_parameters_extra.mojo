@@ -25,9 +25,16 @@ tier is a property of what the rule needs rather than of the backend:
   caller: `extra_trees`/`extra_seed` (it needs the node id and the tree
   index) and `max_delta_step`/`path_smooth` (they need the leaf's row count
   and its parent's finished output). See `needs_grower_support`.
-- Parsed, validated, and refused: `cegb_penalty_feature_coupled` and
-  `forcedsplits_filename`, plus `linear_tree`/`linear_lambda` and
-  `cegb_penalty_feature_lazy` as before. Each names what it would take; see
+- Live in `tree.grow_tree` alone and reachable from the Mojo API only:
+  `forcedsplits_filename`. The document is parsed here
+  (`parse_forced_splits`), mapped to bins by `binning.map_forced_splits` --
+  the one place a raw threshold and a fitted mapper meet -- and applied by
+  `grow_tree` before leaf-wise growth resumes. A parameter string cannot
+  carry a document, so `check_extra_option_supported` names that path rather
+  than accepting the key.
+- Parsed, validated, and refused: `cegb_penalty_feature_coupled`, plus
+  `linear_tree`/`linear_lambda`, `cegb_penalty_feature_lazy`, and
+  `feature_pre_filter`. Each names what it would take; see
   `check_extra_option_supported`.
 
 `distributed.grow_tree_distributed` keeps private copies of `_search` and
@@ -48,8 +55,9 @@ What is here, with LightGBM's name and default
   feature instead of a full scan.
 - `monotone_penalty` (0.0) and `monotone_constraints_method` ("basic").
 - `forcedsplits_filename` (empty): the file's contents parsed into a
-  validated forced-split tree. Reading the file is a caller's job; this
-  module never touches the filesystem.
+  validated forced-split tree, which `binning.map_forced_splits` turns into
+  bin space and `tree.grow_tree` applies. Reading the file is a caller's job;
+  this module never touches the filesystem.
 
 What is *not* here, because it already exists
 ---------------------------------------------
@@ -719,7 +727,6 @@ struct ForcedSplitNode(Copyable, Movable):
     var right: Int
 
 
-@fieldwise_init
 struct ForcedSplits(Copyable, Movable):
     """A validated forced-split tree, LightGBM's `forcedsplits_filename`
     content as a structure.
@@ -728,9 +735,35 @@ struct ForcedSplits(Copyable, Movable):
     splits and is the default. A parent always precedes its children in the
     list, so the structure is acyclic by construction and one ascending pass
     covers it.
+
+    `bins` is the same tree in bin space: `bins[i]` is the threshold bin
+    `nodes[i].threshold` maps to under a fitted `BinMapper`, and the grower
+    applies *that*, because it is handed a `BinnedMatrix` and a binned matrix
+    carries no bin edges. It is empty on a freshly parsed document and filled
+    by `binning.map_forced_splits`, which is the only place a raw threshold
+    and a mapper meet. `is_mapped` is the predicate every consumer tests:
+    a document that has been parsed but not mapped is refused rather than
+    applied, because applying it would mean guessing a bin.
     """
 
     var nodes: List[ForcedSplitNode]
+    var bins: List[Int]
+
+    def __init__(
+        out self,
+        var nodes: List[ForcedSplitNode],
+        var bins: List[Int] = [],
+    ):
+        """A `bins` table of the wrong length (the empty default included)
+        means the tree has not been mapped to bins yet, which is what a parsed
+        document is. Appending the argument keeps every one-argument caller
+        working unchanged."""
+        var n = len(nodes)
+        self.nodes = nodes^
+        if len(bins) == n:
+            self.bins = bins^
+        else:
+            self.bins = List[Int]()
 
     @staticmethod
     def none() -> ForcedSplits:
@@ -738,6 +771,23 @@ struct ForcedSplits(Copyable, Movable):
 
     def is_empty(self) -> Bool:
         return len(self.nodes) == 0
+
+    def is_mapped(self) -> Bool:
+        """Whether every node carries the threshold bin the grower applies.
+        False for an empty tree, which has nothing to apply."""
+        return len(self.nodes) > 0 and len(self.bins) == len(self.nodes)
+
+    def bin_at(self, i: Int) raises -> Int:
+        """Node i's threshold bin. Raises unless the tree has been mapped, so
+        a caller cannot read a bin that was never computed."""
+        if not self.is_mapped():
+            raise Error(
+                "forced splits have not been mapped to bins; call"
+                " binning.map_forced_splits with the fitted BinMapper"
+            )
+        if i < 0 or i >= len(self.bins):
+            raise Error("forced split node index out of range")
+        return self.bins[i]
 
     def n_nodes(self) -> Int:
         return len(self.nodes)
@@ -1047,6 +1097,18 @@ def check_extra_option_supported(name: String) raises:
             " through every trainer and every grower. 'cegb_penalty_split'"
             " and 'cegb_tradeoff' are applied by the split search today"
         )
+    if name == "feature_pre_filter":
+        raise Error(
+            "'feature_pre_filter' is not implemented. It is a Dataset"
+            " construction step: LightGBM drops, before training, the"
+            " features whose every bin boundary would leave a child under"
+            " 'min_data_in_leaf'. mojoboost's split search rejects those"
+            " candidates as it scans (split.find_best_split), so the fitted"
+            " model is already the one LightGBM produces with"
+            " feature_pre_filter=false; what is missing is the speed-up, and"
+            " with it LightGBM's rule that a prefiltered Dataset cannot be"
+            " reused with a larger min_data_in_leaf"
+        )
     if (
         name == "forcedsplits_filename"
         or name == "forced_splits_filename"
@@ -1054,11 +1116,13 @@ def check_extra_option_supported(name: String) raises:
         or name == "fs"
     ):
         raise Error(
-            "'forcedsplits_filename' is parsed but not applied;"
-            " `parse_forced_splits` validates the document, but applying a"
-            " forced node means mapping its raw threshold to a bin, and the"
-            " grower is handed a BinnedMatrix, which carries no bin edges."
-            " Applying forced splits needs the BinMapper at `tree.grow_tree`"
+            "'forcedsplits_filename' names a document, which a"
+            " whitespace-separated parameter string cannot carry any more"
+            " than it can carry 'monotone_constraints'. Forced splits are"
+            " implemented and reachable from the Mojo API: read the file,"
+            " `parse_forced_splits` it, map it with"
+            " `binning.map_forced_splits(mapper, forced)`, and set the result"
+            " on `TreeParams.extra.forced`. `tree.grow_tree` applies it"
         )
 
 
@@ -1193,8 +1257,17 @@ struct ExtraTreeParams(Copyable, Movable):
             )
         if self.penalties.coupled_is_active():
             check_extra_option_supported("cegb_penalty_feature_coupled")
-        if not self.forced.is_empty():
-            check_extra_option_supported("forcedsplits_filename")
+        # A parsed document is not yet applicable: the grower is handed a
+        # BinnedMatrix, which carries no bin edges, so a raw threshold has to
+        # be mapped through the fitted BinMapper first. Refusing here is what
+        # keeps a caller from reading an unforced tree as a forced one.
+        if not self.forced.is_empty() and not self.forced.is_mapped():
+            raise Error(
+                "forced splits carry raw feature thresholds and the grower is"
+                " handed a BinnedMatrix, which has no bin edges. Map them"
+                " once with binning.map_forced_splits(mapper, forced) and put"
+                " the result on ExtraTreeParams.forced"
+            )
 
     def check(
         self, n_features: Int, num_leaves: Int, max_depth: Int,

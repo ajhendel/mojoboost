@@ -26,8 +26,8 @@ categorical column means, and they live in `sparse.mojo` because they are
 facts about that representation, not about a device: a CPU caller has to be
 able to ask them without importing a GPU module, and
 `SparseBinnedMatrix.validate` enforces them on every matrix that enters
-training on either backend. They are imported below and re-exported from
-here, so a device-side caller reads one name in one place.
+training on either backend. Import them from `sparse.mojo`; this module used
+to define them and no longer does.
 
 The short version, because the rest of this module depends on it: an absent
 entry of a categorical feature is the value 0.0, which is *category code 0*,
@@ -57,7 +57,7 @@ from std.atomic import Atomic
 from std.gpu import block_dim, block_idx, global_idx, thread_idx
 from std.math import round
 from std.memory import stack_allocation
-from max.gpu.host import DeviceBuffer, DeviceContext
+from max.gpu.host import DeviceBuffer, DeviceContext, HostBuffer
 from max.gpu.memory import AddressSpace
 from max.gpu.sync import barrier
 
@@ -78,86 +78,27 @@ from .gpu_sparse import (
     TOT_GRAD,
     TOT_HESS,
     GpuSparseHistogramBuilder,
+    _enqueue_zero_i32,
 )
 from .gpu_tiling import DeviceCaps, derive_block_threads
 from .histogram_sparse import SparseNodeEntries
-from .sparse import (
-    SparseBinnedMatrix,
-    absent_is_unknown,
-    check_sparse_categorical_semantics,
-    default_category_bin,
-)
+from .sparse import SparseBinnedMatrix, default_category_bin
 
 comptime CAT_STAT_BINS = CAT_MAX_BINS
 
 
 # --- Semantics ------------------------------------------------------------
-
-
-def default_category_bin(cats: CategoricalSpec, feature: Int) raises -> Int:
-    """The bin an absent entry of a categorical feature falls in.
-
-    Identical to `sparse.default_bins(mapper)[feature]` for a categorical
-    column, computed from the category table alone so a caller holding a
-    `SparseBinnedMatrix` and no mapper can check the matrix against it.
-    """
-    if not cats.is_cat(feature):
-        raise Error("feature is not categorical")
-    return cats.bin_of(feature, 0.0)
-
-
-def absent_is_unknown(cats: CategoricalSpec, feature: Int) raises -> Bool:
-    """Whether absent entries of `feature` land in the unknown bin.
-
-    True when category code 0 is not in the fitted table, in which case every
-    row without a stored entry routes right at every categorical node of this
-    feature, together with the missing and unseen rows. See the module
-    docstring: this is a modelling fact, not a device detail.
-    """
-    return default_category_bin(cats, feature) == UNKNOWN_BIN
-
-
-def check_sparse_categorical_semantics(
-    data: SparseBinnedMatrix
-) raises -> List[Int]:
-    """Check a binned sparse matrix against the categorical rules, and report
-    which categorical features send their absent rows to the unknown bin.
-
-    Three things must hold for every categorical feature, and all three are
-    properties a malformed producer could break without any individual number
-    looking wrong:
-
-    - the column's `default_bin` must be the bin of category code 0, because
-      an absent entry is the value 0.0 and nothing else;
-    - the column must reserve no missing bin: a categorical feature routes
-      missing values to `UNKNOWN_BIN` by construction, and a reserved bin
-      would give it a second, contradictory missing route;
-    - every stored bin must be inside `[0, n_categories]`, since a bin past
-      the table indexes a category that was never fitted.
-
-    Returns the ascending feature ids for which `absent_is_unknown` holds.
-    """
-    var flagged = List[Int]()
-    for f in range(data.n_features):
-        if not data.cats.is_cat(f):
-            continue
-        var expected = default_category_bin(data.cats, f)
-        if Int(data.default_bin[f]) != expected:
-            raise Error(
-                "categorical column's default bin is not the bin of"
-                " category code 0"
-            )
-        if data.missing_bin[f] >= 0:
-            raise Error(
-                "categorical feature must not reserve a missing bin"
-            )
-        var n_cat = data.cats.n_categories(f)
-        for i in range(data.col_offsets[f], data.col_offsets[f + 1]):
-            if Int(data.bin[i]) > n_cat:
-                raise Error("stored bin is past the fitted category table")
-        if expected == UNKNOWN_BIN:
-            flagged.append(f)
-    return flagged^
+#
+# `default_category_bin`, `absent_is_unknown`, and
+# `check_sparse_categorical_semantics` moved to `sparse.mojo`. Defining them
+# here put the only statement of the sparse categorical rules behind a device
+# dependency: the CPU trainers could not call them, and
+# `SparseBinnedMatrix.validate` -- which now enforces exactly these rules on
+# every matrix entering training, on either backend -- would have had to
+# duplicate them. One implementation, at the layer that owns the
+# representation. `default_category_bin` is imported above, since the
+# statistics below derive an absent row's bin from the category table rather
+# than trusting the uploaded column.
 
 
 # --- Category sets --------------------------------------------------------
@@ -713,3 +654,199 @@ def enqueue_category_stats[
         grid_dim=1,
         block_dim=threads,
     )
+
+
+# --- Driving the builder --------------------------------------------------
+#
+# The two entry points below are what makes the rest of this module reachable
+# from the session that owns the device buffers. Before them, `CatSetPool`
+# had no consumer and `_cat_pool_side_kernel` had no launcher: a pool could be
+# filled and uploaded and nothing would ever route by it. They deliberately
+# add no second partition, no second range table, and no second quantization
+# -- every one of those stays `GpuSparseHistogramBuilder`'s.
+
+
+def apply_categorical_split_pooled(
+    mut builder: GpuSparseHistogramBuilder,
+    mut pool: CatSetPool,
+    set_offset: Int,
+    feature: Int,
+    parent: Int,
+    left: Int,
+    right: Int,
+    expected_left: Int = -1,
+) raises:
+    """Apply a categorical split whose set lives in a device-resident pool.
+
+    The same split `GpuSparseHistogramBuilder.apply_split` applies with
+    `is_categorical=True`, with the set read from the pool by word offset
+    instead of carried through four `UInt64` kernel arguments. Everything
+    after the side mask -- the row partition, the entry partition, the
+    children's windows, the reserved-id rules -- is `finish_split`'s, so the
+    two forms cannot drift on what a split does; only on how the mask is
+    computed.
+
+    A free function rather than a builder method because the builder must not
+    depend on this module: `gpu_categorical` imports `gpu_sparse`, and the
+    reverse would be a cycle.
+
+    `set_offset` is what `CatSetPool.push` returned. The pool must have been
+    uploaded since that push, or the device would route by whatever the
+    buffer held before.
+    """
+    if feature < 0 or feature >= builder.n_features:
+        raise Error("split feature out of range")
+    if not builder.cats.is_cat(feature):
+        raise Error("pooled categorical split names a numerical feature")
+    builder.check_split_ids(parent, left, right)
+    if set_offset < 0 or set_offset + CAT_BITSET_WORDS > pool.uploaded:
+        raise Error(
+            "category set offset is outside the uploaded region of the pool;"
+            " call CatSetPool.upload after staging the set"
+        )
+    check_cat_bitset(
+        pool.get(set_offset), builder.cats.n_categories(feature)
+    )
+
+    # An absent entry of a categorical column is category code 0, so the
+    # node's rows all take the side its bin lands on and only the rows with a
+    # stored entry are corrected. The host mirror of the device membership
+    # test decides it, which is why `CatSetPool.contains` exists.
+    var goes_left = pool.contains(set_offset, builder.default_bin[feature])
+    _ = builder.enqueue_default_side(parent, goes_left)
+
+    var window = builder.windows.get(parent)
+    var n_entries = window.ends[feature] - window.starts[feature]
+    if n_entries > 0:
+        var threads = builder.block_threads
+        builder.ctx.enqueue_function[_cat_pool_side_kernel](
+            builder.order_dev.unsafe_ptr(),
+            builder.entry_row_dev.unsafe_ptr(),
+            builder.entry_bin_dev.unsafe_ptr(),
+            builder.ranges_dev.unsafe_ptr(),
+            pool.pool_dev.unsafe_ptr(),
+            builder.side_dev.unsafe_ptr(),
+            Int32(parent),
+            Int32(builder.n_features),
+            Int32(feature),
+            Int32(set_offset),
+            grid_dim=(n_entries + threads - 1) // threads,
+            block_dim=threads,
+        )
+
+    builder.finish_split(parent, left, right, expected_left)
+
+
+struct GpuCategoryStats(Movable):
+    """One reusable output buffer for device category statistics.
+
+    `enqueue_category_stats` is a primitive that allocates nothing and takes
+    raw pointers, which is what keeps it composable -- and also what left it
+    with no caller, since somebody has to own the `3 * n_bins` output plane
+    and the node totals it subtracts against. This owns the plane, allocated
+    once per session, and drives the builder's own totals reduction for the
+    rest, so a categorical column's statistics quantize in exactly the fixed
+    point that column's slice of the histogram quantizes in.
+
+    Constructed from the builder rather than from a context and a bin count,
+    so the buffer cannot end up on a different queue than the kernels that
+    fill it: the accumulation, the totals reduction, and the download have to
+    be ordered against each other, and two `DeviceContext`s are not. The bin
+    count is checked again on every call, because a builder is movable and a
+    caller could hold a stats buffer sized for a different matrix.
+    """
+
+    var ctx: DeviceContext
+    var stats_dev: DeviceBuffer[DType.int32]
+    var host_stats: HostBuffer[DType.int32]
+    var n_bins: Int
+
+    def __init__(
+        out self, mut builder: GpuSparseHistogramBuilder
+    ) raises:
+        var n_bins = builder.n_bins
+        if n_bins < 1 or n_bins > CAT_MAX_BINS:
+            raise Error("category statistics need 1 to 256 bins")
+        self.ctx = builder.ctx
+        self.n_bins = n_bins
+        self.stats_dev = self.ctx.enqueue_create_buffer[DType.int32](
+            3 * n_bins
+        )
+        self.host_stats = self.ctx.enqueue_create_host_buffer[DType.int32](
+            3 * n_bins
+        )
+
+    def compute(
+        mut self,
+        mut builder: GpuSparseHistogramBuilder,
+        node: Int,
+        feature: Int,
+    ) raises -> CategoryStats:
+        """Per-category statistics for one categorical feature at one node.
+
+        Zeroes the plane, sums the node's rows into the builder's totals,
+        accumulates the node's stored entries for this feature, folds the
+        implicit zeros into the default bin by subtraction, and downloads.
+        One host synchronization, the same one a histogram costs.
+
+        The result is bin-indexed exactly as
+        `categorical.find_best_categorical_split` reads it, so it drops
+        straight into the host search as the `base = 0` slice.
+        """
+        if feature < 0 or feature >= builder.n_features:
+            raise Error("feature index out of range")
+        if not builder.cats.is_cat(feature):
+            raise Error("feature is not categorical")
+        if self.n_bins != builder.n_bins:
+            raise Error(
+                "category statistics buffer was sized for a different bin"
+                " count"
+            )
+        var window = builder.entry_window(node)
+        var n_entries = window.ends[feature] - window.starts[feature]
+
+        _enqueue_zero_i32(
+            self.ctx,
+            self.stats_dev.unsafe_ptr(),
+            3 * self.n_bins,
+            builder.block_threads,
+        )
+        builder.enqueue_node_totals(node)
+        enqueue_category_stats(
+            self.ctx,
+            builder.caps,
+            builder.order_dev.unsafe_ptr(),
+            builder.entry_row_dev.unsafe_ptr(),
+            builder.entry_bin_dev.unsafe_ptr(),
+            builder.grad_dev.unsafe_ptr(),
+            builder.hess_dev.unsafe_ptr(),
+            builder.ranges_dev.unsafe_ptr(),
+            builder.totals_dev.unsafe_ptr(),
+            self.stats_dev.unsafe_ptr(),
+            node,
+            builder.n_features,
+            feature,
+            self.n_bins,
+            default_category_bin(builder.cats, feature),
+            n_entries,
+            builder.g_scale,
+            builder.h_scale,
+        )
+        self.ctx.enqueue_copy(
+            dst_ptr=self.host_stats.unsafe_ptr(), src_buf=self.stats_dev
+        )
+        self.ctx.synchronize()
+
+        var src = self.host_stats.unsafe_ptr()
+        var raw = List[Int32](capacity=3 * self.n_bins)
+        for i in range(3 * self.n_bins):
+            raw.append(src.unsafe_load(i))
+        return category_stats_from_fixed(
+            raw,
+            self.n_bins,
+            builder.g_scale,
+            builder.h_scale,
+            feature,
+            builder.cats.n_categories(feature),
+            default_category_bin(builder.cats, feature),
+        )

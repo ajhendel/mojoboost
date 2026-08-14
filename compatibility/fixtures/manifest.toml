@@ -1,0 +1,287 @@
+# Model fixture register.
+#
+# Hand-maintained. Declares which fixtures must exist, what each one is,
+# and where it came from. Checksums are NOT here: `tomllib` reads TOML and
+# the standard library cannot write it, so the computed half lives in
+# `checksums.json`, which `tools/model_fixture_manifest.py --write`
+# produces. This file says what is owed; that file says what is there.
+#
+# Read `README.md` in this directory before adding a row. The rule that
+# governs everything here is that a fixture is never regenerated.
+
+schema_version = 1
+
+# "declared" until every row's files exist and checksums.json covers them.
+# `tools/model_fixture_manifest.py --write` is what moves it to "verified",
+# and it has not been run.
+status = "declared"
+
+# The stem of every fixture is `<stem>.mbst`, `<stem>.input.tsv`, and
+# `<stem>.expected.tsv`, all three relative to this directory.
+suffixes = { model = ".mbst", input = ".input.tsv", expected = ".expected.tsv" }
+
+# Facts a model file may carry. A row's `carries` list is the subset its
+# format version and its training actually recorded; everything absent from
+# the list must read back as absent (migration rule R2) and must raise
+# rather than return a plausible number when asked for (rule R3).
+known_facts = [
+    "missing_routing",
+    "node_covers",
+    "split_gains",
+    "monotone",
+    "categorical",
+    "feature_names",
+]
+
+# ---------------------------------------------------------------------
+# v1. The oldest format. No missing routing, no covers, no gains, and no
+# optional sections at all.
+# ---------------------------------------------------------------------
+
+[[fixture]]
+id = "v1/single_regression"
+stem = "v1/single_regression"
+model_format_version = 1
+kind = "objective"
+num_class = 1
+objective = "regression"
+n_features = 3
+n_trees = 2
+carries = []
+status = "declared"
+proves = "the oldest format still loads and predicts; no fact beyond the tree structure survives from it"
+
+[fixture.provenance]
+kind = "synthetic"
+authored_from = "src/mojoboost/serialize.mojo version history, v1 entry"
+authored_by = "compatibility lane, remaining round task 13"
+produced_at = ""
+note = "Model the token stream on the hand-written file in tests/test_missing.mojo:test_v1_file_still_loads_and_routes_nothing, which is the only v1 file the repository has ever built."
+
+[[fixture]]
+id = "v1/single_binary"
+stem = "v1/single_binary"
+model_format_version = 1
+kind = "objective"
+num_class = 1
+objective = "binary"
+n_features = 2
+n_trees = 2
+carries = []
+status = "declared"
+proves = "the objective code round trips; a v1 binary model still applies its sigmoid at predict time"
+
+[fixture.provenance]
+kind = "synthetic"
+authored_from = "src/mojoboost/serialize.mojo version history, v1 entry"
+authored_by = "compatibility lane, remaining round task 13"
+produced_at = ""
+
+[[fixture]]
+id = "v1/multiclass_3"
+stem = "v1/multiclass_3"
+model_format_version = 1
+kind = "multiclass"
+num_class = 3
+objective = "multiclass"
+n_features = 2
+n_trees = 6
+carries = []
+status = "declared"
+proves = "the kind token dispatches from the header alone, at the oldest version"
+
+[fixture.provenance]
+kind = "synthetic"
+authored_from = "src/mojoboost/serialize.mojo version history, v1 entry"
+authored_by = "compatibility lane, remaining round task 13"
+produced_at = ""
+
+# ---------------------------------------------------------------------
+# v2. Missing routing, plus the three optional sections. One fixture per
+# optional section, because the point of an optional section is that its
+# absence is also a state.
+# ---------------------------------------------------------------------
+
+[[fixture]]
+id = "v2/single_missing"
+stem = "v2/single_missing"
+model_format_version = 2
+kind = "objective"
+num_class = 1
+objective = "regression"
+n_features = 3
+n_trees = 2
+carries = ["missing_routing"]
+status = "declared"
+proves = "per-node default_left and missing_bin round trip, so a reloaded model routes missing values exactly as the trained one did"
+
+[fixture.provenance]
+kind = "synthetic"
+authored_from = "src/mojoboost/serialize.mojo version history, v2 entry"
+authored_by = "compatibility lane, remaining round task 13"
+produced_at = ""
+
+[[fixture]]
+id = "v2/single_monotone"
+stem = "v2/single_monotone"
+model_format_version = 2
+kind = "objective"
+num_class = 1
+objective = "regression"
+n_features = 3
+n_trees = 2
+carries = ["missing_routing", "monotone"]
+status = "declared"
+proves = "the optional monotone section loads; its constraint vector is a property of the trees a consumer cannot recover"
+
+[fixture.provenance]
+kind = "synthetic"
+authored_from = "src/mojoboost/serialize.mojo version history, v2 entry; src/mojoboost/monotone.mojo"
+authored_by = "compatibility lane, remaining round task 13"
+produced_at = ""
+
+[[fixture]]
+id = "v2/single_categorical"
+stem = "v2/single_categorical"
+model_format_version = 2
+kind = "objective"
+num_class = 1
+objective = "regression"
+n_features = 3
+n_trees = 2
+carries = ["missing_routing", "categorical"]
+status = "declared"
+proves = "the categorical section and the per-tree cat sections load, without which a loaded model could not bin a raw category code"
+
+[fixture.provenance]
+kind = "synthetic"
+authored_from = "src/mojoboost/serialize.mojo version history, v2 entry; src/mojoboost/categorical.mojo"
+authored_by = "compatibility lane, remaining round task 13"
+produced_at = ""
+
+# ---------------------------------------------------------------------
+# v3. Covers, unconditionally.
+# ---------------------------------------------------------------------
+
+[[fixture]]
+id = "v3/single_regression"
+stem = "v3/single_regression"
+model_format_version = 3
+kind = "objective"
+num_class = 1
+objective = "regression"
+n_features = 3
+n_trees = 2
+carries = ["missing_routing", "node_covers"]
+status = "declared"
+proves = "covers travel unconditionally at v3, so has_node_count is true and feature contributions are answerable"
+
+[fixture.provenance]
+kind = "synthetic"
+authored_from = "src/mojoboost/serialize.mojo version history, v3 entry"
+authored_by = "compatibility lane, remaining round task 13"
+produced_at = ""
+
+[[fixture]]
+id = "v3/multiclass_3"
+stem = "v3/multiclass_3"
+model_format_version = 3
+kind = "multiclass"
+num_class = 3
+objective = "multiclass"
+n_features = 2
+n_trees = 6
+carries = ["missing_routing", "node_covers"]
+status = "declared"
+proves = "the multiclass shape at v3, so the covers addition is checked on both kinds and not only on the single-output one"
+
+[fixture.provenance]
+kind = "synthetic"
+authored_from = "src/mojoboost/serialize.mojo version history, v3 entry"
+authored_by = "compatibility lane, remaining round task 13"
+produced_at = ""
+
+[[fixture]]
+id = "v3/single_contrib"
+stem = "v3/single_contrib"
+model_format_version = 3
+kind = "objective"
+num_class = 1
+objective = "regression"
+n_features = 4
+n_trees = 3
+carries = ["missing_routing", "node_covers"]
+status = "declared"
+proves = "the contribution sum identity holds on a loaded v3 model: every pred_contrib row sums to that row's raw score exactly"
+
+[fixture.provenance]
+kind = "synthetic"
+authored_from = "src/mojoboost/serialize.mojo version history, v3 entry; src/mojoboost/contrib.mojo"
+authored_by = "compatibility lane, remaining round task 13"
+produced_at = ""
+note = "The only fixture whose expected file is not enough on its own: the contribution assertion is a property of the row, checked by the suite, not a stored vector."
+
+# ---------------------------------------------------------------------
+# v4. Split gains, the presence flag on covers, and the optional feature
+# names section. The version the current build writes.
+# ---------------------------------------------------------------------
+
+[[fixture]]
+id = "v4/single_gains"
+stem = "v4/single_gains"
+model_format_version = 4
+kind = "objective"
+num_class = 1
+objective = "regression"
+n_features = 3
+n_trees = 2
+carries = ["missing_routing", "node_covers", "split_gains"]
+status = "declared"
+proves = "gains travel, so gain importance on a loaded model is the trained model's and not zero"
+
+[fixture.provenance]
+kind = "synthetic"
+authored_from = "src/mojoboost/serialize.mojo version history, v4 entry"
+authored_by = "compatibility lane, remaining round task 13"
+produced_at = ""
+note = "Replace with a `built_at_commit` or `released` row as soon as a build that writes v4 is available to the fixture producer. v4 is the version the current writer emits, so this is the one row that does not have to be synthetic."
+
+[[fixture]]
+id = "v4/single_named_features"
+stem = "v4/single_named_features"
+model_format_version = 4
+kind = "objective"
+num_class = 1
+objective = "regression"
+n_features = 3
+n_trees = 2
+carries = ["missing_routing", "node_covers", "split_gains", "feature_names"]
+status = "declared"
+proves = "the optional feature_names section round trips, including the escape codec: at least one name must contain a space and one must be empty"
+
+[fixture.provenance]
+kind = "synthetic"
+authored_from = "src/mojoboost/serialize.mojo version history, v4 entry; the _escape_name codec and the _EMPTY_NAME_TOKEN constant"
+authored_by = "compatibility lane, remaining round task 13"
+produced_at = ""
+
+[[fixture]]
+id = "v4/resaved_from_v1"
+stem = "v4/resaved_from_v1"
+model_format_version = 4
+kind = "objective"
+num_class = 1
+objective = "regression"
+n_features = 3
+n_trees = 2
+carries = []
+status = "declared"
+proves = "migration rule R4: a v1 model re-saved at v4 is a v4 file that still has no covers and no gains, and it reads back. This is the regression test for the bug v4 fixed, where v3 wrote a loaded-from-v1 model's absent covers as zeros and then rejected its own file"
+
+[fixture.provenance]
+kind = "synthetic"
+derived_from = "v1/single_regression"
+authored_from = "src/mojoboost/serialize.mojo version history, v4 entry, the covers presence flag"
+authored_by = "compatibility lane, remaining round task 13"
+produced_at = ""
+note = "Its predictions must equal v1/single_regression's exactly. That equality is the assertion; the file being larger is not."

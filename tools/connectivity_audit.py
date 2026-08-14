@@ -36,8 +36,10 @@ What it reports:
     Python estimator that is stored on `self` and never read again, and a
     native parameter field that nothing outside its own defining module ever
     sets.
-5.  **Binding functions with no Python caller.** A name in the `def_function`
-    table that no module under `python/mojoboost/` mentions.
+5.  **Binding functions with no Python caller**, and, before that, **binding
+    modules the extension entry point never imports** - a sibling under
+    `bindings/` that `_mojoboost.mojo` does not import is compiled by nothing
+    and reachable from nothing, however many functions it defines.
 6.  **Python APIs with no native call.** The mirror: a native function name
     that Python reaches for - `_mojoboost.foo`, `getattr(_mojoboost, "foo")` -
     that the binding table does not export. These are the degraded paths,
@@ -196,62 +198,40 @@ KIND_ORDER = [CONNECTED, EXPERIMENTAL, PENDING, DEAD]
 #: - Never mark something `CONNECTED` here to silence a finding. If the graph
 #:   says it is unreachable and it is not, the parser is wrong; fix the
 #:   parser.
+#: Written against the tree at commit dc21f03. Rows go stale as lanes land
+#: work: `unified_memory_policy`, `inspection`, `objective_registry`,
+#: `initialization`, `raw_data`, `distributed_transport`, `gpu_fused_round`,
+#: `gpu_leaf_batching`, and `apple_histogram_policy` were all orphans earlier
+#: the same day and are not any more. Re-run the script before trusting a
+#: row; a `CONNECTED` classification on something the graph still calls an
+#: orphan means the row is stale, not that the graph is wrong.
 CLASSIFICATION = {
-    # -- native modules, no root reaches them ------------------------------
+    # -- native modules no entry point reaches -----------------------------
+    "alternate_boosting": (
+        PENDING,
+        "connect_17",
+        "DART and random-forest dispatch. Nothing imports it, so neither "
+        "mode has a route; boosting.mojo still owns the only round loop.",
+    ),
+    "boosting_dart": (
+        PENDING,
+        "connect_17",
+        "Reached only from alternate_boosting, itself unreachable.",
+    ),
+    "boosting_rf": (
+        PENDING,
+        "connect_17",
+        "Reached only from alternate_boosting, itself unreachable.",
+    ),
     "gpu_binned_layout": (
         PENDING,
         "connect_02",
         "Packed-bin layout planner; train_gpu never asks for a plan.",
     ),
-    "gpu_leaf_batching": (
-        PENDING,
-        "connect_02",
-        "Batched multi-leaf histogram kernels; histogram_gpu never batches.",
-    ),
-    "gpu_frontier": (
-        CONNECTED,
-        "connect_02",
-        "Reached through histogram_gpu.",
-    ),
     "gpu_bin_packing": (
         PENDING,
         "connect_02",
         "Reached only from gpu_binned_layout, itself unreachable.",
-    ),
-    "gpu_fused_round": (
-        PENDING,
-        "connect_03",
-        "Device-resident round; train_gpu still round-trips per tree.",
-    ),
-    "gpu_gradient_stream": (
-        PENDING,
-        "connect_03",
-        "Reached only from gpu_fused_round, itself unreachable.",
-    ),
-    "gpu_multiclass_batch": (
-        PENDING,
-        "connect_04",
-        "Class-batched GPU rounds; multiclass GPU training is per-class.",
-    ),
-    "gpu_output_planes": (
-        PENDING,
-        "connect_04",
-        "Reached only from unreachable multiclass and Apple policy modules.",
-    ),
-    "hybrid_leaf_scheduler": (
-        PENDING,
-        "connect_04",
-        "CPU/GPU per-leaf placement; no trainer consults it.",
-    ),
-    "histogram_cache_policy": (
-        PENDING,
-        "connect_04",
-        "Reached only from hybrid_leaf_scheduler, itself unreachable.",
-    ),
-    "apple_histogram_policy": (
-        PENDING,
-        "connect_04",
-        "Apple kernel-specialization plan; histogram_gpu picks its own.",
     ),
     "gpu_levelwise": (
         PENDING,
@@ -262,6 +242,21 @@ CLASSIFICATION = {
         PENDING,
         "connect_02",
         "Reached only from gpu_levelwise, itself unreachable.",
+    ),
+    "gpu_multiclass_batch": (
+        PENDING,
+        "connect_04",
+        "Class-batched GPU rounds; multiclass GPU training is per-class.",
+    ),
+    "hybrid_leaf_scheduler": (
+        PENDING,
+        "connect_04",
+        "CPU/GPU per-leaf placement; no trainer consults it.",
+    ),
+    "histogram_cache_policy": (
+        PENDING,
+        "connect_04",
+        "Reached only from hybrid_leaf_scheduler, itself unreachable.",
     ),
     "gpu_categorical": (
         PENDING,
@@ -278,39 +273,16 @@ CLASSIFICATION = {
         "connect_10",
         "Reached only from gpu_sparse, itself unreachable.",
     ),
-    "objective_registry": (
+    "gpu_portability": (
         PENDING,
-        "connect_08",
-        "The authoritative objective table; objective.mojo and params.mojo "
-        "each still carry their own.",
+        "connect_20",
+        "Portable specialization points. Its own test imports gpu_tiling "
+        "and histogram_gpu rather than this module, so nothing reaches it.",
     ),
-    "inspection": (
+    "gpu_backend_policy": (
         PENDING,
-        "connect_11",
-        "Native model dump; Python re-parses the saved text file instead.",
-    ),
-    "model_dump": (
-        PENDING,
-        "connect_11",
-        "Reached only from inspection, itself unreachable.",
-    ),
-    "initialization": (
-        PENDING,
-        "connect_05",
-        "Startup phase tracing and warmup; nothing calls it at import or fit.",
-    ),
-    "unified_memory_policy": (
-        EXPERIMENTAL,
-        "connect_05",
-        "Route evidence ledger. Reached from bench/apple/unified_memory.mojo "
-        "only; the routes it scores are not implemented in any trainer, so "
-        "wiring it would connect a policy to nothing.",
-    ),
-    "distributed_transport": (
-        PENDING,
-        "connect_13",
-        "Real transport; distributed.mojo still uses the in-process "
-        "collective. Reached from its own test only.",
+        "connect_20",
+        "Reached only from gpu_portability, itself unreachable.",
     ),
     "lgbm_model_io": (
         PENDING,
@@ -318,16 +290,18 @@ CLASSIFICATION = {
         "LightGBM text model reader/writer; no entry point offers it. "
         "Reached from its own test only.",
     ),
-    "raw_data": (
-        PENDING,
-        "connect_12",
-        "Unbinned dataset holder; no trainer or Dataset path takes one.",
-    ),
     "backend": (
         EXPERIMENTAL,
         "connect_01",
-        "A one-function dispatch shim kept as the reference the "
-        "CPU/GPU equivalence test compares against. Test-only by design.",
+        "A one-function dispatch shim kept as the reference the CPU/GPU "
+        "equivalence test compares against. Test-only by design.",
+    ),
+    "unified_memory_policy": (
+        EXPERIMENTAL,
+        "connect_05",
+        "Route evidence ledger, now reached from device_policy and "
+        "histogram_gpu. The routes it scores are still not implemented in "
+        "any trainer, so the decision it returns has one live outcome.",
     ),
     # -- Python modules ----------------------------------------------------
     "mojoboost._public_api_plan": (
@@ -335,6 +309,13 @@ CLASSIFICATION = {
         "connect_07",
         "A plan expressed as data. Its own docstring states that nothing in "
         "the package imports it; importing it would be the bug.",
+    ),
+    "mojoboost._compat": (
+        PENDING,
+        "connect_07",
+        "Holds the pre-import interpreter guard. Nothing calls it, so on "
+        "CPython below EXTENSION_FLOOR the process aborts on a missing "
+        "libpython symbol instead of raising the message this module has.",
     ),
     # -- binding table entries with no Python caller ------------------------
     "dataset_num_data": (
@@ -357,6 +338,107 @@ CLASSIFICATION = {
         PENDING,
         "connect_07",
         "Python reaches raw scores through predict_range instead.",
+    ),
+    "predict": (
+        PENDING,
+        "connect_07",
+        "Superseded in Python by predict_range without being removed.",
+    ),
+    "predict_proba": (
+        PENDING,
+        "connect_07",
+        "Superseded in Python by predict_proba_range without being removed.",
+    ),
+    "predict_batch": (
+        PENDING,
+        "connect_07",
+        "Batched prediction entry; no Python estimator routes to it.",
+    ),
+    "predict_proba_batch": (
+        PENDING,
+        "connect_07",
+        "Batched probability entry; no Python estimator routes to it.",
+    ),
+    "predict_leaf_batch": (
+        PENDING,
+        "connect_07",
+        "Batched leaf indices; no Python estimator routes to it.",
+    ),
+    "predict_leaf_multiclass_batch": (
+        PENDING,
+        "connect_07",
+        "Batched multiclass leaf indices; no Python estimator routes to it.",
+    ),
+    "gpu_predict_capability": (
+        PENDING,
+        "connect_07",
+        "Reports whether GPU prediction covers a model. Python never asks, "
+        "so GPU prediction has no route from the estimators.",
+    ),
+    "gpu_validation_open": (
+        PENDING,
+        "connect_07",
+        "GPU validation session; no Python eval path opens one.",
+    ),
+    "gpu_validation_open_multiclass": (
+        PENDING,
+        "connect_07",
+        "GPU validation session; no Python eval path opens one.",
+    ),
+    "gpu_validation_accumulate": (
+        PENDING,
+        "connect_07",
+        "Reached only through a session Python never opens.",
+    ),
+    "gpu_validation_accumulate_multiclass": (
+        PENDING,
+        "connect_07",
+        "Reached only through a session Python never opens.",
+    ),
+    "gpu_validation_metric": (
+        PENDING,
+        "connect_07",
+        "Reached only through a session Python never opens.",
+    ),
+    "gpu_validation_raw": (
+        PENDING,
+        "connect_07",
+        "Reached only through a session Python never opens.",
+    ),
+    "gpu_validation_reset": (
+        PENDING,
+        "connect_07",
+        "Reached only through a session Python never opens.",
+    ),
+    "gpu_validation_shape": (
+        PENDING,
+        "connect_07",
+        "Reached only through a session Python never opens.",
+    ),
+    # -- native names Python reaches for that no table exports --------------
+    "dump_model": (
+        PENDING,
+        "connect_06",
+        "Implemented in bindings/inspection_bindings.mojo, which "
+        "bindings/_mojoboost.mojo neither imports nor registers.",
+    ),
+    "objective_code": (
+        PENDING,
+        "connect_06",
+        "Implemented in bindings/inspection_bindings.mojo, which "
+        "bindings/_mojoboost.mojo neither imports nor registers.",
+    ),
+    "registry_metrics": (
+        PENDING,
+        "connect_06",
+        "Implemented in bindings/objective_bindings.mojo, which "
+        "bindings/_mojoboost.mojo neither imports nor registers.",
+    ),
+    "decide_device": (
+        PENDING,
+        "connect_06",
+        "device_policy.decide_device exists natively and no binding module "
+        "wraps it, so device_selection.py runs in its degraded mode.",
     ),
 }
 
@@ -964,6 +1046,81 @@ def audit_unused_bindings():
     return findings
 
 
+def audit_binding_modules():
+    """Binding modules the extension entry point never imports.
+
+    `bindings/_mojoboost.mojo` is the whole extension: the
+    `PythonModuleBuilder` block in it is the only thing that becomes an
+    attribute of
+    `mojoboost._mojoboost`. A sibling module under `bindings/` that it does
+    not import is compiled by nothing and callable from nothing, however many
+    `def`s it holds - and `bindings/build.sh` compiles only the entry point,
+    so a sibling is not even on the include path.
+
+    This is the cheapest way to write a whole binding surface that does not
+    exist at runtime, which is why it gets its own section rather than being
+    inferred from the Python side.
+    """
+    findings = []
+    entry = os.path.join(BINDINGS_DIR, "_mojoboost.mojo")
+    text = must_read(entry)
+    body = strip_mojo_comments(text)
+    build = read(os.path.join(BINDINGS_DIR, "build.sh")) or ""
+
+    for path in walk(BINDINGS_DIR, ".mojo"):
+        stem = os.path.splitext(os.path.basename(path))[0]
+        if stem == "_mojoboost":
+            continue
+        imported = re.search(
+            r"^from\s+%s\s+import" % re.escape(stem), body, re.MULTILINE
+        )
+        if imported:
+            continue
+        defined = 0
+        sibling = read(path)
+        if sibling is not None:
+            defined = len(
+                re.findall(
+                    r"^def\s+[a-z][A-Za-z_0-9]*\(",
+                    strip_mojo_comments(sibling),
+                    re.MULTILINE,
+                )
+            )
+        detail = (
+            "%s defines %d functions and %s never imports it, so none of "
+            "them reach Python" % (path, defined, entry)
+        )
+        findings.append(
+            Finding(
+                "binding-modules",
+                stem,
+                detail,
+                kind=PENDING,
+                owner="connect_06",
+            )
+        )
+
+    if "-I bindings" not in build:
+        siblings = [
+            p
+            for p in walk(BINDINGS_DIR, ".mojo")
+            if not p.endswith("_mojoboost.mojo")
+        ]
+        if siblings:
+            findings.append(
+                Finding(
+                    "binding-modules",
+                    "bindings/build.sh",
+                    "compiles only the entry point with -I src; a sibling "
+                    "binding module importing another sibling needs "
+                    "-I bindings on the same command",
+                    kind=PENDING,
+                    owner="unassigned",
+                )
+            )
+    return findings
+
+
 # -- 6. Python APIs with no native call ------------------------------------
 
 
@@ -1269,6 +1426,11 @@ SECTIONS = [
         "dead-parameters",
         "Estimator parameters with no visible downstream consumer",
         audit_dead_parameters,
+    ),
+    (
+        "binding-modules",
+        "Binding modules the extension entry point never imports",
+        audit_binding_modules,
     ),
     (
         "unused-bindings",

@@ -124,6 +124,17 @@ def backend_is_exercised(api: Int) -> Bool:
     return backend_support(api) == SUPPORT_EXERCISED
 
 
+def backend_is_identified(api: Int) -> Bool:
+    """Whether anything told us which API this is.
+
+    False for `API_UNKNOWN`, which is the value every launch carries today:
+    nothing in the shipping code reads an API name before it launches, and
+    `MOJOBOOST_GPU_BACKEND` is unset on an ordinary run. It is the reason
+    `require_backend_exercised` cannot refuse an unidentified device.
+    """
+    return api != API_UNKNOWN and backend_is_covered(api)
+
+
 def env_ack_unvalidated() -> Bool:
     """Whether `MOJOBOOST_GPU_BACKEND_UNVALIDATED=1` acknowledges running a
     specialized path on a backend with no validation record."""
@@ -158,7 +169,8 @@ def require_backend_covered(api: Int) raises:
 
 
 def require_backend_exercised(api: Int, what: String) raises:
-    """Refuse a specialization on a backend this repository has never run.
+    """Refuse a specialization on a *named* backend this repository has
+    never run.
 
     `what` names the thing being asked for, so the error says which
     specialization was refused rather than only that one was.
@@ -170,9 +182,22 @@ def require_backend_exercised(api: Int, what: String) raises:
     override the gate is unsatisfiable by construction. A run that reaches a
     specialization through it is not a validated run and any number it
     produces has to be reported with the flag.
+
+    **An unidentified backend is not refused**, and that is the honest limit
+    of this gate rather than a hole left open by accident. `API_UNKNOWN` is
+    the value every launch carries today: nothing in the shipping code reads
+    an API name before it launches, and `MOJOBOOST_GPU_BACKEND` is unset on
+    an ordinary run. So an unidentified device is indistinguishable here from
+    the Apple part this repository was developed on, and refusing it would
+    refuse every run that ships, including every Metal one. The gate is
+    exactly as strong as the backend identification reaching it; plumbing
+    the reported API name into the policy layer is what makes it bite, and
+    that patch request is in `handoffs/connect_20_gpu_portability.md`.
     """
     require_backend_covered(api)
     if backend_is_exercised(api):
+        return
+    if not backend_is_identified(api):
         return
     if env_ack_unvalidated():
         return

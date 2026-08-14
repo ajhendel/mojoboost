@@ -99,18 +99,54 @@ either gives the batch fewer tiles than it wanted or resolves it to the
 atomic strategy, which needs no partial buffer at all. `plan_batch` reports
 which of those happened; it does not silently do either.
 
+The frontier seam
+-----------------
+A grower does not assemble a batch by hand. Four calls do it, and each one may
+decline rather than force:
+
+    admit_frontier_batch(frontier, pool, storage, features)
+    assign_batch_slots(frontier, pool, admission, stamp)
+    plan_frontier_batch(caps, frontier, admission, g_scale, h_scale, ...)
+    batcher.enqueue_frontier_batch(plan, bins, rows, grad, hess)
+
+`admit_frontier_batch` is the conservative switch and it declines for five
+distinct reasons (`BATCH_*`), every one of which leaves the caller on the
+established one-leaf-per-launch path that
+`GpuActiveRows.enqueue_range_histogram` already implements. Two of them are
+worth naming here: a build whose batched kernels are not compiled in and
+validated (`KernelFeatures.batched_leaf_kernel`), and a bin matrix that is not
+the one-`UInt8`-per-cell layout these kernels index
+(`BinStorageDescriptor.is_dense_feature_major_u8`). Neither is a performance
+judgement; both are facts about what can be run at all.
+
+`enqueue_frontier_batch` takes the `GpuActiveRows` itself rather than a row
+pointer, so a batch reads the permutation the tree is actually growing on and
+every item's window is checked against that tree's live prefix before a kernel
+starts. Under bagging the prefix is the bag, and a window outside it would be
+inside the buffer and outside the dataset the tree is being fit to, which
+nothing downstream could detect.
+
+Nothing in the sequence allocates or synchronizes per leaf: slots come from a
+pool sized once, the item table is two staged copies per batch, and the launch
+is at most three kernels whatever the batch's width. `download_slots` closes
+the loop on the way home, mapping the output pool once for a whole batch
+rather than once per leaf.
+
 Scope and coupling
 ------------------
 This module owns kernels, buffers, and the launch planning for batched
 histogram construction. It does not own the frontier (gpu_frontier.mojo), the
 row permutation (`GpuActiveRows`), the gradients, or the split search: the
-binned matrix, the active-row buffer, and the gradient planes all arrive as
-pointers, exactly as `enqueue_range_histogram` takes them, so nothing is
-uploaded or copied twice. `DeviceCaps`, `derive_block_threads`, and the
-`STRATEGY_*` constants are imported from `gpu_tiling.mojo` so a strategy int
-means one thing across the backend; the per-item tile distribution is local,
-because a shared tile budget across several leaves is a shape
-`derive_tiling` has no way to express.
+binned matrix and the gradient planes arrive as pointers and the row
+permutation arrives as the struct that owns it, exactly as
+`enqueue_range_histogram` takes them, so nothing is uploaded or copied twice.
+`DeviceCaps`, `derive_block_threads`, the `STRATEGY_*` constants, the grid and
+tile bounds, and `BYTES_PER_PARTIAL_CELL` are imported from `gpu_tiling.mojo`
+rather than restated, and `MAX_BINS`/`PLANES_PER_HISTOGRAM` from
+`gpu_histogram_specializations.mojo`, so every one of those numbers means one
+thing across the backend. The per-item tile distribution is local, because a
+shared tile budget across several leaves is a shape `derive_tiling` has no way
+to express.
 """
 
 from std.atomic import Atomic
@@ -1177,6 +1213,436 @@ def slots_for_budget(
     return n
 
 
+def subtraction_stamp(round_index: Int, feature_epoch: Int) raises -> Int:
+    """The compatibility stamp two histograms must share to be subtracted.
+
+    `HistogramSlotPool` refuses a subtraction across differing stamps, and
+    this is the encoding that makes the refusal mean the right thing. The two
+    conditions are exactly the ones `enqueue_subtract`'s docstring names:
+
+    - **Same fixed-point scales.** The scales are re-derived once per round
+      and per class from the gradient magnitude sums, so they are constant
+      within a tree and generally differ between trees. `round_index` is the
+      caller's counter over (boosting round, class) pairs, which is the
+      granularity a scale actually changes at.
+    - **Same active feature set.** A feature present in one histogram and
+      absent from the other would leave a nonzero slice being subtracted from
+      a zero one. `feature_epoch` is the caller's counter, bumped whenever
+      `set_features`/`set_shared_features` narrows or widens the set, which
+      the trainer does once per tree.
+
+    Folded rather than paired because the pool stores one Int and only ever
+    compares stamps for equality; folding two nonnegative counters into
+    `round * 2^24 + epoch` keeps that comparison exact for any run inside the
+    two bounds below, and refuses outside them rather than aliasing two
+    incompatible histograms onto one stamp. The bounds are far above any real
+    fit (16.7 million feature epochs, and rounds counted over (iteration,
+    class) pairs into the billions) and are checked anyway, because an
+    aliased stamp is a wrong histogram and not a lost slot.
+    """
+    if round_index < 0 or feature_epoch < 0:
+        raise Error("stamp counters must be nonnegative")
+    if feature_epoch >= (1 << 24):
+        raise Error("feature epoch is too large for a subtraction stamp")
+    if round_index >= (1 << 32):
+        raise Error("round index is too large for a subtraction stamp")
+    return (round_index << 24) + feature_epoch
+
+
+# --- The frontier seam ----------------------------------------------------
+#
+# What a grower calls to turn `LeafFrontier` state into one launch, without
+# knowing anything below about tiles, item tables, or the packed grid axis.
+# Four steps, in order, and each one may be declined rather than forced:
+#
+#     admit_frontier_batch   is a batch legal and worth assembling at all
+#     assign_batch_slots     give each covered leaf an output histogram slot
+#     plan_frontier_batch    resolve the launch geometry
+#     GpuLeafBatcher.enqueue_frontier_batch   launch it over the active rows
+#
+# The admission step is the conservative switch. Every reason it can decline
+# leaves the caller on the established one-leaf-per-launch path, which is what
+# `GpuActiveRows.enqueue_range_histogram` already does correctly, so a grower
+# can adopt the batched path without a second correctness story.
+
+comptime BATCH_OK = 0
+
+comptime BATCH_NO_PENDING = 1
+"""No leaf needs work, so there is nothing to launch. Not a failure."""
+
+comptime BATCH_SINGLE_ITEM = 2
+"""Only one leaf needs work. A batch of one is the single-leaf launch with an
+item table in front of it, so the established path is preferred outright."""
+
+comptime BATCH_NO_SLOTS = 3
+"""The histogram slot pool cannot give every covered leaf its own output
+slice. Slots are reclaimable and a leaf can always be rebuilt from its row
+range, so this is a memory bound, never a correctness one."""
+
+comptime BATCH_KERNEL_ABSENT = 4
+"""`KernelFeatures.batched_leaf_kernel` is false: the batched kernels are not
+compiled in and validated for this build."""
+
+comptime BATCH_STORAGE_UNSUPPORTED = 5
+"""The bin matrix is not the one-`UInt8`-per-cell, one-feature-per-block
+matrix these kernels index. A packed or blocked layout needs a decoding
+kernel that does not exist; see `BinStorageDescriptor.check_shipping`."""
+
+
+def batch_admission_name(reason: Int) -> String:
+    if reason == BATCH_OK:
+        return String("ok")
+    if reason == BATCH_NO_PENDING:
+        return String("no_pending_leaves")
+    if reason == BATCH_SINGLE_ITEM:
+        return String("single_item")
+    if reason == BATCH_NO_SLOTS:
+        return String("no_free_histogram_slots")
+    if reason == BATCH_KERNEL_ABSENT:
+        return String("batched_kernel_absent")
+    if reason == BATCH_STORAGE_UNSUPPORTED:
+        return String("bin_storage_unsupported")
+    return String("unknown")
+
+
+struct BatchAdmission(Copyable, Movable):
+    """Whether a batch may be assembled from this frontier, and over which
+    slots.
+
+    Carries the numbers the decision was made from, so a caller that declines
+    can report why rather than only that. `slots` is empty unless
+    `reason == BATCH_OK`, which keeps "declined" and "admitted over nothing"
+    from being the same value.
+    """
+
+    var reason: Int
+    var slots: List[Int]
+    """Frontier slots the batch would cover, ascending."""
+
+    var pending: Int
+    """Leaves needing work, before the `max_items` cap."""
+
+    var free_slots: Int
+
+    def __init__(
+        out self,
+        reason: Int,
+        var slots: List[Int],
+        pending: Int,
+        free_slots: Int,
+    ):
+        self.reason = reason
+        self.slots = slots^
+        self.pending = pending
+        self.free_slots = free_slots
+
+    def admitted(self) -> Bool:
+        return self.reason == BATCH_OK
+
+    def n_items(self) -> Int:
+        return len(self.slots)
+
+    def describe(self) -> String:
+        return (
+            String("batch ")
+            + batch_admission_name(self.reason)
+            + " items "
+            + String(len(self.slots))
+            + " pending "
+            + String(self.pending)
+            + " free_slots "
+            + String(self.free_slots)
+        )
+
+
+def _declined(reason: Int, pending: Int, free_slots: Int) -> BatchAdmission:
+    """A declined admission, spelled once so every reason below produces the
+    same shape: no slots, and the two numbers the decision was made from."""
+    return BatchAdmission(reason, List[Int](), pending, free_slots)
+
+
+def admit_frontier_batch(
+    frontier: LeafFrontier,
+    pool: HistogramSlotPool,
+    storage: BinStorageDescriptor,
+    features: KernelFeatures,
+    max_items: Int = DEFAULT_MAX_ITEMS,
+    min_items: Int = 2,
+) raises -> BatchAdmission:
+    """Decide whether this frontier can be batched, and over which slots.
+
+    Pure host arithmetic against state that already exists: no device, no
+    allocation, and nothing mutated, so a caller may ask before committing to
+    anything. The order of the tests is the order a caller would want them
+    reported in, cheapest structural fact first.
+
+    A leaf that already holds a live slot is counted as needing no new one, so
+    re-batching a frontier whose slots survived does not spuriously decline
+    for want of capacity.
+
+    `min_items` is the width below which the batched path is not worth taking;
+    two is the smallest batch that is not a single-leaf launch in disguise,
+    and it is the default because that is a structural fact rather than a
+    measured threshold. A benchmark that wants a higher bar passes one.
+    """
+    if max_items < 1:
+        raise Error("a batch holds at least one item")
+    if min_items < 1:
+        raise Error("a batch holds at least one item")
+    storage.check()
+
+    var pending = len(frontier.pending())
+    var free = pool.free_slots()
+    if not features.batched_leaf_kernel:
+        return _declined(BATCH_KERNEL_ABSENT, pending, free)
+    if not storage.is_dense_feature_major_u8():
+        return _declined(BATCH_STORAGE_UNSUPPORTED, pending, free)
+    if pending < 1:
+        return _declined(BATCH_NO_PENDING, pending, free)
+    if pending < min_items:
+        return _declined(BATCH_SINGLE_ITEM, pending, free)
+
+    var slots = frontier.batch_slots(max_items)
+    if len(slots) < min_items:
+        return _declined(BATCH_SINGLE_ITEM, pending, free)
+    var needed = 0
+    for i in range(len(slots)):
+        var leaf = frontier.leaf(slots[i])
+        if leaf.hist_slot == NO_SLOT:
+            needed += 1
+        elif pool.owner_of(leaf.hist_slot) != leaf.node:
+            # The slot the leaf remembers was taken back by the pool, so it
+            # needs a fresh one. Eviction costs a rebuild, never an answer.
+            needed += 1
+    if needed > free:
+        return _declined(BATCH_NO_SLOTS, pending, free)
+    return BatchAdmission(BATCH_OK, slots^, pending, free)
+
+
+def assign_batch_slots(
+    mut frontier: LeafFrontier,
+    mut pool: HistogramSlotPool,
+    admission: BatchAdmission,
+    stamp: Int,
+) raises -> List[Int]:
+    """Give every leaf the batch covers its own output histogram slot.
+
+    Returns the pool slots, in the admission's order, and writes each one back
+    into the frontier so `work_items` picks it up. A leaf already holding a
+    live slot under the same stamp keeps it, which is what makes re-batching
+    cheap; a slot under a *different* stamp is released and reacquired,
+    because a histogram accumulated under other scales or another feature set
+    is not a histogram this batch may subtract from or add to.
+
+    All-or-nothing. If the pool runs dry part way through (which
+    `admit_frontier_batch` is meant to prevent, but which a caller that
+    acquired slots in between can still cause), every slot this call took is
+    given back and every frontier assignment it made is undone, so the
+    frontier is exactly as it was and the caller can fall back to the
+    single-leaf path without a leaked slot.
+    """
+    if not admission.admitted():
+        raise Error(
+            "only an admitted batch may be given slots: "
+            + batch_admission_name(admission.reason)
+        )
+    var taken = List[Int]()
+    var taken_at = List[Int]()
+    var out = List[Int](capacity=len(admission.slots))
+    for i in range(len(admission.slots)):
+        var s = admission.slots[i]
+        var leaf = frontier.leaf(s)
+        var held = leaf.hist_slot
+        if held != NO_SLOT:
+            if (
+                pool.owner_of(held) == leaf.node
+                and pool.stamp_of(held) == stamp
+            ):
+                out.append(held)
+                continue
+            if pool.owner_of(held) == leaf.node:
+                pool.release(held)
+            frontier.assign_slot(s, NO_SLOT)
+        var got = pool.acquire(leaf.node, stamp)
+        if got < 0:
+            for k in range(len(taken)):
+                pool.release(taken[k])
+                frontier.assign_slot(taken_at[k], NO_SLOT)
+            raise Error(
+                "the histogram slot pool ran out mid-batch; grow the pool"
+                " (slots_for_budget) or batch fewer leaves"
+            )
+        taken.append(got)
+        taken_at.append(s)
+        frontier.assign_slot(s, got)
+        out.append(got)
+    return out^
+
+
+def release_batch_slots(
+    mut frontier: LeafFrontier, mut pool: HistogramSlotPool, slots: List[Int]
+) raises:
+    """Give a batch's output slots back and clear the frontier's memory of
+    them. For a caller abandoning a planned batch, and for the end of a tree,
+    where every slot is dead at once and `HistogramSlotPool.release_all` is
+    the cheaper call."""
+    for i in range(len(slots)):
+        var s = slots[i]
+        if s < 0 or s >= frontier.size():
+            raise Error("frontier slot out of range")
+        var held = frontier.leaf(s).hist_slot
+        if held != NO_SLOT:
+            pool.release(held)
+            frontier.assign_slot(s, NO_SLOT)
+
+
+def uniform_scales(
+    n_items: Int, g_scale: Float32, h_scale: Float32
+) raises -> List[Float32]:
+    """One gradient/hessian scale pair repeated for every item.
+
+    The single-class case, which is every batch the trainer assembles today:
+    a round has one pair of fixed-point scales and every leaf of every tree in
+    it accumulates under them. A multiclass batch that spanned classes would
+    build the list itself, pair by pair, which is why `plan_batch` takes a
+    list rather than a pair.
+    """
+    if n_items < 1:
+        raise Error("a batch needs at least one item")
+    if g_scale <= 0.0 or h_scale <= 0.0:
+        raise Error("fixed-point scales must be positive")
+    var out = List[Float32](capacity=SCALE_WORDS * n_items)
+    for _ in range(n_items):
+        out.append(g_scale)
+        out.append(h_scale)
+    return out^
+
+
+def plan_frontier_batch(
+    caps: DeviceCaps,
+    frontier: LeafFrontier,
+    admission: BatchAdmission,
+    g_scale: Float32,
+    h_scale: Float32,
+    n_slots: Int,
+    n_bins: Int,
+    strategy: Int = STRATEGY_AUTO,
+    max_partial_cells: Int = 0,
+    max_items: Int = DEFAULT_MAX_ITEMS,
+) raises -> BatchPlan:
+    """Resolve the launch for an admitted, slotted batch.
+
+    Thin on purpose: it turns frontier slots into `LeafWorkItem`s (which is
+    where the row windows, the output slots, and the gradient plane come
+    from), repeats the round's scales once per item, and hands both to
+    `plan_batch`, which is the only tile arithmetic in this lane. Call
+    `assign_batch_slots` first; an item whose leaf still holds `NO_SLOT` is
+    refused here with a message that says so, rather than reaching
+    `plan_batch` as a negative index.
+    """
+    if not admission.admitted():
+        raise Error(
+            "only an admitted batch may be planned: "
+            + batch_admission_name(admission.reason)
+        )
+    var items = frontier.work_items(admission.slots)
+    for i in range(len(items)):
+        if items[i].out_slot == NO_SLOT:
+            raise Error(
+                "a batched leaf holds no output histogram slot; call"
+                " assign_batch_slots before plan_frontier_batch"
+            )
+    var scales = uniform_scales(len(items), g_scale, h_scale)
+    return plan_batch(
+        caps,
+        items,
+        scales,
+        n_slots,
+        n_bins,
+        strategy,
+        max_partial_cells,
+        max_items,
+    )
+
+
+def check_batch_covers_ranges(
+    plan: BatchPlan, frontier: LeafFrontier, admission: BatchAdmission
+) raises:
+    """Every item's window is the window its frontier leaf holds.
+
+    Cheap, and worth running before a launch that reads through the active-row
+    permutation: an item whose `row_begin`/`row_count` had drifted from its
+    leaf would accumulate a histogram of some other leaf's rows entirely
+    inside the buffer, so no bound would be violated and no later check would
+    notice. `GpuActiveRows.check_frontier` is the other half, holding the
+    frontier equal to the device's own range table.
+    """
+    if plan.n_items() != len(admission.slots):
+        raise Error("plan and admission cover different item counts")
+    for i in range(plan.n_items()):
+        var leaf = frontier.leaf(admission.slots[i])
+        if plan.items[i].row_begin != leaf.row_begin:
+            raise Error("a batch item does not start at its leaf's rows")
+        if plan.items[i].row_count != leaf.row_count:
+            raise Error("a batch item does not cover its leaf's rows")
+
+
+def batch_windows(plan: BatchPlan) raises -> List[LeafRange]:
+    """Each item's row window, as the lane's one window type.
+
+    `LeafRange` is `gpu_active_rows`' half-open `[begin, end)`, and a batch
+    item carries the same window as a begin and a count. Returning the shared
+    type rather than a second pair is what keeps a caller from inventing a
+    third spelling of a leaf's rows; `LeafRange.overlaps` is then the ready
+    answer to "do two items of this batch read the same rows", which they
+    never should, because live leaves tile the active prefix.
+    """
+    var out = List[LeafRange](capacity=plan.n_items())
+    for i in range(plan.n_items()):
+        var begin = plan.items[i].row_begin
+        out.append(LeafRange(begin, begin + plan.items[i].row_count))
+    return out^
+
+
+def batched_leaf_stats(
+    raw: List[Int32],
+    n_features: Int,
+    n_bins: Int,
+    feature: Int,
+    g_scale: Float64,
+    h_scale: Float64,
+) raises -> LeafStats:
+    """One downloaded slot's gradient sum, hessian sum, and row count.
+
+    A histogram's count plane sums to the leaf's rows over any one feature,
+    and its gradient and hessian planes to the leaf's sums, so a single
+    feature's slice is enough and the whole slot does not have to be scanned.
+    The scales are the ones the slot was accumulated under, which is the same
+    pair `HistogramSlotPool`'s stamp is meant to keep constant, so a caller
+    that respects the stamp cannot convert with the wrong divisor.
+
+    This is the host-side bridge from a batched result back into
+    `LeafFrontier.set_stats`, and it is deliberately the only one: nothing
+    here re-derives a leaf's rows from anything but its own counts.
+    """
+    var hist_size = n_features * n_bins
+    if len(raw) != N_PLANES * hist_size:
+        raise Error("raw histogram is not one full-width slot")
+    if feature < 0 or feature >= n_features:
+        raise Error("feature index out of range")
+    if g_scale == 0.0 or h_scale == 0.0:
+        raise Error("fixed-point scales must not be zero")
+    var base = feature * n_bins
+    var g = 0.0
+    var h = 0.0
+    var c = 0
+    for b in range(n_bins):
+        g += Float64(raw[base + b])
+        h += Float64(raw[hist_size + base + b])
+        c += Int(raw[2 * hist_size + base + b])
+    return LeafStats(g / g_scale, h / h_scale, c)
+
+
 # --- The batcher ----------------------------------------------------------
 
 
@@ -1538,6 +2004,51 @@ struct GpuLeafBatcher(Movable):
                 block_dim=threads,
             )
 
+    def enqueue_frontier_batch[
+        bins_origin: MutOrigin,
+        grad_origin: MutOrigin,
+        hess_origin: MutOrigin, //
+    ](
+        mut self,
+        plan: BatchPlan,
+        bins: MutPointer[UInt8, bins_origin],
+        mut rows: GpuActiveRows,
+        grad: MutPointer[Float32, grad_origin],
+        hess: MutPointer[Float32, hess_origin],
+    ) raises:
+        """`enqueue_batch` against the active-row permutation itself.
+
+        The connection that makes a batch read *only* the rows its leaves own:
+        the row pointer is `GpuActiveRows`' own buffer rather than something
+        the caller found, and every item's window is checked against that
+        permutation's live prefix before anything launches. A window outside
+        `[0, n_active)` is not a bounds violation on the buffer (the buffer is
+        `n_rows` long and the prefix is at most that), so nothing downstream
+        would catch it: it would silently accumulate over rows this tree does
+        not grow on, which under bagging is a different dataset.
+
+        Enqueues only. No transfer, no synchronization, and no allocation, so
+        a batch of thirty leaves costs the same host round trips as a batch of
+        one: `_stage_plan`'s two copies and at most three launches.
+        """
+        if rows.n_rows != self.n_rows:
+            raise Error(
+                "the active-row permutation and this batcher were built for"
+                " different datasets"
+            )
+        var live = rows.n_active()
+        for i in range(plan.n_items()):
+            var begin = plan.items[i].row_begin
+            var count = plan.items[i].row_count
+            if begin < 0 or count < 0 or begin + count > live:
+                raise Error(
+                    "a batch item's rows escape this tree's active row"
+                    " prefix"
+                )
+        self.enqueue_batch(
+            plan, bins, rows.rows_dev.unsafe_ptr(), grad, hess
+        )
+
     def enqueue_subtract(
         mut self, parent_slot: Int, child_slot: Int, dst_slot: Int
     ) raises:
@@ -1587,4 +2098,34 @@ struct GpuLeafBatcher(Movable):
             var p = host.unsafe_ptr()
             for i in range(cells):
                 out.append(p.unsafe_load(slot * cells + i))
+        return out^
+
+    def download_slots(mut self, slots: List[Int]) raises -> List[Int32]:
+        """Several slots' fixed-point histograms in one mapping.
+
+        The whole point of batching is that a launch is not paid per leaf, and
+        `download_slot` gives that back on the way home: one `map_to_host` per
+        leaf is one synchronization per leaf. This maps once and copies every
+        requested slot out of that mapping, so a batch of thirty costs one.
+
+        The result is the slots concatenated in the order given, `slot_cells()`
+        words each, so slot `k` of the request starts at
+        `k * slot_cells()`. Each one is in `GpuHistogramBuilder`'s
+        `[grad | hess | count]` layout, exactly as `download_slot` returns it.
+        """
+        if len(slots) < 1:
+            raise Error("a download needs at least one slot")
+        var cells = self.slot_cells()
+        for i in range(len(slots)):
+            self.pool.check_live(slots[i])
+            for k in range(i):
+                if slots[k] == slots[i]:
+                    raise Error("a download may not list a slot twice")
+        var out = List[Int32](capacity=len(slots) * cells)
+        with self.out_dev.map_to_host() as host:
+            var p = host.unsafe_ptr()
+            for i in range(len(slots)):
+                var base = slots[i] * cells
+                for c in range(cells):
+                    out.append(p.unsafe_load(base + c))
         return out^

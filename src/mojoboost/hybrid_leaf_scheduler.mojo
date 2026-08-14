@@ -128,24 +128,63 @@ Two rules, both structural rather than advisory:
   Between them, which device finished first cannot reach the best-gain scan,
   the tie-break, or the chosen split.
 
+The three answers, and where each comes from
+--------------------------------------------
+A node's histogram is read, built on the host, or built on the device, and
+this module returns exactly one of those:
+
+- **Reuse** (`PLACE_REUSE`) is decided first and without the cost model,
+  because a build that does not happen cannot lose a comparison. It is
+  decided from a `ReuseOffer` the caller makes, never from a search here:
+  the sibling of a committed split, which both growers already subtract, or
+  a cache entry `histogram_cache_policy.HistogramCache.lookup` returned
+  fresh. `plan_split` states the sibling's placement rather than leaving it
+  implied, which is what makes a split plan cover the whole split.
+- **Host** and **device** are the comparison below, unchanged, and today it
+  always answers device for want of a measured cost model.
+
+None of the three changes a split. Reuse hands back the histogram the grower
+would have produced; a host build substitutes only in a mode that says so;
+and the decision is a pure function of counts, so it cannot depend on which
+device finished first.
+
+Where the launch count comes from
+---------------------------------
+`LeafWork.gpu_launches` is what the device path costs before it touches a
+row, and it depends on the strategy the geometry resolved to: one launch for
+the atomic path, two for the tiled one. This module does not know that rule
+and must not learn it. `LeafWork.for_tiling` takes a resolved
+`gpu_tiling.HistogramTiling` and reads the count off it, and a caller holding
+an `apple_histogram_policy.HistogramPlan` passes `plan.tiling()`. That is the
+whole of this module's coupling to the launch policy: it charges for the
+launches the policy will issue, and decides nothing about them.
+
 What this module does not do
 ----------------------------
 It does not accumulate a histogram, own a buffer, touch a device, or edit a
 grower. It does not decide CPU-versus-GPU *training* -- that is
 `device_policy.mojo`, and a hybrid leaf schedule presupposes the GPU trainer
-was already chosen. Histogram lifetimes, cache keys, and invalidation are
-`histogram_cache_policy.mojo`.
+was already chosen. It does not decide what is reusable; that argument is
+made once, in `histogram_cache_policy.mojo`, along with histogram lifetimes,
+cache keys, and invalidation.
 """
 
 from std.os import getenv
 
+from .gpu_tiling import HistogramTiling
 from .histogram_cache_policy import (
+    FRESH,
     ORIGIN_CPU_FLOAT64,
     ORIGIN_CPU_REPLICA,
     ORIGIN_GPU_FIXED,
+    ORIGIN_SUBTRACTED,
+    ORIGIN_UNKNOWN,
+    STALE_ABSENT,
     fixed_download_bytes,
     histogram_cells,
     origin_name,
+    origins_are_subtractable,
+    staleness_name,
 )
 from .parallel import _env_int
 
@@ -221,6 +260,15 @@ def env_hybrid_mode() -> Int:
 comptime PLACE_GPU = 0
 comptime PLACE_CPU = 1
 comptime PLACE_BOTH = 2
+comptime PLACE_REUSE = 3
+"""Neither device builds this node: a histogram that is already the right
+answer is read instead. The two cases are the sibling of a committed split,
+which both growers already subtract, and a cache entry
+`histogram_cache_policy.HistogramCache.lookup` returned as fresh. Reuse is
+the cheapest placement by construction and so is decided before the cost
+comparison, but only from a fact the caller reports; nothing here searches
+for reuse, and `histogram_cache_policy.mojo` is where what is reusable at all
+is argued."""
 
 
 def placement_name(place: Int) -> String:
@@ -228,6 +276,8 @@ def placement_name(place: Int) -> String:
         return String("cpu")
     if place == PLACE_BOTH:
         return String("both")
+    if place == PLACE_REUSE:
+        return String("reuse")
     return String("gpu")
 
 
@@ -242,7 +292,8 @@ comptime DECLINE_EMPTY_NODE = 7
 comptime DECLINE_TRANSFER_DOMINATES = 8
 comptime DECLINE_SLOWER_ON_HOST = 9
 comptime DECLINE_SNAPSHOT_NOT_PAID = 10
-comptime N_DECLINE_REASONS = 11
+comptime REUSED_FRESH_HISTOGRAM = 11
+comptime N_DECLINE_REASONS = 12
 
 
 def decline_name(reason: Int) -> String:
@@ -268,6 +319,8 @@ def decline_name(reason: Int) -> String:
         return String("modelled-slower-on-the-host")
     if reason == DECLINE_SNAPSHOT_NOT_PAID:
         return String("first-host-leaf-cannot-pay-for-the-snapshot")
+    if reason == REUSED_FRESH_HISTOGRAM:
+        return String("reused-a-histogram-that-is-already-the-answer")
     return String("unknown")
 
 
@@ -535,7 +588,14 @@ struct LeafWork(Copyable, Movable):
     """Kernel launches the device path would issue for this node: one for
     the atomic strategy, two for the tiled one (partial accumulate, then
     reduce). Taken from the resolved tiling rather than re-derived, so this
-    module holds no copy of `gpu_tiling.mojo`'s rules."""
+    module holds no copy of `gpu_tiling.mojo`'s rules.
+
+    `node_of` defaults it to one, which is the atomic path and the shape of
+    every small node. A caller that has resolved a geometry should not use
+    that default: `for_tiling` below takes the count from
+    `gpu_tiling.launches_for_strategy`, and a caller holding an
+    `apple_histogram_policy.HistogramPlan` passes `plan.tiling()`.
+    """
 
     @staticmethod
     def node_of(
@@ -581,6 +641,40 @@ struct LeafWork(Copyable, Movable):
             row_source,
             materialize_rows,
             gpu_launches,
+        )
+
+    @staticmethod
+    def for_tiling(
+        node: Int,
+        node_rows: Int,
+        n_slots: Int,
+        n_features: Int,
+        n_bins: Int,
+        dataset_rows: Int,
+        tiling: HistogramTiling,
+        row_source: Int = ROWS_HOST_SNAPSHOT,
+        materialize_rows: Int = 0,
+    ) raises -> LeafWork:
+        """A node whose device path has already been planned.
+
+        The connected form of `node_of`: the launch count comes from the
+        strategy the geometry resolved to rather than from this module's
+        default, so the cost model charges the launches the device will
+        actually issue. A caller holding an
+        `apple_histogram_policy.HistogramPlan` passes `plan.tiling()`, which
+        is the same geometry projected onto the descriptor every launch site
+        takes.
+        """
+        return LeafWork.node_of(
+            node,
+            node_rows,
+            n_slots,
+            n_features,
+            n_bins,
+            dataset_rows,
+            row_source,
+            tiling.launches(),
+            materialize_rows,
         )
 
     def row_slot_kops(self) -> Int:
@@ -877,6 +971,75 @@ struct Placement(Copyable, Movable):
         makes true without making `is_host` true."""
         return self.device == PLACE_CPU or self.device == PLACE_BOTH
 
+    def is_reuse(self) -> Bool:
+        """Whether nothing is accumulated for this node at all. The modelled
+        costs are still carried, so a trace can show what the reuse
+        avoided."""
+        return self.device == PLACE_REUSE
+
+
+@fieldwise_init
+struct ReuseOffer(Copyable, Movable):
+    """What the caller's histogram bookkeeping already holds for this node.
+
+    A fact, not a search. `histogram_cache_policy.HistogramCache.lookup`
+    answers "is this buffer still the right answer for this
+    (dataset, round, tree, feature set, node)?" and returns a staleness code
+    with it; this carries that answer to the placement so a node whose
+    histogram exists is not built a second time on either device.
+
+    Nothing here decides what is reusable. That argument is made once, in
+    `histogram_cache_policy.mojo`, and its conclusion is narrow: beyond the
+    parent/sibling subtraction both growers already exploit there is no reuse
+    in this trainer, because every round refreshes every gradient. So the
+    offer a caller can honestly make is the sibling of a committed split, and
+    `none()` is what everything else gets.
+    """
+
+    var available: Bool
+    var origin: Int
+    """Where the offered histogram came from, for
+    `origins_are_subtractable`: a device build, a host replica, a Float64
+    host build, or a subtraction."""
+
+    var staleness: Int
+    """`FRESH`, or the `histogram_cache_policy` code saying why not."""
+
+    @staticmethod
+    def none() -> ReuseOffer:
+        """No histogram is held for this node, which is the default and the
+        state of every node under the shipped configuration."""
+        return ReuseOffer(False, ORIGIN_UNKNOWN, STALE_ABSENT)
+
+    @staticmethod
+    def held(origin: Int, staleness: Int) -> ReuseOffer:
+        """A cache entry the caller found. Still refused unless it is fresh
+        and carries a known origin."""
+        return ReuseOffer(True, origin, staleness)
+
+    @staticmethod
+    def subtracted_from(parent_origin: Int, direct_origin: Int) -> ReuseOffer:
+        """The sibling of a committed split, which is the one reuse this
+        trainer actually has.
+
+        Offered only when the parent and the directly built child came
+        through the same arithmetic: a dequantized device parent minus a
+        Float64 host child is not the sibling, and
+        `origins_are_subtractable` is the check that says so. When they do
+        not agree the sibling has to be built like any other node, which is
+        what `none()` here produces.
+        """
+        if not origins_are_subtractable(parent_origin, direct_origin):
+            return ReuseOffer.none()
+        return ReuseOffer(True, ORIGIN_SUBTRACTED, FRESH)
+
+    def usable(self) -> Bool:
+        return (
+            self.available
+            and self.staleness == FRESH
+            and self.origin != ORIGIN_UNKNOWN
+        )
+
 
 def decline_reason(ctx: HybridContext, work: LeafWork) raises -> Int:
     """Why this node will not be built on the host, or `ACCEPTED`.
@@ -983,6 +1146,41 @@ def place_leaf(ctx: HybridContext, work: LeafWork) raises -> Placement:
     )
 
 
+def place_leaf_with_reuse(
+    ctx: HybridContext, work: LeafWork, offer: ReuseOffer
+) raises -> Placement:
+    """Decide where one node's histogram comes from, reuse included.
+
+    Three answers, in the order they are cheap: read a histogram that is
+    already the right answer, build it on the host, or build it on the
+    device. The first is decided from the caller's offer alone and never
+    from the cost model, because a build that does not happen cannot be
+    slower than one that does; the other two are `place_leaf`'s comparison,
+    unchanged.
+
+    Reuse changes no split. The reused histogram is the one the grower would
+    have produced -- a subtraction both growers already perform, or a cache
+    entry whose key says it describes this exact
+    (dataset, gradients, feature set, tree, node) -- so the gain scan sees
+    the same cells and picks the same split. What it changes is only whether
+    an accumulation ran.
+    """
+    if not offer.usable():
+        return place_leaf(ctx, work)
+    return Placement(
+        work.node,
+        PLACE_REUSE,
+        REUSED_FRESH_HISTOGRAM,
+        device_leaf_nanos(work, ctx.costs),
+        host_leaf_nanos(work, ctx.costs),
+        host_transfer_nanos(work, ctx.costs),
+        work.transfer_bytes(),
+        work.download_bytes(),
+        offer.origin,
+        False,
+    )
+
+
 @fieldwise_init
 struct SplitPlan(Copyable, Movable):
     """How the two children of one committed split get their histograms.
@@ -994,6 +1192,15 @@ struct SplitPlan(Copyable, Movable):
     build runs. The subtracted sibling is host arithmetic in either case,
     because the parent's histogram is host-resident on the path this module
     accepts.
+
+    Both children carry a placement, so a plan says what happens to the whole
+    split rather than to half of it. The sibling's is normally `PLACE_REUSE`
+    with `ORIGIN_SUBTRACTED`, which is the reuse this trainer already
+    performs and is now stated instead of assumed. It is not reuse when the
+    parent and the direct child came through different arithmetic -- a
+    dequantized device parent and a Float64 host child, which is exactly what
+    `MODE_HOST_FLOAT64` produces -- and then the sibling is placed like any
+    other node.
     """
 
     var direct_node: Int
@@ -1002,9 +1209,34 @@ struct SplitPlan(Copyable, Movable):
     var subtracted_rows: Int
     var direct_is_left: Bool
     var placement: Placement
+    var subtracted_placement: Placement
 
     def builds_on_host(self) -> Bool:
         return self.placement.builds_on_host()
+
+    def sibling_is_subtracted(self) -> Bool:
+        """Whether the sibling comes out of the parent by subtraction, which
+        is the arithmetic the grower already performs."""
+        return (
+            self.subtracted_placement.is_reuse()
+            and self.subtracted_placement.origin == ORIGIN_SUBTRACTED
+        )
+
+    def builds(self) -> Int:
+        """Histogram accumulations this split costs, on either device. One
+        under the shipped configuration, two when the sibling cannot be
+        subtracted, and one more when a mirrored host build runs alongside a
+        device one."""
+        var n = 0
+        if not self.placement.is_reuse():
+            n += 1
+            if self.placement.device == PLACE_BOTH:
+                n += 1
+        if not self.subtracted_placement.is_reuse():
+            n += 1
+            if self.subtracted_placement.device == PLACE_BOTH:
+                n += 1
+        return n
 
 
 def plan_split(
@@ -1021,8 +1253,9 @@ def plan_split(
     right_row_source: Int = ROWS_HOST_SNAPSHOT,
     gpu_launches: Int = 1,
     parent_materialized: Bool = True,
+    parent_origin: Int = ORIGIN_GPU_FIXED,
 ) raises -> SplitPlan:
-    """Plan the one histogram build a committed split needs.
+    """Plan the histogram builds a committed split needs.
 
     Row counts come from the parent histogram's exact integer counts, which
     the grower has before the partition runs, so this plans without waiting
@@ -1034,6 +1267,11 @@ def plan_split(
     direct child charges one host partition over the parent's rows
     (`n_left + n_right`). That partition materializes *both* children at
     once, so the sibling never charges it again.
+
+    `parent_origin` is where the parent's histogram came from, and it decides
+    whether the sibling can be subtracted from it at all. It defaults to
+    `ORIGIN_GPU_FIXED`, which is what the GPU grower holds: a device build,
+    downloaded and dequantized.
     """
     if n_left < 0 or n_right < 0:
         raise Error("child row counts must be nonnegative")
@@ -1069,13 +1307,39 @@ def plan_split(
         gpu_launches,
         materialize,
     )
+    var direct = place_leaf(ctx, work)
+
+    # The sibling. Its rows are whatever is left of the parent's, so the
+    # partition the direct child may have charged has already materialized
+    # them and it charges nothing; what it costs, if it cannot be subtracted,
+    # is an ordinary build of its own row count.
+    var other_source = right_row_source
+    if not direct_is_left:
+        other_source = left_row_source
+    var other_work = LeafWork.node_of(
+        other_node,
+        other_rows,
+        n_slots,
+        n_features,
+        n_bins,
+        dataset_rows,
+        other_source,
+        gpu_launches,
+        0,
+    )
+    var sibling = place_leaf_with_reuse(
+        ctx,
+        other_work,
+        ReuseOffer.subtracted_from(parent_origin, direct.origin),
+    )
     return SplitPlan(
         direct_node,
         direct_rows,
         other_node,
         other_rows,
         direct_is_left,
-        place_leaf(ctx, work),
+        direct,
+        sibling,
     )
 
 
@@ -1260,6 +1524,21 @@ def describe_placement(placement: Placement) -> String:
         origin_name(placement.origin),
         " takes_snapshot=",
         _yes_no(placement.takes_snapshot),
+    )
+
+
+def describe_offer(offer: ReuseOffer) -> String:
+    """One line for a trace: what the caller held for this node and whether
+    it was usable."""
+    return String(
+        "held=",
+        _yes_no(offer.available),
+        " origin=",
+        origin_name(offer.origin),
+        " staleness=",
+        staleness_name(offer.staleness),
+        " usable=",
+        _yes_no(offer.usable()),
     )
 
 

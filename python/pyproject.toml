@@ -39,6 +39,7 @@ requires-python = ">=3.14"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [{ name = "Andrew Hendel" }]
+maintainers = [{ name = "Andrew Hendel" }]
 keywords = [
     "gradient boosting",
     "gbdt",
@@ -157,6 +158,7 @@ Issues = "https://github.com/ajhendel/mojoboost/issues"
 # them rather than at a host that does not exist. No Changelog entry:
 # there is no CHANGELOG file to point at yet.
 Documentation = "https://github.com/ajhendel/mojoboost/tree/main/docs"
+Creator = "https://github.com/ajhendel"
 
 [tool.setuptools]
 # Listed explicitly rather than discovered. Discovery on this directory

@@ -951,8 +951,8 @@ def check_bundle_compatibility(
 # elsewhere asserting a fact ("there is no sparse GPU histogram kernel")
 # that stopped being true.
 #
-# The honest distinction it draws, and the reason `training_supported` is a
-# separate field from `histograms_supported`:
+# The honest distinction it draws, and the reason `training` is a separate
+# field from `histograms`:
 #
 # - the *primitives* are real. `GpuSparseHistogramBuilder` uploads a
 #   compressed matrix, builds a node histogram, and partitions rows and

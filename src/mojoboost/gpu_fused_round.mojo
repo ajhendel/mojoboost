@@ -1044,7 +1044,13 @@ struct GpuDeviceRound(Movable):
         halfway is reported as such rather than silently continued."""
         if self.stage == ROUND_STAGE_CLOSED:
             raise Error("this device round is already closed")
-        if self.stage != ROUND_STAGE_SCALED:
+        # An opened round that grew nothing (an early stop between the
+        # boundary and the first tree) closes cleanly; a round that
+        # enqueued a stage nobody consumed does not, because its readback
+        # buffer is still owed a wait.
+        if self.stage != ROUND_STAGE_OPEN and (
+            self.stage != ROUND_STAGE_SCALED
+        ):
             raise Error(
                 String("a device round left ")
                 + round_stage_name(self.stage)

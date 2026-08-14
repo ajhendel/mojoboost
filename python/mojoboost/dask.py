@@ -122,13 +122,19 @@ Partition rules, and why each one is a rule
   because bin 7 of feature 3 has to mean the same thing on every rank.
 - **A query may not straddle a partition boundary.** LambdaRank gradients
   are computed within a query, and a rank only sees its own rows.
+- **An eval set lands rank for rank on the training data.** A rank scores
+  the validation rows on its own worker and the losses are reduced with
+  the gradients, so the two collections need the same number of ranks and
+  the same worker per rank. Anything else would ship validation rows
+  across the cluster every round.
 
 See also
 --------
 
-docs/distributed.md for the algorithm and its refusal list, and
-handoffs/task17_dask.md for exactly what the transport work has to expose
-before any of the three estimators here can be called supported.
+docs/distributed.md for the algorithm and its refusal list,
+handoffs/task17_dask.md for the original contract, and
+handoffs/connect_15_dask.md for the native entry points the runtime still
+owes and the state of each connection made here.
 """
 
 import hashlib
@@ -824,6 +830,38 @@ def take_model_bytes(ref, timeout=None):
     return blob
 
 
+def _metric_names(eval_metric):
+    """`eval_metric` as a tuple of names, in the order it was given.
+
+    Names rather than resolved metrics: which metric an objective defaults
+    to, and whether a metric is even compatible with it, belongs to the
+    objective registry in Mojo and is decided on the ranks. The client
+    passes the names through and lays the reported history out under them.
+    """
+    if eval_metric is None:
+        return ()
+    if isinstance(eval_metric, str):
+        return (eval_metric,)
+    if callable(eval_metric):
+        raise ValueError(
+            "a custom eval_metric is a Python callable, and a distributed "
+            "fit would have to call it once per rank per round from inside "
+            "a collective. Name a built-in metric, or fit on one machine"
+        )
+    names = tuple(str(name) for name in eval_metric)
+    if len(set(names)) != len(names):
+        raise ValueError(f"eval_metric has repeats: {list(names)!r}")
+    return names
+
+
+def _reader(record):
+    """A `get(name)` over a mapping or an object, so a backend may report
+    its validation history as whichever is natural for it."""
+    if hasattr(record, "get"):
+        return record.get
+    return lambda name, default=None: getattr(record, name, default)
+
+
 _BACKEND = None
 
 
@@ -993,6 +1031,11 @@ class DaskRuntime:
 
     Anything satisfying those can stand in, which is how the tests avoid
     starting a cluster and how another scheduler could be adapted later.
+
+    A fourth method, `client()`, is not part of the seam and is not
+    required: a backend that has to launch tasks on the cluster looks for
+    it and falls back to `distributed.get_client()`. A stand-in runtime
+    without one still validates, plans, and predicts.
     """
 
     def __init__(self, client=None):
@@ -1490,12 +1533,198 @@ class _DaskMixin:
         if not extra:
             return
         raise TypeError(
-            f"distributed fit does not take {sorted(extra)}. Validation "
-            "sets, early stopping, and callbacks need the validation loss "
-            "reduced across ranks every round, which the transport does not "
-            "do yet (docs/distributed.md, section 9). Fit on one machine "
-            "when you need them"
+            f"distributed fit does not take {sorted(extra)}. A distributed "
+            "fit takes eval_set, eval_names, eval_sample_weight, "
+            "eval_metric, early_stopping_rounds, and first_metric_only for "
+            "validation, and nothing else beyond the training data: a "
+            "per-iteration Python callback would have to run on one client "
+            "while every rank waits inside a collective, which is not a "
+            "thing this adapter will pretend to do. Fit on one machine "
+            "when you need it"
         )
+
+    # -- validation -------------------------------------------------------
+
+    def _validation_arguments(
+        self,
+        eval_set,
+        eval_names,
+        eval_sample_weight,
+        eval_query_ids,
+        early_stopping_rounds,
+        eval_metric,
+    ):
+        """The validation request as a normalized tuple, or `()`.
+
+        Early stopping without an eval set is rejected rather than planned:
+        there is nothing to stop on, and a fit that quietly ran to
+        `n_estimators` after being asked to stop early would be the worst
+        of the available answers. It raises `TypeError` because the
+        argument itself is the thing that cannot be honored, which is also
+        what this signature did before it took validation at all.
+        """
+        rounds = int(early_stopping_rounds or 0)
+        if not eval_set:
+            orphaned = set()
+            if rounds > 0:
+                orphaned.add("early_stopping_rounds")
+            if eval_metric:
+                orphaned.add("eval_metric")
+            if eval_names:
+                orphaned.add("eval_names")
+            if eval_sample_weight:
+                orphaned.add("eval_sample_weight")
+            if eval_query_ids:
+                orphaned.add("eval_query_ids")
+            if orphaned:
+                raise TypeError(
+                    f"{sorted(orphaned)} need an eval_set to act on, and "
+                    "this fit was given none. Pass "
+                    "eval_set=[(X_valid, y_valid)] of Dask collections "
+                    "partitioned the way the training data is, or drop the "
+                    "argument"
+                )
+            return ()
+        sets = list(eval_set)
+        names = list(eval_names or [])
+        if names and len(names) != len(sets):
+            raise ValueError(
+                f"{len(names)} eval_names for {len(sets)} eval_set entries"
+            )
+        weights = list(eval_sample_weight or [])
+        if weights and len(weights) != len(sets):
+            raise ValueError(
+                f"{len(weights)} eval_sample_weight entries for "
+                f"{len(sets)} eval_set entries"
+            )
+        queries = list(eval_query_ids or [])
+        if queries and len(queries) != len(sets):
+            raise ValueError(
+                f"{len(queries)} eval_query_ids entries for {len(sets)} "
+                "eval_set entries"
+            )
+        out = []
+        for index, pair in enumerate(sets):
+            try:
+                X_valid, y_valid = pair
+            except (TypeError, ValueError):
+                raise ValueError(
+                    "eval_set holds (X, y) pairs of Dask collections; "
+                    f"entry {index} is {pair!r}"
+                ) from None
+            out.append(
+                (
+                    names[index] if names else f"valid_{index}",
+                    X_valid,
+                    y_valid,
+                    weights[index] if weights else None,
+                    queries[index] if queries else None,
+                )
+            )
+        return tuple(out)
+
+    def _plan_validation(self, validation, runtime, plan, ranking):
+        """A `ValidationPlan` per eval set, on the training rank layout.
+
+        Every rank scores the validation rows that live on its own worker
+        and the losses are reduced, exactly as the gradients are. That only
+        works when the eval collection lands rank for rank on the training
+        collection: same number of ranks, same worker per rank. Anything
+        else would mean shipping validation rows across the cluster every
+        round, so it is refused here with the repartition to make instead.
+        """
+        plans = []
+        for name, X_valid, y_valid, weight, queries in validation:
+            parts = validate_partitions(
+                runtime.partitions(
+                    X_valid,
+                    y_valid,
+                    sample_weight=weight,
+                    query_ids=queries,
+                )
+            )
+            if ranking:
+                validate_query_partitioning(parts)
+            valid_plan = plan_world(parts, self.one_rank_per_worker)
+            if valid_plan.n_features != plan.n_features:
+                raise SchemaError(
+                    f"eval set {name!r} has {valid_plan.n_features} "
+                    f"features and the training data has {plan.n_features}"
+                )
+            if valid_plan.feature_names != plan.feature_names:
+                raise SchemaError(
+                    f"eval set {name!r} and the training data disagree "
+                    f"about their column names ({plan.feature_names!r} "
+                    f"against {valid_plan.feature_names!r})"
+                )
+            if valid_plan.schema.columns != plan.schema.columns:
+                raise SchemaError(
+                    f"eval set {name!r} and the training data disagree "
+                    "about their categorical columns; a category has to "
+                    "carry the same code in both or the model scores the "
+                    "validation rows against a different encoding"
+                )
+            if valid_plan.workers != plan.workers:
+                raise PartitionError(
+                    f"eval set {name!r} lands on workers "
+                    f"{list(valid_plan.workers)} and the training data on "
+                    f"{list(plan.workers)}. A rank scores the validation "
+                    "rows that sit on its own worker, so the two "
+                    "collections have to be partitioned the same way and "
+                    "persisted together. Repartition the eval set to match "
+                    "the training set, or fit without one and score "
+                    "afterwards with predict()"
+                )
+            plans.append(ValidationPlan(name=name, plan=valid_plan))
+        return tuple(plans)
+
+    def _install_metrics(self, record, validation, metrics):
+        """The validation history a backend reported, as fitted state.
+
+        The names are the single-machine ones (`evals_result_`,
+        `best_score_`, `best_iteration_`, `stopped_early_`, `n_iter_`) and
+        the layout of `evals_result_` is the single-machine one, because a
+        distributed fit that reports its validation differently would be a
+        second convention for the same thing. A backend that reports
+        nothing leaves all of them as `_install_shape` set them.
+        """
+        if not record or not validation:
+            return
+        get = _reader(record)
+        values = list(get("values") or ())
+        n_rounds = int(get("n_rounds") or 0)
+        n_valid = len(validation)
+        # The backend's own names win when it reports them: it is the side
+        # that resolved a default metric out of the objective, which the
+        # client cannot do without duplicating the objective registry.
+        metrics = tuple(get("eval_metrics") or metrics)
+        n_metrics = len(metrics)
+        if n_rounds and n_metrics and len(values) >= (
+            n_rounds * n_valid * n_metrics
+        ):
+            self.evals_result_ = {
+                validation[v].name: {
+                    metrics[m]: [
+                        float(
+                            values[(r * n_valid + v) * n_metrics + m]
+                        )
+                        for r in range(n_rounds)
+                    ]
+                    for m in range(n_metrics)
+                }
+                for v in range(n_valid)
+            }
+            # Round 0 is the base-score-only model, exactly as it is for a
+            # single-machine fit, so one fewer round was trained than the
+            # history holds entries for.
+            self.n_iter_ = max(n_rounds - 1, 0)
+        best_iteration = int(get("best_iteration") or -1)
+        if best_iteration >= 0:
+            self.best_iteration_ = best_iteration
+        best_score = get("best_score")
+        if best_score is not None:
+            self.best_score_ = float(best_score)
+        self.stopped_early_ = bool(get("stopped_early"))
 
     # -- fit --------------------------------------------------------------
 
@@ -1510,13 +1739,22 @@ class _DaskMixin:
         label_classes=None,
         objective=None,
         ranking=False,
+        validation=(),
+        eval_metric=None,
+        early_stopping_rounds=0,
+        first_metric_only=False,
     ):
         """The shared fit path: backend first, then the cluster.
 
         The backend is resolved before the collection is touched on
-        purpose. With no transport registered, which is every installation
+        purpose. With no runtime available, which is every published build
         today, a user gets `DistributedNotAvailable` immediately instead of
         after persisting a terabyte.
+
+        Nothing between here and `backend.train` computes anything about
+        the data: this validates metadata, plans ranks, and asks. The rows
+        stay in the partitions dask put them in, and the only thing that
+        comes back to the client is the model.
         """
         backend = get_backend()
         self._reset_fitted()
@@ -1533,9 +1771,16 @@ class _DaskMixin:
         if ranking:
             validate_query_partitioning(partitions)
         plan = plan_world(partitions, self.one_rank_per_worker)
-        require_capabilities(
-            backend, self._capabilities(partitions, plan.schema)
-        )
+        needed = self._capabilities(partitions, plan.schema)
+        valid_plans = ()
+        metrics = ()
+        if validation:
+            needed.add("early_stopping")
+            valid_plans = self._plan_validation(
+                validation, runtime, plan, ranking
+            )
+            metrics = _metric_names(eval_metric)
+        require_capabilities(backend, needed)
         job = TrainingJob(
             plan=plan,
             objective=objective,
@@ -1543,12 +1788,46 @@ class _DaskMixin:
             label_classes=label_classes,
             ranking=ranking,
             timeout=timeout,
+            validation=valid_plans,
+            eval_metrics=metrics,
+            early_stopping_rounds=int(early_stopping_rounds or 0),
+            first_metric_only=bool(first_metric_only),
         )
-        blob = take_model_bytes(backend.train(job), timeout)
+        # Optional, so a backend written against version 0 is unaffected:
+        # the cluster is a property of the collection being fitted, and a
+        # backend that has to reach it gets the runtime here rather than a
+        # live handle inside the frozen job.
+        bind = getattr(backend, "bind_runtime", None)
+        if callable(bind):
+            bind(runtime)
+        ref = self._train_with_cancellation(backend, job)
+        blob = take_model_bytes(ref, timeout)
         self._install_model(blob, plan, label_classes)
+        report = getattr(ref, "metrics", None)
+        if callable(report):
+            self._install_metrics(report(), valid_plans, metrics)
         self._runtime = runtime
         self._plan_ = plan
         return self
+
+    def _train_with_cancellation(self, backend, job):
+        """`backend.train(job)`, with an interrupt stopping the cluster.
+
+        Ctrl-C on the client would otherwise leave every rank sitting
+        inside a collective until its deadline expired, holding a worker
+        each. A backend that declares no `cancel` is left alone, and the
+        interrupt propagates either way: this cancels, it does not swallow.
+        """
+        try:
+            return backend.train(job)
+        except BaseException:
+            cancel = getattr(backend, "cancel", None)
+            if callable(cancel):
+                try:
+                    cancel(job)
+                except Exception:
+                    pass
+            raise
 
     def _install_model(self, blob, plan, label_classes):
         """Turn the bytes a backend returned into this estimator's fitted
@@ -1715,6 +1994,12 @@ class DaskMojoBoostRegressor(_DaskMixin, MojoBoostRegressor):
         X,
         y,
         sample_weight=None,
+        eval_set=None,
+        eval_names=None,
+        eval_sample_weight=None,
+        eval_metric=None,
+        early_stopping_rounds=None,
+        first_metric_only=False,
         runtime=None,
         timeout=None,
         **unsupported,
@@ -1724,8 +2009,25 @@ class DaskMojoBoostRegressor(_DaskMixin, MojoBoostRegressor):
         Validates the partition layout, plans the ranks, negotiates
         capabilities with the registered backend, and installs the model it
         returns. Returns self.
+
+        `eval_set` is a list of `(X, y)` pairs of Dask collections
+        partitioned exactly as the training data is, so each rank scores
+        the validation rows on its own worker and the loss is reduced
+        alongside the gradients. It needs a backend declaring
+        `early_stopping`. `evals_result_` is filled in when the metric
+        names are known, which means when `eval_metric` names them or the
+        backend reports the names it resolved; `best_score_`,
+        `best_iteration_`, and `stopped_early_` come back either way.
         """
         self._reject_unsupported_fit_arguments(unsupported)
+        validation = self._validation_arguments(
+            eval_set,
+            eval_names,
+            eval_sample_weight,
+            None,
+            early_stopping_rounds,
+            eval_metric,
+        )
         objective = (
             "custom" if callable(self.objective) else str(self.objective)
         )
@@ -1736,6 +2038,10 @@ class DaskMojoBoostRegressor(_DaskMixin, MojoBoostRegressor):
             runtime=runtime,
             timeout=timeout,
             objective=objective,
+            validation=validation,
+            eval_metric=eval_metric,
+            early_stopping_rounds=early_stopping_rounds,
+            first_metric_only=first_metric_only,
         )
 
 
@@ -1772,6 +2078,12 @@ class DaskMojoBoostClassifier(_DaskMixin, MojoBoostClassifier):
         y,
         classes,
         sample_weight=None,
+        eval_set=None,
+        eval_names=None,
+        eval_sample_weight=None,
+        eval_metric=None,
+        early_stopping_rounds=None,
+        first_metric_only=False,
         runtime=None,
         timeout=None,
         **unsupported,
@@ -1780,7 +2092,10 @@ class DaskMojoBoostClassifier(_DaskMixin, MojoBoostClassifier):
         global list of label values.
 
         Returns self. `classes_` is what was passed, in the order it was
-        passed, and the workers encode labels through that order.
+        passed, and the workers encode labels through that order, which is
+        why a rank holding an unseen label fails instead of inventing a
+        code for it. `eval_set` is as in `DaskMojoBoostRegressor.fit`, and
+        its labels are encoded through the same class list.
         """
         self._reject_unsupported_fit_arguments(unsupported)
         if isinstance(self.class_weight, str):
@@ -1804,6 +2119,14 @@ class DaskMojoBoostClassifier(_DaskMixin, MojoBoostClassifier):
             )
         if len(set(labels)) != len(labels):
             raise ValueError(f"classes has repeats: {list(labels)!r}")
+        validation = self._validation_arguments(
+            eval_set,
+            eval_names,
+            eval_sample_weight,
+            None,
+            early_stopping_rounds,
+            eval_metric,
+        )
         self._pending_classes = labels
         try:
             return self._distributed_fit(
@@ -1814,6 +2137,10 @@ class DaskMojoBoostClassifier(_DaskMixin, MojoBoostClassifier):
                 timeout=timeout,
                 label_classes=labels,
                 objective="multiclass" if len(labels) > 2 else "binary",
+                validation=validation,
+                eval_metric=eval_metric,
+                early_stopping_rounds=early_stopping_rounds,
+                first_metric_only=first_metric_only,
             )
         finally:
             self._pending_classes = None
@@ -1860,6 +2187,13 @@ class DaskMojoBoostRanker(_DaskMixin, MojoBoostRanker):
         y,
         query_ids,
         sample_weight=None,
+        eval_set=None,
+        eval_names=None,
+        eval_sample_weight=None,
+        eval_query_ids=None,
+        eval_metric=None,
+        early_stopping_rounds=None,
+        first_metric_only=False,
         runtime=None,
         timeout=None,
         **unsupported,
@@ -1871,6 +2205,11 @@ class DaskMojoBoostRanker(_DaskMixin, MojoBoostRanker):
         cannot say whether the query at a partition's edge continues into
         the next one, which is the thing that has to be checked.
 
+        An `eval_set` needs `eval_query_ids`, one per eval set, in the same
+        shape, and its queries are checked against the same partition rule:
+        NDCG is computed within a query, so a query split across two ranks
+        would be scored as two shorter ones.
+
         Returns self.
         """
         self._reject_unsupported_fit_arguments(unsupported)
@@ -1879,6 +2218,21 @@ class DaskMojoBoostRanker(_DaskMixin, MojoBoostRanker):
                 "a distributed ranker needs query_ids: one sequence of "
                 "per-row query ids per partition, in partition order"
             )
+        if eval_set and not eval_query_ids:
+            raise ValueError(
+                "a distributed ranker's eval_set needs eval_query_ids: one "
+                "sequence of per-partition query id columns per eval set. "
+                "Without them a rank cannot form the query groups it "
+                "scores NDCG over"
+            )
+        validation = self._validation_arguments(
+            eval_set,
+            eval_names,
+            eval_sample_weight,
+            eval_query_ids,
+            early_stopping_rounds,
+            eval_metric,
+        )
         return self._distributed_fit(
             X,
             y,
@@ -1888,4 +2242,8 @@ class DaskMojoBoostRanker(_DaskMixin, MojoBoostRanker):
             timeout=timeout,
             objective="lambdarank",
             ranking=True,
+            validation=validation,
+            eval_metric=eval_metric,
+            early_stopping_rounds=early_stopping_rounds,
+            first_metric_only=first_metric_only,
         )

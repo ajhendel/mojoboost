@@ -27,8 +27,10 @@ Intentional differences from LightGBM
   `_raise_if_unimplemented_objective`, tree options through
   `tree_parameters_extra.check_extra_option_supported` (`linear_tree`,
   `linear_lambda`, `cegb_penalty_feature_lazy`,
-  `cegb_penalty_feature_coupled`, `forcedsplits_filename`), and
-  `enable_bundle` through `efb.check_bundling_supported`.
+  `cegb_penalty_feature_coupled`, `forcedsplits_filename`,
+  `feature_pre_filter`), and `enable_bundle` through
+  `efb.check_bundling_supported`, which accepts it for a CPU run and refuses
+  it by name for a device that would ignore it.
 """
 
 from .boosting import (
@@ -48,7 +50,7 @@ from .boosting import (
     TWEEDIE,
 )
 from .device import CPU_DEVICE, parse_device
-from .efb import check_bundling_params, check_bundling_supported
+from .efb import check_bundling_supported
 from .sampling import canonical_data_sample_strategy
 from .tree import TreeParams
 from .tree_parameters_extra import (
@@ -415,6 +417,14 @@ def _validate(config: TrainConfig, saw_num_class: Bool) raises:
     config.booster.tree.extra.check_scalars(
         config.booster.tree.min_data_in_leaf
     )
+    # Exclusive feature bundling: the knobs are range-checked whether or not
+    # the switch is on, so a bad value is named here rather than at the first
+    # training call that happens to turn bundling on, and the switch itself is
+    # checked against the device that would have to honor it.
+    check_bundling_supported(
+        config.booster.bundling.enabled, config.device == CPU_DEVICE
+    )
+    config.booster.bundling.check()
     if config.max_bin < 2:
         raise Error("max_bin must be at least 2")
 
@@ -569,10 +579,15 @@ def parse_params(spec: String) raises -> TrainConfig:
                 _parse_f64(key, value)
             )
         elif key == "enable_bundle":
-            # Accepted only as LightGBM's own "off"; see efb.mojo.
-            check_bundling_supported(_parse_bool(key, value))
+            # Exclusive feature bundling, applied by the dense CPU trainers
+            # (efb.mojo). Off by default, unlike LightGBM. The device check
+            # waits for `_validate`, because `device=` may be named after this
+            # key in the same string.
+            config.booster.bundling.enabled = _parse_bool(key, value)
         elif key == "max_conflict_rate":
-            check_bundling_params(_parse_f64(key, value))
+            config.booster.bundling.params.max_conflict_rate = _parse_f64(
+                key, value
+            )
         elif key == "data_sample_strategy":
             # The spelling is resolved here so a typo is named, but selecting
             # GOSS needs `GossParams`, which a parameter string cannot carry.

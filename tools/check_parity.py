@@ -17,6 +17,19 @@ become false and a deferred row cannot quietly stay false:
    the *public symbols* behind it
 8. the capability-level table in section 0 uses exactly the seven levels
    `docs/CAPABILITY_LEVELS.md` defines, and does not contradict itself
+9. section 0's `publicly reachable` cells agree with the public symbols
+   behind them, in both directions
+
+Check 9 exists because check 7 has a blind spot: it only looks at rows that
+say `deferred` or `unsupported`, so a `partial` row can keep claiming a
+capability is out of reach long after the name landed in
+`mojoboost.__all__`. Reachability is not a claim about quality, so it is
+the one cell a script can decide outright rather than referring to a human.
+
+Reachability of a *module* is a different question, and this script does not
+answer it. `tools/connectivity_audit.py` computes the import graph and
+`tools/audit_integration.py` checks `docs/INTEGRATION_INVENTORY.md` against
+it. Two import graphs would be the duplication all three exist to find.
 
 Check 7 deserves a word, because it is the one that can be got wrong in a
 way that produces a false claim. A watch is a list of public names: an entry
@@ -504,6 +517,42 @@ STALE_DEFERRED_WATCHES = {
     ],
 }
 
+# The `publicly reachable` cell of a section 0 row, tied to the public name
+# that decides it.
+#
+# STALE_DEFERRED_WATCHES only fires on `deferred` and `unsupported` rows, so
+# a row that says `partial` can carry `publicly reachable: no` forever while
+# the symbol behind it quietly lands in `mojoboost.__all__`. Three rows rot
+# that way before this check existed: `cv`, `inspection`, and
+# `device_selection` all became reachable in one afternoon and all three
+# tables still said they were not.
+#
+# The probe grammar is the one STALE_DEFERRED_WATCHES documents. The rule is
+# an equivalence rather than an implication: the cell must say `yes` when
+# every probe resolves and `no` when any of them does not. Both directions
+# are false claims, one overstating reach and one understating it, and
+# understating it is how a capability a user already has stays undocumented.
+PUBLIC_REACHABILITY_PROBES = {
+    "Cross-validation (mojoboost.cv)": ["pyall:cv", "pyall:CVBooster"],
+    "Model inspection and dump (mojoboost.inspection)": [
+        "pyall:dump_model",
+        "pyall:trees_to_dataframe",
+        "pyall:trees_to_records",
+        "pyall:get_split_value_histogram",
+    ],
+    "Explainable device selection (mojoboost.device_selection)": [
+        "pyall:explain_device_choice",
+    ],
+    "Startup diagnostics (mojoboost.diagnostics)": ["pyall:describe_install"],
+    "Dask adapter (mojoboost.dask)": ["pyall:DaskMojoBoostRegressor"],
+    "Exclusive feature bundling": ["mojo:fit_bundles"],
+    "Distributed transport": ["mojo:RankAddress"],
+    "LightGBM model file interop": ["mojo:parse_lgbm_model"],
+    "Remaining tree-parameter rules": ["mojo:passes_min_gain"],
+    "Apple GPU tuning policy": ["mojo:derive_block_threads"],
+    "Per-level feature sampling": ["mojo:select_level_features"],
+}
+
 # Mojo suites the contract cites that no pixi task runs. Empty is the
 # healthy state: every suite the contract offers as evidence is also run.
 # When a suite has to be added here, it belongs in the "Known gaps" section
@@ -729,6 +778,61 @@ def check_levels(text, problems):
                 f"contract: section 0 row {name!r} is publicly reachable and "
                 f"still says {status!r}. A user can call it, so the row owes "
                 "them a real status",
+            )
+
+
+def check_reachability_cells(text, problems):
+    """Section 0's `publicly reachable` cells against the public symbols.
+
+    See PUBLIC_REACHABILITY_PROBES. A watch on a row the contract does not
+    have is itself a failure, the same way a stale-deferred watch is: a
+    watch on nothing checks nothing.
+    """
+    header, rows = levels_table(text)
+    if header is None:
+        return  # check_levels has already reported the missing table
+    index = symbol_index()
+    column = LEVEL_NAMES.index("publicly reachable") + 2
+    scored = {}
+    for row in rows:
+        if len(row) == len(header):
+            scored[strip_ticks(row[0])] = strip_ticks(row[column]).lower()
+
+    for item, probes in sorted(PUBLIC_REACHABILITY_PROBES.items()):
+        cell = scored.get(item)
+        if cell is None:
+            fail(
+                problems,
+                f"check_parity: PUBLIC_REACHABILITY_PROBES watches {item!r}, "
+                "which is not a row in section 0. Rename the watch or drop "
+                "it; a watch on nothing checks nothing.",
+            )
+            continue
+        if cell == "n/a":
+            continue
+        try:
+            missing = [p for p in probes if not resolves(p, index)]
+        except ValueError as exc:
+            fail(problems, f"check_parity: {exc}")
+            continue
+        if not missing and cell != "yes":
+            fail(
+                problems,
+                f"contract: section 0 row {item!r} says publicly reachable "
+                f"{cell!r}, but every public symbol behind it resolves ("
+                + ", ".join(probes)
+                + "). A user can reach it today; say so, and re-audit the "
+                "row's status and evidence while you are there.",
+            )
+        elif missing and cell == "yes":
+            fail(
+                problems,
+                f"contract: section 0 row {item!r} says publicly reachable "
+                "yes, but "
+                + ", ".join(missing)
+                + " does not resolve. Either export the name or correct the "
+                "cell; a reachability claim with no public name behind it "
+                "is the claim this table exists to prevent.",
             )
 
 
@@ -1117,6 +1221,7 @@ def main():
     supported = check_contract(text, problems)
     check_levels_doc(problems)
     check_levels(text, problems)
+    check_reachability_cells(text, problems)
     python_api(problems)
     python_runtime(problems)
     mojo_exports(problems)

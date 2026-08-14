@@ -237,12 +237,16 @@ without training anything. See src/mojoboost/device.mojo for the policy and
 `device=` as well, because where a prediction runs is a property of the
 call and not of the fit that produced the model: mojoboost stores one
 ensemble, so a model fitted on the CPU can be predicted on an accelerator
-and the reverse. `device=None`, the default, is the CPU and consults no
-policy. Leaf ordinals (`pred_leaf`), contributions (`pred_contrib`), and
-sparse input have no accelerator kernel and refuse an explicit `"gpu"`
-rather than running on the CPU and reporting otherwise. On a build without
-the device prediction entry points, every `device=` other than `"cpu"`
-raises for the same reason.
+and the reverse. `device=None`, the default, is the CPU. Scores,
+probabilities, and leaf ordinals (`pred_leaf`) all have a device path;
+contributions (`pred_contrib`) and sparse input do not, and refuse an
+explicit `"gpu"` rather than running on the CPU and reporting otherwise.
+`"auto"` is never refused, because it resolves to the CPU there anyway.
+Which backend runs is decided in Mojo, not here: the entry point asks
+whether the GPU predictor covers the request before it resolves, so an
+explicit `"gpu"` that cannot run says why. On a build without the device
+prediction entry points, every `device=` other than `"cpu"` raises for the
+same reason.
 
 `show_versions()` prints what this installation is, for a bug report, and
 `build_info()` returns the same facts as a dict. Both report whether a GPU
@@ -382,28 +386,21 @@ _BOOSTING_TYPES = ("gbdt", "goss")
 
 #: What to say when a caller asks a prediction to run somewhere and this
 #: build has no entry point that can. The alternative -- running on the CPU
-#: and reporting the device -- is the one outcome an explicit `device=` must
-#: never produce, so this is an error and not a warning.
+#: and reporting the device -- is the one outcome an explicit `device=`
+#: must never produce, so this is an error and not a warning.
 #:
-#: The two entry points are `predict_range_device` and
-#: `predict_proba_range_device`, specified in
-#: handoffs/apple_a4_gpu_predict.md section 4 and built by the bindings
-#: lane. `_Base._predict_batch` uses them the moment they exist; nothing
-#: here changes when they land.
+#: The device-aware entry points are `predict_batch`,
+#: `predict_proba_batch`, `predict_leaf_batch`, and
+#: `predict_leaf_multiclass_batch` in bindings/_mojoboost.mojo. Each takes
+#: the requested device in a params dict, asks gpu_predict.mojo whether the
+#: GPU path covers the request, resolves through device.mojo, and returns
+#: the backend that ran. `_Base._predict_batch` uses one the moment the
+#: build has it and this message when it does not.
 _NO_DEVICE_PREDICT = (
     "this build predicts on the CPU only: the extension does not expose "
     "%s, so device=%r cannot be honored without silently predicting "
     "somewhere else. Rebuild with the device prediction bindings, or pass "
     "device='cpu' (or leave device unset)."
-)
-
-#: Sparse prediction has no accelerator kernel, the same way sparse
-#: training has none. `device="auto"` resolves to the CPU here, which is
-#: what it would resolve to anyway; only an explicit `"gpu"` is refused.
-_NO_SPARSE_DEVICE_PREDICT = (
-    "sparse input predicts on the CPU; there is no sparse accelerator "
-    "kernel. Pass device='cpu' or device='auto' (or leave device unset), "
-    "or densify with .toarray() to predict on an accelerator."
 )
 
 _SQUARED_ERROR = 0
@@ -1659,26 +1656,25 @@ class _Base(_ParamsMixin):
             "min_data_per_group": int(self.min_data_per_group),
         }
 
-    def _resolve_device(
-        self, n_rows, n_features, n_outputs, device=None, workload=None
-    ):
-        """The backend that will actually run, "cpu" or "gpu". Names are
-        case-insensitive, as LightGBM treats `device_type`. Raises
+    def _resolve_device(self, n_rows, n_features, n_outputs, workload=None):
+        """The backend a *fit* will actually run on, "cpu" or "gpu". Names
+        are case-insensitive, as LightGBM treats `device_type`. Raises
         ValueError for an unknown `device` and RuntimeError when "gpu" is
         requested but unavailable or unsupported; "gpu" never falls back to
         the CPU.
 
-        `device` overrides the estimator's own `device` / `device_type`
-        pair. It is what `predict(device=...)` passes, because a prediction
-        device is a property of the call and not of the fit that produced
-        the model.
+        Prediction does not come through here. Where a prediction runs is
+        decided by the same native policy, but from inside the prediction
+        entry point, which is the only place that knows the model's bin
+        count and whether the GPU predictor covers the request; see
+        `_device_request`.
 
         `workload` is a `mojoboost.device_selection.Workload` carrying what
         the native policy gates on beyond the shape (the objective, the bin
         count, the sparse / categorical / missing / eval-set flags). The
-        shape-only workload built here is what the narrow native entry
-        point could carry anyway; a caller with more to declare passes it,
-        and the extra gates run once `decide_device` is bound.
+        shape-only workload built here carries what the narrow native entry
+        point can read anyway; a caller with more to declare passes it, and
+        the extra gates start running once `decide_device` is bound.
 
         No decision is made in Python. `mojoboost.device_selection` is the
         one Python door to the native policy and holds no policy of its
@@ -1686,8 +1682,7 @@ class _Base(_ParamsMixin):
         same engine without the report and is the fallback for a build
         whose `device_selection` module cannot be imported at all.
         """
-        if device is None:
-            device = self._resolve_alias("device", "device_type", "cpu")
+        device = self._resolve_alias("device", "device_type", "cpu")
         try:
             from . import device_selection as _policy
         except Exception:
@@ -2373,84 +2368,116 @@ class _Base(_ParamsMixin):
             )
 
     # -- where one prediction call runs ------------------------------------
+    #
+    # The device is *requested* here and *decided* in Mojo. The prediction
+    # entry points take the requested name in their params dict, ask
+    # gpu_predict.mojo whether the GPU path covers a request of that shape
+    # (only for an explicit "gpu", so the refusal is what an explicit
+    # request gets), resolve through the same device.mojo policy a fit
+    # resolves through, and return the backend that ran. Nothing in this
+    # file decides, thresholds, or infers; adding such a thing here would
+    # put a second policy beside the native one.
 
-    def _predict_device(self, device, n_rows, n_outputs, unsupported=None):
-        """The backend one prediction call runs on, "cpu" or "gpu".
+    def _device_request(self, device):
+        """The device one prediction call asks for: "cpu", "gpu", or
+        "auto".
 
-        `device=None` is the established path and stays exactly that: the
-        CPU, with no policy consulted and nothing new on the call, so a
-        prediction that does not ask for a device is unchanged.
-
-        A name goes through the same native policy a fit goes through, so
-        `"gpu"` raises where no accelerator can run it and `"auto"`
-        resolves the way the policy resolves it. The fitted model is the
-        same object either way: mojoboost stores one ensemble, so a model
-        fitted on the CPU can be predicted on the GPU and the reverse.
-
-        `unsupported` names a prediction mode with no device kernel. An
-        explicit request for the pair is refused here rather than run on
-        the CPU and reported as having run on the device.
+        `device=None` means "cpu", which is the established path: the same
+        backend predictions have always run on, reached the same way.
         """
         name = _device_name(device)
-        if name is None:
-            return "cpu"
-        self._require_fitted()
-        resolved = self._resolve_device(
-            n_rows, self.n_features_in_, n_outputs, device=name
-        )
-        if resolved != "cpu" and unsupported is not None:
+        return "cpu" if name is None else name
+
+    def _batch_params(self, device, start, stop, raw_score=False):
+        """The params dict the dense batch prediction entry points read:
+        the requested device, the resolved half-open iteration pair, and
+        the raw-score flag."""
+        return {
+            "device": self._device_request(device),
+            "start": int(start),
+            "stop": int(stop),
+            "raw_score": int(bool(raw_score)),
+        }
+
+    def _refuse_device(self, device, what):
+        """Refuse an explicit accelerator request for a prediction mode
+        that has no device path.
+
+        `"auto"` is not refused: it resolves to the CPU here, which is
+        where it would resolve anyway. Only an explicit `"gpu"` is, because
+        running it on the CPU and returning as though nothing happened is
+        the one outcome an explicit request must not produce.
+        """
+        if self._device_request(device) == "gpu":
             raise RuntimeError(
-                f"{unsupported} is computed on the CPU; there is no "
-                f"accelerator kernel for it. Pass device='cpu' (or leave "
-                f"device unset) to predict it, or drop the flag to predict "
-                f"scores on {resolved}."
+                f"{what} is computed on the CPU; there is no accelerator "
+                "kernel for it. Pass device='cpu' or device='auto' (or "
+                "leave device unset), or drop the flag to predict scores "
+                "on an accelerator."
             )
-        return resolved
 
     def _predict_batch(
-        self, Xb, n_rows, start, stop, raw, out, device, proba=False
+        self, entry, legacy, Xb, n_rows, params, out, pass_raw=True
     ):
-        """One dense batch prediction into `out`, on `device`.
+        """One dense batch prediction into `out`, through `entry`.
 
-        The two entry points take the same arguments in the same order and
-        differ only in the model kind, so `proba` picks the softmax one.
+        `entry` is a device-aware batch entry point (`predict_batch`,
+        `predict_proba_batch`, `predict_leaf_batch`, ...) and `legacy` the
+        one that predates it. When the build has `entry`, every call goes
+        through it, `device="cpu"` included, so that there is one
+        prediction path rather than a device path beside an older one, and
+        the backend that ran comes back from the call. When it does not,
+        `"cpu"` uses `legacy` and anything else raises: predicting on the
+        CPU while reporting an accelerator is what must not happen.
 
-        When the extension exposes the device-aware entry point, every
-        call goes through it, including `device="cpu"`, so that there is
-        one prediction path rather than a device path beside a legacy one.
-        When it does not, `device="cpu"` uses the entry point that has
-        always been there and anything else raises: predicting on the CPU
-        while reporting an accelerator is the one outcome this must not
-        have.
+        Returns the name of the backend that ran.
         """
-        name = "predict_proba_range" if proba else "predict_range"
-        hook = getattr(_mojoboost, name + "_device", None)
+        hook = getattr(_mojoboost, entry, None)
         if hook is not None:
-            hook(
+            ran = hook(
                 self._model,
                 _addr(Xb),
                 n_rows,
                 self.n_features_in_,
-                start,
-                stop,
-                raw,
-                device,
+                params,
                 _addr(out),
             )
-            return out
+            return params["device"] if ran is None else str(ran)
+        device = params["device"]
         if device != "cpu":
-            raise RuntimeError(_NO_DEVICE_PREDICT % (name + "_device", device))
-        getattr(_mojoboost, name)(
+            raise RuntimeError(_NO_DEVICE_PREDICT % (entry, device))
+        args = (
             self._model,
             _addr(Xb),
             n_rows,
             self.n_features_in_,
-            start,
-            stop,
-            raw,
-            _addr(out),
+            params["start"],
+            params["stop"],
         )
-        return out
+        if pass_raw:
+            args += (params["raw_score"],)
+        getattr(_mojoboost, legacy)(*args, _addr(out))
+        return "cpu"
+
+    def _sparse_predict_params(self, device, params):
+        """A sparse prediction params dict with the requested device in it.
+
+        Sparse prediction has no accelerator kernel, and the refusal for an
+        explicit `"gpu"` is native (`_refuse_gpu_sparse` in
+        bindings/_mojoboost.mojo), so that it carries the same message the
+        dense path gives. A build old enough to read no device key at all
+        would drop the request instead of refusing it, so on that build the
+        refusal is made here.
+        """
+        requested = self._device_request(device)
+        if requested == "cpu":
+            return params
+        if getattr(_mojoboost, "predict_batch", None) is None:
+            raise RuntimeError(
+                _NO_DEVICE_PREDICT % ("predict_batch", requested)
+            )
+        params["device"] = requested
+        return params
 
     def _iteration_slice(self, start_iteration, num_iteration):
         """Resolve LightGBM's `(start_iteration, num_iteration)` pair into
@@ -2522,14 +2549,18 @@ class _Base(_ParamsMixin):
             for r in range(n_rows)
         ]
 
-    def _predict_leaf(self, Xb, n_rows, start, stop):
+    def _predict_leaf(self, Xb, n_rows, start, stop, device=None):
         """Leaf ordinals for every tree in `[start, stop)`.
 
         The shape is `(n_samples, (stop - start) * trees_per_iteration)`,
         where `trees_per_iteration` is the class count for a multiclass
         model and 1 otherwise. The extension writes float64 (the only
         element type that crosses the boundary) and the ordinals are small
-        integers, so casting back is exact."""
+        integers, so casting back is exact.
+
+        The ordinal numbering is the model's and not the backend's: the
+        device walk reports the leaf's rank among its tree's leaves in node
+        order, which is what the host table indexes, so the two agree."""
         per_iteration = self.n_classes_ if self._multiclass else 1
         n_cols = (stop - start) * per_iteration
         if n_cols == 0 or n_rows == 0:
@@ -2540,19 +2571,19 @@ class _Base(_ParamsMixin):
                 return _np.empty((n_rows, n_cols), dtype=_np.int32)
             return [[] for _ in range(n_rows)]
         out = _out_buffer(n_rows * n_cols)
-        query = (
-            _mojoboost.predict_leaf_multiclass
+        entry, legacy = (
+            ("predict_leaf_multiclass_batch", "predict_leaf_multiclass")
             if self._multiclass
-            else _mojoboost.predict_leaf
+            else ("predict_leaf_batch", "predict_leaf")
         )
-        query(
-            self._model,
-            _addr(Xb),
+        self._predict_batch(
+            entry,
+            legacy,
+            Xb,
             n_rows,
-            self.n_features_in_,
-            start,
-            stop,
-            _addr(out),
+            self._batch_params(device, start, stop),
+            out,
+            pass_raw=False,
         )
         if _np is not None:
             return out.reshape(n_rows, n_cols).astype(_np.int32)
@@ -2571,7 +2602,7 @@ class _Base(_ParamsMixin):
 
     def _sparse_scores(
         self, X, raw_score, start_iteration, num_iteration, pred_leaf,
-        pred_contrib, validate_features,
+        pred_contrib, validate_features, device=None,
     ):
         """One score per row for sparse input, response scale or raw.
 
@@ -2579,6 +2610,10 @@ class _Base(_ParamsMixin):
         dense binned matrix, so they are refused here instead of quietly
         densifying. Plain prediction is the sparse walk: one binary search
         per node over that row's own stored entries.
+
+        `device` travels in the params dict so that the refusal for an
+        explicit `"gpu"` is the native one; there is no sparse accelerator
+        kernel, the same way there is no sparse GPU histogram.
         """
         if pred_leaf or pred_contrib:
             raise ValueError(
@@ -2597,7 +2632,11 @@ class _Base(_ParamsMixin):
             if raw_score
             else _mojoboost.predict_csr
         )
-        query(self._model, buffers.params(), _addr(out))
+        query(
+            self._model,
+            self._sparse_predict_params(device, buffers.params()),
+            _addr(out),
+        )
         return out, n_rows
 
     def _sparse_fit_params(self, X, sample_weight):
@@ -3107,37 +3146,33 @@ class MojoBoostRegressor(_Base):
         `device` the model was fitted with: `None` (the default) predicts
         on the CPU, `"gpu"` raises rather than falling back, and `"auto"`
         resolves through the same native policy a fit resolves through. The
-        ensemble is the same object either way. Leaf ordinals,
-        contributions, and sparse input have no accelerator kernel and say
+        ensemble is the same object either way. Scores and leaf ordinals
+        have a device path; contributions and sparse input do not, and say
         so instead of quietly running on the CPU.
 
         `raw_score` and `pred_leaf` cannot be combined."""
         self._check_predict_flags(raw_score, pred_leaf, pred_contrib)
         if _arrays.is_sparse(X):
-            if _device_name(device) == "gpu":
-                raise RuntimeError(_NO_SPARSE_DEVICE_PREDICT)
             out, n_rows = self._sparse_scores(
                 X, raw_score, start_iteration, num_iteration, pred_leaf,
-                pred_contrib, validate_features,
+                pred_contrib, validate_features, device,
             )
             return _finish(out)
         Xb, n_rows = self._check_predict_X(X, validate_features)
         start, stop = self._iteration_slice(start_iteration, num_iteration)
         if pred_leaf:
-            self._predict_device(device, n_rows, 1, "pred_leaf=True")
-            return self._predict_leaf(Xb, n_rows, start, stop)
+            return self._predict_leaf(Xb, n_rows, start, stop, device)
         if pred_contrib:
-            self._predict_device(device, n_rows, 1, "pred_contrib=True")
+            self._refuse_device(device, "pred_contrib=True")
             return self._predict_contrib(Xb, n_rows, start, stop)
         out = _out_buffer(n_rows)
         self._predict_batch(
+            "predict_batch",
+            "predict_range",
             Xb,
             n_rows,
-            start,
-            stop,
-            int(bool(raw_score)),
+            self._batch_params(device, start, stop, raw_score),
             out,
-            self._predict_device(device, n_rows, 1),
         )
         return _finish(out)
 
@@ -3490,14 +3525,14 @@ class MojoBoostClassifier(_Base):
 
     def _predict_proba_sparse(
         self, X, raw_score, start_iteration, num_iteration, pred_leaf,
-        pred_contrib, validate_features,
+        pred_contrib, validate_features, device=None,
     ):
         """`predict_proba` for sparse input. Binary goes through the shared
         single-output path; multiclass has its own row-major buffer."""
         if self.n_classes_ == 2:
             out, n_rows = self._sparse_scores(
                 X, raw_score, start_iteration, num_iteration, pred_leaf,
-                pred_contrib, validate_features,
+                pred_contrib, validate_features, device,
             )
             if raw_score:
                 return _finish(out)
@@ -3522,7 +3557,9 @@ class MojoBoostClassifier(_Base):
         buffers, n_rows = self._check_predict_X_sparse(X, validate_features)
         out = _out_buffer(n_rows * self.n_classes_)
         _mojoboost.predict_proba_csr(
-            self._model, buffers.params(), _addr(out)
+            self._model,
+            self._sparse_predict_params(device, buffers.params()),
+            _addr(out),
         )
         if _np is not None:
             return out.reshape(n_rows, self.n_classes_)
@@ -3568,32 +3605,23 @@ class MojoBoostClassifier(_Base):
         the softmax ensemble as well as the binary one."""
         self._check_predict_flags(raw_score, pred_leaf, pred_contrib)
         if _arrays.is_sparse(X):
-            if _device_name(device) == "gpu":
-                raise RuntimeError(_NO_SPARSE_DEVICE_PREDICT)
             return self._predict_proba_sparse(
                 X, raw_score, start_iteration, num_iteration, pred_leaf,
-                pred_contrib, validate_features,
+                pred_contrib, validate_features, device,
             )
         Xb, n_rows = self._check_predict_X(X, validate_features)
         start, stop = self._iteration_slice(start_iteration, num_iteration)
-        # Trees per boosting round: a binary model grows one, a softmax one
-        # grows one per class. The same count the fit resolved its device
-        # with, so a prediction is gated the way the fit was.
-        n_outputs = 1 if self.n_classes_ == 2 else self.n_classes_
         if pred_leaf:
-            self._predict_device(device, n_rows, n_outputs, "pred_leaf=True")
-            return self._predict_leaf(Xb, n_rows, start, stop)
+            return self._predict_leaf(Xb, n_rows, start, stop, device)
         if pred_contrib:
-            self._predict_device(
-                device, n_rows, n_outputs, "pred_contrib=True"
-            )
+            self._refuse_device(device, "pred_contrib=True")
             return self._predict_contrib(Xb, n_rows, start, stop)
         raw = int(bool(raw_score))
-        resolved = self._predict_device(device, n_rows, n_outputs)
+        params = self._batch_params(device, start, stop, raw_score)
         if self.n_classes_ == 2:
             out = _out_buffer(n_rows)
             self._predict_batch(
-                Xb, n_rows, start, stop, raw, out, resolved
+                "predict_batch", "predict_range", Xb, n_rows, params, out
             )
             if raw:
                 # One raw score per row, as LightGBM returns for a binary
@@ -3604,7 +3632,12 @@ class MojoBoostClassifier(_Base):
             return [[1.0 - p, p] for p in out]
         out = _out_buffer(n_rows * self.n_classes_)
         self._predict_batch(
-            Xb, n_rows, start, stop, raw, out, resolved, proba=True
+            "predict_proba_batch",
+            "predict_proba_range",
+            Xb,
+            n_rows,
+            params,
+            out,
         )
         if _np is not None:
             return out.reshape(n_rows, self.n_classes_)
@@ -4019,20 +4052,18 @@ class MojoBoostRanker(_Base):
         Xb, n_rows = self._check_predict_X(X, validate_features)
         start, stop = self._iteration_slice(start_iteration, num_iteration)
         if pred_leaf:
-            self._predict_device(device, n_rows, 1, "pred_leaf=True")
-            return self._predict_leaf(Xb, n_rows, start, stop)
+            return self._predict_leaf(Xb, n_rows, start, stop, device)
         if pred_contrib:
-            self._predict_device(device, n_rows, 1, "pred_contrib=True")
+            self._refuse_device(device, "pred_contrib=True")
             return self._predict_contrib(Xb, n_rows, start, stop)
         out = _out_buffer(n_rows)
         self._predict_batch(
+            "predict_batch",
+            "predict_range",
             Xb,
             n_rows,
-            start,
-            stop,
-            int(bool(raw_score)),
+            self._batch_params(device, start, stop, raw_score),
             out,
-            self._predict_device(device, n_rows, 1),
         )
         return _finish(out)
 

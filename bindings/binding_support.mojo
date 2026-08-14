@@ -25,6 +25,8 @@ The only direction an address travels is in.
 
 from std.python import Python, PythonObject
 
+from mojoboost.sparse import CscMatrix, CsrMatrix
+
 
 # -- building Python values ----------------------------------------------
 
@@ -133,6 +135,57 @@ def write_f64_buffer(
     )
     for i in range(len(values)):
         out.unsafe_store(i, values[i])
+
+
+def int_buffer(addr: Int, n: Int) raises -> List[Int]:
+    """Copy an int64 buffer (SciPy's `indices` and `indptr`) into a Mojo
+    list."""
+    if addr == 0:
+        raise Error("null buffer address")
+    if n < 0:
+        raise Error("buffer length must not be negative, got ", n)
+    var p = Pointer[Int, MutUntrackedOrigin](unsafe_from_address=addr)
+    var out = List[Int](capacity=n)
+    for i in range(n):
+        out.append(p.unsafe_load(i))
+    return out^
+
+
+def csc_from_params(params: PythonObject) raises -> CscMatrix:
+    """Rebuild a CSC matrix from the buffer addresses in a params mapping.
+
+    The six keys `_arrays.SparseBuffers.params()` emits:
+    `sparse_data_addr`, `sparse_indices_addr`, `sparse_indptr_addr`,
+    `sparse_nnz`, `n_rows`, and `n_features`. SciPy's arrays are
+    normalized to float64 data and int64 indices on the Python side; the
+    matrix itself is validated by the sparse binner, which stays the only
+    place that knows what a well-formed one is.
+    """
+    var n_rows = Int(py=params["n_rows"])
+    var n_features = Int(py=params["n_features"])
+    var nnz = nonnegative(params["sparse_nnz"], "sparse_nnz")
+    return CscMatrix(
+        int_buffer(Int(py=params["sparse_indices_addr"]), nnz),
+        f64_buffer(Int(py=params["sparse_data_addr"]), nnz),
+        int_buffer(Int(py=params["sparse_indptr_addr"]), n_features + 1),
+        n_rows,
+        n_features,
+    )
+
+
+def csr_from_params(params: PythonObject) raises -> CsrMatrix:
+    """Rebuild a CSR matrix from the same six keys, whose `indptr` has one
+    entry per row rather than per feature."""
+    var n_rows = Int(py=params["n_rows"])
+    var n_features = Int(py=params["n_features"])
+    var nnz = nonnegative(params["sparse_nnz"], "sparse_nnz")
+    return CsrMatrix(
+        int_buffer(Int(py=params["sparse_indices_addr"]), nnz),
+        f64_buffer(Int(py=params["sparse_data_addr"]), nnz),
+        int_buffer(Int(py=params["sparse_indptr_addr"]), n_rows + 1),
+        n_rows,
+        n_features,
+    )
 
 
 def str_sequence(seq: PythonObject, n: Int) raises -> List[String]:
