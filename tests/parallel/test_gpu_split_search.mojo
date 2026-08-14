@@ -220,13 +220,22 @@ def _device_search(
     cats: CategoricalSpec = CategoricalSpec.none(),
     bounds: OutputBounds = OutputBounds.unbounded(),
 ) raises -> GpuSplitRecord:
-    var searcher = GpuSplitSearcher(n_features, n_bins, missing_bins, cats)
-    if len(features) > 0:
-        searcher.set_features(features)
-    searcher.set_monotone(monotone)
-    searcher.set_allowed(allowed)
-    searcher.upload_histogram(words)
-    return searcher.search(params, 1.0, 1.0, bounds)
+    # The comptime guard keeps the device instantiation out of CPU-only
+    # builds: module-level helpers compile unconditionally, so without it a
+    # machine with no accelerator fails the arch constraint at compile time
+    # even though only guarded tests call this.
+    comptime if not has_accelerator():
+        raise Error("no accelerator")
+    else:
+        var searcher = GpuSplitSearcher(
+            n_features, n_bins, missing_bins, cats
+        )
+        if len(features) > 0:
+            searcher.set_features(features)
+        searcher.set_monotone(monotone)
+        searcher.set_allowed(allowed)
+        searcher.upload_histogram(words)
+        return searcher.search(params, 1.0, 1.0, bounds)
 
 
 # --- Numerical scan -------------------------------------------------------
