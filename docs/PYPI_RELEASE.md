@@ -213,15 +213,24 @@ Use a throwaway version. `0.1.0.dev1`, then `.dev2` and so on if you need
 another attempt. **A version number on an index can never be reused**,
 even after deletion, so burn dev versions freely and never a real one.
 
-1. Set the three version locations of compatibility policy section 1.1 to
-   `0.1.0.dev1`: `pixi.toml`, `python/pyproject.toml`, and
-   `python/mojoboost/__init__.py`. Commit on a branch. Do not tag.
-2. Run `Release provenance` from the Actions tab (`workflow_dispatch` is
-   its only trigger) with `publish` set to `testpypi`. Leave
-   `macos_target` empty unless you are deliberately building the
-   lowered-floor wheel.
-3. Approve the `testpypi` environment if it is gated.
-4. Verify against the installed package, never against the source tree.
+1. Set the version to `0.1.0.dev1` in the three locations of
+   compatibility policy section 1.1 (`pixi.toml`, `python/pyproject.toml`,
+   `python/mojoboost/__init__.py`) and in
+   `packaging/matrix/platform_matrix.toml`, whose `version` and `filename`
+   rows must agree with the wheel or `validate_artifact.py` rule R1b fails
+   the build. Run `python3 packaging/matrix/validate_matrix.py` to check.
+2. Commit on `main` and tag `v0.1.0.dev1`. Both halves are forced, and an
+   earlier revision of this document got both wrong:
+   `packaging/macos/build_release_wheel.sh` refuses an untagged HEAD, and
+   the `testpypi` environment's deployment branch policy only admits runs
+   dispatched from `main`, so a side branch never reaches the publish job.
+3. Run `Release provenance` from the Actions tab (`workflow_dispatch` is
+   its only trigger), dispatched **from `main`**, with the `ref` input set
+   to `v0.1.0.dev1` (its default is the production tag, so it must be
+   overridden here) and `publish` set to `testpypi`. Leave `macos_target`
+   empty unless you are deliberately building the lowered-floor wheel.
+4. Approve the `testpypi` environment if it is gated.
+5. Verify against the installed package, never against the source tree.
    Run this from a directory that is not the checkout, so that
    `import mojoboost` cannot resolve to `python/mojoboost/`:
 
@@ -236,7 +245,9 @@ even after deletion, so burn dev versions freely and never a real one.
 
    The `--extra-index-url` is required because TestPyPI does not mirror
    numpy or anything else an extra pulls in.
-5. Revert the version commit. Nothing about `0.1.0.dev1` gets merged.
+6. Revert the version commit on `main`. Nothing about `0.1.0.dev1` stays
+   in the tree; the `v0.1.0.dev1` tag stays, because it records the commit
+   the published artifact came from.
 
 TestPyPI prunes projects and is not a backup of anything. Treat every
 TestPyPI upload as disposable.
@@ -252,7 +263,9 @@ claimed, the trusted publisher stops being pending, the provenance chain
 is proved end to end on the real index, and nobody who types
 `pip install mojoboost` gets an alpha they did not ask for.
 
-1. Set the three version locations to `0.1.0a1`. Commit to `main` and tag
+1. Set the four version locations (the three of compatibility policy
+   section 1.1, plus `packaging/matrix/platform_matrix.toml` and its
+   `filename` rows) to `0.1.0a1`. Commit to `main` and tag
    `v0.1.0a1`. `packaging/macos/build_release_wheel.sh` refuses to build
    an untagged commit unless `MOJOBOOST_ALLOW_UNTAGGED=1` is set, and a
    published artifact should never be built with that set.
@@ -295,7 +308,9 @@ Two additional preconditions belong to publishing specifically:
 
 Then:
 
-1. Set the three version locations to the release version. Commit to
+1. Set the four version locations (the three of compatibility policy
+   section 1.1, plus `packaging/matrix/platform_matrix.toml` and its
+   `filename` rows) to the release version. Commit to
    `main` and tag `vX.Y.Z`.
 2. Run `Release provenance` with `publish` set to `testpypi`. Install from
    TestPyPI in a clean venv and confirm it works, exactly as in step 3.
