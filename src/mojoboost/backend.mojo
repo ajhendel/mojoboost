@@ -8,6 +8,11 @@ shared-memory kernel in `histogram_gpu.mojo`.
 
 The GPU backend requires an accelerator at runtime and carries Float32
 precision (see `histogram_gpu.mojo`); the CPU backend is Float64.
+
+This module dispatches single full-dataset histogram builds. For complete
+GPU-resident training (per-leaf histograms, device-side row partitioning,
+one persistent builder across all boosting rounds) use `train_gpu` in
+`train_gpu.mojo`.
 """
 
 from std.sys import has_accelerator

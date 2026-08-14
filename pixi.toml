@@ -7,9 +7,10 @@ version = "0.1.0"
 
 [tasks]
 test = "mojo run -I src tests/test_mojoboost.mojo && mojo run -I src tests/test_metrics.mojo && mojo run -I src tests/test_weights.mojo && mojo run -I src tests/test_multiclass_model.mojo && mojo run -I src tests/test_objectives.mojo && mojo run -I src tests/test_kernels.mojo && mojo run -I src tests/test_serialize.mojo && mojo run -I src tests/test_backend_equivalence.mojo && mojo run -I src tests/test_histogram_reference.mojo"
-test-gpu = "mojo run -I src tests/test_backend_equivalence.mojo"
+test-gpu = "mojo run -I src tests/test_backend_equivalence.mojo && mojo run -I src tests/test_gpu_training.mojo"
 bench = "mojo run -I src bench/bench_train.mojo"
 bench-hist = "mojo run -I src bench/bench_histogram.mojo"
+bench-train-gpu = "mojo run -I src bench/bench_train_gpu.mojo"
 bench-threshold = "mojo run -I src bench/bench_threshold.mojo"
 build-python = "bindings/build.sh"
 test-python = { cmd = "python python/test_python_api.py", depends-on = [

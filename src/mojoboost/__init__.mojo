@@ -24,6 +24,7 @@ from .boosting import (
     train_multiclass_with_valid,
     train_with_valid,
 )
+from .train_gpu import grow_tree_gpu, train_gpu
 from .importance import gain_importance, split_importance
 from .metrics import (
     binary_accuracy,
