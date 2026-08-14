@@ -491,7 +491,7 @@ def test_feature_subsampling_is_refused() raises:
 
 
 def test_unimplemented_growth_features_are_refused() raises:
-    """max_depth and monotone constraints belong to the single-node grower
+    """Depth caps and monotone constraints belong to the single-node grower
     and are not implemented here, so they are errors rather than settings
     that quietly do nothing."""
     var n_rows = 64

@@ -132,11 +132,16 @@ def test_explicit_gpu_raises_when_unavailable() raises:
             _ = resolve_device(GPU_DEVICE, 10, 2, 1)
 
 
-def test_gpu_rejects_multiclass() raises:
-    # Unsupported workload, so explicit gpu raises whether or not an
-    # accelerator is present.
-    with assert_raises():
-        _ = resolve_device(GPU_DEVICE, 1_000, 10, 3)
+def test_gpu_accepts_multiclass() raises:
+    # Multiclass is no longer an unsupported workload: it grows one tree per
+    # class per round through train_multiclass_gpu. Resolution therefore
+    # turns only on whether an accelerator is present, exactly as it does
+    # for single-output training.
+    comptime if not has_accelerator():
+        with assert_raises():
+            _ = resolve_device(GPU_DEVICE, 1_000, 10, 3)
+    else:
+        assert_equal(resolve_device(GPU_DEVICE, 1_000, 10, 3), GPU_DEVICE)
 
 
 def test_auto_chooses_cpu_by_default() raises:
@@ -162,8 +167,10 @@ def test_auto_honors_the_size_threshold() raises:
     # At and above it: GPU when one is available.
     assert_equal(resolve_device(AUTO_DEVICE, 1_000, 10, 1), expected_big)
     assert_equal(resolve_device(AUTO_DEVICE, 100_000, 10, 1), expected_big)
-    # Multiclass is outside the GPU path, so size does not matter.
-    assert_equal(resolve_device(AUTO_DEVICE, 100_000, 10, 3), CPU_DEVICE)
+    # Multiclass is inside the GPU path now, so it obeys the same threshold
+    # as single-output training rather than being forced to the CPU.
+    assert_equal(resolve_device(AUTO_DEVICE, 50, 10, 3), CPU_DEVICE)
+    assert_equal(resolve_device(AUTO_DEVICE, 100_000, 10, 3), expected_big)
 
     # A disabled accelerator sends everything back to the CPU.
     _set_env(_DISABLE_GPU, "1")
@@ -220,15 +227,28 @@ def test_fit_multiclass_device_selection() raises:
     var labels = _labels(features, n_rows, 3)
     var params = BoosterParams(5, 0.1, TreeParams.default())
 
-    # Multiclass is CPU-only: auto works, explicit gpu raises.
+    # auto resolves to the CPU while the size heuristic ships disabled.
     var model = fit_multiclass(
         features, n_rows, n_features, labels, 3, params, device=AUTO_DEVICE
     )
     assert_equal(model.booster.n_classes, 3)
-    with assert_raises():
-        _ = fit_multiclass(
+
+    # Explicit gpu trains on the device when there is one, and raises only
+    # for the absent accelerator, not for the workload.
+    comptime if not has_accelerator():
+        with assert_raises():
+            _ = fit_multiclass(
+                features, n_rows, n_features, labels, 3, params,
+                device=GPU_DEVICE,
+            )
+    else:
+        var on_gpu = fit_multiclass(
             features, n_rows, n_features, labels, 3, params,
             device=GPU_DEVICE,
+        )
+        assert_equal(on_gpu.booster.n_classes, 3)
+        assert_equal(
+            len(on_gpu.booster.trees), len(model.booster.trees)
         )
 
 

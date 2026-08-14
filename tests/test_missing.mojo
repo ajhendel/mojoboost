@@ -15,7 +15,8 @@ from std.testing import assert_equal, assert_false, assert_true, TestSuite
 
 from mojoboost.binning import BinnedMatrix, bin_equal_width, fit_bins
 from mojoboost.boosting import SQUARED_ERROR, BoosterParams, train
-from mojoboost.histogram import Histogram, build_histogram
+from mojoboost.histogram import Histogram
+from mojoboost.histogram_gpu import GpuHistogramBuilder
 from mojoboost.model import Model, fit
 from mojoboost.serialize import load_model, save_model
 from mojoboost.split import find_best_split
@@ -384,54 +385,110 @@ def test_default_direction_is_applied_when_training_and_predicting() raises:
         assert_equal(node, tree.leaf_index_row(data, r))
 
 
-def test_use_missing_false_ignores_the_pattern() raises:
-    # With use_missing off, NaN is just the value 0.0, so a target driven by
-    # missingness alone can no longer be separated the way it is above.
+def test_use_missing_false_collapses_nan_onto_zero() raises:
+    # 0.0 is an observed value in this dataset. With use_missing off, NaN is
+    # binned as 0.0, so the two become the same input and get the same
+    # prediction; with it on, they are different inputs on opposite sides of
+    # the target.
     var n_rows = 300
     var pair = _missingness_dataset(n_rows)
-    var model = fit(
+    var nan_row: List[Float64] = [NAN]
+    var zero_row: List[Float64] = [0.0]
+
+    var off = fit(
         pair[0], n_rows, 1, pair[1], SQUARED_ERROR, _params(4, 60),
         max_bins=16, use_missing=False,
     )
-    assert_false(model.mapper.has_missing())
-    var missing_row: List[Float64] = [NAN]
-    # 0.0 is an observed value here, so the NaN row cannot reach the
-    # missing-row target of +5.
-    assert_true(model.predict(missing_row) < 0.0)
+    assert_false(off.mapper.has_missing())
+    assert_equal(off.predict(nan_row), off.predict(zero_row))
+
+    var on = fit(
+        pair[0], n_rows, 1, pair[1], SQUARED_ERROR, _params(4, 60),
+        max_bins=16,
+    )
+    assert_true(on.mapper.has_missing())
+    assert_true(abs(on.predict(nan_row) - 5.0) < 0.5)
+    assert_true(abs(on.predict(zero_row) + 5.0) < 0.5)
 
 
-def test_gpu_training_routes_missing_like_the_cpu() raises:
+def test_gpu_partitioning_follows_the_default_direction() raises:
+    # Device row partitioning must apply the node's default direction to the
+    # missing bin exactly as `Tree.goes_left` does on the host. Counts are
+    # exact integers on both backends, so this comparison is not subject to
+    # the GPU's Float32 histogram precision.
     comptime if not has_accelerator():
         print("skipped: no accelerator")
     else:
-        var n_rows = 4000
-        var n_features = 4
-        var features = List[Float64](capacity=n_rows * n_features)
-        for f in range(n_features):
-            for r in range(n_rows):
-                # Feature 1 and 3 carry missing values, on different patterns.
-                var v = Float64((r * (f + 3)) % 101) / 101.0
-                if (f == 1 and r % 4 == 0) or (f == 3 and r % 7 == 0):
-                    features.append(NAN)
-                else:
-                    features.append(v)
-        var target = List[Float64](capacity=n_rows)
+        var n_rows = 3000
+        var pair = _missingness_dataset(n_rows)
+        var mapper = fit_bins(pair[0], n_rows, 1, max_bins=16)
+        var data = mapper.transform(pair[0], n_rows)
+        var missing_bin = data.missing_bin[0]
+        assert_true(missing_bin > 0)
+
+        var n_missing = 0
         for r in range(n_rows):
-            var shift = 2.0 if r % 4 == 0 else -1.0
-            target.append(
-                shift + 3.0 * Float64((r * 3) % 101) / 101.0
+            if data.is_missing(r, 0):
+                n_missing += 1
+        assert_true(n_missing > 0)
+
+        var grad = List[Float64](capacity=n_rows)
+        var hess = List[Float64](capacity=n_rows)
+        for r in range(n_rows):
+            grad.append(-pair[1][r])
+            hess.append(1.0)
+
+        var builder = GpuHistogramBuilder(data)
+        builder.upload_gradients(grad, hess)
+
+        # Threshold at the top ordinary bin, so the threshold alone would put
+        # every observed row left and the missing rows decide the sides.
+        var threshold = missing_bin - 1
+        for default_left in [False, True]:
+            builder.begin_tree()
+            builder.apply_split(
+                0, threshold, 0, 1, 2, missing_bin, default_left
             )
+            var left = builder.build_leaf(1)
+            var right = builder.build_leaf(2)
+            var n_left = 0
+            var n_right = 0
+            for b in range(left.n_bins):
+                n_left += left.count[b]
+                n_right += right.count[b]
+            if default_left:
+                assert_equal(n_left, n_rows)
+                assert_equal(n_right, 0)
+                assert_equal(left.count[missing_bin], n_missing)
+            else:
+                assert_equal(n_left, n_rows - n_missing)
+                assert_equal(n_right, n_missing)
+                assert_equal(right.count[missing_bin], n_missing)
+                assert_equal(left.count[missing_bin], 0)
 
-        var mapper = fit_bins(features, n_rows, n_features, max_bins=32)
+
+def test_gpu_training_routes_missing_like_the_cpu() raises:
+    # Missingness alone carries the signal on a single feature, so there is
+    # one meaningful split and no cross-feature gain tie for the GPU's
+    # Float32 histograms to break differently. Tree structure, including the
+    # default directions, must match exactly; predictions to Float32
+    # tolerance, as everywhere else on this backend.
+    comptime if not has_accelerator():
+        print("skipped: no accelerator")
+    else:
+        var n_rows = 3000
+        var pair = _missingness_dataset(n_rows)
+        var mapper = fit_bins(pair[0], n_rows, 1, max_bins=16)
+        var data = mapper.transform(pair[0], n_rows)
         assert_true(mapper.has_missing())
-        var data = mapper.transform(features, n_rows)
 
-        var params = _params(8, 12)
-        var cpu = train(data, target, SQUARED_ERROR, params)
-        var gpu = train_gpu(data, target, SQUARED_ERROR, params)
+        var params = _params(4, 10)
+        var cpu = train(data, pair[1], SQUARED_ERROR, params)
+        var gpu = train_gpu(data, pair[1], SQUARED_ERROR, params)
         assert_equal(len(cpu.trees), len(gpu.trees))
+        assert_true(len(cpu.trees) > 0)
 
-        # Split decisions, including the default directions, must agree.
+        var routes_missing = False
         for t in range(len(cpu.trees)):
             ref a = cpu.trees[t]
             ref b = gpu.trees[t]
@@ -441,6 +498,9 @@ def test_gpu_training_routes_missing_like_the_cpu() raises:
                 assert_equal(a.threshold_bin[i], b.threshold_bin[i])
                 assert_equal(a.missing_bin[i], b.missing_bin[i])
                 assert_equal(a.default_left[i], b.default_left[i])
+                if a.feature[i] >= 0 and a.missing_bin[i] >= 0:
+                    routes_missing = True
+        assert_true(routes_missing)
 
         for r in range(n_rows):
             assert_true(

@@ -23,12 +23,11 @@ LightGBM semantics, matched here:
 - Sampling is skipped for the first `int(1 / learning_rate)` rounds
   (LightGBM's GOSS warmup); `warmup_rounds` overrides that.
 
-Coverage: `train`, `train_with_valid`, `train_multiclass`,
-`train_multiclass_with_valid`, `fit`, `fit_multiclass`, and the GPU
-trainers `train_gpu` and `train_multiclass_gpu` all take a `goss`
-parameter. `train_custom` and `train_ranker` do not, matching where row
-bagging is wired today: the custom-objective trainers grow trees on every
-row, and the ranker samples whole queries rather than rows.
+Coverage follows row bagging exactly: every trainer that takes a `bagging`
+parameter takes a `goss` one too, on the CPU and on the GPU, and the two
+are mutually exclusive. The trainers that take neither are the
+custom-objective ones, which grow every tree on every row, and the ranker,
+which samples whole queries rather than rows.
 
 RNG
 ---

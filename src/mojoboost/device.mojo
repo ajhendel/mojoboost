@@ -114,8 +114,16 @@ def device_name(device: Int) raises -> String:
 def gpu_supports(n_outputs: Int) -> Bool:
     """Whether the complete GPU training path covers this workload.
     `n_outputs` is 1 for single-output training and the class count for
-    multiclass."""
-    return n_outputs == 1
+    multiclass.
+
+    Every workload the device vocabulary routes is now covered: multiclass
+    grows one tree per class per round through `train_multiclass_gpu`, on the
+    same device-resident builder the single-output trainer uses, so it is no
+    longer the exception it was when this guard was written. The check stays
+    as the one place to reject a future workload the GPU path does not
+    implement, which is why `resolve_device` still consults it rather than
+    assuming coverage."""
+    return n_outputs >= 1
 
 
 def resolve_device(

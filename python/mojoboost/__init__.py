@@ -31,10 +31,143 @@ Validation follows LightGBM's scikit-learn wrapper, which validates with
 marker, but not infinities, and `y` and `sample_weight` must be finite.
 Sparse input is rejected rather than densified silently.
 
-`best_iteration_` is the number of boosting iterations the fitted model
-kept. Validation-set early stopping is not reachable from Python yet (the
-Mojo API has `train_with_valid`), so today this is `n_estimators` unless
-training stopped early because the objective converged.
+`best_iteration_` is the boosting iteration the model is used at, and
+`n_iter_` the number that were trained. They differ only when a validation
+metric peaked before the last round with early stopping off; otherwise both
+are `n_estimators` unless training stopped early, either because the
+objective converged or because a validation metric did.
+
+validation sets and early stopping
+----------------------------------
+Every estimator takes them, in LightGBM's spelling::
+
+    model.fit(
+        X, y,
+        eval_set=[(X_valid, y_valid)],   # or (X_valid, y_valid),
+                                         # or eval_X=/eval_y=
+        eval_names=["holdout"],          # valid_0, valid_1, ... by default
+        eval_sample_weight=[w_valid],
+        eval_metric=["l2", "l1"],
+        early_stopping_rounds=10,
+    )
+
+`eval_metric` takes LightGBM's metric names (`l2`, `rmse`, `l1`,
+`quantile`, `huber`, `binary_logloss`, `binary_error`, `auc`,
+`multi_logloss`, `multi_error`, `ndcg`, and their aliases), callables, or
+both, and defaults to the objective's own loss. A built-in name is computed
+by src/mojoboost/metrics.mojo, so it agrees with the Mojo API by
+construction, and `eval_sample_weight` weights it. A callable is
+`f(y_true, y_pred) -> float`, called once per metric per set per round with
+raw scores in `y_pred` (log-odds for the binary classifier, one row-major
+block of `n_classes_` per row for the softmax one), which is what
+LightGBM's `feval` also receives; give it a direction with
+`("name", f, True)` for higher-is-better. It is handed unweighted
+predictions, so combining one with `eval_sample_weight` raises rather than
+quietly dropping the weights.
+
+`early_stopping_rounds` stops training once a watched metric has gone that
+many rounds without improving by more than `min_delta`, and rolls the
+ensemble back to the best round of `primary_metric` (an index or a name) on
+the first validation set. It needs an `eval_set` and says so otherwise.
+With `early_stopping_rounds=0` nothing stops and nothing is rolled back,
+but every value is still recorded and `best_iteration_` still reports where
+the metric peaked.
+
+`evals_result_` holds those values,
+`{valid_name: {metric_name: [round 0, round 1, ...]}}`, where index 0 is
+the base-score-only model, so `evals_result_[name][metric][i]` is the score
+after `i` trees. `best_score_` is the primary metric's best value, and
+`stopped_early_` says whether patience ran out. (LightGBM's `best_score_`
+is a dict of every set's every metric; here it is the one number
+`best_iteration_` was chosen by, and the rest of the grid is in
+`evals_result_`.)
+
+The multiclass classifier and the ranker take all of this too. A
+classifier's validation labels go through the encoding `classes_` records,
+so a label absent from training is an error rather than a silent miscount,
+and a ranker's `eval_group` carries each validation set's own query
+boundaries. Validation is scored on the CPU, so `device="gpu"` with an
+`eval_set` raises rather than falling back. A Python objective callback
+cannot be combined with validation yet (the Mojo API pairs them with
+`train_custom_with_metrics`). The metric contract, and where it departs
+from LightGBM, is in src/mojoboost/custom_metric.mojo.
+
+prediction options
+------------------
+`predict` (and the classifier's `predict_proba`) take LightGBM's prediction
+keywords: `raw_score`, `start_iteration`, `num_iteration`, `pred_leaf`,
+`pred_contrib`, and `validate_features`.
+
+`raw_score` returns scores before the objective's inverse link. It changes
+nothing for the regressor's objectives or for the ranker, which have no
+link; for the binary classifier it returns log-odds of shape
+`(n_samples,)`, one score per row rather than one per class, and for the
+multiclass classifier the pre-softmax scores of shape
+`(n_samples, n_classes)`. Those are LightGBM's shapes.
+
+`start_iteration` and `num_iteration` select a half-open slice of the
+boosting iterations, with LightGBM's clamping: a negative start becomes 0, a
+start past the end selects nothing, and `num_iteration=None` or any value
+<= 0 means every iteration from the start on. The base score belongs to
+iteration 0, so a slice starting there carries it and a later slice does
+not, which is what makes `predict(num_iteration=k)` equal to the prediction
+of a `k`-round fit and makes `[0, k)` and `[k, n)` sum to the whole raw
+score. Out-of-range slices clamp rather than raise, because that is what
+LightGBM callers slicing a shorter-than-expected ensemble depend on; a
+`start_iteration` or `num_iteration` that is not an integer is a `TypeError`.
+
+`num_iteration=None` predicts with `best_iteration_` iterations, LightGBM's
+documented default. mojoboost reaches that structurally rather than by
+bookkeeping: early stopping truncates the ensemble at its best iteration, so
+the trees the model still holds are the best iteration and there is no later
+tree for prediction to exclude.
+
+`pred_leaf` returns the leaf each row reaches in each tree, as integers.
+The shape is `(n_samples, num_iteration)` for the regressor, the ranker, and
+the binary classifier, which are single-output ensembles, and
+`(n_samples, num_iteration * n_classes)` for the multiclass classifier,
+whose column `i * n_classes + k` is class k's tree in iteration i. A leaf is
+named by its ordinal within its own tree, in `[0, num_leaves)`, numbered in
+node order. That numbering is fixed once a tree is grown and survives
+`save`/`load` and pickling, but it is mojoboost's own: it is not LightGBM's
+leaf id and the two agree only by coincidence.
+
+`pred_contrib` returns exact per-feature contributions: one column per
+feature plus an expected-value column, so the shape is
+`(n_samples, n_features + 1)` for the regressor, the ranker, and the binary
+classifier, and `(n_samples, n_classes * (n_features + 1))` in class-major
+blocks for the multiclass classifier. Those are LightGBM's shapes. Every
+row's entries sum to that row's raw score, exactly: these are TreeSHAP
+Shapley values, not a split-gain heuristic, and the sum is a mathematical
+identity rather than a normalization. Contributions always explain the raw
+score whatever the objective's link, so `raw_score=True` cannot be combined
+with them; see src/mojoboost/contrib.mojo for the algorithm and what it
+conditions on. A model loaded from a file written before mojoboost recorded
+node covers (format v1 or v2) raises here rather than guessing at them.
+
+`validate_features` turns the feature-name checks from warnings into errors:
+without it, predicting from a matrix that has names against a model fitted
+without them (or the reverse) warns, as scikit-learn does. Names that are
+present on both sides and disagree raise either way.
+
+`raw_score=True` and `pred_leaf=True` together raise: they ask for different
+dtypes and different shapes. LightGBM lets `pred_leaf` win silently, which
+is not recoverable from the output.
+
+`fit(..., eval_set=[(X_valid, y_valid)], eval_metric=my_metric)` scores
+validation sets with caller-supplied metrics, one call per metric per set
+per round, and `early_stopping_rounds` stops on them. A metric is
+`f(y_true, y_pred) -> float`, where `y_pred` holds raw scores (log-odds for
+the binary classifier) as LightGBM's `feval` also receives; give it a
+direction with `("name", f, True)` for higher-is-better, and pick which
+metric truncates the ensemble with `primary_metric`. `evals_result_` holds
+every value, `{valid_name: {metric_name: [round 0, round 1, ...]}}`, where
+index 0 is the base-score-only model, and `best_score_` the primary
+metric's best value. The metric contract, and where it departs from
+LightGBM, is in src/mojoboost/custom_metric.mojo. There are no built-in
+validation metrics in the Python API yet, and a Python objective callback
+cannot be combined with them yet (the Mojo API pairs them with
+`train_custom_with_metrics`).
 
 Estimators take `device="cpu"` (the default and the dependable backend),
 `device="gpu"`, or `device="auto"`. `"gpu"` raises when no accelerator is
@@ -69,11 +202,12 @@ isolates it. See src/mojoboost/interaction.mojo for the exact rule.
 """
 
 import array as _array
+import operator as _operator
 import os as _os
 import tempfile as _tempfile
 import warnings as _warnings
 
-from . import _arrays, _mojoboost
+from . import _arrays, _eval, _mojoboost
 from ._sklearn import NotFittedError, ParamsMixin as _ParamsMixin
 from ._sklearn import estimator_tags as _estimator_tags
 
@@ -111,6 +245,7 @@ _HUBER = 3
 _QUANTILE = 4
 _L1 = 5
 _CUSTOM = 6
+_LAMBDARANK = 7
 
 # Defaults of the two regularization parameters, named so the constructor
 # signature and the alias resolution in `_params` cannot drift apart.
@@ -120,6 +255,22 @@ _LAMBDA_L2 = 1.0
 # The largest relevance label a ranker accepts, the range of LightGBM's
 # default label_gain (src/mojoboost/ranking.mojo).
 _MAX_RELEVANCE_LABEL = 30
+
+
+def _as_iteration(value, name):
+    """Coerce a `start_iteration`/`num_iteration` argument to an int.
+
+    `bool` is rejected rather than accepted as 0/1: `num_iteration=True`
+    is far more likely to be a misplaced flag than a request for one
+    iteration. numpy integers pass through `__index__`."""
+    if isinstance(value, bool):
+        raise TypeError(f"{name} must be an integer, got a bool")
+    try:
+        return int(_operator.index(value))
+    except TypeError:
+        raise TypeError(
+            f"{name} must be an integer, got {type(value).__name__}"
+        ) from None
 
 
 def _store_vector(out, values, n_rows, name):
@@ -142,6 +293,213 @@ def _store_vector(out, values, n_rows, name):
         )
     for i in range(n_rows):
         out[i] = float(values[i])
+
+
+def _metric_spec(item, index, task):
+    """One `eval_metric` entry as `(name, func, higher_is_better,
+    use_for_early_stopping, code)`.
+
+    Accepted forms: one of LightGBM's metric names, a callable, a
+    `(name, func[, higher_is_better[, use_for_early_stopping]])` tuple, or a
+    dict with those keys. A name resolves to a built-in metric, whose code
+    is what `_mojoboost.eval_metric` computes and whose `func` is None; a
+    callable keeps `code` None instead. Unlike LightGBM, a callable's
+    direction is declared here rather than returned by the callback, because
+    early stopping needs it before the first evaluation.
+    """
+    higher = False
+    early_stopping = True
+    if isinstance(item, str):
+        name, code, higher = _eval.resolve(item, task)
+        return name, None, higher, True, code
+    if callable(item):
+        func = item
+        name = getattr(item, "__name__", None) or f"metric_{index}"
+    elif isinstance(item, dict):
+        spec = dict(item)
+        func = spec.pop("func", spec.pop("metric", None))
+        name = spec.pop("name", None)
+        higher = bool(spec.pop("higher_is_better", False))
+        early_stopping = bool(spec.pop("early_stopping", True))
+        if spec:
+            raise ValueError(
+                f"unknown eval_metric keys {sorted(spec)}; expected name, "
+                "func, higher_is_better, early_stopping"
+            )
+        if name is None:
+            name = getattr(func, "__name__", None) or f"metric_{index}"
+    elif isinstance(item, (tuple, list)):
+        if not 2 <= len(item) <= 4:
+            raise ValueError(
+                "an eval_metric tuple must be (name, func[, "
+                "higher_is_better[, use_for_early_stopping]])"
+            )
+        name, func = item[0], item[1]
+        if len(item) > 2:
+            higher = bool(item[2])
+        if len(item) > 3:
+            early_stopping = bool(item[3])
+    else:
+        raise ValueError(
+            f"eval_metric entry {item!r} must be a callable, a "
+            "(name, func, ...) tuple, or a dict"
+        )
+    if not callable(func):
+        raise ValueError("each eval_metric needs a callable")
+    if not isinstance(name, str) or not name:
+        raise ValueError("each eval_metric needs a non-empty name")
+    return name, func, higher, early_stopping, None
+
+
+def _metric_specs(eval_metric, task, objective=None):
+    """Every `eval_metric` entry normalized, with unique names.
+
+    `eval_metric=None` falls back to the metric LightGBM would score for
+    this task and objective (see `_eval.default_metric`).
+    """
+    if eval_metric is None:
+        eval_metric = _eval.default_metric(task, objective)
+    single = (
+        isinstance(eval_metric, str)
+        or callable(eval_metric)
+        or isinstance(eval_metric, dict)
+        or (
+            isinstance(eval_metric, tuple)
+            and eval_metric
+            and isinstance(eval_metric[0], str)
+            and not all(isinstance(entry, str) for entry in eval_metric)
+        )
+    )
+    items = [eval_metric] if single else list(eval_metric)
+    if not items:
+        raise ValueError("eval_metric must not be empty")
+    specs = [_metric_spec(item, i, task) for i, item in enumerate(items)]
+    names = [spec[0] for spec in specs]
+    if len(set(names)) != len(names):
+        raise ValueError("eval_metric names must be unique")
+    return specs
+
+
+def _primary_index(primary_metric, specs):
+    """The index of the metric that selects the best round, by position or
+    by name."""
+    if primary_metric is None:
+        return 0
+    if isinstance(primary_metric, str):
+        for i, spec in enumerate(specs):
+            if spec[0] == primary_metric:
+                return i
+        raise ValueError(
+            f"primary_metric {primary_metric!r} is not one of the "
+            "eval_metric names"
+        )
+    index = int(primary_metric)
+    if not 0 <= index < len(specs):
+        raise ValueError(
+            f"primary_metric {index} is out of range for {len(specs)} metrics"
+        )
+    return index
+
+
+def _eval_pairs(eval_set, eval_X, eval_y):
+    """The validation sets as a list of `(X, y)` pairs, or None when there
+    are none.
+
+    Three spellings are accepted. `eval_set=[(X, y), ...]` is LightGBM's,
+    `eval_set=(X, y)` is the one-set shorthand (a *tuple* of length two is
+    one pair, a list is a list of pairs), and `eval_X=` / `eval_y=` is the
+    keyword form, which cannot be combined with `eval_set`.
+    """
+    if eval_X is not None or eval_y is not None:
+        if eval_set is not None:
+            raise ValueError(
+                "pass either eval_set or eval_X/eval_y, not both"
+            )
+        if eval_X is None or eval_y is None:
+            raise ValueError("eval_X and eval_y must be given together")
+        return [(eval_X, eval_y)]
+    if eval_set is None:
+        return None
+    if isinstance(eval_set, tuple) and len(eval_set) == 2:
+        return [eval_set]
+    pairs = list(eval_set)
+    if not pairs:
+        raise ValueError("eval_set must not be empty")
+    return pairs
+
+
+def _per_set(value, n_sets, name):
+    """One entry per validation set. A single vector is accepted as well as
+    a list of them, so one eval set needs no nesting."""
+    if value is None:
+        return [None] * n_sets
+    entries = list(value)
+    if entries and not hasattr(entries[0], "__len__"):
+        # A bare vector of numbers rather than a list of vectors.
+        entries = [value]
+    if len(entries) != n_sets:
+        raise ValueError(
+            f"{name} must have one entry per eval_set entry "
+            f"({len(entries)} given for {n_sets})"
+        )
+    return entries
+
+
+def _encode_like(y, n_rows, classes, name):
+    """Validation labels as the class codes the trainer uses, encoded
+    through the classes `fit` recorded.
+
+    A label the training set never held has no code and no meaning here, so
+    it raises instead of being folded into a neighboring class.
+    """
+    known = list(classes.tolist() if hasattr(classes, "tolist") else classes)
+    index = {label: i for i, label in enumerate(known)}
+    values = list(y.tolist() if hasattr(y, "tolist") else y)
+    if len(values) != n_rows:
+        raise ValueError(
+            f"{name} labels must have length {n_rows}, got {len(values)}"
+        )
+    codes = []
+    for value in values:
+        if value not in index:
+            raise ValueError(
+                f"{name} has label {value!r}, which is not one of the "
+                "classes seen during fit"
+            )
+        codes.append(float(index[value]))
+    return _as_f64_vector(codes, n_rows, name)
+
+
+def _early_stopping_rounds(value):
+    """`early_stopping_rounds` as a nonnegative int, with `None` meaning
+    off, as LightGBM's callback treats it."""
+    rounds = 0 if value is None else int(value)
+    if rounds < 0:
+        raise ValueError("early_stopping_rounds must not be negative")
+    return rounds
+
+
+def _check_eval_arguments(
+    eval_set, eval_metric, eval_sample_weight, early_stopping_rounds
+):
+    """Reject the arguments that only mean something with validation data.
+
+    Early stopping in particular needs something to stop on: LightGBM's
+    callback raises when no validation set is present, and so does this,
+    rather than quietly training the full ensemble the caller did not ask
+    for.
+    """
+    if eval_set is not None:
+        return
+    if eval_metric is not None:
+        raise ValueError("eval_metric needs an eval_set to score")
+    if eval_sample_weight is not None:
+        raise ValueError("eval_sample_weight needs an eval_set to weight")
+    if _early_stopping_rounds(early_stopping_rounds) > 0:
+        raise ValueError(
+            "early_stopping_rounds needs an eval_set to stop on; pass "
+            "eval_set=[(X_valid, y_valid)]"
+        )
 
 
 def gpu_available():
@@ -202,6 +560,31 @@ class _Base(_ParamsMixin):
     node, and a `NaN` at predict time follows that direction. Without it,
     every `NaN` is treated as the value 0.0. `+inf` and `-inf` are never
     missing; they bin as the extreme finite values they compare as.
+
+    `categorical_feature` is LightGBM's parameter of the same name (the
+    plural `categorical_features` is accepted as an alias). It names the
+    columns whose integer codes are unordered categories, and takes
+
+    - `"auto"`, the default and LightGBM's: every pandas `category` column
+      of `X`, and nothing else. On any other input that is no columns.
+    - a sequence of feature names, resolved against the columns of a pandas
+      DataFrame, or of column indices, or a mix of the two.
+    - `None` or an empty sequence: no feature is categorical.
+
+    Those columns are split by category set rather than by threshold, with
+    no one-hot expansion, and their missing (negative or `NaN`), unseen, and
+    dropped codes all route right. A pandas `category` column is encoded by
+    its labels and the mapping is kept on the fitted estimator, so a
+    prediction frame that orders or extends its categories differently
+    still lands on the categories the model was fitted with; leaving such a
+    column out of an explicit `categorical_feature` raises rather than
+    feeding its codes to the numerical scan. Category codes on any other
+    input must be whole numbers below 2**31, `NaN`, or negative.
+
+    `max_cat_to_onehot`, `max_cat_threshold`, `cat_smooth`, `cat_l2`, and
+    `min_data_per_group` are LightGBM's categorical hyperparameters, with
+    LightGBM's defaults; they have no effect unless some feature is
+    categorical.
     """
 
     #: Public attributes that `fit` sets and a refit clears. The model
@@ -213,6 +596,11 @@ class _Base(_ParamsMixin):
         "classes_",
         "n_classes_",
         "best_iteration_",
+        "evals_result_",
+        "best_score_",
+        "stopped_early_",
+        "n_iter_",
+        "categorical_feature_",
     )
 
     def __init__(
@@ -249,6 +637,13 @@ class _Base(_ParamsMixin):
         feature_fraction_bynode=1.0,
         feature_fraction_seed=2,
         use_missing=True,
+        categorical_feature="auto",
+        categorical_features=None,
+        max_cat_to_onehot=4,
+        max_cat_threshold=32,
+        cat_smooth=10.0,
+        cat_l2=10.0,
+        min_data_per_group=100,
         importance_type="split",
     ):
         self.num_leaves = num_leaves
@@ -283,6 +678,13 @@ class _Base(_ParamsMixin):
         self.feature_fraction_bynode = feature_fraction_bynode
         self.feature_fraction_seed = feature_fraction_seed
         self.use_missing = use_missing
+        self.categorical_feature = categorical_feature
+        self.categorical_features = categorical_features
+        self.max_cat_to_onehot = max_cat_to_onehot
+        self.max_cat_threshold = max_cat_threshold
+        self.cat_smooth = cat_smooth
+        self.cat_l2 = cat_l2
+        self.min_data_per_group = min_data_per_group
         self.importance_type = importance_type
         self._reset_fitted()
 
@@ -367,6 +769,215 @@ class _Base(_ParamsMixin):
         buf = _array.array("d", out)
         return buf, _addr(buf)
 
+    # -- categorical features ---------------------------------------------
+
+    #: Category codes must stay representable as Int32, the way LightGBM's
+    #: `static_cast<int>` requires. Kept in step with `_MAX_CATEGORY` in
+    #: src/mojoboost/categorical.mojo.
+    _CATEGORY_LIMIT = 1 << 31
+
+    def _categorical_names(self, spec, names):
+        """Declared categorical features resolved to column positions.
+
+        Entries are feature names or column indices, in any mix; names need
+        a matrix that carries them, which in practice means a pandas
+        DataFrame. The result is ascending and distinct, so listing a
+        feature twice, by name and by index, is an error rather than a
+        silent no-op.
+        """
+        if isinstance(spec, (str, bytes)):
+            raise ValueError(
+                "categorical_feature must be 'auto', None, or a sequence of "
+                f"feature names or indices, got {spec!r}"
+            )
+        known = None if names is None else list(names)
+        out = []
+        for entry in spec:
+            if isinstance(entry, bool):
+                raise ValueError(
+                    f"categorical_feature entry {entry!r} is a bool, not a "
+                    "feature name or an index"
+                )
+            if isinstance(entry, str):
+                if known is None:
+                    raise ValueError(
+                        f"categorical_feature names {entry!r}, but X carries "
+                        "no feature names; pass column indices, or fit on a "
+                        "pandas DataFrame"
+                    )
+                if entry not in known:
+                    raise ValueError(
+                        f"categorical_feature name {entry!r} is not a column "
+                        f"of X; X has {known}"
+                    )
+                index = known.index(entry)
+            else:
+                try:
+                    value = float(entry)
+                except (TypeError, ValueError):
+                    raise ValueError(
+                        f"categorical_feature entry {entry!r} is neither a "
+                        "feature name nor an index"
+                    ) from None
+                if value != int(value):
+                    raise ValueError(
+                        "categorical_feature entries must be whole feature "
+                        f"indices, got {entry!r}"
+                    )
+                index = int(value)
+            if index in out:
+                raise ValueError(
+                    f"categorical_feature lists feature {index} twice"
+                )
+            out.append(index)
+        out.sort()
+        return out
+
+    def _resolve_categorical(self, names, dtype_categories):
+        """`(indices, encoders)` for one matrix.
+
+        `indices` are the resolved categorical column positions and
+        `encoders` maps a position to the category labels a pandas
+        `category` column carries there. LightGBM's default, `"auto"`,
+        means exactly those pandas columns and nothing else; `None` and an
+        empty sequence mean no feature is categorical.
+
+        A `category` column left out of an explicit list raises. LightGBM
+        would quietly feed its codes to the numerical scan, which is the
+        one thing a declared category must never be: an ordered number.
+        """
+        spec = self._resolve_alias(
+            "categorical_feature", "categorical_features", "auto"
+        )
+        if isinstance(spec, str):
+            if spec != "auto":
+                raise ValueError(
+                    f"unknown categorical_feature {spec!r}; expected 'auto', "
+                    "None, or a sequence of feature names or indices"
+                )
+            indices = sorted(dtype_categories)
+        else:
+            indices = self._categorical_names(
+                () if spec is None else spec, names
+            )
+            dropped = sorted(set(dtype_categories) - set(indices))
+            if dropped:
+                labels = [
+                    i if names is None else names[i] for i in dropped
+                ]
+                raise ValueError(
+                    f"columns {labels} have pandas categorical dtype but are "
+                    "not in categorical_feature; list them, cast them to a "
+                    "numeric dtype, or leave categorical_feature at 'auto'"
+                )
+        encoders = {
+            index: dtype_categories[index]
+            for index in indices
+            if index in dtype_categories
+        }
+        return indices, encoders
+
+    def _categorical_buffer(self, indices, n_features):
+        """Float64 buffer of resolved categorical indices, or `None` when no
+        feature is categorical. The buffer must stay referenced while the
+        params dict that holds its address is in use."""
+        for index in indices:
+            if not 0 <= index < n_features:
+                raise ValueError(
+                    f"categorical_feature index {index} is out of range for "
+                    f"{n_features} features"
+                )
+        if not indices:
+            return None
+        return _array.array("d", [float(index) for index in indices])
+
+    def _check_category_codes(self, buf, n_rows, indices, names, name="X"):
+        """Reject values a declared categorical column cannot carry.
+
+        A code is a whole number below 2**31. `NaN` and negative values are
+        missing and always allowed. Both bounds are checked here, at fit and
+        at predict alike, rather than left to `bin_of`, which truncates a
+        fractional code toward zero and reads an oversized one as unseen:
+        either would answer a caller who encoded the column differently
+        than they did at fit with a prediction instead of an error.
+        """
+        for index in indices:
+            column = _arrays.column_view(buf, n_rows, index)
+            bad = _arrays.first_bad_code(column, self._CATEGORY_LIMIT)
+            if bad is None:
+                continue
+            label = index if names is None else repr(names[index])
+            raise ValueError(
+                f"categorical feature {label} of {name} holds {bad!r}, which "
+                "is not a category code; codes are whole numbers below 2**31, "
+                "and NaN or any negative value means missing"
+            )
+
+    def _matrix_encoders(self, X, name="X"):
+        """The category tables to encode a matrix with after fitting: the
+        fitted ones, never the matrix's own.
+
+        A `category` column whose labels the model never saw cannot be
+        encoded at all, and a matrix that carries no labels cannot deliver
+        the ones the model was fitted on, so both raise rather than guess.
+        """
+        encoders = getattr(self, "_cat_encoders", None) or {}
+        incoming = _arrays.frame_categories(X)
+        unknown = sorted(set(incoming) - set(encoders))
+        if unknown:
+            raise ValueError(
+                f"columns {unknown} of {name} have pandas categorical dtype, "
+                f"but {type(self).__name__} holds no category mapping for "
+                "them; pass their integer codes, or fit on a frame that "
+                "carries the same categorical columns"
+            )
+        if encoders and not hasattr(X, "iloc"):
+            raise ValueError(
+                f"{type(self).__name__} was fitted on pandas categorical "
+                f"columns {sorted(encoders)}, whose labels only a DataFrame "
+                f"carries; pass {name} as a DataFrame, or fit on integer "
+                "codes instead"
+            )
+        return encoders
+
+    def _restore_categorical(self):
+        """Recover which features are categorical from a model read back
+        from disk.
+
+        The serialized format carries the category tables, so a loaded
+        model splits exactly as it did; what it cannot carry is the pandas
+        label encoding the estimator applied on top, so `_cat_encoders`
+        stays empty and a loaded model takes integer codes only. Pickle the
+        estimator to keep the labels.
+        """
+        query = (
+            _mojoboost.categorical_features_multiclass
+            if self._multiclass
+            else _mojoboost.categorical_features
+        )
+        self._cat_indices = [int(index) for index in query(self._model)]
+        self.categorical_feature_ = list(self._cat_indices)
+
+    def _fit_X(self, X):
+        """`(buffer, n_rows, n_features, names, categorical buffer)` for a
+        training matrix, with its categorical columns resolved and encoded.
+
+        The resolved indices and category tables are recorded on the
+        estimator here: prediction encodes through exactly these, so a
+        prediction frame that orders or extends its categories differently
+        still lands on the categories the model was fitted with.
+        """
+        names = _arrays.feature_names(X)
+        dtype_categories = _arrays.frame_categories(X)
+        indices, encoders = self._resolve_categorical(names, dtype_categories)
+        Xb, n_rows, n_features, names = _arrays.check_X(X, encoders=encoders)
+        cat_buf = self._categorical_buffer(indices, n_features)
+        self._check_category_codes(Xb, n_rows, indices, names)
+        self._cat_indices = list(indices)
+        self._cat_encoders = encoders
+        self.categorical_feature_ = list(indices)
+        return Xb, n_rows, n_features, names, cat_buf
+
     def _resolve_boosting(self):
         """The effective boosting strategy, "gbdt" or "goss".
 
@@ -419,6 +1030,7 @@ class _Base(_ParamsMixin):
         ic_flat=None,
         ic_offsets=None,
         monotone_addr=0,
+        categorical=None,
     ):
         min_data_in_leaf = self._resolve_alias(
             "min_data_in_leaf", "min_child_samples", 20
@@ -472,6 +1084,16 @@ class _Base(_ParamsMixin):
             raise ValueError("feature_fraction must be in (0, 1]")
         if not 0.0 < float(self.feature_fraction_bynode) <= 1.0:
             raise ValueError("feature_fraction_bynode must be in (0, 1]")
+        if int(self.max_cat_to_onehot) < 0:
+            raise ValueError("max_cat_to_onehot must be nonnegative")
+        if int(self.max_cat_threshold) < 1:
+            raise ValueError("max_cat_threshold must be positive")
+        if float(self.cat_smooth) < 0.0:
+            raise ValueError("cat_smooth must be nonnegative")
+        if float(self.cat_l2) < 0.0:
+            raise ValueError("cat_l2 must be nonnegative")
+        if int(self.min_data_per_group) < 1:
+            raise ValueError("min_data_per_group must be positive")
         return {
             "num_leaves": int(self.num_leaves),
             "max_depth": int(self.max_depth),
@@ -508,6 +1130,15 @@ class _Base(_ParamsMixin):
                 0 if ic_offsets is None else len(ic_offsets)
             ),
             "monotone_addr": int(monotone_addr),
+            "categorical_addr": (
+                0 if categorical is None else _addr(categorical)
+            ),
+            "categorical_len": 0 if categorical is None else len(categorical),
+            "max_cat_to_onehot": int(self.max_cat_to_onehot),
+            "max_cat_threshold": int(self.max_cat_threshold),
+            "cat_smooth": float(self.cat_smooth),
+            "cat_l2": float(self.cat_l2),
+            "min_data_per_group": int(self.min_data_per_group),
         }
 
     def _resolve_device(self, n_rows, n_features, n_outputs):
@@ -538,6 +1169,264 @@ class _Base(_ParamsMixin):
         wb = _arrays.check_sample_weight(sample_weight, n_rows)
         return wb, _addr(wb)
 
+    # -- validation sets and custom metrics -------------------------------
+
+    def _eval_sets(
+        self,
+        eval_set,
+        eval_names,
+        n_features,
+        eval_sample_weight=None,
+        eval_group=None,
+        encode=None,
+    ):
+        """Validated validation sets: the buffers to keep alive, the
+        `(name, x_addr, n_rows, y_addr)` specs the binding reads, the label
+        vectors the callbacks receive, the row counts, and the per-set
+        weight and group buffers (None where they were not given).
+
+        `encode` maps a set's labels through the same encoding the training
+        labels went through, which is what the classifier needs and what
+        makes an unseen validation label an error rather than a silent
+        miscount.
+        """
+        pairs = list(eval_set)
+        if not pairs:
+            raise ValueError("eval_set must not be empty")
+        if eval_names is None:
+            names = [f"valid_{i}" for i in range(len(pairs))]
+        else:
+            names = [str(name) for name in eval_names]
+            if len(names) != len(pairs):
+                raise ValueError(
+                    "eval_names must have one name per eval_set entry"
+                )
+        if len(set(names)) != len(names):
+            raise ValueError("eval_names must be unique")
+        set_weights = _per_set(
+            eval_sample_weight, len(pairs), "eval_sample_weight"
+        )
+        set_groups = _per_set(eval_group, len(pairs), "eval_group")
+        keep = []
+        specs = []
+        targets = []
+        rows = []
+        weights = []
+        groups = []
+        for name, pair, weight, group in zip(
+            names, pairs, set_weights, set_groups
+        ):
+            try:
+                X_valid, y_valid = pair
+            except (TypeError, ValueError):
+                raise ValueError(
+                    "each eval_set entry must be an (X, y) pair"
+                ) from None
+            label = f"eval_set {name!r}"
+            Xb, n_valid_rows, n_valid_features, valid_names = _arrays.check_X(
+                X_valid, encoders=self._matrix_encoders(X_valid, label)
+            )
+            if n_valid_features != n_features:
+                raise ValueError(
+                    f"eval_set {name!r} has {n_valid_features} features, but "
+                    f"X has {n_features}"
+                )
+            self._check_category_codes(
+                Xb,
+                n_valid_rows,
+                getattr(self, "_cat_indices", ()),
+                valid_names,
+                label,
+            )
+            if encode is None:
+                yb = _arrays.check_target(y_valid, n_valid_rows)
+            else:
+                yb = encode(y_valid, n_valid_rows, label)
+            wb = (
+                None
+                if weight is None
+                else _arrays.check_sample_weight(weight, n_valid_rows)
+            )
+            gb = None if group is None else _group_buffer(group, n_valid_rows)
+            keep.append((Xb, yb, wb, gb))
+            specs.append((name, _addr(Xb), n_valid_rows, _addr(yb)))
+            targets.append(yb)
+            rows.append(n_valid_rows)
+            weights.append(wb)
+            groups.append(gb)
+        return keep, specs, targets, rows, weights, groups
+
+    def _fit_with_metrics(
+        self,
+        Xb,
+        yb,
+        n_rows,
+        n_features,
+        params,
+        device,
+        objective,
+        eval_set,
+        eval_names,
+        eval_metric,
+        early_stopping_rounds,
+        min_delta,
+        primary_metric,
+        eval_sample_weight=None,
+        eval_group=None,
+        task=_eval.REGRESSION,
+        n_classes=0,
+        encode=None,
+    ):
+        """Train while metrics score the validation sets.
+
+        `eval_metric` holds LightGBM metric names, callables, or both, and
+        defaults to the metric LightGBM would score for this task and
+        objective. A built-in name is evaluated by `_mojoboost.eval_metric`,
+        which calls src/mojoboost/metrics.mojo, so the Python API never
+        recomputes a metric the library already defines; `eval_sample_weight`
+        weights those, one vector per validation set.
+
+        A callable is called once per validation set per round as
+        `metric(y_true, y_pred)`, where `y_pred` holds raw scores (log-odds
+        for the binary classifier, one row-major block of `n_classes` per
+        row for the softmax one), matching LightGBM's `feval`. It returns a
+        float, or LightGBM's `(name, value, is_higher_better)` triple, of
+        which only the value is read: the direction is declared in
+        `eval_metric`. `y_pred` is a view on a buffer the trainer reuses
+        every round, so read it, do not keep it.
+
+        `task` picks the trainer and the metrics that make sense for it:
+        the softmax trainer for `_eval.MULTICLASS`, the LambdaRank one for
+        `_eval.RANKING`, and the single-output one otherwise.
+
+        Sets `evals_result_`, `best_score_`, `stopped_early_`, and the
+        `_metric_*` fields `_record_fit` turns into `best_iteration_` and
+        `n_iter_`; see src/mojoboost/custom_metric.mojo for the
+        early-stopping rules.
+        """
+        if device != "cpu":
+            raise RuntimeError(
+                "validation metrics are scored on the CPU; use device='cpu' "
+                "or device='auto'"
+            )
+        specs = _metric_specs(eval_metric, task, getattr(self, "objective", None))
+        keep, valid_specs, targets, rows, weights, groups = self._eval_sets(
+            eval_set,
+            eval_names,
+            n_features,
+            eval_sample_weight,
+            eval_group,
+            encode,
+        )
+        primary = _primary_index(primary_metric, specs)
+        rounds = _early_stopping_rounds(early_stopping_rounds)
+        if float(min_delta) < 0.0:
+            raise ValueError("min_delta must not be negative")
+        codes = [spec[4] for spec in specs]
+        funcs = [spec[1] for spec in specs]
+        if any(w is not None for w in weights) and any(
+            code is None for code in codes
+        ):
+            raise ValueError(
+                "eval_sample_weight weights the built-in eval metrics; a "
+                "callable metric is handed unweighted predictions, so apply "
+                "the weights inside it instead"
+            )
+        # One block of raw scores per validation row, n_classes wide for the
+        # softmax trainer.
+        width = n_classes if task == _eval.MULTICLASS else 1
+        pred = _out_buffer(max(rows) * width)
+        eval_params = [
+            {
+                "pred_addr": _addr(pred),
+                "y_addr": _addr(targets[v]),
+                "weight_addr": (
+                    0 if weights[v] is None else _addr(weights[v])
+                ),
+                "n_rows": rows[v],
+                "n_classes": int(n_classes),
+                "group_addr": 0 if groups[v] is None else _addr(groups[v]),
+                "n_groups": 0 if groups[v] is None else len(groups[v]),
+                "ndcg_at": int(getattr(self, "ndcg_eval_at", 5)),
+                "alpha": float(getattr(self, "alpha", 0.9)),
+            }
+            for v in range(len(rows))
+        ]
+
+        def bridge(metric_index, valid_index):
+            code = codes[metric_index]
+            if code is not None:
+                return float(
+                    _mojoboost.eval_metric(code, eval_params[valid_index])
+                )
+            value = funcs[metric_index](
+                targets[valid_index], pred[: rows[valid_index] * width]
+            )
+            if isinstance(value, tuple):
+                # LightGBM's feval returns (name, value, is_higher_better).
+                value = value[1]
+            return float(value)
+
+        params["pred_addr"] = _addr(pred)
+        params["valid_sets"] = valid_specs
+        params["n_valid"] = len(valid_specs)
+        params["metrics"] = [
+            # ints, not bools: the binding reads the flags as integers.
+            (spec[0], int(spec[2]), int(spec[3]))
+            for spec in specs
+        ]
+        params["n_metrics"] = len(specs)
+        params["primary_metric"] = primary
+        params["early_stopping_rounds"] = rounds
+        params["min_delta"] = float(min_delta)
+        if task == _eval.MULTICLASS:
+            result = _mojoboost.fit_multiclass_with_metrics(
+                _addr(Xb),
+                n_rows,
+                n_features,
+                _addr(yb),
+                int(n_classes),
+                bridge,
+                params,
+            )
+        elif task == _eval.RANKING:
+            result = _mojoboost.fit_ranker_with_metrics(
+                _addr(Xb), n_rows, n_features, _addr(yb), bridge, params
+            )
+        else:
+            result = _mojoboost.fit_with_metrics(
+                _addr(Xb),
+                n_rows,
+                n_features,
+                _addr(yb),
+                objective,
+                bridge,
+                params,
+            )
+        self._model = result[0]
+        values = result[1]
+        n_rounds = int(result[2])
+        self._metric_best_iteration = int(result[3])
+        # The history counts the base-score-only model as round 0, so one
+        # fewer round was actually trained than it holds entries for.
+        self._metric_n_iter = max(n_rounds - 1, 0)
+        self.best_score_ = float(result[4])
+        self.stopped_early_ = bool(result[5])
+        n_valid = len(valid_specs)
+        n_metrics = len(specs)
+        self.evals_result_ = {
+            valid_specs[v][0]: {
+                specs[m][0]: [
+                    float(values[(r * n_valid + v) * n_metrics + m])
+                    for r in range(n_rounds)
+                ]
+                for m in range(n_metrics)
+            }
+            for v in range(n_valid)
+        }
+        # The validation buffers had to outlive the call above.
+        del keep
+
     # -- fitted state ----------------------------------------------------
 
     def _reset_fitted(self):
@@ -547,6 +1436,15 @@ class _Base(_ParamsMixin):
         self._model = None
         self._importance_cache = None
         self._multiclass = False
+        # Category state is private because prediction needs it whether or
+        # not the caller ever reads `categorical_feature_`; clearing it here
+        # keeps a refit from encoding new data through the old tables.
+        self._cat_indices = ()
+        self._cat_encoders = {}
+        # What validation, if any, shaped the last fit. `_record_fit` reads
+        # them, so a refit without an eval_set must not inherit them.
+        self._metric_best_iteration = None
+        self._metric_n_iter = None
         for name in self._FITTED_ATTRS:
             self.__dict__.pop(name, None)
 
@@ -570,28 +1468,42 @@ class _Base(_ParamsMixin):
                 f"is expecting {self.n_features_in_} features as input"
             )
 
-    def _check_feature_names(self, names):
+    def _check_feature_names(self, names, validate_features=False):
         """Compare the column names of an incoming matrix against the ones
         recorded at fit time, warning when only one side has them and
-        raising when both do and they disagree, as scikit-learn does."""
+        raising when both do and they disagree, as scikit-learn does.
+
+        `validate_features` is LightGBM's `predict` flag: it turns the
+        one-sided cases from warnings into errors, so that asking for
+        validation and getting it silently is not possible. A name mismatch
+        raises either way, because that is a mismatch scikit-learn already
+        refuses to predict through."""
         fitted = getattr(self, "feature_names_in_", None)
         if fitted is None and names is None:
+            if validate_features:
+                raise ValueError(
+                    "validate_features=True needs feature names on both "
+                    f"sides, but {type(self).__name__} was fitted without "
+                    "them and X does not carry them"
+                )
             return
         if fitted is None:
-            _warnings.warn(
+            message = (
                 f"X has feature names, but {type(self).__name__} was fitted "
-                "without feature names",
-                UserWarning,
-                stacklevel=3,
+                "without feature names"
             )
+            if validate_features:
+                raise ValueError(message)
+            _warnings.warn(message, UserWarning, stacklevel=3)
             return
         if names is None:
-            _warnings.warn(
+            message = (
                 "X does not have valid feature names, but "
-                f"{type(self).__name__} was fitted with feature names",
-                UserWarning,
-                stacklevel=3,
+                f"{type(self).__name__} was fitted with feature names"
             )
+            if validate_features:
+                raise ValueError(message)
+            _warnings.warn(message, UserWarning, stacklevel=3)
             return
         if list(names) != list(fitted):
             raise ValueError(
@@ -605,18 +1517,173 @@ class _Base(_ParamsMixin):
         if names is not None:
             self.feature_names_in_ = _arrays.name_array(names)
         self.device_ = device
-        self.best_iteration_ = self._num_iterations()
+        # With validation, the best iteration is the one the primary metric
+        # peaked at; the ensemble is rolled back to it whenever early
+        # stopping is on, so the two agree unless it was left off.
+        best = getattr(self, "_metric_best_iteration", None)
+        self.best_iteration_ = (
+            self._num_iterations() if best is None else best
+        )
+        rounds = getattr(self, "_metric_n_iter", None)
+        self.n_iter_ = self._num_iterations() if rounds is None else rounds
         self._importance_cache = {
             kind: self._raw_importance(kind) for kind in _IMPORTANCE_TYPES
         }
 
-    def _check_predict_X(self, X):
-        """Validate a matrix for prediction against the fitted model."""
+    def _check_predict_X(self, X, validate_features=False):
+        """Validate a matrix for prediction against the fitted model.
+
+        Categorical columns are encoded through the tables `fit` recorded,
+        so the code a label maps to is the one it trained as, whatever the
+        incoming frame calls it."""
         self._require_fitted()
-        Xb, n_rows, n_features, names = _arrays.check_X(X)
+        encoders = self._matrix_encoders(X)
+        Xb, n_rows, n_features, names = _arrays.check_X(X, encoders=encoders)
         self._check_n_features(n_features)
-        self._check_feature_names(names)
+        self._check_feature_names(names, validate_features)
+        self._check_category_codes(
+            Xb, n_rows, getattr(self, "_cat_indices", ()), names
+        )
         return Xb, n_rows
+
+    # -- prediction options ----------------------------------------------
+
+    def _check_predict_flags(self, raw_score, pred_leaf, pred_contrib=False):
+        """Reject prediction flags that ask for different outputs.
+
+        `raw_score` asks for scores on the link scale, `pred_leaf` for leaf
+        ordinals, and `pred_contrib` for per-feature contributions; they have
+        different dtypes and different shapes, so there is no result that
+        satisfies more than one. LightGBM silently picks a winner; mojoboost
+        raises, because the quiet winner is not discoverable from the output.
+
+        `raw_score` with `pred_contrib` is refused for a further reason:
+        contributions always explain the raw score, whatever the objective's
+        link, so `raw_score=True` would read as a choice that does not exist.
+        """
+        asked = []
+        if pred_leaf:
+            asked.append("pred_leaf=True")
+        if pred_contrib:
+            asked.append("pred_contrib=True")
+        if raw_score:
+            asked.append("raw_score=True")
+        if len(asked) > 1:
+            raise ValueError(
+                f"{' and '.join(asked)} ask for different outputs (scores, "
+                "leaf ordinals, and feature contributions have different "
+                "shapes); pass at most one. Contributions always explain the "
+                "raw score, so raw_score=True is redundant with them."
+            )
+
+    def _iteration_slice(self, start_iteration, num_iteration):
+        """Resolve LightGBM's `(start_iteration, num_iteration)` pair into
+        the half-open `[start, stop)` slice of boosting iterations to
+        predict with, clamped to the fitted ensemble.
+
+        The rules are LightGBM's, from `GBDT::InitPredict`: a negative start
+        clamps to 0 and a start past the end clamps to an empty range at the
+        end, `num_iteration=None` or any value <= 0 means every iteration
+        from the start on, and a positive one is capped at what remains.
+        Clamping rather than raising is what LightGBM callers depend on when
+        they slice a shorter ensemble than they expected.
+
+        `num_iteration=None` therefore predicts with `best_iteration_`
+        iterations, which is LightGBM's documented default. mojoboost gets
+        there structurally: early stopping truncates the ensemble at its best
+        iteration, so the trees the model still holds *are* the best
+        iteration and there is no later tree to exclude."""
+        total = self._num_iterations()
+        start = _as_iteration(start_iteration, "start_iteration")
+        start = min(max(start, 0), total)
+        if num_iteration is None:
+            return start, total
+        num = _as_iteration(num_iteration, "num_iteration")
+        if num <= 0:
+            return start, total
+        return start, min(start + num, total)
+
+    def _predict_contrib(self, Xb, n_rows, start, stop):
+        """Exact TreeSHAP contributions from the iterations in
+        `[start, stop)`.
+
+        The shape follows LightGBM. A single-output model gives
+        `(n_samples, n_features + 1)`, the last column being the expected
+        value, so each row sums to that row's raw score. A multiclass model
+        gives `(n_samples, n_classes * (n_features + 1))` in class-major
+        blocks: columns `k * (n_features + 1)` through
+        `k * (n_features + 1) + n_features` are class k's contributions and
+        its expected value, and that block sums to class k's raw score.
+
+        An empty iteration range keeps the shape: the feature columns are
+        zero and the expected-value column carries the base score only when
+        the range includes iteration 0, so the sum property still holds."""
+        stride = self.n_features_in_ + 1
+        per_row = self.n_classes_ * stride if self._multiclass else stride
+        if n_rows == 0:
+            if _np is not None:
+                return _np.empty((0, per_row), dtype=_np.float64)
+            return []
+        out = _out_buffer(n_rows * per_row)
+        query = (
+            _mojoboost.predict_contrib_multiclass
+            if self._multiclass
+            else _mojoboost.predict_contrib
+        )
+        query(
+            self._model,
+            _addr(Xb),
+            n_rows,
+            self.n_features_in_,
+            start,
+            stop,
+            _addr(out),
+        )
+        if _np is not None:
+            return out.reshape(n_rows, per_row)
+        return [
+            [out[r * per_row + c] for c in range(per_row)]
+            for r in range(n_rows)
+        ]
+
+    def _predict_leaf(self, Xb, n_rows, start, stop):
+        """Leaf ordinals for every tree in `[start, stop)`.
+
+        The shape is `(n_samples, (stop - start) * trees_per_iteration)`,
+        where `trees_per_iteration` is the class count for a multiclass
+        model and 1 otherwise. The extension writes float64 (the only
+        element type that crosses the boundary) and the ordinals are small
+        integers, so casting back is exact."""
+        per_iteration = self.n_classes_ if self._multiclass else 1
+        n_cols = (stop - start) * per_iteration
+        if n_cols == 0 or n_rows == 0:
+            # An empty range selects no trees, so there is nothing to ask the
+            # extension for; the result keeps its shape and loses a column
+            # per unselected iteration.
+            if _np is not None:
+                return _np.empty((n_rows, n_cols), dtype=_np.int32)
+            return [[] for _ in range(n_rows)]
+        out = _out_buffer(n_rows * n_cols)
+        query = (
+            _mojoboost.predict_leaf_multiclass
+            if self._multiclass
+            else _mojoboost.predict_leaf
+        )
+        query(
+            self._model,
+            _addr(Xb),
+            n_rows,
+            self.n_features_in_,
+            start,
+            stop,
+            _addr(out),
+        )
+        if _np is not None:
+            return out.reshape(n_rows, n_cols).astype(_np.int32)
+        return [
+            [int(out[r * n_cols + c]) for c in range(n_cols)]
+            for r in range(n_rows)
+        ]
 
     # -- fitted attributes -----------------------------------------------
 
@@ -760,23 +1827,78 @@ class MojoBoostRegressor(_Base):
             raise ValueError("quantile requires 0 < alpha < 1")
         return code
 
-    def fit(self, X, y, sample_weight=None):
+    def fit(
+        self,
+        X,
+        y,
+        sample_weight=None,
+        eval_set=None,
+        eval_names=None,
+        eval_metric=None,
+        early_stopping_rounds=0,
+        min_delta=0.0,
+        primary_metric=0,
+        eval_sample_weight=None,
+        eval_X=None,
+        eval_y=None,
+    ):
         """Fit on `X` (n_samples, n_features) and a numeric target `y`.
 
         `X` may contain NaN, which is the missing-value marker, but not
         infinities; `y` and `sample_weight` must be finite throughout.
+
+        `eval_set` is a list of `(X, y)` validation pairs (or one bare pair,
+        or `eval_X=`/`eval_y=`), named by `eval_names` or `valid_0`,
+        `valid_1`, ... by default, weighted by `eval_sample_weight`, and
+        scored every round by `eval_metric`: LightGBM metric names,
+        callables, or both, defaulting to the objective's own loss (see
+        `_fit_with_metrics`). With `early_stopping_rounds` above 0, training
+        stops once a watched metric goes that many rounds without improving
+        by more than `min_delta`, and the ensemble is truncated to the best
+        round of `primary_metric` (an index or a name) on the first
+        validation set.
+
         Returns self.
         """
         objective = self._objective_code()
+        eval_set = _eval_pairs(eval_set, eval_X, eval_y)
+        _check_eval_arguments(
+            eval_set, eval_metric, eval_sample_weight, early_stopping_rounds
+        )
         self._reset_fitted()
-        Xb, n_rows, n_features, names = _arrays.check_X(X)
+        Xb, n_rows, n_features, names, cat_buf = self._fit_X(X)
         yb = _arrays.check_target(y, n_rows)
         wb, w_addr = self._weight_buffer(sample_weight, n_rows)
         ic_flat, ic_offsets = self._interaction_buffers(n_features)
         mono_buf, mono_addr = self._monotone_buffer(n_features)
         device = self._resolve_device(n_rows, n_features, 1)
-        params = self._params(w_addr, device, ic_flat, ic_offsets, mono_addr)
-        if objective == _CUSTOM:
+        params = self._params(
+            w_addr, device, ic_flat, ic_offsets, mono_addr, cat_buf
+        )
+        if eval_set is not None:
+            if objective == _CUSTOM:
+                raise ValueError(
+                    "a Python objective callback and custom validation "
+                    "metrics cannot be combined yet; the Mojo API pairs them "
+                    "with train_custom_with_metrics"
+                )
+            self._fit_with_metrics(
+                Xb,
+                yb,
+                n_rows,
+                n_features,
+                params,
+                device,
+                objective,
+                eval_set,
+                eval_names,
+                eval_metric,
+                early_stopping_rounds,
+                min_delta,
+                primary_metric,
+                eval_sample_weight,
+            )
+        elif objective == _CUSTOM:
             self._fit_custom(Xb, yb, n_rows, n_features, params, device)
         else:
             self._model = _mojoboost.fit(
@@ -848,12 +1970,56 @@ class MojoBoostRegressor(_Base):
             _addr(Xb), n_rows, n_features, _addr(yb), bridge, params
         )
 
-    def predict(self, X):
-        """Predictions for `X`, one per row."""
-        Xb, n_rows = self._check_predict_X(X)
+    def predict(
+        self,
+        X,
+        raw_score=False,
+        start_iteration=0,
+        num_iteration=None,
+        pred_leaf=False,
+        pred_contrib=False,
+        validate_features=False,
+    ):
+        """Predictions for `X`, one per row.
+
+        `raw_score` returns scores on the link scale instead of the response
+        scale. The two differ only where the objective has a link: the
+        regressor's squared-error, huber, quantile, and L1 objectives predict
+        on the raw scale already, and poisson returns `exp(raw)` without it.
+
+        `start_iteration` and `num_iteration` select a slice of the boosting
+        iterations, following LightGBM: `num_iteration=None` uses every
+        iteration the fitted model kept, which is `best_iteration_`. See
+        `_iteration_slice` for the clamping rules and where the base score
+        sits.
+
+        `pred_leaf` returns leaf ordinals instead of scores, shape
+        `(n_samples, num_iteration)` and integer dtype. Column i is the leaf
+        the row reaches in the tree of iteration `start_iteration + i`,
+        numbered within that tree; see `MojoBoostRegressor.predict` in the
+        module docstring for the numbering's guarantees.
+
+        `validate_features` turns a missing set of feature names on either
+        side into an error rather than a warning.
+
+        `raw_score` and `pred_leaf` cannot be combined."""
+        self._check_predict_flags(raw_score, pred_leaf, pred_contrib)
+        Xb, n_rows = self._check_predict_X(X, validate_features)
+        start, stop = self._iteration_slice(start_iteration, num_iteration)
+        if pred_leaf:
+            return self._predict_leaf(Xb, n_rows, start, stop)
+        if pred_contrib:
+            return self._predict_contrib(Xb, n_rows, start, stop)
         out = _out_buffer(n_rows)
-        _mojoboost.predict(
-            self._model, _addr(Xb), n_rows, self.n_features_in_, _addr(out)
+        _mojoboost.predict_range(
+            self._model,
+            _addr(Xb),
+            n_rows,
+            self.n_features_in_,
+            start,
+            stop,
+            int(bool(raw_score)),
+            _addr(out),
         )
         return _finish(out)
 
@@ -914,6 +2080,7 @@ class MojoBoostRegressor(_Base):
         est._model = _mojoboost.load(str(path))
         est.n_features_in_ = int(_mojoboost.n_features(est._model))
         est.best_iteration_ = est._num_iterations()
+        est._restore_categorical()
         return est
 
     def __sklearn_tags__(self):
@@ -944,12 +2111,37 @@ class MojoBoostClassifier(_Base):
         super().__init__(**kwargs)
         self.objective = objective
 
-    def fit(self, X, y, sample_weight=None):
+    def fit(
+        self,
+        X,
+        y,
+        sample_weight=None,
+        eval_set=None,
+        eval_names=None,
+        eval_metric=None,
+        early_stopping_rounds=0,
+        min_delta=0.0,
+        primary_metric=0,
+        eval_sample_weight=None,
+        eval_X=None,
+        eval_y=None,
+    ):
         """Fit on `X` (n_samples, n_features) and labels `y`.
 
         `X` may contain NaN, the missing-value marker, but not infinities.
         `y` needs at least 2 distinct labels, and `sample_weight` must be
-        finite and nonnegative. Returns self.
+        finite and nonnegative.
+
+        The validation arguments work as they do on `MojoBoostRegressor`,
+        for two classes and for many. Validation labels go through the same
+        encoding the training labels did, so a label that was not in `y` is
+        an error rather than a silent miscount, and the default
+        `eval_metric` is `binary_logloss` or `multi_logloss` accordingly.
+        Metrics receive those encoded labels and raw scores, not
+        probabilities: log-odds for two classes, and one row-major block of
+        `n_classes_` softmax inputs per row beyond that.
+
+        Returns self.
         """
         if self.objective is not None:
             raise ValueError(
@@ -958,8 +2150,12 @@ class MojoBoostClassifier(_Base):
                 "objective and apply your own link (a sigmoid, say) to the "
                 "raw predictions."
             )
+        eval_set = _eval_pairs(eval_set, eval_X, eval_y)
+        _check_eval_arguments(
+            eval_set, eval_metric, eval_sample_weight, early_stopping_rounds
+        )
         self._reset_fitted()
-        Xb, n_rows, n_features, names = _arrays.check_X(X)
+        Xb, n_rows, n_features, names, cat_buf = self._fit_X(X)
         yb, classes = _arrays.encode_labels(y, n_rows)
         n_classes = len(classes)
         wb, w_addr = self._weight_buffer(sample_weight, n_rows)
@@ -971,14 +2167,54 @@ class MojoBoostClassifier(_Base):
             n_rows, n_features, 1 if n_classes == 2 else n_classes
         )
         self._multiclass = n_classes > 2
-        if n_classes == 2:
+        if eval_set is not None:
+
+            def encode(y_valid, n_valid_rows, label):
+                return _encode_like(y_valid, n_valid_rows, classes, label)
+
+            self._fit_with_metrics(
+                Xb,
+                yb,
+                n_rows,
+                n_features,
+                self._params(
+                    w_addr,
+                    device,
+                    ic_flat,
+                    ic_offsets,
+                    mono_addr,
+                    cat_buf,
+                ),
+                device,
+                _BINARY_LOGISTIC,
+                eval_set,
+                eval_names,
+                eval_metric,
+                early_stopping_rounds,
+                min_delta,
+                primary_metric,
+                eval_sample_weight,
+                task=(
+                    _eval.BINARY if n_classes == 2 else _eval.MULTICLASS
+                ),
+                n_classes=n_classes,
+                encode=encode,
+            )
+        elif n_classes == 2:
             self._model = _mojoboost.fit(
                 _addr(Xb),
                 n_rows,
                 n_features,
                 _addr(yb),
                 _BINARY_LOGISTIC,
-                self._params(w_addr, device, ic_flat, ic_offsets, mono_addr),
+                self._params(
+                    w_addr,
+                    device,
+                    ic_flat,
+                    ic_offsets,
+                    mono_addr,
+                    cat_buf,
+                ),
             )
         else:
             self._model = _mojoboost.fit_multiclass(
@@ -987,7 +2223,14 @@ class MojoBoostClassifier(_Base):
                 n_features,
                 _addr(yb),
                 n_classes,
-                self._params(w_addr, device, ic_flat, ic_offsets, mono_addr),
+                self._params(
+                    w_addr,
+                    device,
+                    ic_flat,
+                    ic_offsets,
+                    mono_addr,
+                    cat_buf,
+                ),
             )
         self.classes_ = (
             _np.asarray(classes) if _np is not None else list(classes)
@@ -996,32 +2239,112 @@ class MojoBoostClassifier(_Base):
         self._record_fit(n_features, names, device)
         return self
 
-    def predict_proba(self, X):
+    def predict_proba(
+        self,
+        X,
+        raw_score=False,
+        start_iteration=0,
+        num_iteration=None,
+        pred_leaf=False,
+        pred_contrib=False,
+        validate_features=False,
+    ):
         """Class probabilities, shape (n_samples, n_classes), with columns
-        in `classes_` order. Rows sum to 1."""
-        Xb, n_rows = self._check_predict_X(X)
+        in `classes_` order. Rows sum to 1.
+
+        The prediction options are LightGBM's, and so are the shapes they
+        return, which are not all probability matrices:
+
+        - `raw_score` returns scores before the inverse link, so the result
+          is not a distribution and does not sum to 1. A binary classifier
+          returns the log-odds of the positive class, shape `(n_samples,)`,
+          because there is one score per row and not one per class; a
+          multiclass classifier returns the pre-softmax scores, shape
+          `(n_samples, n_classes)`.
+        - `pred_leaf` returns leaf ordinals, integer dtype. A binary
+          classifier is a single-output ensemble, so its shape is
+          `(n_samples, num_iteration)`; a multiclass classifier grows one
+          tree per class per iteration, so its shape is
+          `(n_samples, num_iteration * n_classes)` with column
+          `i * n_classes + k` holding class k's tree in iteration i.
+
+        `start_iteration` and `num_iteration` slice the boosting iterations
+        as in `MojoBoostRegressor.predict`; the softmax is taken over the
+        sliced scores, so probabilities are those of the truncated ensemble.
+        `validate_features` and the `raw_score`/`pred_leaf` exclusion are
+        also as documented there."""
+        self._check_predict_flags(raw_score, pred_leaf, pred_contrib)
+        Xb, n_rows = self._check_predict_X(X, validate_features)
         n_features = self.n_features_in_
+        start, stop = self._iteration_slice(start_iteration, num_iteration)
+        if pred_leaf:
+            return self._predict_leaf(Xb, n_rows, start, stop)
+        if pred_contrib:
+            return self._predict_contrib(Xb, n_rows, start, stop)
+        raw = int(bool(raw_score))
         if self.n_classes_ == 2:
             out = _out_buffer(n_rows)
-            _mojoboost.predict(
-                self._model, _addr(Xb), n_rows, n_features, _addr(out)
+            _mojoboost.predict_range(
+                self._model,
+                _addr(Xb),
+                n_rows,
+                n_features,
+                start,
+                stop,
+                raw,
+                _addr(out),
             )
+            if raw:
+                # One raw score per row, as LightGBM returns for a binary
+                # model: there is no second column to complement.
+                return _finish(out)
             if _np is not None:
                 return _np.column_stack([1.0 - out, out])
             return [[1.0 - p, p] for p in out]
         out = _out_buffer(n_rows * self.n_classes_)
-        _mojoboost.predict_proba(
-            self._model, _addr(Xb), n_rows, n_features, _addr(out)
+        _mojoboost.predict_proba_range(
+            self._model,
+            _addr(Xb),
+            n_rows,
+            n_features,
+            start,
+            stop,
+            raw,
+            _addr(out),
         )
         if _np is not None:
             return out.reshape(n_rows, self.n_classes_)
         k = self.n_classes_
         return [list(out[r * k : (r + 1) * k]) for r in range(n_rows)]
 
-    def predict(self, X):
+    def predict(
+        self,
+        X,
+        raw_score=False,
+        start_iteration=0,
+        num_iteration=None,
+        pred_leaf=False,
+        pred_contrib=False,
+        validate_features=False,
+    ):
         """Predicted labels, drawn from `classes_`. Defined as the argmax
-        of `predict_proba`, so the two can never disagree."""
-        proba = self.predict_proba(X)
+        of `predict_proba`, so the two can never disagree.
+
+        `raw_score`, `pred_leaf`, and `pred_contrib` ask for something that is
+        not a label, so as in LightGBM they pass `predict_proba`'s result
+        straight through with the shapes documented there rather than taking
+        an argmax."""
+        proba = self.predict_proba(
+            X,
+            raw_score=raw_score,
+            start_iteration=start_iteration,
+            num_iteration=num_iteration,
+            pred_leaf=pred_leaf,
+            pred_contrib=pred_contrib,
+            validate_features=validate_features,
+        )
+        if raw_score or pred_leaf or pred_contrib:
+            return proba
         if _np is not None:
             return self.classes_[_np.argmax(proba, axis=1)]
         indices = [max(range(len(p)), key=p.__getitem__) for p in proba]
@@ -1095,6 +2418,7 @@ class MojoBoostClassifier(_Base):
             else list(range(est.n_classes_))
         )
         est.best_iteration_ = est._num_iterations()
+        est._restore_categorical()
         return est
 
     def __sklearn_tags__(self):
@@ -1265,11 +2589,54 @@ class MojoBoostRanker(_Base):
         params["n_groups"] = len(gb)
         return params
 
-    def fit(self, X, y, group=None, sample_weight=None):
+    def fit(
+        self,
+        X,
+        y,
+        group=None,
+        sample_weight=None,
+        eval_set=None,
+        eval_group=None,
+        eval_names=None,
+        eval_metric=None,
+        early_stopping_rounds=0,
+        min_delta=0.0,
+        primary_metric=0,
+        eval_sample_weight=None,
+        eval_X=None,
+        eval_y=None,
+    ):
         """Fit on `X` (n_samples, n_features), relevance labels `y`, and
-        `group`, the row count of each query in row order. Returns self."""
+        `group`, the row count of each query in row order.
+
+        The validation arguments work as they do on `MojoBoostRegressor`,
+        with `eval_group` carrying each validation set's own query
+        boundaries: a validation set is a ranking problem of its own, so it
+        needs them, and the default `eval_metric` is `ndcg` at the
+        estimator's `ndcg_eval_at`. `eval_sample_weight` is rejected here,
+        because NDCG has no weighted definition in LightGBM to match.
+
+        Returns self.
+        """
+        eval_set = _eval_pairs(eval_set, eval_X, eval_y)
+        _check_eval_arguments(
+            eval_set, eval_metric, eval_sample_weight, early_stopping_rounds
+        )
+        if eval_set is not None:
+            if eval_group is None:
+                raise ValueError(
+                    "a ranker's eval_set needs eval_group: the number of "
+                    "rows in each validation query, in row order"
+                )
+            if eval_sample_weight is not None:
+                raise ValueError(
+                    "eval_sample_weight is not supported for a ranker; NDCG "
+                    "has no weighted definition in LightGBM to match"
+                )
+        elif eval_group is not None:
+            raise ValueError("eval_group needs an eval_set to describe")
         self._reset_fitted()
-        Xb, n_rows, n_features, names = _arrays.check_X(X)
+        Xb, n_rows, n_features, names, cat_buf = self._fit_X(X)
         yb = _arrays.check_target(y, n_rows)
         _check_relevance(yb, n_rows)
         gb = _group_buffer(group, n_rows)
@@ -1283,22 +2650,82 @@ class MojoBoostRanker(_Base):
                 "device='auto'"
             )
         params = self._rank_params(
-            self._params(w_addr, device, ic_flat, ic_offsets, mono_addr), gb
+            self._params(
+                w_addr, device, ic_flat, ic_offsets, mono_addr, cat_buf
+            ),
+            gb,
         )
-        self._model = _mojoboost.fit_ranker(
-            _addr(Xb), n_rows, n_features, _addr(yb), params
-        )
+        if eval_set is not None:
+
+            def check_grades(y_valid, n_valid_rows, label):
+                valid_yb = _arrays.check_target(y_valid, n_valid_rows, label)
+                _check_relevance(valid_yb, n_valid_rows)
+                return valid_yb
+
+            self._fit_with_metrics(
+                Xb,
+                yb,
+                n_rows,
+                n_features,
+                params,
+                device,
+                _LAMBDARANK,
+                eval_set,
+                eval_names,
+                eval_metric,
+                early_stopping_rounds,
+                min_delta,
+                primary_metric,
+                eval_group=eval_group,
+                task=_eval.RANKING,
+                encode=check_grades,
+            )
+        else:
+            self._model = _mojoboost.fit_ranker(
+                _addr(Xb), n_rows, n_features, _addr(yb), params
+            )
         self._record_fit(n_features, names, device)
         return self
 
-    def predict(self, X):
+    def predict(
+        self,
+        X,
+        raw_score=False,
+        start_iteration=0,
+        num_iteration=None,
+        pred_leaf=False,
+        pred_contrib=False,
+        validate_features=False,
+    ):
         """Raw ranking scores for `X`, one per row. Sort a query's rows by
         this score, descending, to get its ranking; the values themselves
-        are not comparable between queries."""
-        Xb, n_rows = self._check_predict_X(X)
+        are not comparable between queries.
+
+        `raw_score` is accepted for signature compatibility and changes
+        nothing: lambdarank has no inverse link, so a ranker's response scale
+        is its raw scale and both settings return the same scores.
+
+        `start_iteration`, `num_iteration`, `pred_leaf`, and
+        `validate_features` behave as in `MojoBoostRegressor.predict`; a
+        ranker is a single-output ensemble, so `pred_leaf` returns shape
+        `(n_samples, num_iteration)`."""
+        self._check_predict_flags(raw_score, pred_leaf, pred_contrib)
+        Xb, n_rows = self._check_predict_X(X, validate_features)
+        start, stop = self._iteration_slice(start_iteration, num_iteration)
+        if pred_leaf:
+            return self._predict_leaf(Xb, n_rows, start, stop)
+        if pred_contrib:
+            return self._predict_contrib(Xb, n_rows, start, stop)
         out = _out_buffer(n_rows)
-        _mojoboost.predict(
-            self._model, _addr(Xb), n_rows, self.n_features_in_, _addr(out)
+        _mojoboost.predict_range(
+            self._model,
+            _addr(Xb),
+            n_rows,
+            self.n_features_in_,
+            start,
+            stop,
+            int(bool(raw_score)),
+            _addr(out),
         )
         return _finish(out)
 
@@ -1322,4 +2749,5 @@ class MojoBoostRanker(_Base):
         est._model = _mojoboost.load(str(path))
         est.n_features_in_ = int(_mojoboost.n_features(est._model))
         est.best_iteration_ = est._num_iterations()
+        est._restore_categorical()
         return est

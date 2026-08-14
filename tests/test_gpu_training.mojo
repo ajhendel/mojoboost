@@ -22,6 +22,7 @@ from mojoboost.boosting import (
 from mojoboost.goss import GossParams
 from mojoboost.histogram import build_histogram_subset
 from mojoboost.histogram_gpu import GpuHistogramBuilder
+from mojoboost.monotone import MonotoneConstraints
 from mojoboost.sampling import select_tree_features, selection_count
 from mojoboost.train_gpu import train_gpu
 from mojoboost.tree import TreeParams
@@ -540,7 +541,7 @@ def test_gpu_feature_subsampling_matches_cpu() raises:
         for t in range(len(gpu.trees)):
             var selected = select_tree_features(n_features, 0.5, 13, t)
             assert_equal(len(selected), selection_count(n_features, 0.5))
-            var candidates: List[Int] = []
+            var candidates = List[Int]()
             for node in range(len(gpu.trees[t].feature)):
                 candidates.append(gpu.trees[t].feature[node])
             for node in range(len(cpu.trees[t].feature)):
@@ -593,6 +594,85 @@ def test_gpu_subsampled_training_is_deterministic() raises:
             assert_equal(
                 a.predict_raw_row(data, r), b.predict_raw_row(data, r)
             )
+
+
+def test_gpu_monotone_constraints_match_cpu() raises:
+    """Monotonic constraints are enforced host-side, on downloaded histograms,
+    so the GPU trainer must produce a monotone model too, and the same one the
+    CPU trainer does to Float32 tolerance."""
+    comptime if not has_accelerator():
+        print("skipped: no accelerator")
+    else:
+        var n_rows = 3_000
+        var n_features = 6
+        var n_bins = 32
+        var features = _make_features(n_rows, n_features)
+        # A V shape in feature 0 and an inverted V in feature 1, so an
+        # unconstrained fit is monotone in neither.
+        var target = List[Float64](capacity=n_rows)
+        for r in range(n_rows):
+            var x0 = features[0 * n_rows + r] - 0.5
+            var x1 = features[1 * n_rows + r] - 0.5
+            target.append(
+                4.0 * x0 * x0 - 3.0 * x1 * x1 + features[2 * n_rows + r]
+            )
+        var data = bin_equal_width(features, n_rows, n_features, n_bins)
+
+        var signs: List[Int] = [1, -1, 0, 0, 0, 0]
+        var params = BoosterParams(
+            15,
+            0.1,
+            TreeParams(
+                15,
+                20,
+                1.0,
+                1e-3,
+                0.0,
+                monotone=MonotoneConstraints.from_signs(signs, n_features),
+            ),
+        )
+        var cpu = train(data, target, SQUARED_ERROR, params)
+        var gpu = train_gpu(data, target, SQUARED_ERROR, params)
+        assert_equal(len(cpu.trees), len(gpu.trees))
+
+        # Walk feature 0's bins upward and feature 1's downward, holding the
+        # rest at a fixed bin, and check each model steps the right way. Bin
+        # ids are what the trees compare against, so this is exactly the
+        # monotonicity the trees encode, and it is asserted per backend: the
+        # two need not grow identical trees, they each need to be monotone.
+        var bins = List[Int](capacity=n_features)
+        for _ in range(n_features):
+            bins.append(n_bins // 2)
+        for b in range(n_bins - 1):
+            bins[0] = b
+            var cpu_lo = cpu.predict_bins(bins)
+            var gpu_lo = gpu.predict_bins(bins)
+            bins[0] = b + 1
+            assert_true(cpu_lo <= cpu.predict_bins(bins))
+            assert_true(gpu_lo <= gpu.predict_bins(bins))
+        bins[0] = n_bins // 2
+        for b in range(n_bins - 1):
+            bins[1] = b
+            var cpu_lo = cpu.predict_bins(bins)
+            var gpu_lo = gpu.predict_bins(bins)
+            bins[1] = b + 1
+            assert_true(cpu_lo >= cpu.predict_bins(bins))
+            assert_true(gpu_lo >= gpu.predict_bins(bins))
+
+        # And the two backends agree on the data itself, to the same Float32
+        # tolerance the other equivalence tests here use.
+        for r in range(n_rows):
+            assert_true(
+                abs(cpu.predict_row(data, r) - gpu.predict_row(data, r))
+                <= 1e-3
+            )
+
+        # The constraint records on the fitted boosters agree.
+        assert_equal(len(cpu.monotone.signs), n_features)
+        assert_equal(len(gpu.monotone.signs), n_features)
+        for f in range(n_features):
+            assert_equal(cpu.monotone.signs[f], signs[f])
+            assert_equal(gpu.monotone.signs[f], signs[f])
 
 
 def main() raises:

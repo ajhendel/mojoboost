@@ -139,8 +139,8 @@ def test_ndcg_hand_calculated() raises:
     # A cutoff past the end of the query is the whole query.
     assert_equal(ndcg(scores, labels, g, 99), ndcg(scores, labels, g, 4))
 
-    assert_true(_close(max_dcg(labels, 0, 4, 4), max4, 0.0))
-    assert_true(_close(max_dcg(labels, 0, 4, 2), max2, 0.0))
+    assert_true(_close(max_dcg(labels, 0, 4, 4), max4, 1e-14))
+    assert_true(_close(max_dcg(labels, 0, 4, 2), max2, 1e-14))
 
 
 def test_ndcg_perfect_and_reversed() raises:

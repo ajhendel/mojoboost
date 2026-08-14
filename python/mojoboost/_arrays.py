@@ -81,6 +81,84 @@ def name_array(names):
     return list(names)
 
 
+def frame_categories(X):
+    """`{column_index: [category, ...]}` for the pandas category-dtype
+    columns of `X`, in column order; empty for anything else.
+
+    The categories are the column's own, in its own order, which is what
+    `.cat.codes` numbers from 0. Recording them is what lets a later
+    prediction frame be encoded through the *fitted* mapping instead of its
+    own, which may order or extend the categories differently.
+    """
+    iloc = getattr(X, "iloc", None)
+    columns = getattr(X, "columns", None)
+    if iloc is None or columns is None:
+        return {}
+    out = {}
+    for i in range(len(columns)):
+        categories = getattr(getattr(iloc[:, i], "cat", None), "categories", None)
+        if categories is None:
+            continue
+        out[i] = list(categories)
+    return out
+
+
+def _codes_from_labels(column, categories):
+    """A column's values as float64 category codes under `categories`.
+
+    A value absent from the table, including a missing one, becomes -1,
+    which mojoboost's binner reads as the unknown category (see
+    src/mojoboost/categorical.mojo).
+    """
+    cat = getattr(column, "cat", None)
+    own = getattr(cat, "categories", None)
+    if own is not None and list(own) == list(categories):
+        # Same table in the same order, so pandas' own codes are the answer
+        # and already use -1 for missing.
+        return np.asarray(cat.codes, dtype=np.float64)
+    index = {}
+    for i, label in enumerate(categories):
+        index[label] = float(i)
+    values = np.asarray(column, dtype=object)
+    out = np.empty(len(values), dtype=np.float64)
+    for r in range(len(values)):
+        try:
+            out[r] = index.get(values[r], -1.0)
+        except TypeError:  # an unhashable value cannot be a category
+            out[r] = -1.0
+    return out
+
+
+def frame_to_array(X, encoders, name="X"):
+    """`X` as a float64 array, with the columns in `encoders` replaced by
+    their category codes under the given tables.
+
+    `encoders` maps a column index to the fitted category list. Every other
+    column converts as it would on its own, so a frame that mixes encoded
+    and numeric columns stays one matrix.
+    """
+    iloc = getattr(X, "iloc", None)
+    shape = getattr(X, "shape", None)
+    if iloc is None or shape is None or len(shape) != 2:
+        raise ValueError(
+            f"{name} must be a pandas DataFrame to carry categorical columns"
+        )
+    n_rows, n_features = shape
+    out = np.empty((n_rows, n_features), dtype=np.float64, order="F")
+    for i in range(n_features):
+        column = iloc[:, i]
+        if i in encoders:
+            out[:, i] = _codes_from_labels(column, encoders[i])
+            continue
+        try:
+            out[:, i] = np.asarray(column, dtype=np.float64)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"{name} column {i} could not be converted to float64: {exc}"
+            ) from None
+    return out
+
+
 def _as_column_major_numpy(X, name):
     try:
         Xa = np.asfortranarray(X, dtype=np.float64)
@@ -139,26 +217,63 @@ def _as_column_major_stdlib(X, name):
     return flat, n_rows, n_features
 
 
-def column_major(X, name="X"):
+def column_major(X, name="X", encoders=None):
     """Return (buffer, n_rows, n_features): a validated float64
     column-major buffer plus its shape. The caller must keep the buffer
-    referenced while using its address."""
+    referenced while using its address.
+
+    A non-empty `encoders` maps column indices to fitted category tables;
+    those columns become integer codes before the conversion, so a frame
+    holding labels rather than numbers still becomes a numeric matrix.
+    """
     if _is_sparse(X):
         raise TypeError(
             f"{name} is a sparse matrix, which mojoboost does not support; "
             "convert it with .toarray() first"
         )
+    if encoders:
+        X = frame_to_array(X, encoders, name)
     if np is not None:
         return _as_column_major_numpy(X, name)
     return _as_column_major_stdlib(X, name)
 
 
-def check_X(X, name="X"):
+def check_X(X, name="X", encoders=None):
     """(buffer, n_rows, n_features, names) for a feature matrix, with the
-    column names when it carries them."""
+    column names when it carries them. `encoders` is as in `column_major`;
+    the names come from the original `X`, before any encoding."""
     names = feature_names(X)
-    buf, n_rows, n_features = column_major(X, name)
+    buf, n_rows, n_features = column_major(X, name, encoders)
     return buf, n_rows, n_features, names
+
+
+def column_view(buf, n_rows, index):
+    """One column of a validated column-major feature buffer."""
+    if np is not None and isinstance(buf, np.ndarray):
+        return buf[:, index]
+    return buf[index * n_rows : (index + 1) * n_rows]
+
+
+def first_bad_code(column, limit):
+    """The first value in `column` that cannot be a category code, or None.
+
+    A code is a whole number below `limit`. `NaN` and negative values are
+    missing rather than codes, so they are never bad; a fractional
+    nonnegative value is, because rounding it would silently merge two
+    categories.
+    """
+    if np is not None and isinstance(column, np.ndarray):
+        bad = (column >= limit) | (
+            (column >= 0.0) & (column != np.floor(column))
+        )
+        found = np.flatnonzero(bad)
+        if found.size == 0:
+            return None
+        return float(column[found[0]])
+    for v in column:
+        if v >= limit or (v >= 0.0 and v != math.floor(v)):
+            return float(v)
+    return None
 
 
 def f64_vector(y, n_rows, name="y"):

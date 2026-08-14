@@ -31,6 +31,14 @@ Version history
   no categorical features writes neither section and so serializes to exactly
   the bytes it did before they existed; a file without them loads as fully
   numerical.
+- v3: adds per-node covers, the training row counts every grower already had
+  and now records (see `Tree.count`). They are the background weighting exact
+  feature contributions condition on (see contrib.mojo), which cannot be
+  recovered from a fitted tree, so they have to travel with it. Unlike the v2
+  additions this section is unconditional: every tree has covers, so every v3
+  tree writes them. v1 and v2 files still load and predict exactly as before;
+  their trees simply carry no covers, and asking such a model for feature
+  contributions raises rather than guessing at them.
 
 Training-time knobs that only shaped which trees were grown (num_leaves,
 regularization, interaction constraints, subsampling) are deliberately absent:
@@ -49,7 +57,7 @@ from .model import Model, MulticlassModel
 from .tree import Tree
 
 comptime _MAGIC = "mojoboost"
-comptime _VERSION = "v2"
+comptime _VERSION = "v3"
 
 
 def _f64_to_token(x: Float64) -> String:
@@ -149,6 +157,12 @@ def _write_trees(mut out: String, trees: List[Tree]):
         for i in range(n_nodes):
             out += String(tree.missing_bin[i]) + " "
         out += "\n"
+        # v3: node covers, one per node, always written. Stored as raw bit
+        # patterns like every other float so a reloaded tree explains
+        # bit-identically to the trained one.
+        for i in range(n_nodes):
+            out += _f64_to_token(tree.count[i]) + " "
+        out += "\n"
         # v2: category sets, written only for a tree that has a categorical
         # node so purely numerical trees keep their original bytes.
         if len(tree.cat_bitset) > 0:
@@ -221,7 +235,7 @@ def _read_monotone(
 
 
 def save_model(model: Model, path: String) raises:
-    """Write a fitted model to `path` in the mojoboost v1 text format."""
+    """Write a fitted model to `path` in the current mojoboost text format."""
     var out = String("")
     out += _MAGIC
     out += " "
@@ -244,7 +258,7 @@ def save_model(model: Model, path: String) raises:
 
 
 def save_multiclass_model(model: MulticlassModel, path: String) raises:
-    """Write a fitted multiclass model to `path` in the mojoboost v1
+    """Write a fitted multiclass model to `path` in the current mojoboost
     text format. Trees keep their round-major order, one per class per
     round."""
     var out = String("")
@@ -385,6 +399,18 @@ def _read_trees(
         else:
             default_left.resize(n_nodes, False)
             missing_bin.resize(n_nodes, -1)
+        # v3: node covers. A v1 or v2 tree has none, which leaves `count`
+        # empty and makes the loaded model refuse to produce feature
+        # contributions (see contrib.mojo) while predicting as it always did.
+        var count = List[Float64](capacity=n_nodes)
+        if version >= 3:
+            for _ in range(n_nodes):
+                var c = r.next_f64()
+                if not c > 0.0:
+                    raise Error(
+                        "corrupt tree: node cover must be positive"
+                    )
+                count.append(c)
         # v2: the optional per-tree category sets. Absent means every node of
         # this tree splits numerically.
         var cat_offset = List[Int](capacity=n_nodes)
@@ -424,16 +450,16 @@ def _read_trees(
             Tree(
                 feature^, threshold^, left^, right^, value^, split_gain^,
                 n_leaves, default_left^, missing_bin^, cat_offset^,
-                cat_bitset^,
+                cat_bitset^, count^,
             )
         )
     return trees^
 
 
 def _read_version(mut r: _TokenReader) raises -> Int:
-    """Check the magic and return the format version as an integer. Both v1
-    and the current v2 are readable; v1 files simply carry no missing-value
-    routing."""
+    """Check the magic and return the format version as an integer. v1, v2,
+    and the current v3 are all readable: v1 files carry no missing-value
+    routing, and neither v1 nor v2 carries node covers."""
     if r.next() != _MAGIC:
         raise Error("not a mojoboost model file")
     var token = r.next()
@@ -441,6 +467,8 @@ def _read_version(mut r: _TokenReader) raises -> Int:
         return 1
     if token == "v2":
         return 2
+    if token == "v3":
+        return 3
     raise Error("unsupported model format version")
 
 
@@ -450,6 +478,20 @@ def _read_kind(mut r: _TokenReader) raises -> String:
     if kind != "objective" and kind != "multiclass":
         raise Error("corrupt model file: unknown model kind")
     return kind^
+
+
+def model_file_kind(path: String) raises -> String:
+    """Which loader a saved model needs, "objective" or "multiclass".
+
+    Reads only the file header, so a caller holding a path but not the
+    training history can dispatch between `load_model` and
+    `load_multiclass_model`. Raises the same errors those two do for a file
+    that is not a mojoboost model.
+    """
+    var content = open(path, "r").read()
+    var r = _TokenReader(content)
+    _ = _read_version(r)
+    return _read_kind(r)
 
 
 def load_model(path: String) raises -> Model:

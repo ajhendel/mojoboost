@@ -195,7 +195,7 @@ def grow_tree_gpu(
 
     builder.begin_tree(bag)
     var n_root = len(bag) if len(bag) > 0 else builder.n_rows
-    var root = tree._add_node(0.0)
+    var root = tree._add_node(0.0, Float64(n_root))
     var root_hist = builder.build_leaf(root)
     tree.value[root] = _leaf_value(
         root_hist, params.lambda_reg, params.lambda_l1, value_feature
@@ -248,8 +248,11 @@ def grow_tree_gpu(
         )
         var n_right = frontier[best_i].n_rows - n_left
 
-        var left_node = tree._add_node(0.0)
-        var right_node = tree._add_node(0.0)
+        # The row counts come off the parent's exact histogram counts, the
+        # same numbers the CPU grower gets from its row lists, so node covers
+        # match across backends.
+        var left_node = tree._add_node(0.0, Float64(n_left))
+        var right_node = tree._add_node(0.0, Float64(n_right))
         builder.apply_split(
             split.feature,
             split.bin,

@@ -13,6 +13,11 @@ build/
 # Test serialization scratch files
 .test_*.tmp
 
+# Built binaries (capi/build.sh, cli/build.sh, capi/run_c_tests.sh)
+capi/test_capi
+cli/mojoboost
+capi_test_*.mbst
+
 # macOS
 .DS_Store
 

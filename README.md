@@ -22,8 +22,11 @@ targets GPUs from the same source.
 
 ## Status
 
-Early development. Training works end to end. What works today, each piece
-with tests
+Early development. Training works end to end. The list below is what works
+today, each piece with tests; for what LightGBM has that mojoboost does not,
+and for the semantics that differ deliberately, read the parity contract in
+[docs/LIGHTGBM_PARITY.md](docs/LIGHTGBM_PARITY.md), which is authoritative
+where this list and it disagree.
 
 - quantile (equal-frequency) feature binning into `uint8` bins, LightGBM
   style, with stored edges so trained models predict on raw, unseen data
@@ -42,6 +45,25 @@ with tests
 - feature interaction constraints (`interaction_constraints`), LightGBM's
   per-branch allowed-feature rule, enforced identically on the CPU and GPU
   trainers and checked structurally on every root-to-leaf path
+- monotonic constraints (`monotone_constraints`) for numerical features,
+  LightGBM's `basic` method: predictions are nondecreasing or nonincreasing
+  along a constrained feature at any feature value, on both the CPU and GPU
+  trainers, for every single-output objective including quantile and L1 leaf
+  renewal; recorded in the model file, and free when unused (an all-zero
+  vector fits bit-identically to no vector at all)
+- native categorical features (`categorical_feature`) with no one-hot
+  expansion: an integer-coded column keeps one column and k + 1 bins, and
+  splits are searched as category *sets* by LightGBM's gradient/Hessian
+  ordering, so codes carry no implied order; one-vs-rest below
+  `max_cat_to_onehot`, the sorted many-vs-many walk above it, with
+  `max_cat_threshold`, `cat_smooth`, `cat_l2`, and `min_data_per_group`
+  carrying LightGBM's meanings and defaults. Missing (negative or `NaN`),
+  unseen, and dropped codes share a reserved bin 0 that is in no split set,
+  so all three route right, as in LightGBM. Category sets are stored per node
+  as a 256-bit set, applied identically by CPU growth, prediction, and the
+  GPU partition kernel, and written to the model file; models with no
+  categorical feature serialize to exactly the bytes they did before. See
+  [Categorical features](#categorical-features)
 - objectives: squared error, binary logistic, poisson, huber, quantile,
   L1 (mean absolute error), and multiclass softmax; quantile and L1
   renew leaf values with residual percentiles the way LightGBM does, and
@@ -59,6 +81,13 @@ with tests
   samples whole queries rather than rows
 - validation-set early stopping with `min_delta` for every objective,
   truncating to the best round
+- custom validation metrics (`train_with_metrics`, `fit_with_metrics`,
+  `MojoBoostRegressor.fit(eval_set=..., eval_metric=...)`), independent of
+  the objective: each metric has a name, a direction, and a flag for
+  whether early stopping watches it, several may run against several
+  validation sets, and an explicit primary metric picks the round the
+  ensemble is truncated to (see
+  [Custom validation metrics](#custom-validation-metrics))
 - evaluation metrics: RMSE, log loss, accuracy, and ROC AUC with
   sklearn-matching tie handling
 - sample weights for every objective, LightGBM semantics (weighted
@@ -80,7 +109,26 @@ with tests
   two importance types
 - SIMD histogram kernels (pointer-based scatter accumulation, vectorized
   sibling subtraction and split scans)
-- multicore CPU histogram accumulation across independent features
+- multicore CPU work across independent features (histogram accumulation, bin
+  fitting, bin transform) and across contiguous row blocks (gradient
+  generation, row partitioning), scheduled from a work estimate rather than an
+  item count so cheap elementwise stages are not fanned out below the point
+  where scheduling costs more than the work. Every path is bit-identical to
+  the serial one at any worker count: feature tasks keep each feature's sum
+  inside one task and row blocks are used only where nothing is summed across
+  rows. `MOJOBOOST_NUM_WORKERS` and `MOJOBOOST_PARALLEL_MIN_OPS` pin the
+  scheduler for reproducible runs; `pixi run bench-profile` times each stage
+  serial against parallel
+- a data-parallel distributed training prototype: rows partitioned across
+  ranks, one histogram all-reduce per tree node, and every split decision
+  taken from global histograms so the tree stays identical on every rank
+  without broadcasting a single split. Equivalence with the single-node
+  trainer is bit-exact wherever the arithmetic is exact. Every rank runs in
+  one process and nothing has run over a network, so no distributed
+  performance is claimed and this is a prototype rather than a feature; the
+  transport and collective contract, the determinism and failure semantics,
+  and what is deliberately unsupported are in
+  [docs/distributed.md](docs/distributed.md)
 - experimental portable GPU histogram accumulation that scales past one
   threadgroup per feature: a 2D grid of (feature, row tile) threadgroups,
   a shared-memory partial histogram per threadgroup, and a choice of two
@@ -150,11 +198,128 @@ a custom objective (see [Custom objectives](#custom-objectives)). Both
 estimators take `device` and record the backend that ran on `device_`; see
 [Device selection](#device-selection).
 
+### scikit-learn conventions
+
+The estimators implement `get_params`, `set_params`, `fit`, `predict`,
+`predict_proba` (classifier), and `score` (R^2 for the regressor, accuracy
+for the classifier), and set `n_features_in_`, `feature_names_in_`,
+`classes_`, `n_classes_`, `feature_importances_`, `best_iteration_`, and
+`device_` when fitted. Methods that need a model raise `NotFittedError`
+before that, which is also a `RuntimeError` and, when scikit-learn is
+installed, its `NotFittedError` too. `clone`, `Pipeline`, `GridSearchCV`,
+and `cross_val_score` work; scikit-learn itself stays optional, and
+nothing imports it except the `__sklearn_tags__` hook scikit-learn calls.
+
+```python
+from sklearn.model_selection import GridSearchCV
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+
+pipe = Pipeline([("scale", StandardScaler()), ("gbdt", MojoBoostRegressor())])
+search = GridSearchCV(pipe, {"gbdt__num_leaves": [15, 31]}, cv=3).fit(X, y)
+```
+
+Classifier labels may be of any single comparable type, as in
+scikit-learn: they are sorted onto `classes_` and encoded to the
+0..n_classes-1 the trainer needs, and `predict` returns labels from
+`classes_`. `feature_importances_` reports what `importance_type` selects,
+`"split"` (LightGBM's default) or `"gain"`. `feature_names_in_` is
+recorded when `X` carries string column names, and a later `predict` with
+different names raises.
+
+Input validation follows LightGBM's own scikit-learn wrapper, which
+validates with `force_all_finite="allow-nan"`: `X` may hold `NaN`, the
+missing-value marker, but not infinities, while `y` and `sample_weight`
+must be finite, and weights must be nonnegative and not all zero. Sparse
+input is rejected rather than densified behind your back.
+
+### Prediction options
+
+`predict`, and the classifier's `predict_proba`, take LightGBM's prediction
+keywords.
+
+```python
+model.predict(X, raw_score=True)              # before the inverse link
+model.predict(X, num_iteration=10)            # the first 10 iterations
+model.predict(X, start_iteration=10)          # everything after them
+model.predict(X, pred_leaf=True)              # leaf ordinals, one per tree
+model.predict(X, pred_contrib=True)           # exact TreeSHAP contributions
+model.predict(X, validate_features=True)      # names must match, not warn
+```
+
+`raw_score` skips the inverse link. It changes nothing for the regressor's
+objectives or the ranker, which have none; the binary classifier returns
+log-odds of shape `(n_samples,)`, one score per row rather than one per
+class, and the multiclass classifier the pre-softmax scores of shape
+`(n_samples, n_classes)`, both as in LightGBM.
+
+`start_iteration` and `num_iteration` slice the boosting iterations, and
+clamp the way LightGBM's `GBDT::InitPredict` does: a negative start becomes
+0, a start past the end selects nothing, and `num_iteration=None` or any
+value <= 0 means every iteration from the start on. The base score belongs
+to iteration 0, so a slice starting there carries it and a later slice does
+not. Two consequences are worth stating, and both are tested: predicting
+with `num_iteration=k` reproduces a `k`-round fit exactly, and `[0, k)` and
+`[k, n)` sum to the whole raw score. Out-of-range slices clamp rather than
+raise; a non-integer bound is a `TypeError`.
+
+`num_iteration=None` predicts with `best_iteration_` iterations, LightGBM's
+documented default. mojoboost gets there structurally: early stopping
+truncates the ensemble at its best iteration, so the trees the model still
+holds are the best iteration and there is nothing later to exclude.
+
+`pred_leaf` returns integers, shape `(n_samples, num_iteration)` for the
+single-output estimators (regressor, ranker, binary classifier) and
+`(n_samples, num_iteration * n_classes)` for the multiclass classifier,
+whose column `i * n_classes + k` holds class k's tree in iteration i. A leaf
+is named by its ordinal within its own tree, in `[0, num_leaves)`, numbered
+in node order; the numbering is fixed once a tree is grown and survives
+`save`/`load` and pickling. It is mojoboost's own numbering and not
+LightGBM's leaf id.
+
+`validate_features` turns the feature-name checks from warnings into
+errors. `raw_score=True` and `pred_leaf=True` together raise, since they ask
+for different dtypes and shapes; LightGBM lets `pred_leaf` win silently,
+which the output does not reveal.
+
+Estimators pickle. The trained model is an opaque handle, so pickling
+serializes it with the same versioned format `save()` writes and restores
+it on unpickling; everything else is ordinary Python state. That makes
+pickle the way to keep a whole estimator, and `save()`/`load()` the way to
+keep a model: a model file holds neither the class labels, the constructor
+hyperparameters, the feature names, nor the split gains, so a loaded
+classifier reports `classes_` as 0..n_classes-1 and a loaded model reports
+zero gain importance (with a warning).
+
+Two documented differences from what a scikit-learn estimator is supposed
+to be, both of which are why mojoboost says "scikit-learn style" and does
+not claim `check_estimator` passes:
+
+- the estimators forward their shared hyperparameters through `**kwargs`,
+  so `get_params()` lists them all but `inspect.signature` does not
+- `best_iteration_` is always set, to the number of boosting iterations
+  the fitted model kept, where LightGBM sets it only when early stopping
+  ran. Without an `eval_set` it equals `n_estimators` unless training
+  stopped early because the objective converged
+
+### Tests and wheels
+
+Two Python suites. `pixi run test-python` runs `python/test_python_api.py`,
+which covers training behavior and deliberately needs nothing but the
+extension module, so it also runs against a bare wheel install.
+`pixi run -e pytest test-estimators` runs `python/tests`, the estimator
+suite, under pytest with scikit-learn and pandas; those tests skip
+themselves when either is missing.
+
 `pixi run test-wheel` builds a self-contained wheel (`pixi run build-wheel`)
-and validates it in a clean venv. The wheel bundles the Mojo runtime
-dylibs the extension links (delocate-style, with an `@loader_path` rpath),
-so installing it requires no Mojo or MAX toolchain. Wheels currently
-target macOS on Apple silicon; Linux wheels need a manylinux build.
+and validates it in two clean venvs: one with the wheel alone, exercising
+the stdlib fallback through `packaging/smoke_test.py` and the
+dependency-free suite, and one with numpy, pytest, scikit-learn, and
+pandas, running the estimator suite against the installed package from a
+neutral directory. The wheel bundles the Mojo runtime dylibs the extension
+links (delocate-style, with an `@loader_path` rpath), so installing it
+requires no Mojo or MAX toolchain. Wheels currently target macOS on Apple
+silicon; Linux wheels need a manylinux build.
 
 ## Device selection
 
@@ -175,9 +340,22 @@ gradient/hessian interface. `train_gpu` handles single-output training
 through one device-resident builder. Quantile and L1 renew their leaf
 values on the host after the tree is grown, exactly as on the CPU.
 
-The `device` routing above is narrower than the trainers underneath it:
-`fit_multiclass` still resolves to the CPU, so reaching GPU multiclass
-means calling `train_multiclass_gpu` directly. GOSS reaches both trainers
+One intentional difference in where training stops. Both trainers end early
+when a round produces a single leaf whose value is under 1e-12, meaning the
+objective has converged. The CPU sums gradients in Float64 and hits exactly
+zero on an already-solved objective; the GPU sums fixed-point gradients, so
+rounding leaves a residue of a few quantization units and its leaf value
+lands nearer 1e-9. On a degenerate dataset (every feature constant, squared
+error already solved by the base score) the CPU therefore stops with no
+trees while the GPU emits a few more single-leaf trees first. Those trees
+are zero to within the device's gradient resolution and the two models
+agree; only the tree count differs. Real data never reaches an exactly zero
+gradient sum, so this shows up only in degenerate cases, and
+`tests/test_gpu_objectives.mojo` pins it.
+
+`fit_multiclass` routes by `device` exactly as `fit` does, so `gpu` grows
+multiclass on the device through `train_multiclass_gpu` rather than
+raising, and `auto` may select it. GOSS reaches both trainers
 and every objective they cover: the sample is chosen on the host from
 Float64 gradients and handed to the device as the tree's row list, so the
 two backends sample identically.
@@ -272,15 +450,21 @@ tile size are runtime values here rather than compile-time ones.
 
 ## Roadmap
 
-1. Integrate the GPU histogram backend into end-to-end training while keeping
-   intermediate state device-resident
-2. Validate the same GPU source on NVIDIA and AMD hardware
+1. Close the v1 gaps in the parity contract
+   ([docs/LIGHTGBM_PARITY.md](docs/LIGHTGBM_PARITY.md)), the largest being
+   feature contributions, sparse input, the Booster and Dataset APIs, and
+   selecting a built-in metric by name from Python
+2. Finish routing `device` through the remaining entry points: multiclass
+   still resolves to the CPU in `fit_multiclass` and in the Python
+   classifier, and `auto` needs a measured crossover before it may choose
+   the GPU
+3. Validate the same GPU source on NVIDIA and AMD hardware
    ([procedure](docs/GPU_VALIDATION.md); neither has been run). The kernels
    already scale past one threadgroup per feature and tile themselves from
    device capabilities, but every measurement so far is Apple Metal
-3. Publish the Python API to PyPI (macOS arm64 wheels build and validate
+4. Publish the Python API to PyPI (macOS arm64 wheels build and validate
    today; Linux needs a manylinux build)
-4. Broader benchmark suite (XGBoost and real datasets)
+5. Broader benchmark suite (XGBoost and real datasets)
 
 ## Defaults
 
@@ -306,6 +490,8 @@ Matched to LightGBM so comparisons are apples to apples.
 | `feature_fraction` | 1.0 (LightGBM's default) |
 | `feature_fraction_bynode` | 1.0 (LightGBM's default) |
 | `feature_fraction_seed` | 2 (LightGBM's default) |
+| `monotone_constraints` | none (LightGBM's default) |
+| `use_missing` | `True` (LightGBM's default) |
 
 ### Maximum depth
 
@@ -544,6 +730,191 @@ importance onto features an unsubsampled ensemble would never reach.
 Subsampling is a training parameter only; it changes which trees get built,
 not the model format.
 
+### Missing values
+
+`NaN` is the missing marker for numerical features, and it is routed rather
+than compared. A feature whose training column holds any `NaN` reserves one
+extra bin for them, above its ordinary bins, at the cost of one bin out of the
+`max_bin` budget. `NaN` is dropped before the quantile edges are fit and
+routed to the reserved bin before any binary search runs, so it never takes
+part in an ordinary quantile comparison.
+
+At every node the split search scores each threshold twice, once with the
+missing rows in the left child and once with them in the right, and stores the
+winner as that node's default direction. Training, raw prediction, binned
+prediction, and GPU row partitioning all apply that one rule, so a missing row
+follows the same path whichever of them is running. Because missingness is
+routed rather than imputed, a pattern of missingness that predicts the target
+is learnable on its own.
+
+```python
+X = np.array([[1.0], [np.nan], [3.0]])
+model = MojoBoostRegressor().fit(X, y)
+model.predict(np.array([[np.nan]]))     # follows each node's default direction
+```
+
+Set `use_missing=False` to switch it off, in which case every `NaN` is binned
+as the value 0.0.
+
+| Value | Treated as |
+|---|---|
+| `NaN`, feature had missing values in training | missing: the reserved bin, routed by the node's default direction |
+| `NaN`, feature had none in training | the value 0.0, matching LightGBM's `missing_type=None` |
+| `NaN`, `use_missing=False` | the value 0.0 |
+| `+inf` | the feature's highest ordinary bin, never missing |
+| `-inf` | bin 0, never missing |
+
+The infinity rows describe the Mojo core. The Python estimators are stricter
+and reject a non-finite `X` value other than `NaN` outright, so an `inf`
+raises there rather than binning.
+
+Bin edges are clamped to +/-1e300 (LightGBM's `Common::AvoidInf`), which is
+what keeps an infinite training value from producing an infinite edge.
+
+Differences from LightGBM, all deliberate:
+
+- LightGBM's `zero_as_missing` is not implemented; only `NaN` is missing.
+- Categorical features have no reserved missing bin. They keep the rule in
+  `categorical.mojo`, where `NaN`, negative codes, and unseen codes share bin
+  0 and route right, which is LightGBM's `CategoricalDecision` behavior.
+
+`pixi run -e bench compare-missing` is the reproducible comparison: it prints
+mojoboost's and LightGBM's routing decisions side by side on the same data.
+Against LightGBM 4.7 every one of them matches.
+
+### Categorical features
+
+Mark the columns whose integer codes are unordered categories with
+`categorical_feature` (LightGBM's parameter name; the plural
+`categorical_features` is accepted as an alias). It takes column indices,
+column names, a mix of the two, or LightGBM's default `"auto"`:
+
+```python
+model = MojoBoostRegressor(categorical_feature=[0, 3]).fit(X, y)
+model = MojoBoostRegressor(categorical_feature=["city", "device"]).fit(df, y)
+model = MojoBoostRegressor().fit(df, y)   # "auto": every category column
+```
+
+or, from Mojo:
+
+```mojo
+var model = fit(
+    features, n_rows, n_features, target, SQUARED_ERROR, params,
+    categorical_features=[0, 3],
+)
+```
+
+The parameter lives on the constructor rather than on `fit`, unlike
+LightGBM, because scikit-learn's clone contract keeps hyperparameters on the
+estimator. It works the same on `MojoBoostRegressor`,
+`MojoBoostClassifier`, and `MojoBoostRanker`, and on the Mojo `fit`,
+`fit_multiclass`, `fit_custom`, and `fit_ranker`.
+
+#### pandas categorical columns
+
+`"auto"`, the default, means every pandas `category` column of `X` and
+nothing else; on a numpy matrix that is no columns, so an estimator that
+never sees a frame behaves exactly as it would have. A `category` column is
+encoded by its **labels**, and the label table is kept on the fitted
+estimator, so a prediction frame that orders or extends its categories
+differently still lands on the categories the model was fitted with:
+
+```python
+train = pd.DataFrame({"city": pd.Categorical(["nyc", "sfo", ...])})
+model = MojoBoostRegressor().fit(train, y)
+model.categorical_feature_          # [0]
+model.predict(other_frame)          # 'nyc' is 'nyc' whatever its code there
+```
+
+Two consequences worth stating outright:
+
+- A `category` column left out of an explicit `categorical_feature` raises.
+  LightGBM quietly feeds its codes to the numerical scan, and a declared
+  category is the one thing that must never become an ordered number.
+- Only a frame carries labels. A model fitted on `category` columns raises
+  rather than predict on a plain array, and a model fitted on integer codes
+  raises rather than read a frame's own codes. Pickle keeps the label
+  tables; `save()` / `load()` does not, because the model file holds the
+  category tables but not the labels (`load()` still restores
+  `categorical_feature_`, so a loaded model splits and routes exactly as it
+  did, on codes).
+
+#### Category codes
+
+Outside a pandas `category` column, the values of a categorical feature are
+integer codes:
+
+| Value | Treated as |
+|---|---|
+| a code seen in training | its own category bin |
+| a code not seen in training | unseen: bin 0, routes right |
+| a code dropped for cardinality | unseen: bin 0, routes right |
+| any negative value | missing: bin 0, routes right |
+| `NaN` | missing: bin 0, routes right |
+| a fractional value | rejected by the Python estimators; truncated toward zero by the Mojo core |
+| `>= 2**31` | rejected: codes must stay representable as Int32, as in LightGBM |
+
+The Python estimators check the last two at fit **and** at predict, rather
+than leaving them to `bin_of`, which truncates a fractional code and reads an
+oversized one as unseen: either would answer a caller who encoded the column
+differently than they did at fit with a prediction instead of an error.
+
+Those columns skip quantile binning entirely. Their distinct codes are
+collected at fit time, sorted ascending, and mapped to bins 1..k; bin 0 is
+reserved. A node splitting such a feature holds a *set* of category bins that
+route left, searched with LightGBM's algorithm: one-vs-rest when the feature
+has at most `max_cat_to_onehot` categories, otherwise categories are ordered
+by `sum_grad / (sum_hess + cat_smooth)` and prefixes of that order are
+accumulated from both ends, up to `max_cat_threshold` per side. Categorical
+and numerical candidates then compete on gain in the same search, so nothing
+about a numerical column changes when a categorical one is added.
+
+**Default routing.** Bin 0 collects three kinds of row, and none of them is
+ever a member of a split set, so all three take the **right** branch at every
+categorical node, matching LightGBM's `CategoricalDecision`:
+
+- missing values: a negative code, or `NaN`
+- unseen categories: codes absent from the training column
+- dropped categories: codes present in training but not kept, when the column
+  had more distinct codes than `max_bins - 1`
+
+**Intentional differences from LightGBM.**
+
+- Row counts are exact. LightGBM estimates a bin's count from its Hessian sum
+  because its histograms carry no counts; mojoboost's do, so
+  `min_data_in_leaf`, `min_data_per_group`, and the `cat_smooth` count filter
+  use exact counts.
+- One-vs-rest is selected on the number of categories, matching the
+  documented meaning of `max_cat_to_onehot`, rather than on an internal bin
+  count that may or may not include the unknown bin.
+- LightGBM keeps the most frequent categories covering 99% of rows and drops
+  categories below `min_data_in_bin`; mojoboost keeps the `max_bins - 1` most
+  frequent and drops nothing else, leaving rare categories to the
+  `cat_smooth` filter during split search.
+- LightGBM's `kEpsilon` (1e-15) Hessian nudges are omitted.
+- Monotonic constraints on a categorical feature are rejected rather than
+  silently applied.
+
+**Both backends.** Categorical features are not a CPU-only feature. The GPU
+trainer searches category partitions on the same downloaded histograms and
+routes rows by the node's 256-bit set in its partition kernel, so a
+categorical model trains on either device and the two agree to the Float32
+tolerance every other backend-equivalence test uses
+(`test_gpu_categorical_splits_match_cpu` in tests/test_categorical.mojo,
+which skips itself without an accelerator). The paths that are CPU-only are
+CPU-only for other reasons: multiclass, ranking, and Python objective or
+metric callbacks all raise for `device="gpu"` before training starts,
+whether or not a feature is categorical.
+
+`bench/compare_categorical_lightgbm.py` fits both libraries on the same
+matrix, with and without the columns marked categorical, and reports held-out
+RMSE for all four:
+
+```
+pixi run build-python
+pixi run -e bench compare-categorical
+```
+
 ### Feature interaction constraints
 
 `interaction_constraints` is a list of feature groups. Two features may
@@ -598,6 +969,73 @@ Three further notes:
   grown, not how a grown tree is evaluated, so the model format is
   unchanged and serialized models carry no constraint record, the same way
   they carry no `num_leaves`
+
+### Monotonic constraints
+
+`monotone_constraints` takes one entry per numerical feature: `1` for
+nondecreasing, `-1` for nonincreasing, `0` for unconstrained.
+
+```python
+MojoBoostRegressor(monotone_constraints=[1, 0, -1]).fit(X, y)
+```
+
+```mojo
+var monotone = MonotoneConstraints.from_signs([1, 0, -1], 3)
+var params = BoosterParams(
+    100,
+    0.1,
+    TreeParams(31, 20, 1.0, 1e-3, 0.0, monotone=monotone^),
+)
+```
+
+The guarantee is global and exact. For any two examples differing only in a
+constrained feature, the model's predictions are ordered the way the
+constraint says, at any raw feature value and not merely on the training
+data. It holds on the response scale too, since the logistic and poisson
+links are increasing.
+
+This is LightGBM's `monotone_constraints_method="basic"`. Each node carries
+an interval its output must lie in; a split on a constrained feature divides
+that interval between its children at the midpoint of their values, so bounds
+only tighten with depth, and every leaf value is clamped into its own
+interval. Candidates are scored from clamped outputs, and a candidate whose
+children would run against the constraint is discarded whatever its gain.
+Two examples that differ only in feature `f` diverge at some node splitting
+on `f`, and every leaf below its low child is capped at that node's midpoint
+while every leaf below the high child is floored at it, which is what makes
+the ordering hold for the whole tree, and so for a positively weighted sum
+of trees.
+
+Notes and deliberate differences:
+
+- LightGBM decides constraints are in play by checking that the vector is
+  non-empty; mojoboost also treats an all-zero vector as inactive, so split
+  search keeps its unconstrained path and the fit is bit-identical to one
+  with no vector at all (there is a test for exactly this)
+- only the `basic` method is implemented; LightGBM's `intermediate` and
+  `advanced` methods buy back some of the accuracy `basic` gives up, and are
+  not attempted here
+- quantile and L1 rewrite every leaf value after the tree is grown, which
+  knows nothing about monotonicity, so mojoboost clamps the renewed value
+  back into its leaf's interval. That keeps the guarantee for those
+  objectives at the cost of biasing the renewed percentile. We have not
+  verified LightGBM's behavior at this step, so treat the clamp as
+  mojoboost-defined rather than matched
+- for multiclass, constraints apply to every per-class tree, so each class's
+  **raw score** is monotone. Softmax probabilities are **not** guaranteed
+  monotone, because a class's probability also moves with the other classes'
+  scores
+- a categorical feature cannot carry a nonzero constraint; the combination is
+  rejected rather than ignored
+- the CPU and GPU trainers share the split search, the interval bookkeeping,
+  and the leaf clamping, so the constraint is enforced identically on both;
+  only the histogram sums the decisions are made from carry the GPU's Float32
+  precision
+- unlike the other training-time restrictions, the constraint vector is
+  recorded in the model file, because it is a property the fitted trees
+  satisfy rather than only a knob that shaped them. The section is written
+  only when there is a vector to write, so files for unconstrained models are
+  unchanged, and a file without it loads as unconstrained
 
 ### Custom objectives
 
@@ -692,6 +1130,121 @@ predictions. That is a fixed per-round cost plus a per-row copy, so it
 shrinks as a fraction of a bigger fit and dominates a small one. Use the
 native Mojo interface when the objective is on a hot path.
 
+### Custom validation metrics
+
+A custom metric scores validation predictions against validation labels and
+returns one scalar. Metrics are independent of objectives: a built-in
+objective can be watched by custom metrics (`train_with_metrics`), a custom
+objective can be watched by them (`train_custom_with_metrics`), and either
+can still use the older single-loss path (`train_with_valid`,
+`train_custom_with_valid`).
+
+```mojo
+from mojoboost import (
+    SQUARED_ERROR, BoosterParams, TreeParams, CustomMetric, MetricSuite,
+    ValidSet, rmse, train_with_metric, train_with_metrics,
+)
+
+def my_rmse(pred: List[Float64], target: List[Float64]) raises -> Float64:
+    return rmse(pred, target)
+
+var valid_sets: List[ValidSet] = [ValidSet("holdout", valid_data, valid_y)]
+var result = train_with_metric(
+    data, target, valid_sets, SQUARED_ERROR, params, "rmse", my_rmse,
+    early_stopping_rounds=10,
+)
+result.booster            # truncated to the best round
+result.best_iteration     # trees kept
+result.history.series(0, 0)   # the metric, round by round
+```
+
+Several metrics go through one dispatching callable, because two Mojo
+callables of the same signature are still different types and cannot share
+a `List`:
+
+```mojo
+def evaluate(
+    metric: Int, valid: Int, pred: List[Float64], y: List[Float64]
+) raises -> Float64:
+    if metric == 0:
+        return my_rmse(pred, y)
+    return binary_auc(pred, y)
+
+var suite = MetricSuite(
+    [CustomMetric("rmse"), CustomMetric("auc", higher_is_better=True)],
+    evaluate,
+    primary=1,
+)
+```
+
+The contract, and where it intentionally differs from LightGBM:
+
+- **predictions are raw scores**, before any inverse link, as LightGBM's
+  `feval` receives them: log-odds for binary logistic, log-mean for
+  poisson. `response_scale(objective, raw)` converts a vector when a metric
+  wants probabilities
+- **the direction is declared, not returned.** LightGBM's `feval` returns
+  `(name, value, is_higher_better)` per call, so the direction is only
+  known after the first evaluation. Here `higher_is_better` belongs to
+  `CustomMetric`, which is what lets the primary metric and the
+  early-stopping set be validated before training starts
+- **metric values must be finite.** A NaN or infinity raises, naming the
+  metric and the round. A NaN would otherwise look like an unending run of
+  non-improving rounds, since every comparison against it is False.
+  LightGBM does not check
+- **early stopping watches every (validation set, flagged metric) pair**
+  and stops as soon as one of them goes `early_stopping_rounds` rounds
+  without improving, which is LightGBM's behavior. The ensemble is then
+  truncated to the best round of the *primary* metric on the *first*
+  validation set, where LightGBM truncates to the best iteration of the
+  pair that triggered the stop: which model you keep should not depend on
+  which pair ran out of patience first
+- **a tie is not an improvement**, and with a nonzero `min_delta` an
+  improvement has to clear it, in whichever direction the metric runs.
+  This is LightGBM's rule
+- **`early_stopping_rounds = 0` disables stopping** and keeps recording:
+  every metric still runs every round, the full ensemble comes back, and
+  `best_iteration` still reports where the primary metric peaked
+- **the history starts at round 0**, the base-score-only model, so
+  `value(i, ...)` is the score after `i` trees. LightGBM's `evals_result_`
+  starts at the first iteration
+- **single output, CPU only**, as for custom objectives: `train_multiclass`
+  has no custom-metric entry point, and there is no GPU trainer with a
+  validation loop
+
+From Python, pass `eval_set` and `eval_metric` to `fit`. Each metric is
+`f(y_true, y_pred) -> float` (LightGBM's `(name, value, is_higher_better)`
+return is accepted, and only its value read), called once per metric per
+validation set per round:
+
+```python
+import numpy as np
+from mojoboost import MojoBoostRegressor
+
+def mape(y_true, y_pred):
+    return float(np.mean(np.abs((y_true - y_pred) / y_true)))
+
+def neg_mse(y_true, y_pred):
+    return -float(np.mean((y_true - y_pred) ** 2))
+
+model = MojoBoostRegressor(n_estimators=500).fit(
+    X, y,
+    eval_set=[(X_valid, y_valid)],
+    eval_metric=[("mape", mape), ("neg_mse", neg_mse, True)],
+    early_stopping_rounds=20,
+    primary_metric="mape",
+)
+model.best_iteration_        # trees kept
+model.best_score_            # the primary metric's best value
+model.evals_result_["valid_0"]["mape"]   # index 0 is the base score alone
+```
+
+A metric may also be a dict, `{"name": ..., "func": ..., "higher_is_better":
+..., "early_stopping": ...}`, which is how a metric is recorded without
+letting it stop training. Combining a Python *objective* callback with
+custom metrics is not wired up yet; the Mojo API pairs them with
+`train_custom_with_metrics`.
+
 ### Learning to rank
 
 LambdaRank, LightGBM's `objective="lambdarank"`. Ranking data is a row
@@ -757,6 +1310,17 @@ pixi run test
 
 The test command includes CPU/GPU equivalence checks. They run when a
 supported accelerator is present and skip cleanly on CPU-only machines.
+
+```sh
+pixi run check-parity     # or: python3 tools/check_parity.py
+```
+
+`check-parity` holds [docs/LIGHTGBM_PARITY.md](docs/LIGHTGBM_PARITY.md) to
+the code: it fails when a row that claims support is deleted or downgraded,
+when the contract cites a file that no longer exists, when a public Python or
+Mojo symbol those rows depend on disappears, or when a test suite the
+contract offers as evidence is not run by any task. It builds nothing and
+needs only the standard library, so it also runs in CI.
 
 ## Benchmarks
 

@@ -563,9 +563,15 @@ struct GpuHistogramBuilder(Movable):
         mut self, grad: List[Float64], hess: List[Float64]
     ) raises:
         """Convert this round's gradients and hessians into the device's
-        Float32 in pinned host memory. Host work only, no transfer."""
+        Float32 in pinned host memory. Host work only, no transfer.
+
+        The device's copy is stale from here until `upload_staged`, and the
+        scales below already describe the new values, so builds are refused
+        in between rather than mixing one round's scale with another's
+        data."""
         if len(grad) != self.n_rows or len(hess) != self.n_rows:
             raise Error("gradient/hessian length must equal n_rows")
+        self.has_gradients = False
 
         var g_scale = _fixed_scale(grad)
         var h_scale = _fixed_scale(hess)

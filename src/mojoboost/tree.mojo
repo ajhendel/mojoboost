@@ -159,7 +159,16 @@ struct Tree(Copyable, Movable):
     bin is in that set. Bin 0 of a categorical feature (missing, unseen, or
     dropped) is never in a set, so those rows always go right. `cat_offset`
     is -1 on every numerical node, which is what the whole array holds for a
-    model with no categorical features."""
+    model with no categorical features.
+
+    `count[i]` is node i's cover: how many of the rows this tree was grown on
+    reach node i. It is the background weighting exact TreeSHAP conditions on
+    (see contrib.mojo), so it is kept with the model and serialized rather
+    than recomputed. Under bagging or GOSS it counts the sampled rows, which
+    are the rows the node's value was fitted from. A tree built without
+    counts (a v1 or v2 file, which predate them) carries zeros, which
+    `has_node_counts` reports and the contribution API refuses to work
+    from."""
 
     var feature: List[Int]
     var threshold_bin: List[Int]
@@ -172,6 +181,7 @@ struct Tree(Copyable, Movable):
     var missing_bin: List[Int]
     var cat_offset: List[Int]
     var cat_bitset: List[UInt64]
+    var count: List[Float64]
 
     def __init__(
         out self,
@@ -186,12 +196,14 @@ struct Tree(Copyable, Movable):
         var missing_bin: List[Int] = [],
         var cat_offset: List[Int] = [],
         var cat_bitset: List[UInt64] = [],
+        var count: List[Float64] = [],
     ):
         """Omitting the missing-routing arrays (or passing ones of the wrong
         length) builds a tree that routes no missing values, which is what a
         model trained without missing support, or loaded from a v1 file,
         needs. Omitting `cat_offset` likewise builds a tree with no
-        categorical nodes."""
+        categorical nodes, and omitting `count` builds a tree with no node
+        covers, which is what a v1 or v2 file describes."""
         var n_nodes = len(feature)
         self.feature = feature^
         self.threshold_bin = threshold_bin^
@@ -216,8 +228,46 @@ struct Tree(Copyable, Movable):
             self.cat_offset = List[Int](capacity=n_nodes)
             self.cat_offset.resize(n_nodes, -1)
         self.cat_bitset = cat_bitset^
+        if len(count) == n_nodes:
+            self.count = count^
+        else:
+            self.count = List[Float64](capacity=n_nodes)
+            self.count.resize(n_nodes, 0.0)
 
-    def _add_node(mut self, value: Float64) -> Int:
+    def has_node_counts(self) -> Bool:
+        """Whether this tree carries node covers (see `count`). False for a
+        tree loaded from a v1 or v2 file, which predate them, and for one
+        built without them; every grower records them. A grown tree always
+        has a positive root cover, so the root alone settles it."""
+        return len(self.count) == len(self.feature) and self.count[0] > 0.0
+
+    def check_node_counts(self) raises:
+        """Raise unless every node carries a positive cover. Exact
+        contribution attribution (contrib.mojo) divides by a node's cover at
+        every internal node, so it checks this once per model rather than
+        guarding each division."""
+        if len(self.count) != len(self.feature):
+            raise Error(
+                "tree carries no node counts: it was loaded from a model file"
+                " written before they were recorded (v1 or v2). Retrain, or"
+                " re-save the model with a current version, to use feature"
+                " contributions."
+            )
+        for i in range(len(self.count)):
+            if not self.count[i] > 0.0:
+                raise Error(
+                    "tree node ",
+                    i,
+                    " has a nonpositive cover (",
+                    self.count[i],
+                    "); feature contributions need every node's training row"
+                    " count",
+                )
+
+    def _add_node(mut self, value: Float64, count: Float64) -> Int:
+        """Append a leaf holding `value`, covered by `count` training rows.
+        Every grower goes through here, so node covers cannot be recorded on
+        one backend and missed on another."""
         var node = len(self.feature)
         self.feature.append(-1)
         self.threshold_bin.append(-1)
@@ -231,6 +281,7 @@ struct Tree(Copyable, Movable):
         self.default_left.append(False)
         self.missing_bin.append(-1)
         self.cat_offset.append(-1)
+        self.count.append(count)
         return node
 
     def _set_split(mut self, node: Int, split: SplitInfo, missing_bin: Int):
@@ -318,6 +369,51 @@ struct Tree(Copyable, Movable):
             else:
                 node = self.right[node]
         return node
+
+    def leaf_index_bins(self, bins: List[Int]) -> Int:
+        """The node index of the leaf `bins` lands in, given one example's
+        per-feature bin ids. The bins counterpart of `leaf_index_row`."""
+        var node = 0
+        while self.feature[node] >= 0:
+            if self.goes_left(node, bins[self.feature[node]]):
+                node = self.left[node]
+            else:
+                node = self.right[node]
+        return node
+
+    def leaf_ordinals(self) -> List[Int]:
+        """Per-node leaf ordinal: a leaf's rank among this tree's leaves in
+        node order, and -1 for every internal node.
+
+        Node ids are an implementation detail (they number internal nodes and
+        leaves together, and shift as a tree grows), so leaf prediction
+        reports this ordinal instead. It lies in [0, n_leaves), it is fixed
+        once the tree is grown, and serialization writes nodes in array order,
+        so a saved and reloaded tree assigns exactly the same ordinals. It is
+        mojoboost's own numbering: it is not LightGBM's leaf id, and the two
+        agree only by coincidence.
+
+        Callers predicting many rows should build this table once per tree and
+        index it with `leaf_index_bins`, which is what `leaf_ordinal_bins`
+        does for a single example."""
+        var out = List[Int](capacity=len(self.feature))
+        var next_ordinal = 0
+        for i in range(len(self.feature)):
+            if self.feature[i] < 0:
+                out.append(next_ordinal)
+                next_ordinal += 1
+            else:
+                out.append(-1)
+        return out^
+
+    def leaf_ordinal_bins(self, bins: List[Int]) -> Int:
+        """The leaf ordinal (see `leaf_ordinals`) this example lands in."""
+        var node = self.leaf_index_bins(bins)
+        var ordinal = 0
+        for i in range(node):
+            if self.feature[i] < 0:
+                ordinal += 1
+        return ordinal
 
 
 struct _LeafState(Movable):
@@ -410,7 +506,10 @@ def partition_rows_into(
     the serial single-pass partition, index for index.
     """
     var n = len(rows)
-    var blocks = plan_row_blocks(n, n)
+    # Each row is touched twice, and each touch is an indirect load of a bin
+    # through a row id, so a row costs roughly three histogram ops rather than
+    # one; the estimate is scaled up to match.
+    var blocks = plan_row_blocks(n, 3 * n)
     var rows_p = rows.unsafe_ptr()
     var bins_p = data.bins.unsafe_ptr().unsafe_offset(
         split.feature * data.n_rows
@@ -664,7 +763,8 @@ def grow_tree(
     var root = tree._add_node(
         _leaf_value(
             root_hist, params.lambda_reg, params.lambda_l1, value_feature
-        )
+        ),
+        Float64(len(root_rows)),
     )
 
     var frontier = List[_LeafState]()
@@ -763,8 +863,8 @@ def grow_tree(
         var children = child_bounds(
             parent_bounds, split_sign, left_value, right_value
         )
-        var left_node = tree._add_node(left_value)
-        var right_node = tree._add_node(right_value)
+        var left_node = tree._add_node(left_value, Float64(len(left_rows)))
+        var right_node = tree._add_node(right_value, Float64(len(right_rows)))
         tree.left[parent_node] = left_node
         tree.right[parent_node] = right_node
         tree._set_split(parent_node, split, split_missing_bin)

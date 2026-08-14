@@ -190,42 +190,6 @@ def test_lambda_l1():
     print(f"lambda_l1 ok (train MSE {mse_plain:.5f} -> {mse_reg:.5f})")
 
 
-def test_regularization_aliases():
-    # LightGBM's scikit-learn estimators spell these reg_alpha and
-    # reg_lambda; both spellings must train the same model.
-    X, y = make_regression(400)
-    named = MojoBoostRegressor(
-        n_estimators=20, lambda_l1=5.0, lambda_l2=3.0
-    ).fit(X, y)
-    aliased = MojoBoostRegressor(
-        n_estimators=20, reg_alpha=5.0, reg_lambda=3.0
-    ).fit(X, y)
-    pa = list(named.predict(X))
-    pb = list(aliased.predict(X))
-    assert all(a == b for a, b in zip(pa, pb)), "aliases trained differently"
-
-    # Redundant but agreeing values are fine; disagreeing ones raise.
-    MojoBoostRegressor(n_estimators=5, lambda_l1=5.0, reg_alpha=5.0).fit(X, y)
-    for bad in (
-        dict(lambda_l1=5.0, reg_alpha=1.0),
-        dict(lambda_l2=2.0, reg_lambda=1.0),
-    ):
-        try:
-            MojoBoostRegressor(n_estimators=5, **bad).fit(X, y)
-            raise AssertionError(f"{bad} should raise")
-        except ValueError:
-            pass
-
-    # Aliases are ordinary constructor parameters: stored unmodified under
-    # their own names, resolved at fit time, so set_params reaches them and
-    # the scikit-learn parameter plumbing needs no special case for them.
-    est = MojoBoostRegressor(n_estimators=5)
-    assert est.reg_alpha is None and est.lambda_l1 == 0.0
-    est.reg_alpha = 7.0  # what set_params does
-    assert est._params(0, "cpu")["lambda_l1"] == 7.0
-    print("regularization aliases ok")
-
-
 def test_lightgbm_sklearn_aliases():
     """Native LightGBM names stay canonical; its sklearn wrapper's names
     are accepted as strict aliases and produce the same model."""
@@ -396,18 +360,12 @@ def test_goss():
     var = sum((t - sum(y) / len(y)) ** 2 for t in y) / len(y)
     assert mse < 0.2 * var, f"GOSS train MSE too high: {mse}"
 
+    # Two representative rejections; the full validation matrix lives in
+    # python/tests/test_params.py.
     for bad in (
         {"boosting": "dart"},
-        {"boosting": "goss", "top_rate": 1.5},
-        {"boosting": "goss", "top_rate": -0.1},
-        {"boosting": "goss", "other_rate": 1.5},
-        {"boosting": "goss", "top_rate": 0.7, "other_rate": 0.4},
-        {"boosting": "goss", "top_rate": 0.0, "other_rate": 0.0},
-        {"boosting": "goss", "goss_seed": -1},
-        {"boosting": "goss", "goss_warmup_rounds": -2},
         # GOSS and row bagging both own the sampled rows.
         {"boosting": "goss", "bagging_fraction": 0.5, "bagging_freq": 1},
-        {"boosting": "goss", "boosting_type": "gbdt"},
     ):
         try:
             MojoBoostRegressor(n_estimators=5, **bad).fit(X, y)
@@ -643,6 +601,109 @@ def test_interaction_constraint_validation():
         except ValueError:
             pass
     print("interaction constraint validation ok")
+
+
+def make_monotone_regression(n_rows, seed=29):
+    """Two features whose target falls then rises in x0 and rises then falls
+    in x1, so an unconstrained fit is monotone in neither."""
+    rng = _rand_stream(seed)
+    X = [[next(rng), next(rng)] for _ in range(n_rows)]
+    y = [
+        (r[0] - 0.5) ** 2 - (r[1] - 0.5) ** 2 for r in X
+    ]
+    return X, y
+
+
+def _monotone_probe_grid(steps=13):
+    """Query points from below the training range to above it."""
+    return [-0.25 + 1.5 * i / (steps - 1) for i in range(steps)]
+
+
+def _predict_probe_grid(model, xs):
+    """Predictions over the (x0, x1) grid, as a list of lists indexed [i][j]."""
+    rows = [[a, b] for a in xs for b in xs]
+    flat = list(model.predict(rows))
+    n = len(xs)
+    return [flat[i * n : (i + 1) * n] for i in range(n)]
+
+
+def test_monotone_constraints():
+    X, y = make_monotone_regression(600)
+    xs = _monotone_probe_grid()
+
+    # Unconstrained, the fit must break both orderings, so the checks below
+    # are not passing on data that was already monotone.
+    plain = MojoBoostRegressor(n_estimators=30).fit(X, y)
+    pg = _predict_probe_grid(plain, xs)
+    assert any(
+        pg[i][j] > pg[i + 1][j]
+        for j in range(len(xs))
+        for i in range(len(xs) - 1)
+    ), "unconstrained fit was already nondecreasing in feature 0"
+
+    model = MojoBoostRegressor(
+        n_estimators=30, monotone_constraints=[1, -1]
+    ).fit(X, y)
+    grid = _predict_probe_grid(model, xs)
+    for j in range(len(xs)):
+        for i in range(len(xs) - 1):
+            assert grid[i][j] <= grid[i + 1][j], (
+                f"prediction fell along feature 0 at x1={xs[j]}"
+            )
+    for i in range(len(xs)):
+        for j in range(len(xs) - 1):
+            assert grid[i][j] >= grid[i][j + 1], (
+                f"prediction rose along feature 1 at x0={xs[i]}"
+            )
+
+    # An all-zero vector is unconstrained, bit for bit.
+    zeros = MojoBoostRegressor(
+        n_estimators=30, monotone_constraints=[0, 0]
+    ).fit(X, y)
+    assert all(
+        a == b
+        for a, b in zip(list(plain.predict(X)), list(zeros.predict(X)))
+    ), "an all-zero constraint vector changed the fit"
+
+    # Saved models keep the constraints and predict identically.
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "monotone.mbst")
+        model.save(path)
+        loaded = MojoBoostRegressor.load(path)
+        before = list(model.predict(X))
+        after = list(loaded.predict(X))
+    assert all(a == b for a, b in zip(before, after)), "round-trip not exact"
+
+    # A binary classifier takes the same parameter, and the increasing link
+    # carries the guarantee through to the probability.
+    Xc = [list(r) for r in X]
+    yc = [1 if t > 0.0 else 0 for t in y]
+    clf = MojoBoostClassifier(
+        n_estimators=25, monotone_constraints=[1, -1]
+    ).fit(Xc, yc)
+    proba = [list(p) for p in clf.predict_proba([[a, 0.5] for a in xs])]
+    for i in range(len(xs) - 1):
+        assert proba[i][1] <= proba[i + 1][1], "class-1 probability fell"
+    print("monotone constraints ok")
+
+
+def test_monotone_constraint_validation():
+    X, y = make_monotone_regression(200)
+    for bad in (
+        [1],               # one entry for two features
+        [1, 0, -1],        # one entry too many
+        [1, 2],            # 2 is not a constraint
+        [1, 0.5],          # fractional, rejected rather than truncated
+        "1,-1",            # LightGBM's string form is not accepted
+    ):
+        try:
+            MojoBoostRegressor(
+                n_estimators=5, monotone_constraints=bad
+            ).fit(X, y)
+            raise AssertionError(f"{bad!r} should raise")
+        except ValueError:
+            pass
+    print("monotone constraint validation ok")
 
 
 def test_device_cpu_and_auto():
@@ -1137,7 +1198,6 @@ if __name__ == "__main__":
     test_sample_weight()
     test_regression_objectives()
     test_lambda_l1()
-    test_regularization_aliases()
     test_lightgbm_sklearn_aliases()
     test_bagging()
     test_goss()
@@ -1145,6 +1205,8 @@ if __name__ == "__main__":
     test_feature_fraction()
     test_interaction_constraints()
     test_interaction_constraint_validation()
+    test_monotone_constraints()
+    test_monotone_constraint_validation()
     test_input_validation()
     test_custom_objective_matches_builtin()
     test_custom_objective_base_score()

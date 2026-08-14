@@ -42,10 +42,12 @@ from std.sys.info import num_physical_cores
 # all three with 1.2-1.6x parallel speedup at exactly this size.
 comptime PARALLEL_MIN_OPS = 1 << 16
 
-# Auto-mode fan-out per physical core. Above 1 the extra tasks absorb the
-# jitter of unequal per-item cost; far above it the scheduling events cost
-# more than the imbalance they hide. Measured flat between 2 and 8 on Apple
-# M4 (bench/bench_profile.mojo), so 4 is the midpoint of the flat region.
+# Auto-mode fan-out per physical core, applied on top of the grain rule in
+# `plan_tasks`. Above 1 the extra tasks absorb the jitter of unequal per-item
+# cost (features differ in bin occupancy, blocks in cache behaviour); far
+# above it the scheduling events cost more than the imbalance they hide. 4 is
+# a starting point, not a measured optimum: sweep it with
+# bench/bench_profile.mojo on an idle machine before treating it as tuned.
 comptime TASKS_PER_CORE = 4
 
 
@@ -75,19 +77,37 @@ def plan_tasks(n_items: Int, total_ops: Int) -> Int:
     """How many parallel tasks to split `n_items` units of work into.
 
     Returns 1 for the serial path. The result is a scheduling decision only:
-    every caller must produce the same answer at every task count, so this
-    can be tuned freely without changing any output.
+    every caller produces the same answer at every task count, so this can be
+    tuned freely without changing any output.
+
+    `total_ops` is the caller's work estimate in *histogram-op equivalents*:
+    one accumulate of a gradient, a hessian, and a count into a scattered bin.
+    Stages whose per-row work is cheaper or dearer than that scale their
+    estimate accordingly (see the callers), because a single count of "rows"
+    or "features" says nothing about how long a task will run, and the whole
+    point of the threshold is to compare work against scheduling overhead.
+
+    Two limits apply in auto mode. Below one grain of work the whole loop
+    stays serial, and above it the task count is capped so that no task holds
+    less than a grain: fanning 100k cheap ops across 40 workers costs far more
+    in scheduling than the 2.5k ops each one would run. An explicit
+    `MOJOBOOST_NUM_WORKERS` bypasses both, so tests can force the parallel
+    path at any size.
     """
     if n_items <= 1:
         return 1
     var workers = env_num_workers()
     if workers == 1:
         return 1
-    if workers == 0 and total_ops < env_parallel_min_ops():
-        return 1
     var n_tasks = workers
     if workers == 0:
+        var grain = env_parallel_min_ops()
+        if total_ops < grain:
+            return 1
         n_tasks = TASKS_PER_CORE * num_physical_cores()
+        var by_grain = total_ops // grain
+        if by_grain < n_tasks:
+            n_tasks = by_grain
         if n_tasks < 1:
             n_tasks = 1
     if n_tasks > n_items:

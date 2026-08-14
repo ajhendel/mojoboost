@@ -257,9 +257,9 @@ def test_rate_validation() raises:
 
 
 def test_training_rejects_bad_rates_and_bagging() raises:
-    var features = _features(80, 2)
+    var features = _features(80, 3)
     var target = _regression_target(features, 80)
-    var data = bin_equal_width(features, 80, 2, 16)
+    var data = bin_equal_width(features, 80, 3, 16)
     var params = BoosterParams(5, 0.3, TreeParams(8, 5, 1.0, 1e-3))
 
     var raised = False

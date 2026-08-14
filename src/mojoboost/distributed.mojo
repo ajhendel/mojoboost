@@ -474,8 +474,11 @@ def _grow_tree_distributed[
         params,
         params.constraints.allowed_features(root_branch),
     )
+    # Covers are the global counts every rank agreed on, so the tree carries
+    # the same node covers on every rank.
     var root = tree._add_node(
-        _leaf_value(root_hist, params.lambda_reg, params.lambda_l1)
+        _leaf_value(root_hist, params.lambda_reg, params.lambda_l1),
+        Float64(root_count),
     )
 
     var frontier = List[_DistLeaf]()
@@ -550,10 +553,12 @@ def _grow_tree_distributed[
             left_hist = subtract_histogram(frontier[best_i].hist, right_hist)
 
         var left_node = tree._add_node(
-            _leaf_value(left_hist, params.lambda_reg, params.lambda_l1)
+            _leaf_value(left_hist, params.lambda_reg, params.lambda_l1),
+            Float64(n_left),
         )
         var right_node = tree._add_node(
-            _leaf_value(right_hist, params.lambda_reg, params.lambda_l1)
+            _leaf_value(right_hist, params.lambda_reg, params.lambda_l1),
+            Float64(n_right),
         )
         tree.feature[parent_node] = split.feature
         tree.threshold_bin[parent_node] = split.bin

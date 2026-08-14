@@ -6,20 +6,32 @@ platforms = ["osx-arm64", "linux-64", "linux-aarch64"]
 version = "0.1.0"
 
 [tasks]
-test = "mojo run -I src tests/test_mojoboost.mojo && mojo run -I src tests/test_metrics.mojo && mojo run -I src tests/test_weights.mojo && mojo run -I src tests/test_multiclass_model.mojo && mojo run -I src tests/test_objectives.mojo && mojo run -I src tests/test_custom_objective.mojo && mojo run -I src tests/test_kernels.mojo && mojo run -I src tests/test_regularization.mojo && mojo run -I src tests/test_max_depth.mojo && mojo run -I src tests/test_bagging.mojo && mojo run -I src tests/test_goss.mojo && mojo run -I src tests/test_interaction.mojo && mojo run -I src tests/test_monotone.mojo && mojo run -I src tests/test_feature_sampling.mojo && mojo run -I src tests/test_ranking.mojo && mojo run -I src tests/test_serialize.mojo && mojo run -I src tests/test_gpu_tiling.mojo && mojo run -I src tests/test_backend_equivalence.mojo && mojo run -I src tests/test_gpu_strategies.mojo && mojo run -I src tests/test_gpu_training.mojo && mojo run -I src tests/test_gpu_objectives.mojo && mojo run -I src tests/test_histogram_reference.mojo && mojo run -I src tests/test_device.mojo && mojo run -I src tests/test_gpu_portability.mojo"
+test = "mojo run -I src tests/test_mojoboost.mojo && mojo run -I src tests/test_metrics.mojo && mojo run -I src tests/test_weights.mojo && mojo run -I src tests/test_multiclass_model.mojo && mojo run -I src tests/test_objectives.mojo && mojo run -I src tests/test_custom_objective.mojo && mojo run -I src tests/test_custom_metrics.mojo && mojo run -I src tests/test_kernels.mojo && mojo run -I src tests/test_regularization.mojo && mojo run -I src tests/test_max_depth.mojo && mojo run -I src tests/test_bagging.mojo && mojo run -I src tests/test_goss.mojo && mojo run -I src tests/test_interaction.mojo && mojo run -I src tests/test_monotone.mojo && mojo run -I src tests/test_categorical.mojo && mojo run -I src tests/test_feature_sampling.mojo && mojo run -I src tests/test_ranking.mojo && mojo run -I src tests/test_serialize.mojo && mojo run -I src tests/test_missing.mojo && mojo run -I src tests/test_gpu_tiling.mojo && mojo run -I src tests/test_backend_equivalence.mojo && mojo run -I src tests/test_gpu_strategies.mojo && mojo run -I src tests/test_gpu_training.mojo && mojo run -I src tests/test_gpu_objectives.mojo && mojo run -I src tests/test_histogram_reference.mojo && mojo run -I src tests/test_cpu_parallel.mojo && mojo run -I src tests/test_distributed.mojo && mojo run -I src tests/test_device.mojo && mojo run -I src tests/test_gpu_portability.mojo && mojo run -I src -I capi tests/test_capi.mojo && mojo run -I src -I cli tests/test_cli.mojo"
 test-gpu = "mojo run -I src tests/test_interaction.mojo && mojo run -I src tests/test_gpu_tiling.mojo && mojo run -I src tests/test_gpu_strategies.mojo && mojo run -I src tests/test_backend_equivalence.mojo && mojo run -I src tests/test_gpu_training.mojo && mojo run -I src tests/test_gpu_objectives.mojo && mojo run -I src tests/test_device.mojo && mojo run -I src tests/test_gpu_portability.mojo"
+# Checks docs/LIGHTGBM_PARITY.md against the repository. Standard library
+# only, and it builds nothing, so it is cheap enough to run on every change.
+check-parity = "python3 tools/check_parity.py"
 bench = "mojo run -I src bench/bench_train.mojo"
 bench-hist = "mojo run -I src bench/bench_histogram.mojo"
 bench-hist-scaling = "mojo run -I src bench/bench_histogram_scaling.mojo"
 bench-train-gpu = "mojo run -I src bench/bench_train_gpu.mojo"
 gpu-validate = "mojo run -I src bench/bench_gpu_validation.mojo"
 bench-threshold = "mojo run -I src bench/bench_threshold.mojo"
+bench-profile = "mojo run -I src bench/bench_profile.mojo"
 bench-custom = "mojo run -I src bench/bench_custom_objective.mojo"
 bench-goss = "mojo run -I src bench/bench_goss.mojo"
 build-python = "bindings/build.sh"
 test-python = { cmd = "python python/test_python_api.py", depends-on = [
     "build-python",
 ] }
+# The C ABI and the command line tool. `test-capi` and `test-cli` are Mojo
+# tests and need no C toolchain; `test-c` compiles capi/test_capi.c against
+# the public header and skips itself when no compiler is installed.
+build-capi = "capi/build.sh"
+build-cli = "cli/build.sh"
+test-capi = "mojo run -I src -I capi tests/test_capi.mojo"
+test-cli = "mojo run -I src -I cli tests/test_cli.mojo"
+test-c = "capi/run_c_tests.sh"
 
 [dependencies]
 mojo = ">=1.0.0,<2"
@@ -32,6 +44,8 @@ lightgbm = "*"
 
 [feature.bench.tasks]
 bench-lgbm = "python bench/bench_lightgbm.py"
+compare-missing = "python bench/compare_missing_lightgbm.py"
+compare-categorical = "python bench/compare_categorical_lightgbm.py"
 bench-custom-py = "python bench/bench_custom_objective.py"
 compare-ranking = "python bench/compare_ranking.py"
 
@@ -49,11 +63,14 @@ test-wheel = { cmd = "packaging/test_wheel.sh", depends-on = ["build-wheel"] }
 pytest = "*"
 scikit-learn = "*"
 pandas = "*"
+pyarrow = "*"
+polars = "*"
 
-# The estimator suite (python/tests) needs pytest, and its scikit-learn and
-# pandas tests skip themselves when those are absent. `test-python` above
-# stays dependency-free on purpose, so it also runs against a bare wheel
-# install. Run this one with `pixi run -e pytest test-estimators`.
+# The estimator suite (python/tests) needs pytest, and its scikit-learn,
+# pandas, pyarrow, and polars tests skip themselves when those are absent.
+# `test-python` above stays dependency-free on purpose, so it also runs
+# against a bare wheel install. Run this one with
+# `pixi run -e pytest test-estimators`.
 [feature.pytest.tasks]
 test-estimators = { cmd = "pytest -q python/tests", depends-on = [
     "build-python",

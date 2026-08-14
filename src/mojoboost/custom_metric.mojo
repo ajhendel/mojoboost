@@ -3,7 +3,9 @@
 A custom metric is a callable that scores validation predictions against
 validation labels and returns one scalar:
 
-    def my_metric(pred: List[Float64], target: List[Float64]) raises -> Float64:
+    def my_metric(
+        pred: List[Float64], target: List[Float64]
+    ) raises -> Float64:
         ...
 
 `MetricFn` is that signature (the same shape as `EvalLossFn` in
@@ -82,14 +84,34 @@ Contract, and how it differs from LightGBM
   `value(i, ...)` is the score after `i` trees and `best_iteration` 0 means
   every tree hurt. LightGBM's `evals_result_` starts at the first
   iteration.
-- Validation rows are never weighted or bagged, matching `train_with_valid`.
-- Single-output only, as for custom objectives: `train_multiclass` has no
-  custom-metric entry point.
+- Validation rows are never bagged, matching `train_with_valid`, and the
+  framework never weights them either: a metric that should be weighted
+  holds its own weights, which is how `metrics.mojo` takes them.
 - CPU only. There is no GPU trainer with a validation loop; the metric
   itself is host code either way.
+
+Multiclass and ranking
+----------------------
+`train_multiclass_with_metrics` and `train_ranker_with_metrics` extend the
+same machinery to the two multi-tree-per-round trainers, with the same
+early-stopping, truncation, and history rules. A round is one tree per class
+for multiclass and one tree for ranking, and `best_iteration` counts rounds
+in both cases.
+
+What the metric receives differs, because that is what the model produces:
+
+- multiclass: `pred` holds row-major raw scores, `pred[r * n_classes + k]`,
+  so it is `n_classes` times as long as the labels. Apply `_softmax_inplace`
+  or your own link to get probabilities. Labels ride in the `ValidSet` as
+  Float64 whole numbers in 0..n_classes-1, the same encoding the trainer
+  takes.
+- ranking: `pred` holds one raw ranking score per row and the labels are
+  graded relevances. Query boundaries are *not* passed to the metric: a
+  ranking metric needs the validation set's own groups, and the caller
+  already holds them, so it captures them rather than being handed them.
 """
 
-from std.math import exp, isfinite
+from std.math import exp, isfinite, log
 
 from .bagging import BaggingParams, bagging_enabled, check_bagging, refresh_bag
 from .binning import BinMapper, BinnedMatrix, fit_bins
@@ -101,20 +123,38 @@ from .boosting import (
     QUANTILE,
     Booster,
     BoosterParams,
+    MulticlassBooster,
     _base_score,
     _check_goss,
     _check_objective,
     _check_sample_weight,
+    _clamp_prob,
     _fill_grad_hess,
+    _fill_softmax_grad_hess,
+    _multiclass_goss_select,
     _renew_leaf_values,
     _sigmoid,
+    _softmax_inplace,
 )
-from .goss import GossParams, goss_round
-from .model import Model
+from .goss import GossParams, GossSelection, apply_goss_scaling, goss_round
+from .model import Model, MulticlassModel
 from .objective import (
     GradHessFn,
     _apply_sample_weight,
     check_custom_grad_hess,
+)
+from .ranking import (
+    LAMBDARANK,
+    RankGroups,
+    RankerParams,
+    _discounts,
+    _fill_lambdas,
+    _inverse_max_dcgs,
+    _refresh_query_bag,
+    check_groups,
+    check_labels,
+    check_ranker_params,
+    groups_from_counts,
 )
 from .tree import Tree, grow_tree
 
@@ -740,32 +780,28 @@ def fit_with_metrics[F: MetricSetFn & Copyable](
     sample_weight: List[Float64] = [],
     alpha: Float64 = 0.9,
     bagging: BaggingParams = BaggingParams.disabled(),
+    goss: GossParams = GossParams.disabled(),
+    use_missing: Bool = True,
+    categorical_features: List[Int] = [],
 ) raises -> MetricFitResult:
     """`train_with_metrics` on raw, column-major features
     (`features[f * n_rows + r]`), the `fit` counterpart.
 
     Validation sets are binned with the mapper fitted on the training data,
-    which is what a deployed model would do to them. CPU only.
+    which is what a deployed model would do to them. `max_bins`,
+    `use_missing`, and `categorical_features` therefore apply to the
+    validation sets as well. CPU only.
     """
-    var mapper = fit_bins(features, n_rows, n_features, max_bins)
+    var mapper = fit_bins(
+        features,
+        n_rows,
+        n_features,
+        max_bins,
+        use_missing=use_missing,
+        categorical_features=categorical_features,
+    )
     var data = mapper.transform(features, n_rows)
-    var binned = List[ValidSet]()
-    for v in range(len(valid_sets)):
-        if len(valid_sets[v].features) != valid_sets[v].n_rows * n_features:
-            raise Error(
-                String(
-                    "validation set ",
-                    valid_sets[v].name,
-                    " must have n_rows * n_features feature values",
-                )
-            )
-        binned.append(
-            ValidSet(
-                valid_sets[v].name,
-                mapper.transform(valid_sets[v].features, valid_sets[v].n_rows),
-                valid_sets[v].target.copy(),
-            )
-        )
+    var binned = _bin_valid_sets(mapper, valid_sets, n_features)
     var result = train_with_metrics(
         data,
         target,
@@ -778,6 +814,7 @@ def fit_with_metrics[F: MetricSetFn & Copyable](
         sample_weight,
         alpha,
         bagging,
+        goss,
     )
     return MetricFitResult(
         Model(mapper^, result.booster.copy()),
@@ -798,3 +835,532 @@ def _new_history(
     for v in range(len(valid_sets)):
         valid_names.append(valid_sets[v].name)
     return MetricHistory(metric_names^, valid_names^)
+
+
+@fieldwise_init
+struct MetricMulticlassTrainResult(Copyable, Movable):
+    """`MetricTrainResult` for the softmax trainer: the same record around a
+    `MulticlassBooster`. `best_iteration` counts rounds, and a round is one
+    tree per class, so the ensemble it names holds
+    `best_iteration * n_classes` trees."""
+
+    var booster: MulticlassBooster
+    var history: MetricHistory
+    var best_iteration: Int
+    var best_score: Float64
+    var stopped_early: Bool
+
+
+@fieldwise_init
+struct MetricMulticlassFitResult(Copyable, Movable):
+    """`MetricMulticlassTrainResult` for the raw-feature entry point: the
+    same record around a `MulticlassModel`, which carries the fitted bin
+    mapper."""
+
+    var model: MulticlassModel
+    var history: MetricHistory
+    var best_iteration: Int
+    var best_score: Float64
+    var stopped_early: Bool
+
+
+def _valid_label_codes(
+    valid_sets: List[ValidSet], n_classes: Int
+) raises -> List[List[Int]]:
+    """Validation labels as the Int class codes the softmax trainer needs.
+
+    They travel in `ValidSet.target` as Float64 because one `ValidSet` type
+    serves every trainer; only whole numbers in 0..n_classes-1 mean anything
+    here, and anything else is rejected rather than truncated.
+    """
+    var out = List[List[Int]]()
+    for v in range(len(valid_sets)):
+        var codes = List[Int](capacity=len(valid_sets[v].target))
+        for r in range(len(valid_sets[v].target)):
+            var value = valid_sets[v].target[r]
+            var ok = isfinite(value)
+            var code = Int(value) if ok else 0
+            if ok:
+                ok = Float64(code) == value and 0 <= code < n_classes
+            if not ok:
+                raise Error(
+                    String(
+                        "validation set ",
+                        valid_sets[v].name,
+                        " has a label outside 0..n_classes-1",
+                    )
+                )
+            codes.append(code)
+        out.append(codes^)
+    return out^
+
+
+def _relevance_codes(valid_sets: List[ValidSet]) raises -> List[List[Int]]:
+    """Validation relevance labels as the Int grades a ranking metric needs,
+    checked against the same range `check_labels` enforces for training."""
+    var out = List[List[Int]]()
+    for v in range(len(valid_sets)):
+        var codes = List[Int](capacity=len(valid_sets[v].target))
+        for r in range(len(valid_sets[v].target)):
+            var value = valid_sets[v].target[r]
+            var ok = isfinite(value)
+            var code = Int(value) if ok else 0
+            if ok:
+                ok = Float64(code) == value
+            if not ok:
+                raise Error(
+                    String(
+                        "validation set ",
+                        valid_sets[v].name,
+                        " has a non-integer relevance label",
+                    )
+                )
+            codes.append(code)
+        check_labels(codes)
+        out.append(codes^)
+    return out^
+
+
+def _multiclass_base_scores(
+    labels: List[Int], n_classes: Int, sample_weight: List[Float64]
+) raises -> List[Float64]:
+    """Log class priors of the training labels, weighted when
+    `sample_weight` is given: the base scores `train_multiclass` starts
+    from."""
+    var class_w = List[Float64](capacity=n_classes)
+    for _ in range(n_classes):
+        class_w.append(0.0)
+    var total_w = 0.0
+    for r in range(len(labels)):
+        if labels[r] < 0 or labels[r] >= n_classes:
+            raise Error("label out of range")
+        var w = sample_weight[r] if len(sample_weight) > 0 else 1.0
+        class_w[labels[r]] += w
+        total_w += w
+    if total_w <= 0.0:
+        raise Error("sample_weight must have a positive sum")
+    var base_scores = List[Float64](capacity=n_classes)
+    for k in range(n_classes):
+        base_scores.append(log(_clamp_prob(class_w[k] / total_w)))
+    return base_scores^
+
+
+def _multiclass_base_raw(
+    valid_sets: List[ValidSet], base_scores: List[Float64], n_classes: Int
+) -> List[List[Float64]]:
+    """One running row-major raw-score vector per validation set,
+    `raw[r * n_classes + k]`, seeded with the training base scores."""
+    var out = List[List[Float64]]()
+    for v in range(len(valid_sets)):
+        var rows = valid_sets[v].data.n_rows
+        var scores = List[Float64](capacity=rows * n_classes)
+        for _ in range(rows):
+            for k in range(n_classes):
+                scores.append(base_scores[k])
+        out.append(scores^)
+    return out^
+
+
+def _update_multiclass_valid_raw(
+    mut valid_raw: List[List[Float64]],
+    valid_sets: List[ValidSet],
+    tree: Tree,
+    learning_rate: Float64,
+    n_classes: Int,
+    k: Int,
+):
+    for v in range(len(valid_sets)):
+        for r in range(valid_sets[v].data.n_rows):
+            valid_raw[v][r * n_classes + k] += (
+                learning_rate * tree.predict_row(valid_sets[v].data, r)
+            )
+
+
+def train_multiclass_with_metrics[F: MetricSetFn & Copyable](
+    data: BinnedMatrix,
+    labels: List[Int],
+    n_classes: Int,
+    valid_sets: List[ValidSet],
+    params: BoosterParams,
+    metrics: MetricSuite[F],
+    early_stopping_rounds: Int = 0,
+    min_delta: Float64 = 0.0,
+    sample_weight: List[Float64] = [],
+    bagging: BaggingParams = BaggingParams.disabled(),
+    goss: GossParams = GossParams.disabled(),
+) raises -> MetricMulticlassTrainResult:
+    """Train a softmax ensemble while scoring caller-supplied metrics.
+
+    Same training contract as `train_multiclass_with_valid` (weights, class
+    priors as base scores, one shared bag or GOSS sample per round); the
+    difference is that the validation signal comes from `metrics` rather
+    than from the multiclass log loss, that any number of validation sets
+    can be scored, and that every value is kept in the returned history.
+
+    Metrics receive the row-major raw scores of a validation set, one block
+    of `n_classes` per row, and its labels as Float64 whole numbers. See the
+    module docstring for the early-stopping and truncation rules; a round is
+    one tree per class here, so truncating to `best_iteration` drops
+    `n_classes` trees at a time.
+    """
+    if len(labels) != data.n_rows:
+        raise Error("labels length must equal n_rows")
+    if n_classes < 2:
+        raise Error("n_classes must be at least 2")
+    _check_sample_weight(sample_weight, data.n_rows)
+    check_bagging(bagging)
+    _check_goss(goss, bagging)
+    params.tree.monotone.check_features(data.n_features)
+    _check_valid_sets(valid_sets, data.n_features)
+    _ = _valid_label_codes(valid_sets, n_classes)
+    metrics.check()
+    _check_early_stopping(metrics.metrics, early_stopping_rounds, min_delta)
+
+    var n = data.n_rows
+    var base_scores = _multiclass_base_scores(labels, n_classes, sample_weight)
+    var raw = List[Float64](capacity=n * n_classes)
+    for _ in range(n):
+        for k in range(n_classes):
+            raw.append(base_scores[k])
+    var prob = List[Float64](capacity=n * n_classes)
+    for _ in range(n * n_classes):
+        prob.append(0.0)
+    var valid_raw = _multiclass_base_raw(valid_sets, base_scores, n_classes)
+
+    var history = _new_history(metrics.metrics, valid_sets)
+    var stop = _StopState(len(valid_sets), metrics.n_metrics())
+    _eval_round(metrics, valid_sets, valid_raw, 0, history)
+    stop.observe(0, history, metrics.metrics, min_delta)
+
+    var trees = List[Tree]()
+    var grad = List[Float64](capacity=n)
+    var hess = List[Float64](capacity=n)
+    var bag = List[Int]()
+    var n_rounds = 0
+    var stopped_early = False
+    for i in range(params.n_estimators):
+        refresh_bag(bag, bagging, n, i)
+        for r in range(n):
+            for k in range(n_classes):
+                prob[r * n_classes + k] = raw[r * n_classes + k]
+            _softmax_inplace(prob, r * n_classes, n_classes)
+
+        # One shared sample for the whole round, drawn before any class's
+        # tree so that every class is grown on the same rows.
+        var selection = GossSelection.all_rows()
+        if goss.active(i, params.learning_rate):
+            selection = _multiclass_goss_select(
+                prob, labels, n_classes, sample_weight, goss, i
+            )
+            bag = selection.rows.copy()
+
+        var made_progress = False
+        var round_trees = List[Tree]()
+        for k in range(n_classes):
+            _fill_softmax_grad_hess(
+                prob, labels, k, n_classes, sample_weight, grad, hess
+            )
+            apply_goss_scaling(selection, grad, hess)
+            var tree = grow_tree(
+                data, grad, hess, params.tree, bag, i * n_classes + k
+            )
+            if tree.n_leaves > 1 or abs(tree.value[0]) >= 1e-12:
+                made_progress = True
+            round_trees.append(tree^)
+
+        # A round that moved nothing indicts this sample under bagging or
+        # GOSS and the run otherwise, exactly as in train_multiclass. The
+        # scores are only updated once the round is known to count, so a
+        # dropped round leaves no trace in the history.
+        if not made_progress:
+            if bagging_enabled(bagging) or goss.enabled:
+                continue
+            break
+
+        for k in range(n_classes):
+            for r in range(n):
+                raw[r * n_classes + k] += (
+                    params.learning_rate * round_trees[k].predict_row(data, r)
+                )
+            _update_multiclass_valid_raw(
+                valid_raw,
+                valid_sets,
+                round_trees[k],
+                params.learning_rate,
+                n_classes,
+                k,
+            )
+            trees.append(round_trees[k].copy())
+        n_rounds += 1
+
+        _eval_round(metrics, valid_sets, valid_raw, n_rounds, history)
+        stop.observe(n_rounds, history, metrics.metrics, min_delta)
+        if early_stopping_rounds > 0 and stop.exhausted(
+            n_rounds, metrics.metrics, early_stopping_rounds
+        ):
+            stopped_early = True
+            break
+
+    var best = stop.best_round[metrics.primary]
+    var best_score = stop.best_value[metrics.primary]
+    if early_stopping_rounds > 0:
+        while len(trees) > best * n_classes:
+            _ = trees.pop()
+    return MetricMulticlassTrainResult(
+        MulticlassBooster(
+            trees^,
+            base_scores^,
+            n_classes,
+            params.learning_rate,
+            params.tree.monotone.copy(),
+        ),
+        history^,
+        best,
+        best_score,
+        stopped_early,
+    )
+
+
+def train_ranker_with_metrics[F: MetricSetFn & Copyable](
+    data: BinnedMatrix,
+    labels: List[Int],
+    groups: RankGroups,
+    valid_sets: List[ValidSet],
+    params: BoosterParams,
+    metrics: MetricSuite[F],
+    early_stopping_rounds: Int = 0,
+    min_delta: Float64 = 0.0,
+    rank_params: RankerParams = RankerParams.default(),
+    sample_weight: List[Float64] = [],
+    bagging: BaggingParams = BaggingParams.disabled(),
+) raises -> MetricTrainResult:
+    """Train a LambdaRank ensemble while scoring caller-supplied metrics.
+
+    Same training contract as `train_ranker_with_valid` (base score 0,
+    query-wise bagging, weights on training rows only); the difference is
+    that the validation signal comes from `metrics`, that any number of
+    validation sets can be scored, and that every value is kept in the
+    returned history.
+
+    A validation set's query boundaries are not passed to the metric, which
+    a ranking metric needs: hold them in the callable, as
+    `fit_ranker_with_metrics`'s callers do. Relevance labels ride in
+    `ValidSet.target` as Float64 whole numbers and are range-checked here.
+
+    Unlike `train_ranker_with_valid`, which starts from "no ranking to
+    beat", round 0 is evaluated and recorded like any other round, so a
+    `best_iteration` of 0 means no tree beat the all-zero scores the
+    ensemble starts from.
+    """
+    if len(labels) != data.n_rows:
+        raise Error("labels length must equal n_rows")
+    check_groups(groups, data.n_rows)
+    check_labels(labels)
+    check_ranker_params(rank_params)
+    _check_sample_weight(sample_weight, data.n_rows)
+    check_bagging(bagging)
+    _check_valid_sets(valid_sets, data.n_features)
+    _ = _relevance_codes(valid_sets)
+    metrics.check()
+    _check_early_stopping(metrics.metrics, early_stopping_rounds, min_delta)
+
+    var n = data.n_rows
+    var raw = List[Float64](capacity=n)
+    raw.resize(n, 0.0)
+    var valid_raw = _base_scores(valid_sets, 0.0)
+    var inverse_max_dcg = _inverse_max_dcgs(
+        labels, groups, rank_params.truncation_level
+    )
+    var discounts = _discounts(groups.max_size())
+
+    var history = _new_history(metrics.metrics, valid_sets)
+    var stop = _StopState(len(valid_sets), metrics.n_metrics())
+    _eval_round(metrics, valid_sets, valid_raw, 0, history)
+    stop.observe(0, history, metrics.metrics, min_delta)
+
+    var trees = List[Tree]()
+    var grad = List[Float64](capacity=n)
+    var hess = List[Float64](capacity=n)
+    var query_bag = List[Int]()
+    var row_bag = List[Int]()
+    var stopped_early = False
+    for i in range(params.n_estimators):
+        _refresh_query_bag(query_bag, row_bag, groups, bagging, i)
+        _fill_lambdas(
+            raw,
+            labels,
+            groups,
+            inverse_max_dcg,
+            discounts,
+            rank_params,
+            sample_weight,
+            grad,
+            hess,
+        )
+        var tree = grow_tree(data, grad, hess, params.tree, row_bag, i)
+        # No pair left to separate; under bagging that is a statement about
+        # this bag, so the round is skipped and the next bag gets its turn.
+        if tree.n_leaves == 1 and abs(tree.value[0]) < 1e-12:
+            if bagging_enabled(bagging):
+                continue
+            break
+
+        for r in range(n):
+            raw[r] += params.learning_rate * tree.predict_row(data, r)
+        _update_valid_raw(valid_raw, valid_sets, tree, params.learning_rate)
+        trees.append(tree^)
+
+        var round = len(trees)
+        _eval_round(metrics, valid_sets, valid_raw, round, history)
+        stop.observe(round, history, metrics.metrics, min_delta)
+        if early_stopping_rounds > 0 and stop.exhausted(
+            round, metrics.metrics, early_stopping_rounds
+        ):
+            stopped_early = True
+            break
+
+    var best = stop.best_round[metrics.primary]
+    var best_score = stop.best_value[metrics.primary]
+    if early_stopping_rounds > 0:
+        while len(trees) > best:
+            _ = trees.pop()
+    return MetricTrainResult(
+        Booster(trees^, 0.0, params.learning_rate, LAMBDARANK),
+        history^,
+        best,
+        best_score,
+        stopped_early,
+    )
+
+
+def _bin_valid_sets(
+    mapper: BinMapper,
+    valid_sets: List[RawValidSet],
+    n_features: Int,
+) raises -> List[ValidSet]:
+    """Bin every raw validation set with the mapper fitted on the training
+    data, which is what a deployed model would do to them."""
+    var binned = List[ValidSet]()
+    for v in range(len(valid_sets)):
+        if len(valid_sets[v].features) != valid_sets[v].n_rows * n_features:
+            raise Error(
+                String(
+                    "validation set ",
+                    valid_sets[v].name,
+                    " must have n_rows * n_features feature values",
+                )
+            )
+        binned.append(
+            ValidSet(
+                valid_sets[v].name,
+                mapper.transform(valid_sets[v].features, valid_sets[v].n_rows),
+                valid_sets[v].target.copy(),
+            )
+        )
+    return binned^
+
+
+def fit_multiclass_with_metrics[F: MetricSetFn & Copyable](
+    features: List[Float64],
+    n_rows: Int,
+    n_features: Int,
+    labels: List[Int],
+    n_classes: Int,
+    valid_sets: List[RawValidSet],
+    params: BoosterParams,
+    metrics: MetricSuite[F],
+    early_stopping_rounds: Int = 0,
+    min_delta: Float64 = 0.0,
+    max_bins: Int = 255,
+    sample_weight: List[Float64] = [],
+    bagging: BaggingParams = BaggingParams.disabled(),
+    goss: GossParams = GossParams.disabled(),
+    use_missing: Bool = True,
+    categorical_features: List[Int] = [],
+) raises -> MetricMulticlassFitResult:
+    """`train_multiclass_with_metrics` on raw, column-major features
+    (`features[f * n_rows + r]`), the `fit_multiclass` counterpart. CPU
+    only."""
+    var mapper = fit_bins(
+        features,
+        n_rows,
+        n_features,
+        max_bins,
+        use_missing=use_missing,
+        categorical_features=categorical_features,
+    )
+    var data = mapper.transform(features, n_rows)
+    var binned = _bin_valid_sets(mapper, valid_sets, n_features)
+    var result = train_multiclass_with_metrics(
+        data,
+        labels,
+        n_classes,
+        binned,
+        params,
+        metrics,
+        early_stopping_rounds,
+        min_delta,
+        sample_weight,
+        bagging,
+        goss,
+    )
+    return MetricMulticlassFitResult(
+        MulticlassModel(mapper^, result.booster.copy()),
+        result.history.copy(),
+        result.best_iteration,
+        result.best_score,
+        result.stopped_early,
+    )
+
+
+def fit_ranker_with_metrics[F: MetricSetFn & Copyable](
+    features: List[Float64],
+    n_rows: Int,
+    n_features: Int,
+    labels: List[Int],
+    group_counts: List[Int],
+    valid_sets: List[RawValidSet],
+    params: BoosterParams,
+    metrics: MetricSuite[F],
+    early_stopping_rounds: Int = 0,
+    min_delta: Float64 = 0.0,
+    rank_params: RankerParams = RankerParams.default(),
+    max_bins: Int = 255,
+    sample_weight: List[Float64] = [],
+    bagging: BaggingParams = BaggingParams.disabled(),
+    use_missing: Bool = True,
+    categorical_features: List[Int] = [],
+) raises -> MetricFitResult:
+    """`train_ranker_with_metrics` on raw, column-major features
+    (`features[f * n_rows + r]`), the `fit_ranker` counterpart. CPU only."""
+    var groups = groups_from_counts(group_counts)
+    var mapper = fit_bins(
+        features,
+        n_rows,
+        n_features,
+        max_bins,
+        use_missing=use_missing,
+        categorical_features=categorical_features,
+    )
+    var data = mapper.transform(features, n_rows)
+    var binned = _bin_valid_sets(mapper, valid_sets, n_features)
+    var result = train_ranker_with_metrics(
+        data,
+        labels,
+        groups,
+        binned,
+        params,
+        metrics,
+        early_stopping_rounds,
+        min_delta,
+        rank_params,
+        sample_weight,
+        bagging,
+    )
+    return MetricFitResult(
+        Model(mapper^, result.booster.copy()),
+        result.history.copy(),
+        result.best_iteration,
+        result.best_score,
+        result.stopped_early,
+    )

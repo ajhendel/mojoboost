@@ -9,9 +9,15 @@ serialization.
 The low- and high-cardinality cases are tested separately because they take
 different search paths: at or below `max_cat_to_onehot` categories the search
 is one-vs-rest, above it the sorted many-vs-many walk (see categorical.mojo).
+
+The multiclass and ranking trainers get their own cases here rather than in
+their own files, because what is under test is the categorical contract, not
+those objectives. The GPU case is here for the same reason: it skips itself
+without an accelerator.
 """
 
 from std.os import remove
+from std.sys import has_accelerator
 from std.testing import (
     assert_almost_equal,
     assert_equal,
@@ -33,9 +39,16 @@ from mojoboost.categorical import (
     fit_categorical_spec,
 )
 from mojoboost.histogram import Histogram
-from mojoboost.model import fit
+from mojoboost.model import Model, fit, fit_multiclass
+from mojoboost.ranking import (
+    RankerParams,
+    fit_ranker,
+    groups_from_counts,
+    ndcg,
+)
 from mojoboost.serialize import load_model, save_model
 from mojoboost.split import find_best_split
+from mojoboost.train_gpu import train_gpu
 from mojoboost.tree import TreeParams, grow_tree
 
 comptime _TMP_PATH = "./.test_categorical_roundtrip.tmp"
@@ -50,6 +63,11 @@ def _splitmix64(state: UInt64) -> UInt64:
 
 def _uniform(counter: UInt64) -> Float64:
     return Float64(_splitmix64(counter) >> 11) * (1.0 / 9007199254740992.0)
+
+
+def _nan() -> Float64:
+    var zero = _uniform(UInt64(0)) * 0.0
+    return zero / zero
 
 
 def _params(num_leaves: Int, n_estimators: Int) -> BoosterParams:
@@ -69,13 +87,15 @@ def _small_cat_params() -> CategoricalParams:
 
 
 def test_bitset_membership_across_words() raises:
+    var members: List[Int] = [1, 63, 64, 65, 127, 128, 200, 255]
+    var absent: List[Int] = [0, 2, 62, 66, 126, 199, 254]
     var bits = cat_empty()
-    for b in [1, 63, 64, 65, 127, 128, 200, 255]:
-        cat_add(bits, b)
-    for b in [1, 63, 64, 65, 127, 128, 200, 255]:
-        assert_true(cat_contains(bits, b))
-    for b in [0, 2, 62, 66, 126, 199, 254]:
-        assert_true(not cat_contains(bits, b))
+    for i in range(len(members)):
+        cat_add(bits, members[i])
+    for i in range(len(members)):
+        assert_true(cat_contains(bits, members[i]))
+    for i in range(len(absent)):
+        assert_true(not cat_contains(bits, absent[i]))
     # Bin 0 is never a category, and out-of-range ids are never members.
     assert_true(not cat_contains(bits, 0))
     assert_true(not cat_contains(bits, 256))
@@ -116,7 +136,7 @@ def test_missing_and_unseen_codes_land_in_bin_zero() raises:
     assert_equal(spec.bin_of(0, 9.0), 0)
     # Missing: negative, and NaN.
     assert_equal(spec.bin_of(0, -1.0), 0)
-    assert_equal(spec.bin_of(0, Float64(0.0) / Float64(0.0)), 0)
+    assert_equal(spec.bin_of(0, _nan()), 0)
     # Out of the representable code range.
     assert_equal(spec.bin_of(0, 4.0e9), 0)
     # Non-integral values truncate toward zero, as LightGBM's cast does.
@@ -251,10 +271,9 @@ def test_sorted_search_groups_non_adjacent_categories() raises:
     assert_true(split.is_categorical)
     # Whichever side won, the three same-sign categories are grouped together.
     var evens_in = cat_contains(split.cat_bitset, 2)
-    for b in [2, 4, 6]:
-        assert_equal(cat_contains(split.cat_bitset, b), evens_in)
-    for b in [1, 3, 5]:
-        assert_equal(cat_contains(split.cat_bitset, b), not evens_in)
+    for b in range(1, 7):
+        var want = evens_in if b % 2 == 0 else not evens_in
+        assert_equal(cat_contains(split.cat_bitset, b), want)
 
 
 def test_max_cat_threshold_caps_the_set_size() raises:
@@ -382,7 +401,7 @@ def test_unseen_and_missing_categories_route_right() raises:
     # is in no split's category set, so all three take the same path.
     var unseen = model.predict([99.0])
     assert_true(model.predict([-1.0]) == unseen)
-    assert_true(model.predict([Float64(0.0) / Float64(0.0)]) == unseen)
+    assert_true(model.predict([_nan()]) == unseen)
     # And they follow the documented default: right at every categorical
     # node, so the prediction is a real leaf of the trained tree.
     assert_true(unseen == unseen)
@@ -468,8 +487,9 @@ def test_serialization_roundtrip_is_bit_exact() raises:
         var row: List[Float64] = [features[r], features[n_rows + r]]
         assert_true(loaded.predict(row) == model.predict(row))
     # Including the routing of codes the model never saw.
-    for code in [99.0, -1.0, 4.5]:
-        var row: List[Float64] = [0.5, code]
+    var odd_codes: List[Float64] = [99.0, -1.0, 4.5]
+    for i in range(len(odd_codes)):
+        var row: List[Float64] = [0.5, odd_codes[i]]
         assert_true(loaded.predict(row) == model.predict(row))
 
 
@@ -490,8 +510,180 @@ def test_numerical_only_models_serialize_unchanged() raises:
     save_model(model, _TMP_PATH)
     var content = open(_TMP_PATH, "r").read()
     remove(_TMP_PATH)
-    assert_true("categorical" not in content)
-    assert_true("cat " not in content)
+    assert_true(content.find("categorical") < 0)
+    assert_true(content.find("cat ") < 0)
+
+
+# --- Other trainers --------------------------------------------------------
+
+
+def test_multiclass_fits_category_groups() raises:
+    """Softmax training reads the same binned matrix, so a categorical column
+    has to work there too: the class is a function of the category, and no
+    ordinal threshold on the code separates the classes."""
+    var n_rows = 600
+    var n_categories = 6
+    var features = List[Float64](capacity=n_rows)
+    var labels = List[Int](capacity=n_rows)
+    for r in range(n_rows):
+        features.append(Float64(r % n_categories))
+    for r in range(n_rows):
+        labels.append((r % n_categories) % 3)
+
+    var params = _params(8, 30)
+    params.tree.cat = _small_cat_params()
+    var model = fit_multiclass(
+        features,
+        n_rows,
+        1,
+        labels,
+        3,
+        params,
+        64,
+        categorical_features=[0],
+    )
+    assert_true(model.mapper.cats.is_cat(0))
+    for c in range(n_categories):
+        assert_equal(model.predict_class([Float64(c)]), c % 3)
+    # Missing, unseen, and dropped codes share the unknown bin, so all three
+    # route right at every categorical node and land on one leaf.
+    var unseen = model.predict_class([Float64(n_categories + 5)])
+    assert_equal(model.predict_class([-1.0]), unseen)
+    assert_equal(model.predict_class([_nan()]), unseen)
+
+
+def _count_categorical_nodes(model: Model) -> Int:
+    """Nodes of a fitted single-output model that route by category set."""
+    var found = 0
+    for t in range(len(model.booster.trees)):
+        for i in range(len(model.booster.trees[t].cat_offset)):
+            if model.booster.trees[t].cat_offset[i] >= 0:
+                found += 1
+    return found
+
+
+def _ranking_dataset(
+    n_queries: Int,
+    per_query: Int,
+    mut features: List[Float64],
+    mut labels: List[Int],
+    mut counts: List[Int],
+):
+    """One categorical column per document whose code alternates relevance,
+    so within a query the relevant documents are the even codes."""
+    for q in range(n_queries):
+        for d in range(per_query):
+            features.append(Float64(d))
+            _ = q
+    for q in range(n_queries):
+        for d in range(per_query):
+            labels.append(1 if d % 2 == 0 else 0)
+            _ = q
+    for _ in range(n_queries):
+        counts.append(per_query)
+
+
+def test_ranker_searches_category_sets() raises:
+    """`fit_ranker` takes `categorical_features` like the other fits. With
+    eight alternating codes and four leaves, an ordinal threshold cannot
+    separate the relevant documents from the rest, so this fails outright if
+    the ranker quietly treats the codes as numbers."""
+    var n_queries = 60
+    var per_query = 8
+    var features = List[Float64]()
+    var labels = List[Int]()
+    var counts = List[Int]()
+    _ranking_dataset(n_queries, per_query, features, labels, counts)
+    var n_rows = n_queries * per_query
+
+    var params = _params(4, 30)
+    params.tree.cat = _small_cat_params()
+    var rank_params = RankerParams(10, 1.0, True, 4)
+
+    var as_cat = fit_ranker(
+        features,
+        n_rows,
+        1,
+        labels,
+        counts,
+        params,
+        rank_params,
+        64,
+        categorical_features=[0],
+    )
+    var as_num = fit_ranker(
+        features, n_rows, 1, labels, counts, params, rank_params, 64
+    )
+    assert_true(as_cat.mapper.cats.is_cat(0))
+    assert_true(not as_num.mapper.cats.is_cat(0))
+
+    # The categorical fit splits by category set and the numerical one never
+    # does, which is the difference the parameter is supposed to make. A
+    # quality gap would not show it: over enough rounds an ordinal model
+    # carves out one code at a time and gets there too.
+    assert_true(_count_categorical_nodes(as_cat) > 0)
+    assert_equal(_count_categorical_nodes(as_num), 0)
+
+    var cat_scores = List[Float64](capacity=n_rows)
+    for r in range(n_rows):
+        var row: List[Float64] = [features[r]]
+        cat_scores.append(as_cat.predict_raw(row))
+    var groups = groups_from_counts(counts)
+    # Every relevant document in the top four is NDCG@4 = 1.
+    assert_almost_equal(ndcg(cat_scores, labels, groups, 4), 1.0, atol=1e-9)
+
+
+# --- GPU -------------------------------------------------------------------
+
+
+def test_gpu_categorical_splits_match_cpu() raises:
+    """The GPU trainer searches category partitions on downloaded histograms
+    and routes rows by the node's bitset in the partition kernel, so it must
+    grow the same categorical model the CPU trainer does, to the Float32
+    tolerance the other backend-equivalence tests use."""
+    comptime if not has_accelerator():
+        print("skipped: no accelerator")
+    else:
+        var n_rows = 2_000
+        var n_features = 3
+        var n_categories = 12
+        var features = List[Float64](capacity=n_rows * n_features)
+        # Feature 0 is the categorical column; 1 and 2 are numerical, so both
+        # search paths run in the same trees.
+        for r in range(n_rows):
+            features.append(Float64(r % n_categories))
+        for f in range(1, n_features):
+            for r in range(n_rows):
+                features.append(_uniform(UInt64(f * n_rows + r)))
+        var target = List[Float64](capacity=n_rows)
+        for r in range(n_rows):
+            var c = r % n_categories
+            target.append(
+                (1.0 if c % 3 == 0 else -1.0) + 2.0 * features[n_rows + r]
+            )
+
+        var params = _params(12, 20)
+        params.tree.cat = _small_cat_params()
+        var mapper = fit_bins(
+            features, n_rows, n_features, 64, categorical_features=[0]
+        )
+        var data = mapper.transform(features, n_rows)
+        var cpu = train(data, target, SQUARED_ERROR, params)
+        var gpu = train_gpu(data, target, SQUARED_ERROR, params)
+
+        assert_equal(len(cpu.trees), len(gpu.trees))
+        var categorical_nodes = 0
+        for t in range(len(gpu.trees)):
+            for i in range(len(gpu.trees[t].feature)):
+                if gpu.trees[t].cat_offset[i] >= 0:
+                    categorical_nodes += 1
+        # Otherwise the tolerance below would pass on two numerical models.
+        assert_true(categorical_nodes > 0)
+        for r in range(n_rows):
+            assert_true(
+                abs(cpu.predict_row(data, r) - gpu.predict_row(data, r))
+                <= 1e-3
+            )
 
 
 def main() raises:

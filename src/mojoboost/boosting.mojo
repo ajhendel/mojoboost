@@ -2,18 +2,33 @@
 
 Trains an additive ensemble of leaf-wise trees on second-order gradients.
 Objectives: squared error (regression), binary logistic (labels in {0, 1}),
-poisson counts, huber, quantile, L1 (mean absolute error), and multiclass
+poisson counts, huber, quantile, L1 (mean absolute error), gamma, tweedie,
+MAPE, fair, cross entropy (labels anywhere in [0, 1]), and multiclass
 softmax (labels in 0..n_classes-1, via train_multiclass).
 
 Caller-supplied objectives live in objective.mojo (`train_custom`); a
 booster trained that way carries the CUSTOM objective code.
 
-QUANTILE and L1 follow LightGBM's RenewTreeOutput: after each tree is
-grown, every leaf's Newton value is replaced by the alpha-percentile
-(median for L1) of the residuals of the rows in that leaf, and shrinkage
-is applied to the renewed value. `alpha` is the target quantile for
-QUANTILE and the transition point of the huber loss for HUBER; the other
-objectives ignore it.
+QUANTILE, L1, and MAPE follow LightGBM's RenewTreeOutput: after each tree
+is grown, every leaf's Newton value is replaced by the alpha-percentile
+(median for L1 and MAPE) of the residuals of the rows in that leaf, and
+shrinkage is applied to the renewed value. `objective_renews_leaves`,
+`renewal_alpha`, and `renewal_weights` are the three pieces of that rule,
+so every trainer that grows a tree applies it the same way.
+
+`alpha` is the objective's scalar parameter, LightGBM's `alpha` where
+LightGBM has one and its per-objective parameter otherwise:
+
+- QUANTILE: the target quantile, LightGBM's `alpha` (default 0.9).
+- HUBER: the transition point, LightGBM's `alpha` (default 0.9).
+- FAIR: the `c` of the fair loss, LightGBM's `fair_c` (default 1.0).
+- TWEEDIE: the variance power in (1, 2), LightGBM's
+  `tweedie_variance_power` (default 1.5).
+
+Every other objective ignores it. One slot rather than four keeps the
+trainer signatures, the C ABI, and the serialized model unchanged as
+objectives are added; the Python layer keeps LightGBM's parameter names
+and maps them here.
 """
 
 from std.math import exp, log
@@ -50,9 +65,26 @@ comptime L1 = 5
 # `_fill_grad_hess`. Predictions for it are raw scores (no known link).
 comptime CUSTOM = 6
 
+# 7 is LAMBDARANK, in ranking.mojo: it continues this one objective registry
+# but its gradients come from query groups rather than from
+# `_fill_grad_hess`, so it lives with the rest of the ranking code.
+
+# The regression family LightGBM calls gamma, tweedie, mape, and fair, and
+# the continuous-label cross entropy it calls xentropy.
+comptime GAMMA = 8
+comptime TWEEDIE = 9
+comptime MAPE = 10
+comptime FAIR = 11
+comptime CROSS_ENTROPY = 12
+
 # LightGBM's poisson_max_delta_step: the hessian is exp(raw + this), which
 # caps the Newton step for rows with tiny predicted means.
 comptime _POISSON_MAX_DELTA_STEP = 0.7
+
+# LightGBM's fair_c and tweedie_variance_power defaults, the value `alpha`
+# takes for FAIR and TWEEDIE when a caller does not set one.
+comptime DEFAULT_FAIR_C = 1.0
+comptime DEFAULT_TWEEDIE_VARIANCE_POWER = 1.5
 
 
 def _sign(x: Float64) -> Float64:
@@ -132,6 +164,15 @@ def _clamp_prob(p: Float64) -> Float64:
     return p
 
 
+@always_inline
+def _mape_label_weight(y: Float64) -> Float64:
+    """LightGBM's MAPE label weight `1 / max(1, |y|)`, the per-row scale that
+    turns an absolute error into a relative one. The floor at 1 is
+    LightGBM's: without it a label near zero would dominate the objective."""
+    var m = abs(y)
+    return 1.0 / m if m > 1.0 else 1.0
+
+
 def _check_objective(
     objective: Int, target: List[Float64], alpha: Float64
 ) raises:
@@ -147,16 +188,44 @@ def _check_objective(
         and objective != HUBER
         and objective != QUANTILE
         and objective != L1
+        and objective != GAMMA
+        and objective != TWEEDIE
+        and objective != MAPE
+        and objective != FAIR
+        and objective != CROSS_ENTROPY
     ):
         raise Error("unknown objective")
     if objective == POISSON:
         for r in range(len(target)):
             if target[r] < 0.0:
                 raise Error("poisson target values must be nonnegative")
+    if objective == TWEEDIE:
+        for r in range(len(target)):
+            if target[r] < 0.0:
+                raise Error("tweedie target values must be nonnegative")
+    if objective == GAMMA:
+        # The gamma deviance has a log(y) in it and its gradient divides by
+        # the prediction; a zero or negative label has no gamma likelihood.
+        for r in range(len(target)):
+            if target[r] <= 0.0:
+                raise Error("gamma target values must be positive")
+    if objective == CROSS_ENTROPY:
+        for r in range(len(target)):
+            if target[r] < 0.0 or target[r] > 1.0:
+                raise Error("cross entropy target values must be in [0, 1]")
     if objective == HUBER and alpha <= 0.0:
         raise Error("huber requires alpha > 0")
     if objective == QUANTILE and (alpha <= 0.0 or alpha >= 1.0):
         raise Error("quantile requires 0 < alpha < 1")
+    if objective == FAIR and alpha <= 0.0:
+        raise Error("fair requires alpha (fair_c) > 0")
+    if objective == TWEEDIE and (alpha <= 1.0 or alpha >= 2.0):
+        # Outside (1, 2) this is no longer the compound Poisson-gamma
+        # LightGBM's tweedie objective assumes: at 1 it is Poisson, at 2
+        # gamma, and the gradient below divides by neither exponent.
+        raise Error(
+            "tweedie requires 1 < alpha (tweedie_variance_power) < 2"
+        )
 
 
 def _check_sample_weight(weights: List[Float64], n: Int) raises:
@@ -187,18 +256,59 @@ def _check_goss(goss: GossParams, bagging: BaggingParams) raises:
         raise Error("goss and bagging cannot both be enabled")
 
 
+def objective_renews_leaves(objective: Int) -> Bool:
+    """Whether this objective replaces its leaf values after each tree, the
+    LightGBM `RenewTreeOutput` rule: the objectives whose Newton step is
+    uninformative because their hessian carries no curvature (it is the row
+    weight itself), so the leaf value comes from a percentile of the
+    residuals instead. See `_renew_leaf_values`."""
+    return objective == QUANTILE or objective == L1 or objective == MAPE
+
+
+def renewal_alpha(objective: Int, alpha: Float64) -> Float64:
+    """The percentile leaf renewal takes for this objective: the target
+    quantile for QUANTILE, the median for L1 and MAPE."""
+    return alpha if objective == QUANTILE else 0.5
+
+
+def renewal_weights(
+    objective: Int, target: List[Float64], weights: List[Float64]
+) -> List[Float64]:
+    """The weights leaf renewal takes for this objective.
+
+    Every objective but MAPE renews on the sample weights themselves.
+    MAPE renews on `sample_weight * 1 / max(1, |y|)`, the same product that
+    scales its gradient, which is LightGBM's `RegressionMAPELOSS`
+    `RenewTreeOutput` override: the leaf value has to be the *relative*
+    median, and a weighted percentile with those weights is it.
+
+    Computed once per training run rather than once per tree, since neither
+    the labels nor the sample weights change between rounds.
+    """
+    if objective != MAPE:
+        return weights.copy()
+    var out = List[Float64](capacity=len(target))
+    for r in range(len(target)):
+        var w = weights[r] if len(weights) > 0 else 1.0
+        out.append(w * _mape_label_weight(target[r]))
+    return out^
+
+
 def _base_score(
     target: List[Float64],
     objective: Int,
     weights: List[Float64],
     alpha: Float64,
 ) raises -> Float64:
-    # QUANTILE and L1 boost from the target percentile, LightGBM style;
-    # every other objective boosts from the (weighted) mean.
-    if objective == QUANTILE or objective == L1:
-        var q = alpha if objective == QUANTILE else 0.5
-        if len(weights) > 0:
-            return _weighted_percentile(target, weights, q)
+    # QUANTILE, L1, and MAPE boost from the target percentile, LightGBM
+    # style; every other objective boosts from the (weighted) mean. MAPE
+    # takes the median under its own label weights, the same weights its
+    # leaf renewal uses.
+    if objective_renews_leaves(objective):
+        var q = renewal_alpha(objective, alpha)
+        var renew_w = renewal_weights(objective, target, weights)
+        if len(renew_w) > 0:
+            return _weighted_percentile(target, renew_w, q)
         return _percentile(target, q)
     var mean = 0.0
     var total_w = 0.0
@@ -209,12 +319,21 @@ def _base_score(
     if total_w <= 0.0:
         raise Error("sample_weight must have a positive sum")
     mean /= total_w
-    if objective == BINARY_LOGISTIC:
+    if objective == BINARY_LOGISTIC or objective == CROSS_ENTROPY:
         var p = _clamp_prob(mean)
         return log(p / (1.0 - p))
     if objective == POISSON:
         if mean <= 0.0:
             raise Error("poisson requires a positive mean target")
+        return log(mean)
+    if objective == GAMMA or objective == TWEEDIE:
+        # Both have the exp link, so both start at the log of the mean, as
+        # in LightGBM where they inherit RegressionPoissonLoss's
+        # BoostFromScore.
+        if mean <= 0.0:
+            raise Error(
+                "gamma and tweedie require a positive mean target"
+            )
         return log(mean)
     return mean
 
@@ -275,7 +394,11 @@ def _fill_grad_hess_into(
     # The objective test is hoisted out of the row loop, so a block runs one
     # straight-line body rather than re-dispatching per row.
     def block(start: Int, end: Int) {imm}:
-        if objective == BINARY_LOGISTIC:
+        if objective == BINARY_LOGISTIC or objective == CROSS_ENTROPY:
+            # One branch for both: cross entropy is the logistic loss with
+            # the {0, 1} label relaxed to any probability in [0, 1], so its
+            # derivatives are the same expression. Only the label
+            # validation and the reported metric differ.
             for r in range(start, end):
                 var w = w_p.unsafe_load(r) if weighted else 1.0
                 var p = _sigmoid(raw_p.unsafe_load(r))
@@ -284,6 +407,47 @@ def _fill_grad_hess_into(
                 if h < 1e-16:
                     h = 1e-16
                 hp.unsafe_store(r, w * h)
+        elif objective == GAMMA:
+            for r in range(start, end):
+                var w = w_p.unsafe_load(r) if weighted else 1.0
+                # d/draw of raw + y * exp(-raw), the gamma deviance under
+                # the log link.
+                var y_over_mu = tgt_p.unsafe_load(r) * exp(
+                    -raw_p.unsafe_load(r)
+                )
+                gp.unsafe_store(r, w * (1.0 - y_over_mu))
+                hp.unsafe_store(r, w * y_over_mu)
+        elif objective == TWEEDIE:
+            for r in range(start, end):
+                var w = w_p.unsafe_load(r) if weighted else 1.0
+                var raw_r = raw_p.unsafe_load(r)
+                var y = tgt_p.unsafe_load(r)
+                # rho is the variance power in (1, 2), so 1 - rho < 0 and
+                # 2 - rho > 0 and the hessian below stays nonnegative.
+                var e1 = exp((1.0 - alpha) * raw_r)
+                var e2 = exp((2.0 - alpha) * raw_r)
+                gp.unsafe_store(r, w * (-y * e1 + e2))
+                hp.unsafe_store(
+                    r, w * (-y * (1.0 - alpha) * e1 + (2.0 - alpha) * e2)
+                )
+        elif objective == MAPE:
+            for r in range(start, end):
+                var w = w_p.unsafe_load(r) if weighted else 1.0
+                var y = tgt_p.unsafe_load(r)
+                # L1 scaled by the label weight: the absolute error becomes
+                # a relative one, which is what MAPE measures.
+                var lw = w * _mape_label_weight(y)
+                gp.unsafe_store(
+                    r, lw * _sign(raw_p.unsafe_load(r) - y)
+                )
+                hp.unsafe_store(r, lw)
+        elif objective == FAIR:
+            for r in range(start, end):
+                var w = w_p.unsafe_load(r) if weighted else 1.0
+                var d = raw_p.unsafe_load(r) - tgt_p.unsafe_load(r)
+                var denom = abs(d) + alpha
+                gp.unsafe_store(r, w * alpha * d / denom)
+                hp.unsafe_store(r, w * alpha * alpha / (denom * denom))
         elif objective == POISSON:
             for r in range(start, end):
                 var w = w_p.unsafe_load(r) if weighted else 1.0
@@ -327,7 +491,13 @@ def _fill_grad_hess_into(
                 )
                 hp.unsafe_store(r, w)
 
-    dispatch_rows(block, n, n)
+    # A row here is a handful of flops on three sequential arrays, perhaps a
+    # sixteenth of the cost of a histogram op's scattered read-modify-write,
+    # so the work estimate is scaled down to match. The scale matters: with
+    # the unscaled count, 100k rows asked for one task per core and
+    # bench/bench_profile.mojo timed the fan-out well below the serial path,
+    # the work per task being far too small to pay for scheduling it.
+    dispatch_rows(block, n, n // 16)
 
 
 def _fill_grad_hess(
@@ -353,6 +523,35 @@ def _mean_loss(
                 total -= log(p)
             else:
                 total -= log(1.0 - p)
+    elif objective == CROSS_ENTROPY:
+        # The same log loss with a continuous label, so both terms count on
+        # every row rather than one being selected by a {0, 1} test.
+        for r in range(len(target)):
+            var p = _clamp_prob(_sigmoid(raw[r]))
+            total -= (
+                target[r] * log(p) + (1.0 - target[r]) * log(1.0 - p)
+            )
+    elif objective == GAMMA:
+        # Gamma negative log likelihood up to a constant in the target:
+        # raw + y * exp(-raw), the loss the gradient above differentiates.
+        for r in range(len(target)):
+            total += raw[r] + target[r] * exp(-raw[r])
+    elif objective == TWEEDIE:
+        # Tweedie negative log likelihood up to a constant in the target.
+        for r in range(len(target)):
+            total += (
+                -target[r] * exp((1.0 - alpha) * raw[r]) / (1.0 - alpha)
+                + exp((2.0 - alpha) * raw[r]) / (2.0 - alpha)
+            )
+    elif objective == MAPE:
+        for r in range(len(target)):
+            total += (
+                abs(raw[r] - target[r]) * _mape_label_weight(target[r])
+            )
+    elif objective == FAIR:
+        for r in range(len(target)):
+            var d = abs(raw[r] - target[r]) / alpha
+            total += alpha * alpha * (d - log(1.0 + d))
     elif objective == POISSON:
         # Poisson negative log likelihood up to a constant in the target.
         for r in range(len(target)):
@@ -443,6 +642,76 @@ struct BoosterParams(Copyable, Movable):
         return BoosterParams(100, 0.1, TreeParams.default())
 
 
+@fieldwise_init
+struct IterationRange(Copyable, Movable):
+    """A half-open `[start, stop)` slice of boosting iterations to predict
+    with, already clamped to what an ensemble holds.
+
+    Prediction over a slice follows LightGBM: the range selects whole
+    boosting iterations (one tree for a single-output model, one tree per
+    class for a multiclass one), and the base score counts as part of
+    iteration 0. So a range starting at 0 adds the base score and a range
+    starting later does not, exactly as in LightGBM, where the base score is
+    folded into the leaf values of the first iteration's trees rather than
+    stored apart. `[0, 0)` is therefore the base-score-only model, the same
+    prediction a zero-iteration ensemble makes, while an empty range that
+    starts later sums to zero.
+
+    Build one with `slice` from an explicit `[start, stop)` pair, or with
+    `clamp` from LightGBM's `(start_iteration, num_iteration)` pair, where a
+    nonpositive `num_iteration` means every remaining iteration."""
+
+    var start: Int
+    var stop: Int
+
+    @staticmethod
+    def slice(n_iterations: Int, start: Int, stop: Int) -> IterationRange:
+        """Clamp an explicit half-open pair into `[0, n_iterations]`. A stop
+        at or below the start yields an empty range rather than an error, so
+        callers can slice past the end of a short ensemble."""
+        var lo = start
+        if lo < 0:
+            lo = 0
+        if lo > n_iterations:
+            lo = n_iterations
+        var hi = stop
+        if hi > n_iterations:
+            hi = n_iterations
+        if hi < lo:
+            hi = lo
+        return IterationRange(lo, hi)
+
+    @staticmethod
+    def clamp(n_iterations: Int, start: Int, num: Int) -> IterationRange:
+        """LightGBM's `(start_iteration, num_iteration)` convention: a
+        negative start clamps to 0, a start past the end clamps to an empty
+        range at the end, and `num <= 0` means every iteration from the start
+        on."""
+        var lo = start
+        if lo < 0:
+            lo = 0
+        if lo > n_iterations:
+            lo = n_iterations
+        var hi = n_iterations
+        if num > 0 and lo + num < n_iterations:
+            hi = lo + num
+        return IterationRange(lo, hi)
+
+    @always_inline
+    def is_empty(self) -> Bool:
+        return self.stop <= self.start
+
+    @always_inline
+    def includes_base(self) -> Bool:
+        """Whether the base score belongs to this range: it sits in
+        iteration 0."""
+        return self.start == 0
+
+    @always_inline
+    def n_iterations(self) -> Int:
+        return self.stop - self.start
+
+
 struct Booster(Copyable, Movable):
     """A fitted single-output ensemble.
 
@@ -480,17 +749,39 @@ struct Booster(Copyable, Movable):
             s += self.learning_rate * self.trees[i].predict_row(data, row)
         return s
 
+    @always_inline
+    def response(self, raw: Float64) -> Float64:
+        """The objective's inverse link applied to a raw score: the
+        probability for logistic and cross entropy, the expected value for
+        poisson, gamma, and tweedie, and the raw score itself otherwise. For
+        CUSTOM this is the raw score, since the framework does not know the
+        objective's link and the caller applies it. Every response-scale
+        prediction goes through here, so the raw and response scales cannot
+        drift apart."""
+        if self.objective == BINARY_LOGISTIC or (
+            self.objective == CROSS_ENTROPY
+        ):
+            return _sigmoid(raw)
+        if (
+            self.objective == POISSON
+            or self.objective == GAMMA
+            or self.objective == TWEEDIE
+        ):
+            return exp(raw)
+        return raw
+
+    @always_inline
+    def n_iterations(self) -> Int:
+        """Boosting iterations this ensemble holds. One iteration is one tree
+        for a single-output model."""
+        return len(self.trees)
+
     def predict_row(self, data: BinnedMatrix, row: Int) -> Float64:
         """Prediction on the response scale (probability for logistic,
         expected count for poisson). For CUSTOM this is the raw score:
         the framework does not know the objective's inverse link, so the
         caller applies it."""
-        var raw = self.predict_raw_row(data, row)
-        if self.objective == BINARY_LOGISTIC:
-            return _sigmoid(raw)
-        if self.objective == POISSON:
-            return exp(raw)
-        return raw
+        return self.response(self.predict_raw_row(data, row))
 
     def predict_raw_bins(self, bins: List[Int]) -> Float64:
         var s = self.base_score
@@ -499,68 +790,103 @@ struct Booster(Copyable, Movable):
         return s
 
     def predict_bins(self, bins: List[Int]) -> Float64:
-        var raw = self.predict_raw_bins(bins)
-        if self.objective == BINARY_LOGISTIC:
-            return _sigmoid(raw)
-        if self.objective == POISSON:
-            return exp(raw)
-        return raw
+        return self.response(self.predict_raw_bins(bins))
+
+    def predict_raw_bins_range(
+        self, bins: List[Int], rng: IterationRange
+    ) -> Float64:
+        """Raw output of the boosting iterations in `rng` alone.
+
+        The base score belongs to iteration 0, so it is added only when the
+        range starts there; see IterationRange. A full range reproduces
+        `predict_raw_bins` exactly, and the ranges [0, k) and [k, n) sum to
+        the full raw score for any k."""
+        var s = self.base_score if rng.includes_base() else 0.0
+        for i in range(rng.start, rng.stop):
+            s += self.learning_rate * self.trees[i].predict_bins(bins)
+        return s
+
+    def predict_bins_range(
+        self, bins: List[Int], rng: IterationRange
+    ) -> Float64:
+        """Response-scale prediction from the iterations in `rng` alone."""
+        return self.response(self.predict_raw_bins_range(bins, rng))
+
+    def leaf_ordinals_range(self, rng: IterationRange) -> List[List[Int]]:
+        """The per-node leaf ordinal table (see `Tree.leaf_ordinals`) of each
+        tree in `rng`, in range order. Build this once and index it with
+        `Tree.leaf_index_bins` when predicting leaves for many rows."""
+        var tables = List[List[Int]](capacity=rng.n_iterations())
+        for i in range(rng.start, rng.stop):
+            tables.append(self.trees[i].leaf_ordinals())
+        return tables^
+
+    def leaf_indices_bins(
+        self, bins: List[Int], rng: IterationRange
+    ) -> List[Int]:
+        """The leaf ordinal this example reaches in each tree of `rng`, one
+        entry per iteration in range order. An empty range yields an empty
+        list."""
+        var out = List[Int](capacity=rng.n_iterations())
+        for i in range(rng.start, rng.stop):
+            out.append(self.trees[i].leaf_ordinal_bins(bins))
+        return out^
 
 
-def train(
+def _same_signs(a: List[Int], b: List[Int]) -> Bool:
+    """Whether two monotonic constraint vectors are the same vector."""
+    if len(a) != len(b):
+        return False
+    for i in range(len(a)):
+        if a[i] != b[i]:
+            return False
+    return True
+
+
+def _boost_rounds(
     data: BinnedMatrix,
     target: List[Float64],
     objective: Int,
     params: BoosterParams,
-    sample_weight: List[Float64] = [],
-    alpha: Float64 = 0.9,
-    bagging: BaggingParams = BaggingParams.disabled(),
-    goss: GossParams = GossParams.disabled(),
-) raises -> Booster:
-    """Train a boosted ensemble. `target` is the regression target for
-    SQUARED_ERROR, HUBER, QUANTILE, and L1, {0, 1} labels for
-    BINARY_LOGISTIC, or nonnegative counts for POISSON. A non-empty
-    sample_weight scales each row's gradient and hessian, LightGBM style;
-    a row with weight zero is ignored. `alpha` is the target quantile for
-    QUANTILE and the huber transition point for HUBER (LightGBM's alpha,
-    default 0.9); other objectives ignore it. `bagging` grows each tree on
-    a seeded row sample (see bagging.mojo); the base score and the
-    per-round score update stay on the full dataset. `goss` grows each tree
-    on a gradient-based sample instead (see goss.mojo), which the same row
-    list carries; the two samplers are mutually exclusive."""
-    if len(target) != data.n_rows:
-        raise Error("target length must equal n_rows")
-    _check_objective(objective, target, alpha)
-    _check_sample_weight(sample_weight, data.n_rows)
-    check_bagging(bagging)
-    _check_goss(goss, bagging)
-    params.tree.monotone.check_features(data.n_features)
+    sample_weight: List[Float64],
+    alpha: Float64,
+    bagging: BaggingParams,
+    goss: GossParams,
+    learning_rate: Float64,
+    round_offset: Int,
+    mut raw: List[Float64],
+    mut trees: List[Tree],
+) raises:
+    """Grow `params.n_estimators` trees, appending them to `trees` and
+    keeping `raw` (the raw score of every training row) in step.
 
+    This is the boosting loop itself, shared by the fit-from-scratch path
+    and the continue-training path. `round_offset` is the number of rounds
+    already grown: every seeded decision (the bagging draw, the GOSS warmup
+    schedule, the per-tree feature sample) reads the absolute round index,
+    so continued rounds draw what they would have drawn had the whole run
+    been one call. `learning_rate` is passed rather than read from `params`
+    because a continued run shrinks with the ensemble's rate.
+    """
     var n = data.n_rows
-    var base_score = _base_score(target, objective, sample_weight, alpha)
-    var raw = List[Float64](capacity=n)
-    for _ in range(n):
-        raw.append(base_score)
-
     var signs = params.tree.monotone.active_signs()
-    var trees = List[Tree]()
+    var renews = objective_renews_leaves(objective)
+    var renew_w = renewal_weights(objective, target, sample_weight)
+    var renew_a = renewal_alpha(objective, alpha)
     var grad = List[Float64](capacity=n)
     var hess = List[Float64](capacity=n)
     var bag = List[Int]()
     for i in range(params.n_estimators):
-        refresh_bag(bag, bagging, n, i)
+        var round = round_offset + i
+        refresh_bag(bag, bagging, n, round)
         _fill_grad_hess(
             raw, target, objective, sample_weight, alpha, grad, hess
         )
-        goss_round(bag, grad, hess, goss, i, params.learning_rate)
-        var tree = grow_tree(data, grad, hess, params.tree, bag, i)
-        if objective == QUANTILE:
+        goss_round(bag, grad, hess, goss, round, learning_rate)
+        var tree = grow_tree(data, grad, hess, params.tree, bag, round)
+        if renews:
             _renew_leaf_values(
-                tree, data, target, raw, sample_weight, alpha, bag, signs
-            )
-        elif objective == L1:
-            _renew_leaf_values(
-                tree, data, target, raw, sample_weight, 0.5, bag, signs
+                tree, data, target, raw, renew_w, renew_a, bag, signs
             )
 
         # A single-leaf tree with a near-zero value means the objective has
@@ -574,8 +900,74 @@ def train(
             break
 
         for r in range(n):
-            raw[r] += params.learning_rate * tree.predict_row(data, r)
+            raw[r] += learning_rate * tree.predict_row(data, r)
         trees.append(tree^)
+
+
+def train(
+    data: BinnedMatrix,
+    target: List[Float64],
+    objective: Int,
+    params: BoosterParams,
+    sample_weight: List[Float64] = [],
+    alpha: Float64 = 0.9,
+    bagging: BaggingParams = BaggingParams.disabled(),
+    goss: GossParams = GossParams.disabled(),
+    init_score: List[Float64] = [],
+) raises -> Booster:
+    """Train a boosted ensemble. `target` is the regression target for
+    SQUARED_ERROR, HUBER, QUANTILE, and L1, {0, 1} labels for
+    BINARY_LOGISTIC, or nonnegative counts for POISSON. A non-empty
+    sample_weight scales each row's gradient and hessian, LightGBM style;
+    a row with weight zero is ignored. `alpha` is the target quantile for
+    QUANTILE and the huber transition point for HUBER (LightGBM's alpha,
+    default 0.9); other objectives ignore it. `bagging` grows each tree on
+    a seeded row sample (see bagging.mojo); the base score and the
+    per-round score update stay on the full dataset. `goss` grows each tree
+    on a gradient-based sample instead (see goss.mojo), which the same row
+    list carries; the two samplers are mutually exclusive.
+
+    A non-empty `init_score` starts boosting from those raw scores instead
+    of from the objective's own base score, LightGBM's `init_score`. The
+    offset is training state, not model state: the returned ensemble has a
+    base score of 0 and predicts the trees alone, so scoring new data means
+    adding the caller's own offset back."""
+    if len(target) != data.n_rows:
+        raise Error("target length must equal n_rows")
+    _check_objective(objective, target, alpha)
+    _check_sample_weight(sample_weight, data.n_rows)
+    check_bagging(bagging)
+    _check_goss(goss, bagging)
+    params.tree.monotone.check_features(data.n_features)
+    if len(init_score) != 0 and len(init_score) != data.n_rows:
+        raise Error("init_score length must equal n_rows")
+
+    var n = data.n_rows
+    var raw = List[Float64](capacity=n)
+    var base_score = 0.0
+    if len(init_score) == n:
+        for r in range(n):
+            raw.append(init_score[r])
+    else:
+        base_score = _base_score(target, objective, sample_weight, alpha)
+        for _ in range(n):
+            raw.append(base_score)
+
+    var trees = List[Tree]()
+    _boost_rounds(
+        data,
+        target,
+        objective,
+        params,
+        sample_weight,
+        alpha,
+        bagging,
+        goss,
+        params.learning_rate,
+        0,
+        raw,
+        trees,
+    )
 
     return Booster(
         trees^,
@@ -584,6 +976,82 @@ def train(
         objective,
         params.tree.monotone.copy(),
     )
+
+
+def train_more(
+    mut booster: Booster,
+    data: BinnedMatrix,
+    target: List[Float64],
+    params: BoosterParams,
+    sample_weight: List[Float64] = [],
+    alpha: Float64 = 0.9,
+    bagging: BaggingParams = BaggingParams.disabled(),
+    goss: GossParams = GossParams.disabled(),
+) raises -> Int:
+    """Append `params.n_estimators` more trees to a fitted ensemble and
+    return how many were actually added.
+
+    Continued training resumes from the raw scores the existing trees
+    produce on `data`, so 40 rounds followed by 60 more give the ensemble
+    100 rounds in one call would have given, provided the data, the
+    objective, and the tree parameters are the same. Those raw scores are
+    recomputed from the model on every call, which costs one pass over the
+    existing trees: adding k rounds in one call is cheaper than k calls of
+    one round.
+
+    `params.n_estimators` is the number of NEW rounds, not the total.
+    `params.learning_rate` must equal the ensemble's own rate and the
+    monotonic constraints must match the ones already recorded on it: a
+    `Booster` carries a single shrinkage factor and a single constraint
+    vector for all of its trees, so neither can change part way through.
+    The objective is the ensemble's, and `data` must be binned by the
+    mapper the ensemble was trained under (see `BinMapper.matches`), which
+    the callers in dataset.mojo check.
+    """
+    if len(target) != data.n_rows:
+        raise Error("target length must equal n_rows")
+    if params.learning_rate != booster.learning_rate:
+        raise Error(
+            "continued training cannot change learning_rate: the ensemble"
+            " shrinks every tree by one rate"
+        )
+    if not _same_signs(params.tree.monotone.signs, booster.monotone.signs):
+        raise Error(
+            "continued training cannot change monotone_constraints: the"
+            " ensemble records the constraints all of its trees satisfy"
+        )
+    if params.n_estimators < 0:
+        raise Error("n_estimators must not be negative")
+    _check_objective(booster.objective, target, alpha)
+    _check_sample_weight(sample_weight, data.n_rows)
+    check_bagging(bagging)
+    _check_goss(goss, bagging)
+    params.tree.monotone.check_features(data.n_features)
+
+    var n = data.n_rows
+    var raw = List[Float64](capacity=n)
+    for r in range(n):
+        raw.append(booster.predict_raw_row(data, r))
+
+    var grown = List[Tree]()
+    _boost_rounds(
+        data,
+        target,
+        booster.objective,
+        params,
+        sample_weight,
+        alpha,
+        bagging,
+        goss,
+        booster.learning_rate,
+        len(booster.trees),
+        raw,
+        grown,
+    )
+    var added = len(grown)
+    for i in range(added):
+        booster.trees.append(grown[i].copy())
+    return added
 
 
 def train_with_valid(
@@ -633,6 +1101,9 @@ def train_with_valid(
         valid_raw.append(base_score)
 
     var signs = params.tree.monotone.active_signs()
+    var renews = objective_renews_leaves(objective)
+    var renew_w = renewal_weights(objective, target, sample_weight)
+    var renew_a = renewal_alpha(objective, alpha)
     var trees = List[Tree]()
     var grad = List[Float64](capacity=n)
     var hess = List[Float64](capacity=n)
@@ -646,13 +1117,9 @@ def train_with_valid(
         )
         goss_round(bag, grad, hess, goss, i, params.learning_rate)
         var tree = grow_tree(data, grad, hess, params.tree, bag, i)
-        if objective == QUANTILE:
+        if renews:
             _renew_leaf_values(
-                tree, data, target, raw, sample_weight, alpha, bag, signs
-            )
-        elif objective == L1:
-            _renew_leaf_values(
-                tree, data, target, raw, sample_weight, 0.5, bag, signs
+                tree, data, target, raw, renew_w, renew_a, bag, signs
             )
         # Under bagging or GOSS a degenerate tree indicts the sample, not
         # the run.
@@ -817,6 +1284,68 @@ struct MulticlassBooster(Copyable, Movable):
         var raw = self.predict_raw_bins(bins)
         _softmax_inplace(raw, 0, self.n_classes)
         return raw^
+
+    @always_inline
+    def n_iterations(self) -> Int:
+        """Boosting iterations this ensemble holds. One iteration grows one
+        tree per class, so this is the tree count over the class count."""
+        return len(self.trees) // self.n_classes
+
+    def predict_raw_bins_range(
+        self, bins: List[Int], rng: IterationRange
+    ) -> List[Float64]:
+        """Per-class raw scores from the boosting iterations in `rng` alone.
+
+        Each class's base score belongs to iteration 0 and is added only when
+        the range starts there, matching the single-output rule; see
+        IterationRange."""
+        var raw = List[Float64](capacity=self.n_classes)
+        for k in range(self.n_classes):
+            raw.append(self.base_scores[k] if rng.includes_base() else 0.0)
+        for i in range(rng.start, rng.stop):
+            for k in range(self.n_classes):
+                raw[k] += self.learning_rate * self.trees[
+                    i * self.n_classes + k
+                ].predict_bins(bins)
+        return raw^
+
+    def predict_proba_bins_range(
+        self, bins: List[Int], rng: IterationRange
+    ) -> List[Float64]:
+        """Class probabilities from the iterations in `rng` alone. The
+        softmax is taken over the sliced raw scores, so these are the
+        probabilities of the truncated ensemble, not a slice of the full
+        model's probabilities."""
+        var raw = self.predict_raw_bins_range(bins, rng)
+        _softmax_inplace(raw, 0, self.n_classes)
+        return raw^
+
+    def leaf_ordinals_range(self, rng: IterationRange) -> List[List[Int]]:
+        """The per-node leaf ordinal table of every tree in `rng`, flattened
+        round-major as the ensemble stores them: entry `i * n_classes + k` is
+        the table of class k's tree in the range's iteration i."""
+        var tables = List[List[Int]](
+            capacity=rng.n_iterations() * self.n_classes
+        )
+        for i in range(rng.start, rng.stop):
+            for k in range(self.n_classes):
+                tables.append(self.trees[i * self.n_classes + k].leaf_ordinals())
+        return tables^
+
+    def leaf_indices_bins(
+        self, bins: List[Int], rng: IterationRange
+    ) -> List[Int]:
+        """The leaf ordinal this example reaches in each tree of `rng`,
+        round-major: entry `i * n_classes + k` is class k's tree in the
+        range's iteration i. The length is `rng.n_iterations() * n_classes`,
+        which is 0 for an empty range."""
+        var out = List[Int](capacity=rng.n_iterations() * self.n_classes)
+        for i in range(rng.start, rng.stop):
+            for k in range(self.n_classes):
+                out.append(
+                    self.trees[i * self.n_classes + k].leaf_ordinal_bins(bins)
+                )
+        return out^
 
 
 def train_multiclass(

@@ -103,7 +103,9 @@ def grow_tree_sparse(
         data, grad, hess, order, root_entries, sum_all(grad, hess)
     )
     var root_split = _search(root_hist, data.n_rows, params)
-    var root = tree._add_node(_leaf_value(root_hist, params.lambda_reg))
+    var root = tree._add_node(
+        _leaf_value(root_hist, params.lambda_reg), Float64(data.n_rows)
+    )
 
     var frontier = List[_SparseLeafState]()
     frontier.append(
@@ -192,10 +194,12 @@ def grow_tree_sparse(
             left_hist = subtract_histogram(frontier[best_i].hist, right_hist)
 
         var left_node = tree._add_node(
-            _leaf_value(left_hist, params.lambda_reg)
+            _leaf_value(left_hist, params.lambda_reg),
+            Float64(len(left_rows)),
         )
         var right_node = tree._add_node(
-            _leaf_value(right_hist, params.lambda_reg)
+            _leaf_value(right_hist, params.lambda_reg),
+            Float64(len(right_rows)),
         )
         tree.feature[parent_node] = split.feature
         tree.threshold_bin[parent_node] = split.bin

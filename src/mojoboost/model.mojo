@@ -14,6 +14,7 @@ from .binning import BinMapper, BinnedMatrix, fit_bins
 from .boosting import (
     Booster,
     BoosterParams,
+    IterationRange,
     MulticlassBooster,
     train,
     train_multiclass,
@@ -21,7 +22,7 @@ from .boosting import (
 from .device import CPU_DEVICE, GPU_DEVICE, resolve_device
 from .goss import GossParams
 from .objective import GradHessFn, train_custom
-from .train_gpu import train_gpu
+from .train_gpu import train_gpu, train_multiclass_gpu
 
 
 @fieldwise_init
@@ -42,6 +43,34 @@ struct Model(Copyable, Movable, Writable):
     def predict_raw(self, row: List[Float64]) raises -> Float64:
         """Raw-score prediction (log-odds for BINARY_LOGISTIC)."""
         return self.booster.predict_raw_bins(self.mapper.bin_row(row))
+
+    def n_iterations(self) -> Int:
+        """Boosting iterations the fitted ensemble kept."""
+        return self.booster.n_iterations()
+
+    def predict_range(
+        self, row: List[Float64], rng: IterationRange
+    ) raises -> Float64:
+        """Response-scale prediction from the boosting iterations in `rng`
+        alone. See IterationRange for how the range is interpreted, including
+        where the base score sits."""
+        return self.booster.predict_bins_range(self.mapper.bin_row(row), rng)
+
+    def predict_raw_range(
+        self, row: List[Float64], rng: IterationRange
+    ) raises -> Float64:
+        """Raw-score prediction from the iterations in `rng` alone."""
+        return self.booster.predict_raw_bins_range(
+            self.mapper.bin_row(row), rng
+        )
+
+    def leaf_indices(
+        self, row: List[Float64], rng: IterationRange
+    ) raises -> List[Int]:
+        """The leaf ordinal this raw example reaches in each tree of `rng`,
+        one entry per iteration. See `Tree.leaf_ordinals` for the numbering
+        and its stability guarantees."""
+        return self.booster.leaf_indices_bins(self.mapper.bin_row(row), rng)
 
 
 @fieldwise_init
@@ -68,6 +97,35 @@ struct MulticlassModel(Copyable, Movable, Writable):
     def predict_raw(self, row: List[Float64]) raises -> List[Float64]:
         """Raw per-class scores before the softmax."""
         return self.booster.predict_raw_bins(self.mapper.bin_row(row))
+
+    def n_iterations(self) -> Int:
+        """Boosting iterations the fitted ensemble kept: one iteration grows
+        one tree per class."""
+        return self.booster.n_iterations()
+
+    def predict_proba_range(
+        self, row: List[Float64], rng: IterationRange
+    ) raises -> List[Float64]:
+        """Class probabilities from the boosting iterations in `rng` alone."""
+        return self.booster.predict_proba_bins_range(
+            self.mapper.bin_row(row), rng
+        )
+
+    def predict_raw_range(
+        self, row: List[Float64], rng: IterationRange
+    ) raises -> List[Float64]:
+        """Per-class raw scores from the iterations in `rng` alone."""
+        return self.booster.predict_raw_bins_range(
+            self.mapper.bin_row(row), rng
+        )
+
+    def leaf_indices(
+        self, row: List[Float64], rng: IterationRange
+    ) raises -> List[Int]:
+        """The leaf ordinal this raw example reaches in each tree of `rng`,
+        round-major: entry `i * n_classes + k` is class k's tree in the
+        range's iteration i."""
+        return self.booster.leaf_indices_bins(self.mapper.bin_row(row), rng)
 
     def predict_class(self, row: List[Float64]) raises -> Int:
         """The argmax class for one raw example."""
@@ -160,13 +218,15 @@ def fit_multiclass(
     categorical_features: List[Int] = [],
 ) raises -> MulticlassModel:
     """Fit a softmax multiclass model on a column-major raw feature matrix
-    (`features[f * n_rows + r]`), labels in 0..n_classes-1. Multiclass
-    training is CPU-only, so GPU_DEVICE raises and AUTO_DEVICE resolves to
-    the CPU. `bagging` draws one bag per round, shared by every class's
+    (`features[f * n_rows + r]`), labels in 0..n_classes-1. `device` carries
+    the same meaning as in `fit`: multiclass runs on either backend, growing
+    one tree per class per round, so GPU_DEVICE trains on the device rather
+    than raising. `bagging` draws one bag per round, shared by every class's
     tree in that round, and `goss` draws its gradient-based sample on the
-    same once-per-round schedule. `use_missing` and `categorical_features`
-    carry the same meaning as in `fit`."""
-    _ = resolve_device(device, n_rows, n_features, n_classes)
+    same once-per-round schedule; both draw identical rows on either device.
+    `use_missing` and `categorical_features` carry the same meaning as in
+    `fit`."""
+    var backend = resolve_device(device, n_rows, n_features, n_classes)
     var mapper = fit_bins(
         features,
         n_rows,
@@ -176,9 +236,15 @@ def fit_multiclass(
         categorical_features=categorical_features,
     )
     var data = mapper.transform(features, n_rows)
-    var booster = train_multiclass(
-        data, labels, n_classes, params, sample_weight, bagging, goss
-    )
+    var booster: MulticlassBooster
+    if backend == GPU_DEVICE:
+        booster = train_multiclass_gpu(
+            data, labels, n_classes, params, sample_weight, bagging, goss
+        )
+    else:
+        booster = train_multiclass(
+            data, labels, n_classes, params, sample_weight, bagging, goss
+        )
     return MulticlassModel(mapper^, booster^)
 
 

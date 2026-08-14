@@ -265,6 +265,49 @@ Failures:      <anything that did not build, run, or agree>
 Unsupported:   <capabilities the backend does not implement>
 ```
 
+### Apple M4, Metal, 2026-08-14
+
+The only device this code has run on, kept here as the format worked example
+and as the baseline the CUDA and HIP records get compared against. The device
+header is what `gpu-validate` printed.
+
+```text
+Mojo:          Mojo 1.0.0 (ed45d567)
+MAX:           26.5.0
+Host:          Apple M4, 10 GPU cores, macOS 25.5.0 arm64
+
+name: Apple M4
+api: metal
+arch_name: 4-metal4
+compute_capability: 4
+multiprocessor_count: 10
+warp_size: unavailable
+max_threads_per_block: 1024
+max_threads_per_multiprocessor: unavailable
+max_blocks_per_multiprocessor: unavailable
+max_shared_memory_per_block: 32768
+max_registers_per_block: unavailable
+max_grid_dim_x: 2147483647
+max_grid_dim_y: 2147483647
+clock_rate_khz: unavailable
+```
+
+Correctness and determinism suites pass. Phase timings run and print; no
+recorded sweep across the four default shapes exists yet, and no profiler
+trace, which is why the status table says `partial` and `not run`.
+
+Notes worth carrying into the CUDA and HIP runs:
+
+- Metal answers five of the eleven attributes and refuses six, including
+  `WARP_SIZE`. The tiling policy's fallbacks are load bearing here, not
+  decorative.
+- Metal reports `max_grid_dim_y` as the full 2^31 - 1, so CUDA's 65535 cap is
+  genuinely the binding one and the clamp exists solely for CUDA. Confirm
+  what each of the other backends reports.
+- At 255 bins the shared reservation is 3072 bytes against 3060 used, so the
+  reserve-by-`MAX_BINS` gap is invisible at the default bin count. It only
+  opens up at smaller `max_bin`, which is where to look for it.
+
 ### Failures and unsupported capabilities
 
 Record these even when everything else passes. A backend that answers no
@@ -273,10 +316,15 @@ capability query still works, and knowing which queries it refuses is how
 
 Known already, from reading rather than running:
 
-- **Metal refuses several device attributes.** `WARP_SIZE` among them.
-  `gpu_tiling.mojo` falls back to portable constants when a query raises, and
-  `bench_gpu_validation.mojo` prints `unavailable` rather than failing. Every
-  backend should be run through the report to find its own refusals.
+- **Metal refuses six of the eleven device attributes.** Measured, not
+  assumed: `WARP_SIZE`, `MAX_THREADS_PER_MULTIPROCESSOR`,
+  `MAX_BLOCKS_PER_MULTIPROCESSOR`, `MAX_REGISTERS_PER_BLOCK`, and
+  `CLOCK_RATE` all raise, and `SHARED_MEMORY_PER_MULTIPROCESSOR` is not a
+  member of `DeviceAttribute` at all. `gpu_tiling.mojo` falls back to
+  portable constants when a query raises, and `bench_gpu_validation.mojo`
+  prints `unavailable` rather than failing. Run every backend through the
+  report to find its own refusals; the fallbacks are only correct as long as
+  we know which ones fire.
 - **No Float64 on device.** Gradients and hessians are carried as Float32
   because Apple GPUs have no Float64. NVIDIA and AMD both have it, so this is
   a portability floor, not a hardware limit, and it is the reason CPU and GPU

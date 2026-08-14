@@ -200,6 +200,49 @@ struct BinMapper(Copyable, Movable):
                 return True
         return False
 
+    def matches(self, other: BinMapper) -> Bool:
+        """Whether two mappers bin every value the same way.
+
+        Equality of the fitted binning, not of the objects: same features,
+        same edges, same missing reservations, same category tables. It is
+        what lets a fitted model take more trees from a dataset that was
+        binned separately (see boosting.train_more) without any chance of a
+        bin index meaning two different things.
+        """
+        if self.n_features != other.n_features:
+            return False
+        if self.n_bins != other.n_bins:
+            return False
+        if len(self.edges) != len(other.edges):
+            return False
+        if len(self.edge_offsets) != len(other.edge_offsets):
+            return False
+        for i in range(len(self.edges)):
+            if self.edges[i] != other.edges[i]:
+                return False
+        for i in range(len(self.edge_offsets)):
+            if self.edge_offsets[i] != other.edge_offsets[i]:
+                return False
+        if len(self.missing_bin) != len(other.missing_bin):
+            return False
+        for i in range(len(self.missing_bin)):
+            if self.missing_bin[i] != other.missing_bin[i]:
+                return False
+        for f in range(self.n_features):
+            if self.cats.is_cat(f) != other.cats.is_cat(f):
+                return False
+        if len(self.cats.codes) != len(other.cats.codes):
+            return False
+        for i in range(len(self.cats.codes)):
+            if self.cats.codes[i] != other.cats.codes[i]:
+                return False
+        if len(self.cats.offsets) != len(other.cats.offsets):
+            return False
+        for i in range(len(self.cats.offsets)):
+            if self.cats.offsets[i] != other.cats.offsets[i]:
+                return False
+        return True
+
     def bin_value(self, feature: Int, v: Float64) -> Int:
         if self.cats.is_cat(feature):
             return self.cats.bin_of(feature, v)

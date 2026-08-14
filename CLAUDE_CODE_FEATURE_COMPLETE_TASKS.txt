@@ -296,6 +296,8 @@ would fail if a large sparse matrix were densified, dense/sparse equivalence
 tests, malformed-index tests, and representative LightGBM comparisons.
 
 
+WE ARE UP TO TASK 9... TASK 10 IS NOT IN YET
+
 TASK 10: MODERN TABLE AND SEQUENCE INPUTS
 =========================================
 
@@ -353,6 +355,8 @@ functions, multiple metrics, and ranker evaluation groups. Use finite-
 difference objective tests and trusted-reference metric tests. Explicitly
 list lower-priority unsupported objectives rather than shipping placeholders.
 
+
+task 11 is in progress not 12
 
 TASK 12: REMAINING TREE CONSTRAINTS AND TRAINING PARAMETERS
 ==========================================================

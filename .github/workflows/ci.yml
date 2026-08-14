@@ -45,6 +45,16 @@ jobs:
       - name: Estimator tests
         run: pixi run -e pytest test-estimators
 
+  # The LightGBM parity contract. Standard library only and no build, so it
+  # runs on a bare runner in seconds and fails when a supported row, a cited
+  # file, or a named public symbol disappears.
+  parity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parity contract
+        run: python3 tools/check_parity.py
+
   # Manual benchmark profiles (workflow_dispatch) on x86-64 and ARM64.
   # lscpu flags show whether the x86 runner has avx2/avx512f, which is the
   # input for any future width-specific fast path.

@@ -778,16 +778,24 @@ def fit_ranker(
     sample_weight: List[Float64] = [],
     bagging: BaggingParams = BaggingParams.disabled(),
     use_missing: Bool = True,
+    categorical_features: List[Int] = [],
 ) raises -> Model:
     """Fit a ranker on a column-major raw feature matrix
     (`features[f * n_rows + r]`) with LightGBM's `group` array of per-query
     row counts. The returned `Model` predicts raw ranking scores and
     serializes through `save_model` / `load_model` like any single-output
     model; query boundaries are a property of the training data, not of the
-    fitted model."""
+    fitted model. `use_missing` and `categorical_features` carry the same
+    meaning as in `model.fit`: a listed feature is split by category set
+    rather than by threshold (see categorical.mojo)."""
     var groups = groups_from_counts(group_counts)
     var mapper = fit_bins(
-        features, n_rows, n_features, max_bins, use_missing=use_missing
+        features,
+        n_rows,
+        n_features,
+        max_bins,
+        use_missing=use_missing,
+        categorical_features=categorical_features,
     )
     var data = mapper.transform(features, n_rows)
     var booster = train_ranker(

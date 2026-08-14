@@ -43,6 +43,107 @@ the sampled rows to compensate. `goss_seed` makes the sample reproducible,
 `int(1 / learning_rate)` full-data rounds, and GOSS cannot be combined with
 row bagging.
 
+## scikit-learn conventions
+
+`get_params`, `set_params`, `fit`, `predict`, `predict_proba`, and `score`
+are there, and a fitted estimator carries `n_features_in_`,
+`feature_names_in_`, `classes_`, `feature_importances_`,
+`best_iteration_`, and `device_`. `clone`, `Pipeline`, `GridSearchCV`, and
+`cross_val_score` work, and estimators pickle. scikit-learn itself is
+optional: nothing imports it except the `__sklearn_tags__` hook it calls.
+
+```python
+from sklearn.model_selection import GridSearchCV
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+
+pipe = Pipeline([("scale", StandardScaler()), ("gbdt", MojoBoostRegressor())])
+search = GridSearchCV(pipe, {"gbdt__num_leaves": [15, 31]}, cv=3).fit(X, y)
+```
+
+Class labels may be of any single comparable type; they are sorted onto
+`classes_` and `predict` returns them. `X` may contain `NaN`, the
+missing-value marker, but not infinities, and `y` and `sample_weight` must
+be finite, which is how LightGBM's own scikit-learn wrapper validates.
+Pickling keeps the whole estimator; `save()`/`load()` keeps the model
+alone, without the class labels, hyperparameters, feature names, or split
+gains.
+
+## Categorical features
+
+`categorical_feature` names the columns whose integer codes are unordered
+categories. It takes column indices, column names, a mix of the two, `None`
+for no categorical feature, or LightGBM's default `"auto"`: every pandas
+`category` column of `X`, and nothing else.
+
+```python
+model = MojoBoostRegressor(categorical_feature=["city"]).fit(df, y)
+model.categorical_feature_          # [0]
+```
+
+Those columns are split by category set rather than by threshold, with no
+one-hot expansion. A pandas `category` column is encoded by its labels and
+the table is kept on the fitted estimator, so the same label reaches the
+same category whatever a later frame numbers it; leaving such a column out
+of an explicit `categorical_feature` raises rather than feeding its codes to
+the numerical scan. Elsewhere the codes are whole numbers below 2**31, and a
+negative code or `NaN` means missing: missing, unseen, and dropped
+categories all route right. Pickling keeps the label tables;
+`save()`/`load()` keeps the category tables but not the labels, so a loaded
+model takes codes. `max_cat_to_onehot`, `max_cat_threshold`, `cat_smooth`,
+`cat_l2`, and `min_data_per_group` are LightGBM's categorical
+hyperparameters, with LightGBM's defaults.
+
+## Prediction options
+
+`predict` and `predict_proba` take LightGBM's prediction keywords:
+
+```python
+model.predict(X, raw_score=True)              # before the inverse link
+model.predict(X, num_iteration=10)            # the first 10 iterations
+model.predict(X, start_iteration=10)          # everything after them
+model.predict(X, pred_leaf=True)              # leaf ordinals, one per tree
+model.predict(X, pred_contrib=True)           # exact TreeSHAP contributions
+model.predict(X, validate_features=True)      # names must match, not warn
+```
+
+`pred_contrib` returns one column per feature plus an expected-value
+column, shape `(n_samples, n_features + 1)`, or
+`(n_samples, n_classes * (n_features + 1))` in class-major blocks for the
+multiclass classifier. Each row (each class block, for multiclass) sums to
+that row's raw score exactly: these are TreeSHAP Shapley values, not a
+split-gain heuristic. `raw_score` cannot be combined with it, since
+contributions always explain the raw score.
+
+`raw_score` is a no-op for the regressor and the ranker, which have no
+inverse link; the binary classifier returns log-odds of shape
+`(n_samples,)` and the multiclass classifier pre-softmax scores of shape
+`(n_samples, n_classes)`, both as LightGBM does.
+
+The iteration bounds clamp as LightGBM's do: a negative start becomes 0, a
+start past the end selects nothing, and `num_iteration=None` or a value
+<= 0 means every iteration from the start on. `None` therefore predicts
+with `best_iteration_` iterations, which after early stopping is every tree
+the model kept. The base score belongs to iteration 0, so `[0, k)` and
+`[k, n)` sum to the whole raw score, and `num_iteration=k` reproduces a
+`k`-round fit.
+
+`pred_leaf` returns integers, `(n_samples, num_iteration)` for the
+single-output estimators and `(n_samples, num_iteration * n_classes)` for
+the multiclass classifier, whose column `i * n_classes + k` is class k's
+tree in iteration i. Leaves are numbered per tree in node order, in
+`[0, num_leaves)`, stably across `save`/`load` and pickling; the numbering
+is mojoboost's own, not LightGBM's leaf id.
+
+`raw_score=True` and `pred_leaf=True` together raise rather than letting one
+win silently.
+
+`check_estimator`'s full suite has not been run, so this is scikit-learn
+style rather than a compliance claim. Known deviations: shared
+hyperparameters are forwarded through `**kwargs`, so `inspect.signature`
+does not list them (`get_params()` does), and `best_iteration_` is always
+set, where LightGBM sets it only when early stopping ran.
+
 ## Device selection
 
 ```python

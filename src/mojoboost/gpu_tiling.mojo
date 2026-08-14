@@ -255,7 +255,10 @@ def derive_tiling(
     var forced_rows = _env_int("MOJOBOOST_GPU_ROW_TILE", 0)
     if forced_rows > 0:
         n_tiles = _ceil_div(n_rows, forced_rows)
-    if n_tiles > tiles_by_memory:
+    # The atomic path allocates no partial buffer, so the memory bound is
+    # not its bound. Under AUTO the clamp still applies, because AUTO may
+    # resolve to the tiled path below.
+    if strategy != STRATEGY_ATOMIC and n_tiles > tiles_by_memory:
         n_tiles = tiles_by_memory
     if n_tiles > MAX_GRID_DIM_Y:
         n_tiles = MAX_GRID_DIM_Y

@@ -1,0 +1,201 @@
+MOJOBOOST FAST DEVELOPMENT INSTRUCTIONS FOR CLAUDE CODE
+=======================================================
+
+Copy this preamble into EVERY Claude Code task.
+
+Work in the `mojoboost` repository. Focus on implementing the requested code.
+Inspect `git status` first and preserve unrelated or concurrent work.
+
+CRITICAL RESOURCE RULES
+-----------------------
+
+NEVER run the full test suite during ordinary development.
+
+Specifically, DO NOT run any of these unless the user explicitly asks for a
+release validation or full-suite run in that message:
+
+- `pixi run test`
+- `pixi run test-gpu`
+- every file in `tests/`
+- `pytest python/tests`
+- `pixi run -e pytest test-estimators`
+- wheel builds or wheel smoke tests
+- all benchmarks
+- the complete GPU validation matrix
+- multiple Mojo tests concurrently
+- repeated clean builds
+- retry loops of any kind around tests or builds
+- polling loops that wait for files or the repository to "settle"
+
+NEVER wrap `pixi run test`, `mojo run`, Python tests, builds, or benchmarks in
+`for`, `while`, retry, watch, polling, or sleep loops. Run one focused command
+once. If it fails, read the failure, change the code, and then rerun only the
+failed focused test. A failing full suite must never be automatically launched
+again, especially not 25 times.
+
+Do not launch background test loops. Do not leave Mojo compiler processes
+running after the task. Do not run tests concurrently with another Claude
+session. This machine has 10 CPU cores and 16 GB RAM; overlapping Mojo builds
+cause extreme swapping and make coding slower.
+
+The full suite consists of many independent `mojo run` invocations that
+recompile shared imports. Running it after every small edit wastes substantial
+CPU and memory. Full validation is an integration/release operation, not an
+ordinary coding step.
+
+DEFAULT DEVELOPMENT LOOP
+------------------------
+
+1. Read only the files relevant to the requested change.
+2. Implement the change.
+3. Run `git diff --check`.
+4. Run ONE smallest relevant focused test file.
+5. If that test exposes a real cross-module issue, run at most ONE additional
+   directly related test file.
+6. Stop testing and report what was and was not run.
+
+Do not spend the majority of the task repeatedly testing unchanged modules.
+Do not rerun a passing test unless code affecting it changed afterward.
+
+FOCUSED MOJO TEST COMMANDS
+--------------------------
+
+Choose only the test matching the code changed:
+
+- Core boosting/tree behavior:
+  `mojo run -I src tests/test_mojoboost.mojo`
+- Objectives:
+  `mojo run -I src tests/test_objectives.mojo`
+- Custom objectives:
+  `mojo run -I src tests/test_custom_objective.mojo`
+- Metrics:
+  `mojo run -I src tests/test_metrics.mojo`
+- Custom metrics:
+  `mojo run -I src tests/test_custom_metrics.mojo`
+- Sample weights:
+  `mojo run -I src tests/test_weights.mojo`
+- Multiclass model behavior:
+  `mojo run -I src tests/test_multiclass_model.mojo`
+- Regularization:
+  `mojo run -I src tests/test_regularization.mojo`
+- Maximum depth:
+  `mojo run -I src tests/test_max_depth.mojo`
+- Bagging:
+  `mojo run -I src tests/test_bagging.mojo`
+- GOSS:
+  `mojo run -I src tests/test_goss.mojo`
+- Feature sampling:
+  `mojo run -I src tests/test_feature_sampling.mojo`
+- Missing values:
+  `mojo run -I src tests/test_missing.mojo`
+- Categorical features:
+  `mojo run -I src tests/test_categorical.mojo`
+- Interaction constraints:
+  `mojo run -I src tests/test_interaction.mojo`
+- Monotonic constraints:
+  `mojo run -I src tests/test_monotone.mojo`
+- Ranking:
+  `mojo run -I src tests/test_ranking.mojo`
+- Sparse histograms/data:
+  `mojo run -I src tests/test_histogram_reference.mojo`
+- Serialization/model format:
+  `mojo run -I src tests/test_serialize.mojo`
+- Distributed interface:
+  `mojo run -I src tests/test_distributed.mojo`
+- Device selection:
+  `mojo run -I src tests/test_device.mojo`
+- CPU/GPU equivalence:
+  `mojo run -I src tests/test_backend_equivalence.mojo`
+- GPU training only:
+  `mojo run -I src tests/test_gpu_training.mojo`
+- GPU objectives only:
+  `mojo run -I src tests/test_gpu_objectives.mojo`
+- GPU strategy only:
+  `mojo run -I src tests/test_gpu_strategies.mojo`
+- GPU tiling only:
+  `mojo run -I src tests/test_gpu_tiling.mojo`
+- GPU portability contracts only:
+  `mojo run -I src tests/test_gpu_portability.mojo`
+
+Do not run GPU tests for changes confined to Python validation, documentation,
+CPU-only code, packaging metadata, or unrelated algorithms.
+
+FOCUSED PYTHON TEST COMMANDS
+----------------------------
+
+Build the Python extension only if the binding or native ABI changed, or if
+the existing extension is absent/stale:
+
+`pixi run build-python`
+
+Then choose ONE relevant file:
+
+- Parameter aliases and cloning:
+  `pixi run -e pytest pytest -q python/tests/test_params.py`
+- Input validation:
+  `pixi run -e pytest pytest -q python/tests/test_validation.py`
+- Prediction behavior:
+  `pixi run -e pytest pytest -q python/tests/test_predict.py`
+- Fitted attributes:
+  `pixi run -e pytest pytest -q python/tests/test_attributes.py`
+- Pickling:
+  `pixi run -e pytest pytest -q python/tests/test_pickle.py`
+- sklearn integration:
+  `pixi run -e pytest pytest -q python/tests/test_sklearn_integration.py`
+- NumPy-optional behavior:
+  `pixi run -e pytest pytest -q python/tests/test_no_numpy.py`
+- Broad binding smoke test only when the binding ABI changed:
+  `pixi run -e pytest python python/test_python_api.py`
+
+When adding behavior, add its tests to the narrowest existing file. Run only
+that file, or preferably the specific new test using:
+
+`pixi run -e pytest pytest -q path/to/test_file.py::test_name`
+
+TEST BUDGET
+-----------
+
+For a normal coding task, testing should stay within this budget:
+
+- One focused test command by default.
+- Two focused test commands maximum without a concrete failure requiring the
+  second one.
+- No command that intentionally exercises the whole project.
+- No benchmark unless the task is specifically about performance.
+- No wheel build unless the task is specifically about packaging.
+
+If a focused test takes more than five minutes or spawns accumulating compiler
+processes, stop it, report the command and symptoms, and continue reviewing the
+code statically. Do not respond by launching more tests.
+
+WHEN FULL VALIDATION IS ALLOWED
+-------------------------------
+
+Only run a full validation pass when the user explicitly requests one of:
+
+- full suite
+- release validation
+- pre-release gate
+- final integration validation
+
+An instruction such as "implement this", "finish this feature", "check your
+work", or "make it pass" does NOT authorize the full suite. Use focused tests.
+
+Even during explicit full validation, run only one suite process at a time and
+first check that no other `mojo`, `pixi`, or Claude-driven test run is active.
+Do not start another full run when one is already running.
+
+REQUIRED FINAL REPORT
+---------------------
+
+At the end of every task, report concisely:
+
+- What code was implemented.
+- The exact one or two focused tests run and their results.
+- That `git diff --check` passed or the reason it did not.
+- Which broader suites were intentionally not run under this policy.
+- Any specific integration risk that should wait for the next explicitly
+  requested full-validation pass.
+
+Do not apologize for not running the full suite. Not running it is the default
+and correct development workflow for this repository.

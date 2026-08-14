@@ -22,6 +22,15 @@ from mojoboost import (
 )
 from mojoboost import BinMapper, Model, MulticlassBooster
 from mojoboost import train_multiclass, train_with_valid
+from mojoboost import (
+    IterationRange,
+    MulticlassModel,
+    fit_multiclass,
+    load_model,
+    save_model,
+)
+
+from std.math import exp
 
 
 def make_toy() raises -> BinnedMatrix:
@@ -337,6 +346,309 @@ def test_early_stopping_prevents_overfit_to_noise() raises:
         early_stopping_rounds=3,
     )
     assert_equal(len(model.trees), 0)
+
+
+# -- iteration-ranged and leaf-index prediction ---------------------------
+
+comptime _LEAF_TMP_PATH = "./.test_leaf_indices.tmp"
+
+
+def _sliceable_model() raises -> Model:
+    """A step-function regression fitted with enough iterations that there
+    is something to slice."""
+    var features: List[Float64] = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
+    var target: List[Float64] = [0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]
+    var params = BoosterParams(20, 0.1, small_tree_params())
+    return fit(features, 8, 1, target, SQUARED_ERROR, params, max_bins=8)
+
+
+def _sliceable_multiclass() raises -> MulticlassModel:
+    var features: List[Float64] = [
+        0.0, 1.0, 2.0, 10.0, 11.0, 12.0, 20.0, 21.0, 22.0,
+    ]
+    var labels: List[Int] = [0, 0, 0, 1, 1, 1, 2, 2, 2]
+    var params = BoosterParams(12, 0.2, small_tree_params())
+    return fit_multiclass(features, 9, 1, labels, 3, params, max_bins=16)
+
+
+def test_iteration_range_clamps_like_lightgbm() raises:
+    # slice() takes an explicit half-open pair.
+    var r = IterationRange.slice(10, -3, 4)
+    assert_equal(r.start, 0)
+    assert_equal(r.stop, 4)
+    r = IterationRange.slice(10, 8, 99)
+    assert_equal(r.start, 8)
+    assert_equal(r.stop, 10)
+    # A start past the last iteration is an empty range at the end, not an
+    # error, so slicing a shorter ensemble than expected still predicts.
+    r = IterationRange.slice(10, 12, 14)
+    assert_equal(r.start, 10)
+    assert_equal(r.stop, 10)
+    assert_true(r.is_empty())
+    # A stop at or below the start is empty rather than negative-length.
+    r = IterationRange.slice(10, 6, 2)
+    assert_equal(r.start, 6)
+    assert_equal(r.stop, 6)
+    assert_true(r.is_empty())
+
+    # clamp() takes LightGBM's (start_iteration, num_iteration) pair, where
+    # a nonpositive count means every remaining iteration.
+    assert_equal(IterationRange.clamp(10, 0, 3).stop, 3)
+    r = IterationRange.clamp(10, 2, 0)
+    assert_equal(r.start, 2)
+    assert_equal(r.stop, 10)
+    assert_equal(IterationRange.clamp(10, 2, -1).stop, 10)
+    r = IterationRange.clamp(10, -5, 4)
+    assert_equal(r.start, 0)
+    assert_equal(r.stop, 4)
+    assert_equal(IterationRange.clamp(10, 4, 100).stop, 10)
+
+    # The base score sits in iteration 0, so only a range starting there
+    # carries it.
+    assert_true(IterationRange.slice(10, 0, 0).includes_base())
+    assert_false(IterationRange.slice(10, 1, 3).includes_base())
+    assert_equal(IterationRange.slice(10, 2, 7).n_iterations(), 5)
+
+
+def test_iteration_slice_matches_a_manual_tree_sum() raises:
+    # The defining property: slicing [0, k) is the base score plus the first
+    # k shrunken tree outputs, summed by hand.
+    var model = _sliceable_model()
+    var n = model.n_iterations()
+    assert_true(n >= 4)
+    var row: List[Float64] = [6.3]
+    var bins = model.mapper.bin_row(row)
+    for k in range(n + 1):
+        var manual = model.booster.base_score
+        for i in range(k):
+            manual += (
+                model.booster.learning_rate
+                * model.booster.trees[i].predict_bins(bins)
+            )
+        var sliced = model.predict_raw_range(row, IterationRange.slice(n, 0, k))
+        assert_true(abs(sliced - manual) < 1e-12)
+
+
+def test_iteration_slices_partition_the_raw_score() raises:
+    # [0, k) and [k, n) sum to the whole raw score for every k >= 1: the
+    # base score belongs to the head, which is the only range starting at 0.
+    var model = _sliceable_model()
+    var n = model.n_iterations()
+    var row: List[Float64] = [2.5]
+    var whole = model.predict_raw(row)
+    for k in range(1, n + 1):
+        var head = model.predict_raw_range(row, IterationRange.slice(n, 0, k))
+        var tail = model.predict_raw_range(row, IterationRange.slice(n, k, n))
+        assert_true(abs(head + tail - whole) < 1e-9)
+
+
+def test_full_range_reproduces_plain_prediction() raises:
+    var model = _sliceable_model()
+    var n = model.n_iterations()
+    var full = IterationRange.slice(n, 0, n)
+    for r in range(8):
+        var row: List[Float64] = [Float64(r)]
+        assert_true(
+            abs(model.predict_raw_range(row, full) - model.predict_raw(row))
+            < 1e-12
+        )
+        assert_true(
+            abs(model.predict_range(row, full) - model.predict(row)) < 1e-12
+        )
+
+
+def test_empty_iteration_ranges_predict_the_base_score() raises:
+    var model = _sliceable_model()
+    var n = model.n_iterations()
+    var row: List[Float64] = [6.3]
+    # [0, 0) selects no trees but does start at iteration 0, so it is the
+    # base-score-only model: what a zero-iteration ensemble predicts.
+    var head = model.predict_raw_range(row, IterationRange.slice(n, 0, 0))
+    assert_true(abs(head - model.booster.base_score) < 1e-12)
+    # An empty range that starts later carries no base score at all.
+    var tail = model.predict_raw_range(row, IterationRange.slice(n, n, n))
+    assert_true(abs(tail) < 1e-12)
+    # Either way it names no trees, so it produces no leaf indices.
+    assert_equal(len(model.leaf_indices(row, IterationRange.slice(n, 0, 0))), 0)
+    assert_equal(len(model.leaf_indices(row, IterationRange.slice(n, n, n))), 0)
+
+
+def test_range_response_scale_transforms_the_raw_score() raises:
+    # A binary model's response scale is the logistic of its raw score at
+    # every slice, not only for the whole ensemble.
+    var features: List[Float64] = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
+    var target: List[Float64] = [0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]
+    var params = BoosterParams(15, 0.3, small_tree_params())
+    var model = fit(
+        features, 8, 1, target, BINARY_LOGISTIC, params, max_bins=8
+    )
+    var n = model.n_iterations()
+    var row: List[Float64] = [5.5]
+    for k in range(n + 1):
+        var rng = IterationRange.slice(n, 0, k)
+        var raw = model.predict_raw_range(row, rng)
+        var response = model.predict_range(row, rng)
+        assert_true(abs(response - 1.0 / (1.0 + exp(-raw))) < 1e-12)
+        # A probability, at every truncation.
+        assert_true(response > 0.0 and response < 1.0)
+
+
+def test_leaf_ordinals_are_dense_and_number_only_leaves() raises:
+    var model = _sliceable_model()
+    for i in range(model.n_iterations()):
+        ref tree = model.booster.trees[i]
+        var table = tree.leaf_ordinals()
+        assert_equal(len(table), len(tree.feature))
+        var seen = 0
+        for node in range(len(table)):
+            if tree.feature[node] < 0:
+                assert_equal(table[node], seen)
+                seen += 1
+            else:
+                assert_equal(table[node], -1)
+        # Every leaf got an ordinal, and the ordinals fill [0, n_leaves).
+        assert_equal(seen, tree.n_leaves)
+
+
+def test_leaf_indices_agree_with_the_ordinal_table() raises:
+    # The per-row walk and the precomputed table are two implementations of
+    # the same numbering; the binding uses the table, so they must agree.
+    var model = _sliceable_model()
+    var n = model.n_iterations()
+    var full = IterationRange.slice(n, 0, n)
+    var tables = model.booster.leaf_ordinals_range(full)
+    for r in range(8):
+        var row: List[Float64] = [Float64(r)]
+        var bins = model.mapper.bin_row(row)
+        var idx = model.leaf_indices(row, full)
+        assert_equal(len(idx), n)
+        for i in range(n):
+            ref tree = model.booster.trees[i]
+            var node = tree.leaf_index_bins(bins)
+            assert_true(tree.feature[node] < 0)
+            assert_equal(idx[i], tables[i][node])
+            assert_true(idx[i] >= 0)
+            assert_true(idx[i] < tree.n_leaves)
+
+
+def test_leaf_index_identifies_the_predicting_leaf() raises:
+    # An ordinal names the leaf whose value the tree contributes, so two
+    # rows share an ordinal only when they share that tree's output.
+    var model = _sliceable_model()
+    var n = model.n_iterations()
+    var full = IterationRange.slice(n, 0, n)
+    var indices = List[List[Int]]()
+    var outputs = List[List[Float64]]()
+    for r in range(8):
+        var row: List[Float64] = [Float64(r)]
+        var bins = model.mapper.bin_row(row)
+        indices.append(model.leaf_indices(row, full))
+        var per_tree = List[Float64](capacity=n)
+        for i in range(n):
+            per_tree.append(model.booster.trees[i].predict_bins(bins))
+        outputs.append(per_tree^)
+    var distinct_somewhere = False
+    for a in range(8):
+        for b in range(8):
+            for i in range(n):
+                if indices[a][i] == indices[b][i]:
+                    assert_true(abs(outputs[a][i] - outputs[b][i]) < 1e-15)
+                else:
+                    distinct_somewhere = True
+    # The model is not a single-leaf ensemble, so the check has teeth.
+    assert_true(distinct_somewhere)
+
+
+def test_leaf_indices_follow_the_iteration_range() raises:
+    var model = _sliceable_model()
+    var n = model.n_iterations()
+    var row: List[Float64] = [3.7]
+    var full = model.leaf_indices(row, IterationRange.slice(n, 0, n))
+    var tail = model.leaf_indices(row, IterationRange.slice(n, 2, n))
+    assert_equal(len(tail), n - 2)
+    for i in range(len(tail)):
+        assert_equal(tail[i], full[i + 2])
+
+
+def test_multiclass_range_matches_a_manual_per_class_sum() raises:
+    var model = _sliceable_multiclass()
+    var n = model.n_iterations()
+    assert_true(n >= 4)
+    var row: List[Float64] = [11.0]
+    var bins = model.mapper.bin_row(row)
+    for k in range(n + 1):
+        var rng = IterationRange.slice(n, 0, k)
+        var raw = model.predict_raw_range(row, rng)
+        assert_equal(len(raw), 3)
+        for c in range(3):
+            var manual = model.booster.base_scores[c]
+            for i in range(k):
+                manual += (
+                    model.booster.learning_rate
+                    * model.booster.trees[i * 3 + c].predict_bins(bins)
+                )
+            assert_true(abs(raw[c] - manual) < 1e-9)
+        # The softmax is taken over the sliced scores, so the truncated
+        # ensemble still returns a distribution.
+        var proba = model.predict_proba_range(row, rng)
+        assert_equal(len(proba), 3)
+        var total = 0.0
+        for c in range(3):
+            assert_true(proba[c] >= 0.0)
+            total += proba[c]
+        assert_true(abs(total - 1.0) < 1e-9)
+
+
+def test_multiclass_leaf_indices_are_round_major() raises:
+    # One tree per class per iteration, laid out so entry i * n_classes + k
+    # is class k's tree in the range's iteration i.
+    var model = _sliceable_multiclass()
+    var n = model.n_iterations()
+    var full = IterationRange.slice(n, 0, n)
+    for r in range(3):
+        var row: List[Float64] = [Float64(r) * 10.0 + 1.0]
+        var bins = model.mapper.bin_row(row)
+        var idx = model.leaf_indices(row, full)
+        assert_equal(len(idx), n * 3)
+        for i in range(n):
+            for k in range(3):
+                ref tree = model.booster.trees[i * 3 + k]
+                assert_equal(idx[i * 3 + k], tree.leaf_ordinal_bins(bins))
+    # A sliced range drops whole iterations, three columns at a time.
+    var probe: List[Float64] = [1.0]
+    var sliced = model.leaf_indices(probe, IterationRange.slice(n, 1, n))
+    assert_equal(len(sliced), (n - 1) * 3)
+    assert_equal(
+        len(model.leaf_indices(probe, IterationRange.slice(n, n, n))), 0
+    )
+
+
+def test_leaf_indices_and_slices_survive_serialization() raises:
+    # Leaf ordinals are derived from node order, and the model format writes
+    # nodes in array order, so a reloaded model must number leaves the same
+    # way and slice to the same scores.
+    var model = _sliceable_model()
+    save_model(model, _LEAF_TMP_PATH)
+    var loaded = load_model(_LEAF_TMP_PATH)
+    var n = model.n_iterations()
+    assert_equal(loaded.n_iterations(), n)
+    var full = IterationRange.slice(n, 0, n)
+    for r in range(8):
+        var row: List[Float64] = [Float64(r) + 0.5]
+        var before = model.leaf_indices(row, full)
+        var after = loaded.leaf_indices(row, full)
+        assert_equal(len(before), len(after))
+        for i in range(len(before)):
+            assert_equal(before[i], after[i])
+        for k in range(n + 1):
+            var rng = IterationRange.slice(n, 0, k)
+            assert_true(
+                abs(
+                    model.predict_raw_range(row, rng)
+                    - loaded.predict_raw_range(row, rng)
+                )
+                < 1e-12
+            )
 
 
 def main() raises:

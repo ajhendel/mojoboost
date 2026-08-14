@@ -219,11 +219,22 @@ the property that matters operationally, and it holds for any data.
 histogram adds row contributions one at a time in row order. The distributed
 one adds them in the same order but regroups them at shard boundaries, and
 floating point addition is not associative, so the two can differ in the last
-bits. When the sums are exactly representable, which covers small integers and
-dyadic rationals, regrouping changes nothing and the distributed model is
-bit-identical to the single-node model at every world size. On general data
-the two agree to within accumulated rounding, and the test suite asserts
-bit-identity on exact data and a tolerance on random data.
+bits. Where the sums are exactly representable, which covers small integers
+and dyadic rationals, regrouping changes nothing and the two are bit-identical
+at every world size.
+
+Two consequences worth stating separately. A single tree grown from given
+gradients is bit-identical at every world size whenever those gradients sum
+exactly, which is a property the caller controls. Multi-round training is not,
+because leaf values are divisions: round one is exact if the targets and the
+base score are, but from round two the gradients are arbitrary doubles and the
+regrouping becomes visible again. Distributed training therefore agrees with
+single-node training to within accumulated rounding, and the test suite asserts
+bit-identity where it is guaranteed and a tolerance where it is not, rather
+than asserting a tolerance everywhere and calling it equivalence.
+
+World size 1 is bit-identical unconditionally, on any data, because a
+one-shard reduction adds a histogram to zero and changes nothing.
 
 This is the same trade LightGBM makes, and the same one the GPU backend makes
 for a different reason. It is worth stating plainly rather than quietly
@@ -340,6 +351,25 @@ sample is drawn over global row indices, so a shard-local bag has to be a
 deterministic projection of the global draw. Both are rejected rather than
 approximated.
 
+**Depth caps, monotone constraints, categorical features, and missing bins.**
+All four are single-node grower features that landed while this prototype was
+being written. None of them needs new communication: a depth cap and the
+monotone output bounds are structural and identical on every rank, and
+categorical and missing-value handling are per-node split searches over an
+already-reduced histogram. They are refused here only because reimplementing
+them in a second growth loop would mean matching four moving targets at once.
+Interaction constraints, which are the same shape of problem, are supported,
+because the allow mask is a pure function of the branch and the existing
+public helpers compute it.
+
+**Everything added to `TreeParams` after this was written.** The rejection
+list is enumerated, not derived, which is the honest weakness of running a
+second growth loop. A parameter added later will not be in the list, so it
+will be ignored instead of refused until someone adds it. The world-size-1
+equivalence test catches a change in default behavior but not the arrival of
+a new opt-in parameter. That is the strongest guarantee a separate loop can
+give, and it is the argument for the refactor in section 11.
+
 **Early stopping and multiclass.** Early stopping needs the validation loss
 reduced across ranks each round, which is one more collective and no new
 ideas. Multiclass grows one tree per class per round, which is the same
@@ -362,33 +392,44 @@ default `pixi run test` suite, since everything is in-process and CPU only.
 
 Equivalence, which is the whole point:
 
-- world size 1 reproduces `grow_tree` exactly, node for node
-- shard counts 1, 2, 3, 4, and 5 all produce the same tree on exactly
-  representable data, including a world size that does not divide the row
-  count evenly
-- `train_distributed` reproduces `train` exactly on exact data for squared
-  error, binary logistic, poisson, and huber
+- world size 1 reproduces `grow_tree` node for node, bit for bit, on random
+  gradients and hessians
+- world sizes 1, 2, 3, 4, 5, 7, and 16 all produce the same tree on exactly
+  representable gradients, including one that does not divide the row count
+  evenly and one with more ranks than rows
+- `train_distributed` at world size 1 reproduces `train` tree for tree for
+  squared error and binary logistic
+- at larger world sizes it agrees with `train` to 1e-9 on every prediction,
+  for squared error, weighted squared error, poisson, and huber. Past round
+  one the gradients are arbitrary doubles, so this is a tolerance rather
+  than bit-identity, which is exactly the section 6 claim
 - a model trained distributed round-trips through `save_model` and
   `load_model` unchanged, since the model structure is the ordinary one
 
 Validation and determinism:
 
-- an empty shard changes nothing and does not deadlock
-- repeating a run gives a bit-identical model
-- a shard whose target length disagrees with its row count fails on every
-  rank with a message naming the lowest failing rank
-- shards that disagree about feature or bin count fail on every rank
-- quantile and L1 are rejected, and the message says why
-- bagging and feature subsampling parameters are rejected
+- empty shards change nothing and do not deadlock, forced by giving the world
+  more ranks than there are rows
+- repeating a run gives a bit-identical tree
+- gradients of the wrong length on ranks 1 and 2 fail on every rank, with the
+  lowest failing rank and the reason in the message
+- a simulated remote rank's failure stops the local ranks that were fine
+- ranks given different feature counts detect which value they disagree about
+- quantile and L1 are refused, and the message says why
+- feature subsampling, depth caps, and monotone constraints are refused
 - weights that are all zero within one shard are fine as long as some other
-  shard has positive weight, and all-zero weights everywhere are rejected
-- the all-reduce count is exactly one per tree node
+  shard carries positive weight, and all-zero weights everywhere are refused
+- the all-reduce count and the reduced element count are exactly the cost
+  model in section 8
 
-The tests that a new transport implementation has to pass are the collective
-conformance tests in the same file: the identity of a world-size-1 all-reduce,
-shape mismatches raising, and the status agreement protocol. A transport that
-passes those and satisfies section 5's five requirements can be substituted
-for `LocalCollective` without touching `distributed.mojo`.
+`_PeerCollective` in the test file is a second `Collective` implementation
+that folds in a simulated remote rank, since a process full of healthy local
+ranks can never reach the cross-rank failure branches on its own. It is also
+the shape of the conformance suite a new transport has to pass: the status
+agreement protocol, the configuration disagreement protocol, and the buffer
+reductions. A transport that passes those and satisfies section 5's five
+requirements can be substituted for `LocalCollective` without touching
+`distributed.mojo`.
 
 ## 11. Relationship to the single-node grower
 
@@ -428,5 +469,7 @@ should not be bundled into the prototype that motivates it.
   constructs a `Collective` and passes it. That is a prototype choice, not a
   proposed API.
 - LightGBM does not promise that distributed training equals single-node
-  training. This prototype does promise it on exactly representable data, and
-  tests it, because that is what makes the algorithm falsifiable at this stage.
+  training. This prototype promises it wherever the arithmetic is exact, and
+  tests it there, because a bit-exact claim is what makes the algorithm
+  falsifiable at this stage. Section 6 is precise about where the promise
+  stops.
