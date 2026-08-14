@@ -1,9 +1,37 @@
+# Distribution metadata for the `mojoboost` package on PyPI.
+#
+# Everything a release publishes about itself is declared here. setup.py
+# holds only the two facts PEP 621 cannot express (the wheel is not pure
+# Python, and the macOS platform tag comes from the Mojo compile step's
+# deployment target rather than from the building machine). Nothing is
+# stated in both files.
+#
+# Two rules govern edits to this file:
+#
+#   1. No claim without evidence. Every interpreter, platform, and
+#      optional dependency below is backed by something in the repository:
+#      packaging/matrix/platform_matrix.toml for what is installable where,
+#      docs/COMPATIBILITY_POLICY.md for what a release promises, and a
+#      guarded import in python/mojoboost/ for every extra.
+#   2. The release procedure that consumes this file is
+#      docs/PYPI_RELEASE.md. A change here that changes what gets
+#      published is a change there too.
+
 [build-system]
 requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
+# setuptools 77 is the floor because the PEP 639 `license` expression and
+# `license-files` below are only understood from that version. It is also
+# the floor pinned in pixi.toml's `pkg` feature, which is the environment
+# packaging/build_wheel.sh runs in.
 
 [project]
 name = "mojoboost"
+# Version lives in three places that must agree, per section 1.1 of
+# docs/COMPATIBILITY_POLICY.md: pixi.toml, this file, and
+# python/mojoboost/__init__.py. Release gate item B1 checks that they do.
+# Deliberately not made dynamic from `mojoboost.__version__`: that would
+# delete this row and contradict a policy this file does not own.
 version = "0.1.0"
 description = "Gradient boosted decision trees in Mojo, with a scikit-learn style Python API"
 readme = "README.md"
@@ -16,25 +44,126 @@ keywords = [
     "gbdt",
     "decision trees",
     "machine learning",
+    "lightgbm",
     "mojo",
+    "gpu",
 ]
+
+# `requires-python` is a floor, not a range, which is what section 6.1 of
+# docs/COMPATIBILITY_POLICY.md states and what this project keeps. It is
+# not the mechanism that stops a wrong install: the wheel carries a
+# `cp314-cp314` tag and no abi3 build exists, so pip refuses a mismatched
+# interpreter by tag before `requires-python` is consulted. A capped
+# `<3.15` would add nothing and would have to be edited on every release
+# the toolchain permits.
+
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
-    "Operating System :: MacOS",
+    "Intended Audience :: Developers",
+    # macOS on Apple silicon is the only platform with a distributable
+    # artifact. Linux is a tier 1 tested *source* install (CI runs the
+    # suite on ubuntu-latest and ubuntu-24.04-arm) but no manylinux wheel
+    # builder exists, so no Linux operating-system classifier is claimed
+    # here. See packaging/matrix/platform_matrix.toml, targets
+    # `linux-x86_64-cp314` and `linux-aarch64-cp314`, both `designed`.
+    "Operating System :: MacOS :: MacOS X",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3 :: Only",
+    # The extension is compiled by the Mojo toolchain against CPython and
+    # is not built against the limited API. No PyPy, no free-threaded
+    # build: max 26.5.0 depends on `python-gil`.
+    "Programming Language :: Python :: Implementation :: CPython",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
 ]
+# Not claimed, and why:
+#   License :: ...            PEP 639 forbids a license classifier
+#                             alongside the `license` expression above,
+#                             and setuptools>=77 rejects the combination.
+#   Typing :: Typed           there is no py.typed marker and no .pyi
+#                             stub in python/mojoboost/.
+#   Environment :: GPU ...    no NVIDIA or AMD device has ever run this
+#                             code. See docs/GPU_VALIDATION.md.
+#   Operating System ::
+#     Microsoft :: Windows    not a pixi.toml platform, never built.
+
+# Runtime dependencies: none, and that is a contract rather than an
+# oversight. Section 6.1 of docs/COMPATIBILITY_POLICY.md promises that
+# every documented path works with plain Python sequences and that numpy
+# is never required. packaging/test_wheel.sh enforces it by installing the
+# wheel into a venv with nothing else in it and running the suite there.
+dependencies = []
 
 [project.optional-dependencies]
+# Every extra corresponds to an import that python/mojoboost/ guards and
+# degrades from. None is required to import mojoboost or to fit a model.
 numpy = ["numpy"]
+# Categorical columns carried as labels, and inspection.py's frame output.
+pandas = ["pandas"]
+# Sparse input only. The wrapper duck-types the CSC/CSR interface and
+# imports nothing from scipy; scipy is what a caller uses to build the
+# matrix in the first place.
+scipy = ["scipy"]
+# The `__sklearn_tags__` hook in python/mojoboost/_sklearn.py, which only
+# scikit-learn itself ever calls. mojoboost is scikit-learn *style* and
+# does not claim scikit-learn compliance; see section 6.1 of
+# docs/COMPATIBILITY_POLICY.md.
+scikit-learn = ["scikit-learn"]
+# Spelled to match the ImportError that python/mojoboost/dask.py raises.
+# dask.dataframe is dask's own optional extra and the module treats it as
+# optional, so it is not pulled in here.
+dask = ["dask[distributed]"]
+# Self-referential so the union cannot drift out of step with the rows
+# above. pip has resolved this form since 21.2, which every interpreter
+# `requires-python` admits ships with.
+all = ["mojoboost[numpy,pandas,scipy,scikit-learn,dask]"]
 
 [project.urls]
 Homepage = "https://github.com/ajhendel/mojoboost"
-Source = "https://github.com/ajhendel/mojoboost"
+Repository = "https://github.com/ajhendel/mojoboost"
+Issues = "https://github.com/ajhendel/mojoboost/issues"
+# The docs are in the repository, not on a docs site, and this points at
+# them rather than at a host that does not exist. No Changelog entry:
+# there is no CHANGELOG file to point at yet.
+Documentation = "https://github.com/ajhendel/mojoboost/tree/main/docs"
 
 [tool.setuptools]
+# Listed explicitly rather than discovered. Discovery on this directory
+# would also find `tests`, and an explicit list makes a new subpackage a
+# deliberate edit instead of a silent addition to the wheel.
 packages = ["mojoboost"]
+# setuptools defaults this to true when the project is configured from
+# pyproject.toml, and it is turned off here on purpose. Left on, the
+# wheel's contents would be decided by the sdist file finders and by
+# MANIFEST.in, which exists in this directory for the opposite purpose
+# (keeping an accidental sdist harmless, including by excluding the
+# extension). Off, the wheel is exactly `packages` plus `package-data`
+# below and nothing else can drift into a published artifact.
+#
+# Turning this back on without also deleting MANIFEST.in would ship a
+# wheel with no `_mojoboost.so` in it.
+include-package-data = false
 
 [tool.setuptools.package-data]
-mojoboost = ["*.so", ".dylibs/*.dylib"]
+# The compiled extension and the MAX runtime libraries that
+# packaging/build_wheel.sh stages next to it and re-signs. Both are
+# gitignored build outputs, so this list describes a built tree, not a
+# checkout. A wheel missing either is broken at import and the
+# clean-venv install in packaging/test_wheel.sh is what catches it.
+#
+# Two layouts, because there are two builders.
+#
+#   .dylibs/    packaging/build_wheel.sh, macOS. delocate's convention.
+#   .libs/      packaging/linux/build_wheel_linux.sh, which stages the ELF
+#               closure there and sets RPATH to $ORIGIN/.libs.
+#
+# Both `.libs` patterns are required and neither is redundant: ELF sonames
+# carry version suffixes, and `*.so` does not match `libfoo.so.1`. A
+# pattern that misses a staged library does not fail here. setuptools
+# drops the file silently and the wheel fails at import on a user's
+# machine. This list is checked by `check_package_data` in
+# packaging/linux/check_metadata_ready.py against the exact names that
+# builder stages.
+mojoboost = ["*.so", ".dylibs/*.dylib", ".libs/*.so", ".libs/*.so.*"]

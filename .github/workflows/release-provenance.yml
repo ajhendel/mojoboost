@@ -1,0 +1,331 @@
+# Release provenance and publication.
+#
+# What this workflow is for: producing an artifact whose origin a stranger can
+# check without trusting the person who published it. It builds the wheel,
+# records its digest, generates an SBOM, attests both to GitHub, and only then
+# publishes through PyPI trusted publishing with no long lived credential
+# anywhere in the repository.
+#
+# The reasoning behind every choice here is docs/RELEASE_SECURITY.md. The parts
+# that are settings rather than files, and therefore cannot live in this file,
+# are listed in handoffs/release_10_security.md under "Owner actions".
+#
+# THIS WORKFLOW CANNOT RUN YET, ON PURPOSE, AND IT FAILS CLOSED IN THREE WAYS.
+#
+#   1. Every `uses:` below says `@REPLACE_WITH_SHA`. That is not a ref, so the
+#      job fails to start. Pinning by tag is not an acceptable interim state
+#      for a workflow that holds an OIDC identity, so the placeholder is left
+#      loud rather than made convenient. packaging/security/check_action_pins.py
+#      is the check that keeps it that way.
+#   2. The build job needs a `[self-hosted, macos, arm64, metal]` runner. None
+#      is registered. A GitHub hosted Apple silicon runner is not a substitute:
+#      it reports an accelerator at compile time and has no Metal toolchain, so
+#      a wheel built there is a different product under the same filename. See
+#      the header of .github/workflows/ci.yml and docs/PLATFORM_MATRIX.md.
+#   3. Publication needs the `pypi` environment and a PyPI pending publisher.
+#      Neither exists, and both are owner actions.
+#
+# Triggering. workflow_dispatch only. There is deliberately no `push`, no
+# `release`, no `pull_request`, and above all no `pull_request_target`. A fork
+# pull request must never reach a job that has `id-token: write`, a self hosted
+# runner, or an environment, and the only reliable way to guarantee that is to
+# have no event that a fork can cause. See docs/RELEASE_SECURITY.md section 7.
+
+name: Release provenance
+
+on:
+  workflow_dispatch:
+    inputs:
+      macos_target:
+        description: macOS deployment target for the extension (empty = SDK default)
+        required: false
+        default: ""
+      publish:
+        description: Where to publish. Build and attest only unless changed.
+        required: true
+        default: none
+        type: choice
+        options:
+          - none
+          - testpypi
+          - pypi
+
+# Deny by default. Every job below adds back exactly what it needs and nothing
+# else, so a step that starts wanting a token has to say so in a diff.
+permissions: {}
+
+# One release at a time. Two concurrent runs would race on the artifact names
+# and, worse, could publish two different wheels under one version.
+concurrency:
+  group: release-provenance
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Guard. Cheap, hosted, and first, so a pin regression fails the run before
+  #    a self hosted runner or an OIDC token is involved.
+  # ---------------------------------------------------------------------------
+  guard:
+    name: Pin and policy guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@REPLACE_WITH_SHA # actions/checkout v4
+        with:
+          persist-credentials: false
+
+      # Standard library only, builds nothing. It will fail on this file until
+      # the placeholders above are replaced with real commit SHAs, which is the
+      # intended behavior and not a bug to work around.
+      - name: Every action is pinned to a commit SHA
+        run: python3 packaging/security/check_action_pins.py .github/workflows/release-provenance.yml
+
+  # ---------------------------------------------------------------------------
+  # 2. Build. The only job that runs on a machine this project does not own the
+  #    image of, so it gets the least trust and the fewest permissions.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build wheel (macOS arm64, Metal)
+    needs: guard
+    runs-on: [self-hosted, macos, arm64, metal]
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    outputs:
+      wheel_name: ${{ steps.digest.outputs.wheel_name }}
+      wheel_sha256: ${{ steps.digest.outputs.wheel_sha256 }}
+    steps:
+      # persist-credentials: false matters more here than anywhere else in this
+      # file. A self hosted runner keeps its workspace between runs, and a
+      # credential left in .git/config there outlives the job that created it.
+      - uses: actions/checkout@REPLACE_WITH_SHA # actions/checkout v4
+        with:
+          persist-credentials: false
+
+      - uses: prefix-dev/setup-pixi@REPLACE_WITH_SHA # prefix-dev/setup-pixi v0.10.1
+        with:
+          cache: true
+          environments: default pkg
+
+      # A wheel built without the Metal toolchain answers has_accelerator()
+      # differently and is a different artifact under the same name. Fail here
+      # rather than publish it.
+      - name: Metal toolchain
+        run: |
+          xcodebuild -version
+          xcrun --find metal
+          xcrun metal --version
+
+      - name: Release matrix contract
+        run: python3 packaging/matrix/validate_matrix.py
+
+      - name: Build and test the wheel
+        env:
+          MOJOBOOST_MACOS_TARGET: ${{ inputs.macos_target }}
+        run: pixi run -e pkg test-wheel
+
+      # The provenance sidecar is written by packaging/build_wheel.sh, which is
+      # another lane's file and does not write it yet (handoffs/task18_platform.md,
+      # edit 4). Everything downstream of here reads it, so its absence is a
+      # hard stop rather than a field left empty.
+      - name: Provenance sidecar exists
+        run: |
+          WHEEL=$(ls python/dist/mojoboost-*.whl)
+          test -f "$WHEEL.provenance.json" || {
+            echo "missing $WHEEL.provenance.json"
+            echo "packaging/build_wheel.sh must write it; see handoffs/task18_platform.md edit 4"
+            exit 1
+          }
+
+      - name: Validate the artifact
+        run: python3 packaging/matrix/validate_artifact.py python/dist/*.whl
+
+      # Outside pixi on purpose. The fixture refuses to run with CONDA_PREFIX
+      # set, because a wheel tested next to the toolchain it must not need has
+      # not been shown to be self-contained.
+      - name: Clean install smoke test
+        run: |
+          env -u CONDA_PREFIX bash packaging/matrix/smoke/clean_install_macos.sh \
+            "$(ls python/dist/mojoboost-*.whl)" clean-install.txt
+
+      # The digest is computed here, on the machine that produced the file, and
+      # carried forward as a job output. Every later job checks what it
+      # downloaded against this string. Artifact upload and download are not a
+      # trust boundary this workflow relies on.
+      - name: Hash manifest
+        id: digest
+        run: |
+          WHEEL=$(ls python/dist/mojoboost-*.whl)
+          python3 packaging/security/hash_manifest.py write \
+            python/dist/SHA256SUMS "$WHEEL" "$WHEEL.provenance.json"
+          cat python/dist/SHA256SUMS
+          {
+            echo "wheel_name=$(basename "$WHEEL")"
+            echo "wheel_sha256=$(python3 packaging/security/hash_manifest.py digest "$WHEEL")"
+          } >> "$GITHUB_OUTPUT"
+
+      # Two artifacts, not one. The publish job uploads the contents of a
+      # directory to PyPI, so nothing that is not a distribution may share a
+      # directory with the wheel.
+      - uses: actions/upload-artifact@REPLACE_WITH_SHA # actions/upload-artifact v4
+        with:
+          name: wheel
+          path: python/dist/*.whl
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@REPLACE_WITH_SHA # actions/upload-artifact v4
+        if: always()
+        with:
+          name: release-metadata
+          path: |
+            python/dist/*.provenance.json
+            python/dist/SHA256SUMS
+            clean-install.txt
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # 3. Attest. Hosted runner, because this is where the OIDC identity is used
+  #    and a hosted image is the one whose contents GitHub, rather than this
+  #    project, is responsible for.
+  # ---------------------------------------------------------------------------
+  provenance:
+    name: SBOM and attestations
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      # Mint the OIDC token the attestation actions exchange for a signing
+      # certificate. No key material is stored anywhere in this repository.
+      id-token: write
+      # Write the attestations to this repository's attestation store.
+      attestations: write
+    steps:
+      - uses: actions/checkout@REPLACE_WITH_SHA # actions/checkout v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@REPLACE_WITH_SHA # actions/download-artifact v4
+        with:
+          name: wheel
+          path: dist
+
+      - uses: actions/download-artifact@REPLACE_WITH_SHA # actions/download-artifact v4
+        with:
+          name: release-metadata
+          path: meta
+
+      # The attestation is only worth as much as the identity of the bytes it
+      # covers. Check the downloaded file against the digest the build job
+      # computed before anything signs anything.
+      - name: Digest matches the build job
+        run: |
+          ACTUAL=$(python3 packaging/security/hash_manifest.py digest \
+            "dist/${{ needs.build.outputs.wheel_name }}")
+          echo "build job: ${{ needs.build.outputs.wheel_sha256 }}"
+          echo "here:      $ACTUAL"
+          test "$ACTUAL" = "${{ needs.build.outputs.wheel_sha256 }}"
+
+      # Syft, in CycloneDX JSON. upload-artifact and upload-release-assets are
+      # off because this job uploads what it wants explicitly, and
+      # dependency-snapshot is off because it writes to the dependency graph,
+      # which would need contents: write for a result nobody consumes.
+      - name: SBOM
+        uses: anchore/sbom-action@REPLACE_WITH_SHA # anchore/sbom-action, pin to a tag you have read
+        with:
+          file: dist/${{ needs.build.outputs.wheel_name }}
+          format: cyclonedx-json
+          output-file: sbom.cyclonedx.json
+          upload-artifact: false
+          upload-release-assets: false
+          dependency-snapshot: false
+
+      # A scanner sees the Python distribution. It does not see that four MAX
+      # runtime libraries are bundled inside it, or which Mojo built the
+      # extension, and an SBOM that omits the shipped native runtime is a
+      # compliance shaped object rather than a bill of materials. This merges
+      # the build's own record in and hashes each bundled library out of the
+      # wheel itself.
+      - name: Supplement the SBOM with the bundled MAX runtime
+        run: |
+          python3 packaging/security/sbom_supplement.py \
+            sbom.cyclonedx.json \
+            "meta/${{ needs.build.outputs.wheel_name }}.provenance.json" \
+            "dist/${{ needs.build.outputs.wheel_name }}" \
+            sbom.merged.cyclonedx.json
+
+      - name: Build provenance attestation
+        uses: actions/attest-build-provenance@REPLACE_WITH_SHA # actions/attest-build-provenance v3
+        with:
+          subject-path: dist/${{ needs.build.outputs.wheel_name }}
+
+      - name: SBOM attestation
+        uses: actions/attest-sbom@REPLACE_WITH_SHA # actions/attest-sbom v3
+        with:
+          subject-path: dist/${{ needs.build.outputs.wheel_name }}
+          sbom-path: sbom.merged.cyclonedx.json
+
+      - uses: actions/upload-artifact@REPLACE_WITH_SHA # actions/upload-artifact v4
+        if: always()
+        with:
+          name: sbom
+          path: |
+            sbom.cyclonedx.json
+            sbom.merged.cyclonedx.json
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # 4. Publish. Separated from the build so that the job holding the publishing
+  #    identity runs no code from this repository and no third party action
+  #    other than the publisher itself.
+  #
+  #    `environment` is what makes this a gate rather than a formality. Required
+  #    reviewers and a branch restriction are configured on the environment, not
+  #    here, and PyPI's pending publisher is scoped to this workflow filename
+  #    and this environment name.
+  # ---------------------------------------------------------------------------
+  publish:
+    name: Publish (${{ inputs.publish }})
+    needs: [build, provenance]
+    if: inputs.publish != 'none'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: ${{ inputs.publish }}
+      url: https://pypi.org/p/mojoboost
+    permissions:
+      # id-token only. No contents, because this job does not check the
+      # repository out. There is no PyPI API token in this workflow, in a
+      # secret, or in an environment variable, and adding one would defeat the
+      # only property this job has.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@REPLACE_WITH_SHA # actions/download-artifact v4
+        with:
+          name: wheel
+          path: dist
+
+      # Nothing but the wheel goes up. The artifact should already contain only
+      # that; this is the check that says so out loud.
+      - name: Only the wheel is in dist
+        run: |
+          ls -l dist
+          test "$(ls dist | wc -l)" -eq 1
+          test -f "dist/${{ needs.build.outputs.wheel_name }}"
+
+      - name: Publish to TestPyPI
+        if: inputs.publish == 'testpypi'
+        uses: pypa/gh-action-pypi-publish@REPLACE_WITH_SHA # pypa/gh-action-pypi-publish v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          packages-dir: dist
+          print-hash: true
+
+      - name: Publish to PyPI
+        if: inputs.publish == 'pypi'
+        uses: pypa/gh-action-pypi-publish@REPLACE_WITH_SHA # pypa/gh-action-pypi-publish v1
+        with:
+          packages-dir: dist
+          print-hash: true

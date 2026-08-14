@@ -1,0 +1,748 @@
+"""Which GPU histogram specialization to use, and when not to.
+
+`gpu_histogram_specializations.mojo` says what a specialized histogram path
+could be built out of. This module decides whether any of it applies to one
+device and one node, and its answer today, on every device, is **no**.
+
+That is the point of the module rather than a gap in it. Nothing in this
+repository has measured a specialized histogram kernel against the shipping
+one on any hardware, and a launch policy that is faster in principle is not a
+launch policy that is faster. So the specialization ladder below is
+default-off: with no explicit request and no environment override, a plan's
+launch geometry is `gpu_tiling.derive_tiling`'s, field for field, obtained by
+calling it rather than by reproducing it.
+
+The ladder
+----------
+Cumulative, each level a superset of the one below:
+
+- `SPEC_LEVEL_BASELINE` -- today's geometry, verbatim from `derive_tiling`.
+  The default.
+- `SPEC_LEVEL_SHAPE` -- geometry re-derived from reported device properties
+  and the node's own shape: threadgroup residency from the threadgroup memory
+  a block really occupies, threadgroup width bounded by the rows available,
+  row tiles amortized against the kernel's bin capacity, partial budget as a
+  fraction of reported device memory. No new kernel: every one of these is a
+  number handed to the launch that exists.
+- `SPEC_LEVEL_PACKED` -- additionally reads four bins per load over a
+  contiguous aligned run of row ids. Needs the packed kernel variant and a
+  device that has shown the wide load pays.
+- `SPEC_LEVEL_BATCHED` -- additionally covers several small leaves in one
+  launch. Needs the batched kernel variant.
+
+Fallback order, applied in this order and reported on the plan
+--------------------------------------------------------------
+1. A level above what `KernelFeatures` says is compiled in falls to the
+   highest level that is.
+2. `SPEC_LEVEL_PACKED` falls to `SPEC_LEVEL_SHAPE` when the device has not
+   reported that wide loads pay, when the node's rows are not a contiguous
+   run, when the column stride is not a multiple of the pack width, or when
+   the aligned body is too short to pay for the head and tail.
+3. `SPEC_LEVEL_SHAPE` falls to `SPEC_LEVEL_BASELINE` when the shape-derived
+   geometry cannot be built (a bin count outside the class ladder, a block
+   that does not fit threadgroup memory).
+4. `SPEC_LEVEL_BASELINE` is `derive_tiling`, which has its own fallback
+   already: the tiled strategy falls to the atomic one whenever the partial
+   buffer will not fit, and every device attribute the query refuses falls to
+   the portable constant.
+
+Every step down is recorded in `HistogramPlan.reason`, so a plan that did
+less than was asked says why rather than looking like the plan that was
+asked for.
+
+What this module will not decide
+--------------------------------
+It does not branch on a model string, a part number, or an Apple generation.
+`GpuProfile` carries a generation and `apple_gpu_policy.mojo` explains at
+length why nothing reads it; the same holds here, for the same reason. Every
+input below is either a reported device property or a property of the
+workload.
+
+It does not change accumulation. Fixed-point Int32 gradients and hessians,
+integer atomics into threadgroup memory, ascending-order reduction: none of
+that is a launch decision and none of it is touched. Every specialization
+here is a decision about how many threadgroups run, how wide they are, which
+rows each one reads, and how many bins its threadgroup allocation holds. The
+integers that come out are the same integers, which is the property that
+makes the whole ladder testable against the baseline by bit comparison.
+
+It does not choose between the CPU and the GPU. That is `device.mojo` and
+`apple_gpu_policy.CrossoverInputs`, and it stays there.
+
+Environment
+-----------
+`MOJOBOOST_GPU_HIST_SPECIALIZATION`, following the `MOJOBOOST_` contract in
+`parallel.mojo`: `off` or `baseline` (the default, and the value of anything
+unrecognized), `shape`, `packed`, `batched`. The existing
+`MOJOBOOST_GPU_ROW_TILE` and `MOJOBOOST_GPU_BLOCK_THREADS` overrides are
+honored at every level, so a benchmark can pin a geometry across the ladder
+and compare only the specialization.
+"""
+
+from std.os import getenv
+
+from .apple_gpu_policy import (
+    MAX_RESIDENT_BLOCKS_PER_CORE,
+    GpuProfile,
+    derive_block_threads,
+    partial_budget_bytes,
+)
+from .gpu_histogram_specializations import (
+    MAX_BATCH_LEAVES,
+    MIN_BATCH_LEAVES,
+    WINDOW_NOT_A_RUN,
+    WINDOW_OK,
+    DeviceHistogramCapabilities,
+    KernelFeatures,
+    LeafBatch,
+    PackedLoadWindow,
+    bin_capacity_for,
+    kernel_shared_bytes,
+    plan_leaf_batches,
+    plan_packed_window,
+    unspecialized_kernel_shared_bytes,
+)
+from .gpu_tiling import (
+    BYTES_PER_PARTIAL_CELL,
+    MAX_GRID_DIM_Y,
+    MIN_ROWS_PER_TILE_BIN_FACTOR,
+    MIN_ROWS_PER_TILE_THREAD_FACTOR,
+    PARTIAL_BUDGET_BYTES,
+    STRATEGY_ATOMIC,
+    STRATEGY_AUTO,
+    STRATEGY_TILED,
+    WARP_GRANULARITY,
+    DeviceCaps,
+    HistogramTiling,
+    derive_tiling,
+    strategy_name,
+)
+from .parallel import _env_int
+
+
+comptime SPEC_LEVEL_UNSET = -1
+comptime SPEC_LEVEL_BASELINE = 0
+comptime SPEC_LEVEL_SHAPE = 1
+comptime SPEC_LEVEL_PACKED = 2
+comptime SPEC_LEVEL_BATCHED = 3
+
+# Why a plan stopped where it did.
+comptime REASON_AS_REQUESTED = 0
+comptime REASON_NOT_REQUESTED = 1
+comptime REASON_KERNEL_ABSENT = 2
+comptime REASON_DEVICE_UNPROVEN = 3
+comptime REASON_ROWS_NOT_A_RUN = 4
+comptime REASON_WINDOW_UNUSABLE = 5
+comptime REASON_SHARED_MEMORY = 6
+comptime REASON_SINGLE_LEAF_FILLS_DEVICE = 7
+comptime REASON_PARTIAL_BUDGET = 8
+
+
+def level_name(level: Int) -> String:
+    if level == SPEC_LEVEL_BASELINE:
+        return String("baseline")
+    if level == SPEC_LEVEL_SHAPE:
+        return String("shape")
+    if level == SPEC_LEVEL_PACKED:
+        return String("packed")
+    if level == SPEC_LEVEL_BATCHED:
+        return String("batched")
+    return String("unset")
+
+
+def reason_name(reason: Int) -> String:
+    if reason == REASON_AS_REQUESTED:
+        return String("as_requested")
+    if reason == REASON_NOT_REQUESTED:
+        return String("not_requested")
+    if reason == REASON_KERNEL_ABSENT:
+        return String("kernel_variant_not_compiled")
+    if reason == REASON_DEVICE_UNPROVEN:
+        return String("device_capability_unproven")
+    if reason == REASON_ROWS_NOT_A_RUN:
+        return String("rows_not_a_contiguous_run")
+    if reason == REASON_WINDOW_UNUSABLE:
+        return String("packed_window_unusable")
+    if reason == REASON_SHARED_MEMORY:
+        return String("threadgroup_memory_too_small")
+    if reason == REASON_SINGLE_LEAF_FILLS_DEVICE:
+        return String("single_leaf_already_fills_device")
+    if reason == REASON_PARTIAL_BUDGET:
+        return String("partial_buffer_budget")
+    return String("unknown")
+
+
+def env_specialization_level() -> Int:
+    """`MOJOBOOST_GPU_HIST_SPECIALIZATION` as a level constant.
+
+    Unset, empty, and unrecognized all mean `SPEC_LEVEL_BASELINE`. There is
+    no `auto`: a level that turned itself on when it liked the shape would be
+    exactly the unmeasured default this module exists to refuse.
+    """
+    var s = getenv("MOJOBOOST_GPU_HIST_SPECIALIZATION")
+    if s == "shape":
+        return SPEC_LEVEL_SHAPE
+    if s == "packed":
+        return SPEC_LEVEL_PACKED
+    if s == "batched":
+        return SPEC_LEVEL_BATCHED
+    return SPEC_LEVEL_BASELINE
+
+
+def _ceil_div(a: Int, b: Int) -> Int:
+    return (a + b - 1) // b
+
+
+@fieldwise_init
+struct HistogramWorkload(Copyable, Movable):
+    """The shape one histogram is being planned for."""
+
+    var dataset_rows: Int
+    """Rows in the binned matrix, which is also the column stride: the bin of
+    row `r` of feature `f` is at `f * dataset_rows + r`."""
+
+    var node_rows: Int
+    """Rows this node owns. Zero is allowed and plans at one row, matching
+    `GpuActiveRows.range_tiling`, so an empty node still gets a launchable
+    geometry."""
+
+    var n_slots: Int
+    """Active features, which is `grid.x`. The full feature count unless
+    feature subsampling narrowed it."""
+
+    var n_bins: Int
+
+    var first_row: Int
+    """Row id at the start of the node's run. Meaningful only when the run
+    flag below is true."""
+
+    var rows_are_contiguous_run: Bool
+    """The caller's assertion that this node's slice of the active-row
+    permutation holds `first_row` through `first_row + node_rows - 1` in
+    ascending order.
+
+    It is a property of the permutation, so it cannot be derived from a
+    shape and is never inferred here. False costs only the packed path; a
+    wrongly-true answer would make the kernel read the wrong rows, which is
+    why the caller has to state it and why `node()` below defaults it off.
+    """
+
+    @staticmethod
+    def node(
+        dataset_rows: Int, node_rows: Int, n_slots: Int, n_bins: Int
+    ) -> HistogramWorkload:
+        """A node whose rows are not known to be a contiguous run, which is
+        every node until the caller proves otherwise."""
+        return HistogramWorkload(
+            dataset_rows, node_rows, n_slots, n_bins, 0, False
+        )
+
+
+@fieldwise_init
+struct HistogramPlan(Copyable, Movable):
+    """A resolved histogram launch for one device and one node."""
+
+    var level_requested: Int
+    var level_applied: Int
+    var reason: Int
+    """`REASON_AS_REQUESTED` when the applied level is the requested one, and
+    otherwise why the plan stopped lower."""
+
+    var strategy: Int
+    var block_threads: Int
+    var n_tiles: Int
+    var rows_per_tile: Int
+
+    var rows_per_thread: Int
+    """`ceil(rows_per_tile / block_threads)`: rows one lane accumulates per
+    tile. Reported rather than chosen. It is bounded below by
+    `MIN_ROWS_PER_TILE_THREAD_FACTOR` whenever the row bound is what set the
+    tile count, and falls below that only on a node with too few rows to feed
+    one threadgroup, where nothing can raise it."""
+
+    var bin_capacity: Int
+    """The class the bin count falls in (16, 32, 64, 128, or 256)."""
+
+    var shared_bytes_per_block: Int
+    """Threadgroup memory one block of the kernel that will actually run
+    occupies. The specialized kernels occupy `kernel_shared_bytes(capacity)`;
+    the shipping ones occupy the `MAX_BINS` width at every bin count, and
+    this reports whichever is true of the build in hand."""
+
+    var resident_blocks_per_core: Int
+    var partial_cell_limit: Int
+    var partial_cells: Int
+
+    var packed_loads: Bool
+    var packed_window: PackedLoadWindow
+
+    var baseline: HistogramTiling
+    """What `derive_tiling` would launch for this node, whatever level was
+    applied. Carried so a caller can compare, a benchmark can report both,
+    and a specialization that misbehaves can be dropped for it at the call
+    site without re-deriving anything."""
+
+    def matches_baseline(self) -> Bool:
+        """Whether this plan's launch geometry is the shipping one. True at
+        `SPEC_LEVEL_BASELINE` by construction, and possibly true above it,
+        since a shape-derived geometry may land on the same numbers."""
+        return (
+            self.strategy == self.baseline.strategy
+            and self.block_threads == self.baseline.block_threads
+            and self.n_tiles == self.baseline.n_tiles
+            and self.rows_per_tile == self.baseline.rows_per_tile
+        )
+
+
+def caps_from_profile(profile: GpuProfile) -> DeviceCaps:
+    """The three attributes `gpu_tiling.mojo` plans from, taken off a
+    profile. Both layers sanitize their inputs the same way, so this is a
+    projection and not a conversion."""
+    return DeviceCaps(
+        profile.core_count,
+        profile.max_threads_per_block,
+        profile.max_shared_memory_per_block,
+    )
+
+
+def kernel_block_bytes(features: KernelFeatures, capacity: Int) -> Int:
+    """Threadgroup memory one block occupies in the build in hand.
+
+    The distinction the bin-capacity specialization is about: without the
+    specialized kernels a block occupies the full `MAX_BINS` width whatever
+    `n_bins` is, so planning residency from `n_bins * 12` overstates how many
+    blocks fit. With them, the narrower footprint is real.
+    """
+    if features.specialized_bin_kernels:
+        return kernel_shared_bytes(capacity)
+    return unspecialized_kernel_shared_bytes()
+
+
+def resident_blocks_per_core(
+    profile: GpuProfile, features: KernelFeatures, capacity: Int
+) raises -> Int:
+    """Threadgroups the policy expects resident on one core: how many really
+    fit in the advertised threadgroup memory, capped at
+    `MAX_RESIDENT_BLOCKS_PER_CORE` and floored at one.
+
+    Same rule as `apple_gpu_policy.resident_blocks_per_core`, against the
+    footprint the compiled kernel has instead of the modeled one.
+    """
+    var per_block = kernel_block_bytes(features, capacity)
+    if per_block < 1:
+        raise Error("a histogram block occupies a positive number of bytes")
+    var fits = profile.max_shared_memory_per_block // per_block
+    if fits > MAX_RESIDENT_BLOCKS_PER_CORE:
+        fits = MAX_RESIDENT_BLOCKS_PER_CORE
+    if fits < 1:
+        fits = 1
+    return fits
+
+
+def baseline_partial_cell_limit(max_partial_cells: Int) -> Int:
+    """Partial-histogram cells `derive_tiling` plans against: the flat
+    portable ceiling, or an already-allocated buffer when the caller has
+    one."""
+    if max_partial_cells > 0:
+        return max_partial_cells
+    return PARTIAL_BUDGET_BYTES // BYTES_PER_PARTIAL_CELL
+
+
+def shape_partial_cell_limit(
+    profile: GpuProfile, max_partial_cells: Int
+) -> Int:
+    """Partial-histogram cells `SPEC_LEVEL_SHAPE` plans against: the reported
+    device budget's fraction, tightened to an already-allocated buffer when
+    there is one.
+
+    `derive_tiling` treats a supplied capacity as replacing its budget; here
+    it narrows it, so a plan can never exceed either bound. The two agree
+    whenever the allocated buffer was itself sized under the budget, which is
+    how it comes to exist. With no reported device memory, which is every
+    device today, `partial_budget_bytes` returns the same portable ceiling
+    `derive_tiling` uses, so the two limits are equal.
+    """
+    var cells = partial_budget_bytes(profile) // BYTES_PER_PARTIAL_CELL
+    if max_partial_cells > 0 and max_partial_cells < cells:
+        cells = max_partial_cells
+    if cells < 1:
+        cells = 1
+    return cells
+
+
+def _shape_block_threads(profile: GpuProfile, node_rows: Int) -> Int:
+    """Threads per threadgroup at `SPEC_LEVEL_SHAPE`: the environment
+    override when set, and otherwise the row-bounded Apple rule, which is a
+    warp multiple, at least one warp, and never above the device maximum."""
+    var requested = _env_int("MOJOBOOST_GPU_BLOCK_THREADS", 0)
+    if requested < 1:
+        return derive_block_threads(profile, node_rows)
+    var threads = requested
+    if threads > profile.max_threads_per_block:
+        threads = profile.max_threads_per_block
+    threads = (threads // WARP_GRANULARITY) * WARP_GRANULARITY
+    if threads < WARP_GRANULARITY:
+        threads = WARP_GRANULARITY
+    return threads
+
+
+def derive_histogram_plan(
+    profile: GpuProfile,
+    device: DeviceHistogramCapabilities,
+    features: KernelFeatures,
+    work: HistogramWorkload,
+    requested_strategy: Int = STRATEGY_AUTO,
+    requested_level: Int = SPEC_LEVEL_UNSET,
+    max_partial_cells: Int = 0,
+) raises -> HistogramPlan:
+    """Resolve one node's histogram launch.
+
+    Pure host arithmetic: no device is opened, nothing is allocated, and
+    nothing is enqueued, so the whole ladder is exercisable on a machine with
+    no accelerator.
+
+    `requested_level` of `SPEC_LEVEL_UNSET` consults
+    `MOJOBOOST_GPU_HIST_SPECIALIZATION` and then defaults to
+    `SPEC_LEVEL_BASELINE`. An explicit level is a ceiling, not a floor: the
+    plan may come back lower, with `reason` saying which check failed.
+
+    `max_partial_cells` is an already-allocated partial buffer, as in
+    `derive_tiling`. It tightens the memory bound here rather than replacing
+    it, so a plan can never ask for more tiles than either the buffer holds
+    or the device budget allows.
+
+    Raises on a shape that cannot be planned at all, matching `derive_tiling`
+    and `derive_policy`: a nonpositive feature count or bin count, a bin
+    count past `MAX_BINS`, or a device whose threadgroup memory cannot hold
+    one histogram.
+    """
+    if work.n_slots < 1:
+        raise Error("histogram plan needs at least one active feature")
+    if work.dataset_rows < 1:
+        raise Error("histogram plan needs a positive dataset row count")
+    if work.node_rows < 0:
+        raise Error("a node cannot own a negative number of rows")
+
+    # An empty node still needs a launchable geometry, and gets the one a
+    # single row would produce. Matching `GpuActiveRows.range_tiling` exactly
+    # keeps the plan comparable to the launch it is planning for.
+    var rows = work.node_rows
+    if rows < 1:
+        rows = 1
+
+    var caps = caps_from_profile(profile)
+    var baseline = derive_tiling(
+        caps,
+        rows,
+        work.n_slots,
+        work.n_bins,
+        requested_strategy,
+        max_partial_cells,
+    )
+
+    var level = requested_level
+    if level == SPEC_LEVEL_UNSET:
+        level = env_specialization_level()
+    if level < SPEC_LEVEL_BASELINE:
+        level = SPEC_LEVEL_BASELINE
+    if level > SPEC_LEVEL_BATCHED:
+        level = SPEC_LEVEL_BATCHED
+
+    var capacity = bin_capacity_for(work.n_bins)
+    var applied = SPEC_LEVEL_BASELINE
+    var reason = REASON_NOT_REQUESTED
+    if level == SPEC_LEVEL_BASELINE:
+        reason = REASON_AS_REQUESTED
+
+    # --- Level 1: geometry from reported properties and the node's shape ---
+
+    if level >= SPEC_LEVEL_SHAPE:
+        if (
+            kernel_block_bytes(features, capacity)
+            > profile.max_shared_memory_per_block
+        ):
+            reason = REASON_SHARED_MEMORY
+        else:
+            applied = SPEC_LEVEL_SHAPE
+            reason = REASON_AS_REQUESTED
+
+    # Baseline geometry until a level above it replaces it. The residency
+    # figure reported here is the fixed target `derive_tiling` assumes rather
+    # than a derived one, because that is what produced this geometry.
+    var block_threads = baseline.block_threads
+    var n_tiles = baseline.n_tiles
+    var rows_per_tile = baseline.rows_per_tile
+    var strategy = baseline.strategy
+    var partial_cells = baseline.partial_cells
+    var resident = MAX_RESIDENT_BLOCKS_PER_CORE
+    var block_bytes = unspecialized_kernel_shared_bytes()
+    var partial_cell_limit = baseline_partial_cell_limit(max_partial_cells)
+
+    if applied >= SPEC_LEVEL_SHAPE:
+        partial_cell_limit = shape_partial_cell_limit(
+            profile, max_partial_cells
+        )
+        block_threads = _shape_block_threads(profile, rows)
+        resident = resident_blocks_per_core(profile, features, capacity)
+        block_bytes = kernel_block_bytes(features, capacity)
+
+        # Enough threadgroups to fill the device. The active features are
+        # already spread across grid.x, so only what is left needs tiles.
+        var tiles_by_occupancy = _ceil_div(
+            profile.core_count * resident, work.n_slots
+        )
+        if tiles_by_occupancy < 1:
+            tiles_by_occupancy = 1
+
+        # Enough rows per tile to pay for zeroing and flushing the block's
+        # partial histogram. That cost is set by the kernel's bin capacity,
+        # not by the bin count, which is the same substitution the shared
+        # footprint above makes.
+        var min_rows_per_tile = MIN_ROWS_PER_TILE_BIN_FACTOR * capacity
+        var by_threads = MIN_ROWS_PER_TILE_THREAD_FACTOR * block_threads
+        if by_threads > min_rows_per_tile:
+            min_rows_per_tile = by_threads
+        var tiles_by_rows = _ceil_div(rows, min_rows_per_tile)
+        if tiles_by_rows < 1:
+            tiles_by_rows = 1
+
+        var wanted = tiles_by_occupancy
+        if tiles_by_rows < wanted:
+            wanted = tiles_by_rows
+
+        var hist_cells = work.n_slots * work.n_bins
+        var tiles_by_memory = partial_cell_limit // hist_cells
+        if tiles_by_memory < 1:
+            tiles_by_memory = 1
+        if tiles_by_memory > MAX_GRID_DIM_Y:
+            tiles_by_memory = MAX_GRID_DIM_Y
+
+        n_tiles = wanted
+        var forced_rows = _env_int("MOJOBOOST_GPU_ROW_TILE", 0)
+        if forced_rows > 0:
+            n_tiles = _ceil_div(rows, forced_rows)
+        strategy = requested_strategy
+        # The atomic path allocates no partial buffer, so the memory bound is
+        # not its bound; under AUTO it still applies, because AUTO may
+        # resolve to the tiled path below.
+        if strategy != STRATEGY_ATOMIC and n_tiles > tiles_by_memory:
+            n_tiles = tiles_by_memory
+        if n_tiles > MAX_GRID_DIM_Y:
+            n_tiles = MAX_GRID_DIM_Y
+        if n_tiles < 1:
+            n_tiles = 1
+
+        rows_per_tile = _ceil_div(rows, n_tiles)
+        n_tiles = _ceil_div(rows, rows_per_tile)
+
+        if strategy == STRATEGY_AUTO:
+            # The same rule `gpu_tiling.mojo` ships, deliberately unchanged:
+            # reduce when there is more than one partial to reduce, use
+            # atomics when there is not. No measurement on any device
+            # supports diverging from it, on Apple silicon least of all,
+            # where none has been taken.
+            if n_tiles > 1:
+                strategy = STRATEGY_TILED
+            else:
+                strategy = STRATEGY_ATOMIC
+
+        partial_cells = 0
+        if strategy == STRATEGY_TILED:
+            partial_cells = n_tiles * hist_cells
+
+    # --- Level 2: packed bin loads ---
+
+    # A node that is not a run needs no window arithmetic, and asking for it
+    # would validate a `first_row` the caller never claimed was meaningful.
+    var window = PackedLoadWindow(False, rows, 0, 0, WINDOW_NOT_A_RUN)
+    if work.rows_are_contiguous_run:
+        window = plan_packed_window(
+            work.dataset_rows, work.first_row, rows, True
+        )
+    var packed = False
+    if level >= SPEC_LEVEL_PACKED and applied >= SPEC_LEVEL_SHAPE:
+        if not features.packed_bin_loads:
+            reason = REASON_KERNEL_ABSENT
+        elif not device.wide_byte_loads:
+            reason = REASON_DEVICE_UNPROVEN
+        elif not work.rows_are_contiguous_run:
+            reason = REASON_ROWS_NOT_A_RUN
+        elif window.reason != WINDOW_OK:
+            reason = REASON_WINDOW_UNUSABLE
+        else:
+            packed = True
+            applied = SPEC_LEVEL_PACKED
+            reason = REASON_AS_REQUESTED
+
+    # --- Level 3: batched small leaves ---
+
+    # Batching is a decision across leaves, so a single-node plan can only
+    # record that the kernel exists. `plan_batched_leaves` below takes the
+    # frontier and returns the launches.
+    if level >= SPEC_LEVEL_BATCHED and applied >= SPEC_LEVEL_SHAPE:
+        if not features.batched_leaf_kernel:
+            reason = REASON_KERNEL_ABSENT
+        else:
+            applied = SPEC_LEVEL_BATCHED
+            reason = REASON_AS_REQUESTED
+
+    return HistogramPlan(
+        level,
+        applied,
+        reason,
+        strategy,
+        block_threads,
+        n_tiles,
+        rows_per_tile,
+        _ceil_div(rows_per_tile, block_threads),
+        capacity,
+        block_bytes,
+        resident,
+        partial_cell_limit,
+        partial_cells,
+        packed,
+        window,
+        baseline,
+    )
+
+
+def max_batch_leaves(
+    plan: HistogramPlan, device: DeviceHistogramCapabilities
+) -> Int:
+    """Leaves one batched launch may cover.
+
+    Three bounds. The portable batch ceiling, the device's third grid
+    dimension, and, on the tiled strategy, what the partial buffer holds: a
+    batched tiled launch needs one partial histogram per (leaf, tile), so the
+    budget that bounded `n_tiles` now has to cover `n_leaves * n_tiles` of
+    them. The atomic strategy allocates no partial buffer and so has only the
+    first two bounds.
+    """
+    var bound = MAX_BATCH_LEAVES
+    if device.max_grid_dim_z < bound:
+        bound = device.max_grid_dim_z
+    if plan.strategy == STRATEGY_TILED and plan.partial_cells > 0:
+        var by_memory = plan.partial_cell_limit // plan.partial_cells
+        if by_memory < bound:
+            bound = by_memory
+    if bound < 1:
+        bound = 1
+    return bound
+
+
+def batching_declined_reason(
+    plan: HistogramPlan,
+    profile: GpuProfile,
+    device: DeviceHistogramCapabilities,
+    features: KernelFeatures,
+    row_counts: List[Int],
+    n_slots: Int,
+) raises -> Int:
+    """Why a frontier will not be batched, or `REASON_AS_REQUESTED` when it
+    will."""
+    if plan.level_requested < SPEC_LEVEL_BATCHED:
+        return REASON_NOT_REQUESTED
+    if not features.batched_leaf_kernel:
+        return REASON_KERNEL_ABSENT
+    if device.max_grid_dim_z < MIN_BATCH_LEAVES:
+        return REASON_DEVICE_UNPROVEN
+    if max_batch_leaves(plan, device) < MIN_BATCH_LEAVES:
+        return REASON_PARTIAL_BUDGET
+    if len(row_counts) < MIN_BATCH_LEAVES:
+        return REASON_SINGLE_LEAF_FILLS_DEVICE
+    if n_slots < 1:
+        raise Error("batching needs at least one active feature")
+
+    var target = profile.core_count * plan.resident_blocks_per_core
+    for i in range(len(row_counts)):
+        var rows = row_counts[i]
+        if rows < 1:
+            rows = 1
+        var tiles = _ceil_div(rows, plan.rows_per_tile)
+        if n_slots * tiles < target:
+            return REASON_AS_REQUESTED
+    return REASON_SINGLE_LEAF_FILLS_DEVICE
+
+
+def plan_batched_leaves(
+    plan: HistogramPlan,
+    profile: GpuProfile,
+    device: DeviceHistogramCapabilities,
+    features: KernelFeatures,
+    row_counts: List[Int],
+    n_slots: Int,
+) raises -> List[LeafBatch]:
+    """Group a frontier of leaves into batched launches, or return an empty
+    list when the frontier will not be batched.
+
+    An empty list is the instruction to launch exactly as today, one leaf at
+    a time; it is never an error. `batching_declined_reason` says which check
+    refused.
+
+    The grouping itself is `plan_leaf_batches`, which preserves order and
+    never merges leaves. Each leaf keeps its own output slice and its own
+    accumulation, so a batched frontier produces the same histograms the
+    unbatched one does, bit for bit.
+    """
+    var out = List[LeafBatch]()
+    if (
+        batching_declined_reason(
+            plan, profile, device, features, row_counts, n_slots
+        )
+        != REASON_AS_REQUESTED
+    ):
+        return out^
+    var target = profile.core_count * plan.resident_blocks_per_core
+    if target < 1:
+        target = 1
+    var batches = plan_leaf_batches(
+        row_counts,
+        n_slots,
+        plan.rows_per_tile,
+        target,
+        max_batch_leaves(plan, device),
+    )
+    return batches^
+
+
+def _yes_no(value: Bool) -> String:
+    if value:
+        return String("yes")
+    return String("no")
+
+
+def describe_plan(plan: HistogramPlan) -> String:
+    """One line for benchmark output and bug reports: what was asked for,
+    what was applied, why, and the geometry that resulted."""
+    return String(
+        "level=",
+        level_name(plan.level_applied),
+        "/",
+        level_name(plan.level_requested),
+        " why=",
+        reason_name(plan.reason),
+        " strategy=",
+        strategy_name(plan.strategy),
+        " threads=",
+        plan.block_threads,
+        " tiles=",
+        plan.n_tiles,
+        " rows_per_tile=",
+        plan.rows_per_tile,
+        " rows_per_thread=",
+        plan.rows_per_thread,
+        " bin_capacity=",
+        plan.bin_capacity,
+        " shared=",
+        plan.shared_bytes_per_block,
+        " resident=",
+        plan.resident_blocks_per_core,
+        " partial=",
+        plan.partial_cells,
+        "/",
+        plan.partial_cell_limit,
+        " packed=",
+        _yes_no(plan.packed_loads),
+        " baseline=",
+        _yes_no(plan.matches_baseline()),
+    )

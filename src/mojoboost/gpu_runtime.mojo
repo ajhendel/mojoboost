@@ -940,6 +940,74 @@ struct SessionLifecycle(Copyable, Movable):
 
 
 # ---------------------------------------------------------------------------
+# The seam the trainers announce their boundaries through
+# ---------------------------------------------------------------------------
+
+
+trait RoundLifecycle:
+    """The four boundaries a boosting loop crosses, as the trainers in
+    train_gpu.mojo announce them.
+
+    `GpuSession` implements it by moving its state machine and counting; the
+    no-op `NoLifecycle` implements it by counting only. A trainer is generic
+    over this trait so one loop body serves both, which is what keeps the
+    session an opt-in wrapper rather than a second trainer: the session-free
+    entry point passes `NoLifecycle` and executes exactly the sequence of
+    device calls it executed before this seam existed.
+
+    The contract is the state machine in `can_transition`: a round is opened
+    once and closed once, each tree inside it is opened and closed, and a
+    multiclass round opens one tree per class without an intervening round
+    boundary.
+    """
+
+    def begin_round(mut self) raises:
+        """One boosting round starts (one tree, or one tree per class)."""
+        ...
+
+    def begin_tree(mut self) raises:
+        """One tree starts growing."""
+        ...
+
+    def end_tree(mut self) raises:
+        """The tree that was growing is finished."""
+        ...
+
+    def end_round(mut self) raises:
+        """The round is finished, including its raw-score update."""
+        ...
+
+
+struct NoLifecycle(RoundLifecycle, Copyable, Movable):
+    """The escape hatch: a lifecycle that owns no device and asserts nothing.
+
+    This is what the session-free trainers pass, so a trainer generic over
+    `RoundLifecycle` costs them two integer increments per round and cannot
+    raise. It deliberately does not validate the transition order: a caller
+    that wants the state machine's checks takes a `GpuSession`.
+    """
+
+    var rounds: Int
+    var trees: Int
+
+    def __init__(out self):
+        self.rounds = 0
+        self.trees = 0
+
+    def begin_round(mut self) raises:
+        self.rounds += 1
+
+    def begin_tree(mut self) raises:
+        self.trees += 1
+
+    def end_tree(mut self) raises:
+        pass
+
+    def end_round(mut self) raises:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # The model of what the current pipeline enqueues
 # ---------------------------------------------------------------------------
 #
@@ -1095,16 +1163,18 @@ def audit_round(
 # ---------------------------------------------------------------------------
 
 
-struct GpuSession(Movable):
+struct GpuSession(RoundLifecycle, Movable):
     """One `DeviceContext` and everything that should outlive a single fit.
 
-    Nothing else in the tree constructs this yet: wiring it into the GPU
-    trainers is central integration, described in
-    `handoffs/apple_a5_runtime.md`. The intended shape is that an estimator
-    holds one session, `GpuHistogramBuilder` borrows the session's context
-    and buffers instead of opening its own, and every drain in the builder
-    goes through `sync_for_host_read` / `sync_for_host_write` here rather
-    than calling `ctx.synchronize()` directly.
+    `GpuHistogramBuilder` and `GpuPredictor` both take a session and borrow
+    its context instead of opening their own, and the trainers in
+    train_gpu.mojo take one through their session overloads, which is where
+    the round and tree boundaries below come from. What is still missing is
+    the owner: an estimator that holds the session across fits, so the pool
+    and residency ledgers can actually skip an upload rather than only
+    record that they could have. That, and routing the builder's drains
+    through `sync_for_host_read` / `sync_for_host_write` instead of
+    `ctx.synchronize()`, are described in `handoffs/apple_a5_runtime.md`.
 
     Teardown is explicit. `close()` drains the queue once, releases the
     pooled slots, clears residency, and moves the lifecycle to `closed`; it

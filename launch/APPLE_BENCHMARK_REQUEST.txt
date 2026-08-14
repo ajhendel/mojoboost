@@ -1,0 +1,80 @@
+DESTINATION: Modular Forum and Modular Discord community-project channels, and as a pinned GitHub issue on ajhendel/mojoboost titled the same way. Post only after the benchmark suite has completed one smoke run somewhere, so that the first person who volunteers is not the person who discovers the harness is broken.
+TITLE: Request: Apple Silicon benchmark and thermal runs on M1 through M5 Macs
+
+MojoBoost trains gradient-boosted trees on the GPU that is already in every Apple Silicon Mac. That is a design goal, not a measured result. Right now this repository has no quotable performance number on any Mac, and it says so in every document that touches the subject. I would like to fix that with real runs on real machines, and I need machines I do not own.
+
+What I am asking for is a run of a written protocol, not a screenshot of a number. The protocol is docs/APPLE_GPU_BENCHMARK_PROTOCOL.md for comparative timings and docs/APPLE_THERMAL_ENERGY.md for thermal, energy, and sustained behavior on laptops. Both are in the repository, both define what counts as a result, and both list what a result may and may not be called afterward. Please read the one you are running before you run it.
+
+WHAT WOULD HELP MOST
+
+A base chip of the newest generation you have. This is the machine most people actually own and the one where a small GPU has the least room to win.
+
+A Max or Ultra part of any generation. This is where the GPU path should look best, and where a failure to scale with GPU cores would be the most informative result of the whole exercise.
+
+An M1 of any kind. It is the oldest supported hardware and the floor for any sentence containing the words "every Apple Silicon Mac".
+
+A fanless MacBook Air alongside a MacBook Pro of the same generation. That pair is the single most interesting thermal contrast available, because the Air dissipates through its chassis and the Pro does not.
+
+WHAT TO RUN
+
+Start with the static checks, which take a second and need nothing installed beyond Python.
+
+    python bench/apple/suite.py --self-check
+    python bench/apple/suite.py --plan
+    bash bench/apple/thermal_capture.sh --self-check
+    bash bench/apple/thermal_capture.sh --list-phases
+
+Then, on an idle machine, from a clean checkout, the smoke scale first. It proves the harness works on your machine and is never quoted as a result.
+
+    caffeinate -dimsu python bench/apple/suite.py --run --scale smoke
+
+Then the real run, which takes hours rather than minutes and should be started when you can leave the machine alone.
+
+    caffeinate -dimsu python bench/apple/suite.py --run --scale full --repetitions 5 --cooldown 60 --note "M4 base, 24 GB, macOS 15.6"
+
+Energy is optional and needs root, because powermetrics does. A run without it is still a complete and useful contribution, and I would rather have twenty runs without energy than two with it.
+
+    sudo -E caffeinate -dimsu python bench/apple/suite.py --run --scale full --repetitions 5 --cooldown 60 --energy --idle-baseline-seconds 30
+
+THERMAL AND SUSTAINED RUNS ARE NOT AUTOMATED YET
+
+Be aware of this before you volunteer for it. bench/apple/thermal_capture.sh plans a thermal run and prints the exact commands one would use. It does not take a sample, and it refuses --execute, because the commands involved include sudo powermetrics and I am not shipping a script that runs that on someone else's laptop on the strength of a flag. The fit loops the thermal phases need do not exist yet either. If you want to help with the thermal side today, the most useful thing is to run the planner, read the plan, and tell me where it is wrong for your machine.
+
+WHAT I WILL DO WITH YOUR RESULTS
+
+Publish the record file next to any table drawn from it, so anyone can check the table against the record. Name the chip variant, the memory size, the OS build, the commit, and the conditions in the same place as the numbers. Credit you if you want to be credited and not if you do not. Publish results that make MojoBoost look bad on exactly the same terms as results that make it look good, because a benchmark you can only lose by not running is not a benchmark.
+
+WHAT I WILL NOT DO
+
+Present a number from one chip as representative of Apple Silicon. Compare your run against someone else's run on a different machine, a different OS version, or a different commit. Fill in a missing measurement with an estimate. Convert a machine-wide power figure into a claim about what MojoBoost consumed, which is a thing no public Apple tooling supports and which this repository prohibits in writing.
+
+PRIVACY, PLEASE READ THIS PART
+
+A benchmark record is a hardware report, and hardware reports on macOS carry identity. The harness deliberately does not collect the worst of it, but you are the last check before anything is published.
+
+The suite reads system_profiler SPDisplaysDataType for the GPU core count. It does not read SPHardwareDataType or SPSoftwareDataType, which carry your serial number, your hardware UUID, your computer name, and your user name. The record schema has no field for any of them.
+
+The idle gate records the names of heavy processes it saw, because a gate that does not is worthless. Those names can reveal your employer's software, an unreleased project, or something personal. Read that list before you post the file. Redact by replacing a name with the word redacted rather than by deleting the entry, so the count stays honest.
+
+The record contains the working directory, which usually contains your home directory and therefore your user name. Read it before you post it.
+
+Do not attach a sysdiagnose, an ioreg battery dump, or nvram output to an issue. Nothing in either protocol asks for them, and they carry far more about you and your machine than a benchmark needs.
+
+If you would rather send the file privately than attach it to a public issue, that is fine and I will publish only the fields the protocol needs.
+
+HOW TO SEND IT
+
+docs/HARDWARE_CONTRIBUTORS.md is the authoritative paperwork for contributing any hardware result, including this one. It has the environment capture script, the record template, the issue template, and the attribution and license terms. Follow it rather than this post where the two ever disagree, and tell me about the disagreement so I can fix it here.
+
+Attach the JSON record file itself and the raw run output. Please do not paste a table of numbers on its own. A table without its record is not reviewable, and I will ask you for the record anyway.
+
+WHAT WILL GET A RUN REJECTED, AND WHY THAT IS NOT PERSONAL
+
+A run on a machine that was doing something else. A run from a checkout with uncommitted changes, because then the commit hash does not describe what ran. A run at smoke scale. A run in a virtual machine. A run where the record's own idle gate reports it failed. Every one of these produces a file the protocol says is unquotable, and I would rather tell you that up front than accept a file I will never be able to use.
+
+Repository: https://github.com/ajhendel/mojoboost
+Benchmark protocol: https://github.com/ajhendel/mojoboost/blob/main/docs/APPLE_GPU_BENCHMARK_PROTOCOL.md
+Thermal and energy protocol: https://github.com/ajhendel/mojoboost/blob/main/docs/APPLE_THERMAL_ENERGY.md
+GPU validation status: https://github.com/ajhendel/mojoboost/blob/main/docs/GPU_VALIDATION.md
+
+To be explicit about where this stands, since it would be easy to read a benchmark request as a claim. No run under either protocol has been performed. Every cell of the M1 to M5 fleet table is empty. The scattered timings currently in bench/README.md were taken on a loaded development machine and are labeled there as unquotable. MojoBoost is an experimental alpha, and the point of this request is to find out what is actually true on the hardware.

@@ -1,0 +1,225 @@
+PURPOSE: Exact manual steps to move mojoboost from github.com/ajhendel/mojoboost to github.com/mojoboost-ml/mojoboost and configure the organization.
+
+NOTHING IN THIS FILE HAS BEEN PERFORMED. Every step below is a manual action for a human with administrative access. No organization was created, no repository was transferred, no GitHub setting was changed, and no network call was made while writing this checklist. handoffs/release_12_organization.md lists the same settings as an explicit not-performed inventory.
+
+Work through the sections in order. Sections A through F are the transfer itself and are hard to undo cleanly, so read section A before starting anything. Sections G through N can be done at any time afterward, though Discussions and private vulnerability reporting should be on before the launch posts go out, because SUPPORT.md and GOVERNANCE.md send people to both.
+
+Time estimate is about ninety minutes if nothing surprises you, most of it in sections H through K.
+
+
+A. DECISIONS AND PREREQUISITES
+
+A1. Confirm the organization name mojoboost-ml is available at https://github.com/mojoboost-ml. If it is taken, every URL in this checklist, in .github/profile/README.md, and in SUPPORT.md changes, so settle the name first.
+
+A2. Decide whether ajhendel@gmail.com stays the published contact address. It is currently the address in SECURITY.md, in CODE_OF_CONDUCT.md, and in pixi.toml, which means it is the address that receives both security reports and conduct reports. A role alias such as one at a domain you control would be better on both counts, since it survives a change of maintainer and does not tie the project's public contact to a personal mailbox. If you change it, change it everywhere at once:
+
+    grep -rn "ajhendel@gmail" . --exclude-dir=.git --exclude-dir=.pixi
+
+    Nothing else in this checklist depends on the answer, so it is safe to defer, but it gets harder to change after the address is quoted in launch posts and forum threads.
+
+A3. Decide whether you are ready for the repository to be publicly attributed to an organization rather than to a person. The transfer is reversible in principle and unpleasant in practice.
+
+A4. Confirm you can create repositories in the new organization. The account performing the transfer must have that permission in the target organization, or the transfer form rejects the destination.
+
+A5. Have a clean working tree. Uncommitted work is not affected by a transfer, but this is the moment to not be halfway through something.
+
+
+B. CREATE THE ORGANIZATION
+
+B1. Go to https://github.com/organizations/plan and create a free organization named mojoboost-ml. Set the contact email to the address from step A2.
+
+B2. Organization Settings, Profile. Set the display name to mojoboost, a one-line description ("Gradient-boosted decision trees written natively in Mojo"), and the URL to https://github.com/mojoboost-ml/mojoboost. Upload an avatar if you have one. Leave the location field empty; the project has no location and inventing one is the kind of small dishonesty this project avoids.
+
+B3. Organization Settings, Authentication security. Turn on "Require two-factor authentication for everyone in your organization". Do this while you are the only member, because turning it on later removes any member who has not enabled 2FA.
+
+B4. Organization Settings, Member privileges. Set "Base permissions" to No permission, so that repository access is granted only through teams. Set "Repository creation" to allow only owners. Leave "Allow members to create public repositories" off. These are reversible and cost nothing while the organization has one member.
+
+
+C. PUBLISH THE ORGANIZATION PROFILE
+
+C1. Create a new public repository named exactly .github under mojoboost-ml. GitHub renders an organization profile only from that repository name.
+
+C2. Add the staged profile text to it at the path profile/README.md. The source of truth is .github/profile/README.md in the mojoboost repository, which is where the text is reviewed. Copy it across and delete the HTML comment block at the top, which exists only to explain the staging.
+
+    git clone https://github.com/mojoboost-ml/.github
+    mkdir -p .github/profile
+    cp <mojoboost>/.github/profile/README.md .github/profile/README.md
+    # remove the leading <!-- ... --> staging comment, then commit and push
+
+C3. Load https://github.com/mojoboost-ml and confirm the profile renders. Every link in it points at mojoboost-ml and stays broken until section D completes, so check the links again after the transfer rather than now.
+
+C4. When the profile text changes later, change it in the mojoboost repository first and copy it across, so the two do not drift.
+
+
+D. TRANSFER THE REPOSITORY
+
+D1. In https://github.com/ajhendel/mojoboost, open Settings, scroll to the Danger Zone, choose "Transfer ownership".
+
+D2. Enter mojoboost-ml as the new owner, type the repository name to confirm, and complete the transfer. It takes effect immediately.
+
+D3. Confirm https://github.com/mojoboost-ml/mojoboost loads and that https://github.com/ajhendel/mojoboost redirects to it.
+
+D4. Issues, pull requests, stars, watchers, releases, tags, and git history move with the repository, and open issue and pull request numbers are preserved. Forks stay attached to the repository in its new location.
+
+
+E. VERIFY WHAT DID AND DID NOT SURVIVE THE TRANSFER
+
+Do not assume any of these. Check each one, because a silently missing setting shows up later as a failing workflow or an unprotected branch.
+
+E1. Actions, Secrets and variables. List what is there and recreate anything the repository needs. There are no secrets in the current workflows, so the expected result is an empty list; confirm that rather than assume it.
+
+E2. Actions, General, on the organization. A new organization must allow the third-party actions this project uses, or every continuous integration run fails at the first step. Set "Allow all actions and reusable workflows", or build an allow list from what the workflows actually reference today:
+
+    grep -rho "uses: [^ ]*" .github/workflows/ | sort -u
+
+    At the time of writing that is actions/* (checkout, upload-artifact, download-artifact, attest-build-provenance, attest-sbom), prefix-dev/setup-pixi, anchore/sbom-action, and pypa/gh-action-pypi-publish. An allow list of GitHub-created actions plus prefix-dev/*, anchore/*, and pypa/* covers it. Re-run the command rather than trusting this list, because the release workflow arrived from a parallel lane and may still be changing.
+
+E3. Push any trivial commit, or run the CI workflow from the Actions tab with workflow_dispatch, and confirm all four jobs still pass on the new location before you tell anyone the repository moved.
+
+E4. Branch protection rules or rulesets. Section I replaces these anyway, so simply note what exists.
+
+E5. The repository description, topics, and the "Include in the home page" links are repository metadata rather than files, and are worth checking. Suggested topics: mojo, gradient-boosting, gbdt, machine-learning, apple-silicon, gpu, metal, lightgbm.
+
+
+F. UPDATE REMOTES
+
+F1. On every machine with a clone, including any machine holding parallel work in progress:
+
+    git remote set-url origin https://github.com/mojoboost-ml/mojoboost.git
+    git remote -v
+
+F2. Pushes to the old URL keep working through the redirect, which is exactly why this is easy to forget. Update it anyway, because the redirect dies the moment step F3 happens.
+
+F3. Never create a new repository named mojoboost under the ajhendel account. That is the one action that permanently breaks every redirect, including links inside launch posts, forum threads, and third-party blog posts you do not control.
+
+F4. Tell anyone with an existing clone or fork to run the same command. A fork does not need it, since forks follow the transfer, but a direct clone benefits from not depending on a redirect.
+
+
+G. UPDATE LINKS INSIDE THE REPOSITORY
+
+The old owner name is hard-coded in dozens of places across more than two dozen files, and the count is still moving because parallel lanes keep adding documents that link to the repository. Every one of them keeps working through the redirect, so none of this is urgent, and all of it should be done before the launch posts go out so that the repository does not advertise a location it no longer occupies.
+
+THIS LANE DID NOT EDIT ANY OF THOSE FILES. They belong to other lanes, and editing them here would have overwritten concurrent work. Do this in one pass after the parallel lanes land, rather than from a list that was already stale when it was written. The authority is the command, not an inventory:
+
+    grep -rn "ajhendel/mojoboost" . --exclude-dir=.git --exclude-dir=.pixi --exclude=pixi.lock
+
+G1. Most hits are plain repository, blob, and issue-template links and can be replaced mechanically once the tree is quiet:
+
+    grep -rl "ajhendel/mojoboost" . --exclude-dir=.git --exclude-dir=.pixi --exclude=pixi.lock \
+      | xargs sed -i '' 's|ajhendel/mojoboost|mojoboost-ml/mojoboost|g'
+
+    That is the BSD sed on macOS, hence the empty -i argument. Review the diff before committing, because the five cases below need judgment and a blanket substitution gets some of them wrong.
+
+G2. Two occurrences in GOVERNANCE.md and CODE_OF_CONDUCT.md are the maintainer's own identity, github.com/ajhendel and an email address, not repository links. Leave those alone. The command above does not match them, which is why it matches on ajhendel/mojoboost rather than on ajhendel.
+
+G3. JSON Schema $id values, in bench/apple/schema.json, bench/apple/thermal_schema.json, bench/real_data/schema.json, and hardware/templates/result.schema.json, deserve care. A schema identifier is not merely a link, and changing it changes the identity of the schema for anything that resolved it. At this stage nothing external has, so change them; if that stops being true, leave them and record the new location separately. Any already-emitted result file that carries the old $id keeps it.
+
+G4. python/pyproject.toml feeds published wheel metadata. If a wheel has already been uploaded anywhere, the old URL is baked into that release and only future releases carry the new one. SECURITY.md records that no release has been published, so today this is free.
+
+G5. docs/GPU_VALIDATION.md contains a self-hosted runner registration URL passed to ./config.sh. A runner registered against the old URL keeps working after a transfer, but the registration token comes from the repository's own settings page, so anyone following those instructions must use the new location. No runner is registered today.
+
+G6. SECURITY.md links directly to the advisory form at /security/advisories/new. Confirm that link resolves after the transfer and after step K1, since it is the one link in the repository where a 404 sends somebody with a vulnerability to email instead.
+
+G7. pixi.toml line 2 carries the author email. Decide it deliberately alongside step A2. It is not a link and the redirect has nothing to do with it.
+
+
+H. TEAMS AND ACCESS
+
+Two teams, matching GOVERNANCE.md. Do not invent more; a third team with nobody in it is an organization pretending to be larger than it is.
+
+H1. Create team maintainers. Visibility visible. Description: "Administrative access. Repository settings, releases, security reports." Add yourself. Grant it the Admin role on the mojoboost repository under the repository's Settings, Collaborators and teams.
+
+H2. Create team contributors. Visibility visible. Description: "Write access. Push directly, per GOVERNANCE.md." Empty for now. Grant it the Write role on the mojoboost repository.
+
+H3. Set both teams to not notify all members by default, so that adding somebody does not subscribe them to everything.
+
+H4. When granting Write access to a new contributor, add them to the contributors team rather than as a direct repository collaborator. Direct collaborators are invisible on the organization page and become impossible to audit.
+
+H5. Do not add anyone to maintainers as a convenience. Admin includes the ability to delete the repository and to change everything in section I.
+
+
+I. MERGE POLICY
+
+The goal from GOVERNANCE.md is that no ordinary alpha contribution waits on a human approval, while workflows, dependencies, packaging, and release tooling do not merge automatically from an untrusted fork. That combination needs a ruleset with a bypass list, not classic branch protection.
+
+I1. Repository Settings, General, Pull Requests. Turn on "Allow auto-merge". Turn on "Automatically delete head branches". Leave the merge button choices as they are.
+
+I2. Repository Settings, Rules, Rulesets. Create a ruleset named "main" targeting the default branch, status Active, with exactly these rules enabled:
+
+    Restrict deletions
+    Block force pushes
+    Require status checks to pass, listing: test (ubuntu-latest), test (ubuntu-24.04-arm), python (ubuntu-latest), python (ubuntu-24.04-arm), parity
+
+    Leave "Require a pull request before merging" OFF. That is the setting that would force every trusted contributor through a review queue, which is the thing this policy exists to avoid.
+
+I3. In the same ruleset, add both maintainers and contributors to the bypass list. This is what lets a trusted contributor push straight to main while a fork pull request still has to go green. Verify it after saving by pushing a trivial commit directly to main; if that push is rejected, the bypass list did not take.
+
+I4. Required status check names must match the job names GitHub actually reports, which come from .github/workflows/ci.yml and include the matrix value in parentheses. The reliable way to get them right is to open a recent completed run, copy each check name from the checks list, and paste it in. A required check whose name does not match anything is never satisfied, which silently blocks every pull request forever. Do not require the bench job; it is workflow_dispatch only and would never report. Do not require anything from gpu-validation.yml for the same reason.
+
+I5. Automatic merging of an outside contributor's pull request is not something a repository setting does by itself. GitHub's auto-merge has to be turned on per pull request, and a pull request is only eligible while a required check is still pending, which is why step I2 exists. Two ways to finish the job:
+
+    (a) A maintainer clicks "Enable auto-merge" on the pull request. This is not an approval and takes one second, but it is a human in the loop.
+    (b) A small workflow enables it automatically, for example a job triggered on pull_request_target that runs `gh pr merge --auto --squash` when the changed paths are all outside the reserved list.
+
+    Option (b) is the one that matches the stated policy. THIS LANE DID NOT WRITE THAT WORKFLOW. Workflow files were explicitly out of scope, so the automatic path does not exist yet and (a) is what happens today. Whoever writes it should know that pull_request_target runs with repository context, so the workflow must not check out or execute the fork's code, and it must compute the reserved-path check itself rather than trusting anything from the pull request.
+
+I6. Reserved paths, as listed in GOVERNANCE.md, are .github/workflows/**, .github/actions/**, pixi.toml, pixi.lock, python/pyproject.toml, packaging/**, tools/**, LICENSE, GOVERNANCE.md, and CODE_OF_CONDUCT.md. Until step I5(b) exists, this list lives only in GOVERNANCE.md and is enforced by a maintainer reading the diff. That is an honest description of the current state and not a gap that pretending otherwise would close.
+
+I7. Repository Settings, Actions, General. Set "Fork pull request workflows from outside collaborators" to "Require approval for first-time contributors who are new to GitHub". The stricter default holds up every newcomer's first run behind a click, which is precisely the friction this project is trying to remove. The risk it trades away is small here: fork workflows run with a read-only token and no secrets.
+
+I8. In the same panel, confirm "Workflow permissions" is "Read repository contents and packages permissions", and that "Allow GitHub Actions to create and approve pull requests" is off. Confirm at the organization level that secrets and write tokens are not sent to fork pull request workflows.
+
+I9. If a self-hosted GPU runner is ever registered, do not make it available to fork pull requests, and keep gpu-validation.yml on workflow_dispatch as it is today. A self-hosted runner reachable from a fork pull request means an anonymous stranger executing code on your Mac. Register any such runner at the repository level rather than the organization level, and re-register it after the transfer if one already exists. None is registered today.
+
+
+J. DISCUSSIONS
+
+J1. Repository Settings, General, Features. Check Discussions. Do this at the repository level rather than the organization level; SUPPORT.md links to repository Discussions.
+
+J2. In the Discussions tab, open the category settings and configure exactly these four, deleting the defaults that do not match, because SUPPORT.md links to three of them by slug:
+
+    Q&A                 answerable format          slug q-a
+    Ideas               open-ended discussion      slug ideas
+    Show and tell       open-ended discussion      slug show-and-tell
+    Announcements       announcement format, maintainers post only
+
+J3. Confirm the three slugs in SUPPORT.md resolve. GitHub derives the slug from the category name, so a rename to "Questions" silently breaks the /categories/q-a link.
+
+J4. Post one Announcement introducing the organization and the governance model, and one Q&A seed asking for NVIDIA and AMD validation results. An empty Discussions tab reads as an abandoned feature, and the first post is the hardest one for a visitor to write.
+
+J5. Leave organization-level Discussions off. One place to ask is better than two.
+
+
+K. SECURITY SETTINGS
+
+K1. Repository Settings, Advanced Security or Security and analysis. Turn on "Private vulnerability reporting". This is the single most important setting in this section. SECURITY.md links straight to the advisory form and tells reporters that a 404 there means the setting is off and they should fall back to unencrypted email. Until it is on, every vulnerability report arrives by the worse channel.
+
+K2. Turn on secret scanning and push protection. Both are free on public repositories and push protection is the one that catches a credential before it reaches history rather than after.
+
+K3. Turn on Dependabot alerts and Dependabot security updates. .github/dependabot.yml already configures scheduled version updates, but alerts and security updates are settings rather than file configuration and are not enabled by the presence of that file. Those pull requests all land on reserved paths and are read by a human before merging, which is the intent stated in the dependabot configuration itself.
+
+K4. Security policy files are not this lane's. SECURITY.md, .github/dependabot.yml, and the release provenance workflow arrived from a parallel security lane, and this lane did not write or edit them. GOVERNANCE.md and SUPPORT.md were written to defer to SECURITY.md rather than restate it, so if that file's reporting channel or timelines change, nothing here needs changing with it.
+
+K5. SECURITY.md references docs/RELEASE_SECURITY.md in several places and that file is not in the tree as of this writing. Either it lands with the rest of that lane's work or the references need fixing. Check before launch; a security policy pointing at a missing document is the kind of thing a first reader notices.
+
+
+L. AFTER THE MOVE
+
+L1. Re-check the links in .github/profile/README.md now that the target exists.
+
+L2. Confirm one full continuous integration run is green at the new location, that a fork pull request from a test account merges the way section I says it does, and that the five-minute README example works from a fresh clone of the new URL. Do these before posting anything, since launch/README.txt already makes the Show HN post conditional on a clean checkout working.
+
+L3. Only then work through launch/README.txt in its recommended order. Update the repository links in those six posts first, per section G.
+
+L4. Send launch/CONTRIBUTOR_INVITE.txt to people individually. It is deliberately not a broadcast.
+
+
+M. WHAT THIS CHECKLIST DOES NOT COVER
+
+M1. Package name ownership. Any name reservation on PyPI or on a Mojo or Modular package index is separate from a GitHub transfer, is not covered here, and belongs with whoever owns packaging.
+
+M2. Social accounts, a domain, or a website. The project does not need any of them and the profile README is deliberately the whole public face.
+
+M3. Moving the ajhendel account's other repositories. Only mojoboost is in scope.
+
+M4. Anything in the mojoboost-r-api working tree, which is a separate repository and a separate decision.

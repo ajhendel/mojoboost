@@ -26,6 +26,30 @@ partition-local prediction, all against a fake backend and a fake runtime.
 `DaskRuntime`, the only code here that calls dask, has never been run
 against a live cluster. Read it as a proposal.
 
+Optional, and import safe
+-------------------------
+
+`import mojoboost.dask` does not import dask, and neither does anything
+this module does until a cluster is actually involved. `dask_available()`
+answers with `importlib.util.find_spec`, `is_dask_collection()` asks the
+object rather than the library, and `_import_dask()` is called from exactly
+two places: `DaskRuntime.client` and `DaskRuntime.map_partitions`. Every
+dataclass, validator, the rank planner, the backend registry, and
+partition-local prediction work with dask absent. That is what makes this
+module safe to expose from the package without adding dask to the install.
+
+There is one import this module cannot make lazy: the three Dask
+estimators subclass the three single-machine ones, and a base class is
+needed when the class statement runs. So `mojoboost.dask` depends on
+`mojoboost` being fully initialized, and `mojoboost/__init__.py` must not
+import this module at the top of its own body, where the estimators do not
+exist yet. It is not a cycle to hide, it is an ordering constraint, and the
+way to expose `mojoboost.dask` without tripping over it is a module-level
+`__getattr__` (PEP 562) in the package, which resolves the submodule on
+first attribute access and costs nothing on `import mojoboost`. The exact
+code is in `mojoboost/_public_api_plan.py` and
+handoffs/integration_06_python_api.md.
+
 The backend protocol, version 0
 -------------------------------
 
@@ -93,12 +117,12 @@ import importlib
 import os
 from dataclasses import dataclass, field
 
-from . import (
-    MojoBoostClassifier,
-    MojoBoostRanker,
-    MojoBoostRegressor,
-    group_from_query_ids,
-)
+# The three base classes, and nothing else: this is the whole of what has
+# to exist before this module can be imported (see "Optional, and import
+# safe" above). Package functions needed only at call time are imported
+# inside the functions that need them, so the ordering constraint stays as
+# small as the class statements make it.
+from . import MojoBoostClassifier, MojoBoostRanker, MojoBoostRegressor
 
 __all__ = [
     "DaskMojoBoostClassifier",
@@ -128,6 +152,7 @@ __all__ = [
     "partition_group",
     "plan_world",
     "register_backend",
+    "require_capabilities",
     "take_model_bytes",
     "validate_partitions",
     "validate_query_partitioning",
@@ -154,6 +179,8 @@ CAPABILITIES = frozenset(
         "weights",  # per-row sample weights
         "quantile_l1",  # leaf renewal, which does not all-reduce
         "bagging",  # row subsampling from a global draw
+        "goss",  # gradient-based one-side sampling, a global order
+        "class_weight",  # per-class weights folded in on the workers
         "feature_fraction",  # column subsampling
         "early_stopping",  # validation loss reduced each round
         "custom_objective",  # a callable objective shipped to the workers
@@ -349,9 +376,13 @@ class PartitionMeta:
       dataframe.
     - `categories` is `((feature index, categories or None), ...)`, in
       ascending index order.
-    - `label_values` is the distinct label values this partition saw, used
-      to agree on the global class list for a classifier. It is not the
-      labels themselves.
+    - `label_values` is the distinct label values this partition saw. It is
+      advisory: nothing populates it and nothing reads it. A classifier's
+      global class list is the `classes` argument of `fit`, because a scan
+      that missed a rare class would give the ranks two different label
+      encodings and no error, and a metadata field cannot promise it saw
+      every partition. A runtime that can fill this in honestly may, and a
+      backend may log it; neither is a way to skip `classes`.
     - `first_query` and `last_query` are the query ids at the two ends of
       the partition, and `group` its per-query row counts. Ranking only.
     - `key`, `label_key`, and `weight_key` locate the rows themselves: the
@@ -459,6 +490,8 @@ def partition_group(query_ids):
     query's rows must be consecutive is enforced in one place. What this
     adds is the partition-level rule: see `validate_query_partitioning`.
     """
+    from . import group_from_query_ids
+
     return tuple(group_from_query_ids(query_ids))
 
 
@@ -1093,8 +1126,14 @@ def _query_groups(query_ids, n_partitions):
             "partitions; a ranker needs one per partition, in row order"
         )
     out = []
-    for ids in per_partition:
+    for index, ids in enumerate(per_partition):
         ids = list(ids)
+        if not ids:
+            raise PartitionError(
+                f"partition {index} has no query ids; an empty partition is "
+                "refused by validate_partitions, and a non-empty one owes a "
+                "query id for every row"
+            )
         out.append((partition_group(ids), ids[0], ids[-1]))
     return out
 
@@ -1103,12 +1142,24 @@ def _query_groups(query_ids, n_partitions):
 # Partition-local prediction
 # ---------------------------------------------------------------------------
 
-#: Deserialized models, keyed by the digest of their bytes. A worker
+#: Deserialized models, keyed by the digest of their bytes and by
+#: everything else that changes what the parsed estimator does. A worker
 #: process predicts many partitions with the same model, and parsing the
 #: model text once per partition would dominate prediction. Keyed by
 #: content, so two estimators that hold the same model share an entry and a
 #: refit never collides with the model it replaced.
+#:
+#: An entry owns a native model handle, so this is bounded: a long-lived
+#: worker that predicts with model after model would otherwise hold every
+#: one of them for the life of the process. Insertion order is the eviction
+#: order, oldest first, which is enough for the access pattern this exists
+#: for (one model, many partitions, then the next model).
 _MODEL_CACHE = {}
+
+#: How many parsed models one worker process keeps. Small on purpose: the
+#: case worth caching is the same model across the partitions of one
+#: collection, and the cost of a miss is one parse.
+_MODEL_CACHE_LIMIT = 4
 
 
 def clear_model_cache():
@@ -1139,8 +1190,25 @@ class _PartitionPredictor:
     kwargs: dict = field(default_factory=dict)
 
     def model(self):
+        """The parsed estimator for this predictor, from the process cache.
+
+        The key is every input `_estimator_from_bytes` reads. `encoders`
+        belongs in it as much as the bytes do: two fits of the same trees
+        over differently ordered category tables predict different things
+        on a pandas frame, and a key that left them out would hand the
+        second fit the first one's encoders. The category tables arrive as
+        lists, which a dict key may not hold, so they are frozen here rather
+        than on the field, where `_estimator_from_bytes` wants them as the
+        estimator stores them.
+        """
         digest = hashlib.sha256(self.blob).hexdigest()
-        key = (digest, self.kind, self.multiclass, self.classes)
+        key = (
+            digest,
+            self.kind,
+            self.multiclass,
+            self.classes,
+            tuple((index, tuple(cats)) for index, cats in self.encoders),
+        )
         cached = _MODEL_CACHE.get(key)
         if cached is None:
             cached = _estimator_from_bytes(
@@ -1150,6 +1218,8 @@ class _PartitionPredictor:
                 self.classes,
                 dict(self.encoders),
             )
+            while len(_MODEL_CACHE) >= _MODEL_CACHE_LIMIT:
+                _MODEL_CACHE.pop(next(iter(_MODEL_CACHE)))
             _MODEL_CACHE[key] = cached
         return cached
 
@@ -1250,6 +1320,30 @@ class _DaskMixin:
         self.one_rank_per_worker = one_rank_per_worker
         self._runtime = None
         self._plan_ = None
+        self._model_blob_cache = None
+
+    # -- the model --------------------------------------------------------
+
+    def _model_blob(self):
+        """The fitted model as bytes, from the one model this estimator
+        owns.
+
+        A fitted estimator holds one model: the handle inside the `Booster`
+        on `_booster`, exactly as a single-machine estimator does. The bytes
+        a backend handed back are kept next to it as a cache and nothing
+        more. They are not pickled and they are not a second source of
+        truth; when they are missing, they are written back out of the
+        Booster through the same versioned format `save()` uses. So there is
+        no state in which this estimator holds two models that could
+        disagree, and an unpickled estimator can still predict on a Dask
+        collection, which needs bytes to ship to the workers.
+        """
+        self._require_fitted()
+        blob = getattr(self, "_model_blob_cache", None)
+        if blob is None:
+            blob = self._model_bytes()
+            self._model_blob_cache = blob
+        return blob
 
     # -- planning ---------------------------------------------------------
 
@@ -1286,6 +1380,13 @@ class _DaskMixin:
             needed.add("weights")
         if self.bagging_fraction != 1.0 or self.subsample not in (None, 1.0):
             needed.add("bagging")
+        # Resolved by the estimator rather than re-read here, so the
+        # `boosting` / `boosting_type` alias rule has one owner. GOSS keeps
+        # the largest gradients and samples the rest, which is a decision
+        # over the global row set: a rank sampling its own rows is a
+        # different algorithm, not a distributed version of this one.
+        if self._resolve_boosting() == "goss":
+            needed.add("goss")
         if self.feature_fraction != 1.0 or self.feature_fraction_bynode != 1.0:
             needed.add("feature_fraction")
         if str(self.device).lower() == "gpu" or (
@@ -1334,8 +1435,8 @@ class _DaskMixin:
         self._reset_fitted()
         self._plan_ = None
         # Not in `_FITTED_ATTRS`, which belongs to the single-machine
-        # estimators, so a refit clears it here.
-        self._model_bytes_ = None
+        # estimators, so a refit drops the stale bytes here.
+        self._model_blob_cache = None
         runtime = self._runtime_for(runtime)
         partitions = validate_partitions(
             runtime.partitions(
@@ -1389,7 +1490,10 @@ class _DaskMixin:
             )
         if plan.feature_names is not None:
             self.feature_names_in_ = list(plan.feature_names)
-        self._model_bytes_ = blob
+        # The Booster built above is the model; these are the same bytes
+        # kept so that shipping them to the workers does not re-serialize
+        # it. See `_model_blob`.
+        self._model_blob_cache = blob
         return self
 
     # -- predict ----------------------------------------------------------
@@ -1424,7 +1528,7 @@ class _DaskMixin:
                     "locally"
                 )
         predictor = _PartitionPredictor(
-            blob=self._model_bytes_,
+            blob=self._model_blob(),
             kind=self._kind,
             multiclass=self._multiclass,
             method=method,
@@ -1462,9 +1566,8 @@ class _DaskMixin:
         cluster. It is what to pickle, save, or hand to code that should
         not know a cluster was involved.
         """
-        self._require_fitted()
         return _estimator_from_bytes(
-            self._model_bytes_,
+            self._model_blob(),
             self._kind,
             self._multiclass,
             self._class_labels(),
@@ -1477,9 +1580,16 @@ class _DaskMixin:
         """Pickle support. A `Client`, a runtime, and a rank plan describe
         a cluster this estimator is finished with, so none of them travel;
         the model does, exactly as it does for the single-machine
-        estimators."""
+        estimators.
+
+        The model travels once. `_Base.__getstate__` already writes the
+        Booster out as bytes, so carrying `_model_blob_cache` as well would
+        put the same model in the pickle twice and leave two copies to
+        disagree if either were ever edited. It is a cache of the one model,
+        and `_model_blob` rebuilds it on demand.
+        """
         state = super().__getstate__()
-        for name in ("_runtime", "_plan_"):
+        for name in ("_runtime", "_plan_", "_model_blob_cache"):
             state[name] = None
         state["client"] = None
         return state
@@ -1563,6 +1673,10 @@ class DaskMojoBoostClassifier(_DaskMixin, MojoBoostClassifier):
         needed = self._shared_capabilities(partitions, schema)
         labels = self._pending_classes or ()
         needed.add("multiclass" if len(labels) > 2 else "binary")
+        if callable(self.objective):
+            needed.add("custom_objective")
+        if self.class_weight is not None:
+            needed.add("class_weight")
         return needed
 
     def fit(
@@ -1582,6 +1696,19 @@ class DaskMojoBoostClassifier(_DaskMixin, MojoBoostClassifier):
         passed, and the workers encode labels through that order.
         """
         self._reject_unsupported_fit_arguments(unsupported)
+        if isinstance(self.class_weight, str):
+            # "balanced" is one over the class frequency, and the frequency
+            # is a global count of rows this client never sees: partition
+            # metadata carries which labels a partition holds, not how many
+            # rows of each. A per-rank "balanced" would weight the same
+            # class differently on every rank.
+            raise ValueError(
+                f"class_weight={self.class_weight!r} needs the row count of "
+                "every class across the whole collection, which the client "
+                "does not have and a rank cannot compute from its own rows. "
+                "Count the labels yourself and pass the weights as a dict, "
+                "or fit on one machine"
+            )
         labels = tuple(classes)
         if len(labels) < 2:
             raise ValueError(
@@ -1608,6 +1735,10 @@ class DaskMojoBoostClassifier(_DaskMixin, MojoBoostClassifier):
         """Class probabilities for `X`, as a Dask collection when `X` is
         one: `n_classes_` columns per row, in `classes_` order."""
         if is_dask_collection(X):
+            # Before `n_classes_` is read for the output width, so an
+            # unfitted estimator raises NotFittedError rather than
+            # AttributeError.
+            self._require_fitted()
             return self._distributed_predict(
                 X,
                 "predict_proba",

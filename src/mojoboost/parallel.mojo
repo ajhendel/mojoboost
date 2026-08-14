@@ -14,6 +14,12 @@ benchmarking and for tests that must force one path:
   threshold (`PARALLEL_MIN_OPS`), compared against the caller's op estimate
   (conventionally items * rows touched).
 
+`apple_cpu_policy.mojo` adds four more, all scheduling-only and all
+documented there: `MOJOBOOST_CPU_TASKS_PER_CORE`, `MOJOBOOST_CPU_CORE_POOL`,
+`MOJOBOOST_CPU_FEATURE_GROUP`, and `MOJOBOOST_CPU_COMPACT_MIN_ROWS`. The two
+above override them: an explicit worker count bypasses the grain floor and
+the core cap alike.
+
 The GPU backend adds its own variables, documented where they are read:
 `MOJOBOOST_GPU_HIST_STRATEGY` (gpu_tiling.mojo),
 `MOJOBOOST_GPU_SPLIT_STRATEGY` (train_gpu.mojo; `device` moves per-node
@@ -24,41 +30,64 @@ grower's histogram count, one host synchronization per split, off by
 default), `MOJOBOOST_GPU_TRACE` and `MOJOBOOST_GPU_STAGING_SLOTS`
 (gpu_runtime.mojo).
 
-Two dispatch shapes are provided. Both keep every floating-point summation
-order independent of the task count, so every result is bit-identical to the
-serial path on every machine and at every worker setting:
+Three dispatch shapes are provided. All of them keep every floating-point
+summation order independent of the task count, so every result is
+bit-identical to the serial path on every machine and at every worker
+setting:
 
-- `dispatch_features` splits independent units (conventionally features)
-  across tasks. A unit's accumulation runs start to finish inside a single
-  task, so no sum is ever reassociated.
+- `dispatch_feature_ranges` hands each task a contiguous half-open range of
+  independent units (conventionally features). A unit's accumulation runs
+  start to finish inside one task, so no sum is ever reassociated, and a
+  kernel that wants to interleave two units for instruction-level
+  parallelism gets them in the same call rather than in two.
+- `dispatch_features` is the one-unit-at-a-time form of the same thing,
+  written in terms of it.
 - `dispatch_rows` splits a row range into contiguous ascending blocks.
   Callers use it only for elementwise work (gradients, predictions, bin
-  lookups) and for counting passes, where disjoint in-order blocks reproduce
-  the serial result exactly. It is deliberately not used for histogram
-  accumulation, which would need a cross-block reduction.
+  lookups, sibling subtraction) and for counting passes, where disjoint
+  in-order blocks reproduce the serial result exactly. It is deliberately
+  not used for histogram accumulation, which would need a cross-block
+  reduction.
 
 Task count comes from the workload shape rather than from the item count.
 One task per item balances perfectly but pays a scheduling event per item,
 which dominates on wide inputs, so auto mode caps the fan-out at
-`TASKS_PER_CORE` tasks per physical core and chunks the rest.
+`TASKS_PER_CORE` tasks per core and chunks the rest. Which cores are counted,
+and how the fan-out reacts to a machine whose cores are not all the same
+speed, is `apple_cpu_policy.mojo`'s decision; this module only applies the
+grain rule and the split.
+
+Ranges are split evenly rather than by a ceiling-divided chunk: task `w` of
+`n` takes `[w * items // n, (w + 1) * items // n)`. Two task counts that
+differ by one item never leave a trailing task empty, which a ceiling chunk
+does (6 tasks over 10 features leaves the sixth with nothing to do), and the
+spread makes the remainder land on different tasks instead of all on the
+last. Which task runs which unit changes nothing about the result.
+
+Nesting. These dispatches are not reentrant-aware: a `sync_parallelize`
+inside a task would oversubscribe the machine with no scheduler to arbitrate
+it. Every caller in this package dispatches from the single-threaded part of
+its stage, and a kernel that runs inside a task uses the serial helper
+instead (`Histogram.reset` rather than a dispatching zero pass, for
+example). Anything new that runs inside a task must do the same.
 """
 
 from max.algorithm import sync_parallelize
 from std.os import getenv
-from std.sys.info import num_physical_cores
+
+from .apple_cpu_policy import DEFAULT_TASKS_PER_CORE, cpu_profile
 
 # Serial-vs-parallel crossover measured at 25k-50k ops on Apple M4, AMD
 # Zen4, and Neoverse-N2 (bench/bench_threshold.mojo); 1 << 16 sits above
 # all three with 1.2-1.6x parallel speedup at exactly this size.
 comptime PARALLEL_MIN_OPS = 1 << 16
 
-# Auto-mode fan-out per physical core, applied on top of the grain rule in
-# `plan_tasks`. Above 1 the extra tasks absorb the jitter of unequal per-item
-# cost (features differ in bin occupancy, blocks in cache behaviour); far
-# above it the scheduling events cost more than the imbalance they hide. 4 is
-# a starting point, not a measured optimum: sweep it with
-# bench/bench_profile.mojo on an idle machine before treating it as tuned.
-comptime TASKS_PER_CORE = 4
+# Auto-mode fan-out per core. The value, the core pool it multiplies, and the
+# reasoning behind both now live in `apple_cpu_policy.mojo`; this name stays
+# because benchmarks and tests print and bound it. Sweep it with
+# bench/bench_profile.mojo (or `MOJOBOOST_CPU_TASKS_PER_CORE`) on an idle
+# machine before treating it as tuned.
+comptime TASKS_PER_CORE = DEFAULT_TASKS_PER_CORE
 
 
 def _env_int(name: String, default: Int) -> Int:
@@ -103,6 +132,11 @@ def plan_tasks(n_items: Int, total_ops: Int) -> Int:
     in scheduling than the 2.5k ops each one would run. An explicit
     `MOJOBOOST_NUM_WORKERS` bypasses both, so tests can force the parallel
     path at any size.
+
+    The per-core ceiling comes from `apple_cpu_policy`, which decides how many
+    cores to count on a machine whose cores are not all the same speed. Its
+    default is every physical core times `TASKS_PER_CORE`, which is what this
+    line has always computed.
     """
     if n_items <= 1:
         return 1
@@ -114,7 +148,7 @@ def plan_tasks(n_items: Int, total_ops: Int) -> Int:
         var grain = env_parallel_min_ops()
         if total_ops < grain:
             return 1
-        n_tasks = TASKS_PER_CORE * num_physical_cores()
+        n_tasks = cpu_profile().max_auto_tasks()
         var by_grain = total_ops // grain
         if by_grain < n_tasks:
             n_tasks = by_grain
@@ -125,34 +159,59 @@ def plan_tasks(n_items: Int, total_ops: Int) -> Int:
     return n_tasks
 
 
+def dispatch_feature_ranges[FuncType: def (Int, Int) -> None](
+    func: FuncType, n_features: Int, total_ops: Int
+) raises:
+    """Run `func(start, end)` over contiguous ranges covering
+    [0, n_features), under the env contract above.
+
+    `func` must be safe to run concurrently for disjoint ranges: each feature
+    writes only its own output range, so ranges of them do too. `total_ops`
+    is the work estimate compared against the auto-mode threshold,
+    conventionally n_features * rows_touched plus whatever else the kernel
+    does per feature (see `apple_cpu_policy.derive_accumulation_plan`, which
+    counts the zeroing pass a histogram build also runs).
+
+    The serial path is a single `func(0, n_features)` call, which is the same
+    shape a task gets, so there is one body to test rather than two. Handing
+    a kernel a range rather than one feature at a time is what lets it
+    interleave two features in one inner loop; it changes nothing about which
+    feature accumulates what, only how many are in flight.
+    """
+    var n_tasks = plan_tasks(n_features, total_ops)
+    if n_tasks <= 1:
+        if n_features > 0:
+            func(0, n_features)
+        return
+
+    # Even split: task w takes [w * n // tasks, (w + 1) * n // tasks). With
+    # n_tasks <= n_features (plan_tasks clamps it) no task comes out empty,
+    # and the remainder is spread instead of landing entirely on the last.
+    def do_range(w: Int) {imm}:
+        func(
+            (w * n_features) // n_tasks,
+            ((w + 1) * n_features) // n_tasks,
+        )
+
+    sync_parallelize(do_range, n_tasks)
+
+
 def dispatch_features[FuncType: def (Int) -> None](
     func: FuncType, n_features: Int, total_ops: Int
 ) raises:
     """Run `func(f)` for f in [0, n_features) under the env contract above.
 
-    `func` must be safe to run concurrently for distinct f (each feature
-    writes only its own output range). `total_ops` is the work estimate
-    compared against the auto-mode threshold, conventionally
-    n_features * rows_touched.
+    The one-feature-at-a-time form of `dispatch_feature_ranges`, and written
+    in terms of it so there is a single split rule to reason about. Use this
+    unless the kernel has something to gain from seeing several features at
+    once.
     """
-    var n_tasks = plan_tasks(n_features, total_ops)
-    if n_tasks <= 1:
-        for f in range(n_features):
+
+    def do_range(start: Int, end: Int) {imm}:
+        for f in range(start, end):
             func(f)
-        return
 
-    var chunk = (n_features + n_tasks - 1) // n_tasks
-
-    def do_chunk(w: Int) {imm}:
-        var f = w * chunk
-        var end = f + chunk
-        if end > n_features:
-            end = n_features
-        while f < end:
-            func(f)
-            f += 1
-
-    sync_parallelize(do_chunk, n_tasks)
+    dispatch_feature_ranges(do_range, n_features, total_ops)
 
 
 @fieldwise_init

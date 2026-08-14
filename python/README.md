@@ -10,6 +10,78 @@ defaults matched to LightGBM. Objectives include squared error, binary
 logistic, Poisson, and multiclass softmax, with sample weights and
 bit-exact model save/load.
 
+> **Experimental public alpha.** The feature surface is broad and training
+> works end to end, but this is not yet a production replacement for
+> LightGBM or XGBoost. Treat every capability according to the evidence in
+> [docs/LIGHTGBM_PARITY.md](https://github.com/ajhendel/mojoboost/blob/main/docs/LIGHTGBM_PARITY.md)
+> and
+> [docs/GPU_VALIDATION.md](https://github.com/ajhendel/mojoboost/blob/main/docs/GPU_VALIDATION.md),
+> report failures, and do not rely on unvalidated hardware or parameter
+> combinations in production.
+
+## Installing
+
+The command this project is building toward is one line.
+
+```sh
+pip install mojoboost
+```
+
+**It does not work yet.** Nothing has been published to PyPI and no release
+wheel exists to download. There are three states, and only the third one
+exists today.
+
+| State | What you type | Status today |
+|---|---|---|
+| Stable pip install | `pip install --only-binary=:all: mojoboost` | **Not available.** No PyPI release exists |
+| A published release wheel | `pip install ./mojoboost-<version>-<tags>.whl` | **Not available.** No release has been built or published |
+| Source checkout with pixi | `git clone`, `pixi install`, `pixi run build-python` | **Works today** |
+
+```sh
+git clone https://github.com/ajhendel/mojoboost.git
+cd mojoboost
+pixi install
+pixi run build-python
+PYTHONPATH=python python -c "import mojoboost; print(mojoboost.__version__)"
+```
+
+[pixi](https://pixi.sh) resolves the pinned Mojo and MAX versions, so no
+separate Mojo or MAX installation is needed. A published wheel will bundle
+the runtime libraries it links and need no toolchain at all.
+
+mojoboost publishes no source distribution, deliberately, so
+`pip install mojoboost` can never turn into a Mojo compile on a machine with
+no Mojo toolchain. It resolves to a wheel that matches your machine or it
+refuses with "no matching distribution found".
+
+The whole picture, with the wheel filename per platform, the first five
+minutes step by step, and every error an install can produce, is in
+[docs/INSTALLATION.md](https://github.com/ajhendel/mojoboost/blob/main/docs/INSTALLATION.md).
+
+## The first five minutes
+
+Import and diagnostics, a tiny regression, a validation set with early
+stopping, a bit-exact save and load, and what each device value does on your
+machine, in one standard-library-only script that prints each result.
+
+```sh
+python examples/install_smoke.py                     # installed package
+PYTHONPATH=python python examples/install_smoke.py   # source checkout
+```
+
+The diagnostics it prints first are what an installation bug report needs.
+
+```python
+import platform, sys
+import mojoboost
+
+print("mojoboost     ", mojoboost.__version__)
+print("package path  ", mojoboost.__file__)
+print("python        ", sys.version.split()[0], sys.executable)
+print("platform      ", platform.platform(), platform.machine())
+print("gpu_available ", mojoboost.gpu_available())
+```
+
 ## Usage
 
 ```python
@@ -236,11 +308,14 @@ model.device_          # the backend that actually ran: "cpu" or "gpu"
 
 `device="cpu"` is the default and the dependable backend. `device="gpu"`
 raises when no accelerator is available or when the GPU path does not
-cover the workload (multiclass is CPU-only), rather than falling back
-silently. `device="auto"` picks for you and currently always picks the
-CPU: no benchmark has established a workload size where end-to-end GPU
-training wins, so no crossover threshold ships enabled.
-`gpu_available()` reports whether this build can train on an accelerator.
+cover the workload, rather than falling back silently. Sparse input, an
+`eval_set`, and a Python objective callback are the workloads it does not
+cover today, and each says so by name. `device="auto"` picks for you and
+currently always picks the CPU, because no benchmark has established a
+workload size where end-to-end GPU training wins and no crossover threshold
+ships enabled. `gpu_available()` reports whether this build can train on an
+accelerator, which is decided when the extension is compiled rather than on
+the machine that runs it.
 
 The device is a training choice rather than part of the model, so saved
 models are identical either way and a loaded estimator carries no
@@ -280,15 +355,51 @@ time.
 
 ## Platform support
 
-Wheels currently target macOS on Apple silicon. The wheel bundles the Mojo
-runtime libraries it needs, so no Mojo or MAX installation is required at
-runtime. On other platforms, build from source with
-[pixi](https://pixi.sh) using the instructions in the repository.
+The first wheel target is macOS on Apple silicon, with Linux x86_64 and
+aarch64 after it. A wheel bundles the Mojo runtime libraries it needs, so no
+Mojo or MAX installation is required at runtime. Intel Macs, Windows, and
+free-threaded Python are out of scope, and the pinned toolchain currently
+fixes the interpreter at CPython 3.14.
+
+None of that has been published or validated yet. Every target, its expected
+artifact name, and the evidence behind its status is in
+[docs/PLATFORM_MATRIX.md](https://github.com/ajhendel/mojoboost/blob/main/docs/PLATFORM_MATRIX.md),
+where the rule is that a platform counts as validated when hardware ran the
+artifact and somebody wrote down what happened.
+
+Until then, build from source with [pixi](https://pixi.sh) using the
+instructions above.
+
+## When something goes wrong
+
+| What you see | What it means |
+|---|---|
+| `No matching distribution found for mojoboost` | The package is not on PyPI yet. Build from source |
+| `Requires-Python >=3.14` in pip's output | Your interpreter is older than the declared floor |
+| `... is not a supported wheel on this platform` | The wheel's tags do not describe your machine. Do not force it |
+| `ModuleNotFoundError: No module named 'mojoboost._mojoboost'` | Source checkout without a built extension. Run `pixi run build-python` |
+| `ImportError: ... Library not loaded: @rpath/libKGENCompilerRTShared.dylib` | The MAX runtime libraries were not found. Run through `pixi run`, or install a self-contained wheel |
+| `RuntimeError: device 'gpu' requested but no accelerator is available` | This build has no GPU path. Availability is fixed when the extension is compiled, not at runtime |
+| `RuntimeError: validation metrics are scored on the CPU` | An `eval_set` with `device="gpu"`. Use `device="cpu"` or `"auto"` |
+| `RuntimeError: sparse input trains on the CPU` | There is no sparse GPU kernel. Use `device="cpu"`, `"auto"`, or densify |
+| `device="auto"` chose the CPU and said nothing | Expected. The crossover table is empty, so `auto` keeps the CPU everywhere |
+
+Each case, with the full message and what to do about it, is in
+[docs/INSTALLATION.md](https://github.com/ajhendel/mojoboost/blob/main/docs/INSTALLATION.md#when-something-goes-wrong).
+Installation problems are in scope for the
+[bug report template](https://github.com/ajhendel/mojoboost/issues/new?template=bug_report.yml);
+accelerator results belong in the
+[hardware validation template](https://github.com/ajhendel/mojoboost/issues/new?template=hardware_validation.yml).
 
 ## Links
 
-Source, benchmarks against LightGBM, and the native Mojo API:
-[github.com/ajhendel/mojoboost](https://github.com/ajhendel/mojoboost)
+- Source, benchmarks against LightGBM, and the native Mojo API:
+  [github.com/ajhendel/mojoboost](https://github.com/ajhendel/mojoboost)
+- [Installation](https://github.com/ajhendel/mojoboost/blob/main/docs/INSTALLATION.md)
+- [LightGBM parity contract](https://github.com/ajhendel/mojoboost/blob/main/docs/LIGHTGBM_PARITY.md)
+- [GPU validation record](https://github.com/ajhendel/mojoboost/blob/main/docs/GPU_VALIDATION.md)
+- [Device selection policy](https://github.com/ajhendel/mojoboost/blob/main/docs/DEVICE_SELECTION.md)
+- [Contributing](https://github.com/ajhendel/mojoboost/blob/main/CONTRIBUTING.md)
 
 ## License
 

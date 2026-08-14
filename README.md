@@ -18,39 +18,91 @@ histogram-based split finding and leaf-wise (best-first) tree growth. Its
 benchmark configuration aligns important parameters with LightGBM for
 reproducible comparisons.
 
-## Five-minute start
+## Installation
 
-The current source install requires [pixi](https://pixi.sh). A Mojo or MAX
-installation is not required separately; pixi resolves the versions pinned by
-this repository.
+The command this project is building toward is one line.
+
+```sh
+pip install mojoboost
+```
+
+**It does not work yet.** Nothing has been published to PyPI and no release
+wheel exists to download, so today there is exactly one way to install
+mojoboost, and it is a source checkout with [pixi](https://pixi.sh).
+
+| State | What you type | Status today |
+|---|---|---|
+| Stable pip install | `pip install mojoboost` | **Not available.** No PyPI release exists |
+| A published release wheel | `pip install ./mojoboost-<version>-<tags>.whl` | **Not available.** No release has been built or published |
+| Source checkout with pixi | the four commands below | **Works today** |
+
+[docs/INSTALLATION.md](docs/INSTALLATION.md) is the full version of this,
+with what each state will require, the wheel filename for each platform, the
+first five minutes step by step, and the error messages an install can
+produce with what each one means.
+
+mojoboost publishes no source distribution, deliberately, so `pip install
+mojoboost` can never turn into a Mojo compile on a machine with no Mojo
+toolchain. It resolves to a wheel that matches your machine or it refuses.
+
+### The source install, which is the one that works
+
+A Mojo or MAX installation is not required separately; pixi resolves the
+versions pinned by this repository.
 
 ```sh
 git clone https://github.com/ajhendel/mojoboost.git
 cd mojoboost
 pixi install
 pixi run build-python
+```
+
+```sh
 PYTHONPATH=python python - <<'PY'
 from mojoboost import MojoBoostRegressor
 
 X = [[0.0], [1.0], [2.0], [3.0], [4.0], [5.0]]
 y = [0.0, 1.0, 4.0, 9.0, 16.0, 25.0]
 
-model = MojoBoostRegressor(n_estimators=20, num_leaves=7, device="cpu")
+model = MojoBoostRegressor(n_estimators=20, num_leaves=7, min_data_in_leaf=1)
 model.fit(X, y)
 print(model.predict([[1.5], [4.5]]))
 print("backend:", model.device_)
 PY
 ```
 
-Use `device="gpu"` to require an available supported accelerator. It raises
-on unsupported hardware or workloads rather than silently falling back. Use
-`device="auto"` only after reading [Device selection](#device-selection): its
-GPU crossover heuristic is deliberately disabled until end-to-end benchmark
-evidence establishes a trustworthy threshold.
+`min_data_in_leaf=1` is there because the default of 20 is larger than that
+toy dataset, and a model that cannot split predicts one constant.
 
-If the example fails, open a bug report using the repository issue template
-and include the output of `pixi run mojo --version`, your operating system,
-processor, and accelerator.
+### The first five minutes
+
+Import and diagnostics, a tiny regression, a validation set with early
+stopping, a bit-exact save and load, and what each device value does on your
+machine, in one script that prints each result.
+
+```sh
+PYTHONPATH=python python examples/install_smoke.py
+```
+
+It uses only the standard library, so it runs in the default pixi
+environment with no numpy installed. Step by step, with the same seven steps
+written out, in [docs/INSTALLATION.md](docs/INSTALLATION.md#the-first-five-minutes).
+
+### Devices, in one paragraph
+
+`device="cpu"` is the default and the dependable backend. `device="gpu"`
+requires an available supported accelerator and raises on unsupported
+hardware or workloads rather than silently falling back. `device="auto"`
+resolves to the CPU on every machine and every workload today, because its
+crossover heuristic is deliberately disabled until end-to-end benchmark
+evidence establishes a trustworthy threshold. Read
+[Device selection](#device-selection) before using it.
+
+If any of this fails, open a
+[bug report](https://github.com/ajhendel/mojoboost/issues/new?template=bug_report.yml),
+which covers installation problems, and paste the diagnostics block
+`examples/install_smoke.py` prints first, plus `pixi run mojo --version`,
+your operating system, processor, and accelerator.
 
 ## Why Mojo
 
@@ -296,7 +348,8 @@ Each raises rather than densifying silently.
 
 ## Python API
 
-Build the extension once with `bindings/build.sh`, then use the
+Build the extension once with `pixi run build-python` (which runs
+`bindings/build.sh`; see [Installation](#installation)), then use the
 scikit-learn style estimators in `python/mojoboost`:
 
 ```python
@@ -575,8 +628,14 @@ dependency-free suite, and one with numpy, pytest, scikit-learn, and
 pandas, running the estimator suite against the installed package from a
 neutral directory. The wheel bundles the Mojo runtime dylibs the extension
 links (delocate-style, with an `@loader_path` rpath), so installing it
-requires no Mojo or MAX toolchain. Wheels currently target macOS on Apple
-silicon; Linux wheels need a manylinux build.
+requires no Mojo or MAX toolchain.
+
+That wheel carries whatever platform tag your build machine produced, and it
+is for you rather than for redistribution. No wheel has been published
+anywhere, on any index or any release page. What a published one would be
+called, which platforms are targeted, and what evidence stands behind each
+row is in [docs/PLATFORM_MATRIX.md](docs/PLATFORM_MATRIX.md); what installing
+one will look like is in [docs/INSTALLATION.md](docs/INSTALLATION.md).
 
 ## Device selection
 

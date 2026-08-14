@@ -1,0 +1,218 @@
+{
+  "schema_version": "1.0.0",
+  "protocol_version": "1.0.0",
+  "is_template": true,
+  "record_id": "nvidia-BOARD-YYYY-MM-DD-HANDLE",
+  "submitted_utc": null,
+  "session_utc": null,
+
+  "contributor": {
+    "handle": "",
+    "platform": "github",
+    "display_name": null,
+    "affiliation": null,
+    "contact": null
+  },
+
+  "license": {
+    "grant": false,
+    "spdx": "Apache-2.0",
+    "attribution_required": true,
+    "attribution_text": null,
+    "employer_cleared": null
+  },
+
+  "hardware": {
+    "vendor": "nvidia",
+    "api": "cuda",
+    "device_name": "",
+    "index_row_id": null,
+    "arch": null,
+    "compute_units": null,
+    "units_note": "streaming multiprocessors",
+    "device_memory_bytes": null,
+    "device_count": null,
+    "machine_kind": null,
+    "instance_type": null,
+    "virtualized": null
+  },
+
+  "host": {
+    "cpu_model": null,
+    "cpu_cores_physical": null,
+    "cpu_cores_logical": null,
+    "cpu_performance_cores": null,
+    "cpu_efficiency_cores": null,
+    "memory_bytes": null,
+    "os_name": "",
+    "os_version": "",
+    "os_build": null,
+    "kernel": null,
+    "arch": "x86_64",
+    "hostname_redacted": true
+  },
+
+  "driver": {
+    "reporting_tool": "nvidia-smi",
+    "driver_version": null,
+    "runtime_version": null,
+    "toolkit_version": null,
+    "present": null,
+    "notes": "The CUDA driver is required. The CUDA toolkit is not, except for ncu and nsys in the profiling step."
+  },
+
+  "toolchain": {
+    "mojo_version": null,
+    "max_version": null,
+    "pixi_version": null,
+    "python_version": null,
+    "metal_toolchain": null
+  },
+
+  "source": {
+    "repo_url": "https://github.com/ajhendel/mojoboost",
+    "commit": "",
+    "branch": null,
+    "dirty": null,
+    "local_changes": null
+  },
+
+  "capture": {
+    "script": "hardware/capture/capture_nvidia.sh",
+    "script_version": null,
+    "raw_file": null,
+    "hand_edited": null,
+    "redactions": null
+  },
+
+  "runs": [
+    {
+      "command": "pixi run test",
+      "status": "not-run",
+      "skipped_reason": null,
+      "failure_text": null,
+      "duration_s": null,
+      "raw_file": null,
+      "notes": null
+    },
+    {
+      "command": "pixi run test-gpu",
+      "status": "not-run",
+      "skipped_reason": null,
+      "failure_text": null,
+      "duration_s": null,
+      "raw_file": null,
+      "notes": "If this prints `skipped: no accelerator` on a machine nvidia-smi can see, the status is skipped and the build did not see the device. That is a finding, not a pass."
+    },
+    {
+      "command": "MOJOBOOST_DISABLE_GPU=1 pixi run test",
+      "status": "not-run",
+      "skipped_reason": null,
+      "failure_text": null,
+      "duration_s": null,
+      "raw_file": null,
+      "notes": null
+    },
+    {
+      "command": "pixi run gpu-validate",
+      "status": "not-run",
+      "skipped_reason": null,
+      "failure_text": null,
+      "duration_s": null,
+      "raw_file": null,
+      "notes": null
+    },
+    {
+      "command": "MOJOBOOST_GPU_HIST_STRATEGY=atomic pixi run gpu-validate 20 100000 100",
+      "status": "not-run",
+      "skipped_reason": null,
+      "failure_text": null,
+      "duration_s": null,
+      "raw_file": null,
+      "notes": "Pairs with the tiled run below. The two must produce bit-identical histograms; a divergence is a correctness bug, not a tuning result."
+    },
+    {
+      "command": "MOJOBOOST_GPU_HIST_STRATEGY=tiled pixi run gpu-validate 20 100000 100",
+      "status": "not-run",
+      "skipped_reason": null,
+      "failure_text": null,
+      "duration_s": null,
+      "raw_file": null,
+      "notes": null
+    }
+  ],
+
+  "device_attributes": {
+    "name": null,
+    "api": null,
+    "arch_name": null,
+    "compute_capability": null,
+    "multiprocessor_count": null,
+    "warp_size": null,
+    "max_threads_per_block": null,
+    "max_threads_per_multiprocessor": null,
+    "max_blocks_per_multiprocessor": null,
+    "max_shared_memory_per_block": null,
+    "max_registers_per_block": null,
+    "max_grid_dim_x": null,
+    "max_grid_dim_y": null,
+    "clock_rate_khz": null,
+    "refused": null
+  },
+
+  "measurements": [],
+
+  "determinism": {
+    "repeat_runs_identical": null,
+    "repeat_count": null,
+    "strategies_agree": null,
+    "evidence": null,
+    "raw_file": null
+  },
+
+  "profiler": {
+    "tool": null,
+    "tool_version": null,
+    "achieved_occupancy": null,
+    "occupancy_limiter": null,
+    "static_shared_bytes": null,
+    "shared_atomic_conflicts": null,
+    "global_atomic_traffic": null,
+    "kernel_vs_transfer": null,
+    "metric_names_confirmed": null,
+    "raw_file": null
+  },
+
+  "findings": {
+    "failures": [],
+    "unsupported": [],
+    "workarounds_used": [],
+    "notes": null
+  },
+
+  "verdict": {
+    "correctness": "not-run",
+    "determinism": "not-run",
+    "phase_timings": "not-run",
+    "profiler": "not-run",
+    "unsupported_reason": null,
+    "contributor_summary": null
+  },
+
+  "raw_output": {
+    "files": [
+      {
+        "name": "",
+        "contains": "",
+        "truncated": null,
+        "sha256": null
+      }
+    ],
+    "complete": null,
+    "redactions": null
+  },
+
+  "conflicts": [],
+
+  "review": null
+}

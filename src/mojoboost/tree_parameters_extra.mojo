@@ -10,6 +10,32 @@ function of numbers can be dropped into those two shared entry points once and
 be live on every backend at once, which is what
 `handoffs/task12_tree_parameters.md` specifies.
 
+What is wired up, and where
+---------------------------
+`ExtraTreeParams` is carried on `tree.TreeParams` as `extra` and reaches the
+search through `tree._search` -> `split.find_best_split`. Three tiers, and the
+tier is a property of what the rule needs rather than of the backend:
+
+- Live wherever `tree._search` is called (the dense CPU grower, the sparse
+  grower, and the GPU grower's host split scan): `min_gain_to_split`,
+  `monotone_penalty`, `feature_contri`, and `cegb_tradeoff` x
+  `cegb_penalty_split`. Each is a function of the histogram, the node's row
+  count, and the node's depth, all of which every caller already passes.
+- Live in `tree.grow_tree` alone, and refused by `tree._search` for any other
+  caller: `extra_trees`/`extra_seed` (it needs the node id and the tree
+  index) and `max_delta_step`/`path_smooth` (they need the leaf's row count
+  and its parent's finished output). See `needs_grower_support`.
+- Parsed, validated, and refused: `cegb_penalty_feature_coupled` and
+  `forcedsplits_filename`, plus `linear_tree`/`linear_lambda` and
+  `cegb_penalty_feature_lazy` as before. Each names what it would take; see
+  `check_extra_option_supported`.
+
+`distributed.grow_tree_distributed` keeps private copies of `_search` and
+`_leaf_value` and so honors none of this; `train_gpu`'s device split search
+scores candidates in a kernel and honors none of it either. Both are recorded
+in `handoffs/integration_08_algorithms.md` as edits this integration could not
+make from the files it owns.
+
 What is here, with LightGBM's name and default
 ---------------------------------------------
 - `min_gain_to_split` (0.0): a floor a candidate's gain must clear.
@@ -337,6 +363,29 @@ struct FeaturePenalties(Copyable, Movable):
         if feature < 0 or feature >= len(self.cegb_penalty_feature_coupled):
             return 0.0
         return self.cegb_penalty_feature_coupled[feature]
+
+    def coupled_is_active(self) -> Bool:
+        """Whether any first-use cost would actually be charged.
+
+        The coupled ledger is the one CEGB half the grower cannot carry on its
+        own: "first use" is per-model, so it is state every trainer would have
+        to thread through every tree. `ExtraTreeParams.check_scalars` refuses
+        an active coupled vector for that reason, and this is the predicate it
+        refuses on — the vector's length alone is not enough, since an
+        all-zero vector charges nothing.
+        """
+        if self.cegb_tradeoff == 0.0:
+            return False
+        for f in range(len(self.cegb_penalty_feature_coupled)):
+            if self.cegb_penalty_feature_coupled[f] != 0.0:
+                return True
+        return False
+
+    def split_costs_active(self) -> Bool:
+        """Whether the per-split CEGB cost would change a gain. Unlike the
+        coupled cost this one is a function of (tradeoff, penalty, rows in the
+        leaf) alone, so the split search charges it with no ledger."""
+        return self.cegb_tradeoff != 0.0 and self.cegb_penalty_split != 0.0
 
     def penalized_gain(
         self,
@@ -987,9 +1036,29 @@ def check_extra_option_supported(name: String) raises:
         raise Error(
             "'cegb_penalty_feature_lazy' is not implemented; it charges for"
             " the rows that have not yet read a feature, which is per-row"
-            " state carried across the whole ensemble."
-            " 'cegb_penalty_feature_coupled' and 'cegb_penalty_split' are"
-            " implemented"
+            " state carried across the whole ensemble. 'cegb_penalty_split'"
+            " and 'cegb_tradeoff' are implemented"
+        )
+    if name == "cegb_penalty_feature_coupled":
+        raise Error(
+            "'cegb_penalty_feature_coupled' is parsed but not applied; it is"
+            " charged the first time a feature is split on anywhere in the"
+            " ensemble, so it needs a per-model feature-use ledger threaded"
+            " through every trainer and every grower. 'cegb_penalty_split'"
+            " and 'cegb_tradeoff' are applied by the split search today"
+        )
+    if (
+        name == "forcedsplits_filename"
+        or name == "forced_splits_filename"
+        or name == "forced_splits"
+        or name == "fs"
+    ):
+        raise Error(
+            "'forcedsplits_filename' is parsed but not applied;"
+            " `parse_forced_splits` validates the document, but applying a"
+            " forced node means mapping its raw threshold to a bin, and the"
+            " grower is handed a BinnedMatrix, which carries no bin edges."
+            " Applying forced splits needs the BinMapper at `tree.grow_tree`"
         )
 
 
@@ -1046,12 +1115,53 @@ struct ExtraTreeParams(Copyable, Movable):
             or not self.forced.is_empty()
         )
 
-    def check(
-        self, n_features: Int, num_leaves: Int, max_depth: Int,
-        min_data_in_leaf: Int,
-    ) raises:
-        """Range checks that need no training data, in the style of
-        `params._validate`: values are rejected rather than clamped."""
+    def needs_leaf_finish(self) -> Bool:
+        """Whether `finish_leaf_output` would move a leaf's value.
+
+        This is the half of the bundle a *grower* has to honor rather than a
+        split search: it needs the leaf's row count and its parent's finished
+        output, neither of which a histogram carries. `tree._search` refuses
+        an active value from a grower that has not opted in, so a backend that
+        does not apply it reports that instead of quietly emitting unsmoothed
+        leaves.
+        """
+        return self.max_delta_step > 0.0 or self.path_smooth > 0.0
+
+    def needs_node_identity(self) -> Bool:
+        """Whether an active rule reads the node id and the tree index.
+
+        Only `extra_trees` does: its threshold draw is keyed by
+        (seed, tree index, node id, feature). A grower that does not pass its
+        node ids would draw every node's threshold from the same stream, so
+        `tree._search` refuses this too rather than let a caller's default 0
+        stand in for a node id.
+        """
+        return self.extra_trees
+
+    def needs_grower_support(self) -> Bool:
+        """Whether this bundle can only be honored by a grower that opts in.
+
+        The complement -- `min_gain_to_split`, `monotone_penalty`,
+        `feature_contri`, and the per-split CEGB cost -- is a function of the
+        histogram, the node's row count, and the node's depth, all of which
+        every caller of `tree._search` already passes, so those are live on
+        every backend that routes through it.
+        """
+        return self.needs_leaf_finish() or self.needs_node_identity()
+
+    def check_scalars(self, min_data_in_leaf: Int) raises:
+        """The half of `check` that needs neither the feature count nor the
+        growth budget, so a parameter string can be rejected before any data
+        is read (see `params._validate`).
+
+        This is also where the two options that are parsed but not applied are
+        refused. Both are real LightGBM features whose missing piece is
+        outside a split search: the coupled CEGB cost needs a per-model
+        feature-use ledger, and a forced-split document needs the bin mapper
+        to turn a raw threshold into a bin. Refusing them here is the
+        repository's rule -- say so, never ignore it -- and keeps a caller
+        from reading an unforced tree as a forced one.
+        """
         if not _is_finite(self.min_gain_to_split) or (
             self.min_gain_to_split < 0.0
         ):
@@ -1081,6 +1191,20 @@ struct ExtraTreeParams(Copyable, Movable):
                 "path_smooth needs min_data_in_leaf of at least 2, got ",
                 min_data_in_leaf,
             )
+        if self.penalties.coupled_is_active():
+            check_extra_option_supported("cegb_penalty_feature_coupled")
+        if not self.forced.is_empty():
+            check_extra_option_supported("forcedsplits_filename")
+
+    def check(
+        self, n_features: Int, num_leaves: Int, max_depth: Int,
+        min_data_in_leaf: Int,
+    ) raises:
+        """Range checks that need no training data, in the style of
+        `params._validate`: values are rejected rather than clamped. The
+        grower calls this once per tree, so the vector lengths are checked
+        against the dataset actually being fitted."""
+        self.check_scalars(min_data_in_leaf)
         self.penalties.check_features(n_features)
         self.forced.check_features(n_features)
         self.forced.check_budget(num_leaves, max_depth)

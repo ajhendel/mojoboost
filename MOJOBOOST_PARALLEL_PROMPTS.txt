@@ -1,8 +1,8 @@
-MOJOBOOST PARALLEL CLAUDE CODE ROUND - ALL 21 TASKS IN ONE FILE
+MOJOBOOST PARALLEL CLAUDE CODE ROUND - ALL 27 TASKS IN ONE FILE
 
 COPYING INSTRUCTIONS
 
-This is the only prompt file for this round. Each TASK section is a complete standalone prompt. Copy one entire TASK section into one Claude Code session. Start all 21 sessions immediately and in parallel. Do not give multiple TASK sections to one session.
+This is the only prompt file for this round. Each TASK section is a complete standalone prompt. Copy one entire TASK section into one Claude Code session. Start all 27 tasks immediately and in parallel in the same shared repository. Do not create fresh worktrees, branches, clones, or separate checkouts. Every task has exclusive file ownership and must preserve unrelated concurrent work. Do not give multiple TASK sections to one session. No task may write or run tests, builds, benchmarks, profilers, project code, CI workflows, retry loops, polling loops, watch processes, or background jobs.
 
 
 ======================================================================
@@ -399,3 +399,92 @@ Refactor _eval.py toward a future thin facade over native registry queries while
 
 The handoff must specify the minimal binding API, compile-time versus runtime representation, code deletable after wiring, every discovered semantic disagreement, and exact future focused and differential validation commands.
 
+=====================================================================
+TASKS 22 THROUGH 27: IMMEDIATE PARALLEL GPU-ORIENTED ALGORITHM OPTIMIZATION
+======================================================================
+
+Tasks 22 through 27 start immediately alongside Tasks 01 through 21. They explore algorithmic changes rather than merely tuning kernel launch parameters. Every task owns new isolated Mojo modules and handoff files. They must not edit the central trainer, existing model semantics, bindings, Python, tests, or public documentation. No proposed algorithm becomes a default or a public claim until Phase 2 correctness and end-to-end benchmark evidence exists. A negative feasibility result is useful and must not be hidden behind speculative code.
+
+======================================================================
+TASK 22: BATCHED MULTI-LEAF HISTOGRAM CONSTRUCTION
+======================================================================
+
+Work immediately and independently in the mojoboost repository. This task runs in parallel with all other Phase 1 lanes. Inspect leaf-wise growth, active-row ranges, histogram subtraction, GPU tiling, and split queues before editing. Preserve unrelated work. Your exclusive ownership is src/mojoboost/gpu_leaf_batching.mojo, src/mojoboost/gpu_frontier.mojo, bench/apple/leaf_batching_plan.json, and handoffs/algorithm_22_leaf_batching.md. Do not edit train_gpu.mojo, histogram_gpu.mojo, tree.mojo, split.mojo, existing GPU modules, Python, bindings, tests, docs, packaging, or workflows.
+
+DO NOT WRITE OR RUN TESTS. Do not execute Mojo, Pixi, Python, pytest, builds, benchmarks, profilers, CI, retries, polling, or background jobs. Static reasoning and isolated implementation only. Do not commit unless asked.
+
+MOJO-FIRST RULE: frontier construction, row ranges, histogram batching, reductions, and candidate metadata belong entirely in Mojo.
+
+Design and implement primitives for processing several active leaves in one GPU launch instead of one leaf at a time. Preserve best-first leaf-wise semantics: batching histogram construction must not mean accepting splits out of gain order. Separate parallel candidate computation from serial best-candidate commitment. Use compact row ranges, per-leaf offsets, bounded scratch memory, histogram subtraction where one child is known, and deterministic result ordering. Handle highly unbalanced frontiers, tiny leaves, feature sampling per node, categorical splits, and multiclass output planes.
+
+Quantify work and memory symbolically. Define when batching one, several, or all candidate leaves is expected to improve occupancy and when partial-buffer growth makes it worse. Do not invent a crossover threshold. The handoff must specify integration seams, semantic invariants, memory bounds, race and ordering risks, future focused cases, and decisive benchmark shapes.
+
+======================================================================
+TASK 23: FUSED OBJECTIVE, SAMPLING, AND ROOT HISTOGRAM PIPELINE
+======================================================================
+
+Work immediately and independently in the mojoboost repository. Inspect native GPU objectives, prediction residency, GOSS and bagging, root histogram construction, multiclass layout, and buffer lifetimes. Preserve unrelated work. Your exclusive ownership is src/mojoboost/gpu_fused_round.mojo, src/mojoboost/gpu_gradient_stream.mojo, bench/apple/fused_round_plan.json, and handoffs/algorithm_23_fused_round.md. Do not edit objective implementations, train_gpu.mojo, histogram_gpu.mojo, sampling modules, runtime modules, Python, bindings, tests, docs, packaging, or workflows.
+
+DO NOT WRITE OR RUN TESTS. Do not execute Mojo, Pixi, Python, pytest, builds, benchmarks, profilers, CI, retries, polling, or background jobs. Static reasoning and isolated implementation only. Do not commit unless asked.
+
+MOJO-FIRST RULE: prediction transforms, gradients, Hessians, sampling masks, compensation weights, and histogram input production remain device-side Mojo operations.
+
+Explore and implement narrow primitives for fusing or streaming the beginning of a boosting round: resident raw predictions to objective gradient/Hessian generation, optional row-selection metadata, and root histogram accumulation without unnecessary full host staging or redundant device memory passes. Do not fuse operations whose synchronization or reuse semantics require materialized arrays for later leaves. Preserve sample weights, class weights, GOSS compensation, bagging determinism, custom-objective fallback, and multiclass softmax normalization.
+
+Compare three designs on paper: materialized gradient planes, tiled gradient production consumed immediately by root histograms, and kernel fusion. Identify bandwidth saved, extra recomputation, register/shared-memory pressure, and which arrays later tree nodes still require. Implement only reusable primitives supported by the reasoning. The handoff must clearly recommend or reject each design and name the later profiler evidence required.
+
+======================================================================
+TASK 24: EXPERIMENTAL GPU-FRIENDLY LEVEL-WISE GROWTH
+======================================================================
+
+Work immediately and independently in the mojoboost repository. Inspect leaf-wise growth semantics, max depth, split queues, model representation, categorical and missing routing, and LightGBM quality assumptions. Preserve unrelated work. Your exclusive ownership is src/mojoboost/gpu_levelwise.mojo, src/mojoboost/levelwise_policy.mojo, docs/design/GPU_LEVELWISE.md, and handoffs/algorithm_24_levelwise.md. Do not edit tree.mojo, boosting.mojo, train_gpu.mojo, Model, serialization, Python, bindings, tests, public README, packaging, or workflows.
+
+DO NOT WRITE OR RUN TESTS. Do not execute Mojo, Pixi, Python, pytest, builds, benchmarks, profilers, CI, retries, polling, or background jobs. Static reasoning and isolated implementation only. Do not commit unless asked.
+
+MOJO-FIRST RULE: experimental growth policy, node frontiers, split decisions, row partitioning, and tree construction belong in Mojo.
+
+Investigate a level-wise or depth-batched GPU growth mode as an explicitly different algorithm, not a hidden optimization of leaf-wise training. The purpose is to expose much more parallel work per launch and reduce host/device decision frequency. Define how num_leaves, max_depth, min-data/Hessian constraints, monotonic and interaction constraints, categorical splits, missing routing, feature sampling, and deterministic tie-breaking apply. Preserve the ordinary Tree representation if possible.
+
+Do not replace leaf-wise growth or claim LightGBM equivalence. Do not expose a public parameter in this lane. Implement isolated frontier and commitment primitives only if their semantics are coherent. The design must state expected quality differences, workloads likely to benefit, memory growth by depth, stopping behavior, and how a future benchmark would compare speed at matched quality rather than matched tree count.
+
+======================================================================
+TASK 25: GPU-OPTIMIZED BINNED DATA LAYOUT AND COMPRESSION
+======================================================================
+
+Work immediately and independently in the mojoboost repository. Inspect BinnedMatrix, max-bin rules, GPU uploads, active-row access, feature sampling, categorical bin ids, missing bins, and current row/feature-major layouts. Preserve unrelated work. Your exclusive ownership is src/mojoboost/gpu_binned_layout.mojo, src/mojoboost/gpu_bin_packing.mojo, bench/apple/bin_layout_plan.json, and handoffs/algorithm_25_binned_layout.md. Do not edit binning.mojo, histogram_gpu.mojo, train_gpu.mojo, sparse modules, Python, bindings, tests, docs, packaging, or workflows.
+
+DO NOT WRITE OR RUN TESTS. Do not execute Mojo, Pixi, Python, pytest, builds, benchmarks, profilers, CI, retries, polling, or background jobs. Static reasoning and isolated implementation only. Do not commit unless asked.
+
+MOJO-FIRST RULE: packing, transposition, addressing, missing-bin representation, and GPU layout policy belong entirely in Mojo.
+
+Design alternative device layouts for binned data: current feature-major bytes, row-major tiles, feature-blocked tiles, and packed 4-bit or 5/6/7-bit representations for smaller bin counts. Evaluate coalescing under compact active-row indices, feature subsampling, categorical access, missing bins, upload cost, decode instruction cost, alignment, and random versus contiguous leaf rows. Build checked addressing and packing primitives with an ordinary UInt8 fallback.
+
+Do not change host binning or model semantics. Do not assume compression is faster; lower transfer and cache traffic can lose to bit extraction. Define an explicit cost model and policy inputs but no default threshold. The handoff must include layout diagrams, byte formulas, decode invariants, portability risks, integration seam, and future profiler questions.
+
+======================================================================
+TASK 26: MULTICLASS AND MULTI-OUTPUT TREE BATCHING
+======================================================================
+
+Work immediately and independently in the mojoboost repository. Inspect multiclass softmax training, one-tree-per-class rounds, prediction layout, gradient planes, GPU buffers, split selection, and per-class independence. Preserve unrelated work. Your exclusive ownership is src/mojoboost/gpu_multiclass_batch.mojo, src/mojoboost/gpu_output_planes.mojo, bench/apple/multiclass_batch_plan.json, and handoffs/algorithm_26_multiclass_batch.md. Do not edit train_gpu.mojo, boosting.mojo, objective modules, Model, Python, bindings, tests, docs, packaging, or workflows.
+
+DO NOT WRITE OR RUN TESTS. Do not execute Mojo, Pixi, Python, pytest, builds, benchmarks, profilers, CI, retries, polling, or background jobs. Static reasoning and isolated implementation only. Do not commit unless asked.
+
+MOJO-FIRST RULE: output-plane layout, softmax buffers, per-class tree work, batched histograms, and result ordering belong in Mojo.
+
+Design and implement primitives for growing or evaluating several independent class trees concurrently within one boosting round. Preserve softmax semantics: all class gradients derive from the same pre-round score matrix, and score updates commit only after the round's class trees are complete. Explore class-major versus row-major gradient/prediction layout, batching histograms across classes, shared binned-data reads, memory limits for many classes, deterministic ordering, and small-class versus large-class policies.
+
+Do not generalize to arbitrary multi-output objectives without a real contract. Do not change serialized tree ordering or prediction shapes. The handoff must identify achievable parallelism, memory formulas, synchronization points, integration requirements, quality invariants, and benchmark cases across 3, 10, 100, and highly imbalanced classes.
+
+======================================================================
+TASK 27: HYBRID CPU/GPU LEAF SCHEDULING AND HISTOGRAM REUSE
+======================================================================
+
+Work immediately and independently in the mojoboost repository. Inspect CPU/GPU histogram interfaces, active-row sizes, histogram subtraction, CPU scheduler thresholds, persistent GPU runtime, and split queue behavior. Preserve unrelated work. Your exclusive ownership is src/mojoboost/hybrid_leaf_scheduler.mojo, src/mojoboost/histogram_cache_policy.mojo, docs/design/HYBRID_TRAINING.md, and handoffs/algorithm_27_hybrid_scheduler.md. Do not edit CPU or GPU histogram implementations, train_gpu.mojo, tree.mojo, boosting.mojo, device policy, Python, bindings, tests, public README, packaging, or workflows.
+
+DO NOT WRITE OR RUN TESTS. Do not execute Mojo, Pixi, Python, pytest, builds, benchmarks, profilers, CI, retries, polling, or background jobs. Static reasoning and isolated implementation only. Do not commit unless asked.
+
+MOJO-FIRST RULE: leaf scheduling, histogram ownership, cache keys, transfer decisions, and deterministic commitment belong in Mojo. Python must not schedule individual leaves.
+
+Investigate a hybrid algorithm in which large leaves remain on the GPU while very small leaves may build histograms on the CPU, without changing best-first split semantics. Define ownership of binned data, gradients, active rows, histogram caches, sibling subtraction, transfers, and synchronization. Avoid copying a small leaf to the CPU when the required state transfer costs more than its histogram. Explore reuse of parent and sibling histograms across devices and invalidation under feature sampling.
+
+Do not add thresholds without measurements and do not let CPU/GPU completion order affect tie-breaking or the chosen split. Implement policy and bookkeeping primitives only where the state model is unambiguous. The handoff must provide a state machine, cost-model inputs, determinism contract, cache-memory bounds, failure fallback, integration seam, and future crossover experiments.

@@ -69,6 +69,19 @@ Intentional differences from LightGBM
 from .gain import leaf_score
 from .metrics import _argsort
 
+# The arithmetic below used to be written inline here. It now lives in one
+# place so the category partition search and the ordinal scan score, filter,
+# and cap through the same formulas; `handoffs/task12_tree_parameters.md`
+# asks for exactly this substitution, and no parameter moves with it -- this
+# module still owns every categorical hyperparameter.
+from .tree_parameters_extra import (
+    cat_effective_l2,
+    cat_enters_search,
+    cat_partition_gain,
+    cat_side_cap,
+    cat_sort_key,
+)
+
 # A 256-bit set covers every bin id representable in the UInt8 binned
 # matrix, so a categorical node's set is a fixed 4-word bitset.
 comptime CAT_BITSET_WORDS = 4
@@ -349,10 +362,17 @@ def _onehot_search(
         if right_h < min_child_hess:
             continue
         var right_g = total_g - left_g
-        var gain = (
-            leaf_score(left_g, left_h, lambda_l1, lambda_reg)
-            + leaf_score(right_g, right_h, lambda_l1, lambda_reg)
-            - parent_score
+        # One-vs-rest scores its children with plain lambda_l2, so the shared
+        # partition formula is used with no cat_l2.
+        var gain = cat_partition_gain(
+            left_g,
+            left_h,
+            right_g,
+            right_h,
+            lambda_l1,
+            lambda_reg,
+            0.0,
+            parent_score,
         )
         if gain > best.gain:
             var bitset = cat_empty()
@@ -386,10 +406,12 @@ def _sorted_search(
     var candidates = List[Int]()
     var keys = List[Float64]()
     for t in range(1, n_categories + 1):
-        if Float64(count[base + t]) < cat.cat_smooth:
+        if not cat_enters_search(count[base + t], cat.cat_smooth):
             continue
         candidates.append(t)
-        keys.append(grad[base + t] / (hess[base + t] + cat.cat_smooth))
+        keys.append(
+            cat_sort_key(grad[base + t], hess[base + t], cat.cat_smooth)
+        )
     var used = len(candidates)
     if used < 2:
         return best^
@@ -399,10 +421,8 @@ def _sorted_search(
     for i in range(used):
         sorted_bins.append(candidates[order[i]])
 
-    var l2 = lambda_reg + cat.cat_l2
-    var max_num_cat = cat.max_cat_threshold
-    if (used + 1) // 2 < max_num_cat:
-        max_num_cat = (used + 1) // 2
+    var l2 = cat_effective_l2(lambda_reg, cat.cat_l2)
+    var max_num_cat = cat_side_cap(used, cat.max_cat_threshold)
 
     for d in range(2):
         var dir = 1 if d == 0 else -1

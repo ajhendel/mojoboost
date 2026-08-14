@@ -1,0 +1,96 @@
+PURPOSE: Copy-and-paste invitations for individual people. Six variants, each plain UTF-8 with Unix LF line endings.
+
+HOW TO USE: Pick one variant, copy the text under it, replace every <PLACEHOLDER>, and delete the USE WHEN and CHANNEL lines before sending. Send these to people individually. The broadcast announcements are the six posts in this directory; these are the messages that actually recruit somebody, and they only work because they are addressed to a person and reference something that person did.
+
+BEFORE SENDING: every link points at github.com/mojoboost-ml, which is live only after the transfer described in ORG_MIGRATION_CHECKLIST.txt. If the transfer has not happened, either wait or substitute github.com/ajhendel/mojoboost.
+
+WHAT NOT TO DO: do not send more than one of these to the same person, do not send a cold invite to somebody who has never expressed interest in Mojo or in gradient boosting, and do not describe mojoboost as anything other than an experimental alpha. The project's whole credibility rests on not overstating, and a recruiting message is the easiest place to lose that.
+
+
+VARIANT 1: COLD INVITE, MOJO OR GPU PROGRAMMING BACKGROUND
+USE WHEN: reaching someone active in the Mojo community whose work suggests they would find the GPU or SIMD problems interesting.
+CHANNEL: Modular forum direct message, Discord direct message, or email.
+
+Hi <NAME>,
+
+I saw <SPECIFIC THING THEY WROTE, BUILT, OR ANSWERED> and thought you might find this interesting.
+
+I have been building mojoboost, a gradient-boosted decision tree library written natively in Mojo. It is in the LightGBM family, histogram-based split finding with leaf-wise growth, with a familiar Python API and a GPU path that runs on the Metal GPU already inside an Apple Silicon Mac. Training works end to end on CPU and GPU. It is an experimental alpha, not a production replacement for LightGBM, and the repository is explicit about which parts are validated and which are not.
+
+The reason I am writing to you specifically is <THE OPEN PROBLEM THAT MATCHES THEIR BACKGROUND, for example: the Metal histogram kernel needs order-preserving active-row compaction and I would value a second opinion on the approach / split search still happens on the host and moving it to the device is the next real speedup / I would like someone who knows Mojo's parallelism primitives better than I do to look at the multicore threshold>.
+
+If any of that appeals, the repository is https://github.com/mojoboost-ml/mojoboost and the five-minute example in the README is genuinely five minutes. Contributing is deliberately low friction: nothing waits on my approval, and once someone has landed a couple of changes they get direct push access. GOVERNANCE.md has the details.
+
+Entirely fine to ignore this. If it is not your thing, a pointer to somebody it might suit would be just as useful.
+
+<YOUR NAME>
+
+
+VARIANT 2: COLD INVITE, GRADIENT BOOSTING BACKGROUND
+USE WHEN: reaching someone who works on GBDT algorithms, LightGBM or XGBoost internals, or tabular machine learning.
+CHANNEL: email or direct message.
+
+Hi <NAME>,
+
+I am building mojoboost, a gradient-boosted decision tree library written from scratch in Mojo, and I am looking for people who know what LightGBM actually does rather than what its documentation says it does.
+
+The shape is familiar: quantile binning into uint8, histogram accumulation with the sibling subtraction trick, leaf-wise growth, the standard second-order gain. What is different is that the hot loop is written in a language with explicit SIMD and compile-time specialization, and the same source targets the GPU. The bet is a substantially simpler codebase at competitive speed. That bet is not settled yet.
+
+Where I could use somebody with your background is differential testing against LightGBM, and the parity contract in docs/LIGHTGBM_PARITY.md, which is the file that states what is supported and which differences are deliberate. Every gap you find in it is a real gap. Categorical handling, ranking objectives, and missing-value semantics are the areas where I would least trust my own reading of LightGBM's behavior.
+
+Repository: https://github.com/mojoboost-ml/mojoboost
+Parity contract: https://github.com/mojoboost-ml/mojoboost/blob/main/docs/LIGHTGBM_PARITY.md
+
+It is an experimental alpha and I would rather hear that something is wrong than that it looks nice. Filing an issue that says "LightGBM does X here and this does Y" is a complete contribution and needs no code.
+
+<YOUR NAME>
+
+
+VARIANT 3: HARDWARE VALIDATION ASK
+USE WHEN: reaching someone who has NVIDIA or AMD hardware, or a Mac of a generation nobody has tested. This is the highest-value ask in the file, because it is specific, bounded, and something the maintainers cannot do themselves.
+CHANNEL: anywhere. Also works as a comment on a thread where somebody mentioned their hardware.
+
+Hi <NAME>,
+
+You mentioned you have <SPECIFIC HARDWARE>. Would you be willing to run one validation pass on it?
+
+mojoboost is a gradient-boosted tree library written in Mojo, with a GPU path. Its correctness has been exercised on an Apple M4 and on nothing else. NVIDIA and AMD have never been validated on real hardware, and the repository says so rather than implying otherwise. A single run from a machine I do not own is worth more to this project right now than almost anything I could write myself.
+
+The procedure is documented at https://github.com/mojoboost-ml/mojoboost/blob/main/docs/GPU_VALIDATION.md and there is an issue template that asks for exactly the fields that make a result comparable. It is a clone, a pixi install, and one command. Perhaps twenty minutes, most of it waiting.
+
+A failure is a better result than a success and I would rather have it. If it does not build, does not run, or produces the wrong numbers, that is the finding, and pasting the error into an issue is the whole contribution.
+
+<YOUR NAME>
+
+
+VARIANT 4: SHORT FORM
+USE WHEN: a chat channel, a reply in a thread, or anywhere a long message would be out of place.
+CHANNEL: Discord, forum reply, social direct message.
+
+I have been building mojoboost, a gradient-boosted tree library written natively in Mojo with an Apple Silicon GPU path. Experimental alpha, training works end to end, and the repository is honest about what is validated and what is not. If <GPU kernels / GBDT internals / packaging / testing against LightGBM> is your thing, I would value the help, and contributing is low friction by design. https://github.com/mojoboost-ml/mojoboost
+
+
+VARIANT 5: AFTER SOMEBODY'S FIRST CONTRIBUTION LANDS
+USE WHEN: a first pull request from a new contributor has merged, or somebody filed an issue good enough that you want them to stay. Send it as a comment on the merged pull request or the issue.
+CHANNEL: GitHub comment.
+
+Thank you for this, it is merged.
+
+Worth knowing how this project works, since it is not the usual arrangement. Nothing here waits on my approval. Your pull request merged when continuous integration went green, and that is the intended path rather than an oversight. The only changes that stop for a human are workflows, dependencies, packaging, and release tooling, which is a supply chain concern and not a judgment about anyone.
+
+If you want to keep going, <THE SPECIFIC NEXT THING, for example: the adjacent case in <FILE> has the same problem / this would pair well with a test for <CASE> / the parity contract has an entry that your change makes newly reachable>. And if this was a one-off fix for something that was blocking you, that is a completely legitimate reason to have been here.
+
+Either way, if you land another change or two, ask me for direct push access and you will have it. GOVERNANCE.md describes the bar, which is deliberately low: a couple of substantive contributions and evidence you will not break things carelessly. Asking is the expected way to get it and self-nomination carries no penalty at all.
+
+
+VARIANT 6: OFFERING WRITE ACCESS
+USE WHEN: an active contributor has cleared the bar in GOVERNANCE.md and has not asked. Do not wait to be asked; most people will not.
+CHANNEL: GitHub comment on their most recent merged pull request, or direct message.
+
+<NAME>, you have landed <NUMBER> changes now and they have all arrived with tests and without needing anyone else to finish them. I would like to give you direct push access. Any objection?
+
+Concretely that means being added to the contributors team, which carries Write on the repository. You push to main directly for anything small and self-contained, you open a pull request when you want another pair of eyes or when the change is big enough that others should see it coming, and the only hard rules are running the focused tests before you push, never force-pushing main, and not self-merging a change to workflows, dependencies, or packaging. GOVERNANCE.md has the full list.
+
+What it does not mean: any obligation to keep contributing, to review anybody else's work, or to be available. Going quiet is not doing anything wrong, and the access does not come with expectations attached.
+
+Say the word and I will add you.

@@ -1,0 +1,595 @@
+# Installing mojoboost
+
+> [!IMPORTANT]
+> mojoboost is an experimental public alpha. It trains, predicts, saves, and
+> loads today, and people can use it for real work on the platform below.
+> It is not yet a drop-in production replacement for LightGBM or XGBoost,
+> and no wheel has been published anywhere. Read
+> [docs/LIGHTGBM_PARITY.md](LIGHTGBM_PARITY.md) for what the library
+> promises and [docs/GPU_VALIDATION.md](GPU_VALIDATION.md) before believing
+> anything about an accelerator.
+
+The command this project is building toward is one line.
+
+```sh
+pip install mojoboost
+```
+
+**That command does not work yet.** Nothing has been published to PyPI, the
+name has not been reserved, and no release wheel exists to download. This
+page separates the command we want from the two things that are actually
+available, so nobody spends an afternoon on an install path that was never
+going to work.
+
+## Three states, and which one you are in
+
+| State | What you type | Status today |
+|---|---|---|
+| 1. Stable pip install | `pip install mojoboost` | **Not available.** No PyPI release exists |
+| 2. A published release wheel | `pip install ./mojoboost-<version>-<tags>.whl` | **Not available.** No release has been built or published |
+| 3. Source checkout with Pixi | `git clone`, `pixi install`, `pixi run build-python` | **Works today.** This is how every current user installs mojoboost |
+
+Pick by what you are trying to do.
+
+- You want to use mojoboost in an ordinary Python project, today. Only state
+  3 exists, and it needs a Pixi environment and a few minutes of build time.
+  There is no way around that yet.
+- You want to use mojoboost in an ordinary Python project once it ships.
+  Read state 1 for the contract, then watch the repository releases.
+- You are contributing, or you want the Mojo API, the C ABI, or the CLI.
+  State 3 is the only one that gives you those at all.
+
+One thing that will never appear on this page is a command that looks like a
+plain pip install and quietly turns into a Mojo compile on a machine with no
+Mojo toolchain. mojoboost publishes no source distribution, deliberately, so
+pip cannot fall back to building from source and cannot fail an hour later
+with a compiler error. See
+[Why there is no sdist](#why-there-is-no-sdist).
+
+---
+
+## State 1. Stable pip install (not available yet)
+
+This is the target, written down now so the contract is fixed before the
+first release rather than after it.
+
+```sh
+python -m pip install --only-binary=:all: mojoboost
+```
+
+`--only-binary=:all:` is not decoration. It tells pip to refuse anything that
+is not a prebuilt wheel, which is exactly the guarantee this project wants to
+make, and it makes an install fail fast and legibly on a platform we do not
+publish for.
+
+What that install will contain, when it exists.
+
+- The `mojoboost` Python package and one compiled extension module,
+  `_mojoboost`, built from the same Mojo sources as the rest of the library.
+- The Mojo and MAX runtime libraries the extension links, bundled inside the
+  wheel with loader-relative paths. **No Mojo installation, no MAX
+  installation, no conda, and no compiler are required to run it.**
+- Nothing else. numpy is optional, scikit-learn is optional, scipy is never
+  imported.
+
+What it will require.
+
+| Requirement | Value today | Where it is decided |
+|---|---|---|
+| Python | 3.14 | `requires-python` in `python/pyproject.toml`, which follows the interpreter the pinned MAX build targets |
+| Platform | macOS on Apple silicon first, Linux x86_64 and aarch64 after that | [docs/PLATFORM_MATRIX.md](PLATFORM_MATRIX.md) |
+| numpy | optional | plain Python sequences work without it; `pip install "mojoboost[numpy]"` pulls it in |
+
+The Python floor is the most likely of these to move before the first
+release. It is an artifact of the toolchain pin rather than a language
+requirement, and whether it can be lowered honestly is being worked out in
+`docs/PYTHON_SUPPORT.md`. Treat 3.14 as the current declared value, not as a
+settled decision.
+
+### What `pip install mojoboost` does right now
+
+It fails, and the failure is the correct one.
+
+```text
+ERROR: Could not find a version that satisfies the requirement mojoboost (from versions: none)
+ERROR: No matching distribution found for mojoboost
+```
+
+That is pip saying the package does not exist on the index. It is not a
+network problem, a proxy problem, or a pip version problem, and no flag fixes
+it. Go to state 3.
+
+### Why there is no sdist
+
+A source distribution would let pip download mojoboost on any machine, start
+a build, and then fail deep inside a toolchain the user never asked for and
+does not have. The compile needs Mojo and MAX from a pinned Pixi environment,
+so a source build on an ordinary Python machine cannot succeed, and an
+install that fails after eight minutes of confusing output is worse than one
+that refuses in a second.
+
+So `pip install mojoboost` will only ever resolve to a wheel that matches the
+machine, or to a clean "no matching distribution found". If you want to build
+from source, that is state 3, and it is a deliberate, documented act rather
+than a silent fallback.
+
+---
+
+## State 2. A published release wheel (not available yet)
+
+When a release exists, its wheels will be attached to a GitHub release, one
+per supported platform, with a `SHA256SUMS` file next to them. This is the
+path for anyone who wants the artifact before or without PyPI, or who
+mirrors artifacts internally.
+
+**No release has been built or published.** The steps below are the contract
+the release machinery is being built against, and none of them has been
+executed. Every filename here comes from
+[docs/PLATFORM_MATRIX.md](PLATFORM_MATRIX.md), which is the authority on
+which targets are real.
+
+### Pick the wheel for your exact platform
+
+A wheel filename is a promise about the machine it runs on, and pip enforces
+it. There is one wheel per row, and no row is a near enough match for another.
+
+| Your machine | The wheel to download |
+|---|---|
+| Apple silicon Mac, Python 3.14 | `mojoboost-0.1.0-cp314-cp314-macosx_26_0_arm64.whl` |
+| Linux x86_64, Python 3.14 | `mojoboost-0.1.0-cp314-cp314-manylinux_2_28_x86_64.whl` |
+| Linux aarch64, Python 3.14 | `mojoboost-0.1.0-cp314-cp314-manylinux_2_28_aarch64.whl` |
+| Intel Mac | none, and there will not be one |
+| Windows | none |
+| Free-threaded Python (`3.14t`) | none |
+
+Read the filename left to right. `cp314` is the interpreter,
+`macosx_26_0_arm64` is the operating system floor and the processor
+architecture. If either half does not describe your machine, that wheel will
+not install, and forcing it is a way to turn a clean refusal into a crash at
+import time.
+
+The macOS floor of 26.0 is a real constraint, not a typo, and it is higher
+than it should be. It comes from the SDK on the build machine rather than
+from the code, and lowering it is a known, scoped piece of work described in
+[docs/PLATFORM_MATRIX.md](PLATFORM_MATRIX.md).
+
+### Install it
+
+```sh
+# 1. Verify the download against the release's SHA256SUMS.
+shasum -a 256 mojoboost-0.1.0-cp314-cp314-macosx_26_0_arm64.whl   # macOS
+sha256sum   mojoboost-0.1.0-cp314-cp314-manylinux_2_28_x86_64.whl # Linux
+
+# 2. Install into a fresh virtual environment, from the file itself.
+python3.14 -m venv .venv
+. .venv/bin/activate
+python -m pip install ./mojoboost-0.1.0-cp314-cp314-macosx_26_0_arm64.whl
+
+# 3. Confirm it imports and can train, from a directory that is not a
+#    mojoboost checkout, so a stray source tree cannot make this pass.
+cd ~
+python -c "import mojoboost; print(mojoboost.__version__, mojoboost.__file__)"
+```
+
+Installing the file path rather than the package name is the point. pip
+either accepts that exact wheel for this interpreter and platform or refuses
+it, and there is nothing for it to substitute.
+
+### Uninstalling
+
+```sh
+python -m pip uninstall mojoboost
+```
+
+The bundled runtime libraries live inside the package directory, so they go
+with it. Nothing is installed outside the environment, and nothing is
+registered with the system.
+
+---
+
+## State 3. Source checkout with Pixi (works today)
+
+This is the real install path right now. It needs [Pixi](https://pixi.sh) and
+about a gigabyte of toolchain, and it gives you the Python API, the Mojo API,
+the C ABI, the CLI, the tests, and the benchmarks. You do not need to install
+Mojo or MAX separately; Pixi resolves the exact versions this repository pins.
+
+```sh
+git clone https://github.com/ajhendel/mojoboost.git
+cd mojoboost
+pixi install
+pixi run build-python
+```
+
+`pixi run build-python` compiles the CPython extension into
+`python/mojoboost/_mojoboost.so`. It is the step that takes the time, and it
+has to be rerun whenever the Mojo sources under `src/` or `bindings/` change.
+
+The package is then importable with the `python` directory on the path.
+
+```sh
+PYTHONPATH=python python -c "import mojoboost; print(mojoboost.__version__)"
+```
+
+If you would rather not set `PYTHONPATH` on every command, install the built
+package into a virtual environment in editable-ish fashion by building a
+wheel from the same checkout.
+
+```sh
+pixi run build-wheel      # writes python/dist/*.whl
+```
+
+That wheel is self-contained in the same way a release wheel would be, and
+installing it into a plain virtual environment is the closest thing to a
+preview of state 2. It carries whatever platform tag your build machine
+produced, so it is for you and not for redistribution.
+
+### What state 3 does not give you
+
+- A package other people can `pip install`. The checkout is a build
+  environment.
+- Any accelerator guarantee. Whether the GPU path is compiled in at all is
+  decided on the machine that builds, because Mojo resolves
+  `has_accelerator()` at compile time. See
+  [docs/DEVICE_SELECTION.md](DEVICE_SELECTION.md).
+- Windows. `pixi.toml` declares macOS arm64 and Linux, and the pinned channel
+  ships no Windows toolchain.
+
+---
+
+## The first five minutes
+
+Everything below assumes mojoboost imports, by whichever state got you there.
+If you are in state 3, prefix each command with `PYTHONPATH=python`.
+
+All of it runs in one script, which prints each step with its result.
+
+```sh
+python examples/install_smoke.py            # installed package
+PYTHONPATH=python python examples/install_smoke.py   # source checkout
+```
+
+The script uses only the standard library, so it runs in the default Pixi
+environment where numpy is not installed. Read it alongside this section; it
+does exactly what the seven steps below do.
+
+### 1. Import, and know what you imported
+
+```python
+import mojoboost
+from mojoboost import MojoBoostRegressor, gpu_available
+
+print(mojoboost.__version__)   # 0.1.0
+print(mojoboost.__file__)      # where this package actually came from
+print(gpu_available())         # True if this build has an accelerator path
+```
+
+`mojoboost.__file__` is worth printing once. A source checkout on
+`PYTHONPATH` shadows an installed wheel, and the two can be different builds.
+
+### 2. Train a tiny regression
+
+```python
+X = [[0.0], [1.0], [2.0], [3.0], [4.0], [5.0]]
+y = [0.0, 1.0, 4.0, 9.0, 16.0, 25.0]
+
+model = MojoBoostRegressor(n_estimators=20, num_leaves=7, min_data_in_leaf=1)
+model.fit(X, y)
+print(model.predict([[1.5], [4.5]]))
+print(model.device_)           # the backend that actually ran
+```
+
+Lists of rows are fine. numpy arrays, pandas frames, polars frames, and SciPy
+sparse matrices all work too, and numpy is used for the return type when it
+is installed.
+
+### 3. Add a validation set and early stopping
+
+```python
+model = MojoBoostRegressor(n_estimators=500, learning_rate=0.05, device="cpu")
+model.fit(
+    X_train, y_train,
+    eval_set=[(X_valid, y_valid)],
+    eval_names=["holdout"],
+    eval_metric=["l2", "l1"],
+    early_stopping_rounds=20,
+)
+
+model.n_iter_            # rounds actually trained
+model.best_iteration_    # the round the primary metric peaked at
+model.best_score_        # its value there
+model.stopped_early_     # whether patience ran out
+model.evals_result_["holdout"]["l2"]   # index 0 is the base score alone
+```
+
+These are LightGBM's spellings, and they mean what they mean there. The
+ensemble is rolled back to `best_iteration_`, so the model you predict with
+is the one that scored best rather than the one that trained last.
+
+Validation metrics are scored on the CPU, so `device="gpu"` with an
+`eval_set` raises rather than falling back. That is why this step passes
+`device="cpu"` explicitly.
+
+### 4. Save and load
+
+```python
+model.save("model.mbst")
+restored = MojoBoostRegressor.load("model.mbst")
+assert list(restored.predict(X_valid)) == list(model.predict(X_valid))
+```
+
+The predictions are bit-identical, not merely close; floats are stored as raw
+bit patterns. The file holds the model and not the estimator, so
+hyperparameters, feature names, and the training device do not travel with
+it. Pickle the estimator when you want those.
+
+### 5. Choose a device
+
+```python
+MojoBoostRegressor(device="cpu")    # default, dependable, every objective
+MojoBoostRegressor(device="gpu")    # accelerator or an exception, never a fallback
+MojoBoostRegressor(device="auto")   # picks for you, and today always picks the CPU
+```
+
+`device="gpu"` is a request that gets honored or refused. It never quietly
+trains on the CPU while you believe you used the GPU. `device="auto"`
+resolves to the CPU on every machine and every workload right now, because no
+benchmark has established a size where GPU training wins, and shipping a
+crossover threshold before that measurement exists would be a performance
+claim with nothing behind it. [docs/DEVICE_SELECTION.md](DEVICE_SELECTION.md)
+has the whole policy.
+
+### 6. Print the diagnostics
+
+Six lines, and they answer most of the questions an installation bug report
+would otherwise need a conversation to establish.
+
+```python
+import platform, sys
+import mojoboost
+
+print("mojoboost     ", mojoboost.__version__)
+print("package path  ", mojoboost.__file__)
+print("python        ", sys.version.split()[0], sys.executable)
+print("platform      ", platform.platform(), platform.machine())
+print("gpu_available ", mojoboost.gpu_available())
+print("extension     ", mojoboost._mojoboost.__file__)
+```
+
+Add the environment variables when a device question is involved, since both
+of them change what the library reports.
+
+```python
+import os
+print("MOJOBOOST_DISABLE_GPU   ", os.environ.get("MOJOBOOST_DISABLE_GPU", "<unset>"))
+print("MOJOBOOST_AUTO_MIN_CELLS", os.environ.get("MOJOBOOST_AUTO_MIN_CELLS", "<unset>"))
+```
+
+In a source checkout, add the toolchain version, which the extension does not
+carry.
+
+```sh
+pixi run mojo --version
+```
+
+`examples/install_smoke.py` prints all of this at the top of its output, so
+running it and pasting the result is the fastest way to fill in the
+Environment field of a bug report.
+
+### 7. Read the two documents that bound the claims
+
+[docs/LIGHTGBM_PARITY.md](LIGHTGBM_PARITY.md) is authoritative wherever a
+README and it disagree about behavior.
+[docs/GPU_VALIDATION.md](GPU_VALIDATION.md) is the record of what hardware
+has actually executed this code, and most of its rows still say **not run**.
+
+---
+
+## When something goes wrong
+
+pip's exact wording moves between versions, so match the shape of the message
+rather than the punctuation.
+
+### Unsupported Python
+
+```text
+ERROR: Ignored the following versions that require a different python version: 0.1.0 Requires-Python >=3.14
+ERROR: Could not find a version that satisfies the requirement mojoboost
+ERROR: No matching distribution found for mojoboost
+```
+
+Your interpreter is older than the declared floor. Check with
+`python -c "import sys; print(sys.version)"`. The floor exists because the
+extension is compiled inside the environment the pinned MAX build defines,
+and that build targets one interpreter. It is not a stylistic preference, and
+it is under review rather than fixed forever.
+
+Installing a wheel file directly on the wrong interpreter gives the tag
+mismatch below instead, because the filename carries `cp314`.
+
+### Wrong architecture, wrong operating system, or too old a macOS
+
+```text
+ERROR: mojoboost-0.1.0-cp314-cp314-macosx_26_0_arm64.whl is not a supported wheel on this platform.
+```
+
+pip compared the filename tags against the machine and they did not match.
+The usual causes, in order.
+
+- An Intel Mac. The `arm64` half of the tag does not match, and there will be
+  no Intel wheel; the pinned channel ships no Intel macOS toolchain.
+- A macOS older than the `macosx_26_0` floor. Check with `sw_vers`.
+- A Linux machine handed a macOS wheel, or x86_64 handed an aarch64 wheel.
+  Check with `uname -sm`.
+- Free-threaded Python. `cp314t` is a different ABI tag from `cp314` and
+  cannot load this extension.
+
+Do not force it. `--force-reinstall`, renaming the file, or
+`--implicit-namespace-packages` style workarounds turn a refusal that costs
+one second into a segfault or an `ImportError` at some later point. The tag
+is a statement about the binary inside.
+
+### Missing runtime library
+
+The install succeeded and the import does not.
+
+```text
+ImportError: dlopen(.../site-packages/mojoboost/_mojoboost.so, 0x0002):
+  Library not loaded: @rpath/libKGENCompilerRTShared.dylib
+  Reason: tried: '.../site-packages/mojoboost/.dylibs/libKGENCompilerRTShared.dylib' (no such file)
+```
+
+or, on Linux,
+
+```text
+ImportError: libKGENCompilerRTShared.so: cannot open shared object file: No such file or directory
+```
+
+The extension found no MAX runtime library to link against at load time. A
+release wheel bundles those libraries inside the package and points the
+extension at them with a loader-relative path, so seeing this from an
+installed wheel means the wheel is broken and is worth a bug report with the
+full message.
+
+From a source checkout it means something more ordinary. Either the extension
+was never built, in which case the message is different and unambiguous,
+
+```text
+ModuleNotFoundError: No module named 'mojoboost._mojoboost'
+```
+
+and the fix is `pixi run build-python`; or it was built and you are running
+it outside the Pixi environment that owns the runtime libraries, in which
+case run through `pixi run`, or build a self-contained wheel with
+`pixi run build-wheel` and install that instead.
+
+### GPU requested and unavailable
+
+```text
+RuntimeError: device 'gpu' requested but no accelerator is available; use device 'cpu' or 'auto'
+```
+
+The build has no accelerator path in it, or `MOJOBOOST_DISABLE_GPU=1` is set.
+Check with `mojoboost.gpu_available()`.
+
+The part that surprises people is that availability is a property of the
+build and not of the machine. Mojo resolves `has_accelerator()` at compile
+time, so a wheel built where no accelerator was visible reports none on every
+machine that installs it, including machines with a perfectly good GPU, and a
+wheel built where one was visible reports one everywhere. On a redistributed
+build whose host cannot actually open a device, the failure arrives when the
+device is opened rather than when it is resolved.
+
+There is no fallback, by design. A silent fallback would turn "my GPU run"
+into "a CPU run that took the same wall clock and I never knew".
+
+### GPU requested for a workload the GPU path does not cover
+
+```text
+RuntimeError: validation metrics are scored on the CPU; use device='cpu' or device='auto'
+```
+
+```text
+RuntimeError: sparse input trains on the CPU; there is no sparse GPU kernel yet.
+Use device='cpu' or device='auto', or densify with .toarray() to train on the GPU.
+```
+
+```text
+RuntimeError: custom objectives train on the CPU; use device='cpu' or device='auto'
+```
+
+Each one names the specific thing that is not covered and what to do instead.
+The rule is the same as above; an explicit `device="gpu"` runs on the
+accelerator or raises, and never densifies your matrix or moves your metric
+computation without telling you. `device="auto"` accepts all of these and
+resolves to the CPU.
+
+A mistyped device name fails earlier and differently.
+
+```text
+ValueError: unknown device 'metal'; expected one of cpu, gpu, auto
+```
+
+There is one device vocabulary across the Mojo API, the C ABI, and Python,
+and `gpu` covers every accelerator rather than naming a vendor.
+
+### `device="auto"` chose the CPU and said nothing
+
+This is not an error and there is no message. It is the current, deliberate
+behavior on every machine and every workload.
+
+```python
+model = MojoBoostRegressor(device="auto").fit(X, y)
+model.device_        # "cpu", on an M4 with a working Metal GPU
+```
+
+The crossover table that `auto` consults is empty. Nothing in this repository
+has measured a workload shape where end-to-end GPU training beats the
+multicore CPU trainer, and the one end-to-end Apple measurement that exists
+came out slower. Until that changes, `auto` keeps the CPU rather than
+implying an evaluation happened that did not.
+
+Two ways forward, depending on what you want.
+
+```python
+MojoBoostRegressor(device="gpu")     # force it, and get an exception if it cannot
+```
+
+```sh
+MOJOBOOST_AUTO_MIN_CELLS=10000000 python your_benchmark.py
+```
+
+`MOJOBOOST_AUTO_MIN_CELLS` is the cell count (`n_rows * n_features`) at or
+above which `auto` selects the GPU, and it is the knob for running the
+crossover benchmark that would justify a shipped default. It is device
+independent on purpose; there are no per vendor or per chip special cases
+anywhere in the policy. If you run that benchmark, the result belongs in an
+issue, filed with the
+[accelerator validation template](https://github.com/ajhendel/mojoboost/issues/new?template=hardware_validation.yml).
+
+### Anything else
+
+Open a bug report with the
+[bug template](https://github.com/ajhendel/mojoboost/issues/new?template=bug_report.yml)
+and include the diagnostics from step 6, the complete error text, and the
+device you requested. Installation problems are explicitly in scope for that
+template. An alpha with quiet failures is worse than one with loud ones, so a
+report about a confusing install is useful, not noise.
+
+---
+
+## Where to go next
+
+| Document | What it settles |
+|---|---|
+| [docs/LIGHTGBM_PARITY.md](LIGHTGBM_PARITY.md) | What mojoboost supports, what LightGBM has that it does not, and which differences are deliberate. Authoritative on behavior |
+| [docs/GPU_VALIDATION.md](GPU_VALIDATION.md) | Which hardware has actually run this code, and the procedure for adding a device |
+| [docs/PLATFORM_MATRIX.md](PLATFORM_MATRIX.md) | Every install target, its artifact name, and the evidence behind its status |
+| [docs/DEVICE_SELECTION.md](DEVICE_SELECTION.md) | The full `cpu` / `gpu` / `auto` policy and the report it produces |
+| [docs/COMPATIBILITY_POLICY.md](COMPATIBILITY_POLICY.md) | What may change between versions and what may not |
+| [CONTRIBUTING.md](../CONTRIBUTING.md) | How to build, which tests to run, and what a pull request has to say |
+| [examples/apple_silicon/](../examples/apple_silicon/) | A longer tour of the Apple silicon path, with the timing table that is still empty |
+
+Issue templates.
+
+- [Bug report](https://github.com/ajhendel/mojoboost/issues/new?template=bug_report.yml),
+  including installation problems.
+- [Accelerator validation report](https://github.com/ajhendel/mojoboost/issues/new?template=hardware_validation.yml),
+  for correctness, determinism, or performance evidence from real hardware.
+  Failures are useful evidence too.
+
+## What has been run for this document
+
+Nothing. No wheel was built, no package was installed, no example was
+executed, and no error message on this page was produced by running the
+command above it in this session.
+
+The messages quoted verbatim were read out of the source that raises them,
+`src/mojoboost/device.mojo` and `python/mojoboost/__init__.py`. The filenames
+and platform tags were read out of
+[docs/PLATFORM_MATRIX.md](PLATFORM_MATRIX.md) and
+`packaging/matrix/platform_matrix.toml`. The pip and dynamic-loader messages
+are shapes rather than transcripts, because their exact wording depends on
+the pip and operating system versions involved. The unrun commands that would
+turn any of this into a record are listed in
+[handoffs/release_04_install_ux.md](../handoffs/release_04_install_ux.md).

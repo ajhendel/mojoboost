@@ -1,0 +1,40 @@
+# mojoboost publishes no source distribution.
+#
+# The `sdist` row of packaging/matrix/platform_matrix.toml is
+# `unsupported` and the reason is not squeamishness: an sdist cannot build
+# without the Mojo toolchain, and pip falls back to an sdist on any
+# platform with no matching wheel. A user on an unsupported platform would
+# get a compile error instead of "no matching distribution found", which
+# is a worse outcome than shipping nothing.
+#
+# This file therefore has one job. If someone runs `python -m build`
+# without `--wheel`, or a release workflow globs `dist/*` instead of
+# `dist/*.whl`, the sdist that gets produced should be small, obviously
+# not a build input, and free of binaries. It is a blast shield, not a
+# packaging feature. docs/PYPI_RELEASE.md is what keeps the sdist off
+# PyPI in the first place.
+#
+# None of this affects the wheel. pyproject.toml sets
+# `include-package-data = false`, so the wheel is exactly `packages` plus
+# `package-data` and MANIFEST.in is not consulted. Turning that setting
+# back on would make the two exclusions below start deleting the
+# extension from the wheel, so do not turn it on.
+
+# Build outputs, staged into the package by packaging/build_wheel.sh.
+# Never in an sdist under any circumstances: they are unlabeled by
+# platform and by interpreter once outside a tagged wheel.
+exclude mojoboost/_mojoboost.so
+prune mojoboost/.dylibs
+
+# The test suites are run from the checkout and from a clean venv against
+# an installed wheel (packaging/test_wheel.sh). Neither reads them from a
+# distribution.
+prune tests
+exclude test_python_api.py
+
+# Local scratch.
+prune build
+prune dist
+prune .pytest_cache
+global-exclude *.py[cod]
+global-exclude .DS_Store

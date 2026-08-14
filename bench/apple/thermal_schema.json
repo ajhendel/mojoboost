@@ -1,0 +1,779 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ajhendel/mojoboost/blob/main/bench/apple/thermal_schema.json",
+  "title": "mojoboost Apple silicon thermal, energy, and sustained-performance record",
+  "description": "One file per run of the thermal protocol in docs/APPLE_THERMAL_ENERGY.md on one machine under one condition set. A record ties a thermal and energy observation to the exact commit, chip variant, memory size, OS build, toolchain, workload, quality result, and benchmark record it came from, so that nothing in it has to be reconstructed later from memory. Every measured quantity is nullable and every null carries a reason. Absence of a number is a fact the record states; it is never a zero and never an estimate. This schema is a sibling of bench/apple/schema.json, not a replacement for it: that one records comparative timings, this one records the state of the machine that produced them.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "thermal_protocol_version",
+    "parent_protocol_version",
+    "capture_script_version",
+    "run_id",
+    "started_utc",
+    "finished_utc",
+    "invocation",
+    "provenance",
+    "machine",
+    "toolchain",
+    "conditions",
+    "benchmark_link",
+    "workload",
+    "phases",
+    "validity"
+  ],
+  "properties": {
+    "schema_version": {
+      "description": "Version of this schema the record was written against. Bump the minor for additive optional fields, the major for anything a reader must be changed to understand.",
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "thermal_protocol_version": {
+      "description": "Version of docs/APPLE_THERMAL_ENERGY.md the run followed. Records written under different protocol versions are not comparable without reading both.",
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "parent_protocol_version": {
+      "description": "Version of docs/APPLE_GPU_BENCHMARK_PROTOCOL.md whose idle gate, quality rule, and prohibitions this run inherited.",
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "capture_script_version": {
+      "description": "Version of bench/apple/thermal_capture.sh that planned or produced the record.",
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "run_id": {
+      "description": "Unique id for this run, used as the result filename stem.",
+      "type": "string",
+      "minLength": 1
+    },
+    "started_utc": { "$ref": "#/$defs/timestamp" },
+    "finished_utc": { "$ref": "#/$defs/timestamp" },
+    "is_template": {
+      "description": "True only for a structural template carrying no measurements. A record with this field true must never be read, quoted, plotted, or merged as a result.",
+      "type": "boolean",
+      "default": false
+    },
+    "is_plan": {
+      "description": "True for a record shell emitted by a planning path rather than by a measurement. Note that the plan document printed by bench/apple/thermal_capture.sh --print-plan is a different document with its own keys and deliberately does not validate against this schema, so that a plan can never be mistaken for a run.",
+      "type": "boolean",
+      "default": false
+    },
+    "invocation": {
+      "description": "How the capture was asked to run, verbatim, so the record can be reproduced.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["argv", "cwd", "executed", "sample_interval_ms", "energy_requested"],
+      "properties": {
+        "argv": { "type": "array", "items": { "type": "string" } },
+        "cwd": {
+          "description": "Working directory. Usually contains a home directory and therefore a user name. Review before publishing; see the privacy section of the protocol.",
+          "type": "string"
+        },
+        "executed": {
+          "description": "False for a planned run that took no sample. A record with executed false carries no measurement and is never quoted.",
+          "type": "boolean"
+        },
+        "sample_interval_ms": {
+          "description": "Interval requested for every sampler in the run. The same interval is used for the idle baseline, which is what makes the baseline subtractable.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "energy_requested": { "type": "boolean" },
+        "operator": {
+          "description": "Free-text identity of whoever ran it, only if that person chose to record it. Optional by design.",
+          "$ref": "#/$defs/nullable_string"
+        },
+        "notes": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "provenance": {
+      "description": "What code produced the numbers. A record whose commit cannot be resolved in the public repository cannot be reviewed and is not quotable.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["git_commit", "git_dirty"],
+      "properties": {
+        "git_commit": {
+          "description": "Full commit hash of the working tree that was measured.",
+          "$ref": "#/$defs/nullable_string"
+        },
+        "git_dirty": {
+          "description": "True when the tree had uncommitted changes, which makes git_commit an incomplete description of what ran.",
+          "type": ["boolean", "null"]
+        },
+        "git_describe": { "$ref": "#/$defs/nullable_string" },
+        "repo_url": { "$ref": "#/$defs/nullable_string" },
+        "build_source": {
+          "description": "Whether the measured mojoboost came from a build of this checkout or from an installed wheel. A wheel run measures the wheel, not the commit.",
+          "enum": ["checkout_build", "wheel", "unknown"]
+        }
+      }
+    },
+    "machine": {
+      "description": "Hardware identity, read from the machine. No field here is inferred from a marketing name, and no field here holds a serial number or a hardware UUID.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "chip_family",
+        "chip_variant",
+        "cpu_brand_string",
+        "model_identifier",
+        "performance_cores",
+        "efficiency_cores",
+        "logical_cores",
+        "gpu_cores",
+        "memory_bytes",
+        "form_factor",
+        "has_fan"
+      ],
+      "properties": {
+        "chip_family": {
+          "description": "Generation bucket used to group results. The authoritative identity is cpu_brand_string plus model_identifier, not this field.",
+          "enum": ["m1", "m2", "m3", "m4", "m5", "other", "unknown"]
+        },
+        "chip_variant": {
+          "description": "Part within the generation. Base, Pro, Max, and Ultra parts differ in GPU core count by more than a factor of eight and in cooling capacity by more than that, so a thermal result from one says nothing about another.",
+          "enum": ["base", "pro", "max", "ultra", "other", "unknown"]
+        },
+        "chip_label": {
+          "description": "Human label for a fleet table, for example \"M4 Pro\". Parsed or supplied by the operator; never invented when the parse fails.",
+          "$ref": "#/$defs/nullable_string"
+        },
+        "cpu_brand_string": {
+          "description": "sysctl machdep.cpu.brand_string, raw.",
+          "$ref": "#/$defs/nullable_string"
+        },
+        "model_identifier": {
+          "description": "sysctl hw.model, raw, for example Mac16,10.",
+          "$ref": "#/$defs/nullable_string"
+        },
+        "performance_cores": {
+          "description": "sysctl hw.perflevel0.physicalcpu.",
+          "$ref": "#/$defs/nullable_integer"
+        },
+        "efficiency_cores": {
+          "description": "sysctl hw.perflevel1.physicalcpu.",
+          "$ref": "#/$defs/nullable_integer"
+        },
+        "logical_cores": { "$ref": "#/$defs/nullable_integer" },
+        "gpu_cores": {
+          "description": "GPU core count from system_profiler SPDisplaysDataType. Null when the key is absent on the installed macOS, which is a fact worth keeping rather than a value worth guessing.",
+          "$ref": "#/$defs/nullable_integer"
+        },
+        "gpu_name": { "$ref": "#/$defs/nullable_string" },
+        "memory_bytes": {
+          "description": "sysctl hw.memsize. Unified memory, shared with the GPU, which is why it belongs in a thermal record: memory pressure and swap change both power and throughput.",
+          "$ref": "#/$defs/nullable_integer"
+        },
+        "form_factor": {
+          "description": "Chassis class, because cooling is a property of the chassis and not of the chip. Supplied by the operator or parsed from model_identifier.",
+          "enum": ["macbook_air", "macbook_pro", "mac_mini", "mac_studio", "imac", "mac_pro", "other", "unknown"]
+        },
+        "has_fan": {
+          "description": "Whether the chassis has active cooling. A fanless machine dissipates through its case, so surface and lid conditions dominate its thermal behavior.",
+          "type": ["boolean", "null"]
+        },
+        "battery_present": { "type": ["boolean", "null"] }
+      }
+    },
+    "toolchain": {
+      "description": "Everything whose version can move a number. A null version means the component was absent, and a phase that needed it carries a status other than ok.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["os_name", "os_version", "os_build", "mojo", "max", "mojoboost"],
+      "properties": {
+        "os_name": { "$ref": "#/$defs/nullable_string" },
+        "os_version": {
+          "description": "sw_vers -productVersion. Power management behavior changes across releases, so a thermal comparison across OS versions is not a comparison.",
+          "$ref": "#/$defs/nullable_string"
+        },
+        "os_build": {
+          "description": "sw_vers -buildVersion. Required, because two machines on the same product version can be on different builds.",
+          "$ref": "#/$defs/nullable_string"
+        },
+        "kernel": { "$ref": "#/$defs/nullable_string" },
+        "mojo": { "$ref": "#/$defs/nullable_string" },
+        "max": { "$ref": "#/$defs/nullable_string" },
+        "pixi": { "$ref": "#/$defs/nullable_string" },
+        "python": { "$ref": "#/$defs/nullable_string" },
+        "mojoboost": { "$ref": "#/$defs/nullable_string" },
+        "mojoboost_gpu_build": {
+          "description": "mojoboost.gpu_available(), a property of the build and the machine together. False means a gpu workload in this record is unsupported, not slow.",
+          "type": ["boolean", "null"]
+        },
+        "powermetrics_available": { "type": ["boolean", "null"] }
+      }
+    },
+    "conditions": {
+      "description": "The declared state of the machine and its surroundings for the whole record. One record describes one condition set; a run in which a condition changed is invalid rather than averaged.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "power_source",
+        "low_power_mode",
+        "lid_state",
+        "surface",
+        "idle_gate_passed",
+        "background_load_rejected"
+      ],
+      "properties": {
+        "power_source": {
+          "description": "The parent protocol requires ac. This protocol permits battery in a record that declares it, because battery behavior is one of the things being measured.",
+          "enum": ["ac", "battery", "unknown"]
+        },
+        "battery_percent_start": {
+          "description": "Context only. A charge delta is not an energy measurement and must never be converted to joules.",
+          "$ref": "#/$defs/nullable_number"
+        },
+        "battery_percent_end": { "$ref": "#/$defs/nullable_number" },
+        "charging": { "type": ["boolean", "null"] },
+        "low_power_mode": { "type": ["boolean", "null"] },
+        "power_mode_raw": {
+          "description": "Verbatim power mode lines from pmset -g. Recorded raw because the available modes differ by machine and release, and normalizing them into a boolean would assert something the tool did not say.",
+          "$ref": "#/$defs/nullable_string"
+        },
+        "lid_state": {
+          "description": "closed_clamshell requires an external display and power; a closed lid with neither is a sleeping machine and not a measurement.",
+          "enum": ["open", "closed_clamshell", "unknown"]
+        },
+        "surface": {
+          "description": "Part of the cooling system, especially on a fanless chassis. soft is measured in order to document the penalty, not avoided in order to hide it.",
+          "enum": ["hard_desk", "stand", "soft", "lap", "unknown"]
+        },
+        "external_display_connected": { "type": ["boolean", "null"] },
+        "display_sleep_prevented": { "type": ["boolean", "null"] },
+        "ambient_temp_c": {
+          "description": "Recorded only when a thermometer was actually read. Never estimated from the room, the season, or the thermostat setting.",
+          "$ref": "#/$defs/nullable_number"
+        },
+        "ambient_source": {
+          "description": "The instrument that produced ambient_temp_c. Required whenever that field is non-null, because an unattributed temperature is not a measurement.",
+          "$ref": "#/$defs/nullable_string"
+        },
+        "machine_idle_minutes_before": {
+          "description": "How long the machine was idle before the first phase. This is what kind of cold the cold fit actually was. A cold page cache is only reachable across a reboot and this protocol does not claim it.",
+          "$ref": "#/$defs/nullable_number"
+        },
+        "load_average_before": { "$ref": "#/$defs/nullable_number" },
+        "load_average_after": { "$ref": "#/$defs/nullable_number" },
+        "competing_processes": {
+          "description": "Heavy process names seen by the gate. Empty is the only acceptable value for a quotable run outside background_control. These names can identify employer software or personal applications; redact by replacing a name with the string redacted rather than by deleting the entry, so the count stays honest.",
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "idle_gate_passed": {
+          "description": "The parent protocol's gate, evaluated before the first measured phase.",
+          "type": "boolean"
+        },
+        "idle_gate_failures": { "type": "array", "items": { "type": "string" } },
+        "background_load_rejected": {
+          "description": "Whether the harness in fact refused to measure while the background_control phase applied a deliberate competing load. Null when that phase was not run. False is a defect in the gate and invalidates the gate for this record, not just the control phase.",
+          "type": ["boolean", "null"]
+        },
+        "background_control_load": {
+          "description": "The exact load applied during background_control, for example \"yes > /dev/null on one core\". Declared, never assumed.",
+          "$ref": "#/$defs/nullable_string"
+        }
+      }
+    },
+    "contrast": {
+      "description": "Declares this record as one half of a contrast against another record. A contrast is legitimate only when the two records agree on commit, machine, toolchain, workload, engine, threads, and every condition field except the one named here.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["declared_variable"],
+      "properties": {
+        "declared_variable": {
+          "enum": ["none", "power_source", "lid_state", "surface", "low_power_mode", "device", "threads", "external_display_connected"]
+        },
+        "baseline_run_id": {
+          "description": "run_id of the other half. Null on the baseline record itself.",
+          "$ref": "#/$defs/nullable_string"
+        },
+        "baseline_record_sha256": { "$ref": "#/$defs/nullable_string" },
+        "verified_identical_fields": {
+          "description": "Fields a reader or a checker confirmed match between the two records. A contrast whose list is empty has not been checked and is a claim rather than a comparison.",
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "known_differences": {
+          "description": "Everything besides declared_variable that is known to differ. A non-empty list here means the difference between the two records is not attributable to the declared variable.",
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "benchmark_link": {
+      "description": "Tie to a bench/apple/schema.json run record. A thermal record is about the state of a machine while it ran something, and without this link nobody can tell what that something was or how well it fit.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["linked", "reason"],
+      "properties": {
+        "linked": { "type": "boolean" },
+        "reason": {
+          "description": "Why there is no link. Required whenever linked is false. The only acceptable reason is that this record carries a complete explicit workload specification of its own.",
+          "$ref": "#/$defs/unavailable_reason"
+        },
+        "suite_run_id": {
+          "description": "run_id of the benchmark record.",
+          "$ref": "#/$defs/nullable_string"
+        },
+        "record_path": {
+          "description": "Repository-relative path of the benchmark record, for example bench/apple/results/<run_id>.json.",
+          "$ref": "#/$defs/nullable_string"
+        },
+        "record_sha256": {
+          "description": "Digest of the linked record file, so a later edit to it is detectable from here.",
+          "$ref": "#/$defs/nullable_string"
+        },
+        "record_protocol_version": { "$ref": "#/$defs/nullable_string" },
+        "measurement_selector": {
+          "description": "Which measurement inside the linked record this thermal record accompanies.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "workload_id": { "$ref": "#/$defs/nullable_string" },
+            "engine_name": { "$ref": "#/$defs/nullable_string" },
+            "requested_threads": { "$ref": "#/$defs/nullable_integer" }
+          }
+        },
+        "same_session": {
+          "description": "True when the linked benchmark record was produced in the same sitting on the same machine. False means the two describe different thermal histories and their numbers must not be merged.",
+          "type": ["boolean", "null"]
+        }
+      }
+    },
+    "workload": {
+      "description": "What was fit, in full, whether or not a benchmark record is linked. A thermal record that cannot state its own workload is a record of nothing.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "task", "rows", "features", "rounds", "device", "requested_threads", "seed"],
+      "properties": {
+        "source": {
+          "description": "suite_catalog means the shape is one of the eight in bench/apple/suite.py and the id field names it. explicit means the shape is defined by the fields here alone.",
+          "enum": ["suite_catalog", "explicit"]
+        },
+        "id": {
+          "description": "Workload id from the suite catalog when source is suite_catalog. Not constrained to that enum here, so that a later catalog addition does not silently invalidate old thermal records; the linked benchmark record is the authority on which ids exist.",
+          "$ref": "#/$defs/nullable_string"
+        },
+        "task": { "enum": ["regression", "binary", "multiclass", "ranking"] },
+        "rows": { "type": "integer", "minimum": 1 },
+        "features": { "type": "integer", "minimum": 1 },
+        "valid_rows": { "$ref": "#/$defs/nullable_integer" },
+        "rounds": { "type": "integer", "minimum": 1 },
+        "num_leaves": { "$ref": "#/$defs/nullable_integer" },
+        "max_bin": { "$ref": "#/$defs/nullable_integer" },
+        "learning_rate": { "$ref": "#/$defs/nullable_number" },
+        "min_data_in_leaf": { "$ref": "#/$defs/nullable_integer" },
+        "lambda_l2": { "$ref": "#/$defs/nullable_number" },
+        "n_classes": { "$ref": "#/$defs/nullable_integer" },
+        "device": {
+          "description": "The backend the fits ran on. gpu never falls back; an unavailable device is a phase status of unsupported, not a cpu number in a gpu record.",
+          "enum": ["cpu", "gpu"]
+        },
+        "device_resolved": {
+          "description": "The backend the library reports it actually used. A gpu record whose device_resolved is cpu is a defect in the record, not a fast CPU.",
+          "$ref": "#/$defs/nullable_string"
+        },
+        "requested_threads": {
+          "description": "MOJOBOOST_NUM_WORKERS for the run. Thread count changes both power draw and how quickly a chassis reaches its limit, so it is part of the workload here rather than an aside.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "env": {
+          "description": "Thread and backend environment variables set for the measured process.",
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "seed": { "type": "integer" },
+        "data_digest": {
+          "description": "Hash of the generated X and y bytes. Two records that report different digests were not given the same data and must not be compared.",
+          "$ref": "#/$defs/nullable_string"
+        }
+      }
+    },
+    "quality": {
+      "description": "Held-out quality from the fits in this record, computed by the same scorer the benchmark suite uses. A throughput or energy figure without a quality number next to it is not a result, and that rule is inherited from the parent protocol unchanged.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["available", "reason"],
+      "properties": {
+        "available": { "type": "boolean" },
+        "reason": { "$ref": "#/$defs/unavailable_reason" },
+        "metric": {
+          "description": "Which metric the values are, for example valid_rmse.",
+          "$ref": "#/$defs/nullable_string"
+        },
+        "value_first_fit": { "$ref": "#/$defs/nullable_number" },
+        "value_median": { "$ref": "#/$defs/nullable_number" },
+        "value_min": { "$ref": "#/$defs/nullable_number" },
+        "value_max": { "$ref": "#/$defs/nullable_number" },
+        "prediction_digest": {
+          "description": "Hash of the held-out raw predictions. Equal digests across the fits of one record is the determinism check. A thermal run whose digests drift across fits is measuring something other than the same model repeatedly, and that is a finding, not noise.",
+          "$ref": "#/$defs/nullable_string"
+        },
+        "digests_identical_across_fits": { "type": ["boolean", "null"] }
+      }
+    },
+    "phases": {
+      "description": "One entry per phase the plan contained, including phases that did not run. A skipped phase is present with a status, never dropped.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/phase" }
+    },
+    "validity": {
+      "description": "The record's own verdict on itself, enumerated so a reader does not have to reconstruct the judgment from the fields above.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["quotable", "invalid_reasons", "warnings"],
+      "properties": {
+        "quotable": {
+          "description": "False whenever invalid_reasons is non-empty. A record that is not quotable is still written and still kept; it is simply never the source of a published number, with or without a caveat.",
+          "type": "boolean"
+        },
+        "invalid_reasons": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "idle_gate_failed",
+              "background_process_detected",
+              "background_control_not_rejected",
+              "dirty_tree",
+              "no_quality_metric",
+              "benchmark_link_missing",
+              "workload_mismatch",
+              "energy_without_baseline",
+              "sampler_keys_empty",
+              "phase_aborted",
+              "record_edited",
+              "condition_undeclared",
+              "not_executed"
+            ]
+          }
+        },
+        "warnings": {
+          "description": "Facts that do not invalidate the record but travel with any table drawn from it, for example an unrecorded ambient temperature, a null GPU core count, an unverified fan reading, absent energy, or a short idle period before the cold fit.",
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "throttled": {
+          "description": "Whether any thermal sample in any measured phase showed a limit. Note that this does not invalidate a thermal record. Throttling invalidates a timing under the parent protocol and is the measurement under this one.",
+          "type": ["boolean", "null"]
+        }
+      }
+    },
+    "notes": {
+      "description": "Free text from the operator. Anything that would change how a reader interprets the record and has no field of its own belongs here.",
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  },
+  "$defs": {
+    "timestamp": {
+      "description": "ISO 8601 UTC timestamp, second resolution, trailing Z.",
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "nullable_number": { "type": ["number", "null"] },
+    "nullable_integer": { "type": ["integer", "null"] },
+    "nullable_string": { "type": ["string", "null"] },
+    "unavailable_reason": {
+      "description": "Why a block holds nulls. Required whenever available is false, and the empty string is not an acceptable value.",
+      "type": ["string", "null"],
+      "minLength": 1
+    },
+
+    "phase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "status"],
+      "properties": {
+        "id": {
+          "description": "Which of the protocol's eight phases this is. idle_baseline samples the idle machine with the sampler the workload phases will use. cold_fit is the first fit in a fresh process on an idle machine. warm_fit is the next fit in that process with no cooldown. repeat_series is ten fits back to back, which is deliberately not the same measurement as the suite's five-fit w7_repeated_fit. sustained repeats identical fits for a declared window. throttle_probe continues until a thermal limit appears or a ceiling is reached. cooldown_recovery samples the idle machine afterward until the thermal state returns or a ceiling is reached. background_control is the negative control that the gate must reject.",
+          "enum": [
+            "idle_baseline",
+            "cold_fit",
+            "warm_fit",
+            "repeat_series",
+            "sustained",
+            "throttle_probe",
+            "cooldown_recovery",
+            "background_control"
+          ]
+        },
+        "status": {
+          "description": "ok when the phase ran to its own stopping rule. skipped when the plan excluded it. unsupported when the machine or build cannot express it, for example a gpu workload on a build without GPU support. error when it raised. aborted when it ended early for a reason other than its declared stopping rule, which invalidates the record.",
+          "enum": ["ok", "skipped", "unsupported", "error", "aborted"]
+        },
+        "message": { "$ref": "#/$defs/nullable_string" },
+        "started_utc": { "$ref": "#/$defs/timestamp" },
+        "finished_utc": { "$ref": "#/$defs/timestamp" },
+        "duration_seconds": {
+          "description": "Wall clock the phase actually occupied, which is not necessarily the requested window.",
+          "$ref": "#/$defs/nullable_number"
+        },
+        "requested_window_seconds": {
+          "description": "The window the plan asked for. A sustained ratio quoted from a phase whose duration fell short of this is not quotable.",
+          "$ref": "#/$defs/nullable_number"
+        },
+        "stopping_rule": {
+          "description": "What ended the phase, in the phase's own terms, for example \"window elapsed\", \"thermal limit observed\", \"ceiling reached without recovery\".",
+          "$ref": "#/$defs/nullable_string"
+        },
+        "fits": {
+          "description": "Every fit the phase performed, in order. Present for fit-bearing phases and empty for idle_baseline and cooldown_recovery.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/fit" }
+        },
+        "throughput": { "$ref": "#/$defs/throughput" },
+        "thermal_series": { "$ref": "#/$defs/thermal_series" },
+        "energy": { "$ref": "#/$defs/energy" },
+        "process_attribution": { "$ref": "#/$defs/process_attribution" },
+        "notes": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+
+    "fit": {
+      "description": "One fit. Wall clock and quality from the same fit, because a throughput number without a loss next to it is not a result.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["index", "cold", "ok"],
+      "properties": {
+        "index": { "type": "integer", "minimum": 0 },
+        "cold": {
+          "description": "True for the first fit in a fresh process, which pays device context creation, kernel or shader compilation, and first allocation. Whether the machine was also cold is conditions.machine_idle_minutes_before, not this field.",
+          "type": "boolean"
+        },
+        "ok": { "type": "boolean" },
+        "start_offset_s": {
+          "description": "Seconds from the phase start, so a fit can be placed against the thermal and power series.",
+          "$ref": "#/$defs/nullable_number"
+        },
+        "fit_s": {
+          "description": "Binning plus training, which is what a user calling fit() waits for. The same definition as the parent schema's timings.fit_s.",
+          "$ref": "#/$defs/nullable_number"
+        },
+        "quality_value": {
+          "description": "Held-out metric from this fit, in the units named by quality.metric. Null with the record's quality block marked unavailable when scoring did not run.",
+          "$ref": "#/$defs/nullable_number"
+        },
+        "prediction_digest": { "$ref": "#/$defs/nullable_string" },
+        "peak_rss_bytes": {
+          "description": "Peak resident size of the fitting process. On unified memory a device allocation the process owns is counted here, so this is not comparable to a discrete GPU's host-side peak.",
+          "$ref": "#/$defs/nullable_integer"
+        },
+        "message": { "$ref": "#/$defs/nullable_string" }
+      }
+    },
+
+    "throughput": {
+      "description": "Fit rate over time, bucketed, which is the whole point of the sustained phases. A single aggregate rate hides exactly the decline this protocol exists to see.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["available", "reason"],
+      "properties": {
+        "available": { "type": "boolean" },
+        "reason": { "$ref": "#/$defs/unavailable_reason" },
+        "bucket_seconds": {
+          "description": "Bucket width. Required beside every fits_per_minute figure, because a rate without its bucket is not comparable to another rate.",
+          "$ref": "#/$defs/nullable_number"
+        },
+        "buckets": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["index", "start_offset_s", "end_offset_s", "fits_completed", "complete"],
+            "properties": {
+              "index": { "type": "integer", "minimum": 0 },
+              "start_offset_s": { "type": "number", "minimum": 0 },
+              "end_offset_s": { "type": "number", "minimum": 0 },
+              "fits_completed": { "type": "integer", "minimum": 0 },
+              "complete": {
+                "description": "False for a trailing bucket the window ended inside. An incomplete bucket is never counted as a slow minute and is excluded from the sustained ratio.",
+                "type": "boolean"
+              },
+              "fits_per_minute": { "$ref": "#/$defs/nullable_number" },
+              "mean_fit_s": { "$ref": "#/$defs/nullable_number" },
+              "median_fit_s": { "$ref": "#/$defs/nullable_number" }
+            }
+          }
+        },
+        "first_bucket_fits_per_minute": { "$ref": "#/$defs/nullable_number" },
+        "last_complete_bucket_fits_per_minute": { "$ref": "#/$defs/nullable_number" },
+        "sustained_ratio": {
+          "description": "Last complete bucket divided by the first. 1.0 means the machine held its clock for the whole window. A ratio below 1 is a statement about this chassis under this load, and it is a thermal claim only when the thermal series in the same phase recorded a limit.",
+          "$ref": "#/$defs/nullable_number"
+        },
+        "time_to_first_throttle_s": {
+          "description": "Offset of the first thermal sample showing a limit. Null when no sample showed one, which is different from zero.",
+          "$ref": "#/$defs/nullable_number"
+        },
+        "cold_fit_s": { "$ref": "#/$defs/nullable_number" },
+        "warm_fit_s": { "$ref": "#/$defs/nullable_number" },
+        "steady_fit_s": {
+          "description": "For repeat_series, the median of fits six through ten. The headline pair for that phase is the cold fit against this.",
+          "$ref": "#/$defs/nullable_number"
+        },
+        "cold_over_steady_ratio": { "$ref": "#/$defs/nullable_number" }
+      }
+    },
+
+    "thermal_series": {
+      "description": "Throttle state sampled through a phase. Throttling is detected here or it is not claimed at all; it is never inferred from a timing that fell, because background load makes timings fall too.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["available", "reason", "source"],
+      "properties": {
+        "available": { "type": "boolean" },
+        "reason": { "$ref": "#/$defs/unavailable_reason" },
+        "source": {
+          "description": "pmset_therm needs no privileges. powermetrics_thermal needs root and reports a coarse pressure level. Neither reports a temperature, and no field in this block is degrees Celsius.",
+          "enum": ["pmset_therm", "powermetrics_thermal", "both", "none"]
+        },
+        "sample_interval_s": { "$ref": "#/$defs/nullable_number" },
+        "samples": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["offset_s"],
+            "properties": {
+              "offset_s": { "type": "number", "minimum": 0 },
+              "cpu_speed_limit_percent": {
+                "description": "pmset -g therm CPU_Speed_Limit. 100 means unthrottled. Whether this field moves at all on a given Apple silicon machine under sustained load is itself something a first run establishes; a series that never leaves 100 while throughput halves is evidence about the instrument, not about the machine.",
+                "$ref": "#/$defs/nullable_number"
+              },
+              "scheduler_limit_percent": { "$ref": "#/$defs/nullable_number" },
+              "available_cpus": { "$ref": "#/$defs/nullable_integer" },
+              "thermal_pressure": {
+                "description": "powermetrics thermal sampler pressure level, verbatim, for example Nominal. A level, not a temperature.",
+                "$ref": "#/$defs/nullable_string"
+              },
+              "fan_rpm": {
+                "description": "From the powermetrics smc sampler where it reports one. The fields present differ by model and release and a fanless chassis has none, which is why fan_reading_verified exists.",
+                "$ref": "#/$defs/nullable_number"
+              }
+            }
+          }
+        },
+        "fan_reading_verified": {
+          "description": "False until someone has confirmed on this model and OS build that the parsed fan field means what the record assumes. Unverified fan numbers are recorded and not published.",
+          "type": ["boolean", "null"]
+        },
+        "min_speed_limit_percent": { "$ref": "#/$defs/nullable_number" },
+        "worst_thermal_pressure": { "$ref": "#/$defs/nullable_string" },
+        "throttled": {
+          "description": "True when any sample in this phase showed a speed limit below 100 or a pressure above nominal.",
+          "type": ["boolean", "null"]
+        },
+        "first_throttle_offset_s": { "$ref": "#/$defs/nullable_number" },
+        "recovery_offset_s": {
+          "description": "For cooldown_recovery, the offset at which the thermal state returned to its pre-run value. Null when it did not recover before the ceiling, which is a result rather than a missing number, and the ceiling is then recorded in stopping_rule.",
+          "$ref": "#/$defs/nullable_number"
+        }
+      }
+    },
+
+    "energy": {
+      "description": "Machine-level power and energy over a measured window. This sampler reports the whole machine and not a process, which is why an idle baseline is recorded separately and why no field here may be attributed to mojoboost. Energy is measured or it is null: there is no estimated method value, and deriving a number here from CPU time, core count, thread count, TDP, or a battery percentage delta is prohibited by the protocol.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["available", "reason", "method", "scope"],
+      "properties": {
+        "available": { "type": "boolean" },
+        "reason": {
+          "description": "Required whenever available is false. Typical values name the missing permission, the missing tool, or the unrecognized output.",
+          "$ref": "#/$defs/unavailable_reason"
+        },
+        "method": {
+          "description": "powermetrics is the only sampler this protocol permits. estimated is deliberately not a value.",
+          "enum": ["powermetrics", "none"]
+        },
+        "scope": {
+          "description": "Always machine for a measured block. The field exists so that every energy number in this repository states its scope at the point of use rather than in a footnote somewhere else.",
+          "enum": ["machine", "none"]
+        },
+        "requires_sudo": { "type": ["boolean", "null"] },
+        "sample_interval_ms": { "$ref": "#/$defs/nullable_integer" },
+        "sample_count": { "$ref": "#/$defs/nullable_integer" },
+        "window_seconds": {
+          "description": "Duration the samples cover. Every mean below is over this window and every joule figure is a mean times this window, so a mean quoted without this number is not a number.",
+          "$ref": "#/$defs/nullable_number"
+        },
+        "window_definition": {
+          "description": "What the window covers, so a reader can tell a per-phase figure from a per-fit one.",
+          "enum": ["phase", "measured_region", "single_fit", "bucket", "idle_baseline"]
+        },
+        "cpu_power_w_mean": { "$ref": "#/$defs/nullable_number" },
+        "cpu_power_w_max": { "$ref": "#/$defs/nullable_number" },
+        "gpu_power_w_mean": { "$ref": "#/$defs/nullable_number" },
+        "gpu_power_w_max": { "$ref": "#/$defs/nullable_number" },
+        "ane_power_w_mean": { "$ref": "#/$defs/nullable_number" },
+        "package_power_w_mean": { "$ref": "#/$defs/nullable_number" },
+        "combined_power_w_mean": { "$ref": "#/$defs/nullable_number" },
+        "combined_power_w_max": { "$ref": "#/$defs/nullable_number" },
+        "cpu_energy_j": { "$ref": "#/$defs/nullable_number" },
+        "gpu_energy_j": { "$ref": "#/$defs/nullable_number" },
+        "package_energy_j": { "$ref": "#/$defs/nullable_number" },
+        "combined_energy_j": { "$ref": "#/$defs/nullable_number" },
+        "idle_baseline_power_w": {
+          "description": "Mean machine power from the idle_baseline phase of this same record, carried here so the subtraction below is checkable in place.",
+          "$ref": "#/$defs/nullable_number"
+        },
+        "energy_above_idle_j": {
+          "description": "combined_energy_j minus idle_baseline_power_w times window_seconds. Null whenever either factor is null. This is the only energy figure the protocol considers worth quoting, and even it is about the machine rather than the process.",
+          "$ref": "#/$defs/nullable_number"
+        },
+        "fits_in_window": {
+          "description": "Fits completed inside the window, so energy per fit can be read as a division a reader can check rather than as a field they must trust.",
+          "$ref": "#/$defs/nullable_integer"
+        },
+        "energy_above_idle_per_fit_j": {
+          "description": "energy_above_idle_j divided by fits_in_window. Null when either is null. For a short fit at a coarse sample interval this is the honest unit, because a single fit may cover only a handful of samples.",
+          "$ref": "#/$defs/nullable_number"
+        },
+        "keys_seen": {
+          "description": "Power keys the parser actually matched. powermetrics key names and units differ by macOS version and chip, so a block whose keys list is empty while available is true is a parser failure to investigate and never a machine that used no power.",
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+
+    "process_attribution": {
+      "description": "Per-process figures from powermetrics --samplers tasks --show-process-energy. These are energy impact scores, a weighted composite of CPU time, wakeups, and device activity computed by a model whose weights Apple does not publish and which changes across releases. They are useful for one thing only, checking whether mojoboost was in fact the dominant consumer during a window. They are not joules, they carry no unit, and they may not be compared across machines or converted into an energy claim.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["available", "reason", "joules_claimable"],
+      "properties": {
+        "available": { "type": "boolean" },
+        "reason": { "$ref": "#/$defs/unavailable_reason" },
+        "method": { "enum": ["powermetrics_tasks", "none"] },
+        "joules_claimable": {
+          "description": "Always false. The field exists so that the prohibition travels inside every record rather than only in the protocol document.",
+          "const": false
+        },
+        "target_process": { "$ref": "#/$defs/nullable_string" },
+        "target_energy_impact_score": {
+          "description": "Unitless heuristic score for the measured process over the window.",
+          "$ref": "#/$defs/nullable_number"
+        },
+        "total_energy_impact_score": {
+          "description": "Unitless heuristic score summed over all processes in the same window.",
+          "$ref": "#/$defs/nullable_number"
+        },
+        "target_share": {
+          "description": "target_energy_impact_score divided by total_energy_impact_score. A share near 1 supports the sentence \"mojoboost dominated this window\". It supports no sentence containing a joule.",
+          "$ref": "#/$defs/nullable_number"
+        },
+        "other_top_processes": {
+          "description": "Names of the other largest consumers, which is what makes an idle gate failure legible after the fact. These names come from the machine and can identify unrelated software; review before publishing and redact by replacing a name rather than deleting an entry.",
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    }
+  }
+}

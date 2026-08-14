@@ -1,0 +1,363 @@
+# Linux wheel release, x86_64 and ARM64.
+#
+# THIS WORKFLOW HAS NEVER RUN. It is manual (workflow_dispatch), it does not
+# publish anything by default, and until someone dispatches it no Linux wheel
+# exists. Nothing in ci.yml depends on it and it never triggers on push.
+#
+# What it is for, and what it deliberately is not:
+#
+#   ci.yml proves the SOURCE builds and passes on Linux, on both architectures,
+#   inside the pinned pixi environment. That is a real and continuous claim and
+#   it is not this workflow's subject.
+#
+#   This workflow produces a REDISTRIBUTABLE ARTIFACT: a binary that has to work
+#   on a machine with no pixi, no conda, no Mojo and no MAX. A green ci.yml run
+#   is compatible with a wheel that fails to import on a user's laptop. The two
+#   claims share a repository and nothing else.
+#
+# Default tag policy is `plain`, which produces linux_x86_64 and linux_aarch64.
+# PyPI and TestPyPI reject those tags on upload, which is the intended safety
+# property: an unaudited Linux wheel cannot reach an index by accident, and it
+# can still be attached to a GitHub release for people who are being asked to
+# test it. Promoting to a manylinux tag is a deliberate input, and it is only
+# honest after the four conditions in packaging/linux/README.md are met.
+#
+# BEFORE THIS IS ENABLED FOR REAL:
+#   * Pin every third-party action by full commit SHA. The `@v4` and
+#     `@v0.10.1` refs below are readable placeholders, and a tag is mutable.
+#     Task 10 (release security) owns the pinning policy; this file has to be
+#     updated when that lands.
+#   * Two blockers in python/pyproject.toml and python/setup.py have to be
+#     fixed first. The preflight step below fails loudly while they stand, and
+#     handoffs/release_03_linux_wheels.md has the exact edits.
+#   * pixi.toml has to provide patchelf on Linux, or the build step fails.
+
+name: Release wheels (Linux)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Tag or commit SHA to build from (never a branch name)
+        required: true
+      arch:
+        description: Which architectures to build
+        type: choice
+        options: [both, x86_64, aarch64]
+        default: both
+      tag_policy:
+        description: >-
+          plain = linux_<arch>, honest and unpublishable to an index.
+          manylinux = a glibc promise you must have measured first.
+        type: choice
+        options: [plain, manylinux]
+        default: plain
+      manylinux_floor:
+        description: glibc floor for the manylinux policy, underscore form
+        default: "2_28"
+      publish_testpypi:
+        description: >-
+          Attempt TestPyPI trusted publishing. Also requires the repository
+          variable MOJOBOOST_TESTPYPI_ENABLED to be 'true', and a manylinux tag.
+        type: boolean
+        default: false
+
+# Nothing is granted at the top level. Each job asks for what it needs and no
+# job asks for write access to this repository.
+permissions: {}
+
+concurrency:
+  group: release-linux-${{ inputs.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # -------------------------------------------------------------------------
+  # A wheel is attributable or it is not a release. This job costs seconds and
+  # refuses the two dispatch mistakes that produce an artifact nobody can trace
+  # or trust.
+  # -------------------------------------------------------------------------
+  guard:
+    name: Guard
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4 # TODO(pin): full commit SHA before enabling
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: The ref must be immutable
+        run: |
+          set -euo pipefail
+          REF='${{ inputs.ref }}'
+          if git rev-parse -q --verify "refs/tags/$REF" >/dev/null; then
+            echo "building from tag $REF"
+          elif git cat-file -e "$REF^{commit}" 2>/dev/null && [ ${#REF} -ge 40 ]; then
+            echo "building from commit $REF"
+          else
+            echo "::error::'$REF' is neither a tag nor a full commit SHA."
+            echo "A branch moves. An artifact built from one cannot be rebuilt."
+            exit 1
+          fi
+
+      - name: Publishing to an index requires a publishable tag
+        if: inputs.publish_testpypi
+        run: |
+          set -euo pipefail
+          if [ '${{ inputs.tag_policy }}' != 'manylinux' ]; then
+            echo "::error::publish_testpypi with tag_policy=plain."
+            echo "linux_x86_64 and linux_aarch64 are rejected by TestPyPI on"
+            echo "upload. This would fail at the last step after building"
+            echo "everything. Decide the tag first, and only claim manylinux"
+            echo "once a clean container of that glibc has passed."
+            exit 1
+          fi
+
+      # The architecture selection is resolved here rather than with a job
+      # level `if`, because the matrix context is not available in one: a job
+      # level condition cannot see which row it is about, so the natural
+      # spelling of this silently keeps every row.
+      - name: Resolve the architecture matrix
+        id: matrix
+        run: |
+          set -euo pipefail
+          X86='{"arch":"x86_64","runner":"ubuntu-22.04"}'
+          ARM='{"arch":"aarch64","runner":"ubuntu-22.04-arm"}'
+          case '${{ inputs.arch }}' in
+            both)    ROWS="$X86,$ARM" ;;
+            x86_64)  ROWS="$X86" ;;
+            aarch64) ROWS="$ARM" ;;
+          esac
+          echo "matrix={\"include\":[$ROWS]}" >> "$GITHUB_OUTPUT"
+
+  # -------------------------------------------------------------------------
+  # Native runners on both architectures. No emulation and no cross build: the
+  # extension is compiled by the Mojo toolchain for the host it runs on.
+  #
+  # ubuntu-22.04 rather than 24.04 on purpose. The build host's glibc is the
+  # ceiling on how low the artifact's floor can be (2.35 vs 2.39), and this job
+  # is producing an artifact rather than testing source, which is why it does
+  # not match ci.yml's runner choice.
+  # -------------------------------------------------------------------------
+  build:
+    name: Build ${{ matrix.arch }}
+    needs: guard
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.guard.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4 # TODO(pin): full commit SHA before enabling
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - uses: prefix-dev/setup-pixi@v0.10.1 # TODO(pin): full commit SHA
+        with:
+          cache: true
+          environments: default pkg
+
+      # The host, recorded before anything is built. The glibc version here is
+      # the ceiling on any claim the artifact can make, and it is not
+      # recoverable from the wheel afterwards.
+      - name: Build host
+        run: |
+          uname -a
+          ldd --version | head -1
+          cat /etc/os-release | head -2
+          echo "accelerator tooling:"
+          command -v nvidia-smi || echo "  no nvidia-smi"
+          command -v rocm-smi || echo "  no rocm-smi"
+
+      # Fails while python/setup.py hard-codes a macOS platform tag and
+      # python/pyproject.toml's package-data cannot carry the bundled runtime.
+      # Both are Task 01's files and both are quiet failures if ignored.
+      - name: Metadata preflight
+        run: python3 packaging/linux/check_metadata_ready.py
+
+      - name: Matrix contract
+        run: python3 packaging/matrix/validate_matrix.py
+
+      - name: Build the wheel
+        env:
+          MOJOBOOST_TAG_POLICY: ${{ inputs.tag_policy }}
+          MOJOBOOST_MANYLINUX: ${{ inputs.manylinux_floor }}
+        run: pixi run -e pkg packaging/linux/build_wheel_linux.sh
+
+      # Runs again here even though the builder calls it, because the builder
+      # is allowed to change and this step is the one the release decision
+      # reads. It parses the ELF dynamic sections; it does not install anything.
+      - name: Inspect the artifact
+        run: |
+          set -euo pipefail
+          python3 packaging/linux/inspect_wheel.py python/dist/*.whl \
+            | tee inspect-${{ matrix.arch }}.txt
+
+      # Flat, because the downloading job verifies the manifest by running
+      # sha256sum -c next to the files. Uploading python/dist/* alongside a
+      # file at the repository root would preserve the directory structure and
+      # move the wheels a level down from where the manifest says they are.
+      - name: Stage the release files
+        run: |
+          set -euo pipefail
+          mkdir -p artifact
+          cp python/dist/*.whl python/dist/*.provenance.json artifact/
+          cp inspect-${{ matrix.arch }}.txt artifact/
+          cd artifact
+          sha256sum *.whl *.provenance.json > SHA256SUMS-${{ matrix.arch }}.txt
+          cat SHA256SUMS-${{ matrix.arch }}.txt
+
+      - uses: actions/upload-artifact@v4 # TODO(pin): full commit SHA
+        if: always()
+        with:
+          name: wheel-linux-${{ matrix.arch }}
+          path: artifact/
+          # warn rather than error, because this step also runs when the build
+          # failed and there is legitimately nothing to upload. The build step
+          # is what reports that failure.
+          if-no-files-found: warn
+
+  # -------------------------------------------------------------------------
+  # Install the wheel where its own toolchain is not. This is the only step
+  # that can fail for the reason the whole exercise exists: a wheel that works
+  # beside the environment that built it and nowhere else.
+  #
+  # The container is deliberately not the build image, and the digest is
+  # deliberately not defaulted. packaging/linux/images.env explains why.
+  # -------------------------------------------------------------------------
+  clean-install:
+    name: Clean install ${{ matrix.arch }}
+    needs: [guard, build]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.guard.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4 # TODO(pin): full commit SHA
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4 # TODO(pin): full commit SHA
+        with:
+          name: wheel-linux-${{ matrix.arch }}
+          path: dist
+
+      - name: Verify the manifest before trusting the file
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum -c SHA256SUMS-${{ matrix.arch }}.txt
+
+      - name: Resolve the verification image
+        id: image
+        run: |
+          set -euo pipefail
+          . packaging/linux/images.env
+          case "${{ matrix.arch }}" in
+            x86_64)  REF=$VERIFY_OLD_X86_64_REF;  DIGEST=$VERIFY_OLD_X86_64_DIGEST ;;
+            aarch64) REF=$VERIFY_OLD_AARCH64_REF; DIGEST=$VERIFY_OLD_AARCH64_DIGEST ;;
+          esac
+          if [ -z "$DIGEST" ]; then
+            echo "::error::no digest for $REF in packaging/linux/images.env."
+            echo "A release that cannot say which image bytes it was verified"
+            echo "against has not been verified reproducibly. Fill the digest"
+            echo "in and commit it. See the comments in that file."
+            exit 1
+          fi
+          echo "image=$REF@$DIGEST" >> "$GITHUB_OUTPUT"
+
+      # The fixture refuses to run with CONDA_PREFIX set or with mojo on PATH,
+      # which is the point: a wheel tested next to its own toolchain has not
+      # been shown to need nothing from it.
+      - name: Clean install and smoke test
+        run: |
+          set -euo pipefail
+          . packaging/linux/images.env
+          docker run --rm -v "$PWD:/io" -w /io \
+            -e PYTHON="$MANYLINUX_PYTHON" \
+            ${{ steps.image.outputs.image }} \
+            packaging/matrix/smoke/clean_install_linux.sh \
+              "$(ls dist/*.whl)" clean-install-${{ matrix.arch }}.txt
+
+      # readelf -V per library and `ldd -r`, which the fixture above does not
+      # produce. This is where the artifact's real glibc floor is measured, so
+      # it runs in the oldest image rather than on the runner.
+      - name: ELF report on the target
+        run: |
+          set -euo pipefail
+          . packaging/linux/images.env
+          docker run --rm -v "$PWD:/io" -w /io \
+            -e PYTHON="$MANYLINUX_PYTHON" \
+            ${{ steps.image.outputs.image }} \
+            packaging/linux/container_elf_report.sh \
+              "$(ls dist/*.whl)" /io/elf-${{ matrix.arch }}.txt
+
+      - uses: actions/upload-artifact@v4 # TODO(pin): full commit SHA
+        if: always()
+        with:
+          name: clean-install-linux-${{ matrix.arch }}
+          path: |
+            clean-install-${{ matrix.arch }}.txt
+            elf-${{ matrix.arch }}.txt
+          if-no-files-found: warn
+
+  # -------------------------------------------------------------------------
+  # TestPyPI, and only TestPyPI. Disabled by default in three independent ways,
+  # because the failure this guards against is irreversible in the way that
+  # matters: a filename published to an index can be yanked but never reused.
+  #
+  #   1. publish_testpypi defaults to false
+  #   2. the repository variable MOJOBOOST_TESTPYPI_ENABLED must be 'true',
+  #      which is a setting in the repository rather than a field in a dispatch
+  #      form, so enabling it is a decision with an owner and an audit trail
+  #   3. the `testpypi` environment should carry required reviewers, which is a
+  #      GitHub setting this file cannot express. Task 10's handoff owns it
+  #
+  # Trusted publishing (OIDC), so there is no long-lived token anywhere. This
+  # is the only job in the workflow that gets id-token: write, and it gets
+  # nothing else.
+  # -------------------------------------------------------------------------
+  publish-testpypi:
+    name: TestPyPI (disabled by default)
+    needs: [build, clean-install]
+    if: >-
+      inputs.publish_testpypi &&
+      inputs.tag_policy == 'manylinux' &&
+      vars.MOJOBOOST_TESTPYPI_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    environment: testpypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4 # TODO(pin): full commit SHA
+        with:
+          pattern: wheel-linux-*
+          path: staging
+          merge-multiple: true
+
+      # Only wheels go to the index. The provenance sidecars and manifests are
+      # release assets, not distributions, and twine would reject them anyway.
+      - name: Stage the wheels alone
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find staging -name '*.whl' -exec cp {} dist/ \;
+          ls -l dist
+          test -n "$(ls dist/*.whl 2>/dev/null)"
+
+      - uses: pypa/gh-action-pypi-publish@release/v1 # TODO(pin): full commit SHA
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          packages-dir: dist
+          print-hash: true

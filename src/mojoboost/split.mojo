@@ -46,6 +46,17 @@ time. A feature with no reserved missing bin is scanned exactly as before and
 reports `default_left = False`; prediction never consults it, because no bin
 id can equal that feature's missing bin of -1.
 
+The remaining tree controls
+---------------------------
+`ExtraTreeParams` (tree_parameters_extra.mojo) rides in as one argument and
+defaults to inactive, in which case nothing below changes. Active, it adds a
+gain floor (`min_gain_to_split`), per-feature gain multipliers and the
+computable CEGB split cost, a discount on constrained splits
+(`monotone_penalty`), a single drawn threshold per feature (`extra_trees`),
+and candidate scoring at capped and smoothed child outputs (`max_delta_step`,
+`path_smooth`). The costs and the floor are applied once per feature, after
+that feature's best candidate is known, which is LightGBM's placement.
+
 Monotonic constraints
 ---------------------
 The search also takes the node's constraint vector and output bounds. With an
@@ -77,6 +88,13 @@ from .monotone import (
     monotone_sign,
     output_score,
     violates,
+)
+from .tree_parameters_extra import (
+    ExtraTreeParams,
+    apply_monotone_penalty,
+    extra_threshold_index,
+    finish_leaf_output,
+    passes_min_gain,
 )
 
 
@@ -172,31 +190,98 @@ def _split_gain(
     sign: Int,
     bounds: OutputBounds,
     constrained: Bool,
+    finish: Bool = False,
+    max_delta_step: Float64 = 0.0,
+    path_smooth: Float64 = 0.0,
+    left_c: Int = 0,
+    right_c: Int = 0,
+    parent_output: Float64 = 0.0,
 ) -> Float64:
     """Gain of one candidate split. `left_g` and `right_g` are the child
     gradient sums after L1 soft-thresholding.
 
-    Unconstrained, this is the plain second-order formula. Under active
-    monotonic constraints it is LightGBM's constrained form: both child
-    outputs are clamped into the node's bounds and scored at those outputs,
-    and a candidate whose outputs run against `sign` scores 0.0, which no
-    caller accepts because a split must beat a gain of 0.0 to be chosen.
+    Unconstrained and unfinished, this is the plain second-order formula.
+    Under active monotonic constraints it is LightGBM's constrained form: both
+    child outputs are clamped into the node's bounds and scored at those
+    outputs, and a candidate whose outputs run against `sign` scores 0.0,
+    which no caller accepts because a split must beat a gain of 0.0 to be
+    chosen.
+
+    `finish` is the same shape for `max_delta_step` and `path_smooth`: both
+    make a child emit something other than the free Newton step, so a
+    candidate scored at the free step would not be the gain the tree
+    realizes. The children are scored at `finish_leaf_output(...)` instead,
+    which is exactly the value `tree._leaf_value` will write, and the monotone
+    clamp is then applied on top of the finished output rather than under it,
+    so an active constraint still bounds what a leaf can emit.
     """
-    if not constrained:
+    if not constrained and not finish:
         return (
             left_g * left_g / (left_h + lambda_reg)
             + right_g * right_g / (right_h + lambda_reg)
             - parent_score
         )
-    var left_out = bounds.clamp(-left_g / (left_h + lambda_reg))
-    var right_out = bounds.clamp(-right_g / (right_h + lambda_reg))
-    if violates(sign, left_out, right_out):
-        return 0.0
+    var left_out = -left_g / (left_h + lambda_reg)
+    var right_out = -right_g / (right_h + lambda_reg)
+    if finish:
+        left_out = finish_leaf_output(
+            left_out, max_delta_step, path_smooth, left_c, parent_output
+        )
+        right_out = finish_leaf_output(
+            right_out, max_delta_step, path_smooth, right_c, parent_output
+        )
+    if constrained:
+        left_out = bounds.clamp(left_out)
+        right_out = bounds.clamp(right_out)
+        if violates(sign, left_out, right_out):
+            return 0.0
     return (
         output_score(left_g, left_h, lambda_reg, left_out)
         + output_score(right_g, right_h, lambda_reg, right_out)
         - parent_score
     )
+
+
+@always_inline
+def _feature_gain(
+    gain: Float64,
+    feature: Int,
+    extra: ExtraTreeParams,
+    extra_active: Bool,
+    penalize: Bool,
+    sign: Int,
+    depth: Int,
+    node_rows: Int,
+) -> Float64:
+    """One feature's best gain after that feature's costs, or 0.0 when the
+    result is rejected (a gain of 0.0 never beats the running best, which
+    starts there and is compared strictly).
+
+    Called once per feature, which is where LightGBM charges `feature_contri`
+    and the CEGB split cost and the only placement where a per-feature cost is
+    charged once rather than once per candidate. The order is LightGBM's: the
+    multiplier scales the gain, the costs are then subtracted as absolute
+    amounts, the monotone penalty discounts what is left, and
+    `min_gain_to_split` is the floor the result must clear.
+
+    `feature_already_used` is passed as True because the coupled first-use
+    cost is refused before training starts (see
+    `tree_parameters_extra.ExtraTreeParams.check_scalars`): there is no ledger
+    to consult, and charging it at every split would be a different penalty
+    from the one LightGBM applies.
+
+    With no bundle active this returns `gain` unchanged, so the caller's
+    comparison is the one the scan made inline before the bundle existed.
+    """
+    if not extra_active:
+        return gain
+    var g = gain
+    if penalize:
+        g = extra.penalties.penalized_gain(g, feature, node_rows, True)
+    g = apply_monotone_penalty(g, sign, depth, extra.monotone_penalty)
+    if not passes_min_gain(g, extra.min_gain_to_split):
+        return 0.0
+    return g
 
 
 def find_best_split(
@@ -212,6 +297,12 @@ def find_best_split(
     bounds: OutputBounds = OutputBounds.unbounded(),
     cats: CategoricalSpec = CategoricalSpec.none(),
     cat_params: CategoricalParams = CategoricalParams.default(),
+    extra: ExtraTreeParams = ExtraTreeParams(),
+    n_rows: Int = 0,
+    depth: Int = 0,
+    node: Int = 0,
+    tree_index: Int = 0,
+    parent_output: Float64 = 0.0,
 ) raises -> SplitInfo:
     """Scan all (feature, bin) split candidates and return the one with the
     highest gain. `lambda_reg` is the L2 penalty on the leaf hessian sum and
@@ -242,7 +333,32 @@ def find_best_split(
     `cats` marks which features are categorical (`BinnedMatrix.cats`) and
     `cat_params` holds the categorical hyperparameters. A categorical feature
     is handed to `find_best_categorical_split` instead of being scanned by
-    threshold, and its `missing_bins` entry is not consulted."""
+    threshold, and its `missing_bins` entry is not consulted.
+
+    `extra` is the remaining tree-control bundle
+    (`tree_parameters_extra.ExtraTreeParams`) and defaults to inactive, in
+    which case this function scans exactly as it did before it existed. When
+    it is active:
+
+    - a feature's best candidate is penalized once per feature, after the
+      feature's scan and before it is compared against the running best. That
+      is LightGBM's placement and the only one where a per-feature cost is
+      charged once rather than once per candidate.
+    - `min_gain_to_split` is the floor that best candidate must clear. At the
+      default 0.0 it is the `gain > 0.0` test the running best already
+      applies.
+    - `extra_trees` replaces a feature's scan with a single drawn threshold,
+      keyed by (`extra_seed`, `tree_index`, `node`, feature). A feature whose
+      draw fails `min_data_in_leaf` or `min_child_hess` yields no split for
+      that feature rather than falling back to a full scan, as in LightGBM.
+    - `max_delta_step` and `path_smooth` change what a child emits, so
+      candidates are scored at the finished outputs (see `_split_gain`).
+      `parent_output` is this node's own value, which is what its children
+      smooth toward, and `n_rows` its row count.
+
+    `n_rows` is the node's row count, used by the per-split CEGB cost and, at
+    0, taken from the histogram's own totals. `depth` is the node's depth in
+    edges from the root, which `monotone_penalty` discounts by."""
     var best = SplitInfo(-1, -1, 0.0, False)
     if len(missing_bins) > 0 and len(missing_bins) != hist.n_features:
         raise Error("missing_bins length must equal n_features")
@@ -259,6 +375,24 @@ def find_best_split(
     var masked = len(allowed) > 0
     var use_all = len(features) == 0
     var n_active = hist.n_features if use_all else len(features)
+
+    # Tested once per node, not once per candidate: an inactive bundle must
+    # leave the scan on exactly the path it took before the bundle existed.
+    var extra_active = extra.is_active()
+    var penalize = extra_active and extra.penalties.is_active()
+    var finish = extra.needs_leaf_finish()
+    var draw_one = extra.extra_trees
+    if draw_one and cats.any_categorical():
+        # LightGBM randomizes the categorical set search too, over partition
+        # positions rather than over thresholds. That is a different draw
+        # from this one and is not implemented, so the combination is refused
+        # rather than silently scoring categoricals exhaustively while every
+        # numerical feature gets a single draw.
+        raise Error(
+            "extra_trees is implemented for numerical thresholds only; a"
+            " categorical feature is searched as category partitions, whose"
+            " random draw is a separate rule"
+        )
 
     comptime W = SIMD_LANES
     var grad_p = hist.grad.unsafe_ptr()
@@ -294,6 +428,21 @@ def find_best_split(
             total_h += hess_p.unsafe_load(base + b)
             total_c += count_p.unsafe_load(base + b)
             b += 1
+        # This feature's own best candidate, held apart from `best` so a
+        # per-feature cost is charged once, after the feature's scan, rather
+        # than once per candidate. With no bundle active the two are the same
+        # thing: a local best starting at 0.0 followed by a strict comparison
+        # against `best` accepts exactly the candidates the inline comparison
+        # accepted, in the same order, so the chosen split is unchanged.
+        var f_gain = 0.0
+        var f_bin = -1
+        var f_default_left = False
+        var f_found = False
+        # The node's rows, which the per-split CEGB cost is charged per. Every
+        # feature's bins sum to the same total, so the histogram answers this
+        # when the caller does not.
+        var node_rows = n_rows if n_rows > 0 else total_c
+
         # Categorical features are searched as category partitions, never as
         # ordinal thresholds. Bin 0 (missing, unseen, dropped) is excluded
         # from every candidate set there, so this feature's `missing_bins`
@@ -319,8 +468,19 @@ def find_best_split(
                 min_data_in_leaf,
                 cat_params,
             )
-            if cs.found and cs.gain > best.gain:
-                best = SplitInfo.categorical(f, cs.gain, cs.bitset)
+            if cs.found:
+                var g = _feature_gain(
+                    cs.gain,
+                    f,
+                    extra,
+                    extra_active,
+                    penalize,
+                    sign,
+                    depth,
+                    node_rows,
+                )
+                if g > best.gain:
+                    best = SplitInfo.categorical(f, g, cs.bitset)
             continue
 
         var parent_g = soft_threshold_l1(total_g, lambda_l1)
@@ -337,6 +497,19 @@ def find_best_split(
             miss_h = hist.hess[base + missing_bin]
             miss_c = hist.count[base + missing_bin]
 
+        # `extra_trees`: one drawn threshold for this feature instead of the
+        # whole scan. The candidate space is the same one the scan walks, so
+        # the top threshold counts only when missing rows can fill the right
+        # child, and a feature that offers no candidate offers no split.
+        var pick = -1
+        if draw_one:
+            var n_candidates = n_scan if miss_c > 0 else n_scan - 1
+            pick = extra_threshold_index(
+                n_candidates, extra.extra_seed, tree_index, node, f
+            )
+            if pick < 0:
+                continue
+
         var left_g = 0.0
         var left_h = 0.0
         var left_c = 0
@@ -348,6 +521,11 @@ def find_best_split(
             left_g += hist.grad[base + b]
             left_h += hist.hess[base + b]
             left_c += hist.count[base + b]
+            # The prefix sums above are what the drawn threshold is built
+            # from, so they are accumulated for every bin below it and only
+            # the drawn one is scored.
+            if draw_one and b != pick:
+                continue
 
             # Missing to the left, scored first so an exact tie keeps
             # default_left, as in LightGBM. With no missing rows in this node
@@ -377,36 +555,70 @@ def find_best_split(
                         sign,
                         bounds,
                         constrained,
+                        finish,
+                        extra.max_delta_step,
+                        extra.path_smooth,
+                        dl_left_c,
+                        total_c - dl_left_c,
+                        parent_output,
                     )
-                    if gain > best.gain:
-                        best = SplitInfo(f, b, gain, True, True)
+                    if gain > f_gain:
+                        f_gain = gain
+                        f_bin = b
+                        f_default_left = True
+                        f_found = True
 
             # Missing to the right. For a feature with no missing bin this is
             # the only candidate and the scan is exactly the ordinal one.
             if missing_bin < 0 or miss_c > 0:
                 var right_g = total_g - left_g
                 var right_h = total_h - left_h
-                if left_h < min_child_hess or right_h < min_child_hess:
-                    continue
-                if (
-                    left_c < min_data_in_leaf
+                if not (
+                    left_h < min_child_hess
+                    or right_h < min_child_hess
+                    or left_c < min_data_in_leaf
                     or total_c - left_c < min_data_in_leaf
                 ):
-                    continue
-                var tl = soft_threshold_l1(left_g, lambda_l1)
-                var tr = soft_threshold_l1(right_g, lambda_l1)
-                var gain = _split_gain(
-                    tl,
-                    left_h,
-                    tr,
-                    right_h,
-                    lambda_reg,
-                    parent_score,
-                    sign,
-                    bounds,
-                    constrained,
-                )
-                if gain > best.gain:
-                    best = SplitInfo(f, b, gain, True, False)
+                    var tl = soft_threshold_l1(left_g, lambda_l1)
+                    var tr = soft_threshold_l1(right_g, lambda_l1)
+                    var gain = _split_gain(
+                        tl,
+                        left_h,
+                        tr,
+                        right_h,
+                        lambda_reg,
+                        parent_score,
+                        sign,
+                        bounds,
+                        constrained,
+                        finish,
+                        extra.max_delta_step,
+                        extra.path_smooth,
+                        left_c,
+                        total_c - left_c,
+                        parent_output,
+                    )
+                    if gain > f_gain:
+                        f_gain = gain
+                        f_bin = b
+                        f_default_left = False
+                        f_found = True
+
+            if draw_one:
+                break
+
+        if f_found:
+            var g = _feature_gain(
+                f_gain,
+                f,
+                extra,
+                extra_active,
+                penalize,
+                sign,
+                depth,
+                node_rows,
+            )
+            if g > best.gain:
+                best = SplitInfo(f, f_bin, g, True, f_default_left)
 
     return best^

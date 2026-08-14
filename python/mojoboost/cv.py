@@ -95,6 +95,22 @@ When it fires, the returned history is truncated to the winning round and
 through that round. Without early stopping `best_iteration` stays -1 and
 prediction uses every iteration.
 
+Where these names live
+----------------------
+`cv` and `CVBooster` are this module's whole public surface. Every other
+name in it, `FoldModel` included, is internal and may change without
+notice.
+
+Both are meant to be re-exported at the top level, so that `mojoboost.cv(
+params, train_set, ...)` is the call a LightGBM user reaches for. The
+package cannot then also answer `mojoboost.cv` with this module: the
+function wins the attribute, and `import mojoboost.cv as m` binds `m` to
+the function rather than to the module. `from mojoboost.cv import cv,
+CVBooster` keeps working either way, because that form goes through the
+import system rather than through the attribute. That trade is deliberate
+and is written up, with the alternative, in
+handoffs/integration_06_python_api.md.
+
 Differences from LightGBM
 -------------------------
 - **`results["iterations"]`** is mojoboost's addition: the round number each
@@ -134,6 +150,8 @@ from .basic import _ROUND_ALIASES, _Config
 
 _np = _arrays.np
 
+#: The public surface, and all of it. `FoldModel` and everything else
+#: without a leading underscore is internal; see the module docstring.
 __all__ = ["CVBooster", "cv"]
 
 #: The two sides of a fold, in the order they are reported.
@@ -581,6 +599,13 @@ class CVBooster:
     not run; `predict` slices to it by default, so the prediction is the one
     the reported history describes rather than the one the extra rounds
     would give.
+
+    One run has one of these. `cv()` builds it before the first round and
+    keeps it: the object a callback reads as `env.model` is the object the
+    caller gets back in `results["cvbooster"]`, holding the same `Booster`
+    per fold rather than a second wrapper around it. That is why
+    `best_iteration` is filled in at the end of the run rather than at
+    construction, and why a callback may leave state on it.
     """
 
     def __init__(self, boosters=None, best_iteration=-1, fold_names=None):
@@ -951,6 +976,14 @@ def cv(
                 _RetrainFold(dtrain, dvalid, run_params, rounds, init_model)
             )
 
+    # The fitted folds, owned once for the whole run: the callbacks and the
+    # returned history hand out this object rather than each building their
+    # own wrapper around the same Boosters. A `_RetrainFold` has no Booster
+    # until it is advanced, so the list is refreshed rather than snapshotted
+    # (`_sync_folds`).
+    cvbooster = CVBooster(fold_names=[split.name for split in splits])
+    _sync_folds(cvbooster, models)
+
     # (side, history key, metric spec), in the order they are reported.
     keys = [(side, f"{side} {spec[0]}", spec) for side in sides
             for spec in specs]
@@ -980,7 +1013,7 @@ def cv(
     for index, round_number in enumerate(checkpoints):
         if callbacks:
             stop_exception = _run_phase(
-                callbacks, models, fold_params, round_number, rounds,
+                callbacks, cvbooster, fold_params, round_number, rounds,
                 before=True, env_results=[],
             )
             if stop_exception is not None:
@@ -991,6 +1024,7 @@ def cv(
                 break
         for model in models:
             model.advance_to(round_number)
+        _sync_folds(cvbooster, models)
 
         means = {}
         for side in sides:
@@ -1008,7 +1042,7 @@ def cv(
         if callbacks:
             stop_exception = _run_phase(
                 callbacks,
-                models,
+                cvbooster,
                 fold_params,
                 round_number,
                 rounds,
@@ -1045,13 +1079,25 @@ def cv(
                     "cv_agg",
                 )
 
+    _sync_folds(cvbooster, models)
+    cvbooster.best_iteration = best_iteration
     if return_cvbooster:
-        results["cvbooster"] = CVBooster(
-            [model.booster for model in models],
-            best_iteration,
-            [split.name for split in splits],
-        )
+        # Added after the truncation above, which walks every entry of
+        # `results` as a history list.
+        results["cvbooster"] = cvbooster
     return results
+
+
+def _sync_folds(cvbooster, models):
+    """Point the run's `CVBooster` at the current fold models.
+
+    `_IncrementalFold` has its `Booster` from construction and this is a
+    no-op for it. `_RetrainFold` has none until it is advanced, so the one
+    `CVBooster` the run owns is refreshed at each point it becomes
+    observable rather than rebuilt around a fresh list.
+    """
+    cvbooster.boosters = [model.booster for model in models]
+    return cvbooster
 
 
 def _preprocessed(fpreproc, dtrain, dvalid, run_params, name):
@@ -1079,15 +1125,17 @@ def _preprocessed(fpreproc, dtrain, dvalid, run_params, name):
     return dtrain, dvalid, dict(run_params or {})
 
 
-def _run_phase(callbacks, models, params, round_number, rounds, before,
+def _run_phase(callbacks, cvbooster, params, round_number, rounds, before,
                env_results):
     """One phase's callbacks for one evaluated round.
 
-    The environment is LightGBM's, with the `CVBooster` in the `model` slot
-    so a callback can reach the folds, and `iteration` 0-based as it is
-    everywhere else in this package. The before-iteration phase runs before
-    the round is grown and sees no results, because nothing has been scored
-    yet; the after-iteration phase sees the across-fold means.
+    The environment is LightGBM's, with the run's `CVBooster` in the `model`
+    slot so a callback can reach the folds, and `iteration` 0-based as it is
+    everywhere else in this package. It is the same object every round and
+    the same object the caller is handed, so a callback that stashes state
+    on it finds the state again. The before-iteration phase runs before the
+    round is grown and sees no results, because nothing has been scored yet;
+    the after-iteration phase sees the across-fold means.
 
     A callback that raises `EarlyStopException` stops the run, as it does in
     `fit`, and the exception is returned rather than raised. Anything else
@@ -1096,7 +1144,7 @@ def _run_phase(callbacks, models, params, round_number, rounds, before,
     from .callback import CallbackEnv, EarlyStopException, _sorted_phase
 
     env = CallbackEnv(
-        model=CVBooster([model.booster for model in models], -1),
+        model=cvbooster,
         params=dict(params),
         iteration=round_number - 1,
         begin_iteration=0,

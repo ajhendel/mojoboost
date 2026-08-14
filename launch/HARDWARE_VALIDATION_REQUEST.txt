@@ -1,0 +1,78 @@
+DESTINATION: Modular Discord, GitHub Discussions, Reddit, and direct outreach. Four versions below. Post one, not all. Delete everything above the version you are posting, including its own header line.
+
+PURPOSE: Recruit outside contributors who own hardware this project has never run on, and get evidence back in a form that can be reviewed rather than believed.
+
+POSTING RULES
+
+Do not claim NVIDIA or AMD support, validation, or performance. Nothing has run on either. The whole point of the post is that the rows are empty.
+Do not claim performance leadership, production readiness, or feature parity with LightGBM. The honest description is a broad LightGBM-shaped feature surface at experimental-alpha maturity.
+Do not promise anything in exchange for a result other than attribution, which is automatic.
+Check the current self-promotion rules of any subreddit or forum before posting, and prefer answering an existing thread to starting one.
+Link the contributor protocol, not the repository root. Somebody deciding whether to spend an hour needs to see what the hour involves.
+If somebody reports a failure, thank them for it in public. Failure records are the ones nobody files, and the tone of the first response decides whether a second one arrives.
+
+--- SHORT VERSION: Modular Discord, chat channels, and anywhere a long post would be rude ---
+
+MojoBoost is a gradient-boosted tree library written natively in Mojo, with one GPU source shared by Metal, CUDA, and HIP. No CUDA file, no HIP file, no Metal file, no vendor branch anywhere in it.
+
+That design commitment is worth exactly as much as the evidence behind it, and the evidence is one Apple M4. No NVIDIA device and no AMD device has ever executed this code, on a desk or in CI. No Apple chip other than that M4 has either.
+
+If you have a GPU and an hour, you can change that. There is a read-only environment capture script, a record template, and a procedure that says exactly what to run and what counts as a result. Correctness only is a complete contribution and takes about thirty minutes, most of it the build. A machine where it fails to build is the single most useful thing anyone could send right now, and nobody has sent one.
+
+Protocol: https://github.com/ajhendel/mojoboost/blob/main/docs/HARDWARE_CONTRIBUTORS.md
+Repository: https://github.com/ajhendel/mojoboost
+
+Experimental public alpha. Attribution for every accepted record, and that is the whole of what is on offer.
+
+--- LONG VERSION: GitHub Discussions, the Modular forum, and mailing lists ---
+
+MojoBoost is a gradient-boosted decision tree library written natively in Mojo, with a LightGBM-familiar Python API. It has one GPU source spanning every backend it targets: the histogram and partition kernels, the device-resident tree growth, and a tiling policy that derives launch geometry from device attributes at runtime. There is no CUDA file, no HIP file, no Metal file, and no vendor branch anywhere in it.
+
+That is a design commitment, and it is worth exactly as much as the evidence that the one source is correct on every backend it claims to target. Here is the evidence. One Apple M4, correctness and determinism passing, phase timings printing but not recorded as a sweep, no profiler trace. That is the entire body of hardware evidence this project has. No NVIDIA device and no AMD device has ever executed this code, on a laptop or in CI, and no Apple chip other than that M4 has either. The status tables in the repository say "not run" in most cells because most cells have not been run, and they will keep saying it until somebody with the hardware runs them.
+
+What a first record settles, per device. On any NVIDIA board: whether the shared source builds, computes the right answer, and repeats bit-identically on CUDA. Determinism is the interesting one, because fixed-point Int32 accumulation is what buys it and a backend whose atomics or scheduling differ from Metal's is exactly where it would break. On any AMD board: the same three questions on HIP, and which of consumer RDNA and datacenter CDNA you ran, since a result from one says nothing about the other. On an M1, M2, M3, or M5: whether the tiling policy's fallbacks are right on a chip that answers a different set of device attributes, because Metal refuses six of eleven attribute queries on the recorded M4 and nobody knows what the others refuse.
+
+What contributing involves. Clone, `pixi install`, run one read-only capture script that installs nothing and uploads nothing, run the test suites, fill in a JSON template, attach the raw terminal output, open an issue. Around thirty minutes for a correctness-only record, which is a complete contribution and the bar for a first record on any device. Two to three hours for a full record with a phase-timing sweep. Half a day if you also produce a profiler trace, which is rare and is the only thing that could ever justify a device-specific change to the code.
+
+The rules that make a record worth having, in case they tell you whether this is your kind of project. A GPU suite that prints "skipped: no accelerator" is not a pass, and on a machine with a GPU it means the build did not see the device. A throughput number without a loss number next to it is not a result. Raw output is required, because a record without it is a claim rather than evidence. A failure, a refused card, or a Mac with no Metal compiler is a complete and publishable result, and there is a status for it. Your record is about your device and will never be generalized into a statement about a vendor or an architecture.
+
+Everything is Apache 2.0, attribution is automatic and is the only thing on offer, and a withdrawal request is honored.
+
+Contributor protocol: https://github.com/ajhendel/mojoboost/blob/main/docs/HARDWARE_CONTRIBUTORS.md
+Validation procedure: https://github.com/ajhendel/mojoboost/blob/main/docs/GPU_VALIDATION.md
+Repository: https://github.com/ajhendel/mojoboost
+
+This is an experimental public alpha, not a production or performance claim.
+
+--- REDDIT VERSION: check the subreddit rules first, and prefer an existing thread ---
+
+I have been writing a gradient-boosted tree library in Mojo with one GPU source shared across Metal, CUDA, and HIP. No per-vendor kernels, no vendor branches: the launch geometry is derived from device attributes at runtime instead.
+
+The honest status is that it has run on exactly one GPU, an Apple M4. Nothing NVIDIA, nothing AMD, no other Apple chip, not once, not in CI. So I am not posting a benchmark, because I do not have one worth posting, and the numbers I do have came off a loaded development machine and are labeled unquotable in the repository for that reason.
+
+What I am asking for is validation from people who own the hardware I do not. There is a written procedure, a read-only capture script that installs nothing and uploads nothing, a record template, and a review process that will not turn your one board into a claim about a vendor. Correctness only is about thirty minutes and counts as a complete contribution. A machine where the build fails is the most useful record anyone could file and nobody has filed one yet.
+
+Protocol and what an hour actually involves: https://github.com/ajhendel/mojoboost/blob/main/docs/HARDWARE_CONTRIBUTORS.md
+
+Experimental alpha. Apache 2.0. Attribution for accepted records, which is the entire compensation on offer, and I would rather say that plainly than dress it up.
+
+--- DIRECT OUTREACH: email or a direct message, one person, edit before sending ---
+
+Subject: One hour on your <device> would settle something MojoBoost cannot settle alone
+
+Hello <name>,
+
+I maintain MojoBoost, a gradient-boosted tree library written natively in Mojo. It has one GPU source for Metal, CUDA, and HIP, with no vendor branch anywhere in it, and the launch geometry derived from device attributes at runtime rather than hard-coded per chip.
+
+I am writing because you have a <device> and this code has never run on one. It has run on exactly one GPU, an Apple M4. Every NVIDIA and AMD row in the repository says "not run", accurately.
+
+What I would ask, if you are willing, is about thirty minutes: clone, `pixi install`, run one read-only capture script, run the GPU test suites, and send me the raw output. There is a written procedure and a template, and correctness alone is a complete contribution. If it fails to build on your card, that is the most useful result of all and I would like the error text more than I would like a pass.
+
+The one thing I would like to be clear about up front: I will not turn your result into a claim about your vendor. A record about a <device> becomes a statement about that board and nothing wider. You are credited by name or handle, the record and its raw output are published under Apache 2.0 alongside the code, and I will remove it on request.
+
+The protocol, which says exactly what the hour involves: https://github.com/ajhendel/mojoboost/blob/main/docs/HARDWARE_CONTRIBUTORS.md
+
+No obligation, and no follow-up if this is not a good use of your time.
+
+Best,
+<name>

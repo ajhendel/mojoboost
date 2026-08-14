@@ -1,0 +1,86 @@
+# Dependency updates.
+#
+# The policy this implements, including what is deliberately left manual, is
+# docs/RELEASE_SECURITY.md section 6. Two things about this file are worth
+# knowing before editing it.
+#
+# 1. It opens pull requests. It never merges one. There is no auto-merge
+#    workflow in this repository and adding one for these pull requests would
+#    be unsafe for the reasons in docs/RELEASE_SECURITY.md section 7, which are
+#    about workflow and packaging changes specifically and do not go away
+#    because the author is a bot.
+#
+# 2. It cannot see this project's real supply chain. Dependabot has no conda
+#    or pixi ecosystem, so `pixi.toml` and `pixi.lock` are invisible to it, and
+#    those two files are where `mojo`, `max`, and every conda-forge package the
+#    build uses are pinned. The MAX runtime libraries that ship inside the
+#    macOS wheel come from there and from nowhere else. Updating them is a
+#    manual `pixi update` under docs/RELEASE_SECURITY.md section 6.3, and no
+#    alert in this repository will tell you when one is needed.
+#
+# Enabling Dependabot *security* updates and the alerts that drive them is a
+# repository settings action, not a file. This file only configures scheduled
+# version updates. See handoffs/release_10_security.md, "Owner actions".
+
+version: 2
+
+updates:
+  # GitHub Actions. This is the ecosystem that matters here, because the
+  # release path is a workflow and every action in it runs with whatever
+  # permissions that job grants.
+  #
+  # Actions are pinned by commit SHA (docs/RELEASE_SECURITY.md section 5).
+  # Dependabot understands SHA pins, bumps the SHA, and rewrites the version
+  # comment on the same line, so pinning does not cost you the updates. It is
+  # the only mechanism that makes SHA pinning maintainable by one person.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "America/New_York"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "ci"
+      - "security-review-required"
+    commit-message:
+      prefix: "ci"
+    # One pull request per week for all of them. A workflow change gets read as
+    # a unit or it does not get read, and five separate action bumps get
+    # rubber stamped in a way one grouped diff does not.
+    groups:
+      actions:
+        patterns:
+          - "*"
+
+  # The Python distribution metadata.
+  #
+  # Expect this to find nothing for a while, and that is not a
+  # misconfiguration. python/pyproject.toml declares one optional dependency
+  # with no version constraint and a build-system requirement that Dependabot's
+  # pip ecosystem does not update. The entry is here so that the first time a
+  # pinned runtime dependency is added, it is already watched, rather than
+  # being added and then forgotten.
+  #
+  # The test and benchmark dependencies (pytest, scikit-learn, pandas, numpy,
+  # lightgbm) are pixi features, not pip requirements, so they are invisible
+  # here too. They are also not shipped to anyone.
+  - package-ecosystem: "pip"
+    directory: "/python"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "America/New_York"
+    open-pull-requests-limit: 3
+    labels:
+      - "dependencies"
+      - "python"
+    commit-message:
+      prefix: "deps"
+    groups:
+      python:
+        patterns:
+          - "*"

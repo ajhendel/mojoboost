@@ -1,0 +1,169 @@
+name: Hardware result record (machine-readable)
+description: Submit a filled-in hardware record plus its raw output, from any Apple, NVIDIA, or AMD device
+title: "[Hardware result]: "
+labels:
+  - hardware-validation
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Read [docs/HARDWARE_CONTRIBUTORS.md](https://github.com/ajhendel/mojoboost/blob/main/docs/HARDWARE_CONTRIBUTORS.md) first. It is the protocol; [docs/GPU_VALIDATION.md](https://github.com/ajhendel/mojoboost/blob/main/docs/GPU_VALIDATION.md) is the procedure, and [docs/APPLE_GPU_BENCHMARK_PROTOCOL.md](https://github.com/ajhendel/mojoboost/blob/main/docs/APPLE_GPU_BENCHMARK_PROTOCOL.md) is the one for quotable Apple timings.
+
+        Three things worth knowing before you fill this in.
+
+        A GPU suite that printed `skipped: no accelerator` is **not** a pass. On a machine with a GPU it means the build did not see the device, which is a finding worth reporting on its own.
+
+        A failure is a result. A build that does not compile, a card the installed ROCm refuses, a Mac with no Metal compiler: all of these are worth filing, and none of them has been filed yet.
+
+        Prefer prose to JSON? Use the [accelerator validation report](https://github.com/ajhendel/mojoboost/issues/new?template=hardware_validation.yml) form instead. It is still accepted.
+
+  - type: dropdown
+    id: vendor
+    attributes:
+      label: Vendor and API
+      options:
+        - Apple, Metal
+        - NVIDIA, CUDA
+        - AMD, HIP
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: device
+    attributes:
+      label: Exact device
+      description: As the vendor tool prints it. The exact board, never the family.
+      placeholder: NVIDIA L4, AMD Radeon RX 7900 XTX, Apple M2 Max 38-core GPU
+    validations:
+      required: true
+
+  - type: input
+    id: arch
+    attributes:
+      label: Architecture
+      description: The number that transfers between boards. gfx target, compute capability, or the Metal arch_name. Write "unknown" if no tool reported one.
+      placeholder: gfx1100, compute capability 8.9, 4-metal4
+    validations:
+      required: true
+
+  - type: dropdown
+    id: machine_kind
+    attributes:
+      label: Where the device lives
+      description: A shared cloud host and an idle desk machine are different measurement conditions, and a reader cannot tell from the numbers.
+      options:
+        - Laptop
+        - Desktop or workstation
+        - Server, bare metal
+        - Cloud instance
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: commit
+    attributes:
+      label: Commit
+      description: Full 40-character hash from `git rev-parse HEAD`. Not a branch name. Add "(dirty)" if `git status --porcelain` printed anything.
+      placeholder: 24077a6... (full hash)
+    validations:
+      required: true
+
+  - type: input
+    id: toolchain
+    attributes:
+      label: Mojo and MAX versions
+      description: From `pixi run mojo --version` and `pixi list --environment default | grep -Ei '^(mojo|max)'`, in the session that produced these results.
+      placeholder: Mojo 1.0.0 (ed45d567), MAX 26.5.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: correctness
+    attributes:
+      label: Correctness outcome
+      description: What the GPU equivalence suites actually did. Correctness gates everything after it.
+      options:
+        - Pass, the suites ran on the device and agreed with the CPU reference
+        - Fail, something did not agree
+        - Skipped, the suites printed "skipped: no accelerator"
+        - Unsupported, the build or the runtime refused this device
+        - Not run
+    validations:
+      required: true
+
+  - type: textarea
+    id: capture
+    attributes:
+      label: Environment capture output
+      description: The full output of `sh hardware/capture/capture_<vendor>.sh`. Attach it as a file instead if it is long, and write the filename here.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: record
+    attributes:
+      label: Record
+      description: The filled-in template from hardware/templates/, with is_template set to false. Fields no command answered stay null.
+      render: json
+    validations:
+      required: true
+
+  - type: textarea
+    id: raw_output
+    attributes:
+      label: Raw output, or the names of the files you attached
+      description: What the terminal printed, unedited. Drag files into this issue to attach them and list their names here. A record without raw output is a claim rather than evidence, and is not accepted.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: skipped_or_failed
+    attributes:
+      label: Skips, failures, and refusals
+      description: For every command that skipped, failed, or was refused, the line it printed, verbatim. Include the driver or ROCm version that refused, and any workaround such as HSA_OVERRIDE_GFX_VERSION, which makes the run a run of a different device.
+      render: text
+
+  - type: textarea
+    id: timings
+    attributes:
+      label: Phase timings, with model quality next to them
+      description: Leave empty if you ran correctness only; that is a complete contribution. If you did time it, every timing needs the training MSE or loss from the same fit beside it, plus the repetition count and whether the machine was idle. A throughput number without a loss number next to it is not a result.
+      render: text
+
+  - type: checkboxes
+    id: attestations
+    attributes:
+      label: Before you submit
+      options:
+        - label: Every number here was copied from output I watched print. Nothing is retyped from memory, rounded, estimated, or filled in from a similar machine.
+          required: true
+        - label: A test that printed "skipped" is recorded as skipped, not as a pass.
+          required: true
+        - label: Any timing I reported has a model quality number from the same fit next to it, or I reported no timings.
+          required: true
+        - label: I have said what I redacted or truncated, if anything.
+          required: true
+
+  - type: checkboxes
+    id: license
+    attributes:
+      label: License and attribution
+      options:
+        - label: I license this record, its raw output, and the numbers in it for inclusion in mojoboost under the Apache License 2.0, with attribution to my account, and I may publish this hardware result.
+          required: true
+
+  - type: input
+    id: attribution
+    attributes:
+      label: Attribution name
+      description: How you want to be credited in docs/HARDWARE_CONTRIBUTORS.md. Leave empty to be credited by your GitHub handle.
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else
+      description: What surprised you, what you would check next, what you think the numbers do and do not support. Read as context, never as a substitute for the output.

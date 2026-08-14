@@ -87,6 +87,15 @@ from .boosting import (
     MulticlassBooster,
 )
 from .categorical import CAT_BITSET_WORDS
+from .gpu_runtime import (
+    PHASE_ALLOC,
+    ROLE_VALID,
+    SLOT_VALID_BINS,
+    SLOT_VALID_SCORE,
+    GpuSession,
+    MatrixIdentity,
+    bins_fingerprint,
+)
 from .gpu_tiling import DeviceCaps, derive_block_threads, query_device_caps
 from .metrics import check_metric_weight
 from .tree import Tree
@@ -632,6 +641,14 @@ struct GpuPredictor(Movable):
     validation buffers are separate and sized once by `set_validation`, so
     an ad-hoc prediction during a training run cannot disturb the running
     validation scores.
+
+    The context is the caller's choice. `GpuPredictor(n_features, n_outputs)`
+    opens a private one, which is right for scoring a finished model.
+    Scoring alongside a training run should pass that run's context or its
+    `GpuSession` instead, which is what `train_gpu_with_valid` does: one
+    in-order queue holds both the round's training kernels and the
+    validation walk, so neither needs a fence against the other, and there
+    is one device context per run rather than two.
     """
 
     var ctx: DeviceContext
@@ -671,16 +688,48 @@ struct GpuPredictor(Movable):
     var block_threads: Int
 
     def __init__(out self, n_features: Int, n_outputs: Int) raises:
-        """Open a device and allocate the placeholder buffers. Nothing is
-        scored until `upload_ensemble` has run."""
+        """Open a private device context and allocate the placeholder
+        buffers. Nothing is scored until `upload_ensemble` has run.
+
+        A predictor that scores alongside a training run should take that
+        run's context instead, through one of the two overloads below: two
+        contexts on one device are two queues, and a predictor that shares
+        the trainer's queue needs no fence against it."""
+        var ctx = DeviceContext()
+        var caps = query_device_caps(ctx)
+        self = Self(ctx, caps, n_features, n_outputs)
+
+    def __init__(
+        out self, mut session: GpuSession, n_features: Int, n_outputs: Int
+    ) raises:
+        """Predict on `session`'s context, and charge the allocation to the
+        session's `PHASE_ALLOC` counter. The validation buffers are not
+        sized here; `set_validation`'s session overload records those, since
+        that is where their shape is known."""
+        var started = session.clock()
+        self = Self(session.ctx, session.caps, n_features, n_outputs)
+        session.record(PHASE_ALLOC, started)
+
+    def __init__(
+        out self,
+        ctx: DeviceContext,
+        caps: DeviceCaps,
+        n_features: Int,
+        n_outputs: Int,
+    ) raises:
+        """Predict on a caller-supplied context and its queried
+        capabilities; the two public forms above both land here. The
+        trainers in train_gpu.mojo pass `builder.ctx` and `builder.caps`, so
+        validation scoring queues behind the round's training kernels in one
+        in-order queue."""
         if n_features < 1:
             raise Error("GPU prediction requires at least one feature")
         if n_outputs < 1:
             raise Error("GPU prediction requires at least one output")
-        self.ctx = DeviceContext()
+        self.ctx = ctx
         self.n_features = n_features
         self.n_outputs = n_outputs
-        self.caps = query_device_caps(self.ctx)
+        self.caps = caps.copy()
         self.block_threads = derive_block_threads(self.caps)
         self.n_trees = 0
         self.learning_rate = 1.0
@@ -1054,6 +1103,47 @@ struct GpuPredictor(Movable):
             )
         self.ctx.enqueue_memset(self.valid_raw_dev, Float32(0.0))
         self.ctx.synchronize()
+
+    def set_validation(
+        mut self,
+        mut session: GpuSession,
+        data: BinnedMatrix,
+        target: List[Float64],
+        weight: List[Float64] = [],
+    ) raises:
+        """`set_validation`, recorded in `session`'s ledgers under the slots
+        gpu_runtime.mojo reserved for a held-out matrix.
+
+        Bookkeeping only, no behavior change: the matrix, labels, weights,
+        and score vector are uploaded and drained exactly as the plain form
+        does. What the entries record is what a pooled path could later
+        skip. A second predictor on the same session and the same validation
+        matrix still re-uploads today, because the buffers live in the
+        predictor rather than in the session, which is the same limit the
+        builder's session constructor carries.
+        """
+        var started = session.clock()
+        self.set_validation(data, target, weight)
+        _ = session.admit_matrix(
+            ROLE_VALID,
+            MatrixIdentity(
+                data.n_rows,
+                data.n_features,
+                data.n_bins,
+                bins_fingerprint(
+                    data.bins, data.n_rows, data.n_features, data.n_bins
+                ),
+            ),
+        )
+        _ = session.request_buffer(
+            SLOT_VALID_BINS, data.n_rows * data.n_features, 1
+        )
+        # The raw scores and the response scratch are the same shape and
+        # share the slot, since the pool tracks a role's high-water size.
+        _ = session.request_buffer(
+            SLOT_VALID_SCORE, data.n_rows * self.n_outputs, 4
+        )
+        session.record(PHASE_ALLOC, started)
 
     def reset_validation(mut self, base_scores: List[Float64]) raises:
         """Set every validation row's raw score to the ensemble's per-output

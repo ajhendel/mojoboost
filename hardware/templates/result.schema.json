@@ -1,0 +1,655 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ajhendel/mojoboost/blob/main/hardware/templates/result.schema.json",
+  "title": "mojoboost outside hardware validation record",
+  "description": "One file per device per session, written by an outside contributor and reviewed by a maintainer before anything in the repository changes. A record describes what was run, on what, and what happened. Every quantity that was not measured is null and carries a reason. Absence of a number is a fact the record states, never a zero and never an estimate. The procedures these fields come from are docs/GPU_VALIDATION.md and, for Apple timing and energy, docs/APPLE_GPU_BENCHMARK_PROTOCOL.md. The contributor protocol is docs/HARDWARE_CONTRIBUTORS.md. Nothing has ever been validated against this schema; it is a specification, not a tested program.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "protocol_version",
+    "record_id",
+    "submitted_utc",
+    "contributor",
+    "license",
+    "hardware",
+    "host",
+    "toolchain",
+    "source",
+    "runs",
+    "verdict",
+    "raw_output"
+  ],
+  "properties": {
+    "schema_version": {
+      "description": "Version of this schema the record was written against. Minor for additive optional fields, major for anything a reader must change to understand.",
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "protocol_version": {
+      "description": "Version of docs/HARDWARE_CONTRIBUTORS.md the session followed. Records written under different protocol versions are not comparable without reading both.",
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "is_template": {
+      "description": "True only for the empty templates in this directory. A record with this field true must never be read, quoted, indexed, or merged as evidence. Set it to false, or delete it, when you fill the template in.",
+      "type": "boolean",
+      "default": false
+    },
+    "record_id": {
+      "description": "Unique id for this record, and the filename stem when a maintainer accepts it. Convention: <vendor>-<device-slug>-<YYYY-MM-DD>-<contributor-handle>, for example nvidia-l4-2026-08-20-octocat. Two records from the same person on the same device on the same day get a -2 suffix rather than overwriting each other.",
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9.-]*$",
+      "minLength": 3
+    },
+    "submitted_utc": { "$ref": "#/$defs/timestamp" },
+    "session_utc": {
+      "description": "When the commands were actually run, if that is not the day the record was submitted.",
+      "$ref": "#/$defs/nullable_timestamp"
+    },
+    "contributor": {
+      "description": "Who ran it. A record with no identifiable contributor cannot be attributed, and an unattributed result is not accepted, because there is then nobody to ask when a number is questioned.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["handle", "platform"],
+      "properties": {
+        "handle": {
+          "description": "GitHub account, or the account on whatever platform the record arrived through.",
+          "type": "string",
+          "minLength": 1
+        },
+        "platform": {
+          "description": "Where the record was submitted from.",
+          "type": "string",
+          "enum": ["github", "discord", "email", "forum", "other"]
+        },
+        "display_name": {
+          "description": "The name to use in the attribution line, if it differs from the handle. Optional, and never required.",
+          "$ref": "#/$defs/nullable_string"
+        },
+        "affiliation": {
+          "description": "Optional. Include only if you want it published; it is never asked for and never inferred.",
+          "$ref": "#/$defs/nullable_string"
+        },
+        "contact": {
+          "description": "Optional public contact for follow-up questions. Do not put a private address here. The issue thread is the normal way to reach a contributor.",
+          "$ref": "#/$defs/nullable_string"
+        }
+      }
+    },
+    "license": {
+      "description": "The grant that makes the record includable. Without it the evidence cannot be committed to the repository, however good it is.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["grant", "spdx", "attribution_required"],
+      "properties": {
+        "grant": {
+          "description": "True means: this record, its raw output, and the numbers in it may be committed to the mojoboost repository, quoted in its documentation, and redistributed with it.",
+          "type": "boolean"
+        },
+        "spdx": {
+          "description": "The license the contribution is made under. Apache-2.0 matches the repository. Anything else has to be discussed before the record can be committed.",
+          "type": "string",
+          "enum": ["Apache-2.0", "CC0-1.0", "other"]
+        },
+        "attribution_required": {
+          "description": "True by default. mojoboost attributes every contributed record whether or not the contributor requires it; setting this false only waives the requirement, it does not request anonymity.",
+          "type": "boolean",
+          "default": true
+        },
+        "attribution_text": {
+          "description": "Exactly how you want to be credited in docs/HARDWARE_CONTRIBUTORS.md and in the record of truth. Null means the handle is used.",
+          "$ref": "#/$defs/nullable_string"
+        },
+        "employer_cleared": {
+          "description": "True if the hardware or the time belonged to an employer and you have confirmed you may publish this. Null if the question does not apply. This is asked once, here, so it is not asked in the thread.",
+          "type": ["boolean", "null"],
+          "default": null
+        }
+      }
+    },
+    "hardware": {
+      "description": "The accelerator. Exact board, not family. A result from a consumer part does not transfer to a datacenter part of the same vendor, and a result from one Apple tier does not transfer to another.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["vendor", "api", "device_name"],
+      "properties": {
+        "vendor": { "type": "string", "enum": ["apple", "nvidia", "amd", "other"] },
+        "api": { "type": "string", "enum": ["metal", "cuda", "hip", "none", "other"] },
+        "device_name": {
+          "description": "As the vendor tool reports it, verbatim. \"NVIDIA L4\", \"AMD Radeon RX 7900 XTX\", \"Apple M4 Pro\".",
+          "type": "string",
+          "minLength": 1
+        },
+        "index_row_id": {
+          "description": "The id of the matching row in packaging/matrix/accelerators/index.toml, or null if no row exists yet. A missing row is normal for a device nobody anticipated; the maintainer adds it on acceptance.",
+          "$ref": "#/$defs/nullable_string"
+        },
+        "arch": {
+          "description": "The architecture the runtime reports. gfx1100, gfx942, compute capability 8.9, 4-metal4. This is the number that transfers between boards; the marketing name is not.",
+          "$ref": "#/$defs/nullable_string"
+        },
+        "compute_units": {
+          "description": "SMs, CUs, or GPU cores, whichever the vendor tool reports, with the unit named in units_note.",
+          "$ref": "#/$defs/nullable_number"
+        },
+        "units_note": { "$ref": "#/$defs/nullable_string" },
+        "device_memory_bytes": {
+          "description": "VRAM on a discrete part. Null on unified memory, where host memory is the number and it belongs in host.memory_bytes.",
+          "$ref": "#/$defs/nullable_number"
+        },
+        "device_count": {
+          "description": "How many accelerators were visible. mojoboost uses one. A record from a multi-GPU host says so, because it changes nothing in the code and everything in how a timing is read.",
+          "$ref": "#/$defs/nullable_number"
+        },
+        "machine_kind": {
+          "description": "Where the device lives. A cloud instance under a noisy neighbor and a desk machine are different measurement conditions.",
+          "type": ["string", "null"],
+          "enum": ["laptop", "desktop", "workstation", "server", "cloud-instance", "other", null]
+        },
+        "instance_type": {
+          "description": "Cloud instance type, for example g5.xlarge, or null on bare metal.",
+          "$ref": "#/$defs/nullable_string"
+        },
+        "virtualized": {
+          "description": "True if the GPU was passed through or virtualized rather than owned by the OS directly.",
+          "type": ["boolean", "null"],
+          "default": null
+        }
+      }
+    },
+    "host": {
+      "description": "The machine around the accelerator. mojoboost bins on the CPU and stages every transfer through host memory, so the host is part of every timing.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["os_name", "os_version", "arch"],
+      "properties": {
+        "cpu_model": { "$ref": "#/$defs/nullable_string" },
+        "cpu_cores_physical": { "$ref": "#/$defs/nullable_number" },
+        "cpu_cores_logical": { "$ref": "#/$defs/nullable_number" },
+        "cpu_performance_cores": {
+          "description": "Apple silicon only, from sysctl hw.perflevel0.physicalcpu. Null elsewhere.",
+          "$ref": "#/$defs/nullable_number"
+        },
+        "cpu_efficiency_cores": { "$ref": "#/$defs/nullable_number" },
+        "memory_bytes": { "$ref": "#/$defs/nullable_number" },
+        "os_name": { "type": "string", "minLength": 1 },
+        "os_version": { "type": "string", "minLength": 1 },
+        "os_build": {
+          "description": "macOS build string, or the Linux distribution release id. Two machines on the same marketing version and different builds have produced different answers before.",
+          "$ref": "#/$defs/nullable_string"
+        },
+        "kernel": { "$ref": "#/$defs/nullable_string" },
+        "arch": { "type": "string", "enum": ["arm64", "aarch64", "x86_64", "other"] },
+        "hostname_redacted": {
+          "description": "Always true. The capture scripts do not collect the hostname, and a record that contains one has been edited by hand; remove it.",
+          "type": "boolean",
+          "default": true
+        }
+      }
+    },
+    "driver": {
+      "description": "The vendor runtime. Absent tooling is a valid answer and the reason the tool was absent is the useful part.",
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "reporting_tool": {
+          "description": "nvidia-smi, rocm-smi, system_profiler, or none.",
+          "$ref": "#/$defs/nullable_string"
+        },
+        "driver_version": { "$ref": "#/$defs/nullable_string" },
+        "runtime_version": {
+          "description": "CUDA driver-reported runtime, or the ROCm version from /opt/rocm/.info/version.",
+          "$ref": "#/$defs/nullable_string"
+        },
+        "toolkit_version": {
+          "description": "nvcc or hipcc version. Not required to run mojoboost; required only for the profilers.",
+          "$ref": "#/$defs/nullable_string"
+        },
+        "present": {
+          "description": "False when no vendor tooling could be found at all. That is a complete, publishable result and pairs with verdict unsupported.",
+          "type": ["boolean", "null"],
+          "default": null
+        },
+        "notes": { "$ref": "#/$defs/nullable_string" }
+      }
+    },
+    "toolchain": {
+      "description": "What built the code. A record without these four cannot be reproduced and cannot be compared against another record.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mojo_version", "max_version"],
+      "properties": {
+        "mojo_version": {
+          "description": "Verbatim from `pixi run mojo --version` in the session that produced the results.",
+          "$ref": "#/$defs/nullable_string"
+        },
+        "max_version": {
+          "description": "Verbatim from `pixi list --environment default | grep -Ei '^(mojo|max)'`.",
+          "$ref": "#/$defs/nullable_string"
+        },
+        "pixi_version": { "$ref": "#/$defs/nullable_string" },
+        "python_version": { "$ref": "#/$defs/nullable_string" },
+        "metal_toolchain": {
+          "description": "Apple only. Having an Apple GPU and being able to build GPU code are different facts, and this is the second one. A machine with no Metal compiler is a legitimate record and stops at this block.",
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "xcode_select_path": { "$ref": "#/$defs/nullable_string" },
+            "metal_path": { "$ref": "#/$defs/nullable_string" },
+            "metal_version": { "$ref": "#/$defs/nullable_string" },
+            "xcodebuild_version": { "$ref": "#/$defs/nullable_string" },
+            "present": { "type": ["boolean", "null"], "default": null }
+          }
+        }
+      }
+    },
+    "source": {
+      "description": "Which mojoboost was run. A commit is not optional; a timing without one describes nothing anybody can return to.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["commit"],
+      "properties": {
+        "repo_url": { "$ref": "#/$defs/nullable_string" },
+        "commit": {
+          "description": "Full 40-character hash from `git rev-parse HEAD`. Not the short form, not a branch name, not \"latest main\".",
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "branch": { "$ref": "#/$defs/nullable_string" },
+        "dirty": {
+          "description": "True if `git status --porcelain` printed anything. A dirty tree is fine for exploration and is not quotable; say so rather than cleaning the tree afterwards and claiming the commit.",
+          "type": ["boolean", "null"],
+          "default": null
+        },
+        "local_changes": {
+          "description": "If dirty, what was changed and why. Null if clean.",
+          "$ref": "#/$defs/nullable_string"
+        }
+      }
+    },
+    "capture": {
+      "description": "The environment capture that produced the fields above.",
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "script": {
+          "description": "hardware/capture/capture_apple.sh, capture_nvidia.sh, or capture_amd.sh.",
+          "$ref": "#/$defs/nullable_string"
+        },
+        "script_version": { "$ref": "#/$defs/nullable_string" },
+        "raw_file": {
+          "description": "Name of the attached file holding the capture output verbatim.",
+          "$ref": "#/$defs/nullable_string"
+        },
+        "hand_edited": {
+          "description": "True if anything in the capture output was changed before attaching, including redaction. Say what was changed in redactions.",
+          "type": ["boolean", "null"],
+          "default": null
+        },
+        "redactions": { "$ref": "#/$defs/nullable_string" }
+      }
+    },
+    "runs": {
+      "description": "One entry per command you ran, in the order you ran them, whether it passed, failed, skipped, or never happened. The list is the evidence; the verdict below is only a summary of it. A GPU suite that printed `skipped: no accelerator` on a machine with a GPU is status skipped, never pass, and it means the build did not see the device.",
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/run" }
+    },
+    "device_attributes": {
+      "description": "The device header printed by `pixi run gpu-validate`, verbatim, one string per line of it. `unavailable` is a result and is recorded as the string \"unavailable\", not as null. Which queries a backend refuses is what the fallbacks in gpu_tiling.mojo depend on.",
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "$ref": "#/$defs/nullable_string" },
+        "api": { "$ref": "#/$defs/nullable_string" },
+        "arch_name": { "$ref": "#/$defs/nullable_string" },
+        "compute_capability": { "$ref": "#/$defs/nullable_string" },
+        "multiprocessor_count": { "$ref": "#/$defs/nullable_string" },
+        "warp_size": { "$ref": "#/$defs/nullable_string" },
+        "max_threads_per_block": { "$ref": "#/$defs/nullable_string" },
+        "max_threads_per_multiprocessor": { "$ref": "#/$defs/nullable_string" },
+        "max_blocks_per_multiprocessor": { "$ref": "#/$defs/nullable_string" },
+        "max_shared_memory_per_block": { "$ref": "#/$defs/nullable_string" },
+        "max_registers_per_block": { "$ref": "#/$defs/nullable_string" },
+        "max_grid_dim_x": { "$ref": "#/$defs/nullable_string" },
+        "max_grid_dim_y": { "$ref": "#/$defs/nullable_string" },
+        "clock_rate_khz": { "$ref": "#/$defs/nullable_string" },
+        "refused": {
+          "description": "Every attribute query that raised, by name. An empty array means none raised and is different from null, which means nobody looked.",
+          "type": ["array", "null"],
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "measurements": {
+      "description": "Timings. Empty is correct and common: correctness gates timing, and a record with correctness and nothing else is a real contribution. Every entry that reports a timing also reports the quality of the model that timing produced.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/measurement" }
+    },
+    "determinism": {
+      "description": "Repeat runs bit-identical, and the two accumulation strategies agreeing bit-identically. This is the property most likely to break on a backend whose atomics or scheduling differ from Metal's, and it is the single most valuable line in a first NVIDIA or AMD record.",
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "repeat_runs_identical": { "type": ["boolean", "null"], "default": null },
+        "repeat_count": { "$ref": "#/$defs/nullable_number" },
+        "strategies_agree": {
+          "description": "MOJOBOOST_GPU_HIST_STRATEGY=atomic against tiled, on the same shape. A divergence is a correctness bug, not a tuning result.",
+          "type": ["boolean", "null"],
+          "default": null
+        },
+        "evidence": { "$ref": "#/$defs/nullable_string" },
+        "raw_file": { "$ref": "#/$defs/nullable_string" }
+      }
+    },
+    "profiler": {
+      "description": "Occupancy, shared memory, and atomic traffic read off a real trace. Null is the normal answer; almost nobody will do this, and a record without it is still worth having.",
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "tool": { "$ref": "#/$defs/nullable_string" },
+        "tool_version": { "$ref": "#/$defs/nullable_string" },
+        "achieved_occupancy": { "$ref": "#/$defs/nullable_string" },
+        "occupancy_limiter": { "$ref": "#/$defs/nullable_string" },
+        "static_shared_bytes": { "$ref": "#/$defs/nullable_string" },
+        "shared_atomic_conflicts": { "$ref": "#/$defs/nullable_string" },
+        "global_atomic_traffic": { "$ref": "#/$defs/nullable_string" },
+        "kernel_vs_transfer": { "$ref": "#/$defs/nullable_string" },
+        "metric_names_confirmed": {
+          "description": "True if the counter names were checked against `ncu --query-metrics` or `rocprofv3 --list-avail` on the installed version. They drift between releases, and an unchecked name is a number attached to the wrong thing.",
+          "type": ["boolean", "null"],
+          "default": null
+        },
+        "raw_file": { "$ref": "#/$defs/nullable_string" }
+      }
+    },
+    "findings": {
+      "description": "What did not work. This section is the reason to file a record even when nothing succeeded.",
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "failures": {
+          "description": "Anything that did not build, run, or agree, with the exact error text.",
+          "type": ["array", "null"],
+          "items": { "type": "string" }
+        },
+        "unsupported": {
+          "description": "Capabilities the backend does not implement, and refusals such as a card missing from the installed ROCm support list.",
+          "type": ["array", "null"],
+          "items": { "type": "string" }
+        },
+        "workarounds_used": {
+          "description": "Anything that changed what was actually measured, such as HSA_OVERRIDE_GFX_VERSION. An overridden target is a different device from the one this record names, and a record that hides one is worse than no record.",
+          "type": ["array", "null"],
+          "items": { "type": "string" }
+        },
+        "notes": { "$ref": "#/$defs/nullable_string" }
+      }
+    },
+    "verdict": {
+      "description": "The contributor's own summary, in the same four steps packaging/matrix/accelerators/index.toml uses, so a maintainer can transfer it without reinterpreting it. This is a claim about this session on this machine, and it is never a claim about the vendor, the architecture, or the family.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["correctness", "determinism", "phase_timings", "profiler"],
+      "properties": {
+        "correctness": { "$ref": "#/$defs/step_status" },
+        "determinism": { "$ref": "#/$defs/step_status" },
+        "phase_timings": { "$ref": "#/$defs/step_status" },
+        "profiler": { "$ref": "#/$defs/step_status" },
+        "unsupported_reason": {
+          "description": "Required when any step above is `unsupported`. What refused, and with what message.",
+          "$ref": "#/$defs/nullable_string"
+        },
+        "contributor_summary": {
+          "description": "Two or three sentences in your own words. Read as context, never as a substitute for the output.",
+          "$ref": "#/$defs/nullable_string"
+        }
+      }
+    },
+    "raw_output": {
+      "description": "Where the terminal output lives. A record without raw output is a claim, not evidence, and is not accepted. Attach files to the issue rather than pasting many pages into a form field; list them here by name.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["files"],
+      "properties": {
+        "files": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "contains"],
+            "properties": {
+              "name": { "type": "string", "minLength": 1 },
+              "contains": {
+                "description": "What is in it. \"capture output\", \"pixi run test-gpu\", \"gpu-validate sweep, four shapes\".",
+                "type": "string",
+                "minLength": 1
+              },
+              "truncated": { "type": ["boolean", "null"], "default": null },
+              "sha256": {
+                "description": "Optional. Lets a maintainer confirm the file in the repository is the file that was attached.",
+                "$ref": "#/$defs/nullable_string"
+              }
+            }
+          }
+        },
+        "complete": {
+          "description": "True if the attached output is the whole terminal output of the commands in runs, unedited apart from any redaction named below. False means something was trimmed, and what was trimmed goes in redactions.",
+          "type": ["boolean", "null"],
+          "default": null
+        },
+        "redactions": { "$ref": "#/$defs/nullable_string" }
+      }
+    },
+    "conflicts": {
+      "description": "Record ids that disagree with this one on the same device. Filled by whoever notices, contributor or maintainer. Conflicting records both stay; neither is deleted, and neither is edited to agree with the other.",
+      "type": ["array", "null"],
+      "items": { "type": "string" }
+    },
+    "review": {
+      "description": "Maintainer-only. A contributor leaves this null; a maintainer fills it when the record is accepted, and it is the audit trail for every status change the record caused.",
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "state": {
+          "type": ["string", "null"],
+          "enum": ["submitted", "in-review", "accepted", "accepted-with-notes", "needs-info", "rejected", null]
+        },
+        "reviewer": { "$ref": "#/$defs/nullable_string" },
+        "reviewed_utc": { "$ref": "#/$defs/nullable_timestamp" },
+        "issue_url": { "$ref": "#/$defs/nullable_string" },
+        "record_of_truth_section": {
+          "description": "The heading appended to docs/GPU_VALIDATION.md for this record, if one was.",
+          "$ref": "#/$defs/nullable_string"
+        },
+        "index_rows_changed": {
+          "description": "Row ids in packaging/matrix/accelerators/index.toml this record moved, and to what.",
+          "type": ["array", "null"],
+          "items": { "type": "string" }
+        },
+        "notes": { "$ref": "#/$defs/nullable_string" }
+      }
+    }
+  },
+  "$defs": {
+    "timestamp": {
+      "description": "ISO 8601 UTC, seconds resolution, for example 2026-08-20T14:03:11Z.",
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "nullable_timestamp": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "nullable_string": { "type": ["string", "null"] },
+    "nullable_number": { "type": ["number", "null"] },
+    "run_status": {
+      "description": "pass: it ran and every assertion held. fail: it ran and something did not hold. skipped: it ran and declined to test anything, which on a machine with a GPU means the build did not see the device. unsupported: the build or the runtime refused this device or this path, which is a complete result. not-run: nobody ran it.",
+      "type": "string",
+      "enum": ["pass", "fail", "skipped", "unsupported", "not-run"]
+    },
+    "step_status": {
+      "description": "Per-step summary, using the vocabulary of packaging/matrix/accelerators/index.toml plus the two words a contributor needs. `skipped` never becomes `pass`, and a maintainer transferring this record writes `not-run` in the index for a step this record marks `skipped`.",
+      "type": "string",
+      "enum": ["pass", "fail", "partial", "skipped", "unsupported", "not-run"]
+    },
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["command", "status"],
+      "properties": {
+        "command": {
+          "description": "Exactly what you typed, including every environment variable set on the line.",
+          "type": "string",
+          "minLength": 1
+        },
+        "status": { "$ref": "#/$defs/run_status" },
+        "skipped_reason": {
+          "description": "Required when status is skipped. The line the suite printed, verbatim, for example `skipped: no accelerator`.",
+          "$ref": "#/$defs/nullable_string"
+        },
+        "failure_text": {
+          "description": "Required when status is fail. The failing assertion or error, verbatim. Not a paraphrase.",
+          "$ref": "#/$defs/nullable_string"
+        },
+        "duration_s": { "$ref": "#/$defs/nullable_number" },
+        "raw_file": {
+          "description": "Which attached file holds this command's output.",
+          "$ref": "#/$defs/nullable_string"
+        },
+        "notes": { "$ref": "#/$defs/nullable_string" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "const": "skipped" } }, "required": ["status"] },
+          "then": { "required": ["skipped_reason"], "properties": { "skipped_reason": { "type": "string", "minLength": 1 } } }
+        },
+        {
+          "if": { "properties": { "status": { "const": "fail" } }, "required": ["status"] },
+          "then": { "required": ["failure_text"], "properties": { "failure_text": { "type": "string", "minLength": 1 } } }
+        }
+      ]
+    },
+    "measurement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "status", "shape"],
+      "properties": {
+        "source": {
+          "description": "Which harness produced it. Phase times from a Mojo driver and totals from the Python suite are different runs of different code and are never mixed in one row.",
+          "type": "string",
+          "enum": ["gpu-validate", "apple-suite", "bench-train-gpu", "bench-hist-scaling", "other"]
+        },
+        "command": { "$ref": "#/$defs/nullable_string" },
+        "status": { "$ref": "#/$defs/run_status" },
+        "shape": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["rows", "features"],
+          "properties": {
+            "rows": { "type": "number" },
+            "features": { "type": "number" },
+            "rounds": { "$ref": "#/$defs/nullable_number" },
+            "classes": { "$ref": "#/$defs/nullable_number" },
+            "note": { "$ref": "#/$defs/nullable_string" }
+          }
+        },
+        "env": {
+          "description": "The pinned threading and tuning variables for this measurement. Unset is recorded as null, not as the default value you believe it has.",
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "MOJOBOOST_NUM_WORKERS": { "$ref": "#/$defs/nullable_string" },
+            "MOJOBOOST_PARALLEL_MIN_OPS": { "$ref": "#/$defs/nullable_string" },
+            "MOJOBOOST_GPU_HIST_STRATEGY": { "$ref": "#/$defs/nullable_string" },
+            "MOJOBOOST_GPU_ROW_TILE": { "$ref": "#/$defs/nullable_string" },
+            "MOJOBOOST_GPU_BLOCK_THREADS": { "$ref": "#/$defs/nullable_string" },
+            "MOJOBOOST_DISABLE_GPU": { "$ref": "#/$defs/nullable_string" }
+          }
+        },
+        "repetitions": {
+          "description": "How many times this shape was run. One repetition is a number, not a measurement, and is reported as such.",
+          "$ref": "#/$defs/nullable_number"
+        },
+        "timings_s": {
+          "description": "Seconds, from the harness output, not retyped from memory and not rounded. Field names match the phases bench/bench_gpu_validation.mojo prints, so a record and a driver run can be read side by side. A phase the harness did not print is null.",
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "binning_s": { "$ref": "#/$defs/nullable_number" },
+            "setup_s": { "$ref": "#/$defs/nullable_number" },
+            "stage_s": { "$ref": "#/$defs/nullable_number" },
+            "grad_h2d_s": { "$ref": "#/$defs/nullable_number" },
+            "hist_kernel_root_s": { "$ref": "#/$defs/nullable_number" },
+            "hist_d2h_s": { "$ref": "#/$defs/nullable_number" },
+            "hist_decode_s": { "$ref": "#/$defs/nullable_number" },
+            "partition_kernel_s": { "$ref": "#/$defs/nullable_number" },
+            "hist_kernel_child_s": { "$ref": "#/$defs/nullable_number" },
+            "gpu_train_s": { "$ref": "#/$defs/nullable_number" },
+            "cpu_train_s": { "$ref": "#/$defs/nullable_number" },
+            "predict_s": { "$ref": "#/$defs/nullable_number" }
+          }
+        },
+        "quality": {
+          "description": "The model the timing produced. A throughput number without a loss number next to it is not a result; that rule comes from docs/GPU_VALIDATION.md and holds here unchanged. The schema enforces it for any measurement whose status is pass.",
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "metric": {
+              "description": "What was measured, named exactly. train_mse is what gpu-validate prints; valid_rmse, valid_logloss, and valid_multi_logloss are what the Apple suite computes.",
+              "$ref": "#/$defs/nullable_string"
+            },
+            "gpu_value": { "$ref": "#/$defs/nullable_number" },
+            "cpu_value": { "$ref": "#/$defs/nullable_number" },
+            "max_abs_diff_vs_cpu": {
+              "description": "Where the harness reports it. CPU and GPU are expected to differ, because the device accumulates in Float32; what matters is that the difference is inside the documented tolerance.",
+              "$ref": "#/$defs/nullable_number"
+            },
+            "note": { "$ref": "#/$defs/nullable_string" }
+          }
+        },
+        "peak_rss_bytes": { "$ref": "#/$defs/nullable_number" },
+        "conditions": {
+          "description": "Anything about the machine that would move the number. On a laptop this is not optional: thermal state, power source, and what else was running are the difference between a measurement and an anecdote.",
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "machine_idle": { "type": ["boolean", "null"], "default": null },
+            "on_ac_power": { "type": ["boolean", "null"], "default": null },
+            "throttle_detected": { "type": ["boolean", "null"], "default": null },
+            "load_average_1m": { "$ref": "#/$defs/nullable_number" },
+            "note": { "$ref": "#/$defs/nullable_string" }
+          }
+        },
+        "quotable": {
+          "description": "False if anything above disqualifies the number from being quoted outside the record: a busy machine, a throttled run, one repetition, a dirty tree, a smoke scale. Default to false when unsure. A record full of unquotable numbers is still useful evidence.",
+          "type": ["boolean", "null"],
+          "default": null
+        },
+        "raw_file": { "$ref": "#/$defs/nullable_string" },
+        "notes": { "$ref": "#/$defs/nullable_string" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "const": "pass" } }, "required": ["status"] },
+          "then": {
+            "required": ["quality", "raw_file"],
+            "properties": {
+              "quality": {
+                "type": "object",
+                "required": ["metric", "gpu_value"],
+                "properties": {
+                  "metric": { "type": "string", "minLength": 1 },
+                  "gpu_value": { "type": "number" }
+                }
+              },
+              "raw_file": { "type": "string", "minLength": 1 }
+            }
+          }
+        }
+      ]
+    }
+  }
+}
