@@ -529,9 +529,10 @@ quietly fixed, because each is somebody's in-flight work:
    `MojoBoostRegressor._OBJECTIVE_PARAM` or silently inherit `alpha`.
 5. **TreeSHAP and the Mojo `Dataset` are one export away from being
    reachable.** `src/mojoboost/contrib.mojo` is exported but has no Python
-   argument; `src/mojoboost/dataset.mojo` is not exported at all. Both rows
-   above say `partial` for that reason: the algorithm existing is not the
-   same as a user being able to call it.
+   argument; the Mojo-side `Dataset` lives in `src/mojoboost/trainset.mojo`
+   and reaches Python only through the Booster ABI. Both rows above say
+   `partial` for that reason: the algorithm existing is not the same as a
+   user being able to call it.
 
 ## Enforcement
 
