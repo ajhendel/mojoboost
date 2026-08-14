@@ -25,6 +25,7 @@ def find_best_split(
     hist: Histogram,
     lambda_reg: Float64 = 1.0,
     min_child_hess: Float64 = 1e-3,
+    min_data_in_leaf: Int = 0,
 ) -> SplitInfo:
     """Scan all (feature, bin) split candidates and return the one with the
     highest gain. Only splits with positive gain are returned as found."""
@@ -34,19 +35,25 @@ def find_best_split(
         var base = f * hist.n_bins
         var total_g = 0.0
         var total_h = 0.0
+        var total_c = 0
         for b in range(hist.n_bins):
             total_g += hist.grad[base + b]
             total_h += hist.hess[base + b]
+            total_c += hist.count[base + b]
         var parent_score = total_g * total_g / (total_h + lambda_reg)
 
         var left_g = 0.0
         var left_h = 0.0
+        var left_c = 0
         for b in range(hist.n_bins - 1):
             left_g += hist.grad[base + b]
             left_h += hist.hess[base + b]
+            left_c += hist.count[base + b]
             var right_g = total_g - left_g
             var right_h = total_h - left_h
             if left_h < min_child_hess or right_h < min_child_hess:
+                continue
+            if left_c < min_data_in_leaf or total_c - left_c < min_data_in_leaf:
                 continue
             var gain = (
                 left_g * left_g / (left_h + lambda_reg)
