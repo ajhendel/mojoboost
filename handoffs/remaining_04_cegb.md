@@ -6,17 +6,21 @@ Owned by this lane, and the only files it touched:
 - `docs/CEGB.md` (new)
 - `handoffs/remaining_04_cegb.md` (this file)
 
-Nothing was built, run, tested, benchmarked, or committed. Every claim below
-was derived by reading source. Every command in section 9 is **UNRUN**.
+Nothing was built, run, tested, benchmarked, or committed by this lane. Every
+claim below was derived by reading source. Every command in section 9 is
+**UNRUN**. (A concurrent lane's commit `e6f3959` swept these files into the
+history while this lane was still writing them; the content is this lane's,
+unmodified.)
 
 Ownership note. `MOJOBOOST_CONNECT_EVERYTHING_PARALLEL_PROMPTS.txt` task 17
 also names `src/mojoboost/cegb.mojo`, and task 09 owns
 `tree_parameters_extra.mojo`, `split.mojo`, `tree.mojo`, `boosting.mojo`, and
-`params.mojo`. At the time this lane ran, `cegb.mojo` did not exist and
-`handoffs/connect_17_alternate_boosting.md` had not been written, so this lane
-created it. **If task 17 becomes active, it owns this file from then on**, and
-the patches in section 4 belong to task 09's owner, not to a second editor of
-those files.
+`params.mojo`. Task 17 ran first and **declined to create `cegb.mojo`**
+(`handoffs/connect_17_alternate_boosting.md` section 7), so this lane created
+it under its own explicit ownership. That is a stance disagreement, not a file
+collision, and section 10 resolves it. **If task 17 becomes active again, it
+owns this file from then on**, and the patches in section 4 belong to task
+09's owner, not to a second editor of those files.
 
 ---
 
@@ -216,7 +220,7 @@ through the same multiplication in the same order.
 `find_best_split`'s new argument is defaulted and trailing.
 
 **Minimal later validation (UNRUN)**:
-`pixi run mojo run tests/parallel/test_tree_parameters_extra.mojo`
+`mojo run -I src tests/parallel/test_tree_parameters_extra.mojo`
 -- the CEGB cases at lines 199 and 219 go through `penalized_gain`, which
 PATCH 2 changes, so this file is the one that proves 1+2 together.
 
@@ -289,7 +293,7 @@ Mojo-API callers constructing `FeaturePenalties` by field name change three
 names, which is why 2c is spelled out.
 
 **Minimal later validation (UNRUN)**:
-`pixi run mojo run tests/parallel/test_tree_parameters_extra.mojo`
+`mojo run -I src tests/parallel/test_tree_parameters_extra.mojo`
 
 ---
 
@@ -400,7 +404,9 @@ bit-identical.
 direct caller outside `boosting.mojo`.
 
 **Minimal later validation (UNRUN)**:
-`pixi run mojo run tests/parallel/test_tree.mojo`
+`mojo run -I src tests/test_regularization.mojo`
+(the smallest existing file that grows trees through `_search` with gain
+rules active; `tests/test_tree.mojo` does not exist)
 
 ---
 
@@ -445,7 +451,9 @@ work at all.
 **Serialization effect**: none. **Public API effect**: none through `params`.
 
 **Minimal later validation (UNRUN)**:
-`pixi run mojo run tests/parallel/test_boosting.mojo`
+`mojo run -I src tests/test_continued.mojo`
+(covers `fit_more`, which is the path this patch adds a refusal to;
+`tests/test_boosting.mojo` does not exist)
 
 ---
 
@@ -469,7 +477,7 @@ nowhere, which is that file's existing invariant.
 
 **Public API effect**: none. **Serialization effect**: none.
 **Minimal later validation (UNRUN)**:
-`pixi run mojo run tests/parallel/test_distributed.mojo`
+`mojo run -I src tests/test_distributed.mojo`
 
 ---
 
@@ -490,7 +498,8 @@ PATCH 3's `grower_applies_cegb=False` refusal for the coupled and lazy
 penalties, and keeps the split cost.
 
 **Public API effect**: none. **Minimal later validation (UNRUN)**:
-`pixi run mojo run tests/parallel/test_train_gpu.mojo`
+`mojo run -I src tests/test_gpu_strategies.mojo`
+(`tests/test_train_gpu.mojo` does not exist)
 
 ---
 
@@ -529,7 +538,7 @@ should be relaxed to accept a restored ledger rather than deleted.
 
 **Public API effect**: a new format version, and `model_file_kind` /
 `_read_version` gain a case. **Minimal later validation (UNRUN)**:
-`pixi run mojo run tests/parallel/test_serialize.mojo`
+`mojo run -I src tests/test_serialize.mojo`
 
 ---
 
@@ -659,7 +668,8 @@ when the row does move.
 5. **Bagging changes the effective penalty.** Documented (`docs/CEGB.md`
    section 7), not corrected. A user comparing runs at two bagging fractions
    will see the regularization strength move.
-6. **Ownership collision.** Task 17 also claims `cegb.mojo`. Section 0.
+6. **Ownership collision.** Task 17 also claims `cegb.mojo`. See the
+   ownership note under the file list at the top.
 
 ## 9. Smallest later validation, all UNRUN
 
@@ -667,20 +677,33 @@ Nothing below was run by this lane. Run them one at a time, not as a suite.
 
 ```
 # after PATCH 1 + 2, the only existing test that touches CEGB arithmetic
-pixi run mojo run tests/parallel/test_tree_parameters_extra.mojo
+mojo run -I src tests/parallel/test_tree_parameters_extra.mojo
 
 # after PATCH 3
-pixi run mojo run tests/parallel/test_tree.mojo
+mojo run -I src tests/test_regularization.mojo
 
 # after PATCH 4
-pixi run mojo run tests/parallel/test_boosting.mojo
+mojo run -I src tests/test_continued.mojo
 
-# after PATCH 9, that the two vectors are still refused by the string parser
-pixi run mojo run tests/parallel/test_params.mojo
+# after PATCH 5
+mojo run -I src tests/test_distributed.mojo
+
+# after PATCH 7
+mojo run -I src tests/test_sparse.mojo
+
+# after PATCH 8
+mojo run -I src tests/test_serialize.mojo
+
+# after PATCH 9, the only file that exercises parse_params
+mojo run -I src -I capi tests/test_capi.mojo
 
 # after PATCH 10, that the parity checker agrees the row moved on evidence
 pixi run check-parity
 ```
+
+There is no `tests/test_tree.mojo`, `test_boosting.mojo`, or
+`test_params.mojo`; the files above are the closest existing coverage. One
+file at a time, never the whole suite.
 
 A focused test for `cegb.mojo` itself does not exist and this lane did not
 write one. The cases worth covering first, in order: the split cost against
@@ -688,3 +711,56 @@ write one. The cases worth covering first, in order: the split cost against
 once across two trees and not once per tree; the refund restoring a cached
 gain exactly; `count_unread` under a bag that omits rows; and each of the four
 refusals raising.
+
+## 10. Relationship to `handoffs/connect_17_alternate_boosting.md`
+
+That lane ran first and reached a different conclusion about the same
+subsystem. Both conclusions are recorded here so whoever applies the patches
+picks one deliberately rather than applying both.
+
+**What connect-17 decided.** Section 7 of that handoff: no `cegb.mojo`,
+because `FeaturePenalties` is already connected to the production split
+search and a second module would be the duplicate policy engine that task
+forbids. Its patch P5 threads a `List[Bool] feature_used` ledger through
+`split.find_best_split`, `tree.grow_tree`, and `boosting._boost_rounds`, and
+leaves `cegb_penalty_feature_lazy` refused.
+
+**Why this lane created the file anyway.** Its own prompt (remaining task 04)
+names `src/mojoboost/cegb.mojo` as exclusive ownership and asks for the whole
+of CEGB, including the lazy per-row penalty, the coupled ledger, active-row
+accounting, the EFB/categorical feature recovery, and the unsupported
+GPU/distributed combinations. None of those fit inside `FeaturePenalties`,
+which is a per-feature gain-multiplier struct that happens to carry three CEGB
+scalars. The result is not a second policy engine: PATCH 2 **deletes** the
+CEGB fields from `FeaturePenalties`, so after the patches there is exactly one
+home, and it is this one.
+
+**P5 versus PATCH 1 to 4.** They edit the same three files and must not both
+be applied. PATCH 1 to 4 is a strict superset:
+
+| | connect-17 P5 | this lane, PATCH 1 to 4 |
+| --- | --- | --- |
+| coupled ledger | `List[Bool]` threaded by hand | `CegbLedger`, with the same flags |
+| lazy penalty | stays refused | implemented, refused only where a backend cannot carry it |
+| cached-candidate refund | **not addressed** | `cegb_stale_cached_gain`, applied to the frontier |
+| feature index under EFB | not addressed | `cegb_dataset_feature` |
+| GPU / distributed | not addressed | four explicit refusals |
+| `feature_contri` separation | untouched, so the two stay fused in `penalized_gain` | PATCH 2 splits them |
+
+**The refund is the substantive gap, not a nicety.** Leaf-wise growth caches
+each leaf's best split. Without the refund, a candidate charged a feature's
+first-use cost keeps that charge after some other leaf has already paid it,
+so the tree that comes out is not the one the formula describes. P5 as written
+would produce that tree. See `docs/CEGB.md` section 5.1, including the open
+question about which cached splits LightGBM itself refunds.
+
+**Where the two agree, exactly.** P5 step 5 (drop the
+`check_extra_option_supported("cegb_penalty_feature_coupled")` call from
+`ExtraTreeParams.check_scalars`) is PATCH 2d and PATCH 9, same edit, same
+precondition. P5 step 4 (the ensemble owns the ledger, not the split search)
+is PATCH 4, same reasoning.
+
+**Recommendation.** Apply PATCH 1 to 4 and drop P5. If a reviewer prefers
+connect-17's smaller change, apply P5 and delete `src/mojoboost/cegb.mojo`
+and `docs/CEGB.md` outright rather than leaving both: two CEGB homes is the
+one outcome neither lane wants.

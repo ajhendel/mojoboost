@@ -1745,6 +1745,7 @@ struct LgbmImportReport(Copyable, Movable, Writable):
     var n_edges: Int
     var n_missing_reservations: Int
     var has_node_counts: Bool
+    var feature_names: List[String]
 
     def __init__(
         out self,
@@ -1759,6 +1760,7 @@ struct LgbmImportReport(Copyable, Movable, Writable):
         n_edges: Int,
         n_missing_reservations: Int,
         has_node_counts: Bool,
+        var feature_names: List[String],
     ):
         self.n_features = n_features
         self.n_trees = n_trees
@@ -1771,6 +1773,7 @@ struct LgbmImportReport(Copyable, Movable, Writable):
         self.n_edges = n_edges
         self.n_missing_reservations = n_missing_reservations
         self.has_node_counts = has_node_counts
+        self.feature_names = feature_names^
 
     def mapper_is_training_binning(self) -> Bool:
         """Always False, and a method rather than a comment so a caller can
@@ -1808,6 +1811,8 @@ struct LgbmImportReport(Copyable, Movable, Writable):
             self.n_missing_reservations,
             ", node_counts=",
             self.has_node_counts,
+            ", feature_names=",
+            len(self.feature_names),
             ", training_binning=False)",
         )
 
@@ -1871,6 +1876,16 @@ def _import_report(
     for f in range(mapping.mapper.n_features):
         if mapping.mapper.missing_bin[f] >= 0:
             reservations += 1
+    # LightGBM's `feature_names` line is space-separated, so a name with a
+    # space in it would arrive as two names and silently shift every column
+    # after it. A count that does not match is therefore dropped whole
+    # rather than trusted in part, which is also what `save_model` demands:
+    # one name per feature or none at all.
+    var names = List[String]()
+    for token in header.get("feature_names", "").split():
+        names.append(String(token))
+    if len(names) != mapping.mapper.n_features:
+        names = List[String]()
     return LgbmImportReport(
         mapping.mapper.n_features,
         n_trees,
@@ -1883,6 +1898,7 @@ def _import_report(
         len(mapping.mapper.edges),
         reservations,
         has_node_counts,
+        names^,
     )
 
 
@@ -2463,6 +2479,23 @@ def _assemble(
     return out^
 
 
+def _check_export_names(names: List[String], n_features: Int) raises:
+    """Feature names are all of them or none of them.
+
+    The same rule `serialize._check_feature_names` enforces, and stated the
+    same way: a list of the wrong length is refused rather than padded,
+    because a name attached to the wrong column is worse than no name.
+    """
+    if len(names) != 0 and len(names) != n_features:
+        raise Error(
+            "feature_names has ",
+            len(names),
+            " entries for a model with ",
+            n_features,
+            " features; pass one per feature or none at all",
+        )
+
+
 def _n_categorical(mapper: BinMapper) -> Int:
     var n = 0
     for f in range(mapper.n_features):
@@ -2688,20 +2721,25 @@ def export_lgbm_multiclass_model(
         _n_categorical(model.mapper),
         model.booster.learning_rate != 1.0,
         base_folded,
+        len(feature_names),
     )
     return LgbmExport(text^, report^)
 
 
-def save_lgbm_model(model: Model, path: String) raises:
+def save_lgbm_model(
+    model: Model, path: String, feature_names: List[String] = []
+) raises:
     """Write a single-output `Model` to `path` in LightGBM's text format."""
-    var text = dump_lgbm_model(model)
+    var text = dump_lgbm_model(model, feature_names)
     with open(path, "w") as f:
         f.write(text)
 
 
-def save_lgbm_multiclass_model(model: MulticlassModel, path: String) raises:
+def save_lgbm_multiclass_model(
+    model: MulticlassModel, path: String, feature_names: List[String] = []
+) raises:
     """Write a `MulticlassModel` to `path` in LightGBM's text format."""
-    var text = dump_lgbm_multiclass_model(model)
+    var text = dump_lgbm_multiclass_model(model, feature_names)
     with open(path, "w") as f:
         f.write(text)
 
@@ -2783,14 +2821,20 @@ def import_lgbm_file(
 
     Which of the two loaders the file needs is decided from the file, the
     same way `serialize.model_file_kind` decides it for a native one.
+
+    The LightGBM header's `feature_names` cross into the native file's own
+    feature-name header when there is one name per feature; anything else is
+    dropped whole, since a name on the wrong column is worse than no name.
     """
     var text = open(lgbm_path, "r").read()
     if lgbm_text_kind(text) == "multiclass":
         var multi = import_lgbm_multiclass_model(text)
-        save_multiclass_model(multi.model, model_path)
+        save_multiclass_model(
+            multi.model, model_path, multi.report.feature_names
+        )
         return multi.report^
     var single = import_lgbm_model(text)
-    save_model(single.model, model_path)
+    save_model(single.model, model_path, single.report.feature_names)
     return single.report^
 
 
@@ -2809,14 +2853,17 @@ def export_lgbm_file(
     whether the LightGBM file's predictions are bit-identical to the native
     model's or equal only to within a few units in the last place.
     """
+    # The names live in the file's header, not on the loaded `Model`, so
+    # they are read from the same path rather than reconstructed.
+    var names = load_feature_names(model_path)
     if model_file_kind(model_path) == "multiclass":
         var multi = load_multiclass_model(model_path)
-        var multi_out = export_lgbm_multiclass_model(multi)
+        var multi_out = export_lgbm_multiclass_model(multi, names)
         with open(lgbm_path, "w") as f:
             f.write(multi_out.text)
         return multi_out.report^
     var single = load_model(model_path)
-    var single_out = export_lgbm_model(single)
+    var single_out = export_lgbm_model(single, names)
     with open(lgbm_path, "w") as f:
         f.write(single_out.text)
     return single_out.report^

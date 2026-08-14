@@ -1655,10 +1655,12 @@ def train_distributed_run[
         # decisions about a reduced scalar or an unconditional barrier, so
         # every rank takes the same one at the same round.
         var stop_now = False
+        var scored = False
         var due = options.scores_every_round()
         if not due and options.metric_every > 0:
             due = len(trees) % options.metric_every == 0
         if scores_metric and due:
+            scored = True
             var value = distributed_metric(comm, shards, raw, objective, alpha)
             report.metric_rounds.append(len(trees))
             report.metric_values.append(value)
@@ -1699,9 +1701,14 @@ def train_distributed_run[
                 )
             )
 
+        # Only this round's score, never the last one that happened to exist: a
+        # callback reading `env.value(0, 0)` on a round that scored nothing
+        # would otherwise act on a metric from several rounds ago. An empty
+        # `evaluation` makes `value` raise, which is the same contract the
+        # before-iteration phase already has.
         env.iteration = i
         env.evaluation.clear()
-        if len(report.metric_values) > 0:
+        if scored:
             env.evaluation.append(
                 report.metric_values[len(report.metric_values) - 1]
             )

@@ -642,7 +642,7 @@ def require_histogram_launchable(
     grid_x: Int,
     n_bins: Int,
     compiled: KernelFeatures,
-    selected: KernelFeatures,
+    selected: KernelFeatures = KernelFeatures.none(),
 ) raises:
     """The whole gate for one resolved histogram launch.
 
@@ -660,6 +660,12 @@ def require_histogram_launchable(
     which is what the validation gate applies to. Passing `compiled` for
     both would refuse the shipping path, because linking `histogram_gpu`
     instantiates the batched kernels whether or not anything selects them.
+
+    `selected` defaults to `KernelFeatures.none()`, which is the
+    conservative answer for a caller that does not yet track what its plan
+    chose: the geometry and primitive gates still apply and the
+    specialization gate is inert. A caller that knows should say so, since
+    an unstated selection cannot be checked.
 
     Raises on the first failure, naming it. Returns nothing on success: it
     is a gate, not a plan, and the plan it gates is `tiling`.

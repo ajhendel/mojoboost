@@ -130,6 +130,7 @@ from .apple_histogram_policy import (
 from .binning import BinnedMatrix
 from .categorical import CatBitset, CategoricalSpec, cat_empty
 from .gpu_active_rows import GpuActiveRows, LeafRange, RowRouting
+from .gpu_binned_layout import check_layout_support
 from .gpu_frontier import LeafWorkItem
 from .gpu_histogram_specializations import (
     DeviceHistogramCapabilities,
@@ -142,6 +143,13 @@ from .gpu_leaf_batching import (
     slots_for_budget,
     subtraction_stamp,
     uniform_scales,
+)
+from .gpu_portability import (
+    BackendContract,
+    contract_from_profile,
+    require_bins_supported,
+    require_device_can_host_kernels,
+    require_histogram_launchable,
 )
 from .gpu_objectives_native import (
     DEFAULT_MAX_NODES,
@@ -284,6 +292,11 @@ struct GpuHistogramBuilder(Movable):
     var cats: CategoricalSpec
     var active: List[Int]
     var caps: DeviceCaps
+    # What this backend is required to provide, derived once from `caps` when
+    # the builder opens. Every launch below is checked against it by
+    # `_require_launchable`; see gpu_portability.mojo, which is the one place
+    # that knows what a backend must have for these kernels to run.
+    var contract: BackendContract
     var tiling: HistogramTiling
     var g_scale: Float64
     var h_scale: Float64
@@ -387,12 +400,32 @@ struct GpuHistogramBuilder(Movable):
             raise Error("GPU backend requires at least one row")
         if data.n_features < 1:
             raise Error("GPU backend requires at least one feature")
-        if data.n_bins < 1:
-            raise Error("GPU backend requires at least one bin")
-        if data.n_bins > MAX_BINS:
-            raise Error("GPU backend supports at most 256 bins")
         if data.n_rows > MAX_ROWS:
             raise Error("GPU backend supports at most 2^31 - 1 rows")
+
+        # The bin count is the portability module's limit to state, not this
+        # one's: the kernels index a `MAX_BINS`-wide threadgroup plane by a
+        # UInt8 bin, and `require_bins_supported` is where that structural
+        # fact is written down. This replaces the two hand-rolled bin checks
+        # that used to sit here and said the same thing in a second place.
+        require_bins_supported(data.n_bins)
+
+        # What this backend must provide, asked once when the builder opens.
+        # This is the question the builder never asked at all, and the one
+        # worth asking early: a device that cannot host these kernels fails
+        # here rather than after the binned matrix has been uploaded to it.
+        self.contract = contract_from_profile(profile_from_caps(caps))
+        require_device_can_host_kernels(self.contract, caps)
+        # Whether this shape can be laid out on a device at all is
+        # `gpu_binned_layout`'s question, and it asks two the checks above do
+        # not: a feature count past the Int32 index range, and an
+        # `n_rows * n_features` cell count that overflows it even though each
+        # factor fits. Those are the shapes whose flat bin index would wrap.
+        # The specific tests run first so a bad row or bin count is still
+        # reported as the number it is rather than as an unsupported layout,
+        # which is the order `_check_device_search_supported` uses in
+        # train_gpu.mojo for the same reason.
+        check_layout_support(data.n_rows, data.n_features, data.n_bins)
         if len(data.bins) != data.n_rows * data.n_features:
             raise Error("binned matrix size must equal n_rows * n_features")
 

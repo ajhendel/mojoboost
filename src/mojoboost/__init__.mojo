@@ -91,6 +91,11 @@ from .contrib import (
     predict_contrib_multiclass,
     tree_expected_value,
 )
+# The raw feature matrix a `Dataset` is built from, dense or sparse. It is
+# on the public surface because it is what `Dataset.from_raw` takes and what
+# `Dataset.subset` selects rows out of, so a caller that wants a sparse or a
+# re-binnable dataset needs the name.
+from .raw_data import RawData
 from .trainset import (
     Dataset,
     train_dataset,
@@ -366,9 +371,13 @@ from .params import (
     parse_params,
 )
 from .serialize import (
+    file_kind,
+    load_dataset,
+    load_feature_names,
     load_model,
     load_multiclass_model,
     model_file_kind,
+    save_dataset,
     save_model,
     save_multiclass_model,
 )

@@ -671,10 +671,12 @@ def cegb_adjusted_gain(
 
     `gain` must already carry `feature_contri` (see
     `tree_parameters_extra.FeaturePenalties.contri_of`) and must not already
-    carry any CEGB term: this function is the single place the subtraction
-    happens. The result may be negative, which is not an error -- the caller's
-    `min_gain_to_split` floor rejects it, exactly as it rejects a candidate
-    whose raw gain was too small.
+    carry any CEGB term. This and `CegbNodeCosts.adjusted_gain` are the only
+    two entry points that subtract, and they compute the same sum: this one
+    for a caller holding a ledger, that one for a scan holding prepared
+    per-node costs. The result may be negative, which is not an error -- the
+    caller's `min_gain_to_split` floor rejects it, exactly as it rejects a
+    candidate whose raw gain was too small.
 
     Charged once per feature, after that feature's scan and before its best
     candidate is compared against the running best. That placement is

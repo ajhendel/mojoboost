@@ -449,11 +449,21 @@ def _code_for_objective_name(name):
     """The native objective code for a public objective name, or None.
 
     Asks the extension, because the name-to-code mapping is
-    `objective_from_name` in src/mojoboost/params.mojo and belongs there.
-    Returns None for every failure, including a build with no
-    `objective_code` binding and a name that function refuses: an
+    `objective_code_from_name` in src/mojoboost/objective_registry.mojo
+    and belongs there. Returns None for every failure, including a build
+    with no name resolver bound and a name the registry refuses: an
     unresolved name is reported as an undeclared objective, which skips
     the gate, and is never guessed at here.
+
+    `objective_code_of_name` is asked for by that name, and not as
+    `objective_code`, because those are two different questions that two
+    earlier plans gave one name. `_mojoboost.objective_code` takes a
+    *model handle* and answers what a fitted model was trained for
+    (`python/mojoboost/inspection.py` calls it that way); the resolver
+    here takes a name and answers what a caller asked for. Binding both
+    under one name would silently disable whichever caller lost. The
+    older name is still tried second, so a build that predates the split
+    keeps whatever it had.
 
     Do not replace this with a dict. A name table in Python is exactly the
     second implementation this module exists to not have.
@@ -462,7 +472,9 @@ def _code_for_objective_name(name):
         ext = _extension()
     except NativePolicyUnavailable:
         return None
-    resolve = getattr(ext, "objective_code", None)
+    resolve = getattr(ext, "objective_code_of_name", None)
+    if resolve is None:
+        resolve = getattr(ext, "objective_code", None)
     if resolve is None:
         return None
     try:

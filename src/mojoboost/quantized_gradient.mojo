@@ -1549,10 +1549,10 @@ def build_quantized_histogram_into(
             var col = bins_all_p.unsafe_offset(f * n_rows)
             for i_row in range(n_sub):
                 var r = rows_p.unsafe_load(i_row)
-                var bin = base + Int(col.unsafe_load(r))
-                gp.unsafe_store(bin, gp.unsafe_load(bin) + qg.unsafe_load(r))
-                hp.unsafe_store(bin, hp.unsafe_load(bin) + qh.unsafe_load(r))
-                cp.unsafe_store(bin, cp.unsafe_load(bin) + 1)
+                var cell = base + Int(col.unsafe_load(r))
+                gp.unsafe_store(cell, gp.unsafe_load(cell) + qg.unsafe_load(r))
+                hp.unsafe_store(cell, hp.unsafe_load(cell) + qh.unsafe_load(r))
+                cp.unsafe_store(cell, cp.unsafe_load(cell) + 1)
 
     # One op per (feature, row) accumulate plus the zeroing of every active
     # feature's slice, which is the same accounting

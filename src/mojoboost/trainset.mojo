@@ -68,10 +68,14 @@ and the categorical declaration, so changing either afterwards would leave
 the binned matrix describing data the dataset no longer holds. Fields are
 supplied at construction; change one by constructing another dataset.
 
-Prepared tables are not serialized here. Writing a binned matrix and its
-mapper to a file the way `serialize.mojo` writes a model needs that module's
-mapper reader and writer, which are private to it; see
-handoffs/connect_12_dataset_cv.md for the exact request.
+A prepared table serializes, and separately from a model.
+`serialize.save_dataset` / `serialize.load_dataset` write and read the
+binning and the columns as their own file kind, with their own magic and
+their own version, so no loader can mistake one for the other. It lives
+there rather than here because the mapper reader and writer do, and one
+mapper codec is the point. `Dataset.from_binned_dense` and
+`from_binned_sparse` are the entry points it reads back through; a table
+read from a file carries no raw matrix, so it cannot be `subset`.
 """
 
 from .bagging import BaggingParams
@@ -498,6 +502,143 @@ struct Dataset(Copyable, Movable, Writable):
             max_bin,
             use_missing,
             keep_raw,
+        )
+
+    @staticmethod
+    def from_binned_dense(
+        var mapper: BinMapper,
+        var data: BinnedMatrix,
+        var label: List[Float64] = [],
+        var weight: List[Float64] = [],
+        var group: List[Int] = [],
+        var init_score: List[Float64] = [],
+        var feature_names: List[String] = [],
+        var categorical_features: List[Int] = [],
+        max_bin: Int = 255,
+        use_missing: Bool = True,
+        borrowed_binning: Bool = False,
+    ) raises -> Dataset:
+        """A dataset over a matrix that has *already* been binned.
+
+        For a caller holding a mapper and the matrix it produced rather than
+        raw values: `serialize.load_dataset` reads a prepared table this way,
+        and a shard that was binned elsewhere arrives this way. The mapper
+        and the matrix are checked against each other, so a file or a
+        transport that lost a byte is refused here rather than producing bin
+        indices that mean nothing.
+
+        The result retains no raw matrix, so it cannot be `subset`. Bins
+        cannot be refitted from bins; that is the whole reason `subset` needs
+        `keep_raw`.
+        """
+        if data.n_features != mapper.n_features:
+            raise Error(
+                "a binned matrix and its mapper must agree on the feature"
+                " count"
+            )
+        if data.n_bins != mapper.n_bins:
+            raise Error("a binned matrix and its mapper must agree on n_bins")
+        if len(data.bins) != data.n_rows * data.n_features:
+            raise Error("binned matrix length must equal n_rows * n_features")
+        var n_rows = data.n_rows
+        var n_features = data.n_features
+        _check_columns(
+            n_rows,
+            n_features,
+            label,
+            weight,
+            group,
+            init_score,
+            feature_names,
+            categorical_features,
+        )
+        return Dataset(
+            mapper^,
+            data^,
+            _empty_sparse_binned(n_features),
+            False,
+            RawData.none(),
+            borrowed_binning,
+            n_rows,
+            n_features,
+            label^,
+            weight^,
+            group^,
+            init_score^,
+            feature_names^,
+            categorical_features^,
+            max_bin,
+            use_missing,
+        )
+
+    @staticmethod
+    def from_binned_sparse(
+        var mapper: BinMapper,
+        var sparse_data: SparseBinnedMatrix,
+        var label: List[Float64] = [],
+        var weight: List[Float64] = [],
+        var group: List[Int] = [],
+        var init_score: List[Float64] = [],
+        var feature_names: List[String] = [],
+        var categorical_features: List[Int] = [],
+        max_bin: Int = 255,
+        use_missing: Bool = True,
+        borrowed_binning: Bool = False,
+    ) raises -> Dataset:
+        """The sparse counterpart of `from_binned_dense`, with the same
+        checks: the mapper and the matrix must agree, and the offsets must
+        describe the features they claim to."""
+        if sparse_data.n_features != mapper.n_features:
+            raise Error(
+                "a binned matrix and its mapper must agree on the feature"
+                " count"
+            )
+        if sparse_data.n_bins != mapper.n_bins:
+            raise Error("a binned matrix and its mapper must agree on n_bins")
+        if len(sparse_data.col_offsets) != sparse_data.n_features + 1:
+            raise Error(
+                "a binned sparse matrix needs one column offset per feature,"
+                " plus a final total"
+            )
+        if len(sparse_data.default_bin) != sparse_data.n_features:
+            raise Error(
+                "a binned sparse matrix needs one default bin per feature"
+            )
+        if len(sparse_data.row_index) != len(sparse_data.bin):
+            raise Error("row indices and bins must be one per stored entry")
+        if sparse_data.col_offsets[sparse_data.n_features] != len(
+            sparse_data.bin
+        ):
+            raise Error("column offsets must end at the stored-entry count")
+        var n_rows = sparse_data.n_rows
+        var n_features = sparse_data.n_features
+        _check_columns(
+            n_rows,
+            n_features,
+            label,
+            weight,
+            group,
+            init_score,
+            feature_names,
+            categorical_features,
+        )
+        return Dataset(
+            mapper^,
+            _empty_binned(n_features),
+            sparse_data^,
+            True,
+            RawData.none(),
+            borrowed_binning,
+            n_rows,
+            n_features,
+            label^,
+            weight^,
+            group^,
+            init_score^,
+            feature_names^,
+            categorical_features^,
+            max_bin,
+            use_missing,
         )
 
     @staticmethod

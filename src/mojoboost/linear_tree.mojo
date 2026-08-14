@@ -273,6 +273,17 @@ from the two ensembles: the sidecar must be as long as the tree list, its
 feature count must match, and an ensemble that already has linear leaves
 cannot be continued as a constant-leaf one or the reverse.
 
+Per-tree weights (DART)
+-----------------------
+`alternate_boosting.fold_weights_into_trees` multiplies each tree's node
+values by that tree's drop weight, so that an ensemble with per-tree weights
+becomes one a single-shrinkage `Booster` represents exactly.
+`LinearEnsemble.scale_all` is its other half: folding the constants without
+the coefficients would leave a leaf whose affine function no longer passes
+through the value its tree carries, and the two would describe different
+models. The two calls belong together, with the same weight vector, in the
+same place.
+
 Serialization
 -------------
 A new model format version, v4. `linear_section_text` writes the section and
@@ -291,9 +302,10 @@ LightGBM differences
   constant-leaf ones. mojoboost grows the constant-leaf tree and refits its
   leaves. The fitted leaves are optimal for the tree that was grown; the
   tree is not the one LightGBM would have grown. This is the largest and
-  most visible difference and it is not a rounding matter. `_LeafFit` and
-  `solve_leaf_coefficients` are the pieces a linear-aware split search would
-  reuse; the cost is one solve per candidate rather than one per leaf.
+  most visible difference and it is not a rounding matter.
+  `accumulate_leaf_stats` and `solve_leaf_coefficients` are the pieces a
+  linear-aware split search would reuse; the cost is one solve per candidate
+  rather than one per leaf.
 - **Regularization placement.** `linear_lambda` is applied to the
   coefficients and not to the intercept. LightGBM's `linear_lambda` is added
   to the diagonal of its own `(m+1)`-square system; whether its intercept
@@ -340,10 +352,17 @@ from .tree import Tree
 # ---------------------------------------------------------------------------
 
 # The model format version a file carrying linear leaves has to declare.
-# `serialize.mojo` writes v3 today; a `linear` section is what makes a file
-# v4. A v4 file with no linear leaves is byte-identical to the v3 one, so the
-# bump costs nothing for models that do not use the feature.
-comptime LINEAR_MODEL_FORMAT_VERSION = 4
+# `serialize.mojo` writes v4 today (split gains, a cover presence flag, and
+# optional feature names); a `linear` section is what makes a file v5. A v5
+# file with no linear leaves is byte-identical to the v4 one, so the bump
+# costs nothing for models that do not use the feature.
+#
+# The number is read off `serialize._VERSION` rather than assumed: v4 was
+# taken by another lane while this module was being written, which is
+# exactly the hazard `linear_model_format_version` exists to contain. If
+# `_VERSION` moves again before this is wired, this constant moves with it
+# and nothing else here changes.
+comptime LINEAR_MODEL_FORMAT_VERSION = 5
 
 # The token that opens the optional serialized section, and the section's own
 # revision. The section carries its own revision so a later change to what a
@@ -971,9 +990,10 @@ def check_linear_tree_public() raises:
         " continued training; the v4 `linear` section wired into"
         " serialize.mojo; a linear-aware raw-score pass in boosting.mojo;"
         " explicit refusals in contrib.mojo, gpu_predict.mojo, and"
-        " lgbm_model_io.mojo; leaf_const/leaf_coeff in model_dump.mojo; and"
-        " the parameter accepted by params.mojo instead of refused. See"
-        " handoffs/remaining_03_linear_trees.md"
+        " lgbm_model_io.mojo; leaf_const/leaf_coeff in model_dump.mojo;"
+        " LinearEnsemble.scale_all beside DART's weight folding in"
+        " alternate_boosting.mojo; and the parameter accepted by params.mojo"
+        " instead of refused. See handoffs/remaining_03_linear_trees.md"
     )
 
 

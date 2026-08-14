@@ -24,10 +24,13 @@ Two things this deliberately does not do:
 - It does not nest the trees. A tree crosses as a flat node table with
   `left` and `right` as indices into it, and `inspection._nested_node`
   nests them. Nesting on this side would mean building the same dict twice.
-- It does not parse model text. The one fact the text cannot carry, per
-  node split gain, is carried by the dump; `has_split_gain` says whether
-  a given model has it, and a node's `split_gain` is None when it does not
-  rather than a zero a consumer could mistake for a measured gain.
+- It does not parse model text, in either direction. Whether a given model
+  carries per node split gains is `has_split_gain`'s answer, computed
+  natively: a model saved by a current build keeps them (format v4), and
+  one read back from a v1, v2, or v3 file does not, because those formats
+  dropped them and a fitted tree cannot recompute them. A node's
+  `split_gain` is None in that case, never a zero a consumer could mistake
+  for a measured gain.
 
 Wave 2's dump-consuming functions rebuild the dump per call. That is right
 for the one-row conformance checks the Python layer makes and wrong for a

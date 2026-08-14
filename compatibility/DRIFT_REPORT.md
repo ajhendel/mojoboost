@@ -185,51 +185,63 @@ becoming lazy a no-op, and it is not.
 
 ---
 
-## F6. Seven environment variables are documented; twenty-one are named in code
+## F6. Seven environment variables are documented; forty-four are named in code
 
 **Severity: an undocumented surface people will find and use.**
 
 Compatibility policy section 9.5 documents seven. A scan for double-quoted
 `MOJOBOOST_*` literals under `src/`, `bindings/`, `python/`, `capi/`, and
-`cli/` finds twenty-one, of which nineteen are read by Mojo and two by
-Python.
+`cli/` finds forty-four distinct names.
 
-Declared and read (5 of the 7):
-`MOJOBOOST_DISABLE_GPU`, `MOJOBOOST_GPU_HIST_STRATEGY`,
-`MOJOBOOST_AUTO_MIN_CELLS`, and, through the `_env_int` wrapper in
-`parallel.mojo`, `MOJOBOOST_NUM_WORKERS` and
-`MOJOBOOST_PARALLEL_MIN_OPS`.
+**All seven declared variables are found, so `environment.stale` is empty
+and invariant I8 passes.** Two of the seven,
+`MOJOBOOST_GPU_BLOCK_THREADS` and `MOJOBOOST_GPU_ROW_TILE`, are read
+through `_env_int(name, default)` in `gpu_tiling.mojo` and
+`apple_histogram_policy.mojo` rather than passed to `getenv` directly, as
+are `MOJOBOOST_NUM_WORKERS` and `MOJOBOOST_PARALLEL_MIN_OPS` in
+`parallel.mojo`. A scan of `getenv` call sites alone finds nineteen names
+and misses four of the seven documented ones, which is why the snapshot
+schema defines `observed` as the literal scan and keeps `read_directly` as
+a separate, narrower field.
 
-Declared, and **not found by any literal scan** (2 of the 7):
-`MOJOBOOST_GPU_BLOCK_THREADS` and `MOJOBOOST_GPU_ROW_TILE`. Either they
-are read through a computed name, or they are documented and unread. A
-static reading cannot tell which, and the difference matters: the second
-is a documented control that does nothing.
+The other thirty-seven are read and undeclared, in five recognizable
+groups:
 
-Read, and not declared (16):
-`MOJOBOOST_CPU_CORE_POOL`, `MOJOBOOST_DASK_BACKEND`,
-`MOJOBOOST_DIST_MACHINES`, `MOJOBOOST_DIST_MODE`,
-`MOJOBOOST_GPU_BACKEND`, `MOJOBOOST_GPU_BACKEND_UNVALIDATED`,
-`MOJOBOOST_GPU_GRAD_LAYOUT`, `MOJOBOOST_GPU_HIST_SPECIALIZATION`,
-`MOJOBOOST_GPU_OBJECTIVE`, `MOJOBOOST_GPU_SPLIT_STRATEGY`,
-`MOJOBOOST_GPU_TRACE`, `MOJOBOOST_GPU_TRANSFER`,
-`MOJOBOOST_GPU_TRANSFER_UNPROVEN`, `MOJOBOOST_GPU_VALID_SCORING`,
-`MOJOBOOST_GPU_WARMUP`, `MOJOBOOST_HYBRID_LEAVES`,
-`MOJOBOOST_STARTUP_TRACE`.
+| Group | Variables |
+|---|---|
+| CPU policy | `MOJOBOOST_CPU_COMPACT_MIN_ROWS`, `MOJOBOOST_CPU_CORE_POOL`, `MOJOBOOST_CPU_FEATURE_GROUP`, `MOJOBOOST_CPU_TASKS_PER_CORE`, `MOJOBOOST_HIST_CACHE_BYTES` |
+| Distributed | `MOJOBOOST_DIST_JOB_ID`, `MOJOBOOST_DIST_MACHINES`, `MOJOBOOST_DIST_MODE`, `MOJOBOOST_DIST_RANK`, `MOJOBOOST_DIST_RESTART_EPOCH`, `MOJOBOOST_DIST_TIMEOUT_S`, `MOJOBOOST_DIST_WORLD_SIZE`, `MOJOBOOST_DISTRIBUTED_BASE_PORT`, `MOJOBOOST_DISTRIBUTED_CONNECT_TIMEOUT`, `MOJOBOOST_DISTRIBUTED_PROVIDER`, `MOJOBOOST_DASK_BACKEND` |
+| GPU tuning | `MOJOBOOST_GPU_BATCH_SLOTS`, `MOJOBOOST_GPU_CLASS_BATCH`, `MOJOBOOST_GPU_CLASS_BATCH_BYTES`, `MOJOBOOST_GPU_GRAD_LAYOUT`, `MOJOBOOST_GPU_HIST_SPECIALIZATION`, `MOJOBOOST_GPU_OBJECTIVE`, `MOJOBOOST_GPU_SPLIT_STRATEGY`, `MOJOBOOST_GPU_STAGING_SLOTS`, `MOJOBOOST_GPU_TRANSFER`, `MOJOBOOST_GPU_VALID_SCORING`, `MOJOBOOST_GPU_WARMUP`, `MOJOBOOST_HYBRID_LEAVES` |
+| Diagnostics and tracing | `MOJOBOOST_GPU_TRACE`, `MOJOBOOST_GPU_VERIFY_ROWS`, `MOJOBOOST_HYBRID_TRACE`, `MOJOBOOST_STARTUP_TRACE`, `MOJOBOOST_STARTUP_REPORT_FD` |
+| Escape hatches, and build | `MOJOBOOST_GPU_BACKEND`, `MOJOBOOST_GPU_BACKEND_UNVALIDATED`, `MOJOBOOST_GPU_TRANSFER_UNPROVEN`, `MOJOBOOST_MACOS_DEPLOYMENT_TARGET` |
 
-An undeclared variable is not a bug. Most of these read as diagnostic and
-tuning knobs, and section 2 of the compatibility policy already says only
-what is listed is public. But an environment variable is discoverable by
-grep and is the easiest surface in the project to depend on accidentally,
-and two of them, `MOJOBOOST_GPU_BACKEND_UNVALIDATED` and
+An undeclared variable is not a bug, and this lane does not propose
+declaring all thirty-seven. Section 2 of the compatibility policy already
+says only what is listed is public, and most of these are tuning and
+tracing knobs whose whole value is that they can be retuned in a patch
+release. Two of them, `MOJOBOOST_GPU_BACKEND_UNVALIDATED` and
 `MOJOBOOST_GPU_TRANSFER_UNPROVEN`, name in their own spelling the reason
 nobody should rely on them.
 
-**Fix.** Not a policy change. Either declare each one or say in one place
-that the undeclared `MOJOBOOST_*` variables are diagnostics and carry no
-promise. The snapshot's `environment.undeclared` block keeps the count
-honest either way, and `environment.stale` is what would fail if a
-documented variable stopped being read.
+What is worth acting on is the ratio. Seven documented against forty-four
+present means the documented list reads as an enumeration when it is a
+selection, and an environment variable is the easiest surface in this
+project to depend on accidentally: it needs no import, no link, and no
+recompile.
+
+**Fix.** Not a policy change. One sentence in section 9.5 saying that the
+table is the public set and that other `MOJOBOOST_*` variables are
+diagnostics and tuning controls carrying no promise. The snapshot's
+`environment.undeclared` block then keeps the count visible without
+turning every new knob into a documentation change, and
+`environment.stale` is what fails if a documented variable stops being
+read.
+
+**A parsing note for the tool author.** The scan also finds the bare
+prefix literal `"MOJOBOOST_"`, which is a prefix filter rather than a
+variable name. Discard any literal that is exactly the prefix, or the
+snapshot gains a phantom forty-fifth variable that can never be declared
+and can never go away.
 
 ---
 

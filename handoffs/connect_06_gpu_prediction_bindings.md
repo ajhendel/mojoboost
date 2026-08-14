@@ -258,6 +258,34 @@ Line ~944 names `GpuPredictor.upload_validation`; the method is
 Swapping it removes the second copy of the zero-base-score rule. Behavior
 identical; do it only if the lane wants it.
 
+**R7 — `src/mojoboost/serialize.mojo` (serialization lane).** `_read_mapper`
+never range-checks the `n_bins` it reads, and it never checks a feature's
+edge count against it. It validates everything *relative* to `n_bins`
+(`missing_bin < n_bins`, `n_cat < n_bins`) but not `n_bins` itself, so a
+file declaring 1000 bins loads. Every other `BinMapper` construction site
+enforces the byte ceiling: `fit_bins` (binning.mojo:394), `fit_bins_csc`
+(sparse.mojo:501), and `_bins_needed` in the LightGBM importer, which raises
+above `_MAX_BINS = 256`. Add the same guard after the header is read:
+
+```mojo
+    if n_bins < 2 or n_bins > 256:
+        raise Error("corrupt mapper: n_bins must be in [2, 256]")
+```
+
+and, after the offsets are validated, the per-feature form of it:
+
+```mojo
+    for f in range(n_features):
+        if offsets[f + 1] - offsets[f] > n_bins - 1:
+            raise Error("corrupt mapper: a feature has more edges than bins")
+```
+
+Why it matters is in section 12: bins live in a byte, so above the ceiling
+`transform` truncates modulo 256 while `bin_row` does not, and the two
+prediction paths would disagree. This predates this lane (`transform` is
+also how training bins, and how `Model.predict_batch` already binned), but
+the new batch entry points inherit it.
+
 ## 7. Exact estimator calls Task 07 must add
 
 All of these are in `python/mojoboost/__init__.py`, which this lane does not
@@ -374,11 +402,10 @@ host score unless `matches_host` is true, which is the same rule
    sum of the leaf values it collects rounds differently. An estimator that
    asserts exact equality between devices will fail; that property is
    `gpu_predict.mojo`'s documented contract, not something introduced here.
-3. **`BinMapper.transform` vs `bin_row`.** The batch path bins with
-   `transform` and the established path with `bin_row`. They should agree by
-   construction (same edges, same rule), but nothing in this lane verified
-   it, and a disagreement would move rows between leaves rather than round
-   them. This is the single highest-value check for the test lane.
+3. **`BinMapper.transform` vs `bin_row`: settled by proof, see section 12.**
+   They agree for every mapper any binner can produce. The one residual is a
+   deserialization gap (patch request R7), not a difference between the two
+   paths.
 4. **Concurrent churn.** `device_policy.mojo`, `objective_registry.mojo`,
    and `metrics.mojo` are all being edited by other lanes right now. This
    lane imports `BLOCK_*`, `MAX_GPU_ROWS`, `MIN_GPU_BINS`, `MAX_GPU_BINS`,
@@ -422,8 +449,77 @@ pixi run mojo run -I src tests/parallel/test_gpu_predict.mojo
 pixi run mojo format src/mojoboost/gpu_predict.mojo bindings/_mojoboost.mojo
 ```
 
-The check worth writing next, once (3) is clean: a test that predicts the
-same dense matrix through `Model.predict_batch` with `CPU_DEVICE` and
-through `predict_range`'s per-row path and asserts exact equality. That
-pins risk 3, needs no accelerator, and is the assumption every new entry
-point rests on.
+Section 12 settles by proof what would otherwise have been the first test
+to write. What is left worth a test is narrower and named there.
+
+## 12. `BinMapper.transform` vs `bin_row`: the batch path bins identically
+
+The assumption every new entry point rests on: the batch path bins with
+`BinMapper.transform` and the established row-at-a-time path with
+`bin_row`, and a disagreement would move rows between leaves rather than
+round them. Checked by reading both, not by running either.
+
+**Claim.** For every feature `f` and every value `v`,
+`bin_value(f, v) == Int(transform(...).bins[f * n_rows + r])` for the cell
+`(f, r)` holding `v`. The two paths therefore hand `predict_bins_range` the
+same bin vector, and predictions are equal exactly, not approximately.
+
+Both read the same cell: `_row` in the bindings takes
+`features[f * n_rows + r]` and `transform`'s `do_feature` takes
+`feat_p[col + r]` with `col = f * n_rows`. Same column-major indexing.
+
+Branch by branch, against `binning.mojo:276` (`bin_value`) and
+`binning.mojo:315` (`do_feature`):
+
+| Case | `bin_value` | `transform` | Same? |
+| --- | --- | --- | --- |
+| Categorical | `cats.bin_of(f, v)`, tested before anything else | `cats.bin_of(f, v)`, tested before anything else | Same call on the same spec. NaN and negatives are handled inside `bin_of`, so neither path applies the numeric missing rule to a categorical. |
+| NaN, missing bin reserved | returns `missing_bin[f]` | stores `mb = missing_bin[f]` | Same field. |
+| NaN, none reserved | substitutes `value = 0.0`, falls through | substitutes `v = 0.0`, falls through | Same substitution, and NaN never reaches a comparison in either. |
+| Ordinary numeric | binary search `[edge_offsets[f], edge_offsets[f+1])`, predicate `value <= edges[mid]`, midpoint `(left+right)//2`, result `left - lo` | the same four things, through raw pointers into the same lists | Identical arithmetic. |
+
+Degenerate shapes agree too. A constant column has zero edges, so
+`left == right` and the loop never runs: bin 0 on both. An all-NaN column
+with `use_missing` fits `n_out = 0` and `missing_bin = 1`, and both paths
+return 1 for NaN and 0 for anything else. `transform`'s
+`dispatch_features` parallelism cannot perturb a value: each cell is
+written exactly once and nothing accumulates.
+
+**The one place they could differ is the byte.** `transform` stores
+`UInt8(bin)` and `bin_value` returns an `Int`, so they agree iff every bin
+index is at most 255. It is, for every mapper a binner can produce:
+
+- Numeric: `n_out` edges give bins `0..n_out`, and `fit_bins` writes at most
+  `n_ordinary - 1 <= max_bins - 1 <= 255` edges.
+- Reserved missing bin: `n_out + 1` where reserving forces
+  `n_ordinary = max_bins - 1`, so `n_out <= 254` and the missing bin is
+  `<= 255`.
+- Categorical: `bin_of` returns `UNKNOWN_BIN = 0` or `1..n_categories`, and
+  `fit_categorical_spec` keeps at most `max_bins - 1 <= 255` categories.
+
+and `max_bins` is confined to `[2, 256]` at every construction site but one:
+
+| Site | Guard |
+| --- | --- |
+| `binning.fit_bins` | `max_bins < 2 or max_bins > 256` raises |
+| `sparse.fit_bins_csc` | same check |
+| `lgbm_model_io._synthesize_mapping` | `_bins_needed` raises above `_MAX_BINS = 256` |
+| `serialize._read_mapper` | **none**: `n_bins` is read and used to validate `missing_bin` and the category tables, but is never itself range-checked, and no feature's edge count is checked against it |
+
+**Verdict.** The two paths are provably identical for every model that
+`fit_bins`, the sparse binner, or the LightGBM importer produced, and for
+every save/load round trip of one. The batch entry points added by this
+lane are therefore exact against the established path on the CPU, and the
+GPU path routes every row to the same leaf (bins are integers; only the
+sum of leaf values rounds in Float32, which is the documented contract).
+
+The residual is R7, and it is not a difference between the two paths in
+normal use: a corrupt or hand-edited model file declaring more than 256
+bins loads today, and from then on *every* `transform`-based path truncates
+modulo 256 while `bin_row` stays exact. That includes training and the
+pre-existing `Model.predict_batch`, so it predates this lane; the new entry
+points inherit it. With R7 applied, the proof above has no exceptions.
+
+The test worth writing, once R7 lands and the build is green (UNRUN):
+load a mapper whose header declares `n_bins = 300` and assert `load_model`
+raises. The equality itself needs no test; it needs the guard.

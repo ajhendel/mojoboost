@@ -1139,16 +1139,191 @@ struct RowFields(Copyable, Movable):
             raise Error("the source delivered a query id for only some rows")
 
 
-def gather_row_fields[S: Sequence & Movable](
-    mut src: S, mut cancel: CancelToken, mut stats: SequenceStats
-) raises -> RowFields:
-    """One pass over the source, keeping only the row fields and the row
-    identity.
+comptime CATEGORY_KEY_STRIDE = 4294967296
+"""`1 << 32`, the stride that packs (column slot, category code) into one
+integer key. Category codes are already required to be below `2 ** 31` by
+`categorical.fit_categorical_spec`, so the packing is lossless for every
+code the binner would accept and the pack itself is where a larger one is
+caught."""
 
-    This is the census pass: it is what tells the multi-pass binner how many
-    rows there are before it allocates a feature block, and it is where the
-    row ranges every later stage means come from. It touches the feature
-    values only to count them.
+comptime MAX_CATEGORY_CODE = 2147483648
+"""`1 << 31`, the exclusive ceiling `categorical._MAX_CATEGORY` puts on a
+category code. Repeated here rather than imported because that one is
+private to a file this lane does not own; the two must stay in step, and the
+handoff carries the patch that would share one."""
+
+
+struct CategoryTally(Copyable, Movable, Writable):
+    """Distinct category codes of the declared categorical columns, counted
+    while a pass is already reading the data.
+
+    It fits nothing. `binning.fit_bins` fits the category tables, and a
+    second table here could disagree with that one. What this answers is the
+    question worth answering *before* the expensive passes: how many distinct
+    codes each declared column really holds, so a column with a million codes
+    and a `max_bin` of 255 is reported as about to lose almost all of them to
+    the unknown bin rather than discovered afterwards.
+
+    Distinct codes are held as one sorted list of `slot * 2**32 + code` keys,
+    deduplicated after every chunk. Memory is the total cardinality of the
+    declared columns plus one chunk's codes, which is the bound a tally can
+    have: a column whose cardinality is unbounded is exactly the case this
+    exists to report.
+    """
+
+    var features: List[Int]
+    var keys: List[Int]
+    var max_code: List[Int]
+    var missing_rows: List[Int]
+    var keep: Int
+
+    def __init__(out self, categorical_features: List[Int], keep: Int) raises:
+        if keep < 1:
+            raise Error("keep must be positive")
+        self.features = categorical_features.copy()
+        self.keys = List[Int]()
+        self.max_code = List[Int]()
+        self.missing_rows = List[Int]()
+        for _ in range(len(self.features)):
+            self.max_code.append(-1)
+            self.missing_rows.append(0)
+        self.keep = keep
+
+    @staticmethod
+    def none() raises -> CategoryTally:
+        """A tally of nothing, for a source with no declared categoricals.
+        Every method is then a no-op, which is what lets the census pass take
+        one unconditionally."""
+        return CategoryTally(List[Int](), 1)
+
+    def write_to(self, mut writer: Some[Writer]):
+        writer.write(
+            "CategoryTally(features=",
+            len(self.features),
+            ", keep=",
+            self.keep,
+            ")",
+        )
+
+    def write_repr_to(self, mut writer: Some[Writer]):
+        self.write_to(writer)
+
+    def observe(mut self, chunk: RawChunk) raises:
+        """Fold one chunk's declared categorical columns into the tally.
+
+        Missing is `not (v >= 0.0)`, which also rejects `NaN`, matching
+        `CategoricalSpec.bin_of` and both spec fitters. An absent sparse entry
+        is the value 0.0, so it is category code 0, matching
+        `sparse._distinct_codes_and_counts_csc`.
+        """
+        if len(self.features) == 0:
+            return
+        var fresh = List[Int]()
+        for i in range(len(self.features)):
+            var f = self.features[i]
+            if f < 0 or f >= chunk.n_features:
+                raise Error("categorical feature index out of range")
+            var slot_key = i * CATEGORY_KEY_STRIDE
+            if chunk.is_sparse:
+                var lo = chunk.csc.col_offsets[f]
+                var hi = chunk.csc.col_offsets[f + 1]
+                for e in range(lo, hi):
+                    var v = chunk.csc.values[e]
+                    if not (v >= 0.0):
+                        self.missing_rows[i] += 1
+                        continue
+                    var code = self._code_of(v)
+                    if code > self.max_code[i]:
+                        self.max_code[i] = code
+                    fresh.append(slot_key + code)
+                if hi - lo < chunk.n_rows:
+                    # The rows with no stored entry hold 0.0, which is code 0.
+                    if self.max_code[i] < 0:
+                        self.max_code[i] = 0
+                    fresh.append(slot_key)
+                continue
+            var col = f * chunk.n_rows
+            for r in range(chunk.n_rows):
+                var v = chunk.values[col + r]
+                if not (v >= 0.0):
+                    self.missing_rows[i] += 1
+                    continue
+                var code = self._code_of(v)
+                if code > self.max_code[i]:
+                    self.max_code[i] = code
+                fresh.append(slot_key + code)
+        if len(fresh) == 0:
+            return
+        for j in range(len(self.keys)):
+            fresh.append(self.keys[j])
+        sort(fresh)
+        var merged = List[Int]()
+        for j in range(len(fresh)):
+            if j == 0 or fresh[j] != fresh[j - 1]:
+                merged.append(fresh[j])
+        self.keys = merged^
+
+    def _code_of(self, v: Float64) raises -> Int:
+        """A raw value as a category code, refusing what the binner would
+        refuse."""
+        if v >= Float64(MAX_CATEGORY_CODE):
+            raise Error(
+                "categorical feature values must be below 2^31; use smaller"
+                " integer codes"
+            )
+        return Int(v)
+
+    def distinct(self, i: Int) -> Int:
+        """Distinct codes seen so far in the tally's `i`-th column."""
+        var lo = i * CATEGORY_KEY_STRIDE
+        var hi = lo + CATEGORY_KEY_STRIDE
+        var n = 0
+        for j in range(len(self.keys)):
+            if self.keys[j] >= lo and self.keys[j] < hi:
+                n += 1
+        return n
+
+    def cap_exceeded(self, i: Int) -> Bool:
+        """Whether the `i`-th column has more distinct codes than the binning
+        can keep, so the rest fall into the unknown bin."""
+        return self.distinct(i) > self.keep
+
+    def any_cap_exceeded(self) -> Bool:
+        for i in range(len(self.features)):
+            if self.cap_exceeded(i):
+                return True
+        return False
+
+    def report(self) -> String:
+        """One line per declared categorical column. Empty when there are
+        none, so a caller can print it unconditionally."""
+        var out = String("")
+        for i in range(len(self.features)):
+            out += "feature " + String(self.features[i])
+            out += ": " + String(self.distinct(i)) + " distinct codes"
+            out += ", max " + String(self.max_code[i])
+            out += ", " + String(self.missing_rows[i]) + " missing"
+            if self.cap_exceeded(i):
+                out += " (over the cap of " + String(self.keep) + ")"
+            out += "\n"
+        return out^
+
+
+def gather_row_fields[S: Sequence & Movable](
+    mut src: S,
+    mut tally: CategoryTally,
+    mut cancel: CancelToken,
+    mut stats: SequenceStats,
+) raises -> RowFields:
+    """One pass over the source, keeping only the row fields, the row
+    identity, and the category tally.
+
+    This is the census pass. It is what tells the multi-pass binner how many
+    rows there are before it allocates a feature block, it is where the row
+    ranges every later stage means come from, and it is the one pass that is
+    already touching every value, so the categorical tally rides along rather
+    than costing a pass of its own. Pass `CategoryTally.none()` when there is
+    nothing to tally.
     """
     src.rewind()
     stats.begin_pass()
@@ -1159,6 +1334,7 @@ def gather_row_fields[S: Sequence & Movable](
         var chunk = src.next_chunk()
         require_chunk_schema(schema, chunk)
         stats.observe(chunk)
+        tally.observe(chunk)
         fields.append_chunk(chunk)
     cancel.check()
     fields.check(schema)

@@ -23,6 +23,26 @@ from std.os import abort
 from std.python import Python, PythonObject
 from std.python.bindings import PythonModuleBuilder
 
+# `Dataset` construction beyond the dense case, and the reads that answer
+# from a constructed one. They live in their own module because they are a
+# coherent group and this file is long; they are registered here, in the one
+# `PythonModuleBuilder`, because that is the only place a name becomes
+# reachable from Python.
+from dataset_bindings import (
+    dataset_bin_upper_bounds,
+    dataset_categorical_features,
+    dataset_copy_field,
+    dataset_create_csc,
+    dataset_create_reference,
+    dataset_feature_names,
+    dataset_feature_num_bin,
+    dataset_field,
+    dataset_field_length,
+    dataset_metadata,
+    dataset_missing_bins,
+    dataset_subset,
+)
+
 from mojoboost.bagging import BaggingParams
 from mojoboost.categorical import CategoricalParams, CategoricalSpec
 from mojoboost.contrib import ContribExplainer
@@ -124,8 +144,12 @@ from mojoboost.ranking import (
     ndcg as mojo_ndcg,
 )
 from mojoboost.serialize import (
+    file_kind as mojo_file_kind,
+    load_dataset as mojo_load_dataset,
+    load_feature_names,
     load_model,
     load_multiclass_model,
+    save_dataset as mojo_save_dataset,
     save_model,
     save_multiclass_model,
 )
@@ -144,6 +168,25 @@ def PyInit__mojoboost() abi("C") -> PythonObject:
         m.def_function[dataset_num_data]("dataset_num_data")
         m.def_function[dataset_num_feature]("dataset_num_feature")
         m.def_function[dataset_num_bin]("dataset_num_bin")
+        # From dataset_bindings.mojo: the constructors the dense one has no
+        # room for, and the reads that answer from the constructed object.
+        m.def_function[dataset_create_csc]("dataset_create_csc")
+        m.def_function[dataset_create_reference]("dataset_create_reference")
+        m.def_function[dataset_subset]("dataset_subset")
+        m.def_function[dataset_metadata]("dataset_metadata")
+        m.def_function[dataset_feature_names]("dataset_feature_names")
+        m.def_function[dataset_categorical_features](
+            "dataset_categorical_features"
+        )
+        m.def_function[dataset_field]("dataset_field")
+        m.def_function[dataset_field_length]("dataset_field_length")
+        m.def_function[dataset_copy_field]("dataset_copy_field")
+        m.def_function[dataset_feature_num_bin]("dataset_feature_num_bin")
+        m.def_function[dataset_bin_upper_bounds]("dataset_bin_upper_bounds")
+        m.def_function[dataset_missing_bins]("dataset_missing_bins")
+        m.def_function[dataset_save]("dataset_save")
+        m.def_function[dataset_load]("dataset_load")
+        m.def_function[file_kind]("file_kind")
         m.def_function[train_dataset]("train_dataset")
         m.def_function[train_dataset_multiclass]("train_dataset_multiclass")
         m.def_function[train_dataset_ranker]("train_dataset_ranker")
@@ -220,6 +263,7 @@ def PyInit__mojoboost() abi("C") -> PythonObject:
         m.def_function[load]("load")
         m.def_function[save_multiclass]("save_multiclass")
         m.def_function[load_multiclass]("load_multiclass")
+        m.def_function[model_feature_names]("model_feature_names")
         m.def_function[gpu_available]("gpu_available")
         m.def_function[resolve_device]("resolve_device")
         return m.finalize()
@@ -2269,9 +2313,31 @@ def feature_importance_multiclass(
     return PythonObject(None)
 
 
-def save(model: PythonObject, path: PythonObject) raises -> PythonObject:
+def _saved_names(
+    feature_names: PythonObject, n_names: PythonObject
+) raises -> List[String]:
+    """Feature names for a model about to be written, as a sequence plus
+    its length like every other string sequence at this boundary (see
+    `dataset_create`). An empty list writes no names section, which is what
+    a model with none has always written."""
+    var names = List[String]()
+    var n = Int(py=n_names)
+    for i in range(n):
+        names.append(String(py=feature_names[i]))
+    return names^
+
+
+def save(
+    model: PythonObject,
+    path: PythonObject,
+    feature_names: PythonObject,
+    n_names: PythonObject,
+) raises -> PythonObject:
+    """Write the model to `path`. Names travel with it from model format
+    v4 on; `save_model` refuses a list that does not name this model's
+    features rather than dropping it."""
     var m = model.downcast_value_ptr[Model]()
-    save_model(m[], String(py=path))
+    save_model(m[], String(py=path), _saved_names(feature_names, n_names))
     return PythonObject(None)
 
 
@@ -2281,16 +2347,36 @@ def load(path: PythonObject) raises -> PythonObject:
 
 
 def save_multiclass(
-    model: PythonObject, path: PythonObject
+    model: PythonObject,
+    path: PythonObject,
+    feature_names: PythonObject,
+    n_names: PythonObject,
 ) raises -> PythonObject:
     var m = model.downcast_value_ptr[MulticlassModel]()
-    save_multiclass_model(m[], String(py=path))
+    save_multiclass_model(
+        m[], String(py=path), _saved_names(feature_names, n_names)
+    )
     return PythonObject(None)
 
 
 def load_multiclass(path: PythonObject) raises -> PythonObject:
     var model = load_multiclass_model(String(py=path))
     return PythonObject(alloc=model^)
+
+
+def model_feature_names(path: PythonObject) raises -> PythonObject:
+    """The feature names a saved model carries, empty for a file that has
+    none: every file written before v4, and any model saved without them.
+
+    A `Model` has no names field, so this reads the file header rather than
+    a handle. It is what lets a `Booster` read back from disk report the
+    names it was trained with instead of `Column_0`, `Column_1`, ...
+    """
+    var out = Python.list()
+    var names = load_feature_names(String(py=path))
+    for i in range(len(names)):
+        out.append(PythonObject(names[i]))
+    return out^
 
 
 # -- datasets and booster-level training ---------------------------------
@@ -2316,6 +2402,10 @@ def dataset_create(
     `n_groups`. It also holds the binning configuration (`max_bin`,
     `use_missing`, `categorical_addr` with `categorical_len`) and
     `feature_names`, a sequence of `n_names` strings.
+
+    `keep_raw` retains the raw matrix inside the dataset, which is what
+    `dataset_subset` needs and the only thing here that copies it; 0 is the
+    default and drops it after binning, as this entry point always did.
     """
     var nr = Int(py=n_rows)
     var nf = Int(py=n_features)
@@ -2353,8 +2443,37 @@ def dataset_create(
         _parse_categorical(params),
         Int(py=params["max_bin"]),
         _parse_use_missing(params),
+        Int(py=params["keep_raw"]) != 0,
     )
     return PythonObject(alloc=dataset^)
+
+
+def dataset_save(dataset: PythonObject, path: PythonObject) raises:
+    """Write a constructed dataset to `path` as a prepared table.
+
+    The binning is what a run pays for before it can start, so a table
+    written here is what lets the next process skip it. It is not a model
+    file and cannot be loaded as one: see `serialize.save_dataset`.
+    """
+    var d = dataset.downcast_value_ptr[Dataset]()
+    mojo_save_dataset(d[], String(py=path))
+
+
+def dataset_load(path: PythonObject) raises -> PythonObject:
+    """Read a prepared table written by `dataset_save`.
+
+    The result carries no raw matrix, so `dataset_metadata` reports
+    `has_raw` false for it and `dataset_subset` refuses it: bins cannot be
+    refitted from bins.
+    """
+    var dataset = mojo_load_dataset(String(py=path))
+    return PythonObject(alloc=dataset^)
+
+
+def file_kind(path: PythonObject) raises -> PythonObject:
+    """What a mojoboost file holds: "objective", "multiclass", or
+    "dataset". Reads only the header."""
+    return PythonObject(mojo_file_kind(String(py=path)))
 
 
 def dataset_num_data(dataset: PythonObject) raises -> PythonObject:

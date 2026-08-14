@@ -79,6 +79,14 @@ from std.time import perf_counter_ns
 from max.gpu.host import DeviceContext
 
 from .gpu_tiling import DeviceCaps, query_device_caps
+from .hybrid_leaf_scheduler import (
+    MODE_OFF,
+    HybridContext,
+    LeafWork,
+    decline_name,
+    decline_reason,
+    describe_context,
+)
 from .initialization import (
     PHASE_CONTEXT_CREATE,
     PHASE_DEVICE_DISCOVERY,
@@ -1243,6 +1251,12 @@ struct GpuSession(RoundLifecycle, Movable):
     var startup: StartupTrace
     var fits: FitLatency
     var warmup: WarmupPlan
+    # What `hybrid_leaf_scheduler` decided for this run, or empty when
+    # `MOJOBOOST_HYBRID_LEAVES` is off. A String rather than a context
+    # because the session neither makes nor consumes the placement: it is
+    # the thing that outlives a fit and can report one, and that module's
+    # switch exists precisely to make its decline reason observable.
+    var hybrid: String
 
     def __init__(out self, staging_slots: Int = 0) raises:
         """Open a device context and take the session's bookkeeping with it.
@@ -1288,6 +1302,7 @@ struct GpuSession(RoundLifecycle, Movable):
         # of disappearing into the first round. Front-loading the creation
         # itself needs typed `DeviceFunction` fields on whichever struct
         # owns the context; see handoffs/performance_15_startup.md.
+        self.hybrid = String("")
         self.warmup = WarmupPlan.from_env()
         if self.warmup.level >= WARMUP_TRAIN:
             _ = self.warmup.include(KERNEL_HIST_ATOMIC)

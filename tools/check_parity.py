@@ -532,6 +532,16 @@ STALE_DEFERRED_WATCHES = {
 # every probe resolves and `no` when any of them does not. Both directions
 # are false claims, one overstating reach and one understating it, and
 # understating it is how a capability a user already has stays undocumented.
+#
+# Every probe here is `pyall:`, deliberately. A capability is watchable this
+# way only when one public name decides it, and on the Python side that
+# holds: a name is in `mojoboost.__all__` or it is not. On the Mojo side it
+# does not. Section 2 of `docs/COMPATIBILITY_POLICY.md` makes the parameter
+# string `parse_params` accepts public too, so a capability can be reachable
+# through `enable_bundle=true` with no exported symbol anywhere, and a probe
+# on the symbol would then demand `no` for something the C ABI and the CLI
+# can already ask for. Those rows stay under STALE_DEFERRED_WATCHES, which
+# asks a human rather than deciding.
 PUBLIC_REACHABILITY_PROBES = {
     "Cross-validation (mojoboost.cv)": ["pyall:cv", "pyall:CVBooster"],
     "Model inspection and dump (mojoboost.inspection)": [
@@ -545,12 +555,6 @@ PUBLIC_REACHABILITY_PROBES = {
     ],
     "Startup diagnostics (mojoboost.diagnostics)": ["pyall:describe_install"],
     "Dask adapter (mojoboost.dask)": ["pyall:DaskMojoBoostRegressor"],
-    "Exclusive feature bundling": ["mojo:fit_bundles"],
-    "Distributed transport": ["mojo:RankAddress"],
-    "LightGBM model file interop": ["mojo:parse_lgbm_model"],
-    "Remaining tree-parameter rules": ["mojo:passes_min_gain"],
-    "Apple GPU tuning policy": ["mojo:derive_block_threads"],
-    "Per-level feature sampling": ["mojo:select_level_features"],
 }
 
 # Mojo suites the contract cites that no pixi task runs. Empty is the

@@ -11,15 +11,15 @@ What is here is deliberately narrow. These are *cores*: pure functions and
 small records over a `Collective`, with no growth loop, no trainer, and no
 transport. There is no third copy of the boosting round loop and no second
 `Collective` implementation anywhere in this file. A grower that wants
-feature-parallel split election calls `elect_split` once per node the way it
-already calls `find_best_split` once per node; a grower that wants voting
-calls `select_top_k`, `allreduce_votes`, and `elect_voted_features` and then
-reduces a smaller histogram. Both seams are one function call wide, which is
-what keeps them from becoming a parallel trainer.
+feature-parallel split election calls `elect_split_collective` once per node
+the way it already calls `find_best_split` once per node; a grower that wants
+voting calls `select_top_k`, `allreduce_votes`, and `elect_voted_features`
+and then reduces a smaller histogram. Both seams are one function call wide,
+which is what keeps them from becoming a parallel trainer.
 
 **Status. Neither mode is operational, and `require_strategy_operational`
 refuses both.** The cores are written and the reasoning below is meant to be
-checkable, but no driver in this repository calls them, no test has run them,
+checkable, but no grower in this repository calls them, no test has run them,
 and nothing in the repository has moved a byte between two processes: see
 `transport_available` in distributed_transport.mojo, which is False in every
 build today. No parallel speedup, scaling, or communication measurement is
@@ -33,25 +33,25 @@ full `n_features * n_bins` histogram all-reduced once per node.
 **Feature parallel** (cores here). Features partitioned, *rows not*: every
 rank holds the whole binned matrix and every row of it, and builds histograms
 only for the features it owns. That is LightGBM's own arrangement, and it is
-what removes the row-assignment broadcast that the textbook version of this
-mode needs: once the winning split is known, every rank can route its own
-copy of every row through it without being told which row went where.
+what removes the row-assignment broadcast the textbook version of this mode
+needs: once the winning split is known, every rank routes its own copy of
+every row through it without being told which row went where.
 
 Per node the communication is one all-gather of `world_size` split
-candidates, 16 integers each, against data parallel's `3 * n_features *
-n_bins` numbers. The saving is enormous and the trade is memory: nothing
-about this mode makes a dataset that does not fit on one machine fit on two.
-It pays when features are the expensive axis, which is the narrow case
-section 2 of docs/distributed.md describes.
+candidates, `CANDIDATE_WORDS` integers each, against data parallel's
+`3 * n_features * n_bins` numbers. The trade is memory: nothing about this
+mode makes a dataset that does not fit on one machine fit on two. It pays
+when features are the expensive axis, which is the narrow case section 2 of
+docs/distributed.md describes.
 
 **Voting parallel** (cores here). Data parallel with a filter: each rank
 ranks its own features by local gain, the ranks vote, and only the elected
 features have their histograms reduced. Communication drops by roughly
 `n_features / n_selected` and *exactness goes with it*: a feature that no
-rank ranks highly locally can still be the global winner, and when it is,
-the elected set does not contain it and the tree takes a different split.
-`voting_is_exact()` returns False and says so in one place, so no caller can
-be under the impression that this mode agrees with single-node training.
+rank ranks highly locally can still be the global winner, and when it is, the
+elected set does not contain it and the tree takes a different split.
+`voting_is_exact()` returns False in one place, so no caller has to decide
+for itself whether this mode agrees with single-node training.
 
 ## Determinism, which is the whole reason these are cores and not a loop
 
@@ -59,31 +59,29 @@ Three properties, each pinned by one function here.
 
 **The election reproduces the single-node scan order.** `FeaturePartition`
 is contiguous and ascending: rank `r` owns `[r * F // W, (r + 1) * F // W)`.
-So ascending rank order *is* ascending feature order, and `elect_split`
-scans candidates in ascending rank order keeping a candidate only on a
-strict gain improvement, which is exactly what `find_best_split` does over
-features within one rank. Given identical histograms, feature-parallel
-election therefore selects the identical split a single-node scan would,
-including which of two tied features wins. A round-robin or hashed feature
-partition would break that argument, so `FeaturePartition` implements one
-scheme and refuses to be given another.
+So ascending rank order *is* ascending feature order, and `elect_split` scans
+candidates in ascending rank order keeping one only on a strict gain
+improvement, which is exactly what `find_best_split` does over features
+within one rank. Given identical histograms, feature-parallel election
+therefore selects the identical split a single-node scan would, ties
+included. A round-robin or hashed feature partition would break that
+argument, so `FeaturePartition` implements one scheme and offers no other.
 
 **The exchange is order independent.** `allgather_candidates` writes each
 rank's record into that rank's own slot of a world-sized integer vector and
 reduces with `allreduce_max_int`, which is an all-gather when every other
 slot is zero and every record word is non-negative. Maximum is commutative
-and idempotent, so the result does not depend on arrival order, on which
-rank answered first, or on the reduction tree; it depends only on what the
-ranks wrote. Every encoder here is total and non-negative by construction,
-which is the invariant `encode_candidate` enforces before any collective is
-issued.
+and idempotent, so the result depends only on what the ranks wrote, never on
+arrival order, on which rank answered first, or on the reduction tree. Every
+encoder here is total and non-negative by construction, which is the
+invariant `encode_candidate` enforces before any collective is issued.
 
-**Gains cross as bits.** A gain travels as the two halves of its IEEE-754
-bit pattern, so the comparison every rank makes is over the identical
-numbers rather than over two roundings of them. Gains are non-negative and
-finite by validation, and the bit pattern of a non-negative finite double is
-monotone in its value, so the comparison is the same one whether it is made
-on the bits or on the doubles.
+**Gains cross as bits.** A gain travels as the two halves of its IEEE-754 bit
+pattern, so the comparison every rank makes is over identical numbers rather
+than over two roundings of them. Gains are non-negative and finite by
+validation, and the bit pattern of a non-negative finite double is monotone in
+its value, so the comparison is the same one whether it is made on the bits or
+on the doubles.
 
 ## Failure semantics
 
@@ -108,21 +106,19 @@ assumed away:
 
 Leaf values, the frontier scan, the smaller-child choice, row routing, and
 the stopping rule. Under feature parallel every one of those is a local
-computation on data every rank already holds, so none of them needs a
-message and none of them belongs here. Under voting parallel they are the
+computation on data every rank already holds, so none of them needs a message
+and none of them belongs here. Under voting parallel they are the
 data-parallel ones, unchanged, over the histogram that was reduced.
+
+See docs/DISTRIBUTED_STRATEGIES.md for the design, the driver each mode still
+needs, and the validation neither has had.
 """
 
-from .categorical import (
-    CAT_BITSET_WORDS,
-    CategoricalParams,
-    CategoricalSpec,
-    CatBitset,
-    cat_empty,
-)
+from std.math import isfinite
+
+from .categorical import CAT_BITSET_WORDS, CategoricalSpec, cat_empty
 from .collective import (
     STATUS_LAYOUT_MISMATCH,
-    STATUS_OK,
     STATUS_SHAPE_MISMATCH,
     STATUS_UNSUPPORTED,
     Collective,
@@ -134,10 +130,9 @@ from .collective import (
 )
 from .distributed_transport import digest_ints, f64_bits, f64_from_bits
 from .histogram import Histogram
-from .monotone import MonotoneConstraints, OutputBounds
+from .monotone import OutputBounds
 from .split import SplitInfo, find_best_split
 from .tree import TreeParams
-from .tree_parameters_extra import ExtraTreeParams
 
 # ---------------------------------------------------------------------------
 # Strategy codes
@@ -153,7 +148,8 @@ comptime STRATEGY_SERIAL = 0
 """Single node. Not a distributed mode; accepted so a caller can name it."""
 
 comptime STRATEGY_DATA_PARALLEL = 1
-"""Rows partitioned, full histograms reduced. Implemented in distributed.mojo."""
+"""Rows partitioned, full histograms reduced. Implemented in distributed.mojo.
+"""
 
 comptime STRATEGY_FEATURE_PARALLEL = 2
 """Features partitioned, every rank holding every row. Cores here only."""
@@ -207,22 +203,30 @@ def parse_strategy(text: String) raises -> Int:
 struct StrategyCapabilities(Copyable, Movable):
     """What one mode needs and what it can carry.
 
-    Written down as a record rather than as prose because three different
-    callers ask the same questions of it: a trainer deciding whether a
-    parameter bundle is admissible, a binding reporting what the build can
-    do, and the Dask adapter mapping a fit onto a backend's declared
-    capability names. All three should get the same answers from one place.
+    Written down as a record rather than as prose because three callers ask
+    the same questions of it: a trainer deciding whether a parameter bundle is
+    admissible, a binding reporting what the build can do, and the Dask
+    adapter mapping a fit onto a backend's declared capability names. All
+    three should get the same answers from one place.
 
-    `implemented` is the only field that is about this repository rather than
-    about the mode. It is False for both modes in this file, and
+    `implemented` is the only field about this repository rather than about
+    the mode. It is False for both modes in this file, and
     `require_strategy_operational` is what enforces it.
+
+    `exact_split_search` means the mode searches every feature at every node,
+    so it chooses the split a single-node scan of the same histograms would
+    choose. It is a statement about the search and not about floating point:
+    data parallel regroups a sum at shard boundaries and so agrees with
+    single-node training only to within accumulated rounding, which
+    docs/distributed.md section 6 states precisely and this field does not
+    restate.
     """
 
     var strategy: Int
     var implemented: Bool
     var needs_every_row_on_every_rank: Bool
     var reduces_histograms: Bool
-    var equals_single_node: Bool
+    var exact_split_search: Bool
     var supports_categorical: Bool
     var supports_monotone: Bool
     var supports_missing: Bool
@@ -236,10 +240,10 @@ struct StrategyCapabilities(Copyable, Movable):
             text += ": implemented"
         else:
             text += ": cores only, no driver"
-        if self.equals_single_node:
-            text += ", equals single-node training"
+        if self.exact_split_search:
+            text += ", searches every feature"
         else:
-            text += ", does not equal single-node training"
+            text += ", searches a voted subset"
         return text^
 
 
@@ -251,55 +255,90 @@ def strategy_capabilities(strategy: Int) raises -> StrategyCapabilities:
     **Feature parallel supports bagging and feature subsampling, and data
     parallel does not.** Both draw from a seeded RNG over *global* row or
     feature indices. Under feature parallel every rank holds every row, so
-    every rank can reproduce the global draw exactly and no projection onto a
+    every rank reproduces the global draw exactly and no projection onto a
     shard is needed. Under data parallel a shard-local bag has to be a
     deterministic projection of a global draw, which distributed.mojo refuses
     rather than approximates.
 
     **Feature parallel supports categorical splits, monotone constraints, and
     missing bins, and the data-parallel prototype does not.** Not because the
-    mode is cleverer: because these cores forward a node's search to the one
-    `find_best_split` the single-node grower uses, so whatever that function
-    enforces is enforced here by construction. The data-parallel prototype
-    refuses them because it runs a second growth loop that would have to
-    reimplement them (docs/distributed.md section 9).
+    mode is cleverer: because `search_owned_features` forwards a node's search
+    to the one `find_best_split` the single-node grower and the GPU grower
+    already use, so whatever that function enforces is enforced here by
+    construction. The data-parallel prototype refuses them because it runs a
+    second growth loop that would have to reimplement them
+    (docs/distributed.md section 9).
 
-    **Voting parallel does not equal single-node training.** The elected
-    feature set can exclude the globally best feature. That is the mode, not
-    a defect, and it is why `voting_is_exact()` exists.
+    **Voting parallel does not search every feature.** The elected feature set
+    can exclude the globally best feature. That is the mode, not a defect, and
+    it is why `voting_is_exact()` exists.
 
     **Ranking groups.** Feature parallel keeps every row on every rank, so a
-    query group is never straddled and `check_group_alignment` has nothing to
-    refuse. Voting parallel partitions rows and inherits the data-parallel
-    constraint exactly.
+    query group is never straddled and `check_group_alignment` in
+    distributed.mojo has nothing to refuse. Voting parallel partitions rows
+    and inherits the data-parallel constraint exactly.
     """
     if strategy == STRATEGY_SERIAL:
         return StrategyCapabilities(
-            STRATEGY_SERIAL, True, True, False, True,
-            True, True, True, True, True, True,
+            STRATEGY_SERIAL,
+            True,
+            True,
+            False,
+            True,
+            True,
+            True,
+            True,
+            True,
+            True,
+            True,
         )
     if strategy == STRATEGY_DATA_PARALLEL:
         return StrategyCapabilities(
-            STRATEGY_DATA_PARALLEL, True, False, True, True,
-            False, False, False, False, False, False,
+            STRATEGY_DATA_PARALLEL,
+            True,
+            False,
+            True,
+            True,
+            False,
+            False,
+            False,
+            False,
+            False,
+            False,
         )
     if strategy == STRATEGY_FEATURE_PARALLEL:
         return StrategyCapabilities(
-            STRATEGY_FEATURE_PARALLEL, False, True, False, True,
-            True, True, True, True, True, True,
+            STRATEGY_FEATURE_PARALLEL,
+            False,
+            True,
+            False,
+            True,
+            True,
+            True,
+            True,
+            True,
+            True,
+            True,
         )
     if strategy == STRATEGY_VOTING_PARALLEL:
         return StrategyCapabilities(
-            STRATEGY_VOTING_PARALLEL, False, False, True, False,
-            False, False, False, False, False, False,
+            STRATEGY_VOTING_PARALLEL,
+            False,
+            False,
+            True,
+            False,
+            False,
+            False,
+            False,
+            False,
+            False,
+            False,
         )
-    raise Error(
-        String("unknown parallel strategy code ", strategy)
-    )
+    raise Error(String("unknown parallel strategy code ", strategy))
 
 
 def voting_is_exact() -> Bool:
-    """Whether voting parallel reaches the same split data parallel would.
+    """Whether voting parallel reaches the split data parallel would.
 
     False, in one place, so that no caller has to decide for itself. The
     elected feature set is chosen from local rankings, and a feature that is
@@ -333,7 +372,6 @@ def strategy_unsupported_mask(
     two changes away from a working configuration learns both changes from one
     error instead of one per attempt.
     """
-    var mask = 0
     if (
         strategy != STRATEGY_SERIAL
         and strategy != STRATEGY_DATA_PARALLEL
@@ -341,6 +379,7 @@ def strategy_unsupported_mask(
         and strategy != STRATEGY_VOTING_PARALLEL
     ):
         return UNSUPPORTED_STRATEGY_UNKNOWN
+    var mask = 0
     if strategy == STRATEGY_SERIAL:
         if world_size != 1:
             mask |= UNSUPPORTED_SERIAL_WORLD
@@ -360,13 +399,11 @@ def strategy_unsupported_mask(
 def raise_strategy_unsupported(strategy: Int, mask: Int) raises:
     """Turn a mask into the one error every rank raises.
 
-    Ordered from the most fundamental to the least, so a caller reads the
-    reason that has to be fixed first.
+    Ordered from the most fundamental reason to the least, so a caller reads
+    the one that has to be fixed first.
     """
     if mask & UNSUPPORTED_STRATEGY_UNKNOWN != 0:
-        raise Error(
-            String("unknown parallel strategy code ", strategy)
-        )
+        raise Error(String("unknown parallel strategy code ", strategy))
     if mask & UNSUPPORTED_NO_DRIVER != 0:
         raise Error(
             String(
@@ -404,14 +441,13 @@ def require_strategy_operational(
     """The gate. Raises unless `strategy` can actually run here.
 
     Today it raises for feature and voting parallel unconditionally, and for
-    data parallel only when the world cannot be reached. That is deliberate:
-    a core that has never been driven, never been run across processes, and
-    never been measured is not a mode a caller should be able to select by
-    accident.
+    data parallel whenever the world spans processes this build cannot reach.
+    That is deliberate: a core that has never been driven, never run across
+    processes, and never measured is not a mode a caller should be able to
+    select by accident.
     """
-    raise_strategy_unsupported(
-        strategy, strategy_unsupported_mask(strategy, world_size, transport_ready)
-    )
+    var mask = strategy_unsupported_mask(strategy, world_size, transport_ready)
+    raise_strategy_unsupported(strategy, mask)
 
 
 # ---------------------------------------------------------------------------
@@ -427,10 +463,10 @@ struct FeaturePartition(Copyable, Movable):
     keeps the reduction visiting rows in the dataset's own order; here it
     keeps ascending rank order equal to ascending feature order, which is what
     makes `elect_split`'s tie-break the same one `find_best_split` applies
-    inside a rank. A round-robin partition would balance a ragged feature cost
-    slightly better and would break that equality, so it is not offered: every
-    feature costs the same `n_bins` cells to scan, and there is nothing ragged
-    to balance.
+    inside a rank. A round-robin partition would balance a ragged per-feature
+    cost slightly better and would break that equality, so it is not offered:
+    every feature costs the same `n_bins` cells to scan, and there is nothing
+    ragged to balance.
 
     A rank may own zero features when the world is wider than the feature
     count. Such a rank still takes part in every collective, contributing a
@@ -449,6 +485,14 @@ struct FeaturePartition(Copyable, Movable):
         self.n_features = n_features
         self.world_size = world_size
 
+    def _check_rank(self, rank: Int) raises:
+        if rank < 0 or rank >= self.world_size:
+            raise Error(
+                String(
+                    "rank ", rank, " is outside a world of ", self.world_size
+                )
+            )
+
     def start(self, rank: Int) raises -> Int:
         self._check_rank(rank)
         return rank * self.n_features // self.world_size
@@ -460,14 +504,6 @@ struct FeaturePartition(Copyable, Movable):
     def count(self, rank: Int) raises -> Int:
         return self.end(rank) - self.start(rank)
 
-    def _check_rank(self, rank: Int) raises:
-        if rank < 0 or rank >= self.world_size:
-            raise Error(
-                String(
-                    "rank ", rank, " is outside a world of ", self.world_size
-                )
-            )
-
     def owns(self, rank: Int, feature: Int) raises -> Bool:
         return feature >= self.start(rank) and feature < self.end(rank)
 
@@ -476,7 +512,7 @@ struct FeaturePartition(Copyable, Movable):
 
         A forward scan rather than an inverted formula: the world is small,
         the blocks are ascending, and one definition of the boundary that
-        cannot drift from `start`/`end` is worth more here than the
+        cannot drift from `start` and `end` is worth more here than the
         arithmetic.
         """
         if feature < 0 or feature >= self.n_features:
@@ -505,7 +541,8 @@ struct FeaturePartition(Copyable, Movable):
         """The partition every rank must agree about, in one integer, so a
         disagreement is one reduced value rather than `world_size` compared
         boundaries."""
-        return digest_ints([self.n_features, self.world_size])
+        var values: List[Int] = [self.n_features, self.world_size]
+        return digest_ints(values)
 
 
 def intersect_ascending(owned: List[Int], selected: List[Int]) -> List[Int]:
@@ -514,8 +551,7 @@ def intersect_ascending(owned: List[Int], selected: List[Int]) -> List[Int]:
     Both inputs are ascending, so this is a merge and not a search, and the
     result stays ascending, which `find_best_split` requires. An empty
     `selected` means every feature was selected, which is that function's own
-    convention, so it passes `owned` through unchanged rather than returning
-    nothing.
+    convention, so `owned` passes through unchanged rather than emptying it.
     """
     if len(selected) == 0:
         return owned.copy()
@@ -538,25 +574,25 @@ def intersect_ascending(owned: List[Int], selected: List[Int]) -> List[Int]:
 # Split candidates on the wire
 # ---------------------------------------------------------------------------
 #
-# A candidate is 16 non-negative integers. Non-negative because the all-gather
-# is built on `allreduce_max_int` over slots the other ranks leave at zero, and
-# a negative word would then reduce to another rank's zero instead of to
-# itself. Every field that can legitimately be negative is stored with an
-# offset, and every 64-bit quantity is stored as two 32-bit halves, so no word
-# can reach the sign bit of an Int on any platform this builds for.
+# A candidate is `CANDIDATE_WORDS` non-negative integers. Non-negative because
+# the all-gather is built on `allreduce_max_int` over slots the other ranks
+# leave at zero, and a negative word would then reduce to another rank's zero
+# instead of to itself. Every field that can legitimately be negative is stored
+# with an offset, and every 64-bit quantity is stored as two 32-bit halves, so
+# no word can reach the sign bit of an `Int`.
 
 comptime CANDIDATE_WORDS = 8 + 2 * CAT_BITSET_WORDS
 
 comptime _W_MARK = 0
 """1 when a rank wrote this block. Zero means a rank never contributed, which
-is a failure and not an absent candidate."""
+is a broken exchange and not an absent candidate."""
 
 comptime _W_FOUND = 1
 comptime _W_FEATURE = 2
 """`feature + 1`, so the -1 of a not-found split stores as 0."""
 
 comptime _W_BIN = 3
-"""`bin + 1`, likewise, and a categorical split stores 0 here."""
+"""`bin + 1`, likewise; a categorical split stores 0 here."""
 
 comptime _W_FLAGS = 4
 """Bit 0 categorical, bit 1 default_left."""
@@ -567,14 +603,10 @@ comptime _W_NODE = 7
 """`node + 1`, so a zero marks a block nobody wrote."""
 
 comptime _W_CATS = 8
-"""`2 * CAT_BITSET_WORDS` halves of the categorical bitset."""
-
-comptime _HALF = 0x1_0000_0000
+"""The first of `2 * CAT_BITSET_WORDS` halves of the categorical bitset."""
 
 
-def encode_candidate(
-    split: SplitInfo, node: Int
-) raises -> List[Int]:
+def encode_candidate(split: SplitInfo, node: Int) raises -> List[Int]:
     """One rank's answer for one node, as `CANDIDATE_WORDS` non-negative
     integers.
 
@@ -594,11 +626,11 @@ def encode_candidate(
     if not split.found:
         return out^
 
-    if split.gain < 0.0 or not (split.gain == split.gain):
+    if split.gain < 0.0 or not isfinite(split.gain):
         raise Error(
-            "a found split must carry a non-negative, non-NaN gain; the"
-            " candidate exchange compares gains as bit patterns and a"
-            " negative or NaN gain does not order"
+            "a found split must carry a non-negative finite gain; the"
+            " candidate exchange compares gains as bit patterns, and a"
+            " negative, infinite, or NaN gain does not order"
         )
     if split.feature < 0:
         raise Error("a found split must name a feature")
@@ -618,21 +650,24 @@ def encode_candidate(
         flags |= 2
     out[_W_FLAGS] = flags
     var bits = f64_bits(split.gain)
-    out[_W_GAIN_LO] = Int(bits % _HALF)
-    out[_W_GAIN_HI] = Int(bits // _HALF)
+    out[_W_GAIN_LO] = Int(bits % 0x1_0000_0000)
+    out[_W_GAIN_HI] = Int(bits // 0x1_0000_0000)
     if split.is_categorical:
         for w in range(CAT_BITSET_WORDS):
             var word = split.cat_bitset[w]
-            out[_W_CATS + 2 * w] = Int(word % _HALF)
-            out[_W_CATS + 2 * w + 1] = Int(word // _HALF)
+            out[_W_CATS + 2 * w] = Int(word % 0x1_0000_0000)
+            out[_W_CATS + 2 * w + 1] = Int(word // 0x1_0000_0000)
     return out^
 
 
 @fieldwise_init
 struct Candidate(Copyable, Movable):
-    """One rank's decoded answer. `present` is False only for a rank that
-    never wrote its slot, which is a broken exchange rather than a rank with
-    nothing to say: a rank with nothing to say writes a not-found split."""
+    """One rank's decoded answer.
+
+    `present` is False only for a rank that never wrote its slot, which is a
+    broken exchange rather than a rank with nothing to say: a rank with
+    nothing to say writes a not-found split, which is present and not found.
+    """
 
     var rank: Int
     var node: Int
@@ -643,11 +678,14 @@ struct Candidate(Copyable, Movable):
 def decode_candidate(
     words: List[Int], offset: Int, rank: Int
 ) raises -> Candidate:
-    """Decode one rank's block. Every field is checked against the encoding's
-    own invariants, because after a reduction the bytes are as trustworthy as
-    the least trustworthy rank that contributed to them."""
+    """Decode one rank's block.
+
+    Every field is checked against the encoding's own invariants, because
+    after a reduction the words are as trustworthy as the least trustworthy
+    rank that contributed to them.
+    """
     if offset < 0 or offset + CANDIDATE_WORDS > len(words):
-        raise Error("candidate block runs past the end of the buffer")
+        raise Error("a candidate block runs past the end of the buffer")
     for w in range(CANDIDATE_WORDS):
         if words[offset + w] < 0:
             raise Error(
@@ -666,16 +704,16 @@ def decode_candidate(
         return Candidate(rank, node, SplitInfo(-1, -1, 0.0, False), True)
 
     var flags = words[offset + _W_FLAGS]
-    if flags < 0 or flags > 3:
+    if flags > 3:
         raise Error("a candidate carries unknown split flags")
     var is_cat = (flags & 1) != 0
     var default_left = (flags & 2) != 0
-    var bits = UInt64(words[offset + _W_GAIN_HI]) * UInt64(_HALF) + UInt64(
+    var bits = UInt64(words[offset + _W_GAIN_HI]) * 0x1_0000_0000 + UInt64(
         words[offset + _W_GAIN_LO]
     )
     var gain = f64_from_bits(bits)
-    if gain < 0.0 or not (gain == gain):
-        raise Error("a candidate carries a negative or NaN gain")
+    if gain < 0.0 or not isfinite(gain):
+        raise Error("a candidate carries a negative, infinite, or NaN gain")
     var feature = words[offset + _W_FEATURE] - 1
     if feature < 0:
         raise Error("a found candidate must name a feature")
@@ -685,9 +723,9 @@ def decode_candidate(
             raise Error("a categorical candidate must not carry a bin")
         var bitset = cat_empty()
         for w in range(CAT_BITSET_WORDS):
-            bitset[w] = UInt64(words[offset + _W_CATS + 2 * w + 1]) * UInt64(
-                _HALF
-            ) + UInt64(words[offset + _W_CATS + 2 * w])
+            var hi = UInt64(words[offset + _W_CATS + 2 * w + 1])
+            var lo = UInt64(words[offset + _W_CATS + 2 * w])
+            bitset[w] = hi * 0x1_0000_0000 + lo
         return Candidate(
             rank, node, SplitInfo.categorical(feature, gain, bitset), True
         )
@@ -706,15 +744,15 @@ def allgather_candidates[
     """Every rank's candidate for one node, on every rank.
 
     `local` holds this process's local ranks' candidates, one per
-    `comm.n_local_ranks()`, which is the same shape `agree_status` takes and
+    `comm.n_local_ranks()`, which is the shape `agree_status` takes and which
     degenerates to a single entry under a one-rank-per-process transport.
 
     One collective, and the collective is a maximum over a vector in which
-    each rank wrote only its own slot. That is an all-gather built from the
+    each rank wrote only its own slot. That is an all-gather built from a
     reduction `Collective` already has, rather than a new trait method every
     future transport would have to implement. It is skipped when this process
-    already hosts the whole world, because there is no peer whose slots could
-    differ from the zeros this process wrote.
+    already hosts the whole world, because then there is no peer whose slots
+    could differ from the zeros this process wrote.
     """
     var world = comm.world_size()
     var n_local = comm.n_local_ranks()
@@ -728,15 +766,15 @@ def allgather_candidates[
             raise Error("local rank id out of range")
         var block = encode_candidate(local[i], node)
         var base = r * CANDIDATE_WORDS
-        for w in range(CANDIDATE_WORDS):
-            if buf[base + w] != 0:
-                raise Error(
-                    String(
-                        "two local ranks both claim rank ",
-                        r,
-                        " in the candidate exchange",
-                    )
+        if buf[base + _W_MARK] != 0:
+            raise Error(
+                String(
+                    "two local ranks both claim rank ",
+                    r,
+                    " in the candidate exchange",
                 )
+            )
+        for w in range(CANDIDATE_WORDS):
             buf[base + w] = block[w]
 
     if not hosts_whole_world(comm):
@@ -757,7 +795,7 @@ def allgather_candidates[
 struct ElectedSplit(Copyable, Movable):
     """The winning candidate and who proposed it.
 
-    `owner` is carried because it is free and because it is the only thing a
+    `owner` is carried because it is free and because it is the only part a
     caller cannot recompute: everything else about the decision is a pure
     function of the gathered candidates, which every rank holds identically.
     It is -1 when no rank found a split, which is how a node becomes a leaf.
@@ -766,7 +804,7 @@ struct ElectedSplit(Copyable, Movable):
     var split: SplitInfo
     var owner: Int
 
-    def found(self) -> Bool:
+    def is_found(self) -> Bool:
         return self.split.found
 
 
@@ -785,13 +823,12 @@ def elect_split(
     Three failures are checked rather than assumed, and all three are pure
     functions of the gathered vector, so every rank raises together:
 
-    - a rank whose block was never written (a contributor that did not
-      contribute)
-    - a rank that answered for a different node (a collective that overtook
-      its predecessor, seen from above the transport)
-    - a rank that returned a split on a feature it does not own (a partition
-      that is being ignored, which would silently double-count a feature or
-      leave one unsearched)
+    - a rank whose block was never written, which is a contributor that did
+      not contribute
+    - a rank that answered for a different node, which is a collective that
+      overtook its predecessor, seen from above the transport
+    - a rank that returned a split on a feature it does not own, which would
+      silently double-count one feature and leave another unsearched
     """
     if len(candidates) != partition.world_size:
         raise Error(
@@ -811,7 +848,7 @@ def elect_split(
                     r,
                     " contributed no candidate for node ",
                     node,
-                    "; every rank must answer every election",
+                    "; every rank answers every election",
                 )
             )
         if c.node != node:
@@ -837,10 +874,12 @@ def elect_split(
                     ", which it does not own",
                 )
             )
-        if c.split.gain > best.gain or not best.found:
-            if c.split.gain > 0.0:
-                best = c.split.copy()
-                owner = r
+        # `best.gain` starts at 0.0 and a found split's gain is strictly
+        # positive, so this one test is both the improvement rule and the
+        # positive-gain floor, exactly as in `find_best_split`.
+        if c.split.gain > best.gain:
+            best = c.split.copy()
+            owner = r
     return ElectedSplit(best^, owner)
 
 
@@ -854,8 +893,8 @@ def elect_split_collective[
 ) raises -> ElectedSplit:
     """One node's whole feature-parallel exchange: gather, then elect.
 
-    This is the entire seam a feature-parallel grower needs. It replaces the
-    `find_best_split` call a single-node grower makes at a node, takes one
+    This is the entire seam a feature-parallel grower needs. It stands where
+    the `find_best_split` call stands in a single-node grower, costs one
     collective, and returns a split every rank agrees on. Nothing else about
     the grower changes, which is the argument for building the mode this way
     rather than as a third growth loop.
@@ -895,16 +934,15 @@ def search_owned_features(
     cost, and the gain floor are then enforced here by construction rather
     than by a second copy that can drift. That is the difference between these
     cores and the data-parallel prototype's second growth loop, and it is why
-    `strategy_capabilities` can claim those four rows for this mode.
+    `strategy_capabilities` can claim those rows for this mode.
 
     The two guards ahead of the scan are the ones `tree._search` applies, kept
-    here because a rank that skips them would propose a split its peers would
-    have refused, and the election has no way to tell the difference.
+    here because a rank that skipped them would propose a split its peers
+    would have refused, and the election cannot tell the difference.
 
     `params.extra.needs_grower_support()` is refused rather than forwarded:
     `extra_trees`, `max_delta_step`, and `path_smooth` are applied by the
-    grower, and a feature-parallel grower that applies them does not exist to
-    be trusted with them yet.
+    grower, and there is no feature-parallel grower to be trusted with them.
     """
     partition._check_rank(rank)
     if hist.n_features != partition.n_features:
@@ -925,9 +963,9 @@ def search_owned_features(
     var owned = intersect_ascending(partition.features(rank), selected)
     if len(owned) == 0:
         # A rank that owns nothing this node may search still answers the
-        # election, with a not-found candidate. Returning early also avoids
-        # `find_best_split`'s empty-list convention, where an empty feature
-        # list means every feature rather than none.
+        # election, with a not-found candidate. Returning here also avoids
+        # `find_best_split`'s empty-list convention, under which an empty
+        # feature list means every feature rather than none.
         return SplitInfo(-1, -1, 0.0, False)
 
     return find_best_split(
@@ -971,15 +1009,15 @@ def select_top_k(
 ) raises -> List[Int]:
     """This rank's `k` best features by local gain, ascending by feature id.
 
-    `gains[f]` is the best gain rank `r` found on feature `f` and `found[f]`
+    `gains[f]` is the best gain this rank found on feature `f` and `found[f]`
     whether it found one at all. Selection is by repeated maximum scan rather
     than by a sort: `k` is 20 by default against a feature count in the
     hundreds or thousands, the scan is exact, and it needs no comparator whose
     tie-break could differ from the one this file argues about everywhere
     else. Ties go to the lower feature id, which is `find_best_split`'s rule.
 
-    The result is returned ascending because it is a feature id list, and
-    every consumer of one here treats ascending order as part of the type.
+    The result is ascending because it is a feature id list, and every
+    consumer of one here treats ascending order as part of the type.
     """
     check_top_k(k)
     if len(gains) != len(found):
@@ -987,29 +1025,22 @@ def select_top_k(
     var n = len(gains)
     var taken = List[Bool](capacity=n)
     taken.resize(n, False)
-    var chosen = List[Int]()
     for _ in range(k):
         var best = -1
         var best_gain = 0.0
         for f in range(n):
-            if taken[f] or not found[f]:
+            if taken[f] or not found[f] or gains[f] <= 0.0:
                 continue
-            if gains[f] <= 0.0:
-                continue
-            if best < 0 or gains[f] > best_gain:
+            if gains[f] > best_gain:
                 best = f
                 best_gain = gains[f]
         if best < 0:
             break
         taken[best] = True
-        chosen.append(best)
-    # `chosen` is in descending-gain order; the ascending id list is what the
-    # vote and the histogram build both want.
     var out = List[Int]()
     for f in range(n):
         if taken[f]:
             out.append(f)
-    _ = chosen^
     return out^
 
 
@@ -1021,14 +1052,14 @@ def allreduce_votes[
     """How many ranks voted for each feature.
 
     `local_votes[i]` is the ascending feature list local rank `i` selected.
-    One integer reduction over `n_features` counts, which is exact at any
-    world size and independent of arrival order, and which costs `n_features`
-    integers against the `3 * n_features * n_bins` numbers a full histogram
-    reduction costs. That ratio is the mode.
+    One integer reduction over `n_features` counts, exact at any world size
+    and independent of arrival order, costing `n_features` integers against
+    the `3 * n_features * n_bins` numbers a full histogram reduction costs.
+    That ratio is the mode.
 
     LightGBM's voting is richer than a count: it aggregates the local gains as
     well and runs a second local pass over the merged candidates. This counts
-    votes only, and breaks ties by ascending feature id. It is a different
+    votes only and breaks ties by ascending feature id. It is a different
     selection rule from LightGBM's and therefore a different model; see
     docs/DISTRIBUTED_STRATEGIES.md.
     """
@@ -1060,7 +1091,7 @@ def elect_voted_features(votes: List[Int], n_select: Int) raises -> List[Int]:
     elected set a pure function of the reduced vote vector and therefore
     identical on every rank without another message. A feature nobody voted
     for is never elected, so the set is smaller than `n_select` when fewer
-    features drew a vote, which is correct: reducing a feature no rank thinks
+    features drew a vote. That is correct: reducing a feature no rank believes
     can split is pure cost.
     """
     if n_select < 1:
@@ -1074,7 +1105,7 @@ def elect_voted_features(votes: List[Int], n_select: Int) raises -> List[Int]:
         for f in range(n):
             if taken[f] or votes[f] <= 0:
                 continue
-            if best < 0 or votes[f] > best_votes:
+            if votes[f] > best_votes:
                 best = f
                 best_votes = votes[f]
         if best < 0:
@@ -1085,6 +1116,35 @@ def elect_voted_features(votes: List[Int], n_select: Int) raises -> List[Int]:
         if taken[f]:
             out.append(f)
     return out^
+
+
+struct PackedHistogram(Copyable, Movable):
+    """The elected features' histogram cells, contiguous and reducible.
+
+    Packed rather than reduced in place because a reduction over the full
+    histogram buffer would move exactly the bytes this mode exists not to
+    move. The packing order is the elected list's order, which is ascending,
+    so unpacking needs no key beyond the same list.
+    """
+
+    var grad: List[Float64]
+    var hess: List[Float64]
+    var count: List[Int]
+    var n_selected: Int
+    var n_bins: Int
+
+    def __init__(out self, n_selected: Int, n_bins: Int) raises:
+        if n_selected < 0 or n_bins < 1:
+            raise Error("a packed histogram needs at least one bin")
+        var cells = n_selected * n_bins
+        self.grad = zeros_f64(cells)
+        self.hess = zeros_f64(cells)
+        self.count = zeros_int(cells)
+        self.n_selected = n_selected
+        self.n_bins = n_bins
+
+    def cells(self) -> Int:
+        return self.n_selected * self.n_bins
 
 
 def voting_payload_cells(n_selected: Int, n_bins: Int) raises -> Int:
@@ -1100,19 +1160,10 @@ def voting_payload_cells(n_selected: Int, n_bins: Int) raises -> Int:
 
 def pack_selected(
     hist: Histogram, selected: List[Int]
-) raises -> Tuple[List[Float64], List[Float64], List[Int]]:
-    """The elected features' cells, packed contiguously in the order given.
-
-    Packed rather than reduced in place because a reduction over the full
-    histogram buffer would move exactly the bytes this mode exists to avoid
-    moving. The packing order is the elected list's order, which is ascending,
-    so `unpack_selected` needs no key.
-    """
+) raises -> PackedHistogram:
+    """Copy the elected features' cells out of a local histogram."""
+    var packed = PackedHistogram(len(selected), hist.n_bins)
     var n_bins = hist.n_bins
-    var cells = len(selected) * n_bins
-    var grad = zeros_f64(cells)
-    var hess = zeros_f64(cells)
-    var count = zeros_int(cells)
     var previous = -1
     for i in range(len(selected)):
         var f = selected[i]
@@ -1124,37 +1175,32 @@ def pack_selected(
         var src = f * n_bins
         var dst = i * n_bins
         for b in range(n_bins):
-            grad[dst + b] = hist.grad[src + b]
-            hess[dst + b] = hist.hess[src + b]
-            count[dst + b] = hist.count[src + b]
-    return (grad^, hess^, count^)
+            packed.grad[dst + b] = hist.grad[src + b]
+            packed.hess[dst + b] = hist.hess[src + b]
+            packed.count[dst + b] = hist.count[src + b]
+    return packed^
 
 
 def unpack_selected(
-    mut hist: Histogram,
-    selected: List[Int],
-    grad: List[Float64],
-    hess: List[Float64],
-    count: List[Int],
+    mut hist: Histogram, selected: List[Int], packed: PackedHistogram
 ) raises:
     """Write reduced cells back, leaving every unelected feature at zero.
 
     Zero and not stale: `find_best_split` reads an unelected feature's slice
     only if it is asked to scan it, and a caller that passes the elected list
-    as `features` never asks. Leaving the rest zeroed rather than untouched
-    means a caller that forgets sees a feature with no rows in it instead of
-    another node's statistics.
+    as `features` never asks. Zeroing the rest rather than leaving it means a
+    caller that forgets sees a feature with no rows in it instead of another
+    node's statistics.
     """
-    var n_bins = hist.n_bins
-    var cells = len(selected) * n_bins
-    if len(grad) != cells or len(hess) != cells or len(count) != cells:
+    if packed.n_selected != len(selected) or packed.n_bins != hist.n_bins:
         raise Error(
-            "the packed buffers do not match the selected feature count"
+            "the packed histogram does not match the selected feature list"
         )
     for i in range(len(hist.grad)):
         hist.grad[i] = 0.0
         hist.hess[i] = 0.0
         hist.count[i] = 0
+    var n_bins = hist.n_bins
     for i in range(len(selected)):
         var f = selected[i]
         if f < 0 or f >= hist.n_features:
@@ -1162,33 +1208,99 @@ def unpack_selected(
         var dst = f * n_bins
         var src = i * n_bins
         for b in range(n_bins):
-            hist.grad[dst + b] = grad[src + b]
-            hist.hess[dst + b] = hess[src + b]
-            hist.count[dst + b] = count[src + b]
+            hist.grad[dst + b] = packed.grad[src + b]
+            hist.hess[dst + b] = packed.hess[src + b]
+            hist.count[dst + b] = packed.count[src + b]
 
 
 def allreduce_selected[
     C: Collective
-](
-    mut comm: C,
-    mut grad: List[Float64],
-    mut hess: List[Float64],
-    mut count: List[Int],
-) raises:
+](mut comm: C, mut packed: PackedHistogram) raises:
     """Reduce one voting-parallel node's packed histogram.
 
     Three reductions, matching `allreduce_histogram` in distributed.mojo
     exactly so the two modes have one communication shape between them, and
     for the same reason: counts stay integers and their exactness stays
-    obvious. Packing all three into one buffer is the same optimization
-    section 8 of docs/distributed.md describes for data parallel, and it is
-    the same decision to defer it until round trips exist and cost something.
+    obvious. Packing all three into one buffer is the optimization section 8
+    of docs/distributed.md describes for data parallel, and it is deferred
+    here for the same reason it is deferred there.
     """
-    if len(grad) != len(hess) or len(grad) != len(count):
-        raise Error("the three packed buffers must describe the same cells")
-    comm.allreduce_sum_f64(grad)
-    comm.allreduce_sum_f64(hess)
-    comm.allreduce_sum_int(count)
+    comm.allreduce_sum_f64(packed.grad)
+    comm.allreduce_sum_f64(packed.hess)
+    comm.allreduce_sum_int(packed.count)
+
+
+# ---------------------------------------------------------------------------
+# Cost model
+# ---------------------------------------------------------------------------
+
+
+@fieldwise_init
+struct StrategyCostPlan(Copyable, Movable):
+    """What one tree node costs on the wire under one mode.
+
+    Computed rather than asserted, so a test can pin the comparison between
+    modes against these functions instead of against a comment, exactly as
+    `histogram_plan` in distributed_transport.mojo does for data parallel.
+    The byte counts are payload only: framing is the transport's, and
+    `HistogramPlan.framing_bytes_per_node` is where it is accounted.
+    """
+
+    var strategy: Int
+    var world_size: Int
+    var reduces_per_node: Int
+    var f64_elements_per_node: Int
+    var int_elements_per_node: Int
+    var payload_bytes_per_node: Int
+
+
+def strategy_cost_plan(
+    strategy: Int,
+    world_size: Int,
+    n_features: Int,
+    n_bins: Int,
+    n_selected: Int = 0,
+) raises -> StrategyCostPlan:
+    """The per-node communication of one mode.
+
+    Data parallel is three reductions of `n_features * n_bins`, which is what
+    `histogram_plan` already counts and is repeated here only so the modes can
+    be compared in one place. Feature parallel is one reduction of
+    `world_size * CANDIDATE_WORDS` integers, independent of the bin count and
+    of the feature count. Voting parallel is data parallel over the elected
+    features, plus the one `n_features` vote reduction that elected them.
+
+    `n_selected` is read only for voting parallel, where 0 means the
+    `DEFAULT_TOP_K` LightGBM default.
+    """
+    if world_size < 1:
+        raise Error("world_size must be positive")
+    if n_features < 1 or n_bins < 1:
+        raise Error("a cost plan needs at least one feature and one bin")
+    if strategy == STRATEGY_DATA_PARALLEL:
+        var cells = n_features * n_bins
+        return StrategyCostPlan(
+            strategy, world_size, 3, 2 * cells, cells, 3 * cells * 8
+        )
+    if strategy == STRATEGY_FEATURE_PARALLEL:
+        var words = world_size * CANDIDATE_WORDS
+        return StrategyCostPlan(strategy, world_size, 1, 0, words, words * 8)
+    if strategy == STRATEGY_VOTING_PARALLEL:
+        var selected = n_selected if n_selected > 0 else DEFAULT_TOP_K
+        if selected > n_features:
+            selected = n_features
+        var cells = selected * n_bins
+        return StrategyCostPlan(
+            strategy,
+            world_size,
+            4,
+            2 * cells,
+            cells + n_features,
+            3 * cells * 8 + n_features * 8,
+        )
+    if strategy == STRATEGY_SERIAL:
+        return StrategyCostPlan(strategy, world_size, 0, 0, 0, 0)
+    raise Error(String("unknown parallel strategy code ", strategy))
 
 
 # ---------------------------------------------------------------------------
@@ -1203,12 +1315,12 @@ def agree_strategy[
 ) raises:
     """Refuse a world whose ranks were configured differently.
 
-    One collective, over the four integers that decide what every rank is
-    about to do. A rank started with a different strategy, a different feature
-    count, or a different `top_k` would search a different set and vote a
-    different number of times, and the resulting model would be neither of the
-    two configurations. The digest halves ride along so a future field added
-    to the partition is covered without another reduction.
+    One collective, over the values that decide what every rank is about to
+    do. A rank started with a different strategy, a different feature count,
+    or a different `top_k` would search a different set and vote a different
+    number of times, and the resulting model would be neither of the two
+    configurations. The partition digest rides along so a field added to the
+    partition later is covered without another reduction.
     """
     var digest = partition.digest()
     var values: List[Int] = [
@@ -1216,8 +1328,8 @@ def agree_strategy[
         partition.n_features,
         partition.world_size,
         top_k,
-        Int(digest % UInt64(_HALF)),
-        Int(digest // UInt64(_HALF)),
+        Int(digest % 0x1_0000_0000),
+        Int(digest // 0x1_0000_0000),
     ]
     var names: List[String] = [
         "the parallel strategy",
@@ -1243,8 +1355,8 @@ def strategy_statuses[
 
     Recorded rather than raised, so `agree_status` can turn them into one
     error every rank raises together. This is the shape every validation in
-    distributed.mojo takes, and it is the reason a bad configuration stops the
-    world instead of hanging it.
+    distributed.mojo takes, and it is why a bad configuration stops the world
+    instead of hanging it.
     """
     var n_local = comm.n_local_ranks()
     var statuses = zeros_int(n_local)

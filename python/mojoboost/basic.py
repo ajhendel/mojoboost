@@ -669,9 +669,9 @@ class Booster:
 
     or let `train()` do that for you. `Booster(model_file=...)` and
     `Booster(model_str=...)` read a model back; what a model file holds is
-    the ensemble and its binning, not the parameters, the feature names, or
-    the split gains, so a booster read back reports what it has and says so
-    where it cannot.
+    the ensemble, its binning, its split gains, and its feature names, but
+    not the training parameters, so a booster read back reports what it has
+    and says so where it cannot.
     """
 
     def __init__(
@@ -1019,8 +1019,12 @@ class Booster:
         """Per-feature importance: `split` counts the nodes that split on
         each feature and `gain` sums the gain those splits earned.
 
-        Gains are not part of the serialized model, so a Booster read back
-        from a file or a pickle reports zero gain importance.
+        Gains travel with the model from format v4 on, so a Booster read
+        back from a file or a pickle reports the gain importance it was
+        trained with. One read from a v1, v2, or v3 file reports zeros:
+        those formats dropped gains, and a fitted tree cannot recompute
+        them. `dump_model()["has_split_gain"]` tells that apart from a
+        measured zero.
         """
         if importance_type not in _IMPORTANCE_TYPES:
             raise ValueError(
@@ -1066,8 +1070,8 @@ class Booster:
 
         LightGBM's `Booster.dump_model()`. `feature_names` overrides the
         names the model carries, which is how a model read back from a file
-        (those carry none) gets named. Every key is in
-        `docs/MODEL_INSPECTION_SCHEMA.md`; the two to branch on are
+        written before format v4 (those carry none) gets named. Every key
+        is in `docs/MODEL_INSPECTION_SCHEMA.md`; the two to branch on are
         `has_split_gain` and `has_node_count`.
         """
         from . import inspection
@@ -1111,11 +1115,21 @@ class Booster:
 
     def save_model(self, filename):
         """Write the model to `filename` in mojoboost's versioned text
-        format. The format is mojoboost's own and is not LightGBM's."""
+        format. The format is mojoboost's own and is not LightGBM's.
+
+        The feature names travel with the model when it has any: a model
+        file carries them from format v4 on, so one read back reports the
+        names it was trained with rather than `Column_0`, `Column_1`, ...
+        A model that never had names writes none, and its file is what it
+        always was.
+        """
+        names = [] if self._names is None else [str(n) for n in self._names]
         if self._n_classes:
-            _mojoboost.save_multiclass(self._handle, str(filename))
+            _mojoboost.save_multiclass(
+                self._handle, str(filename), names, len(names)
+            )
         else:
-            _mojoboost.save(self._handle, str(filename))
+            _mojoboost.save(self._handle, str(filename), names, len(names))
         return self
 
     def model_to_string(self):
@@ -1143,7 +1157,15 @@ class Booster:
 
     def _load_path(self, path):
         """Read a model file, single-output or multiclass. The format
-        distinguishes the two, so which one it is comes from the file."""
+        distinguishes the two, so which one it is comes from the file.
+
+        Feature names come back too when the file carries them (v4 and
+        later). A file without them leaves whatever names the caller
+        already had alone, which is what keeps an older pickle's names: it
+        stores them beside the model text, and an older text cannot carry
+        them. With neither, `_names` stays None and `feature_name()`
+        reports `Column_i`, because the model names nothing.
+        """
         try:
             self._handle = _mojoboost.load(path)
             self._n_classes = 0
@@ -1151,6 +1173,9 @@ class Booster:
             self._handle = _mojoboost.load_multiclass(path)
             self._n_classes = int(_mojoboost.n_classes(self._handle))
             self._task = _eval.MULTICLASS
+        names = list(_mojoboost.model_feature_names(path))
+        if names:
+            self._names = [str(name) for name in names]
 
     @classmethod
     def _from_estimator(cls, handle, estimator):
@@ -1189,10 +1214,10 @@ class Booster:
     # -- pickling --------------------------------------------------------
 
     def __getstate__(self):
-        """The model travels as the text `model_to_string` writes; the
-        training set, the parameter object, and the split gains do not
-        pickle with it (a Mojo handle is not picklable, and gains are not
-        part of the format)."""
+        """The model travels as the text `model_to_string` writes, split
+        gains and feature names included (model format v4 carries both).
+        The training set and the parameter object do not pickle with it: a
+        Mojo handle is not picklable."""
         return {
             "model_str": None if self._handle is None
             else self.model_to_string(),
@@ -1312,8 +1337,8 @@ def _continue(config, train_set, init_model):
     """Continue training from an existing booster, leaving it untouched.
 
     The model is copied first, so the trees `init_model` holds are still
-    its own afterwards, and the copy keeps the split gains a save/load
-    round trip would drop.
+    its own afterwards. A copy is the handle itself and keeps everything,
+    which is now also true of a save/load round trip through format v4.
     """
     if not isinstance(init_model, Booster):
         raise TypeError(

@@ -310,7 +310,25 @@ import os as _os
 import tempfile as _tempfile
 import warnings as _warnings
 
-from . import _arrays, _eval, _mojoboost, callback as _callback
+# The interpreter check runs before the extension is named, not around it.
+# On an interpreter older than `_compat.EXTENSION_FLOOR` the Mojo runtime
+# resolves CPython entry points out of libpython at load time and ends the
+# process on the first one it cannot find:
+#
+#     ABORT: ... symbol not found: Py_NewRef
+#
+# An abort is not an exception, so a `try` around the import below would
+# never run its handler. `_compat.import_extension` raises ImportError first
+# and only then touches the extension; see _compat.py and section 10 of
+# docs/PYTHON_SUPPORT.md for the measurement. Binding the result here is what
+# makes `from . import _mojoboost` elsewhere in the package cheap and safe:
+# by the time any submodule runs, this has already either bound the module in
+# `sys.modules` or raised.
+from . import _compat
+
+_mojoboost = _compat.import_extension()
+
+from . import _arrays, _eval, callback as _callback
 from ._sklearn import NotFittedError, ParamsMixin as _ParamsMixin
 from ._sklearn import estimator_tags as _estimator_tags
 

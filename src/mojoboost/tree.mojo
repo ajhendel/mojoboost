@@ -867,6 +867,18 @@ def grow_tree(
     are both in hand. An inactive bundle, which is the default, leaves every
     decision below exactly as it was.
 
+    `params.extra.forced` is LightGBM's `forcedsplits_filename`, parsed and
+    mapped to bins (see `binning.map_forced_splits`). Its nodes are applied
+    before any gain-chosen split, in forced-node order, through the same loop
+    body: the frontier leaf that owes a forced node is split on that node's
+    feature and threshold instead of on its own best candidate, its children
+    inherit that node's children, and once the forced tree is exhausted
+    leaf-wise growth resumes from the frontier it left behind. A forced node
+    records a gain of 0.0, because none was chosen, and routes missing rows
+    right, because the document does not say. `ExtraTreeParams.check` has
+    already confirmed the forced tree fits inside `num_leaves` and
+    `max_depth`, so the loop cannot run out of budget half way through it.
+
     `bundling` is an exclusive-feature-bundling plan and its matrix (efb.mojo),
     or `BundledMatrix.none()`, which is the default and the fallback. When it
     is active this grower reads **two** matrices and keeps them strictly
@@ -1020,24 +1032,68 @@ def grow_tree(
     var frontier = List[_LeafState]()
     frontier.append(
         _LeafState(
-            root, root_rows^, root_hist^, root_split^, root_branch^, depth=0
+            root,
+            root_rows^,
+            root_hist^,
+            root_split^,
+            root_branch^,
+            depth=0,
+            forced=0 if not params.extra.forced.is_empty() else -1,
         )
     )
     var n_leaves = 1
 
     while n_leaves < params.num_leaves:
-        # Pick the leaf with the best gain anywhere in the tree.
+        # Forced splits go first, in forced-node order. A parent always
+        # precedes its children in the forced tree, so ascending order is a
+        # valid application order, and `check_budget` has already guaranteed
+        # the whole forced tree fits inside num_leaves and max_depth, so this
+        # loop cannot run out of budget part way through it.
         var best_i = -1
-        var best_gain = 0.0
+        var forced_node = -1
         for i in range(len(frontier)):
-            if frontier[i].split.found and frontier[i].split.gain > best_gain:
-                best_gain = frontier[i].split.gain
+            if frontier[i].forced >= 0 and (
+                forced_node < 0 or frontier[i].forced < forced_node
+            ):
+                forced_node = frontier[i].forced
                 best_i = i
         if best_i < 0:
-            break
+            # Nothing forced: pick the leaf with the best gain anywhere in the
+            # tree, which is leaf-wise growth exactly as it was.
+            var best_gain = 0.0
+            for i in range(len(frontier)):
+                if (
+                    frontier[i].split.found
+                    and frontier[i].split.gain > best_gain
+                ):
+                    best_gain = frontier[i].split.gain
+                    best_i = i
+            if best_i < 0:
+                break
 
         var parent_node = frontier[best_i].node
-        var split = frontier[best_i].split.copy()
+        var split: SplitInfo
+        var left_forced = -1
+        var right_forced = -1
+        if forced_node >= 0:
+            # A forced node's split is the caller's, not the histogram's: it
+            # is applied whatever its gain, so it carries a gain of 0.0 (there
+            # is no chosen-by-gain value to record, and `gain_importance` will
+            # read it as the zero contribution it is). Missing rows go right,
+            # because the forced-split document says nothing about them and no
+            # scan chose a direction.
+            var fn = params.extra.forced.nodes[forced_node]
+            split = SplitInfo(
+                fn.feature,
+                params.extra.forced.bin_at(forced_node),
+                0.0,
+                True,
+                False,
+            )
+            left_forced = fn.left
+            right_forced = fn.right
+        else:
+            split = frontier[best_i].split.copy()
 
         # Partition the parent's rows by the chosen split. A categorical
         # split routes by set membership; otherwise rows in the feature's
@@ -1060,6 +1116,24 @@ def grow_tree(
             split,
             split_missing_bin,
         )
+        if forced_node >= 0 and (
+            len(left_rows) == 0 or len(right_rows) == 0
+        ):
+            # A gain-chosen split cannot do this: `min_data_in_leaf` and
+            # `min_child_hess` reject an empty side before it is ever
+            # selected. A forced one can, because it is applied whatever the
+            # data does, and an empty child would give a leaf with no rows to
+            # value. Naming it is the only honest answer.
+            raise Error(
+                "forced split node ",
+                forced_node,
+                " on feature ",
+                split.feature,
+                " at bin ",
+                split.bin,
+                " leaves one child empty; the threshold falls outside the"
+                " values this node's rows take",
+            )
 
         # The parent's histogram is read once more, by the subtraction below,
         # and is dead after that; moving it out here is what lets its buffer
@@ -1204,6 +1278,7 @@ def grow_tree(
             branch.copy(),
             depth=child_depth,
             bounds=children.left.copy(),
+            forced=left_forced,
         )
         frontier.append(
             _LeafState(
@@ -1214,6 +1289,7 @@ def grow_tree(
                 branch^,
                 depth=child_depth,
                 bounds=children.right.copy(),
+                forced=right_forced,
             )
         )
         n_leaves += 1

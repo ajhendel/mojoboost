@@ -1,4 +1,4 @@
-"""Model serialization.
+"""Model and prepared-table serialization.
 
 Saves and loads fitted models (`Model` and `MulticlassModel`) as a
 plain-text token stream. Floats are stored as their raw IEEE-754 bit
@@ -6,6 +6,23 @@ patterns (decimal UInt64), so save/load round-trips are bit-exact and
 the format has no locale or precision pitfalls. The format is
 versioned; the token after the version distinguishes single-output
 files ("objective") from multiclass files ("multiclass").
+
+Prepared tables
+---------------
+`save_dataset` and `load_dataset` write and read a binned
+`trainset.Dataset`: the binning, the matrix it produced, and the columns
+that describe its rows. That is a **different kind of file** from a model,
+with its own magic (`mojoboost-dataset`) and its own version (`d1`), so
+neither loader can be handed the other's file and get partway through it;
+`file_kind` names all three kinds and `model_file_kind` refuses the third
+with the reason. They live here rather than in `trainset.mojo` because the
+mapper codec lives here, and a bin edge written two ways is a bin edge that
+can disagree with itself: a prepared table carries the model format's mapper
+section verbatim, and records which revision of it the file holds.
+
+What a prepared table does not carry is trees, so loading one cannot produce
+something predictable, and the raw matrix, so a loaded table cannot be
+`subset`. See the section at the end of this module.
 
 Version history
 ---------------
@@ -73,15 +90,25 @@ nothing downstream can rederive.
 
 from std.memory import bitcast
 
-from .binning import BinMapper, no_missing_bins
+from .binning import BinMapper, BinnedMatrix, no_missing_bins
 from .categorical import CAT_BITSET_WORDS, CategoricalSpec
 from .boosting import Booster, MulticlassBooster
 from .monotone import MonotoneConstraints
 from .model import Model, MulticlassModel
+from .sparse import SparseBinnedMatrix
+from .trainset import Dataset
 from .tree import Tree
 
 comptime _MAGIC = "mojoboost"
 comptime _VERSION = "v4"
+
+# Prepared tables are a different kind of file and say so in their first
+# token, so no loader can be handed one and start reading it as a model.
+# The header then carries the *model* format version, because a prepared
+# table reuses the mapper section verbatim and has to record which revision
+# of it the file holds.
+comptime _DATASET_MAGIC = "mojoboost-dataset"
+comptime _DATASET_VERSION = "d1"
 
 # The version this build writes, as the integer `_read_version` returns.
 # `MODEL_FORMAT_VERSION` in model_dump.mojo reports this number to a dump
@@ -772,10 +799,35 @@ def model_file_kind(path: String) raises -> String:
     Reads only the file header, so a caller holding a path but not the
     training history can dispatch between `load_model` and
     `load_multiclass_model`. Raises the same errors those two do for a file
-    that is not a mojoboost model.
+    that is not a mojoboost model, and names the case where it is a
+    mojoboost file of the other kind: a prepared table is not a model, and
+    "not a mojoboost model file" would be a misleading way to say so.
     """
     var content = open(path, "r").read()
     var r = _TokenReader(content)
+    if r.peek() == _DATASET_MAGIC:
+        raise Error(
+            "this is a prepared dataset file, not a model; read it with"
+            " load_dataset"
+        )
+    _ = _read_version(r)
+    _ = _read_feature_names(r)
+    return _read_kind(r)
+
+
+def file_kind(path: String) raises -> String:
+    """What a mojoboost file holds: "objective", "multiclass", or
+    "dataset".
+
+    `model_file_kind` answers the first two and refuses the third, which is
+    what a caller dispatching between the two model loaders wants. This one
+    answers all three, for a caller that does not yet know which kind of
+    thing it was handed. Reads only the header either way.
+    """
+    var content = open(path, "r").read()
+    var r = _TokenReader(content)
+    if r.peek() == _DATASET_MAGIC:
+        return String("dataset")
     _ = _read_version(r)
     _ = _read_feature_names(r)
     return _read_kind(r)
@@ -865,3 +917,306 @@ def load_multiclass_model(path: String) raises -> MulticlassModel:
         trees^, base_scores^, n_classes, learning_rate, monotone^
     )
     return MulticlassModel(mapper^, booster^)
+
+
+# -- prepared tables -----------------------------------------------------
+#
+# A prepared table is a `Dataset`: a fitted binning, the matrix it produced,
+# and the columns that describe its rows. Binning is the expensive part of
+# starting a run, so writing one out is what lets a second process, a second
+# machine, or tomorrow's run skip it.
+#
+# It is deliberately not a model file and shares no loader with one. A model
+# carries trees and predicts; a prepared table carries data and cannot. The
+# first token differs, so neither loader can be fed the other's file and get
+# partway through it. What the two do share is the mapper section, byte for
+# byte and codec for codec, because a bin edge written two ways is a bin
+# edge that can disagree with itself.
+#
+# What a prepared table does not carry is the raw matrix. A table read back
+# therefore cannot be `subset`, since bins cannot be refitted from bins, and
+# `Dataset.has_raw()` says so rather than the caller finding out from a
+# failed subset. `borrowed_binning` travels with the file because it is the
+# leakage-relevant fact about the edges: whether they were fitted on these
+# rows or inherited from a reference.
+#
+# The format is the module's text token stream, so a dense table costs one
+# decimal token per cell. That is large, and it is the same trade the model
+# format already makes: exact round trips and no locale or precision
+# pitfalls, at the price of size.
+
+
+def _write_u8_list(mut out: String, values: List[UInt8]):
+    for i in range(len(values)):
+        out += String(Int(values[i])) + " "
+    out += "\n"
+
+
+def _write_int_list(mut out: String, values: List[Int]):
+    for i in range(len(values)):
+        out += String(values[i]) + " "
+    out += "\n"
+
+
+def _read_u8_list(mut r: _TokenReader, n: Int) raises -> List[UInt8]:
+    var out = List[UInt8](capacity=n)
+    for _ in range(n):
+        var v = r.next_int()
+        if v < 0 or v > 255:
+            raise Error("corrupt prepared dataset: bin value out of range")
+        out.append(UInt8(v))
+    return out^
+
+
+def _read_int_list(mut r: _TokenReader, n: Int) raises -> List[Int]:
+    var out = List[Int](capacity=n)
+    for _ in range(n):
+        out.append(r.next_int())
+    return out^
+
+
+def _write_f64_column(mut out: String, name: String, values: List[Float64]):
+    """One of a dataset's optional per-row columns. A column the dataset
+    does not have is written with a length of zero rather than skipped, so
+    the reader never has to guess which of the three is missing."""
+    out += "column " + name + " " + String(len(values)) + "\n"
+    for i in range(len(values)):
+        out += _f64_to_token(values[i]) + " "
+    out += "\n"
+
+
+def _read_f64_column(
+    mut r: _TokenReader, name: String
+) raises -> List[Float64]:
+    if r.next() != "column":
+        raise Error("expected 'column'")
+    var got = r.next()
+    if got != name:
+        raise Error(
+            "corrupt prepared dataset: expected the ",
+            name,
+            " column, found ",
+            got,
+        )
+    var n = r.next_int()
+    if n < 0:
+        raise Error("corrupt prepared dataset: negative column length")
+    var out = List[Float64](capacity=n)
+    for _ in range(n):
+        out.append(r.next_f64())
+    return out^
+
+
+def save_dataset(dataset: Dataset, path: String) raises:
+    """Write a binned `Dataset` to `path` as a prepared table.
+
+    Everything needed to train on the data again without seeing it again:
+    the fitted mapper (the same section a model file carries, categorical
+    tables and missing-bin reservations included), the binned matrix in
+    whichever representation the dataset holds, the binning parameters, the
+    feature names, the categorical declaration, and the label, weight,
+    init-score, and group columns.
+
+    The raw matrix is not written. A table read back is a binning, not the
+    values it was fitted from, so `Dataset.has_raw()` is false on it and
+    `subset` raises. Use `Dataset.subset` before saving, not after loading.
+    """
+    var out = String("")
+    out += _DATASET_MAGIC + " " + _DATASET_VERSION + " "
+    out += String(CURRENT_FORMAT_VERSION) + "\n"
+    out += "dataset "
+    out += String(dataset.n_rows) + " "
+    out += String(dataset.n_features) + " "
+    out += String(dataset.max_bin) + " "
+    out += String(1 if dataset.use_missing else 0) + " "
+    out += String(1 if dataset.is_sparse else 0) + " "
+    out += String(1 if dataset.borrowed_binning else 0) + "\n"
+
+    _write_feature_names(out, dataset.feature_names)
+    out += "categorical_features "
+    out += String(len(dataset.categorical_features)) + "\n"
+    _write_int_list(out, dataset.categorical_features)
+
+    _write_mapper(out, dataset.mapper)
+    _write_categorical(out, dataset.mapper.cats)
+
+    if dataset.is_sparse:
+        out += "sparse "
+        out += String(dataset.sparse_data.nnz()) + " "
+        out += String(dataset.sparse_data.n_bins) + "\n"
+        _write_int_list(out, dataset.sparse_data.row_index)
+        _write_u8_list(out, dataset.sparse_data.bin)
+        _write_int_list(out, dataset.sparse_data.col_offsets)
+        _write_u8_list(out, dataset.sparse_data.default_bin)
+        _write_int_list(out, dataset.sparse_data.missing_bin)
+    else:
+        out += "bins "
+        out += String(len(dataset.data.bins)) + " "
+        out += String(dataset.data.n_bins) + "\n"
+        _write_u8_list(out, dataset.data.bins)
+        _write_int_list(out, dataset.data.missing_bin)
+
+    _write_f64_column(out, "label", dataset.label)
+    _write_f64_column(out, "weight", dataset.weight)
+    _write_f64_column(out, "init_score", dataset.init_score)
+    out += "group " + String(len(dataset.group)) + "\n"
+    _write_int_list(out, dataset.group)
+
+    with open(path, "w") as f:
+        f.write(out)
+
+
+def load_dataset(path: String) raises -> Dataset:
+    """Read a prepared table written by `save_dataset`.
+
+    The mapper and the matrix are checked against each other by
+    `Dataset.from_binned_dense` / `from_binned_sparse`, and every column is
+    checked against the row count, so a truncated or edited file is refused
+    here rather than producing bin indices that mean nothing.
+
+    A model file is refused with the reason, not with "not a mojoboost
+    dataset file": it is a mojoboost file, of the other kind.
+    """
+    var content = open(path, "r").read()
+    var r = _TokenReader(content)
+    var magic = r.next()
+    if magic == _MAGIC:
+        raise Error(
+            "this is a model file, not a prepared dataset; read it with"
+            " load_model or load_multiclass_model"
+        )
+    if magic != _DATASET_MAGIC:
+        raise Error("not a mojoboost prepared dataset file")
+    if r.next() != _DATASET_VERSION:
+        raise Error("unsupported prepared dataset format version")
+    # The mapper section's revision, which is a model-format version because
+    # the section is the model format's.
+    var mapper_version = r.next_int()
+    if mapper_version < 2 or mapper_version > CURRENT_FORMAT_VERSION:
+        raise Error(
+            "prepared dataset carries a mapper section this build cannot"
+            " read"
+        )
+
+    if r.next() != "dataset":
+        raise Error("expected 'dataset'")
+    var n_rows = r.next_int()
+    var n_features = r.next_int()
+    var max_bin = r.next_int()
+    var use_missing = r.next_int() != 0
+    var is_sparse = r.next_int() != 0
+    var borrowed_binning = r.next_int() != 0
+    if n_rows < 1 or n_features < 1:
+        raise Error("corrupt prepared dataset: nonpositive shape")
+
+    var names = _read_feature_names(r)
+    if r.next() != "categorical_features":
+        raise Error("expected 'categorical_features'")
+    var n_categorical = r.next_int()
+    if n_categorical < 0 or n_categorical > n_features:
+        raise Error("corrupt prepared dataset: categorical count out of range")
+    var categorical = _read_int_list(r, n_categorical)
+
+    var mapper = _read_mapper(r, mapper_version)
+    _check_feature_names(names, mapper.n_features)
+    if mapper.n_features != n_features:
+        raise Error(
+            "corrupt prepared dataset: the mapper and the header disagree on"
+            " the feature count"
+        )
+
+    var data = BinnedMatrix(List[UInt8](), 0, n_features, 0)
+    var sparse_data = SparseBinnedMatrix(
+        List[Int](), List[UInt8](), List[Int](), List[UInt8](), 0, 0, 0
+    )
+    if is_sparse:
+        if r.next() != "sparse":
+            raise Error("expected 'sparse'")
+        var nnz = r.next_int()
+        var n_bins = r.next_int()
+        if nnz < 0:
+            raise Error("corrupt prepared dataset: negative entry count")
+        if n_bins != mapper.n_bins:
+            raise Error(
+                "corrupt prepared dataset: the matrix and the mapper"
+                " disagree on n_bins"
+            )
+        var row_index = _read_int_list(r, nnz)
+        var bin = _read_u8_list(r, nnz)
+        var col_offsets = _read_int_list(r, n_features + 1)
+        var default_bin = _read_u8_list(r, n_features)
+        var missing_bin = _read_int_list(r, n_features)
+        sparse_data = SparseBinnedMatrix(
+            row_index^,
+            bin^,
+            col_offsets^,
+            default_bin^,
+            n_rows,
+            n_features,
+            n_bins,
+            mapper.cats.copy(),
+            missing_bin^,
+        )
+    else:
+        if r.next() != "bins":
+            raise Error("expected 'bins'")
+        var n_cells = r.next_int()
+        var n_bins = r.next_int()
+        if n_cells != n_rows * n_features:
+            raise Error(
+                "corrupt prepared dataset: the matrix does not have one bin"
+                " per cell"
+            )
+        if n_bins != mapper.n_bins:
+            raise Error(
+                "corrupt prepared dataset: the matrix and the mapper"
+                " disagree on n_bins"
+            )
+        var bins = _read_u8_list(r, n_cells)
+        var missing_bin = _read_int_list(r, n_features)
+        data = BinnedMatrix(
+            bins^,
+            n_rows,
+            n_features,
+            n_bins,
+            mapper.cats.copy(),
+            missing_bin^,
+        )
+
+    var label = _read_f64_column(r, "label")
+    var weight = _read_f64_column(r, "weight")
+    var init_score = _read_f64_column(r, "init_score")
+    if r.next() != "group":
+        raise Error("expected 'group'")
+    var n_queries = r.next_int()
+    if n_queries < 0:
+        raise Error("corrupt prepared dataset: negative query count")
+    var group = _read_int_list(r, n_queries)
+
+    if is_sparse:
+        return Dataset.from_binned_sparse(
+            mapper^,
+            sparse_data^,
+            label^,
+            weight^,
+            group^,
+            init_score^,
+            names^,
+            categorical^,
+            max_bin,
+            use_missing,
+            borrowed_binning,
+        )
+    return Dataset.from_binned_dense(
+        mapper^,
+        data^,
+        label^,
+        weight^,
+        group^,
+        init_score^,
+        names^,
+        categorical^,
+        max_bin,
+        use_missing,
+        borrowed_binning,
+    )

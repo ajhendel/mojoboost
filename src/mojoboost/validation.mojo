@@ -499,15 +499,17 @@ def check_gradient_pair(
 ) raises -> Float64:
     """A custom objective's gradients and hessians, and the total hessian.
 
-    One of each per row, every value finite, every hessian nonnegative, and
-    a positive hessian total. The sign rule is not stylistic: a leaf value is
-    `-G / (H + lambda)`, so a negative hessian can drive the denominator
-    through zero and produce a leaf of arbitrary magnitude from a well-behaved
-    gradient. A zero total means every row is flat, which the same division
-    cannot survive either.
+    One of each per row, every value finite, every hessian nonnegative. The
+    sign rule is not stylistic: a leaf value is `-G / (H + lambda)`, so a
+    negative hessian can drive the denominator through zero and produce a
+    leaf of arbitrary magnitude from a well-behaved gradient.
 
-    Returned so the caller does not accumulate it a second time in a
-    different order.
+    A zero *total* is allowed here and is not an error. A converged custom
+    objective can legitimately return all-zero curvature for a round, and the
+    right answer to that is a root-only tree, not a raise. The total is
+    returned rather than judged, so a caller that does need it positive says
+    so with `check_positive_hessian_total`, and the sum is still accumulated
+    only once and in one order.
     """
     check_required_length(len(grad), n_rows, "gradients")
     check_required_length(len(hess), n_rows, "hessians")
@@ -529,13 +531,24 @@ def check_gradient_pair(
                 " zero",
             )
         total += h
+    return total
+
+
+def check_positive_hessian_total(total: Float64, where: String) raises:
+    """The opt-in half of `check_gradient_pair`, for a caller whose next step
+    divides by the total rather than by a per-node sum."""
+    if not isfinite(total):
+        raise Error(
+            "hessian total at ", where, " must be finite, got ", total
+        )
     if total <= 0.0:
         raise Error(
-            "hessians must have a positive sum, got ",
+            "hessian total at ",
+            where,
+            " must be positive, got ",
             total,
             "; with a zero total no leaf value is defined",
         )
-    return total
 
 
 def check_positive_scalar(value: Float64, name: String) raises:
@@ -1723,3 +1736,172 @@ def check_cleanup_balanced(
             acquired,
             " acquisitions were never released",
         )
+
+
+# ---------------------------------------------------------------------------
+# Composite entry points
+# ---------------------------------------------------------------------------
+#
+# Each of these is the whole contract of one existing call site, in the order
+# that site checks it. They exist so that adopting this module is a one-line
+# edit rather than a rewrite: a caller replaces its block of `if ... raise`
+# with one call and keeps its own control flow around it. Nothing here adds a
+# rule; every one is a call to the narrow checks above, and a caller that
+# wants a different subset calls those directly.
+
+
+def check_dataset_columns(
+    n_rows: Int,
+    n_features: Int,
+    n_values: Int,
+    n_label: Int,
+    n_weight: Int,
+    n_group: Int,
+    n_init_score: Int,
+    n_feature_names: Int,
+) raises:
+    """The length half of a dataset's construction contract.
+
+    This is `trainset.Dataset.__init__`'s opening block, which validates
+    every optional column against the row count at construction rather than
+    at train time, so a mismatch is reported while the caller still knows
+    which array they passed. The group *contents* are checked separately, by
+    `check_group_counts`, because they need the counts themselves.
+    """
+    check_dense_matrix(n_values, n_rows, n_features)
+    check_column_length(n_label, n_rows, "label")
+    check_column_length(n_weight, n_rows, "weight")
+    check_column_length(n_init_score, n_rows, "init_score")
+    if n_feature_names != 0 and n_feature_names != n_features:
+        raise Error(
+            "feature_name must have one name per feature: got ",
+            n_feature_names,
+            " for ",
+            n_features,
+            " features",
+        )
+    if n_group != 0 and n_group > n_rows:
+        raise Error(
+            "group has ",
+            n_group,
+            " queries but the data has only ",
+            n_rows,
+            " rows, and every query needs at least one row",
+        )
+
+
+def check_training_inputs(
+    n_rows: Int,
+    n_features: Int,
+    label: List[Float64],
+    weight: List[Float64],
+    n_init_score: Int,
+) raises -> Float64:
+    """The contract every single-output trainer opens with, and the total
+    weight it produces.
+
+    Shape, one finite label per row, the sample-weight rules, and an init
+    score that is absent or one per row. The objective's own rules about
+    those labels (nonnegative for Poisson, positive for gamma, and the rest)
+    stay in `boosting._check_objective`, which runs after this and knows
+    which objective it is.
+    """
+    check_shape(n_rows, n_features)
+    check_labels_finite(label, n_rows)
+    check_column_length(n_init_score, n_rows, "init_score")
+    return check_weights(weight, n_rows)
+
+
+def check_multiclass_inputs(
+    n_rows: Int,
+    n_features: Int,
+    label: List[Float64],
+    weight: List[Float64],
+    n_classes: Int,
+) raises -> List[Int]:
+    """The multiclass counterpart, returning the class codes.
+
+    `check_classes_present` runs here rather than being left to the trainer
+    because the codes have just been built and the sweep is free at that
+    point; deferring it would mean a second pass over the labels.
+    """
+    check_shape(n_rows, n_features)
+    check_required_length(len(label), n_rows, "label")
+    _ = check_weights(weight, n_rows)
+    var codes = check_class_codes(label, n_classes)
+    check_classes_present(codes, n_classes)
+    return codes^
+
+
+def check_ranking_inputs(
+    n_rows: Int,
+    n_features: Int,
+    label: List[Float64],
+    weight: List[Float64],
+    group: List[Int],
+) raises -> List[Int]:
+    """The ranking counterpart, returning the graded relevances.
+
+    A ranking dataset without `group` is refused here rather than defaulted
+    to one query per row: LambdaRank computes its gradients within a query,
+    so treating every row as its own query produces zero lambdas everywhere
+    and a model that fits nothing.
+    """
+    check_shape(n_rows, n_features)
+    check_required_length(len(label), n_rows, "label")
+    _ = check_weights(weight, n_rows)
+    if len(group) == 0:
+        raise Error(
+            "a ranking dataset needs `group`: the number of rows in each"
+            " query, in row order"
+        )
+    _ = check_group_counts(group, n_rows)
+    return check_relevance_labels(label)
+
+
+def check_valid_set(
+    train_n_features: Int,
+    valid_n_features: Int,
+    valid_n_rows: Int,
+    n_valid_label: Int,
+) raises:
+    """A validation set is shaped like the training set it is scored against.
+
+    The feature count is the one that matters: a validation matrix with a
+    different width is binned by the training mapper into bins that mean
+    different features, and the resulting metric is a number with no meaning
+    rather than a bad score.
+    """
+    if valid_n_features != train_n_features:
+        raise Error(
+            "valid_data must have the same features as the training data:"
+            " got ",
+            valid_n_features,
+            " against ",
+            train_n_features,
+        )
+    if valid_n_rows < 1:
+        raise Error(
+            "a validation set needs at least one row, got ", valid_n_rows
+        )
+    check_required_length(n_valid_label, valid_n_rows, "valid_label")
+
+
+def check_loaded_tree(
+    feature: List[Int],
+    left: List[Int],
+    right: List[Int],
+    n_nodes: Int,
+    n_leaves: Int,
+    n_features: Int,
+    running_total: Int,
+) raises -> Int:
+    """One tree as it comes off disk, plus the ensemble's running node total.
+
+    Returns the updated total, so a loader threads one accumulator through
+    its tree loop and both ceilings are enforced by the same call.
+    """
+    check_tree_topology(feature, left, right, n_nodes, n_leaves, n_features)
+    var total = checked_add(running_total, n_nodes, "model node count")
+    check_model_nodes(total)
+    return total

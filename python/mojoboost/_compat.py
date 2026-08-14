@@ -25,6 +25,15 @@ That is measured, on CPython 3.9, and it is recorded in section 10 of
 import would never run its handler, and pending stdout is lost with it. The
 only place a check can do any good is in front.
 
+**Where it is called from.** `python/mojoboost/__init__.py` calls
+`import_extension()` and binds the result, ahead of every other import in
+the package. That is the only call site it needs and the only one it should
+have: importing any submodule of `mojoboost` runs the package's `__init__`
+first, so a check there runs before any other module can name the extension.
+The modules that later say `from . import _mojoboost` are reading a module
+that is already in `sys.modules` by then, which is why they do not repeat
+the check and must not start.
+
 `EXTENSION_FLOOR` is a measured property of the compiled artifact and is not
 the same fact as `requires-python` in `python/pyproject.toml`, which is what
 the project chooses to declare and may be higher. `docs/PYTHON_SUPPORT.md` is

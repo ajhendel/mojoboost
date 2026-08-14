@@ -303,6 +303,14 @@ this lane owns.
 
 Steps 1 through 4 change no public surface. Step 5 is the only one that does.
 
+A competing, smaller proposal exists: patch P5 of
+`handoffs/connect_17_alternate_boosting.md` threads a plain `List[Bool]`
+first-use ledger through the same three files and leaves the lazy penalty
+refused. It does not address the cached-candidate refund of section 5.1, the
+feature recovery of section 6, or the backend refusals of section 8. The two
+must not both be applied; section 10 of `handoffs/remaining_04_cegb.md`
+compares them line by line.
+
 ## 12. Reachability, precisely
 
 | Claim | True today? |

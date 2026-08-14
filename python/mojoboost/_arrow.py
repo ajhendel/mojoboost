@@ -260,8 +260,15 @@ def arrow_available():
 
 def _looks_like_type(obj):
     """True for an Arrow `DataType`, which every column exposes as `.type`
-    and which is the object this module classifies."""
-    return hasattr(obj, "id") and hasattr(obj, "num_fields")
+    and which is the object this module classifies.
+
+    `num_fields` is the current spelling of the child count and
+    `num_children` is the older one; accepting either is what keeps
+    recognition from turning into a pyarrow version check.
+    """
+    if not hasattr(obj, "id"):
+        return False
+    return hasattr(obj, "num_fields") or hasattr(obj, "num_children")
 
 
 def is_arrow_array(obj):
@@ -489,6 +496,14 @@ class _Unhashable:
 
     def __eq__(self, other):
         return False
+
+
+#: The lane-visible spelling of `_hashable`. `_sequence.unify_categories`
+#: unifies dictionaries across batches the way `_unify_dictionaries`
+#: unifies them across chunks, and both have to agree on what "the same
+#: label" means, so they call the same function rather than each writing a
+#: key rule.
+hashable_label = _hashable
 
 
 def _unify_dictionaries(chunks, column_name, index, matrix_name):
@@ -720,8 +735,14 @@ def _new_column(n_rows):
     return _array.array("d", bytes(8 * n_rows))
 
 
-def column_values(column, n_rows, name="column", index=0, categories=None,
-                  matrix_name="X"):
+def column_values(
+    column,
+    n_rows,
+    name="column",
+    index=0,
+    categories=None,
+    matrix_name="X",
+):
     """One Arrow column as a float64 buffer of length `n_rows`.
 
     `categories`, when given, is a fitted category table and the column
@@ -1067,7 +1088,14 @@ def arrow_f64_vector(values, n_rows, name="y"):
             "(a classifier encodes them) or their codes as a numeric column"
         )
     if kind == "refused":
-        raise _refusal(values.type, name, 0, name)
+        advice = _REFUSED_TYPES.get(
+            type_name(values.type),
+            "convert it to a numeric column",
+        )
+        raise ValueError(
+            f"{name} has Arrow type {values.type}, which is not a numeric "
+            f"column: {advice}"
+        )
     length = len(values)
     if length != n_rows:
         raise ValueError(

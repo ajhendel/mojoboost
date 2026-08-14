@@ -1,0 +1,386 @@
+# Handoffs to the jobs that would test what they claim.
+#
+# Every handoff in `handoffs/` was written by a lane that did not run anything,
+# or ran one script. Each one therefore ends with a set of claims and a set of
+# patches for other people's files. This manifest answers the coordinator's
+# question: given that I just applied the patches from handoff X, what is the
+# smallest thing I should run?
+#
+# Two kinds of entry.
+#
+#   [[handoff]]  a file that exists in handoffs/ today
+#   [[lane]]     a lane of the current parallel round whose handoff may not be
+#                written yet. `path` is where it will land. The planner reports
+#                a missing lane file as pending rather than as an error, because
+#                a lane that has not finished is not a broken manifest.
+#
+# `--self-check` fails on a [[handoff]] path that does not exist, and prints, but
+# does not fail on, any file in handoffs/ that no entry names. New handoffs land
+# in this repository faster than anything else in it.
+
+schema = 1
+
+# ---------------------------------------------------------------------------
+# GPU algorithms and the Apple lane
+# ---------------------------------------------------------------------------
+
+[[handoff]]
+paths = [
+    "handoffs/algorithm_22_leaf_batching.md",
+    "handoffs/algorithm_24_levelwise.md",
+    "handoffs/algorithm_26_multiclass_batch.md",
+    "handoffs/algorithm_27_hybrid_scheduler.md",
+]
+jobs = ["native:compile-package"]
+escalate = ["differential:backend-equivalence", "differential:gpu-training", "hardware:gpu-suites"]
+note = "Every module these four lanes wrote is in the gap list in subsystems.toml: no suite imports gpu_leaf_batching, gpu_levelwise, gpu_multiclass_batch, hybrid_leaf_scheduler, or levelwise_policy. A compile is the only focused evidence available until a caller and a suite exist. The escalations become the right answer the moment one of these is wired into the grower."
+
+[[handoff]]
+paths = ["handoffs/algorithm_23_fused_round.md"]
+jobs = ["differential:gpu-training", "native:gpu-active-rows"]
+escalate = ["differential:backend-equivalence", "hardware:gpu-validate"]
+note = "The fused round touches objective, sampling, and the root histogram in one pass, so the equivalence job is the one that would notice a fusion that changed an answer."
+
+[[handoff]]
+paths = ["handoffs/algorithm_25_binned_layout.md"]
+jobs = ["native:compile-package"]
+escalate = ["differential:gpu-strategies", "differential:backend-equivalence"]
+
+[[handoff]]
+paths = ["handoffs/apple_a1_active_rows.md"]
+jobs = ["native:gpu-active-rows"]
+escalate = ["differential:gpu-training"]
+note = "Order preservation is the property; native:gpu-active-rows asserts it."
+
+[[handoff]]
+paths = ["handoffs/apple_a2_split_search.md"]
+jobs = ["native:gpu-split-search"]
+escalate = ["differential:backend-equivalence", "native:monotone", "native:categorical"]
+
+[[handoff]]
+paths = ["handoffs/apple_a3_objectives.md", "handoffs/migration_21_objective_metric_registry.md"]
+jobs = ["native:gpu-objectives-native", "native:objectives"]
+escalate = ["differential:gpu-objectives", "native:metrics", "python:eval-set"]
+
+[[handoff]]
+paths = ["handoffs/apple_a4_gpu_predict.md", "handoffs/connect_06_gpu_prediction_bindings.md"]
+jobs = ["native:gpu-predict"]
+escalate = ["python:predict", "differential:backend-equivalence"]
+note = "The bindings half of this needs python:build-ext first, and the parity contract holds GPU prediction at partial precisely because the predict binding takes no device."
+
+[[handoff]]
+paths = ["handoffs/apple_a5_runtime.md"]
+jobs = ["native:gpu-runtime"]
+escalate = ["differential:gpu-strategies", "hardware:gpu-validate"]
+
+[[handoff]]
+paths = ["handoffs/apple_a6_policy.md", "handoffs/performance_14_gpu_histogram.md"]
+jobs = ["native:apple-gpu-policy", "differential:gpu-tiling"]
+escalate = ["hardware:hist-strategy-sweep", "hardware:apple-suite-smoke"]
+note = "A tuning policy that is wrong is slow, not incorrect, so the correctness jobs will pass either way. Only a hardware sweep can tell whether the policy chose well."
+
+[[handoff]]
+paths = ["handoffs/apple_a7_unified_memory.md", "handoffs/performance_18_unified_memory.md"]
+jobs = ["native:compile-package"]
+escalate = ["hardware:apple-suite-smoke", "hardware:thermal"]
+note = "unified_memory_policy.mojo is imported by no suite. Both lanes state plainly that nothing was compiled or run."
+
+[[handoff]]
+paths = ["handoffs/apple_a8_benchmarks.md", "handoffs/performance_17_thermal_energy.md"]
+jobs = ["static:apple-selfcheck", "static:thermal-plan"]
+escalate = ["static:apple-plan", "hardware:apple-suite-smoke", "hardware:thermal"]
+
+[[handoff]]
+paths = ["handoffs/apple_a9_device_selection.md", "handoffs/migration_20_device_policy.md", "handoffs/connect_05_device_policy.md"]
+jobs = ["native:device", "python:device-selection"]
+escalate = ["differential:cpu-pinned", "smoke:install-example"]
+
+[[handoff]]
+paths = ["handoffs/apple_a10_demo.md", "handoffs/release_04_install_ux.md"]
+jobs = ["smoke:install-example"]
+escalate = ["smoke:wheel-surface", "wheel:clean-install-macos"]
+
+[[handoff]]
+paths = ["handoffs/performance_13_apple_cpu.md"]
+jobs = ["native:cpu-parallel", "native:histogram-reference"]
+escalate = ["differential:threads-1", "differential:threads-max", "broad:bench-threshold"]
+
+[[handoff]]
+paths = ["handoffs/performance_15_startup.md"]
+jobs = ["static:startup-artifacts"]
+escalate = ["smoke:import", "smoke:install-example"]
+
+[[handoff]]
+paths = ["handoffs/performance_16_sparse_categorical_gpu.md", "handoffs/connect_10_sparse_categorical.md"]
+jobs = ["native:sparse", "native:categorical"]
+escalate = ["native:efb", "differential:backend-equivalence"]
+note = "The sparse GPU path raises for device='gpu', so nothing in the differential tier reaches it. gpu_sparse.mojo and gpu_sparse_layout.mojo are in the gap list."
+
+[[handoff]]
+paths = ["handoffs/connect_20_gpu_portability.md"]
+jobs = ["differential:gpu-portability"]
+escalate = ["hardware:gpu-suites", "native:compile-package"]
+
+# ---------------------------------------------------------------------------
+# Connection lanes
+# ---------------------------------------------------------------------------
+
+[[handoff]]
+paths = ["handoffs/connect_01_gpu_trainer.md", "handoffs/connect_02_gpu_dataflow.md", "handoffs/integration_07_apple_gpu.md"]
+jobs = ["differential:gpu-training", "differential:backend-equivalence"]
+escalate = ["hardware:gpu-suites", "hardware:gpu-validate", "broad:full-suite"]
+note = "Connecting the GPU core into the production trainer changes the default path for every user of device='auto'. This is one of the few changes where broad:full-suite is proportionate."
+
+[[handoff]]
+paths = ["handoffs/connect_04_gpu_scheduling.md"]
+jobs = ["native:compile-package"]
+escalate = ["differential:gpu-training", "hardware:gpu-suites"]
+
+[[handoff]]
+paths = ["handoffs/connect_11_serialization_inspection.md", "handoffs/migration_19_model_inspection.md", "handoffs/task14_inspection.md"]
+jobs = ["native:serialize", "python:inspection"]
+escalate = ["native:contrib", "python:pickle", "static:parity"]
+note = "Adding split_gains to the bindings flips has_split_gain in every dump, which is a schema-visible change; docs/MODEL_INSPECTION_SCHEMA.md is the contract python:inspection checks."
+
+[[handoff]]
+paths = ["handoffs/connect_12_dataset_cv.md", "handoffs/task15_cv.md"]
+jobs = ["python:cv", "native:trainset"]
+escalate = ["native:continued", "broad:estimators", "static:parity"]
+note = "static:parity because exporting cv from mojoboost.__all__ fires the Dask watch in check_parity.py and moves several contract rows at once."
+
+[[handoff]]
+paths = ["handoffs/connect_17_alternate_boosting.md", "handoffs/remaining_01_dart.md"]
+jobs = ["native:compile-package"]
+escalate = ["native:core", "native:objectives", "broad:full-suite"]
+note = "alternate_boosting.mojo, boosting_dart.mojo, and boosting_rf.mojo are all in the gap list. The escalation applies once a trainer calls them, not before."
+
+[[handoff]]
+paths = ["handoffs/connect_18_release.md", "handoffs/task18_platform.md", "handoffs/release_02_macos_wheels.md", "handoffs/release_03_linux_wheels.md"]
+jobs = ["static:matrix", "static:linux-metadata"]
+escalate = ["wheel:build", "wheel:test", "wheel:validate-artifact", "wheel:clean-install-macos", "wheel:clean-install-linux"]
+note = "The static pair is free and catches the metadata errors that produce a wrong artifact quietly. Nothing promotes a matrix row except a clean-install record."
+
+[[handoff]]
+paths = ["handoffs/connect_21_native_interfaces.md"]
+jobs = ["native:capi", "native:cli"]
+escalate = ["native:c-abi-from-c"]
+
+[[handoff]]
+paths = ["handoffs/connect_08_objective_registry.md"]
+jobs = ["native:objectives", "native:metrics", "native:custom-objective", "native:custom-metrics"]
+escalate = ["native:gpu-objectives-native", "python:eval-set", "static:parity"]
+note = "One registry reached from everywhere means one place that can change every objective's behavior at once. The four native jobs are the minimum; static:parity because section 9 of the contract lists the metric names this registry now owns."
+
+[[handoff]]
+paths = ["handoffs/connect_14_bindings.md"]
+jobs = ["python:build-ext", "python:api", "python:basic"]
+escalate = ["broad:estimators", "static:parity", "static:startup-artifacts"]
+note = "A new binding is a new public name, which is what STALE_DEFERRED_WATCHES watches. Expect static:parity to fire on purpose and re-audit the row it names rather than silencing it."
+
+[[handoff]]
+paths = ["handoffs/connect_15_dask.md"]
+jobs = ["distributed:dask-contract"]
+escalate = ["distributed:in-process", "distributed:two-process"]
+note = "Dask on a real distributed backend cannot be evidence until distributed:two-process exists, because there is no real backend under it yet."
+
+[[handoff]]
+paths = ["handoffs/connect_22_audit.md"]
+jobs = ["static:parity", "static:plan-selfcheck"]
+escalate = ["broad:full-suite"]
+note = "A cross-lane patch queue is exactly the situation this planner was written for: apply a patch, run the subsystem's jobs, move on. Do not open with the broad suite."
+
+[[handoff]]
+paths = ["handoffs/integration_06_python_api.md"]
+jobs = ["python:basic", "python:params", "static:parity"]
+escalate = ["broad:estimators", "python:cv"]
+
+[[handoff]]
+paths = ["handoffs/integration_08_algorithms.md", "handoffs/task12_tree_parameters.md", "handoffs/task13_efb.md", "handoffs/task21_sampling.md"]
+jobs = ["native:tree-parameters-extra", "native:efb", "native:sampling"]
+escalate = ["native:core", "native:feature-sampling", "broad:full-suite"]
+
+[[handoff]]
+paths = ["handoffs/integration_09_parity.md"]
+jobs = ["static:parity"]
+escalate = ["broad:lightgbm-compare"]
+note = "The contract's LightGBM-side inventories are carried forward from a v1 audit against 4.7.0 and have not been re-derived. broad:lightgbm-compare is the only job in this repository that touches a running LightGBM."
+
+[[handoff]]
+paths = ["handoffs/task16_distributed.md"]
+jobs = ["distributed:transport", "distributed:in-process"]
+escalate = ["distributed:two-process"]
+note = "distributed:two-process is blocked. Item 2 of this handoff is the thing that would unblock it."
+
+[[handoff]]
+paths = ["handoffs/task17_dask.md"]
+jobs = ["distributed:dask-contract"]
+escalate = ["python:basic"]
+
+[[handoff]]
+paths = ["handoffs/task19_real_data.md"]
+jobs = ["static:realdata-selfcheck"]
+escalate = ["broad:real-data-smoke", "broad:lightgbm-compare"]
+
+[[handoff]]
+paths = ["handoffs/task20_compatibility.md", "handoffs/release_05_python_versions.md"]
+jobs = ["static:python-compat"]
+escalate = ["static:matrix", "smoke:wheel-surface"]
+
+[[handoff]]
+paths = ["handoffs/task22_lgbm_io.md"]
+jobs = ["native:lgbm-model-io"]
+escalate = ["native:serialize", "broad:lightgbm-compare"]
+
+[[handoff]]
+paths = ["handoffs/release_01_pypi.md"]
+jobs = ["static:linux-metadata", "static:matrix"]
+escalate = ["wheel:build", "wheel:hash"]
+
+[[handoff]]
+paths = ["handoffs/release_10_security.md"]
+jobs = ["static:action-pins"]
+escalate = ["wheel:hash", "wheel:verify-release"]
+
+[[handoff]]
+paths = ["handoffs/release_11_hardware_network.md"]
+jobs = ["static:capture-audit"]
+escalate = ["hardware:capture-apple", "hardware:capture-nvidia", "hardware:capture-amd"]
+
+[[handoff]]
+paths = ["handoffs/release_12_organization.md"]
+jobs = []
+note = "Community and organization paperwork. No command in this repository validates it, and saying so is better than attaching one that does not."
+
+[[handoff]]
+paths = ["handoffs/remaining_04_cegb.md"]
+jobs = ["native:compile-package"]
+escalate = ["native:tree-parameters-extra", "native:core"]
+note = "The CEGB penalties are primitives with no grower calling them, the same shape as tree_parameters_extra."
+
+[[handoff]]
+paths = ["handoffs/remaining_14_validation_plan.md"]
+jobs = ["static:plan-selfcheck"]
+note = "This lane. The planner has never been run; --self-check is the first thing anyone should run against it."
+
+# ---------------------------------------------------------------------------
+# Lanes of the current remaining-parity round
+#
+# Source: MOJOBOOST_REMAINING_PARITY_PARALLEL_PROMPTS.txt in the repository
+# root. Each lane owns one or two new modules and a handoff, and every one of
+# them is under instruction not to run anything. `jobs` is what the coordinator
+# should run after applying that lane's READY-TO-APPLY patches, not what the
+# lane itself should run.
+# ---------------------------------------------------------------------------
+
+[[lane]]
+id = "remaining-01-dart"
+path = "handoffs/remaining_01_dart.md"
+owns = ["src/mojoboost/boosting_dart.mojo", "docs/DART.md"]
+jobs = ["native:compile-package"]
+escalate = ["native:core", "native:serialize"]
+note = "Dropout changes which trees exist at prediction time, so serialization is in the escalation."
+
+[[lane]]
+id = "remaining-02-rf"
+path = "handoffs/remaining_02_rf.md"
+owns = ["src/mojoboost/boosting_rf.mojo", "docs/RANDOM_FOREST_MODE.md"]
+jobs = ["native:compile-package"]
+escalate = ["native:core", "native:bagging"]
+
+[[lane]]
+id = "remaining-03-linear-trees"
+path = "handoffs/remaining_03_linear_trees.md"
+owns = ["src/mojoboost/linear_tree.mojo", "docs/LINEAR_TREES.md"]
+jobs = ["native:compile-package"]
+escalate = ["native:serialize", "native:contrib", "native:core"]
+note = "A leaf that holds a linear model changes the model format and what a contribution means. Both escalations are load-bearing."
+
+[[lane]]
+id = "remaining-04-cegb"
+path = "handoffs/remaining_04_cegb.md"
+owns = ["src/mojoboost/cegb.mojo", "docs/CEGB.md"]
+jobs = ["native:compile-package"]
+escalate = ["native:tree-parameters-extra", "native:core"]
+
+[[lane]]
+id = "remaining-05-ranking"
+path = "handoffs/remaining_05_ranking.md"
+owns = ["src/mojoboost/ranking_advanced.mojo", "docs/RANKING_ADVANCED.md"]
+jobs = ["native:ranking", "native:metrics"]
+escalate = ["broad:lightgbm-compare"]
+
+[[lane]]
+id = "remaining-06-quantized-gradients"
+path = "handoffs/remaining_06_quantized_gradients.md"
+owns = ["src/mojoboost/quantized_gradient.mojo", "docs/QUANTIZED_GRADIENTS.md"]
+jobs = ["native:compile-package"]
+escalate = ["native:histogram-reference", "differential:backend-equivalence"]
+note = "Quantized accumulation is a numerics change. native:histogram-reference is the job that compares an optimized path against its definition."
+
+[[lane]]
+id = "remaining-07-external-memory"
+path = "handoffs/remaining_07_external_memory.md"
+owns = ["src/mojoboost/external_memory.mojo", "src/mojoboost/sequence.mojo", "docs/EXTERNAL_MEMORY.md"]
+jobs = ["native:compile-package"]
+escalate = ["native:trainset", "native:kernels", "python:no-numpy"]
+
+[[lane]]
+id = "remaining-08-model-editing"
+path = "handoffs/remaining_08_model_editing.md"
+owns = ["src/mojoboost/model_editing.mojo", "docs/MODEL_EDITING.md"]
+jobs = ["native:compile-package"]
+escalate = ["native:serialize", "python:inspection", "static:parity"]
+note = "refit, rollback, and the bounds are five watched rows in check_parity.py. Landing any of them without editing the contract fails static:parity, which is the check working."
+
+[[lane]]
+id = "remaining-09-distributed-strategies"
+path = "handoffs/remaining_09_distributed_strategies.md"
+owns = ["src/mojoboost/distributed_strategies.mojo", "src/mojoboost/distributed_gpu.mojo"]
+jobs = ["distributed:in-process", "distributed:transport"]
+escalate = ["distributed:two-process", "differential:gpu-training"]
+
+[[lane]]
+id = "remaining-10-ecosystem-inputs"
+path = "handoffs/remaining_10_ecosystem_inputs.md"
+owns = ["python/mojoboost/_arrow.py", "python/mojoboost/_polars.py", "python/mojoboost/_sequence.py"]
+jobs = ["python:validation", "python:no-numpy"]
+escalate = ["python:basic", "broad:estimators"]
+note = "pyarrow and polars are already in the pytest environment, so these tests will not skip themselves the way the scipy ones do."
+
+[[lane]]
+id = "remaining-11-gpu-backends"
+path = "handoffs/remaining_11_gpu_backends.md"
+owns = ["src/mojoboost/gpu_cuda_policy.mojo", "src/mojoboost/gpu_amd_policy.mojo"]
+jobs = ["differential:gpu-portability", "native:compile-package"]
+escalate = ["hardware:gpu-suites", "hardware:capture-nvidia", "hardware:capture-amd"]
+note = "Neither vendor's device exists in this project's CI or on the development machine. The hardware escalations are the only evidence that would ever exist for this lane."
+
+[[lane]]
+id = "remaining-12-validation"
+path = "handoffs/remaining_12_validation.md"
+owns = ["src/mojoboost/validation.mojo", "python/mojoboost/_validation.py"]
+jobs = ["python:validation", "native:core"]
+escalate = ["broad:estimators", "broad:full-suite"]
+note = "A central validation layer changes what raises, which is the one kind of change that can break every suite at once."
+
+[[lane]]
+id = "remaining-13-compatibility"
+path = "handoffs/remaining_13_compatibility.md"
+owns = ["compatibility/", "tools/api_snapshot.py", "tools/model_fixture_manifest.py"]
+jobs = ["static:python-compat", "static:parity"]
+escalate = ["native:serialize", "python:pickle"]
+note = "That lane authors two tools and is told not to run them, exactly as this one is. When they land, they belong in the static tier of jobs.toml; patch P4 in this lane's handoff has the entries."
+
+[[lane]]
+id = "remaining-14-validation-plan"
+path = "handoffs/remaining_14_validation_plan.md"
+owns = ["tools/validation_plan.py", "docs/FOCUSED_VALIDATION_PLAN.md", "validation/manifests/"]
+jobs = ["static:plan-selfcheck"]
+
+[[lane]]
+id = "remaining-15-release-gate"
+path = "handoffs/remaining_15_release_gate.md"
+owns = ["docs/POST_INTEGRATION_GAPS.md", "docs/V1_RELEASE_GATE.md", "tools/remaining_gaps.py"]
+jobs = ["static:parity", "static:matrix"]
+escalate = ["static:plan-selfcheck"]
+note = "The release gate that lane defines and the plan this lane emits are the two halves of the same question. Its gate says what must be true; this planner says which command would show it."

@@ -36,7 +36,7 @@ def _bits_to_float(token):
 class _Tree:
     __slots__ = ("feature", "threshold", "left", "right", "value",
                  "default_left", "missing_bin", "cat_offset", "cat_bitset",
-                 "count")
+                 "count", "split_gain")
 
     def goes_left(self, node, bin_id):
         off = self.cat_offset[node]
@@ -74,7 +74,9 @@ class _ReferenceModel:
         self._i = 0
         assert self._next() == "mojoboost"
         version = self._next()
-        assert version == "v3", f"expected a v3 file, got {version}"
+        assert version == "v4", f"expected a v4 file, got {version}"
+        self.version = int(version[1:])
+        self._read_feature_names()
         kind = self._next()
         self.multiclass = kind == "multiclass"
         if self.multiclass:
@@ -103,6 +105,17 @@ class _ReferenceModel:
 
     def _peek(self):
         return self._t[self._i] if self._i < len(self._t) else ""
+
+    def _read_feature_names(self):
+        """The optional v4 names section, between the version and the kind
+        token. This reference reads covers and routing, so it only has to
+        step over the names; `test_inspection.py` is what checks them."""
+        self.feature_names = None
+        if self._peek() != "feature_names":
+            return
+        self._next()
+        n_names = int(self._next())
+        self.feature_names = [self._next() for _ in range(n_names)]
 
     def _read_mapper(self):
         assert self._next() == "mapper"
@@ -155,7 +168,23 @@ class _ReferenceModel:
                 int(self._next()) != 0 for _ in range(n_nodes)
             ]
             t.missing_bin = [int(self._next()) for _ in range(n_nodes)]
-            t.count = [_bits_to_float(self._next()) for _ in range(n_nodes)]
+            # v4 flags both of these: a tree that has no covers (loaded from
+            # a v1 or v2 file) and one that has no gains (loaded from
+            # anything before v4) say so rather than writing zeros.
+            assert self._next() == "counts"
+            if int(self._next()):
+                t.count = [
+                    _bits_to_float(self._next()) for _ in range(n_nodes)
+                ]
+            else:
+                t.count = [0.0] * n_nodes
+            assert self._next() == "gains"
+            if int(self._next()):
+                t.split_gain = [
+                    _bits_to_float(self._next()) for _ in range(n_nodes)
+                ]
+            else:
+                t.split_gain = [0.0] * n_nodes
             t.cat_offset = [-1] * n_nodes
             t.cat_bitset = []
             if self._peek() == "cat":
@@ -516,26 +545,33 @@ def test_contributions_survive_save_and_load(tmp_path):
 
 
 def _downgrade_to_v2(path, out_path):
-    """Rewrite a v3 model file as the v2 it would have been.
+    """Rewrite a v4 model file as the v2 it would have been.
 
-    v3 added exactly one line per tree, the node covers, written eighth in
-    each tree block (after feature, threshold, left, right, value,
-    default_left, missing_bin). Dropping it and the version bump is the whole
-    difference, which is what makes this a real v2 file rather than a
-    truncated v3 one."""
+    A v2 tree block is seven lines after the header: feature, threshold,
+    left, right, value, default_left, missing_bin. v3 appended the node
+    covers unconditionally; v4 puts a `counts <flag>` line in front of them
+    and adds `gains <flag>` and its own array the same way, each array
+    present only when its flag is 1. Dropping all four, and the version
+    token, is the whole difference, which is what makes this a real v2 file
+    rather than a truncated v4 one.
+    """
     lines = open(path).read().splitlines()
     out = []
     i = 0
     while i < len(lines):
         line = lines[i]
         if i == 0:
-            out.append(line.replace("mojoboost v3", "mojoboost v2"))
+            out.append(line.replace("mojoboost v4", "mojoboost v2"))
             i += 1
             continue
         out.append(line)
         if line.startswith("tree "):
             out.extend(lines[i + 1 : i + 8])
-            i += 9  # skip the covers line
+            i += 8
+            for flag in ("counts", "gains"):
+                assert lines[i].startswith(flag), lines[i]
+                present = lines[i].split()[1] == "1"
+                i += 2 if present else 1
             continue
         i += 1
     open(out_path, "w").write("\n".join(out) + "\n")

@@ -64,8 +64,10 @@ comptime DUMP_FORMAT_VERSION = 1
 
 # The save format a model written today serializes to (see serialize.mojo).
 # Recorded in the dump so a consumer knows which optional facts a model of
-# this vintage can carry at all.
-comptime MODEL_FORMAT_VERSION = 3
+# this vintage can carry at all. It has to track `CURRENT_FORMAT_VERSION`
+# there, which exists to be tracked; v4 is the one that carries split
+# gains, so a model saved by this build keeps them.
+comptime MODEL_FORMAT_VERSION = 4
 
 # Codes a categorical feature can represent, mirroring the private
 # `_MAX_CATEGORY` in categorical.mojo. The dump interpreter reproduces that
@@ -445,10 +447,13 @@ def threshold_value(
 def has_split_gains(trees: List[Tree]) -> Bool:
     """Whether this ensemble's gains survived to be reported.
 
-    Gains are recorded when a node is split and are not serialized, so a
-    model read back from a file carries zeros. A split is only ever taken
-    for a positive gain, so one positive gain anywhere settles it, and an
-    ensemble that never split has no gain to report either way.
+    Gains are recorded when a node is split, and model format v4 writes
+    them with the tree, so a model saved and loaded by a current build
+    keeps them. One read back from a v1, v2, or v3 file carries zeros:
+    those formats dropped gains, and a fitted tree cannot recompute them.
+    A split is only ever taken for a positive gain, so one positive gain
+    anywhere settles it, and an ensemble that never split has no gain to
+    report either way.
     """
     for t in range(len(trees)):
         for i in range(len(trees[t].split_gain)):

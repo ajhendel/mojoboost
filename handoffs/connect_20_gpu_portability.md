@@ -1,9 +1,20 @@
 # Connect 20: portable CUDA/AMD specialization points
 
 Status: the portability contract layer is landed and consumes the real
-production types. **Nothing calls it yet**, because every call site lives in
-another lane's files. The patch requests below are exact and each one is a
-few lines.
+production types. It has exactly one consumer,
+`src/mojoboost/gpu_cuda_policy.mojo`, written by another lane on top of it
+while this was being finished. **Nothing on the production call path reaches
+either of them**, because every launch site lives in another lane's files.
+`tools/connectivity_audit.py` and `docs/CONNECTION_AUDIT.md` independently
+mark both new modules `PENDING` against this task, and applying section 6 is
+what lifts that. The patch requests below are exact and each one is a few
+lines.
+
+Late note, after two other lanes committed mid-task (`dc21f03`, `860b1cf`):
+both files created here were swept into `860b1cf` by another lane's commit
+before this handoff was written. Nothing here staged, committed, or pushed
+anything. The working tree carries two later corrections to those files,
+described in section 4.3.
 
 Nothing was committed, staged, or formatted. No Mojo, Python, pixi, build,
 test, benchmark, linter, formatter, or network command was run. Nothing in
@@ -156,6 +167,54 @@ Two connections into existing types rather than new ones:
   gap `gpu_tiling.shared_bytes_for` documents: the model is `n_bins * 12`,
   the shipping kernels allocate 3072 bytes at every bin count, and the two
   agree only at 256 bins.
+
+### 4.3 Two corrections made after the first draft
+
+Both were found by reading `histogram_gpu.build_kernel_features()`, and both
+are in the working tree rather than in `860b1cf`.
+
+**`selected` versus `compiled`.** `build_kernel_features()` returns
+`KernelFeatures(False, False, True)`: `batched_leaf_kernel` is true because
+linking `histogram_gpu` instantiates the batched kernels from
+`gpu_leaf_batching`. That is a fact about compilation, not about what any
+plan chose. The first draft of `require_specializations_allowed` took one
+`KernelFeatures` and would therefore have refused **every** run on a named
+non-Metal backend. It now takes the *selected* set, and
+`require_histogram_launchable` takes both separately: `compiled` decides the
+threadgroup footprint, `selected` faces the validation gate.
+
+`selected` is a trailing parameter defaulting to `KernelFeatures.none()`, so
+the six-argument call in `gpu_cuda_policy.mojo:1494` keeps compiling
+unchanged and lands its `features` on `compiled`, which is the slot that
+argument belongs in.
+
+**An unidentified backend is not refused.** `API_UNKNOWN` is the value every
+launch carries today, because nothing in the shipping code reads an API name
+before it launches. The first draft refused it, which would have refused the
+Metal path this repository actually runs on.
+`gpu_backend_policy.backend_is_identified` now separates "we know it is
+CUDA and nobody has run CUDA" from "we do not know what this is", and only
+the first is refused. This is the honest limit of the gate and is stated in
+the module docstring, in `docs/GPU_PORTABILITY.md`, and in section 9.
+
+### 4.4 The one consumer that exists
+
+`src/mojoboost/gpu_cuda_policy.mojo` (another lane, 1511 lines, untracked at
+the time of writing) is the CUDA specialization layer built on top of these
+two modules. It imports `backend_support` and `support_name` from
+`gpu_backend_policy` and `REQ_IN_ORDER_QUEUE`, `BackendContract`,
+`contract_from_profile`, `describe_contract`, `histogram_capabilities`,
+`kernel_shared_request`, `require_histogram_launchable`, and
+`require_specializations_allowed` from `gpu_portability`. That is the
+layering this lane intended: the portable contract underneath, the
+backend-specific reading of reported attributes above it, and no second
+contract.
+
+One thing for that lane to check, filed as request 6.6: its call at
+`gpu_cuda_policy.mojo:984` passes the caller's `features` to
+`require_specializations_allowed`, which is the *selected* slot. If the
+value that reaches it is `histogram_gpu.build_kernel_features()`, a CUDA
+plan will be refused for a linkage fact rather than for a choice.
 
 ### Two files, not one, and why
 
@@ -434,7 +493,28 @@ should surface the support level in its error text when it fails for another
 reason, so a user on CUDA reading an error knows the backend has never been
 validated here. It must not fail *because* of the support level.
 
-### 6.6 Task 18 (`docs/PLATFORM_MATRIX.md`, `packaging/matrix/platform_matrix.toml`)
+### 6.6 Whoever owns `src/mojoboost/gpu_cuda_policy.mojo`
+
+**(a)** At `gpu_cuda_policy.mojo:984`, confirm that the `features` reaching
+`require_specializations_allowed` is what the plan *selected* and not what
+the build compiled. If callers pass `histogram_gpu.build_kernel_features()`,
+which reports `batched_leaf_kernel = True` for a linkage reason, every CUDA
+plan is refused for the wrong reason. Splitting that parameter into
+`compiled` and `selected`, as `require_histogram_launchable` now does, is
+the same fix.
+
+**(b)** The six-argument call at `gpu_cuda_policy.mojo:1494` still compiles:
+`selected` was added as a trailing parameter defaulting to
+`KernelFeatures.none()`. Passing the selected set explicitly is what turns
+the specialization gate on for that path.
+
+**(c)** An AMD counterpart to that module would sit in the same place and
+should reuse `BackendContract` rather than define a second one.
+`docs/AMD_GPU.md` lists what it would encode, and the one AMD-specific
+policy worth having is reading the device's real `grid.y` bound instead of
+applying CUDA's 65535 floor.
+
+### 6.7 Task 18 (`docs/PLATFORM_MATRIX.md`, `packaging/matrix/platform_matrix.toml`)
 
 **(a)** Add a GPU-backend section to `docs/PLATFORM_MATRIX.md` using that
 file's existing four-word vocabulary, and keep the TOML in step so
@@ -492,10 +572,13 @@ file would make the file machine-specific for no benefit.
 
 ## 9. Risks
 
-1. **Unreferenced code until section 6 is applied.** The honest status: this
-   lane could not edit a single call site, so what landed is a contract with
-   no callers. If no other lane applies the patch requests, this is
-   documentation with a type checker.
+1. **Unreachable from production until section 6 is applied.** The honest
+   status: this lane could not edit a single launch site. One consumer
+   exists (`gpu_cuda_policy.mojo`) and it is itself unreachable, so the
+   whole subtree is a contract that nothing on a training path consults.
+   `tools/connectivity_audit.py` says the same in its own words. If no
+   other lane applies the patch requests, this is documentation with a type
+   checker.
 2. **The specialization gate is weak until the API name is plumbed.** 6.4(c)
    is the change that matters. Without it a CUDA device is indistinguishable
    from the M4 and the gate never fires. This is stated in the module
@@ -524,7 +607,15 @@ file would make the file machine-specific for no benefit.
 
 ## 10. Remaining disconnections
 
-- No call site calls any gate. Section 6.
+- No launch site calls any gate. Section 6. `gpu_cuda_policy.mojo` calls
+  them, and nothing calls `gpu_cuda_policy.mojo`.
+- Neither new module is exported from `src/mojoboost/__init__.mojo`.
+  Section 6.1(d).
+- `tests/test_gpu_portability.mojo` exists (another lane's file, which this
+  lane may not edit) and, per `docs/CONNECTION_AUDIT.md`, imports
+  `gpu_tiling` and `histogram_gpu` rather than the module it is named for.
+  Whoever owns the test directory should point it at `gpu_portability`; the
+  coverage worth having is listed in section 11.
 - No backend identity reaches a launch. Section 6.4(c).
 - `apple_histogram_policy` is still the only planner and is still
   Apple-named. Section 6.3(b).
@@ -549,9 +640,11 @@ smallest thing that could fail, one at a time.
 # after at least one export from 6.1(d) exists.
 pixi run mojo build -I src src/mojoboost/gpu_portability.mojo
 
-# UNRUN. The one focused test to write for this lane, when tests are allowed
-# again: pure host arithmetic, no accelerator needed.
-pixi run mojo run -I src tests/parallel/test_gpu_portability.mojo
+# UNRUN. The focused test for this lane. The file already exists and, per
+# docs/CONNECTION_AUDIT.md, does not import the module it is named for;
+# pointing it at gpu_portability is the change. Pure host arithmetic, no
+# accelerator needed.
+pixi run mojo run -I src tests/test_gpu_portability.mojo
 ```
 
 What that test should cover, since it is cheap and none of it needs a

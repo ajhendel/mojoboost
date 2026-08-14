@@ -101,7 +101,7 @@ INTENTIONAL DIFFERENCES FROM LightGBM
   `models_` is non-empty, so trees added to an existing rf model are fitted at
   a raw score of 0 rather than at the base score the first trees used. That
   makes `50 + 50` rounds a different model from `100`. `RfBooster` stores the
-  base score and `train_rf_more` reuses it, so the two agree here.
+  base score and `train_forest_more` reuses it, so the two agree here.
 - **Degenerate trees keep their value.** When no split passes the tree
   constraints, LightGBM discards the grown stump and appends a tree whose
   single leaf is 0 (`AsConstantTree(0.0)` on the first iteration, a
@@ -132,16 +132,31 @@ INTENTIONAL DIFFERENCES FROM LightGBM
   randomized by `pos_bagging_fraction` / `neg_bagging_fraction`, although it
   is the same per-round row draw. See `rf_randomizer_name`.
 
+Two layers, and which one to call
+--------------------------------
+`train_forest` and `RfBooster` are the algorithm: an averaged model, with
+LightGBM's slice semantics and a base score it can continue from. `train_rf`,
+`train_rf_more`, and `is_forest` are the `boosting='rf'` surface: the same
+training, handed the arguments every other mode takes and returning an
+ordinary `Booster` through `RfBooster.to_booster`. `alternate_boosting.mojo`
+dispatches to the second layer, which is why an rf model needs no change to
+serialization, prediction, contributions, or importance today.
+
+The bridge is exact for a full-model prediction and lossy for two things
+only, both listed on `to_booster`: iteration ranges, and the base score a
+continuation needs. Neither is repairable without a flag on the model saying
+"average these trees", which is the first patch in
+`handoffs/remaining_02_rf.md`.
+
 Reachability
 ------------
-Nothing in `src/mojoboost/` imports this module yet, and no parameter turns it
-on: `boosting=rf` is still rejected by params.mojo, `average_output` is still
-refused by lgbm_model_io.mojo, and neither `Booster` nor the model format has
-a flag that says "average these trees". `to_booster` is the bridge that
-exists today (see its docstring); `handoffs/remaining_02_rf.md` carries the
-patches for the rest. This module deliberately does not half-wire any of it:
-an accepted `boosting=rf` that trained a summed ensemble would be worse than
-one that is rejected.
+`src/mojoboost/alternate_boosting.mojo` imports `train_rf` and
+`train_rf_more`, so a Mojo caller can train a forest today. Nothing above
+that reaches it: `boosting=rf` is still rejected by params.mojo and by the
+Python estimators, `average_output` is still refused by lgbm_model_io.mojo,
+and no parameter string or keyword turns the mode on. This module
+deliberately does not half-wire any of that: an accepted `boosting=rf` that
+trained a summed ensemble would be worse than one that is rejected.
 """
 
 from std.math import log
@@ -288,6 +303,26 @@ struct RfParams(Copyable, Movable):
             100,
             TreeParams.default(),
             BaggingParams(0.8, 1, DEFAULT_BAGGING_SEED),
+            GossParams.disabled(),
+            ClassBaggingParams.disabled(),
+        )
+
+    @staticmethod
+    def from_booster_params(
+        params: BoosterParams, bagging: BaggingParams
+    ) -> RfParams:
+        """The forest a `(BoosterParams, BaggingParams)` pair describes.
+
+        The bridge for callers that hold the ordinary training arguments and
+        select the mode separately, which is how `boosting=rf` arrives from
+        `alternate_boosting.train_boosting`. `params.learning_rate` is not
+        read: `check_rf_learning_rate` is what says so out loud, and the
+        adapters below call it.
+        """
+        return RfParams(
+            params.n_estimators,
+            params.tree.copy(),
+            bagging.copy(),
             GossParams.disabled(),
             ClassBaggingParams.disabled(),
         )
@@ -457,7 +492,7 @@ struct RfBooster(Copyable, Movable):
     right answer.
 
     `base_score` is the constant every tree was fitted from. It is not part of
-    prediction (the trees already carry it); it is what `train_rf_more` needs
+    prediction (the trees already carry it); it is what `train_forest_more` needs
     to add trees that belong to the same forest, and what a reader needs to
     interpret a single tree's values.
 
@@ -595,7 +630,7 @@ struct RfBooster(Copyable, Movable):
         - **continued training.** The returned `Booster` reports a
           `learning_rate` of `1 / T` and a base score of 0, so `train_more`
           would shrink new trees by the averaging weight of the old ones and
-          boost them from zero. `train_rf_more` on this `RfBooster` is the
+          boost them from zero. `train_forest_more` on this `RfBooster` is the
           continuation path; there is no continuing the bridged model.
 
         The mean here is accumulated pre-scaled (`sum(tree_i / T)`) where
@@ -604,11 +639,19 @@ struct RfBooster(Copyable, Movable):
         exactly whenever `T` is a power of two, since scaling by an exact
         power of two commutes with rounding; otherwise they can differ in the
         last place.
+
+        An empty forest bridges to the base score carried as a base score,
+        which is what an empty forest predicts and what an empty boosted
+        ensemble is. `is_forest` cannot tell the two apart, and nothing could:
+        with no trees they are the same object.
         """
         if len(self.trees) == 0:
-            raise Error(
-                "an empty random forest has no averaging weight to give a"
-                " Booster; train at least one tree"
+            return Booster(
+                List[Tree](),
+                self.base_score,
+                RF_SHRINKAGE,
+                self.objective,
+                self.monotone.copy(),
             )
         return Booster(
             self.trees.copy(),
@@ -701,7 +744,7 @@ def _rf_rounds(
         trees.append(tree^)
 
 
-def train_rf(
+def train_forest(
     data: BinnedMatrix,
     target: List[Float64],
     objective: Int,
@@ -760,7 +803,7 @@ def train_rf(
     )
 
 
-def train_rf_more(
+def train_forest_more(
     mut forest: RfBooster,
     data: BinnedMatrix,
     target: List[Float64],
@@ -836,7 +879,168 @@ def train_rf_more(
     return added
 
 
-def train_rf_with_valid(
+# --- The `boosting=rf` surface --------------------------------------------
+#
+# `train_forest` above is the algorithm and `RfBooster` is what it produces.
+# The three functions below are the surface a caller that selects a strategy
+# by name reaches instead: they take the ordinary training arguments, return
+# an ordinary `Booster` through `RfBooster.to_booster`, and are what
+# `alternate_boosting.mojo` dispatches `boosting='rf'` to. Everything the
+# bridge gives up is listed on `to_booster`; in exchange, an rf model
+# serializes, predicts, and explains through paths that need no change.
+
+
+def is_forest(booster: Booster) -> Bool:
+    """Whether this ensemble has the shape `RfBooster.to_booster` produces:
+    a zero base score and a shrinkage factor of exactly `1 / T`.
+
+    Structural, and deliberately not conclusive. A fitted `Booster` records
+    no boosting mode, so this is the only question that can be asked of one,
+    and a boosted ensemble could in principle answer yes to it. What it does
+    reliably catch is the mistake worth catching: continuing a forest as GBDT
+    (which would shrink new trees by `1 / T`) or a GBDT model as a forest
+    (which would rescale every existing tree). An empty ensemble answers no,
+    because an empty forest and an empty boosted ensemble are the same object.
+
+    The comparison is exact rather than tolerant on purpose: the rate is
+    written by `average_weight` and read back by `serialize.load_model`,
+    which stores raw IEEE-754 bit patterns, so the round trip is exact and a
+    near miss means a different model.
+    """
+    if len(booster.trees) == 0:
+        return False
+    if booster.base_score != 0.0:
+        return False
+    return booster.learning_rate == 1.0 / Float64(len(booster.trees))
+
+
+def train_rf(
+    data: BinnedMatrix,
+    target: List[Float64],
+    objective: Int,
+    params: BoosterParams,
+    sample_weight: List[Float64] = [],
+    alpha: Float64 = 0.9,
+    bagging: BaggingParams = BaggingParams.disabled(),
+    init_score: List[Float64] = [],
+) raises -> Booster:
+    """Train `boosting='rf'` and return an ordinary `Booster`.
+
+    `train_forest` with the arguments the other modes take.
+    `params.learning_rate` must be 1.0 (`check_rf_learning_rate`) and
+    `init_score` must be empty (`check_rf_init_score`); the sampler must
+    randomize the run (`check_rf_params`).
+
+    GOSS is not an argument here. It is a `boosting` value of its own, so a
+    caller that selects a strategy by name has already chosen between them;
+    `train_forest` is the entry point for a forest that samples by gradient.
+    """
+    check_rf_learning_rate(params.learning_rate)
+    var forest = train_forest(
+        data,
+        target,
+        objective,
+        RfParams.from_booster_params(params, bagging),
+        sample_weight,
+        alpha,
+        init_score,
+    )
+    return forest.to_booster()
+
+
+def train_rf_more(
+    mut booster: Booster,
+    data: BinnedMatrix,
+    target: List[Float64],
+    params: BoosterParams,
+    sample_weight: List[Float64] = [],
+    alpha: Float64 = 0.9,
+    bagging: BaggingParams = BaggingParams.disabled(),
+    init_score: List[Float64] = [],
+) raises -> Int:
+    """Add `params.n_estimators` trees to a forest held as a `Booster`, and
+    rescale it to its new size. Returns how many trees were added.
+
+    The ensemble is checked with `is_forest` before anything is touched: this
+    rewrites `booster.learning_rate`, which on a boosted ensemble is the
+    shrinkage every one of its trees was fitted under and would be a silent
+    corruption of the model.
+
+    Unlike `train_forest_more`, the constant the new trees are fitted at
+    cannot be read off the model: `to_booster` folds it into the leaves and a
+    `Booster` has nowhere to record it. It is recomputed here from `target`
+    and `sample_weight`, so the added trees are the trees one call would have
+    grown exactly when this is the data the forest was trained on, which is
+    the precondition `boosting.train_more` already states for continuing at
+    all. A forest kept as an `RfBooster` needs no such precondition, because
+    it carries its own base score; that is what `train_forest_more` is for.
+    """
+    check_rf_learning_rate(params.learning_rate)
+    check_rf_init_score(init_score)
+    if not is_forest(booster):
+        raise Error(
+            "boosting='rf' cannot continue this ensemble: a forest has a base"
+            " score of 0 and a shrinkage of 1 / n_trees (see"
+            " boosting_rf.is_forest), and adding averaged trees to a boosted"
+            " ensemble would rescale every tree already in it"
+        )
+    if len(target) != data.n_rows:
+        raise Error("target length must equal n_rows")
+    if not _same_signs(params.tree.monotone.signs, booster.monotone.signs):
+        raise Error(
+            "continued training cannot change monotone_constraints: the"
+            " forest records the constraints all of its trees satisfy"
+        )
+    _check_objective(booster.objective, target, alpha)
+    _check_sample_weight(sample_weight, data.n_rows)
+    var rf = RfParams.from_booster_params(params, bagging)
+    check_rf_params(rf, booster.objective)
+    params.tree.monotone.check_features(data.n_features)
+
+    var n = data.n_rows
+    # Recomputed rather than recovered; see the docstring.
+    var base_score = _base_score(
+        target, booster.objective, sample_weight, alpha
+    )
+    var init_raw = _constant_scores(n, base_score)
+    var grad0 = List[Float64](capacity=n)
+    var hess0 = List[Float64](capacity=n)
+    _fill_grad_hess(
+        init_raw,
+        target,
+        booster.objective,
+        sample_weight,
+        alpha,
+        grad0,
+        hess0,
+    )
+
+    var grown = List[Tree]()
+    _rf_rounds(
+        data,
+        target,
+        booster.objective,
+        rf,
+        sample_weight,
+        alpha,
+        base_score,
+        grad0,
+        hess0,
+        len(booster.trees),
+        rf.n_estimators,
+        grown,
+    )
+    var added = len(grown)
+    for i in range(added):
+        booster.trees.append(grown[i].copy())
+    # The averaging weight is a function of the tree count, so growing the
+    # forest rescales every tree in it, the old ones included. That is what
+    # averaging means, and it is why this takes the ensemble by reference.
+    booster.learning_rate = 1.0 / Float64(len(booster.trees))
+    return added
+
+
+def train_forest_with_valid(
     data: BinnedMatrix,
     target: List[Float64],
     valid_data: BinnedMatrix,
@@ -861,7 +1065,7 @@ def train_rf_with_valid(
     `early_stopping_rounds` do the same job they do elsewhere.
 
     Truncation is exact: the forest of the first `k` trees is the forest
-    `train_rf` would have grown with `n_estimators = k`, because tree `i` does
+    `train_forest` would have grown with `n_estimators = k`, because tree `i` does
     not depend on tree `i - 1`. Truncating a boosted ensemble only holds
     because the base score and the earlier trees are unchanged; here nothing
     is changed at all except the denominator.
@@ -1096,9 +1300,12 @@ struct RfMulticlassBooster(Copyable, Movable):
         `1 / rounds`, and correctness for the full range only."""
         var rounds = self.n_iterations()
         if rounds == 0:
-            raise Error(
-                "an empty random forest has no averaging weight to give a"
-                " MulticlassBooster; train at least one round"
+            return MulticlassBooster(
+                List[Tree](),
+                self.base_scores.copy(),
+                self.n_classes,
+                RF_SHRINKAGE,
+                self.monotone.copy(),
             )
         var zeros = List[Float64](capacity=self.n_classes)
         zeros.resize(self.n_classes, 0.0)
@@ -1197,7 +1404,7 @@ def _multiclass_rf_gradients(
         hesses.append(hess^)
 
 
-def train_rf_multiclass(
+def train_forest_multiclass(
     data: BinnedMatrix,
     labels: List[Int],
     n_classes: Int,
@@ -1251,7 +1458,7 @@ def train_rf_multiclass(
     )
 
 
-def train_rf_multiclass_more(
+def train_forest_multiclass_more(
     mut forest: RfMulticlassBooster,
     data: BinnedMatrix,
     labels: List[Int],
@@ -1309,7 +1516,7 @@ def train_rf_multiclass_more(
     return len(grown) // forest.n_classes
 
 
-def train_rf_multiclass_with_valid(
+def train_forest_multiclass_with_valid(
     data: BinnedMatrix,
     labels: List[Int],
     valid_data: BinnedMatrix,
@@ -1324,7 +1531,7 @@ def train_rf_multiclass_with_valid(
     its best round count.
 
     The signal is the multiclass log loss of the averaged model, on the terms
-    `train_rf_with_valid` describes. Truncation drops whole rounds, so the
+    `train_forest_with_valid` describes. Truncation drops whole rounds, so the
     per-class trees stay in step.
     """
     if len(labels) != data.n_rows:

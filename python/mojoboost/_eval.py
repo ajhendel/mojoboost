@@ -78,8 +78,8 @@ registry queries:
 `_NativeTable` answers them from one snapshot of the native registry,
 taken once at import through `_mojoboost.registry_metrics`,
 `registry_metric_aliases`, `registry_objectives`, and
-`registry_objective_aliases` (the binding API in
-handoffs/migration_21_objective_metric_registry.md §4). `_CompatTable`
+`registry_objective_aliases` (the binding API in section 4 of
+handoffs/migration_21_objective_metric_registry.md). `_CompatTable`
 answers them from the mirrored dicts in the marked block below, and is
 what runs on a build that does not expose those four functions -- which
 is every build today, because the binding has not landed. `_selected()`
@@ -281,8 +281,8 @@ class _CompatTable:
 # The native table. Reads the registry, holds no facts of its own.
 # ===========================================================================
 
-#: The four registry entry points, in the spelling
-#: handoffs/migration_21_objective_metric_registry.md §4 specifies. All four
+#: The four registry entry points, in the spelling section 4 of
+#: handoffs/migration_21_objective_metric_registry.md specifies. All four
 #: are needed: answering half the queries natively and half from the mirror
 #: is exactly the drift this module exists to prevent.
 _REGISTRY_HOOKS = (
@@ -293,7 +293,7 @@ _REGISTRY_HOOKS = (
 )
 
 #: Field positions in the registry tuples, so a reader can check them
-#: against §4 without counting.
+#: against section 4 without counting.
 _METRIC_CODE, _METRIC_NAME, _METRIC_TASK, _METRIC_HIGHER = 0, 1, 2, 3
 _OBJECTIVE_CODE, _OBJECTIVE_TASK, _OBJECTIVE_DEFAULT = 0, 2, 12
 

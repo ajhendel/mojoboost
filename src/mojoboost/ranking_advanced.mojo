@@ -53,7 +53,7 @@ around writing a second one wherever it can:
   `_fill_query_lambdas_general`, because neither can be expressed as a
   transform of the scores. That function is a generalization of
   `ranking._fill_query_lambdas`, not a fork of it: with the default gain
-  table, `keep_rate = 1`, and `dcg_cutoff = truncation_level` it must
+  table, a keep rate of 1, and `dcg_cutoff = truncation_level` it must
   reproduce it bit for bit, and the differential check that says so is
   listed UNRUN in the handoff.
 - The metrics compose `ranking`'s primitives (`_argsort_desc_range`,
@@ -92,17 +92,17 @@ consequences that are easy to get wrong and are load bearing here:
 - the biases are state that lives *across* rounds and is not part of the
   fitted model. A serialized ranker does not carry them (see
   docs/RANKING_ADVANCED.md, "What a model file does not hold"), which is why
-  continued training on a positioned dataset is refused rather than resumed
-  from zeros.
+  continued training on a positioned dataset must be refused rather than
+  resumed from zeros.
 
 INTENTIONAL DIFFERENCES FROM LightGBM
 -------------------------------------
-- A custom `label_gain` must be nondecreasing. LightGBM only requires that
-  the vector be long enough for the largest label. A decreasing entry makes
-  "more relevant label" and "larger gain" disagree, and the pair loop picks
-  its `high` document by *label*, so `dcg_gap` would go negative and the
-  lambda would push the less relevant document up. That is a silent
-  inversion of the objective, so it is rejected.
+- A custom `label_gain` must be nondecreasing and start at zero. LightGBM
+  only requires that the vector be long enough for the largest label. A
+  decreasing entry makes "more relevant label" and "larger gain" disagree,
+  and the pair loop picks its `high` document by *label*, so `dcg_gap` would
+  go negative and the lambda would push the less relevant document up. That
+  is a silent inversion of the objective, so it is rejected.
 - `max_dcg_cutoff` can be set independently of `truncation_level`.
   LightGBM ties them. The default (0) keeps them tied, so this is off unless
   asked for.
@@ -119,15 +119,14 @@ INTENTIONAL DIFFERENCES FROM LightGBM
   the two meet).
 """
 
-from std.math import log2
+from std.math import isfinite, log2
 
 from .bagging import BaggingParams, bagging_enabled, check_bagging
-from .binning import BinMapper, BinnedMatrix, fit_bins
+from .binning import BinnedMatrix, fit_bins
 from .boosting import Booster, BoosterParams, _check_sample_weight
 from .metrics import METRIC_MAP, METRIC_NDCG
 from .model import Model
 from .ranking import (
-    DEFAULT_NDCG_EVAL_AT,
     DEFAULT_TRUNCATION_LEVEL,
     LAMBDARANK,
     MAX_RELEVANCE_LABEL,
@@ -186,8 +185,12 @@ comptime _GOLDEN = UInt64(0x9E3779B97F4A7C15)
 comptime EMPTY_QUERY_RAISE = 0
 comptime EMPTY_QUERY_DROP = 1
 
-# LightGBM's default `eval_at` for the ranking metrics.
-comptime DEFAULT_EVAL_AT = [1, 2, 3, 4, 5]
+
+def default_eval_at() -> List[Int]:
+    """LightGBM's default `eval_at` for the ranking metrics: positions 1
+    through 5. A function rather than a constant because a `List` is a
+    runtime value; every caller gets its own copy to own."""
+    return [1, 2, 3, 4, 5]
 
 
 # ---------------------------------------------------------------------------
@@ -236,7 +239,7 @@ struct LabelGain(Copyable, Movable):
 
     def of(self, label: Int) -> Float64:
         """The gain of `label`. The caller has already validated the label
-        against `max_label` (`check_relevance_labels` does)."""
+        against `max_label`, which `check_relevance_labels` does."""
         return self.gains[label]
 
 
@@ -249,15 +252,15 @@ def check_label_gain(gain: LabelGain) raises:
     *label*, so a gain that falls as the label rises inverts the objective
     without any error surfacing. `gains[0] == 0` is the definition of an
     irrelevant document contributing nothing to DCG; LightGBM's default
-    satisfies it and a table that does not would shift every query's DCG by
-    a constant that does not cancel in the NDCG ratio."""
+    satisfies it, and a table that does not would add a constant to every
+    query's DCG that does not cancel in the NDCG ratio."""
     if len(gain.gains) == 0:
         raise Error("label_gain must have at least one entry")
     if gain.gains[0] != 0.0:
         raise Error("label_gain[0] must be 0: label 0 is the irrelevant one")
     for l in range(len(gain.gains)):
         var g = gain.gains[l]
-        if g != g or g > 1.7e308 or g < -1.7e308:
+        if not isfinite(g):
             raise Error("label_gain entries must be finite")
         if g < 0.0:
             raise Error("label_gain entries must be nonnegative")
@@ -330,7 +333,7 @@ def ideal_dcg(
 ) raises -> Float64:
     """The best DCG at cutoff k this query's labels can reach under `gain`.
 
-    `ranking.max_dcg` for the default table, so the default path has one
+    `ranking.max_dcg` for the default table, so the default path keeps one
     implementation; the counting sort here for any other."""
     if gain.is_lightgbm_default:
         return max_dcg(labels, start, cnt, k)
@@ -346,7 +349,8 @@ def ideal_dcg(
 def _inverse_max_dcgs_table(
     labels: List[Int], groups: RankGroups, k: Int, gain: LabelGain
 ) raises -> List[Float64]:
-    """`1 / maxDCG@k` per query, or 0.0 for a query with nothing to gain.
+    """`1 / maxDCG@k` per query, or 0.0 for a query with nothing to gain,
+    which zeroes that query's lambdas as in LightGBM.
 
     `ranking._inverse_max_dcgs` when the table is the default one."""
     if gain.is_lightgbm_default:
@@ -363,6 +367,7 @@ def _inverse_max_dcgs_table(
 # ---------------------------------------------------------------------------
 
 
+@fieldwise_init
 struct PositionMap(Copyable, Movable):
     """Which slot of the result page each row was shown in.
 
@@ -372,6 +377,12 @@ struct PositionMap(Copyable, Movable):
     position column, which is the ordinary biased LambdaRank case and the
     only case with parity evidence behind it.
 
+    Build one with `positions_from_codes`, which validates by construction,
+    or validate a hand-built one with `check_positions`. This follows
+    `RankGroups`: the struct holds the arrays, a checker holds the
+    invariants, so a caller cannot be surprised by a constructor that
+    raises.
+
     Position ids are a property of the *training log*, not of the model, and
     they are not needed to predict: a served ranking has no positions yet.
     """
@@ -379,28 +390,10 @@ struct PositionMap(Copyable, Movable):
     var ids: List[Int]
     var n_positions: Int
 
-    def __init__(out self, var ids: List[Int], n_positions: Int) raises:
-        if n_positions < 0:
-            raise Error("n_positions must be nonnegative")
-        if n_positions == 0 and len(ids) != 0:
-            raise Error("a position map with no positions must have no rows")
-        for r in range(len(ids)):
-            if ids[r] < 0 or ids[r] >= n_positions:
-                raise Error(
-                    "position id ",
-                    ids[r],
-                    " is outside [0, ",
-                    n_positions,
-                    ")",
-                )
-        self.ids = ids^
-        self.n_positions = n_positions
-
     @staticmethod
     def absent() -> PositionMap:
         """No position column: ordinary LambdaRank."""
-        var empty = List[Int]()
-        return PositionMap(empty^, 0)
+        return PositionMap(List[Int](), 0)
 
     def is_absent(self) -> Bool:
         return self.n_positions == 0 or len(self.ids) == 0
@@ -430,7 +423,7 @@ def positions_from_codes(codes: List[Int]) raises -> PositionEncoding:
     the row order and needs no sort, so two runs over the same data agree and
     a learned bias vector means the same thing in both. Unlike query ids,
     positions may repeat and interleave freely: a position is a label on a
-    row, not a run of rows."""
+    row, not a run of rows, so nothing here rejects a code that reappears."""
     if len(codes) == 0:
         raise Error("position codes must contain at least one row")
     var table = List[Int]()
@@ -452,27 +445,41 @@ def positions_from_codes(codes: List[Int]) raises -> PositionEncoding:
 def check_positions(positions: PositionMap, n_rows: Int) raises:
     """Validate a position map against a dataset of `n_rows` rows. An absent
     map passes: it is the ordinary no-position case."""
-    if positions.is_absent():
+    if positions.n_positions < 0:
+        raise Error("n_positions must be nonnegative")
+    if positions.n_positions == 0:
+        if len(positions.ids) != 0:
+            raise Error("a position map with no positions must have no rows")
         return
     if len(positions.ids) != n_rows:
         raise Error("position ids must have one entry per row")
+    for r in range(len(positions.ids)):
+        if positions.ids[r] < 0 or positions.ids[r] >= positions.n_positions:
+            raise Error(
+                "position id ",
+                positions.ids[r],
+                " is outside [0, ",
+                positions.n_positions,
+                ")",
+            )
 
 
-struct PositionBiasState(Copyable, Movable):
+struct PositionBiasState(Copyable, Movable, Writable):
     """The learned per-position score offsets, and the evidence behind them.
 
     `biases[p]` is added to the raw score of every row shown at position p
     before the pair loop runs, and is updated once per round by a Newton
     step on the same lambdas the trees are fitted to. `counts[p]` and the
-    two derivative sums record the last update, so a caller can report why a
-    bias moved (or did not) without instrumenting the trainer.
+    two derivative vectors record the last update, so a caller can report
+    why a bias moved (or did not) without instrumenting the trainer.
 
     This is **training state, not model state.** A fitted `Booster` does not
     carry it and `serialize.save_model` does not write it; the biases exist
     to make the trees fitted alongside them unbiased, and the trees are what
     is served. That is also why continued training on a positioned dataset
-    is refused rather than resumed: resuming from zero biases would fit the
-    next round's trees against a correction the earlier rounds already made.
+    must be refused rather than resumed: resuming from zero biases would fit
+    the next round's trees against a correction the earlier rounds already
+    made.
     """
 
     var biases: List[Float64]
@@ -522,6 +529,17 @@ struct PositionBiasState(Copyable, Movable):
             out.append(scores[r] + self.biases[positions.ids[r]])
         return out^
 
+    def write_to(self, mut writer: Some[Writer]):
+        writer.write("PositionBiasState(updates=", self.updates, ", biases=[")
+        for p in range(len(self.biases)):
+            if p > 0:
+                writer.write(", ")
+            writer.write(self.biases[p])
+        writer.write("])")
+
+    def write_repr_to(self, mut writer: Some[Writer]):
+        self.write_to(writer)
+
 
 def update_position_bias(
     mut state: PositionBiasState,
@@ -540,7 +558,7 @@ def update_position_bias(
     derivatives are of the utility, so they are the negated gradients; the
     L2 term is scaled by the number of rows at the position, so a position
     seen a thousand times is not shrunk as hard as one seen twice; and the
-    denominator carries a 1e-3 floor so a position with no rows leaves its
+    denominator carries the 1e-3 floor so a position with no rows leaves its
     bias where it was.
 
     Does nothing when there is no position column, so a caller may call it
@@ -634,7 +652,7 @@ struct AdvancedRankParams(Copyable, Movable):
         return AdvancedRankParams(
             RankerParams.default(),
             LabelGain.default(),
-            DEFAULT_EVAL_AT,
+            default_eval_at(),
             0,
             DEFAULT_POSITION_BIAS_REGULARIZATION,
             DEFAULT_PAIR_SAMPLING_RATE,
@@ -681,11 +699,11 @@ def check_advanced_rank_params(params: AdvancedRankParams) raises:
                 raise Error(
                     "eval_at position ", params.eval_at[i], " is listed twice"
                 )
-    var found = False
+    var watched = False
     for i in range(len(params.eval_at)):
         if params.eval_at[i] == params.base.ndcg_eval_at:
-            found = True
-    if not found:
+            watched = True
+    if not watched:
         raise Error(
             "ndcg_eval_at (",
             params.base.ndcg_eval_at,
@@ -693,8 +711,10 @@ def check_advanced_rank_params(params: AdvancedRankParams) raises:
             " is one of the cutoffs the run reports",
         )
     if params.max_dcg_cutoff < 0:
-        raise Error("max_dcg_cutoff must be nonnegative (0 = follow"
-                    " lambdarank_truncation_level)")
+        raise Error(
+            "max_dcg_cutoff must be nonnegative (0 follows"
+            " lambdarank_truncation_level)"
+        )
     if params.position_bias_regularization < 0.0:
         raise Error(
             "lambdarank_position_bias_regularization must be nonnegative"
@@ -722,18 +742,17 @@ def _pair_stream(seed: Int, iteration: Int, query: Int) -> UInt64:
     (i, j) depends only on (seed, iteration, query, i, j), so it survives
     reordering, threading, bagging, and being replayed from the middle of a
     run. Sign bits are masked off so negative seeds are accepted."""
-    var h = _splitmix64(
-        UInt64(seed & 0x7FFFFFFFFFFFFFFF) ^ _PAIR_DOMAIN
-    )
+    var h = _splitmix64(UInt64(seed & 0x7FFFFFFFFFFFFFFF) ^ _PAIR_DOMAIN)
     h = _splitmix64(h ^ UInt64(iteration & 0x7FFFFFFFFFFFFFFF))
     return _splitmix64(h ^ UInt64(query & 0x7FFFFFFFFFFFFFFF))
 
 
 def _pair_kept(stream: UInt64, i: Int, j: Int, rate: Float64) -> Bool:
-    """Whether the pair at ranks (i, j) survives the draw."""
-    return _uniform(_splitmix64(stream ^ (UInt64(i) * _GOLDEN)) + UInt64(j)) < (
-        rate
-    )
+    """Whether the pair at ranks (i, j) survives the draw. The two ranks are
+    mixed rather than added so that (i, j) and (j, i) - and every other pair
+    with the same sum - draw independently."""
+    var counter = _splitmix64(stream ^ (UInt64(i) * _GOLDEN)) + UInt64(j)
+    return _uniform(counter) < rate
 
 
 def pair_budget(groups: RankGroups, truncation_level: Int) -> Int:
@@ -741,9 +760,10 @@ def pair_budget(groups: RankGroups, truncation_level: Int) -> Int:
     query, ignoring labels.
 
     The cost model behind `pair_sampling_rate`: a query of `cnt` documents
-    contributes `sum over i < min(cnt - 1, truncation) of (cnt - 1 - i)`.
-    Label ties only remove work from this, never add it, so this is an upper
-    bound on the round's pair count."""
+    contributes the sum over `i < min(cnt - 1, truncation)` of
+    `cnt - 1 - i`. Label ties only remove work from this, never add it, so
+    this is an upper bound on the round's pair count and
+    `GroupAudit.n_pairs` is the exact one."""
     var total = 0
     for q in range(groups.n_queries()):
         var cnt = groups.size(q)
@@ -806,9 +826,9 @@ def _fill_query_lambdas_general(
     for i in range(top):
         for j in range(i + 1, cnt):
             # Tied labels express no preference, so the pair carries no
-            # information in either direction and is skipped before the draw
-            # (skipping it after would spend randomness on nothing and make
-            # the kept set depend on the labels).
+            # information in either direction and is skipped before the draw.
+            # Skipping it after would spend randomness on nothing and make
+            # which pairs survive depend on the labels.
             if labels[start + order[i]] == labels[start + order[j]]:
                 continue
             if sampling and not _pair_kept(
@@ -925,7 +945,7 @@ def advanced_lambdarank_gradients(
     4. the position biases take one Newton step on those weighted lambdas
 
     `iteration` and `learning_rate` are the boosting round index and the
-    boosting learning rate. The first keys the pair draw so a round is
+    boosting learning rate. The first keys the pair draw, so a round is
     reproducible from its index alone; the second is the step size of the
     bias update, as it is in LightGBM, where the objective reads
     `config.learning_rate` for exactly this."""
@@ -936,13 +956,12 @@ def advanced_lambdarank_gradients(
     check_advanced_rank_params(params)
     check_positions(positions, len(scores))
     _check_sample_weight(sample_weight, len(scores))
-    if not positions.is_absent() and bias.n_positions() != (
-        positions.n_positions
-    ):
-        raise Error(
-            "the position bias state was built for a different number of"
-            " positions than the position map names"
-        )
+    if not positions.is_absent():
+        if bias.n_positions() != positions.n_positions:
+            raise Error(
+                "the position bias state was built for a different number of"
+                " positions than the position map names"
+            )
     if iteration < 0:
         raise Error("iteration must be nonnegative")
 
@@ -993,6 +1012,7 @@ def advanced_lambdarank_gradients(
 # ---------------------------------------------------------------------------
 
 
+@fieldwise_init
 struct GroupAudit(Copyable, Movable, Writable):
     """What a query set is actually made of.
 
@@ -1013,6 +1033,10 @@ struct GroupAudit(Copyable, Movable, Writable):
     var n_tied_label: Int
     var n_pairable: Int
     var n_pairs: Int
+
+    def trains_on_nothing(self) -> Bool:
+        """Whether no query in the set can produce a single lambda."""
+        return self.n_pairs == 0
 
     def write_to(self, mut writer: Some[Writer]):
         writer.write(
@@ -1040,10 +1064,6 @@ struct GroupAudit(Copyable, Movable, Writable):
     def write_repr_to(self, mut writer: Some[Writer]):
         self.write_to(writer)
 
-    def trains_on_nothing(self) -> Bool:
-        """Whether no query in the set can produce a single lambda."""
-        return self.n_pairs == 0
-
 
 def audit_groups(
     labels: List[Int],
@@ -1061,7 +1081,7 @@ def audit_groups(
     round's cost.
 
     Ranks are not known before the scores are, so `n_pairs` counts pairs of
-    *positions in an arbitrary order* under the truncation. It is exact when
+    *positions in the input order* under the truncation. It is exact when
     the truncation level is at least the largest query, which is the default
     for query sets of 30 documents or fewer, and an estimate above that."""
     check_groups(groups, groups.n_rows)
@@ -1070,7 +1090,7 @@ def audit_groups(
     if truncation_level < 1:
         raise Error("truncation_level must be positive")
 
-    var min_size = groups.size(0) if groups.n_queries() > 0 else 0
+    var min_size = groups.size(0)
     var max_size = 0
     var n_single = 0
     var n_zero = 0
@@ -1201,19 +1221,16 @@ def prunable_queries(
     differing labels within the truncation, or no attainable DCG at all.
 
     Dropping these from **training** changes no gradient, because each of
-    their rows already receives a lambda of exactly 0.0, so a tree grown
-    without them is the tree grown with them wherever the leaf values depend
-    on gradients rather than on counts. It is not free, though:
-    `min_data_in_leaf` and every other count-based rule *do* see the rows,
-    so pruning changes which splits are legal. Treat this as a cost
-    decision, not an identity.
+    their rows already receives a lambda of exactly 0.0. It is not free,
+    though: `min_data_in_leaf` and every other count-based rule *do* see
+    those rows, so pruning them changes which splits are legal. Treat this
+    as a cost decision, not an identity.
 
     Dropping them from **evaluation** is not safe under any reading. They
     are counted as 1.0 by both NDCG and MAP, so removing them changes the
     reported number; `RankEval.n_degenerate` reports how many there were
     instead."""
-    var audit_labels = len(labels)
-    if audit_labels != groups.n_rows:
+    if len(labels) != groups.n_rows:
         raise Error("labels length must equal the group row count")
     if truncation_level < 1:
         raise Error("truncation_level must be positive")
@@ -1320,10 +1337,10 @@ struct RankEval(Copyable, Movable, Writable):
     labels zero for NDCG, no relevant document for MAP - each of which
     contributes exactly 1.0. `n_single_document` is the number that could
     not have contributed anything else, since a query of one document is
-    always perfectly ranked. A reported NDCG of 0.9 over a set that is a
-    third degenerate is a different number from a reported NDCG of 0.9 over
-    a set that is not, and nothing downstream can tell them apart without
-    these.
+    always perfectly ranked at every cutoff. A reported NDCG of 0.9 over a
+    set that is a third degenerate is a different number from a reported
+    NDCG of 0.9 over a set that is not, and nothing downstream can tell them
+    apart without these.
     """
 
     var metric: Int
@@ -1359,6 +1376,7 @@ struct RankEval(Copyable, Movable, Writable):
         self.weighted = weighted
 
     def name(self) raises -> String:
+        """The metric's LightGBM name, for reporting."""
         if self.metric == METRIC_NDCG:
             return String("ndcg")
         if self.metric == METRIC_MAP:
@@ -1394,11 +1412,12 @@ struct RankEval(Copyable, Movable, Writable):
         return Float64(self.n_degenerate) / Float64(self.n_queries)
 
     def write_to(self, mut writer: Some[Writer]):
-        try:
-            writer.write(self.name())
-        except:
-            writer.write("rank_metric")
-        writer.write("(")
+        if self.metric == METRIC_NDCG:
+            writer.write("ndcg(")
+        elif self.metric == METRIC_MAP:
+            writer.write("map(")
+        else:
+            writer.write("rank_metric(")
         for c in range(len(self.cutoffs)):
             if c > 0:
                 writer.write(", ")
@@ -1410,10 +1429,10 @@ struct RankEval(Copyable, Movable, Writable):
             self.n_degenerate,
             ", single_document=",
             self.n_single_document,
-            ", weighted=",
-            self.weighted,
-            ")",
         )
+        if self.weighted:
+            writer.write(", query weighted")
+        writer.write(")")
 
     def write_repr_to(self, mut writer: Some[Writer]):
         self.write_to(writer)
@@ -1435,6 +1454,18 @@ def _check_eval_inputs(
         raise Error("sample_weight length must equal n_rows")
 
 
+def _eval_query_weights(
+    groups: RankGroups,
+    params: AdvancedRankParams,
+    sample_weight: List[Float64],
+) raises -> List[Float64]:
+    """The per-query weights an evaluation averages under, or an empty list
+    when the run is unweighted."""
+    if not params.weight_queries:
+        return List[Float64]()
+    return query_weights(groups, sample_weight)
+
+
 def ndcg_eval(
     scores: List[Float64],
     labels: List[Int],
@@ -1448,27 +1479,31 @@ def ndcg_eval(
 
     Composed from `ranking`'s primitives: `_argsort_desc_range` orders the
     documents, `_sorted_gains` (or the gain-table form) builds the ideal
-    ranking, `_discounts` supplies `1 / log2(rank + 2)`. What is here and not
-    in `ranking.ndcg_at_cutoffs` is the per-query vector, the query weights,
-    the custom gain vector, and the counts.
+    ranking, `_discounts` supplies `1 / log2(rank + 2)`. What is here and
+    not in `ranking.ndcg_at_cutoffs` is the per-query vector, the query
+    weights, the custom gain vector, and the counts.
 
     `ranking.ndcg_at_cutoffs` remains the authority for the case the two
     share - unweighted, default gains - and this must agree with it there.
     Ties in the scores keep their input order, as they do there, because the
-    same stable ordering does the sorting."""
+    same stable ordering does the sorting.
+
+    Scores are the model's raw scores. A position bias, if one was learned,
+    is *not* added: the ranking a user is served has no position column, so
+    scoring the adjusted scores would report a number no deployment can
+    reach."""
     _check_eval_inputs(scores, labels, groups, params, sample_weight)
 
     var cutoffs = params.eval_at.copy()
     var n_c = len(cutoffs)
     var n_q = groups.n_queries()
-    var qw = query_weights(groups, sample_weight) if params.weight_queries (
-    ) else List[Float64]()
+    var qw = _eval_query_weights(groups, params, sample_weight)
     var weighted = len(qw) > 0
 
     var totals = List[Float64](capacity=n_c)
     for _ in range(n_c):
         totals.append(0.0)
-    var values = List[Float64]()
+    var values = List[Float64](capacity=n_c)
     var per = List[Float64]()
     if per_query:
         per.resize(n_c * n_q, 0.0)
@@ -1486,8 +1521,9 @@ def ndcg_eval(
             n_single += 1
         var order = _argsort_desc_range(scores, start, cnt)
         var gains = _query_sorted_gains(labels, start, cnt, params.gain)
-        # The ideal DCG is zero at every cutoff exactly when every gain is
-        # zero, so degeneracy is a property of the query, not of a cutoff.
+        # The ideal DCG is zero at every cutoff exactly when the largest
+        # gain in the query is zero, so degeneracy is a property of the
+        # query and not of a cutoff.
         if gains[0] <= 0.0:
             n_degenerate += 1
         for c in range(n_c):
@@ -1525,13 +1561,13 @@ def map_eval(
     sample_weight: List[Float64] = [],
     per_query: Bool = False,
 ) raises -> RankEval:
-    """Mean average precision at every position in `params.eval_at`, with the
-    same metadata.
+    """Mean average precision at every position in `params.eval_at`, with
+    the same metadata.
 
     Relevance is binary (any label above 0), AP@k is divided by
     `min(k, relevant in query)`, and a query with nothing relevant counts as
-    1.0 - the conventions `ranking.map_at_cutoffs` documents and this must
-    agree with on the unweighted case. The gain vector plays no part: MAP
+    1.0 - the conventions `ranking.map_at_cutoffs` documents, and this must
+    agree with it on the unweighted case. The gain vector plays no part: MAP
     does not read graded relevance, which is exactly why a run should report
     both metrics rather than either alone."""
     _check_eval_inputs(scores, labels, groups, params, sample_weight)
@@ -1539,14 +1575,13 @@ def map_eval(
     var cutoffs = params.eval_at.copy()
     var n_c = len(cutoffs)
     var n_q = groups.n_queries()
-    var qw = query_weights(groups, sample_weight) if params.weight_queries (
-    ) else List[Float64]()
+    var qw = _eval_query_weights(groups, params, sample_weight)
     var weighted = len(qw) > 0
 
     var totals = List[Float64](capacity=n_c)
     for _ in range(n_c):
         totals.append(0.0)
-    var values = List[Float64]()
+    var values = List[Float64](capacity=n_c)
     var per = List[Float64]()
     if per_query:
         per.resize(n_c * n_q, 0.0)
@@ -1611,8 +1646,8 @@ def map_eval(
 def check_query_bagging(bagging: BaggingParams, groups: RankGroups) raises:
     """Validate query bagging against the query count, not the row count.
 
-    `bagging.check_bagging` validates the fraction and frequency; this adds
-    the check that only ranking can make. `bagging.sample_rows` guarantees a
+    `bagging.check_bagging` validates the fraction and the frequency; this
+    adds the check only ranking can make. `bagging.sample_rows` guarantees a
     nonempty bag by falling back to the single smallest draw, so a fraction
     of 0.001 over 20 queries does not fail - it silently trains every round
     on one query. That is a configuration mistake, not a random outcome, and
@@ -1664,8 +1699,8 @@ struct QueryFold(Copyable, Movable):
 
     Both sides carry their rows *and* their `group` arrays, because a row
     list without query boundaries is not a ranking dataset: the maxDCG a
-    fold's rows are normalized against is determined by which of them share
-    a query."""
+    fold's rows are normalized against is decided by which of them share a
+    query."""
 
     var train_rows: List[Int]
     var test_rows: List[Int]
@@ -1693,13 +1728,12 @@ struct QueryFold(Copyable, Movable):
 
 def _fold_shuffle(n: Int, seed: Int) -> List[Int]:
     """A deterministic permutation of `0..n-1`, Fisher-Yates over a
-    counter-based stream so the order depends on (seed, n) alone."""
+    counter-based stream, so the order depends on (seed, n) alone and not on
+    how many draws came before it."""
     var order = List[Int](capacity=n)
     for i in range(n):
         order.append(i)
-    var stream = _splitmix64(
-        UInt64(seed & 0x7FFFFFFFFFFFFFFF) ^ _FOLD_DOMAIN
-    )
+    var stream = _splitmix64(UInt64(seed & 0x7FFFFFFFFFFFFFFF) ^ _FOLD_DOMAIN)
     for i in range(n - 1, 0, -1):
         var j = Int(_uniform(stream + UInt64(i)) * Float64(i + 1))
         if j > i:
@@ -1724,14 +1758,16 @@ def query_folds(
     the unit here, exactly as it is for bagging.
 
     Fold f holds queries `[f * Q // K, (f + 1) * Q // K)` of the query
-    order - the same contiguous chunking `python/mojoboost/cv.py::_chunk_folds`
-    does, so the Mojo and Python paths agree fold for fold when they are
-    given the same shuffle. With `shuffle=True` that order is a
-    counter-based permutation of the query indices, never of the rows.
+    order - the same contiguous chunking
+    `python/mojoboost/cv.py::_chunk_folds` does, so the Mojo and Python
+    paths agree fold for fold when they are given the same order. With
+    `shuffle=True` that order is a counter-based permutation of the query
+    indices, never of the rows.
 
     Every query lands in exactly one test fold and in every other fold's
-    training side, so the folds partition the query set and the row lists
-    they hand back are ascending."""
+    training side, so the folds partition the query set, and both row lists
+    come back ascending because the query lists are sorted before they are
+    expanded."""
     if n_folds < 2:
         raise Error("n_folds must be at least 2")
     var n_q = groups.n_queries()
@@ -1744,8 +1780,10 @@ def query_folds(
             " queries",
         )
 
-    var order = _fold_shuffle(n_q, seed) if shuffle else List[Int]()
-    if not shuffle:
+    var order: List[Int]
+    if shuffle:
+        order = _fold_shuffle(n_q, seed)
+    else:
         order = List[Int](capacity=n_q)
         for q in range(n_q):
             order.append(q)
@@ -1766,12 +1804,16 @@ def query_folds(
         # is what tree growth and `_expand_queries` assume.
         sort(test_q)
         sort(train_q)
+        var train_rows = rows_of_queries(groups, train_q)
+        var test_rows = rows_of_queries(groups, test_q)
+        var train_counts = group_counts_of_queries(groups, train_q)
+        var test_counts = group_counts_of_queries(groups, test_q)
         folds.append(
             QueryFold(
-                rows_of_queries(groups, train_q),
-                rows_of_queries(groups, test_q),
-                group_counts_of_queries(groups, train_q),
-                group_counts_of_queries(groups, test_q),
+                train_rows^,
+                test_rows^,
+                train_counts^,
+                test_counts^,
                 train_q^,
                 test_q^,
             )
@@ -1788,7 +1830,7 @@ def query_folds(
 struct QueryPartition(Copyable, Movable):
     """One rank's slice of a ranking dataset, cut on query boundaries.
 
-    Half-open in both coordinates: the rank owns queries
+    Half open in both coordinates: the rank owns queries
     `[query_start, query_end)` and rows `[row_start, row_end)`, and the two
     agree by construction. A rank may own no queries, in which case it owns
     no rows and takes part in every collective as a zero contribution, which
@@ -1828,11 +1870,11 @@ def partition_queries(
 
     The cut is the contiguous, order-preserving one closest to an even row
     split: boundary `r` is placed at the query boundary nearest to
-    `r * n_rows // W`, ties going to the earlier boundary, and boundaries
-    are forced nondecreasing so a run of large queries yields empty ranks
-    rather than a crossed partition. Concatenating the partitions in
-    ascending rank order reproduces the dataset row for row, which is the
-    property `distributed.partition_rows` documents and the floating point
+    `r * n_rows // W`, and boundaries are forced nondecreasing so a run of
+    large queries yields empty ranks rather than a crossed partition.
+    Concatenating the partitions in ascending rank order reproduces the
+    dataset row for row, which is the property
+    `distributed.partition_rows` documents and the floating point
     equivalence argument rests on."""
     if world_size < 1:
         raise Error("world_size must be positive")
@@ -1843,8 +1885,9 @@ def partition_queries(
     cuts.append(0)
     for r in range(1, world_size):
         var target = r * n_rows // world_size
-        # The query boundaries are `groups.starts`, ascending, so the
-        # nearest one is found by a scan that never goes backwards.
+        # `groups.starts` is ascending, so the nearest boundary is found by
+        # a scan that starts where the previous rank ended and stops at the
+        # first boundary that has reached the target.
         var best_q = cuts[r - 1]
         var best_gap = -1
         for q in range(cuts[r - 1], n_q + 1):
@@ -1856,8 +1899,6 @@ def partition_queries(
                 best_q = q
             if groups.starts[q] >= target:
                 break
-        if best_q < cuts[r - 1]:
-            best_q = cuts[r - 1]
         cuts.append(best_q)
     cuts.append(n_q)
 
@@ -1913,6 +1954,8 @@ def check_query_partition(
             )
         if p.query_end < p.query_start:
             raise Error("partition for rank ", r, " ends before it starts")
+        if p.query_end > groups.n_queries():
+            raise Error("partition for rank ", r, " names a missing query")
         if p.row_start != groups.starts[p.query_start]:
             raise Error(
                 "partition for rank ",
@@ -1938,6 +1981,36 @@ def check_query_partition(
 # ---------------------------------------------------------------------------
 
 
+struct TrainedAdvancedRanker(Copyable, Movable):
+    """A trained ranking ensemble and the position biases learned beside it.
+
+    Two values rather than one because they have different lifetimes: the
+    `Booster` is the model and serializes, the `PositionBiasState` is
+    training state that no model file holds. Returning them together is what
+    keeps the biases recoverable at all - a caller that throws this half
+    away has thrown away the only record of the correction the trees were
+    fitted under."""
+
+    var booster: Booster
+    var bias: PositionBiasState
+
+    def __init__(out self, var booster: Booster, var bias: PositionBiasState):
+        self.booster = booster^
+        self.bias = bias^
+
+
+struct FittedAdvancedRanker(Copyable, Movable):
+    """`TrainedAdvancedRanker` with the bin mapper folded in, the ranking
+    counterpart of `ranking.fit_ranker`'s `Model` return."""
+
+    var model: Model
+    var bias: PositionBiasState
+
+    def __init__(out self, var model: Model, var bias: PositionBiasState):
+        self.model = model^
+        self.bias = bias^
+
+
 def train_ranker_advanced(
     data: BinnedMatrix,
     labels: List[Int],
@@ -1947,8 +2020,7 @@ def train_ranker_advanced(
     positions: PositionMap = PositionMap.absent(),
     sample_weight: List[Float64] = [],
     bagging: BaggingParams = BaggingParams.disabled(),
-    mut bias_out: PositionBiasState = PositionBiasState(0),
-) raises -> Booster:
+) raises -> TrainedAdvancedRanker:
     """Train a LambdaRank ensemble with the advanced features applied.
 
     A second outer loop, and it is honest about why: the position biases are
@@ -1957,22 +2029,17 @@ def train_ranker_advanced(
     `advanced_lambdarank_gradients` for the round's gradients (which is
     `ranking._fill_lambdas` itself in every default configuration),
     `ranking._refresh_query_bag` for the bag, `tree.grow_tree` for the tree,
-    and an ordinary `boosting.Booster` of ordinary `tree.Tree` values for the
-    result. The handoff carries the patch that folds this back into
+    and an ordinary `boosting.Booster` of ordinary `tree.Tree` values for
+    the result. The handoff carries the patch that folds this back into
     `ranking.train_ranker` as an optional argument, at which point this
     function goes away.
 
-    `bias_out` receives the learned position biases, because they are not
-    part of the returned model and would otherwise be unrecoverable. It must
-    be sized for `positions` (`PositionBiasState.for_positions`); the
-    default, a zero-position state, is the right one when there is no
-    position column.
-
-    The result is an ordinary single-output `Booster` carrying the
-    `LAMBDARANK` objective code, boosting from 0.0 as `ranking.train_ranker`
-    does, and it serializes and predicts through exactly the same paths. A
-    model file therefore does not record that position bias was used, which
-    is the serialization consequence recorded in docs/RANKING_ADVANCED.md.
+    The returned booster boosts from 0.0 as `ranking.train_ranker`'s does,
+    carries the `LAMBDARANK` objective code, and serializes and predicts
+    through exactly the same paths. A model file therefore does not record
+    that position bias was used, which is the serialization consequence
+    recorded in docs/RANKING_ADVANCED.md, and the returned
+    `PositionBiasState` is the only copy of what was learned.
     """
     if len(labels) != data.n_rows:
         raise Error("labels length must equal n_rows")
@@ -1982,16 +2049,11 @@ def train_ranker_advanced(
     check_positions(positions, data.n_rows)
     _check_sample_weight(sample_weight, data.n_rows)
     check_query_bagging(bagging, groups)
-    if not positions.is_absent():
-        if bias_out.n_positions() != positions.n_positions:
-            raise Error(
-                "bias_out must be built for this dataset's positions; use"
-                " PositionBiasState.for_positions"
-            )
 
     var n = data.n_rows
     var raw = List[Float64](capacity=n)
     raw.resize(n, 0.0)
+    var bias = PositionBiasState.for_positions(positions)
 
     var trees = List[Tree]()
     var grad = List[Float64](capacity=n)
@@ -2005,7 +2067,7 @@ def train_ranker_advanced(
             labels,
             groups,
             positions,
-            bias_out,
+            bias,
             grad,
             hess,
             rank_params,
@@ -2028,13 +2090,14 @@ def train_ranker_advanced(
             raw[r] += params.learning_rate * tree.predict_row(data, r)
         trees.append(tree^)
 
-    return Booster(
+    var booster = Booster(
         trees^,
         0.0,
         params.learning_rate,
         LAMBDARANK,
         params.tree.monotone.copy(),
     )
+    return TrainedAdvancedRanker(booster^, bias^)
 
 
 def fit_ranker_advanced(
@@ -2051,13 +2114,12 @@ def fit_ranker_advanced(
     bagging: BaggingParams = BaggingParams.disabled(),
     use_missing: Bool = True,
     categorical_features: List[Int] = [],
-    mut bias_out: PositionBiasState = PositionBiasState(0),
-) raises -> Model:
+) raises -> FittedAdvancedRanker:
     """`ranking.fit_ranker` with the advanced parameters.
 
-    Binning, the raw column-major layout, `use_missing`, and
-    `categorical_features` mean exactly what they do there; the `group`
-    array goes through `sanitize_group_counts` first, so
+    Binning, the raw column-major layout (`features[f * n_rows + r]`),
+    `use_missing`, and `categorical_features` mean exactly what they do
+    there; the `group` array goes through `sanitize_group_counts` first, so
     `rank_params.empty_query_policy` decides whether a query holding no rows
     is an error or is dropped."""
     var groups = groups_from_counts_sanitized(
@@ -2074,7 +2136,7 @@ def fit_ranker_advanced(
         categorical_features=categorical_features,
     )
     var data = mapper.transform(features, n_rows)
-    var booster = train_ranker_advanced(
+    var trained = train_ranker_advanced(
         data,
         labels,
         groups,
@@ -2083,6 +2145,6 @@ def fit_ranker_advanced(
         positions,
         sample_weight,
         bagging,
-        bias_out,
     )
-    return Model(mapper^, booster^)
+    var model = Model(mapper^, trained.booster.copy())
+    return FittedAdvancedRanker(model^, trained.bias^)

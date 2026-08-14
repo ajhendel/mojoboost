@@ -480,6 +480,89 @@ def check_float_param(value, name):
 # ---------------------------------------------------------------------------
 
 
+def check_fit_structure(
+    X,
+    y,
+    n_rows,
+    n_features,
+    sample_weight=None,
+    group=None,
+    init_score=None,
+    name="X",
+):
+    """Every structural rule a fit call has, in the order a caller hits them.
+
+    One call so that adopting this module is a one-line edit at each
+    estimator rather than a rewrite. It runs after ``X`` has been turned into
+    a buffer, because the shape is what the earlier conversion produced, and
+    it checks the per-row columns against that shape.
+
+    ``group`` is checked only for length agreement with itself, not for
+    contents: whether the counts are positive and sum to ``n_rows`` is
+    arithmetic on the numbers, which is ``validation.check_group_counts``'s.
+
+    Returns the validated ``(n_rows, n_features)`` pair.
+    """
+    n_rows, n_features = check_shape(n_rows, n_features, name)
+    check_length(y, n_rows, "y")
+    check_frame_index_aligned(X, y, "y")
+    check_optional_length(sample_weight, n_rows, "sample_weight")
+    check_optional_length(init_score, n_rows, "init_score")
+    if group is not None:
+        try:
+            n_queries = len(group)
+        except TypeError:
+            raise TypeError(
+                "group must be a sequence of per-query row counts, got "
+                f"{type(group).__name__}"
+            ) from None
+        if n_queries < 1:
+            raise ValueError("group must contain at least one query")
+        if n_queries > n_rows:
+            raise ValueError(
+                f"group has {n_queries} queries but X has only {n_rows} "
+                "rows, and every query needs at least one row"
+            )
+    return n_rows, n_features
+
+
+def check_feature_count_matches(
+    fitted_n_features, incoming_n_features, name="X"
+):
+    """A matrix is as wide as the one the model was fitted on.
+
+    The binned matrix is positional, so a matrix of a different width is
+    binned into bins that mean different features and predicts a number with
+    no relationship to the input.
+    """
+    fitted = int(fitted_n_features)
+    incoming = int(incoming_n_features)
+    if incoming != fitted:
+        raise ValueError(
+            f"{name} has {incoming} features, but this model was fitted on "
+            f"{fitted}"
+        )
+    return incoming
+
+
+def check_predict_structure(
+    X, n_features, fitted_n_features, fitted_names=None, n_rows=None, name="X"
+):
+    """Every structural rule a predict call has, in one call.
+
+    Width first, because it is the failure that produces nonsense rather than
+    an error. Then names, when both sides carry them, which catches the case
+    a width check cannot: the same columns, rearranged.
+    """
+    incoming = check_feature_count_matches(
+        fitted_n_features, n_features, name
+    )
+    if n_rows is not None:
+        check_shape(n_rows, incoming, name)
+    check_feature_names_match(fitted_names, frame_column_names(X), name)
+    return incoming
+
+
 def domain_checks_are_native():
     """True, always, and here to be imported rather than called.
 
@@ -521,7 +604,9 @@ __all__ = [
     "MAX_FEATURES",
     "MAX_ROWS",
     "check_category_tables",
+    "check_feature_count_matches",
     "check_feature_names_match",
+    "check_fit_structure",
     "check_float64_convertible",
     "check_float_param",
     "check_frame_index_aligned",
@@ -530,6 +615,7 @@ __all__ = [
     "check_ndim",
     "check_optional_length",
     "check_param_mapping",
+    "check_predict_structure",
     "check_rectangular",
     "check_shape",
     "check_sparse_index_width",

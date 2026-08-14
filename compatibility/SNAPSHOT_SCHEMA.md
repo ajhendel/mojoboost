@@ -251,6 +251,10 @@ throwaway cross-check; the rest were found by this lane.
 8. **`__all__` in `__init__.py` is interleaved with comments and is not
    sorted.** Take the `ast.List` elements in order and keep that order.
    Sorting it here would make a rewrite invisible.
+9. **The bare prefix `"MOJOBOOST_"` occurs as a literal.** It is a prefix
+   filter, not a variable. A scan that keeps it adds a phantom variable to
+   `environment.observed` that can never be declared and never goes away.
+   Discard any literal equal to the prefix.
 
 ## 6. Invariants the tool enforces
 
@@ -273,7 +277,18 @@ about the tree rather than facts about the file.
 | I11 | The union of `mojo.exports_by_module` values equals `check_parity.mojo_export_names()` | Two parsers over one file must agree, or one of them is dropping a module |
 
 I5 and I11 are the two that catch a whole class of bug rather than one
-bug. I5 is currently violated; see `DRIFT_REPORT.md`.
+bug.
+
+**I4 and I5 are violated on the tree as read**, which is findings F1 and
+F2 in [DRIFT_REPORT.md](DRIFT_REPORT.md). So the first
+`tools/api_snapshot.py --check` after this lane will exit non-zero on
+those two before it says anything about the snapshot file, and that is the
+correct outcome: the invariants are facts about the tree, and the tree is
+wrong. Fixing them is not this lane's to do.
+
+I1, I2, I3, I6, I7, and I8 hold on the tree as read. I9 and I10 hold
+vacuously, because the register carries no ordinary entries. I11 was not
+evaluated, because evaluating it means running the tool.
 
 ### 6.4 On importing `check_parity`
 

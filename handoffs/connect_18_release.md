@@ -1,8 +1,11 @@
 # Connect 18. Release packaging, platform matrix, and install experience
 
-Static inspection only. Nothing here was built, installed, published, or run.
-No wheel was produced, no workflow was dispatched, no validator was executed.
-Every claim below comes from reading files.
+Static inspection, plus one command. Nothing here was built, installed, or
+published. No wheel was produced and no workflow was dispatched. The single
+exception is `packaging/matrix/validate_matrix.py`, a read-only
+standard-library check that was run against this lane's own edits and passed;
+it is recorded at the end of this document, including what it does not prove.
+Every other claim below comes from reading files.
 
 ## What this lane found, and what it actually did
 
@@ -256,11 +259,8 @@ which artifacts the matrix admits exist and which checks run against them.
 
 ## Risks
 
-- **The new `validate_matrix.py` rules were not executed.** If a target row was
-  missed, the failure is a loud validator error at the top of a release run,
-  not a bad artifact. All eight target rows were confirmed by inspection to
-  carry `publishable`, `builder_script`, and `workflow`, and the file's
-  triple-quote count is even, but no parser has read either file.
+- ~~The new `validate_matrix.py` rules were not executed.~~ **Retired.** They
+  were run and passed, on all eight targets. See the command section below.
 - **`publishable` widens what the matrix accepts.** A future Linux row could
   now legally carry a bare `linux_` tag. That is the intent, and the guard is
   that such a row must declare itself unpublishable and the TestPyPI job
@@ -271,25 +271,55 @@ which artifacts the matrix admits exist and which checks run against them.
   inspection step behaves, but it does mean a matrix error stops a build later
   than `validate_matrix.py` would.
 
-## Smallest later commands, all UNRUN
+## Smallest later commands
 
-None of these were executed by this lane.
+### Command 1, RUN, and it passed
+
+The matrix contract check was run in the session that produced this handoff,
+after the repository owner lifted the static-inspection restriction for this one
+read-only, standard-library, no-network command.
 
 ```sh
-# 1. Does the matrix still parse and agree with the repository?
 python3 packaging/matrix/validate_matrix.py
+```
 
-# 2. Does the Python this lane edited compile?
-python3 -m py_compile packaging/matrix/validate_matrix.py
+```
+release matrix ok: 8 targets, 3 source installs, 25 devices, 1 with any recorded evidence
+```
 
-# 3. Does the Linux workflow still parse as YAML?
-python3 -c "import yaml,sys; yaml.safe_load(open('.github/workflows/release-linux.yml'))"
+This is the only executed evidence behind anything in this document, and it is
+worth being precise about what it does and does not establish.
 
-# 4. Only after a Linux wheel exists, and expected to pass now that the
-#    plain-tag rows are declared. This is the check that would have failed.
+**What it proves.** The TOML parses, so both new `[[target]]` blocks and their
+multi-line notes are well formed, and the target count of 8 is the expected 6
+plus the two new `-manylinux` rows. The edited `validate_matrix.py` compiles and
+every rule in it ran. The new `builder_script` and `workflow` fields on all
+eight targets resolve to files that exist in the tree, which is the check that
+would have caught the original `builder = "does not exist yet"` drift. The new
+`publishable` rules accept the four Linux rows, meaning the two plain rows carry
+`publishable = false` alongside their bare `linux_` tags and the two manylinux
+rows do not. `check_doc` found both new target ids in
+`docs/PLATFORM_MATRIX.md`, so the TOML and that document are back in step.
+
+**What it does not prove.** Nothing about a wheel, a build, a platform, or any
+performance or parity claim. It reads files and compares them to each other. No
+artifact exists for it to have inspected, and no status in the matrix was
+promoted on the strength of it. Every target is still `designed` with empty
+evidence.
+
+### Commands 2 and 3, still UNRUN
+
+```sh
+# Does the Linux workflow still parse as YAML, after the added step?
+python3 -c "import yaml; yaml.safe_load(open('.github/workflows/release-linux.yml'))"
+
+# Only after a Linux wheel exists, and expected to pass now that the
+# plain-tag rows are declared. This is the check that would have failed
+# against a default build before this lane.
 python3 packaging/matrix/validate_artifact.py python/dist/*.whl
 ```
 
-Command 1 is the one that matters and is the cheapest. It exercises every rule
-this lane changed, reads the TOML, checks the new path fields against the tree,
-and cross-checks `docs/PLATFORM_MATRIX.md` for the two new target ids.
+The YAML parse is the remaining cheap one. The added step was written to match
+the indentation and shape of the two steps around it, and `git diff --check` is
+clean, but no parser has read the file. `validate_artifact.py` was not edited by
+this lane and cannot run until a Linux wheel exists.

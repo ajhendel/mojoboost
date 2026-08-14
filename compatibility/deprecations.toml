@@ -1,0 +1,82 @@
+# The deprecation register.
+#
+# Hand-maintained. Read by `tools/api_snapshot.py --check`, which enforces
+# invariants I9 and I10 of compatibility/SNAPSHOT_SCHEMA.md: the register
+# and the tree cannot disagree about whether a name exists, and no entry
+# may promise a removal sooner than the overlap floor allows.
+#
+# The schema is docs/DEPRECATION_POLICY.md section 3. Read it before
+# adding a row; the fields are not obvious and two of them are conditional.
+
+schema_version = 1
+
+# ---------------------------------------------------------------------
+# Ordinary deprecations. There are none.
+# ---------------------------------------------------------------------
+#
+# This is a fact about the project and not an omission. A grep for
+# `DeprecationWarning`, `deprecated`, and `Deprecated` across
+# python/mojoboost/, src/mojoboost/, bindings/, and capi/mojoboost.h
+# returns nothing: no surface in mojoboost has ever been deprecated,
+# because no release has ever shipped one to deprecate.
+#
+# Every removal so far is covered by exemption `never_released`
+# (deprecation policy section 5), and that exemption expires the moment a
+# release is tagged. Section 6 of that document is the rule that matters
+# here: the entries owed at the tag go in before the tag, not after.
+#
+# A row looks like this. Copy it, do not uncomment it: a commented row is
+# not read by tomllib, and a row that is read must describe something
+# real.
+#
+#   [[deprecation]]
+#   id = "estimator-best-score-scalar"
+#   surface = "python"                  # python|mojo|c_abi|parameter|env|cli|model_format|dump_schema
+#   name = "MojoBoostRegressor.best_score_"
+#   state = "deprecated"                # soft|deprecated|removed
+#   since = "0.4.0"
+#   announced_at = "2026-11-02"
+#   remove_in = "0.6.0"                 # required when state = "deprecated"
+#   replacement = "evals_result_"
+#   reason = "One sentence. Why it is going, not what it did."
+#   migration = "What a caller changes. A sentence, or a before/after pair."
+#
+# `since` is the release that carried the announcement and it is not one
+# of the two minor releases the overlap costs: announced in 0.4.0 means
+# removable in 0.6.0, not 0.5.0.
+
+# ---------------------------------------------------------------------
+# Candidates. Decisions owed before the first tagged release.
+# ---------------------------------------------------------------------
+#
+# NOT deprecations. Nothing here is announced, nothing warns, and no clock
+# is running. A candidate is a surface whose shape is unresolved, where
+# resolving it after the tag costs a deprecation window and resolving it
+# before the tag costs nothing.
+#
+# The register carries them so that "we meant to settle that" is a row a
+# tool can list rather than a memory. `tools/api_snapshot.py --check`
+# reports the count and does not fail on it; the release gate is what
+# fails, through items C4 and C5 of the compatibility policy.
+
+[[candidate]]
+id = "best-score-scalar-or-dict"
+surface = "python"
+name = "_Base.best_score_"
+owed_by = "the first tagged release"
+gate_item = "C4"
+question = "Scalar, the best value of the primary metric that best_iteration_ was chosen by, or LightGBM's nested dict of every validation set's every metric."
+current = "scalar"
+why_now = "Changing the type of a fitted attribute is a breaking change under compatibility policy section 5.2. Before the tag it is free; after it, it is a major release or a deprecation window on an attribute that cannot hold both shapes at once."
+note = "The equivalent grid already exists as evals_result_, so the dict shape would be a second spelling of data the estimator already exposes. That is an argument, not the decision."
+
+[[candidate]]
+id = "inspection-submodule-import-path"
+surface = "python"
+name = "mojoboost.inspection"
+owed_by = "the first tagged release"
+gate_item = "C5"
+question = "Is `import mojoboost.inspection` a supported path, or is the top-level re-export the only one."
+current = "both work, and only one is documented"
+why_now = "Four inspection names are now in mojoboost.__all__, resolved lazily through _LAZY_ATTRS, which is how gate item C5 was answered. Compatibility policy section 6.1 still says no submodule other than mojoboost.callback is a supported import path, so the submodule spelling works and is formally outside the surface. Whichever way it is settled, settling it after the tag costs a window, because callers will have written both."
+note = "See DRIFT_REPORT.md finding F5. The same question applies to mojoboost.cv, mojoboost.dask, mojoboost.device_selection, and mojoboost.diagnostics, all four of which are in _LAZY_SUBMODULES."

@@ -137,7 +137,37 @@ release numbers enforceable rather than aspirational.
 numbers do not carry time, and the calendar half of section 3.1 cannot be
 checked from a version string alone.
 
-### 3.3 What the register is not
+### 3.3 Candidates, which are not deprecations
+
+The register carries a second array, `[[candidate]]`. A candidate is a
+surface whose shape is unresolved and where resolving it after the first
+tagged release costs a deprecation window that resolving it before costs
+nothing.
+
+Nothing about a candidate is announced. It does not warn, no clock runs,
+and it is not a promise to anyone outside the project. It exists so that
+"we meant to settle that" is a row rather than a memory.
+
+| Key | Meaning |
+|---|---|
+| `id` | Stable, kebab-case, as for a deprecation |
+| `surface`, `name` | As for a deprecation |
+| `owed_by` | The release the decision is owed by. Today, always the first tagged release |
+| `gate_item` | The release gate item that fails if it is not settled, where one exists |
+| `question` | The decision, stated so that either answer is a sentence |
+| `current` | What the tree does today |
+| `why_now` | What it costs to defer. If deferring costs nothing, it is not a candidate |
+
+`tools/api_snapshot.py --check` reports the candidate count and does not
+fail on it. Failing is the release gate's job, through the item each
+candidate names.
+
+A candidate is resolved by deleting the row, in the same commit as the
+change or the decision to keep things as they are. A candidate resolved in
+favor of changing the surface produces a `[[deprecation]]` row if the
+change lands after the tag, and no row at all if it lands before.
+
+### 3.4 What the register is not
 
 It is not a changelog and it is not a list of everything that ever
 changed. Only surfaces that are public under section 2 of the

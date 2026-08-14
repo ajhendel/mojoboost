@@ -116,12 +116,14 @@ from .boosting import (
     renewal_weights,
 )
 from .goss import GossParams, GossSelection, apply_goss_scaling, goss_round
+from .gpu_frontier import subtraction_builds_left
 from .gpu_fused_round import (
     ROUND_OK,
     GpuTreeRouter,
     round_eligibility,
     round_eligibility_reason,
 )
+from .gpu_multiclass_batch import MulticlassRoundGuard
 from .gpu_predict import (
     METRIC_L1,
     METRIC_L2,
@@ -871,7 +873,12 @@ def grow_tree_gpu(
             var pair = builder.build_leaves(child_nodes)
             left_hist = pair[0].copy()
             right_hist = pair[1].copy()
-        elif n_left <= n_right:
+        elif subtraction_builds_left(n_left, n_right):
+            # Which child is built and which is derived is
+            # `gpu_frontier.subtraction_builds_left`, whose docstring names
+            # this test and `grow_tree`'s as the two it matches. Written once
+            # so a batched grower and this one cannot pick different children
+            # and then disagree about which histogram a slot holds.
             left_hist = builder.build_leaf(left_node)
             right_hist = subtract_histogram(frontier[best_i].hist, left_hist)
         else:
@@ -1515,7 +1522,18 @@ def _train_multiclass_gpu_rounds[
     """The softmax loop both `train_multiclass_gpu` entry points run. A
     round opens once and each class's tree inside it opens and closes, which
     is the tree-to-tree transition `SessionLifecycle` allows without an
-    intervening round boundary."""
+    intervening round boundary.
+
+    Both paths below drive one `MulticlassRoundGuard`
+    (gpu_multiclass_batch.mojo), which is where the softmax round contract
+    lives: the probability snapshot is taken once, when the raw scores hold
+    every previous round's trees and none of this round's; every class then
+    grows exactly one tree from that snapshot and folds it into the scores
+    exactly once before the next snapshot. That rule is what the two loops
+    have always obeyed by construction, and it is the one a batched or
+    reordered class schedule can break silently, so it is checked here rather
+    than restated as a comment. The guard owns no device state and allocates
+    two flag lists."""
     comptime if not has_accelerator():
         raise Error("GPU training requires an accelerator")
     else:
@@ -1535,12 +1553,16 @@ def _train_multiclass_gpu_rounds[
                 labels_f, sample_weight, n_classes, 2 * params.tree.num_leaves
             )
             state.init_raw(builder.ctx, base_scores)
+            var guard = MulticlassRoundGuard(n_classes)
             for i in range(params.n_estimators):
                 life.begin_round()
+                guard.open_round()
                 state.refresh_softmax(builder.ctx)
+                guard.note_probs()
                 var made_progress = False
                 for k in range(n_classes):
                     builder.fill_softmax_gradients_device(state, k)
+                    guard.note_gradients(k, 1)
                     life.begin_tree()
                     var tree = grow_tree_gpu(
                         builder,
@@ -1550,13 +1572,21 @@ def _train_multiclass_gpu_rounds[
                         split_search,
                     )
                     life.end_tree()
+                    guard.note_tree(k)
                     if tree.n_leaves > 1 or abs(tree.value[0]) >= 1e-12:
                         made_progress = True
                     # Before the next class's begin_tree resets the ranges.
                     builder.update_raw_device(
                         state, tree.value, params.learning_rate, k
                     )
+                    guard.note_commit(k)
                     trees.append(tree^)
+                # `close_round`, not `abandon_round`, even when the trees are
+                # about to be dropped: they already reached the raw scores,
+                # so the round is finished and owes nothing. `abandon_round`
+                # is for a schedule that drops trees before committing them,
+                # which neither of these loops does.
+                guard.close_round()
                 life.end_round()
                 if not made_progress:
                     for _ in range(n_classes):
@@ -1577,13 +1607,20 @@ def _train_multiclass_gpu_rounds[
         var grad = List[Float64](capacity=n)
         var hess = List[Float64](capacity=n)
         var bag = List[Int]()
+        var guard = MulticlassRoundGuard(n_classes)
         for i in range(params.n_estimators):
             life.begin_round()
+            guard.open_round()
             refresh_bag(bag, bagging, n, i)
             for r in range(n):
                 for k in range(n_classes):
                     prob[r * n_classes + k] = raw[r * n_classes + k]
                 _softmax_inplace(prob, r * n_classes, n_classes)
+            # The host path's probability snapshot, taken from raw scores
+            # that hold every earlier round's trees and none of this one's,
+            # which is the same instant `refresh_softmax` captures on the
+            # device path.
+            guard.note_probs()
 
             # One shared sample for the whole round, drawn before any class's
             # tree, exactly as on the CPU.
@@ -1601,6 +1638,7 @@ def _train_multiclass_gpu_rounds[
                 )
                 apply_goss_scaling(selection, grad, hess)
                 builder.upload_gradients(grad, hess)
+                guard.note_gradients(k, 1)
                 # Feature subsampling draws once per tree, so each class's
                 # tree in a round gets its own feature set; the same index
                 # the CPU grower uses keeps the two backends on identical
@@ -1610,13 +1648,16 @@ def _train_multiclass_gpu_rounds[
                     builder, params.tree, bag, i * n_classes + k, split_search
                 )
                 life.end_tree()
+                guard.note_tree(k)
                 if tree.n_leaves > 1 or abs(tree.value[0]) >= 1e-12:
                     made_progress = True
                 for r in range(n):
                     raw[r * n_classes + k] += (
                         params.learning_rate * tree.predict_row(data, r)
                     )
+                guard.note_commit(k)
                 trees.append(tree^)
+            guard.close_round()
             life.end_round()
 
             # No class made progress: with bagging or GOSS that is a

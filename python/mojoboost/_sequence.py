@@ -257,7 +257,9 @@ def describe_input(data):
     }
     if kind == "arrow_table":
         out["adapter"] = "mojoboost._arrow"
-        out["columns"] = [plan.as_dict() for plan in _arrow.describe_columns(data)]
+        out["columns"] = [
+            plan.as_dict() for plan in _arrow.describe_columns(data)
+        ]
     elif kind == "polars_frame":
         out["adapter"] = "mojoboost._polars"
         out["columns"] = [
@@ -287,7 +289,8 @@ def describe_input(data):
 
 
 def _batch_kind(batch):
-    """The converter key for one batch, or None when nothing converts it.
+    """The converter key for one batch: `"arrow"`, `"polars"`, or
+    `"dense"`, the last covering everything `_arrays` already reads.
 
     A batch is anything a feature matrix can be, which is why this reads
     almost like `input_kind` and does not share its body: `input_kind`
