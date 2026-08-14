@@ -1,6 +1,10 @@
 # pixi environments
 .pixi/
 
+# Local planning files and scratch artifacts (never publish)
+CLAUDE_CODE_*.txt
+/*.mbst
+
 # Mojo build artifacts
 *.mojopkg
 build/
