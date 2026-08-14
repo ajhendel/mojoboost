@@ -56,8 +56,10 @@ it, so a caller that asks for a multi-process world is refused with
 flips that one name, and nothing above it changes.
 """
 
-from std.memory import bitcast
+from std.memory import bitcast, stack_allocation
 from std.os import getenv
+from std.sys.ffi import external_call
+from std.sys.info import CompilationTarget
 from std.time import perf_counter_ns
 
 from .collective import (

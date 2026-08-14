@@ -91,6 +91,7 @@ from std.os import getenv
 from std.sys import has_accelerator
 from max.gpu.host import DeviceContext
 
+from .apple_histogram_policy import ClassSchedule
 from .bagging import BaggingParams, bagging_enabled, check_bagging, refresh_bag
 from .binning import BinnedMatrix
 from .boosting import (
@@ -115,7 +116,6 @@ from .boosting import (
     renewal_alpha,
     renewal_weights,
 )
-from .apple_histogram_policy import ClassSchedule
 from .goss import GossParams, GossSelection, apply_goss_scaling, goss_round
 from .gpu_frontier import subtraction_builds_left
 from .gpu_fused_round import (
