@@ -450,6 +450,26 @@ def f64_vector(y, n_rows, name="y"):
     return ya
 
 
+def i64_vector(values, name="rows"):
+    """A contiguous int64 buffer of whole numbers.
+
+    Row selections cross the boundary as int64 rather than as float64,
+    unlike the per-row columns: a row index is an index, and the buffer it
+    is read through on the Mojo side (`binding_support.int_buffer`) reads
+    machine integers. Fractional values are refused rather than truncated,
+    because a truncated row index silently selects a different row.
+    """
+    out = []
+    for value in values:
+        number = int(value)
+        if number != value:
+            raise ValueError(f"{name} must be whole numbers, got {value!r}")
+        out.append(number)
+    if np is not None:
+        return np.ascontiguousarray(out, dtype=np.int64)
+    return _array.array("q", out)
+
+
 def _require_finite(values, name):
     if np is not None:
         if not np.isfinite(values).all():

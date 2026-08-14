@@ -26,22 +26,23 @@ never leaves the grower**. Concretely, inside `grow_tree`:
 
 - histograms are accumulated over the *bundled* matrix, which is the whole
   point: O(#bundles) column scans instead of O(#features);
-- split search unbundles each member's own histogram
-  (`unbundle_histogram`) and scores it in the member's own local bin ids, so
-  a `SplitInfo` always names an **original** feature and an **original**
-  local bin;
+- each accumulated histogram is expanded straight back into the per-feature
+  shape (`expand_bundled_histogram`), so split search, leaf values, and
+  sibling subtraction read exactly what they have always read and need no
+  knowledge of bundling at all;
 - row partitioning reads the *original* matrix, because the split it routes
   by is expressed in original terms.
 
 So a `Tree` grown with bundling is indistinguishable from one grown without
 it: same feature ids, same threshold bins, same missing routing, same
-categorical sets. `Model`, `Booster.predict_*`, `serialize.mojo`,
-`importance.mojo`, and `contrib.mojo` therefore need **no change at all**, no
-plan travels with the model, and there is no v4 format bump. That is a
-deliberate trade: the plan is rebuilt from the training matrix on every
-training call and is never used to score, which costs one extra dense matrix
-and one pass over it and buys a fit that no downstream consumer can tell
-apart.
+categorical sets. `split.find_best_split`, `Model`, `Booster.predict_*`,
+`serialize.mojo`, `importance.mojo`, and `contrib.mojo` therefore need **no
+change at all**, no plan travels with the model, and there is no v4 format
+bump. That is a deliberate trade: the plan is rebuilt from the training matrix
+on every training call and is never used to score, which costs one extra dense
+matrix, one pass over it, and one O(#features x #bins) expansion per node --
+the same order as the sibling subtraction the grower already does -- and buys
+a fit that no downstream consumer can tell apart.
 
 The sparse path is a different question. `bundle_csc` and the sparse plan
 below still exist for it, and a sparse integration that bundles the *stored*
@@ -147,12 +148,12 @@ missing bin is left a singleton.
 The **dense** plan (`fit_bundles_dense`) is free of that restriction and
 ignores `bundle_missing`, because the dense integration never routes a row
 by a bundle column: `grow_tree` partitions on the original matrix and reads
-the original `BinnedMatrix.missing_bin` table, and the split search reads a
-member's local histogram, in which the missing bin is at its original local
-index. A missing value is simply one more non-default bin there, recovered
-exactly. The dense plan therefore records `slot_missing = -1` on every slot,
-which says "this plan makes no claim about routing missing values", and a
-dense caller must not read `missing_bins` off it.
+the original `BinnedMatrix.missing_bin` table, and the split search reads an
+expanded per-feature histogram in which the missing bin sits at its original
+index. A missing value is simply one more non-default bin in the bundle,
+recovered exactly. The dense plan therefore records `slot_missing = -1` on
+every slot, which says "this plan makes no claim about routing missing
+values", and a dense caller must not read `missing_bins` off it.
 
 Categorical features
 --------------------
@@ -1096,13 +1097,11 @@ def dense_bin_counts(data: BinnedMatrix) raises -> List[Int]:
     plan that has to encode an unseen row, which is why `fit_bundles` reads
     the mapper instead.
 
-    The consequence inside the split search is that a bundled member is
-    scanned over its own `[0, n_local)` range instead of over the matrix's
-    full `n_bins`. The candidates that disappear are exactly the thresholds at
-    or above the column's highest occupied bin, every one of which puts every
-    row in the left child and so scores a gain of 0.0 against a parent that
-    already scores it; none of them can win, so the chosen split is the same
-    one the full scan chooses.
+    Nothing downstream loses a candidate by it. `expand_bundled_histogram`
+    writes each member back into the full `n_bins`-wide slice the split search
+    reads, zeroing the bins past `n_local` -- which is what an unbundled
+    histogram holds for them too, since no training row occupies them. The
+    scan therefore sees the same candidates it always saw.
     """
     if data.n_features < 1 or data.n_rows < 1:
         raise Error("matrix must have positive dimensions")
@@ -1562,10 +1561,12 @@ def bundle_csc(
     )
 
 
-def unbundle_histogram_into(
+def _recover_member_into(
     mut out_grad: List[Float64],
     mut out_hess: List[Float64],
     mut out_count: List[Int],
+    out_base: Int,
+    out_bins: Int,
     plan: FeatureBundling,
     bundle: Int,
     slot_rank: Int,
@@ -1574,14 +1575,15 @@ def unbundle_histogram_into(
     count: List[Int],
     base: Int,
 ) raises:
-    """`unbundle_histogram` writing into buffers the caller owns.
+    """One member's local histogram, written into
+    `out_*[out_base : out_base + out_bins)`.
 
-    The split search calls this once per feature per node, so the three
-    output lists are reused across features and across nodes instead of being
-    allocated per call; they are resized to the member's local bin count and
-    fully written, so their previous contents never leak. This is the same
-    `_into` split the histogram builders and the row partitioner already make,
-    and for the same reason.
+    The single copy of the recovery arithmetic. Both public forms below go
+    through it, so a caller reading one member and a caller expanding a whole
+    bundled histogram cannot get different numbers. Bins past the member's own
+    count are zeroed, which is what a rectangular histogram holds for them
+    anyway, so the whole output range is written and a reused buffer never
+    leaks a previous node's statistics.
     """
     if bundle < 0 or bundle >= plan.n_bundles():
         raise Error("bundle index out of range")
@@ -1597,16 +1599,26 @@ def unbundle_histogram_into(
 
     var k = lo + slot_rank
     var n_local = plan.slot_bins[k]
-    out_grad.resize(n_local, 0.0)
-    out_hess.resize(n_local, 0.0)
-    out_count.resize(n_local, 0)
+    if n_local > out_bins:
+        raise Error(
+            "member needs more bins than the output histogram has per feature"
+        )
+    if out_base < 0 or out_base + out_bins > len(out_grad):
+        raise Error("output block is outside the supplied arrays")
+    if len(out_hess) != len(out_grad) or len(out_count) != len(out_grad):
+        raise Error("output grad, hess, and count must have equal length")
+
+    for b in range(n_local, out_bins):
+        out_grad[out_base + b] = 0.0
+        out_hess[out_base + b] = 0.0
+        out_count[out_base + b] = 0
 
     if hi - lo == 1:
         # Identity encoded: the block is already the member's histogram.
         for b in range(n_local):
-            out_grad[b] = grad[base + b]
-            out_hess[b] = hess[base + b]
-            out_count[b] = count[base + b]
+            out_grad[out_base + b] = grad[base + b]
+            out_hess[out_base + b] = hess[base + b]
+            out_count[out_base + b] = count[base + b]
         return
 
     var total_grad = 0.0
@@ -1621,15 +1633,126 @@ def unbundle_histogram_into(
     var start = plan.slot_offset[k]
     for i in range(n_local - 1):
         var local = i if i < d else i + 1
-        out_grad[local] = grad[base + start + i]
-        out_hess[local] = hess[base + start + i]
-        out_count[local] = count[base + start + i]
+        out_grad[out_base + local] = grad[base + start + i]
+        out_hess[out_base + local] = hess[base + start + i]
+        out_count[out_base + local] = count[base + start + i]
         total_grad -= grad[base + start + i]
         total_hess -= hess[base + start + i]
         total_count -= count[base + start + i]
-    out_grad[d] = total_grad
-    out_hess[d] = total_hess
-    out_count[d] = total_count
+    out_grad[out_base + d] = total_grad
+    out_hess[out_base + d] = total_hess
+    out_count[out_base + d] = total_count
+
+
+def unbundle_histogram_into(
+    mut out_grad: List[Float64],
+    mut out_hess: List[Float64],
+    mut out_count: List[Int],
+    plan: FeatureBundling,
+    bundle: Int,
+    slot_rank: Int,
+    grad: List[Float64],
+    hess: List[Float64],
+    count: List[Int],
+    base: Int,
+) raises:
+    """`unbundle_histogram` writing into buffers the caller owns.
+
+    The lists are resized to the member's local bin count and fully written,
+    so a reused buffer never leaks its previous contents. This is the same
+    `_into` split the histogram builders and the row partitioner already make,
+    and for the same reason.
+    """
+    if bundle < 0 or bundle >= plan.n_bundles():
+        raise Error("bundle index out of range")
+    var lo = plan.bundle_start[bundle]
+    var hi = plan.bundle_start[bundle + 1]
+    if slot_rank < 0 or slot_rank >= hi - lo:
+        raise Error("slot rank out of range for this bundle")
+    var n_local = plan.slot_bins[lo + slot_rank]
+    out_grad.resize(n_local, 0.0)
+    out_hess.resize(n_local, 0.0)
+    out_count.resize(n_local, 0)
+    _recover_member_into(
+        out_grad,
+        out_hess,
+        out_count,
+        0,
+        n_local,
+        plan,
+        bundle,
+        slot_rank,
+        grad,
+        hess,
+        count,
+        base,
+    )
+
+
+def expand_bundled_histogram(
+    mut out_grad: List[Float64],
+    mut out_hess: List[Float64],
+    mut out_count: List[Int],
+    out_n_bins: Int,
+    plan: FeatureBundling,
+    grad: List[Float64],
+    hess: List[Float64],
+    count: List[Int],
+    src_n_bins: Int,
+    features: List[Int],
+) raises:
+    """Turn a per-bundle histogram back into a per-feature one.
+
+    This is where a bundle stops existing. `grad`/`hess`/`count` are a
+    histogram over the bundled matrix, laid out `[bundle * src_n_bins + b]`;
+    the output is laid out `[feature * out_n_bins + b]` in the plan's original
+    feature space, which is exactly the shape `split.find_best_split` and
+    `tree._leaf_value` have always read. Every consumer downstream of it --
+    the scan, the tree, prediction, serialization, importance, contributions
+    -- therefore needs no knowledge of bundling at all.
+
+    A non-empty `features` expands only those features and leaves every other
+    slice untouched, matching `build_histogram_into`'s convention that
+    unselected features stay zero; the caller zeroes the buffer once per tree
+    and the selected slices are fully rewritten per node.
+
+    Cost and exactness. The expansion is O(#features x out_n_bins) per node,
+    the same order as the sibling subtraction the grower already does, while
+    the accumulation it feeds off is O(#rows x #bundles) instead of
+    O(#rows x #features) -- which is the whole point. It is also linear, so
+    expanding a parent and a child and subtracting gives the same numbers as
+    subtracting first and expanding the difference; that is what lets the
+    grower keep the histogram-subtraction trick unchanged. A member's default
+    bin is recovered by subtraction from its bundle's block total rather than
+    accumulated directly, so it agrees with an unbundled fit exactly in exact
+    arithmetic and to floating-point association in practice, which is the
+    same trade sibling subtraction already makes.
+    """
+    if out_n_bins < 1 or src_n_bins < 1:
+        raise Error("histogram bin counts must be positive")
+    if len(out_grad) != plan.n_features * out_n_bins:
+        raise Error("expanded histogram must be n_features x out_n_bins")
+    var use_all = len(features) == 0
+    var n_active = plan.n_features if use_all else len(features)
+    for i in range(n_active):
+        var f = i if use_all else features[i]
+        if f < 0 or f >= plan.n_features:
+            raise Error("feature index out of range for this bundling plan")
+        var bundle = plan.bundle_of[f]
+        _recover_member_into(
+            out_grad,
+            out_hess,
+            out_count,
+            f * out_n_bins,
+            out_n_bins,
+            plan,
+            bundle,
+            plan.slot_of[f] - plan.bundle_start[bundle],
+            grad,
+            hess,
+            count,
+            bundle * src_n_bins,
+        )
 
 
 def unbundle_histogram(

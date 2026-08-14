@@ -493,11 +493,18 @@ CONTRACT_NARROW = "narrow"
 
 #: Wire sentinels for "the caller did not declare this". The boundary
 #: carries plain ints, so an undeclared value needs a value; the binding
-#: normalizes anything negative to the native `BINS_UNSPECIFIED` and
-#: anything below -1 to `OBJECTIVE_UNSPECIFIED` (-1 is the multiclass
-#: marker and is a real code). These are transport, not policy: no rule
-#: here reads them, and the native layer decides what an undeclared field
-#: means.
+#: normalizes any negative `n_bins` to the native `BINS_UNSPECIFIED` (which
+#: is 0 natively, so a caller must not send 0 to mean undeclared) and any
+#: negative `objective` to `OBJECTIVE_UNSPECIFIED`.
+#:
+#: That second folding takes in the multiclass marker (-1) deliberately.
+#: `MULTICLASS` is not one of the built-in single-output objectives
+#: `device_policy.is_builtin_objective` recognizes, so sending it would
+#: gate the run as "not a built-in objective", which is the wrong reason:
+#: multiclass is a tree count, and `n_outputs` already carries it.
+#:
+#: These are transport, not policy: no rule here reads them, and the
+#: native layer decides what an undeclared field means.
 _BINS_UNSPECIFIED = -1
 _OBJECTIVE_UNSPECIFIED = -2
 
@@ -594,26 +601,35 @@ class _FullNativePolicy:
         self._decide = decide
 
     def decide(self, requested, workload):
-        # Flags cross as 0/1 ints, and the bin count and the objective code
-        # as their `_UNSPECIFIED` sentinels when undeclared, so the boundary
-        # carries no Python bool conversion and no optional. That is the
-        # convention the rest of the bindings already use (see `goss` in
-        # bindings/_mojoboost.mojo).
+        # The device name is positional and the workload is one mapping,
+        # which is the shape `_parse_params` in bindings/_mojoboost.mojo
+        # already reads and the shape the binding registers. A workload has
+        # a dozen fields; sending them positionally would fix their order
+        # in two languages at once and would bet on an argument count no
+        # entry point in the module has tried.
+        #
+        # Inside the mapping: flags cross as 0/1 ints and the bin count and
+        # the objective code as their `_UNSPECIFIED` sentinels when
+        # undeclared, so the boundary carries no Python bool conversion and
+        # no optional. That is the convention the rest of the bindings
+        # already use (see `goss` in bindings/_mojoboost.mojo).
         text = self._decide(
             requested,
-            int(workload.n_rows),
-            int(workload.n_features),
-            int(workload.n_outputs),
-            _BINS_UNSPECIFIED
-            if workload.max_bin is None
-            else int(workload.max_bin),
-            _OBJECTIVE_UNSPECIFIED
-            if workload.objective_code is None
-            else int(workload.objective_code),
-            1 if workload.sparse else 0,
-            1 if workload.categorical else 0,
-            1 if workload.has_missing else 0,
-            1 if workload.has_eval_set else 0,
+            {
+                "n_rows": int(workload.n_rows),
+                "n_features": int(workload.n_features),
+                "n_outputs": int(workload.n_outputs),
+                "n_bins": _BINS_UNSPECIFIED
+                if workload.max_bin is None
+                else int(workload.max_bin),
+                "objective": _OBJECTIVE_UNSPECIFIED
+                if workload.objective_code is None
+                else int(workload.objective_code),
+                "sparse": 1 if workload.sparse else 0,
+                "categorical": 1 if workload.categorical else 0,
+                "has_missing": 1 if workload.has_missing else 0,
+                "uses_validation": 1 if workload.has_eval_set else 0,
+            },
         )
         return _parse_decision(str(text))
 

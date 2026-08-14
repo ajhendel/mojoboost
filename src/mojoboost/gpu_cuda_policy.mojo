@@ -678,6 +678,19 @@ struct BackendLaunchPlan(Copyable, Movable):
     var baseline: HistogramTiling
     var strategy: StrategyInputs
 
+    var selected: KernelFeatures
+    """The specialized kernel variants this plan actually chose, which is
+    what `gpu_portability.require_specializations_allowed` gates on and is
+    deliberately not the same as the set compiled into the build.
+
+    A plan from this layer selects the bin-capacity kernel exactly when it
+    is compiled in, because its shared-memory footprint and its tile
+    amortization already assume that narrower partial histogram. It never
+    selects packed loads or batched leaves: choosing those is the
+    specialization ladder's job (`apple_histogram_policy.mojo`), and a
+    second selector here would be a second ladder.
+    """
+
     def matches_baseline(self) -> Bool:
         """Whether this plan's geometry is the portable one. True whenever
         the device reported nothing beyond the three attributes
@@ -931,11 +944,18 @@ def derive_plan_for(
     n_rows: Int,
     n_slots: Int,
     n_bins: Int,
-    features: KernelFeatures,
+    compiled: KernelFeatures,
     requested_strategy: Int = STRATEGY_AUTO,
     max_partial_cells: Int = 0,
 ) raises -> BackendLaunchPlan:
     """Resolve one node's histogram launch for a backend.
+
+    `compiled` is what this build linked in, which is the distinction
+    `gpu_portability.require_specializations_allowed` turns on: linking the
+    batched module compiles its kernels whether or not anything selects
+    them. What this plan *selects* is derived from `compiled` and reported
+    on `BackendLaunchPlan.selected`, and it is that set, not this argument,
+    that the unexercised-backend gate is applied to.
 
     Pure host arithmetic. The tile arithmetic is
     `gpu_tiling.resolve_tiling`, called with three bounds this layer
@@ -981,9 +1001,18 @@ def derive_plan_for(
 
     var profile = report.profile(api)
     var contract = contract_from_profile(profile)
-    require_specializations_allowed(contract, features)
 
-    var shared_bytes = kernel_shared_request(n_bins, features)
+    # What this plan chooses, which is what the unexercised-backend gate
+    # applies to. The bin-capacity kernel is chosen exactly when it is
+    # compiled in, because the shared footprint and the amortization width
+    # below already assume it; packed loads and batched leaves are the
+    # specialization ladder's to choose and are never chosen here.
+    var selected = KernelFeatures(
+        compiled.specialized_bin_kernels, False, False
+    )
+    require_specializations_allowed(contract, selected)
+
+    var shared_bytes = kernel_shared_request(n_bins, compiled)
     require_shared_within_ceiling(api, shared_bytes, static_shared_ceiling)
     require_shared_reported_fits(api, report, shared_bytes)
 
@@ -1007,7 +1036,7 @@ def derive_plan_for(
     # tile count on every device, which is a behavior change nothing here
     # has measured.
     var amortize_bins = n_bins
-    if features.specialized_bin_kernels:
+    if compiled.specialized_bin_kernels:
         amortize_bins = bin_capacity_for(n_bins)
 
     var partial_cell_limit = (
@@ -1052,6 +1081,7 @@ def derive_plan_for(
         tiling^,
         baseline^,
         inputs^,
+        selected^,
     )
 
 
@@ -1212,7 +1242,7 @@ def static_shared_ceiling() -> Int:
 
 
 def require_shared_memory_supported(
-    report: DeviceReport, n_bins: Int, features: KernelFeatures
+    report: DeviceReport, n_bins: Int, compiled: KernelFeatures
 ) raises:
     """Refuse a threadgroup allocation this backend or this device will not
     accept, for the kernel this build compiled.
@@ -1224,7 +1254,7 @@ def require_shared_memory_supported(
     kernel really has, not the `n_bins * 12` model whose own docstring
     records that it is optimistic below 256 bins.
     """
-    var shared_bytes = kernel_shared_request(n_bins, features)
+    var shared_bytes = kernel_shared_request(n_bins, compiled)
     require_shared_within_ceiling(
         API_CUDA, shared_bytes, CUDA_STATIC_SHARED_CEILING_BYTES
     )
@@ -1390,7 +1420,7 @@ def packed_body_transactions(window: PackedLoadWindow) raises -> Int:
 
 
 def cuda_specialization(
-    report: DeviceReport, features: KernelFeatures
+    report: DeviceReport, compiled: KernelFeatures
 ) raises -> BackendSpecialization:
     """The whole CUDA descriptor for one reported device and one build."""
     require_subgroup_width_plausible(report)
@@ -1408,7 +1438,7 @@ def cuda_specialization(
         concurrent_queues_available(),
         unified_memory_inferable(),
         False,
-        features.any(),
+        compiled.any(),
     )
 
 
@@ -1437,7 +1467,7 @@ def derive_cuda_plan(
     n_rows: Int,
     n_slots: Int,
     n_bins: Int,
-    features: KernelFeatures,
+    compiled: KernelFeatures,
     requested_strategy: Int = STRATEGY_AUTO,
     max_partial_cells: Int = 0,
 ) raises -> BackendLaunchPlan:
@@ -1458,7 +1488,7 @@ def derive_cuda_plan(
         n_rows,
         n_slots,
         n_bins,
-        features,
+        compiled,
         requested_strategy,
         max_partial_cells,
     )
@@ -1469,7 +1499,7 @@ def require_cuda_launchable(
     plan: BackendLaunchPlan,
     grid_x: Int,
     n_bins: Int,
-    features: KernelFeatures,
+    compiled: KernelFeatures,
 ) raises:
     """The whole gate for one resolved CUDA launch.
 
@@ -1490,21 +1520,27 @@ def require_cuda_launchable(
     require_cuda(plan.api)
     var contract = cuda_contract(report)
     require_in_order_queue(contract)
-    require_shared_memory_supported(report, n_bins, features)
+    require_shared_memory_supported(report, n_bins, compiled)
     require_histogram_launchable(
-        contract, report.caps(), plan.tiling, grid_x, n_bins, features
+        contract,
+        report.caps(),
+        plan.tiling,
+        grid_x,
+        n_bins,
+        compiled,
+        plan.selected,
     )
 
 
 def describe_cuda(
-    report: DeviceReport, features: KernelFeatures
+    report: DeviceReport, compiled: KernelFeatures
 ) raises -> String:
     """One line pairing the backend contract with this module's descriptor,
     for a diagnostic record or a bug report."""
     return String(
         describe_contract(cuda_contract(report)),
         " | ",
-        describe_specialization(cuda_specialization(report, features)),
+        describe_specialization(cuda_specialization(report, compiled)),
         " | attributes_answered=",
         report.answered(),
         "/10",

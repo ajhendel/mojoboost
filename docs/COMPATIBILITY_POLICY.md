@@ -68,7 +68,7 @@ others, and a release note that changes any of them says so explicitly.
 |---|---|---|---|
 | Library version | `pixi.toml`, `pyproject.toml`, `__version__` | 0.1.0 | Any release |
 | C ABI version | `MOJOBOOST_ABI_VERSION` in `capi/mojoboost.h` | 1 | A declaration in the header changes incompatibly |
-| Model format version | `_VERSION` in `src/mojoboost/serialize.mojo` | v3 | The file format gains or changes a section |
+| Model format version | `_VERSION` in `src/mojoboost/serialize.mojo` | v4 | The file format gains or changes a section |
 | Dump schema version | `DUMP_FORMAT_VERSION` in `python/mojoboost/inspection.py` | 1 | A dump key is removed, retyped, or given a new meaning |
 | Snapshot schema version | `schema_version` in `tests/parallel/api_snapshot_manifest.json` | 1 | The manifest's own shape changes |
 
@@ -268,9 +268,9 @@ amounts.
 
 | Path | Carries | Does not carry |
 |---|---|---|
-| `pickle` | The whole estimator, including hyperparameters and fitted attributes | Split gains, which are not in the model format |
-| `save` and `load` | The model. `n_features_in_` and `best_iteration_` are recomputed from it | Hyperparameters, feature names, `device_`, split gains, `evals_result_` |
-| `Booster.model_to_string` and `model_from_string` | The model | The training set, the parameter object, split gains |
+| `pickle` | The whole estimator, including hyperparameters, fitted attributes, and the model's split gains and feature names | Nothing a fitted estimator holds |
+| `save` and `load` | The model, its split gains, and its feature names. `n_features_in_` and `best_iteration_` are recomputed from it | Hyperparameters, `device_`, `evals_result_` |
+| `Booster.model_to_string` and `model_from_string` | The model, its split gains, and its feature names | The training set, the parameter object |
 
 That split is stable. A `load` gaining an attribute is additive. A `load`
 losing one is breaking.
@@ -405,7 +405,7 @@ for humans is not covered.
 ### 7.1 What the format is
 
 A versioned plain-text token stream, magic `mojoboost`, current version
-`v3`. Floats travel as their IEEE-754 bit patterns rendered as decimal
+`v4`. Floats travel as their IEEE-754 bit patterns rendered as decimal
 `UInt64`, so a save and load round trip is bit-exact and the file has no
 locale or precision pitfalls and no endianness dependence. The token after
 the version distinguishes a single-output file (`objective`) from a
@@ -426,11 +426,21 @@ major versions unless a release note says otherwise.
 | v1 | Mapper edges and offsets, per-node feature, threshold, children, value | Yes |
 | v2 | Missing-value routing, optional monotone section, optional categorical sections | Yes |
 | v3 | Per-node covers, unconditional | Yes |
+| v4 | Per-node split gains, per-node covers behind a presence flag, optional feature names | Yes |
 
 An older file loads as what it is. A v1 or v2 file describes a model
 trained without covers, so asking it for feature contributions raises
 rather than guessing at them, and a v1 file routes no missing values
-because the model it describes had none.
+because the model it describes had none. A file older than v4 carries no
+split gains, so the model it describes reports zero gain importance and a
+dump of it reports `has_split_gain: false`: the absence is reported, never
+filled in with a zero that could be mistaken for a measurement.
+
+Re-saving an older model writes what it has and records what it lacks. v3
+could not: it wrote a coverless model's zeros as if they were covers, and
+its own reader refused the result. v4's presence flags are what make that
+round trip lossless in the only sense available to it, and the current
+reader also accepts the files that bug produced.
 
 ### 7.3 Forward compatibility, which is not guaranteed
 
@@ -454,11 +464,15 @@ breaking change even though every file still loads.
 ### 7.5 What the file deliberately does not hold
 
 Training-time knobs that only shaped which trees were grown are absent:
-`num_leaves`, regularization, interaction constraints, subsampling, split
-gains, feature names, and the training device. They cannot be checked
-against a loaded model and are not needed to evaluate it. Monotone
-constraints are the exception, because they are a property the trees
-satisfy that a consumer may need and cannot recover.
+`num_leaves`, regularization, interaction constraints, subsampling, and
+the training device. They cannot be checked against a loaded model and are
+not needed to evaluate it. Two things that are also not needed to evaluate
+a model are held anyway, because a consumer may need them and neither can
+be recovered from a fitted tree: monotone constraints, which are a
+property the trees satisfy, and split gains (v4), which are what the model
+reports as gain importance and what a dump reports per node. Feature names
+(v4, optional) are held for the same reason and are the model's own
+labeling rather than a training knob.
 
 Adding one of these to the format later is a format change under section
 7.3, not a fix.

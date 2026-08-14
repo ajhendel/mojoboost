@@ -20,9 +20,8 @@ algorithm and defines no model:
   this lane does not own `boosting.mojo`. That is a temporary address, not a
   design; see `handoffs/connect_17_alternate_boosting.md`.
 - `boosting_rf.mojo` is the whole of random-forest mode, single-output and
-  multiclass, including its own continuation and early-stopping entry points.
-  This module only translates the uniform argument set into its `RfParams`
-  and bridges its `RfBooster` back to a `Booster`.
+  multiclass, including its own continuation, early stopping, and the
+  `Booster` adapter. This module only routes `rf` into it.
 - `gbdt` and `goss` route into the untouched production `boosting.train` with
   the arguments they always took. Nothing about them changes.
 
@@ -50,32 +49,33 @@ What the fold gives up is the ability to read a tree's weight back off a
 saved model, which matters in exactly one place and is handled there (see
 `train_dart_more`).
 
-RF: the RfBooster bridge, and its two sharp edges
--------------------------------------------------
+RF: dispatch only, because boosting_rf already carries the adapter
+------------------------------------------------------------------
 `boosting_rf` keeps its own `RfBooster`, because a forest averages rather
-than sums and `Booster` has no `average_output` flag. `RfBooster.to_booster`
-is the bridge: base score 0 and a rate of `1 / T` make a `Booster`'s sum the
-forest's mean, so a bridged forest predicts, serializes, dumps, and explains
-correctly. `train_boosting` returns the bridged `Booster` so that every mode
-has one return type.
+than sums and `Booster` has no `average_output` flag. It also supplies the
+whole bridge: `RfBooster.to_booster` (base score 0 and a rate of `1 / T`
+make a `Booster`'s sum the forest's mean), `is_forest` for the structural
+check, and `train_rf` / `train_rf_more`, which take exactly the uniform
+argument set the other modes take and return an ordinary `Booster`. So this
+module dispatches to those two and adds nothing: no `RfParams` translation
+of its own (that is `RfParams.from_booster_params`), no bridge of its own,
+and no continuation of its own.
 
-Two things do not survive the bridge, and this module refuses rather than
-papering over either:
+The uniform argument set is narrower than a forest can be. `train_rf` takes
+no `GossParams` and no `ClassBaggingParams`, on `boosting_rf`'s own
+reasoning that GOSS is a `boosting` value in its own right, so a caller who
+selected a strategy by name has already chosen between them. Both are
+therefore REFUSED here under `rf` rather than dropped, with the error naming
+`boosting_rf.train_forest` and `RfParams`, which is the entry point for a
+forest randomized by gradient sampling or by class-conditional bagging, and
+the entry point for iteration ranges (a bridged `Booster` divides by the
+whole tree count whatever the range).
 
-- **Iteration ranges.** `Booster.predict_raw_bins_range` divides by `T`
-  whatever the range. Only the full range is the forest's own prediction.
-  Callers who need ranges must hold the `RfBooster` and use
-  `boosting_rf.train_rf` directly.
-- **Continued training.** A bridged `Booster` reports a rate of `1 / T` and a
-  base score of 0, so continuing it would shrink new trees by the old ones'
-  averaging weight and boost them from zero. `train_boosting_more` therefore
-  REFUSES `rf` by name and points at `boosting_rf.train_rf_more`, which
-  continues an `RfBooster` exactly.
-
-`boosting.train_more` must likewise never be pointed at a DART or a bridged
-RF ensemble. It would read the folded `1.0`, or the forest's `1 / T`, as the
+`boosting.train_more` must never be pointed at a DART or a bridged RF
+ensemble. It would read the folded `1.0`, or the forest's `1 / T`, as the
 rate to shrink new GBDT trees by. `train_boosting_more` is the continuation
-entry point and the DART path checks the ensemble's shape before touching it.
+entry point; the DART path checks the ensemble's unit factor and the RF path
+checks `boosting_rf.is_forest` before either touches anything.
 
 Combinations that are refused rather than resolved
 --------------------------------------------------
@@ -86,9 +86,9 @@ Combinations that are refused rather than resolved
   (`boosting_rf.check_rf_learning_rate`), with `init_score`
   (`check_rf_init_score`), with a custom objective or `lambdarank`
   (`check_rf_objective`), or with no source of per-tree randomness at all
-  (`check_rf_params`). Note that `rf` DOES accept GOSS, which is one of the
-  randomizers LightGBM's own `RF::Init` admits; only `gbdt` and `dart` refuse
-  it.
+  (`check_rf_params`).
+- `rf` with GOSS or with balanced bagging, refused **here** with the reason
+  above and the entry point that does take them.
 - `goss` mode with a disabled `GossParams`, and the converse for the modes
   that cannot take one.
 - `dart` mode with a disabled `DartParams`, and an enabled one under any
@@ -138,14 +138,7 @@ from .boosting_dart import (
     dart_uniform_weights,
     select_drop,
 )
-from .boosting_rf import (
-    RfBooster,
-    RfParams,
-    check_rf_learning_rate,
-    check_rf_params,
-    is_rf_boosting,
-    train_rf,
-)
+from .boosting_rf import is_rf_boosting, train_rf, train_rf_more
 from .device import CPU_DEVICE
 from .goss import GossParams
 from .model import Model
@@ -209,10 +202,9 @@ struct AlternateBoostingParams(Copyable, Movable):
     disabled bundle, or leaving an enabled one under another mode, is refused
     rather than silently resolved.
 
-    Random forest needs no bundle here: its configuration is
-    `boosting_rf.RfParams`, which `rf_params_of` assembles from the same
-    `BoosterParams` / `BaggingParams` / `GossParams` / `ClassBaggingParams`
-    every other mode is given.
+    Random forest needs no bundle here: `boosting_rf.train_rf` takes the same
+    `BoosterParams` and `BaggingParams` every other mode is given, and
+    assembles its own `RfParams` with `RfParams.from_booster_params`.
     """
 
     var mode: Int
@@ -242,7 +234,7 @@ struct AlternateBoostingParams(Copyable, Movable):
     @staticmethod
     def rf() -> AlternateBoostingParams:
         """Random forest. Its settings are the ordinary tree and sampler
-        parameters; see `rf_params_of` and `boosting_rf.check_rf_params`."""
+        parameters; see `boosting_rf.check_rf_params`."""
         var out = AlternateBoostingParams()
         out.mode = BOOSTING_RF
         return out^
@@ -267,15 +259,17 @@ struct AlternateBoostingParams(Copyable, Movable):
         return out^
 
     def allows_goss(self) -> Bool:
-        """Whether this mode can be handed an enabled `GossParams`.
+        """Whether this mode can be handed an enabled `GossParams` here.
 
-        `goss` requires one. `rf` accepts one, because gradient-based sampling
-        is one of the per-tree randomizers `boosting_rf.check_rf_params`
-        admits, exactly as LightGBM's `RF::Init` does. `gbdt` and `dart` do
-        not: for `gbdt` GOSS is a different `boosting` value, and for `dart`
-        `check_dart_supported` gives the reason.
+        Only `goss`, which requires one. `gbdt` refuses because GOSS is a
+        different `boosting` value; `dart` refuses for the reason
+        `check_dart_supported` gives. `rf` refuses **here** even though a
+        forest can legitimately be randomized by gradient sampling, because
+        `boosting_rf.train_rf` takes no `GossParams`: that combination is
+        reached through `boosting_rf.train_forest` with an `RfParams`, and
+        `train_boosting` says so in the error.
         """
-        return self.mode == BOOSTING_GOSS or self.mode == BOOSTING_RF
+        return self.mode == BOOSTING_GOSS
 
     def validate(self, goss: GossParams) raises:
         """Reject a mode that disagrees with the row sampler or the dropout
@@ -292,6 +286,13 @@ struct AlternateBoostingParams(Copyable, Movable):
             raise Error(
                 "boosting='goss' needs an enabled GossParams; it carries"
                 " top_rate, other_rate, and the seed"
+            )
+        if goss.enabled and self.mode == BOOSTING_RF:
+            raise Error(
+                "boosting='rf' with goss is a real configuration, but not"
+                " through this entry point: boosting_rf.train_rf takes no"
+                " GossParams. Build a boosting_rf.RfParams with the goss"
+                " field set and call boosting_rf.train_forest"
             )
         if goss.enabled and not self.allows_goss():
             raise Error(
@@ -318,33 +319,25 @@ struct AlternateBoostingParams(Copyable, Movable):
             )
 
 
-def rf_params_of(
-    params: BoosterParams,
-    bagging: BaggingParams,
-    goss: GossParams,
-    class_bagging: ClassBaggingParams = ClassBaggingParams.disabled(),
-) raises -> RfParams:
-    """The `boosting_rf.RfParams` a uniform argument set describes.
+def _check_rf_uniform_args(class_bagging: ClassBaggingParams) raises:
+    """Refuse the one uniform argument `boosting_rf.train_rf` has no place to
+    put.
 
-    `RfParams` deliberately has no `learning_rate`, because a forest applies
-    no shrinkage. So the rate a caller passed has to be accounted for rather
-    than dropped: `check_rf_learning_rate` refuses anything but
-    `RF_SHRINKAGE`, which follows the rule `params._check_alpha_key` already
-    states. LightGBM instead accepts the rate and overrides it, which hides a
-    real mistake, and this is the one place that difference is visible.
-
-    Nothing else is translated: the tree controls, the three row samplers, and
-    the tree count all mean what they mean everywhere else, because the same
-    grower grows a forest's trees.
+    GOSS is already refused by `AlternateBoostingParams.validate`, which sees
+    it. Balanced bagging is not a `boosting` value and so has no mode to
+    disagree with, but `train_rf` takes no `ClassBaggingParams` either, and a
+    forest randomized only by the class-conditional fractions is a
+    configuration `boosting_rf.rf_randomizer_name` explicitly accepts. So it
+    is named rather than dropped, with the entry point that takes it.
     """
-    check_rf_learning_rate(params.learning_rate)
-    return RfParams(
-        params.n_estimators,
-        params.tree.copy(),
-        bagging,
-        goss,
-        class_bagging,
-    )
+    if class_bagging.enabled():
+        raise Error(
+            "boosting='rf' with pos_bagging_fraction / neg_bagging_fraction"
+            " is a real configuration, but not through this entry point:"
+            " boosting_rf.train_rf takes no ClassBaggingParams. Build a"
+            " boosting_rf.RfParams with the class_bagging field set and call"
+            " boosting_rf.train_forest"
+        )
 
 
 def fold_weights_into_trees(
@@ -644,33 +637,6 @@ def train_dart_more(
     return len(booster.trees) - before
 
 
-def train_forest(
-    data: BinnedMatrix,
-    target: List[Float64],
-    objective: Int,
-    params: BoosterParams,
-    sample_weight: List[Float64] = [],
-    alpha: Float64 = 0.9,
-    bagging: BaggingParams = BaggingParams.disabled(),
-    goss: GossParams = GossParams.disabled(),
-    class_bagging: ClassBaggingParams = ClassBaggingParams.disabled(),
-) raises -> RfBooster:
-    """Random-forest mode from the uniform argument set, keeping the forest.
-
-    `train_boosting` bridges the result to a `Booster` so that every mode has
-    one return type. This is the entry point for a caller who needs what the
-    bridge cannot carry: iteration ranges, and continued training through
-    `boosting_rf.train_rf_more`. See the module docstring.
-
-    `init_score` is absent rather than accepted-and-refused, because the
-    uniform argument set has no place to put a value that
-    `boosting_rf.check_rf_init_score` would only reject.
-    """
-    var rf = rf_params_of(params, bagging, goss, class_bagging)
-    check_rf_params(rf, objective)
-    return train_rf(data, target, objective, rf, sample_weight, alpha)
-
-
 def train_boosting(
     data: BinnedMatrix,
     target: List[Float64],
@@ -691,10 +657,13 @@ def train_boosting(
     returned `Booster` is an ordinary one whatever the mode; what the mode
     changes is which trees are in it and what shrinkage factor they share.
 
-    `rf` comes back through `RfBooster.to_booster`, which is exact for whole
-    predictions and lossy for iteration ranges and for continuation. Use
-    `train_forest` when either matters; `init_score` is refused under `rf` by
-    `boosting_rf.check_rf_init_score` rather than ignored.
+    `rf` goes to `boosting_rf.train_rf`, which bridges its own `RfBooster`
+    back with `to_booster`. That bridge is exact for whole predictions and
+    lossy for iteration ranges (a forest's `Booster` divides by the whole
+    tree count whatever the range), so a caller who needs ranges holds the
+    `RfBooster` from `boosting_rf.train_forest` instead. `init_score` is
+    refused under `rf` by `boosting_rf.check_rf_init_score` rather than
+    ignored.
     """
     boosting.validate(goss)
     if boosting.mode == BOOSTING_DART:
@@ -717,12 +686,17 @@ def train_boosting(
             init_score,
         )
     if boosting.mode == BOOSTING_RF:
-        var rf = rf_params_of(params, bagging, goss, class_bagging)
-        check_rf_params(rf, objective)
-        var forest = train_rf(
-            data, target, objective, rf, sample_weight, alpha, init_score
+        _check_rf_uniform_args(class_bagging)
+        return train_rf(
+            data,
+            target,
+            objective,
+            params,
+            sample_weight,
+            alpha,
+            bagging,
+            init_score,
         )
-        return forest.to_booster()
     return train(
         data,
         target,
@@ -758,18 +732,27 @@ def train_boosting_more(
     before touching it, which is structural: it can catch a mismatch but
     cannot certify a match.
 
-    `rf` is REFUSED here, not dispatched. A bridged forest reports a rate of
-    `1 / T` and a base score of 0, so there is no continuing it from a
-    `Booster`; hold the `RfBooster` from `train_forest` and call
-    `boosting_rf.train_rf_more`, which continues a forest exactly.
+    `rf` goes to `boosting_rf.train_rf_more`, which checks
+    `boosting_rf.is_forest` first and rescales every existing tree, because
+    the averaging weight is a function of the tree count. Note its own
+    caveat: the constant the new trees are fitted at cannot be read off a
+    bridged `Booster`, so it is recomputed from `target` and `sample_weight`,
+    which is exact only when this is the data the forest was trained on. A
+    forest kept as an `RfBooster` carries its own base score and needs no
+    such precondition; that is `boosting_rf.train_forest_more`.
     """
     boosting.validate(goss)
     if boosting.mode == BOOSTING_RF:
-        raise Error(
-            "boosting='rf' cannot be continued from a Booster: a bridged"
-            " forest carries a base score of 0 and a shrinkage of 1 / T, so"
-            " neither its offset nor its averaging weight survives. Keep the"
-            " RfBooster from train_forest and call boosting_rf.train_rf_more"
+        _check_rf_uniform_args(class_bagging)
+        return train_rf_more(
+            booster,
+            data,
+            target,
+            params,
+            sample_weight,
+            alpha,
+            bagging,
+            init_score,
         )
     if boosting.mode == BOOSTING_DART:
         if class_bagging.enabled():

@@ -66,17 +66,17 @@ def decide_device_workload(
     """Resolve a device request over a whole workload and return the
     serialized decision.
 
-    **Register at most one device decision entry point.**
-    `handoffs/connect_05_device_policy.md` section 5.1 asks task 06 for a
-    ten-argument `decide_device` in `_mojoboost.mojo`, which is the shape
-    `_FullNativePolicy.decide` in device_selection.py already sends. This
-    is the same call with the workload packed into one mapping, and it
-    exists for one reason: if that ten-argument registration turns out to
-    exceed what `def_function` accepts, this is the drop-in that does not,
-    and the Python patch that goes with it is in
-    `handoffs/connect_14_bindings.md`. Eight arguments are proven in tree
-    (`predict_range`); ten are not. Register this *instead of*, never
-    alongside, the ten-argument form.
+    **This is the one device decision entry point.** It is registered as
+    `decide_device`, which is the name `device_selection.py` looks for.
+    `handoffs/connect_05_device_policy.md` section 5.1 asked for a
+    ten-argument version written directly in `_mojoboost.mojo` instead;
+    this form was taken over it because a workload has a dozen fields and
+    sending them positionally would fix their order in two languages and
+    bet on an argument count nothing in the module has tried (eight are
+    proven by `predict_range`, ten were never tried). `_FullNativePolicy`
+    in device_selection.py sends the mapping. Do not add the positional
+    form beside this one: two entry points to one decision is how the two
+    drift.
 
     `device` is the requested name, `"cpu"`, `"gpu"`, or `"auto"`, already
     lowercased by the caller. `workload` is a mapping with:
@@ -166,11 +166,20 @@ def _penalties(
     return out^
 
 
-def _extra_params(
+def extra_params_from_mapping(
     params: PythonObject, n_features: Int
 ) raises -> ExtraTreeParams:
     """The extra tree bundle from the params mapping. Reads only; every
-    range check is `ExtraTreeParams.check`'s."""
+    range check is `ExtraTreeParams.check`'s.
+
+    Public because `_mojoboost.mojo` calls it too: `_parse_params` folds the
+    result into the `TreeParams` it builds, so the bundle a fit is trained
+    with and the bundle `extra_params_check` validates are parsed by the same
+    function from the same keys. Two parsers over one mapping is how the
+    validator and the trainer would come to disagree about what a parameter
+    means, and this is a Mojo-side helper rather than a registered binding:
+    it returns an `ExtraTreeParams`, which is not a `PythonObject`.
+    """
     var out = ExtraTreeParams()
     out.min_gain_to_split = Float64(py=params["min_gain_to_split"])
     out.max_delta_step = Float64(py=params["max_delta_step"])
@@ -221,7 +230,7 @@ def extra_params_check(
     opted in should refuse rather than train something else.
     """
     var n_features = Int(py=shape["n_features"])
-    var extra = _extra_params(params, n_features)
+    var extra = extra_params_from_mapping(params, n_features)
     extra.check(
         n_features,
         Int(py=shape["num_leaves"]),

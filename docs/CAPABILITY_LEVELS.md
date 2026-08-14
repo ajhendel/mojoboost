@@ -15,12 +15,20 @@ scores the contested capabilities against them, `README.md` and release
 notes cite them by name, and `tools/check_parity.py` checks that the
 contract's level table uses these names and no others.
 
+Two of the seven, `integrated` and `publicly reachable`, are statements
+about the call graph rather than about behavior, and they are the two that
+rot fastest on a tree with several lanes in flight.
+`docs/INTEGRATION_INVENTORY.md` is the current evidence behind every `no`
+in those two columns, `docs/ARCHITECTURE.md` is the map it renders, and
+`tools/connectivity_audit.py` computes both from the import graph without
+importing or building anything.
+
 ## The seven levels
 
 | Level | A capability has it when | How it is proved | What it does not imply |
 |---|---|---|---|
 | implemented | Code exists in this repository that performs the behavior | A named module, struct, or function | That anything calls it |
-| integrated | A shipping code path calls it, so some entry point behaves differently because it exists | A caller outside the module's own tests and outside `tests/` | That a user can ask for it by name |
+| integrated | A shipping code path calls it, so some entry point behaves differently because it exists | A caller outside the module's own tests and outside `tests/` | That a user can ask for it by name, or that any default changes |
 | publicly reachable | A user can invoke it through a surface section 2 of `docs/COMPATIBILITY_POLICY.md` lists as public | The public name, and the file it is exported from | That it is correct, or fast |
 | focused-tested | A test in this repository exercises this behavior specifically, and a pixi task CI runs executes that test | The test file, and the task that runs it | That it agrees with LightGBM, or with anything outside this repository |
 | differential-tested | Its output is checked against an independent implementation: LightGBM, scikit-learn, or an arithmetic reference computed by hand | The comparison script or the reference test | That the comparison runs automatically |
@@ -49,6 +57,22 @@ run instead.
 
 **One machine is one machine.** Hardware validation names the device.
 "Validated on Apple M4" never widens to "validated on GPUs".
+
+**An import is not a call, and a call is not a default.** A module that a
+reachable file imports and never uses is the cheapest possible fake
+connection: the graph says it is reached and no behavior depends on it.
+`integrated` needs a call site. A module that is called but whose output an
+environment variable gates, so that the default run behaves exactly as it
+did before, is integrated and still not something a user gets; say so in
+the evidence, and name the variable. `docs/INTEGRATION_INVENTORY.md` keeps
+a section for precisely this state.
+
+**Reachable through any public surface counts.** Section 2 of
+`docs/COMPATIBILITY_POLICY.md` lists six of them, and the parameter string
+`parse_params` accepts is one. A capability a user can turn on with
+`enable_bundle=true` through the C ABI is publicly reachable even though no
+symbol for it is exported and no Python estimator takes it. The narrowness
+belongs in the status word and the evidence, not in a `no` in this column.
 
 **Levels are claims about today.** They are re-derived by reading the
 repository, not carried forward from a handoff. A handoff describes what

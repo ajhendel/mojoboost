@@ -308,6 +308,15 @@ well-defined on them, but a per-leaf regression on pairwise gradients is not
 a combination LightGBM documents or mojoboost has checked. Refused rather
 than guessed at.
 
+The four codes above are **mirrored** in `linear_tree.mojo` as `_QUANTILE`,
+`_L1`, `_LAMBDARANK`, and `_MAPE` rather than imported. `Booster` is what
+holds the sidecar, so `boosting.mojo` will import `linear_tree.mojo`, and
+`src/mojoboost` has no mutual imports anywhere; the reverse edge would be
+the first one. The codes are part of a stable public numbering (serialized
+in every model file, crossing the C ABI), so they do not move, and the
+handoff asks the boosting lane for a compile-time cross-check anyway. This
+is the same trade `model_dump.mojo` makes with `categorical._MAX_CATEGORY`.
+
 ## Multiclass
 
 Nothing special. `LinearEnsemble.trees` is parallel to `Booster.trees`, and

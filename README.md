@@ -148,6 +148,18 @@ and for the semantics that differ deliberately, read the parity contract in
 [docs/LIGHTGBM_PARITY.md](docs/LIGHTGBM_PARITY.md), which is authoritative
 where this list and it disagree.
 
+One caution that the size of the list makes worth stating plainly. A file
+in `src/mojoboost/` is not a feature. Several capabilities in this
+repository are written, compile, and are reached by no entry point, so
+nothing you can call behaves differently because they exist.
+[docs/INTEGRATION_INVENTORY.md](docs/INTEGRATION_INVENTORY.md) is the
+current list of those, [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) is the
+map of what does reach what, and
+[docs/CAPABILITY_LEVELS.md](docs/CAPABILITY_LEVELS.md) is the vocabulary
+all three use. The list below is not in that state: every item names
+something a user can reach, and where one capability has two
+implementations the item says which one runs.
+
 - quantile (equal-frequency) feature binning into `uint8` bins, LightGBM
   style, with stored edges so trained models predict on raw, unseen data
 - histogram accumulation with the sibling subtraction trick
@@ -223,8 +235,12 @@ where this list and it disagree.
 - class weighting: `class_weight="balanced"` or a per-class dict on the
   Python classifier, and LightGBM's `scale_pos_weight` / `is_unbalance`
   under their own names in `src/mojoboost/class_weight.mojo`. Each is
-  folded into the row weights before training, so there is one weighting
-  mechanism rather than two
+  folded into the row weights before training rather than into the
+  objective, so it composes with `sample_weight` instead of competing with
+  it. Two implementations of that folding exist today, one in Mojo and one
+  in the Python estimator, and only the Python one runs for a
+  `MojoBoostClassifier`; see
+  [docs/INTEGRATION_INVENTORY.md](docs/INTEGRATION_INVENTORY.md)
 - sample weights for every objective, LightGBM semantics (weighted
   gradients, hessians, and base scores; zero-weight rows are ignored)
 - seeded row bagging (`bagging_fraction`, `bagging_freq`, `bagging_seed`)
@@ -597,11 +613,12 @@ takes, which is the same routing prediction uses, and it unwinds a repeated
 feature before re-extending it. A depth-zero tree contributes to the
 expected value alone, since it says nothing about any feature.
 
-Node covers are recorded during training and travel with the model in
-format v3, because they cannot be recovered from a fitted tree. A model
+Node covers are recorded during training and travel with the model from
+format v3 on, because they cannot be recovered from a fitted tree. A model
 saved by an older build (v1 or v2) still loads and predicts exactly as
 before, but asking it for contributions raises rather than guessing at the
-covers; retrain or re-save from a current build.
+covers; retrain or re-save from a current build. Split gains travel the
+same way from v4 on, for the same reason.
 
 How this is checked: `tests/test_contrib.mojo` and
 `python/tests/test_contrib.py` each carry an independent implementation that
@@ -616,10 +633,12 @@ Estimators pickle. The trained model is an opaque handle, so pickling
 serializes it with the same versioned format `save()` writes and restores
 it on unpickling; everything else is ordinary Python state. That makes
 pickle the way to keep a whole estimator, and `save()`/`load()` the way to
-keep a model: a model file holds neither the class labels, the constructor
-hyperparameters, the feature names, nor the split gains, so a loaded
-classifier reports `classes_` as 0..n_classes-1 and a loaded model reports
-zero gain importance (with a warning).
+keep a model: a model file holds the ensemble, its binning, its split
+gains, and its feature names, but neither the class labels nor the
+constructor hyperparameters, so a loaded classifier reports `classes_` as
+0..n_classes-1. A model saved before format v4 carries no gains and
+reports zero gain importance (with a warning), which
+`dump_model()["has_split_gain"]` tells apart from a measured zero.
 
 Two documented differences from what a scikit-learn estimator is supposed
 to be, both of which are why mojoboost says "scikit-learn style" and does
@@ -807,16 +826,22 @@ tile size are runtime values here rather than compile-time ones.
 
 ## Roadmap
 
-1. Close the v1 gaps in the parity contract
-   ([docs/LIGHTGBM_PARITY.md](docs/LIGHTGBM_PARITY.md)), the largest being
-   feature contributions, the Booster and Dataset APIs, and selecting a
-   built-in metric by name from Python. Sparse input landed for training and
-   prediction; the gaps left there are a sparse GPU kernel, custom
-   objectives, and `eval_set` from Python
-2. Finish routing `device` through the remaining entry points: multiclass
-   still resolves to the CPU in `fit_multiclass` and in the Python
-   classifier, and `auto` needs a measured crossover before it may choose
-   the GPU
+1. Connect what is already written. The repository has grown faster than
+   its call graph: several capability families are implemented, compile,
+   and are reached by no entry point at all, including packed-bin GPU
+   layout, level-wise GPU growth, class-batched multiclass rounds, hybrid
+   CPU and GPU leaf placement, the sparse and categorical GPU kernels,
+   DART and random forest, CEGB, and LightGBM model file interop. The
+   current list, with what blocks each one, is
+   [docs/INTEGRATION_INVENTORY.md](docs/INTEGRATION_INVENTORY.md).
+   Registering the four auxiliary modules in `bindings/` is the single
+   largest item in it
+2. Close the remaining v1 gaps in the parity contract
+   ([docs/LIGHTGBM_PARITY.md](docs/LIGHTGBM_PARITY.md)). Sparse input
+   landed for training and prediction; the gaps left there are a reachable
+   sparse GPU kernel, custom objectives, and `eval_set` from Python. Bring
+   `device="auto"` a measured crossover, so that it may choose the GPU on
+   evidence rather than on a guess
 3. Validate the same GPU source on NVIDIA and AMD hardware
    ([procedure](docs/GPU_VALIDATION.md); neither has been run). The kernels
    already scale past one threadgroup per feature and tile themselves from
@@ -1822,9 +1847,24 @@ pixi run check-parity     # or: python3 tools/check_parity.py
 `check-parity` holds [docs/LIGHTGBM_PARITY.md](docs/LIGHTGBM_PARITY.md) to
 the code: it fails when a row that claims support is deleted or downgraded,
 when the contract cites a file that no longer exists, when a public Python or
-Mojo symbol those rows depend on disappears, or when a test suite the
-contract offers as evidence is not run by any task. It builds nothing and
-needs only the standard library, so it also runs in CI.
+Mojo symbol those rows depend on disappears, when a test suite the
+contract offers as evidence is not run by any task, or when a row claims a
+capability is out of reach after its name landed in `mojoboost.__all__`. It
+builds nothing and needs only the standard library, so it also runs in CI.
+
+```sh
+python3 tools/connectivity_audit.py    # what is connected to what
+python3 tools/audit_integration.py     # is the written inventory still true
+```
+
+Those two answer a different question: not "is this claim about LightGBM
+right" but "does anything call this code at all". The first computes the
+import graph from the four entry points and reports orphan modules, unused
+imports, duplicate policies, public parameters nothing reads, and native
+functions Python asks for that no binding exports. The second checks
+[docs/INTEGRATION_INVENTORY.md](docs/INTEGRATION_INVENTORY.md) against that
+graph. Neither imports mojoboost or builds anything, so both run on a bare
+checkout.
 
 ## Benchmarks
 

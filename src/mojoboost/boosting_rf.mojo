@@ -195,7 +195,6 @@ from .boosting import (
 )
 from .goss import GossParams, GossSelection, apply_goss_scaling, goss_round
 from .monotone import MonotoneConstraints
-from .ranking import LAMBDARANK
 from .sampling import (
     ClassBaggingParams,
     check_feature_fractions,
@@ -230,6 +229,14 @@ comptime RF_RANDOM_FEATURE_FRACTION = String("feature_fraction")
 # binary-only, so any non-binary code carries it; this names which one is
 # passed rather than leaving a bare `SQUARED_ERROR` in a multiclass call.
 comptime _NOT_BINARY = SQUARED_ERROR
+
+# `ranking.LAMBDARANK`, by value rather than by import. `ranking.mojo` imports
+# `model.mojo`, which imports the whole prediction and GPU stack, and the
+# handoff asks for `model.fit` to gain a boosting mode; importing ranking here
+# would close that loop the moment it does. `boosting._check_objective` also
+# refuses this code, so the only thing lost if the two ever disagree is the
+# better of two error messages.
+comptime _LAMBDARANK = 7
 
 
 def is_rf_boosting(value: String) -> Bool:
@@ -371,7 +378,7 @@ def check_rf_objective(objective: Int) raises:
             " be evaluated once and never again (LightGBM refuses the same"
             " combination)"
         )
-    if objective == LAMBDARANK:
+    if objective == _LAMBDARANK:
         raise Error(
             "boosting='rf' does not support 'lambdarank': lambda gradients at"
             " a constant score carry no ranking, so every tree in the forest"

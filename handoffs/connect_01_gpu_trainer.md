@@ -197,104 +197,369 @@ widen what the resolver allows, so `False` cannot enable an unproven route.
 | local scale-table loop vs `uniform_scales` | **Fused.** |
 | raw-pointer `enqueue_batch` vs `enqueue_frontier_batch` | **Fused** onto the range-checked entry. |
 | per-slot `download_slot` loop vs `download_slots` | **Fused** onto the one-mapping entry. |
-| `gpu_frontier.LeafFrontier` vs `_GpuLeafState` / `_GpuRecordLeafState` | **Selected against, quarantined.** `LeafFrontier` is a complete alternate frontier with its own commit planning and monotone clamping. Adopting it would rewrite both growers' tie-breaking, node-id assignment, and clamp order, which is exactly the `Tree` semantics this lane must preserve. Only `LeafWorkItem` (the frontier's declared contract with the batcher) is consumed. Migrating the growers onto `LeafFrontier` is a separate, testable change. |
+| `grow_tree_gpu`'s inline `n_left <= n_right` vs `subtraction_builds_left` | **Fused.** The predicate is `gpu_frontier`'s; the inline test is gone. |
+| builder's hand-rolled shape validation vs `check_layout_support` | **Fused, additively.** The specific messages run first; the layout check adds the two overflow shapes they missed. |
+| the multiclass loops' informal round contract vs `MulticlassRoundGuard` | **Fused.** The contract was a comment in two loops and is now one checked state machine driven by both. |
+| `gpu_frontier.LeafFrontier` vs `_GpuLeafState` / `_GpuRecordLeafState` | **Selected against, quarantined.** `LeafFrontier` is a complete alternate frontier with its own commit planning and monotone clamping. Adopting it would rewrite both growers' tie-breaking, node-id assignment, and clamp order, which is exactly the `Tree` semantics this lane must preserve. Only `LeafWorkItem` (the frontier's declared contract with the batcher) is consumed. Migrating the growers onto `LeafFrontier` is a separate, testable change, and §6.4 is the patch for it. Only `LeafWorkItem` and `subtraction_builds_left` are consumed. |
 | `gpu_fused_round.round_start` / `softmax_round_start` vs `builder.fill_gradients_device` | **Selected against.** They are convenience sequencers over `GpuObjectiveState` plus `GpuRowSelection` compensation, and their own docstrings say a caller with scale-independent work to interleave (which the trainer has: root row seeding) should call the stages directly. The trainer already calls the stages. `round_eligibility` and `GpuTreeRouter` from the same module *are* connected. |
 | `gpu_gradient_stream.HostGradientStage` vs `builder.stage_gradients`/`upload_staged` | **Selected against.** The builder's pinned staging is the shipped path and is what `StagingRing` models. |
 | `gpu_binned_layout` / `gpu_histogram_specializations` packing | **Not connected.** Both are planners and host-side packers; no kernel in the package reads a packed or blocked layout. `KernelFeatures.packed_bin_loads` and `specialized_bin_kernels` are declared `False` in `build_kernel_features`, which is the honest statement that the variants do not exist. |
 
 ---
+## 5. Second pass: what the first pass wrote off, revisited
 
-## 5. Remaining disconnections
+The first pass listed six modules as unconnectable. Four of them had a
+connection inside this lane's owned files after all, and they are now made.
+The revised list is below; §5.7 says what is still genuinely out of reach and
+why, and §6 turns every remaining blocker into an applicable patch.
 
-1. **Device split search cannot read a batched histogram.** The
-   `SPLIT_SEARCH_DEVICE` grower builds both children and is the frontier
-   batching most wants, but a batched build lands in the batcher's slot pool
-   and `GpuSplitSearcher.enqueue` takes a whole `DeviceBuffer` with no word
-   offset. Patch request in §6.
-2. **Interleaved gradient planes** (`gpu_gradient_stream.InterleavedGradients`
-   + `enqueue_leaf_interleaved`, `MOJOBOOST_GPU_GRAD_LAYOUT=interleaved`)
-   are unreached. `gpu_gradient_stream` imports `histogram_gpu`, so
-   `histogram_gpu` cannot import it back; the drop-in free function cannot be
-   called from inside `build_leaf`. Patch request in §6.
-3. **Multiclass class batching** (`gpu_multiclass_batch.GpuClassBatch`) is
-   unreached. Its contract holds only where several classes' histograms are
-   wanted over the *same* row ranges, which after each class's first split is
-   no longer true, because each class grows its own tree and its own
-   partition. The compatible window is the per-class root, and taking it
-   needs `n_classes` gradient planes resident at once plus a `plane`-aware
-   `LeafWorkItem` batch. Not attempted rather than faked.
-4. **`hybrid_leaf_scheduler`** is unreached. `place_leaf` declines everything
-   today (`MODE_OFF` by default, and `DECLINE_COSTS_UNMEASURED` whenever it
-   is not), and a host placement additionally needs the host `BinnedMatrix`,
-   which `GpuHistogramBuilder` deliberately does not retain. Wiring a policy
-   that can only answer `PLACE_GPU` would be an import, not an integration.
-5. **Synchronization ownership is still split.** `GpuHistogramBuilder` calls
-   `ctx.synchronize()` directly; `GpuSession.sync_for_host_read/write` exist
-   and are unused by it, because the builder copies the `DeviceContext` and
-   holds no session reference. Routing the builder's drains through the
-   session is the change `handoffs/apple_a5_runtime.md` describes and needs a
-   session-borrowing builder.
+### 5.1 `gpu_frontier.subtraction_builds_left` — CONNECTED (fused)
+
+`grow_tree_gpu` tested `n_left <= n_right` inline to decide which child is
+built and which is subtracted. `subtraction_builds_left` is that predicate,
+and its docstring names `grow_tree` and `grow_tree_gpu` as the two tests it
+matches. The inline test is gone; the grower calls it. A batched grower and
+this one can no longer pick different children and then disagree about which
+histogram a slot holds. Pure host arithmetic, no behavior change.
+
+### 5.2 `gpu_binned_layout.check_layout_support` — CONNECTED (fused)
+
+`GpuHistogramBuilder`'s constructor hand-rolled its shape validation.
+`layout_support` asks two questions it did not: a feature count past the
+Int32 index range, and an `n_rows * n_features` cell count that overflows
+Int32 even though each factor fits. Those are exactly the shapes whose flat
+bin index would wrap, and the builder indexes `bins[f * n_rows + r]`
+throughout.
+
+`check_layout_support` now runs in the constructor **after** the existing
+specific raises, so a bad row, feature, or bin count is still reported as the
+number it is; only the shapes the old checks missed reach the layout message.
+This is the ordering `_check_device_search_supported` already uses in
+`train_gpu.mojo` for the same reason. Strictly additive coverage; no existing
+error message changed, so nothing asserting on those strings can break.
+
+### 5.3 `gpu_multiclass_batch.MulticlassRoundGuard` — CONNECTED
+
+Both softmax loops in `_train_multiclass_gpu_rounds` now drive one guard. The
+mapping is exact and was checked gate by gate against the guard's stated
+ordering:
+
+| Guard call | Device path | Host path |
+| --- | --- | --- |
+| `open_round()` | top of round `i` | top of round `i` |
+| `note_probs()` | after `state.refresh_softmax` | after the `_softmax_inplace` pass |
+| `note_gradients(k, 1)` | after `fill_softmax_gradients_device(state, k)` | after `upload_gradients(grad, hess)` |
+| `note_tree(k)` | after `grow_tree_gpu` | after `grow_tree_gpu` |
+| `note_commit(k)` | after `update_raw_device(..., k)` | after the `raw[r * n_classes + k] +=` pass |
+| `close_round()` | after the class loop | after the class loop |
+
+`close_round`, not `abandon_round`, in both — including the no-progress round
+that drops its trees. That is deliberate and is a real distinction the guard
+surfaced: both loops advance the raw scores for every class *before* testing
+`made_progress`, so by the time the trees are popped they have already landed.
+`abandon_round` refuses a round with a committed class for exactly that
+reason, and calling it here would be the wrong claim about what happened.
+
+What this buys: the one rule that a batched or reordered class schedule can
+break silently — the probability snapshot must be taken when the raw scores
+hold every previous round's trees and none of this round's — is now checked
+rather than commented. Ordering is unchanged, so a correct run is unaffected.
+
+**Risk, stated plainly.** This is the one change in either pass that can turn
+a working trainer into one that raises, because the guard has no fallback: a
+misread precondition is a fatal error, not a downgrade. The mapping above was
+derived from the guard's implementation (`open_round` requires no pending
+commits and resets the flags; `note_probs` requires `ROUND_OPEN` and refuses a
+second call; `note_gradients` requires `probs_fresh` and an in-range class
+run; `note_tree` requires `probs_fresh` and refuses a second tree per class;
+`note_commit` requires that class's tree and refuses a second commit;
+`close_round` requires every class grown and committed), not from its
+docstring alone. It is still unverified by execution. The two-line revert is
+to delete the `guard` declaration and its six call sites.
+
+### 5.4 `hybrid_leaf_scheduler` — CONNECTED (as a report, which is what it is)
+
+`GpuSession.note_hybrid` resolves `MOJOBOOST_HYBRID_LEAVES` against the run's
+real facts (whether `SPLIT_SEARCH_DEVICE` resolved, whether the gradients are
+host resident, that the trainer holds the `BinnedMatrix` for the whole fit,
+the active row count and dataset shape) and keeps `describe_context` plus
+`decline_name(decline_reason(...))` for `trace()`. All three session trainer
+overloads call it.
+
+Deliberately **not** a raise, unlike the transfer route in §3.4. That route's
+alternatives are unimplemented, so honoring a request silently with the
+default would mislead. This mode's alternatives are implemented and merely
+unlicensed — no run has measured the coefficients its comparison needs — and
+the module's own docstring says the switch exists before the numbers do
+precisely so the decline reason is *observable*. Making it fatal would
+contradict the design it is being connected to.
+
+So the honest statement of what changed: the variable was read by nothing and
+is now answered. A caller who sets it on a `SPLIT_SEARCH_DEVICE` run sees
+`no_host_parent`; on a device-objective run, `gradients_on_device`; otherwise
+`costs_unmeasured`. Those are three different pieces of work, and before this
+they were indistinguishable from the variable having no effect.
+
+The representative node is the root over every feature. That is sufficient
+because every gate this can reach is a property of the run: the per-node
+arithmetic in `decline_reason` sits behind the unmeasured-costs gate.
+
+### 5.5 `gpu_frontier.LeafFrontier` — still selected against, and now for a
+second reason
+
+The first reason stands: adopting it rewrites both growers' tie-breaking,
+node-id assignment, and clamp order, which is the `Tree` semantics this lane
+must preserve.
+
+The second reason is new and decisive for *now*. `gpu_frontier.mojo` is being
+actively rewritten by another lane in this worktree during this task. Between
+the first and second pass of this lane, `CommitPlan` gained a `missing_bin`
+field and a `smaller_child_slot_is_left` method, a `FRONTIER_*` completion
+status was added, and `GpuActiveRows.apply_commit` appeared as a new
+consumer. Swapping the shipped grower onto a target that is moving, without
+the ability to compile or test, is the wrong risk to take. The patch that
+would do it is §6.4, written against the interface as it stands, and it
+should be applied when that lane settles.
+
+### 5.6 `gpu_multiclass_batch.GpuClassBatch` — still not connected, but the
+stated obstacle was wrong
+
+The first pass said it would duplicate the dataset. That is false and worth
+correcting: `GpuClassBatch` holds no bins buffer at all (its fields are
+gradients, hessians, scales, partials, output, features, and the two range
+arrays), and the binned matrix arrives as a pointer exactly as it does for
+`GpuLeafBatcher`. There is no second residency.
+
+The real obstacle is the one that remains: its contract is several classes'
+histograms over the *same* row ranges, which after each class's first split
+is no longer true, because each class grows its own tree and its own
+partition. The compatible window is the per-class root. Taking it needs
+`n_classes` gradient planes resident at once and a `plane`-aware batch, plus a
+`grow_tree_gpu` that can accept a precomputed root histogram. That is a
+restructure of the multiclass loop, not a call site. §6.3 is the interface
+note it needs first.
+
+### 5.7 Still out of reach from this lane
+
+1. **Device split search cannot read a batched histogram.** Patch §6.1.
+2. **Interleaved gradient planes.** `gpu_gradient_stream` imports
+   `histogram_gpu`, so the cycle blocks the call. Patch §6.2.
+3. **Packed and blocked bin layouts.** `gpu_binned_layout`'s planners and
+   `gpu_histogram_specializations`' packing helpers describe layouts no kernel
+   in the package reads. `build_kernel_features` declares
+   `packed_bin_loads = False` and `specialized_bin_kernels = False`, which is
+   the honest statement. Connecting them means writing kernels, not call
+   sites, and that is a different lane.
+4. **`gpu_fused_round.round_start` / `softmax_round_start`,
+   `gpu_gradient_stream.HostGradientStage`.** Selected against on the merits
+   (§4), not blocked. No patch is owed.
+5. **Synchronization ownership is still split** between the builder's direct
+   `ctx.synchronize()` and `GpuSession.sync_for_host_read/write`. Needs a
+   session-borrowing builder; `handoffs/apple_a5_runtime.md` owns it.
 6. **Nothing owns a `GpuSession` across two fits.** The pool and residency
-   ledgers still only record what a second fit could have skipped. The fit
-   latency added here is the first thing that observes the cold/warm split.
-7. **`gpu_levelwise`, `gpu_output_planes`, `gpu_binned_layout`** remain
-   unreached from the trainer.
+   ledgers still only record what a second fit could have skipped.
+7. **`gpu_levelwise`, `gpu_output_planes`** remain unreached.
 
 ---
 
-## 6. Exact cross-lane patch requests
+## 6. Ready-to-apply integration patches
 
-**R1 — `src/mojoboost/gpu_split_search.mojo`: a word offset on the histogram.**
+Each is mechanically applicable by the lane that owns the target file. None
+was applied here: every target is outside this lane's ownership.
 
-Add a defaulted parameter to `GpuSplitSearcher.enqueue` and thread it into
-`_launch_search` and the scan kernel's base index:
+### 6.1 `hist_offset` on the device split search
 
-```
-def enqueue(
-    mut self,
-    mut hist: DeviceBuffer[DType.int32],
-    params: GpuSplitParams,
-    g_scale: Float64,
-    h_scale: Float64,
-    bounds: OutputBounds = OutputBounds.unbounded(),
-    record: Int = 0,
-    hist_offset: Int = 0,          # NEW: Int32 words into `hist`
-) raises:
-```
+- **Target file / symbol:** `src/mojoboost/gpu_split_search.mojo`,
+  `GpuSplitSearcher.enqueue`, and `_launch_search`.
+- **Ownership:** not this lane's. Blocks §5.7.1.
+- **Signature:**
 
-`hist_offset` must default to 0 so every existing call is unchanged, and must
-be validated against `hist` (`hist_offset >= 0` and
-`hist_offset + 3 * n_features * n_bins <= len(hist)`). With it,
-`_search_leaf_device` can hand the searcher
-`batcher.out_dev` at `slot * batcher.slot_cells()` and the device-search
-grower can search two batch-built children without a readback.
+  ```
+  def enqueue(
+      mut self,
+      mut hist: DeviceBuffer[DType.int32],
+      params: GpuSplitParams,
+      g_scale: Float64,
+      h_scale: Float64,
+      bounds: OutputBounds = OutputBounds.unbounded(),
+      record: Int = 0,
+      hist_offset: Int = 0,          # NEW: Int32 words into `hist`
+  ) raises:
+  ```
 
-**R2 — `src/mojoboost/gpu_gradient_stream.mojo`: break the import cycle for the
-interleaved layout.** Either
+  `_launch_search` takes the same new trailing `hist_offset: Int = 0` and adds
+  it to the base index the scan kernel reads `hist` from. The scan kernel
+  already receives `n_features * n_bins` as its plane stride, so the change is
+  one added base offset, not a new indexing scheme.
+- **Validation inside `enqueue`, before `_upload_params`:**
 
-- move `enqueue_leaf_interleaved` (and only it) into `histogram_gpu.mojo`,
-  leaving `InterleavedGradients` and `enqueue_range_histogram_interleaved`
-  where they are, so `histogram_gpu` can import the plane struct without
-  `gpu_gradient_stream` importing the builder; or
-- change `enqueue_leaf_interleaved` to take the pieces it uses
-  (`mut rows: GpuActiveRows`, `bins`, `feat`, `out`, `part` pointers,
-  `caps`, `tiling.strategy`, `part_capacity`, `n_slots`, the two scales)
-  instead of `mut builder: GpuHistogramBuilder`, which drops the
-  `from .histogram_gpu import GpuHistogramBuilder` line entirely.
+  ```
+  if hist_offset < 0:
+      raise Error("histogram offset must be nonnegative")
+  if hist_offset + 3 * self.n_features * self.n_bins > len(hist):
+      raise Error("histogram offset escapes the buffer")
+  ```
+- **Call site this unblocks:** `train_gpu._search_leaf_device` (this lane's
+  file), which would become: acquire a pool slot, build the node through
+  `builder.build_leaves`, then
+  `searcher.enqueue(batcher.out_dev, split_params, g_scale, h_scale, bounds,
+  0, slot * batcher.slot_cells())`. With it,
+  `_grow_tree_gpu_device_search` builds both children in one packed launch
+  and searches both without a readback, which is the frontier
+  `gpu_frontier.leaves_per_launch` reports as `FEEDER_DEVICE_SEARCH = 2`.
+- **State flow:** the fixed-point scales already travel as `g_scale`/`h_scale`
+  arguments and are per round, so a pooled slot needs no new scale plumbing.
+  The slot's stamp (`gpu_leaf_batching.subtraction_stamp`) is host-side and
+  does not cross.
+- **Errors:** the two raises above. An out-of-range offset must raise rather
+  than clamp: clamping would search a different node's histogram and return a
+  plausible record.
+- **Fallback:** the default `hist_offset = 0` makes every existing call
+  byte-identical, so the patch is inert until a caller passes one.
+- **Serialization effect:** none.
+- **Public API effect:** additive defaulted parameter on an exported symbol.
+- **Dependency:** none; applicable immediately.
+- **Minimal later validation — UNRUN:**
+  `pixi run mojo test tests/parallel/test_gpu_split_search.mojo`, and a case
+  asserting that a record searched at `hist_offset = k * slot_cells()` equals
+  the same histogram searched at offset 0 in its own buffer.
 
-The second is preferred: it is the same shape every other kernel entry in the
-package already has, and it leaves the layout switch selectable from
-`histogram_gpu.enqueue_leaf` behind `env_grad_layout()`.
+### 6.2 Break the `gpu_gradient_stream` → `histogram_gpu` cycle
 
-**R3 — `src/mojoboost/gpu_multiclass_batch.mojo`: state the tree-ordering
-contract explicitly.** `GpuClassBatch` batches classes over shared row
-ranges. Add to its docstring (or as a checked precondition) the window in
-which that holds for a trainer: all classes of one round share a row range
-only at their trees' roots, because each class then partitions independently.
-Without that stated, a later integration will batch past the root and read
-another class's rows.
+- **Target file / symbol:** `src/mojoboost/gpu_gradient_stream.mojo`,
+  `enqueue_leaf_interleaved`, and the module's
+  `from .histogram_gpu import GpuHistogramBuilder` line.
+- **Ownership:** not this lane's. Blocks §5.7.2.
+- **Signature** (preferred of the two options; it deletes the import
+  outright):
 
----
+  ```
+  def enqueue_leaf_interleaved[
+      bins_origin: MutOrigin,
+      feat_origin: MutOrigin,
+      out_origin: MutOrigin,
+      part_origin: MutOrigin, //
+  ](
+      mut rows: GpuActiveRows,
+      mut planes: InterleavedGradients,
+      leaf: Int,
+      caps: DeviceCaps,
+      bins: MutPointer[UInt8, bins_origin],
+      feat: MutPointer[Int32, feat_origin],
+      out: MutPointer[Int32, out_origin],
+      part: MutPointer[Int32, part_origin],
+      n_slots: Int,
+      strategy: Int,
+      part_capacity: Int,
+      g_scale: Float32,
+      h_scale: Float32,
+  ) raises:
+  ```
+
+  The body is unchanged except that `builder.X` becomes the corresponding
+  parameter; it already computes `rows.range_tiling(...)` and calls
+  `enqueue_range_histogram_interleaved`. This is the shape every other kernel
+  entry in the package has (compare
+  `GpuActiveRows.enqueue_range_histogram`), so it is a normalization as much
+  as an unblocking.
+
+  The `builder.has_gradients` and `planes.n_rows != builder.n_rows` checks
+  move to the caller, which is where the builder is.
+- **Call site this unblocks:** `histogram_gpu.GpuHistogramBuilder.enqueue_leaf`
+  gains a branch on `gpu_gradient_stream.env_grad_layout()`, and the builder
+  gains a `List[InterleavedGradients]` holder packed once per round, exactly
+  as it holds `List[GpuLeafBatcher]` today.
+- **State flow:** the interleaved plane is `2 * n_rows` Float32 filled by
+  `planes.pack(ctx, grad_dev, hess_dev)` once per round, after the magnitudes
+  are reduced and after any compensation, so it holds the values the
+  histograms will read. The builder is the only object that knows when that
+  moment is, which is why the switch belongs there.
+- **Errors:** `pack` before build is already enforced by `planes.packed`;
+  the row-count agreement check moves to the builder's constructor of the
+  holder, where it is a construction-time invariant rather than a per-node
+  test.
+- **Ownership note:** `histogram_gpu.mojo` is this lane's, so the caller half
+  is applicable here the moment the callee half lands. It was not written
+  speculatively, because a call to a signature that does not exist is worse
+  than no call.
+- **Fallback:** `env_grad_layout()` defaults to `LAYOUT_SPLIT`, the shipped
+  two-plane path, and anything but the exact string `interleaved` resolves
+  there.
+- **Serialization effect:** none. The plane is a re-layout of the same
+  Float32 values, so histograms are unchanged.
+- **Public API effect:** breaking signature change on
+  `enqueue_leaf_interleaved`, which has no caller in the repository today.
+- **Dependency:** none.
+- **Minimal later validation — UNRUN:**
+  `MOJOBOOST_GPU_GRAD_LAYOUT=interleaved pixi run mojo test tests/test_gpu_strategies.mojo`,
+  asserting the interleaved and split layouts produce identical histograms —
+  which they must, since `pack` is a pure copy.
+
+### 6.3 State `GpuClassBatch`'s tree-ordering window
+
+- **Target file / symbol:** `src/mojoboost/gpu_multiclass_batch.mojo`,
+  `GpuClassBatch` docstring, and ideally `enqueue_ranged_histogram`.
+- **Ownership:** not this lane's. Blocks §5.6.
+- **Change:** add to the struct docstring, and enforce in
+  `enqueue_ranged_histogram` if the begin/count arrays make it checkable:
+
+  > Classes of one round share a row range only at their trees' roots. Each
+  > class then grows its own tree and its own partition, so from the first
+  > split onward class `k`'s node ranges are not class `j`'s. A batch that
+  > spans classes past the root reads another class's rows, which is not a
+  > precision difference but a different dataset. Callers batching per level
+  > must batch within one class's tree, or restrict a cross-class batch to
+  > the roots.
+
+- **Why a note and not a check:** the struct takes per-slot `begin`/`count`
+  arrays and cannot tell whether two slots' ranges came from the same
+  partition. If the owning lane wants it checked, the cheapest form is a
+  caller-supplied partition epoch per slot, refused when they differ — the
+  same shape as `HistogramSlotPool`'s stamp.
+- **State flow / errors / fallback / serialization / public API:** none;
+  documentation, or one added precondition.
+- **Dependency:** none.
+- **Minimal later validation — UNRUN:** none needed for the note. For the
+  epoch check, `pixi run mojo test tests/parallel/test_gpu_multiclass_batch.mojo`
+  (create if absent) asserting a cross-epoch batch raises.
+
+### 6.4 Move the growers onto `LeafFrontier` (deferred, not blocked)
+
+- **Target files:** `src/mojoboost/train_gpu.mojo` (this lane's) against
+  `src/mojoboost/gpu_frontier.mojo` (not this lane's, and currently moving).
+- **Ownership:** the call site is ownable here; the interface is not, and
+  §5.5 is why this waits.
+- **Change:** replace `_GpuRecordLeafState` in `_grow_tree_gpu_device_search`
+  with `LeafFrontier`, mapping the loop as:
+
+  | Today | `LeafFrontier` |
+  | --- | --- |
+  | `frontier.append(_GpuRecordLeafState(...))` | `frontier.begin_tree(n_root)` then `set_candidate` |
+  | the `best_gain` scan | `select_best()` |
+  | `tree._add_node` pair + clamp + `child_bounds` | `plan_commit(slot, signs)` |
+  | `frontier[best_i] = left; frontier.append(right)` | `apply_commit(plan)` |
+  | `if n_left <= n_right` | `plan.build_left` (already fused, §5.1) |
+  | `builder.apply_split(...)` | `plan.missing_bin` + `RowRouting.from_split` |
+
+- **The precondition that must be verified before applying:** `plan_commit`
+  must assign node ids in the same order `Tree._add_node` does (left then
+  right), and `select_best` must break ties toward the lower frontier index,
+  because both growers' node ids are the device's leaf ids and a different
+  order is a different tree. Both appear to hold as written; neither is
+  checked here.
+- **Fallback:** keep `_grow_tree_gpu_device_search` as written and add the
+  frontier version behind the existing `split_search` switch rather than
+  replacing it, until a differential run shows identical trees.
+- **Serialization effect:** none if the precondition holds; a changed node
+  order would change every serialized model, which is why it is a
+  precondition and not a detail.
+- **Public API effect:** none.
+- **Dependency:** the concurrent `gpu_frontier.mojo` rewrite must settle
+  first.
+- **Minimal later validation — UNRUN:**
+  `MOJOBOOST_GPU_SPLIT_STRATEGY=device pixi run mojo test tests/parallel/test_gpu_split_search.mojo`,
+  asserting the frontier grower and the record grower produce identical trees
+  on the same seed.
 
 ## 7. Fallbacks preserved
 
@@ -337,6 +602,12 @@ occurrences of the name outside `train_gpu.mojo` were prose in
 **Additive signature change (one).** `_train_gpu_rounds` gained a defaulted
 `route_all_rows`. It is module-private.
 
+**New `GpuSession` methods.** `note_alloc`, `begin_fit`, `end_fit`,
+`session_state`, `note_hybrid`. All additive; `trace()` gained startup,
+warm-up, paid-state, and (only when `MOJOBOOST_HYBRID_LEAVES` is set) hybrid
+lines, so anything parsing `trace()` output by line count would see more
+lines. The docstring already says it is not for parsing by anything shipped.
+
 **New exports** in `__init__.mojo`: `BATCH_POOL_BUDGET_BYTES`,
 `DEFAULT_BATCH_SLOTS`, `MAX_BATCH_SLOTS`, `build_kernel_features`,
 `env_batch_slots` (histogram_gpu); `SPEC_LEVEL_BASELINE`, `SPEC_LEVEL_BATCHED`,
@@ -346,7 +617,11 @@ occurrences of the name outside `train_gpu.mojo` were prose in
 `round_eligibility_reason` (gpu_fused_round); `BatchPlan`, `GpuLeafBatcher`,
 `plan_batch`, `slots_for_budget` (gpu_leaf_batching); `FitLatency`,
 `SessionState`, `StartupTrace`, `WarmupPlan`, `env_warmup_level`,
-`session_state_from_trace` (initialization).
+`session_state_from_trace` (initialization); `subtraction_builds_left`
+(gpu_frontier); `check_layout_support`, `layout_support` (gpu_binned_layout);
+`MulticlassRoundGuard` (gpu_multiclass_batch); `HybridContext`, `LeafWork`,
+`Placement`, `decline_name`, `decline_reason`, `place_leaf`
+(hybrid_leaf_scheduler).
 
 `apple_histogram_policy.HistogramPlan` was deliberately **not** exported:
 `distributed_transport.mojo` defines a struct of the same name, and a
@@ -396,11 +671,26 @@ were already defined by their own modules and are now read on a real path.
    path) to Float32 (device), which can move `best_iteration` and leaf values
    within Float32 noise relative to the CPU trainer. It is opt-in for exactly
    that reason.
-6. **`_build_leaves_batched` chunking is untested against `max_items`.** A
+6. **`MulticlassRoundGuard` has no fallback.** It is the only change in
+   either pass that converts a wiring mistake into a fatal error rather than a
+   downgrade, and it now sits on the shipped multiclass path, both the device
+   and the host variant. The call mapping was derived from the guard's
+   implementation gate by gate (§5.3) and is still unverified by execution.
+   Revert is deleting the `guard` declaration and its six call sites in
+   `_train_multiclass_gpu_rounds`.
+7. **`check_layout_support` can refuse a shape the builder previously
+   accepted** — specifically `n_features > Int32.MAX` or an
+   `n_rows * n_features` product that overflows Int32. Those shapes would have
+   produced a wrapped flat bin index, so refusing is the correct behavior, but
+   it is a behavior change and not only added coverage.
+8. **`note_hybrid` reports, it does not decide.** Nothing routes a histogram
+   to the host. A reader who sees a `hybrid` line in `trace()` is seeing a
+   resolved decline, not a placement that happened.
+9. **`_build_leaves_batched` chunking is untested against `max_items`.** A
    frontier larger than `min(max_items, pool_capacity)` is served by several
    launches; the ordering contract that makes that safe is the download
    between chunks, which is stated in the code and not enforced.
-7. **`session_state()` reports `kernels_ready` from
+10. **`session_state()` reports `kernels_ready` from
    `kernels.warm_count >= N_KERNELS`.** The registry is only fed by
    `note_kernel`, which no shipped code path calls yet, so this reads `False`
    on every real session today. That is conservative and correct as a report;
@@ -423,7 +713,14 @@ UNRUN  MOJOBOOST_GPU_HIST_SPECIALIZATION=batched \
          pixi run mojo test tests/test_gpu_strategies.mojo
 UNRUN  MOJOBOOST_GPU_TRANSFER=map_write \
          pixi run mojo test tests/test_gpu_strategies.mojo   # expect a raise
+UNRUN  pixi run mojo test tests/test_gpu_objectives.mojo     # round guard
+UNRUN  MOJOBOOST_HYBRID_LEAVES=replica \
+         pixi run mojo test tests/parallel/test_gpu_active_rows.mojo
 ```
+
+`tests/test_gpu_objectives.mojo` is the one that matters most after the second
+pass (it is the file that calls `train_multiclass_gpu`): `MulticlassRoundGuard` is the only added code with no fallback, so a
+single softmax GPU fit either passes or names the gate it violated.
 
 The first three are the only ones that answer the open question, which is
 whether this lane's source compiles. The batched run is the first that would

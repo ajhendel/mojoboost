@@ -323,7 +323,7 @@ def static_shared_ceiling() -> Int:
 
 
 def require_shared_memory_supported(
-    report: DeviceReport, n_bins: Int, features: KernelFeatures
+    report: DeviceReport, n_bins: Int, compiled: KernelFeatures
 ) raises:
     """Refuse a workgroup LDS allocation this backend or this device will
     not accept, for the kernel this build compiled.
@@ -334,7 +334,7 @@ def require_shared_memory_supported(
     footprint the compiled kernel really has, not the `n_bins * 12` model
     whose own docstring records that it is optimistic below 256 bins.
     """
-    var shared_bytes = kernel_shared_request(n_bins, features)
+    var shared_bytes = kernel_shared_request(n_bins, compiled)
     require_shared_within_ceiling(
         API_HIP, shared_bytes, AMD_LDS_PER_WORKGROUP_BYTES
     )
@@ -504,7 +504,7 @@ def packed_body_transactions(window: PackedLoadWindow) raises -> Int:
 
 
 def amd_specialization(
-    report: DeviceReport, features: KernelFeatures
+    report: DeviceReport, compiled: KernelFeatures
 ) raises -> BackendSpecialization:
     """The whole HIP descriptor for one reported device and one build."""
     require_subgroup_width_plausible(report)
@@ -522,7 +522,7 @@ def amd_specialization(
         concurrent_queues_available(),
         unified_memory_inferable(),
         False,
-        features.any(),
+        compiled.any(),
     )
 
 
@@ -551,7 +551,7 @@ def derive_amd_plan(
     n_rows: Int,
     n_slots: Int,
     n_bins: Int,
-    features: KernelFeatures,
+    compiled: KernelFeatures,
     requested_strategy: Int = STRATEGY_AUTO,
     max_partial_cells: Int = 0,
 ) raises -> BackendLaunchPlan:
@@ -572,7 +572,7 @@ def derive_amd_plan(
         n_rows,
         n_slots,
         n_bins,
-        features,
+        compiled,
         requested_strategy,
         max_partial_cells,
     )
@@ -612,7 +612,7 @@ def require_amd_launchable(
     plan: BackendLaunchPlan,
     grid_x: Int,
     n_bins: Int,
-    features: KernelFeatures,
+    compiled: KernelFeatures,
 ) raises:
     """The whole gate for one resolved HIP launch.
 
@@ -632,21 +632,27 @@ def require_amd_launchable(
     require_amd(plan.api)
     var contract = amd_contract(report)
     require_in_order_queue(contract)
-    require_shared_memory_supported(report, n_bins, features)
+    require_shared_memory_supported(report, n_bins, compiled)
     require_histogram_launchable(
-        contract, report.caps(), plan.tiling, grid_x, n_bins, features
+        contract,
+        report.caps(),
+        plan.tiling,
+        grid_x,
+        n_bins,
+        compiled,
+        plan.selected,
     )
 
 
 def describe_amd(
-    report: DeviceReport, features: KernelFeatures
+    report: DeviceReport, compiled: KernelFeatures
 ) raises -> String:
     """One line pairing the backend contract with this module's descriptor,
     for a diagnostic record or a bug report."""
     return String(
         describe_contract(amd_contract(report)),
         " | ",
-        describe_specialization(amd_specialization(report, features)),
+        describe_specialization(amd_specialization(report, compiled)),
         " | wavefront_matches_granularity=",
         _bool_text(wavefront_matches_granularity(report)),
         " | attributes_answered=",

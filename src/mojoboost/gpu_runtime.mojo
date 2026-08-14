@@ -1365,6 +1365,63 @@ struct GpuSession(RoundLifecycle, Movable):
         one-time costs, however long the process sat idle first."""
         self.fits.note_fit(self.startup, started)
 
+    def note_hybrid(
+        mut self,
+        device_split_search: Bool,
+        gradients_host_resident: Bool,
+        bins_host_resident: Bool,
+        n_active_rows: Int,
+        n_features: Int,
+        n_bins: Int,
+        dataset_rows: Int,
+    ) raises:
+        """Resolve `MOJOBOOST_HYBRID_LEAVES` against this run's facts and
+        keep the answer for `trace()`.
+
+        Nothing here moves a histogram. `hybrid_leaf_scheduler` can only
+        answer `PLACE_GPU` today, because no run has measured the
+        coefficients its comparison needs, and its own docstring says the
+        switch exists before the numbers do so that the decline reason is
+        *observable* rather than fatal. This is where it becomes observable:
+        a caller that set the variable and sees `costs_unmeasured` learns
+        which work would remove the decline, and a caller that set it on a
+        `SPLIT_SEARCH_DEVICE` run sees `no_host_parent` instead, which is a
+        different answer about a different obstacle.
+
+        Deliberately not a raise, unlike the transfer route in
+        histogram_gpu.mojo. That route's alternatives are unimplemented, so
+        asking for one and getting the default silently would mislead; this
+        mode's alternatives are implemented and merely unlicensed, and the
+        run it produces is the correct one either way.
+
+        The representative node is the root over every feature, which is
+        enough: every gate this can reach is a property of the run, not of a
+        node, since the per-node arithmetic sits behind the unmeasured-costs
+        gate.
+        """
+        var ctx = HybridContext.from_env(
+            device_split_search,
+            gradients_host_resident,
+            bins_host_resident,
+            n_active_rows,
+        )
+        if ctx.mode == MODE_OFF:
+            self.hybrid = String("")
+            return
+        var work = LeafWork.node_of(
+            0,
+            n_active_rows,
+            n_features,
+            n_features,
+            n_bins,
+            dataset_rows,
+        )
+        self.hybrid = (
+            describe_context(ctx)
+            + " placement="
+            + decline_name(decline_reason(ctx, work))
+        )
+
     def session_state(self) -> SessionState:
         """What this session has already paid, for `decide_device`.
 
@@ -1502,4 +1559,6 @@ struct GpuSession(RoundLifecycle, Movable):
         out += self.startup.report()
         out += self.warmup.report()
         out += "session.paid " + self.session_state().describe() + "\n"
+        if self.hybrid.byte_length() > 0:
+            out += "hybrid " + self.hybrid + "\n"
         return out

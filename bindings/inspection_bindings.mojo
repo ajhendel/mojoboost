@@ -390,6 +390,12 @@ def model_file_kind(path: PythonObject) raises -> PythonObject:
     exception, which is what `Booster._load_path` does today: an exception
     from a corrupt file and an exception from the wrong loader are not the
     same thing and should not be handled the same way.
+
+    Not a rename of `file_kind`, which is bound alongside it and answers
+    `"objective"`, `"multiclass"`, or `"dataset"` for a caller that does
+    not yet know what it was handed. This one is for the caller that knows
+    it wants a model: it refuses a prepared dataset file by name, rather
+    than reporting a third kind the model loaders cannot use.
     """
     return PythonObject(mojo_model_file_kind(String(py=path)))
 

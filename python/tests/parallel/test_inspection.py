@@ -43,11 +43,11 @@ def dump(fitted):
 def test_dump_reports_its_own_version_and_source(dump):
     assert dump["dump_format_version"] == inspection.DUMP_FORMAT_VERSION
     assert dump["producer"] == "mojoboost"
-    assert dump["model_format_version"] == 3
-    # No native hook is bound, so the model text is the source and the one
-    # thing it cannot carry is the split gains.
-    assert dump["source"].startswith("model_to_string")
-    assert dump["has_split_gain"] is False
+    assert dump["model_format_version"] == 4
+    # Whichever built it: the native dump reads the model, and the model
+    # text carries gains and covers itself from format v4 on.
+    assert dump["source"] in ("native", "model_to_string")
+    assert dump["has_split_gain"] is True
     assert dump["has_node_count"] is True
 
 
@@ -112,7 +112,10 @@ def test_nodes_carry_the_documented_keys(dump):
                 assert node["threshold"] is not None
                 assert node["categories"] is None
                 assert node["category_bins"] is None
-                assert node["split_gain"] is None
+                # A gain is a measurement now, not an absence: format v4
+                # carries it, and a node was only split for a positive one.
+                assert node["split_gain"] > 0.0
+                assert np.isfinite(node["split_gain"])
                 assert node["missing_type"] == "None"
 
 
@@ -256,12 +259,23 @@ def test_multiclass_dump_is_round_major(multiclass):
     assert np.allclose(got, expected, rtol=0, atol=1e-12)
 
 
+def _without_source(dump):
+    """A dump minus the one key that records which path built it. Two
+    sources describing the same trees have to agree on everything else,
+    and that is the claim worth checking."""
+    return {key: value for key, value in dump.items() if key != "source"}
+
+
 def test_dump_from_the_model_text_alone(fitted, dump):
-    """The dump's only source today is the model text, so handing that text
-    in directly has to give the same schema."""
+    """Handing the model text in directly has to give the same schema the
+    model itself does. The text carries gains and covers (format v4), so
+    the two agree on every fact and differ only in `source`, which says
+    which path built the dump and is not a fact about the model."""
     model, _ = fitted
     text = model.booster_.model_to_string()
-    assert inspection.dump_model(text) == dump
+    assert _without_source(inspection.dump_model(text)) == _without_source(
+        dump
+    )
 
 
 def test_a_booster_read_back_dumps_the_same_trees(fitted, dump):
@@ -308,7 +322,13 @@ def test_trees_to_records_has_lightgbm_columns(fitted, dump):
     assert root["missing_direction"] in ("left", "right")
     # mojoboost records covers, not hessian sums, so there is no weight.
     assert all(row["weight"] is None for row in rows)
-    assert all(row["split_gain"] is None for row in rows)
+    # A gain belongs to a split, so a leaf row has none and every internal
+    # row has one. Before format v4 carried gains, every row was None.
+    for row in rows:
+        leaf = row["left_child"] is None
+        assert (row["split_gain"] is None) is leaf
+        if not leaf:
+            assert row["split_gain"] > 0.0
 
     by_name = {row["node_index"]: row for row in rows}
     for row in rows:
@@ -457,6 +477,79 @@ def test_leaf_editing_is_not_offered():
     for name in ("set_leaf_output", "set_leaf_value", "edit_leaf"):
         assert not hasattr(inspection, name)
     assert "set_leaf_output" not in inspection.__all__
+
+
+def test_the_refusal_to_edit_is_reported_rather_than_discovered():
+    """The absence above is a decision, so it answers when asked. The
+    reasons are the invariants an edit would falsify, and both of the facts
+    it names are serialized, which is why the contradiction would outlive
+    the session that made it."""
+    status = inspection.model_editing_support()
+    assert status["supported"] is False
+    assert inspection.MODEL_EDITING_SUPPORTED is False
+    assert status["operation"] == "set_leaf_output"
+    assert len(status["invariants"]) == 3
+    assert set(status["serialized_state"]) == {"count", "split_gain"}
+    assert status["read_only_alternative"] == "leaf_outputs"
+
+
+# -- gains, importance, and what survives a save -------------------------
+
+
+def test_split_gains_sum_to_the_gain_importance(fitted, dump):
+    """The dump's gains and `feature_importance("gain")` are the same
+    numbers read two ways: `src/mojoboost/importance.mojo` sums
+    `Tree.split_gain`, and so does the dump. Nothing recomputes gain
+    importance from a dump, and this is what pins that."""
+    model, _ = fitted
+    totals = [0.0] * dump["num_feature"]
+    for tree in dump["tree_info"]:
+        for node in _walk_nodes(tree["tree_structure"]):
+            if "leaf_index" not in node:
+                totals[node["split_feature"]] += node["split_gain"]
+    native = inspection.feature_importance(model, "gain")
+    assert np.allclose(list(native), totals, rtol=0, atol=1e-9)
+    counts = inspection.feature_importance(model, "split")
+    assert sum(counts) == sum(
+        1
+        for tree in dump["tree_info"]
+        for node in _walk_nodes(tree["tree_structure"])
+        if "leaf_index" not in node
+    )
+
+
+def test_a_saved_model_keeps_its_gains(fitted, tmp_path):
+    """Format v4 carries split gains, so a model read back from a file
+    reports the gain importance it was trained with. Before v4 every one of
+    these was zero, and `has_split_gain` was False."""
+    model, _ = fitted
+    path = tmp_path / "model.mbst"
+    model.booster_.save_model(path)
+    revived = Booster(model_file=str(path))
+
+    assert inspection.dump_model(revived)["has_split_gain"] is True
+    before = list(inspection.feature_importance(model, "gain"))
+    after = list(inspection.feature_importance(revived, "gain"))
+    assert np.allclose(after, before, rtol=0, atol=0.0)
+    assert any(value > 0.0 for value in after)
+
+
+def test_leaf_outputs_are_the_leaf_values_by_ordinal(fitted, dump):
+    """The reading half of the pair whose writing half is refused above.
+    The ordinal is the one `predict(pred_leaf=True)` reports, so a leaf's
+    output is looked up by the number the model itself gives it."""
+    model, _ = fitted
+    outputs = inspection.leaf_outputs(model, dump=dump)
+    assert len(outputs) == len(dump["tree_info"])
+    for tree, values in zip(dump["tree_info"], outputs):
+        assert len(values) == tree["num_leaves"]
+        assert all(value is not None for value in values)
+        for node in _walk_nodes(tree["tree_structure"]):
+            if "leaf_index" in node:
+                assert values[node["leaf_index"]] == node["leaf_value"]
+    assert inspection.leaf_outputs(model, 0, dump=dump) == outputs[0]
+    with pytest.raises(ValueError, match="outside"):
+        inspection.leaf_outputs(model, len(outputs), dump=dump)
 
 
 # -- helpers -------------------------------------------------------------

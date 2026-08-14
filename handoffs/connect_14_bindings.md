@@ -1,6 +1,6 @@
 # Connect 14 handoff: bindings for the native capabilities except GPU prediction
 
-Owned and edited by this lane, and nothing else:
+Owned and edited by this lane:
 
 - `bindings/binding_support.mojo` (new)
 - `bindings/objective_bindings.mojo` (new)
@@ -10,9 +10,20 @@ Owned and edited by this lane, and nothing else:
 - `bindings/basic_bindings.mojo` (new)
 - `handoffs/connect_14_bindings.md` (this file)
 
-Nothing outside that list was touched. `bindings/_mojoboost.mojo` belongs
-to task 06 and is untouched here; every line it needs is in section 6.1,
-ready to paste.
+**Edited outside that list, on explicit instruction, after the modules
+above were written.** Three items had been left as patch requests and were
+then directed to be fixed rather than requested. Each is additive, each is
+recorded in full at the section named, and no other lane's work was
+reverted, reformatted, or moved:
+
+| File | Lane it belongs to | What changed | Section |
+| --- | --- | --- | --- |
+| `bindings/_mojoboost.mojo` | task 06 | four module imports and their registrations, plus one `decide_device` | 6.1 |
+| `bindings/build.sh` | unowned | `-I bindings` on the build command | 6.2 |
+| `python/mojoboost/device_selection.py` | task 05 | the name resolver, the workload mapping, one comment | 6.3 |
+
+Task 06 had already imported and registered `dataset_bindings` in full
+before this; that work is untouched and the additions sit beside it.
 
 Nothing was committed by this lane. Note for a reviewer: another lane ran
 a sweeping commit (860b1cf) partway through this work, so
@@ -190,13 +201,18 @@ distributed training. The patch that removes it is 6.5.
 
 Everything else in every module is read from native code.
 
-## 6. Cross-lane patch requests
+## 6. Cross-lane changes
 
-### 6.1 `bindings/_mojoboost.mojo` (owner: task 06) — required
+6.1, 6.2 and 6.3 are **applied**, in the working tree, uncommitted. The
+rest are still requests. Read an applied section as the record of what
+landed and why, not as work to repeat.
 
-Nothing existing changes. Two additive blocks.
+### 6.1 `bindings/_mojoboost.mojo` (owner: task 06) — APPLIED
 
-**(a) Imports.** Add above the `mojoboost.*` import block:
+Nothing existing changed. Two additive blocks, placed beside the
+`dataset_bindings` import and registration that lane had already written.
+
+**(a) Imports.** Added above the `mojoboost.*` import block:
 
 ```mojo
 from basic_bindings import (
@@ -260,7 +276,8 @@ from objective_bindings import (
 ```
 
 **(b) Registration.** In `PyInit__mojoboost`, after
-`m.def_function[resolve_device]("resolve_device")`:
+`m.def_function[resolve_device]("resolve_device")`, and beginning with the
+one device entry point (see (c)):
 
 ```mojo
         # -- inspection (handoffs/migration_19_model_inspection.md) ----
@@ -340,24 +357,33 @@ from objective_bindings import (
         m.def_function[native_clock_ns]("native_clock_ns")
 ```
 
-**(c) The device entry point: register exactly one.**
-`handoffs/connect_05_device_policy.md` §5.1 asks for a ten-argument
-`decide_device` written directly in `_mojoboost.mojo`. Prefer that: it is
-the shape `_FullNativePolicy.decide` in `device_selection.py` already
-sends, so it needs no Python patch. Then **do not** register
-`decide_device_workload`.
-
-If ten arguments turn out to exceed what `def_function` accepts (eight is
-proven in tree by `predict_range`; ten is not, and
-`handoffs/performance_15_startup.md` claims a cap of six, which the
-existing eight-argument entry points contradict), register this instead:
+**(c) The device entry point: exactly one, and this is it.**
 
 ```mojo
         m.def_function[decide_device_workload]("decide_device")
 ```
 
-and apply 6.3(b) in the same commit, because the Python caller's argument
-shape changes with it.
+`handoffs/connect_05_device_policy.md` §5.1 asked instead for a
+ten-argument `decide_device` written directly in `_mojoboost.mojo`,
+matching the ten positional arguments `_FullNativePolicy.decide` used to
+send. That request is **superseded**, and 6.3(b) moved the Python caller
+to the mapping in the same change. Two reasons, in order:
+
+1. Ten arguments to `def_function` is a bet nothing in the module has
+   tried. Eight are proven (`predict_range`, `predict_proba_range`), and
+   `handoffs/performance_15_startup.md` claims a cap of six, which those
+   eight-argument entry points already contradict. Nobody knows the real
+   number, and the fix costs nothing to avoid needing to know.
+2. A workload has a dozen fields and will gain more. Positionally, their
+   order is fixed in two languages at once, and adding one moves every
+   call site; as a mapping, a new field is a new key. `_parse_params`
+   already reads a mapping for exactly this reason.
+
+`_FullNativePolicy` in `device_selection.py` has never run in a shipped
+build, because `decide_device` was never bound, so changing its call shape
+broke no caller. If someone later establishes that ten arguments register
+cleanly and prefers the positional form, it replaces this one; it does not
+join it.
 
 **(d) `dataset_create` gains `keep_raw`** (`connect_12_dataset_cv.md`
 §6.2(a)): read `keep_raw` from `params` and pass it as the twelfth
@@ -389,39 +415,61 @@ The signatures are identical except that the two sparse builders take the
 params mapping directly, which is what `_csc(params)` and `_csr(params)`
 already do. `_sparse_shape` becomes unused and goes with them.
 
-### 6.2 `bindings/build.sh` (owner: whoever touches it first; task 06 or 18) — required
+### 6.2 `bindings/build.sh` (owner: unowned) — APPLIED
 
-The build compiles one file with `-I src`, so the sibling modules are not
-on the import path:
+The build compiled one file with `-I src` only, so the sibling modules
+were not on the import path. Now:
 
 ```sh
 pixi run mojo build --emit shared-lib -I src -I bindings \
     bindings/_mojoboost.mojo -o python/mojoboost/_mojoboost.so
 ```
 
-If Mojo already puts the input file's own directory on the path, this is a
-no-op and harmless. It has not been verified either way here, because
-verifying it means running a build. Any packaging script that reproduces
-this command needs the same flag.
+If Mojo already puts the input file's own directory on the path, the flag
+is a harmless no-op; if it does not, this is what makes 6.1(a) resolve.
+Which of the two is true has not been established here, because
+establishing it means running a build.
 
-### 6.3 `python/mojoboost/device_selection.py` (owner: task 05)
+`packaging/build_wheel.sh` and `packaging/linux/build_wheel_linux.sh` both
+invoke this script rather than repeating the command, so both wheels pick
+the flag up and no packaging file needed to change. `capi/build.sh` builds
+a different entry point (`capi/`) and is untouched. A comment in the script
+now says all of this, so the next person to add a module here knows the
+flag is load-bearing.
 
-**(a) One line, always worth applying.** `_code_for_objective_name`
-currently looks only for `objective_code`, which is now the *model handle*
-accessor. Prefer the name resolver:
+### 6.3 `python/mojoboost/device_selection.py` (owner: task 05) — APPLIED
+
+**(a) The name resolver.** `_code_for_objective_name` looked only for
+`objective_code`, which is now the *model handle* accessor, so it would
+have handed a `str` to `downcast_value_ptr[Model]()` and swallowed the
+exception, reporting every named objective as undeclared and skipping the
+gate. It now prefers the name resolver and keeps the old name as a
+fallback for a build that predates the split:
 
 ```python
-    resolve = getattr(ext, "objective_code_of_name", None) or getattr(
-        ext, "objective_code", None
-    )
+    resolve = getattr(ext, "objective_code_of_name", None)
+    if resolve is None:
+        resolve = getattr(ext, "objective_code", None)
 ```
 
-Without it a name-only caller silently reports its objective as
-undeclared, which skips the objective gate. With it, `explain_device_choice(
-X, y, objective="lambdarank")` gets `BLOCK_RANKING_OBJECTIVE` as intended.
+The fallback still fails soft for the reason above, which is the existing
+behavior, and the docstring now says why the two names are two questions.
+With this, `explain_device_choice(X, y, objective="lambdarank")` gets
+`BLOCK_RANKING_OBJECTIVE` as intended.
 
-**(b) Only if 6.1(c) took the fallback branch.** Replace the ten positional
-arguments in `_FullNativePolicy.decide` with the mapping:
+**(c) A sentinel comment that was wrong.** The note above
+`_BINS_UNSPECIFIED` said the binding folds "anything below -1" to
+`OBJECTIVE_UNSPECIFIED`, preserving -1 as "a real code". It does not, and
+should not: `MULTICLASS` (-1) is excluded from
+`device_policy.is_builtin_objective`, so sending it gates the run as "not
+a built-in objective", which is the wrong reason to refuse a GPU. The
+binding folds every negative objective, `migration_20` specified that, and
+the comment now says so. It also now warns that `n_bins` must not be sent
+as 0 to mean undeclared, since 0 *is* the native sentinel and a declared 0
+would be read as a bin count.
+
+**(b) The workload mapping**, applied together with 6.1(c). The ten
+positional arguments in `_FullNativePolicy.decide` became one mapping:
 
 ```python
         text = self._decide(
@@ -444,12 +492,10 @@ arguments in `_FullNativePolicy.decide` with the mapping:
         )
 ```
 
-**(c) A latent mismatch worth fixing whichever branch is taken.**
-`_BINS_UNSPECIFIED = -1` in Python, and `BINS_UNSPECIFIED = 0` natively.
-Both bindings fold *any* negative `n_bins` to the native sentinel, so -1
-works, but a caller that sends 0 meaning "undeclared" would have it read
-as a declared bin count of zero. Either keep sending -1 (the bindings
-handle it) or change the Python constant to 0; do not send both.
+`_BINS_UNSPECIFIED` stays -1 on the Python side. The binding folds any
+negative to the native `BINS_UNSPECIFIED`, which is 0, so -1 travels
+correctly; changing the Python constant to 0 would work too, but only one
+of the two conventions may be in use and -1 is the one already written.
 
 ### 6.4 `python/mojoboost/_eval.py` and `__init__.py` (owner: task 07)
 
@@ -554,14 +600,19 @@ unblocked by 6.1: `dataset_create_csc`, `dataset_create_reference`, and
 
 ## 9. Risks, and what is unverified
 
-1. **Nothing compiles yet.** The single largest risk. Syntax, import
-   resolution, `def_function` arity, and `PythonObject` conversions are
-   all read, not run.
-2. **Cross-module imports in `bindings/`** depend on 6.2. If Mojo does not
-   put the input file's directory on the path and `-I bindings` is not
-   added, `_mojoboost.mojo` will not resolve `from inspection_bindings
-   import ...` and the build fails loudly. It cannot fail quietly.
-3. **`def_function` arity above eight is unproven** (section 6.1(c)).
+1. **Nothing compiles yet.** The single largest risk, and the one every
+   other item on this list resolves into. Syntax, import resolution, and
+   `PythonObject` conversions are all read, not run. Everything below
+   fails at build time, loudly, or not at all; none of it can produce a
+   module that imports and then behaves wrongly.
+2. **Cross-module imports in `bindings/` are now load-bearing.** 6.1(a)
+   makes `_mojoboost.mojo` import five sibling modules and 6.2 puts the
+   directory on the path. If Mojo resolves them some other way the flag is
+   inert; if it does not and the flag were dropped, the build stops at the
+   first import.
+3. ~~`def_function` arity above eight is unproven.~~ Retired: no entry
+   point takes more than the eight already proven, because the two calls
+   that would have taken more take a mapping instead (6.1(c)).
 4. **Submodule imports of modules not re-exported by `__init__.mojo`**
    (section 6.6). Same character of failure: loud, at build time.
 5. **`Python.import_module("builtins").dict()`** is used for every dict
@@ -596,7 +647,8 @@ In order. Each is the smallest thing that establishes the next.
 
 ```sh
 # 1. Does the extension build with the new modules on the path?
-#    Requires 6.1 and 6.2 to be applied first.
+#    6.1 and 6.2 are applied, so this is now the first thing to run and
+#    the one that answers risks 1, 2, and 4 at once.
 bash bindings/build.sh                                          # UNRUN
 
 # 2. Is every new name actually exported?

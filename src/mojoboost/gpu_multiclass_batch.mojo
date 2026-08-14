@@ -295,6 +295,39 @@ def _zero_batch_kernel(
         buffer[unsafe_offset=i] = 0
 
 
+def _scatter_slot_kernel(
+    grad: MutPointer[Float32, MutAnyOrigin],
+    hess: MutPointer[Float32, MutAnyOrigin],
+    out_grad: MutPointer[Float32, MutAnyOrigin],
+    out_hess: MutPointer[Float32, MutAnyOrigin],
+    n_rows: Int32,
+    slot: Int32,
+):
+    """Copy one batch slot's gradient and hessian planes into a caller's
+    single-class buffers.
+
+    A plain device-to-device streaming copy of `2 * 4 * n_rows` bytes, with
+    no arithmetic in it: the values a slot holds are the values the caller
+    receives, bit for bit, so a tree grown from the copy is the tree the
+    sequential path would have grown from the same gradients.
+
+    This exists because the two layouts serve different lifetimes rather than
+    different arithmetic. A batch holds `k_count` classes resident at once,
+    which is what lets one magnitude readback serve all of them; the grower
+    accumulates from one class at a time, out of a buffer it owns for the
+    whole session. Something has to bridge the two at the moment a class's
+    tree starts growing, and a copy is the bridge that leaves both owners
+    intact.
+    """
+    var r = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var nr = Int(n_rows)
+    if r >= nr:
+        return
+    var base = Int(slot) * nr
+    out_grad[unsafe_offset=r] = grad[unsafe_offset = base + r][0]
+    out_hess[unsafe_offset=r] = hess[unsafe_offset = base + r][0]
+
+
 def _batch_hist_shared_kernel(
     bins: MutPointer[UInt8, MutAnyOrigin],
     rows: MutPointer[Int32, MutAnyOrigin],
@@ -1128,6 +1161,46 @@ struct GpuClassBatch(Movable):
         """`magnitude_sums` then `set_scales`: the round's one readback."""
         var mags = self.magnitude_sums(k_count)
         self.set_scales(mags)
+
+    def scatter_slot(
+        mut self,
+        slot: Int,
+        mut grad_dst: DeviceBuffer[DType.float32],
+        mut hess_dst: DeviceBuffer[DType.float32],
+    ) raises:
+        """Copy slot `slot`'s gradient and hessian planes into a caller's
+        own `Float32[n_rows]` buffers, on the device.
+
+        The hand-off to a grower that accumulates one class at a time out of
+        buffers it owns (`GpuHistogramBuilder.fill_batched_gradients` is that
+        caller). Nothing is synchronized: the copy is enqueued behind the
+        gradient fill that produced the plane and ahead of whatever the
+        caller enqueues next, on the one queue they share.
+
+        The destination must hold at least `n_rows` Float32. The scales that
+        belong with the copied plane are `scale_of(slot)` and
+        `hess_scale_of(slot)`; a caller that takes the values without the
+        scales has a plane it cannot quantize, which is why this refuses to
+        run before `refresh_scales`.
+        """
+        self._check_slot(slot)
+        if not self.has_gradients:
+            raise Error("fill the batch's gradients before scattering them")
+        if not self.has_scales:
+            raise Error(
+                "refresh the batch's scales before scattering a slot; the"
+                " plane is unusable without the scale it was reduced at"
+            )
+        self.ctx.enqueue_function[_scatter_slot_kernel](
+            self.grad_dev.unsafe_ptr(),
+            self.hess_dev.unsafe_ptr(),
+            grad_dst.unsafe_ptr(),
+            hess_dst.unsafe_ptr(),
+            Int32(self.n_rows),
+            Int32(slot),
+            grid_dim=self._row_blocks(),
+            block_dim=self.block_threads,
+        )
 
     def set_features(
         mut self, slot: Int, features: List[Int]

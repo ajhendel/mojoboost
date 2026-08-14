@@ -128,7 +128,12 @@ from .collective import (
     zeros_f64,
     zeros_int,
 )
-from .distributed_transport import digest_ints, f64_bits, f64_from_bits
+from .distributed_transport import (
+    digest_ints,
+    f64_bits,
+    f64_from_bits,
+    transport_available,
+)
 from .histogram import Histogram
 from .monotone import OutputBounds
 from .split import SplitInfo, find_best_split
@@ -364,13 +369,24 @@ comptime UNSUPPORTED_SERIAL_WORLD = 16
 
 
 def strategy_unsupported_mask(
-    strategy: Int, world_size: Int, transport_ready: Bool
+    strategy: Int,
+    world_size: Int,
+    multi_process: Bool,
+    transport_ready: Bool,
 ) -> Int:
     """Every reason this build cannot run `strategy` at this world size.
 
     All of them at once rather than the first one found, so a caller that is
     two changes away from a working configuration learns both changes from one
     error instead of one per attempt.
+
+    `multi_process` is what separates a world spread over processes from one
+    hosted inside this one, and it is why the transport gate is conditional. A
+    four-rank world hosted by `LocalCollective` is a legal, working
+    configuration today, and refusing it because no socket exists would refuse
+    the only distributed training that runs. `hosts_whole_world` in
+    collective.mojo is the predicate a caller reads this from, and
+    `require_strategy` does exactly that.
     """
     if (
         strategy != STRATEGY_SERIAL
@@ -391,7 +407,7 @@ def strategy_unsupported_mask(
         or strategy == STRATEGY_VOTING_PARALLEL
     ):
         mask |= UNSUPPORTED_NO_DRIVER
-    if not transport_ready:
+    if multi_process and not transport_ready:
         mask |= UNSUPPORTED_NO_TRANSPORT
     return mask
 
@@ -436,18 +452,42 @@ def raise_strategy_unsupported(strategy: Int, mask: Int) raises:
 
 
 def require_strategy_operational(
-    strategy: Int, world_size: Int, transport_ready: Bool
+    strategy: Int,
+    world_size: Int,
+    multi_process: Bool,
+    transport_ready: Bool,
 ) raises:
-    """The gate. Raises unless `strategy` can actually run here.
+    """The gate, as a pure function of what it is told.
 
-    Today it raises for feature and voting parallel unconditionally, and for
-    data parallel whenever the world spans processes this build cannot reach.
-    That is deliberate: a core that has never been driven, never run across
-    processes, and never measured is not a mode a caller should be able to
-    select by accident.
+    Raises for feature and voting parallel unconditionally, and for any mode
+    whose world spans processes this build cannot reach. That is deliberate: a
+    core that has never been driven, never run across processes, and never
+    measured is not a mode a caller should be able to select by accident.
     """
-    var mask = strategy_unsupported_mask(strategy, world_size, transport_ready)
+    var mask = strategy_unsupported_mask(
+        strategy, world_size, multi_process, transport_ready
+    )
     raise_strategy_unsupported(strategy, mask)
+
+
+def require_strategy[
+    C: Collective
+](comm: C, strategy: Int) raises:
+    """The gate, against the world and the build actually in front of it.
+
+    The two facts the pure form has to be told are read here from the only
+    places that know them: whether the world spans processes from
+    `hosts_whole_world`, and whether this build can reach another process from
+    `transport_available`. A caller cannot then pass a `transport_ready` its
+    build does not have, which is the failure mode a boolean parameter invites
+    and the reason this wrapper exists rather than being left to the caller.
+    """
+    require_strategy_operational(
+        strategy,
+        comm.world_size(),
+        not hosts_whole_world(comm),
+        transport_available(),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1289,14 +1329,14 @@ def strategy_cost_plan(
         var selected = n_selected if n_selected > 0 else DEFAULT_TOP_K
         if selected > n_features:
             selected = n_features
-        var cells = selected * n_bins
+        var voted_cells = selected * n_bins
         return StrategyCostPlan(
             strategy,
             world_size,
             4,
-            2 * cells,
-            cells + n_features,
-            3 * cells * 8 + n_features * 8,
+            2 * voted_cells,
+            voted_cells + n_features,
+            3 * voted_cells * 8 + n_features * 8,
         )
     if strategy == STRATEGY_SERIAL:
         return StrategyCostPlan(strategy, world_size, 0, 0, 0, 0)
@@ -1387,10 +1427,19 @@ def check_strategy_world[
 ) raises:
     """Everything that has to be true before the first election.
 
-    Two collectives, both once per run and neither per node: the status
-    agreement and the configuration agreement. The order is the one
+    The gate first, then two collectives, both once per run and neither per
+    node: the status agreement and the configuration agreement. The gate is
+    ahead of both because its inputs are the strategy, the world size, and two
+    facts about the build, all of which are identical on every rank, so it
+    raises everywhere or nowhere and no rank is left in a collective a refused
+    peer will never call. The two agreements are then in the order
     `grow_tree_distributed` uses, statuses first, so a rank whose own state is
     broken is reported as broken rather than as disagreeing.
+
+    This function is therefore the only entry point a driver needs, and it is
+    the one that will start raising less as the modes become real.
     """
-    agree_status(comm, strategy_statuses(comm, strategy, partition, n_features))
+    require_strategy(comm, strategy)
+    var statuses = strategy_statuses(comm, strategy, partition, n_features)
+    agree_status(comm, statuses)
     agree_strategy(comm, strategy, partition, top_k)

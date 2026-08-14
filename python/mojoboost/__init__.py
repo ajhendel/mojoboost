@@ -1166,6 +1166,19 @@ class _Base(_ParamsMixin):
         cat_smooth=10.0,
         cat_l2=10.0,
         min_data_per_group=100,
+        min_gain_to_split=0.0,
+        min_split_gain=None,
+        max_delta_step=0.0,
+        path_smooth=0.0,
+        extra_trees=False,
+        extra_seed=6,
+        monotone_penalty=0.0,
+        monotone_constraints_penalty=None,
+        monotone_constraints_method="basic",
+        feature_contri=None,
+        cegb_tradeoff=1.0,
+        cegb_penalty_split=0.0,
+        forced_splits=None,
         importance_type="split",
     ):
         self.num_leaves = num_leaves
@@ -1207,6 +1220,19 @@ class _Base(_ParamsMixin):
         self.cat_smooth = cat_smooth
         self.cat_l2 = cat_l2
         self.min_data_per_group = min_data_per_group
+        self.min_gain_to_split = min_gain_to_split
+        self.min_split_gain = min_split_gain
+        self.max_delta_step = max_delta_step
+        self.path_smooth = path_smooth
+        self.extra_trees = extra_trees
+        self.extra_seed = extra_seed
+        self.monotone_penalty = monotone_penalty
+        self.monotone_constraints_penalty = monotone_constraints_penalty
+        self.monotone_constraints_method = monotone_constraints_method
+        self.feature_contri = feature_contri
+        self.cegb_tradeoff = cegb_tradeoff
+        self.cegb_penalty_split = cegb_penalty_split
+        self.forced_splits = forced_splits
         self.importance_type = importance_type
         self._reset_fitted()
 
@@ -1289,6 +1315,35 @@ class _Base(_ParamsMixin):
                 )
             out.append(sign)
         buf = _array.array("d", out)
+        return buf, _addr(buf)
+
+    def _feature_contri_buffer(self, n_features):
+        """Validated float64 buffer for `feature_contri` and its address, or
+        `(None, 0)` when unset. The buffer must stay referenced while the
+        address is in use, the same contract `_monotone_buffer` has.
+
+        LightGBM's `feature_contri` is one multiplier per feature applied to
+        that feature's split gain, so a value below zero would flip the sign
+        of a gain rather than scale it. `FeaturePenalties.check` in
+        src/mojoboost/tree_parameters_extra.mojo refuses that too; the length
+        is checked here because this is where `n_features` is known and the
+        message can name the mismatch.
+        """
+        contri = self.feature_contri
+        if contri is None:
+            return None, 0
+        if isinstance(contri, (str, bytes)):
+            raise ValueError(
+                "feature_contri must be a sequence of per-feature gain"
+                " multipliers, not a string"
+            )
+        values = [float(v) for v in contri]
+        if len(values) != n_features:
+            raise ValueError(
+                f"feature_contri has {len(values)} entries but X has"
+                f" {n_features} features"
+            )
+        buf = _array.array("d", values)
         return buf, _addr(buf)
 
     # -- categorical features ---------------------------------------------
@@ -1674,7 +1729,16 @@ class _Base(_ParamsMixin):
             "min_data_per_group": int(self.min_data_per_group),
         }
 
-    def _resolve_device(self, n_rows, n_features, n_outputs, workload=None):
+    def _resolve_device(
+        self,
+        n_rows,
+        n_features,
+        n_outputs,
+        objective_code=None,
+        sparse=False,
+        categorical=False,
+        has_eval_set=False,
+    ):
         """The backend a *fit* will actually run on, "cpu" or "gpu". Names
         are case-insensitive, as LightGBM treats `device_type`. Raises
         ValueError for an unknown `device` and RuntimeError when "gpu" is
@@ -1687,18 +1751,25 @@ class _Base(_ParamsMixin):
         count and whether the GPU predictor covers the request; see
         `_device_request`.
 
-        `workload` is a `mojoboost.device_selection.Workload` carrying what
-        the native policy gates on beyond the shape (the objective, the bin
-        count, the sparse / categorical / missing / eval-set flags). The
-        shape-only workload built here carries what the narrow native entry
-        point can read anyway; a caller with more to declare passes it, and
-        the extra gates start running once `decide_device` is bound.
+        Everything after `n_outputs` is what the native policy gates on
+        beyond the shape, and every one of them changes an answer:
+        `objective_code` blocks the GPU for a custom objective and for
+        lambdarank, `sparse` blocks it because there is no sparse GPU
+        histogram, `has_eval_set` blocks it because validation metrics are
+        scored on the host, and `max_bin` (read off the estimator) and
+        `categorical` and `use_missing` are reported. Leaving one
+        undeclared does not make it false, it makes the decision
+        incomplete, which the report says. `objective_code=None` is
+        undeclared, which is what the multiclass classifier means: its
+        trees-per-round is the fact that matters and `n_outputs` carries
+        it.
 
         No decision is made in Python. `mojoboost.device_selection` is the
         one Python door to the native policy and holds no policy of its
         own; the direct `_mojoboost.resolve_device` call below reaches the
-        same engine without the report and is the fallback for a build
-        whose `device_selection` module cannot be imported at all.
+        same engine without the report, and is both the fallback for a
+        build whose `device_selection` cannot be imported and the reason
+        the callers keep their own guards (see `_gpu_unsupported`).
         """
         device = self._resolve_alias("device", "device_type", "cpu")
         try:
@@ -1706,10 +1777,17 @@ class _Base(_ParamsMixin):
         except Exception:
             _policy = None
         if _policy is not None:
-            if workload is None:
-                workload = _policy.Workload(
-                    n_rows, n_features, n_classes=n_outputs
-                )
+            workload = _policy.Workload(
+                n_rows,
+                n_features,
+                objective_code=objective_code,
+                n_classes=n_outputs,
+                max_bin=int(self.max_bin),
+                sparse=bool(sparse),
+                categorical=bool(categorical),
+                has_missing=bool(self.use_missing),
+                has_eval_set=bool(has_eval_set),
+            )
             # DeviceUnavailableError is a RuntimeError subclass carrying the
             # native refusal text, so it propagates as what this method has
             # always raised, with the report attached.

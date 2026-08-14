@@ -303,13 +303,14 @@ this lane owns.
 
 Steps 1 through 4 change no public surface. Step 5 is the only one that does.
 
-A competing, smaller proposal exists: patch P5 of
-`handoffs/connect_17_alternate_boosting.md` threads a plain `List[Bool]`
-first-use ledger through the same three files and leaves the lazy penalty
-refused. It does not address the cached-candidate refund of section 5.1, the
-feature recovery of section 6, or the backend refusals of section 8. The two
-must not both be applied; section 10 of `handoffs/remaining_04_cegb.md`
-compares them line by line.
+The earlier, smaller P5 proposal in
+`handoffs/connect_17_alternate_boosting.md` has been withdrawn. Its plain
+`List[Bool]` first-use ledger did not refund coupled cost from cached leaf
+candidates after another leaf committed the feature, so it could change the
+leaf-wise frontier order relative to the stated formula. The authoritative
+integration is PATCH 1 through PATCH 4 of
+`handoffs/remaining_04_cegb.md`, including `cegb_stale_cached_gain`. P5 must
+not be applied.
 
 ## 12. Reachability, precisely
 

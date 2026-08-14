@@ -84,60 +84,60 @@ from std.math import isfinite, isnan
 # every element count under 2^46 leaves every product of two of them, and
 # every such product plus an offset, comfortably inside Int64.
 
-comptime MAX_ALLOC_ELEMS = 1 << 46
+comptime MAX_ALLOC_ELEMS: Int = 1 << 46
 """Largest element count any allocation in this package may request.
 
 At 8 bytes an element that is 512 TiB, so no real allocation approaches it;
 what it buys is that `a * b` for two checked counts cannot wrap Int64, which
 is what makes `checked_mul` a total function rather than a guess."""
 
-comptime MAX_FEATURES = 1 << 31
+comptime MAX_FEATURES: Int = 1 << 31
 """Largest feature count. LightGBM indexes features with `int` and
 `categorical.mojo` requires category codes to survive `static_cast<int>`, so
 a wider feature axis could not round-trip through either."""
 
-comptime MAX_ROWS = 1 << 44
+comptime MAX_ROWS: Int = 1 << 44
 """Largest row count. Bounded well under `MAX_ALLOC_ELEMS` so that
 `n_rows * n_features` for any accepted shape is still checkable."""
 
-comptime MAX_BIN_COUNT = 256
+comptime MAX_BIN_COUNT: Int = 256
 """Largest bin count per feature. The binned matrix stores bin ids as UInt8
 (see binning.mojo), so 256 is a representational limit, not a policy."""
 
-comptime MAX_NNZ = 1 << 44
+comptime MAX_NNZ: Int = 1 << 44
 """Largest stored-entry count in a compressed sparse matrix."""
 
-comptime MAX_TREE_NODES = 1 << 24
+comptime MAX_TREE_NODES: Int = 1 << 24
 """Largest node count in one tree read from a file. A tree with more than
 sixteen million nodes is not a tree anyone trained; `num_leaves` is capped
 far below this by every grower."""
 
-comptime MAX_MODEL_TREES = 1 << 22
+comptime MAX_MODEL_TREES: Int = 1 << 22
 """Largest tree count in one model file. `num_iterations * num_class` for
 any real ensemble is several orders of magnitude below this."""
 
-comptime MAX_MODEL_NODES = 1 << 30
+comptime MAX_MODEL_NODES: Int = 1 << 30
 """Largest total node count across a model's trees. Per-tree and per-model
 ceilings are both needed: many small trees exhaust memory as surely as one
 enormous one, and only the running total catches that."""
 
-comptime MAX_ITERATIONS = 1 << 24
+comptime MAX_ITERATIONS: Int = 1 << 24
 """Largest boosting round count a run may be asked for."""
 
-comptime MAX_DEPTH_LIMIT = 1 << 20
+comptime MAX_DEPTH_LIMIT: Int = 1 << 20
 """Largest `max_depth` a caller may state. Depth is bounded by node count in
 practice; this rejects a value so large it can only be a unit error."""
 
-comptime MAX_CLASSES = 1 << 20
+comptime MAX_CLASSES: Int = 1 << 20
 """Largest class count. One tree per class per round is the multiclass cost
 model, so the class count multiplies the whole ensemble."""
 
-comptime MAX_CATEGORY_CODE = 1 << 31
+comptime MAX_CATEGORY_CODE: Int = 1 << 31
 """Exclusive upper bound on a raw category code, matching
 `categorical._MAX_CATEGORY`: LightGBM reads codes through
 `static_cast<int>`, so a code at or above 2^31 cannot round-trip."""
 
-comptime MAX_RELEVANCE = 30
+comptime MAX_RELEVANCE: Int = 30
 """Largest graded relevance label. This must stay equal to
 `ranking.MAX_RELEVANCE_LABEL`, which is the value `ranking.label_gain`
 tabulates against; `label_gain` is `2^label - 1`, and the table it reads
@@ -617,8 +617,25 @@ def scan_column(
     Infinities are not tolerated here either, so a caller that scans columns
     without having run `check_features_finite` still gets the same refusal
     with the same message.
+
+    The slice bound is checked rather than assumed, because this is the one
+    function here that reads a column without having been told the feature
+    count and so cannot derive the bound from the shape.
     """
-    var base = feature * n_rows
+    if feature < 0:
+        raise Error("feature index cannot be negative, got ", feature)
+    var base = checked_mul(feature, n_rows, "column offset")
+    if base + n_rows > len(values):
+        raise Error(
+            "feature ",
+            feature,
+            " needs values [",
+            base,
+            ", ",
+            base + n_rows,
+            ") but the matrix holds only ",
+            len(values),
+        )
     var n_missing = 0
     var n_finite = 0
     var first = 0.0
@@ -1600,7 +1617,7 @@ def check_booster_ranges(
 # ---------------------------------------------------------------------------
 
 
-comptime CONTROL_CODES = 3
+comptime CONTROL_CODES: Int = 3
 """How many callback control codes exist. The codes themselves
 (`CONTINUE = 0`, `STOP = 1`, `ABORT = 2`) are named in callback.mojo; this
 module knows only that they are the integers `[0, CONTROL_CODES)`, which is

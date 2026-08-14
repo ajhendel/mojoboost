@@ -1243,6 +1243,16 @@ def _zeroed_i64(size: Int) -> List[Int64]:
 
 
 @fieldwise_init
+struct QuantTotals(Copyable, Movable):
+    """One feature's, or one node's, integer totals. The integer counterpart
+    of `histogram.FeatureTotals`."""
+
+    var grad: Int64
+    var hess: Int64
+    var count: Int
+
+
+@fieldwise_init
 struct QuantizedHistogram(Copyable, Movable):
     """Per-(feature, bin) integer statistics, flattened as
     `[f * n_bins + b]`, in the same layout as `histogram.Histogram`.
@@ -1359,16 +1369,6 @@ struct QuantizedHistogram(Copyable, Movable):
             h += self.hess[base + b]
             c += self.count[base + b]
         return QuantTotals(g, h, c)
-
-
-@fieldwise_init
-struct QuantTotals(Copyable, Movable):
-    """One feature's, or one node's, integer totals. The integer counterpart
-    of `histogram.FeatureTotals`."""
-
-    var grad: Int64
-    var hess: Int64
-    var count: Int
 
 
 def check_same_lattice(a: QuantScales, b: QuantScales) raises:

@@ -220,7 +220,8 @@ from .apple_histogram_policy import (
     derive_histogram_plan,
     env_specialization_level,
 )
-from .gpu_frontier import LeafWorkItem
+from .gpu_binned_layout import check_layout_support, layout_support
+from .gpu_frontier import LeafWorkItem, subtraction_builds_left
 from .gpu_fused_round import (
     ROUND_OK,
     GpuTreeRouter,
@@ -232,6 +233,15 @@ from .gpu_leaf_batching import (
     GpuLeafBatcher,
     plan_batch,
     slots_for_budget,
+)
+from .gpu_multiclass_batch import MulticlassRoundGuard
+from .hybrid_leaf_scheduler import (
+    HybridContext,
+    LeafWork,
+    Placement,
+    decline_name,
+    decline_reason,
+    place_leaf,
 )
 from .initialization import (
     FitLatency,

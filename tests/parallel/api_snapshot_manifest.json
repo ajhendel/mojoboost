@@ -52,7 +52,7 @@
   "versions": {
     "library": "0.1.0",
     "c_abi": 1,
-    "model_format": "v3",
+    "model_format": "v4",
     "dump_format": 1,
     "snapshot_schema": 1,
     "python_wheel_tag": "cp314-cp314-macosx_26_0_arm64",
@@ -495,7 +495,7 @@
       "model_sparse": ["fit_csc", "fit_multiclass_csc", "predict_class_csr", "predict_csr", "predict_proba_csr", "predict_raw_csr"],
       "ranking": ["DEFAULT_NDCG_EVAL_AT", "DEFAULT_SIGMOID", "DEFAULT_TRUNCATION_LEVEL", "LAMBDARANK", "MAX_RELEVANCE_LABEL", "RankGroups", "RankerParams", "check_groups", "check_labels", "check_ranker_params", "fit_ranker", "groups_from_counts", "groups_from_query_ids", "label_gain", "lambdarank_gradients", "map_at_cutoffs", "max_dcg", "mean_average_precision", "ndcg", "ndcg_at_cutoffs", "train_ranker", "train_ranker_with_valid"],
       "params": ["MULTICLASS", "SUPPORTED_KEYS", "TrainConfig", "objective_default_alpha", "objective_display_name", "objective_from_name", "params_names_mojo_api_only", "parse_params"],
-      "serialize": ["load_model", "load_multiclass_model", "model_file_kind", "save_model", "save_multiclass_model"]
+      "serialize": ["load_feature_names", "load_model", "load_multiclass_model", "model_file_kind", "save_model", "save_multiclass_model"]
     },
     "internal_frozen_helpers": {
       "module": "src/mojoboost/boosting.mojo",
@@ -584,17 +584,18 @@
   },
   "model_format": {
     "magic": "mojoboost",
-    "version": "v3",
+    "version": "v4",
     "encoding": "plain text tokens; floats as IEEE-754 bit patterns in decimal UInt64",
     "kind_token": ["objective", "multiclass"],
-    "readable_versions": ["v1", "v2", "v3"],
+    "readable_versions": ["v1", "v2", "v3", "v4"],
     "forward_compatible": false,
     "sections": {
       "v1": ["mapper edges and offsets", "per-node feature, threshold, children, value"],
       "v2": ["missing bins and per-node default_left", "optional monotone section", "optional categorical section", "optional per-tree cat section"],
-      "v3": ["per-node covers, unconditional"]
+      "v3": ["per-node covers, unconditional"],
+      "v4": ["per-node split gains behind a per-tree flag", "per-node covers behind a per-tree flag, so a tree that has none says so", "optional feature_names section, one escaped token per name"]
     },
-    "absent_by_design": ["num_leaves", "regularization", "interaction constraints", "subsampling", "split gains", "feature names", "training device"]
+    "absent_by_design": ["num_leaves", "regularization", "interaction constraints", "subsampling", "training device"]
   },
   "inspection": {
     "module": "mojoboost.inspection",

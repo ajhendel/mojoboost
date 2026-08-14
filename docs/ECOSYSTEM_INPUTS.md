@@ -242,6 +242,14 @@ What is checked, batch by batch, before anything is converted:
   `_arrow` uses across the chunks of one column, so batch 5's third
   category is batch 2's third category.
 
+`Batches` answers `shape`, `num_data()`, `row_counts()`, and `offsets()`
+without converting anything, and caches the schema check and the unified
+category tables, so a fit that asks for the names, then the categories,
+then the matrix pays for the first two once. Answering `shape` is also what
+puts a batched input into `mojoboost.device_selection.Workload.from_data`
+and `explain_device_choice`, which read a two-element `shape` off whatever
+they are given; an Arrow table and a polars frame already have one.
+
 `BatchedInput` carries the assembled `matrix` (column-major float64, the
 shape `_arrays.addr` and `column_view` read), the `names`, the unified
 `categories`, the `offsets` of each batch in the matrix, and the `label`,

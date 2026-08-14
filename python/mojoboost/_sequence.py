@@ -254,6 +254,8 @@ def describe_input(data):
         "type": type(data).__name__,
         "adapter": None,
         "columns": None,
+        "arrow_installed": _arrow.arrow_available(),
+        "polars_installed": _polars.polars_available(),
     }
     if kind == "arrow_table":
         out["adapter"] = "mojoboost._arrow"
@@ -275,8 +277,7 @@ def describe_input(data):
         ]
     elif kind == "batches":
         out["adapter"] = "mojoboost._sequence"
-        source = data if isinstance(data, Batches) else Batches(data)
-        out["columns"] = source.describe()
+        out["columns"] = _wrap(data).describe()
     elif kind is not None:
         out["adapter"] = (
             "mojoboost._arrow" if kind.startswith("arrow") else
@@ -454,13 +455,27 @@ class Batches:
     second time. `drained` says which happened.
     """
 
-    __slots__ = ("_batches", "drained", "source_type")
+    __slots__ = (
+        "_batches",
+        "drained",
+        "source_type",
+        "_schema",
+        "_categories",
+    )
 
     def __init__(self, source):
         self.source_type = type(source).__name__
         self._batches, self.drained = _collect_batches(source)
         if not self._batches:
             raise ValueError("a batched input must have at least one batch")
+        # Both are derived from the batches and both are asked for more
+        # than once on a fit (`feature_names`, `frame_categories`, and
+        # `check_X` each want one of them), so they are computed once. The
+        # batches are held, not consumed, and an Arrow table or a polars
+        # frame does not change under its holder, so the answers do not go
+        # stale.
+        self._schema = None
+        self._categories = None
 
     def __len__(self):
         return len(self._batches)
@@ -475,6 +490,34 @@ class Batches:
     def batches(self):
         """The batches themselves, in order."""
         return list(self._batches)
+
+    def schema(self, name="X"):
+        """`(names, n_features)` for the whole input, checked across every
+        batch and computed once."""
+        if self._schema is None:
+            self._schema = _check_consistency(self._batches, name)
+        return self._schema
+
+    def categories(self, name="X"):
+        """The unified category table per column, computed once."""
+        if self._categories is None:
+            self._categories = unify_categories(self._batches, name)
+        return self._categories
+
+    @property
+    def shape(self):
+        """`(n_rows, n_features)`, so a batched input answers the shape
+        question everything else answers.
+
+        `mojoboost.device_selection.Workload.from_data` reads `shape` off
+        anything two-dimensional, which is how an Arrow table and a polars
+        frame already reach it; this is what puts `Batches` in the same
+        position without a change in that module. It costs one cheap pass
+        over the batches (each reports its own row count) and no
+        conversion.
+        """
+        _, n_features = self.schema()
+        return self.num_data(), n_features
 
     def row_counts(self):
         """Rows per batch, without converting anything."""
@@ -608,17 +651,34 @@ def _check_consistency(source, name):
 
 
 def _batch_width(batch, names):
-    """Features in one batch, without converting it."""
+    """Features in one batch, without converting it.
+
+    A batch that cannot say how wide it is fails here rather than at the
+    concatenation, because a 1-dimensional batch is the likely cause and
+    "rows must have equal length" would be the wrong thing to be told.
+    """
     if names is not None:
         return len(names)
     shape = getattr(batch, "shape", None)
-    if shape is not None and len(shape) == 2:
-        return int(shape[1])
+    if shape is not None:
+        if len(shape) == 2:
+            return int(shape[1])
+        raise ValueError(
+            f"a batch must be 2-dimensional, got shape {tuple(shape)}; a "
+            "batch is a block of rows of the feature matrix, so one row is "
+            "shape (1, n_features) and one feature is (n_rows, 1)"
+        )
     columns = getattr(batch, "num_columns", None)
     if columns is not None:
         return int(columns)
-    first = batch[0]
-    return len(first)
+    try:
+        return len(batch[0])
+    except TypeError:
+        raise ValueError(
+            f"a batch of type {type(batch).__name__} does not describe its "
+            "width; pass batches as arrays, frames, tables, or lists of "
+            "rows"
+        ) from None
 
 
 def unify_categories(source, name="X"):
@@ -687,16 +747,25 @@ def _key(label):
 def batch_feature_names(source):
     """Feature names for a batched input, or None. The
     `_arrays.feature_names` counterpart, for `Batches`."""
-    batches = source if isinstance(source, Batches) else Batches(source)
-    names, _ = _check_consistency(batches, "X")
+    names, _ = _wrap(source).schema()
     return names
 
 
 def batch_categories(source):
     """`{column_index: [label, ...]}` for a batched input. The
     `_arrays.frame_categories` counterpart, for `Batches`."""
-    batches = source if isinstance(source, Batches) else Batches(source)
-    return unify_categories(batches)
+    return _wrap(source).categories()
+
+
+def _wrap(source):
+    """`source` as a `Batches`, wrapping it only if it is not one already.
+
+    Reusing the wrapper is what makes the caches on it worth having: a fit
+    asks for the names, then the categories, then the matrix, and an
+    already-wrapped input answers the first two from what it worked out the
+    first time.
+    """
+    return source if isinstance(source, Batches) else Batches(source)
 
 
 def _allocate_matrix(n_rows, n_features):
@@ -848,9 +917,12 @@ def materialize(
     bounded-memory binner needs, which is why `Batches` keeps the batches
     rather than consuming them.
     """
-    batches = source if isinstance(source, Batches) else Batches(source)
-    taken = [c for c in (label_column, weight_column, query_column)
-             if c is not None]
+    batches = _wrap(source)
+    taken = [
+        c
+        for c in (label_column, weight_column, query_column)
+        if c is not None
+    ]
     if len(set(taken)) != len(taken):
         raise ValueError(
             "label_column, weight_column, and query_column must name "
@@ -874,14 +946,19 @@ def materialize(
             )
         feature_batches.append(_batch_drop(batch, taken, "materialize"))
 
-    names, n_features = _check_consistency(feature_batches, name)
+    # With nothing taken out, the feature batches are the batches, so the
+    # wrapper's cached schema and category tables are the answer. With a
+    # label or a weight column removed they are not, and both are worked
+    # out again on what is left.
+    if taken:
+        names, n_features = _check_consistency(feature_batches, name)
+        found = unify_categories(feature_batches, name)
+    else:
+        names, n_features = batches.schema(name)
+        found = batches.categories(name)
     if n_features == 0:
         raise ValueError(f"{name} must have at least one feature")
-    tables = (
-        dict(encoders)
-        if encoders
-        else unify_categories(feature_batches, name)
-    )
+    tables = dict(encoders) if encoders else found
     counts = [_batch_rows(batch) for batch in feature_batches]
     n_rows = sum(counts)
     if n_rows == 0:

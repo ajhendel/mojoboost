@@ -93,6 +93,7 @@ from .boosting import (
 from .gpu_active_rows import GpuActiveRows
 from .gpu_tiling import derive_block_threads, query_device_caps
 from .objective_registry import objective_gradients_on_device
+from .quantized_gradient import fixed_point_scale
 
 # Clamp on every `exp` argument. exp(60) is 1.1e26, four orders of magnitude
 # inside the Float32 maximum, so the poisson hessian's extra
@@ -111,10 +112,6 @@ comptime HESS_FLOOR = Float32(1e-16)
 # histogram kernels do.
 comptime SUM_THREADS = 256
 comptime SUM_BLOCKS = 256
-
-# Mirrors `_FIXED_ONE` in histogram_gpu.mojo: half the Int32 range, the bound
-# every partial sum of scaled values has to stay inside.
-comptime FIXED_ONE = Float64(1 << 30)
 
 # Default capacity of the node-value table `update_raw` uploads. A tree has
 # `2 * num_leaves - 1` nodes, so this covers num_leaves up to 1024 without a
@@ -152,27 +149,13 @@ def supports_device_objective(objective: Int) -> Bool:
 
 
 def device_fixed_scale(total: Float64) raises -> Float32:
-    """The fixed-point histogram scale for a magnitude sum, the scalar core
-    of `_fixed_scale` in histogram_gpu.mojo with the host-side pass over the
-    values replaced by `magnitude_sums`.
+    """The fixed-point histogram scale for a device magnitude sum.
 
-    Same expression, same Float32 result, so a builder fed from the device
-    reduction quantizes identically to one fed from a host list. The two must
-    stay in step; the handoff names the one-line refactor that would leave a
-    single definition.
+    `quantized_gradient.fixed_point_scale` is the definition; this name
+    remains because GPU modules already import it and because it identifies
+    which side of the boundary produced the magnitude sum.
     """
-    var t = total
-    if not isfinite(t):
-        raise Error("gradients and hessians must be finite")
-    if t < 1e-12:
-        t = 1e-12
-    var scale = Float32(FIXED_ONE / t)
-    if not isfinite(scale) or scale <= 0.0:
-        raise Error(
-            "gradient/hessian magnitudes are out of range for the GPU"
-            " fixed-point histogram"
-        )
-    return scale
+    return fixed_point_scale(total)
 
 
 @always_inline

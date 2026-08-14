@@ -120,11 +120,13 @@ from max.gpu.host import DeviceBuffer, DeviceContext, HostBuffer
 from .apple_histogram_policy import (
     REASON_AS_REQUESTED,
     SPEC_LEVEL_BATCHED,
+    ClassSchedule,
     HistogramPlan,
     HistogramWorkload,
     batching_declined_reason,
     derive_histogram_plan,
     env_specialization_level,
+    plan_class_schedule,
     profile_from_caps,
 )
 from .binning import BinnedMatrix
@@ -132,6 +134,8 @@ from .categorical import CatBitset, CategoricalSpec, cat_empty
 from .gpu_active_rows import GpuActiveRows, LeafRange, RowRouting
 from .gpu_binned_layout import check_layout_support
 from .gpu_frontier import LeafWorkItem
+from .gpu_multiclass_batch import GpuClassBatch
+from .gpu_output_planes import BatchEligibility
 from .gpu_histogram_specializations import (
     DeviceHistogramCapabilities,
     KernelFeatures,
@@ -157,6 +161,7 @@ from .gpu_objectives_native import (
     device_fixed_scale,
 )
 from .parallel import _env_int
+from .quantized_gradient import fixed_point_scale, magnitude_sum
 from .unified_memory_policy import (
     ROLE_BINS,
     ROUTE_COPY_STAGED,
@@ -193,8 +198,6 @@ comptime MAX_BINS = 256
 
 # Row indices and leaf ids cross into the kernels as Int32.
 comptime MAX_ROWS = Int(Int32.MAX)
-
-comptime _FIXED_ONE = Float64(1 << 30)
 
 # Histogram slots the batched path may hold at once, and the byte budget it
 # is capped against. A slot is a full-width `3 * n_features * n_bins` Int32
@@ -235,28 +238,8 @@ def build_kernel_features() -> KernelFeatures:
 
 
 def _fixed_scale(values: List[Float64]) raises -> Float32:
-    """Fixed-point scale from the magnitude sum: every partial sum of scaled
-    values stays within +/- 2^30, half the Int32 range.
-
-    Returned as Float32 because that is the precision the kernel multiplies
-    by, so the host-side inverse matches the device quantization exactly.
-    Magnitude sums below the floor are numerically zero against any
-    regularization; the floor keeps the scale finite instead of dividing by
-    (near) zero."""
-    var total = 0.0
-    for i in range(len(values)):
-        total += abs(values[i])
-    if not isfinite(total):
-        raise Error("gradients and hessians must be finite")
-    if total < 1e-12:
-        total = 1e-12
-    var scale = Float32(_FIXED_ONE / total)
-    if not isfinite(scale) or scale <= 0.0:
-        raise Error(
-            "gradient/hessian magnitudes are out of range for the GPU"
-            " fixed-point histogram"
-        )
-    return scale
+    """Fixed-point scale derived from a host-side value list."""
+    return fixed_point_scale(magnitude_sum(values))
 
 
 struct GpuHistogramBuilder(Movable):
@@ -293,9 +276,11 @@ struct GpuHistogramBuilder(Movable):
     var active: List[Int]
     var caps: DeviceCaps
     # What this backend is required to provide, derived once from `caps` when
-    # the builder opens. Every launch below is checked against it by
-    # `_require_launchable`; see gpu_portability.mojo, which is the one place
-    # that knows what a backend must have for these kernels to run.
+    # the builder opens. Every launch geometry this builder resolves is
+    # checked against it by `require_histogram_launchable`: at construction,
+    # whenever `set_features` narrows the grid, and once more before the
+    # batched pool is allocated. See gpu_portability.mojo, which is the one
+    # place that knows what a backend must have for these kernels to run.
     var contract: BackendContract
     var tiling: HistogramTiling
     var g_scale: Float64
@@ -460,6 +445,17 @@ struct GpuHistogramBuilder(Movable):
         self.tiling = derive_tiling(
             self.caps, data.n_rows, data.n_features, data.n_bins, strategy
         )
+        # The whole-matrix launch this tiling describes, checked before
+        # anything is allocated for it. The grid's x axis carries the feature
+        # count on this path.
+        require_histogram_launchable(
+            self.contract,
+            self.caps,
+            self.tiling,
+            data.n_features,
+            data.n_bins,
+            build_kernel_features(),
+        )
         self.part_capacity = self.tiling.partial_cells
         self.rows = GpuActiveRows(
             self.ctx, data.n_rows, data.n_features, data.n_bins, self.caps
@@ -576,6 +572,18 @@ struct GpuHistogramBuilder(Movable):
             self.tiling.strategy,
             self.part_capacity,
         )
+        # A narrowed grid is a different launch and gets the same gate the
+        # full one got. Feature subsampling only ever shrinks grid.x, so this
+        # cannot start failing mid-tree on a builder that opened cleanly, but
+        # checking is what makes that a property rather than an assumption.
+        require_histogram_launchable(
+            self.contract,
+            self.caps,
+            self.tiling,
+            len(self.active),
+            self.n_bins,
+            build_kernel_features(),
+        )
         with self.feat_dev.map_to_host() as host:
             var dst = host.unsafe_ptr()
             for i in range(len(features)):
@@ -682,6 +690,83 @@ struct GpuHistogramBuilder(Movable):
         self.has_gradients = True
         self.round_epoch += 1
 
+    def class_schedule(
+        self,
+        n_classes: Int,
+        eligibility: BatchEligibility,
+        requested_batch: Int = 0,
+    ) raises -> ClassSchedule:
+        """How a softmax round's classes may be grouped on this device.
+
+        The companion of `histogram_plan`, from the same profile and the same
+        dataset shape: the class grouping needs a resolved tile count and the
+        device's threadgroup memory, and planning it here is what keeps it
+        from being derived a second time somewhere else. The workload is the
+        round's *root*, because that is the level a batch is formed at.
+
+        Its default is the sequential path -- one class at a time, exactly
+        what this trainer does today -- unless a caller or
+        `MOJOBOOST_GPU_CLASS_BATCH` asks for more. Nothing is allocated here;
+        the schedule is a value, and `GpuClassBatch.for_plan` is what spends
+        against it.
+        """
+        return plan_class_schedule(
+            profile_from_caps(self.caps),
+            DeviceHistogramCapabilities.portable(),
+            build_kernel_features(),
+            HistogramWorkload.node(
+                self.n_rows, self.n_rows, len(self.active), self.n_bins
+            ),
+            self.n_features,
+            n_classes,
+            eligibility,
+            self.tiling.strategy,
+            self.spec_level,
+            self.part_capacity,
+            0,
+            requested_batch,
+        )
+
+    def fill_batched_gradients(
+        mut self, mut batch: GpuClassBatch, slot: Int
+    ) raises:
+        """One batched class's gradients into the histogram buffers.
+
+        The batched counterpart of `fill_softmax_gradients_device`, and
+        deliberately the same four statements: the class's Float32 gradients
+        and hessians arrive in this builder's buffers, the fixed-point scales
+        that quantize them are set, and the round epoch advances because a
+        new gradient set invalidates every cached histogram.
+
+        What differs is only where the two come from. In the sequential form
+        each class runs its own reduction and its own readback, and a
+        readback drains the queue; here `GpuClassBatch.refresh_scales` has
+        already reduced every class of the batch in one launch and read the
+        partials back once, so this class's scale is looked up rather than
+        waited for. The numbers are the same either way: the batched
+        reduction uses the same blocks, the same grid stride, and the same
+        ascending Float64 host fold per class as the single-class one, so a
+        class's scale does not depend on the batch it was reduced in.
+
+        The plane itself is copied rather than pointed at
+        (`GpuClassBatch.scatter_slot`). This builder owns its gradient
+        buffers for the whole session and every enqueue below reads them, so
+        adopting a pointer into someone else's allocation would make every
+        later build depend on that allocation outliving it. The copy is
+        `2 * 4 * n_rows` bytes, device to device, once per class per round --
+        against a histogram pass that reads `n_rows * n_features` bins per
+        node -- and it buys the removal of one host synchronization per
+        class, which is the cost the batch exists to remove. That trade has
+        not been measured on any device.
+        """
+        if batch.n_rows != self.n_rows:
+            raise Error("class batch and histogram builder disagree on n_rows")
+        batch.scatter_slot(slot, self.grad_dev, self.hess_dev)
+        self.g_scale = batch.scale_of(slot)
+        self.h_scale = batch.hess_scale_of(slot)
+        self.has_gradients = True
+        self.round_epoch += 1
+
     def update_raw_device(
         mut self,
         mut state: GpuObjectiveState,
@@ -782,6 +867,14 @@ struct GpuHistogramBuilder(Movable):
             raise Error("leaf id must be nonnegative and fit in Int32")
 
         var n_slots = len(self.active)
+        # Deliberately not gated by `require_histogram_launchable`, and this
+        # is the reason rather than an oversight. This runs once per node, and
+        # the gate allocates a `List[Int]` of required primitives per call. It
+        # would also have nothing new to check: `n_slots` is `len(self.active)`,
+        # which `set_features` gated when it last changed, and a node's tiling
+        # only ever shrinks the full-matrix one this builder opened with, since
+        # a node holds a subset of the rows. Every dimension here was bounded
+        # by a gate that already ran.
         var tiling = self.rows.range_tiling(
             self.caps,
             leaf,
@@ -898,6 +991,21 @@ struct GpuHistogramBuilder(Movable):
         var slots = want if want < affordable else affordable
         if slots < 2:
             return False
+        # The one launch on this builder whose selected variants differ from
+        # the default, and so the one place the specialization gate has teeth:
+        # a backend that has never run the batched kernel refuses it here,
+        # before the slot pool is allocated, rather than at the launch. The
+        # `selected` argument is what makes this different from the two gates
+        # above, which pass the conservative `KernelFeatures.none()`.
+        require_histogram_launchable(
+            self.contract,
+            self.caps,
+            self.tiling,
+            len(self.active),
+            self.n_bins,
+            build_kernel_features(),
+            KernelFeatures(False, False, True),
+        )
         self.batcher.append(
             GpuLeafBatcher(
                 self.ctx,

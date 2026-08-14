@@ -54,14 +54,14 @@ Differences from LightGBM, all deliberate
   `fit(eval_set=..., early_stopping_rounds=...)`.
 - **`dump_model` and `trees_to_dataframe` report what mojoboost records.**
   Both are here, and both delegate to `mojoboost.inspection`, which is the
-  one implementation of the schema. Two columns cannot be filled the way
-  LightGBM fills them: `split_gain` is absent from a model read back from a
-  file or a pickle, because gains are recorded during growth and
-  deliberately not serialized, and `weight` is always None, because
-  mojoboost records a node's training row cover (in `count`) and not the
-  hessian sum LightGBM calls weight. `docs/MODEL_INSPECTION_SCHEMA.md` has
-  the rest; `model_to_string()` still gives the whole model in mojoboost's
-  versioned text format.
+  one implementation of the schema. One column cannot be filled the way
+  LightGBM fills it: `weight` is always None, because mojoboost records a
+  node's training row cover (in `count`) and not the hessian sum LightGBM
+  calls weight. `split_gain` is filled, and travels with the model from
+  format v4 on, so only a model read from a file written before that
+  reports None and says so through `has_split_gain`.
+  `docs/MODEL_INSPECTION_SCHEMA.md` has the rest; `model_to_string()`
+  still gives the whole model in mojoboost's versioned text format.
 
 See docs/LIGHTGBM_PARITY.md for the full row-by-row statement.
 """
@@ -316,6 +316,20 @@ class _Config:
             n_features,
             self.n_classes if self.task == _eval.MULTICLASS else 1,
         )
+        if getattr(dataset, "is_sparse", False):
+            # The GPU trainer reads a dense binned matrix, so a sparse
+            # dataset resolves to the CPU rather than being densified. An
+            # explicit device='gpu' is a request that cannot be served and
+            # is refused here, where the caller's own word for it is still
+            # in hand; 'auto' would have picked the CPU anyway on anything
+            # this path can run.
+            if getattr(self.base, "device", "auto") == "gpu":
+                raise RuntimeError(
+                    "sparse input trains on the CPU; there is no sparse GPU "
+                    "kernel yet. Use device='cpu' or device='auto', or "
+                    "densify with .toarray() to train on the GPU."
+                )
+            device = "cpu"
         params = self.base._params(
             0, device, ic_flat, ic_offsets, mono_addr, None
         )
@@ -354,6 +368,29 @@ class Dataset:
 
     Binning happens on `construct()`, or on the first `train()` that uses
     the dataset. Until then this is validated data and nothing more.
+
+    Sparse data
+    -----------
+    A SciPy sparse matrix stays sparse: it is binned as CSC and trained on
+    as a `SparseBinnedMatrix`, so nothing ever allocates
+    `n_rows * n_features`. The paths that have no sparse implementation say
+    so rather than densifying: `device='gpu'`, `objective='lambdarank'`, and
+    continued training through `Booster.update`.
+
+    `reference` and `keep_raw`
+    --------------------------
+    `reference=` bins this data with **that dataset's** fitted mapper
+    instead of fitting new edges. A bin index then means what it means in
+    the reference, which is what a validation set needs, since it will be
+    scored by a model trained on the reference, and what continued training
+    requires. It is the wrong argument for a cross-validation fold, whose
+    held-out rows must not have shaped the binning; `subset()` without
+    `shared_binning` is that one.
+
+    `keep_raw=True` retains the raw matrix inside the *native* dataset,
+    which is what `subset()` needs, since bins cannot be refitted from
+    bins. It is not `free_raw_data`, which controls the Python-side
+    reference to the matrix you passed in.
     """
 
     def __init__(
@@ -368,13 +405,25 @@ class Dataset:
         params=None,
         reference=None,
         free_raw_data=False,
+        keep_raw=False,
     ):
         self.params = self._binning_params(params)
         self.free_raw_data = bool(free_raw_data)
+        self.keep_raw = bool(keep_raw)
         self._handle = None
 
-        Xb, n_rows, n_features, frame_names = _arrays.check_X(data)
-        self._x = Xb
+        # Sparse input takes the sparse binner, which reads the three CSC
+        # arrays directly; the dense entry point refuses it rather than
+        # densifying behind the caller (see `_arrays.column_major`).
+        self._sparse = _arrays.is_sparse(data)
+        if self._sparse:
+            buffers, n_rows, n_features, frame_names = _arrays.check_X_sparse(
+                data, "csc"
+            )
+            self._x = buffers
+        else:
+            Xb, n_rows, n_features, frame_names = _arrays.check_X(data)
+            self._x = Xb
         self._n_rows = n_rows
         self._n_features = n_features
         self._raw = data
@@ -515,9 +564,15 @@ class Dataset:
         )
 
     def _check_reference(self, reference):
-        """A reference dataset changes nothing here, but a mismatched one
-        means the caller expected shared binning that they are not getting,
-        so it is reported."""
+        """A reference dataset supplies this one's binning, so a mismatched
+        one is refused here rather than producing bin indices that mean two
+        different things.
+
+        The binning parameters, the feature names, and the categorical
+        declaration come from the reference on `construct()`, because they
+        describe the columns rather than the rows. Ones passed here that
+        disagree with it are reported instead of being silently overruled.
+        """
         if not isinstance(reference, Dataset):
             raise TypeError("reference must be a Dataset")
         if reference.num_feature() != self._n_features:
@@ -528,13 +583,33 @@ class Dataset:
         if reference.params != self.params:
             raise ValueError(
                 f"reference was binned with {reference.params} but this "
-                f"dataset uses {self.params}; mojoboost bins a validation "
-                "set through the model's own mapper, so the two must at "
-                "least agree on the binning parameters"
+                f"dataset uses {self.params}; this dataset is binned by the "
+                "reference's fitted mapper, so the two must agree on the "
+                "binning parameters"
+            )
+        if self._categorical and self._categorical != reference._categorical:
+            raise ValueError(
+                "a dataset built from a reference takes the reference's "
+                "categorical declaration, because the binning is the "
+                f"reference's; it declares {reference._categorical} and this "
+                f"one was given {self._categorical}"
+            )
+        if self._sparse:
+            raise NotImplementedError(
+                "reference binning takes a dense matrix: the binding reads "
+                "the rows as a dense buffer. Densify with .toarray(), or "
+                "build the dataset without reference= and accept that it "
+                "bins itself"
             )
 
     def construct(self):
         """Bin the data, if it has not been binned already. Returns self.
+
+        Three constructors live behind this, and which one runs is decided
+        by what the dataset was built from rather than by a flag:
+        `reference=` bins by that dataset's fitted mapper, a sparse matrix
+        bins to a sparse binned matrix, and everything else takes the dense
+        path. All three are the same `trainset.Dataset` afterwards.
 
         This is where the raw matrix is dropped when `free_raw_data=True`.
         """
@@ -568,10 +643,26 @@ class Dataset:
             "use_missing": int(bool(self.params["use_missing"])),
             "feature_names": [] if self._names is None else list(self._names),
             "n_names": 0 if self._names is None else len(self._names),
+            "keep_raw": int(self.keep_raw),
         }
-        self._handle = _mojoboost.dataset_create(
-            _addr(self._x), self._n_rows, self._n_features, params
-        )
+        if self.reference is not None:
+            # The reference's mapper, its names, its categorical
+            # declaration, and its binning parameters. Only the rows and
+            # the per-row columns are this dataset's, so the keys above
+            # that describe the columns are ignored on this path.
+            self._handle = _mojoboost.dataset_create_reference(
+                self.reference._constructed(),
+                _addr(self._x),
+                self._n_rows,
+                params,
+            )
+        elif self._sparse:
+            params.update(self._x.params())
+            self._handle = _mojoboost.dataset_create_csc(params)
+        else:
+            self._handle = _mojoboost.dataset_create(
+                _addr(self._x), self._n_rows, self._n_features, params
+            )
         # `cat` had to outlive the call above.
         del cat
         if self.free_raw_data:
@@ -581,6 +672,140 @@ class Dataset:
 
     def _constructed(self):
         return self.construct()._handle
+
+    # -- subsets and prepared tables --------------------------------------
+
+    @staticmethod
+    def _field_list(handle, field):
+        """One of a constructed dataset's optional columns, read from the
+        native side. Empty means the dataset has none."""
+        return [float(v) for v in _mojoboost.dataset_field(handle, field)]
+
+    @staticmethod
+    def _field_buffer(handle, field):
+        """`_field_list` as the float64 buffer this class keeps its columns
+        in, or None. `Booster.eval` passes their addresses, so a dataset
+        this process did not build has to hold real buffers rather than
+        lists."""
+        values = Dataset._field_list(handle, field)
+        if not values:
+            return None
+        return _arrays.f64_vector(values, len(values), field)
+
+    @classmethod
+    def _from_handle(cls, handle):
+        """A `Dataset` around a native handle this process did not bin.
+
+        Everything it answers comes from the native side, because nothing
+        else can: the shape, the binning parameters, the names, the
+        categorical declaration, and the four optional columns. It holds no
+        raw matrix, so it can be trained on and described but not predicted
+        on; `Booster.predict` says so.
+        """
+        self = cls.__new__(cls)
+        meta = _mojoboost.dataset_metadata(handle)
+        self._handle = handle
+        self._sparse = bool(meta["is_sparse"])
+        self._n_rows = int(meta["num_data"])
+        self._n_features = int(meta["num_feature"])
+        self.params = {
+            "max_bin": int(meta["max_bin"]),
+            "use_missing": bool(meta["use_missing"]),
+        }
+        self.free_raw_data = False
+        self.keep_raw = bool(meta["has_raw"])
+        self.reference = None
+        self._x = None
+        self._raw = None
+        names = [str(n) for n in _mojoboost.dataset_feature_names(handle)]
+        self._names = names if names else None
+        self._categorical = [
+            int(f) for f in _mojoboost.dataset_categorical_features(handle)
+        ]
+        self._label = cls._field_buffer(handle, "label")
+        self._weight = cls._field_buffer(handle, "weight")
+        self._init_score = cls._field_buffer(handle, "init_score")
+        self._group = cls._field_buffer(handle, "group")
+        return self
+
+    def subset(self, rows, shared_binning=False):
+        """The named rows as their own `Dataset`.
+
+        `rows` must be strictly ascending and in range. The selection and
+        the binning both happen natively, so which of the two constructions
+        this is stays one decision, made in `trainset.mojo`:
+
+        - `shared_binning=False` (the default) **bins the subset over its
+          own rows**, so the rows left out had no say in the edges. This is
+          what a cross-validation fold or a held-out split needs.
+        - `shared_binning=True` bins it by this dataset's mapper, which is
+          LightGBM's `Dataset.subset`: the part is binned as the whole was,
+          so a model trained on the whole can score it.
+
+        Either way the source must have been built with `keep_raw=True`.
+        Bins cannot be refitted from bins, so a dataset that dropped its raw
+        matrix raises rather than returning something that looks right.
+
+        The per-row columns come back from the native subset rather than
+        being sliced again here, which is what keeps the ranking rule (a
+        subset takes whole queries, never part of one) in one place.
+        """
+        selection = [int(r) for r in rows]
+        if not selection:
+            raise ValueError("a subset needs at least one row")
+        buf = _arrays.i64_vector(selection, "rows")
+        handle = _mojoboost.dataset_subset(
+            self._constructed(),
+            _addr(buf),
+            len(selection),
+            int(bool(shared_binning)),
+        )
+        # `buf` had to outlive the call above.
+        del buf
+        if self._raw is None or self._sparse:
+            # Nothing to slice on this side: either the matrix is gone, or
+            # it is sparse and row selection out of it is the native
+            # subset's job, which already happened.
+            return Dataset._from_handle(handle)
+        group = [int(v) for v in Dataset._field_list(handle, "group")]
+        out = Dataset(
+            _arrays.take_rows(self._raw, selection),
+            label=Dataset._field_buffer(handle, "label"),
+            weight=Dataset._field_buffer(handle, "weight"),
+            group=group or None,
+            init_score=Dataset._field_buffer(handle, "init_score"),
+            feature_name=self._names,
+            categorical_feature=self._categorical or None,
+            params=dict(self.params),
+            free_raw_data=False,
+            keep_raw=not bool(shared_binning),
+        )
+        # The rows were already binned natively; adopting that handle is
+        # what makes this one binning rather than two.
+        out._handle = handle
+        return out
+
+    def save_binned(self, path):
+        """Write the binning and the columns to `path` as a prepared table.
+
+        Binning is what a run pays for before it can start, so a table
+        written here is what lets the next process, or the next machine,
+        skip it. It is not a model file and cannot be loaded as one.
+        Returns self.
+        """
+        _mojoboost.dataset_save(self._constructed(), str(path))
+        return self
+
+    @classmethod
+    def load_binned(cls, path):
+        """Read a prepared table written by `save_binned`.
+
+        The result is a constructed `Dataset`: train on it, ask it for its
+        fields, continue a model on it. It carries no raw matrix, because a
+        prepared table is a binning rather than the values it was fitted
+        from, so it cannot be `subset` and cannot be predicted on.
+        """
+        return cls._from_handle(_mojoboost.dataset_load(str(path)))
 
     # -- description -----------------------------------------------------
 
@@ -596,6 +821,30 @@ class Dataset:
         """Bins the binning reserved per feature. Constructs the dataset,
         since a bin count is a property of fitted bins."""
         return int(_mojoboost.dataset_num_bin(self._constructed()))
+
+    @property
+    def is_sparse(self):
+        """Whether the binned matrix is sparse, which is decided by what the
+        dataset was built from and never changes afterwards."""
+        return self._sparse
+
+    def nnz(self):
+        """Stored entries in the binned matrix: the stored ones for a sparse
+        dataset, every cell for a dense one. Constructs the dataset, since
+        the count is a property of the binned matrix."""
+        return int(_mojoboost.dataset_metadata(self._constructed())["nnz"])
+
+    def metadata(self):
+        """Everything scalar about the constructed dataset, in one call:
+        the shape, the effective and requested bin counts, `use_missing`,
+        the column and query counts, and `is_sparse`, `nnz`, and `has_raw`.
+
+        Read from the binned dataset rather than from this object's own
+        copies, so it answers for a dataset this process did not build
+        (`load_binned`, `subset`) as well as for one it did.
+        """
+        meta = _mojoboost.dataset_metadata(self._constructed())
+        return {str(key): meta[key] for key in meta}
 
     @property
     def feature_name(self):
@@ -651,9 +900,10 @@ class Dataset:
 
     def __repr__(self):
         state = "constructed" if self._handle is not None else "unconstructed"
+        layout = "sparse" if self._sparse else "dense"
         return (
             f"Dataset({self._n_rows} rows, {self._n_features} features, "
-            f"{state})"
+            f"{layout}, {state})"
         )
 
 
@@ -827,15 +1077,28 @@ class Booster:
 
     # -- prediction ------------------------------------------------------
 
+    def _predict_data(self, data):
+        """The matrix to predict on, out of a `Dataset` or a bare matrix.
+
+        A `Dataset` is a binning; predicting on it means predicting on the
+        rows it was binned from, through the *model's* own mapper. So this
+        needs the raw matrix, and a dataset that has none says which of the
+        two ways it came to have none.
+        """
+        if not isinstance(data, Dataset):
+            return data
+        raw = data.get_data()
+        if raw is None:
+            raise ValueError(
+                "this Dataset has no raw matrix to predict on: it was built "
+                "with free_raw_data=True, or read from a prepared table, "
+                "which carries a binning rather than the values it was "
+                "fitted from"
+            )
+        return raw
+
     def _check_X(self, data):
-        if isinstance(data, Dataset):
-            raw = data.get_data()
-            if raw is None:
-                raise ValueError(
-                    "this Dataset's raw data was freed, so there is nothing "
-                    "to predict on; build it with free_raw_data=False"
-                )
-            data = raw
+        data = self._predict_data(data)
         Xb, n_rows, n_features, _ = _arrays.check_X(data)
         expected = self.num_feature()
         if n_features != expected:
@@ -873,8 +1136,17 @@ class Booster:
         `start_iteration` and `num_iteration` slice the ensemble the way
         LightGBM's do: out-of-range bounds clamp rather than raise, and
         `num_iteration=None` means every iteration from the start on.
+
+        Sparse input is walked without densifying, which is what the sparse
+        prediction path is for; the options it cannot serve are refused
+        rather than silently densified.
         """
-        Xb, n_rows = self._check_X(data)
+        matrix = self._predict_data(data)
+        if _arrays.is_sparse(matrix):
+            return self._predict_sparse(
+                matrix, raw_score, start_iteration, num_iteration
+            )
+        Xb, n_rows = self._check_X(matrix)
         start, stop = self._slice(start_iteration, num_iteration)
         if self._n_classes:
             out = _out_buffer(n_rows * self._n_classes)
@@ -903,6 +1175,52 @@ class Booster:
             int(bool(raw_score)),
             _addr(out),
         )
+        return _finish(out)
+
+    def _predict_sparse(self, X, raw_score, start_iteration, num_iteration):
+        """Predictions for a SciPy sparse matrix, one binary search per node
+        over that row's own stored entries rather than a densified row.
+
+        Two options have no sparse implementation and are refused with the
+        reason: slicing the ensemble, which reads a dense binned matrix, and
+        raw scores from a softmax model, for which there is no sparse entry
+        point. Densifying behind the caller would defeat the path they chose
+        by passing a sparse matrix.
+        """
+        if start_iteration != 0 or num_iteration is not None:
+            raise ValueError(
+                "iteration slicing does not take sparse input yet; densify "
+                "with .toarray()"
+            )
+        buffers, n_rows, n_features, _ = _arrays.check_X_sparse(X, "csr")
+        expected = self.num_feature()
+        if n_features != expected:
+            raise ValueError(
+                f"X has {n_features} features, but this Booster was trained "
+                f"on {expected}"
+            )
+        params = buffers.params()
+        if self._n_classes:
+            if raw_score:
+                raise ValueError(
+                    "raw scores from a softmax model do not take sparse "
+                    "input yet; densify with .toarray()"
+                )
+            out = _out_buffer(n_rows * self._n_classes)
+            _mojoboost.predict_proba_csr(self._handle, params, _addr(out))
+            if _np is not None:
+                return out.reshape(n_rows, self._n_classes)
+            k = self._n_classes
+            return [list(out[r * k : (r + 1) * k]) for r in range(n_rows)]
+        out = _out_buffer(n_rows)
+        query = (
+            _mojoboost.predict_raw_csr
+            if raw_score
+            else _mojoboost.predict_csr
+        )
+        query(self._handle, params, _addr(out))
+        # `buffers` had to outlive the call above.
+        del buffers
         return _finish(out)
 
     # -- evaluation ------------------------------------------------------

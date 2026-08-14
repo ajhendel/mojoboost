@@ -258,33 +258,50 @@ Line ~944 names `GpuPredictor.upload_validation`; the method is
 Swapping it removes the second copy of the zero-base-score rule. Behavior
 identical; do it only if the lane wants it.
 
-**R7 — `src/mojoboost/serialize.mojo` (serialization lane).** `_read_mapper`
-never range-checks the `n_bins` it reads, and it never checks a feature's
-edge count against it. It validates everything *relative* to `n_bins`
-(`missing_bin < n_bins`, `n_cat < n_bins`) but not `n_bins` itself, so a
-file declaring 1000 bins loads. Every other `BinMapper` construction site
-enforces the byte ceiling: `fit_bins` (binning.mojo:394), `fit_bins_csc`
-(sparse.mojo:501), and `_bins_needed` in the LightGBM importer, which raises
-above `_MAX_BINS = 256`. Add the same guard after the header is read:
+**R7 — APPLIED, not requested, and outside this lane's ownership.** The
+deserialization gap section 12 found was fixed directly, on the repository
+owner's explicit instruction. Two files were touched that this lane does
+not own; both were clean (no uncommitted work from another lane) when
+edited, and the changes are additive.
 
-```mojo
-    if n_bins < 2 or n_bins > 256:
-        raise Error("corrupt mapper: n_bins must be in [2, 256]")
-```
+`src/mojoboost/binning.mojo`:
 
-and, after the offsets are validated, the per-feature form of it:
+- New `comptime MAX_BINS = 256`, beside `MAX_EDGE`, documenting *why* the
+  ceiling exists: a bin index is stored in a byte, so above it `transform`
+  and `bin_value` disagree by a whole leaf. This module owns
+  `BinnedMatrix.bins: List[UInt8]`, so it is the ceiling's home.
+- `fit_bins`'s existing bounds check now spells its limit with the
+  constant. The rendered message is unchanged
+  (`max_bins must be in [2, 256]`), so any test matching on it still
+  matches.
 
-```mojo
-    for f in range(n_features):
-        if offsets[f + 1] - offsets[f] > n_bins - 1:
-            raise Error("corrupt mapper: a feature has more edges than bins")
-```
+`src/mojoboost/serialize.mojo`, in `_read_mapper`:
 
-Why it matters is in section 12: bins live in a byte, so above the ceiling
-`transform` truncates modulo 256 while `bin_row` does not, and the two
-prediction paths would disagree. This predates this lane (`transform` is
-also how training bins, and how `Model.predict_batch` already binned), but
-the new batch entry points inherit it.
+- `n_bins` is now range-checked to `[1, MAX_BINS]`. The floor is 1, not 2:
+  `_bins_needed` in the LightGBM importer starts at 1 and returns it for a
+  model whose trees hold no threshold, so a converted model can legitimately
+  save a single-bin mapper, and a floor of 2 would reject it on load.
+- Each feature's edge count is checked against the declared bins
+  (`width <= n_bins - 1`, since k edges give ordinary bins 0..k), and a
+  negative width is refused.
+- `offsets[0] != 0` is now refused too. All three producers
+  (`fit_bins`, `fit_bins_csc`, `_collect_edges`) start the offsets at zero;
+  a file that does not would misindex every feature's slice, and the
+  binary search would silently answer bin 0 rather than raise.
+
+Verified against all three producers before adding the guards, so nothing
+legitimate is rejected: widths are non-negative and bounded by
+`max_bins - 1` in both binners and by `_bins_needed` in the importer, and
+all three write `offsets[0] == 0`.
+
+Follow-up, not done: `comptime MAX_BINS = 256` is also declared
+independently in `histogram_gpu.mojo`, `gpu_output_planes.mojo`,
+`gpu_gradient_stream.mojo`, and `gpu_histogram_specializations.mojo`, and
+mirrored as `MAX_GPU_BINS` in `device_policy.mojo`. Those are about
+shared-memory histogram width, which happens to equal the storage ceiling;
+`sparse.fit_bins_csc` and `lgbm_model_io._MAX_BINS` still carry their own
+literals. Collapsing them onto `binning.MAX_BINS` is a five-file change
+across other lanes and was left alone.
 
 ## 7. Exact estimator calls Task 07 must add
 
@@ -402,10 +419,10 @@ host score unless `matches_host` is true, which is the same rule
    sum of the leaf values it collects rounds differently. An estimator that
    asserts exact equality between devices will fail; that property is
    `gpu_predict.mojo`'s documented contract, not something introduced here.
-3. **`BinMapper.transform` vs `bin_row`: settled by proof, see section 12.**
-   They agree for every mapper any binner can produce. The one residual is a
-   deserialization gap (patch request R7), not a difference between the two
-   paths.
+3. **`BinMapper.transform` vs `bin_row`: settled, see section 12.** They
+   agree for every mapper any binner can produce, and the one exception (an
+   unchecked bin count on load) was closed under R7. The guards added there
+   are themselves unrun, so they carry risk 1 like everything else.
 4. **Concurrent churn.** `device_policy.mojo`, `objective_registry.mojo`,
    and `metrics.mojo` are all being edited by other lanes right now. This
    lane imports `BLOCK_*`, `MAX_GPU_ROWS`, `MIN_GPU_BINS`, `MAX_GPU_BINS`,
@@ -444,6 +461,9 @@ bindings/build.sh
 
 # 2. The one existing test over this module, unchanged by this lane.
 pixi run mojo run -I src tests/parallel/test_gpu_predict.mojo
+
+# 2b. R7 touched the format reader; this is the test that round-trips it.
+pixi run mojo run -I src tests/test_serialize.mojo
 
 # 3. Formatting of the two owned files only.
 pixi run mojo format src/mojoboost/gpu_predict.mojo bindings/_mojoboost.mojo
@@ -504,22 +524,24 @@ and `max_bins` is confined to `[2, 256]` at every construction site but one:
 | `binning.fit_bins` | `max_bins < 2 or max_bins > 256` raises |
 | `sparse.fit_bins_csc` | same check |
 | `lgbm_model_io._synthesize_mapping` | `_bins_needed` raises above `_MAX_BINS = 256` |
-| `serialize._read_mapper` | **none**: `n_bins` is read and used to validate `missing_bin` and the category tables, but is never itself range-checked, and no feature's edge count is checked against it |
+| `serialize._read_mapper` | **was none**, now `n_bins` in `[1, MAX_BINS]` plus a per-feature edge-count check — see R7, applied |
 
-**Verdict.** The two paths are provably identical for every model that
-`fit_bins`, the sparse binner, or the LightGBM importer produced, and for
-every save/load round trip of one. The batch entry points added by this
-lane are therefore exact against the established path on the CPU, and the
-GPU path routes every row to the same leaf (bins are integers; only the
-sum of leaf values rounds in Float32, which is the documented contract).
+**Verdict.** The two paths are identical for every model that `fit_bins`,
+the sparse binner, or the LightGBM importer produced, and for every
+save/load round trip of one. The batch entry points added by this lane are
+therefore exact against the established path on the CPU, and the GPU path
+routes every row to the same leaf (bins are integers; only the sum of leaf
+values rounds in Float32, which is the documented contract).
 
-The residual is R7, and it is not a difference between the two paths in
-normal use: a corrupt or hand-edited model file declaring more than 256
-bins loads today, and from then on *every* `transform`-based path truncates
-modulo 256 while `bin_row` stays exact. That includes training and the
-pre-existing `Model.predict_batch`, so it predates this lane; the new entry
-points inherit it. With R7 applied, the proof above has no exceptions.
+The one exception was deserialization: a corrupt or hand-edited file
+declaring more than 256 bins used to load, and from then on *every*
+`transform`-based path would truncate modulo 256 while `bin_row` stayed
+exact — training included, and the pre-existing `Model.predict_batch`
+included. That was fixed under R7, so the proof above now has no
+exceptions: there is no `BinMapper` any supported path can produce or load
+for which the two ways of binning a value disagree.
 
-The test worth writing, once R7 lands and the build is green (UNRUN):
-load a mapper whose header declares `n_bins = 300` and assert `load_model`
-raises. The equality itself needs no test; it needs the guard.
+The test worth writing, once the build is green (UNRUN): a mapper header
+declaring `n_bins = 300`, or a feature whose edge count exceeds its bins,
+and assert `load_model` raises. The equality itself needs no test; it
+needed the guard.

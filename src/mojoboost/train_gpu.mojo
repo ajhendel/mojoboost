@@ -115,6 +115,7 @@ from .boosting import (
     renewal_alpha,
     renewal_weights,
 )
+from .apple_histogram_policy import ClassSchedule
 from .goss import GossParams, GossSelection, apply_goss_scaling, goss_round
 from .gpu_frontier import subtraction_builds_left
 from .gpu_fused_round import (
@@ -123,7 +124,9 @@ from .gpu_fused_round import (
     round_eligibility,
     round_eligibility_reason,
 )
-from .gpu_multiclass_batch import MulticlassRoundGuard
+from .gpu_multiclass_batch import GpuClassBatch, MulticlassRoundGuard
+from .gpu_objectives_native import GpuObjectiveState
+from .gpu_output_planes import BatchEligibility
 from .gpu_predict import (
     METRIC_L1,
     METRIC_L2,
@@ -1321,6 +1324,17 @@ def train_gpu(
         var device_grads = device_gradients(
             objective, 1, objective_source, bagging, goss, routes_all
         )
+        # `MOJOBOOST_HYBRID_LEAVES` against this run's real facts. Reports
+        # only; see `GpuSession.note_hybrid`.
+        session.note_hybrid(
+            resolve_split_search(split_search) == SPLIT_SEARCH_DEVICE,
+            not device_grads,
+            True,
+            data.n_rows,
+            data.n_features,
+            data.n_bins,
+            data.n_rows,
+        )
         # The session's own fit latency: the first fit through a session
         # pays the one-time costs and every later one does not, and that
         # split is positional, so only the owner can attribute it.
@@ -1459,6 +1473,17 @@ def train_custom_gpu[F: GradHessFn](
             raise Error("target length must equal n_rows")
         _check_sample_weight(sample_weight, data.n_rows)
 
+        # A custom objective evaluates on the host, so this run's gradients
+        # are host resident by construction.
+        session.note_hybrid(
+            resolve_split_search(split_search) == SPLIT_SEARCH_DEVICE,
+            True,
+            True,
+            data.n_rows,
+            data.n_features,
+            data.n_bins,
+            data.n_rows,
+        )
         var fit = session.begin_fit()
         var builder = GpuHistogramBuilder(session, data)
         var booster = _train_custom_gpu_rounds(
@@ -1501,6 +1526,112 @@ def _multiclass_base_scores(
     for k in range(n_classes):
         base_scores.append(log(_clamp_prob(class_w[k] / total_w)))
     return base_scores^
+
+
+def _train_multiclass_gpu_batched[
+    S: RoundLifecycle
+](
+    mut builder: GpuHistogramBuilder,
+    mut life: S,
+    mut state: GpuObjectiveState,
+    n_classes: Int,
+    params: BoosterParams,
+    var base_scores: List[Float64],
+    schedule: ClassSchedule,
+    split_search: Int,
+) raises -> MulticlassBooster:
+    """The device softmax loop with a batch of classes resident at once.
+
+    The same rounds `_train_multiclass_gpu_rounds` runs, with one step
+    hoisted. Sequentially, each class fills its gradients, reduces its own
+    magnitudes, and *waits* for them, because the fixed-point scale has to be
+    on the host before a histogram can be quantized; that wait drains the
+    queue once per class. Here a batch's classes fill together and reduce
+    together, so a round pays one readback per batch instead of one per
+    class, and the classes of a batch keep their gradients resident while
+    their trees grow one after another.
+
+    Everything else is the sequential loop, unmoved: the same grower, the
+    same seed `round * n_classes + k`, the same score update through
+    `update_raw_device`, the same `close_round` reasoning, the same
+    no-progress truncation, and trees appended in ascending `k` so tree
+    `(i, k)` still lands at `i * n_classes + k` in the serialized ensemble.
+
+    Nor does it change a number. Batches are contiguous ascending runs
+    (`ClassBatchPlan`), slot `s` of batch `b` is class `b * batch + s`, and
+    the batched gradient kernel and magnitude reduction are the single-class
+    ones with the class moved into `grid.y`: same arithmetic per row, same
+    blocks, same grid stride, same ascending Float64 host fold. So a class's
+    gradients, its scale, and every histogram quantized with it are what the
+    sequential loop would have produced. `MulticlassRoundGuard` checks the
+    part of that which is an ordering rather than an arithmetic: one
+    snapshot per round, one tree per class, every commit before the next
+    snapshot, and batches consumed in the plan's order.
+
+    Not reached unless a caller or `MOJOBOOST_GPU_CLASS_BATCH` asked for a
+    batch above one. No measurement supports the default moving.
+    """
+    comptime if not has_accelerator():
+        raise Error("GPU training requires an accelerator")
+    else:
+        var trees = List[Tree]()
+        var plan = schedule.batches
+        var batch = GpuClassBatch.for_plan(
+            builder.ctx,
+            builder.n_rows,
+            builder.n_features,
+            builder.n_bins,
+            plan,
+        )
+        var guard = MulticlassRoundGuard(n_classes)
+        for i in range(params.n_estimators):
+            life.begin_round()
+            guard.open_round()
+            state.refresh_softmax(builder.ctx)
+            guard.note_probs()
+            var made_progress = False
+            for b in range(plan.n_batches()):
+                var k_begin = plan.batch_begin(b)
+                var k_count = plan.batch_count(b)
+                # One launch for the batch's gradients, then the round's one
+                # readback for its scales. The guard checks that the batch
+                # is the next one the plan expects.
+                guard.note_batch(plan, b)
+                batch.fill_gradients(state, k_begin, k_count)
+                batch.refresh_scales(k_count)
+                for slot in range(k_count):
+                    var k = plan.class_at(b, slot)
+                    # This slot's plane and its already-reduced scale into
+                    # the builder's own buffers; no wait, because the scale
+                    # is known.
+                    builder.fill_batched_gradients(batch, slot)
+                    life.begin_tree()
+                    var tree = grow_tree_gpu(
+                        builder,
+                        params.tree,
+                        [],
+                        i * n_classes + k,
+                        split_search,
+                    )
+                    life.end_tree()
+                    guard.note_tree(k)
+                    if tree.n_leaves > 1 or abs(tree.value[0]) >= 1e-12:
+                        made_progress = True
+                    # Before the next class's begin_tree resets the ranges.
+                    builder.update_raw_device(
+                        state, tree.value, params.learning_rate, k
+                    )
+                    guard.note_commit(k)
+                    trees.append(tree^)
+            guard.close_round()
+            life.end_round()
+            if not made_progress:
+                for _ in range(n_classes):
+                    _ = trees.pop()
+                break
+        return MulticlassBooster(
+            trees^, base_scores^, n_classes, params.learning_rate
+        )
 
 
 def _train_multiclass_gpu_rounds[
@@ -1553,6 +1684,37 @@ def _train_multiclass_gpu_rounds[
                 labels_f, sample_weight, n_classes, 2 * params.tree.num_leaves
             )
             state.init_raw(builder.ctx, base_scores)
+
+            # How many classes may hold their gradients on the device at
+            # once. The default is one -- the loop below, unchanged -- and a
+            # wider batch is opt-in through `MOJOBOOST_GPU_CLASS_BATCH`,
+            # because batching changes the memory a fit holds and nothing in
+            # this repository has measured it against the sequential loop.
+            #
+            # `deeper_node()` rather than `round_root()`: eligibility says
+            # what a batch's classes *share*, and this path shares nothing
+            # but the launch. Each class's histogram is still built by the
+            # builder, one class at a time, out of the buffers it owns; the
+            # bin reads are shared only by the batched histogram kernels,
+            # which need a grower that consumes a whole frontier level at
+            # once and are not driven from here. Claiming shared rows would
+            # allocate a batch whose single count plane this path never
+            # writes.
+            var schedule = builder.class_schedule(
+                n_classes, BatchEligibility.deeper_node()
+            )
+            if not schedule.is_sequential():
+                return _train_multiclass_gpu_batched(
+                    builder,
+                    life,
+                    state,
+                    n_classes,
+                    params,
+                    base_scores^,
+                    schedule,
+                    split_search,
+                )
+
             var guard = MulticlassRoundGuard(n_classes)
             for i in range(params.n_estimators):
                 life.begin_round()
@@ -1764,6 +1926,15 @@ def train_multiclass_gpu(
         )
         var device_grads = device_gradients(
             _SOFTMAX_OBJECTIVE, n_classes, objective_source, bagging, goss
+        )
+        session.note_hybrid(
+            resolve_split_search(split_search) == SPLIT_SEARCH_DEVICE,
+            not device_grads,
+            True,
+            data.n_rows,
+            data.n_features,
+            data.n_bins,
+            data.n_rows,
         )
         var fit = session.begin_fit()
         var builder = GpuHistogramBuilder(session, data)

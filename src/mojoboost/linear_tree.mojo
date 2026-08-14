@@ -336,16 +336,41 @@ from std.math import isfinite, sqrt
 from std.memory import bitcast
 
 from .binning import BinnedMatrix
-from .boosting import (
-    L1,
-    MAPE,
-    QUANTILE,
-    objective_renews_leaves,
-)
 from .categorical import CategoricalSpec
 from .monotone import MonotoneConstraints
-from .ranking import LAMBDARANK
 from .tree import Tree
+
+# ---------------------------------------------------------------------------
+# Objective codes, mirrored
+# ---------------------------------------------------------------------------
+#
+# This module sits *below* `boosting.mojo` in the import graph, because
+# `Booster` is what will hold a `LinearEnsemble` (see the handoff) and
+# `src/mojoboost` has no mutual imports anywhere. So the four objective codes
+# the leaf-compatibility gate needs are mirrored here rather than imported,
+# the way `model_dump.mojo` mirrors `categorical._MAX_CATEGORY` for the same
+# kind of reason.
+#
+# The canonical definitions are `boosting.QUANTILE`, `boosting.L1`,
+# `boosting.MAPE`, and `ranking.LAMBDARANK`. They are part of a stable public
+# numbering (the objective code is serialized in every model file and crosses
+# the C ABI), so they do not move; if one ever does, this block and
+# `boosting.objective_renews_leaves` have to move together, and the handoff
+# asks the boosting lane for a cross-check that would fail if they did not.
+
+comptime _QUANTILE = 4
+comptime _L1 = 5
+comptime _LAMBDARANK = 7
+comptime _MAPE = 10
+
+
+def _objective_renews_leaves(objective: Int) -> Bool:
+    """Mirror of `boosting.objective_renews_leaves`: the objectives that
+    replace every leaf's Newton value with a weighted residual percentile
+    after growth."""
+    return (
+        objective == _QUANTILE or objective == _L1 or objective == _MAPE
+    )
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -869,13 +894,13 @@ def check_objective_compatible(objective: Int) raises:
     come from query-group pairs and the combination is unvalidated. See the
     module docstring.
     """
-    if objective_renews_leaves(objective):
+    if _objective_renews_leaves(objective):
         var name = String("a leaf-renewing")
-        if objective == QUANTILE:
+        if objective == _QUANTILE:
             name = String("QUANTILE")
-        elif objective == L1:
+        elif objective == _L1:
             name = String("L1")
-        elif objective == MAPE:
+        elif objective == _MAPE:
             name = String("MAPE")
         raise Error(
             "linear leaves are not available for the ",
@@ -886,7 +911,7 @@ def check_objective_compatible(objective: Int) raises:
             " decoupled from. Use a Newton objective, or leave linear_tree"
             " off",
         )
-    if objective == LAMBDARANK:
+    if objective == _LAMBDARANK:
         raise Error(
             "linear leaves are not available for LAMBDARANK: its gradients"
             " come from query-group pairs, and a per-leaf regression on them"

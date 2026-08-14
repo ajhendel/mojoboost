@@ -715,15 +715,15 @@ refusals raising.
 ## 10. Relationship to `handoffs/connect_17_alternate_boosting.md`
 
 That lane ran first and reached a different conclusion about the same
-subsystem. Both conclusions are recorded here so whoever applies the patches
-picks one deliberately rather than applying both.
+subsystem. The disagreement is now resolved: this lane's implementation and
+PATCH 1 through PATCH 4 are authoritative, and connect-17 P5 is withdrawn.
 
-**What connect-17 decided.** Section 7 of that handoff: no `cegb.mojo`,
-because `FeaturePenalties` is already connected to the production split
-search and a second module would be the duplicate policy engine that task
-forbids. Its patch P5 threads a `List[Bool] feature_used` ledger through
-`split.find_best_split`, `tree.grow_tree`, and `boosting._boost_rounds`, and
-leaves `cegb_penalty_feature_lazy` refused.
+**What connect-17 originally decided.** Section 7 originally proposed no
+`cegb.mojo`, because `FeaturePenalties` was already connected to the
+production split search. Its P5 threaded a `List[Bool] feature_used` ledger
+through `split.find_best_split`, `tree.grow_tree`, and
+`boosting._boost_rounds`, and left `cegb_penalty_feature_lazy` refused. That
+proposal is now explicitly withdrawn in the connect-17 handoff.
 
 **Why this lane created the file anyway.** Its own prompt (remaining task 04)
 names `src/mojoboost/cegb.mojo` as exclusive ownership and asks for the whole
@@ -760,7 +760,8 @@ question about which cached splits LightGBM itself refunds.
 precondition. P5 step 4 (the ensemble owns the ledger, not the split search)
 is PATCH 4, same reasoning.
 
-**Recommendation.** Apply PATCH 1 to 4 and drop P5. If a reviewer prefers
-connect-17's smaller change, apply P5 and delete `src/mojoboost/cegb.mojo`
-and `docs/CEGB.md` outright rather than leaving both: two CEGB homes is the
-one outcome neither lane wants.
+**Decision.** Apply PATCH 1 through PATCH 4 and do not apply P5. The smaller
+alternative is no longer offered because its missing cached-candidate refund
+is a semantic defect under leaf-wise growth. `src/mojoboost/cegb.mojo` is the
+sole authority; PATCH 2 removes the temporary CEGB fields and arithmetic from
+`FeaturePenalties`, leaving one CEGB home after integration.

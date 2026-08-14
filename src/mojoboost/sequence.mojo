@@ -28,14 +28,16 @@ makes.
 
 Schema negotiation
 ------------------
-The first chunk of a pass fixes the schema; every later chunk is checked
-against it with `ChunkSchema.require_compatible`, which compares the feature
-count, the feature names when both sides carry them, the categorical
-declaration, the representation (dense or sparse), and which optional row
-fields are present. A source whose third chunk suddenly stops carrying
-weights is a source that would silently train a differently weighted model,
-so it raises. `ChunkSchema.fingerprint` folds the same facts into one
-integer, which is what a cache manifest stores and re-checks on reopen.
+The source declares one `ChunkSchema`, and every delivered chunk is checked
+against it by `require_chunk_schema`: the feature count, the representation
+(dense or sparse), and which optional row fields it brought. A source whose
+third chunk stops carrying weights is a source that would silently train a
+differently weighted model, so it raises. Feature names and the categorical
+declaration are the caller's policy rather than any chunk's, so they are
+compared schema against schema by `ChunkSchema.require_compatible` when there
+really are two (a cache manifest's and a caller's). `ChunkSchema.fingerprint`
+folds all of it into one integer, which is what a cache manifest stores and
+re-checks on reopen.
 
 Repeatable iteration
 --------------------
@@ -69,6 +71,7 @@ not convert between dense and sparse: a sparse source stays sparse all the
 way into `sparse.fit_bins_csc`, exactly as `raw_data.RawData` keeps it.
 """
 
+from .raw_data import RawData
 from .sparse import CscMatrix, CsrMatrix
 
 
@@ -640,21 +643,33 @@ def require_chunk_schema(schema: ChunkSchema, chunk: RawChunk) raises:
     `ChunkSchema.require_compatible` is where those are compared, against a
     second schema (a cache manifest's, a caller's) that could really differ.
     """
+    var head = sequence_status_message(SEQ_SCHEMA_MISMATCH) + ": "
     if chunk.n_features != schema.n_features:
-        raise Error("every chunk must carry the same number of features")
+        raise Error(
+            head + "every chunk must carry the same number of features"
+        )
     if chunk.is_sparse != schema.is_sparse:
         raise Error(
-            "a source is dense or sparse for its whole length; chunks cannot"
-            " change representation"
+            head
+            + "a source is dense or sparse for its whole length; chunks"
+            " cannot change representation"
         )
     if (len(chunk.label) != 0) != schema.has_label:
-        raise Error("chunks disagree about whether rows carry a label")
+        raise Error(
+            head + "chunks disagree about whether rows carry a label"
+        )
     if (len(chunk.weight) != 0) != schema.has_weight:
-        raise Error("chunks disagree about whether rows carry a weight")
+        raise Error(
+            head + "chunks disagree about whether rows carry a weight"
+        )
     if (len(chunk.init_score) != 0) != schema.has_init_score:
-        raise Error("chunks disagree about whether rows carry an init score")
+        raise Error(
+            head + "chunks disagree about whether rows carry an init score"
+        )
     if (len(chunk.query_ids) != 0) != schema.has_query_ids:
-        raise Error("chunks disagree about whether rows carry a query id")
+        raise Error(
+            head + "chunks disagree about whether rows carry a query id"
+        )
     chunk.check_fields()
 
 
@@ -1137,6 +1152,80 @@ struct RowFields(Copyable, Movable):
             )
         if schema.has_query_ids and len(self.query_ids) != self.n_rows:
             raise Error("the source delivered a query id for only some rows")
+
+
+def memory_sequence_from_raw(
+    var raw: RawData,
+    chunk_rows: Int,
+    var label: List[Float64] = [],
+    var weight: List[Float64] = [],
+    var init_score: List[Float64] = [],
+    var query_ids: List[Int] = [],
+    var feature_names: List[String] = [],
+    var categorical_features: List[Int] = [],
+) raises -> MemorySequence:
+    """Stream a dense `raw_data.RawData` without repacking it.
+
+    `RawData` is the type every existing dense caller already builds
+    (`Dataset.from_raw`, the sparse constructors, the Python array
+    conversion), and its dense buffer is the same column-major layout a
+    `MemorySequence` chunks, so this is a move rather than a copy. It raises
+    on sparse input rather than densifying it, exactly as
+    `RawData.transform_dense` does; `csc_sequence_from_raw` is the other
+    half.
+    """
+    if raw.is_empty():
+        raise Error("this RawData holds no matrix")
+    if raw.is_sparse:
+        raise Error(
+            "sparse input streams as a CscSequence; call"
+            " csc_sequence_from_raw"
+        )
+    var n_rows = raw.n_rows
+    var n_features = raw.n_features
+    return MemorySequence(
+        raw.values^,
+        n_rows,
+        n_features,
+        chunk_rows,
+        label^,
+        weight^,
+        init_score^,
+        query_ids^,
+        feature_names^,
+        categorical_features^,
+    )
+
+
+def csc_sequence_from_raw(
+    var raw: RawData,
+    chunk_rows: Int,
+    var label: List[Float64] = [],
+    var weight: List[Float64] = [],
+    var init_score: List[Float64] = [],
+    var query_ids: List[Int] = [],
+    var feature_names: List[String] = [],
+    var categorical_features: List[Int] = [],
+) raises -> CscSequence:
+    """Stream a sparse `raw_data.RawData`, keeping it sparse. Raises on dense
+    input, as `RawData.transform_sparse` does."""
+    if raw.is_empty():
+        raise Error("this RawData holds no matrix")
+    if not raw.is_sparse:
+        raise Error(
+            "dense input streams as a MemorySequence; call"
+            " memory_sequence_from_raw"
+        )
+    return CscSequence(
+        raw.csc^,
+        chunk_rows,
+        label^,
+        weight^,
+        init_score^,
+        query_ids^,
+        feature_names^,
+        categorical_features^,
+    )
 
 
 comptime CATEGORY_KEY_STRIDE = 4294967296

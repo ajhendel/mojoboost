@@ -99,17 +99,19 @@ exactly the substrate a chunked histogram accumulator would need, and none of
 them is a claim that one exists.
 """
 
+from std.memory import bitcast
+
 from .bagging import BaggingParams
 from .binning import BinMapper, BinnedMatrix, fit_bins, no_missing_bins
 from .boosting import (
     Booster,
     BoosterParams,
-    MulticlassBooster,
     train,
     train_more,
     train_multiclass,
     train_multiclass_more,
 )
+from .boosting_sparse import train_multiclass_sparse, train_sparse
 from .categorical import CategoricalSpec
 from .device import CPU_DEVICE, GPU_DEVICE, resolve_device
 from .goss import GossParams
@@ -120,17 +122,20 @@ from .ranking import (
     groups_from_query_ids,
     train_ranker,
 )
+from .raw_data import RawData
 from .sequence import (
     FNV_OFFSET,
+    SEQ_NOT_REPEATABLE,
     CancelToken,
+    CategoryTally,
     ChunkSchema,
-    ChunkPlan,
     RawChunk,
     RowFields,
     RowIdRange,
     Sequence,
     SequenceStats,
     check_row_coverage,
+    csc_sequence_from_raw,
     feature_block_width,
     fnv1a_f64,
     fnv1a_int,
@@ -138,6 +143,8 @@ from .sequence import (
     gather_dense_block,
     gather_row_fields,
     gather_sparse_block,
+    memory_sequence_from_raw,
+    sequence_status_message,
 )
 from .sparse import (
     CscMatrix,
@@ -206,10 +213,12 @@ def _f64_token(x: Float64) -> String:
 
 
 def _parse_f64(token: String) raises -> Float64:
-    return Float64.from_bits(_parse_u64(token))
+    return bitcast[DType.float64, 1](
+        SIMD[DType.uint64, 1](_parse_u64(token))
+    )
 
 
-struct _TokenReader(Movable):
+struct _TokenReader:
     """Whitespace-separated tokens out of a file's contents."""
 
     var tokens: List[String]
@@ -446,201 +455,6 @@ struct ExternalMemoryParams(Copyable, Movable, Writable):
                         " whitespace-free tokens; this one has a space or a"
                         " control byte"
                     )
-
-
-struct CategoryTally(Copyable, Movable, Writable):
-    """Distinct code counts for the declared categorical columns, gathered
-    while the census pass is already reading the data.
-
-    It does not fit anything. `binning.fit_bins` fits the category tables, on
-    the gathered block, and duplicating that here would be a second table
-    that could disagree with the first. What this answers is the question a
-    caller wants answered *before* paying for the bin-construction passes:
-    how many distinct codes each declared column actually holds, and
-    therefore whether the `max_bin - 1` cap is about to drop most of them
-    into the unknown bin.
-
-    The tally is bounded by the column's cardinality, not by the row count,
-    and `cap_exceeded` is what a caller checks.
-    """
-
-    var features: List[Int]
-    var distinct: List[Int]
-    var max_code: List[Int]
-    var missing_rows: List[Int]
-    var keep: Int
-
-    def __init__(
-        out self, categorical_features: List[Int], keep: Int
-    ) raises:
-        if keep < 1:
-            raise Error("keep must be positive")
-        self.features = categorical_features.copy()
-        self.distinct = List[Int]()
-        self.max_code = List[Int]()
-        self.missing_rows = List[Int]()
-        for _ in range(len(self.features)):
-            self.distinct.append(0)
-            self.max_code.append(-1)
-            self.missing_rows.append(0)
-        self.keep = keep
-
-    def write_to(self, mut writer: Some[Writer]):
-        writer.write(
-            "CategoryTally(features=",
-            len(self.features),
-            ", keep=",
-            self.keep,
-            ")",
-        )
-
-    def write_repr_to(self, mut writer: Some[Writer]):
-        self.write_to(writer)
-
-    def cap_exceeded(self, i: Int) -> Bool:
-        """Whether column `i` of the tally has more distinct codes than the
-        binning can keep, so the rest will fall into the unknown bin."""
-        return self.distinct[i] > self.keep
-
-    def report(self) -> String:
-        """One line per declared categorical column, for a caller that wants
-        to log what it is about to bin."""
-        var out = String("")
-        for i in range(len(self.features)):
-            out += "feature " + String(self.features[i])
-            out += ": " + String(self.distinct[i]) + " distinct codes"
-            out += ", max " + String(self.max_code[i])
-            out += ", " + String(self.missing_rows[i]) + " missing"
-            if self.cap_exceeded(i):
-                out += " (over the cap of " + String(self.keep) + ")"
-            out += "\n"
-        return out^
-
-
-def _tally_chunk(mut tally: CategoryTally, chunk: RawChunk) raises:
-    """Fold one chunk's declared categorical columns into the tally.
-
-    Distinct counting is done with a per-column sorted list of the codes seen
-    so far, which is bounded by the column's cardinality. A column whose
-    cardinality is itself unbounded is exactly the case this exists to
-    report, so the growth is the diagnosis rather than a bug.
-    """
-    for i in range(len(tally.features)):
-        var f = tally.features[i]
-        if f >= chunk.n_features:
-            raise Error("categorical feature index out of range")
-        var seen = List[Int]()
-        for r in range(chunk.n_rows):
-            var v = chunk.value_at(r, f)
-            # `not (v >= 0.0)` also rejects NaN, matching
-            # `CategoricalSpec.bin_of` and the two spec fitters.
-            if not (v >= 0.0):
-                tally.missing_rows[i] += 1
-                continue
-            var code = Int(v)
-            if code > tally.max_code[i]:
-                tally.max_code[i] = code
-            seen.append(code)
-        sort(seen)
-        var j = 0
-        while j < len(seen):
-            var k = j
-            while k + 1 < len(seen) and seen[k + 1] == seen[j]:
-                k += 1
-            j = k + 1
-        # Distinct codes of the whole source, not of this chunk: a code seen
-        # in two chunks must count once, so the running set is kept sorted
-        # and merged rather than counted per chunk.
-        tally.distinct[i] = _merge_distinct_count(tally, i, seen)
-
-
-def _merge_distinct_count(
-    mut tally: CategoryTally, i: Int, chunk_codes: List[Int]
-) -> Int:
-    """Placeholder kept honest: see `CategoryTallyState`.
-
-    A running distinct set per column is what this needs, and a struct field
-    cannot hold a list of lists here without the nested-mutation dance, so
-    the state lives in `CategoryTallyState` and this returns what the caller
-    already has.
-    """
-    return tally.distinct[i]
-
-
-struct CategoryTallyState(Copyable, Movable):
-    """The running distinct-code sets behind `CategoryTally`.
-
-    One flat sorted list of `(feature slot, code)` pairs rather than a list
-    of lists: the pairs are kept sorted by slot and then by code, which makes
-    a merge with one chunk's codes a linear pass and keeps every buffer flat.
-    Memory is the total cardinality of the declared columns, which is the
-    bound the tally is documented to have.
-    """
-
-    var slot: List[Int]
-    var code: List[Int]
-
-    def __init__(out self):
-        self.slot = List[Int]()
-        self.code = List[Int]()
-
-    def merge(mut self, i: Int, chunk_codes: List[Int]):
-        """Union this chunk's sorted codes for slot `i` into the running
-        set, keeping the flat arrays sorted by (slot, code)."""
-        var out_slot = List[Int]()
-        var out_code = List[Int]()
-        var a = 0
-        var b = 0
-        # Everything before slot i is copied, then the two runs are merged,
-        # then everything after is copied. One pass, no nested containers.
-        while a < len(self.slot) and self.slot[a] < i:
-            out_slot.append(self.slot[a])
-            out_code.append(self.code[a])
-            a += 1
-        while a < len(self.slot) and self.slot[a] == i and b < len(
-            chunk_codes
-        ):
-            if self.code[a] < chunk_codes[b]:
-                out_slot.append(i)
-                out_code.append(self.code[a])
-                a += 1
-            elif chunk_codes[b] < self.code[a]:
-                if len(out_code) == 0 or out_slot[
-                    len(out_code) - 1
-                ] != i or out_code[len(out_code) - 1] != chunk_codes[b]:
-                    out_slot.append(i)
-                    out_code.append(chunk_codes[b])
-                b += 1
-            else:
-                out_slot.append(i)
-                out_code.append(self.code[a])
-                a += 1
-                b += 1
-        while a < len(self.slot) and self.slot[a] == i:
-            out_slot.append(i)
-            out_code.append(self.code[a])
-            a += 1
-        while b < len(chunk_codes):
-            if len(out_code) == 0 or out_slot[
-                len(out_code) - 1
-            ] != i or out_code[len(out_code) - 1] != chunk_codes[b]:
-                out_slot.append(i)
-                out_code.append(chunk_codes[b])
-            b += 1
-        while a < len(self.slot):
-            out_slot.append(self.slot[a])
-            out_code.append(self.code[a])
-            a += 1
-        self.slot = out_slot^
-        self.code = out_code^
-
-    def count(self, i: Int) -> Int:
-        """Distinct codes recorded for slot `i`."""
-        var n = 0
-        for j in range(len(self.slot)):
-            if self.slot[j] == i:
-                n += 1
-        return n
 
 
 struct ExternalChunkRecord(Copyable, Movable, Writable):
@@ -978,6 +792,7 @@ def _sparse_chunk_to_text(
     return out^
 
 
+@fieldwise_init
 struct ChunkHeader(Copyable, Movable):
     """The first few tokens of a chunk file, read before its payload."""
 
@@ -1350,7 +1165,9 @@ def _merge_block_mappers(
             raise Error("a bin-construction block used a different max_bin")
         for local in range(m.n_features):
             if f >= n_features:
-                raise Error("the bin-construction blocks cover too many features")
+                raise Error(
+                    "the bin-construction blocks cover too many features"
+                )
             var lo = m.edge_offsets[local]
             var hi = m.edge_offsets[local + 1]
             for e in range(lo, hi):
@@ -1410,8 +1227,9 @@ def fit_mapper_external[S: Sequence & Movable](
     params.check_against(schema)
     if not src.is_repeatable():
         raise Error(
-            "bin construction reads the source once per feature block; this"
-            " source cannot be read twice. Spill it with spill_source first"
+            sequence_status_message(SEQ_NOT_REPEATABLE)
+            + ": bin construction reads the source once per feature block."
+            " Spill it to a raw cache with spill_source first"
         )
     var n_features = schema.n_features
     var width = feature_block_width(
@@ -1473,6 +1291,7 @@ struct ExternalDataset(Copyable, Movable, Writable):
     var layout: CacheLayout
     var manifest: ExternalManifest
     var mapper: BinMapper
+    var categorical_report: String
     var discarded: Bool
 
     def __init__(
@@ -1480,13 +1299,19 @@ struct ExternalDataset(Copyable, Movable, Writable):
         var layout: CacheLayout,
         var manifest: ExternalManifest,
         var mapper: BinMapper,
+        var categorical_report: String = String(""),
     ) raises:
+        """`categorical_report` is `CategoryTally.report` from the build's
+        census pass. It is a diagnosis rather than data, so it is not written
+        to the manifest and a reopened cache carries an empty one; rebuild or
+        re-tally to get it back."""
         manifest.check()
         if mapper.n_features != manifest.n_features:
             raise Error("the mapper does not describe this cache's features")
         self.layout = layout^
         self.manifest = manifest^
         self.mapper = mapper^
+        self.categorical_report = categorical_report^
         self.discarded = False
 
     def write_to(self, mut writer: Some[Writer]):
@@ -1773,15 +1598,18 @@ def build_external_dataset[S: Sequence & Movable](
     """
     if not src.is_repeatable():
         raise Error(
-            "an external-memory build reads its source several times; this"
-            " source cannot be read twice. Spill it to a raw cache with"
-            " spill_source and build from that"
+            sequence_status_message(SEQ_NOT_REPEATABLE)
+            + ": an external-memory build reads its source several times."
+            " Spill it to a raw cache with spill_source and build from that"
         )
     var schema = src.schema()
     params.check_against(schema)
 
     var stats = SequenceStats()
-    var fields = gather_row_fields(src, cancel, stats)
+    var tally = CategoryTally(
+        params.categorical_features, params.max_bin - 1
+    )
+    var fields = gather_row_fields(src, tally, cancel, stats)
     var n_rows = fields.n_rows
     if n_rows < 1:
         raise Error("the source delivered no rows")
@@ -1856,7 +1684,56 @@ def build_external_dataset[S: Sequence & Movable](
     )
     manifest.check()
     _ = _write_file(layout.manifest_path(), manifest.to_text())
-    return ExternalDataset(layout^, manifest^, mapper^)
+    return ExternalDataset(layout^, manifest^, mapper^, tally.report())
+
+
+def build_external_dataset_from_raw(
+    var raw: RawData,
+    var layout: CacheLayout,
+    params: ExternalMemoryParams,
+    mut cancel: CancelToken,
+    var label: List[Float64] = [],
+    var weight: List[Float64] = [],
+    var init_score: List[Float64] = [],
+    var query_ids: List[Int] = [],
+) raises -> ExternalDataset:
+    """Build a cache from the ingestion type the rest of the tree already
+    uses.
+
+    `raw_data.RawData` is what every existing caller holds before binning, so
+    this is the door between the resident world and this one: the same matrix
+    that would have gone to `Dataset` goes to a cache instead, dense or
+    sparse, without changing representation. It is not the interesting case
+    for external memory (the matrix is already resident, so nothing is
+    saved), and it is the case that makes the streaming path testable against
+    the resident one: the same input, two routes, one answer.
+
+    The chunk size is `params.chunk_rows`, which is what the manifest records
+    and what a rebuild has to repeat to produce the same cache files.
+    """
+    if raw.is_sparse:
+        var src = csc_sequence_from_raw(
+            raw^,
+            params.chunk_rows,
+            label^,
+            weight^,
+            init_score^,
+            query_ids^,
+            params.feature_names.copy(),
+            params.categorical_features.copy(),
+        )
+        return build_external_dataset(src, layout^, params, cancel)
+    var dense_src = memory_sequence_from_raw(
+        raw^,
+        params.chunk_rows,
+        label^,
+        weight^,
+        init_score^,
+        query_ids^,
+        params.feature_names.copy(),
+        params.categorical_features.copy(),
+    )
+    return build_external_dataset(dense_src, layout^, params, cancel)
 
 
 def open_external_dataset(
@@ -1967,6 +1844,8 @@ struct ExternalCapabilities(Copyable, Movable, Writable):
         out += "  streaming histograms: no (every histogram builder takes a"
         out += " whole binned matrix)\n"
         out += "  CPU training, materialized: yes\n"
+        out += "  sparse CPU training, materialized: yes (the stored entries"
+        out += " rather than every cell)\n"
         out += "  GPU training, materialized: yes (device transfer is of the"
         out += " materialized matrix, not of chunks)\n"
         out += "  multiclass, materialized: yes\n"
@@ -1988,7 +1867,7 @@ def check_external_supported(
     this build refuses. The message names what would have to exist rather
     than saying no.
     """
-    _ = dataset.num_data()
+    dataset.manifest.check()
     if streaming:
         raise Error(
             "training directly from cache chunks is not implemented: every"
@@ -2120,6 +1999,73 @@ def train_external_multiclass(
     return MulticlassModel(dataset.mapper.copy(), booster^)
 
 
+def train_external_sparse(
+    dataset: ExternalDataset,
+    objective: Int,
+    params: BoosterParams,
+    max_bytes: Int,
+    alpha: Float64 = 0.9,
+    bagging: BaggingParams = BaggingParams.disabled(),
+    goss: GossParams = GossParams.disabled(),
+) raises -> Model:
+    """Train a single-output model from a sparse external-memory dataset,
+    without densifying it.
+
+    The sparse counterpart of `train_external`, and the reason a sparse
+    source is worth keeping sparse all the way through: the materialized form
+    is the stored entries, not `n_rows * n_features` cells, so a sparse cache
+    trains within a budget a dense one could not. CPU only, as
+    `boosting_sparse.train_sparse` is; the GPU sparse path is reached through
+    its own trainers and is not wired here.
+    """
+    var data = dataset.materialize_sparse_binned(max_bytes)
+    var fields = dataset.row_fields()
+    _check_labels(fields.label, data.n_rows)
+    var booster = train_sparse(
+        data,
+        fields.label,
+        objective,
+        params,
+        fields.weight,
+        alpha,
+        bagging,
+        goss,
+        fields.init_score,
+    )
+    return Model(dataset.mapper.copy(), booster^)
+
+
+def train_external_sparse_multiclass(
+    dataset: ExternalDataset,
+    n_classes: Int,
+    params: BoosterParams,
+    max_bytes: Int,
+    bagging: BaggingParams = BaggingParams.disabled(),
+    goss: GossParams = GossParams.disabled(),
+) raises -> MulticlassModel:
+    """The softmax counterpart of `train_external_sparse`. CPU only, and
+    `init_score` is refused for the reason it is refused everywhere else: one
+    offset per row cannot say what each class starts from."""
+    var data = dataset.materialize_sparse_binned(max_bytes)
+    var fields = dataset.row_fields()
+    _check_labels(fields.label, data.n_rows)
+    if len(fields.init_score) != 0:
+        raise Error(
+            "init_score is not supported for multiclass training: one offset"
+            " per row cannot say what each class starts from"
+        )
+    var booster = train_multiclass_sparse(
+        data,
+        _int_labels(fields.label, n_classes),
+        n_classes,
+        params,
+        fields.weight,
+        bagging,
+        goss,
+    )
+    return MulticlassModel(dataset.mapper.copy(), booster^)
+
+
 def external_groups(dataset: ExternalDataset) raises -> RankGroups:
     """Query boundaries for a ranking dataset, from the cached query ids.
 
@@ -2159,7 +2105,7 @@ def train_external_ranker(
     var booster = train_ranker(
         data,
         _relevance_labels(fields.label),
-        groups^,
+        groups,
         params,
         rank_params,
         fields.weight,

@@ -23,10 +23,31 @@ checks that its output is launchable on the weakest device each backend
 allows, and that the fixed-point accumulator cannot overflow. Neither
 replaces running on the hardware; docs/GPU_VALIDATION.md holds the runner
 instructions and the record of what has actually been executed.
+
+**What this file asserts against.** `gpu_portability.mojo` is where the
+portable floors are written down and where the gates that enforce them live,
+and it is what `histogram_gpu.mojo` calls when a builder opens and whenever
+a launch geometry changes. So the checks below run the real gates rather
+than re-deriving their arithmetic: a floor that moves in the module moves
+here, and a gate that stops refusing something fails here. The three
+constants this file used to define for itself are now read from the module
+and asserted against the published backend limits instead, because two
+copies of a portability floor is exactly the drift the file exists to catch.
 """
 
-from std.testing import assert_equal, assert_true, TestSuite
+from std.testing import assert_equal, assert_raises, assert_true, TestSuite
 
+from mojoboost.apple_gpu_policy import API_CUDA, API_HIP, API_METAL, API_UNKNOWN
+from mojoboost.gpu_histogram_specializations import KernelFeatures
+from mojoboost.gpu_portability import (
+    GRID_AXES,
+    MIN_SHARED_MEMORY_PER_BLOCK,
+    N_REQUIREMENTS,
+    contract_for,
+    require_bins_supported,
+    require_device_can_host_kernels,
+    require_histogram_launchable,
+)
 from mojoboost.gpu_tiling import (
     MAX_GRID_DIM_Y,
     STRATEGY_ATOMIC,
@@ -54,8 +75,19 @@ comptime PORTABLE_WARP_GRANULARITY = 64
 
 # Bytes the histogram kernels actually reserve in shared memory: three
 # MAX_BINS-long Int32 planes, sized by the compile-time maximum rather than
-# by the dataset's bin count.
+# by the dataset's bin count. `gpu_portability` computes the same number from
+# its own terms, and one of the tests below pins the two together.
 comptime SHARED_BYTES_RESERVED = 3 * MAX_BINS * 4
+
+# What the shipping path carries: nothing in the launch sequence reads an API
+# name, so `API_UNKNOWN` and its portable floor is the contract every real
+# launch is checked against today.
+comptime _SHIPPING_API = API_UNKNOWN
+
+# The variants this build compiles in, mirroring
+# `histogram_gpu.build_kernel_features()`. Kept as a literal rather than
+# imported so a change there has to be noticed here.
+comptime _COMPILED_VARIANTS = KernelFeatures(False, False, True)
 
 # The fixed-point scale in histogram_gpu.mojo targets 2^30, half the Int32
 # range, for the sum of scaled magnitudes before rounding.
@@ -114,6 +146,138 @@ def test_bin_count_fits_the_kernel_index_type() raises:
     """Bins arrive from the binner as UInt8 and index shared memory, so 256
     is the hard ceiling on every backend."""
     assert_true(MAX_BINS <= 256, "more bins than a UInt8 bin value can encode")
+
+
+def test_module_floor_matches_the_kernel_reservation() raises:
+    """`gpu_portability.MIN_SHARED_MEMORY_PER_BLOCK` is what
+    `require_device_can_host_kernels` refuses a device for, and it has to be
+    the same number the kernels actually reserve.
+
+    The module derives it from `PLANES_PER_HISTOGRAM * BYTES_PER_PLANE_CELL *
+    MAX_BINS` and this file derives it as `3 * MAX_BINS * 4`. Pinning them
+    together is what keeps the gate honest: a plane count or a cell width
+    that changed in one place and not the other would otherwise let the gate
+    admit a device the kernels cannot launch on."""
+    assert_equal(
+        MIN_SHARED_MEMORY_PER_BLOCK,
+        SHARED_BYTES_RESERVED,
+        "the portability floor and the kernel reservation have diverged",
+    )
+    assert_true(
+        MIN_SHARED_MEMORY_PER_BLOCK <= PORTABLE_SHARED_BYTES_PER_BLOCK,
+        "the floor the gate enforces exceeds what every backend guarantees",
+    )
+
+
+def test_every_covered_backend_promises_the_shipping_primitives() raises:
+    """Each of the four covered API codes must yield a contract that provides
+    every primitive the kernels use, and the two grid axes they launch on.
+
+    This is the check that fails when a backend is added to the table with a
+    primitive left False: the shipping kernels use all six unconditionally,
+    so a contract that does not promise them describes a device this package
+    cannot target, and it should be refused at the table rather than at a
+    launch on hardware."""
+    var apis = [API_UNKNOWN, API_METAL, API_CUDA, API_HIP]
+    for a in range(len(apis)):
+        var contract = contract_for(apis[a])
+        assert_equal(
+            contract.api, apis[a], "contract_for returned another backend"
+        )
+        assert_true(
+            contract.grid_axes >= GRID_AXES,
+            "a covered backend must offer the grid axes the kernels launch on",
+        )
+        assert_equal(
+            contract.launch_granularity,
+            PORTABLE_WARP_GRANULARITY,
+            "launch granularity is not the portable wavefront multiple",
+        )
+        assert_true(
+            contract.max_grid_dim_y <= MAX_GRID_DIM_Y,
+            "a contract promises more grid.y than the tightest backend cap",
+        )
+        for r in range(N_REQUIREMENTS):
+            assert_true(
+                contract.provides(r),
+                "a covered backend does not promise a primitive the shipping"
+                " kernels use unconditionally",
+            )
+        # Float64 device arithmetic is off everywhere, including on backends
+        # that have it: one source, and Apple silicon sets the floor.
+        assert_true(
+            not contract.device_float64_permitted,
+            "a backend permits device Float64 that the shared source cannot"
+            " emit",
+        )
+
+
+def test_the_shipping_gate_admits_the_weakest_device() raises:
+    """The gate `histogram_gpu` calls on every builder and every geometry
+    change must accept the portable floor.
+
+    This is the direction that matters: a gate that refuses the weakest
+    supported device refuses the path that ships. Running the real
+    `require_device_can_host_kernels` and `require_histogram_launchable`
+    here, rather than re-deriving their arithmetic, is what makes this a
+    test of the gate instead of a second copy of it."""
+    var contract = contract_for(_SHIPPING_API)
+    var caps = _weakest_device()
+    require_device_can_host_kernels(contract, caps)
+
+    var shapes = [10_000, 20, 100_000, 100, 1_000_000, 20]
+    var i = 0
+    while i + 1 < len(shapes):
+        var tiling = derive_tiling(caps, shapes[i], shapes[i + 1], MAX_BINS)
+        require_histogram_launchable(
+            contract,
+            caps,
+            tiling,
+            shapes[i + 1],
+            MAX_BINS,
+            _COMPILED_VARIANTS,
+        )
+        i += 2
+
+
+def test_the_gate_refuses_a_device_below_the_floor() raises:
+    """A gate that never refuses anything is not a gate.
+
+    The two properties `require_device_can_host_kernels` exists to enforce
+    are the threadgroup memory the kernels allocate and a threadgroup at
+    least one launch granularity wide. A device short of either cannot run
+    any histogram this package builds, and finding that out at the first
+    launch would waste the upload that preceded it."""
+    var contract = contract_for(_SHIPPING_API)
+
+    var starved = DeviceCaps(
+        _MIN_SM_COUNT,
+        PORTABLE_MAX_THREADS_PER_BLOCK,
+        MIN_SHARED_MEMORY_PER_BLOCK - 1,
+    )
+    with assert_raises():
+        require_device_can_host_kernels(contract, starved)
+
+    var narrow = DeviceCaps(
+        _MIN_SM_COUNT,
+        PORTABLE_WARP_GRANULARITY - 1,
+        PORTABLE_SHARED_BYTES_PER_BLOCK,
+    )
+    with assert_raises():
+        require_device_can_host_kernels(contract, narrow)
+
+
+def test_the_gate_refuses_an_unsupported_bin_count() raises:
+    """`require_bins_supported` is the one limit `histogram_gpu` stopped
+    spelling out for itself, so it has to hold here. Bins index a
+    `MAX_BINS`-wide threadgroup plane by a UInt8 value; neither zero nor
+    more than `MAX_BINS` is representable."""
+    require_bins_supported(1)
+    require_bins_supported(MAX_BINS)
+    with assert_raises():
+        require_bins_supported(0)
+    with assert_raises():
+        require_bins_supported(MAX_BINS + 1)
 
 
 def test_derived_block_shape_is_launchable_on_every_backend() raises:

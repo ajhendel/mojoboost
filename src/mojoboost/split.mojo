@@ -80,7 +80,6 @@ from .categorical import (
 # Re-exported: the L1 soft-threshold lives in gain.mojo so the numerical scan
 # here and the category partition search in categorical.mojo share one
 # definition, but `split.soft_threshold_l1` remains its public name.
-from .efb import FeatureBundling, unbundle_histogram_into
 from .gain import soft_threshold_l1
 from .histogram import Histogram, SIMD_LANES
 from .monotone import (
@@ -304,7 +303,6 @@ def find_best_split(
     node: Int = 0,
     tree_index: Int = 0,
     parent_output: Float64 = 0.0,
-    bundling: FeatureBundling = FeatureBundling.none(),
 ) raises -> SplitInfo:
     """Scan all (feature, bin) split candidates and return the one with the
     highest gain. `lambda_reg` is the L2 penalty on the leaf hessian sum and
@@ -362,42 +360,19 @@ def find_best_split(
     0, taken from the histogram's own totals. `depth` is the node's depth in
     edges from the root, which `monotone_penalty` discounts by.
 
-    `bundling` is an exclusive-feature-bundling plan (efb.mojo) and defaults
-    to `FeatureBundling.none()`, in which case `hist` is an ordinary
-    per-feature histogram and everything below reads it directly. With an
-    active plan `hist` is a per-*bundle* histogram instead, and this function
-    is where a bundle stops existing: every other argument here
-    (`allowed`, `features`, `missing_bins`, `monotone`, `cats`, and
-    `extra.penalties`) is still indexed by **original** feature, each
-    candidate feature's own histogram is recovered by
-    `unbundle_histogram_into` and scanned in its own local bin ids, and the
-    `SplitInfo` that comes back names an original feature and an original bin.
-    Nothing downstream -- row partitioning, the tree, prediction,
-    serialization, importance, contributions -- ever sees a bundle id.
-
-    Two consequences worth stating. A feature's totals are read off its whole
-    bundle column, which is exact because every row occupies exactly one bin
-    of every column, bundled or not. And a bundled member is scanned over its
-    own bin count rather than the matrix's, which drops only the thresholds at
-    or above its highest occupied bin, none of which can win (see
-    `efb.dense_bin_counts`)."""
+    Exclusive feature bundling (efb.mojo) never reaches here: a bundled
+    histogram is expanded back to one slice per original feature before the
+    search runs (`tree.grow_tree`), so this function reads the per-feature
+    histogram it has always read and a `SplitInfo` names an original feature
+    and an original bin whatever the training matrix looked like."""
     var best = SplitInfo(-1, -1, 0.0, False)
-    var bundled = bundling.active()
-    # With a plan in hand the histogram is per bundle, so the width every
-    # per-feature argument is checked against comes from the plan instead.
-    var n_features = bundling.n_features if bundled else hist.n_features
-    if bundled and hist.n_features != bundling.n_bundles():
-        raise Error(
-            "histogram must have one column per bundle when a bundling plan"
-            " is supplied"
-        )
-    if len(missing_bins) > 0 and len(missing_bins) != n_features:
+    if len(missing_bins) > 0 and len(missing_bins) != hist.n_features:
         raise Error("missing_bins length must equal n_features")
-    if len(monotone) > 0 and len(monotone) != n_features:
+    if len(monotone) > 0 and len(monotone) != hist.n_features:
         raise Error("monotone length must equal n_features")
     var constrained = len(monotone) > 0
     if constrained and cats.any_categorical():
-        for f in range(n_features):
+        for f in range(hist.n_features):
             if cats.is_cat(f) and monotone_sign(monotone, f) != MONOTONE_FREE:
                 raise Error(
                     "monotonic constraints are not supported on categorical"
@@ -405,7 +380,7 @@ def find_best_split(
                 )
     var masked = len(allowed) > 0
     var use_all = len(features) == 0
-    var n_active = n_features if use_all else len(features)
+    var n_active = hist.n_features if use_all else len(features)
 
     # Tested once per node, not once per candidate: an inactive bundle must
     # leave the scan on exactly the path it took before the bundle existed.
@@ -429,22 +404,19 @@ def find_best_split(
     var grad_p = hist.grad.unsafe_ptr()
     var hess_p = hist.hess.unsafe_ptr()
     var count_p = hist.count.unsafe_ptr()
-    # One member's recovered histogram, reused across features and nodes.
-    # Untouched, and so never allocated, when no plan is active.
-    var local_grad = List[Float64]()
-    var local_hess = List[Float64]()
-    var local_count = List[Int]()
     for i_feature in range(n_active):
         var f = i_feature if use_all else features[i_feature]
-        if f < 0 or f >= n_features:
+        if f < 0 or f >= hist.n_features:
             continue
         if masked and (f >= len(allowed) or not allowed[f]):
             continue
         var sign = monotone_sign(monotone, f) if constrained else MONOTONE_FREE
-        # The column this feature's statistics live in: itself when unbundled,
-        # its bundle when not. Totals come off the whole column either way,
-        # which is exact because every row occupies one bin of every column.
-        var base = (bundling.bundle_of[f] if bundled else f) * hist.n_bins
+        var missing_bin = -1
+        if len(missing_bins) > 0:
+            missing_bin = missing_bins[f]
+            if missing_bin >= hist.n_bins:
+                raise Error("missing bin index out of range")
+        var base = f * hist.n_bins
         var vg = SIMD[DType.float64, W](0.0)
         var vh = SIMD[DType.float64, W](0.0)
         var vc = SIMD[DType.int, W](0)
@@ -517,59 +489,19 @@ def find_best_split(
                     best = SplitInfo.categorical(f, g, cs.bitset)
             continue
 
-        # A bundled member is scanned in its own local bin ids, recovered from
-        # its bundle's block. A singleton bundle is identity encoded, so the
-        # recovery is a copy of the block's first `slot_bins` entries; doing it
-        # for every member rather than branching on bundle size keeps one path
-        # through the scan. With no plan the three pointers stay the
-        # histogram's own and the scan is byte for byte the one it always was.
-        var sbase = base
-        var s_bins = hist.n_bins
-        var sg = grad_p
-        var sh = hess_p
-        var sc = count_p
-        if bundled:
-            var bundle = bundling.bundle_of[f]
-            unbundle_histogram_into(
-                local_grad,
-                local_hess,
-                local_count,
-                bundling,
-                bundle,
-                bundling.slot_of[f] - bundling.bundle_start[bundle],
-                hist.grad,
-                hist.hess,
-                hist.count,
-                base,
-            )
-            sbase = 0
-            s_bins = len(local_grad)
-            sg = local_grad.unsafe_ptr()
-            sh = local_hess.unsafe_ptr()
-            sc = local_count.unsafe_ptr()
-
-        # The missing bin is this feature's own, in its own local bin ids,
-        # which is what a bundled member's recovered histogram is indexed by
-        # too, so nothing about missing-value routing changes under bundling.
-        var missing_bin = -1
-        if len(missing_bins) > 0:
-            missing_bin = missing_bins[f]
-            if missing_bin >= s_bins:
-                raise Error("missing bin index out of range")
-
         var parent_g = soft_threshold_l1(total_g, lambda_l1)
         var parent_score = parent_g * parent_g / (total_h + lambda_reg)
 
         # Ordinary bins are [0, n_scan); the missing bin sits at n_scan and is
         # never a threshold, only a side to route.
-        var n_scan = missing_bin if missing_bin >= 0 else s_bins
+        var n_scan = missing_bin if missing_bin >= 0 else hist.n_bins
         var miss_g = 0.0
         var miss_h = 0.0
         var miss_c = 0
         if missing_bin >= 0:
-            miss_g = sg.unsafe_load(sbase + missing_bin)
-            miss_h = sh.unsafe_load(sbase + missing_bin)
-            miss_c = sc.unsafe_load(sbase + missing_bin)
+            miss_g = hist.grad[base + missing_bin]
+            miss_h = hist.hess[base + missing_bin]
+            miss_c = hist.count[base + missing_bin]
 
         # `extra_trees`: one drawn threshold for this feature instead of the
         # whole scan. The candidate space is the same one the scan walks, so
@@ -592,9 +524,9 @@ def find_best_split(
             # split at all when missing rows are there to fill the right child.
             if b == n_scan - 1 and miss_c == 0:
                 break
-            left_g += sg.unsafe_load(sbase + b)
-            left_h += sh.unsafe_load(sbase + b)
-            left_c += sc.unsafe_load(sbase + b)
+            left_g += hist.grad[base + b]
+            left_h += hist.hess[base + b]
+            left_c += hist.count[base + b]
             # The prefix sums above are what the drawn threshold is built
             # from, so they are accumulated for every bin below it and only
             # the drawn one is scored.

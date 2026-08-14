@@ -268,9 +268,9 @@ Two version numbers travel in the dump and they answer different
 questions. `dump_format_version` says what the dump's keys mean, and
 `model_format_version` says which optional facts a model of that vintage
 can carry at all. Branch on the capability flags rather than assuming: a
-dump built by parsing a model file reports `has_split_gain: false`,
-because split gains are recorded during growth and deliberately not
-serialized, and a v1 or v2 model reports `has_node_count: false`.
+model read from a file written before v4 reports `has_split_gain: false`,
+because those formats dropped the gains and a fitted tree cannot recompute
+them, and a v1 or v2 model reports `has_node_count: false`.
 
 **Two caveats.** `trees_to_dataframe` needs pandas, which mojoboost does
 not depend on; `trees_to_records` is the dependency-free form. And as of
@@ -298,11 +298,11 @@ booster = mb.Booster(model_str=text)
 
 | Path | Carries | Does not carry |
 |---|---|---|
-| `pickle` | The whole estimator: hyperparameters, fitted attributes, feature names | Split gains, which the format never held |
-| `save` and `load` | The model. `n_features_in_` and `best_iteration_` are recomputed from it | Hyperparameters, feature names, `device_`, `evals_result_`, split gains |
-| `model_to_string` | The model | The training set, the parameter object, split gains |
+| `pickle` | The whole estimator: hyperparameters, fitted attributes, feature names, split gains | Nothing a fitted estimator holds |
+| `save` and `load` | The model, its split gains, and its feature names. `n_features_in_` and `best_iteration_` are recomputed from it | Hyperparameters, `device_`, `evals_result_` |
+| `model_to_string` | The model, its split gains, and its feature names | The training set, the parameter object |
 
-The file format is versioned and currently v3. Floats travel as IEEE-754
+The file format is versioned and currently v4. Floats travel as IEEE-754
 bit patterns, so a round trip is bit-exact and there is no locale,
 precision, or endianness pitfall. Every release reads every file any
 earlier release wrote. An older release does **not** read a newer file,
@@ -397,7 +397,7 @@ between the two libraries.
 - A model loaded from a v1 or v2 file raises on `pred_contrib`. Those
   formats predate per-node covers, which are the background weighting the
   exact contributions condition on, and they cannot be recovered from a
-  fitted tree. Refit, or retrain and save in v3.
+  fitted tree. Refit, or re-save from a current build, which writes v4.
 - Neither flag takes sparse input. See the next section.
 
 ## 9. Sparse input

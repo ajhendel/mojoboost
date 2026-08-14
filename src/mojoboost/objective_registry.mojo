@@ -89,12 +89,38 @@ Each `check_*` raises the sentence a user should read; each predicate is
 silent. A caller that has to build its own message uses the predicate, and a
 caller that is about to refuse uses the check, so the wording lives once.
 
-Temporary mirrors
------------------
-Three things below are duplicated from files this lane does not own, so the
-duplicate is spelled out rather than hidden:
+Where this module sits
+----------------------
+Below metrics.mojo and above everything else:
 
-- `MULTICLASS` mirrors params.mojo's, `LAMBDARANK` mirrors ranking.mojo's.
+    metrics  <-  objective_registry  <-  boosting  <-  everything else
+        ^________________________________|
+
+metrics.mojo defines the metric codes, because a code names a function and
+nineteen of those functions are there, and it imports nothing. This module
+defines the objective codes and everything either kind of code *means*.
+boosting.mojo binds the objective codes back under their own names, so the
+forty-odd callers that import them from `.boosting` are unaffected, and it
+calls in for the two facts it used to own: `objective_link`, which
+`Booster.response` applies, and `check_objective_param`, which
+`_check_objective` runs.
+
+That direction is load-bearing. While the objective codes lived in
+boosting.mojo the arrow ran the other way, this module could not be imported
+by boosting.mojo, and the inverse link was therefore decided in three places
+(`Booster.response`, `response_scale`, `response_for_objective`) that agreed
+only by inspection. All three now read `objective_link`.
+
+metrics.mojo still cannot import this module, and does not need to: it
+computes, it does not decide. `eval_builtin_metric` in custom_metric.mojo is
+the one call path that asks this module what a code means and then lands
+there.
+
+Remaining mirrors
+-----------------
+Two things below are still duplicated in files this module does not own, so
+the duplicate is spelled out rather than hidden:
+
 - The objective name and alias resolution mirrors `objective_from_name`,
   `objective_display_name`, `objective_default_alpha`, and
   `_raise_if_unimplemented_objective` in params.mojo, message text
@@ -106,87 +132,164 @@ duplicate is spelled out rather than hidden:
   the CLI depend on must not drag the GPU stack behind it. The dependency
   runs the other way after wiring.
 
-Each mirror is listed in handoffs/migration_21_objective_metric_registry.md
-with the exact deletion that removes it. Until those deletions land, this
-module is authoritative by intent and the mirrored files are authoritative
-in fact.
+`LAMBDARANK` is also still spelled in ranking.mojo. Both are now definitions
+of the same number in two files; ranking.mojo should bind this one, which is
+the deletion listed in handoffs/migration_21_objective_metric_registry.md
+section 3.3.
+
+Each mirror is listed in that handoff with the exact deletion that removes
+it. Until those deletions land, this module is authoritative by intent and
+the mirrored files are authoritative in fact.
 """
 
-from .boosting import (
-    BINARY_LOGISTIC,
-    CROSS_ENTROPY,
-    CUSTOM,
-    DEFAULT_FAIR_C,
-    DEFAULT_TWEEDIE_VARIANCE_POWER,
-    FAIR,
-    GAMMA,
-    HUBER,
-    L1,
-    MAPE,
-    POISSON,
-    QUANTILE,
-    SQUARED_ERROR,
-    TWEEDIE,
-    _check_objective,
-    objective_renews_leaves,
-)
 from .metrics import (
-    METRIC_AUC,
-    METRIC_AVERAGE_PRECISION,
-    METRIC_BINARY_ERROR,
-    METRIC_BINARY_LOGLOSS,
-    METRIC_CROSS_ENTROPY,
-    METRIC_FAIR,
-    METRIC_GAMMA,
-    METRIC_GAMMA_DEVIANCE,
-    METRIC_HUBER,
-    METRIC_KLDIV,
-    METRIC_L1,
-    METRIC_L2,
-    METRIC_MAP,
-    METRIC_MAPE,
-    METRIC_MULTI_ERROR,
-    METRIC_MULTI_LOGLOSS,
-    METRIC_NDCG,
-    METRIC_POISSON,
-    METRIC_QUANTILE,
-    METRIC_RMSE,
-    METRIC_TWEEDIE,
-    N_BUILTIN_METRICS,
+    METRIC_AUC as _METRIC_AUC,
+    METRIC_AVERAGE_PRECISION as _METRIC_AVERAGE_PRECISION,
+    METRIC_BINARY_ERROR as _METRIC_BINARY_ERROR,
+    METRIC_BINARY_LOGLOSS as _METRIC_BINARY_LOGLOSS,
+    METRIC_CROSS_ENTROPY as _METRIC_CROSS_ENTROPY,
+    METRIC_FAIR as _METRIC_FAIR,
+    METRIC_GAMMA as _METRIC_GAMMA,
+    METRIC_GAMMA_DEVIANCE as _METRIC_GAMMA_DEVIANCE,
+    METRIC_HUBER as _METRIC_HUBER,
+    METRIC_KLDIV as _METRIC_KLDIV,
+    METRIC_L1 as _METRIC_L1,
+    METRIC_L2 as _METRIC_L2,
+    METRIC_MAP as _METRIC_MAP,
+    METRIC_MAPE as _METRIC_MAPE,
+    METRIC_MULTI_ERROR as _METRIC_MULTI_ERROR,
+    METRIC_MULTI_LOGLOSS as _METRIC_MULTI_LOGLOSS,
+    METRIC_NDCG as _METRIC_NDCG,
+    METRIC_POISSON as _METRIC_POISSON,
+    METRIC_QUANTILE as _METRIC_QUANTILE,
+    METRIC_RMSE as _METRIC_RMSE,
+    METRIC_TWEEDIE as _METRIC_TWEEDIE,
+    N_BUILTIN_METRICS as _N_BUILTIN_METRICS,
 )
 
-# Two imports rather than two more tables, and both are re-exported so a
-# caller that wants objective or metric metadata needs one import.
-#
 # `objective_renews_leaves` is the boosting loop's own function: it is called
 # once per training run there and the registry answers with the same
 # function, so the LightGBM `RenewTreeOutput` rule has exactly one
-# definition.
+# definition. It is re-exported here so a caller that wants objective
+# metadata needs one import.
 #
-# The `METRIC_*` codes and `N_BUILTIN_METRICS` live in metrics.mojo because a
-# code names a function and nineteen of those functions are in that file.
-# This module owns what a code *means*; metrics.mojo owns what it computes.
-# The dependency runs registry -> metrics and never back: metrics.mojo cannot
-# import this module, since boosting.mojo imports `_argsort` from it and this
-# module imports boosting.
+# The `METRIC_*` codes and `N_BUILTIN_METRICS` are *defined* in metrics.mojo,
+# because a code names a function and nineteen of those functions are in that
+# file. This module owns what a code means; metrics.mojo owns what it
+# computes. The dependency runs registry -> metrics and never back:
+# metrics.mojo cannot import this module, since boosting.mojo imports
+# `_argsort` from it and this module imports boosting.
+#
+# The bindings below are aliases of metrics.mojo's constants, not second
+# definitions: the value is bound once, in one file, and a caller that
+# spells `objective_registry.METRIC_L2` and one that spells
+# `metrics.METRIC_L2` are reading the same `comptime`. They are re-declared
+# rather than plainly re-exported for the same reason device.mojo wraps
+# device_policy.mojo's vocabulary: the symbols a module exports should be
+# defined in it, whatever an importer's view of a re-exported name turns out
+# to be. `__init__.mojo` imports them from `.metrics` and must not also
+# import them from here, which would put the name in the package namespace
+# twice.
+
+comptime METRIC_L2 = _METRIC_L2
+comptime METRIC_RMSE = _METRIC_RMSE
+comptime METRIC_L1 = _METRIC_L1
+comptime METRIC_QUANTILE = _METRIC_QUANTILE
+comptime METRIC_HUBER = _METRIC_HUBER
+comptime METRIC_BINARY_LOGLOSS = _METRIC_BINARY_LOGLOSS
+comptime METRIC_BINARY_ERROR = _METRIC_BINARY_ERROR
+comptime METRIC_AUC = _METRIC_AUC
+comptime METRIC_MULTI_LOGLOSS = _METRIC_MULTI_LOGLOSS
+comptime METRIC_MULTI_ERROR = _METRIC_MULTI_ERROR
+comptime METRIC_NDCG = _METRIC_NDCG
+comptime METRIC_MAPE = _METRIC_MAPE
+comptime METRIC_FAIR = _METRIC_FAIR
+comptime METRIC_POISSON = _METRIC_POISSON
+comptime METRIC_GAMMA = _METRIC_GAMMA
+comptime METRIC_GAMMA_DEVIANCE = _METRIC_GAMMA_DEVIANCE
+comptime METRIC_TWEEDIE = _METRIC_TWEEDIE
+comptime METRIC_CROSS_ENTROPY = _METRIC_CROSS_ENTROPY
+comptime METRIC_KLDIV = _METRIC_KLDIV
+comptime METRIC_AVERAGE_PRECISION = _METRIC_AVERAGE_PRECISION
+comptime METRIC_MAP = _METRIC_MAP
+comptime N_BUILTIN_METRICS = _N_BUILTIN_METRICS
 
 # ---------------------------------------------------------------------------
 # Objective codes
 # ---------------------------------------------------------------------------
 
-# The single-output objective codes are boosting.mojo's, imported above. Two
-# more codes complete the space; both are mirrors (see the module docstring).
+# The whole objective code space, in one place. These were boosting.mojo's
+# and are now this module's, with boosting.mojo binding them back under the
+# same names (`comptime SQUARED_ERROR = _SQUARED_ERROR`, the way device.mojo
+# binds device_policy.mojo's vocabulary), so every caller that imports them
+# from `.boosting` keeps compiling and keeps reading the same values.
+#
+# The move is what breaks the import cycle. While the codes lived in
+# boosting.mojo this module had to import boosting, so boosting could not
+# import this module, so `Booster.response` could not read `objective_link`
+# and had to carry its own copy of the link table. The dependency now runs
+# metrics -> objective_registry -> boosting, one direction only, and there is
+# one link table.
+#
+# A code is a number in a serialized model and crosses the Python boundary as
+# an integer, so none of these may be renumbered. The gaps are historical and
+# deliberate: 6 is `CUSTOM` and 7 is `LAMBDARANK`, both of which sit inside
+# the single-output range without being single-output built-ins.
 
-# Softmax multiclass, params.mojo's `MULTICLASS`. Negative to stay out of the
-# single-output code space forever: multiclass is trained by
-# `train_multiclass`, not by `train`, and a model of it holds one tree per
-# class per round.
+comptime SQUARED_ERROR = 0
+comptime BINARY_LOGISTIC = 1
+comptime POISSON = 2
+comptime HUBER = 3
+comptime QUANTILE = 4
+comptime L1 = 5
+
+# Marks a booster trained through `train_custom` in objective.mojo. It is not
+# a built-in objective: `train` and `train_gpu` reject it, because the
+# gradients come from a caller-supplied callable rather than from
+# `_fill_grad_hess`. Predictions for it are raw scores (no known link).
+comptime CUSTOM = 6
+
+# LambdaRank. Its gradients come from query groups rather than from
+# `_fill_grad_hess`, so the code that computes them lives in ranking.mojo,
+# but it is one of the objective codes a fitted model carries.
+comptime LAMBDARANK = 7
+
+# The regression family LightGBM calls gamma, tweedie, mape, and fair, and
+# the continuous-label cross entropy it calls xentropy.
+comptime GAMMA = 8
+comptime TWEEDIE = 9
+comptime MAPE = 10
+comptime FAIR = 11
+comptime CROSS_ENTROPY = 12
+
+# Softmax multiclass. Negative to stay out of the single-output code space
+# forever: multiclass is trained by `train_multiclass`, not by `train`, and a
+# model of it holds one tree per class per round.
 comptime MULTICLASS = -1
 
-# LambdaRank, ranking.mojo's `LAMBDARANK`. Its gradients come from query
-# groups rather than from `_fill_grad_hess`, which is why it lives with the
-# ranking code, but it is one of the objective codes a fitted model carries.
-comptime LAMBDARANK = 7
+# LightGBM's fair_c and tweedie_variance_power defaults, the value the
+# objective's one scalar slot takes for FAIR and TWEEDIE when a caller does
+# not set one. `objective_param_domain` carries them as its `default` field;
+# they are named here because boosting.mojo binds them back and callers have
+# always imported them by name.
+comptime DEFAULT_FAIR_C = 1.0
+comptime DEFAULT_TWEEDIE_VARIANCE_POWER = 1.5
+
+
+def objective_renews_leaves(objective: Int) -> Bool:
+    """Whether this objective replaces its leaf values after each tree, the
+    LightGBM `RenewTreeOutput` rule: the objectives whose Newton step is
+    uninformative because their hessian carries no curvature (it is the row
+    weight itself), so the leaf value comes from a percentile of the
+    residuals instead. See `_renew_leaf_values` in boosting.mojo, which is
+    what acts on it, and `objective_init_kind`, which is what it decides.
+
+    Moved here from boosting.mojo with the codes: it is a property of the
+    objective rather than a step of the boosting loop, it is the one fact
+    `objective_init_kind` cannot compose without, and the loop calls it once
+    per training run. boosting.mojo wraps it under the same name.
+    """
+    return objective == QUANTILE or objective == L1 or objective == MAPE
 
 # ---------------------------------------------------------------------------
 # Vocabularies
@@ -303,7 +406,7 @@ comptime CLASS_WEIGHT_MULTICLASS = 2
 `balanced` apply; `scale_pos_weight` and `is_unbalance` do not, since there
 is no single positive class to lift."""
 
-# The metric codes are imported from metrics.mojo above and re-exported, so
+# The metric codes are bound to metrics.mojo's above, so
 # `objective_registry.METRIC_L2` and `metrics.METRIC_L2` are the same
 # constant rather than two that have to agree. They are the codes
 # `eval_metric` in bindings/_mojoboost.mojo dispatches on and
@@ -724,8 +827,9 @@ struct ParamDomain(Copyable, Movable):
     Declarative, for the callers that need the domain rather than a verdict:
     a Python estimator validating a keyword before it reaches Mojo, a binding
     filling a parameter description, a document listing what `tweedie` takes.
-    `check_objective_param` remains the *enforcing* answer, and it delegates
-    to the trainer's own check so the message a user sees is the trainer's.
+    `check_objective_param` is the *enforcing* answer over the same data, and
+    boosting.mojo's `_check_objective` calls it, so the bounds a caller reads
+    here are the bounds the trainer applies.
 
     `applies` is False for the ten objectives that read no scalar, and every
     other field is then meaningless. `has_upper` is False for the two domains
@@ -790,10 +894,10 @@ def objective_param_domain(objective: Int) raises -> ParamDomain:
     distribution is the compound Poisson-gamma the objective assumes (at 1 it
     is Poisson and at 2 gamma, and its gradient divides by neither exponent).
 
-    These bounds are stated in `_check_objective` in boosting.mojo as well,
-    which is the enforcing copy. `check_objective_param` runs both and raises
-    if they ever disagree, so the duplication is loud rather than silent; see
-    the handoff for the deletion that removes it.
+    This is the only statement of the four intervals. `_check_objective` in
+    boosting.mojo used to carry its own copy and now calls
+    `check_objective_param`, which reads this, so a bound changed here
+    changes what the trainer accepts and there is nothing left to drift.
     """
     var kind = objective_param(objective)
     if kind == PARAM_NONE:
@@ -816,35 +920,44 @@ def objective_param_domain(objective: Int) raises -> ParamDomain:
 def check_objective_param(objective: Int, value: Float64) raises:
     """Validate the objective's scalar parameter without looking at data.
 
-    Delegates to `_check_objective` with no labels, which runs exactly the
-    parameter range checks and skips every label check, so the message a
-    user sees is the trainer's own and there is no second copy of the ranges
-    to drift. Objectives with no scalar, and the three with their own
-    trainers, are accepted unexamined: their trainers validate what they
-    read.
+    The enforcing answer, and the only one: `_check_objective` in
+    boosting.mojo calls this for its four range checks rather than repeating
+    them, so the bounds are stated once (in `objective_param_domain`) and
+    the sentence a user reads is stated once (here). The sentences are
+    boosting.mojo's own, word for word, because they are what every existing
+    caller and document already quotes.
 
-    `objective_param_domain` states the same four intervals declaratively,
-    for the callers that need the bounds rather than a verdict. That is a
-    second statement of the same fact, so this function checks it: a value
-    the trainer accepts and the domain rejects raises here rather than
-    reaching a Python layer that would reject it later for its own reasons.
-    The check costs one comparison and runs once per training run.
+    Objectives with no scalar, and the three with their own trainers, are
+    accepted unexamined: their trainers validate what they read. That is why
+    `_check_objective` can call this unconditionally after it has rejected
+    an unknown code.
     """
     if not objective_is_builtin(objective):
         return
-    _check_objective(objective, [], value)
     var domain = objective_param_domain(objective)
-    if not domain.contains(value):
+    if domain.contains(value):
+        return
+    if objective == HUBER:
+        raise Error("huber requires alpha > 0")
+    if objective == QUANTILE:
+        raise Error("quantile requires 0 < alpha < 1")
+    if objective == FAIR:
+        raise Error("fair requires alpha (fair_c) > 0")
+    if objective == TWEEDIE:
+        # Outside (1, 2) this is no longer the compound Poisson-gamma
+        # LightGBM's tweedie objective assumes: at 1 it is Poisson, at 2
+        # gamma, and the gradient divides by neither exponent.
         raise Error(
-            "registry drift: boosting.mojo accepts ",
-            objective_param_name(objective),
-            "=",
-            value,
-            " for objective '",
-            objective_canonical_name(objective),
-            "' but objective_param_domain says ",
-            domain.describe(),
+            "tweedie requires 1 < alpha (tweedie_variance_power) < 2"
         )
+    raise Error(
+        "objective '",
+        objective_canonical_name(objective),
+        "' requires ",
+        objective_param_name(objective),
+        " in ",
+        domain.describe(),
+    )
 
 
 @always_inline

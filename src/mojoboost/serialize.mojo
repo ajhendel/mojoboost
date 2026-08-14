@@ -90,7 +90,7 @@ nothing downstream can rederive.
 
 from std.memory import bitcast
 
-from .binning import BinMapper, BinnedMatrix, no_missing_bins
+from .binning import MAX_BINS, BinMapper, BinnedMatrix, no_missing_bins
 from .categorical import CAT_BITSET_WORDS, CategoricalSpec
 from .boosting import Booster, MulticlassBooster
 from .monotone import MonotoneConstraints
@@ -567,14 +567,48 @@ def _read_mapper(mut r: _TokenReader, version: Int) raises -> BinMapper:
     var n_edges = r.next_int()
     if n_features < 1 or n_edges < 0:
         raise Error("corrupt mapper header")
+    # The byte ceiling, checked on the way in as every binner checks it on
+    # the way out. Without it a file can declare a bin count no
+    # `BinnedMatrix` can hold, and the two ways to bin a value stop
+    # agreeing: `BinMapper.transform` narrows to `UInt8` and wraps modulo
+    # 256, while `BinMapper.bin_value` returns the true index. Prediction
+    # would then depend on which path a caller took, by a whole leaf. One
+    # bin is legal and means a single-bin binning, which is what a converted
+    # model whose trees hold no threshold has.
+    if n_bins < 1 or n_bins > MAX_BINS:
+        raise Error(
+            "corrupt mapper: n_bins must be in [1, ",
+            MAX_BINS,
+            "]; a bin index is stored in a byte",
+        )
     var edges = List[Float64](capacity=n_edges)
     for _ in range(n_edges):
         edges.append(r.next_f64())
     var offsets = List[Int](capacity=n_features + 1)
     for _ in range(n_features + 1):
         offsets.append(r.next_int())
-    if offsets[n_features] != n_edges:
+    if offsets[0] != 0 or offsets[n_features] != n_edges:
         raise Error("corrupt mapper offsets")
+    # Each feature's slice has to be non-negative and to fit the declared
+    # bins: k edges give ordinary bins 0..k, so k may not exceed
+    # `n_bins - 1`. A feature that also reserves a missing bin uses one
+    # fewer, and the reservation is range-checked against `n_bins` below;
+    # the loose bound here is enough to keep every producible bin index
+    # inside the byte, which is what the ceiling is for.
+    for f in range(n_features):
+        var width = offsets[f + 1] - offsets[f]
+        if width < 0:
+            raise Error("corrupt mapper offsets")
+        if width > n_bins - 1:
+            raise Error(
+                "corrupt mapper: feature ",
+                f,
+                " has ",
+                width,
+                " edges, more than its ",
+                n_bins,
+                " bins allow",
+            )
     # A v1 mapper predates missing-value support and reserves no bins.
     var missing_bin = no_missing_bins(n_features)
     if version >= 2:

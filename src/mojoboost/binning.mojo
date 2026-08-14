@@ -84,6 +84,13 @@ def _log2_ceil(n: Int) -> Int:
 # training value cannot produce an infinite (or non-increasing) edge.
 comptime MAX_EDGE = 1e300
 
+# A bin index is stored in a byte (`BinnedMatrix.bins` is `List[UInt8]`), so
+# no binning may reserve more than this many bins. Every path that produces
+# a `BinMapper` has to hold the ceiling, because `BinMapper.transform`
+# narrows to `UInt8` while `BinMapper.bin_value` returns an `Int`: above it
+# the two disagree silently, by a whole leaf rather than by a rounding step.
+comptime MAX_BINS = 256
+
 
 def _avoid_inf(x: Float64) -> Float64:
     """LightGBM's `Common::AvoidInf`, clamping an edge into +/-1e300."""
@@ -391,8 +398,8 @@ def fit_bins(
     over the remaining `max_bins - 1` bins from the non-missing values alone,
     so `NaN` never enters a quantile comparison. `use_missing=False` reserves
     nothing and bins `NaN` as 0.0, matching LightGBM's `use_missing=false`."""
-    if max_bins < 2 or max_bins > 256:
-        raise Error("max_bins must be in [2, 256]")
+    if max_bins < 2 or max_bins > MAX_BINS:
+        raise Error("max_bins must be in [2, ", MAX_BINS, "]")
     if n_rows < 1:
         raise Error("n_rows must be positive")
     if len(features) != n_rows * n_features:

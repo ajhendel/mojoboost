@@ -43,6 +43,56 @@ from dataset_bindings import (
     dataset_subset,
 )
 
+# The rest of the capability modules, on the same terms: each owns one
+# subject, none of them decides anything, and all of them become reachable
+# only here. `bindings/build.sh` puts this directory on the import path
+# (`-I bindings`), which is what makes these top-level imports resolve.
+from basic_bindings import (
+    decide_device_workload,
+    efb_check,
+    efb_defaults,
+    extra_option_supported,
+    extra_params_check,
+    extra_params_from_mapping,
+    forced_splits_check,
+    native_clock_ns,
+    startup_environment,
+    startup_phase_contract,
+)
+from distributed_bindings import (
+    distributed_capability,
+    distributed_check_machine_list,
+    distributed_status_message,
+    transport_status_message,
+)
+from inspection_bindings import (
+    dump_leaf_index,
+    dump_leaf_index_multiclass,
+    dump_model,
+    dump_model_json,
+    dump_model_json_multiclass,
+    dump_model_multiclass,
+    dump_raw_scores,
+    dump_raw_scores_multiclass,
+    model_file_kind,
+    model_format_versions,
+    objective_code,
+    split_values,
+    split_values_multiclass,
+)
+from objective_bindings import (
+    check_objective_param,
+    metric_code_of_name,
+    objective_code_of_name,
+    objective_name_status_of,
+    registry_metric_aliases,
+    registry_metrics,
+    registry_objective_aliases,
+    registry_objective_unimplemented,
+    registry_objectives,
+    registry_vocabulary,
+)
+
 from mojoboost.bagging import BaggingParams
 from mojoboost.categorical import CategoricalParams, CategoricalSpec
 from mojoboost.contrib import ContribExplainer
@@ -266,6 +316,72 @@ def PyInit__mojoboost() abi("C") -> PythonObject:
         m.def_function[model_feature_names]("model_feature_names")
         m.def_function[gpu_available]("gpu_available")
         m.def_function[resolve_device]("resolve_device")
+        # The whole device decision, not just the backend name. One entry
+        # point and one only: `resolve_device` above answers the shape-only
+        # question and stays, and `device_selection.py` prefers this when it
+        # is present. The workload crosses as a mapping rather than as ten
+        # positional arguments, which is the shape `_parse_params` already
+        # uses and which needs no bet on how many arguments `def_function`
+        # accepts (eight are proven by `predict_range`; ten were never
+        # tried). See handoffs/connect_14_bindings.md section 6.1(c).
+        m.def_function[decide_device_workload]("decide_device")
+        # -- structured inspection (migration_19_model_inspection.md) ----
+        m.def_function[dump_model]("dump_model")
+        m.def_function[dump_model_multiclass]("dump_model_multiclass")
+        m.def_function[split_values]("split_values")
+        m.def_function[split_values_multiclass]("split_values_multiclass")
+        m.def_function[dump_raw_scores]("dump_raw_scores")
+        m.def_function[dump_raw_scores_multiclass](
+            "dump_raw_scores_multiclass"
+        )
+        m.def_function[dump_leaf_index]("dump_leaf_index")
+        m.def_function[dump_leaf_index_multiclass](
+            "dump_leaf_index_multiclass"
+        )
+        m.def_function[dump_model_json]("dump_model_json")
+        m.def_function[dump_model_json_multiclass](
+            "dump_model_json_multiclass"
+        )
+        # Takes a model handle and answers what it was trained for. The
+        # name-to-code resolver is `objective_code_of_name` below; they are
+        # two questions and only one of them may hold this name.
+        m.def_function[objective_code]("objective_code")
+        m.def_function[model_file_kind]("model_file_kind")
+        m.def_function[model_format_versions]("model_format_versions")
+        # -- objective and metric registry -------------------------------
+        m.def_function[registry_objectives]("registry_objectives")
+        m.def_function[registry_objective_aliases](
+            "registry_objective_aliases"
+        )
+        m.def_function[registry_objective_unimplemented](
+            "registry_objective_unimplemented"
+        )
+        m.def_function[registry_metrics]("registry_metrics")
+        m.def_function[registry_metric_aliases]("registry_metric_aliases")
+        m.def_function[registry_vocabulary]("registry_vocabulary")
+        m.def_function[objective_code_of_name]("objective_code_of_name")
+        m.def_function[metric_code_of_name]("metric_code_of_name")
+        m.def_function[objective_name_status_of]("objective_name_status")
+        m.def_function[check_objective_param]("check_objective_param")
+        # -- run configuration -------------------------------------------
+        m.def_function[extra_params_check]("extra_params_check")
+        m.def_function[extra_option_supported]("extra_option_supported")
+        m.def_function[forced_splits_check]("forced_splits_check")
+        m.def_function[efb_check]("efb_check")
+        m.def_function[efb_defaults]("efb_defaults")
+        # -- distributed runtime -----------------------------------------
+        m.def_function[distributed_capability]("distributed_capability")
+        m.def_function[distributed_check_machine_list](
+            "distributed_check_machine_list"
+        )
+        m.def_function[distributed_status_message](
+            "distributed_status_message"
+        )
+        m.def_function[transport_status_message]("transport_status_message")
+        # -- startup diagnostics -----------------------------------------
+        m.def_function[startup_phase_contract]("startup_phase_contract")
+        m.def_function[startup_environment]("startup_environment")
+        m.def_function[native_clock_ns]("native_clock_ns")
         return m.finalize()
     except e:
         abort(String("failed to create _mojoboost module: ", e))
@@ -400,6 +516,17 @@ def _parse_params(
         max_depth=Int(py=params["max_depth"]),
         monotone=_parse_monotone(params, n_features),
         cat=_parse_cat_params(params),
+        # The remaining LightGBM tree controls
+        # (src/mojoboost/tree_parameters_extra.mojo). Until this was passed,
+        # the bundle took its inactive default on every fit that came through
+        # Python, so `min_gain_to_split`, `max_delta_step`, `path_smooth`,
+        # `extra_trees`, `monotone_penalty`, the per-feature gain multipliers
+        # and split costs, and forced splits were reachable from the C ABI and
+        # the CLI (which parse a text spec through params.mojo) and from
+        # nowhere else. `extra_params_from_mapping` is the same parser
+        # `extra_params_check` validates with, so what is checked and what is
+        # trained cannot come apart.
+        extra=extra_params_from_mapping(params, n_features),
     )
     return BoosterParams(
         Int(py=params["n_estimators"]),

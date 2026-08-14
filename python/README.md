@@ -17,7 +17,10 @@ bit-exact model save/load.
 > and
 > [docs/GPU_VALIDATION.md](https://github.com/ajhendel/mojoboost/blob/main/docs/GPU_VALIDATION.md),
 > report failures, and do not rely on unvalidated hardware or parameter
-> combinations in production.
+> combinations in production. The parity contract scores each capability on
+> seven independent axes rather than one, because several things in the
+> repository are implemented and reachable by nobody; a row saying
+> `supported` is the one that means what it sounds like.
 
 ## Installing
 
@@ -300,6 +303,53 @@ recorded, so a label absent from training raises. The ranker takes
 match. Validation is scored on the CPU, so `device="gpu"` with an
 `eval_set` raises rather than falling back.
 
+## Model inspection
+
+The ensemble as structured data, in LightGBM's shapes, at the top level of
+the package:
+
+```python
+import mojoboost as mb
+
+schema = mb.dump_model(model)                  # the documented dump schema
+frame = mb.trees_to_dataframe(model)           # one pandas row per node
+records = mb.trees_to_records(model)           # the same, as dicts, no pandas
+hist = mb.get_split_value_histogram(model, "age", bins=10)
+```
+
+`model` is a fitted estimator, a `Booster`, or the text
+`Booster.model_to_string()` produces, so a model read back from a file can
+be inspected without refitting. `feature_names=` names the features of a
+model that carries none. Every key of the dump is documented in
+[docs/MODEL_INSPECTION_SCHEMA.md](https://github.com/ajhendel/mojoboost/blob/main/docs/MODEL_INSPECTION_SCHEMA.md);
+the two to branch on are `has_split_gain` and `has_node_count`.
+
+One gap worth knowing before you build on it. The dump is rebuilt by
+parsing the model text, and split gains are recorded during growth and
+never serialized, so every node reports `split_gain: None` and the dump
+reports `has_split_gain: False`. `trees_to_dataframe` inherits that hole.
+It closes when the extension grows the native dump entry point, which is
+written but not registered; the state of that seam is in
+[docs/INTEGRATION_INVENTORY.md](https://github.com/ajhendel/mojoboost/blob/main/docs/INTEGRATION_INVENTORY.md).
+
+## Cross-validation
+
+LightGBM's `cv`, over the same trainer, returning the same
+`{metric-mean, metric-stdv}` history:
+
+```python
+history = mb.cv({"objective": "regression", "num_leaves": 31},
+                mb.Dataset(X, label=y),
+                num_boost_round=100, nfold=5,
+                early_stopping_rounds=10)
+```
+
+`folds`, `stratified`, `shuffle`, `metrics`, `feval`, `fpreproc`,
+`init_model`, `eval_train_metric`, and `return_cvbooster` are all there, and
+a caller-supplied splitter works as well as a fold count. Each fold is
+binned from its own training rows rather than sliced out of one constructed
+`Dataset`, so fold binning cannot leak across the split.
+
 ## Device selection
 
 ```python
@@ -308,6 +358,22 @@ from mojoboost import MojoBoostRegressor, gpu_available
 model = MojoBoostRegressor(device="auto").fit(X, y)
 model.device_          # the backend that actually ran: "cpu" or "gpu"
 ```
+
+To ask what a device would do before committing to it, without handling an
+exception:
+
+```python
+report = mb.explain_device_choice(X, y, device="gpu")
+print(report)                  # the resolution and the reasons behind it
+report.would_raise             # True when a fit would have raised
+report.to_dict()               # JSON-serializable, for a log or a ticket
+```
+
+The backend in a report is the native engine's answer, the same one `fit`
+would get. The rest of the report is currently narrower than the engine
+knows: the binding that would carry the blocking reasons, warnings, memory
+estimate, and evidence identifier across is not registered yet, so
+`report.contract` reads `"narrow"` and says which gates were skipped.
 
 `device="cpu"` is the default and the dependable backend. `device="gpu"`
 raises when no accelerator is available or when the GPU path does not
@@ -408,6 +474,10 @@ accelerator results belong in the
   [github.com/ajhendel/mojoboost](https://github.com/ajhendel/mojoboost)
 - [Installation](https://github.com/ajhendel/mojoboost/blob/main/docs/INSTALLATION.md)
 - [LightGBM parity contract](https://github.com/ajhendel/mojoboost/blob/main/docs/LIGHTGBM_PARITY.md)
+- [Capability levels](https://github.com/ajhendel/mojoboost/blob/main/docs/CAPABILITY_LEVELS.md),
+  the seven words the parity contract scores against
+- [Integration inventory](https://github.com/ajhendel/mojoboost/blob/main/docs/INTEGRATION_INVENTORY.md),
+  what is written here and reachable by nobody
 - [GPU validation record](https://github.com/ajhendel/mojoboost/blob/main/docs/GPU_VALIDATION.md)
 - [Device selection policy](https://github.com/ajhendel/mojoboost/blob/main/docs/DEVICE_SELECTION.md)
 - [Contributing](https://github.com/ajhendel/mojoboost/blob/main/CONTRIBUTING.md)

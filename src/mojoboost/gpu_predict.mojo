@@ -77,11 +77,6 @@ from max.gpu.sync import barrier
 
 from .binning import BinnedMatrix
 from .boosting import (
-    BINARY_LOGISTIC,
-    CROSS_ENTROPY,
-    GAMMA,
-    POISSON,
-    TWEEDIE,
     Booster,
     IterationRange,
     MulticlassBooster,
@@ -122,7 +117,12 @@ from .metrics import (
     METRIC_MULTI_LOGLOSS as HOST_METRIC_MULTI_LOGLOSS,
     check_metric_weight,
 )
-from .objective_registry import metric_canonical_name
+from .objective_registry import (
+    LINK_EXP,
+    LINK_SIGMOID,
+    metric_canonical_name,
+    objective_link,
+)
 from .tree import Tree
 
 
@@ -472,10 +472,25 @@ def _metric_kernel(
 def response_for_objective(objective: Int) -> Int:
     """The device response code matching `Booster.response` for a built-in
     objective. CUSTOM and every objective without a link map to
-    RESPONSE_IDENTITY, which is what `Booster.response` returns for them."""
-    if objective == BINARY_LOGISTIC or objective == CROSS_ENTROPY:
+    RESPONSE_IDENTITY, which is what `Booster.response` returns for them.
+
+    Which objective has which link is `objective_link` in
+    objective_registry.mojo and is not decided here; this is only the map
+    from the registry's vocabulary to the device's. It used to be a second
+    copy of the table, agreeing with `Booster.response` and
+    `response_scale` by inspection. A device kernel applying a different
+    link from the host is the one disagreement in this file that would
+    produce wrong numbers rather than an error, so it is worth the
+    indirection.
+
+    `LINK_SOFTMAX` maps to RESPONSE_IDENTITY because the multiclass path
+    takes the softmax in its own kernel over a whole row rather than through
+    the per-element response map; see `predict_proba_gpu`.
+    """
+    var link = objective_link(objective)
+    if link == LINK_SIGMOID:
         return RESPONSE_SIGMOID
-    if objective == POISSON or objective == GAMMA or objective == TWEEDIE:
+    if link == LINK_EXP:
         return RESPONSE_EXP
     return RESPONSE_IDENTITY
 

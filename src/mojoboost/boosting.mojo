@@ -56,21 +56,55 @@ from .sampling import (
     has_positive_rows,
     refresh_class_bag,
 )
+from .objective_registry import (
+    BINARY_LOGISTIC as _BINARY_LOGISTIC,
+    CROSS_ENTROPY as _CROSS_ENTROPY,
+    CUSTOM as _CUSTOM,
+    DEFAULT_FAIR_C as _DEFAULT_FAIR_C,
+    DEFAULT_TWEEDIE_VARIANCE_POWER as _DEFAULT_TWEEDIE_VARIANCE_POWER,
+    FAIR as _FAIR,
+    GAMMA as _GAMMA,
+    HUBER as _HUBER,
+    L1 as _L1,
+    LINK_EXP,
+    LINK_SIGMOID,
+    MAPE as _MAPE,
+    POISSON as _POISSON,
+    QUANTILE as _QUANTILE,
+    SQUARED_ERROR as _SQUARED_ERROR,
+    TWEEDIE as _TWEEDIE,
+    check_objective_param,
+    objective_link,
+    objective_renews_leaves as _objective_renews_leaves,
+)
 from .tree import Tree, TreeParams, grow_tree, node_bounds
 from .tree_parameters_extra import ExtraTreeParams, finish_leaf_output
 
-comptime SQUARED_ERROR = 0
-comptime BINARY_LOGISTIC = 1
-comptime POISSON = 2
-comptime HUBER = 3
-comptime QUANTILE = 4
-comptime L1 = 5
+# The objective codes, and what they mean, live in objective_registry.mojo.
+# They are bound back here under the names this module has always exported,
+# the way device.mojo binds device_policy.mojo's vocabulary, so every caller
+# that imports them from `.boosting` keeps compiling and keeps reading the
+# same values. They are bindings rather than plain re-exports so the symbols
+# this module exports are defined in it, whatever an importer's view of a
+# re-exported name turns out to be.
+#
+# They moved so that this module can import the registry. While they lived
+# here the registry had to import this file, so this file could not import
+# the registry, so `Booster.response` had to carry its own copy of the
+# inverse-link table. It no longer does; see `response`.
+
+comptime SQUARED_ERROR = _SQUARED_ERROR
+comptime BINARY_LOGISTIC = _BINARY_LOGISTIC
+comptime POISSON = _POISSON
+comptime HUBER = _HUBER
+comptime QUANTILE = _QUANTILE
+comptime L1 = _L1
 
 # Marks a booster trained through `train_custom` in objective.mojo. It is not
 # a built-in objective: `train` and `train_gpu` reject it, because the
 # gradients come from a caller-supplied callable rather than from
 # `_fill_grad_hess`. Predictions for it are raw scores (no known link).
-comptime CUSTOM = 6
+comptime CUSTOM = _CUSTOM
 
 # 7 is LAMBDARANK, in ranking.mojo: it continues this one objective registry
 # but its gradients come from query groups rather than from
@@ -78,20 +112,22 @@ comptime CUSTOM = 6
 
 # The regression family LightGBM calls gamma, tweedie, mape, and fair, and
 # the continuous-label cross entropy it calls xentropy.
-comptime GAMMA = 8
-comptime TWEEDIE = 9
-comptime MAPE = 10
-comptime FAIR = 11
-comptime CROSS_ENTROPY = 12
+comptime GAMMA = _GAMMA
+comptime TWEEDIE = _TWEEDIE
+comptime MAPE = _MAPE
+comptime FAIR = _FAIR
+comptime CROSS_ENTROPY = _CROSS_ENTROPY
 
 # LightGBM's poisson_max_delta_step: the hessian is exp(raw + this), which
-# caps the Newton step for rows with tiny predicted means.
+# caps the Newton step for rows with tiny predicted means. This one is not
+# metadata and stays here: it is a term in the hessian, not a fact about the
+# objective a caller could ask for.
 comptime _POISSON_MAX_DELTA_STEP = 0.7
 
 # LightGBM's fair_c and tweedie_variance_power defaults, the value `alpha`
 # takes for FAIR and TWEEDIE when a caller does not set one.
-comptime DEFAULT_FAIR_C = 1.0
-comptime DEFAULT_TWEEDIE_VARIANCE_POWER = 1.5
+comptime DEFAULT_FAIR_C = _DEFAULT_FAIR_C
+comptime DEFAULT_TWEEDIE_VARIANCE_POWER = _DEFAULT_TWEEDIE_VARIANCE_POWER
 
 
 def _sign(x: Float64) -> Float64:
@@ -220,19 +256,12 @@ def _check_objective(
         for r in range(len(target)):
             if target[r] < 0.0 or target[r] > 1.0:
                 raise Error("cross entropy target values must be in [0, 1]")
-    if objective == HUBER and alpha <= 0.0:
-        raise Error("huber requires alpha > 0")
-    if objective == QUANTILE and (alpha <= 0.0 or alpha >= 1.0):
-        raise Error("quantile requires 0 < alpha < 1")
-    if objective == FAIR and alpha <= 0.0:
-        raise Error("fair requires alpha (fair_c) > 0")
-    if objective == TWEEDIE and (alpha <= 1.0 or alpha >= 2.0):
-        # Outside (1, 2) this is no longer the compound Poisson-gamma
-        # LightGBM's tweedie objective assumes: at 1 it is Poisson, at 2
-        # gamma, and the gradient below divides by neither exponent.
-        raise Error(
-            "tweedie requires 1 < alpha (tweedie_variance_power) < 2"
-        )
+    # The four scalar-parameter ranges, and their sentences, are
+    # `check_objective_param` in objective_registry.mojo, over the intervals
+    # `objective_param_domain` states. They used to be spelled out here as
+    # well; a caller that wants the bounds without a training run needs them
+    # as data, and two statements of a bound is one too many.
+    check_objective_param(objective, alpha)
 
 
 def _check_sample_weight(weights: List[Float64], n: Int) raises:
@@ -305,8 +334,12 @@ def objective_renews_leaves(objective: Int) -> Bool:
     LightGBM `RenewTreeOutput` rule: the objectives whose Newton step is
     uninformative because their hessian carries no curvature (it is the row
     weight itself), so the leaf value comes from a percentile of the
-    residuals instead. See `_renew_leaf_values`."""
-    return objective == QUANTILE or objective == L1 or objective == MAPE
+    residuals instead. See `_renew_leaf_values`.
+
+    The rule itself is in objective_registry.mojo, where
+    `objective_init_kind` also reads it; this is the name the boosting loop
+    and its callers have always used."""
+    return _objective_renews_leaves(objective)
 
 
 def renewal_alpha(objective: Int, alpha: Float64) -> Float64:
@@ -860,16 +893,23 @@ struct Booster(Copyable, Movable):
         CUSTOM this is the raw score, since the framework does not know the
         objective's link and the caller applies it. Every response-scale
         prediction goes through here, so the raw and response scales cannot
-        drift apart."""
-        if self.objective == BINARY_LOGISTIC or (
-            self.objective == CROSS_ENTROPY
-        ):
+        drift apart.
+
+        Which objective has which link is `objective_link` in
+        objective_registry.mojo. This function, `response_scale` in
+        custom_metric.mojo, and `response_for_objective` in gpu_predict.mojo
+        each used to carry the same table and agree by inspection; all three
+        now read it. A metric scoring one link while a prediction applies
+        another is the kind of disagreement that produces wrong numbers
+        rather than an error.
+
+        `LINK_SOFTMAX` cannot reach here: a `Booster` is single-output, and
+        multiclass raw scores go through `MulticlassBooster`, whose softmax
+        is over a whole row rather than one score."""
+        var link = objective_link(self.objective)
+        if link == LINK_SIGMOID:
             return _sigmoid(raw)
-        if (
-            self.objective == POISSON
-            or self.objective == GAMMA
-            or self.objective == TWEEDIE
-        ):
+        if link == LINK_EXP:
             return exp(raw)
         return raw
 
