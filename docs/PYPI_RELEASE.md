@@ -1,24 +1,23 @@
 # Publishing mojoboost to PyPI
 
 The exact steps to claim the name `mojoboost`, publish an artifact, and
-undo a bad one. Every step here is owner-only: it needs administrative
-access to the GitHub repository and to a PyPI account, and no step in it
-can be delegated to a contributor or to an agent.
+undo a bad one. Account enrollment and approval steps require the owner;
+repository preparation and read-only verification can be automated.
 
 ## Status
 
-Nothing in this document has been executed. There is no PyPI project named
-`mojoboost` owned by this repository, no TestPyPI project, no trusted
-publisher, no API token, and no git tag.
+As of 2026-08-14, pending trusted publishers for `mojoboost` are configured
+on TestPyPI and PyPI for `mojoboost-ml/mojoboost`, workflow
+`release-provenance.yml`, and environments `testpypi` and `pypi`
+respectively. The matching GitHub environments exist, are restricted by
+deployment branch policy, and the production `pypi` environment requires an
+approval from `ajhendel`. No API token is used.
 
-The release workflow does exist, as
-`.github/workflows/release-provenance.yml`, and it cannot run yet on
-purpose. It fails closed in three ways: every `uses:` is pinned to a
-`@REPLACE_WITH_SHA` placeholder rather than a ref, the build job needs a
-`[self-hosted, macos, arm64, metal]` runner that is not registered, and
-publication needs a `pypi` environment and a PyPI pending publisher that
-do not exist. The first two belong to the lane that owns that file. The
-third is this document, step 1.
+The release workflow exists at `.github/workflows/release-provenance.yml`,
+all third-party actions are pinned, and its self-hosted Apple-silicon Metal
+runner is registered. The normal CI run for the setup commit passed on both
+x86-64 and ARM Linux. The pending publishers have not been exercised yet, so
+neither index has a `mojoboost` project created by this repository.
 
 The version in the repository is 0.1.0 and no artifact of it has been
 published anywhere.
@@ -73,16 +72,10 @@ The order matters, and the two claims are deliberately separated.
 4. [Cut a production release](#5-the-production-release) only after the
    section 12 release gate passes.
 
-Step 1 can happen today and costs nothing. Steps 2 and 3 cannot yet: the
-release workflow is pinned to placeholder SHAs and needs a self-hosted
-Apple silicon runner with a Metal toolchain, neither of which is this
-document's to fix. Step 4 is further out still, because the release gate
-has open items and the macOS wheel target is `designed` rather than
-`validated` in the matrix.
-
-Do step 1 anyway, and do it before anything else. It is reversible, it
-requires no artifact, and the value of a pending publisher is entirely in
-having created it before the first upload rather than after.
+Step 1 is complete. Steps 2 and 3 are now mechanically available, but each is
+an external publication and must be started deliberately. Step 4 remains
+gated by the compatibility policy and by target validation in the platform
+matrix.
 
 ## 1. Bind the name: pending trusted publishers
 
