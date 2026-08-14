@@ -3,7 +3,17 @@
 Lane 04. Owned files: `src/mojoboost/gpu_multiclass_batch.mojo`,
 `src/mojoboost/hybrid_leaf_scheduler.mojo`,
 `src/mojoboost/apple_histogram_policy.mojo`, `src/mojoboost/gpu_tiling.mojo`,
-and this handoff. Nothing outside that list was edited.
+and this handoff.
+
+**Two files outside that list were edited, at the user's explicit
+direction:** `src/mojoboost/histogram_gpu.mojo` and
+`src/mojoboost/train_gpu.mojo`, both Task 01's. The user asked this lane to
+implement §7.2 -- the blocking gap that kept batched gradients from reaching
+the grower -- rather than leave it as a patch request. §7.2 records exactly
+what was added, what mechanism was chosen instead of the one originally
+requested, and why. Nothing else in those two files was changed; the existing
+sequential multiclass loop is byte-identical and the new path is unreachable
+without `MOJOBOOST_GPU_CLASS_BATCH`.
 
 **Nothing here was run.** No Mojo, no Pixi, no build, no test, no benchmark.
 Every statement below is from reading the source. No claim is made about
@@ -103,21 +113,30 @@ one at a time in both branches. In the device-gradient branch
 in `src/`; its kernels, its buffers, and its round guard were unreachable
 from any call path.
 
-*After.* Still no importer -- the trainer is Task 01's file -- but the module
-is now callable without a caller inventing policy:
+*After.* The module is reachable, and reached:
 
 - `apple_histogram_policy.plan_class_schedule(...)` returns a `ClassSchedule`
   holding both halves of the decision (the launch plan and the
   `ClassBatchPlan`), and its default is the sequential path.
-- `GpuClassBatch.for_plan(ctx, ..., schedule.batches)` allocates exactly what
-  the plan budgeted.
-- `MulticlassRoundGuard.note_batch(plan, b)` drives the round from the plan
-  and refuses out-of-order batches.
-- `GpuClassBatch.enqueue_level_histogram(...)` picks the kernel from the
-  level's `BatchEligibility` and takes its row tile from `plan_geometry`.
+- `GpuHistogramBuilder.class_schedule(n_classes, eligibility)` asks it from
+  the builder's own profile and shape (§7.2).
+- `_train_multiclass_gpu_rounds` calls that once per fit. If the schedule is
+  sequential -- the shipped default -- the existing loop runs unchanged and
+  nothing below happens. Otherwise it hands off to
+  `_train_multiclass_gpu_batched`.
+- That helper allocates `GpuClassBatch.for_plan(ctx, ..., schedule.batches)`,
+  drives the round with `MulticlassRoundGuard.note_batch(plan, b)` (which
+  refuses out-of-order batches), fills one batch's gradients at a time, and
+  copies each slot into the builder with `scatter_slot` /
+  `fill_batched_gradients` before `grow_tree_gpu`.
 
-§7.2 is the exact provider change Task 01 needs before the batched gradients
-can feed the existing grower.
+Trees are still appended in ascending `k` and tree `(i, k)` still lands at
+`i * n_classes + k`.
+
+Not yet reached: `GpuClassBatch.enqueue_level_histogram` and the two batched
+histogram kernels. Those need a grower that consumes a whole frontier level's
+histograms at once (§9 item 7). The batched path today shares the gradient
+fill and the magnitude readback, not the bin read.
 
 ### 3.3 Hybrid placement
 
@@ -300,6 +319,9 @@ mentions a cost says what it costs, not what it saves.
 
 ## 7. Cross-lane patch requests (exact)
 
+All still requests except §7.2, which the user directed this lane to
+implement; it is kept in place, rewritten as a record of what was done.
+
 ### 7.1 Task 01 -- make the plan the launch (`histogram_gpu.mojo`)
 
 The builder already computes a plan (`histogram_plan`, line 815) and already
@@ -326,83 +348,101 @@ the buffer it already has. The plan is given `self.part_capacity` as
 `max_partial_cells` and so should already satisfy this; the check is there
 because "should" is not "does".
 
-### 7.2 Task 01 -- let a batched gradient plane feed the grower (blocking)
+### 7.2 Task 01 -- let a batched gradient plane feed the grower (IMPLEMENTED)
 
-This is the one thing that stops multiclass batching from being connectable
-today, and it cannot be done from this lane.
+**This section was a request and is now a change.** The user directed this
+lane to implement it, so `histogram_gpu.mojo` and `train_gpu.mojo` -- Task
+01's files -- were edited. That is outside the ownership stated at the top of
+this handoff and is recorded here so Task 01 sees it rather than discovers
+it. Nothing else in either file was touched; in particular the existing
+sequential multiclass loop is byte-identical.
 
-`GpuClassBatch` holds gradients class-major, so slot `c`'s plane is a
-contiguous `Float32[n_rows]` starting at `grad_offset(c)` -- deliberately the
-same shape `GpuHistogramBuilder` already accumulates from. What is missing is
-a way to point the builder at it. `fill_softmax_gradients_device(state, k)`
-(train_gpu.mojo:1543) writes the builder's own buffer and there is no
-accessor that adopts an external one.
+**The mechanism is not the one this section originally proposed.** The
+request was pointer adoption -- `adopt_gradients` taking raw
+`MutPointer[Float32, ...]` at the batch's slot offset. It was not
+implemented, for two reasons found while writing it:
 
-Requested addition to `histogram_gpu.mojo`:
+1. No struct in `src/mojoboost` stores a pointer field. Holding one would
+   need `Optional[MutPointer[...]]` with an erased origin, a first-of-its-kind
+   construct in this package, and unverifiable without a build this lane may
+   not run.
+2. The builder owns its gradient buffers for the whole session and every
+   enqueue below reads them. Adopting a pointer into someone else's
+   allocation makes every later build depend on that allocation outliving the
+   builder -- a lifetime obligation the type system would not be carrying.
+
+What was implemented instead is a device-to-device slot copy, which mirrors
+the existing `fill_softmax_gradients_device` exactly and adds no new lifetime
+rule. Three additions:
 
 ```mojo
-def adopt_gradients[
-    grad_origin: MutOrigin, hess_origin: MutOrigin, //
-](
-    mut self,
-    grad: MutPointer[Float32, grad_origin],
-    hess: MutPointer[Float32, hess_origin],
-    g_scale: Float64,
-    h_scale: Float64,
-) raises:
-    """Accumulate from gradient and hessian planes this builder does not own,
-    at scales it did not derive. The planes must be `Float32[n_rows]` in row
-    order and must outlive every enqueue that follows."""
+# gpu_multiclass_batch.mojo (owned by this lane)
+def _scatter_slot_kernel(...)          # one row per thread, plane -> plane
+def GpuClassBatch.scatter_slot(
+    mut self, slot: Int,
+    mut grad_dst: DeviceBuffer[DType.float32],
+    mut hess_dst: DeviceBuffer[DType.float32],
+) raises
+
+# histogram_gpu.mojo (Task 01's file)
+def class_schedule(self, n_classes: Int, eligibility: BatchEligibility,
+                   requested_batch: Int = 0) raises -> ClassSchedule
+def fill_batched_gradients(mut self, mut batch: GpuClassBatch,
+                           slot: Int) raises
 ```
 
-with `self.g_scale`/`self.h_scale` set from the arguments and
-`has_gradients` set, so the existing enqueues read the batch's slot. Then a
-batched round is the existing loop with the per-class gradient fill and
-magnitude readback hoisted out:
+`fill_batched_gradients` is the same four statements as
+`fill_softmax_gradients_device`: the class's planes arrive in the builder's
+own buffers (here by copy rather than by a softmax kernel), both fixed-point
+scales are set from `batch.scale_of(slot)` / `batch.hess_scale_of(slot)`,
+`has_gradients` is set, and `round_epoch` advances so the histogram cache
+treats it as a new round's gradients. It refuses a batch whose `n_rows`
+disagrees with the builder's. `scatter_slot` refuses before `fill_gradients`
+and before `refresh_scales`, because a plane without the scale it was reduced
+at cannot be quantized.
+
+The copy costs one `Float32[n_rows]` read and write per class per round, on
+the device, on the queue both already share. That is the price of not
+introducing a pointer field; it is a stated cost, not a claimed saving.
+
+**The round loop.** `train_gpu.mojo` gained
+`_train_multiclass_gpu_batched`, called from `_train_multiclass_gpu_rounds`
+immediately after `state.init_raw(builder.ctx, base_scores)` and before the
+sequential loop:
 
 ```mojo
-# _train_multiclass_gpu_rounds, device_grads branch (train_gpu.mojo:1530)
-var schedule = plan_class_schedule(...)          # default: sequential
+var schedule = builder.class_schedule(
+    n_classes, BatchEligibility.deeper_node()
+)
 if not schedule.is_sequential():
-    var batch = GpuClassBatch.for_plan(builder.ctx, n, n_features, n_bins,
-                                       schedule.batches)
-    var guard = MulticlassRoundGuard(n_classes)
-    for i in range(params.n_estimators):
-        guard.open_round()
-        state.refresh_softmax(builder.ctx); guard.note_probs()
-        for b in range(schedule.batches.n_batches()):
-            guard.note_batch(schedule.batches, b)
-            batch.fill_gradients(state, schedule.batches.batch_begin(b),
-                                 schedule.batches.batch_count(b))
-            batch.refresh_scales(schedule.batches.batch_count(b))
-            for slot in range(schedule.batches.batch_count(b)):
-                var k = schedule.batches.class_at(b, slot)
-                builder.adopt_gradients(
-                    batch.grad_dev.unsafe_ptr() + batch.grad_offset(slot),
-                    batch.hess_dev.unsafe_ptr() + batch.grad_offset(slot),
-                    batch.scale_of(slot), batch.hess_scale_of(slot))
-                var tree = grow_tree_gpu(builder, params.tree, [],
-                                         i * n_classes + k, split_search)
-                guard.note_tree(k)
-                builder.update_raw_device(state, tree.value,
-                                          params.learning_rate, k)
-                guard.note_commit(k)
-                trees.append(tree^)                # still ascending k
-        guard.close_round()
+    return _train_multiclass_gpu_batched(
+        builder, life, state, n_classes, params,
+        base_scores^, schedule, split_search,
+    )
 ```
+
+`deeper_node()` and not `round_root()` because this path shares no bin read:
+the grower builds each class's histogram through the builder, one class at a
+time. What the batch buys here is the batched gradient fill and one magnitude
+readback per batch instead of `n_classes` of each.
+
+Since `plan_class_schedule`'s default is sequential (§6), the guard is false
+under the shipped configuration and the existing loop runs unchanged. The
+batched helper is reachable only with `MOJOBOOST_GPU_CLASS_BATCH` set.
 
 Ordering is preserved by construction: batches are contiguous ascending runs
-and slots within a batch are ascending, so `trees` is still appended in
-ascending `k` and tree `(i, k)` still lands at `i * n_classes + k`.
-`guard.abandon_round()` is the call for the no-progress path that drops the
-round's trees.
+and slots within a batch are ascending, so `trees` is appended in ascending
+`k` and tree `(i, k)` still lands at `i * n_classes + k`. The helper mirrors
+the sequential loop's bookkeeping rather than inventing its own -- same
+`life.begin_round()`/`begin_tree()`/`end_tree()`/`end_round()` calls, same
+`MulticlassRoundGuard` sequence (Task 01 had already wired the guard into
+both existing loops, including `close_round` rather than `abandon_round` on
+the no-progress path), and the same no-progress truncation and `break`.
 
-What this form does **not** yet get is the shared bin read: the grower builds
-each class's histogram through the builder, one class at a time. It gets the
-batched gradient fill and the one magnitude readback per batch instead of
-`n_classes` of each. Driving `GpuClassBatch.enqueue_level_histogram` from the
-grower needs a grower that can consume `batch.histograms(k_count)` for a
-whole frontier level, which is a larger change and is not requested here.
+What this still does **not** get is the shared bin read. Driving
+`GpuClassBatch.enqueue_level_histogram` from the grower needs a grower that
+consumes `batch.histograms(k_count)` for a whole frontier level; that is a
+larger change and is still not requested here (§9 item 7).
 
 ### 7.3 Task 01 -- exports (`__init__.mojo`)
 
@@ -508,9 +548,25 @@ guard exists to enforce exactly that.
 
 **No public Python or C API effect.** None of these modules is exported to
 Python today, and this lane requested no export (§7.3 is a request to Task
-01, not an edit).
+01, not an edit). The §7.2 implementation adds no Python-visible surface
+either: `class_schedule` and `fill_batched_gradients` are Mojo methods on a
+type that is not bound, and `_train_multiclass_gpu_batched` is private.
 
-**Native API changes, all additive except two:**
+**Native API changes in Task 01's files (§7.2), all additive:**
+
+- `GpuHistogramBuilder` gained two methods, `class_schedule` and
+  `fill_batched_gradients`. No existing method changed signature or body.
+- `train_gpu.mojo` gained one private function,
+  `_train_multiclass_gpu_batched`, and one early-return guard in
+  `_train_multiclass_gpu_rounds` that is false under the shipped defaults.
+- Four imports were added to `train_gpu.mojo` (`ClassSchedule`,
+  `GpuClassBatch`, `MulticlassRoundGuard`, `BatchEligibility`;
+  `GpuObjectiveState` was made explicit) and four to `histogram_gpu.mojo`.
+  This makes `gpu_multiclass_batch` and `hybrid_leaf_scheduler`'s sibling
+  `apple_histogram_policy` importers of the trainer's dependency set for the
+  first time; the direction is still strictly upward and there is no cycle.
+
+**Native API changes in the owned files, all additive except two:**
 
 - `_batch_hist_shared_kernel` gained two trailing parameters (`slot_begin`,
   `write_counts`). It is a private kernel with one caller, both in this file.
@@ -531,14 +587,17 @@ a difference.
 
 ## 9. Remaining disconnections
 
-1. **The trainer still calls none of it.** `train_gpu.mojo` imports
-   `DeviceCaps` and nothing else from this layer. §7.1 and §7.2 are the
-   patches; both are Task 01's to apply.
+1. **The trainer calls the multiclass half, not the hybrid half.**
+   `train_gpu.mojo` now reaches `apple_histogram_policy` and
+   `gpu_multiclass_batch` through §7.2. `hybrid_leaf_scheduler` still has no
+   importer anywhere.
 2. **The launch still comes from `self.tiling`, not from the plan.** The
-   ladder decides batching yes/no (histogram_gpu.mojo:1035) and nothing
-   else. §7.1.
-3. **Batched gradients cannot reach the grower.** No accessor adopts an
-   external gradient plane. §7.2. This is the blocking one.
+   ladder decides batching yes/no (histogram_gpu.mojo:1035) and, now, the
+   class schedule. It still does not decide a launch. §7.1 is unapplied.
+3. **Batched gradients now reach the grower, by copy.** §7.2 is
+   implemented. What remains is that the copy exists at all: a grower that
+   accumulated directly from the batch's slot would not need it, and that is
+   the same level-wide grower item 7 asks for.
 4. **The hybrid scheduler has no cost model and cannot get one here.**
    `HybridCosts.unmeasured()` declines every leaf, by design, and a measured
    model needs a benchmark this lane may not write or run. The reuse arm is
@@ -553,7 +612,10 @@ a difference.
 7. **Shared bin reads at a round's root need a level-wide grower.** §7.2's
    integration gets the batched gradient fill and the single magnitude
    readback; the shared histogram launch needs a grower that consumes a whole
-   frontier level's histograms at once.
+   frontier level's histograms at once. This is why the batched path asks for
+   `BatchEligibility.deeper_node()` rather than `round_root()`: it would be
+   claiming a sharing it does not perform. `enqueue_level_histogram`,
+   `enqueue_shared_groups`, and both batched kernels remain unreached.
 8. **No emitter for `bench/apple/histogram_plan.json`.** That file is
    hand-derived and says so. This lane's refactor is argued to be
    numerically identical for `derive_tiling` and for
@@ -575,7 +637,25 @@ a difference.
   scale read, and both output planes were re-indexed by the absolute slot
   while threadgroup memory stays indexed by the group-local class. An error
   there would silently write one class's histogram into another's plane.
-  Nothing exercises it yet; it is unreachable until §7.2 lands.
+  Nothing exercises it: §7.2 landed without reaching the batched kernels (§9
+  item 7), so this stays unreached.
+- **This lane edited two files it does not own.** `histogram_gpu.mojo` and
+  `train_gpu.mojo` are Task 01's, and the edits were made at the user's
+  direction, not by agreement with that lane. If Task 01 has the same files
+  open this is a merge conflict waiting to happen, and the resolution should
+  favor Task 01's version of everything outside the two new methods, the new
+  private helper, and the imports listed in §8.
+- **`_scatter_slot_kernel` is new device code with no test.** It is the
+  simplest kernel in the file -- one row per thread, two loads, two stores,
+  bounds-checked -- but "simplest" is not "checked". An off-by-`n_rows` in
+  the slot base would feed the grower a neighboring class's gradients, and
+  the result would be a silently worse model rather than a crash. §11 lists
+  what would catch it.
+- **The copy is a per-class cost the sequential path does not pay.** Batching
+  trades `n_classes` softmax gradient fills and magnitude readbacks for one
+  per batch, and pays back one `Float32[n_rows]` device copy per class.
+  Whether that trade is positive is a measurement nobody has taken, which is
+  one more reason the schedule defaults to sequential.
 - **The count plane is written by the first group only.** If a caller ever
   issues the groups of one batch across two zeroing passes, counts would be
   lost rather than doubled. `enqueue_shared_groups` owns both the zeroing and
@@ -626,8 +706,27 @@ UNRUN  the emitter named in bench/apple/histogram_plan.json's `verification`
        block, diffed against the hand-derived table. It is the only thing
        that would confirm the shape level's numbers survived the fusion.
 
+UNRUN  pixi run mojo run tests/test_train_gpu.mojo  (or whichever existing
+       file covers the multiclass GPU path -- this lane did not open the
+       tests directory)
+       The shipped defaults must be untouched by §7.2: plan_class_schedule
+       returns sequential, the guard in _train_multiclass_gpu_rounds is
+       false, and the existing loop runs. This is the regression check for
+       editing two files this lane does not own.
+
+UNRUN  the same file with MOJOBOOST_GPU_CLASS_BATCH=2, on a device, on a
+       small softmax fit, compared tree-for-tree against the same fit with
+       the variable unset. Equality is the claim §7.2 makes and does not
+       check: the batched softmax kernel was read to have the same arithmetic
+       in the same order as the sequential one, and the magnitude reduction
+       the same grid and the same ascending Float64 host fold, so the scales
+       and therefore the fixed-point histograms should be identical. That
+       argument is what would be under test, along with _scatter_slot_kernel's
+       slot base.
+
 UNRUN  a bit-comparison of a batched shared histogram against the sequential
        one, at batch sizes 2, 4, and 8 with per_block 4, on hardware. This is
        what would check the slot_begin addressing and the once-only count
-       plane. It needs §7.2 first, and it needs a device.
+       plane. It needs a level-wide grower (§9 item 7) first, which §7.2 did
+       not build, and it needs a device.
 ```

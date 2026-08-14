@@ -244,7 +244,8 @@ def frame_categories(X):
         return {}
     out = {}
     for i in range(len(columns)):
-        categories = getattr(getattr(iloc[:, i], "cat", None), "categories", None)
+        cat = getattr(iloc[:, i], "cat", None)
+        categories = getattr(cat, "categories", None)
         if categories is None:
             continue
         out[i] = list(categories)

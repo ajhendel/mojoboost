@@ -55,6 +55,7 @@ from .efb import (
     EFB_NONE,
     FeatureBundling,
     columns_for_features,
+    expand_bundled_histogram,
 )
 from .histogram import Histogram, subtract_histogram
 from .histogram_sparse import (
@@ -287,6 +288,19 @@ struct SparseBundling(Copyable, Movable):
             raise Error("bundling view and matrix disagree on column count")
         if self.active and self.plan.n_rows != data.n_rows:
             raise Error("bundling plan and matrix disagree on n_rows")
+
+    def source_bins(self, data: SparseBinnedMatrix) -> Int:
+        """The bin count of the matrix the *original* features were binned
+        into.
+
+        A bundled matrix is only as wide as the widest bundle, so its
+        `n_bins` is not the width a second matrix binned by the same mapper
+        would have. A trainer comparing a validation matrix against its
+        training matrix has to compare against this instead.
+        """
+        if not self.active:
+            return data.n_bins
+        return self.plan.n_bins
 
     def column(self, feature: Int) -> Int:
         """The matrix column `feature`'s entries live in."""

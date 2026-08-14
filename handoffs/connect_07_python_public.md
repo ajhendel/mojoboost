@@ -111,12 +111,54 @@ Before: `_Base._resolve_device` did its own `_DEVICES` spelling check, then
 called `_mojoboost.resolve_device` directly and wrapped the failure in
 `RuntimeError`.
 
-After: it builds a `device_selection.Workload` from the shape and calls
+After: it builds a `device_selection.Workload` and calls
 `device_selection.select_device`, which is the one Python door to the
 native policy. The refusal is now `DeviceUnavailableError`, a
 `RuntimeError` subclass carrying the identical native message plus the
 report. The direct `resolve_device` call is kept as the fallback for a
 build whose `device_selection` cannot be imported at all.
+
+The workload is no longer shape-only. `decide_device` is bound (it landed
+in `bindings/_mojoboost.mojo` while this lane was open), so the extra
+fields now decide rather than sit inert, and all four fit paths declare
+them:
+
+| Call site | Declares |
+|---|---|
+| `MojoBoostRegressor.fit`, dense | `objective_code`, `categorical`, `has_eval_set` |
+| `MojoBoostClassifier.fit`, dense | `objective_code` (binary only, see below), `categorical`, `has_eval_set` |
+| `MojoBoostRanker.fit` | `objective_code=_LAMBDARANK`, `categorical`, `has_eval_set` |
+| `_Base._sparse_fit_params`, both estimators | `sparse=True`, `objective_code`, `categorical` |
+
+`max_bin` and `has_missing` are read off the estimator inside
+`_resolve_device`, so every call carries them. `MojoBoostClassifier`
+gained `_objective_code(n_classes=None)`, which answers `_BINARY_LOGISTIC`
+for two classes and `None` (undeclared) for softmax, because softmax is
+not in the device vocabulary at all: it is its own trainer and what the
+native policy gates on there is `n_outputs`. `MojoBoostRanker` gained
+`_objective_code()` returning `_LAMBDARANK`. Undeclared is a reported gap
+(`WARN_INCOMPLETE_REQUEST`), never an assumed value; that is
+`OBJECTIVE_UNSPECIFIED` in `src/mojoboost/device_policy.mojo`.
+
+The four Python CPU-only refusals (eval set, sparse, custom objective,
+lambdarank) each have an exact native counterpart, and the native one now
+fires first. They are kept as backstops behind one helper,
+`_Base._gpu_unsupported`, whose docstring names the block each mirrors:
+
+| Python backstop | Native block that now owns it |
+|---|---|
+| `_fit_with_metrics` | `BLOCK_VALIDATION_SET` |
+| `_sparse_fit_params` | `BLOCK_SPARSE_INPUT` |
+| `_fit_custom` | `BLOCK_CUSTOM_OBJECTIVE` |
+| `MojoBoostRanker.fit` | `BLOCK_RANKING_OBJECTIVE` |
+
+They are not dead code and must not be deleted with the native capability
+work. A build that exposes `resolve_device` but not `decide_device` is the
+`CONTRACT_NARROW` case `device_selection` still supports, and its answer
+is shape-only, so an explicit `device="gpu"` would otherwise reach a
+trainer with no kernel for the request. Against a full-contract build they
+never fire, because `device` arrived already refused or already resolved
+to `"cpu"`.
 
 ### 2.4 Metric registry
 
@@ -169,6 +211,17 @@ applied.
 10. **`_public_api_plan.py` bumped to version 2**, with
     `CURRENT_TOP_LEVEL` matching the real `__all__` and the
     `inspection` / `device_selection` placeholders replaced.
+11. **The fit workloads are complete**, not shape-only: objective code,
+    sparsity, categorical presence, bin count, missing-value handling, and
+    the presence of an eval set all reach
+    `src/mojoboost/device_policy.mojo` now that `decide_device` is bound
+    (section 2.3).
+12. **`MojoBoostClassifier._objective_code` and
+    `MojoBoostRanker._objective_code`** added, so all three estimators can
+    name their objective to the policy. The regressor already had one.
+13. **The four CPU-only guards became documented backstops** behind
+    `_Base._gpu_unsupported`, each naming the native block that now owns
+    the decision.
 
 ---
 
@@ -180,52 +233,57 @@ applied.
 | A Python-side device *resolution* for prediction (an earlier draft of this lane resolved through `_resolve_device` before calling) | Removed before it landed. Prediction sends the requested name and Mojo resolves; two resolvers would have double-gated `auto`. |
 | `_eval`'s mirrored `_METRICS` / `_ALIASES` / `_DEFAULTS` / `_TASK_DEFAULTS` | Quarantined, not deleted. They stay behind the marked block and `_CompatTable`, which is the fallback while the registry is unbound. `handoffs/migration_21_objective_metric_registry.md` §5 lists them as deletable *after* wiring; this lane wired the reader, not the deletion. |
 | `__init__.py`'s `_SQUARED_ERROR.._CROSS_ENTROPY`, `_UNIMPLEMENTED_OBJECTIVES`, `_OBJECTIVES`, `_OBJECTIVE_PARAM` | Left alone. Same handoff lists them as deletable after `registry_objectives` / `registry_objective_unimplemented` are bound; they are load-bearing today and deleting them now would break every fit. Section 6 carries the request. |
+| Four separately worded `if device != "cpu": raise RuntimeError(...)` blocks in `__init__.py` | Fused into `_Base._gpu_unsupported`, and demoted: each is now a backstop for the narrow contract, with the native block code that decides written next to it. Not deleted, for the reason in section 2.3. |
+| The sparse fit's `if self.device == "gpu"` check, which read the raw attribute and so missed the `device_type` alias | Fused: `_sparse_fit_params` asks `_resolve_device(..., sparse=True)`, which resolves the alias and lets `BLOCK_SPARSE_INPUT` write the refusal. |
 | `inspection.py`'s text parser | Not this lane's file. Untouched. |
 
 ---
 
 ## 5. Remaining disconnections
 
-1. **The registry bindings are written but not registered.**
-   `bindings/objective_bindings.mojo` defines `registry_objectives`,
-   `registry_objective_aliases`, `registry_objective_unimplemented`,
-   `registry_metrics`, `registry_metric_aliases`, `registry_vocabulary`,
-   `objective_code_of_name`, `metric_code_of_name`. None appears in the
-   `def_function` block of `bindings/_mojoboost.mojo`, and that file does
-   not import the module. So `_eval._native_snapshot()` returns `None` and
-   the mirror runs. Field layouts were checked against
-   `_objective_record` and `registry_metrics` line by line and match.
-2. **The inspection bindings are written but not registered.** Same for
-   `bindings/inspection_bindings.mojo` (`dump_model`, `objective_code`,
-   `split_values`, `dump_raw_scores`, `dump_leaf_index`, and the multiclass
-   forms). `inspection.py` already prefers them, so `objective_` costs a
-   `model_to_string()` round trip until they are bound.
-3. **The built extension predates the batch entry points.**
-   `python/mojoboost/_mojoboost.so` is older than the `predict_batch`
-   registration, so on the artifact currently on disk every `device=`
-   other than `"cpu"` raises `_NO_DEVICE_PREDICT`. That is the fallback
-   behaving correctly, not a defect, and it clears on a rebuild.
-4. **Validation and early stopping are still CPU-only.**
-   `_fit_with_metrics` raises for `device != "cpu"`. The
+Three items that stood here when this handoff was first written are now
+resolved and are recorded as such rather than deleted, because other
+handoffs point at them. The registry bindings, the inspection bindings,
+and `decide_device` were all registered in `bindings/_mojoboost.mojo` by
+the bindings lane while this lane was open (section 6a). So
+`_eval._native_snapshot()` now finds all four hooks, `inspection.objective_of`
+now takes the `objective_code` hook instead of a `model_to_string()` round
+trip, and the fit workloads are complete (section 2.3). None of that is
+asserted as working: it is what the code paths select, unbuilt and untested
+here.
+
+What remains:
+
+1. **The built extension may predate these entry points.**
+   `python/mojoboost/_mojoboost.so` on disk was not rebuilt by this lane,
+   so on that artifact `predict_batch` and the registry hooks may be
+   absent and every `device=` other than `"cpu"` raises
+   `_NO_DEVICE_PREDICT` while `_eval` runs the mirror. That is the
+   fallback behaving correctly, not a defect, and it clears on a rebuild
+   (`bindings/build.sh`, UNRUN, section 13).
+2. **Validation and early stopping still *train* CPU-only, and now the
+   native policy is what says so.** `BLOCK_VALIDATION_SET` in
+   `src/mojoboost/device_policy.mojo` refuses `device="gpu"` with an eval
+   set; `_fit_with_metrics` keeps the same refusal as a narrow-contract
+   backstop. This is a missing capability, not a missing connection. The
    `gpu_validation_open` / `_reset` / `_accumulate` / `_metric` / `_raw`
    entry points exist and are registered, but they are a scoped handle for
    use *inside* a training loop, and the loop is
-   `src/mojoboost/custom_metric.mojo`, which has no device parameter and is
-   driven end to end by one `fit_with_metrics` call. Python cannot
-   interleave from outside, so the guard stays. Section 6 carries the
-   request.
-5. **`pred_contrib` has no device path.** There is no
+   `src/mojoboost/custom_metric.mojo`, which has no device parameter and
+   is driven end to end by one `fit_with_metrics` call. Python cannot
+   interleave from outside. Section 6c carries the request, and lifting it
+   is a native change plus the deletion of one Python backstop, in that
+   order.
+3. **`pred_contrib` has no device path.** There is no
    `predict_contrib_batch`. An explicit `device="gpu"` is refused by
    `_refuse_device`; `"auto"` runs on the CPU, which is where it would
    resolve anyway.
-6. **The fit workloads are shape-only.** `_resolve_device` builds
-   `Workload(n_rows, n_features, n_classes=n_outputs)` and not the full
-   one `handoffs/migration_20_device_policy.md` §2b describes. Two reasons:
-   `decide_device` is unbound, so the extra fields would be inert; and
-   `_objective_code()` exists on `MojoBoostRegressor` only, so the
-   classifier and ranker call sites need their own spelling first. The
-   `workload=` parameter is on `_resolve_device` ready for it.
-7. **`mojoboost.cv` shadows the module.** By decision, recorded in
+4. **The sparse fit still passes `"cpu"` into `_params`** rather than the
+   resolved name. That is not a gap: the resolution above it can only
+   return `"cpu"` or raise, and the literal is what the CSC trainers read.
+   It is listed so that whoever adds a sparse GPU kernel knows the string
+   is there.
+5. **`mojoboost.cv` shadows the module.** By decision, recorded in
    `_public_api_plan.NAME_COLLISIONS`. `import mojoboost.cv as m` binds the
    function. The clean fix is renaming `cv.py` to `engine.py`, which needs
    a lane owning `cv.py` and `python/tests/parallel/test_cv.py`.
@@ -234,9 +292,18 @@ applied.
 
 ## 6. Cross-lane patch requests, exact
 
-### 6a. To the bindings lane (owner of `bindings/_mojoboost.mojo`)
+### 6a. To the bindings lane. **LANDED, no action left**
 
-Register the two modules that are already written. In the import block:
+This request was written when `bindings/_mojoboost.mojo` imported none of
+these modules. It now imports `dataset_bindings`, `basic_bindings`,
+`distributed_bindings`, `inspection_bindings`, and `objective_bindings`,
+and registers every entry point below plus `decide_device`,
+`objective_code_of_name`, and the `dataset_*` family. The patch is kept
+verbatim only as the record of what was asked for; do not apply it again.
+What it says about *behavior* is still the thing to read, and it is at the
+bottom of this subsection.
+
+The original request follows. In the import block:
 
 ```mojo
 from objective_bindings import (
@@ -285,11 +352,11 @@ m.def_function[dump_leaf_index]("dump_leaf_index")
 m.def_function[dump_leaf_index_multiclass]("dump_leaf_index_multiclass")
 ```
 
-`bindings/dataset_bindings.mojo` is unregistered too (`dataset_create_csc`,
+`bindings/dataset_bindings.mojo` was unregistered too (`dataset_create_csc`,
 `dataset_subset`, `dataset_metadata`, `dataset_field`,
-`dataset_bin_upper_bounds`, and the rest). Nothing in this lane's files
-reads it, so it is noted rather than requested; whichever lane owns
-`Dataset`'s Python surface should say what it needs.
+`dataset_bin_upper_bounds`, and the rest); it is registered now. Nothing in
+this lane's files reads it, so it was noted rather than requested;
+whichever lane owns `Dataset`'s Python surface should say what it needs.
 
 Nothing in Python changes when this lands. `_eval._selected()` starts
 returning `_NativeTable`, `inspection.objective_of` starts using the
@@ -322,7 +389,14 @@ that changing them is a knowing change and not a silent one:
 
 ### 6c. To the validation lane (`src/mojoboost/custom_metric.mojo` + bindings)
 
-To lift the CPU-only guard on `fit(eval_set=..., device=...)`:
+Still open, and now purely a capability request. The *decision* moved
+native when `decide_device` was bound: `BLOCK_VALIDATION_SET` is what
+refuses `device="gpu"` with an eval set, because
+`_resolve_device(..., has_eval_set=True)` declares it. What is missing is
+the ability to score validation metrics on a device at all, which lives in
+the file below and cannot be reached from Python.
+
+To lift it, in this order:
 
 1. `train_with_callbacks` (and the multiclass and ranker forms) take a
    device code and, for a device run, replace `_update_valid_raw` with the
@@ -332,31 +406,43 @@ To lift the CPU-only guard on `fit(eval_set=..., device=...)`:
 2. `fit_with_metrics` / `fit_multiclass_with_metrics` /
    `fit_ranker_with_metrics` read `params["device"]`, which the estimator
    already puts there (`_Base._params` sets `"device"`).
-3. Then, in `python/mojoboost/__init__.py`, delete exactly this, in
-   `_fit_with_metrics`:
+3. Remove the `BLOCK_VALIDATION_SET` gate in
+   `src/mojoboost/device_policy.mojo`, which is the refusal users
+   actually meet.
+4. Then, and only then, in `python/mojoboost/__init__.py`, delete exactly
+   this, in `_fit_with_metrics`:
 
 ```python
-        if device != "cpu":
-            raise RuntimeError(
-                "validation metrics are scored on the CPU; use device='cpu' "
-                "or device='auto'"
-            )
+        # Backstop; BLOCK_VALIDATION_SET is what refuses this on a build
+        # whose native policy can be asked. See `_gpu_unsupported`.
+        self._gpu_unsupported(
+            device, "validation metrics are scored on the CPU"
+        )
 ```
 
    and the "Validation is scored on the CPU, so `device="gpu"` with an
    `eval_set` raises rather than falling back" sentence in the module
-   docstring. Do not delete it before a test asserts the device and host
+   docstring. Leave `_gpu_unsupported` itself and its three other callers
+   alone. Do not delete it before a test asserts the device and host
    metric histories agree to the documented tolerance: the two differ at
    Float32 precision and early stopping compares a metric against its own
    running best, so a mixed history is not merely imprecise.
 
-### 6d. To the device policy lane
+### 6d. To the device policy lane. **Python side done**
 
-When `decide_device` is bound, `_resolve_device`'s `workload=` parameter is
-the seam for §2b's full workloads. The three call sites are
-`MojoBoostRegressor.fit`, `MojoBoostClassifier.fit`, and
-`MojoBoostRanker.fit`; each needs an objective code, and only the
-regressor has `_objective_code()` today.
+`_resolve_device` now sends the full workload from all four fit paths
+(section 2.3), which is `handoffs/migration_20_device_policy.md` §2b
+applied. Two things to know, neither a request:
+
+- The classifier declares an objective code for binary only. Softmax
+  passes `objective_code=None`, which crosses as `OBJECTIVE_UNSPECIFIED`
+  and carries `WARN_INCOMPLETE_REQUEST`. If a multiclass objective code
+  is ever added to the device vocabulary, `MojoBoostClassifier._objective_code`
+  is the one place to say so.
+- `_NarrowNativePolicy` is still reachable and still needed. Deleting it,
+  or the `_gpu_unsupported` backstops that cover it, is a decision to stop
+  supporting a build that has `resolve_device` without `decide_device`.
+  Make it deliberately, in one change, in both files.
 
 ### 6e. To the documentation lane
 

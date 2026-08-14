@@ -78,10 +78,11 @@ Read this before touching `docs/LIGHTGBM_PARITY.md`.
 
 - mojoboost does **not** implement unbiased LambdaRank. The code exists; the
   evidence does not.
-- `lambdarank_position_bias_regularization` stays `deferred` (contract line
-  ~421). `Dataset.position` stays `deferred` (contract line ~295).
-  `label_gain` stays `different` (line ~420). `eval_at` stays `partial`
-  (line ~432).
+- `lambdarank_position_bias_regularization` stays `deferred`.
+  `Dataset.position` stays `deferred`. `label_gain` stays `different`.
+  `eval_at` stays `partial`. (*Rows, not line numbers.* Find each by its
+  leading `` `name` `` cell in `docs/LIGHTGBM_PARITY.md`; the file's line
+  numbers moved while this handoff was being written.)
 - `ranking_advanced.mojo` is exported from nothing. `tools/check_parity.py`
   check 7 resolves *public symbols*, and a module exported by nobody
   resolves to nothing, which is the correct answer: written, not delivered.
@@ -205,7 +206,8 @@ test for the fallback.
 **Dependency:** patch 1.
 
 **Why.** LightGBM's `Dataset.position` is the field that carries position
-ids, and `docs/LIGHTGBM_PARITY.md` line ~295 records it as
+ids, and the `` `Dataset.position` `` row of `docs/LIGHTGBM_PARITY.md`
+records it as
 `deferred - needs unbiased LambdaRank`. It is the same shape as `group`: a
 column supplied at construction, validated against `n_rows` there, and read
 back but never mutated.
@@ -286,7 +288,7 @@ dataset trains, that `position` reads back, and that `position` without
 
 **Owner files:** `src/mojoboost/boosting.mojo`, `python/mojoboost/basic.py`
 **Target symbols:** `train_more` (Mojo), `Booster._require_trainable`
-(Python, `basic.py:776`)
+(Python)
 **Dependency:** patch 2.
 
 **Why.** The position biases are training state that no model file carries.
@@ -295,8 +297,8 @@ against a correction the earlier rounds already applied - the trees are then
 double-corrected and nothing raises. `docs/RANKING_ADVANCED.md` section 2
 has the argument.
 
-**Python.** `basic.py:784` already raises `NotImplementedError` for
-`_eval.RANKING`, so **nothing needs to change today**. When patch 1 of the
+**Python.** The `_eval.RANKING` branch inside `Booster._require_trainable`
+already raises `NotImplementedError`, so **nothing needs to change today**. When patch 1 of the
 *task 15* handoff lands (`train_ranker_more`, which removes that branch),
 the branch must be replaced rather than deleted:
 
@@ -340,7 +342,6 @@ refuses `update()`.
 
 **Owner file:** `src/mojoboost/distributed.mojo`
 **Target symbol:** new `partition_rows_at`, beside `partition_rows`
-(`distributed.mojo:124`)
 **Dependency:** none.
 
 **Why.** `partition_rows` cuts at `r * n_rows // W`, which lands inside a
@@ -430,7 +431,7 @@ still passing after the refactor.
 ## Patch 5 - parameter names in `params.mojo`
 
 **Owner file:** `src/mojoboost/params.mojo`
-**Target symbol:** `_MOJO_API_ONLY` (`params.mojo:86`)
+**Target symbol:** `_MOJO_API_ONLY` (in `src/mojoboost/params.mojo`)
 **Dependency:** patches 1, 2.
 
 **Why.** `label_gain`, `sigmoid`, `eval_at`, and
@@ -452,7 +453,8 @@ already reports the right thing for anything in `_MOJO_API_ONLY`.
 
 **Errors.** A user writing
 `objective=lambdarank lambdarank_position_bias_regularization=0.01` still
-hits the existing `lambdarank` refusal first (`params.mojo:176`), which is
+hits the existing `if name == "lambdarank"` refusal in `params.mojo` first,
+which is
 correct and should not be softened.
 
 **Fallback / serialization / public API effect:** none. This patch only
@@ -467,8 +469,8 @@ is `True`.
 ## Patch 6 - `eval_at` as a list in the registry
 
 **Owner file:** `src/mojoboost/objective_registry.mojo`
-**Target symbols:** `metric_needs` (~line 943), and the `NEEDS_CUTOFF`
-documentation
+**Target symbols:** `metric_needs`, and the `comptime NEEDS_CUTOFF = 8`
+docstring
 **Dependency:** none, but pointless before patch 7.
 
 **Why.** `metric_needs(METRIC_NDCG)` returns `NEEDS_GROUPS | NEEDS_CUTOFF`
@@ -477,8 +479,8 @@ in one pass, which is what LightGBM's `eval_at` means. The flag's *meaning*
 needs to widen; its *value* must not change.
 
 **Change.** No new bit and no renumbering - `NEEDS_CUTOFF` crosses the
-Python boundary as an integer. Only the comment at `objective_registry.mojo`
-line ~205 changes, from "a cutoff" to:
+Python boundary as an integer. Only the docstring under
+`comptime NEEDS_CUTOFF = 8` changes, from "a cutoff" to:
 
 ```mojo
 comptime NEEDS_CUTOFF = 8
@@ -703,7 +705,7 @@ to the existing note that "query boundaries are a property of the training
 data, not of the fitted model".
 
 **Public API effect.** Four new constructor parameters and one new `fit`
-argument. `docs/LIGHTGBM_PARITY.md` line ~413 (`sigmoid`) is the row that
+argument. The `` `sigmoid` `` row of `docs/LIGHTGBM_PARITY.md` is the row that
 lists the ranker's constructor parameters; it does not change status, only
 its note.
 
@@ -716,7 +718,7 @@ its note.
 ## Patch 9 - point the Python ranking folds at `query_folds`
 
 **Owner file:** `python/mojoboost/cv.py`
-**Target symbols:** `_chunk_folds` / `_rows_of_queries` (lines ~286-395)
+**Target symbols:** `_chunk_folds` / `_rows_of_queries`
 **Dependency:** patches 7, 8. **Optional** - `cv.py` is correct today.
 
 **Why.** `cv.py` already splits ranking folds on whole queries, in Python,
@@ -757,20 +759,21 @@ unchanged and still passing.
 **Dependency:** **V5 must exist and pass.** Everything else is secondary.
 
 **Do not touch these rows until then.** For the record, what each becomes
-once the evidence exists:
+once the evidence exists. *Rows, not line numbers* - find each by its
+leading `` `name` `` cell, since this file's line numbers move every round:
 
-| Row | Line | Today | After V5 passes |
-| --- | --- | --- | --- |
-| `lambdarank_position_bias_regularization` | ~421 | `deferred` - "Part of unbiased LambdaRank, which is out of v1" | `supported`, citing `src/mojoboost/ranking_advanced.mojo` and the differential bench |
-| `Dataset.position` | ~295 | `deferred` - "Needs unbiased LambdaRank, task 12" | `supported`, citing `src/mojoboost/trainset.mojo` |
-| `label_gain` | ~420 | `different` - fixed at `2^i - 1` | `partial`: a custom vector is accepted, with the nondecreasing and `gains[0] == 0` rules stated as intentional differences |
-| `eval_at` | ~432 | `partial` - a single cutoff | `supported` if patch 8 lands with the list |
-| `rank_xendcg` | ~472 | `different` | **unchanged.** This lane did not implement it, and `params.mojo:218` should keep saying so |
+| Row | Today | After V5 passes |
+| --- | --- | --- |
+| `lambdarank_position_bias_regularization` | `deferred` - "Part of unbiased LambdaRank, which is out of v1" | `supported`, citing `src/mojoboost/ranking_advanced.mojo` and the differential bench |
+| `Dataset.position` | `deferred` - "Needs unbiased LambdaRank, task 12" | `supported`, citing `src/mojoboost/trainset.mojo` |
+| `label_gain` | `different` - fixed at `2^i - 1` | `partial`: a custom vector is accepted, with the nondecreasing and `gains[0] == 0` rules stated as intentional differences |
+| `eval_at` | `partial` - a single cutoff | `supported` if patch 8 lands with the list |
+| `rank_xendcg` | `different` | **unchanged.** This lane did not implement it, and the `if name == "rank_xendcg"` branch in `params.mojo` should keep saying so |
 
 **`tools/check_parity.py` interactions, both of which will bite:**
 
-- `WATCHES["Dataset.position"] = ["pymethod:Dataset.position"]`
-  (`check_parity.py:479`). Check 7 resolves that name; patch 8 does not add
+- `WATCHES["Dataset.position"] = ["pymethod:Dataset.position"]` in
+  `tools/check_parity.py`. Check 7 resolves that name; patch 8 does not add
   a `Dataset.position` *method*, so the watch will keep resolving to nothing
   and the row will keep looking correctly deferred. When the row is upgraded,
   the watch must move out of the deferred set, or check 7 will contradict
@@ -809,11 +812,11 @@ from .ranking_advanced import (
 
 ## Appendix - things deliberately not done
 
-- **`rank_xendcg`.** Out of scope, and `params.mojo:218` reports it by name
-  with a correct reason. Adding it is a separate objective, not a variant of
-  this one.
-- **A GPU path.** `docs/LIGHTGBM_PARITY.md` line ~478 records LambdaRank as
-  CPU-only. The pair loop is `O(truncation * cnt)` per query with a data
+- **`rank_xendcg`.** Out of scope, and the `if name == "rank_xendcg"` branch
+  in `params.mojo` reports it by name with a correct reason. Adding it is a
+  separate objective, not a variant of this one.
+- **A GPU path.** The GPU-coverage paragraph under the objectives table in
+  `docs/LIGHTGBM_PARITY.md` records "LambdaRank is CPU only". The pair loop is `O(truncation * cnt)` per query with a data
   dependent inner bound, which is a different kernel shape from the
   histogram work, and nothing here changes that.
 - **Exposing the learned biases.** They are training state and serving does

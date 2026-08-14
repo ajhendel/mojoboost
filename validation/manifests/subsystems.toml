@@ -467,6 +467,21 @@ title = "This planner and its manifests"
 paths = ["validation/", "tools/validation_plan.py", "docs/FOCUSED_VALIDATION_PLAN.md"]
 jobs = ["static:plan-selfcheck"]
 
+[[subsystem]]
+id = "compatibility-register"
+title = "The public API snapshot and the model fixture register"
+paths = [
+    "compatibility/",
+    "tools/api_snapshot.py",
+    "tools/model_fixture_manifest.py",
+    "docs/COMPATIBILITY_POLICY.md",
+]
+jobs = ["static:api-snapshot", "static:model-fixtures"]
+# A snapshot difference is a claim about the public surface, and the surface is
+# the thing serialization has to keep reading, so a change here escalates to the
+# two suites that read and write model files rather than to a broad suite.
+escalate = ["native:serialize", "python:pickle", "static:parity"]
+
 # ---------------------------------------------------------------------------
 # Gaps: paths with no focused job at all
 #

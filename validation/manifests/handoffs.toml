@@ -367,9 +367,9 @@ note = "A central validation layer changes what raises, which is the one kind of
 id = "remaining-13-compatibility"
 path = "handoffs/remaining_13_compatibility.md"
 owns = ["compatibility/", "tools/api_snapshot.py", "tools/model_fixture_manifest.py"]
-jobs = ["static:python-compat", "static:parity"]
+jobs = ["static:api-snapshot", "static:model-fixtures", "static:python-compat", "static:parity"]
 escalate = ["native:serialize", "python:pickle"]
-note = "That lane authors two tools and is told not to run them, exactly as this one is. When they land, they belong in the static tier of jobs.toml; patch P4 in this lane's handoff has the entries."
+note = "That lane authors two tools and is told not to run them, exactly as this one is. Both landed while this lane was writing, so they are wired into the static tier here rather than deferred; both fail until that lane generates their baselines, which is not a regression. See docs/FOCUSED_VALIDATION_PLAN.md section 7."
 
 [[lane]]
 id = "remaining-14-validation-plan"

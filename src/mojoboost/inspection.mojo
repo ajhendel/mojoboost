@@ -349,6 +349,7 @@ def model_editing_status_json() -> String:
     out += "]"
     out += ",\"serialized_state\":[\"count\",\"split_gain\"]"
     out += ",\"model_format_version\":" + String(MODEL_FORMAT_VERSION)
+    out += ",\"read_only_alternative\":\"leaf_outputs\""
     out += "}"
     return out^
 

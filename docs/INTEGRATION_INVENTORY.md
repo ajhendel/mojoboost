@@ -1,6 +1,6 @@
 # Integration inventory
 
-Snapshot: 2026-08-14, tree at commit `860b1cf`.
+Snapshot: 2026-08-14, tree at commit `63aad82`.
 Checked by: `python3 tools/audit_integration.py`
 
 What is written in this repository but not reachable from any entry point,
@@ -54,55 +54,76 @@ it, not a second opinion.
 | `boosting_dart` | PENDING | connect_17 | Reached only from `alternate_boosting`, itself unreachable |
 | `boosting_rf` | PENDING | connect_17 | Reached only from `alternate_boosting`, itself unreachable |
 | `cegb` | PENDING | unassigned | LightGBM's four `cegb_*` controls as a gain adjustment. No grower charges a split, and no parameter turns it on |
-| `gpu_backend_policy` | PENDING | connect_20 | Reached only from `gpu_portability`, itself unreachable |
-| `gpu_bin_packing` | PENDING | connect_02 | Reached only from `gpu_binned_layout`, itself unreachable |
-| `gpu_binned_layout` | PENDING | connect_02 | Packed-bin layout planner; `train_gpu` never asks for a plan |
+| `distributed_gpu` | PENDING | unassigned | Contracts for distributed GPU histogram exchange. Nothing joins `train_gpu` to `distributed`, and its own docstring says so |
+| `distributed_strategies` | PENDING | unassigned | Feature-parallel and voting-parallel cores. `distributed.mojo` implements data-parallel only and never dispatches to these |
+| `external_memory` | PENDING | unassigned | Streaming dataset construction over `sequence`. No entry point offers an out-of-core fit |
+| `gpu_amd_policy` | PENDING | unassigned | HIP launch policy. Reached only from `gpu_cuda_policy`, itself unreachable |
+| `gpu_cuda_policy` | PENDING | unassigned | CUDA launch policy. Nothing on the shipping GPU path selects a backend-specific policy |
 | `gpu_categorical` | PENDING | connect_10 | GPU category statistics; the GPU trainer refuses categoricals |
 | `gpu_levelwise` | PENDING | connect_02 | Level-wise GPU growth; no trainer offers a level-wise mode |
-| `gpu_multiclass_batch` | PENDING | connect_04 | Class-batched GPU rounds; multiclass GPU training is per class |
-| `gpu_portability` | PENDING | connect_20 | Portable specialization points. Its own test imports `gpu_tiling` and `histogram_gpu` rather than this module, so nothing reaches it |
 | `gpu_sparse` | PENDING | connect_10 | Reached only from `gpu_categorical`, itself unreachable |
 | `gpu_sparse_layout` | PENDING | connect_10 | Reached only from `gpu_sparse`, itself unreachable |
-| `histogram_cache_policy` | PENDING | connect_04 | Reached only from `hybrid_leaf_scheduler`, itself unreachable |
-| `hybrid_leaf_scheduler` | PENDING | connect_04 | CPU/GPU per-leaf placement; no trainer consults it |
 | `levelwise_policy` | PENDING | connect_02 | Reached only from `gpu_levelwise`, itself unreachable |
 | `lgbm_model_io` | PENDING | connect_16 | LightGBM text model reader and writer; no entry point offers it. Reached from `tests/parallel/test_lgbm_model_io.mojo` only |
+| `linear_tree` | PENDING | unassigned | Linear leaves as an algorithm core. `params.mojo` parses `linear_tree` and `tree_parameters_extra.mojo` names it, but no grower imports this module |
+| `model_editing` | PENDING | unassigned | `rollback_one_iter`, `set_leaf_output`, `shuffle_models`, `refit`, prediction bounds. No binding and no native caller |
+| `ranking_advanced` | PENDING | unassigned | The ranking layer above `ranking.mojo`. Nothing imports it, so the extras have no route |
+| `sequence` | PENDING | unassigned | The chunk protocol every streaming path is written against. Reached only from `external_memory`, itself unreachable |
+| `validation` | PENDING | unassigned | The central validation layer. Call sites still re-derive their own checks; nothing imports this module |
 
-Two shapes recur and are worth naming, because they change what a fix
+Three shapes recur and are worth naming, because they change what a fix
 costs:
 
-- **Chains.** `gpu_bin_packing` is unreachable only because
-  `gpu_binned_layout` is, and `gpu_sparse_layout` only because `gpu_sparse`
-  is. One connecting edge at the head of a chain reaches all of it, so the
-  count of orphans overstates the count of decisions.
+- **Chains.** `gpu_sparse_layout` is unreachable only because `gpu_sparse`
+  is, `sequence` only because `external_memory` is, and `gpu_amd_policy`
+  only because `gpu_cuda_policy` is. One connecting edge at the head of a
+  chain reaches all of it, so the count of orphans overstates the count of
+  decisions.
 - **Test-only modules.** `backend` and `lgbm_model_io` are imported by
   their own suites and by nothing else. Their tests pass, which is why the
   parity contract can say `focused-tested: yes` and `integrated: no` in the
   same row without contradicting itself.
+- **Named but not imported.** `linear_tree` and `cegb` have their parameter
+  names parsed in `src/mojoboost/params.mojo`, so a user can set them and
+  nothing happens. A parameter that parses is not a capability that runs,
+  and this is the failure mode the `integrated` column exists to catch.
+
+Between commit `860b1cf` and this snapshot a connecting lane reached seven
+modules that were orphans in the previous revision: `gpu_binned_layout` and
+`gpu_bin_packing` (now imported by `src/mojoboost/histogram_gpu.mojo` and
+re-exported from `src/mojoboost/__init__.mojo`), `gpu_portability` and
+`gpu_backend_policy`, `gpu_multiclass_batch`, and `hybrid_leaf_scheduler`
+with `histogram_cache_policy` (now imported by
+`src/mojoboost/gpu_runtime.mojo`). Reached is not called: the parity rows
+for those capabilities stay at `deferred` until a call site, not an import,
+is shown. `CLASSIFICATION` in `tools/connectivity_audit.py` still carries
+entries for all seven; they are now judgments about modules that are no
+longer findings, and removing them is a patch for that file's owner.
 
 ## Binding modules the extension does not register
 
-`bindings/` holds five auxiliary modules beside `_mojoboost.mojo`.
-`_mojoboost.mojo` builds the only `PythonModuleBuilder` in the repository
-and imports none of them, so nothing they define is callable from Python.
+`_mojoboost.mojo` builds the only `PythonModuleBuilder` in the repository,
+so a module it does not import defines nothing a user can call.
 
 | File | What it defines | What stays blocked |
 |---|---|---|
-| `bindings/binding_support.mojo` | fifteen marshalling helpers (`py_dict`, `f64_buffer`, `csc_from_params`, and the rest) | nothing directly; it is the substrate the other four are written against |
-| `bindings/dataset_bindings.mojo` | `dataset_metadata`, `dataset_feature_names`, `dataset_categorical_features`, `dataset_field`, `dataset_bin_upper_bounds`, `dataset_missing_bins`, and three more | `Dataset` accessors that today read cached Python state instead of asking the native dataset |
-| `bindings/distributed_bindings.mojo` | `distributed_capability`, `distributed_check_machine_list`, `distributed_status_message`, `transport_status_message` | distributed training has no Python route at all |
-| `bindings/inspection_bindings.mojo` | `dump_model`, `dump_model_multiclass`, `split_values`, `dump_raw_scores`, `dump_leaf_index`, their multiclass twins, `objective_code`, `dump_model_json`, `model_file_kind`, `model_format_versions` | `mojoboost.inspection` rebuilds the dump by parsing `Booster.model_to_string()` |
-| `bindings/objective_bindings.mojo` | `registry_objectives`, `registry_objective_aliases`, `registry_metrics`, `registry_metric_aliases`, `registry_vocabulary`, `objective_code_of_name`, `metric_code_of_name`, and three more | `python/mojoboost/_eval.py` reads mirror tables instead of the native registry |
+| `bindings/binding_support.mojo` | marshalling helpers (`py_dict`, `f64_buffer`, `csc_from_params`, and the rest) | nothing. It is the substrate the other binding modules are written against, and they import it; the extension module does not need to |
 
-Registering these is one edit in one file, and it is the highest leverage
-connecting change available: it converts three Python fallbacks into thin
-formatters over native answers.
+This section was the largest disconnection in the previous revision, and it
+is closed. At commit `860b1cf` the extension imported none of the auxiliary
+modules; at `63aad82` it imports `basic_bindings`, `dataset_bindings`,
+`distributed_bindings`, `inspection_bindings`, and `objective_bindings`, and
+its `def_function` table registers `dump_model`, `dump_model_multiclass`,
+`split_values`, `dump_leaf_index`, `dump_raw_scores`, `objective_code`,
+`decide_device`, and the six `registry_*` entries. What was three Python
+fallbacks is now three thin formatters over native answers, with the
+fallbacks kept behind `getattr` for an extension built before the change.
 
-Note what is *not* in that list. `split_gains` appears nowhere in
+One name did not survive that pass. `split_gains` still appears nowhere in
 `bindings/`, so the gain hook `python/mojoboost/inspection.py` probes for
-has no implementation on either side of the seam, and `decide_device` has
-no wrapper in any binding module either. Those two are missing
-implementations rather than unregistered ones.
+has no implementation on either side of the seam; it is a missing
+implementation rather than an unregistered one, and the row below is what is
+left of this section.
 
 ## Native names Python reaches for that no binding registers
 
@@ -115,14 +136,18 @@ keep.
 
 | Native name | Python caller | What happens without it |
 |---|---|---|
-| `decide_device` | `python/mojoboost/device_selection.py` | the report runs in its `"narrow"` contract: the backend is still the native answer through `resolve_device`, but the blocking reasons, warnings, memory estimate, policy version, and evidence identifier do not cross |
-| `dump_model`, `dump_model_multiclass` | `python/mojoboost/inspection.py` | the dump is rebuilt by parsing `Booster.model_to_string()` |
-| `split_gains`, `split_gains_multiclass` | `python/mojoboost/inspection.py` | every dumped node carries `split_gain: None` and `has_split_gain: False`, because gains are recorded during growth and never serialized |
-| `split_values`, `split_values_multiclass` | `python/mojoboost/inspection.py` | derived from the parsed model text |
-| `dump_leaf_index`, `dump_leaf_index_multiclass` | `python/mojoboost/inspection.py` | derived from the parsed model text |
-| `dump_raw_scores`, `dump_raw_scores_multiclass` | `python/mojoboost/inspection.py` | derived from the parsed model text |
-| `objective_code` | `python/mojoboost/inspection.py`, `python/mojoboost/device_selection.py` | the objective is resolved from a Python table instead of from the native registry |
-| `registry_metrics`, `registry_metric_aliases`, `registry_objectives`, `registry_objective_aliases` | `python/mojoboost/_eval.py` | the metric and objective vocabulary comes from mirror dicts in Python rather than from `src/mojoboost/objective_registry.mojo` |
+| `split_gains`, `split_gains_multiclass` | `python/mojoboost/inspection.py` | every dumped node carries `split_gain: None` and `has_split_gain: False`, because gains are recorded during growth and never serialized. `_native_split_gains` probes for the hook, finds nothing on either side of the seam, and the dump reports its source as `model_to_string` rather than `model_to_string+split_gains` |
+
+The rest of this table is gone, and the reason is worth recording rather
+than deleting. At `860b1cf` it held eight rows: `decide_device`,
+`dump_model`, `split_values`, `dump_leaf_index`, `dump_raw_scores`,
+`objective_code`, and the four `registry_*` names. All of them are now in
+the `def_function` table of `bindings/_mojoboost.mojo`. The `getattr` probes
+in `python/mojoboost/inspection.py`, `device_selection.py`, and `_eval.py`
+remain, which is correct: they are the compatibility path for an extension
+built from an older tree, and `_eval.registry_source()` and
+`report.contract` still say which implementation answered. A probe that
+finds its hook is not a fallback in force.
 
 ## Policy that exists twice
 
@@ -132,16 +157,17 @@ finished. Listed here so that a reader of either side finds the other.
 
 | Question | Native, authoritative | Python, in force today |
 |---|---|---|
-| Which backend runs this job | `src/mojoboost/device_policy.mojo` | `device_selection.py` formats; the estimators bypass it entirely and call `_mojoboost.resolve_device` from `_Base._resolve_device` |
-| What an objective or metric is called | `src/mojoboost/objective_registry.mojo` | mirror tables in `python/mojoboost/_eval.py` |
-| What a model dump contains | `src/mojoboost/inspection.mojo`, `src/mojoboost/model_dump.mojo` | `python/mojoboost/inspection.py` parses the model text |
+| Which backend runs this job | `src/mojoboost/device_policy.mojo` | `explain_device_choice` reaches the full native report now that `decide_device` is bound, but `_Base._resolve_device` still calls `_mojoboost.resolve_device` directly, so what a `fit` actually does is decided by the narrower of the two entry points |
+| What an objective or metric is called | `src/mojoboost/objective_registry.mojo` | the mirror tables in `python/mojoboost/_eval.py` are still present and still the code path when the hooks are absent; `registry_source()` returns `"native"` or `"compat"` and is the only honest way to say which one answered |
+| What a model dump contains | `src/mojoboost/inspection.mojo`, `src/mojoboost/model_dump.mojo` | `python/mojoboost/inspection.py` keeps its `model_to_string` parser as the fallback, and uses it unconditionally for split gains, which no native hook supplies |
 | How class weights become row weights | `src/mojoboost/class_weight.mojo` | `_Base._class_weight_rows` in `python/mojoboost/__init__.py` computes them in Python. This one is not a fallback: no binding is probed, and the Mojo module has no caller anywhere in `src/` |
 
-`class_weight` is the sharpest of the four, and the README claim that there
-is "one weighting mechanism rather than two" describes the intent rather
-than the tree: the Mojo module is publicly reachable from
-`src/mojoboost/__init__.mojo` and reached by nothing, while the Python
-estimators use their own arithmetic.
+`class_weight` is the sharpest of the four, and the only one where no seam
+is even open. `src/mojoboost/class_weight.mojo` is re-exported from
+`src/mojoboost/__init__.mojo`, so it counts as reachable, and nothing in
+`src/` imports it: a Mojo caller can use it, a `MojoBoostClassifier` never
+does, and the two implementations can disagree without any test noticing.
+`README.md` says which one runs.
 
 There is also a name collision worth knowing about:
 `derive_block_threads` is defined twice, in `src/mojoboost/gpu_tiling.mojo`

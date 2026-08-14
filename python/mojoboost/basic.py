@@ -310,7 +310,8 @@ class _Config:
         keep = []
         ic_flat, ic_offsets = self.base._interaction_buffers(n_features)
         mono_buf, mono_addr = self.base._monotone_buffer(n_features)
-        keep.extend([ic_flat, ic_offsets, mono_buf])
+        contri_buf, contri_addr = self.base._feature_contri_buffer(n_features)
+        keep.extend([ic_flat, ic_offsets, mono_buf, contri_buf])
         device = self.base._resolve_device(
             dataset.num_data(),
             n_features,
@@ -331,7 +332,7 @@ class _Config:
                 )
             device = "cpu"
         params = self.base._params(
-            0, device, ic_flat, ic_offsets, mono_addr, None
+            0, device, ic_flat, ic_offsets, mono_addr, None, contri_addr
         )
         params["n_estimators"] = int(rounds)
         params["objective"] = int(self.objective_code)

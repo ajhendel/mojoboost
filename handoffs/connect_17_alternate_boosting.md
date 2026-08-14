@@ -82,8 +82,14 @@ boosting_rf.*                  (no caller anywhere)
 alternate_boosting.fit_boosting            (raw features -> Model)
 alternate_boosting.train_boosting          (binned matrix -> Booster)
 alternate_boosting.train_boosting_more     (continue)
+alternate_boosting.train_boosting_with_valid          (early stopping)
+alternate_boosting.train_boosting_multiclass          (-> MulticlassBooster)
+alternate_boosting.train_boosting_multiclass_more
+alternate_boosting.train_boosting_multiclass_with_valid
   |
-  +-- gbdt / goss -> boosting.train / boosting.train_more   (UNCHANGED)
+  +-- gbdt / goss -> boosting.train / train_more / train_with_valid /
+  |                  train_multiclass / train_multiclass_more /
+  |                  train_multiclass_with_valid            (UNCHANGED)
   |
   +-- dart -> alternate_boosting.train_dart / train_dart_more
   |            -> boosting_dart.check_dart_supported
@@ -98,12 +104,20 @@ alternate_boosting.train_boosting_more     (continue)
   |            -> alternate_boosting.fold_weights_into_trees
   |            -> boosting.Booster (learning_rate = 1.0)
   |
+  +-- dart, the other three entry points -> REFUSED by name
+  |     (multiclass: no round loop yet; with_valid: truncation is wrong)
+  |
   +-- rf   -> alternate_boosting._check_rf_uniform_args
                -> boosting_rf.train_rf / train_rf_more
                     -> RfParams.from_booster_params
                     -> boosting_rf.check_rf_learning_rate / check_rf_params
                     -> boosting_rf.train_forest -> RfBooster
                     -> RfBooster.to_booster()  (base 0, rate 1 / T)
+               -> boosting_rf.train_forest_with_valid
+               -> boosting_rf.train_forest_multiclass
+               -> boosting_rf.train_forest_multiclass_with_valid
+                    -> RfMulticlassBooster.to_multiclass_booster()
+               (multiclass continuation REFUSED; see 3.5)
 ```
 
 `boosting.mojo`, `tree.mojo`, `split.mojo`, `params.mojo`, `serialize.mojo`,
@@ -208,6 +222,43 @@ calling `boosting_rf.is_rf_boosting` rather than by a second list, so the
 names and the trainer that implements them cannot drift apart. `gbdt` and
 `goss` route into the untouched production `boosting.train`.
 
+### 3.5 The rest of the RF surface is connected, on request
+
+`handoffs/remaining_02_rf.md` section 4.8 asked this lane for the multiclass
+and validation-set dispatchers, and stated that `boosting_rf.mojo` needs
+nothing new for them. Three entry points were added here accordingly:
+`train_boosting_with_valid`, `train_boosting_multiclass`, and
+`train_boosting_multiclass_with_valid`, each dispatching `rf` to the
+already-written `train_forest_with_valid`, `train_forest_multiclass`, and
+`train_forest_multiclass_with_valid`, and `gbdt`/`goss` to the untouched
+`boosting.train_with_valid`, `train_multiclass`, and
+`train_multiclass_with_valid`. A fourth, `train_boosting_multiclass_more`,
+was added for `gbdt`/`goss` continuation.
+
+This does not reintroduce the adapter deleted in section 4. The translation
+is one call to `boosting_rf`'s own public `RfParams.from_booster_params` plus
+its own `to_booster` / `to_multiclass_booster`; no `RfParams` is assembled
+field by field here, and no check is restated. Only
+`check_rf_learning_rate` is called directly, because these three
+`train_forest_*` functions are the raw entry points and do not call it
+themselves the way `train_rf` does.
+
+Two refusals are new and deliberate:
+
+- **`dart` on all three**, and on the multiclass continuation. Multiclass
+  DART is a missing loop (section 9.4). Validation-set DART is refused
+  because truncation is wrong for it, which is section 5's "continued
+  training" argument applied to early stopping; the same function dispatches
+  `rf` to a truncating implementation, because a forest's trees are
+  independent and truncation there is exact.
+- **`rf` on `train_boosting_multiclass_more`.** The single-output bridge
+  recovers the constant by recomputing it from `target`; the multiclass
+  constant is the vector of class log priors, and `boosting_rf` exposes no
+  bridged multiclass continuation. Recomputing the priors here would be a
+  second copy of `boosting_rf._class_log_priors`, so the error names
+  `train_forest_multiclass_more` instead. Removing this refusal is a
+  `boosting_rf` change (P10), not one for this file.
+
 ---
 
 ## 4. Duplicates fused or quarantined
@@ -307,10 +358,18 @@ mode.
   trees. This is the only place in the library where that is true. The rate
   the ensemble was trained with is **lost** by folding, so it is taken from
   `params` and cannot be checked; that is the single cost of the fold.
-- RF: exact and cheap through `boosting_rf.train_rf_more` on an `RfBooster`
-  (no raw scores to replay, gradients re-derived from the stored base score).
-  **Refused** from `train_boosting_more`, because a bridged `Booster` has lost
-  both the base score and the averaging weight.
+- RF: dispatched from `train_boosting_more` to `boosting_rf.train_rf_more`,
+  which gates on `boosting_rf.is_forest` (base score 0, rate 1 / n_trees)
+  before it touches anything, since rewriting `learning_rate` on a boosted
+  ensemble would silently rescale every tree in it. There are no raw scores
+  to replay. The constant the new trees are fitted at is **not recoverable**
+  from the model, because `to_booster` folded the averaging weight into the
+  leaves and a `Booster` has nowhere to record a base score; it is
+  **recomputed** from `target` and `sample_weight`, so the trees added match
+  a single call exactly only when this is the data the forest was trained on
+  — the precondition `boosting.train_more` already states. A forest kept as
+  an `RfBooster` carries its own base score and needs no such precondition;
+  that is what `boosting_rf.train_forest_more` is for. See risk 5b.
 
 **Serialization requirements.** None for either mode as bridged. Both write
 through v3 today. What a v4 would buy is in P9.
@@ -442,13 +501,14 @@ correct behavior. This lane changed neither.
    the connectivity audit will still report all three modules as orphans.
    P1. Highest-value follow-up.
 2. **No parameter string, Python, C ABI, or CLI route.** P2, P3, P6.
-3. **Multiclass is implemented for RF and not exposed.**
-   `boosting_rf.train_rf_multiclass`, `train_rf_multiclass_more`,
-   `train_rf_multiclass_with_valid`, and
-   `RfMulticlassBooster.to_multiclass_booster` all exist and nothing calls
-   them. `train_boosting` is single-output. Adding
-   `train_boosting_multiclass` to this module is mechanical; it needs the
-   same `rf_params_of` translation and the same bridge.
+3. **Multiclass RF continuation has no bridged route.** Resolved for
+   training and early stopping in section 3.5, which connects
+   `train_forest_multiclass` and `train_forest_multiclass_with_valid`.
+   `train_forest_multiclass_more` remains reachable only as an
+   `RfMulticlassBooster`, because the class log priors are folded away by
+   `to_multiclass_booster` and re-deriving them here would duplicate
+   `boosting_rf._class_log_priors`. P10, or P9, which removes the fold
+   entirely.
 4. **Multiclass DART does not exist.** `boosting_dart` is already shaped for
    it (`n_classes` in `select_drop`, `dart_begin_round`, `dart_commit_round`,
    `dart_recompute_raw`; it drops whole iterations so a round's class group
@@ -464,8 +524,10 @@ correct behavior. This lane changed neither.
    score with `boosting._mean_loss`, call
    `dart_record_best(best, weights, loss, min_delta)` after each round,
    `dart_restore_best(best, trees, weights)` at the end, and fold **after**
-   restoring. `boosting_rf.train_rf_with_valid` already exists for forests
-   and is likewise unexposed.
+   restoring. It would then replace the `dart` refusal in
+   `train_boosting_with_valid`, which is where a caller meets this today.
+   Forests are already connected there (section 3.5), since truncation is
+   exact for independent trees.
 6. **A bridged forest's iteration ranges are still wrong.**
    `Booster.predict_raw_bins_range` divides by the whole tree count whatever
    the range, so `Model.predict_range` on an `rf` model is not the forest's
@@ -492,14 +554,23 @@ Insert after the `from .boosting_sparse import (...)` block:
 
 ```mojo
 from .boosting_dart import (
+    DEFAULT_DROP_RATE,
+    DEFAULT_DROP_SEED,
+    DEFAULT_MAX_DROP,
+    DEFAULT_SKIP_DROP,
     DartBestState,
     DartDrop,
     DartNormalization,
     DartParams,
     check_dart_supported,
+    dart_begin_round,
+    dart_commit_round,
     dart_normalization,
     dart_recompute_raw,
+    dart_record_best,
+    dart_restore_best,
     dart_uniform_weights,
+    dart_weights_are_uniform,
     select_drop,
 )
 from .boosting_rf import (
@@ -535,10 +606,18 @@ from .alternate_boosting import (
     parse_boosting,
     train_boosting,
     train_boosting_more,
+    train_boosting_multiclass,
+    train_boosting_multiclass_more,
+    train_boosting_multiclass_with_valid,
+    train_boosting_with_valid,
     train_dart,
     train_dart_more,
 )
 ```
+
+`handoffs/remaining_02_rf.md` section 4.1 asks for the same `boosting_rf`
+export block. The two requests are the same edit; land one of them, with the
+union of the two symbol lists.
 
 This alone moves all three modules from orphan to connected in
 `tools/connectivity_audit.py`. That table's `alternate_boosting`,
@@ -658,9 +737,11 @@ optional v4 section written only when it is true (the way v2's monotone and
 categorical sections are, so an existing model serializes to the bytes it
 does today), would let:
 
-- `RfBooster` collapse into `Booster`, deleting `to_booster`, its two sharp
-  edges (iteration ranges and continuation), `train_forest`, and the `rf`
-  refusal in `train_boosting_more`;
+- `RfBooster` collapse into `Booster`, deleting `to_booster`, the split
+  between `train_forest`/`train_rf` and `train_forest_more`/`train_rf_more`,
+  and both sharp edges the fold creates: iteration ranges, and
+  `train_rf_more` recomputing a base score it cannot read back
+  (section 5, risk 5b);
 - `Booster.predict_raw_bins_range` divide by the range's tree count rather
   than the whole ensemble's, which is what makes a forest's iteration ranges
   meaningful;
@@ -670,6 +751,25 @@ does today), would let:
 Do this before, not after, P6: a Python `boosting="rf"` whose
 `predict(num_iteration=k)` silently means something else is worse than no
 Python route at all.
+
+### P10 - `train_rf_multiclass_more` (owner: `boosting_rf.mojo`)
+
+Small, and only worth doing if P9 is not. `train_boosting_multiclass_more`
+refuses `rf` because a bridged `MulticlassBooster` has lost the class log
+priors its trees were fitted at (section 3.5). The single-output path solves
+this by recomputing the constant inside `boosting_rf.train_rf_more`; the
+multiclass equivalent is the same three steps next to it:
+
+- a structural check, the multiclass counterpart of `is_forest`
+  (`base_scores` all zero, `learning_rate == 1 / n_iterations()`);
+- `_class_log_priors(labels, n_classes, sample_weight)` to recompute the
+  base scores, carrying the same precondition `train_rf_more` documents
+  (exact only when this is the data the forest was trained on);
+- `_rf_rounds_multiclass` for the new rounds, then rescale to the new size.
+
+Then `train_boosting_multiclass_more` replaces its `rf` refusal with a call,
+matching the single-output path exactly. P9 makes this unnecessary by
+removing the fold, so prefer P9 if both are on the table.
 
 ---
 
@@ -694,6 +794,17 @@ would need the `1 / T` conversion applied on the way in.
 files imports them. `boosting.train`, `model.fit`, `params.parse_params`, the
 bindings, the C ABI, the CLI, and the Python package all behave exactly as
 before. P1 through P3 and P6 are what make the modes reachable.
+
+The seven functions P1 would expose (`train_boosting`,
+`train_boosting_more`, `train_boosting_with_valid`,
+`train_boosting_multiclass`, `train_boosting_multiclass_more`,
+`train_boosting_multiclass_with_valid`, `fit_boosting`) each take every
+argument its `boosting.mojo` counterpart takes, in the same positional
+order, with `boosting: AlternateBoostingParams` inserted as the first
+defaulted argument. A caller that passes `AlternateBoostingParams()` gets
+`gbdt` and the production function verbatim, so the mode surface is a
+superset of the existing one at every entry point and P3 can route
+`model.fit` through it without changing any existing call.
 
 ---
 
@@ -793,3 +904,15 @@ ordered so a failure isolates fastest. This lane wrote no tests.
    and that a second `train_dart_more` on the result still runs (folding is
    idempotent). Do **not** assert bit equality against a single longer call;
    section 5 says it does not hold.
+8. The three entry points added in section 3.5, each in one line:
+   `train_boosting_multiclass` with `rf` returning a `MulticlassBooster`
+   whose `learning_rate` is `1 / rounds` and whose `base_scores` are all
+   zero, and with `gbdt` matching `boosting.train_multiclass` exactly;
+   `train_boosting_with_valid` with `rf` returning at most
+   `params.n_estimators` trees; and all four multiclass/valid entry points
+   raising for `dart`. Nothing about the algorithms is being tested here,
+   only that the dispatch reaches them, since `boosting_rf` owns their
+   correctness.
+9. `train_boosting_multiclass_more` raising for `rf` with the message naming
+   `boosting_rf.train_forest_multiclass_more`, and adding rounds for `gbdt`.
+   Delete this case when P10 or P9 lands.

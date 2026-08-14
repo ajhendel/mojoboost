@@ -605,6 +605,7 @@
     "all": [
       "DUMP_FORMAT_VERSION",
       "SUPPORTED_MODEL_FORMAT_VERSIONS",
+      "MODEL_EDITING_SUPPORTED",
       "OBJECTIVE_NAMES",
       "dump_model",
       "parse_model_string",
@@ -612,9 +613,17 @@
       "trees_to_dataframe",
       "split_values",
       "get_split_value_histogram",
+      "feature_importance",
+      "leaf_outputs",
+      "model_editing_support",
       "leaf_index_of",
       "raw_scores",
-      "booster_of"
+      "booster_of",
+      "feature_name_of",
+      "n_features_of",
+      "n_iter_of",
+      "objective_of",
+      "best_score_of"
     ],
     "reexported_at_top_level": false,
     "open_question": "not in mojoboost.__all__ and not a supported import path under compatibility policy section 6.1; release gate item C5",

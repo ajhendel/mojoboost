@@ -20,21 +20,22 @@ test was written or run, no build, no Python, no benchmark, and pyarrow and
 polars were never imported. Every claim below is a reading of the code as
 written.
 
-> **Read this before integrating: a concurrent session committed this
-> lane's files mid-task.** Four commits landed while this lane ran
-> (`dc21f03`, `860b1cf`, `e6f3959`, `5085097`), and one of them swept up
-> `_arrow.py`, `_polars.py`, `_sequence.py`, and `docs/ECOSYSTEM_INPUTS.md`
-> as they stood at that moment, together with many other lanes' work.
-> `_arrow.py` and `_polars.py` were finished by then and the committed
-> versions are correct. **`_sequence.py` and `docs/ECOSYSTEM_INPUTS.md`
-> were not**: the committed snapshot predates `Batches.shape`, the cached
-> `schema()` / `categories()`, the `_wrap` helper, the `_batch_width`
-> dimension check, and the `describe_input` availability fields. The
-> working tree holds the correct version as an uncommitted delta
-> (`git diff -- python/mojoboost/_sequence.py docs/ECOSYSTEM_INPUTS.md`
-> is exactly those changes and nothing else). **Commit the working tree,
-> not the committed snapshot.** No other lane's file was touched by this
-> one.
+> **Read this before integrating: concurrent sessions committed this
+> lane's files while it was still writing them.** Five commits landed
+> during this lane (`dc21f03`, `860b1cf`, `e6f3959`, `5085097`, `e28a24d`),
+> and they swept up `_arrow.py`, `_polars.py`, `_sequence.py`, and
+> `docs/ECOSYSTEM_INPUTS.md` as they stood at that moment, together with
+> many other lanes' work. One of those snapshots was taken mid-write: it
+> predated `Batches.shape`, the cached `schema()` / `categories()`, the
+> `_wrap` helper, the `_batch_width` dimension check, and the
+> `describe_input` availability fields. The last commit picked the rest up,
+> so **HEAD now matches the working tree for the three modules and the
+> doc** (`git diff HEAD -- python/mojoboost/_arrow.py
+> python/mojoboost/_polars.py python/mojoboost/_sequence.py
+> docs/ECOSYSTEM_INPUTS.md` is empty) and there is nothing to recover. This
+> handoff itself carries one later uncommitted edit, this paragraph. If you
+> are reading from an older checkout, the commit to take is `e28a24d`. No
+> other lane's file was touched by this one.
 
 Other lanes also changed `python/mojoboost/_arrays.py` (a new
 `i64_vector`), `__init__.py`, `basic.py`, `device_selection.py`,

@@ -1763,9 +1763,11 @@ struct ExternalCapabilities(Copyable, Movable, Writable):
     """What can be trained from an external-memory dataset, and how.
 
     Written as a struct rather than a table in a document because a caller
-    has to be able to ask. Every `True` here is reachable through the
-    functions in this module; every `False` raises with a message that says
-    what would have to exist.
+    has to be able to ask. Every `True` here is reachable from this module,
+    either through a trainer defined here or by handing the result of
+    `materialize_binned` to the function that already implements it
+    (`efb.fit_bundles` is the second kind, and is not called here). Every
+    `False` raises with a message that says what would have to exist.
 
     The dividing line is one fact: every histogram builder in the tree takes
     a whole `BinnedMatrix` or `SparseBinnedMatrix`. So everything is
@@ -1852,7 +1854,8 @@ struct ExternalCapabilities(Copyable, Movable, Writable):
         out += "  ranking groups: yes (query ids are assembled globally, so"
         out += " a query may straddle chunks)\n"
         out += "  bagging and GOSS: yes, over materialized row indices\n"
-        out += "  EFB: yes, over a materialized sparse matrix\n"
+        out += "  EFB: yes, by calling efb.fit_bundles (or"
+        out += " fit_bundles_dense) on a materialized matrix\n"
         out += "  init score: yes (CPU paths only, as elsewhere)\n"
         out += "  continued training: yes, under the same binning\n"
         return out^

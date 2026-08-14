@@ -328,8 +328,9 @@ def dump_model(model, feature_names=None):
 
     `model` is a fitted estimator, a `mojoboost.Booster`, or the text
     `Booster.model_to_string()` produces. `feature_names` overrides the
-    names the model carries, and is how a caller names the features of a
-    model read back from a file, which carries none.
+    names the model carries; it is how a caller names the features of a
+    model read back from a file written before format v4, which is the
+    version that started carrying them.
 
     See `docs/MODEL_INSPECTION_SCHEMA.md` for every key. The two a
     consumer should branch on: `has_split_gain` says whether per node
@@ -678,6 +679,10 @@ def model_editing_support():
             "at growth time, which the tree no longer holds",
         ],
         "serialized_state": ["count", "split_gain"],
+        # The newest format this build reads, which is also the one it
+        # writes: it is what makes the contradiction durable rather than
+        # confined to the session that made the edit.
+        "model_format_version": max(SUPPORTED_MODEL_FORMAT_VERSIONS),
         "read_only_alternative": "leaf_outputs",
     }
 

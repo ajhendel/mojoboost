@@ -168,6 +168,44 @@ requires_files = ["tools/validation_plan.py", "validation/manifests/jobs.toml"]
 provenance = "unverified"
 proves = "That every job, tier, subsystem, and handoff entry in validation/manifests resolves to files that exist."
 
+# The next two are the compatibility lane's tools. They landed while this lane
+# was writing, so they are wired here rather than left to patch P4. Both are
+# `unverified` and both fail today, for a reason that is not a regression:
+# their baselines are not in the tree. `compatibility/api_snapshot.json` does
+# not exist, and `compatibility/fixtures/manifest.toml` carries
+# `status = "declared"` with a comment saying `--write` has not been run.
+# `requires_files` therefore names only the inputs that do exist, so that
+# `--self-check` reports the manifest as consistent and the job itself reports
+# the missing baseline. See docs/FOCUSED_VALIDATION_PLAN.md section 7.
+
+[[job]]
+id = "static:api-snapshot"
+tier = "static"
+title = "Public API snapshot"
+command = "python3 tools/api_snapshot.py --check"
+requires_files = [
+    "tools/api_snapshot.py",
+    "compatibility/SNAPSHOT_SCHEMA.md",
+    "docs/COMPATIBILITY_POLICY.md",
+]
+provenance = "unverified"
+proves = "That the public surface still matches compatibility/api_snapshot.json, once that file exists. Until it does, this job proves only that the generator runs."
+evidence = "compatibility/api_snapshot.json"
+
+[[job]]
+id = "static:model-fixtures"
+tier = "static"
+title = "Model format fixture register"
+command = "python3 tools/model_fixture_manifest.py --check"
+requires_files = [
+    "tools/model_fixture_manifest.py",
+    "compatibility/fixtures/manifest.toml",
+    "compatibility/MODEL_FORMAT_MIGRATIONS.md",
+]
+provenance = "unverified"
+proves = "That every fixture the register declares exists and still hashes to what was recorded. Fails until the owning lane runs --write, which this lane must not do."
+evidence = "compatibility/fixtures/checksums.json"
+
 # ===========================================================================
 # smoke
 # ===========================================================================

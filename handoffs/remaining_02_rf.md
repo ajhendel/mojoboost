@@ -19,6 +19,12 @@ beside them appeared during this session; `lgbm_model_io.mojo`, `tree.mojo`,
 and `trainset.mojo` were modified by other lanes while this file was being
 written. Nothing here touches any of them.
 
+This session committed nothing. Another lane's commit (`5085097`) swept an
+in-progress copy of `src/mojoboost/boosting_rf.mojo` into HEAD partway
+through, so a reviewer diffing against HEAD sees only this lane's last two
+edits; the file as a whole is new in this round. `docs/RANDOM_FOREST_MODE.md`
+and this handoff are untracked.
+
 **The one hard constraint this session had to meet.**
 `src/mojoboost/alternate_boosting.mojo` (another lane's file) already
 contains

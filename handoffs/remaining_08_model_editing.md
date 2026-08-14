@@ -2,11 +2,20 @@
 
 Everything below is static reasoning. **No build, test, formatter, linter,
 Python process, or benchmark was run.** The code this task produced is
-**uncompiled**. Nothing was staged or committed, and no file outside this
-task's ownership was touched.
+**uncompiled**. This task staged and committed nothing, and touched no file
+outside its ownership.
 
 Ownership exercised: `src/mojoboost/model_editing.mojo` (new),
 `docs/MODEL_EDITING.md` (new), and this file (new).
+
+**The three files are nonetheless committed, at `63aad82` ("Document
+remaining integration and compatibility work"), not by this task.** This is
+a shared checkout and a concurrent lane's `git commit` picked them up. Two
+consequences for whoever reads this next: uncompiled code is already in
+history, so the first build that runs is a build of committed code and any
+syntax fix is a follow-up commit rather than an amend; and the same broad
+commit is why `git log` attributes these files to another lane's message.
+The content at `63aad82` is this task's content unmodified.
 
 ## 0. Conflict with CONNECT_EVERYTHING Task 11
 
@@ -24,9 +33,10 @@ already answered that question **no**:
   and a hardcoded `model_editing_status_json()` naming three invariants
   plus serialization as the reasons.
 - `python/mojoboost/inspection.py` mirrors it as
-  `MODEL_EDITING_SUPPORTED = False`, lists `leaf_outputs` and
-  `model_editing_support` in `__all__`, and has a "Not offered" section in
-  its module docstring.
+  `MODEL_EDITING_SUPPORTED = False` and has a "Not offered" section in its
+  module docstring. It has since gained definitions for `leaf_outputs` and
+  `model_editing_support`, the latter a hand-written refusal restating the
+  same three invariants; §4.3 is written against that later state.
 
 **This task supersedes that answer, and §1.1 says why the three named
 invariants do not in fact block leaf editing.** The patches in §4 are the
@@ -43,7 +53,7 @@ states two contradictory things about editing. `docs/MODEL_EDITING.md` and
 | --- | --- | --- |
 | `rollback_one_iter` | nothing, in any layer | implemented in `model_editing.mojo`, with an explicit boosting mode |
 | `lower_bound` / `upper_bound` | nothing | implemented, raw and response scale, per class for softmax |
-| `get_leaf_output` | `leaf_outputs` named in `inspection.py.__all__`, no definition found in the file | implemented natively as `leaf_outputs`, `leaf_outputs_shrunk`, `get_leaf_output`, `get_leaf_output_shrunk` |
+| `get_leaf_output` | `inspection.py.leaf_outputs`, a Python walk of the dump (Task 11 defined it while this task ran; it was a bare `__all__` entry when the survey was taken) | implemented natively as `leaf_outputs`, `leaf_outputs_shrunk`, `get_leaf_output`, `get_leaf_output_shrunk`; the Python one is kept as the dump-side reader, see §4.3 |
 | `set_leaf_output` | refused by `inspection.mojo.model_editing_status_json` | implemented, with a clamp-or-reject policy and a whole-tree monotone re-verification |
 | `shuffle_models` | nothing | implemented as `permute_iterations` (explicit) plus a seeded `shuffle_iterations` |
 | `refit` | nothing for `Tree`; `linear_tree.refit_linear_tree` exists for the linear-leaf model of another lane and is a different operation | implemented, reusing the grower's leaf formula and the trainer's `_renew_leaf_values` |
@@ -362,13 +372,20 @@ from .model_editing import (
 ### 4.3 Turn on editing in the Python inspection facade
 
 - **Target file**: `python/mojoboost/inspection.py`
-- **Target symbols**: the module docstring's "Not offered" section (lines
-  ~48-64), `MODEL_EDITING_SUPPORTED` (line ~113), and the missing
-  `leaf_outputs` / `model_editing_support` definitions that `__all__`
-  already names.
+- **Target symbols**: the module docstring's "Not offered" section (the
+  "Leaf editing" paragraph, ~line 50), `MODEL_EDITING_SUPPORTED` (~line
+  113), `leaf_outputs` (~line 615), and `model_editing_support` (~line
+  653).
 - **Ownership**: CONNECT Task 11.
+- **Restated against the file as it stands.** When this patch was first
+  written both functions were names in `__all__` with no definition and the
+  patch supplied them. Task 11 has since defined both, so the patch is now
+  smaller and the sketches it used to carry are gone: `leaf_outputs()` as
+  written is correct and is kept, including its `dump=` parameter and its
+  `tree_index` range check, which the sketch did not have. What remains is
+  the status, which is still the pre-editing refusal.
 - **Patch**:
-  1. Replace the "Not offered" section with a pointer:
+  1. Replace the docstring's "Leaf editing" paragraph with a pointer:
 
 ```
 Editing
@@ -380,7 +397,8 @@ operation; `leaf_outputs()` reads leaf values and
 `mojoboost.Booster.set_leaf_output()` writes one.
 ```
 
-  2. Replace the constant with a native read plus a conservative default:
+  2. Replace the constant with a native read plus a conservative default,
+     and `import json as _json` at the top if it is not already imported:
 
 ```python
 def _editing_supported():
@@ -396,25 +414,22 @@ def _editing_supported():
 MODEL_EDITING_SUPPORTED = _editing_supported()
 ```
 
-  3. Add the two functions `__all__` already promises:
+  3. Replace the body of `model_editing_support()` with the native table.
+     Its present body is a hand-written refusal built from the three
+     objections §1.1 answers, so it cannot be kept alongside a build that
+     edits; the reasons it lists are now wrong, not merely stale:
 
 ```python
-def leaf_outputs(model, tree_index=None):
-    """Leaf values in leaf-ordinal order: a list per tree, or one tree's.
-
-    Unshrunk, as the model stores them (see docs/MODEL_EDITING.md); the
-    dump's `shrinkage` is the factor prediction applies.
-    """
-    dump = dump_model(model)
-    trees = dump["tree_info"]
-    if tree_index is None:
-        return [_leaf_values_of(t) for t in trees]
-    return _leaf_values_of(trees[tree_index])
-
-
 def model_editing_support():
     """The native capability table: which editing operations this build
-    performs, and the reason for each one it does not."""
+    performs, and the reason for each one it does not.
+
+    `src/mojoboost/model_editing.mojo` is where the table is built, in
+    `editing_capabilities`; `docs/MODEL_EDITING.md` is the contract it
+    reports on. Refusals carry their reason, so a caller asking "can I set
+    a split threshold?" gets an answer to branch on rather than an
+    exception.
+    """
     hook = getattr(_mojoboost, "model_editing_status", None)
     if hook is None:
         return {"supported": False, "operations": [],
@@ -422,22 +437,31 @@ def model_editing_support():
     return _json.loads(hook())
 ```
 
-  with `_leaf_values_of(tree)` a depth-first walk of `tree_structure`
-  collecting `leaf_value` in `leaf_index` order, and `import json as _json`
-  at the top.
+  4. In `leaf_outputs()`, change the closing docstring line
+     `"""Read only. This is the half of LightGBM's leaf-output pair
+     mojoboost offers; `model_editing_support()` says why there is no
+     setter."""` to name the setter that now exists:
+     "`mojoboost.Booster.set_leaf_output()` is the writing half."
+     The function body is unchanged.
 - **State flow**: `_mojoboost.model_editing_status()` (§4.4) ->
   `model_editing_status_json()` -> `editing_capabilities()`.
 - **Errors**: none raised; a missing hook degrades to "not supported",
   which is the pre-existing behavior.
 - **Dependency**: §4.4 for the hook. Applying §4.3 alone is safe and
-  changes nothing (the hook is absent, so the constant stays `False`).
+  changes nothing observable (the hook is absent, so the constant stays
+  `False` and `model_editing_support()` returns the same "not supported"),
+  but it does drop the three stated reasons, which is the point: they are
+  the claims §1.1 refutes and they should not outlive this patch.
 - **Fallback**: the `getattr` guard is the fallback and must stay: the
   wheel and the source tree can disagree about which bindings exist.
 - **Serialization effect**: none.
 - **Public API effect**: `MODEL_EDITING_SUPPORTED` becomes build-dependent
-  rather than a literal; `leaf_outputs` and `model_editing_support` stop
-  being names in `__all__` with no definition (importing `*` from this
-  module raises `AttributeError` today).
+  rather than a literal. `model_editing_support()` keeps its name and its
+  "answer to branch on" contract but changes shape: the old keys
+  (`operation`, `reason`, `invariants`, `serialized_state`,
+  `model_format_version`, `read_only_alternative`) are replaced by
+  `operations`, a list of per-operation records. Any consumer reading the
+  old keys breaks; the schema is documented in `docs/MODEL_EDITING.md`.
 - **Validation (UNRUN)**: `python -c "import mojoboost.inspection"`.
 
 ---

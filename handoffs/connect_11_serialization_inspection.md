@@ -17,15 +17,27 @@ unstaged in the working tree. That was not this task's doing, and nothing
 was reverted to undo it. Every change described below is present in the
 working tree, whichever side of those commits it landed on.
 
-Owned paths, and this task's whole footprint:
+The work ran in two phases. Phase 1 stayed inside the four owned paths
+below the first rule. Phase 2 was explicitly authorized afterward and
+applied the cross-lane patches phase 1 had only been able to request; §6
+is written as applied rather than requested for that reason.
 
 | File | What changed |
 | --- | --- |
+| **owned** | |
 | `src/mojoboost/serialize.mojo` | model format **v4**: split gains, a presence flag on covers, an optional feature-names section, and `load_feature_names` |
 | `src/mojoboost/importance.mojo` | docstrings only: gain importance now survives a save, and where the absence still shows |
 | `src/mojoboost/inspection.mojo` | `MODEL_EDITING_SUPPORTED` and `model_editing_status_json`; gain docstrings tracking v4 |
 | `python/mojoboost/inspection.py` | reads v4 (gains, cover flag, names); `feature_importance`, `leaf_outputs`, `model_editing_support`; name precedence |
 | `handoffs/connect_11_serialization_inspection.md` | this file |
+| **phase 2** | |
+| `src/mojoboost/model_dump.mojo` | `MODEL_FORMAT_VERSION = 4` and the gain docstring behind it |
+| `bindings/_mojoboost.mojo` | names through `save` / `save_multiclass`; `model_feature_names` |
+| `python/mojoboost/basic.py` | names through `save_model` and `_load_path`; five stale docstrings |
+| `python/tests/test_contrib.py` | its independent parser taught v4 |
+| `python/tests/parallel/test_inspection.py` | v4 assertions, and four new tests |
+| `tests/parallel/api_snapshot_manifest.json` | v4, and the `inspection` surface resynced |
+| `docs/` ×5, `README.md` | §8 |
 
 ---
 
@@ -73,17 +85,24 @@ in `src/`.
   is a public-API behavior change reached through the existing binding,
   with no binding edit.
 - `model_dump.has_split_gains` (native) answers `True` for a loaded model
-  for the same reason, so the native dump reports what the text dump
-  reports the moment the bindings expose it.
+  for the same reason, so the native dump and the text dump report the
+  same capability flags for the same model.
 - `mojoboost.inspection` now also answers `feature_importance`,
   `leaf_outputs`, and `model_editing_support`, so the schema surface
   covers everything this task was asked to route through it.
+- Feature names survive a save and a load, which is what makes the two
+  implementations agree on `feature_names` for a model read from disk
+  instead of one of them inventing `Column_i`.
 
-**Still not connected**, and it needs files this task did not own:
-`src/mojoboost/inspection.mojo` and `src/mojoboost/model_dump.mojo` still
-have no caller. The exports live in `src/mojoboost/__init__.mojo` and the
-hooks in `bindings/_mojoboost.mojo`, both out of scope here. §6 restates
-the exact patches, which are `migration_19`'s wave 1 unchanged.
+**Now connected.** `src/mojoboost/model_dump.mojo` and
+`src/mojoboost/inspection.mojo` had no caller anywhere when this task
+began. `bindings/inspection_bindings.mojo` gives them one: the concurrent
+inspection lane wrote and registered the dump hooks (§6.3), so
+`mojoboost.inspection.dump_model` now finds a native `dump_model` and the
+text parser is the fallback rather than the only path.
+`model_editing_status_json` is the one function in `inspection.mojo` still
+without a caller; it is a constant status with no handle argument, and
+binding it is a one-line addition whenever a consumer wants it natively.
 
 ## 3. The one decision reversed from an earlier handoff
 
@@ -165,12 +184,15 @@ from.
   gain sums equal it by construction because both read the same
   `Tree.split_gain`.
 - **Kept deliberately.** `python/mojoboost/inspection.py`'s parser, below
-  its `COMPATIBILITY` banner. It is the only working path until the dump
-  hooks exist, and deleting it now would leave `dump_model` with nothing.
-  `migration_19` §8 is still the deletion list and is still correct; this
-  task added three functions to it (`_parse_feature_names`,
-  `_unescape_name`, `_text_gains`) and one signature (`_resolve_names`
-  gained a `from_file` argument).
+  its `COMPATIBILITY` banner. It was the only working path when this task
+  began; the dump hooks are registered now (§6.3), so it is the fallback
+  rather than the path. It is not dead code and should not be deleted with
+  the hooks in place: a caller can hand `dump_model` a model *string*, for
+  which there is no handle to call a hook on, and an older `_mojoboost.so`
+  in the tree still lands here. `migration_19` §8 is still the deletion
+  list and is still correct as an eventual plan; this task added three
+  functions to it (`_parse_feature_names`, `_unescape_name`, `_text_gains`)
+  and one signature (`_resolve_names` gained a `from_file` argument).
 - **Kept deliberately.** `_has_split_gains` in `serialize.mojo` restates
   `model_dump.has_split_gains` per tree. Importing `model_dump` into
   `serialize.mojo` would put an uncompiled module on the critical build
@@ -182,129 +204,123 @@ from.
   a live handle. The text is asked first now; the hook is the fallback.
 - **Quarantined, not removed.** `python/tests/test_contrib.py` carries its
   own model-text parser. It is a test's independent reference and should
-  stay independent, but it hard-asserts `v3` and will fail on the first
-  v4 file. §7 has the exact patch.
+  stay independent; it hard-asserted `v3` and would have failed on the
+  first v4 file, so it was taught v4 in place rather than pointed at the
+  library parser it exists to disagree with. §7.
 
-## 6. Cross-lane patch requests
+## 6. Cross-lane patches: applied
 
-Nothing below was applied. Each names the file, the owner as this round's
-task list has it, and the exact change.
+These began as requests, because the task that opened this handoff owned
+only the four files in the table above. That boundary was then lifted
+explicitly, so everything below is **applied** in the working tree, not
+asked for. One item was deliberately left to its own lane, and it is
+called out as such in §6.3.
 
-### 6.1 `src/mojoboost/model_dump.mojo` (inspection lane, task 19)
+Still nothing was compiled, built, or tested. "Applied" means the edit is
+in the file, and nothing more than that.
 
-Line 68, and it is the one patch that must land with this change or the
-native dump misreports:
+### 6.1 `src/mojoboost/model_dump.mojo` — applied
 
-```mojo
-comptime MODEL_FORMAT_VERSION = 4
-```
+`comptime MODEL_FORMAT_VERSION = 4`, the one patch that had to land with
+this change or the native dump would misreport its own vintage. The
+comment above it now points at `CURRENT_FORMAT_VERSION` in
+`serialize.mojo`, which is the number it has to track and which exists for
+that purpose. `has_split_gains`'s docstring no longer says gains "are not
+serialized"; it says they are, from v4 on, and that a model read from a
+v1, v2, or v3 file carries zeros.
 
-and in `has_split_gains`'s docstring, replace "are not serialized" with
-"are serialized from model format v4 on, so a model read from a v1, v2, or
-v3 file carries zeros". The comment above `MODEL_FORMAT_VERSION` should
-point at `CURRENT_FORMAT_VERSION` in `serialize.mojo`, which is the number
-it has to track and which now exists for that purpose.
+### 6.2 `src/mojoboost/__init__.mojo` — nothing needed
 
-### 6.2 `src/mojoboost/__init__.mojo` (public exports, tasks 06 / 14)
+`serialize` is not re-exported from the package `__init__`, so
+`load_feature_names` needs no export line until it is. The file was left
+alone.
 
-`migration_19` §3's export block, unchanged, plus one line on the existing
-`from .serialize import ...` if there is one (there is not today; serialize
-is not re-exported from the package `__init__`, so `load_feature_names`
-needs no export until it is).
+### 6.3 `bindings/_mojoboost.mojo` — applied, with one deliberate exception
 
-### 6.3 `bindings/_mojoboost.mojo` (task 06)
+Applied here:
 
-1. **Wave 1 of `migration_19` §4, verbatim**: `dump_model`,
-   `dump_model_multiclass`, and their registration. `python/mojoboost/
-   inspection.py` picks them up by name with no Python change; `_hook`
-   already looks for exactly these names and appends `_multiclass` for a
-   softmax handle. Waves 2 and 3 are still separable and still optional.
-2. **Feature names through save and load.** `save` / `save_multiclass`
-   gain the `feature_names` / `n_names` pair the dataset constructor
-   already uses (`python/mojoboost/basic.py:562`), and pass a
-   `List[String]` to `save_model`:
+- `load_feature_names` imported from `mojoboost.serialize`.
+- `_saved_names(feature_names, n_names)`, the sequence-plus-length decoder
+  every string sequence at this boundary already uses.
+- `save` and `save_multiclass` gained the `feature_names` / `n_names`
+  pair and pass a `List[String]` through to `save_model`.
+- `model_feature_names(path)`, which reads a file's names without loading
+  the model, and returns an empty list for a pre-v4 file. Registered as
+  `m.def_function[model_feature_names]("model_feature_names")`.
 
-```mojo
-def save(
-    model: PythonObject,
-    path: PythonObject,
-    feature_names: PythonObject,
-    n_names: PythonObject,
-) raises -> PythonObject:
-    var m = model.downcast_value_ptr[Model]()
-    save_model(m[], String(py=path), _dump_names(feature_names, n_names))
-    return PythonObject(None)
-```
+**Deliberately not applied here:** registering `bindings/
+inspection_bindings.mojo`'s dump hooks. That module was authored by the
+concurrent inspection lane, which was mid-flight on adding `-I bindings`
+to `bindings/build.sh` while this task was working; duplicating the
+registration would have clobbered it. That lane has since landed it —
+`dump_model`, `dump_model_multiclass`, `dump_model_json`,
+`dump_model_json_multiclass`, `split_values`, `dump_raw_scores`,
+`dump_leaf_index`, `objective_code`, `model_file_kind`, and
+`model_format_versions` are all registered as of `63aad82`. Nothing on the
+Python side had to change to pick them up: `_hook` looks for exactly those
+names and appends `_multiclass` for a softmax handle.
 
-   and one new reader, so a loaded `Booster` can recover them:
+The `split_gains` / `split_gains_multiclass` hooks are **still not bound**,
+and that is now a smaller gap than it was: v4 carries the gains in the
+text, so the hook is only what gives a *pre-v4* file's gains back from a
+live handle. `python/mojoboost/inspection.py` asks the text first and the
+hook second, so binding it later changes nothing that works today.
 
-```mojo
-def model_feature_names(path: PythonObject) raises -> PythonObject:
-    """The names a saved model carries, empty for a file that has none."""
-    var out = Python.list()
-    var names = load_feature_names(String(py=path))
-    for i in range(len(names)):
-        out.append(PythonObject(names[i]))
-    return out^
-```
+### 6.4 `python/mojoboost/basic.py` — applied
 
-   with `load_feature_names` added to the `from mojoboost.serialize import`
-   list and `m.def_function[model_feature_names]("model_feature_names")`
-   next to `load`.
+1. `Booster.save_model` passes `names, len(names)` to both `save` and
+   `save_multiclass`, so names written by Python survive the file.
+2. `Booster._load_path` restores them with
+   `names = list(_mojoboost.model_feature_names(path))` and assigns only
+   `if names:`. The guard is not cosmetic: a pre-v4 blob returns an empty
+   list, and an unconditional assignment would erase names an older pickle
+   had carried in its own state.
+3. `Booster.feature_importance`'s docstring no longer claims gains are not
+   serialized. It reports the trained gains; only a model read from a
+   pre-v4 file reports zeros.
+4. `Booster.__getstate__`'s docstring, the `Booster` class docstring,
+   `_continue`, `dump_model`, and the module docstring bullet were
+   corrected the same way. A pickle is `model_to_string`, which carries
+   gains from v4 on.
+5. `Booster.dump_model`, `trees_to_dataframe`, and
+   `get_split_value_histogram` exist as delegating methods. Another lane
+   added them; they are noted here because §6 previously listed them as
+   outstanding.
 
-### 6.4 `python/mojoboost/basic.py` (task 06)
+### 6.5 `python/mojoboost/__init__.py` — done by another lane
 
-1. `Booster.save_model`: pass `self._names` (or `[]`) and its length to the
-   binding, so names written by Python survive the file.
-2. `Booster._load_path`: after loading, `self._names = _mojoboost.
-   model_feature_names(path) or None`. This is what makes
-   `Booster.feature_name()`, the native dump, and the text dump all report
-   the same names for a model read from disk; without it the file's names
-   are visible only to the fallback parser.
-3. `Booster.feature_importance` docstring: "Gains are not part of the
-   serialized model, so a Booster read back from a file or a pickle reports
-   zero gain importance" is now wrong. It reports the trained gains; only a
-   model read from a **pre-v4** file reports zeros.
-4. `Booster.__getstate__` docstring: "and the split gains do not" pickle is
-   now wrong for the same reason. A pickle is `model_to_string`, which
-   carries gains from v4 on.
-5. Still outstanding from `task14_inspection.md` §3, unchanged and not done
-   by anyone yet: `Booster.dump_model`, `Booster.trees_to_dataframe`,
-   `Booster.get_split_value_histogram` as delegating methods, and the
-   module docstring's "No `dump_model` / `trees_to_dataframe`" bullet.
+`mojoboost.inspection` is re-exported and `feature_name_`, `n_features_`,
+`objective_` are delegating properties on `_Base`. Verified present, not
+edited here.
 
-### 6.5 `python/mojoboost/__init__.py` (task 06)
+## 7. Tests changed, and why each is a change in what is true
 
-Unchanged from `task14_inspection.md` §4: re-export the `inspection`
-submodule, add `"inspection"` to `__all__`, and add `feature_name_`,
-`n_features_`, `objective_` to `_Base` as delegating properties (not in
-`_FITTED_ATTRS`).
-
-## 7. Tests that must change, and why each is a change in what is true
-
-None of these are editable here. The first two **will fail** once the
-extension is rebuilt with this change; they pass against the prebuilt
-`_mojoboost.so` in the tree, which still writes v3.
+**All of these are edited and none are run.** Every one encodes a fact
+that v4 changed, so leaving them alone would have left the suite asserting
+the old format. They are written against a rebuilt extension: against the
+prebuilt `_mojoboost.so` in the tree, which still writes v3, the v4
+assertions do not hold. That is the expected state, not a defect, and it
+is the first thing to check after a rebuild.
 
 | File | Change |
 | --- | --- |
-| `python/tests/test_contrib.py` | `_ReferenceModel.__init__` asserts `version == "v3"`; accept `"v4"` and read the two new per-tree blocks in `_read_trees`: after `missing_bin`, expect the token `counts`, read a flag, read `n_nodes` covers only when it is 1 (else zeros), then expect `gains`, read a flag, read `n_nodes` gains when it is 1. Also skip an optional `feature_names <n>` + `n` tokens right after the version, before the kind token. `_downgrade_to_v2` rewrites `mojoboost v3` and drops one line per tree; for v4 it rewrites `mojoboost v4` and drops the `counts` flag line, the covers line if present, the `gains` flag line, and the gains line if present |
-| `python/tests/parallel/test_inspection.py` | `test_dump_reports_its_own_version_and_source`: `has_split_gain` is now `True` (`source` still starts with `model_to_string`, so that half stands). `test_nodes_carry_the_documented_keys` line 115: an internal node's `split_gain` is a finite number, not `None`. `test_trees_to_records_has_lightgbm_columns` line 311: internal-node rows carry a gain; leaf rows still carry `None`. Worth adding in the same commit: the per-feature sums of the dump's `split_gain` equal `booster_.feature_importance("gain")`, and a saved-and-reloaded model reports `has_split_gain: True` where it used to report `False` |
-| `tests/parallel/api_snapshot_manifest.json` | `versions.model_format` and `model_format.version` become `"v4"`; `readable_versions` gains `"v4"`; `model_format.sections` gains a `"v4"` entry (`per-node split gains, flagged`, `per-node covers behind a presence flag`, `optional feature names`); `absent_by_design` **drops** `"split gains"` and `"feature names"`; `mojo.public_api.serialize` gains `"load_feature_names"`; `inspection.all` gains `"MODEL_EDITING_SUPPORTED"`, `"feature_importance"`, `"leaf_outputs"`, `"model_editing_support"` |
-| `tests/test_serialize.mojo` | worth adding, and the smallest real check of this change: fit a small model, save, load, and assert every node's `split_gain` matches bit for bit; then save a model built from a tree with no covers and assert it loads. A names round trip is a third case |
+| `python/tests/test_contrib.py` | `_ReferenceModel` asserts `"v4"` and keeps the version on `self`. `_read_feature_names` skips the optional `feature_names <n>` section between the version and the kind token; the count is read into a named local first, because a list comprehension over `self._next()` would leave the token order to evaluation order. `_read_trees` reads the `counts` flag and then the covers only when it is 1, then the `gains` flag and the gains the same way. `_Tree.__slots__` gained `"split_gain"`, without which the assignment raises. `_downgrade_to_v2` was rewritten to drop the four v3/v4 lines conditionally rather than one line per tree |
+| `python/tests/parallel/test_inspection.py` | `model_format_version == 4`; `source in ("native", "model_to_string")`, because the native hooks are registered now and which one answers depends on the build; `has_split_gain is True`; internal nodes assert a finite `split_gain > 0.0`; `trees_to_records` asserts gain-present-iff-internal. `test_dump_from_the_model_text_alone` compares through a new `_without_source` helper, since a text dump and a native dump agree on everything except which of them built it. Four tests added: the editing refusal is reported rather than discovered; the dump's per-feature gain sums equal `feature_importance("gain")`; a saved and reloaded model keeps its gains; `leaf_outputs` are the leaf values by ordinal |
+| `tests/parallel/api_snapshot_manifest.json` | `versions.model_format` and `model_format.version` are `"v4"`; `readable_versions` gained `"v4"`; `model_format.sections` gained a `v4` entry; `absent_by_design` **dropped** "split gains" and "feature names", which is the whole point of the change; `mojo.public_api.serialize` gained `load_feature_names`; `inspection.all` was resynced with `inspection.__all__` |
+| `tests/test_serialize.mojo` | **not written.** Still the smallest real check of this change, and still worth adding: fit a small model, save, load, assert every node's `split_gain` matches bit for bit; save a model whose trees have no covers and assert it loads; round trip a name holding a space and a backslash |
 
-## 8. Documentation that is now stale
+## 8. Documentation updated
 
-| File | Line | What |
-| --- | --- | --- |
-| `docs/COMPATIBILITY_POLICY.md` | 71 | model format version `v3` → `v4` |
-| | 408 | "`v3`" in the format description |
-| | 428 | the version table gains a v4 row |
-| `docs/MODEL_INSPECTION_SCHEMA.md` | — | `has_split_gain` is false when the model carries no gains, which is now only a pre-v4 file (`migration_19` §7 already asked for this clause); the "Native hooks" section; feature names can come from the model file |
-| `docs/LIGHTGBM_PARITY.md` | 280 | "now at v3" |
-| | the five rows `task14_inspection.md` §5 lists | still pointing at task 14; `pixi run check-parity` is its own CI job, so edit them in the same commit as the Python surface |
-| `README.md` | 582 | says gains cannot be recovered because they are not in the format |
-| `docs/tutorials/feature_complete_walkthrough.md` | 305, 400 | "currently v3", "retrain and save in v3" |
+All applied. Listed so a reviewer can check the claims rather than
+rediscover which files talk about the format.
+
+| File | What changed |
+| --- | --- |
+| `docs/COMPATIBILITY_POLICY.md` | version table and §7.1 say v4; §7.2 gained a v4 row and two paragraphs, on reporting the absence of covers and gains rather than writing zeros, and on what a lossless re-save does; §5.3's persistence table and §7.5's "what the file deliberately does not hold" both corrected |
+| `docs/MODEL_INSPECTION_SCHEMA.md` | `has_split_gain` is false only for a pre-v4 model, and both flags are properties of the model rather than of the version alone; a new "Where the names come from" section giving the four-source precedence; the editing status is now a documented payload; `leaf_outputs` and `feature_importance` added to the derived shapes; "Native hooks" rewritten for hooks that exist |
+| `docs/LIGHTGBM_PARITY.md` | "Split gains in a dump" deferred → supported; `Booster.dump_model / trees_to_dataframe` partial → supported; the leaf-output row deferred → partial, since the getter half now exists; `Booster(model_file=)`; "now at v4". One citation was reworded so `tools/check_parity.py`'s `PATH_RE` can actually verify it: that regex only matches a backticked path, so `inspection.mojo::model_editing_status_json` was split into a path and a symbol |
+| `README.md` | the covers-and-gains paragraph, which said gains cannot be recovered because the format does not hold them, and the pickle-versus-save paragraph |
+| `docs/tutorials/feature_complete_walkthrough.md` | the persistence table; "currently v4"; what `has_split_gain` means; "re-save from a current build" replacing "retrain" |
 
 ## 9. Fallbacks preserved
 

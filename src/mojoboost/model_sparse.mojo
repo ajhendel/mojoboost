@@ -36,7 +36,11 @@ from .boosting import (
     _softmax_inplace,
 )
 from .bagging import BaggingParams
-from .boosting_sparse import train_multiclass_sparse, train_sparse
+from .boosting_sparse import (
+    prepare_bundling_csc,
+    train_multiclass_sparse,
+    train_sparse,
+)
 from .goss import GossParams
 from .sampling import ClassBaggingParams
 from .model import Model, MulticlassModel
@@ -73,13 +77,24 @@ def fit_csc(
     than quantiles, exactly as in `fit`: `fit_categorical_spec_csc` counts an
     absent entry as category code 0, which is what it is, and the fitted
     tables, tie-breaking, and unknown-category bin are the dense ones.
-    `init_score` and `class_bagging` carry their `train_sparse` meanings."""
+    `init_score` and `class_bagging` carry their `train_sparse` meanings.
+
+    `params.bundling` is exclusive feature bundling, and this is where it is
+    fitted: `prepare_bundling_csc` either replaces the binned matrix with a
+    bundled one and returns the view that reads it, or declines and returns
+    the matrix untouched (which is the default, since `enable_bundle`
+    defaults to off). Either way the model returned is the same shape -- the
+    plan is training-time scaffolding and is dropped here, so `mapper` and
+    the trees are in the original feature space and nothing about
+    `save_model` changes."""
     var mapper = fit_bins_csc(
         csc, max_bins, categorical_features, use_missing
     )
-    var data = transform_csc(mapper, csc)
+    var prepared = prepare_bundling_csc(
+        mapper, transform_csc(mapper, csc), params.bundling
+    )
     var booster = train_sparse(
-        data,
+        prepared.data,
         target,
         objective,
         params,
@@ -89,6 +104,7 @@ def fit_csc(
         goss,
         init_score,
         class_bagging,
+        prepared.bundling,
     )
     return Model(mapper^, booster^)
 
@@ -107,13 +123,24 @@ def fit_multiclass_csc(
 ) raises -> MulticlassModel:
     """Fit a softmax multiclass model on a sparse matrix, labels in
     0..n_classes-1. `goss` draws one gradient-based sample per round, shared
-    by every class's tree in that round, as in `fit_multiclass`."""
+    by every class's tree in that round, as in `fit_multiclass`.
+    `params.bundling` carries its `fit_csc` meaning, and the one plan fitted
+    here is shared by every class's tree."""
     var mapper = fit_bins_csc(
         csc, max_bins, categorical_features, use_missing
     )
-    var data = transform_csc(mapper, csc)
+    var prepared = prepare_bundling_csc(
+        mapper, transform_csc(mapper, csc), params.bundling
+    )
     var booster = train_multiclass_sparse(
-        data, labels, n_classes, params, sample_weight, bagging, goss
+        prepared.data,
+        labels,
+        n_classes,
+        params,
+        sample_weight,
+        bagging,
+        goss,
+        prepared.bundling,
     )
     return MulticlassModel(mapper^, booster^)
 

@@ -17,6 +17,21 @@ Read and not edited: `trainset.mojo`, `raw_data.mojo`, `sparse.mojo`,
 
 Nothing was committed, staged, built, run, or tested.
 
+> **All four lane files are already tracked at HEAD, committed by other
+> sessions.** `5085097` ("Expand validation and advanced training
+> integration") picked up `src/mojoboost/validation.mojo`,
+> `python/mojoboost/_validation.py`, and `docs/VALIDATION_CONTRACT.md`;
+> `e28a24d` ("Integrate advanced training and public API work") picked up
+> this handoff and the remaining `validation.mojo` delta (the `: Int`
+> annotations on the `comptime` ceilings, and the `scan_column` bounds guard
+> — negative-feature check, `checked_mul` for the column base offset, and a
+> slice-bound check against `len(values)`). All four match what this lane
+> wrote; three of them now produce **zero diff** against HEAD, and the only
+> uncommitted content in the lane is the test-expectation detail added to
+> **P14**, **P15**, and open question 3 below. This lane committed nothing
+> itself. An integrator should not read the zero-diff files as unfinished
+> work, and should not re-apply them.
+
 > **Concurrent work is live in this tree.** While this lane was reading,
 > another session extended `trainset.mojo` (reference binning,
 > `subset_shared_binning`, sparse datasets, `from_binned_dense` /
@@ -905,10 +920,36 @@ def _check_compressed(
   or (b) have `_arrays` catch the bridged error and re-raise as `ValueError`,
   which preserves the type at the cost of one `try` per entry point. This
   lane recommends (b).
+- **Tests that assert the rules step 2 removes.**
+  `python/tests/test_validation.py` (committed, 179 lines, `8913489`) pins
+  exactly the Python-side numeric domain. It is **not** this lane's file and
+  was not edited. Step 2 moves each of these to the native error surface, so
+  whoever applies it owns moving the expectation with it. Native wording is
+  given so the `match=` string can be updated in the same edit:
+
+  | Test (line) | Asserts | Native replacement | Wording still matches? |
+  | --- | --- | --- | --- |
+  | `test_x_rejects_infinities` (42) | `ValueError`, `"infinite"` | `check_features_finite` — `"feature values must not be infinite (NaN is allowed ...)"` | yes |
+  | `test_predict_validates_like_fit` (166) | `ValueError`, `"infinite"` | same, on the predict path | yes |
+  | `test_regression_target_must_be_finite` (82) | `ValueError`, `"NaN or infinite"` | `check_labels_finite` -> `check_finite_vector` — `"label must be finite: entry 1 is nan"` | **no** |
+  | `test_classifier_rejects_non_finite_numeric_labels` (100) | `ValueError`, `"NaN or infinite"` | same (this one arrives via `encode_labels`, a distinct path — check whether step 2 even reaches it) | **no** |
+  | `test_sample_weight_must_be_finite` (124) | `ValueError`, `"NaN or infinite"` | `check_weights` — `"sample_weight must be finite: row 1 is nan"` | **no** |
+  | `test_sample_weight_must_be_nonnegative` (129) | `ValueError`, `"nonnegative"` | `check_weights` — `"sample_weight must be nonnegative: row 1 is -1.0"` | yes |
+  | `test_sample_weight_must_not_be_all_zeros` (134) | `ValueError`, `"all zeros"` | `check_weights` — `"sample_weight must have a positive sum, got 0.0; an all-zero vector drops every row from training"` | **no** |
+
+  Four of the seven need a new `match=` string. **All seven need the
+  exception type resolved first** — they all expect `ValueError`, and a
+  native raise crosses the bridge as `RuntimeError` unless option (b) below
+  is taken. Two neighbours must keep passing unchanged:
+  `test_x_allows_nan_as_the_missing_marker` (49) — `check_features_finite`
+  permits NaN, by design — and
+  `test_zero_weights_are_allowed_when_some_row_survives` (139) —
+  `check_weights` rejects only a zero *total*, not a zero entry.
 - **Dependency:** P4 and P10 for step 2.
 - **Minimal later validation (UNRUN):** fit on a frame with a NaN feature
   (must succeed, NaN is missing) and on one with an `inf` feature (must
-  raise, from whichever side owns it after the patch).
+  raise, from whichever side owns it after the patch). Then re-run
+  `python/tests/test_validation.py` and reconcile the seven rows above.
 
 ---
 
@@ -938,10 +979,20 @@ def _check_compressed(
 - **Serialization effect:** none.
 - **Public API effect:** additive refusals, both `ValueError`. A user who has
   been fitting on a misaligned frame will start seeing an error; that is the
-  point, and it should be in the changelog.
+  point, and it should be in the changelog. **One existing expectation
+  breaks on wording, not on type:**
+  `python/tests/test_validation.py::test_predict_rejects_a_different_feature_count`
+  (line 161) asserts `ValueError, match="expecting 4 features"`, while
+  `check_feature_count_matches` raises
+  `"X has 5 features, but this model was fitted on 4"`. The type is right and
+  the meaning is identical. Either update the `match=` string in that test
+  (not this lane's file) or reword the message in `_validation.py` (which
+  *is* this lane's file) — the latter is the smaller change and the message
+  is not load-bearing anywhere else.
 - **Dependency:** none.
 - **Minimal later validation (UNRUN):** fit on `(DataFrame, Series)` with a
-  shared index (passes) and with `y` reindexed (must raise).
+  shared index (passes) and with `y` reindexed (must raise). Then re-run
+  `python/tests/test_validation.py` and settle the `match=` string above.
 
 ---
 
@@ -1021,8 +1072,20 @@ def _check_compressed(
    their current contract.
 
 3. **Message-text assertions in the test tree.** Nearly every patch changes
-   error wording to add the offending index and value. This lane did not
-   read the tests and did not run them. Expect to update expectations.
+   error wording to add the offending index and value.
+   `python/tests/test_validation.py` (179 lines, `8913489`) is where that
+   lands hardest: it pins the Python-side numeric domain with
+   `pytest.raises(ValueError, match=...)`. This lane **read** it statically
+   and did **not** run it, and did **not** edit it — it is outside this
+   lane's ownership. Eight expectations are affected, enumerated with their
+   native replacement wording in the tables under **P14** (seven, from the
+   numeric-domain removal) and **P15** (one, the feature-count message).
+   Four of the eight fail on the `match=` string alone; all seven under P14
+   also depend on how open question 2 is resolved, because they expect
+   `ValueError` and a native raise arrives as `RuntimeError` unless the
+   bridge re-raises. Resolve question 2 first, then update the eight in a
+   single pass. Other test files were not read; expect more of the same
+   wherever a message is asserted.
 
 4. **`ranking.MAX_RELEVANCE_LABEL` vs `validation.MAX_RELEVANCE`** are two
    names for `30`. Unify or assert; do not leave both free.

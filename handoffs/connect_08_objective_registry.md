@@ -1,6 +1,6 @@
 # Handoff, connect task 08: the native objective and metric registry, everywhere
 
-Lane 08. Owned files, and the only files edited:
+Lane 08. Owned files:
 
 - `src/mojoboost/objective_registry.mojo`
 - `src/mojoboost/objective.mojo`
@@ -8,23 +8,37 @@ Lane 08. Owned files, and the only files edited:
 - `src/mojoboost/custom_metric.mojo`
 - this handoff
 
-Nothing was committed by this lane. Note for whoever reads `git log`:
-concurrent lanes committed the shared worktree three times mid-session
-(`dc21f03`, `860b1cf`, `e6f3959`) and swept this lane's in-progress edits
-into those commits, so the four owned source files show as clean rather than
-modified. The content is intact and was verified after each sweep; the commit
-authorship is not this lane's doing and no commit was made from here. This
-handoff is the only file left untracked.
+**Four files outside that list were also edited, in a second pass, at the
+repository owner's explicit direction** after the first pass filed them as
+cross-lane patch requests. They are `src/mojoboost/__init__.mojo` (6.1),
+`src/mojoboost/boosting.mojo` and `src/mojoboost/gpu_predict.mojo` (6.5), and
+nothing else. Each edit is exactly the patch this handoff already specified,
+applied rather than requested; every section below that described one as
+pending has been rewritten to say what landed. No other lane's file was
+touched, nothing was reverted, reformatted, or cleaned, and no commit was made
+from here.
+
+Note for whoever reads `git log`: concurrent lanes committed the shared
+worktree several times mid-session (`dc21f03`, `860b1cf`, `e6f3959` among
+them) and swept this lane's in-progress edits into those commits, so most of
+these files show as clean rather than modified. The content is intact and was
+verified after each sweep; the commit authorship is not this lane's doing.
 
 Baseline for every line count below is `20e0fcc`, the last commit that
 predates this lane's first edit.
 
-| File | Before | After |
-| --- | --- | --- |
-| `objective_registry.mojo` | 1165 | 1698 |
-| `metrics.mojo` | 600 | 751 |
-| `custom_metric.mojo` | 1574 | 2283 |
-| `objective.mojo` | 321 | 498 |
+| File | Before | After | Owned |
+| --- | --- | --- | --- |
+| `objective_registry.mojo` | 1165 | 1811 | yes |
+| `metrics.mojo` | 600 | 751 | yes |
+| `custom_metric.mojo` | 1574 | 2283 | yes |
+| `objective.mojo` | 321 | 498 | yes |
+| `__init__.mojo` | 331 | +140 lines, all additions | no — 6.1 |
+| `boosting.mojo` | 1871 | see 6.5 | no — 6.5 |
+| `gpu_predict.mojo` | 1341 | see 6.5 | no — 6.5 |
+
+The last two carry concurrent edits from other lanes, so a line delta would
+not be this lane's; 6.5 lists the changes by name instead.
 
 `git diff --check` is clean.
 
@@ -258,30 +272,45 @@ New registry facts, all consumed by at least one of the above:
 | --- | --- | --- |
 | the objective-code link table in `response_scale` | `custom_metric.mojo` | `objective_link` |
 | `BINARY_LOGISTIC`, `CROSS_ENTROPY`, `GAMMA`, `POISSON`, `TWEEDIE` imports | `custom_metric.mojo` | nothing — they existed only for that table |
-| `comptime METRIC_L2 .. METRIC_MAP`, `N_BUILTIN_METRICS` | `objective_registry.mojo` | imported from `metrics.mojo` and re-exported |
+| `comptime METRIC_L2 .. METRIC_MAP`, `N_BUILTIN_METRICS` | `objective_registry.mojo` | defined in `metrics.mojo`, imported and re-declared here |
+| the objective-code link table in `Booster.response` | `boosting.mojo` | `objective_link` (6.5) |
+| the objective-code link table in `response_for_objective` | `gpu_predict.mojo` | `objective_link` (6.5) |
+| `_check_objective`'s four parameter-range branches | `boosting.mojo` | `check_objective_param` (6.5) |
+| `objective_renews_leaves`'s body | `boosting.mojo` | delegates to the registry (6.5) |
 
 The third row is a *move*, not a deletion, and it deserves the argument.
 A metric code names a function, and nineteen of the twenty-one functions are
 in `metrics.mojo`, so the numbering belongs with them. The registry imports
-and re-exports them, so `objective_registry.METRIC_L2` still resolves and
-every value is unchanged — lane 21's export patch (its section 3.1) still
-works verbatim.
+them under `_`-prefixed names and re-declares each as
+`comptime METRIC_L2 = _METRIC_L2`, so `objective_registry.METRIC_L2` still
+resolves, is defined in the module that exports it, and carries an unchanged
+value — lane 21's export patch (its section 3.1) still works verbatim. That
+re-declaration is `device.mojo`'s pattern over `device_policy.mojo`, adopted
+for the reason `device.mojo` gives: the symbols a module has always exported
+should be defined in it, whatever an importer's view of a re-exported name
+turns out to be. It also retires the open question this handoff used to
+carry as 9.3.
 
 The move was forced as well as right. `metrics.mojo` **cannot** import
-`objective_registry`: `boosting.mojo` imports `_argsort` from `metrics.mojo`
-and the registry imports `boosting.mojo`, so the three would form a cycle.
-Defining the codes in the leaf and importing upward is the only direction
-that works. The dependency edges now read:
+`objective_registry`: `boosting.mojo` imports `_argsort` from `metrics.mojo`,
+so anything `boosting.mojo` sits above must stay above `metrics.mojo` too.
+
+The last four rows are the second pass. The objective codes moved the other
+way — *up*, out of `boosting.mojo` into the registry, re-declared back into
+`boosting.mojo` by the same pattern — which reverses the one edge that used to
+force the registry to import `boosting.mojo`. With that edge gone the whole
+graph is a line:
 
 ```
-metrics  <-  boosting  <-  objective_registry  <-  objective  <-  custom_metric
-   ^-------------------------|                        ^              ^
-   (registry imports metrics directly too)            |              |
-                                            custom_metric imports all of them
+metrics  <-  objective_registry  <-  boosting  <-  objective  <-  custom_metric
+                    ^                    ^
+                    |                    +-- gpu_predict, and everything else
+                    +-- imported directly by all four
 ```
 
-No cycle. This is stated in both module docstrings so the next person does
-not try to "fix" it.
+No cycle, and no module below `boosting.mojo` needs to know it exists. This
+is stated in the module docstrings so the next person does not try to "fix"
+it.
 
 ### 4.2 Quarantined (documented, not deleted, because the file is another lane's)
 
@@ -289,8 +318,6 @@ not try to "fix" it.
 | --- | --- | --- |
 | `comptime _METRIC_*` (21 lines) | `bindings/_mojoboost.mojo` | 6.4 |
 | `eval_metric`'s 21-branch dispatch + hand-written transform | `bindings/_mojoboost.mojo` | 6.4 |
-| `Booster.response`'s link chain | `boosting.mojo` | 6.5 |
-| `response_for_objective`'s link chain | `gpu_predict.mojo` | 6.5 |
 | `supports_device_objective` | `gpu_objectives_native.mojo` | 6.2 |
 | `objective_from_name`, `objective_display_name`, `objective_default_alpha`, `_alpha_key_for`, `_raise_if_unimplemented_objective`, `comptime MULTICLASS` | `params.mojo` | lane 21 section 3.2, unchanged |
 | `comptime LAMBDARANK` | `ranking.mojo` | lane 21 section 3.3, unchanged |
@@ -301,13 +328,22 @@ not try to "fix" it.
 ### 4.3 Mirrors still inside the registry
 
 Unchanged from lane 21's handoff, and still labelled in the module
-docstring: `comptime MULTICLASS`, `comptime LAMBDARANK`, and
-`objective_gradients_on_device`. Each is a duplicate of a file this lane does
-not own and each is removed by a patch listed above. One mirror was added:
-`objective_param_domain` restates the four intervals `_check_objective`
-enforces. That one is **loud rather than silent** — `check_objective_param`
-runs both and raises a "registry drift" error naming both sides if they ever
-disagree. It is one comparison, once per training run.
+docstring: `comptime MULTICLASS` (mirrored in `params.mojo`) and
+`comptime LAMBDARANK` (mirrored in `ranking.mojo`). Both are removed by lane
+21's sections 3.2 and 3.3, in files this lane does not own.
+`objective_gradients_on_device` is the third and is lane 03's (6.2a).
+
+`objective_param_domain` was a fourth mirror in the first pass, restating the
+four intervals `_check_objective` enforced, kept honest by a drift check that
+ran both. The second pass deleted the mirror instead: `_check_objective` now
+calls `check_objective_param`, the domain is stated once, and the drift check
+is gone because there is no longer a second side to drift from. The four
+error sentences a user sees are unchanged, verbatim — see 6.5.
+
+`comptime SQUARED_ERROR .. CROSS_ENTROPY`, `CUSTOM`, `DEFAULT_FAIR_C`,
+`DEFAULT_TWEEDIE_VARIANCE_POWER`, and `objective_renews_leaves` are now
+*defined* here and re-declared in `boosting.mojo`, so they are no longer
+mirrors in either direction: one definition, one binding, one value.
 
 ---
 
@@ -362,10 +398,17 @@ two identical entries in the early-stopping state.
 
 ## 6. Cross-lane patch requests, exact
 
-### 6.1 Task 01 (`src/mojoboost/__init__.mojo`) — blocks everything else
+### 6.1 Task 01 (`src/mojoboost/__init__.mojo`) — APPLIED
 
-Nothing in this lane is reachable as `mojoboost.*` until this lands. Add,
-after the `from .metrics import (...)` block:
+Nothing in this lane was reachable as `mojoboost.*` without it, so it was
+applied here rather than requested (see the note at the top of this handoff).
+`+140` lines, every one an addition; no existing export line was changed,
+moved, or removed. Task 01 should read this as a done deal rather than a
+request, and re-check it only if it is reorganizing the file.
+
+The registry block was inserted after `from .metrics import (...)`, with a
+comment above it saying what the surface is and which names are deliberately
+absent:
 
 ```mojo
 from .objective_registry import (
@@ -460,16 +503,30 @@ from .objective_registry import (
 )
 ```
 
-Three deliberate omissions, each of which is a **duplicate-symbol error** if
-added today. The registry re-exports all three, so importing them from here
-*and* from their defining module puts the same name in the namespace twice:
+Three deliberate omissions, each of which would be a **duplicate-symbol
+error**. Every one of these names does reach `mojoboost.*` — just from the
+module that defines it, not from the registry as well:
 
-- `MULTICLASS` and `LAMBDARANK` — defined twice until lane 21's sections 3.2
-  and 3.3 land (`params.mojo`, `ranking.mojo`).
-- `objective_renews_leaves` — already exported from `.boosting`.
-- the `METRIC_*` codes and `N_BUILTIN_METRICS` — see the next block.
+- the objective codes `SQUARED_ERROR .. CROSS_ENTROPY`, `CUSTOM`,
+  `DEFAULT_FAIR_C`, `DEFAULT_TWEEDIE_VARIANCE_POWER`, and
+  `objective_renews_leaves` — already exported from `.boosting`, which
+  re-declares them from the registry (4.1). `MULTICLASS` arrives from
+  `.params` and `LAMBDARANK` from `.ranking`, and stays that way until lane
+  21's sections 3.2 and 3.3 land.
+- the `METRIC_*` codes, `N_BUILTIN_METRICS`, and `DEFAULT_BINARY_THRESHOLD` —
+  from `.metrics`; see the next block.
+- the alias-name tables `OBJECTIVE_ALIAS_NAMES`, `METRIC_ALIAS_NAMES`,
+  `KNOWN_OBJECTIVE_NAMES`, `UNIMPLEMENTED_OBJECTIVE_ALIAS_NAMES`, and the four
+  `*_METRIC_NAMES` strings. Not a collision — these are the joined strings the
+  `*_names` query functions return, and the functions are the surface. Export
+  them only if a caller needs the table itself.
 
-Extend the existing `from .metrics import (...)` block with:
+A duplicate check over the finished file (all `from .x import (...)` blocks,
+454 names) reports no name twice.
+
+Extend the existing `from .metrics import (...)` block with (applied; the
+constants sort above `average_precision`, `eval_metric_by_code` between
+`cross_entropy_loss` and `fair_loss`):
 
 ```mojo
     DEFAULT_BINARY_THRESHOLD,
@@ -499,11 +556,18 @@ Extend the existing `from .metrics import (...)` block with:
 ```
 
 Import the metric codes from `.metrics` and **not** from
-`.objective_registry`: they are the same constants (the registry
-re-exports them) and importing both spellings into one namespace is a
-duplicate.
+`.objective_registry`: they are the same constants (the registry re-declares
+them) and importing both spellings into one namespace is a duplicate.
 
-Extend `from .objective import (...)` with:
+One consequence worth knowing before the compatibility snapshot lands:
+`tools/api_snapshot.py`'s `mojo_exports_by_module` parses exactly these
+blocks, so the new names become part of `compatibility/api_snapshot.json` the
+first time it is written. That file does not exist in the tree yet, so
+`--check` cannot fail on this today. `tests/parallel/api_snapshot_manifest.json`
+does list the old `custom_metric` export set and is now stale, but it says of
+itself that "nothing re-runs it", so it is a record rather than a gate.
+
+Extend `from .objective import (...)` with (applied):
 
 ```mojo
     apply_sample_weight,
@@ -512,7 +576,8 @@ Extend `from .objective import (...)` with:
     matching_base_score,
 ```
 
-Extend `from .custom_metric import (...)` with:
+Extend `from .custom_metric import (...)` with (applied; `BuiltinMetricContext`
+sorts with the other structs, the rest alphabetically among the functions):
 
 ```mojo
     BuiltinMetricContext,
@@ -666,14 +731,50 @@ name is *absent* from the alias tuple rather than a sentinel code.
 **(c)** Do not add a metric-computation binding beyond (a). There is exactly
 one native code-to-call map and it should stay that way.
 
-### 6.5 The remaining two link copies (lanes owning `boosting.mojo` and `gpu_predict.mojo`)
+### 6.5 The other two link copies (`boosting.mojo`, `gpu_predict.mojo`) — APPLIED
 
-Not this lane's files, and not lane 03's or 07's either. Recording them here
-because `custom_metric.response_scale` has now moved and leaving the other
-two behind is the whole risk of a partial migration.
+The first pass filed these as requests and flagged the `boosting.mojo` one as
+a trap: the registry imported `boosting.mojo`, so `boosting.mojo` could not
+import the registry, and the patch as written would have made a cycle. Two
+ways out were recorded. **Option 1, the clean one, was taken**, so this
+section now describes what is in the tree.
+
+**`objective_registry.mojo` — the edge reversal.** The registry no longer has
+a `from .boosting import (...)` line at all; its only import is
+`from .metrics import (...)`. What moved into it:
+
+- `comptime SQUARED_ERROR = 0` .. `CROSS_ENTROPY = 12`, plus `CUSTOM = 6`,
+  `LAMBDARANK = 7`, `MULTICLASS = -1`, `DEFAULT_FAIR_C = 1.0`, and
+  `DEFAULT_TWEEDIE_VARIANCE_POWER = 1.5`. Same values.
+- `objective_renews_leaves`, three comparisons, moved body and all.
+- `check_objective_param` became self-contained: it asks
+  `objective_param_domain` and raises. The four LightGBM-parity sentences
+  (`"huber requires alpha > 0"`, `"quantile requires 0 < alpha < 1"`,
+  `"fair requires alpha (fair_c) > 0"`,
+  `"tweedie requires 1 < alpha (tweedie_variance_power) < 2"`) are reproduced
+  verbatim, and a fifth generic branch built from `ParamDomain.describe()`
+  covers anything added later. `_POISSON_MAX_DELTA_STEP` stayed in
+  `boosting.mojo`: it is a term in a hessian, not a fact about an objective.
+
+**`boosting.mojo` — four changes, all local.**
+
+1. A `from .objective_registry import (...)` block importing the codes under
+   `_`-prefixed names plus `LINK_EXP`, `LINK_SIGMOID`, `objective_link`,
+   `check_objective_param`, and `objective_renews_leaves as
+   _objective_renews_leaves`.
+2. Each constant re-declared under the name this module has always exported:
+   `comptime SQUARED_ERROR = _SQUARED_ERROR`, and so on for the other
+   thirteen. Every existing `from .boosting import SQUARED_ERROR` in the tree
+   keeps working and keeps reading the same value; nothing outside this file
+   had to change.
+3. `objective_renews_leaves` is now `return _objective_renews_leaves(objective)`.
+4. `_check_objective`'s four `if objective == X and not (bounds)` branches
+   replaced by one `check_objective_param(objective, alpha)`. Same messages,
+   same order, one statement of the intervals.
+
+And `Booster.response` is the patch as originally written:
 
 ```mojo
-# boosting.mojo, Booster.response
 var link = objective_link(self.objective)
 if link == LINK_SIGMOID:
     return _sigmoid(raw)
@@ -682,28 +783,36 @@ if link == LINK_EXP:
 return raw
 ```
 
-**This creates a cycle and must not be applied as written.**
-`objective_registry.mojo` imports `boosting.mojo`, so `boosting.mojo` cannot
-import the registry. Two ways out, for whoever owns the sequencing (lane 22
-is the natural home for the decision):
+`exp` and `_sigmoid` are still imported and still used elsewhere in the file
+(the poisson, gamma, tweedie, and logistic gradient fills); nothing became
+dead.
 
-1. Move the objective code constants (`SQUARED_ERROR .. CROSS_ENTROPY`,
-   `DEFAULT_FAIR_C`, `DEFAULT_TWEEDIE_VARIANCE_POWER`) and
-   `objective_renews_leaves` out of `boosting.mojo` into
-   `objective_registry.mojo`, reversing that one edge. The registry would
-   then import nothing from `boosting.mojo` except `_check_objective`, which
-   is the only remaining reason for the edge, and `check_objective_param`
-   could enforce `objective_param_domain` directly instead of delegating.
-   This is the clean end state and it deletes the drift check in
-   `check_objective_param`.
-2. Leave `Booster.response` as it is and document it as the third copy.
+**`gpu_predict.mojo` — the easy one.** `response_for_objective` now maps
+`LINK_*` to its own `RESPONSE_*` codes and the five objective-code imports it
+carried from `.boosting` are gone:
 
-`gpu_predict.response_for_objective` has no such problem — `gpu_predict.mojo`
-does not sit under the registry — and becomes a two-line map from `LINK_*` to
-its `RESPONSE_*` codes. Land it with
-`tests/parallel/test_gpu_predict.mojo` and
-`tests/test_backend_equivalence.mojo` green: it changes no value, it moves a
-branch.
+```mojo
+var link = objective_link(objective)
+if link == LINK_SIGMOID:
+    return RESPONSE_SIGMOID
+if link == LINK_EXP:
+    return RESPONSE_EXP
+return RESPONSE_IDENTITY
+```
+
+It changes no value; it moves a branch. Its import line is now
+`from .objective_registry import (LINK_EXP, LINK_SIGMOID,
+metric_canonical_name, objective_link)`.
+
+Note the deliberate asymmetry with `response_scale`: here `LINK_SOFTMAX`
+falls through to `RESPONSE_IDENTITY`, because the multiclass GPU path takes
+the softmax itself over a row block and asks this function only for the
+per-element stage. `response_scale` has no such caller above it and raises
+instead (9.2). Both are documented at their definitions.
+
+All four copies of the inverse link — `Booster.response`, `response_scale`,
+`response_for_objective`, and the binding's transform (6.4, still
+outstanding) — are down to three read from one table and one request.
 
 ---
 
@@ -711,29 +820,32 @@ branch.
 
 Honest list of what is still not wired, and why.
 
-1. **The registry is still not exported.** Until section 6.1 lands, none of
-   this is reachable as `mojoboost.*`, and the only live consumers are the
-   three owned modules that import it directly. This is the single blocking
-   item.
-2. **`metrics.mojo` does not import the registry and never will.** The cycle
-   through `boosting._argsort` forbids it. This is stated as a fact rather
-   than a gap: `metrics.mojo` is arithmetic and the registry connection lives
-   one level up, in `custom_metric.eval_builtin_metric`. If a future change
+The first pass listed seven. Three of them (the missing export, the
+`Booster.response` copy, the duplicated parameter domain) were closed by the
+second pass and are described in 6.1 and 6.5. What is left:
+
+1. **`metrics.mojo` does not import the registry.** It is the leaf; the
+   registry imports *it*. This is a fact rather than a gap: `metrics.mojo` is
+   arithmetic, and the registry connection lives one level up in
+   `custom_metric.eval_builtin_metric`. `boosting.mojo` also takes `_argsort`
+   from it, so the direction is forced as well as chosen. If a future change
    genuinely needs registry facts inside `metrics.mojo`, the patch is to move
    `_argsort` into a leaf module (`sampling.mojo` or a new `sortutil.mojo`)
-   and repoint `boosting.mojo`'s import. Not done here: `boosting.mojo` is
-   not this lane's file and the move buys nothing today.
-3. **No native caller of `check_objective_class_weight`.** No native entry
+   and repoint `boosting.mojo`'s import.
+2. **No native caller of `check_objective_class_weight`.** No native entry
    point takes a `class_weight` argument — expansion is the caller's job, by
    `class_weight.mojo`'s design — so the check has nowhere native to sit. It
    is for lane 07 (6.3d).
-4. **No native caller of `check_objective_backend`.** For lanes 03 and 05.
-5. **`objective_param_domain` is a second statement of `_check_objective`'s
-   ranges.** Loud (the drift check) but still second. 6.5 option 1 removes
-   it.
-6. **The three registry mirrors from lane 21 are untouched**: `MULTICLASS`,
-   `LAMBDARANK`, `objective_gradients_on_device`. Their deletions are lane
-   21's sections 3.2, 3.3, 3.4 and are not this lane's to apply.
+3. **No native caller of `check_objective_backend`.** For lanes 03 and 05.
+4. **Two registry mirrors from lane 21 are untouched**: `MULTICLASS` in
+   `params.mojo` and `LAMBDARANK` in `ranking.mojo`, both still reaching
+   `mojoboost.*` from those modules rather than from the registry. Their
+   deletions are lane 21's sections 3.2 and 3.3.
+   `objective_gradients_on_device` is the third and is 6.2a.
+5. **The binding still carries its own metric codes and its own transform.**
+   6.4, the largest single remaining win, and the last copy of the inverse
+   link.
+6. **The Python layer still carries `_eval.py`'s tables.** 6.3.
 7. **`train_with_valid` and friends still infer no metric.** The built-in
    metric path is a new set of entry points beside them, not a replacement;
    see section 8.
@@ -775,18 +887,27 @@ would have preserved exactly the drift the change exists to remove.
 ### 9.1 `check_objective_metric` refuses pairs that used to be scored
 
 The native path now enforces "the metric's task must equal the objective's
-task", which is `_eval.resolve`'s rule in Python and is stricter than
-LightGBM. Nothing enforced it in Mojo before. Consequences:
+task", which is stricter than LightGBM. Nothing enforced it in Mojo before.
+Audited after the fact, by tracing every caller:
 
-- No effect on any existing native caller: `MetricSuite` metrics are
-  caller-supplied and are not checked (they cannot be — a caller-supplied
-  metric has no task).
-- If the 6.4a binding patch lands, `eval_metric` starts refusing e.g.
-  `binary_logloss` on a poisson model. Python already refuses that in
-  `_eval.resolve`, so no supported Python path reaches it; a direct
-  `_mojoboost.eval_metric` call would.
+- **Its only caller is `BuiltinMetricContext.check`**, which this lane wrote.
+  `rg` finds no other. So the rule narrows nothing that predates the lane; it
+  is a new rule on a new surface, not a change to an old one.
+- **`MetricSuite` metrics are untouched.** They are caller-supplied and are
+  not checked — they cannot be, a caller-supplied metric has no task. Section
+  8's fallbacks are all on that path.
+- **It agrees with the Python layer name for name.** `_eval.py`'s `_METRICS`
+  table assigns each of the twenty-one metrics a task, and the registry's
+  `metric_task` assigns the same one in every case, including the two that
+  could plausibly have gone the other way: `cross_entropy` and
+  `kullback_leibler` are `REGRESSION` in both. Objective side likewise —
+  `objective_task` sends `CROSS_ENTROPY` to `TASK_REGRESSION`, matching
+  `_eval`'s `xentropy`. So a Python caller sees no change in which pairs are
+  accepted, and if 6.4a lands the binding gains the check Python already
+  applies above it.
 
-Rated low, but it is a real narrowing and should not land silently.
+Rated: real narrowing, no reachable regression. It should still not land
+silently, which is what this section is for.
 
 ### 9.2 `response_scale` now raises for a multiclass objective
 

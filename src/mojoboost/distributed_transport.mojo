@@ -56,11 +56,11 @@ it, so a caller that asks for a multi-process world is refused with
 flips that one name, and nothing above it changes.
 """
 
-from std.memory import bitcast, stack_allocation
+from std.memory import bitcast
 from std.os import getenv
 from std.sys.ffi import external_call
 from std.sys.info import CompilationTarget
-from std.time import perf_counter_ns
+from std.time import perf_counter_ns, sleep
 
 from .collective import (
     Collective,
@@ -1479,6 +1479,557 @@ def recv_frame_bytes[
 
 
 # ---------------------------------------------------------------------------
+# The socket endpoint: BSD sockets over libc, by FFI
+# ---------------------------------------------------------------------------
+#
+# This is the one part of the file that leaves Mojo. Everything above it is
+# pure logic over `List[UInt8]` and is exercised in process; everything here
+# is a direct `external_call` into libc and cannot be exercised without two
+# processes and a port.
+#
+# The C ABI it is written against is documented rather than discovered,
+# because the alternative was to leave the transport unopenable. What that
+# means concretely, and what a reader must not assume:
+#
+# - the constant tables below are transcribed from the macOS and Linux
+#   headers, per platform, and are `comptime` so the wrong platform's values
+#   are never compiled in. Only macOS and Linux are supported;
+#   `SOCKETS_SUPPORTED` is False anywhere else and every entry point refuses.
+# - `sockaddr_in` differs between the two: macOS leads with a `sin_len` byte,
+#   Linux does not. Both layouts are written by `_sockaddr_in`.
+# - the integer fields are written little-endian by hand, which is correct on
+#   every platform this project targets (x86-64 and arm64) and is stated here
+#   rather than assumed silently. The two port and address fields are network
+#   byte order and are written big-endian for the same reason.
+# - hostnames are not resolved. `getaddrinfo` returns a struct whose field
+#   order differs between the two platforms, and getting that wrong is a
+#   silent wrong-address rather than a compile error, so a machine list must
+#   carry dotted-quad IPv4 (or `localhost`) and is refused with a clear
+#   message otherwise.
+# - deadlines are real: every send and every receive arms `SO_SNDTIMEO` or
+#   `SO_RCVTIMEO` with the time actually left before the caller's absolute
+#   deadline, so a peer that stops answering surfaces as `TRANSPORT_TIMEOUT`
+#   rather than as a hang. Connect is a bounded retry loop against the same
+#   deadline, because a worker generally starts before the root is listening.
+# - `SIGPIPE` is suppressed (`MSG_NOSIGNAL` on Linux, `SO_NOSIGPIPE` on
+#   macOS) so a peer that exits mid-run is reported as worker loss instead of
+#   killing this process.
+#
+# None of this has been compiled or run in this repository. See
+# `transport_validated`.
+
+comptime _IS_MACOS = CompilationTarget.is_macos()
+comptime _IS_LINUX = CompilationTarget.is_linux()
+
+comptime SOCKETS_SUPPORTED = _IS_MACOS or _IS_LINUX
+"""Whether a socket `ByteEndpoint` is compiled in on this platform."""
+
+comptime AF_INET = 2
+comptime SOCK_STREAM = 1
+comptime IPPROTO_TCP = 6
+comptime TCP_NODELAY = 1
+comptime SOCKADDR_IN_BYTES = 16
+comptime TIMEVAL_BYTES = 16
+comptime LISTEN_BACKLOG = 128
+
+comptime SOL_SOCKET = 0xFFFF if _IS_MACOS else 1
+comptime SO_REUSEADDR = 0x0004 if _IS_MACOS else 2
+comptime SO_RCVTIMEO = 0x1006 if _IS_MACOS else 20
+comptime SO_SNDTIMEO = 0x1005 if _IS_MACOS else 21
+comptime SO_NOSIGPIPE = 0x1022  # macOS only; unused on Linux
+comptime MSG_NOSIGNAL = 0 if _IS_MACOS else 0x4000
+
+comptime EINTR = 4
+comptime EAGAIN = 35 if _IS_MACOS else 11
+comptime ECONNREFUSED = 61 if _IS_MACOS else 111
+comptime EADDRNOTAVAIL = 49 if _IS_MACOS else 99
+comptime ETIMEDOUT = 60 if _IS_MACOS else 110
+comptime EHOSTUNREACH = 65 if _IS_MACOS else 113
+comptime ENETUNREACH = 51 if _IS_MACOS else 101
+
+comptime CONNECT_RETRY_SECONDS = 0.05
+"""How long a worker waits before retrying a refused connection to the root.
+
+Short enough that a root starting a moment later costs a moment, long enough
+that a root that never starts is not a spin. The bound is the connect
+deadline, not this number."""
+
+
+def _errno() -> Int:
+    """The current thread's `errno`.
+
+    It is a function on both platforms and a differently named one on each,
+    which is the whole reason this exists.
+    """
+    comptime if _IS_MACOS:
+        return Int(external_call["__error", UnsafePointer[Int32]]()[])
+    comptime if _IS_LINUX:
+        return Int(external_call["__errno_location", UnsafePointer[Int32]]()[])
+    return 0
+
+
+def _errno_text(prefix: String, err: Int) -> String:
+    return prefix + " (errno " + String(err) + ")"
+
+
+def _zero_bytes(n: Int) -> List[UInt8]:
+    var out = List[UInt8](capacity=n)
+    out.resize(n, 0)
+    return out^
+
+
+def sockets_unavailable_detail() -> String:
+    return String(
+        "this platform has no socket endpoint compiled in: only macOS and"
+        " Linux are supported, and the constant tables and struct layouts in"
+        " distributed_transport.mojo are written for those two only"
+    )
+
+
+def parse_ipv4(host: String) raises -> UInt32:
+    """A dotted-quad IPv4 address as a host-order 32-bit value.
+
+    `localhost` is accepted and means 127.0.0.1, because that is what a
+    hermetic two-process test writes in its machine list. Every other name is
+    refused rather than resolved: see the note on `getaddrinfo` above.
+    """
+    var text = String("127.0.0.1") if host == "localhost" else String(host)
+    var parts = text.split(".")
+    if len(parts) != 4:
+        raise transport_error(
+            TRANSPORT_CONFIG_INVALID,
+            -1,
+            "'"
+            + host
+            + "' is not a dotted-quad IPv4 address. This build does not"
+            " resolve hostnames, so a machine list must carry addresses such"
+            " as 127.0.0.1:12400",
+        )
+    var value = UInt32(0)
+    for i in range(4):
+        var octet: Int
+        try:
+            octet = Int(String(parts[i]))
+        except:
+            raise transport_error(
+                TRANSPORT_CONFIG_INVALID,
+                -1,
+                "'" + host + "' has a non-numeric octet",
+            )
+        if octet < 0 or octet > 255:
+            raise transport_error(
+                TRANSPORT_CONFIG_INVALID,
+                -1,
+                "'" + host + "' has an octet outside 0..255",
+            )
+        value = (value << 8) | UInt32(octet)
+    return value
+
+
+def _sockaddr_in(ip: UInt32, port: Int) -> List[UInt8]:
+    """A `struct sockaddr_in` for this platform, as 16 bytes.
+
+    macOS: `{u8 sin_len, u8 sin_family, be16 sin_port, be32 sin_addr, u8[8]}`.
+    Linux: `{u16 sin_family, be16 sin_port, be32 sin_addr, u8[8]}`.
+    """
+    var out = _zero_bytes(SOCKADDR_IN_BYTES)
+    comptime if _IS_MACOS:
+        out[0] = UInt8(SOCKADDR_IN_BYTES)
+        out[1] = UInt8(AF_INET)
+    comptime if not _IS_MACOS:
+        out[0] = UInt8(AF_INET)
+        out[1] = 0
+    out[2] = UInt8((port >> 8) & 0xFF)
+    out[3] = UInt8(port & 0xFF)
+    out[4] = UInt8((ip >> 24) & 0xFF)
+    out[5] = UInt8((ip >> 16) & 0xFF)
+    out[6] = UInt8((ip >> 8) & 0xFF)
+    out[7] = UInt8(ip & 0xFF)
+    return out^
+
+
+def _timeval(ns: Int) -> List[UInt8]:
+    """A `struct timeval` for `ns`, never zero.
+
+    A zero `timeval` means "no timeout" to `setsockopt`, which is the exact
+    opposite of what a caller passing a deadline that has nearly expired
+    means, so it is clamped up to one microsecond instead.
+    """
+    var total = ns if ns > 0 else 1000
+    var sec = total // NS_PER_SECOND
+    var usec = (total % NS_PER_SECOND) // 1000
+    if sec == 0 and usec == 0:
+        usec = 1
+    var out = _zero_bytes(TIMEVAL_BYTES)
+    for i in range(8):
+        out[i] = UInt8((sec >> (8 * i)) & 0xFF)
+    for i in range(4):
+        out[8 + i] = UInt8((usec >> (8 * i)) & 0xFF)
+    return out^
+
+
+def _setsockopt(
+    fd: Int, level: Int, option: Int, mut value: List[UInt8]
+) -> Int:
+    return Int(
+        external_call["setsockopt", Int32](
+            Int32(fd),
+            Int32(level),
+            Int32(option),
+            value.unsafe_ptr(),
+            UInt32(len(value)),
+        )
+    )
+
+
+def _set_flag(fd: Int, level: Int, option: Int, on: Bool) -> Int:
+    var value = _zero_bytes(4)
+    if on:
+        value[0] = 1
+    return _setsockopt(fd, level, option, value)
+
+
+def _set_timeout(fd: Int, option: Int, ns: Int) raises:
+    var tv = _timeval(ns)
+    if _setsockopt(fd, SOL_SOCKET, option, tv) != 0:
+        raise transport_error(
+            TRANSPORT_CONFIG_INVALID,
+            -1,
+            _errno_text("could not set a socket timeout", _errno()),
+        )
+
+
+def _close_fd(fd: Int):
+    if fd >= 0:
+        _ = external_call["close", Int32](Int32(fd))
+
+
+def _new_stream_socket() raises -> Int:
+    comptime if not SOCKETS_SUPPORTED:
+        raise transport_error(
+            TRANSPORT_UNAVAILABLE, -1, sockets_unavailable_detail()
+        )
+    var fd = Int(
+        external_call["socket", Int32](
+            Int32(AF_INET), Int32(SOCK_STREAM), Int32(0)
+        )
+    )
+    if fd < 0:
+        raise transport_error(
+            TRANSPORT_PEER_LOST,
+            -1,
+            _errno_text("could not create a socket", _errno()),
+        )
+    # Small frames back to back: Nagle would add up to 40ms to every
+    # collective, which on a per-node all-reduce is the whole cost.
+    _ = _set_flag(fd, IPPROTO_TCP, TCP_NODELAY, True)
+    comptime if _IS_MACOS:
+        _ = _set_flag(fd, SOL_SOCKET, SO_NOSIGPIPE, True)
+    return fd
+
+
+struct SocketEndpoint(ByteEndpoint, Copyable, Movable):
+    """A `ByteEndpoint` over a connected TCP socket. The real transport.
+
+    It holds a file descriptor and nothing else, which is deliberate: it is
+    `Copyable` because `TransportCollective` requires it, and a copy therefore
+    shares the descriptor rather than duplicating it. For the same reason
+    there is no destructor. Closing is explicit, exactly once, through
+    `close`, and `TransportCollective.shutdown` is what performs it for a
+    real run.
+
+    Every read and write arms the corresponding socket timeout from the
+    caller's absolute deadline before it is issued, so `deadline_ns` means
+    what the trait says it means: the deadline for the whole operation, not a
+    fresh timeout per syscall.
+    """
+
+    var peer: Int
+    var fd: Int
+    var live: Bool
+
+    def __init__(out self, peer: Int, fd: Int):
+        self.peer = peer
+        self.fd = fd
+        self.live = True
+
+    def peer_rank(self) -> Int:
+        return self.peer
+
+    def is_open(self) -> Bool:
+        return self.live
+
+    def _arm(self, option: Int, deadline_ns: Int) raises:
+        var remaining = deadline_ns - Int(perf_counter_ns())
+        if remaining <= 0:
+            raise transport_error(
+                TRANSPORT_TIMEOUT,
+                self.peer,
+                "the deadline had already passed before the syscall",
+            )
+        _set_timeout(self.fd, option, remaining)
+
+    def send_all(mut self, bytes: List[UInt8], deadline_ns: Int) raises:
+        if not self.live:
+            raise transport_error(
+                TRANSPORT_PEER_LOST, self.peer, "write to a closed socket"
+            )
+        var total = len(bytes)
+        var sent = 0
+        while sent < total:
+            self._arm(SO_SNDTIMEO, deadline_ns)
+            var n = Int(
+                external_call["send", Int64](
+                    Int32(self.fd),
+                    bytes.unsafe_ptr() + sent,
+                    UInt64(total - sent),
+                    Int32(MSG_NOSIGNAL),
+                )
+            )
+            if n > 0:
+                sent += n
+                continue
+            var err = _errno()
+            if err == EINTR:
+                continue
+            if err == EAGAIN:
+                raise transport_error(
+                    TRANSPORT_TIMEOUT,
+                    self.peer,
+                    "the send deadline expired after "
+                    + String(sent)
+                    + " of "
+                    + String(total)
+                    + " bytes",
+                )
+            self.live = False
+            raise transport_error(
+                TRANSPORT_PEER_LOST,
+                self.peer,
+                _errno_text("send failed", err),
+            )
+
+    def recv_exact(mut self, n: Int, deadline_ns: Int) raises -> List[UInt8]:
+        if n < 0:
+            raise transport_error(
+                TRANSPORT_FRAME_CORRUPT, self.peer, "negative read length"
+            )
+        if not self.live:
+            raise transport_error(
+                TRANSPORT_PEER_LOST, self.peer, "read from a closed socket"
+            )
+        var out = _zero_bytes(n)
+        var got = 0
+        while got < n:
+            self._arm(SO_RCVTIMEO, deadline_ns)
+            var r = Int(
+                external_call["recv", Int64](
+                    Int32(self.fd),
+                    out.unsafe_ptr() + got,
+                    UInt64(n - got),
+                    Int32(0),
+                )
+            )
+            if r > 0:
+                got += r
+                continue
+            if r == 0:
+                # An orderly shutdown mid-frame is a worker that exited, not
+                # a short read: there is no more data coming, ever.
+                self.live = False
+                raise transport_error(
+                    TRANSPORT_PEER_LOST,
+                    self.peer,
+                    "the peer closed the connection after "
+                    + String(got)
+                    + " of "
+                    + String(n)
+                    + " bytes",
+                )
+            var err = _errno()
+            if err == EINTR:
+                continue
+            if err == EAGAIN:
+                raise transport_error(
+                    TRANSPORT_TIMEOUT,
+                    self.peer,
+                    "no bytes before the deadline after "
+                    + String(got)
+                    + " of "
+                    + String(n),
+                )
+            self.live = False
+            raise transport_error(
+                TRANSPORT_PEER_LOST,
+                self.peer,
+                _errno_text("recv failed", err),
+            )
+        return out^
+
+    def close(mut self) raises:
+        if not self.live:
+            return
+        self.live = False
+        _close_fd(self.fd)
+
+
+struct SocketListener(Movable):
+    """The root's listening socket, open only for the length of a rendezvous.
+
+    `SO_REUSEADDR` is set because a job restarted immediately after one that
+    ended would otherwise be refused for as long as the previous port sits in
+    `TIME_WAIT`, which is the common case for a retry and has nothing to do
+    with the port being in use.
+    """
+
+    var fd: Int
+    var port: Int
+
+    def __init__(out self, host: String, port: Int) raises:
+        var ip = parse_ipv4(host)
+        var fd = _new_stream_socket()
+        _ = _set_flag(fd, SOL_SOCKET, SO_REUSEADDR, True)
+        var addr = _sockaddr_in(ip, port)
+        var rc = Int(
+            external_call["bind", Int32](
+                Int32(fd), addr.unsafe_ptr(), UInt32(SOCKADDR_IN_BYTES)
+            )
+        )
+        if rc != 0:
+            var err = _errno()
+            _close_fd(fd)
+            raise transport_error(
+                TRANSPORT_CONFIG_INVALID,
+                ROOT_RANK,
+                _errno_text(
+                    "could not bind " + host + ":" + String(port), err
+                ),
+            )
+        if (
+            Int(
+                external_call["listen", Int32](
+                    Int32(fd), Int32(LISTEN_BACKLOG)
+                )
+            )
+            != 0
+        ):
+            var err = _errno()
+            _close_fd(fd)
+            raise transport_error(
+                TRANSPORT_CONFIG_INVALID,
+                ROOT_RANK,
+                _errno_text("could not listen", err),
+            )
+        self.fd = fd
+        self.port = port
+
+    def accept_one(mut self, deadline_ns: Int) raises -> Int:
+        """Accept one connection, or raise when the deadline passes.
+
+        `accept` honors `SO_RCVTIMEO` on both supported platforms, which is
+        why there is no `poll` here and no non-blocking mode to unwind.
+        """
+        while True:
+            var remaining = deadline_ns - Int(perf_counter_ns())
+            if remaining <= 0:
+                raise transport_error(
+                    TRANSPORT_TIMEOUT,
+                    ROOT_RANK,
+                    "not every worker connected before the connect deadline",
+                )
+            _set_timeout(self.fd, SO_RCVTIMEO, remaining)
+            var addr = _zero_bytes(SOCKADDR_IN_BYTES)
+            var addr_len: List[UInt32] = [UInt32(SOCKADDR_IN_BYTES)]
+            var fd = Int(
+                external_call["accept", Int32](
+                    Int32(self.fd),
+                    addr.unsafe_ptr(),
+                    addr_len.unsafe_ptr(),
+                )
+            )
+            if fd >= 0:
+                _ = _set_flag(fd, IPPROTO_TCP, TCP_NODELAY, True)
+                comptime if _IS_MACOS:
+                    _ = _set_flag(fd, SOL_SOCKET, SO_NOSIGPIPE, True)
+                return fd
+            var err = _errno()
+            if err == EINTR:
+                continue
+            if err == EAGAIN:
+                raise transport_error(
+                    TRANSPORT_TIMEOUT,
+                    ROOT_RANK,
+                    "not every worker connected before the connect deadline",
+                )
+            raise transport_error(
+                TRANSPORT_PEER_LOST,
+                ROOT_RANK,
+                _errno_text("accept failed", err),
+            )
+
+    def close(mut self):
+        _close_fd(self.fd)
+        self.fd = -1
+
+
+def connect_to_root(
+    host: String, port: Int, rank: Int, deadline_ns: Int
+) raises -> Int:
+    """Connect to the root, retrying a refusal until the deadline.
+
+    A refused connection is the expected state, not an error: workers and the
+    root are separate processes and nothing orders their starts, so a worker
+    that beats the root to the port must wait rather than fail. Refusal,
+    timeout, and an unreachable route are retried; anything else is reported
+    at once, because retrying a malformed address only delays the message.
+    """
+    var ip = parse_ipv4(host)
+    while True:
+        if Int(perf_counter_ns()) >= deadline_ns:
+            raise transport_error(
+                TRANSPORT_TIMEOUT,
+                rank,
+                "could not reach the root at "
+                + host
+                + ":"
+                + String(port)
+                + " before the connect deadline",
+            )
+        var fd = _new_stream_socket()
+        var remaining = deadline_ns - Int(perf_counter_ns())
+        if remaining > 0:
+            _set_timeout(fd, SO_SNDTIMEO, remaining)
+        var addr = _sockaddr_in(ip, port)
+        var rc = Int(
+            external_call["connect", Int32](
+                Int32(fd), addr.unsafe_ptr(), UInt32(SOCKADDR_IN_BYTES)
+            )
+        )
+        if rc == 0:
+            return fd
+        var err = _errno()
+        _close_fd(fd)
+        var retryable = (
+            err == ECONNREFUSED
+            or err == ETIMEDOUT
+            or err == EINTR
+            or err == EAGAIN
+            or err == EHOSTUNREACH
+            or err == ENETUNREACH
+            or err == EADDRNOTAVAIL
+        )
+        if not retryable:
+            raise transport_error(
+                TRANSPORT_PEER_LOST,
+                rank,
+                _errno_text(
+                    "could not connect to " + host + ":" + String(port), err
+                ),
+            )
+        sleep(CONNECT_RETRY_SECONDS)
+
+
+# ---------------------------------------------------------------------------
 # The blocking collective driver
 # ---------------------------------------------------------------------------
 
@@ -1956,14 +2507,16 @@ comptime RUNTIME_LOCAL = 0
 that runs today."""
 
 comptime RUNTIME_TRANSPORT = 1
-"""One rank per process, over byte endpoints. Configurable and validated, but
-not openable in this build: see `transport_available`."""
+"""One rank per process, over TCP. See `transport_available` for whether this
+platform has an endpoint, and `transport_validated` for the separate and more
+important question of whether anyone has ever run it."""
 
 # Whether a `ByteEndpoint` that can actually reach another process is compiled
-# in. `MemoryEndpoint` is a fake and does not count. This is a comptime False
-# rather than a runtime probe because the adapter's absence is a fact about the
-# build, and a socket endpoint landing flips exactly this one name.
-comptime HAS_BYTE_ENDPOINT = False
+# in. `MemoryEndpoint` is a fake and does not count; `SocketEndpoint` is not,
+# and this is now exactly the platform predicate for it. It stays a comptime
+# name rather than a runtime probe because whether the adapter exists is a
+# fact about the build.
+comptime HAS_BYTE_ENDPOINT = SOCKETS_SUPPORTED
 
 
 def runtime_mode_name(mode: Int) -> String:
@@ -1989,22 +2542,58 @@ def parse_runtime_mode(text: String) raises -> Int:
 def transport_available() -> Bool:
     """Whether this build can open a session to another process.
 
-    False, and stated once here so that every caller refuses for the same
+    True on macOS and Linux, where `SocketEndpoint` is compiled in, and False
+    elsewhere. Stated once here so that every caller refuses for the same
     reason with the same message instead of each discovering the gap its own
-    way. Everything above the endpoint is written and exercised; nothing below
-    it exists.
+    way.
+
+    Available is not the same as validated. See `transport_validated`, which
+    is the honest answer to "has this ever worked", and which is False.
     """
     return HAS_BYTE_ENDPOINT
 
 
+def transport_validated() -> Bool:
+    """Whether the socket transport has ever moved a byte between processes.
+
+    False, and deliberately a separate name from `transport_available` rather
+    than folded into it, because the two facts are different and conflating
+    them is how an untested path gets described as a working one.
+
+    What is true: the framing, ordering, deadline, cancellation, worker loss,
+    handshake, and reduction logic above the endpoint are exercised in process
+    against `MemoryEndpoint`, and `SocketEndpoint` is a complete BSD socket
+    adapter written against the documented C ABI of macOS and Linux.
+
+    What is not true, and is not claimed anywhere: that it has been compiled,
+    that a rendezvous has completed, that two processes have trained together,
+    or anything at all about multi-host behavior, throughput, or scaling. The
+    hermetic two-process procedure in docs/DISTRIBUTED_TRANSPORT.md section 7
+    is what turns this to True, and until someone runs it a caller that needs
+    a validated transport should gate on this and not on availability.
+    """
+    return False
+
+
 def transport_unavailable_detail() -> String:
     return String(
-        "this build has no ByteEndpoint that can reach another process:"
-        " MemoryEndpoint is an in-process fake, and the socket adapter"
-        " docs/DISTRIBUTED_TRANSPORT.md section 7 specifies is not written."
-        " Configuration, framing, ordering, deadlines, and the reduction are"
-        " all validated, so a rank can be configured and refused rather than"
-        " left to hang. Train with the local runtime meanwhile"
+        "this build has no ByteEndpoint that can reach another process."
+        " SocketEndpoint is compiled in on macOS and Linux only, because the"
+        " syscall constants and the sockaddr_in layout it needs are written"
+        " for those two platforms. Configuration, framing, ordering,"
+        " deadlines, and the reduction are all validated on every platform,"
+        " so a rank can still be configured and refused rather than left to"
+        " hang. Train with the local runtime meanwhile"
+    )
+
+
+def transport_unvalidated_detail() -> String:
+    return String(
+        "the socket transport in this build has never been compiled or run:"
+        " no rendezvous has completed and no byte has moved between two"
+        " processes. Everything above the endpoint is exercised in process."
+        " Run the hermetic two-process procedure in"
+        " docs/DISTRIBUTED_TRANSPORT.md section 7 before depending on it"
     )
 
 
@@ -2012,7 +2601,12 @@ def transport_unavailable_detail() -> String:
 struct RuntimeCapability(Copyable, Movable):
     """What this build's distributed stack can actually do.
 
-    - `multi_process`: whether two processes can train together.
+    - `multi_process`: whether two processes can train together on this
+      platform, meaning a socket endpoint is compiled in.
+    - `validated`: whether that path has ever been compiled and run. False.
+      It is separate from `multi_process` on purpose: a caller that must not
+      run unproven code gates on this one, and a caller reporting what the
+      build supports reports the other. Nothing collapses the two.
     - `local_collective`: whether a world hosted in one process is available.
     - `protocol_version`: the version every rank of a job must agree on.
     - `max_world_size`: the largest world this build can form, or -1 when a
@@ -2020,34 +2614,51 @@ struct RuntimeCapability(Copyable, Movable):
       module's.
     - `reason`: empty when `multi_process` is True, and the explanation to
       report otherwise.
+    - `caveat`: empty when `validated` is True, and what is unproven
+      otherwise. Non-empty today even when `multi_process` is True, which is
+      the case this field exists for.
     """
 
     var multi_process: Bool
+    var validated: Bool
     var local_collective: Bool
     var protocol_version: Int
     var max_world_size: Int
     var reason: String
+    var caveat: String
 
 
 def distributed_runtime_capability() -> RuntimeCapability:
     """The one native answer to "can this build train across processes".
 
-    It exists in order to say no, and to say it in one place: the Python
-    bindings, the Dask backend, and a launcher all report this rather than each
-    carrying its own copy of the fact and its own wording. A caller that
-    refuses distributed work should refuse on `multi_process` and quote
-    `reason`, and must not infer availability from this function existing.
+    It answers in one place: the Python bindings, the Dask backend, and a
+    launcher all report this rather than each carrying its own copy of the
+    fact and its own wording. A caller that refuses distributed work should
+    refuse on `multi_process` and quote `reason`, and a caller that refuses
+    *unproven* distributed work should refuse on `validated` and quote
+    `caveat`. Neither should be inferred from this function existing.
     """
+    var caveat = transport_unvalidated_detail()
+    if transport_validated():
+        caveat = String("")
     if transport_available():
         return RuntimeCapability(
-            True, True, TRANSPORT_PROTOCOL_VERSION, -1, String("")
+            True,
+            transport_validated(),
+            True,
+            TRANSPORT_PROTOCOL_VERSION,
+            -1,
+            String(""),
+            caveat^,
         )
     return RuntimeCapability(
+        False,
         False,
         True,
         TRANSPORT_PROTOCOL_VERSION,
         1,
         transport_unavailable_detail(),
+        caveat^,
     )
 
 
@@ -2321,17 +2932,11 @@ def open_transport_collective[
 ) raises -> TransportCollective[E]:
     """A session over already-connected endpoints, handshaken and ready.
 
-    The endpoints are an argument because opening them is the one thing this
-    module cannot do: whoever writes the socket adapter connects them and hands
-    them here, and everything from the handshake onwards is this function's.
-
-    Until such an adapter exists this refuses, because `require_transport`
-    refuses: the only `E` that satisfies the bound is the in-memory fake, and
-    calling a fake a transport is the one thing this file will not do. A test
-    that wants to drive the blocking driver over `MemoryEndpoint` builds a
-    `TransportCollective` directly from a session and a list of endpoints,
-    which is exactly the composition this function performs and is honest about
-    what it is exercising.
+    The endpoints are an argument rather than something opened here so that
+    connecting and handshaking stay separable: `connect_world` performs the
+    rendezvous and hands its result to this, and a test that wants to drive
+    the blocking driver over `MemoryEndpoint` can compose the same two pieces
+    without a port. `open_socket_collective` is the two together.
     """
     require_transport(spec)
     var session = TransportSession(spec.transport_config())

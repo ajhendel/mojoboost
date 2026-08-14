@@ -305,6 +305,7 @@ access, so asking for it is what pays for it:
 """
 
 import array as _array
+import json as _json
 import operator as _operator
 import os as _os
 import tempfile as _tempfile
@@ -1107,6 +1108,43 @@ class _Base(_ParamsMixin):
     `min_data_per_group` are LightGBM's categorical hyperparameters, with
     LightGBM's defaults; they have no effect unless some feature is
     categorical.
+
+    The remaining LightGBM tree controls keep LightGBM's names, defaults,
+    and meanings, and are applied by the same Mojo code the C ABI and the
+    CLI reach (`ExtraTreeParams` in src/mojoboost/tree_parameters_extra.mojo).
+    Every one of them is inactive at its default, so leaving them alone
+    leaves a fit bit-identical to what it was:
+
+    - `min_gain_to_split` (alias `min_split_gain`) is the gain a split must
+      clear to be taken at all.
+    - `max_delta_step` caps the absolute value of a leaf's output.
+    - `path_smooth` shrinks each leaf toward its parent's output in
+      proportion to how few rows the leaf holds; LightGBM needs
+      `min_data_in_leaf` of at least 2 for it, and so does mojoboost.
+    - `extra_trees` draws one threshold per feature at random instead of
+      scanning for the best one, keyed by `extra_seed` together with the
+      tree index and the node id, so a fit is reproducible.
+    - `monotone_penalty` (alias `monotone_constraints_penalty`) discounts
+      the gain of a split near the root of a monotone branch.
+      `monotone_constraints_method` is LightGBM's name for the algorithm;
+      only `"basic"` is implemented, and `"intermediate"` and `"advanced"`
+      raise rather than silently resolving to it.
+    - `feature_contri` is one gain multiplier per feature (LightGBM's
+      `feature_contri`), and `cegb_tradeoff` with `cegb_penalty_split` are
+      the cost-effective gradient boosting knobs that charge a split for
+      being taken. `cegb_penalty_feature_coupled` and
+      `cegb_penalty_feature_lazy` are refused by name: both need per-model
+      state no trainer keeps.
+    - `forced_splits` is LightGBM's forced-splits document, given as the
+      JSON text or as the `dict`/`list` to serialize, rather than as
+      `forcedsplits_filename`. Its raw thresholds still have to be mapped
+      onto a fitted binning, which no entry point does yet, so a document
+      raises with what that would take instead of training an unforced
+      tree that reads as a forced one.
+
+    `max_delta_step`, `path_smooth`, and `extra_trees` need a grower that
+    passes each node's identity and row count. A backend that does not
+    refuses rather than dropping them.
     """
 
     #: Public attributes that `fit` sets and a refit clears. The model
@@ -1345,6 +1383,40 @@ class _Base(_ParamsMixin):
             )
         buf = _array.array("d", values)
         return buf, _addr(buf)
+
+    def _forced_splits_text(self):
+        """`forced_splits` as the document text the native parser reads, or
+        `""` when unset.
+
+        LightGBM takes this as `forcedsplits_filename`, a path. mojoboost
+        refuses that name (`check_extra_option_supported` in
+        src/mojoboost/tree_parameters_extra.mojo) and takes the document
+        itself, so that reading a file is the caller's step and not a hidden
+        one inside a fit. A `str` is passed through unchanged; a `dict` or
+        `list` is serialized here, because the schema
+        `parse_forced_splits` accepts is JSON and building it as Python
+        objects is how a caller would rather write it:
+
+            forced_splits={"feature": 0, "threshold": 1.5}
+
+        Read a LightGBM file with `open(path).read()` and pass the text.
+        Every error in the document is raised natively by
+        `parse_forced_splits`, which names the byte it stopped at; nothing
+        here inspects the schema.
+        """
+        forced = self.forced_splits
+        if forced is None:
+            return ""
+        if isinstance(forced, bytes):
+            return forced.decode("utf-8")
+        if isinstance(forced, str):
+            return forced
+        if isinstance(forced, (dict, list)):
+            return _json.dumps(forced)
+        raise TypeError(
+            "forced_splits must be the document text, or a dict or list to"
+            f" serialize as JSON, not {type(forced).__name__}"
+        )
 
     # -- categorical features ---------------------------------------------
 
@@ -1608,6 +1680,7 @@ class _Base(_ParamsMixin):
         ic_offsets=None,
         monotone_addr=0,
         categorical=None,
+        contri_addr=0,
     ):
         min_data_in_leaf = self._resolve_alias(
             "min_data_in_leaf", "min_child_samples", 20
@@ -1622,6 +1695,12 @@ class _Base(_ParamsMixin):
         )
         bagging_freq = self._resolve_alias(
             "bagging_freq", "subsample_freq", 0
+        )
+        min_gain_to_split = self._resolve_alias(
+            "min_gain_to_split", "min_split_gain", 0.0
+        )
+        monotone_penalty = self._resolve_alias(
+            "monotone_penalty", "monotone_constraints_penalty", 0.0
         )
         # Same ranges src/mojoboost/params.mojo and callback.mojo enforce,
         # so an estimator cannot construct a configuration the trainer
@@ -1727,6 +1806,39 @@ class _Base(_ParamsMixin):
             "cat_smooth": float(self.cat_smooth),
             "cat_l2": float(self.cat_l2),
             "min_data_per_group": int(self.min_data_per_group),
+            # The remaining LightGBM tree controls, read by
+            # `extra_params_from_mapping` in bindings/basic_bindings.mojo
+            # into the `ExtraTreeParams` that rides on `TreeParams.extra`
+            # (src/mojoboost/tree_parameters_extra.mojo). Every key is sent
+            # on every fit, inactive defaults included, because the parser
+            # subscripts the mapping rather than testing for a key: a
+            # missing one is a KeyError at the boundary, not a default.
+            #
+            # The ranges are not re-checked here. `ExtraTreeParams.check`
+            # runs inside `tree.grow_tree`, and it is the same check the C
+            # ABI and the CLI reach through params.mojo, so there is one
+            # authority for what these values may be rather than a Python
+            # copy of it that can drift.
+            "min_gain_to_split": float(min_gain_to_split),
+            "max_delta_step": float(self.max_delta_step),
+            "path_smooth": float(self.path_smooth),
+            # int, not bool: the binding reads it as an integer.
+            "extra_trees": int(bool(self.extra_trees)),
+            "extra_seed": int(self.extra_seed),
+            "monotone_penalty": float(monotone_penalty),
+            "monotone_constraints_method": str(
+                self.monotone_constraints_method
+            ),
+            "feature_contri_addr": int(contri_addr),
+            "cegb_tradeoff": float(self.cegb_tradeoff),
+            "cegb_penalty_split": float(self.cegb_penalty_split),
+            # Always 0. `cegb_penalty_feature_coupled` is parsed natively
+            # and then refused by name, because charging it needs a
+            # per-model feature-use ledger that no trainer keeps; the key
+            # exists so the parser reads one shape of mapping from every
+            # caller, and there is no estimator parameter that can set it.
+            "cegb_penalty_feature_coupled_addr": 0,
+            "forced_splits": self._forced_splits_text(),
         }
 
     def _resolve_device(
@@ -1803,6 +1915,32 @@ class _Base(_ParamsMixin):
             )
         except Exception as exc:
             raise RuntimeError(str(exc)) from None
+
+    def _gpu_unsupported(self, device, lead, hint=None):
+        """Backstop refusal for a request no accelerator kernel covers.
+
+        Every call site here mirrors a block in
+        src/mojoboost/device_policy.mojo, which is what actually decides
+        once `_resolve_device` reaches the full native contract:
+        BLOCK_SPARSE_INPUT, BLOCK_VALIDATION_SET, BLOCK_CUSTOM_OBJECTIVE,
+        and BLOCK_RANKING_OBJECTIVE. Against such a build these checks
+        never fire, because `device` arrived already refused or already
+        resolved to "cpu".
+
+        They stay because the narrow contract exists. A build that exposes
+        `resolve_device` but not `decide_device` answers on shape alone,
+        so an explicit device="gpu" would otherwise reach a trainer with no
+        kernel for the request and either fall back silently or fail
+        somewhere less legible. `device="auto"` resolves to the CPU either
+        way, which is what the native policy picks too, so only an explicit
+        request is refused.
+        """
+        if device == "cpu":
+            return
+        message = f"{lead}; use device='cpu' or device='auto'"
+        if hint is not None:
+            message += f". {hint}"
+        raise RuntimeError(message)
 
     def _weight_buffer(self, sample_weight, n_rows):
         """Validated weight buffer and its address (buffer must stay
@@ -2011,11 +2149,11 @@ class _Base(_ParamsMixin):
         `n_iter_`; see src/mojoboost/custom_metric.mojo for the
         early-stopping rules.
         """
-        if device != "cpu":
-            raise RuntimeError(
-                "validation metrics are scored on the CPU; use device='cpu' "
-                "or device='auto'"
-            )
+        # Backstop; BLOCK_VALIDATION_SET is what refuses this on a build
+        # whose native policy can be asked. See `_gpu_unsupported`.
+        self._gpu_unsupported(
+            device, "validation metrics are scored on the CPU"
+        )
         specs = _metric_specs(
             eval_metric, task, getattr(self, "objective", None)
         )
@@ -2735,7 +2873,9 @@ class _Base(_ParamsMixin):
         )
         return out, n_rows
 
-    def _sparse_fit_params(self, X, sample_weight):
+    def _sparse_fit_params(
+        self, X, sample_weight, objective_code=None, n_outputs=1
+    ):
         """Everything a sparse fit needs: the CSC buffers, the shape, the
         column names, the params dict with the buffers folded in, and a
         tuple to keep every referenced buffer alive across the call.
@@ -2743,24 +2883,46 @@ class _Base(_ParamsMixin):
         Sparse training runs on the CPU. The GPU histogram kernels take a
         dense binned matrix, so rather than densify behind the caller's
         back, `device="gpu"` is refused and `device="auto"` resolves to the
-        CPU, which is what it would pick anyway.
+        CPU, which is what it would pick anyway. Both of those answers come
+        from the native policy, which is asked with `sparse=True` (that is
+        its BLOCK_SPARSE_INPUT), not decided here; `objective_code` and
+        `n_outputs` are passed so the refusal it writes names every reason
+        the request was blocked, not just this one.
         """
-        if self.device == "gpu":
-            raise RuntimeError(
-                "sparse input trains on the CPU; there is no sparse GPU "
-                "kernel yet. Use device='cpu' or device='auto', or densify "
-                "with .toarray() to train on the GPU."
-            )
         buffers, n_rows, n_features, names = _arrays.check_X_sparse(X, "csc")
         wb, w_addr = self._weight_buffer(sample_weight, n_rows)
         ic_flat, ic_offsets = self._interaction_buffers(n_features)
         mono_buf, mono_addr = self._monotone_buffer(n_features)
+        contri_buf, contri_addr = self._feature_contri_buffer(n_features)
         cat_buf = self._sparse_categorical_buffer(X, names, n_features)
+        device = self._resolve_device(
+            n_rows,
+            n_features,
+            n_outputs,
+            objective_code=objective_code,
+            sparse=True,
+            categorical=cat_buf is not None,
+        )
+        # Backstop for a shape-only build; see `_gpu_unsupported`.
+        self._gpu_unsupported(
+            device,
+            "sparse input trains on the CPU, and there is no sparse GPU "
+            "kernel yet",
+            "Densify with .toarray() to train on an accelerator.",
+        )
         params = self._params(
-            w_addr, "cpu", ic_flat, ic_offsets, mono_addr, cat_buf
+            w_addr, "cpu", ic_flat, ic_offsets, mono_addr, cat_buf, contri_addr
         )
         params.update(buffers.params())
-        keep = (buffers, wb, ic_flat, ic_offsets, mono_buf, cat_buf)
+        keep = (
+            buffers,
+            wb,
+            ic_flat,
+            ic_offsets,
+            mono_buf,
+            cat_buf,
+            contri_buf,
+        )
         return buffers, n_rows, n_features, names, params, keep
 
     def _sparse_categorical_buffer(self, X, names, n_features):
@@ -3093,7 +3255,7 @@ class MojoBoostRegressor(_Base):
                 )
             self._reject_sparse_eval_set(eval_set)
             buffers, n_rows, n_features, names, params, keep = (
-                self._sparse_fit_params(X, sample_weight)
+                self._sparse_fit_params(X, sample_weight, objective)
             )
             yb = _arrays.check_target(y, n_rows)
             self._model = _mojoboost.fit_csc(_addr(yb), objective, params)
@@ -3105,9 +3267,23 @@ class MojoBoostRegressor(_Base):
         wb, w_addr = self._weight_buffer(sample_weight, n_rows)
         ic_flat, ic_offsets = self._interaction_buffers(n_features)
         mono_buf, mono_addr = self._monotone_buffer(n_features)
-        device = self._resolve_device(n_rows, n_features, 1)
+        contri_buf, contri_addr = self._feature_contri_buffer(n_features)
+        device = self._resolve_device(
+            n_rows,
+            n_features,
+            1,
+            objective_code=objective,
+            categorical=cat_buf is not None,
+            has_eval_set=eval_set is not None,
+        )
         params = self._params(
-            w_addr, device, ic_flat, ic_offsets, mono_addr, cat_buf
+            w_addr,
+            device,
+            ic_flat,
+            ic_offsets,
+            mono_addr,
+            cat_buf,
+            contri_addr,
         )
         if eval_set is not None:
             if objective == _CUSTOM:
@@ -3174,11 +3350,9 @@ class MojoBoostRegressor(_Base):
         native Mojo interface in src/mojoboost/objective.mojo, which
         specializes on the callable and pays nothing per round.
         """
-        if device != "cpu":
-            raise RuntimeError(
-                "custom objectives train on the CPU; use device='cpu' or "
-                "device='auto'"
-            )
+        # Backstop; BLOCK_CUSTOM_OBJECTIVE is what refuses this on a build
+        # whose native policy can be asked. See `_gpu_unsupported`.
+        self._gpu_unsupported(device, "custom objectives train on the CPU")
         fobj = self.objective
         raw = _out_buffer(n_rows)
         grad = _out_buffer(n_rows)
@@ -3386,6 +3560,29 @@ class MojoBoostClassifier(_Base):
         self.objective = objective
         self.class_weight = class_weight
 
+    def _objective_code(self, n_classes=None):
+        """The native objective code this classifier trains, or None when
+        the class count is the answer instead of a code.
+
+        Two classes is `binary_logistic`, a built-in single-output
+        objective the device vocabulary routes. Softmax is not one: it is
+        its own trainer growing one tree per class per round, and what the
+        native policy gates on there is `n_outputs`, which the caller
+        passes. Naming a code for it would assert something the request is
+        not, so it stays undeclared, which the native decision reports as
+        an incomplete request rather than assuming either way.
+
+        `n_classes` is the count the current fit has just encoded, for the
+        callers that ask before `n_classes_` exists; without it the fitted
+        attribute answers, and before a fit there is nothing to answer
+        with.
+        """
+        if n_classes is None:
+            n_classes = getattr(self, "n_classes_", None)
+        if n_classes is None:
+            return None
+        return _BINARY_LOGISTIC if int(n_classes) == 2 else None
+
     def _class_weight_rows(self, codes, n_rows, classes, sample_weight):
         """`sample_weight` with `class_weight` folded in, or it unchanged
         when there is no class weighting.
@@ -3508,10 +3705,16 @@ class MojoBoostClassifier(_Base):
         wb, w_addr = self._weight_buffer(sample_weight, n_rows)
         ic_flat, ic_offsets = self._interaction_buffers(n_features)
         mono_buf, mono_addr = self._monotone_buffer(n_features)
+        contri_buf, contri_addr = self._feature_contri_buffer(n_features)
         # Binary is single-output (one tree per round), so it has a GPU
         # path; only the softmax ensemble is CPU-only.
         device = self._resolve_device(
-            n_rows, n_features, 1 if n_classes == 2 else n_classes
+            n_rows,
+            n_features,
+            1 if n_classes == 2 else n_classes,
+            objective_code=self._objective_code(n_classes),
+            categorical=cat_buf is not None,
+            has_eval_set=eval_set is not None,
         )
         self._multiclass = n_classes > 2
         if eval_set is not None:
@@ -3531,6 +3734,7 @@ class MojoBoostClassifier(_Base):
                     ic_offsets,
                     mono_addr,
                     cat_buf,
+                    contri_addr,
                 ),
                 device,
                 _BINARY_LOGISTIC,
@@ -3562,6 +3766,7 @@ class MojoBoostClassifier(_Base):
                     ic_offsets,
                     mono_addr,
                     cat_buf,
+                    contri_addr,
                 ),
             )
         else:
@@ -3578,6 +3783,7 @@ class MojoBoostClassifier(_Base):
                     ic_offsets,
                     mono_addr,
                     cat_buf,
+                    contri_addr,
                 ),
             )
         self.classes_ = (
@@ -3598,7 +3804,12 @@ class MojoBoostClassifier(_Base):
             yb, X.shape[0], classes, sample_weight
         )
         buffers, n_rows, n_features, names, params, keep = (
-            self._sparse_fit_params(X, sample_weight)
+            self._sparse_fit_params(
+                X,
+                sample_weight,
+                self._objective_code(n_classes),
+                1 if n_classes == 2 else n_classes,
+            )
         )
         if n_rows != len(yb):
             raise ValueError("X and y must have the same number of rows")
@@ -3997,6 +4208,16 @@ class MojoBoostRanker(_Base):
         self.lambdarank_norm = lambdarank_norm
         self.ndcg_eval_at = ndcg_eval_at
 
+    @staticmethod
+    def _objective_code():
+        """LambdaRank, the one objective this estimator trains. It is a
+        fixed fact rather than a parameter, which is why nothing here reads
+        `self`; `fit` passes it to the native device policy, which blocks
+        the accelerator on it (BLOCK_RANKING_OBJECTIVE), and
+        `_metric_objective` reads it for the identity link the ranking
+        metrics use."""
+        return _LAMBDARANK
+
     def _rank_params(self, params, gb):
         if int(self.lambdarank_truncation_level) < 1:
             raise ValueError("lambdarank_truncation_level must be positive")
@@ -4074,15 +4295,27 @@ class MojoBoostRanker(_Base):
         wb, w_addr = self._weight_buffer(sample_weight, n_rows)
         ic_flat, ic_offsets = self._interaction_buffers(n_features)
         mono_buf, mono_addr = self._monotone_buffer(n_features)
-        device = self._resolve_device(n_rows, n_features, 1)
-        if device != "cpu":
-            raise RuntimeError(
-                "lambdarank trains on the CPU; use device='cpu' or "
-                "device='auto'"
-            )
+        contri_buf, contri_addr = self._feature_contri_buffer(n_features)
+        device = self._resolve_device(
+            n_rows,
+            n_features,
+            1,
+            objective_code=self._objective_code(),
+            categorical=cat_buf is not None,
+            has_eval_set=eval_set is not None,
+        )
+        # Backstop; BLOCK_RANKING_OBJECTIVE is what refuses this on a build
+        # whose native policy can be asked. See `_gpu_unsupported`.
+        self._gpu_unsupported(device, "lambdarank trains on the CPU")
         params = self._rank_params(
             self._params(
-                w_addr, device, ic_flat, ic_offsets, mono_addr, cat_buf
+                w_addr,
+                device,
+                ic_flat,
+                ic_offsets,
+                mono_addr,
+                cat_buf,
+                contri_addr,
             ),
             gb,
         )

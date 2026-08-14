@@ -93,18 +93,35 @@ Combinations that are refused rather than resolved
   that cannot take one.
 - `dart` mode with a disabled `DartParams`, and an enabled one under any
   other mode.
-- Multiclass under `dart`. `boosting_rf` already implements multiclass
-  forests (`train_rf_multiclass`), so only DART is single-output here;
+- Multiclass under `dart`, from `train_boosting_multiclass` and its two
+  relatives. `boosting_rf` implements multiclass forests
+  (`train_forest_multiclass`), so only DART is single-output here;
   `boosting_dart` is written for the round-major multiclass layout, so that
   gap is a loop rather than a redesign.
+- Continuing a **bridged multiclass forest** (`train_boosting_multiclass_more`
+  under `rf`), because the class log priors its trees were fitted at are
+  folded away and `boosting_rf` exposes no bridged multiclass continuation to
+  dispatch to. `train_forest_multiclass_more` is the entry point.
+
+The four entry points and what each mode does
+---------------------------------------------
+| | `gbdt` / `goss` | `dart` | `rf` |
+| `train_boosting` | `boosting.train` | here | `train_rf` |
+| `train_boosting_more` | `train_more` | here | `train_rf_more` |
+| `..._with_valid` | `train_with_valid` | REFUSED | `train_forest_with_valid` |
+| `..._multiclass` | `train_multiclass` | REFUSED | `train_forest_multiclass` |
+
+`..._multiclass_more` and `..._multiclass_with_valid` follow the multiclass
+row, except that `rf` continuation is refused as above.
 
 DART validation-set early stopping is NOT connected. `boosting_dart` provides
 `DartBestState`, `dart_record_best`, and `dart_restore_best` precisely because
 truncating a DART ensemble to its best round is wrong: a later round may have
 rescaled a tree the best round contained, so popping trees recovers the right
-tree set with the wrong weights. There is no `train_dart_with_valid` here
-rather than one that truncates and quietly gets the weights wrong.
-`boosting_rf.train_rf_with_valid` already exists for forests.
+tree set with the wrong weights. So `train_boosting_with_valid` refuses `dart`
+rather than truncating and quietly getting the weights wrong. Truncation *is*
+exact for a forest, whose trees are independent, which is why the same
+function dispatches `rf` to `boosting_rf.train_forest_with_valid`.
 """
 
 from .bagging import (
@@ -117,6 +134,7 @@ from .binning import BinnedMatrix, fit_bins
 from .boosting import (
     Booster,
     BoosterParams,
+    MulticlassBooster,
     _base_score,
     _check_objective,
     _check_sample_weight,
@@ -127,6 +145,10 @@ from .boosting import (
     renewal_weights,
     train,
     train_more,
+    train_multiclass,
+    train_multiclass_more,
+    train_multiclass_with_valid,
+    train_with_valid,
 )
 from .boosting_dart import (
     DartParams,
@@ -138,7 +160,16 @@ from .boosting_dart import (
     dart_uniform_weights,
     select_drop,
 )
-from .boosting_rf import is_rf_boosting, train_rf, train_rf_more
+from .boosting_rf import (
+    RfParams,
+    check_rf_learning_rate,
+    is_rf_boosting,
+    train_forest_multiclass,
+    train_forest_multiclass_with_valid,
+    train_forest_with_valid,
+    train_rf,
+    train_rf_more,
+)
 from .device import CPU_DEVICE
 from .goss import GossParams
 from .model import Model
@@ -781,6 +812,239 @@ def train_boosting_more(
         goss,
         init_score,
         class_bagging,
+    )
+
+
+def train_boosting_with_valid(
+    data: BinnedMatrix,
+    target: List[Float64],
+    valid_data: BinnedMatrix,
+    valid_target: List[Float64],
+    objective: Int,
+    params: BoosterParams,
+    early_stopping_rounds: Int,
+    boosting: AlternateBoostingParams = AlternateBoostingParams(),
+    min_delta: Float64 = 0.0,
+    sample_weight: List[Float64] = [],
+    alpha: Float64 = 0.9,
+    bagging: BaggingParams = BaggingParams.disabled(),
+    goss: GossParams = GossParams.disabled(),
+    class_bagging: ClassBaggingParams = ClassBaggingParams.disabled(),
+) raises -> Booster:
+    """Train with validation-set early stopping under the selected mode.
+
+    `gbdt` and `goss` go to `boosting.train_with_valid` unchanged. `rf` goes
+    to `boosting_rf.train_forest_with_valid` and is bridged back the way
+    `train_rf` bridges an ordinary forest.
+
+    Truncating a forest to its best round count is **exact**, unlike
+    truncating a DART ensemble: a forest's trees are independent, so its
+    first `k` trees are the forest `n_estimators = k` would have grown, and
+    the bridged rate of `1 / k` is read off the truncated model. What early
+    stopping measures differs from a boosted run, though, and
+    `train_forest_with_valid` says what: a forest's validation loss falls
+    because averaging removes variance, so the answer is "how many trees are
+    enough", not "has this converged".
+
+    `dart` is refused. `boosting_dart` supplies `DartBestState`,
+    `dart_record_best`, and `dart_restore_best` for the version that records
+    and replays the best state instead, which is what DART needs and which
+    nothing calls yet; see the module docstring.
+    """
+    boosting.validate(goss)
+    if boosting.mode == BOOSTING_DART:
+        raise Error(
+            "boosting='dart' has no validation-set entry point: a round after"
+            " the best one may have rescaled a tree the best round contained,"
+            " so truncating to the best round recovers the right tree set with"
+            " the wrong weights. Use boosting_dart.dart_record_best /"
+            " dart_restore_best to hold the best state instead"
+        )
+    if boosting.mode == BOOSTING_RF:
+        _check_rf_uniform_args(class_bagging)
+        check_rf_learning_rate(params.learning_rate)
+        var forest = train_forest_with_valid(
+            data,
+            target,
+            valid_data,
+            valid_target,
+            objective,
+            RfParams.from_booster_params(params, bagging),
+            early_stopping_rounds,
+            min_delta,
+            sample_weight,
+            alpha,
+        )
+        return forest.to_booster()
+    return train_with_valid(
+        data,
+        target,
+        valid_data,
+        valid_target,
+        objective,
+        params,
+        early_stopping_rounds,
+        min_delta,
+        sample_weight,
+        alpha,
+        bagging,
+        goss,
+        class_bagging,
+    )
+
+
+def train_boosting_multiclass(
+    data: BinnedMatrix,
+    labels: List[Int],
+    n_classes: Int,
+    params: BoosterParams,
+    boosting: AlternateBoostingParams = AlternateBoostingParams(),
+    sample_weight: List[Float64] = [],
+    bagging: BaggingParams = BaggingParams.disabled(),
+    goss: GossParams = GossParams.disabled(),
+) raises -> MulticlassBooster:
+    """Train a softmax ensemble under the selected mode.
+
+    `gbdt` and `goss` go to `boosting.train_multiclass` unchanged. `rf` goes
+    to `boosting_rf.train_forest_multiclass` and is bridged back by
+    `RfMulticlassBooster.to_multiclass_booster`, which is the single-output
+    bridge per class: zero base scores, a `learning_rate` of `1 / rounds`,
+    and correctness for the whole ensemble rather than for iteration ranges.
+
+    There is no balanced-bagging argument here, as there is none on
+    `boosting.train_multiclass`: LightGBM's `pos_bagging_fraction` /
+    `neg_bagging_fraction` are binary-classification controls, which is what
+    `boosting_rf.check_rf_params` says for a forest.
+
+    `dart` is refused, and the gap is a loop rather than a redesign;
+    see the module docstring.
+    """
+    boosting.validate(goss)
+    if boosting.mode == BOOSTING_DART:
+        raise Error(
+            "boosting='dart' is single-output in this build: boosting_dart is"
+            " already written for the round-major multiclass layout"
+            " (n_classes reaches select_drop, dart_begin_round,"
+            " dart_commit_round, and dart_recompute_raw, and a round drops"
+            " whole iterations so a round's class group goes together), but"
+            " no multiclass round loop drives it yet"
+        )
+    if boosting.mode == BOOSTING_RF:
+        check_rf_learning_rate(params.learning_rate)
+        var forest = train_forest_multiclass(
+            data,
+            labels,
+            n_classes,
+            RfParams.from_booster_params(params, bagging),
+            sample_weight,
+        )
+        return forest.to_multiclass_booster()
+    return train_multiclass(
+        data, labels, n_classes, params, sample_weight, bagging, goss
+    )
+
+
+def train_boosting_multiclass_more(
+    mut booster: MulticlassBooster,
+    data: BinnedMatrix,
+    labels: List[Int],
+    params: BoosterParams,
+    boosting: AlternateBoostingParams = AlternateBoostingParams(),
+    sample_weight: List[Float64] = [],
+    bagging: BaggingParams = BaggingParams.disabled(),
+    goss: GossParams = GossParams.disabled(),
+) raises -> Int:
+    """Continue a softmax ensemble under the selected mode, returning how
+    many rounds were added.
+
+    `rf` is **refused**, unlike the single-output path. `boosting_rf` bridges
+    a forest's continuation for single-output runs (`train_rf_more`) by
+    recomputing the constant its new trees are fitted at from `target`; the
+    multiclass constant is a vector of class log priors and `boosting_rf`
+    exposes no bridged multiclass continuation, so there is nothing here to
+    dispatch to and recomputing the priors in this module would be a second
+    copy of an algorithm that already exists. Continue such a forest as an
+    `RfMulticlassBooster` through `train_forest_multiclass_more`, which
+    carries its own base scores and needs no precondition at all.
+
+    `dart` is refused for the same reason `train_boosting_multiclass` is.
+    """
+    boosting.validate(goss)
+    if boosting.mode == BOOSTING_RF:
+        raise Error(
+            "boosting='rf' cannot continue a bridged MulticlassBooster: the"
+            " class log priors its trees were fitted at are folded away by"
+            " to_multiclass_booster and boosting_rf exposes no bridged"
+            " multiclass continuation. Hold the forest as an"
+            " RfMulticlassBooster and call"
+            " boosting_rf.train_forest_multiclass_more"
+        )
+    if boosting.mode == BOOSTING_DART:
+        raise Error(
+            "boosting='dart' is single-output in this build; see"
+            " train_boosting_multiclass"
+        )
+    return train_multiclass_more(
+        booster, data, labels, params, sample_weight, bagging, goss
+    )
+
+
+def train_boosting_multiclass_with_valid(
+    data: BinnedMatrix,
+    labels: List[Int],
+    valid_data: BinnedMatrix,
+    valid_labels: List[Int],
+    n_classes: Int,
+    params: BoosterParams,
+    early_stopping_rounds: Int,
+    boosting: AlternateBoostingParams = AlternateBoostingParams(),
+    min_delta: Float64 = 0.0,
+    sample_weight: List[Float64] = [],
+    bagging: BaggingParams = BaggingParams.disabled(),
+    goss: GossParams = GossParams.disabled(),
+) raises -> MulticlassBooster:
+    """Train a softmax ensemble with validation-set early stopping under the
+    selected mode.
+
+    `rf` goes to `boosting_rf.train_forest_multiclass_with_valid`, whose
+    truncation drops whole rounds so the per-class trees stay in step, and is
+    bridged back the same way `train_boosting_multiclass` bridges. `dart` is
+    refused on both counts: it is single-output here, and truncation is wrong
+    for it (`train_boosting_with_valid`).
+    """
+    boosting.validate(goss)
+    if boosting.mode == BOOSTING_DART:
+        raise Error(
+            "boosting='dart' is single-output in this build, and truncating a"
+            " dart ensemble to its best round is wrong in any case; see"
+            " train_boosting_multiclass and train_boosting_with_valid"
+        )
+    if boosting.mode == BOOSTING_RF:
+        check_rf_learning_rate(params.learning_rate)
+        var forest = train_forest_multiclass_with_valid(
+            data,
+            labels,
+            valid_data,
+            valid_labels,
+            n_classes,
+            RfParams.from_booster_params(params, bagging),
+            early_stopping_rounds,
+            min_delta,
+            sample_weight,
+        )
+        return forest.to_multiclass_booster()
+    return train_multiclass_with_valid(
+        data,
+        labels,
+        valid_data,
+        valid_labels,
+        n_classes,
+        params,
+        early_stopping_rounds,
+        min_delta,
+        sample_weight,
+        bagging,
+        goss,
     )
 
 
