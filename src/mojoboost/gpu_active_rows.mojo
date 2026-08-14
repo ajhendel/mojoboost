@@ -78,13 +78,52 @@ range table. The scatter writes into a second full-size buffer and a copy
 kernel folds just the parent's range back, so the ranges other leaves hold
 stay valid: ping-ponging whole buffers would invalidate them.
 
+**Ownership and growth.** `GpuActiveRows` owns exactly the index machinery:
+`rows`, `scratch`, `offsets` (one Int32 per row each), the per-scan-block sums,
+the one-element total, and the pinned staging buffers. Nothing here ever
+reallocates: the buffers are sized for the *dataset*, and every tree, node,
+and split works inside that fixed footprint, so there is no capacity growth
+policy because there is no capacity that grows. What does grow is the host
+`LeafRangeTable`, by at most two `LeafRange` appends per split, and it is
+cleared at every `reset_root`. A dataset larger than the buffers is not a
+resize, it is a different `GpuActiveRows`.
+
+Empty leaves
+------------
+An empty range is a first-class state, not an error. `partition` of an empty
+window enqueues nothing and reports zero rows left, and its two children are
+recorded as empty ranges at the parent's own offset, so the live ranges keep
+tiling `[0, n_active)`. `enqueue_range_histogram` for an empty node zeroes the
+output and returns without launching an accumulation, which is the histogram
+that node has. A leaf that holds no rows therefore costs one zeroing pass and
+no row work, and never a special case in the caller.
+
+Multiclass, bagging, and GOSS
+-----------------------------
+One `GpuActiveRows` holds one permutation, and a K-class round grows K trees
+over it, one per class, in sequence: `begin_tree` reseeds the root and clears
+the range table, so class `k + 1` starts from a clean permutation. The class
+index does not reach this module at all, because which rows exist does not
+depend on the class; it reaches the gradient plane instead, through
+`LeafFrontier.plane` and `gpu_leaf_batching.ITEM_PLANE`.
+
+Bagging and GOSS reach it in exactly one way: as the `bag` list handed to
+`begin_tree`, which becomes the live prefix. There are no per-row weights on
+the device and none are wanted. GOSS's amplification of the small-gradient
+sample is applied to the gradients before they are uploaded (see
+`goss.apply_goss_scaling`), so a row's weight is already inside `grad[r]` and
+`hess[r]` by the time any kernel here reads it. A second weight vector would
+be a second place to scale, and two places to scale is one too many.
+
 What is not here
 ----------------
 This module owns no dataset, gradients, or histogram output. Those live in
 `GpuHistogramBuilder`, and the range-histogram entry points below take them
 as pointers so the builder can call in without a second copy of anything.
 See `handoffs/apple_a1_active_rows.md` for the step-by-step replacement of
-the leaf-id filtering path.
+the leaf-id filtering path and `handoffs/connect_02_gpu_dataflow.md` for the
+frontier seam (`begin_tree_with`, `apply_commit`, `check_frontier`) this
+module offers a grower.
 """
 
 from std.atomic import Atomic
@@ -97,6 +136,8 @@ from max.gpu.sync import barrier
 
 from .binning import BinnedMatrix
 from .categorical import CatBitset, cat_empty
+from .gpu_frontier import CommitPlan, LeafFrontier
+from .gpu_histogram_specializations import MAX_BINS
 from .gpu_tiling import (
     STRATEGY_TILED,
     DeviceCaps,
@@ -106,8 +147,6 @@ from .gpu_tiling import (
 )
 from .parallel import _env_int
 from .split import SplitInfo
-
-comptime MAX_BINS = 256
 
 # Row indices and leaf ids cross into the kernels as Int32.
 comptime MAX_ROWS = Int(Int32.MAX)
@@ -1113,6 +1152,129 @@ struct GpuActiveRows(Movable):
             n_left = expected_left
 
         _ = self.ranges.split(parent, left, right, n_left)
+        return n_left
+
+    # --- The frontier seam -------------------------------------------------
+    #
+    # Three calls a grower makes instead of maintaining the row ranges and the
+    # host-side leaf list separately. `LeafFrontier` holds the same windows
+    # this module's `LeafRangeTable` holds, and holding them twice is only
+    # safe if something keeps them equal; `check_frontier` is that something,
+    # and `apply_commit` is the one state transition that moves both.
+
+    def begin_tree_with(
+        mut self,
+        mut frontier: LeafFrontier,
+        bag: List[Int] = [],
+        max_leaves: Int = 0,
+        plane: Int = 0,
+    ) raises -> Int:
+        """Start a tree on the device and on the host frontier at once, and
+        return the number of rows it grows on.
+
+        One call rather than two, because the two agree on exactly one number
+        and letting a caller pass it twice is letting a caller pass it wrong:
+        `n_active` is `len(bag)` when bagging or GOSS selected rows and
+        `n_rows` when they did not, and both the root `LeafRange` and the root
+        `FrontierLeaf` have to be that window.
+
+        `max_leaves` is the `num_leaves` budget the frontier reports
+        completion against and `plane` the class index of a multiclass round;
+        neither reaches the device, because neither changes which rows exist.
+        A multiclass round grows one tree per class over this same
+        permutation, sequentially, so calling this once per class is correct
+        and costs one root seed each.
+        """
+        self.begin_tree(bag)
+        var n_active = self.ranges.n_active
+        frontier.begin_tree(n_active, max_leaves, plane)
+        return n_active
+
+    def check_frontier(self, frontier: LeafFrontier) raises:
+        """Every live frontier leaf's window is the range its node owns here.
+
+        The check that makes a disagreement between the two tables loud
+        instead of silent. A frontier leaf whose `row_begin`/`row_count` had
+        drifted from its `LeafRange` would build a histogram of the wrong
+        rows, and nothing about the launch would be out of bounds, so nothing
+        else would notice. Linear in the frontier, which is a few hundred
+        entries, and meant to be called after a commit or before a batch
+        rather than inside a row loop.
+        """
+        if frontier.n_active != self.ranges.n_active:
+            raise Error(
+                "frontier and active-row table disagree on the active row"
+                " count"
+            )
+        for i in range(frontier.size()):
+            var leaf = frontier.leaf(i)
+            var window = self.ranges.get(leaf.node)
+            if window.begin != leaf.row_begin:
+                raise Error(
+                    "frontier leaf's row window does not start where its"
+                    " active-row range does"
+                )
+            if window.count() != leaf.row_count:
+                raise Error(
+                    "frontier leaf's row count does not match its active-row"
+                    " range"
+                )
+
+    def partition_commit[
+        bins_origin: MutOrigin, //
+    ](
+        mut self,
+        bins: MutPointer[UInt8, bins_origin],
+        plan: CommitPlan,
+    ) raises -> Int:
+        """Split the committed leaf's range into its children's, from the
+        plan alone.
+
+        The routing rule is built here, from `plan.split` and
+        `plan.missing_bin`, through the same `RowRouting.from_split` the host
+        reference model uses, so a caller never restates the
+        missing/categorical rule and cannot state it differently from the
+        kernels. The left count is the plan's `left_count`, which the search
+        already counted exactly off the parent histogram's integer count
+        plane, so nothing is downloaded and nothing synchronizes unless
+        `MOJOBOOST_GPU_VERIFY_ROWS=1` asks for the cross-check.
+
+        An empty parent partitions to two empty children: the enqueue returns
+        without a launch and the range table records `[b, b)` twice, which is
+        what keeps the live ranges tiling `[0, n_active)` whatever the tree
+        does.
+        """
+        var routing = RowRouting.from_split(plan.split, plan.missing_bin)
+        return self.partition(
+            bins,
+            plan.parent_node,
+            plan.left_node,
+            plan.right_node,
+            routing,
+            plan.left_count,
+        )
+
+    def apply_commit[
+        bins_origin: MutOrigin, //
+    ](
+        mut self,
+        mut frontier: LeafFrontier,
+        bins: MutPointer[UInt8, bins_origin],
+        plan: CommitPlan,
+    ) raises -> Int:
+        """The whole of one commit: partition on the device, move the
+        frontier on the host, and return the left row count.
+
+        This is the single state transition a grower needs per split. It runs
+        the device half first so a failure to route leaves the frontier
+        untouched rather than half advanced, and it re-checks the two tables
+        against each other afterwards, which is cheap next to a partition and
+        is what turns a wiring mistake into an error at the split that caused
+        it instead of at some later histogram.
+        """
+        var n_left = self.partition_commit(bins, plan)
+        frontier.apply_commit(plan)
+        self.check_frontier(frontier)
         return n_left
 
     def range_tiling(

@@ -10,6 +10,16 @@ deliberately narrower than the Mojo API.
 - `mojoboost_capi.mojo` is the implementation.
 - `build.sh` produces `libmojoboost.dylib` (macOS) or `libmojoboost.so`.
 - `test_capi.c` is the C test; `run_c_tests.sh` builds and runs it.
+- `docs/C_API.md` is the reference, including the version history.
+- `packaging/native/` is how the header and library are laid out in a
+  release.
+
+The implementation reimplements nothing. Training is `fit`, prediction is
+`Model.predict_batch`, inspection is `dump_model`, the device decision is
+`resolve_device`, and the file format is `serialize.mojo` — the same code
+the Python package and the command line tool call. A change to how
+mojoboost bins, walks trees, or picks a device reaches C callers without
+anyone touching this directory.
 
 ```sh
 pixi run build-capi     # build the shared library
@@ -37,9 +47,17 @@ stating plainly:
 | `MojoBoostModel *` | library | `mojoboost_model_free` |
 | `MojoBoostError *` | library | `mojoboost_error_free` |
 | `mojoboost_error_message` result | error object | nothing; valid until the next call passed that error object |
+| `mojoboost_model_dump_json` result | caller | `mojoboost_string_free` |
 
 The library copies whatever it needs from your buffers during the call and
-retains nothing afterward. Both free functions accept `NULL`.
+retains nothing afterward. Every free function accepts `NULL`.
+
+Note the one asymmetry: `mojoboost_error_message` hands back a pointer the
+error object still owns, so it must not be freed and does not outlive the
+next call on that object, whereas `mojoboost_model_dump_json` hands over a
+fresh allocation the caller must release with `mojoboost_string_free`.
+Never `free()` a library allocation directly: the library may not share the
+caller's allocator.
 
 ## Errors
 
@@ -52,7 +70,7 @@ discards the message but keeps the status code.
 | `MOJOBOOST_ERROR_INVALID_ARGUMENT` | a NULL, a nonpositive dimension, a buffer too small, a shape that does not match the model, or a parameter string that is wrong |
 | `MOJOBOOST_ERROR_TRAINING` | the arguments were well formed but training failed, for example poisson with a negative label |
 | `MOJOBOOST_ERROR_IO` | a model file could not be read or written |
-| `MOJOBOOST_ERROR_UNSUPPORTED` | the parameter string named a real mojoboost feature that only the Mojo API exposes |
+| `MOJOBOOST_ERROR_UNSUPPORTED` | the parameter string named a real mojoboost feature that only the Mojo API exposes, or a device request the policy refused |
 
 An error object is cleared at the start of every call that receives it,
 including calls that then succeed, so a stale message never survives.
@@ -112,6 +130,48 @@ is `data[f * n_rows + r]`. `NaN` is a missing value. Predictions are written
 row-major, `out[r * k + c]` for `k = mojoboost_model_num_classes(model)`,
 which is 1 for every single-output model.
 
+## Iteration ranges and devices
+
+`mojoboost_predict` and `mojoboost_predict_raw` score the whole ensemble on
+the CPU. `mojoboost_predict_ex` is the same call with the rest of the
+prediction surface exposed:
+
+```c
+/* the first 50 iterations only, on whichever device the policy picks */
+mojoboost_predict_ex(model, x, n_rows, n_features,
+                     /* start_iteration */ 0, /* num_iteration */ 50,
+                     MOJOBOOST_PREDICT_RESPONSE, MOJOBOOST_DEVICE_AUTO,
+                     pred, n_rows * k, err);
+```
+
+Ranges are in boosting iterations, not trees, which for a multiclass model
+differ by a factor of `num_class`; `mojoboost_model_num_iterations` reports
+the right unit. `num_iteration <= 0` means every iteration from the start
+on, LightGBM's convention.
+
+`MOJOBOOST_DEVICE_GPU` fails with `MOJOBOOST_ERROR_UNSUPPORTED` and the
+policy's own reason rather than falling back to the CPU. Check
+`mojoboost_gpu_available()` before asking for it, and note that a 1 there
+means the request is worth making, not that every workload is covered.
+
+## Inspecting a model
+
+`mojoboost_model_dump_json` returns the whole model in the inspection
+schema (`docs/MODEL_INSPECTION_SCHEMA.md`), which is versioned separately
+from this ABI:
+
+```c
+char *json = NULL;
+if (mojoboost_model_dump_json(model, &json, err) == MOJOBOOST_OK) {
+    puts(json);
+    mojoboost_string_free(json);
+}
+```
+
+That is the whole model-reading surface. There is no way to walk trees node
+by node from C, on purpose: the schema is a documented, versioned format,
+while a node-level API would freeze the tree representation.
+
 ## Example
 
 ```c
@@ -158,8 +218,19 @@ as one under `/dev/null`, is still an `MOJOBOOST_ERROR_IO`.
 
 ## Stability
 
-`MOJOBOOST_ABI_VERSION` changes only when a declaration in `mojoboost.h`
-changes in a way that breaks a compiled caller. `mojoboost_abi_version()`
-reports what the loaded library was built with, for callers that load it
-dynamically. `tests/test_capi.mojo` checks that the header and the
-implementation still agree on every constant.
+`MOJOBOOST_ABI_VERSION` is incremented whenever `mojoboost.h` gains
+declarations. Versions are cumulative: each one adds and none removes or
+changes, so a caller built against version N works unchanged against any
+library reporting at least N. Test for the version that introduced the
+newest symbol you call, never for equality.
+
+| Version | Adds |
+|---|---|
+| 1 | train, predict, save, load, accessors, errors |
+| 2 | `mojoboost_predict_ex`, `mojoboost_model_num_iterations`, `mojoboost_gpu_available`, `mojoboost_model_dump_json`, `mojoboost_string_free`, the `MOJOBOOST_DEVICE_*` and `MOJOBOOST_PREDICT_*` constants |
+
+`mojoboost_abi_version()` reports what the loaded library was built with,
+for callers that load it dynamically. `tests/test_capi.mojo` checks that the
+header and the implementation still agree on every constant. A change that
+did break a compiled caller would ship as a renamed library rather than as a
+version number that silently means something else.

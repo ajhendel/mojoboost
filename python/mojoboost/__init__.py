@@ -20,9 +20,19 @@ scikit-learn conventions
 ------------------------
 The estimators implement `get_params`, `set_params`, `fit`, `predict`,
 `predict_proba` (classifier), and `score`, record `n_features_in_`,
-`feature_names_in_`, `classes_`, `feature_importances_`, and
-`best_iteration_` when fitted, raise `NotFittedError` before that, and
-pickle. `clone`, `Pipeline`, `GridSearchCV`, and `cross_val_score` work.
+`feature_names_in_`, `classes_`, `n_classes_`, `feature_importances_`,
+`device_`, `best_iteration_`, and `n_iter_` when fitted, raise
+`NotFittedError` before that, and pickle. `clone`, `Pipeline`,
+`GridSearchCV`, and `cross_val_score` work.
+
+LightGBM's own fitted attributes are here too, and each is answered by the
+model rather than kept in step with it: `booster_` is the `Booster`,
+`objective_` the resolved objective's canonical name, `feature_name_` the
+training feature names (`Column_0`, `Column_1`, ... when the model carries
+none), and `n_features_` the feature count read off the model. With an
+`eval_set`, `evals_result_`, `best_score_`, and `stopped_early_` record
+what validation saw; without one they are absent, because there was no
+metric to report.
 scikit-learn is optional: nothing here imports it except the
 `__sklearn_tags__` hook that scikit-learn itself calls.
 
@@ -218,7 +228,21 @@ available or when the GPU path does not cover the workload, rather than
 falling back silently; `"auto"` picks a backend for you and currently
 always picks the CPU. `gpu_available()` reports whether this build can
 train on an accelerator. Fitting records the backend that ran on
-`device_`. See src/mojoboost/device.mojo for the full policy.
+`device_`. The decision is made in Mojo and nowhere else, and
+`explain_device_choice(X, y, device="gpu")` returns the report behind it
+without training anything. See src/mojoboost/device.mojo for the policy and
+`mojoboost.device_selection` for the Python door to it.
+
+`predict`, `predict_proba`, and the ranker's `predict` take their own
+`device=` as well, because where a prediction runs is a property of the
+call and not of the fit that produced the model: mojoboost stores one
+ensemble, so a model fitted on the CPU can be predicted on an accelerator
+and the reverse. `device=None`, the default, is the CPU and consults no
+policy. Leaf ordinals (`pred_leaf`), contributions (`pred_contrib`), and
+sparse input have no accelerator kernel and refuse an explicit `"gpu"`
+rather than running on the CPU and reporting otherwise. On a build without
+the device prediction entry points, every `device=` other than `"cpu"`
+raises for the same reason.
 
 `show_versions()` prints what this installation is, for a bug report, and
 `build_info()` returns the same facts as a dict. Both report whether a GPU
@@ -249,6 +273,31 @@ matches: a feature in no group is never split on at all, so constraining a
 few features drops the rest from the model. To leave a feature free to
 interact with everything, put it in every group; a group of its own instead
 isolates it. See src/mojoboost/interaction.mojo for the exact rule.
+
+The rest of the package
+-----------------------
+`import mojoboost` costs the compiled extension and nothing else. Nothing
+here imports numpy, pandas, scipy, scikit-learn, or dask, and none of them
+has to be installed. Everything below the estimators is reached on first
+access, so asking for it is what pays for it:
+
+- `mojoboost.cv(params, train_set, ...)` cross-validates, as `lightgbm.cv`
+  does, and `CVBooster` is what `return_cvbooster=True` hands back. Note
+  that `mojoboost.cv` is the *function*: it shadows the module of the same
+  name, so reach the module as `from mojoboost.cv import ...`.
+- `mojoboost.inspection` is structured model inspection, the schema in
+  docs/MODEL_INSPECTION_SCHEMA.md. `dump_model`, `trees_to_dataframe`,
+  `trees_to_records`, and `get_split_value_histogram` are re-exported here
+  and are also methods on `Booster`. pandas is needed for the frame form
+  and for nothing else.
+- `mojoboost.device_selection` explains what a device request would do.
+  `explain_device_choice` is re-exported here.
+- `mojoboost.diagnostics` describes the install and the startup phases,
+  and is what `build_info()` and `show_versions()` read.
+- `mojoboost.dask` is **experimental and cannot train**. No transport
+  ships, so every `fit` raises `DistributedNotAvailable`; the module is
+  the client-side contract for a backend, not a feature, which is why
+  nothing from it is exported here. Importing it does not import dask.
 """
 
 import array as _array
@@ -346,6 +395,15 @@ _NO_DEVICE_PREDICT = (
     "%s, so device=%r cannot be honored without silently predicting "
     "somewhere else. Rebuild with the device prediction bindings, or pass "
     "device='cpu' (or leave device unset)."
+)
+
+#: Sparse prediction has no accelerator kernel, the same way sparse
+#: training has none. `device="auto"` resolves to the CPU here, which is
+#: what it would resolve to anyway; only an explicit `"gpu"` is refused.
+_NO_SPARSE_DEVICE_PREDICT = (
+    "sparse input predicts on the CPU; there is no sparse accelerator "
+    "kernel. Pass device='cpu' or device='auto' (or leave device unset), "
+    "or densify with .toarray() to predict on an accelerator."
 )
 
 _SQUARED_ERROR = 0
@@ -669,6 +727,24 @@ def _check_eval_arguments(
             "trainer that scores validation metrics; pass "
             "eval_set=[(X_valid, y_valid)]"
         )
+
+
+def _device_name(device):
+    """A `predict(device=...)` argument, validated and lowercased.
+
+    `None` passes through as `None`, which means the established path: the
+    CPU, with no policy consulted. The names are case-insensitive, as
+    LightGBM treats `device_type`, and the spelling check is here rather
+    than across the boundary only so that a typo names the alternatives.
+    """
+    if device is None:
+        return None
+    if not isinstance(device, str) or device.lower() not in _DEVICES:
+        raise ValueError(
+            f"unknown device {device!r}; expected one of "
+            + ", ".join(_DEVICES)
+        )
+    return device.lower()
 
 
 def gpu_available():
@@ -2097,6 +2173,58 @@ class _Base(_ParamsMixin):
         booster._names = None if names is None else [str(n) for n in names]
         return booster
 
+    # -- LightGBM's fitted attributes that the model already answers -------
+    #
+    # These three are properties rather than entries in `_FITTED_ATTRS`
+    # because their source is the model, not the fit: an estimator loaded
+    # with `load()` or unpickled answers them, and nothing has to be kept
+    # in step with them. `mojoboost.inspection` is the single reader; it
+    # is imported inside each property so that the top-level import does
+    # not pay for a submodule most callers never touch.
+
+    @property
+    def objective_(self):
+        """LightGBM's `objective_`: the resolved objective's canonical
+        name.
+
+        Resolved, not echoed. It comes from the objective code the fitted
+        model carries, so an estimator constructed with an alias (`mae`)
+        reports the canonical spelling (`regression_l1`), a softmax
+        classifier reports `multiclass`, and a callable objective reports
+        `custom`.
+
+        Until `_mojoboost.objective_code` is bound, reading this costs a
+        `model_to_string()` round trip (see `inspection.objective_of`), so
+        it is a fitted attribute worth reading once rather than per row.
+        """
+        self._require_fitted()
+        from . import inspection
+
+        return inspection.objective_of(self)
+
+    @property
+    def feature_name_(self):
+        """LightGBM's `feature_name_`: the training feature names, or
+        `Column_0`, `Column_1`, ... when the model carries none.
+
+        `feature_names_in_` is scikit-learn's attribute and exists only
+        when the training matrix carried names; this one always exists on a
+        fitted model, which is the difference between the two.
+        """
+        self._require_fitted()
+        from . import inspection
+
+        return inspection.feature_name_of(self)
+
+    @property
+    def n_features_(self):
+        """LightGBM's `n_features_`: the feature count the model was fitted
+        on, read from the model rather than from a fit-time attribute."""
+        self._require_fitted()
+        from . import inspection
+
+        return inspection.n_features_of(self)
+
     def _reset_fitted(self):
         """Drop everything a previous fit left behind. Called by `__init__`
         and at the top of every `fit`, so a failed refit does not leave the
@@ -2263,11 +2391,12 @@ class _Base(_ParamsMixin):
         explicit request for the pair is refused here rather than run on
         the CPU and reported as having run on the device.
         """
-        if device is None:
+        name = _device_name(device)
+        if name is None:
             return "cpu"
         self._require_fitted()
         resolved = self._resolve_device(
-            n_rows, self.n_features_in_, n_outputs, device=device
+            n_rows, self.n_features_in_, n_outputs, device=name
         )
         if resolved != "cpu" and unsupported is not None:
             raise RuntimeError(
@@ -2985,12 +3114,8 @@ class MojoBoostRegressor(_Base):
         `raw_score` and `pred_leaf` cannot be combined."""
         self._check_predict_flags(raw_score, pred_leaf, pred_contrib)
         if _arrays.is_sparse(X):
-            if self._predict_device(device, 0, 1) != "cpu":
-                raise RuntimeError(
-                    "sparse input predicts on the CPU; there is no sparse "
-                    "accelerator kernel. Pass device='cpu' (or leave device "
-                    "unset), or densify with .toarray()."
-                )
+            if _device_name(device) == "gpu":
+                raise RuntimeError(_NO_SPARSE_DEVICE_PREDICT)
             out, n_rows = self._sparse_scores(
                 X, raw_score, start_iteration, num_iteration, pred_leaf,
                 pred_contrib, validate_features,
@@ -3413,6 +3538,7 @@ class MojoBoostClassifier(_Base):
         pred_leaf=False,
         pred_contrib=False,
         validate_features=False,
+        device=None,
     ):
         """Class probabilities, shape (n_samples, n_classes), with columns
         in `classes_` order. Rows sum to 1.
@@ -3437,32 +3563,37 @@ class MojoBoostClassifier(_Base):
         as in `MojoBoostRegressor.predict`; the softmax is taken over the
         sliced scores, so probabilities are those of the truncated ensemble.
         `validate_features` and the `raw_score`/`pred_leaf` exclusion are
-        also as documented there."""
+        also as documented there. `device` chooses where this one call
+        runs, as it does for `MojoBoostRegressor.predict`, and applies to
+        the softmax ensemble as well as the binary one."""
         self._check_predict_flags(raw_score, pred_leaf, pred_contrib)
         if _arrays.is_sparse(X):
+            if _device_name(device) == "gpu":
+                raise RuntimeError(_NO_SPARSE_DEVICE_PREDICT)
             return self._predict_proba_sparse(
                 X, raw_score, start_iteration, num_iteration, pred_leaf,
                 pred_contrib, validate_features,
             )
         Xb, n_rows = self._check_predict_X(X, validate_features)
-        n_features = self.n_features_in_
         start, stop = self._iteration_slice(start_iteration, num_iteration)
+        # Trees per boosting round: a binary model grows one, a softmax one
+        # grows one per class. The same count the fit resolved its device
+        # with, so a prediction is gated the way the fit was.
+        n_outputs = 1 if self.n_classes_ == 2 else self.n_classes_
         if pred_leaf:
+            self._predict_device(device, n_rows, n_outputs, "pred_leaf=True")
             return self._predict_leaf(Xb, n_rows, start, stop)
         if pred_contrib:
+            self._predict_device(
+                device, n_rows, n_outputs, "pred_contrib=True"
+            )
             return self._predict_contrib(Xb, n_rows, start, stop)
         raw = int(bool(raw_score))
+        resolved = self._predict_device(device, n_rows, n_outputs)
         if self.n_classes_ == 2:
             out = _out_buffer(n_rows)
-            _mojoboost.predict_range(
-                self._model,
-                _addr(Xb),
-                n_rows,
-                n_features,
-                start,
-                stop,
-                raw,
-                _addr(out),
+            self._predict_batch(
+                Xb, n_rows, start, stop, raw, out, resolved
             )
             if raw:
                 # One raw score per row, as LightGBM returns for a binary
@@ -3472,15 +3603,8 @@ class MojoBoostClassifier(_Base):
                 return _np.column_stack([1.0 - out, out])
             return [[1.0 - p, p] for p in out]
         out = _out_buffer(n_rows * self.n_classes_)
-        _mojoboost.predict_proba_range(
-            self._model,
-            _addr(Xb),
-            n_rows,
-            n_features,
-            start,
-            stop,
-            raw,
-            _addr(out),
+        self._predict_batch(
+            Xb, n_rows, start, stop, raw, out, resolved, proba=True
         )
         if _np is not None:
             return out.reshape(n_rows, self.n_classes_)
@@ -3496,6 +3620,7 @@ class MojoBoostClassifier(_Base):
         pred_leaf=False,
         pred_contrib=False,
         validate_features=False,
+        device=None,
     ):
         """Predicted labels, drawn from `classes_`. Defined as the argmax
         of `predict_proba`, so the two can never disagree.
@@ -3512,6 +3637,7 @@ class MojoBoostClassifier(_Base):
             pred_leaf=pred_leaf,
             pred_contrib=pred_contrib,
             validate_features=validate_features,
+            device=device,
         )
         if raw_score or pred_leaf or pred_contrib:
             return proba
@@ -3873,6 +3999,7 @@ class MojoBoostRanker(_Base):
         pred_leaf=False,
         pred_contrib=False,
         validate_features=False,
+        device=None,
     ):
         """Raw ranking scores for `X`, one per row. Sort a query's rows by
         this score, descending, to get its ranking; the values themselves
@@ -3882,27 +4009,30 @@ class MojoBoostRanker(_Base):
         nothing: lambdarank has no inverse link, so a ranker's response scale
         is its raw scale and both settings return the same scores.
 
-        `start_iteration`, `num_iteration`, `pred_leaf`, and
-        `validate_features` behave as in `MojoBoostRegressor.predict`; a
-        ranker is a single-output ensemble, so `pred_leaf` returns shape
-        `(n_samples, num_iteration)`."""
+        `start_iteration`, `num_iteration`, `pred_leaf`,
+        `validate_features`, and `device` behave as in
+        `MojoBoostRegressor.predict`; a ranker is a single-output ensemble,
+        so `pred_leaf` returns shape `(n_samples, num_iteration)`.
+        Lambdarank *training* is CPU-only, but a fitted ranker is an
+        ordinary single-output ensemble, so predicting it is not."""
         self._check_predict_flags(raw_score, pred_leaf, pred_contrib)
         Xb, n_rows = self._check_predict_X(X, validate_features)
         start, stop = self._iteration_slice(start_iteration, num_iteration)
         if pred_leaf:
+            self._predict_device(device, n_rows, 1, "pred_leaf=True")
             return self._predict_leaf(Xb, n_rows, start, stop)
         if pred_contrib:
+            self._predict_device(device, n_rows, 1, "pred_contrib=True")
             return self._predict_contrib(Xb, n_rows, start, stop)
         out = _out_buffer(n_rows)
-        _mojoboost.predict_range(
-            self._model,
-            _addr(Xb),
+        self._predict_batch(
+            Xb,
             n_rows,
-            self.n_features_in_,
             start,
             stop,
             int(bool(raw_score)),
-            _addr(out),
+            out,
+            self._predict_device(device, n_rows, 1),
         )
         return _finish(out)
 

@@ -21,6 +21,12 @@ The layering is deliberate and is the whole point of the file:
 - `TransportCollective` is the thin blocking driver that composes the two and
   conforms to `Collective`, so `train_distributed` can be handed one without a
   line of `distributed.mojo` changing.
+- the runtime section at the end is the only seam anything outside Mojo uses.
+  A `RuntimeSpec` describes a rank's world and nothing about the data;
+  `open_local_collective` and `open_transport_collective` are the only two ways
+  a collective is built; and `transport_available` is the single place that
+  answers whether another process can be reached, so every caller refuses for
+  the same reason with the same message.
 
 What is implemented and tested, and what is not, is stated plainly because the
 distinction matters more here than anywhere else in the repository:
@@ -44,10 +50,14 @@ and the hermetic two-process test it has to pass.
 **Therefore not claimed.** Nothing here has moved a byte between two
 processes or two hosts. No multi-host behavior, no throughput, and no
 scalability is claimed. `MemoryEndpoint` is a fake, named as one, and is not
-a transport.
+a transport. `HAS_BYTE_ENDPOINT` is False and `transport_available` returns
+it, so a caller that asks for a multi-process world is refused with
+`TRANSPORT_UNAVAILABLE` before it partitions a row. A socket adapter landing
+flips that one name, and nothing above it changes.
 """
 
 from std.memory import bitcast
+from std.os import getenv
 from std.time import perf_counter_ns
 
 from .collective import (
@@ -1922,3 +1932,380 @@ def zero_contribution_f64(size: Int) -> List[Float64]:
 
 def zero_contribution_int(size: Int) -> List[Int]:
     return zeros_int(size)
+
+
+# ---------------------------------------------------------------------------
+# The runtime interface
+# ---------------------------------------------------------------------------
+#
+# One narrow seam for everything outside Mojo: the Python bindings, the Dask
+# client in python/mojoboost/dask.py, and a future launcher all describe a run
+# the same way here, and get back either a working `Collective` or one error
+# that says exactly why they cannot have one.
+#
+# It is deliberately small. A `RuntimeSpec` is the rank, the world, the machine
+# list, the job id, and the timeouts, and nothing about the data or the model.
+# `open_local_collective` and `open_transport_collective` are the only two ways
+# a collective is ever built. `transport_available` is the one place that says
+# whether a second process can be reached at all, and today it says no.
+
+comptime RUNTIME_LOCAL = 0
+"""Every rank of the world hosted in this process. Real, and the only mode
+that runs today."""
+
+comptime RUNTIME_TRANSPORT = 1
+"""One rank per process, over byte endpoints. Configurable and validated, but
+not openable in this build: see `transport_available`."""
+
+# Whether a `ByteEndpoint` that can actually reach another process is compiled
+# in. `MemoryEndpoint` is a fake and does not count. This is a comptime False
+# rather than a runtime probe because the adapter's absence is a fact about the
+# build, and a socket endpoint landing flips exactly this one name.
+comptime HAS_BYTE_ENDPOINT = False
+
+
+def runtime_mode_name(mode: Int) -> String:
+    if mode == RUNTIME_LOCAL:
+        return "local"
+    if mode == RUNTIME_TRANSPORT:
+        return "transport"
+    return "unknown"
+
+
+def parse_runtime_mode(text: String) raises -> Int:
+    if text == "local":
+        return RUNTIME_LOCAL
+    if text == "transport":
+        return RUNTIME_TRANSPORT
+    raise transport_error(
+        TRANSPORT_CONFIG_INVALID,
+        -1,
+        "runtime mode must be 'local' or 'transport', got '" + text + "'",
+    )
+
+
+def transport_available() -> Bool:
+    """Whether this build can open a session to another process.
+
+    False, and stated once here so that every caller refuses for the same
+    reason with the same message instead of each discovering the gap its own
+    way. Everything above the endpoint is written and exercised; nothing below
+    it exists.
+    """
+    return HAS_BYTE_ENDPOINT
+
+
+def transport_unavailable_detail() -> String:
+    return String(
+        "this build has no ByteEndpoint that can reach another process:"
+        " MemoryEndpoint is an in-process fake, and the socket adapter"
+        " docs/DISTRIBUTED_TRANSPORT.md section 7 specifies is not written."
+        " Configuration, framing, ordering, deadlines, and the reduction are"
+        " all validated, so a rank can be configured and refused rather than"
+        " left to hang. Train with the local runtime meanwhile"
+    )
+
+
+@fieldwise_init
+struct RuntimeSpec(Copyable, Movable):
+    """How one rank reaches its world, and nothing else.
+
+    `mode` picks between a world hosted in this process and one spread over
+    processes. In `RUNTIME_LOCAL`, `addresses` is empty and `rank` is 0,
+    because the process is every rank; in `RUNTIME_TRANSPORT`, `addresses` is
+    the machine list indexed by rank, which is the rank assignment itself.
+
+    Nothing here describes the data, the objective, or the model. That
+    separation is what lets a launcher build this from an environment before it
+    has read a row, and what keeps the training entry point in
+    `distributed.mojo` from growing a second copy of the wire configuration.
+    """
+
+    var mode: Int
+    var rank: Int
+    var world_size: Int
+    var addresses: List[RankAddress]
+    var job_id: UInt64
+    var connect_timeout_ns: Int
+    var collective_timeout_ns: Int
+    var restart_epoch: Int
+
+    def validate(self) raises:
+        """Refuse a spec before anything is opened.
+
+        Every check here is one whose absence would surface later as a hang, a
+        silently wrong rank assignment, or a model whose provenance cannot be
+        reconstructed.
+        """
+        if self.mode != RUNTIME_LOCAL and self.mode != RUNTIME_TRANSPORT:
+            raise transport_error(
+                TRANSPORT_CONFIG_INVALID,
+                self.rank,
+                "unknown runtime mode " + String(self.mode),
+            )
+        if self.world_size < 1:
+            raise transport_error(
+                TRANSPORT_CONFIG_INVALID, self.rank, "world size must be > 0"
+            )
+        if self.rank < 0 or self.rank >= self.world_size:
+            raise transport_error(
+                TRANSPORT_CONFIG_INVALID,
+                self.rank,
+                "rank is outside the world",
+            )
+        if self.restart_epoch < 0:
+            raise transport_error(
+                TRANSPORT_CONFIG_INVALID,
+                self.rank,
+                "restart epoch must not be negative",
+            )
+        if self.mode == RUNTIME_LOCAL:
+            if len(self.addresses) != 0:
+                raise transport_error(
+                    TRANSPORT_CONFIG_INVALID,
+                    self.rank,
+                    "a local runtime has no addresses to connect to",
+                )
+            if self.rank != 0:
+                raise transport_error(
+                    TRANSPORT_CONFIG_INVALID,
+                    self.rank,
+                    "a local runtime hosts every rank and is rank 0",
+                )
+            return
+        if len(self.addresses) != self.world_size:
+            raise transport_error(
+                TRANSPORT_CONFIG_INVALID,
+                self.rank,
+                "the machine list has "
+                + String(len(self.addresses))
+                + " entries for a world of "
+                + String(self.world_size),
+            )
+        _ = self.transport_config()
+
+    def transport_config(self) raises -> TransportConfig:
+        """The validated wire configuration, or an error for a local spec."""
+        if self.mode != RUNTIME_TRANSPORT:
+            raise transport_error(
+                TRANSPORT_CONFIG_INVALID,
+                self.rank,
+                "a local runtime has no wire configuration",
+            )
+        var config = TransportConfig(
+            self.rank,
+            self.addresses.copy(),
+            self.job_id,
+            self.connect_timeout_ns,
+            self.collective_timeout_ns,
+        )
+        config.validate()
+        return config^
+
+    def schema_digest(self) raises -> UInt64:
+        """The digest every rank of this run must agree on.
+
+        For a transport run it is the machine list's, so a rank started against
+        a stale list is refused rather than silently taking over another rank's
+        shard. For a local run there is no list and no peer, so it is the mode
+        and the world size: enough to stamp a checkpoint with what produced it,
+        and honest about carrying nothing more.
+        """
+        if self.mode == RUNTIME_TRANSPORT:
+            return self.transport_config().schema_digest()
+        return digest_ints(
+            [TRANSPORT_PROTOCOL_VERSION, RUNTIME_LOCAL, self.world_size]
+        )
+
+    def describe(self) -> String:
+        var text = String(
+            "runtime ",
+            runtime_mode_name(self.mode),
+            " rank ",
+            self.rank,
+            " of ",
+            self.world_size,
+        )
+        for i in range(len(self.addresses)):
+            text += " " + self.addresses[i].text()
+        return text^
+
+
+def local_runtime(world_size: Int, job_id: UInt64 = 0) raises -> RuntimeSpec:
+    """A world hosted entirely in this process."""
+    var spec = RuntimeSpec(
+        RUNTIME_LOCAL,
+        0,
+        world_size,
+        List[RankAddress](),
+        job_id,
+        30 * NS_PER_SECOND,
+        300 * NS_PER_SECOND,
+        0,
+    )
+    spec.validate()
+    return spec^
+
+
+def transport_runtime(
+    machines: String,
+    rank: Int,
+    job_id: UInt64,
+    connect_timeout_ns: Int = 30 * NS_PER_SECOND,
+    collective_timeout_ns: Int = 300 * NS_PER_SECOND,
+    restart_epoch: Int = 0,
+) raises -> RuntimeSpec:
+    """A multi-process world, from a machine list in LightGBM's shape.
+
+    Building this succeeds even though opening it does not, which is the point:
+    a launcher can validate its machine list, its rank assignment, and its
+    timeouts long before an endpoint exists, and `open_transport_collective`
+    then refuses for one clearly stated reason rather than for a parse error.
+    """
+    var config = parse_machine_list(machines, rank, job_id)
+    var spec = RuntimeSpec(
+        RUNTIME_TRANSPORT,
+        rank,
+        config.world_size,
+        config.addresses.copy(),
+        job_id,
+        connect_timeout_ns,
+        collective_timeout_ns,
+        restart_epoch,
+    )
+    spec.validate()
+    return spec^
+
+
+def _env_int(name: String, default: Int) -> Int:
+    var s = getenv(name)
+    if s.byte_length() == 0:
+        return default
+    try:
+        return Int(s)
+    except:
+        return default
+
+
+def runtime_from_env() raises -> RuntimeSpec:
+    """The spec a launcher put in this process's environment.
+
+    Read once, here, so that a rank id never comes from the order processes
+    happened to start:
+
+        MOJOBOOST_DIST_MODE        local (default) or transport
+        MOJOBOOST_DIST_WORLD_SIZE  ranks in the world, local mode only
+        MOJOBOOST_DIST_RANK        this process's rank, transport mode only
+        MOJOBOOST_DIST_MACHINES    the machine list text, host:port entries
+                                   separated by whitespace or newlines
+        MOJOBOOST_DIST_JOB_ID      the job id every frame carries
+        MOJOBOOST_DIST_TIMEOUT_S   per-collective deadline in seconds
+
+    In transport mode the world size comes from the machine list rather than
+    from a variable, so the two cannot disagree.
+    """
+    var mode_text = getenv("MOJOBOOST_DIST_MODE")
+    var mode = RUNTIME_LOCAL
+    if mode_text.byte_length() > 0:
+        mode = parse_runtime_mode(mode_text)
+    var job_raw = _env_int("MOJOBOOST_DIST_JOB_ID", 0)
+    if job_raw < 0:
+        raise transport_error(
+            TRANSPORT_CONFIG_INVALID, -1, "MOJOBOOST_DIST_JOB_ID is negative"
+        )
+    var job_id = UInt64(job_raw)
+    if mode == RUNTIME_LOCAL:
+        return local_runtime(_env_int("MOJOBOOST_DIST_WORLD_SIZE", 1), job_id)
+    var machines = getenv("MOJOBOOST_DIST_MACHINES")
+    if machines.byte_length() == 0:
+        raise transport_error(
+            TRANSPORT_CONFIG_INVALID,
+            -1,
+            "transport mode needs MOJOBOOST_DIST_MACHINES",
+        )
+    var timeout_s = _env_int("MOJOBOOST_DIST_TIMEOUT_S", 300)
+    if timeout_s <= 0:
+        raise transport_error(
+            TRANSPORT_CONFIG_INVALID,
+            -1,
+            "MOJOBOOST_DIST_TIMEOUT_S must be positive",
+        )
+    return transport_runtime(
+        machines,
+        _env_int("MOJOBOOST_DIST_RANK", -1),
+        job_id,
+        30 * NS_PER_SECOND,
+        timeout_s * NS_PER_SECOND,
+        _env_int("MOJOBOOST_DIST_RESTART_EPOCH", 0),
+    )
+
+
+def require_transport(spec: RuntimeSpec) raises:
+    """Refuse a transport run this build cannot open.
+
+    Called before anything is partitioned or allocated, so a rank configured
+    for a world it cannot reach stops at once with a message that says why,
+    rather than blocking in a handshake that will never complete.
+    """
+    if spec.mode != RUNTIME_TRANSPORT:
+        return
+    if not transport_available():
+        raise transport_error(
+            TRANSPORT_UNAVAILABLE, spec.rank, transport_unavailable_detail()
+        )
+
+
+def open_local_collective(spec: RuntimeSpec) raises -> LocalCollective:
+    """The collective for a world hosted in this process."""
+    spec.validate()
+    if spec.mode != RUNTIME_LOCAL:
+        raise transport_error(
+            TRANSPORT_CONFIG_INVALID,
+            spec.rank,
+            "open_local_collective needs a local runtime spec",
+        )
+    return LocalCollective(spec.world_size)
+
+
+def open_transport_collective[
+    E: ByteEndpoint & Copyable & Deinitable
+](
+    spec: RuntimeSpec,
+    var peers: List[E],
+    peer_handshakes: List[HandshakeRecord],
+) raises -> TransportCollective[E]:
+    """A session over already-connected endpoints, handshaken and ready.
+
+    The endpoints are an argument because opening them is the one thing this
+    module cannot do: whoever writes the socket adapter connects them and hands
+    them here, and everything from the handshake onwards is this function's.
+    Until such an adapter exists the only `E` that satisfies the bound is the
+    in-memory fake, so `require_transport` refuses first and this is reachable
+    only from tests.
+    """
+    require_transport(spec)
+    var session = TransportSession(spec.transport_config())
+    session.epoch = spec.restart_epoch
+    session.complete_handshake(peer_handshakes)
+    return TransportCollective[E](session^, peers^)
+
+
+def session_checkpoint_meta(
+    session: TransportSession, model_digest: UInt64, n_trees: Int
+) raises -> CheckpointMeta:
+    """Stamp a checkpoint with the session that produced it.
+
+    A free function rather than a method so the checkpoint record stays
+    readable from a session a caller already holds, and so the trainer can
+    build the same record from a `RuntimeSpec` when it is running without a
+    transport at all.
+    """
+    return CheckpointMeta(
+        session.config.job_id,
+        session.config.schema_digest(),
+        model_digest,
+        session.epoch,
+        session.seq,
+        session.config.world_size,
+        n_trees,
+    )

@@ -70,13 +70,36 @@ Two consequences worth stating plainly:
 the miss rate rather than a claim about it. Nothing here decides how deep to
 speculate; that is a policy question a measurement answers.
 
+What the frontier owns
+----------------------
+Everything about a live leaf that is not a device buffer, in one place, so a
+grower never keeps a second parallel list of any of it:
+
+    offsets and lengths   `row_begin`/`row_count`, the leaf's window into the
+                          active-row permutation. `GpuActiveRows.LeafRange` is
+                          the same window on the device side, and
+                          `GpuActiveRows.check_frontier` holds the two equal
+                          rather than assuming they stay so.
+    statistics            `LeafStats`: gradient sum, hessian sum, exact row
+                          count, plus `set_sibling_stats` for the host half of
+                          the subtraction trick.
+    completion            `max_leaves`, `status()`, `is_complete()`: whether a
+                          tree stopped because its budget ran out or because
+                          nothing was left to split, which the trainer's
+                          `while` loop cannot currently distinguish.
+    multiclass index      `plane`, the class whose gradient plane this tree's
+                          leaves read, stamped onto every `LeafWorkItem`.
+    device bookkeeping    `hist_slot` (which histogram slot holds this leaf)
+                          and `partitioned` (whether its rows are already
+                          split by its own candidate).
+
 Scope
 -----
 Host-side bookkeeping only. No `DeviceContext`, no buffer, no kernel, no
 environment read, so the whole frontier story is reasonable, and later
 testable, on a machine with no accelerator. The device half is
 `gpu_leaf_batching.mojo`, which consumes the `LeafWorkItem` list this module
-produces.
+produces, and `gpu_active_rows.mojo`, which consumes the `CommitPlan`.
 """
 
 from .interaction import extend_branch

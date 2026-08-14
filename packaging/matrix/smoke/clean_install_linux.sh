@@ -1,15 +1,22 @@
 #!/usr/bin/env bash
 # Clean-install smoke test for a Linux mojoboost wheel, x86_64 or aarch64.
 #
-# NOT WIRED INTO ANYTHING AND NOT EXECUTED, and it currently has nothing to
-# test: no Linux wheel builder exists. packaging/build_wheel.sh is macOS only,
-# because install_name_tool and codesign have no Linux counterpart and the ELF
-# equivalent is a different program rather than a flag. See
-# handoffs/task18_platform.md for what building one would take.
+# NOT EXECUTED. The builder it was waiting for now exists:
+# packaging/linux/build_wheel_linux.sh, run by the build job of
+# .github/workflows/release-linux.yml. It is a separate program from
+# packaging/build_wheel.sh rather than a port, because install_name_tool and
+# codesign have no Linux counterpart and the ELF equivalent is a different
+# program rather than a flag.
 #
-# This fixture exists now so the acceptance criteria are settled before anyone
-# writes that builder. A Linux wheel that passes this is shippable; one that
-# does not, is not, whatever it does on the machine that built it.
+# What has still never happened is a build. Every Linux row in
+# packaging/matrix/platform_matrix.toml is `designed` with empty evidence, so
+# no wheel has been produced under either tag policy and this fixture has still
+# never had an artifact to run against.
+#
+# The acceptance criteria below were settled before that builder was written,
+# and they are unchanged by its arrival. A Linux wheel that passes this is
+# shippable; one that does not, is not, whatever it does on the machine that
+# built it.
 #
 #   packaging/matrix/smoke/clean_install_linux.sh <wheel> [record file]
 #

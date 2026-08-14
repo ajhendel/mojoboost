@@ -70,9 +70,9 @@ comptime ERROR_UNSUPPORTED: Int32 = -4
 # The C spelling of the device vocabulary. These are defined from the codes
 # in device.mojo rather than written out, so the ABI cannot drift from the
 # policy module that owns the meaning of each value.
-comptime DEVICE_CPU: Int32 = CPU_DEVICE
-comptime DEVICE_GPU: Int32 = GPU_DEVICE
-comptime DEVICE_AUTO: Int32 = AUTO_DEVICE
+comptime DEVICE_CPU: Int32 = Int32(CPU_DEVICE)
+comptime DEVICE_GPU: Int32 = Int32(GPU_DEVICE)
+comptime DEVICE_AUTO: Int32 = Int32(AUTO_DEVICE)
 
 # Prediction flags. Only one bit is defined; anything else is rejected, so a
 # caller cannot silently get response-scale output by setting a flag this

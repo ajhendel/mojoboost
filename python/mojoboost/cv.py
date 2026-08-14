@@ -35,16 +35,39 @@ over all the rows and then sliced would carry every fold's quantiles into
 every other fold.
 
 So `cv()` never slices a constructed `Dataset`. It slices the *raw* matrix
-and the raw columns, builds a fresh `Dataset` per fold per side, and lets
-each one bin itself over its own rows. `fpreproc` is called after the split,
-once per fold, with that fold's two datasets and a copy of the parameters,
-so any preprocessing it fits is fitted on training rows alone. The cost is
-one binning pass per fold rather than one in total, which is the price of
-the guarantee.
+and the raw columns (`_arrays.take_rows`, the same selection
+`src/mojoboost/raw_data.mojo` performs natively), builds a fresh `Dataset`
+per fold per side, and lets each one bin itself over its own rows.
+`fpreproc` is called after the split, once per fold, with that fold's two
+datasets and a copy of the parameters, so any preprocessing it fits is
+fitted on training rows alone. The cost is one binning pass per fold rather
+than one in total, which is the price of the guarantee. Only the training
+side actually pays it: a `Dataset` bins on `construct()`, and the held-out
+side is never constructed, because it is scored through the *model's* mapper
+(`Booster.predict` reads its raw matrix) rather than through its own.
+
+A fold is never built with `reference=`. Reference binning reuses another
+dataset's fitted edges, which is right for a validation set that a model
+trained on the reference will score, and is exactly the leak here: the
+reference's edges were fitted over rows this fold holds out. The same
+distinction is drawn on the Mojo side between `Dataset.from_raw` /
+`Dataset.subset`, which fit, and `Dataset.from_reference` /
+`Dataset.subset_shared_binning`, which reuse.
 
 A fold whose training rows overlap its own held-out rows is rejected rather
 than scored, including when the overlap came from `folds=` you passed in
 yourself.
+
+Parallelism
+-----------
+The folds run one after another, and each fold's training is what uses the
+machine: binning, histogram building, and split search parallelize inside
+Mojo across the workers `MOJOBOOST_NUM_WORKERS` allows. So the core count a
+run uses is the trainer's, whatever `nfold` is, and nothing here multiplies
+it. Do not wrap `cv()` in a process or thread pool over folds without
+dividing `MOJOBOOST_NUM_WORKERS` by the pool size first: `nfold` trainers
+each claiming every core is slower than one trainer claiming every core, not
+faster.
 
 Folds
 -----
@@ -133,6 +156,9 @@ Differences from LightGBM
   between rounds needs the fold boosters to re-read it, which `Booster` has
   no way to be told. A schedule that believes it is doing something and is
   not is worse than a failed run, so `CVBooster.reset_parameter` raises.
+- **`CVBooster.predict_mean`** is mojoboost's addition: the across-fold mean
+  of `predict`, refused for ranking rather than guessed at. LightGBM leaves
+  the combination to the caller entirely, and `predict` still does.
 - **`init_model` is refused.** Continued training checks that the dataset is
   the one the model was trained on, by comparing the binning, and a fold is
   by construction binned over its own rows. So every fold would be rejected
@@ -165,43 +191,18 @@ _VALID = "valid"
 def _take_rows(data, rows):
     """`data` restricted to `rows`, in the order `rows` gives them.
 
-    The layouts a `Dataset` accepts are not one type, so this dispatches the
-    way the rest of the package does: on what the object offers rather than
-    on what it is. A frame keeps its columns, so the fold datasets keep the
-    feature names and the category dtypes the whole one had.
+    The layout dispatch lives in `_arrays`, next to the rest of the package's
+    buffer plumbing, so that the one place that knows how to select rows out
+    of a numpy array, a pandas frame, a pyarrow table, and a polars frame is
+    the place that knows how to read them at all. This name stays because it
+    is what the fold code reads like.
     """
-    if _arrays._is_sparse(data):
-        raise TypeError(
-            "cv() takes a Dataset built on a dense matrix; a sparse one "
-            "cannot be sliced into folds here because Dataset does not "
-            "accept sparse data"
-        )
-    index = list(rows)
-    iloc = getattr(data, "iloc", None)
-    if iloc is not None:  # pandas
-        return iloc[index]
-    if _np is not None and isinstance(data, _np.ndarray):
-        return data[_np.asarray(index, dtype=_np.intp)]
-    take = getattr(data, "take", None)
-    if take is not None and getattr(data, "column_names", None) is not None:
-        return take(index)  # pyarrow
-    if getattr(data, "columns", None) is not None:
-        try:
-            return data[index]  # polars
-        except (TypeError, ValueError):
-            pass
-    if _np is not None and hasattr(data, "__array__"):
-        return _np.asarray(data)[_np.asarray(index, dtype=_np.intp)]
-    return [data[i] for i in index]
+    return _arrays.take_rows(data, rows, "cv() data")
 
 
 def _take_column(column, rows):
     """One of a dataset's columns restricted to `rows`, or None."""
-    if column is None:
-        return None
-    if _np is not None:
-        return _np.asarray(column)[_np.asarray(list(rows), dtype=_np.intp)]
-    return [column[i] for i in rows]
+    return _arrays.take_column(column, rows)
 
 
 # -- fold generation -----------------------------------------------------
@@ -471,6 +472,11 @@ def _fold_dataset(source, rows, group):
     rows. The binning parameters, the feature names, and the categorical
     declaration are the source's, because those describe the columns rather
     than the rows.
+
+    `reference=` is deliberately not passed on, whether or not the source had
+    one: a fold binned through someone else's fitted edges would be scored
+    under quantiles its held-out rows helped choose (see the module
+    docstring).
     """
     raw = source.get_data()
     if raw is None:
@@ -594,6 +600,7 @@ class CVBooster:
         cvbooster.num_trees()                 # [n_fold_0, n_fold_1, ...]
         cvbooster.feature_importance("gain")  # one vector per fold
         cvbooster.predict(X)                  # one prediction per fold
+        cvbooster.predict_mean(X)             # their mean, where defined
 
     `best_iteration` is the round early stopping chose, or -1 when it did
     not run; `predict` slices to it by default, so the prediction is the one
@@ -676,6 +683,54 @@ class CVBooster:
             )
             for booster in self.boosters
         ]
+
+    def predict_mean(self, data, raw_score=False, start_iteration=0,
+                     num_iteration=None):
+        """The across-fold mean of `predict`, where a mean is defined.
+
+        The bagged prediction a cross-validated model is usually wanted for:
+        the same slicing rules as `predict`, averaged over the folds. It is
+        the right combination for a regression, for probabilities, and for
+        raw scores on a common scale.
+
+        It is refused for a ranking model, because a LambdaRank score is
+        meaningful only within one model's ordering of one query: averaging
+        the folds' scores mixes scales that were never comparable, and the
+        result would still look like a ranking. Take `predict()` and combine
+        the orderings deliberately.
+        """
+        if not self.boosters:
+            raise ValueError(
+                "this CVBooster has no fitted folds to average; it comes "
+                "from cv(return_cvbooster=True)"
+            )
+        for booster in self.boosters:
+            if getattr(booster, "_task", None) == _eval.RANKING:
+                raise ValueError(
+                    "ranking scores are not comparable across folds, so "
+                    "their mean is not a ranking; use CVBooster.predict() "
+                    "and combine the orderings yourself"
+                )
+        folds = self.predict(
+            data,
+            raw_score=raw_score,
+            start_iteration=start_iteration,
+            num_iteration=num_iteration,
+        )
+        if _np is not None:
+            return _np.asarray(folds, dtype=_np.float64).mean(axis=0)
+        n = len(folds)
+        first = folds[0]
+        if len(first) and hasattr(first[0], "__len__"):
+            return [
+                [
+                    math.fsum(fold[r][c] for fold in folds) / n
+                    for c in range(len(first[r]))
+                ]
+                for r in range(len(first))
+            ]
+        return [math.fsum(fold[r] for fold in folds) / n
+                for r in range(len(first))]
 
     def reset_parameter(self, new_parameters):
         """Refused: the fold boosters have no way to be told.

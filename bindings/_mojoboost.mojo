@@ -69,7 +69,6 @@ from mojoboost.trainset import (
 )
 from mojoboost.binning import BinnedMatrix
 from mojoboost.device import (
-    CPU_DEVICE,
     GPU_DEVICE,
     device_name as mojo_device_name,
     gpu_available as mojo_gpu_available,
@@ -126,6 +125,7 @@ def PyInit__mojoboost() abi("C") -> PythonObject:
         _ = m.add_type[Model]("Model")
         _ = m.add_type[MulticlassModel]("MulticlassModel")
         _ = m.add_type[Dataset]("Dataset")
+        _ = m.add_type[GpuValidation]("GpuValidation")
         m.def_function[dataset_create]("dataset_create")
         m.def_function[dataset_num_data]("dataset_num_data")
         m.def_function[dataset_num_feature]("dataset_num_feature")
@@ -162,6 +162,25 @@ def PyInit__mojoboost() abi("C") -> PythonObject:
         m.def_function[predict_proba_range]("predict_proba_range")
         m.def_function[predict_leaf]("predict_leaf")
         m.def_function[predict_leaf_multiclass]("predict_leaf_multiclass")
+        m.def_function[predict_batch]("predict_batch")
+        m.def_function[predict_proba_batch]("predict_proba_batch")
+        m.def_function[predict_leaf_batch]("predict_leaf_batch")
+        m.def_function[predict_leaf_multiclass_batch](
+            "predict_leaf_multiclass_batch"
+        )
+        m.def_function[gpu_predict_capability]("gpu_predict_capability")
+        m.def_function[gpu_validation_open]("gpu_validation_open")
+        m.def_function[gpu_validation_open_multiclass](
+            "gpu_validation_open_multiclass"
+        )
+        m.def_function[gpu_validation_shape]("gpu_validation_shape")
+        m.def_function[gpu_validation_reset]("gpu_validation_reset")
+        m.def_function[gpu_validation_accumulate]("gpu_validation_accumulate")
+        m.def_function[gpu_validation_accumulate_multiclass](
+            "gpu_validation_accumulate_multiclass"
+        )
+        m.def_function[gpu_validation_metric]("gpu_validation_metric")
+        m.def_function[gpu_validation_raw]("gpu_validation_raw")
         m.def_function[predict_contrib]("predict_contrib")
         m.def_function[predict_contrib_multiclass](
             "predict_contrib_multiclass"
@@ -1108,8 +1127,15 @@ def predict_csr(
     model: PythonObject, params: PythonObject, out_addr: PythonObject
 ) raises -> PythonObject:
     """Response-scale predictions for a sparse matrix, into a preallocated
-    float64 buffer of length n_rows."""
+    float64 buffer of length n_rows.
+
+    The sparse walk is host-only. An explicit `device="gpu"` is refused
+    rather than densified (see `_refuse_gpu_sparse`); a dict that names no
+    device is the CPU, which is what every caller of this function has
+    always meant."""
     var m = model.downcast_value_ptr[Model]()
+    var shape = _sparse_shape(params)
+    _refuse_gpu_sparse(params, shape[0], shape[1], 1)
     _store(mojo_predict_csr(m[], _csr(params)), out_addr)
     return PythonObject(None)
 
@@ -1117,8 +1143,11 @@ def predict_csr(
 def predict_raw_csr(
     model: PythonObject, params: PythonObject, out_addr: PythonObject
 ) raises -> PythonObject:
-    """Raw-score predictions for a sparse matrix."""
+    """Raw-score predictions for a sparse matrix (see `predict_csr` on the
+    device)."""
     var m = model.downcast_value_ptr[Model]()
+    var shape = _sparse_shape(params)
+    _refuse_gpu_sparse(params, shape[0], shape[1], 1)
     _store(mojo_predict_raw_csr(m[], _csr(params)), out_addr)
     return PythonObject(None)
 
@@ -1127,8 +1156,11 @@ def predict_proba_csr(
     model: PythonObject, params: PythonObject, out_addr: PythonObject
 ) raises -> PythonObject:
     """Multiclass probabilities for a sparse matrix, row-major
-    `[r * n_classes + k]`, into a buffer of length n_rows * n_classes."""
+    `[r * n_classes + k]`, into a buffer of length n_rows * n_classes (see
+    `predict_csr` on the device)."""
     var m = model.downcast_value_ptr[MulticlassModel]()
+    var shape = _sparse_shape(params)
+    _refuse_gpu_sparse(params, shape[0], shape[1], m[].booster.n_classes)
     _store(mojo_predict_proba_csr(m[], _csr(params)), out_addr)
     return PythonObject(None)
 
@@ -1348,6 +1380,61 @@ def predict_proba_range(
     return PythonObject(None)
 
 
+def _leaf_host(
+    model: PythonObject,
+    features: List[Float64],
+    n_rows: Int,
+    n_features: Int,
+    rng: IterationRange,
+    out_addr: PythonObject,
+) raises:
+    """The host leaf walk for a single-output model, one row at a time.
+
+    Split out of `predict_leaf` so the device-aware entry point below can
+    fall back to exactly this code rather than to a second copy of it."""
+    var m = model.downcast_value_ptr[Model]()
+    var n_cols = rng.n_iterations()
+    var out = Pointer[Float64, MutUntrackedOrigin](
+        unsafe_from_address=Int(py=out_addr)
+    )
+    # One ordinal table per tree in the range, built once and shared by every
+    # row: the mapping from node id to leaf ordinal is a property of the tree.
+    var tables = m[].booster.leaf_ordinals_range(rng)
+    for r in range(n_rows):
+        var bins = m[].mapper.bin_row(_row(features, n_rows, n_features, r))
+        for i in range(n_cols):
+            var node = m[].booster.trees[rng.start + i].leaf_index_bins(bins)
+            out.unsafe_store(r * n_cols + i, Float64(tables[i][node]))
+
+
+def _leaf_multiclass_host(
+    model: PythonObject,
+    features: List[Float64],
+    n_rows: Int,
+    n_features: Int,
+    rng: IterationRange,
+    out_addr: PythonObject,
+) raises:
+    """The host leaf walk for a multiclass model (see `_leaf_host`)."""
+    var m = model.downcast_value_ptr[MulticlassModel]()
+    var k = m[].booster.n_classes
+    var n_rounds = rng.n_iterations()
+    var n_cols = n_rounds * k
+    var out = Pointer[Float64, MutUntrackedOrigin](
+        unsafe_from_address=Int(py=out_addr)
+    )
+    var tables = m[].booster.leaf_ordinals_range(rng)
+    for r in range(n_rows):
+        var bins = m[].mapper.bin_row(_row(features, n_rows, n_features, r))
+        for i in range(n_rounds):
+            for c in range(k):
+                var tree = (rng.start + i) * k + c
+                var node = m[].booster.trees[tree].leaf_index_bins(bins)
+                out.unsafe_store(
+                    r * n_cols + i * k + c, Float64(tables[i * k + c][node])
+                )
+
+
 def predict_leaf(
     model: PythonObject,
     x_addr: PythonObject,
@@ -1368,21 +1455,9 @@ def predict_leaf(
     var nr = Int(py=n_rows)
     var nf = Int(py=n_features)
     var rng = _iteration_slice(m[].n_iterations(), start, stop)
-    var n_cols = rng.n_iterations()
-    if n_cols == 0 or nr == 0:
+    if rng.n_iterations() == 0 or nr == 0:
         return PythonObject(None)
-    var features = _f64_list(Int(py=x_addr), nr * nf)
-    var out = Pointer[Float64, MutUntrackedOrigin](
-        unsafe_from_address=Int(py=out_addr)
-    )
-    # One ordinal table per tree in the range, built once and shared by every
-    # row: the mapping from node id to leaf ordinal is a property of the tree.
-    var tables = m[].booster.leaf_ordinals_range(rng)
-    for r in range(nr):
-        var bins = m[].mapper.bin_row(_row(features, nr, nf, r))
-        for i in range(n_cols):
-            var node = m[].booster.trees[rng.start + i].leaf_index_bins(bins)
-            out.unsafe_store(r * n_cols + i, Float64(tables[i][node]))
+    _leaf_host(model, _f64_list(Int(py=x_addr), nr * nf), nr, nf, rng, out_addr)
     return PythonObject(None)
 
 
@@ -1403,25 +1478,11 @@ def predict_leaf_multiclass(
     var nr = Int(py=n_rows)
     var nf = Int(py=n_features)
     var rng = _iteration_slice(m[].n_iterations(), start, stop)
-    var k = m[].booster.n_classes
-    var n_rounds = rng.n_iterations()
-    var n_cols = n_rounds * k
-    if n_cols == 0 or nr == 0:
+    if rng.n_iterations() == 0 or nr == 0:
         return PythonObject(None)
-    var features = _f64_list(Int(py=x_addr), nr * nf)
-    var out = Pointer[Float64, MutUntrackedOrigin](
-        unsafe_from_address=Int(py=out_addr)
+    _leaf_multiclass_host(
+        model, _f64_list(Int(py=x_addr), nr * nf), nr, nf, rng, out_addr
     )
-    var tables = m[].booster.leaf_ordinals_range(rng)
-    for r in range(nr):
-        var bins = m[].mapper.bin_row(_row(features, nr, nf, r))
-        for i in range(n_rounds):
-            for c in range(k):
-                var tree = (rng.start + i) * k + c
-                var node = m[].booster.trees[tree].leaf_index_bins(bins)
-                out.unsafe_store(
-                    r * n_cols + i * k + c, Float64(tables[i * k + c][node])
-                )
     return PythonObject(None)
 
 
@@ -1499,6 +1560,514 @@ def predict_contrib_multiclass(
         )
         for c in range(width):
             out.unsafe_store(r * width + c, row_out[c])
+    return PythonObject(None)
+
+
+# -- GPU prediction ------------------------------------------------------
+#
+# Every prediction entry point above walks the trees on the host, one row at
+# a time, whatever `device` the estimator was configured with: nothing in
+# this module has ever reached gpu_predict.mojo, so `device="gpu"` has been
+# a training-only setting. The entry points below are the batched forms that
+# do reach it.
+#
+# None of them decides where to run. They hand the requested device to
+# `Model.predict_batch` and `MulticlassModel.predict_batch`, which is the one
+# place that chooses between the host walk and `GpuPredictor`, and they
+# return the name of the backend that actually ran so a caller reporting
+# `device="auto"` never has to assume which one it got. An explicit `gpu`
+# that the prediction path cannot serve raises here, before any work, with
+# the reason from `gpu_predict_support`; it is never quietly served by the
+# CPU.
+#
+# The established path is untouched. `predict`, `predict_raw`,
+# `predict_proba`, `predict_range`, `predict_proba_range`, `predict_leaf`,
+# and `predict_leaf_multiclass` keep their signatures and their host walk,
+# so an estimator that has not moved over behaves exactly as before.
+
+
+def _optional_device(params: PythonObject) raises -> Int:
+    """The device a params dict requests, or the CPU when it names none.
+
+    The sparse prediction dicts are built by `_arrays.py` and carry buffers
+    only, so a device key is optional there and its absence has to mean the
+    established behavior rather than an error."""
+    return parse_device(String(py=params.get("device", PythonObject("cpu"))))
+
+
+def _predict_device(
+    params: PythonObject,
+    n_rows: Int,
+    n_features: Int,
+    n_outputs: Int,
+    n_bins: Int,
+) raises -> Int:
+    """The backend a dense prediction call will run on: CPU or GPU.
+
+    Two questions, each asked of the module that owns it. Whether the GPU
+    prediction path covers a request of this shape at all is
+    `gpu_predict_support` in gpu_predict.mojo, and it is asked only for an
+    explicit `gpu`, so its refusal is the message an explicit request gets.
+    Which backend runs is `resolve_device` in device.mojo, the same call
+    `Model.predict_batch` makes on the way in, so what this returns is what
+    the predictor will reach. Nothing here decides anything.
+    """
+    var requested = _parse_device(params)
+    if requested == GPU_DEVICE:
+        var support = gpu_predict_support(
+            n_rows, n_features, n_outputs, n_bins
+        )
+        support.raise_if_blocked()
+    return mojo_resolve_device(requested, n_rows, n_features, n_outputs)
+
+
+def _refuse_gpu_sparse(
+    params: PythonObject, n_rows: Int, n_features: Int, n_outputs: Int
+) raises:
+    """Refuse an explicit `gpu` for sparse input.
+
+    The prediction kernels read a dense binned matrix, so a sparse request
+    has no GPU path at all. Densifying behind the caller's back would be the
+    silent fallback this whole vocabulary exists to prevent, so the refusal
+    is explicit and carries `gpu_predict_support`'s message."""
+    if _optional_device(params) != GPU_DEVICE:
+        return
+    var support = gpu_predict_support(
+        n_rows, n_features, n_outputs, sparse=True
+    )
+    support.raise_if_blocked()
+
+
+def _store_ints(values: List[Int], out_addr: PythonObject) raises:
+    """Widen leaf ordinals into the caller's float64 buffer. Float64 is the
+    only element type crossing this boundary and a leaf ordinal is a small
+    nonnegative integer, so the conversion is exact and the wrapper casts
+    them back."""
+    var out = Pointer[Float64, MutUntrackedOrigin](
+        unsafe_from_address=Int(py=out_addr)
+    )
+    for i in range(len(values)):
+        out.unsafe_store(i, Float64(values[i]))
+
+
+def gpu_predict_capability(params: PythonObject) raises -> PythonObject:
+    """Whether the GPU prediction path covers a request, without asking for
+    it.
+
+    `params` carries `n_rows`, `n_features`, `n_outputs` (1 for a
+    single-output model, the class count for multiclass), `n_bins` (the
+    binner's reserved bin count, or 0 when the caller does not know it), and
+    `sparse` as an int flag. The answer is
+    `[supported, block_code, reason_name, message]`, where `block_code` and
+    `reason_name` are device_policy.mojo's stable refusal vocabulary, so an
+    estimator can branch on the code and show the prose.
+
+    This is the question form. The refusal form is what the prediction entry
+    points raise for an explicit `gpu`, and both come from the same record.
+    """
+    var support = gpu_predict_support(
+        Int(py=params["n_rows"]),
+        Int(py=params["n_features"]),
+        Int(py=params["n_outputs"]),
+        Int(py=params["n_bins"]),
+        Int(py=params["sparse"]) != 0,
+    )
+    var out = Python.list()
+    out.append(PythonObject(Int(support.supported)))
+    out.append(PythonObject(support.block_code))
+    out.append(PythonObject(support.reason_name()))
+    out.append(PythonObject(support.message.copy()))
+    return out^
+
+
+def predict_batch(
+    model: PythonObject,
+    x_addr: PythonObject,
+    n_rows: PythonObject,
+    n_features: PythonObject,
+    params: PythonObject,
+    out_addr: PythonObject,
+) raises -> PythonObject:
+    """Single-output predictions for a whole dense batch, on the device the
+    params dict names, into a preallocated float64 buffer of length n_rows.
+
+    `params` carries `device` ("cpu", "gpu", or "auto"), the resolved
+    half-open iteration pair `start` and `stop`, and `raw_score` as an int
+    flag. The buffer and the iteration semantics are `predict_range`'s; what
+    is new is that the whole batch crosses at once, which is what the device
+    walk needs, and that the backend that ran comes back as the return value.
+    """
+    var m = model.downcast_value_ptr[Model]()
+    var nr = Int(py=n_rows)
+    var nf = Int(py=n_features)
+    var rng = _iteration_slice(
+        m[].n_iterations(), params["start"], params["stop"]
+    )
+    var device = _predict_device(params, nr, nf, 1, m[].mapper.n_bins)
+    var features = _f64_list(Int(py=x_addr), nr * nf)
+    _store(
+        m[].predict_batch(
+            features, nr, rng, Int(py=params["raw_score"]) != 0, device
+        ),
+        out_addr,
+    )
+    return PythonObject(mojo_device_name(device))
+
+
+def predict_proba_batch(
+    model: PythonObject,
+    x_addr: PythonObject,
+    n_rows: PythonObject,
+    n_features: PythonObject,
+    params: PythonObject,
+    out_addr: PythonObject,
+) raises -> PythonObject:
+    """Multiclass output for a whole dense batch, row-major
+    `[r * n_classes + k]`, into a preallocated float64 buffer of size
+    n_rows * n_classes: softmax probabilities, or per-class raw scores when
+    `params["raw_score"]` is nonzero.
+
+    The multiclass shape is the ensemble's, not this function's: the device
+    path walks one tree per class per iteration and softmaxes across the row,
+    which is what `MulticlassBooster` does on the host."""
+    var m = model.downcast_value_ptr[MulticlassModel]()
+    var nr = Int(py=n_rows)
+    var nf = Int(py=n_features)
+    var k = m[].booster.n_classes
+    var rng = _iteration_slice(
+        m[].n_iterations(), params["start"], params["stop"]
+    )
+    var device = _predict_device(params, nr, nf, k, m[].mapper.n_bins)
+    var features = _f64_list(Int(py=x_addr), nr * nf)
+    _store(
+        m[].predict_batch(
+            features, nr, rng, Int(py=params["raw_score"]) != 0, device
+        ),
+        out_addr,
+    )
+    return PythonObject(mojo_device_name(device))
+
+
+def predict_leaf_batch(
+    model: PythonObject,
+    x_addr: PythonObject,
+    n_rows: PythonObject,
+    n_features: PythonObject,
+    params: PythonObject,
+    out_addr: PythonObject,
+) raises -> PythonObject:
+    """`predict_leaf` for a whole dense batch, on the device the params dict
+    names: row-major `[r * n_iterations + i]` float64 ordinals.
+
+    The ordinal numbering is the same on both backends. The device walk
+    reports the leaf's rank among its tree's leaves in node order, which is
+    what `Tree.leaf_ordinals` counts and what the host table above indexes,
+    so a saved model reports the same ordinals whichever device reads it.
+    An empty iteration range writes nothing and still reports the device it
+    resolved to."""
+    var m = model.downcast_value_ptr[Model]()
+    var nr = Int(py=n_rows)
+    var nf = Int(py=n_features)
+    var rng = _iteration_slice(
+        m[].n_iterations(), params["start"], params["stop"]
+    )
+    var device = _predict_device(params, nr, nf, 1, m[].mapper.n_bins)
+    var name = PythonObject(mojo_device_name(device))
+    if rng.n_iterations() == 0 or nr == 0:
+        return name^
+    var features = _f64_list(Int(py=x_addr), nr * nf)
+    if device == GPU_DEVICE:
+        _store_ints(
+            leaf_indices_gpu(
+                m[].booster, m[].mapper.transform(features, nr), rng
+            ),
+            out_addr,
+        )
+        return name^
+    _leaf_host(model, features, nr, nf, rng, out_addr)
+    return name^
+
+
+def predict_leaf_multiclass_batch(
+    model: PythonObject,
+    x_addr: PythonObject,
+    n_rows: PythonObject,
+    n_features: PythonObject,
+    params: PythonObject,
+    out_addr: PythonObject,
+) raises -> PythonObject:
+    """`predict_leaf_multiclass` for a whole dense batch, on the device the
+    params dict names: row-major and round-major within a row, column
+    `i * n_classes + k`."""
+    var m = model.downcast_value_ptr[MulticlassModel]()
+    var nr = Int(py=n_rows)
+    var nf = Int(py=n_features)
+    var k = m[].booster.n_classes
+    var rng = _iteration_slice(
+        m[].n_iterations(), params["start"], params["stop"]
+    )
+    var device = _predict_device(params, nr, nf, k, m[].mapper.n_bins)
+    var name = PythonObject(mojo_device_name(device))
+    if rng.n_iterations() == 0 or nr == 0:
+        return name^
+    var features = _f64_list(Int(py=x_addr), nr * nf)
+    if device == GPU_DEVICE:
+        _store_ints(
+            leaf_indices_multiclass_gpu(
+                m[].booster, m[].mapper.transform(features, nr), rng
+            ),
+            out_addr,
+        )
+        return name^
+    _leaf_multiclass_host(model, features, nr, nf, rng, out_addr)
+    return name^
+
+
+# -- resident validation scoring -----------------------------------------
+#
+# A training loop driven from Python scores its validation set once per
+# round. Doing that through `predict_batch` would re-upload the whole matrix
+# and re-walk the whole ensemble every round, which is the cost
+# `GpuPredictor`'s resident validation path exists to remove: the matrix,
+# its labels, its weights, and the running raw-score vector go to the device
+# once, and a round uploads only the trees it grew.
+#
+# `GpuValidation` is that path with a Python-owned lifetime. The handle is
+# opaque: nothing about a device buffer crosses the boundary, and the only
+# way out is a metric value or a copy of the raw scores into a caller's
+# float64 buffer. The model is not retained either. Each accumulate call
+# reads the trees it needs and copies them, so a handle never keeps a
+# model alive and a model can be updated, copied, or dropped underneath it.
+#
+# There is no CPU form of this handle, and it does not take a device: it is
+# the device path by construction, so opening one on a build or a machine
+# that cannot serve it raises `gpu_predict_support`'s refusal rather than
+# silently scoring on the host. A caller that wants host validation scoring
+# has `eval_metric` and the fits that carry their own metric suites.
+
+
+struct GpuValidation(Movable, Writable):
+    """A validation set kept on the device across a training run.
+
+    Holds a `GpuPredictor` with its validation buffers already sized and
+    seeded, plus the shape a caller needs to size its own buffers. The
+    predictor opens its own device context, which is right for a loop driven
+    from outside Mojo: the trainer's context is not reachable from Python, so
+    sharing one is not on the table here the way it is for
+    `train_gpu_with_valid`.
+    """
+
+    var predictor: GpuPredictor
+    var n_rows: Int
+    var n_outputs: Int
+
+    def __init__(
+        out self,
+        data: BinnedMatrix,
+        target: List[Float64],
+        weight: List[Float64],
+        n_outputs: Int,
+    ) raises:
+        self.predictor = GpuPredictor(data.n_features, n_outputs)
+        self.predictor.set_validation(data, target, weight)
+        self.n_rows = data.n_rows
+        self.n_outputs = n_outputs
+
+    def write_to(self, mut writer: Some[Writer]):
+        writer.write(
+            "GpuValidation(n_rows=",
+            self.n_rows,
+            ", n_outputs=",
+            self.n_outputs,
+            ")",
+        )
+
+    def write_repr_to(self, mut writer: Some[Writer]):
+        self.write_to(writer)
+
+
+def _validation_columns(
+    params: PythonObject, n_rows: Int
+) raises -> List[List[Float64]]:
+    """The label column and the optional weight column of a validation set,
+    from the params dict's `y_addr` and `weight_addr` (0 for absent). The
+    weight contract is metrics.mojo's, and `set_validation` validates it."""
+    var target = _f64_list(Int(py=params["y_addr"]), n_rows)
+    var weight = List[Float64]()
+    if Int(py=params["weight_addr"]) != 0:
+        weight = _f64_list(Int(py=params["weight_addr"]), n_rows)
+    var out = List[List[Float64]]()
+    out.append(target^)
+    out.append(weight^)
+    return out^
+
+
+def gpu_validation_open(
+    model: PythonObject,
+    x_addr: PythonObject,
+    n_rows: PythonObject,
+    n_features: PythonObject,
+    params: PythonObject,
+) raises -> PythonObject:
+    """Make a validation set device-resident for a single-output model and
+    seed its raw scores with the model's base score.
+
+    The matrix is binned by the model's own mapper, on the host, because bin
+    edges are Float64 and a routing decision is discrete; only the bins go to
+    the device. `params` carries `y_addr` and `weight_addr` (0 for no
+    weights).
+
+    Returns an opaque handle. Accumulate the rounds the model gains into it
+    with `gpu_validation_accumulate`, then read a metric or the raw scores.
+    """
+    var m = model.downcast_value_ptr[Model]()
+    var nr = Int(py=n_rows)
+    var nf = Int(py=n_features)
+    var support = gpu_predict_support(nr, nf, 1, m[].mapper.n_bins)
+    support.raise_if_blocked()
+    var features = _f64_list(Int(py=x_addr), nr * nf)
+    var columns = _validation_columns(params, nr)
+    var handle = GpuValidation(
+        m[].mapper.transform(features, nr), columns[0], columns[1], 1
+    )
+    var base: List[Float64] = [m[].booster.base_score]
+    handle.predictor.reset_validation(base)
+    return PythonObject(alloc=handle^)
+
+
+def gpu_validation_open_multiclass(
+    model: PythonObject,
+    x_addr: PythonObject,
+    n_rows: PythonObject,
+    n_features: PythonObject,
+    params: PythonObject,
+) raises -> PythonObject:
+    """`gpu_validation_open` for a softmax model. The labels are class codes
+    in 0..n_classes-1, the same encoding `fit_multiclass` takes, and the
+    resident score vector is `n_rows * n_classes` wide."""
+    var m = model.downcast_value_ptr[MulticlassModel]()
+    var nr = Int(py=n_rows)
+    var nf = Int(py=n_features)
+    var k = m[].booster.n_classes
+    var support = gpu_predict_support(nr, nf, k, m[].mapper.n_bins)
+    support.raise_if_blocked()
+    var features = _f64_list(Int(py=x_addr), nr * nf)
+    var columns = _validation_columns(params, nr)
+    var handle = GpuValidation(
+        m[].mapper.transform(features, nr), columns[0], columns[1], k
+    )
+    handle.predictor.reset_validation(m[].booster.base_scores)
+    return PythonObject(alloc=handle^)
+
+
+def gpu_validation_shape(handle: PythonObject) raises -> PythonObject:
+    """`[n_rows, n_outputs]` for the resident validation set, so a caller can
+    size the buffer `gpu_validation_raw` fills."""
+    var h = handle.downcast_value_ptr[GpuValidation]()
+    var out = Python.list()
+    out.append(PythonObject(h[].n_rows))
+    out.append(PythonObject(h[].n_outputs))
+    return out^
+
+
+def gpu_validation_reset(
+    handle: PythonObject, base_addr: PythonObject
+) raises -> PythonObject:
+    """Set every resident raw score back to the per-output base score in the
+    caller's float64 buffer of length n_outputs.
+
+    Where a boosting run starts, and the only place the base score enters:
+    `gpu_validation_accumulate` never adds it, exactly as `IterationRange`
+    counts it as part of iteration 0 rather than of every round."""
+    var h = handle.downcast_value_ptr[GpuValidation]()
+    h[].predictor.reset_validation(
+        _f64_list(Int(py=base_addr), h[].n_outputs)
+    )
+    return PythonObject(None)
+
+
+def gpu_validation_accumulate(
+    handle: PythonObject,
+    model: PythonObject,
+    start: PythonObject,
+    stop: PythonObject,
+) raises -> PythonObject:
+    """Fold the single-output model's iterations in `[start, stop)` into the
+    resident raw scores.
+
+    A loop that appended one round calls this with that round's pair, and
+    scoring the round costs one tree walk per validation row rather than a
+    walk of the whole ensemble. An empty range does nothing."""
+    var h = handle.downcast_value_ptr[GpuValidation]()
+    var m = model.downcast_value_ptr[Model]()
+    if h[].n_outputs != 1:
+        raise Error(
+            "this validation handle was opened for a multiclass model; use"
+            " gpu_validation_accumulate_multiclass"
+        )
+    accumulate_booster_rounds(
+        h[].predictor,
+        m[].booster,
+        _iteration_slice(m[].n_iterations(), start, stop),
+    )
+    return PythonObject(None)
+
+
+def gpu_validation_accumulate_multiclass(
+    handle: PythonObject,
+    model: PythonObject,
+    start: PythonObject,
+    stop: PythonObject,
+) raises -> PythonObject:
+    """`gpu_validation_accumulate` for a softmax model. One iteration is one
+    tree per class, so the range is taken in whole rounds."""
+    var h = handle.downcast_value_ptr[GpuValidation]()
+    var m = model.downcast_value_ptr[MulticlassModel]()
+    if h[].n_outputs != m[].booster.n_classes:
+        raise Error(
+            "the model's class count does not match the validation handle"
+        )
+    accumulate_multiclass_rounds(
+        h[].predictor,
+        m[].booster,
+        _iteration_slice(m[].n_iterations(), start, stop),
+    )
+    return PythonObject(None)
+
+
+def gpu_validation_metric(
+    handle: PythonObject, metric: PythonObject, response: PythonObject
+) raises -> PythonObject:
+    """Score the resident validation set on the device.
+
+    `metric` is a `METRIC_*` code and `response` a `RESPONSE_*` code from
+    gpu_predict.mojo: the inverse link to apply to the raw scores first,
+    because every metric takes predictions on the response scale. The raw
+    scores are left intact for the next accumulate.
+
+    The device metric set is smaller than the host one and its log losses
+    clamp at the Float32 floor rather than at 1e-15, so a caller whose
+    stopping rule is defined by a host metric should read the raw scores with
+    `gpu_validation_raw` and score them with `eval_metric` instead. That is
+    the same choice `train_gpu`'s device validation scorer makes per
+    objective."""
+    var h = handle.downcast_value_ptr[GpuValidation]()
+    return PythonObject(
+        h[].predictor.validation_metric(Int(py=metric), Int(py=response))
+    )
+
+
+def gpu_validation_raw(
+    handle: PythonObject, out_addr: PythonObject
+) raises -> PythonObject:
+    """Copy the resident raw scores into a preallocated float64 buffer of
+    length n_rows * n_outputs, row-major `[r * n_outputs + k]`.
+
+    The escape hatch, and the only way scores leave the device: it is what
+    lets the host metric suite score a run whose metric the device has no
+    kernel for."""
+    var h = handle.downcast_value_ptr[GpuValidation]()
+    _store(h[].predictor.validation_raw(), out_addr)
     return PythonObject(None)
 
 

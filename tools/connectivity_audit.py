@@ -54,7 +54,7 @@ What it reports:
 
 What it deliberately does not do:
 
-- **It does not re-check the LightGBM parity contract.** `tools/check_parity.py`
+- **It does not re-check the LightGBM parity contract.** `check_parity.py`
   owns `docs/LIGHTGBM_PARITY.md` and `docs/CAPABILITY_LEVELS.md`: the level
   definitions, the evidence columns, the claim/row schema. This script checks
   only that paths named as evidence exist as files, and defers everything
@@ -517,21 +517,28 @@ def strip_mojo_comments(text):
     return "".join(out)
 
 
-def parse_import_list(text, start):
-    """The imported-name list of a Mojo import, given the text after the
-    `import` keyword. Returns (names, consumed_extra_text).
+def read_import_list(tail):
+    """(names, characters consumed) for an import list, given every character
+    from the start of the list to the end of the file.
 
-    Handles the two forms in this repository: a bare list on one line, and a
-    parenthesized list spanning many. `X as _Y` contributes `X`, because the
-    question the graph asks is which symbol of the *source* module was taken.
+    Handles the two forms both languages use here: a bare list that ends at
+    the newline, and a parenthesized list that ends at its closing paren,
+    however many lines later. `X as _Y` contributes `X`, because the question
+    the graph asks is which symbol of the *source* module was taken.
+
+    The consumed count lets a caller cut the whole statement out of the file,
+    which is how "imported and never used" avoids counting the import itself
+    as a use.
     """
-    if not start.lstrip().startswith("("):
-        body = start
+    lead = len(tail) - len(tail.lstrip())
+    stripped = tail.lstrip()
+    if not stripped.startswith("("):
+        body = stripped.split("\n", 1)[0]
+        consumed = lead + len(body)
     else:
-        body = start.lstrip()[1:]
         depth = 1
         collected = []
-        for char in body:
+        for char in stripped[1:]:
             if char == "(":
                 depth += 1
             elif char == ")":
@@ -540,6 +547,7 @@ def parse_import_list(text, start):
                     break
             collected.append(char)
         body = "".join(collected)
+        consumed = lead + len(body) + 2
     names = []
     for piece in body.replace("\n", " ").split(","):
         piece = piece.strip()
@@ -548,7 +556,30 @@ def parse_import_list(text, start):
         head = piece.split()[0]
         if re.match(r"^[A-Za-z_][A-Za-z_0-9]*$", head):
             names.append(head)
-    return names
+    return names, consumed
+
+
+def parse_import_list(tail):
+    """Just the names. See `read_import_list`."""
+    return read_import_list(tail)[0]
+
+
+def strip_mojo_import_block(body):
+    """`body` with every `from .x import (...)` statement cut out entirely,
+    parenthesized continuations included."""
+    spans = []
+    for match in MOJO_IMPORT.finditer(body):
+        _names, consumed = read_import_list(body[match.start(2) :])
+        spans.append((match.start(), match.start(2) + consumed))
+    out = []
+    cursor = 0
+    for start, end in spans:
+        if start < cursor:
+            continue
+        out.append(body[cursor:start])
+        cursor = end
+    out.append(body[cursor:])
+    return "".join(out)
 
 
 def mojo_imports(path, text=None):
@@ -561,11 +592,10 @@ def mojo_imports(path, text=None):
     found = defaultdict(list)
     for match in MOJO_IMPORT.finditer(body):
         module = match.group(1)
-        # Re-slice from the real text so a parenthesized list that spans
-        # lines is available in full.
-        tail = body[match.end(1) :]
-        tail = tail.split("import", 1)[1] if "import" in tail else ""
-        found[module].extend(parse_import_list(body, tail))
+        # `.` does not cross a newline under re.MULTILINE, so group(2) is only
+        # the first line of a parenthesized list. Slice from where that group
+        # starts instead, and let parse_import_list find the closing paren.
+        found[module].extend(parse_import_list(body[match.start(2) :]))
     return dict(found)
 
 
@@ -624,7 +654,9 @@ NATIVE_GETATTR = re.compile(
 #: The keyword arguments of a Python estimator's `__init__`, taken from the
 #: `self.x = x` block that follows it. Matching the assignment rather than
 #: the signature keeps generated defaults and `**kwargs` out.
-PY_SELF_ASSIGN = re.compile(r"^\s{8}self\.([a-z_][a-z_0-9]*)\s*=\s*\1\s*$", re.MULTILINE)
+PY_SELF_ASSIGN = re.compile(
+    r"^\s{8}self\.([a-z_][a-z_0-9]*)\s*=\s*\1\s*$", re.MULTILINE
+)
 
 
 def python_modules():
@@ -658,7 +690,10 @@ def python_import_graph():
             if module:
                 edges.add(module)
             else:
-                for symbol in parse_import_list(text, match.group(2)):
+                # `from . import x`: x is a submodule when one is named that,
+                # and otherwise an attribute of the package (the package uses
+                # both forms, and only the first is an edge).
+                for symbol in parse_import_list(text[match.start(2) :]):
                     if symbol in modules:
                         edges.add(symbol)
         for match in PY_IMPORT_PKG.finditer(text):
@@ -764,7 +799,7 @@ def audit_unused_imports():
         # Everything after the import block, so an import does not count as
         # its own use.
         imports = mojo_imports(path, text)
-        without_imports = MOJO_IMPORT.sub("", body)
+        without_imports = strip_mojo_import_block(body)
         for module, names in sorted(imports.items()):
             unused = []
             for name in names:
@@ -1096,9 +1131,7 @@ def audit_missing_paths():
         where = ", ".join(sorted(set(seen[path])))
         owner = "connect_19" if path.endswith(".md") else "unassigned"
         if source_is_parity(seen[path]):
-            detail = "named as parity evidence in %s; the file is not there" % (
-                where,
-            )
+            detail = "named as parity evidence in %s; not there" % where
         else:
             detail = "named in %s; the file is not there" % where
         findings.append(

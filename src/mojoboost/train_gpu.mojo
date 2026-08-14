@@ -818,10 +818,25 @@ def grow_tree_gpu(
             expected_left=n_left,
         )
 
-        # Histogram subtraction trick: build the smaller child directly.
+        # Both children, however the launch policy wants them. Batched,
+        # they go up in one packed launch over exactly their own row ranges
+        # (gpu_leaf_batching.mojo); otherwise the subtraction trick builds
+        # the smaller child and derives the sibling on the host.
+        #
+        # The two produce the same pair of histograms, and exactly, not to a
+        # tolerance: accumulation is fixed-point Int32 under one scale for
+        # the whole tree, and a parent's bins are the exact integer sum of
+        # its children's, so subtracting one built child and building both
+        # children agree bin for bin. Which one runs is therefore a launch
+        # decision no split can observe.
         var left_hist: Histogram
         var right_hist: Histogram
-        if n_left <= n_right:
+        var child_nodes: List[Int] = [left_node, right_node]
+        if builder.batches_nodes(child_nodes):
+            var pair = builder.build_leaves(child_nodes)
+            left_hist = pair[0].copy()
+            right_hist = pair[1].copy()
+        elif n_left <= n_right:
             left_hist = builder.build_leaf(left_node)
             right_hist = subtract_histogram(frontier[best_i].hist, left_hist)
         else:
@@ -1217,6 +1232,7 @@ def train_gpu(
             goss,
             device_grads,
             split_search,
+            routes_all,
         )
 
 
@@ -1261,8 +1277,12 @@ def train_gpu(
         var device_grads = device_gradients(
             objective, 1, objective_source, bagging, goss, routes_all
         )
+        # The session's own fit latency: the first fit through a session
+        # pays the one-time costs and every later one does not, and that
+        # split is positional, so only the owner can attribute it.
+        var fit = session.begin_fit()
         var builder = GpuHistogramBuilder(session, data)
-        return _train_gpu_rounds(
+        var booster = _train_gpu_rounds(
             builder,
             session,
             data,
@@ -1275,7 +1295,10 @@ def train_gpu(
             goss,
             device_grads,
             split_search,
+            routes_all,
         )
+        session.end_fit(fit)
+        return booster^
 
 
 def _train_custom_gpu_rounds[
@@ -1392,8 +1415,9 @@ def train_custom_gpu[F: GradHessFn](
             raise Error("target length must equal n_rows")
         _check_sample_weight(sample_weight, data.n_rows)
 
+        var fit = session.begin_fit()
         var builder = GpuHistogramBuilder(session, data)
-        return _train_custom_gpu_rounds(
+        var booster = _train_custom_gpu_rounds(
             builder,
             session,
             data,
@@ -1404,6 +1428,8 @@ def train_custom_gpu[F: GradHessFn](
             base_score,
             split_search,
         )
+        session.end_fit(fit)
+        return booster^
 
 
 def _multiclass_base_scores(
@@ -1661,8 +1687,9 @@ def train_multiclass_gpu(
         var device_grads = device_gradients(
             _SOFTMAX_OBJECTIVE, n_classes, objective_source, bagging, goss
         )
+        var fit = session.begin_fit()
         var builder = GpuHistogramBuilder(session, data)
-        return _train_multiclass_gpu_rounds(
+        var booster = _train_multiclass_gpu_rounds(
             builder,
             session,
             data,
@@ -1676,6 +1703,8 @@ def train_multiclass_gpu(
             device_grads,
             split_search,
         )
+        session.end_fit(fit)
+        return booster^
 
 
 # ---------------------------------------------------------------------------

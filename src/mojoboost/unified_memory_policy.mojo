@@ -1318,7 +1318,7 @@ struct SessionMemoryPlan(Copyable, Movable):
         """
         var out = String("")
         for role in range(len(self.decisions)):
-            var d = self.decisions[role]
+            var d = self.decisions[role].copy()
             out += "transfer." + role_name(d.role)
             out += " " + route_name(d.requested)
             out += " " + route_name(d.selected)

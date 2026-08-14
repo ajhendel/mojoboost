@@ -110,9 +110,11 @@ def _parse_f64(token: String) raises -> Float64:
     )
 
 
-# The five bytes a feature name may not contain literally: the file is a
-# whitespace-separated token stream, so a name carrying one would be read
-# back as two names. Escaping them is what lets a name be a single token.
+# The bytes a feature name may not carry literally: the file is a
+# whitespace-separated token stream, so a name holding one of the four
+# whitespace bytes would be read back as two names, and the backslash is
+# what escapes them. `_BYTE_DEL` is not escaped, only refused, along with
+# every other control byte (see `_escape_name`).
 comptime _BYTE_TAB = 9
 comptime _BYTE_LF = 10
 comptime _BYTE_CR = 13
@@ -788,6 +790,7 @@ def load_model(path: String) raises -> Model:
     var base_score = r.next_f64()
 
     var mapper = _read_mapper(r, version)
+    _check_feature_names(names, mapper.n_features)
     var monotone = _read_monotone(r, mapper.n_features)
     var trees = _read_trees(r, mapper.n_features, version, mapper.n_bins)
     var booster = Booster(
@@ -797,11 +800,13 @@ def load_model(path: String) raises -> Model:
 
 
 def load_multiclass_model(path: String) raises -> MulticlassModel:
-    """Load a model saved by `save_multiclass_model`."""
+    """Load a model saved by `save_multiclass_model`. Feature names are read
+    and checked exactly as `load_model` does with them."""
     var content = open(path, "r").read()
     var r = _TokenReader(content)
 
     var version = _read_version(r)
+    var names = _read_feature_names(r)
     if _read_kind(r) != "multiclass":
         raise Error(
             "this is a single-output model file; use load_model"
@@ -819,6 +824,7 @@ def load_multiclass_model(path: String) raises -> MulticlassModel:
         base_scores.append(r.next_f64())
 
     var mapper = _read_mapper(r, version)
+    _check_feature_names(names, mapper.n_features)
     var monotone = _read_monotone(r, mapper.n_features)
     var trees = _read_trees(r, mapper.n_features, version, mapper.n_bins)
     if len(trees) % n_classes != 0:

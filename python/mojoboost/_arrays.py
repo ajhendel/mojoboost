@@ -152,6 +152,62 @@ def check_X_sparse(X, layout="csc", name="X"):
 
 
 
+def take_rows(data, rows, name="X"):
+    """`data` restricted to `rows`, in the order `rows` gives them.
+
+    The layouts a feature matrix arrives in are not one type, so this
+    dispatches the way the rest of the package does: on what the object
+    offers rather than on what it is. A frame keeps its columns, so a
+    selection out of a pandas or polars frame still carries the feature
+    names and the category dtypes the whole one had.
+
+    This is row selection on the *raw* matrix, which is the only place it is
+    safe to do: bin edges are fitted from data, so selecting rows out of a
+    matrix that was already binned would carry the whole matrix's quantiles
+    into the part. `mojoboost.cv` builds every fold through here for exactly
+    that reason, and `src/mojoboost/raw_data.mojo` does the same selection on
+    the Mojo side.
+
+    Sparse input is refused rather than sliced, because the `Dataset` the
+    selection would be handed does not accept it yet (see
+    handoffs/connect_12_dataset_cv.md); scipy would slice it happily, and the
+    failure would then surface two calls later with a worse message.
+    """
+    if _is_sparse(data):
+        raise TypeError(
+            f"{name} is a sparse matrix, and rows cannot be selected out of "
+            "it here because Dataset does not accept sparse data; densify "
+            "with .toarray()"
+        )
+    index = list(rows)
+    iloc = getattr(data, "iloc", None)
+    if iloc is not None:  # pandas
+        return iloc[index]
+    if np is not None and isinstance(data, np.ndarray):
+        return data[np.asarray(index, dtype=np.intp)]
+    take = getattr(data, "take", None)
+    if take is not None and getattr(data, "column_names", None) is not None:
+        return take(index)  # pyarrow
+    if getattr(data, "columns", None) is not None:
+        try:
+            return data[index]  # polars
+        except (TypeError, ValueError):
+            pass
+    if np is not None and hasattr(data, "__array__"):
+        return np.asarray(data)[np.asarray(index, dtype=np.intp)]
+    return [data[i] for i in index]
+
+
+def take_column(column, rows):
+    """One per-row column restricted to `rows`, or None for a column the
+    caller does not have."""
+    if column is None:
+        return None
+    if np is not None:
+        return np.asarray(column)[np.asarray(list(rows), dtype=np.intp)]
+    return [column[i] for i in rows]
+
+
 def feature_names(X):
     """Column names when `X` carries them and all of them are strings
     (a pandas DataFrame, typically), None otherwise. Matching what

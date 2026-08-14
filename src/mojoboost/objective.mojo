@@ -56,12 +56,60 @@ Early stopping is supported by `train_custom_with_valid`, which takes a
 second callable of type `EvalLossFn` (raw scores and labels in, a scalar
 lower-is-better loss out), because a custom objective carries no metric the
 framework could infer.
+
+What the registry says about `CUSTOM`
+------------------------------------
+`objective_registry.mojo` holds one record per objective, `CUSTOM` included,
+and every clause of the contract above is one of its fields:
+
+    objective_grad_hess_source(CUSTOM) == GRAD_CALLBACK
+    objective_init_kind(CUSTOM)        == INIT_CALLER
+    objective_link(CUSTOM)             == LINK_IDENTITY
+    objective_gradients_on_device(CUSTOM) is False
+    objective_class_weight_kind(CUSTOM) == CLASS_WEIGHT_NONE
+    objective_has_default_metric(CUSTOM) is False
+
+`_check_custom_contract` asserts all six once per training run, so the two
+files cannot drift into disagreeing about what a custom objective is: if
+someone gives `CUSTOM` a link in the registry, the trainer that returns raw
+scores stops rather than returning a number that is no longer what the
+registry promises. It is six integer compares before the first tree.
+
+`matching_base_score` is the other direction: it hands a custom objective the
+starting score a built-in one would have used, so "reproduce the built-in
+SQUARED_ERROR exactly" does not require knowing that squared error starts
+from the label mean and poisson from its logarithm. The registry says which
+rule each objective follows and boosting.mojo computes it.
 """
 
 from std.math import isfinite
 
 from .binning import BinnedMatrix
-from .boosting import CUSTOM, Booster, BoosterParams, _check_sample_weight
+from .boosting import (
+    CUSTOM,
+    Booster,
+    BoosterParams,
+    _base_score,
+    _check_sample_weight,
+)
+from .objective_registry import (
+    CLASS_WEIGHT_NONE,
+    GRAD_CALLBACK,
+    INIT_CALLER,
+    LINK_IDENTITY,
+    SUPPORTS_CPU,
+    SUPPORTS_GPU,
+    check_objective_param,
+    objective_canonical_name,
+    objective_class_weight_kind,
+    objective_backends,
+    objective_grad_hess_source,
+    objective_gradients_on_device,
+    objective_has_default_metric,
+    objective_init_kind,
+    objective_is_builtin,
+    objective_link,
+)
 from .tree import Tree, grow_tree
 
 comptime GradHessFn = def (
@@ -71,6 +119,113 @@ comptime GradHessFn = def (
 
 comptime EvalLossFn = def (List[Float64], List[Float64]) raises -> Float64
 """Raw predictions and labels in, a scalar lower-is-better loss out."""
+
+
+def _check_custom_contract() raises:
+    """Assert that the registry still describes `CUSTOM` the way this module
+    trains it.
+
+    Six compares, once per training run, before the first tree. Each one
+    pairs a registry fact with the line of this file that depends on it, so a
+    change to either side fails here instead of silently changing what a
+    model means. See the module docstring for why each holds.
+    """
+    if objective_grad_hess_source(CUSTOM) != GRAD_CALLBACK:
+        raise Error(
+            "registry drift: objective_grad_hess_source(CUSTOM) is not"
+            " GRAD_CALLBACK, but train_custom takes its derivatives from a"
+            " caller-supplied callable"
+        )
+    if objective_init_kind(CUSTOM) != INIT_CALLER:
+        raise Error(
+            "registry drift: objective_init_kind(CUSTOM) is not INIT_CALLER,"
+            " but train_custom starts from the caller's base_score"
+        )
+    if objective_link(CUSTOM) != LINK_IDENTITY:
+        raise Error(
+            "registry drift: objective_link(CUSTOM) is not LINK_IDENTITY,"
+            " but a model trained here returns raw scores"
+        )
+    if objective_gradients_on_device(CUSTOM):
+        raise Error(
+            "registry drift: objective_gradients_on_device(CUSTOM) is True,"
+            " but a custom objective's callback runs on the host"
+        )
+    if objective_class_weight_kind(CUSTOM) != CLASS_WEIGHT_NONE:
+        raise Error(
+            "registry drift: objective_class_weight_kind(CUSTOM) is not"
+            " CLASS_WEIGHT_NONE, but a custom objective's labels are real"
+            " numbers with no class to weight"
+        )
+    if objective_has_default_metric(CUSTOM):
+        raise Error(
+            "registry drift: objective_has_default_metric(CUSTOM) is True,"
+            " but only a custom objective's author knows what it optimizes"
+        )
+
+
+def custom_objective_backends() raises -> Int:
+    """Which backends can train a custom objective, as `SUPPORTS_*` flags.
+
+    Both: `train_custom` here and `train_custom_gpu`, which grows the trees
+    on the device and calls the gradient callback on the host. The device
+    never computes the derivatives, which is a narrower claim and is
+    `objective_gradients_on_device(CUSTOM)`, False. The registry is the one
+    place that distinction is written down.
+    """
+    return objective_backends(CUSTOM)
+
+
+def check_custom_base_score(base_score: Float64) raises:
+    """A custom objective's starting raw score must be a finite number.
+
+    `INIT_CALLER` means the framework picks nothing, so this is the only
+    check there is: a NaN base score would make every gradient the callback
+    ever sees a NaN, and the round-by-round validation would then blame the
+    callback for a value the trainer handed it.
+    """
+    if not isfinite(base_score):
+        raise Error("base_score must be finite")
+
+
+def matching_base_score(
+    objective: Int,
+    target: List[Float64],
+    weights: List[Float64] = [],
+    alpha: Float64 = 0.9,
+) raises -> Float64:
+    """The `base_score` that starts a custom objective where the built-in
+    `objective` would have started.
+
+    A custom objective boosts from `base_score` because the framework does
+    not know its link (see the module docstring). A caller reimplementing a
+    built-in loss does know, and this saves them from restating the rule:
+    `train_custom(..., base_score=matching_base_score(SQUARED_ERROR, y))`
+    reproduces the built-in squared-error run, and swapping in `POISSON`
+    reproduces the poisson one without the caller having to know that one
+    starts from the label mean and the other from its logarithm.
+
+    Computed by boosting.mojo's `_base_score`, the same call the built-in
+    trainer makes, so the two are the same number and not two roundings of
+    it. Only the built-in single-output objectives have one to match: the
+    other three either have no framework-chosen start (`CUSTOM` itself),
+    start at zero because the scale is arbitrary (`LAMBDARANK`), or need one
+    score per class rather than one (`MULTICLASS`), and each is refused by
+    name. `mean_label` remains the direct call for the weighted mean itself,
+    which is this function under the identity link.
+    """
+    if not objective_is_builtin(objective):
+        raise Error(
+            "objective '",
+            objective_canonical_name(objective),
+            "' has no single base score a custom objective could match:"
+            " init kind ",
+            objective_init_kind(objective),
+            " (see INIT_* in objective_registry.mojo)",
+        )
+    check_objective_param(objective, alpha)
+    _check_sample_weight(weights, len(target))
+    return _base_score(target, objective, weights, alpha)
 
 
 def check_custom_grad_hess(
@@ -186,6 +341,26 @@ def mean_label(
     return mean / total_w
 
 
+def apply_sample_weight(
+    mut grad: List[Float64], mut hess: List[Float64], weights: List[Float64]
+):
+    """The public name for the one place a custom objective's derivatives
+    meet the row weights.
+
+    Called once per round by every custom-objective trainer here, in
+    `train_custom_with_metrics`, and in `train_custom_gpu`. It is the only
+    application: the callback never sees the weights, so it cannot apply them
+    a second time, and a class weight is not a separate step either. Every
+    class-level policy mojoboost has (`class_weight`, `balanced`,
+    `scale_pos_weight`, `is_unbalance`) is expanded by class_weight.mojo into
+    exactly this `sample_weight` vector *before* training starts, which is
+    what makes double application impossible rather than merely discouraged.
+    A row with `sample_weight` 2.0 in a class weighted 3.0 arrives here as
+    one weight of 6.0.
+    """
+    _apply_sample_weight(grad, hess, weights)
+
+
 def train_custom[F: GradHessFn](
     data: BinnedMatrix,
     target: List[Float64],
@@ -207,9 +382,11 @@ def train_custom[F: GradHessFn](
     per row; see the module docstring for the full contract. Predictions
     from the returned booster are raw scores.
     """
+    _check_custom_contract()
     if len(target) != data.n_rows:
         raise Error("target length must equal n_rows")
     _check_sample_weight(sample_weight, data.n_rows)
+    check_custom_base_score(base_score)
 
     var n = data.n_rows
     var raw = List[Float64](capacity=n)
@@ -264,6 +441,7 @@ def train_custom_with_valid[F: GradHessFn, L: EvalLossFn](
     and the ensemble is truncated to its best round. As with the built-in
     trainer, sample_weight applies to training rows only.
     """
+    _check_custom_contract()
     if len(target) != data.n_rows:
         raise Error("target length must equal n_rows")
     if len(valid_target) != valid_data.n_rows:
@@ -273,6 +451,7 @@ def train_custom_with_valid[F: GradHessFn, L: EvalLossFn](
     if early_stopping_rounds < 1:
         raise Error("early_stopping_rounds must be positive")
     _check_sample_weight(sample_weight, data.n_rows)
+    check_custom_base_score(base_score)
 
     var n = data.n_rows
     var raw = List[Float64](capacity=n)

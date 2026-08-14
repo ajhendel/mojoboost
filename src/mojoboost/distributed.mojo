@@ -16,7 +16,29 @@ docs/distributed.md for the design; the short version is:
 - a rank with no rows still calls every collective, contributing zeros
 
 Everything about how ranks talk to each other lives behind the `Collective`
-trait in collective.mojo. Nothing in this file names a transport.
+trait in collective.mojo. Nothing in this file opens a connection, names a
+socket, or knows what a frame is.
+
+What it does now use from distributed_transport.mojo is the part of that module
+that is not about bytes: the schema digest, the histogram cost contract, the
+split digest, the checkpoint record, and the `RuntimeSpec` that says which
+world a process belongs to. Those were written against this algorithm and then
+left unreferenced by it, which is what made a validated transport and an
+unvalidated training run coexist. `run_distributed` is now the one entry point
+that turns a `RuntimeSpec` into a collective and a trained model, and it
+refuses a multi-process spec outright, because no endpoint in this build can
+reach another process.
+
+Two rules keep the additions from changing what a run already does:
+
+- every collective this file added is behind `hosts_whole_world`, so a world
+  hosted in one process issues exactly the reductions it always did. There is
+  nothing to negotiate with a peer that is this same process, and the values
+  a peer would confirm are computed here for every rank already.
+- everything a caller has to ask for (split verification, metrics, early
+  stopping, checkpoints, callbacks) is off in `DistributedRunOptions()`, so
+  `train_distributed` is `train_distributed_run` with the defaults and the two
+  produce the same model from the same messages.
 
 Determinism: for a fixed dataset, partition, and world size this is
 bit-identical run to run and rank to rank. It equals single-node training
@@ -48,19 +70,46 @@ from .boosting import (
     BoosterParams,
     _clamp_prob,
     _fill_grad_hess,
+    _mean_loss,
+)
+from .callback import (
+    ABORT,
+    AFTER_ITERATION,
+    BEFORE_ITERATION,
+    CONTINUE,
+    STOP,
+    IterationEnv,
+    IterationFn,
+    no_callback,
 )
 from .collective import (
     STATUS_INVALID_TARGET,
     STATUS_INVALID_WEIGHT,
     STATUS_OK,
+    STATUS_PARTITION_MISMATCH,
     STATUS_SHAPE_MISMATCH,
     Collective,
     add_into_f64,
     add_into_int,
     agree_equal_ints,
     agree_status,
+    hosts_whole_world,
     zeros_f64,
     zeros_int,
+)
+from .distributed_transport import (
+    RUNTIME_LOCAL,
+    RUNTIME_TRANSPORT,
+    CheckpointMeta,
+    RuntimeSpec,
+    check_histogram_buffers,
+    digest_halves,
+    digest_ints,
+    f64_bits,
+    histogram_plan,
+    open_local_collective,
+    require_transport,
+    split_digest,
 )
 from .histogram import (
     Histogram,
@@ -91,6 +140,7 @@ comptime _UNSUPPORTED_MISSING_BIN = 32
 comptime _UNSUPPORTED_FEATURE_FRACTION_BYLEVEL = 64
 comptime _UNSUPPORTED_EXTRA_TREES = 128
 comptime _UNSUPPORTED_FORCED_SPLITS = 256
+comptime _UNSUPPORTED_RANKING = 512
 
 
 struct DataShard(Copyable, Movable):
@@ -121,6 +171,211 @@ struct DataShard(Copyable, Movable):
         self.weight = weight^
 
 
+struct ShardPlan(Copyable, Movable):
+    """Where every rank's rows sit in the global row order.
+
+    `row_offset[r]` is the first global row index rank r owns and `n_rows[r]`
+    is how many it owns, so the ranks tile `[0, total_rows)` in ascending rank
+    order with no gap and no overlap. That is the same thing
+    `RankAssignment.row_offset` and `n_rows` mean on the Dask side of
+    python/mojoboost/dask.py, deliberately, so a plan built there and a plan
+    negotiated here describe one partition rather than two.
+
+    It matters beyond bookkeeping in three places. The floating point
+    equivalence argument is that the reduction visits row contributions in the
+    dataset's own order, which is only true if this tiling is the identity on
+    the row order. A ranking query group that straddles two ranks cannot be
+    scored by either of them, and `check_group_alignment` is that constraint
+    written against these offsets. And a restart at a different world size
+    re-shards the data underneath a half-built model, which is why the
+    checkpoint record carries the world size this plan was built for.
+    """
+
+    var row_offset: List[Int]
+    var n_rows: List[Int]
+
+    def __init__(out self, var row_offset: List[Int], var n_rows: List[Int]):
+        self.row_offset = row_offset^
+        self.n_rows = n_rows^
+
+    def world_size(self) -> Int:
+        return len(self.n_rows)
+
+    def total_rows(self) -> Int:
+        var total = 0
+        for r in range(len(self.n_rows)):
+            total += self.n_rows[r]
+        return total
+
+    def validate(self) raises:
+        """Refuse a plan that is not a tiling. Cheap, and worth doing on a plan
+        that arrived from outside Mojo rather than trusting it."""
+        if len(self.row_offset) != len(self.n_rows):
+            raise Error("a shard plan needs one offset per rank")
+        if len(self.n_rows) < 1:
+            raise Error("a shard plan needs at least one rank")
+        var expected = 0
+        for r in range(len(self.n_rows)):
+            if self.n_rows[r] < 0:
+                raise Error("a shard cannot hold a negative row count")
+            if self.row_offset[r] != expected:
+                raise Error(
+                    String(
+                        "shard plan is not contiguous: rank ",
+                        r,
+                        " starts at row ",
+                        self.row_offset[r],
+                        " where the ranks before it end at ",
+                        expected,
+                    )
+                )
+            expected += self.n_rows[r]
+
+    @staticmethod
+    def from_counts(counts: List[Int]) raises -> ShardPlan:
+        """The plan implied by per-rank row counts, as one prefix sum.
+
+        This is how a plan comes back from a reduction: the counts are the
+        thing ranks can contribute, and the offsets follow from them
+        identically on every rank without a second message.
+        """
+        var offsets = List[Int](capacity=len(counts))
+        var running = 0
+        for r in range(len(counts)):
+            offsets.append(running)
+            running += counts[r]
+        var plan = ShardPlan(offsets^, counts.copy())
+        plan.validate()
+        return plan^
+
+    @staticmethod
+    def contiguous(n_rows: Int, world_size: Int) raises -> ShardPlan:
+        """The block partition `partition_rows` builds.
+
+        The one definition of the boundary, so a caller that needs to know
+        which rows a rank will own asks this rather than recomputing
+        `r * n // W` and drifting from it.
+        """
+        if world_size < 1:
+            raise Error("world_size must be positive")
+        if n_rows < 0:
+            raise Error("n_rows must not be negative")
+        var counts = List[Int](capacity=world_size)
+        for r in range(world_size):
+            counts.append(
+                (r + 1) * n_rows // world_size - r * n_rows // world_size
+            )
+        return ShardPlan.from_counts(counts)
+
+
+def resolve_partition[
+    C: Collective
+](mut comm: C, shards: List[DataShard]) raises -> ShardPlan:
+    """The global row partition, agreed across the world.
+
+    Every rank contributes its own row counts into its own slots of a
+    world-sized vector and reduces the sum, so each rank ends up holding every
+    rank's count and derives the identical offsets from them. A rank therefore
+    learns where its rows sit in the global order without being told, which is
+    what the ranking-group constraint and the checkpoint record both need.
+
+    One reduction, and only when this process does not already hold every rank:
+    a world hosted in one process has all the counts in hand, and reducing them
+    would be a round trip to confirm what it just computed.
+    """
+    var world = comm.world_size()
+    var counts = zeros_int(world)
+    for i in range(len(shards)):
+        var r = comm.local_rank(i)
+        if r < 0 or r >= world:
+            raise Error("local rank id out of range")
+        counts[r] = shards[i].data.n_rows
+    if not hosts_whole_world(comm):
+        comm.allreduce_sum_int(counts)
+    return ShardPlan.from_counts(counts)
+
+
+def _partition_statuses[
+    C: Collective
+](comm: C, shards: List[DataShard], plan: ShardPlan) -> List[Int]:
+    """Per-local-rank status for the plan against the shards actually held.
+
+    Recorded rather than raised, like every other validation here, so a rank
+    whose shard disagrees with the agreed plan does not raise while the rest of
+    the world waits in a collective it will never call.
+    """
+    var n_local = comm.n_local_ranks()
+    var statuses = zeros_int(n_local)
+    if plan.world_size() != comm.world_size() or len(shards) != n_local:
+        for i in range(n_local):
+            statuses[i] = STATUS_PARTITION_MISMATCH
+        return statuses^
+    for i in range(n_local):
+        var r = comm.local_rank(i)
+        if r < 0 or r >= plan.world_size():
+            statuses[i] = STATUS_PARTITION_MISMATCH
+        elif plan.n_rows[r] != shards[i].data.n_rows:
+            statuses[i] = STATUS_PARTITION_MISMATCH
+    return statuses^
+
+
+def check_group_alignment(plan: ShardPlan, groups: List[Int]) raises:
+    """Refuse a ranking partition that splits a query across two ranks.
+
+    A query group's rows are scored against each other, so a rank holding half
+    of one can compute neither its NDCG nor its lambdas, and no reduction over
+    per-rank sums can repair that: the missing quantity is a comparison, not a
+    sum. LightGBM's rule is the same, and section 3 of docs/distributed.md
+    states it for this partition.
+
+    `groups` is the global query sizes in row order, which is the same shape
+    `groups_from_counts` takes in ranking.mojo. This checks the constraint and
+    nothing else; distributed lambdarank is not implemented, and
+    `train_distributed_run` refuses it separately. The constraint is worth
+    having on its own because it is what a client has to satisfy *before* it
+    partitions, and satisfying it after the fact is not possible.
+    """
+    plan.validate()
+    var total = 0
+    for g in range(len(groups)):
+        if groups[g] <= 0:
+            raise Error("a query group must contain at least one row")
+        total += groups[g]
+    if total != plan.total_rows():
+        raise Error(
+            String(
+                "the query groups cover ",
+                total,
+                " rows and the shard plan covers ",
+                plan.total_rows(),
+            )
+        )
+    # Walk the group boundaries once and require every rank boundary to be one
+    # of them. Both sequences are ascending, so this is a merge and not a
+    # search.
+    var g = 0
+    var boundary = 0
+    for r in range(1, plan.world_size()):
+        var edge = plan.row_offset[r]
+        while boundary < edge and g < len(groups):
+            boundary += groups[g]
+            g += 1
+        if boundary != edge:
+            raise Error(
+                String(
+                    "query group ",
+                    g - 1,
+                    " straddles the boundary between rank ",
+                    r - 1,
+                    " and rank ",
+                    r,
+                    " at row ",
+                    edge,
+                    "; a group must be owned entirely by one rank",
+                )
+            )
+
+
 def partition_rows(
     data: BinnedMatrix,
     target: List[Float64],
@@ -129,26 +384,24 @@ def partition_rows(
 ) raises -> List[DataShard]:
     """Split a dataset into `world_size` shards, one per rank.
 
-    The partition is contiguous and order preserving: rank r owns rows
-    `[r * n // W, (r + 1) * n // W)`, so concatenating shards in ascending
-    rank order reproduces the dataset row for row. That is what lets the
-    global reduction visit row contributions in the same order the
-    single-node trainer does, which is the whole floating point equivalence
-    argument. A world size larger than the row count simply yields empty
-    shards, which take part in every collective as zero contributions.
+    The partition is `ShardPlan.contiguous`: contiguous and order preserving,
+    so concatenating shards in ascending rank order reproduces the dataset row
+    for row. That is what lets the global reduction visit row contributions in
+    the same order the single-node trainer does, which is the whole floating
+    point equivalence argument. A world size larger than the row count simply
+    yields empty shards, which take part in every collective as zero
+    contributions.
     """
-    if world_size < 1:
-        raise Error("world_size must be positive")
     if len(target) != data.n_rows:
         raise Error("target length must equal n_rows")
     if len(weight) > 0 and len(weight) != data.n_rows:
         raise Error("sample_weight length must equal n_rows")
 
+    var plan = ShardPlan.contiguous(data.n_rows, world_size)
     var shards = List[DataShard]()
     for r in range(world_size):
-        var start = r * data.n_rows // world_size
-        var end = (r + 1) * data.n_rows // world_size
-        var rows = end - start
+        var start = plan.row_offset[r]
+        var rows = plan.n_rows[r]
 
         var bins = List[UInt8](capacity=rows * data.n_features)
         bins.resize(rows * data.n_features, 0)
@@ -233,7 +486,20 @@ def allreduce_histogram[C: Collective](
     Three reductions rather than one, so that counts stay integers and their
     exactness is obvious. A production transport should pack gradients and
     hessians into one message; see docs/distributed.md section 8.
+
+    The three buffers are checked against `histogram_plan` first. That is the
+    cost contract in distributed_transport.mojo, and checking here is what
+    connects it to the schedule it describes rather than leaving it as an
+    assertion about a comment: a histogram whose buffers do not describe one
+    features-by-bins grid is refused locally, by the rank that built it, rather
+    than reaching the peers as a length disagreement attributed to whoever
+    happened to receive it. It costs three integer comparisons per node and no
+    messages.
     """
+    var plan = histogram_plan(hist.n_features, hist.n_bins)
+    check_histogram_buffers(
+        plan, len(hist.grad), len(hist.hess), len(hist.count)
+    )
     comm.allreduce_sum_f64(hist.grad)
     comm.allreduce_sum_f64(hist.hess)
     comm.allreduce_sum_int(hist.count)

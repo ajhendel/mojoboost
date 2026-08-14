@@ -149,12 +149,48 @@ comptime FREC_TOTAL_HESS = 6
 comptime FREC_LEFT_VALUE = 7
 comptime FREC_RIGHT_VALUE = 8
 comptime FREC_PARENT_VALUE = 9
+comptime FREC_RUNNER_GAIN = 10
+"""The best gain among every candidate this node scored *except* the
+winner, across every scanned feature. The margin `gain - runner_gain` is
+what a caller measures a Float32 near-tie against; see
+`GpuSplitRecord.is_near_tie` and the near-tie section of the module
+docstring."""
 
-comptime SPLIT_FWORDS = 10
+comptime SPLIT_FWORDS = 11
 
 comptime FLAG_FOUND = 1
 comptime FLAG_DEFAULT_LEFT = 2
 comptime FLAG_CATEGORICAL = 4
+
+# --- Per-node integer parameter block ------------------------------------
+#
+# The two node-varying integers that cannot be kernel arguments once a whole
+# frontier is searched by one launch: how many feature slots this node
+# scans, and where its histogram starts in the buffer the launch was given.
+# One row per record.
+
+comptime NODE_SLOTS = 0
+comptime NODE_HIST_BASE = 1
+"""Offset, in Int32 words, of this node's `[grad | hess | count]`
+histogram inside the buffer passed to the launch. Zero for a caller that
+hands over one node's histogram (`GpuHistogramBuilder.out_dev`), and
+`slot * 3 * n_features * n_bins` for a caller whose leaves share one
+multi-slot buffer, which is exactly the layout `GpuLeafBatcher.out_dev`
+holds and `slot_cells` measures."""
+
+comptime NODE_WORDS = 2
+
+# Relative margin below which a node's winning gain and its runner-up are
+# not distinguishable in Float32 with any confidence.
+#
+# Float32 carries about 1.2e-7 of relative resolution. A gain is a
+# difference of three quotients, each accumulated from dequantized sums, so
+# a handful of roundings separate a computed gain from the exact one; 1e-6
+# is roughly eight of those, which is the conservative side of the only
+# number that matters here, since being too eager costs a host rescan of
+# one node and being too lax silently accepts a split the host would not
+# have chosen.
+comptime SPLIT_TIE_RELATIVE = Float64(1e-6)
 
 # --- Per-node float parameter block --------------------------------------
 #
@@ -287,6 +323,7 @@ def gpu_split_gain(
 
 def _scan_slot_kernel(
     hist: MutPointer[Int32, MutAnyOrigin],
+    node_tab: MutPointer[Int32, MutAnyOrigin],
     feat_ids: MutPointer[Int32, MutAnyOrigin],
     allow: MutPointer[Int32, MutAnyOrigin],
     missing: MutPointer[Int32, MutAnyOrigin],
@@ -297,20 +334,26 @@ def _scan_slot_kernel(
     out_f: MutPointer[Float32, MutAnyOrigin],
     n_bins: Int32,
     hist_size: Int32,
+    record_base: Int32,
+    feat_stride: Int32,
     min_data_in_leaf: Int32,
     constrained: Int32,
     cat_onehot_max: Int32,
     cat_max_threshold: Int32,
     cat_min_group: Int32,
 ):
-    """One threadgroup per active feature slot: scan that feature's
-    candidates and write its best one as a per-slot record.
+    """One threadgroup per (node, active feature slot): scan that feature's
+    candidates for that node and write its best one as a per-slot record.
 
     The scan runs on one thread because the candidate order is the
     tie-breaking rule and a threshold scan is a prefix sum; features are the
-    parallel dimension. Every accumulation is exact fixed-point Int32, so the
-    sums do not depend on this choice and a later per-bin parallel scan
-    cannot change a result."""
+    parallel dimension, and nodes are the second one. A launch covers
+    records `[record_base, record_base + grid_dim.y)`, each with its own
+    feature set, allow mask, float parameters, and histogram offset, which
+    is what lets a whole frontier be scanned by one launch instead of one
+    launch and one host wait per node. Every accumulation is exact
+    fixed-point Int32, so the sums do not depend on either choice and a
+    later per-bin parallel scan cannot change a result."""
     # Allocated at entry rather than inside the categorical branch, so the
     # threadgroup's shared allocation is unconditional and static.
     var keys = stack_allocation[
@@ -325,12 +368,22 @@ def _scan_slot_kernel(
     ]()
 
     var slot = Int(block_idx.x)
-    var f = Int(feat_ids[unsafe_offset=slot][0])
+    var record = Int(record_base) + Int(block_idx.y)
+    var nt = record * NODE_WORDS
+    # A launch is as wide as the widest node in the batch, so a node with a
+    # narrower feature set leaves the tail slots alone. The reduction reads
+    # only this node's own slots, so what those hold does not matter.
+    if slot >= Int(node_tab[unsafe_offset = nt + NODE_SLOTS][0]):
+        return
+    var stride = Int(feat_stride)
+    var table = record * stride
+    var f = Int(feat_ids[unsafe_offset = table + slot][0])
     var nb = Int(n_bins)
     var hs = Int(hist_size)
-    var base = f * nb
-    var io = slot * SPLIT_IWORDS
-    var fo = slot * SPLIT_FWORDS
+    var base = Int(node_tab[unsafe_offset = nt + NODE_HIST_BASE][0]) + f * nb
+    var io = (table + slot) * SPLIT_IWORDS
+    var fo = (table + slot) * SPLIT_FWORDS
+    var pf = record * PF_WORDS
 
     for i in range(SPLIT_IWORDS):
         out_i[unsafe_offset = io + i] = Int32(0)
@@ -340,15 +393,15 @@ def _scan_slot_kernel(
     out_i[unsafe_offset = io + IREC_BIN] = Int32(-1)
     out_i[unsafe_offset = io + IREC_ORDINAL] = Int32(-1)
 
-    var g_inv = fparams[unsafe_offset=PF_G_INV][0]
-    var h_inv = fparams[unsafe_offset=PF_H_INV][0]
-    var lambda_l2 = fparams[unsafe_offset=PF_LAMBDA_L2][0]
-    var lambda_l1 = fparams[unsafe_offset=PF_LAMBDA_L1][0]
-    var min_child_hess = fparams[unsafe_offset=PF_MIN_CHILD_HESS][0]
-    var bound_lo = fparams[unsafe_offset=PF_BOUND_LO][0]
-    var bound_hi = fparams[unsafe_offset=PF_BOUND_HI][0]
-    var cat_smooth = fparams[unsafe_offset=PF_CAT_SMOOTH][0]
-    var cat_l2 = fparams[unsafe_offset=PF_CAT_L2][0]
+    var g_inv = fparams[unsafe_offset = pf + PF_G_INV][0]
+    var h_inv = fparams[unsafe_offset = pf + PF_H_INV][0]
+    var lambda_l2 = fparams[unsafe_offset = pf + PF_LAMBDA_L2][0]
+    var lambda_l1 = fparams[unsafe_offset = pf + PF_LAMBDA_L1][0]
+    var min_child_hess = fparams[unsafe_offset = pf + PF_MIN_CHILD_HESS][0]
+    var bound_lo = fparams[unsafe_offset = pf + PF_BOUND_LO][0]
+    var bound_hi = fparams[unsafe_offset = pf + PF_BOUND_HI][0]
+    var cat_smooth = fparams[unsafe_offset = pf + PF_CAT_SMOOTH][0]
+    var cat_l2 = fparams[unsafe_offset = pf + PF_CAT_L2][0]
 
     # Totals over this feature's bins. Every accumulated feature has the same
     # totals bit for bit, because a row contributes the same quantized value
@@ -369,7 +422,7 @@ def _scan_slot_kernel(
 
     # A feature the node's interaction constraints disallow is skipped before
     # any of its candidates is scored, exactly as in `find_best_split`.
-    if allow[unsafe_offset=slot][0] == Int32(0):
+    if allow[unsafe_offset = table + slot][0] == Int32(0):
         return
 
     var sign = Int32(MONOTONE_FREE)
@@ -381,6 +434,11 @@ def _scan_slot_kernel(
     )
 
     var best_gain = Float32(0.0)
+    # The best gain of every candidate this feature scored except the
+    # winner, kept so the reduction can report the node's margin. Updated at
+    # every acceptance site and nowhere else, so it costs one compare per
+    # candidate and cannot change which candidate wins.
+    var runner_gain = Float32(0.0)
     var best_bin = -1
     var best_ordinal = -1
     var best_default_left = False
@@ -422,6 +480,7 @@ def _scan_slot_kernel(
                     - parent_score
                 )
                 if gain > best_gain:
+                    runner_gain = best_gain
                     best_gain = gain
                     best_left_g = lg
                     best_left_h = lh
@@ -434,6 +493,8 @@ def _scan_slot_kernel(
                     out_i[unsafe_offset=word] = Int32(
                         1 << (t % CAT_WORD_BITS)
                     )
+                elif gain > runner_gain:
+                    runner_gain = gain
         else:
             # Many-vs-many over prefixes of the gradient/hessian ordering,
             # walked from both ends.
@@ -513,6 +574,7 @@ def _scan_slot_kernel(
                             - parent_score
                         )
                         if gain > best_gain:
+                            runner_gain = best_gain
                             best_gain = gain
                             best_left_g = lg
                             best_left_h = lh
@@ -533,6 +595,8 @@ def _scan_slot_kernel(
                                     unsafe_offset=word
                                 ][0] | Int32(1 << (m % CAT_WORD_BITS))
                                 p += direction
+                        elif gain > runner_gain:
+                            runner_gain = gain
     else:
         # --- Ordinal threshold scan ------------------------------------
         var missing_bin = Int(missing[unsafe_offset=f][0])
@@ -586,6 +650,7 @@ def _scan_slot_kernel(
                         is_constrained,
                     )
                     if gain > best_gain:
+                        runner_gain = best_gain
                         best_gain = gain
                         best_bin = b
                         best_ordinal = 2 * b
@@ -594,6 +659,8 @@ def _scan_slot_kernel(
                         best_left_h = dl_h
                         best_left_c = dl_c
                         found = True
+                    elif gain > runner_gain:
+                        runner_gain = gain
 
             # Missing to the right. For a feature with no missing bin this is
             # the only candidate and the scan is exactly the ordinal one.
@@ -622,6 +689,7 @@ def _scan_slot_kernel(
                     is_constrained,
                 )
                 if gain > best_gain:
+                    runner_gain = best_gain
                     best_gain = gain
                     best_bin = b
                     best_ordinal = 2 * b + 1
@@ -630,6 +698,8 @@ def _scan_slot_kernel(
                     best_left_h = left_h
                     best_left_c = left_c
                     found = True
+                elif gain > runner_gain:
+                    runner_gain = gain
 
     if not found:
         return
@@ -648,6 +718,7 @@ def _scan_slot_kernel(
     var lgf = best_left_g.cast[DType.float32]() * g_inv
     var lhf = best_left_h.cast[DType.float32]() * h_inv
     out_f[unsafe_offset = fo + FREC_GAIN] = best_gain
+    out_f[unsafe_offset = fo + FREC_RUNNER_GAIN] = runner_gain
     out_f[unsafe_offset = fo + FREC_LEFT_GRAD] = lgf
     out_f[unsafe_offset = fo + FREC_LEFT_HESS] = lhf
     out_f[unsafe_offset = fo + FREC_RIGHT_GRAD] = total_g - lgf
@@ -659,40 +730,61 @@ def _reduce_slots_kernel(
     slot_f: MutPointer[Float32, MutAnyOrigin],
     out_i: MutPointer[Int32, MutAnyOrigin],
     out_f: MutPointer[Float32, MutAnyOrigin],
+    node_tab: MutPointer[Int32, MutAnyOrigin],
     fparams: MutPointer[Float32, MutAnyOrigin],
-    n_slots: Int32,
-    out_index: Int32,
+    record_base: Int32,
+    feat_stride: Int32,
 ):
-    """Fold the per-slot records into one, in ascending slot order, and fill
-    in the child and parent leaf values.
+    """Fold one node's per-slot records into one, in ascending slot order,
+    and fill in the child and parent leaf values.
 
+    One thread per node, launched over the same records the scan covered.
     A single thread walking the slots in order, accepting a new best only on
     a strictly greater gain, is what makes the winner the first candidate of
     the first slot holding the maximum gain: the same rule, in the same
     order, as the host's one loop. No atomics are involved, so the result
-    cannot depend on scheduling."""
-    var lambda_l2 = fparams[unsafe_offset=PF_LAMBDA_L2][0]
-    var lambda_l1 = fparams[unsafe_offset=PF_LAMBDA_L1][0]
-    var oi = Int(out_index) * SPLIT_IWORDS
-    var of = Int(out_index) * SPLIT_FWORDS
+    cannot depend on scheduling, and a batched frontier reduces exactly as a
+    one-node launch does since no node reads another node's slots."""
+    var record = Int(record_base) + Int(block_idx.x)
+    var table = record * Int(feat_stride)
+    var nt = record * NODE_WORDS
+    var n_slots = Int(node_tab[unsafe_offset = nt + NODE_SLOTS][0])
+    var pf = record * PF_WORDS
+    var lambda_l2 = fparams[unsafe_offset = pf + PF_LAMBDA_L2][0]
+    var lambda_l1 = fparams[unsafe_offset = pf + PF_LAMBDA_L1][0]
+    var oi = record * SPLIT_IWORDS
+    var of = record * SPLIT_FWORDS
 
     var best = -1
     var best_gain = Float32(0.0)
-    for s in range(Int(n_slots)):
-        var flags = slot_i[unsafe_offset = s * SPLIT_IWORDS + IREC_FLAGS][0]
+    # The best gain among the slots that did not win, folded together with
+    # the winning slot's own runner-up below. Ties do not move it: a slot
+    # whose gain equals the current best is not the winner and is a genuine
+    # runner-up, which is exactly the case a near-tie test has to see.
+    var runner_gain = Float32(0.0)
+    for s in range(n_slots):
+        var si = (table + s) * SPLIT_IWORDS
+        var sf = (table + s) * SPLIT_FWORDS
+        var flags = slot_i[unsafe_offset = si + IREC_FLAGS][0]
         if (flags & Int32(FLAG_FOUND)) == Int32(0):
             continue
-        var gain = slot_f[unsafe_offset = s * SPLIT_FWORDS + FREC_GAIN][0]
+        var gain = slot_f[unsafe_offset = sf + FREC_GAIN][0]
         if best < 0 or gain > best_gain:
+            if best >= 0 and best_gain > runner_gain:
+                runner_gain = best_gain
             best = s
             best_gain = gain
+        elif gain > runner_gain:
+            runner_gain = gain
 
-    # The parent's totals come from slot 0, which is the feature the host
-    # grower already uses for leaf values (`tree_features[0]`). Every
-    # accumulated feature carries the same totals bit for bit.
-    var total_g = slot_f[unsafe_offset=FREC_TOTAL_GRAD][0]
-    var total_h = slot_f[unsafe_offset=FREC_TOTAL_HESS][0]
-    var total_c = slot_i[unsafe_offset=IREC_TOTAL_COUNT][0]
+    # The parent's totals come from this node's slot 0, which is the feature
+    # the host grower already uses for leaf values (`tree_features[0]`).
+    # Every accumulated feature carries the same totals bit for bit.
+    var zi = table * SPLIT_IWORDS
+    var zf = table * SPLIT_FWORDS
+    var total_g = slot_f[unsafe_offset = zf + FREC_TOTAL_GRAD][0]
+    var total_h = slot_f[unsafe_offset = zf + FREC_TOTAL_HESS][0]
+    var total_c = slot_i[unsafe_offset = zi + IREC_TOTAL_COUNT][0]
 
     if best < 0:
         for i in range(SPLIT_IWORDS):
@@ -710,8 +802,8 @@ def _reduce_slots_kernel(
         )
         return
 
-    var bi = best * SPLIT_IWORDS
-    var bf = best * SPLIT_FWORDS
+    var bi = (table + best) * SPLIT_IWORDS
+    var bf = (table + best) * SPLIT_FWORDS
     for i in range(SPLIT_IWORDS):
         out_i[unsafe_offset = oi + i] = slot_i[unsafe_offset = bi + i][0]
     for i in range(SPLIT_FWORDS):
@@ -723,6 +815,15 @@ def _reduce_slots_kernel(
     out_i[unsafe_offset = oi + IREC_TOTAL_COUNT] = total_c
     out_f[unsafe_offset = of + FREC_TOTAL_GRAD] = total_g
     out_f[unsafe_offset = of + FREC_TOTAL_HESS] = total_h
+
+    # The node's runner-up is the better of the best losing feature and the
+    # winning feature's own second candidate, so the margin a caller tests
+    # covers both ways a decision can be close: two features that scored
+    # nearly the same, and two bins of one feature that did.
+    var own_runner = slot_f[unsafe_offset = bf + FREC_RUNNER_GAIN][0]
+    if own_runner > runner_gain:
+        runner_gain = own_runner
+    out_f[unsafe_offset = of + FREC_RUNNER_GAIN] = runner_gain
 
     var left_g = slot_f[unsafe_offset = bf + FREC_LEFT_GRAD][0]
     var left_h = slot_f[unsafe_offset = bf + FREC_LEFT_HESS][0]

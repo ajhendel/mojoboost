@@ -162,8 +162,6 @@ from .initialization import SessionState, warmup_level_name
 # under their own names would shadow this module's, which is how a report
 # ends up naming a route refusal as the reason a GPU request was denied.
 from .unified_memory_policy import (
-    N_ROLES as N_TRANSFER_ROLES,
-    RouteDecision,
     SessionMemoryPlan,
     block_reason_name as transfer_block_name,
     evidence_name as transfer_evidence_name,
@@ -1620,7 +1618,7 @@ struct DeviceDecision(Copyable, Movable):
         # wants the headline reads `transfer_all_default` and one that wants
         # to explain a per-role fallback reads these.
         for i in range(len(self.capabilities.transfer.decisions)):
-            var d = self.capabilities.transfer.decisions[i]
+            var d = self.capabilities.transfer.decisions[i].copy()
             out += String(
                 "transfer=",
                 transfer_role_name(d.role),

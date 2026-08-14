@@ -60,6 +60,35 @@ nothing.
 No registry call belongs inside a per-row or per-round loop. The trainers
 ask once per run, before the first tree.
 
+The query surface
+-----------------
+Everything a binding, a Python facade, or a device provider needs to ask,
+grouped. Nothing outside this module should answer any of them for itself.
+
+- Identity: `objective_code_from_name`, `objective_canonical_name`,
+  `objective_name_status`, `objective_is_known`, `objective_is_builtin`,
+  `objective_task`, `objective_alias_names`, `all_objective_codes`,
+  and the same five for metrics.
+- Prediction: `objective_link`, `metric_transform`.
+- Parameters: `objective_param`, `objective_param_name`,
+  `objective_default_param`, `objective_param_domain`,
+  `check_objective_param`, `metric_scoring_param`.
+- Derivatives and initialization: `objective_grad_hess_source`,
+  `objective_init_kind`, `objective_renews_leaves`, `objective_needs_groups`.
+- Backends: `objective_backends`, `objective_gradients_on_device`,
+  `check_objective_backend`.
+- Weighting: `objective_class_weight_kind`,
+  `objective_supports_scale_pos_weight`, `check_objective_class_weight`.
+- Metric fit: `objective_default_metric`, `objective_has_default_metric`,
+  `objective_supports_metric`, `check_objective_metric`,
+  `metric_code_for_objective`, `metric_codes_for_task`,
+  `metric_names_for_task`, `metric_higher_is_better`, `metric_needs`.
+- Whole records: `objective_spec`, `metric_spec`.
+
+Each `check_*` raises the sentence a user should read; each predicate is
+silent. A caller that has to build its own message uses the predicate, and a
+caller that is about to refuse uses the check, so the wording lives once.
+
 Temporary mirrors
 -----------------
 Three things below are duplicated from files this lane does not own, so the
@@ -713,9 +742,9 @@ struct ParamDomain(Copyable, Movable):
     var default: Float64
 
     @staticmethod
-    def none() -> Self:
+    def none() -> ParamDomain:
         """The domain of an objective that reads no scalar."""
-        return Self(False, 0.0, False, False, 0.0, False, 0.0)
+        return ParamDomain(False, 0.0, False, False, 0.0, False, 0.0)
 
     def contains(self, value: Float64) -> Bool:
         """Whether `value` lies in the domain. Always True when the
@@ -1449,6 +1478,55 @@ def _metric_param_owner(metric: Int) raises -> Int:
     )
 
 
+def metric_scoring_param(
+    metric: Int, objective: Int, alpha: Float64
+) raises -> Float64:
+    """The scalar a metric should be scored at, given the objective's own.
+
+    Four metrics are a family rather than a function: `quantile` and `huber`
+    read an alpha, `fair` a c, and `tweedie` a variance power. LightGBM
+    scores them at the *objective's* parameter, so a tweedie model scored at
+    a different variance power is scoring a different loss, and this returns
+    that parameter after checking it lies in the objective's domain.
+
+    The awkward case is a metric whose parameter is not the objective's:
+    `tweedie` scoring a huber model, say, where both are regression metrics
+    so the pair is allowed, but the objective's `alpha` of 0.9 is not a
+    variance power and `tweedie_loss` would refuse it. The value is therefore
+    always validated against the domain of the objective the *metric* belongs
+    to, and the mismatch is named rather than left to surface as a metric
+    complaining about a number it was never told the origin of. When the two
+    coincide, which is every default metric and every deliberate pairing, the
+    check is exactly `check_objective_param` on the objective itself.
+
+    Metrics that read no scalar return 0.0, which the fifteen of them ignore.
+    """
+    if metric_needs(metric) & NEEDS_PARAM == 0:
+        return 0.0
+    var owner = _metric_param_owner(metric)
+    if objective_param_domain(owner).contains(alpha):
+        return alpha
+    if owner == objective:
+        # The objective's own parameter is out of its own domain. The
+        # trainer's message is the right one, and it is the only one a user
+        # who set `alpha` themselves should ever see.
+        check_objective_param(objective, alpha)
+    raise Error(
+        "metric '",
+        metric_canonical_name(metric),
+        "' reads ",
+        objective_param_name(owner),
+        " in ",
+        objective_param_domain(owner).describe(),
+        ", but objective '",
+        objective_canonical_name(objective),
+        "' supplies ",
+        alpha,
+        "; score a metric of the objective's own family, or pass the"
+        " metric's parameter explicitly",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Enumeration
 # ---------------------------------------------------------------------------
@@ -1559,6 +1637,14 @@ struct ObjectiveSpec(Copyable, Movable):
     var gradients_on_device: Bool
     var backends: Int
     var builtin: Bool
+    var grad_source: Int
+    var init_kind: Int
+    var class_weight_kind: Int
+    var default_metric: Int
+    """The metric to score when none is named, or -1 for `CUSTOM`, the one
+    objective with no default. A sentinel rather than a raise because this
+    record exists to be marshalled whole, and one objective out of fourteen
+    should not make the record unbuildable."""
 
 
 def objective_spec(objective: Int) raises -> ObjectiveSpec:
@@ -1567,6 +1653,9 @@ def objective_spec(objective: Int) raises -> ObjectiveSpec:
     from."""
     if not objective_is_known(objective):
         raise Error("unknown objective code ", objective)
+    var default_metric = -1
+    if objective_has_default_metric(objective):
+        default_metric = objective_default_metric(objective)
     return ObjectiveSpec(
         objective,
         objective_task(objective),
@@ -1579,6 +1668,10 @@ def objective_spec(objective: Int) raises -> ObjectiveSpec:
         objective_gradients_on_device(objective),
         objective_backends(objective),
         objective_is_builtin(objective),
+        objective_grad_hess_source(objective),
+        objective_init_kind(objective),
+        objective_class_weight_kind(objective),
+        default_metric,
     )
 
 
@@ -1603,53 +1696,4 @@ def metric_spec(metric: Int) raises -> MetricSpec:
         metric_higher_is_better(metric),
         metric_needs(metric),
         metric_transform(metric),
-    )
-
-
-def metric_scoring_param(
-    metric: Int, objective: Int, alpha: Float64
-) raises -> Float64:
-    """The scalar a metric should be scored at, given the objective's own.
-
-    Four metrics are a family rather than a function: `quantile` and `huber`
-    read an alpha, `fair` a c, and `tweedie` a variance power. LightGBM
-    scores them at the *objective's* parameter, so a tweedie model scored at
-    a different variance power is scoring a different loss, and this returns
-    that parameter after checking it lies in the objective's domain.
-
-    The awkward case is a metric whose parameter is not the objective's:
-    `tweedie` scoring a huber model, say, where both are regression metrics
-    so the pair is allowed, but the objective's `alpha` of 0.9 is not a
-    variance power and `tweedie_loss` would refuse it. The value is therefore
-    always validated against the domain of the objective the *metric* belongs
-    to, and the mismatch is named rather than left to surface as a metric
-    complaining about a number it was never told the origin of. When the two
-    coincide, which is every default metric and every deliberate pairing, the
-    check is exactly `check_objective_param` on the objective itself.
-
-    Metrics that read no scalar return 0.0, which the fifteen of them ignore.
-    """
-    if metric_needs(metric) & NEEDS_PARAM == 0:
-        return 0.0
-    var owner = _metric_param_owner(metric)
-    if objective_param_domain(owner).contains(alpha):
-        return alpha
-    if owner == objective:
-        # The objective's own parameter is out of its own domain. The
-        # trainer's message is the right one, and it is the only one a user
-        # who set `alpha` themselves should ever see.
-        check_objective_param(objective, alpha)
-    raise Error(
-        "metric '",
-        metric_canonical_name(metric),
-        "' reads ",
-        objective_param_name(owner),
-        " in ",
-        objective_param_domain(owner).describe(),
-        ", but objective '",
-        objective_canonical_name(objective),
-        "' supplies ",
-        alpha,
-        "; score a metric of the objective's own family, or pass the"
-        " metric's parameter explicitly",
     )

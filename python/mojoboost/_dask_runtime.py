@@ -89,13 +89,15 @@ import os
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from .dask import (
+    BACKEND_PROTOCOL_VERSION,
     CAPABILITIES,
     DistributedNotAvailable,
     DistributedRankError,
     DistributedTimeout,
+    ModelOwnershipError,
     PartitionError,
 )
 
@@ -579,8 +581,6 @@ class NativeDistributedBackend:
 
 def _check_protocol(job):
     version = getattr(job, "protocol_version", None)
-    from .dask import BACKEND_PROTOCOL_VERSION
-
     if version != BACKEND_PROTOCOL_VERSION:
         raise DistributedNotAvailable(
             f"this backend speaks backend protocol "
@@ -618,7 +618,7 @@ class NativeModelRef:
     def result(self, timeout=None):
         """The bytes of rank 0's model, once every rank has finished."""
         if self.released:
-            raise _ownership_error(
+            raise ModelOwnershipError(
                 "this model reference was already released"
             )
         payloads = _await_ranks(
@@ -649,12 +649,6 @@ class NativeModelRef:
         self._backend.forget(self._job_id)
 
 
-def _ownership_error(message):
-    from .dask import ModelOwnershipError
-
-    return ModelOwnershipError(message)
-
-
 # ---------------------------------------------------------------------------
 # Waiting, cancelling, and losing a worker
 # ---------------------------------------------------------------------------
@@ -670,6 +664,13 @@ def _await_ranks(client, futures, plan, job_id, timeout):
     collective is a worker held indefinitely.
     """
     distributed = _import_distributed()
+    # `distributed.wait` raises its own TimeoutError, which is asyncio's,
+    # which is the builtin one only from Python 3.11. Both spellings are
+    # caught so a timeout does not escape as an unrelated error on an
+    # older interpreter.
+    timeouts = tuple(
+        {TimeoutError, getattr(distributed, "TimeoutError", TimeoutError)}
+    )
     pending = list(futures)
     deadline = None if timeout is None else time.monotonic() + timeout
     try:
@@ -681,7 +682,7 @@ def _await_ranks(client, futures, plan, job_id, timeout):
                 done, not_done = distributed.wait(
                     pending, timeout=wait_for, return_when="FIRST_COMPLETED"
                 )
-            except TimeoutError:
+            except timeouts:
                 _cancel_world(client, job_id, futures, plan)
                 raise DistributedTimeout(
                     f"the distributed fit did not finish within {timeout} "
@@ -939,35 +940,34 @@ def _rank_call(job, rank):
     )
 
 
-@dataclass(frozen=True)
-class _RankBlocks:
+def _rank_blocks(client, job, rank):
     """Futures for the blocks one rank owns, in row order.
 
     Futures rather than values: dask resolves them on the worker, and the
     worker is the one already holding them, so the training rows never
     reach the client. That is the whole reason this module submits tasks
     instead of gathering partitions and calling a local fit.
+
+    Plain lists and dicts rather than a dataclass, deliberately. Dask walks
+    lists, tuples, and dicts looking for the futures in a task's arguments
+    and replaces them with their values on the worker; it does not walk
+    into an arbitrary object, so a future hidden inside one would arrive on
+    the worker as a future the rank task would then have to resolve
+    itself, from inside the task that is holding the thread it needs.
     """
-
-    features: tuple = ()
-    labels: tuple = ()
-    weights: tuple = ()
-    validation: tuple = ()  # one _RankBlocks-shaped tuple per eval set
-
-
-def _rank_blocks(client, job, rank):
     plan = job.plan
     parts = [plan.partitions[index] for index in rank.partitions]
-    blocks = _RankBlocks(
-        features=_futures_for(client, [part.key for part in parts]),
-        labels=_futures_for(client, [part.label_key for part in parts]),
-        weights=_futures_for(client, [part.weight_key for part in parts]),
-        validation=tuple(
+    return {
+        "features": _futures_for(client, [part.key for part in parts]),
+        "labels": _futures_for(client, [part.label_key for part in parts]),
+        "weights": _futures_for(
+            client, [part.weight_key for part in parts]
+        ),
+        "validation": [
             _validation_blocks(client, valid, rank)
             for valid in getattr(job, "validation", ())
-        ),
-    )
-    return blocks
+        ],
+    }
 
 
 def _validation_blocks(client, valid, rank):
@@ -981,11 +981,13 @@ def _validation_blocks(client, valid, rank):
     plan = valid.plan
     owned = plan.ranks[rank.rank]
     parts = [plan.partitions[index] for index in owned.partitions]
-    return _RankBlocks(
-        features=_futures_for(client, [part.key for part in parts]),
-        labels=_futures_for(client, [part.label_key for part in parts]),
-        weights=_futures_for(client, [part.weight_key for part in parts]),
-    )
+    return {
+        "features": _futures_for(client, [part.key for part in parts]),
+        "labels": _futures_for(client, [part.label_key for part in parts]),
+        "weights": _futures_for(
+            client, [part.weight_key for part in parts]
+        ),
+    }
 
 
 def _futures_for(client, keys):
@@ -997,7 +999,7 @@ def _futures_for(client, keys):
     """
     keys = list(keys)
     if not keys or all(key is None for key in keys):
-        return ()
+        return []
     if any(key is None for key in keys):
         raise PartitionError(
             "some partitions carry a data key and some do not, so the rank "
@@ -1005,7 +1007,7 @@ def _futures_for(client, keys):
             "metadata bug: report the collection that produced it"
         )
     distributed = _import_distributed()
-    return tuple(distributed.Future(key, client=client) for key in keys)
+    return [distributed.Future(key, client=client) for key in keys]
 
 
 # ---------------------------------------------------------------------------
@@ -1030,7 +1032,6 @@ def _train_rank(rank, launch, call, blocks):
     build has no native runtime it says so here rather than falling back to
     anything.
     """
-    provider, source = _resolve_provider()
     status = native_runtime_status(refresh=True)
     if not status.available:
         raise DistributedNotAvailable(
@@ -1038,9 +1039,10 @@ def _train_rank(rank, launch, call, blocks):
             "mojoboost has a distributed runtime and this worker's does "
             "not, or they are different builds"
         )
+    provider, _ = _resolve_provider()
     from . import _arrays
 
-    features = _concat_blocks(blocks.features, "X", rank)
+    features = _concat_blocks(blocks.get("features"), "X", rank)
     if features is None:
         raise DistributedRankError(
             f"rank {rank} was given no feature partitions"
@@ -1055,7 +1057,7 @@ def _train_rank(rank, launch, call, blocks):
             "that trains on the wrong shape silently corrupts every "
             "reduced histogram"
         )
-    labels = _concat_blocks(blocks.labels, "y", rank)
+    labels = _concat_blocks(blocks.get("labels"), "y", rank)
     if labels is None:
         raise DistributedRankError(
             f"rank {rank} was given no labels; distributed fit needs y "
@@ -1065,13 +1067,13 @@ def _train_rank(rank, launch, call, blocks):
         yb = _encode_labels_through(labels, call.label_classes, n_rows, rank)
     else:
         yb = _arrays.check_target(labels, n_rows)
-    weights = _concat_blocks(blocks.weights, "sample_weight", rank)
+    weights = _concat_blocks(blocks.get("weights"), "sample_weight", rank)
     wb = None if weights is None else _arrays.check_sample_weight(
         weights, n_rows
     )
     valid_buffers = []
     valid_specs = []
-    for index, valid in enumerate(blocks.validation):
+    for index, valid in enumerate(blocks.get("validation") or ()):
         spec, keep = _validation_arrays(
             valid, call, index, n_features, rank, _arrays
         )
@@ -1163,8 +1165,12 @@ def _validation_arrays(valid, call, index, n_features, rank, _arrays):
     their addresses: dropping them before the native call returns would
     hand the trainer freed memory.
     """
-    features = _concat_blocks(valid.features, f"eval_set[{index}] X", rank)
-    labels = _concat_blocks(valid.labels, f"eval_set[{index}] y", rank)
+    features = _concat_blocks(
+        valid.get("features"), f"eval_set[{index}] X", rank
+    )
+    labels = _concat_blocks(
+        valid.get("labels"), f"eval_set[{index}] y", rank
+    )
     if features is None or labels is None:
         raise DistributedRankError(
             f"rank {rank} is missing its rows for eval set {index}; every "
@@ -1182,7 +1188,7 @@ def _validation_arrays(valid, call, index, n_features, rank, _arrays):
         )
     yb = _arrays.check_target(labels, n_rows, name=f"eval_set[{index}] y")
     weights = _concat_blocks(
-        valid.weights, f"eval_set[{index}] weight", rank
+        valid.get("weights"), f"eval_set[{index}] weight", rank
     )
     wb = None if weights is None else _arrays.check_sample_weight(
         weights, n_rows
@@ -1288,13 +1294,14 @@ def _forget_session(job_id):
         _WORKER_SESSIONS.pop(job_id, None)
 
 
-def _cancel_sessions(dask_worker=None, job_id=None):
+def _cancel_sessions(job_id, dask_worker=None):
     """Cancel this worker's session for a job. Runs under `client.run`.
 
-    `client.run` passes `dask_worker` and calls this with whatever extra
-    arguments were given, so the job id is a keyword with a default rather
-    than a positional. Cancelling an unknown job is not an error: a worker
-    that already finished its rank has nothing to cancel.
+    The job id is positional and `dask_worker` is the parameter dask fills
+    in by keyword when a run function asks for it, which is the order
+    `client.run(_cancel_sessions, job_id, workers=...)` produces.
+    Cancelling an unknown job is not an error: a worker that already
+    finished its rank has nothing to cancel.
     """
     with _WORKER_LOCK:
         entry = _WORKER_SESSIONS.get(job_id)
@@ -1316,7 +1323,7 @@ def _concat_blocks(blocks, name, rank):
     partitions are contiguous in it. Anything else would silently permute
     training rows against their labels.
     """
-    parts = [block for block in blocks if block is not None]
+    parts = [block for block in (blocks or ()) if block is not None]
     if not parts:
         return None
     if len(parts) == 1:

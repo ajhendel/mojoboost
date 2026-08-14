@@ -153,13 +153,47 @@ from .boosting import (
     renewal_weights,
 )
 from .goss import GossParams, GossSelection, apply_goss_scaling, goss_round
+from .metrics import (
+    METRIC_MAP,
+    METRIC_MULTI_ERROR,
+    METRIC_MULTI_LOGLOSS,
+    METRIC_NDCG,
+    eval_metric_by_code,
+    multiclass_error,
+    multiclass_log_loss,
+)
 from .model import Model, MulticlassModel
 from .objective import (
     GradHessFn,
     _apply_sample_weight,
     check_custom_grad_hess,
 )
+from .objective_registry import (
+    LINK_EXP,
+    LINK_IDENTITY,
+    LINK_SIGMOID,
+    LINK_SOFTMAX,
+    MULTICLASS,
+    NEEDS_CUTOFF,
+    NEEDS_GROUPS,
+    NEEDS_N_CLASSES,
+    TRANSFORM_OBJECTIVE_LINK,
+    TRANSFORM_RAW,
+    TRANSFORM_SOFTMAX,
+    check_objective_metric,
+    metric_canonical_name,
+    metric_code_for_objective,
+    metric_higher_is_better,
+    metric_is_builtin,
+    metric_needs,
+    metric_scoring_param,
+    metric_transform,
+    objective_canonical_name,
+    objective_default_metric,
+    objective_link,
+)
 from .ranking import (
+    DEFAULT_NDCG_EVAL_AT,
     LAMBDARANK,
     RankGroups,
     RankerParams,
@@ -171,6 +205,8 @@ from .ranking import (
     check_labels,
     check_ranker_params,
     groups_from_counts,
+    mean_average_precision,
+    ndcg,
 )
 from .tree import Tree, grow_tree
 
@@ -373,7 +409,7 @@ struct MetricFitResult(Copyable, Movable):
     var stopped_early: Bool
 
 
-def response_scale(objective: Int, raw: List[Float64]) -> List[Float64]:
+def response_scale(objective: Int, raw: List[Float64]) raises -> List[Float64]:
     """Apply an objective's inverse link to raw scores: the sigmoid for
     BINARY_LOGISTIC and CROSS_ENTROPY, exp for POISSON, GAMMA, and TWEEDIE,
     identity otherwise (including CUSTOM, whose link the framework does not
@@ -384,17 +420,39 @@ def response_scale(objective: Int, raw: List[Float64]) -> List[Float64]:
     expected values the poisson, gamma, and tweedie metrics want. It applies
     the same links `Booster.response` does, so a metric sees exactly what a
     prediction would return.
+
+    Which link belongs to which objective is `objective_link` in
+    objective_registry.mojo and is not decided here. It used to be: this
+    function, `Booster.response`, and `response_for_objective` in
+    gpu_predict.mojo each carried the same list of objective codes, agreeing
+    by inspection. Reading the answer from the registry is what makes them
+    unable to stop agreeing.
+
+    `LINK_SOFTMAX` raises rather than returning something: a softmax is not a
+    per-row map, so a multiclass raw vector cannot be converted one element
+    at a time. `eval_builtin_metric` handles the multiclass metrics on
+    row-major blocks instead, and `_softmax_inplace` is the call that does
+    it.
     """
+    var link = objective_link(objective)
     var out = List[Float64](capacity=len(raw))
-    if objective == BINARY_LOGISTIC or objective == CROSS_ENTROPY:
+    if link == LINK_SIGMOID:
         for r in range(len(raw)):
             out.append(_sigmoid(raw[r]))
-    elif objective == POISSON or objective == GAMMA or objective == TWEEDIE:
+    elif link == LINK_EXP:
         for r in range(len(raw)):
             out.append(exp(raw[r]))
-    else:
+    elif link == LINK_IDENTITY:
         for r in range(len(raw)):
             out.append(raw[r])
+    else:
+        raise Error(
+            "objective '",
+            objective_canonical_name(objective),
+            "' has a softmax link, which is not a per-row transform; score"
+            " its raw scores with eval_builtin_metric, which takes the"
+            " softmax of each row",
+        )
     return out^
 
 

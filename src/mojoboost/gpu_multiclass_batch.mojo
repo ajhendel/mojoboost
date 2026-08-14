@@ -37,10 +37,28 @@ at once, without changing a single number the sequential path produces.
     `GpuClassBatch`                the buffers those kernels read and write,
                                    allocated once per session for a batch
                                    capacity, plus the per-class fixed-point
-                                   scales and the histogram extraction.
+                                   scales and the histogram extraction. Its
+                                   `enqueue_level_histogram` is the one call
+                                   a grower makes per level: it picks between
+                                   the two kernels from the level's
+                                   `BatchEligibility` and takes its row tile
+                                   from `gpu_tiling`'s policy rather than
+                                   from a caller's guess.
     `MulticlassRoundGuard`         host-side bookkeeping that refuses any
                                    ordering which would break the softmax
                                    contract below. No device state.
+
+Where the batch size and the group size come from
+-------------------------------------------------
+Neither is decided here. `gpu_output_planes.plan_class_batches` decides how
+many classes may be resident and how many share a threadgroup, and
+`apple_histogram_policy.plan_class_schedule` runs it from a resolved launch
+geometry so the two halves agree; this module allocates for the plan
+(`GpuClassBatch.for_plan`), drives it (`MulticlassRoundGuard.note_batch`),
+and refuses anything the kernels cannot actually do. Its default is the
+schedule's default, which is the sequential path: one class at a time,
+exactly what the trainer does today, until a caller or
+`MOJOBOOST_GPU_CLASS_BATCH` asks for more.
 
 Softmax semantics, preserved exactly
 ------------------------------------
@@ -120,11 +138,19 @@ from .gpu_objectives_native import (
 from .gpu_output_planes import (
     MAX_BINS,
     SHARED_CLASS_CAP,
+    BatchEligibility,
     ClassBatchPlan,
     class_major_index,
     row_major_index,
 )
-from .gpu_tiling import DeviceCaps, derive_block_threads, query_device_caps
+from .gpu_tiling import (
+    STRATEGY_ATOMIC,
+    DeviceCaps,
+    HistogramTiling,
+    derive_block_threads,
+    derive_tiling,
+    query_device_caps,
+)
 from .histogram import Histogram, _zeroed_f64, _zeroed_int
 
 # Row indices cross into the kernels as Int32, as everywhere else on the
@@ -285,6 +311,8 @@ def _batch_hist_shared_kernel(
     rows_per_tile: Int32,
     begin: Int32,
     count: Int32,
+    slot_begin: Int32,
+    write_counts: Int32,
 ):
     """The batched histogram for a row window every class in the batch
     shares: one bin read serves `k_count` classes.
@@ -312,6 +340,16 @@ def _batch_hist_shared_kernel(
     `k_count`, so a short final batch writes the same slots a full one
     would: grad of slot `c` at `c * hist_size`, hess at
     `(cap + c) * hist_size`, and the shared counts at `2 * cap * hist_size`.
+
+    `slot_begin` offsets the group of classes this launch carries within the
+    batch, and `k_count` is the size of that group rather than of the batch.
+    Threadgroup memory holds `SHARED_CLASS_CAP` classes, so a batch wider
+    than that shares its bin reads in groups of at most that many, one launch
+    each, which is the count `ClassBatchPlan.bin_passes_per_round` reports.
+    Every group scans the same rows, so exactly one of them may write the
+    batch's single count plane: `write_counts` is nonzero for the first and
+    zero for the rest. The bin's local count is still accumulated in every
+    group, because it is what says which bins a flush may skip.
     """
     var f = Int(feat_ids[unsafe_offset = Int(block_idx.x)][0])
     var tid = thread_idx.x
@@ -351,24 +389,27 @@ def _batch_hist_shared_kernel(
         tile_end = n
 
     var col = f * nr
+    var s0 = Int(slot_begin)
     var j = tile_begin + tid
     while j < tile_end:
         var r = Int(rows[unsafe_offset = Int(begin) + j][0])
-        # The one bin read the whole batch shares. Everything below reuses
-        # it; a sequential run would have issued this load once per class.
+        # The one bin read this group of classes shares. Everything below
+        # reuses it; a sequential run would have issued this load once per
+        # class.
         var bin = Int(bins[unsafe_offset = col + r])
         _ = Atomic.fetch_add(sc.unsafe_offset(bin), Int32(1))
         for c in range(kc):
+            var slot = s0 + c
             var gq = Int32(
                 round(
-                    grad[unsafe_offset = c * nr + r][0]
-                    * scales[unsafe_offset=c][0]
+                    grad[unsafe_offset = slot * nr + r][0]
+                    * scales[unsafe_offset=slot][0]
                 )
             )
             var hq = Int32(
                 round(
-                    hess[unsafe_offset = c * nr + r][0]
-                    * scales[unsafe_offset = Int(cap) + c][0]
+                    hess[unsafe_offset = slot * nr + r][0]
+                    * scales[unsafe_offset = Int(cap) + slot][0]
                 )
             )
             _ = Atomic.fetch_add(sg.unsafe_offset(c * nb + bin), gq)
@@ -382,18 +423,20 @@ def _batch_hist_shared_kernel(
         var bi = Int(b)
         if sc[unsafe_offset=bi][0] != 0:
             for c in range(kc):
+                var slot = s0 + c
                 _ = Atomic.fetch_add(
-                    out_hist.unsafe_offset(c * hs + base + bi),
+                    out_hist.unsafe_offset(slot * hs + base + bi),
                     sg[unsafe_offset = c * nb + bi][0],
                 )
                 _ = Atomic.fetch_add(
-                    out_hist.unsafe_offset((Int(cap) + c) * hs + base + bi),
+                    out_hist.unsafe_offset((Int(cap) + slot) * hs + base + bi),
                     sh[unsafe_offset = c * nb + bi][0],
                 )
-            _ = Atomic.fetch_add(
-                out_hist.unsafe_offset(2 * Int(cap) * hs + base + bi),
-                sc[unsafe_offset=bi][0],
-            )
+            if write_counts != 0:
+                _ = Atomic.fetch_add(
+                    out_hist.unsafe_offset(2 * Int(cap) * hs + base + bi),
+                    sc[unsafe_offset=bi][0],
+                )
         b += block_dim.x
 
 
@@ -507,6 +550,37 @@ def _batch_hist_ranges_kernel(
 
 
 # ---------------------------------------------------------------------------
+# What the kernels above statically occupy
+# ---------------------------------------------------------------------------
+
+# Int32 planes, which is what both kernels allocate their threadgroup
+# histograms in.
+comptime BYTES_PER_SHARED_CELL = 4
+
+
+def batched_shared_bytes() -> Int:
+    """Threadgroup memory one block of `_batch_hist_shared_kernel` occupies.
+
+    Statically `SHARED_CLASS_CAP` gradient planes, `SHARED_CLASS_CAP` hessian
+    planes, and one count plane, each `MAX_BINS` wide, whatever `n_bins` and
+    `k_count` are at runtime. Reported rather than modeled from the bin
+    count, because it is the allocation that has to fit and a device that
+    advertises less cannot run this kernel at any batch size.
+    """
+    return (
+        2 * SHARED_CLASS_CAP * MAX_BINS + MAX_BINS
+    ) * BYTES_PER_SHARED_CELL
+
+
+def ranged_shared_bytes() -> Int:
+    """Threadgroup memory one block of `_batch_hist_ranges_kernel` occupies:
+    one gradient, one hessian, and one count plane, `MAX_BINS` wide. The same
+    footprint as the single-class path, because this kernel puts the class in
+    `grid.x` rather than in threadgroup memory."""
+    return 3 * MAX_BINS * BYTES_PER_SHARED_CELL
+
+
+# ---------------------------------------------------------------------------
 # The round's synchronization contract
 # ---------------------------------------------------------------------------
 
@@ -542,6 +616,13 @@ struct MulticlassRoundGuard(Copyable, Movable):
     var tree_done: List[Bool]
     var committed: List[Bool]
     var rounds_closed: Int
+    var next_batch: Int
+    """The batch index `note_batch` will accept next. Batches of a plan are
+    contiguous ascending runs, and consuming them in that order is what makes
+    "collect by ascending slot" the same thing as "collect by ascending
+    class"; taking them out of order would still produce correct trees but
+    would silently break that identity, so it is refused rather than
+    documented."""
 
     def __init__(out self, n_classes: Int) raises:
         if n_classes < 2:
@@ -555,6 +636,7 @@ struct MulticlassRoundGuard(Copyable, Movable):
             self.tree_done.append(False)
             self.committed.append(False)
         self.rounds_closed = 0
+        self.next_batch = 0
 
     def open_round(mut self) raises:
         """Start a round. Refuses to open while any class of the previous
@@ -574,6 +656,7 @@ struct MulticlassRoundGuard(Copyable, Movable):
             self.committed[k] = False
         self.phase = ROUND_OPEN
         self.probs_fresh = False
+        self.next_batch = 0
 
     def note_probs(mut self) raises:
         """Record the round's one `refresh_softmax`."""
@@ -601,6 +684,32 @@ struct MulticlassRoundGuard(Copyable, Movable):
             raise Error("a gradient batch must cover at least one class")
         if k_begin < 0 or k_begin + k_count > self.n_classes:
             raise Error("gradient batch is outside the class range")
+
+    def note_batch(mut self, plan: ClassBatchPlan, b: Int) raises:
+        """Record a batched gradient fill for batch `b` of `plan`, in the
+        plan's own order.
+
+        The connective form of `note_gradients`: the class range comes from
+        `ClassBatchPlan.batch_begin`/`batch_count` rather than from a caller
+        that recomputed it, and the batches must arrive ascending and
+        without gaps, which is what the plan means by a partition. A caller
+        driving the round from a plan cannot then produce a class ordering
+        the ensemble's round-major layout does not expect.
+        """
+        if plan.n_classes != self.n_classes:
+            raise Error(
+                "the class batch plan and the round guard disagree on the"
+                " class count"
+            )
+        plan.check()
+        if b != self.next_batch:
+            raise Error(
+                "class batches are consumed in the plan's ascending order;"
+                " out-of-order batches would break the identity between"
+                " ascending slot and ascending class"
+            )
+        self.note_gradients(plan.batch_begin(b), plan.batch_count(b))
+        self.next_batch = b + 1
 
     def note_tree(mut self, k: Int) raises:
         """Record that class `k`'s tree of this round finished growing."""
@@ -694,6 +803,10 @@ struct GpuClassBatch(Movable):
     """
 
     var ctx: DeviceContext
+    var caps: DeviceCaps
+    """The device properties this batch's launches are planned from. Held so
+    `plan_geometry` derives a row tile from the same policy every other
+    histogram launch uses, instead of a caller inventing one."""
     var grad_dev: DeviceBuffer[DType.float32]
     """Class-major gradients, `grad[slot * n_rows + r]`."""
     var hess_dev: DeviceBuffer[DType.float32]
@@ -755,8 +868,21 @@ struct GpuClassBatch(Movable):
             raise Error("GPU backend supports at most 256 bins")
         if cap < 1:
             raise Error("class batch capacity must be positive")
+        if shared_counts and (
+            batched_shared_bytes() > caps.max_shared_memory_per_block
+        ):
+            # A shared-count output exists to be written by the batched
+            # shared-row kernel, and that kernel's threadgroup allocation is
+            # static. A device that cannot hold it cannot run this batch at
+            # any size, so it is refused here rather than at the launch.
+            raise Error(
+                "device threadgroup memory too small for the batched shared"
+                " histogram kernel; allocate the batch with shared_counts"
+                " False and use the ranged path"
+            )
 
         self.ctx = ctx
+        self.caps = caps
         self.n_rows = n_rows
         self.n_features = n_features
         self.n_bins = n_bins
@@ -853,6 +979,35 @@ struct GpuClassBatch(Movable):
         buffer reads this batch's slot by starting here, because the plane is
         class-major and therefore contiguous."""
         return class_major_index(0, slot, self.n_rows)
+
+    def supports_shared_bin_reads(self) -> Bool:
+        """Whether this device can run the batched shared-row kernel at all.
+        False only on a device advertising less threadgroup memory than that
+        kernel statically allocates; the ranged path still runs there."""
+        return batched_shared_bytes() <= self.caps.max_shared_memory_per_block
+
+    def plan_geometry(self, node_rows: Int) raises -> HistogramTiling:
+        """The launch geometry for a node of `node_rows` rows, from the same
+        policy every other histogram launch uses.
+
+        `gpu_tiling.derive_tiling` over this batch's own shape: the active
+        feature count is `grid.x`, the row tile is `grid.y`, and the block
+        width is the one this batch was constructed with. The strategy is
+        pinned to `STRATEGY_ATOMIC` because both batched kernels accumulate
+        with atomics and allocate no partial buffer, so a tiled geometry
+        would budget memory this path never uses; the resulting tile count is
+        therefore bounded by occupancy and row amortization only.
+
+        An empty node plans at one row, matching `GpuActiveRows.range_tiling`
+        and `apple_histogram_policy.derive_histogram_plan`, so a node that
+        owns nothing still yields a launchable geometry.
+        """
+        var rows = node_rows
+        if rows < 1:
+            rows = 1
+        return derive_tiling(
+            self.caps, rows, self.n_slots, self.n_bins, STRATEGY_ATOMIC
+        )
 
     def _row_blocks(self) -> Int:
         return (
@@ -1085,6 +1240,55 @@ struct GpuClassBatch(Movable):
         by the same `k_count` this path is trying to make affordable. Both
         strategies produce identical integer histograms anyway, so this is a
         cost choice and not a semantic one.
+
+        The whole-batch case of `enqueue_shared_groups`, which is the general
+        form: it is this call with a group size equal to the batch, and it is
+        the only form available when the batch is no wider than a
+        threadgroup can hold.
+        """
+        if k_count > SHARED_CLASS_CAP:
+            raise Error(
+                "more classes share a threadgroup than the batched shared"
+                " histogram kernel allocates for; see SHARED_CLASS_CAP"
+            )
+        self.enqueue_shared_groups(
+            bins, rows, begin, count, k_count, k_count, rows_per_tile
+        )
+
+    def enqueue_shared_groups[
+        bins_origin: MutOrigin,
+        rows_origin: MutOrigin, //,
+    ](
+        mut self,
+        bins: MutPointer[UInt8, bins_origin],
+        rows: MutPointer[Int32, rows_origin],
+        begin: Int,
+        count: Int,
+        k_count: Int,
+        per_block: Int,
+        rows_per_tile: Int,
+    ) raises:
+        """Histogram `k_count` classes over one shared row window, sharing
+        each bin read across `per_block` classes at a time.
+
+        A threadgroup holds `SHARED_CLASS_CAP` classes' partial histograms,
+        so a batch wider than that cannot share every read in one launch. It
+        shares them in groups instead: `ceil(k_count / per_block)` launches,
+        each carrying a contiguous ascending run of slots, which is exactly
+        the bin-pass count `ClassBatchPlan.bin_passes_per_round` reports for a
+        plan whose `per_block` this is.
+
+        The output is zeroed once, before the first group, and the batch's
+        single count plane is written by the first group only: every group
+        scans the same rows, so a count accumulated per group would be the
+        row count times the number of groups. Slots outside `k_count` are
+        left untouched, as in every other enqueue here.
+
+        Grouping changes no cell. A class's gradients, its own fixed-point
+        scale, and the integer bin it lands in do not depend on which launch
+        carried it, and integer addition is associative, so the histogram of
+        slot `s` is the same whether it shared a threadgroup with three other
+        classes or with none.
         """
         if not self.has_gradients:
             raise Error("fill the batch's gradients before histogramming")
@@ -1092,10 +1296,17 @@ struct GpuClassBatch(Movable):
             raise Error("refresh the batch's scales before histogramming")
         if k_count < 1 or k_count > self.cap:
             raise Error("class batch size out of range")
-        if k_count > SHARED_CLASS_CAP:
+        if per_block < 1 or per_block > k_count:
+            raise Error("classes per threadgroup out of range")
+        if per_block > SHARED_CLASS_CAP:
             raise Error(
                 "more classes share a threadgroup than the batched shared"
                 " histogram kernel allocates for; see SHARED_CLASS_CAP"
+            )
+        if not self.supports_shared_bin_reads():
+            raise Error(
+                "device threadgroup memory too small for the batched shared"
+                " histogram kernel; use the ranged path"
             )
         if begin < 0 or count < 0 or begin + count > self.n_rows:
             raise Error("row window runs past the row buffer")
@@ -1107,25 +1318,33 @@ struct GpuClassBatch(Movable):
         if count == 0:
             return
         var n_tiles = (count + rows_per_tile - 1) // rows_per_tile
-        self.ctx.enqueue_function[_batch_hist_shared_kernel](
-            bins,
-            rows,
-            self.grad_dev.unsafe_ptr(),
-            self.hess_dev.unsafe_ptr(),
-            self.feat_dev.unsafe_ptr(),
-            self.scale_dev.unsafe_ptr(),
-            self.out_dev.unsafe_ptr(),
-            Int32(self.n_rows),
-            Int32(self.n_bins),
-            Int32(self.hist_size()),
-            Int32(self.cap),
-            Int32(k_count),
-            Int32(rows_per_tile),
-            Int32(begin),
-            Int32(count),
-            grid_dim=(self.n_slots, n_tiles),
-            block_dim=self.block_threads,
-        )
+        var slot = 0
+        while slot < k_count:
+            var group = per_block
+            if slot + group > k_count:
+                group = k_count - slot
+            self.ctx.enqueue_function[_batch_hist_shared_kernel](
+                bins,
+                rows,
+                self.grad_dev.unsafe_ptr(),
+                self.hess_dev.unsafe_ptr(),
+                self.feat_dev.unsafe_ptr(),
+                self.scale_dev.unsafe_ptr(),
+                self.out_dev.unsafe_ptr(),
+                Int32(self.n_rows),
+                Int32(self.n_bins),
+                Int32(self.hist_size()),
+                Int32(self.cap),
+                Int32(group),
+                Int32(rows_per_tile),
+                Int32(begin),
+                Int32(count),
+                Int32(slot),
+                Int32(1) if slot == 0 else Int32(0),
+                grid_dim=(self.n_slots, n_tiles),
+                block_dim=self.block_threads,
+            )
+            slot += group
 
     def enqueue_ranged_histogram[
         bins_origin: MutOrigin,
@@ -1198,6 +1417,85 @@ struct GpuClassBatch(Movable):
             grid_dim=(self.n_slots * k_count, n_tiles),
             block_dim=self.block_threads,
         )
+
+    def enqueue_level_histogram[
+        bins_origin: MutOrigin,
+        rows_origin: MutOrigin, //,
+    ](
+        mut self,
+        bins: MutPointer[UInt8, bins_origin],
+        rows: MutPointer[Int32, rows_origin],
+        eligibility: BatchEligibility,
+        k_count: Int,
+        per_block: Int,
+        begin: Int,
+        count: Int,
+        rows_stride: Int,
+        max_count: Int,
+        rows_per_tile: Int = 0,
+    ) raises -> Bool:
+        """Histogram one level of a round for the whole batch, sharing bin
+        reads exactly when the caller's state says they may be shared.
+
+        The one entry point a grower needs per level, and the only place the
+        choice between the two batched kernels is made. It is made from
+        `BatchEligibility`, which is a record of what the classes actually
+        share -- the same rows in the same order, and the same feature set in
+        the same slot order -- and not from which method a caller reached
+        for. `BatchEligibility.round_root` is true of a round's root because
+        the round draws its bag before any class's tree;
+        `BatchEligibility.deeper_node` is false of everything below, where
+        each class has chosen its own split.
+
+        Which arguments matter depends on that decision, and both sets are
+        taken so the caller does not have to know in advance:
+
+        - shared: `begin` and `count` are the one row window every class
+          reads, and `per_block` is how many classes share a threadgroup.
+        - ranged: the per-class windows come from `set_windows`, `max_count`
+          is the largest of them, and `rows_stride` is `n_rows` when each
+          class owns a permutation or 0 when they share one.
+
+        `rows_per_tile` of 0 derives the row tile from `plan_geometry`, which
+        is `gpu_tiling`'s policy over this batch's shape. A positive value
+        pins it, for a benchmark that must hold the geometry fixed.
+
+        Returns whether bin reads were shared, so a caller can report what it
+        got rather than what it asked for.
+
+        A batch allocated with `shared_counts` True has one count plane for
+        the whole batch and so cannot take the ranged path; reaching this
+        with an ineligible level on such a batch raises rather than writing
+        counts that belong to another class. A session that needs both levels
+        allocates the `3 * cap` form, which either kernel can write.
+        """
+        if k_count < 1 or k_count > self.cap:
+            raise Error("class batch size out of range")
+        var share = (
+            eligibility.bin_reads_shared()
+            and per_block > 1
+            and self.supports_shared_bin_reads()
+        )
+        if share:
+            var group = per_block
+            if group > SHARED_CLASS_CAP:
+                group = SHARED_CLASS_CAP
+            if group > k_count:
+                group = k_count
+            var tile = rows_per_tile
+            if tile < 1:
+                tile = self.plan_geometry(count).rows_per_tile
+            self.enqueue_shared_groups(
+                bins, rows, begin, count, k_count, group, tile
+            )
+            return True
+        var ranged_tile = rows_per_tile
+        if ranged_tile < 1:
+            ranged_tile = self.plan_geometry(max_count).rows_per_tile
+        self.enqueue_ranged_histogram(
+            bins, rows, k_count, rows_stride, max_count, ranged_tile
+        )
+        return False
 
     def download(mut self) raises:
         """Copy the batched histogram into pinned host memory and wait. One

@@ -10,21 +10,32 @@ requires, assigns ranks to workers, hands the result to a *backend*, and
 turns the model that comes back into an ordinary fitted mojoboost
 estimator. It does not implement a transport, and it does not train.
 
-Nothing here trains a model today
----------------------------------
+Where the training actually happens
+-----------------------------------
 
-The transport lives elsewhere (src/mojoboost/distributed_transport.mojo,
-in flight while this was written), and no backend is registered by default.
-`DaskMojoBoostRegressor(...).fit(...)` therefore raises
-`DistributedNotAvailable` before it touches the cluster, and every claim
-below about what happens after `backend.train` describes a contract this
-module upholds on its side, not a distributed run anyone has observed. The
-one path that has been exercised is the one the tests exercise: metadata
-validation, the rank plan, capability negotiation, model ownership, and
-partition-local prediction, all against a fake backend and a fake runtime.
+`mojoboost/_dask_runtime.py` is the one backend this package ships. It
+finds the native distributed runtime in the extension module, launches one
+rank per worker with the partitions left where dask put them, and hands
+rank 0's model bytes back through the protocol below. `get_backend()` falls
+back to it when nothing else is registered, so a build whose extension
+exports the runtime trains through Mojo with no registration step, and a
+build whose extension does not says exactly which entry points are missing.
 
-`DaskRuntime`, the only code here that calls dask, has never been run
-against a live cluster. Read it as a proposal.
+Today every published build is the second kind: the transport in
+src/mojoboost/distributed_transport.mojo has no socket endpoint, so
+`DaskMojoBoostRegressor(...).fit(...)` raises `DistributedNotAvailable`
+before it touches the cluster, naming what is absent.
+
+Nothing in this module ever trains, in any state. It validates, plans,
+negotiates, and reassembles; when there is no backend it refuses. It does
+not fit on the client, and it does not fit rank by rank and average, which
+would be a different algorithm under this one's name.
+
+What has been exercised is what the tests exercise: metadata validation,
+the rank plan, capability negotiation, model ownership, and partition-local
+prediction, against a fake backend and a fake runtime. `DaskRuntime` and
+the launch path in `_dask_runtime` have never been run against a live
+cluster. Read them as proposals.
 
 Optional, and import safe
 -------------------------
@@ -62,8 +73,16 @@ is being built at the same time. A backend is any object with:
 
 `job` is a `TrainingJob`: a `WorldPlan` (ranks, workers, row offsets, the
 column schema), the objective name, the estimator's hyperparameters under
-their LightGBM spellings, the global class labels for a classifier, and a
-timeout. A backend reads it and never mutates it; every field is frozen.
+their LightGBM spellings, the global class labels for a classifier, the
+validation plans and early stopping settings, and a timeout. A backend
+reads it and never mutates it; every field is frozen.
+
+Three members are optional, called through `getattr` so a backend written
+against version 0 still works:
+
+    backend.bind_runtime(runtime)   before train, to reach the cluster
+    backend.cancel(job)             when the caller interrupts a fit
+    ref.metrics()                   the validation history rank 0 reported
 
 The model reference is any object with:
 
@@ -134,6 +153,8 @@ __all__ = [
     "CategoricalSchema",
     "DaskRuntime",
     "DistributedNotAvailable",
+    "DistributedRankError",
+    "DistributedTimeout",
     "ModelOwnershipError",
     "PartitionError",
     "PartitionMeta",
@@ -141,11 +162,13 @@ __all__ = [
     "SchemaError",
     "TrainingJob",
     "UnsupportedByBackend",
+    "ValidationPlan",
     "WorldPlan",
     "backend_registered",
     "clear_backend",
     "clear_model_cache",
     "dask_available",
+    "distributed_status",
     "get_backend",
     "is_dask_collection",
     "merge_categorical_schema",
@@ -216,6 +239,21 @@ class UnsupportedByBackend(RuntimeError):
 class ModelOwnershipError(RuntimeError):
     """A model reference did not behave the way the protocol requires: no
     bytes, the wrong type, or a use after release."""
+
+
+class DistributedRankError(RuntimeError):
+    """One rank of a running fit failed, so the whole fit was cancelled.
+
+    A worker that dies mid-fit, a rank whose build has no native runtime,
+    and a rank whose rows do not match the plan all arrive here. There is
+    no partial model to recover: every other rank is waiting inside a
+    collective the dead one will never answer, and the client cancels them
+    rather than leaving them there.
+    """
+
+
+class DistributedTimeout(DistributedRankError):
+    """A fit ran past `timeout` seconds and every rank was cancelled."""
 
 
 # ---------------------------------------------------------------------------
@@ -684,6 +722,22 @@ def plan_world(partitions, one_rank_per_worker=True):
 
 
 @dataclass(frozen=True)
+class ValidationPlan:
+    """One eval set, planned onto the same ranks as the training data.
+
+    `plan` is a full `WorldPlan` over the validation collection, and its
+    rank `r` is required to sit on the same worker as training rank `r`.
+    That is what lets a rank score its own validation rows and contribute
+    them to the reduction without any validation row moving between
+    workers, and it is checked on the client (`_plan_validation`) rather
+    than discovered by a backend halfway through round one.
+    """
+
+    name: str
+    plan: WorldPlan
+
+
+@dataclass(frozen=True)
 class TrainingJob:
     """Everything a backend needs to run one distributed fit.
 
@@ -691,6 +745,13 @@ class TrainingJob:
     dataclass, so a backend can hold on to it, ship it, or log it without
     the client and the workers disagreeing about it later. `params` is a
     plain dict by necessity and is not to be mutated.
+
+    `validation`, `eval_metrics`, `early_stopping_rounds`, and
+    `first_metric_only` are empty or zero for a fit with no eval set, which
+    is what a version 0 backend written before they existed sees. A backend
+    that declares the `early_stopping` capability reduces each eval set's
+    metric across ranks every round and reports the history back through
+    `ref.metrics()`.
     """
 
     plan: WorldPlan
@@ -699,6 +760,10 @@ class TrainingJob:
     label_classes: tuple = None
     ranking: bool = False
     timeout: float = None
+    validation: tuple = ()
+    eval_metrics: tuple = ()
+    early_stopping_rounds: int = 0
+    first_metric_only: bool = False
     protocol_version: int = BACKEND_PROTOCOL_VERSION
 
 
@@ -815,28 +880,50 @@ def _check_backend(backend):
 
 def get_backend():
     """The distributed backend, or a `DistributedNotAvailable` explaining
-    that distributed training is not wired up yet.
+    precisely why there is none.
 
     Resolution order: whatever `register_backend` installed, then the
     `MOJOBOOST_DASK_BACKEND` environment variable as
-    `package.module:attribute`, for a worker or a notebook that cannot call
-    `register_backend` itself. There is no default: nothing in mojoboost
-    ships a transport today.
+    `package.module:attribute`, then the native runtime this package ships
+    (`mojoboost/_dask_runtime.py`), which is used with no registration step
+    on a build whose extension module exports it.
+
+    The native probe is the last step rather than the first so that a
+    registered backend always wins, which is what makes the fake backend in
+    the tests and a third-party transport possible on a build that has its
+    own.
     """
     if _BACKEND is not None:
         return _BACKEND
     spec = os.environ.get("MOJOBOOST_DASK_BACKEND", "").strip()
     if spec:
         return _resolve_backend_spec(spec)
+    from . import _dask_runtime
+
+    status = _dask_runtime.native_runtime_status()
+    if status.available:
+        return _check_backend(_dask_runtime.native_backend())
     raise DistributedNotAvailable(
-        "no distributed backend is registered, so mojoboost cannot train "
-        "across a Dask cluster. The transport is not finished; this module "
-        "is the client-side contract for it. Register one with "
-        "mojoboost.dask.register_backend(...) or name one in "
-        "MOJOBOOST_DASK_BACKEND as 'package.module:attribute'. Train on one "
-        "machine with MojoBoostRegressor, MojoBoostClassifier, or "
-        "MojoBoostRanker meanwhile"
+        "mojoboost cannot train across a Dask cluster on this "
+        f"installation: {status.reason}. No backend is registered either. "
+        "Register one with mojoboost.dask.register_backend(...) or name "
+        "one in MOJOBOOST_DASK_BACKEND as 'package.module:attribute'. "
+        "Train on one machine with MojoBoostRegressor, "
+        "MojoBoostClassifier, or MojoBoostRanker meanwhile"
     )
+
+
+def distributed_status():
+    """What the native distributed runtime reports about itself.
+
+    A `RuntimeStatus`: whether a cluster fit is possible, the reason when
+    it is not, the capabilities the runtime declares, and the transport's
+    name. Safe to call anywhere, including with no cluster and no dask
+    installed; it never raises and never imports dask.
+    """
+    from . import _dask_runtime
+
+    return _dask_runtime.native_runtime_status()
 
 
 def _resolve_backend_spec(spec):

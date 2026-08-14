@@ -58,10 +58,20 @@ device-to-host wait to happen before anything else in the round can be
 enqueued. Split, the caller can enqueue every launch that does not depend
 on the scale (seeding the root permutation, in the trainer) ahead of the
 wait, so that work executes while the host is blocked instead of after it.
-The reduction itself is the same grid-stride over the same fixed block
-count with the same shared-memory tree, so the partials, their host-side
-Float64 total, and every scale and histogram derived from them are
-bit-identical to what the unsplit call produces.
+The reduction is literally the same launch: both halves call
+`enqueue_abs_sum` and `sum_abs_partials` in gpu_objectives_native.mojo, so
+the partials, their host-side Float64 total, and every scale and histogram
+derived from them are the unsplit call's, not a copy of the kernel kept in
+step by hand. (An earlier draft of this module did carry that copy,
+`_magnitude_partials_kernel`, and said so; the fused version deletes it.)
+
+`GpuDeviceRound` is the staged interface the trainer consumes. It owns the
+magnitude reader and the tree router, borrows the objective state, the row
+selection, and the histogram builder's buffers, and enforces the one
+correct stage order (gradients, ranking if the sampler needs one,
+compensation, magnitudes, scales, raw-score update). It is a sequencer,
+not a second trainer: every stage delegates to the function or kernel that
+already owns that step.
 
 The round drivers below then sequence a round start in the one order that
 is correct under sampling: gradients, then compensation, then magnitudes.

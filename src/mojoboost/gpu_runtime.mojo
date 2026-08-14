@@ -58,6 +58,20 @@ Environment contract, matching the `MOJOBOOST_` convention in parallel.mojo:
 - `MOJOBOOST_GPU_STAGING_SLOTS`: staging ring depth, default
   `DEFAULT_STAGING_SLOTS`, clamped to `[1, MAX_STAGING_SLOTS]`. `1`
   reproduces today's single-buffer behavior exactly.
+- `MOJOBOOST_STARTUP_TRACE=1` times the one-time phases (initialization.mojo)
+  a session actually performs: context creation, device discovery, kernel
+  creation, and first versus warm fit. Off by default, and the phase *counts*
+  are kept either way, which is what `session_state()` answers from.
+- `MOJOBOOST_GPU_WARMUP` (`off`, `train`, `all`) names which kernels a
+  session intends to front-load. Nothing is created up front yet; what the
+  plan buys today is that the first launch of a named kernel is attributed to
+  warm-up rather than to the first round.
+
+The startup half of this is deliberately owned here rather than duplicated.
+`initialization.mojo` defines the phases, the cold/warm split, and the
+`SessionState` that `device_policy.decide_device` takes as data, and its
+`SessionState` docstring names `GpuSession` as the object that can answer
+truthfully whether a context is open. `session_state()` is that answer.
 """
 
 from std.os import getenv
@@ -65,6 +79,20 @@ from std.time import perf_counter_ns
 from max.gpu.host import DeviceContext
 
 from .gpu_tiling import DeviceCaps, query_device_caps
+from .initialization import (
+    PHASE_CONTEXT_CREATE,
+    PHASE_DEVICE_DISCOVERY,
+    PHASE_FIRST_ALLOC,
+    PHASE_FIRST_TRANSFER,
+    PHASE_KERNEL_CREATE,
+    WARMUP_ALL,
+    WARMUP_TRAIN,
+    FitLatency,
+    SessionState,
+    StartupTrace,
+    WarmupPlan,
+    session_state_from_trace,
+)
 from .parallel import _env_int
 
 
@@ -79,6 +107,18 @@ comptime PHASE_KERNEL = 3
 comptime PHASE_SYNC = 4
 comptime PHASE_CLEANUP = 5
 comptime N_PHASES = 6
+
+
+def _elapsed_since(started: Int) -> Int:
+    """Nanoseconds since `started`, or 0 when `started` came from a disabled
+    clock or the reading went backwards. The one place this arithmetic is
+    written outside a `record`."""
+    if started <= 0:
+        return 0
+    var elapsed = Int(perf_counter_ns()) - started
+    if elapsed < 0:
+        return 0
+    return elapsed
 
 
 def phase_name(phase: Int) -> String:
@@ -1194,6 +1234,15 @@ struct GpuSession(RoundLifecycle, Movable):
     var residency: ResidencyLedger
     var pool: PoolLedger
     var kernels: KernelRegistry
+    # The one-time costs, from initialization.mojo. `PhaseCounters` above
+    # times a *running* session's phases; this times the phases a session is
+    # opened to pay only once, and a session is the object that can say
+    # truthfully whether they have been paid. `MOJOBOOST_STARTUP_TRACE=1`
+    # turns the timing on; the call counts are kept either way, which is
+    # what `session_state` reads.
+    var startup: StartupTrace
+    var fits: FitLatency
+    var warmup: WarmupPlan
 
     def __init__(out self, staging_slots: Int = 0) raises:
         """Open a device context and take the session's bookkeeping with it.
@@ -1202,14 +1251,27 @@ struct GpuSession(RoundLifecycle, Movable):
         `MOJOBOOST_GPU_STAGING_SLOTS`; an explicit positive value outranks
         the environment, matching how `strategy` outranks
         `MOJOBOOST_GPU_HIST_STRATEGY` in gpu_tiling.mojo.
+
+        Context creation and device discovery are the two startup phases a
+        session actually performs, so they are timed here rather than
+        estimated: `MOJOBOOST_STARTUP_TRACE=1` reports them through
+        `trace()`, and `session_state()` reports that they were paid whether
+        or not the timing was on.
         """
         var counters = PhaseCounters.from_env()
+        var startup = StartupTrace.from_env()
         var started = counters.clock()
         var slots = staging_slots if staging_slots > 0 else (
             env_staging_slots()
         )
+
+        var opened = startup.clock()
         self.ctx = DeviceContext()
+        startup.record(PHASE_CONTEXT_CREATE, opened)
+        var probed = startup.clock()
         self.caps = query_device_caps(self.ctx)
+        startup.record(PHASE_DEVICE_DISCOVERY, probed)
+
         self.counters = counters^
         self.life = SessionLifecycle()
         self.hazards = HazardTracker()
@@ -1217,6 +1279,23 @@ struct GpuSession(RoundLifecycle, Movable):
         self.residency = ResidencyLedger()
         self.pool = PoolLedger()
         self.kernels = KernelRegistry()
+        self.startup = startup^
+        self.fits = FitLatency()
+        # `MOJOBOOST_GPU_WARMUP` names the intent; the kernel ids are this
+        # module's, which is why the plan takes ids rather than defining its
+        # own. Nothing is created here: what the plan buys today is that the
+        # first launch of a planned kernel is attributed to warm-up instead
+        # of disappearing into the first round. Front-loading the creation
+        # itself needs typed `DeviceFunction` fields on whichever struct
+        # owns the context; see handoffs/performance_15_startup.md.
+        self.warmup = WarmupPlan.from_env()
+        if self.warmup.level >= WARMUP_TRAIN:
+            _ = self.warmup.include(KERNEL_HIST_ATOMIC)
+            _ = self.warmup.include(KERNEL_HIST_PARTIAL)
+            _ = self.warmup.include(KERNEL_HIST_REDUCE)
+            _ = self.warmup.include(KERNEL_PARTITION)
+        if self.warmup.level >= WARMUP_ALL:
+            _ = self.warmup.include(KERNEL_PREDICT)
         self.counters.record(PHASE_ALLOC, started)
         self.life.open()
 
@@ -1233,13 +1312,56 @@ struct GpuSession(RoundLifecycle, Movable):
     def note_kernel(mut self, kernel: Int, started: Int) raises:
         """One kernel launch. The first launch of each kernel is attributed
         to `PHASE_COMPILE` as well, since that is where the compile or
-        driver-cache lookup happens."""
+        driver-cache lookup happens, and to the startup trace's
+        `kernel_create`, which is the one-time half of the same cost. A
+        kernel this session's warm-up plan named also records what its
+        creation took, so `trace()` can say which kernel dominates a cold
+        start rather than only that one does."""
         if self.kernels.mark_warm(kernel):
             self.counters.record(PHASE_COMPILE, started)
+            self.startup.record(PHASE_KERNEL_CREATE, started)
+            if self.warmup.is_planned(kernel):
+                self.warmup.note_created(kernel, _elapsed_since(started))
         self.counters.record(PHASE_KERNEL, started)
 
     def note_transfer(mut self, started: Int) raises:
         self.counters.record(PHASE_TRANSFER, started)
+        self.startup.record(PHASE_FIRST_TRANSFER, started)
+
+    def note_alloc(mut self, started: Int) raises:
+        """One device allocation, counted against both the running phase
+        counters and the startup trace's `first_alloc`. `StartupTrace` keeps
+        the first occurrence of a phase separately, so a caller that
+        allocates every round still gets the cold number out of it."""
+        self.counters.record(PHASE_ALLOC, started)
+        self.startup.record(PHASE_FIRST_ALLOC, started)
+
+    # -- startup and fit latency ------------------------------------------
+
+    def begin_fit(self) -> Int:
+        """Start a fit measurement. 0 when startup tracing is off, which is
+        what makes an untraced fit pay no clock read at either end."""
+        return self.startup.clock()
+
+    def end_fit(mut self, started: Int) raises:
+        """Close the measurement `begin_fit` started, against `first_fit`
+        for this session's first fit and `warm_fit` for every one after it.
+        Positional, not temporal: the first fit is the one that pays the
+        one-time costs, however long the process sat idle first."""
+        self.fits.note_fit(self.startup, started)
+
+    def session_state(self) -> SessionState:
+        """What this session has already paid, for `decide_device`.
+
+        The device policy is pure by contract and takes this as data. A live
+        session answers it truthfully, which no free function can: the
+        context is open because this object opened it, and the kernels are
+        ready exactly when the registry says every one has launched once.
+        """
+        var state = session_state_from_trace(self.startup, self.warmup.level)
+        state.context_open = True
+        state.kernels_ready = self.kernels.warm_count >= N_KERNELS
+        return state^
 
     # -- synchronization boundaries ---------------------------------------
 
@@ -1362,4 +1484,7 @@ struct GpuSession(RoundLifecycle, Movable):
         out += "session.rounds " + String(self.life.rounds) + "\n"
         out += "session.trees " + String(self.life.trees) + "\n"
         out += "session.state " + state_name(self.life.state) + "\n"
+        out += self.startup.report()
+        out += self.warmup.report()
+        out += "session.paid " + self.session_state().describe() + "\n"
         return out

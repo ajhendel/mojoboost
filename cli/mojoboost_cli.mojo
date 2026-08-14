@@ -8,10 +8,17 @@ usable without writing any code.
     mojoboost train --data train.csv --model model.mbst \
         --params "objective=binary num_iterations=200"
     mojoboost predict --model model.mbst --data test.csv --output pred.csv
-    mojoboost info --model model.mbst
+    mojoboost info --model model.mbst --json
 
 Hyperparameters come from the same parameter string the C ABI takes (see
-params.mojo), so the two front ends never drift apart.
+params.mojo), so the two front ends never drift apart. The same holds for
+everything else this tool does: prediction is `Model.predict_batch`,
+`--json` is `dump_model`, `--device` is `parse_device`, and the file format
+is serialize.mojo. Nothing about a model is computed here.
+
+This is a mojoboost-native command interface, not a LightGBM one. There is
+no config-file mode and no `task=` verb: commands are subcommands, options
+are flags, and the parameter string carries hyperparameters only.
 
 The data format is documented in cli/README.md and implemented by
 `read_table` below. In short: one example per line, comma separated
@@ -435,7 +442,9 @@ def command_train(args: List[String]) raises -> String:
             n_features,
             " features, ",
             table.n_rows,
-            " rows -> ",
+            " rows, device ",
+            device_name(config.device),
+            " -> ",
             options.model,
         )
     return summary^
@@ -521,9 +530,9 @@ def command_info(args: List[String]) raises -> String:
     inspection-schema JSON with --json.
 
     The JSON is not formatted here. It comes from `dump_model` in
-    inspection.mojo, the one implementation of that schema, which is what
-    keeps `mojoboost info --json` and `Booster.dump_model()` in Python
-    byte-identical for the same file.
+    inspection.mojo, the one implementation of that schema, which is also
+    what the Python `mojoboost.inspection.dump_model` reaches on its native
+    path. Nothing about the schema is decided in this file.
     """
     var options = parse_options(args)
     if options.model.byte_length() == 0:

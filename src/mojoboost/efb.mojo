@@ -258,25 +258,6 @@ def check_bundling_params(max_conflict_rate: Float64) raises:
     )
 
 
-def check_bundling_honored(settings: EfbSettings, trainer: String) raises:
-    """Refuse an active bundling request in a trainer that does not apply it.
-
-    `boosting.mojo`'s dense trainers honor `BoosterParams.bundling`; the
-    sparse, GPU, distributed, ranking, custom-objective, and custom-metric
-    trainers do not. Each of those should call this on entry so that a caller
-    who set the switch is told which trainer dropped it, rather than getting
-    an unbundled fit that looks exactly like a bundled one.
-    """
-    if not settings.enabled:
-        return
-    raise Error(
-        "'enable_bundle' is applied by the dense CPU trainers in"
-        " boosting.mojo (train, train_more, train_with_valid,"
-        " train_multiclass*); ",
-        trainer,
-        " builds its histograms another way and would ignore it. Leave"
-        " enable_bundle at its default of false for this trainer",
-    )
 
 
 @fieldwise_init
@@ -320,6 +301,69 @@ struct EfbParams(Copyable, Movable):
             raise Error("max_nondefault_rate must be in (0, 1]")
         if self.min_reduction < 0.0 or self.min_reduction >= 1.0:
             raise Error("min_reduction must be in [0, 1)")
+
+
+struct EfbSettings(Copyable, Movable):
+    """LightGBM's `enable_bundle` plus the knobs it governs, as one field a
+    trainer can carry.
+
+    `enabled` is the master switch and defaults to False
+    (`DEFAULT_ENABLE_BUNDLE`), unlike LightGBM, which defaults it to true; see
+    the module docstring for why nothing here turns bundling on by itself.
+    `params` is the plan-construction policy and is inert while `enabled` is
+    False, which is what keeps a default configuration on exactly the path it
+    took before bundling existed.
+
+    Held apart from `EfbParams` rather than added to it so that every
+    positional `EfbParams(...)` caller keeps working unchanged.
+    """
+
+    var enabled: Bool
+    var params: EfbParams
+
+    def __init__(
+        out self,
+        enabled: Bool = DEFAULT_ENABLE_BUNDLE,
+        var params: EfbParams = EfbParams.default(),
+    ):
+        self.enabled = enabled
+        self.params = params^
+
+    @staticmethod
+    def disabled() -> EfbSettings:
+        """Bundling off, which is the default everywhere."""
+        return EfbSettings(False, EfbParams.default())
+
+    def check(self) raises:
+        """Range-check the knobs, and refuse the lossy mode.
+
+        Runs whether or not `enabled` is set, so a bad value in a parameter
+        string is named before any data is read rather than at the first
+        training call that happens to turn bundling on.
+        """
+        self.params.check()
+        check_bundling_params(self.params.max_conflict_rate)
+
+
+def check_bundling_honored(settings: EfbSettings, trainer: String) raises:
+    """Refuse an active bundling request in a trainer that does not apply it.
+
+    `boosting.mojo`'s dense trainers honor `BoosterParams.bundling`; the
+    sparse, GPU, distributed, ranking, custom-objective, and custom-metric
+    trainers do not. Each of those should call this on entry so that a caller
+    who set the switch is told which trainer dropped it, rather than getting
+    an unbundled fit that looks exactly like a bundled one.
+    """
+    if not settings.enabled:
+        return
+    raise Error(
+        "'enable_bundle' is applied by the dense CPU trainers in"
+        " boosting.mojo (train, train_more, train_with_valid,"
+        " train_multiclass*); ",
+        trainer,
+        " builds its histograms another way and would ignore it. Leave"
+        " enable_bundle at its default of false for this trainer",
+    )
 
 
 @fieldwise_init
@@ -405,6 +449,40 @@ struct FeatureBundling(Copyable, Movable):
         self.source_entries = source_entries
         self.bundled_entries = bundled_entries
         self.use_bundling = use_bundling
+
+    @staticmethod
+    def none() -> FeatureBundling:
+        """The empty plan: no bundles, no features, bundling off.
+
+        This is the "not bundled" value, so a consumer needs no `Optional`:
+        `active()` is False for it and every caller tests that one predicate.
+        It is deliberately not a valid plan in `validate`'s sense (it covers
+        no features), and nothing ever validates it, because nothing ever
+        encodes or decodes through it.
+        """
+        return FeatureBundling(
+            List[Int](),
+            List[Int](),
+            List[Int](),
+            List[Int](),
+            List[Int](),
+            List[Int](),
+            List[Int](),
+            List[Int](),
+            List[Int](),
+            List[Int](),
+            0,
+            0,
+            0,
+            0,
+            0,
+            False,
+        )
+
+    def active(self) -> Bool:
+        """Whether this plan describes a layout at all. False for `none()`,
+        which is the value a caller that is not bundling passes."""
+        return len(self.bundle_bins) > 0
 
     def n_bundles(self) -> Int:
         return len(self.bundle_bins)
@@ -738,12 +816,35 @@ def _merge_rows(a: List[Int], b: List[Int]) -> List[Int]:
     return out^
 
 
-def fit_bundles(
-    mapper: BinMapper,
-    data: SparseBinnedMatrix,
-    params: EfbParams = EfbParams.default(),
+def _fit_bundles_core(
+    var rows: List[List[Int]],
+    counts: List[Int],
+    local_bins: List[Int],
+    defaults: List[Int],
+    missings: List[Int],
+    eligible: List[Bool],
+    n_features: Int,
+    n_rows: Int,
+    n_bins: Int,
+    source_entries: Int,
+    params: EfbParams,
 ) raises -> FeatureBundling:
-    """Build a bundling plan for a binned sparse matrix.
+    """The greedy itself, shared by the sparse and the dense entry points.
+
+    Every caller describes each feature the same way -- its non-default rows,
+    how many there are, how many local bins it has, its default and missing
+    bins, and whether it may be bundled at all -- and this decides the
+    layout. Keeping one copy is what makes a sparse plan and a dense plan
+    packed by identical rules, so a future sparse integration cannot drift
+    from the dense one.
+
+    `counts[f]` rather than `len(rows[f])` is the non-default count, because a
+    caller may decline to materialize the row list of a feature it has
+    already ruled ineligible: on a dense matrix an ineligible column's list
+    can be nearly `n_rows` long and is never read, since an ineligible
+    feature becomes a closed singleton and is never a merge candidate. For a
+    caller that materializes everything the two are equal and this changes
+    nothing.
 
     Greedy, serial, and order-fixed (see "Determinism" in the module
     docstring). Every feature ends in exactly one bundle: a feature that
@@ -753,52 +854,11 @@ def fit_bundles(
 
     The returned plan reports `use_bundling`; it does not act on it.
     """
-    params.check()
-    if mapper.n_features != data.n_features:
-        raise Error("mapper and matrix must agree on n_features")
-    if data.n_rows < 1 or data.n_features < 1:
-        raise Error("matrix must have positive dimensions")
-
-    var n_features = data.n_features
-    var n_rows = data.n_rows
     var max_conflicts = Int(Float64(n_rows) * params.max_conflict_rate)
-    var dense_cut = Int(Float64(n_rows) * params.max_nondefault_rate)
 
-    var rows = List[List[Int]](capacity=n_features)
-    var local_bins = List[Int](capacity=n_features)
-    var defaults = List[Int](capacity=n_features)
-    var missings = List[Int](capacity=n_features)
-    var eligible = List[Bool](capacity=n_features)
     var neg_counts = List[Float64](capacity=n_features)
-
     for f in range(n_features):
-        var nd = nondefault_rows(data, f)
-        var n_local = feature_bin_count(mapper, f)
-        var d = Int(data.default_bin[f])
-        if d >= n_local:
-            raise Error(
-                "matrix default bin is outside the mapper's bin count; the"
-                " matrix was binned by a different mapper"
-            )
-        var mb = data.missing_bin[f]
-        if mb >= n_local:
-            raise Error("matrix missing bin is outside the mapper's bin count")
-        # A feature is bundleable when it is numerical, not too dense, not
-        # holding missing values the consumer cannot yet route, and narrow
-        # enough to fit a bundle at all.
-        var ok = not mapper.cats.is_cat(f)
-        if mb >= 0 and not params.bundle_missing:
-            ok = False
-        if len(nd) > dense_cut:
-            ok = False
-        if n_local > params.max_bundle_bins:
-            ok = False
-        neg_counts.append(-Float64(len(nd)))
-        rows.append(nd^)
-        local_bins.append(n_local)
-        defaults.append(d)
-        missings.append(mb)
-        eligible.append(ok)
+        neg_counts.append(-Float64(counts[f]))
 
     # Stable ascending sort of the negated counts is a descending sort of the
     # counts with ties broken toward the smaller feature index.
@@ -806,6 +866,7 @@ def fit_bundles(
 
     var b_members = List[List[Int]]()
     var b_union = List[List[Int]]()
+    var b_entries = List[Int]()
     var b_bins = List[Int]()
     var b_conflict = List[Int]()
     var b_open = List[Bool]()
@@ -818,6 +879,7 @@ def fit_bundles(
             only.append(f)
             b_members.append(only^)
             b_union.append(rows[f].copy())
+            b_entries.append(counts[f])
             b_bins.append(width)
             b_conflict.append(0)
             b_open.append(False)
@@ -838,6 +900,7 @@ def fit_bundles(
                 continue
             b_members[b].append(f)
             b_union[b] = _merge_rows(b_union[b], rows[f])
+            b_entries[b] = len(b_union[b])
             b_bins[b] += width
             b_conflict[b] += conflict
             placed = True
@@ -847,6 +910,7 @@ def fit_bundles(
             only.append(f)
             b_members.append(only^)
             b_union.append(rows[f].copy())
+            b_entries.append(counts[f])
             b_bins.append(width)
             b_conflict.append(0)
             b_open.append(True)
@@ -886,7 +950,7 @@ def fit_bundles(
         bundle_start.append(len(members))
         bundle_bins.append(1 + b_bins[b])
         collisions.append(b_conflict[b])
-        bundled_entries += len(b_union[b])
+        bundled_entries += b_entries[b]
 
     var plan = FeatureBundling(
         members^,
@@ -901,8 +965,8 @@ def fit_bundles(
         collisions^,
         n_features,
         n_rows,
-        data.n_bins,
-        data.nnz(),
+        n_bins,
+        source_entries,
         bundled_entries,
         False,
     )
@@ -918,6 +982,434 @@ def fit_bundles(
         and Float64(after) <= Float64(before) * (1.0 - params.min_reduction)
     )
     return plan^
+
+
+def fit_bundles(
+    mapper: BinMapper,
+    data: SparseBinnedMatrix,
+    params: EfbParams = EfbParams.default(),
+) raises -> FeatureBundling:
+    """Build a bundling plan for a binned sparse matrix.
+
+    Bin widths come from the fitted mapper rather than from the data, because
+    a bin a training column happened not to use is still a bin an unseen row
+    can land in, and a sparse plan is built for a consumer that encodes rows
+    through it at scoring time. The dense entry point below has a different
+    answer for that, and says why.
+    """
+    params.check()
+    if mapper.n_features != data.n_features:
+        raise Error("mapper and matrix must agree on n_features")
+    if data.n_rows < 1 or data.n_features < 1:
+        raise Error("matrix must have positive dimensions")
+
+    var n_features = data.n_features
+    var n_rows = data.n_rows
+    var dense_cut = Int(Float64(n_rows) * params.max_nondefault_rate)
+
+    var rows = List[List[Int]](capacity=n_features)
+    var counts = List[Int](capacity=n_features)
+    var local_bins = List[Int](capacity=n_features)
+    var defaults = List[Int](capacity=n_features)
+    var missings = List[Int](capacity=n_features)
+    var eligible = List[Bool](capacity=n_features)
+
+    for f in range(n_features):
+        var nd = nondefault_rows(data, f)
+        var n_local = feature_bin_count(mapper, f)
+        var d = Int(data.default_bin[f])
+        if d >= n_local:
+            raise Error(
+                "matrix default bin is outside the mapper's bin count; the"
+                " matrix was binned by a different mapper"
+            )
+        var mb = data.missing_bin[f]
+        if mb >= n_local:
+            raise Error("matrix missing bin is outside the mapper's bin count")
+        # A feature is bundleable when it is numerical, not too dense, not
+        # holding missing values the consumer cannot yet route, and narrow
+        # enough to fit a bundle at all.
+        var ok = not mapper.cats.is_cat(f)
+        if mb >= 0 and not params.bundle_missing:
+            ok = False
+        if len(nd) > dense_cut:
+            ok = False
+        if n_local > params.max_bundle_bins:
+            ok = False
+        counts.append(len(nd))
+        rows.append(nd^)
+        local_bins.append(n_local)
+        defaults.append(d)
+        missings.append(mb)
+        eligible.append(ok)
+
+    return _fit_bundles_core(
+        rows^,
+        counts,
+        local_bins,
+        defaults,
+        missings,
+        eligible,
+        n_features,
+        n_rows,
+        data.n_bins,
+        data.nnz(),
+        params,
+    )
+
+
+# ---------------------------------------------------------------------------
+# The dense CPU path
+# ---------------------------------------------------------------------------
+#
+# A dense `BinnedMatrix` has no notion of an absent entry, so "the bin holding
+# 0.0" is not the right definition of a feature's resting value here and the
+# mapper that would compute it is a layer above the trainer. The dense path
+# uses **the column's most frequent bin** instead. On the data EFB is for --
+# one-hot columns, indicator columns, bag-of-words counts, anything quantile
+# binned whose mass sits on one value -- that bin *is* the bin of 0.0, so the
+# two definitions agree exactly; where they differ, the most frequent bin is
+# the better choice, because it is by construction the bin whose rows are free
+# to share the bundle, which is the quantity that decides whether bundling
+# pays. LightGBM folds away a feature's most frequent bin for the same reason.
+#
+# Widths are counted off the training matrix rather than read from a mapper,
+# which is safe here and only here: the dense plan never encodes a row that
+# was not part of the fit. It is used to lay out histograms during growth and
+# is discarded when the last tree is grown, so there is no unseen row for a
+# too-narrow range to lose. See `dense_bin_counts` for what that costs and
+# what it does not.
+
+
+def dense_bin_counts(data: BinnedMatrix) raises -> List[Int]:
+    """How many local bins each column of a dense binned matrix uses.
+
+    One more than the highest bin the column actually holds, raised to cover
+    the feature's reserved missing bin and, for a categorical feature, its
+    whole fitted category table, so a category that no training row carries
+    still gets its slot.
+
+    Counted off the data, not off a mapper. That is sound for the dense
+    integration and unsound in general: it is correct because the plan is used
+    only to lay out histograms over *this* matrix, and a bin no training row
+    occupies contributes nothing to any histogram. It would be wrong for a
+    plan that has to encode an unseen row, which is why `fit_bundles` reads
+    the mapper instead.
+
+    The consequence inside the split search is that a bundled member is
+    scanned over its own `[0, n_local)` range instead of over the matrix's
+    full `n_bins`. The candidates that disappear are exactly the thresholds at
+    or above the column's highest occupied bin, every one of which puts every
+    row in the left child and so scores a gain of 0.0 against a parent that
+    already scores it; none of them can win, so the chosen split is the same
+    one the full scan chooses.
+    """
+    if data.n_features < 1 or data.n_rows < 1:
+        raise Error("matrix must have positive dimensions")
+    var out = List[Int](capacity=data.n_features)
+    for f in range(data.n_features):
+        var top = 0
+        var base = f * data.n_rows
+        for r in range(data.n_rows):
+            var b = Int(data.bins[base + r])
+            if b > top:
+                top = b
+        if data.missing_bin[f] > top:
+            top = data.missing_bin[f]
+        if data.cats.is_cat(f) and data.cats.n_categories(f) > top:
+            top = data.cats.n_categories(f)
+        out.append(top + 1)
+    return out^
+
+
+def dense_default_bins(data: BinnedMatrix) raises -> List[Int]:
+    """Each column's most frequent bin, ties broken toward the smaller bin id.
+
+    This is the dense path's "at rest" bin, the one a bundle's shared bin
+    stands in for; see the section comment above for why it is the most
+    frequent bin and not the bin of 0.0. Ties are broken deterministically so
+    that the same matrix always yields the same plan.
+    """
+    if data.n_features < 1 or data.n_rows < 1:
+        raise Error("matrix must have positive dimensions")
+    var out = List[Int](capacity=data.n_features)
+    var tally = List[Int](capacity=EFB_MAX_BINS)
+    tally.resize(EFB_MAX_BINS, 0)
+    for f in range(data.n_features):
+        for b in range(EFB_MAX_BINS):
+            tally[b] = 0
+        var base = f * data.n_rows
+        for r in range(data.n_rows):
+            tally[Int(data.bins[base + r])] += 1
+        var best = 0
+        for b in range(1, EFB_MAX_BINS):
+            if tally[b] > tally[best]:
+                best = b
+        out.append(best)
+    return out^
+
+
+def nondefault_rows_dense(
+    data: BinnedMatrix, feature: Int, default_bin: Int
+) raises -> List[Int]:
+    """Ascending rows where a dense column is not at `default_bin`.
+
+    The dense counterpart of `nondefault_rows`. A missing value is one of
+    these: it sits in its own reserved bin, which is a value the bundle has to
+    keep, not an absence.
+    """
+    if feature < 0 or feature >= data.n_features:
+        raise Error("feature index out of range")
+    var out = List[Int]()
+    var base = feature * data.n_rows
+    for r in range(data.n_rows):
+        if Int(data.bins[base + r]) != default_bin:
+            out.append(r)
+    return out^
+
+
+def count_nondefault_dense(
+    data: BinnedMatrix, feature: Int, default_bin: Int
+) raises -> Int:
+    """How many rows of a dense column are not at `default_bin`.
+
+    Counted without materializing the row list, so a column that turns out to
+    be too dense to bundle costs a pass rather than an allocation the size of
+    the column. On a wide dense matrix that is the difference between a plan
+    fit and an out-of-memory one.
+    """
+    if feature < 0 or feature >= data.n_features:
+        raise Error("feature index out of range")
+    var out = 0
+    var base = feature * data.n_rows
+    for r in range(data.n_rows):
+        if Int(data.bins[base + r]) != default_bin:
+            out += 1
+    return out
+
+
+def fit_bundles_dense(
+    data: BinnedMatrix, params: EfbParams = EfbParams.default()
+) raises -> FeatureBundling:
+    """Build a bundling plan for a dense binned matrix.
+
+    Same greedy, same determinism, and the same `use_bundling` verdict as the
+    sparse entry point; the differences are the three the section comment
+    above states, plus one more:
+
+    - `EfbParams.bundle_missing` is ignored. A feature reserving a missing bin
+      bundles like any other, because the dense integration never routes a row
+      by a bundle column (see the module docstring). `slot_missing` is left at
+      -1 on every slot to say so.
+
+    The plan reports `use_bundling`; it does not act on it. `prepare_bundling`
+    is what turns the verdict into a decision.
+    """
+    params.check()
+    if data.n_rows < 1 or data.n_features < 1:
+        raise Error("matrix must have positive dimensions")
+
+    var n_features = data.n_features
+    var n_rows = data.n_rows
+    var dense_cut = Int(Float64(n_rows) * params.max_nondefault_rate)
+    var defaults = dense_default_bins(data)
+    var local_bins = dense_bin_counts(data)
+
+    var rows = List[List[Int]](capacity=n_features)
+    var counts = List[Int](capacity=n_features)
+    var missings = List[Int](capacity=n_features)
+    var eligible = List[Bool](capacity=n_features)
+    var source_entries = 0
+
+    for f in range(n_features):
+        var n_nd = count_nondefault_dense(data, f, defaults[f])
+        source_entries += n_nd
+        # A feature is bundleable when it is numerical, not too dense, and
+        # narrow enough to fit a bundle at all. Missingness is not a bar here.
+        var ok = not data.cats.is_cat(f)
+        if n_nd > dense_cut:
+            ok = False
+        if local_bins[f] > params.max_bundle_bins:
+            ok = False
+        # Only an eligible feature's rows are materialized: an ineligible one
+        # becomes a closed singleton, which the greedy never reads rows from,
+        # and on a dense matrix that list is the expensive thing.
+        if ok:
+            rows.append(nondefault_rows_dense(data, f, defaults[f]))
+        else:
+            rows.append(List[Int]())
+        counts.append(n_nd)
+        missings.append(EFB_NONE)
+        eligible.append(ok)
+
+    return _fit_bundles_core(
+        rows^,
+        counts,
+        local_bins,
+        defaults,
+        missings,
+        eligible,
+        n_features,
+        n_rows,
+        data.n_bins,
+        source_entries,
+        params,
+    )
+
+
+def bundle_dense(
+    data: BinnedMatrix, plan: FeatureBundling
+) raises -> BinnedMatrix:
+    """Apply a dense plan, producing the bundled binned matrix.
+
+    One column per bundle, column-major like its source. A row at a member's
+    default bin is left at the bundle's default bin, which is what recovers
+    it; on a collision the earliest member in the bundle's member order keeps
+    the row, exactly as `bundle_csc` resolves it, so the two applications of
+    one plan agree.
+
+    A singleton bundle is identity encoded, so its category table and its
+    reserved missing bin carry over unchanged and a plan of all singletons
+    reproduces the source matrix bin for bin. A multi-member bundle is
+    numerical and carries no reserved missing bin, because the dense
+    integration routes missing values from the original matrix (see the module
+    docstring); `missing_bin` is -1 on it.
+    """
+    if plan.n_features != data.n_features:
+        raise Error("plan and matrix must agree on n_features")
+    if plan.n_rows != data.n_rows:
+        raise Error("plan and matrix must agree on n_rows")
+
+    var n_rows = data.n_rows
+    var n_bundles = plan.n_bundles()
+    var n_bins = plan.max_bundle_bins()
+    var bins = List[UInt8](capacity=n_rows * n_bundles)
+    bins.resize(n_rows * n_bundles, 0)
+    var missing_bin = List[Int](capacity=n_bundles)
+    var cat_flags = List[Bool](capacity=n_bundles)
+    var cat_codes = List[Int]()
+    var cat_offsets = List[Int](capacity=n_bundles + 1)
+    cat_offsets.append(0)
+
+    for b in range(n_bundles):
+        var lo = plan.bundle_start[b]
+        var hi = plan.bundle_start[b + 1]
+        var size = hi - lo
+        var out_base = b * n_rows
+        if size == 1:
+            # Identity encoded: copy the column through untouched.
+            var f = plan.members[lo]
+            var in_base = f * n_rows
+            for r in range(n_rows):
+                bins[out_base + r] = data.bins[in_base + r]
+            cat_flags.append(data.cats.is_cat(f))
+            if data.cats.is_cat(f):
+                for i in range(
+                    data.cats.offsets[f], data.cats.offsets[f + 1]
+                ):
+                    cat_codes.append(data.cats.codes[i])
+            missing_bin.append(data.missing_bin[f])
+        else:
+            # Every row starts at the shared bin, which is what "every member
+            # is at its default" reads back as.
+            for r in range(n_rows):
+                bins[out_base + r] = UInt8(EFB_SHARED_BIN)
+            for k in range(lo, hi):
+                var f = plan.members[k]
+                var d = plan.slot_default[k]
+                var in_base = f * n_rows
+                for r in range(n_rows):
+                    var v = Int(data.bins[in_base + r])
+                    if v == d:
+                        continue
+                    # The shared bin is "unclaimed": no member ever encodes to
+                    # it, so an occupied slot means an earlier member already
+                    # took this row and wins the collision.
+                    if Int(bins[out_base + r]) != EFB_SHARED_BIN:
+                        continue
+                    bins[out_base + r] = UInt8(plan.encode(f, v))
+            cat_flags.append(False)
+            missing_bin.append(EFB_NONE)
+        cat_offsets.append(len(cat_codes))
+
+    return BinnedMatrix(
+        bins^,
+        n_rows,
+        n_bundles,
+        n_bins,
+        CategoricalSpec(cat_flags^, cat_codes^, cat_offsets^),
+        missing_bin^,
+    )
+
+
+struct BundledMatrix(Copyable, Movable):
+    """A fitted plan together with the matrix it produced, or neither.
+
+    This is the value `tree.grow_tree` takes: `active` False is "grow on the
+    original matrix", which is both the default and the fallback, and `active`
+    True means histograms come from `data` and split search unbundles through
+    `plan`. It is a training-time view of one matrix, not a second
+    representation of the model: nothing here is serialized, predicted from,
+    or kept once the last tree is grown.
+    """
+
+    var plan: FeatureBundling
+    var data: BinnedMatrix
+    var active: Bool
+
+    def __init__(
+        out self,
+        var plan: FeatureBundling,
+        var data: BinnedMatrix,
+        active: Bool,
+    ):
+        self.plan = plan^
+        self.data = data^
+        self.active = active
+
+    @staticmethod
+    def none() -> BundledMatrix:
+        """No bundling: the value every caller that is not bundling passes,
+        and the one a negative `use_bundling` verdict falls back to."""
+        return BundledMatrix(
+            FeatureBundling.none(),
+            BinnedMatrix(List[UInt8](), 0, 0, 0),
+            False,
+        )
+
+
+def prepare_bundling(
+    data: BinnedMatrix, settings: EfbSettings
+) raises -> BundledMatrix:
+    """Fit and apply a bundling plan, or decide not to.
+
+    Three ways to get `BundledMatrix.none()`, and all three are the same fit:
+
+    - `settings.enabled` is False, which is the default;
+    - the plan packs nothing (`n_bundles == n_features`) or does not clear
+      `EfbParams.min_reduction`, so `fit_bundles_dense` reports
+      `use_bundling = False`;
+    - the matrix has no rows or no features to bundle.
+
+    That is the conservative fallback the integration keeps: bundling changes
+    how histograms are laid out and nothing else, so declining it is always
+    available and always produces the same trees.
+
+    Called once per training call, not once per tree: the plan is a function
+    of the matrix and the parameters, so refitting it per tree would cost the
+    same answer many times over. It is deterministic, so a continued run
+    (`train_more`) rebuilds exactly the plan the first call used.
+    """
+    if not settings.enabled:
+        return BundledMatrix.none()
+    settings.check()
+    if data.n_rows < 1 or data.n_features < 2:
+        return BundledMatrix.none()
+    var plan = fit_bundles_dense(data, settings.params)
+    if not plan.use_bundling:
+        return BundledMatrix.none()
+    var bundled = bundle_dense(data, plan)
+    return BundledMatrix(plan^, bundled^, True)
 
 
 def bundle_csc(

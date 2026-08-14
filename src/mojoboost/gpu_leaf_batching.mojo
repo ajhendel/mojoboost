@@ -121,39 +121,32 @@ from max.gpu.host import DeviceBuffer, DeviceContext, HostBuffer
 from max.gpu.memory import AddressSpace
 from max.gpu.sync import barrier
 
-from .gpu_frontier import LeafWorkItem
+from .gpu_active_rows import MAX_ROWS, GpuActiveRows, LeafRange
+from .gpu_frontier import NO_SLOT, LeafFrontier, LeafStats, LeafWorkItem
+from .gpu_histogram_specializations import (
+    MAX_BINS,
+    PLANES_PER_HISTOGRAM,
+    BinStorageDescriptor,
+    KernelFeatures,
+)
 from .gpu_tiling import (
+    BYTES_PER_PARTIAL_CELL,
+    MAX_GRID_DIM_Y,
+    MIN_ROWS_PER_TILE_BIN_FACTOR,
+    MIN_ROWS_PER_TILE_THREAD_FACTOR,
     STRATEGY_ATOMIC,
     STRATEGY_AUTO,
     STRATEGY_TILED,
+    TARGET_BLOCKS_PER_SM,
     DeviceCaps,
     derive_block_threads,
 )
 
-comptime MAX_BINS = 256
-
-# Row indices cross into the kernels as Int32.
-comptime MAX_ROWS = Int(Int32.MAX)
-
-# CUDA caps grid.y at 65535; Metal and HIP allow more, so the smallest
-# portable bound applies to the packed tile axis everywhere.
-comptime MAX_GRID_DIM_Y = 65535
-
-# Int32 gradient + Int32 hessian + Int32 count per (tile, slot, bin).
-comptime BYTES_PER_PARTIAL_CELL = 12
-
 # Gradient, hessian, and count planes, in that order, in every histogram.
-comptime N_PLANES = 3
-
-# Resident threadgroups to aim for per multiprocessor. Mirrors
-# `gpu_tiling.TARGET_BLOCKS_PER_SM`; the batch aims the whole launch at it
-# rather than any one leaf.
-comptime TARGET_BLOCKS_PER_SM = 8
-
-# A tile must scan enough rows to amortize writing (or atomically folding)
-# its n_bins-wide partial histogram. Mirrors `gpu_tiling.MIN_ROWS_PER_TILE_*`.
-comptime MIN_ROWS_PER_TILE_BIN_FACTOR = 8
-comptime MIN_ROWS_PER_TILE_THREAD_FACTOR = 4
+# Imported rather than restated: it is the same three planes
+# `gpu_histogram_specializations` sizes a shared histogram with and
+# `histogram_gpu` lays its output buffer out as.
+comptime N_PLANES = PLANES_PER_HISTOGRAM
 
 # Items one launch may cover. The binary search is logarithmic in this and
 # the item table is staged in full on every launch, so the bound keeps both
@@ -810,8 +803,11 @@ def plan_batch(
                 tiles[i] = want
                 scaled += want
             # Integer flooring can leave the total above the budget by at
-            # most one tile per item; give the surplus back from the largest
-            # shares first, never below the floor of one.
+            # most one tile per item; give the surplus back in ascending item
+            # order, never below the floor of one. Ascending rather than
+            # largest-first because the order has to be a function of the
+            # batch and not of a sort's tie-breaking, and every order that is
+            # gives the same total.
             var over = scaled - tiles_budget
             var idx = 0
             while over > 0 and idx < n:
@@ -1120,6 +1116,22 @@ struct HistogramSlotPool(Movable):
         if slot < 0 or slot >= self.capacity:
             raise Error("histogram slot out of range")
         return self.owner[slot]
+
+    def stamp_of(self, slot: Int) raises -> Int:
+        """The compatibility stamp a slot was accumulated under, or -1 for a
+        free slot. Two slots may only be subtracted when these agree; see
+        `check_subtractable` and `subtraction_stamp`."""
+        if slot < 0 or slot >= self.capacity:
+            raise Error("histogram slot out of range")
+        return self.stamp[slot]
+
+    def slot_of_owner(self, owner: Int) -> Int:
+        """The live slot `owner` holds, or -1. Owners are leaf node ids and a
+        node holds at most one slot, so the answer is unique."""
+        for i in range(self.capacity):
+            if self.owner[i] == owner:
+                return i
+        return -1
 
     def check_live(self, slot: Int) raises:
         if slot < 0 or slot >= self.capacity:

@@ -75,7 +75,7 @@ handoffs/connect_12_dataset_cv.md for the exact request.
 """
 
 from .bagging import BaggingParams
-from .binning import BinMapper, BinnedMatrix, BinnedMatrix, fit_bins
+from .binning import BinMapper, BinnedMatrix, fit_bins
 from .boosting import (
     Booster,
     BoosterParams,
@@ -419,9 +419,11 @@ struct Dataset(Copyable, Movable, Writable):
             sparse_data = raw.transform_sparse(mapper)
         else:
             data = raw.transform_dense(mapper)
-        var kept = RawData.none()
+        var kept: RawData
         if keep_raw:
             kept = raw^
+        else:
+            kept = RawData.none()
         return Dataset(
             mapper^,
             data^,
@@ -552,9 +554,11 @@ struct Dataset(Copyable, Movable, Writable):
             sparse_data = transform_csc(mapper, raw.csc)
         else:
             data = raw.transform_dense(mapper)
-        var kept = RawData.none()
+        var kept: RawData
         if keep_raw:
             kept = raw^
+        else:
+            kept = RawData.none()
         return Dataset(
             mapper^,
             data^,
@@ -631,7 +635,7 @@ struct Dataset(Copyable, Movable, Writable):
             raise Error("feature index out of range")
         if len(self.feature_names) == 0:
             return String("Column_") + String(index)
-        return self.feature_names[index]
+        return self.feature_names[index].copy()
 
     def is_categorical(self, feature: Int) raises -> Bool:
         """Whether a feature was declared categorical for this binning."""
@@ -687,6 +691,8 @@ struct Dataset(Copyable, Movable, Writable):
         trained on.
         """
         var raw = self.raw_matrix()
+        # Ahead of the group work below, which indexes by row and would
+        # otherwise read out of range for a selection `subset` will reject.
         raw.check_rows(rows)
         var group = _subset_group(self.group, rows, self.n_rows)
         return Dataset.from_raw(
@@ -714,6 +720,7 @@ struct Dataset(Copyable, Movable, Writable):
         did not shape the binning; use `subset` for that.
         """
         var raw = self.raw_matrix()
+        # As in `subset`: check before the group work indexes by row.
         raw.check_rows(rows)
         var group = _subset_group(self.group, rows, self.n_rows)
         return Dataset.from_reference(

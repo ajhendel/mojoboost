@@ -62,6 +62,17 @@ threshold, no density heuristic, and no automatic fallback that would pick a
 path on this module's authority. See
 `docs/GPU_SPARSE_CATEGORICAL_DESIGN.md` for the benchmark that has to run
 before a threshold is allowed to exist.
+
+What this module *does* decide
+------------------------------
+Whether a given dataset can run on the device path at all, and whether a
+training path exists to run it from. `SparseGpuCapability` at the bottom of
+this file is the one record that answers both, `check_sparse_gpu_histograms`
+is the raising form for a caller wanting the primitives, and
+`check_sparse_gpu_training` is the raising form for an explicit
+`device="gpu"` request on sparse input -- which today always raises, because
+no trainer drives these primitives. A capability record is how that stays
+honest: nothing here reports GPU support and then runs on the CPU.
 """
 
 from .categorical import CAT_MAX_BINS, CategoricalSpec
@@ -928,3 +939,143 @@ def check_bundle_compatibility(
         lossless,
         lossless,
     )
+
+
+# --- The capability record --------------------------------------------
+#
+# One value that answers, for one dataset and one device, what the sparse
+# device path can and cannot do -- and says so in a form a trainer, a
+# binding, or a device policy can report without catching an exception. It
+# exists because the alternative is what the repository had: three separate
+# checks in three modules, none of them consulted by anything, and a policy
+# elsewhere asserting a fact ("there is no sparse GPU histogram kernel")
+# that stopped being true.
+#
+# The honest distinction it draws, and the reason `training_supported` is a
+# separate field from `histograms_supported`:
+#
+# - the *primitives* are real. `GpuSparseHistogramBuilder` uploads a
+#   compressed matrix, builds a node histogram, and partitions rows and
+#   entries at a split; `gpu_categorical` computes per-category statistics
+#   and routes a categorical split from a device-resident set.
+# - the *training path* is not. No grower drives them, no `device="gpu"`
+#   reaches them, and nothing here will report that it does. A request that
+#   asks for sparse GPU training gets an error naming the missing piece,
+#   never a silent fall back to the CPU trainer while claiming the device.
+
+
+def sparse_gpu_training_is_wired() -> Bool:
+    """Whether a sparse GPU *training* path exists.
+
+    Constant `False` today, and deliberately a function rather than a
+    comment: every place that must not claim sparse GPU training reads it,
+    so wiring a trainer is one edit here plus the trainer, and forgetting to
+    flip it fails closed rather than open.
+    """
+    return False
+
+
+@fieldwise_init
+struct SparseGpuCapability(Copyable, Movable):
+    """What the sparse device path can do with one dataset on one device.
+
+    `support` and `categorical` are `sparse_support` / `categorical_support`
+    codes, `SPARSE_OK` when the shape is expressible. `histograms` is whether
+    the device primitives can run at all, and `training` is whether a
+    training path exists to run them from -- two different questions, kept
+    apart so neither can be read as the other.
+
+    `unknown_absent` lists the categorical features whose absent rows land in
+    the unknown bin (see `sparse.absent_is_unknown`). That is a modelling
+    fact rather than a limit, so it never blocks anything; it rides along
+    because this is the record a caller already has in hand when it decides
+    what to report.
+    """
+
+    var support: Int
+    var categorical: Int
+    var histograms: Bool
+    var training: Bool
+    var unknown_absent: List[Int]
+
+    def blocked_reason(self) -> Int:
+        """The first code that makes this dataset unrunnable on the device
+        path, or `SPARSE_OK` when the shape is fine."""
+        if self.support != SPARSE_OK:
+            return self.support
+        return self.categorical
+
+    def explain(self) -> String:
+        """One line, suitable for an error message or a report."""
+        var reason = self.blocked_reason()
+        if reason != SPARSE_OK:
+            return String(
+                "sparse GPU path unavailable: ", sparse_support_name(reason)
+            )
+        if not self.training:
+            return String(
+                "sparse GPU primitives are available for this dataset but no"
+                " sparse GPU training path is wired; training runs on the"
+                " CPU sparse trainer"
+            )
+        return String("sparse GPU training available")
+
+
+def sparse_gpu_capability(
+    caps: DeviceCaps, data: SparseBinnedMatrix
+) raises -> SparseGpuCapability:
+    """The capability record for one binned sparse matrix on one device.
+
+    Validates the matrix first, through `SparseBinnedMatrix.validate`: a
+    record derived from a structurally broken matrix would describe a dataset
+    that cannot be trained on at all, on either backend.
+    """
+    data.validate()
+    var flagged = check_sparse_categorical_semantics(data)
+    var support = sparse_support(
+        caps, data.n_rows, data.n_features, data.n_bins, data.nnz()
+    )
+    var categorical = categorical_support(
+        data.cats, data.n_features, data.n_bins
+    )
+    var runnable = support == SPARSE_OK and categorical == SPARSE_OK
+    return SparseGpuCapability(
+        support,
+        categorical,
+        runnable,
+        runnable and sparse_gpu_training_is_wired(),
+        flagged^,
+    )
+
+
+def check_sparse_gpu_histograms(
+    caps: DeviceCaps, data: SparseBinnedMatrix
+) raises -> SparseGpuCapability:
+    """Raise unless the sparse device *primitives* can run on this dataset,
+    and return the record either way.
+
+    What `GpuSparseHistogramBuilder`'s constructor asks, in a form a caller
+    can ask before it opens a device context.
+    """
+    var capability = sparse_gpu_capability(caps, data)
+    if not capability.histograms:
+        raise Error(capability.explain())
+    return capability^
+
+
+def check_sparse_gpu_training(
+    caps: DeviceCaps, data: SparseBinnedMatrix
+) raises -> SparseGpuCapability:
+    """Raise unless a sparse GPU *training* path exists for this dataset.
+
+    This is what an explicit `device="gpu"` request on sparse input must go
+    through. Today it always raises, because `sparse_gpu_training_is_wired`
+    is False: an unsupported shape raises with its own reason, and a
+    perfectly supported one raises saying the primitives exist but nothing
+    drives them. Neither answer is "we ran it on the CPU and called it the
+    device".
+    """
+    var capability = check_sparse_gpu_histograms(caps, data)
+    if not capability.training:
+        raise Error(capability.explain())
+    return capability^

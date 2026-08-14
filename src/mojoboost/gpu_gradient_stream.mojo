@@ -367,6 +367,22 @@ struct GpuRowSelection(Movable):
         selection (`GossSelection.all_rows()`) becomes `select_all`."""
         self.set_selection(ctx, selection.rows, selection.scale)
 
+    def from_bag(mut self, ctx: DeviceContext, bag: List[Int]) raises:
+        """`set_selection` from a row bag: the ids, and deliberately no
+        multipliers.
+
+        Bagging changes which rows a tree is grown on and never what a
+        row's derivatives are, so a bagged round carries no compensation
+        and `apply_compensation` stays a no-op for it. That is the whole
+        difference from `from_goss`, and it is why a bagged round is free
+        of the Float32 ranking caveat: the bag comes from a counter stream
+        keyed by (seed, bag index, row) and never reads a gradient.
+
+        An empty bag is `select_all`, which is what an empty bag means
+        everywhere else in the library.
+        """
+        self.set_selection(ctx, bag)
+
     def apply_compensation(
         mut self,
         ctx: DeviceContext,
@@ -456,6 +472,40 @@ struct GpuRowSelection(Movable):
         for r in range(self.n_rows):
             out.append(Float64(src.unsafe_load(r)))
         return out^
+
+
+def selection_capacity(
+    n_rows: Int, bagging_on: Bool, goss_on: Bool
+) raises -> Int:
+    """`max_selected` for a session, from what the run is configured to
+    sample.
+
+    `n_rows` whenever anything samples, and 0 (placeholder buffers only)
+    when nothing does. Neither sampler has a tighter bound that holds every
+    round: a bag is a Binomial draw, so its size is only `bagging_fraction`
+    in expectation, and a GOSS selection can exceed `top_k + other_k` when
+    importances tie. Sizing to the looser bound costs `8 * n_rows` bytes
+    once per session and removes a reallocation the trainer would otherwise
+    have to reason about mid-run.
+    """
+    if n_rows < 1:
+        raise Error("row selection requires at least one row")
+    return n_rows if (bagging_on or goss_on) else 0
+
+
+def selection_wants_ranking(
+    goss_on: Bool, allow_device_ranking: Bool
+) -> Bool:
+    """Whether a session needs the `|grad * hess|` ranking plane.
+
+    Only a GOSS run whose caller has accepted a Float32 ranking, which is
+    the same condition `round_eligibility` gates on: without that
+    acceptance the sample is drawn from host-side Float64 gradients and the
+    plane would never be read. Passing this as `with_importance` is what
+    keeps the `n_rows` Float32 plane and its pinned readback buffer out of
+    every run that does not sample.
+    """
+    return goss_on and allow_device_ranking
 
 
 struct HostGradientStage(Movable):

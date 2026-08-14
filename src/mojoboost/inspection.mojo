@@ -26,6 +26,15 @@ The schema's primitives (`node_depths`, `split_ordinals`, `category_bins`,
 predicates, and the version constants) live in `model_dump.mojo` and are
 re-exported here, so a caller that reaches for `inspection` finds them
 where the schema doc says they are.
+
+Editing
+-------
+Nothing here writes to a model, and `model_editing_status_json` says so in
+a form a consumer can read rather than leaving the absence to be
+discovered. The invariants that would have to be restated after an
+arbitrary leaf edit are named there and in
+`docs/MODEL_INSPECTION_SCHEMA.md`; until they can be, the dump is a report
+and not a handle.
 """
 
 from std.math import isnan
@@ -126,11 +135,13 @@ def _json_f64_list(values: List[Float64]) -> String:
 def split_gains(trees: List[Tree]) -> String:
     """Per node split gains, one JSON array per tree, in tree order.
 
-    The one fact a dump built from a saved model cannot recover: gains are
-    recorded when a node is split and are not serialized. A leaf's entry is
-    0.0, since a leaf earned no gain. This is the smallest shape a binding
-    can expose to give a text-sourced dump its gains back; the whole dump
-    carries them already.
+    A leaf's entry is 0.0, since a leaf earned no gain. Model format v4
+    serializes gains (see serialize.mojo), so a model saved and loaded by a
+    current build carries its own; this stays as the smallest shape a
+    binding can expose to give a dump built from an older file's *text* its
+    gains back, from a live handle that still holds them. The whole dump
+    carries them already, so a build that exposes the dump does not need
+    this.
     """
     var out = String("[")
     for t in range(len(trees)):
@@ -297,6 +308,48 @@ def dump_json(dump: ModelDump) raises -> String:
             out += ","
         _write_tree(out, dump, dump.trees[t])
     out += "]}"
+    return out^
+
+
+# Whether this build can edit a fitted model in place. False, and the one
+# place that says so: `model_editing_status_json` reports it, and
+# `python/mojoboost/inspection.py` mirrors it as `MODEL_EDITING_SUPPORTED`.
+# Flipping it is not a flag change; it is the work the status names.
+comptime MODEL_EDITING_SUPPORTED = False
+
+
+def model_editing_status_json() -> String:
+    """Whether a fitted model can be edited, and if not, what would have to
+    hold first.
+
+    An explicit status rather than a missing function, so a consumer asking
+    "can I set a leaf value here?" gets an answer it can branch on instead
+    of an `AttributeError`. The three invariants are the reason the answer
+    is no: each is a fact a fitted tree records about the fit that produced
+    it, and an arbitrary leaf edit falsifies all three while leaving them in
+    place, where nothing downstream could tell the edit from corruption.
+
+    Serialization is the fourth reason, and it is the one this build could
+    not paper over: a v4 file carries node covers and split gains, so an
+    edited leaf would be saved alongside the sums and counts that contradict
+    it.
+    """
+    var out = String("{\"supported\":false")
+    out += ",\"operation\":\"set_leaf_output\""
+    out += ",\"reason\":\"a fitted tree records facts about the fit that"
+    out += " produced it; an arbitrary leaf edit falsifies them and leaves"
+    out += " them in place\""
+    out += ",\"invariants\":["
+    out += "\"node covers are the training rows that reached a node, and"
+    out += " exact feature contributions condition on them\""
+    out += ",\"an internal node's value is the value it held when it was"
+    out += " created, not a function of its children\""
+    out += ",\"a split gain was computed from the gradient sums a leaf held"
+    out += " at growth time, which the tree no longer holds\""
+    out += "]"
+    out += ",\"serialized_state\":[\"count\",\"split_gain\"]"
+    out += ",\"model_format_version\":" + String(MODEL_FORMAT_VERSION)
+    out += "}"
     return out^
 
 

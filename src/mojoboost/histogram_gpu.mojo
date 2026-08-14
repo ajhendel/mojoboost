@@ -116,7 +116,6 @@ from max.gpu.host import DeviceBuffer, DeviceContext, HostBuffer
 
 from .apple_histogram_policy import (
     REASON_AS_REQUESTED,
-    REASON_NOT_REQUESTED,
     SPEC_LEVEL_BATCHED,
     HistogramPlan,
     HistogramWorkload,
@@ -985,48 +984,74 @@ struct GpuHistogramBuilder(Movable):
         _ = counts
         return out^
 
+    def batches(mut self, counts: List[Int]) raises -> Bool:
+        """Whether leaves of these row counts would be built in one launch.
+
+        The whole batching decision, in one place, so a grower choosing
+        between a batch and the subtraction trick and `build_leaves` itself
+        cannot answer it differently. Three conditions, none of them new:
+        the batched level was asked for
+        (`MOJOBOOST_GPU_HIST_SPECIALIZATION=batched`), the launcher and its
+        slot pool are affordable at this dataset's shape, and
+        `apple_histogram_policy.batching_declined_reason` endorses this
+        frontier, which it does not for fewer than two leaves and does not
+        when every leaf already fills the device on its own.
+
+        The plan the verdict is read off belongs to the batch's *largest*
+        leaf, which is the one with the best chance of filling the device
+        alone: if even its geometry leaves the device short, no smaller leaf
+        in the batch fills it either.
+        """
+        if self.spec_level < SPEC_LEVEL_BATCHED or len(counts) < 2:
+            return False
+        if not self.open_batching():
+            return False
+        var widest = 0
+        for i in range(len(counts)):
+            if counts[i] > widest:
+                widest = counts[i]
+        var verdict = batching_declined_reason(
+            self.histogram_plan(widest),
+            profile_from_caps(self.caps),
+            build_kernel_features(),
+            counts,
+            len(self.active),
+        )
+        return verdict == REASON_AS_REQUESTED
+
+    def batches_nodes(mut self, nodes: List[Int]) raises -> Bool:
+        """`batches` for a list of node ids, with the row counts looked up
+        here. The level check comes first so the default path answers
+        without touching the range table."""
+        if self.spec_level < SPEC_LEVEL_BATCHED or len(nodes) < 2:
+            return False
+        return self.batches(self.leaf_rows(nodes))
+
+    def leaf_rows(self, nodes: List[Int]) raises -> List[Int]:
+        """Each node's current row count, off the device-resident ranges.
+        What a grower hands `batches` before it decides."""
+        var counts = List[Int](capacity=len(nodes))
+        for i in range(len(nodes)):
+            counts.append(self.rows.range_of(nodes[i]).count())
+        return counts^
+
     def build_leaves(mut self, nodes: List[Int]) raises -> List[Histogram]:
         """Every node's histogram, in `nodes` order.
 
         The multi-leaf entry point, and the one a grower with more than one
-        pending leaf should call. Whether it batches is not this method's
-        decision and not a new switch: the level comes from
-        `MOJOBOOST_GPU_HIST_SPECIALIZATION` and the verdict from
-        `apple_histogram_policy.batching_declined_reason`, which declines a
-        batch of fewer than two leaves and a frontier whose every leaf
-        already fills the device. Declined, unrequested, or unaffordable,
-        each node goes through `build_leaf` exactly as before, so a caller
-        may always call this and never has to branch on the policy itself.
-
-        The plan the verdict is read off belongs to the batch's *largest*
-        node, which is the leaf with the best chance of filling the device
-        alone: if even its geometry leaves the device short, no smaller leaf
-        in the batch fills it either.
+        pending leaf should call. Whether it batches is `batches`'s answer
+        and not a switch of its own; where that answer is no, each node goes
+        through `build_leaf` exactly as before, so a caller may always call
+        this and never has to branch on the policy itself.
         """
         if len(nodes) < 1:
             raise Error("build_leaves needs at least one node")
-        var counts = List[Int](capacity=len(nodes))
-        var widest = 0
         for i in range(len(nodes)):
             for k in range(i):
                 if nodes[k] == nodes[i]:
                     raise Error("build_leaves may not hold a node twice")
-            var rows = self.rows.range_of(nodes[i]).count()
-            counts.append(rows)
-            if rows > widest:
-                widest = rows
-
-        var verdict = REASON_NOT_REQUESTED
-        if self.spec_level >= SPEC_LEVEL_BATCHED and len(nodes) >= 2:
-            if self.open_batching():
-                verdict = batching_declined_reason(
-                    self.histogram_plan(widest),
-                    profile_from_caps(self.caps),
-                    build_kernel_features(),
-                    counts,
-                    len(self.active),
-                )
-        if verdict == REASON_AS_REQUESTED:
+        var counts = self.leaf_rows(nodes)
+        if self.batches(counts):
             return self._build_leaves_batched(nodes, counts)
 
         var out = List[Histogram](capacity=len(nodes))

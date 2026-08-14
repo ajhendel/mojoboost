@@ -1,48 +1,46 @@
 """Categorical primitives for the sparse GPU path.
 
-Three things live here, all of them isolated: they read a device-resident
+Two things live here, both of them device-side: they read a device-resident
 sparse matrix and a category table and hand back statistics or a routing
-mask, and none of them changes how a tree is grown, how a model is stored, or
-how a prediction is made.
+mask, and neither changes how a tree is grown, how a model is stored, or how
+a prediction is made.
 
-1. **The sparse categorical semantics**, stated and checkable. A categorical
-   feature's absent entries are the value 0.0, which is *category code 0*,
-   and that is a very different thing from a numerical feature's zero. See
-   below; this is the subtlety the rest of the module exists to keep honest.
-2. **Device-side category-set membership**, through a pooled bitset rather
+1. **Device-side category-set membership**, through a pooled bitset rather
    than through four kernel arguments, so a grower can hold every live node's
-   category set on the device at once.
-3. **Device-side category statistics** for one categorical feature at one
+   category set on the device at once. `apply_categorical_split_pooled`
+   routes a split from the pool and then hands the partition and the range
+   bookkeeping back to `GpuSparseHistogramBuilder.finish_split`, so the
+   pooled and the four-argument forms share one split implementation.
+2. **Device-side category statistics** for one categorical feature at one
    node, straight from the compressed column, with the implicit zeros folded
    in by the same subtraction `gpu_sparse.mojo` uses for the default bin.
+   `GpuCategoryStats` owns the one output buffer that needs and drives the
+   builder's own node-total reduction, so the two accumulations quantize
+   identically.
+
+Where the semantics live
+------------------------
+Not here. `sparse.default_category_bin`, `sparse.absent_is_unknown`, and
+`sparse.check_sparse_categorical_semantics` state what an absent entry of a
+categorical column means, and they live in `sparse.mojo` because they are
+facts about that representation, not about a device: a CPU caller has to be
+able to ask them without importing a GPU module, and
+`SparseBinnedMatrix.validate` enforces them on every matrix that enters
+training on either backend. They are imported below and re-exported from
+here, so a device-side caller reads one name in one place.
+
+The short version, because the rest of this module depends on it: an absent
+entry of a categorical feature is the value 0.0, which is *category code 0*,
+so it takes category 0's bin when the fitted table kept that code and
+`UNKNOWN_BIN` when it did not -- and in the second case every absent row
+routes right at every categorical node of the feature, along with the
+missing, unseen, and dropped ones. `absent_is_unknown` is how a caller finds
+out which of the two a column got.
 
 What is *not* here: the split search. `gpu_split_search.mojo` already runs
 LightGBM's one-vs-rest and sorted category searches on the device, over a
 histogram, and it neither knows nor cares whether that histogram came from a
 dense matrix or a compressed one. Nothing in this module duplicates it.
-
-Absent entries of a categorical feature
----------------------------------------
-`sparse.default_bins` gives a categorical feature the bin of the value 0.0,
-which `CategoricalSpec.bin_of` resolves as:
-
-- **code 0 was kept** (it is in the fitted table): the default bin is that
-  category's own bin, `i + 1` for the i-th kept code. Every row without a
-  stored entry for this feature is then a row of category 0, which is exactly
-  what it is, and those rows join whichever side of a split category 0 lands
-  on.
-- **code 0 was not kept** (the column never held it, or it was dropped as
-  too rare for `max_bins - 1`): the default bin is `UNKNOWN_BIN`, bin 0. Bin
-  0 is never a member of a split's category set, so *every absent row routes
-  right at every categorical node of this feature*, along with the missing,
-  unseen, and dropped rows.
-
-Both are correct, and the second is the trap: a one-hot-ish column whose
-zeros mean "not this category" behaves completely differently depending on
-whether 0 survived the category table, and nothing in the numbers says so.
-`absent_is_unknown` answers it for a feature, and
-`check_sparse_categorical_semantics` answers it for a whole matrix, so a
-caller can report it rather than discover it in a fitted model.
 
 Bin 0 must never enter a category set
 -------------------------------------
@@ -79,10 +77,16 @@ from .gpu_sparse import (
     TOT_COUNT,
     TOT_GRAD,
     TOT_HESS,
+    GpuSparseHistogramBuilder,
 )
 from .gpu_tiling import DeviceCaps, derive_block_threads
 from .histogram_sparse import SparseNodeEntries
-from .sparse import SparseBinnedMatrix
+from .sparse import (
+    SparseBinnedMatrix,
+    absent_is_unknown,
+    check_sparse_categorical_semantics,
+    default_category_bin,
+)
 
 comptime CAT_STAT_BINS = CAT_MAX_BINS
 

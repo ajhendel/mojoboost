@@ -9,10 +9,16 @@ entries plus one sequential pass over its own rows.
 Nothing here is wired into training and nothing enables it. There is no
 `device="gpu"` path for sparse input, no automatic switch from the dense
 builder, and no densification anywhere: a `SparseBinnedMatrix` goes to the
-device as a compressed structure and comes back as a `Histogram`. See
+device as a compressed structure and comes back as a `Histogram`. That gap
+is now a value rather than a docstring: `gpu_sparse_layout`'s
+`SparseGpuCapability` records that the primitives are available and the
+training path is not, this builder holds one for its dataset, and
+`check_sparse_gpu_training` is what an explicit sparse `device="gpu"`
+request must go through -- so such a request fails with a reason instead of
+running on the CPU under a device label. See
 `docs/GPU_SPARSE_CATEGORICAL_DESIGN.md` for the design and
-`handoffs/performance_16_sparse_categorical_gpu.md` for the integration a
-training path would need.
+`handoffs/connect_10_sparse_categorical.md` for the integration a training
+path would need.
 
 Two indexings, both device-resident
 -----------------------------------
@@ -134,7 +140,8 @@ What is deliberately not here
   histogram on the device and does not care how the histogram was built, so
   a sparse histogram feeds it unchanged.
 - **No `device="gpu"` for sparse input.** Not exposed, not routed to, not
-  defaulted to.
+  defaulted to, and `SparseGpuCapability.training` is False so nothing can
+  report otherwise by accident.
 """
 
 from std.atomic import Atomic
@@ -154,9 +161,9 @@ from .gpu_sparse_layout import (
     SPARSE_REDUCE_MAX_THREADS,
     SPARSE_SCAN_MAX_THREADS,
     SparseDeviceLayout,
+    SparseGpuCapability,
     SparseRangeTable,
-    check_categorical_support,
-    check_sparse_support,
+    check_sparse_gpu_histograms,
     derive_entry_tiling,
 )
 from .gpu_tiling import (
@@ -991,6 +998,11 @@ struct GpuSparseHistogramBuilder(Movable):
     var block_threads: Int
     var layout: SparseDeviceLayout
     var windows: SparseRangeTable
+    var capability: SparseGpuCapability
+    """What the device path can do with this dataset, recorded at
+    construction. `capability.training` is False, and stays False until a
+    sparse GPU trainer exists: holding the record here means a caller that
+    got a builder still cannot read it as a claim that training is wired."""
     var g_scale: Float64
     var h_scale: Float64
     var has_gradients: Bool
@@ -1028,21 +1040,17 @@ struct GpuSparseHistogramBuilder(Movable):
                 "max_nodes must be at least 2; the last id is reserved"
             )
         var nnz = data.nnz()
-        check_sparse_support(
-            caps, data.n_rows, data.n_features, data.n_bins, nnz
-        )
-        check_categorical_support(data.cats, data.n_features, data.n_bins)
-        if len(data.row_index) != nnz:
-            raise Error("row_index and bin must have equal length")
-        if len(data.col_offsets) != data.n_features + 1:
-            raise Error("col_offsets must have length n_features + 1")
-        if data.col_offsets[0] != 0:
-            raise Error("col_offsets must start at 0")
-        if data.col_offsets[data.n_features] != nnz:
-            raise Error("col_offsets must end at nnz")
-        if len(data.default_bin) != data.n_features:
-            raise Error("default_bin must have one entry per feature")
+        # The structural half (offset shape, index and bin ranges, ascending
+        # row order per column, categorical default bins) is
+        # `SparseBinnedMatrix.validate`'s, shared with the CPU trainers, so
+        # the two backends cannot drift on what a well-formed matrix is. Only
+        # the device-specific half -- the Int32 index widths, the bin ceiling,
+        # the shared-memory bound, and the 256-bit category set -- is checked
+        # here, and it is checked through the capability record so that a
+        # caller can ask the same question without opening a context.
+        var capability = check_sparse_gpu_histograms(caps, data)
 
+        self.capability = capability^
         self.ctx = ctx
         self.n_rows = data.n_rows
         self.n_features = data.n_features
@@ -1070,23 +1078,16 @@ struct GpuSparseHistogramBuilder(Movable):
         self.col_offsets = data.col_offsets.copy()
         self.default_bin = List[Int](capacity=data.n_features)
         for f in range(data.n_features):
-            var d = Int(data.default_bin[f])
-            if d < 0 or d >= data.n_bins:
-                raise Error("default bin out of range")
-            self.default_bin.append(d)
+            self.default_bin.append(Int(data.default_bin[f]))
 
-        # Every index the kernels dereference is checked once, here, rather
-        # than guarded per access: a stored entry naming a row or a bin
-        # outside the matrix would read out of bounds on the device, where
-        # there is nothing to catch it.
+        # Every index the kernels dereference was bounded by the validation
+        # above, which is what makes this a pure width narrowing: a stored
+        # entry naming a row or a bin outside the matrix would read out of
+        # bounds on the device, where there is nothing to catch it, so it is
+        # rejected before the upload rather than guarded per access.
         var widened_rows = List[Int32](capacity=nnz)
         for i in range(nnz):
-            var r = data.row_index[i]
-            if r < 0 or r >= data.n_rows:
-                raise Error("stored entry row index out of range")
-            if Int(data.bin[i]) >= data.n_bins:
-                raise Error("stored entry bin out of range")
-            widened_rows.append(Int32(r))
+            widened_rows.append(Int32(data.row_index[i]))
         var widened_cols = List[Int32](capacity=data.n_features + 1)
         for f in range(data.n_features + 1):
             widened_cols.append(Int32(data.col_offsets[f]))
@@ -1370,30 +1371,32 @@ struct GpuSparseHistogramBuilder(Movable):
 
     # --- histograms -------------------------------------------------------
 
-    def enqueue_leaf(mut self, leaf: Int) raises:
-        """Enqueue the three kernels building `leaf`'s histogram. Does not
-        transfer or synchronize."""
-        if not self.has_gradients:
-            raise Error("call upload_gradients before build_leaf")
-        if leaf < 0 or leaf >= self.max_nodes - 1:
+    def _check_node(self, node: Int) raises:
+        if node < 0 or node >= self.max_nodes - 1:
             raise Error(
                 "node id out of range; the last id is reserved for a bagged"
                 " root's out-of-bag entries and owns no rows"
             )
 
-        var hist_size = self.n_features * self.n_bins
-        _enqueue_zero_i32(
-            self.ctx,
-            self.out_dev.unsafe_ptr(),
-            3 * hist_size,
-            self.block_threads,
-        )
+    def enqueue_node_totals(mut self, node: Int) raises:
+        """Zero the totals cells and sum `node`'s rows into them, in the same
+        fixed point the entry accumulation uses.
+
+        Split out of `enqueue_leaf` because the totals are what *any*
+        subtraction-completed accumulation over this node needs, not only the
+        histogram: `gpu_categorical.enqueue_category_stats` fills one
+        feature's per-category planes and then subtracts against these same
+        three cells. One reduction, one owner, no second copy of the
+        quantization.
+        """
+        if not self.has_gradients:
+            raise Error("call upload_gradients first")
+        self._check_node(node)
         _enqueue_zero_i32(
             self.ctx, self.totals_dev.unsafe_ptr(), 3, self.block_threads
         )
-
         var reduce_threads = self._reduce_threads()
-        var window = self.rows.range_of(leaf)
+        var window = self.rows.range_of(node)
         if window.count() > 0:
             # Capped at a few waves rather than at one element per thread:
             # the kernel's whole output is three cells, so the block count is
@@ -1419,6 +1422,23 @@ struct GpuSparseHistogramBuilder(Movable):
                 grid_dim=total_blocks,
                 block_dim=reduce_threads,
             )
+
+    def enqueue_leaf(mut self, leaf: Int) raises:
+        """Enqueue the three kernels building `leaf`'s histogram. Does not
+        transfer or synchronize."""
+        if not self.has_gradients:
+            raise Error("call upload_gradients before build_leaf")
+        self._check_node(leaf)
+
+        var hist_size = self.n_features * self.n_bins
+        _enqueue_zero_i32(
+            self.ctx,
+            self.out_dev.unsafe_ptr(),
+            3 * hist_size,
+            self.block_threads,
+        )
+        self.enqueue_node_totals(leaf)
+        var reduce_threads = self._reduce_threads()
 
         var n_slots = len(self.active)
         var max_entries = self.windows.max_entries(leaf, self.active)
@@ -1544,6 +1564,87 @@ struct GpuSparseHistogramBuilder(Movable):
             out.append(Int(src.unsafe_load(f)))
         return out^
 
+    def check_split_ids(self, parent: Int, left: Int, right: Int) raises:
+        """The node-id contract every split has to satisfy, whatever computed
+        its side mask."""
+        if parent < 0 or left < 0 or right < 0:
+            raise Error("node ids must be nonnegative")
+        if (
+            left >= self.max_nodes - 1
+            or right >= self.max_nodes - 1
+            or parent >= self.max_nodes - 1
+        ):
+            raise Error(
+                "node id is at or past the reserved id; raise max_nodes"
+            )
+        if left == parent or right == parent or left == right:
+            raise Error(
+                "child node ids must differ from the parent and each other"
+            )
+
+    def enqueue_default_side(
+        mut self, parent: Int, goes_left: Bool
+    ) raises -> Int:
+        """Write one side over every row of `parent` and return its row count.
+
+        Every row of the node takes the side of the split feature's default
+        bin -- that is what an absent entry routes as, because an absent entry
+        *is* the value 0.0 -- and only the rows that do have a stored entry
+        for the split feature are corrected afterwards. Both the numerical
+        and the categorical arm start here.
+        """
+        self._check_node(parent)
+        var rng = self.rows.range_of(parent)
+        if rng.count() > 0:
+            self.ctx.enqueue_function[_sparse_side_default_kernel](
+                self.rows.rows_dev.unsafe_ptr(),
+                self.side_dev.unsafe_ptr(),
+                Int32(rng.begin),
+                Int32(rng.count()),
+                SIDE_LEFT if goes_left else SIDE_RIGHT,
+                grid_dim=self._blocks(rng.count()),
+                block_dim=self.block_threads,
+            )
+        return rng.count()
+
+    def finish_split(
+        mut self,
+        parent: Int,
+        left: Int,
+        right: Int,
+        expected_left: Int = -1,
+    ) raises:
+        """Partition `parent`'s rows and entries by the side mask currently
+        in `side_dev`, and record the children's windows.
+
+        The half of a split that does not depend on how the mask was
+        computed, so a caller that filled the mask some other way -- the
+        pooled categorical routing in `gpu_categorical.mojo` is the one that
+        does -- reuses this rather than repeating the partition, the
+        reserved-id rules, and the range bookkeeping. `apply_split` is that
+        caller too.
+
+        The side buffer is read as a synthetic one-column binned matrix:
+        feature 0, inclusive threshold bin 0, no missing bin, so `bin <= 0`
+        reads as "side == SIDE_LEFT". That lets the row partition be the
+        dense path's, unforked.
+        """
+        self.check_split_ids(parent, left, right)
+        _ = self.rows.partition(
+            self.side_dev.unsafe_ptr(),
+            parent,
+            left,
+            right,
+            RowRouting.numerical(0, 0, -1, False),
+            expected_left,
+        )
+        self._enqueue_entry_partition(parent, left, right)
+        if self.defer_ranges:
+            self.windows.bound_split(parent, left, right)
+        else:
+            var mids = self._download_mids()
+            self.windows.split(parent, left, right, mids)
+
     def apply_split(
         mut self,
         feature: Int,
@@ -1571,20 +1672,7 @@ struct GpuSparseHistogramBuilder(Movable):
         """
         if feature < 0 or feature >= self.n_features:
             raise Error("split feature out of range")
-        if parent < 0 or left < 0 or right < 0:
-            raise Error("node ids must be nonnegative")
-        if (
-            left >= self.max_nodes - 1
-            or right >= self.max_nodes - 1
-            or parent >= self.max_nodes - 1
-        ):
-            raise Error(
-                "node id is at or past the reserved id; raise max_nodes"
-            )
-        if left == parent or right == parent or left == right:
-            raise Error(
-                "child node ids must differ from the parent and each other"
-            )
+        self.check_split_ids(parent, left, right)
 
         var routing: RowRouting
         if is_categorical:
@@ -1595,24 +1683,10 @@ struct GpuSparseHistogramBuilder(Movable):
             )
         routing.check(self.n_features, self.n_bins)
 
-        var rng = self.rows.range_of(parent)
         var window = self.windows.get(parent)
-
-        # Every row of the node takes the side of the split feature's default
-        # bin -- that is what an absent entry routes as, because an absent
-        # entry *is* the value 0.0 -- and only the rows with a stored entry
-        # for this feature are corrected below.
-        var goes_left = routing.goes_left(self.default_bin[feature])
-        if rng.count() > 0:
-            self.ctx.enqueue_function[_sparse_side_default_kernel](
-                self.rows.rows_dev.unsafe_ptr(),
-                self.side_dev.unsafe_ptr(),
-                Int32(rng.begin),
-                Int32(rng.count()),
-                SIDE_LEFT if goes_left else SIDE_RIGHT,
-                grid_dim=self._blocks(rng.count()),
-                block_dim=self.block_threads,
-            )
+        _ = self.enqueue_default_side(
+            parent, routing.goes_left(self.default_bin[feature])
+        )
         var n_entries = window.ends[feature] - window.starts[feature]
         if n_entries > 0:
             var cat = routing.cat_bitset
@@ -1637,25 +1711,7 @@ struct GpuSparseHistogramBuilder(Movable):
                 block_dim=self.block_threads,
             )
 
-        # The side buffer is a synthetic one-column binned matrix: feature 0,
-        # inclusive threshold bin 0, no missing bin, so `bin <= 0` reads as
-        # "side == SIDE_LEFT". That lets the row partition be the dense
-        # path's, unforked.
-        _ = self.rows.partition(
-            self.side_dev.unsafe_ptr(),
-            parent,
-            left,
-            right,
-            RowRouting.numerical(0, 0, -1, False),
-            expected_left,
-        )
-
-        self._enqueue_entry_partition(parent, left, right)
-        if self.defer_ranges:
-            self.windows.bound_split(parent, left, right)
-        else:
-            var mids = self._download_mids()
-            self.windows.split(parent, left, right, mids)
+        self.finish_split(parent, left, right, expected_left)
 
 
 def _magnitude_sum(values: List[Float64]) raises -> Float64:
