@@ -2,21 +2,94 @@
 
 Trains an additive ensemble of leaf-wise trees on second-order gradients.
 Objectives: squared error (regression), binary logistic (labels in {0, 1}),
-and multiclass softmax (labels in 0..n_classes-1, via train_multiclass).
+poisson counts, huber, quantile, L1 (mean absolute error), and multiclass
+softmax (labels in 0..n_classes-1, via train_multiclass).
+
+QUANTILE and L1 follow LightGBM's RenewTreeOutput: after each tree is
+grown, every leaf's Newton value is replaced by the alpha-percentile
+(median for L1) of the residuals of the rows in that leaf, and shrinkage
+is applied to the renewed value. `alpha` is the target quantile for
+QUANTILE and the transition point of the huber loss for HUBER; the other
+objectives ignore it.
 """
 
 from std.math import exp, log
 
 from .binning import BinnedMatrix
+from .metrics import _argsort
 from .tree import Tree, TreeParams, grow_tree
 
 comptime SQUARED_ERROR = 0
 comptime BINARY_LOGISTIC = 1
 comptime POISSON = 2
+comptime HUBER = 3
+comptime QUANTILE = 4
+comptime L1 = 5
 
 # LightGBM's poisson_max_delta_step: the hessian is exp(raw + this), which
 # caps the Newton step for rows with tiny predicted means.
 comptime _POISSON_MAX_DELTA_STEP = 0.7
+
+
+def _sign(x: Float64) -> Float64:
+    if x > 0.0:
+        return 1.0
+    if x < 0.0:
+        return -1.0
+    return 0.0
+
+
+def _percentile(values: List[Float64], alpha: Float64) -> Float64:
+    """LightGBM's PercentileFun: linear interpolation at position
+    (n - 1) * alpha of the ascending sorted values."""
+    var n = len(values)
+    if n <= 1:
+        return values[0]
+    var order = _argsort(values)
+    var float_pos = Float64(n - 1) * alpha
+    var pos = Int(float_pos)
+    if pos >= n - 1:
+        return values[order[n - 1]]
+    var bias = float_pos - Float64(pos)
+    var v1 = values[order[pos]]
+    var v2 = values[order[pos + 1]]
+    return v1 + (v2 - v1) * bias
+
+
+def _weighted_percentile(
+    values: List[Float64], weights: List[Float64], alpha: Float64
+) -> Float64:
+    """LightGBM's WeightedPercentileFun: stable-sort by value, walk the
+    weighted cdf to threshold = alpha * total weight, and interpolate
+    between the straddling values only when their cdf gap is at least
+    1.0 (otherwise the lower value is returned)."""
+    var n = len(values)
+    if n <= 1:
+        return values[0]
+    var order = _argsort(values)
+    var cdf = List[Float64](capacity=n)
+    var total = 0.0
+    for i in range(n):
+        total += weights[order[i]]
+        cdf.append(total)
+    var threshold = total * alpha
+    var pos = n
+    for i in range(n):
+        if cdf[i] > threshold:
+            pos = i
+            break
+    if pos > n - 1:
+        pos = n - 1
+    if pos == 0 or pos == n - 1:
+        return values[order[pos]]
+    var v1 = values[order[pos - 1]]
+    var v2 = values[order[pos]]
+    if cdf[pos] - cdf[pos - 1] >= 1.0:
+        return (
+            (threshold - cdf[pos - 1]) / (cdf[pos] - cdf[pos - 1]) * (v2 - v1)
+            + v1
+        )
+    return v1
 
 
 def _sigmoid(x: Float64) -> Float64:
@@ -35,17 +108,26 @@ def _clamp_prob(p: Float64) -> Float64:
     return p
 
 
-def _check_objective(objective: Int, target: List[Float64]) raises:
+def _check_objective(
+    objective: Int, target: List[Float64], alpha: Float64
+) raises:
     if (
         objective != SQUARED_ERROR
         and objective != BINARY_LOGISTIC
         and objective != POISSON
+        and objective != HUBER
+        and objective != QUANTILE
+        and objective != L1
     ):
         raise Error("unknown objective")
     if objective == POISSON:
         for r in range(len(target)):
             if target[r] < 0.0:
                 raise Error("poisson target values must be nonnegative")
+    if objective == HUBER and alpha <= 0.0:
+        raise Error("huber requires alpha > 0")
+    if objective == QUANTILE and (alpha <= 0.0 or alpha >= 1.0):
+        raise Error("quantile requires 0 < alpha < 1")
 
 
 def _check_sample_weight(weights: List[Float64], n: Int) raises:
@@ -55,14 +137,28 @@ def _check_sample_weight(weights: List[Float64], n: Int) raises:
         return
     if len(weights) != n:
         raise Error("sample_weight length must equal n_rows")
+    var total = 0.0
     for r in range(n):
         if weights[r] < 0.0:
             raise Error("sample_weight entries must be nonnegative")
+        total += weights[r]
+    if total <= 0.0:
+        raise Error("sample_weight must have a positive sum")
 
 
 def _base_score(
-    target: List[Float64], objective: Int, weights: List[Float64]
+    target: List[Float64],
+    objective: Int,
+    weights: List[Float64],
+    alpha: Float64,
 ) raises -> Float64:
+    # QUANTILE and L1 boost from the target percentile, LightGBM style;
+    # every other objective boosts from the (weighted) mean.
+    if objective == QUANTILE or objective == L1:
+        var q = alpha if objective == QUANTILE else 0.5
+        if len(weights) > 0:
+            return _weighted_percentile(target, weights, q)
+        return _percentile(target, q)
     var mean = 0.0
     var total_w = 0.0
     for r in range(len(target)):
@@ -87,6 +183,7 @@ def _fill_grad_hess(
     target: List[Float64],
     objective: Int,
     weights: List[Float64],
+    alpha: Float64,
     mut grad: List[Float64],
     mut hess: List[Float64],
 ):
@@ -107,6 +204,29 @@ def _fill_grad_hess(
             var mu = exp(raw[r])
             grad.append(w * (mu - target[r]))
             hess.append(w * exp(raw[r] + _POISSON_MAX_DELTA_STEP))
+    elif objective == HUBER:
+        for r in range(len(target)):
+            var w = weights[r] if len(weights) > 0 else 1.0
+            var diff = raw[r] - target[r]
+            if abs(diff) <= alpha:
+                grad.append(w * diff)
+            else:
+                grad.append(w * _sign(diff) * alpha)
+            hess.append(w)
+    elif objective == QUANTILE:
+        for r in range(len(target)):
+            var w = weights[r] if len(weights) > 0 else 1.0
+            var diff = raw[r] - target[r]
+            if diff >= 0.0:
+                grad.append(w * (1.0 - alpha))
+            else:
+                grad.append(w * -alpha)
+            hess.append(w)
+    elif objective == L1:
+        for r in range(len(target)):
+            var w = weights[r] if len(weights) > 0 else 1.0
+            grad.append(w * _sign(raw[r] - target[r]))
+            hess.append(w)
     else:
         for r in range(len(target)):
             var w = weights[r] if len(weights) > 0 else 1.0
@@ -115,7 +235,7 @@ def _fill_grad_hess(
 
 
 def _mean_loss(
-    raw: List[Float64], target: List[Float64], objective: Int
+    raw: List[Float64], target: List[Float64], objective: Int, alpha: Float64
 ) -> Float64:
     var total = 0.0
     if objective == BINARY_LOGISTIC:
@@ -129,11 +249,63 @@ def _mean_loss(
         # Poisson negative log likelihood up to a constant in the target.
         for r in range(len(target)):
             total += exp(raw[r]) - target[r] * raw[r]
+    elif objective == HUBER:
+        for r in range(len(target)):
+            var d = abs(raw[r] - target[r])
+            if d <= alpha:
+                total += 0.5 * d * d
+            else:
+                total += alpha * (d - 0.5 * alpha)
+    elif objective == QUANTILE:
+        # Pinball loss.
+        for r in range(len(target)):
+            var d = raw[r] - target[r]
+            if d >= 0.0:
+                total += (1.0 - alpha) * d
+            else:
+                total += -alpha * d
+    elif objective == L1:
+        for r in range(len(target)):
+            total += abs(raw[r] - target[r])
     else:
         for r in range(len(target)):
             var d = raw[r] - target[r]
             total += d * d
     return total / Float64(len(target))
+
+
+def _renew_leaf_values(
+    mut tree: Tree,
+    data: BinnedMatrix,
+    target: List[Float64],
+    raw: List[Float64],
+    weights: List[Float64],
+    alpha: Float64,
+) raises:
+    """LightGBM's RenewTreeOutput for QUANTILE and L1: replace each leaf's
+    Newton value with the alpha-percentile of the residuals
+    (target - current raw score) of the rows in that leaf. Runs before
+    shrinkage, which then applies to the renewed value."""
+    var n_nodes = len(tree.feature)
+    var leaf_residuals = List[List[Float64]]()
+    var leaf_weights = List[List[Float64]]()
+    for _ in range(n_nodes):
+        leaf_residuals.append(List[Float64]())
+        leaf_weights.append(List[Float64]())
+    for r in range(data.n_rows):
+        var node = tree.leaf_index_row(data, r)
+        leaf_residuals[node].append(target[r] - raw[r])
+        if len(weights) > 0:
+            leaf_weights[node].append(weights[r])
+    for node in range(n_nodes):
+        if tree.feature[node] >= 0 or len(leaf_residuals[node]) == 0:
+            continue
+        if len(weights) > 0:
+            tree.value[node] = _weighted_percentile(
+                leaf_residuals[node], leaf_weights[node], alpha
+            )
+        else:
+            tree.value[node] = _percentile(leaf_residuals[node], alpha)
 
 
 @fieldwise_init
@@ -192,19 +364,22 @@ def train(
     objective: Int,
     params: BoosterParams,
     sample_weight: List[Float64] = [],
+    alpha: Float64 = 0.9,
 ) raises -> Booster:
     """Train a boosted ensemble. `target` is the regression target for
-    SQUARED_ERROR, {0, 1} labels for BINARY_LOGISTIC, or nonnegative
-    counts for POISSON. A non-empty sample_weight scales each row's
-    gradient and hessian, LightGBM style; a row with weight zero is
-    ignored."""
+    SQUARED_ERROR, HUBER, QUANTILE, and L1, {0, 1} labels for
+    BINARY_LOGISTIC, or nonnegative counts for POISSON. A non-empty
+    sample_weight scales each row's gradient and hessian, LightGBM style;
+    a row with weight zero is ignored. `alpha` is the target quantile for
+    QUANTILE and the huber transition point for HUBER (LightGBM's alpha,
+    default 0.9); other objectives ignore it."""
     if len(target) != data.n_rows:
         raise Error("target length must equal n_rows")
-    _check_objective(objective, target)
+    _check_objective(objective, target, alpha)
     _check_sample_weight(sample_weight, data.n_rows)
 
     var n = data.n_rows
-    var base_score = _base_score(target, objective, sample_weight)
+    var base_score = _base_score(target, objective, sample_weight, alpha)
     var raw = List[Float64](capacity=n)
     for _ in range(n):
         raw.append(base_score)
@@ -213,8 +388,14 @@ def train(
     var grad = List[Float64](capacity=n)
     var hess = List[Float64](capacity=n)
     for _ in range(params.n_estimators):
-        _fill_grad_hess(raw, target, objective, sample_weight, grad, hess)
+        _fill_grad_hess(
+            raw, target, objective, sample_weight, alpha, grad, hess
+        )
         var tree = grow_tree(data, grad, hess, params.tree)
+        if objective == QUANTILE:
+            _renew_leaf_values(tree, data, target, raw, sample_weight, alpha)
+        elif objective == L1:
+            _renew_leaf_values(tree, data, target, raw, sample_weight, 0.5)
 
         # A single-leaf tree with a near-zero value means the objective has
         # converged; further rounds cannot make progress.
@@ -238,25 +419,26 @@ def train_with_valid(
     early_stopping_rounds: Int,
     min_delta: Float64 = 0.0,
     sample_weight: List[Float64] = [],
+    alpha: Float64 = 0.9,
 ) raises -> Booster:
     """Train with validation-set early stopping. Stops when the validation
-    loss (MSE / log loss) has not improved by more than min_delta for
-    early_stopping_rounds consecutive rounds and truncates the ensemble
-    to its best round. sample_weight applies to training rows only; the
-    validation loss is unweighted."""
+    loss (MSE / log loss / huber / pinball / MAE) has not improved by more
+    than min_delta for early_stopping_rounds consecutive rounds and
+    truncates the ensemble to its best round. sample_weight applies to
+    training rows only; the validation loss is unweighted."""
     if len(target) != data.n_rows:
         raise Error("target length must equal n_rows")
     if len(valid_target) != valid_data.n_rows:
         raise Error("valid_target length must equal valid n_rows")
     if valid_data.n_features != data.n_features:
         raise Error("valid_data must have the same features")
-    _check_objective(objective, target)
+    _check_objective(objective, target, alpha)
     if early_stopping_rounds < 1:
         raise Error("early_stopping_rounds must be positive")
     _check_sample_weight(sample_weight, data.n_rows)
 
     var n = data.n_rows
-    var base_score = _base_score(target, objective, sample_weight)
+    var base_score = _base_score(target, objective, sample_weight, alpha)
     var raw = List[Float64](capacity=n)
     for _ in range(n):
         raw.append(base_score)
@@ -267,11 +449,17 @@ def train_with_valid(
     var trees = List[Tree]()
     var grad = List[Float64](capacity=n)
     var hess = List[Float64](capacity=n)
-    var best_loss = _mean_loss(valid_raw, valid_target, objective)
+    var best_loss = _mean_loss(valid_raw, valid_target, objective, alpha)
     var best_n_trees = 0
     for _ in range(params.n_estimators):
-        _fill_grad_hess(raw, target, objective, sample_weight, grad, hess)
+        _fill_grad_hess(
+            raw, target, objective, sample_weight, alpha, grad, hess
+        )
         var tree = grow_tree(data, grad, hess, params.tree)
+        if objective == QUANTILE:
+            _renew_leaf_values(tree, data, target, raw, sample_weight, alpha)
+        elif objective == L1:
+            _renew_leaf_values(tree, data, target, raw, sample_weight, 0.5)
         if tree.n_leaves == 1 and abs(tree.value[0]) < 1e-12:
             break
 
@@ -283,7 +471,7 @@ def train_with_valid(
             )
         trees.append(tree^)
 
-        var loss = _mean_loss(valid_raw, valid_target, objective)
+        var loss = _mean_loss(valid_raw, valid_target, objective, alpha)
         if loss < best_loss - min_delta:
             best_loss = loss
             best_n_trees = len(trees)

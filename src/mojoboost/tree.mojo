@@ -77,6 +77,16 @@ struct Tree(Copyable, Movable):
                 node = self.right[node]
         return self.value[node]
 
+    def leaf_index_row(self, data: BinnedMatrix, row: Int) -> Int:
+        """The node index of the leaf this row lands in."""
+        var node = 0
+        while self.feature[node] >= 0:
+            if data.bin_at(row, self.feature[node]) <= self.threshold_bin[node]:
+                node = self.left[node]
+            else:
+                node = self.right[node]
+        return node
+
 
 struct _LeafState(Movable):
     """A grown-but-unsplit leaf: its node id, rows, histogram, and the best

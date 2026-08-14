@@ -32,8 +32,10 @@ with tests
   `min_data_in_leaf` and hessian constraints
 - leaf-wise (best-first) tree growth with `num_leaves` cap and Newton-step
   leaf values
-- objectives: squared error, binary logistic, poisson, and multiclass
-  softmax
+- objectives: squared error, binary logistic, poisson, huber, quantile,
+  L1 (mean absolute error), and multiclass softmax; quantile and L1
+  renew leaf values with residual percentiles the way LightGBM does, and
+  `alpha` follows LightGBM's meaning for huber and quantile
 - validation-set early stopping with `min_delta` for every objective,
   truncating to the best round
 - evaluation metrics: RMSE, log loss, accuracy, and ROC AUC with

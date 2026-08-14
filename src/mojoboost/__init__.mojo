@@ -11,7 +11,10 @@ from .split import SplitInfo, find_best_split
 from .tree import Tree, TreeParams, grow_tree
 from .boosting import (
     BINARY_LOGISTIC,
+    HUBER,
+    L1,
     POISSON,
+    QUANTILE,
     SQUARED_ERROR,
     Booster,
     BoosterParams,

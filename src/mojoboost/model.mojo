@@ -79,11 +79,14 @@ def fit(
     params: BoosterParams,
     max_bins: Int = 255,
     sample_weight: List[Float64] = [],
+    alpha: Float64 = 0.9,
 ) raises -> Model:
-    """Fit on a column-major raw feature matrix (`features[f * n_rows + r]`)."""
+    """Fit on a column-major raw feature matrix (`features[f * n_rows + r]`).
+    `alpha` is the target quantile for QUANTILE and the huber transition
+    point for HUBER; other objectives ignore it."""
     var mapper = fit_bins(features, n_rows, n_features, max_bins)
     var data = mapper.transform(features, n_rows)
-    var booster = train(data, target, objective, params, sample_weight)
+    var booster = train(data, target, objective, params, sample_weight, alpha)
     return Model(mapper^, booster^)
 
 
