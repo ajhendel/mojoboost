@@ -249,11 +249,14 @@ jobs:
       # compliance shaped object rather than a bill of materials. This merges
       # the build's own record in and hashes each bundled library out of the
       # wheel itself.
+      # The release-metadata artifact mixes roots (python/dist and the
+      # workspace root), so upload-artifact preserves paths relative to their
+      # common ancestor and the sidecar arrives nested under python/dist.
       - name: Supplement the SBOM with the bundled MAX runtime
         run: |
           python3 packaging/security/sbom_supplement.py \
             sbom.cyclonedx.json \
-            "meta/${{ needs.build.outputs.wheel_name }}.provenance.json" \
+            "meta/python/dist/${{ needs.build.outputs.wheel_name }}.provenance.json" \
             "dist/${{ needs.build.outputs.wheel_name }}" \
             sbom.merged.cyclonedx.json
 
