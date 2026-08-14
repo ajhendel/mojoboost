@@ -157,24 +157,29 @@ def test_subset_matches_reference_serial_and_parallel() raises:
         build_histogram_subset(data, grad, hess, tiny),
     )
 
-    # Every 3rd row: still below the multicore threshold.
-    var third = List[Int]()
-    for r in range(0, n_rows, 3):
-        third.append(r)
-    assert_true(n_features * len(third) < PARALLEL_MIN_OPS)
+    # Strides derived from the threshold so these cases keep exercising the
+    # serial and parallel paths at whatever value PARALLEL_MIN_OPS is tuned
+    # to; the guards fail loudly if a future value breaks that.
+    var below_stride = n_features * n_rows // (PARALLEL_MIN_OPS - 1) + 1
+    var below = List[Int]()
+    for r in range(0, n_rows, below_stride):
+        below.append(r)
+    assert_true(n_features * len(below) < PARALLEL_MIN_OPS)
     _assert_same(
-        _reference_subset(data, grad, hess, third),
-        build_histogram_subset(data, grad, hess, third),
+        _reference_subset(data, grad, hess, below),
+        build_histogram_subset(data, grad, hess, below),
     )
 
-    # Every 2nd row: above the multicore threshold.
-    var half = List[Int]()
-    for r in range(0, n_rows, 2):
-        half.append(r)
-    assert_true(n_features * len(half) >= PARALLEL_MIN_OPS)
+    var above_stride = n_features * n_rows // (2 * PARALLEL_MIN_OPS)
+    if above_stride < 1:
+        above_stride = 1
+    var above = List[Int]()
+    for r in range(0, n_rows, above_stride):
+        above.append(r)
+    assert_true(n_features * len(above) >= PARALLEL_MIN_OPS)
     _assert_same(
-        _reference_subset(data, grad, hess, half),
-        build_histogram_subset(data, grad, hess, half),
+        _reference_subset(data, grad, hess, above),
+        build_histogram_subset(data, grad, hess, above),
     )
 
 
