@@ -42,8 +42,9 @@ fi
 # -c` checks the lines it is given and says nothing about files it was never
 # told about.
 shopt -s nullglob
-FILES=(*.whl *.provenance.json inspection.json otool.txt clean-install.txt)
+FILES=(*.whl *.provenance.json inspection.json otool.txt)
 shopt -u nullglob
+[ -f clean-install.txt ] && FILES+=(clean-install.txt)
 [ "${#FILES[@]}" -gt 0 ] || { echo "nothing to hash in $DIR" >&2; exit 2; }
 
 # Sorted, so two builds of the same set of files produce byte-identical
