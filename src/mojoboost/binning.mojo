@@ -39,10 +39,43 @@ a categorical column changes nothing about how the numerical columns are
 binned.
 
 Fitting and transforming parallelize across features: every feature's edge
-computation (column copy + sort) and bin assignment is independent and
-writes only its own output range, so workers need no synchronization and
+computation (column copy + rank resolution) and bin assignment is independent
+and writes only its own output range, so workers need no synchronization and
 the result is bit-identical to the serial path. Inputs too small to
 amortize task-scheduling overhead stay serial.
+
+How the quantile boundaries are found
+-------------------------------------
+A quantile boundary needs two order statistics of the column, the values at
+ranks `idx - 1` and `idx`, and there are at most `max_bins - 1` boundaries. A
+full sort answers every possible rank, which is `n log n` per feature to
+answer at most `2 * (max_bins - 1)` questions; above `SELECT_MIN_ROWS`
+non-missing values `resolve_ranks` answers exactly those questions instead,
+in two linear passes over the column:
+
+1. Bucket every value by the top bits of an order-preserving 64-bit key,
+   rebased on the column's own key range so the buckets straddle the values
+   that are actually there rather than the whole double line.
+2. Prefix-sum the bucket counts. A bucket whose global rank range holds no
+   requested rank is dropped entirely; the rest are gathered, in bucket
+   order, into one compact buffer.
+3. Resolve each gathered bucket: a bucket whose values are all equal answers
+   its ranks immediately (this is what makes constant, binary, and other
+   low-cardinality columns free), a small one is sorted, and a large one is
+   bucketed again on its own narrower key range, to `SELECT_MAX_DEPTH`.
+
+The result is the same value at the same rank a full sort would have put
+there, so the edges are identical; the module-level `sort` path is kept for
+small columns and as the reference the tests compare against. Sorting is
+still the worst case: a column too large for step 3's depth budget and too
+spread out for its buckets to separate ends up sorting one bucket, which is
+never more work than sorting the whole column was.
+
+`emit_quantile_edges` is the single authority on how a resolved boundary
+becomes an edge (midpoint, `_avoid_inf` clamp, strictly-increasing filter),
+and `quantile_boundary_indices` on which boundaries exist at all. The dense
+fast path, the dense sort path, and `sparse.fit_bins_csc` all go through
+both, so there is one rule rather than three copies of it.
 
 Forced splits
 -------------
@@ -64,9 +97,10 @@ work is spread.
 """
 
 from std.math import isnan
+from std.memory import bitcast
 
 from .categorical import CategoricalSpec, fit_categorical_spec
-from .parallel import dispatch_feature_ranges, dispatch_features
+from .parallel import _env_int, dispatch_feature_ranges, dispatch_features
 from .tree_parameters_extra import ForcedSplits
 
 
@@ -101,6 +135,299 @@ def _avoid_inf(x: Float64) -> Float64:
     if x <= -MAX_EDGE:
         return -MAX_EDGE
     return x
+
+
+comptime POSITIVE_INF = bitcast[DType.float64, 1](
+    SIMD[DType.uint64, 1](0x7FF0000000000000)
+)
+"""`+inf` as a padding sentinel: `POSITIVE_INF < v` is false for every `v`
+a search can be handed, `+inf` included, so a padded search table cannot
+change a bin. Spelled from its bit pattern so it needs no library constant."""
+
+
+# --------------------------------------------------------------------------
+# Quantile boundaries: which ones exist, and how one becomes an edge.
+# --------------------------------------------------------------------------
+
+
+def quantile_boundary_indices(
+    n_valid: Int, n_ordinary: Int, mut idxs: List[Int]
+):
+    """The rank `idx` of every quantile boundary that exists, ascending.
+
+    Boundary `b` of `n_ordinary` bins sits at `idx = b * n_valid //
+    n_ordinary`, and it exists only when `0 < idx < n_valid`: a boundary at
+    rank 0 or at rank `n_valid` has nothing on one side of it. `idx` is
+    non-decreasing in `b` and repeats are kept, because two boundaries
+    landing on the same rank is exactly the duplicate case
+    `emit_quantile_edges` filters, and dropping them here would change which
+    edge is compared against which.
+
+    The single authority on where the boundaries are. Every fitter, dense or
+    sparse, exact or selected, asks this rather than recomputing the
+    expression, so a boundary means one thing everywhere.
+    """
+    idxs.clear()
+    for b in range(1, n_ordinary):
+        var idx = b * n_valid // n_ordinary
+        if idx <= 0 or idx >= n_valid:
+            continue
+        idxs.append(idx)
+
+
+def emit_quantile_edges(
+    below: List[Float64], above: List[Float64], mut out: List[Float64]
+):
+    """Turn resolved boundaries into strictly increasing bin edges.
+
+    `below[j]` and `above[j]` are the values at ranks `idx - 1` and `idx` of
+    the j-th boundary `quantile_boundary_indices` reported, in the same
+    order. An edge is the midpoint of the two, clamped by `_avoid_inf`.
+
+    Two boundaries produce no edge. One whose two values are equal has no gap
+    to cut (that is how a duplicate-heavy column ends up using fewer bins
+    than `max_bins`), and one whose clamped midpoint fails to exceed the last
+    edge kept would break the strictly-increasing invariant `bin_value` and
+    `transform` search against. Repeated ranks (`n_valid < n_ordinary`) hit
+    the first rule and clamped infinities the second.
+
+    The single authority on the edge rule; `out` is cleared first, so a
+    caller can hand it the same reusable buffer for every feature.
+    """
+    # Non-raising, because the dense fitter calls this from inside a worker
+    # closure that cannot raise. The two arrays describe the same boundaries
+    # by construction; the clamp is here so a caller that got that wrong
+    # loses boundaries rather than reading past the end of an array.
+    var n = len(below)
+    if len(above) < n:
+        n = len(above)
+    out.clear()
+    for j in range(n):
+        var lo = below[j]
+        var hi = above[j]
+        if hi <= lo:
+            continue
+        var edge = _avoid_inf((lo + hi) / 2.0)
+        if len(out) > 0 and edge <= out[len(out) - 1]:
+            continue
+        out.append(edge)
+
+
+# --------------------------------------------------------------------------
+# Rank selection: the order statistics a quantile fit needs, without a full
+# sort. See the module docstring for why and how.
+# --------------------------------------------------------------------------
+
+comptime SELECT_MIN_ROWS = 1 << 16
+"""Non-missing values below which a feature is sorted outright. Two linear
+passes plus a bucket table only pay for themselves once the column is much
+larger than the handful of ranks a quantile fit asks about, and a small
+column's sort is already cheap. Scheduling-only in the sense that matters:
+both paths produce the same edges, and `tests/test_binning.mojo` asserts it
+on both sides of this threshold."""
+
+comptime SELECT_BUCKET_BITS = 16
+comptime SELECT_BUCKETS = 1 << SELECT_BUCKET_BITS
+"""Buckets one rebasing pass splits a segment into. The point of the pass is
+to drop buckets, so there have to be far more of them than the at most
+`2 * (max_bins - 1)` ranks being asked about, or every bucket holds a rank
+and nothing is dropped. At 16 bits against 255 bins under a percent of the
+buckets survive, which is what turns a sort of the column into a sort of a
+few hundred short runs. The cost is a 512 KB count table per worker,
+allocated only when a column is large enough to take this path."""
+
+comptime SELECT_SMALL_SEGMENT = 1 << 12
+"""A gathered bucket at or below this many values is sorted rather than
+bucketed again. Below it the sort is a few microseconds and another pass
+would cost more than it saves."""
+
+comptime SELECT_MAX_DEPTH = 4
+"""How many times a segment may be rebucketed before it is simply sorted.
+Four levels of `SELECT_BUCKET_BITS` cover the whole 64-bit key, so the budget
+only runs out on a column whose values crowd into one bucket at every scale
+without being equal; sorting that bucket is exact and is never more work than
+sorting the whole column."""
+
+
+def env_select_min_rows() -> Int:
+    """`SELECT_MIN_ROWS` under `MOJOBOOST_BINNING_SELECT_MIN_ROWS`.
+
+    Scheduling-only, in the same sense as the two variables in
+    `parallel.mojo`: the two paths resolve the same order statistics, so this
+    decides which one runs and nothing else. It exists so a test can assert
+    that equality on data small enough to fit in a test, and so a benchmark
+    can measure one path against the other without rebuilding. `0`, unset, or
+    unparsable means the default.
+    """
+    var n = _env_int("MOJOBOOST_BINNING_SELECT_MIN_ROWS", SELECT_MIN_ROWS)
+    return SELECT_MIN_ROWS if n <= 0 else n
+
+
+def order_key(v: Float64) -> UInt64:
+    """An order-preserving `UInt64` view of a non-`NaN` double.
+
+    IEEE-754 doubles compare as sign-magnitude integers, so flipping every
+    bit of a negative pattern and the sign bit of a non-negative one turns
+    the value order into unsigned integer order: `a < b` implies
+    `order_key(a) < order_key(b)` for every pair of non-`NaN` doubles,
+    infinities included.
+
+    The one pair it separates that `<` does not is `-0.0` and `+0.0`, which
+    are equal as values and get different keys. That cannot move an edge:
+    the two only ever meet as a boundary's `below` and `above`, where
+    `above <= below` holds either way round and `emit_quantile_edges` drops
+    the boundary, and a midpoint taken against a neighbour is the same for
+    both signs of zero.
+    """
+    var u = v.to_bits().cast[DType.uint64]()
+    if (u >> 63) != 0:
+        return u ^ 0xFFFF_FFFF_FFFF_FFFF
+    return u | 0x8000_0000_0000_0000
+
+
+def _bucket_shift(span: UInt64) -> UInt64:
+    """Smallest `s` with `span >> s < SELECT_BUCKETS`, so a key range of
+    `span` maps onto at most `SELECT_BUCKETS` buckets."""
+    var s = UInt64(0)
+    var v = span
+    while v >= UInt64(SELECT_BUCKETS):
+        v = v >> 1
+        s += 1
+    return s
+
+
+def resolve_ranks(
+    mut seg: List[Float64],
+    rank_base: Int,
+    ranks: List[Int],
+    r_lo: Int,
+    r_hi: Int,
+    mut counts: List[Int],
+    mut vals: List[Float64],
+    depth: Int,
+):
+    """Fill `vals[i]` with the `ranks[i] - rank_base`-th smallest value of
+    `seg`, for every `i` in `[r_lo, r_hi)`.
+
+    `ranks` is ascending and every entry it is asked about lies inside
+    `[rank_base, rank_base + len(seg))`. `seg` is scratch: it may be permuted
+    or sorted, and the caller refills it. `counts` is a reusable bucket table,
+    grown here on first use and not read across calls. The answer is by
+    definition the value a full sort would have left at that rank, so this is
+    an implementation of `sort`-then-index and not an approximation of it.
+    """
+    if r_lo >= r_hi:
+        return
+    var n = len(seg)
+    if n <= 0:
+        # Unreachable from the fitters: a rank inside the segment implies at
+        # least one value in it. Non-raising because this runs inside a
+        # worker closure, so an impossible call returns rather than throws.
+        return
+
+    # All equal: every rank in the segment has that value. This is the
+    # low-cardinality path -- a constant column, a binary column, or an
+    # integer column with few levels resolves entirely here, because every
+    # gathered bucket holds one repeated value.
+    var first = seg[0]
+    var constant = True
+    for i in range(1, n):
+        if seg[i] != first:
+            constant = False
+            break
+    if constant:
+        for i in range(r_lo, r_hi):
+            vals[i] = first
+        return
+
+    if n <= SELECT_SMALL_SEGMENT or depth >= SELECT_MAX_DEPTH:
+        sort(seg)
+        for i in range(r_lo, r_hi):
+            vals[i] = seg[ranks[i] - rank_base]
+        return
+
+    # Rebase the buckets on this segment's own key range, so they straddle
+    # the values that are there. A fixed slice of the double line would put a
+    # narrow column entirely in one bucket and make no progress.
+    var kmin = order_key(seg[0])
+    var kmax = kmin
+    for i in range(1, n):
+        var k = order_key(seg[i])
+        if k < kmin:
+            kmin = k
+        if k > kmax:
+            kmax = k
+    var shift = _bucket_shift(kmax - kmin)
+    var n_buckets = Int((kmax - kmin) >> shift) + 1
+
+    if len(counts) < SELECT_BUCKETS:
+        counts.resize(SELECT_BUCKETS, 0)
+    var cp = counts.unsafe_ptr()
+    for b in range(n_buckets):
+        cp.unsafe_store(b, 0)
+    var sp = seg.unsafe_ptr()
+    for i in range(n):
+        var b = Int((order_key(sp.unsafe_load(i)) - kmin) >> shift)
+        cp.unsafe_store(b, cp.unsafe_load(b) + 1)
+
+    # Walk buckets and requested ranks together, both ascending. A bucket
+    # holding no requested rank is dropped; the rest get a slot in the gather
+    # buffer and keep the rank window they answer.
+    var seg_start = List[Int]()
+    var seg_len = List[Int]()
+    var seg_rank_base = List[Int]()
+    var seg_r_lo = List[Int]()
+    var seg_r_hi = List[Int]()
+    var start = 0
+    var ri = r_lo
+    var gathered = 0
+    for b in range(n_buckets):
+        var c = cp.unsafe_load(b)
+        var stop = start + c
+        var lo = ri
+        while ri < r_hi and ranks[ri] - rank_base < stop:
+            ri += 1
+        if ri > lo:
+            seg_start.append(gathered)
+            seg_len.append(c)
+            seg_rank_base.append(rank_base + start)
+            seg_r_lo.append(lo)
+            seg_r_hi.append(ri)
+            cp.unsafe_store(b, gathered)
+            gathered += c
+        else:
+            cp.unsafe_store(b, -1)
+        start = stop
+
+    var hot = List[Float64](capacity=gathered)
+    hot.resize(gathered, 0.0)
+    var hp = hot.unsafe_ptr()
+    for i in range(n):
+        var v = sp.unsafe_load(i)
+        var b = Int((order_key(v) - kmin) >> shift)
+        var d = cp.unsafe_load(b)
+        if d >= 0:
+            hp.unsafe_store(d, v)
+            cp.unsafe_store(b, d + 1)
+
+    # `counts` is free again from here, so the recursion reuses it rather
+    # than allocating a table per level.
+    for s in range(len(seg_start)):
+        var slen = seg_len[s]
+        var sub = List[Float64](capacity=slen)
+        var base = seg_start[s]
+        for i in range(slen):
+            sub.append(hp.unsafe_load(base + i))
+        resolve_ranks(
+            sub,
+            seg_rank_base[s],
+            ranks,
+            seg_r_lo[s],
+            seg_r_hi[s],
+            counts,
+            vals,
+            depth + 1,
+        )
 
 
 def no_missing_bins(n_features: Int) -> List[Int]:
@@ -312,10 +639,41 @@ struct BinMapper(Copyable, Movable):
         var bins = List[UInt8](capacity=n_rows * n_features)
         bins.resize(n_rows * n_features, 0)
 
+        # A per-feature search table, built once per call: each numerical
+        # feature's edges padded up to a power of two with `+inf` sentinels.
+        # That buys a fixed, branch-free descent per value in place of a
+        # data-dependent loop whose every step is a mispredictable branch. A
+        # sentinel never counts (`+inf < v` is false for every `v`, `+inf`
+        # included), so padding cannot move a bin, and `bin_value` keeps the
+        # plain search as the reference the tests compare against.
+        #
+        # The table is at most `n_features * n_bins` doubles, built in
+        # `n_features * n_bins` work against `n_features * n_rows` searches.
+        var pad = List[Float64](capacity=n_features * self.n_bins)
+        var pad_offsets = List[Int](capacity=n_features + 1)
+        var pad_half = List[Int](capacity=n_features)
+        pad_offsets.append(0)
+        for f in range(n_features):
+            var lo = self.edge_offsets[f]
+            var k = self.edge_offsets[f + 1] - lo
+            # Smallest power of two strictly greater than k, so the descent's
+            # largest reachable answer (k) is representable and a feature with
+            # no edges still gets one sentinel to point at.
+            var m = 1
+            while m <= k:
+                m += m
+            for i in range(k):
+                pad.append(self.edges[lo + i])
+            for _ in range(k, m):
+                pad.append(POSITIVE_INF)
+            pad_offsets.append(len(pad))
+            pad_half.append(m >> 1)
+
         var bins_p = bins.unsafe_ptr()
         var feat_p = features.unsafe_ptr()
-        var edges_p = self.edges.unsafe_ptr()
-        var offs_p = self.edge_offsets.unsafe_ptr()
+        var pad_p = pad.unsafe_ptr()
+        var poff_p = pad_offsets.unsafe_ptr()
+        var half_p = pad_half.unsafe_ptr()
         var miss_p = self.missing_bin.unsafe_ptr()
         ref cats = self.cats
 
@@ -328,8 +686,8 @@ struct BinMapper(Copyable, Movable):
                         UInt8(cats.bin_of(f, feat_p.unsafe_load(col + r))),
                     )
                 return
-            var lo = offs_p.unsafe_load(f)
-            var hi = offs_p.unsafe_load(f + 1)
+            var pbase = poff_p.unsafe_load(f)
+            var half = half_p.unsafe_load(f)
             var mb = miss_p.unsafe_load(f)
             for r in range(n_rows):
                 var v = feat_p.unsafe_load(col + r)
@@ -340,15 +698,17 @@ struct BinMapper(Copyable, Movable):
                         bins_p.unsafe_store(col + r, UInt8(mb))
                         continue
                     v = 0.0
-                var left = lo
-                var right = hi
-                while left < right:
-                    var mid = (left + right) // 2
-                    if v <= edges_p.unsafe_load(mid):
-                        right = mid
-                    else:
-                        left = mid + 1
-                bins_p.unsafe_store(col + r, UInt8(left - lo))
+                # Count the edges strictly below `v`, which is the bin
+                # `bin_value`'s search arrives at: it stops at the first edge
+                # with `v <= edge`, and the edges are strictly increasing.
+                var pos = 0
+                var step = half
+                while step > 0:
+                    var nxt = pos + step
+                    var go = pad_p.unsafe_load(pbase + nxt - 1) < v
+                    pos = nxt if go else pos
+                    step = step >> 1
+                bins_p.unsafe_store(col + r, UInt8(pos))
 
         # A row costs one binary search over at most `n_bins` edges, not one
         # accumulate: about `log2(n_bins)` dependent compares, each on a hot
@@ -423,21 +783,31 @@ def fit_bins(
     var counts_p = counts.unsafe_ptr()
     var missing_p = missing_bin.unsafe_ptr()
     var feat_p = features.unsafe_ptr()
+    var select_min_rows = env_select_min_rows()
     ref spec = cats
 
     def do_range(f_start: Int, f_end: Int) {imm}:
-        # One sort buffer per task rather than one per feature: the buffer is
+        # One set of scratch buffers per task rather than per feature: each is
         # emptied and refilled between features, keeping the capacity it
-        # already grew, so a 500-feature fit does one allocation per worker
-        # instead of 500. Every feature still sees exactly the column it saw
-        # before, in the same order, so the edges are unchanged.
+        # already grew, so a 500-feature fit does a handful of allocations per
+        # worker instead of thousands. Every feature still sees exactly the
+        # column it saw before, in the same order, so the edges are unchanged.
+        # `bucket_counts` is the rank-selection table and stays empty (and
+        # unallocated) on a task that never takes that path.
         var col = List[Float64](capacity=n_rows)
+        var idxs = List[Int]()
+        var ranks = List[Int]()
+        var vals = List[Float64]()
+        var below = List[Float64]()
+        var above = List[Float64]()
+        var edge_buf = List[Float64]()
+        var bucket_counts = List[Int]()
         for f in range(f_start, f_end):
             # Categorical columns never enter quantile binning.
             if spec.is_cat(f):
                 counts_p.unsafe_store(f, 0)
                 continue
-            # NaN is dropped before the sort, so it never takes part in a
+            # NaN is dropped before any ordering, so it never takes part in a
             # quantile comparison, and a column that has any gives up one bin
             # to hold its missing values.
             col.clear()
@@ -449,31 +819,57 @@ def fit_bins(
             var n_valid = len(col)
             var reserve = use_missing and n_valid < n_rows
             var n_ordinary = max_bins - 1 if reserve else max_bins
-            sort(col)
+
+            quantile_boundary_indices(n_valid, n_ordinary, idxs)
+            below.clear()
+            above.clear()
+            if n_valid >= select_min_rows:
+                # The ranks the boundaries ask about, ascending and unique.
+                # `idxs` is non-decreasing, so appending `idx - 1` then `idx`
+                # while each is past the last kept rank produces exactly that.
+                ranks.clear()
+                for j in range(len(idxs)):
+                    var idx = idxs[j]
+                    if len(ranks) == 0 or ranks[len(ranks) - 1] < idx - 1:
+                        ranks.append(idx - 1)
+                    if ranks[len(ranks) - 1] < idx:
+                        ranks.append(idx)
+                vals.clear()
+                vals.resize(len(ranks), 0.0)
+                resolve_ranks(
+                    col, 0, ranks, 0, len(ranks), bucket_counts, vals, 0
+                )
+                # `idxs` and `ranks` both ascend, so one cursor walks them
+                # together instead of searching per boundary.
+                var rp = 0
+                for j in range(len(idxs)):
+                    var idx = idxs[j]
+                    while ranks[rp] < idx - 1:
+                        rp += 1
+                    below.append(vals[rp])
+                    while ranks[rp] < idx:
+                        rp += 1
+                    above.append(vals[rp])
+            else:
+                sort(col)
+                for j in range(len(idxs)):
+                    below.append(col[idxs[j] - 1])
+                    above.append(col[idxs[j]])
+            emit_quantile_edges(below, above, edge_buf)
+
             var out = scratch_p.unsafe_offset(f * max_edges)
-            var n_out = 0
-            for b in range(1, n_ordinary):
-                var idx = b * n_valid // n_ordinary
-                if idx <= 0 or idx >= n_valid:
-                    continue
-                var below = col[idx - 1]
-                var above = col[idx]
-                if above <= below:
-                    continue
-                var edge = _avoid_inf((below + above) / 2.0)
-                # Repeated quantile indices (n_valid < n_ordinary) revisit the
-                # same boundary, and clamping an infinite midpoint can repeat
-                # the previous edge; keep edges strictly increasing either way.
-                if n_out > 0 and edge <= out.unsafe_load(n_out - 1):
-                    continue
-                out.unsafe_store(n_out, edge)
-                n_out += 1
+            var n_out = len(edge_buf)
+            for i in range(n_out):
+                out.unsafe_store(i, edge_buf[i])
             counts_p.unsafe_store(f, n_out)
             # k edges give ordinary bins 0..k, so the missing bin is k + 1.
             missing_p.unsafe_store(f, n_out + 1 if reserve else -1)
 
-    # A feature costs a copy of its column plus a sort of it, so the estimate
-    # carries the comparison count rather than the row count alone.
+    # A feature costs a copy of its column plus resolving order statistics in
+    # it, so the estimate carries a comparison count rather than the row count
+    # alone. It stays the sort's estimate: it decides only how the work is
+    # spread, the selected path is the cheaper of the two, and keeping one
+    # number keeps the serial/parallel crossover where it was measured.
     dispatch_feature_ranges(
         do_range, n_features, n_features * n_rows * (1 + _log2_ceil(n_rows))
     )

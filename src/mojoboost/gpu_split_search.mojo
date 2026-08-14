@@ -1940,8 +1940,38 @@ struct GpuSplitSearcher(Movable):
         self.stage_node.unsafe_ptr().unsafe_store(
             record * NODE_WORDS + NODE_HIST_BASE, Int32(0)
         )
-        self._launch(
-            self.hist_dev, params, record, 1, self.active_len[record]
+        # Do not call `_launch(self.hist_dev, ...)`: that borrows all of
+        # `self` mutably for the method receiver while also borrowing one of
+        # its fields mutably as an argument, which Mojo correctly rejects as
+        # aliasing.  The owned-histogram path is the one place the histogram
+        # belongs to the searcher, so spell the disjoint field borrows out at
+        # the free-function boundary after staging the tables.
+        self._copy_tables()
+        _launch_search(
+            self.ctx,
+            self.hist_dev,
+            self.node_dev,
+            self.feat_dev,
+            self.allow_dev,
+            self.missing_dev,
+            self.catn_dev,
+            self.mono_dev,
+            self.fparam_dev,
+            self.slot_i_dev,
+            self.slot_f_dev,
+            self.rec_i_dev,
+            self.rec_f_dev,
+            self.n_bins,
+            self.n_features * self.n_bins,
+            self.n_features,
+            self.active_len[record],
+            record,
+            1,
+            params.min_data_in_leaf,
+            self.constrained,
+            params.cat.max_cat_to_onehot,
+            params.cat.max_cat_threshold,
+            params.cat.min_data_per_group,
         )
         return self.download(record)
 

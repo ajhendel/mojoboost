@@ -14,6 +14,11 @@ benchmarking and for tests that must force one path:
   threshold (`PARALLEL_MIN_OPS`), compared against the caller's op estimate
   (conventionally items * rows touched).
 
+`binning.mojo` adds one more of the same kind:
+`MOJOBOOST_BINNING_SELECT_MIN_ROWS` chooses between the two ways a quantile
+fit resolves its order statistics (rank selection or a full sort). Both
+resolve the same values, so it moves no edge and no bin.
+
 `apple_cpu_policy.mojo` adds four more, all scheduling-only and all
 documented there: `MOJOBOOST_CPU_TASKS_PER_CORE`, `MOJOBOOST_CPU_CORE_POOL`,
 `MOJOBOOST_CPU_FEATURE_GROUP`, and `MOJOBOOST_CPU_COMPACT_MIN_ROWS`. The two

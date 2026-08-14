@@ -60,9 +60,10 @@ from std.math import isnan
 from .binning import (
     BinMapper,
     BinnedMatrix,
-    _avoid_inf,
     _sized_missing_bins,
+    emit_quantile_edges,
     no_missing_bins,
+    quantile_boundary_indices,
 )
 from .categorical import (
     UNKNOWN_BIN,
@@ -552,28 +553,32 @@ def fit_bins_csc(
             n_stored_zero += 1
         var n_zero = n_stored_zero + n_implicit
 
+        # Which boundaries exist and how each becomes an edge are
+        # `binning.mojo`'s rules, called rather than restated: the dense and
+        # sparse fits are required to agree edge for edge, and two copies of
+        # the midpoint-clamp-and-dedupe loop is the way that stops being true.
+        # All this path supplies is where a rank's value lives in the implied
+        # dense sorted column.
+        var idxs = List[Int]()
+        quantile_boundary_indices(n_valid, n_ordinary, idxs)
+        var below = List[Float64](capacity=len(idxs))
+        var above = List[Float64](capacity=len(idxs))
+        for j in range(len(idxs)):
+            below.append(
+                _sorted_column_at(
+                    stored, n_neg, n_zero, n_implicit, idxs[j] - 1
+                )
+            )
+            above.append(
+                _sorted_column_at(stored, n_neg, n_zero, n_implicit, idxs[j])
+            )
+        var edge_buf = List[Float64]()
+        emit_quantile_edges(below, above, edge_buf)
+
         var out = scratch_p.unsafe_offset(f * max_edges)
-        var n_out = 0
-        for b in range(1, n_ordinary):
-            var idx = b * n_valid // n_ordinary
-            if idx <= 0 or idx >= n_valid:
-                continue
-            var below = _sorted_column_at(
-                stored, n_neg, n_zero, n_implicit, idx - 1
-            )
-            var above = _sorted_column_at(
-                stored, n_neg, n_zero, n_implicit, idx
-            )
-            if above <= below:
-                continue
-            var edge = _avoid_inf((below + above) / 2.0)
-            # Repeated quantile indices (n_valid < n_ordinary) revisit the
-            # same boundary, and clamping an infinite midpoint can repeat the
-            # previous edge; keep edges strictly increasing either way.
-            if n_out > 0 and edge <= out.unsafe_load(n_out - 1):
-                continue
-            out.unsafe_store(n_out, edge)
-            n_out += 1
+        var n_out = len(edge_buf)
+        for i in range(n_out):
+            out.unsafe_store(i, edge_buf[i])
         counts_p.unsafe_store(f, n_out)
         # k edges give ordinary bins 0..k, so the missing bin is k + 1.
         missing_p.unsafe_store(f, n_out + 1 if reserve else -1)

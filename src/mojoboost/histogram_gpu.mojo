@@ -208,6 +208,17 @@ comptime DEFAULT_BATCH_SLOTS = 4
 comptime MAX_BATCH_SLOTS = 64
 comptime BATCH_POOL_BUDGET_BYTES = 64 * 1024 * 1024
 
+# The byte budget the *resident frontier* is sized against, which is a
+# different question from the batch pool's and so a different number. A batch
+# pool holds as many leaves as one launch is worth widening to, and four is a
+# guess about launch width; a resident frontier holds one slot per live leaf
+# for the whole tree, so its depth is `num_leaves` and nothing smaller works
+# at all (see `open_resident`). Four times the batch budget is what a default
+# 31-leaf frontier costs up to about 850 features at 256 bins, which covers
+# the dense workloads the GPU trainer is benchmarked on; wider datasets fall
+# back to the incremental device search rather than allocating past it.
+comptime RESIDENT_POOL_BUDGET_BYTES = 256 * 1024 * 1024
+
 
 def env_batch_slots() -> Int:
     """`MOJOBOOST_GPU_BATCH_SLOTS`, the histogram slot pool depth, clamped to
@@ -275,6 +286,11 @@ struct GpuHistogramBuilder(Movable):
     var cats: CategoricalSpec
     var active: List[Int]
     var caps: DeviceCaps
+    # Stable strings reported by the context when the builder opens.  Split
+    # strategy policy consumes them without reopening or re-querying a
+    # device for every tree.
+    var device_api: String
+    var device_arch: String
     # What this backend is required to provide, derived once from `caps` when
     # the builder opens. Every launch geometry this builder resolves is
     # checked against it by `require_histogram_launchable`: at construction,
@@ -434,6 +450,8 @@ struct GpuHistogramBuilder(Movable):
         self.bins_route = route.selected
         self.spec_level = env_specialization_level()
 
+        var device_api = ctx.api()
+        var device_arch = ctx.arch_name()
         self.ctx = ctx
         self.n_rows = data.n_rows
         self.n_features = data.n_features
@@ -441,6 +459,8 @@ struct GpuHistogramBuilder(Movable):
         self.missing_bin = data.missing_bin.copy()
         self.cats = data.cats.copy()
         self.caps = caps.copy()
+        self.device_api = device_api^
+        self.device_arch = device_arch^
         self.batcher = List[GpuLeafBatcher]()
         self.tiling = derive_tiling(
             self.caps, data.n_rows, data.n_features, data.n_bins, strategy
@@ -856,15 +876,30 @@ struct GpuHistogramBuilder(Movable):
             expected_left,
         )
 
-    def enqueue_leaf(mut self, leaf: Int) raises:
+    def enqueue_leaf(mut self, leaf: Int, resident_slot: Int = -1) raises:
         """Enqueue the kernels building the histogram of the rows `leaf`
         currently owns, reading only that node's compacted row range. Does
         not transfer or synchronize. A small node gets a grid sized for its
-        own rows rather than for the dataset; see gpu_active_rows.mojo."""
+        own rows rather than for the dataset; see gpu_active_rows.mojo.
+
+        `resident_slot` names where the result goes: -1, the default, is this
+        builder's own single-node output buffer, and a nonnegative value is
+        that slot of the resident frontier pool (`enqueue_resident_leaf`,
+        which is the entry point that checks the slot is live). Only the
+        destination pointer differs, which is the point: a resident histogram
+        is built by the same kernel at the same launch geometry over the same
+        rows as the shipping one, so residency cannot be a second histogram
+        implementation whose cost has to be measured on its own. The two
+        calls below are written out rather than sharing one because the
+        destination's origin is part of its type, so no single variable holds
+        either pointer.
+        """
         if not self.has_gradients:
             raise Error("call upload_gradients before build_leaf")
         if leaf < 0 or leaf > MAX_ROWS:
             raise Error("leaf id must be nonnegative and fit in Int32")
+        if resident_slot >= 0 and len(self.batcher) == 0:
+            raise Error("no resident histogram pool is open")
 
         var n_slots = len(self.active)
         # Deliberately not gated by `require_histogram_launchable`, and this
@@ -882,6 +917,24 @@ struct GpuHistogramBuilder(Movable):
             self.tiling.strategy,
             self.part_capacity,
         )
+        if resident_slot >= 0:
+            var cells = 3 * self.n_features * self.n_bins
+            self.rows.enqueue_range_histogram(
+                tiling,
+                leaf,
+                self.bins_dev.unsafe_ptr(),
+                self.grad_dev.unsafe_ptr(),
+                self.hess_dev.unsafe_ptr(),
+                self.feat_dev.unsafe_ptr(),
+                self.batcher[0]
+                .out_dev.unsafe_ptr()
+                .unsafe_offset(resident_slot * cells),
+                self.part_dev.unsafe_ptr(),
+                n_slots,
+                Float32(self.g_scale),
+                Float32(self.h_scale),
+            )
+            return
         self.rows.enqueue_range_histogram(
             tiling,
             leaf,
@@ -1021,6 +1074,170 @@ struct GpuHistogramBuilder(Movable):
         )
         self.batch_feat_stamp = -1
         return True
+
+    # -- device-resident frontier -----------------------------------------
+    #
+    # The batched launcher's slot pool, used as *storage for a frontier*
+    # rather than as a wider launch. The two uses share every buffer and
+    # every kernel; what differs is who reads a slot. `build_leaves`
+    # downloads a slot and throws it away, so it holds a slot only across
+    # one launch. The device split search reads a slot where it lies, so a
+    # leaf's histogram is worth keeping until that leaf splits — and once a
+    # parent's histogram is still on the device when its children are built,
+    # `enqueue_subtract` derives the larger child instead of accumulating it,
+    # which is the same halving of histogram work the host-search grower gets
+    # from `subtract_histogram`. See `train_gpu._grow_tree_gpu_device_search`.
+
+    def resident_slots(self) -> Int:
+        """Slots the resident frontier pool holds, or zero when none is
+        open. A grower asks before it commits to the resident path."""
+        return self.batcher[0].pool.capacity if len(self.batcher) > 0 else 0
+
+    def resident_frontier_fits(self, want_slots: Int) raises -> Bool:
+        """Whether the resident pool can hold the complete leaf frontier.
+
+        The automatic split policy asks this before selecting device search;
+        `open_resident` asks it again before allocation.  Keeping the budget
+        arithmetic here prevents policy and allocation from drifting.
+        """
+        if want_slots < 2:
+            return False
+        if len(self.batcher) > 0:
+            return self.batcher[0].pool.capacity >= want_slots
+        return (
+            slots_for_budget(
+                RESIDENT_POOL_BUDGET_BYTES, self.n_features, self.n_bins
+            )
+            >= want_slots
+        )
+
+    def open_resident(mut self, want_slots: Int) raises -> Bool:
+        """Allocate a slot pool deep enough to hold `want_slots` leaves at
+        once, and report whether the resident path is available afterwards.
+
+        All or nothing, and deliberately so. A leaf-wise frontier holds a
+        slot per live leaf for the whole tree, so a pool one slot short does
+        not degrade gracefully: it strands a leaf whose histogram has to be
+        rebuilt from its rows, which is the accumulation the residency was
+        bought to avoid. Rather than carry a second, slower path through the
+        grower for a case that only arises on very wide datasets, this
+        answers False and the caller keeps the incremental search it already
+        has.
+
+        Unlike `open_batching` this is not gated on
+        `MOJOBOOST_GPU_HIST_SPECIALIZATION=batched`, and the reason is that it
+        selects no specialized kernel. That level gates a *launch policy*
+        nothing has benchmarked (is a wide batch faster than several
+        single-leaf builds?); residency asks where a histogram lives, and
+        `enqueue_resident_leaf` builds one with the kernel that already
+        ships. So the specialization half of the gate is inert here, exactly
+        as it is for `set_features`, and only the geometry and primitive
+        checks below have anything to say.
+
+        A pool already open is reused when it is deep enough, since a builder
+        holds at most one batcher for its whole life and a tree's slots are
+        released back to it rather than reallocated.
+        """
+        if not self.resident_frontier_fits(want_slots):
+            return False
+        require_histogram_launchable(
+            self.contract,
+            self.caps,
+            self.tiling,
+            len(self.active),
+            self.n_bins,
+            build_kernel_features(),
+        )
+        self.batcher.append(
+            GpuLeafBatcher(
+                self.ctx,
+                self.caps,
+                self.n_rows,
+                self.n_features,
+                self.n_bins,
+                want_slots,
+                self.part_capacity,
+                DEFAULT_MAX_ITEMS,
+                1,
+            )
+        )
+        self.batch_feat_stamp = -1
+        return True
+
+    def resident_stamp(self) raises -> Int:
+        """The stamp this builder's slots are acquired under right now: the
+        round's scales and the tree's feature set, in the one encoding
+        `gpu_leaf_batching` defines. Two slots may only be subtracted when
+        these agree, which within one tree they always do."""
+        return subtraction_stamp(self.round_epoch, self.feat_epoch)
+
+    def acquire_resident(mut self, node: Int) raises -> Int:
+        """A pool slot owned by `node`, or -1 when the pool is full."""
+        if len(self.batcher) == 0:
+            raise Error("no resident histogram pool is open")
+        return self.batcher[0].pool.acquire(node, self.resident_stamp())
+
+    def release_resident(mut self, slot: Int) raises:
+        """Give one leaf's slot back."""
+        if len(self.batcher) == 0:
+            raise Error("no resident histogram pool is open")
+        self.batcher[0].pool.release(slot)
+
+    def release_resident_all(mut self):
+        """Give every slot back, which is what the end of a tree means: no
+        histogram from one tree is readable by the next, since the next tree
+        repartitions every row. Cheap and idempotent, so a grower calls it
+        when it starts as well, and an error that escapes mid-tree cannot
+        leak the frontier's slots into the following one."""
+        if len(self.batcher) > 0:
+            self.batcher[0].pool.release_all()
+
+    def reown_resident(mut self, slot: Int, node: Int) raises:
+        """Hand a live slot to `node`. The bookkeeping half of an in-place
+        subtraction, whose result is the sibling's histogram sitting in the
+        parent's slot."""
+        if len(self.batcher) == 0:
+            raise Error("no resident histogram pool is open")
+        self.batcher[0].pool.reassign(slot, node)
+
+    def enqueue_resident_leaf(mut self, node: Int, slot: Int) raises:
+        """Build `node`'s histogram into pool slot `slot` and leave it there.
+        Enqueues only: no transfer and no synchronization.
+
+        `enqueue_leaf`'s kernel, its Apple-aware launch geometry, and its
+        rows, aimed at a pool slot instead of the builder's own output
+        buffer. Nothing about the accumulation moves, so a resident histogram
+        is the one the single-leaf path would have produced, bin for bin, and
+        the resident grower's cost is that path's cost plus a subtraction.
+
+        Not the batched multi-leaf kernel, deliberately. A resident frontier
+        builds exactly one leaf per split (the other is subtracted), so a
+        batch would be a batch of one: it would pay `_stage_plan`'s two
+        copies and the batched kernel's per-item indirection to launch the
+        same work, and it would make the resident path's histograms a
+        different kernel's output from the host-search path's, which is a
+        variable a comparison between them does not need. The slot pool is
+        what this borrows from `gpu_leaf_batching`; the launch is not.
+        """
+        if len(self.batcher) == 0:
+            raise Error("no resident histogram pool is open")
+        self.batcher[0].pool.check_live(slot)
+        self.enqueue_leaf(node, resident_slot=slot)
+
+    def enqueue_resident_subtract(
+        mut self, parent_slot: Int, child_slot: Int, dst_slot: Int
+    ) raises:
+        """`dst = parent - child` over resident slots, on the device.
+
+        The device-side counterpart of `histogram.subtract_histogram`, and
+        exact for the same reason the host one is: accumulation is fixed-point
+        Int32 under one scale for the whole tree, so a parent's bins are the
+        exact integer sum of its children's. `dst_slot` may be `parent_slot`,
+        which is how a frontier keeps exactly one slot per live leaf.
+        """
+        if len(self.batcher) == 0:
+            raise Error("no resident histogram pool is open")
+        self.batcher[0].enqueue_subtract(parent_slot, child_slot, dst_slot)
 
     def _histogram_from_words(
         self, words: List[Int32], offset: Int = 0

@@ -202,7 +202,7 @@ to describe them as behavior a user gets.
 |---|---|---|---|
 | `apple_histogram_policy` | `histogram_gpu` | `SPEC_LEVEL_BASELINE`, which is `derive_tiling` verbatim | `MOJOBOOST_GPU_HIST_SPECIALIZATION` set to `shape`, `packed`, or `batched` |
 | `apple_gpu_policy` | `device_policy`, `apple_histogram_policy` | supplies the device profile and the memory estimate; its tuning derivations are consulted only through the line above | as above |
-| `gpu_split_search` | `train_gpu` | the host scan, because Float32 device gains can flip near-tie decisions | `MOJOBOOST_GPU_SPLIT_STRATEGY=device` |
+| `gpu_split_search` | `train_gpu` | the host scan, because Float32 device gains can flip near-tie decisions and the measured difference (a few percent either way, `docs/LIGHTGBM_PARITY.md`) does not pay for that | `MOJOBOOST_GPU_SPLIT_STRATEGY=device` |
 | `unified_memory_policy` | `device_policy`, `histogram_gpu` | one live route; the others it scores are not implemented in any trainer | `MOJOBOOST_GPU_TRANSFER` |
 | `device_policy` crossover table | `device`, and through it every `fit` | empty, so `auto` resolves to the CPU on every machine and every workload | `MOJOBOOST_AUTO_MIN_CELLS` |
 | `gpu_multiclass_batch` | `train_gpu`, `histogram_gpu` | a sequential schedule, so multiclass GPU training stays one tree per class per round and `_train_multiclass_gpu_batched` is not entered | `MOJOBOOST_GPU_CLASS_BATCH` above one, or a caller passing its own batch |

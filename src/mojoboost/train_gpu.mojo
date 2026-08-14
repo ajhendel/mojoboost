@@ -51,9 +51,10 @@ replaced, and none of them defaults to a claim no benchmark has made:
                  `host` (never; upload from `_fill_grad_hess` instead), or
                  `device` (a hard requirement, which raises with a specific
                  reason when the kernels cannot serve it)
-  split search   `split_search` / `MOJOBOOST_GPU_SPLIT_STRATEGY`, defaulting
-                 to the host scan over downloaded histograms; see the
-                 SPLIT_SEARCH_* constants
+  split search   `split_search` / `MOJOBOOST_GPU_SPLIT_STRATEGY`; explicit
+                 host/device requests are exact, while AUTO uses the pure
+                 workload and hardware policy in gpu_split_policy.mojo and
+                 conservatively falls back to the host scan
   validation     `valid_scoring` / `MOJOBOOST_GPU_VALID_SCORING`, defaulting
                  to the host tree walk; see `train_gpu_with_valid` and the
                  VALID_SCORE_* constants
@@ -139,7 +140,9 @@ from .gpu_split_search import (
     GpuSplitParams,
     GpuSplitRecord,
     GpuSplitSearcher,
+    SplitNodeRequest,
 )
+from .gpu_split_policy import decide_split_search
 from .gpu_tiling import DeviceCaps
 from .histogram import Histogram, subtract_histogram
 from .histogram_gpu import GpuHistogramBuilder
@@ -151,6 +154,7 @@ from .objective import (
 from .interaction import extend_branch
 from .monotone import (
     MONOTONE_FREE,
+    ChildBounds,
     OutputBounds,
     child_bounds,
     midpoint,
@@ -226,13 +230,13 @@ def _count_left(
 
 # Where each node's best split is chosen. HOST downloads the node's
 # histogram and scans it in Float64 with `_search`, which is what keeps
-# CPU/GPU split decisions identical and is the default until a benchmark
-# says otherwise. DEVICE scans the histogram where it was accumulated (see
+# CPU/GPU split decisions identical and is the conservative fallback. DEVICE
+# scans the histogram where it was accumulated (see
 # gpu_split_search.mojo) and downloads one 136-byte record per node instead
 # of the whole histogram; its gains and leaf values are Float32, so split
 # decisions can differ from the host's on near-ties. AUTO reads
-# `MOJOBOOST_GPU_SPLIT_STRATEGY` (`host` or `device`) and then defaults to
-# HOST.
+# `MOJOBOOST_GPU_SPLIT_STRATEGY` (`host` or `device`) and otherwise resolves
+# through gpu_split_policy.mojo from the workload and reported hardware.
 comptime SPLIT_SEARCH_AUTO = 0
 comptime SPLIT_SEARCH_HOST = 1
 comptime SPLIT_SEARCH_DEVICE = 2
@@ -249,14 +253,86 @@ def env_split_search() -> Int:
 
 
 def resolve_split_search(strategy: Int) -> Int:
-    """An explicit strategy outranks the environment; AUTO resolves through
-    `MOJOBOOST_GPU_SPLIT_STRATEGY` and then to the host scan."""
+    """Legacy request-only resolution without workload or hardware facts.
+
+    Production tree growth uses `resolve_split_search_for`; this helper stays
+    conservative for callers that cannot supply a builder and therefore
+    cannot justify an automatic device choice.
+    """
     var s = strategy
     if s == SPLIT_SEARCH_AUTO:
         s = env_split_search()
     if s == SPLIT_SEARCH_DEVICE:
         return SPLIT_SEARCH_DEVICE
     return SPLIT_SEARCH_HOST
+
+
+def _device_search_semantics_supported(params: TreeParams) -> Bool:
+    """Question form of `_check_device_search_supported` for AUTO.
+
+    Explicit device selection still calls the raising check and reports the
+    exact unsupported setting.  AUTO needs a non-raising eligibility answer
+    so it can retain the fully featured host scan instead of failing a fit.
+    """
+    return (
+        not params.extra.is_active()
+        and params.feature_fraction_bylevel == 1.0
+    )
+
+
+def _estimated_active_features(params: TreeParams, n_features: Int) -> Int:
+    """Features a tree-level histogram is expected to scan.
+
+    `feature_fraction` is the only draw known before the tree seed is applied;
+    per-node sampling is intentionally not folded in because the resident
+    frontier holds full-width slots and the policy must not understate its
+    memory shape.
+    """
+    var active = Int(Float64(n_features) * params.feature_fraction)
+    if active < 1:
+        return 1
+    if active > n_features:
+        return n_features
+    return active
+
+
+def resolve_split_search_for(
+    builder: GpuHistogramBuilder, params: TreeParams
+) raises -> Int:
+    """Resolve explicit/environment requests, then workload-aware AUTO.
+
+    Explicit `host` and `device` retain their old meanings.  With neither
+    present, the pure policy sees the reported device signature, actual
+    matrix shape, tree budget, semantic eligibility, and the builder's own
+    resident-memory calculation.  Unknown or marginal cases stay on host.
+    """
+    var decision = decide_split_search(
+        builder.device_api,
+        builder.device_arch,
+        builder.n_rows,
+        _estimated_active_features(params, builder.n_features),
+        builder.n_bins,
+        params.num_leaves,
+        _device_search_semantics_supported(params),
+        builder.resident_frontier_fits(params.num_leaves),
+    )
+    return (
+        SPLIT_SEARCH_DEVICE if decision.uses_device() else SPLIT_SEARCH_HOST
+    )
+
+
+def resolve_split_search_for(
+    builder: GpuHistogramBuilder, params: TreeParams, strategy: Int
+) raises -> Int:
+    """Explicit request wrapper around workload-aware AUTO."""
+    var requested = strategy
+    if requested == SPLIT_SEARCH_AUTO:
+        requested = env_split_search()
+    if requested == SPLIT_SEARCH_DEVICE:
+        return SPLIT_SEARCH_DEVICE
+    if requested == SPLIT_SEARCH_HOST:
+        return SPLIT_SEARCH_HOST
+    return resolve_split_search_for(builder, params)
 
 
 # Where a round's gradients come from. DEVICE generates them on the device
@@ -364,7 +440,13 @@ struct _GpuRecordLeafState(Movable):
     """A grown-but-unsplit leaf under device split selection: the compact
     search record stands in for the histogram the host-search frontier
     carries, since the record already holds the split, both children's
-    counts and Newton values, and the parent's value."""
+    counts and Newton values, and the parent's value.
+
+    `slot` is where this leaf's histogram still lives on the device, or -1
+    when nothing kept it. The resident loop keeps one, so that a split can
+    derive its larger child by subtraction instead of accumulating it; the
+    incremental loop keeps none, because its histograms are overwritten in
+    the builder's single-node buffer by the next node's build."""
 
     var node: Int
     var n_rows: Int
@@ -372,6 +454,7 @@ struct _GpuRecordLeafState(Movable):
     var branch: List[Int]
     var depth: Int
     var bounds: OutputBounds
+    var slot: Int
 
     def __init__(
         out self,
@@ -381,6 +464,7 @@ struct _GpuRecordLeafState(Movable):
         var branch: List[Int] = [],
         depth: Int = 0,
         var bounds: OutputBounds = OutputBounds.unbounded(),
+        slot: Int = -1,
     ):
         self.node = node
         self.n_rows = n_rows
@@ -388,6 +472,23 @@ struct _GpuRecordLeafState(Movable):
         self.branch = branch^
         self.depth = depth
         self.bounds = bounds^
+        self.slot = slot
+
+
+def _apply_shape_rules(
+    mut rec: GpuSplitRecord, n_rows: Int, depth: Int, params: TreeParams
+):
+    """The rules `_search` applies before it ever looks at bins, applied to a
+    record the device produced.
+
+    The depth limit and the minimum-row rules are properties of the tree, not
+    of a histogram, so no kernel is told about them and every device-search
+    loop clears `found` here instead. Written once so the incremental and the
+    resident loop cannot cut growth at different leaves."""
+    if params.max_depth > 0 and depth >= params.max_depth:
+        rec.found = False
+    if n_rows < 2 * params.min_data_in_leaf or n_rows < 2:
+        rec.found = False
 
 
 def _search_leaf_device(
@@ -432,10 +533,7 @@ def _search_leaf_device(
         bounds,
     )
     var rec = searcher.download()
-    if params.max_depth > 0 and depth >= params.max_depth:
-        rec.found = False
-    if n_rows < 2 * params.min_data_in_leaf or n_rows < 2:
-        rec.found = False
+    _apply_shape_rules(rec, n_rows, depth, params)
     return rec^
 
 
@@ -472,30 +570,108 @@ def _check_device_search_supported(params: TreeParams) raises:
         )
 
 
+def resident_frontier_disabled() -> Bool:
+    """`MOJOBOOST_GPU_SPLIT_RESIDENT=0`, which forces the device split search
+    back onto its incremental loop even where the slot pool would open.
+
+    An escape hatch and a measurement handle, not a tuning knob. It exists so
+    the two device-search loops can be compared on one machine in one thermal
+    state, which is the comparison the resident loop was written to win, and
+    so a run that hits a slot-pool problem has somewhere to go that is not
+    "use the host scan". Unset, the resident loop runs wherever it fits."""
+    return getenv("MOJOBOOST_GPU_SPLIT_RESIDENT") == "0"
+
+
+def _node_features(
+    params: TreeParams,
+    tree_features: List[Int],
+    tree_index: Int,
+    node: Int,
+) raises -> List[Int]:
+    """One node's search feature set: the per-node draw
+    (`feature_fraction_bynode`) taken from the node id the CPU grower would
+    have assigned it. Written once so both device-search loops narrow a
+    node's scan to the same features."""
+    return select_node_features(
+        tree_features,
+        params.feature_fraction_bynode,
+        params.feature_fraction_seed,
+        tree_index,
+        node,
+    )
+
+
+def _commit_device_split(
+    mut tree: Tree,
+    rec: GpuSplitRecord,
+    split: SplitInfo,
+    split_missing_bin: Int,
+    parent_node: Int,
+    left_node: Int,
+    right_node: Int,
+    parent_bounds: OutputBounds,
+    signs: List[Int],
+) raises -> ChildBounds:
+    """Write a device-chosen split and its two child values into the tree,
+    and return the intervals the children's own searches must respect.
+
+    The same clamp-and-divide the host-search grower does, over the raw
+    Newton values the record already carries instead of over a downloaded
+    histogram: no-ops when unconstrained, and on a constrained feature whose
+    two outputs a rounding step inverted, both collapse to their midpoint so
+    the ordering stays exact. Shared by both device-search loops, which is
+    what keeps a monotone fit from depending on where the histograms lived.
+    """
+    var split_sign = monotone_sign(signs, split.feature)
+    var left_value = parent_bounds.clamp(rec.left_value)
+    var right_value = parent_bounds.clamp(rec.right_value)
+    if split_sign != MONOTONE_FREE and left_value > right_value:
+        var mid = midpoint(left_value, right_value)
+        left_value = mid
+        right_value = mid
+    var children = child_bounds(
+        parent_bounds, split_sign, left_value, right_value
+    )
+    tree.value[left_node] = left_value
+    tree.value[right_node] = right_value
+    tree.left[parent_node] = left_node
+    tree.right[parent_node] = right_node
+    tree._set_split(parent_node, split, split_missing_bin)
+    return children^
+
+
 def _grow_tree_gpu_device_search(
     mut builder: GpuHistogramBuilder,
     params: TreeParams,
     bag: List[Int] = [],
     tree_index: Int = 0,
 ) raises -> Tree:
-    """`grow_tree_gpu` with split selection on the device (stage 1 of
-    handoffs/apple_a2_split_search.md): every node's histogram is built and
-    searched where it lives, and only a 136-byte record crosses to the host
-    per node instead of the whole `3 * n_features * n_bins` histogram.
+    """`grow_tree_gpu` with split selection on the device: every node's
+    histogram is built and searched where it lives, and only a 136-byte
+    record crosses to the host per node instead of the whole
+    `3 * n_features * n_bins` histogram.
 
-    Both children's histograms are built on the device, which replaces the
-    host-side sibling subtraction: one extra histogram build per split in
-    exchange for the removed per-node transfer. That is a tradeoff, not a
-    claimed speedup; no benchmark has compared the two paths yet.
+    Two loops implement that, and which one runs is a memory question the
+    builder answers. `_device_search_resident` keeps every live leaf's
+    histogram in a device slot, so a split builds only its smaller child and
+    derives the larger by subtracting on the device, and searches both
+    children in one launch pair. `_device_search_incremental` keeps nothing,
+    so a split builds both children and searches them one at a time. The
+    resident loop is the one to want: it does the same histogram work the
+    host-search grower does and pays neither the per-node download nor the
+    per-node wait, while the incremental loop does roughly twice the
+    accumulation and waits twice per split, which is measurably slower than
+    the host scan it was meant to beat.
 
-    Those two children are also the frontier `gpu_leaf_batching` wants, and
-    this path is the one that cannot take it yet. A batched build writes
-    into the batcher's own slot pool, and `GpuSplitSearcher.enqueue` takes a
-    whole `DeviceBuffer` with no word offset into it, so a pooled slot
-    cannot be handed to the search kernels without a change there. The
-    host-search grower above batches instead, where the histograms come home
-    anyway; see handoffs/connect_01_gpu_trainer.md for the exact provider
-    change this needs.
+    Residency needs one slot per live leaf for the whole tree, so it is all
+    or nothing: `builder.open_resident(params.num_leaves)` declines when a
+    dataset is wide enough that `num_leaves` full-width histograms exceed the
+    pool budget, and the incremental loop is the fallback rather than a
+    stranded leaf. It also needs `min_data_in_leaf >= 1`, since a subtraction
+    is only worth taking when the child that *is* built is nonempty, and that
+    floor is what the search kernel enforces to guarantee it.
+    `MOJOBOOST_GPU_SPLIT_RESIDENT=0` forces the incremental loop where the
+    resident one would have fit, which is how the two are compared.
 
     Gains, hessian tests, and leaf values are Float32 on the device, so a
     near-tie between two candidates can resolve differently than the host
@@ -525,12 +701,15 @@ def _grow_tree_gpu_device_search(
         tree_index,
     )
     builder.set_features(tree_features)
+    # Two record slots, because the resident loop searches a split's two
+    # children in one launch pair; the incremental loop uses the first only.
     var searcher = GpuSplitSearcher(
         builder.ctx,
         builder.n_features,
         builder.n_bins,
         builder.missing_bin,
         builder.cats,
+        max_records=2,
     )
     searcher.set_monotone(signs)
     var split_params = GpuSplitParams(
@@ -540,13 +719,64 @@ def _grow_tree_gpu_device_search(
         params.min_data_in_leaf,
         params.cat.copy(),
     )
+
+    builder.begin_tree(bag)
+    var n_root = len(bag) if len(bag) > 0 else builder.n_rows
+    if (
+        not resident_frontier_disabled()
+        and params.min_data_in_leaf >= 1
+        and builder.open_resident(params.num_leaves)
+    ):
+        return _device_search_resident(
+            builder,
+            searcher,
+            split_params,
+            params,
+            tree_features,
+            signs,
+            tree_index,
+            n_root,
+        )
+    return _device_search_incremental(
+        builder,
+        searcher,
+        split_params,
+        params,
+        tree_features,
+        signs,
+        tree_index,
+        n_root,
+    )
+
+
+def _device_search_incremental(
+    mut builder: GpuHistogramBuilder,
+    mut searcher: GpuSplitSearcher,
+    split_params: GpuSplitParams,
+    params: TreeParams,
+    tree_features: List[Int],
+    signs: List[Int],
+    tree_index: Int,
+    n_root: Int,
+) raises -> Tree:
+    """Device split selection with nothing kept between nodes.
+
+    Both of a split's children are accumulated from their own rows, because
+    the parent's histogram is gone by then: it was written into the builder's
+    single-node output buffer, which the next node's build overwrites. That
+    is roughly twice the accumulation the subtraction trick needs, and each
+    child's record is a wait of its own, so this is the slower of the two
+    device-search loops by a wide margin. It stays because it needs no slot
+    pool at all, which is what a dataset wide enough to price residency out
+    is left with; see `_grow_tree_gpu_device_search`.
+
+    The caller has already opened the tree (`begin_tree`), narrowed the
+    feature set, and staged the searcher's monotone vector.
+    """
     var tree = Tree(
         List[Int](), List[Int](), List[Int](), List[Int](),
         List[Float64](), List[Float64](), 0,
     )
-
-    builder.begin_tree(bag)
-    var n_root = len(bag) if len(bag) > 0 else builder.n_rows
     var root = tree._add_node(0.0, Float64(n_root))
     var root_branch = List[Int]()
     var root_rec = _search_leaf_device(
@@ -608,24 +838,17 @@ def _grow_tree_gpu_device_search(
             expected_left=n_left,
         )
 
-        # Same clamp-and-divide as the host paths: no-ops when
-        # unconstrained. The record carries the raw Newton values.
-        var parent_bounds = frontier[best_i].bounds.copy()
-        var split_sign = monotone_sign(signs, split.feature)
-        var left_value = parent_bounds.clamp(rec.left_value)
-        var right_value = parent_bounds.clamp(rec.right_value)
-        if split_sign != MONOTONE_FREE and left_value > right_value:
-            var mid = midpoint(left_value, right_value)
-            left_value = mid
-            right_value = mid
-        var children = child_bounds(
-            parent_bounds, split_sign, left_value, right_value
+        var children = _commit_device_split(
+            tree,
+            rec,
+            split,
+            split_missing_bin,
+            parent_node,
+            left_node,
+            right_node,
+            frontier[best_i].bounds,
+            signs,
         )
-        tree.value[left_node] = left_value
-        tree.value[right_node] = right_value
-        tree.left[parent_node] = left_node
-        tree.right[parent_node] = right_node
-        tree._set_split(parent_node, split, split_missing_bin)
 
         var branch = extend_branch(frontier[best_i].branch, split.feature)
         var allowed = params.constraints.allowed_features(branch)
@@ -681,6 +904,232 @@ def _grow_tree_gpu_device_search(
     return tree^
 
 
+def _device_search_resident(
+    mut builder: GpuHistogramBuilder,
+    mut searcher: GpuSplitSearcher,
+    split_params: GpuSplitParams,
+    params: TreeParams,
+    tree_features: List[Int],
+    signs: List[Int],
+    tree_index: Int,
+    n_root: Int,
+) raises -> Tree:
+    """Device split selection over a device-resident frontier.
+
+    Every live leaf holds a histogram slot for as long as it is a leaf, which
+    is what turns a split into one histogram build instead of two: the
+    smaller child is accumulated from its own rows into a fresh slot, and the
+    larger is derived by subtracting it from the parent's slot, in place, on
+    the device. That is exactly the arithmetic the host-search grower does
+    with `subtract_histogram`, moved to where the histograms already are, and
+    it is exact for the same reason — accumulation is fixed-point Int32 under
+    one scale for the whole tree, so a parent's bins are the exact integer
+    sum of its children's. `subtraction_builds_left` picks which child is
+    built, the same test `grow_tree` and `grow_tree_gpu` use, so no two
+    growers can disagree about which histogram a slot holds.
+
+    The two children are then searched in one `enqueue_frontier` and brought
+    home by one `download_frontier`, so a split costs one host wait rather
+    than one per child. Per split, that is: one histogram build, one
+    subtraction kernel, one search launch pair, one wait, and 272 bytes
+    across the bus. The host-search grower pays one build, one wait, a
+    `3 * n_features * n_bins` download, a host subtraction, and two host
+    scans; the incremental device loop pays two builds and two waits.
+
+    Nothing about a decision changes. The batch stages each node's own
+    feature set, allow mask, and monotone interval into its own record, the
+    scan order inside a node is unchanged, and the records are the ones the
+    same nodes searched one at a time would produce. Slot residency is a
+    memory decision, not a numeric one.
+
+    The caller has already opened the tree (`begin_tree`), narrowed the
+    feature set, staged the searcher's monotone vector, and confirmed with
+    `builder.open_resident` that the pool is deep enough for `num_leaves`.
+    """
+    # A tree's slots die with it: the next tree repartitions every row, so no
+    # histogram here is readable by it. Releasing on the way in as well as on
+    # the way out means an error that escapes mid-tree cannot leak a frontier
+    # into the following one.
+    builder.release_resident_all()
+    var tree = Tree(
+        List[Int](), List[Int](), List[Int](), List[Int](),
+        List[Float64](), List[Float64](), 0,
+    )
+    var root = tree._add_node(0.0, Float64(n_root))
+    var root_branch = List[Int]()
+    var root_slot = builder.acquire_resident(root)
+    if root_slot < 0:
+        raise Error("the resident histogram pool is full at the root")
+    builder.enqueue_resident_leaf(root, root_slot)
+    var root_batch = List[SplitNodeRequest]()
+    root_batch.append(
+        SplitNodeRequest(
+            root_slot,
+            _node_features(params, tree_features, tree_index, root),
+            params.constraints.allowed_features(root_branch),
+            OutputBounds.unbounded(),
+        )
+    )
+    # The searcher shares the builder's context, so these kernels queue
+    # behind the histogram build with no fence, and they read the pool
+    # buffer the build just wrote rather than a copy of it.
+    searcher.enqueue_frontier(
+        builder.batcher[0].out_dev,
+        root_batch,
+        split_params,
+        builder.g_scale,
+        builder.h_scale,
+    )
+    var root_recs = searcher.download_frontier(1)
+    var root_rec = root_recs[0].copy()
+    _apply_shape_rules(root_rec, n_root, 0, params)
+    tree.value[root] = root_rec.parent_value
+
+    var frontier = List[_GpuRecordLeafState]()
+    frontier.append(
+        _GpuRecordLeafState(
+            root, n_root, root_rec^, root_branch^, depth=0, slot=root_slot
+        )
+    )
+    var n_leaves = 1
+
+    while n_leaves < params.num_leaves:
+        # Pick the leaf with the best gain anywhere in the tree, ties to
+        # the lower frontier index, exactly as the host-search loop does.
+        var best_i = -1
+        var best_gain = 0.0
+        for i in range(len(frontier)):
+            if frontier[i].rec.found and frontier[i].rec.gain > best_gain:
+                best_gain = frontier[i].rec.gain
+                best_i = i
+        if best_i < 0:
+            break
+
+        var parent_node = frontier[best_i].node
+        var parent_slot = frontier[best_i].slot
+        var rec = frontier[best_i].rec.copy()
+        var split = rec.to_split_info()
+        var split_missing_bin = -1 if split.is_categorical else (
+            builder.missing_bin[split.feature]
+        )
+        # Exact integers off the record, from the same histogram counts the
+        # host `_count_left` would sum.
+        var n_left = rec.left.count
+        var n_right = rec.right.count
+
+        var left_node = tree._add_node(0.0, Float64(n_left))
+        var right_node = tree._add_node(0.0, Float64(n_right))
+        builder.apply_split(
+            split.feature,
+            split.bin,
+            parent_node,
+            left_node,
+            right_node,
+            split_missing_bin,
+            split.default_left,
+            split.is_categorical,
+            split.cat_bitset,
+            expected_left=n_left,
+        )
+
+        var children = _commit_device_split(
+            tree,
+            rec,
+            split,
+            split_missing_bin,
+            parent_node,
+            left_node,
+            right_node,
+            frontier[best_i].bounds,
+            signs,
+        )
+
+        # The subtraction trick, device side. The built child gets a fresh
+        # slot; the derived one takes over the parent's, which is what keeps
+        # the pool at one slot per live leaf rather than one per node.
+        var build_left = subtraction_builds_left(n_left, n_right)
+        var built_node = left_node if build_left else right_node
+        var derived_node = right_node if build_left else left_node
+        var built_slot = builder.acquire_resident(built_node)
+        if built_slot < 0:
+            raise Error(
+                "the resident histogram pool ran out mid-tree; it is sized"
+                " for num_leaves slots, so this means the pool and the leaf"
+                " budget disagree"
+            )
+        builder.enqueue_resident_leaf(built_node, built_slot)
+        builder.enqueue_resident_subtract(
+            parent_slot, built_slot, parent_slot
+        )
+        builder.reown_resident(parent_slot, derived_node)
+        var left_slot = built_slot if build_left else parent_slot
+        var right_slot = parent_slot if build_left else built_slot
+
+        # Both children inherit the same branch feature set, so they share
+        # one allow mask, and both sit one edge below the leaf that split.
+        var branch = extend_branch(frontier[best_i].branch, split.feature)
+        var allowed = params.constraints.allowed_features(branch)
+        var child_depth = frontier[best_i].depth + 1
+        var batch = List[SplitNodeRequest](capacity=2)
+        batch.append(
+            SplitNodeRequest(
+                left_slot,
+                _node_features(params, tree_features, tree_index, left_node),
+                allowed.copy(),
+                children.left.copy(),
+            )
+        )
+        batch.append(
+            SplitNodeRequest(
+                right_slot,
+                _node_features(params, tree_features, tree_index, right_node),
+                allowed^,
+                children.right.copy(),
+            )
+        )
+        searcher.enqueue_frontier(
+            builder.batcher[0].out_dev,
+            batch,
+            split_params,
+            builder.g_scale,
+            builder.h_scale,
+        )
+        # The split's one wait, and what upholds the staging contracts on
+        # both sides: the batcher's pinned item table and the searcher's
+        # pinned node tables are only restaged after this returns.
+        var recs = searcher.download_frontier(2)
+        var left_rec = recs[0].copy()
+        var right_rec = recs[1].copy()
+        _apply_shape_rules(left_rec, n_left, child_depth, params)
+        _apply_shape_rules(right_rec, n_right, child_depth, params)
+
+        frontier[best_i] = _GpuRecordLeafState(
+            left_node,
+            n_left,
+            left_rec^,
+            branch.copy(),
+            depth=child_depth,
+            bounds=children.left.copy(),
+            slot=left_slot,
+        )
+        frontier.append(
+            _GpuRecordLeafState(
+                right_node,
+                n_right,
+                right_rec^,
+                branch^,
+                depth=child_depth,
+                bounds=children.right.copy(),
+                slot=right_slot,
+            )
+        )
+        n_leaves += 1
+
+    tree.n_leaves = n_leaves
+    builder.release_resident_all()
+    return tree^
+
+
 def grow_tree_gpu(
     mut builder: GpuHistogramBuilder,
     params: TreeParams,
@@ -724,10 +1173,10 @@ def grow_tree_gpu(
     decisions are made from carry the GPU's Float32 precision.
 
     `split_search` picks where that split selection runs (see the
-    SPLIT_SEARCH_* constants above): the default resolves to this host
-    scan, and SPLIT_SEARCH_DEVICE routes to the device-side scan, which
-    trades the identical-split guarantee for a fixed 136-byte per-node
-    readback.
+    SPLIT_SEARCH_* constants above): explicit requests are honored, while
+    AUTO consults `gpu_split_policy` and otherwise stays on this host scan.
+    The device-side scan trades the identical-split guarantee for compact
+    records and resident frontier processing.
 
     Where a split's two children's histograms come from is the builder's
     launch decision, not this grower's: `builder.batches_nodes` answers it
@@ -736,7 +1185,10 @@ def grow_tree_gpu(
     produce the same pair of histograms exactly, since fixed-point Int32
     accumulation under one scale makes a parent's bins the exact integer sum
     of its children's, so no split decision can tell which ran."""
-    if resolve_split_search(split_search) == SPLIT_SEARCH_DEVICE:
+    if (
+        resolve_split_search_for(builder, params, split_search)
+        == SPLIT_SEARCH_DEVICE
+    ):
         return _grow_tree_gpu_device_search(builder, params, bag, tree_index)
     params.constraints.check_features(builder.n_features)
     params.monotone.check_features(builder.n_features)
@@ -1324,10 +1776,16 @@ def train_gpu(
         var device_grads = device_gradients(
             objective, 1, objective_source, bagging, goss, routes_all
         )
+        # The session's own fit latency: the first fit through a session
+        # pays the one-time costs and every later one does not.
+        var fit = session.begin_fit()
+        var builder = GpuHistogramBuilder(session, data)
         # `MOJOBOOST_HYBRID_LEAVES` against this run's real facts. Reports
-        # only; see `GpuSession.note_hybrid`.
+        # the workload-aware split resolution rather than treating AUTO as
+        # the historical host default.
         session.note_hybrid(
-            resolve_split_search(split_search) == SPLIT_SEARCH_DEVICE,
+            resolve_split_search_for(builder, params.tree, split_search)
+            == SPLIT_SEARCH_DEVICE,
             not device_grads,
             True,
             data.n_rows,
@@ -1335,11 +1793,6 @@ def train_gpu(
             data.n_bins,
             data.n_rows,
         )
-        # The session's own fit latency: the first fit through a session
-        # pays the one-time costs and every later one does not, and that
-        # split is positional, so only the owner can attribute it.
-        var fit = session.begin_fit()
-        var builder = GpuHistogramBuilder(session, data)
         var booster = _train_gpu_rounds(
             builder,
             session,
@@ -1473,10 +1926,13 @@ def train_custom_gpu[F: GradHessFn](
             raise Error("target length must equal n_rows")
         _check_sample_weight(sample_weight, data.n_rows)
 
+        var fit = session.begin_fit()
+        var builder = GpuHistogramBuilder(session, data)
         # A custom objective evaluates on the host, so this run's gradients
         # are host resident by construction.
         session.note_hybrid(
-            resolve_split_search(split_search) == SPLIT_SEARCH_DEVICE,
+            resolve_split_search_for(builder, params.tree, split_search)
+            == SPLIT_SEARCH_DEVICE,
             True,
             True,
             data.n_rows,
@@ -1484,8 +1940,6 @@ def train_custom_gpu[F: GradHessFn](
             data.n_bins,
             data.n_rows,
         )
-        var fit = session.begin_fit()
-        var builder = GpuHistogramBuilder(session, data)
         var booster = _train_custom_gpu_rounds(
             builder,
             session,
@@ -1927,8 +2381,11 @@ def train_multiclass_gpu(
         var device_grads = device_gradients(
             _SOFTMAX_OBJECTIVE, n_classes, objective_source, bagging, goss
         )
+        var fit = session.begin_fit()
+        var builder = GpuHistogramBuilder(session, data)
         session.note_hybrid(
-            resolve_split_search(split_search) == SPLIT_SEARCH_DEVICE,
+            resolve_split_search_for(builder, params.tree, split_search)
+            == SPLIT_SEARCH_DEVICE,
             not device_grads,
             True,
             data.n_rows,
@@ -1936,8 +2393,6 @@ def train_multiclass_gpu(
             data.n_bins,
             data.n_rows,
         )
-        var fit = session.begin_fit()
-        var builder = GpuHistogramBuilder(session, data)
         var booster = _train_multiclass_gpu_rounds(
             builder,
             session,

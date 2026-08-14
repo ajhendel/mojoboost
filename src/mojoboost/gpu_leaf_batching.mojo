@@ -1161,6 +1161,30 @@ struct HistogramSlotPool(Movable):
             raise Error("histogram slot out of range")
         return self.stamp[slot]
 
+    def reassign(mut self, slot: Int, owner: Int) raises:
+        """Hand a live slot to a different leaf without freeing it.
+
+        The one move `acquire`/`release` cannot express, and the subtraction
+        trick needs it: `enqueue_subtract(parent, child, dst=parent)` leaves
+        the parent's slot holding the *larger child's* histogram, so the slot
+        outlives its owner by one generation and the leaf that reads it next
+        is not the leaf that filled it. Releasing and reacquiring would be
+        wrong twice over, since it could hand the slot to another leaf in
+        between and it would reset the stamp the derived histogram was
+        actually accumulated under.
+
+        The stamp is deliberately left alone for that reason: it describes
+        the scales and feature set the words in the slot were accumulated
+        with, which a change of owner does not move.
+        """
+        if slot < 0 or slot >= self.capacity:
+            raise Error("histogram slot out of range")
+        if owner < 0:
+            raise Error("a histogram slot needs a nonnegative owner")
+        if self.owner[slot] < 0:
+            raise Error("a free histogram slot has no owner to reassign")
+        self.owner[slot] = owner
+
     def slot_of_owner(self, owner: Int) -> Int:
         """The live slot `owner` holds, or -1. Owners are leaf node ids and a
         node holds at most one slot, so the answer is unique."""
