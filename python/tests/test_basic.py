@@ -448,9 +448,11 @@ def test_booster_pickles(regression):
     revived = pickle.loads(pickle.dumps(booster))
     np.testing.assert_array_equal(revived.predict(X), booster.predict(X))
     assert revived.current_iteration() == 10
-    # Split gains are not in the format, and the training set does not
-    # pickle; both say so rather than pretending.
-    assert revived.feature_importance("gain").sum() == 0
+    # Model format v4 preserves split gains. The training set deliberately
+    # does not pickle, so continued training still says so clearly.
+    np.testing.assert_array_equal(
+        revived.feature_importance("gain"), booster.feature_importance("gain")
+    )
     with pytest.raises(ValueError, match="no training set"):
         revived.update()
 

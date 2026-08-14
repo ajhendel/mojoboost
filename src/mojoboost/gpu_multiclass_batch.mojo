@@ -915,7 +915,7 @@ struct GpuClassBatch(Movable):
             )
 
         self.ctx = ctx
-        self.caps = caps
+        self.caps = caps.copy()
         self.n_rows = n_rows
         self.n_features = n_features
         self.n_bins = n_bins

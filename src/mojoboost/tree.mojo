@@ -1133,16 +1133,16 @@ def grow_tree(
             # read it as the zero contribution it is). Missing rows go right,
             # because the forced-split document says nothing about them and no
             # scan chose a direction.
-            var fn = params.extra.forced.nodes[forced_node]
+            var forced_spec = params.extra.forced.nodes[forced_node].copy()
             split = SplitInfo(
-                fn.feature,
+                forced_spec.feature,
                 params.extra.forced.bin_at(forced_node),
                 0.0,
                 True,
                 False,
             )
-            left_forced = fn.left
-            right_forced = fn.right
+            left_forced = forced_spec.left
+            right_forced = forced_spec.right
         else:
             split = frontier[best_i].split.copy()
 

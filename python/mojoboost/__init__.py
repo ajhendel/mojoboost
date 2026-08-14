@@ -1956,6 +1956,12 @@ class _Base(_ParamsMixin):
         the callers keep their own guards (see `_gpu_unsupported`).
         """
         device = self._resolve_alias("device", "device_type", "cpu")
+        if not isinstance(device, str) or device.lower() not in _DEVICES:
+            raise ValueError(
+                f"unknown device {device!r}; expected one of "
+                + ", ".join(_DEVICES)
+            )
+        device = device.lower()
         try:
             from . import device_selection as _policy
         except Exception:
@@ -1976,14 +1982,9 @@ class _Base(_ParamsMixin):
             # native refusal text, so it propagates as what this method has
             # always raised, with the report attached.
             return _policy.select_device(device, workload).resolved
-        if not isinstance(device, str) or device.lower() not in _DEVICES:
-            raise ValueError(
-                f"unknown device {device!r}; expected one of "
-                + ", ".join(_DEVICES)
-            )
         try:
             return _mojoboost.resolve_device(
-                device.lower(), int(n_rows), int(n_features), int(n_outputs)
+                device, int(n_rows), int(n_features), int(n_outputs)
             )
         except Exception as exc:
             raise RuntimeError(str(exc)) from None
@@ -3046,10 +3047,10 @@ class _Base(_ParamsMixin):
         """Per-feature importance of the kind `importance_type` names.
 
         Split counts and total gains are both computed when the model is
-        fitted, so changing `importance_type` afterwards costs nothing and
-        a pickled estimator keeps both. A model read back with `load()` is
-        the exception: gains are not part of the serialized format, so it
-        reports zero gain importance and warns.
+        fitted, so changing `importance_type` afterwards costs nothing.
+        Model format v4 preserves both values across save/load and pickle;
+        older model formats return zero gains because they did not store
+        them.
         """
         self._require_fitted()
         importance_type = self.importance_type
@@ -3062,14 +3063,6 @@ class _Base(_ParamsMixin):
         if cache is not None:
             values = cache[importance_type]
             return values.copy() if _np is not None else list(values)
-        if importance_type == "gain":
-            _warnings.warn(
-                "split gains are not stored in the model file, so gain "
-                "importance is zero for a model read back with load(); "
-                "pickle the estimator instead to keep it",
-                UserWarning,
-                stacklevel=2,
-            )
         return self._raw_importance(importance_type)
 
     # -- pickling --------------------------------------------------------
@@ -3554,11 +3547,13 @@ class MojoBoostRegressor(_Base):
 
     def save(self, path):
         """Write the fitted model to `path` in mojoboost's versioned text
-        format. This stores the model, not the estimator: hyperparameters,
-        feature names, and split gains do not travel with it. Pickle the
-        estimator to keep those."""
+        format. This stores the model, including v4 feature names when they
+        exist, but not the estimator's constructor hyperparameters. Pickle
+        the estimator when those must travel too."""
         self._require_fitted()
-        _mojoboost.save(self._model, str(path))
+        fitted_names = getattr(self, "feature_names_in_", None)
+        names = [] if fitted_names is None else [str(n) for n in fitted_names]
+        _mojoboost.save(self._model, str(path), names, len(names))
 
     @classmethod
     def load(cls, path):
@@ -3568,8 +3563,8 @@ class MojoBoostRegressor(_Base):
         reports `n_features_in_` and `best_iteration_`. What does not come
         back is everything the file never held: the training device (the
         ensemble is the same either way, so there is no `device_`),
-        constructor hyperparameters, feature names, and split gains. Use
-        pickle when you want the whole estimator.
+        constructor hyperparameters and estimator-only state. Use pickle
+        when you want the whole estimator.
         """
         est = cls()
         est._model = _mojoboost.load(str(path))
@@ -3578,6 +3573,9 @@ class MojoBoostRegressor(_Base):
         # The file holds exactly the trees that survived training, so the
         # loaded model has as many iterations as it has rounds on disk.
         est.n_iter_ = est.best_iteration_
+        names = list(_mojoboost.model_feature_names(str(path)))
+        if names:
+            est.feature_names_in_ = _arrays.name_array(names)
         est._restore_categorical()
         return est
 
@@ -4092,10 +4090,14 @@ class MojoBoostClassifier(_Base):
         stores the model and not the estimator; in particular the original
         class labels are not part of the format."""
         self._require_fitted()
+        fitted_names = getattr(self, "feature_names_in_", None)
+        names = [] if fitted_names is None else [str(n) for n in fitted_names]
         if self._multiclass:
-            _mojoboost.save_multiclass(self._model, str(path))
+            _mojoboost.save_multiclass(
+                self._model, str(path), names, len(names)
+            )
         else:
-            _mojoboost.save(self._model, str(path))
+            _mojoboost.save(self._model, str(path), names, len(names))
 
     @classmethod
     def load(cls, path):
@@ -4127,6 +4129,9 @@ class MojoBoostClassifier(_Base):
         )
         est.best_iteration_ = est._num_iterations()
         est.n_iter_ = est.best_iteration_
+        names = list(_mojoboost.model_feature_names(str(path)))
+        if names:
+            est.feature_names_in_ = _arrays.name_array(names)
         est._restore_categorical()
         return est
 
@@ -4479,7 +4484,9 @@ class MojoBoostRanker(_Base):
         format. Query boundaries are training data, not model state, so
         they do not travel with it."""
         self._require_fitted()
-        _mojoboost.save(self._model, str(path))
+        fitted_names = getattr(self, "feature_names_in_", None)
+        names = [] if fitted_names is None else [str(n) for n in fitted_names]
+        _mojoboost.save(self._model, str(path), names, len(names))
 
     @classmethod
     def load(cls, path):
@@ -4489,6 +4496,9 @@ class MojoBoostRanker(_Base):
         est.n_features_in_ = int(_mojoboost.n_features(est._model))
         est.best_iteration_ = est._num_iterations()
         est.n_iter_ = est.best_iteration_
+        names = list(_mojoboost.model_feature_names(str(path)))
+        if names:
+            est.feature_names_in_ = _arrays.name_array(names)
         est._restore_categorical()
         return est
 

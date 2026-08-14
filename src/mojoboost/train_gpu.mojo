@@ -1575,7 +1575,7 @@ def _train_multiclass_gpu_batched[
         raise Error("GPU training requires an accelerator")
     else:
         var trees = List[Tree]()
-        var plan = schedule.batches
+        var plan = schedule.batches.copy()
         var batch = GpuClassBatch.for_plan(
             builder.ctx,
             builder.n_rows,

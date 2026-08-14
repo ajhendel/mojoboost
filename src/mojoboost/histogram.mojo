@@ -184,10 +184,12 @@ def _zero_excluded(
     if len(features) == 0 or n_features <= 0 or n_bins <= 0:
         return
 
-    var active = List[Bool](capacity=n_features)
-    active.resize(n_features, False)
+    # Mojo's scalar pointer API cannot load `Bool`. A byte preserves the
+    # compact active mask and keeps the parallel zeroing pass unchanged.
+    var active = List[UInt8](capacity=n_features)
+    active.resize(n_features, UInt8(0))
     for i in range(len(features)):
-        active[features[i]] = True
+        active[features[i]] = UInt8(1)
 
     var gp = out_grad.unsafe_ptr()
     var hp = out_hess.unsafe_ptr()
@@ -195,25 +197,25 @@ def _zero_excluded(
     var active_p = active.unsafe_ptr()
     comptime W = SIMD_LANES
 
-    @always_inline
-    def zero_slice(base: Int) {imm}:
-        """One feature's slice, in vector stores with a scalar tail."""
-        var b = 0
-        while b + W <= n_bins:
-            gp.unsafe_store(base + b, SIMD[DType.float64, W](0.0))
-            hp.unsafe_store(base + b, SIMD[DType.float64, W](0.0))
-            cp.unsafe_store(base + b, SIMD[DType.int, W](0))
-            b += W
-        while b < n_bins:
-            gp.unsafe_store(base + b, 0.0)
-            hp.unsafe_store(base + b, 0.0)
-            cp.unsafe_store(base + b, 0)
-            b += 1
-
     def zero_range(f_start: Int, f_end: Int) {imm}:
         for f in range(f_start, f_end):
-            if not active_p.unsafe_load(f):
-                zero_slice(f * n_bins)
+            if active_p.unsafe_load(f) == UInt8(0):
+                var base = f * n_bins
+                var b = 0
+                while b + W <= n_bins:
+                    gp.unsafe_store(
+                        base + b, SIMD[DType.float64, W](0.0)
+                    )
+                    hp.unsafe_store(
+                        base + b, SIMD[DType.float64, W](0.0)
+                    )
+                    cp.unsafe_store(base + b, SIMD[DType.int, W](0))
+                    b += W
+                while b < n_bins:
+                    gp.unsafe_store(base + b, 0.0)
+                    hp.unsafe_store(base + b, 0.0)
+                    cp.unsafe_store(base + b, 0)
+                    b += 1
 
     dispatch_feature_ranges(zero_range, n_features, total_ops)
 
@@ -290,22 +292,6 @@ def _accumulate_full(
     var pair_features = plan.group_width >= 2
     comptime W = SIMD_LANES
 
-    @always_inline
-    def zero_slice(base: Int) {imm}:
-        """One feature's slice, zeroed on the task that is about to fill
-        it rather than in a separate pass over the whole output."""
-        var b = 0
-        while b + W <= n_bins:
-            gp.unsafe_store(base + b, SIMD[DType.float64, W](0.0))
-            hp.unsafe_store(base + b, SIMD[DType.float64, W](0.0))
-            cp.unsafe_store(base + b, SIMD[DType.int, W](0))
-            b += W
-        while b < n_bins:
-            gp.unsafe_store(base + b, 0.0)
-            hp.unsafe_store(base + b, 0.0)
-            cp.unsafe_store(base + b, 0)
-            b += 1
-
     def accumulate_range(i_start: Int, i_end: Int) {imm}:
         var i = i_start
         while i < i_end:
@@ -318,8 +304,23 @@ def _accumulate_full(
                 var f1 = (i + 1) if use_all else feat_p.unsafe_load(i + 1)
                 var base0 = f0 * n_bins
                 var base1 = f1 * n_bins
-                zero_slice(base0)
-                zero_slice(base1)
+                var zb = 0
+                while zb + W <= n_bins:
+                    gp.unsafe_store(base0 + zb, SIMD[DType.float64, W](0.0))
+                    hp.unsafe_store(base0 + zb, SIMD[DType.float64, W](0.0))
+                    cp.unsafe_store(base0 + zb, SIMD[DType.int, W](0))
+                    gp.unsafe_store(base1 + zb, SIMD[DType.float64, W](0.0))
+                    hp.unsafe_store(base1 + zb, SIMD[DType.float64, W](0.0))
+                    cp.unsafe_store(base1 + zb, SIMD[DType.int, W](0))
+                    zb += W
+                while zb < n_bins:
+                    gp.unsafe_store(base0 + zb, 0.0)
+                    hp.unsafe_store(base0 + zb, 0.0)
+                    cp.unsafe_store(base0 + zb, 0)
+                    gp.unsafe_store(base1 + zb, 0.0)
+                    hp.unsafe_store(base1 + zb, 0.0)
+                    cp.unsafe_store(base1 + zb, 0)
+                    zb += 1
                 var col0 = bins_p.unsafe_offset(f0 * n_rows)
                 var col1 = bins_p.unsafe_offset(f1 * n_rows)
                 for r in range(n_rows):
@@ -340,7 +341,17 @@ def _accumulate_full(
             else:
                 var f = i if use_all else feat_p.unsafe_load(i)
                 var base = f * n_bins
-                zero_slice(base)
+                var zb = 0
+                while zb + W <= n_bins:
+                    gp.unsafe_store(base + zb, SIMD[DType.float64, W](0.0))
+                    hp.unsafe_store(base + zb, SIMD[DType.float64, W](0.0))
+                    cp.unsafe_store(base + zb, SIMD[DType.int, W](0))
+                    zb += W
+                while zb < n_bins:
+                    gp.unsafe_store(base + zb, 0.0)
+                    hp.unsafe_store(base + zb, 0.0)
+                    cp.unsafe_store(base + zb, 0)
+                    zb += 1
                 var col = bins_p.unsafe_offset(f * n_rows)
                 for r in range(n_rows):
                     var g = grad_p.unsafe_load(r)
@@ -497,22 +508,6 @@ def _accumulate_subset(
     if compact:
         dispatch_rows(fill_pairs, n_sub, plan.gather_ops)
 
-    @always_inline
-    def zero_slice(base: Int) {imm}:
-        """One feature's slice, zeroed on the task that is about to fill
-        it rather than in a separate pass over the whole output."""
-        var b = 0
-        while b + W <= n_bins:
-            gp.unsafe_store(base + b, SIMD[DType.float64, W](0.0))
-            hp.unsafe_store(base + b, SIMD[DType.float64, W](0.0))
-            cp.unsafe_store(base + b, SIMD[DType.int, W](0))
-            b += W
-        while b < n_bins:
-            gp.unsafe_store(base + b, 0.0)
-            hp.unsafe_store(base + b, 0.0)
-            cp.unsafe_store(base + b, 0)
-            b += 1
-
     def accumulate_range(i_start: Int, i_end: Int) {imm}:
         var i = i_start
         while i < i_end:
@@ -521,8 +516,23 @@ def _accumulate_subset(
                 var f1 = (i + 1) if use_all else feat_p.unsafe_load(i + 1)
                 var base0 = f0 * n_bins
                 var base1 = f1 * n_bins
-                zero_slice(base0)
-                zero_slice(base1)
+                var zb = 0
+                while zb + W <= n_bins:
+                    gp.unsafe_store(base0 + zb, SIMD[DType.float64, W](0.0))
+                    hp.unsafe_store(base0 + zb, SIMD[DType.float64, W](0.0))
+                    cp.unsafe_store(base0 + zb, SIMD[DType.int, W](0))
+                    gp.unsafe_store(base1 + zb, SIMD[DType.float64, W](0.0))
+                    hp.unsafe_store(base1 + zb, SIMD[DType.float64, W](0.0))
+                    cp.unsafe_store(base1 + zb, SIMD[DType.int, W](0))
+                    zb += W
+                while zb < n_bins:
+                    gp.unsafe_store(base0 + zb, 0.0)
+                    hp.unsafe_store(base0 + zb, 0.0)
+                    cp.unsafe_store(base0 + zb, 0)
+                    gp.unsafe_store(base1 + zb, 0.0)
+                    hp.unsafe_store(base1 + zb, 0.0)
+                    cp.unsafe_store(base1 + zb, 0)
+                    zb += 1
                 var col0 = bins_all_p.unsafe_offset(f0 * n_rows)
                 var col1 = bins_all_p.unsafe_offset(f1 * n_rows)
                 for i_row in range(n_sub):
@@ -543,7 +553,17 @@ def _accumulate_subset(
 
             var f = i if use_all else feat_p.unsafe_load(i)
             var base = f * n_bins
-            zero_slice(base)
+            var zb = 0
+            while zb + W <= n_bins:
+                gp.unsafe_store(base + zb, SIMD[DType.float64, W](0.0))
+                hp.unsafe_store(base + zb, SIMD[DType.float64, W](0.0))
+                cp.unsafe_store(base + zb, SIMD[DType.int, W](0))
+                zb += W
+            while zb < n_bins:
+                gp.unsafe_store(base + zb, 0.0)
+                hp.unsafe_store(base + zb, 0.0)
+                cp.unsafe_store(base + zb, 0)
+                zb += 1
             var col = bins_all_p.unsafe_offset(f * n_rows)
             if compact:
                 for i_row in range(n_sub):
@@ -620,6 +640,58 @@ def subtract_histogram(parent: Histogram, child: Histogram) raises -> Histogram:
     return out^
 
 
+def _subtract_histogram_arrays(
+    mut out_grad: List[Float64],
+    mut out_hess: List[Float64],
+    mut out_count: List[Int],
+    parent_grad: List[Float64],
+    parent_hess: List[Float64],
+    parent_count: List[Int],
+    child_grad: List[Float64],
+    child_hess: List[Float64],
+    child_count: List[Int],
+    size: Int,
+) raises:
+    """Parallel SIMD sibling subtraction over independent array borrows.
+
+    Keeping this worker outside `Histogram` field access gives each buffer a
+    stable origin that Mojo's ownership checker can carry into the parallel
+    closure. The dispatch, range partitioning, SIMD width, and arithmetic are
+    identical to the original optimized implementation.
+    """
+    var pg = parent_grad.unsafe_ptr()
+    var ph = parent_hess.unsafe_ptr()
+    var pc = parent_count.unsafe_ptr()
+    var cg = child_grad.unsafe_ptr()
+    var ch = child_hess.unsafe_ptr()
+    var cc = child_count.unsafe_ptr()
+    var og = out_grad.unsafe_ptr()
+    var oh = out_hess.unsafe_ptr()
+    var oc = out_count.unsafe_ptr()
+
+    def subtract_block(start: Int, end: Int) {imm}:
+        comptime W = SIMD_LANES
+        var i = start
+        while i + W <= end:
+            og.unsafe_store(
+                i, pg.unsafe_load[width=W](i) - cg.unsafe_load[width=W](i)
+            )
+            oh.unsafe_store(
+                i, ph.unsafe_load[width=W](i) - ch.unsafe_load[width=W](i)
+            )
+            oc.unsafe_store(
+                i, pc.unsafe_load[width=W](i) - cc.unsafe_load[width=W](i)
+            )
+            i += W
+        while i < end:
+            og.unsafe_store(i, pg.unsafe_load(i) - cg.unsafe_load(i))
+            oh.unsafe_store(i, ph.unsafe_load(i) - ch.unsafe_load(i))
+            oc.unsafe_store(i, pc.unsafe_load(i) - cc.unsafe_load(i))
+            i += 1
+
+    dispatch_rows(subtract_block, size, subtract_ops(size))
+
+
 def subtract_histogram_into(
     mut out: Histogram, parent: Histogram, child: Histogram
 ) raises:
@@ -644,35 +716,15 @@ def subtract_histogram_into(
     if not out.matches(parent.n_features, parent.n_bins):
         raise Error("output histogram shape must match the operands")
 
-    var size = parent.n_features * parent.n_bins
-    var pg = parent.grad.unsafe_ptr()
-    var ph = parent.hess.unsafe_ptr()
-    var pc = parent.count.unsafe_ptr()
-    var cg = child.grad.unsafe_ptr()
-    var ch = child.hess.unsafe_ptr()
-    var cc = child.count.unsafe_ptr()
-    var og = out.grad.unsafe_ptr()
-    var oh = out.hess.unsafe_ptr()
-    var oc = out.count.unsafe_ptr()
-
-    def subtract_block(start: Int, end: Int) {imm}:
-        comptime W = SIMD_LANES
-        var i = start
-        while i + W <= end:
-            og.unsafe_store(
-                i, pg.unsafe_load[width=W](i) - cg.unsafe_load[width=W](i)
-            )
-            oh.unsafe_store(
-                i, ph.unsafe_load[width=W](i) - ch.unsafe_load[width=W](i)
-            )
-            oc.unsafe_store(
-                i, pc.unsafe_load[width=W](i) - cc.unsafe_load[width=W](i)
-            )
-            i += W
-        while i < end:
-            og.unsafe_store(i, pg.unsafe_load(i) - cg.unsafe_load(i))
-            oh.unsafe_store(i, ph.unsafe_load(i) - ch.unsafe_load(i))
-            oc.unsafe_store(i, pc.unsafe_load(i) - cc.unsafe_load(i))
-            i += 1
-
-    dispatch_rows(subtract_block, size, subtract_ops(size))
+    _subtract_histogram_arrays(
+        out.grad,
+        out.hess,
+        out.count,
+        parent.grad,
+        parent.hess,
+        parent.count,
+        child.grad,
+        child.hess,
+        child.count,
+        parent.n_features * parent.n_bins,
+    )

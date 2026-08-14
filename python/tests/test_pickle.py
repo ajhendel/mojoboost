@@ -125,15 +125,17 @@ def test_loaded_model_reports_codes_not_original_labels(binary):
     )
 
 
-def test_loaded_model_warns_about_gain_importance(fitted_regressor):
+def test_loaded_model_preserves_gain_importance(fitted_regressor):
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "model.mbst")
         fitted_regressor.save(path)
         loaded = MojoBoostRegressor.load(path)
-    # Split counts come from the tree structure, which is serialized.
+    # Model format v4 serializes both split counts and split gains.
     assert np.allclose(
         loaded.feature_importances_, fitted_regressor.feature_importances_
     )
     loaded.importance_type = "gain"
-    with pytest.warns(UserWarning, match="gain importance"):
-        assert not np.asarray(loaded.feature_importances_).any()
+    fitted_regressor.importance_type = "gain"
+    assert np.allclose(
+        loaded.feature_importances_, fitted_regressor.feature_importances_
+    )

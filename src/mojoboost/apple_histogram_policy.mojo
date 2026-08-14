@@ -670,8 +670,8 @@ def derive_histogram_plan(
         partial_cell_limit,
         partial_cells,
         packed,
-        window,
-        baseline,
+        window^,
+        baseline^,
     )
 
 
@@ -877,7 +877,7 @@ def plan_class_schedule(
         budget_bytes,
         requested,
     )
-    return ClassSchedule(plan, batches, eligibility)
+    return ClassSchedule(plan^, batches^, eligibility.copy())
 
 
 def _yes_no(value: Bool) -> String:

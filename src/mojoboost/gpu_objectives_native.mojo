@@ -537,8 +537,8 @@ def enqueue_abs_sum(
     )
 
 
-def sum_abs_partials(
-    partials: MutPointer[Float32, MutAnyOrigin],
+def sum_abs_partials[partials_origin: MutOrigin, //](
+    partials: MutPointer[Float32, partials_origin],
 ) raises -> GradMagnitudes:
     """Fold a downloaded partial buffer into the two totals.
 

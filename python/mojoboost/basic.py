@@ -1091,8 +1091,8 @@ class Booster:
         raw = data.get_data()
         if raw is None:
             raise ValueError(
-                "this Dataset has no raw matrix to predict on: it was built "
-                "with free_raw_data=True, or read from a prepared table, "
+                "this Dataset's raw matrix was freed or is unavailable: it "
+                "was built with free_raw_data=True, or read from a prepared table, "
                 "which carries a binning rather than the values it was "
                 "fitted from"
             )
