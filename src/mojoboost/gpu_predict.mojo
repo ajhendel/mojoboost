@@ -71,6 +71,7 @@ it is implemented.
 from std.gpu import block_dim, block_idx, global_idx, thread_idx
 from std.math import exp, log
 from std.memory import stack_allocation
+from std.sys import has_accelerator
 from max.gpu.host import DeviceBuffer, DeviceContext, HostBuffer
 from max.gpu.memory import AddressSpace
 from max.gpu.sync import barrier
@@ -1568,20 +1569,26 @@ def predict_gpu(
     """One-shot response-scale prediction for a single-output ensemble
     (builds a predictor and uploads everything each call; use `GpuPredictor`
     for repeated prediction)."""
-    var predictor = GpuPredictor(data.n_features, 1)
-    predictor.upload_ensemble(flatten_booster(booster))
-    return predictor.response_scores(
-        data, rng, response_for_objective(booster.objective)
-    )
+    comptime if not has_accelerator():
+        raise Error("GPU prediction requires an accelerator")
+    else:
+        var predictor = GpuPredictor(data.n_features, 1)
+        predictor.upload_ensemble(flatten_booster(booster))
+        return predictor.response_scores(
+            data, rng, response_for_objective(booster.objective)
+        )
 
 
 def predict_raw_gpu(
     booster: Booster, data: BinnedMatrix, rng: IterationRange
 ) raises -> List[Float64]:
     """One-shot raw-score prediction for a single-output ensemble."""
-    var predictor = GpuPredictor(data.n_features, 1)
-    predictor.upload_ensemble(flatten_booster(booster))
-    return predictor.raw_scores(data, rng)
+    comptime if not has_accelerator():
+        raise Error("GPU prediction requires an accelerator")
+    else:
+        var predictor = GpuPredictor(data.n_features, 1)
+        predictor.upload_ensemble(flatten_booster(booster))
+        return predictor.raw_scores(data, rng)
 
 
 def predict_proba_gpu(
@@ -1589,9 +1596,12 @@ def predict_proba_gpu(
 ) raises -> List[Float64]:
     """One-shot class probabilities for a softmax ensemble, row-major
     `[r * n_classes + k]`."""
-    var predictor = GpuPredictor(data.n_features, booster.n_classes)
-    predictor.upload_ensemble(flatten_multiclass(booster))
-    return predictor.response_scores(data, rng, RESPONSE_SOFTMAX)
+    comptime if not has_accelerator():
+        raise Error("GPU prediction requires an accelerator")
+    else:
+        var predictor = GpuPredictor(data.n_features, booster.n_classes)
+        predictor.upload_ensemble(flatten_multiclass(booster))
+        return predictor.response_scores(data, rng, RESPONSE_SOFTMAX)
 
 
 def predict_raw_multiclass_gpu(
@@ -1599,9 +1609,12 @@ def predict_raw_multiclass_gpu(
 ) raises -> List[Float64]:
     """One-shot per-class raw scores for a softmax ensemble, row-major
     `[r * n_classes + k]`, the scores `predict_proba_gpu` softmaxes."""
-    var predictor = GpuPredictor(data.n_features, booster.n_classes)
-    predictor.upload_ensemble(flatten_multiclass(booster))
-    return predictor.raw_scores(data, rng)
+    comptime if not has_accelerator():
+        raise Error("GPU prediction requires an accelerator")
+    else:
+        var predictor = GpuPredictor(data.n_features, booster.n_classes)
+        predictor.upload_ensemble(flatten_multiclass(booster))
+        return predictor.raw_scores(data, rng)
 
 
 def leaf_indices_gpu(
@@ -1616,9 +1629,12 @@ def leaf_indices_gpu(
     empty range returns an empty list, the same shape the host path reports
     for it.
     """
-    var predictor = GpuPredictor(data.n_features, 1)
-    predictor.upload_ensemble(flatten_booster(booster))
-    return predictor.leaf_indices(data, rng)
+    comptime if not has_accelerator():
+        raise Error("GPU prediction requires an accelerator")
+    else:
+        var predictor = GpuPredictor(data.n_features, 1)
+        predictor.upload_ensemble(flatten_booster(booster))
+        return predictor.leaf_indices(data, rng)
 
 
 def leaf_indices_multiclass_gpu(
@@ -1628,9 +1644,12 @@ def leaf_indices_multiclass_gpu(
     round-major within a row:
     `[r * n_iterations * n_classes + i * n_classes + k]`, which is what
     `MulticlassBooster.leaf_indices_bins` returns for a single example."""
-    var predictor = GpuPredictor(data.n_features, booster.n_classes)
-    predictor.upload_ensemble(flatten_multiclass(booster))
-    return predictor.leaf_indices(data, rng)
+    comptime if not has_accelerator():
+        raise Error("GPU prediction requires an accelerator")
+    else:
+        var predictor = GpuPredictor(data.n_features, booster.n_classes)
+        predictor.upload_ensemble(flatten_multiclass(booster))
+        return predictor.leaf_indices(data, rng)
 
 
 # --- Folding rounds into a resident validation set ---------------------
