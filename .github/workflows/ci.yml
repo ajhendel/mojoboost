@@ -43,3 +43,5 @@ jobs:
         run: lscpu | grep -iE 'model name|architecture|^flags' || true
       - name: Histogram benchmark
         run: pixi run bench-hist 200000 100 10
+      - name: Multicore threshold sweep
+        run: pixi run bench-threshold
