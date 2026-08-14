@@ -163,6 +163,17 @@ from .custom_metric import (
     train_with_metrics,
 )
 from .histogram_gpu import GpuHistogramBuilder, build_histogram_gpu
+from .gpu_predict import (
+    GpuPredictor,
+    flatten_booster,
+    flatten_multiclass,
+    flatten_trees,
+    predict_gpu,
+    predict_proba_gpu,
+    predict_raw_gpu,
+    predict_raw_multiclass_gpu,
+    response_for_objective,
+)
 from .train_gpu import (
     grow_tree_gpu,
     train_custom_gpu,

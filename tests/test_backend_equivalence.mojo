@@ -11,7 +11,15 @@ from std.testing import assert_equal, assert_true, TestSuite
 
 from mojoboost.backend import CPU, GPU, build_histogram
 from mojoboost.binning import bin_equal_width
+from mojoboost.boosting import (
+    SQUARED_ERROR,
+    BoosterParams,
+    IterationRange,
+)
+from mojoboost.device import CPU_DEVICE, GPU_DEVICE
 from mojoboost.histogram_gpu import GpuHistogramBuilder
+from mojoboost.model import fit, fit_multiclass
+from mojoboost.tree import TreeParams
 
 
 def _splitmix64(state: UInt64) -> UInt64:
@@ -93,6 +101,68 @@ def test_gpu_builder_reuse_is_deterministic() raises:
             assert_equal(a.grad[i], b.grad[i])
             assert_equal(a.hess[i], b.hess[i])
             assert_equal(a.count[i], b.count[i])
+
+
+def test_model_predict_batch_matches_across_devices() raises:
+    comptime if not has_accelerator():
+        print("skipped: no accelerator")
+    else:
+        var n_rows = 1_200
+        var n_features = 5
+        var features = List[Float64](capacity=n_rows * n_features)
+        for k in range(n_rows * n_features):
+            features.append(_uniform(UInt64(k)))
+        var target = List[Float64](capacity=n_rows)
+        for r in range(n_rows):
+            target.append(
+                3.0 * features[0 * n_rows + r]
+                - 2.0 * features[1 * n_rows + r]
+                + features[2 * n_rows + r]
+            )
+        var params = BoosterParams(15, 0.1, TreeParams(15, 5, 1.0, 1e-3, 0.0))
+        var model = fit(
+            features, n_rows, n_features, target, SQUARED_ERROR, params
+        )
+        var rng = IterationRange(0, model.n_iterations())
+
+        # Same trees, same bins, same leaves; the only difference is the
+        # device's Float32 accumulation of leaf values.
+        for raw in [False, True]:
+            var cpu = model.predict_batch(
+                features, n_rows, rng, raw_score=raw, device=CPU_DEVICE
+            )
+            var gpu = model.predict_batch(
+                features, n_rows, rng, raw_score=raw, device=GPU_DEVICE
+            )
+            assert_equal(len(cpu), n_rows)
+            assert_equal(len(gpu), n_rows)
+            for r in range(n_rows):
+                assert_true(abs(cpu[r] - gpu[r]) <= 1e-4)
+
+        var labels = List[Int](capacity=n_rows)
+        for r in range(n_rows):
+            labels.append(Int(3.0 * features[0 * n_rows + r]) % 3)
+        var mc = fit_multiclass(features, n_rows, n_features, labels, 3, params)
+        var mc_rng = IterationRange(0, mc.n_iterations())
+        for raw in [False, True]:
+            var cpu = mc.predict_batch(
+                features, n_rows, mc_rng, raw_score=raw, device=CPU_DEVICE
+            )
+            var gpu = mc.predict_batch(
+                features, n_rows, mc_rng, raw_score=raw, device=GPU_DEVICE
+            )
+            assert_equal(len(cpu), n_rows * 3)
+            assert_equal(len(gpu), n_rows * 3)
+            for i in range(n_rows * 3):
+                assert_true(abs(cpu[i] - gpu[i]) <= 1e-4)
+        var proba = mc.predict_batch(
+            features, n_rows, mc_rng, device=GPU_DEVICE
+        )
+        for r in range(n_rows):
+            var total = 0.0
+            for k in range(3):
+                total += proba[r * 3 + k]
+            assert_true(abs(total - 1.0) <= 1e-5)
 
 
 def main() raises:

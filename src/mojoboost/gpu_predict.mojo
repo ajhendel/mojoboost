@@ -1239,3 +1239,13 @@ def predict_proba_gpu(
     var predictor = GpuPredictor(data.n_features, booster.n_classes)
     predictor.upload_ensemble(flatten_multiclass(booster))
     return predictor.response_scores(data, rng, RESPONSE_SOFTMAX)
+
+
+def predict_raw_multiclass_gpu(
+    booster: MulticlassBooster, data: BinnedMatrix, rng: IterationRange
+) raises -> List[Float64]:
+    """One-shot per-class raw scores for a softmax ensemble, row-major
+    `[r * n_classes + k]`, the scores `predict_proba_gpu` softmaxes."""
+    var predictor = GpuPredictor(data.n_features, booster.n_classes)
+    predictor.upload_ensemble(flatten_multiclass(booster))
+    return predictor.raw_scores(data, rng)
