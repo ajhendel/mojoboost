@@ -22,6 +22,7 @@ from mojoboost.binning import BinMapper, fit_bins
 from mojoboost.boosting import (
     BINARY_LOGISTIC,
     L1,
+    MAPE,
     QUANTILE,
     SQUARED_ERROR,
     Booster,
@@ -760,7 +761,7 @@ def test_sparse_training_matches_dense() raises:
 
 
 def test_sparse_renewed_objectives_match_dense() raises:
-    """QUANTILE and L1, the two objectives that renew leaf values.
+    """QUANTILE, L1, and MAPE, the three objectives that renew leaf values.
 
     Held to a shorter run than the smooth objectives on purpose. Their
     gradient is a step function of sign(raw - target), so once two split
@@ -781,7 +782,7 @@ def test_sparse_renewed_objectives_match_dense() raises:
     var target = _target(dense, n_rows, UInt64(600_000))
     var params = BoosterParams(12, 0.1, TreeParams(15, 20, 1.0, 1e-3))
 
-    for objective in [QUANTILE, L1]:
+    for objective in [QUANTILE, L1, MAPE]:
         var want = train(binned, target, objective, params)
         var got = train_sparse(sparse, target, objective, params)
         assert_equal(len(got.trees), len(want.trees))

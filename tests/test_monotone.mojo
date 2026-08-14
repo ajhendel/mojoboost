@@ -29,6 +29,8 @@ from mojoboost.boosting import (
 )
 from mojoboost.histogram import build_histogram
 from mojoboost.model import Model, fit, fit_multiclass
+from mojoboost.model_sparse import fit_csc
+from mojoboost.sparse import csc_from_dense
 from mojoboost.monotone import (
     MONOTONE_DECREASING,
     MONOTONE_FREE,
@@ -341,6 +343,39 @@ def test_quantile_and_l1_renewal_stay_monotone() raises:
             ),
             alpha=0.7,
         )
+        var grid = _predict_grid(model, xs)
+        _assert_nondecreasing_in_f0(grid, len(xs))
+        _assert_nonincreasing_in_f1(grid, len(xs))
+
+
+def test_sparse_renewal_stays_monotone_and_records() raises:
+    # The sparse trainer shares the renewal layer with the dense one, so the
+    # renewal clamp and the recorded constraints must survive the sparse
+    # path too: without the clamp a renewed leaf can step outside its
+    # monotone interval, and without the record the fitted model cannot
+    # state the property its trees satisfy.
+    var features = _grid_features()
+    var target = _v_shape_target(features)
+    var n = _SIDE * _SIDE
+    var xs = _query_grid()
+    var csc = csc_from_dense(features, n, 2)
+
+    for which in range(2):
+        var objective = QUANTILE if which == 0 else L1
+        var model = fit_csc(
+            csc,
+            target,
+            objective,
+            _params(
+                20,
+                MonotoneConstraints.from_signs(
+                    [MONOTONE_INCREASING, MONOTONE_DECREASING], 2
+                ),
+            ),
+            alpha=0.7,
+        )
+        assert_equal(model.booster.monotone.signs[0], MONOTONE_INCREASING)
+        assert_equal(model.booster.monotone.signs[1], MONOTONE_DECREASING)
         var grid = _predict_grid(model, xs)
         _assert_nondecreasing_in_f0(grid, len(xs))
         _assert_nonincreasing_in_f1(grid, len(xs))

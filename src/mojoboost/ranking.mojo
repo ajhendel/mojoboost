@@ -738,7 +738,13 @@ def train_ranker(
             raw[r] += params.learning_rate * tree.predict_row(data, r)
         trees.append(tree^)
 
-    return Booster(trees^, 0.0, params.learning_rate, LAMBDARANK)
+    return Booster(
+        trees^,
+        0.0,
+        params.learning_rate,
+        LAMBDARANK,
+        params.tree.monotone.copy(),
+    )
 
 
 def train_ranker_with_valid(
@@ -838,7 +844,13 @@ def train_ranker_with_valid(
 
     while len(trees) > best_n_trees:
         _ = trees.pop()
-    return Booster(trees^, 0.0, params.learning_rate, LAMBDARANK)
+    return Booster(
+        trees^,
+        0.0,
+        params.learning_rate,
+        LAMBDARANK,
+        params.tree.monotone.copy(),
+    )
 
 
 def fit_ranker(

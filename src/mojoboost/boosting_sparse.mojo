@@ -1,8 +1,9 @@
 """Gradient boosting on sparse data.
 
 The objective layer is shared with `boosting.mojo` verbatim: base scores,
-gradients and hessians, losses, sample weights, LightGBM leaf renewal for
-QUANTILE and L1, bagging, and GOSS all come from there, so a sparse fit
+gradients and hessians, losses, sample weights, LightGBM leaf renewal
+(QUANTILE, L1, and MAPE, via `objective_renews_leaves`), bagging, and GOSS
+all come from there, so a sparse fit
 differs from a dense one only in how histograms are accumulated. Only the
 loop skeleton is mirrored here, the way `train_gpu.mojo` mirrors it for the
 GPU path; the dense loop is left untouched.
@@ -30,8 +31,6 @@ from .bagging import (
     refresh_bag,
 )
 from .boosting import (
-    L1,
-    QUANTILE,
     Booster,
     BoosterParams,
     MulticlassBooster,
@@ -46,10 +45,13 @@ from .boosting import (
     _percentile,
     _softmax_inplace,
     _weighted_percentile,
+    objective_renews_leaves,
+    renewal_alpha,
+    renewal_weights,
 )
 from .goss import GossParams, goss_round
 from .sparse import SparseBinnedMatrix, SparseBinnedRows
-from .tree import Tree
+from .tree import Tree, node_bounds
 from .tree_sparse import (
     grow_tree_sparse,
     predict_row_sparse,
@@ -64,13 +66,20 @@ def _renew_leaf_values_sparse(
     raw: List[Float64],
     weights: List[Float64],
     alpha: Float64,
+    monotone: List[Int] = [],
 ) raises:
     """LightGBM's RenewTreeOutput over the assignment `grow_tree_sparse`
     already produced: replace each leaf's Newton value with the
     alpha-percentile of the residuals of the rows in it. Rows marked -1 are
     outside the bag the tree was grown on and are skipped, which is what the
-    dense path does by renewing over the bag."""
+    dense path does by renewing over the bag.
+
+    A non-empty `monotone` clamps every renewed value back into its leaf's
+    monotone interval, exactly as `_renew_leaf_values` does on the dense
+    path: renewal without the clamp would discard the constraint the tree
+    was grown under (see monotone.mojo)."""
     var n_nodes = len(tree.feature)
+    var bounds = node_bounds(tree, monotone)
     var leaf_residuals = List[List[Float64]]()
     var leaf_weights = List[List[Float64]]()
     for _ in range(n_nodes):
@@ -86,12 +95,16 @@ def _renew_leaf_values_sparse(
     for node in range(n_nodes):
         if tree.feature[node] >= 0 or len(leaf_residuals[node]) == 0:
             continue
+        var renewed: Float64
         if len(weights) > 0:
-            tree.value[node] = _weighted_percentile(
+            renewed = _weighted_percentile(
                 leaf_residuals[node], leaf_weights[node], alpha
             )
         else:
-            tree.value[node] = _percentile(leaf_residuals[node], alpha)
+            renewed = _percentile(leaf_residuals[node], alpha)
+        if len(bounds) > 0:
+            renewed = bounds[node].clamp(renewed)
+        tree.value[node] = renewed
 
 
 def _add_tree_scores(
@@ -127,24 +140,41 @@ def train_sparse(
     alpha: Float64 = 0.9,
     bagging: BaggingParams = BaggingParams.disabled(),
     goss: GossParams = GossParams.disabled(),
+    init_score: List[Float64] = [],
 ) raises -> Booster:
     """Sparse counterpart of `train`, with identical arguments and
     semantics. The returned `Booster` is an ordinary one: it serializes,
     loads, and predicts on dense rows exactly like a densely trained
-    model."""
+    model.
+
+    A non-empty `init_score` starts boosting from those raw scores instead
+    of from the objective's own base score, exactly as in `train`: the
+    returned ensemble has a base score of 0 and predicts the trees alone."""
     if len(target) != data.n_rows:
         raise Error("target length must equal n_rows")
     _check_objective(objective, target, alpha)
     _check_sample_weight(sample_weight, data.n_rows)
     check_bagging(bagging)
     _check_goss(goss, bagging)
+    params.tree.monotone.check_features(data.n_features)
+    if len(init_score) != 0 and len(init_score) != data.n_rows:
+        raise Error("init_score length must equal n_rows")
 
     var n = data.n_rows
-    var base_score = _base_score(target, objective, sample_weight, alpha)
     var raw = List[Float64](capacity=n)
-    for _ in range(n):
-        raw.append(base_score)
+    var base_score = 0.0
+    if len(init_score) == n:
+        for r in range(n):
+            raw.append(init_score[r])
+    else:
+        base_score = _base_score(target, objective, sample_weight, alpha)
+        for _ in range(n):
+            raw.append(base_score)
 
+    var signs = params.tree.monotone.active_signs()
+    var renews = objective_renews_leaves(objective)
+    var renew_w = renewal_weights(objective, target, sample_weight)
+    var renew_a = renewal_alpha(objective, alpha)
     var trees = List[Tree]()
     var grad = List[Float64](capacity=n)
     var hess = List[Float64](capacity=n)
@@ -156,13 +186,15 @@ def train_sparse(
         )
         goss_round(bag, grad, hess, goss, i, params.learning_rate)
         var grown = grow_tree_sparse(data, grad, hess, params.tree, bag, i)
-        if objective == QUANTILE:
+        if renews:
             _renew_leaf_values_sparse(
-                grown.tree, grown.row_leaf, target, raw, sample_weight, alpha
-            )
-        elif objective == L1:
-            _renew_leaf_values_sparse(
-                grown.tree, grown.row_leaf, target, raw, sample_weight, 0.5
+                grown.tree,
+                grown.row_leaf,
+                target,
+                raw,
+                renew_w,
+                renew_a,
+                signs,
             )
 
         if grown.tree.n_leaves == 1 and abs(grown.tree.value[0]) < 1e-12:
@@ -175,7 +207,13 @@ def train_sparse(
         )
         trees.append(grown.tree.copy())
 
-    return Booster(trees^, base_score, params.learning_rate, objective)
+    return Booster(
+        trees^,
+        base_score,
+        params.learning_rate,
+        objective,
+        params.tree.monotone.copy(),
+    )
 
 
 def train_sparse_with_valid(
@@ -207,6 +245,7 @@ def train_sparse_with_valid(
     _check_sample_weight(sample_weight, data.n_rows)
     check_bagging(bagging)
     _check_goss(goss, bagging)
+    params.tree.monotone.check_features(data.n_features)
 
     var n = data.n_rows
     var n_valid = valid_data.n_rows
@@ -219,6 +258,10 @@ def train_sparse_with_valid(
     for _ in range(n_valid):
         valid_raw.append(base_score)
 
+    var signs = params.tree.monotone.active_signs()
+    var renews = objective_renews_leaves(objective)
+    var renew_w = renewal_weights(objective, target, sample_weight)
+    var renew_a = renewal_alpha(objective, alpha)
     var trees = List[Tree]()
     var grad = List[Float64](capacity=n)
     var hess = List[Float64](capacity=n)
@@ -232,13 +275,15 @@ def train_sparse_with_valid(
         )
         goss_round(bag, grad, hess, goss, i, params.learning_rate)
         var grown = grow_tree_sparse(data, grad, hess, params.tree, bag, i)
-        if objective == QUANTILE:
+        if renews:
             _renew_leaf_values_sparse(
-                grown.tree, grown.row_leaf, target, raw, sample_weight, alpha
-            )
-        elif objective == L1:
-            _renew_leaf_values_sparse(
-                grown.tree, grown.row_leaf, target, raw, sample_weight, 0.5
+                grown.tree,
+                grown.row_leaf,
+                target,
+                raw,
+                renew_w,
+                renew_a,
+                signs,
             )
         if grown.tree.n_leaves == 1 and abs(grown.tree.value[0]) < 1e-12:
             if bagging_enabled(bagging) or goss.enabled:
@@ -264,7 +309,13 @@ def train_sparse_with_valid(
 
     while len(trees) > best_n_trees:
         _ = trees.pop()
-    return Booster(trees^, base_score, params.learning_rate, objective)
+    return Booster(
+        trees^,
+        base_score,
+        params.learning_rate,
+        objective,
+        params.tree.monotone.copy(),
+    )
 
 
 def train_multiclass_sparse(

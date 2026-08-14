@@ -614,6 +614,7 @@ def train_with_callbacks[
     var renews = objective_renews_leaves(objective)
     var renew_w = renewal_weights(objective, target, sample_weight)
     var renew_a = renewal_alpha(objective, alpha)
+    var signs = params.tree.monotone.active_signs()
 
     # The rate the booster was created with. While `baked` is False every
     # tree is shrunk by it at predict time; once a schedule moves off it the
@@ -664,7 +665,7 @@ def train_with_callbacks[
         var tree = grow_tree(data, grad, hess, current.tree, bag, i)
         if renews:
             _renew_leaf_values(
-                tree, data, target, raw, renew_w, renew_a, bag
+                tree, data, target, raw, renew_w, renew_a, bag, signs
             )
         # Under bagging or GOSS a degenerate tree indicts the sample, not
         # the run, exactly as in train_with_valid. Tested before any
@@ -723,7 +724,13 @@ def train_with_callbacks[
         while len(trees) > best:
             _ = trees.pop()
     return MetricTrainResult(
-        Booster(trees^, base_score, 1.0 if baked else lr0, objective),
+        Booster(
+            trees^,
+            base_score,
+            1.0 if baked else lr0,
+            objective,
+            params.tree.monotone.copy(),
+        ),
         history^,
         best,
         best_score,
@@ -844,7 +851,13 @@ def train_custom_with_metrics[G: GradHessFn, F: MetricSetFn & Copyable](
         while len(trees) > best:
             _ = trees.pop()
     return MetricTrainResult(
-        Booster(trees^, base_score, params.learning_rate, CUSTOM),
+        Booster(
+            trees^,
+            base_score,
+            params.learning_rate,
+            CUSTOM,
+            params.tree.monotone.copy(),
+        ),
         history^,
         best,
         best_score,
@@ -1413,7 +1426,13 @@ def train_ranker_with_metrics[F: MetricSetFn & Copyable](
         while len(trees) > best:
             _ = trees.pop()
     return MetricTrainResult(
-        Booster(trees^, 0.0, params.learning_rate, LAMBDARANK),
+        Booster(
+            trees^,
+            0.0,
+            params.learning_rate,
+            LAMBDARANK,
+            params.tree.monotone.copy(),
+        ),
         history^,
         best,
         best_score,

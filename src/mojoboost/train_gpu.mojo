@@ -503,7 +503,13 @@ def train_custom_gpu[F: GradHessFn](
                 raw[r] += params.learning_rate * tree.predict_row(data, r)
             trees.append(tree^)
 
-        return Booster(trees^, base_score, params.learning_rate, CUSTOM)
+        return Booster(
+            trees^,
+            base_score,
+            params.learning_rate,
+            CUSTOM,
+            params.tree.monotone.copy(),
+        )
 
 
 def train_multiclass_gpu(

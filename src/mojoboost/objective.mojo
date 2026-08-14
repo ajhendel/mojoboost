@@ -234,7 +234,13 @@ def train_custom[F: GradHessFn](
             raw[r] += params.learning_rate * tree.predict_row(data, r)
         trees.append(tree^)
 
-    return Booster(trees^, base_score, params.learning_rate, CUSTOM)
+    return Booster(
+        trees^,
+        base_score,
+        params.learning_rate,
+        CUSTOM,
+        params.tree.monotone.copy(),
+    )
 
 
 def train_custom_with_valid[F: GradHessFn, L: EvalLossFn](
@@ -306,4 +312,10 @@ def train_custom_with_valid[F: GradHessFn, L: EvalLossFn](
 
     while len(trees) > best_n_trees:
         _ = trees.pop()
-    return Booster(trees^, base_score, params.learning_rate, CUSTOM)
+    return Booster(
+        trees^,
+        base_score,
+        params.learning_rate,
+        CUSTOM,
+        params.tree.monotone.copy(),
+    )
