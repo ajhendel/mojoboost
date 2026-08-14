@@ -188,6 +188,10 @@ def test_categorical_feature_alias_trains_the_same_model(regression):
     `categorical_feature`, and marking a column must actually change the
     model it trains."""
     X, y = regression
+    X = X.copy()
+    # Categorical columns must hold whole-number codes, and the labels are
+    # permuted so no ordinal threshold can reproduce the categorical splits.
+    X[:, 0] = (np.floor(X[:, 0] * 8) * 5) % 8
     named = MojoBoostRegressor(
         n_estimators=5, categorical_feature=[0]
     ).fit(X, y)

@@ -474,9 +474,9 @@ def test_pred_leaf_and_pred_contrib_are_mutually_exclusive():
 def test_sparse_input_is_rejected_as_it_is_everywhere_else():
     sparse = pytest.importorskip("scipy.sparse")
     model, X, _ = _fitted_regressor()
-    # Contributions take the same input path as every other prediction, so
-    # sparse input fails the same way rather than being densified quietly.
-    with pytest.raises(TypeError, match="sparse"):
+    # Plain prediction takes sparse input now, but contributions do not
+    # yet, and they refuse rather than densifying quietly.
+    with pytest.raises(ValueError, match="sparse"):
         model.predict(sparse.csr_matrix(X), pred_contrib=True)
     # Densifying is the documented workaround, and it works.
     contrib = model.predict(sparse.csr_matrix(X).toarray(), pred_contrib=True)

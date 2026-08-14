@@ -60,10 +60,10 @@ def test_x_rejects_non_numeric_dtype():
         _fit(X=np.array([["a", "b"], ["c", "d"], ["e", "f"], ["g", "h"]]))
 
 
-def test_x_rejects_sparse_input():
+def test_x_accepts_sparse_input():
     sparse = pytest.importorskip("scipy.sparse")
-    with pytest.raises(TypeError, match="sparse"):
-        _fit(X=sparse.csr_matrix(X_OK))
+    est = _fit(X=sparse.csr_matrix(X_OK))
+    assert np.isfinite(est.predict(sparse.csr_matrix(X_OK))).all()
 
 
 def test_ragged_rows_are_rejected():

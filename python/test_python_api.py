@@ -757,13 +757,22 @@ def test_device_gpu():
     binary = MojoBoostClassifier(n_estimators=10, device="gpu").fit(Xb, yb)
     assert binary.device_ == "gpu"
 
-    # Multiclass has no GPU path: it raises instead of falling back.
+    # Multiclass trains one class per round through the GPU trainer, so it
+    # gets the same tolerance-based CPU agreement as the regressor above.
     Xc, yc = make_classification(300, 3)
-    try:
-        MojoBoostClassifier(n_estimators=5, device="gpu").fit(Xc, yc)
-        raise AssertionError("multiclass on gpu should raise")
-    except RuntimeError:
-        pass
+    multi = MojoBoostClassifier(n_estimators=5, device="gpu").fit(Xc, yc)
+    assert multi.device_ == "gpu"
+    multi_cpu = MojoBoostClassifier(n_estimators=5, device="cpu").fit(Xc, yc)
+    worst_mc = max(
+        abs(a - b)
+        for gpu_row, cpu_row in zip(
+            multi.predict_proba(Xc), multi_cpu.predict_proba(Xc)
+        )
+        for a, b in zip(gpu_row, cpu_row)
+    )
+    assert worst_mc <= 1e-3, (
+        f"gpu and cpu multiclass probabilities differ by {worst_mc}"
+    )
     print(f"device gpu ok (max |gpu - cpu| {worst:.2e})")
 
 

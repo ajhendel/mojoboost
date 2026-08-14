@@ -321,12 +321,12 @@ def _check_alpha_key(config: TrainConfig, alpha_key: String) raises:
     the same slot here, accepting the wrong one would be worse still, so a
     mismatch raises.
     """
-    if len(alpha_key) == 0:
+    if alpha_key.byte_length() == 0:
         return
     var expected = _alpha_key_for(config.objective)
     if alpha_key == expected:
         return
-    if len(expected) == 0:
+    if expected.byte_length() == 0:
         raise Error(
             "parameter '",
             alpha_key,
@@ -487,7 +487,7 @@ def parse_params(spec: String) raises -> TrainConfig:
             # parameter (see boosting.mojo). Two of them at once would be
             # two different numbers for one slot, so that is rejected rather
             # than resolved by order.
-            if len(alpha_key) > 0 and alpha_key != key:
+            if alpha_key.byte_length() > 0 and alpha_key != key:
                 raise Error(
                     "parameters '",
                     alpha_key,
@@ -516,7 +516,7 @@ def parse_params(spec: String) raises -> TrainConfig:
     # The objective may be named after its scalar parameter in the string,
     # so the default and the name check both wait until the whole string is
     # parsed.
-    if len(alpha_key) == 0:
+    if alpha_key.byte_length() == 0:
         config.alpha = objective_default_alpha(config.objective)
     else:
         _check_alpha_key(config, alpha_key)

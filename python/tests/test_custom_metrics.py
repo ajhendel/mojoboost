@@ -26,7 +26,9 @@ def _split(X, y, n_valid=100):
 
 def test_metric_drives_early_stopping(regression):
     X, y, Xv, yv = _split(*regression)
-    model = MojoBoostRegressor(n_estimators=200).fit(
+    # The default learning rate keeps improving on this fixture for all 200
+    # rounds, so overfit faster to guarantee a five-round plateau.
+    model = MojoBoostRegressor(n_estimators=200, learning_rate=0.3).fit(
         X,
         y,
         eval_set=[(Xv, yv)],
