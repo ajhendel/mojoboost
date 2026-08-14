@@ -8,6 +8,27 @@ and returns a `BinMapper` whose stored edges let a trained model bin raw,
 unseen feature values at prediction time. `bin_equal_width` remains as a
 simple mapper-free alternative for experiments.
 
+Ties
+----
+A quantile boundary is a rank, and a rank can land in the middle of a run of
+equal values. When it does, the edge is cut where that run *ends*, not
+skipped: `emit_quantile_edges` takes the next distinct value above the
+boundary's value, and the strictly-increasing filter collapses the many
+boundaries sharing one run down to the single edge that run earns.
+
+This is the difference between a low-cardinality column being usable and
+being invisible. A balanced binary column of 100k rows has 254 boundaries and
+all of them land inside one of its two runs, so cutting only at ranks that
+straddle a change gave it no edges at all, one bin, and no split any tree
+could ever make on it; the same was true of a sparse column whose implicit
+zeros outnumber its stored values. Columns of distinct values are unaffected
+(the next distinct value above rank `idx - 1` is the value at rank `idx`), and
+so are columns with at most `max_bins` values (every rank is a boundary, so
+the run's end is one too). Full LightGBM parity is a further step and is not
+claimed: LightGBM builds distinct values with counts and guarantees a bin per
+distinct value below the budget, which also catches a level too rare for any
+boundary to land on.
+
 Missing values
 --------------
 `NaN` is the missing marker for numerical features. A feature whose training
@@ -185,16 +206,29 @@ def emit_quantile_edges(
 ):
     """Turn resolved boundaries into strictly increasing bin edges.
 
-    `below[j]` and `above[j]` are the values at ranks `idx - 1` and `idx` of
-    the j-th boundary `quantile_boundary_indices` reported, in the same
-    order. An edge is the midpoint of the two, clamped by `_avoid_inf`.
+    `below[j]` is the value at rank `idx - 1` of the j-th boundary
+    `quantile_boundary_indices` reported, and `above[j]` is the smallest
+    value in the column that is strictly greater than it, or `below[j]` again
+    when there is none. An edge is the midpoint of the two, clamped by
+    `_avoid_inf`.
 
-    Two boundaries produce no edge. One whose two values are equal has no gap
-    to cut (that is how a duplicate-heavy column ends up using fewer bins
-    than `max_bins`), and one whose clamped midpoint fails to exceed the last
-    edge kept would break the strictly-increasing invariant `bin_value` and
-    `transform` search against. Repeated ranks (`n_valid < n_ordinary`) hit
-    the first rule and clamped infinities the second.
+    Why `above` is the next distinct value and not the value at rank `idx`.
+    A boundary landing inside a run of equal values has no gap *at that rank*,
+    but the column still has a gap: the run has to end somewhere. Cutting at
+    the end of the run is what a tied quantile means, and taking the value at
+    rank `idx` instead dropped the boundary entirely, which is how a balanced
+    binary column used to come out of a 255-bin fit with no edges at all and
+    therefore one unsplittable bin. The two rules agree exactly whenever the
+    old one worked: with no ties `above` is the value at rank `idx`, and when
+    every rank is a boundary (`n_valid <= n_ordinary`) the run's own end is
+    also a boundary and the filter below collapses the pair.
+
+    Two boundaries still produce no edge. One whose `below` is the column
+    maximum has nothing above it, and one whose clamped midpoint fails to
+    exceed the last edge kept would break the strictly-increasing invariant
+    `bin_value` and `transform` search against; the second is also what
+    collapses the many boundaries that share a run down to the one edge that
+    run earns.
 
     The single authority on the edge rule; `out` is cleared first, so a
     caller can hand it the same reusable buffer for every feature.
@@ -288,6 +322,97 @@ def order_key(v: Float64) -> UInt64:
     if (u >> 63) != 0:
         return u ^ 0xFFFF_FFFF_FFFF_FFFF
     return u | 0x8000_0000_0000_0000
+
+
+def first_above_sorted(col: List[Float64], lo: Int, hi: Int, w: Float64) -> Int:
+    """First rank in `[lo, hi)` of an ascending `col` whose value exceeds `w`,
+    or `hi` when `w` is the largest value there.
+
+    The sorted path's answer to "where does this run end": `col[lo - 1] == w`
+    at every call site, so everything below `lo` is already at or under `w`.
+    """
+    var left = lo
+    var right = hi
+    while left < right:
+        var mid = (left + right) // 2
+        if col[mid] > w:
+            right = mid
+        else:
+            left = mid + 1
+    return left
+
+
+def resolve_above_unsorted(
+    col: List[Float64],
+    below: List[Float64],
+    mut above: List[Float64],
+    mut cand: List[Float64],
+    mut found: List[Int],
+):
+    """`above[j]` = the smallest value in `col` strictly greater than
+    `below[j]`, or `below[j]` when there is none.
+
+    The selected path's answer to the same question, for a column it has
+    deliberately not sorted. `below` is ascending, so the values that exceed
+    `below[j]` are exactly those assigned to index `j` or later by the search
+    below, and one suffix-minimum sweep over the boundaries turns per-index
+    minima into per-boundary answers. One pass over the column and a
+    few-hundred-entry search per value, against a table small enough to stay
+    in L1.
+
+    Only called when a boundary actually landed on a tie: with no ties the
+    value at rank `idx` is already the next distinct value, so a column of
+    distinct values pays nothing for this at all.
+    """
+    var m = len(below)
+    above.clear()
+    if m <= 0:
+        return
+    cand.clear()
+    cand.resize(m, 0.0)
+    # 0/1 rather than Bool: the raw-pointer loads below are defined for
+    # scalar element types only.
+    found.clear()
+    found.resize(m, 0)
+
+    var bp = below.unsafe_ptr()
+    var cp = cand.unsafe_ptr()
+    var fp = found.unsafe_ptr()
+    var vp = col.unsafe_ptr()
+    for i in range(len(col)):
+        var v = vp.unsafe_load(i)
+        # Count of boundaries with `below < v`; the last of them is the only
+        # index this value can be the immediate successor of.
+        var left = 0
+        var right = m
+        while left < right:
+            var mid = (left + right) // 2
+            if bp.unsafe_load(mid) < v:
+                left = mid + 1
+            else:
+                right = mid
+        if left == 0:
+            continue
+        var j = left - 1
+        if fp.unsafe_load(j) == 0 or v < cp.unsafe_load(j):
+            cp.unsafe_store(j, v)
+            fp.unsafe_store(j, 1)
+
+    for t in range(m - 1):
+        var j = m - 2 - t
+        if fp.unsafe_load(j + 1) != 0:
+            if (
+                fp.unsafe_load(j) == 0
+                or cp.unsafe_load(j + 1) < cp.unsafe_load(j)
+            ):
+                cp.unsafe_store(j, cp.unsafe_load(j + 1))
+                fp.unsafe_store(j, 1)
+
+    for j in range(m):
+        if fp.unsafe_load(j) != 0:
+            above.append(cp.unsafe_load(j))
+        else:
+            above.append(bp.unsafe_load(j))
 
 
 comptime _KEY_EMPTY = UInt64(0)
@@ -882,6 +1007,8 @@ def fit_bins(
         var vals = List[Float64]()
         var below = List[Float64]()
         var above = List[Float64]()
+        var cand = List[Float64]()
+        var found = List[Int]()
         var edge_buf = List[Float64]()
         var bucket_counts = List[Int]()
         var bucket_keys = List[UInt64]()
@@ -933,6 +1060,7 @@ def fit_bins(
                 # `idxs` and `ranks` both ascend, so one cursor walks them
                 # together instead of searching per boundary.
                 var rp = 0
+                var tied = False
                 for j in range(len(idxs)):
                     var idx = idxs[j]
                     while ranks[rp] < idx - 1:
@@ -941,11 +1069,22 @@ def fit_bins(
                     while ranks[rp] < idx:
                         rp += 1
                     above.append(vals[rp])
+                    if vals[rp] <= below[j]:
+                        tied = True
+                # A boundary inside a run of equal values needs the value the
+                # run ends at, which the rank it was handed does not know.
+                # Only a column that has such a boundary pays for the extra
+                # pass; one of distinct values already has its answer.
+                if tied:
+                    resolve_above_unsorted(col, below, above, cand, found)
             else:
                 sort(col)
                 for j in range(len(idxs)):
-                    below.append(col[idxs[j] - 1])
-                    above.append(col[idxs[j]])
+                    var idx = idxs[j]
+                    var w = col[idx - 1]
+                    below.append(w)
+                    var e = first_above_sorted(col, idx, n_valid, w)
+                    above.append(col[e] if e < n_valid else w)
             emit_quantile_edges(below, above, edge_buf)
 
             var out = scratch_p.unsafe_offset(f * max_edges)

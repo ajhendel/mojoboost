@@ -564,14 +564,34 @@ def fit_bins_csc(
         var below = List[Float64](capacity=len(idxs))
         var above = List[Float64](capacity=len(idxs))
         for j in range(len(idxs)):
-            below.append(
-                _sorted_column_at(
-                    stored, n_neg, n_zero, n_implicit, idxs[j] - 1
+            var idx = idxs[j]
+            var w = _sorted_column_at(
+                stored, n_neg, n_zero, n_implicit, idx - 1
+            )
+            below.append(w)
+            # The next distinct value above `w`, which is what the edge rule
+            # cuts against (see `binning.emit_quantile_edges`). The implied
+            # dense column is sorted and indexable by rank, so the run `w`
+            # belongs to is found by bisecting it rather than walking it --
+            # which matters here, where a column's implicit zeros can be a run
+            # of nearly every row.
+            var left = idx
+            var right = n_valid
+            while left < right:
+                var mid = (left + right) // 2
+                if (
+                    _sorted_column_at(stored, n_neg, n_zero, n_implicit, mid)
+                    > w
+                ):
+                    right = mid
+                else:
+                    left = mid + 1
+            if left < n_valid:
+                above.append(
+                    _sorted_column_at(stored, n_neg, n_zero, n_implicit, left)
                 )
-            )
-            above.append(
-                _sorted_column_at(stored, n_neg, n_zero, n_implicit, idxs[j])
-            )
+            else:
+                above.append(w)
         var edge_buf = List[Float64]()
         emit_quantile_edges(below, above, edge_buf)
 

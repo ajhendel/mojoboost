@@ -766,11 +766,19 @@ def test_sparse_renewed_objectives_match_dense() raises:
     Held to a shorter run than the smooth objectives on purpose. Their
     gradient is a step function of sign(raw - target), so once two split
     candidates are tied to within the rounding that separates the two
-    accumulators -- which happens on this dataset around round 13, where the
-    winner and the runner-up agree to 13 significant digits -- the two fits
-    pick different (equally good) splits and then keep diverging. That is a
-    property of tied data, not of either accumulator; up to that point the
-    two paths agree to the last bits, which is what this asserts.
+    accumulators, the two fits pick different (equally good) splits and then
+    keep diverging. That is a property of tied data, not of either
+    accumulator; up to that point the two paths agree to the last bits, which
+    is what this asserts.
+
+    The round count is a calibration to this dataset and was 12 while a
+    boundary landing inside a run of equal values produced no edge: this
+    column is 85% exact zeros, so it used to bin into almost nothing and the
+    first tie arrived around round 13. Cutting a tie at the end of its run
+    (see binning.emit_quantile_edges) gives the column its real bins, and
+    with real bins the first tie is QUANTILE's at round 7 -- L1 and MAPE
+    still agree bit for bit across all 12. Six rounds keeps a round of margin
+    under that.
     """
     var n_rows = 1500
     var n_features = 12
@@ -780,7 +788,7 @@ def test_sparse_renewed_objectives_match_dense() raises:
     var sparse = transform_csc(mapper, csc)
     var binned = mapper.transform(dense, n_rows)
     var target = _target(dense, n_rows, UInt64(600_000))
-    var params = BoosterParams(12, 0.1, TreeParams(15, 20, 1.0, 1e-3))
+    var params = BoosterParams(6, 0.1, TreeParams(15, 20, 1.0, 1e-3))
 
     for objective in [QUANTILE, L1, MAPE]:
         var want = train(binned, target, objective, params)

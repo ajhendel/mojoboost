@@ -218,9 +218,10 @@ def test_emit_quantile_edges_rules() raises:
     assert_equal(out[0], 1.0, "first midpoint")
     assert_equal(out[1], 3.0, "second midpoint")
 
-    # A boundary with no gap produces nothing.
+    # A boundary whose value is the column maximum has nothing above it, so
+    # the caller passes `below` back and it produces nothing.
     emit_quantile_edges([1.0, 1.0], [1.0, 3.0], out)
-    assert_equal(len(out), 1, "equal pair dropped")
+    assert_equal(len(out), 1, "maximum-valued boundary dropped")
     assert_equal(out[0], 2.0, "only the real gap")
 
     # A repeated boundary cannot repeat an edge.
@@ -293,20 +294,18 @@ def test_binary_and_low_cardinality_columns() raises:
         features.append(0.0 if (r % 10) != 0 else 100.0)
 
     var mapper = _fit_both_ways(features, n_rows, 3, 255, "low cardinality")
-    # A column with k distinct values has at most k - 1 gaps to cut, and a
-    # quantile boundary only becomes an edge when it lands on one; the exact
-    # count is a property of where the boundaries fall, which `_fit_both_ways`
-    # already pins against the sort path. What matters here is that the
-    # selection resolved the column without a sort and stayed inside that
-    # ceiling.
-    assert_true(
-        mapper.edge_offsets[1] - mapper.edge_offsets[0] <= 1, "binary"
+    # A column with k distinct values and k <= max_bins gets its k - 1 gaps
+    # cut, every one of them. Every boundary here lands inside a run, so
+    # before ties were cut at the end of their run these came out with no
+    # edges at all and one unsplittable bin.
+    assert_equal(
+        mapper.edge_offsets[1] - mapper.edge_offsets[0], 1, "binary"
     )
-    assert_true(
-        mapper.edge_offsets[2] - mapper.edge_offsets[1] <= 4, "five levels"
+    assert_equal(
+        mapper.edge_offsets[2] - mapper.edge_offsets[1], 4, "five levels"
     )
-    assert_true(
-        mapper.edge_offsets[3] - mapper.edge_offsets[2] <= 1, "two levels"
+    assert_equal(
+        mapper.edge_offsets[3] - mapper.edge_offsets[2], 1, "two levels"
     )
     _assert_transform_matches_bin_value(
         mapper, features, n_rows, "low cardinality"
@@ -435,6 +434,74 @@ def test_max_bin_values() raises:
             _assert_transform_matches_bin_value(
                 mapper, features, n_rows, String("max_bin ", mb)
             )
+
+
+def test_ties_are_cut_where_the_run_ends() raises:
+    """The regression this rule exists for: a column whose every quantile
+    boundary lands inside a run of equal values still gets its gaps cut."""
+    var n_rows = 100_000
+
+    # Balanced binary. 254 boundaries, both runs 50k long, so not one
+    # boundary straddles the change.
+    var flag = List[Float64](capacity=n_rows)
+    for r in range(n_rows):
+        flag.append(1.0 if (r % 2) == 0 else 0.0)
+    var m = _fit_both_ways(flag, n_rows, 1, 255, "balanced binary")
+    assert_equal(m.edge_offsets[1], 1, "a binary column has one gap to cut")
+    assert_true(
+        m.edges[0] > 0.0 and m.edges[0] < 1.0, "and cuts between the two"
+    )
+    var d = m.transform(flag, n_rows)
+    assert_equal(d.bin_at(0, 0), 1, "a one lands in the upper bin")
+    assert_equal(d.bin_at(1, 0), 0, "a zero in the lower bin")
+
+    # Skewed binary: the rare level is still a bin of its own.
+    var rare = List[Float64](capacity=n_rows)
+    for r in range(n_rows):
+        rare.append(1.0 if (r % 10) == 0 else 0.0)
+    var m2 = _fit_both_ways(rare, n_rows, 1, 255, "skewed binary")
+    assert_equal(m2.edge_offsets[1], 1, "10/90 binary still has its gap")
+
+    # More levels than bins: the budget binds, not the ties.
+    var many = List[Float64](capacity=n_rows)
+    for r in range(n_rows):
+        many.append(Float64(r % 300))
+    var m3 = _fit_both_ways(many, n_rows, 1, 255, "300 levels")
+    assert_true(
+        m3.edge_offsets[1] > 200 and m3.edge_offsets[1] <= 254,
+        String("300 levels into 255 bins gave ", m3.edge_offsets[1], " edges"),
+    )
+
+
+def test_distinct_columns_are_unchanged_by_the_tie_rule() raises:
+    """With no ties the next distinct value above rank idx - 1 is the value at
+    rank idx, so the rule is a no-op: this is why continuous data bins exactly
+    as it always did."""
+    var n_rows = SELECT_MIN_ROWS + 91
+    var col = List[Float64](capacity=n_rows)
+    for r in range(n_rows):
+        col.append(Float64(r) * 1.5)
+    var m = _fit_both_ways(col, n_rows, 1, 255, "strictly increasing")
+    assert_equal(m.edge_offsets[1], 254, "every boundary cuts")
+    for i in range(1, m.edge_offsets[1]):
+        assert_true(
+            m.edges[i] > m.edges[i - 1], String("edge ", i, " increases")
+        )
+    _assert_transform_matches_bin_value(m, col, n_rows, "strictly increasing")
+
+
+def test_every_rank_a_boundary_is_unchanged_by_the_tie_rule() raises:
+    """The other no-op case: with n_valid <= n_ordinary every rank is a
+    boundary, so a run's own end is one too and the old rule already found
+    it."""
+    var features: List[Float64] = [
+        0.0, 0.0, 0.0, 1.0, 1.0, 5.0, 5.0, 5.0, 9.0, 9.0
+    ]
+    var m = _fit_both_ways(features, 10, 1, 255, "every rank a boundary")
+    assert_equal(m.edge_offsets[1], 3, "four levels, three gaps")
+    assert_equal(m.edges[0], 0.5, "0 | 1")
+    assert_equal(m.edges[1], 3.0, "1 | 5")
+    assert_equal(m.edges[2], 7.0, "5 | 9")
 
 
 # ---------------------------------------------------------------------------
