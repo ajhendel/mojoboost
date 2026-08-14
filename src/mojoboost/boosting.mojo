@@ -230,6 +230,24 @@ def train_with_valid(
     return Booster(trees^, base_score, params.learning_rate, objective)
 
 
+def _multiclass_mean_loss(
+    raw: List[Float64], labels: List[Int], n_classes: Int
+) -> Float64:
+    """Mean negative log likelihood of the true class from row-major raw
+    scores, via a max-subtracted log-sum-exp."""
+    var total = 0.0
+    for r in range(len(labels)):
+        var m = raw[r * n_classes]
+        for k in range(1, n_classes):
+            if raw[r * n_classes + k] > m:
+                m = raw[r * n_classes + k]
+        var denom = 0.0
+        for k in range(n_classes):
+            denom += exp(raw[r * n_classes + k] - m)
+        total -= raw[r * n_classes + labels[r]] - m - log(denom)
+    return total / Float64(len(labels))
+
+
 def _softmax_inplace(mut scores: List[Float64], start: Int, k: Int):
     var m = scores[start]
     for i in range(1, k):
@@ -342,6 +360,119 @@ def train_multiclass(
                 _ = trees.pop()
             break
 
+    return MulticlassBooster(
+        trees^, base_scores^, n_classes, params.learning_rate
+    )
+
+
+def train_multiclass_with_valid(
+    data: BinnedMatrix,
+    labels: List[Int],
+    valid_data: BinnedMatrix,
+    valid_labels: List[Int],
+    n_classes: Int,
+    params: BoosterParams,
+    early_stopping_rounds: Int,
+    min_delta: Float64 = 0.0,
+) raises -> MulticlassBooster:
+    """Train a softmax multiclass ensemble with validation-set early
+    stopping. Stops when the validation multiclass log loss has not
+    improved by more than min_delta for early_stopping_rounds consecutive
+    rounds and truncates the ensemble to its best round (a round is one
+    tree per class)."""
+    if len(labels) != data.n_rows:
+        raise Error("labels length must equal n_rows")
+    if len(valid_labels) != valid_data.n_rows:
+        raise Error("valid_labels length must equal valid n_rows")
+    if valid_data.n_features != data.n_features:
+        raise Error("valid_data must have the same features")
+    if n_classes < 2:
+        raise Error("n_classes must be at least 2")
+    if early_stopping_rounds < 1:
+        raise Error("early_stopping_rounds must be positive")
+    var n = data.n_rows
+    var n_valid = valid_data.n_rows
+
+    # Base scores are log priors of the TRAINING labels.
+    var counts = List[Int](capacity=n_classes)
+    for _ in range(n_classes):
+        counts.append(0)
+    for r in range(n):
+        if labels[r] < 0 or labels[r] >= n_classes:
+            raise Error("label out of range")
+        counts[labels[r]] += 1
+    for r in range(n_valid):
+        if valid_labels[r] < 0 or valid_labels[r] >= n_classes:
+            raise Error("valid label out of range")
+    var base_scores = List[Float64](capacity=n_classes)
+    for k in range(n_classes):
+        base_scores.append(log(_clamp_prob(Float64(counts[k]) / Float64(n))))
+
+    # Row-major raw scores for both sets: raw[r * n_classes + k].
+    var raw = List[Float64](capacity=n * n_classes)
+    for _ in range(n):
+        for k in range(n_classes):
+            raw.append(base_scores[k])
+    var valid_raw = List[Float64](capacity=n_valid * n_classes)
+    for _ in range(n_valid):
+        for k in range(n_classes):
+            valid_raw.append(base_scores[k])
+    var prob = List[Float64](capacity=n * n_classes)
+    for _ in range(n * n_classes):
+        prob.append(0.0)
+
+    var trees = List[Tree]()
+    var grad = List[Float64](capacity=n)
+    var hess = List[Float64](capacity=n)
+    var best_loss = _multiclass_mean_loss(valid_raw, valid_labels, n_classes)
+    var best_n_rounds = 0
+    var n_rounds = 0
+    for _ in range(params.n_estimators):
+        for r in range(n):
+            for k in range(n_classes):
+                prob[r * n_classes + k] = raw[r * n_classes + k]
+            _softmax_inplace(prob, r * n_classes, n_classes)
+
+        var made_progress = False
+        for k in range(n_classes):
+            grad.clear()
+            hess.clear()
+            for r in range(n):
+                var p = prob[r * n_classes + k]
+                var y = 1.0 if labels[r] == k else 0.0
+                grad.append(p - y)
+                var h = 2.0 * p * (1.0 - p)
+                if h < 1e-16:
+                    h = 1e-16
+                hess.append(h)
+            var tree = grow_tree(data, grad, hess, params.tree)
+            if tree.n_leaves > 1 or abs(tree.value[0]) >= 1e-12:
+                made_progress = True
+            for r in range(n):
+                raw[r * n_classes + k] += (
+                    params.learning_rate * tree.predict_row(data, r)
+                )
+            for r in range(n_valid):
+                valid_raw[r * n_classes + k] += (
+                    params.learning_rate * tree.predict_row(valid_data, r)
+                )
+            trees.append(tree^)
+
+        if not made_progress:
+            for _ in range(n_classes):
+                _ = trees.pop()
+            break
+        n_rounds += 1
+
+        var loss = _multiclass_mean_loss(valid_raw, valid_labels, n_classes)
+        if loss < best_loss - min_delta:
+            best_loss = loss
+            best_n_rounds = n_rounds
+        elif n_rounds - best_n_rounds >= early_stopping_rounds:
+            break
+
+    while len(trees) > best_n_rounds * n_classes:
+        _ = trees.pop()
     return MulticlassBooster(
         trees^, base_scores^, n_classes, params.learning_rate
     )

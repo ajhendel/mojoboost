@@ -17,6 +17,15 @@ from .boosting import (
     MulticlassBooster,
     train,
     train_multiclass,
+    train_multiclass_with_valid,
     train_with_valid,
+)
+from .metrics import (
+    binary_accuracy,
+    binary_auc,
+    binary_log_loss,
+    multiclass_accuracy,
+    multiclass_log_loss,
+    rmse,
 )
 from .model import Model, fit

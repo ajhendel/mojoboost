@@ -30,8 +30,10 @@ with tests
 - leaf-wise (best-first) tree growth with `num_leaves` cap and Newton-step
   leaf values
 - objectives: squared error, binary logistic, and multiclass softmax
-- validation-set early stopping with `min_delta`, truncating to the best
-  round
+- validation-set early stopping with `min_delta` for every objective,
+  truncating to the best round
+- evaluation metrics: RMSE, log loss, accuracy, and ROC AUC with
+  sklearn-matching tie handling
 
 ```mojo
 from mojoboost import BINARY_LOGISTIC, BoosterParams, TreeParams, fit
