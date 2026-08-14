@@ -21,6 +21,7 @@ device.mojo, and nothing here decides it.
 
 from std.memory import unsafe_memcpy
 from std.os import abort
+from std.sys import has_accelerator
 from std.python import Python, PythonObject
 from std.python.bindings import PythonModuleBuilder
 
@@ -2180,10 +2181,13 @@ struct GpuValidation(Movable, Writable):
         weight: List[Float64],
         n_outputs: Int,
     ) raises:
-        self.predictor = GpuPredictor(data.n_features, n_outputs)
-        self.predictor.set_validation(data, target, weight)
-        self.n_rows = data.n_rows
-        self.n_outputs = n_outputs
+        comptime if not has_accelerator():
+            raise Error("GPU validation requires an accelerator")
+        else:
+            self.predictor = GpuPredictor(data.n_features, n_outputs)
+            self.predictor.set_validation(data, target, weight)
+            self.n_rows = data.n_rows
+            self.n_outputs = n_outputs
 
     def write_to(self, mut writer: Some[Writer]):
         writer.write(
@@ -2232,19 +2236,22 @@ def gpu_validation_open(
     Returns an opaque handle. Accumulate the rounds the model gains into it
     with `gpu_validation_accumulate`, then read a metric or the raw scores.
     """
-    var m = model.downcast_value_ptr[Model]()
-    var nr = Int(py=n_rows)
-    var nf = Int(py=n_features)
-    var support = gpu_predict_support(nr, nf, 1, m[].mapper.n_bins)
-    support.raise_if_blocked()
-    var features = _f64_view(Int(py=x_addr), nr * nf)
-    var columns = _validation_columns(params, nr)
-    var handle = GpuValidation(
-        m[].mapper.transform(features, nr), columns[0], columns[1], 1
-    )
-    var base: List[Float64] = [m[].booster.base_score]
-    handle.predictor.reset_validation(base)
-    return PythonObject(alloc=handle^)
+    comptime if not has_accelerator():
+        raise Error("GPU validation requires an accelerator")
+    else:
+        var m = model.downcast_value_ptr[Model]()
+        var nr = Int(py=n_rows)
+        var nf = Int(py=n_features)
+        var support = gpu_predict_support(nr, nf, 1, m[].mapper.n_bins)
+        support.raise_if_blocked()
+        var features = _f64_view(Int(py=x_addr), nr * nf)
+        var columns = _validation_columns(params, nr)
+        var handle = GpuValidation(
+            m[].mapper.transform(features, nr), columns[0], columns[1], 1
+        )
+        var base: List[Float64] = [m[].booster.base_score]
+        handle.predictor.reset_validation(base)
+        return PythonObject(alloc=handle^)
 
 
 def gpu_validation_open_multiclass(
@@ -2257,19 +2264,22 @@ def gpu_validation_open_multiclass(
     """`gpu_validation_open` for a softmax model. The labels are class codes
     in 0..n_classes-1, the same encoding `fit_multiclass` takes, and the
     resident score vector is `n_rows * n_classes` wide."""
-    var m = model.downcast_value_ptr[MulticlassModel]()
-    var nr = Int(py=n_rows)
-    var nf = Int(py=n_features)
-    var k = m[].booster.n_classes
-    var support = gpu_predict_support(nr, nf, k, m[].mapper.n_bins)
-    support.raise_if_blocked()
-    var features = _f64_view(Int(py=x_addr), nr * nf)
-    var columns = _validation_columns(params, nr)
-    var handle = GpuValidation(
-        m[].mapper.transform(features, nr), columns[0], columns[1], k
-    )
-    handle.predictor.reset_validation(m[].booster.base_scores)
-    return PythonObject(alloc=handle^)
+    comptime if not has_accelerator():
+        raise Error("GPU validation requires an accelerator")
+    else:
+        var m = model.downcast_value_ptr[MulticlassModel]()
+        var nr = Int(py=n_rows)
+        var nf = Int(py=n_features)
+        var k = m[].booster.n_classes
+        var support = gpu_predict_support(nr, nf, k, m[].mapper.n_bins)
+        support.raise_if_blocked()
+        var features = _f64_view(Int(py=x_addr), nr * nf)
+        var columns = _validation_columns(params, nr)
+        var handle = GpuValidation(
+            m[].mapper.transform(features, nr), columns[0], columns[1], k
+        )
+        handle.predictor.reset_validation(m[].booster.base_scores)
+        return PythonObject(alloc=handle^)
 
 
 def gpu_validation_shape(handle: PythonObject) raises -> PythonObject:
@@ -2291,11 +2301,14 @@ def gpu_validation_reset(
     Where a boosting run starts, and the only place the base score enters:
     `gpu_validation_accumulate` never adds it, exactly as `IterationRange`
     counts it as part of iteration 0 rather than of every round."""
-    var h = handle.downcast_value_ptr[GpuValidation]()
-    h[].predictor.reset_validation(
-        _f64_list(Int(py=base_addr), h[].n_outputs)
-    )
-    return PythonObject(None)
+    comptime if not has_accelerator():
+        raise Error("GPU validation requires an accelerator")
+    else:
+        var h = handle.downcast_value_ptr[GpuValidation]()
+        h[].predictor.reset_validation(
+            _f64_list(Int(py=base_addr), h[].n_outputs)
+        )
+        return PythonObject(None)
 
 
 def gpu_validation_accumulate(
@@ -2310,19 +2323,22 @@ def gpu_validation_accumulate(
     A loop that appended one round calls this with that round's pair, and
     scoring the round costs one tree walk per validation row rather than a
     walk of the whole ensemble. An empty range does nothing."""
-    var h = handle.downcast_value_ptr[GpuValidation]()
-    var m = model.downcast_value_ptr[Model]()
-    if h[].n_outputs != 1:
-        raise Error(
-            "this validation handle was opened for a multiclass model; use"
-            " gpu_validation_accumulate_multiclass"
+    comptime if not has_accelerator():
+        raise Error("GPU validation requires an accelerator")
+    else:
+        var h = handle.downcast_value_ptr[GpuValidation]()
+        var m = model.downcast_value_ptr[Model]()
+        if h[].n_outputs != 1:
+            raise Error(
+                "this validation handle was opened for a multiclass model; use"
+                " gpu_validation_accumulate_multiclass"
+            )
+        accumulate_booster_rounds(
+            h[].predictor,
+            m[].booster,
+            _iteration_slice(m[].n_iterations(), start, stop),
         )
-    accumulate_booster_rounds(
-        h[].predictor,
-        m[].booster,
-        _iteration_slice(m[].n_iterations(), start, stop),
-    )
-    return PythonObject(None)
+        return PythonObject(None)
 
 
 def gpu_validation_accumulate_multiclass(
@@ -2333,18 +2349,21 @@ def gpu_validation_accumulate_multiclass(
 ) raises -> PythonObject:
     """`gpu_validation_accumulate` for a softmax model. One iteration is one
     tree per class, so the range is taken in whole rounds."""
-    var h = handle.downcast_value_ptr[GpuValidation]()
-    var m = model.downcast_value_ptr[MulticlassModel]()
-    if h[].n_outputs != m[].booster.n_classes:
-        raise Error(
-            "the model's class count does not match the validation handle"
+    comptime if not has_accelerator():
+        raise Error("GPU validation requires an accelerator")
+    else:
+        var h = handle.downcast_value_ptr[GpuValidation]()
+        var m = model.downcast_value_ptr[MulticlassModel]()
+        if h[].n_outputs != m[].booster.n_classes:
+            raise Error(
+                "the model's class count does not match the validation handle"
+            )
+        accumulate_multiclass_rounds(
+            h[].predictor,
+            m[].booster,
+            _iteration_slice(m[].n_iterations(), start, stop),
         )
-    accumulate_multiclass_rounds(
-        h[].predictor,
-        m[].booster,
-        _iteration_slice(m[].n_iterations(), start, stop),
-    )
-    return PythonObject(None)
+        return PythonObject(None)
 
 
 def gpu_validation_metric(
@@ -2367,13 +2386,16 @@ def gpu_validation_metric(
     `gpu_validation_raw` and pass them to `eval_metric` instead. That is the
     same choice `train_gpu`'s device validation scorer makes per objective.
     """
-    var h = handle.downcast_value_ptr[GpuValidation]()
-    var response = RESPONSE_SOFTMAX
-    if h[].n_outputs == 1:
-        response = response_for_objective(Int(py=objective))
-    return PythonObject(
-        validation_host_metric(h[].predictor, Int(py=metric), response)
-    )
+    comptime if not has_accelerator():
+        raise Error("GPU validation requires an accelerator")
+    else:
+        var h = handle.downcast_value_ptr[GpuValidation]()
+        var response = RESPONSE_SOFTMAX
+        if h[].n_outputs == 1:
+            response = response_for_objective(Int(py=objective))
+        return PythonObject(
+            validation_host_metric(h[].predictor, Int(py=metric), response)
+        )
 
 
 def gpu_validation_metric_matches_host(
@@ -2402,9 +2424,12 @@ def gpu_validation_raw(
     The escape hatch, and the only way scores leave the device: it is what
     lets the host metric suite score a run whose metric the device has no
     kernel for."""
-    var h = handle.downcast_value_ptr[GpuValidation]()
-    _store(h[].predictor.validation_raw(), out_addr)
-    return PythonObject(None)
+    comptime if not has_accelerator():
+        raise Error("GPU validation requires an accelerator")
+    else:
+        var h = handle.downcast_value_ptr[GpuValidation]()
+        _store(h[].predictor.validation_raw(), out_addr)
+        return PythonObject(None)
 
 
 def gpu_available() raises -> PythonObject:
