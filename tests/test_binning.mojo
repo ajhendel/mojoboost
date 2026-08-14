@@ -582,5 +582,95 @@ def test_equal_width_path_is_untouched() raises:
     assert_equal(data.bin_at(7, 0), 3, "last row")
 
 
+def test_few_features_split_by_rows_and_still_match_serial() raises:
+    """`transform` on a matrix with fewer features than workers.
+
+    That shape used to cap itself at `n_features` workers; it now cuts each
+    feature's rows into blocks. Binning a cell depends on that cell alone, so
+    the bins must come out byte for byte the same as the serial run at every
+    worker count. Row counts are deliberately not multiples of the block
+    sizes, so the last block of each feature is short and a mistake in the
+    tail clamp would leave trailing rows unwritten (bin 0) rather than binned.
+    """
+    var widths = [1, 2, 3]
+    var row_counts = [SELECT_MIN_ROWS + 7, SELECT_MIN_ROWS + 1]
+    var counts = [2, 3, 4, 8, 16]
+    for wi in range(len(widths)):
+        var n_features = widths[wi]
+        for ri in range(len(row_counts)):
+            var n_rows = row_counts[ri]
+            var features = List[Float64](capacity=n_rows * n_features)
+            for f in range(n_features):
+                for r in range(n_rows):
+                    features.append(
+                        _uniform(UInt64(f) * 7919 + UInt64(r) * 31 + 1)
+                    )
+
+            _serial()
+            var mapper = fit_bins(features, n_rows, n_features, 255)
+            var serial_data = mapper.transform(features, n_rows)
+            var what = String(n_features, " features x ", n_rows, " rows")
+
+            # A tail left unwritten reads as bin 0, and so does a genuinely
+            # smallest value, so pin the last row against the reference search
+            # rather than against a constant.
+            for f in range(n_features):
+                assert_equal(
+                    serial_data.bin_at(n_rows - 1, f),
+                    mapper.bin_value(f, features[f * n_rows + n_rows - 1]),
+                    String(what, ": serial last row of feature ", f),
+                )
+
+            for ci in range(len(counts)):
+                _workers(counts[ci])
+                var d = mapper.transform(features, n_rows)
+                for c in range(len(serial_data.bins)):
+                    if d.bins[c] != serial_data.bins[c]:
+                        _auto()
+                        raise Error(
+                            what,
+                            ", workers ",
+                            counts[ci],
+                            ": cell ",
+                            c,
+                            " differs from serial",
+                        )
+    _auto()
+
+
+def test_row_split_bins_a_categorical_feature_the_same_way() raises:
+    """The categorical branch of `transform` is tiled by rows too, and a
+    category's bin is a table lookup on its own cell, so the tiles cannot
+    disagree with the serial pass or with `bin_value`."""
+    var n_rows = SELECT_MIN_ROWS + 5
+    var n_features = 2
+    var features = List[Float64](capacity=n_rows * n_features)
+    # Feature 0 is declared categorical and takes seven levels; feature 1 is
+    # ordinary, so one call covers both branches of the tiled kernel.
+    for r in range(n_rows):
+        features.append(Float64(r % 7))
+    for r in range(n_rows):
+        features.append(_uniform(UInt64(r) * 6151 + 17))
+
+    _serial()
+    var mapper = fit_bins(features, n_rows, n_features, 255, [0])
+    var serial_data = mapper.transform(features, n_rows)
+
+    var counts = [2, 4, 8]
+    for ci in range(len(counts)):
+        _workers(counts[ci])
+        var d = mapper.transform(features, n_rows)
+        for c in range(len(serial_data.bins)):
+            if d.bins[c] != serial_data.bins[c]:
+                _auto()
+                raise Error(
+                    "workers ", counts[ci], ": cell ", c, " differs from serial"
+                )
+    _auto()
+    _assert_transform_matches_bin_value(
+        mapper, features, n_rows, "categorical plus numeric, row split"
+    )
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

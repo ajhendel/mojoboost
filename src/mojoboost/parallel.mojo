@@ -35,7 +35,7 @@ grower's histogram count, one host synchronization per split, off by
 default), `MOJOBOOST_GPU_TRACE` and `MOJOBOOST_GPU_STAGING_SLOTS`
 (gpu_runtime.mojo).
 
-Three dispatch shapes are provided. All of them keep every floating-point
+Four dispatch shapes are provided. All of them keep every floating-point
 summation order independent of the task count, so every result is
 bit-identical to the serial path on every machine and at every worker
 setting:
@@ -47,6 +47,11 @@ setting:
   parallelism gets them in the same call rather than in two.
 - `dispatch_features` is the one-unit-at-a-time form of the same thing,
   written in terms of it.
+- `dispatch_feature_rows` splits by feature *and*, when there are fewer
+  features than tasks, by rows within each feature. Elementwise callers
+  only: it exists so that a matrix with four features over five million
+  rows can use more than four workers, which neither of the two above can
+  do. With features to spare it is `dispatch_feature_ranges` verbatim.
 - `dispatch_rows` splits a row range into contiguous ascending blocks.
   Callers use it only for elementwise work (gradients, predictions, bin
   lookups, sibling subtraction) and for counting passes, where disjoint
@@ -217,6 +222,81 @@ def dispatch_features[FuncType: def (Int) -> None](
             func(f)
 
     dispatch_feature_ranges(do_range, n_features, total_ops)
+
+
+def dispatch_feature_rows[FuncType: def (Int, Int, Int) -> None](
+    func: FuncType, n_features: Int, n_rows: Int, total_ops: Int
+) raises:
+    """Run `func(f, row_start, row_end)` over tiles covering
+    [0, n_features) x [0, n_rows), under the env contract above.
+
+    For an elementwise kernel: one where the value written at (f, r) depends
+    on that cell alone. `dispatch_features` splits such a kernel by feature
+    and nothing else, so a matrix with four features cannot use more than
+    four workers however many rows it has. Four features by five million rows
+    is a real shape (a few engineered signals over a long history), and on
+    that shape feature-only splitting leaves most of the machine idle.
+
+    So the split falls back to rows only when it has to. With at least as
+    many features as tasks, this *is* `dispatch_feature_ranges`, called
+    rather than reimplemented: one task per contiguous run of features,
+    exactly the schedule that shape has always had, and no new tasks to pay
+    for. Below that, each feature's rows are cut into enough blocks to reach
+    the task count, and the tiles are dispatched as one flat list.
+
+    Tiling cannot move a result. Every tile writes only its own
+    `(f, [row_start, row_end))` cells, reads only the matching input cells,
+    and computes each from that cell alone, so the output is the same bytes
+    at every task count and on every machine. That is a property of the
+    kernel, not of the schedule, which is why this is restricted to
+    elementwise callers: a kernel that reduces across rows (a column
+    minimum, a rank, a histogram) needs a combine step and must not use this.
+
+    `total_ops` is the usual work estimate in histogram-op equivalents. It is
+    compared against the auto-mode threshold once, over the whole matrix, so
+    a shape stays serial here on exactly the same grounds it would elsewhere.
+    """
+    var n_tasks = plan_tasks(n_features * n_rows, total_ops)
+    if n_tasks <= 1:
+        for f in range(n_features):
+            if n_rows > 0:
+                func(f, 0, n_rows)
+        return
+
+    if n_features >= n_tasks:
+        # Enough features to keep every task busy: the established schedule,
+        # reached through the established call so there is one split rule.
+        def do_range(start: Int, end: Int) {imm}:
+            for f in range(start, end):
+                func(f, 0, n_rows)
+
+        dispatch_feature_ranges(do_range, n_features, total_ops)
+        return
+
+    # Blocks per feature, rounded up, so `n_features * blocks >= n_tasks` and
+    # no worker is left without a tile. Clamped to `n_rows` because a block
+    # cannot be shorter than one row.
+    var per_feature = (n_tasks + n_features - 1) // n_features
+    if per_feature > n_rows:
+        per_feature = n_rows
+    if per_feature < 1:
+        return
+    var chunk = (n_rows + per_feature - 1) // per_feature
+    # Recount from the chunk, as `plan_row_blocks` does: ceiling division can
+    # leave a trailing block empty, and an empty tile is a task that costs
+    # scheduling and does nothing.
+    var n_blocks = (n_rows + chunk - 1) // chunk
+
+    def do_tile(t: Int) {imm}:
+        var f = t // n_blocks
+        var b = t - f * n_blocks
+        var r0 = b * chunk
+        var r1 = r0 + chunk
+        if r1 > n_rows:
+            r1 = n_rows
+        func(f, r0, r1)
+
+    sync_parallelize(do_tile, n_features * n_blocks)
 
 
 @fieldwise_init

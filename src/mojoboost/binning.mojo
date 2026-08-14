@@ -126,7 +126,12 @@ from std.math import isnan
 from std.memory import bitcast
 
 from .categorical import CategoricalSpec, fit_categorical_spec
-from .parallel import _env_int, dispatch_feature_ranges, dispatch_features
+from .parallel import (
+    _env_int,
+    dispatch_feature_ranges,
+    dispatch_feature_rows,
+    dispatch_features,
+)
 from .tree_parameters_extra import ForcedSplits
 
 
@@ -884,10 +889,10 @@ struct BinMapper(Copyable, Movable):
         var miss_p = self.missing_bin.unsafe_ptr()
         ref cats = self.cats
 
-        def do_feature(f: Int) {imm}:
+        def do_tile(f: Int, r_lo: Int, r_hi: Int) {imm}:
             var col = f * n_rows
             if cats.is_cat(f):
-                for r in range(n_rows):
+                for r in range(r_lo, r_hi):
                     bins_p.unsafe_store(
                         col + r,
                         UInt8(cats.bin_of(f, feat_p.unsafe_load(col + r))),
@@ -896,7 +901,7 @@ struct BinMapper(Copyable, Movable):
             var pbase = poff_p.unsafe_load(f)
             var half = half_p.unsafe_load(f)
             var mb = miss_p.unsafe_load(f)
-            for r in range(n_rows):
+            for r in range(r_lo, r_hi):
                 var v = feat_p.unsafe_load(col + r)
                 # NaN is routed before any comparison, so it never takes part
                 # in the quantile search (see `bin_value`).
@@ -920,9 +925,16 @@ struct BinMapper(Copyable, Movable):
         # A row costs one binary search over at most `n_bins` edges, not one
         # accumulate: about `log2(n_bins)` dependent compares, each on a hot
         # but data-dependent load.
-        dispatch_features(
-            do_feature,
+        #
+        # Split by feature *and* by rows. Binning a cell reads that cell and
+        # writes that cell, so tiles are independent and the bins are the same
+        # bytes however the tiles fall. With features to spare this is the
+        # by-feature split it has always been; with only a handful of features
+        # over a long history it is what keeps the other cores working.
+        dispatch_feature_rows(
+            do_tile,
             n_features,
+            n_rows,
             n_features * n_rows * (1 + _log2_ceil(self.n_bins)),
         )
         return BinnedMatrix(
