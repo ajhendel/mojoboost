@@ -45,7 +45,7 @@ can check.
 high value is marked `unsupported` to keep the matrix clean; the expensive
 items (feature contributions, sparse input, a real distributed transport,
 non-Apple GPU validation) are `deferred` with a named reason and, where one
-exists, a task number in `CLAUDE_CODE_FEATURE_COMPLETE_TASKS.txt`.
+exists, a task number in the maintainer's local planning notes.
 
 ## v1 scope
 
