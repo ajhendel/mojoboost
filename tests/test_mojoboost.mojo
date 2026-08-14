@@ -1,7 +1,11 @@
 from std.testing import assert_equal, assert_true, assert_false, TestSuite
 
 from mojoboost import (
+    BINARY_LOGISTIC,
+    SQUARED_ERROR,
     BinnedMatrix,
+    Booster,
+    BoosterParams,
     Histogram,
     SplitInfo,
     Tree,
@@ -12,6 +16,7 @@ from mojoboost import (
     find_best_split,
     grow_tree,
     subtract_histogram,
+    train,
 )
 
 
@@ -165,6 +170,55 @@ def test_tree_min_data_in_leaf() raises:
     var params = TreeParams(31, 3, 1.0, 1e-3)
     var tree = grow_tree(data, grad, hess, params)
     assert_equal(tree.n_leaves, 2)
+
+
+def small_tree_params() -> TreeParams:
+    return TreeParams(4, 1, 1.0, 1e-3)
+
+
+def test_boosting_regression_step_function() raises:
+    var data = make_toy()
+    var target: List[Float64] = [0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]
+    var params = BoosterParams(100, 0.1, small_tree_params())
+    var model = train(data, target, SQUARED_ERROR, params)
+    for r in range(8):
+        assert_true(abs(model.predict_row(data, r) - target[r]) < 0.05)
+
+
+def test_boosting_binary_logistic() raises:
+    # Label is feature 0; a boosted logistic model should become confident.
+    var data = make_additive()
+    var target: List[Float64] = [0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]
+    var params = BoosterParams(200, 0.2, small_tree_params())
+    var model = train(data, target, BINARY_LOGISTIC, params)
+    for r in range(8):
+        var p = model.predict_row(data, r)
+        assert_true(p >= 0.0 and p <= 1.0)
+        if target[r] > 0.5:
+            assert_true(p > 0.8)
+        else:
+            assert_true(p < 0.2)
+
+
+def test_boosting_converged_early_stop() raises:
+    # A constant target is fit exactly by the base score; no trees needed.
+    var data = make_toy()
+    var target: List[Float64] = [2.5, 2.5, 2.5, 2.5, 2.5, 2.5, 2.5, 2.5]
+    var params = BoosterParams(50, 0.1, small_tree_params())
+    var model = train(data, target, SQUARED_ERROR, params)
+    assert_equal(len(model.trees), 0)
+    assert_true(abs(model.predict_row(data, 0) - 2.5) < 1e-12)
+
+
+def test_boosting_validates_objective() raises:
+    var data = make_toy()
+    var target = ones(8)
+    var raised = False
+    try:
+        _ = train(data, target, 99, BoosterParams(1, 0.1, small_tree_params()))
+    except:
+        raised = True
+    assert_true(raised)
 
 
 def main() raises:

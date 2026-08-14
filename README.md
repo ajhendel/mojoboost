@@ -19,22 +19,39 @@ targets GPUs from the same source.
 
 ## Status
 
-Early development. What works today, each piece with tests
+Early development. Training works end to end. What works today, each piece
+with tests
 
 - equal-width feature binning into `uint8` bins
-- histogram accumulation (gradient sums, hessian sums, counts)
-- best-split search with the standard second-order gain formula
+- histogram accumulation with the sibling subtraction trick
+- best-split search with the standard second-order gain formula,
+  `min_data_in_leaf` and hessian constraints
+- leaf-wise (best-first) tree growth with `num_leaves` cap and Newton-step
+  leaf values
+- boosting loop with squared-error and binary-logistic objectives
+
+```mojo
+from mojoboost import (
+    BINARY_LOGISTIC, BoosterParams, TreeParams, bin_equal_width, train,
+)
+
+def main() raises:
+    var data = bin_equal_width(features, n_rows, n_features, n_bins=255)
+    var params = BoosterParams(100, 0.1, TreeParams.default())
+    var model = train(data, labels, BINARY_LOGISTIC, params)
+    var p = model.predict_row(data, 0)
+```
 
 ## Roadmap
 
-1. Leaf-wise tree growth with `num_leaves` cap and histogram subtraction trick
-2. Quantile (equal-frequency) binning, LightGBM style
-3. Boosting loop with logistic and squared-error objectives, early stopping
-4. SIMD histogram kernels and multicore training
-5. scikit-learn style `fit`/`predict` Python API via Mojo interop
-6. Reproducible benchmark suite vs LightGBM and XGBoost (same defaults, same
+1. Quantile (equal-frequency) binning, LightGBM style, with stored bin edges
+   so prediction works on raw (unbinned) data
+2. Multiclass objective and validation-set early stopping
+3. SIMD histogram kernels and multicore training
+4. scikit-learn style `fit`/`predict` Python API via Mojo interop
+5. Reproducible benchmark suite vs LightGBM and XGBoost (same defaults, same
    datasets, hardware documented)
-7. GPU training
+6. GPU training
 
 ## Defaults
 

@@ -9,3 +9,10 @@ from .histogram import (
 )
 from .split import SplitInfo, find_best_split
 from .tree import Tree, TreeParams, grow_tree
+from .boosting import (
+    BINARY_LOGISTIC,
+    SQUARED_ERROR,
+    Booster,
+    BoosterParams,
+    train,
+)
