@@ -15,14 +15,12 @@ never write the same location and need no atomics. Nodes too small to amortize
 task-scheduling overhead take the serial path.
 """
 
-from max.algorithm import sync_parallelize
 from std.sys.info import simd_width_of
 
 from .binning import BinnedMatrix
+from .parallel import PARALLEL_MIN_OPS, dispatch_features
 
 comptime SIMD_LANES = 4 * simd_width_of[DType.float64]()
-
-comptime PARALLEL_MIN_OPS = 1 << 17
 
 
 @fieldwise_init
@@ -78,11 +76,7 @@ def build_histogram(
             hp.unsafe_store(b, hp.unsafe_load(b) + hess_p.unsafe_load(r))
             cp.unsafe_store(b, cp.unsafe_load(b) + 1)
 
-    if data.n_features > 1 and data.n_features * n_rows >= PARALLEL_MIN_OPS:
-        sync_parallelize(do_feature, data.n_features)
-    else:
-        for f in range(data.n_features):
-            do_feature(f)
+    dispatch_features(do_feature, data.n_features, data.n_features * n_rows)
 
     return Histogram(g^, h^, c^, data.n_features, data.n_bins)
 
@@ -123,11 +117,7 @@ def build_histogram_subset(
             hp.unsafe_store(b, hp.unsafe_load(b) + hess_p.unsafe_load(r))
             cp.unsafe_store(b, cp.unsafe_load(b) + 1)
 
-    if data.n_features > 1 and data.n_features * n_sub >= PARALLEL_MIN_OPS:
-        sync_parallelize(do_feature, data.n_features)
-    else:
-        for f in range(data.n_features):
-            do_feature(f)
+    dispatch_features(do_feature, data.n_features, data.n_features * n_sub)
 
     return Histogram(g^, h^, c^, data.n_features, data.n_bins)
 

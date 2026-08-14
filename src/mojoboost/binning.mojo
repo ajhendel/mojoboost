@@ -7,7 +7,15 @@ operate on fixed-size histograms instead of sorted feature values.
 and returns a `BinMapper` whose stored edges let a trained model bin raw,
 unseen feature values at prediction time. `bin_equal_width` remains as a
 simple mapper-free alternative for experiments.
+
+Fitting and transforming parallelize across features: every feature's edge
+computation (column copy + sort) and bin assignment is independent and
+writes only its own output range, so workers need no synchronization and
+the result is bit-identical to the serial path. Inputs too small to
+amortize task-scheduling overhead stay serial.
 """
+
+from .parallel import dispatch_features
 
 
 @fieldwise_init
@@ -59,12 +67,33 @@ struct BinMapper(Copyable, Movable):
         """Bin a column-major feature matrix (`features[f * n_rows + r]`)."""
         if len(features) != n_rows * self.n_features:
             raise Error("features length must equal n_rows * n_features")
-        var bins = List[UInt8](capacity=n_rows * self.n_features)
-        for f in range(self.n_features):
+        var n_features = self.n_features
+        var bins = List[UInt8](capacity=n_rows * n_features)
+        bins.resize(n_rows * n_features, 0)
+
+        var bins_p = bins.unsafe_ptr()
+        var feat_p = features.unsafe_ptr()
+        var edges_p = self.edges.unsafe_ptr()
+        var offs_p = self.edge_offsets.unsafe_ptr()
+
+        def do_feature(f: Int) {imm}:
+            var lo = offs_p.unsafe_load(f)
+            var hi = offs_p.unsafe_load(f + 1)
             var col = f * n_rows
             for r in range(n_rows):
-                bins.append(UInt8(self.bin_value(f, features[col + r])))
-        return BinnedMatrix(bins^, n_rows, self.n_features, self.n_bins)
+                var v = feat_p.unsafe_load(col + r)
+                var left = lo
+                var right = hi
+                while left < right:
+                    var mid = (left + right) // 2
+                    if v <= edges_p.unsafe_load(mid):
+                        right = mid
+                    else:
+                        left = mid + 1
+                bins_p.unsafe_store(col + r, UInt8(left - lo))
+
+        dispatch_features(do_feature, n_features, n_features * n_rows)
+        return BinnedMatrix(bins^, n_rows, n_features, self.n_bins)
 
     def bin_row(self, row: List[Float64]) raises -> List[Int]:
         """Bin one example (length n_features) for prediction."""
@@ -92,14 +121,26 @@ def fit_bins(
     if len(features) != n_rows * n_features:
         raise Error("features length must equal n_rows * n_features")
 
-    var edges = List[Float64]()
-    var offsets = List[Int]()
-    offsets.append(0)
-    for f in range(n_features):
+    # Each feature's edges land in its own fixed-stride scratch slice; a
+    # serial pass then concatenates them in feature order, so the result is
+    # identical whichever path ran.
+    var max_edges = max_bins - 1
+    var scratch = List[Float64](capacity=n_features * max_edges)
+    scratch.resize(n_features * max_edges, 0.0)
+    var counts = List[Int](capacity=n_features)
+    counts.resize(n_features, 0)
+
+    var scratch_p = scratch.unsafe_ptr()
+    var counts_p = counts.unsafe_ptr()
+    var feat_p = features.unsafe_ptr()
+
+    def do_feature(f: Int) {imm}:
         var col = List[Float64](capacity=n_rows)
         for r in range(n_rows):
-            col.append(features[f * n_rows + r])
+            col.append(feat_p.unsafe_load(f * n_rows + r))
         sort(col)
+        var out = scratch_p.unsafe_offset(f * max_edges)
+        var n_out = 0
         for b in range(1, max_bins):
             var idx = b * n_rows // max_bins
             if idx <= 0 or idx >= n_rows:
@@ -111,9 +152,21 @@ def fit_bins(
             var edge = (below + above) / 2.0
             # Repeated quantile indices (n_rows < max_bins) revisit the same
             # boundary; keep edges strictly increasing.
-            if len(edges) > offsets[f] and edge <= edges[len(edges) - 1]:
+            if n_out > 0 and edge <= out.unsafe_load(n_out - 1):
                 continue
-            edges.append(edge)
+            out.unsafe_store(n_out, edge)
+            n_out += 1
+        counts_p.unsafe_store(f, n_out)
+
+    dispatch_features(do_feature, n_features, n_features * n_rows)
+
+    var edges = List[Float64]()
+    var offsets = List[Int](capacity=n_features + 1)
+    offsets.append(0)
+    for f in range(n_features):
+        var base = f * max_edges
+        for i in range(counts[f]):
+            edges.append(scratch[base + i])
         offsets.append(len(edges))
     return BinMapper(edges^, offsets^, n_features, max_bins)
 
