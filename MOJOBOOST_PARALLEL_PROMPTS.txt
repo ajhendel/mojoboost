@@ -1,0 +1,401 @@
+MOJOBOOST PARALLEL CLAUDE CODE ROUND - ALL 21 TASKS IN ONE FILE
+
+COPYING INSTRUCTIONS
+
+This is the only prompt file for this round. Each TASK section is a complete standalone prompt. Copy one entire TASK section into one Claude Code session. Start all 21 sessions immediately and in parallel. Do not give multiple TASK sections to one session.
+
+
+======================================================================
+SOURCE FILE: prompts/README.txt
+======================================================================
+
+MOJOBOOST PARALLEL RELEASE AND INTEGRATION ROUND
+
+These twenty-one prompts are designed to start immediately and run in parallel. Give exactly one file to each Claude Code session. Do not combine prompts in one session.
+
+Every lane has exclusive file ownership. If a lane discovers a required edit outside its ownership, it must document that edit in its handoff file instead of making it. This is what keeps parallel work from colliding.
+
+This round deliberately performs no testing or execution. No lane may run Mojo, Pixi, Python, pytest, pip, build scripts, benchmarks, CI workflows, or retry and polling loops. No lane may write new tests. Each lane must document the exact commands that a later coordinated validation pass should run.
+
+Start all lanes at the same time:
+
+01_PYPI_RELEASE.txt - PyPI metadata and release contract
+02_MACOS_WHEELS.txt - macOS ARM64 wheel production
+03_LINUX_WHEELS.txt - Linux x86_64 and ARM64 wheels
+04_PIP_INSTALL_UX.txt - pip-first installation documentation and diagnostics
+05_PYTHON_VERSION_SUPPORT.txt - broaden or truthfully constrain Python support
+06_PUBLIC_PYTHON_API_INTEGRATION.txt - prepare CV and optional Dask public APIs
+07_APPLE_GPU_CORE_INTEGRATION.txt - connect isolated Apple GPU subsystems
+08_ALGORITHM_INTEGRATION.txt - connect EFB, tree parameters, and sampling work
+09_PARITY_CONTRACT_REFRESH.txt - make the LightGBM matrix current
+10_RELEASE_SECURITY.txt - signing, provenance, release safety, and recovery
+11_HARDWARE_VALIDATION_NETWORK.txt - make outside Apple/NVIDIA/AMD validation easy
+12_ORG_AND_COMMUNITY_LAUNCH.txt - organization identity and low-friction contribution
+13_APPLE_CPU_PERFORMANCE.txt - Apple CPU SIMD, cache, allocation, and scheduler performance
+14_APPLE_GPU_HISTOGRAM_TUNING.txt - Apple-aware histogram specialization and launch policy
+15_FIRST_USE_AND_COMPILE_LATENCY.txt - import, context, kernel, and first-fit latency
+16_SPARSE_CATEGORICAL_GPU.txt - future sparse and categorical GPU primitives
+17_APPLE_THERMAL_ENERGY.txt - sustained MacBook thermal and energy methodology
+18_UNIFIED_MEMORY_INTEGRATION.txt - measured Apple unified-memory integration seam
+19_NATIVE_MODEL_INSPECTION.txt - move model parsing, traversal, and inspection into Mojo
+20_NATIVE_DEVICE_POLICY.txt - make Mojo authoritative for device choice and memory policy
+21_NATIVE_OBJECTIVE_METRIC_REGISTRY.txt - remove duplicated Python objective and metric semantics
+
+After every lane is done, stop all coding sessions, review the handoffs, resolve central integration conflicts, and only then schedule a separate validation pass. Do not interpret a completed lane as verified behavior.
+
+MOJO-FIRST RULE FOR EVERY LANE: performance-critical algorithms, model state, data representation, objectives, training, prediction, and accelerator work belong in Mojo. Python may provide estimator ergonomics, optional ecosystem adapters, release tooling, and benchmark orchestration. Do not move training logic into Python for convenience. If a Python API needs new behavior, expose a narrow native Mojo capability and keep Python as translation and ownership glue.
+
+======================================================================
+SOURCE FILE: prompts/01_PYPI_RELEASE.txt
+======================================================================
+
+TASK 01: PYPI METADATA AND RELEASE CONTRACT
+
+Work immediately and independently in the mojoboost repository. This task runs in parallel with eleven other lanes. Inspect the current files and git status before editing. Preserve all unrelated and concurrent work. Your exclusive ownership is python/pyproject.toml, python/setup.py, python/MANIFEST.in if needed, and docs/PYPI_RELEASE.md. Do not edit README.md, python/README.md, packaging/, .github/workflows/, or any source module. If another file must change, describe the exact edit in handoffs/release_01_pypi.md instead of making it.
+
+DO NOT WRITE OR RUN TESTS. Do not run Mojo, Pixi, Python, pytest, pip, build, twine, auditwheel, delocate, benchmarks, CI, network publication commands, retry loops, polling loops, or background jobs. Do not upload anything to PyPI or TestPyPI. Static file inspection with rg, sed, and git diff is allowed. Do not commit unless asked.
+
+Make the Python distribution metadata ready for the public package name mojoboost. Audit name, version source, description, readme, Apache-2.0 license expression and license files, authorship, project URLs, classifiers, keywords, optional dependencies, package data, extension artifacts, wheel purity, and source-distribution contents. Eliminate duplicated metadata between setup.py and pyproject.toml where safely possible. Do not claim Python versions or platforms without evidence; coordinate by documentation with Task 05. Do not invent a source build that can work without the Mojo toolchain.
+
+Create docs/PYPI_RELEASE.md containing exact owner-only steps for reserving the name safely, configuring trusted publishing with GitHub OIDC, creating a TestPyPI release, promoting the identical artifact to PyPI, verifying hashes, yanking a bad release, and rotating or avoiding API tokens. Separate package-name reservation from a production release. Require artifacts to come from release workflows rather than a developer laptop.
+
+Write handoffs/release_01_pypi.md with files changed, unresolved metadata decisions, exact later validation commands, and every action deliberately not executed.
+
+======================================================================
+SOURCE FILE: prompts/02_MACOS_WHEELS.txt
+======================================================================
+
+TASK 02: SELF-CONTAINED MACOS ARM64 WHEELS
+
+Work immediately and independently in the mojoboost repository. This task runs in parallel with eleven other lanes. Inspect the current packaging design and git status first. Preserve unrelated work. Your exclusive ownership is packaging/macos/, .github/workflows/release-macos.yml, and handoffs/release_02_macos_wheels.md. Do not edit existing packaging/matrix files, Python metadata, README files, source code, or other workflows. Document any required external edit in the handoff.
+
+DO NOT WRITE OR RUN TESTS. Do not run Mojo, Pixi, Python, pytest, pip, build scripts, wheel tools, delocate, codesign, benchmarks, workflow dispatch, network publication commands, retries, polling, or background jobs. Static inspection only. Do not commit unless asked.
+
+Design and implement the release machinery for a self-contained macOS ARM64 wheel. Reuse the existing packaging contracts without modifying their files. The workflow must build from a tagged commit on a native Apple Silicon runner, bundle only required Mojo/MAX runtime libraries, repair loader paths, produce truthful platform tags, generate SHA-256 hashes, retain artifacts, and support TestPyPI trusted publishing without enabling production publication by default. Pin third-party Actions by full commit SHA and minimize permissions.
+
+Include static scripts that inspect wheel structure and Mach-O dependency declarations when later executed. Do not pretend they have run. Account for codesigning and notarization only if actually necessary for a Python extension wheel; explain the decision. Ensure release artifacts contain LICENSE and package metadata and do not contain source-tree secrets, caches, test data, or machine-specific paths.
+
+The handoff must provide exact later commands for clean-venv install, import, tiny fit/predict/save/load, architecture verification, dependency inspection, and uninstall. Mark all results unverified.
+
+======================================================================
+SOURCE FILE: prompts/03_LINUX_WHEELS.txt
+======================================================================
+
+TASK 03: LINUX X86_64 AND ARM64 WHEELS
+
+Work immediately and independently in the mojoboost repository. This task runs in parallel with eleven other lanes. Inspect current packaging and CI before editing. Preserve unrelated work. Your exclusive ownership is packaging/linux/, .github/workflows/release-linux.yml, and handoffs/release_03_linux_wheels.md. Do not edit Python metadata, existing packaging/matrix files, README files, source code, or other workflows. Put required cross-file edits in the handoff.
+
+DO NOT WRITE OR RUN TESTS. Do not run Mojo, Pixi, Python, pytest, pip, Docker, Podman, build scripts, auditwheel, benchmarks, workflow dispatch, publication commands, retry loops, polling loops, or background jobs. Static inspection only. Do not commit unless asked.
+
+Create a truthful Linux wheel plan and release workflow for x86_64 and ARM64 targets that Mojo actually supports. Do not label artifacts manylinux until the build environment and linked symbols justify it. Prefer controlled container images or documented native runners, pinned toolchain versions, deterministic artifact naming, SHA-256 manifests, minimal workflow permissions, and TestPyPI trusted publishing disabled by default until artifacts are validated.
+
+Add static inspection scripts for ELF architecture, DT_NEEDED entries, GLIBC symbol versions, RPATH/RUNPATH, bundled runtime libraries, wheel tags, and accidental host paths. They are future tools and must not be executed in this lane. Explicitly distinguish source-install support in CI from a redistributable wheel contract.
+
+The handoff must list exact future clean-container install/import/fit/predict/serialize commands for both architectures, expected failure behavior on unsupported systems, unresolved licensing questions for bundled runtime components, and all unrun checks.
+
+======================================================================
+SOURCE FILE: prompts/04_PIP_INSTALL_UX.txt
+======================================================================
+
+TASK 04: PIP-FIRST INSTALLATION EXPERIENCE
+
+Work immediately and independently in the mojoboost repository. This task runs in parallel with eleven other lanes. Inspect current user documentation and package loading behavior first. Preserve unrelated work. Your exclusive ownership is README.md, python/README.md, docs/INSTALLATION.md, examples/install_smoke.py, and handoffs/release_04_install_ux.md. Do not edit packaging metadata, workflows, setup.py, native source, or Python library modules. Record needed code changes in the handoff.
+
+DO NOT WRITE OR RUN TESTS. Do not execute Mojo, Pixi, Python, pytest, pip, build scripts, examples, benchmarks, CI, network commands, retries, polling, or background processes. Do not write test files. Static editing only. Do not commit unless asked.
+
+Rewrite installation guidance around the desired command pip install mojoboost while remaining explicit that it is unavailable until the first wheel is published. Present three clearly separated states: future stable pip install, downloading a release wheel for the exact supported platform, and current contributor source setup with Pixi. Do not show a command that silently falls back to compiling Mojo on an ordinary Python machine.
+
+Make the first five minutes exceptionally clear: install, import, tiny regression, validation and early stopping, save/load, device selection, and how to print diagnostic versions. Add a small example script for that flow, but do not execute it. Include common error messages for unsupported Python, wrong architecture, missing runtime library, unavailable GPU, unsupported GPU workload, and requesting auto before crossover evidence exists.
+
+Keep the experimental-alpha warning visible without making the package sound unusable. Link to parity, GPU validation, contributing, and issue templates. The handoff must list every claim that depends on Tasks 01 through 03 or Task 05 before it can be published.
+
+======================================================================
+SOURCE FILE: prompts/05_PYTHON_VERSION_SUPPORT.txt
+======================================================================
+
+TASK 05: PYTHON VERSION SUPPORT CONTRACT
+
+Work immediately and independently in the mojoboost repository. This task runs in parallel with eleven other lanes. Inspect the Python source, CPython extension boundary, Mojo requirements, and current >=3.14 metadata. Preserve unrelated work. Your exclusive ownership is docs/PYTHON_SUPPORT.md, tools/audit_python_compat.py, python/mojoboost/_compat.py, and handoffs/release_05_python_versions.md. Do not edit pyproject.toml, setup.py, README files, workflows, or existing Python modules. Required edits outside ownership belong in the handoff.
+
+DO NOT WRITE OR RUN TESTS. Do not run Python, Mojo, Pixi, pytest, pip, builds, compatibility tools, CI, network queries, benchmarks, retries, polling, or background jobs. The audit tool may be authored but not executed. Do not create test code. Static inspection only. Do not commit unless asked.
+
+Determine why the package currently requires Python 3.14. Separate a real ABI or syntax requirement from an accidental development-environment pin. Audit language features, typing syntax, extension naming, Py_LIMITED_API feasibility, setuptools behavior, numpy/scikit-learn compatibility, and the Python versions supported by the pinned Mojo/MAX toolchain. Do not lower the declared minimum without evidence.
+
+Create a compatibility audit tool that later scans syntax and metadata without importing the extension. Design _compat.py only for genuinely necessary small compatibility shims; do not add speculative abstraction. Write a proposed support matrix with statuses proven, expected, blocked, and unsupported. Identify the highest-value realistic range for first release and exact evidence needed per interpreter and platform.
+
+The handoff must give Task 01 the precise future requires-python value or state that it remains unresolved, with reasons. Include exact later matrix commands and no fabricated results.
+
+======================================================================
+SOURCE FILE: prompts/06_PUBLIC_PYTHON_API_INTEGRATION.txt
+======================================================================
+
+TASK 06: PREPARE CV AND OPTIONAL DASK PUBLIC PYTHON CAPABILITIES
+
+Work immediately and independently in the mojoboost repository. This task runs in parallel with twenty other lanes. Inspect python/mojoboost/cv.py, dask.py, basic.py, and the current package exports before editing. Preserve unrelated work. Your exclusive ownership is python/mojoboost/cv.py, python/mojoboost/dask.py, python/mojoboost/_public_api_plan.py, and handoffs/integration_06_python_api.md. Do not edit python/mojoboost/__init__.py, inspection.py, device_selection.py, native bindings, tests, documentation, packaging, or other Python modules. Task 19 owns inspection, Task 20 owns device selection, and a later integration owner will update __init__.py from the combined handoffs.
+
+DO NOT WRITE OR RUN TESTS. Do not execute Python, Mojo, Pixi, pytest, pip, builds, examples, benchmarks, CI, retries, polling, or background jobs. Static reasoning only. Do not commit unless asked.
+
+Prepare the isolated CV and Dask modules for a coherent public Python surface without claiming native capabilities they do not have. Keep Dask optional and import-safe; it must remain available through mojoboost.dask without importing Dask at package import time. Resolve duplicate model ownership and circular dependencies within owned files rather than hiding them. Create _public_api_plan.py as declarative proposed export metadata only; it must not mutate package imports or execute optional dependencies.
+
+Do not implement training, metrics, distributed reductions, or model computation in Python. CV may orchestrate native fold training and Dask may orchestrate native workers, but all model work remains Mojo. Preserve existing estimator behavior and aliases.
+
+Document every native binding or central export edit needed but outside this lane. The handoff must contain a proposed public symbol list, intentional LightGBM differences, risks, and exact focused future validation commands.
+
+======================================================================
+SOURCE FILE: prompts/07_APPLE_GPU_CORE_INTEGRATION.txt
+======================================================================
+
+TASK 07: INTEGRATE THE ISOLATED APPLE GPU CORE
+
+Work immediately and independently in the mojoboost repository. This task runs in parallel with twenty other lanes. Inspect the existing trainer and all isolated Apple GPU modules before editing. Preserve unrelated work. Your exclusive ownership is src/mojoboost/train_gpu.mojo, src/mojoboost/histogram_gpu.mojo, src/mojoboost/gpu_active_rows.mojo, src/mojoboost/gpu_objectives_native.mojo, src/mojoboost/gpu_predict.mojo, src/mojoboost/gpu_runtime.mojo, src/mojoboost/gpu_split_search.mojo, src/mojoboost/__init__.mojo, and handoffs/integration_07_apple_gpu.md. Do not edit src/mojoboost/device.mojo, src/mojoboost/apple_gpu_policy.mojo, bindings, Python, tests, benchmarks, docs, tree growth outside these files, or packaging. Task 20 owns the authoritative device policy; consume its existing interface or document a required future call rather than editing it.
+
+DO NOT WRITE OR RUN TESTS. Do not execute Mojo, Pixi, Python, pytest, builds, formatters that rewrite files, benchmarks, profilers, CI, retries, polling, or background jobs. Static reasoning only. Do not commit unless asked.
+
+Connect the isolated Apple GPU foundations to the actual trainer in conservative, reviewable stages inside the owned files: persistent context and buffers, active-row ranges, device-side supported objectives, GPU prediction primitives for validation reuse, and device-side split search. Preserve a compile-time or runtime escape hatch to the established GPU path for every stage until validation occurs. Do not delete the known path. Do not enable auto GPU selection or claim speedups.
+
+Maintain deterministic accumulation, explicit synchronization ownership, CPU-equivalent tree semantics, categorical and missing routing, row/feature sampling composition, multiclass layout, and clear errors for unsupported objectives. Avoid one giant alternate trainer; reuse the lane modules behind narrow interfaces. Where the current central Tree or binding contract prevents correct integration, stop that stage and document the exact external edit instead of approximating it.
+
+The handoff must provide a stage-by-stage diff map, default path, fallback switches, buffer lifetime diagram, known uncompiled risks, and the exact smallest future test and benchmark command for each stage.
+
+======================================================================
+SOURCE FILE: prompts/08_ALGORITHM_INTEGRATION.txt
+======================================================================
+
+TASK 08: INTEGRATE EFB, TREE PARAMETERS, AND SAMPLING
+
+Work immediately and independently in the mojoboost repository. This task runs in parallel with eleven other lanes. Inspect the isolated EFB, extra tree-parameter, and expanded sampling implementations plus their handoffs. Preserve unrelated work. Your exclusive ownership is src/mojoboost/efb.mojo, src/mojoboost/tree_parameters_extra.mojo, src/mojoboost/sampling.mojo, src/mojoboost/tree.mojo, src/mojoboost/split.mojo, src/mojoboost/categorical.mojo, src/mojoboost/boosting.mojo, src/mojoboost/params.mojo, and handoffs/integration_08_algorithms.md. Do not edit GPU files, bindings, Python, serialization, tests, docs, or packaging.
+
+DO NOT WRITE OR RUN TESTS. Do not execute Mojo, Pixi, Python, pytest, builds, benchmarks, CI, retries, polling, or background jobs. Static reasoning only. Do not commit unless asked.
+
+Integrate only capabilities whose semantics can be preserved within the owned files. Wire high-value tree parameters into actual split and leaf decisions with defaults that leave existing behavior unchanged. Integrate expanded sampling while preserving counter-based deterministic streams and correct composition with GOSS, row bagging, feature sampling, ranker query sampling, and GPU row lists. Integrate EFB only behind an explicit disabled-by-default option unless the current data representation can recover original feature splits and missing/zero semantics without serialization changes.
+
+Do not create placeholders for linear trees, forced split files, or parameters that require bindings and serialization before they are real. Prefer a documented external dependency over partially effective public behavior. Reject conflicting settings explicitly.
+
+The handoff must list what became reachable, what remains inert, every required binding/serialization/Python edit outside ownership, default-behavior invariants, and exact future focused validation commands.
+
+======================================================================
+SOURCE FILE: prompts/09_PARITY_CONTRACT_REFRESH.txt
+======================================================================
+
+TASK 09: REFRESH THE LIGHTGBM PARITY CONTRACT
+
+Work immediately and independently in the mojoboost repository. This task runs in parallel with eleven other lanes. Audit the live public entry points instead of trusting old prose. Preserve unrelated work. Your exclusive ownership is docs/LIGHTGBM_PARITY.md, tools/check_parity.py, docs/CAPABILITY_LEVELS.md, and handoffs/integration_09_parity.md. Do not edit implementation, tests, README files, packaging, or workflows.
+
+DO NOT WRITE OR RUN TESTS. Do not execute Python, Mojo, Pixi, pytest, pip, builds, benchmarks, parity scripts, CI, network commands, retries, polling, or background jobs. Static inspection only. Do not commit unless asked.
+
+Correct known drift: sparse Python input and the C API exist; callbacks, metrics, continued training, GPU multiclass, and fitted attributes have evolved; new CV, inspection, Dask, EFB, distributed transport, model IO, and Apple GPU modules may exist without being integrated. A file existing is not support. Mark each capability as implemented, integrated, publicly reachable, focused-tested, differential-tested, hardware-validated, and release-packaged rather than collapsing those ideas.
+
+Update tools/check_parity.py so a future run can detect obvious stale deferred rows when named public symbols or evidence paths exist, while avoiding false claims based only on file presence. Preserve intentional differences from LightGBM. Add a concise capability-level vocabulary document that README and release materials can cite.
+
+Do not upgrade a row based on a parallel handoff alone. The handoff must enumerate every status change with evidence and list uncertain rows for integration-owner review.
+
+======================================================================
+SOURCE FILE: prompts/10_RELEASE_SECURITY.txt
+======================================================================
+
+TASK 10: RELEASE SECURITY, PROVENANCE, AND RECOVERY
+
+Work immediately and independently in the mojoboost repository. This task runs in parallel with eleven other lanes. Inspect current workflows and packaging contracts. Preserve unrelated work. Your exclusive ownership is SECURITY.md, docs/RELEASE_SECURITY.md, .github/dependabot.yml, .github/workflows/release-provenance.yml, packaging/security/, and handoffs/release_10_security.md. Do not edit existing workflows, source, Python metadata, README files, or other packaging directories.
+
+DO NOT WRITE OR RUN TESTS. Do not execute Python, Mojo, Pixi, pytest, pip, builds, scanners, signing tools, GitHub workflows, network publication, retries, polling, or background jobs. Static authoring only. Do not commit unless asked.
+
+Define a credible alpha security posture before publishing executable native wheels. Add a private vulnerability-reporting policy, supported-version statement, dependency-update policy, release-owner model, compromised-release response, yank and revoke procedure, and disclosure expectations. Design least-privilege trusted publishing, artifact hashes, build provenance, SBOM generation, and attestations using GitHub-supported mechanisms. Pin Actions by immutable SHA and grant only required permissions.
+
+Do not add secrets or token placeholders that encourage long-lived PyPI credentials. Do not make fork pull requests execute untrusted code with write tokens or secrets. Explicitly address why automatic merging of arbitrary untrusted workflow or packaging changes is unsafe even for an alpha.
+
+The handoff must separate implemented configuration from settings the organization owner must enable manually and provide exact future verification commands without running them.
+
+======================================================================
+SOURCE FILE: prompts/11_HARDWARE_VALIDATION_NETWORK.txt
+======================================================================
+
+TASK 11: OUTSIDE HARDWARE VALIDATION NETWORK
+
+Work immediately and independently in the mojoboost repository. This task runs in parallel with eleven other lanes. Inspect GPU validation, Apple protocol, issue forms, and release matrix. Preserve unrelated work. Your exclusive ownership is docs/HARDWARE_CONTRIBUTORS.md, hardware/, .github/ISSUE_TEMPLATE/hardware_result.yml, launch/HARDWARE_VALIDATION_REQUEST.txt, and handoffs/release_11_hardware_network.md. Do not edit existing GPU docs, existing issue forms, benchmarks, source, workflows, or packaging matrix files.
+
+DO NOT WRITE OR RUN TESTS. Do not execute Mojo, Pixi, Python, pytest, pip, builds, benchmarks, profilers, CI, network submission, retries, polling, or background jobs. Do not write test code. Static authoring only. Do not commit unless asked.
+
+Make it easy for outside contributors to supply trustworthy results from Apple M1 through M5, NVIDIA CUDA, and AMD HIP systems. Create a compact contributor protocol that references the authoritative existing procedures, requires exact hardware/OS/driver/Mojo/MAX/commit metadata, distinguishes skipped tests from passes, records model quality beside timing, captures raw output, and licenses results for inclusion with attribution.
+
+Add empty machine-readable result templates and per-vendor environment-capture shell scripts that print commands but do not install packages, mutate the system, or upload anything. Scripts must avoid secrets and make unsupported status a valid result. Create a plain-text recruitment post suitable for Modular Discord, GitHub Discussions, Reddit, and direct outreach.
+
+The handoff must explain how maintainers review and accept contributed evidence, how conflicting results coexist, and how results feed the existing platform matrix without overstating generality.
+
+======================================================================
+SOURCE FILE: prompts/12_ORG_AND_COMMUNITY_LAUNCH.txt
+======================================================================
+
+TASK 12: ORGANIZATION AND LOW-FRICTION COMMUNITY LAUNCH
+
+Work immediately and independently in the mojoboost repository. This task runs in parallel with eleven other lanes. Assume the project will live at github.com/mojoboost-ml/mojoboost. Inspect current launch and contribution materials. Preserve unrelated work. Your exclusive ownership is .github/profile/README.md, GOVERNANCE.md, SUPPORT.md, CODE_OF_CONDUCT.md, .github/PULL_REQUEST_TEMPLATE.md, launch/ORG_MIGRATION_CHECKLIST.txt, launch/CONTRIBUTOR_INVITE.txt, and handoffs/release_12_organization.md. Do not edit README.md, CONTRIBUTING.md, existing launch posts, workflows, source, packaging, or issue forms.
+
+DO NOT WRITE OR RUN TESTS. Do not execute Mojo, Pixi, Python, pytest, pip, builds, benchmarks, GitHub API mutations, repository transfers, organization settings changes, network posts, retries, polling, or background jobs. Do not write test code. Static authoring only. Do not commit unless asked.
+
+Prepare the mojoboost-ml organization to look intentional and welcome contributors without pretending to be a company. Define the project mission, Apache-2.0 governance, benevolent-maintainer decision model for the alpha, how active contributors receive direct Write access, how maintainers are added or removed, conflict resolution, security escalation, and how governance may evolve.
+
+Keep pull requests lightweight: no human approval requirement should be proposed for ordinary alpha contributions. Recommend direct pushes for trusted active contributors and automatic merging after a minimal machine safety check for outsiders. Do not recommend immediately merging arbitrary untrusted workflow, packaging, or release changes. Provide exact manual steps for transferring the repository, updating remotes and links, configuring organization teams, enabling Discussions, setting the organization profile, and preserving redirects.
+
+Create plain copy-and-paste contributor invitation text. The handoff must list all GitHub settings that cannot be represented in repository files and clearly mark them not performed.
+
+======================================================================
+SOURCE FILE: prompts/13_APPLE_CPU_PERFORMANCE.txt
+======================================================================
+
+TASK 13: APPLE CPU PERFORMANCE, SIMD, CACHE, AND SCHEDULING
+
+Work immediately and independently in the mojoboost repository. This task runs in parallel with seventeen other lanes. Inspect the current CPU histogram, binning, parallel scheduler, and allocation patterns before editing. Preserve unrelated work. Your exclusive ownership is src/mojoboost/histogram.mojo, src/mojoboost/binning.mojo, src/mojoboost/parallel.mojo, src/mojoboost/apple_cpu_policy.mojo, bench/apple/cpu_plan.json, and handoffs/performance_13_apple_cpu.md. Do not edit tree.mojo, split.mojo, boosting.mojo, GPU files, Python, tests, existing benchmark drivers, docs, bindings, or packaging. Put every required external edit in the handoff.
+
+DO NOT WRITE OR RUN TESTS. Do not execute Mojo, Pixi, Python, pytest, pip, builds, formatters that rewrite unrelated files, benchmarks, profilers, CI, retries, polling, or background jobs. Static reasoning only. Do not commit unless asked.
+
+MOJO-FIRST RULE: all CPU hot paths, scheduling policy, memory layout, and SIMD specialization must remain in Mojo. Do not add Python computation or a Python performance policy.
+
+Improve the design and implementation for Apple Silicon CPU execution while preserving exact model semantics. Focus on feature-level task sizing, avoiding dispatch for tiny leaves, scratch-buffer reuse, histogram alignment and layout, contiguous numerical loops, bin-count specialization, vectorized sibling subtraction, split-scan preparation, cache locality, and avoiding oversubscription. Use detected architectural capabilities and work estimates rather than hardcoding the development Mac. Treat performance and efficiency cores conservatively because portable APIs may not expose stable affinity controls.
+
+Defaults must preserve current deterministic results. Do not introduce unordered floating-point reductions. Do not add an n_jobs Python parameter in this lane; document the native runtime control and any future narrow binding needed. Do not claim ARM SIMD code is emitted without later compiler inspection.
+
+The handoff must contain a map of hot loops changed, expected mechanism for each improvement, semantic invariants, exact future microbench and end-to-end commands, and a list of claims that require profiler or assembly evidence.
+
+======================================================================
+SOURCE FILE: prompts/14_APPLE_GPU_HISTOGRAM_TUNING.txt
+======================================================================
+
+TASK 14: APPLE-AWARE GPU HISTOGRAM SPECIALIZATION
+
+Work immediately and independently in the mojoboost repository. This task runs in parallel with seventeen other lanes. Inspect gpu_tiling.mojo, histogram_gpu.mojo, the active-row handoff, and the Apple policy module. Preserve unrelated work. Your exclusive ownership is src/mojoboost/gpu_tiling.mojo, src/mojoboost/apple_histogram_policy.mojo, src/mojoboost/gpu_histogram_specializations.mojo, bench/apple/histogram_plan.json, and handoffs/performance_14_gpu_histogram.md. Do not edit histogram_gpu.mojo, train_gpu.mojo, apple_gpu_policy.mojo, Python, tests, existing benchmark drivers, bindings, docs, or packaging. Required central edits belong in the handoff.
+
+DO NOT WRITE OR RUN TESTS. Do not execute Mojo, Pixi, Python, pytest, builds, benchmarks, profilers, CI, retries, polling, or background jobs. Static reasoning only. Do not commit unless asked.
+
+MOJO-FIRST RULE: kernel policy, specializations, layouts, and device capability decisions belong in Mojo. Python may later report the selected policy but must not calculate it.
+
+Create conservative Mojo primitives and policy for specializing the histogram path by bin counts such as 15, 31, 63, 127, and 255; threadgroup size; rows per tile; rows per thread; shared-memory footprint; partial-buffer budget; tiled versus atomic combination; vectorized or packed bin loads where safe; and batching of multiple small leaves. Select from reported device properties and workload shape, not a literal M4 model string. Preserve portable fallback behavior for Metal, CUDA, and HIP.
+
+Do not use an Apple-only intrinsic unless isolated behind an explicit capability boundary with a portable implementation. Do not assume subgroup width. Do not change deterministic integer accumulation or enable an unmeasured policy by default. Produce narrow call-site instructions for Task 07 rather than editing its files.
+
+The handoff must define every policy input/output, fallback order, memory-bound calculations, required future correctness cases, profiler questions, and end-to-end evidence needed before enabling each specialization.
+
+======================================================================
+SOURCE FILE: prompts/15_FIRST_USE_AND_COMPILE_LATENCY.txt
+======================================================================
+
+TASK 15: FIRST-USE, IMPORT, CONTEXT, AND COMPILE LATENCY
+
+Work immediately and independently in the mojoboost repository. This task runs in parallel with seventeen other lanes. Inspect extension loading, native initialization, GPU context creation, kernel construction, and packaging behavior. Preserve unrelated work. Your exclusive ownership is src/mojoboost/initialization.mojo, python/mojoboost/diagnostics.py, tools/inspect_startup_artifacts.py, docs/STARTUP_LATENCY.md, and handoffs/performance_15_startup.md. Do not edit gpu_runtime.mojo, train_gpu.mojo, __init__.py, packaging workflows, metadata, tests, benchmarks, or existing source files. Document required call-site changes in the handoff.
+
+DO NOT WRITE OR RUN TESTS. Do not execute Mojo, Pixi, Python, pytest, pip, builds, import timing, benchmarks, CI, retries, polling, or background jobs. Static authoring only. Do not commit unless asked.
+
+MOJO-FIRST RULE: context ownership, kernel handles, native initialization, and cacheable compiled state belong in Mojo. Python diagnostics may report phases and environment information but must not own performance-critical state.
+
+Design a measurable startup contract separating Python import, extension loading, Mojo runtime loading, device discovery, context creation, kernel creation or compilation, first allocation, first fit, and warm repeated fit. Add native structures for phase recording that can later be wired into the persistent runtime without taking timestamps on hot paths when disabled. Add a lightweight Python diagnostics formatter that consumes supplied values and does not duplicate device policy.
+
+Audit whether precompiled kernels or persistent caches are actually supported by the current toolchain before proposing them. Do not claim caching exists. Document wheel versus source-install implications, cache invalidation keys, versioning, permissions, and failure recovery. Avoid global state that prevents multiple estimators or clean interpreter shutdown.
+
+The handoff must give exact future measurement commands, integration points owned by other lanes, expected cold/warm output schema, and every unverified assumption.
+
+======================================================================
+SOURCE FILE: prompts/16_SPARSE_CATEGORICAL_GPU.txt
+======================================================================
+
+TASK 16: SPARSE AND CATEGORICAL GPU PRIMITIVES
+
+Work immediately and independently in the mojoboost repository. This task runs in parallel with seventeen other lanes. Inspect current CSC/CSR training, sparse histograms, categorical set splits, missing routing, GPU layouts, and EFB work. Preserve unrelated work. Your exclusive ownership is src/mojoboost/gpu_sparse.mojo, src/mojoboost/gpu_categorical.mojo, src/mojoboost/gpu_sparse_layout.mojo, docs/GPU_SPARSE_CATEGORICAL_DESIGN.md, and handoffs/performance_16_sparse_categorical_gpu.md. Do not edit existing sparse, categorical, tree, histogram, GPU trainer, Python, binding, test, benchmark, serialization, or packaging files. Required integration edits belong in the handoff.
+
+DO NOT WRITE OR RUN TESTS. Do not execute Mojo, Pixi, Python, pytest, builds, benchmarks, profilers, CI, retries, polling, or background jobs. Static reasoning only. Do not commit unless asked.
+
+MOJO-FIRST RULE: sparse layouts, kernels, categorical ordering, missing routing, EFB decoding, and all training computation belong in Mojo. Do not densify through Python or implement a Python fallback disguised as GPU support.
+
+Design and implement isolated GPU primitives only where correct semantics can be expressed without central changes. Cover compact sparse row access for leaf ranges, zero versus missing semantics, explicitly stored zeros, feature-oriented sparse histogram accumulation, categorical category-set membership, device-side category statistics, and compatibility with EFB recovery. Preserve the current ordinary Model representation and CPU prediction unless a format change is explicitly documented.
+
+Do not expose device=gpu for sparse input in this lane. Do not silently densify. Do not assume sparse always wins or build an automatic threshold without measurements. Keep unsupported combinations explicit.
+
+The handoff must include memory and work complexity, required serialization and binding changes, adversarial correctness cases, expected CPU fallback behavior, and a staged future integration and validation plan.
+
+======================================================================
+SOURCE FILE: prompts/17_APPLE_THERMAL_ENERGY.txt
+======================================================================
+
+TASK 17: MACBOOK THERMAL, ENERGY, AND SUSTAINED PERFORMANCE
+
+Work immediately and independently in the mojoboost repository. This task runs in parallel with seventeen other lanes. Inspect the Apple benchmark protocol, suite schema, unified-memory methodology, and existing phase definitions. Preserve unrelated work. Your exclusive ownership is docs/APPLE_THERMAL_ENERGY.md, bench/apple/thermal_schema.json, bench/apple/thermal_capture.sh, launch/APPLE_BENCHMARK_REQUEST.txt, and handoffs/performance_17_thermal_energy.md. Do not edit existing benchmark drivers or schemas, source, Python package, tests, workflows, packaging, or current Apple documentation. Document external edits in the handoff.
+
+DO NOT WRITE OR RUN TESTS. Do not execute Mojo, Pixi, Python, pytest, builds, benchmarks, powermetrics, pmset sampling, profilers, CI, retries, polling, or background jobs. Static authoring only. Do not commit unless asked.
+
+MOJO-FIRST RULE: training and instrumentation hooks remain native Mojo. Shell and Python-side orchestration may collect operating-system telemetry but must not alter algorithmic behavior.
+
+Define a reproducible MacBook protocol for cold fit, warm fit, ten repeated fits, sustained throughput, thermal throttling, machine-wide energy, average power over a defined interval, battery versus plugged-in runs, lid and surface conditions, cooldown, background-load rejection, and result attribution. Clearly distinguish machine-wide Apple powermetrics data from per-process claims. Treat energy capture as optional when permissions or hardware counters are unavailable and never substitute estimated values.
+
+Create an inert capture script that validates arguments and prints the commands it would use unless a future explicit execute flag is supplied; do not make it run privileged commands by default. Define a schema that links every thermal record to commit, exact chip variant, memory, OS, toolchain, workload, quality result, and benchmark record.
+
+The handoff must state publication rules, invalid-run criteria, privacy risks in system reports, future integration points, and exact commands a human may deliberately run later.
+
+======================================================================
+SOURCE FILE: prompts/18_UNIFIED_MEMORY_INTEGRATION.txt
+======================================================================
+
+TASK 18: APPLE UNIFIED-MEMORY INTEGRATION SEAM
+
+Work immediately and independently in the mojoboost repository. This task runs in parallel with seventeen other lanes. Inspect the existing unified-memory driver and documentation, device buffer APIs, binned data ownership, and persistent GPU runtime. Preserve unrelated work. Your exclusive ownership is bench/apple/unified_memory.mojo, docs/APPLE_UNIFIED_MEMORY.md, src/mojoboost/unified_memory_policy.mojo, and handoffs/performance_18_unified_memory.md. Do not edit gpu_runtime.mojo, histogram_gpu.mojo, train_gpu.mojo, Python, tests, other benchmarks, bindings, packaging, or workflows. Required central changes belong in the handoff.
+
+DO NOT WRITE OR RUN TESTS. Do not execute Mojo, Pixi, Python, pytest, builds, the unified-memory driver, benchmarks, profilers, powermetrics, CI, retries, polling, or background jobs. Static reasoning only. Do not commit unless asked.
+
+MOJO-FIRST RULE: allocation-route policy, buffer ownership, synchronization, and any future shared-memory path belong in Mojo. Python must never decide pointer lifetime or whether a transfer can be omitted.
+
+Strengthen the existing experiment and create a narrow disabled-by-default policy seam for explicit-copy, mapped, host-direct, or other routes actually expressible by the current Mojo APIs. A route that is not supported must report unsupported or not_probed rather than compile-fiction. Correctness checksums and synchronization ownership are mandatory before a timing is considered comparable. Preserve explicit-copy as the dependable default.
+
+Do not use the phrase zero-copy as a conclusion. Separate no copy issued by mojoboost from runtime page migration, hidden blits, and physical duplication. Account for first touch, page migration, memory pressure, compression, swap, CPU/GPU contention, resident validation matrices, and pre-binned data duplication. Do not enable a route based on the driver alone; require end-to-end trainer evidence.
+
+The handoff must map the precise future integration seam, pointer and buffer lifetimes, invalidation rules, measurable hypotheses, profiler evidence required, and claims each possible result would and would not license.
+
+======================================================================
+SOURCE FILE: prompts/19_NATIVE_MODEL_INSPECTION.txt
+======================================================================
+
+TASK 19: MOVE MODEL INSPECTION AND TREE TRAVERSAL INTO MOJO
+
+Work immediately and independently in the mojoboost repository. This task runs in parallel with twenty other lanes. Inspect python/mojoboost/inspection.py, src/mojoboost/inspection.mojo, serialization, Model, Tree, feature importance, and binding conventions before editing. Preserve unrelated work. Your exclusive ownership is src/mojoboost/inspection.mojo, src/mojoboost/model_dump.mojo, python/mojoboost/inspection.py, and handoffs/migration_19_model_inspection.md. Do not edit serialization, Model, Tree, bindings/_mojoboost.mojo, python/mojoboost/__init__.py, tests, docs, packaging, or workflows. Required binding, serialization, and export edits belong in the handoff.
+
+DO NOT WRITE OR RUN TESTS. Do not execute Mojo, Pixi, Python, pytest, pip, builds, examples, benchmarks, formatters, CI, retries, polling, or background jobs. Static reasoning only. Do not commit unless asked.
+
+MOJO-FIRST RULE: parsing MojoBoost model state, traversing trees, reconstructing categorical splits, converting thresholds, calculating depths and leaf ordinals, collecting split values, producing raw scores, and generating the stable dump schema belong in Mojo. Python may convert a native dump into dictionaries, records, pandas DataFrames, and plotting-library inputs.
+
+Remove the architectural need for Python to reverse-engineer MojoBoost's serialized text. Build native Mojo data structures and functions for tree/node inspection using the in-memory Model and Tree whenever possible. Define one stable schema containing feature metadata, objective metadata, tree-per-iteration count, node indices, depths, split feature, numerical threshold or categorical set, default direction, missing bin, counts, split gains when available, leaf values, and child links. Avoid parsing serialization merely because it is currently accessible from Python.
+
+Reduce inspection.py toward a formatting and ecosystem facade. Do not remove a working compatibility path until a native binding exists; isolate it clearly and mark the exact deletion point. Do not duplicate prediction in Python. Do not invent unavailable gains or metadata.
+
+The handoff must specify exact narrow binding functions, ownership and lifetime of returned data, schema versioning, compatibility behavior for old model formats, Python code that can be deleted after wiring, intentional LightGBM differences, and future focused validation commands.
+
+======================================================================
+SOURCE FILE: prompts/20_NATIVE_DEVICE_POLICY.txt
+======================================================================
+
+TASK 20: MAKE MOJO AUTHORITATIVE FOR DEVICE CHOICE
+
+Work immediately and independently in the mojoboost repository. This task runs in parallel with twenty other lanes. Inspect python/mojoboost/device_selection.py, src/mojoboost/device.mojo, apple_gpu_policy.mojo, GPU limits, runtime capability reporting, and current estimator resolution. Preserve unrelated work. Your exclusive ownership is src/mojoboost/device.mojo, src/mojoboost/apple_gpu_policy.mojo, src/mojoboost/device_policy.mojo, python/mojoboost/device_selection.py, and handoffs/migration_20_device_policy.md. Do not edit train_gpu.mojo, gpu_runtime.mojo, bindings, python/mojoboost/__init__.py, tests, docs, benchmarks, packaging, or workflows. Required call-site and binding changes belong in the handoff.
+
+DO NOT WRITE OR RUN TESTS. Do not execute Mojo, Pixi, Python, pytest, pip, builds, examples, benchmarks, profilers, CI, retries, polling, or background jobs. Static reasoning only. Do not commit unless asked.
+
+MOJO-FIRST RULE: supported objectives, workload limits, memory estimates, hardware capabilities, crossover rules, fallback decisions, explicit-GPU refusal, and the selected backend must have one authoritative implementation in Mojo. Python may inspect X and y enough to create plain workload metadata and format the native decision report.
+
+Create a native device-policy contract with serializable inputs and outputs: requested device, rows, features, outputs, bins, objective, sparse/categorical/missing flags, validation use, estimated buffers, detected backend capabilities, selected device, blocking reasons, warnings, policy version, and evidence identifier. Preserve auto=CPU until measured crossover evidence is installed. Explicit gpu must raise instead of silently falling back. Unknown hardware must use a conservative portable fallback.
+
+Reduce device_selection.py toward workload extraction and human-readable formatting. Do not retain an independent Python decision engine. Maintain a temporary compatibility implementation only behind a clearly named boundary until bindings are connected. Do not make OS marketing names authoritative when reported device capabilities are available.
+
+The handoff must specify narrow binding calls, exact estimator integration edits, policy-version and evidence management, Python code deletable after wiring, memory-estimate invariants, fallback semantics, and future focused validation and benchmark commands.
+
+======================================================================
+SOURCE FILE: prompts/21_NATIVE_OBJECTIVE_METRIC_REGISTRY.txt
+======================================================================
+
+TASK 21: ONE NATIVE OBJECTIVE AND METRIC REGISTRY
+
+Work immediately and independently in the mojoboost repository. This task runs in parallel with twenty other lanes. Inspect python/mojoboost/_eval.py, estimator objective handling, params parsing, objective.mojo, metrics.mojo, custom_metric.mojo, ranking metrics, aliases, and backend support declarations. Preserve unrelated work. Your exclusive ownership is src/mojoboost/objective_registry.mojo, python/mojoboost/_eval.py, and handoffs/migration_21_objective_metric_registry.md. Do not edit existing objective, metrics, params, estimator, binding, test, documentation, packaging, or workflow files. Required changes belong in the handoff.
+
+DO NOT WRITE OR RUN TESTS. Do not execute Mojo, Pixi, Python, pytest, pip, builds, examples, benchmarks, CI, retries, polling, or background jobs. Static reasoning only. Do not commit unless asked.
+
+MOJO-FIRST RULE: canonical objective and metric names, aliases, default metrics, metric direction, compatible tasks, required parameters, response transforms, CPU/GPU support, ranking requirements, and whether an objective renews leaf values belong in one Mojo registry. Python may translate Python callables and format validation errors but must not maintain a second semantic table.
+
+Design a compile-time-friendly native registry or explicit query functions that avoid runtime virtual dispatch in training hot paths. The registry is metadata and dispatch selection, not a rewrite of objective computation. Cover every currently public built-in objective and metric and preserve intentional unsupported-name errors. Make custom objectives and metrics explicit non-registry callables.
+
+Refactor _eval.py toward a future thin facade over native registry queries while retaining a clearly isolated compatibility table until bindings exist. Do not change public aliases or defaults in this lane. Detect and document disagreements between Python, Mojo params, README, and parity documentation rather than choosing silently.
+
+The handoff must specify the minimal binding API, compile-time versus runtime representation, code deletable after wiring, every discovered semantic disagreement, and exact future focused and differential validation commands.
+
