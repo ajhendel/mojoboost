@@ -889,6 +889,9 @@ def enqueue_range_histogram_interleaved[
         )
         var n_cells = 3 * n_slots * rows.n_bins
         var blocks = (n_cells + threads - 1) // threads
+        # No fused subtraction here: the interleaved plane serves the
+        # gradient stream, which builds one node at a time and holds no
+        # resident sibling to derive.
         rows.ctx.enqueue_function[_range_reduce_kernel](
             partials,
             feat_ids,
@@ -897,6 +900,8 @@ def enqueue_range_histogram_interleaved[
             Int32(rows.n_bins),
             Int32(hist_size),
             Int32(tiling.n_tiles),
+            Int32(0),
+            Int32(0),
             grid_dim=blocks,
             block_dim=threads,
         )

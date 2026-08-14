@@ -87,3 +87,78 @@ def main() raises:
             cg += cpu_hist.grad[b]
             gg += gpu_hist.grad[b]
         print("feature0 grad totals (cpu, gpu):", cg, gg)
+
+        _feature_group_arms(builder, reps)
+
+
+def _quiet_band(times: List[Float64]) -> Float64:
+    """How far this arm's median sits above its own best run, in percent.
+
+    The spread between the fastest and the slowest run is not a noise floor
+    here: a single descheduled run inflates the maximum by 3x and would bury
+    any real difference. The band between the minimum and the median is what
+    the arm reproduces, so that is what a difference has to clear.
+    """
+    var lo = times[0]
+    var med = times[len(times) // 2]
+    if lo <= 0.0:
+        return 0.0
+    return 100.0 * (med - lo) / lo
+
+
+def _feature_group_arms(mut builder: GpuHistogramBuilder, reps: Int) raises:
+    """Interleaved A/B of the histogram launch shape: one feature per
+    threadgroup against two (`gpu_active_rows.mojo`).
+
+    Both arms build the same root histogram, bit for bit, so this times a
+    launch shape and nothing else. The arms alternate inside one process
+    because this machine's device timings drift several-fold across time
+    windows, which makes two runs minutes apart incomparable; only
+    back-to-back interleaved repeats resolve a difference.
+
+    The paired arm only reaches its own kernel on the atomic strategy. On
+    the tiled strategy both arms run the same partial kernel and the
+    comparison should come out flat, which is worth printing rather than
+    hiding: a difference there would mean the arm was not what it said.
+    """
+    var one = List[Float64](capacity=reps)
+    var two = List[Float64](capacity=reps)
+    builder.begin_tree()
+    # First launch of each kernel pays its compilation; neither is timed.
+    for g in range(1, 3):
+        builder.set_feature_group(g)
+        builder.enqueue_leaf(0)
+        builder.synchronize()
+
+    for _ in range(reps):
+        builder.set_feature_group(1)
+        var a0 = perf_counter_ns()
+        builder.enqueue_leaf(0)
+        builder.synchronize()
+        var a1 = perf_counter_ns()
+        one.append(Float64(a1 - a0) / 1e9)
+
+        builder.set_feature_group(2)
+        var b0 = perf_counter_ns()
+        builder.enqueue_leaf(0)
+        builder.synchronize()
+        var b1 = perf_counter_ns()
+        two.append(Float64(b1 - b0) / 1e9)
+    builder.set_feature_group(1)
+
+    sort(one)
+    sort(two)
+    var band_one = _quiet_band(one)
+    var band_two = _quiet_band(two)
+    var floor = band_one if band_one > band_two else band_two
+    print("feature_group_1_min_ms:", one[0] * 1e3)
+    print("feature_group_1_median_ms:", one[len(one) // 2] * 1e3)
+    print("feature_group_2_min_ms:", two[0] * 1e3)
+    print("feature_group_2_median_ms:", two[len(two) // 2] * 1e3)
+    var speedup = one[len(one) // 2] / two[len(two) // 2]
+    var delta = 100.0 * (speedup - 1.0)
+    print("feature_group_2_vs_1_speedup:", speedup)
+    if abs(delta) > floor:
+        print("feature_group_verdict: resolved, band_pct", floor)
+    else:
+        print("feature_group_verdict: indistinguishable, band_pct", floor)

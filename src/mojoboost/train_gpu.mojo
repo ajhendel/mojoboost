@@ -1044,9 +1044,12 @@ def _device_search_resident(
             signs,
         )
 
-        # The subtraction trick, device side. The built child gets a fresh
-        # slot; the derived one takes over the parent's, which is what keeps
-        # the pool at one slot per live leaf rather than one per node.
+        # The subtraction trick, device side, folded into the build. The
+        # built child gets a fresh slot; the derived one takes over the
+        # parent's, which is what keeps the pool at one slot per live leaf
+        # rather than one per node. The subtraction rides along inside the
+        # histogram kernel, so a split spends one launch here rather than
+        # two and never makes a slot-sized pass over the pool to do it.
         var build_left = subtraction_builds_left(n_left, n_right)
         var built_node = left_node if build_left else right_node
         var derived_node = right_node if build_left else left_node
@@ -1057,9 +1060,8 @@ def _device_search_resident(
                 " for num_leaves slots, so this means the pool and the leaf"
                 " budget disagree"
             )
-        builder.enqueue_resident_leaf(built_node, built_slot)
-        builder.enqueue_resident_subtract(
-            parent_slot, built_slot, parent_slot
+        builder.enqueue_resident_leaf_subtracting(
+            built_node, built_slot, parent_slot
         )
         builder.reown_resident(parent_slot, derived_node)
         var left_slot = built_slot if build_left else parent_slot

@@ -542,6 +542,18 @@ struct GpuHistogramBuilder(Movable):
         """The accumulation strategy this builder resolved to."""
         return self.tiling.strategy
 
+    def set_feature_group(mut self, group: Int) raises:
+        """How many features one histogram threadgroup accumulates: 1, the
+        shipping launch, or 2, the paired one (gpu_active_rows.mojo). Both
+        build the same integer histogram, so this is a launch shape and not
+        a numeric option; it exists so a benchmark can hold both arms in one
+        process instead of reading its arm from the environment."""
+        self.rows.set_feature_group(group)
+
+    def feature_group(self) -> Int:
+        """The launch shape `set_feature_group` last chose."""
+        return self.rows.feature_group
+
     def synchronize(self) raises:
         """Block until every enqueued device operation has completed."""
         self.ctx.synchronize()
@@ -876,7 +888,12 @@ struct GpuHistogramBuilder(Movable):
             expected_left,
         )
 
-    def enqueue_leaf(mut self, leaf: Int, resident_slot: Int = -1) raises:
+    def enqueue_leaf(
+        mut self,
+        leaf: Int,
+        resident_slot: Int = -1,
+        subtract_from_slot: Int = -1,
+    ) raises:
         """Enqueue the kernels building the histogram of the rows `leaf`
         currently owns, reading only that node's compacted row range. Does
         not transfer or synchronize. A small node gets a grid sized for its
@@ -893,6 +910,13 @@ struct GpuHistogramBuilder(Movable):
         calls below are written out rather than sharing one because the
         destination's origin is part of its type, so no single variable holds
         either pointer.
+
+        `subtract_from_slot`, valid only alongside a `resident_slot`, is a
+        second live slot to subtract this histogram from as it is built. It
+        is the sibling subtraction of `enqueue_resident_subtract` folded into
+        the build, so a split costs one kernel where it used to cost two;
+        `enqueue_resident_leaf_subtracting` is the entry point that checks
+        the two slots may be subtracted at all.
         """
         if not self.has_gradients:
             raise Error("call upload_gradients before build_leaf")
@@ -900,6 +924,12 @@ struct GpuHistogramBuilder(Movable):
             raise Error("leaf id must be nonnegative and fit in Int32")
         if resident_slot >= 0 and len(self.batcher) == 0:
             raise Error("no resident histogram pool is open")
+        if subtract_from_slot >= 0 and resident_slot < 0:
+            raise Error(
+                "a fused subtraction needs a resident destination slot"
+            )
+        if subtract_from_slot >= 0 and subtract_from_slot == resident_slot:
+            raise Error("a histogram slot cannot be subtracted from itself")
 
         var n_slots = len(self.active)
         # Deliberately not gated by `require_histogram_launchable`, and this
@@ -919,6 +949,12 @@ struct GpuHistogramBuilder(Movable):
         )
         if resident_slot >= 0:
             var cells = 3 * self.n_features * self.n_bins
+            var pool = self.batcher[0].out_dev.unsafe_ptr()
+            # Where the sibling to derive sits relative to this build's own
+            # slot, in Int32 words. Both are slots of one pool buffer, so the
+            # kernels reach the second through this offset rather than
+            # through a second pointer into the same allocation.
+            var sub_offset = (subtract_from_slot - resident_slot) * cells
             self.rows.enqueue_range_histogram(
                 tiling,
                 leaf,
@@ -926,13 +962,13 @@ struct GpuHistogramBuilder(Movable):
                 self.grad_dev.unsafe_ptr(),
                 self.hess_dev.unsafe_ptr(),
                 self.feat_dev.unsafe_ptr(),
-                self.batcher[0]
-                .out_dev.unsafe_ptr()
-                .unsafe_offset(resident_slot * cells),
+                pool.unsafe_offset(resident_slot * cells),
                 self.part_dev.unsafe_ptr(),
                 n_slots,
                 Float32(self.g_scale),
                 Float32(self.h_scale),
+                sub_offset,
+                subtract_from_slot >= 0,
             )
             return
         self.rows.enqueue_range_histogram(
@@ -1223,6 +1259,43 @@ struct GpuHistogramBuilder(Movable):
             raise Error("no resident histogram pool is open")
         self.batcher[0].pool.check_live(slot)
         self.enqueue_leaf(node, resident_slot=slot)
+
+    def enqueue_resident_leaf_subtracting(
+        mut self, node: Int, slot: Int, parent_slot: Int
+    ) raises:
+        """Build `node` into `slot` and derive its sibling into `parent_slot`
+        in the same launch: `enqueue_resident_leaf` followed by
+        `enqueue_resident_subtract(parent_slot, slot, parent_slot)`, with the
+        subtraction folded into the kernel that writes the build.
+
+        A split is where a device-resident frontier spends its fixed cost.
+        Every kernel launch on this machine's GPU costs about twenty
+        microseconds of enqueue whatever it does, and the standalone
+        subtraction is a launch that reads and writes every cell of two whole
+        slots -- `3 * n_features * n_bins` words apiece, a size set by the
+        dataset and not by the node -- to add nothing to the histogram the
+        build already computed. Folding it in costs the build one extra
+        store per cell it was already writing, or three extra global atomics
+        per populated bin per block on the atomic path, and it drops the
+        launch. Deep in a tree, where nodes are small and that slot-sized
+        pass dominates the build itself, that is the difference worth having.
+
+        Nothing about the result moves. Both operands are fixed-point Int32
+        under one scale, so the difference is exact, which is the same reason
+        `enqueue_resident_subtract` and the host `subtract_histogram` are
+        exact; the stamps are checked here exactly as that path checks them;
+        and the cells the fused form skips (a narrowed feature set's inactive
+        slices, and bins this node put no rows in) are cells where the
+        subtrahend is zero. The two paths therefore leave the pool holding
+        the same words, which `test_gpu_active_rows` asserts bin for bin.
+
+        Enqueues only: no transfer and no synchronization.
+        """
+        if len(self.batcher) == 0:
+            raise Error("no resident histogram pool is open")
+        self.batcher[0].pool.check_live(slot)
+        self.batcher[0].pool.check_subtractable(parent_slot, slot)
+        self.enqueue_leaf(node, resident_slot=slot, subtract_from_slot=parent_slot)
 
     def enqueue_resident_subtract(
         mut self, parent_slot: Int, child_slot: Int, dst_slot: Int

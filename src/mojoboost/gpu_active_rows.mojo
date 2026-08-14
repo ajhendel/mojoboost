@@ -158,6 +158,16 @@ comptime MAX_ROWS = Int(Int32.MAX)
 # device accepts.
 comptime SCAN_MAX_THREADS = 1024
 
+# Features one histogram threadgroup may accumulate at once. Two is not a
+# tuning constant looking for a third value: the shared histogram is
+# `MAX_BINS` Int32 in each of three planes, so a group of G costs 3 * G KiB
+# of a 32 KiB threadgroup budget, and at G = 4 a device that wants several
+# resident blocks per core has nothing left. Widening this means sizing the
+# shared allocation by the node's real `n_bins` instead of by `MAX_BINS`,
+# which is a different change.
+comptime FEATURE_GROUP_MAX = 2
+comptime GROUPED_BINS = FEATURE_GROUP_MAX * MAX_BINS
+
 
 @always_inline
 def _row_goes_left(
@@ -446,6 +456,8 @@ def _range_hist_atomic_kernel(
     count: Int32,
     g_scale: Float32,
     h_scale: Float32,
+    sub_offset: Int32,
+    do_sub: Int32,
 ):
     """`_hist_leaf_kernel` over a compacted range instead of over every row.
 
@@ -456,6 +468,19 @@ def _range_hist_atomic_kernel(
     accumulation, one flush into the shared `[grad | hess | count]` output)
     is unchanged, so the histogram it produces is the same integer histogram
     that path produces.
+
+    With `do_sub`, the flush also subtracts what it added from the slot
+    `sub_offset` words away, which is the sibling subtraction folded into the
+    build. The destination is named as a signed offset rather than a second
+    pointer because both slots live in one pool buffer, and two pointers into
+    one buffer is an aliasing the compiler is right to refuse. It is the same
+    arithmetic `_subtract_slice_kernel` performs and exact for the same
+    reason -- both slots are fixed-point Int32 under one scale, so a
+    parent's bins are the exact integer sum of its children's -- but it
+    costs three more global atomics per populated bin per block instead of a
+    second launch that reads and writes every cell of two whole slots. Bins
+    this node never touched are left alone, which is what subtracting zero
+    from them would have done anyway.
     """
     var f = Int(feat_ids[unsafe_offset = Int(block_idx.x)][0])
     var tid = thread_idx.x
@@ -501,19 +526,171 @@ def _range_hist_atomic_kernel(
     barrier()
 
     var base = f * nb
+    var sub = Int(do_sub) != 0
     b = tid
     while b < nb:
         if sc[unsafe_offset=b][0] != 0:
+            var vg = sg[unsafe_offset=b][0]
+            var vh = sh[unsafe_offset=b][0]
+            var vc = sc[unsafe_offset=b][0]
+            _ = Atomic.fetch_add(out_hist.unsafe_offset(base + b), vg)
+            _ = Atomic.fetch_add(out_hist.unsafe_offset(hs + base + b), vh)
+            _ = Atomic.fetch_add(out_hist.unsafe_offset(2 * hs + base + b), vc)
+            if sub:
+                var so = Int(sub_offset) + base + b
+                _ = Atomic.fetch_add(out_hist.unsafe_offset(so), -vg)
+                _ = Atomic.fetch_add(out_hist.unsafe_offset(hs + so), -vh)
+                _ = Atomic.fetch_add(out_hist.unsafe_offset(2 * hs + so), -vc)
+        b += block_dim.x
+
+
+def _range_hist_atomic_g2_kernel(
+    bins: MutPointer[UInt8, MutAnyOrigin],
+    rows: MutPointer[Int32, MutAnyOrigin],
+    grad: MutPointer[Float32, MutAnyOrigin],
+    hess: MutPointer[Float32, MutAnyOrigin],
+    feat_ids: MutPointer[Int32, MutAnyOrigin],
+    out_hist: MutPointer[Int32, MutAnyOrigin],
+    n_rows: Int32,
+    n_slots: Int32,
+    n_bins: Int32,
+    hist_size: Int32,
+    rows_per_tile: Int32,
+    begin: Int32,
+    count: Int32,
+    g_scale: Float32,
+    h_scale: Float32,
+    sub_offset: Int32,
+    do_sub: Int32,
+):
+    """`_range_hist_atomic_kernel` with two features per threadgroup.
+
+    The row side of the histogram is what this saves. With one feature per
+    block, `rows[begin + j]`, `grad[r]`, and `hess[r]` are read once per
+    feature and the two quantizations are recomputed once per feature, so a
+    (row, feature) visit moves thirteen bytes of which the bin is one
+    (`gpu_binned_layout.mojo` prices the whole family). A block that owns two
+    feature slots reads the row index, the gradient, and the hessian once and
+    spends them twice, which is the `pair_features` walk `histogram.mojo`
+    already does on the CPU, lifted to a threadgroup.
+
+    What it costs is shared memory: two features need two histograms, so the
+    allocation doubles and half as many threadgroups are resident per core.
+    The work per core does not change, since each resident block now covers
+    two features, but the latency hiding does, and which way that lands is a
+    measurement, not an argument. Hence `GpuActiveRows.feature_group`: this
+    kernel runs only when a caller or `MOJOBOOST_GPU_FEATURE_GROUP` asks for
+    it.
+
+    The result is bit-identical to the one-feature kernel and not merely
+    close. Accumulation stays fixed-point Int32 in both, integer addition is
+    associative and commutative, and every atomic here adds the same
+    per-(row, feature) quantized value into the same bin, so only the order
+    of the adds differs and the order of integer adds cannot change a sum.
+    An odd active-feature count leaves the last block unpaired; it runs the
+    one-feature body and writes one slice, so a feature is never counted
+    twice and never dropped. `sub_offset`/`do_sub` are the one-feature
+    kernel's fused sibling subtraction, applied to each of the block's
+    slices for the same reason and with the same exactness.
+    """
+    var slot0 = 2 * Int(block_idx.x)
+    var slot1 = slot0 + 1
+    var paired = slot1 < Int(n_slots)
+    var f0 = Int(feat_ids[unsafe_offset=slot0][0])
+    var f1 = 0
+    if paired:
+        f1 = Int(feat_ids[unsafe_offset=slot1][0])
+    var tid = thread_idx.x
+    var nb = Int(n_bins)
+    var nr = Int(n_rows)
+    var hs = Int(hist_size)
+    var n = Int(count)
+
+    var sg = stack_allocation[
+        GROUPED_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
+    ]()
+    var sh = stack_allocation[
+        GROUPED_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
+    ]()
+    var sc = stack_allocation[
+        GROUPED_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
+    ]()
+
+    # The second feature's bins live directly above the first's, so one
+    # zeroing walk covers both and an unpaired block never touches the upper
+    # half.
+    var span = 2 * nb if paired else nb
+    var b = tid
+    while b < span:
+        sg[unsafe_offset=b] = 0
+        sh[unsafe_offset=b] = 0
+        sc[unsafe_offset=b] = 0
+        b += block_dim.x
+    barrier()
+
+    var tile_begin = block_idx.y * Int(rows_per_tile)
+    var tile_end = tile_begin + Int(rows_per_tile)
+    if tile_end > n:
+        tile_end = n
+
+    var col0 = f0 * nr
+    var col1 = f1 * nr
+    var j = tile_begin + tid
+    while j < tile_end:
+        var r = Int(rows[unsafe_offset = Int(begin) + j][0])
+        var gq = Int32(round(grad[unsafe_offset=r][0] * g_scale))
+        var hq = Int32(round(hess[unsafe_offset=r][0] * h_scale))
+        var b0 = Int(bins[unsafe_offset = col0 + r])
+        _ = Atomic.fetch_add(sg.unsafe_offset(b0), gq)
+        _ = Atomic.fetch_add(sh.unsafe_offset(b0), hq)
+        _ = Atomic.fetch_add(sc.unsafe_offset(b0), Int32(1))
+        if paired:
+            var b1 = nb + Int(bins[unsafe_offset = col1 + r])
+            _ = Atomic.fetch_add(sg.unsafe_offset(b1), gq)
+            _ = Atomic.fetch_add(sh.unsafe_offset(b1), hq)
+            _ = Atomic.fetch_add(sc.unsafe_offset(b1), Int32(1))
+        j += block_dim.x
+    barrier()
+
+    var sub = Int(do_sub) != 0
+    var base0 = f0 * nb
+    b = tid
+    while b < nb:
+        if sc[unsafe_offset=b][0] != 0:
+            var vg = sg[unsafe_offset=b][0]
+            var vh = sh[unsafe_offset=b][0]
+            var vc = sc[unsafe_offset=b][0]
+            _ = Atomic.fetch_add(out_hist.unsafe_offset(base0 + b), vg)
+            _ = Atomic.fetch_add(out_hist.unsafe_offset(hs + base0 + b), vh)
             _ = Atomic.fetch_add(
-                out_hist.unsafe_offset(base + b), sg[unsafe_offset=b][0]
+                out_hist.unsafe_offset(2 * hs + base0 + b), vc
             )
+            if sub:
+                var so = Int(sub_offset) + base0 + b
+                _ = Atomic.fetch_add(out_hist.unsafe_offset(so), -vg)
+                _ = Atomic.fetch_add(out_hist.unsafe_offset(hs + so), -vh)
+                _ = Atomic.fetch_add(out_hist.unsafe_offset(2 * hs + so), -vc)
+        b += block_dim.x
+    if not paired:
+        return
+    var base1 = f1 * nb
+    b = tid
+    while b < nb:
+        var s = nb + b
+        if sc[unsafe_offset=s][0] != 0:
+            var vg = sg[unsafe_offset=s][0]
+            var vh = sh[unsafe_offset=s][0]
+            var vc = sc[unsafe_offset=s][0]
+            _ = Atomic.fetch_add(out_hist.unsafe_offset(base1 + b), vg)
+            _ = Atomic.fetch_add(out_hist.unsafe_offset(hs + base1 + b), vh)
             _ = Atomic.fetch_add(
-                out_hist.unsafe_offset(hs + base + b), sh[unsafe_offset=b][0]
+                out_hist.unsafe_offset(2 * hs + base1 + b), vc
             )
-            _ = Atomic.fetch_add(
-                out_hist.unsafe_offset(2 * hs + base + b),
-                sc[unsafe_offset=b][0],
-            )
+            if sub:
+                var so = Int(sub_offset) + base1 + b
+                _ = Atomic.fetch_add(out_hist.unsafe_offset(so), -vg)
+                _ = Atomic.fetch_add(out_hist.unsafe_offset(hs + so), -vh)
+                _ = Atomic.fetch_add(out_hist.unsafe_offset(2 * hs + so), -vc)
         b += block_dim.x
 
 
@@ -601,6 +778,8 @@ def _range_reduce_kernel(
     n_bins: Int32,
     hist_size: Int32,
     n_tiles: Int32,
+    sub_offset: Int32,
+    do_sub: Int32,
 ):
     """Element-wise reduction of the tiled partials, in ascending tile order.
 
@@ -609,6 +788,17 @@ def _range_reduce_kernel(
     it, so integration should delete this copy and call the existing kernel.
     It lives here so the range path can be exercised end to end from this
     module alone.
+
+    With `do_sub`, the same thread that writes a cell also subtracts it from
+    the slot `sub_offset` words away, which is the sibling subtraction folded
+    into the build. The destination is a signed offset rather than a second
+    pointer because both slots live in one pool buffer. Each
+    thread owns one cell of each slot and no thread reads a cell another
+    writes, so the in-place update is race free even though the destination
+    is a live histogram. The cells this reduction does not cover are the
+    inactive features', which are zero in every live slot -- the build zeroes
+    a whole slot whenever the feature set is narrowed -- so subtracting them
+    would have been a no-op.
     """
     var i = global_idx.x
     var nb = Int(n_bins)
@@ -625,7 +815,11 @@ def _range_reduce_kernel(
         var slot = rem // nb
         var b = rem - slot * nb
         var f = Int(feat_ids[unsafe_offset=slot][0])
-        out_hist[unsafe_offset = p * Int(hist_size) + f * nb + b] = acc
+        var cell = p * Int(hist_size) + f * nb + b
+        out_hist[unsafe_offset=cell] = acc
+        if Int(do_sub) != 0:
+            var sc = Int(sub_offset) + cell
+            out_hist[unsafe_offset=sc] = out_hist[unsafe_offset=sc][0] - acc
 
 
 @fieldwise_init
@@ -906,6 +1100,10 @@ struct GpuActiveRows(Movable):
     var block_threads: Int
     var ranges: LeafRangeTable
     var verify_counts: Bool
+    # Features one histogram threadgroup accumulates: 1 is the shipping
+    # kernel, 2 the paired one. Never read by anything but
+    # `enqueue_range_histogram`, and it changes no histogram it produces.
+    var feature_group: Int
 
     def __init__(
         out self,
@@ -963,6 +1161,16 @@ struct GpuActiveRows(Movable):
         # not a dependency. `MOJOBOOST_GPU_VERIFY_ROWS=1` turns it on, which
         # is what tests and a first integration want.
         self.verify_counts = _env_int("MOJOBOOST_GPU_VERIFY_ROWS", 0) != 0
+        # One feature per threadgroup unless asked otherwise. The paired
+        # kernel produces the identical histogram, so this is a launch-shape
+        # knob and nothing else; it stays at 1 until a measurement on the
+        # device in question says otherwise.
+        var group = _env_int("MOJOBOOST_GPU_FEATURE_GROUP", 1)
+        if group < 1:
+            group = 1
+        if group > FEATURE_GROUP_MAX:
+            group = FEATURE_GROUP_MAX
+        self.feature_group = group
 
         # A bagged tree stages only its bag's slots, and the copy that
         # follows takes the whole buffer, so the tail is zeroed once here
@@ -981,6 +1189,22 @@ struct GpuActiveRows(Movable):
 
     def range_of(self, node: Int) raises -> LeafRange:
         return self.ranges.get(node)
+
+    def set_feature_group(mut self, group: Int) raises:
+        """How many features one histogram threadgroup accumulates.
+
+        An argument rather than only an environment variable, because an A/B
+        that reads its arm from the environment can silently run one arm
+        under the other's label; that happened once in this repository with
+        the split-search strategy and the benchmark harness now passes the
+        arm in. Takes effect on the next `enqueue_range_histogram`, and
+        cannot change a histogram, only the launch that builds it.
+        """
+        if group < 1 or group > FEATURE_GROUP_MAX:
+            raise Error(
+                "feature group must be between 1 and ", FEATURE_GROUP_MAX
+            )
+        self.feature_group = group
 
     def begin_tree(mut self, bag: List[Int] = []) raises:
         """Seed the root's rows and make node 0 own all of them.
@@ -1319,6 +1543,8 @@ struct GpuActiveRows(Movable):
         n_slots: Int,
         g_scale: Float32,
         h_scale: Float32,
+        sub_offset: Int = 0,
+        subtract: Bool = False,
     ) raises:
         """Enqueue the histogram of `node`'s rows, reading only those rows.
 
@@ -1329,9 +1555,25 @@ struct GpuActiveRows(Movable):
         kernel rather than `enqueue_memset` because the caller handed in a
         pointer; the zeroing rule is unchanged, only the atomic path and a
         narrowed feature set need it.
+
+        Under `subtract`, the histogram `sub_offset` Int32 words from
+        `out_hist` is a second one this build is taken out of as it goes:
+        `sub -= out`, folded into whichever kernel writes the result. That is
+        the sibling subtraction of a resident frontier done without the
+        launch and without the pass over two whole slots that a separate
+        `_subtract_slice_kernel` costs, and it is the same exact fixed-point
+        arithmetic. A nonzero offset is required, since the two histograms
+        are different slots of one pool; `sub_offset` is ignored without
+        `subtract`. An empty node subtracts nothing, which is right: a child
+        with no rows leaves its sibling holding the parent's histogram
+        unchanged.
         """
         if n_slots < 1 or n_slots > self.n_features:
             raise Error("active feature count out of range")
+        if subtract and sub_offset == 0:
+            raise Error(
+                "a fused subtraction must name a slot other than the build's"
+            )
         var window = self.ranges.get(node)
         var hist_size = self.n_features * self.n_bins
         var threads = tiling.block_threads
@@ -1355,6 +1597,8 @@ struct GpuActiveRows(Movable):
             )
         if window.count() <= 0:
             return
+
+        var do_sub = Int32(1) if subtract else Int32(0)
 
         if tiling.strategy == STRATEGY_TILED:
             self.ctx.enqueue_function[_range_hist_partial_kernel](
@@ -1385,7 +1629,36 @@ struct GpuActiveRows(Movable):
                 Int32(self.n_bins),
                 Int32(hist_size),
                 Int32(tiling.n_tiles),
+                Int32(sub_offset),
+                do_sub,
                 grid_dim=blocks,
+                block_dim=threads,
+            )
+        elif self.feature_group >= 2 and n_slots >= 2:
+            # Half as many threadgroups, each owning two feature slots. The
+            # last one is unpaired when `n_slots` is odd, which the kernel
+            # handles rather than the launch: a block that covers one slot
+            # writes one slice.
+            var grouped_blocks = (n_slots + 1) // 2
+            self.ctx.enqueue_function[_range_hist_atomic_g2_kernel](
+                bins,
+                self.rows_dev.unsafe_ptr(),
+                grad,
+                hess,
+                feat_ids,
+                out_hist,
+                Int32(self.n_rows),
+                Int32(n_slots),
+                Int32(self.n_bins),
+                Int32(hist_size),
+                Int32(tiling.rows_per_tile),
+                Int32(window.begin),
+                Int32(window.count()),
+                g_scale,
+                h_scale,
+                Int32(sub_offset),
+                do_sub,
+                grid_dim=(grouped_blocks, tiling.n_tiles),
                 block_dim=threads,
             )
         else:
@@ -1404,6 +1677,8 @@ struct GpuActiveRows(Movable):
                 Int32(window.count()),
                 g_scale,
                 h_scale,
+                Int32(sub_offset),
+                do_sub,
                 grid_dim=(n_slots, tiling.n_tiles),
                 block_dim=threads,
             )

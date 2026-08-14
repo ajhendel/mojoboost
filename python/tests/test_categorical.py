@@ -367,15 +367,20 @@ def test_the_classifier_takes_categorical_columns():
 
 
 def test_the_ranker_takes_categorical_columns():
-    """The ranker's own fit path has to pass the indices through too; with
-    four leaves an ordinal threshold cannot separate the relevant documents
-    from the rest."""
+    """The ranker's own fit path passes categorical indices to one tree.
+
+    Keep this to one estimator: a categorical split can group all even codes
+    at once, while one four-leaf numerical tree cannot represent all seven
+    alternating boundaries.  With many boosting rounds the numerical model
+    can eventually compose enough thresholds to score perfectly too, which
+    tests boosting capacity rather than categorical plumbing.
+    """
     n_queries, per_query = 60, 8
     codes = np.tile(np.arange(per_query), n_queries)
     X = codes.astype(float).reshape(-1, 1)
     y = (codes % 2 == 0).astype(np.int64)
     group = [per_query] * n_queries
-    kwargs = dict(CAT_KWARGS, num_leaves=4, n_estimators=30, ndcg_eval_at=4)
+    kwargs = dict(CAT_KWARGS, num_leaves=4, n_estimators=1, ndcg_eval_at=4)
     as_cat = MojoBoostRanker(categorical_feature=[0], **kwargs).fit(
         X, y, group=group
     )
