@@ -281,21 +281,54 @@ def PyInit__mojoboost() abi("C") -> PythonObject:
             "predict_leaf_multiclass_batch"
         )
         m.def_function[gpu_predict_capability]("gpu_predict_capability")
-        m.def_function[gpu_validation_open]("gpu_validation_open")
-        m.def_function[gpu_validation_open_multiclass](
-            "gpu_validation_open_multiclass"
-        )
-        m.def_function[gpu_validation_shape]("gpu_validation_shape")
-        m.def_function[gpu_validation_reset]("gpu_validation_reset")
-        m.def_function[gpu_validation_accumulate]("gpu_validation_accumulate")
-        m.def_function[gpu_validation_accumulate_multiclass](
-            "gpu_validation_accumulate_multiclass"
-        )
-        m.def_function[gpu_validation_metric]("gpu_validation_metric")
+        # Registering a function specializes its body.  On a CPU-only build,
+        # specializing the real resident-validation functions reaches
+        # `GpuPredictor` and asks the compiler for a GPU architecture that the
+        # runner does not have.  Keep the Python surface present, but bind
+        # stubs which fail explicitly without mentioning a device type.
+        comptime if has_accelerator():
+            m.def_function[gpu_validation_open]("gpu_validation_open")
+            m.def_function[gpu_validation_open_multiclass](
+                "gpu_validation_open_multiclass"
+            )
+            m.def_function[gpu_validation_shape]("gpu_validation_shape")
+            m.def_function[gpu_validation_reset]("gpu_validation_reset")
+            m.def_function[gpu_validation_accumulate](
+                "gpu_validation_accumulate"
+            )
+            m.def_function[gpu_validation_accumulate_multiclass](
+                "gpu_validation_accumulate_multiclass"
+            )
+            m.def_function[gpu_validation_metric]("gpu_validation_metric")
+            m.def_function[gpu_validation_raw]("gpu_validation_raw")
+        else:
+            m.def_function[_gpu_validation_open_unavailable](
+                "gpu_validation_open"
+            )
+            m.def_function[_gpu_validation_open_unavailable](
+                "gpu_validation_open_multiclass"
+            )
+            m.def_function[_gpu_validation_shape_unavailable](
+                "gpu_validation_shape"
+            )
+            m.def_function[_gpu_validation_reset_unavailable](
+                "gpu_validation_reset"
+            )
+            m.def_function[_gpu_validation_accumulate_unavailable](
+                "gpu_validation_accumulate"
+            )
+            m.def_function[_gpu_validation_accumulate_unavailable](
+                "gpu_validation_accumulate_multiclass"
+            )
+            m.def_function[_gpu_validation_metric_unavailable](
+                "gpu_validation_metric"
+            )
+            m.def_function[_gpu_validation_raw_unavailable](
+                "gpu_validation_raw"
+            )
         m.def_function[gpu_validation_metric_matches_host](
             "gpu_validation_metric_matches_host"
         )
-        m.def_function[gpu_validation_raw]("gpu_validation_raw")
         m.def_function[predict_contrib]("predict_contrib")
         m.def_function[predict_contrib_multiclass](
             "predict_contrib_multiclass"
@@ -2153,6 +2186,59 @@ def predict_leaf_multiclass_batch(
 # that cannot serve it raises `gpu_predict_support`'s refusal rather than
 # silently scoring on the host. A caller that wants host validation scoring
 # has `eval_metric` and the fits that carry their own metric suites.
+
+
+def _gpu_validation_unavailable() raises:
+    raise Error("GPU validation requires an accelerator-enabled build")
+
+
+def _gpu_validation_open_unavailable(
+    model: PythonObject,
+    x_addr: PythonObject,
+    n_rows: PythonObject,
+    n_features: PythonObject,
+    params: PythonObject,
+) raises -> PythonObject:
+    _gpu_validation_unavailable()
+    return PythonObject(None)
+
+
+def _gpu_validation_shape_unavailable(
+    handle: PythonObject,
+) raises -> PythonObject:
+    _gpu_validation_unavailable()
+    return PythonObject(None)
+
+
+def _gpu_validation_reset_unavailable(
+    handle: PythonObject, base_addr: PythonObject
+) raises -> PythonObject:
+    _gpu_validation_unavailable()
+    return PythonObject(None)
+
+
+def _gpu_validation_accumulate_unavailable(
+    handle: PythonObject,
+    model: PythonObject,
+    start: PythonObject,
+    stop: PythonObject,
+) raises -> PythonObject:
+    _gpu_validation_unavailable()
+    return PythonObject(None)
+
+
+def _gpu_validation_metric_unavailable(
+    handle: PythonObject, metric: PythonObject, objective: PythonObject
+) raises -> PythonObject:
+    _gpu_validation_unavailable()
+    return PythonObject(None)
+
+
+def _gpu_validation_raw_unavailable(
+    handle: PythonObject, out_addr: PythonObject
+) raises -> PythonObject:
+    _gpu_validation_unavailable()
+    return PythonObject(None)
 
 
 struct GpuValidation(Movable, Writable):

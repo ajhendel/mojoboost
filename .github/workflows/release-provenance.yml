@@ -10,20 +10,16 @@
 # that are settings rather than files, and therefore cannot live in this file,
 # are listed in handoffs/release_10_security.md under "Owner actions".
 #
-# THIS WORKFLOW CANNOT RUN YET, ON PURPOSE, AND IT FAILS CLOSED IN THREE WAYS.
+# THIS WORKFLOW FAILS CLOSED UNLESS ITS RELEASE PRECONDITIONS ARE MET.
 #
-#   1. Every `uses:` below says `@REPLACE_WITH_SHA`. That is not a ref, so the
-#      job fails to start. Pinning by tag is not an acceptable interim state
-#      for a workflow that holds an OIDC identity, so the placeholder is left
-#      loud rather than made convenient. packaging/security/check_action_pins.py
-#      is the check that keeps it that way.
-#   2. The build job needs a `[self-hosted, macos, arm64, metal]` runner. None
-#      is registered. A GitHub hosted Apple silicon runner is not a substitute:
+#   1. The build job needs a `[self-hosted, macos, arm64, metal]` runner. A
+#      GitHub hosted Apple silicon runner is not a substitute:
 #      it reports an accelerator at compile time and has no Metal toolchain, so
 #      a wheel built there is a different product under the same filename. See
 #      the header of .github/workflows/ci.yml and docs/PLATFORM_MATRIX.md.
-#   3. Publication needs the `pypi` environment and a PyPI pending publisher.
-#      Neither exists, and both are owner actions.
+#   2. Publication needs the matching `testpypi` or `pypi` environment and a
+#      pending Trusted Publisher. The environments exist; publisher setup is an
+#      owner action on the package index.
 #
 # Triggering. workflow_dispatch only. There is deliberately no `push`, no
 # `release`, no `pull_request`, and above all no `pull_request_target`. A fork
@@ -40,6 +36,10 @@ on:
         description: macOS deployment target for the extension (empty = SDK default)
         required: false
         default: ""
+      ref:
+        description: Tagged release ref to build (for example v0.1.0)
+        required: true
+        default: "v0.1.0"
       publish:
         description: Where to publish. Build and attest only unless changed.
         required: true
@@ -72,13 +72,12 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@REPLACE_WITH_SHA # actions/checkout v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
 
-      # Standard library only, builds nothing. It will fail on this file until
-      # the placeholders above are replaced with real commit SHAs, which is the
-      # intended behavior and not a bug to work around.
+      # Standard library only and builds nothing. It fails closed if a future
+      # edit replaces any reviewed commit SHA with a mutable tag or branch.
       - name: Every action is pinned to a commit SHA
         run: python3 packaging/security/check_action_pins.py .github/workflows/release-provenance.yml
 
@@ -100,11 +99,13 @@ jobs:
       # persist-credentials: false matters more here than anywhere else in this
       # file. A self hosted runner keeps its workspace between runs, and a
       # credential left in .git/config there outlives the job that created it.
-      - uses: actions/checkout@REPLACE_WITH_SHA # actions/checkout v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
           persist-credentials: false
 
-      - uses: prefix-dev/setup-pixi@REPLACE_WITH_SHA # prefix-dev/setup-pixi v0.10.1
+      - uses: prefix-dev/setup-pixi@f00437f565399d418b0acc85936d12c1fb668347 # v0.10.1
         with:
           cache: true
           environments: default pkg
@@ -124,7 +125,7 @@ jobs:
       - name: Build and test the wheel
         env:
           MOJOBOOST_MACOS_TARGET: ${{ inputs.macos_target }}
-        run: pixi run -e pkg test-wheel
+        run: packaging/macos/build_release_wheel.sh
 
       # The provenance sidecar is written by the build, not by this workflow
       # (handoffs/task18_platform.md edit 4, and packaging/macos/provenance.sh).
@@ -169,13 +170,13 @@ jobs:
       # Two artifacts, not one. The publish job uploads the contents of a
       # directory to PyPI, so nothing that is not a distribution may share a
       # directory with the wheel.
-      - uses: actions/upload-artifact@REPLACE_WITH_SHA # actions/upload-artifact v4
+      - uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
         with:
           name: wheel
           path: python/dist/*.whl
           if-no-files-found: error
 
-      - uses: actions/upload-artifact@REPLACE_WITH_SHA # actions/upload-artifact v4
+      - uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
         if: always()
         with:
           name: release-metadata
@@ -203,16 +204,16 @@ jobs:
       # Write the attestations to this repository's attestation store.
       attestations: write
     steps:
-      - uses: actions/checkout@REPLACE_WITH_SHA # actions/checkout v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
 
-      - uses: actions/download-artifact@REPLACE_WITH_SHA # actions/download-artifact v4
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
         with:
           name: wheel
           path: dist
 
-      - uses: actions/download-artifact@REPLACE_WITH_SHA # actions/download-artifact v4
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
         with:
           name: release-metadata
           path: meta
@@ -233,7 +234,7 @@ jobs:
       # dependency-snapshot is off because it writes to the dependency graph,
       # which would need contents: write for a result nobody consumes.
       - name: SBOM
-        uses: anchore/sbom-action@REPLACE_WITH_SHA # anchore/sbom-action, pin to a tag you have read
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           file: dist/${{ needs.build.outputs.wheel_name }}
           format: cyclonedx-json
@@ -257,17 +258,17 @@ jobs:
             sbom.merged.cyclonedx.json
 
       - name: Build provenance attestation
-        uses: actions/attest-build-provenance@REPLACE_WITH_SHA # actions/attest-build-provenance v3
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
         with:
           subject-path: dist/${{ needs.build.outputs.wheel_name }}
 
       - name: SBOM attestation
-        uses: actions/attest-sbom@REPLACE_WITH_SHA # actions/attest-sbom v3
+        uses: actions/attest-sbom@4651f806c01d8637787e274ac3bdf724ef169f34 # v3
         with:
           subject-path: dist/${{ needs.build.outputs.wheel_name }}
           sbom-path: sbom.merged.cyclonedx.json
 
-      - uses: actions/upload-artifact@REPLACE_WITH_SHA # actions/upload-artifact v4
+      - uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
         if: always()
         with:
           name: sbom
@@ -302,7 +303,7 @@ jobs:
       # only property this job has.
       id-token: write
     steps:
-      - uses: actions/download-artifact@REPLACE_WITH_SHA # actions/download-artifact v4
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
         with:
           name: wheel
           path: dist
@@ -317,7 +318,7 @@ jobs:
 
       - name: Publish to TestPyPI
         if: inputs.publish == 'testpypi'
-        uses: pypa/gh-action-pypi-publish@REPLACE_WITH_SHA # pypa/gh-action-pypi-publish v1
+        uses: pypa/gh-action-pypi-publish@15c56dba361d8335944d31a2ecd17d700fc7bcbc # v1.12.2
         with:
           repository-url: https://test.pypi.org/legacy/
           packages-dir: dist
@@ -325,7 +326,7 @@ jobs:
 
       - name: Publish to PyPI
         if: inputs.publish == 'pypi'
-        uses: pypa/gh-action-pypi-publish@REPLACE_WITH_SHA # pypa/gh-action-pypi-publish v1
+        uses: pypa/gh-action-pypi-publish@15c56dba361d8335944d31a2ecd17d700fc7bcbc # v1.12.2
         with:
           packages-dir: dist
           print-hash: true
