@@ -1,6 +1,7 @@
 # Integration inventory
 
-Snapshot: 2026-08-14, tree at commit `63aad82`.
+Snapshot: 2026-08-14, tree at commit `9c1e771`, closure unchanged since
+`63aad82`.
 Checked by: `python3 tools/audit_integration.py`
 
 What is written in this repository but not reachable from any entry point,
@@ -94,9 +95,20 @@ modules that were orphans in the previous revision: `gpu_binned_layout` and
 re-exported from `src/mojoboost/__init__.mojo`), `gpu_portability` and
 `gpu_backend_policy`, `gpu_multiclass_batch`, and `hybrid_leaf_scheduler`
 with `histogram_cache_policy` (now imported by
-`src/mojoboost/gpu_runtime.mojo`). Reached is not called: the parity rows
-for those capabilities stay at `deferred` until a call site, not an import,
-is shown. `CLASSIFICATION` in `tools/connectivity_audit.py` still carries
+`src/mojoboost/gpu_runtime.mojo`). Reached is not called, so each was read
+for a call site rather than promoted as a group, and they did not land in
+the same place. `gpu_portability` is called: `histogram_gpu` opens its
+builder through `require_bins_supported`,
+`require_device_can_host_kernels`, and `require_histogram_launchable`, which
+replaced hand-rolled checks, and `gpu_backend_policy` answers underneath it.
+`gpu_multiclass_batch` is called, behind `MOJOBOOST_GPU_CLASS_BATCH`, and
+its parity row moved from `deferred` to `partial` for that reason. The other
+four are reached and not exercised: `gpu_binned_layout` contributes one
+overflow guard and no packed plan, `gpu_bin_packing` nothing at all,
+`hybrid_leaf_scheduler` a report that moves no histogram, and
+`histogram_cache_policy` only what that report reads. Their rows stay at
+`deferred` with the reach written into the evidence.
+`CLASSIFICATION` in `tools/connectivity_audit.py` still carries
 entries for all seven; they are now judgments about modules that are no
 longer findings, and removing them is a patch for that file's owner.
 
@@ -191,6 +203,8 @@ to describe them as behavior a user gets.
 | `gpu_split_search` | `train_gpu` | the host scan, because Float32 device gains can flip near-tie decisions | `MOJOBOOST_GPU_SPLIT_STRATEGY=device` |
 | `unified_memory_policy` | `device_policy`, `histogram_gpu` | one live route; the others it scores are not implemented in any trainer | `MOJOBOOST_GPU_TRANSFER` |
 | `device_policy` crossover table | `device`, and through it every `fit` | empty, so `auto` resolves to the CPU on every machine and every workload | `MOJOBOOST_AUTO_MIN_CELLS` |
+| `gpu_multiclass_batch` | `train_gpu`, `histogram_gpu` | a sequential schedule, so multiclass GPU training stays one tree per class per round and `_train_multiclass_gpu_batched` is not entered | `MOJOBOOST_GPU_CLASS_BATCH` above one, or a caller passing its own batch |
+| `hybrid_leaf_scheduler` | `gpu_runtime` | a report and nothing else. `GpuSession.note_hybrid` records what was asked for and why it was declined; no histogram changes device | nothing. `MOJOBOOST_HYBRID_LEAVES` and `MOJOBOOST_HYBRID_TRACE` change what is reported, not where a histogram is built |
 
 ## Python package modules
 

@@ -35,7 +35,7 @@ from mojoboost.device import decide_device_report
 from mojoboost.device_policy import BINS_UNSPECIFIED, OBJECTIVE_UNSPECIFIED
 from mojoboost.efb import (
     EfbParams,
-    check_bundling_params,
+    EfbSettings,
     check_bundling_supported,
 )
 from mojoboost.initialization import (
@@ -284,34 +284,57 @@ def forced_splits_check(
 # -- exclusive feature bundling ------------------------------------------
 
 
-def efb_check(
-    enable_bundle: PythonObject, params: PythonObject
-) raises -> PythonObject:
-    """Validate a bundling configuration.
+def efb_settings_from_mapping(params: PythonObject) raises -> EfbSettings:
+    """The bundling switch and the knobs it governs, from the params
+    mapping. Reads only; every range check is `EfbSettings.check`'s and
+    every reachability check is the caller's.
 
-    `enable_bundle` is 0/1. `params` carries `max_conflict_rate`,
-    `max_bundle_bins`, `max_bundle_size`, `max_nondefault_rate`,
-    `min_reduction`, and `bundle_missing` (0/1).
+    Public for the same reason `extra_params_from_mapping` is:
+    `_parse_params` in `_mojoboost.mojo` calls it to fill
+    `BoosterParams.bundling`, so the settings a fit is trained with and the
+    settings `efb_check` validates come from one function reading one set
+    of keys. It is a Mojo-side helper rather than a registered binding
+    because it returns an `EfbSettings`, which is not a `PythonObject`.
 
-    The order matters and is the native order: whether bundling is
-    reachable at all, then whether the one knob whose cost is invisible
-    was touched, then the ranges. A silently unbundled fit is a correct
-    model and not the one that was asked for, and nothing in the metrics
-    would show it, so `enable_bundle=1` is refused by name with what it
-    would take. `enable_bundle=0` is accepted: it is LightGBM's own
-    default spelled out.
+    The keys are flat, not nested: `enable_bundle` (0/1),
+    `max_conflict_rate`, `max_bundle_bins`, `max_bundle_size`,
+    `max_nondefault_rate`, `min_reduction`, and `bundle_missing` (0/1) sit
+    beside the tree parameters in the one mapping a fit already sends.
     """
-    check_bundling_supported(flag(enable_bundle, "enable_bundle"))
-    check_bundling_params(Float64(py=params["max_conflict_rate"]))
-    var efb = EfbParams(
-        Float64(py=params["max_conflict_rate"]),
-        Int(py=params["max_bundle_bins"]),
-        Int(py=params["max_bundle_size"]),
-        Float64(py=params["max_nondefault_rate"]),
-        Float64(py=params["min_reduction"]),
-        flag(params["bundle_missing"], "bundle_missing"),
+    return EfbSettings(
+        flag(params["enable_bundle"], "enable_bundle"),
+        EfbParams(
+            Float64(py=params["max_conflict_rate"]),
+            Int(py=params["max_bundle_bins"]),
+            Int(py=params["max_bundle_size"]),
+            Float64(py=params["max_nondefault_rate"]),
+            Float64(py=params["min_reduction"]),
+            flag(params["bundle_missing"], "bundle_missing"),
+        ),
     )
-    efb.check()
+
+
+def efb_check(params: PythonObject, cpu: PythonObject) raises -> PythonObject:
+    """Validate a bundling configuration against the device that would
+    have to honor it.
+
+    `params` carries the flat keys `efb_settings_from_mapping` reads, which
+    are the keys a fit already sends. `cpu` is 0/1: whether the run this
+    configuration belongs to would go to a CPU trainer, since only those
+    apply a plan.
+
+    The order is the native one, the order `params.mojo` checks a parameter
+    string in: whether bundling is reachable on this device at all, then
+    the ranges, which are checked whether or not the switch is on so that a
+    bad value is named before any data is read rather than at the first
+    call that happens to turn bundling on. `enable_bundle=1` on a CPU run
+    is accepted; on any other device it is refused by name, because a
+    silently unbundled fit is a correct model, just not the one that was
+    asked for, and nothing in the metrics would show it.
+    """
+    var settings = efb_settings_from_mapping(params)
+    check_bundling_supported(settings.enabled, flag(cpu, "cpu"))
+    settings.check()
     return PythonObject(None)
 
 

@@ -7,15 +7,16 @@ was run against `python/mojoboost/inspection.py` to check that the file
 still parses. That imports nothing and executes none of the module, but it
 is a Python process, so it is named here rather than left out.
 
-This task committed nothing and staged nothing. Two repository-wide
-commits from other lanes swept the tree while this one was working
-(`dc21f03 Connect accelerator and public API foundations` and `860b1cf
-Integrate training and interoperability subsystems`), so most of
-`src/mojoboost/serialize.mojo` and all of `src/mojoboost/importance.mojo`
-and `src/mojoboost/inspection.mojo` are already in history; the rest is
-unstaged in the working tree. That was not this task's doing, and nothing
-was reverted to undo it. Every change described below is present in the
-working tree, whichever side of those commits it landed on.
+This task committed nothing and staged nothing. Repository-wide commits
+from other lanes swept the tree repeatedly while this one was working,
+beginning with `dc21f03 Connect accelerator and public API foundations`
+and `860b1cf Integrate training and interoperability subsystems` and
+ending with `f6ae025 Snapshot parallel integration work` and `9c1e771
+Refine integration handoffs and sparse training`. By the last of them
+every file this task touched was already in history, so there is no
+unstaged remainder to describe. That was not this task's doing, and
+nothing was reverted to undo it. Every change described below is present
+in the tree, whichever lane's commit carried it there.
 
 The work ran in two phases. Phase 1 stayed inside the four owned paths
 below the first rule. Phase 2 was explicitly authorized afterward and
@@ -338,9 +339,14 @@ rediscover which files talk about the format.
   message.
 - Editing: refused, and now refused *explicitly*.
   `inspection.model_editing_support()` and
-  `inspection.model_editing_status_json` (Mojo) return the same status,
-  the same three invariants, and name `count` and `split_gain` as the
-  serialized state an edit would contradict. `set_leaf_output`,
+  `inspection.model_editing_status_json` (Mojo) return the same seven
+  keys with the same values: `supported`, `operation`, `reason`, the same
+  three `invariants`, `serialized_state` naming `count` and `split_gain`,
+  `model_format_version` (4 from either side), and
+  `read_only_alternative`. The last two were each present on one side
+  only until this task added the missing one to the other, so the seven-row
+  table in `docs/MODEL_INSPECTION_SCHEMA.md` describes both payloads and
+  not just the one it was written from. `set_leaf_output`,
   `set_leaf_value`, and `edit_leaf` remain absent, so
   `test_leaf_editing_is_not_offered` still passes unchanged.
 
@@ -383,10 +389,17 @@ rediscover which files talk about the format.
    `if not c > 0.0`; if it does not compile, `from std.math import isnan`
    is what `inspection.mojo` uses.
 4. `src/mojoboost/inspection.mojo` and `src/mojoboost/model_dump.mojo` are
-   still uncompiled, unchanged from `migration_19` §14. The
-   `_json_string` / `codepoint_slices` risk that handoff names is still
-   the first thing to check there; this task did not touch it and did not
-   introduce a second use of it.
+   still uncompiled. The `_json_string` / `codepoint_slices` risk named in
+   `migration_19` §14 is still the first thing to check there; this task
+   introduced no second use of it. What this task did add to that file is
+   `MODEL_EDITING_SUPPORTED` and `model_editing_status_json`, whose only
+   construct worth a second look is `String(MODEL_FORMAT_VERSION)`. The
+   file converts `Int` to `String` in dozens of places already
+   (`String(rec.depth)` and its neighbors), but always from a struct
+   field; this one is from the `comptime` alias in `model_dump.mojo`. If
+   that distinction matters to the compiler, a local `var v: Int =
+   MODEL_FORMAT_VERSION` before the conversion is the whole fix. Either
+   way it carries less risk than the codec in item 1, not more.
 5. `python/mojoboost/inspection.py` was not executed. Its v4 branches
    cannot run until the extension is rebuilt, and its name codec has never
    been round-tripped against the Mojo one. The two were written from the

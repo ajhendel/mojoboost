@@ -602,24 +602,55 @@ before this lane loads after it and answers the new attributes.
 2. **The `mojoboost.cv` collision is real and silent in one direction.**
    Documented in three places (module docstring, the import comment,
    `_public_api_plan.NAME_COLLISIONS`) and it still deserves the rename.
-3. **`objective_` is not cached** and costs a `model_to_string()` round
-   trip until `objective_code` is registered. Reading it per row would be
-   slow. The docstring says so; nothing in the package reads it in a loop.
+3. **`objective_` is not cached.** `objective_code` is registered now
+   (`bindings/_mojoboost.mojo` line 348) and `inspection.objective_of`
+   prefers it, so the `model_to_string()` round trip only remains against
+   an `.so` built before that registration, which is what is on disk here.
+   Either way reading it per row would be slow. The docstring says so;
+   nothing in the package reads it in a loop.
 4. **`_predict_batch` trusts the batch entry point's return value** for the
    backend that ran and falls back to the requested name when it returns
    `None`. If a future entry point returns something other than a device
    name, the value is only used as a return value here and is not consumed
    by any caller in this file yet.
-5. **`_NativeTable` has never executed.** No build exposes the four hooks,
-   so the snapshot path is unrun code. It is guarded by try/except at every
-   step and falls back whole; the risk is that it is subtly wrong when it
-   first runs, not that it breaks anything now.
-6. **Concurrent-lane churn.** `cv.py`, `dask.py`, `_arrays.py`,
+5. **`_NativeTable` has never executed.** The four `registry_*` hooks are
+   registered now (`bindings/_mojoboost.mojo` lines 352 to 361), so the
+   snapshot path is selected the first time the extension is rebuilt, and
+   it has still never run. That is the risk, because it goes from
+   unreachable to live on a rebuild rather than on a code change anyone
+   reviews. It is guarded by
+   try/except at every step and falls back whole, so the failure mode is a
+   silent return to the mirror rather than a break. Step 9 of section 13 is
+   the check that it took.
+6. **The `_gpu_unsupported` backstops assume `_resolve_device` ran first.**
+   Each of the four call sites refuses only what its own `device` argument
+   still says, and that argument is the resolved answer, not the raw
+   parameter. A future fit path that calls a guard before resolving, or
+   that resolves a workload missing the flag the guard covers, would see
+   `"gpu"` for a request the native policy would have refused for a
+   different reason and report the wrong one. The guards are ordered
+   directly after their `_resolve_device` call today in all four places.
+7. **Concurrent-lane churn.** `cv.py`, `dask.py`, `_arrays.py`,
    `inspection.py`, and `bindings/_mojoboost.mojo` all changed while this
-   lane read them. The reads that matter were repeated at the end
-   (`cv.py`'s module-scope imports, `_arrays.SparseBuffers.params()`'s
-   keys, the batch entry point signatures and the native
-   `_iteration_slice` semantics) and still hold.
+   lane read them, and `python/mojoboost/__init__.py` itself took writes
+   from the forced-splits lane (`import json as _json`,
+   `_forced_splits_text`, a `contri_addr` params field, and
+   `min_gain_to_split` / `monotone_penalty` alias resolution) while this
+   lane was editing it. Nothing of that was reverted. The reads that matter
+   were repeated at the end (`cv.py`'s module-scope imports,
+   `_arrays.SparseBuffers.params()`'s keys, the batch entry point
+   signatures, the native `_iteration_slice` semantics, and the
+   `def_function` block) and still hold.
+8. **This lane's work was committed by another lane, not by this one.**
+   This lane ran no `git add` and no `git commit`. A concurrent
+   tree-wide snapshot swept the working tree anyway, so
+   `python/mojoboost/__init__.py` went in with `f6ae025` and part of this
+   handoff with `9c1e771`. `git status` therefore shows those files clean,
+   which reads as "nothing changed here" and is wrong. The changes are in
+   history, mixed into commits whose messages describe other lanes, so a
+   later reviewer looking for this lane by commit will not find it. Read
+   the diff of those two commits against `e28a24d` for the Python surface
+   rather than trusting the commit subjects.
 
 ---
 
@@ -627,8 +658,12 @@ before this lane loads after it and answers the new attributes.
 
 Run one at a time and stop at the first failure.
 
-1. Rebuild the extension, because the one on disk predates the batch entry
-   points:
+1. Rebuild the extension. The one on disk predates the batch entry points,
+   the four `registry_*` hooks, `objective_code`, and `decide_device`, so
+   until it is rebuilt `_eval` runs the mirror, `objective_` pays the
+   `model_to_string()` round trip, and `device_selection` reports
+   `CONTRACT_NARROW`. Three of the changes in this lane only take effect
+   after this step:
    `pixi run build-python`
 2. The cheapest end-to-end check that the surface imports and stays cheap:
    `pixi run -e pytest python -c "import mojoboost, sys; print(sorted(mojoboost.__all__)); print('dask' in sys.modules, 'pandas' in sys.modules, 'sklearn' in sys.modules)"`
@@ -648,9 +683,17 @@ Run one at a time and stop at the first failure.
 8. The no-numpy path, because the list branches of the changed predict
    methods are only exercised there:
    `pixi run -e pytest pytest -q python/tests/test_no_numpy.py`
-9. Only after 6a lands:
+9. The two things step 1 switches on, which nothing before this asserts.
+   6a landed while this lane was open, so both are expected to have
+   changed:
    `pixi run -e pytest python -c "import mojoboost._eval as e; print(e.registry_source())"`
-   Expect `native`, then re-run 3 through 8.
+   Expect `native`, not `mirror`.
+   `pixi run -e pytest python -c "import mojoboost.device_selection as d; print(d.native_contract())"`
+   Expect `full`, not `narrow`. That is the one that proves the fit
+   workloads reach the native policy rather than
+   `_NarrowNativePolicy`'s shape-only answer.
+   Then re-run 3 through 8, because step 1 changed which code path they
+   take.
 
 Not a validation step, but the check that costs nothing:
 `git diff --check -- python/mojoboost/__init__.py python/mojoboost/basic.py python/mojoboost/_eval.py python/mojoboost/_public_api_plan.py handoffs/connect_07_python_public.md`

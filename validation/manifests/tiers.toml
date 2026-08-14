@@ -61,6 +61,19 @@ lock_file = "/tmp/mojoboost-build.lock"
 classes = ["cpu", "gpu", "build"]
 note = "One lock file for all three classes today. See patch P1."
 
+# The forward seam for P1. The emitted script exports `lock_env` before every
+# exclusive job, carrying the per-class path below. Today's wrapper hardcodes
+# its lock path and reads no environment, so the export is inert and all three
+# classes keep sharing `lock_file`, which is the current behavior and is safe.
+# The day P1 lands and the wrapper honors this variable, the classes separate
+# with no further change to any file in this directory or to the planner.
+lock_env = "MOJOBOOST_BUILD_LOCK"
+
+[locks.class_lock_files]
+cpu = "/tmp/mojoboost-cpu.lock"
+gpu = "/tmp/mojoboost-gpu.lock"
+build = "/tmp/mojoboost-build.lock"
+
 # `--measure` plans carry timings that contention would invalidate, so they
 # may contain jobs from only one exclusion class.
 [measurement]

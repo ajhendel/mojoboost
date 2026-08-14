@@ -25,9 +25,10 @@ split digest, the checkpoint record, and the `RuntimeSpec` that says which
 world a process belongs to. Those were written against this algorithm and then
 left unreferenced by it, which is what made a validated transport and an
 unvalidated training run coexist. `run_distributed` is now the one entry point
-that turns a `RuntimeSpec` into a collective and a trained model, and it
-refuses a multi-process spec outright, because no endpoint in this build can
-reach another process.
+that turns a `RuntimeSpec` into a collective and a trained model. A local spec
+opens a world hosted in this process; a transport spec goes through the socket
+rendezvous in distributed_transport.mojo, which is implemented and which
+nobody has yet run.
 
 Two rules keep the additions from changing what a run already does:
 
@@ -99,6 +100,7 @@ from .collective import (
 )
 from .distributed_transport import (
     RUNTIME_LOCAL,
+    RUNTIME_TRANSPORT,
     CheckpointMeta,
     RuntimeSpec,
     check_histogram_buffers,
@@ -107,6 +109,7 @@ from .distributed_transport import (
     f64_bits,
     histogram_plan,
     open_local_collective,
+    open_socket_collective,
     require_transport,
     split_digest,
 )
@@ -1773,38 +1776,63 @@ def run_distributed[
 ) raises -> DistributedOutcome:
     """Train through a runtime spec: the one entry point for bindings and Dask.
 
-    It does three things and no more. It refuses a spec this build cannot open,
+    It does four things and no more. It refuses a spec this build cannot open,
     before a row is partitioned, so a rank configured for a world it cannot
     reach fails with the reason rather than blocking in a handshake that will
-    never complete. It opens the collective the spec names. And it stamps the
-    run with the spec's job id and schema digest, so a checkpoint records what
-    a restart would have to match.
+    never complete. It opens the collective the spec names: a world hosted in
+    this process for `RUNTIME_LOCAL`, or a rendezvous over sockets for
+    `RUNTIME_TRANSPORT`. It stamps the run with the spec's job id and schema
+    digest, so a checkpoint records what a restart would have to match. And it
+    closes a transport session on the way out, whether the run succeeded or
+    raised, because a rank that leaves its descriptors open leaves its peers
+    blocked rather than told.
 
-    Only `RUNTIME_LOCAL` opens today. That is not a policy choice: no
-    `ByteEndpoint` in this build can reach another process,
-    `transport_available` says so, and `require_transport` raises it. Every
-    stage above the endpoint (configuration, schema, partition, ordering,
-    deadlines, the reduction, split agreement, the checkpoint record) is
-    connected and runs on the local runtime today; the byte
-    stream underneath them is what is missing, and no multi-host behavior is
-    claimed until the two-process test in docs/DISTRIBUTED_TRANSPORT.md
-    section 7 exists and passes.
+    A caveat that belongs on the entry point rather than only in the handoff:
+    the socket path here has never been run. `transport_validated()` in
+    distributed_transport.mojo is False, and every claim about multi-process
+    or multi-host training waits on the two-process procedure in
+    docs/DISTRIBUTED_TRANSPORT.md section 7. What is connected is the whole
+    path from spec to rendezvous to reduction; what is unproven is the
+    syscall layer at the bottom of it.
+
+    A caller that has already connected its own endpoints, or that wants to
+    drive the protocol over `MemoryEndpoint`, composes
+    `open_transport_collective` with `train_distributed_run` instead and does
+    not come through here.
 
     Pass `no_callback` from callback.mojo when there is nothing to observe.
     """
     spec.validate()
     require_transport(spec)
-    if spec.mode != RUNTIME_LOCAL:
-        raise Error(
-            "run_distributed opens a local runtime only. A transport runtime's"
-            " endpoints are connected by whoever launched the processes, which"
-            " then calls open_transport_collective and hands the result to"
-            " train_distributed_run"
-        )
-    var comm = open_local_collective(spec)
     var stamped = options.copy()
     stamped.job_id = spec.job_id
     stamped.schema = spec.schema_digest()
-    return train_distributed_run(
-        shards, objective, params, comm, stamped, on_iteration, alpha
-    )
+    if spec.mode == RUNTIME_LOCAL:
+        var comm = open_local_collective(spec)
+        return train_distributed_run(
+            shards, objective, params, comm, stamped, on_iteration, alpha
+        )
+    if spec.mode != RUNTIME_TRANSPORT:
+        raise Error(
+            "run_distributed opens a local or a transport runtime, and this"
+            " spec is neither"
+        )
+    # Blocks here until every rank of the world has connected and announced
+    # itself, or the spec's connect deadline passes.
+    var wire = open_socket_collective(spec)
+    var outcome: DistributedOutcome
+    try:
+        outcome = train_distributed_run(
+            shards, objective, params, wire, stamped, on_iteration, alpha
+        )
+    except e:
+        # Shut down before the error escapes, and swallow whatever shutting
+        # down reports: the failure worth raising is the one that got us here,
+        # and a session that already lost a peer will complain about it again.
+        try:
+            wire.shutdown()
+        except:
+            pass
+        raise e
+    wire.shutdown()
+    return outcome^

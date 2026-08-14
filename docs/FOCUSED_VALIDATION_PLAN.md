@@ -212,7 +212,8 @@ run, and it is built so that running it by accident is hard.
   the timeout rather than failing.
 - Every job with a non-empty exclusion class is wrapped in
   `tools/with_build_lock.sh`, so a plan run here serializes against a build
-  started in another terminal.
+  started in another terminal. It also exports `MOJOBOOST_BUILD_LOCK` with that
+  class's own lock path, which the wrapper does not read yet; see section 7.
 - Each job's exit status is captured through a status file rather than through
   `PIPESTATUS`, which is not POSIX. The tee'd log would otherwise report a
   failing suite as a pass. There is a comment in the emitted script saying so,
@@ -297,7 +298,17 @@ so the first failure is not read as a regression.
 a single machine-wide lock. A CPU job and a GPU job that could safely overlap do
 not, and a plan is a sequence anyway, so the cost falls on other sessions. The
 alternative was a second implementation of fcntl locking inside the planner,
-which is the kind of duplicate that later disagrees with itself. Patch P1.
+which is the kind of duplicate that later disagrees with itself.
+
+What was done inside ownership is the seam, not the fix. `[locks]` in
+`tiers.toml` now carries `lock_env = "MOJOBOOST_BUILD_LOCK"` and a
+`[locks.class_lock_files]` table, and the emitted script exports that variable
+with the job's class lock path before every exclusive job. The wrapper reads no
+environment today, so the export is inert and all three classes keep sharing one
+file, which is the current behavior. `--self-check` prints a note saying exactly
+that, checked by reading the wrapper rather than by grepping the tree, so the
+note disappears on its own the day the wrapper honors the variable and not a day
+earlier. Patch P1 is the small change to the wrapper that reads it.
 
 **18 modules are reached by no suite.** Listed as `[[gap]]` entries with
 `native:compile-package` as the fallback. See section 3.2.

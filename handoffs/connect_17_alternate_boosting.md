@@ -25,7 +25,7 @@ concurrent cores are strictly better.
 | Capability | Authoritative implementation | State on arrival |
 |---|---|---|
 | DART | `src/mojoboost/boosting_dart.mojo` (concurrent) | Complete algorithm core over `(trees, weights, raw)`. Grows no tree, owns no loop, reachable from nothing. Multiclass-shaped: `n_classes` runs through every entry point. Carries the early-stopping snapshot DART needs and a slow reference (`dart_recompute_raw`). |
-| Random forest | `src/mojoboost/boosting_rf.mojo` (concurrent) | Complete: single-output and multiclass, `train_rf` / `train_rf_more` / `train_rf_with_valid` and the three multiclass counterparts, GOSS and class bagging, LightGBM's `AddBias` bias folding, `check_rf_*` validation. Keeps its **own** `RfBooster` / `RfMulticlassBooster` and bridges to `Booster` / `MulticlassBooster` with `to_booster` / `to_multiclass_booster`. Reachable from nothing. |
+| Random forest | `src/mojoboost/boosting_rf.mojo` (concurrent) | Complete: single-output and multiclass. Two argument shapes: `train_rf` / `train_rf_more` take `BoosterParams` and hand back a bridged `Booster`; `train_forest` / `train_forest_more` / `train_forest_with_valid` / `train_forest_multiclass` / `train_forest_multiclass_more` / `train_forest_multiclass_with_valid` take `RfParams` and keep the forest unbridged. GOSS and class bagging, LightGBM's `AddBias` bias folding, `check_rf_*` validation. Keeps its **own** `RfBooster` / `RfMulticlassBooster` and bridges to `Booster` / `MulticlassBooster` with `to_booster` / `to_multiclass_booster`. Reachable from nothing. |
 | Linear trees | none | Refused by name in `tree_parameters_extra.check_extra_option_supported` (`linear_tree`, `linear_lambda`) and in `lgbm_model_io` (`is_linear=1`, `leaf_const`, `leaf_coeff`). Deliberately absent. |
 | CEGB | `tree_parameters_extra.FeaturePenalties` | The two computable split penalties are **already connected** to production: `TreeParams.extra.penalties` -> `tree._search` -> `split._feature_gain` -> `penalized_gain`. `params.parse_params` accepts `cegb_tradeoff` and `cegb_penalty_split`. The coupled ledger and the lazy penalty are parsed and refused. |
 
@@ -378,9 +378,12 @@ through v3 today. What a v4 would buy is in P9.
 
 ## 6. Fallbacks preserved
 
-- `gbdt` and `goss` route into `boosting.train` / `boosting.train_more`
-  verbatim. No behavior change is possible for an existing caller, because no
-  existing caller reaches this module.
+- `gbdt` and `goss` route into `boosting.train`, `boosting.train_more`,
+  `boosting.train_with_valid`, `boosting.train_multiclass`,
+  `boosting.train_multiclass_more`, and `boosting.train_multiclass_with_valid`
+  verbatim, one production function per entry point, every argument forwarded
+  in its original position. No behavior change is possible for an existing
+  caller, because no existing caller reaches this module.
 - `AlternateBoostingParams()` defaults to `BOOSTING_GBDT` with
   `DartParams.disabled()`, so a caller that constructs the bundle and sets
   nothing gets today's trainer.
@@ -399,6 +402,8 @@ Failures are explicit, never downgrades:
 | `dart` with `drop_rate=0, skip_drop=1` (gbdt wearing dart's names) | `DartParams.validate` |
 | `dart` with balanced (class-conditional) bagging | `train_boosting` |
 | `dart` continued from a non-unit-factor ensemble | `train_dart_more` |
+| `dart` with early stopping (a later round may rescale a tree the best round contained) | `train_boosting_with_valid` |
+| `dart` multiclass, at any of the three multiclass entry points | `train_boosting_multiclass`, `train_boosting_multiclass_more`, `train_boosting_multiclass_with_valid` |
 | `goss` mode with a disabled `GossParams` | `AlternateBoostingParams.validate` |
 | an enabled `GossParams` under `gbdt` or `dart` | `AlternateBoostingParams.validate` |
 | an enabled `DartParams` under any non-`dart` mode | `AlternateBoostingParams.validate` |
@@ -409,6 +414,7 @@ Failures are explicit, never downgrades:
 | `rf` with GOSS, through this entry point | `AlternateBoostingParams.validate` |
 | `rf` with balanced bagging, through this entry point | `_check_rf_uniform_args` |
 | `rf` continued from an ensemble that is not shaped like a forest | `boosting_rf.is_forest`, via `train_rf_more` |
+| `rf` multiclass continuation from a bridged `MulticlassBooster` (the class log priors were folded away by `to_multiclass_booster`) | `train_boosting_multiclass_more` |
 
 Note what the two `rf` sampler refusals are and are not. A forest randomized
 by GOSS, or by the class-conditional bagging fractions, is a **legal**
@@ -416,8 +422,17 @@ configuration that `boosting_rf.rf_randomizer_name` explicitly accepts. It is
 refused *through this entry point only*, because `boosting_rf.train_rf` takes
 neither a `GossParams` nor a `ClassBaggingParams`, and both errors name
 `boosting_rf.train_forest` with an `RfParams` as the way to get it. That is a
-narrowness of the uniform argument set, not a capability gap, and it is the
-one place this connector is less capable than the core it dispatches to.
+narrowness of the uniform argument set, not a capability gap.
+
+The multiclass continuation refusal is the same shape, and also names its own
+way out: `boosting_rf.train_forest_multiclass_more` exists and continues a
+softmax forest correctly, reusing the forest's own base scores rather than
+re-deriving them from the labels in hand. What it needs is an unbridged
+`RfMulticlassBooster`, which is exactly what `to_multiclass_booster` has
+already spent. A caller who wants to add rounds to a multiclass forest should
+hold the `RfMulticlassBooster` and call `boosting_rf` directly, or wait for P9,
+which removes the fold and makes the bridge lossless. These two are the places
+this connector is less capable than the core it dispatches to.
 
 `rf` refusing a learning rate rather than silently overriding it (LightGBM
 sets `shrinkage_rate_ = 1`) follows the rule `params._check_alpha_key` already
@@ -754,18 +769,30 @@ Python route at all.
 
 ### P10 - `train_rf_multiclass_more` (owner: `boosting_rf.mojo`)
 
-Small, and only worth doing if P9 is not. `train_boosting_multiclass_more`
-refuses `rf` because a bridged `MulticlassBooster` has lost the class log
-priors its trees were fitted at (section 3.5). The single-output path solves
-this by recomputing the constant inside `boosting_rf.train_rf_more`; the
-multiclass equivalent is the same three steps next to it:
+Small, and only worth doing if P9 is not. This is a **new** function, the
+multiclass counterpart of `train_rf_more`: `BoosterParams` in, a bridged
+`MulticlassBooster` mutated in place, rounds added returned. It is not
+`train_forest_multiclass_more`, which already exists and is correct; that one
+takes `RfParams` and an unbridged `RfMulticlassBooster` that still carries its
+base scores, and is unreachable from a caller who only holds what
+`train_boosting_multiclass` handed back.
+
+`train_boosting_multiclass_more` refuses `rf` because a bridged
+`MulticlassBooster` has lost the class log priors its trees were fitted at
+(section 3.5). The single-output path solves this by recomputing the constant
+inside `boosting_rf.train_rf_more`; the multiclass equivalent is the same
+three steps next to it:
 
 - a structural check, the multiclass counterpart of `is_forest`
   (`base_scores` all zero, `learning_rate == 1 / n_iterations()`);
 - `_class_log_priors(labels, n_classes, sample_weight)` to recompute the
   base scores, carrying the same precondition `train_rf_more` documents
   (exact only when this is the data the forest was trained on);
-- `_rf_rounds_multiclass` for the new rounds, then rescale to the new size.
+- unbridge into an `RfMulticlassBooster`, hand it to the existing
+  `train_forest_multiclass_more` with `RfParams.from_booster_params(...)`,
+  then re-bridge with `to_multiclass_booster`. Reuse that function rather
+  than calling `_rf_rounds_multiclass` a second time; every check it runs
+  (monotone signs, `check_rf_params`, label range) is wanted here too.
 
 Then `train_boosting_multiclass_more` replaces its `rf` refusal with a call,
 matching the single-output path exactly. P9 makes this unnecessary by

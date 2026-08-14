@@ -205,6 +205,17 @@ KIND_ORDER = [CONNECTED, EXPERIMENTAL, PENDING, DEAD]
 #: the same day and are not any more. Re-run the script before trusting a
 #: row; a `CONNECTED` classification on something the graph still calls an
 #: orphan means the row is stale, not that the graph is wrong.
+#:
+#: A row whose finding has been fixed is deleted rather than flipped to
+#: `CONNECTED`, for the reason above: a row that says `CONNECTED` while the
+#: graph still reports an orphan hides a regression, and a deleted row costs
+#: nothing, since an unclassified finding defaults to `PENDING` and lands
+#: back in the queue. Deleted in the connect_22 fix pass, all three now
+#: reachable and all three verifiable by reading the imports named here:
+#: `gpu_portability` (imported by `src/mojoboost/histogram_gpu.mojo`, which
+#: also calls `require_bins_supported` and `require_histogram_launchable`),
+#: `gpu_backend_policy` (reached through it), and `mojoboost._compat`
+#: (called from `python/mojoboost/__init__.py` before the extension import).
 CLASSIFICATION = {
     # -- native modules no entry point reaches -----------------------------
     "alternate_boosting": (
@@ -273,17 +284,6 @@ CLASSIFICATION = {
         "connect_10",
         "Reached only from gpu_sparse, itself unreachable.",
     ),
-    "gpu_portability": (
-        PENDING,
-        "connect_20",
-        "Portable specialization points. Its own test imports gpu_tiling "
-        "and histogram_gpu rather than this module, so nothing reaches it.",
-    ),
-    "gpu_backend_policy": (
-        PENDING,
-        "connect_20",
-        "Reached only from gpu_portability, itself unreachable.",
-    ),
     "lgbm_model_io": (
         PENDING,
         "connect_16",
@@ -309,13 +309,6 @@ CLASSIFICATION = {
         "connect_07",
         "A plan expressed as data. Its own docstring states that nothing in "
         "the package imports it; importing it would be the bug.",
-    ),
-    "mojoboost._compat": (
-        PENDING,
-        "connect_07",
-        "Holds the pre-import interpreter guard. Nothing calls it, so on "
-        "CPython below EXTENSION_FLOOR the process aborts on a missing "
-        "libpython symbol instead of raising the message this module has.",
     ),
     # -- binding table entries with no Python caller ------------------------
     "dataset_num_data": (

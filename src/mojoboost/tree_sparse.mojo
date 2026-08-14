@@ -347,8 +347,8 @@ struct SparseBundling(Copyable, Movable):
 
         A column has to be accumulated when *any* of its members was picked
         by feature subsampling; the extra members' statistics ride along in
-        it and are never scanned, which is what the unbundling in
-        `split.find_best_split` makes safe.
+        it and are never scanned, because `_node_histogram` expands only the
+        picked features out of it.
         """
         if not self.active:
             return features.copy()
@@ -531,15 +531,16 @@ def grow_tree_sparse(
     `bundling` is an exclusive-feature-bundling plan resolved against `data`
     (see `SparseBundling`). With an active one, `data` is the *bundled*
     matrix: histograms are accumulated per bundle column, which is the whole
-    point, and `tree._search` recovers each candidate feature's own
-    histogram out of its bundle's before scanning it. Everything on this
-    side of that recovery stays in the original feature space -- the feature
+    point, and `_node_histogram` expands each one back into the original
+    per-feature shape before anything reads it. Everything on this side of
+    that expansion stays in the original feature space -- the feature
     sample, the interaction and monotonic constraints, the missing-bin
-    table, the categorical spec, and the `SplitInfo` that comes back -- so
-    **the tree that comes out names original features and original bins**
-    and no consumer of it ever sees a bundle id. An unresolved view (the
-    default) is resolved here against `data` as an inactive one, which makes
-    the bundled and unbundled paths one path rather than two.
+    table, the categorical spec, the split search, the leaf values, and the
+    `SplitInfo` that comes back -- so **the tree that comes out names
+    original features and original bins** and no consumer of it ever sees a
+    bundle id. An unresolved view (the default) is resolved here against
+    `data` as an inactive one, which makes the bundled and unbundled paths
+    one path rather than two.
     """
     if len(grad) != data.n_rows or len(hess) != data.n_rows:
         raise Error("gradient/hessian length must equal n_rows")
@@ -585,10 +586,12 @@ def grow_tree_sparse(
     # Subsampling picks original features; accumulation is by column. A
     # column is accumulated when any of its members was picked.
     var tree_columns = bundles.columns_for(tree_features)
-    # Any accumulated column answers the node's totals, since every row
-    # occupies exactly one bin of every column. It has to be one of the
-    # accumulated ones, because the rest are left at zero.
-    var value_feature = bundles.column(tree_features[0])
+    # Any accumulated feature answers the node's totals, since every row
+    # occupies exactly one bin of every feature. It has to be one of the
+    # accumulated ones, because the rest are left at zero. Histograms reach
+    # this point already expanded, so this is an original feature id, the
+    # same as the dense grower's.
+    var value_feature = tree_features[0]
 
     var tree = Tree(
         List[Int](), List[Int](), List[Int](), List[Int](),
@@ -616,8 +619,16 @@ def grow_tree_sparse(
         root_rows = bag.copy()
         root_totals = sum_rows(grad, hess, bag)
 
-    var root_hist = build_histogram_sparse_node(
-        data, grad, hess, order, root_entries, root_totals, tree_columns
+    var root_hist = _node_histogram(
+        data,
+        grad,
+        hess,
+        order,
+        root_entries,
+        root_totals,
+        bundles,
+        tree_features,
+        tree_columns,
     )
     var root_branch = List[Int]()
     # The root's value comes before its search, because path smoothing makes a
@@ -658,7 +669,6 @@ def grow_tree_sparse(
         tree_index=tree_index,
         parent_output=tree.value[root],
         grower_applies_extra=True,
-        bundling=bundles.plan,
     )
 
     var frontier = List[_SparseLeafState]()
@@ -699,8 +709,8 @@ def grow_tree_sparse(
         # once per entry. Under bundling this is where a bin belonging to
         # another member of the column becomes "this feature is at its
         # default", which is exactly what it means and exactly what
-        # `unbundle_histogram` folded into the default bin when the
-        # histogram this split was chosen from was recovered.
+        # `_node_histogram` folded into the default bin when the histogram
+        # this split was chosen from was expanded.
         var local_of = bundles.local_table(split.feature, data.n_bins)
 
         # Rows with no stored entry for the split feature carry its implicit
@@ -750,24 +760,28 @@ def grow_tree_sparse(
         var left_hist: Histogram
         var right_hist: Histogram
         if len(left_rows) <= len(right_rows):
-            left_hist = build_histogram_sparse_node(
+            left_hist = _node_histogram(
                 data,
                 grad,
                 hess,
                 order,
                 left_entries,
                 sum_rows(grad, hess, left_rows),
+                bundles,
+                tree_features,
                 tree_columns,
             )
             right_hist = subtract_histogram(frontier[best_i].hist, left_hist)
         else:
-            right_hist = build_histogram_sparse_node(
+            right_hist = _node_histogram(
                 data,
                 grad,
                 hess,
                 order,
                 right_entries,
                 sum_rows(grad, hess, right_rows),
+                bundles,
+                tree_features,
                 tree_columns,
             )
             left_hist = subtract_histogram(frontier[best_i].hist, right_hist)
@@ -843,7 +857,6 @@ def grow_tree_sparse(
             tree_index=tree_index,
             parent_output=left_value,
             grower_applies_extra=True,
-            bundling=bundles.plan,
         )
         var right_split = _search(
             right_hist,
@@ -868,7 +881,6 @@ def grow_tree_sparse(
             tree_index=tree_index,
             parent_output=right_value,
             grower_applies_extra=True,
-            bundling=bundles.plan,
         )
 
         frontier[best_i] = _SparseLeafState(

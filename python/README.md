@@ -324,12 +324,16 @@ model that carries none. Every key of the dump is documented in
 [docs/MODEL_INSPECTION_SCHEMA.md](https://github.com/ajhendel/mojoboost/blob/main/docs/MODEL_INSPECTION_SCHEMA.md);
 the two to branch on are `has_split_gain` and `has_node_count`.
 
-One gap worth knowing before you build on it. The dump is rebuilt by
-parsing the model text, and split gains are recorded during growth and
-never serialized, so every node reports `split_gain: None` and the dump
-reports `has_split_gain: False`. `trees_to_dataframe` inherits that hole.
-It closes when the extension grows the native dump entry point, which is
-written but not registered; the state of that seam is in
+One thing worth knowing before you build on it. A model this version wrote
+carries per-node split gains, because model format v4 serializes them, so
+`split_gain` is a measured number on every internal node and
+`has_split_gain` is `True`. A model read back from a file an older version
+wrote carries none, and every node reports `split_gain: None` with
+`has_split_gain: False`. Branch on the flag rather than on the value: a
+`None` means "this file never had it", and a `0.0` means a split whose
+measured gain was zero. `trees_to_dataframe` and `trees_to_records` inherit
+whichever of the two the dump was built from. The state of the native dump
+seam is in
 [docs/INTEGRATION_INVENTORY.md](https://github.com/ajhendel/mojoboost/blob/main/docs/INTEGRATION_INVENTORY.md).
 
 ## Cross-validation
@@ -370,10 +374,14 @@ report.to_dict()               # JSON-serializable, for a log or a ticket
 ```
 
 The backend in a report is the native engine's answer, the same one `fit`
-would get. The rest of the report is currently narrower than the engine
-knows: the binding that would carry the blocking reasons, warnings, memory
-estimate, and evidence identifier across is not registered yet, so
-`report.contract` reads `"narrow"` and says which gates were skipped.
+would get. How much of the rest crosses depends on the extension you have,
+and `report.contract` says which: `"full"` means `decide_device` answered
+and the blocking reasons, warnings, memory estimate, and evidence
+identifier are the engine's own, and `"narrow"` means only the older
+`resolve_device` was there, in which case the report names the gates that
+were skipped rather than guessing at them. An extension built from this
+source registers `decide_device`, so `"full"` is what a current build
+reports.
 
 `device="cpu"` is the default and the dependable backend. `device="gpu"`
 raises when no accelerator is available or when the GPU path does not

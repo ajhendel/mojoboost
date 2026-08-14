@@ -181,6 +181,21 @@ class Manifests:
             return job["exclusive"]
         return self.tier_of(job_id).get("exclusive", "")
 
+    def lock_env(self):
+        """The variable the wrapper will read a lock path from, once it does."""
+        return self.locks.get("lock_env", "")
+
+    def lock_file_for(self, klass):
+        """The lock file an exclusion class should take.
+
+        Falls back to the single shared lock, which is what the wrapper uses
+        today regardless of what this returns. See tiers.toml [locks].
+        """
+        shared = self.locks.get("lock_file", "/tmp/mojoboost-build.lock")
+        if not klass:
+            return shared
+        return self.locks.get("class_lock_files", {}).get(klass, shared)
+
     def order_key(self, job_id):
         job = self.jobs.get(job_id)
         if job is None:
@@ -731,6 +746,8 @@ SCRIPT_HEADER = """\
 # Jobs run one at a time. Heavy ones take {lock}, the lock this repository
 # already uses to keep two sessions from compiling at once, so a plan running
 # here will wait for a build running in another terminal instead of fighting it.
+# Each exclusive job also exports its class's lock path, which that wrapper does
+# not read yet; until it does, cpu, gpu, and build share one lock file.
 #
 # Wall clock limits are enforced with timeout(1) when one is on PATH. macOS
 # ships none by default; `brew install coreutils` provides gtimeout, which this
@@ -828,7 +845,16 @@ def render_sh(plan, out_path):
         for name, value in sorted(env.items()):
             exports += f"    {name}={shlex.quote(str(value))}\n"
             exports += f"    export {name}\n"
-        if man.exclusive(job_id):
+        klass = man.exclusive(job_id)
+        if klass:
+            # The per-class lock path travels in an environment variable the
+            # current wrapper does not read, so this changes nothing today and
+            # separates the classes the moment the wrapper honors it. Patch P1
+            # in handoffs/remaining_14_validation_plan.md.
+            lock_name = man.lock_env()
+            if lock_name:
+                exports += f"    {lock_name}={shlex.quote(man.lock_file_for(klass))}\n"
+                exports += f"    export {lock_name}\n"
             invocation = '"$MB_LOCK" /bin/sh -c "$MB_RUNNER"'
         else:
             invocation = '/bin/sh -c "$MB_RUNNER"'
@@ -1020,6 +1046,38 @@ def self_check(man):
                     "Setting a variable nothing reads is a plan that quietly "
                     "does not do what it says"
                 )
+
+    # the lock table
+    wrapper = man.locks.get("wrapper", "")
+    if not wrapper:
+        fail("tiers: [locks] names no wrapper, so exclusive jobs would run unserialized")
+    elif not exists(wrapper):
+        fail(f"tiers: [locks] wrapper {wrapper} does not exist")
+    classes = set(man.locks.get("classes", []))
+    for klass in sorted(man.locks.get("class_lock_files", {})):
+        if klass not in classes:
+            fail(f"tiers: [locks.class_lock_files] names {klass!r}, which is not an exclusion class")
+    lock_env = man.lock_env()
+    if lock_env and not lock_env.startswith("MOJOBOOST_"):
+        fail(f"tiers: [locks] lock_env is {lock_env!r}, which is outside this project's MOJOBOOST_* env contract")
+    declared = {man.exclusive(job_id) for job_id in man.jobs}
+    for klass in sorted(k for k in declared if k):
+        if klass not in classes:
+            fail(f"tiers: exclusion class {klass!r} is used by a job or tier and is not listed in [locks] classes")
+    if lock_env and wrapper and exists(wrapper):
+        # Read the wrapper itself rather than the corpus: a mention in a doc is
+        # not a wrapper that honors the variable.
+        try:
+            wrapper_text = (ROOT / normalize(wrapper)).read_text(errors="ignore")
+        except OSError:
+            wrapper_text = ""
+        if lock_env not in wrapper_text:
+            notes.append(
+                f"{lock_env} is exported by the emitted script and {wrapper} "
+                "does not read it, so every exclusion class still shares "
+                f"{man.locks.get('lock_file', 'one lock')}. Inert, not broken. "
+                "Patch P1 in handoffs/remaining_14_validation_plan.md"
+            )
 
     # subsystems and gaps
     for subsystem in man.subsystems:

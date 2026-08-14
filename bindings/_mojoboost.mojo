@@ -51,6 +51,7 @@ from basic_bindings import (
     decide_device_workload,
     efb_check,
     efb_defaults,
+    efb_settings_from_mapping,
     extra_option_supported,
     extra_params_check,
     extra_params_from_mapping,
@@ -148,12 +149,14 @@ from mojoboost.trainset import (
 )
 from mojoboost.binning import BinnedMatrix
 from mojoboost.device import (
+    CPU_DEVICE,
     GPU_DEVICE,
     device_name as mojo_device_name,
     gpu_available as mojo_gpu_available,
     parse_device,
     resolve_device as mojo_resolve_device,
 )
+from mojoboost.efb import check_bundling_honored, check_bundling_supported
 from mojoboost.gpu_predict import (
     RESPONSE_SOFTMAX,
     GpuPredictor,
@@ -499,8 +502,26 @@ def _parse_monotone(
 
 
 def _parse_params(
-    params: PythonObject, n_features: Int
+    params: PythonObject,
+    n_features: Int,
+    unbundled: String = "",
+    cpu: Bool = True,
 ) raises -> BoosterParams:
+    """The `BoosterParams` a fit runs under, from the params mapping.
+
+    `unbundled` and `cpu` are how an entry point declares what it is about
+    to call, because `BoosterParams.bundling` is only applied by some
+    trainers (see efb.mojo) and this is the last place that knows which one
+    is next. `unbundled` names the entry point when its trainer does not
+    apply a bundling plan at all -- the custom-objective, custom-metric,
+    and ranking trainers -- and an active switch is then refused by name
+    rather than dropped. Leave it empty when the trainer does apply one,
+    and pass `cpu=False` for a run that resolved to the GPU, which is the
+    same device check `params.mojo` makes for a parameter string. The
+    default is the CPU-honoring case because every entry point that leaves
+    both alone (the sparse fits and continued training) is CPU-only by
+    construction.
+    """
     var tree = TreeParams(
         Int(py=params["num_leaves"]),
         Int(py=params["min_data_in_leaf"]),
@@ -528,10 +549,26 @@ def _parse_params(
         # trained cannot come apart.
         extra=extra_params_from_mapping(params, n_features),
     )
+    # Exclusive feature bundling (src/mojoboost/efb.mojo). Until this was
+    # passed, `BoosterParams.bundling` took its disabled default on every fit
+    # that came through Python, so `enable_bundle` and the knobs it governs
+    # were reachable from the CLI and the C ABI (params.mojo parses
+    # `enable_bundle` and `max_conflict_rate`) and from nowhere else.
+    # `efb_settings_from_mapping` is the same parser `efb_check` validates
+    # with, so what is checked and what is trained cannot come apart.
+    var bundling = efb_settings_from_mapping(params)
+    # Reachability first, then ranges: the order params.mojo checks a
+    # parameter string in. The ranges run whether or not the switch is on.
+    if len(unbundled) > 0:
+        check_bundling_honored(bundling, unbundled)
+    else:
+        check_bundling_supported(bundling.enabled, cpu)
+    bundling.check()
     return BoosterParams(
         Int(py=params["n_estimators"]),
         Float64(py=params["learning_rate"]),
         tree^,
+        bundling^,
     )
 
 
@@ -616,7 +653,12 @@ def fit(
     var nf = Int(py=n_features)
     var features = _f64_list(Int(py=x_addr), nr * nf)
     var target = _f64_list(Int(py=y_addr), nr)
-    var bp = _parse_params(params, nf)
+    # The device is read before the parameters because bundling is applied
+    # by the dense CPU trainer and not by the GPU one, so `_parse_params`
+    # has to know which of the two `mojo_fit` will dispatch to. The wrapper
+    # sends a device it has already resolved, so this is the backend.
+    var device = _parse_device(params)
+    var bp = _parse_params(params, nf, cpu=device == CPU_DEVICE)
     var weights = _parse_weights(params, nr)
     var model = mojo_fit(
         features,
@@ -628,7 +670,7 @@ def fit(
         Int(py=params["max_bin"]),
         weights,
         Float64(py=params["alpha"]),
-        _parse_device(params),
+        device,
         _parse_bagging(params),
         _parse_goss(params),
         use_missing=_parse_use_missing(params),
@@ -661,7 +703,7 @@ def fit_custom(
     var nf = Int(py=n_features)
     var features = _f64_list(Int(py=x_addr), nr * nf)
     var target = _f64_list(Int(py=y_addr), nr)
-    var bp = _parse_params(params, nf)
+    var bp = _parse_params(params, nf, unbundled="fit_custom")
     var weights = _parse_weights(params, nr)
 
     var raw_addr = Int(py=params["raw_addr"])
@@ -749,7 +791,7 @@ def fit_with_metrics(
     var nf = Int(py=n_features)
     var features = _f64_list(Int(py=x_addr), nr * nf)
     var target = _f64_list(Int(py=y_addr), nr)
-    var bp = _parse_params(params, nf)
+    var bp = _parse_params(params, nf, unbundled="fit_with_metrics")
     var weights = _parse_weights(params, nr)
 
     var pred_p = _pred_pointer(params)
@@ -984,7 +1026,7 @@ def fit_multiclass_with_metrics(
     var nc = Int(py=n_classes)
     var features = _f64_list(Int(py=x_addr), nr * nf)
     var labels = _int_list_from_f64(Int(py=y_addr), nr)
-    var bp = _parse_params(params, nf)
+    var bp = _parse_params(params, nf, unbundled="fit_multiclass_with_metrics")
     var weights = _parse_weights(params, nr)
     var pred_p = _pred_pointer(params)
     var valid_sets = _parse_valid_sets(params, nf)
@@ -1048,7 +1090,7 @@ def fit_ranker_with_metrics(
     var nf = Int(py=n_features)
     var features = _f64_list(Int(py=x_addr), nr * nf)
     var labels = _int_list_from_f64(Int(py=y_addr), nr)
-    var bp = _parse_params(params, nf)
+    var bp = _parse_params(params, nf, unbundled="fit_ranker_with_metrics")
     var weights = _parse_weights(params, nr)
     var pred_p = _pred_pointer(params)
     var valid_sets = _parse_valid_sets(params, nf)
@@ -1228,7 +1270,9 @@ def fit_multiclass(
     var nf = Int(py=n_features)
     var features = _f64_list(Int(py=x_addr), nr * nf)
     var labels = _int_list_from_f64(Int(py=y_addr), nr)
-    var bp = _parse_params(params, nf)
+    # Read the device first, for the reason `fit` does.
+    var device = _parse_device(params)
+    var bp = _parse_params(params, nf, cpu=device == CPU_DEVICE)
     var weights = _parse_weights(params, nr)
     var model = mojo_fit_multiclass(
         features,
@@ -1239,7 +1283,7 @@ def fit_multiclass(
         bp,
         Int(py=params["max_bin"]),
         weights,
-        _parse_device(params),
+        device,
         _parse_bagging(params),
         _parse_goss(params),
         use_missing=_parse_use_missing(params),
@@ -1387,7 +1431,7 @@ def fit_ranker(
     var nf = Int(py=n_features)
     var features = _f64_list(Int(py=x_addr), nr * nf)
     var labels = _int_list_from_f64(Int(py=y_addr), nr)
-    var bp = _parse_params(params, nf)
+    var bp = _parse_params(params, nf, unbundled="fit_ranker")
     var weights = _parse_weights(params, nr)
     var model = mojo_fit_ranker(
         features,
@@ -2628,12 +2672,14 @@ def train_dataset(
     `max_bin`, `use_missing`, and the categorical declaration are not read
     from `params` here."""
     var d = dataset.downcast_value_ptr[Dataset]()
+    # Read the device first, for the reason `fit` does.
+    var device = _parse_device(params)
     var model = mojo_train_dataset(
         d[],
         Int(py=params["objective"]),
-        _parse_params(params, d[].num_feature()),
+        _parse_params(params, d[].num_feature(), cpu=device == CPU_DEVICE),
         Float64(py=params["alpha"]),
-        _parse_device(params),
+        device,
         _parse_bagging(params),
         _parse_goss(params),
     )
@@ -2646,11 +2692,13 @@ def train_dataset_multiclass(
     """Train a softmax model on a constructed dataset, whose label holds
     class codes in 0..n_classes-1."""
     var d = dataset.downcast_value_ptr[Dataset]()
+    # Read the device first, for the reason `fit` does.
+    var device = _parse_device(params)
     var model = mojo_train_dataset_multiclass(
         d[],
         Int(py=params["n_classes"]),
-        _parse_params(params, d[].num_feature()),
-        _parse_device(params),
+        _parse_params(params, d[].num_feature(), cpu=device == CPU_DEVICE),
+        device,
         _parse_bagging(params),
         _parse_goss(params),
     )
@@ -2665,7 +2713,11 @@ def train_dataset_ranker(
     var d = dataset.downcast_value_ptr[Dataset]()
     var model = mojo_train_dataset_ranker(
         d[],
-        _parse_params(params, d[].num_feature()),
+        _parse_params(
+            params,
+            d[].num_feature(),
+            unbundled="train_dataset_ranker",
+        ),
         _parse_rank_params(params),
         _parse_bagging(params),
     )

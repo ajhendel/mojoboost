@@ -21,15 +21,20 @@ The layering is deliberate and is the whole point of the file:
 - `TransportCollective` is the thin blocking driver that composes the two and
   conforms to `Collective`, so `train_distributed` can be handed one without a
   line of `distributed.mojo` changing.
-- the runtime section at the end is the only seam anything outside Mojo uses.
-  A `RuntimeSpec` describes a rank's world and nothing about the data;
-  `open_local_collective` and `open_transport_collective` are the only two ways
-  a collective is built; and `transport_available` is the single place that
-  answers whether another process can be reached, so every caller refuses for
-  the same reason with the same message.
+- `SocketEndpoint` is the real one: a BSD socket reached through
+  `external_call`, with the connect, accept, and relay sequence in
+  `connect_world` on top of it. It is the only part of this file that names a
+  syscall, and the only part whose correctness depends on something outside
+  the repository.
+- the runtime section is the only seam anything outside Mojo uses. A
+  `RuntimeSpec` describes a rank's world and nothing about the data;
+  `open_local_collective`, `open_transport_collective`, and
+  `open_socket_collective` are the only ways a collective is built; and
+  `distributed_runtime_capability` is the single place that answers what this
+  build can do, so every caller refuses for the same reason with the same
+  message.
 
-What is implemented and tested, and what is not, is stated plainly because the
-distinction matters more here than anywhere else in the repository:
+Three separate claims are made here, and keeping them apart is the point:
 
 **Implemented and tested in process.** Frame encode and decode, checksum
 rejection, the per-collective sequence and epoch numbering, out-of-order and
@@ -39,21 +44,21 @@ accumulation, deadline expiry, cancellation, worker loss, machine list
 parsing, the histogram all-reduce cost contract, split agreement, and
 checkpoint restart compatibility.
 
-**Not implemented.** A socket `ByteEndpoint`. Mojo's standard library exposes
-no socket module at the version this repository pins, and this repository has
-no foreign function interface precedent to borrow, so writing one here would
-mean shipping untested syscall bindings under a protocol that is otherwise
-fully tested. The boundary is drawn exactly where that adapter lands, and
-docs/DISTRIBUTED_TRANSPORT.md section 7 specifies the syscall sequence it owes
-and the hermetic two-process test it has to pass.
+**Implemented and never run.** The socket layer: `SocketEndpoint`,
+`SocketListener`, `connect_to_root`, the rendezvous in `connect_world`, and
+`open_socket_collective`. The C ABI it depends on is transcribed from platform
+headers rather than discovered by a compiler, and only macOS and Linux are
+covered; on any other platform `SOCKETS_SUPPORTED` is False and
+`transport_available` says so. Nothing in this section has been compiled or
+executed in this repository, and the handoff records every unverified
+assumption line by line.
 
-**Therefore not claimed.** Nothing here has moved a byte between two
-processes or two hosts. No multi-host behavior, no throughput, and no
-scalability is claimed. `MemoryEndpoint` is a fake, named as one, and is not
-a transport. `HAS_BYTE_ENDPOINT` is False and `transport_available` returns
-it, so a caller that asks for a multi-process world is refused with
-`TRANSPORT_UNAVAILABLE` before it partitions a row. A socket adapter landing
-flips that one name, and nothing above it changes.
+**Therefore not claimed.** No byte has moved between two processes or two
+hosts here. No multi-host behavior, no throughput, and no scalability is
+claimed. `transport_validated` is the predicate for that and it returns False,
+and `distributed_runtime_capability` reports it as a caveat alongside
+availability, so nothing downstream can read "the code exists" as "the code
+works". `MemoryEndpoint` remains a fake, named as one, and is not a transport.
 """
 
 from std.memory import bitcast
@@ -288,9 +293,13 @@ comptime NS_PER_SECOND = 1_000_000_000
 
 @fieldwise_init
 struct RankAddress(Copyable, Movable):
-    """Where one rank listens. Purely descriptive: nothing in this module
-    resolves or connects to it, and the socket adapter that will is not
-    written."""
+    """Where one rank listens.
+
+    Descriptive on its own: parsing an address neither resolves nor connects
+    to it. `parse_ipv4` and `connect_to_root` are what turn one of these into
+    a socket, and they accept dotted-quad addresses and `localhost` only,
+    because this build resolves no hostnames.
+    """
 
     var host: String
     var port: Int
@@ -2498,13 +2507,14 @@ def zero_contribution_int(size: Int) -> List[Int]:
 #
 # It is deliberately small. A `RuntimeSpec` is the rank, the world, the machine
 # list, the job id, and the timeouts, and nothing about the data or the model.
-# `open_local_collective` and `open_transport_collective` are the only two ways
-# a collective is ever built. `transport_available` is the one place that says
-# whether a second process can be reached at all, and today it says no.
+# `open_local_collective`, `open_transport_collective`, and
+# `open_socket_collective` are the only ways a collective is ever built.
+# `distributed_runtime_capability` is the one place that says what a caller can
+# expect, and it reports availability and validation as two separate facts.
 
 comptime RUNTIME_LOCAL = 0
 """Every rank of the world hosted in this process. Real, and the only mode
-that runs today."""
+anyone has run."""
 
 comptime RUNTIME_TRANSPORT = 1
 """One rank per process, over TCP. See `transport_available` for whether this
@@ -2964,3 +2974,247 @@ def session_checkpoint_meta(
         session.config.world_size,
         n_trees,
     )
+
+
+# ---------------------------------------------------------------------------
+# Rendezvous
+# ---------------------------------------------------------------------------
+#
+# The only place in this module where a process meets another one.
+#
+# The shape follows the topology in `TransportCollective`: every non-root rank
+# connects to the root and to nobody else, so the root is the only rank that
+# ever hears from more than one peer. That makes the rendezvous asymmetric in
+# a way worth stating, because the handshake contract is not. Completing a
+# handshake requires each rank to hold one record per *other* rank, and a
+# worker has only one connection to learn them over. So the root relays. It
+# reads one record from each worker, and sends back to each worker the whole
+# set minus that worker's own: its own record first, then the others in
+# ascending rank order, `world_size - 1` records in all.
+#
+# Rank order is recovered from the announced records rather than from the
+# order connections arrive in, which is arbitrary. `peers[i]` is rank `i + 1`
+# on the root because `_gather_f64` folds in list order and that order is the
+# reduction order.
+
+
+struct WorldConnection(Movable):
+    """The endpoints and records a rendezvous produced, before a session.
+
+    Kept separate from `TransportCollective` so a failure between connecting
+    and handshaking has something to close. The endpoints share their
+    descriptors with any copy of them, and `SocketEndpoint` has no destructor,
+    so handing them to a collective and dropping this record leaves the
+    descriptors open and owned by the collective, which is the intended
+    handoff: `close` here is for the paths where no collective was built.
+    """
+
+    var peers: List[SocketEndpoint]
+    var handshakes: List[HandshakeRecord]
+
+    def __init__(
+        out self,
+        var peers: List[SocketEndpoint],
+        var handshakes: List[HandshakeRecord],
+    ):
+        self.peers = peers^
+        self.handshakes = handshakes^
+
+    def close(mut self):
+        """Release every descriptor, ignoring errors.
+
+        Errors are ignored because this runs on the failure path, where the
+        error worth reporting is the one that got us here.
+        """
+        for i in range(len(self.peers)):
+            try:
+                self.peers[i].close()
+            except:
+                pass
+
+
+def _close_endpoints(mut peers: List[SocketEndpoint]):
+    for i in range(len(peers)):
+        try:
+            peers[i].close()
+        except:
+            pass
+
+
+def _root_rendezvous(
+    spec: RuntimeSpec, config: TransportConfig, deadline_ns: Int
+) raises -> WorldConnection:
+    """Accept every worker, learn who it is, and tell it about the others."""
+    var local = local_handshake(config, spec.restart_epoch)
+    var world = config.world_size
+    var accepted = List[SocketEndpoint](capacity=world - 1)
+    var records = List[HandshakeRecord](capacity=world - 1)
+    var seen = List[Bool](capacity=world)
+    seen.resize(world, False)
+    seen[ROOT_RANK] = True
+    var listener = SocketListener(
+        config.addresses[ROOT_RANK].host, config.addresses[ROOT_RANK].port
+    )
+    try:
+        for _ in range(world - 1):
+            var fd = listener.accept_one(deadline_ns)
+            var endpoint = SocketEndpoint(-1, fd)
+            var record = decode_handshake(
+                endpoint.recv_exact(HANDSHAKE_BYTES, deadline_ns)
+            )
+            # Rejected here rather than in `complete_handshake` so the
+            # process that announced a stale machine list is told over the
+            # connection it opened, while it still exists.
+            var status = handshake_status(local, record)
+            if status != TRANSPORT_OK:
+                raise transport_error(
+                    status,
+                    record.rank,
+                    "a connecting process announced a world this root cannot"
+                    " join",
+                )
+            if seen[record.rank]:
+                raise transport_error(
+                    TRANSPORT_WORLD_MISMATCH,
+                    record.rank,
+                    "two processes connected claiming rank "
+                    + String(record.rank),
+                )
+            seen[record.rank] = True
+            endpoint.peer = record.rank
+            accepted.append(endpoint^)
+            records.append(record^)
+    except e:
+        listener.close()
+        _close_endpoints(accepted)
+        raise e
+    # Nothing else will connect, and a listening socket left open outlives
+    # the run's need for it.
+    listener.close()
+
+    # Announced order, not arrival order.
+    var peers = List[SocketEndpoint](capacity=world - 1)
+    var handshakes = List[HandshakeRecord](capacity=world - 1)
+    for target in range(1, world):
+        for i in range(len(records)):
+            if records[i].rank == target:
+                # A copy shares the descriptor and there is no destructor, so
+                # `accepted` going out of scope closes nothing.
+                peers.append(accepted[i].copy())
+                handshakes.append(records[i].copy())
+                break
+
+    try:
+        for i in range(len(peers)):
+            # One write per peer rather than one per record: the whole set is
+            # under two kilobytes for any world this transport can form, and a
+            # single write is one fewer place for a partial send to matter.
+            var blob = encode_handshake(local)
+            for j in range(len(handshakes)):
+                if j == i:
+                    continue
+                var other = encode_handshake(handshakes[j])
+                for b in range(len(other)):
+                    blob.append(other[b])
+            peers[i].send_all(blob, deadline_ns)
+    except e:
+        _close_endpoints(peers)
+        raise e
+    return WorldConnection(peers^, handshakes^)
+
+
+def _worker_rendezvous(
+    spec: RuntimeSpec, config: TransportConfig, deadline_ns: Int
+) raises -> WorldConnection:
+    """Reach the root, announce this rank, and take the world it reports."""
+    var local = local_handshake(config, spec.restart_epoch)
+    var root = config.addresses[ROOT_RANK]
+    var fd = connect_to_root(root.host, root.port, config.rank, deadline_ns)
+    var endpoint = SocketEndpoint(ROOT_RANK, fd)
+    var expected = config.world_size - 1
+    var handshakes = List[HandshakeRecord](capacity=expected)
+    try:
+        endpoint.send_all(encode_handshake(local), deadline_ns)
+        var blob = endpoint.recv_exact(HANDSHAKE_BYTES * expected, deadline_ns)
+        for k in range(expected):
+            var one = List[UInt8](capacity=HANDSHAKE_BYTES)
+            for b in range(HANDSHAKE_BYTES):
+                one.append(blob[k * HANDSHAKE_BYTES + b])
+            var record = decode_handshake(one)
+            var status = handshake_status(local, record)
+            if status != TRANSPORT_OK:
+                raise transport_error(
+                    status,
+                    record.rank,
+                    "the root relayed a handshake this rank cannot accept",
+                )
+            handshakes.append(record^)
+    except e:
+        try:
+            endpoint.close()
+        except:
+            pass
+        raise e
+    var peers = List[SocketEndpoint](capacity=1)
+    peers.append(endpoint^)
+    return WorldConnection(peers^, handshakes^)
+
+
+def connect_world(spec: RuntimeSpec) raises -> WorldConnection:
+    """Form the world this spec describes, over real sockets.
+
+    Blocks until every rank has connected and announced itself or the connect
+    deadline in the spec passes, whichever is first. A worker that starts
+    before the root retries a refused connection for as long as that deadline
+    allows, so process start order does not have to be controlled.
+
+    The world is not usable yet when this returns: `open_transport_collective`
+    still has to complete the handshake, which is what checks that every rank
+    is present exactly once. Splitting the two is what lets a caller close the
+    endpoints when the handshake is the thing that fails.
+
+    A `world_size` of 1 in transport mode opens nothing. It is a legitimate
+    degenerate configuration, usually a launcher scaling to one node, and
+    binding a port to talk to nobody would only invent a way to fail.
+    """
+    spec.validate()
+    if spec.mode != RUNTIME_TRANSPORT:
+        raise transport_error(
+            TRANSPORT_CONFIG_INVALID,
+            spec.rank,
+            "connect_world needs a transport runtime spec",
+        )
+    require_transport(spec)
+    var config = spec.transport_config()
+    if config.world_size == 1:
+        return WorldConnection(
+            List[SocketEndpoint](), List[HandshakeRecord]()
+        )
+    var deadline_ns = Int(perf_counter_ns()) + spec.connect_timeout_ns
+    if config.is_root():
+        return _root_rendezvous(spec, config, deadline_ns)
+    return _worker_rendezvous(spec, config, deadline_ns)
+
+
+def open_socket_collective(
+    spec: RuntimeSpec,
+) raises -> TransportCollective[SocketEndpoint]:
+    """Connect, handshake, and return the collective a trainer runs over.
+
+    The one call a caller needs for multi-process training, and the only one
+    in this module that both opens a socket and returns something a trainer
+    can use. `TransportCollective.shutdown` closes what this opened; on the
+    failure path this closes it here, because there is no collective to
+    shut down.
+
+    This has never been run. `transport_validated()` is the predicate for
+    that, and it returns False.
+    """
+    var world = connect_world(spec)
+    try:
+        return open_transport_collective[SocketEndpoint](
+            spec, world.peers.copy(), world.handshakes.copy()
+        )
+    except e:
+        world.close()
+        raise e

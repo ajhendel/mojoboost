@@ -113,9 +113,15 @@ Mojo errors and are re-raised as `ValueError` or `RuntimeError`.
 `def_function` table cannot be called from Python, no matter how public it
 is in Mojo. The Python package handles that gracefully in several places:
 it probes for a hook with `getattr(_mojoboost, name, None)` and falls back
-to a slower path when the hook is absent. Those fallbacks are the honest
-way to ship an unfinished seam, and each is also a live disconnection.
-`docs/INTEGRATION_INVENTORY.md` lists every one of them.
+to a slower path when the hook is absent. A probe is not the same thing as
+a disconnection, and the difference is which extension you built. Most of
+these hooks are registered as of this revision: `_mojoboost.mojo` imports
+the inspection, objective-registry, dataset, and distributed binding
+modules, so a package built from this tree takes the native route and the
+probe is what keeps it working against an extension built before the
+change. One hook still finds nothing on any build, `split_gains`, and it
+is a missing implementation rather than an unregistered one.
+`docs/INTEGRATION_INVENTORY.md` says which is which, one row at a time.
 
 ### 2. Native to C
 
@@ -155,11 +161,18 @@ today, the table names it and says which is meant to win.
 | What a parameter string means | `src/mojoboost/params.mojo` | none |
 
 Every "second implementation" in that table is a disconnection, not a
-design. The pattern in each case is the same: the native module exists and
-is tested, the binding does not export it, and Python keeps a fallback so
-that the package works against the extension as built. Deleting a fallback
-before its binding lands would break the package; keeping one after its
-binding lands is how two answers to one question start.
+design, and they are in two different states. For the dump, the registry,
+and the device report the binding has landed, so the second implementation
+is now a compatibility path rather than the path, and the risk has moved
+with it: keeping a fallback after its binding lands is how two answers to
+one question start, and the deletion is what is owed next. Two things keep
+them alive for now. `python/mojoboost/inspection.py` still parses for split
+gains, because no `split_gains` hook exists to ask, and
+`_Base._resolve_device` still calls `resolve_device` directly rather than
+the fuller `decide_device` the same extension now registers, so a report
+and a `fit` remain two decisions. `class_weight` is the one row where no
+binding is even open: the Mojo module has no caller at all, and the Python
+arithmetic is what every estimator runs.
 
 ## Reachability, and how to check it
 

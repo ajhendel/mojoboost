@@ -1145,6 +1145,45 @@ class _Base(_ParamsMixin):
     `max_delta_step`, `path_smooth`, and `extra_trees` need a grower that
     passes each node's identity and row count. A backend that does not
     refuses rather than dropping them.
+
+    `enable_bundle` is LightGBM's exclusive feature bundling: sparse
+    features that are never non-zero on the same row are packed into one
+    column, so the histogram loop runs over fewer of them
+    (src/mojoboost/efb.mojo). It defaults to `False`, which is *not*
+    LightGBM's default of true, and turning it on changes how long a fit
+    takes rather than what it returns: the plan is fitted once per training
+    call and dropped when the call ends, and the trees name original
+    features and original bins, so a bundled fit and an unbundled one are
+    the same model.
+
+    Only the trainers that apply a plan accept the switch, and the rest
+    raise rather than train an unbundled model that looks bundled: it is
+    honored by dense CPU fits, by continued training, and by the sparse
+    path (`fit` on a sparse matrix bundles the CSC matrix directly), and
+    refused by `device="gpu"`, by a custom objective, by a custom metric or
+    an eval set, and by the ranker.
+
+    The knobs it governs are the plan-construction policy. `enable_bundle`
+    and `max_conflict_rate` are LightGBM's names; the other five have no
+    LightGBM counterpart and are described in `src/mojoboost/efb.mojo`:
+
+    - `max_conflict_rate` is the fraction of rows a bundle may hold
+      collisions on. Only LightGBM's own default of 0.0, which makes
+      bundling exactly lossless, is accepted; above it a collision drops a
+      training value where no metric reports the loss, so it raises with
+      what lifting that would take.
+    - `max_bundle_bins` (256) and `max_bundle_size` (0, meaning unlimited)
+      cap a bundle's bins and members.
+    - `max_nondefault_rate` (0.95) leaves a feature that is non-default on
+      more rows than this out of any multi-member bundle.
+    - `min_reduction` (0.0) is the fraction of the histogram footprint a
+      plan must remove before it is applied at all; under it the fit runs
+      unbundled.
+    - `bundle_missing` (`False`) lets features that reserve a missing bin
+      join a multi-member bundle.
+
+    All seven are range-checked natively on every fit, whether or not the
+    switch is on, so a bad value is named before any data is read.
     """
 
     #: Public attributes that `fit` sets and a refit clears. The model
@@ -1217,6 +1256,13 @@ class _Base(_ParamsMixin):
         cegb_tradeoff=1.0,
         cegb_penalty_split=0.0,
         forced_splits=None,
+        enable_bundle=False,
+        max_conflict_rate=0.0,
+        max_bundle_bins=256,
+        max_bundle_size=0,
+        max_nondefault_rate=0.95,
+        min_reduction=0.0,
+        bundle_missing=False,
         importance_type="split",
     ):
         self.num_leaves = num_leaves
@@ -1271,6 +1317,13 @@ class _Base(_ParamsMixin):
         self.cegb_tradeoff = cegb_tradeoff
         self.cegb_penalty_split = cegb_penalty_split
         self.forced_splits = forced_splits
+        self.enable_bundle = enable_bundle
+        self.max_conflict_rate = max_conflict_rate
+        self.max_bundle_bins = max_bundle_bins
+        self.max_bundle_size = max_bundle_size
+        self.max_nondefault_rate = max_nondefault_rate
+        self.min_reduction = min_reduction
+        self.bundle_missing = bundle_missing
         self.importance_type = importance_type
         self._reset_fitted()
 
@@ -1839,6 +1892,25 @@ class _Base(_ParamsMixin):
             # caller, and there is no estimator parameter that can set it.
             "cegb_penalty_feature_coupled_addr": 0,
             "forced_splits": self._forced_splits_text(),
+            # Exclusive feature bundling, read by
+            # `efb_settings_from_mapping` in bindings/basic_bindings.mojo
+            # into the `EfbSettings` that rides on `BoosterParams.bundling`
+            # (src/mojoboost/efb.mojo). Sent on every fit for the same
+            # reason the block above is, and range-checked in the same one
+            # place: `EfbSettings.check`, which the C ABI and the CLI reach
+            # through params.mojo.
+            #
+            # Which trainers may honor the switch is decided at the
+            # boundary, in `_parse_params`, because that is where the
+            # trainer about to run is known. A trainer that would ignore it
+            # raises instead.
+            "enable_bundle": int(bool(self.enable_bundle)),
+            "max_conflict_rate": float(self.max_conflict_rate),
+            "max_bundle_bins": int(self.max_bundle_bins),
+            "max_bundle_size": int(self.max_bundle_size),
+            "max_nondefault_rate": float(self.max_nondefault_rate),
+            "min_reduction": float(self.min_reduction),
+            "bundle_missing": int(bool(self.bundle_missing)),
         }
 
     def _resolve_device(

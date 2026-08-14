@@ -463,6 +463,13 @@ REQUIRED_MOJO_EXPORTS = [
 #   pyarg:CLASS.METHOD:ARG  ARG is a parameter of CLASS.METHOD
 #   pyattr:NAME             NAME in _Base._FITTED_ATTRS
 #   mojo:NAME               NAME re-exported from src/mojoboost/__init__.mojo
+#   env:MOJOBOOST_NAME      the variable is read by a shipping source file
+#
+# `env:` is the one probe that is not a name a caller writes, and it is here
+# because section 2 of docs/COMPATIBILITY_POLICY.md makes the MOJOBOOST_*
+# variables public: a capability a user turns on that way is reachable, and
+# a row claiming otherwise is as wrong as one that misses an export. See
+# env_var_names for what counts as reading one.
 #
 # A watch fires only when *every* probe resolves, and firing means "re-audit
 # this row", not "this row is wrong in a particular direction".
@@ -555,6 +562,9 @@ PUBLIC_REACHABILITY_PROBES = {
     ],
     "Startup diagnostics (mojoboost.diagnostics)": ["pyall:describe_install"],
     "Dask adapter (mojoboost.dask)": ["pyall:DaskMojoBoostRegressor"],
+    "Class-batched GPU multiclass rounds": [
+        "env:MOJOBOOST_GPU_CLASS_BATCH",
+    ],
 }
 
 # Mojo suites the contract cites that no pixi task runs. Empty is the
@@ -854,6 +864,35 @@ def mojo_export_names():
     return names
 
 
+def env_var_names():
+    """`MOJOBOOST_*` names a shipping source file reads.
+
+    Section 2 of `docs/COMPATIBILITY_POLICY.md` makes these part of the
+    public surface, so a capability whose only route is an environment
+    variable is still publicly reachable, and that claim needs the same kind
+    of evidence as an exported name. A variable named only in a comment or a
+    document is not a route: the name has to appear inside a string literal
+    in a file under `src/mojoboost`, `bindings`, or `python/mojoboost`,
+    which is where every reader of one lives.
+    """
+    names = set()
+    quoted = re.compile(r"[\"'](MOJOBOOST_[A-Z0-9_]+)[\"']")
+    for base, pattern in (
+        (ROOT / "src" / "mojoboost", "*.mojo"),
+        (ROOT / "bindings", "*.mojo"),
+        (PY_PKG, "*.py"),
+    ):
+        if not base.is_dir():
+            continue
+        for path in sorted(base.glob(pattern)):
+            try:
+                text = path.read_text()
+            except OSError:
+                continue
+            names.update(quoted.findall(text))
+    return names
+
+
 def symbol_index():
     """Every public symbol the watches can probe, parsed rather than
     imported. Keys are the probe kinds documented on
@@ -865,6 +904,7 @@ def symbol_index():
         "args": {},
         "pyattr": set(),
         "mojo": mojo_export_names(),
+        "env": env_var_names(),
     }
 
     def read_module(path):
@@ -947,6 +987,8 @@ def resolves(probe, index):
         return rest in index["pyattr"]
     if kind == "mojo":
         return rest in index["mojo"]
+    if kind == "env":
+        return rest in index["env"]
     raise ValueError(f"unknown probe kind {kind!r} in {probe!r}")
 
 

@@ -8,7 +8,7 @@ Lane 08. Owned files:
 - `src/mojoboost/custom_metric.mojo`
 - this handoff
 
-**Four files outside that list were also edited, in a second pass, at the
+**Three files outside that list were also edited, in a second pass, at the
 repository owner's explicit direction** after the first pass filed them as
 cross-lane patch requests. They are `src/mojoboost/__init__.mojo` (6.1),
 `src/mojoboost/boosting.mojo` and `src/mojoboost/gpu_predict.mojo` (6.5), and
@@ -45,6 +45,16 @@ not be this lane's; 6.5 lists the changes by name instead.
 **Nothing was run.** No `mojo`, no `pixi`, no build, no test, no formatter.
 Every claim below is from reading. Section 10 lists the smallest commands
 that would check them, all marked UNRUN.
+
+Method note, so nobody has to guess how the counting claims were reached: the
+symbol inventories in this handoff (which names exist in which module, the
+454-export duplicate check in 6.1, the collision check against the pre-existing
+exports) came from throwaway `python3` scripts that regex-parse the source
+text — the same job as `rg`, over the same bytes. They never imported the
+package, executed project code, invoked `mojo`, or built anything. If that
+still reads as "ran Python" to you, treat every count in this document as
+unverified and re-derive it with `rg`; nothing in the source tree depends on
+those scripts, and none of them were kept.
 
 ---
 
@@ -976,63 +986,159 @@ allocates a second (the softmax copy) so the caller's raw scores stay raw.
 
 ### 9.5 Unverified
 
-Nothing here was compiled or run. In particular: the closure capture syntax
-in the four `*_with_builtin_metrics` entry points
-(`raises {imm codes, imm context} -> Float64`) follows
-`custom_metric.train_with_metric` and `bindings/_mojoboost.mojo:469`, but a
-capture of a `struct` value rather than a `List` is new in this file. The
-`@staticmethod def name() -> StructName` form follows `BaggingParams.disabled`
-and `GossParams.disabled`. `mut self` follows `_StopState.observe`. Bitwise
-`&` against `==` is parenthesized everywhere rather than relying on Python
-precedence.
+Nothing here was compiled or run, in either pass. Every claim below is a
+reading of source text against in-repo precedent, and each is a place where a
+compiler could disagree.
+
+From the first pass, still unverified:
+
+- the closure capture syntax in the four `*_with_builtin_metrics` entry
+  points (`raises {imm codes, imm context} -> Float64`) follows
+  `custom_metric.train_with_metric` and `bindings/_mojoboost.mojo:469`, but a
+  capture of a `struct` value rather than a `List` is new in this file;
+- the `@staticmethod def name() -> StructName` form follows
+  `BaggingParams.disabled` and `GossParams.disabled`;
+- `mut self` follows `_StopState.observe`;
+- bitwise `&` against `==` is parenthesized everywhere rather than relying on
+  Python precedence.
+
+From the second pass (the four fixes), newly unverified:
+
+- **the import graph is a line, by reading.** `metrics` imports only
+  `std.math`; `objective_registry` imports only `.metrics`; `boosting` imports
+  `.objective_registry`; `objective` and `gpu_predict` import `.boosting` and
+  `.objective_registry`; `custom_metric` sits above all of them. No file was
+  found importing a file below it in that order, but the check was `rg` over
+  `from \.` lines, not a compile.
+- **the re-declare pattern is assumed to be free.** `comptime X = _X` at
+  module scope in `objective_registry.mojo` (22 metric codes) and in
+  `boosting.mojo` (14 objective codes plus two link codes) follows
+  `device.mojo` exactly. If Mojo rejects aliasing an imported `comptime` under
+  a new name at module scope, both blocks fail together and the fix is to
+  import the codes unaliased and delete the binding block.
+- **454 exports, zero duplicates, by script.** The count and the collision
+  check came from a regex parse of `__init__.mojo`'s import blocks (see the
+  method note in the header), not from importing the package. A name that
+  exists in its defining module but is not actually exportable — a `comptime`
+  inside a struct body, say — would pass that check and fail the compile.
+  Every added name was grepped to its definition site; none were inside a
+  struct.
+- **the three deliberate omissions in 6.1** rest on the claim that a name
+  reaching `__init__.mojo` from two modules is a duplicate-symbol error. The
+  objective codes and the `METRIC_*` codes are each now visible from two
+  places (their definition site and the module that re-declares them), so
+  each is imported from one only — the module it was always imported from, so
+  no public name moved. If Mojo tolerates the duplicate instead of rejecting
+  it, the omissions are harmless rather than necessary.
+- **`Booster.response` was rewritten to branch on `objective_link`** rather
+  than on objective codes. The mapping was checked row by row against the old
+  branch set, but it is a behavioral rewrite of a public method and nothing
+  executed it.
+- **`_check_objective`'s four range branches were replaced by one
+  `check_objective_param` call.** The messages the two produce are not
+  byte-identical; if any test asserts on the old wording it will fail on the
+  string, not on the logic.
 
 ---
 
 ## 10. Validation, smallest first — ALL UNRUN
 
 Nothing below was executed. Run them in order; each is cheap and each
-isolates one class of failure.
+isolates one class of failure. The order matters more after the second pass
+than it did after the first: the import graph was rearranged, so the early
+checks are structural and the later ones are behavioral. Stop at the first
+failure rather than running the rest.
 
-**UNRUN 1 — does it compile at all.** The only check that settles 9.3.
+**UNRUN 1 — the bottom of the graph.** `metrics.mojo` imports only
+`std.math`, so this compiles or the metric codes themselves are wrong.
+
+```
+pixi run mojo build src/mojoboost/metrics.mojo -o /dev/null
+```
+
+**UNRUN 2 — the registry, one edge up.** Its only import is `.metrics`. This
+is also the check that settles the re-declare pattern (9.5): 22 lines of
+`comptime METRIC_X = _METRIC_X` at module scope either bind or they do not.
 
 ```
 pixi run mojo build src/mojoboost/objective_registry.mojo -o /dev/null
 ```
 
-**UNRUN 2 — does the package compile with the new import edges.** Catches a
-cycle, which is the one structural risk introduced.
+**UNRUN 3 — the reversed edge.** `boosting.mojo` now imports *from* the
+registry rather than the registry importing from it, and re-declares the
+fourteen objective constants the same way. This is where a cycle would show
+up, and it is the one structural risk the second pass introduced.
+
+```
+pixi run mojo build src/mojoboost/boosting.mojo -o /dev/null
+```
+
+**UNRUN 4 — the two consumers of `objective_link`.** `Booster.response` and
+`response_for_objective` were both rewritten to branch on the link rather
+than on objective codes (6.5).
+
+```
+pixi run mojo build src/mojoboost/gpu_predict.mojo -o /dev/null
+```
+
+**UNRUN 5 — the top of the graph.** `custom_metric.mojo` changed most and
+sits above everything else.
 
 ```
 pixi run mojo build src/mojoboost/custom_metric.mojo -o /dev/null
 ```
 
-**UNRUN 3 — one focused existing test, not the suite.** `custom_metric.mojo`
+**UNRUN 6 — the package surface.** `+140` export lines landed in
+`__init__.mojo` (6.1). This catches a name that exists in its defining module
+but is not exportable, and any duplicate the regex check in 6.1 missed. It is
+last among the compile checks because it is the only one that pulls in every
+other lane's files too, so a failure here may not be this lane's.
+
+```
+pixi run mojo build src/mojoboost/__init__.mojo -o /dev/null
+```
+
+**UNRUN 7 — one focused existing test, not the suite.** `custom_metric.mojo`
 changed most and `response_scale` changed semantics:
 
 ```
 pixi run mojo test tests/test_custom_metrics.mojo
 ```
 
-**UNRUN 4 — the custom-objective contract assertions.**
+**UNRUN 8 — the custom-objective contract assertions.**
 
 ```
 pixi run mojo test tests/test_custom_objective.mojo
 ```
 
-**UNRUN 5 — a registry self-check probe** (write it, do not add it to the
+**UNRUN 9 — the objective parameter checks.** `_check_objective`'s four range
+branches became one `check_objective_param` call (6.5), and the error strings
+are not byte-identical to the old ones (9.5).
+`test_new_objectives_validate_alpha` is the test that exercises them; reading
+it, it asserts only that *something* raised, never on the wording, so the
+rewrite should pass it unchanged — which makes this the check that the
+registry's domains match the ranges they replaced.
+
+```
+pixi run mojo test tests/test_objectives.mojo
+```
+
+**UNRUN 10 — a registry self-check probe** (write it, do not add it to the
 suite yet). Three properties, in this order:
 
 1. round trip: every name in `objective_alias_names()` resolves, and every
    code in `all_objective_codes()` names itself;
 2. domain agreement: for each of `QUANTILE`, `HUBER`, `FAIR`, `TWEEDIE`,
    sample the boundary and a value just inside and just outside, and confirm
-   `check_objective_param` and `objective_param_domain.contains` agree — this
-   is the drift check firing on purpose;
+   `check_objective_param` and `objective_param_domain.contains` agree. The
+   old cross-module drift check is gone (4.3) because there is nothing left to
+   drift from; this is the intra-registry version, that the raising path and
+   the declarative path describe the same interval;
 3. metric coverage: for every code `0 .. N_BUILTIN_METRICS - 1`,
    `eval_builtin_metric` returns a finite number on a two-row toy input with
    a compatible objective, and raises on an incompatible one.
 
-**UNRUN 6 — differential, after 6.4a lands.** For each metric code and a
+**UNRUN 11 — differential, after 6.4a lands.** For each metric code and a
 fixed toy model, the binding's old `eval_metric` and the new one must return
 bit-identical values for every *compatible* pair. The incompatible pairs are
 where they are allowed to differ (9.1), and that difference should be
