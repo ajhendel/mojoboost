@@ -1695,6 +1695,7 @@ def train_distributed_run[
                             base_score,
                             params.learning_rate,
                             objective,
+                            params.tree.monotone.copy(),
                         )
                     ),
                     len(report.checkpoints),
@@ -1731,7 +1732,11 @@ def train_distributed_run[
             break
 
     var model = Booster(
-        trees^, base_score, params.learning_rate, objective
+        trees^,
+        base_score,
+        params.learning_rate,
+        objective,
+        params.tree.monotone.copy(),
     )
     report.model_digest = model_digest(model)
     return DistributedOutcome(model^, report^)

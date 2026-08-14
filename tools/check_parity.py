@@ -19,6 +19,9 @@ become false and a deferred row cannot quietly stay false:
    `docs/CAPABILITY_LEVELS.md` defines, and does not contradict itself
 9. section 0's `publicly reachable` cells agree with the public symbols
    behind them, in both directions
+10. every trainer that returns a booster passes the monotone constraints it
+    trained under into it, rather than letting them fall back to the
+    "no constraints" default
 
 Check 9 exists because check 7 has a blind spot: it only looks at rows that
 say `deferred` or `unsupported`, so a `partial` row can keep claiming a
@@ -1224,6 +1227,139 @@ def mojo_exports(problems):
             )
 
 
+#: Construction sites that may leave `monotone` at its default, each with
+#: the reason it is not a dropped constraint. Keyed by (file, struct); the
+#: value is the reason, printed when the exemption is unused so a stale
+#: entry gets removed rather than accumulating.
+MONOTONE_EXEMPT = {
+    ("boosting_rf.mojo", "Booster"): (
+        "an empty throwaway built only to call `.response()`, which is a "
+        "property of the objective and reads no constraint"
+    ),
+    ("tree.mojo", "TreeParams"): (
+        "`TreeParams.default()`, whose documented job is to state "
+        "LightGBM's defaults, of which no constraints is one"
+    ),
+    ("lgbm_model_io.mojo", "Booster"): (
+        "a model parsed from LightGBM's own format, which this reader "
+        "does not parse constraints out of; see the import row in the "
+        "contract"
+    ),
+    ("lgbm_model_io.mojo", "MulticlassBooster"): (
+        "a model parsed from LightGBM's own format, which this reader "
+        "does not parse constraints out of; see the import row in the "
+        "contract"
+    ),
+}
+
+
+def _struct_blocks(text):
+    """(name, source) for each top-level struct, in file order."""
+    lines = text.splitlines()
+    starts = [
+        (i, m.group(1))
+        for i, line in enumerate(lines)
+        for m in [re.match(r"struct\s+(\w+)", line)]
+        if m
+    ]
+    for n, (i, name) in enumerate(starts):
+        end = starts[n + 1][0] if n + 1 < len(starts) else len(lines)
+        yield name, "\n".join(lines[i:end])
+
+
+def _monotone_carriers():
+    """Structs that store a `MonotoneConstraints` behind a defaulted
+    argument.
+
+    Discovered rather than listed. A struct that starts carrying
+    constraints is covered the day it is written, which is the whole
+    point: the last set of dropped constraints was found by reading, and
+    reading does not scale to the next one.
+    """
+    carriers = {}
+    for path in sorted((ROOT / "src" / "mojoboost").glob("*.mojo")):
+        text = path.read_text()
+        for name, block in _struct_blocks(text):
+            stores = re.search(
+                r"var monotone:\s*MonotoneConstraints\s*$", block, re.M
+            )
+            defaulted = re.search(
+                r"var monotone:\s*MonotoneConstraints\s*=", block
+            )
+            if stores and defaulted:
+                carriers[name] = path.name
+    return carriers
+
+
+def _call_args(text, open_paren):
+    """The argument text of the call whose `(` is at `open_paren`."""
+    depth = 0
+    for i in range(open_paren, len(text)):
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return text[open_paren + 1 : i]
+    return None
+
+
+def monotone_passthrough(problems):
+    """Every construction of a constraint-carrying struct passes them on.
+
+    `monotone` defaults to "no constraints" on all of these, so omitting
+    the argument compiles, runs, trains, and returns a model that quietly
+    reports it was fit without constraints. That failure has already
+    happened once across seven trainers, and it was fixed by hand in each
+    of them while the shape that produced it was left in place. Reading
+    cannot be the guard here, because the mistake is an *absence* and
+    there is nothing at the call site to notice.
+
+    Anything genuinely fine to leave defaulted goes in `MONOTONE_EXEMPT`
+    with its reason, so the exemption is an argument rather than silence.
+    """
+    carriers = _monotone_carriers()
+    if not carriers:
+        problems.append(
+            "no MonotoneConstraints-carrying struct found; the monotone "
+            "passthrough check has stopped checking anything"
+        )
+        return
+    seen_exempt = set()
+    roots = [ROOT / "src" / "mojoboost", ROOT / "bindings"]
+    for base in roots:
+        if not base.is_dir():
+            continue
+        for path in sorted(base.glob("*.mojo")):
+            text = path.read_text()
+            for name in carriers:
+                pattern = r"(?<![\w.])" + name + r"\s*\("
+                for m in re.finditer(pattern, text):
+                    line_start = text.rfind("\n", 0, m.start()) + 1
+                    if text[line_start:].lstrip().startswith("struct "):
+                        continue
+                    args = _call_args(text, m.end() - 1)
+                    if args is None or "monotone" in args:
+                        continue
+                    key = (path.name, name)
+                    if key in MONOTONE_EXEMPT:
+                        seen_exempt.add(key)
+                        continue
+                    line = text.count("\n", 0, m.start()) + 1
+                    problems.append(
+                        f"{path.name}:{line} builds {name} without passing "
+                        "monotone constraints, so the model it returns "
+                        "reports none; pass params.tree.monotone.copy() or "
+                        "add an entry to MONOTONE_EXEMPT saying why not"
+                    )
+    for key in sorted(set(MONOTONE_EXEMPT) - seen_exempt):
+        problems.append(
+            f"MONOTONE_EXEMPT has a stale entry for {key[1]} in {key[0]}; "
+            "that construction no longer exists or now passes constraints, "
+            "so remove the exemption"
+        )
+
+
 def unwired_tests(text, problems):
     """Cited Mojo suites that no pixi task runs."""
     cited = {
@@ -1273,6 +1409,7 @@ def main():
     mojo_exports(problems)
     stale_deferred(text, problems)
     unwired_tests(text, problems)
+    monotone_passthrough(problems)
 
     header, level_rows = levels_table(text)
     print(f"  {len(supported)} rows marked supported")

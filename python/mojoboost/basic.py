@@ -1209,10 +1209,11 @@ class Booster:
                 )
             out = _out_buffer(n_rows * self._n_classes)
             _mojoboost.predict_proba_csr(self._handle, params, _addr(out))
-            if _np is not None:
-                return out.reshape(n_rows, self._n_classes)
-            k = self._n_classes
-            return [list(out[r * k : (r + 1) * k]) for r in range(n_rows)]
+            # No numpy-free arm here: `check_X_sparse` above refuses sparse
+            # input outright when numpy is missing, so this point is only
+            # ever reached with numpy present. See
+            # `test_sparse_input_is_refused_rather_than_served`.
+            return out.reshape(n_rows, self._n_classes)
         out = _out_buffer(n_rows)
         query = (
             _mojoboost.predict_raw_csr

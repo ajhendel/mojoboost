@@ -2084,7 +2084,11 @@ def _train_multiclass_gpu_batched[
                     _ = trees.pop()
                 break
         return MulticlassBooster(
-            trees^, base_scores^, n_classes, params.learning_rate
+            trees^,
+            base_scores^,
+            n_classes,
+            params.learning_rate,
+            params.tree.monotone.copy(),
         )
 
 
@@ -2209,7 +2213,11 @@ def _train_multiclass_gpu_rounds[
                         _ = trees.pop()
                     break
             return MulticlassBooster(
-                trees^, base_scores^, n_classes, params.learning_rate
+                trees^,
+                base_scores^,
+                n_classes,
+                params.learning_rate,
+                params.tree.monotone.copy(),
             )
 
         # Row-major raw scores and softmax scratch: raw[r * n_classes + k].
@@ -2287,7 +2295,11 @@ def _train_multiclass_gpu_rounds[
                 break
 
         return MulticlassBooster(
-            trees^, base_scores^, n_classes, params.learning_rate
+            trees^,
+            base_scores^,
+            n_classes,
+            params.learning_rate,
+            params.tree.monotone.copy(),
         )
 
 
