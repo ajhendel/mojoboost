@@ -6,7 +6,7 @@ platforms = ["osx-arm64", "linux-64", "linux-aarch64"]
 version = "0.1.0"
 
 [tasks]
-test = "mojo run -I src tests/test_mojoboost.mojo && mojo run -I src tests/test_metrics.mojo && mojo run -I src tests/test_kernels.mojo && mojo run -I src tests/test_serialize.mojo"
+test = "mojo run -I src tests/test_mojoboost.mojo && mojo run -I src tests/test_metrics.mojo && mojo run -I src tests/test_weights.mojo && mojo run -I src tests/test_kernels.mojo && mojo run -I src tests/test_serialize.mojo"
 bench = "mojo run -I src bench/bench_train.mojo"
 
 [dependencies]

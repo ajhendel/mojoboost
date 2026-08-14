@@ -20,6 +20,7 @@ from .boosting import (
     train_multiclass_with_valid,
     train_with_valid,
 )
+from .importance import split_importance
 from .metrics import (
     binary_accuracy,
     binary_auc,

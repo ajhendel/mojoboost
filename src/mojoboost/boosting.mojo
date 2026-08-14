@@ -30,11 +30,30 @@ def _clamp_prob(p: Float64) -> Float64:
     return p
 
 
-def _base_score(target: List[Float64], objective: Int) -> Float64:
+def _check_sample_weight(weights: List[Float64], n: Int) raises:
+    """An empty list means unweighted; otherwise one nonnegative weight
+    per training row."""
+    if len(weights) == 0:
+        return
+    if len(weights) != n:
+        raise Error("sample_weight length must equal n_rows")
+    for r in range(n):
+        if weights[r] < 0.0:
+            raise Error("sample_weight entries must be nonnegative")
+
+
+def _base_score(
+    target: List[Float64], objective: Int, weights: List[Float64]
+) raises -> Float64:
     var mean = 0.0
+    var total_w = 0.0
     for r in range(len(target)):
-        mean += target[r]
-    mean /= Float64(len(target))
+        var w = weights[r] if len(weights) > 0 else 1.0
+        mean += w * target[r]
+        total_w += w
+    if total_w <= 0.0:
+        raise Error("sample_weight must have a positive sum")
+    mean /= total_w
     if objective == BINARY_LOGISTIC:
         var p = _clamp_prob(mean)
         return log(p / (1.0 - p))
@@ -45,6 +64,7 @@ def _fill_grad_hess(
     raw: List[Float64],
     target: List[Float64],
     objective: Int,
+    weights: List[Float64],
     mut grad: List[Float64],
     mut hess: List[Float64],
 ):
@@ -52,16 +72,18 @@ def _fill_grad_hess(
     hess.clear()
     if objective == BINARY_LOGISTIC:
         for r in range(len(target)):
+            var w = weights[r] if len(weights) > 0 else 1.0
             var p = _sigmoid(raw[r])
-            grad.append(p - target[r])
+            grad.append(w * (p - target[r]))
             var h = p * (1.0 - p)
             if h < 1e-16:
                 h = 1e-16
-            hess.append(h)
+            hess.append(w * h)
     else:
         for r in range(len(target)):
-            grad.append(raw[r] - target[r])
-            hess.append(1.0)
+            var w = weights[r] if len(weights) > 0 else 1.0
+            grad.append(w * (raw[r] - target[r]))
+            hess.append(w)
 
 
 def _mean_loss(
@@ -132,16 +154,20 @@ def train(
     target: List[Float64],
     objective: Int,
     params: BoosterParams,
+    sample_weight: List[Float64] = [],
 ) raises -> Booster:
     """Train a boosted ensemble. `target` is the regression target for
-    SQUARED_ERROR or {0, 1} labels for BINARY_LOGISTIC."""
+    SQUARED_ERROR or {0, 1} labels for BINARY_LOGISTIC. A non-empty
+    sample_weight scales each row's gradient and hessian, LightGBM
+    style; a row with weight zero is ignored."""
     if len(target) != data.n_rows:
         raise Error("target length must equal n_rows")
     if objective != SQUARED_ERROR and objective != BINARY_LOGISTIC:
         raise Error("unknown objective")
+    _check_sample_weight(sample_weight, data.n_rows)
 
     var n = data.n_rows
-    var base_score = _base_score(target, objective)
+    var base_score = _base_score(target, objective, sample_weight)
     var raw = List[Float64](capacity=n)
     for _ in range(n):
         raw.append(base_score)
@@ -150,7 +176,7 @@ def train(
     var grad = List[Float64](capacity=n)
     var hess = List[Float64](capacity=n)
     for _ in range(params.n_estimators):
-        _fill_grad_hess(raw, target, objective, grad, hess)
+        _fill_grad_hess(raw, target, objective, sample_weight, grad, hess)
         var tree = grow_tree(data, grad, hess, params.tree)
 
         # A single-leaf tree with a near-zero value means the objective has
@@ -174,11 +200,13 @@ def train_with_valid(
     params: BoosterParams,
     early_stopping_rounds: Int,
     min_delta: Float64 = 0.0,
+    sample_weight: List[Float64] = [],
 ) raises -> Booster:
     """Train with validation-set early stopping. Stops when the validation
     loss (MSE / log loss) has not improved by more than min_delta for
     early_stopping_rounds consecutive rounds and truncates the ensemble
-    to its best round."""
+    to its best round. sample_weight applies to training rows only; the
+    validation loss is unweighted."""
     if len(target) != data.n_rows:
         raise Error("target length must equal n_rows")
     if len(valid_target) != valid_data.n_rows:
@@ -189,9 +217,10 @@ def train_with_valid(
         raise Error("unknown objective")
     if early_stopping_rounds < 1:
         raise Error("early_stopping_rounds must be positive")
+    _check_sample_weight(sample_weight, data.n_rows)
 
     var n = data.n_rows
-    var base_score = _base_score(target, objective)
+    var base_score = _base_score(target, objective, sample_weight)
     var raw = List[Float64](capacity=n)
     for _ in range(n):
         raw.append(base_score)
@@ -205,7 +234,7 @@ def train_with_valid(
     var best_loss = _mean_loss(valid_raw, valid_target, objective)
     var best_n_trees = 0
     for _ in range(params.n_estimators):
-        _fill_grad_hess(raw, target, objective, grad, hess)
+        _fill_grad_hess(raw, target, objective, sample_weight, grad, hess)
         var tree = grow_tree(data, grad, hess, params.tree)
         if tree.n_leaves == 1 and abs(tree.value[0]) < 1e-12:
             break
@@ -295,25 +324,34 @@ def train_multiclass(
     labels: List[Int],
     n_classes: Int,
     params: BoosterParams,
+    sample_weight: List[Float64] = [],
 ) raises -> MulticlassBooster:
-    """Train a softmax multiclass ensemble on labels in 0..n_classes-1."""
+    """Train a softmax multiclass ensemble on labels in 0..n_classes-1.
+    A non-empty sample_weight scales each row's gradient and hessian and
+    weights the class priors; a row with weight zero is ignored."""
     if len(labels) != data.n_rows:
         raise Error("labels length must equal n_rows")
     if n_classes < 2:
         raise Error("n_classes must be at least 2")
+    _check_sample_weight(sample_weight, data.n_rows)
     var n = data.n_rows
 
-    # Base scores are log priors.
-    var counts = List[Int](capacity=n_classes)
+    # Base scores are log priors (weighted when sample_weight is given).
+    var class_w = List[Float64](capacity=n_classes)
     for _ in range(n_classes):
-        counts.append(0)
+        class_w.append(0.0)
+    var total_w = 0.0
     for r in range(n):
         if labels[r] < 0 or labels[r] >= n_classes:
             raise Error("label out of range")
-        counts[labels[r]] += 1
+        var w = sample_weight[r] if len(sample_weight) > 0 else 1.0
+        class_w[labels[r]] += w
+        total_w += w
+    if total_w <= 0.0:
+        raise Error("sample_weight must have a positive sum")
     var base_scores = List[Float64](capacity=n_classes)
     for k in range(n_classes):
-        base_scores.append(log(_clamp_prob(Float64(counts[k]) / Float64(n))))
+        base_scores.append(log(_clamp_prob(class_w[k] / total_w)))
 
     # Row-major raw scores and softmax scratch: raw[r * n_classes + k].
     var raw = List[Float64](capacity=n * n_classes)
@@ -340,12 +378,13 @@ def train_multiclass(
             for r in range(n):
                 var p = prob[r * n_classes + k]
                 var y = 1.0 if labels[r] == k else 0.0
-                grad.append(p - y)
+                var w = sample_weight[r] if len(sample_weight) > 0 else 1.0
+                grad.append(w * (p - y))
                 # LightGBM/XGBoost softmax hessian: 2 * p * (1 - p), floored.
                 var h = 2.0 * p * (1.0 - p)
                 if h < 1e-16:
                     h = 1e-16
-                hess.append(h)
+                hess.append(w * h)
             var tree = grow_tree(data, grad, hess, params.tree)
             if tree.n_leaves > 1 or abs(tree.value[0]) >= 1e-12:
                 made_progress = True
@@ -374,12 +413,14 @@ def train_multiclass_with_valid(
     params: BoosterParams,
     early_stopping_rounds: Int,
     min_delta: Float64 = 0.0,
+    sample_weight: List[Float64] = [],
 ) raises -> MulticlassBooster:
     """Train a softmax multiclass ensemble with validation-set early
     stopping. Stops when the validation multiclass log loss has not
     improved by more than min_delta for early_stopping_rounds consecutive
     rounds and truncates the ensemble to its best round (a round is one
-    tree per class)."""
+    tree per class). sample_weight applies to training rows only; the
+    validation loss is unweighted."""
     if len(labels) != data.n_rows:
         raise Error("labels length must equal n_rows")
     if len(valid_labels) != valid_data.n_rows:
@@ -390,23 +431,30 @@ def train_multiclass_with_valid(
         raise Error("n_classes must be at least 2")
     if early_stopping_rounds < 1:
         raise Error("early_stopping_rounds must be positive")
+    _check_sample_weight(sample_weight, data.n_rows)
     var n = data.n_rows
     var n_valid = valid_data.n_rows
 
-    # Base scores are log priors of the TRAINING labels.
-    var counts = List[Int](capacity=n_classes)
+    # Base scores are log priors of the TRAINING labels (weighted when
+    # sample_weight is given).
+    var class_w = List[Float64](capacity=n_classes)
     for _ in range(n_classes):
-        counts.append(0)
+        class_w.append(0.0)
+    var total_w = 0.0
     for r in range(n):
         if labels[r] < 0 or labels[r] >= n_classes:
             raise Error("label out of range")
-        counts[labels[r]] += 1
+        var w = sample_weight[r] if len(sample_weight) > 0 else 1.0
+        class_w[labels[r]] += w
+        total_w += w
+    if total_w <= 0.0:
+        raise Error("sample_weight must have a positive sum")
     for r in range(n_valid):
         if valid_labels[r] < 0 or valid_labels[r] >= n_classes:
             raise Error("valid label out of range")
     var base_scores = List[Float64](capacity=n_classes)
     for k in range(n_classes):
-        base_scores.append(log(_clamp_prob(Float64(counts[k]) / Float64(n))))
+        base_scores.append(log(_clamp_prob(class_w[k] / total_w)))
 
     # Row-major raw scores for both sets: raw[r * n_classes + k].
     var raw = List[Float64](capacity=n * n_classes)
@@ -440,11 +488,12 @@ def train_multiclass_with_valid(
             for r in range(n):
                 var p = prob[r * n_classes + k]
                 var y = 1.0 if labels[r] == k else 0.0
-                grad.append(p - y)
+                var w = sample_weight[r] if len(sample_weight) > 0 else 1.0
+                grad.append(w * (p - y))
                 var h = 2.0 * p * (1.0 - p)
                 if h < 1e-16:
                     h = 1e-16
-                hess.append(h)
+                hess.append(w * h)
             var tree = grow_tree(data, grad, hess, params.tree)
             if tree.n_leaves > 1 or abs(tree.value[0]) >= 1e-12:
                 made_progress = True

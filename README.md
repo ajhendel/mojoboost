@@ -34,6 +34,9 @@ with tests
   truncating to the best round
 - evaluation metrics: RMSE, log loss, accuracy, and ROC AUC with
   sklearn-matching tie handling
+- sample weights for every objective, LightGBM semantics (weighted
+  gradients, hessians, and base scores; zero-weight rows are ignored)
+- split-count feature importance
 
 ```mojo
 from mojoboost import BINARY_LOGISTIC, BoosterParams, TreeParams, fit
