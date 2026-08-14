@@ -4,10 +4,18 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
+# macOS runners are intentionally absent: Apple-silicon runners report an
+# accelerator at compile time but lack the Metal toolchain, so the GPU
+# equivalence test cannot build there. osx-arm64 is validated locally.
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - uses: prefix-dev/setup-pixi@v0.10.1
@@ -15,3 +23,23 @@ jobs:
           cache: true
       - name: Run tests
         run: pixi run test
+
+  # Manual benchmark profiles (workflow_dispatch) on x86-64 and ARM64.
+  # lscpu flags show whether the x86 runner has avx2/avx512f, which is the
+  # input for any future width-specific fast path.
+  bench:
+    if: github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: prefix-dev/setup-pixi@v0.10.1
+        with:
+          cache: true
+      - name: CPU info
+        run: lscpu | grep -iE 'model name|architecture|^flags' || true
+      - name: Histogram benchmark
+        run: pixi run bench-hist 200000 100 10
