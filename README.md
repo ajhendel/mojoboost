@@ -1,5 +1,7 @@
 # mojoboost
 
+[![CI](https://github.com/ajhendel/mojoboost/actions/workflows/ci.yml/badge.svg)](https://github.com/ajhendel/mojoboost/actions/workflows/ci.yml)
+
 Gradient boosted decision trees in [Mojo](https://www.modular.com/mojo).
 
 mojoboost is a from-scratch GBDT library in the LightGBM family. It uses
