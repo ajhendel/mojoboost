@@ -7,6 +7,14 @@ next to this file). numpy is used when available; plain Python sequences
     from mojoboost import MojoBoostRegressor
     model = MojoBoostRegressor().fit(X, y)
     pred = model.predict(X)
+
+Estimators take `device="cpu"` (the default and the dependable backend),
+`device="gpu"`, or `device="auto"`. `"gpu"` raises when no accelerator is
+available or when the GPU path does not cover the workload, rather than
+falling back silently; `"auto"` picks a backend for you and currently
+always picks the CPU. `gpu_available()` reports whether this build can
+train on an accelerator. Fitting records the backend that ran on
+`device_`. See src/mojoboost/device.mojo for the full policy.
 """
 
 import array as _array
@@ -21,7 +29,9 @@ except ImportError:
 # Keep in sync with python/pyproject.toml.
 __version__ = "0.1.0"
 
-__all__ = ["MojoBoostRegressor", "MojoBoostClassifier"]
+__all__ = ["MojoBoostRegressor", "MojoBoostClassifier", "gpu_available"]
+
+_DEVICES = ("cpu", "gpu", "auto")
 
 _SQUARED_ERROR = 0
 _BINARY_LOGISTIC = 1
@@ -84,6 +94,12 @@ def _finish(buf):
     return buf if _np is not None else list(buf)
 
 
+def gpu_available():
+    """True when this build can train on an accelerator. False on a
+    CPU-only build and when `MOJOBOOST_DISABLE_GPU=1` is set."""
+    return bool(_mojoboost.gpu_available())
+
+
 class _Base:
     """Shared hyperparameters, mojoboost defaults (LightGBM-matched)."""
 
@@ -94,30 +110,56 @@ class _Base:
         n_estimators=100,
         min_data_in_leaf=20,
         lambda_l2=1.0,
+        lambda_l1=0.0,
         min_child_hess=1e-3,
         max_bin=255,
+        device="cpu",
     ):
         self.num_leaves = num_leaves
         self.learning_rate = learning_rate
         self.n_estimators = n_estimators
         self.min_data_in_leaf = min_data_in_leaf
         self.lambda_l2 = lambda_l2
+        self.lambda_l1 = lambda_l1
         self.min_child_hess = min_child_hess
         self.max_bin = max_bin
+        self.device = device
         self._model = None
 
-    def _params(self, sample_weight_addr):
+    def _params(self, sample_weight_addr, device):
+        if float(self.lambda_l1) < 0.0:
+            raise ValueError("lambda_l1 must be nonnegative")
         return {
             "num_leaves": int(self.num_leaves),
             "learning_rate": float(self.learning_rate),
             "n_estimators": int(self.n_estimators),
             "min_data_in_leaf": int(self.min_data_in_leaf),
             "lambda_l2": float(self.lambda_l2),
+            "lambda_l1": float(self.lambda_l1),
             "min_child_hess": float(self.min_child_hess),
             "max_bin": int(self.max_bin),
             "sample_weight_addr": int(sample_weight_addr),
             "alpha": float(getattr(self, "alpha", 0.9)),
+            "device": device,
         }
+
+    def _resolve_device(self, n_rows, n_features, n_outputs):
+        """The backend that will actually run, "cpu" or "gpu". Raises
+        ValueError for an unknown `device` and RuntimeError when "gpu" is
+        requested but unavailable or unsupported; "gpu" never falls back to
+        the CPU."""
+        device = self.device
+        if not isinstance(device, str) or device.lower() not in _DEVICES:
+            raise ValueError(
+                f"unknown device {device!r}; expected one of "
+                + ", ".join(_DEVICES)
+            )
+        try:
+            return _mojoboost.resolve_device(
+                device.lower(), int(n_rows), int(n_features), int(n_outputs)
+            )
+        except Exception as exc:
+            raise RuntimeError(str(exc)) from None
 
     def _weight_buffer(self, sample_weight, n_rows):
         """Validated weight buffer and its address (buffer must stay
@@ -172,15 +214,17 @@ class MojoBoostRegressor(_Base):
         Xb, n_rows, n_features = _as_column_major(X)
         yb = _as_f64_vector(y, n_rows)
         wb, w_addr = self._weight_buffer(sample_weight, n_rows)
+        device = self._resolve_device(n_rows, n_features, 1)
         self._model = _mojoboost.fit(
             _addr(Xb),
             n_rows,
             n_features,
             _addr(yb),
             objective,
-            self._params(w_addr),
+            self._params(w_addr, device),
         )
         self.n_features_in_ = n_features
+        self.device_ = device
         return self
 
     def predict(self, X):
@@ -198,6 +242,9 @@ class MojoBoostRegressor(_Base):
 
     @classmethod
     def load(cls, path):
+        """Load a saved model. The training device is not part of the model
+        file (the ensemble is the same either way), so a loaded estimator
+        has no `device_`; `device` governs the next `fit`."""
         est = cls()
         est._model = _mojoboost.load(str(path))
         return est
@@ -205,7 +252,9 @@ class MojoBoostRegressor(_Base):
 
 class MojoBoostClassifier(_Base):
     """Binary (logistic) for 2 classes, softmax for more. Labels must be
-    integers 0..n_classes-1."""
+    integers 0..n_classes-1. Multiclass training is CPU-only, so
+    `device="gpu"` raises for 3 or more classes and `device="auto"`
+    resolves to the CPU."""
 
     def fit(self, X, y, sample_weight=None):
         Xb, n_rows, n_features = _as_column_major(X)
@@ -218,6 +267,7 @@ class MojoBoostClassifier(_Base):
                 "with at least 2 classes present"
             )
         wb, w_addr = self._weight_buffer(sample_weight, n_rows)
+        device = self._resolve_device(n_rows, n_features, n_classes)
         if n_classes == 2:
             self._model = _mojoboost.fit(
                 _addr(Xb),
@@ -225,7 +275,7 @@ class MojoBoostClassifier(_Base):
                 n_features,
                 _addr(yb),
                 _BINARY_LOGISTIC,
-                self._params(w_addr),
+                self._params(w_addr, device),
             )
         else:
             self._model = _mojoboost.fit_multiclass(
@@ -234,10 +284,11 @@ class MojoBoostClassifier(_Base):
                 n_features,
                 _addr(yb),
                 n_classes,
-                self._params(w_addr),
+                self._params(w_addr, device),
             )
         self.n_classes_ = n_classes
         self.n_features_in_ = n_features
+        self.device_ = device
         return self
 
     def predict_proba(self, X):
@@ -275,6 +326,8 @@ class MojoBoostClassifier(_Base):
 
     @classmethod
     def load(cls, path):
+        """Load a saved model. As with the regressor, the training device
+        is not stored, so a loaded estimator has no `device_`."""
         est = cls()
         try:
             est._model = _mojoboost.load(str(path))

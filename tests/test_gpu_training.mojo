@@ -197,5 +197,45 @@ def test_gpu_training_is_deterministic() raises:
             )
 
 
+def test_gpu_l1_regularized_training_matches_cpu() raises:
+    """`lambda_l1` is applied host-side to downloaded histogram sums, so the
+    GPU trainer must reproduce the CPU trainer's regularized splits and
+    shrunken leaf values, not just the unregularized ones."""
+    comptime if not has_accelerator():
+        print("skipped: no accelerator")
+    else:
+        var n_rows = 3_000
+        var n_features = 6
+        var features = _make_features(n_rows, n_features)
+        var target = _regression_target(features, n_rows)
+        var data = bin_equal_width(features, n_rows, n_features, 64)
+
+        var l1 = BoosterParams(15, 0.1, TreeParams(15, 20, 1.0, 1e-3, 2.0))
+        var cpu = train(data, target, SQUARED_ERROR, l1)
+        var gpu = train_gpu(data, target, SQUARED_ERROR, l1)
+
+        assert_equal(len(cpu.trees), len(gpu.trees))
+        for r in range(n_rows):
+            assert_true(
+                abs(cpu.predict_row(data, r) - gpu.predict_row(data, r))
+                <= 1e-3
+            )
+
+        # The regularizer must actually bite: leaf values shrink toward
+        # zero, so the regularized fit moves less far from the base score.
+        var plain = BoosterParams(15, 0.1, TreeParams(15, 20, 1.0, 1e-3))
+        var gpu_plain = train_gpu(data, target, SQUARED_ERROR, plain)
+        var l1_travel = 0.0
+        var plain_travel = 0.0
+        for r in range(n_rows):
+            l1_travel += abs(
+                gpu.predict_raw_row(data, r) - gpu.base_score
+            )
+            plain_travel += abs(
+                gpu_plain.predict_raw_row(data, r) - gpu_plain.base_score
+            )
+        assert_true(l1_travel < plain_travel)
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

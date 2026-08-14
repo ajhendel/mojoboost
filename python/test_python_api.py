@@ -12,7 +12,11 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from mojoboost import MojoBoostClassifier, MojoBoostRegressor
+from mojoboost import (
+    MojoBoostClassifier,
+    MojoBoostRegressor,
+    gpu_available,
+)
 
 
 def _rand_stream(seed):
@@ -146,6 +150,150 @@ def test_regression_objectives():
     print(f"regression objectives ok (q90 coverage {frac_below:.3f})")
 
 
+def test_lambda_l1():
+    X, y = make_regression(600)
+    mean_y = sum(y) / len(y)
+
+    # The default is 0, so passing it explicitly must not change the fit.
+    default = MojoBoostRegressor(n_estimators=30).fit(X, y)
+    explicit = MojoBoostRegressor(n_estimators=30, lambda_l1=0.0).fit(X, y)
+    pa = list(default.predict(X))
+    pb = list(explicit.predict(X))
+    assert all(a == b for a, b in zip(pa, pb)), "lambda_l1=0 changed the fit"
+
+    # A moderate penalty shrinks every leaf's Newton step, so the fitted
+    # predictions stay closer to the base score and fit the target less well.
+    reg = MojoBoostRegressor(n_estimators=30, lambda_l1=5.0).fit(X, y)
+    pc = list(reg.predict(X))
+    assert any(a != c for a, c in zip(pa, pc)), "lambda_l1 had no effect"
+    travel_plain = sum(abs(p - mean_y) for p in pa)
+    travel_reg = sum(abs(p - mean_y) for p in pc)
+    assert travel_reg < travel_plain, "lambda_l1 did not shrink the fit"
+    mse_plain = sum((p - t) ** 2 for p, t in zip(pa, y)) / len(y)
+    mse_reg = sum((p - t) ** 2 for p, t in zip(pc, y)) / len(y)
+    assert mse_reg > mse_plain, "lambda_l1 did not regularize the train fit"
+
+    # A penalty larger than any gradient sum zeroes every candidate gain and
+    # the root value, so training stops with an empty ensemble that predicts
+    # the base score (the target mean) everywhere.
+    huge = MojoBoostRegressor(n_estimators=30, lambda_l1=1e6).fit(X, y)
+    for p in list(huge.predict(X))[:50]:
+        assert abs(p - mean_y) < 1e-9, f"expected base score, got {p}"
+    print(f"lambda_l1 ok (train MSE {mse_plain:.5f} -> {mse_reg:.5f})")
+
+
+def test_device_cpu_and_auto():
+    X, y = make_regression(400)
+    cpu = MojoBoostRegressor(n_estimators=20, device="cpu").fit(X, y)
+    assert cpu.device_ == "cpu"
+
+    # auto resolves to the CPU today (the size heuristic ships disabled),
+    # so it must be bit-identical to an explicit cpu fit.
+    auto = MojoBoostRegressor(n_estimators=20, device="auto").fit(X, y)
+    assert auto.device_ == "cpu", f"auto chose {auto.device_}"
+    assert all(
+        a == b for a, b in zip(cpu.predict(X), auto.predict(X))
+    ), "auto and cpu disagree"
+
+    # The default is cpu, and it survives a refit.
+    default = MojoBoostRegressor(n_estimators=20).fit(X, y)
+    assert default.device == "cpu" and default.device_ == "cpu"
+    assert all(a == b for a, b in zip(cpu.predict(X), default.predict(X)))
+
+    clf = MojoBoostClassifier(n_estimators=20, device="auto").fit(
+        *make_classification(400, 3)
+    )
+    assert clf.device_ == "cpu"
+    print("device cpu/auto ok")
+
+
+def test_device_gpu():
+    X, y = make_regression(300)
+    if not gpu_available():
+        try:
+            MojoBoostRegressor(n_estimators=10, device="gpu").fit(X, y)
+            raise AssertionError("gpu without an accelerator should raise")
+        except RuntimeError:
+            pass
+        print("device gpu ok (no accelerator: explicit gpu raises)")
+        return
+
+    gpu = MojoBoostRegressor(n_estimators=10, device="gpu").fit(X, y)
+    assert gpu.device_ == "gpu"
+    cpu = MojoBoostRegressor(n_estimators=10, device="cpu").fit(X, y)
+    # GPU histograms are Float32 fixed-point, so agreement with the Float64
+    # CPU trainer is tolerance-based (see src/mojoboost/train_gpu.mojo).
+    worst = max(
+        abs(a - b) for a, b in zip(gpu.predict(X), cpu.predict(X))
+    )
+    assert worst <= 1e-3, f"gpu and cpu predictions differ by {worst}"
+
+    # Multiclass has no GPU path: it raises instead of falling back.
+    Xc, yc = make_classification(300, 3)
+    try:
+        MojoBoostClassifier(n_estimators=5, device="gpu").fit(Xc, yc)
+        raise AssertionError("multiclass on gpu should raise")
+    except RuntimeError:
+        pass
+    print(f"device gpu ok (max |gpu - cpu| {worst:.2e})")
+
+
+def test_device_gpu_unavailable():
+    """MOJOBOOST_DISABLE_GPU makes the library report no accelerator, so the
+    unavailable path is covered on GPU machines too."""
+    X, y = make_regression(200)
+    previous = os.environ.get("MOJOBOOST_DISABLE_GPU")
+    os.environ["MOJOBOOST_DISABLE_GPU"] = "1"
+    try:
+        assert not gpu_available()
+        try:
+            MojoBoostRegressor(n_estimators=5, device="gpu").fit(X, y)
+            raise AssertionError("unavailable gpu should raise")
+        except RuntimeError:
+            pass
+        # auto stays usable and picks the CPU.
+        auto = MojoBoostRegressor(n_estimators=5, device="auto").fit(X, y)
+        assert auto.device_ == "cpu"
+    finally:
+        if previous is None:
+            del os.environ["MOJOBOOST_DISABLE_GPU"]
+        else:
+            os.environ["MOJOBOOST_DISABLE_GPU"] = previous
+    print("device unavailable-gpu ok")
+
+
+def test_device_invalid():
+    X, y = make_regression(100)
+    for bad in ("cuda", "CPU", "", None, 1, "gpu "):
+        try:
+            MojoBoostRegressor(n_estimators=5, device=bad).fit(X, y)
+            raise AssertionError(f"device={bad!r} should raise")
+        except ValueError:
+            pass
+    print("device validation ok")
+
+
+def test_device_serialization():
+    """The device is a training choice, not part of the model, so files
+    round-trip bit-exactly and carry no device."""
+    X, y = make_regression(300)
+    devices = ["cpu"] + (["gpu"] if gpu_available() else [])
+    for device in devices:
+        model = MojoBoostRegressor(n_estimators=10, device=device).fit(X, y)
+        assert model.device_ == device
+        pred = list(model.predict(X))
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, f"{device}.mbst")
+            model.save(path)
+            loaded = MojoBoostRegressor.load(path)
+            assert list(loaded.predict(X)) == pred, "round-trip not exact"
+            assert not hasattr(loaded, "device_"), (
+                "a loaded model should carry no training device"
+            )
+            assert loaded.device == "cpu", "load() defaults device to cpu"
+    print(f"device serialization ok ({', '.join(devices)})")
+
+
 def test_input_validation():
     model = MojoBoostRegressor()
     try:
@@ -162,6 +310,7 @@ def test_input_validation():
         dict(objective="l2"),
         dict(objective="huber", alpha=0.0),
         dict(objective="quantile", alpha=1.5),
+        dict(lambda_l1=-1.0),
     ):
         try:
             MojoBoostRegressor(**bad).fit([[1.0], [2.0]], [1.0, 2.0])
@@ -190,5 +339,11 @@ if __name__ == "__main__":
     test_multiclass_classifier()
     test_sample_weight()
     test_regression_objectives()
+    test_lambda_l1()
     test_input_validation()
+    test_device_cpu_and_auto()
+    test_device_gpu()
+    test_device_gpu_unavailable()
+    test_device_invalid()
+    test_device_serialization()
     print("all python API tests passed")

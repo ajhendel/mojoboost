@@ -5,6 +5,9 @@ Objectives: squared error (regression), binary logistic (labels in {0, 1}),
 poisson counts, huber, quantile, L1 (mean absolute error), and multiclass
 softmax (labels in 0..n_classes-1, via train_multiclass).
 
+Caller-supplied objectives live in objective.mojo (`train_custom`); a
+booster trained that way carries the CUSTOM objective code.
+
 QUANTILE and L1 follow LightGBM's RenewTreeOutput: after each tree is
 grown, every leaf's Newton value is replaced by the alpha-percentile
 (median for L1) of the residuals of the rows in that leaf, and shrinkage
@@ -17,6 +20,19 @@ from std.math import exp, log
 
 from .binning import BinnedMatrix
 from .metrics import _argsort
+from .bagging import (
+    BaggingParams,
+    bagging_enabled,
+    check_bagging,
+    refresh_bag,
+)
+from .goss import (
+    GossParams,
+    GossSelection,
+    apply_goss_scaling,
+    goss_round,
+    goss_select,
+)
 from .tree import Tree, TreeParams, grow_tree
 
 comptime SQUARED_ERROR = 0
@@ -25,6 +41,12 @@ comptime POISSON = 2
 comptime HUBER = 3
 comptime QUANTILE = 4
 comptime L1 = 5
+
+# Marks a booster trained through `train_custom` in objective.mojo. It is not
+# a built-in objective: `train` and `train_gpu` reject it, because the
+# gradients come from a caller-supplied callable rather than from
+# `_fill_grad_hess`. Predictions for it are raw scores (no known link).
+comptime CUSTOM = 6
 
 # LightGBM's poisson_max_delta_step: the hessian is exp(raw + this), which
 # caps the Newton step for rows with tiny predicted means.
@@ -111,6 +133,11 @@ def _clamp_prob(p: Float64) -> Float64:
 def _check_objective(
     objective: Int, target: List[Float64], alpha: Float64
 ) raises:
+    if objective == CUSTOM:
+        raise Error(
+            "custom objectives must be trained with train_custom (or"
+            " train_custom_with_valid / fit_custom / train_custom_gpu)"
+        )
     if (
         objective != SQUARED_ERROR
         and objective != BINARY_LOGISTIC
@@ -144,6 +171,18 @@ def _check_sample_weight(weights: List[Float64], n: Int) raises:
         total += weights[r]
     if total <= 0.0:
         raise Error("sample_weight must have a positive sum")
+
+
+def _check_goss(goss: GossParams, bagging: BaggingParams) raises:
+    """Validate the GOSS rates and reject GOSS together with row bagging.
+
+    Both strategies own the row list a tree is grown on, and LightGBM makes
+    them exclusive too: it silently turns bagging off under GOSS. mojoboost
+    raises instead, so a configuration that would quietly ignore half of
+    itself is reported."""
+    goss.validate()
+    if goss.enabled and bagging_enabled(bagging):
+        raise Error("goss and bagging cannot both be enabled")
 
 
 def _base_score(
@@ -281,18 +320,24 @@ def _renew_leaf_values(
     raw: List[Float64],
     weights: List[Float64],
     alpha: Float64,
+    bag: List[Int] = [],
 ) raises:
     """LightGBM's RenewTreeOutput for QUANTILE and L1: replace each leaf's
     Newton value with the alpha-percentile of the residuals
     (target - current raw score) of the rows in that leaf. Runs before
-    shrinkage, which then applies to the renewed value."""
+    shrinkage, which then applies to the renewed value.
+
+    A non-empty `bag` renews from bagged rows only, the rows the tree was
+    grown on; LightGBM likewise renews over its bagged partition."""
     var n_nodes = len(tree.feature)
     var leaf_residuals = List[List[Float64]]()
     var leaf_weights = List[List[Float64]]()
     for _ in range(n_nodes):
         leaf_residuals.append(List[Float64]())
         leaf_weights.append(List[Float64]())
-    for r in range(data.n_rows):
+    var n_used = len(bag) if len(bag) > 0 else data.n_rows
+    for i in range(n_used):
+        var r = bag[i] if len(bag) > 0 else i
         var node = tree.leaf_index_row(data, r)
         leaf_residuals[node].append(target[r] - raw[r])
         if len(weights) > 0:
@@ -335,7 +380,9 @@ struct Booster(Copyable, Movable):
 
     def predict_row(self, data: BinnedMatrix, row: Int) -> Float64:
         """Prediction on the response scale (probability for logistic,
-        expected count for poisson)."""
+        expected count for poisson). For CUSTOM this is the raw score:
+        the framework does not know the objective's inverse link, so the
+        caller applies it."""
         var raw = self.predict_raw_row(data, row)
         if self.objective == BINARY_LOGISTIC:
             return _sigmoid(raw)
@@ -365,6 +412,8 @@ def train(
     params: BoosterParams,
     sample_weight: List[Float64] = [],
     alpha: Float64 = 0.9,
+    bagging: BaggingParams = BaggingParams.disabled(),
+    goss: GossParams = GossParams.disabled(),
 ) raises -> Booster:
     """Train a boosted ensemble. `target` is the regression target for
     SQUARED_ERROR, HUBER, QUANTILE, and L1, {0, 1} labels for
@@ -372,11 +421,17 @@ def train(
     sample_weight scales each row's gradient and hessian, LightGBM style;
     a row with weight zero is ignored. `alpha` is the target quantile for
     QUANTILE and the huber transition point for HUBER (LightGBM's alpha,
-    default 0.9); other objectives ignore it."""
+    default 0.9); other objectives ignore it. `bagging` grows each tree on
+    a seeded row sample (see bagging.mojo); the base score and the
+    per-round score update stay on the full dataset. `goss` grows each tree
+    on a gradient-based sample instead (see goss.mojo), which the same row
+    list carries; the two samplers are mutually exclusive."""
     if len(target) != data.n_rows:
         raise Error("target length must equal n_rows")
     _check_objective(objective, target, alpha)
     _check_sample_weight(sample_weight, data.n_rows)
+    check_bagging(bagging)
+    _check_goss(goss, bagging)
 
     var n = data.n_rows
     var base_score = _base_score(target, objective, sample_weight, alpha)
@@ -387,19 +442,31 @@ def train(
     var trees = List[Tree]()
     var grad = List[Float64](capacity=n)
     var hess = List[Float64](capacity=n)
-    for _ in range(params.n_estimators):
+    var bag = List[Int]()
+    for i in range(params.n_estimators):
+        refresh_bag(bag, bagging, n, i)
         _fill_grad_hess(
             raw, target, objective, sample_weight, alpha, grad, hess
         )
-        var tree = grow_tree(data, grad, hess, params.tree)
+        goss_round(bag, grad, hess, goss, i, params.learning_rate)
+        var tree = grow_tree(data, grad, hess, params.tree, bag, i)
         if objective == QUANTILE:
-            _renew_leaf_values(tree, data, target, raw, sample_weight, alpha)
+            _renew_leaf_values(
+                tree, data, target, raw, sample_weight, alpha, bag
+            )
         elif objective == L1:
-            _renew_leaf_values(tree, data, target, raw, sample_weight, 0.5)
+            _renew_leaf_values(
+                tree, data, target, raw, sample_weight, 0.5, bag
+            )
 
         # A single-leaf tree with a near-zero value means the objective has
-        # converged; further rounds cannot make progress.
+        # converged; further rounds cannot make progress. Under bagging or
+        # GOSS one such tree only says this sample had nothing to give
+        # (every sampled row zero-weight, say), so the round is skipped and
+        # the next sample gets its turn.
         if tree.n_leaves == 1 and abs(tree.value[0]) < 1e-12:
+            if bagging_enabled(bagging) or goss.enabled:
+                continue
             break
 
         for r in range(n):
@@ -420,12 +487,18 @@ def train_with_valid(
     min_delta: Float64 = 0.0,
     sample_weight: List[Float64] = [],
     alpha: Float64 = 0.9,
+    bagging: BaggingParams = BaggingParams.disabled(),
+    goss: GossParams = GossParams.disabled(),
 ) raises -> Booster:
     """Train with validation-set early stopping. Stops when the validation
     loss (MSE / log loss / huber / pinball / MAE) has not improved by more
     than min_delta for early_stopping_rounds consecutive rounds and
     truncates the ensemble to its best round. sample_weight applies to
-    training rows only; the validation loss is unweighted."""
+    training rows only; the validation loss is unweighted. `bagging`
+    samples training rows per tree (see bagging.mojo); validation rows are
+    never bagged, so the early-stopping signal stays out of sample. `goss`
+    samples training rows by gradient magnitude instead (see goss.mojo) and
+    leaves the validation loss untouched in the same way."""
     if len(target) != data.n_rows:
         raise Error("target length must equal n_rows")
     if len(valid_target) != valid_data.n_rows:
@@ -436,6 +509,8 @@ def train_with_valid(
     if early_stopping_rounds < 1:
         raise Error("early_stopping_rounds must be positive")
     _check_sample_weight(sample_weight, data.n_rows)
+    check_bagging(bagging)
+    _check_goss(goss, bagging)
 
     var n = data.n_rows
     var base_score = _base_score(target, objective, sample_weight, alpha)
@@ -451,16 +526,27 @@ def train_with_valid(
     var hess = List[Float64](capacity=n)
     var best_loss = _mean_loss(valid_raw, valid_target, objective, alpha)
     var best_n_trees = 0
-    for _ in range(params.n_estimators):
+    var bag = List[Int]()
+    for i in range(params.n_estimators):
+        refresh_bag(bag, bagging, n, i)
         _fill_grad_hess(
             raw, target, objective, sample_weight, alpha, grad, hess
         )
-        var tree = grow_tree(data, grad, hess, params.tree)
+        goss_round(bag, grad, hess, goss, i, params.learning_rate)
+        var tree = grow_tree(data, grad, hess, params.tree, bag, i)
         if objective == QUANTILE:
-            _renew_leaf_values(tree, data, target, raw, sample_weight, alpha)
+            _renew_leaf_values(
+                tree, data, target, raw, sample_weight, alpha, bag
+            )
         elif objective == L1:
-            _renew_leaf_values(tree, data, target, raw, sample_weight, 0.5)
+            _renew_leaf_values(
+                tree, data, target, raw, sample_weight, 0.5, bag
+            )
+        # Under bagging or GOSS a degenerate tree indicts the sample, not
+        # the run.
         if tree.n_leaves == 1 and abs(tree.value[0]) < 1e-12:
+            if bagging_enabled(bagging) or goss.enabled:
+                continue
             break
 
         for r in range(n):
@@ -549,15 +635,19 @@ def train_multiclass(
     n_classes: Int,
     params: BoosterParams,
     sample_weight: List[Float64] = [],
+    bagging: BaggingParams = BaggingParams.disabled(),
 ) raises -> MulticlassBooster:
     """Train a softmax multiclass ensemble on labels in 0..n_classes-1.
     A non-empty sample_weight scales each row's gradient and hessian and
-    weights the class priors; a row with weight zero is ignored."""
+    weights the class priors; a row with weight zero is ignored. `bagging`
+    draws one bag per round and every class's tree in that round is grown
+    on it, so the per-class trees stay comparable."""
     if len(labels) != data.n_rows:
         raise Error("labels length must equal n_rows")
     if n_classes < 2:
         raise Error("n_classes must be at least 2")
     _check_sample_weight(sample_weight, data.n_rows)
+    check_bagging(bagging)
     var n = data.n_rows
 
     # Base scores are log priors (weighted when sample_weight is given).
@@ -589,7 +679,9 @@ def train_multiclass(
     var trees = List[Tree]()
     var grad = List[Float64](capacity=n)
     var hess = List[Float64](capacity=n)
-    for _ in range(params.n_estimators):
+    var bag = List[Int]()
+    for i in range(params.n_estimators):
+        refresh_bag(bag, bagging, n, i)
         for r in range(n):
             for k in range(n_classes):
                 prob[r * n_classes + k] = raw[r * n_classes + k]
@@ -609,7 +701,11 @@ def train_multiclass(
                 if h < 1e-16:
                     h = 1e-16
                 hess.append(w * h)
-            var tree = grow_tree(data, grad, hess, params.tree)
+            # Feature subsampling draws once per tree, so each class's tree
+            # in a round gets its own feature set.
+            var tree = grow_tree(
+                data, grad, hess, params.tree, bag, i * n_classes + k
+            )
             if tree.n_leaves > 1 or abs(tree.value[0]) >= 1e-12:
                 made_progress = True
             for r in range(n):
@@ -618,9 +714,13 @@ def train_multiclass(
                 )
             trees.append(tree^)
 
+        # No class made progress: with bagging that is a statement about
+        # this bag, so the round is dropped and the next bag gets its turn.
         if not made_progress:
             for _ in range(n_classes):
                 _ = trees.pop()
+            if bagging_enabled(bagging):
+                continue
             break
 
     return MulticlassBooster(
@@ -638,13 +738,15 @@ def train_multiclass_with_valid(
     early_stopping_rounds: Int,
     min_delta: Float64 = 0.0,
     sample_weight: List[Float64] = [],
+    bagging: BaggingParams = BaggingParams.disabled(),
 ) raises -> MulticlassBooster:
     """Train a softmax multiclass ensemble with validation-set early
     stopping. Stops when the validation multiclass log loss has not
     improved by more than min_delta for early_stopping_rounds consecutive
     rounds and truncates the ensemble to its best round (a round is one
     tree per class). sample_weight applies to training rows only; the
-    validation loss is unweighted."""
+    validation loss is unweighted. `bagging` samples training rows per
+    round; validation rows are never bagged."""
     if len(labels) != data.n_rows:
         raise Error("labels length must equal n_rows")
     if len(valid_labels) != valid_data.n_rows:
@@ -656,6 +758,7 @@ def train_multiclass_with_valid(
     if early_stopping_rounds < 1:
         raise Error("early_stopping_rounds must be positive")
     _check_sample_weight(sample_weight, data.n_rows)
+    check_bagging(bagging)
     var n = data.n_rows
     var n_valid = valid_data.n_rows
 
@@ -699,7 +802,9 @@ def train_multiclass_with_valid(
     var best_loss = _multiclass_mean_loss(valid_raw, valid_labels, n_classes)
     var best_n_rounds = 0
     var n_rounds = 0
-    for _ in range(params.n_estimators):
+    var bag = List[Int]()
+    for i in range(params.n_estimators):
+        refresh_bag(bag, bagging, n, i)
         for r in range(n):
             for k in range(n_classes):
                 prob[r * n_classes + k] = raw[r * n_classes + k]
@@ -718,7 +823,11 @@ def train_multiclass_with_valid(
                 if h < 1e-16:
                     h = 1e-16
                 hess.append(w * h)
-            var tree = grow_tree(data, grad, hess, params.tree)
+            # Feature subsampling draws once per tree, so each class's tree
+            # in a round gets its own feature set.
+            var tree = grow_tree(
+                data, grad, hess, params.tree, bag, i * n_classes + k
+            )
             if tree.n_leaves > 1 or abs(tree.value[0]) >= 1e-12:
                 made_progress = True
             for r in range(n):
@@ -731,9 +840,14 @@ def train_multiclass_with_valid(
                 )
             trees.append(tree^)
 
+        # Popped trees are all single-leaf with value ~0, so the score
+        # updates above were no-ops. Under bagging the next bag still gets
+        # its turn.
         if not made_progress:
             for _ in range(n_classes):
                 _ = trees.pop()
+            if bagging_enabled(bagging):
+                continue
             break
         n_rounds += 1
 

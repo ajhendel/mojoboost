@@ -1,0 +1,716 @@
+MOJOBOOST CLAUDE CODE TASKS
+===========================
+
+Each task below is self-contained. Copy and send only one task at a time.
+Do not run tasks concurrently because several touch the same central types,
+serialization format, bindings, and training loops.
+
+
+TASK 1: STABILIZE END-TO-END GPU TRAINING
+=========================================
+
+Work in the `mojoboost` repository. Inspect the current implementation and
+git status before editing because the project is evolving quickly. Preserve
+unrelated work and do not rewrite existing APIs unnecessarily. Follow the
+existing CPU/GPU backend boundary. Add focused equivalence and validation
+tests, update serialization when model structure changes, update the Python
+bindings when public parameters change, run the complete Mojo and Python
+suites, run `git diff --check`, and do not commit unless asked. Match LightGBM
+semantics where practical, but document intentional differences. Do not claim
+performance without reproducible benchmarks.
+
+Review the current `train_gpu.mojo`, expanded `histogram_gpu.mojo`, and
+`test_gpu_training.mojo`. Complete and stabilize the end-to-end GPU path.
+
+Requirements:
+
+- Keep binned features and leaf assignments device-resident for the training
+  session.
+- Upload gradients and Hessians only once per boosting round.
+- Perform row partitioning and child histogram construction on the GPU.
+- Preserve sibling histogram subtraction.
+- Support every objective that can correctly share the existing
+  gradient/Hessian interface.
+- Add explicit errors for unsupported combinations.
+- Export the public GPU training API from the package.
+- Add the GPU suite to the appropriate Pixi test task without breaking
+  CPU-only CI.
+- Add CPU/GPU model-quality, determinism, sample-weight, and edge-case tests.
+- Benchmark complete CPU and GPU training, including setup and transfers.
+
+Do not optimize specifically for Apple M4. Treat the existing
+one-threadgroup-per-feature kernel as a portable correctness baseline.
+
+
+TASK 2: PUBLIC DEVICE SELECTION
+===============================
+
+Work in the `mojoboost` repository. Inspect the current implementation and
+git status before editing because the project is evolving quickly. Preserve
+unrelated work and do not rewrite existing APIs unnecessarily. Follow the
+existing CPU/GPU backend boundary. Add focused equivalence and validation
+tests, update serialization when model structure changes, update the Python
+bindings when public parameters change, run the complete Mojo and Python
+suites, run `git diff --check`, and do not commit unless asked. Match LightGBM
+semantics where practical, but document intentional differences. Do not claim
+performance without reproducible benchmarks.
+
+Add a coherent backend-selection API across Mojo and Python:
+
+- `device="cpu"`
+- `device="gpu"`
+- `device="auto"`
+
+CPU should remain the dependable implementation. Explicit `gpu` must raise
+when unavailable rather than silently falling back. `auto` may initially
+choose CPU unless the complete GPU path is supported and a conservative
+workload heuristic selects it.
+
+Record the selected backend on fitted Python estimators. Add tests for
+explicit CPU, explicit GPU, unavailable GPU, auto selection, serialization,
+and invalid values. Do not use M4-specific heuristics.
+
+
+TASK 3: GPU SCALING ACROSS ARCHITECTURES
+========================================
+
+Work in the `mojoboost` repository. Inspect the current implementation and
+git status before editing because the project is evolving quickly. Preserve
+unrelated work and do not rewrite existing APIs unnecessarily. Follow the
+existing CPU/GPU backend boundary. Add focused equivalence and validation
+tests, update serialization when model structure changes, update the Python
+bindings when public parameters change, run the complete Mojo and Python
+suites, run `git diff --check`, and do not commit unless asked. Match LightGBM
+semantics where practical, but document intentional differences. Do not claim
+performance without reproducible benchmarks.
+
+Replace or augment the one-threadgroup-per-feature GPU histogram strategy
+with a scalable design:
+
+- Multiple threadgroups per feature
+- Partial histograms per threadgroup
+- A deterministic reduction stage
+- Compile-time or runtime tiling parameters derived from device capabilities
+- A portable baseline shared across Metal, CUDA, and HIP
+
+Preserve the current correctness implementation as a fallback until the new
+path is fully validated. Benchmark small, medium, and large row/feature
+shapes. Report kernel time separately from conversion, upload, download, and
+setup time.
+
+
+TASK 4: MISSING-VALUE ROUTING
+=============================
+
+Work in the `mojoboost` repository. Inspect the current implementation and
+git status before editing because the project is evolving quickly. Preserve
+unrelated work and do not rewrite existing APIs unnecessarily. Follow the
+existing CPU/GPU backend boundary. Add focused equivalence and validation
+tests, update serialization when model structure changes, update the Python
+bindings when public parameters change, run the complete Mojo and Python
+suites, run `git diff --check`, and do not commit unless asked. Match LightGBM
+semantics where practical, but document intentional differences. Do not claim
+performance without reproducible benchmarks.
+
+Add native missing-value support for numerical features.
+
+Requirements:
+
+- Reserve an explicit bin representation for missing values.
+- Persist missing-value behavior in the bin mapper and serialized model.
+- During split search, evaluate both "missing goes left" and "missing goes
+  right."
+- Store the chosen default direction in every internal tree node.
+- Apply the same rule during training, raw prediction, binned prediction, CPU
+  execution, and GPU row partitioning.
+- Define behavior for `NaN`, positive infinity, and negative infinity.
+- Add tests where the missingness pattern itself is predictive.
+- Compare representative predictions and split behavior with LightGBM.
+
+Do not silently map `NaN` through ordinary quantile comparisons.
+
+
+TASK 5: MAXIMUM TREE DEPTH
+==========================
+
+Work in the `mojoboost` repository. Inspect the current implementation and
+git status before editing because the project is evolving quickly. Preserve
+unrelated work and do not rewrite existing APIs unnecessarily. Follow the
+existing CPU/GPU backend boundary. Add focused equivalence and validation
+tests, update serialization when model structure changes, update the Python
+bindings when public parameters change, run the complete Mojo and Python
+suites, run `git diff --check`, and do not commit unless asked. Match LightGBM
+semantics where practical, but document intentional differences. Do not claim
+performance without reproducible benchmarks.
+
+Add `max_depth` while preserving leaf-wise growth.
+
+- `max_depth <= 0` should mean unlimited, matching LightGBM-style semantics
+  where practical.
+- Track node depth during tree growth.
+- Prevent splitting a leaf at the depth limit.
+- Support CPU and GPU tree growth identically.
+- Add it to `TreeParams`, Python estimators, serialization if necessary, and
+  documentation.
+- Test unbalanced leaf-wise trees, `max_depth=1`, unlimited depth, and its
+  interaction with `num_leaves`.
+
+
+TASK 6: L1 SPLIT REGULARIZATION
+===============================
+
+Work in the `mojoboost` repository. Inspect the current implementation and
+git status before editing because the project is evolving quickly. Preserve
+unrelated work and do not rewrite existing APIs unnecessarily. Follow the
+existing CPU/GPU backend boundary. Add focused equivalence and validation
+tests, update serialization when model structure changes, update the Python
+bindings when public parameters change, run the complete Mojo and Python
+suites, run `git diff --check`, and do not commit unless asked. Match LightGBM
+semantics where practical, but document intentional differences. Do not claim
+performance without reproducible benchmarks.
+
+Add LightGBM-style `lambda_l1` regularization.
+
+Apply soft-thresholding to gradient sums consistently in:
+
+- Split-gain calculation
+- Leaf-value calculation
+- CPU tree growth
+- GPU-assisted tree growth
+
+Expose it through Mojo parameters and Python estimators. Add analytical unit
+tests with known gradient/Hessian totals, zero and nonzero regularization,
+weighted examples, and CPU/GPU equivalence.
+
+
+TASK 7: FEATURE SUBSAMPLING
+===========================
+
+Work in the `mojoboost` repository. Inspect the current implementation and
+git status before editing because the project is evolving quickly. Preserve
+unrelated work and do not rewrite existing APIs unnecessarily. Follow the
+existing CPU/GPU backend boundary. Add focused equivalence and validation
+tests, update serialization when model structure changes, update the Python
+bindings when public parameters change, run the complete Mojo and Python
+suites, run `git diff --check`, and do not commit unless asked. Match LightGBM
+semantics where practical, but document intentional differences. Do not claim
+performance without reproducible benchmarks.
+
+Implement deterministic feature subsampling.
+
+Support:
+
+- Per-tree feature fraction
+- Optionally per-node feature fraction as a separate parameter
+- Reproducible seeded selection
+- No replacement within a selection
+
+Split search must ignore excluded features without copying the complete
+dataset. CPU and GPU paths must consume the same selected-feature set. Expose
+the parameters and seed in Mojo/Python, and test determinism, different seeds,
+`1.0` equivalence, invalid fractions, and feature-importance behavior.
+
+
+TASK 8: ROW BAGGING
+===================
+
+Work in the `mojoboost` repository. Inspect the current implementation and
+git status before editing because the project is evolving quickly. Preserve
+unrelated work and do not rewrite existing APIs unnecessarily. Follow the
+existing CPU/GPU backend boundary. Add focused equivalence and validation
+tests, update serialization when model structure changes, update the Python
+bindings when public parameters change, run the complete Mojo and Python
+suites, run `git diff --check`, and do not commit unless asked. Match LightGBM
+semantics where practical, but document intentional differences. Do not claim
+performance without reproducible benchmarks.
+
+Implement seeded row bagging with LightGBM-like `bagging_fraction` and
+`bagging_freq` semantics.
+
+Requirements:
+
+- Deterministic sampling from a documented RNG
+- Correct interaction with sample weights
+- Excluded rows must not affect gradients, histograms, leaf counts, or
+  base-score semantics
+- CPU and GPU paths must use identical sampled rows
+- Avoid materializing unnecessary data copies
+
+Test `fraction=1`, reproducibility, different seeds, zero-weight rows, small
+datasets, and CPU/GPU equivalence.
+
+
+TASK 9: MONOTONIC CONSTRAINTS
+=============================
+
+Work in the `mojoboost` repository. Inspect the current implementation and
+git status before editing because the project is evolving quickly. Preserve
+unrelated work and do not rewrite existing APIs unnecessarily. Follow the
+existing CPU/GPU backend boundary. Add focused equivalence and validation
+tests, update serialization when model structure changes, update the Python
+bindings when public parameters change, run the complete Mojo and Python
+suites, run `git diff --check`, and do not commit unless asked. Match LightGBM
+semantics where practical, but document intentional differences. Do not claim
+performance without reproducible benchmarks.
+
+Add monotonic constraints for numerical features.
+
+Accept one constraint per feature: `-1`, `0`, or `1`. Enforce constraints
+during split evaluation and leaf-value assignment so predictions are globally
+monotonic along constrained features.
+
+Start with the basic LightGBM-style method; do not attempt advanced constraint
+algorithms initially. Persist constraints in model metadata when needed. Add
+exhaustive grid tests showing nondecreasing/nonincreasing predictions,
+unconstrained equivalence, invalid configurations, multiclass policy, and
+serialization behavior.
+
+
+TASK 10: INTERACTION CONSTRAINTS
+================================
+
+Work in the `mojoboost` repository. Inspect the current implementation and
+git status before editing because the project is evolving quickly. Preserve
+unrelated work and do not rewrite existing APIs unnecessarily. Follow the
+existing CPU/GPU backend boundary. Add focused equivalence and validation
+tests, update serialization when model structure changes, update the Python
+bindings when public parameters change, run the complete Mojo and Python
+suites, run `git diff --check`, and do not commit unless asked. Match LightGBM
+semantics where practical, but document intentional differences. Do not claim
+performance without reproducible benchmarks.
+
+Add feature interaction constraints.
+
+Represent allowed feature groups and track the valid feature set along every
+tree path. Split search must exclude features that would violate the
+configured groups.
+
+Define and document behavior for overlapping groups and unconstrained
+features. Implement identical CPU/GPU behavior. Add structural tests that
+inspect every root-to-leaf path, plus validation and Python API tests.
+
+
+TASK 11: NATIVE CATEGORICAL FEATURES
+====================================
+
+Work in the `mojoboost` repository. Inspect the current implementation and
+git status before editing because the project is evolving quickly. Preserve
+unrelated work and do not rewrite existing APIs unnecessarily. Follow the
+existing CPU/GPU backend boundary. Add focused equivalence and validation
+tests, update serialization when model structure changes, update the Python
+bindings when public parameters change, run the complete Mojo and Python
+suites, run `git diff --check`, and do not commit unless asked. Match LightGBM
+semantics where practical, but document intentional differences. Do not claim
+performance without reproducible benchmarks.
+
+Design and implement native categorical splits without one-hot encoding.
+
+Begin with integer-coded categorical columns:
+
+- Mark categorical features explicitly.
+- Give them appropriate binning metadata.
+- Search category partitions using gradient/Hessian ordering rather than
+  treating category IDs as ordinal thresholds.
+- Store categorical split sets in tree nodes.
+- Support unseen categories and missing categories with documented default
+  routing.
+- Update CPU prediction, GPU partitioning, serialization, and Python
+  bindings.
+
+Add low- and high-cardinality tests and comparisons against LightGBM. Keep
+categorical work isolated from numerical quantile binning.
+
+
+TASK 12: SPARSE MATRIX SUPPORT
+==============================
+
+Work in the `mojoboost` repository. Inspect the current implementation and
+git status before editing because the project is evolving quickly. Preserve
+unrelated work and do not rewrite existing APIs unnecessarily. Follow the
+existing CPU/GPU backend boundary. Add focused equivalence and validation
+tests, update serialization when model structure changes, update the Python
+bindings when public parameters change, run the complete Mojo and Python
+suites, run `git diff --check`, and do not commit unless asked. Match LightGBM
+semantics where practical, but document intentional differences. Do not claim
+performance without reproducible benchmarks.
+
+Add sparse training and prediction without densifying the complete matrix.
+
+First define an internal CSC-oriented representation because MojoBoost's
+histogram work is feature-oriented. Support SciPy CSR/CSC through the Python
+API, converting to the chosen internal format when necessary.
+
+Explicitly define whether implicit zero is a numerical zero or missing value.
+Implement sparse histogram accumulation, binning, prediction, and validation.
+Benchmark memory and speed on truly sparse datasets. Preserve the dense
+implementation instead of forcing both through an inefficient abstraction.
+
+
+TASK 13: RANKING
+================
+
+Work in the `mojoboost` repository. Inspect the current implementation and
+git status before editing because the project is evolving quickly. Preserve
+unrelated work and do not rewrite existing APIs unnecessarily. Follow the
+existing CPU/GPU backend boundary. Add focused equivalence and validation
+tests, update serialization when model structure changes, update the Python
+bindings when public parameters change, run the complete Mojo and Python
+suites, run `git diff --check`, and do not commit unless asked. Match LightGBM
+semantics where practical, but document intentional differences. Do not claim
+performance without reproducible benchmarks.
+
+Add learning-to-rank as a separate, carefully scoped feature.
+
+Start with LambdaRank:
+
+- Query/group boundaries
+- Relevance labels
+- Pairwise lambdas and Hessians
+- NDCG metric and cutoff positions
+- Group-aware validation and early stopping
+- Python `MojoBoostRanker`
+
+Reject malformed or noncontiguous groups. Add hand-calculated tiny-query tests
+and comparisons with LightGBM. Do not mix rows from different queries during
+bagging or validation.
+
+
+TASK 14: GOSS
+=============
+
+Work in the `mojoboost` repository. Inspect the current implementation and
+git status before editing because the project is evolving quickly. Preserve
+unrelated work and do not rewrite existing APIs unnecessarily. Follow the
+existing CPU/GPU backend boundary. Add focused equivalence and validation
+tests, update serialization when model structure changes, update the Python
+bindings when public parameters change, run the complete Mojo and Python
+suites, run `git diff --check`, and do not commit unless asked. Match LightGBM
+semantics where practical, but document intentional differences. Do not claim
+performance without reproducible benchmarks.
+
+Implement Gradient-based One-Side Sampling as an optional training strategy.
+
+Preserve high-gradient rows, sample low-gradient rows deterministically, and
+apply the correct compensation multiplier. Integrate with sample weights,
+objectives, CPU/GPU histograms, and leaf row counts.
+
+Add statistical and deterministic tests, `top_rate`/`other_rate` validation,
+disabled-mode equivalence, and benchmarks. Keep ordinary GBDT as the default.
+
+
+TASK 15: EXCLUSIVE FEATURE BUNDLING
+===================================
+
+Work in the `mojoboost` repository. Inspect the current implementation and
+git status before editing because the project is evolving quickly. Preserve
+unrelated work and do not rewrite existing APIs unnecessarily. Follow the
+existing CPU/GPU backend boundary. Add focused equivalence and validation
+tests, update serialization when model structure changes, update the Python
+bindings when public parameters change, run the complete Mojo and Python
+suites, run `git diff --check`, and do not commit unless asked. Match LightGBM
+semantics where practical, but document intentional differences. Do not claim
+performance without reproducible benchmarks.
+
+Implement Exclusive Feature Bundling only after sparse support is stable.
+
+Detect approximately mutually exclusive sparse features, construct bundles,
+retain mappings from bundled bins to original features, and ensure split
+results map back to the correct original feature and threshold.
+
+Add conflict accounting and a configurable conflict limit. Test
+exact-exclusive, slightly conflicting, dense, and categorical cases. Benchmark
+memory and training time. EFB must remain optional and must never silently
+change prediction semantics.
+
+
+TASK 16: CUSTOM OBJECTIVES
+==========================
+
+Work in the `mojoboost` repository. Inspect the current implementation and
+git status before editing because the project is evolving quickly. Preserve
+unrelated work and do not rewrite existing APIs unnecessarily. Follow the
+existing CPU/GPU backend boundary. Add focused equivalence and validation
+tests, update serialization when model structure changes, update the Python
+bindings when public parameters change, run the complete Mojo and Python
+suites, run `git diff --check`, and do not commit unless asked. Match LightGBM
+semantics where practical, but document intentional differences. Do not claim
+performance without reproducible benchmarks.
+
+Design a custom-objective interface that accepts predictions and labels and
+produces gradient/Hessian arrays.
+
+First implement a native Mojo trait or compile-time callable interface so the
+inner loop remains efficient. Then investigate Python callbacks separately
+and document their performance cost rather than forcing Python calls into hot
+loops.
+
+Add a custom squared-error example that exactly reproduces the built-in
+objective, input-shape validation, Hessian validation, sample-weight
+semantics, multiclass policy, and early-stopping compatibility.
+
+
+TASK 17: CUSTOM METRICS
+=======================
+
+Work in the `mojoboost` repository. Inspect the current implementation and
+git status before editing because the project is evolving quickly. Preserve
+unrelated work and do not rewrite existing APIs unnecessarily. Follow the
+existing CPU/GPU backend boundary. Add focused equivalence and validation
+tests, update serialization when model structure changes, update the Python
+bindings when public parameters change, run the complete Mojo and Python
+suites, run `git diff --check`, and do not commit unless asked. Match LightGBM
+semantics where practical, but document intentional differences. Do not claim
+performance without reproducible benchmarks.
+
+Add custom validation metrics independently from custom objectives.
+
+Support:
+
+- Metric name
+- Scalar result
+- Whether higher is better
+- Use by early stopping
+- Multiple metrics with an explicit primary metric
+
+Start with native Mojo callables, then add Python callbacks if binding support
+is reliable. Test minimize/maximize behavior, ties, `min_delta`, multiple
+validation sets if supported, and callback errors.
+
+
+TASK 18: PYTHON API MATURITY
+============================
+
+Work in the `mojoboost` repository. Inspect the current implementation and
+git status before editing because the project is evolving quickly. Preserve
+unrelated work and do not rewrite existing APIs unnecessarily. Follow the
+existing CPU/GPU backend boundary. Add focused equivalence and validation
+tests, update serialization when model structure changes, update the Python
+bindings when public parameters change, run the complete Mojo and Python
+suites, run `git diff --check`, and do not commit unless asked. Match LightGBM
+semantics where practical, but document intentional differences. Do not claim
+performance without reproducible benchmarks.
+
+Bring the Python estimators closer to scikit-learn conventions.
+
+Add:
+
+- `get_params()` and `set_params()`
+- Fitted-state checks
+- `classes_`, `n_features_in_`, `feature_importances_`, and `best_iteration_`
+- Input validation for dtype, shape, finite values, labels, and weights
+- `score()`
+- `predict_proba()` consistency
+- Feature names where feasible
+- Pickling or a clearly documented alternative
+- Wheel builds and installation tests
+
+Add pytest-based tests and basic compatibility with `clone`, `Pipeline`, and
+`GridSearchCV`. Avoid claiming full sklearn compliance until estimator checks
+pass.
+
+
+TASK 19: C API AND CLI
+======================
+
+Work in the `mojoboost` repository. Inspect the current implementation and
+git status before editing because the project is evolving quickly. Preserve
+unrelated work and do not rewrite existing APIs unnecessarily. Follow the
+existing CPU/GPU backend boundary. Add focused equivalence and validation
+tests, update serialization when model structure changes, update the Python
+bindings when public parameters change, run the complete Mojo and Python
+suites, run `git diff --check`, and do not commit unless asked. Match LightGBM
+semantics where practical, but document intentional differences. Do not claim
+performance without reproducible benchmarks.
+
+Design a small stable C ABI before considering R bindings.
+
+Include opaque model handles and functions for:
+
+- Training dense data
+- Prediction
+- Save/load
+- Error retrieval
+- Resource destruction
+
+Do not expose Mojo-owned internal layouts across the ABI. Add lifecycle,
+invalid-input, and leak-oriented tests. Build a minimal CLI on top of the C or
+native Mojo API for train/predict from a documented file format.
+
+
+TASK 20: R API
+==============
+
+Work in the `mojoboost` repository. Inspect the current implementation and
+git status before editing because the project is evolving quickly. Preserve
+unrelated work and do not rewrite existing APIs unnecessarily. Follow the
+existing CPU/GPU backend boundary. Add focused equivalence and validation
+tests, update serialization when model structure changes, update the Python
+bindings when public parameters change, run the complete Mojo and Python
+suites, run `git diff --check`, and do not commit unless asked. Match LightGBM
+semantics where practical, but document intentional differences. Do not claim
+performance without reproducible benchmarks.
+
+Implement an R package only after the C ABI is stable.
+
+Wrap the C interface rather than binding directly to unstable Mojo internals.
+Support dense matrices first, then sparse matrices after the core sparse path
+exists. Add model lifetime management, R-native errors, package tests, and a
+minimal regression/classification example.
+
+
+TASK 21: DISTRIBUTED TRAINING
+=============================
+
+Work in the `mojoboost` repository. Inspect the current implementation and
+git status before editing because the project is evolving quickly. Preserve
+unrelated work and do not rewrite existing APIs unnecessarily. Follow the
+existing CPU/GPU backend boundary. Add focused equivalence and validation
+tests, update serialization when model structure changes, update the Python
+bindings when public parameters change, run the complete Mojo and Python
+suites, run `git diff --check`, and do not commit unless asked. Match LightGBM
+semantics where practical, but document intentional differences. Do not claim
+performance without reproducible benchmarks.
+
+Treat distributed training as a separate major design project.
+
+Begin with a design document and prototype data-parallel histogram reduction:
+
+- Horizontally partition rows
+- Build local histograms
+- All-reduce histogram statistics
+- Select a globally consistent split
+- Keep tree structure synchronized
+- Preserve deterministic failure behavior
+
+Define transport and collective requirements without embedding them
+throughout tree logic. Prototype on CPU first. Do not begin distributed GPU
+training until single-node GPU training is stable and benchmarked.
+
+
+TASK 22: MULTICORE CPU MATURITY
+===============================
+
+Work in the `mojoboost` repository. Inspect the current implementation and
+git status before editing because the project is evolving quickly. Preserve
+unrelated work and do not rewrite existing APIs unnecessarily. Follow the
+existing CPU/GPU backend boundary. Add focused equivalence and validation
+tests, update serialization when model structure changes, update the Python
+bindings when public parameters change, run the complete Mojo and Python
+suites, run `git diff --check`, and do not commit unless asked. Match LightGBM
+semantics where practical, but document intentional differences. Do not claim
+performance without reproducible benchmarks.
+
+Profile and optimize the CPU backend across x86-64 and ARM64 without creating
+per-chip forks.
+
+Measure:
+
+- Binning
+- Full and subset histograms
+- Histogram subtraction
+- Split scanning
+- Row partitioning
+- Gradient generation
+- Prediction
+
+Validate the shared SIMD/scalar paths on AVX2, AVX-512 where available, and
+ARM NEON. Tune worker scheduling based on workload shape, reduce allocation in
+tree growth, and add reusable scratch buffers. Preserve environment controls
+for reproducibility. Publish repeatable comparisons against LightGBM at one
+thread and equal machine-wide thread counts.
+
+
+TASK 23: NVIDIA AND AMD VALIDATION
+==================================
+
+Work in the `mojoboost` repository. Inspect the current implementation and
+git status before editing because the project is evolving quickly. Preserve
+unrelated work and do not rewrite existing APIs unnecessarily. Follow the
+existing CPU/GPU backend boundary. Add focused equivalence and validation
+tests, update serialization when model structure changes, update the Python
+bindings when public parameters change, run the complete Mojo and Python
+suites, run `git diff --check`, and do not commit unless asked. Match LightGBM
+semantics where practical, but document intentional differences. Do not claim
+performance without reproducible benchmarks.
+
+Validate the same GPU source on at least one NVIDIA CUDA system and one AMD
+HIP system. Do not add vendor branches before measuring.
+
+For each device:
+
+- Run correctness and determinism suites.
+- Record compiler/MAX versions and driver information.
+- Run multiple dataset shapes.
+- Separate setup, transfers, kernels, and total training.
+- Inspect occupancy, shared-memory use, and atomic contention.
+- Document failures and unsupported capabilities.
+
+Only introduce compile-time device tuning when a benchmark and profiler trace
+justify it. If the required hardware is not available, prepare reproducible
+CI or runner instructions and stop rather than inventing results.
+
+
+TASK 24: PRODUCTION HARDENING
+=============================
+
+Work in the `mojoboost` repository. Inspect the current implementation and
+git status before editing because the project is evolving quickly. Preserve
+unrelated work and do not rewrite existing APIs unnecessarily. Follow the
+existing CPU/GPU backend boundary. Add focused equivalence and validation
+tests, update serialization when model structure changes, update the Python
+bindings when public parameters change, run the complete Mojo and Python
+suites, run `git diff --check`, and do not commit unless asked. Match LightGBM
+semantics where practical, but document intentional differences. Do not claim
+performance without reproducible benchmarks.
+
+Perform a production-readiness pass without adding new algorithms.
+
+Cover:
+
+- Empty and malformed inputs
+- Constant features and targets
+- Extreme gradients and Hessians
+- NaN and infinity policy
+- Integer overflow and fixed-point GPU bounds
+- Large allocation failures
+- Corrupt model files
+- Cross-version serialization
+- Thread safety
+- Determinism contracts
+- Fuzz and property tests
+- Sanitizer-like tooling where available
+- API documentation and examples
+- Security policy and release process
+
+Produce a readiness report distinguishing experimental, supported, and
+untested configurations. Fix concrete correctness and safety defects found by
+the audit, but keep unrelated feature work out of scope.
+
+
+SUGGESTED EXECUTION ORDER
+=========================
+
+1. Stabilize end-to-end GPU training
+2. Public device selection
+3. Missing-value routing
+4. Maximum tree depth
+5. L1 split regularization
+6. Multicore CPU maturity
+7. NVIDIA and AMD validation
+8. GPU scaling across architectures
+9. Feature subsampling
+10. Row bagging
+11. Python API maturity
+12. Native categorical features
+13. Sparse matrix support
+14. Monotonic constraints
+15. Interaction constraints
+16. Custom objectives
+17. Custom metrics
+18. Ranking
+19. GOSS
+20. Exclusive Feature Bundling
+21. C API and CLI
+22. R API
+23. Distributed training
+24. Production hardening

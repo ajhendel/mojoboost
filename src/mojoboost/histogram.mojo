@@ -13,6 +13,11 @@ Accumulation parallelizes across features: each feature owns the
 `[f * n_bins, (f + 1) * n_bins)` slice of the output, so per-feature workers
 never write the same location and need no atomics. Nodes too small to amortize
 task-scheduling overhead take the serial path.
+
+Every builder takes an optional list of feature ids (empty means all). Under
+feature subsampling only those features are accumulated; the output keeps its
+full `n_features * n_bins` shape with the excluded slices left at zero, so no
+dataset is copied or re-indexed and sibling subtraction stays exact.
 """
 
 from std.sys.info import simd_width_of
@@ -46,12 +51,25 @@ def _zeroed_int(size: Int) -> List[Int]:
     return c^
 
 
+def _check_features(features: List[Int], n_features: Int) raises:
+    """Feature ids must be in range; an empty list means every feature."""
+    for i in range(len(features)):
+        if features[i] < 0 or features[i] >= n_features:
+            raise Error("feature index out of range")
+
+
 def build_histogram(
-    data: BinnedMatrix, grad: List[Float64], hess: List[Float64]
+    data: BinnedMatrix,
+    grad: List[Float64],
+    hess: List[Float64],
+    features: List[Int] = [],
 ) raises -> Histogram:
-    """Build a full-dataset histogram from per-row gradients and hessians."""
+    """Build a full-dataset histogram from per-row gradients and hessians.
+    With a non-empty `features`, only those features are accumulated and the
+    rest of the output stays zero."""
     if len(grad) != data.n_rows or len(hess) != data.n_rows:
         raise Error("gradient/hessian length must equal n_rows")
+    _check_features(features, data.n_features)
 
     var size = data.n_features * data.n_bins
     var g = _zeroed_f64(size)
@@ -66,8 +84,12 @@ def build_histogram(
     var bins_p = data.bins.unsafe_ptr()
     var n_rows = data.n_rows
     var n_bins = data.n_bins
+    var use_all = len(features) == 0
+    var n_active = data.n_features if use_all else len(features)
+    var feat_p = features.unsafe_ptr()
 
-    def do_feature(f: Int) {imm}:
+    def do_feature(i: Int) {imm}:
+        var f = i if use_all else feat_p.unsafe_load(i)
         var col = bins_p.unsafe_offset(f * n_rows)
         var base = f * n_bins
         for r in range(n_rows):
@@ -76,7 +98,7 @@ def build_histogram(
             hp.unsafe_store(b, hp.unsafe_load(b) + hess_p.unsafe_load(r))
             cp.unsafe_store(b, cp.unsafe_load(b) + 1)
 
-    dispatch_features(do_feature, data.n_features, data.n_features * n_rows)
+    dispatch_features(do_feature, n_active, n_active * n_rows)
 
     return Histogram(g^, h^, c^, data.n_features, data.n_bins)
 
@@ -86,10 +108,14 @@ def build_histogram_subset(
     grad: List[Float64],
     hess: List[Float64],
     rows: List[Int],
+    features: List[Int] = [],
 ) raises -> Histogram:
-    """Build a histogram over a subset of rows (one tree node's rows)."""
+    """Build a histogram over a subset of rows (one tree node's rows). With a
+    non-empty `features`, only those features are accumulated and the rest of
+    the output stays zero."""
     if len(grad) != data.n_rows or len(hess) != data.n_rows:
         raise Error("gradient/hessian length must equal n_rows")
+    _check_features(features, data.n_features)
 
     var size = data.n_features * data.n_bins
     var g = _zeroed_f64(size)
@@ -106,8 +132,12 @@ def build_histogram_subset(
     var n_rows = data.n_rows
     var n_bins = data.n_bins
     var n_sub = len(rows)
+    var use_all = len(features) == 0
+    var n_active = data.n_features if use_all else len(features)
+    var feat_p = features.unsafe_ptr()
 
-    def do_feature(f: Int) {imm}:
+    def do_feature(i_feature: Int) {imm}:
+        var f = i_feature if use_all else feat_p.unsafe_load(i_feature)
         var col = bins_all_p.unsafe_offset(f * n_rows)
         var base = f * n_bins
         for i in range(n_sub):
@@ -117,7 +147,7 @@ def build_histogram_subset(
             hp.unsafe_store(b, hp.unsafe_load(b) + hess_p.unsafe_load(r))
             cp.unsafe_store(b, cp.unsafe_load(b) + 1)
 
-    dispatch_features(do_feature, data.n_features, data.n_features * n_sub)
+    dispatch_features(do_feature, n_active, n_active * n_sub)
 
     return Histogram(g^, h^, c^, data.n_features, data.n_bins)
 

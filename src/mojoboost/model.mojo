@@ -3,8 +3,13 @@
 `fit` bins the raw training matrix with quantile binning, trains a boosted
 ensemble, and returns a `Model` that carries the fitted `BinMapper` so it
 can predict on raw, unseen feature values.
+
+Both entry points take a `device` (see device.mojo). The device chooses
+which trainer grows the trees; it is not a property of the fitted model,
+which is the same tree ensemble either way and serializes identically.
 """
 
+from .bagging import BaggingParams
 from .binning import BinMapper, BinnedMatrix, fit_bins
 from .boosting import (
     Booster,
@@ -13,6 +18,9 @@ from .boosting import (
     train,
     train_multiclass,
 )
+from .device import CPU_DEVICE, GPU_DEVICE, resolve_device
+from .objective import GradHessFn, train_custom
+from .train_gpu import train_gpu
 
 
 @fieldwise_init
@@ -80,13 +88,27 @@ def fit(
     max_bins: Int = 255,
     sample_weight: List[Float64] = [],
     alpha: Float64 = 0.9,
+    device: Int = CPU_DEVICE,
+    bagging: BaggingParams = BaggingParams.disabled(),
 ) raises -> Model:
     """Fit on a column-major raw feature matrix (`features[f * n_rows + r]`).
     `alpha` is the target quantile for QUANTILE and the huber transition
-    point for HUBER; other objectives ignore it."""
+    point for HUBER; other objectives ignore it. `device` is CPU_DEVICE,
+    GPU_DEVICE, or AUTO_DEVICE; GPU_DEVICE raises when no accelerator is
+    available instead of falling back. `bagging` samples training rows per
+    tree (see bagging.mojo) and draws the same rows on either device."""
+    var backend = resolve_device(device, n_rows, n_features, 1)
     var mapper = fit_bins(features, n_rows, n_features, max_bins)
     var data = mapper.transform(features, n_rows)
-    var booster = train(data, target, objective, params, sample_weight, alpha)
+    var booster: Booster
+    if backend == GPU_DEVICE:
+        booster = train_gpu(
+            data, target, objective, params, sample_weight, alpha, bagging
+        )
+    else:
+        booster = train(
+            data, target, objective, params, sample_weight, alpha, bagging
+        )
     return Model(mapper^, booster^)
 
 
@@ -99,10 +121,45 @@ def fit_multiclass(
     params: BoosterParams,
     max_bins: Int = 255,
     sample_weight: List[Float64] = [],
+    device: Int = CPU_DEVICE,
+    bagging: BaggingParams = BaggingParams.disabled(),
 ) raises -> MulticlassModel:
     """Fit a softmax multiclass model on a column-major raw feature matrix
-    (`features[f * n_rows + r]`), labels in 0..n_classes-1."""
+    (`features[f * n_rows + r]`), labels in 0..n_classes-1. Multiclass
+    training is CPU-only, so GPU_DEVICE raises and AUTO_DEVICE resolves to
+    the CPU. `bagging` draws one bag per round, shared by every class's
+    tree in that round."""
+    _ = resolve_device(device, n_rows, n_features, n_classes)
     var mapper = fit_bins(features, n_rows, n_features, max_bins)
     var data = mapper.transform(features, n_rows)
-    var booster = train_multiclass(data, labels, n_classes, params, sample_weight)
+    var booster = train_multiclass(
+        data, labels, n_classes, params, sample_weight, bagging
+    )
     return MulticlassModel(mapper^, booster^)
+
+
+def fit_custom[F: GradHessFn](
+    features: List[Float64],
+    n_rows: Int,
+    n_features: Int,
+    target: List[Float64],
+    grad_hess: F,
+    params: BoosterParams,
+    max_bins: Int = 255,
+    sample_weight: List[Float64] = [],
+    base_score: Float64 = 0.0,
+) raises -> Model:
+    """Fit a caller-supplied objective on a column-major raw feature matrix
+    (`features[f * n_rows + r]`), the `fit` counterpart of `train_custom`
+    (see objective.mojo for the callback contract).
+
+    `Model.predict` returns the raw score for a custom-objective model,
+    since the framework does not know the inverse link. CPU only: there is
+    no `device` argument, use `train_custom_gpu` on a pre-binned matrix for
+    GPU tree growth."""
+    var mapper = fit_bins(features, n_rows, n_features, max_bins)
+    var data = mapper.transform(features, n_rows)
+    var booster = train_custom(
+        data, target, grad_hess, params, sample_weight, base_score
+    )
+    return Model(mapper^, booster^)

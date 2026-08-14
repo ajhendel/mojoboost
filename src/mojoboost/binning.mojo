@@ -8,6 +8,12 @@ and returns a `BinMapper` whose stored edges let a trained model bin raw,
 unseen feature values at prediction time. `bin_equal_width` remains as a
 simple mapper-free alternative for experiments.
 
+Features named in `categorical_features` are binned by `categorical.mojo`
+instead: they get no quantile edges at all, and their raw integer codes map
+to bins through a fitted category table. The two paths never mix, so adding
+a categorical column changes nothing about how the numerical columns are
+binned.
+
 Fitting and transforming parallelize across features: every feature's edge
 computation (column copy + sort) and bin assignment is independent and
 writes only its own output range, so workers need no synchronization and
@@ -15,26 +21,56 @@ the result is bit-identical to the serial path. Inputs too small to
 amortize task-scheduling overhead stay serial.
 """
 
+from .categorical import CategoricalSpec, fit_categorical_spec
 from .parallel import dispatch_features
 
 
-@fieldwise_init
 struct BinnedMatrix(Copyable, Movable):
     """Column-major binned feature matrix.
 
-    Bin for (row r, feature f) is stored at `bins[f * n_rows + r]`.
+    Bin for (row r, feature f) is stored at `bins[f * n_rows + r]`. `cats`
+    records which features are categorical, so split finding knows to search
+    category partitions rather than ordinal thresholds; an empty spec means
+    every feature is numerical.
     """
 
     var bins: List[UInt8]
     var n_rows: Int
     var n_features: Int
     var n_bins: Int
+    var cats: CategoricalSpec
+
+    def __init__(
+        out self,
+        var bins: List[UInt8],
+        n_rows: Int,
+        n_features: Int,
+        n_bins: Int,
+    ):
+        self.bins = bins^
+        self.n_rows = n_rows
+        self.n_features = n_features
+        self.n_bins = n_bins
+        self.cats = CategoricalSpec.none()
+
+    def __init__(
+        out self,
+        var bins: List[UInt8],
+        n_rows: Int,
+        n_features: Int,
+        n_bins: Int,
+        var cats: CategoricalSpec,
+    ):
+        self.bins = bins^
+        self.n_rows = n_rows
+        self.n_features = n_features
+        self.n_bins = n_bins
+        self.cats = cats^
 
     def bin_at(self, row: Int, feature: Int) -> Int:
         return Int(self.bins[feature * self.n_rows + row])
 
 
-@fieldwise_init
 struct BinMapper(Copyable, Movable):
     """Per-feature bin edges fit on training data.
 
@@ -42,14 +78,47 @@ struct BinMapper(Copyable, Movable):
     strictly increasing. A value v maps to the first bin b whose edge
     satisfies v <= edge[b]; values above every edge map to the last bin.
     A feature with k edges uses k + 1 bins (k + 1 <= n_bins).
+
+    Categorical features carry no edges; `cats` holds their category tables
+    and `bin_value` routes them through it instead.
     """
 
     var edges: List[Float64]
     var edge_offsets: List[Int]
     var n_features: Int
     var n_bins: Int
+    var cats: CategoricalSpec
+
+    def __init__(
+        out self,
+        var edges: List[Float64],
+        var edge_offsets: List[Int],
+        n_features: Int,
+        n_bins: Int,
+    ):
+        self.edges = edges^
+        self.edge_offsets = edge_offsets^
+        self.n_features = n_features
+        self.n_bins = n_bins
+        self.cats = CategoricalSpec.all_numerical(n_features)
+
+    def __init__(
+        out self,
+        var edges: List[Float64],
+        var edge_offsets: List[Int],
+        n_features: Int,
+        n_bins: Int,
+        var cats: CategoricalSpec,
+    ):
+        self.edges = edges^
+        self.edge_offsets = edge_offsets^
+        self.n_features = n_features
+        self.n_bins = n_bins
+        self.cats = cats^
 
     def bin_value(self, feature: Int, v: Float64) -> Int:
+        if self.cats.is_cat(feature):
+            return self.cats.bin_of(feature, v)
         var lo = self.edge_offsets[feature]
         var left = lo
         var right = self.edge_offsets[feature + 1]
@@ -75,11 +144,19 @@ struct BinMapper(Copyable, Movable):
         var feat_p = features.unsafe_ptr()
         var edges_p = self.edges.unsafe_ptr()
         var offs_p = self.edge_offsets.unsafe_ptr()
+        ref cats = self.cats
 
         def do_feature(f: Int) {imm}:
+            var col = f * n_rows
+            if cats.is_cat(f):
+                for r in range(n_rows):
+                    bins_p.unsafe_store(
+                        col + r,
+                        UInt8(cats.bin_of(f, feat_p.unsafe_load(col + r))),
+                    )
+                return
             var lo = offs_p.unsafe_load(f)
             var hi = offs_p.unsafe_load(f + 1)
-            var col = f * n_rows
             for r in range(n_rows):
                 var v = feat_p.unsafe_load(col + r)
                 var left = lo
@@ -93,7 +170,9 @@ struct BinMapper(Copyable, Movable):
                 bins_p.unsafe_store(col + r, UInt8(left - lo))
 
         dispatch_features(do_feature, n_features, n_features * n_rows)
-        return BinnedMatrix(bins^, n_rows, n_features, self.n_bins)
+        return BinnedMatrix(
+            bins^, n_rows, n_features, self.n_bins, self.cats.copy()
+        )
 
     def bin_row(self, row: List[Float64]) raises -> List[Int]:
         """Bin one example (length n_features) for prediction."""
@@ -110,16 +189,25 @@ def fit_bins(
     n_rows: Int,
     n_features: Int,
     max_bins: Int = 255,
+    categorical_features: List[Int] = [],
 ) raises -> BinMapper:
     """Fit quantile (equal-frequency) bin edges on a column-major feature
     matrix. Edges are midpoints between distinct values at quantile
-    boundaries, so duplicate-heavy features simply use fewer bins."""
+    boundaries, so duplicate-heavy features simply use fewer bins.
+
+    Feature indices listed in `categorical_features` are treated as
+    integer-coded categoricals: they are excluded from quantile binning
+    entirely and get a category table instead (see `categorical.mojo`)."""
     if max_bins < 2 or max_bins > 256:
         raise Error("max_bins must be in [2, 256]")
     if n_rows < 1:
         raise Error("n_rows must be positive")
     if len(features) != n_rows * n_features:
         raise Error("features length must equal n_rows * n_features")
+
+    var cats = fit_categorical_spec(
+        features, n_rows, n_features, categorical_features, max_bins
+    )
 
     # Each feature's edges land in its own fixed-stride scratch slice; a
     # serial pass then concatenates them in feature order, so the result is
@@ -133,8 +221,13 @@ def fit_bins(
     var scratch_p = scratch.unsafe_ptr()
     var counts_p = counts.unsafe_ptr()
     var feat_p = features.unsafe_ptr()
+    ref spec = cats
 
     def do_feature(f: Int) {imm}:
+        # Categorical columns never enter quantile binning.
+        if spec.is_cat(f):
+            counts_p.unsafe_store(f, 0)
+            return
         var col = List[Float64](capacity=n_rows)
         for r in range(n_rows):
             col.append(feat_p.unsafe_load(f * n_rows + r))
@@ -168,7 +261,7 @@ def fit_bins(
         for i in range(counts[f]):
             edges.append(scratch[base + i])
         offsets.append(len(edges))
-    return BinMapper(edges^, offsets^, n_features, max_bins)
+    return BinMapper(edges^, offsets^, n_features, max_bins, cats^)
 
 
 def bin_equal_width(

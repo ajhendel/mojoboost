@@ -27,6 +27,27 @@ proba = clf.predict_proba(X)
 `fit` accepts `sample_weight`. numpy is optional; plain Python sequences
 work without it. Install with the `numpy` extra to pull it in.
 
+## Device selection
+
+```python
+from mojoboost import MojoBoostRegressor, gpu_available
+
+model = MojoBoostRegressor(device="auto").fit(X, y)
+model.device_          # the backend that actually ran: "cpu" or "gpu"
+```
+
+`device="cpu"` is the default and the dependable backend. `device="gpu"`
+raises when no accelerator is available or when the GPU path does not
+cover the workload (multiclass is CPU-only), rather than falling back
+silently. `device="auto"` picks for you and currently always picks the
+CPU: no benchmark has established a workload size where end-to-end GPU
+training wins, so no crossover threshold ships enabled.
+`gpu_available()` reports whether this build can train on an accelerator.
+
+The device is a training choice rather than part of the model, so saved
+models are identical either way and a loaded estimator carries no
+`device_`.
+
 ## Platform support
 
 Wheels currently target macOS on Apple silicon. The wheel bundles the Mojo

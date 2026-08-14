@@ -10,6 +10,9 @@ build/
 *.dylib
 *.dll
 
+# Test serialization scratch files
+.test_*.tmp
+
 # macOS
 .DS_Store
 

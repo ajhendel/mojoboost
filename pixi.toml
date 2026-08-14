@@ -6,8 +6,8 @@ platforms = ["osx-arm64", "linux-64", "linux-aarch64"]
 version = "0.1.0"
 
 [tasks]
-test = "mojo run -I src tests/test_mojoboost.mojo && mojo run -I src tests/test_metrics.mojo && mojo run -I src tests/test_weights.mojo && mojo run -I src tests/test_multiclass_model.mojo && mojo run -I src tests/test_objectives.mojo && mojo run -I src tests/test_kernels.mojo && mojo run -I src tests/test_serialize.mojo && mojo run -I src tests/test_backend_equivalence.mojo && mojo run -I src tests/test_histogram_reference.mojo"
-test-gpu = "mojo run -I src tests/test_backend_equivalence.mojo && mojo run -I src tests/test_gpu_training.mojo"
+test = "mojo run -I src tests/test_mojoboost.mojo && mojo run -I src tests/test_metrics.mojo && mojo run -I src tests/test_weights.mojo && mojo run -I src tests/test_multiclass_model.mojo && mojo run -I src tests/test_objectives.mojo && mojo run -I src tests/test_kernels.mojo && mojo run -I src tests/test_regularization.mojo && mojo run -I src tests/test_serialize.mojo && mojo run -I src tests/test_backend_equivalence.mojo && mojo run -I src tests/test_gpu_training.mojo && mojo run -I src tests/test_histogram_reference.mojo && mojo run -I src tests/test_device.mojo"
+test-gpu = "mojo run -I src tests/test_backend_equivalence.mojo && mojo run -I src tests/test_gpu_training.mojo && mojo run -I src tests/test_device.mojo"
 bench = "mojo run -I src bench/bench_train.mojo"
 bench-hist = "mojo run -I src bench/bench_histogram.mojo"
 bench-train-gpu = "mojo run -I src bench/bench_train_gpu.mojo"
@@ -39,6 +39,12 @@ pip = "*"
 build-wheel = "packaging/build_wheel.sh"
 test-wheel = { cmd = "packaging/test_wheel.sh", depends-on = ["build-wheel"] }
 
+[feature.pytest.dependencies]
+pytest = "*"
+scikit-learn = "*"
+pandas = "*"
+
 [environments]
 bench = ["bench"]
 pkg = ["pkg"]
+pytest = ["pytest"]
