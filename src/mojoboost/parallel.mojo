@@ -15,7 +15,10 @@ for tests that must force one path:
 from max.algorithm import sync_parallelize
 from std.os import getenv
 
-comptime PARALLEL_MIN_OPS = 1 << 17
+# Serial-vs-parallel crossover measured at 25k-50k ops on Apple M4, AMD
+# Zen4, and Neoverse-N2 (bench/bench_threshold.mojo); 1 << 16 sits above
+# all three with 1.2-1.6x parallel speedup at exactly this size.
+comptime PARALLEL_MIN_OPS = 1 << 16
 
 
 def _env_int(name: String, default: Int) -> Int:
