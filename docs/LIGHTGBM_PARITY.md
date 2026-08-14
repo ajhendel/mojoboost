@@ -479,7 +479,7 @@ inverse link exactly once before any metric sees them.
 | Capability | Status | Notes |
 |---|---|---|
 | GPU histogram construction | supported | Portable kernel, 2D grid, fixed-point Int32 reduction, two combine strategies that are bit-identical to each other. `src/mojoboost/histogram_gpu.mojo`, `tests/test_gpu_strategies.mojo` |
-| End-to-end GPU training | supported | `train_gpu`, device-resident binned matrix and leaf assignments. `src/mojoboost/train_gpu.mojo`, `tests/test_gpu_training.mojo` |
+| End-to-end GPU training | supported | `train_gpu`, device-resident binned matrix and compacted per-leaf row ranges. `src/mojoboost/train_gpu.mojo`, `src/mojoboost/gpu_active_rows.mojo`, `tests/test_gpu_training.mojo` |
 | GPU multiclass | partial | `train_multiclass_gpu` exists, but `fit_multiclass` and the Python classifier still resolve multiclass to the CPU |
 | CUDA (NVIDIA) validation | deferred | The source targets it and `tests/test_gpu_portability.mojo` pins the launch limits CUDA imposes, but **no NVIDIA device has run this code**. `docs/GPU_VALIDATION.md` holds the procedure and the status table |
 | HIP (AMD) validation | deferred | Same |

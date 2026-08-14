@@ -3,17 +3,19 @@
 Same conceptual inputs and outputs as the CPU builders in `histogram.mojo`,
 different algorithm for the hardware. The dataset stays device-resident for
 a whole training session: the binned matrix is uploaded once at construction,
-gradients and hessians once per boosting round, and a per-row leaf-assignment
-array (row -> current leaf node id) lives on the device so tree growth never
-copies row-index lists across the PCIe/unified-memory boundary.
+gradients and hessians once per boosting round, and a device-resident
+permutation of the row indices (see gpu_active_rows.mojo) gives every live
+leaf a contiguous half-open range of rows, so tree growth never copies
+row-index lists across the PCIe/unified-memory boundary.
 
 Histograms build with a 2D grid: `grid.x` is the active feature, `grid.y` a
 tile of rows, so a device gets `n_active * n_tiles` threadgroups of parallel
 work instead of just `n_active`. Every threadgroup accumulates a partial
-histogram for its (feature, row-tile) in shared memory, filtering rows by the
-target leaf id. The launch geometry (threads per group, tiles per feature) is
-derived from device capabilities at runtime rather than fixed at compile
-time; see `gpu_tiling.mojo`.
+histogram for its (feature, row-tile) in shared memory, reading only the
+node's own compacted row range. The launch geometry (threads per group,
+tiles per feature) is derived per node from device capabilities and the
+node's own row count rather than fixed at compile time; see
+`gpu_tiling.mojo` and `gpu_active_rows.mojo`.
 
 Two strategies combine those partials, both selectable and both tested:
 
@@ -57,17 +59,19 @@ Gradients are carried as Float32 on the device: Apple GPUs have no Float64.
 Results convert back to the Float64 `Histogram` on download; agreement with
 the CPU builder is to Float32 precision, not bit-exact. Counts are exact.
 
-Row bagging rides on the same leaf-assignment array: `begin_tree` parks
-excluded rows at the OUT_OF_BAG leaf id instead of the root, and since node
-ids are nonnegative, those rows match no histogram filter and no partition
-for the rest of the tree. Nothing is compacted or reuploaded, so a bagged
-tree costs the same device memory as an unbagged one.
+Row bagging rides on the same permutation: `begin_tree` seeds the root
+range with the bag's rows in the caller's order, and a row outside the bag
+is simply not inside any range, so no kernel ever iterates it. A bagged
+tree costs one n_rows Int32 staged copy; an unbagged one seeds the
+identity permutation with a kernel and costs no transfer at all.
 
-Every node's histogram is built by scanning all n_rows and filtering on the
-leaf id, so a tree costs `num_leaves * n_rows * n_features` bin reads where
-the CPU builder's row-index lists cost `n_rows * n_features` per level. That
-is the deliberate portable baseline: order-preserving row compaction is the
-next step, and it changes the kernel, not this module's contract.
+Every node's histogram is built by scanning exactly that node's rows, so a
+tree costs on the order of `sum over built nodes of node_rows * n_features`
+bin reads, the same asymptotic cost as the CPU builder's row-index lists,
+instead of the `nodes_built * n_rows * n_features` the pre-compaction
+filtering kernels paid. The partition that maintains the ranges is a
+stable four-launch scan/scatter that is bit-deterministic and keeps each
+node's rows in the exact order the CPU grower's row lists hold them.
 
 Transfers stage through pinned host buffers and one-way copies rather than
 `map_to_host`, which copies in both directions on every use. That also makes
@@ -77,16 +81,12 @@ reports: `stage_gradients` (Float64 to Float32 conversion), `upload_staged`
 and `histogram_from_host` (fixed-point to Float64 conversion).
 """
 
-from std.atomic import Atomic
-from std.gpu import block_dim, block_idx, global_idx, thread_idx
-from std.math import isfinite, round
-from std.memory import stack_allocation
+from std.math import isfinite
 from max.gpu.host import DeviceBuffer, DeviceContext, HostBuffer
-from max.gpu.memory import AddressSpace
-from max.gpu.sync import barrier
 
 from .binning import BinnedMatrix
 from .categorical import CatBitset, CategoricalSpec, cat_empty
+from .gpu_active_rows import GpuActiveRows, RowRouting
 from .gpu_tiling import (
     STRATEGY_ATOMIC,
     STRATEGY_AUTO,
@@ -100,264 +100,10 @@ from .histogram import Histogram, _zeroed_f64, _zeroed_int
 
 comptime MAX_BINS = 256
 
-# Leaf id of a row excluded by row bagging. Node ids are nonnegative, so a
-# row parked here is matched by no histogram build and no split.
-comptime OUT_OF_BAG = Int32(-1)
-
 # Row indices and leaf ids cross into the kernels as Int32.
 comptime MAX_ROWS = Int(Int32.MAX)
 
 comptime _FIXED_ONE = Float64(1 << 30)
-
-
-def _hist_leaf_kernel(
-    bins: MutPointer[UInt8, MutAnyOrigin],
-    leaf_ids: MutPointer[Int32, MutAnyOrigin],
-    grad: MutPointer[Float32, MutAnyOrigin],
-    hess: MutPointer[Float32, MutAnyOrigin],
-    feat_ids: MutPointer[Int32, MutAnyOrigin],
-    out_hist: MutPointer[Int32, MutAnyOrigin],
-    n_rows: Int32,
-    n_bins: Int32,
-    hist_size: Int32,
-    rows_per_chunk: Int32,
-    target_leaf: Int32,
-    g_scale: Float32,
-    h_scale: Float32,
-):
-    """Atomic strategy: one shared-memory partial per (feature, row-tile),
-    folded into the output with global integer atomics."""
-    # grid.x indexes the active feature set, not the dataset's features, so
-    # under feature subsampling excluded features get no threadgroups at all
-    # and their output slices keep the zeros the memset left. Writes still go
-    # to the global feature's slice, so the histogram layout never changes.
-    var f = Int(feat_ids[unsafe_offset = Int(block_idx.x)][0])
-    var tid = thread_idx.x
-    var nb = Int(n_bins)
-    var nr = Int(n_rows)
-    var hs = Int(hist_size)
-
-    var sg = stack_allocation[
-        MAX_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
-    ]()
-    var sh = stack_allocation[
-        MAX_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
-    ]()
-    var sc = stack_allocation[
-        MAX_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
-    ]()
-
-    var b = tid
-    while b < nb:
-        sg[unsafe_offset=b] = 0
-        sh[unsafe_offset=b] = 0
-        sc[unsafe_offset=b] = 0
-        b += block_dim.x
-    barrier()
-
-    var row_begin = block_idx.y * Int(rows_per_chunk)
-    var row_end = row_begin + Int(rows_per_chunk)
-    if row_end > nr:
-        row_end = nr
-
-    var col = f * nr
-    var r = row_begin + tid
-    while r < row_end:
-        if leaf_ids[unsafe_offset=r][0] == target_leaf:
-            var bin = Int(bins[unsafe_offset=col + r])
-            var gq = Int32(round(grad[unsafe_offset=r][0] * g_scale))
-            var hq = Int32(round(hess[unsafe_offset=r][0] * h_scale))
-            _ = Atomic.fetch_add(sg.unsafe_offset(bin), gq)
-            _ = Atomic.fetch_add(sh.unsafe_offset(bin), hq)
-            _ = Atomic.fetch_add(sc.unsafe_offset(bin), Int32(1))
-        r += block_dim.x
-    barrier()
-
-    # One flush into the shared [grad | hess | count] output buffer.
-    var base = f * nb
-    b = tid
-    while b < nb:
-        if sc[unsafe_offset=b][0] != 0:
-            _ = Atomic.fetch_add(
-                out_hist.unsafe_offset(base + b), sg[unsafe_offset=b][0]
-            )
-            _ = Atomic.fetch_add(
-                out_hist.unsafe_offset(hs + base + b), sh[unsafe_offset=b][0]
-            )
-            _ = Atomic.fetch_add(
-                out_hist.unsafe_offset(2 * hs + base + b),
-                sc[unsafe_offset=b][0],
-            )
-        b += block_dim.x
-
-
-def _hist_partial_kernel(
-    bins: MutPointer[UInt8, MutAnyOrigin],
-    leaf_ids: MutPointer[Int32, MutAnyOrigin],
-    grad: MutPointer[Float32, MutAnyOrigin],
-    hess: MutPointer[Float32, MutAnyOrigin],
-    feat_ids: MutPointer[Int32, MutAnyOrigin],
-    partials: MutPointer[Int32, MutAnyOrigin],
-    n_rows: Int32,
-    n_slots: Int32,
-    n_bins: Int32,
-    rows_per_tile: Int32,
-    target_leaf: Int32,
-    g_scale: Float32,
-    h_scale: Float32,
-):
-    """Tiled strategy, stage one: one shared-memory partial per (feature,
-    row-tile), written to that tile's own slice of the partial buffer.
-
-    The partial buffer is indexed by active-feature slot rather than by
-    global feature id, so under feature subsampling it stays proportional to
-    the work actually launched. Tile `t` owns
-    `partials[t * 3 * n_slots * n_bins ...]`, laid out `[grad | hess |
-    count]` like the output. Every element is written exactly once by
-    exactly one threadgroup, so the buffer needs no zeroing and the writes
-    need no atomics.
-    """
-    var slot = Int(block_idx.x)
-    var f = Int(feat_ids[unsafe_offset=slot][0])
-    var t = block_idx.y
-    var tid = thread_idx.x
-    var nb = Int(n_bins)
-    var nr = Int(n_rows)
-    var plane = Int(n_slots) * nb
-
-    var sg = stack_allocation[
-        MAX_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
-    ]()
-    var sh = stack_allocation[
-        MAX_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
-    ]()
-    var sc = stack_allocation[
-        MAX_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
-    ]()
-
-    var b = tid
-    while b < nb:
-        sg[unsafe_offset=b] = 0
-        sh[unsafe_offset=b] = 0
-        sc[unsafe_offset=b] = 0
-        b += block_dim.x
-    barrier()
-
-    var row_begin = t * Int(rows_per_tile)
-    var row_end = row_begin + Int(rows_per_tile)
-    if row_end > nr:
-        row_end = nr
-
-    var col = f * nr
-    var r = row_begin + tid
-    while r < row_end:
-        if leaf_ids[unsafe_offset=r][0] == target_leaf:
-            var bin = Int(bins[unsafe_offset=col + r])
-            var gq = Int32(round(grad[unsafe_offset=r][0] * g_scale))
-            var hq = Int32(round(hess[unsafe_offset=r][0] * h_scale))
-            _ = Atomic.fetch_add(sg.unsafe_offset(bin), gq)
-            _ = Atomic.fetch_add(sh.unsafe_offset(bin), hq)
-            _ = Atomic.fetch_add(sc.unsafe_offset(bin), Int32(1))
-        r += block_dim.x
-    barrier()
-
-    var base = t * 3 * plane + slot * nb
-    b = tid
-    while b < nb:
-        partials[unsafe_offset = base + b] = sg[unsafe_offset=b][0]
-        partials[unsafe_offset = base + plane + b] = sh[unsafe_offset=b][0]
-        partials[unsafe_offset = base + 2 * plane + b] = sc[
-            unsafe_offset=b
-        ][0]
-        b += block_dim.x
-
-
-def _hist_reduce_kernel(
-    partials: MutPointer[Int32, MutAnyOrigin],
-    feat_ids: MutPointer[Int32, MutAnyOrigin],
-    out_hist: MutPointer[Int32, MutAnyOrigin],
-    n_slots: Int32,
-    n_bins: Int32,
-    hist_size: Int32,
-    n_tiles: Int32,
-):
-    """Tiled strategy, stage two: one thread per partial element sums that
-    element across tiles, in ascending tile order, and scatters the total to
-    the global feature's slice of the output.
-
-    All three planes reduce in this one loop. Sequential summation in a
-    fixed order over exact integers, so the result cannot depend on
-    scheduling, and every active output element is written by exactly one
-    thread.
-    """
-    var i = global_idx.x
-    var nb = Int(n_bins)
-    var plane = Int(n_slots) * nb
-    var n = 3 * plane
-    if i < n:
-        var acc = Int32(0)
-        var off = i
-        for _ in range(Int(n_tiles)):
-            acc += partials[unsafe_offset=off][0]
-            off += n
-        var p = i // plane
-        var rem = i - p * plane
-        var slot = rem // nb
-        var b = rem - slot * nb
-        var f = Int(feat_ids[unsafe_offset=slot][0])
-        out_hist[unsafe_offset = p * Int(hist_size) + f * nb + b] = acc
-
-
-def _partition_kernel(
-    bins: MutPointer[UInt8, MutAnyOrigin],
-    leaf_ids: MutPointer[Int32, MutAnyOrigin],
-    n_rows: Int32,
-    feature: Int32,
-    threshold_bin: Int32,
-    parent: Int32,
-    left: Int32,
-    right: Int32,
-    missing_bin: Int32,
-    default_left: Int32,
-    is_categorical: Int32,
-    cat0: UInt64,
-    cat1: UInt64,
-    cat2: UInt64,
-    cat3: UInt64,
-):
-    var r = global_idx.x
-    var nr = Int(n_rows)
-    if r < nr:
-        if leaf_ids[unsafe_offset=r][0] == parent:
-            var bin = Int32(bins[unsafe_offset = Int(feature) * nr + r])
-            var go_left: Bool
-            if is_categorical != 0:
-                # Categorical split: the node's 256-bit category set arrives
-                # as four scalar words, so the test is the same membership
-                # `Tree.goes_left` runs on the host. Bin 0 (missing, unseen,
-                # dropped) is never a member, so those rows go right.
-                var word: UInt64
-                var w = Int(bin) >> 6
-                if w == 0:
-                    word = cat0
-                elif w == 1:
-                    word = cat1
-                elif w == 2:
-                    word = cat2
-                else:
-                    word = cat3
-                go_left = ((word >> UInt64(Int(bin) & 63)) & 1) != 0
-            # Rows in the missing bin follow the split's default direction,
-            # the same rule `Tree.goes_left` applies on the host. A feature
-            # with no missing bin passes -1, which no bin id can equal.
-            elif bin == missing_bin:
-                go_left = default_left != 0
-            else:
-                go_left = bin <= threshold_bin
-            if go_left:
-                leaf_ids[unsafe_offset=r] = left
-            else:
-                leaf_ids[unsafe_offset=r] = right
 
 
 def _fixed_scale(values: List[Float64]) raises -> Float32:
@@ -392,7 +138,9 @@ struct GpuHistogramBuilder(Movable):
 
     var ctx: DeviceContext
     var bins_dev: DeviceBuffer[DType.uint8]
-    var leaf_dev: DeviceBuffer[DType.int32]
+    # The device-resident active-row permutation and its per-leaf ranges;
+    # every histogram and every partition works through it.
+    var rows: GpuActiveRows
     var grad_dev: DeviceBuffer[DType.float32]
     var hess_dev: DeviceBuffer[DType.float32]
     # The feature ids builds accumulate, device side; the first `n_active`
@@ -454,6 +202,9 @@ struct GpuHistogramBuilder(Movable):
             self.caps, data.n_rows, data.n_features, data.n_bins, strategy
         )
         self.part_capacity = self.tiling.partial_cells
+        self.rows = GpuActiveRows(
+            self.ctx, data.n_rows, data.n_features, data.n_bins, self.caps
+        )
         self.g_scale = 1.0
         self.h_scale = 1.0
         self.has_gradients = False
@@ -464,9 +215,6 @@ struct GpuHistogramBuilder(Movable):
         var n_cells = data.n_rows * data.n_features
         var hist_size = data.n_features * data.n_bins
         self.bins_dev = self.ctx.enqueue_create_buffer[DType.uint8](n_cells)
-        self.leaf_dev = self.ctx.enqueue_create_buffer[DType.int32](
-            data.n_rows
-        )
         self.grad_dev = self.ctx.enqueue_create_buffer[DType.float32](
             data.n_rows
         )
@@ -496,8 +244,6 @@ struct GpuHistogramBuilder(Movable):
         self.host_out = self.ctx.enqueue_create_host_buffer[DType.int32](
             3 * hist_size
         )
-
-        self.ctx.enqueue_memset(self.leaf_dev, 0)
 
         # Upload the binned matrix once; it is reused every call. The copy
         # reads host memory owned by the caller's `data`, so it has to
@@ -609,28 +355,17 @@ struct GpuHistogramBuilder(Movable):
         self.upload_staged()
 
     def begin_tree(mut self, bag: List[Int] = []) raises:
-        """Reset every row's leaf assignment to the root node (id 0).
+        """Seed the tree's active rows and make the root (node 0) own all of
+        them.
 
-        A non-empty `bag` of row indices puts only those rows at the root
-        and marks the rest OUT_OF_BAG. No node id is ever negative, so an
-        out-of-bag row matches no `build_leaf` target and no `apply_split`
-        parent: it is invisible to every histogram and every partition for
-        the rest of this tree, without the gradients or the binned matrix
-        being touched. The bag costs one n_rows Int32 write, which is what
-        the unbagged reset costs as a memset.
+        Unbagged, the root range is the identity permutation, written by a
+        kernel so a tree costs no host-to-device row transfer at all. With a
+        non-empty `bag`, the bag's rows are staged in the caller's order and
+        the rows left out are simply not inside the root range: no sentinel
+        leaf id, no per-node filtering, and no cost for a row this tree
+        ignores. See gpu_active_rows.mojo.
         """
-        if len(bag) == 0:
-            self.ctx.enqueue_memset(self.leaf_dev, 0)
-            return
-        for i in range(len(bag)):
-            if bag[i] < 0 or bag[i] >= self.n_rows:
-                raise Error("bag row index out of range")
-        with self.leaf_dev.map_to_host() as host:
-            var dst = host.unsafe_ptr()
-            for r in range(self.n_rows):
-                dst.unsafe_store(r, OUT_OF_BAG)
-            for i in range(len(bag)):
-                dst.unsafe_store(bag[i], Int32(0))
+        self.rows.begin_tree(bag)
 
     def apply_split(
         mut self,
@@ -643,16 +378,25 @@ struct GpuHistogramBuilder(Movable):
         default_left: Bool = False,
         is_categorical: Bool = False,
         cat_bitset: CatBitset = cat_empty(),
+        expected_left: Int = -1,
     ) raises:
         """Reassign rows of `parent` to `left`/`right` by the chosen split,
-        entirely on the device. Rows in `missing_bin` follow `default_left`
-        instead of the threshold; -1 (the default) means the feature has no
-        missing bin and every row goes by the threshold.
+        entirely on the device: the parent's contiguous row range is stably
+        partitioned into the two children's. Rows in `missing_bin` follow
+        `default_left` instead of the threshold; -1 (the default) means the
+        feature has no missing bin and every row goes by the threshold.
 
         With `is_categorical`, `cat_bitset` is the node's category set and
         `threshold_bin`/`missing_bin`/`default_left` are ignored: a row goes
         left exactly when its bin is in the set, which is what
-        `Tree.goes_left` does on the host."""
+        `Tree.goes_left` does on the host.
+
+        `expected_left` is the left row count the caller already knows
+        exactly (the grower has it from the parent histogram's integer
+        counts). Passing it keeps the split fully enqueued; the default -1
+        downloads the device's own count, which synchronizes. With
+        `MOJOBOOST_GPU_VERIFY_ROWS=1` a supplied count is checked against
+        the device's anyway."""
         if feature < 0 or feature >= self.n_features:
             raise Error("split feature out of range")
         if not is_categorical and (
@@ -669,93 +413,53 @@ struct GpuHistogramBuilder(Movable):
             raise Error(
                 "child leaf ids must differ from the parent and each other"
             )
-        var threads = self.tiling.block_threads
-        var blocks = (self.n_rows + threads - 1) // threads
-        self.ctx.enqueue_function[_partition_kernel](
+        var routing: RowRouting
+        if is_categorical:
+            routing = RowRouting.categorical(feature, cat_bitset)
+        else:
+            routing = RowRouting.numerical(
+                feature, threshold_bin, missing_bin, default_left
+            )
+        _ = self.rows.partition(
             self.bins_dev.unsafe_ptr(),
-            self.leaf_dev.unsafe_ptr(),
-            Int32(self.n_rows),
-            Int32(feature),
-            Int32(threshold_bin),
-            Int32(parent),
-            Int32(left),
-            Int32(right),
-            Int32(missing_bin),
-            Int32(1) if default_left else Int32(0),
-            Int32(1) if is_categorical else Int32(0),
-            cat_bitset[0],
-            cat_bitset[1],
-            cat_bitset[2],
-            cat_bitset[3],
-            grid_dim=blocks,
-            block_dim=threads,
+            parent,
+            left,
+            right,
+            routing,
+            expected_left,
         )
 
     def enqueue_leaf(mut self, leaf: Int) raises:
-        """Enqueue the kernels building the histogram of the rows currently
-        assigned to `leaf`. Does not transfer or synchronize."""
+        """Enqueue the kernels building the histogram of the rows `leaf`
+        currently owns, reading only that node's compacted row range. Does
+        not transfer or synchronize. A small node gets a grid sized for its
+        own rows rather than for the dataset; see gpu_active_rows.mojo."""
         if not self.has_gradients:
             raise Error("call upload_gradients before build_leaf")
         if leaf < 0 or leaf > MAX_ROWS:
             raise Error("leaf id must be nonnegative and fit in Int32")
 
-        var hist_size = self.n_features * self.n_bins
         var n_slots = len(self.active)
-        var threads = self.tiling.block_threads
-        if self.tiling.strategy == STRATEGY_TILED:
-            # The reduction writes every active feature's slice, so the
-            # output only needs zeroing when some feature is inactive.
-            if n_slots < self.n_features:
-                self.ctx.enqueue_memset(self.out_dev, 0)
-            self.ctx.enqueue_function[_hist_partial_kernel](
-                self.bins_dev.unsafe_ptr(),
-                self.leaf_dev.unsafe_ptr(),
-                self.grad_dev.unsafe_ptr(),
-                self.hess_dev.unsafe_ptr(),
-                self.feat_dev.unsafe_ptr(),
-                self.part_dev.unsafe_ptr(),
-                Int32(self.n_rows),
-                Int32(n_slots),
-                Int32(self.n_bins),
-                Int32(self.tiling.rows_per_tile),
-                Int32(leaf),
-                Float32(self.g_scale),
-                Float32(self.h_scale),
-                grid_dim=(n_slots, self.tiling.n_tiles),
-                block_dim=threads,
-            )
-            var n_cells = 3 * n_slots * self.n_bins
-            var blocks = (n_cells + threads - 1) // threads
-            self.ctx.enqueue_function[_hist_reduce_kernel](
-                self.part_dev.unsafe_ptr(),
-                self.feat_dev.unsafe_ptr(),
-                self.out_dev.unsafe_ptr(),
-                Int32(n_slots),
-                Int32(self.n_bins),
-                Int32(hist_size),
-                Int32(self.tiling.n_tiles),
-                grid_dim=blocks,
-                block_dim=threads,
-            )
-        else:
-            self.ctx.enqueue_memset(self.out_dev, 0)
-            self.ctx.enqueue_function[_hist_leaf_kernel](
-                self.bins_dev.unsafe_ptr(),
-                self.leaf_dev.unsafe_ptr(),
-                self.grad_dev.unsafe_ptr(),
-                self.hess_dev.unsafe_ptr(),
-                self.feat_dev.unsafe_ptr(),
-                self.out_dev.unsafe_ptr(),
-                Int32(self.n_rows),
-                Int32(self.n_bins),
-                Int32(hist_size),
-                Int32(self.tiling.rows_per_tile),
-                Int32(leaf),
-                Float32(self.g_scale),
-                Float32(self.h_scale),
-                grid_dim=(n_slots, self.tiling.n_tiles),
-                block_dim=threads,
-            )
+        var tiling = self.rows.range_tiling(
+            self.caps,
+            leaf,
+            n_slots,
+            self.tiling.strategy,
+            self.part_capacity,
+        )
+        self.rows.enqueue_range_histogram(
+            tiling,
+            leaf,
+            self.bins_dev.unsafe_ptr(),
+            self.grad_dev.unsafe_ptr(),
+            self.hess_dev.unsafe_ptr(),
+            self.feat_dev.unsafe_ptr(),
+            self.out_dev.unsafe_ptr(),
+            self.part_dev.unsafe_ptr(),
+            n_slots,
+            Float32(self.g_scale),
+            Float32(self.h_scale),
+        )
 
     def download_raw(mut self) raises:
         """Copy the fixed-point histogram into pinned host memory and wait.

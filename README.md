@@ -646,8 +646,12 @@ Histogram accumulation launches a 2D grid: `grid.x` is the active feature,
 `grid.y` a tile of rows. A device therefore gets `n_active * n_tiles`
 threadgroups rather than one per feature, which is what lets a wide GPU stay
 busy on a dataset with few features. Each threadgroup accumulates a partial
-histogram for its (feature, row tile) in shared memory, filtering rows by
-the target leaf id.
+histogram for its (feature, row tile) in shared memory, reading only the
+target node's own rows: a device-resident, order-preserving permutation of
+the row indices keeps every live leaf's rows in one contiguous range, so a
+node's histogram costs that node's rows rather than a scan of the whole
+dataset, and the launch grid is sized per node from the rows it actually
+owns.
 
 Two strategies combine those partials:
 
@@ -844,10 +848,10 @@ Bags are drawn from a counter-based splitmix64 stream keyed by
 `(bagging_seed, bag index, row index)` rather than from a running RNG. A
 given bag therefore depends on nothing that happened before it, which is
 what lets the CPU and GPU trainers grow round *i* on identical rows, and
-what makes a run reproducible from the seed alone. On the GPU the bag rides
-the existing leaf-assignment array: out-of-bag rows are parked at a leaf id
-no histogram build can target, so nothing is compacted, copied, or
-reuploaded.
+what makes a run reproducible from the seed alone. On the GPU the bag seeds
+the root's device-side row range directly: rows outside the bag are simply
+not inside any leaf's range, so no kernel ever iterates them and a bagged
+tree costs one staged Int32 copy of the bag.
 
 Two intentional differences from LightGBM:
 

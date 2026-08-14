@@ -14,6 +14,12 @@ benchmarking and for tests that must force one path:
   threshold (`PARALLEL_MIN_OPS`), compared against the caller's op estimate
   (conventionally items * rows touched).
 
+The GPU backend adds its own variables, documented where they are read:
+`MOJOBOOST_GPU_HIST_STRATEGY` (gpu_tiling.mojo) and
+`MOJOBOOST_GPU_VERIFY_ROWS` (gpu_active_rows.mojo; `1` makes every device
+row partition verify its left count against the grower's histogram count,
+one host synchronization per split, off by default).
+
 Two dispatch shapes are provided. Both keep every floating-point summation
 order independent of the task count, so every result is bit-identical to the
 serial path on every machine and at every worker setting:

@@ -2,11 +2,15 @@
 
 `train_gpu` mirrors `train` in boosting.mojo but grows every tree through the
 GPU backend: one persistent `GpuHistogramBuilder` holds the binned matrix,
-gradients/hessians, and a per-row leaf-assignment array device-resident for
-the whole session. Per boosting round, the host uploads gradients once; per
-split, the device reassigns rows and builds the smaller child's histogram
-(the sibling comes from the subtraction trick on the host, where histograms
-are small: n_features * n_bins).
+gradients/hessians, and a device-resident active-row permutation in which
+every live leaf owns a contiguous row range (see gpu_active_rows.mojo).
+Per boosting round, the host uploads gradients once; per split, the device
+stably partitions the parent's range and builds the smaller child's
+histogram over exactly that child's rows (the sibling comes from the
+subtraction trick on the host, where histograms are small:
+n_features * n_bins). The grower hands the partition its exact left count
+from the parent histogram's integer counts, so a split enqueues without a
+host synchronization.
 
 Division of labor:
   CPU  boosting coordination, split selection over downloaded histograms,
@@ -150,10 +154,10 @@ def grow_tree_gpu(
     `grow_tree`, so equal split decisions yield identical tree layouts.
 
     A non-empty `bag` restricts growth to those rows, exactly as in
-    `grow_tree`: the device parks the rest out of bag (see
-    histogram_gpu.mojo), so bagged rows are the only rows any histogram,
-    count, or split on this tree sees. Both backends take the bag from the
-    same sampler, so the two grow on identical rows.
+    `grow_tree`: only the bag's rows are seeded into the root's device-side
+    row range (see gpu_active_rows.mojo), so bagged rows are the only rows
+    any histogram, count, or split on this tree sees. Both backends take the
+    bag from the same sampler, so the two grow on identical rows.
 
     Interaction constraints are tracked exactly as in `grow_tree`: the same
     branch feature sets, the same allow masks, and the same `_search` entry
@@ -264,6 +268,7 @@ def grow_tree_gpu(
             split.default_left,
             split.is_categorical,
             split.cat_bitset,
+            expected_left=n_left,
         )
 
         # Histogram subtraction trick: build the smaller child directly.
