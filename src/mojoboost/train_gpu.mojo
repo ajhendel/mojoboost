@@ -930,11 +930,42 @@ def _device_search_resident(
 
     The two children are then searched in one `enqueue_frontier` and brought
     home by one `download_frontier`, so a split costs one host wait rather
-    than one per child. Per split, that is: one histogram build, one
-    subtraction kernel, one search launch pair, one wait, and 272 bytes
-    across the bus. The host-search grower pays one build, one wait, a
-    `3 * n_features * n_bins` download, a host subtraction, and two host
-    scans; the incremental device loop pays two builds and two waits.
+    than one per child. Per split, that is: one histogram build with the
+    sibling subtraction folded into it, one search launch pair, one wait, and
+    272 bytes across the bus. The host-search grower pays one build, one
+    wait, a `3 * n_features * n_bins` download, a host subtraction, and two
+    host scans; the incremental device loop pays two builds and two waits.
+
+    What a split's fixed cost actually is
+    -------------------------------------
+    Eight launches and one wait, and on an Apple M4 (`pixi run
+    bench-launch-cost`, which measures both directly) that is about 20us of
+    enqueue per launch and about 126us for the wait: roughly 280us a split,
+    or 0.85s of a 3.05s run at 50000 x 100. Read those two numbers before
+    proposing anything whose whole benefit is fewer launches or fewer waits,
+    because they set the price. One launch removed is worth about 60ms over
+    a default run, near 2%, which is inside the benchmark harness's noise
+    floor -- so a fusion has to justify itself as strictly less work for an
+    identical result, not by a measured speedup.
+
+    The eight are four for the row partition (flag scan, block-sum scan,
+    scatter, copy back), two or three for the histogram (a conditional
+    zeroing, then either the atomic kernel or the partial and reduce pair),
+    and two for the split search. The wait is not one of the things that can
+    be removed: one per split is the floor while the host chooses the next
+    leaf, writes the tree, and draws per-node feature subsets.
+
+    Three fusions have already been examined and are not open. The output
+    zeroing is skipped already whenever the tiled path builds a full feature
+    set (`gpu_active_rows.enqueue_range_histogram`). Folding the split
+    search's per-record reduce into its per-slot scan needs a wider
+    threadgroup, and each scan thread owns a `MAX_SPLIT_BINS` categorical
+    sort scratch, so the shared allocation grows with the block -- the same
+    occupancy trap that made the earlier scan reshape measure inside noise.
+    Dropping the partition's copy-back needs a per-buffer staleness parity
+    carried across splits, because the scatter writes only the parent's
+    window and swapping whole buffers would invalidate every other leaf's
+    range; that is bookkeeping, not fusion.
 
     Nothing about a decision changes. The batch stages each node's own
     feature set, allow mask, and monotone interval into its own record, the
