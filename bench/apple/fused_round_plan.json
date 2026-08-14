@@ -90,15 +90,35 @@
       ]
     },
     {
-      "id": "partial_fusion",
-      "name": "Interleaved gradient and hessian plane",
-      "verdict": "not implemented, worth measuring first",
-      "verdict_basis": "outside this lane's files",
-      "statement": "Store the two derivatives as one interleaved plane so a row's pair is one eight-byte load in the histogram gather instead of two four-byte loads from two distant arrays.",
-      "structural_argument": "The histogram reads the derivative planes once per active feature at permuted row indices, which is the largest single term in the round after the bins themselves. Interleaving halves the number of gather transactions without changing a single value. It needs an edit to the histogram kernels, which this lane does not own.",
+      "id": "device_tree_router",
+      "name": "Device-side leaf assignment for every row",
+      "verdict": "implemented, unmeasured",
+      "verdict_basis": "closes the one thing blocking bagging from the device round",
+      "statement": "GpuTreeRouter assigns every row a leaf of the grown tree on the device and advances every row's raw score, so a bagged tree no longer needs a host tree walk over all rows.",
+      "structural_argument": "Bagging updates every row's raw score after every tree, in bag or not, and the leaf-range update covers only in-bag rows. That, and not the sample, is what kept bagging off the device round. The router adds no arithmetic: it composes _append_tree and _leaf_kernel from gpu_predict.mojo over the histogram builder's own binned matrix with GpuObjectiveState.update_raw, so the routing rule is not duplicated a sixth time and no second copy of the dataset is uploaded.",
+      "parity_note": "Routing is exact rather than approximate. Both this walk and the host's tree.predict_row decide on integer bins, so they take identical branches for every row; only the Float32 carrier of the added value differs, which is the device path's documented precision everywhere else. A bag depends on no gradient, so unlike GOSS there is no sampling caveat at all.",
+      "cost_note": "One launch and n_rows * depth bin reads per tree, against one launch per leaf over in-bag rows only for the range update. For an unbagged tree the ranges already cover every row and remain the cheaper path; this is for the bagged tree, whose alternative today is a host walk that also drags the objective back onto the host.",
       "evidence_required": [
-        "A memory-bandwidth counter reading on the root histogram kernel, so the share of gradient-plane reads that actually reach memory rather than cache is known. The whole case rests on that share and the cost model refuses to assume it.",
-        "The same reading at two feature counts an order of magnitude apart, since the re-read factor is the feature count."
+        "Predictions from a bagged GPU run against a bagged CPU run at equal seed, fraction, frequency, and rounds. Because the bag and the routing are both exact, this should agree to the Float32 tolerance the GPU trainer already documents, and a larger gap means a real defect rather than precision.",
+        "Per-tree wall clock for the router against the leaf-range update on an unbagged run, to confirm the ranges stay the cheaper path there and the router is not made the default.",
+        "Per-round wall clock for a bagged run, device round against the host-gradient fallback it replaces."
+      ]
+    },
+    {
+      "id": "interleaved_planes",
+      "name": "Interleaved gradient and hessian plane",
+      "verdict": "implemented, unmeasured, off by default",
+      "verdict_basis": "the transaction halving is unconditional; only the wall clock it buys is not",
+      "statement": "Store the two derivatives as one interleaved plane so a row's pair is gh[2r] and gh[2r+1], eight aligned bytes inside one cache line, instead of two four-byte loads from two planes n_rows apart.",
+      "structural_argument": "Below the root the row indices are a permutation, so the derivative reads are a gather: a warp of 32 threads touches up to 32 cache lines in the gradient plane and 32 more in the hessian plane. Interleaved, each thread's pair is inside one line, so the same warp touches 32 lines instead of 64. That halving holds whether the accesses hit or miss: on a miss it halves the lines fetched from memory, on a hit it halves the lookups. The root is the one node where it is neutral rather than a win, since the unbagged root's permutation is the identity and both layouts coalesce.",
+      "correction": "An earlier draft of this plan said the case rested entirely on a memory-bandwidth counter reading. That was overstated. The transaction count halves unconditionally; what the counter decides is how much wall clock that is worth at a given shape, which is a different and smaller question.",
+      "implementation_note": "Built additively in gpu_gradient_stream.mojo rather than by editing the histogram kernels in gpu_active_rows.mojo, which belong to another lane and were mid-flight. The two accumulation kernels are those kernels with exactly two lines changed, the two derivative loads; the reduction and zeroing kernels are imported and reused rather than copied. Selected by MOJOBOOST_GPU_GRAD_LAYOUT=interleaved, defaulting to the shipped split layout, so both layouts are runnable from one build, which is what comparing them requires.",
+      "costs": "8 * n_rows bytes of device memory for the plane, and one 16 * n_rows byte pack pass per round to fill it. The pack is paid once per round against a gather paid once per (node, feature); at fifty features and six histogram passes per tree it is under one percent of what it reorganizes. It disappears entirely if the derivative kernels are taught to write pairs directly, which is a change to gpu_objectives_native.mojo.",
+      "evidence_required": [
+        "Bit-identity of the histograms built both ways on the same gradients. The pack is a pure copy and the accumulation is unchanged, so any difference at all is a defect, not a precision result. This is the first thing to check and it needs no timing.",
+        "Per-node GPU duration for the histogram kernel, split against interleaved, at a node below the root where the permutation is genuinely scattered. The root is expected to be neutral and is not the test.",
+        "The same at two feature counts an order of magnitude apart, since the number of times the planes are re-read is the feature count.",
+        "Bytes read from device memory by the histogram kernel in both layouts, which is what turns the transaction argument into a wall-clock one."
       ]
     }
   ],
@@ -305,9 +325,19 @@
       "threshold": "Keep if the device path is faster at any shape in this plan and no shape regresses, and only after the sample-difference count per round is reported. A speedup that comes with an unreported sample difference is not a result."
     },
     {
-      "claim": "The interleaved derivative plane is worth building.",
-      "decided_by": "Bytes read from device memory by the root histogram kernel, at two feature counts an order of magnitude apart.",
-      "threshold": "Build it only if the measured bytes scale with the feature count, which is the claim that the re-reads reach memory. If they do not scale, the gather is cache-served and the change buys nothing."
+      "claim": "Row bagging may take the device round.",
+      "decided_by": "Prediction agreement between a bagged GPU run and a bagged CPU run at equal seed, fraction, frequency, and rounds.",
+      "threshold": "Ship only on agreement to the Float32 tolerance the GPU trainer already documents. Both the bag and the routing are exact, so a larger gap is a defect and not a precision result. This widens which configurations take the device path, so the check gates the device_gradients change, not just the router."
+    },
+    {
+      "claim": "The interleaved derivative plane is correct.",
+      "decided_by": "Bit-identity of histograms built both ways from the same gradients, on the same build, switched with MOJOBOOST_GPU_GRAD_LAYOUT.",
+      "threshold": "Any difference is a defect. The pack is a pure Float32 copy and the accumulation order, rounding, and atomics are unchanged, so there is no tolerance to allow here."
+    },
+    {
+      "claim": "The interleaved derivative plane should become the default.",
+      "decided_by": "Per-node histogram kernel duration at a node below the root, split against interleaved, at two feature counts an order of magnitude apart, plus bytes read from device memory in both layouts.",
+      "threshold": "Flip the default only if the interleaved layout wins at both feature counts and the root does not regress. The transaction count halves either way, so a null result means the gather was not the bottleneck at that shape, not that the layout is wrong; record it as such rather than as a refutation."
     },
     {
       "claim": "Any fusion of the objective into the histogram.",

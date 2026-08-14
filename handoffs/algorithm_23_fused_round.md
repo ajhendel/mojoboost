@@ -18,8 +18,8 @@ source says, not about what a run showed.
 
 | File | State |
 |---|---|
-| `src/mojoboost/gpu_fused_round.mojo` | New. Round-start drivers, the split magnitude reduction, the eligibility gate, and the traffic model. |
-| `src/mojoboost/gpu_gradient_stream.mojo` | New. Device row-selection metadata, the GOSS ranking plane, and single-pass host staging. |
+| `src/mojoboost/gpu_fused_round.mojo` | New. Round-start drivers, the split magnitude reduction, the device tree router that unblocks bagging, the eligibility gate, and the traffic model. |
+| `src/mojoboost/gpu_gradient_stream.mojo` | New. Device row-selection metadata, the GOSS ranking plane, single-pass host staging, and the interleaved derivative plane with its two histogram kernels. |
 | `bench/apple/fused_round_plan.json` | New. What would have to be measured before any of this is called faster. |
 | `handoffs/algorithm_23_fused_round.md` | This file. |
 
@@ -194,16 +194,58 @@ reason, and only one of them has it.
 Bagging is blocked, but by something else, and the lane found exactly one
 thing: bagging semantics update **every** row's raw score after every tree,
 in bag or not, so that out-of-bag rows carry correct gradients into later
-rounds (`bagging.mojo` module docstring says so explicitly). The device
-update walks leaf ranges, which by construction cover only in-bag rows.
-`update_raw`'s own docstring already flags this. Until out-of-bag rows are
-scored on the device, a bagged device round would train later rounds on
-stale derivatives, which is worse than merely different ones.
+rounds (`bagging.mojo` module docstring says so explicitly). The leaf-range
+update walks ranges, which by construction cover only in-bag rows.
+`update_raw`'s own docstring already flags this.
 
-`round_eligibility` in `gpu_fused_round.mojo` records the two reasons
-separately, as `ROUND_BAGGING_OUT_OF_BAG` and `ROUND_GOSS_RANK_PRECISION`,
-with `round_eligibility_reason` giving a sentence a caller can raise
-verbatim.
+`round_eligibility` records the two reasons separately, as
+`ROUND_BAGGING_OUT_OF_BAG` and `ROUND_GOSS_RANK_PRECISION`, with
+`round_eligibility_reason` giving a sentence a caller can raise verbatim.
+
+### 2b. `GpuTreeRouter`: the bagging blocker, closed
+
+That one blocker is now fixed rather than only named.
+
+`GpuTreeRouter.update_all_rows` assigns every row a leaf of the grown tree
+on the device and advances every row's raw score by
+`learning_rate * value[leaf]`, which is exactly what the host trainer's
+`raw[r] += learning_rate * tree.predict_row(data, r)` does over all rows.
+With it, a bagged run is eligible for the device round, and eligible with
+**no precision caveat at all**: a bag depends on no gradient, and the
+routing walk decides on integer bins, so the device and host trainers grow
+on identical rows and take identical branches. Only the Float32 carrier of
+the added value differs, which is the device path's documented precision
+everywhere else.
+
+It writes no kernel. The rule that sends a row left or right is already
+written five times over (`Tree.goes_left`, `SplitInfo.goes_left`,
+`RowRouting.goes_left`, `_predict_kernel`, `_leaf_kernel`) and the
+repository is explicit that they must not drift, so a sixth copy was not an
+option. The router flattens the tree with `_append_tree` and launches
+`_leaf_kernel`, both from `gpu_predict.mojo`, over the histogram builder's
+**own** `bins_dev` (no second copy of the dataset, and the two index it
+identically as `bins[feature * n_rows + row]`), then hands the device-side
+assignment to `GpuObjectiveState.update_raw`. Two shipped kernels,
+composed; no new arithmetic anywhere.
+
+One wrinkle worth knowing: `_leaf_kernel` reports leaf **ordinals**, not
+node ids, so `route` returns the tree's leaf values in ordinal order and
+that table is what `update_raw` is given. `_append_tree` numbers leaves in
+ascending node order and `route` builds the table by the same walk, so the
+two cannot disagree.
+
+Cost per tree: one launch and `n_rows * depth` bin reads, against the range
+update's one launch per leaf over in-bag rows only. **For an unbagged tree
+keep using the ranges**; they already cover every row and are cheaper. Use
+one or the other, never both, or the in-bag rows advance twice.
+
+**Debt this creates.** `_leaf_kernel` and `_append_tree` are
+underscore-private to `gpu_predict.mojo` and this module imports them
+across the package boundary. That is deliberate (the alternative was
+duplicating the routing rule) but it should not stay implicit: integration
+should promote both to public names, or move them to a module both the
+predictor and the trainer can depend on, so the coupling is declared rather
+than tolerated.
 
 What the selection provides:
 
@@ -237,6 +279,76 @@ of reads changed: 40 bytes per row down to 24.
 Chunked overlap of conversion with transfer was **not** built. It needs a
 copy into a sub-range of a device buffer, and the copy entry points reached
 from here take whole buffers. That is the follow-up.
+
+### 3b. `InterleavedGradients`: the derivative gather, halved
+
+A histogram reads a row's gradient and its hessian together, always, never
+one without the other. The shipped layout keeps them in two planes `n_rows`
+apart, so a thread issues two loads to two addresses sharing no cache line.
+Below the root the row indices are a permutation, so those loads are a
+gather: a warp of 32 threads touches up to 32 lines in the gradient plane
+and 32 more in the hessian plane.
+
+Interleaved, a row's pair is `gh[2r]` and `gh[2r + 1]`, eight bytes that
+are eight-byte aligned and therefore always inside one line. The same warp
+touches 32 lines instead of 64.
+
+**A correction to what I said earlier in this lane.** I first wrote that
+the case for this "rests entirely on a counter reading". That was
+overstated. The transaction count halves unconditionally: on a miss it
+halves the lines fetched from memory, on a hit it halves the lookups. What
+a measurement decides is how much wall clock that is worth at a given
+shape, which is a smaller and different question. The root is the one node
+where it is neutral rather than a win, since the unbagged root's
+permutation is the identity and both layouts coalesce perfectly.
+
+**Built additively, on purpose.** The two accumulation kernels are
+`_range_hist_partial_kernel` and `_range_hist_atomic_kernel` from
+`gpu_active_rows.mojo` with exactly two lines changed, the two derivative
+loads. That file, `histogram_gpu.mojo`, and `train_gpu.mojo` belong to
+task 07, which was mid-flight with a live GPU histogram performance lane
+when this was written, so editing them would have collided. Additive costs
+one duplication and buys three things: nothing existing changes, no
+signature moves and no test is invalidated, and **both layouts are
+runnable from one build**, which is what comparing them requires. The
+reduction and zeroing kernels are imported and reused, not copied, since
+they depend on the partial layout rather than on how the derivatives were
+read.
+
+Selected by `MOJOBOOST_GPU_GRAD_LAYOUT=interleaved`, defaulting to `split`.
+Off by default because it is unmeasured, which is the same rule every other
+device stage in this trainer follows.
+
+Results are bit-identical to the split path, and that is the first thing to
+check: `pack` copies Float32 with no arithmetic, so `gh[2r]` is exactly
+`grad[r]`, and the accumulation order, the fixed-point rounding, and the
+atomics are untouched. Any difference at all is a defect, not a precision
+result, so there is no tolerance to allow.
+
+Usage is a drop-in for `builder.enqueue_leaf`:
+
+```mojo
+var planes = InterleavedGradients(builder.ctx, data.n_rows)   # once
+# ... per round, after gradients are final and compensated ...
+planes.pack(builder.ctx, builder.grad_dev, builder.hess_dev)
+# ... per node, instead of builder.enqueue_leaf(leaf) ...
+enqueue_leaf_interleaved(builder, planes, leaf)
+builder.download_raw()                       # unchanged
+var hist = builder.histogram_from_host()     # unchanged
+```
+
+Costs `8 * n_rows` bytes of device memory (8 MB at a million rows) and one
+`16 * n_rows` byte pack pass per round. The pack is paid once per round
+against a gather paid once per (node, feature): at fifty features and six
+histogram passes per tree it is under one percent of what it reorganizes.
+It disappears entirely if `_grad_hess_kernel` is ever taught to write pairs
+directly, which is `gpu_objectives_native.mojo`'s call to make.
+
+**The duplication is a debt.** Integration should collapse the two kernel
+pairs into one pair parameterized by layout and delete these, exactly as
+`_range_reduce_kernel`'s own docstring asks for the copy that module
+already carries. Until then a change to the accumulation rule has to be
+made in both places, and that is the sharpest edge this lane leaves behind.
 
 ### 4. `RoundTraffic` and the three traffic functions
 
@@ -321,6 +433,71 @@ Three ordering constraints, all load-bearing:
   left out, which is what `_fixed_scale` does over the whole gradient list.
   That is the conservative side, since a histogram only reads a subset.
 
+### A bagged round on the device
+
+```mojo
+refresh_bag(bag, bagging, n, i)                  # unchanged host RNG
+enqueue_gradients(ctx, state, objective, alpha, grad_dev, hess_dev)
+enqueue_magnitudes(ctx, selection, mags, grad_dev, hess_dev)
+builder.begin_tree(bag)                          # bag seeds the root range
+var scales = mags.read_scales(ctx)
+# ... grow the tree ...
+router.update_all_rows(                          # NOT update_raw_device
+    ctx, state, tree, builder.bins_dev, params.learning_rate
+)
+```
+
+`selection` stays `select_all()` here: a bag changes which rows a tree sees,
+never what a row's derivatives are, so there is nothing to compensate. The
+one substitution against the unbagged loop is the last line, and it is the
+whole fix.
+
+### The `device_gradients` change in `train_gpu.mojo`
+
+This lane may not edit that file, so here is the change in full. The
+current body refuses bagging and GOSS together:
+
+```mojo
+    if bagging_enabled(bagging) or goss.enabled:
+        if s == OBJECTIVE_SOURCE_DEVICE:
+            raise Error(
+                "row sampling draws its sample from host-side gradients, so"
+                " bagging and GOSS cannot take the device objective path;"
+                ...
+```
+
+Bagging belongs on the device path once the trainer routes all rows, and
+its stated reason was never true of it. Split the test, and let the
+bagging arm depend on which raw-score update the loop calls rather than on
+bagging itself:
+
+```mojo
+    if goss.enabled:
+        # A GOSS sample is a ranking of |grad * hess|, so it does need
+        # host-side gradients unless the caller accepts a Float32 ranking.
+        if s == OBJECTIVE_SOURCE_DEVICE:
+            raise Error(...)          # message unchanged, minus bagging
+        return False
+    if bagging_enabled(bagging) and not routes_all_rows:
+        # Not the sample: the sample is an RNG draw. The out-of-bag rows'
+        # raw scores are what the leaf-range update does not cover.
+        if s == OBJECTIVE_SOURCE_DEVICE:
+            raise Error(
+                "a bagged device round has to advance every row's raw"
+                " score, in bag or not; use GpuTreeRouter.update_all_rows"
+            )
+        return False
+    return True
+```
+
+`round_eligibility(objective, n_classes, bagging_on, goss_on,
+allow_device_ranking, routes_all_rows)` already encodes exactly this, so
+the cheapest integration is to call it and translate the code rather than
+maintain a second copy of the rule. Note that this widens which
+configurations take the device path, so it changes behavior for existing
+bagged GPU runs and wants the parity check in the plan file before it
+ships.
+
 ### Multiclass
 
 `state.refresh_softmax(ctx)` once per round, before the first class, then
@@ -354,7 +531,10 @@ What is preserved exactly:
   `_softmax_inplace` does, and the drivers only call it.
 - **Bagging determinism.** Untouched. Bags come from `bagging.mojo` and are
   consumed by `begin_tree(bag)` as before; the selection is a device image
-  of a host decision, never a device decision.
+  of a host decision, never a device decision. `GpuTreeRouter` adds no
+  exposure either: it routes on integer bins, so it takes the same branch
+  the host tree walk takes for every row, and the only difference is the
+  Float32 carrier of the value it adds.
 - **GOSS compensation.** The multiplier, the threshold rule, the counts,
   and the warmup are all still `goss.mojo`.
 - **Custom-objective fallback.** Untouched and explicitly gated:
@@ -396,13 +576,13 @@ and which claim each one decides:
    equal seed and rounds**, reported alongside the per-round count of
    differing sampled rows. Decides whether device row selection ships. A
    speedup reported without the sample-difference count is not a result.
-3. **Bytes read from device memory by the root histogram kernel, at two
-   feature counts an order of magnitude apart.** Decides the interleaved
-   derivative plane, the largest remaining win and the one this lane could
-   not build because it needs the histogram kernels. If the measured bytes
-   do not scale with the feature count, the gather is cache-served and the
-   change buys nothing. The cost model deliberately refuses to assume
-   either way.
+3. **Histograms built both ways, compared bit for bit**, then per-node
+   kernel duration at a node **below the root** (the root is expected to be
+   neutral and is not the test), at two feature counts an order of
+   magnitude apart. Decides whether the interleaved plane becomes the
+   default. A null result means the gather was not the bottleneck at that
+   shape, not that the layout is wrong: the transaction count halves either
+   way. Record it as such.
 4. **Nothing decides the objective-into-histogram fusion.** It is refused
    on the circular dependency between the fixed-point scale and the
    gradients it quantizes. Reopening it means changing how histograms
@@ -418,13 +598,22 @@ and which claim each one decides:
    `GpuObjectiveState` an enqueue/read split and delete
    `_magnitude_partials_kernel`, or delete `_abs_sum_kernel` and route
    `magnitude_sums` through `MagnitudeReader`. The second is smaller.
-3. **Score out-of-bag rows on the device**, which is the single thing
-   standing between row bagging and the device round. Two candidates: reset
-   the permutation to the identity and replay the tree's splits so every
-   row lands in a leaf range, or walk the tree on the device with the
-   predictor that already exists in `gpu_predict.mojo` and skip the range
-   update entirely. The second looks cheaper and reuses shipped code.
-4. **Sub-range device copies**, which would let `HostGradientStage` overlap
+3. **Promote `_leaf_kernel` and `_append_tree`** out of
+   `gpu_predict.mojo`'s private surface, or move them somewhere both the
+   predictor and the trainer can depend on, so `GpuTreeRouter`'s reuse of
+   them is a declared dependency rather than a cross-module reach into
+   private names.
+4. **Apply the `device_gradients` split** above, behind the parity check in
+   the plan file, since it widens which configurations take the device
+   path.
+5. **Sub-range device copies**, which would let `HostGradientStage` overlap
    conversion with transfer instead of only fusing its passes.
-5. **The interleaved derivative plane**, after question 3 above is
-   answered and not before.
+6. **Collapse the duplicated histogram kernels.** The interleaved pair in
+   `gpu_gradient_stream.mojo` and the split pair in `gpu_active_rows.mojo`
+   differ by two lines and must not drift. One pair parameterized by layout
+   replaces both. This is task 07's file, so it is a conversation with that
+   lane rather than an edit to make unilaterally.
+7. **Teach `_grad_hess_kernel` to write pairs directly**, which deletes the
+   pack pass entirely. That is `gpu_objectives_native.mojo`, another lane's
+   file, and it is only worth raising once the layout has earned its
+   default.

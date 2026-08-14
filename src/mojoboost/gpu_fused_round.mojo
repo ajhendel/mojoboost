@@ -77,11 +77,20 @@ shared reason ("row sampling draws its sample from host-side gradients")
 that is only true of one of them. A GOSS selection is a ranking over
 gradient values. A bag is not: `sample_rows` draws from a counter stream
 keyed by (seed, bag index, row) and never reads a derivative. Bagging is
-blocked by something else entirely, and by exactly one thing, which the
-codes below name: bagging requires every row's raw score to advance after
-each tree, in bag or not, and the device update walks leaf ranges that
-cover only the in-bag rows. The handoff spells out the two ways to close
-that.
+blocked by something else entirely, and by exactly one thing: bagging
+requires every row's raw score to advance after each tree, in bag or not,
+and the leaf-range update covers only the in-bag rows.
+
+`GpuTreeRouter` closes that one thing. It assigns every row a leaf of the
+grown tree on the device and hands the assignment to the raw-score update
+that already exists, so a bagged tree advances every row's score without a
+host tree walk and without the round leaving the device path. It writes no
+kernel of its own: the routing walk and the score update are both shipped
+kernels, composed, which is the only acceptable way to add a sixth caller
+of a rule that is already written five times. With it,
+`round_eligibility` reports a bagged run as eligible, and with no
+precision caveat, since a bag depends on no gradient and the walk decides
+on integer bins.
 """
 
 from std.gpu import block_idx, thread_idx
@@ -92,8 +101,10 @@ from max.gpu.memory import AddressSpace
 from max.gpu.sync import barrier
 
 from .boosting import CUSTOM
+from .categorical import CAT_BITSET_WORDS
 from .gpu_gradient_stream import GpuRowSelection
 from .gpu_objectives_native import (
+    DEFAULT_MAX_NODES,
     SUM_BLOCKS,
     SUM_THREADS,
     GpuObjectiveState,
@@ -101,6 +112,9 @@ from .gpu_objectives_native import (
     device_fixed_scale,
     supports_device_objective,
 )
+from .gpu_predict import NODE_STRIDE, _append_tree, _leaf_kernel
+from .gpu_tiling import derive_block_threads, query_device_caps
+from .tree import Tree
 
 # Element sizes the cost model counts in. The device carries gradients,
 # hessians, raw scores, targets, and weights as Float32, row ids and
@@ -392,8 +406,222 @@ def softmax_round_start(
     return mags.read_scales(ctx)
 
 
+struct GpuTreeRouter(Movable):
+    """Every row's leaf in a grown tree, device side, so that a bagged
+    round can advance every row's raw score without leaving the device.
+
+    This is the one thing that blocks row bagging from the device
+    objective path. Bagging updates every row's raw score after every
+    tree, in bag or not, so that an out-of-bag row carries a correct
+    gradient into later rounds (`bagging.mojo` says so explicitly). The
+    device update walks the leaf ranges the grower left behind, and those
+    cover only the rows the tree was grown on, so the out-of-bag rows keep
+    stale scores. `update_raw`'s own docstring already flags it and names
+    the two ways out; this is the cheaper of them.
+
+    How it avoids being a sixth copy of the routing rule. The rule that
+    sends a row left or right is already written five times over
+    (`Tree.goes_left`, `SplitInfo.goes_left`, `RowRouting.goes_left`,
+    `_predict_kernel`, `_leaf_kernel`) and the repository's comments are
+    explicit that they must not drift. So this struct writes no kernel at
+    all. It flattens the tree with `_append_tree` and launches
+    `_leaf_kernel`, both from gpu_predict.mojo, over the histogram
+    builder's own binned matrix, and hands the result to
+    `GpuObjectiveState.update_raw`, which already applies
+    `learning_rate * value[leaf]` per row. Two shipped kernels, composed;
+    no new arithmetic anywhere.
+
+    Because `_leaf_kernel` reports leaf *ordinals* rather than node ids,
+    `route` returns the tree's leaf values in ordinal order, which is
+    exactly the table `update_raw` should then be given. Ordinals are
+    assigned to leaves in ascending node order in `_append_tree`, and the
+    table is built by the same walk, so the two cannot disagree.
+
+    Cost and when to use it. One launch and `n_rows * depth` bin reads per
+    tree, against the range update's one launch per leaf over the in-bag
+    rows only. For an unbagged tree the ranges already cover every row and
+    are cheaper, so use them; this exists for the bagged tree, where the
+    alternative today is a host-side tree walk over every row, which also
+    drags the whole objective back onto the host.
+
+    Use one or the other, never both. `update_raw_ranges` and
+    `update_all_rows` each add a full `learning_rate * value` step, so
+    calling both would advance the in-bag rows twice.
+
+    Routing here is exact, not approximate. Both this walk and the host's
+    `tree.predict_row` route on integer bins, so they take identical
+    branches; only the Float32 carrier of the value added differs, which
+    is the device path's documented precision everywhere else.
+    """
+
+    var nodes_dev: DeviceBuffer[DType.int32]
+    var cat_dev: DeviceBuffer[DType.uint64]
+    var root_dev: DeviceBuffer[DType.int32]
+    var leaf_dev: DeviceBuffer[DType.int32]
+    """One leaf ordinal per row, device resident. This is what
+    `update_raw` consumes, so the assignment never reaches the host."""
+    var stage_nodes: HostBuffer[DType.int32]
+    var stage_cat: HostBuffer[DType.uint64]
+    var stage_root: HostBuffer[DType.int32]
+    var n_rows: Int
+    var max_nodes: Int
+    var cat_capacity: Int
+    var block_threads: Int
+
+    def __init__(
+        out self,
+        ctx: DeviceContext,
+        n_rows: Int,
+        max_nodes: Int = DEFAULT_MAX_NODES,
+    ) raises:
+        """Allocate for the largest tree this session will grow. A tree
+        has `2 * num_leaves - 1` nodes, so the default covers num_leaves up
+        to 1024, the same bound `GpuObjectiveState` takes."""
+        if n_rows < 1:
+            raise Error("tree routing requires at least one row")
+        if max_nodes < 1:
+            raise Error("max_nodes must be positive")
+        self.n_rows = n_rows
+        self.max_nodes = max_nodes
+        self.cat_capacity = max_nodes * CAT_BITSET_WORDS
+        self.block_threads = derive_block_threads(query_device_caps(ctx))
+
+        var node_cells = max_nodes * NODE_STRIDE
+        self.nodes_dev = ctx.enqueue_create_buffer[DType.int32](node_cells)
+        self.cat_dev = ctx.enqueue_create_buffer[DType.uint64](
+            self.cat_capacity
+        )
+        self.root_dev = ctx.enqueue_create_buffer[DType.int32](1)
+        self.leaf_dev = ctx.enqueue_create_buffer[DType.int32](n_rows)
+        self.stage_nodes = ctx.enqueue_create_host_buffer[DType.int32](
+            node_cells
+        )
+        self.stage_cat = ctx.enqueue_create_host_buffer[DType.uint64](
+            self.cat_capacity
+        )
+        self.stage_root = ctx.enqueue_create_host_buffer[DType.int32](1)
+
+        # The uploads below take whole buffers, so a tree smaller than the
+        # capacity still transfers the tail. No walk reads past the nodes
+        # the tree actually has, since `_append_tree` validates that every
+        # child link points forward and stays inside the tree, so this is
+        # hygiene rather than correctness.
+        var dst_nodes = self.stage_nodes.unsafe_ptr()
+        for i in range(node_cells):
+            dst_nodes.unsafe_store(i, Int32(0))
+        var dst_cat = self.stage_cat.unsafe_ptr()
+        for i in range(self.cat_capacity):
+            dst_cat.unsafe_store(i, UInt64(0))
+
+    def route(
+        mut self,
+        ctx: DeviceContext,
+        tree: Tree,
+        mut bins_dev: DeviceBuffer[DType.uint8],
+    ) raises -> List[Float64]:
+        """Assign every row a leaf of `tree` and return the tree's leaf
+        values in ordinal order.
+
+        `bins_dev` is the histogram builder's own binned matrix, so no
+        second copy of the dataset is uploaded or kept; the two index it
+        identically, as `bins[feature * n_rows + row]`.
+
+        Enqueued, not synchronized: the assignment stays on the device and
+        the returned table is host-side arithmetic over the tree the
+        caller already holds.
+        """
+        var n_nodes = len(tree.feature)
+        if n_nodes < 1:
+            raise Error("cannot route rows through a tree with no nodes")
+        if n_nodes > self.max_nodes:
+            raise Error(
+                "tree has more nodes than the router was constructed for;"
+                " construct with a larger max_nodes"
+            )
+
+        # `_append_tree` rebases the links, assigns the leaf ordinals, and
+        # raises on a link that does not point forward, which is what
+        # guarantees the device walk terminates instead of hanging.
+        var nodes = List[Int32](capacity=NODE_STRIDE * n_nodes)
+        var values = List[Float32](capacity=n_nodes)
+        var cat_pool = List[UInt64]()
+        var tree_root = List[Int32](capacity=1)
+        _append_tree(tree, nodes, values, cat_pool, tree_root)
+        if len(cat_pool) > self.cat_capacity:
+            raise Error(
+                "tree carries more categorical bitset words than the router"
+                " was constructed for"
+            )
+
+        # Any copy still reading the staging buffers has to finish before
+        # they are overwritten.
+        ctx.synchronize()
+        var dst_nodes = self.stage_nodes.unsafe_ptr()
+        for i in range(len(nodes)):
+            dst_nodes.unsafe_store(i, nodes[i])
+        var dst_cat = self.stage_cat.unsafe_ptr()
+        for i in range(len(cat_pool)):
+            dst_cat.unsafe_store(i, cat_pool[i])
+        self.stage_root.unsafe_ptr().unsafe_store(0, tree_root[0])
+        ctx.enqueue_copy(dst_buf=self.nodes_dev, src_ptr=dst_nodes)
+        ctx.enqueue_copy(dst_buf=self.cat_dev, src_ptr=dst_cat)
+        ctx.enqueue_copy(
+            dst_buf=self.root_dev, src_ptr=self.stage_root.unsafe_ptr()
+        )
+
+        var blocks = (
+            self.n_rows + self.block_threads - 1
+        ) // self.block_threads
+        # One output, one iteration: the kernel's per-row slot collapses to
+        # `leaves[r]`, which is the layout `update_raw` reads.
+        ctx.enqueue_function[_leaf_kernel](
+            bins_dev.unsafe_ptr(),
+            self.nodes_dev.unsafe_ptr(),
+            self.cat_dev.unsafe_ptr(),
+            self.root_dev.unsafe_ptr(),
+            self.leaf_dev.unsafe_ptr(),
+            Int32(self.n_rows),
+            Int32(1),
+            Int32(0),
+            Int32(1),
+            grid_dim=(blocks, 1),
+            block_dim=self.block_threads,
+        )
+
+        # Leaf values in ordinal order. `_append_tree` numbers the leaves
+        # in ascending node order, and so does this, so entry `o` is the
+        # value of the leaf `_leaf_kernel` reports as ordinal `o`.
+        var ordinal_values = List[Float64](capacity=tree.n_leaves)
+        for i in range(n_nodes):
+            if tree.feature[i] < 0:
+                ordinal_values.append(tree.value[i])
+        return ordinal_values^
+
+    def update_all_rows(
+        mut self,
+        ctx: DeviceContext,
+        mut state: GpuObjectiveState,
+        tree: Tree,
+        mut bins_dev: DeviceBuffer[DType.uint8],
+        learning_rate: Float64,
+        k: Int = 0,
+    ) raises:
+        """Advance every row's raw score by `tree`, in bag or not.
+
+        The bagged counterpart of `update_raw_ranges`, and the equivalent
+        of the host trainer's `raw[r] += learning_rate * tree.predict_row(
+        data, r)` over all rows. Call after the tree is grown and before
+        the next `begin_tree`; do not also call `update_raw_ranges` for the
+        same tree.
+        """
+        var ordinal_values = self.route(ctx, tree, bins_dev)
+        state.update_raw(
+            ctx, self.leaf_dev, ordinal_values, learning_rate, k
+        )
+
+
 # Why a configuration can or cannot take the device round. These are
-# reasons, not a ranking: a caller that asked for the device path
+# reasons, not a ranking: a caller that asked for the device round
 # explicitly should be told which one applies rather than being quietly
 # downgraded, which is the contract `device_gradients` already has.
 comptime ROUND_OK = 0
@@ -409,6 +637,7 @@ def round_eligibility(
     bagging_on: Bool,
     goss_on: Bool,
     allow_device_ranking: Bool = False,
+    routes_all_rows: Bool = False,
 ) raises -> Int:
     """Which reason, if any, keeps this configuration off the device
     round.
@@ -420,15 +649,21 @@ def round_eligibility(
 
     `ROUND_BAGGING_OUT_OF_BAG` is the bagging blocker, and it is not the
     sample. A bag is drawn from a counter stream and needs no gradients,
-    so the sample itself is free to be device side. What is not yet
-    device side is the raw-score update for the rows the bag left out:
+    so the sample itself is free to be device side. What the leaf-range
+    update does not cover is the raw score of the rows the bag left out:
     bagging semantics update every row's score after every tree, in bag
     or not, so that an out-of-bag row carries a correct gradient into
-    later rounds, and the device update walks leaf ranges that by
-    construction cover only in-bag rows. Until those rows are scored on
-    the device the bagged round is not equivalent to the host one, and a
-    trainer that took this path anyway would train later rounds on stale
+    later rounds, and the ranges by construction cover only in-bag rows.
+    A trainer that ignored that would train later rounds on stale
     derivatives rather than merely different ones.
+
+    `routes_all_rows` is the caller stating that it advances the raw
+    scores with `GpuTreeRouter.update_all_rows` rather than with
+    `update_raw_ranges`, which covers every row and closes exactly that
+    gap. With it, a bagged run is eligible, and eligible with no
+    precision caveat at all: the bag does not depend on a gradient and
+    the routing walk decides on integer bins, so the device and host
+    trainers grow on identical rows and take identical branches.
 
     `ROUND_GOSS_RANK_PRECISION` is a warning turned into a gate. Every
     stage of a GOSS round can run on the device, but the selection is a
@@ -449,7 +684,7 @@ def round_eligibility(
     # without appearing in `supports_device_objective`.
     if n_classes == 1 and not supports_device_objective(objective):
         return ROUND_NO_DEVICE_KERNEL
-    if bagging_on:
+    if bagging_on and not routes_all_rows:
         return ROUND_BAGGING_OUT_OF_BAG
     if goss_on and not allow_device_ranking:
         return ROUND_GOSS_RANK_PRECISION
@@ -474,9 +709,10 @@ def round_eligibility_reason(code: Int) -> String:
     if code == ROUND_BAGGING_OUT_OF_BAG:
         return String(
             "row bagging updates every row's raw score after every tree,"
-            " and the device update covers only the rows inside a leaf"
+            " and the leaf-range update covers only the rows inside a"
             " range, so the out-of-bag rows would carry stale derivatives"
-            " into later rounds"
+            " into later rounds; advance the scores with"
+            " GpuTreeRouter.update_all_rows and pass routes_all_rows=True"
         )
     if code == ROUND_GOSS_RANK_PRECISION:
         return String(

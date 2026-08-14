@@ -1,9 +1,15 @@
-"""Row-selection metadata and single-pass gradient staging for a GPU round.
+"""Gradient planes for a GPU round: their layout, their staging, and the
+row sample that scales them.
 
-This module holds the two pieces of the start of a boosting round that are
+This module holds the pieces of the start of a boosting round that are
 neither the objective itself (gpu_objectives_native.mojo) nor the histogram
 (histogram_gpu.mojo, gpu_active_rows.mojo), and that today force a round
 onto a slower path than the hardware needs.
+
+There are three, and the third has its own banner further down: a device
+image of a row sample, a one-pass host staging path for gradients that
+genuinely originate on the host, and the interleaved derivative plane,
+which changes how every histogram in a tree reads the two derivatives.
 
 `GpuRowSelection` is the device image of a row sample. A sample is two
 arrays, the selected row ids and their compensation multipliers, and the
@@ -57,6 +63,12 @@ into a sub-range of a device buffer, and the copy entry points reached
 from here take whole buffers. The single fused pass is the part that does
 not need it; the handoff names the sub-range copy as the follow-up.
 
+No edit to the shipped histogram kernels. The interleaved path below is
+additive and off by default, so the split-plane path it competes with is
+byte for byte the one that shipped, and the two can be run against each
+other on one build. That is a requirement of measuring them, not only a
+courtesy to the lane that owns those files.
+
 Precision
 ---------
 The device carries gradients, hessians, and multipliers as Float32. The
@@ -72,13 +84,57 @@ exposure, because a bag is drawn from a counter stream keyed by
 (seed, bag index, row) and never looks at a gradient.
 """
 
-from std.math import isfinite
-from std.gpu import global_idx
+from std.atomic import Atomic
+from std.gpu import block_dim, block_idx, global_idx, thread_idx
+from std.math import isfinite, round
+from std.memory import stack_allocation
+from std.os import getenv
 from max.gpu.host import DeviceBuffer, DeviceContext, HostBuffer
+from max.gpu.memory import AddressSpace
+from max.gpu.sync import barrier
 
 from .goss import GossSelection
+from .gpu_active_rows import (
+    GpuActiveRows,
+    _range_reduce_kernel,
+    _zero_int32_kernel,
+)
 from .gpu_objectives_native import GradMagnitudes
-from .gpu_tiling import derive_block_threads, query_device_caps
+from .gpu_tiling import (
+    STRATEGY_TILED,
+    HistogramTiling,
+    derive_block_threads,
+    query_device_caps,
+)
+from .histogram_gpu import GpuHistogramBuilder
+
+# The widest histogram a threadgroup's shared partial holds, as in
+# histogram_gpu.mojo and gpu_active_rows.mojo. Each of those defines it
+# for itself; this follows that rather than reaching for one of theirs.
+comptime MAX_BINS = 256
+
+# Which layout the derivative planes are in when a histogram reads them.
+# SPLIT is the shipped one, two Float32 planes indexed by row. INTERLEAVED
+# is the pair layout below. The default is SPLIT: the interleaved path is
+# unmeasured, and this module's contract is that nothing changes until a
+# benchmark says it should.
+comptime LAYOUT_SPLIT = 0
+comptime LAYOUT_INTERLEAVED = 1
+
+
+def env_grad_layout() -> Int:
+    """`MOJOBOOST_GPU_GRAD_LAYOUT` as a layout constant. Anything other
+    than `interleaved` is the shipped split layout, so an unset or
+    misspelled variable cannot silently move a run onto the new path."""
+    if getenv("MOJOBOOST_GPU_GRAD_LAYOUT") == "interleaved":
+        return LAYOUT_INTERLEAVED
+    return LAYOUT_SPLIT
+
+
+def layout_name(layout: Int) -> String:
+    if layout == LAYOUT_INTERLEAVED:
+        return String("interleaved")
+    return String("split")
 
 
 def _row_scale_kernel(
@@ -489,3 +545,431 @@ struct HostGradientStage(Movable):
             raise Error("call stage before upload")
         ctx.enqueue_copy(dst_buf=grad_dev, src_ptr=self.stage_g.unsafe_ptr())
         ctx.enqueue_copy(dst_buf=hess_dev, src_ptr=self.stage_h.unsafe_ptr())
+
+
+# --------------------------------------------------------------------------
+# The interleaved derivative plane.
+#
+# A histogram reads a row's gradient and its hessian together, always, and
+# never one without the other. The shipped layout keeps them in two planes
+# `n_rows` apart, so a thread issues two loads to two addresses that share
+# no cache line. Below the root the row indices are a permutation, so those
+# loads are a gather: a warp of 32 threads touches up to 32 lines in the
+# gradient plane and 32 more in the hessian plane.
+#
+# Interleaved, a row's pair is `gh[2r]` and `gh[2r + 1]`, eight bytes that
+# are eight-byte aligned and therefore always inside one cache line. The
+# same warp touches 32 lines instead of 64.
+#
+# That halving is unconditional, and it is worth being precise about why,
+# because an earlier draft of this lane's handoff overstated the
+# uncertainty. Whether the gather hits or misses, the transaction count
+# halves: on a miss it halves the lines fetched from memory, on a hit it
+# halves the lookups. What a measurement is still needed for is how much
+# wall clock that buys, which depends on whether the gather is the
+# bottleneck at a given shape, and on nothing here.
+#
+# The root is the one node where it is neutral rather than a win: the
+# unbagged root's permutation is the identity, so both layouts read
+# consecutive rows and both coalesce perfectly.
+#
+# Why this lives here rather than in the histogram modules. The kernels
+# below are `_range_hist_partial_kernel` and `_range_hist_atomic_kernel`
+# from gpu_active_rows.mojo with exactly two lines changed, the two loads.
+# Those files belong to another lane and were mid-flight when this was
+# written, so this path is additive: nothing existing changes, no signature
+# moves, no test is invalidated, and the two layouts stay side by side,
+# which is what comparing them needs anyway. THE DUPLICATION IS A DEBT.
+# Integration should collapse the two pairs into one pair parameterized by
+# layout and delete these, exactly as `_range_reduce_kernel`'s own
+# docstring asks for the copy that module already carries. Until then, a
+# change to the accumulation rule has to be made in both places.
+#
+# The reduction and the zeroing kernels are not duplicated: they depend on
+# the partial layout and not on how the derivatives were read, so this
+# imports and reuses them.
+#
+# Results are bit-identical to the split path. `pack` copies Float32
+# values with no arithmetic, so `gh[2r]` is exactly `grad[r]`, and the
+# accumulation order, the fixed-point rounding, and the atomics are
+# unchanged. A histogram built either way is the same integer histogram.
+# --------------------------------------------------------------------------
+
+
+def _pack_gh_kernel(
+    grad: MutPointer[Float32, MutAnyOrigin],
+    hess: MutPointer[Float32, MutAnyOrigin],
+    gh: MutPointer[Float32, MutAnyOrigin],
+    n_rows: Int32,
+):
+    """Interleave the two derivative planes into pairs. One row per
+    thread, a pure copy: no arithmetic, so no value changes."""
+    var r = global_idx.x
+    if r >= Int(n_rows):
+        return
+    var i = 2 * r
+    gh[unsafe_offset=i] = grad[unsafe_offset=r][0]
+    gh[unsafe_offset = i + 1] = hess[unsafe_offset=r][0]
+
+
+def _range_hist_partial_gh_kernel(
+    bins: MutPointer[UInt8, MutAnyOrigin],
+    rows: MutPointer[Int32, MutAnyOrigin],
+    gh: MutPointer[Float32, MutAnyOrigin],
+    feat_ids: MutPointer[Int32, MutAnyOrigin],
+    partials: MutPointer[Int32, MutAnyOrigin],
+    n_rows: Int32,
+    n_slots: Int32,
+    n_bins: Int32,
+    rows_per_tile: Int32,
+    begin: Int32,
+    count: Int32,
+    g_scale: Float32,
+    h_scale: Float32,
+):
+    """`_range_hist_partial_kernel` reading one interleaved plane instead
+    of two. Same partial layout, same write-once-no-atomics contract, so
+    the existing reduction kernel combines these partials unchanged."""
+    var slot = Int(block_idx.x)
+    var f = Int(feat_ids[unsafe_offset=slot][0])
+    var t = block_idx.y
+    var tid = thread_idx.x
+    var nb = Int(n_bins)
+    var nr = Int(n_rows)
+    var n = Int(count)
+    var plane = Int(n_slots) * nb
+
+    var sg = stack_allocation[
+        MAX_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
+    ]()
+    var sh = stack_allocation[
+        MAX_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
+    ]()
+    var sc = stack_allocation[
+        MAX_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
+    ]()
+
+    var b = tid
+    while b < nb:
+        sg[unsafe_offset=b] = 0
+        sh[unsafe_offset=b] = 0
+        sc[unsafe_offset=b] = 0
+        b += block_dim.x
+    barrier()
+
+    var tile_begin = t * Int(rows_per_tile)
+    var tile_end = tile_begin + Int(rows_per_tile)
+    if tile_end > n:
+        tile_end = n
+
+    var col = f * nr
+    var j = tile_begin + tid
+    while j < tile_end:
+        var r = Int(rows[unsafe_offset = Int(begin) + j][0])
+        var bin = Int(bins[unsafe_offset = col + r])
+        # The one change from the split-plane kernel: both derivatives
+        # come from one eight-byte aligned pair rather than from two
+        # planes n_rows apart.
+        var gi = 2 * r
+        var gq = Int32(round(gh[unsafe_offset=gi][0] * g_scale))
+        var hq = Int32(round(gh[unsafe_offset = gi + 1][0] * h_scale))
+        _ = Atomic.fetch_add(sg.unsafe_offset(bin), gq)
+        _ = Atomic.fetch_add(sh.unsafe_offset(bin), hq)
+        _ = Atomic.fetch_add(sc.unsafe_offset(bin), Int32(1))
+        j += block_dim.x
+    barrier()
+
+    var base = t * 3 * plane + slot * nb
+    b = tid
+    while b < nb:
+        partials[unsafe_offset = base + b] = sg[unsafe_offset=b][0]
+        partials[unsafe_offset = base + plane + b] = sh[unsafe_offset=b][0]
+        partials[unsafe_offset = base + 2 * plane + b] = sc[
+            unsafe_offset=b
+        ][0]
+        b += block_dim.x
+
+
+def _range_hist_atomic_gh_kernel(
+    bins: MutPointer[UInt8, MutAnyOrigin],
+    rows: MutPointer[Int32, MutAnyOrigin],
+    gh: MutPointer[Float32, MutAnyOrigin],
+    feat_ids: MutPointer[Int32, MutAnyOrigin],
+    out_hist: MutPointer[Int32, MutAnyOrigin],
+    n_rows: Int32,
+    n_bins: Int32,
+    hist_size: Int32,
+    rows_per_tile: Int32,
+    begin: Int32,
+    count: Int32,
+    g_scale: Float32,
+    h_scale: Float32,
+):
+    """`_range_hist_atomic_kernel` reading one interleaved plane instead
+    of two."""
+    var f = Int(feat_ids[unsafe_offset = Int(block_idx.x)][0])
+    var tid = thread_idx.x
+    var nb = Int(n_bins)
+    var nr = Int(n_rows)
+    var hs = Int(hist_size)
+    var n = Int(count)
+
+    var sg = stack_allocation[
+        MAX_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
+    ]()
+    var sh = stack_allocation[
+        MAX_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
+    ]()
+    var sc = stack_allocation[
+        MAX_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
+    ]()
+
+    var b = tid
+    while b < nb:
+        sg[unsafe_offset=b] = 0
+        sh[unsafe_offset=b] = 0
+        sc[unsafe_offset=b] = 0
+        b += block_dim.x
+    barrier()
+
+    var tile_begin = block_idx.y * Int(rows_per_tile)
+    var tile_end = tile_begin + Int(rows_per_tile)
+    if tile_end > n:
+        tile_end = n
+
+    var col = f * nr
+    var j = tile_begin + tid
+    while j < tile_end:
+        var r = Int(rows[unsafe_offset = Int(begin) + j][0])
+        var bin = Int(bins[unsafe_offset = col + r])
+        var gi = 2 * r
+        var gq = Int32(round(gh[unsafe_offset=gi][0] * g_scale))
+        var hq = Int32(round(gh[unsafe_offset = gi + 1][0] * h_scale))
+        _ = Atomic.fetch_add(sg.unsafe_offset(bin), gq)
+        _ = Atomic.fetch_add(sh.unsafe_offset(bin), hq)
+        _ = Atomic.fetch_add(sc.unsafe_offset(bin), Int32(1))
+        j += block_dim.x
+    barrier()
+
+    var base = f * nb
+    b = tid
+    while b < nb:
+        if sc[unsafe_offset=b][0] != 0:
+            _ = Atomic.fetch_add(
+                out_hist.unsafe_offset(base + b), sg[unsafe_offset=b][0]
+            )
+            _ = Atomic.fetch_add(
+                out_hist.unsafe_offset(hs + base + b), sh[unsafe_offset=b][0]
+            )
+            _ = Atomic.fetch_add(
+                out_hist.unsafe_offset(2 * hs + base + b),
+                sc[unsafe_offset=b][0],
+            )
+        b += block_dim.x
+
+
+def enqueue_range_histogram_interleaved[
+    bins_origin: MutOrigin,
+    gh_origin: MutOrigin,
+    feat_origin: MutOrigin,
+    out_origin: MutOrigin,
+    part_origin: MutOrigin, //,
+](
+    mut rows: GpuActiveRows,
+    tiling: HistogramTiling,
+    node: Int,
+    bins: MutPointer[UInt8, bins_origin],
+    gh: MutPointer[Float32, gh_origin],
+    feat_ids: MutPointer[Int32, feat_origin],
+    out_hist: MutPointer[Int32, out_origin],
+    partials: MutPointer[Int32, part_origin],
+    n_slots: Int,
+    g_scale: Float32,
+    h_scale: Float32,
+) raises:
+    """`GpuActiveRows.enqueue_range_histogram` over the interleaved plane.
+
+    Same arguments, same output layout, same two strategies, same zeroing
+    rule, and the same reduction kernel; only the plane the derivatives
+    come from differs. The histogram it produces is bit-identical to the
+    one the split-plane path produces from the same values.
+    """
+    if n_slots < 1 or n_slots > rows.n_features:
+        raise Error("active feature count out of range")
+    var window = rows.ranges.get(node)
+    var hist_size = rows.n_features * rows.n_bins
+    var threads = tiling.block_threads
+
+    # The reduction of the tiled path writes every active feature's slice,
+    # so that path only needs zeroing when some feature is inactive; the
+    # atomic path always does, and so does a node with no rows.
+    if (
+        tiling.strategy != STRATEGY_TILED
+        or n_slots < rows.n_features
+        or window.count() <= 0
+    ):
+        var cells = 3 * hist_size
+        var zero_blocks = (cells + threads - 1) // threads
+        rows.ctx.enqueue_function[_zero_int32_kernel](
+            out_hist,
+            Int32(cells),
+            grid_dim=zero_blocks,
+            block_dim=threads,
+        )
+    if window.count() <= 0:
+        return
+
+    if tiling.strategy == STRATEGY_TILED:
+        rows.ctx.enqueue_function[_range_hist_partial_gh_kernel](
+            bins,
+            rows.rows_dev.unsafe_ptr(),
+            gh,
+            feat_ids,
+            partials,
+            Int32(rows.n_rows),
+            Int32(n_slots),
+            Int32(rows.n_bins),
+            Int32(tiling.rows_per_tile),
+            Int32(window.begin),
+            Int32(window.count()),
+            g_scale,
+            h_scale,
+            grid_dim=(n_slots, tiling.n_tiles),
+            block_dim=threads,
+        )
+        var n_cells = 3 * n_slots * rows.n_bins
+        var blocks = (n_cells + threads - 1) // threads
+        rows.ctx.enqueue_function[_range_reduce_kernel](
+            partials,
+            feat_ids,
+            out_hist,
+            Int32(n_slots),
+            Int32(rows.n_bins),
+            Int32(hist_size),
+            Int32(tiling.n_tiles),
+            grid_dim=blocks,
+            block_dim=threads,
+        )
+    else:
+        rows.ctx.enqueue_function[_range_hist_atomic_gh_kernel](
+            bins,
+            rows.rows_dev.unsafe_ptr(),
+            gh,
+            feat_ids,
+            out_hist,
+            Int32(rows.n_rows),
+            Int32(rows.n_bins),
+            Int32(hist_size),
+            Int32(tiling.rows_per_tile),
+            Int32(window.begin),
+            Int32(window.count()),
+            g_scale,
+            h_scale,
+            grid_dim=(n_slots, tiling.n_tiles),
+            block_dim=threads,
+        )
+
+
+struct InterleavedGradients(Movable):
+    """The interleaved derivative plane and the pass that fills it.
+
+    Construct once per training session on the builder's context, then per
+    round, after the gradients are final and their magnitudes reduced,
+    call `pack`. Histograms then read this plane through
+    `enqueue_leaf_interleaved` instead of `builder.enqueue_leaf`.
+
+    Costs `8 * n_rows` bytes of device memory (8 MB at a million rows) and
+    one `16 * n_rows` byte pass per round to fill. Both are paid once per
+    round against a gather that happens once per (node, feature), so at
+    fifty features and six histogram passes per tree the pack is under one
+    percent of what it reorganizes. The pack disappears entirely if the
+    derivative kernels are ever taught to write pairs directly, which is a
+    change to `_grad_hess_kernel` in gpu_objectives_native.mojo and
+    belongs to that lane.
+
+    Order matters in one place: pack after the magnitude reduction and
+    after any compensation, so the plane holds the values the histograms
+    will actually read.
+    """
+
+    var gh_dev: DeviceBuffer[DType.float32]
+    """`[grad_0, hess_0, grad_1, hess_1, ...]`, `2 * n_rows` Float32."""
+    var n_rows: Int
+    var block_threads: Int
+    var packed: Bool
+
+    def __init__(out self, ctx: DeviceContext, n_rows: Int) raises:
+        if n_rows < 1:
+            raise Error("interleaved gradients require at least one row")
+        self.n_rows = n_rows
+        self.packed = False
+        self.block_threads = derive_block_threads(query_device_caps(ctx))
+        self.gh_dev = ctx.enqueue_create_buffer[DType.float32](2 * n_rows)
+
+    def pack(
+        mut self,
+        ctx: DeviceContext,
+        mut grad_dev: DeviceBuffer[DType.float32],
+        mut hess_dev: DeviceBuffer[DType.float32],
+    ) raises:
+        """Fill the interleaved plane from the two split planes. Enqueued,
+        not synchronized, and a pure copy, so the plane holds exactly the
+        Float32 values the split planes hold."""
+        var blocks = (
+            self.n_rows + self.block_threads - 1
+        ) // self.block_threads
+        ctx.enqueue_function[_pack_gh_kernel](
+            grad_dev.unsafe_ptr(),
+            hess_dev.unsafe_ptr(),
+            self.gh_dev.unsafe_ptr(),
+            Int32(self.n_rows),
+            grid_dim=blocks,
+            block_dim=self.block_threads,
+        )
+        self.packed = True
+
+
+def enqueue_leaf_interleaved(
+    mut builder: GpuHistogramBuilder,
+    mut planes: InterleavedGradients,
+    leaf: Int,
+) raises:
+    """`GpuHistogramBuilder.enqueue_leaf` reading the interleaved plane.
+
+    A drop-in for that method: same node, same active feature set, same
+    per-node launch geometry, same output buffer, so `download_raw` and
+    `histogram_from_host` follow unchanged. Call `planes.pack` once for
+    the round first.
+    """
+    if not builder.has_gradients:
+        raise Error("fill the gradients before building a leaf")
+    if not planes.packed:
+        raise Error("call pack before building a leaf from the pair plane")
+    if planes.n_rows != builder.n_rows:
+        raise Error(
+            "the interleaved plane and the builder disagree on the row count"
+        )
+    if leaf < 0:
+        raise Error("leaf id must be nonnegative")
+
+    var n_slots = len(builder.active)
+    var tiling = builder.rows.range_tiling(
+        builder.caps,
+        leaf,
+        n_slots,
+        builder.tiling.strategy,
+        builder.part_capacity,
+    )
+    enqueue_range_histogram_interleaved(
+        builder.rows,
+        tiling,
+        leaf,
+        builder.bins_dev.unsafe_ptr(),
+        planes.gh_dev.unsafe_ptr(),
+        builder.feat_dev.unsafe_ptr(),
+        builder.out_dev.unsafe_ptr(),
+        builder.part_dev.unsafe_ptr(),
+        n_slots,
+        Float32(builder.g_scale),
+        Float32(builder.h_scale),
+    )
