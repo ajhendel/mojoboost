@@ -14,6 +14,9 @@ from .boosting import (
     SQUARED_ERROR,
     Booster,
     BoosterParams,
+    MulticlassBooster,
     train,
+    train_multiclass,
+    train_with_valid,
 )
 from .model import Model, fit

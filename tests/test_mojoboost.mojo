@@ -20,7 +20,8 @@ from mojoboost import (
     subtract_histogram,
     train,
 )
-from mojoboost import BinMapper, Model
+from mojoboost import BinMapper, Model, MulticlassBooster
+from mojoboost import train_multiclass, train_with_valid
 
 
 def make_toy() raises -> BinnedMatrix:
@@ -280,6 +281,62 @@ def test_model_predicts_raw_data() raises:
     var high: List[Float64] = [6.3]
     assert_true(abs(model.predict(low) - 0.0) < 0.05)
     assert_true(abs(model.predict(high) - 1.0) < 0.05)
+
+
+def test_multiclass_three_classes() raises:
+    # 9 rows, one feature with three separated clusters; the model must
+    # put high probability on the right class for every training row.
+    var features: List[Float64] = [
+        0.0, 1.0, 2.0, 10.0, 11.0, 12.0, 20.0, 21.0, 22.0,
+    ]
+    var labels: List[Int] = [0, 0, 0, 1, 1, 1, 2, 2, 2]
+    var mapper = fit_bins(features, n_rows=9, n_features=1, max_bins=16)
+    var data = mapper.transform(features, 9)
+    var params = BoosterParams(150, 0.2, small_tree_params())
+    var model = train_multiclass(data, labels, 3, params)
+    for r in range(9):
+        var row: List[Float64] = [features[r]]
+        var proba = model.predict_proba_bins(mapper.bin_row(row))
+        var total = 0.0
+        var argmax = 0
+        for k in range(3):
+            total += proba[k]
+            if proba[k] > proba[argmax]:
+                argmax = k
+        assert_true(abs(total - 1.0) < 1e-9)
+        assert_equal(argmax, labels[r])
+        assert_true(proba[labels[r]] > 0.7)
+
+
+def test_early_stopping_truncates() raises:
+    # Once the step function is fit, per-round validation improvement
+    # shrinks below min_delta, so training must stop well short of
+    # n_estimators while still keeping enough rounds to fit the step.
+    var data = make_toy()
+    var target: List[Float64] = [0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]
+    var params = BoosterParams(500, 0.3, small_tree_params())
+    var model = train_with_valid(
+        data, target, data, target, SQUARED_ERROR, params,
+        early_stopping_rounds=5, min_delta=1e-6,
+    )
+    assert_true(len(model.trees) < 100)
+    assert_true(len(model.trees) > 0)
+    for r in range(8):
+        assert_true(abs(model.predict_row(data, r) - target[r]) < 0.05)
+
+
+def test_early_stopping_prevents_overfit_to_noise() raises:
+    # Validation labels flip the training labels, so validation loss only
+    # degrades as training fits: the returned ensemble must be tiny.
+    var data = make_toy()
+    var target: List[Float64] = [0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]
+    var flipped: List[Float64] = [1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
+    var params = BoosterParams(500, 0.3, small_tree_params())
+    var model = train_with_valid(
+        data, target, data, flipped, SQUARED_ERROR, params,
+        early_stopping_rounds=3,
+    )
+    assert_equal(len(model.trees), 0)
 
 
 def main() raises:

@@ -22,36 +22,39 @@ targets GPUs from the same source.
 Early development. Training works end to end. What works today, each piece
 with tests
 
-- equal-width feature binning into `uint8` bins
+- quantile (equal-frequency) feature binning into `uint8` bins, LightGBM
+  style, with stored edges so trained models predict on raw, unseen data
 - histogram accumulation with the sibling subtraction trick
 - best-split search with the standard second-order gain formula,
   `min_data_in_leaf` and hessian constraints
 - leaf-wise (best-first) tree growth with `num_leaves` cap and Newton-step
   leaf values
-- boosting loop with squared-error and binary-logistic objectives
+- objectives: squared error, binary logistic, and multiclass softmax
+- validation-set early stopping with `min_delta`, truncating to the best
+  round
 
 ```mojo
-from mojoboost import (
-    BINARY_LOGISTIC, BoosterParams, TreeParams, bin_equal_width, train,
-)
+from mojoboost import BINARY_LOGISTIC, BoosterParams, TreeParams, fit
 
 def main() raises:
-    var data = bin_equal_width(features, n_rows, n_features, n_bins=255)
+    # features is column-major: features[f * n_rows + r]
     var params = BoosterParams(100, 0.1, TreeParams.default())
-    var model = train(data, labels, BINARY_LOGISTIC, params)
-    var p = model.predict_row(data, 0)
+    var model = fit(features, n_rows, n_features, labels,
+                    BINARY_LOGISTIC, params)
+    var p = model.predict(row)   # raw feature values in, probability out
 ```
+
+Lower-level entry points `train`, `train_with_valid`, and
+`train_multiclass` operate on pre-binned matrices.
 
 ## Roadmap
 
-1. Quantile (equal-frequency) binning, LightGBM style, with stored bin edges
-   so prediction works on raw (unbinned) data
-2. Multiclass objective and validation-set early stopping
-3. SIMD histogram kernels and multicore training
-4. scikit-learn style `fit`/`predict` Python API via Mojo interop
-5. Reproducible benchmark suite vs LightGBM and XGBoost (same defaults, same
+1. SIMD histogram kernels and multicore training
+2. scikit-learn style `fit`/`predict` Python API via Mojo interop
+3. Reproducible benchmark suite vs LightGBM and XGBoost (same defaults, same
    datasets, hardware documented)
-6. GPU training
+4. Model serialization
+5. GPU training
 
 ## Defaults
 
