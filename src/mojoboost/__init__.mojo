@@ -11,6 +11,7 @@ from .split import SplitInfo, find_best_split
 from .tree import Tree, TreeParams, grow_tree
 from .boosting import (
     BINARY_LOGISTIC,
+    POISSON,
     SQUARED_ERROR,
     Booster,
     BoosterParams,
@@ -20,7 +21,7 @@ from .boosting import (
     train_multiclass_with_valid,
     train_with_valid,
 )
-from .importance import split_importance
+from .importance import gain_importance, split_importance
 from .metrics import (
     binary_accuracy,
     binary_auc,

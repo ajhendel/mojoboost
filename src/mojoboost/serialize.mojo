@@ -205,8 +205,16 @@ def _read_trees(mut r: _TokenReader, n_features: Int) raises -> List[Tree]:
                 or right[i] >= n_nodes
             ):
                 raise Error("corrupt tree: child index out of range")
+        # Split gains are a training artifact and are not serialized;
+        # loaded trees carry zero gains.
+        var split_gain = List[Float64](capacity=n_nodes)
+        for _ in range(n_nodes):
+            split_gain.append(0.0)
         trees.append(
-            Tree(feature^, threshold^, left^, right^, value^, n_leaves)
+            Tree(
+                feature^, threshold^, left^, right^, value^, split_gain^,
+                n_leaves,
+            )
         )
     return trees^
 

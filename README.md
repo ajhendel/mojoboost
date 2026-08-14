@@ -29,14 +29,16 @@ with tests
   `min_data_in_leaf` and hessian constraints
 - leaf-wise (best-first) tree growth with `num_leaves` cap and Newton-step
   leaf values
-- objectives: squared error, binary logistic, and multiclass softmax
+- objectives: squared error, binary logistic, poisson, and multiclass
+  softmax
 - validation-set early stopping with `min_delta` for every objective,
   truncating to the best round
 - evaluation metrics: RMSE, log loss, accuracy, and ROC AUC with
   sklearn-matching tie handling
 - sample weights for every objective, LightGBM semantics (weighted
   gradients, hessians, and base scores; zero-weight rows are ignored)
-- split-count feature importance
+- feature importance, split counts and total gain, matching LightGBM's
+  two importance types
 - SIMD histogram kernels (pointer-based scatter accumulation, vectorized
   sibling subtraction and split scans)
 - model serialization: `save_model`/`load_model` with a versioned text

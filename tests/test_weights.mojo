@@ -7,6 +7,7 @@ from mojoboost import (
     Tree,
     TreeParams,
     bin_equal_width,
+    gain_importance,
     grow_tree,
     split_importance,
     train,
@@ -147,6 +148,33 @@ def test_split_importance_ensemble() raises:
     var counts = split_importance(model.trees, 2)
     assert_true(counts[0] > 0)
     assert_equal(counts[1], 0)
+
+
+def test_gain_importance_single_tree() raises:
+    # Same single-split tree as the split-count test. The recorded gain
+    # must equal the hand-computed value: GL = -4, GR = 4, H = 4 per
+    # side, lambda = 1, so gain = 16/5 + 16/5 - 0 = 6.4.
+    var features: List[Float64] = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
+    var data = bin_equal_width(features, n_rows=8, n_features=1, n_bins=8)
+    var grad: List[Float64] = [-1.0, -1.0, -1.0, -1.0, 1.0, 1.0, 1.0, 1.0]
+    var hess: List[Float64] = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+    var tree = grow_tree(data, grad, hess, small_tree_params())
+    var trees = List[Tree]()
+    trees.append(tree^)
+    var gains = gain_importance(trees, 2)
+    assert_true(abs(gains[0] - 6.4) < 1e-12)
+    assert_true(gains[1] == 0.0)
+
+
+def test_gain_importance_ensemble() raises:
+    var features: List[Float64] = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
+    var target: List[Float64] = [0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]
+    var data = bin_equal_width(features, n_rows=8, n_features=1, n_bins=8)
+    var params = BoosterParams(10, 0.3, small_tree_params())
+    var model = train(data, target, SQUARED_ERROR, params)
+    var gains = gain_importance(model.trees, 2)
+    assert_true(gains[0] > 0.0)
+    assert_true(gains[1] == 0.0)
 
 
 def main() raises:

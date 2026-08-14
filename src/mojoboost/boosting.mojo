@@ -12,6 +12,11 @@ from .tree import Tree, TreeParams, grow_tree
 
 comptime SQUARED_ERROR = 0
 comptime BINARY_LOGISTIC = 1
+comptime POISSON = 2
+
+# LightGBM's poisson_max_delta_step: the hessian is exp(raw + this), which
+# caps the Newton step for rows with tiny predicted means.
+comptime _POISSON_MAX_DELTA_STEP = 0.7
 
 
 def _sigmoid(x: Float64) -> Float64:
@@ -28,6 +33,19 @@ def _clamp_prob(p: Float64) -> Float64:
     if p > 1.0 - 1e-15:
         return 1.0 - 1e-15
     return p
+
+
+def _check_objective(objective: Int, target: List[Float64]) raises:
+    if (
+        objective != SQUARED_ERROR
+        and objective != BINARY_LOGISTIC
+        and objective != POISSON
+    ):
+        raise Error("unknown objective")
+    if objective == POISSON:
+        for r in range(len(target)):
+            if target[r] < 0.0:
+                raise Error("poisson target values must be nonnegative")
 
 
 def _check_sample_weight(weights: List[Float64], n: Int) raises:
@@ -57,6 +75,10 @@ def _base_score(
     if objective == BINARY_LOGISTIC:
         var p = _clamp_prob(mean)
         return log(p / (1.0 - p))
+    if objective == POISSON:
+        if mean <= 0.0:
+            raise Error("poisson requires a positive mean target")
+        return log(mean)
     return mean
 
 
@@ -79,6 +101,12 @@ def _fill_grad_hess(
             if h < 1e-16:
                 h = 1e-16
             hess.append(w * h)
+    elif objective == POISSON:
+        for r in range(len(target)):
+            var w = weights[r] if len(weights) > 0 else 1.0
+            var mu = exp(raw[r])
+            grad.append(w * (mu - target[r]))
+            hess.append(w * exp(raw[r] + _POISSON_MAX_DELTA_STEP))
     else:
         for r in range(len(target)):
             var w = weights[r] if len(weights) > 0 else 1.0
@@ -97,6 +125,10 @@ def _mean_loss(
                 total -= log(p)
             else:
                 total -= log(1.0 - p)
+    elif objective == POISSON:
+        # Poisson negative log likelihood up to a constant in the target.
+        for r in range(len(target)):
+            total += exp(raw[r]) - target[r] * raw[r]
     else:
         for r in range(len(target)):
             var d = raw[r] - target[r]
@@ -130,10 +162,13 @@ struct Booster(Copyable, Movable):
         return s
 
     def predict_row(self, data: BinnedMatrix, row: Int) -> Float64:
-        """Prediction on the response scale (probability for logistic)."""
+        """Prediction on the response scale (probability for logistic,
+        expected count for poisson)."""
         var raw = self.predict_raw_row(data, row)
         if self.objective == BINARY_LOGISTIC:
             return _sigmoid(raw)
+        if self.objective == POISSON:
+            return exp(raw)
         return raw
 
     def predict_raw_bins(self, bins: List[Int]) -> Float64:
@@ -146,6 +181,8 @@ struct Booster(Copyable, Movable):
         var raw = self.predict_raw_bins(bins)
         if self.objective == BINARY_LOGISTIC:
             return _sigmoid(raw)
+        if self.objective == POISSON:
+            return exp(raw)
         return raw
 
 
@@ -157,13 +194,13 @@ def train(
     sample_weight: List[Float64] = [],
 ) raises -> Booster:
     """Train a boosted ensemble. `target` is the regression target for
-    SQUARED_ERROR or {0, 1} labels for BINARY_LOGISTIC. A non-empty
-    sample_weight scales each row's gradient and hessian, LightGBM
-    style; a row with weight zero is ignored."""
+    SQUARED_ERROR, {0, 1} labels for BINARY_LOGISTIC, or nonnegative
+    counts for POISSON. A non-empty sample_weight scales each row's
+    gradient and hessian, LightGBM style; a row with weight zero is
+    ignored."""
     if len(target) != data.n_rows:
         raise Error("target length must equal n_rows")
-    if objective != SQUARED_ERROR and objective != BINARY_LOGISTIC:
-        raise Error("unknown objective")
+    _check_objective(objective, target)
     _check_sample_weight(sample_weight, data.n_rows)
 
     var n = data.n_rows
@@ -213,8 +250,7 @@ def train_with_valid(
         raise Error("valid_target length must equal valid n_rows")
     if valid_data.n_features != data.n_features:
         raise Error("valid_data must have the same features")
-    if objective != SQUARED_ERROR and objective != BINARY_LOGISTIC:
-        raise Error("unknown objective")
+    _check_objective(objective, target)
     if early_stopping_rounds < 1:
         raise Error("early_stopping_rounds must be positive")
     _check_sample_weight(sample_weight, data.n_rows)

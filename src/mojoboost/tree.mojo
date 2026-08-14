@@ -43,6 +43,7 @@ struct Tree(Copyable, Movable):
     var left: List[Int]
     var right: List[Int]
     var value: List[Float64]
+    var split_gain: List[Float64]
     var n_leaves: Int
 
     def _add_node(mut self, value: Float64) -> Int:
@@ -52,6 +53,9 @@ struct Tree(Copyable, Movable):
         self.left.append(-1)
         self.right.append(-1)
         self.value.append(value)
+        # Recorded when the node is split; stays 0.0 for leaves (and for
+        # every node of a model loaded from disk).
+        self.split_gain.append(0.0)
         return node
 
     def predict_row(self, data: BinnedMatrix, row: Int) -> Float64:
@@ -127,7 +131,7 @@ def grow_tree(
     """Grow one tree, leaf-wise, on the full dataset."""
     var tree = Tree(
         List[Int](), List[Int](), List[Int](), List[Int](),
-        List[Float64](), 0,
+        List[Float64](), List[Float64](), 0,
     )
 
     var all_rows = List[Int](capacity=data.n_rows)
@@ -186,6 +190,7 @@ def grow_tree(
         tree.threshold_bin[parent_node] = split.bin
         tree.left[parent_node] = left_node
         tree.right[parent_node] = right_node
+        tree.split_gain[parent_node] = split.gain
 
         var left_split = _search(left_hist, len(left_rows), params)
         var right_split = _search(right_hist, len(right_rows), params)
