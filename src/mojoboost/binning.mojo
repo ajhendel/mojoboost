@@ -24,10 +24,50 @@ could ever make on it; the same was true of a sparse column whose implicit
 zeros outnumber its stored values. Columns of distinct values are unaffected
 (the next distinct value above rank `idx - 1` is the value at rank `idx`), and
 so are columns with at most `max_bins` values (every rank is a boundary, so
-the run's end is one too). Full LightGBM parity is a further step and is not
-claimed: LightGBM builds distinct values with counts and guarantees a bin per
-distinct value below the budget, which also catches a level too rare for any
-boundary to land on.
+the run's end is one too).
+
+Levels
+------
+The tie rule finds a run once a boundary lands in it, and a boundary is a
+rank, so it cannot find a level too rare to hold one. Three rows in sixty
+thousand sit between two boundaries however far their value is from anything
+else, so they were binned with their neighbours: the level was in the data
+and absent from the model.
+
+So before any boundary is computed, a column is asked how many distinct
+values it has. If there are no more of them than the feature has ordinary
+bins, it gets an edge between every adjacent pair and the boundaries are not
+consulted at all: one bin per level, whatever each level's population, and
+the rest of the budget left unspent. That is LightGBM's `GreedyFindBin` in
+the `num_distinct_values <= max_bin` case at `min_data_in_bin` of 1, which is
+the minimum-population rule this binner has for numerical features (see
+docs/LIGHTGBM_PARITY.md; LightGBM's default of 3 would merge some of those
+levels back together).
+
+`collect_distinct` answers the question for the dense fit and
+`distinct_levels_sorted` for the sparse one, which has sorted its stored
+values already. The two are required to agree, because a sparse matrix and
+its dense form must bin identically, and they are tested against each other.
+
+A column with more levels than bins is refused within its first few hundred
+rows, so an ordinary continuous column pays a few hundred probes to ask and
+then takes the quantile path exactly as before, edges unchanged bit for bit.
+Measured at 250,000 x 100 continuous, four workers, that costs 0.0276 s
+against 0.0270 s without asking, which is inside the run-to-run spread. On a
+column that does have few levels it is not a cost at all: 250,000 x 100 with
+twenty levels each fits in 0.0100 s through the levels against 0.0924 s
+through the boundaries, because the boundary path pays for a bucket table
+and a second pass to resolve its ties and this one is a single scan.
+
+Full parity is still a further step, and stops at the same place it did.
+Past the bin budget LightGBM keeps counting, and spends the counts: a value
+populous enough to deserve a bin of its own takes one (`is_big_count_value`),
+and the target bin size is recomputed from what budget is left as it goes.
+This binner uses quantile boundaries there. Doing it LightGBM's way needs
+distinct values with counts for every column, which LightGBM affords by
+binning a sample of at most `bin_construct_sample_cnt` rows rather than all
+of them; that sampling is deferred here, so the counts would have to come off
+the full column.
 
 Missing values
 --------------
@@ -292,6 +332,17 @@ only runs out on a column whose values crowd into one bucket at every scale
 without being equal; sorting that bucket is exact and is never more work than
 sorting the whole column."""
 
+comptime DISTINCT_SLOTS = 1 << 11
+comptime DISTINCT_SHIFT = UInt64(53)
+"""Slots in the set `collect_distinct` uses to decide whether a column has
+few enough distinct values to give each one its own bin, and the shift that
+turns a scrambled key into one of them (64 - 11).
+
+The largest set it ever holds is `MAX_BINS + 1` keys, the size at which the
+answer is already no, so the table never loads past an eighth and a probe is
+about one slot. It is 16 KB per worker, allocated on first use and then
+reused for every column that worker sees."""
+
 
 def env_select_min_rows() -> Int:
     """`SELECT_MIN_ROWS` under `MOJOBOOST_BINNING_SELECT_MIN_ROWS`.
@@ -442,6 +493,124 @@ def value_from_key(k: UInt64) -> Float64:
     else:
         u = u ^ 0xFFFF_FFFF_FFFF_FFFF
     return bitcast[DType.float64, 1](SIMD[DType.uint64, 1](u))
+
+
+def collect_distinct(
+    col: List[Float64],
+    n_valid: Int,
+    limit: Int,
+    mut table: List[UInt64],
+    mut slots: List[Int],
+    mut out: List[Float64],
+) -> Bool:
+    """The ascending distinct values of `col[0, n_valid)` when there are at
+    most `limit` of them; `False`, with `out` empty, as soon as there is one
+    more.
+
+    This is what lets a column with few enough levels get a bin per level
+    instead of a bin per quantile boundary, which is LightGBM's
+    `GreedyFindBin` when `num_distinct_values <= max_bin` (see `fit_bins`).
+
+    It answers no cheaply, which is what makes it affordable to ask on every
+    column. A continuous column reaches `limit + 1` distinct values within
+    its first few hundred rows and stops there, so the whole check costs a
+    few hundred probes however many million rows the column has. A column
+    that really does have few levels is scanned to the end, at about a probe
+    per row: a multiply, a shift, and a load from a table small enough to sit
+    in L1.
+
+    Keys are `order_key`'s, so the set never compares two doubles for
+    equality; two values are one level exactly when their bit patterns match,
+    which is the same rule the rest of this module orders by. Zero is the
+    single exception, normalized below.
+
+    The table is left clean for the next call rather than rewritten at the
+    start of one: at most `limit + 1` of its slots are ever filled, so
+    clearing the recorded ones is bounded by the answer rather than by the
+    table, and a fit over thousands of features does not rewrite 16 KB per
+    feature.
+    """
+    out.clear()
+    if limit < 1 or limit > MAX_BINS or n_valid < 1:
+        return False
+    if len(table) != DISTINCT_SLOTS:
+        table.clear()
+        table.resize(DISTINCT_SLOTS, _KEY_EMPTY)
+        slots.clear()
+    var tp = table.unsafe_ptr()
+    for i in range(len(slots)):
+        tp.unsafe_store(slots[i], _KEY_EMPTY)
+    slots.clear()
+
+    var cp = col.unsafe_ptr()
+    var full = False
+    for r in range(n_valid):
+        var v = cp.unsafe_load(r)
+        if v == 0.0:
+            # `-0.0` and `0.0` are one value to every comparison an edge is
+            # built from, so they have to be one level here too; their bit
+            # patterns differ, so the key alone would make them two.
+            v = 0.0
+        var k = order_key(v)
+        # Fibonacci scramble, then take the top bits: the low bits of a key
+        # are a double's mantissa, and columns of round numbers share them.
+        var s = Int((k * UInt64(0x9E37_79B9_7F4A_7C15)) >> DISTINCT_SHIFT)
+        while True:
+            var cur = tp.unsafe_load(s)
+            if cur == k:
+                break
+            if cur == _KEY_EMPTY:
+                if len(out) >= limit:
+                    full = True
+                    break
+                tp.unsafe_store(s, k)
+                slots.append(s)
+                out.append(v)
+                break
+            s = (s + 1) & (DISTINCT_SLOTS - 1)
+        if full:
+            break
+    if full:
+        out.clear()
+        return False
+    # At most `limit` values, so this is a sort of a few hundred at the very
+    # most, once per column.
+    sort(out)
+    return True
+
+
+def distinct_levels_sorted(
+    sorted_col: List[Float64], n: Int, limit: Int, mut out: List[Float64]
+) -> Bool:
+    """`collect_distinct`'s answer for a column that is already sorted.
+
+    Equal values are adjacent in a sorted column, so the levels are a walk
+    and there is no set to build. `sparse.fit_bins_csc` sorts its stored
+    values anyway and wants this one; the dense fit does not sort at all any
+    more and wants the other.
+
+    The two must agree on every column, or a sparse matrix and its dense form
+    would bin differently, and `tests/test_sparse.mojo` requires them to be
+    identical edge for edge. They agree because the only way two finite
+    doubles can be one level here is bit equality, which is what
+    `collect_distinct` keys on, with the single exception of `-0.0` and `0.0`
+    that both normalize the same way. `tests/test_binning.mojo` checks the
+    two against each other directly.
+    """
+    out.clear()
+    if limit < 1 or limit > MAX_BINS or n < 1:
+        return False
+    for i in range(n):
+        var v = sorted_col[i]
+        if v == 0.0:
+            v = 0.0
+        if len(out) > 0 and out[len(out) - 1] == v:
+            continue
+        if len(out) >= limit:
+            out.clear()
+            return False
+        out.append(v)
+    return True
 
 
 def _bucket_shift(span: UInt64) -> UInt64:
@@ -1024,6 +1193,9 @@ def fit_bins(
         var edge_buf = List[Float64]()
         var bucket_counts = List[Int]()
         var bucket_keys = List[UInt64]()
+        var dist_table = List[UInt64]()
+        var dist_slots = List[Int]()
+        var dist_vals = List[Float64]()
         for f in range(f_start, f_end):
             # Categorical columns never enter quantile binning.
             if spec.is_cat(f):
@@ -1042,61 +1214,78 @@ def fit_bins(
             var reserve = use_missing and n_valid < n_rows
             var n_ordinary = max_bins - 1 if reserve else max_bins
 
-            quantile_boundary_indices(n_valid, n_ordinary, idxs)
             below.clear()
             above.clear()
-            if n_valid >= select_min_rows:
-                # The ranks the boundaries ask about, ascending and unique.
-                # `idxs` is non-decreasing, so appending `idx - 1` then `idx`
-                # while each is past the last kept rank produces exactly that.
-                ranks.clear()
-                for j in range(len(idxs)):
-                    var idx = idxs[j]
-                    if len(ranks) == 0 or ranks[len(ranks) - 1] < idx - 1:
-                        ranks.append(idx - 1)
-                    if ranks[len(ranks) - 1] < idx:
-                        ranks.append(idx)
-                vals.clear()
-                vals.resize(len(ranks), 0.0)
-                resolve_ranks(
-                    col,
-                    0,
-                    ranks,
-                    0,
-                    len(ranks),
-                    bucket_counts,
-                    bucket_keys,
-                    vals,
-                    0,
-                )
-                # `idxs` and `ranks` both ascend, so one cursor walks them
-                # together instead of searching per boundary.
-                var rp = 0
-                var tied = False
-                for j in range(len(idxs)):
-                    var idx = idxs[j]
-                    while ranks[rp] < idx - 1:
-                        rp += 1
-                    below.append(vals[rp])
-                    while ranks[rp] < idx:
-                        rp += 1
-                    above.append(vals[rp])
-                    if vals[rp] <= below[j]:
-                        tied = True
-                # A boundary inside a run of equal values needs the value the
-                # run ends at, which the rank it was handed does not know.
-                # Only a column that has such a boundary pays for the extra
-                # pass; one of distinct values already has its answer.
-                if tied:
-                    resolve_above_unsorted(col, below, above, cand, found)
+            if collect_distinct(
+                col, n_valid, n_ordinary, dist_table, dist_slots, dist_vals
+            ):
+                # Few enough levels that every one of them can have its own
+                # bin, so cut between each adjacent pair and let the budget
+                # go unspent. Quantile boundaries are ranks, and a rank
+                # cannot find a level that is too rare for any boundary to
+                # land in: one row in a million gets no boundary of its own,
+                # so it used to be swallowed by its neighbour however far
+                # away that neighbour was. This is LightGBM's rule for the
+                # same case.
+                for j in range(len(dist_vals) - 1):
+                    below.append(dist_vals[j])
+                    above.append(dist_vals[j + 1])
             else:
-                sort(col)
-                for j in range(len(idxs)):
-                    var idx = idxs[j]
-                    var w = col[idx - 1]
-                    below.append(w)
-                    var e = first_above_sorted(col, idx, n_valid, w)
-                    above.append(col[e] if e < n_valid else w)
+                quantile_boundary_indices(n_valid, n_ordinary, idxs)
+                if n_valid >= select_min_rows:
+                    # The ranks the boundaries ask about, ascending and
+                    # unique. `idxs` is non-decreasing, so appending `idx - 1`
+                    # then `idx` while each is past the last kept rank
+                    # produces exactly that.
+                    ranks.clear()
+                    for j in range(len(idxs)):
+                        var idx = idxs[j]
+                        if len(ranks) == 0 or ranks[len(ranks) - 1] < idx - 1:
+                            ranks.append(idx - 1)
+                        if ranks[len(ranks) - 1] < idx:
+                            ranks.append(idx)
+                    vals.clear()
+                    vals.resize(len(ranks), 0.0)
+                    resolve_ranks(
+                        col,
+                        0,
+                        ranks,
+                        0,
+                        len(ranks),
+                        bucket_counts,
+                        bucket_keys,
+                        vals,
+                        0,
+                    )
+                    # `idxs` and `ranks` both ascend, so one cursor walks them
+                    # together instead of searching per boundary.
+                    var rp = 0
+                    var tied = False
+                    for j in range(len(idxs)):
+                        var idx = idxs[j]
+                        while ranks[rp] < idx - 1:
+                            rp += 1
+                        below.append(vals[rp])
+                        while ranks[rp] < idx:
+                            rp += 1
+                        above.append(vals[rp])
+                        if vals[rp] <= below[j]:
+                            tied = True
+                    # A boundary inside a run of equal values needs the value
+                    # the run ends at, which the rank it was handed does not
+                    # know. Only a column that has such a boundary pays for
+                    # the extra pass; one of distinct values already has its
+                    # answer.
+                    if tied:
+                        resolve_above_unsorted(col, below, above, cand, found)
+                else:
+                    sort(col)
+                    for j in range(len(idxs)):
+                        var idx = idxs[j]
+                        var w = col[idx - 1]
+                        below.append(w)
+                        var e = first_above_sorted(col, idx, n_valid, w)
+                        above.append(col[e] if e < n_valid else w)
             emit_quantile_edges(below, above, edge_buf)
 
             var out = scratch_p.unsafe_offset(f * max_edges)

@@ -403,7 +403,7 @@ Aliases are omitted; section 2 lists the aliases mojoboost accepts.
 |---|---|---|
 | `max_bin` | supported | Default 255 |
 | `max_bin_by_feature` | deferred | Per-feature bin counts. Straightforward once the binner takes a vector; low demand |
-| `min_data_in_bin` | partial | Enforced for categorical features (`min_data_per_group` governs the sorted search); the numerical binner has no minimum-population rule |
+| `min_data_in_bin` | partial | Enforced for categorical features (`min_data_per_group` governs the sorted search); the numerical binner has no minimum-population rule, which is `min_data_in_bin = 1`. At that setting a numerical column with no more distinct values than it has ordinary bins is binned exactly as LightGBM's `GreedyFindBin` bins it: one bin per value, however rare the value. LightGBM's default of 3 would merge some of those levels back together, and past the bin budget the two diverge further; both differences are stated in the module docstring of `src/mojoboost/binning.mojo` |
 | `data_random_seed` | different | Binning is deterministic and reads every row, so there is no sampling seed to set |
 | `bin_construct_sample_cnt` | deferred | See `subsample_for_bin` in section 2 |
 | `is_enable_sparse` | different | There is no toggle: the input type decides. A SciPy sparse matrix takes the sparse path (section 6) and a dense matrix takes the dense one, and neither converts to the other |

@@ -28,6 +28,8 @@ from mojoboost.binning import (
     value_from_key,
     BinMapper,
     bin_equal_width,
+    collect_distinct,
+    distinct_levels_sorted,
     emit_quantile_edges,
     fit_bins,
     order_key,
@@ -670,6 +672,229 @@ def test_row_split_bins_a_categorical_feature_the_same_way() raises:
     _assert_transform_matches_bin_value(
         mapper, features, n_rows, "categorical plus numeric, row split"
     )
+
+
+def test_collect_distinct_answers_and_leaves_its_table_clean() raises:
+    """The helper on its own: it reports the levels when there are few
+    enough, refuses as soon as there is one more, and one table serves a
+    whole run of columns. A stale key left behind by an earlier column would
+    make a later one lose a level, which is why the refusals below are
+    interleaved with the answers rather than run at the end."""
+    var table = List[UInt64]()
+    var slots = List[Int]()
+    var out = List[Float64]()
+
+    var three: List[Float64] = [2.0, 5.0, 2.0, -1.0, 5.0, -1.0, 2.0]
+    assert_true(
+        collect_distinct(three, 7, 8, table, slots, out), "three levels fit"
+    )
+    assert_equal(len(out), 3, "three levels")
+    assert_equal(out[0], -1.0, "ascending, first")
+    assert_equal(out[1], 2.0, "ascending, second")
+    assert_equal(out[2], 5.0, "ascending, third")
+
+    # Exactly at the limit is an answer; one past it is not.
+    var eight = List[Float64](capacity=8)
+    for i in range(8):
+        eight.append(Float64(i) * 3.0)
+    assert_true(
+        collect_distinct(eight, 8, 8, table, slots, out), "eight levels fit"
+    )
+    assert_equal(len(out), 8, "eight levels")
+    assert_true(
+        not collect_distinct(eight, 8, 7, table, slots, out),
+        "eight levels do not fit in seven",
+    )
+    assert_equal(len(out), 0, "a refusal reports nothing")
+
+    # The same three-level column again, through the table that just took a
+    # refusal and an eight-level answer.
+    assert_true(
+        collect_distinct(three, 7, 8, table, slots, out), "three levels again"
+    )
+    assert_equal(len(out), 3, "three levels after reuse")
+    assert_equal(out[0], -1.0, "ascending after reuse")
+
+    # Negative and positive zero are one level, not two: every comparison an
+    # edge is built from treats them as equal.
+    var zeros: List[Float64] = [0.0, -0.0, 0.0, -0.0]
+    assert_true(collect_distinct(zeros, 4, 8, table, slots, out), "zeros fit")
+    assert_equal(len(out), 1, "-0.0 and 0.0 are one level")
+
+    # An empty column has no levels to report and is not an answer.
+    assert_true(
+        not collect_distinct(three, 0, 8, table, slots, out), "no rows"
+    )
+
+
+def test_a_rare_level_gets_its_own_bin() raises:
+    """A level too rare for any quantile boundary to land in.
+
+    Boundaries are ranks. Three rows in sixty thousand hold no rank that any
+    of 254 boundaries asks about, so under the boundary rule alone those
+    three rows were swallowed by the zeros however far away they sat: one
+    edge, two bins, and no split that could separate a 3 from a 0. Counting
+    the levels finds them.
+    """
+    var n_rows = SELECT_MIN_ROWS + 1000
+    var features = List[Float64](capacity=n_rows)
+    for _ in range(n_rows):
+        features.append(0.0)
+    features[5] = 1.0
+    features[900] = 2.0
+    features[40000] = 3.0
+
+    var mapper = _fit_both_ways(features, n_rows, 1, 255, "one rare level")
+    assert_equal(mapper.edge_offsets[1], 3, "one edge per adjacent pair")
+    for level in range(4):
+        assert_equal(
+            mapper.bin_value(0, Float64(level)),
+            level,
+            String("level ", level, " has its own bin"),
+        )
+    _assert_transform_matches_bin_value(
+        mapper, features, n_rows, "one rare level"
+    )
+
+
+def test_levels_stop_getting_their_own_bin_past_the_budget() raises:
+    """The handover. At the budget every level is a bin; one level past it
+    the column goes back to quantile boundaries, which cannot give each level
+    a bin because there are more levels than bins to give."""
+    var n_rows = SELECT_MIN_ROWS + 64
+
+    # Eight levels into eight ordinary bins: one edge per adjacent pair.
+    var eight = List[Float64](capacity=n_rows)
+    for r in range(n_rows):
+        # Level 7 is rare on purpose; it still earns a bin.
+        eight.append(7.0 if r == 3 else Float64(r % 7))
+    var m8 = _fit_both_ways(eight, n_rows, 1, 8, "eight levels")
+    assert_equal(m8.edge_offsets[1], 7, "seven edges for eight levels")
+    for level in range(8):
+        assert_equal(
+            m8.bin_value(0, Float64(level)),
+            level,
+            String("eight levels, level ", level),
+        )
+
+    # Nine levels into eight ordinary bins: the budget binds. Which pair of
+    # levels ends up sharing is the quantile rule's business and is not
+    # asserted here; that some pair must is the point.
+    var nine = List[Float64](capacity=n_rows)
+    for r in range(n_rows):
+        nine.append(8.0 if r == 3 else Float64(r % 8))
+    var m9 = _fit_both_ways(nine, n_rows, 1, 8, "nine levels")
+    assert_true(
+        m9.edge_offsets[1] <= 7, "nine levels cannot exceed the bin budget"
+    )
+    var seen = List[Int]()
+    for level in range(9):
+        var b = m9.bin_value(0, Float64(level))
+        var known = False
+        for i in range(len(seen)):
+            if seen[i] == b:
+                known = True
+        if not known:
+            seen.append(b)
+    assert_true(
+        len(seen) < 9, "nine levels cannot each have a bin in eight of them"
+    )
+
+
+def test_a_continuous_column_never_takes_the_level_path() raises:
+    """More distinct values than bins is the ordinary case, and it must reach
+    the quantile boundaries unchanged: a full budget of edges, and a helper
+    that refuses before it has read any meaningful part of the column."""
+    var n_rows = SELECT_MIN_ROWS + 33
+    var col = _random_column(n_rows, 4242)
+    var table = List[UInt64]()
+    var slots = List[Int]()
+    var out = List[Float64]()
+    assert_true(
+        not collect_distinct(col, n_rows, 255, table, slots, out),
+        "a continuous column has far more than 255 levels",
+    )
+    var mapper = _fit_both_ways(col, n_rows, 1, 255, "continuous")
+    assert_equal(mapper.edge_offsets[1], 254, "a full budget of edges")
+
+
+def test_a_reserved_missing_bin_costs_the_levels_one() raises:
+    """The level count is compared against the ordinary bins, not against
+    `max_bins`, so a column that reserves a missing bin has one fewer level
+    it can spend. Eight levels plus a NaN at `max_bins = 8` therefore falls
+    back to boundaries, while seven levels plus a NaN still fits."""
+    var n_rows = SELECT_MIN_ROWS + 64
+
+    var seven = List[Float64](capacity=n_rows)
+    for r in range(n_rows):
+        seven.append(NAN if r == 0 else Float64(r % 7))
+    var m7 = _fit_both_ways(seven, n_rows, 1, 8, "seven levels and a NaN")
+    assert_equal(m7.edge_offsets[1], 6, "six edges for seven levels")
+    assert_equal(m7.missing_bin[0], 7, "the missing bin sits above them")
+
+    var eight = List[Float64](capacity=n_rows)
+    for r in range(n_rows):
+        eight.append(NAN if r == 0 else (7.0 if r == 3 else Float64(r % 7)))
+    var m8 = _fit_both_ways(eight, n_rows, 1, 8, "eight levels and a NaN")
+    assert_true(
+        m8.edge_offsets[1] <= 6,
+        "eight levels do not fit in seven ordinary bins",
+    )
+
+
+def test_the_two_level_counters_agree() raises:
+    """`collect_distinct` (dense, unsorted) and `distinct_levels_sorted`
+    (sparse, sorted) have to give the same answer on every column, because a
+    sparse matrix and its dense form are required to bin identically. Checked
+    over columns that stress the ways they could differ: repeats, both signs,
+    both zeros, extremes, and both sides of the limit.
+    """
+    var table = List[UInt64]()
+    var slots = List[Int]()
+    var a = List[Float64]()
+    var b = List[Float64]()
+
+    var limits = [1, 2, 3, 7, 8, 64, 255, 256]
+    for li in range(len(limits)):
+        var limit = limits[li]
+        for shape in range(6):
+            var col = List[Float64]()
+            if shape == 0:
+                for i in range(500):
+                    col.append(Float64(i % 9) - 4.0)
+            elif shape == 1:
+                # Both zeros, repeatedly, with values either side.
+                for i in range(200):
+                    col.append(0.0 if i % 4 == 0 else -0.0)
+                    if i % 7 == 0:
+                        col.append(-2.5)
+                    if i % 11 == 0:
+                        col.append(2.5)
+            elif shape == 2:
+                col.append(-INF)
+                col.append(INF)
+                for i in range(100):
+                    col.append(Float64(i % 3))
+            elif shape == 3:
+                # Exactly `limit` levels, then exactly one more.
+                for i in range(limit * 3):
+                    col.append(Float64(i % limit))
+            elif shape == 4:
+                for i in range((limit + 1) * 3):
+                    col.append(Float64(i % (limit + 1)))
+            else:
+                for i in range(300):
+                    col.append(_uniform(UInt64(i) * 977 + UInt64(limit)))
+
+            var n = len(col)
+            var fit_a = collect_distinct(col, n, limit, table, slots, a)
+            sort(col)
+            var fit_b = distinct_levels_sorted(col, n, limit, b)
+            var what = String("limit ", limit, ", shape ", shape)
+            assert_equal(fit_a, fit_b, String(what, ": same verdict"))
+            assert_equal(len(a), len(b), String(what, ": same level count"))
+            for i in range(len(a)):
+                assert_equal(a[i], b[i], String(what, ": level ", i))
 
 
 def main() raises:

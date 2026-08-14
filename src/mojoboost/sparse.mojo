@@ -61,6 +61,7 @@ from .binning import (
     BinMapper,
     BinnedMatrix,
     _sized_missing_bins,
+    distinct_levels_sorted,
     emit_quantile_edges,
     no_missing_bins,
     quantile_boundary_indices,
@@ -559,39 +560,78 @@ def fit_bins_csc(
         # the midpoint-clamp-and-dedupe loop is the way that stops being true.
         # All this path supplies is where a rank's value lives in the implied
         # dense sorted column.
-        var idxs = List[Int]()
-        quantile_boundary_indices(n_valid, n_ordinary, idxs)
-        var below = List[Float64](capacity=len(idxs))
-        var above = List[Float64](capacity=len(idxs))
-        for j in range(len(idxs)):
-            var idx = idxs[j]
-            var w = _sorted_column_at(
-                stored, n_neg, n_zero, n_implicit, idx - 1
-            )
-            below.append(w)
-            # The next distinct value above `w`, which is what the edge rule
-            # cuts against (see `binning.emit_quantile_edges`). The implied
-            # dense column is sorted and indexable by rank, so the run `w`
-            # belongs to is found by bisecting it rather than walking it --
-            # which matters here, where a column's implicit zeros can be a run
-            # of nearly every row.
-            var left = idx
-            var right = n_valid
-            while left < right:
-                var mid = (left + right) // 2
-                if (
-                    _sorted_column_at(stored, n_neg, n_zero, n_implicit, mid)
-                    > w
-                ):
-                    right = mid
+        var below = List[Float64]()
+        var above = List[Float64]()
+
+        # Few enough levels to give each one a bin, which is the same
+        # question and the same answer as on the dense path. The stored
+        # values are sorted, so counting them is a walk; the absent entries
+        # add the level 0.0, and only when no stored value is already zero.
+        var levels = List[Float64]()
+        var levels_fit = distinct_levels_sorted(
+            stored, len(stored), n_ordinary, levels
+        )
+        if levels_fit and n_implicit > 0:
+            var has_zero = False
+            for i in range(len(levels)):
+                if levels[i] == 0.0:
+                    has_zero = True
+                    break
+                if levels[i] > 0.0:
+                    break
+            if not has_zero:
+                if len(levels) >= n_ordinary:
+                    levels_fit = False
                 else:
-                    left = mid + 1
-            if left < n_valid:
-                above.append(
-                    _sorted_column_at(stored, n_neg, n_zero, n_implicit, left)
+                    levels.append(0.0)
+                    sort(levels)
+        elif not levels_fit and len(stored) == 0 and n_implicit > 0:
+            # Nothing stored and rows absent: one level, the implicit zero.
+            # `distinct_levels_sorted` was handed an empty column and could
+            # not say so.
+            levels.append(0.0)
+            levels_fit = True
+
+        if levels_fit:
+            for j in range(len(levels) - 1):
+                below.append(levels[j])
+                above.append(levels[j + 1])
+        else:
+            var idxs = List[Int]()
+            quantile_boundary_indices(n_valid, n_ordinary, idxs)
+            for j in range(len(idxs)):
+                var idx = idxs[j]
+                var w = _sorted_column_at(
+                    stored, n_neg, n_zero, n_implicit, idx - 1
                 )
-            else:
-                above.append(w)
+                below.append(w)
+                # The next distinct value above `w`, which is what the edge
+                # rule cuts against (see `binning.emit_quantile_edges`). The
+                # implied dense column is sorted and indexable by rank, so the
+                # run `w` belongs to is found by bisecting it rather than
+                # walking it -- which matters here, where a column's implicit
+                # zeros can be a run of nearly every row.
+                var left = idx
+                var right = n_valid
+                while left < right:
+                    var mid = (left + right) // 2
+                    if (
+                        _sorted_column_at(
+                            stored, n_neg, n_zero, n_implicit, mid
+                        )
+                        > w
+                    ):
+                        right = mid
+                    else:
+                        left = mid + 1
+                if left < n_valid:
+                    above.append(
+                        _sorted_column_at(
+                            stored, n_neg, n_zero, n_implicit, left
+                        )
+                    )
+                else:
+                    above.append(w)
         var edge_buf = List[Float64]()
         emit_quantile_edges(below, above, edge_buf)
 
