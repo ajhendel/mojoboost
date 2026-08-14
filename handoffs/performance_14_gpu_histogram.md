@@ -14,6 +14,13 @@ Files this lane owns and changed.
 - `src/mojoboost/gpu_tiling.mojo` (additive only, see section 9)
 - `handoffs/performance_14_gpu_histogram.md` (this file)
 
+This lane committed nothing. A concurrent integration commit in the shared
+checkout (`b04b5f0`, "Integrate parallel release and accelerator work") swept
+these files up mid-edit, so most of them are already in history without this
+lane having staged them; a few later cleanups to the two new modules are
+still unstaged. Nothing in that commit came from this lane's intent, and
+nothing here was reviewed as part of it.
+
 Files this lane read and did not touch: `histogram_gpu.mojo`,
 `gpu_active_rows.mojo`, `train_gpu.mojo`, `apple_gpu_policy.mojo`,
 `device.mojo`, `parallel.mojo`, `binning.mojo`, all of `tests/`, all of

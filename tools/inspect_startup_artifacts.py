@@ -41,9 +41,13 @@ Exit status is 0 unless `--strict` is given, in which case a failed
 expectation exits 1:
 
 1. the extension exists and parses
-2. every `@rpath`-relative dependency resolves against some search path
-   that exists on this filesystem
-3. a wheel layout carries all four MAX runtime libraries
+2. every dependency that names exactly one place (`@rpath/...`,
+   `@loader_path/...`, an absolute path) is actually there. A bare ELF
+   SONAME is exempt: the system loader resolves `libc`, and faulting it
+   would bury the one line that matters
+3. a `.dylibs` layout carries all four MAX runtime libraries. The `.libs`
+   layout is exempt, because the Linux builder stages whatever the ELF
+   closure turned out to be rather than a fixed list
 4. a wheel layout has no absolute search path pointing outside the
    package, which would mean the rpath rewrite in
    `packaging/build_wheel.sh` did not happen and the wheel only works on
@@ -324,11 +328,16 @@ def expand_search_path(entry: str, image_dir: Path) -> str:
 def resolve_dependencies(record: dict) -> list:
     """For each dependency, where the loader would look and what is there.
 
-    Only `@rpath`-relative and `@loader_path`-relative names are resolved.
-    An absolute name is reported with whether that exact path exists; a
-    bare SONAME (the ELF case) is reported unresolved, because resolving
-    it means reimplementing the whole `ld.so` search order and being
-    subtly wrong about it.
+    `required` is the field that decides whether a miss is a problem:
+
+    - `@rpath/...`, `@loader_path/...`, and absolute names name exactly
+      one place each. If nothing is there, the load fails. Required.
+    - a bare SONAME, which is what ELF `DT_NEEDED` carries, is resolved
+      against this image's own `DT_RPATH` / `DT_RUNPATH` first, because
+      that is the order `ld.so` uses and it is how a bundled `.libs`
+      library is found. A miss only means the system loader will handle
+      it, which is the correct outcome for `libc` and friends, so it is
+      not required and not an error.
     """
     image_dir = Path(record["path"]).resolve().parent
     expanded = [
@@ -338,26 +347,27 @@ def resolve_dependencies(record: dict) -> list:
     resolved = []
     for dep in record.get("dependencies", []):
         name = dep["name"]
-        entry = {"name": name, "kind": dep["kind"], "resolved": None}
+        entry = {
+            "name": name,
+            "kind": dep["kind"],
+            "resolved": None,
+            "required": True,
+            "candidates": [],
+        }
         if name.startswith("@rpath/"):
             tail = name[len("@rpath/") :]
-            candidates = [os.path.join(p, tail) for p in expanded]
-            entry["candidates"] = candidates
-            for candidate in candidates:
-                if os.path.exists(candidate):
-                    entry["resolved"] = candidate
-                    break
+            entry["candidates"] = [os.path.join(p, tail) for p in expanded]
         elif name.startswith("@loader_path"):
-            candidate = expand_search_path(name, image_dir)
-            entry["candidates"] = [candidate]
-            if os.path.exists(candidate):
-                entry["resolved"] = candidate
+            entry["candidates"] = [expand_search_path(name, image_dir)]
         elif os.path.isabs(name):
             entry["candidates"] = [name]
-            if os.path.exists(name):
-                entry["resolved"] = name
         else:
-            entry["candidates"] = []
+            entry["required"] = False
+            entry["candidates"] = [os.path.join(p, name) for p in expanded]
+        for candidate in entry["candidates"]:
+            if os.path.exists(candidate):
+                entry["resolved"] = candidate
+                break
         resolved.append(entry)
     return resolved
 
@@ -375,17 +385,49 @@ def find_extension(package_dir: Path):
 
 
 def bundled_runtime_dir(package_dir: Path):
-    for name in (".dylibs", ".libs"):
+    """The staged runtime directory and which builder produced it.
+
+    Two layouts, because there are two builders, and they are not
+    interchangeable:
+
+    - `.dylibs`, from `packaging/build_wheel.sh` on macOS. delocate's
+      convention. Holds exactly the four MAX runtime dylibs, named
+      `lib*.dylib`.
+    - `.libs`, from `packaging/linux/build_wheel_linux.sh`. Holds the ELF
+      closure staged by soname, so names carry version suffixes
+      (`libfoo.so.1`) and the set is whatever the closure turned out to
+      be, not a fixed list of four.
+
+    Returns `(path, layout)` or `(None, None)`.
+    """
+    for name, layout in ((".dylibs", "dylibs"), (".libs", "libs")):
         path = package_dir / name
         if path.is_dir():
-            return path
-    return None
+            return path, layout
+    return None, None
+
+
+def library_stem(filename: str) -> str:
+    """`libfoo` from `libfoo.dylib`, `libfoo.so`, or `libfoo.so.1.2`.
+
+    `Path.stem` is wrong for the ELF case: it turns `libfoo.so.1` into
+    `libfoo.so`, so a name comparison against it silently never matches.
+    """
+    for marker in (".dylib", ".so"):
+        at = filename.find(marker)
+        if at > 0:
+            return filename[:at]
+    return filename
+
+
+def is_library(filename: str) -> bool:
+    return filename.endswith((".dylib", ".so")) or ".so." in filename
 
 
 def collect(package_dir: Path, extra: list) -> dict:
     """Inspect the package's artifacts plus any explicitly named files."""
     extension = find_extension(package_dir)
-    runtime_dir = bundled_runtime_dir(package_dir)
+    runtime_dir, runtime_layout = bundled_runtime_dir(package_dir)
 
     if extension is None:
         install_kind = "absent"
@@ -400,8 +442,8 @@ def collect(package_dir: Path, extra: list) -> dict:
     bundled_names = []
     if runtime_dir is not None:
         for entry in sorted(runtime_dir.iterdir()):
-            if entry.suffix in (".dylib", ".so") or ".so." in entry.name:
-                bundled_names.append(entry.stem)
+            if is_library(entry.name):
+                bundled_names.append(library_stem(entry.name))
                 images.append(inspect_image(entry))
     for path in extra:
         images.append(inspect_image(Path(path)))
@@ -413,6 +455,7 @@ def collect(package_dir: Path, extra: list) -> dict:
     return {
         "package_dir": str(package_dir),
         "install_kind": install_kind,
+        "runtime_layout": runtime_layout,
         "extension": str(extension) if extension else None,
         "runtime_dir": str(runtime_dir) if runtime_dir else None,
         "bundled": bundled_names,
@@ -457,11 +500,10 @@ def check(result: dict) -> list:
             continue
 
         for dep in record["resolved_dependencies"]:
-            if dep["resolved"] is not None:
-                continue
-            if not dep["candidates"]:
-                # A bare SONAME on ELF. The loader's own search order
-                # decides, and guessing at it here would be noise.
+            if dep["resolved"] is not None or not dep["required"]:
+                # Not required means a bare SONAME the system loader will
+                # resolve. Reporting `libc.so.6` as missing would bury the
+                # one line that matters under a dozen that never do.
                 continue
             problems.append(
                 (
@@ -499,7 +541,12 @@ def check(result: dict) -> list:
                         )
                     )
 
-    if kind == "wheel":
+    if result["runtime_layout"] == "dylibs":
+        # Only the macOS builder stages a known, fixed set. The Linux
+        # builder stages whatever the ELF closure turned out to be, by
+        # soname, so a fixed list of four would fail every correct Linux
+        # wheel. The dependency check above is what covers that layout,
+        # and packaging/linux/check_metadata_ready.py owns the rest.
         have = set(result["bundled"])
         for lib in BUNDLED_RUNTIME_LIBS:
             if lib not in have:
@@ -510,6 +557,16 @@ def check(result: dict) -> list:
                         % (lib, result["runtime_dir"]),
                     )
                 )
+    elif kind == "wheel":
+        problems.append(
+            (
+                "warning",
+                "%s layout: the staged set is an ELF closure rather than a"
+                " fixed list, so its completeness is not checked here. Run"
+                " packaging/linux/inspect_elf.sh on the target, which uses"
+                " a real loader." % result["runtime_layout"],
+            )
+        )
     else:
         problems.append(
             (
@@ -532,7 +589,15 @@ def render(result: dict, problems: list) -> str:
     lines.append("install kind:  %s" % result["install_kind"])
     lines.append("package dir:   %s" % result["package_dir"])
     lines.append("extension:     %s" % (result["extension"] or "none"))
-    lines.append("runtime dir:   %s" % (result["runtime_dir"] or "none"))
+    lines.append(
+        "runtime dir:   %s%s"
+        % (
+            result["runtime_dir"] or "none",
+            " (%s layout)" % result["runtime_layout"]
+            if result["runtime_layout"]
+            else "",
+        )
+    )
     lines.append(
         "images:        %d, %.1f MiB total"
         % (result["totals"]["images"], result["totals"]["bytes"] / 1048576.0)
@@ -587,7 +652,7 @@ def render(result: dict, problems: list) -> str:
         for dep in deps:
             if dep["resolved"]:
                 state = "ok"
-            elif dep["candidates"]:
+            elif dep["required"]:
                 state = "UNRESOLVED"
             else:
                 state = "loader search"

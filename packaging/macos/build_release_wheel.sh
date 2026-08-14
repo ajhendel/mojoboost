@@ -6,9 +6,15 @@
 # NOT EXECUTED. Nothing in packaging/macos has been run: no wheel was built by
 # it, no artifact inspected, no hash computed. Read it before trusting it.
 #
-# This is not a second wheel builder. `pixi run -e pkg build-wheel`
-# (packaging/build_wheel.sh) is the builder and stays the builder. This script
-# is what a release does around it:
+# This is not a second wheel builder. `packaging/build_wheel.sh` is the builder
+# and stays the builder; this script reaches it through `pixi run -e pkg
+# test-wheel`, which builds and then installs the result into two clean venvs
+# and runs the suites there. That task, not a bare `build-wheel`, is the entry
+# point on purpose: a release that skips `packaging/test_wheel.sh` skips the one
+# check that answers "does this wheel work", and the checkers below only answer
+# "does it say true things about itself".
+#
+# This script is what a release does around that:
 #
 #   1. refuse to build unless the checkout is a clean, tagged commit whose tag
 #      matches the version in python/pyproject.toml
@@ -126,7 +132,13 @@ else
     echo "deployment target: SDK default (expect macosx_26_0 on a current Xcode)"
 fi
 
-pixi run -e pkg build-wheel
+# Builds through packaging/build_wheel.sh (test-wheel depends on build-wheel),
+# then installs the wheel into a bare venv and a full one and runs the suites
+# against the install rather than against the source tree. It runs inside pixi,
+# where the Mojo runtime is on the library path whether the wheel bundles it or
+# not, which is why it cannot be the last word on self-containment. The
+# clean-install fixture is, and it runs outside pixi in the release workflow.
+pixi run -e pkg test-wheel
 
 shopt -s nullglob
 WHEELS=("$DIST"/mojoboost-*.whl)
@@ -161,14 +173,22 @@ say "provenance"
 # through pixi. The workflow runs it as a separate step outside the environment,
 # which is the only way its result means anything.
 
+# Each checker runs even when an earlier one failed, and the exit status is
+# collected rather than propagated immediately. A release decision wants the
+# whole list, and a failing run is exactly when the evidence below (the
+# inspection report, the otool dump, the hashes) is worth having: aborting on
+# the first failure would leave the artifact directory with less in it than a
+# passing run produces.
+rc=0
+
 say "matrix contract"
-py packaging/matrix/validate_matrix.py
+py packaging/matrix/validate_matrix.py || rc=1
 
 say "artifact against the matrix"
-py packaging/matrix/validate_artifact.py "$WHEEL"
+py packaging/matrix/validate_artifact.py "$WHEEL" || rc=1
 
 say "release inspection"
-py "$MACOS_DIR/inspect_wheel.py" "$WHEEL" --json "$DIST/inspection.json"
+py "$MACOS_DIR/inspect_wheel.py" "$WHEEL" --json "$DIST/inspection.json" || rc=1
 
 # The load commands as the system tool reports them, kept as evidence next to
 # the artifact. inspect_wheel.py parses the same bytes with the standard
@@ -193,6 +213,17 @@ say "hashes"
 
 say "done"
 echo "$WHEEL"
+
+if [ "$rc" -ne 0 ]; then
+    echo
+    echo "One or more checkers failed. Read the whole log above rather than the"
+    echo "last failure: each checker prints its own verdict and they cover"
+    echo "different questions. The artifact and every report about it are in"
+    echo "$DIST, which is where they need to be to work out which of the wheel"
+    echo "and the matrix is the one that is wrong."
+    exit "$rc"
+fi
+
 echo
 echo "Built and verified. Not validated: no platform in"
 echo "packaging/matrix/platform_matrix.toml may be moved off 'designed' by this"

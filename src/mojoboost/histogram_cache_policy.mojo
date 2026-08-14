@@ -630,7 +630,7 @@ struct HistogramCache(Copyable, Movable):
             self.entries[i] = self.entries[last].copy()
         _ = self.entries.pop()
 
-    def drop_stale(mut self, now: CacheEpochs) -> Int:
+    def drop_stale(mut self, now: CacheEpochs) raises -> Int:
         """Drop every entry that no longer describes anything and return how
         many went. A round or tree boundary makes this the whole cache; it
         is a sweep rather than a clear so that a boundary which invalidated
@@ -650,7 +650,7 @@ struct HistogramCache(Copyable, Movable):
         self.stale_drops += dropped
         return dropped
 
-    def clear(mut self):
+    def clear(mut self) raises:
         self.entries.clear()
         self.live_bytes = 0
 

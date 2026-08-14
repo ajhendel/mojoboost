@@ -361,16 +361,21 @@ the opposite of the truth.
 startup.py_import        1 <ns> <ns> supplied 1
 startup.ext_load         1 <ns> <ns> supplied 1
 startup.runtime_load     1 <ns> <ns> supplied 1
-startup.device_discovery 1 <ns> <ns> native   1
-startup.context_create   1 <ns> <ns> native   1
-startup.kernel_create    5 <ns> <ns> native   1
-startup.first_alloc      7 <ns> <ns> native   1
-startup.first_transfer   1 <ns> <ns> native   1
-startup.first_fit        1 <ns> <ns> native   1
-startup.warm_fit         0 0    0    native   0
+startup.device_discovery 1  <ns> <ns> native   1
+startup.context_create   1  <ns> <ns> native   1
+startup.kernel_create    <n> <ns> <ns> native   1
+startup.first_alloc      17 <ns> <ns> native   1
+startup.first_transfer   1  <ns> <ns> native   1
+startup.first_fit        1  <ns> <ns> native   1
+startup.warm_fit         0  0    0    native   0
 startup.cold_ns <ns>
 startup.warm_ns 0
 ```
+
+`first_alloc` at 17 is derived, not measured: `GpuHistogramBuilder`
+allocates 6 device and 3 pinned host buffers, and the `GpuActiveRows` it
+constructs allocates 5 device and 3 pinned host. `kernel_create` has no
+expected value, for the reason in integration point 3.
 
 ### Warm, same process after four more fits
 

@@ -111,7 +111,6 @@ comptime SPARSE_SHARED_MEMORY = 5
 comptime SPARSE_EMPTY = 6
 comptime SPARSE_CATEGORIES_EXCEED_BINS = 7
 comptime SPARSE_BUNDLED_CATEGORICAL = 8
-comptime SPARSE_BUNDLE_LOSSY = 9
 
 
 def sparse_support_name(reason: Int) -> String:
@@ -135,8 +134,6 @@ def sparse_support_name(reason: Int) -> String:
         return String("categorical feature has more categories than bins")
     if reason == SPARSE_BUNDLED_CATEGORICAL:
         return String("categorical feature inside a multi-member bundle")
-    if reason == SPARSE_BUNDLE_LOSSY:
-        return String("bundling plan drops stored entries")
     return String("unknown")
 
 
@@ -160,8 +157,8 @@ def sparse_support(
         return SPARSE_TOO_MANY_ROWS
     if n_features > SPARSE_MAX_INDEX:
         return SPARSE_TOO_MANY_FEATURES
-    # `nnz + 1` because `col_offsets[n_features]` is nnz itself and every
-    # offset is an Int32.
+    # `>=` rather than `>`: `col_offsets[n_features]` is nnz itself, and it
+    # is an Int32 like every other offset.
     if nnz < 0 or nnz >= SPARSE_MAX_INDEX:
         return SPARSE_TOO_MANY_ENTRIES
     if shared_bytes_for(n_bins) > caps.max_shared_memory_per_block:
@@ -496,6 +493,12 @@ def derive_entry_tiling(
     feature with fewer entries simply leaves its tail tiles with nothing to
     do. That imbalance is the known weakness of this geometry and it is
     proportional to how uneven the column occupancies are; see the handoff.
+
+    One inherited surprise: because the policy is reused verbatim,
+    `MOJOBOOST_GPU_ROW_TILE` forces the tile size here too, and it then means
+    *entries* per tile rather than rows per tile. Reusing one override for
+    one policy is better than a second variable that could disagree with it,
+    but a benchmark that sets it should know it is setting both.
     """
     var n = max_entries
     if n < 1:
@@ -666,6 +669,7 @@ struct SparseRangeTable(Copyable, Movable):
         children's windows sub-windows of the parent's for every feature.
         """
         var window = self.get(parent)
+        var parent_exact = self.is_exact(parent)
         self._check_ids(parent, left, right)
         if len(mids) != self.n_features:
             raise Error("midpoint list must have one entry per feature")
@@ -694,8 +698,8 @@ struct SparseRangeTable(Copyable, Movable):
         # midpoint yields two windows that each still contain their child's
         # true window. Exactness therefore propagates rather than being
         # recovered: a child of a bound parent is still only bounded.
-        self.exact[left] = self.exact[parent]
-        self.exact[right] = self.exact[parent]
+        self.exact[left] = parent_exact
+        self.exact[right] = parent_exact
         self.nodes[parent] = SparseNodeEntries.empty(self.n_features)
 
     def bound_split(

@@ -309,6 +309,11 @@ def params_names_mojo_api_only(spec: String) -> Bool:
             value == "lambdarank" or value == "custom"
         ):
             return True
+        # `data_sample_strategy=bagging` is accepted; only the GOSS value
+        # needs the Mojo API, because selecting it means handing the trainer
+        # a `GossParams`.
+        if key == "data_sample_strategy" and value == "goss":
+            return True
     return False
 
 

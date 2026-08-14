@@ -412,7 +412,13 @@ struct RunPlan(Copyable, Movable):
 
     def counted_in_steady_state(self, rnd: Int) -> Bool:
         """Round 0 carries first touch and the retouch round carries a
-        transition; neither belongs in a steady-state mean."""
+        transition; neither belongs in a steady-state mean.
+
+        The runners branch on `rnd == 0` and `is_retouch` directly rather
+        than calling this, because they have to route those two rounds to
+        different accumulators anyway. It is here as the single written
+        statement of what the steady state excludes.
+        """
         return rnd > 0 and not self.is_retouch(rnd)
 
 

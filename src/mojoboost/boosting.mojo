@@ -659,10 +659,11 @@ def _renew_leaf_values(
     var bounds = node_bounds(tree, monotone)
     var finish = extra.needs_leaf_finish()
     # Built before any leaf is rewritten, though renewal touches leaves only
-    # and every parent is internal, so the two orders agree.
-    var parent_output = List[Float64](capacity=n_nodes)
-    parent_output.resize(n_nodes, 0.0)
+    # and every parent is internal, so the two orders agree. Left empty, and
+    # so unallocated, when there is no smoothing to do.
+    var parent_output = List[Float64]()
     if finish:
+        parent_output.resize(n_nodes, 0.0)
         for node in range(n_nodes):
             if tree.feature[node] < 0:
                 continue

@@ -147,7 +147,7 @@ Only `STRATEGY_ATOMIC` is implemented. The dense path's tiled strategy exists
 to stop many row tiles contending on the same output bins; the sparse path's
 tiles are entry tiles, which are far fewer per feature, and the hottest bin
 by far (the default one) is never touched by the accumulation at all. It is
-filled once, by one thread, in a separate kernel. A partial-buffer variant is
+filled once, in a separate reducing kernel. A partial-buffer variant is
 a measurement away, not a design change.
 
 ### Known weakness: uneven columns
@@ -326,7 +326,7 @@ active features, `B` bins.
 | gradient reads | `R * A` | `R + E` |
 | kernel launches | 1 (2 tiled) | 3 |
 | host syncs per node | 1 | 1 |
-| device work for the default bin | none | `A * B` adds, one thread per feature |
+| device work for the default bin | none | `A * B` adds, one threadgroup per feature |
 
 Per split, with `F` features, `N` the parent's row count, `P` the parent's
 entry count.

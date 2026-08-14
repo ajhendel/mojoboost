@@ -807,24 +807,17 @@ struct SpeculationLedger(Copyable, Movable):
         return Float64(self.hits) / Float64(total)
 
     def report(self) -> String:
-        return String(
-            "batches=",
-            self.batches,
-            " items=",
-            self.items,
-            " items_per_batch=",
-            self.items_per_batch(),
-            " hits=",
-            self.hits,
-            " misses=",
-            self.misses,
-            " hit_rate=",
-            self.hit_rate(),
-            " wasted_histograms=",
-            self.wasted_histograms,
-            " redundant_partitions=",
-            self.redundant_partitions,
+        var out = String("batches ") + String(self.batches) + "\n"
+        out += "items " + String(self.items) + "\n"
+        out += "items_per_batch " + String(self.items_per_batch()) + "\n"
+        out += "hits " + String(self.hits) + "\n"
+        out += "misses " + String(self.misses) + "\n"
+        out += "hit_rate " + String(self.hit_rate()) + "\n"
+        out += "wasted_histograms " + String(self.wasted_histograms) + "\n"
+        out += (
+            "redundant_partitions " + String(self.redundant_partitions) + "\n"
         )
+        return out
 
 
 # --- How many leaves a grower can actually offer --------------------------

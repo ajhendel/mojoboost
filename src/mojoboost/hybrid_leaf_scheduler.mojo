@@ -705,13 +705,13 @@ def decline_reason(ctx: HybridContext, work: LeafWork) raises -> Int:
         return DECLINE_NO_HOST_BINS
     if ctx.mode == MODE_REPLICA and not ctx.quantized_replica_verified:
         return DECLINE_REPLICA_UNVERIFIED
+    if not ctx.costs.measured:
+        return DECLINE_COSTS_UNMEASURED
     if work.node_rows < 1:
         # An empty node's histogram is all zeros on either device and the
         # grower's shape rules will refuse to split it anyway; sending it
         # anywhere new is churn, not a decision.
         return DECLINE_EMPTY_NODE
-    if not ctx.costs.measured:
-        return DECLINE_COSTS_UNMEASURED
 
     var build = host_build_nanos(work, ctx.costs)
     var transfer = host_transfer_nanos(work, ctx.costs)
@@ -905,7 +905,7 @@ struct WaveBarrier(Copyable, Movable):
         self.completions = List[Int]()
         self.waves = 0
 
-    def open(mut self):
+    def open(mut self) raises:
         """Start a new wave, discarding the previous one's record."""
         self.nodes.clear()
         self.done.clear()

@@ -418,9 +418,15 @@ def gpu_trains_objective(objective: Int) -> Bool:
 
     Every built-in objective, which is what `train_gpu` accepts: it runs
     the same `_check_objective` the CPU trainer does and then grows trees
-    on the device. `CUSTOM` and `LAMBDARANK` are not built-in and are
-    trained through `train_custom` and the ranker, both of which are host
-    paths.
+    on the device.
+
+    Deliberately narrower than "does any GPU trainer exist for this". It
+    does not for `LAMBDARANK`, which is CPU only; it does for `CUSTOM`
+    (`train_custom_gpu`) and for multiclass (`train_multiclass_gpu`), but
+    neither is reachable through the `device` setting, because each is its
+    own entry point. This predicate answers what the device vocabulary can
+    route, which is the only question this module is asked.
+    `objective_backends` in objective_registry.mojo answers the wider one.
 
     `OBJECTIVE_UNSPECIFIED` answers True: a caller that did not name an
     objective is not asserting an unsupported one, and the decision carries
@@ -1041,12 +1047,21 @@ def _collect_blocks(
         )
 
     if request.objective == CUSTOM:
+        # `train_custom_gpu` does exist, and it grows trees on the device
+        # while calling the gradient callback on the host. The `device`
+        # vocabulary does not route to it: `fit` and `fit_multiclass` send
+        # a custom objective to `train_custom`, and `train_gpu` itself
+        # rejects the code. So this block is about the path the request
+        # will actually take, not a claim that no GPU custom trainer
+        # exists. Reaching that trainer is an explicit call, not a device
+        # setting.
         blocks.add(
             BLOCK_CUSTOM_OBJECTIVE,
             String(
                 "a custom objective's gradients come from a caller-supplied"
-                " callable on the host, so it trains through train_custom on"
-                " the CPU"
+                " callable, and the device setting routes it to train_custom"
+                " on the CPU; call train_custom_gpu directly to grow its"
+                " trees on the device"
             ),
         )
     elif request.objective == LAMBDARANK:
@@ -1336,7 +1351,9 @@ struct DeviceDecision(Copyable, Movable):
         out += String("n_outputs=", self.request.n_outputs, "\n")
         out += String("cells=", self.request.cells(), "\n")
         out += String("n_bins=", self.request.n_bins, "\n")
-        out += String("bins_known=", _bool_text(self.request.bins_known()), "\n")
+        out += String(
+            "bins_known=", _bool_text(self.request.bins_known()), "\n"
+        )
         out += String("objective=", self.request.objective, "\n")
         out += String(
             "objective_known=",

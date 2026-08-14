@@ -159,6 +159,34 @@ Register it beside the others in the module builder:
 work, they still run the same engine, and `python/mojoboost/__init__.py`
 still calls `resolve_device` (see section 2).
 
+## 1a-bis. Use `objective_registry.objective_code_from_name`, not `objective_from_name`
+
+A parallel lane (task 21) landed `src/mojoboost/objective_registry.mojo`
+while this one was writing, and it changes the recommendation above for
+the better. `objective_code_from_name` there resolves **every** public
+spelling, including the three `objective_from_name` in `params.mojo`
+refuses or rewrites: `lambdarank`, `custom`, and `multiclass`. That is
+exactly the resolver a device question wants, because all three are real
+answers to "what is this run's objective" even though none of them is a
+parameter-string objective.
+
+So in section 1b below, prefer:
+
+```mojo
+from mojoboost.objective_registry import objective_code_from_name
+...
+    return PythonObject(objective_code_from_name(String(py=name)))
+```
+
+and the `lambdarank` caveat in that section goes away: a name-only caller
+then does get `BLOCK_RANKING_OBJECTIVE`. `multiclass` still resolves to
+`MULTICLASS` (-1), which the `decide_device` binding folds into
+`OBJECTIVE_UNSPECIFIED` because `n_outputs` already carries the class
+count.
+
+Land this only after both lanes are in. Until then the `params.mojo`
+version in section 1b works, with the caveat stated there.
+
 ## 1b. Optional: `objective_code`, for the name-only explain path
 
 `explain_device_choice(X, y, objective="poisson")` is a public entry point
@@ -320,6 +348,55 @@ should stay as is: it fires before a `Workload` exists.
 objective. Pass it: `BLOCK_CUSTOM_OBJECTIVE` then refuses the GPU
 natively, with a message that explains why rather than just refusing.
 That makes the Python guard at line 2497 redundant, per section 2b.
+
+---
+
+# 2d. Convergence with `objective_registry.mojo` (task 21)
+
+Both lanes were in flight at once and both needed objective metadata, so
+there are three near-neighbor predicates now. They are **not** the same
+question, and the registry's own docstring says so; keep them distinct.
+
+| Predicate | Home | Asks |
+|---|---|---|
+| `objective_backends` | `objective_registry.mojo` | Does *any* GPU trainer exist for this objective? |
+| `objective_gradients_on_device` | `objective_registry.mojo` | Are the derivatives computed on the device? |
+| `gpu_trains_objective` | `device_policy.mojo` | Does `train_gpu` itself accept this code? |
+
+They differ on exactly two codes, and the differences are the point:
+
+- `CUSTOM`: a GPU trainer exists (`train_custom_gpu`), its gradients are
+  *not* on the device, and `train_gpu` does not accept it. The `device`
+  setting routes a custom objective to `train_custom` on the CPU, which is
+  why `BLOCK_CUSTOM_OBJECTIVE` is correct even though a device-side custom
+  trainer exists. The block message says so.
+- `MULTICLASS`: a GPU trainer exists (`train_multiclass_gpu`) and
+  `train_gpu` does not accept the code, because multiclass has its own
+  entry point. The device policy never sees `MULTICLASS` as an objective:
+  the class count arrives as `n_outputs`, and `gpu_supports_outputs`
+  answers for it.
+
+Once both lanes have landed, three edits collapse the remaining overlap.
+None is required for correctness, and none should be made before both
+files are committed and compiling.
+
+1. Replace the `LAMBDARANK` mirror in `device_policy.mojo` with
+   `from .objective_registry import LAMBDARANK`. The registry mirrors it
+   from `ranking.mojo` for the same import-cycle reason this module does,
+   so this removes one of the two copies rather than both. Check first
+   that `objective_registry` does not import `device_policy`; today it
+   imports only `.boosting`, so the direction is safe.
+2. Make `gpu_objective_is_device_resident` in `device_policy.mojo`
+   delegate to `objective_registry.objective_gradients_on_device`, and
+   delete its body. That is the same collapse the docstring on
+   `gpu_objective_is_device_resident` already asks for against
+   `gpu_objectives_native.supports_device_objective`, and the registry is
+   the better target because it does not pull in `max.gpu`.
+3. Use `objective_code_from_name` in the binding, per section 1a-bis.
+
+`is_builtin_objective` and `gpu_trains_objective` stay in
+`device_policy.mojo`. They answer a question about `train_gpu`'s accepted
+set, which is a device-routing fact, not objective metadata.
 
 ---
 

@@ -1,0 +1,219 @@
+{
+  "schema_version": "1.0.0",
+  "document": "bin_layout_measurement_plan",
+  "title": "GPU binned-data layout and compression: what has to be measured before a threshold exists",
+  "status": "unmeasured",
+  "status_note": "Nothing in this file has been run. Every measured quantity is null, and null means 'not measured', never zero. The plan exists so that gpu_binned_layout.decide_layout can be given real numbers; until those numbers exist the verdict is LAYOUT_UNDECIDED by construction and no default threshold is permitted anywhere in the source.",
+  "owns": [
+    "src/mojoboost/gpu_binned_layout.mojo",
+    "src/mojoboost/gpu_bin_packing.mojo",
+    "bench/apple/bin_layout_plan.json",
+    "handoffs/algorithm_25_binned_layout.md"
+  ],
+  "relates_to": {
+    "protocol": "docs/APPLE_GPU_BENCHMARK_PROTOCOL.md",
+    "run_record_schema": "bench/apple/schema.json",
+    "note": "This file is a measurement *plan*, not a run record. A run that executes it emits a record against bench/apple/schema.json; this document says what to put in it and why."
+  },
+
+  "baseline": {
+    "layout": "feature-major-u8",
+    "why": "It is what GpuHistogramBuilder uploads today, byte for byte. BinLayoutPlan calls it the passthrough plan: one feature per block, width 8, block_offset[f] == f * n_rows, no alignment padding, no tail pad. It costs zero packing work and zero decode instructions, so it must be charged exactly that and not a byte more, or every comparison tilts toward the candidate.",
+    "must_hold": "plan.is_passthrough() and plan.check_passthrough_offsets() and plan.bytes() == n_rows * n_features"
+  },
+
+  "variants": [
+    {
+      "id": "feature-major-u8",
+      "kind": "LAYOUT_FEATURE_MAJOR_U8",
+      "block_features": 1,
+      "width_bits": 8,
+      "is_baseline": true,
+      "rationale": "The current layout. Optimal bin locality at the root, one sector per row at depth, zero waste under feature subsampling, zero decode cost.",
+      "expected_weakness": "Re-reads the row index, gradient, and hessian once per feature: 12 bytes of row-side traffic per (row, feature) against 1 byte of bin."
+    },
+    {
+      "id": "feature-major-packed",
+      "kind": "LAYOUT_FEATURE_MAJOR_PACKED",
+      "block_features": 1,
+      "width_bits": "per-feature, width_for_bins(declared bins)",
+      "is_baseline": false,
+      "rationale": "The narrowest change: same access pattern, fewer bytes resident. Isolates the decode cost from every other variable.",
+      "expected_weakness": "Removes at most 3.8% of per-(row, feature) traffic and adds 2 loads plus 4 ALU ops per element. This is the variant most likely to lose outright, and measuring that is the point."
+    },
+    {
+      "id": "feature-blocked-u8-G4",
+      "kind": "LAYOUT_FEATURE_BLOCKED_U8",
+      "block_features": 4,
+      "width_bits": 8,
+      "is_baseline": false,
+      "rationale": "Isolates blocking from compression. Cuts row-side traffic ~4x; needs a multi-feature histogram kernel with 4 * n_bins * 12 shared bytes.",
+      "expected_weakness": "Wastes (G - active)/G of bin traffic under colsample; 12 KB of shared memory at n_bins=256 caps occupancy."
+    },
+    {
+      "id": "feature-blocked-u8-G8",
+      "kind": "LAYOUT_FEATURE_BLOCKED_U8",
+      "block_features": 8,
+      "width_bits": 8,
+      "is_baseline": false,
+      "rationale": "The point where shared memory starts to bind at n_bins=256 (24 KB), so it brackets the occupancy cliff rather than assuming where it is.",
+      "expected_weakness": "May exceed a Metal threadgroup's 32 KB at n_bins=256 once the kernel's other state is counted."
+    },
+    {
+      "id": "feature-blocked-packed-G4",
+      "kind": "LAYOUT_FEATURE_BLOCKED_PACKED",
+      "block_features": 4,
+      "width_bits": "per-block, promoted to the block maximum",
+      "is_baseline": false,
+      "rationale": "Blocking and compression together, which is where they are predicted to compose: a narrower width puts more of a block's row inside one sector.",
+      "expected_weakness": "Promotion to the block maximum wastes bits when a block mixes a 3-bit and an 8-bit feature."
+    },
+    {
+      "id": "feature-blocked-packed-wide",
+      "kind": "LAYOUT_FEATURE_BLOCKED_PACKED",
+      "block_features": "max_block_for_shared(width, n_bins, caps)",
+      "width_bits": "per-block",
+      "is_baseline": false,
+      "rationale": "The variant that tests the strongest claim in the design: a feature of width w needs only 2^w shared histogram slots, so a 4-bit block can be 16x wider than an 8-bit one under the same threadgroup budget. If compression pays anywhere, it pays here, and for a shared-memory reason rather than a bandwidth one.",
+      "expected_weakness": "Only reachable on datasets whose features genuinely have few bins; a max_bins=255 dataset with dense quantiles never gets narrow widths."
+    },
+    {
+      "id": "row-major-u8",
+      "kind": "LAYOUT_ROW_MAJOR_U8",
+      "block_features": "n_features",
+      "width_bits": 8,
+      "is_baseline": false,
+      "rationale": "The deep-node optimum and the layout the prediction kernel already wants. Included even where training cannot launch it, because gpu_predict.mojo reads many features of one row and is the natural consumer.",
+      "expected_weakness": "Needs n_features * n_bins * 12 shared bytes for a single-pass histogram, which is unreachable for any realistic n_features; for training it is a bound, not a candidate."
+    },
+    {
+      "id": "row-major-packed",
+      "kind": "LAYOUT_ROW_MAJOR_PACKED",
+      "block_features": "n_features",
+      "width_bits": "uniform, promoted to the matrix maximum",
+      "is_baseline": false,
+      "rationale": "Same as above with the transfer and residency reduced. Its real interest is the prediction path and the upload cost, not the training histogram.",
+      "expected_weakness": "Uniform promotion means one 255-bin feature forces width 8 on the whole matrix."
+    }
+  ],
+
+  "cost_model": {
+    "source": "src/mojoboost/gpu_binned_layout.mojo",
+    "structs": ["LayoutNodeCost", "LayoutBuildCost", "MeasuredLayoutCosts"],
+    "units": [
+      {
+        "name": "sector_bytes",
+        "meaning": "Bytes a device actually fetches for one scattered access. Not a tunable: a hardware fact that has to be established per device before any sector-denominated cost means anything.",
+        "measured_value": null,
+        "how_to_measure": "Stride sweep: read one byte every S bytes for S in {1,2,4,...,256} over a buffer far larger than L2, and find the stride past which achieved bandwidth stops falling. The plateau is the sector.",
+        "note": "SECTOR_BYTES_UNKNOWN (0) propagates into sectors_touched() returning 0 and MeasuredLayoutCosts.is_measured() returning false, so an unmeasured sector cannot silently become a default."
+      },
+      {
+        "name": "ns_per_sector",
+        "meaning": "Time to fetch one sector under the histogram kernel's access pattern, not under a streaming benchmark.",
+        "measured_value": null,
+        "how_to_measure": "Vary node_rows at fixed n_features and fit the slope of enqueue_leaf time against layout_node_cost().bin_sectors + row_sectors."
+      },
+      {
+        "name": "ns_per_decode_op",
+        "meaning": "Marginal cost of one bit-extraction ALU op in the inner loop. The quantity everyone is tempted to assume is zero.",
+        "measured_value": null,
+        "how_to_measure": "Run feature-major-packed against feature-major-u8 on a dataset whose widths are all 8 versus all 4, holding sectors constant by choosing n_rows so both fit L2. The difference is decode, isolated."
+      },
+      {
+        "name": "ns_per_launch",
+        "meaning": "Per-threadgroup-grid launch overhead. Blocking trades launches against row-side traffic, so the exchange rate matters.",
+        "measured_value": null,
+        "how_to_measure": "Already separable in bench/bench_histogram.mojo's enqueue_leaf phase; sweep n_active with an empty node."
+      },
+      {
+        "name": "ns_per_upload_byte",
+        "meaning": "Host-to-device cost per byte. On Apple unified memory this may be near zero, which would remove compression's transfer argument entirely.",
+        "measured_value": null,
+        "how_to_measure": "bench/bench_histogram.mojo already times upload_staged; extend to the bins buffer."
+      },
+      {
+        "name": "ns_per_pack_write",
+        "meaning": "Host cost of one pack_value call. Amortized over a training run it should vanish; over a one-shot build_histogram_gpu it may dominate.",
+        "measured_value": null,
+        "how_to_measure": "Time pack_binned_matrix directly at each width; it is pure host work and needs no device."
+      }
+    ],
+    "known_omissions": [
+      "L2 residency across blocks. The model charges the row side once per touched block, which is exact when rows/grad/hess exceed L2 and an overestimate when they do not. This is the single largest unknown and the first profiler question below.",
+      "The partition kernel's own bin reads. _flag_scan_kernel and _scatter_kernel read one feature's bins per split and would need the same decode; they are not in layout_node_cost at all.",
+      "Sibling subtraction. The grower builds only one child and subtracts the other, which halves the deep-node node count and therefore changes which regime dominates a whole tree.",
+      "The prediction path. gpu_predict walks trees per row and prefers the opposite layout; it is not priced here and a training-side verdict must not be read as covering it."
+    ]
+  },
+
+  "shapes_to_sweep": {
+    "n_rows": [100000, 1000000, 10000000],
+    "n_features": [16, 64, 256],
+    "n_bins": [16, 64, 255],
+    "width_profiles": [
+      "all-8 (dense quantiles, the case compression cannot help)",
+      "all-4 (<=16 bins per feature, the case compression should help most)",
+      "mixed (a realistic tabular set: many low-cardinality categoricals, a few dense numerics)"
+    ],
+    "colsample": [1.0, 0.5, 0.2],
+    "node_depths": [0, 1, 3, 5, 8, 12],
+    "why_depth_is_swept": "sectors_touched crosses from the streaming regime to the scattered one at count = span_bytes / sector. At 1e6 rows, width 8, and a 32-byte sector that is depth 5. A benchmark that only measures root nodes will conclude compression works; one that only measures leaves will conclude it does nothing. Both would be wrong."
+  },
+
+  "profiler_questions": [
+    {
+      "id": "Q1",
+      "question": "Does the row side (rows, grad, hess) stay resident in L2 across the features of one node, or is it re-fetched from DRAM per feature?",
+      "why_it_decides": "If it stays resident, blocking's headline 4x saving is largely illusory and the whole design's premise weakens. If it does not, blocking is worth far more than compression and should be built first.",
+      "how": "Counter the DRAM read bytes for one enqueue_leaf at n_features=64 and compare against n_features * node_rows * 12 versus node_rows * 12."
+    },
+    {
+      "id": "Q2",
+      "question": "What is the achieved bin-read efficiency (bytes used / bytes fetched) as a function of node depth, per layout?",
+      "why_it_decides": "It is the direct measurement of sectors_touched. If the measured curve does not have the two-regime shape the model assumes, the model is wrong and decide_layout must not be trusted even with measurements."
+    },
+    {
+      "id": "Q3",
+      "question": "Is the 4-bit decode actually 4 extra ALU ops in the emitted kernel, or does the compiler fuse the shift and mask into the load?",
+      "why_it_decides": "decode_cost() asserts a static instruction count. If the real count differs, ns_per_decode_op is being fitted against a wrong regressor and every packed verdict inherits the error.",
+      "how": "Read the generated Metal/PTX for the packed histogram kernel and count."
+    },
+    {
+      "id": "Q4",
+      "question": "At what block width G does occupancy fall off, per device and per n_bins?",
+      "why_it_decides": "max_block_for_shared computes the arithmetic bound from MAX_SHARED_MEMORY_PER_BLOCK, but the practical bound is lower: a block that fits but leaves only one resident threadgroup per multiprocessor can be slower than a narrower one. The gap between the two bounds is not derivable."
+    },
+    {
+      "id": "Q5",
+      "question": "On Apple unified memory, is ns_per_upload_byte distinguishable from zero?",
+      "why_it_decides": "If it is zero, the transfer argument for compression disappears entirely on the target device and only the shared-memory argument (Q4) survives. That would be a reason to build blocking and skip packing."
+    },
+    {
+      "id": "Q6",
+      "question": "Does packing change the fixed-point histogram at all?",
+      "why_it_decides": "It must not. Bin ids are preserved by construction, so every histogram must be bit-identical to the baseline's. Any difference is a bug in the addressing, not a precision effect, and matches_dense() plus a bit-exact histogram comparison is the check.",
+      "expected_answer": "No difference, bit for bit."
+    },
+    {
+      "id": "Q7",
+      "question": "How much does the partition kernel cost under a blocked layout?",
+      "why_it_decides": "A split reads one feature's bins for a whole node. Feature-major gives that a contiguous column; a blocked layout gives it a strided gather with stride G*w/8. Blocking could win the histogram and lose the partition, and the model does not currently price this at all."
+    },
+    {
+      "id": "Q8",
+      "question": "Does a row-major or wide-blocked layout speed up gpu_predict enough to justify a second resident copy of the matrix?",
+      "why_it_decides": "Training and prediction want opposite layouts. Keeping both costs memory; keeping one costs time on whichever path loses. This is a product decision that needs both numbers."
+    }
+  ],
+
+  "acceptance": {
+    "before_any_threshold_is_added": [
+      "Every unit in cost_model.units has a non-null measured_value on at least one Apple device and one non-Apple device.",
+      "Q1, Q2, and Q3 are answered, because they test the model's structure rather than its coefficients.",
+      "Q6 is answered 'no difference, bit for bit' on every variant, including the mixed-width and categorical cases.",
+      "The measured verdict from decide_layout agrees with end-to-end wall-clock on at least the three width_profiles at colsample 1.0 and 0.2."
+    ],
+    "if_acceptance_fails": "The layouts stay available and unselected. gpu_binned_layout exposes them, prices them, and returns LAYOUT_UNDECIDED; nothing in the training path changes. An unmeasured layout that is never selected costs nothing; an unmeasured layout that is selected by a guessed threshold is a silent performance and correctness risk."
+  }
+}

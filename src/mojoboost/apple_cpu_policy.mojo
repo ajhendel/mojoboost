@@ -47,10 +47,10 @@ What this module deliberately does NOT encode
   three assumptions named below, which are conservative floors rather than
   the development Mac's values.
 - **No claim that any of it is measured.** Every constant here is a starting
-  point with a stated mechanism, not a tuned optimum. `bench/apple/cpu_plan.json`
-  lists the sweep that would turn each one into a measured value, and the
-  handoff lists which claims need profiler or disassembly evidence before
-  anyone repeats them.
+  point with a stated mechanism, not a tuned optimum.
+  `bench/apple/cpu_plan.json` lists the sweep that would turn each one into
+  a measured value, and the handoff lists which claims need profiler or
+  disassembly evidence before anyone repeats them.
 - **No affinity, no QoS class, no thread pinning, no core-type
   detection beyond the counts `std.sys.info` reports.**
 - **No Python.** The policy is consumed by Mojo hot paths; a Python
@@ -299,6 +299,7 @@ struct CpuProfile(Copyable, Movable):
 
     def describe(self) -> String:
         """One line for benchmark headers and bug reports."""
+        var neon = String("yes") if self.has_neon else String("no")
         return String(
             "cores=",
             self.physical_cores,
@@ -317,7 +318,7 @@ struct CpuProfile(Copyable, Movable):
             " f64_lanes=",
             self.float64_lanes,
             " neon=",
-            self.has_neon,
+            neon,
             " assumed_line=",
             self.cache_line_bytes,
             " assumed_l1d=",
@@ -401,11 +402,12 @@ struct AccumulationPlan(Copyable, Movable):
         return self.active_ops + self.excluded_ops + self.gather_ops
 
     def describe(self) -> String:
+        var compact = String("yes") if self.compact_rows else String("no")
         return String(
             "group_width=",
             self.group_width,
             " compact_rows=",
-            self.compact_rows,
+            compact,
             " active_ops=",
             self.active_ops,
             " excluded_ops=",

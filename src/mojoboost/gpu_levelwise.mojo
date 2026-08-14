@@ -84,6 +84,7 @@ from .monotone import (
     monotone_sign,
 )
 from .split import SplitInfo
+from .tree_parameters_extra import finish_leaf_output
 
 
 # Bytes one histogram cell occupies. A cell is one (feature, bin) pair, and a
@@ -108,6 +109,13 @@ struct LevelNode(Copyable, Movable):
     split on between the root and it, empty unless interaction constraints
     are configured. `bounds` is the interval its output must lie in,
     unbounded unless a monotone constraint above it applies.
+
+    `value` is the output the node already emits, which is what its children
+    smooth toward under `path_smooth`. `tree.grow_tree` reads the same
+    quantity straight off `tree.value[parent_node]`; a level-wise grower
+    cannot, because it plans a whole level's children before writing any of
+    them, so the frontier carries it. It is 0.0 with the leaf controls at
+    their defaults, where nothing reads it.
     """
 
     var node: Int
@@ -115,6 +123,7 @@ struct LevelNode(Copyable, Movable):
     var n_rows: Int
     var branch: List[Int]
     var bounds: OutputBounds
+    var value: Float64
 
     def __init__(
         out self,
@@ -123,12 +132,14 @@ struct LevelNode(Copyable, Movable):
         n_rows: Int,
         var branch: List[Int] = [],
         var bounds: OutputBounds = OutputBounds.unbounded(),
+        value: Float64 = 0.0,
     ):
         self.node = node
         self.depth = depth
         self.n_rows = n_rows
         self.branch = branch^
         self.bounds = bounds^
+        self.value = value
 
 
 struct LevelFrontier(Copyable, Movable):
@@ -150,11 +161,17 @@ struct LevelFrontier(Copyable, Movable):
         self.depth = depth
 
     @staticmethod
-    def root(n_rows: Int) -> LevelFrontier:
+    def root(n_rows: Int, value: Float64 = 0.0) -> LevelFrontier:
         """The depth-0 frontier: node 0 alone, covering the tree's rows (the
-        bag's rows under bagging, every row otherwise)."""
+        bag's rows under bagging, every row otherwise). `value` is the root's
+        own output, which its children smooth toward under `path_smooth`; the
+        grower has it from the root histogram."""
         var f = LevelFrontier(0)
-        f.nodes.append(LevelNode(0, 0, n_rows))
+        f.nodes.append(
+            LevelNode(
+                0, 0, n_rows, List[Int](), OutputBounds.unbounded(), value
+            )
+        )
         return f^
 
     def n_nodes(self) -> Int:
@@ -274,16 +291,39 @@ def child_sums(
     return ChildSums(lg, lh, lc, rg, rh, rc)
 
 
-@always_inline
-def newton_value(
-    grad_sum: Float64, hess_sum: Float64, lambda_reg: Float64,
+def child_leaf_value(
+    grad_sum: Float64,
+    hess_sum: Float64,
+    lambda_reg: Float64,
     lambda_l1: Float64 = 0.0,
+    n_data: Int = 0,
+    parent_output: Float64 = 0.0,
+    max_delta_step: Float64 = 0.0,
+    path_smooth: Float64 = 0.0,
 ) -> Float64:
     """The leaf output `tree._leaf_value` produces, from sums a caller
-    already holds rather than from a histogram. Same formula, same L1
-    soft-threshold, so a level-wise leaf and a leaf-wise leaf differ only by
-    the order their sums were accumulated in."""
-    return -soft_threshold_l1(grad_sum, lambda_l1) / (hess_sum + lambda_reg)
+    already holds rather than from a histogram.
+
+    Same Newton step, same L1 soft-threshold, and the same `max_delta_step`
+    cap and `path_smooth` shrinkage toward the parent's emitted output, in
+    the same order, so a level-wise leaf and a leaf-wise leaf differ only by
+    the order their sums were accumulated in. Both leaf controls default to
+    off, in which case this is the Newton step alone.
+
+    Level-wise growth can honor the leaf-side controls at all only because
+    both of their inputs are available before the child's histogram exists:
+    `n_data` is the exact integer count from `child_sums`, and
+    `parent_output` is the value the parent already emits, carried on
+    `LevelNode.value`.
+    """
+    var value = -soft_threshold_l1(grad_sum, lambda_l1) / (
+        hess_sum + lambda_reg
+    )
+    if max_delta_step <= 0.0 and path_smooth <= 0.0:
+        return value
+    return finish_leaf_output(
+        value, max_delta_step, path_smooth, n_data, parent_output
+    )
 
 
 struct CommittedSplit(Copyable, Movable):
@@ -396,6 +436,7 @@ struct LevelCommit(Copyable, Movable):
                     s.n_left,
                     s.branch.copy(),
                     s.left_bounds.copy(),
+                    s.left_value,
                 )
             )
             out.nodes.append(
@@ -405,6 +446,7 @@ struct LevelCommit(Copyable, Movable):
                     s.n_right,
                     s.branch.copy(),
                     s.right_bounds.copy(),
+                    s.right_value,
                 )
             )
         out.check_sorted()
@@ -459,6 +501,8 @@ def plan_level(
     max_depth: Int,
     n_leaves_before: Int,
     n_eligible: Int,
+    max_delta_step: Float64 = 0.0,
+    path_smooth: Float64 = 0.0,
 ) raises -> LevelCommit:
     """Turn one level's search results into the edits that apply it.
 
@@ -512,16 +556,33 @@ def plan_level(
         # Read out of `split` before it is transferred into the commit below.
         var branch = extend_branch(frontier.nodes[i].branch, split.feature)
 
+        # Both children smooth toward the value the parent already emits,
+        # which is what `tree.grow_tree` reads off `tree.value[parent_node]`.
+        var parent_output = frontier.nodes[i].value
         var parent_bounds = frontier.nodes[i].bounds.copy()
         var sign = monotone_sign(signs, split.feature)
         var left_value = parent_bounds.clamp(
-            newton_value(
-                sums.left_grad, sums.left_hess, lambda_reg, lambda_l1
+            child_leaf_value(
+                sums.left_grad,
+                sums.left_hess,
+                lambda_reg,
+                lambda_l1,
+                sums.left_count,
+                parent_output,
+                max_delta_step,
+                path_smooth,
             )
         )
         var right_value = parent_bounds.clamp(
-            newton_value(
-                sums.right_grad, sums.right_hess, lambda_reg, lambda_l1
+            child_leaf_value(
+                sums.right_grad,
+                sums.right_hess,
+                lambda_reg,
+                lambda_l1,
+                sums.right_count,
+                parent_output,
+                max_delta_step,
+                path_smooth,
             )
         )
         if sign != MONOTONE_FREE and left_value > right_value:
@@ -579,6 +640,8 @@ def decide_level(
     min_data_in_leaf: Int,
     n_leaves_before: Int,
     budget_mode: Int = BUDGET_RANK,
+    max_delta_step: Float64 = 0.0,
+    path_smooth: Float64 = 0.0,
 ) raises -> LevelCommit:
     """`level_candidates`, then `admit_level`, then `plan_level`.
 
@@ -606,6 +669,8 @@ def decide_level(
         max_depth,
         n_leaves_before,
         count_eligible(candidates),
+        max_delta_step,
+        path_smooth,
     )
 
 

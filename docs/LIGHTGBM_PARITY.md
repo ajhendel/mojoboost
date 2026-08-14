@@ -675,10 +675,11 @@ runs in CI on every push and pull request.
   `fit(eval_metric=)`, `fit(eval_sample_weight=)`, `cv`/`CVBooster`,
   `dump_model`/`trees_to_dataframe`/`get_split_value_histogram`, `n_iter_`,
   GPU multiclass, and the C API. Downgraded: the macOS arm64 wheel, on the
-  evidence of `docs/PLATFORM_MATRIX.md` and the absence of a CI job. Added
-  rows for the command line tool, sparse-on-GPU, the persistent GPU
-  session, and the Apple tiling policy. Recorded six modules that are
-  implemented and unintegrated, and two docstrings that contradict their
-  own code.
+  evidence of `docs/PLATFORM_MATRIX.md` and the absence of a per-change
+  wheel job, and GPU prediction, which was already documented as Mojo only.
+  Added rows for the command line tool, the Linux wheel, sparse-on-GPU, the
+  persistent GPU session, and the Apple tiling policy. Recorded six modules
+  that are implemented and unintegrated, and two docstrings that contradict
+  their own code.
 - **v1 (2026-08-14)**: first audit, against LightGBM 4.7.0 and mojoboost at
   `6190f88`.

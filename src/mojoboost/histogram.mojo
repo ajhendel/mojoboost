@@ -61,17 +61,12 @@ over rows in ascending order inside a single task.
 from std.sys.info import simd_width_of
 
 from .apple_cpu_policy import (
-    AccumulationPlan,
     cpu_profile,
     derive_accumulation_plan,
     subtract_ops,
 )
 from .binning import BinnedMatrix
-from .parallel import (
-    PARALLEL_MIN_OPS,
-    dispatch_feature_ranges,
-    dispatch_rows,
-)
+from .parallel import dispatch_feature_ranges, dispatch_rows
 
 comptime SIMD_LANES = 4 * simd_width_of[DType.float64]()
 
@@ -553,14 +548,11 @@ def _accumulate_subset(
             if compact:
                 for i_row in range(n_sub):
                     var r = rows_p.unsafe_load(i_row)
+                    var g = pairs_p.unsafe_load(2 * i_row)
+                    var h = pairs_p.unsafe_load(2 * i_row + 1)
                     var b = base + Int(col.unsafe_load(r))
-                    gp.unsafe_store(
-                        b, gp.unsafe_load(b) + pairs_p.unsafe_load(2 * i_row)
-                    )
-                    hp.unsafe_store(
-                        b,
-                        hp.unsafe_load(b) + pairs_p.unsafe_load(2 * i_row + 1),
-                    )
+                    gp.unsafe_store(b, gp.unsafe_load(b) + g)
+                    hp.unsafe_store(b, hp.unsafe_load(b) + h)
                     cp.unsafe_store(b, cp.unsafe_load(b) + 1)
             else:
                 # Small node, or one active feature: the gather would cost a
@@ -568,9 +560,11 @@ def _accumulate_subset(
                 # row ids as they always were.
                 for i_row in range(n_sub):
                     var r = rows_p.unsafe_load(i_row)
+                    var g = grad_p.unsafe_load(r)
+                    var h = hess_p.unsafe_load(r)
                     var b = base + Int(col.unsafe_load(r))
-                    gp.unsafe_store(b, gp.unsafe_load(b) + grad_p.unsafe_load(r))
-                    hp.unsafe_store(b, hp.unsafe_load(b) + hess_p.unsafe_load(r))
+                    gp.unsafe_store(b, gp.unsafe_load(b) + g)
+                    hp.unsafe_store(b, hp.unsafe_load(b) + h)
                     cp.unsafe_store(b, cp.unsafe_load(b) + 1)
             i += 1
 

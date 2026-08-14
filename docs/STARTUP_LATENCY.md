@@ -118,21 +118,35 @@ observed.
 startup.py_import        1 <ns> <ns> supplied 1
 startup.ext_load         1 <ns> <ns> supplied 1
 startup.runtime_load     1 <ns> <ns> supplied 1
-startup.device_discovery 1 <ns> <ns> native   1
-startup.context_create   1 <ns> <ns> native   1
-startup.kernel_create    5 <ns> <ns> native   1
-startup.first_alloc      7 <ns> <ns> native   1
-startup.first_transfer   1 <ns> <ns> native   1
-startup.first_fit        1 <ns> <ns> native   1
-startup.warm_fit         0 0    0    native   0
+startup.device_discovery 1  <ns> <ns> native   1
+startup.context_create   1  <ns> <ns> native   1
+startup.kernel_create    <n> <ns> <ns> native   1
+startup.first_alloc      17 <ns> <ns> native   1
+startup.first_transfer   1  <ns> <ns> native   1
+startup.first_fit        1  <ns> <ns> native   1
+startup.warm_fit         0  0    0    native   0
 startup.cold_ns <ns>
 startup.warm_ns 0
 ```
 
-`kernel_create` at 5 and `first_alloc` at 7 are the counts the current GPU
-path would produce, from `N_KERNELS` and the seven device buffers
-`GpuHistogramBuilder` allocates. They are structural, not measured, and a
-run that produces different counts has found a real discrepancy.
+`first_alloc` at 17 is structural rather than measured, and it is worth
+deriving rather than taking on faith. A cold `GpuHistogramBuilder`
+allocates 6 device buffers and 3 pinned host buffers itself, and the
+`GpuActiveRows` it constructs allocates 5 more device buffers and 3 more
+pinned host buffers: 11 device, 6 pinned, 17 total. Anything else is a real
+discrepancy worth chasing.
+
+**Note for whoever reads `gpu_runtime.mojo` next:** its module docstring
+says the builder "allocates seven device buffers and three pinned host
+buffers". That was true before the active-row compaction landed and is
+stale now. Counted from the constructors, not from the docstring.
+
+`kernel_create` is left as `<n>` on purpose. `N_KERNELS` is 5, but that is
+the size of `KernelRegistry`'s inventory, not the number of distinct
+kernels the GPU path launches, which is at least the 24 launch sites across
+`gpu_active_rows`, `gpu_objectives_native`, `gpu_predict`, and
+`gpu_split_search`. The inventory has to be extended before this count
+means anything; see the handoff.
 
 ### Warm run, expected shape
 
@@ -351,19 +365,27 @@ in a struct field is fine once the fields are declared.
 
 ## Wheel versus source install
 
-The two install kinds have different first-import costs and different
-failure modes, and `tools/inspect_startup_artifacts.py` tells them apart
-without loading anything: a `.dylibs` directory next to the extension means
-the wheel layout.
+The install kinds have different first-import costs and different failure
+modes, and `tools/inspect_startup_artifacts.py` tells them apart without
+loading anything: a staged runtime directory next to the extension means a
+wheel, and which directory it is names the builder.
 
-| | Source build | Wheel |
-|---|---|---|
-| Produced by | `bindings/build.sh` | `packaging/build_wheel.sh` |
-| Extension | `python/mojoboost/_mojoboost.so` | same, inside the wheel |
-| MAX runtime | four dylibs in the pixi environment | four dylibs in `mojoboost/.dylibs` |
-| Search path | absolute rpath to `$CONDA_PREFIX/lib` | `@loader_path/.dylibs` |
-| Signature | as linked | re-signed ad hoc after `install_name_tool` |
-| Breaks when | the pixi environment moves or is removed | a bundled dylib is stripped by a repacker |
+| | Source build | Wheel, `dylibs` | Wheel, `libs` |
+|---|---|---|---|
+| Produced by | `bindings/build.sh` | `packaging/build_wheel.sh` | `packaging/linux/build_wheel_linux.sh` |
+| Platform | any | macOS arm64 | Linux |
+| MAX runtime | in the pixi environment | four dylibs in `mojoboost/.dylibs` | the ELF closure in `mojoboost/.libs`, staged by soname |
+| Search path | absolute rpath to `$CONDA_PREFIX/lib` | `@loader_path/.dylibs` | `$ORIGIN/.libs` |
+| Signature | as linked | re-signed ad hoc after `install_name_tool` | not applicable |
+| Breaks when | the pixi environment moves or is removed | a bundled dylib is stripped by a repacker | a closure member is missed at staging time |
+
+The two wheel layouts are not interchangeable and must not be checked
+against each other. The macOS bundle is a known set of four, so a missing
+member is detectable by name. The Linux bundle is whatever the closure
+turned out to be, so there is no list to check it against, and
+`--strict` says so rather than inventing one. That is what
+`packaging/linux/check_metadata_ready.py` and a real loader
+(`packaging/linux/inspect_elf.sh`) are for.
 
 Consequences for the startup contract:
 
@@ -511,11 +533,10 @@ checked. They are the first thing to test.
 4. **`DeviceContext()` cost is unmeasured**, and may be dominated by driver
    context creation that no amount of session reuse avoids on the first
    one.
-5. **`kernel_create` = 5 and `first_alloc` = 7** are read off `N_KERNELS`
-   and the `GpuHistogramBuilder` constructor. Later lanes have added
-   kernels (`gpu_active_rows`, `gpu_split_search`, `gpu_predict`,
-   `gpu_objectives_native`) that `N_KERNELS` does not cover, so the real
-   counts are probably higher.
+5. **`first_alloc` = 17 is counted from constructors, not observed**, and
+   `kernel_create` has no expected value at all, because `N_KERNELS` = 5
+   is the registry's inventory rather than the number of kernels the path
+   launches. Extending that inventory is a prerequisite, not a follow-up.
 6. **The five-run minimum protocol is unvalidated.** Startup variance on
    this machine has never been characterized; five may be far too few.
 7. **No non-Apple device has ever run this code.** Every statement about

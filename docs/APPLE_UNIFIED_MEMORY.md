@@ -458,7 +458,7 @@ with no accelerator. It answers one question per buffer role, and it answers
 
 The route question is asked per role, because the roles differ in direction,
 lifetime, and who owns the host memory. `structural_support` encodes what is
-possible before any measurement is considered, and three of its answers are
+possible before any measurement is considered, and four of its answers are
 findings in their own right that no benchmark can overturn.
 
 | Role | Buffer | Direction | Shared route structurally possible? |
@@ -467,8 +467,9 @@ findings in their own right that no benchmark can overturn.
 | `grad`, `hess` | `grad_dev` / `hess_dev` via `stage_g` / `stage_h` | host to device | Yes, subject to evidence |
 | `hist_out` | `out_dev` | device to host | **No**: `BLOCK_DEVICE_WRITTEN_ATOMICS` until the driver answers |
 | `row_seed` | `GpuActiveRows.stage_rows` | host to device | Yes, subject to evidence |
-| `valid_bins` | `gpu_predict.mojo`'s `bins_dev` | host to device | **No** for `host_direct`, same as `bins` |
+| `valid_bins` | `gpu_predict.mojo`'s `valid_bins_dev` | host to device | **No** for `host_direct`, same as `bins` |
 | `predict_out` | `gpu_predict.mojo`'s `host_out` | device to host | Yes, subject to evidence |
+| `batch_bins` | `gpu_predict.mojo`'s `bins_dev` via `stage_bins` | host to device | Yes, and it is the only bins-shaped role where that is true |
 
 The `bins` answer is the one that bounds the whole experiment's value, so it is
 worth spelling out. `BinnedMatrix.bins` is a plain heap `List[UInt8]` built by
@@ -482,11 +483,21 @@ copy and one device buffer, and on a unified pool that is not an improvement.
 change to another module's data ownership, not a flag, and it is in the handoff
 as a required external edit rather than something this lane can do.
 
-The scoring path is worse and is worth measuring before it is optimized:
-`gpu_predict.mojo` stages the caller's bins through a pinned host buffer before
-uploading, so a scored matrix is resident three times over (caller list, pinned
-stage, device buffer). `unified_memory_policy.scoring_bins_duplication()`
-records that, and `training_bins_duplication()` records the training path's two.
+The `batch_bins` answer is the interesting exception. `GpuPredictor.upload_bins`
+already stages the batch into a pinned `stage_bins` that the predictor owns, so
+the pointer a shared route would need already exists, and a shared route there
+would drop both the device buffer and the copy. That staging copy is not an
+oversight to be deleted: `bins_dev` is sized to the high-water batch rather than
+to this batch, and `enqueue_copy` moves a whole buffer, so copying from the
+caller's exactly-sized list would read past its end. Removing it means a
+sub-range copy (no such API is verified here), an exact-size reallocation per
+batch, or the shared route.
+
+The three duplication shapes are recorded in the policy module so nobody has to
+re-derive them: `training_bins_duplication()` and `validation_bins_duplication()`
+are two copies each (caller list plus device buffer, no staging), and
+`batch_scoring_bins_duplication()` is three. A fit that also scores a held-out
+set holds the first two at once, which is what `MOJOBOOST_UM_HOLD_MIB` models.
 
 ### The evidence ladder
 

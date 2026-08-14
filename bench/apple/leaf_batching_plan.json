@@ -1,0 +1,171 @@
+{
+  "plan_version": "1.0.0",
+  "lane": "algorithm_22_leaf_batching",
+  "modules": [
+    "src/mojoboost/gpu_frontier.mojo",
+    "src/mojoboost/gpu_leaf_batching.mojo"
+  ],
+  "handoff": "handoffs/algorithm_22_leaf_batching.md",
+  "status": "planned",
+  "carries_measurements": false,
+  "note": "This file is a plan, not a record. It holds no timings and must never be read as one. Nothing in this lane was built, run, benchmarked, or profiled; the numbers below are shapes to measure and predictions to refute, and every one of them is currently unmeasured. Records produced by running this plan belong in files validated against bench/apple/schema.json, which is the only schema in this directory that describes results.",
+
+  "claims_under_test": [
+    {
+      "id": "c1_identical_histograms",
+      "kind": "correctness",
+      "claim": "A leaf's histogram is bit-identical whether it was built alone by GpuActiveRows.enqueue_range_histogram or as one item of a batch of K, for every K, both accumulation strategies, and every feature set.",
+      "why_decisive": "The whole lane rests on batching being a launch decision that no result can observe. If this fails, nothing else in the plan matters.",
+      "measurement": "Download both histograms as fixed-point Int32 words and compare word for word. Not tolerance based: both are exact integers.",
+      "refuted_if": "any word differs"
+    },
+    {
+      "id": "c2_occupancy_gain",
+      "kind": "performance",
+      "claim": "Batched construction is faster than one launch per leaf only on frontiers where every leaf, launched alone, creates fewer threadgroups than the device holds.",
+      "why_decisive": "This is the boundary the design predicts and the one place a crossover could be measured rather than invented. plan_batch reports which side of it a plan sits on as VERDICT_SINGLE_FILLS or VERDICT_OCCUPANCY_GAIN without claiming a speedup for either.",
+      "measurement": "Wall clock of the histogram phase for the same frontier, batched and serial, at each frontier profile below.",
+      "refuted_if": "serial is at least as fast on a frontier the planner called occupancy_gain, or batched is faster on one it called single_fills"
+    },
+    {
+      "id": "c3_packed_tile_axis",
+      "kind": "performance",
+      "claim": "Concatenating each item's tiles onto one axis beats giving every item the largest item's tile count, and by more the more unbalanced the frontier is.",
+      "why_decisive": "It is the reason this lane uses a two dimensional grid with a binary search rather than a leaf axis. The alternative is cheap to implement, so the comparison has to be made rather than argued.",
+      "measurement": "Same frontier under the packed plan and under a padded plan whose grid.y is max over items of n_tiles, with the idle threadgroups counted.",
+      "refuted_if": "the padded launch is not slower on the unbalanced profiles"
+    },
+    {
+      "id": "c4_device_subtraction",
+      "kind": "performance",
+      "claim": "Deriving a sibling with _subtract_slice_kernel is faster than downloading the parent, subtracting on the host, and having the sibling's histogram on the host.",
+      "why_decisive": "It removes a host synchronization per commit, which the split search lane already measured as the expensive part of a node. It only pays if the split search is also on the device; with a host search the parent has to come down anyway.",
+      "measurement": "Per commit: device subtract launch, against download_raw plus histogram_from_host plus subtract_histogram.",
+      "refuted_if": "the device subtract does not remove a synchronization, or costs more than the host path at small n_features * n_bins"
+    },
+    {
+      "id": "c5_partial_buffer_bound",
+      "kind": "performance",
+      "claim": "There is a batch width past which the tiled strategy's partial buffer forces either fewer tiles per item or a fall back to the atomic strategy, and past which widening the batch stops helping.",
+      "why_decisive": "It is the cost side of batching and the one the design cannot reason away. The partial buffer is total_tiles * n_slots * n_bins * 12 bytes and grows with the batch, where the output pool grows with the frontier.",
+      "measurement": "Sweep batch width at fixed partial capacity, recording the planner verdict, the resolved strategy, total_tiles, partial bytes, and wall clock.",
+      "refuted_if": "no width shows the verdict flipping to partial_bound, or the flip has no visible cost"
+    },
+    {
+      "id": "c6_feeder_reality",
+      "kind": "feasibility",
+      "claim": "Leaf-wise growth as shipped offers one leaf per commit, so batching is worth nothing until the grower changes.",
+      "why_decisive": "It is the negative result this lane must not hide. Measuring it first stops every later number from being an answer to a question nobody has.",
+      "measurement": "Count leaves per histogram launch, per tree, under each of the four feeders named in gpu_frontier.leaves_per_launch.",
+      "refuted_if": "the shipped host-search grower is observed offering more than one leaf per commit"
+    },
+    {
+      "id": "c7_speculation_is_free",
+      "kind": "correctness",
+      "claim": "A speculative batch changes no tree. The committed split sequence, the node ids, and the fitted model are identical to the serial best-first ones.",
+      "why_decisive": "Speculation is what makes batches wider than two possible under best-first growth, and it is only admissible if it is semantically invisible.",
+      "measurement": "Fit the same data with speculation depth 1, 2, 4, 8 and compare the serialized models byte for byte, plus SpeculationLedger hit rate and wasted-histogram counts.",
+      "refuted_if": "any two depths produce different models"
+    }
+  ],
+
+  "counters_to_add": {
+    "note": "None of these exist yet. They are what a benchmark driver has to expose before any row of this plan can be filled in, and they are all counts or nanoseconds that the modules can report without a profiler.",
+    "per_tree": [
+      "histogram_launches",
+      "leaves_per_launch_mean",
+      "leaves_per_launch_max",
+      "host_synchronizations",
+      "speculation_hits",
+      "speculation_misses",
+      "wasted_histograms",
+      "redundant_partitions",
+      "histogram_slot_evictions"
+    ],
+    "per_launch": [
+      "n_items",
+      "n_slots",
+      "total_tiles",
+      "blocks",
+      "idle_blocks",
+      "strategy",
+      "planner_verdict",
+      "partial_bytes",
+      "batch_kernel_ns",
+      "reduce_kernel_ns",
+      "zero_kernel_ns",
+      "stage_bytes"
+    ],
+    "per_commit": [
+      "subtract_kernel_ns",
+      "partition_kernel_ns",
+      "smaller_child_rows",
+      "larger_child_rows"
+    ]
+  },
+
+  "frontier_profiles": [
+    {
+      "id": "p1_balanced",
+      "description": "Every live leaf holds roughly the same number of rows, which is what a shallow tree on well conditioned data produces.",
+      "row_counts": "n_active / n_leaves, within a factor of 1.25",
+      "tests": ["c2_occupancy_gain", "c5_partial_buffer_bound"]
+    },
+    {
+      "id": "p2_one_huge_many_tiny",
+      "description": "One leaf holds most of the rows and the rest hold hundreds. The normal shape of leaf-wise growth on skewed data, and the shape the packed tile axis exists for.",
+      "row_counts": "one leaf at 0.8 * n_active, the rest split evenly",
+      "tests": ["c3_packed_tile_axis", "c2_occupancy_gain"]
+    },
+    {
+      "id": "p3_all_tiny",
+      "description": "Every live leaf is at or near min_data_in_leaf. The tail of a deep tree, where per launch overhead is the whole cost.",
+      "row_counts": "min_data_in_leaf to 4 * min_data_in_leaf",
+      "tests": ["c2_occupancy_gain", "c6_feeder_reality"]
+    },
+    {
+      "id": "p4_with_empty",
+      "description": "A frontier containing leaves with no rows at all, which max_depth and monotone rejection can produce.",
+      "row_counts": "p3 plus two leaves at zero rows",
+      "tests": ["c1_identical_histograms"]
+    }
+  ],
+
+  "shapes": {
+    "note": "The cross product is too large to run. The required minimum is every shape at the marked value of each axis, with the others held at their default, plus the full sweep on batch_width.",
+    "rows": { "values": [10000, 100000, 1000000, 10000000], "default": 1000000 },
+    "features": { "values": [10, 50, 200, 1000], "default": 50, "why": "n_slots is grid.x, so it decides how much of the device one leaf already fills; a 1000 feature dataset fills it with one tile and a 10 feature one cannot." },
+    "bins": { "values": [16, 32, 64, 256], "default": 256, "why": "max_bin 15, 31, 63 and 255 are the LightGBM parity values; bins set both the threadgroup memory and the partial cell count." },
+    "num_leaves": { "values": [31, 127, 255], "default": 31 },
+    "min_data_in_leaf": { "values": [1, 20, 100], "default": 20 },
+    "batch_width": { "values": [1, 2, 4, 8, 16, 32], "default": 8, "why": "1 is the shipped behavior and the control. 2 is what the device-search grower can offer without speculation. The rest need speculation or level-wise growth." },
+    "strategy": { "values": ["auto", "tiled", "atomic"], "default": "auto" },
+    "speculation_depth": { "values": [1, 2, 4, 8], "default": 1 },
+    "feeder": { "values": ["host_search", "device_search", "speculative", "levelwise"], "default": "host_search" },
+    "n_classes": { "values": [1, 3, 10], "default": 1, "why": "A multiclass round holds one gradient plane and one row permutation per class, so it is where the per item plane and the pool bound are exercised at all." }
+  },
+
+  "memory_to_record": {
+    "note": "Every one of these is computable from the plan before the run, so recording the measured value next to the predicted one is the check that the model is right.",
+    "output_pool_bytes": "pool_capacity * 3 * n_features * n_bins * 4",
+    "partial_bytes": "total_tiles * n_slots * n_bins * 12",
+    "item_table_bytes": "max_items * (8 + 2) * 4 + max_items * n_features * 4",
+    "device_total_bytes": "the above plus the binned matrix, the gradient planes, and the active-row buffers, which this lane does not own"
+  },
+
+  "protocol": {
+    "inherits": "docs/APPLE_GPU_BENCHMARK_PROTOCOL.md",
+    "requirements": [
+      "AC power, idle machine, warmup repetition discarded but kept in the record, thermal samples before and after, as the Apple protocol already requires.",
+      "MOJOBOOST_GPU_VERIFY_ROWS=1 for the correctness rows and unset for the timing rows, since the verification download adds a synchronization per split.",
+      "Every timing row must be accompanied by the planner verdict for the same plan. A time without the verdict cannot be attributed to occupancy, memory, or anything else.",
+      "A batched row and a serial row must be grown from the same seed on the same data, and their models compared, or the timing is comparing two different amounts of work."
+    ]
+  },
+
+  "not_measured_and_why": [
+    "Nothing in this plan has been run. The lane is static reasoning and isolated implementation only, and no Mojo, pixi, benchmark, or profiler was executed while writing it.",
+    "Per kernel occupancy and register pressure are absent because this project has no portable way to read them and will not report a vendor tool's number as if it were portable.",
+    "Energy is absent because it belongs to the thermal lane's sampler and would be a machine level number attributed to one kernel, which the Apple schema already refuses."
+  ]
+}

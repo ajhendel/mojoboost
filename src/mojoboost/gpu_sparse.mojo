@@ -127,7 +127,7 @@ What is deliberately not here
   tiles from contending on the same output bins; the sparse path's tiles are
   entry tiles, which are far fewer per feature, and the hottest bin by far
   (the default one) is never touched by the accumulation at all -- it is
-  filled once, by one thread, in a separate kernel. The partial-buffer
+  filled once, in a separate reducing kernel. The partial-buffer
   variant is a measurement away, not a design change; the handoff says what
   it would look like.
 - **No device split search.** `gpu_split_search.mojo` already scans a
@@ -172,7 +172,24 @@ comptime MAX_BINS = SPARSE_MAX_BINS
 # The scan buffers hold one Int32 per thread, so the block size the
 # segmented partition can be launched with is bounded by the allocation
 # rather than by the device maximum, exactly as in `gpu_active_rows.mojo`.
+# One Int32 per thread is 4 KB at this bound, which every backend holds.
 comptime SCAN_MAX_THREADS = 1024
+
+# The two reducing kernels (node totals, default-bin completion) keep *three*
+# Int32 planes per thread, so the same 1024 bound would ask for 12 KB of
+# shared memory per threadgroup. That is most of the 16 KB a conservatively
+# reported device offers (`gpu_tiling.FALLBACK_SHARED_MEMORY_PER_BLOCK`), and
+# it would throttle occupancy everywhere else for no gain: both kernels are
+# launched at the derived block size, which targets 256. Bounding the
+# allocation at 256 costs nothing and keeps the request at 3 KB.
+comptime REDUCE_MAX_THREADS = 256
+
+# Threadgroups per multiprocessor the node-total reduction is capped at.
+# Enough waves to saturate the device, few enough that the three output cells
+# do not become an atomic hot spot. `gpu_tiling.TARGET_BLOCKS_PER_SM` is the
+# same number for the histogram grid, which has `n_features * n_bins` output
+# cells to spread over and so is not bound by the same concern.
+comptime TOTALS_BLOCKS_PER_SM = 8
 
 # Side codes. 0 is left so the synthetic routing `bin <= 0` that drives the
 # row partition reads as "side == left" (see the module docstring).
@@ -247,15 +264,30 @@ def _sparse_totals_kernel(
     totals: MutPointer[Int32, MutAnyOrigin],
     begin: Int32,
     count: Int32,
+    n_blocks: Int32,
     g_scale: Float32,
     h_scale: Float32,
 ):
     """The node's fixed-point gradient, hessian, and row-count totals.
 
-    One element per thread over the node's compacted row range, summed within
-    the threadgroup by the same Hillis-Steele shared scan the partition uses
-    (a scan rather than a tree reduction so the block size need not be a
-    power of two), then one global atomic per plane per block.
+    Each thread walks the node's row range with a grid stride, accumulating
+    into registers; the threadgroup then reduces with the same Hillis-Steele
+    shared scan the partition uses (a scan rather than a tree reduction so
+    the block size need not be a power of two), and its last thread issues
+    one global atomic per plane.
+
+    The grid stride is why `n_blocks` is an argument. Three cells are the
+    entire output of this kernel, so every block contends on the same three
+    addresses; one element per thread would put `ceil(node_rows / 256)`
+    blocks on them, which is tens of thousands of atomics on three words for
+    a large node. The launcher instead caps the grid at a few waves and lets
+    each thread cover many rows, which is free: the per-thread accumulation
+    is exact integer addition, so covering rows in a different order cannot
+    change the result.
+
+    Must be launched with at most `REDUCE_MAX_THREADS` threads, which is what
+    the shared planes are sized for; `GpuSparseHistogramBuilder` clamps it,
+    and with exactly `n_blocks` blocks, or rows go unread.
 
     The quantization is `round(g * scale)`, the *same expression* the
     accumulation kernel applies to the same row, which is what makes the
@@ -267,29 +299,31 @@ def _sparse_totals_kernel(
     var n = Int(count)
 
     var sg = stack_allocation[
-        SCAN_MAX_THREADS,
+        REDUCE_MAX_THREADS,
         Scalar[DType.int32],
         address_space = AddressSpace.SHARED,
     ]()
     var sh = stack_allocation[
-        SCAN_MAX_THREADS,
+        REDUCE_MAX_THREADS,
         Scalar[DType.int32],
         address_space = AddressSpace.SHARED,
     ]()
     var sc = stack_allocation[
-        SCAN_MAX_THREADS,
+        REDUCE_MAX_THREADS,
         Scalar[DType.int32],
         address_space = AddressSpace.SHARED,
     ]()
 
+    var stride = nthreads * Int(n_blocks)
     var gq = Int32(0)
     var hq = Int32(0)
     var cq = Int32(0)
-    if j < n:
+    while j < n:
         var r = Int(rows[unsafe_offset = Int(begin) + j][0])
-        gq = Int32(round(grad[unsafe_offset=r][0] * g_scale))
-        hq = Int32(round(hess[unsafe_offset=r][0] * h_scale))
-        cq = Int32(1)
+        gq += Int32(round(grad[unsafe_offset=r][0] * g_scale))
+        hq += Int32(round(hess[unsafe_offset=r][0] * h_scale))
+        cq += Int32(1)
+        j += stride
     sg[unsafe_offset=tid] = gq
     sh[unsafe_offset=tid] = hq
     sc[unsafe_offset=tid] = cq
@@ -427,45 +461,104 @@ def _sparse_default_fill_kernel(
 ):
     """Give each active feature's default bin the node's implicit zeros.
 
-    One thread per active feature slot: sum that feature's whole bin row in
-    each plane, subtract it from the node total, and add the difference to
-    the default bin's cell. The read-modify-write is deliberate -- the
-    default bin may already hold stored entries that happened to bin there,
-    and those must not be counted twice.
+    One threadgroup per active feature slot, not one thread. The block sums
+    that feature's whole bin row in each plane, strided across its threads so
+    the reads coalesce along the row, reduces the three planes with the same
+    Hillis-Steele shared scan the totals kernel uses, and has its last thread
+    subtract the sums from the node totals and add the differences to the
+    default bin's cells.
+
+    The geometry matters more here than it looks. This kernel touches
+    `n_slots * 3 * n_bins` cells, and on the wide sparse data the whole path
+    exists for (tens of thousands of columns) a thread-per-feature version
+    issues every one of those loads from a single thread with a stride of
+    `n_bins`, which is entirely uncoalesced and can cost more than the
+    accumulation it completes.
+
+    The read-modify-write on the default bin is deliberate: it may already
+    hold stored entries that happened to bin there, and those must not be
+    counted twice.
 
     Only active slots are touched, so a feature the caller excluded keeps a
     zero slice and sibling subtraction stays exact, exactly as on the dense
-    and CPU sparse paths.
+    and CPU sparse paths. `set_features` rejects a duplicated feature id,
+    which would otherwise give one feature two slots and fold the leftover
+    into its default bin twice.
+
+    Must be launched with at most `REDUCE_MAX_THREADS` threads.
     """
-    var slot = global_idx.x
+    var slot = Int(block_idx.x)
+    # Block-uniform, so no thread reaches a barrier its neighbors skip.
     if slot >= Int(n_slots):
         return
     var f = Int(feat_ids[unsafe_offset=slot][0])
+    var tid = thread_idx.x
+    var nthreads = block_dim.x
     var nb = Int(n_bins)
     var hs = Int(hist_size)
     var base = f * nb
 
-    var sum_g = Int32(0)
-    var sum_h = Int32(0)
-    var sum_c = Int32(0)
-    for b in range(nb):
-        sum_g += out_hist[unsafe_offset = base + b][0]
-        sum_h += out_hist[unsafe_offset = hs + base + b][0]
-        sum_c += out_hist[unsafe_offset = 2 * hs + base + b][0]
+    var sg = stack_allocation[
+        REDUCE_MAX_THREADS,
+        Scalar[DType.int32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var sh = stack_allocation[
+        REDUCE_MAX_THREADS,
+        Scalar[DType.int32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var sc = stack_allocation[
+        REDUCE_MAX_THREADS,
+        Scalar[DType.int32],
+        address_space = AddressSpace.SHARED,
+    ]()
 
-    var db = base + Int(default_bin[unsafe_offset=f])
-    out_hist[unsafe_offset=db] = (
-        out_hist[unsafe_offset=db][0]
-        + (totals[unsafe_offset=TOT_GRAD][0] - sum_g)
-    )
-    out_hist[unsafe_offset = hs + db] = (
-        out_hist[unsafe_offset = hs + db][0]
-        + (totals[unsafe_offset=TOT_HESS][0] - sum_h)
-    )
-    out_hist[unsafe_offset = 2 * hs + db] = (
-        out_hist[unsafe_offset = 2 * hs + db][0]
-        + (totals[unsafe_offset=TOT_COUNT][0] - sum_c)
-    )
+    var acc_g = Int32(0)
+    var acc_h = Int32(0)
+    var acc_c = Int32(0)
+    var b = tid
+    while b < nb:
+        acc_g += out_hist[unsafe_offset = base + b][0]
+        acc_h += out_hist[unsafe_offset = hs + base + b][0]
+        acc_c += out_hist[unsafe_offset = 2 * hs + base + b][0]
+        b += nthreads
+    sg[unsafe_offset=tid] = acc_g
+    sh[unsafe_offset=tid] = acc_h
+    sc[unsafe_offset=tid] = acc_c
+    barrier()
+
+    var offset = 1
+    while offset < nthreads:
+        var cg = Int32(0)
+        var ch = Int32(0)
+        var cc = Int32(0)
+        if tid >= offset:
+            cg = sg[unsafe_offset = tid - offset][0]
+            ch = sh[unsafe_offset = tid - offset][0]
+            cc = sc[unsafe_offset = tid - offset][0]
+        barrier()
+        if tid >= offset:
+            sg[unsafe_offset=tid] = sg[unsafe_offset=tid][0] + cg
+            sh[unsafe_offset=tid] = sh[unsafe_offset=tid][0] + ch
+            sc[unsafe_offset=tid] = sc[unsafe_offset=tid][0] + cc
+        barrier()
+        offset += offset
+
+    if tid == nthreads - 1:
+        var db = base + Int(default_bin[unsafe_offset=f])
+        out_hist[unsafe_offset=db] = (
+            out_hist[unsafe_offset=db][0]
+            + (totals[unsafe_offset=TOT_GRAD][0] - sg[unsafe_offset=tid][0])
+        )
+        out_hist[unsafe_offset = hs + db] = (
+            out_hist[unsafe_offset = hs + db][0]
+            + (totals[unsafe_offset=TOT_HESS][0] - sh[unsafe_offset=tid][0])
+        )
+        out_hist[unsafe_offset = 2 * hs + db] = (
+            out_hist[unsafe_offset = 2 * hs + db][0]
+            + (totals[unsafe_offset=TOT_COUNT][0] - sc[unsafe_offset=tid][0])
+        )
 
 
 def _sparse_side_default_kernel(
@@ -811,6 +904,29 @@ def check_entry_row_consistency(
             seen[r] = f
 
 
+def _enqueue_zero_i32[
+    buf_origin: MutOrigin, //
+](
+    ctx: DeviceContext,
+    buf: MutPointer[Int32, buf_origin],
+    n: Int,
+    threads: Int,
+) raises:
+    """Zero an Int32 device range through a pointer.
+
+    A free function rather than a method so a caller can pass one of its own
+    fields without borrowing itself mutably at the same time.
+    """
+    if n <= 0:
+        return
+    ctx.enqueue_function[_zero_i32_kernel](
+        buf,
+        Int32(n),
+        grid_dim=(n + threads - 1) // threads,
+        block_dim=threads,
+    )
+
+
 # --- Device-resident sparse builder --------------------------------------
 
 
@@ -1038,7 +1154,12 @@ struct GpuSparseHistogramBuilder(Movable):
         # written by the split that creates it before anything reads it), but
         # the table is zeroed once so a wiring mistake reads an empty window
         # rather than another tree's.
-        self._enqueue_zero_i32(self.ranges_dev.unsafe_ptr(), range_cells)
+        _enqueue_zero_i32(
+            self.ctx,
+            self.ranges_dev.unsafe_ptr(),
+            range_cells,
+            self.block_threads,
+        )
 
         # Every feature is active until `set_features` narrows it.
         with self.feat_dev.map_to_host() as host:
@@ -1054,17 +1175,17 @@ struct GpuSparseHistogramBuilder(Movable):
         var b = (n + self.block_threads - 1) // self.block_threads
         return b if b > 0 else 1
 
-    def _enqueue_zero_i32[
-        buf_origin: MutOrigin, //
-    ](mut self, buf: MutPointer[Int32, buf_origin], n: Int) raises:
-        if n <= 0:
-            return
-        self.ctx.enqueue_function[_zero_i32_kernel](
-            buf,
-            Int32(n),
-            grid_dim=self._blocks(n),
-            block_dim=self.block_threads,
-        )
+    def _reduce_threads(self) -> Int:
+        """Block size for the two reducing kernels, clamped to what their
+        shared planes are sized for (`REDUCE_MAX_THREADS`)."""
+        var t = self.block_threads
+        return t if t < REDUCE_MAX_THREADS else REDUCE_MAX_THREADS
+
+    def device_layout(self) -> SparseDeviceLayout:
+        """This session's device buffer accounting: element counts, byte
+        counts, and the ratio against the dense bin matrix the dense builder
+        would have uploaded. See `gpu_sparse_layout.mojo`."""
+        return self.layout.copy()
 
     def strategy(self) -> Int:
         """The accumulation strategy. Only the atomic one is implemented on
@@ -1098,15 +1219,27 @@ struct GpuSparseHistogramBuilder(Movable):
         windows are maintained at every split, whether or not that feature is
         active, because a later node may activate it and a window that
         skipped a split would no longer be a sub-window of its parent's.
+
+        A feature id may not appear twice. Two slots naming one feature would
+        accumulate that feature's entries into its output slice twice *and*
+        fold the node's leftover into its default bin twice, giving a
+        histogram whose counts exceed the node's row count. The subsamplers
+        in `sampling.mojo` never produce a repeat, so this only fires on a
+        wiring mistake, which is exactly when it is worth catching.
         """
         if len(features) == 0:
             raise Error("active feature set must not be empty")
         if len(features) > self.n_features:
             raise Error("active feature set is larger than n_features")
+        var seen = List[Bool](capacity=self.n_features)
+        seen.resize(self.n_features, False)
         var changed = len(features) != len(self.active)
         for i in range(len(features)):
             if features[i] < 0 or features[i] >= self.n_features:
                 raise Error("feature index out of range")
+            if seen[features[i]]:
+                raise Error("duplicate feature index in the active set")
+            seen[features[i]] = True
             if not changed and self.active[i] != features[i]:
                 changed = True
         if not changed:
@@ -1225,7 +1358,8 @@ struct GpuSparseHistogramBuilder(Movable):
             block_dim=self.block_threads,
         )
         self._enqueue_entry_partition(0, 0, self.max_nodes - 1)
-        self.windows.compact_root(self._download_mids())
+        var mids = self._download_mids()
+        self.windows.compact_root(mids)
 
     # --- histograms -------------------------------------------------------
 
@@ -1234,15 +1368,37 @@ struct GpuSparseHistogramBuilder(Movable):
         transfer or synchronize."""
         if not self.has_gradients:
             raise Error("call upload_gradients before build_leaf")
-        if leaf < 0 or leaf >= self.max_nodes:
-            raise Error("node id out of range")
+        if leaf < 0 or leaf >= self.max_nodes - 1:
+            raise Error(
+                "node id out of range; the last id is reserved for a bagged"
+                " root's out-of-bag entries and owns no rows"
+            )
 
         var hist_size = self.n_features * self.n_bins
-        self._enqueue_zero_i32(self.out_dev.unsafe_ptr(), 3 * hist_size)
-        self._enqueue_zero_i32(self.totals_dev.unsafe_ptr(), 3)
+        _enqueue_zero_i32(
+            self.ctx,
+            self.out_dev.unsafe_ptr(),
+            3 * hist_size,
+            self.block_threads,
+        )
+        _enqueue_zero_i32(
+            self.ctx, self.totals_dev.unsafe_ptr(), 3, self.block_threads
+        )
 
+        var reduce_threads = self._reduce_threads()
         var window = self.rows.range_of(leaf)
         if window.count() > 0:
+            # Capped at a few waves rather than at one element per thread:
+            # the kernel's whole output is three cells, so the block count is
+            # the atomic contention on them. A grid stride covers the rest.
+            var total_blocks = (
+                window.count() + reduce_threads - 1
+            ) // reduce_threads
+            var cap = self.caps.sm_count * TOTALS_BLOCKS_PER_SM
+            if total_blocks > cap:
+                total_blocks = cap
+            if total_blocks < 1:
+                total_blocks = 1
             self.ctx.enqueue_function[_sparse_totals_kernel](
                 self.rows.rows_dev.unsafe_ptr(),
                 self.grad_dev.unsafe_ptr(),
@@ -1250,10 +1406,11 @@ struct GpuSparseHistogramBuilder(Movable):
                 self.totals_dev.unsafe_ptr(),
                 Int32(window.begin),
                 Int32(window.count()),
+                Int32(total_blocks),
                 Float32(self.g_scale),
                 Float32(self.h_scale),
-                grid_dim=self._blocks(window.count()),
-                block_dim=self.block_threads,
+                grid_dim=total_blocks,
+                block_dim=reduce_threads,
             )
 
         var n_slots = len(self.active)
@@ -1297,8 +1454,8 @@ struct GpuSparseHistogramBuilder(Movable):
             Int32(n_slots),
             Int32(self.n_bins),
             Int32(hist_size),
-            grid_dim=self._blocks(n_slots),
-            block_dim=self.block_threads,
+            grid_dim=n_slots,
+            block_dim=reduce_threads,
         )
 
     def download_raw(mut self) raises:
@@ -1490,7 +1647,8 @@ struct GpuSparseHistogramBuilder(Movable):
         if self.defer_ranges:
             self.windows.bound_split(parent, left, right)
         else:
-            self.windows.split(parent, left, right, self._download_mids())
+            var mids = self._download_mids()
+            self.windows.split(parent, left, right, mids)
 
 
 def _magnitude_sum(values: List[Float64]) raises -> Float64:

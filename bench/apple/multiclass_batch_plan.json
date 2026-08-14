@@ -1,0 +1,313 @@
+{
+  "plan_version": "1.0.0",
+  "title": "mojoboost multiclass tree-batching benchmark plan",
+  "description": "What to measure before the batched per-class primitives in src/mojoboost/gpu_multiclass_batch.mojo are wired into the GPU softmax trainer, and what each measurement decides. This file is a plan, not a result: every measured quantity below is null and carries the reason it is null. A run of this plan emits records against bench/apple/schema.json; nothing here is a claim about performance, and no number in it was measured.",
+  "subject": {
+    "modules": [
+      "src/mojoboost/gpu_multiclass_batch.mojo",
+      "src/mojoboost/gpu_output_planes.mojo"
+    ],
+    "baseline": "The sequential per-class loop in train_gpu._train_multiclass_gpu_rounds on its device-gradient path: per class one fill_softmax_gradients_device, one magnitude reduction with a host synchronization, one grow_tree_gpu, one update_raw_device.",
+    "unmodified": [
+      "src/mojoboost/train_gpu.mojo",
+      "src/mojoboost/boosting.mojo",
+      "src/mojoboost/gpu_objectives_native.mojo",
+      "src/mojoboost/histogram_gpu.mojo",
+      "src/mojoboost/gpu_active_rows.mojo"
+    ]
+  },
+  "knobs": {
+    "MOJOBOOST_GPU_CLASS_BATCH": "Force a class batch size; 0 or unset lets the memory budget decide. A forced size that does not fit raises rather than silently shrinking, so a record cannot report a geometry it did not run.",
+    "MOJOBOOST_GPU_CLASS_BATCH_BYTES": "Device-memory budget for one resident class batch. Default 536870912 (512 MiB).",
+    "MOJOBOOST_GPU_HIST_STRATEGY": "Unchanged. The batched histogram kernels accumulate atomically only, so this knob affects the baseline and the per-class tail, not the batched launches.",
+    "MOJOBOOST_NUM_WORKERS": "Set to 1 for every run in this plan: host-side parallelism is not the subject and it perturbs the queue drain being measured."
+  },
+  "quantities": {
+    "bin_passes_per_round": "How many times a round reads the binned matrix at the level under test. Sequential = n_classes. Batched with shared bin reads = ceil(n_classes / classes_per_block). This is the quantity the root-level batch exists to move, and it is derived, not measured.",
+    "host_synchronizations_per_round": "Queue drains a round costs. Sequential = n_classes (one magnitude readback each) plus one per node histogram download. Batched = 1 magnitude readback per batch.",
+    "histogram_launches_per_level": "Kernel launches one frontier level costs. Sequential = n_classes per node. Batched = one per class batch per node level.",
+    "round_wall_ms": "Median wall time of one boosting round, measured.",
+    "peak_device_bytes": "Peak device allocation attributable to the class batch, measured against the formula in gpu_output_planes.class_batch_bytes."
+  },
+  "invariants": {
+    "must_hold_exactly": [
+      "Every batched class histogram is cell-for-cell identical to the histogram the sequential path builds for that class at the same node, in fixed-point Int32, before dequantization.",
+      "Every class's fixed-point scale is bit-identical to the scale the sequential path derives for that class, because the batched magnitude reduction uses the same SUM_BLOCKS grid, the same SUM_THREADS block, the same grid stride, and the same Float64 host accumulation order.",
+      "The serialized ensemble is byte-identical: trees stay at round * n_classes + k, and each tree is grown under the feature subsample seeded by that same index.",
+      "Prediction shapes and layouts are unchanged: raw scores and probabilities stay row-major x[r * n_classes + k] on host and device.",
+      "Two runs of the same configuration produce identical model bytes."
+    ],
+    "must_hold_by_construction": [
+      "Every class gradient of a round derives from the round's single probability snapshot, never from a score matrix any of the round's own trees has advanced.",
+      "No refresh of the probability snapshot happens while any class tree of the previous round is uncommitted (MulticlassRoundGuard.open_round refuses it).",
+      "Class order out of the batch is ascending, regardless of the order slots complete."
+    ],
+    "checked_by": "Not by this plan. These are test-suite obligations; the benchmark refuses to report a timing for a configuration whose parity check did not pass, so a record carries the parity verdict as a precondition rather than as a result."
+  },
+  "cases": [
+    {
+      "id": "mc03_root_shared",
+      "why": "The smallest multiclass shape anyone actually trains, and the one where per-class launch overhead is the largest fraction of a round. Three classes fit one threadgroup, so the whole round's root histogram is a single bin pass.",
+      "n_classes": 3,
+      "n_rows": 100000,
+      "n_features": 50,
+      "n_bins": 256,
+      "class_distribution": "balanced",
+      "feature_subsampling": false,
+      "level": "round root",
+      "eligibility": { "shared_rows": true, "shared_features": true },
+      "plan": {
+        "batch_size": 3,
+        "n_batches": 1,
+        "classes_per_block": 3,
+        "shared_counts": true
+      },
+      "derived": {
+        "bin_passes_per_round_sequential": 3,
+        "bin_passes_per_round_batched": 1,
+        "host_synchronizations_per_round_sequential": 3,
+        "host_synchronizations_per_round_batched": 1,
+        "memory_bytes": {
+          "gradient_planes": 2400000,
+          "row_indices": 0,
+          "histogram_output": 358400,
+          "magnitude_partials": 6144,
+          "partial_histogram": 0,
+          "total": 2764544,
+          "note": "row_indices is 0 because a root batch borrows the one permutation the round already drew; partial_histogram is 0 because the batched kernels accumulate atomically."
+        }
+      },
+      "measurements": {
+        "round_wall_ms": null,
+        "peak_device_bytes": null,
+        "reason": "not measured; this file is a plan"
+      }
+    },
+    {
+      "id": "mc10_root_shared",
+      "why": "Ten classes at a million rows is where the gradient planes first cost real memory (80 MB) and where the batch stops fitting one threadgroup, so it is the first case that shows the classes_per_block ceiling rather than the class count.",
+      "n_classes": 10,
+      "n_rows": 1000000,
+      "n_features": 100,
+      "n_bins": 256,
+      "class_distribution": "balanced",
+      "feature_subsampling": false,
+      "level": "round root",
+      "eligibility": { "shared_rows": true, "shared_features": true },
+      "plan": {
+        "batch_size": 10,
+        "n_batches": 1,
+        "classes_per_block": 4,
+        "shared_counts": true
+      },
+      "derived": {
+        "bin_passes_per_round_sequential": 10,
+        "bin_passes_per_round_batched": 3,
+        "host_synchronizations_per_round_sequential": 10,
+        "host_synchronizations_per_round_batched": 1,
+        "memory_bytes": {
+          "gradient_planes": 80000000,
+          "row_indices": 0,
+          "histogram_output": 2150400,
+          "magnitude_partials": 20480,
+          "partial_histogram": 0,
+          "total": 82170880
+        }
+      },
+      "measurements": {
+        "round_wall_ms": null,
+        "peak_device_bytes": null,
+        "reason": "not measured; this file is a plan"
+      }
+    },
+    {
+      "id": "mc100_root_budget_bound",
+      "why": "A hundred classes is where the memory formula, not the device, decides the batch. At a million rows the gradient planes alone are 800 MB, over the 512 MiB default budget, so the planner splits the round into two batches. This case exists to confirm that the split is where the formula says it is and that a split batch still produces the sequential model.",
+      "n_classes": 100,
+      "n_rows": 1000000,
+      "n_features": 100,
+      "n_bins": 256,
+      "class_distribution": "balanced",
+      "feature_subsampling": false,
+      "level": "round root",
+      "eligibility": { "shared_rows": true, "shared_features": true },
+      "plan": {
+        "batch_size": 65,
+        "n_batches": 2,
+        "batch_sizes": [65, 35],
+        "classes_per_block": 4,
+        "shared_counts": true,
+        "budget_bytes": 536870912
+      },
+      "derived": {
+        "bin_passes_per_round_sequential": 100,
+        "bin_passes_per_round_batched": 25,
+        "host_synchronizations_per_round_sequential": 100,
+        "host_synchronizations_per_round_batched": 2,
+        "memory_bytes": {
+          "gradient_planes": 520000000,
+          "row_indices": 0,
+          "histogram_output": 13414400,
+          "magnitude_partials": 133120,
+          "partial_histogram": 0,
+          "total": 533547520,
+          "note": "The largest batch, K = 65: 8206848 * K + 102400 bytes, the largest K under the 536870912 budget."
+        }
+      },
+      "measurements": {
+        "round_wall_ms": null,
+        "peak_device_bytes": null,
+        "reason": "not measured; this file is a plan"
+      },
+      "also_run": {
+        "variant": "budget raised to 1073741824 so the whole round is one batch",
+        "purpose": "Separate the cost of splitting a round from the cost of the class count. If one batch of 100 and two batches of 65 and 35 time the same, the split is free and the default budget can stay conservative."
+      }
+    },
+    {
+      "id": "mc10_root_subsampled",
+      "why": "Feature subsampling draws a different feature set per tree (seed round * n_classes + k), so the classes of a round no longer scan the same columns and no bin read can be shared. The batch falls back to launch sharing alone. This case measures what launch sharing is worth on its own, which is the honest lower bound for every real training run with colsample below 1.",
+      "n_classes": 10,
+      "n_rows": 1000000,
+      "n_features": 100,
+      "n_bins": 256,
+      "class_distribution": "balanced",
+      "feature_subsampling": true,
+      "colsample": 0.5,
+      "level": "round root",
+      "eligibility": { "shared_rows": true, "shared_features": false },
+      "plan": {
+        "batch_size": 10,
+        "n_batches": 1,
+        "classes_per_block": 1,
+        "shared_counts": false,
+        "kernel": "_batch_hist_ranges_kernel with rows_stride 0, because the classes still share one permutation"
+      },
+      "derived": {
+        "bin_passes_per_round_sequential": 10,
+        "bin_passes_per_round_batched": 10,
+        "host_synchronizations_per_round_sequential": 10,
+        "host_synchronizations_per_round_batched": 1,
+        "memory_bytes": {
+          "gradient_planes": 80000000,
+          "row_indices": 0,
+          "histogram_output": 3072000,
+          "magnitude_partials": 20480,
+          "partial_histogram": 0,
+          "total": 83092480
+        }
+      },
+      "measurements": {
+        "round_wall_ms": null,
+        "peak_device_bytes": null,
+        "reason": "not measured; this file is a plan"
+      }
+    },
+    {
+      "id": "mc10_depth_frontier",
+      "why": "Below the root the classes have diverged and each node holds a fraction of the rows, so a per-class launch is far too small to fill the device. This case measures the depth levels alone, at a fixed num_leaves, to find the depth at which batching stops paying and the per-class tail should just run sequentially.",
+      "n_classes": 10,
+      "n_rows": 1000000,
+      "n_features": 100,
+      "n_bins": 256,
+      "num_leaves": 63,
+      "class_distribution": "balanced",
+      "feature_subsampling": false,
+      "level": "levels 1 and below",
+      "eligibility": { "shared_rows": false, "shared_features": true },
+      "plan": {
+        "batch_size": 10,
+        "n_batches": 1,
+        "classes_per_block": 1,
+        "shared_counts": false,
+        "kernel": "_batch_hist_ranges_kernel with rows_stride n_rows"
+      },
+      "derived": {
+        "bin_passes_per_round_sequential": 10,
+        "bin_passes_per_round_batched": 10,
+        "histogram_launches_per_level_sequential": 10,
+        "histogram_launches_per_level_batched": 1,
+        "memory_bytes": {
+          "gradient_planes": 80000000,
+          "row_indices": 120000000,
+          "histogram_output": 3072000,
+          "magnitude_partials": 20480,
+          "partial_histogram": 0,
+          "total": 203092480,
+          "note": "row_indices is the term that appears only below the root: 12 bytes per row per class for a permutation, a scatter scratch, and the scan offsets, because diverged classes cannot share one active-row buffer."
+        }
+      },
+      "measurements": {
+        "round_wall_ms": null,
+        "level_wall_ms_by_depth": null,
+        "peak_device_bytes": null,
+        "reason": "not measured; this file is a plan"
+      }
+    },
+    {
+      "id": "mc10_imbalanced",
+      "why": "The case the batch is least likely to survive. Softmax grows one tree per class over every row whatever the class prior, so imbalance does not change any class's row count; what it changes is the gradient magnitudes, and with them the per-class fixed-point scale and how early a rare class's tree stops splitting. A batch whose slots finish at different depths runs ragged, and the ranged kernel's grid is sized by the largest window, so the idle tiles are the cost this case exists to size.",
+      "n_classes": 10,
+      "n_rows": 1000000,
+      "n_features": 100,
+      "n_bins": 256,
+      "class_distribution": "class 0 holds 97 percent of the rows; classes 1 through 9 hold roughly 0.33 percent each",
+      "feature_subsampling": false,
+      "level": "round root and all levels",
+      "eligibility": { "shared_rows": true, "shared_features": true },
+      "plan": {
+        "batch_size": 10,
+        "n_batches": 1,
+        "classes_per_block": 4,
+        "shared_counts": true
+      },
+      "derived": {
+        "bin_passes_per_round_sequential": 10,
+        "bin_passes_per_round_batched": 3,
+        "memory_bytes": {
+          "gradient_planes": 80000000,
+          "row_indices": 0,
+          "histogram_output": 2150400,
+          "magnitude_partials": 20480,
+          "partial_histogram": 0,
+          "total": 82170880
+        }
+      },
+      "measurements": {
+        "round_wall_ms": null,
+        "leaves_by_class": null,
+        "depth_by_class": null,
+        "grad_scale_by_class": null,
+        "idle_tile_fraction_by_level": null,
+        "reason": "not measured; this file is a plan"
+      },
+      "watch": [
+        "grad_scale_by_class spread. A rare class has a tiny summed gradient magnitude and therefore a large fixed-point scale. The scale is derived per class from that class's own magnitude sums, so it is the same number the sequential path derives, but this is the configuration where a saturation bug would show first, and the record should carry the per-class scales so the check is possible after the fact.",
+        "leaves_by_class spread. If rare classes stop splitting several levels before class 0, the ragged batch spends most of its deep levels launching grids for classes that have nothing left to do. A large spread is the evidence for dropping finished classes from the batch rather than for a wider batch."
+      ]
+    },
+    {
+      "id": "determinism_repeat",
+      "why": "Batching is only admissible if it changes nothing. This is not a timing case.",
+      "procedure": "Run mc10_root_shared and mc100_root_budget_bound twice each at a fixed seed and compare serialized model bytes, then compare each against the same configuration trained with MOJOBOOST_GPU_CLASS_BATCH=1, which forces the sequential geometry through the same code path.",
+      "expected": "Byte-identical in all three comparisons.",
+      "measurements": {
+        "identical": null,
+        "reason": "not measured; this file is a plan"
+      }
+    }
+  ],
+  "reporting": {
+    "record_schema": "bench/apple/schema.json",
+    "required_conditions": [
+      "Thermal state captured per bench/apple/thermal_capture.sh, because a hundred-class round is long enough to throttle and a throttled batched run against an unthrottled sequential one is not a comparison.",
+      "The parity verdict for the configuration, as a precondition. A timing without it is not reportable."
+    ],
+    "refuses_to_report": "A speedup for any configuration whose batched and sequential models are not byte-identical, and a speedup averaged across cases. The cases move different quantities (bin passes, synchronizations, launches) and averaging them would hide which one paid."
+  },
+  "open_questions": [
+    "Where the crossover is between the batched ranged kernel and the sequential per-class loop as a node's row count falls. mc10_depth_frontier is meant to answer it; there is no defensible default until it does, which is why nothing in the Mojo modules picks a depth.",
+    "Whether SHARED_CLASS_CAP of 4 is the right ceiling on Apple silicon, or whether a bin-capacity-parameterized kernel (the subject of gpu_histogram_specializations.mojo) would let 8 or 16 classes share a threadgroup at 64 bins and change the bin-pass arithmetic materially.",
+    "Whether dropping finished classes from a ragged batch is worth the bookkeeping, which mc10_imbalanced sizes but does not settle."
+  ]
+}

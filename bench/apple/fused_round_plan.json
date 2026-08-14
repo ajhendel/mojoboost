@@ -1,0 +1,325 @@
+{
+  "plan_version": "1.0.0",
+  "parent_protocol_version": "1.0.0",
+  "title": "mojoboost fused round-start measurement plan",
+  "description": "A plan, not a result. It records what would have to be measured, on what hardware, with what instrument, before any of the three round-start designs in src/mojoboost/gpu_fused_round.mojo may be called faster or slower than another. Every number under cost_model is an arithmetic prediction from the model in that module, computed by hand from its formulas and carrying no measurement whatsoever. A reader who wants a timing takes this file as the recipe and writes a record against bench/apple/schema.json; this file is never the record.",
+  "created_utc": "2026-08-14T00:00:00Z",
+  "is_plan": true,
+  "measurements": null,
+  "measurements_null_reason": "No benchmark, profiler, build, or training run was executed for this lane. The lane was static reasoning and isolated implementation only, and a plan that carried a number it did not measure would be indistinguishable from a result.",
+  "owner_files": [
+    "src/mojoboost/gpu_fused_round.mojo",
+    "src/mojoboost/gpu_gradient_stream.mojo",
+    "bench/apple/fused_round_plan.json",
+    "handoffs/algorithm_23_fused_round.md"
+  ],
+  "related": {
+    "protocol": "docs/APPLE_GPU_BENCHMARK_PROTOCOL.md",
+    "thermal_protocol": "docs/APPLE_THERMAL_ENERGY.md",
+    "record_schema": "bench/apple/schema.json",
+    "handoff": "handoffs/algorithm_23_fused_round.md",
+    "code_under_test": [
+      "src/mojoboost/gpu_objectives_native.mojo",
+      "src/mojoboost/histogram_gpu.mojo",
+      "src/mojoboost/gpu_active_rows.mojo",
+      "src/mojoboost/train_gpu.mojo"
+    ]
+  },
+
+  "designs": [
+    {
+      "id": "materialized",
+      "name": "Materialized gradient planes",
+      "verdict": "recommended",
+      "verdict_basis": "structural",
+      "statement": "One gradient kernel writes grad[n] and hess[n], one reduction takes their magnitudes, every histogram in the tree reads the two planes.",
+      "structural_argument": "Every node below the root gathers grad[r] and hess[r] at permuted row indices drawn from the active-row permutation. The planes therefore have to exist for the whole tree whatever the root does, so no design that removes them can be correct, and every alternative is competing only for the root.",
+      "evidence_required": [
+        "None to keep it. This is the shipped behavior and the burden is on a replacement."
+      ]
+    },
+    {
+      "id": "streamed",
+      "name": "Tiled gradient production consumed immediately by the root histogram",
+      "verdict": "rejected",
+      "verdict_basis": "structural, confirmed by the byte model",
+      "statement": "Produce the gradients one row tile at a time and hand each tile straight to the root histogram accumulation for those rows.",
+      "structural_argument": "The planes are still written, because the nodes below the root read them, so the design saves no bytes at all. On an in-order queue a tile's histogram launch cannot begin before that tile's gradient launch has retired, so it saves no time either. It costs one extra launch per tile.",
+      "would_be_reconsidered_if": "The backend exposed concurrent queues with explicit events, so a gradient tile and a histogram tile from different tiles could genuinely overlap, AND a profiler trace showed a gap between the gradient kernel and the first histogram kernel large enough to hide.",
+      "evidence_required": [
+        "Metal System Trace timeline showing the gradient kernel and the root histogram kernel as adjacent non-overlapping GPU intervals, with the idle gap between them measured.",
+        "The same trace under a two-queue prototype showing the gap closed, before the design is called viable."
+      ]
+    },
+    {
+      "id": "fused",
+      "name": "Kernel fusion, objective evaluated inside the histogram kernel",
+      "verdict": "rejected",
+      "verdict_basis": "circular dependency, independent of any measurement",
+      "statement": "The histogram kernel recomputes each row's gradient and hessian from the raw score, the label, and the weight instead of loading them from planes.",
+      "structural_argument": "The histogram accumulates in fixed point, and the fixed-point scale is a global reduction over the same gradients being accumulated. Every gradient in the dataset has to exist before the first bin of the first histogram can be quantized. A kernel that produced and consumed gradients in one launch would need its scale before it had computed the sum the scale comes from. A second hazard sits behind that one: with grid.x indexed by feature, each row is visited once per active feature, so any magnitude accumulation folded into the fused kernel would over-count every row by the active feature count.",
+      "supporting_argument": "Even at the model's most favorable framing, where the planes are never written and no later node needs them, fusion removes at most the gradient pass and multiplies per-row objective evaluations by the active feature count plus one. On a weighted objective it reads three Float32 per row per feature where the materialized design reads two, and it moves more bytes than it saves at every feature count above one.",
+      "would_be_reconsidered_if": "The histogram accumulated in floating point rather than fixed point, removing the global scale and with it the circular dependency. That is a much larger change than this lane, and it would give up bit-determinism across run orders, which is a shipped property.",
+      "evidence_required": [
+        "None can rescue it while the scale is global. The evidence listed under partial_fusion below is what a narrower variant would need."
+      ]
+    },
+    {
+      "id": "deferred_magnitude",
+      "name": "Split the magnitude reduction into enqueue and read",
+      "verdict": "implemented, unmeasured",
+      "verdict_basis": "removes a forced ordering, changes no value",
+      "statement": "MagnitudeReader enqueues the reduction and its readback without synchronizing, so the caller can enqueue every launch that does not depend on the scale before the host waits.",
+      "structural_argument": "GpuObjectiveState.magnitude_sums performs the kernel, the copy, and the synchronization in one call, which forces the round's device-to-host wait to happen before anything else in the round is enqueued. The reduction order, the block count, the shared-memory tree, and the host-side Float64 finish are unchanged, so the partials, the totals, the scales, and every histogram derived from them are bit-identical.",
+      "evidence_required": [
+        "A Metal System Trace of one round showing the GPU idle interval between the magnitude kernel and the first root histogram kernel, before and after the seeding launch is moved ahead of the wait. The win is bounded by that interval and is zero if it is already zero.",
+        "MOJOBOOST_GPU_TRACE=1 PHASE_SYNC totals per round, before and after, on the same machine in the same thermal state."
+      ]
+    },
+    {
+      "id": "device_row_selection",
+      "name": "Row-selection metadata on the device",
+      "verdict": "implemented, unmeasured",
+      "verdict_basis": "removes a whole-path fallback rather than a pass",
+      "statement": "GpuRowSelection holds the selected row ids and their compensation multipliers as device buffers and applies the multipliers with one kernel, so a sampled round no longer has to leave the device objective path.",
+      "structural_argument": "Today device_gradients in train_gpu.mojo refuses the device path for any sampled run, which costs the run a host-side objective evaluation per round, a 2 * n_rows Float32 upload per round, and a host tree walk over every row per tree to advance the raw scores. The sample itself was never the reason: it is two small arrays and a multiply.",
+      "evidence_required": [
+        "Wall-clock per round for a GOSS run on the host path against the same run on the device path, same seed, same rounds, on the machine and in the thermal state the protocol requires.",
+        "A parity check of the drawn sample: the row ids the CPU sampler draws against the ones drawn from the device ranking plane, reported as a count of differing rows per round, not as pass or fail. The device scores are Float32 and near-threshold rows can cross.",
+        "Model agreement on a held-out split between the two paths, to the Float32 tolerance the GPU trainer already documents."
+      ]
+    },
+    {
+      "id": "partial_fusion",
+      "name": "Interleaved gradient and hessian plane",
+      "verdict": "not implemented, worth measuring first",
+      "verdict_basis": "outside this lane's files",
+      "statement": "Store the two derivatives as one interleaved plane so a row's pair is one eight-byte load in the histogram gather instead of two four-byte loads from two distant arrays.",
+      "structural_argument": "The histogram reads the derivative planes once per active feature at permuted row indices, which is the largest single term in the round after the bins themselves. Interleaving halves the number of gather transactions without changing a single value. It needs an edit to the histogram kernels, which this lane does not own.",
+      "evidence_required": [
+        "A memory-bandwidth counter reading on the root histogram kernel, so the share of gradient-plane reads that actually reach memory rather than cache is known. The whole case rests on that share and the cost model refuses to assume it.",
+        "The same reading at two feature counts an order of magnitude apart, since the re-read factor is the feature count."
+      ]
+    }
+  ],
+
+  "cost_model": {
+    "source": "src/mojoboost/gpu_fused_round.mojo, materialized_round_traffic / streamed_round_traffic / fused_round_traffic",
+    "units": "bytes issued by kernels, reads plus writes, for one tree's round start plus its root histogram",
+    "assumptions": [
+      "No cache is modeled. The question fusion asks is whether re-reading the derivative planes once per feature costs anything, and a model that assumed those reads were served from cache would answer the question by assumption. Read the numbers as an upper bound and as a ratio between designs.",
+      "The fused design is modeled at its ceiling: it is credited with never writing the derivative planes, which no real tree can be, since every node below the root reads them.",
+      "The atomic strategy's global read-modify-write traffic is not modeled; its partial term is the one-tile output write.",
+      "Tile counts are the values derive_tiling in gpu_tiling.mojo resolves for a device reporting ten multiprocessors, restated here as an input rather than queried."
+    ],
+    "shapes": [
+      {
+        "id": "wide_unweighted",
+        "n_rows": 1000000,
+        "n_features": 50,
+        "n_bins": 256,
+        "n_tiles": 2,
+        "weighted": false,
+        "predicted": {
+          "materialized": {
+            "gradient_bytes": 16000000,
+            "magnitude_bytes": 8000000,
+            "seed_bytes": 4000000,
+            "root_hist_bytes": 650307200,
+            "total_bytes": 678307200,
+            "objective_rows": 1000000,
+            "launches": 5
+          },
+          "streamed": {
+            "total_bytes": 678307200,
+            "launches": 6,
+            "note": "Identical bytes by construction. The extra launch is the finding."
+          },
+          "fused": {
+            "gradient_bytes": 0,
+            "magnitude_bytes": 8000000,
+            "seed_bytes": 4000000,
+            "root_hist_bytes": 650307200,
+            "total_bytes": 662307200,
+            "objective_rows": 51000000,
+            "launches": 4
+          },
+          "fusion_delta_bytes": -16000000,
+          "fusion_delta_fraction_of_materialized": -0.0236,
+          "fusion_recompute_factor": 51,
+          "round_start_share_of_total": 0.0413
+        },
+        "measured": null,
+        "measured_null_reason": "Nothing was run in this lane."
+      },
+      {
+        "id": "wide_weighted",
+        "n_rows": 1000000,
+        "n_features": 50,
+        "n_bins": 256,
+        "n_tiles": 2,
+        "weighted": true,
+        "predicted": {
+          "materialized": {
+            "gradient_bytes": 20000000,
+            "magnitude_bytes": 8000000,
+            "seed_bytes": 4000000,
+            "root_hist_bytes": 650307200,
+            "total_bytes": 682307200,
+            "objective_rows": 1000000,
+            "launches": 5
+          },
+          "fused": {
+            "gradient_bytes": 0,
+            "magnitude_bytes": 12000000,
+            "seed_bytes": 4000000,
+            "root_hist_bytes": 850307200,
+            "total_bytes": 866307200,
+            "objective_rows": 51000000,
+            "launches": 4
+          },
+          "fusion_delta_bytes": 184000000,
+          "fusion_delta_fraction_of_materialized": 0.2697,
+          "fusion_recompute_factor": 51,
+          "note": "A sample weight flips the sign. The fused histogram reads three Float32 per row per feature where the materialized one reads two."
+        },
+        "measured": null,
+        "measured_null_reason": "Nothing was run in this lane."
+      },
+      {
+        "id": "narrow_unweighted",
+        "n_rows": 1000000,
+        "n_features": 10,
+        "n_bins": 256,
+        "n_tiles": 8,
+        "weighted": false,
+        "predicted": {
+          "materialized": {
+            "gradient_bytes": 16000000,
+            "magnitude_bytes": 8000000,
+            "seed_bytes": 4000000,
+            "root_hist_bytes": 130245760,
+            "total_bytes": 158245760,
+            "objective_rows": 1000000,
+            "launches": 5
+          },
+          "fused": {
+            "total_bytes": 142245760,
+            "objective_rows": 11000000,
+            "launches": 4
+          },
+          "fusion_delta_bytes": -16000000,
+          "fusion_delta_fraction_of_materialized": -0.1011,
+          "fusion_recompute_factor": 11,
+          "round_start_share_of_total": 0.1770,
+          "note": "The narrowest shape is the most favorable to fusion and it is still bounded by ten percent of the root, against eleven times the objective evaluations."
+        },
+        "measured": null,
+        "measured_null_reason": "Nothing was run in this lane."
+      },
+      {
+        "id": "very_wide_unweighted",
+        "n_rows": 100000,
+        "n_features": 200,
+        "n_bins": 256,
+        "n_tiles": 1,
+        "weighted": false,
+        "predicted": {
+          "materialized": {
+            "gradient_bytes": 1600000,
+            "magnitude_bytes": 800000,
+            "seed_bytes": 400000,
+            "root_hist_bytes": 260614400,
+            "total_bytes": 263414400,
+            "objective_rows": 100000,
+            "launches": 5
+          },
+          "fused": {
+            "total_bytes": 261814400,
+            "objective_rows": 20100000,
+            "launches": 4
+          },
+          "fusion_delta_bytes": -1600000,
+          "fusion_delta_fraction_of_materialized": -0.0061,
+          "fusion_recompute_factor": 201,
+          "round_start_share_of_total": 0.0106
+        },
+        "measured": null,
+        "measured_null_reason": "Nothing was run in this lane."
+      }
+    ],
+    "tree_amortization": {
+      "description": "The shapes above cover the root only. A tree builds the root and then, for every split, only the smaller child, so the rows scanned across a tree are roughly the root's plus one root-sized pass per level. The round start is paid once per tree, so its share falls by that factor.",
+      "worked_example": {
+        "shape": "wide_unweighted",
+        "num_leaves": 31,
+        "assumed_histogram_passes_per_tree": 6,
+        "round_start_share_of_tree": 0.0071
+      },
+      "measured": null,
+      "measured_null_reason": "The passes-per-tree factor is an assumption about tree shape, not a measurement. A real run would report the rows actually scanned from the leaf ranges."
+    }
+  },
+
+  "instrumentation": {
+    "phase_timers": {
+      "env": "MOJOBOOST_GPU_TRACE=1",
+      "source": "src/mojoboost/gpu_runtime.mojo",
+      "phases_of_interest": ["PHASE_KERNEL", "PHASE_SYNC", "PHASE_TRANSFER"],
+      "what_it_answers": "How much of a round is spent waiting rather than computing, which is the only quantity the deferred-magnitude split can move.",
+      "what_it_cannot_answer": "Bytes moved. It counts host-observed intervals, not memory traffic."
+    },
+    "gpu_counters": {
+      "instrument": "Xcode Instruments, Metal System Trace, plus a GPU capture for per-kernel counters",
+      "counters_of_interest": [
+        "per-kernel GPU duration for the gradient kernel, the magnitude kernel, and the root histogram kernel",
+        "idle intervals between consecutive kernels of one round",
+        "bytes read from device memory by the root histogram kernel, which is the one number the cost model refuses to assume"
+      ],
+      "why_it_is_required": "Every design comparison in this file that is not settled structurally reduces to what fraction of the derivative-plane re-reads reach memory. Nothing in the source can answer that."
+    },
+    "environment_switches": [
+      "MOJOBOOST_GPU_OBJECTIVE=host|device, to run the same configuration on both gradient sources",
+      "MOJOBOOST_GPU_HIST_STRATEGY=atomic|tiled, so a comparison is not silently made across two accumulation strategies",
+      "MOJOBOOST_GPU_BLOCK_THREADS and MOJOBOOST_GPU_ROW_TILE, pinned rather than derived, so two runs share a launch geometry"
+    ]
+  },
+
+  "procedure": [
+    "Follow docs/APPLE_GPU_BENCHMARK_PROTOCOL.md in full: idle gate, repetitions, cooldown, and the quality result that decides whether a run counts at all. This plan adds workloads to that protocol and replaces none of it.",
+    "Pin the launch geometry with the environment switches above before comparing any two configurations. A comparison across two derived tilings measures the policy, not the design.",
+    "For every shape, run the materialized path as the baseline first, in both gradient sources, so that a later device-path number has a same-session baseline rather than a remembered one.",
+    "Capture the GPU trace on one representative round per shape, not on the whole fit. The question is the shape of a round, and a whole-fit capture buries it.",
+    "Write the timings into a record against bench/apple/schema.json, with every quantity this plan predicted left as a prediction and every measured quantity carrying its own field. Never overwrite a prediction with a measurement in this file."
+  ],
+
+  "acceptance": [
+    {
+      "claim": "The deferred magnitude split is worth keeping.",
+      "decided_by": "The GPU idle interval between the magnitude readback and the first root histogram kernel, measured before the split.",
+      "threshold": "Keep only if that interval exceeds the cost of one seeding launch on the same machine. If it is already zero the split is neutral and should be kept only for the ordering freedom it gives, not for a speed claim."
+    },
+    {
+      "claim": "Row selection belongs on the device.",
+      "decided_by": "Per-round wall clock for a GOSS run, device path against host path, at equal rounds and equal seed.",
+      "threshold": "Keep if the device path is faster at any shape in this plan and no shape regresses, and only after the sample-difference count per round is reported. A speedup that comes with an unreported sample difference is not a result."
+    },
+    {
+      "claim": "The interleaved derivative plane is worth building.",
+      "decided_by": "Bytes read from device memory by the root histogram kernel, at two feature counts an order of magnitude apart.",
+      "threshold": "Build it only if the measured bytes scale with the feature count, which is the claim that the re-reads reach memory. If they do not scale, the gather is cache-served and the change buys nothing."
+    },
+    {
+      "claim": "Any fusion of the objective into the histogram.",
+      "decided_by": "Nothing.",
+      "threshold": "Refused on the circular dependency between the fixed-point scale and the gradients it quantizes, which no measurement can move. Reopening it requires changing how histograms accumulate, not a benchmark."
+    }
+  ],
+
+  "prohibitions": [
+    "No number in this file may be quoted as a measurement. Every one of them is arithmetic from a model whose assumptions are listed above.",
+    "No design may be called faster than another on the strength of this plan alone.",
+    "A run that fails the protocol's idle gate or quality result produces no number here, not a caveated one.",
+    "Absence of a measurement is stated, never zeroed and never estimated."
+  ]
+}

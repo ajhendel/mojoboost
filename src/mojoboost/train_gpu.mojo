@@ -77,6 +77,8 @@ from .bagging import BaggingParams, bagging_enabled, check_bagging, refresh_bag
 from .binning import BinnedMatrix
 from .boosting import (
     CUSTOM,
+    L1,
+    SQUARED_ERROR,
     Booster,
     BoosterParams,
     MulticlassBooster,
@@ -97,7 +99,13 @@ from .boosting import (
 )
 from .goss import GossParams, GossSelection, apply_goss_scaling, goss_round
 from .gpu_objectives_native import supports_device_objective
-from .gpu_predict import GpuPredictor, flatten_trees
+from .gpu_predict import (
+    METRIC_L1,
+    METRIC_L2,
+    RESPONSE_IDENTITY,
+    GpuPredictor,
+    flatten_trees,
+)
 from .gpu_runtime import GpuSession, NoLifecycle, RoundLifecycle
 from .gpu_split_search import (
     GpuSplitParams,
@@ -1583,6 +1591,38 @@ struct _HostValidScorer(GpuValidScorer, Movable):
         return _mean_loss(self.raw, target, objective, alpha)
 
 
+def device_loss_metric(objective: Int) -> Int:
+    """The METRIC_* code whose device definition is `_mean_loss`'s for
+    `objective`, term for term, or -1 when the device has no equal and the
+    loss has to be computed on the host from the downloaded raw scores.
+
+    Two objectives qualify today, and the agreement is exact rather than
+    approximate. `_mean_loss`'s squared-error branch sums `(raw - y)^2` and
+    divides by the row count; `METRIC_L2` under `RESPONSE_IDENTITY` sums
+    `w * d * d` and divides by `check_metric_weight([], n)`, which is `n`.
+    `_mean_loss`'s L1 branch and `METRIC_L1` line up the same way. The
+    remaining difference is the one this whole path already carries: the
+    device sums Float32 terms over Float32 labels, so the value agrees to
+    Float32 tolerance, not bit for bit.
+
+    Binary logistic is deliberately **not** here even though
+    `METRIC_BINARY_LOG_LOSS` exists and looks like a match. The two clamp
+    probabilities at different floors, `_clamp_prob` at 1e-15 and `_clamp32`
+    at 1e-7, because Float32 cannot hold `1 - 1e-15` apart from 1. On a
+    confidently wrong row the host reports `-log(1e-15)` and the device
+    saturates at `-log(1e-7)`, and confidently wrong rows are exactly the
+    ones a log-loss stopping decision turns on. Scoring it on the host from
+    `validation_raw()` keeps the run's loss definition intact. Anyone adding
+    a code here should be able to write the host expression and the kernel
+    expression side by side and see them agree, including the clamps.
+    """
+    if objective == SQUARED_ERROR:
+        return METRIC_L2
+    if objective == L1:
+        return METRIC_L1
+    return -1
+
+
 def _open_valid_predictor(
     ctx: DeviceContext,
     caps: DeviceCaps,
@@ -1669,6 +1709,17 @@ struct _DeviceValidScorer(GpuValidScorer, Movable):
         comptime if not has_accelerator():
             raise Error("GPU validation scoring requires an accelerator")
         else:
+            # Reduce on the device when the device's definition of this
+            # objective's loss is `_mean_loss`'s, which turns a per-round
+            # n_valid download into an n_blocks one. Otherwise the raw
+            # scores come home and the host owns the loss, which is what
+            # keeps the eight objectives the device has no kernel for on
+            # exactly the definition the CPU trainer stops on.
+            var metric = device_loss_metric(objective)
+            if metric >= 0:
+                return self.predictor.validation_metric(
+                    metric, RESPONSE_IDENTITY
+                )
             var raw = self.predictor.validation_raw()
             return _mean_loss(raw, target, objective, alpha)
 

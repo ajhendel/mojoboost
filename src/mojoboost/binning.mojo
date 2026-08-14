@@ -43,12 +43,33 @@ computation (column copy + sort) and bin assignment is independent and
 writes only its own output range, so workers need no synchronization and
 the result is bit-identical to the serial path. Inputs too small to
 amortize task-scheduling overhead stay serial.
+
+Work estimates. The threshold that decides serial from parallel is stated in
+histogram-op equivalents (see `parallel.plan_tasks`), and a row of binning is
+not one of those. Fitting sorts each column, so its estimate carries the
+comparison count; transforming binary-searches each value, so its estimate
+carries the search depth. Counting one op per (feature, row) here would have
+kept a stage that is 8 to 20 times dearer per row than a histogram
+accumulate on the serial path well past the point where it pays for a
+dispatch. None of this moves an edge or a bin: it decides only how the same
+work is spread.
 """
 
 from std.math import isnan
 
 from .categorical import CategoricalSpec, fit_categorical_spec
-from .parallel import dispatch_features
+from .parallel import dispatch_feature_ranges, dispatch_features
+
+
+def _log2_ceil(n: Int) -> Int:
+    """Smallest k with `2 ** k >= n`, and 0 for n <= 1. Used only to weight
+    work estimates, so an off-by-one costs a scheduling decision at worst."""
+    var k = 0
+    var v = 1
+    while v < n:
+        v += v
+        k += 1
+    return k
 
 # LightGBM's Common::kMaxDouble: bin edges are clamped here so an infinite
 # training value cannot produce an infinite (or non-increasing) edge.
@@ -313,7 +334,14 @@ struct BinMapper(Copyable, Movable):
                         left = mid + 1
                 bins_p.unsafe_store(col + r, UInt8(left - lo))
 
-        dispatch_features(do_feature, n_features, n_features * n_rows)
+        # A row costs one binary search over at most `n_bins` edges, not one
+        # accumulate: about `log2(n_bins)` dependent compares, each on a hot
+        # but data-dependent load.
+        dispatch_features(
+            do_feature,
+            n_features,
+            n_features * n_rows * (1 + _log2_ceil(self.n_bins)),
+        )
         return BinnedMatrix(
             bins^,
             n_rows,
@@ -381,46 +409,58 @@ def fit_bins(
     var feat_p = features.unsafe_ptr()
     ref spec = cats
 
-    def do_feature(f: Int) {imm}:
-        # Categorical columns never enter quantile binning.
-        if spec.is_cat(f):
-            counts_p.unsafe_store(f, 0)
-            return
-        # NaN is dropped before the sort, so it never takes part in a
-        # quantile comparison, and a column that has any gives up one bin to
-        # hold its missing values.
+    def do_range(f_start: Int, f_end: Int) {imm}:
+        # One sort buffer per task rather than one per feature: the buffer is
+        # emptied and refilled between features, keeping the capacity it
+        # already grew, so a 500-feature fit does one allocation per worker
+        # instead of 500. Every feature still sees exactly the column it saw
+        # before, in the same order, so the edges are unchanged.
         var col = List[Float64](capacity=n_rows)
-        for r in range(n_rows):
-            var v = feat_p.unsafe_load(f * n_rows + r)
-            if not isnan(v):
-                col.append(v)
-        var n_valid = len(col)
-        var reserve = use_missing and n_valid < n_rows
-        var n_ordinary = max_bins - 1 if reserve else max_bins
-        sort(col)
-        var out = scratch_p.unsafe_offset(f * max_edges)
-        var n_out = 0
-        for b in range(1, n_ordinary):
-            var idx = b * n_valid // n_ordinary
-            if idx <= 0 or idx >= n_valid:
+        for f in range(f_start, f_end):
+            # Categorical columns never enter quantile binning.
+            if spec.is_cat(f):
+                counts_p.unsafe_store(f, 0)
                 continue
-            var below = col[idx - 1]
-            var above = col[idx]
-            if above <= below:
-                continue
-            var edge = _avoid_inf((below + above) / 2.0)
-            # Repeated quantile indices (n_valid < n_ordinary) revisit the
-            # same boundary, and clamping an infinite midpoint can repeat the
-            # previous edge; keep edges strictly increasing either way.
-            if n_out > 0 and edge <= out.unsafe_load(n_out - 1):
-                continue
-            out.unsafe_store(n_out, edge)
-            n_out += 1
-        counts_p.unsafe_store(f, n_out)
-        # k edges give ordinary bins 0..k, so the missing bin is k + 1.
-        missing_p.unsafe_store(f, n_out + 1 if reserve else -1)
+            # NaN is dropped before the sort, so it never takes part in a
+            # quantile comparison, and a column that has any gives up one bin
+            # to hold its missing values.
+            col.clear()
+            var base = f * n_rows
+            for r in range(n_rows):
+                var v = feat_p.unsafe_load(base + r)
+                if not isnan(v):
+                    col.append(v)
+            var n_valid = len(col)
+            var reserve = use_missing and n_valid < n_rows
+            var n_ordinary = max_bins - 1 if reserve else max_bins
+            sort(col)
+            var out = scratch_p.unsafe_offset(f * max_edges)
+            var n_out = 0
+            for b in range(1, n_ordinary):
+                var idx = b * n_valid // n_ordinary
+                if idx <= 0 or idx >= n_valid:
+                    continue
+                var below = col[idx - 1]
+                var above = col[idx]
+                if above <= below:
+                    continue
+                var edge = _avoid_inf((below + above) / 2.0)
+                # Repeated quantile indices (n_valid < n_ordinary) revisit the
+                # same boundary, and clamping an infinite midpoint can repeat
+                # the previous edge; keep edges strictly increasing either way.
+                if n_out > 0 and edge <= out.unsafe_load(n_out - 1):
+                    continue
+                out.unsafe_store(n_out, edge)
+                n_out += 1
+            counts_p.unsafe_store(f, n_out)
+            # k edges give ordinary bins 0..k, so the missing bin is k + 1.
+            missing_p.unsafe_store(f, n_out + 1 if reserve else -1)
 
-    dispatch_features(do_feature, n_features, n_features * n_rows)
+    # A feature costs a copy of its column plus a sort of it, so the estimate
+    # carries the comparison count rather than the row count alone.
+    dispatch_feature_ranges(
+        do_range, n_features, n_features * n_rows * (1 + _log2_ceil(n_rows))
+    )
 
     var edges = List[Float64]()
     var offsets = List[Int](capacity=n_features + 1)
@@ -445,14 +485,30 @@ def bin_equal_width(
         raise Error("n_bins must be in [2, 256]")
     if len(features) != n_rows * n_features:
         raise Error("features length must equal n_rows * n_features")
+    # The range pass reads row 0 before it loops, so a column with no rows has
+    # to be rejected here rather than read: this path now writes through a raw
+    # pointer, where an out-of-range read is silent rather than caught.
+    # `fit_bins` rejects the same shape. A matrix with no features at all is
+    # still fine, because nothing reads it.
+    if n_features > 0 and n_rows < 1:
+        raise Error("n_rows must be positive")
 
+    # Sized up front and written by index rather than appended, which is what
+    # lets the features run in parallel: each one owns the
+    # `[f * n_rows, (f + 1) * n_rows)` slice of the output and nothing else.
+    # Its two passes (the range, then the assignment) stay in ascending row
+    # order, so every bin is what the serial loop produced.
     var bins = List[UInt8](capacity=n_rows * n_features)
-    for f in range(n_features):
+    bins.resize(n_rows * n_features, 0)
+    var bins_p = bins.unsafe_ptr()
+    var feat_p = features.unsafe_ptr()
+
+    def do_feature(f: Int) {imm}:
         var col = f * n_rows
-        var lo = features[col]
+        var lo = feat_p.unsafe_load(col)
         var hi = lo
         for r in range(1, n_rows):
-            var v = features[col + r]
+            var v = feat_p.unsafe_load(col + r)
             if v < lo:
                 lo = v
             if v > hi:
@@ -460,7 +516,7 @@ def bin_equal_width(
         var width = (hi - lo) / Float64(n_bins)
         for r in range(n_rows):
             var b: Int
-            var v = features[col + r]
+            var v = feat_p.unsafe_load(col + r)
             if width <= 0.0 or isnan(v):
                 b = 0
             else:
@@ -469,5 +525,8 @@ def bin_equal_width(
                     b = n_bins - 1
                 if b < 0:
                     b = 0
-            bins.append(UInt8(b))
+            bins_p.unsafe_store(col + r, UInt8(b))
+
+    # Two passes over each column, both of them a load and a compare or two.
+    dispatch_features(do_feature, n_features, 2 * n_features * n_rows)
     return BinnedMatrix(bins^, n_rows, n_features, n_bins)

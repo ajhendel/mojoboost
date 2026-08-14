@@ -37,17 +37,33 @@ this form was chosen over a 32-bit-word bit stream:
   is what bounds the decode to a fixed instruction count with no loop and no
   branch.
 
+The `w = 8` specialization
+--------------------------
+At width 8 every shift is zero, the mask is the identity, and the second
+window byte contributes nothing that the mask does not immediately discard.
+So width 8 is not merely a member of the family, it is a *provable*
+one-byte-load, no-ALU, no-slack path, and both `unpack_value` and
+`pack_value` take it explicitly:
+
+    value(i) = buf[i]        store(i, v) = buf[i] = v
+
+That branch is on a loop-invariant width, so it costs nothing in a host loop
+and disappears entirely in a kernel specialized on the width. It is what
+makes the uncompressed layout the *same code* as the packed one rather than
+a parallel implementation, and it is what lets a width-8 stream be byte for
+byte the existing `BinnedMatrix.bins` column with no padding and no
+reformatting at all.
+
 Padding
 -------
-Because the window always reads `buf[b + 1]`, a stream of `n` values needs
-one byte of slack past its last data byte:
+Below width 8 the window reads and writes `buf[b + 1]`, so a stream needs one
+byte of slack past its last data byte; at width 8 it needs none:
 
-    packed_bytes(n, w) = ceil(n * w / 8) + PACK_TAIL_PAD
+    packed_stream_bytes(n, w) = ceil(n * w / 8) + (0 if w == 8 else 1)
 
 The pad byte is never read for its contents, only for its address, so its
-value is unspecified; `pack_column` leaves it zero. Dropping the pad would
-make the last element of the last column of a matrix read one byte past the
-allocation.
+value is unspecified; `pack_column` leaves it zero. Dropping it below width 8
+would make the last element of a stream touch one byte past the allocation.
 
 Writing
 -------
@@ -59,21 +75,19 @@ consequence a caller has to respect:
     ordered. Adjacent elements of one stream overlap whenever w < 8, so a
     stream must be packed by a single writer.
 
-Different streams that start at different, non-overlapping byte ranges are
-independent, so packing is safe to parallelize *across* columns and never
-*within* one. `gpu_binned_layout.mojo` aligns every column to
-`COLUMN_ALIGN_BYTES` (16), which is more than the one byte of separation the
-straddle rule needs, so column-parallel packing there is sound.
+The subtle half of that rule is the *last* element. Below width 8 a stream's
+writable footprint runs one byte past its data, because the last element's
+read-modify-write covers its second window byte. Two such streams laid out
+back to back would share that byte, and packing them concurrently would lose
+updates even though neither stream's *data* overlaps the other's.
 
-The `w = 8` degenerate case
----------------------------
-At width 8 the formulas collapse to `byte_of(i) = i`, `shift_of(i) = 0`,
-`value(i) = buf[i]`, which is byte for byte the existing `UInt8` binned
-matrix. That is deliberate: the ordinary uncompressed layout is not a
-separate code path but the `w = 8` member of this family, so a caller that
-disables packing runs the same addressing arithmetic with a shift of zero
-and a mask of 255. `assert_byte_identity_invariant` checks it rather than
-asserting it in a comment.
+Two streams are therefore independent only when their footprints are
+disjoint, which is what `writable_footprint_end` reports and
+`streams_disjoint` tests, and why `gpu_binned_layout.BinLayoutPlan` pads
+every block rather than only the last one. Alignment alone does not supply
+it: a block whose data is a multiple of the alignment ends flush against the
+next. At width 8 the footprint is the data and no pad is needed, which is the
+case that has to stay free.
 
 What this module refuses to do
 ------------------------------
@@ -99,7 +113,8 @@ comptime BIN_WIDTH_MAX = 8
 comptime BIN_WIDTH_FALLBACK = 8
 
 # Slack byte past the end of a packed stream, so the two-byte decode window
-# of the last element stays inside the allocation.
+# of the last element stays inside the allocation. Applies below width 8
+# only; `tail_pad_for` is the width-aware form and the one to call.
 comptime PACK_TAIL_PAD = 1
 
 # Bits per byte, named so the formulas below read as formulas.
@@ -170,15 +185,60 @@ def packed_data_bytes(n_elems: Int, width: Int) raises -> Int:
     return (n_elems * width + BITS_PER_BYTE - 1) // BITS_PER_BYTE
 
 
-def packed_column_bytes(n_elems: Int, width: Int) raises -> Int:
-    """Bytes a stream of `n_elems` values at `width` must have allocated:
-    its data bytes plus `PACK_TAIL_PAD`.
+def tail_pad_for(width: Int) raises -> Int:
+    """Slack bytes a stream at `width` needs past its data.
 
-    At `width = 8` this is `n_elems + 1`, one byte more than the
-    uncompressed column, which is the price of keeping a single branch-free
-    decode for every width.
+    `PACK_TAIL_PAD` below width 8, where the decode window reads a second
+    byte, and zero at width 8, where the specialization proves it does not.
+    Zero here is what lets a width-8 stream be the existing `UInt8` column
+    with nothing appended.
     """
-    return packed_data_bytes(n_elems, width) + PACK_TAIL_PAD
+    check_bin_width(width)
+    if width == BIN_WIDTH_FALLBACK:
+        return 0
+    return PACK_TAIL_PAD
+
+
+def packed_stream_bytes(n_elems: Int, width: Int) raises -> Int:
+    """Bytes a stream of `n_elems` values at `width` must have allocated:
+    its data bytes plus `tail_pad_for(width)`.
+
+    At `width = 8` this is exactly `n_elems`, so an uncompressed stream is
+    the uncompressed column and not a byte more.
+    """
+    return packed_data_bytes(n_elems, width) + tail_pad_for(width)
+
+
+def writable_footprint_end(n_elems: Int, width: Int) raises -> Int:
+    """Last byte index, relative to a stream's base, that reading or packing
+    the stream may touch.
+
+    One past the data below width 8, because the final element's
+    read-modify-write covers its second window byte; the last data byte at
+    width 8, where there is no second byte. Two streams may be packed
+    concurrently only when their `[base, base + this]` intervals are
+    disjoint; `streams_disjoint` is that test.
+    """
+    if n_elems <= 0:
+        return -1
+    return packed_stream_bytes(n_elems, width) - 1
+
+
+def streams_disjoint(
+    base_a: Int,
+    n_a: Int,
+    width_a: Int,
+    base_b: Int,
+    n_b: Int,
+    width_b: Int,
+) raises -> Bool:
+    """Whether two streams can be packed by two writers without one losing
+    the other's update. Compares writable footprints, not data ranges."""
+    var end_a = base_a + writable_footprint_end(n_a, width_a)
+    var end_b = base_b + writable_footprint_end(n_b, width_b)
+    if base_a <= base_b:
+        return end_a < base_b
+    return end_b < base_a
 
 
 def packed_bits_ratio(width: Int) raises -> Float64:
@@ -247,7 +307,13 @@ def unpack_value(
     raising form. The arithmetic below is the exact expression a device
     kernel evaluates, with `Int` standing in for the kernel's `UInt32`; both
     are exact for the 16-bit window, so the two agree bit for bit.
+
+    The width-8 branch is the specialization the module docstring justifies:
+    one load, no shift, no mask, and no second byte, so an uncompressed
+    stream reads exactly as `bins[f * n_rows + r]` reads today.
     """
+    if width == BIN_WIDTH_FALLBACK:
+        return Int(buf[base + index])
     var byte = base + element_byte_offset(index, width)
     var window = Int(buf[byte]) | (Int(buf[byte + 1]) << BITS_PER_BYTE)
     return (window >> element_bit_shift(index, width)) & bin_width_mask(
@@ -258,14 +324,18 @@ def unpack_value(
 def unpack_value_checked(
     buf: List[UInt8], base: Int, index: Int, n_elems: Int, width: Int
 ) raises -> Int:
-    """`unpack_value` with the width, the element index, and the two window
-    bytes all checked against the buffer."""
+    """`unpack_value` with the width, the element index, and the stream's
+    whole footprint checked against the buffer.
+
+    Checking the footprint rather than this element's window is deliberate:
+    a buffer that can hold the last element can hold every earlier one, and
+    the footprint is the quantity a layout has to have reserved.
+    """
     check_bin_width(width)
     check_element_index(index, n_elems)
     if base < 0:
         raise Error("stream base must not be negative")
-    var byte = base + element_byte_offset(index, width)
-    if byte + 1 >= len(buf):
+    if base + writable_footprint_end(n_elems, width) >= len(buf):
         raise Error(
             "packed stream runs past the buffer: the tail pad is missing"
         )
@@ -284,7 +354,14 @@ def pack_value(
     `value` is masked to `width` bits rather than validated, so a caller that
     has not checked its bin ids against the width silently stores a truncated
     id. `pack_value_checked` is the form that refuses instead.
+
+    The width-8 branch stores the byte outright, so an uncompressed stream
+    never touches the byte past its data and two such streams laid out back
+    to back stay independent.
     """
+    if width == BIN_WIDTH_FALLBACK:
+        buf[base + index] = UInt8(value & 255)
+        return
     var byte = base + element_byte_offset(index, width)
     var shift = element_bit_shift(index, width)
     var mask = bin_width_mask(width)
@@ -319,8 +396,7 @@ def pack_value_checked(
         raise Error("stream base must not be negative")
     if value < 0 or value >= bins_representable(width):
         raise Error("bin id does not fit the width it is being packed at")
-    var byte = base + element_byte_offset(index, width)
-    if byte + 1 >= len(buf):
+    if base + writable_footprint_end(n_elems, width) >= len(buf):
         raise Error(
             "packed stream runs past the buffer: the tail pad is missing"
         )
@@ -351,7 +427,7 @@ def pack_column(
         raise Error("element count must not be negative")
     if src_offset < 0 or src_offset + n_elems > len(src):
         raise Error("source range is outside the bin matrix")
-    if base < 0 or base + packed_column_bytes(n_elems, width) > len(buf):
+    if base < 0 or base + packed_stream_bytes(n_elems, width) > len(buf):
         raise Error("packed column does not fit the destination buffer")
     var limit = bins_representable(width)
     for i in range(n_elems):
@@ -379,7 +455,7 @@ def unpack_column(
     check_bin_width(width)
     if n_elems < 0:
         raise Error("element count must not be negative")
-    if base < 0 or base + packed_column_bytes(n_elems, width) > len(buf):
+    if base < 0 or base + packed_stream_bytes(n_elems, width) > len(buf):
         raise Error("packed column does not fit the source buffer")
     var out = List[UInt8](capacity=n_elems)
     for i in range(n_elems):
@@ -396,8 +472,8 @@ def column_roundtrips(
     A verification helper for callers and for a future test lane, not a
     packing path: it allocates its own buffer and throws it away.
     """
-    var buf = List[UInt8](capacity=packed_column_bytes(n_elems, width))
-    buf.resize(packed_column_bytes(n_elems, width), 0)
+    var buf = List[UInt8](capacity=packed_stream_bytes(n_elems, width))
+    buf.resize(packed_stream_bytes(n_elems, width), 0)
     pack_column(buf, 0, src, src_offset, n_elems, width)
     var back = unpack_column(buf, 0, n_elems, width)
     if len(back) != n_elems:
@@ -461,9 +537,13 @@ def assert_byte_identity_invariant(n_elems: Int) raises:
     """At the fallback width the packed stream is the uncompressed column.
 
     Checks the addressing, not a buffer: element `i` must live at byte `i`
-    with shift 0 and must never straddle. This is what lets the packed path
-    and the `UInt8` path share one kernel and one set of formulas.
+    with shift 0 and must never straddle, and the stream must need no pad.
+    This is what lets the packed path and the `UInt8` path share one kernel
+    and one set of formulas, and what makes `BinLayoutPlan`'s passthrough
+    plan the existing `bins` buffer rather than a copy of it.
     """
+    if packed_stream_bytes(n_elems, BIN_WIDTH_FALLBACK) != n_elems:
+        raise Error("width 8 must need exactly one byte per element")
     for i in range(n_elems):
         if element_byte_offset(i, BIN_WIDTH_FALLBACK) != i:
             raise Error("width 8 must address element i at byte i")
@@ -487,13 +567,24 @@ def assert_straddle_invariant(n_elems: Int, width: Int) raises:
 
 
 def assert_window_inside(n_elems: Int, width: Int) raises:
-    """The last element's two-byte window stays inside `packed_column_bytes`.
+    """The last element's decode window stays inside `packed_stream_bytes`.
 
     This is the tail pad's whole justification, so it is checked against the
-    same formula the allocator uses rather than against a constant.
+    same formulas the allocator uses rather than against a constant. Below
+    width 8 the window is two bytes and the pad is what makes the second one
+    legal; at width 8 the window is one byte and there is no pad to check.
     """
     if n_elems <= 0:
         return
     var last = element_byte_offset(n_elems - 1, width)
-    if last + 1 >= packed_column_bytes(n_elems, width):
-        raise Error("packed column is missing its tail pad")
+    var window_end = last
+    if width != BIN_WIDTH_FALLBACK:
+        window_end = last + 1
+    # The footprint is an upper bound, exact at width 8 and occasionally one
+    # byte loose below it (two 7-bit values fill 14 bits, so the last one
+    # ends inside byte 1 while the data spans two bytes and the footprint
+    # allows for a third). Loose is the safe direction: it over-reserves.
+    if window_end > writable_footprint_end(n_elems, width):
+        raise Error("the last element's window runs past the footprint")
+    if window_end >= packed_stream_bytes(n_elems, width):
+        raise Error("packed stream is missing its tail pad")

@@ -87,6 +87,9 @@ comptime _UNSUPPORTED_MAX_DEPTH = 4
 comptime _UNSUPPORTED_MONOTONE = 8
 comptime _UNSUPPORTED_CATEGORICAL = 16
 comptime _UNSUPPORTED_MISSING_BIN = 32
+comptime _UNSUPPORTED_FEATURE_FRACTION_BYLEVEL = 64
+comptime _UNSUPPORTED_EXTRA_TREES = 128
+comptime _UNSUPPORTED_FORCED_SPLITS = 256
 
 
 struct DataShard(Copyable, Movable):
@@ -256,16 +259,32 @@ def _left_count(hist: Histogram, feature: Int, bin: Int) -> Int:
 
 
 def _leaf_value(
-    hist: Histogram, lambda_reg: Float64, lambda_l1: Float64
+    hist: Histogram,
+    lambda_reg: Float64,
+    lambda_l1: Float64,
+    n_data: Int = 0,
+    parent_output: Float64 = 0.0,
+    max_delta_step: Float64 = 0.0,
+    path_smooth: Float64 = 0.0,
 ) -> Float64:
-    """Newton leaf value with LightGBM's L1 shrinkage, mirroring the
-    single-node grower's `_leaf_value`."""
+    """Newton leaf value with LightGBM's L1 shrinkage, then `max_delta_step`
+    and `path_smooth`, mirroring the single-node grower's `_leaf_value`.
+
+    `n_data` is the leaf's *global* row count, the same integer every rank
+    reads off the reduced histogram, so the smoothing weight is identical on
+    every rank and no extra message is needed to agree on a leaf value.
+    """
     var g = 0.0
     var h = 0.0
     for b in range(hist.n_bins):
         g += hist.grad[b]
         h += hist.hess[b]
-    return -soft_threshold_l1(g, lambda_l1) / (h + lambda_reg)
+    var value = -soft_threshold_l1(g, lambda_l1) / (h + lambda_reg)
+    if max_delta_step <= 0.0 and path_smooth <= 0.0:
+        return value
+    return finish_leaf_output(
+        value, max_delta_step, path_smooth, n_data, parent_output
+    )
 
 
 def _search(
@@ -273,11 +292,24 @@ def _search(
     n_rows: Int,
     params: TreeParams,
     allowed: List[Bool],
+    parent_output: Float64 = 0.0,
 ) raises -> SplitInfo:
     """Best split for one node, from the global histogram. Mirrors the
     single-node grower's `_search`; ties resolve by the same ascending
     feature and bin scan order on every rank, so no tie-break protocol is
-    needed."""
+    needed.
+
+    `params.extra` is forwarded, so `min_gain_to_split`, `feature_contri`,
+    and the CEGB split cost decide here exactly as they do on the single-node
+    grower. Every input they read is global (the reduced histogram and the
+    exact row count), so they cannot make two ranks disagree. The parts of
+    the bundle this grower cannot honor are refused up front by
+    `_unsupported_mask`, not silently dropped.
+
+    `monotone_penalty` needs no depth here: this grower refuses monotone
+    constraints outright, so no feature carries a sign and the penalty is the
+    identity by definition.
+    """
     if n_rows < 2 * params.min_data_in_leaf or n_rows < 2:
         return SplitInfo(-1, -1, 0.0, False)
     return find_best_split(
@@ -287,6 +319,9 @@ def _search(
         min_data_in_leaf=params.min_data_in_leaf,
         lambda_l1=params.lambda_l1,
         allowed=allowed,
+        extra=params.extra,
+        n_rows=n_rows,
+        parent_output=parent_output,
     )
 
 
@@ -328,10 +363,20 @@ def _unsupported_mask(params: TreeParams, shards: List[DataShard]) -> Int:
         mask |= _UNSUPPORTED_FEATURE_FRACTION
     if params.feature_fraction_bynode != 1.0:
         mask |= _UNSUPPORTED_FEATURE_FRACTION_BYNODE
+    if params.feature_fraction_bylevel != 1.0:
+        mask |= _UNSUPPORTED_FEATURE_FRACTION_BYLEVEL
     if params.max_depth > 0:
         mask |= _UNSUPPORTED_MAX_DEPTH
     if params.monotone.is_active():
         mask |= _UNSUPPORTED_MONOTONE
+    # The rest of `params.extra` is honored below: `min_gain_to_split`, the
+    # per-feature gain multipliers, and the CEGB split cost go into the
+    # search, and `max_delta_step` and `path_smooth` into the leaf values.
+    # These two cannot be.
+    if params.extra.extra_trees:
+        mask |= _UNSUPPORTED_EXTRA_TREES
+    if not params.extra.forced.is_empty():
+        mask |= _UNSUPPORTED_FORCED_SPLITS
     for i in range(len(shards)):
         if shards[i].data.cats.any_categorical():
             mask |= _UNSUPPORTED_CATEGORICAL
@@ -374,6 +419,21 @@ def _raise_unsupported(mask: Int) raises:
         raise Error(
             "distributed training does not support reserved missing bins; the"
             " distributed grower does not route missing values"
+        )
+    if mask & _UNSUPPORTED_FEATURE_FRACTION_BYLEVEL != 0:
+        raise Error(
+            "distributed training does not support feature_fraction_bylevel;"
+            " the draw would have to be reproduced identically on every rank"
+        )
+    if mask & _UNSUPPORTED_EXTRA_TREES != 0:
+        raise Error(
+            "distributed training does not support extra_trees; the threshold"
+            " draw is keyed by the tree index, which this grower is not given"
+        )
+    if mask & _UNSUPPORTED_FORCED_SPLITS != 0:
+        raise Error(
+            "distributed training does not support forced splits; applying"
+            " one needs the bin mapper, which this grower is not given"
         )
 
 

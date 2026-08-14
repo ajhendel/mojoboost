@@ -35,8 +35,14 @@ if [ "$MODE" = "--verify" ]; then
     exit 0
 fi
 
+# clean-install.txt is listed but is normally absent at the point
+# build_release_wheel.sh calls this, because the clean-install fixture runs
+# afterwards and outside pixi. Re-running this script after that step picks it
+# up. A file missing from the manifest is not a verification failure: `shasum
+# -c` checks the lines it is given and says nothing about files it was never
+# told about.
 shopt -s nullglob
-FILES=(*.whl *.provenance.json inspection.json otool.txt)
+FILES=(*.whl *.provenance.json inspection.json otool.txt clean-install.txt)
 shopt -u nullglob
 [ "${#FILES[@]}" -gt 0 ] || { echo "nothing to hash in $DIR" >&2; exit 2; }
 

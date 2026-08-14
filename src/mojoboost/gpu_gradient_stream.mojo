@@ -174,6 +174,9 @@ struct GpuRowSelection(Movable):
     var n_selected: Int
     var block_threads: Int
     var has_importance: Bool
+    var has_compensation: Bool
+    """Whether this round's selection carried multipliers at all. A bag
+    does not, so a bagged round never launches the scaling kernel."""
 
     def __init__(
         out self,
@@ -201,6 +204,7 @@ struct GpuRowSelection(Movable):
         self.max_selected = max_selected
         self.n_selected = 0
         self.has_importance = with_importance
+        self.has_compensation = False
         self.block_threads = derive_block_threads(query_device_caps(ctx))
 
         var cap = max_selected if max_selected > 0 else 1
@@ -228,6 +232,7 @@ struct GpuRowSelection(Movable):
         selection means the same thing here that an empty bag means
         everywhere else in the library."""
         self.n_selected = 0
+        self.has_compensation = False
 
     def is_all_rows(self) -> Bool:
         return self.n_selected == 0
@@ -296,6 +301,7 @@ struct GpuRowSelection(Movable):
         ctx.enqueue_copy(dst_buf=self.rows_dev, src_ptr=dst_rows)
         ctx.enqueue_copy(dst_buf=self.scale_dev, src_ptr=dst_scale)
         self.n_selected = len(rows)
+        self.has_compensation = len(scale) > 0
 
     def from_goss(
         mut self, ctx: DeviceContext, selection: GossSelection
@@ -322,7 +328,7 @@ struct GpuRowSelection(Movable):
         the histograms will actually read, which is the invariant the
         fixed-point accumulation depends on for its overflow bound.
         """
-        if self.n_selected <= 0:
+        if self.n_selected <= 0 or not self.has_compensation:
             return
         var blocks = (
             self.n_selected + self.block_threads - 1
@@ -367,9 +373,9 @@ struct GpuRowSelection(Movable):
             block_dim=self.block_threads,
         )
 
-    def download_importance(mut self, ctx: DeviceContext) raises -> List[
-        Float64
-    ]:
+    def download_importance(
+        mut self, ctx: DeviceContext
+    ) raises -> List[Float64]:
         """The ranking plane, host side, ready for `goss_select`.
 
         One `n_rows` Float32 transfer and one synchronization, against the

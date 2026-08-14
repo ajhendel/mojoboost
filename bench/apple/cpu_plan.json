@@ -1,0 +1,202 @@
+{
+  "plan_version": "1.0.0",
+  "title": "Apple silicon CPU measurement plan for the histogram, binning, and scheduling lane",
+  "status": "unmeasured",
+  "description": "A plan, not a record. Nothing in this file is a measurement: it states what the CPU changes in src/mojoboost/{histogram,binning,parallel,apple_cpu_policy}.mojo are expected to do, the command that would show each one, and what result would falsify it. Run records for the Apple GPU suite live under bench/apple/ against schema.json; this file deliberately does not claim that schema, because it describes work to be done rather than a run that happened. When these are measured, the numbers belong in a run record or in docs, not here.",
+  "owner_lane": "performance_13_apple_cpu",
+  "handoff": "handoffs/performance_13_apple_cpu.md",
+  "semantic_invariant": "Every knob below is a scheduling or memory-traffic decision. Trees, splits, gains, and predictions must be bit-identical across every cell of every sweep. Any cell that changes a model output is a bug in this lane, not a tuning result, and stops the sweep.",
+
+  "environment_contract": {
+    "MOJOBOOST_NUM_WORKERS": "0 auto, 1 serial, N forces N tasks. Overrides everything below.",
+    "MOJOBOOST_PARALLEL_MIN_OPS": "grain floor in histogram-op equivalents; default 65536.",
+    "MOJOBOOST_CPU_TASKS_PER_CORE": "auto-mode fan-out per core; default 4.",
+    "MOJOBOOST_CPU_CORE_POOL": "all (default) or performance; which cores auto mode counts.",
+    "MOJOBOOST_CPU_FEATURE_GROUP": "1 or 2; features interleaved in one accumulation loop. Default 2.",
+    "MOJOBOOST_CPU_COMPACT_MIN_ROWS": "rows below which a node skips the gradient/hessian gather. Default 256."
+  },
+
+  "preconditions": [
+    "Machine idle, on AC power, no other build or benchmark running: an efficiency-core scheduling change is inside the noise of a busy laptop.",
+    "One warm-up run discarded, then at least 5 repetitions per cell; report median and spread, never a single run.",
+    "Same binary across the cells of one sweep. Every knob here is an environment variable precisely so that a sweep does not recompile between cells.",
+    "Record the machine line printed by bench/bench_profile.mojo (cores, performance cores, SIMD width, tasks per core) with every result."
+  ],
+
+  "changes_under_test": [
+    {
+      "id": "fused-zeroing",
+      "file": "src/mojoboost/histogram.mojo",
+      "claim": "Zeroing the output inside each feature's task, instead of one pass over the whole buffer before the build, removes one streaming write plus read of n_features * n_bins * 24 bytes per node and parallelizes what remains.",
+      "expected_effect": "Largest on wide, shallow shapes and on small nodes, where the zeroing pass was a larger share of the build than the accumulation.",
+      "falsified_if": "Node-level histogram build time does not improve at n_features >= 100, n_bins = 255, node rows <= 1000."
+    },
+    {
+      "id": "gradient-gather",
+      "file": "src/mojoboost/histogram.mojo",
+      "claim": "Gathering a node's (gradient, hessian) pairs once into a contiguous buffer turns two indirect loads per feature per row into two sequential loads, leaving one gather for the whole node.",
+      "expected_effect": "Grows with the active feature count and with dataset size, because the gradients and hessians are read through row ids over buffers far larger than cache. Nothing at one active feature, where the policy skips it.",
+      "falsified_if": "Subset build time at 1M rows, 100 features, 50% node does not improve against MOJOBOOST_CPU_COMPACT_MIN_ROWS set above the node size."
+    },
+    {
+      "id": "feature-pairing",
+      "file": "src/mojoboost/histogram.mojo",
+      "claim": "Accumulating two features in one inner loop gives the core two independent read-modify-write chains and halves the loads of the shared row id and gradient pair.",
+      "expected_effect": "A modest gain that comes from overlapping the store-to-load latency of repeated bins. This is the claim in this lane most likely to be wrong: it depends on how the hardware disambiguates two stores the compiler cannot prove disjoint.",
+      "falsified_if": "MOJOBOOST_CPU_FEATURE_GROUP=2 is not faster than 1 at equal compaction. Then set DEFAULT_FEATURE_GROUP to 1 and delete the paired loops."
+    },
+    {
+      "id": "parallel-subtraction",
+      "file": "src/mojoboost/histogram.mojo",
+      "claim": "Sibling subtraction is six memory streams over n_features * n_bins cells and was serial; splitting it into contiguous blocks and weighting its work estimate by three ops per cell lets it reach the parallel path.",
+      "expected_effect": "Visible on any shape whose histogram is larger than L2, i.e. n_features * n_bins * 24 bytes above a few MB.",
+      "falsified_if": "Subtraction time at 500 features x 255 bins does not fall between MOJOBOOST_NUM_WORKERS=1 and auto."
+    },
+    {
+      "id": "work-estimates",
+      "files": [
+        "src/mojoboost/histogram.mojo",
+        "src/mojoboost/binning.mojo",
+        "src/mojoboost/apple_cpu_policy.mojo"
+      ],
+      "claim": "Work estimates now count what a stage actually does per row: the zeroing pass for a histogram build, the comparison count for a quantile fit, the search depth for a transform, three streams per cell for a subtraction.",
+      "expected_effect": "Stages that were dearer than one histogram op per row cross into the parallel path at the size where they actually pay for a dispatch, rather than at 8 to 20 times that size.",
+      "falsified_if": "A stage newly taking the parallel path is slower there than it was serially at the same shape. That is a threshold to raise, not an estimate to revert."
+    },
+    {
+      "id": "even-task-split",
+      "file": "src/mojoboost/parallel.mojo",
+      "claim": "Splitting a feature range evenly rather than by a ceiling-divided chunk removes empty trailing tasks and spreads the remainder.",
+      "expected_effect": "Small, and concentrated where the task count does not divide the feature count.",
+      "falsified_if": "No effect at any shape. Keep it anyway: an empty task is a scheduling event for no work."
+    },
+    {
+      "id": "core-pool",
+      "file": "src/mojoboost/apple_cpu_policy.mojo",
+      "claim": "Unknown, and that is the point. On a machine whose cores differ in speed, a barrier-synchronized fan-out finishes with its slowest task, so counting only the performance cores may beat counting all of them.",
+      "expected_effect": "Untested in either direction. The default (all physical cores) is what this repository already shipped; the alternative exists so the question can be answered rather than assumed.",
+      "falsified_if": "Not applicable. This cell is a measurement, not a claim."
+    },
+    {
+      "id": "fit-scratch-reuse",
+      "file": "src/mojoboost/binning.mojo",
+      "claim": "One sort buffer per task instead of one per feature turns a per-feature allocation into a per-worker one during quantile fitting.",
+      "expected_effect": "Grows with feature count; nothing at a handful of features.",
+      "falsified_if": "fit_bins time at 500 features does not improve."
+    },
+    {
+      "id": "parallel-equal-width-binning",
+      "file": "src/mojoboost/binning.mojo",
+      "claim": "bin_equal_width was a serial appending loop; sized up front and written by index, its features are independent.",
+      "expected_effect": "Near-linear in worker count on large synthetic datasets, which is where this path is used.",
+      "falsified_if": "No improvement at 1M rows x 100 features between MOJOBOOST_NUM_WORKERS=1 and auto."
+    }
+  ],
+
+  "microbenchmarks": [
+    {
+      "id": "hist-scaling",
+      "command": "pixi run bench-hist-scaling",
+      "measures": ["fused-zeroing", "gradient-gather", "feature-pairing"],
+      "note": "Existing driver, not owned by this lane and not modified by it. Read its output for the full and subset builders before touching anything else."
+    },
+    {
+      "id": "hist-basic",
+      "command": "pixi run bench-hist",
+      "measures": ["fused-zeroing", "parallel-subtraction"]
+    },
+    {
+      "id": "profile",
+      "command": "pixi run bench-profile",
+      "measures": ["work-estimates", "even-task-split", "core-pool"],
+      "note": "Prints the machine line every result in this plan must be recorded with, and reports serial against auto per stage."
+    },
+    {
+      "id": "threshold",
+      "command": "pixi run bench-threshold",
+      "measures": ["work-estimates"],
+      "note": "This is the driver PARALLEL_MIN_OPS came from. Any change to the grain floor is argued from a rerun of it, not from reasoning."
+    },
+    {
+      "id": "train",
+      "command": "pixi run bench",
+      "measures": ["fused-zeroing", "gradient-gather", "parallel-subtraction", "work-estimates"],
+      "note": "End-to-end CPU training. The only number that decides whether this lane was worth anything."
+    }
+  ],
+
+  "sweeps": [
+    {
+      "id": "compaction-and-pairing",
+      "goal": "Attribute the subset-builder gain to the gather and to the pairing separately.",
+      "note": "The two are coupled on purpose in the kernel: pairing is only used on the compacted path, so the cell (compaction off, group 2) does not exist. These three cells still separate the effects.",
+      "cells": [
+        {"MOJOBOOST_CPU_COMPACT_MIN_ROWS": "1000000000", "MOJOBOOST_CPU_FEATURE_GROUP": "1", "label": "baseline: neither"},
+        {"MOJOBOOST_CPU_COMPACT_MIN_ROWS": "256", "MOJOBOOST_CPU_FEATURE_GROUP": "1", "label": "gather only"},
+        {"MOJOBOOST_CPU_COMPACT_MIN_ROWS": "256", "MOJOBOOST_CPU_FEATURE_GROUP": "2", "label": "gather and pairing"}
+      ],
+      "commands": ["hist-scaling", "train"]
+    },
+    {
+      "id": "compaction-threshold",
+      "goal": "Find the node size at which the gather starts paying, which is what DEFAULT_COMPACT_MIN_ROWS should be.",
+      "cells": [
+        {"MOJOBOOST_CPU_COMPACT_MIN_ROWS": "32"},
+        {"MOJOBOOST_CPU_COMPACT_MIN_ROWS": "128"},
+        {"MOJOBOOST_CPU_COMPACT_MIN_ROWS": "256"},
+        {"MOJOBOOST_CPU_COMPACT_MIN_ROWS": "1024"},
+        {"MOJOBOOST_CPU_COMPACT_MIN_ROWS": "4096"}
+      ],
+      "commands": ["hist-scaling", "train"],
+      "note": "Sweep at a fixed feature count first: the crossover depends on how many features re-read the gradients, so record the feature count with the answer."
+    },
+    {
+      "id": "fan-out",
+      "goal": "Whether 4 tasks per core is right on an asymmetric machine.",
+      "cells": [
+        {"MOJOBOOST_CPU_TASKS_PER_CORE": "1"},
+        {"MOJOBOOST_CPU_TASKS_PER_CORE": "2"},
+        {"MOJOBOOST_CPU_TASKS_PER_CORE": "4"},
+        {"MOJOBOOST_CPU_TASKS_PER_CORE": "8"},
+        {"MOJOBOOST_CPU_TASKS_PER_CORE": "16"}
+      ],
+      "commands": ["profile", "train"],
+      "note": "Over-decomposition only helps if the runtime hands a waiting core the next task. If 1 is as good as 8 the pool is static, which changes what the core-pool sweep below means."
+    },
+    {
+      "id": "core-pool",
+      "goal": "Whether excluding the efficiency cores from a barrier-synchronized fan-out beats including them.",
+      "cells": [
+        {"MOJOBOOST_CPU_CORE_POOL": "all"},
+        {"MOJOBOOST_CPU_CORE_POOL": "performance"}
+      ],
+      "commands": ["profile", "train"],
+      "note": "Run both at each of MOJOBOOST_CPU_TASKS_PER_CORE 1 and 4: the answer is expected to depend on whether over-decomposition is already hiding the slow cores."
+    },
+    {
+      "id": "grain",
+      "goal": "Whether the grain floor is still right now that the estimates that feed it count the real per-row work.",
+      "cells": [
+        {"MOJOBOOST_PARALLEL_MIN_OPS": "16384"},
+        {"MOJOBOOST_PARALLEL_MIN_OPS": "65536"},
+        {"MOJOBOOST_PARALLEL_MIN_OPS": "262144"}
+      ],
+      "commands": ["threshold", "profile"]
+    }
+  ],
+
+  "equivalence_gate": {
+    "note": "Run before any timing is believed, and after any knob is changed. These are existing tests, owned by other lanes; this lane runs them and does not edit them.",
+    "commands": [
+      "pixi run mojo run -I src tests/test_cpu_parallel.mojo",
+      "pixi run mojo run -I src tests/test_histogram_reference.mojo"
+    ],
+    "expectation": "Bit-identical results between forced-serial and parallel paths, and between the allocating and the _into builders, at every setting in this plan."
+  },
+
+  "evidence_required": [
+    "Any claim that a loop vectorized, or that a particular ARM instruction was emitted, needs disassembly. Nothing in this lane has been compiled, let alone disassembled.",
+    "Any claim about which of two memory streams is the bottleneck needs a profiler with cache-miss counters, not a wall-clock delta.",
+    "Any claim about efficiency-core scheduling needs a run on a machine whose performance and efficiency core counts differ, recorded with both counts."
+  ]
+}

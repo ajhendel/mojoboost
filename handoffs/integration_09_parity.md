@@ -10,8 +10,18 @@ else:
 | `tools/check_parity.py` | extended |
 | `handoffs/integration_09_parity.md` | this file |
 
-Nothing was committed or staged. No implementation, test, README, packaging
-file, or workflow was touched.
+This lane committed and staged nothing. It should be noted anyway that a
+concurrent lane's whole-tree commits swept these files in while they were
+being written: `docs/CAPABILITY_LEVELS.md` and `tools/check_parity.py`
+landed in `9a9c8d1 "Prepare packaging and parallel optimization work"`, and
+`handoffs/integration_09_parity.md` in `b04b5f0 "Integrate parallel release
+and accelerator work"`. The content in `9a9c8d1` is final for both files.
+`docs/LIGHTGBM_PARITY.md` and this handoff carry later edits in the working
+tree, from the second packaging pass described in section 4. Whoever
+assembles the round should know that this lane's work is spread across two
+commits with other lanes' messages.
+
+No implementation, test, README, packaging file, or workflow was touched.
 
 ## What was run, and what was not
 
@@ -20,10 +30,10 @@ no benchmark, and in particular **`tools/check_parity.py` was not run**, so
 this lane cannot claim the script passes. It was verified statically
 instead, with `grep`, `sed`, and `awk` over the two files it reads:
 
-- every one of the 97 repository paths the contract cites resolves to a file
+- every one of the 99 repository paths the contract cites resolves to a file
   that exists
 - every status cell in the contract is one of the five vocabulary words
-  (142 `supported`, 61 `deferred`, 45 `different`, 36 `partial`, 17
+  (142 `supported`, 61 `deferred`, 45 `different`, 37 `partial`, 17
   `unsupported`)
 - all 104 names in `REQUIRED_SUPPORTED` appear as a `supported` row
 - all 36 keys in `STALE_DEFERRED_WATCHES` appear as a row, and every one of
@@ -190,15 +200,20 @@ does not own.
 
 Ranked by how much a wrong call costs.
 
-1. **`macOS arm64 wheel`, downgraded to `partial`.** The evidence is
-   `docs/PLATFORM_MATRIX.md` plus the absence of a wheel job in
-   `.github/workflows/ci.yml`, both of which this lane read directly. But
-   the working tree has untracked `packaging/linux/`, `packaging/macos/`,
-   and `.github/workflows/release-provenance.yml` from a concurrent
-   packaging lane, which this lane did not read and must not adopt. **If
-   that lane lands a wheel job or a recorded clean-install run, restore the
-   row to `supported` and put `"macOS arm64 wheel"` back in
-   `REQUIRED_SUPPORTED`.** Do it on the evidence, not on the handoff.
+1. **The three wheel rows, and how fast they are moving.** Section 13 was
+   audited twice, because a release lane landed `packaging/macos/`,
+   `packaging/linux/`, `.github/workflows/release-macos.yml`,
+   `.github/workflows/release-linux.yml`, and
+   `.github/workflows/release-provenance.yml` while this lane was writing.
+   The second pass read those files in the tree, which is evidence, and
+   left `macOS arm64 wheel` at `partial` on one narrow ground: a release
+   workflow that fires on a tag is not a per-change guard, and
+   `docs/PLATFORM_MATRIX.md` still says `designed`. **If that lane adds a
+   per-change wheel job, or records a clean-install run in the matrix,
+   restore the row to `supported` and put `"macOS arm64 wheel"` back in
+   `REQUIRED_SUPPORTED`.** Do it on the evidence, not on their handoff. The
+   same test decides the new `Linux wheel, x86-64 and ARM64` row. Expect
+   section 13 to be the first part of this contract to go stale.
 2. **`GPU multiclass`, upgraded to `supported`.** It rests on
    `gpu_supports` admitting every output count, in a file whose module
    docstring says the opposite. Someone who knows which of the two is

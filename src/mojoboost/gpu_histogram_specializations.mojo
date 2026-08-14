@@ -32,13 +32,19 @@ they demand of the kernel side:
    `pack4_bins`/`unpack_bin` are the portable pack and extract. See the
    capability boundary below for what a wide load would have to prove first.
 
-3. **Batched small leaves.** A node whose histogram launches fewer
-   threadgroups than the device can hold leaves the device underfilled, and a
-   tree's frontier is full of such nodes. `plan_leaf_batches` groups
-   consecutive small nodes into one launch whose `grid.z` is the leaf, so one
-   launch covers several nodes. Each leaf writes its own output slice, so
-   nothing about the accumulation changes; the batching is a launch decision
-   only.
+3. **Batched small leaves, planned elsewhere.** A node whose histogram
+   launches fewer threadgroups than the device can hold leaves the device
+   underfilled, and a tree's frontier is full of such nodes. The kernels and
+   the plan for that live in `gpu_leaf_batching.mojo`, which concatenates the
+   batch's row tiles onto one flat `grid.y` axis and binary searches it per
+   threadgroup. This module deliberately contains **no** batch planner: an
+   earlier draft of it planned a `grid.z` batch with a uniform tile count per
+   leaf, which wastes every threadgroup past a small leaf's end and rests on
+   a portable `grid.z` bound this project has never established. The packed
+   tile axis has neither problem, so the duplicate was removed rather than
+   maintained beside it. What survives here is the policy-side question of
+   *whether* a frontier wants batching, which is
+   `apple_histogram_policy.batching_declined_reason`.
 
 What is deliberately not here
 -----------------------------
@@ -103,20 +109,6 @@ comptime PACK_LANES = 4
 # An aligned body shorter than this is not worth a separate code path: the
 # head and tail loops would dominate whatever the body saved.
 comptime MIN_PACKED_BODY_QUADS = 4
-
-# Bounds on one batched launch. The lower bound is what makes a batch a batch
-# at all; the upper bound keeps `grid.z` well inside the smallest portable
-# grid bound and keeps the per-leaf descriptor array small enough to stay in
-# a single small buffer.
-comptime MIN_BATCH_LEAVES = 2
-comptime MAX_BATCH_LEAVES = 32
-
-# The widest ratio between the largest and smallest row count in one batch.
-# Every leaf in a batch shares one `grid.y`, sized for the largest, so a leaf
-# far smaller than its batch-mates contributes threadgroups that exit at
-# once. Four bounds that waste at three quarters of a leaf's blocks in the
-# worst case, which is the point past which batching stops paying.
-comptime BATCH_ROW_SPREAD = 4
 
 
 def _ceil_div(a: Int, b: Int) -> Int:
@@ -284,11 +276,6 @@ struct DeviceHistogramCapabilities(Copyable, Movable):
     the launch rounding in `gpu_tiling.mojo` is a portable granularity rather
     than a width claim."""
 
-    var max_grid_dim_z: Int
-    """Bound on the third grid dimension, which is what a batched leaf launch
-    spends. The portable value is the smallest bound across the supported
-    backends."""
-
     var wide_byte_loads: Bool
     """Whether a four-byte aligned load of the bin matrix has been shown to
     beat four one-byte loads on this device. False everywhere until a
@@ -303,8 +290,17 @@ struct DeviceHistogramCapabilities(Copyable, Movable):
     @staticmethod
     def portable() -> DeviceHistogramCapabilities:
         """A device that has reported nothing beyond being launchable. No
-        specialization that needs a device fact is available from here."""
-        return DeviceHistogramCapabilities(0, 65535, False, False)
+        specialization that needs a device fact is available from here.
+
+        There is deliberately no grid-dimension field. An earlier draft
+        carried a portable `grid.z` bound for a batched leaf launch, which was
+        a number this project has never established on Metal, CUDA, and HIP
+        alike. The batched path that survives (`gpu_leaf_batching.mojo`) packs
+        its tiles onto `grid.y`, whose portable bound *is* known and already
+        lives in `gpu_tiling.MAX_GRID_DIM_Y`, so nothing needs the third axis
+        or a guess about it.
+        """
+        return DeviceHistogramCapabilities(0, False, False)
 
 
 @fieldwise_init
@@ -328,8 +324,9 @@ struct KernelFeatures(Copyable, Movable):
     run of row ids."""
 
     var batched_leaf_kernel: Bool
-    """A histogram kernel whose `grid.z` selects among several leaves in one
-    launch, each writing its own output slice."""
+    """The batched histogram kernels in `gpu_leaf_batching.mojo` are compiled
+    in and validated: several leaves in one launch, their row tiles packed
+    onto one `grid.y` axis, each leaf writing its own output slice."""
 
     @staticmethod
     def none() -> KernelFeatures:
@@ -389,6 +386,16 @@ struct PackedLoadWindow(Copyable, Movable):
     which depends on the feature unless `dataset_rows` is itself a multiple
     of `PACK_LANES`. `plan_packed_window` requires that multiple, so one
     window describes every feature in a launch rather than one per feature.
+
+    **This arithmetic assumes one byte per (row, feature) cell**, which is
+    what `GpuHistogramBuilder` uploads today. It is not a safe assumption in
+    general: `gpu_bin_packing.mojo` and `gpu_binned_layout.mojo` describe
+    sub-byte bin widths, under which an element index is no longer a byte
+    offset and a four-row group is no longer four bytes. If either layout is
+    adopted for the training path, this window is wrong rather than merely
+    unhelpful, and it must be re-derived against the packed stream's own
+    offset arithmetic (`gpu_bin_packing.element_byte_offset` and
+    `element_bit_shift`) before the packed path is enabled on it.
     """
 
     var usable: Bool
@@ -473,167 +480,3 @@ def plan_packed_window(
     if body_quads < MIN_PACKED_BODY_QUADS:
         return PackedLoadWindow(False, count, 0, 0, WINDOW_TOO_SHORT)
     return PackedLoadWindow(True, head, body_quads, tail, WINDOW_OK)
-
-
-# --- Batched small leaves ---
-
-
-@fieldwise_init
-struct LeafBatch(Copyable, Movable):
-    """One launch covering several leaves, `grid.z` selecting among them."""
-
-    var first: Int
-    """Index of the first leaf in the caller's list."""
-
-    var n_leaves: Int
-    var rows_per_tile: Int
-    var n_tiles: Int
-    """`grid.y` for the whole batch: enough tiles for the largest leaf in
-    it."""
-
-    var min_rows: Int
-    var max_rows: Int
-    var blocks: Int
-    """`n_leaves * n_slots * n_tiles`, the threadgroups this launch
-    creates."""
-
-    var wasted_blocks: Int
-    """Threadgroups whose tile starts past their own leaf's row count and so
-    exit immediately. Zero when every leaf in the batch needs the batch's
-    full `grid.y`. Reported rather than hidden: it is the cost side of
-    batching and the number a benchmark has to weigh the saved launches
-    against."""
-
-
-def batch_blocks(n_leaves: Int, n_slots: Int, n_tiles: Int) -> Int:
-    return n_leaves * n_slots * n_tiles
-
-
-def plan_leaf_batches(
-    row_counts: List[Int],
-    n_slots: Int,
-    rows_per_tile: Int,
-    target_blocks: Int,
-    max_leaves: Int = MAX_BATCH_LEAVES,
-) raises -> List[LeafBatch]:
-    """Group consecutive leaves into launches, greedily, in the caller's
-    order.
-
-    A batch grows while it is still smaller than `target_blocks`, still under
-    `max_leaves`, and still inside `BATCH_ROW_SPREAD` between its largest and
-    smallest leaf. It closes as soon as any of the three stops holding, so
-    every batch but the last is either full or wide enough to fill the
-    device.
-
-    Order is preserved and leaves are never reordered or merged: batch `k`
-    holds a contiguous slice of the input, `grid.z` indexes within it, and
-    each leaf writes only its own output slice. No accumulation crosses a
-    leaf, so batching cannot change a single histogram value. A leaf with no
-    rows is planned at one row, matching `GpuActiveRows.range_tiling`, and
-    still gets its output zeroed by the launch that covers it.
-
-    Returns one batch per leaf when nothing can be grouped, which is the
-    correct answer and not a failure: the caller launches them exactly as it
-    does today.
-    """
-    if n_slots < 1:
-        raise Error("leaf batching needs at least one active feature")
-    if rows_per_tile < 1:
-        raise Error("leaf batching needs a positive rows per tile")
-    if target_blocks < 1:
-        raise Error("leaf batching needs a positive block target")
-    if max_leaves < 1:
-        raise Error("leaf batching needs a positive leaf bound")
-
-    var out = List[LeafBatch](capacity=len(row_counts))
-    var i = 0
-    while i < len(row_counts):
-        var first_rows = row_counts[i]
-        if first_rows < 1:
-            first_rows = 1
-        var min_rows = first_rows
-        var max_rows = first_rows
-        var n_leaves = 1
-        var n_tiles = _ceil_div(max_rows, rows_per_tile)
-        var blocks = batch_blocks(n_leaves, n_slots, n_tiles)
-
-        while (
-            blocks < target_blocks
-            and n_leaves < max_leaves
-            and i + n_leaves < len(row_counts)
-        ):
-            var next_rows = row_counts[i + n_leaves]
-            if next_rows < 1:
-                next_rows = 1
-            var next_min = min_rows
-            var next_max = max_rows
-            if next_rows < next_min:
-                next_min = next_rows
-            if next_rows > next_max:
-                next_max = next_rows
-            if next_max > BATCH_ROW_SPREAD * next_min:
-                break
-            min_rows = next_min
-            max_rows = next_max
-            n_leaves += 1
-            n_tiles = _ceil_div(max_rows, rows_per_tile)
-            blocks = batch_blocks(n_leaves, n_slots, n_tiles)
-
-        var used = 0
-        for k in range(n_leaves):
-            var rows = row_counts[i + k]
-            if rows < 1:
-                rows = 1
-            used += _ceil_div(rows, rows_per_tile)
-        var wasted = (n_leaves * n_tiles - used) * n_slots
-
-        out.append(
-            LeafBatch(
-                i,
-                n_leaves,
-                rows_per_tile,
-                n_tiles,
-                min_rows,
-                max_rows,
-                blocks,
-                wasted,
-            )
-        )
-        i += n_leaves
-    return out^
-
-
-def batching_pays(
-    row_counts: List[Int],
-    n_slots: Int,
-    rows_per_tile: Int,
-    target_blocks: Int,
-) raises -> Bool:
-    """Whether grouping is worth planning at all: more than one leaf, and at
-    least one of them too small to fill the device on its own."""
-    if len(row_counts) < MIN_BATCH_LEAVES:
-        return False
-    if n_slots < 1 or rows_per_tile < 1 or target_blocks < 1:
-        raise Error("batching test needs positive slots, tile, and target")
-    for i in range(len(row_counts)):
-        var rows = row_counts[i]
-        if rows < 1:
-            rows = 1
-        if batch_blocks(1, n_slots, _ceil_div(rows, rows_per_tile)) < (
-            target_blocks
-        ):
-            return True
-    return False
-
-
-def total_wasted_blocks(batches: List[LeafBatch]) -> Int:
-    """Threadgroups the whole batch plan creates that exit immediately."""
-    var total = 0
-    for i in range(len(batches)):
-        total += batches[i].wasted_blocks
-    return total
-
-
-def total_launches(batches: List[LeafBatch]) -> Int:
-    """Histogram launches the plan costs, against one per leaf today."""
-    return len(batches)

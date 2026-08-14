@@ -201,13 +201,29 @@ comptime ROLE_ROW_SEED = 4
 per tree, and only when bagging is on."""
 
 comptime ROLE_VALID_BINS = 5
-"""A validation matrix held device-resident for scoring, `gpu_predict.mojo`'s
-`bins_dev`."""
+"""A validation matrix held device-resident for scoring,
+`gpu_predict.mojo`'s `valid_bins_dev`.
+
+Uploaded by `upload_validation` straight from the caller's `data.bins` into a
+buffer sized exactly to that matrix, so it holds two copies and no pinned
+staging one, exactly like `ROLE_BINS`. It is a separate role because it is
+resident for a different span: the training matrix lives for a fit, this lives
+for as long as the estimator scores against the same validation set, and both
+are resident at once."""
 
 comptime ROLE_PREDICT_OUT = 6
-"""Prediction scores coming back, `gpu_predict.mojo`'s `host_out`."""
+"""Prediction scores coming back, `gpu_predict.mojo`'s `host_out`. Written by
+the predict kernel with plain stores, not atomics."""
 
-comptime N_ROLES = 7
+comptime ROLE_BATCH_BINS = 7
+"""A batch of rows being scored, `gpu_predict.mojo`'s `bins_dev`, staged
+through the pinned `stage_bins`.
+
+The only role whose bytes already sit in a runtime allocation the session owns
+before they reach the device, which is what makes it the only bins-shaped role
+a shared route is structurally able to serve. See `structural_support`."""
+
+comptime N_ROLES = 8
 
 
 def role_name(role: Int) -> String:
@@ -225,6 +241,8 @@ def role_name(role: Int) -> String:
         return String("valid_bins")
     if role == ROLE_PREDICT_OUT:
         return String("predict_out")
+    if role == ROLE_BATCH_BINS:
+        return String("batch_bins")
     return String("unknown")
 
 
@@ -337,7 +355,7 @@ def structural_support(role: Int, route: Int) raises -> Int:
     platform question is asked.
 
     This is the part that no measurement can change, because it is about how
-    mojoboost's own data structures are laid out today. Three findings are
+    mojoboost's own data structures are laid out today. Four findings are
     encoded here and each is worth stating in full, because each one bounds
     what the whole experiment could be worth:
 
@@ -359,12 +377,24 @@ def structural_support(role: Int, route: Int) raises -> Int:
       and the failure mode is a wrong histogram rather than a raise, so the
       role is blocked until the driver's `out_host_direct` route answers it.
 
-    - `ROLE_VALID_BINS` inherits `ROLE_BINS`'s ownership problem and adds one
-      of its own: the scoring path in `gpu_predict.mojo` stages the caller's
-      bins through a pinned host buffer before uploading, so a scored matrix
-      is resident three times over (caller list, pinned stage, device
-      buffer). That is the clearest duplication in the system and it is not
-      fixed by a route choice either.
+    - `ROLE_VALID_BINS` inherits `ROLE_BINS`'s ownership problem exactly:
+      `upload_validation` copies straight out of the caller's `data.bins`
+      into a buffer sized to that matrix, so it holds two copies and the
+      shared route has the same nothing to hand a kernel. It is worth
+      remembering that this one is resident *alongside* the training matrix
+      rather than instead of it.
+
+    - `ROLE_BATCH_BINS` is the exception, and it is the only role in the
+      system where a shared route is structurally available today.
+      `upload_bins` already writes the batch into a pinned `stage_bins` that
+      the predictor owns, so the pointer a kernel would need already exists.
+      The staging copy is there because `bins_dev` is sized to the
+      high-water batch rather than to this batch and `enqueue_copy` moves a
+      whole buffer, so copying from the caller's exactly-sized list would
+      read past its end. A shared route would keep the staging write and drop
+      both the device buffer and the copy, taking the batch path from three
+      resident copies to two. It is still gated on evidence like everything
+      else.
     """
     if role < 0 or role >= N_ROLES:
         raise Error("unknown buffer role ", role)
@@ -389,6 +419,9 @@ def structural_support(role: Int, route: Int) raises -> Int:
             return BLOCK_DEVICE_WRITTEN_ATOMICS
         return ELIGIBLE
 
+    # ROLE_BATCH_BINS is deliberately not in this test: its bytes already
+    # live in a pinned buffer the predictor owns, so it is the one
+    # bins-shaped role whose source is device-visible.
     if role == ROLE_BINS or role == ROLE_VALID_BINS:
         if route == ROUTE_HOST_DIRECT:
             return BLOCK_SOURCE_NOT_DEVICE_VISIBLE
@@ -712,7 +745,11 @@ struct Footprint(Copyable, Movable):
 
 
 def role_element_bytes(role: Int) raises -> Int:
-    if role == ROLE_BINS or role == ROLE_VALID_BINS:
+    if (
+        role == ROLE_BINS
+        or role == ROLE_VALID_BINS
+        or role == ROLE_BATCH_BINS
+    ):
         return 1
     if role == ROLE_ROW_SEED:
         return 4
@@ -727,7 +764,11 @@ def role_elements(
     """How many elements a role's buffer holds for one dataset shape."""
     if n_rows < 1 or n_features < 1 or n_bins < 1:
         raise Error("footprint needs positive rows, features, and bins")
-    if role == ROLE_BINS or role == ROLE_VALID_BINS:
+    if (
+        role == ROLE_BINS
+        or role == ROLE_VALID_BINS
+        or role == ROLE_BATCH_BINS
+    ):
         return n_rows * n_features
     if role == ROLE_GRAD or role == ROLE_HESS or role == ROLE_ROW_SEED:
         return n_rows
@@ -752,7 +793,16 @@ def role_uses(role: Int, n_rounds: Int, n_nodes_per_round: Int) raises -> Int:
         raise Error("footprint needs at least one round and one node")
     if role == ROLE_BINS or role == ROLE_VALID_BINS:
         return 1
-    if role == ROLE_GRAD or role == ROLE_HESS or role == ROLE_ROW_SEED:
+    if role == ROLE_BATCH_BINS:
+        # Once per scored batch, and a caller scoring in batches calls this
+        # once per batch rather than passing a batch count.
+        return 1
+    if role == ROLE_GRAD or role == ROLE_HESS:
+        return n_rounds
+    if role == ROLE_ROW_SEED:
+        # Once per tree rather than once per round. They differ under
+        # multiclass, which grows one tree per class per round, so a
+        # multiclass caller passes the tree count as `n_rounds` here.
         return n_rounds
     if role == ROLE_HIST_OUT:
         return n_rounds * n_nodes_per_round
@@ -810,12 +860,15 @@ struct SourceDuplication(Copyable, Movable):
     """How many host-side copies of the caller's data a path holds, before
     any device allocation is counted.
 
-    This is the accounting a route choice does *not* change, and it is listed
-    because it is larger than anything a route choice does change. The
-    training path holds the caller's `List[UInt8]` and the device buffer. The
-    scoring path in `gpu_predict.mojo` holds the caller's list, a pinned
-    staging buffer, and the device buffer, for three copies of the same
-    matrix, and on a unified pool all three are the same DRAM.
+    Mostly this is accounting a route choice does *not* change, and it is
+    listed because it is larger than anything a route choice does change.
+    Training and validation both hold the caller's `List[UInt8]` and one
+    device buffer. Batch scoring holds three copies of the same matrix, and
+    that is the one a route choice could reduce, for the reason
+    `structural_support` gives.
+
+    On a unified pool every one of these copies is the same DRAM, which is
+    why counting them is the memory question and the route is not.
     """
 
     var caller_copies: Int
@@ -838,9 +891,31 @@ def training_bins_duplication() -> SourceDuplication:
     return SourceDuplication(1, 0, 1)
 
 
-def scoring_bins_duplication() -> SourceDuplication:
-    """`gpu_predict.mojo`: caller's list, a pinned `stage_bins`, and a device
-    buffer."""
+def validation_bins_duplication() -> SourceDuplication:
+    """`GpuPredictor.upload_validation`: caller's list plus one device buffer,
+    the same shape as training.
+
+    The validation buffer is sized to exactly the validation matrix, so the
+    upload reads the caller's list directly and needs no staging copy. This
+    one is resident *alongside* the training matrix, not instead of it, so a
+    fit that scores a held-out set holds four copies of two matrices.
+    """
+    return SourceDuplication(1, 0, 1)
+
+
+def batch_scoring_bins_duplication() -> SourceDuplication:
+    """`GpuPredictor.upload_bins`: caller's list, the pinned `stage_bins`, and
+    the device buffer.
+
+    The third copy is not an oversight. `bins_dev` is sized to the high-water
+    batch rather than to this batch, and `enqueue_copy` moves a whole buffer,
+    so copying from the caller's exactly-sized list would read past its end.
+    Removing the copy means either a sub-range copy (no such API is verified
+    here) or sizing the device buffer to each batch, which trades the copy for
+    an allocation per batch. This is also the one path where a shared route
+    could remove it instead, because the staged bytes are already in a
+    runtime allocation the predictor owns.
+    """
     return SourceDuplication(1, 1, 1)
 
 

@@ -337,10 +337,11 @@ def _batch_hist_shared_kernel(
 
     var b = tid
     while b < nb:
-        sc[unsafe_offset=b] = 0
+        var bi = Int(b)
+        sc[unsafe_offset=bi] = 0
         for c in range(kc):
-            sg[unsafe_offset = c * nb + b] = 0
-            sh[unsafe_offset = c * nb + b] = 0
+            sg[unsafe_offset = c * nb + bi] = 0
+            sh[unsafe_offset = c * nb + bi] = 0
         b += block_dim.x
     barrier()
 
@@ -378,19 +379,20 @@ def _batch_hist_shared_kernel(
     var base = f * nb
     b = tid
     while b < nb:
-        if sc[unsafe_offset=b][0] != 0:
+        var bi = Int(b)
+        if sc[unsafe_offset=bi][0] != 0:
             for c in range(kc):
                 _ = Atomic.fetch_add(
-                    out_hist.unsafe_offset(c * hs + base + b),
-                    sg[unsafe_offset = c * nb + b][0],
+                    out_hist.unsafe_offset(c * hs + base + bi),
+                    sg[unsafe_offset = c * nb + bi][0],
                 )
                 _ = Atomic.fetch_add(
-                    out_hist.unsafe_offset((Int(cap) + c) * hs + base + b),
-                    sh[unsafe_offset = c * nb + b][0],
+                    out_hist.unsafe_offset((Int(cap) + c) * hs + base + bi),
+                    sh[unsafe_offset = c * nb + bi][0],
                 )
             _ = Atomic.fetch_add(
-                out_hist.unsafe_offset(2 * Int(cap) * hs + base + b),
-                sc[unsafe_offset=b][0],
+                out_hist.unsafe_offset(2 * Int(cap) * hs + base + bi),
+                sc[unsafe_offset=bi][0],
             )
         b += block_dim.x
 
@@ -719,6 +721,10 @@ struct GpuClassBatch(Movable):
     var n_slots: Int
     var has_gradients: Bool
     var has_scales: Bool
+    var last_counts_shared: Bool
+    """Whether the most recent enqueue wrote one count plane for the batch
+    or one per class. A `3 * cap` allocation accepts both kernels, so the
+    extraction has to read the flag rather than the allocation."""
 
     def __init__(
         out self,
@@ -760,6 +766,7 @@ struct GpuClassBatch(Movable):
         self.n_slots = n_features
         self.has_gradients = False
         self.has_scales = False
+        self.last_counts_shared = shared_counts
 
         var hist_size = n_features * n_bins
         var planes = 3 * cap
@@ -825,7 +832,7 @@ struct GpuClassBatch(Movable):
         produced, so the memory the planner budgeted is the memory the
         session takes."""
         plan.check()
-        return GpuClassBatch(
+        var batch = GpuClassBatch(
             ctx,
             n_rows,
             n_features,
@@ -833,6 +840,7 @@ struct GpuClassBatch(Movable):
             plan.batch_size,
             plan.shared_counts,
         )
+        return batch^
 
     @always_inline
     def hist_size(self) -> Int:
@@ -993,10 +1001,11 @@ struct GpuClassBatch(Movable):
                 "every class in a batch must scan the same number of"
                 " features; the count is the launch's feature stride"
             )
+        var base = slot * self.n_features
         with self.feat_dev.map_to_host() as host:
             var dst = host.unsafe_ptr()
             for i in range(len(features)):
-                dst.unsafe_store(slot * self.n_features + i, Int32(features[i]))
+                dst.unsafe_store(base + i, Int32(features[i]))
 
     def set_features_uniform(
         mut self, features: List[Int], k_count: Int
@@ -1047,7 +1056,7 @@ struct GpuClassBatch(Movable):
 
     def enqueue_shared_histogram[
         bins_origin: MutOrigin,
-        rows_origin: MutOrigin, //,
+        rows_origin: MutOrigin, //
     ](
         mut self,
         bins: MutPointer[UInt8, bins_origin],
@@ -1094,6 +1103,7 @@ struct GpuClassBatch(Movable):
             raise Error("rows per tile must be positive")
 
         self._zero_output()
+        self.last_counts_shared = True
         if count == 0:
             return
         var n_tiles = (count + rows_per_tile - 1) // rows_per_tile
@@ -1119,7 +1129,7 @@ struct GpuClassBatch(Movable):
 
     def enqueue_ranged_histogram[
         bins_origin: MutOrigin,
-        rows_origin: MutOrigin, //,
+        rows_origin: MutOrigin, //
     ](
         mut self,
         bins: MutPointer[UInt8, bins_origin],
@@ -1164,6 +1174,7 @@ struct GpuClassBatch(Movable):
             raise Error("rows per tile must be positive")
 
         self._zero_output()
+        self.last_counts_shared = False
         if max_count == 0:
             return
         var n_tiles = (max_count + rows_per_tile - 1) // rows_per_tile
@@ -1208,6 +1219,11 @@ struct GpuClassBatch(Movable):
         path would have produced.
         """
         self._check_slot(slot)
+        if not self.has_scales:
+            raise Error(
+                "the batch has no fixed-point scales, so its integer cells"
+                " cannot be dequantized; call refresh_scales"
+            )
         var hist_size = self.hist_size()
         var g = _zeroed_f64(hist_size)
         var h = _zeroed_f64(hist_size)
@@ -1221,7 +1237,7 @@ struct GpuClassBatch(Movable):
         var g_base = slot * hist_size
         var h_base = (self.cap + slot) * hist_size
         var c_base = (2 * self.cap + slot) * hist_size
-        if self.shared_counts:
+        if self.last_counts_shared:
             c_base = 2 * self.cap * hist_size
         for i in range(hist_size):
             gp.unsafe_store(i, Float64(src.unsafe_load(g_base + i)) * g_inv)

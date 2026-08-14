@@ -43,17 +43,23 @@ Install kinds
 kinds have different first-use costs and different failure modes:
 
 - **source build**: `bindings/build.sh` wrote `_mojoboost.so` next to this
-  file, and the extension resolves the four MAX runtime dylibs through an
-  absolute rpath into the pixi environment that built it. Moving or
-  deleting that environment breaks the import.
-- **wheel**: `packaging/build_wheel.sh` bundled those dylibs into
-  `mojoboost/.dylibs` and rewrote the rpath to `@loader_path/.dylibs`, so
-  the loader stays inside the package. Nothing outside it is consulted.
+  file, and the extension resolves the MAX runtime through an absolute
+  rpath into the pixi environment that built it. Moving or deleting that
+  environment breaks the import.
+- **wheel, `dylibs` layout**: `packaging/build_wheel.sh` bundled the four
+  MAX runtime dylibs into `mojoboost/.dylibs` and rewrote the rpath to
+  `@loader_path/.dylibs`, so the loader stays inside the package.
+- **wheel, `libs` layout**: `packaging/linux/build_wheel_linux.sh` staged
+  the ELF closure into `mojoboost/.libs` by soname and set the RPATH to
+  `$ORIGIN/.libs`. The staged set is whatever the closure turned out to
+  be, not a fixed list, which is why `missing_runtime_libs` applies only
+  to the macOS layout.
 
-The distinction is visible without loading anything: a `.dylibs`
-directory next to the extension means the wheel layout. What that layout
-implies for load time, and what `tools/inspect_startup_artifacts.py`
-reports about it, is in the startup document.
+The distinction is visible without loading anything: a `.dylibs` or
+`.libs` directory next to the extension means the wheel layout, and which
+one it is names the builder. What that implies for load time, and what
+`tools/inspect_startup_artifacts.py` reports about it, is in the startup
+document.
 """
 
 import os
@@ -293,35 +299,65 @@ class InstallDescription:
 
     `kind` is one of:
 
-    - `"wheel"`: a `.dylibs` (or `.libs`) directory sits next to the
-      extension, so the runtime libraries travel with the package.
+    - `"wheel"`: a staged runtime directory sits next to the extension, so
+      the runtime libraries travel with the package.
     - `"source"`: the extension is present with no bundled runtime, which
       is what `bindings/build.sh` produces. It resolves its dependencies
       through an absolute rpath into the environment that built it.
     - `"absent"`: no extension. Every native phase is unmeasurable and
       `import mojoboost` fails.
 
+    `runtime_layout` distinguishes the two builders, which stage different
+    things and must not be checked against each other:
+
+    - `"dylibs"`, from `packaging/build_wheel.sh` on macOS, holds exactly
+      the four MAX runtime dylibs.
+    - `"libs"`, from `packaging/linux/build_wheel_linux.sh`, holds the ELF
+      closure staged by soname, so the names carry version suffixes and
+      the set is whatever the closure turned out to be.
+
     Nothing here loads the extension to decide, so the description is
     valid even when importing it would fail, which is precisely when
     somebody needs it.
     """
 
-    __slots__ = ("kind", "package_dir", "extension", "runtime_dir", "bundled")
+    __slots__ = (
+        "kind",
+        "package_dir",
+        "extension",
+        "runtime_dir",
+        "runtime_layout",
+        "bundled",
+    )
 
-    def __init__(self, kind, package_dir, extension, runtime_dir, bundled):
+    def __init__(
+        self,
+        kind,
+        package_dir,
+        extension,
+        runtime_dir,
+        bundled,
+        runtime_layout=None,
+    ):
         self.kind = kind
         self.package_dir = package_dir
         self.extension = extension
         self.runtime_dir = runtime_dir
+        self.runtime_layout = runtime_layout
         self.bundled = tuple(bundled)
 
     @property
     def missing_runtime_libs(self):
-        """Bundled-layout libraries that are not present. Empty for a
-        source install, where none are expected."""
-        if self.kind != "wheel":
+        """MAX runtime libraries absent from a macOS bundle.
+
+        Empty for anything but the `dylibs` layout. The Linux builder
+        stages an ELF closure rather than a fixed list of four, so
+        applying this list to it would report every correct Linux wheel as
+        broken.
+        """
+        if self.runtime_layout != "dylibs":
             return ()
-        have = {os.path.splitext(name)[0] for name in self.bundled}
+        have = {_library_stem(name) for name in self.bundled}
         return tuple(
             name for name in BUNDLED_RUNTIME_LIBS if name not in have
         )
@@ -332,12 +368,26 @@ class InstallDescription:
             "package_dir": self.package_dir,
             "extension": self.extension,
             "runtime_dir": self.runtime_dir,
+            "runtime_layout": self.runtime_layout,
             "bundled": list(self.bundled),
             "missing_runtime_libs": list(self.missing_runtime_libs),
         }
 
     def __repr__(self):
         return "<InstallDescription %s>" % self.kind
+
+
+def _library_stem(filename):
+    """`libfoo` from `libfoo.dylib`, `libfoo.so`, or `libfoo.so.1.2`.
+
+    `os.path.splitext` is wrong for the ELF case: it turns `libfoo.so.1`
+    into `libfoo.so`, so a name comparison against it never matches.
+    """
+    for marker in (".dylib", ".so"):
+        at = filename.find(marker)
+        if at > 0:
+            return filename[:at]
+    return filename
 
 
 def _extension_candidates(package_dir):
@@ -370,11 +420,13 @@ def describe_install(package_dir=None):
         os.path.join(package_dir, candidates[0]) if candidates else None
     )
     runtime_dir = None
+    runtime_layout = None
     bundled = []
-    for name in (".dylibs", ".libs"):
+    for name, layout in ((".dylibs", "dylibs"), (".libs", "libs")):
         path = os.path.join(package_dir, name)
         if os.path.isdir(path):
             runtime_dir = path
+            runtime_layout = layout
             try:
                 bundled = sorted(os.listdir(path))
             except OSError:
@@ -387,7 +439,7 @@ def describe_install(package_dir=None):
     else:
         kind = "source"
     return InstallDescription(
-        kind, package_dir, extension, runtime_dir, bundled
+        kind, package_dir, extension, runtime_dir, bundled, runtime_layout
     )
 
 

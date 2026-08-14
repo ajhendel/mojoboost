@@ -28,7 +28,10 @@ Cumulative, each level a superset of the one below:
   contiguous aligned run of row ids. Needs the packed kernel variant and a
   device that has shown the wide load pays.
 - `SPEC_LEVEL_BATCHED` -- additionally covers several small leaves in one
-  launch. Needs the batched kernel variant.
+  launch. Needs the batched kernel variant. The launch itself is planned by
+  `gpu_leaf_batching.plan_batch`, which owns the tile sharing, the partial
+  buffer bound, and the kernels; this module contributes only the decision of
+  whether a frontier wants batching at all.
 
 Fallback order, applied in this order and reported on the plan
 --------------------------------------------------------------
@@ -53,10 +56,10 @@ asked for.
 `HistogramPlan.level_applied` is a contiguous position on that ladder, and
 it is a statement about **one node**: a node whose rows are not a contiguous
 run stops at `SPEC_LEVEL_SHAPE` however capable the build is. Batching is a
-decision across nodes, so `plan_batched_leaves` gates on `level_requested`
-and `KernelFeatures` rather than on `level_applied`; otherwise a frontier
-would lose its batching because one node in it happened not to be
-contiguous.
+decision across nodes, so `batching_declined_reason` gates on
+`level_requested` and `KernelFeatures` rather than on `level_applied`;
+otherwise a frontier would lose its batching because one node in it happened
+not to be contiguous.
 
 What this module will not decide
 --------------------------------
@@ -98,17 +101,13 @@ from .apple_gpu_policy import (
     partial_budget_bytes,
 )
 from .gpu_histogram_specializations import (
-    MAX_BATCH_LEAVES,
-    MIN_BATCH_LEAVES,
     WINDOW_NOT_A_RUN,
     WINDOW_OK,
     DeviceHistogramCapabilities,
     KernelFeatures,
-    LeafBatch,
     PackedLoadWindow,
     bin_capacity_for,
     kernel_shared_bytes,
-    plan_leaf_batches,
     plan_packed_window,
     unspecialized_kernel_shared_bytes,
 )
@@ -137,6 +136,11 @@ comptime SPEC_LEVEL_SHAPE = 1
 comptime SPEC_LEVEL_PACKED = 2
 comptime SPEC_LEVEL_BATCHED = 3
 
+# A frontier below this many leaves is not a batch. The upper bound on a
+# batch is not a policy question and is not set here: `gpu_leaf_batching`
+# owns it, along with everything else about how a batch is laid out.
+comptime MIN_BATCH_LEAVES = 2
+
 # Why a plan stopped where it did.
 comptime REASON_AS_REQUESTED = 0
 comptime REASON_NOT_REQUESTED = 1
@@ -146,7 +150,6 @@ comptime REASON_ROWS_NOT_A_RUN = 4
 comptime REASON_WINDOW_UNUSABLE = 5
 comptime REASON_SHARED_MEMORY = 6
 comptime REASON_SINGLE_LEAF_FILLS_DEVICE = 7
-comptime REASON_PARTIAL_BUDGET = 8
 
 
 def level_name(level: Int) -> String:
@@ -178,8 +181,6 @@ def reason_name(reason: Int) -> String:
         return String("threadgroup_memory_too_small")
     if reason == REASON_SINGLE_LEAF_FILLS_DEVICE:
         return String("single_leaf_already_fills_device")
-    if reason == REASON_PARTIAL_BUDGET:
-        return String("partial_buffer_budget")
     return String("unknown")
 
 
@@ -493,11 +494,12 @@ def derive_histogram_plan(
     if level > SPEC_LEVEL_BATCHED:
         level = SPEC_LEVEL_BATCHED
 
+    # Every rung below either reaches the level asked for or overwrites this
+    # with the check that stopped it, so `REASON_AS_REQUESTED` is the state
+    # of a plan that has not yet been refused anything.
     var capacity = bin_capacity_for(work.n_bins)
     var applied = SPEC_LEVEL_BASELINE
-    var reason = REASON_NOT_REQUESTED
-    if level == SPEC_LEVEL_BASELINE:
-        reason = REASON_AS_REQUESTED
+    var reason = REASON_AS_REQUESTED
 
     # --- Level 1: geometry from reported properties and the node's shape ---
 
@@ -625,9 +627,10 @@ def derive_histogram_plan(
     # `level_applied` is a contiguous ladder position, so this level is only
     # reached when the packed one was. That is a statement about this node,
     # and batching is a decision across nodes, which is why
-    # `plan_batched_leaves` gates on `level_requested` and `KernelFeatures`
-    # instead: a frontier must not lose its batching because one node's rows
-    # happened not to be contiguous.
+    # `batching_declined_reason` gates on `level_requested` and
+    # `KernelFeatures` instead: a frontier must not lose its batching because
+    # one node's rows happened not to be contiguous. The launch a batched
+    # frontier gets is `gpu_leaf_batching.plan_batch`'s, not this plan's.
     if level >= SPEC_LEVEL_BATCHED and applied >= SPEC_LEVEL_PACKED:
         if not features.batched_leaf_kernel:
             reason = REASON_KERNEL_ABSENT
@@ -655,53 +658,39 @@ def derive_histogram_plan(
     )
 
 
-def max_batch_leaves(
-    plan: HistogramPlan, device: DeviceHistogramCapabilities
-) -> Int:
-    """Leaves one batched launch may cover.
-
-    Three bounds. The portable batch ceiling, the device's third grid
-    dimension, and, on the tiled strategy, what the partial buffer holds: a
-    batched tiled launch needs one partial histogram per (leaf, tile), so the
-    budget that bounded `n_tiles` now has to cover `n_leaves * n_tiles` of
-    them. The atomic strategy allocates no partial buffer and so has only the
-    first two bounds.
-    """
-    var bound = MAX_BATCH_LEAVES
-    if device.max_grid_dim_z < bound:
-        bound = device.max_grid_dim_z
-    if plan.strategy == STRATEGY_TILED and plan.partial_cells > 0:
-        var by_memory = plan.partial_cell_limit // plan.partial_cells
-        if by_memory < bound:
-            bound = by_memory
-    if bound < 1:
-        bound = 1
-    return bound
-
-
 def batching_declined_reason(
     plan: HistogramPlan,
     profile: GpuProfile,
-    device: DeviceHistogramCapabilities,
     features: KernelFeatures,
     row_counts: List[Int],
     n_slots: Int,
 ) raises -> Int:
     """Why a frontier will not be batched, or `REASON_AS_REQUESTED` when it
-    will."""
+    wants to be.
+
+    This is a decision, not a plan. It answers the one question that belongs
+    to a launch policy, which is whether this frontier leaves the device
+    underfilled, and it deliberately does not group the leaves, hand out
+    tiles, or size a partial buffer. `gpu_leaf_batching.plan_batch` does all
+    three, from the same `DeviceCaps` and the same amortization constants,
+    and a second planner here that disagreed with it by a tile would be worse
+    than no planner at all.
+
+    `row_counts` is the frontier in launch order. A count below one is read
+    as one, matching `GpuActiveRows.range_tiling`.
+    """
+    if n_slots < 1:
+        raise Error("batching needs at least one active feature")
     if plan.level_requested < SPEC_LEVEL_BATCHED:
         return REASON_NOT_REQUESTED
     if not features.batched_leaf_kernel:
         return REASON_KERNEL_ABSENT
-    if device.max_grid_dim_z < MIN_BATCH_LEAVES:
-        return REASON_DEVICE_UNPROVEN
-    if max_batch_leaves(plan, device) < MIN_BATCH_LEAVES:
-        return REASON_PARTIAL_BUDGET
     if len(row_counts) < MIN_BATCH_LEAVES:
         return REASON_SINGLE_LEAF_FILLS_DEVICE
-    if n_slots < 1:
-        raise Error("batching needs at least one active feature")
 
+    # One leaf too small to fill the device on its own is the whole case for
+    # batching. A frontier where every leaf already fills it has nothing to
+    # gain and would only pay the packed tile axis's binary search.
     var target = profile.core_count * plan.resident_blocks_per_core
     for i in range(len(row_counts)):
         var rows = row_counts[i]
@@ -711,47 +700,6 @@ def batching_declined_reason(
         if n_slots * tiles < target:
             return REASON_AS_REQUESTED
     return REASON_SINGLE_LEAF_FILLS_DEVICE
-
-
-def plan_batched_leaves(
-    plan: HistogramPlan,
-    profile: GpuProfile,
-    device: DeviceHistogramCapabilities,
-    features: KernelFeatures,
-    row_counts: List[Int],
-    n_slots: Int,
-) raises -> List[LeafBatch]:
-    """Group a frontier of leaves into batched launches, or return an empty
-    list when the frontier will not be batched.
-
-    An empty list is the instruction to launch exactly as today, one leaf at
-    a time; it is never an error. `batching_declined_reason` says which check
-    refused.
-
-    The grouping itself is `plan_leaf_batches`, which preserves order and
-    never merges leaves. Each leaf keeps its own output slice and its own
-    accumulation, so a batched frontier produces the same histograms the
-    unbatched one does, bit for bit.
-    """
-    var out = List[LeafBatch]()
-    if (
-        batching_declined_reason(
-            plan, profile, device, features, row_counts, n_slots
-        )
-        != REASON_AS_REQUESTED
-    ):
-        return out^
-    var target = profile.core_count * plan.resident_blocks_per_core
-    if target < 1:
-        target = 1
-    var batches = plan_leaf_batches(
-        row_counts,
-        n_slots,
-        plan.rows_per_tile,
-        target,
-        max_batch_leaves(plan, device),
-    )
-    return batches^
 
 
 def _yes_no(value: Bool) -> String:
