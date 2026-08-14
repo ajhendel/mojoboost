@@ -448,6 +448,23 @@ requires_files = ["tests/test_missing.mojo"]
 provenance = "ci"
 proves = "That NaN routes to the learned default direction on both backends and survives serialization."
 
+# The only suite that imports mojoboost.binning directly. It carries its own
+# path toggle: `_fit_both_ways` fits every fixture twice, once through rank
+# selection and once through the full sort, by moving
+# MOJOBOOST_BINNING_SELECT_MIN_ROWS, and asserts the two agree edge for edge.
+# So one job covers both implementations and there is no second entry for the
+# sort path. It also sweeps worker counts, which is why it is dearer than a
+# native job's default guess.
+[[job]]
+id = "native:binning"
+tier = "native"
+title = "Quantile binning"
+command = "pixi run mojo run -I src tests/test_binning.mojo"
+requires_files = ["tests/test_binning.mojo"]
+budget_seconds = 120
+provenance = "ci"
+proves = "That the selected and sorted quantile paths resolve the same edges, that a column with no more distinct values than bins gets one bin per level, that ties cut where their run ends, and that bins do not move with the worker count."
+
 [[job]]
 id = "native:sparse"
 tier = "native"
@@ -619,6 +636,30 @@ command = "pixi run mojo run -I src tests/parallel/test_gpu_split_search.mojo"
 requires_files = ["tests/parallel/test_gpu_split_search.mojo"]
 provenance = "ci"
 proves = "That device-side split selection picks the split the CPU scan picks, including under monotone and categorical rules."
+
+# Listed rather than omitted so the gap has an entry instead of a silence,
+# which is the same reason distributed:two-process is here. The suite exists
+# on disk and no pixi task runs it, so it has never run in CI and running it
+# by hand is not what this planner is for: a job whose command is not the
+# repository's own entry point would be this file inventing a way to run a
+# test, and the next person would not find it from pixi.toml. Patch P4 in
+# handoffs/remaining_14_validation_plan.md adds it to the test chain, at which
+# point this entry becomes an ordinary native job.
+#
+# tools/check_parity.py does not catch this one. Its unwired-suite check reads
+# suites cited in docs/LIGHTGBM_PARITY.md, and nothing cites this file, so an
+# uncited suite that no task runs passes both checks. --self-check now catches
+# the mirror case (a suite the chain runs that no job names); this direction is
+# reported by --coverage.
+[[job]]
+id = "native:gpu-split-policy"
+tier = "native"
+title = "GPU split policy"
+blocked = true
+blocked_reason = "tests/parallel/test_gpu_split_policy.mojo is in no pixi task, so there is no repository entry point to call. Patch P4 adds one."
+requires_files = ["tests/parallel/test_gpu_split_policy.mojo"]
+provenance = "unverified"
+proves = "Nothing yet. No task runs this suite, so it has never run here or in CI."
 
 [[job]]
 id = "native:lgbm-model-io"

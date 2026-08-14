@@ -14,6 +14,19 @@ someone reading source, and section 6 says what follows from that. Every
 mapping from a changed file to a command was derived statically, by the method
 in section 3, and section 3 also says what that method cannot see.
 
+The map was revised on 2026-08-14 against a tree that had moved under it, and
+because the planner still may not be run, that revision was a hand audit: the
+same cross-references `--self-check` makes, made with `grep` and read by eye.
+It found three things, all now fixed or recorded in section 7. A suite in the
+test chain that no job named, which made the binning subsystem plan without its
+own tests. A suite on disk that no task runs, which two separate checks were
+each structurally unable to see. And 42 handoff entries pointing into a
+directory a coordinator had deliberately deleted, which would have made the
+first real `--self-check` run fail 42 times for no defect at all. The first of
+those is now a `--self-check` failure in its own right, so the next one costs a
+command instead of an audit. What that audit could not do is prove the planner
+runs; see section 8.
+
 This is not `docs/VALIDATION_CONTRACT.md`. That document is about validating
 *user input* to the library. This one is about validating *the library* after
 an edit. The two words collide and nothing else about them does.
@@ -145,27 +158,39 @@ All four live in `validation/manifests/`, are TOML, and are read with
 **`tiers.toml`** declares the nine tiers, the budget defaults, the mutual
 exclusion classes, and the lock wrapper. Nine `[[tier]]` entries.
 
-**`jobs.toml`** is the command table. 119 `[[job]]` entries, keyed `tier:name`,
+**`jobs.toml`** is the command table. 121 `[[job]]` entries, keyed `tier:name`,
 each with a `command`, a `requires_files` list that `--self-check` verifies
 exists, a `provenance` of `ci`, `documented`, or `unverified`, a `proves`
-sentence, and where its output is filed. Distribution by tier is native 44,
+sentence, and where its output is filed. Distribution by tier is native 46,
 python 18, static 14, differential 10, wheel 8, hardware 8, broad 8, smoke 5,
-distributed 4. Every one of the 47 Mojo suites and all 17 pytest files is named
-by exactly one job. One job, `distributed:two-process`, carries `blocked = true`
-and no command, because `docs/DISTRIBUTED_TRANSPORT.md` section 1 states that
-nothing in this repository has moved a byte between two processes. It is listed
-rather than omitted so the gap has an entry instead of a silence.
+distributed 4. All 49 Mojo suites and all 17 pytest files are named by exactly
+one job. Two jobs carry `blocked = true` and no command:
+`distributed:two-process`, because `docs/DISTRIBUTED_TRANSPORT.md` section 1
+states that nothing in this repository has moved a byte between two processes,
+and `native:gpu-split-policy`, because no pixi task runs that suite. Both are
+listed rather than omitted so the gap has an entry instead of a silence.
 
 **`subsystems.toml`** is the map from section 3. 46 `[[subsystem]]` entries,
 each with `paths`, `jobs`, and `escalate`, plus 6 `[[gap]]` entries.
 
 **`handoffs.toml`** answers the other question a coordinator asks, which is not
 "what did I change" but "I just applied the patches from handoff X, what now".
-42 `[[handoff]]` entries covering the handoff directory, grouped where several
-handoffs share a job set, and 15 `[[lane]]` entries for the remaining-parity
-lanes. A lane whose file does not exist yet is reported as pending, not as an
-error, because these lanes are written in parallel and a missing file means
-"not yet", not "wrong".
+42 `[[handoff]]` entries, grouped where several handoffs share a job set, and 15
+`[[lane]]` entries for the remaining-parity lanes. A lane whose file does not
+exist yet is reported as pending, not as an error, because these lanes are
+written in parallel and a missing file means "not yet", not "wrong".
+
+The handoff directory those 42 entries name is gone. Commit `21ff9fa`, "Remove
+obsolete handoff documents", deleted `handoffs/` after this manifest was
+written, which under the original rule made `--self-check` emit 42 failures for
+one decision somebody made on purpose. The entries are kept and an `[archive]`
+table now declares the retirement, so a missing path under that prefix is
+reported as retired, once, in a note. The reasoning is in the file's own header:
+the mapping is the durable half and the memo was the transient one, so "you
+applied the leaf-batching work, run these jobs" is still the right answer with
+the memo deleted. An entry whose file comes back is checked again with no edit,
+because the rule keys on the file being absent rather than on the entry being
+disbelieved, and any `[[handoff]]` outside the retired prefix still fails.
 
 ## 5. Using the planner
 
@@ -193,10 +218,26 @@ exclusion class. Output is `--format text|json|sh`, optionally to `--out`, with
 Three checks act on the manifests rather than on the tree.
 `--self-check` validates every cross-reference, every `requires_files` path,
 every `pixi run` task name against the tasks actually declared in `pixi.toml`,
-and every `MOJOBOOST_*` variable against the documented env contract, and exits
-1 on any problem. `--coverage` reports what the manifests do not name, as notes,
-never as failures. `--list-tiers`, `--list-jobs`, and `--list-subsystems` dump
-the tables.
+every `MOJOBOOST_*` variable against the documented env contract, and that every
+Mojo suite the pixi task chain runs is named by some job, and exits 1 on any
+problem. `--coverage` reports what the manifests do not name, as notes, never as
+failures. `--list-tiers`, `--list-jobs`, and `--list-subsystems` dump the
+tables.
+
+That suite rule is the one check here that is a failure rather than a note, and
+the asymmetry is deliberate. A new module nothing maps yet is normal; this tree
+grows faster than any manifest in it, so `--coverage` says so and moves on. A
+suite in `pixi.toml` is different, because putting it there is a statement that
+it belongs to the checkable whole. A map that has not caught up with one is not
+incomplete, it is wrong, and it is wrong in the direction that matters: it tells
+somebody their change needs no test when a test for it exists and runs on every
+push.
+
+That is not hypothetical. `tests/test_binning.mojo` was added to the test chain,
+and until it was found by hand it was named by no job, so a plan for a change to
+`src/mojoboost/binning.mojo` returned `native:kernels`, `native:trainset`, and
+`native:histogram-reference`, and not one of them is the binning suite. The rule
+exists so the next one costs a failing `--self-check` instead of an audit.
 
 ### 5.1 The emitted script
 
@@ -316,6 +357,38 @@ earlier. Patch P1 is the small change to the wrapper that reads it.
 **One distributed job is blocked outright.** `distributed:two-process` has no
 command because no two-process path exists. See section 4.
 
+**`tests/parallel/test_gpu_split_policy.mojo` is run by nothing.** The suite is
+on disk and no task in `pixi.toml` names it, so it has never run here or in CI.
+`tools/check_parity.py` does not catch it either: its unwired-suite check reads
+the suites cited in `docs/LIGHTGBM_PARITY.md`, nothing cites this file, and
+`KNOWN_UNWIRED_TESTS` is empty, so an uncited suite that no task runs passes
+both checks. It is `native:gpu-split-policy` here, `blocked = true`, with
+`provenance = "unverified"` and a `proves` that says it proves nothing yet.
+Giving it a command in this file was the wrong fix, because a job that invents
+its own way to run a test is one the next person will not find from `pixi.toml`.
+Patch P4 adds it to the test chain, after which the entry becomes ordinary.
+
+**`MOJOBOOST_BINNING_SELECT_MIN_ROWS` is not in the README env contract.**
+`src/mojoboost/binning.mojo` reads it and both that module and
+`src/mojoboost/parallel.mojo` document it in their docstrings, but the README
+list that `--self-check` treats as the contract does not have it. It is
+scheduling-only, in the sense that both paths it selects between resolve the
+same edges, and `tests/test_binning.mojo` asserts that on both sides of the
+threshold. No job here sets it, precisely because that suite already sweeps it
+itself, so nothing in these manifests is broken by the omission. It is recorded
+because the next lane to reach for a documented knob will not find it. Patch P5.
+
+**The binning subsystem pointed at three suites, none of them the binning
+suite.** Fixed here, and worth writing down because of how it was found rather
+than what it was. `native:sparse` was promoted from an escalation into the
+minimum for the binning subsystem at the same time, on evidence rather than
+suspicion: `sparse.fit_bins_csc` reimplements the rank walk over an implied
+dense column, and on 2026-08-14 a rule added to the dense binner and not to that
+one made the two disagree. `test_sparse_binning_matches_dense_exactly` was the
+only thing in the tree that noticed. A change to `binning.mojo` that does not
+touch `sparse.mojo` is exactly the change that breaks that pair, so it cannot be
+an escalation somebody has to remember to ask for.
+
 ## 8. What this lane did not do
 
 It did not run the planner, any suite, any build, any benchmark, or any CI job.
@@ -323,7 +396,20 @@ It did not commit. It did not edit any file outside `tools/validation_plan.py`,
 `docs/FOCUSED_VALIDATION_PLAN.md`, `validation/manifests/`, and
 `handoffs/remaining_14_validation_plan.md`.
 
-The first person to run `python3 tools/validation_plan.py --self-check` will be
-the first person to execute any of this. That command reads files and exits, it
-is in the `static` tier by its own classification, and its failures are the
-cheapest possible evidence that this map has gone stale.
+That holds for the 2026-08-14 revision too, and it is the load-bearing caveat on
+everything that revision claims. The audit behind it checked the manifests
+against the tree; it did not check the planner against the Python interpreter.
+`tools/validation_plan.py` gained a regular expression, a method, a helper, and
+two branches in `self_check`, and not one line of that has been parsed by
+anything but a reader. The new failure rule is the sharpest illustration of the
+risk: it is asserted to pass on the current tree because the same set difference
+was computed by hand with `comm`, on 48 suites named in `pixi.toml` against 49
+named in `jobs.toml`, and a hand-checked set difference is evidence about the
+manifests, not about whether the code that computes it runs.
+
+So the first person to run `python3 tools/validation_plan.py --self-check` is
+still the first person to execute any of this, and now also the first to find
+out whether the file imports. That command reads files and exits, it is in the
+`static` tier by its own classification, and its failures are the cheapest
+possible evidence that this map has gone stale. If it raises rather than
+reporting, that is this revision's bug and not a stale manifest.

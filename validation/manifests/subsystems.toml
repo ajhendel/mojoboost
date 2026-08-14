@@ -55,9 +55,9 @@ paths = [
     "src/mojoboost/trainset.mojo",
     "src/mojoboost/raw_data.mojo",
 ]
-jobs = ["native:kernels", "native:trainset", "native:histogram-reference"]
-escalate = ["native:categorical", "native:missing", "native:sparse"]
-note = "Bin boundaries move every downstream number, so the histogram reference is part of the minimum here rather than an escalation."
+jobs = ["native:binning", "native:sparse", "native:kernels", "native:trainset", "native:histogram-reference"]
+escalate = ["native:categorical", "native:missing", "native:continued"]
+note = "Bin boundaries move every downstream number, so the histogram reference is part of the minimum here rather than an escalation. native:binning is the only suite that imports mojoboost.binning directly and it was missing from this list until it was noticed by hand. native:sparse was promoted out of the escalations for a demonstrated reason rather than a suspected one: sparse.fit_bins_csc reimplements the rank walk over an implied dense column, so a rule added to the dense binner and not to that one makes the two disagree, and test_sparse_binning_matches_dense_exactly is the only thing in the tree that notices. It caught exactly that on 2026-08-14, when the level rule landed dense-only. A change to binning.mojo that does not touch sparse.mojo is precisely the change this catches, so it cannot be an escalation the operator has to remember to ask for."
 
 [[subsystem]]
 id = "histogram-cpu"
@@ -67,9 +67,9 @@ paths = [
     "src/mojoboost/parallel.mojo",
     "src/mojoboost/histogram_cache_policy.mojo",
 ]
-jobs = ["native:histogram-reference", "native:cpu-parallel"]
+jobs = ["native:histogram-reference", "native:cpu-parallel", "native:binning"]
 escalate = ["differential:threads-1", "differential:threads-max", "broad:bench-threshold"]
-note = "The two thread-count jobs are the ones that catch a race that only shows up at one worker count."
+note = "The two thread-count jobs are the ones that catch a race that only shows up at one worker count. native:binning is in the minimum because parallel.mojo is a dispatch library whose shapes are used, not tested, by the file that defines them: dispatch_feature_rows has exactly one caller, BinMapper.transform, and the suite that sweeps worker counts over it and compares every cell against the serial run is the binning one. test_cpu_parallel covers the dispatch helpers' own arithmetic and would not notice a tiling that dropped a row block."
 
 [[subsystem]]
 id = "split"
@@ -135,9 +135,9 @@ paths = [
     "src/mojoboost/model_sparse.mojo",
     "src/mojoboost/tree_sparse.mojo",
 ]
-jobs = ["native:sparse", "native:monotone"]
+jobs = ["native:sparse", "native:binning", "native:monotone"]
 escalate = ["python:validation", "python:contrib"]
-note = "The Python side of this chain is guarded by pytest.importorskip('scipy.sparse') and the pytest environment installs no scipy, so those escalations skip themselves today. See docs/FOCUSED_VALIDATION_PLAN.md section 7."
+note = "native:binning is here for the same reason native:sparse is in the binning subsystem, in the other direction: sparse.fit_bins_csc is required to produce the edges binning.fit_bins produces, so a change on either side of that pair has to run both. The Python side of this chain is guarded by pytest.importorskip('scipy.sparse') and the pytest environment installs no scipy, so those escalations skip themselves today. See docs/FOCUSED_VALIDATION_PLAN.md section 7."
 
 [[subsystem]]
 id = "serialization"

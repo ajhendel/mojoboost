@@ -17,8 +17,42 @@
 # `--self-check` fails on a [[handoff]] path that does not exist, and prints, but
 # does not fail on, any file in handoffs/ that no entry names. New handoffs land
 # in this repository faster than anything else in it.
+#
+# ---------------------------------------------------------------------------
+# The handoff directory was retired
+#
+# Commit 21ff9fa, "Remove obsolete handoff documents", deleted handoffs/. Every
+# [[handoff]] path below therefore names a file that is no longer in the tree,
+# and the rule in the paragraph above would make --self-check emit 42 failures
+# for one decision somebody made on purpose. A check that cries about a
+# deliberate deletion is a check people learn to skip, and the day it reports a
+# real staleness nobody reads it.
+#
+# So [archive] below declares the retirement, and the planner reports a missing
+# [[handoff]] path as retired, in one note, when the prefix matches. Two things
+# are deliberately preserved by keeping the entries rather than deleting them.
+#
+# The mapping is the durable part. "You applied the leaf-batching work, run
+# these jobs" is still the right answer whether or not the memo that requested
+# it is on disk; the memo was the transient artifact and the job list was not.
+#
+# And a restored file still works. An entry whose path comes back is checked
+# again exactly as before, with no edit here, because the rule keys on the file
+# being absent and not on the entry being disbelieved.
+#
+# A [[handoff]] outside the retired prefix, or one inside it whose file exists
+# and is wrong, still fails. Retirement suppresses one specific known-absent
+# case and nothing else.
+# ---------------------------------------------------------------------------
 
 schema = 1
+
+[archive]
+retired = true
+prefix = "handoffs/"
+commit = "21ff9fa"
+title = "Remove obsolete handoff documents"
+note = "Paths under this prefix that are absent are reported as retired rather than as failures. Delete this table the day handoffs/ comes back as a live directory, and the 42 entries below start failing again until they are pruned to what exists."
 
 # ---------------------------------------------------------------------------
 # GPU algorithms and the Apple lane

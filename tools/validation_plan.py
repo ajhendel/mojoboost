@@ -69,6 +69,7 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import json
+import re
 import shlex
 import subprocess
 import sys
@@ -134,6 +135,7 @@ class Manifests:
         self.gaps = self.subsystems_doc.get("gap", [])
         self.handoffs = self.handoffs_doc.get("handoff", [])
         self.lanes = self.handoffs_doc.get("lane", [])
+        self.archive = self.handoffs_doc.get("archive", {})
 
     def _load(self, name):
         path = self.directory / f"{name}.toml"
@@ -180,6 +182,20 @@ class Manifests:
         if "exclusive" in job:
             return job["exclusive"]
         return self.tier_of(job_id).get("exclusive", "")
+
+    def retired_path(self, path):
+        """True when this path is a known casualty of a deliberate deletion.
+
+        `[archive]` in handoffs.toml names a prefix and the commit that removed
+        it. A path under that prefix which is absent is retired; one which is
+        present is checked normally, so restoring a file needs no edit here.
+        """
+        if not self.archive.get("retired"):
+            return False
+        prefix = normalize(self.archive.get("prefix", ""))
+        if not prefix:
+            return False
+        return normalize(path).startswith(prefix) and not exists(path)
 
     def lock_env(self):
         """The variable the wrapper will read a lock path from, once it does."""
@@ -908,6 +924,21 @@ def pixi_tasks():
     return names
 
 
+SUITE_RE = re.compile(r"tests/(?:parallel/)?test_[A-Za-z0-9_]+\.mojo")
+
+
+def pixi_suites():
+    """Mojo suites some pixi task actually runs.
+
+    A suite named here is one the repository itself considers part of a
+    checkable whole. That is a stronger signal than a file sitting in tests/,
+    which may be a lane's work in progress, and it is the signal --self-check
+    holds the manifests to.
+    """
+    text = (ROOT / "pixi.toml").read_text()
+    return {normalize(m) for m in SUITE_RE.findall(text)}
+
+
 def repo_corpus():
     """Text of the files a MOJOBOOST_* name would be defined in."""
     parts = []
@@ -1047,6 +1078,32 @@ def self_check(man):
                     "does not do what it says"
                 )
 
+    # Every suite the repository's own task chain runs must be reachable from a
+    # job, or the planner under-plans in the one direction that matters: it
+    # tells someone their change needs no test when a test for it exists and
+    # runs on every push.
+    #
+    # This is a failure and not a note on purpose. The other coverage gaps are
+    # notes because the tree grows faster than the map and an unmapped new
+    # module is normal. This one is different: adding a suite to pixi.toml is a
+    # deliberate statement that it belongs to the checkable whole, so a map that
+    # has not caught up is wrong rather than merely incomplete. It is also the
+    # exact case that went unnoticed until it was found by hand:
+    # tests/test_binning.mojo was in the test chain and in no job, so a change
+    # to src/mojoboost/binning.mojo planned three suites, none of them the one
+    # that tests binning.
+    covered_suites = set()
+    for job in man.jobs.values():
+        for path in job.get("requires_files", []):
+            covered_suites.add(normalize(path))
+        covered_suites.update(SUITE_RE.findall(job.get("command", "")))
+    for suite in sorted(pixi_suites() - covered_suites):
+        fail(
+            f"jobs: {suite} is run by a pixi task and named by no job, so a "
+            "change to what it covers plans without it. Add a [[job]] for it "
+            "and put that job in the subsystem that owns the module it imports"
+        )
+
     # the lock table
     wrapper = man.locks.get("wrapper", "")
     if not wrapper:
@@ -1099,14 +1156,30 @@ def self_check(man):
             fail(f"subsystems: the gap for {gap['paths'][0]} has no reason")
 
     # handoffs and lanes
+    retired = []
     for entry in man.handoffs:
         for path in entry["paths"]:
-            if not exists(path):
+            if exists(path):
+                continue
+            if man.retired_path(path):
+                retired.append(normalize(path))
+            else:
                 fail(f"handoffs: {path} does not exist")
         for key in ("jobs", "escalate"):
             for job_id in entry.get(key, []):
                 if job_id not in job_ids:
                     fail(f"handoffs: {entry['paths'][0]} {key} names {job_id}, which is not a job")
+    if retired:
+        # One note for the whole directory, not one per file. The point of the
+        # note is that the mapping outlived the memos, which is a single fact.
+        notes.append(
+            f"{len(retired)} handoff paths were removed by "
+            f"{man.archive.get('commit', 'a deliberate deletion')} "
+            f"({man.archive.get('title', 'handoffs retired')}). Their job "
+            "mappings are kept on purpose; see the header of handoffs.toml. "
+            "--handoff still resolves them, because it matches on names and "
+            "never reads the file."
+        )
     for lane in man.lanes:
         for key in ("jobs", "escalate"):
             for job_id in lane.get(key, []):
