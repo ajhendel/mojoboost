@@ -208,6 +208,28 @@ to describe them as behavior a user gets.
 | `gpu_multiclass_batch` | `train_gpu`, `histogram_gpu` | a sequential schedule, so multiclass GPU training stays one tree per class per round and `_train_multiclass_gpu_batched` is not entered | `MOJOBOOST_GPU_CLASS_BATCH` above one, or a caller passing its own batch |
 | `hybrid_leaf_scheduler` | `gpu_runtime` | a report and nothing else. `GpuSession.note_hybrid` records what was asked for and why it was declined; no histogram changes device | nothing. `MOJOBOOST_HYBRID_LEAVES` and `MOJOBOOST_HYBRID_TRACE` change what is reported, not where a histogram is built |
 
+Two of those rows are held off by default because they were measured and did
+not pay, not because the connecting work is outstanding, and the difference
+matters to anyone reading this table for a list of available wins.
+
+`gpu_split_search` is the clearer case. Its device scan is finished, tested,
+and slower. On an M4 it trains about 24% behind the host scan at 50000 rows
+by 100 features over three repeats per arm, and at 250000 by 100 the two are
+indistinguishable, so promoting it would buy split decisions that can differ
+from the CPU's in exchange for nothing measurable. Two theory-driven attempts
+at its remaining cost have both come back inside noise, and the module's own
+docstring now records that the scan kernel's shape is not where that cost
+lives, so the next attempt on it should start from a profile.
+
+The `batched` specialization behind `apple_histogram_policy` is the subtler
+one. It batches histogram builds across leaves, which is worth doing under
+level-wise growth where a whole level is built at once. The shipping grower
+is leaf-wise and now derives a sibling by subtraction, so a split builds one
+histogram and computes the other, and there is at most one build per split
+left to batch. That specialization is waiting on `gpu_levelwise`, not on a
+switch, and reading it as a free win off this table is a mistake made at
+least once.
+
 ## Python package modules
 
 | Module | In `mojoboost.__all__` | Notes |

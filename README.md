@@ -718,6 +718,12 @@ launch. At 250000 by 100 a single run put the two at 3.15 s and 3.22 s,
 which is 2% apart and unrepeated, so read it as no measured difference
 rather than as a win. The default stays on the host scan, because nothing
 measured so far pays for split decisions that can differ from the CPU's.
+To repeat or refute any of that, run
+`pixi run bench-train-gpu 50000 100 reg 5 gpu-host,gpu-device`, which
+alternates the two arms inside one process and prints each arm's own spread
+next to the delta between them. Only adjacent samples are comparable on a
+machine that throttles, so the harness calls a gap narrower than that spread
+indistinguishable instead of reporting it as a number.
 Batched prediction can also run on the device through
 `Model.predict_batch(..., device=GPU_DEVICE)`; binning stays host-side, so
 both devices route every row to the same leaf.

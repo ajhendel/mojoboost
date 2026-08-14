@@ -2,15 +2,40 @@
 
 Generates the same deterministic synthetic dataset as bench_train.mojo
 (counter-based splitmix64), bins it once, then times complete boosted
-training — including GPU initialization and all transfers — through both
-the CPU trainer (`train`) and the GPU trainer (`train_gpu`), with the
-library defaults (LightGBM-matched). Also reports each model's training
-loss so throughput is never read apart from fit quality.
+training — including GPU initialization and all transfers — through any
+combination of the CPU trainer (`train`) and the GPU trainer (`train_gpu`)
+under a chosen split-search strategy, with the library defaults
+(LightGBM-matched). Also reports each model's training loss so throughput is
+never read apart from fit quality.
+
+Arms alternate inside a single process rather than running blocked, because
+adjacent samples are the only comparable ones on a thermally variable
+machine: back-to-back repeats here have agreed to a fraction of a percent
+while the same binary minutes apart drifted by multiples. Two arms timed in
+separate invocations cannot settle a few-percent question no matter how many
+decimal places they print, so the summary reports each arm's own spread and
+refuses to call a gap smaller than that spread a result.
+
+Each arm names its split-search strategy as an argument to `train_gpu`, not
+through MOJOBOOST_GPU_SPLIT_STRATEGY, so a mistyped or word-split shell
+export cannot leave one arm running the other arm's code path under the
+wrong label. `gpu` is whatever SPLIT_SEARCH_AUTO resolves to for the
+workload; `gpu-host` and `gpu-device` pin the choice.
 
 CPU-side threading honors MOJOBOOST_NUM_WORKERS / MOJOBOOST_PARALLEL_MIN_OPS
 (see parallel.mojo), so pin those for reproducible comparisons.
 
-Usage: mojo run -I src bench/bench_train_gpu.mojo [n_rows] [n_features] [reg|binary]
+The first repeat of the first GPU arm also pays one-time device setup, which
+is why the summary leads with the minimum rather than the mean.
+
+Usage: mojo run -I src bench/bench_train_gpu.mojo \\
+    [n_rows] [n_features] [reg|binary] [repeats] [arms]
+
+`arms` is a comma-separated list of cpu, gpu, gpu-host, gpu-device, in the
+order they should run; the first is the baseline every other arm is compared
+against. Defaults: 100000 rows, 100 features, reg, 1 repeat, `cpu,gpu`.
+
+    pixi run bench-train-gpu 50000 100 reg 5 gpu-host,gpu-device
 """
 
 from std.math import exp, log
@@ -26,7 +51,12 @@ from mojoboost.boosting import (
     train,
 )
 from mojoboost.binning import BinnedMatrix
-from mojoboost.train_gpu import train_gpu
+from mojoboost.train_gpu import (
+    SPLIT_SEARCH_AUTO,
+    SPLIT_SEARCH_DEVICE,
+    SPLIT_SEARCH_HOST,
+    train_gpu,
+)
 
 
 def _splitmix64(state: UInt64) -> UInt64:
@@ -71,6 +101,158 @@ def _train_loss(
     return loss / Float64(data.n_rows)
 
 
+# An arm is a trainer plus, for the GPU trainer, an explicit split-search
+# strategy. ARM_GPU leaves the choice to SPLIT_SEARCH_AUTO and so measures
+# what a caller actually gets; the two pinned arms are what a comparison
+# between the strategies has to use.
+comptime ARM_CPU = 0
+comptime ARM_GPU = 1
+comptime ARM_GPU_HOST = 2
+comptime ARM_GPU_DEVICE = 3
+
+
+struct ArmRun(Copyable, Movable):
+    """One timed training run: wall seconds, training loss, tree count."""
+
+    var seconds: Float64
+    var loss: Float64
+    var n_trees: Int
+
+    def __init__(out self, seconds: Float64, loss: Float64, n_trees: Int):
+        self.seconds = seconds
+        self.loss = loss
+        self.n_trees = n_trees
+
+
+def _arm_name(arm: Int) -> String:
+    if arm == ARM_CPU:
+        return String("cpu")
+    if arm == ARM_GPU_HOST:
+        return String("gpu-host")
+    if arm == ARM_GPU_DEVICE:
+        return String("gpu-device")
+    return String("gpu")
+
+
+def _arm_key(arm: Int) -> String:
+    """`_arm_name` with the hyphen removed, for `key: value` output lines."""
+    if arm == ARM_GPU_HOST:
+        return String("gpu_host")
+    if arm == ARM_GPU_DEVICE:
+        return String("gpu_device")
+    return _arm_name(arm)
+
+
+def _parse_arms(spec: String) raises -> List[Int]:
+    """A comma-separated arm list, in the order the arms should run."""
+    var arms = List[Int]()
+    for part in spec.split(","):
+        var name = String(part)
+        if name.byte_length() == 0:
+            continue
+        if name == "cpu":
+            arms.append(ARM_CPU)
+        elif name == "gpu":
+            arms.append(ARM_GPU)
+        elif name == "gpu-host":
+            arms.append(ARM_GPU_HOST)
+        elif name == "gpu-device":
+            arms.append(ARM_GPU_DEVICE)
+        else:
+            raise Error(
+                String(
+                    "unknown arm '",
+                    name,
+                    "'; use cpu, gpu, gpu-host, or gpu-device",
+                )
+            )
+    if len(arms) == 0:
+        raise Error("no arms selected")
+    return arms^
+
+
+def _run_arm(
+    arm: Int,
+    data: BinnedMatrix,
+    target: List[Float64],
+    objective: Int,
+    want_loss: Bool,
+) raises -> ArmRun:
+    """Time one complete training run on one arm.
+
+    The loss pass sits outside the timed region and is requested on the first
+    repeat only: the fit is deterministic, so scoring it again on every
+    repeat would only add prediction time to a wall clock that is meant to
+    measure training.
+    """
+    var params = BoosterParams.default()
+    if arm == ARM_CPU:
+        var cpu_t0 = perf_counter_ns()
+        var cpu_model = train(data, target, objective, params)
+        var cpu_s = Float64(perf_counter_ns() - cpu_t0) / 1e9
+        var cpu_loss = -1.0
+        if want_loss:
+            cpu_loss = _train_loss(cpu_model, data, target, objective)
+        return ArmRun(cpu_s, cpu_loss, len(cpu_model.trees))
+
+    var strategy = SPLIT_SEARCH_AUTO
+    if arm == ARM_GPU_HOST:
+        strategy = SPLIT_SEARCH_HOST
+    elif arm == ARM_GPU_DEVICE:
+        strategy = SPLIT_SEARCH_DEVICE
+    # Includes GpuHistogramBuilder construction and every transfer.
+    var gpu_t0 = perf_counter_ns()
+    var gpu_model = train_gpu(
+        data, target, objective, params, split_search=strategy
+    )
+    var gpu_s = Float64(perf_counter_ns() - gpu_t0) / 1e9
+    var gpu_loss = -1.0
+    if want_loss:
+        gpu_loss = _train_loss(gpu_model, data, target, objective)
+    return ArmRun(gpu_s, gpu_loss, len(gpu_model.trees))
+
+
+def _min_of(values: List[Float64]) -> Float64:
+    var m = values[0]
+    for i in range(1, len(values)):
+        if values[i] < m:
+            m = values[i]
+    return m
+
+
+def _max_of(values: List[Float64]) -> Float64:
+    var m = values[0]
+    for i in range(1, len(values)):
+        if values[i] > m:
+            m = values[i]
+    return m
+
+
+def _median_of(values: List[Float64]) -> Float64:
+    var s = List[Float64](capacity=len(values))
+    for i in range(len(values)):
+        s.append(values[i])
+    for i in range(1, len(s)):
+        var v = s[i]
+        var j = i - 1
+        while j >= 0 and s[j] > v:
+            s[j + 1] = s[j]
+            j -= 1
+        s[j + 1] = v
+    var n = len(s)
+    if n % 2 == 1:
+        return s[n // 2]
+    return 0.5 * (s[n // 2 - 1] + s[n // 2])
+
+
+def _pct(fraction: Float64) -> Float64:
+    """A fraction as a percentage rounded to one decimal place."""
+    var scaled = fraction * 1000.0
+    if scaled >= 0.0:
+        return Float64(Int(scaled + 0.5)) / 10.0
+    return Float64(Int(scaled - 0.5)) / 10.0
+
+
 def main() raises:
     comptime if not has_accelerator():
         print("no accelerator present; GPU training benchmark skipped")
@@ -79,6 +261,10 @@ def main() raises:
         var n_features = 100
         var objective = SQUARED_ERROR
         var obj_name = String("reg")
+        var repeats = 1
+        var arms = List[Int]()
+        arms.append(ARM_CPU)
+        arms.append(ARM_GPU)
         var args = argv()
         if len(args) > 1:
             n_rows = Int(String(args[1]))
@@ -90,6 +276,12 @@ def main() raises:
                 objective = BINARY_LOGISTIC
             elif obj_name != "reg":
                 raise Error("objective must be 'reg' or 'binary'")
+        if len(args) > 4:
+            repeats = Int(String(args[4]))
+            if repeats < 1:
+                raise Error("repeats must be at least 1")
+        if len(args) > 5:
+            arms = _parse_arms(String(args[5]))
         if n_features < 4:
             raise Error("need at least 4 features")
 
@@ -130,20 +322,94 @@ def main() raises:
         var t1 = perf_counter_ns()
         print("binning_s:", Float64(t1 - t0) / 1e9)
 
-        var t2 = perf_counter_ns()
-        var cpu = train(data, target, objective, BoosterParams.default())
-        var t3 = perf_counter_ns()
-        var cpu_s = Float64(t3 - t2) / 1e9
-        print("cpu_train_s:", cpu_s)
-        print("cpu_n_trees:", len(cpu.trees))
-        print("cpu_train_loss:", _train_loss(cpu, data, target, objective))
+        var n_arms = len(arms)
+        var arm_list = String("")
+        for a in range(n_arms):
+            if a > 0:
+                arm_list += ","
+            arm_list += _arm_name(arms[a])
+        print("arms:", arm_list)
+        print("repeats:", repeats)
+        if repeats < 3:
+            print(
+                "warning: fewer than 3 repeats cannot separate a real"
+                " difference from machine drift; pass a repeat count of 3 or"
+                " more before reporting a delta"
+            )
 
-        # Includes GpuHistogramBuilder construction and every transfer.
-        var t4 = perf_counter_ns()
-        var gpu = train_gpu(data, target, objective, BoosterParams.default())
-        var t5 = perf_counter_ns()
-        var gpu_s = Float64(t5 - t4) / 1e9
-        print("gpu_train_s:", gpu_s)
-        print("gpu_n_trees:", len(gpu.trees))
-        print("gpu_train_loss:", _train_loss(gpu, data, target, objective))
-        print("gpu_speedup_x:", cpu_s / gpu_s)
+        # Interleaved, not blocked: one repeat runs every arm before the next
+        # repeat starts, so the samples being compared sit next to each other
+        # in time. Running all of one arm and then all of the other puts the
+        # two arms in different thermal windows and makes the difference
+        # between them unreadable.
+        var samples = List[Float64](capacity=repeats * n_arms)
+        var losses = List[Float64](capacity=n_arms)
+        var tree_counts = List[Int](capacity=n_arms)
+        for _ in range(n_arms):
+            losses.append(-1.0)
+            tree_counts.append(0)
+        for rep in range(repeats):
+            for a in range(n_arms):
+                var run = _run_arm(
+                    arms[a], data, target, objective, rep == 0
+                )
+                samples.append(run.seconds)
+                if rep == 0:
+                    losses[a] = run.loss
+                    tree_counts[a] = run.n_trees
+                print(
+                    "run", rep + 1, _arm_name(arms[a]), "train_s:", run.seconds
+                )
+
+        # The minimum leads because it is the sample least contaminated by
+        # thermal drift and by the one-time device setup the first GPU run
+        # pays. The spread beside it is what says whether the minimum can be
+        # trusted at all.
+        var mins = List[Float64](capacity=n_arms)
+        var spreads = List[Float64](capacity=n_arms)
+        for a in range(n_arms):
+            var vals = List[Float64](capacity=repeats)
+            for rep in range(repeats):
+                vals.append(samples[rep * n_arms + a])
+            var lo = _min_of(vals)
+            var hi = _max_of(vals)
+            mins.append(lo)
+            spreads.append((hi - lo) / lo)
+            var key = _arm_key(arms[a])
+            print(key + "_train_s:", lo)
+            print(key + "_train_s_median:", _median_of(vals))
+            print(key + "_train_s_max:", hi)
+            print(key + "_spread_pct:", _pct(spreads[a]))
+            print(key + "_n_trees:", tree_counts[a])
+            print(key + "_train_loss:", losses[a])
+
+        # Every delta is reported against the noise floor that produced it,
+        # taken as the wider of the two arms' own spreads. A gap smaller than
+        # that floor is not a result however many decimals it carries, and
+        # saying so here is the whole point of the repeat count.
+        var base_key = _arm_key(arms[0])
+        for a in range(1, n_arms):
+            var key = _arm_key(arms[a])
+            var delta = (mins[a] - mins[0]) / mins[0]
+            var magnitude = delta if delta >= 0.0 else -delta
+            var floor = spreads[0] if spreads[0] > spreads[a] else spreads[a]
+            print(key + "_speedup_x:", mins[0] / mins[a])
+            if repeats == 1:
+                # A single sample per arm has a spread of zero by
+                # construction, not a noise floor of zero, so no delta can be
+                # called resolved against it.
+                print(
+                    key + "_vs_" + base_key + ":",
+                    "unresolvable delta_pct",
+                    _pct(delta),
+                    "noise_floor_pct unmeasured-at-1-repeat",
+                )
+            else:
+                print(
+                    key + "_vs_" + base_key + ":",
+                    "indistinguishable" if magnitude <= floor else "resolved",
+                    "delta_pct",
+                    _pct(delta),
+                    "noise_floor_pct",
+                    _pct(floor),
+                )
