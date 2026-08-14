@@ -5,5 +5,13 @@
 *.mojopkg
 build/
 
+# Platform-specific Python extension builds
+*.so
+*.dylib
+*.dll
+
 # macOS
 .DS_Store
+
+# Python
+__pycache__/

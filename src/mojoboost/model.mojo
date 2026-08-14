@@ -16,9 +16,15 @@ from .boosting import (
 
 
 @fieldwise_init
-struct Model(Copyable, Movable):
+struct Model(Copyable, Movable, Writable):
     var mapper: BinMapper
     var booster: Booster
+
+    def write_to(self, mut writer: Some[Writer]):
+        writer.write("Model(n_trees=", len(self.booster.trees), ")")
+
+    def write_repr_to(self, mut writer: Some[Writer]):
+        self.write_to(writer)
 
     def predict(self, row: List[Float64]) raises -> Float64:
         """Response-scale prediction for one raw example (length n_features)."""
@@ -30,9 +36,21 @@ struct Model(Copyable, Movable):
 
 
 @fieldwise_init
-struct MulticlassModel(Copyable, Movable):
+struct MulticlassModel(Copyable, Movable, Writable):
     var mapper: BinMapper
     var booster: MulticlassBooster
+
+    def write_to(self, mut writer: Some[Writer]):
+        writer.write(
+            "MulticlassModel(n_classes=",
+            self.booster.n_classes,
+            ", n_trees=",
+            len(self.booster.trees),
+            ")",
+        )
+
+    def write_repr_to(self, mut writer: Some[Writer]):
+        self.write_to(writer)
 
     def predict_proba(self, row: List[Float64]) raises -> List[Float64]:
         """Class probabilities for one raw example (length n_features)."""
