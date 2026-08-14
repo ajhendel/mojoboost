@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: LightGBM parity contract
+    url: https://github.com/ajhendel/mojoboost/blob/main/docs/LIGHTGBM_PARITY.md
+    about: Check documented support and intentional differences before filing a parity issue.
+  - name: GPU validation procedure
+    url: https://github.com/ajhendel/mojoboost/blob/main/docs/GPU_VALIDATION.md
+    about: Use the reproducible procedure for hardware claims and reports.

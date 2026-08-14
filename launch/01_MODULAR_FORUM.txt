@@ -1,0 +1,18 @@
+DESTINATION: Modular Forum, Community Showcase or community projects category, https://forum.modular.com/
+TITLE: MojoBoost: native gradient-boosted trees in Mojo with Apple Silicon GPU support
+
+I am open-sourcing MojoBoost, an experimental gradient-boosted tree library written natively in Mojo.
+
+The goal is a familiar LightGBM-style Python experience backed by portable CPU and GPU implementations, with first-class support for the Metal GPU already present in Apple Silicon Macs.
+
+The repository now has a broad feature surface: dense and sparse histogram training, leaf-wise growth, categorical and missing-value handling, regression, classification and ranking, validation and early stopping, callbacks, serialization, continued training, model contributions, a Dataset and Booster API, Python estimators, a C API, and a CLI foundation. The GPU path includes device-resident binned data and row assignments, tiled histograms, deterministic integer accumulation, row partitioning, multiclass training, and runtime device-aware launch geometry.
+
+This is a substantial public alpha, not a production replacement for LightGBM. Feature combinations, edge cases, packaging, performance validation, and cross-hardware testing still need work. Metal correctness has been exercised on an Apple M4. NVIDIA and AMD have not been validated, and the repository says so explicitly.
+
+I am particularly looking for contributors interested in Mojo GPU programming, Apple Silicon profiling, gradient-boosted tree algorithms, Python packaging, differential testing against LightGBM, and validation on real NVIDIA or AMD hardware.
+
+Repository: https://github.com/ajhendel/mojoboost
+Parity contract: https://github.com/ajhendel/mojoboost/blob/main/docs/LIGHTGBM_PARITY.md
+GPU validation status and procedure: https://github.com/ajhendel/mojoboost/blob/main/docs/GPU_VALIDATION.md
+
+I would especially value feedback on the GPU architecture, API boundaries, and the shortest path to a reliable Apple Silicon benchmark story.

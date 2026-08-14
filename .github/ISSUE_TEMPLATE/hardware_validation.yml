@@ -1,0 +1,52 @@
+name: Accelerator validation report
+description: Contribute correctness, determinism, or performance evidence from real hardware
+title: "[Hardware]: "
+labels:
+  - hardware-validation
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Follow docs/GPU_VALIDATION.md. A skipped GPU test is not a validation result. Report failures too; they are useful evidence.
+  - type: input
+    id: device
+    attributes:
+      label: Exact accelerator
+      placeholder: Apple M4 10-core GPU, NVIDIA L4, AMD RX 7900 XTX
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include OS, architecture, driver, Mojo/MAX versions, CPU, and memory.
+    validations:
+      required: true
+  - type: textarea
+    id: commands
+    attributes:
+      label: Commands run
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: correctness
+    attributes:
+      label: Correctness and determinism output
+      description: Include complete output, including whether any test skipped.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: timings
+    attributes:
+      label: Phase timings and model quality
+      description: Include setup, transfers, kernels, total training, prediction, peak memory if available, and the quality metric.
+      render: text
+  - type: checkboxes
+    id: consent
+    attributes:
+      label: Publication
+      options:
+        - label: These results may be added to docs/GPU_VALIDATION.md with attribution to my GitHub account.
+          required: true

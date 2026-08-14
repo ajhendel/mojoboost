@@ -2,12 +2,55 @@
 
 [![CI](https://github.com/ajhendel/mojoboost/actions/workflows/ci.yml/badge.svg)](https://github.com/ajhendel/mojoboost/actions/workflows/ci.yml)
 
-Gradient boosted decision trees in [Mojo](https://www.modular.com/mojo).
+Native gradient-boosted trees accelerated by the GPU already inside Apple
+Silicon Macs, written in [Mojo](https://www.modular.com/mojo).
+
+> [!IMPORTANT]
+> mojoboost is an experimental public alpha. Its feature surface is broad,
+> but it is not yet a production replacement for LightGBM or XGBoost. Treat
+> every capability according to the evidence in
+> [docs/LIGHTGBM_PARITY.md](docs/LIGHTGBM_PARITY.md) and
+> [docs/GPU_VALIDATION.md](docs/GPU_VALIDATION.md), report failures, and do
+> not rely on unvalidated hardware or parameter combinations in production.
 
 mojoboost is a from-scratch GBDT library in the LightGBM family. It uses
 histogram-based split finding and leaf-wise (best-first) tree growth. Its
 benchmark configuration aligns important parameters with LightGBM for
 reproducible comparisons.
+
+## Five-minute start
+
+The current source install requires [pixi](https://pixi.sh). A Mojo or MAX
+installation is not required separately; pixi resolves the versions pinned by
+this repository.
+
+```sh
+git clone https://github.com/ajhendel/mojoboost.git
+cd mojoboost
+pixi install
+pixi run build-python
+PYTHONPATH=python python - <<'PY'
+from mojoboost import MojoBoostRegressor
+
+X = [[0.0], [1.0], [2.0], [3.0], [4.0], [5.0]]
+y = [0.0, 1.0, 4.0, 9.0, 16.0, 25.0]
+
+model = MojoBoostRegressor(n_estimators=20, num_leaves=7, device="cpu")
+model.fit(X, y)
+print(model.predict([[1.5], [4.5]]))
+print("backend:", model.device_)
+PY
+```
+
+Use `device="gpu"` to require an available supported accelerator. It raises
+on unsupported hardware or workloads rather than silently falling back. Use
+`device="auto"` only after reading [Device selection](#device-selection): its
+GPU crossover heuristic is deliberately disabled until end-to-end benchmark
+evidence establishes a trustworthy threshold.
+
+If the example fails, open a bug report using the repository issue template
+and include the output of `pixi run mojo --version`, your operating system,
+processor, and accelerator.
 
 ## Why Mojo
 
@@ -22,8 +65,11 @@ targets GPUs from the same source.
 
 ## Status
 
-Early development. Training works end to end. The list below is what works
-today, each piece with tests; for what LightGBM has that mojoboost does not,
+Experimental public alpha. Training works end to end and the repository has
+a broad LightGBM-shaped feature surface. That is not the same as verified
+behavioral or production parity: combinations, edge cases, installation
+targets, and non-Apple accelerators remain less mature. The list below is
+what works today, each piece with tests; for what LightGBM has that mojoboost does not,
 and for the semantics that differ deliberately, read the parity contract in
 [docs/LIGHTGBM_PARITY.md](docs/LIGHTGBM_PARITY.md), which is authoritative
 where this list and it disagree.
@@ -1657,6 +1703,11 @@ Requires [pixi](https://pixi.sh).
 pixi install
 pixi run test
 ```
+
+During ordinary development, run only the smallest test file covering the
+change. The full suite is an integration or release check and should not be
+launched repeatedly or concurrently on a shared development machine. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for the focused-test workflow.
 
 The test command includes CPU/GPU equivalence checks. They run when a
 supported accelerator is present and skip cleanly on CPU-only machines.

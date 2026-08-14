@@ -1,0 +1,14 @@
+DESTINATION: Hacker News Submit page after the README five-minute example works from a clean checkout and one reproducible end-to-end Apple GPU result is published
+TITLE: Show HN: MojoBoost - Gradient-boosted trees for Apple Silicon GPUs, written in Mojo
+
+I built MojoBoost, an open-source histogram-based gradient-boosted tree library written natively in Mojo.
+
+The project is an attempt to provide a familiar LightGBM-style Python experience while using one Mojo codebase for CPU and GPU execution. Its initial focus is the Metal GPU already inside Apple Silicon Macs: no CUDA installation and no external GPU.
+
+The repository includes dense and sparse leaf-wise training, numerical and categorical data, missing values, regression, classification, ranking, validation and early stopping, callbacks, serialization, TreeSHAP contributions, Dataset and Booster APIs, Python estimators, and end-to-end GPU tree growth.
+
+This is an experimental public alpha rather than a claim of production parity with LightGBM or XGBoost. The repository publishes its known gaps and hardware evidence. Apple M4 Metal correctness has been exercised; NVIDIA and AMD remain unvalidated.
+
+Repository: https://github.com/ajhendel/mojoboost
+
+I would appreciate feedback on the architecture, reproducibility, packaging, and which real tabular workloads would make the most useful Apple CPU-versus-GPU crossover benchmark.

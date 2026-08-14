@@ -1,0 +1,658 @@
+{
+  "schema_version": 1,
+  "status": "proposed",
+  "generated_by": null,
+  "library_version": "0.1.0",
+  "source_commit": null,
+  "about": [
+    "A record of mojoboost's public surface, as defined by section 2 of",
+    "docs/COMPATIBILITY_POLICY.md, in a form two releases can be diffed in.",
+    "Section 11.2 of that document classifies every kind of diff.",
+    "PROPOSED, NOT GENERATED. This file was written by hand from a reading",
+    "of the source. No tool produced it and nothing verified it against a",
+    "built extension module, so it states the intended shape of the",
+    "snapshot rather than a checked fact about the tree. The generator,",
+    "the pixi task, the CI job, and the exports the generator needs are",
+    "specified in handoffs/task20_compatibility.md. Once that tool exists,",
+    "its output replaces this file wholesale and `status` becomes",
+    "\"generated\".",
+    "Absence of a name here is not evidence the name is absent from the",
+    "code. It may be evidence that the hand pass missed it."
+  ],
+  "verification": {
+    "method": "throwaway ast and regex cross-check, no build and no import of mojoboost, run against the working tree after this file was written",
+    "result": "no drift in any block listed under checked",
+    "checked": [
+      "mojo.exports_by_module, module set and every module's name set",
+      "python.all",
+      "python.fitted_attributes",
+      "python.shared_estimator_parameters, names and every default value",
+      "python.estimators.*.own_parameters",
+      "python.estimators.*.methods fit, predict, predict_proba argument names and defaults",
+      "python.callbacks.all, callback_env_fields, resettable, reset_aliases, reset_slots",
+      "len(RESETTABLE) equals RESET_SLOTS in bindings/_mojoboost.mojo",
+      "python.eval_metric_names.documented is a subset of _METRICS",
+      "c_abi.functions against the declarations in capi/mojoboost.h",
+      "versions.library against all three of its locations",
+      "versions.model_format against serialize.mojo, versions.c_abi against the header",
+      "platforms.declared against pixi.toml"
+    ],
+    "not_checked": [
+      "python.functional_api, the Dataset and Booster method lists",
+      "python.module_functions, python.exceptions, python.sparse_input",
+      "python.estimators.*.objective_names",
+      "mojo.objective_codes, mojo.internal_frozen_helpers",
+      "parameter_string.supported_keys",
+      "cli, model_format.sections, inspection, environment_variables",
+      "platforms tiers above tier 1, artifacts, numerical_contracts"
+    ],
+    "note": "the checked list is a fact about the tree at the time of the check, not a substitute for tools/api_snapshot.py. Nothing re-runs it."
+  },
+  "versions": {
+    "library": "0.1.0",
+    "c_abi": 1,
+    "model_format": "v3",
+    "snapshot_schema": 1,
+    "python_wheel_tag": "cp314-cp314-macosx_26_0_arm64",
+    "requires_python": ">=3.14",
+    "mojo_toolchain": ">=1.0.0,<2",
+    "max_toolchain": ">=26.5.0,<27"
+  },
+  "python": {
+    "module": "mojoboost",
+    "all": [
+      "Booster",
+      "Dataset",
+      "MojoBoostRegressor",
+      "MojoBoostClassifier",
+      "MojoBoostRanker",
+      "NotFittedError",
+      "train",
+      "gpu_available",
+      "group_from_query_ids",
+      "ndcg_score",
+      "CallbackEnv",
+      "EarlyStopException",
+      "callback",
+      "early_stopping",
+      "log_evaluation",
+      "record_evaluation",
+      "reset_parameter"
+    ],
+    "supported_import_paths": ["mojoboost", "mojoboost.callback"],
+    "optional_dependencies": ["numpy", "scipy", "scikit-learn", "pandas"],
+    "shared_estimator_parameters": {
+      "num_leaves": 31,
+      "max_depth": -1,
+      "learning_rate": 0.1,
+      "n_estimators": 100,
+      "min_data_in_leaf": 20,
+      "min_child_samples": null,
+      "lambda_l2": 1.0,
+      "lambda_l1": 0.0,
+      "reg_lambda": null,
+      "reg_alpha": null,
+      "min_child_hess": 0.001,
+      "min_child_weight": null,
+      "max_bin": 255,
+      "device": "cpu",
+      "device_type": null,
+      "interaction_constraints": null,
+      "monotone_constraints": null,
+      "bagging_fraction": 1.0,
+      "subsample": null,
+      "bagging_freq": 0,
+      "subsample_freq": null,
+      "bagging_seed": 3,
+      "boosting": "gbdt",
+      "boosting_type": null,
+      "top_rate": 0.2,
+      "other_rate": 0.1,
+      "goss_seed": 3,
+      "goss_warmup_rounds": -1,
+      "feature_fraction": 1.0,
+      "feature_fraction_bynode": 1.0,
+      "feature_fraction_seed": 2,
+      "use_missing": true,
+      "categorical_feature": "auto",
+      "categorical_features": null,
+      "max_cat_to_onehot": 4,
+      "max_cat_threshold": 32,
+      "cat_smooth": 10.0,
+      "cat_l2": 10.0,
+      "min_data_per_group": 100,
+      "importance_type": "split"
+    },
+    "parameter_aliases": {
+      "min_child_samples": "min_data_in_leaf",
+      "min_child_weight": "min_child_hess",
+      "reg_alpha": "lambda_l1",
+      "reg_lambda": "lambda_l2",
+      "subsample": "bagging_fraction",
+      "subsample_freq": "bagging_freq",
+      "device_type": "device",
+      "boosting_type": "boosting",
+      "categorical_features": "categorical_feature"
+    },
+    "alias_conflict_behavior": "raises when both members of a pair are set to different non-default values",
+    "fitted_attributes": [
+      "n_features_in_",
+      "feature_names_in_",
+      "device_",
+      "classes_",
+      "n_classes_",
+      "best_iteration_",
+      "evals_result_",
+      "best_score_",
+      "stopped_early_",
+      "n_iter_",
+      "categorical_feature_"
+    ],
+    "unfitted_access": "NotFittedError",
+    "estimators": {
+      "MojoBoostRegressor": {
+        "bases": ["_Base"],
+        "estimator_type": "regressor",
+        "own_parameters": {
+          "objective": "regression",
+          "alpha": 0.9,
+          "fair_c": 1.0,
+          "tweedie_variance_power": 1.5,
+          "base_score": 0.0
+        },
+        "objective_names": [
+          "regression",
+          "huber",
+          "quantile",
+          "mae",
+          "regression_l1",
+          "poisson",
+          "gamma",
+          "tweedie",
+          "mape",
+          "fair",
+          "cross_entropy",
+          "xentropy"
+        ],
+        "objective_callable": true,
+        "methods": {
+          "fit": {
+            "X": "required",
+            "y": "required",
+            "sample_weight": null,
+            "eval_set": null,
+            "eval_names": null,
+            "eval_metric": null,
+            "early_stopping_rounds": 0,
+            "min_delta": 0.0,
+            "primary_metric": 0,
+            "eval_sample_weight": null,
+            "eval_X": null,
+            "eval_y": null,
+            "callbacks": null
+          },
+          "predict": {
+            "X": "required",
+            "raw_score": false,
+            "start_iteration": 0,
+            "num_iteration": null,
+            "pred_leaf": false,
+            "pred_contrib": false,
+            "validate_features": false
+          },
+          "score": {"X": "required", "y": "required", "sample_weight": null},
+          "save": {"path": "required"},
+          "load": {"path": "required", "kind": "classmethod"}
+        },
+        "properties": ["booster_", "feature_importances_"],
+        "protocols": ["get_params", "set_params", "__getstate__", "__setstate__", "__sklearn_tags__", "__sklearn_is_fitted__"]
+      },
+      "MojoBoostClassifier": {
+        "bases": ["_Base"],
+        "estimator_type": "classifier",
+        "own_parameters": {"objective": null, "class_weight": null},
+        "objective_names": [],
+        "objective_note": "accepted only so that passing one raises a message instead of a TypeError",
+        "class_weight_values": ["None", "balanced", "{label: weight} dict"],
+        "methods": {
+          "fit": {
+            "X": "required",
+            "y": "required",
+            "sample_weight": null,
+            "eval_set": null,
+            "eval_names": null,
+            "eval_metric": null,
+            "early_stopping_rounds": 0,
+            "min_delta": 0.0,
+            "primary_metric": 0,
+            "eval_sample_weight": null,
+            "eval_X": null,
+            "eval_y": null,
+            "callbacks": null
+          },
+          "predict": {
+            "X": "required",
+            "raw_score": false,
+            "start_iteration": 0,
+            "num_iteration": null,
+            "pred_leaf": false,
+            "pred_contrib": false,
+            "validate_features": false
+          },
+          "predict_proba": {
+            "X": "required",
+            "raw_score": false,
+            "start_iteration": 0,
+            "num_iteration": null,
+            "pred_leaf": false,
+            "pred_contrib": false,
+            "validate_features": false
+          },
+          "score": {"X": "required", "y": "required", "sample_weight": null},
+          "save": {"path": "required"},
+          "load": {"path": "required", "kind": "classmethod"}
+        },
+        "properties": ["booster_", "feature_importances_"],
+        "protocols": ["get_params", "set_params", "__getstate__", "__setstate__", "__sklearn_tags__", "__sklearn_is_fitted__"]
+      },
+      "MojoBoostRanker": {
+        "bases": ["_Base"],
+        "estimator_type": "ranker",
+        "own_parameters": {
+          "lambdarank_truncation_level": 30,
+          "sigmoid": 1.0,
+          "lambdarank_norm": true,
+          "ndcg_eval_at": 5
+        },
+        "methods": {
+          "fit": {
+            "X": "required",
+            "y": "required",
+            "group": null,
+            "sample_weight": null,
+            "eval_set": null,
+            "eval_group": null,
+            "eval_names": null,
+            "eval_metric": null,
+            "early_stopping_rounds": 0,
+            "min_delta": 0.0,
+            "primary_metric": 0,
+            "eval_sample_weight": null,
+            "eval_X": null,
+            "eval_y": null,
+            "callbacks": null
+          },
+          "predict": {
+            "X": "required",
+            "raw_score": false,
+            "start_iteration": 0,
+            "num_iteration": null,
+            "pred_leaf": false,
+            "pred_contrib": false,
+            "validate_features": false
+          },
+          "score": {"X": "required", "y": "required", "group": null, "sample_weight": null},
+          "save": {"path": "required"},
+          "load": {"path": "required", "kind": "classmethod"}
+        },
+        "properties": ["booster_", "feature_importances_"],
+        "protocols": ["get_params", "set_params", "__getstate__", "__setstate__", "__sklearn_is_fitted__"]
+      }
+    },
+    "functional_api": {
+      "module": "mojoboost.basic",
+      "all": ["Booster", "Dataset", "train"],
+      "train": {
+        "params": "required",
+        "train_set": "required",
+        "num_boost_round": null,
+        "valid_sets": null,
+        "valid_names": null,
+        "init_model": null
+      },
+      "Dataset": {
+        "constructor": {
+          "data": "required",
+          "label": null,
+          "weight": null,
+          "group": null,
+          "init_score": null,
+          "feature_name": null,
+          "categorical_feature": null,
+          "params": null,
+          "reference": null,
+          "free_raw_data": false
+        },
+        "methods": [
+          "construct",
+          "num_data",
+          "num_feature",
+          "num_bin",
+          "feature_name",
+          "categorical_feature",
+          "get_label",
+          "get_weight",
+          "get_group",
+          "get_init_score",
+          "get_data",
+          "get_field",
+          "__repr__"
+        ],
+        "immutable_after_construction": true,
+        "absent_by_design": ["set_label", "set_field", "set_categorical_feature"]
+      },
+      "Booster": {
+        "constructor": {
+          "params": null,
+          "train_set": null,
+          "model_file": null,
+          "model_str": null,
+          "note": "exactly one of train_set, model_file, model_str"
+        },
+        "methods": {
+          "update": {"num_iteration": 1},
+          "predict": {
+            "data": "required",
+            "raw_score": false,
+            "start_iteration": 0,
+            "num_iteration": null
+          },
+          "add_valid": {"data": "required", "name": "required"},
+          "eval": {"data": "required", "name": "required", "metric": null},
+          "eval_train": {"metric": null},
+          "eval_valid": {"metric": null},
+          "feature_importance": {"importance_type": "split"},
+          "save_model": {"filename": "required"},
+          "model_to_string": {},
+          "model_from_string": {"model_str": "required", "kind": "classmethod"},
+          "current_iteration": {},
+          "num_model_per_iteration": {},
+          "num_trees": {},
+          "num_feature": {},
+          "feature_name": {}
+        },
+        "protocols": ["__getstate__", "__setstate__", "__repr__"],
+        "absent_by_design": ["dump_model", "trees_to_dataframe"]
+      }
+    },
+    "module_functions": {
+      "gpu_available": {},
+      "group_from_query_ids": {"query_ids": "required"},
+      "ndcg_score": {"scores": "required", "y": "required", "group": "required", "at": 5}
+    },
+    "exceptions": {
+      "NotFittedError": {"bases": ["sklearn.exceptions.NotFittedError", "RuntimeError"]},
+      "EarlyStopException": {"attributes": ["best_iteration", "best_score"]}
+    },
+    "callbacks": {
+      "module": "mojoboost.callback",
+      "all": [
+        "CallbackEnv",
+        "EarlyStopException",
+        "RESETTABLE",
+        "TrainingHandle",
+        "early_stopping",
+        "log_evaluation",
+        "record_evaluation",
+        "reset_parameter"
+      ],
+      "callback_env_fields": [
+        "model",
+        "params",
+        "iteration",
+        "begin_iteration",
+        "end_iteration",
+        "evaluation_result_list"
+      ],
+      "callback_env_kind": "namedtuple, so field order is positional contract",
+      "phases": {"BEFORE_ITERATION": 0, "AFTER_ITERATION": 1},
+      "resettable": [
+        "learning_rate",
+        "num_leaves",
+        "max_depth",
+        "min_data_in_leaf",
+        "min_sum_hessian_in_leaf",
+        "lambda_l1",
+        "lambda_l2",
+        "feature_fraction",
+        "feature_fraction_bynode"
+      ],
+      "reset_slots": 9,
+      "reset_slot_owner": "bindings/_mojoboost.mojo RESET_SLOTS, _write_reset, _read_reset",
+      "reset_aliases": {
+        "min_child_samples": "min_data_in_leaf",
+        "min_child_weight": "min_sum_hessian_in_leaf",
+        "min_sum_hessian": "min_sum_hessian_in_leaf",
+        "min_child_hess": "min_sum_hessian_in_leaf",
+        "reg_alpha": "lambda_l1",
+        "reg_lambda": "lambda_l2",
+        "colsample_bytree": "feature_fraction",
+        "colsample_bynode": "feature_fraction_bynode",
+        "sub_feature": "feature_fraction",
+        "shrinkage_rate": "learning_rate",
+        "eta": "learning_rate"
+      },
+      "factories": {
+        "early_stopping": {"signature_source": "python/mojoboost/callback.py"},
+        "log_evaluation": {"period": 1, "show_stdv": true},
+        "record_evaluation": {"eval_result": "required"},
+        "reset_parameter": {"kwargs": "one schedule per resettable parameter"}
+      },
+      "supported_by": ["MojoBoostRegressor", "MojoBoostClassifier (binary)"],
+      "refused_by": ["MojoBoostClassifier (softmax)", "MojoBoostRanker"],
+      "requires": ["eval_set"]
+    },
+    "eval_metric_names": {
+      "source": "python/mojoboost/_eval.py",
+      "computed_by": "src/mojoboost/metrics.mojo",
+      "documented": ["l2", "rmse", "l1", "quantile", "huber", "binary_logloss", "binary_error", "auc", "multi_logloss", "multi_error", "ndcg"],
+      "note": "aliases resolve through the same registry; a callable f(y_true, y_pred) -> float is also accepted, with ('name', f, True) for higher-is-better"
+    },
+    "sparse_input": {
+      "accepted": "any SciPy sparse matrix or array, never densified",
+      "fit_layout": "csc",
+      "predict_layout": "csr",
+      "implicit_zero": "the value 0.0, not missing",
+      "unavailable": ["device=gpu", "python objective callback", "eval_set", "early stopping", "ranking", "pred_leaf", "pred_contrib", "iteration slicing"]
+    }
+  },
+  "mojo": {
+    "package": "mojoboost",
+    "export_source": "src/mojoboost/__init__.mojo",
+    "abi_promise": "none; Mojo has no stable ABI, so the guarantee is source compatibility only",
+    "exports_by_module": {
+      "bagging": ["DEFAULT_BAGGING_SEED", "BaggingParams", "bagging_enabled", "check_bagging", "refresh_bag", "sample_rows"],
+      "categorical": ["CAT_BITSET_WORDS", "CategoricalParams", "CategoricalSpec", "cat_add", "cat_contains", "cat_empty", "cat_pool_contains", "find_best_categorical_split", "fit_categorical_spec"],
+      "gain": ["leaf_score"],
+      "binning": ["BinMapper", "BinnedMatrix", "bin_equal_width", "fit_bins"],
+      "histogram": ["Histogram", "build_histogram", "build_histogram_subset", "subtract_histogram"],
+      "goss": ["GossParams", "GossSelection", "apply_goss_scaling", "goss_importance", "goss_round", "goss_select"],
+      "interaction": ["InteractionConstraints", "extend_branch"],
+      "monotone": ["MONOTONE_DECREASING", "MONOTONE_FREE", "MONOTONE_INCREASING", "MonotoneConstraints", "OutputBounds"],
+      "sampling": ["DEFAULT_FEATURE_FRACTION_SEED", "check_feature_fraction", "check_feature_fractions", "sample_without_replacement", "select_node_features", "select_tree_features", "selection_count"],
+      "split": ["SplitInfo", "find_best_split", "soft_threshold_l1"],
+      "tree": ["Tree", "TreeParams", "grow_tree", "node_bounds"],
+      "boosting": ["BINARY_LOGISTIC", "CROSS_ENTROPY", "CUSTOM", "DEFAULT_FAIR_C", "DEFAULT_TWEEDIE_VARIANCE_POWER", "FAIR", "GAMMA", "HUBER", "L1", "MAPE", "POISSON", "QUANTILE", "SQUARED_ERROR", "TWEEDIE", "Booster", "BoosterParams", "IterationRange", "MulticlassBooster", "objective_renews_leaves", "renewal_alpha", "renewal_weights", "train", "train_more", "train_multiclass", "train_multiclass_more", "train_multiclass_with_valid", "train_with_valid"],
+      "contrib": ["ContribExplainer", "predict_contrib", "predict_contrib_bins", "predict_contrib_bins_multiclass", "predict_contrib_multiclass", "tree_expected_value"],
+      "trainset": ["Dataset", "train_dataset", "train_dataset_multiclass", "train_dataset_ranker", "update_dataset", "update_dataset_multiclass"],
+      "collective": ["STATUS_INVALID_PARAM", "STATUS_INVALID_TARGET", "STATUS_INVALID_WEIGHT", "STATUS_LAYOUT_MISMATCH", "STATUS_OK", "STATUS_SHAPE_MISMATCH", "STATUS_UNSUPPORTED", "Collective", "LocalCollective", "agree_equal_ints", "agree_status", "status_message"],
+      "distributed": ["DataShard", "allreduce_histogram", "grow_tree_distributed", "partition_rows", "partition_values", "train_distributed"],
+      "device": ["AUTO_DEVICE", "CPU_DEVICE", "GPU_DEVICE", "device_name", "gpu_available", "parse_device", "resolve_device"],
+      "objective": ["EvalLossFn", "GradHessFn", "check_custom_grad_hess", "mean_label", "squared_error_grad_hess", "squared_error_loss", "train_custom", "train_custom_with_valid"],
+      "custom_metric": ["MetricFn", "MetricSetFn", "CustomMetric", "MetricFitResult", "MetricHistory", "MetricMulticlassFitResult", "MetricMulticlassTrainResult", "MetricSuite", "MetricTrainResult", "RawValidSet", "ValidSet", "fit_multiclass_with_metrics", "fit_ranker_with_metrics", "fit_with_metrics", "response_scale", "train_custom_with_metrics", "train_multiclass_with_metrics", "train_ranker_with_metrics", "train_with_metric", "train_with_metrics"],
+      "histogram_gpu": ["GpuHistogramBuilder", "build_histogram_gpu"],
+      "train_gpu": ["grow_tree_gpu", "train_custom_gpu", "train_gpu", "train_multiclass_gpu"],
+      "importance": ["gain_importance", "split_importance"],
+      "class_weight": ["balanced_class_weights", "balanced_sample_weight", "binary_labels_to_codes", "check_class_balance_params", "check_class_weights", "class_counts", "class_weight_rows", "scale_pos_weight_rows", "unbalance_scale", "unbalanced_sample_weight"],
+      "metrics": ["average_precision", "binary_accuracy", "binary_auc", "binary_error", "binary_log_loss", "check_metric_weight", "cross_entropy_loss", "fair_loss", "gamma_deviance", "gamma_loss", "huber_loss", "kullback_leibler", "l1", "l2", "mape", "multiclass_accuracy", "multiclass_error", "multiclass_log_loss", "poisson_loss", "quantile_loss", "rmse", "tweedie_loss"],
+      "model": ["Model", "MulticlassModel", "fit", "fit_custom", "fit_multiclass"],
+      "sparse": ["CscMatrix", "CsrMatrix", "SparseBinnedMatrix", "SparseBinnedRows", "csc_from_dense", "default_bins", "fit_bins_csc", "transform_csc"],
+      "histogram_sparse": ["NodeTotals", "SparseEntryOrder", "SparseNodeEntries", "build_histogram_sparse", "build_histogram_sparse_node", "build_histogram_sparse_subset"],
+      "tree_sparse": ["SparseTreeResult", "grow_tree_sparse", "predict_row_sparse"],
+      "boosting_sparse": ["train_multiclass_sparse", "train_sparse", "train_sparse_with_valid"],
+      "model_sparse": ["fit_csc", "fit_multiclass_csc", "predict_class_csr", "predict_csr", "predict_proba_csr", "predict_raw_csr"],
+      "ranking": ["DEFAULT_NDCG_EVAL_AT", "DEFAULT_SIGMOID", "DEFAULT_TRUNCATION_LEVEL", "LAMBDARANK", "MAX_RELEVANCE_LABEL", "RankGroups", "RankerParams", "check_groups", "check_labels", "check_ranker_params", "fit_ranker", "groups_from_counts", "groups_from_query_ids", "label_gain", "lambdarank_gradients", "map_at_cutoffs", "max_dcg", "mean_average_precision", "ndcg", "ndcg_at_cutoffs", "train_ranker", "train_ranker_with_valid"],
+      "params": ["MULTICLASS", "SUPPORTED_KEYS", "TrainConfig", "objective_default_alpha", "objective_display_name", "objective_from_name", "params_names_mojo_api_only", "parse_params"],
+      "serialize": ["load_model", "load_multiclass_model", "model_file_kind", "save_model", "save_multiclass_model"]
+    },
+    "internal_frozen_helpers": {
+      "module": "src/mojoboost/boosting.mojo",
+      "names": ["_fill_grad_hess", "_base_score", "_check_objective", "_check_sample_weight", "_renew_leaf_values"],
+      "note": "frozen for in-tree callers only; not public and not covered by the compatibility policy"
+    },
+    "objective_codes": {
+      "SQUARED_ERROR": 0,
+      "BINARY_LOGISTIC": 1,
+      "POISSON": 2,
+      "HUBER": 3,
+      "QUANTILE": 4,
+      "L1": 5,
+      "CUSTOM": 6,
+      "LAMBDARANK": 7,
+      "GAMMA": 8,
+      "TWEEDIE": 9,
+      "MAPE": 10,
+      "FAIR": 11,
+      "CROSS_ENTROPY": 12,
+      "MULTICLASS": -1
+    }
+  },
+  "c_abi": {
+    "header": "capi/mojoboost.h",
+    "abi_version": 1,
+    "status_codes": {
+      "MOJOBOOST_OK": 0,
+      "MOJOBOOST_ERROR_INVALID_ARGUMENT": -1,
+      "MOJOBOOST_ERROR_TRAINING": -2,
+      "MOJOBOOST_ERROR_IO": -3,
+      "MOJOBOOST_ERROR_UNSUPPORTED": -4
+    },
+    "opaque_types": ["MojoBoostModel", "MojoBoostError"],
+    "functions": [
+      "int32_t mojoboost_abi_version(void)",
+      "void mojoboost_library_version(int32_t *major, int32_t *minor, int32_t *patch)",
+      "MojoBoostError *mojoboost_error_create(void)",
+      "void mojoboost_error_free(MojoBoostError *error)",
+      "const char *mojoboost_error_message(const MojoBoostError *error)",
+      "int32_t mojoboost_train_dense(const double *data, int64_t n_rows, int64_t n_features, const double *labels, const double *weights, const char *parameters, MojoBoostModel **out_model, MojoBoostError *error)",
+      "int32_t mojoboost_predict(const MojoBoostModel *model, const double *data, int64_t n_rows, int64_t n_features, double *out_values, int64_t out_len, MojoBoostError *error)",
+      "int32_t mojoboost_predict_raw(const MojoBoostModel *model, const double *data, int64_t n_rows, int64_t n_features, double *out_values, int64_t out_len, MojoBoostError *error)",
+      "int32_t mojoboost_save_model(const MojoBoostModel *model, const char *path, MojoBoostError *error)",
+      "int32_t mojoboost_load_model(const char *path, MojoBoostModel **out_model, MojoBoostError *error)",
+      "int32_t mojoboost_model_num_features(const MojoBoostModel *model, int64_t *out_value, MojoBoostError *error)",
+      "int32_t mojoboost_model_num_classes(const MojoBoostModel *model, int64_t *out_value, MojoBoostError *error)",
+      "int32_t mojoboost_model_num_trees(const MojoBoostModel *model, int64_t *out_value, MojoBoostError *error)",
+      "void mojoboost_model_free(MojoBoostModel *model)"
+    ],
+    "not_covered": ["error message wording", "shared library file name and soname"]
+  },
+  "cli": {
+    "binary": "cli/mojoboost",
+    "commands": ["train", "predict"],
+    "exit_status": {"0": "success", "1": "runtime failure", "2": "usage error"},
+    "not_covered": ["human-readable stderr text"]
+  },
+  "parameter_string": {
+    "parser": "src/mojoboost/params.mojo parse_params",
+    "used_by": ["capi", "cli"],
+    "shape": "whitespace separated key=value pairs, LightGBM names",
+    "supported_keys": [
+      "objective",
+      "num_class",
+      "num_iterations",
+      "learning_rate",
+      "num_leaves",
+      "min_data_in_leaf",
+      "min_sum_hessian_in_leaf",
+      "lambda_l1",
+      "lambda_l2",
+      "max_depth",
+      "feature_fraction",
+      "feature_fraction_bynode",
+      "feature_fraction_seed",
+      "max_bin",
+      "alpha",
+      "fair_c",
+      "tweedie_variance_power",
+      "device",
+      "use_missing"
+    ],
+    "unknown_key": "error, not ignored",
+    "mojo_api_only_key": "reported as unsupported with a reason, not as unknown"
+  },
+  "model_format": {
+    "magic": "mojoboost",
+    "version": "v3",
+    "encoding": "plain text tokens; floats as IEEE-754 bit patterns in decimal UInt64",
+    "kind_token": ["objective", "multiclass"],
+    "readable_versions": ["v1", "v2", "v3"],
+    "forward_compatible": false,
+    "sections": {
+      "v1": ["mapper edges and offsets", "per-node feature, threshold, children, value"],
+      "v2": ["missing bins and per-node default_left", "optional monotone section", "optional categorical section", "optional per-tree cat section"],
+      "v3": ["per-node covers, unconditional"]
+    },
+    "absent_by_design": ["num_leaves", "regularization", "interaction constraints", "subsampling", "split gains", "feature names", "training device"]
+  },
+  "inspection": {
+    "structured_dump": null,
+    "structured_dump_note": "no dump_model and no trees_to_dataframe; when added, it gets its own schema version",
+    "available": [
+      "Booster.model_to_string",
+      "feature_importances_",
+      "Booster.feature_importance",
+      "predict(pred_leaf=True)",
+      "predict(pred_contrib=True)",
+      "evals_result_",
+      "booster_ accessors",
+      "Dataset accessors"
+    ],
+    "leaf_id_numbering": "ordinal within its own tree in [0, num_leaves), node order, mojoboost's own and not LightGBM's",
+    "contrib_shapes": {
+      "single_output": "(n_samples, n_features + 1)",
+      "multiclass": "(n_samples, n_classes * (n_features + 1)), class-major blocks"
+    },
+    "leaf_shapes": {
+      "single_output": "(n_samples, num_iteration)",
+      "multiclass": "(n_samples, num_iteration * n_classes)"
+    },
+    "evals_result_shape": "{valid_name: {metric_name: [round 0, round 1, ...]}}, index 0 is the base-score-only model"
+  },
+  "environment_variables": {
+    "MOJOBOOST_NUM_WORKERS": "1 serial, N>1 forced chunked and takes precedence over the threshold, 0 or unset automatic",
+    "MOJOBOOST_PARALLEL_MIN_OPS": "overrides the parallel dispatch threshold",
+    "MOJOBOOST_DISABLE_GPU": "device selection behaves as though no accelerator were present",
+    "MOJOBOOST_GPU_HIST_STRATEGY": "selects the GPU histogram strategy",
+    "MOJOBOOST_GPU_BLOCK_THREADS": "overrides GPU launch block width",
+    "MOJOBOOST_GPU_ROW_TILE": "overrides GPU row tile size",
+    "MOJOBOOST_AUTO_MIN_CELLS": "threshold for automatic device selection",
+    "covered": "semantics",
+    "not_covered": "default numeric values, which are tuning constants"
+  },
+  "platforms": {
+    "declared": ["osx-arm64", "linux-64", "linux-aarch64"],
+    "tiers": {
+      "linux-64 CPU": 1,
+      "linux-aarch64 CPU": 1,
+      "osx-arm64 CPU": 2,
+      "apple-gpu-metal": 2,
+      "nvidia-gpu-cuda": 3,
+      "amd-gpu-hip": 3
+    },
+    "never_executed": ["nvidia-gpu-cuda", "amd-gpu-hip"],
+    "unsupported": ["windows"],
+    "artifacts": ["macOS arm64 wheel, cp314-cp314-macosx_26_0_arm64, unpublished"],
+    "no_artifact": ["linux-64", "linux-aarch64"]
+  },
+  "numerical_contracts": [
+    "pred_contrib rows sum to the raw score exactly",
+    "predict(num_iteration=k) equals a k-round fit; [0,k) plus [k,n) equals the whole raw score",
+    "save and load round trips bit-exactly",
+    "all-ones sample_weight equals no sample_weight, bit-identically",
+    "no callbacks means no boundary crossing and a bit-identical model",
+    "a sparse fit equals the dense fit with gaps filled with zeros",
+    "a repeat run on the same device is bit-identical",
+    "worker count does not change a CPU result",
+    "CPU and GPU agree within a Float32 tolerance with exact integer counts, and are not bit-identical to each other"
+  ]
+}

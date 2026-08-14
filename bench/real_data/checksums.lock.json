@@ -1,0 +1,22 @@
+{
+  "_about": [
+    "Observed digests for the datasets in sources.json.",
+    "",
+    "Written only by `python bench/real_data/fetch.py --pin <dataset>`, which",
+    "records what it actually downloaded. Nothing in this file is written by",
+    "hand, and an entry that is not here has not been verified by anyone.",
+    "",
+    "`archive` is the digest of the bytes served at the URL. `members` holds",
+    "the digest of each extracted file the loader reads, so a re-zipped",
+    "archive with the same contents still verifies at the member level.",
+    "`pinned_at` is the UTC date of the fetch that recorded the entry and",
+    "`pinned_by` is the value of MOJOBOOST_BENCH_PINNER or the hostname.",
+    "",
+    "When a pin stops matching, the dataset changed underneath us. That is a",
+    "finding, not a nuisance: record the new digest as a second entry under",
+    "`superseded` and say which results used which."
+  ],
+  "version": 1,
+  "pins": {},
+  "superseded": {}
+}

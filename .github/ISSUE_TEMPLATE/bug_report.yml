@@ -1,0 +1,64 @@
+name: Bug report
+description: Report incorrect behavior, a crash, or an installation problem
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing mojoboost. It is an experimental public alpha. Please include a minimal reproducer and complete environment details.
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Describe the observed behavior and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproducer
+    attributes:
+      label: Minimal reproducer
+      description: Include the smallest code and data shape that reproduces the problem.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include OS, architecture, CPU, GPU, Python version, and output from pixi run mojo --version.
+    validations:
+      required: true
+  - type: dropdown
+    id: device
+    attributes:
+      label: Requested device
+      options:
+        - cpu
+        - gpu
+        - auto
+        - not applicable
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Complete error or output
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: comparison
+    attributes:
+      label: LightGBM or CPU comparison
+      description: If relevant, include aligned LightGBM or mojoboost CPU output and parameters.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched existing issues for this failure.
+          required: true
+        - label: I removed private or sensitive data from the reproducer.
+          required: true

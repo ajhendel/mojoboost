@@ -1,0 +1,196 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ajhendel/mojoboost/bench/real_data/schema.json",
+  "title": "mojoboost real-data differential result record",
+  "description": "One record per measured run. run.py writes one file per run under records/ and concatenates them into records.json; records.csv is a flat projection of the same records and is derived, never authoritative. Two conventions run through the schema. A measurement that could not be taken is an object with a null value and an unavailable_reason, never an omitted field and never an estimate. And a timing is always a list of samples or a single measured phase, never a pre-averaged number, so the reader can see the spread that produced it.",
+  "type": "object",
+  "required": ["schema_version", "status", "scenario", "engine"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "status": {
+      "enum": ["ok", "error", "timeout", "skipped"],
+      "description": "A run that did not complete is recorded, not dropped."
+    },
+    "run_id": {"type": ["string", "null"]},
+    "job_index": {"type": ["integer", "null"]},
+    "repeat": {"type": ["integer", "null"], "description": "Whole-process repeat index."},
+    "scenario": {"type": "string"},
+    "scenario_title": {"type": "string"},
+    "tier": {"enum": ["smoke", "standard", "large"]},
+    "task": {"enum": ["regression", "binary", "multiclass", "ranking"]},
+    "primary_metric": {"type": "string"},
+    "threads": {"type": "integer", "minimum": 1},
+    "engine": {"enum": ["mojoboost", "lightgbm"]},
+    "engine_version": {"type": ["string", "null"]},
+    "device_requested": {"enum": ["cpu", "gpu", "auto"]},
+    "device_used": {
+      "type": ["string", "null"],
+      "description": "What the engine resolved to, which can differ from what was asked for. The sparse path is cpu whatever was requested."
+    },
+    "path": {
+      "type": "string",
+      "description": "Which API the run went through: `dataset` for the Dataset and train pair, `estimator_csc` for the sparse estimator path where binning is not separable."
+    },
+    "data": {
+      "type": "object",
+      "required": ["data_kind", "dataset"],
+      "properties": {
+        "data_kind": {"enum": ["real", "synthetic"]},
+        "dataset": {"type": "string"},
+        "pinned": {"type": "boolean"},
+        "pin_reason": {"type": ["string", "null"]},
+        "fallback_reason": {
+          "type": ["string", "null"],
+          "description": "Why the generator was used when real data was asked for. Null when nothing fell back. A fallback is never silent."
+        },
+        "generator": {"type": "string"},
+        "generator_kwargs": {"type": "object"},
+        "split": {"type": "object"},
+        "source": {"type": "object"},
+        "categorical_feature": {"type": "array", "items": {"type": "integer"}},
+        "category_vocab_sha256": {"type": "string"},
+        "train": {"$ref": "#/$defs/part"},
+        "test": {"$ref": "#/$defs/part"}
+      }
+    },
+    "params": {
+      "type": "object",
+      "required": ["shared", "engine"],
+      "description": "The canonical parameters and the engine's translation of them, both recorded so a reader can check the alignment rather than trust it.",
+      "properties": {
+        "shared": {"type": "object"},
+        "engine": {"type": "object"}
+      }
+    },
+    "caveats": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Known ways this run is not a like-for-like comparison. Copied into every record the scenario produces and reprinted by report.py."
+    },
+    "quality": {
+      "type": "object",
+      "additionalProperties": {"type": ["number", "null"]},
+      "description": "Computed by quality.py from the predictions. Never an engine's own metric output."
+    },
+    "baseline_quality": {
+      "type": "object",
+      "additionalProperties": {"type": ["number", "null"]},
+      "description": "The trivial model's score on the same test set, so agreement between two bad models can be told apart from agreement between two good ones."
+    },
+    "predictions_sha256": {"type": "string"},
+    "predictions_shape": {"type": "array", "items": {"type": "integer"}},
+    "predictions_path": {"type": "string"},
+    "warmup": {"$ref": "#/$defs/phase"},
+    "phases": {
+      "type": "object",
+      "properties": {
+        "import": {"$ref": "#/$defs/phase"},
+        "binning": {
+          "oneOf": [{"$ref": "#/$defs/phase"}, {"type": "null"}],
+          "description": "Null on a path that bins inside fit, with binning_unavailable_reason alongside."
+        },
+        "binning_unavailable_reason": {"type": "string"},
+        "train": {"$ref": "#/$defs/phase"},
+        "predict_batch": {"$ref": "#/$defs/samples"},
+        "predict_row": {"$ref": "#/$defs/samples"}
+      }
+    },
+    "model": {
+      "type": "object",
+      "properties": {
+        "num_trees": {"type": ["integer", "null"]},
+        "current_iteration": {"type": ["integer", "null"]},
+        "num_bin": {"type": ["integer", "null"]},
+        "size": {
+          "type": "object",
+          "properties": {
+            "string_bytes": {"type": ["integer", "null"]},
+            "file_bytes": {"type": ["integer", "null"]},
+            "file_sha256": {"type": "string"},
+            "error": {"type": ["string", "null"]}
+          }
+        }
+      }
+    },
+    "transfers": {
+      "$ref": "#/$defs/optional_measurement",
+      "description": "Host-to-device transfer time. Currently unavailable on both engines and recorded as such rather than estimated."
+    },
+    "peak_rss_bytes": {
+      "type": ["integer", "null"],
+      "description": "Peak resident set of the worker process, in bytes on every platform. Meaningful because each run has its own process."
+    },
+    "environment": {
+      "type": "object",
+      "description": "envinfo.collect(). Machine, versions, git state, accelerator availability, thread environment, and the machine's load and thermal state at collection time."
+    },
+    "worker": {
+      "type": "object",
+      "properties": {
+        "returncode": {"type": "integer"},
+        "wall_s": {"type": "number"},
+        "stderr_tail": {"type": "string"}
+      }
+    },
+    "error": {
+      "type": "object",
+      "properties": {
+        "type": {"type": "string"},
+        "message": {"type": "string"},
+        "traceback": {"type": "string"},
+        "stderr": {"type": "string"}
+      }
+    },
+    "skip_reason": {"type": "string"}
+  },
+  "$defs": {
+    "phase": {
+      "type": "object",
+      "required": ["elapsed_s"],
+      "properties": {
+        "elapsed_s": {"type": ["number", "null"], "description": "Wall time, perf_counter."},
+        "cpu_s": {"type": ["number", "null"], "description": "Process CPU time across all threads."},
+        "parallel_efficiency": {
+          "type": ["number", "null"],
+          "description": "cpu_s divided by elapsed_s. Near 1 on a single-threaded run; a run configured for N threads that reports 1 did not get them."
+        }
+      }
+    },
+    "samples": {
+      "type": "object",
+      "required": ["measured"],
+      "properties": {
+        "warmup": {"type": "array", "items": {"$ref": "#/$defs/phase"}},
+        "measured": {"type": "array", "items": {"$ref": "#/$defs/phase"}}
+      },
+      "description": "Warmup calls and measured calls kept apart. Aggregation happens in report.py, not here."
+    },
+    "optional_measurement": {
+      "type": "object",
+      "required": ["value"],
+      "properties": {
+        "value": {"type": ["number", "null"]},
+        "unit": {"type": "string"},
+        "unavailable_reason": {"type": "string"}
+      }
+    },
+    "part": {
+      "type": "object",
+      "properties": {
+        "rows": {"type": "integer"},
+        "features": {"type": "integer"},
+        "sparse": {"type": "boolean"},
+        "nnz": {"type": "integer"},
+        "density": {"type": "number"},
+        "missing_fraction": {"type": "number"},
+        "queries": {"type": "integer"},
+        "label_mean": {"type": "number"},
+        "label_distinct": {"type": "integer"},
+        "digest": {
+          "type": ["string", "null"],
+          "description": "sha256 of the exact bytes handed to the engine. Both engines build their data independently; equal digests are what makes the pair comparable, and verify.py checks it."
+        }
+      }
+    }
+  }
+}

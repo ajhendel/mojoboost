@@ -1,0 +1,402 @@
+"""The orchestrator. Builds the job matrix and runs it, one process at a
+time.
+
+    python bench/real_data/run.py --dry-run
+    python bench/real_data/run.py --tier smoke
+    python bench/real_data/run.py --scenario dense_regression --device cpu gpu
+    python bench/real_data/run.py --tier standard --threads 1 --threads 8
+
+Runs are sequential and that is not negotiable. Two training runs sharing a
+machine share its memory bandwidth, its cache, and on a laptop its thermal
+budget, and every number either of them produces is then a number about the
+other one too. The harness is slower for it and the timings mean something.
+
+What this writes, under `results/<run_id>/`:
+
+    manifest.json   the matrix, the environment, and what was skipped
+    jobs/*.json     one job spec per run, so any single run can be repeated
+    records/*.json  one record per run
+    predictions/*.npy
+    records.json    every record, concatenated
+    records.csv     the flat view, for a spreadsheet
+
+Nothing in this directory is committed. `results/README.md` says why.
+
+The exit code reports whether the matrix ran, not whether the results were
+good. Quality is verify.py's decision and speed is nobody's.
+"""
+
+import argparse
+import csv
+import json
+import os
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+
+import envinfo  # noqa: E402
+import scenarios  # noqa: E402
+
+DEFAULT_RESULTS = os.path.join(HERE, "results")
+
+#: Thread-count environment for a run. Every library that might spin up its
+#: own pool is pinned to the same number, so a background BLAS pool cannot
+#: quietly help one engine.
+THREAD_ENV = (
+    "MOJOBOOST_NUM_WORKERS",
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+)
+
+
+def default_threads():
+    """Physical cores where that is knowable, logical cores otherwise. On a
+    machine with performance and efficiency cores this is the whole chip,
+    which is what a user gets by default and therefore what to measure."""
+    cpu = envinfo._cpu()
+    return cpu.get("physical_cores") or cpu.get("logical_cores") or 1
+
+
+def build_matrix(args):
+    jobs = []
+    for scenario_id in args.scenario:
+        spec = scenarios.resolve(scenario_id, args.tier, args.variant)
+        for device in args.device:
+            for engine in args.engine:
+                if engine not in spec["engines"]:
+                    continue
+                if device != "cpu":
+                    if device not in spec["devices"]:
+                        jobs.append(
+                            _skip(
+                                scenario_id, engine, device, args,
+                                f"{scenario_id} declares no {device} support",
+                            )
+                        )
+                        continue
+                    if engine == "lightgbm":
+                        jobs.append(
+                            _skip(
+                                scenario_id, engine, device, args,
+                                "LightGBM runs on the CPU in this harness; a "
+                                "cpu-vs-gpu row is a mojoboost-internal "
+                                "comparison and is labelled as one",
+                            )
+                        )
+                        continue
+                for threads in args.threads:
+                    for repeat in range(args.repeats):
+                        jobs.append(
+                            {
+                                "scenario": scenario_id,
+                                "tier": args.tier,
+                                "variant": args.variant,
+                                "engine": engine,
+                                "device": device,
+                                "threads": threads,
+                                "repeat": repeat,
+                                "predict_repeats": args.predict_repeats,
+                                "allow_unpinned": args.allow_unpinned,
+                                "data_digest": not args.no_data_digest,
+                            }
+                        )
+    for index, job in enumerate(jobs):
+        job["job_index"] = index
+    return jobs
+
+
+def _skip(scenario_id, engine, device, args, reason):
+    return {
+        "scenario": scenario_id,
+        "tier": args.tier,
+        "variant": args.variant,
+        "engine": engine,
+        "device": device,
+        "threads": args.threads[0],
+        "repeat": 0,
+        "skip": reason,
+    }
+
+
+def label(job):
+    return (
+        f"{job['scenario']}.{job['engine']}.{job['device']}."
+        f"t{job['threads']}.r{job['repeat']}"
+    )
+
+
+def run_job(job, run_dir, run_id, timeout):
+    """Run one job in a fresh process and return its record."""
+    name = label(job)
+    job_path = os.path.join(run_dir, "jobs", f"{job['job_index']:03d}-{name}.json")
+    record_path = os.path.join(run_dir, "records", f"{job['job_index']:03d}-{name}.json")
+    pred_path = os.path.join(run_dir, "predictions", f"{job['job_index']:03d}-{name}.npy")
+
+    payload = dict(job, run_id=run_id)
+    with open(job_path, "w") as handle:
+        json.dump(payload, handle, indent=2)
+        handle.write("\n")
+
+    env = dict(os.environ)
+    for name_ in THREAD_ENV:
+        env[name_] = str(job["threads"])
+    if job["device"] == "cpu":
+        # A cpu row must be a cpu row even on a machine with an
+        # accelerator, whatever the device parameter would otherwise
+        # resolve to.
+        env["MOJOBOOST_DISABLE_GPU"] = "1"
+    else:
+        env.pop("MOJOBOOST_DISABLE_GPU", None)
+
+    started = time.time()
+    proc = subprocess.run(
+        [
+            sys.executable, os.path.join(HERE, "worker.py"),
+            "--job", job_path,
+            "--out", record_path,
+            "--predictions", pred_path,
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+    wall = time.time() - started
+
+    if os.path.exists(record_path):
+        with open(record_path) as handle:
+            record = json.load(handle)
+    else:
+        record = {
+            "schema_version": 1,
+            "status": "error",
+            "scenario": job["scenario"],
+            "engine": job["engine"],
+            "device_requested": job["device"],
+            "threads": job["threads"],
+            "repeat": job["repeat"],
+            "error": {
+                "type": "WorkerCrash",
+                "message": f"worker exited {proc.returncode} with no record",
+                "stderr": proc.stderr[-4000:],
+            },
+        }
+        with open(record_path, "w") as handle:
+            json.dump(record, handle, indent=2)
+            handle.write("\n")
+    record["worker"] = {
+        "returncode": proc.returncode,
+        "wall_s": wall,
+        "stderr_tail": proc.stderr[-2000:] if proc.stderr else "",
+    }
+    return record
+
+
+CSV_COLUMNS = (
+    "run_id", "scenario", "tier", "task", "data_kind", "dataset", "pinned",
+    "engine", "engine_version", "device_requested", "device_used", "threads",
+    "repeat", "status", "primary_metric", "primary_value", "train_s",
+    "train_cpu_s", "binning_s", "predict_batch_s", "predict_row_s",
+    "warmup_s", "import_s", "peak_rss_bytes", "model_bytes", "num_trees",
+    "train_rows", "train_features", "predictions_sha256", "data_sha256",
+)
+
+
+def _flat(record):
+    def phase(name, field="elapsed_s"):
+        phases = record.get("phases") or {}
+        block = phases.get(name)
+        if isinstance(block, dict) and field in block:
+            return block[field]
+        if isinstance(block, dict) and "measured" in block:
+            values = [s[field] for s in block["measured"] if s.get(field) is not None]
+            return min(values) if values else None
+        return None
+
+    data = record.get("data") or {}
+    train = data.get("train") or {}
+    quality_block = record.get("quality") or {}
+    primary = record.get("primary_metric")
+    return {
+        "run_id": record.get("run_id"),
+        "scenario": record.get("scenario"),
+        "tier": record.get("tier"),
+        "task": record.get("task"),
+        "data_kind": data.get("data_kind"),
+        "dataset": data.get("dataset"),
+        "pinned": data.get("pinned"),
+        "engine": record.get("engine"),
+        "engine_version": record.get("engine_version"),
+        "device_requested": record.get("device_requested"),
+        "device_used": record.get("device_used"),
+        "threads": record.get("threads"),
+        "repeat": record.get("repeat"),
+        "status": record.get("status"),
+        "primary_metric": primary,
+        "primary_value": quality_block.get(primary),
+        "train_s": phase("train"),
+        "train_cpu_s": phase("train", "cpu_s"),
+        "binning_s": phase("binning"),
+        "predict_batch_s": phase("predict_batch"),
+        "predict_row_s": phase("predict_row"),
+        "warmup_s": (record.get("warmup") or {}).get("elapsed_s"),
+        "import_s": phase("import"),
+        "peak_rss_bytes": record.get("peak_rss_bytes"),
+        "model_bytes": ((record.get("model") or {}).get("size") or {}).get("string_bytes"),
+        "num_trees": (record.get("model") or {}).get("num_trees"),
+        "train_rows": train.get("rows"),
+        "train_features": train.get("features"),
+        "predictions_sha256": record.get("predictions_sha256"),
+        "data_sha256": train.get("digest"),
+    }
+
+
+def write_outputs(run_dir, run_id, records, manifest):
+    with open(os.path.join(run_dir, "records.json"), "w") as handle:
+        json.dump({"run_id": run_id, "records": records}, handle, indent=2, default=str)
+        handle.write("\n")
+    with open(os.path.join(run_dir, "records.csv"), "w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(CSV_COLUMNS))
+        writer.writeheader()
+        for record in records:
+            writer.writerow(_flat(record))
+    with open(os.path.join(run_dir, "manifest.json"), "w") as handle:
+        json.dump(manifest, handle, indent=2, default=str)
+        handle.write("\n")
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument(
+        "--scenario", action="append", choices=sorted(scenarios.SCENARIOS),
+        help="repeatable; every scenario by default",
+    )
+    parser.add_argument("--tier", choices=scenarios.TIERS, default="standard")
+    parser.add_argument("--variant", choices=("auto", "real", "synthetic"), default="auto")
+    parser.add_argument(
+        "--engine", action="append", choices=("mojoboost", "lightgbm"),
+        help="repeatable; both by default",
+    )
+    parser.add_argument(
+        "--device", action="append", choices=("cpu", "gpu"),
+        help="repeatable; cpu by default",
+    )
+    parser.add_argument(
+        "--threads", action="append", type=int,
+        help="repeatable; the machine's physical core count by default",
+    )
+    parser.add_argument(
+        "--repeats", type=int, default=3,
+        help="whole-process repeats per cell; 3 is the minimum that shows a spread",
+    )
+    parser.add_argument("--predict-repeats", type=int, default=3)
+    parser.add_argument("--timeout", type=int, default=7200, help="seconds per run")
+    parser.add_argument("--out", default=DEFAULT_RESULTS)
+    parser.add_argument("--tag", default="", help="appended to the run id")
+    parser.add_argument("--allow-unpinned", action="store_true")
+    parser.add_argument(
+        "--no-data-digest", action="store_true",
+        help="skip hashing the input matrices; faster, and gives up the "
+             "guarantee that both engines saw identical data",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="write the matrix and the job files, run nothing",
+    )
+    args = parser.parse_args(argv)
+
+    args.scenario = args.scenario or sorted(scenarios.SCENARIOS)
+    args.engine = args.engine or ["mojoboost", "lightgbm"]
+    args.device = args.device or ["cpu"]
+    args.threads = args.threads or [default_threads()]
+
+    jobs = build_matrix(args)
+    run_id = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + (
+        f"-{args.tag}" if args.tag else ""
+    )
+    run_dir = os.path.join(args.out, run_id)
+    for sub in ("jobs", "records", "predictions"):
+        os.makedirs(os.path.join(run_dir, sub), exist_ok=True)
+
+    manifest = {
+        "run_id": run_id,
+        "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "arguments": vars(args),
+        "environment": envinfo.collect(),
+        "jobs": jobs,
+        "sequential": True,
+        "note": (
+            "Runs are sequential. Timings from a run whose manifest says "
+            "otherwise are timings of a contended machine."
+        ),
+    }
+
+    runnable = [job for job in jobs if "skip" not in job]
+    skipped = [job for job in jobs if "skip" in job]
+    print(f"run {run_id}: {len(runnable)} runs, {len(skipped)} skipped")
+    for job in skipped:
+        print(f"  skip {label(job)}: {job['skip']}")
+
+    if args.dry_run:
+        for job in runnable:
+            print(f"  would run {label(job)}")
+        write_outputs(run_dir, run_id, [], manifest)
+        print(f"\nmatrix written to {run_dir}. Nothing was run.")
+        return 0
+
+    records = []
+    for job in runnable:
+        print(f"  {label(job)} ... ", end="", flush=True)
+        try:
+            record = run_job(job, run_dir, run_id, args.timeout)
+        except subprocess.TimeoutExpired:
+            record = {
+                "schema_version": 1,
+                "status": "timeout",
+                "scenario": job["scenario"],
+                "engine": job["engine"],
+                "device_requested": job["device"],
+                "threads": job["threads"],
+                "repeat": job["repeat"],
+                "error": {"type": "Timeout", "message": f"exceeded {args.timeout}s"},
+            }
+        records.append(record)
+        state = record.get("status")
+        detail = ""
+        if state == "ok":
+            metric = record.get("primary_metric")
+            detail = f"{metric}={record['quality'].get(metric):.6g}"
+        else:
+            detail = (record.get("error") or {}).get("message", "")[:120]
+        print(f"{state} {detail}")
+
+    for job in skipped:
+        records.append(
+            {
+                "schema_version": 1, "status": "skipped",
+                "scenario": job["scenario"], "engine": job["engine"],
+                "device_requested": job["device"], "threads": job["threads"],
+                "repeat": 0, "skip_reason": job["skip"],
+            }
+        )
+
+    write_outputs(run_dir, run_id, records, manifest)
+    failed = [r for r in records if r.get("status") in ("error", "timeout")]
+    print(f"\nwrote {run_dir}/records.json")
+    print(
+        "next: `python bench/real_data/verify.py "
+        f"{os.path.join(run_dir, 'records.json')}` for the correctness "
+        "verdict, then report.py for the timings."
+    )
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

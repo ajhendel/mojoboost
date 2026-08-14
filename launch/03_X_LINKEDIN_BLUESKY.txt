@@ -1,0 +1,11 @@
+DESTINATION: X, LinkedIn, or Bluesky from your personal account
+
+I am open-sourcing MojoBoost: native gradient-boosted trees written in Mojo, targeting the GPU already inside every Apple Silicon Mac.
+
+The project combines a LightGBM-familiar Python API with native CPU and GPU training. It already has a broad feature surface including sparse and categorical data, missing values, regression, classification, ranking, early stopping, callbacks, serialization, model contributions, and end-to-end GPU tree growth.
+
+It is an experimental public alpha, not yet a production replacement for LightGBM or XGBoost. I am looking for contributors and testers interested in Mojo, Apple GPU optimization, tree algorithms, Python packaging, and validation on Apple, NVIDIA, and AMD hardware.
+
+Repository: https://github.com/ajhendel/mojoboost
+
+The immediate technical priorities are active-row compaction, device-side split selection and objectives, persistent GPU execution, trustworthy end-to-end benchmarks, and easy macOS installation.

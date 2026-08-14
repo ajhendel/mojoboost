@@ -1,0 +1,10 @@
+# Downloaded datasets. Pinned by checksums.lock.json, which is committed;
+# the bytes themselves are not, and some of them run to gigabytes.
+data/
+
+# Run output. results/README.md says why none of it is committed.
+results/*
+!results/README.md
+
+__pycache__/
+*.pyc

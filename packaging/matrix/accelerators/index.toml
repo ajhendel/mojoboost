@@ -1,0 +1,424 @@
+# Accelerator evidence index.
+#
+# One row per device we would claim anything about. Every row starts at
+# `not-run` and moves only when a record exists, in the format the templates in
+# this directory define, holding output somebody watched print.
+#
+# docs/GPU_VALIDATION.md is the record of truth; this file is its index, so a
+# row here can never be ahead of what that document contains. The rule
+# validate_matrix.py enforces: any status other than `not-run` requires a
+# non-empty `record`, and any row claiming `validated` requires all four of
+# correctness, determinism, phase_timings, and profiler to be `pass`.
+#
+# The chip list is a fill-in target, not a support claim. A row existing here
+# says the device is worth recording, not that it works, not that MAX supports
+# it, and not that anyone owns one.
+
+schema = 1
+record_of_truth = "docs/GPU_VALIDATION.md"
+
+[vocabulary]
+"not-run" = "Nothing has executed on this device. The default, and the only honest state without a record."
+partial = "Some of the six validation steps ran and are recorded. The per-step columns say which."
+validated = "All four recorded columns pass and the record names the host, the driver, and the toolchain."
+unsupported = "The build or the runtime refuses this device, and the refusal is recorded."
+
+[steps]
+correctness = "GPU histograms and GPU-trained models agree with the CPU reference inside the documented Float32 tolerance; integer counts agree exactly."
+determinism = "Repeat runs are bit-identical, and the two accumulation strategies agree bit-identically."
+phase_timings = "A recorded `pixi run gpu-validate` sweep across several shapes, with training MSE next to every throughput number."
+profiler = "Occupancy, shared-memory limiter, bank conflicts, and atomic traffic read off a real trace and compared against the harness predictions."
+
+# ---------------------------------------------------------------------------
+# Apple, Metal
+#
+# `template` is packaging/matrix/accelerators/TEMPLATE_apple.md.
+#
+# What every Apple row must record beyond the common block, because these are
+# the numbers the tiling policy depends on and they are the ones that differ
+# across the family: `max_shared_memory_per_block`, `multiprocessor_count`,
+# `max_threads_per_block`, and which of the eleven device attributes the
+# backend refuses. On the M4 that refusal list is six long; assume nothing
+# about the others.
+# ---------------------------------------------------------------------------
+
+[[device]]
+id = "apple-m1"
+vendor = "apple"
+chip = "M1"
+api = "metal"
+status = "not-run"
+correctness = "not-run"
+determinism = "not-run"
+phase_timings = "not-run"
+profiler = "not-run"
+record = ""
+template = "packaging/matrix/accelerators/TEMPLATE_apple.md"
+
+[[device]]
+id = "apple-m1-pro"
+vendor = "apple"
+chip = "M1 Pro"
+api = "metal"
+status = "not-run"
+correctness = "not-run"
+determinism = "not-run"
+phase_timings = "not-run"
+profiler = "not-run"
+record = ""
+template = "packaging/matrix/accelerators/TEMPLATE_apple.md"
+
+[[device]]
+id = "apple-m1-max"
+vendor = "apple"
+chip = "M1 Max"
+api = "metal"
+status = "not-run"
+correctness = "not-run"
+determinism = "not-run"
+phase_timings = "not-run"
+profiler = "not-run"
+record = ""
+template = "packaging/matrix/accelerators/TEMPLATE_apple.md"
+
+[[device]]
+id = "apple-m1-ultra"
+vendor = "apple"
+chip = "M1 Ultra"
+api = "metal"
+status = "not-run"
+correctness = "not-run"
+determinism = "not-run"
+phase_timings = "not-run"
+profiler = "not-run"
+record = ""
+template = "packaging/matrix/accelerators/TEMPLATE_apple.md"
+
+[[device]]
+id = "apple-m2"
+vendor = "apple"
+chip = "M2"
+api = "metal"
+status = "not-run"
+correctness = "not-run"
+determinism = "not-run"
+phase_timings = "not-run"
+profiler = "not-run"
+record = ""
+template = "packaging/matrix/accelerators/TEMPLATE_apple.md"
+
+[[device]]
+id = "apple-m2-pro"
+vendor = "apple"
+chip = "M2 Pro"
+api = "metal"
+status = "not-run"
+correctness = "not-run"
+determinism = "not-run"
+phase_timings = "not-run"
+profiler = "not-run"
+record = ""
+template = "packaging/matrix/accelerators/TEMPLATE_apple.md"
+
+[[device]]
+id = "apple-m2-max"
+vendor = "apple"
+chip = "M2 Max"
+api = "metal"
+status = "not-run"
+correctness = "not-run"
+determinism = "not-run"
+phase_timings = "not-run"
+profiler = "not-run"
+record = ""
+template = "packaging/matrix/accelerators/TEMPLATE_apple.md"
+
+[[device]]
+id = "apple-m2-ultra"
+vendor = "apple"
+chip = "M2 Ultra"
+api = "metal"
+status = "not-run"
+correctness = "not-run"
+determinism = "not-run"
+phase_timings = "not-run"
+profiler = "not-run"
+record = ""
+template = "packaging/matrix/accelerators/TEMPLATE_apple.md"
+
+[[device]]
+id = "apple-m3"
+vendor = "apple"
+chip = "M3"
+api = "metal"
+status = "not-run"
+correctness = "not-run"
+determinism = "not-run"
+phase_timings = "not-run"
+profiler = "not-run"
+record = ""
+template = "packaging/matrix/accelerators/TEMPLATE_apple.md"
+
+[[device]]
+id = "apple-m3-pro"
+vendor = "apple"
+chip = "M3 Pro"
+api = "metal"
+status = "not-run"
+correctness = "not-run"
+determinism = "not-run"
+phase_timings = "not-run"
+profiler = "not-run"
+record = ""
+template = "packaging/matrix/accelerators/TEMPLATE_apple.md"
+
+[[device]]
+id = "apple-m3-max"
+vendor = "apple"
+chip = "M3 Max"
+api = "metal"
+status = "not-run"
+correctness = "not-run"
+determinism = "not-run"
+phase_timings = "not-run"
+profiler = "not-run"
+record = ""
+template = "packaging/matrix/accelerators/TEMPLATE_apple.md"
+
+[[device]]
+id = "apple-m3-ultra"
+vendor = "apple"
+chip = "M3 Ultra"
+api = "metal"
+status = "not-run"
+correctness = "not-run"
+determinism = "not-run"
+phase_timings = "not-run"
+profiler = "not-run"
+record = ""
+template = "packaging/matrix/accelerators/TEMPLATE_apple.md"
+
+[[device]]
+id = "apple-m4"
+vendor = "apple"
+chip = "M4"
+api = "metal"
+status = "partial"
+correctness = "pass"
+determinism = "pass"
+phase_timings = "partial"
+profiler = "not-run"
+record = "docs/GPU_VALIDATION.md"
+template = "packaging/matrix/accelerators/TEMPLATE_apple.md"
+notes = """
+The 10 GPU core part, the development machine, and the only device that has
+ever run this code. `partial` on phase timings means the harness runs and
+prints; no recorded sweep across the four default shapes exists. The recorded
+device header is in docs/GPU_VALIDATION.md and reports
+max_shared_memory_per_block 32768, multiprocessor_count 10,
+max_threads_per_block 1024, and six attributes refused including WARP_SIZE.
+"""
+
+[[device]]
+id = "apple-m4-pro"
+vendor = "apple"
+chip = "M4 Pro"
+api = "metal"
+status = "not-run"
+correctness = "not-run"
+determinism = "not-run"
+phase_timings = "not-run"
+profiler = "not-run"
+record = ""
+template = "packaging/matrix/accelerators/TEMPLATE_apple.md"
+notes = """
+A larger member of the same generation as the recorded M4 is the cheapest
+useful second Apple data point: it changes multiprocessor_count and nothing
+else about the backend, so it tests whether the tiling policy scales with core
+count on Metal without introducing a second variable.
+"""
+
+[[device]]
+id = "apple-m4-max"
+vendor = "apple"
+chip = "M4 Max"
+api = "metal"
+status = "not-run"
+correctness = "not-run"
+determinism = "not-run"
+phase_timings = "not-run"
+profiler = "not-run"
+record = ""
+template = "packaging/matrix/accelerators/TEMPLATE_apple.md"
+
+[[device]]
+id = "apple-m5"
+vendor = "apple"
+chip = "M5"
+api = "metal"
+status = "not-run"
+correctness = "not-run"
+determinism = "not-run"
+phase_timings = "not-run"
+profiler = "not-run"
+record = ""
+template = "packaging/matrix/accelerators/TEMPLATE_apple.md"
+notes = """
+Add M5 Pro, M5 Max, and M5 Ultra rows when those chips exist and the pinned MAX
+release lists them. Do not pre-create rows for hardware that has not shipped; an
+empty row reads as a gap in testing rather than as a gap in the product line.
+"""
+
+# ---------------------------------------------------------------------------
+# NVIDIA, CUDA
+#
+# `template` is packaging/matrix/accelerators/TEMPLATE_nvidia.md.
+#
+# The rows below are the devices the validation procedure in
+# docs/GPU_VALIDATION.md names as rentable for a few dollars, plus the two
+# datacenter parts worth a row if one is ever borrowed. None is owned. The
+# workflow job that would run them, `nvidia` in .github/workflows/gpu-
+# validation.yml, targets a self-hosted runner that has never been registered.
+# ---------------------------------------------------------------------------
+
+[[device]]
+id = "nvidia-a10g"
+vendor = "nvidia"
+chip = "A10G"
+api = "cuda"
+status = "not-run"
+correctness = "not-run"
+determinism = "not-run"
+phase_timings = "not-run"
+profiler = "not-run"
+record = ""
+template = "packaging/matrix/accelerators/TEMPLATE_nvidia.md"
+notes = "AWS g5.xlarge. Named in docs/GPU_VALIDATION.md as a cheap validation host."
+
+[[device]]
+id = "nvidia-l4"
+vendor = "nvidia"
+chip = "L4"
+api = "cuda"
+status = "not-run"
+correctness = "not-run"
+determinism = "not-run"
+phase_timings = "not-run"
+profiler = "not-run"
+record = ""
+template = "packaging/matrix/accelerators/TEMPLATE_nvidia.md"
+notes = "AWS g6.xlarge or GCP g2-standard-4."
+
+[[device]]
+id = "nvidia-a100"
+vendor = "nvidia"
+chip = "A100"
+api = "cuda"
+status = "not-run"
+correctness = "not-run"
+determinism = "not-run"
+phase_timings = "not-run"
+profiler = "not-run"
+record = ""
+template = "packaging/matrix/accelerators/TEMPLATE_nvidia.md"
+
+[[device]]
+id = "nvidia-h100"
+vendor = "nvidia"
+chip = "H100"
+api = "cuda"
+status = "not-run"
+correctness = "not-run"
+determinism = "not-run"
+phase_timings = "not-run"
+profiler = "not-run"
+record = ""
+template = "packaging/matrix/accelerators/TEMPLATE_nvidia.md"
+
+[[device]]
+id = "nvidia-rtx-consumer"
+vendor = "nvidia"
+chip = "consumer GeForce RTX"
+api = "cuda"
+status = "not-run"
+correctness = "not-run"
+determinism = "not-run"
+phase_timings = "not-run"
+profiler = "not-run"
+record = ""
+template = "packaging/matrix/accelerators/TEMPLATE_nvidia.md"
+notes = """
+Record the exact board, not the family. A consumer result does not transfer to
+a datacenter part or the other way round, and this row must be split into
+per-board rows the moment a second one is run.
+"""
+
+# ---------------------------------------------------------------------------
+# AMD, HIP
+#
+# `template` is packaging/matrix/accelerators/TEMPLATE_amd.md.
+#
+# Consumer RDNA and datacenter CDNA are different enough that a result from one
+# says nothing about the other, which is why they get separate rows rather than
+# one AMD row.
+# ---------------------------------------------------------------------------
+
+[[device]]
+id = "amd-mi300x"
+vendor = "amd"
+chip = "MI300X"
+api = "hip"
+status = "not-run"
+correctness = "not-run"
+determinism = "not-run"
+phase_timings = "not-run"
+profiler = "not-run"
+record = ""
+template = "packaging/matrix/accelerators/TEMPLATE_amd.md"
+notes = "CDNA. Azure or Oracle Cloud capacity, or a bare-metal lease."
+
+[[device]]
+id = "amd-mi210"
+vendor = "amd"
+chip = "MI210"
+api = "hip"
+status = "not-run"
+correctness = "not-run"
+determinism = "not-run"
+phase_timings = "not-run"
+profiler = "not-run"
+record = ""
+template = "packaging/matrix/accelerators/TEMPLATE_amd.md"
+notes = "CDNA. Bare-metal lease."
+
+[[device]]
+id = "amd-rx-7900"
+vendor = "amd"
+chip = "Radeon RX 7900 XT/XTX"
+api = "hip"
+status = "not-run"
+correctness = "not-run"
+determinism = "not-run"
+phase_timings = "not-run"
+profiler = "not-run"
+record = ""
+template = "packaging/matrix/accelerators/TEMPLATE_amd.md"
+notes = """
+RDNA. The cheapest HIP target to keep on a desk, and the one docs/
+GPU_VALIDATION.md recommends for a permanent validation box. Record which of
+XT and XTX ran.
+"""
+
+[[device]]
+id = "amd-rx-9070"
+vendor = "amd"
+chip = "Radeon RX 9070"
+api = "hip"
+status = "not-run"
+correctness = "not-run"
+determinism = "not-run"
+phase_timings = "not-run"
+profiler = "not-run"
+record = ""
+template = "packaging/matrix/accelerators/TEMPLATE_amd.md"
+notes = "RDNA."

@@ -1,0 +1,183 @@
+{
+  "_about": [
+    "Correctness thresholds. These gate; timings do not.",
+    "",
+    "Two kinds of number get confused in benchmark suites. A quality",
+    "difference between two engines fitting the same objective on the same",
+    "bins is small, stable, and reproducible, so a threshold on it is a real",
+    "test: cross it and something is wrong. A timing is none of those things",
+    "on a laptop with a thermal budget, so a threshold on it is a coin toss",
+    "wearing a lab coat. verify.py reads this file and decides pass or fail.",
+    "report.py prints the timings and decides nothing.",
+    "",
+    "Every value here was chosen before any run, from what the two",
+    "implementations are known to differ by, and each carries its reasoning.",
+    "Loosening one after seeing a result is allowed and has to be done in a",
+    "commit that says so; editing one to make today's run green is how a",
+    "suite stops meaning anything.",
+    "",
+    "Directions. `max_worse` is how much worse mojoboost may be than",
+    "LightGBM on the primary metric. Being better is not capped, but being",
+    "much better is checked too: `implausible_better` catches the case where",
+    "the two engines were not actually given the same problem, which looks",
+    "like a win and is a bug."
+  ],
+  "version": 1,
+  "defaults": {
+    "determinism": {
+      "mojoboost": {
+        "require_identical_predictions": true,
+        "scope": "same scenario, device, and thread count",
+        "rationale": "Repeat training is bit-identical by design, including on the accelerator, where the histogram reduction stays in fixed point precisely so that it is. A digest that moves is a regression in that property and is worth failing over even when the metrics are unchanged."
+      },
+      "lightgbm": {
+        "require_identical_predictions": true,
+        "gating": false,
+        "rationale": "LightGBM is run with deterministic=true and a fixed seed, so repeats should match. It is reported rather than gated because it is not this project's invariant to hold."
+      }
+    },
+    "data_agreement": {
+      "require_identical_digests": true,
+      "rationale": "Both engines rebuild the data independently in their own processes. Equal digests are what makes the comparison a comparison; unequal digests make every other number in the row meaningless, so this fails before anything else is checked."
+    },
+    "device_agreement": {
+      "max_abs_prediction_diff": 1e-3,
+      "primary_metric_relative": 0.005,
+      "rationale": "The tolerance the repository's own CPU-and-accelerator equivalence tests use for predictions. Split selection is identical in exact arithmetic; the accelerator histogram accumulates in fixed point and converts once, so differences are at rounding scale and do not compound across a hundred rounds."
+    },
+    "pinning": {
+      "require_pinned_for_real_data": true,
+      "rationale": "A real-data result from unverified bytes is a result about an unknown dataset. Synthetic runs are exempt because their recipe is the pin."
+    }
+  },
+  "scenarios": {
+    "dense_regression": {
+      "primary_metric": "rmse",
+      "differential": {
+        "kind": "relative",
+        "max_worse": 0.03,
+        "implausible_better": 0.10,
+        "rationale": "Same objective, same bin count, same leaf count. What is left is tie breaking in the split search and the order of floating-point summation, which moves RMSE in the third decimal place. Three percent is far above that and far below a broken model."
+      },
+      "secondary": {"mae": {"kind": "relative", "max_worse": 0.05}},
+      "baseline": {
+        "kind": "relative_improvement",
+        "metric": "rmse",
+        "min": 0.20,
+        "rationale": "A model that cannot beat the training mean by a fifth did not fit. Two engines agreeing on a non-model would otherwise pass the differential check."
+      }
+    },
+    "imbalanced_binary": {
+      "primary_metric": "average_precision",
+      "differential": {
+        "kind": "absolute",
+        "max_worse": 0.02,
+        "implausible_better": 0.05,
+        "rationale": "Average precision on a rare class is dominated by the ordering of a few hundred rows at the top of the ranking, so it is noisier than AUC on the same model. Two percentage points absolute is the noise band; more than that is a difference in the trees."
+      },
+      "secondary": {
+        "auc": {"kind": "absolute", "max_worse": 0.005},
+        "logloss": {"kind": "relative", "max_worse": 0.03}
+      },
+      "baseline": {
+        "kind": "absolute_floor",
+        "metric": "auc",
+        "min": 0.65,
+        "rationale": "The constant baseline scores 0.5 by construction. A model below 0.65 has found almost nothing and its agreement with another such model says nothing."
+      }
+    },
+    "multiclass": {
+      "primary_metric": "multi_logloss",
+      "differential": {
+        "kind": "relative",
+        "max_worse": 0.05,
+        "implausible_better": 0.15,
+        "rationale": "Multiclass compounds: one tree per class per round, and a divergence in round one is carried by every later round through the softmax. Five percent allows for that accumulation where three would fail on drift alone."
+      },
+      "secondary": {"accuracy": {"kind": "absolute", "max_worse": 0.01}},
+      "baseline": {
+        "kind": "relative_improvement",
+        "metric": "multi_logloss",
+        "min": 0.10,
+        "rationale": "The baseline is the class prior, which is a strong opponent on a skewed problem. Ten percent is enough to show the trees are contributing."
+      }
+    },
+    "ranking": {
+      "primary_metric": "ndcg@10",
+      "differential": {
+        "kind": "absolute",
+        "max_worse": 0.02,
+        "implausible_better": 0.05,
+        "rationale": "The loosest threshold in the file, and the caveats on the scenario say why: LightGBM reads its pairwise sigmoid from a lookup table where mojoboost evaluates it, so the two models diverge from the first pair rather than from the first tie. Comparable NDCG is the claim being tested, not identical models."
+      },
+      "secondary": {"ndcg@5": {"kind": "absolute", "max_worse": 0.025}},
+      "baseline": {
+        "kind": "absolute_improvement",
+        "metric": "ndcg@10",
+        "min": 0.05,
+        "rationale": "The baseline leaves every query in stored order, which on a real ranking file is not random and can score surprisingly well. Five points above it is the floor for having learned anything."
+      }
+    },
+    "categorical_missing": {
+      "primary_metric": "rmse",
+      "differential": {
+        "kind": "relative",
+        "max_worse": 0.05,
+        "implausible_better": 0.15,
+        "rationale": "Category-set splits are chosen by sorting categories on a smoothed gradient statistic and taking a prefix, and two implementations of that sort break ties differently on a high-cardinality column. Missing direction is decided per node and can flip on a near-tie. Both are genuine divergence sources, so this is looser than the dense case."
+      },
+      "secondary": {},
+      "baseline": {
+        "kind": "relative_improvement",
+        "metric": "rmse",
+        "min": 0.15,
+        "rationale": "The categorical signal in the generator is most of the variance, so a model that handled categories as ordinal numbers would still beat the mean. Fifteen percent, not twenty, so this checks for a fit rather than for a good one."
+      },
+      "real_variant_overrides": {
+        "adult": {
+          "primary_metric": "auc",
+          "differential": {"kind": "absolute", "max_worse": 0.01},
+          "baseline": {"kind": "absolute_floor", "metric": "auc", "min": 0.85},
+          "rationale": "The real variant of this scenario is a classification problem. 0.85 AUC on adult is well inside what a gradient-boosted model reaches, so a run below it has a data or encoding fault rather than a modelling one."
+        }
+      }
+    },
+    "sparse_highdim": {
+      "primary_metric": "auc",
+      "differential": {
+        "kind": "absolute",
+        "max_worse": 0.01,
+        "implausible_better": 0.03,
+        "rationale": "Both engines see the same CSC matrix with the same zero semantics, and neither is doing feature bundling. The remaining difference is which of many near-identical sparse columns wins a split, which moves AUC in the third decimal place."
+      },
+      "secondary": {"average_precision": {"kind": "absolute", "max_worse": 0.03}},
+      "baseline": {
+        "kind": "absolute_floor",
+        "metric": "auc",
+        "min": 0.70,
+        "rationale": "Signal is concentrated in a few hundred of tens of thousands of columns. A model that missed them lands near 0.5, and 0.70 separates that clearly from a model that found them."
+      }
+    }
+  },
+  "performance": {
+    "gating": false,
+    "rationale": [
+      "No timing in this harness fails a run, on purpose.",
+      "",
+      "The machine this is most likely to run on is a laptop that throttles,",
+      "shares its memory bandwidth with a browser, and is sometimes on",
+      "battery. A ratio measured there is a fact about that afternoon.",
+      "report.py prints the spread across repeats next to the middle, refuses",
+      "to compare runs from different machines or different builds, and will",
+      "not print a speedup from fewer than three repeats. That is the whole",
+      "performance policy: show the distribution, name the conditions, and",
+      "let the reader decide."
+    ],
+    "reporting": {
+      "min_repeats_for_ratio": 3,
+      "aggregate": "median",
+      "spread": "min and max across repeats",
+      "instability_warning_iqr_over_median": 0.10
+    }
+  }
+}

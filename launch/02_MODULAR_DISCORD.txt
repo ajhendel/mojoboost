@@ -1,0 +1,13 @@
+DESTINATION: Modular Discord, the channel for Mojo projects, showcases, or GPU development
+
+I just open-sourced MojoBoost, an experimental gradient-boosted tree library written natively in Mojo.
+
+The core idea is a LightGBM-familiar Python API with one Mojo implementation spanning CPU and supported GPUs, with an emphasis on the Metal GPU inside Apple Silicon Macs.
+
+It already includes end-to-end dense and sparse training, numerical and categorical features, missing values, regression, classification, ranking, early stopping, callbacks, serialization, TreeSHAP contributions, and an end-to-end GPU tree-growth path. Metal correctness has been exercised on an Apple M4; NVIDIA and AMD are explicitly unvalidated.
+
+I am looking for technical feedback and contributors, especially around active-row compaction, device-side split selection and objectives, persistent GPU state, Apple tuning, packaging, and cross-device validation.
+
+https://github.com/ajhendel/mojoboost
+
+This is an experimental public alpha, not a production or performance-parity claim.

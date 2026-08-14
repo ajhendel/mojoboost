@@ -1,0 +1,565 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ajhendel/mojoboost/blob/main/bench/apple/schema.json",
+  "title": "mojoboost Apple silicon benchmark run record",
+  "description": "One file per run of bench/apple/suite.py on one machine. A record is a complete description of what was measured, under what conditions, with every quantity that was not measured explicitly null and carrying a reason. Absence of a number is a fact the record must state, never a zero. The protocol these fields come from is docs/APPLE_GPU_BENCHMARK_PROTOCOL.md.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "protocol_version",
+    "suite_version",
+    "run_id",
+    "started_utc",
+    "finished_utc",
+    "invocation",
+    "machine",
+    "software",
+    "conditions",
+    "measurements"
+  ],
+  "properties": {
+    "schema_version": {
+      "description": "Version of this schema the record was written against. Bump the minor for additive optional fields, the major for anything a reader must be changed to understand.",
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "protocol_version": {
+      "description": "Version of docs/APPLE_GPU_BENCHMARK_PROTOCOL.md the run followed. Records written under different protocol versions are not comparable without reading both.",
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "suite_version": {
+      "description": "Version of bench/apple/suite.py that produced the record.",
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "run_id": {
+      "description": "Unique id for this run, used as the result filename stem.",
+      "type": "string",
+      "minLength": 1
+    },
+    "started_utc": { "$ref": "#/$defs/timestamp" },
+    "finished_utc": { "$ref": "#/$defs/timestamp" },
+    "is_template": {
+      "description": "True only for the structural template emitted by `suite.py --self-check`, which carries no measurements. A record with this field true must never be read, quoted, plotted, or merged as a result.",
+      "type": "boolean",
+      "default": false
+    },
+    "invocation": {
+      "description": "How the suite was asked to run, verbatim, so the record can be reproduced.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["argv", "cwd", "repetitions", "cooldown_seconds", "energy_requested"],
+      "properties": {
+        "argv": { "type": "array", "items": { "type": "string" } },
+        "cwd": { "type": "string" },
+        "repetitions": { "type": "integer", "minimum": 1 },
+        "cooldown_seconds": { "type": "number", "minimum": 0 },
+        "energy_requested": { "type": "boolean" },
+        "git_commit": { "$ref": "#/$defs/nullable_string" },
+        "git_dirty": { "type": ["boolean", "null"] }
+      }
+    },
+    "machine": { "$ref": "#/$defs/machine" },
+    "software": { "$ref": "#/$defs/software" },
+    "conditions": { "$ref": "#/$defs/conditions" },
+    "measurements": {
+      "description": "One entry per (workload, engine) pair the plan contained, including pairs that did not run. A pair the suite skipped or that failed is present with a status other than ok, never dropped.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/measurement" }
+    },
+    "notes": {
+      "description": "Free text from the operator. Anything that would change how a reader interprets the numbers and has no field of its own belongs here.",
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  },
+  "$defs": {
+    "timestamp": {
+      "description": "ISO 8601 UTC timestamp, second resolution, trailing Z.",
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "nullable_number": { "type": ["number", "null"] },
+    "nullable_integer": { "type": ["integer", "null"] },
+    "nullable_string": { "type": ["string", "null"] },
+    "unavailable_reason": {
+      "description": "Why a block holds nulls. Required whenever available is false, and the empty string is not an acceptable value.",
+      "type": ["string", "null"],
+      "minLength": 1
+    },
+
+    "machine": {
+      "description": "Hardware identity. Every field is read from the machine, none is inferred from a model name.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "chip_family",
+        "chip_label",
+        "cpu_brand_string",
+        "model_identifier",
+        "physical_cores",
+        "performance_cores",
+        "efficiency_cores",
+        "logical_cores",
+        "gpu_cores",
+        "memory_bytes"
+      ],
+      "properties": {
+        "chip_family": {
+          "description": "Generation bucket used to group results. Derived from cpu_brand_string by the suite; other whenever the parse is not certain. The authoritative identity is cpu_brand_string plus model_identifier, not this field.",
+          "enum": ["m1", "m2", "m3", "m4", "m5", "other", "unknown"]
+        },
+        "chip_label": {
+          "description": "Human label for the fleet table, for example \"M4 Pro\". Written by the operator or parsed from cpu_brand_string; never invented when the parse fails.",
+          "$ref": "#/$defs/nullable_string"
+        },
+        "cpu_brand_string": {
+          "description": "sysctl machdep.cpu.brand_string, raw.",
+          "$ref": "#/$defs/nullable_string"
+        },
+        "model_identifier": {
+          "description": "sysctl hw.model, raw, for example Mac16,10.",
+          "$ref": "#/$defs/nullable_string"
+        },
+        "arch": { "$ref": "#/$defs/nullable_string" },
+        "physical_cores": { "$ref": "#/$defs/nullable_integer" },
+        "performance_cores": {
+          "description": "sysctl hw.perflevel0.physicalcpu. The matched-thread rule in the protocol is stated in these, not in logical cores.",
+          "$ref": "#/$defs/nullable_integer"
+        },
+        "efficiency_cores": {
+          "description": "sysctl hw.perflevel1.physicalcpu.",
+          "$ref": "#/$defs/nullable_integer"
+        },
+        "logical_cores": { "$ref": "#/$defs/nullable_integer" },
+        "gpu_cores": {
+          "description": "GPU core count as reported by system_profiler SPDisplaysDataType. Null when that key is absent on the installed macOS, which is a fact worth keeping rather than a value worth guessing.",
+          "$ref": "#/$defs/nullable_integer"
+        },
+        "gpu_name": { "$ref": "#/$defs/nullable_string" },
+        "memory_bytes": { "$ref": "#/$defs/nullable_integer" },
+        "unified_memory": {
+          "description": "True on Apple silicon. Physically unified memory is not by itself a zero-copy claim; see docs/APPLE_UNIFIED_MEMORY.md.",
+          "type": ["boolean", "null"]
+        }
+      }
+    },
+
+    "software": {
+      "description": "Everything whose version can move a number. A null version means the component was absent, and a measurement that needed it carries status unsupported.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["os_name", "os_version", "python", "mojo", "max", "mojoboost", "lightgbm", "xgboost", "numpy"],
+      "properties": {
+        "os_name": { "$ref": "#/$defs/nullable_string" },
+        "os_version": { "$ref": "#/$defs/nullable_string" },
+        "os_build": { "$ref": "#/$defs/nullable_string" },
+        "kernel": { "$ref": "#/$defs/nullable_string" },
+        "python": { "$ref": "#/$defs/nullable_string" },
+        "mojo": { "$ref": "#/$defs/nullable_string" },
+        "max": { "$ref": "#/$defs/nullable_string" },
+        "mojoboost": { "$ref": "#/$defs/nullable_string" },
+        "mojoboost_gpu_build": {
+          "description": "mojoboost.gpu_available(), which is a property of the build and the machine together. False means the GPU rows of this record are unsupported, not slow.",
+          "type": ["boolean", "null"]
+        },
+        "lightgbm": { "$ref": "#/$defs/nullable_string" },
+        "xgboost": { "$ref": "#/$defs/nullable_string" },
+        "numpy": { "$ref": "#/$defs/nullable_string" },
+        "scipy": { "$ref": "#/$defs/nullable_string" }
+      }
+    },
+
+    "conditions": {
+      "description": "The state of the machine around the run. The protocol's idle and cooldown rules are enforced against these, and a record that fails them is still written, marked, and not quoted.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["idle_gate_passed", "load_average_before", "power_source", "thermal_before", "thermal_after", "throttle_detected"],
+      "properties": {
+        "idle_gate_passed": {
+          "description": "False when the suite ran under --allow-busy with a gate check that failed. Every timing in such a record is conditioned on load that was not controlled.",
+          "type": "boolean"
+        },
+        "idle_gate_failures": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "load_average_before": { "$ref": "#/$defs/nullable_number" },
+        "load_average_after": { "$ref": "#/$defs/nullable_number" },
+        "competing_processes": {
+          "description": "Names of heavy processes seen by the gate, for example mojo, pixi, pytest, Xcode. Empty is the only acceptable value for a quotable run.",
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "power_source": {
+          "description": "AC is required by the protocol. On battery, Apple silicon changes both clocks and power limits.",
+          "enum": ["ac", "battery", "unknown"]
+        },
+        "low_power_mode": { "type": ["boolean", "null"] },
+        "display_sleep_prevented": { "type": ["boolean", "null"] },
+        "thermal_before": { "$ref": "#/$defs/thermal" },
+        "thermal_after": { "$ref": "#/$defs/thermal" },
+        "throttle_detected": {
+          "description": "True when any thermal sample during the run showed a speed limit below 100 or a thermal pressure above nominal. A true here invalidates every timing in the record.",
+          "type": "boolean"
+        },
+        "idle_power_baseline": {
+          "description": "Idle machine power measured under the same sampler immediately before the workloads, which is what makes an energy delta meaningful.",
+          "$ref": "#/$defs/energy"
+        }
+      }
+    },
+
+    "thermal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["available", "reason"],
+      "properties": {
+        "available": { "type": "boolean" },
+        "reason": { "$ref": "#/$defs/unavailable_reason" },
+        "source": {
+          "description": "Which tool produced the sample.",
+          "enum": ["pmset_therm", "powermetrics_thermal", "none"]
+        },
+        "cpu_speed_limit_percent": {
+          "description": "pmset -g therm CPU_Speed_Limit. 100 means unthrottled.",
+          "$ref": "#/$defs/nullable_number"
+        },
+        "scheduler_limit_percent": { "$ref": "#/$defs/nullable_number" },
+        "available_cpus": { "$ref": "#/$defs/nullable_integer" },
+        "thermal_pressure": {
+          "description": "powermetrics thermal sampler pressure level, verbatim, for example Nominal.",
+          "$ref": "#/$defs/nullable_string"
+        },
+        "raw": { "$ref": "#/$defs/nullable_string" }
+      }
+    },
+
+    "energy": {
+      "description": "Machine-level power and energy over a measured window. These samplers report the whole machine, not the process, which is why an idle baseline is recorded separately and why energy is never attributed to one engine without stating that.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["available", "reason"],
+      "properties": {
+        "available": { "type": "boolean" },
+        "reason": { "$ref": "#/$defs/unavailable_reason" },
+        "method": {
+          "description": "powermetrics is the only sampler this suite implements. estimated is not a permitted value: energy is measured or it is null.",
+          "enum": ["powermetrics", "none"]
+        },
+        "requires_sudo": { "type": ["boolean", "null"] },
+        "sample_interval_ms": { "$ref": "#/$defs/nullable_integer" },
+        "sample_count": { "$ref": "#/$defs/nullable_integer" },
+        "window_seconds": {
+          "description": "Duration the samples cover. Energy fields are the mean power over this window times this window, and are null when either factor is.",
+          "$ref": "#/$defs/nullable_number"
+        },
+        "cpu_power_w_mean": { "$ref": "#/$defs/nullable_number" },
+        "cpu_power_w_max": { "$ref": "#/$defs/nullable_number" },
+        "gpu_power_w_mean": { "$ref": "#/$defs/nullable_number" },
+        "gpu_power_w_max": { "$ref": "#/$defs/nullable_number" },
+        "ane_power_w_mean": { "$ref": "#/$defs/nullable_number" },
+        "package_power_w_mean": { "$ref": "#/$defs/nullable_number" },
+        "combined_power_w_mean": { "$ref": "#/$defs/nullable_number" },
+        "cpu_energy_j": { "$ref": "#/$defs/nullable_number" },
+        "gpu_energy_j": { "$ref": "#/$defs/nullable_number" },
+        "package_energy_j": { "$ref": "#/$defs/nullable_number" },
+        "combined_energy_j": { "$ref": "#/$defs/nullable_number" },
+        "energy_above_idle_j": {
+          "description": "combined_energy_j minus the idle baseline power times the same window. Null when no baseline was taken.",
+          "$ref": "#/$defs/nullable_number"
+        },
+        "keys_seen": {
+          "description": "Power keys the parser actually found. powermetrics key names differ by macOS version and chip, so a record whose keys_seen is empty while available is true is a parser failure to investigate, not a machine that used no power.",
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+
+    "workload": {
+      "description": "The dataset and fitting task, identical for every engine compared against it.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "task", "rows", "features", "rounds", "seed"],
+      "properties": {
+        "id": {
+          "enum": [
+            "w1_small_dense",
+            "w2_medium_dense",
+            "w3_large_dense",
+            "w4_sparse",
+            "w5_multiclass",
+            "w6_missing_categorical",
+            "w7_repeated_fit",
+            "w8_prediction"
+          ]
+        },
+        "kind": { "enum": ["dense", "sparse", "missing_categorical"] },
+        "task": { "enum": ["regression", "binary", "multiclass"] },
+        "rows": { "type": "integer", "minimum": 1 },
+        "features": { "type": "integer", "minimum": 1 },
+        "valid_rows": { "type": "integer", "minimum": 0 },
+        "rounds": { "type": "integer", "minimum": 1 },
+        "num_leaves": { "type": "integer", "minimum": 2 },
+        "max_bin": { "type": "integer", "minimum": 2 },
+        "learning_rate": { "type": "number" },
+        "min_data_in_leaf": { "type": "integer", "minimum": 1 },
+        "lambda_l2": { "type": "number" },
+        "n_classes": { "$ref": "#/$defs/nullable_integer" },
+        "nonzeros_per_row": { "$ref": "#/$defs/nullable_integer" },
+        "missing_fraction": { "$ref": "#/$defs/nullable_number" },
+        "categorical_features": { "$ref": "#/$defs/nullable_integer" },
+        "categorical_cardinality": { "$ref": "#/$defs/nullable_integer" },
+        "fits": {
+          "description": "Fits performed inside one process for the repeated-fit workload, which is what separates one-time compilation and device setup from steady-state cost.",
+          "$ref": "#/$defs/nullable_integer"
+        },
+        "predict_batches": { "$ref": "#/$defs/nullable_integer" },
+        "predict_batch_rows": { "$ref": "#/$defs/nullable_integer" },
+        "seed": { "type": "integer" },
+        "data_digest": {
+          "description": "Hash of the generated X and y bytes. Two engines that report different digests were not given the same data and must not be compared.",
+          "$ref": "#/$defs/nullable_string"
+        }
+      }
+    },
+
+    "engine": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "device", "requested_threads", "resolved_threads"],
+      "properties": {
+        "name": {
+          "enum": ["mojoboost_cpu", "mojoboost_gpu", "lightgbm_cpu", "xgboost_cpu", "xgboost_gpu"]
+        },
+        "version": { "$ref": "#/$defs/nullable_string" },
+        "device": { "enum": ["cpu", "gpu"] },
+        "requested_threads": {
+          "description": "The matched thread count the plan asked for. 1 and the performance-core count are the two points the protocol requires.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "resolved_threads": {
+          "description": "What the engine reports it used, when it can report it. Null when the library has no such accessor, which the protocol treats as unverified rather than matched.",
+          "$ref": "#/$defs/nullable_integer"
+        },
+        "device_resolved": {
+          "description": "The backend that actually ran, from the library itself, for example mojoboost's device_ attribute. A gpu row whose device_resolved is cpu is a bug in the record, not a fast CPU.",
+          "$ref": "#/$defs/nullable_string"
+        },
+        "env": {
+          "description": "Thread and backend environment variables set for the worker process.",
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "params": {
+          "description": "Full parameter dictionary handed to the library, after the protocol's parameter-matching rules.",
+          "type": "object"
+        },
+        "comparability": {
+          "description": "How the engine's semantics differ from mojoboost's on this workload, when they do. A note here means timings are comparable but the fitted models are not the same model.",
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+
+    "measurement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["workload", "engine", "status", "repetitions"],
+      "properties": {
+        "workload": { "$ref": "#/$defs/workload" },
+        "engine": { "$ref": "#/$defs/engine" },
+        "status": {
+          "description": "ok when every repetition completed. unsupported when the engine cannot express the workload, for example mojoboost_gpu on sparse input. skipped when the plan excluded it. error when a repetition raised, in which case message carries the exception text.",
+          "enum": ["ok", "unsupported", "skipped", "error"]
+        },
+        "message": { "$ref": "#/$defs/nullable_string" },
+        "repetitions": {
+          "description": "Per-repetition records in execution order, including the discarded warmup repetition, which is marked rather than deleted.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/repetition" }
+        },
+        "summary": { "$ref": "#/$defs/summary" },
+        "quality": { "$ref": "#/$defs/quality" },
+        "memory": { "$ref": "#/$defs/memory" },
+        "energy": { "$ref": "#/$defs/energy" },
+        "thermal_after": { "$ref": "#/$defs/thermal" }
+      }
+    },
+
+    "repetition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["index", "warmup", "timings"],
+      "properties": {
+        "index": { "type": "integer", "minimum": 0 },
+        "warmup": {
+          "description": "True for the repetition the protocol discards. Its timings are kept because the gap between it and the rest is the compilation and first-touch cost.",
+          "type": "boolean"
+        },
+        "timings": { "$ref": "#/$defs/timings" },
+        "device_phases": { "$ref": "#/$defs/device_phases" }
+      }
+    },
+
+    "timings": {
+      "description": "Wall-clock seconds, host-visible, measured with time.perf_counter around regions defined in the protocol. Phases never overlap and never sum to more than total_s.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["total_s"],
+      "properties": {
+        "data_gen_s": {
+          "description": "Synthetic data construction. Not part of any comparison, recorded so a long total can be attributed.",
+          "$ref": "#/$defs/nullable_number"
+        },
+        "import_s": {
+          "description": "Importing the engine library in a fresh process.",
+          "$ref": "#/$defs/nullable_number"
+        },
+        "binning_s": {
+          "description": "Quantile binning of the training matrix, host side, before any tree is grown. mojoboost exposes it as Dataset.construct(); LightGBM as lgb.Dataset.construct(); XGBoost as QuantileDMatrix construction.",
+          "$ref": "#/$defs/nullable_number"
+        },
+        "warmup_compile_s": {
+          "description": "First-use cost that later repetitions do not pay: shader or kernel compilation, device context creation, and lazy library initialization. Measurable as a separate region only where the library exposes one, otherwise inferred from the warmup repetition and left null here.",
+          "$ref": "#/$defs/nullable_number"
+        },
+        "train_s": {
+          "description": "Boosting only, with the binned dataset already built.",
+          "$ref": "#/$defs/nullable_number"
+        },
+        "fit_s": {
+          "description": "Binning plus training, which is what a user calling fit() waits for.",
+          "$ref": "#/$defs/nullable_number"
+        },
+        "first_fit_s": {
+          "description": "Repeated-fit workload only: the first fit in the process.",
+          "$ref": "#/$defs/nullable_number"
+        },
+        "steady_fit_s": {
+          "description": "Repeated-fit workload only: median of the fits after the first.",
+          "$ref": "#/$defs/nullable_number"
+        },
+        "predict_s": { "$ref": "#/$defs/nullable_number" },
+        "predict_rows_per_s": { "$ref": "#/$defs/nullable_number" },
+        "total_s": {
+          "description": "Everything the worker process spent on the measured region, data generation excluded.",
+          "type": "number",
+          "minimum": 0
+        }
+      }
+    },
+
+    "device_phases": {
+      "description": "The inside of a GPU fit. The Python layer cannot see these, so a record only carries them when a source that can see them supplied them. Field names match the phases bench/bench_gpu_validation.mojo already prints, so the two are readable side by side.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source"],
+      "properties": {
+        "source": {
+          "description": "instrumentation is a counter export from the training run itself. mojo_driver is a separate run of a Mojo phase driver on the same shape, which is a different run and must be labeled as one. unavailable is the honest default.",
+          "enum": ["instrumentation", "mojo_driver", "unavailable"]
+        },
+        "reason": { "$ref": "#/$defs/unavailable_reason" },
+        "setup_s": { "$ref": "#/$defs/nullable_number" },
+        "compile_s": { "$ref": "#/$defs/nullable_number" },
+        "alloc_s": { "$ref": "#/$defs/nullable_number" },
+        "stage_s": { "$ref": "#/$defs/nullable_number" },
+        "grad_h2d_s": { "$ref": "#/$defs/nullable_number" },
+        "hist_kernel_root_s": { "$ref": "#/$defs/nullable_number" },
+        "hist_kernel_child_s": { "$ref": "#/$defs/nullable_number" },
+        "partition_kernel_s": { "$ref": "#/$defs/nullable_number" },
+        "hist_d2h_s": { "$ref": "#/$defs/nullable_number" },
+        "hist_decode_s": { "$ref": "#/$defs/nullable_number" },
+        "sync_s": { "$ref": "#/$defs/nullable_number" },
+        "cleanup_s": { "$ref": "#/$defs/nullable_number" },
+        "launch_geometry": {
+          "description": "What the tiling policy resolved to, so a timing can be tied to the geometry that produced it.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "strategy": { "$ref": "#/$defs/nullable_string" },
+            "row_tiles": { "$ref": "#/$defs/nullable_integer" },
+            "block_threads": { "$ref": "#/$defs/nullable_integer" },
+            "threadgroups": { "$ref": "#/$defs/nullable_integer" }
+          }
+        }
+      }
+    },
+
+    "summary": {
+      "description": "Statistics over the non-warmup repetitions. Median is the headline; min and max are required because a median without a spread cannot be compared against another median.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["n", "metric", "median_s", "min_s", "max_s"],
+      "properties": {
+        "n": { "type": "integer", "minimum": 0 },
+        "metric": {
+          "description": "Which timing field the statistics are over.",
+          "type": "string"
+        },
+        "median_s": { "$ref": "#/$defs/nullable_number" },
+        "min_s": { "$ref": "#/$defs/nullable_number" },
+        "max_s": { "$ref": "#/$defs/nullable_number" },
+        "spread_ratio": {
+          "description": "max_s divided by min_s. Above the protocol's threshold the run is unstable and is rerun rather than reported.",
+          "$ref": "#/$defs/nullable_number"
+        }
+      }
+    },
+
+    "quality": {
+      "description": "Model quality on the held-out split, computed by the suite from raw predictions so every engine is scored by the same code. A timing without a quality number next to it is not a result.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["available", "reason"],
+      "properties": {
+        "available": { "type": "boolean" },
+        "reason": { "$ref": "#/$defs/unavailable_reason" },
+        "train_rmse": { "$ref": "#/$defs/nullable_number" },
+        "valid_rmse": { "$ref": "#/$defs/nullable_number" },
+        "train_logloss": { "$ref": "#/$defs/nullable_number" },
+        "valid_logloss": { "$ref": "#/$defs/nullable_number" },
+        "valid_multi_logloss": { "$ref": "#/$defs/nullable_number" },
+        "valid_accuracy": { "$ref": "#/$defs/nullable_number" },
+        "prediction_digest": {
+          "description": "Hash of the held-out raw predictions. Equal digests across repetitions is the determinism check; across devices it is the CPU/GPU agreement check, which is expected to differ within Float32 tolerance rather than match exactly.",
+          "$ref": "#/$defs/nullable_string"
+        },
+        "max_abs_diff_vs_cpu": {
+          "description": "Largest absolute difference between this engine's held-out raw predictions and the mojoboost CPU predictions on the same workload, when that reference ran.",
+          "$ref": "#/$defs/nullable_number"
+        }
+      }
+    },
+
+    "memory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["available", "reason"],
+      "properties": {
+        "available": { "type": "boolean" },
+        "reason": { "$ref": "#/$defs/unavailable_reason" },
+        "peak_rss_bytes": {
+          "description": "getrusage(RUSAGE_SELF).ru_maxrss of the worker process, in bytes on macOS. It covers the whole worker, including the generated data, and on unified memory it also covers device allocations the process owns.",
+          "$ref": "#/$defs/nullable_integer"
+        },
+        "data_bytes": {
+          "description": "Exact size of the generated arrays, computed from the shapes rather than measured, so peak_rss_bytes can be read net of the data.",
+          "$ref": "#/$defs/nullable_integer"
+        },
+        "footprint_bytes": {
+          "description": "Phys footprint from the footprint(1) tool when it was run. Null otherwise.",
+          "$ref": "#/$defs/nullable_integer"
+        },
+        "swap_ins": { "$ref": "#/$defs/nullable_integer" },
+        "compressed_pages": { "$ref": "#/$defs/nullable_integer" }
+      }
+    }
+  }
+}

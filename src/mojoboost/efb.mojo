@@ -1,0 +1,982 @@
+"""Exclusive feature bundling (EFB).
+
+Sparse data usually has many features that are almost never non-zero at the
+same row: one-hot columns of the same source variable, bag-of-words counts,
+indicator columns. EFB packs such mutually exclusive features into a single
+*bundle* that occupies one column of the binned matrix, so histogram
+construction costs O(#bundles) column scans instead of O(#features) while
+losing nothing: within a bundle every original feature keeps its own
+contiguous range of bin ids, so an original (feature, bin) pair is always
+recoverable from the bundled bin.
+
+This module is the EFB core only: conflict measurement, plan construction,
+encoding, decoding, and the bundled matrix. Nothing here is wired into
+training, and nothing enables it: `fit_bundles` is only called when a caller
+asks for it, and it reports its own `use_bundling` verdict, which the caller
+is free to ignore. See `handoffs/task13_efb.md` for the integration a
+training path needs.
+
+What "exclusive" means here
+---------------------------
+A feature's *default bin* is the bin holding the value 0.0
+(`sparse.default_bins`); a row is **non-default** for feature f when its bin
+differs from `default_bin[f]`. Two features conflict at a row when both are
+non-default there. That is the only definition used, and it settles the three
+cases the sparse layout distinguishes (see sparse.mojo):
+
+- An **absent** entry is the value 0.0, so it is at the default bin and never
+  conflicts. Absent rows are what makes bundling pay.
+- An **explicitly stored zero**, or any stored value that happens to bin to
+  the default bin, is treated identically to an absent entry: it is not a
+  conflict, and `bundle_csc` drops it, because the bundle column recovers it
+  from the bundle's default bin. Storing such an entry or leaving it out
+  therefore produces a bit-identical plan and a bit-identical bundled matrix.
+- A **missing** value (a stored `NaN`, binned into the feature's reserved
+  missing bin) is *not* at the default bin, so it is non-default and it does
+  conflict. Missingness is a real value here, not an absence. See
+  "Missing values" below for why that makes bundling them opt-in.
+
+Bin layout
+----------
+A bundle with a single member is **identity encoded**: its bundle bin *is*
+the member's local bin, its default bin is the member's default bin, and its
+category table and reserved missing bin carry over unchanged. A plan in which
+every bundle is a singleton therefore reproduces the source matrix exactly,
+apart from dropping stored entries that sat at their default bin.
+
+A bundle with two or more members reserves bundle bin 0
+(`EFB_SHARED_BIN`) for "every member is at its default", and gives member k
+the half-open range `[slot_offset[k], slot_offset[k] + local_bins[k] - 1)`,
+laid out in member order starting at 1. A member's local bin b encodes as
+
+    b == default          ->  EFB_SHARED_BIN
+    b <  default          ->  slot_offset[k] + b
+    b >  default          ->  slot_offset[k] + b - 1
+
+so the member contributes `local_bins[k] - 1` bundle bins and the bundle uses
+`1 + sum(local_bins - 1)` in total. That total is capped at
+`EfbParams.max_bundle_bins` (256 at the most), because the binned matrix
+stores bins as `UInt8`. Note the same formula gives a singleton's bin count,
+`local_bins[0]`, so the cap is uniform.
+
+Collisions
+----------
+With `max_conflict_rate > 0` a bundle may hold rows where several members are
+non-default, and one column cannot represent that. The rule is fixed and
+deterministic: **the member appearing earliest in the bundle's member order
+wins the row**, and the losing entries are dropped, i.e. they read back as
+their feature's default bin. `collisions[b]` counts exactly those dropped
+entries, so a plan states its own approximation error rather than hiding it.
+`max_conflict_rate = 0.0`, the default, admits no collisions at all and the
+bundling is then exactly lossless.
+
+Splits stay per-feature
+-----------------------
+Bundling is a storage and histogram-traversal optimization, never a change of
+hypothesis space. A threshold across two members' ranges would compare bin
+ids of unrelated features and is meaningless. Split search must scan each
+member's own range, and `unbundle_histogram` reconstructs a member's local
+histogram from the bundle's: the member's own range is copied back, and its
+default bin is recovered by subtracting that range from the node total, since
+rows where the member is default sit either in bundle bin 0 or inside some
+*other* member's range. That subtraction is the same trade the sparse
+accumulator already makes for its zero bin.
+
+Missing values
+--------------
+A member's reserved missing bin encodes like any other non-default bin, and
+`missing_bins` reports the bundle bins that hold missing values. But a
+multi-member bundle can then hold several of them, and the binned matrix
+carries one `missing_bin` per column, while the split search learns one
+`default_left` per node. Until that is generalized, `EfbParams.bundle_missing`
+defaults to False and a feature reserving a missing bin is left as a
+singleton, which is always correct. Setting it True produces a valid plan and
+a valid bundled matrix, and it is the caller's job to consume `missing_bins`.
+
+Categorical features
+--------------------
+Categorical features are never bundled with anything: each becomes a
+singleton bundle. Their bins index a fitted category table, and bin 0 is the
+reserved unknown/missing bin that must route right (see categorical.mojo);
+neither survives being offset into a shared range, and a set split spanning
+two features' categories is not a thing the tree can express. Identity
+encoding for singletons is what keeps their tables valid unchanged.
+
+Determinism
+-----------
+Fitting is serial and order-fixed on purpose. Features are visited in
+descending non-default count with ties broken toward the smaller feature
+index (via the stable `_argsort`, the same trick `categorical.mojo` uses), a
+candidate joins the first bundle in creation order that accepts it, and
+bundles come out in creation order. The same matrix and parameters therefore
+always give a bit-identical plan, on any machine and under any worker count.
+The plan is small (O(n_features)) and fitting it is O(nnz log nnz) at worst,
+so there is no reason to trade that determinism for parallelism.
+
+Differences from LightGBM
+-------------------------
+- LightGBM caps a group's conflict count against a budget derived from
+  `max_conflict_rate` and tracks it approximately across a group; the budget
+  here is the same but the conflict count is exact, computed against the
+  bundle's accumulated set of non-default rows.
+- LightGBM's bundles may mix a feature's zero bin with its neighbours'
+  because its "most frequent bin" is folded away; here the shared bin is
+  defined by the default bin (the bin of 0.0), which is what the sparse path
+  already means by absent.
+- LightGBM will bundle categorical features into multi-value groups; this
+  implementation does not, for the reason above.
+"""
+
+from .binning import BinMapper
+from .metrics import _argsort
+from .categorical import CategoricalSpec
+from .sparse import SparseBinnedMatrix
+
+# The bundle bin meaning "every member of this bundle is at its default".
+# Only multi-member bundles reserve it; a singleton is identity encoded.
+comptime EFB_SHARED_BIN = 0
+
+# "No such feature", "no such bin", "not bundled".
+comptime EFB_NONE = -1
+
+# Binned matrices store bins as UInt8, so no bundle can exceed 256 bins.
+comptime EFB_MAX_BINS = 256
+
+# Memory accounting: a stored entry costs one Int row index and one UInt8
+# bin, and each column costs one Int offset plus one UInt8 default bin.
+comptime _BYTES_PER_INDEX = 8
+comptime _BYTES_PER_BIN = 1
+
+
+@fieldwise_init
+struct EfbParams(Copyable, Movable):
+    """Bundling knobs.
+
+    - `max_conflict_rate`: fraction of rows a bundle may hold collisions on,
+      LightGBM's parameter of that name. 0.0 (the default) makes bundling
+      exactly lossless.
+    - `max_bundle_bins`: bins one bundle may use, capped at `EFB_MAX_BINS`
+      by the `UInt8` bin storage.
+    - `max_bundle_size`: members per bundle; 0 means unlimited.
+    - `max_nondefault_rate`: a feature non-default on a larger fraction of
+      rows than this is too dense to bundle usefully and is left a singleton.
+      LightGBM applies the same filter at 0.95.
+    - `min_reduction`: fraction of the dense histogram footprint the plan
+      must remove before `use_bundling` is True (see `FeatureBundling`).
+    - `bundle_missing`: allow features reserving a missing bin to join a
+      multi-member bundle. Off by default; see the module docstring.
+    """
+
+    var max_conflict_rate: Float64
+    var max_bundle_bins: Int
+    var max_bundle_size: Int
+    var max_nondefault_rate: Float64
+    var min_reduction: Float64
+    var bundle_missing: Bool
+
+    @staticmethod
+    def default() -> EfbParams:
+        return EfbParams(0.0, EFB_MAX_BINS, 0, 0.95, 0.0, False)
+
+    def check(self) raises:
+        if self.max_conflict_rate < 0.0 or self.max_conflict_rate > 1.0:
+            raise Error("max_conflict_rate must be in [0, 1]")
+        if self.max_bundle_bins < 2 or self.max_bundle_bins > EFB_MAX_BINS:
+            raise Error("max_bundle_bins must be in [2, 256]")
+        if self.max_bundle_size < 0:
+            raise Error("max_bundle_size must be non-negative")
+        if self.max_nondefault_rate <= 0.0 or self.max_nondefault_rate > 1.0:
+            raise Error("max_nondefault_rate must be in (0, 1]")
+        if self.min_reduction < 0.0 or self.min_reduction >= 1.0:
+            raise Error("min_reduction must be in [0, 1)")
+
+
+@fieldwise_init
+struct LocalHistogram(Copyable, Movable):
+    """One original feature's per-bin statistics, recovered from a bundle's
+    histogram by `unbundle_histogram`. Indexed by the feature's own local bin
+    ids, so split search reads it exactly as it reads an unbundled column."""
+
+    var grad: List[Float64]
+    var hess: List[Float64]
+    var count: List[Int]
+
+
+struct FeatureBundling(Copyable, Movable):
+    """A fitted bundling plan: which features share a column, and how their
+    bins map into it.
+
+    Bundle b owns member slots `[bundle_start[b], bundle_start[b + 1])`.
+    Slot k describes one original feature: `members[k]` is its index,
+    `slot_bins[k]` its local bin count, `slot_default[k]` its local default
+    bin, `slot_missing[k]` its local missing bin (or -1), and
+    `slot_offset[k]` where its non-default bins begin inside the bundle
+    (0 for the identity-encoded singleton case).
+
+    `bundle_of[f]` and `slot_of[f]` invert that for a feature. `bundle_bins[b]`
+    is how many bins bundle b uses and `collisions[b]` how many stored entries
+    the bundling drops in it (see the module docstring).
+
+    The plan is a function of the training matrix and the parameters alone,
+    so it can be applied unchanged to any later matrix binned by the same
+    mapper: `bundle_csc` reads only the plan.
+    """
+
+    var members: List[Int]
+    var bundle_start: List[Int]
+    var slot_offset: List[Int]
+    var slot_bins: List[Int]
+    var slot_default: List[Int]
+    var slot_missing: List[Int]
+    var bundle_of: List[Int]
+    var slot_of: List[Int]
+    var bundle_bins: List[Int]
+    var collisions: List[Int]
+    var n_features: Int
+    var n_rows: Int
+    var n_bins: Int
+    var source_entries: Int
+    var bundled_entries: Int
+    var use_bundling: Bool
+
+    def __init__(
+        out self,
+        var members: List[Int],
+        var bundle_start: List[Int],
+        var slot_offset: List[Int],
+        var slot_bins: List[Int],
+        var slot_default: List[Int],
+        var slot_missing: List[Int],
+        var bundle_of: List[Int],
+        var slot_of: List[Int],
+        var bundle_bins: List[Int],
+        var collisions: List[Int],
+        n_features: Int,
+        n_rows: Int,
+        n_bins: Int,
+        source_entries: Int,
+        bundled_entries: Int,
+        use_bundling: Bool,
+    ):
+        self.members = members^
+        self.bundle_start = bundle_start^
+        self.slot_offset = slot_offset^
+        self.slot_bins = slot_bins^
+        self.slot_default = slot_default^
+        self.slot_missing = slot_missing^
+        self.bundle_of = bundle_of^
+        self.slot_of = slot_of^
+        self.bundle_bins = bundle_bins^
+        self.collisions = collisions^
+        self.n_features = n_features
+        self.n_rows = n_rows
+        self.n_bins = n_bins
+        self.source_entries = source_entries
+        self.bundled_entries = bundled_entries
+        self.use_bundling = use_bundling
+
+    def n_bundles(self) -> Int:
+        return len(self.bundle_bins)
+
+    def bundle_size(self, bundle: Int) -> Int:
+        return self.bundle_start[bundle + 1] - self.bundle_start[bundle]
+
+    def member_at(self, bundle: Int, k: Int) -> Int:
+        """The k-th member feature of `bundle`, in member order."""
+        return self.members[self.bundle_start[bundle] + k]
+
+    def is_bundled(self, feature: Int) -> Bool:
+        """Whether `feature` actually shares its column with another."""
+        return self.bundle_size(self.bundle_of[feature]) > 1
+
+    def max_bundle_bins(self) -> Int:
+        """Bins the widest bundle uses; the bundled matrix's `n_bins`."""
+        var out = 0
+        for b in range(len(self.bundle_bins)):
+            if self.bundle_bins[b] > out:
+                out = self.bundle_bins[b]
+        return out
+
+    def total_collisions(self) -> Int:
+        var out = 0
+        for b in range(len(self.collisions)):
+            out += self.collisions[b]
+        return out
+
+    def is_lossless(self) -> Bool:
+        """Whether the bundling drops no stored entry, so every original
+        (feature, bin) is recoverable for every row."""
+        return self.total_collisions() == 0
+
+    def encode(self, feature: Int, local_bin: Int) raises -> Int:
+        """The bundle bin a local bin of `feature` maps to.
+
+        A multi-member bundle sends the member's default bin to
+        `EFB_SHARED_BIN`; a singleton is identity encoded.
+        """
+        if feature < 0 or feature >= self.n_features:
+            raise Error("feature index out of range")
+        var s = self.slot_of[feature]
+        if s < 0:
+            raise Error("feature is not in the plan")
+        if local_bin < 0 or local_bin >= self.slot_bins[s]:
+            raise Error("local bin out of range for this feature")
+        if self.bundle_size(self.bundle_of[feature]) == 1:
+            return local_bin
+        var d = self.slot_default[s]
+        if local_bin == d:
+            return EFB_SHARED_BIN
+        if local_bin < d:
+            return self.slot_offset[s] + local_bin
+        return self.slot_offset[s] + local_bin - 1
+
+    def slot_containing(self, bundle: Int, bundle_bin: Int) raises -> Int:
+        """The member slot owning `bundle_bin`, or `EFB_NONE` for a
+        multi-member bundle's shared bin."""
+        if bundle < 0 or bundle >= self.n_bundles():
+            raise Error("bundle index out of range")
+        if bundle_bin < 0 or bundle_bin >= self.bundle_bins[bundle]:
+            raise Error("bundle bin out of range")
+        var lo = self.bundle_start[bundle]
+        var hi = self.bundle_start[bundle + 1]
+        if hi - lo == 1:
+            return lo
+        if bundle_bin == EFB_SHARED_BIN:
+            return EFB_NONE
+        for k in range(lo, hi):
+            var start = self.slot_offset[k]
+            if bundle_bin >= start and bundle_bin < start + self.slot_bins[
+                k
+            ] - 1:
+                return k
+        # Unreachable for a validated plan: the members' ranges tile
+        # [1, bundle_bins) exactly.
+        raise Error("bundle bin belongs to no member")
+
+    def decode_feature(self, bundle: Int, bundle_bin: Int) raises -> Int:
+        """The original feature a bundle bin came from, or `EFB_NONE` for a
+        multi-member bundle's shared bin, which belongs to every member at
+        once."""
+        var s = self.slot_containing(bundle, bundle_bin)
+        if s == EFB_NONE:
+            return EFB_NONE
+        return self.members[s]
+
+    def decode_bin(self, bundle: Int, bundle_bin: Int) raises -> Int:
+        """The original local bin a bundle bin came from, or `EFB_NONE` for
+        the shared bin."""
+        var s = self.slot_containing(bundle, bundle_bin)
+        if s == EFB_NONE:
+            return EFB_NONE
+        if self.bundle_size(bundle) == 1:
+            return bundle_bin
+        var local = bundle_bin - self.slot_offset[s]
+        if local >= self.slot_default[s]:
+            local += 1
+        return local
+
+    def missing_bins(self, bundle: Int) raises -> List[Int]:
+        """Bundle bins of `bundle` that hold missing values, ascending by
+        member order. Empty when no member reserves a missing bin."""
+        if bundle < 0 or bundle >= self.n_bundles():
+            raise Error("bundle index out of range")
+        var out = List[Int]()
+        for k in range(
+            self.bundle_start[bundle], self.bundle_start[bundle + 1]
+        ):
+            if self.slot_missing[k] >= 0:
+                out.append(self.encode(self.members[k], self.slot_missing[k]))
+        return out^
+
+    def bundle_default_bin(self, bundle: Int) -> Int:
+        """The bundle's own default bin: the shared bin for a multi-member
+        bundle, the member's own default bin for a singleton."""
+        var lo = self.bundle_start[bundle]
+        if self.bundle_start[bundle + 1] - lo == 1:
+            return self.slot_default[lo]
+        return EFB_SHARED_BIN
+
+    def binned_bytes_unbundled(self) -> Int:
+        """Bytes the source binned CSC matrix occupies."""
+        return (
+            self.source_entries * (_BYTES_PER_INDEX + _BYTES_PER_BIN)
+            + (self.n_features + 1) * _BYTES_PER_INDEX
+            + self.n_features * _BYTES_PER_BIN
+        )
+
+    def binned_bytes_bundled(self) -> Int:
+        """Bytes the bundled binned CSC matrix occupies."""
+        var n = self.n_bundles()
+        return (
+            self.bundled_entries * (_BYTES_PER_INDEX + _BYTES_PER_BIN)
+            + (n + 1) * _BYTES_PER_INDEX
+            + n * _BYTES_PER_BIN
+        )
+
+    def histogram_slots_unbundled(self) -> Int:
+        """(feature, bin) slots a dense histogram over the source matrix
+        needs. The histogram is rectangular, so every feature costs the full
+        `n_bins` whether it uses them or not."""
+        return self.n_features * self.n_bins
+
+    def histogram_slots_bundled(self) -> Int:
+        """(bundle, bin) slots a dense histogram over the bundled matrix
+        needs, padded the same rectangular way."""
+        return self.n_bundles() * self.max_bundle_bins()
+
+    def validate(self) raises:
+        """Structural check of the plan: every feature placed exactly once,
+        every member range inside its bundle, and the ranges tiling the
+        bundle's bins without gaps or overlap."""
+        var n = self.n_bundles()
+        if len(self.bundle_start) != n + 1:
+            raise Error("bundle_start must have length n_bundles + 1")
+        if self.bundle_start[0] != 0:
+            raise Error("bundle_start must start at 0")
+        if self.bundle_start[n] != len(self.members):
+            raise Error("bundle_start must end at the member count")
+        if len(self.slot_offset) != len(self.members):
+            raise Error("slot arrays must be per member")
+        if (
+            len(self.slot_bins) != len(self.members)
+            or len(self.slot_default) != len(self.members)
+            or len(self.slot_missing) != len(self.members)
+        ):
+            raise Error("slot arrays must be per member")
+        if (
+            len(self.bundle_of) != self.n_features
+            or len(self.slot_of) != self.n_features
+        ):
+            raise Error("bundle_of and slot_of must be per feature")
+        if len(self.collisions) != n:
+            raise Error("collisions must be per bundle")
+
+        var seen = List[Bool](capacity=self.n_features)
+        seen.resize(self.n_features, False)
+        for b in range(n):
+            var lo = self.bundle_start[b]
+            var hi = self.bundle_start[b + 1]
+            if hi <= lo:
+                raise Error("a bundle must have at least one member")
+            if self.bundle_bins[b] < 1 or self.bundle_bins[b] > EFB_MAX_BINS:
+                raise Error("bundle bin count out of range")
+            var expected = 1 if hi - lo > 1 else 0
+            var total = 1
+            for k in range(lo, hi):
+                var f = self.members[k]
+                if f < 0 or f >= self.n_features:
+                    raise Error("member feature index out of range")
+                if seen[f]:
+                    raise Error("feature appears in more than one bundle")
+                seen[f] = True
+                if self.bundle_of[f] != b or self.slot_of[f] != k:
+                    raise Error("bundle_of/slot_of disagree with the members")
+                if self.slot_bins[k] < 1:
+                    raise Error("a member must have at least one bin")
+                if (
+                    self.slot_default[k] < 0
+                    or self.slot_default[k] >= self.slot_bins[k]
+                ):
+                    raise Error("member default bin out of range")
+                if self.slot_missing[k] >= self.slot_bins[k]:
+                    raise Error("member missing bin out of range")
+                if self.slot_missing[k] >= 0 and (
+                    self.slot_missing[k] == self.slot_default[k]
+                ):
+                    raise Error("a missing bin cannot be the default bin")
+                if hi - lo == 1:
+                    if self.slot_offset[k] != 0:
+                        raise Error("a singleton bundle is identity encoded")
+                    total = self.slot_bins[k]
+                else:
+                    if self.slot_offset[k] != expected:
+                        raise Error("member ranges must tile the bundle")
+                    expected += self.slot_bins[k] - 1
+                    total = expected
+            if total != self.bundle_bins[b]:
+                raise Error("bundle bin count disagrees with its members")
+            if self.collisions[b] < 0:
+                raise Error("collision count must be non-negative")
+        for f in range(self.n_features):
+            if not seen[f]:
+                raise Error("feature is in no bundle")
+
+
+def feature_bin_count(mapper: BinMapper, feature: Int) raises -> Int:
+    """How many bins `feature` can take under `mapper`.
+
+    Read from the fitted mapper rather than counted off the data, because a
+    bin a training column happened not to use is still a bin an unseen row
+    can land in, and a bundle's ranges have to leave room for it.
+    """
+    if feature < 0 or feature >= mapper.n_features:
+        raise Error("feature index out of range")
+    if mapper.cats.is_cat(feature):
+        # Kept categories map to bins 1..k, plus the reserved unknown bin 0.
+        return mapper.cats.n_categories(feature) + 1
+    var n = (
+        mapper.edge_offsets[feature + 1] - mapper.edge_offsets[feature] + 1
+    )
+    var mb = mapper.missing_bin[feature]
+    if mb >= 0 and mb + 1 > n:
+        n = mb + 1
+    return n
+
+
+def nondefault_rows(data: SparseBinnedMatrix, feature: Int) raises -> List[Int]:
+    """Ascending rows where `feature` is not at its default bin.
+
+    Stored entries that sit at the default bin are skipped, which is what
+    makes an explicitly stored zero and an absent entry indistinguishable
+    here.
+    """
+    if feature < 0 or feature >= data.n_features:
+        raise Error("feature index out of range")
+    var d = data.default_bin[feature]
+    var out = List[Int]()
+    for i in range(data.col_offsets[feature], data.col_offsets[feature + 1]):
+        if data.bin[i] != d:
+            out.append(data.row_index[i])
+    return out^
+
+
+def conflict_count(a: List[Int], b: List[Int]) -> Int:
+    """Rows present in both ascending row lists. O(len(a) + len(b))."""
+    var i = 0
+    var j = 0
+    var out = 0
+    while i < len(a) and j < len(b):
+        if a[i] == b[j]:
+            out += 1
+            i += 1
+            j += 1
+        elif a[i] < b[j]:
+            i += 1
+        else:
+            j += 1
+    return out
+
+
+def pairwise_conflict(
+    data: SparseBinnedMatrix, f: Int, g: Int
+) raises -> Int:
+    """Rows where features `f` and `g` are both non-default."""
+    return conflict_count(nondefault_rows(data, f), nondefault_rows(data, g))
+
+
+def _count_in(rows: List[Int], sorted_union: List[Int]) -> Int:
+    """How many of `rows` are already in `sorted_union`, by binary search, so
+    the cost follows the candidate rather than the accumulated bundle."""
+    var out = 0
+    for i in range(len(rows)):
+        var lo = 0
+        var hi = len(sorted_union)
+        while lo < hi:
+            var mid = (lo + hi) // 2
+            if sorted_union[mid] < rows[i]:
+                lo = mid + 1
+            else:
+                hi = mid
+        if lo < len(sorted_union) and sorted_union[lo] == rows[i]:
+            out += 1
+    return out
+
+
+def _merge_rows(a: List[Int], b: List[Int]) -> List[Int]:
+    """Ascending union of two ascending row lists."""
+    var out = List[Int](capacity=len(a) + len(b))
+    var i = 0
+    var j = 0
+    while i < len(a) and j < len(b):
+        if a[i] == b[j]:
+            out.append(a[i])
+            i += 1
+            j += 1
+        elif a[i] < b[j]:
+            out.append(a[i])
+            i += 1
+        else:
+            out.append(b[j])
+            j += 1
+    while i < len(a):
+        out.append(a[i])
+        i += 1
+    while j < len(b):
+        out.append(b[j])
+        j += 1
+    return out^
+
+
+def fit_bundles(
+    mapper: BinMapper,
+    data: SparseBinnedMatrix,
+    params: EfbParams = EfbParams.default(),
+) raises -> FeatureBundling:
+    """Build a bundling plan for a binned sparse matrix.
+
+    Greedy, serial, and order-fixed (see "Determinism" in the module
+    docstring). Every feature ends in exactly one bundle: a feature that
+    cannot or should not be bundled becomes a singleton rather than being
+    dropped, so the plan always covers the whole matrix and a caller can
+    apply it without carrying a second, unbundled matrix alongside.
+
+    The returned plan reports `use_bundling`; it does not act on it.
+    """
+    params.check()
+    if mapper.n_features != data.n_features:
+        raise Error("mapper and matrix must agree on n_features")
+    if data.n_rows < 1 or data.n_features < 1:
+        raise Error("matrix must have positive dimensions")
+
+    var n_features = data.n_features
+    var n_rows = data.n_rows
+    var max_conflicts = Int(Float64(n_rows) * params.max_conflict_rate)
+    var dense_cut = Int(Float64(n_rows) * params.max_nondefault_rate)
+
+    var rows = List[List[Int]](capacity=n_features)
+    var local_bins = List[Int](capacity=n_features)
+    var defaults = List[Int](capacity=n_features)
+    var missings = List[Int](capacity=n_features)
+    var eligible = List[Bool](capacity=n_features)
+    var neg_counts = List[Float64](capacity=n_features)
+
+    for f in range(n_features):
+        var nd = nondefault_rows(data, f)
+        var n_local = feature_bin_count(mapper, f)
+        var d = Int(data.default_bin[f])
+        if d >= n_local:
+            raise Error(
+                "matrix default bin is outside the mapper's bin count; the"
+                " matrix was binned by a different mapper"
+            )
+        var mb = data.missing_bin[f]
+        if mb >= n_local:
+            raise Error("matrix missing bin is outside the mapper's bin count")
+        # A feature is bundleable when it is numerical, not too dense, not
+        # holding missing values the consumer cannot yet route, and narrow
+        # enough to fit a bundle at all.
+        var ok = not mapper.cats.is_cat(f)
+        if mb >= 0 and not params.bundle_missing:
+            ok = False
+        if len(nd) > dense_cut:
+            ok = False
+        if n_local > params.max_bundle_bins:
+            ok = False
+        neg_counts.append(-Float64(len(nd)))
+        rows.append(nd^)
+        local_bins.append(n_local)
+        defaults.append(d)
+        missings.append(mb)
+        eligible.append(ok)
+
+    # Stable ascending sort of the negated counts is a descending sort of the
+    # counts with ties broken toward the smaller feature index.
+    var order = _argsort(neg_counts)
+
+    var b_members = List[List[Int]]()
+    var b_union = List[List[Int]]()
+    var b_bins = List[Int]()
+    var b_conflict = List[Int]()
+    var b_open = List[Bool]()
+
+    for oi in range(len(order)):
+        var f = order[oi]
+        var width = local_bins[f] - 1
+        if not eligible[f]:
+            var only = List[Int](capacity=1)
+            only.append(f)
+            b_members.append(only^)
+            b_union.append(rows[f].copy())
+            b_bins.append(width)
+            b_conflict.append(0)
+            b_open.append(False)
+            continue
+        var placed = False
+        for b in range(len(b_members)):
+            if not b_open[b]:
+                continue
+            if (
+                params.max_bundle_size > 0
+                and len(b_members[b]) >= params.max_bundle_size
+            ):
+                continue
+            if 1 + b_bins[b] + width > params.max_bundle_bins:
+                continue
+            var conflict = _count_in(rows[f], b_union[b])
+            if b_conflict[b] + conflict > max_conflicts:
+                continue
+            b_members[b].append(f)
+            b_union[b] = _merge_rows(b_union[b], rows[f])
+            b_bins[b] += width
+            b_conflict[b] += conflict
+            placed = True
+            break
+        if not placed:
+            var only = List[Int](capacity=1)
+            only.append(f)
+            b_members.append(only^)
+            b_union.append(rows[f].copy())
+            b_bins.append(width)
+            b_conflict.append(0)
+            b_open.append(True)
+
+    var n_bundles = len(b_members)
+    var members = List[Int](capacity=n_features)
+    var bundle_start = List[Int](capacity=n_bundles + 1)
+    var slot_offset = List[Int](capacity=n_features)
+    var slot_bins = List[Int](capacity=n_features)
+    var slot_default = List[Int](capacity=n_features)
+    var slot_missing = List[Int](capacity=n_features)
+    var bundle_of = List[Int](capacity=n_features)
+    bundle_of.resize(n_features, EFB_NONE)
+    var slot_of = List[Int](capacity=n_features)
+    slot_of.resize(n_features, EFB_NONE)
+    var bundle_bins = List[Int](capacity=n_bundles)
+    var collisions = List[Int](capacity=n_bundles)
+    var bundled_entries = 0
+
+    bundle_start.append(0)
+    for b in range(n_bundles):
+        var size = len(b_members[b])
+        var offset = 1
+        for k in range(size):
+            var f = b_members[b][k]
+            bundle_of[f] = b
+            slot_of[f] = len(members)
+            members.append(f)
+            slot_bins.append(local_bins[f])
+            slot_default.append(defaults[f])
+            slot_missing.append(missings[f])
+            if size == 1:
+                slot_offset.append(0)
+            else:
+                slot_offset.append(offset)
+                offset += local_bins[f] - 1
+        bundle_start.append(len(members))
+        bundle_bins.append(1 + b_bins[b])
+        collisions.append(b_conflict[b])
+        bundled_entries += len(b_union[b])
+
+    var plan = FeatureBundling(
+        members^,
+        bundle_start^,
+        slot_offset^,
+        slot_bins^,
+        slot_default^,
+        slot_missing^,
+        bundle_of^,
+        slot_of^,
+        bundle_bins^,
+        collisions^,
+        n_features,
+        n_rows,
+        data.n_bins,
+        data.nnz(),
+        bundled_entries,
+        False,
+    )
+    plan.validate()
+    # The fallback decision. Bundling has to buy back both the column count
+    # it saves in traversal and the rectangular histogram it widens: a plan
+    # that packs a few narrow features into one very wide bundle can cost
+    # more histogram slots than it saves columns.
+    var before = plan.histogram_slots_unbundled()
+    var after = plan.histogram_slots_bundled()
+    plan.use_bundling = (
+        n_bundles < n_features
+        and Float64(after) <= Float64(before) * (1.0 - params.min_reduction)
+    )
+    return plan^
+
+
+def bundle_csc(
+    data: SparseBinnedMatrix, plan: FeatureBundling
+) raises -> SparseBinnedMatrix:
+    """Apply a plan, producing the bundled binned matrix.
+
+    One column per bundle, canonical CSC. Entries at a member's default bin
+    are dropped, since the bundle's default bin recovers them; that is what
+    makes an explicitly stored zero and an absent entry produce identical
+    output. On a collision the earliest member in the bundle's member order
+    keeps the row (see the module docstring), so the result is a deterministic
+    function of the matrix and the plan.
+
+    A singleton bundle is identity encoded, so its category table and its
+    reserved missing bin carry over unchanged. A multi-member bundle is
+    numerical and carries a reserved missing bin only when exactly one of its
+    members reserves one; `plan.missing_bins` reports the full list either
+    way.
+    """
+    if plan.n_features != data.n_features:
+        raise Error("plan and matrix must agree on n_features")
+    if plan.n_rows != data.n_rows:
+        raise Error("plan and matrix must agree on n_rows")
+
+    var n_bundles = plan.n_bundles()
+    var out_rows = List[Int]()
+    var out_bins = List[UInt8]()
+    var col_offsets = List[Int](capacity=n_bundles + 1)
+    col_offsets.append(0)
+    var default_bin = List[UInt8](capacity=n_bundles)
+    var missing_bin = List[Int](capacity=n_bundles)
+    var cat_flags = List[Bool](capacity=n_bundles)
+    var cat_codes = List[Int]()
+    var cat_offsets = List[Int](capacity=n_bundles + 1)
+    cat_offsets.append(0)
+
+    for b in range(n_bundles):
+        var lo = plan.bundle_start[b]
+        var hi = plan.bundle_start[b + 1]
+        var size = hi - lo
+        var acc_rows = List[Int]()
+        var acc_bins = List[UInt8]()
+        for k in range(lo, hi):
+            var f = plan.members[k]
+            var d = data.default_bin[f]
+            var m_rows = List[Int]()
+            var m_bins = List[UInt8]()
+            for i in range(
+                data.col_offsets[f], data.col_offsets[f + 1]
+            ):
+                if data.bin[i] == d:
+                    continue
+                m_rows.append(data.row_index[i])
+                m_bins.append(UInt8(plan.encode(f, Int(data.bin[i]))))
+            if k == lo:
+                acc_rows = m_rows^
+                acc_bins = m_bins^
+                continue
+            # Merge, with the already-accumulated (earlier) member winning
+            # every collision.
+            var new_rows = List[Int](capacity=len(acc_rows) + len(m_rows))
+            var new_bins = List[UInt8](capacity=len(acc_rows) + len(m_rows))
+            var i = 0
+            var j = 0
+            while i < len(acc_rows) and j < len(m_rows):
+                if acc_rows[i] <= m_rows[j]:
+                    if acc_rows[i] == m_rows[j]:
+                        j += 1
+                    new_rows.append(acc_rows[i])
+                    new_bins.append(acc_bins[i])
+                    i += 1
+                else:
+                    new_rows.append(m_rows[j])
+                    new_bins.append(m_bins[j])
+                    j += 1
+            while i < len(acc_rows):
+                new_rows.append(acc_rows[i])
+                new_bins.append(acc_bins[i])
+                i += 1
+            while j < len(m_rows):
+                new_rows.append(m_rows[j])
+                new_bins.append(m_bins[j])
+                j += 1
+            acc_rows = new_rows^
+            acc_bins = new_bins^
+
+        for i in range(len(acc_rows)):
+            out_rows.append(acc_rows[i])
+            out_bins.append(acc_bins[i])
+        col_offsets.append(len(out_rows))
+        default_bin.append(UInt8(plan.bundle_default_bin(b)))
+
+        var mb = plan.missing_bins(b)
+        missing_bin.append(mb[0] if len(mb) == 1 else EFB_NONE)
+
+        var is_cat = size == 1 and data.cats.is_cat(plan.members[lo])
+        cat_flags.append(is_cat)
+        if is_cat:
+            var f = plan.members[lo]
+            for i in range(
+                data.cats.offsets[f], data.cats.offsets[f + 1]
+            ):
+                cat_codes.append(data.cats.codes[i])
+        cat_offsets.append(len(cat_codes))
+
+    return SparseBinnedMatrix(
+        out_rows^,
+        out_bins^,
+        col_offsets^,
+        default_bin^,
+        data.n_rows,
+        n_bundles,
+        plan.max_bundle_bins(),
+        CategoricalSpec(cat_flags^, cat_codes^, cat_offsets^),
+        missing_bin^,
+    )
+
+
+def unbundle_histogram(
+    plan: FeatureBundling,
+    bundle: Int,
+    slot_rank: Int,
+    grad: List[Float64],
+    hess: List[Float64],
+    count: List[Int],
+    base: Int,
+) raises -> LocalHistogram:
+    """One member's local histogram, recovered from its bundle's.
+
+    `grad`, `hess`, and `count` are a histogram whose bundle-`bundle` block
+    starts at index `base` and runs for `plan.bundle_bins[bundle]` bins;
+    `slot_rank` selects the member within the bundle, 0-based in member
+    order.
+
+    The member's own range copies straight back. Its default bin is recovered
+    by subtracting that range from the block total, because a row where this
+    member is at its default sits either in the shared bin or inside another
+    member's range. That subtraction is exact when the bundle is lossless; a
+    collision the member lost is folded into its default bin, which is the
+    approximation `max_conflict_rate` buys.
+    """
+    if bundle < 0 or bundle >= plan.n_bundles():
+        raise Error("bundle index out of range")
+    var lo = plan.bundle_start[bundle]
+    var hi = plan.bundle_start[bundle + 1]
+    if slot_rank < 0 or slot_rank >= hi - lo:
+        raise Error("slot rank out of range for this bundle")
+    var width = plan.bundle_bins[bundle]
+    if base < 0 or base + width > len(grad):
+        raise Error("histogram block is outside the supplied arrays")
+    if len(hess) != len(grad) or len(count) != len(grad):
+        raise Error("grad, hess, and count must have equal length")
+
+    var k = lo + slot_rank
+    var n_local = plan.slot_bins[k]
+    var out_grad = List[Float64](capacity=n_local)
+    out_grad.resize(n_local, 0.0)
+    var out_hess = List[Float64](capacity=n_local)
+    out_hess.resize(n_local, 0.0)
+    var out_count = List[Int](capacity=n_local)
+    out_count.resize(n_local, 0)
+
+    if hi - lo == 1:
+        # Identity encoded: the block is already the member's histogram.
+        for b in range(n_local):
+            out_grad[b] = grad[base + b]
+            out_hess[b] = hess[base + b]
+            out_count[b] = count[base + b]
+        return LocalHistogram(out_grad^, out_hess^, out_count^)
+
+    var total_grad = 0.0
+    var total_hess = 0.0
+    var total_count = 0
+    for b in range(width):
+        total_grad += grad[base + b]
+        total_hess += hess[base + b]
+        total_count += count[base + b]
+
+    var d = plan.slot_default[k]
+    var start = plan.slot_offset[k]
+    for i in range(n_local - 1):
+        var local = i if i < d else i + 1
+        out_grad[local] = grad[base + start + i]
+        out_hess[local] = hess[base + start + i]
+        out_count[local] = count[base + start + i]
+        total_grad -= grad[base + start + i]
+        total_hess -= hess[base + start + i]
+        total_count -= count[base + start + i]
+    out_grad[d] = total_grad
+    out_hess[d] = total_hess
+    out_count[d] = total_count
+    return LocalHistogram(out_grad^, out_hess^, out_count^)

@@ -1,0 +1,16 @@
+DESTINATION: Reddit r/MachineLearning as a project or discussion post, only after checking its current rules and using the required title tag
+TITLE: [P] MojoBoost: native gradient-boosted trees in Mojo with an Apple Silicon GPU path
+
+I am open-sourcing MojoBoost, an experimental histogram-based gradient-boosted tree library written natively in Mojo.
+
+The technical motivation is to explore whether one Mojo implementation can provide competitive CPU execution and portable GPU execution while offering a LightGBM-familiar Python interface. Apple Silicon is the initial differentiator: the project targets the Metal GPU already present in Macs without requiring CUDA or an external accelerator.
+
+The current repository has dense and sparse leaf-wise training, numerical and native categorical features, missing-value routing, regression, binary and multiclass classification, LambdaRank, weighting, many objectives and metrics, validation and early stopping, callbacks, serialization, continued training, TreeSHAP contributions, Dataset and Booster APIs, Python estimators, and an end-to-end GPU tree-growth path.
+
+The important caveat is maturity. This is a public alpha with a broad LightGBM-shaped feature surface, not verified behavioral or production parity. Edge cases, feature combinations, packaging, and differential validation remain active work. GPU correctness has been exercised on an Apple M4. NVIDIA and AMD have not been validated. The repository separates supported, partial, deferred, and intentionally different behavior in a parity contract.
+
+Repository: https://github.com/ajhendel/mojoboost
+Parity contract: https://github.com/ajhendel/mojoboost/blob/main/docs/LIGHTGBM_PARITY.md
+GPU evidence and procedure: https://github.com/ajhendel/mojoboost/blob/main/docs/GPU_VALIDATION.md
+
+I would welcome technical criticism, reproducible failures, differential tests, hardware-validation reports, and contributions. The next GPU priorities are active-row compaction, device-side split selection and objective generation, persistent device state, GPU prediction and validation, and an M1-through-M5 benchmark matrix.
