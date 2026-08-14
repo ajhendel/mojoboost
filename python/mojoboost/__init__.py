@@ -341,7 +341,7 @@ from .basic import Booster, Dataset, train
 _np = _arrays.np
 
 # Keep in sync with python/pyproject.toml.
-__version__ = "0.1.0"
+__version__ = "0.1.0.dev1"
 
 __all__ = [
     # The model, and the two doors to it.
