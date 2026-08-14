@@ -37,6 +37,14 @@ with tests
 - sample weights for every objective, LightGBM semantics (weighted
   gradients, hessians, and base scores; zero-weight rows are ignored)
 - split-count feature importance
+- SIMD histogram kernels (pointer-based scatter accumulation, vectorized
+  sibling subtraction and split scans)
+- model serialization: `save_model`/`load_model` with a versioned text
+  format that stores floats as raw bit patterns, so loaded models predict
+  bit-exactly; multiclass models via `save_multiclass_model` and
+  `load_multiclass_model`
+- multiclass end to end on raw data: `fit_multiclass` returns a
+  `MulticlassModel` with `predict_proba` and `predict_class`
 
 ```mojo
 from mojoboost import BINARY_LOGISTIC, BoosterParams, TreeParams, fit
@@ -54,12 +62,10 @@ Lower-level entry points `train`, `train_with_valid`, and
 
 ## Roadmap
 
-1. SIMD histogram kernels and multicore training
+1. Multicore training (feature-parallel histogram accumulation)
 2. scikit-learn style `fit`/`predict` Python API via Mojo interop
-3. Reproducible benchmark suite vs LightGBM and XGBoost (same defaults, same
-   datasets, hardware documented)
-4. Model serialization
-5. GPU training
+3. Broader benchmark suite (XGBoost, real datasets)
+4. GPU training
 
 ## Defaults
 
@@ -72,7 +78,7 @@ Matched to LightGBM so comparisons are apples to apples.
 | `n_estimators` | 100 |
 | `min_data_in_leaf` | 20 |
 | `max_bin` | 255 |
-| `lambda_l2` | 0.0 (gain search default 1.0 until the boosting loop lands) |
+| `lambda_l2` | 1.0 (LightGBM's own default is 0; benchmarks set both to 1.0) |
 
 ## Development
 
@@ -85,8 +91,26 @@ pixi run test
 
 ## Benchmarks
 
-Coming with the boosting loop. Nothing will be claimed here that is not
-reproducible from scripts in `benchmarks/`.
+Reproducible from `bench/` (methodology, exact parameters, and caveats in
+[bench/README.md](bench/README.md)). Both drivers generate bit-identical
+synthetic data from the same splitmix64 stream and train with matched
+parameters. 100,000 rows x 100 features, 100 rounds, Apple M4:
+
+| | mojoboost (1 thread) | LightGBM (1 thread) |
+|---|---|---|
+| Regression: training | 3.53 s | 2.41 s |
+| Regression: binning | 0.55 s | 0.81 s |
+| Regression: train MSE | 0.003615 | 0.003797 |
+| Binary: training | 3.50 s | 2.32 s |
+| Binary: train logloss | 0.267034 | 0.267168 |
+
+Within 1.5x of single-threaded LightGBM on training and faster at binning,
+with no multithreading, GOSS, or EFB yet.
+
+```sh
+pixi run bench                 # mojoboost
+pixi run -e bench bench-lgbm --threads 1
+```
 
 ## License
 
