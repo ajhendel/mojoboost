@@ -1,6 +1,6 @@
 """mojoboost: gradient boosted decision trees in Mojo."""
 
-from .binning import BinnedMatrix, bin_equal_width
+from .binning import BinMapper, BinnedMatrix, bin_equal_width, fit_bins
 from .histogram import (
     Histogram,
     build_histogram,
@@ -16,3 +16,4 @@ from .boosting import (
     BoosterParams,
     train,
 )
+from .model import Model, fit

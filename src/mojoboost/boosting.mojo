@@ -54,6 +54,18 @@ struct Booster(Copyable, Movable):
             return _sigmoid(raw)
         return raw
 
+    def predict_raw_bins(self, bins: List[Int]) -> Float64:
+        var s = self.base_score
+        for i in range(len(self.trees)):
+            s += self.learning_rate * self.trees[i].predict_bins(bins)
+        return s
+
+    def predict_bins(self, bins: List[Int]) -> Float64:
+        var raw = self.predict_raw_bins(bins)
+        if self.objective == BINARY_LOGISTIC:
+            return _sigmoid(raw)
+        return raw
+
 
 def train(
     data: BinnedMatrix,

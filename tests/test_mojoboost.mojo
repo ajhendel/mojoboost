@@ -14,10 +14,13 @@ from mojoboost import (
     build_histogram,
     build_histogram_subset,
     find_best_split,
+    fit,
+    fit_bins,
     grow_tree,
     subtract_histogram,
     train,
 )
+from mojoboost import BinMapper, Model
 
 
 def make_toy() raises -> BinnedMatrix:
@@ -219,6 +222,64 @@ def test_boosting_validates_objective() raises:
     except:
         raised = True
     assert_true(raised)
+
+
+def test_quantile_binning_identity() raises:
+    # 8 distinct values into 8 quantile bins: edges land between each pair,
+    # so binning is the identity, same as the equal-width toy.
+    var features: List[Float64] = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
+    var mapper = fit_bins(features, n_rows=8, n_features=1, max_bins=8)
+    var data = mapper.transform(features, 8)
+    for r in range(8):
+        assert_equal(data.bin_at(r, 0), r)
+    # Unseen values: below range, between training values, above range.
+    assert_equal(mapper.bin_value(0, -100.0), 0)
+    assert_equal(mapper.bin_value(0, 2.4), 2)
+    assert_equal(mapper.bin_value(0, 100.0), 7)
+
+
+def test_quantile_binning_duplicates() raises:
+    # A binary feature must collapse to a single edge (2 used bins) even
+    # with max_bins much larger than n_rows.
+    var features: List[Float64] = [0.0, 0.0, 0.0, 1.0, 1.0, 1.0]
+    var mapper = fit_bins(features, n_rows=6, n_features=1, max_bins=255)
+    assert_equal(mapper.edge_offsets[1] - mapper.edge_offsets[0], 1)
+    for r in range(3):
+        assert_equal(mapper.bin_value(0, features[r]), 0)
+    for r in range(3, 6):
+        assert_equal(mapper.bin_value(0, features[r]), 1)
+
+
+def test_quantile_binning_skewed() raises:
+    # Equal-frequency binning must separate a dense cluster that
+    # equal-width binning would collapse into one bin.
+    var features: List[Float64] = [
+        1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 1000000.0,
+    ]
+    var mapper = fit_bins(features, n_rows=8, n_features=1, max_bins=4)
+    var bins_seen = List[Int]()
+    for r in range(8):
+        var b = mapper.bin_value(0, features[r])
+        var new = True
+        for i in range(len(bins_seen)):
+            if bins_seen[i] == b:
+                new = False
+        if new:
+            bins_seen.append(b)
+    assert_equal(len(bins_seen), 4)
+
+
+def test_model_predicts_raw_data() raises:
+    # End to end on raw features: fit a regression on a step function and
+    # predict unseen raw values on both sides of the step.
+    var features: List[Float64] = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
+    var target: List[Float64] = [0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]
+    var params = BoosterParams(100, 0.1, small_tree_params())
+    var model = fit(features, 8, 1, target, SQUARED_ERROR, params, max_bins=8)
+    var low: List[Float64] = [1.4]
+    var high: List[Float64] = [6.3]
+    assert_true(abs(model.predict(low) - 0.0) < 0.05)
+    assert_true(abs(model.predict(high) - 1.0) < 0.05)
 
 
 def main() raises:

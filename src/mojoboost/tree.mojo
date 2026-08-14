@@ -63,6 +63,16 @@ struct Tree(Copyable, Movable):
                 node = self.right[node]
         return self.value[node]
 
+    def predict_bins(self, bins: List[Int]) -> Float64:
+        """Predict one example given its per-feature bin ids."""
+        var node = 0
+        while self.feature[node] >= 0:
+            if bins[self.feature[node]] <= self.threshold_bin[node]:
+                node = self.left[node]
+            else:
+                node = self.right[node]
+        return self.value[node]
+
 
 struct _LeafState(Movable):
     """A grown-but-unsplit leaf: its node id, rows, histogram, and the best
