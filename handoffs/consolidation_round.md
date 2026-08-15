@@ -72,3 +72,55 @@ vocabularies (parallel strategy vs histogram tiling strategy); left as is.
 
 sequence.mojo and python _sequence.py parked, connect later; both now carry
 an owner and reason in the audit table instead of "unassigned".
+
+## Close-out (2026-08-15)
+
+Audit counts, `python3 tools/connectivity_audit.py`, same tool each time
+except where a row says the tool changed:
+
+| Snapshot | Findings | Native orphans | Duplicate public names |
+|---|---|---|---|
+| pre-round e3d2de6 | 292 | 21 | 119 |
+| round start (K1, K4, K5 landed) | 265 | 20 | 90 |
+| after K10/K11 audit rewires (13d87ef re-export rule) | 204 | 18 | 28 |
+| close-out (transitive binding reach, root re-exports, string-dispatch reads: 428bea8, 888c3f9) | 138 | 18 | 28 |
+
+The last two rows are mostly the audit getting more accurate rather than the
+tree changing: `binding_support` was reached all along, the package root's
+imports are its export surface, and 19 binding exports are called by string.
+Every remaining orphan and uncalled export has an owner and a reason in
+`CLASSIFICATION`; `docs/INTEGRATION_INVENTORY.md` renders the same table and
+`tools/audit_integration.py` reports zero errors and zero gaps against it.
+Nothing was deleted under the deletion bar except K6's three whole-model
+predict bindings (e98d4eb) and K2's cuda/amd twins (f23bd1b); everything
+else that is unreachable is parked with a named unblocker.
+
+Decisions taken by C0:
+
+- `python/mojotrees/_public_api_plan.py` stays. Four docs cite it and its
+  own docstring says nothing should import it; it is documentation as data,
+  classified EXPERIMENTAL under connect_07.
+- The 28 remaining duplicate public names are recorded, not rewired: each
+  pair sits in at least one parked module (`CancelToken` in sequence /
+  validation, `MAX_ROWS` across four GPU modules held by connect_04,
+  `LeafCandidate` in gpu_frontier / growth_policy, and so on). They are the
+  next round's first list.
+
+Gated, not done, with the exact unblocker:
+
+- K8 step 3 (`MAX_ROWS` single site across gpu_active_rows /
+  gpu_multiclass_batch / gpu_predict / histogram_gpu; gpu_frontier
+  `SpeculationLedger` trim) and K11's deferred `gpu_predict`
+  `DEVICE_METRIC_*` rename: `train_gpu.mojo`, `hybrid_leaf_scheduler.mojo`,
+  `gpu_active_rows.mojo`, `histogram_gpu.mojo` are dirty in the shared
+  checkout (connect_04 / hybrid costs, `train_gpu.mojo` mid-edit and not
+  parsing at close-out). Runnable the moment `git status` shows them clean.
+- K6's `_f64_list` / `_int_list` / `_csc` / `_csr` helpers in
+  `_mojotrees.mojo` duplicating `binding_support`: same gate (needs an
+  extension build).
+- Stale doc pointers to `gpu_levelwise.mojo` / `levelwise_policy.mojo` in
+  `docs/design/GPU_LEVELWISE.md` are the growth_policy lane's (f4651d1)
+  historical text; `docs/CONNECTION_AUDIT.md`, `docs/C_API.md`,
+  `docs/RANDOM_FOREST_MODE.md`, `docs/DISTRIBUTED_STRATEGIES.md` name files
+  that were never created (unrun-test names and an old build path); left
+  as they read.
