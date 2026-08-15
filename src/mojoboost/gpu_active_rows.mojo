@@ -954,6 +954,15 @@ def _range_hist_partial_g4_kernel(
     unchanged. Bit-identical for the reasons the pairing is: fixed-point
     Int32, same per-(row, feature) quantized adds, and integer addition
     cannot see the order.
+
+    Measured on an Apple M4, three interleaved repeats per arm in one
+    process at 5M x 50, 100 rounds: 12.09s at group 2 against 11.70s at
+    group 4, a 1.034x difference with both arms' spreads under 1% and
+    predictions byte-identical. Resolved, and small: the occupancy halving
+    gives back most of what the traffic halving buys, so the Metal default
+    stays at the pairing — three percent on one part is inside the risk
+    that a different Apple generation inverts it. Group 4 stays the
+    explicit request for whoever measures their own device.
     """
     var slot0 = 4 * Int(block_idx.x)
     var owned = Int(n_slots) - slot0
