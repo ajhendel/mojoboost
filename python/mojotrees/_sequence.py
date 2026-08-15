@@ -1,9 +1,12 @@
 """Batched input, and the one dispatcher over every ecosystem adapter.
 
 Internal, on the terms of section 2 of `docs/COMPATIBILITY_POLICY.md`.
-`docs/ECOSYSTEM_INPUTS.md` is the prose, and
-`handoffs/remaining_10_ecosystem_inputs.md` holds the patches that wire this
-into `_arrays`, `Dataset`, and the estimators.
+`docs/ECOSYSTEM_INPUTS.md` is the prose. This module is wired: `_arrays`
+asks `adapter_for`, `categories_for`, `names_for`, `vector_for`, and
+`labels_for` at each of its dispatch points, so an Arrow table, a polars
+frame, an `lgb.Sequence`, or a `Batches` is accepted everywhere a feature
+matrix is; and `mojotrees.Dataset` built from batches streams them into
+the native binner one at a time through `stream_dataset` below.
 
 Two jobs, and they belong together
 ----------------------------------
@@ -15,8 +18,8 @@ object belongs to, and that decision must be made in one place or the
 estimators, `Dataset`, and `cv` will each grow their own version of it.
 `adapter_for`, `categories_for`, `names_for`, and `vector_for` are that
 place. Each returns a callable (or None), each callable has the signature
-of the `_arrays` function it stands in for, and the patch that puts them in
-front of `_arrays.check_X` is four lines long. It is in the handoff.
+of the `_arrays` function it stands in for, and `_arrays` calls them first
+at every dispatch point (`_arrays._ecosystem`).
 
 **Batches.** A caller who already has their data in pieces (Arrow record
 batches off a Parquet reader, a `lgb.Sequence`, a list of frames per file)
@@ -29,23 +32,18 @@ ids pulled out of the batches if they travel inside them.
 What this is not
 ----------------
 
-**It is not bounded-memory training.** `materialize` holds every batch and
-the assembled matrix at once, so peak memory is higher than handing over
-one matrix, not lower. That is worth having anyway (the pieces are usually
-already in memory, and the alternative is the caller writing this loop
-themselves), and it is worth being blunt about, because the LightGBM
-feature it resembles, `lgb.Dataset(lgb.Sequence(...))`, is a bounded-memory
-feature.
+**`materialize` is not bounded-memory.** It holds every batch and the
+assembled matrix at once. It is the path for callers who want one matrix
+back (`check_X_batches`, prediction on batches), and it stays.
 
-Bounded memory needs a binner that accepts data in pieces, which is a
-native question: two passes over the batches, quantiles built incrementally,
-bins fixed before any row is written. That core is `src/mojotrees/
-sequence.mojo` and `src/mojotrees/external_memory.mojo` (task 07), and the
-Python side of it is a thin loop over `Batches` that hands one batch at a
-time to a binding this package does not have yet. `Batches` is deliberately
-shaped so that loop can be written against it without changing anything
-here: it exposes the batches, their row counts, and their schemas
-separately from the assembly step.
+**`stream_dataset` is the LightGBM `Dataset(Sequence)` shape.** It hands
+one converted batch at a time to the extension's `dataset_chunks_*`
+bindings (`bindings/sequence_bindings.mojo`), which append it to a native
+column-major accumulator and bin the whole once at the end, so Python never
+holds more than one converted batch. The native side still holds the full
+float64 matrix while binning, because exact global quantiles need it; the
+truly bounded path (uint8 bins on disk, `2 + n_features / block_width`
+passes) is `src/mojotrees/external_memory.mojo`, native and exported.
 
 **It does not guess that a list is batches.** `[[1.0, 2.0], [3.0, 4.0]]` is
 a matrix of two rows, and `_arrays` has always read it as one. A list of
@@ -580,6 +578,12 @@ def _collect_batches(source):
         return list(to_batches()), True
     if hasattr(source, "read_next_batch") and hasattr(source, "schema"):
         return list(_drain_reader(source)), True
+    if is_sequence_protocol(source):
+        # LightGBM's `lgb.Sequence`: `__len__` is the number of rows,
+        # `__getitem__` answers a row for an int and a block of rows for a
+        # slice, and `batch_size` is how many rows to read at a time. So
+        # the batches are the slices, exactly as LightGBM reads them.
+        return list(_sequence_slices(source)), False
     if hasattr(source, "__len__") and hasattr(source, "__getitem__"):
         return [source[i] for i in range(len(source))], False
     try:
@@ -589,6 +593,19 @@ def _collect_batches(source):
             f"a batched input must be iterable or indexable; a "
             f"{type(source).__name__} is neither"
         ) from None
+
+
+def _sequence_slices(seq):
+    """The row blocks of an `lgb.Sequence`, `batch_size` rows at a time."""
+    n_rows = len(seq)
+    step = int(getattr(seq, "batch_size", 0) or 0)
+    if step < 1:
+        raise ValueError(
+            "a Sequence must declare a positive batch_size, got "
+            f"{getattr(seq, 'batch_size', None)!r}"
+        )
+    for start in range(0, n_rows, step):
+        yield seq[start : min(start + step, n_rows)]
 
 
 def _drain_reader(reader):
@@ -755,6 +772,12 @@ def batch_categories(source):
     """`{column_index: [label, ...]}` for a batched input. The
     `_arrays.frame_categories` counterpart, for `Batches`."""
     return _wrap(source).categories()
+
+
+def wrap(source):
+    """`source` as a `Batches`, wrapping it only if it is not one already.
+    The public spelling of `_wrap`, for `basic.Dataset`."""
+    return _wrap(source)
 
 
 def _wrap(source):
@@ -994,6 +1017,45 @@ def materialize(
         weight=weight,
         query_ids=query_ids,
     )
+
+
+def stream_dataset(source, params, ext, name="X", encoders=None):
+    """Bin batches into a native `Dataset` one batch at a time.
+
+    `params` is the dict `basic.Dataset.construct` builds for
+    `dataset_create` (binning configuration, names, categorical
+    declaration, and the optional per-row column addresses); `ext` is the
+    extension module. Returns the native handle. Each batch is converted
+    through its own adapter (so an Arrow record batch, a polars frame, and
+    a numpy block may be mixed, as `materialize` allows) and pushed as
+    soon as it is converted; the previous batch's buffer is released
+    before the next is made.
+    """
+    batches = _wrap(source)
+    names, n_features = batches.schema(name)
+    if n_features == 0:
+        raise ValueError(f"{name} must have at least one feature")
+    tables = dict(encoders) if encoders else batches.categories(name)
+    acc = ext.dataset_chunks_begin(n_features)
+    pushed = 0
+    for position, batch in enumerate(batches):
+        buffer, rows, width, _ = _batch_convert(
+            batch, f"{name} batch {position}", tables
+        )
+        if width != n_features:
+            raise ValueError(
+                f"{name} batch {position} converted to {width} features "
+                f"but was described as {n_features}"
+            )
+        if rows == 0:
+            continue
+        pushed = ext.dataset_chunks_push(
+            acc, _arrays.addr(buffer), rows, 0, 0, 0
+        )
+        del buffer
+    if pushed == 0:
+        raise ValueError(f"{name} must have at least one row")
+    return ext.dataset_chunks_finish(acc, params)
 
 
 def check_X_batches(X, name="X", encoders=None):

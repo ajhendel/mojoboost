@@ -216,11 +216,26 @@ def take_column(column, rows):
     return [column[i] for i in rows]
 
 
+def _ecosystem():
+    """`_sequence`, imported late: it imports this module at load time, and
+    it is the one dispatcher over the Arrow, polars, and batches adapters
+    (`docs/ECOSYSTEM_INPUTS.md`). Every dispatch point below asks it first
+    and answers None for numpy, pandas, plain sequences, and SciPy sparse,
+    so those inputs stay on exactly the path they always took."""
+    from . import _sequence
+
+    return _sequence
+
+
 def feature_names(X):
     """Column names when `X` carries them and all of them are strings
     (a pandas DataFrame, typically), None otherwise. Matching what
     scikit-learn records in `feature_names_in_`, a frame with non-string
-    columns contributes no names."""
+    columns contributes no names. An Arrow table, a polars frame, or
+    batches answer through their adapter."""
+    adapter = _ecosystem().names_for(X)
+    if adapter is not None:
+        return adapter(X)
     columns = getattr(X, "columns", None)
     if columns is None:
         return None
@@ -246,6 +261,9 @@ def frame_categories(X):
     prediction frame be encoded through the *fitted* mapping instead of its
     own, which may order or extend the categories differently.
     """
+    adapter = _ecosystem().categories_for(X)
+    if adapter is not None:
+        return adapter(X)
     iloc = getattr(X, "iloc", None)
     columns = getattr(X, "columns", None)
     if iloc is None or columns is None:
@@ -399,7 +417,14 @@ def column_major(X, name="X", encoders=None):
 def check_X(X, name="X", encoders=None):
     """(buffer, n_rows, n_features, names) for a feature matrix, with the
     column names when it carries them. `encoders` is as in `column_major`;
-    the names come from the original `X`, before any encoding."""
+    the names come from the original `X`, before any encoding.
+
+    An Arrow table or record batch, a polars frame, an `lgb.Sequence`, or a
+    `_sequence.Batches` goes through its adapter, which returns the same
+    four values; anything else is the numpy/pandas/sequence path below."""
+    adapter = _ecosystem().adapter_for(X)
+    if adapter is not None:
+        return adapter(X, name, encoders)
     names = feature_names(X)
     buf, n_rows, n_features = column_major(X, name, encoders)
     return buf, n_rows, n_features, names
@@ -435,7 +460,11 @@ def first_bad_code(column, limit):
 
 
 def f64_vector(y, n_rows, name="y"):
-    """A float64 vector of length `n_rows`, without a finiteness check."""
+    """A float64 vector of length `n_rows`, without a finiteness check. An
+    Arrow array or a polars series converts through its adapter."""
+    adapter = _ecosystem().vector_for(y)
+    if adapter is not None:
+        return adapter(y, n_rows, name)
     if np is not None:
         try:
             ya = np.ascontiguousarray(y, dtype=np.float64)
@@ -520,8 +549,13 @@ def encode_labels(y, n_rows):
     `classes` is the sorted unique labels, exactly as passed, and `codes`
     is a float64 buffer of their indices into it. Labels of any comparable
     type work, so strings and gappy integers are fine; the trainer only
-    ever sees 0..n_classes-1, which is what it requires.
+    ever sees 0..n_classes-1, which is what it requires. An Arrow array or
+    a polars series is read as its labels (a dictionary column as its
+    values, not its codes) so `classes_` holds what the caller passed.
     """
+    to_labels = _ecosystem().labels_for(y)
+    if to_labels is not None:
+        y = to_labels(y)
     if np is not None:
         ya = np.asarray(y)
         if ya.ndim != 1:
