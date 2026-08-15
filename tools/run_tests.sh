@@ -42,6 +42,22 @@
 # This parallelizes *within* one suite run.  `tools/with_build_lock.sh` is
 # the opposite concern, serializing whole runs against other sessions in the
 # same checkout, and the two compose: run this under that lock.
+#
+# Where the time goes.  Measured, not assumed: almost all of a suite run is
+# `mojo` compiling, not tests executing.  `tests/test_tree_parameters_extra.mojo`
+# runs its 47 tests in 0.061 ms against roughly three seconds of wall clock
+# on an M4 and seventeen in CI.  `TestSuite` itself is not slow; a
+# compute-heavy function costs the same called directly, called through a
+# function pointer, and called by `TestSuite` (231.9 / 220.4 / 221.2 ms).
+# So the levers that matter are compile-side, and the two that work are
+# already here: one `mojo precompile` of the package instead of sixty, and
+# concurrent files.  Lowering the optimization level is NOT a lever, it is
+# worse on both counts (`-O0` compiled the file above in 4.68 s against
+# 3.09 s at the default `-O3`, and ran the tests ten times slower).  The
+# one lever left is the on-disk compile cache under
+# `$MODULAR_HOME/cache/.mojo_cache`, worth 3.10 s cold against 0.57 s warm
+# on that same file; it survives locally and CI throws it away every run.
+# docs/design/TEST_HARNESS_COST.md has the numbers and the CI recipe.
 
 set -uo pipefail
 
@@ -176,19 +192,35 @@ trap 'rm -rf "$RESULTS"' EXIT
 
 echo "running ${#SELECTED[@]} test files, mode=$MODE, jobs=$JOBS"
 
+# `TestSuite` closes with a line of the form
+#
+#   Summary [ 0.061 ] 47 tests run: 47 passed , 0 failed , 0 skipped
+#
+# and that bracketed number is MILLISECONDS, not seconds.  Measured against
+# a test that sleeps for exactly one second, the harness prints 1000.598.
+# Reporting it next to the wall clock is the whole point: for almost every
+# file in this tree the two numbers differ by four or five orders of
+# magnitude, which says the wall time is `mojo` compiling and not the tests
+# running.  See docs/design/TEST_HARNESS_COST.md.
+suite_ms() {
+  local ms
+  ms="$(sed -n 's/^Summary \[ *\([0-9.][0-9.]*\) \].*/\1/p' "$1" | tail -1)"
+  if [ -n "$ms" ]; then echo "$ms"; else echo "?"; fi
+}
+
 run_one() {
   local name="$1"
   local log="$RESULTS/$name.log"
   local start=$SECONDS
   if mojo run $PKG_INCLUDE -I tests $(extra_includes "$name") \
         "tests/$name.mojo" >"$log" 2>&1; then
-    echo "  ok   $name ($((SECONDS - start))s)"
+    echo "  ok   $name ($((SECONDS - start))s wall, $(suite_ms "$log")ms in tests)"
   else
     echo "fail" >"$RESULTS/$name.failed"
-    echo "  FAIL $name ($((SECONDS - start))s)"
+    echo "  FAIL $name ($((SECONDS - start))s wall, $(suite_ms "$log")ms in tests)"
   fi
 }
-export -f run_one extra_includes
+export -f run_one extra_includes suite_ms
 export RESULTS PKG_INCLUDE ROOT
 
 printf '%s\n' "${SELECTED[@]}" | xargs -P "$JOBS" -I{} bash -c 'run_one "$@"' _ {}
