@@ -1,11 +1,11 @@
-"""NVIDIA/CUDA backend specialization policy.
+"""NVIDIA/CUDA and AMD/HIP backend specialization policy.
 
-What one backend adds on top of the portable contract, and nothing else.
-`gpu_portability.mojo` says what the shared GPU source is allowed to
+What one vendor backend adds on top of the portable contract, and nothing
+else. `gpu_portability.mojo` says what the shared GPU source is allowed to
 require of *any* device MAX opens; `gpu_tiling.mojo` says how a launch
 geometry is arithmetically derived from bounds; this module says which
-bounds a CUDA device actually reports, and what follows from the two
-attributes Metal refuses and CUDA answers.
+bounds a CUDA or HIP device actually reports, and what follows from the
+attributes Metal refuses and those two answer.
 
 It is a pure policy layer, in the shape of `apple_gpu_policy.mojo`:
 reported numbers and a dataset shape in, a launch plan out. It opens no
@@ -15,57 +15,80 @@ a machine with no accelerator, which is the only way any of it could be
 exercised here at all.
 
 **No hardware validation is claimed for any of this.** This repository has
-never executed a GPU kernel on an NVIDIA device.
-`gpu_backend_policy.backend_support(API_CUDA)` is `SUPPORT_PORTABLE`, every
-CUDA row in `docs/GPU_VALIDATION.md` reads "not run", and every function
-here that would select a specialized kernel variant routes through
-`require_specializations_allowed`, which refuses on an unexercised backend
-unless `MOJOTREES_GPU_BACKEND_UNVALIDATED=1` acknowledges it.
+never executed a GPU kernel on an NVIDIA or an AMD device.
+`gpu_backend_policy.backend_support` is `SUPPORT_PORTABLE` for `API_CUDA`
+and `API_HIP` alike, every CUDA and HIP row in `docs/GPU_VALIDATION.md`
+reads "not run", and every function here that would select a specialized
+kernel variant routes through `require_specializations_allowed`, which
+refuses on an unexercised backend unless `MOJOTREES_GPU_BACKEND_UNVALIDATED=1`
+acknowledges it.
+
+One module, two vendors
+-----------------------
+The CUDA and HIP policies were once two files (`gpu_cuda_policy.mojo` and
+`gpu_amd_policy.mojo`) that differed only in the constants they plugged
+into the same fifteen functions. The consolidation round of 2026-08 merged
+them: everything vendor-specific is a field of `VendorTraits`, `cuda_traits`
+and `hip_traits` are the two values, `traits_for` picks by API code, and
+every function that used to exist twice exists once and takes the traits.
+Functions whose bodies were identical on both vendors take no traits at
+all. The backend-neutral section (`DeviceReport`, `Occupancy`,
+`BackendLaunchPlan`, `BackendSpecialization`, and their derivations) is
+unchanged; `docs/GPU_BACKEND_SPECIALIZATIONS.md` records its eventual home
+as `gpu_portability.mojo`.
 
 What this module encodes
 ------------------------
 Only differences that are (a) reported by the device through an attribute
 Mojo's `DeviceContext.get_attribute` exposes, or (b) documented properties
-of the CUDA programming model that the shared source is already subject to.
-Nothing is encoded from a chip name, a compute capability number, a
-marketing tier, or a guess about throughput.
+of the vendor's programming model that the shared source is already subject
+to. Nothing is encoded from a chip name, a compute capability number, a
+`gfx` identifier, a marketing tier, or a guess about throughput.
 
-- **Subgroup width.** CUDA answers `DeviceAttribute.WARP_SIZE`; Metal
-  refuses it (`docs/GPU_VALIDATION.md`, the M4 capture). A *reported* width
-  is used, as the granularity a threadgroup width is rounded to. An
+- **Subgroup width.** CUDA and HIP answer `DeviceAttribute.WARP_SIZE`;
+  Metal refuses it (`docs/GPU_VALIDATION.md`, the M4 capture). A *reported*
+  width is used, as the granularity a threadgroup width is rounded to. An
   unreported one stays 0, meaning unknown, and the portable
-  `gpu_tiling.WARP_GRANULARITY` rounding applies instead. `CUDA_WARP_LANES`
-  below is never substituted for a missing report; it is only used to
-  refuse a reported value that cannot be a CUDA warp, which would mean the
-  attribute was misread.
-- **Occupancy bounds.** CUDA answers
-  `MAX_THREADS_PER_MULTIPROCESSOR` and `MAX_BLOCKS_PER_MULTIPROCESSOR`;
-  Metal refuses both, which is why `gpu_tiling.TARGET_BLOCKS_PER_SM` is a
-  fixed 8 and why `apple_gpu_policy.resident_blocks_per_core` estimates
-  residency from the per-*block* shared-memory limit instead. That estimate
-  is not reproduced here: the per-multiprocessor shared-memory pool is not
-  a member of `DeviceAttribute` at all, so dividing the per-block limit by
-  a per-block footprint answers a different question than the one
-  residency asks. This module derives residency from the two attributes
-  that do answer it and reports which of them bound the result, and falls
-  back to the portable target when neither is reported, so an unreported
-  device plans exactly as it does today.
+  `gpu_tiling.WARP_GRANULARITY` rounding applies instead. The vendor's
+  admissible widths (`VendorTraits.subgroup_widths`: 32 for every CUDA
+  architecture that has shipped; 64 on CDNA and 32 on RDNA for AMD) are
+  never substituted for a missing report; they only refuse a reported value
+  that cannot be that vendor's subgroup, which would mean the attribute was
+  misread. On CUDA a reported 32 lets a narrow node take a finer block than
+  the portable 64-lane rounding allows. On HIP the portable granularity is
+  already the wider wavefront, so a reported width can only leave the
+  rounding alone (64) or refine it (32 on RDNA), never ask for a block the
+  portable rule would have refused; `subgroup_matches_granularity` reports
+  which.
+- **Occupancy bounds.** Both answer `MAX_THREADS_PER_MULTIPROCESSOR` and
+  `MAX_BLOCKS_PER_MULTIPROCESSOR`; Metal refuses both, which is why
+  `gpu_tiling.TARGET_BLOCKS_PER_SM` is a fixed 8 and why
+  `apple_gpu_policy.resident_blocks_per_core` estimates residency from the
+  per-*block* shared-memory limit instead. That estimate is not reproduced
+  here: the per-multiprocessor shared-memory pool is not a member of
+  `DeviceAttribute` at all. This module derives residency from the two
+  attributes that do answer it and reports which of them bound the result,
+  and falls back to the portable target when neither is reported, so an
+  unreported device plans exactly as it does today.
 - **Static threadgroup memory.** CUDA caps *statically* declared shared
   memory at 48 KiB per block; going above it requires an opt-in dynamic
   allocation the shared source does not take (its histogram planes are
   `stack_allocation[..., AddressSpace.SHARED]`, which is static by
-  construction). The shipping kernels request 3 KiB, so this ceiling is
-  inert today and is checked so that stays a fact rather than an
-  assumption.
+  construction). CDNA and RDNA allocate a workgroup at most 64 KiB of local
+  data share. That is the one number that differs between the two, and it
+  is `VendorTraits.static_shared_ceiling_bytes`. The shipping kernels
+  request 3 KiB, so both ceilings are inert today and are checked so that
+  stays a fact rather than an assumption.
 - **Packed-bin alignment.** The portable packed window is four one-byte
   cells per 32-bit word (`gpu_histogram_specializations.PACK_LANES`), and
-  that arithmetic is not re-derived here. What is added is the CUDA memory
-  transaction granularity the window is measured against, so a benchmark
-  can say whether a body of packed loads covers whole sectors or fragments
-  of them.
+  that arithmetic is not re-derived here. What is added is the memory
+  transaction granularity the window is measured against (32-byte sectors
+  on CUDA, 64-byte cache lines on HIP), so a benchmark can say whether a
+  body of packed loads covers whole transactions or fragments of them.
 - **Allocation and transfer.** Unified memory does not follow from the API
-  name on CUDA: a discrete card, an integrated part, and managed memory
-  are indistinguishable from "cuda". It therefore has to be reported, and
+  name on either vendor: a discrete card, an integrated part, CUDA managed
+  memory, an XNACK-enabled HIP device, and an accelerated processing unit
+  are indistinguishable by name. It therefore has to be reported, and
   `DeviceReport.unified_memory` defaults False, which routes every buffer
   through the staged copy `unified_memory_policy.plan_session_routes`
   already selects for a non-unified device.
@@ -77,44 +100,34 @@ marketing tier, or a guess about throughput.
 What this module deliberately does NOT encode
 ---------------------------------------------
 - **No strategy preference.** `preferred_strategy` returns
-  `STRATEGY_AUTO` on every shape. NVIDIA device-memory atomics are widely
-  held to be cheaper than the tiled reduction at low contention, and that
-  is exactly the kind of claim this repository has no measurement for on
-  any NVIDIA part. `StrategyInputs` reports what such a rule would key on
-  and carries `TILED_PREFERENCE_UNMEASURED` where the threshold would go,
-  in the shape `apple_gpu_policy.CrossoverInputs` uses for the CPU/GPU
-  crossover it also declines to invent.
+  `STRATEGY_AUTO` on every shape and both vendors. NVIDIA device-memory
+  atomics are widely held to be cheaper than the tiled reduction at low
+  contention, and that is exactly the kind of claim this repository has no
+  measurement for on any NVIDIA or AMD part. `StrategyInputs` reports what
+  such a rule would key on and carries `TILED_PREFERENCE_UNMEASURED` where
+  the threshold would go, in the shape `apple_gpu_policy.CrossoverInputs`
+  uses for the CPU/GPU crossover it also declines to invent.
 - **No Float64.** `gpu_portability.require_device_float64` refuses it on
-  every backend including this one. NVIDIA has Float64; Apple silicon does
-  not, and one source takes the weakest backend's floor. Relaxing that for
-  CUDA is a specialization needing the same evidence as any other, and it
-  is not taken here.
-- **No compute-capability branch.** `DeviceContext.compute_capability()`
-  exists and nothing below reads it. A capability number would be a proxy
-  for a generation, and branching on a generation is what
-  `apple_gpu_policy.mojo` explains at length that this project does not do.
+  every backend including these. NVIDIA and CDNA have Float64; Apple silicon
+  does not, and one source takes the weakest backend's floor. Relaxing that
+  is a specialization needing the same evidence as any other, and it is not
+  taken here.
+- **No compute-capability or `gfx` branch.** `DeviceContext.compute_capability()`
+  and `arch_name()` exist and nothing below reads them. A capability number
+  or a `gfx` identifier would be a proxy for a generation, and branching on
+  a generation is what `apple_gpu_policy.mojo` explains at length that this
+  project does not do. On AMD it would also be a worse answer than the one
+  already available: the wavefront is directly queryable as `WARP_SIZE`.
 - **No register-pressure bound.** `MAX_REGISTERS_PER_BLOCK` is reported and
   is carried on `DeviceReport` for diagnostics, but registers *per thread*
   for the compiled kernel are not queryable from here, so no occupancy
   bound is derived from it. `Occupancy.registers_bound_known` says so.
 - **No second geometry engine.** The tile arithmetic is
-  `gpu_tiling.resolve_tiling`, called with CUDA-derived bounds. The
+  `gpu_tiling.resolve_tiling`, called with vendor-derived bounds. The
   baseline every plan is compared against is `gpu_tiling.derive_tiling`,
   called rather than reproduced. The launch gate is
   `gpu_portability.require_histogram_launchable`, called rather than
   restated.
-
-Backend-neutral section
------------------------
-The section marked "Backend-neutral" below (`DeviceReport`, `Occupancy`,
-`BackendLaunchPlan`, `BackendSpecialization`, and their helpers) is not
-CUDA-specific and `gpu_amd_policy.mojo` imports it from here rather than
-carrying a second copy. It lives in this file because this lane owns only
-`gpu_cuda_policy.mojo` and `gpu_amd_policy.mojo`; its home is
-`gpu_portability.mojo`, and `handoffs/remaining_11_gpu_backends.md` carries
-the ready-to-apply patch that relocates it there. Until that lands, an
-importer should read the neutral names as belonging to the portability
-layer that happens to be spelled here.
 
 Where this module sits
 ----------------------
@@ -123,18 +136,19 @@ Above `gpu_tiling.mojo`, `gpu_histogram_specializations.mojo`,
 `unified_memory_policy.mojo`; below anything that launches. That direction
 is fixed: none of those may import this module, or the layering closes into
 a cycle. Nothing in the shipping path imports it yet, which
-`docs/GPU_BACKEND_SPECIALIZATIONS.md` records as the honest status and the
-handoff carries the call-site patches for.
+`docs/GPU_BACKEND_SPECIALIZATIONS.md` records as the honest status.
 
 LightGBM difference: LightGBM ships a separate CUDA device type with its
 own kernels, so its CUDA behavior can diverge from its OpenCL behavior
-arbitrarily. mojotrees has one source and one `gpu` device value, so a
-CUDA difference has to be expressible as a bound handed to the shared
+arbitrarily, and it reaches AMD hardware through its OpenCL `gpu` device
+type. mojotrees has one source and one `gpu` device value, so a vendor
+difference has to be expressible as a bound handed to the shared
 arithmetic. Everything in this module is such a bound.
 """
 
 from .apple_gpu_policy import (
     API_CUDA,
+    API_HIP,
     APPLE_GEN_UNKNOWN,
     GpuProfile,
     api_name,
@@ -143,12 +157,10 @@ from .apple_gpu_policy import (
 from .gpu_backend_policy import backend_support, support_name
 from .gpu_histogram_specializations import (
     PACK_LANES,
-    BinStorageDescriptor,
     DeviceHistogramCapabilities,
     KernelFeatures,
     PackedLoadWindow,
     bin_capacity_for,
-    plan_packed_window_for,
 )
 from .gpu_portability import (
     REQ_IN_ORDER_QUEUE,
@@ -183,7 +195,7 @@ from .unified_memory_policy import SessionMemoryPlan, plan_session_routes
 
 # =====================================================================
 # Backend-neutral. Relocation target: gpu_portability.mojo. See the
-# module docstring and handoffs/remaining_11_gpu_backends.md.
+# module docstring and docs/GPU_BACKEND_SPECIALIZATIONS.md.
 # =====================================================================
 
 
@@ -782,7 +794,7 @@ def describe_specialization(spec: BackendSpecialization) -> String:
     )
 
 
-def describe_plan(plan: BackendLaunchPlan) -> String:
+def describe_backend_plan(plan: BackendLaunchPlan) -> String:
     """One line for benchmark output and bug reports: which backend the
     plan was made for, what bounded it, and whether it differs from the
     portable geometry at all."""
@@ -823,9 +835,9 @@ def describe_plan(plan: BackendLaunchPlan) -> String:
 # --- Shared derivations, parameterized by backend ----------------------
 #
 # The three functions below take the backend-specific numbers as arguments
-# so `gpu_amd_policy.mojo` can run the identical arithmetic against its own
-# constants. They are the reason there is no second copy of the block-width
-# rule, the shared-memory gate, or the plan assembly.
+# so both vendors run the identical arithmetic against their own constants.
+# They are the reason there is no second copy of the block-width rule, the
+# shared-memory gate, or the plan assembly.
 
 
 def derive_block_threads_for(
@@ -836,7 +848,7 @@ def derive_block_threads_for(
     `granularity`.
 
     The row bound is the shape-driven part and it is not an Apple rule
-    despite `apple_gpu_policy.derive_block_threads` also applying it: a
+    despite `apple_gpu_policy.shape_block_threads` also applying it: a
     256-thread block scanning 40 rows leaves seven eighths of its lanes with
     nothing to accumulate on any device. What is backend-specific is only
     `granularity`, which is the reported subgroup width when the device
@@ -1086,7 +1098,8 @@ def derive_plan_for(
 
 
 # =====================================================================
-# End backend-neutral section. Everything below is CUDA.
+# End backend-neutral section. Everything below is per vendor, driven by
+# `VendorTraits`.
 # =====================================================================
 
 
@@ -1115,42 +1128,172 @@ comptime CUDA_SECTOR_BYTES = 32
 # stated rather than implied.
 comptime CUDA_NATIVE_WIDE_LOAD_BYTES = 16
 
+# The two wavefront widths AMD GPUs execute in. Used **only** to refuse a
+# reported value that can be neither, which would mean the attribute was
+# misread or the backend code is wrong. Neither is ever substituted for an
+# unreported width.
+comptime AMD_WAVEFRONT_CDNA = 64
+comptime AMD_WAVEFRONT_RDNA = 32
 
-def require_cuda(api: Int) raises:
-    """Refuse an API code this module has no business planning for.
+# Local data share a workgroup may statically declare, on both CDNA and
+# RDNA. `gpu_tiling.WARP_GRANULARITY` is 64 for the CDNA wavefront; this is
+# the other AMD number the shared source is subject to, and it is the one
+# that differs from CUDA's 48 KiB static cap.
+comptime AMD_LDS_PER_WORKGROUP_BYTES = 64 * 1024
+
+# The cache line a global load is served in. The unit a packed-bin body is
+# measured in, not a threshold anything is compared against here.
+comptime AMD_CACHE_LINE_BYTES = 64
+
+# The widest single load HIP offers (`global_load_dwordx4`, 128 bits). As
+# on CUDA, the shared source emits none.
+comptime AMD_NATIVE_WIDE_LOAD_BYTES = 16
+
+
+@fieldwise_init
+struct VendorTraits(Copyable, Movable):
+    """Everything that differs between the CUDA and HIP policies.
+
+    Documented properties of the programming model and the vendor's shipped
+    hardware, not measurements and not per-chip constants. Two values exist,
+    `cuda_traits()` and `hip_traits()`; every vendor-specific function below
+    takes one, and a function that takes none was identical on both vendors
+    before the two modules were merged.
+    """
+
+    var api: Int
+    """`API_CUDA` or `API_HIP`."""
+
+    var vendor: String
+    """"NVIDIA" or "AMD", for messages."""
+
+    var subgroup_noun: String
+    """What the vendor calls lanes in lockstep: "warp" or "wavefront"."""
+
+    var subgroup_widths: List[Int]
+    """Reported `WARP_SIZE` values that can be this vendor's subgroup. Used
+    only to refuse a report outside the set; never substituted for a
+    missing report."""
+
+    var static_shared_ceiling_bytes: Int
+    """Statically declared threadgroup memory per block the programming
+    model allows: 48 KiB on CUDA, 64 KiB of local data share on HIP."""
+
+    var static_shared_noun: String
+    """How the ceiling is described in messages."""
+
+    var transaction_bytes: Int
+    """The memory transaction granularity a global load is served at:
+    32-byte sectors on CUDA, 64-byte cache lines on HIP."""
+
+    var transaction_noun: String
+    """"sector" or "cache line"."""
+
+    var native_wide_load_bytes: Int
+    """The widest single load the vendor offers, which the shared source
+    does not emit."""
+
+    def widths_text(self) -> String:
+        """The admissible subgroup widths, for a message."""
+        var out = String("")
+        for i in range(len(self.subgroup_widths)):
+            if i > 0:
+                out += String(" or ")
+            out += String(self.subgroup_widths[i])
+        return out
+
+
+def cuda_traits() -> VendorTraits:
+    """The NVIDIA/CUDA traits."""
+    return VendorTraits(
+        API_CUDA,
+        String("NVIDIA"),
+        String("warp"),
+        [CUDA_WARP_LANES],
+        CUDA_STATIC_SHARED_CEILING_BYTES,
+        String("static shared-memory"),
+        CUDA_SECTOR_BYTES,
+        String("sector"),
+        CUDA_NATIVE_WIDE_LOAD_BYTES,
+    )
+
+
+def hip_traits() -> VendorTraits:
+    """The AMD/HIP traits. `subgroup_widths` admits both wavefronts because
+    CDNA executes 64 lanes in lockstep and RDNA 32, so this vendor cannot
+    have one architectural width the way CUDA can."""
+    return VendorTraits(
+        API_HIP,
+        String("AMD"),
+        String("wavefront"),
+        [AMD_WAVEFRONT_CDNA, AMD_WAVEFRONT_RDNA],
+        AMD_LDS_PER_WORKGROUP_BYTES,
+        String("per-workgroup LDS"),
+        AMD_CACHE_LINE_BYTES,
+        String("cache line"),
+        AMD_NATIVE_WIDE_LOAD_BYTES,
+    )
+
+
+def traits_for(api: Int) raises -> VendorTraits:
+    """The traits for an API code this module plans for.
 
     A capability error rather than a silent fallback, and it refuses
-    `API_UNKNOWN` too: a device that did not name its API might be CUDA and
-    might not, and planning CUDA bounds for it would apply a 48 KiB static
-    shared ceiling and a 32-lane rounding granularity to a device nobody
-    identified. The portable path already covers an unidentified device;
-    an operator who knows it is CUDA declares it with
-    `MOJOTREES_GPU_BACKEND=cuda`, which `device_policy.env_declared_api`
-    reads.
+    `API_UNKNOWN` too: a device that did not name its API might be one of
+    these vendors and might not, and planning vendor bounds for it would
+    apply a static shared ceiling and a subgroup admissibility rule to a
+    device nobody identified. The portable path already covers an
+    unidentified device; an operator who knows the vendor declares it with
+    `MOJOTREES_GPU_BACKEND=cuda` or `=hip`, which
+    `device_policy.env_declared_api` reads (the `rocm` spellings are
+    accepted too, through `apple_gpu_policy.parse_api`).
     """
     if api == API_CUDA:
-        return
+        return cuda_traits()
+    if api == API_HIP:
+        return hip_traits()
     raise Error(
-        "gpu_cuda_policy plans for the cuda backend only; got api code ",
+        "gpu_vendor_policy plans for the cuda and hip backends only; got"
+        " api code ",
         api,
         " (",
         api_name(api),
         "). An unidentified device takes the portable path in"
-        " gpu_tiling.mojo; declare MOJOTREES_GPU_BACKEND=cuda if this"
-        " device is known to be NVIDIA",
+        " gpu_tiling.mojo; declare MOJOTREES_GPU_BACKEND=cuda or =hip if"
+        " this device's vendor is known",
     )
 
 
-def cuda_contract(report: DeviceReport) raises -> BackendContract:
+def require_vendor(traits: VendorTraits, api: Int) raises:
+    """Refuse an API code that is not the one these traits plan for."""
+    if api == traits.api:
+        return
+    raise Error(
+        "this plan is for the ",
+        api_name(traits.api),
+        " backend only; got api code ",
+        api,
+        " (",
+        api_name(api),
+        ")",
+    )
+
+
+def vendor_contract(
+    traits: VendorTraits, report: DeviceReport
+) raises -> BackendContract:
     """The portability contract for the device this report describes.
 
     `gpu_portability.contract_from_profile`'s answer, not a second one: the
     grid bound, the primitive set, and the Float64 refusal are properties of
     the shared source and belong to that layer. What this adds is only that
-    the profile is built from a CUDA report, so `unified_memory` on the
-    contract is what the device said rather than what the API name implies.
+    the profile is built from a vendor report, so `unified_memory` on the
+    contract is what the device said rather than what the API name implies,
+    which matters most on HIP: an XNACK-enabled part and an accelerated
+    processing unit are both unified and both spell their API "hip", and a
+    discrete card spells it the same way.
     """
-    return contract_from_profile(report.profile(API_CUDA))
+    return contract_from_profile(report.profile(traits.api))
 
 
 # --- Subgroup width ----------------------------------------------------
@@ -1159,59 +1302,78 @@ def cuda_contract(report: DeviceReport) raises -> BackendContract:
 def subgroup_width(report: DeviceReport) -> Int:
     """Lanes in lockstep on this device, or 0 for unknown.
 
-    The reported `WARP_SIZE` and nothing else. `CUDA_WARP_LANES` is not
+    The reported `WARP_SIZE` and nothing else. No vendor constant is
     substituted for a missing report, for the reason
     `gpu_histogram_specializations.DeviceHistogramCapabilities` gives: 0
     means unknown, nothing in this package divides by a width, and a
-    confident wrong width is worse than an honest missing one.
+    confident wrong width is worse than an honest missing one. On AMD that
+    restraint is not stylistic: the two families disagree by a factor of
+    two, so a guess is as likely to be wrong as right.
     """
     if report.warp_size > 0:
         return report.warp_size
     return 0
 
 
-def require_subgroup_width_plausible(report: DeviceReport) raises:
-    """Refuse a reported width that cannot be a CUDA warp.
+def require_subgroup_width_plausible(
+    traits: VendorTraits, report: DeviceReport
+) raises:
+    """Refuse a reported width that cannot be this vendor's subgroup.
 
-    Not a device check: every CUDA architecture that has shipped has a
-    32-lane warp, so a positive report of anything else means the attribute
-    was misread, the report was filled in from the wrong device, or the API
-    code is wrong. Unreported passes, because unknown is a legitimate
-    answer and the portable rounding granularity covers it.
+    Not a device check: a positive report outside `traits.subgroup_widths`
+    means the attribute was misread, the report was filled in from the
+    wrong device, or the API code is wrong. Unreported passes, because
+    unknown is a legitimate answer and the portable rounding granularity
+    covers it.
     """
     if report.warp_size <= 0:
         return
-    if report.warp_size == CUDA_WARP_LANES:
-        return
+    for i in range(len(traits.subgroup_widths)):
+        if report.warp_size == traits.subgroup_widths[i]:
+            return
     raise Error(
         "this device reported a subgroup width of ",
         report.warp_size,
-        " for the cuda backend, and every CUDA architecture has a ",
-        CUDA_WARP_LANES,
-        "-lane warp; the attribute or the backend code is wrong",
+        " for the ",
+        api_name(traits.api),
+        " backend, and a ",
+        traits.vendor,
+        " ",
+        traits.subgroup_noun,
+        " is ",
+        traits.widths_text(),
+        " lanes; the attribute or the backend code is wrong",
     )
 
 
-def require_subgroup_width_known(report: DeviceReport, what: String) raises:
+def require_subgroup_width_known(
+    traits: VendorTraits, report: DeviceReport, what: String
+) raises:
     """Refuse a specialization that needs a subgroup width on a device that
     did not report one.
 
     Nothing in this package needs one today, which is why this has no
-    caller: no kernel here performs a warp shuffle, a ballot, or a
-    warp-level reduction, and `gpu_tiling.WARP_GRANULARITY` is a rounding
-    granularity rather than a width claim. It exists so the first
-    warp-level specialization has a gate to pass rather than a constant to
-    reach for.
+    caller: no kernel here performs a cross-lane shuffle, a ballot, or a
+    subgroup-level reduction, and `gpu_tiling.WARP_GRANULARITY` is a
+    rounding granularity rather than a width claim. It exists so the first
+    cross-lane specialization has a gate to pass rather than a constant to
+    reach for; on AMD, reaching for a constant would mean picking between
+    32 and 64 without evidence.
     """
     if subgroup_width(report) > 0:
         return
     raise Error(
         "'",
         what,
-        "' needs the subgroup width and this device did not report"
-        " WARP_SIZE; nothing in this package assumes a width, and"
-        " gpu_tiling.WARP_GRANULARITY is a launch-rounding granularity"
-        " rather than a device width",
+        "' needs the ",
+        traits.subgroup_noun,
+        " width and this device did not report WARP_SIZE; a ",
+        traits.vendor,
+        " ",
+        traits.subgroup_noun,
+        " is ",
+        traits.widths_text(),
+        " lanes and nothing here assumes a width without a report",
     )
 
 
@@ -1221,11 +1383,13 @@ def block_width_granularity(report: DeviceReport) -> Int:
     device did not report one.
 
     A reported 32 is finer than the portable 64, so a narrow node can get a
-    32-thread block on CUDA where the portable rule floors at 64. That is a
-    real difference and it rests entirely on the device having answered the
+    32-thread block where the portable rule floors at 64. That is a real
+    difference and it rests entirely on the device having answered the
     query; with no answer this returns the portable granularity and
     `derive_block_threads_for` delegates to `clamp_block_threads`, which is
-    the shipping rule unchanged.
+    the shipping rule unchanged. On AMD the portable 64 is the CDNA
+    wavefront, so an unreported device rounds to a legal multiple on either
+    family, and a reported 32 refines that for an RDNA part.
     """
     var width = subgroup_width(report)
     if width > 0:
@@ -1233,32 +1397,49 @@ def block_width_granularity(report: DeviceReport) -> Int:
     return WARP_GRANULARITY
 
 
+def subgroup_matches_granularity(report: DeviceReport) -> Bool:
+    """Whether the portable rounding granularity is this device's subgroup
+    width.
+
+    True on a CDNA part and on any device that did not report a width,
+    false on RDNA and on CUDA. Reported rather than acted on: a threadgroup
+    rounded to 64 on a 32-lane part is still a legal launch and still fully
+    occupied, it is simply rounded coarser than it needed to be. This is
+    the one line a capture on new hardware should be read against, because
+    it is where the portable constant and the device stop agreeing.
+    """
+    return block_width_granularity(report) == WARP_GRANULARITY
+
+
 # --- Shared memory, atomics, queue -------------------------------------
 
 
-def static_shared_ceiling() -> Int:
-    """Statically declared threadgroup memory per block CUDA allows."""
-    return CUDA_STATIC_SHARED_CEILING_BYTES
+def static_shared_ceiling(traits: VendorTraits) -> Int:
+    """Statically declared threadgroup memory per block this vendor's
+    programming model allows."""
+    return traits.static_shared_ceiling_bytes
 
 
 def require_shared_memory_supported(
-    report: DeviceReport, n_bins: Int, compiled: KernelFeatures
+    traits: VendorTraits,
+    report: DeviceReport,
+    n_bins: Int,
+    compiled: KernelFeatures,
 ) raises:
     """Refuse a threadgroup allocation this backend or this device will not
     accept, for the kernel this build compiled.
 
-    Both halves in one call: the 48 KiB static ceiling the CUDA programming
-    model imposes whatever the device advertises, and the per-block limit
-    the device reported. What is checked is
-    `gpu_portability.kernel_shared_request`, the footprint the compiled
-    kernel really has, not the `n_bins * 12` model whose own docstring
-    records that it is optimistic below 256 bins.
+    Both halves in one call: the vendor's static ceiling whatever the
+    device advertises, and the per-block limit the device reported. What is
+    checked is `gpu_portability.kernel_shared_request`, the footprint the
+    compiled kernel really has, not the `n_bins * 12` model whose own
+    docstring records that it is optimistic below 256 bins.
     """
     var shared_bytes = kernel_shared_request(n_bins, compiled)
     require_shared_within_ceiling(
-        API_CUDA, shared_bytes, CUDA_STATIC_SHARED_CEILING_BYTES
+        traits.api, shared_bytes, traits.static_shared_ceiling_bytes
     )
-    require_shared_reported_fits(API_CUDA, report, shared_bytes)
+    require_shared_reported_fits(traits.api, report, shared_bytes)
 
 
 def require_in_order_queue(contract: BackendContract) raises:
@@ -1267,8 +1448,8 @@ def require_in_order_queue(contract: BackendContract) raises:
     The property `gpu_runtime.HazardTracker` rests on: device work never
     needs a host synchronization to observe earlier device work, so the
     only required synchronizations are the two host-side hazards it tracks.
-    CUDA promises it for a single stream, which is the only queue model this
-    package uses.
+    CUDA and HIP both promise it for a single stream, which is the only
+    queue model this package uses.
     """
     if contract.provides(REQ_IN_ORDER_QUEUE):
         return
@@ -1286,10 +1467,11 @@ def concurrent_queues_available() -> Bool:
     False. `DeviceContext` is used here through `enqueue_create_buffer`,
     `enqueue_create_host_buffer`, `enqueue_copy`, `enqueue_memset`, and
     `synchronize`, all against one context per session
-    (`gpu_runtime.GpuSession` owns exactly one). CUDA streams exist; no
-    abstraction in this repository reaches them, and claiming overlap that
-    the code does not implement would make `gpu_runtime.PhaseCounters`
-    attribute time to a concurrency that never happened.
+    (`gpu_runtime.GpuSession` owns exactly one). CUDA and HIP streams
+    exist; no abstraction in this repository reaches them, and claiming
+    overlap that the code does not implement would make
+    `gpu_runtime.PhaseCounters` attribute time to a concurrency that never
+    happened.
     """
     return False
 
@@ -1315,14 +1497,17 @@ def require_concurrent_queues(what: String) raises:
 
 
 def unified_memory_inferable() -> Bool:
-    """Whether unified memory follows from the API name on this backend.
+    """Whether unified memory follows from the API name on these vendors.
 
     False. A discrete card, an integrated part, and CUDA managed memory are
-    all "cuda" to a name query, so `gpu_portability.contract_for` sets
-    unified for Metal alone and `contract_from_profile` takes it from a
-    report instead. `DeviceReport.unified_memory` is that report and it
-    defaults False, which is the conservative answer: it keeps every buffer
-    on the staged copy route and tightens nothing.
+    all "cuda" to a name query; an XNACK-enabled discrete card, an
+    accelerated processing unit with genuinely shared memory, and an
+    ordinary discrete card all spell their API "hip".
+    `gpu_portability.contract_for` therefore sets unified for Metal alone
+    and `contract_from_profile` takes it from a report instead.
+    `DeviceReport.unified_memory` is that report and it defaults False,
+    which is the conservative answer: it keeps every buffer on the staged
+    copy route and tightens nothing.
     """
     return False
 
@@ -1336,26 +1521,29 @@ def allocation_plan(report: DeviceReport) raises -> SessionMemoryPlan:
     second route table here that disagreed with it by one role would be
     worse than none.
 
-    With `unified_memory` False, which is what an unreported CUDA device
+    With `unified_memory` False, which is what an unreported device
     carries, every role resolves to the staged copy the GPU histogram
     builder already requires (`ROUTE_COPY_STAGED`), so this changes nothing
-    about what a CUDA session does today and only says why.
+    about what a session does today and only says why.
     """
     return plan_session_routes(report.unified_memory)
 
 
-def partial_budget_for(report: DeviceReport) -> Int:
+def partial_budget_for(traits: VendorTraits, report: DeviceReport) -> Int:
     """Bytes the partial-histogram buffer may claim on this device.
 
     `apple_gpu_policy.partial_budget_bytes`' rule, which is not Apple-
     specific despite where it lives: a fraction of the reported budget,
     the tighter fraction when memory is unified, capped by the portable
     ceiling, and the whole portable ceiling when no budget was reported.
-    A CUDA device that reports a budget and is not unified takes the
-    discrete fraction; one that reports nothing plans exactly as
-    `gpu_tiling.PARTIAL_BUDGET_BYTES` says today.
+    A device that reports a budget and is not unified takes the discrete
+    fraction; one that reports nothing plans exactly as
+    `gpu_tiling.PARTIAL_BUDGET_BYTES` says today. The unified fraction is
+    the one that matters on HIP, because a HIP device can honestly report
+    unified memory where a Metal device always does and a CUDA device
+    usually does not.
     """
-    return partial_budget_bytes(report.profile(API_CUDA))
+    return partial_budget_bytes(report.profile(traits.api))
 
 
 # --- Packed bin loads --------------------------------------------------
@@ -1363,77 +1551,63 @@ def partial_budget_for(report: DeviceReport) -> Int:
 
 def pack_alignment_bytes() -> Int:
     """The alignment the portable packed window requires: four one-byte
-    cells per 32-bit word. Not a CUDA number; carried so the descriptor can
-    state it beside the wider load CUDA offers and does not get."""
+    cells per 32-bit word. Not a vendor number; carried so the descriptor
+    can state it beside the wider load the vendor offers and does not
+    get."""
     return PACK_LANES
 
 
-def native_wide_load_bytes() -> Int:
-    """The widest single load CUDA offers, which the shared source does not
-    emit."""
-    return CUDA_NATIVE_WIDE_LOAD_BYTES
+def native_wide_load_bytes(traits: VendorTraits) -> Int:
+    """The widest single load this vendor offers, which the shared source
+    does not emit."""
+    return traits.native_wide_load_bytes
 
 
-def coalescing_bytes() -> Int:
+def coalescing_bytes(traits: VendorTraits) -> Int:
     """The transaction granularity a global load is served at."""
-    return CUDA_SECTOR_BYTES
+    return traits.transaction_bytes
 
 
-def plan_packed_window(
-    storage: BinStorageDescriptor,
-    first_row: Int,
-    count: Int,
-    rows_are_contiguous_run: Bool,
-) raises -> PackedLoadWindow:
-    """The packed-load window for a node on this backend.
-
-    `gpu_histogram_specializations.plan_packed_window_for`'s answer,
-    unmodified. The window arithmetic is a property of the bin matrix's
-    layout and not of the device, so there is nothing for a backend policy
-    to change about it, and re-deriving it here is exactly how a second
-    copy would come to read the wrong bytes. What this module contributes
-    is `packed_body_transactions` below, which measures the window the
-    shared planner produced against this backend's transaction size.
-    """
-    return plan_packed_window_for(
-        storage, first_row, count, rows_are_contiguous_run
-    )
-
-
-def packed_body_transactions(window: PackedLoadWindow) raises -> Int:
+def packed_body_transactions(
+    traits: VendorTraits, window: PackedLoadWindow
+) raises -> Int:
     """Memory transactions the packed body of one window costs on this
-    backend, at `coalescing_bytes` per transaction.
+    vendor, at `coalescing_bytes` per transaction.
 
     A diagnostic, not a decision: nothing selects the packed path on it.
     It is reported so a benchmark that does enable the packed path can say
-    whether the body covered whole sectors or fragments of them, which is
-    the quantity that would distinguish a packed win from a packed wash.
+    whether the body covered whole transactions or fragments of them, which
+    is the quantity that would distinguish a packed win from a packed wash.
+    The count on HIP is half CUDA's for the same window, because the cache
+    line is twice the sector; that difference is the reason each vendor
+    reports its own rather than sharing one number.
+
     An unusable window costs nothing, because its body is empty.
     """
     if not window.usable:
         return 0
     var body_bytes = window.body_quads * PACK_LANES
-    return _ceil_div(body_bytes, CUDA_SECTOR_BYTES)
+    return _ceil_div(body_bytes, traits.transaction_bytes)
 
 
-# --- The CUDA entry points ---------------------------------------------
+# --- The vendor entry points -------------------------------------------
 
 
-def cuda_specialization(
-    report: DeviceReport, compiled: KernelFeatures
+def vendor_specialization(
+    traits: VendorTraits, report: DeviceReport, compiled: KernelFeatures
 ) raises -> BackendSpecialization:
-    """The whole CUDA descriptor for one reported device and one build."""
-    require_subgroup_width_plausible(report)
+    """The whole vendor descriptor for one reported device and one build."""
+    require_subgroup_width_plausible(traits, report)
     return BackendSpecialization(
-        API_CUDA,
-        backend_support(API_CUDA),
+        traits.api,
+        backend_support(traits.api),
         subgroup_width(report),
         report.warp_size > 0,
         block_width_granularity(report),
-        CUDA_STATIC_SHARED_CEILING_BYTES,
+        traits.static_shared_ceiling_bytes,
         report.max_shared_memory_per_block,
-        CUDA_SECTOR_BYTES,
-        CUDA_NATIVE_WIDE_LOAD_BYTES,
+        traits.transaction_bytes,
+        traits.native_wide_load_bytes,
         PACK_LANES,
         concurrent_queues_available(),
         unified_memory_inferable(),
@@ -1442,27 +1616,28 @@ def cuda_specialization(
     )
 
 
-def cuda_histogram_capabilities(
-    report: DeviceReport,
+def vendor_histogram_capabilities(
+    traits: VendorTraits, report: DeviceReport
 ) raises -> DeviceHistogramCapabilities:
     """The capability record `apple_histogram_policy.derive_histogram_plan`
-    consumes, for a CUDA device that reported a subgroup width.
+    consumes, for a device that reported a subgroup width.
 
     `gpu_portability.histogram_capabilities` builds it from a contract,
     where the width is always 0 because the contract carries no reading.
     This substitutes the reported width when the device answered
-    `WARP_SIZE`, which is the one field a CUDA report can improve on. Every
-    other field is the contract's: `wide_byte_loads` stays False on every
-    backend because it is a measurement rather than a specification and no
-    measurement exists.
+    `WARP_SIZE`, which is the one field a vendor report can improve on.
+    Every other field is the contract's: `wide_byte_loads` stays False on
+    every backend because it is a measurement rather than a specification
+    and no measurement exists.
     """
-    require_subgroup_width_plausible(report)
-    var caps = histogram_capabilities(cuda_contract(report))
+    require_subgroup_width_plausible(traits, report)
+    var caps = histogram_capabilities(vendor_contract(traits, report))
     caps.subgroup_width = subgroup_width(report)
     return caps^
 
 
-def derive_cuda_plan(
+def derive_vendor_plan(
+    traits: VendorTraits,
     report: DeviceReport,
     n_rows: Int,
     n_slots: Int,
@@ -1471,20 +1646,20 @@ def derive_cuda_plan(
     requested_strategy: Int = STRATEGY_AUTO,
     max_partial_cells: Int = 0,
 ) raises -> BackendLaunchPlan:
-    """Resolve one node's histogram launch on a CUDA device.
+    """Resolve one node's histogram launch on a device of this vendor.
 
-    `derive_plan_for` with this backend's granularity rule and static
+    `derive_plan_for` with this vendor's granularity rule and static
     shared-memory ceiling. Everything the plan reports about how it was
     bounded is on the returned value, including the portable plan it would
     otherwise have been, so a caller that does not trust it can launch
     `plan.baseline` instead without re-deriving anything.
     """
-    require_subgroup_width_plausible(report)
+    require_subgroup_width_plausible(traits, report)
     return derive_plan_for(
-        API_CUDA,
+        traits.api,
         report,
         block_width_granularity(report),
-        CUDA_STATIC_SHARED_CEILING_BYTES,
+        traits.static_shared_ceiling_bytes,
         n_rows,
         n_slots,
         n_bins,
@@ -1494,33 +1669,60 @@ def derive_cuda_plan(
     )
 
 
-def require_cuda_launchable(
+def vendor_strategy_inputs(plan: BackendLaunchPlan) raises -> StrategyInputs:
+    """What a measured vendor strategy rule would key on, off a resolved
+    plan.
+
+    The plan already carries these; this is the accessor that makes that
+    explicit at a call site that wants only the strategy question, and it
+    is a copy rather than a second derivation.
+    """
+    return plan.strategy.copy()
+
+
+def vendor_preferred_strategy(plan: BackendLaunchPlan) raises -> Int:
+    """Which accumulation strategy this vendor would rather run for a
+    resolved plan.
+
+    `preferred_strategy`'s answer, which is `STRATEGY_AUTO` on every shape
+    and every backend: the portable rule in `gpu_tiling.resolve_tiling`
+    decides, and it already did, so a caller that consults this and gets
+    `STRATEGY_AUTO` should launch `plan.tiling.strategy` unchanged. It is
+    reached through the shared function so that a measured AMD rule and a
+    measured NVIDIA rule cannot come to disagree about what "no preference"
+    means.
+    """
+    return preferred_strategy(vendor_strategy_inputs(plan))
+
+
+def require_vendor_launchable(
+    traits: VendorTraits,
     report: DeviceReport,
     plan: BackendLaunchPlan,
     grid_x: Int,
     n_bins: Int,
     compiled: KernelFeatures,
 ) raises:
-    """The whole gate for one resolved CUDA launch.
+    """The whole gate for one resolved launch on this vendor.
 
     `gpu_portability.require_histogram_launchable` for the bin count, the
     primitives the resolved strategy needs, the build's specializations
     against what this backend has run, and the geometry against what the
-    device reported; then this backend's own two additions, which that
+    device reported; then this vendor's own two additions, which that
     layer does not carry because they are not portable facts: the in-order
-    queue the synchronization model depends on, and the 48 KiB static
-    shared-memory ceiling the CUDA programming model imposes whatever the
-    device advertises.
+    queue the synchronization model depends on, and the static
+    shared-memory ceiling the programming model imposes whatever the device
+    advertises.
 
     Raises on the first failure, naming it. `grid_x` is passed rather than
     derived because the axis carries the feature count in
     `histogram_gpu.mojo`, the active feature count under feature
     subsampling, and a leaf-slot count in `gpu_leaf_batching.mojo`.
     """
-    require_cuda(plan.api)
-    var contract = cuda_contract(report)
+    require_vendor(traits, plan.api)
+    var contract = vendor_contract(traits, report)
     require_in_order_queue(contract)
-    require_shared_memory_supported(report, n_bins, compiled)
+    require_shared_memory_supported(traits, report, n_bins, compiled)
     require_histogram_launchable(
         contract,
         report.caps(),
@@ -1532,15 +1734,19 @@ def require_cuda_launchable(
     )
 
 
-def describe_cuda(
-    report: DeviceReport, compiled: KernelFeatures
+def describe_vendor(
+    traits: VendorTraits, report: DeviceReport, compiled: KernelFeatures
 ) raises -> String:
     """One line pairing the backend contract with this module's descriptor,
     for a diagnostic record or a bug report."""
     return String(
-        describe_contract(cuda_contract(report)),
+        describe_contract(vendor_contract(traits, report)),
         " | ",
-        describe_specialization(cuda_specialization(report, compiled)),
+        describe_specialization(
+            vendor_specialization(traits, report, compiled)
+        ),
+        " | subgroup_matches_granularity=",
+        _bool_text(subgroup_matches_granularity(report)),
         " | attributes_answered=",
         report.answered(),
         "/10",
