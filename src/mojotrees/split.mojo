@@ -89,6 +89,12 @@ from .monotone import (
     output_score,
     violates,
 )
+from .cegb import (
+    CegbLedger,
+    CegbNodeCosts,
+    check_cegb_grower_support,
+    prepare_cegb_node,
+)
 from .tree_parameters_extra import (
     ExtraTreeParams,
     apply_monotone_penalty,
@@ -252,23 +258,27 @@ def _feature_gain(
     sign: Int,
     depth: Int,
     node_rows: Int,
-) -> Float64:
+    cegb: CegbNodeCosts,
+) raises -> Float64:
     """One feature's best gain after that feature's costs, or 0.0 when the
     result is rejected (a gain of 0.0 never beats the running best, which
     starts there and is compared strictly).
 
     Called once per feature, which is where LightGBM charges `feature_contri`
-    and the CEGB split cost and the only placement where a per-feature cost is
-    charged once rather than once per candidate. The order is LightGBM's: the
-    multiplier scales the gain, the costs are then subtracted as absolute
-    amounts, the monotone penalty discounts what is left, and
-    `min_gain_to_split` is the floor the result must clear.
+    and every CEGB cost, and the only placement where a per-feature cost is
+    charged once rather than once per candidate: the split cost is a property
+    of the node and the coupled and lazy costs are properties of the feature,
+    so charging per candidate would multiply them by however many thresholds
+    the feature happens to offer. The order is LightGBM's: the multiplier
+    scales the gain, the CEGB costs are then subtracted as absolute amounts,
+    the monotone penalty discounts what is left, and `min_gain_to_split` is
+    the floor the result must clear.
 
-    `feature_already_used` is passed as True because the coupled first-use
-    cost is refused before training starts (see
-    `tree_parameters_extra.ExtraTreeParams.check_scalars`): there is no ledger
-    to consult, and charging it at every split would be a different penalty
-    from the one LightGBM applies.
+    `cegb` is the node's costs, prepared once before this scan by
+    `cegb.prepare_cegb_node`, so charging them here is one lookup and one
+    subtraction with no ledger read and no walk over the node's rows.
+    `penalize` gates only the `feature_contri` multiplier; the CEGB terms gate
+    themselves on `CegbNodeCosts.active`.
 
     With no bundle active this returns `gain` unchanged, so the caller's
     comparison is the one the scan made inline before the bundle existed.
@@ -277,7 +287,8 @@ def _feature_gain(
         return gain
     var g = gain
     if penalize:
-        g = extra.penalties.penalized_gain(g, feature, node_rows, True)
+        g = extra.penalties.penalized_gain(g, feature)
+    g = cegb.adjusted_gain_at(g, feature, node_rows)
     g = apply_monotone_penalty(g, sign, depth, extra.monotone_penalty)
     if not passes_min_gain(g, extra.min_gain_to_split):
         return 0.0
@@ -303,6 +314,7 @@ def find_best_split(
     node: Int = 0,
     tree_index: Int = 0,
     parent_output: Float64 = 0.0,
+    cegb: CegbNodeCosts = CegbNodeCosts.inactive(),
 ) raises -> SplitInfo:
     """Scan all (feature, bin) split candidates and return the one with the
     highest gain. `lambda_reg` is the L2 penalty on the leaf hessian sum and
@@ -360,6 +372,13 @@ def find_best_split(
     0, taken from the histogram's own totals. `depth` is the node's depth in
     edges from the root, which `monotone_penalty` discounts by.
 
+    `cegb` is this node's CEGB costs (`cegb.prepare_cegb_node`), computed once
+    before the scan so that charging a candidate is one lookup and one
+    subtraction. Only a grower carrying the ensemble's `CegbLedger` can build
+    them; a caller that passes none gets the split cost reconstructed from
+    `extra.penalties.cegb` and is refused for the two penalties that need the
+    ledger.
+
     Exclusive feature bundling (efb.mojo) never reaches here: a bundled
     histogram is expanded back to one slice per original feature before the
     search runs (`tree.grow_tree`), so this function reads the per-feature
@@ -385,7 +404,23 @@ def find_best_split(
     # Tested once per node, not once per candidate: an inactive bundle must
     # leave the scan on exactly the path it took before the bundle existed.
     var extra_active = extra.is_active()
-    var penalize = extra_active and extra.penalties.is_active()
+    var penalize = extra_active and extra.penalties.contri_active()
+
+    # `cegb` is this node's prepared costs, which only a grower holding the
+    # ensemble's ledger can build. A caller that prepared none but did
+    # configure CEGB still gets the split cost, from the same numbers through
+    # the same multiplication in the same order: `CegbNodeCosts` keeps
+    # `split_rate` factored from the row count precisely so the count this
+    # scan computes inside its loop is the one charged. The coupled and lazy
+    # costs cannot be reconstructed that way, because they read state that
+    # spans the ensemble, so they are refused here rather than silently
+    # charged as zero.
+    var costs = cegb.copy()
+    if not costs.active and extra.penalties.cegb.is_active():
+        check_cegb_grower_support(extra.penalties.cegb, False, False)
+        costs = prepare_cegb_node(
+            extra.penalties.cegb, CegbLedger.none(), hist.n_features, 0
+        )
     var finish = extra.needs_leaf_finish()
     var draw_one = extra.extra_trees
     if draw_one and cats.any_categorical():
@@ -484,6 +519,7 @@ def find_best_split(
                     sign,
                     depth,
                     node_rows,
+                    costs,
                 )
                 if g > best.gain:
                     best = SplitInfo.categorical(f, g, cs.bitset)
@@ -623,6 +659,7 @@ def find_best_split(
                 sign,
                 depth,
                 node_rows,
+                costs,
             )
             if g > best.gain:
                 best = SplitInfo(f, f_bin, g, True, f_default_left)

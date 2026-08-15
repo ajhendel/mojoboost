@@ -147,22 +147,28 @@ def _penalties(
 ) raises -> FeaturePenalties:
     """The per-feature costs from the params mapping.
 
-    `feature_contri` and `cegb_penalty_feature_coupled` arrive as float64
-    buffer addresses with `n_features` entries, 0 for absent, which is the
-    convention `_parse_monotone` already follows for its per-feature
-    column.
+    `feature_contri`, `cegb_penalty_feature_coupled`, and
+    `cegb_penalty_feature_lazy` arrive as float64 buffer addresses with
+    `n_features` entries, 0 for absent, which is the convention
+    `_parse_monotone` already follows for its per-feature column. The two
+    CEGB vectors land on `FeaturePenalties.cegb`, which is a
+    `cegb.CegbConfig`: this struct carries the parameters and cegb.mojo
+    charges them.
     """
     var out = FeaturePenalties()
     var contri_addr = Int(py=params["feature_contri_addr"])
     if contri_addr != 0:
         out.contri = f64_buffer(contri_addr, n_features)
-    out.cegb_tradeoff = Float64(py=params["cegb_tradeoff"])
-    out.cegb_penalty_split = Float64(py=params["cegb_penalty_split"])
+    out.cegb.tradeoff = Float64(py=params["cegb_tradeoff"])
+    out.cegb.penalty_split = Float64(py=params["cegb_penalty_split"])
     var coupled_addr = Int(py=params["cegb_penalty_feature_coupled_addr"])
     if coupled_addr != 0:
-        out.cegb_penalty_feature_coupled = f64_buffer(
+        out.cegb.penalty_feature_coupled = f64_buffer(
             coupled_addr, n_features
         )
+    var lazy_addr = Int(py=params["cegb_penalty_feature_lazy_addr"])
+    if lazy_addr != 0:
+        out.cegb.penalty_feature_lazy = f64_buffer(lazy_addr, n_features)
     return out^
 
 
@@ -207,9 +213,10 @@ def extra_params_check(
     `min_gain_to_split`, `max_delta_step`, `path_smooth`, `extra_trees`
     (0/1), `extra_seed`, `monotone_penalty`,
     `monotone_constraints_method` (LightGBM's name for it),
-    `cegb_tradeoff`, `cegb_penalty_split`, the two per-feature buffer
-    addresses `feature_contri_addr` and
-    `cegb_penalty_feature_coupled_addr` (0 for absent), and
+    `cegb_tradeoff`, `cegb_penalty_split`, the three per-feature buffer
+    addresses `feature_contri_addr`,
+    `cegb_penalty_feature_coupled_addr`, and
+    `cegb_penalty_feature_lazy_addr` (0 for absent), and
     `forced_splits`, the document's text or an empty string.
 
     `shape` carries `n_features`, `num_leaves`, `max_depth`, and
@@ -218,9 +225,11 @@ def extra_params_check(
 
     Raises with the native message for a value out of range, for a vector
     of the wrong length, for a forced-splits document that does not fit
-    the budget, and for the two options that are parsed but not applied
-    (`cegb_penalty_feature_coupled` and `forcedsplits_filename`), which
-    are refused by name rather than ignored.
+    the budget, and for `forcedsplits_filename`, which is refused by name
+    rather than ignored. The CEGB vectors are not refused here: whether
+    the coupled and lazy penalties can be charged is a property of the
+    grower, and `cegb.check_cegb_grower_support` answers it at
+    `tree._search`.
 
     Returns the four facts a caller needs to route the fit:
     `is_active` (whether anything here would change it at all),

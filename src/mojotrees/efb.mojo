@@ -572,6 +572,66 @@ struct FeatureBundling(Copyable, Movable):
             return EFB_NONE
         return self.members[s]
 
+    def charged_feature(
+        self, feature: Int, bin: Int, is_categorical: Bool = False
+    ) raises -> Int:
+        """The dataset feature a split found in the search space is charged
+        to, for a per-feature cost keyed by dataset feature id.
+
+        `cegb.CegbConfig`'s penalty vectors and `cegb.CegbLedger` are indexed
+        that way, and the split search does not always see that id:
+
+        - Without bundling, and for every categorical feature (categorical
+          splits are searched as category partitions over one column), the
+          search space *is* the dataset, so this is the identity.
+        - With bundling on, a scanned "feature" is a bundle and a threshold
+          bin belongs to one member of it. `decode_feature` recovers the
+          member, and the member is what actually gets read at prediction
+          time, so the member is what a per-feature cost is charged to.
+          Charging the bundle would make one sparse feature's first use pay
+          for every feature bundled with it.
+
+        A multi-member bundle's shared bin (`EFB_SHARED_BIN`) belongs to
+        every member at once, so a split whose threshold is that bin cannot be
+        attributed to one feature; that is refused rather than charged to an
+        arbitrary member. A validated plan never puts a threshold there -- the
+        shared bin is where every member's default value lands -- so this is a
+        guard on an inconsistent plan, not a case a caller has to handle.
+
+        This lives here rather than in `cegb.mojo` because it is a pure
+        bundling query and because `cegb.mojo` deliberately imports nothing
+        from this package: `tree_parameters_extra` imports `cegb`, and this
+        module reaches `tree_parameters_extra` through `binning`, so the
+        import would close a cycle.
+        """
+        if not self.use_bundling:
+            return feature
+        if is_categorical:
+            raise Error(
+                "a categorical split inside a feature bundle cannot be"
+                " charged to one dataset feature; categorical features are"
+                " not bundled, so this plan and this split disagree"
+            )
+        if feature < 0 or feature >= self.n_bundles():
+            raise Error(
+                "bundle ",
+                feature,
+                " is out of range for ",
+                self.n_bundles(),
+                " bundles",
+            )
+        if self.bundle_size(feature) == 1:
+            return self.member_at(feature, 0)
+        var member = self.decode_feature(feature, bin)
+        if member == EFB_NONE:
+            raise Error(
+                "a split on bundle ",
+                feature,
+                " at its shared bin belongs to every member of the bundle, so"
+                " it cannot be charged to one feature",
+            )
+        return member
+
     def decode_bin(self, bundle: Int, bundle_bin: Int) raises -> Int:
         """The original local bin a bundle bin came from, or `EFB_NONE` for
         the shared bin."""

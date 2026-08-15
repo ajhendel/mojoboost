@@ -8,7 +8,7 @@ changed rule rather than as a changed golden value.
     max_delta_step      |output| <= step, sign kept
     path_smooth         out = raw * w/(w+1) + parent/(w+1),  w = n / smooth
     feature_contri      gain *= multiplier
-    CEGB                gain -= tradeoff * (split * rows + coupled on first use)
+    CEGB                see cegb.mojo; this file holds the parameters only
     extra_trees         one uniform threshold index per (tree, node, feature)
     monotone_penalty    the three-case depth factor
     forced splits       a validated four-key document, errors on anything else
@@ -17,6 +17,7 @@ changed rule rather than as a changed golden value.
 from std.testing import assert_equal, assert_false, assert_raises, assert_true
 from std.testing import TestSuite
 
+from mojotrees.cegb import cegb_split_cost
 from mojotrees.tree_parameters_extra import (
     DEFAULT_EXTRA_SEED,
     MONOTONE_ADVANCED,
@@ -177,56 +178,72 @@ def test_split_gain_from_outputs_drops_when_outputs_are_forced() raises:
 def test_penalties_default_to_the_identity() raises:
     var neutral = FeaturePenalties()
     assert_false(neutral.is_active())
-    assert_true(close(neutral.penalized_gain(7.0, 3, 1000, False), 7.0))
+    assert_false(neutral.contri_active())
+    assert_true(close(neutral.penalized_gain(7.0, 3), 7.0))
     assert_true(close(neutral.contri_of(3), 1.0))
-    assert_true(close(neutral.coupled_of(3), 0.0))
+    # The CEGB half lives on `cegb` (cegb.mojo) and is inactive too.
+    assert_false(neutral.cegb.is_active())
+    assert_true(close(neutral.cegb.coupled_of(3), 0.0))
 
 
 def test_feature_contri_scales_one_feature_only() raises:
     var contri: List[Float64] = [1.0, 0.5, 0.0]
     var p = FeaturePenalties.from_contri(contri)
     assert_true(p.is_active())
-    assert_true(close(p.penalized_gain(8.0, 0, 10, True), 8.0))
-    assert_true(close(p.penalized_gain(8.0, 1, 10, True), 4.0))
+    assert_true(close(p.penalized_gain(8.0, 0), 8.0))
+    assert_true(close(p.penalized_gain(8.0, 1), 4.0))
     # A zero multiplier leaves the feature unable to clear any floor, which
     # switches it off by weight rather than by mask.
-    assert_true(close(p.penalized_gain(8.0, 2, 10, True), 0.0))
-    assert_false(passes_min_gain(p.penalized_gain(8.0, 2, 10, True), 0.0))
+    assert_true(close(p.penalized_gain(8.0, 2), 0.0))
+    assert_false(passes_min_gain(p.penalized_gain(8.0, 2), 0.0))
     # A feature past the end of the vector is unweighted.
-    assert_true(close(p.penalized_gain(8.0, 9, 10, True), 8.0))
+    assert_true(close(p.penalized_gain(8.0, 9), 8.0))
 
 
 def test_cegb_split_penalty_scales_with_leaf_rows() raises:
-    var p = FeaturePenalties.cegb(2.0, 0.5)
+    # The costs live on `penalties.cegb` and are charged by cegb.mojo, so
+    # these assert on the config this struct carries. The arithmetic itself
+    # is tests/test_cegb.mojo's.
+    var p = FeaturePenalties.from_cegb(2.0, 0.5)
     assert_true(p.is_active())
-    # 8 - 2 * 0.5 * 4 = 4, and the charge doubles with the row count.
-    assert_true(close(p.penalized_gain(8.0, 0, 4, True), 4.0))
-    assert_true(close(p.penalized_gain(8.0, 0, 8, True), 0.0))
+    assert_false(p.contri_active())
+    assert_true(p.cegb.split_cost_active())
+    assert_true(close(cegb_split_cost(p.cegb, 4), 4.0))
+    assert_true(close(cegb_split_cost(p.cegb, 8), 8.0))
     # A tradeoff of zero switches the whole CEGB side off.
-    var off = FeaturePenalties.cegb(0.0, 0.5)
+    var off = FeaturePenalties.from_cegb(0.0, 0.5)
     assert_false(off.is_active())
-    assert_true(close(off.penalized_gain(8.0, 0, 8, False), 8.0))
+    assert_true(close(cegb_split_cost(off.cegb, 8), 0.0))
+    # And the multiplier half is untouched by either.
+    assert_true(close(p.penalized_gain(8.0, 0), 8.0))
 
 
-def test_cegb_coupled_penalty_is_charged_on_first_use_only() raises:
+def test_cegb_coupled_penalty_is_carried_not_charged_here() raises:
     var coupled: List[Float64] = [0.0, 3.0]
-    var p = FeaturePenalties.cegb(2.0, 0.0, coupled)
-    # Feature 1, not yet used anywhere: 8 - 2 * 3 = 2.
-    assert_true(close(p.penalized_gain(8.0, 1, 100, False), 2.0))
-    # Already used: no charge, and the charge never scaled with the rows.
-    assert_true(close(p.penalized_gain(8.0, 1, 100, True), 8.0))
-    # Feature 0 carries no cost either way.
-    assert_true(close(p.penalized_gain(8.0, 0, 100, False), 8.0))
+    var p = FeaturePenalties.from_cegb(2.0, 0.0, coupled)
+    assert_true(p.is_active())
+    assert_true(p.cegb.coupled_active())
+    assert_true(p.cegb.needs_feature_ledger())
+    assert_true(close(p.cegb.coupled_of(1), 3.0))
+    assert_true(close(p.cegb.coupled_of(0), 0.0))
+    # `penalized_gain` is the multiplier and nothing else, whatever the CEGB
+    # costs say: charging them here as well is how they would be applied
+    # twice.
+    assert_true(close(p.penalized_gain(8.0, 1), 8.0))
 
 
-def test_penalties_compose_multiplier_then_costs() raises:
+def test_penalties_keep_the_multiplier_and_the_costs_apart() raises:
     var weights: List[Float64] = [0.5, 1.0]
     var p = FeaturePenalties.from_contri(weights)
-    p.cegb_tradeoff = 1.0
-    p.cegb_penalty_split = 1.0
-    # The multiplier scales the gain, then the cost is subtracted from the
-    # scaled value: 10 * 0.5 - 1 * 1 * 2 = 3.
-    assert_true(close(p.penalized_gain(10.0, 0, 2, True), 3.0))
+    p.cegb.tradeoff = 1.0
+    p.cegb.penalty_split = 1.0
+    # The multiplier scales the gain: 10 * 0.5 = 5. The cost is subtracted
+    # from that by cegb.mojo, at `split._feature_gain`, one call later:
+    # 5 - 1 * 1 * 2 = 3.
+    assert_true(close(p.penalized_gain(10.0, 0), 5.0))
+    assert_true(
+        close(p.penalized_gain(10.0, 0) - cegb_split_cost(p.cegb, 2), 3.0)
+    )
 
 
 def test_penalties_reject_unusable_vectors() raises:
@@ -241,13 +258,18 @@ def test_penalties_reject_unusable_vectors() raises:
         wrong_length.check_features(3)
 
     var bad_costs: List[Float64] = [1.0, -2.0]
-    var bad_coupled = FeaturePenalties.cegb(1.0, 0.0, bad_costs)
+    var bad_coupled = FeaturePenalties.from_cegb(1.0, 0.0, bad_costs)
     with assert_raises():
         bad_coupled.check_features(2)
 
-    var bad_tradeoff = FeaturePenalties.cegb(-1.0, 0.0)
+    var bad_tradeoff = FeaturePenalties.from_cegb(-1.0, 0.0)
     with assert_raises():
         bad_tradeoff.check_features(2)
+
+    var bad_lazy: List[Float64] = [1.0, -2.0]
+    var lazy = FeaturePenalties.from_cegb(1.0, 0.0, [], bad_lazy)
+    with assert_raises():
+        lazy.check_features(2)
 
     # An empty bundle fits any width.
     FeaturePenalties().check_features(7)
@@ -575,12 +597,14 @@ def test_deferred_options_are_rejected_by_name() raises:
         check_extra_option_supported("linear_tree")
     with assert_raises():
         check_extra_option_supported("linear_lambda")
-    with assert_raises():
-        check_extra_option_supported("cegb_penalty_feature_lazy")
     # An implemented name passes through; this checker speaks only to the
-    # options it refuses.
+    # options it refuses. All four cegb_* names are implemented now
+    # (cegb.mojo); the two that need the per-ensemble ledger are refused per
+    # grower, by `cegb.check_cegb_grower_support`, not by name here.
     check_extra_option_supported("path_smooth")
     check_extra_option_supported("cegb_penalty_split")
+    check_extra_option_supported("cegb_penalty_feature_coupled")
+    check_extra_option_supported("cegb_penalty_feature_lazy")
 
 
 def test_defaults_are_lightgbms_and_are_inactive() raises:

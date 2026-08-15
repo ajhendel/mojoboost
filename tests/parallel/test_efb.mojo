@@ -291,6 +291,45 @@ def test_encode_decode_round_trip() raises:
         _ = plan.decode_feature(1, 0)
 
 
+def test_a_split_is_charged_to_the_member_that_gets_read() raises:
+    # `charged_feature` is what a per-feature cost keyed by dataset feature
+    # id (cegb.mojo's two vectors and its ledger) asks a bundled search
+    # space. Charging the bundle would make one sparse feature's first use
+    # pay for every feature bundled with it.
+    var data = _exclusive_fixture()
+    var fitted = fit_bundles(_three_bin_mapper(), data)
+
+    # In force, whatever this fixture's own verdict was: the question is
+    # what a bundled search space answers, not whether this plan pays.
+    var plan = fitted.copy()
+    plan.use_bundling = True
+    for f in range(3):
+        var b = plan.bundle_of[f]
+        var s = plan.slot_of[f]
+        for local in range(3):
+            if local == plan.slot_default[s]:
+                continue
+            assert_equal(plan.charged_feature(b, plan.encode(f, local)), f)
+
+    # The shared bin belongs to every member at once, so it cannot be
+    # charged to one feature, and a categorical feature is never bundled at
+    # all: both are refused rather than attributed to an arbitrary member.
+    with assert_raises():
+        _ = plan.charged_feature(0, EFB_SHARED_BIN)
+    with assert_raises():
+        _ = plan.charged_feature(0, 1, True)
+    with assert_raises():
+        _ = plan.charged_feature(99, 1)
+
+    # Not in force is the identity: the search space is the dataset, so the
+    # feature the scan named is the feature that is read.
+    var off = fitted.copy()
+    off.use_bundling = False
+    assert_equal(off.charged_feature(0, EFB_SHARED_BIN), 0)
+    assert_equal(off.charged_feature(2, 5), 2)
+    assert_equal(off.charged_feature(99, 1, True), 99)
+
+
 def test_bundled_matrix_recovers_every_cell() raises:
     """The contract, checked exhaustively: for every row and every feature,
     reading the bundle column and decoding it either names that feature and

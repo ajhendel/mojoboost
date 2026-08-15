@@ -59,6 +59,14 @@ created.
 """
 
 from .binning import BinnedMatrix
+from .cegb import (
+    CegbLedger,
+    CegbNodeCosts,
+    cegb_commit_split,
+    cegb_stale_cached_gain,
+    check_cegb_grower_support,
+    prepare_cegb_node,
+)
 from .categorical import (
     CAT_BITSET_WORDS,
     CategoricalParams,
@@ -736,6 +744,8 @@ def _search(
     tree_index: Int = 0,
     parent_output: Float64 = 0.0,
     grower_applies_extra: Bool = False,
+    cegb: CegbNodeCosts = CegbNodeCosts.inactive(),
+    grower_applies_cegb: Bool = False,
 ) raises -> SplitInfo:
     """Best split for one node. `allowed` is the node's interaction-constraint
     allow mask and `features` its subsampled feature ids; empty means every
@@ -775,6 +785,14 @@ def _search(
             " leaf row count, or the parent output that they read. Train on"
             " the dense CPU grower, or leave them at their defaults"
         )
+    # The same contract for CEGB, split along the line of what the term
+    # needs: the split cost is a function of the node's row count and is live
+    # for every caller here, while the coupled and lazy penalties read a
+    # ledger that spans the ensemble and are refused for a grower that does
+    # not carry one. `cegb` is that grower's prepared per-node costs.
+    check_cegb_grower_support(
+        params.extra.penalties.cegb, grower_applies_cegb, grower_applies_cegb
+    )
     # A leaf at the depth limit yields no split, which is what stops growth
     # beneath it; leaf-wise selection is otherwise untouched.
     if params.max_depth > 0 and depth >= params.max_depth:
@@ -800,6 +818,7 @@ def _search(
         node=node,
         tree_index=tree_index,
         parent_output=parent_output,
+        cegb=cegb,
     )
 
 
@@ -890,8 +909,47 @@ def grow_tree(
     tree_index: Int = 0,
     bundling: BundledMatrix = BundledMatrix.none(),
 ) raises -> Tree:
+    """Grow one tree with no CEGB ledger: `grow_tree_with_cegb` with an inert
+    one.
+
+    This is the entry point every trainer that does not carry a
+    `cegb.CegbLedger` calls, and it is unchanged for all of them. The inert
+    ledger is not a silent default: `cegb_penalty_split` is still charged,
+    because it reads only the node's row count, while
+    `cegb_penalty_feature_coupled` and `cegb_penalty_feature_lazy` are
+    *refused* by `check_cegb_grower_support` rather than charged as zero, so
+    no caller can get a model that quietly ignored them. A trainer that wants
+    them owns a ledger for the whole ensemble and calls `grow_tree_with_cegb`;
+    `boosting.fit` and `boosting.fit_multiclass` do.
+
+    A `mut` argument cannot be defaulted, which is why this is a second entry
+    point rather than a defaulted parameter.
+    """
+    var ledger = CegbLedger.none()
+    return grow_tree_with_cegb(
+        data, grad, hess, params, ledger, bag, tree_index, bundling
+    )
+
+
+def grow_tree_with_cegb(
+    data: BinnedMatrix,
+    grad: List[Float64],
+    hess: List[Float64],
+    params: TreeParams,
+    mut ledger: CegbLedger,
+    bag: List[Int] = [],
+    tree_index: Int = 0,
+    bundling: BundledMatrix = BundledMatrix.none(),
+) raises -> Tree:
     """Grow one tree, leaf-wise by default or depth-wise under
     `params.grow_policy == GROW_DEPTHWISE`.
+
+    `ledger` is the ensemble's CEGB ledger (cegb.mojo), read once per node to
+    cost that node's features and written once per chosen split. It spans the
+    whole ensemble rather than one tree, which is CEGB's premise: the model
+    pays for a feature once, so a later tree reusing it gets it free. Pass
+    `CegbLedger.none()` (or call `grow_tree`) when no CEGB penalty needing a
+    ledger is configured.
 
     A non-empty `bag` of row indices (see bagging.mojo) restricts growth to
     those rows: the root histogram covers the bag alone, so every count,
@@ -977,6 +1035,14 @@ def grow_tree(
         params.max_depth,
         params.min_data_in_leaf,
     )
+    # Whether this call can honor the CEGB penalties that read the ledger,
+    # asked once per tree rather than at the first node, so a trainer that did
+    # not thread one is told before any histogram is built. `carries_cegb` is
+    # also what `_search` is given, so the refusal below and the one inside it
+    # are the same test on the same state.
+    var cegb_config = params.extra.penalties.cegb.copy()
+    var carries_cegb = ledger.is_tracking()
+    check_cegb_grower_support(cegb_config, carries_cegb, carries_cegb)
     # A plan is fitted from one matrix and is meaningless against another, so
     # the shapes are checked before the first histogram rather than showing up
     # as a bin id that means the wrong feature.
@@ -1085,20 +1151,34 @@ def grow_tree(
     # root is always node 0, so its per-level and per-node feature draws are
     # fixed too.
     var root_branch = List[Int]()
+    # Hoisted out of the `_search` call because the node's costs must be
+    # prepared over exactly the feature set the scan will look at: costing
+    # more would walk rows for features that are never scanned, and costing
+    # fewer makes `CegbNodeCosts.delta_of` raise for a feature the scan asks
+    # about.
+    var root_features = select_split_features(
+        tree_features,
+        params.feature_fraction_bylevel,
+        params.feature_fraction_bynode,
+        params.feature_fraction_seed,
+        tree_index,
+        0,
+        0,
+    )
+    var root_costs = prepare_cegb_node(
+        cegb_config,
+        ledger,
+        data.n_features,
+        len(root_rows),
+        root_rows,
+        root_features,
+    )
     var root_split = _search(
         root_hist,
         len(root_rows),
         params,
         params.constraints.allowed_features(root_branch),
-        select_split_features(
-            tree_features,
-            params.feature_fraction_bylevel,
-            params.feature_fraction_bynode,
-            params.feature_fraction_seed,
-            tree_index,
-            0,
-            0,
-        ),
+        root_features,
         depth=0,
         missing_bins=data.missing_bin,
         monotone=signs,
@@ -1107,6 +1187,8 @@ def grow_tree(
         tree_index=tree_index,
         parent_output=tree.value[root],
         grower_applies_extra=True,
+        cegb=root_costs,
+        grower_applies_cegb=carries_cegb,
     )
 
     var frontier = List[_LeafState]()
@@ -1310,6 +1392,36 @@ def grow_tree(
         tree.right[parent_node] = right_node
         tree._set_split(parent_node, split, split_missing_bin)
 
+        # The CEGB ledger is written here and nowhere else: after the parent's
+        # own split is recorded and before either child is searched, so both
+        # children see the ledger this split just updated. That is LightGBM's
+        # order. A forced split commits too -- the model computes that feature
+        # at prediction time whether a gain chose it or the caller did.
+        #
+        # `split.feature` is a dataset feature id rather than a bundle id,
+        # because this grower expands a bundled histogram back to one slice
+        # per original feature before searching it (`_hist_full`) and
+        # partitions rows by the original matrix. A grower that searched
+        # bundles directly would charge
+        # `bundling.plan.charged_feature(split.feature, split.bin, ...)`.
+        if carries_cegb:
+            var commit = cegb_commit_split(
+                ledger, cegb_config, split.feature, frontier[best_i].rows
+            )
+            if commit.feature_newly_used:
+                # Every other leaf's cached candidate was scored while this
+                # feature still owed its first-use cost. The model computes it
+                # now whatever those leaves do, so the candidates that were
+                # charged for it get exactly that charge back. The split and
+                # lazy terms belong to their own nodes and a split over here
+                # does not touch them.
+                for i in range(len(frontier)):
+                    if i == best_i:
+                        continue
+                    frontier[i].split.gain += cegb_stale_cached_gain(
+                        commit, frontier[i].split.feature, split.feature
+                    )
+
         # Both children inherit the same branch feature set, so they share one
         # allow mask, and both sit one edge below the leaf that was split.
         var branch = extend_branch(frontier[best_i].branch, split.feature)
@@ -1317,20 +1429,29 @@ def grow_tree(
         var child_depth = frontier[best_i].depth + 1
         # Each child draws its own per-node feature set from its node id, out
         # of the set its depth drew from the tree's.
+        var left_features = select_split_features(
+            tree_features,
+            params.feature_fraction_bylevel,
+            params.feature_fraction_bynode,
+            params.feature_fraction_seed,
+            tree_index,
+            child_depth,
+            left_node,
+        )
+        var left_costs = prepare_cegb_node(
+            cegb_config,
+            ledger,
+            data.n_features,
+            len(left_rows),
+            left_rows,
+            left_features,
+        )
         var left_split = _search(
             left_hist,
             len(left_rows),
             params,
             allowed,
-            select_split_features(
-                tree_features,
-                params.feature_fraction_bylevel,
-                params.feature_fraction_bynode,
-                params.feature_fraction_seed,
-                tree_index,
-                child_depth,
-                left_node,
-            ),
+            left_features,
             depth=child_depth,
             missing_bins=data.missing_bin,
             monotone=signs,
@@ -1340,21 +1461,32 @@ def grow_tree(
             tree_index=tree_index,
             parent_output=left_value,
             grower_applies_extra=True,
+            cegb=left_costs,
+            grower_applies_cegb=carries_cegb,
+        )
+        var right_features = select_split_features(
+            tree_features,
+            params.feature_fraction_bylevel,
+            params.feature_fraction_bynode,
+            params.feature_fraction_seed,
+            tree_index,
+            child_depth,
+            right_node,
+        )
+        var right_costs = prepare_cegb_node(
+            cegb_config,
+            ledger,
+            data.n_features,
+            len(right_rows),
+            right_rows,
+            right_features,
         )
         var right_split = _search(
             right_hist,
             len(right_rows),
             params,
             allowed,
-            select_split_features(
-                tree_features,
-                params.feature_fraction_bylevel,
-                params.feature_fraction_bynode,
-                params.feature_fraction_seed,
-                tree_index,
-                child_depth,
-                right_node,
-            ),
+            right_features,
             depth=child_depth,
             missing_bins=data.missing_bin,
             monotone=signs,
@@ -1364,6 +1496,8 @@ def grow_tree(
             tree_index=tree_index,
             parent_output=right_value,
             grower_applies_extra=True,
+            cegb=right_costs,
+            grower_applies_cegb=carries_cegb,
         )
 
         frontier[best_i] = _LeafState(

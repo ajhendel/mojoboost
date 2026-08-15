@@ -71,10 +71,12 @@ committed. Nothing depends on scan order, thread count, or how many nodes were
 scored before this one:
 
 - `unread` is counted as an integer and multiplied once. LightGBM accumulates
-  `lazy[f]` once per unread row, which for a large leaf is a different
-  floating-point number from `lazy[f] * count`. Ours is the exact one; this is
-  recorded in `docs/CEGB.md` as an intentional difference to confirm before
-  the parity table calls the lazy penalty bit-comparable.
+  `lazy[f]` once per unread row (`CalculateOndemandCosts` does `total +=
+  penalty` inside its row loop, confirmed against LightGBM master), which for
+  a large leaf is a different floating-point number from `lazy[f] * count`.
+  Ours is the exact one, and `docs/CEGB.md` records it as an intentional
+  difference so the parity table does not call the lazy penalty
+  bit-comparable.
 - The ledger is written once per *committed* split, never during a scan, so a
   parallel scan cannot observe a half-updated ledger and two scans of the same
   node score identically.
@@ -82,45 +84,37 @@ scored before this one:
   coupled flag flips at the same moment with no message. The lazy count does
   not have that property; see `check_cegb_distributed`.
 
-Fusing the pre-existing fragment
---------------------------------
-`tree_parameters_extra.FeaturePenalties` already carries `cegb_tradeoff`,
-`cegb_penalty_split`, and `cegb_penalty_feature_coupled`, and applies the
-first two inside `penalized_gain` (via `split._feature_gain`). That is the
-fragment this module fuses: `CegbConfig.from_feature_penalties` reads it, and
-`cegb_adjusted_gain` reproduces its arithmetic exactly when no ledger is
-active, so the split search's current behavior is a special case of this one
-rather than a second implementation of it.
+One home for the parameters
+---------------------------
+`tree_parameters_extra.FeaturePenalties` holds a `CegbConfig` and nothing else
+CEGB-shaped: its `penalized_gain` applies the `feature_contri` multiplier and
+stops there, and every CEGB term is subtracted by this module, through
+`CegbNodeCosts`, at `split._feature_gain`. There is exactly one implementation
+of the arithmetic and exactly one place a caller can set the parameters.
 
-The fusion is only half-done until `FeaturePenalties` sheds its three `cegb_*`
-fields and holds a `CegbConfig` instead. That file belongs to another lane, so
-`handoffs/remaining_04_cegb.md` carries the exact patch; until it is applied,
-`FeaturePenalties.penalized_gain` and `cegb_adjusted_gain` must not both be
-called on one gain. `cegb_adjusted_gain` is the one to keep, because it is the
-only one that can charge the coupled and lazy terms at all.
+The import runs one way -- `tree_parameters_extra` imports `cegb`, never the
+reverse -- and this module imports nothing from the package at all, which is
+what keeps that edge acyclic: `binning` and `categorical` both import
+`tree_parameters_extra`, so any import from here into the data layer would
+close a loop. That is why the one bundling-shaped question CEGB asks, which
+dataset feature a split in a bundled search space is charged to, lives on
+`efb.FeatureBundling.charged_feature` instead of here.
 
-Nothing here is exposed as a parameter yet
-------------------------------------------
-`params.parse_params` accepts `cegb_tradeoff` and `cegb_penalty_split` only,
-and `check_extra_option_supported` still refuses `cegb_penalty_feature_lazy`
-and `cegb_penalty_feature_coupled` by name. Those refusals stay until a real
-split decision consumes the ledger: a parameter that parses and then does
-nothing is worse than one that is rejected. The handoff lists, in order, the
-edits that make each refusal safe to remove.
+Where this is charged
+---------------------
+`tree.grow_tree` is the grower that carries the ledger: it builds one
+`CegbNodeCosts` per node before the scan, passes it to `tree._search`, and
+calls `cegb_commit_split` when a split is chosen. `boosting.fit` and
+`boosting.fit_multiclass` own the `CegbLedger` for the whole ensemble and hand
+the same one to every tree. Every other grower leaves the ledger inert, which
+charges the split cost and *refuses* the coupled and lazy penalties through
+`check_cegb_grower_support` rather than ignoring them.
 """
-
-from .efb import EFB_NONE, FeatureBundling
-from .tree_parameters_extra import FeaturePenalties
 
 # LightGBM's `cegb_tradeoff` default. A tradeoff of 0.0 switches every CEGB
 # term off at once whatever the individual penalties are, which is the
 # documented way to disable the whole mechanism without clearing its vectors.
 comptime CEGB_DEFAULT_TRADEOFF = 1.0
-
-# `cegb_dataset_feature` returns this when a bundled split lands on a bin that
-# belongs to no single original feature. Deliberately the same sentinel
-# `efb.decode_feature` uses, since it is that call's answer being passed on.
-comptime CEGB_FEATURE_AMBIGUOUS = EFB_NONE
 
 # 64 rows per word in the lazy read bitset.
 comptime _ROW_BITS = 6
@@ -207,23 +201,6 @@ struct CegbConfig(Copyable, Movable):
         out.penalty_split = penalty_split
         out.penalty_feature_coupled = penalty_feature_coupled.copy()
         out.penalty_feature_lazy = penalty_feature_lazy.copy()
-        return out^
-
-    @staticmethod
-    def from_feature_penalties(p: FeaturePenalties) raises -> CegbConfig:
-        """The CEGB half of an existing `FeaturePenalties`, and nothing else.
-
-        This is the fusion seam: `FeaturePenalties` is where the split search
-        reads `cegb_tradeoff` and `cegb_penalty_split` today, so a caller
-        holding one can get the authoritative bundle out of it without a
-        second source of truth. `p.contri` is deliberately *not* read -- the
-        multiplier stays that struct's, and reading it here would be the first
-        step toward charging it twice.
-        """
-        var out = CegbConfig()
-        out.tradeoff = p.cegb_tradeoff
-        out.penalty_split = p.cegb_penalty_split
-        out.penalty_feature_coupled = p.cegb_penalty_feature_coupled.copy()
         return out^
 
     def coupled_of(self, feature: Int) -> Float64:
@@ -370,7 +347,12 @@ struct CegbLedger(Copyable, Movable):
     is that the *model* pays for a feature once, so a second tree that reuses
     a feature the first tree already needed gets it free. A ledger reset per
     tree would charge the first-use cost once per tree, which is a different
-    (and much harsher) regularizer.
+    (and much harsher) regularizer. Confirmed against LightGBM master:
+    `CostEfficientGradientBoosting::Init` sizes `is_feature_used_in_split_`
+    and the `feature_used_in_data_` bitset once and `BeforeTrain` does not
+    clear either, while it *does* clear the per-tree `splits_per_leaf_` cache
+    beside them. Both lifetimes are deliberate there and both are matched
+    here.
 
     LIFECYCLE AND CONTINUED TRAINING
 
@@ -451,6 +433,17 @@ struct CegbLedger(Copyable, Movable):
     def is_tracking(self) -> Bool:
         """Whether this ledger records anything at all."""
         return self.tracks_features or self.tracks_rows
+
+    def bytes_allocated(self) -> Int:
+        """How much memory this ledger holds.
+
+        The row bitset is `n_features * n_rows` bits and is the only part that
+        can be large: 12.5 MB for 100 features over 10 million rows, 1.25 GB
+        at 10000 features. Reported rather than capped, because any cap would
+        be a number this library invented; a caller that wants to refuse a
+        configuration can ask before training and say so in its own terms.
+        """
+        return len(self.feature_used) + 8 * len(self.row_read)
 
     def feature_is_used(self, feature: Int) -> Bool:
         """Whether `feature` has been split on before now.
@@ -839,13 +832,26 @@ def prepare_cegb_node(
         raise Error("cegb: n_features must be nonnegative")
     if n_active_rows < 0:
         raise Error("cegb: n_active_rows must be nonnegative")
-    if config.needs_ledger() and not ledger.is_tracking():
+    # Each half of the ledger is checked against the half of the
+    # configuration that reads it. `is_tracking()` alone would let a ledger
+    # built for a coupled-only run cost a lazy penalty, and an untracked row
+    # bitset answers "already read" to every question, so the lazy term would
+    # come out as a plausible zero instead of an error.
+    if config.needs_feature_ledger() and not ledger.tracks_features:
         raise Error(
-            "cegb_penalty_feature_coupled and cegb_penalty_feature_lazy are"
-            " charged against a per-ensemble ledger; this node was costed"
-            " with an inert one, which would charge every first use again."
-            " Build one with CegbLedger.create and carry it across the whole"
-            " ensemble"
+            "cegb_penalty_feature_coupled is charged against a per-ensemble"
+            " feature-use ledger; this node was costed with one that does not"
+            " track features, which would charge every first use again. Build"
+            " it with CegbLedger.create from this same configuration and"
+            " carry it across the whole ensemble"
+        )
+    if config.needs_row_ledger() and not ledger.tracks_rows:
+        raise Error(
+            "cegb_penalty_feature_lazy is charged against a per-(feature,"
+            " row) read bitset; this node was costed with a ledger that does"
+            " not track rows, which would charge nothing at all. Build it"
+            " with CegbLedger.create from this same configuration and carry"
+            " it across the whole ensemble"
         )
     if config.needs_row_ledger():
         if len(rows) != n_active_rows:
@@ -872,7 +878,12 @@ def prepare_cegb_node(
 
     var want_coupled = config.coupled_active()
     var want_lazy = config.lazy_active()
-    if not want_coupled and not want_lazy:
+    # The marking loop runs whenever the scan set is restricted, even for a
+    # configuration with only the split cost: `prepared` starts all-False
+    # there, so skipping the loop would leave every feature uncosted and make
+    # `delta_of` raise for exactly the features the scan is about to ask
+    # about. Returning early is only safe when every feature is prepared.
+    if not out.restricted and not want_coupled and not want_lazy:
         return out^
 
     var n_scan = n_features if not out.restricted else len(features)
@@ -978,81 +989,29 @@ def cegb_stale_cached_gain(
     term and the lazy term are properties of the cached candidate's own node
     and are unchanged by a split somewhere else.
 
-    NOT YET CONFIRMED AGAINST LightGBM. LightGBM refreshes its cached
-    per-leaf best splits at this point too, and whether it refunds every
-    cached leaf or only the ones on the newly used feature decides which tree
-    comes out. This implements the arithmetically consistent rule -- refund
-    what was charged -- and `docs/CEGB.md` records the comparison as an open
-    parity question. It is stated here because a caller reading only this
-    function must not take the choice for settled.
+    CONFIRMED AGAINST LightGBM master, and one difference remains.
+    `CostEfficientGradientBoosting::UpdateLeafBestSplits` walks every leaf but
+    the one just split, adds `cegb_tradeoff * cegb_penalty_feature_coupled[f]`
+    to that leaf's cached candidate *on the newly used feature*, and installs
+    it as the leaf's best split if it now beats it. The amount and the
+    condition are this function's: only candidates on `f` are refunded, and
+    the refund is exactly what was charged.
+
+    What LightGBM can do and this cannot: it keeps a candidate per (leaf,
+    feature) -- `splits_per_leaf_`, sized `num_leaves * num_features` and
+    cleared per tree -- so a leaf whose best split is on some *other* feature
+    can still have its runner-up on `f` promoted once `f` is free. mojotrees's
+    frontier caches one candidate per leaf, so a refund can improve a cached
+    best but never resurrect a candidate that was not it. Matching that needs
+    the per-(leaf, feature) table, which is `n_leaves * n_features` split
+    records against the one this grower keeps; `docs/CEGB.md` section 10
+    carries it as the remaining difference rather than an open question.
     """
     if not commit.feature_newly_used:
         return 0.0
     if cached_feature != split_feature:
         return 0.0
     return commit.coupled_refund
-
-
-# ---------------------------------------------------------------------------
-# Which dataset feature a split is charged to
-# ---------------------------------------------------------------------------
-
-
-def cegb_dataset_feature(
-    bundling: FeatureBundling,
-    feature: Int,
-    bin: Int,
-    is_categorical: Bool = False,
-) raises -> Int:
-    """The dataset feature a split found in the search space is charged to.
-
-    CEGB's penalty vectors, and the ledger, are indexed by dataset feature id.
-    The split search does not always see that id:
-
-    - Without feature bundling, and for every categorical feature (categorical
-      splits are searched as category partitions over one column), the search
-      space *is* the dataset, so this is the identity.
-    - With exclusive feature bundling on, a scanned "feature" is a bundle and
-      a threshold bin belongs to one member of it. `efb.decode_feature`
-      recovers the member, and that member is the feature that actually gets
-      read at prediction time -- so it, not the bundle, is what CEGB charges.
-      Charging the bundle would make one sparse feature's first use pay for
-      every feature bundled with it.
-
-    A multi-member bundle's shared bin (`efb.EFB_SHARED_BIN`) belongs to every
-    member at once, so a split whose threshold is that bin cannot be
-    attributed to one feature; that is refused rather than charged to an
-    arbitrary member. A validated bundling plan never puts a threshold there
-    -- the shared bin is where every member's default value lands -- so this
-    is a guard on an inconsistent plan, not a case a caller has to handle.
-    """
-    if not bundling.use_bundling:
-        return feature
-    if is_categorical:
-        raise Error(
-            "cegb: a categorical split inside a feature bundle cannot be"
-            " charged to one dataset feature; categorical features are not"
-            " bundled, so this plan and this split disagree"
-        )
-    if feature < 0 or feature >= bundling.n_bundles():
-        raise Error(
-            "cegb: bundle ",
-            feature,
-            " is out of range for ",
-            bundling.n_bundles(),
-            " bundles",
-        )
-    if bundling.bundle_size(feature) == 1:
-        return bundling.member_at(feature, 0)
-    var member = bundling.decode_feature(feature, bin)
-    if member == CEGB_FEATURE_AMBIGUOUS:
-        raise Error(
-            "cegb: a split on bundle ",
-            feature,
-            " at its shared bin belongs to every member of the bundle, so it"
-            " cannot be charged to one feature",
-        )
-    return member
 
 
 # ---------------------------------------------------------------------------

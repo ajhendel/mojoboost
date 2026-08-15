@@ -201,8 +201,11 @@ class _Base(_ParamsMixin):
       `feature_contri`), and `cegb_tradeoff` with `cegb_penalty_split` are
       the cost-effective gradient boosting knobs that charge a split for
       being taken. `cegb_penalty_feature_coupled` and
-      `cegb_penalty_feature_lazy` are refused by name: both need per-model
-      state no trainer keeps.
+      `cegb_penalty_feature_lazy` are implemented too (charged against the
+      per-ensemble ledger in src/mojotrees/cegb.mojo), but both are
+      per-feature vectors and this estimator has no parameter carrying one
+      for them yet; the Mojo API reaches them through
+      `TreeParams.extra.penalties.cegb`.
     - `forced_splits` is LightGBM's forced-splits document, given as the
       JSON text or as the `dict`/`list` to serialize, rather than as
       `forcedsplits_filename`. Its raw thresholds still have to be mapped
@@ -1048,12 +1051,17 @@ class _Base(_ParamsMixin):
             "feature_contri_addr": int(contri_addr),
             "cegb_tradeoff": float(self.cegb_tradeoff),
             "cegb_penalty_split": float(self.cegb_penalty_split),
-            # Always 0. `cegb_penalty_feature_coupled` is parsed natively
-            # and then refused by name, because charging it needs a
-            # per-model feature-use ledger that no trainer keeps; the key
-            # exists so the parser reads one shape of mapping from every
-            # caller, and there is no estimator parameter that can set it.
+            # Both always 0. `cegb_penalty_feature_coupled` and
+            # `cegb_penalty_feature_lazy` are applied by the trainer now
+            # (src/mojotrees/cegb.mojo, charged against the per-ensemble
+            # `CegbLedger` that `boosting.train` owns), but they are
+            # per-feature vectors and this estimator has no parameter that
+            # carries one for them yet; the Mojo API reaches them through
+            # `TreeParams.extra.penalties.cegb`. The keys are sent on every
+            # fit because the native parser subscripts the mapping rather
+            # than testing for a key.
             "cegb_penalty_feature_coupled_addr": 0,
+            "cegb_penalty_feature_lazy_addr": 0,
             "forced_splits": self._forced_splits_text(),
             # Exclusive feature bundling, read by
             # `efb_settings_from_mapping` in bindings/basic_bindings.mojo

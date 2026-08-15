@@ -59,8 +59,25 @@ from .growth_policy import (
     grow_policy_name,
     parse_grow_policy,
 )
+from .cegb import (
+    CEGB_DEFAULT_TRADEOFF,
+    CegbConfig,
+    CegbLedger,
+    CegbNodeCosts,
+    cegb_adjusted_gain,
+    cegb_commit_split,
+    cegb_delta_gain,
+    cegb_stale_cached_gain,
+    prepare_cegb_node,
+)
 from .split import SplitInfo, find_best_split, soft_threshold_l1
-from .tree import Tree, TreeParams, grow_tree, node_bounds
+from .tree import (
+    Tree,
+    TreeParams,
+    grow_tree,
+    grow_tree_with_cegb,
+    node_bounds,
+)
 from .boosting import (
     BINARY_LOGISTIC,
     CROSS_ENTROPY,

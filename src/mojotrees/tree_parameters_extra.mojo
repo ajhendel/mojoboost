@@ -32,8 +32,11 @@ tier is a property of what the rule needs rather than of the backend:
   `grow_tree` before leaf-wise growth resumes. A parameter string cannot
   carry a document, so `check_extra_option_supported` names that path rather
   than accepting the key.
-- Parsed, validated, and refused: `cegb_penalty_feature_coupled`, plus
-  `linear_tree`/`linear_lambda`, `cegb_penalty_feature_lazy`, and
+- Live in `tree.grow_tree` alone because they need the per-ensemble ledger
+  `boosting.fit` owns, and refused per grower rather than by name:
+  `cegb_penalty_feature_coupled` and `cegb_penalty_feature_lazy`. See
+  `cegb.check_cegb_grower_support`.
+- Parsed, validated, and refused by name: `linear_tree`/`linear_lambda` and
   `feature_pre_filter`. Each names what it would take; see
   `check_extra_option_supported`.
 
@@ -48,9 +51,10 @@ What is here, with LightGBM's name and default
 - `min_gain_to_split` (0.0): a floor a candidate's gain must clear.
 - `max_delta_step` (0.0): a cap on the magnitude of a leaf's output.
 - `path_smooth` (0.0): leaf-value shrinkage toward the parent's output.
-- `feature_contri` (empty): per-feature multipliers on split gain, plus the
-  two computable CEGB split penalties (`cegb_tradeoff` 1.0,
-  `cegb_penalty_split` 0.0, `cegb_penalty_feature_coupled` empty).
+- `feature_contri` (empty): per-feature multipliers on split gain, held on
+  `FeaturePenalties` beside a `cegb.CegbConfig` carrying all four `cegb_*`
+  costs (`cegb_tradeoff` 1.0, `cegb_penalty_split` 0.0, both per-feature
+  vectors empty).
 - `extra_trees` (false) / `extra_seed` (6): one randomly chosen threshold per
   feature instead of a full scan.
 - `monotone_penalty` (0.0) and `monotone_constraints_method` ("basic").
@@ -111,6 +115,7 @@ the repository's rule for a real LightGBM feature that is not implemented:
 say so, do not ignore it.
 """
 
+from .cegb import CegbConfig
 from .gain import leaf_score, soft_threshold_l1
 from .monotone import MONOTONE_FREE, output_score
 from .rng import splitmix64, uniform
@@ -290,41 +295,41 @@ def split_gain_from_outputs(
 struct FeaturePenalties(Copyable, Movable):
     """Per-feature costs charged against a candidate's gain.
 
-    Two LightGBM mechanisms, kept in one struct because both are applied at
-    the same point (once a feature's best candidate is known) and both are
-    inactive by default:
+    Two LightGBM mechanisms, applied at the same point (once a feature's best
+    candidate is known) and both inactive by default:
 
     - `feature_contri`: a multiplier per feature. A feature with multiplier
       0.5 must find twice the gain to compete. Empty means every multiplier
-      is 1.0.
-    - Cost-effective gradient boosting: `cegb_tradeoff * cegb_penalty_split *
-      rows_in_leaf` is charged to every split, and
-      `cegb_tradeoff * cegb_penalty_feature_coupled[f]` is charged the first
-      time feature `f` is split on at all.
+      is 1.0. This struct owns it, and `contri_of` is its only reader.
+    - Cost-effective gradient boosting, all four `cegb_*` parameters, held in
+      `cegb` and implemented in `cegb.mojo`. This struct carries them so a
+      caller sets every per-feature cost in one place; it does not charge
+      them. `cegb.CegbNodeCosts` does, at `split._feature_gain`, immediately
+      after the multiplier.
 
-    INTENTIONAL DIFFERENCES FROM LightGBM
+    THE DIVISION IS LOAD-BEARING. The multiplier scales a gain and the CEGB
+    costs are absolute amounts subtracted from the scaled value, which is
+    LightGBM's composition. Applying either one twice is the one way the two
+    mechanisms silently corrupt each other, so each has exactly one owner:
+    `penalized_gain` multiplies and never subtracts, and `cegb.mojo` subtracts
+    and never multiplies.
+
+    INTENTIONAL DIFFERENCE FROM LightGBM
 
     - Multipliers must be nonnegative. LightGBM accepts a negative
       `feature_contri`, which flips the sign of a gain and breaks the
       invariant that a chosen split has positive gain. Zero is accepted and
       means the feature can never win, which is the useful end of that range.
-    - `cegb_penalty_feature_lazy` is not represented. It charges for the rows
-      that have not yet read a feature, which is per-row state carried across
-      the whole ensemble, not a function of (feature, leaf size). It is a
-      subsystem, and `check_extra_option_supported` rejects it by name.
+      `CegbConfig.check` rejects negative costs for the same reason.
     """
 
     var contri: List[Float64]
-    var cegb_tradeoff: Float64
-    var cegb_penalty_split: Float64
-    var cegb_penalty_feature_coupled: List[Float64]
+    var cegb: CegbConfig
 
     def __init__(out self):
         """No penalties: every multiplier 1.0, every cost 0.0."""
         self.contri = List[Float64]()
-        self.cegb_tradeoff = 1.0
-        self.cegb_penalty_split = 0.0
-        self.cegb_penalty_feature_coupled = List[Float64]()
+        self.cegb = CegbConfig()
 
     @staticmethod
     def from_contri(contri: List[Float64]) raises -> FeaturePenalties:
@@ -334,32 +339,38 @@ struct FeaturePenalties(Copyable, Movable):
         return out^
 
     @staticmethod
-    def cegb(
+    def from_cegb(
         tradeoff: Float64,
         penalty_split: Float64,
         penalty_feature_coupled: List[Float64] = [],
+        penalty_feature_lazy: List[Float64] = [],
     ) raises -> FeaturePenalties:
-        """The two computable CEGB penalties, with no gain multipliers."""
+        """The CEGB costs, with no gain multipliers.
+
+        Named `from_cegb` rather than `cegb` because `cegb` is now the field
+        this builds; the old name would shadow it.
+        """
         var out = FeaturePenalties()
-        out.cegb_tradeoff = tradeoff
-        out.cegb_penalty_split = penalty_split
-        out.cegb_penalty_feature_coupled = penalty_feature_coupled.copy()
+        out.cegb = CegbConfig.of(
+            tradeoff,
+            penalty_split,
+            penalty_feature_coupled,
+            penalty_feature_lazy,
+        )
         return out^
+
+    def contri_active(self) -> Bool:
+        """Whether any gain multiplier would change a gain."""
+        for f in range(len(self.contri)):
+            if self.contri[f] != 1.0:
+                return True
+        return False
 
     def is_active(self) -> Bool:
         """Whether anything here would change a gain. An inactive bundle must
         leave the scan bit-identical, so the growers test this once per node
         rather than multiplying by 1.0 per candidate."""
-        if self.cegb_penalty_split > 0.0 and self.cegb_tradeoff != 0.0:
-            return True
-        if self.cegb_tradeoff != 0.0:
-            for f in range(len(self.cegb_penalty_feature_coupled)):
-                if self.cegb_penalty_feature_coupled[f] != 0.0:
-                    return True
-        for f in range(len(self.contri)):
-            if self.contri[f] != 1.0:
-                return True
-        return False
+        return self.cegb.is_active() or self.contri_active()
 
     def contri_of(self, feature: Int) -> Float64:
         """This feature's gain multiplier, 1.0 when unset."""
@@ -367,60 +378,17 @@ struct FeaturePenalties(Copyable, Movable):
             return 1.0
         return self.contri[feature]
 
-    def coupled_of(self, feature: Int) -> Float64:
-        """This feature's first-use cost, 0.0 when unset."""
-        if feature < 0 or feature >= len(self.cegb_penalty_feature_coupled):
-            return 0.0
-        return self.cegb_penalty_feature_coupled[feature]
+    def penalized_gain(self, gain: Float64, feature: Int) -> Float64:
+        """A candidate's gain after this feature's `feature_contri`
+        multiplier, and nothing else.
 
-    def coupled_is_active(self) -> Bool:
-        """Whether any first-use cost would actually be charged.
-
-        The coupled ledger is the one CEGB half the grower cannot carry on its
-        own: "first use" is per-model, so it is state every trainer would have
-        to thread through every tree. `ExtraTreeParams.check_scalars` refuses
-        an active coupled vector for that reason, and this is the predicate it
-        refuses on — the vector's length alone is not enough, since an
-        all-zero vector charges nothing.
+        The CEGB terms are subtracted immediately after this, by
+        `cegb.CegbNodeCosts.adjusted_gain_at`, which is the only place they
+        are charged. Keeping the two apart is what lets a node's costs be
+        prepared once and applied in one subtraction per candidate, and it is
+        what makes double-charging impossible rather than merely unlikely.
         """
-        if self.cegb_tradeoff == 0.0:
-            return False
-        for f in range(len(self.cegb_penalty_feature_coupled)):
-            if self.cegb_penalty_feature_coupled[f] != 0.0:
-                return True
-        return False
-
-    def split_costs_active(self) -> Bool:
-        """Whether the per-split CEGB cost would change a gain. Unlike the
-        coupled cost this one is a function of (tradeoff, penalty, rows in the
-        leaf) alone, so the split search charges it with no ledger."""
-        return self.cegb_tradeoff != 0.0 and self.cegb_penalty_split != 0.0
-
-    def penalized_gain(
-        self,
-        gain: Float64,
-        feature: Int,
-        n_data_in_leaf: Int,
-        feature_already_used: Bool,
-    ) -> Float64:
-        """A candidate's gain after this feature's costs.
-
-        The multiplier scales first and the costs are then subtracted, so a
-        cost is an absolute amount of gain rather than something the
-        multiplier rescales. The result may be negative; the caller's gain
-        floor rejects it.
-        """
-        var out = gain * self.contri_of(feature)
-        if self.cegb_tradeoff != 0.0:
-            if self.cegb_penalty_split != 0.0:
-                out -= (
-                    self.cegb_tradeoff
-                    * self.cegb_penalty_split
-                    * Float64(n_data_in_leaf)
-                )
-            if not feature_already_used:
-                out -= self.cegb_tradeoff * self.coupled_of(feature)
-        return out
+        return gain * self.contri_of(feature)
 
     def check_features(self, n_features: Int) raises:
         """Raise unless the vectors fit a dataset with `n_features` columns
@@ -440,32 +408,7 @@ struct FeaturePenalties(Copyable, Movable):
                     f,
                     "] must be a finite nonnegative number",
                 )
-        var coupled = len(self.cegb_penalty_feature_coupled)
-        if coupled > 0 and coupled != n_features:
-            raise Error(
-                "cegb_penalty_feature_coupled has ",
-                coupled,
-                " entries but the data has ",
-                n_features,
-                " features",
-            )
-        for f in range(coupled):
-            var v = self.cegb_penalty_feature_coupled[f]
-            if not _is_finite(v) or v < 0.0:
-                raise Error(
-                    "cegb_penalty_feature_coupled[",
-                    f,
-                    "] must be a finite nonnegative number",
-                )
-        if not _is_finite(self.cegb_tradeoff) or self.cegb_tradeoff < 0.0:
-            raise Error("cegb_tradeoff must be a finite nonnegative number")
-        if (
-            not _is_finite(self.cegb_penalty_split)
-            or self.cegb_penalty_split < 0.0
-        ):
-            raise Error(
-                "cegb_penalty_split must be a finite nonnegative number"
-            )
+        self.cegb.check(n_features)
 
 
 # ---------------------------------------------------------------------------
@@ -1070,21 +1013,12 @@ def check_extra_option_supported(name: String) raises:
             "'linear_lambda' is not implemented; it regularizes the per-leaf"
             " regression of 'linear_tree', which is a deferred subsystem"
         )
-    if name == "cegb_penalty_feature_lazy":
-        raise Error(
-            "'cegb_penalty_feature_lazy' is not implemented; it charges for"
-            " the rows that have not yet read a feature, which is per-row"
-            " state carried across the whole ensemble. 'cegb_penalty_split'"
-            " and 'cegb_tradeoff' are implemented"
-        )
-    if name == "cegb_penalty_feature_coupled":
-        raise Error(
-            "'cegb_penalty_feature_coupled' is parsed but not applied; it is"
-            " charged the first time a feature is split on anywhere in the"
-            " ensemble, so it needs a per-model feature-use ledger threaded"
-            " through every trainer and every grower. 'cegb_penalty_split'"
-            " and 'cegb_tradeoff' are applied by the split search today"
-        )
+    # The four cegb_* names are implemented (cegb.mojo) and are not refused
+    # here. The two that need the per-ensemble ledger are refused per grower
+    # instead, by `cegb.check_cegb_grower_support` at `tree._search`, because
+    # whether they can be honored is a property of the backend and not of the
+    # name: the dense CPU grower carries the ledger and the node's row ids,
+    # and every other grower says so rather than ignoring the setting.
     if name == "feature_pre_filter":
         raise Error(
             "'feature_pre_filter' is not implemented. It is a Dataset"
@@ -1206,13 +1140,15 @@ struct ExtraTreeParams(Copyable, Movable):
         growth budget, so a parameter string can be rejected before any data
         is read (see `params._validate`).
 
-        This is also where the two options that are parsed but not applied are
-        refused. Both are real LightGBM features whose missing piece is
-        outside a split search: the coupled CEGB cost needs a per-model
-        feature-use ledger, and a forced-split document needs the bin mapper
-        to turn a raw threshold into a bin. Refusing them here is the
-        repository's rule -- say so, never ignore it -- and keeps a caller
-        from reading an unforced tree as a forced one.
+        This is also where an unmapped forced-split document is refused: it
+        is a real LightGBM feature whose missing piece is outside a split
+        search, since a raw threshold needs the bin mapper to become a bin.
+        Refusing it here is the repository's rule -- say so, never ignore it
+        -- and keeps a caller from reading an unforced tree as a forced one.
+        The CEGB costs are not refused here: whether the coupled and lazy
+        penalties can be honored is a property of the grower, so
+        `cegb.check_cegb_grower_support` refuses them at `tree._search`, where
+        the answer is known.
         """
         if not _is_finite(self.min_gain_to_split) or (
             self.min_gain_to_split < 0.0
@@ -1243,8 +1179,6 @@ struct ExtraTreeParams(Copyable, Movable):
                 "path_smooth needs min_data_in_leaf of at least 2, got ",
                 min_data_in_leaf,
             )
-        if self.penalties.coupled_is_active():
-            check_extra_option_supported("cegb_penalty_feature_coupled")
         # A parsed document is not yet applicable: the grower is handed a
         # BinnedMatrix, which carries no bin edges, so a raw threshold has to
         # be mapped through the fitted BinMapper first. Refusing here is what

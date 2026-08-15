@@ -1,13 +1,19 @@
 # Cost-effective gradient boosting (CEGB)
 
-Status: **implemented, not yet reachable.** `src/mojotrees/cegb.mojo` is the
-authoritative implementation of all four of LightGBM's `cegb_*` controls. No
-grower calls it yet, and no public parameter reaches it, so setting a CEGB
-option through `params.parse_params` today still does what it did before this
-file existed. Section 8 lists exactly what has to land before each parameter
-becomes reachable, and section 9 records what has and has not been checked.
+Status: **implemented and reachable.** `src/mojotrees/cegb.mojo` is the
+authoritative implementation of all four of LightGBM's `cegb_*` controls, and
+it is the only one: `tree_parameters_extra.FeaturePenalties` holds a
+`CegbConfig` and applies the `feature_contri` multiplier alone. The dense CPU
+grower (`tree.grow_tree_with_cegb`) carries the ledger, `boosting.fit` and
+`boosting.fit_multiclass` own it for the whole ensemble, and every other
+grower charges the split cost and *refuses* the two penalties that need the
+ledger. `cegb_tradeoff` and `cegb_penalty_split` are reachable from a
+parameter string; the two per-feature vectors are Mojo-API-only, for the same
+reason `monotone_constraints` is. Section 12 is the precise reachability
+table.
 
-Everything below is derived by reading the code. Nothing here has been run.
+Everything below is derived by reading the code, and the LightGBM claims from
+reading LightGBM master. Nothing here has been run.
 
 ## 1. What CEGB is
 
@@ -69,14 +75,12 @@ LightGBM's composition rather than a product of the two mechanisms.
 
 **`contri` is applied exactly once, and not by cegb.mojo.**
 `tree_parameters_extra.FeaturePenalties.contri_of` is the multiplier's only
-owner. `cegb_adjusted_gain` and `CegbNodeCosts.adjusted_gain` take a gain that
-has already been multiplied and only subtract. Double-applying
-`feature_contri` is the one way these two mechanisms can silently corrupt each
-other, and it is a live risk right now, because
-`FeaturePenalties.penalized_gain` still applies both the multiplier and the
-CEGB split cost in one call. Until the patch in
-`handoffs/remaining_04_cegb.md` splits it, `penalized_gain` and the cegb.mojo
-entry points must not both be called on one gain.
+owner and `penalized_gain` multiplies without subtracting anything.
+`cegb_adjusted_gain` and `CegbNodeCosts.adjusted_gain` take a gain that has
+already been multiplied and only subtract. Double-applying `feature_contri`,
+or the split cost, is the one way these two mechanisms can silently corrupt
+each other, which is why the two live in separate calls one line apart in
+`split._feature_gain` rather than in one function that does both.
 
 **Only the split term is a pure function of the node.** The coupled term reads
 a flag that lives for the whole ensemble, and the lazy term reads a
@@ -134,12 +138,24 @@ correct and re-running the scan is not necessary, because the split term and
 the lazy term are properties of the cached candidate's own node and are
 unchanged by a split somewhere else.
 
-This is an open parity question, and it is flagged in the code as well as
-here. LightGBM refreshes its cached per-leaf best splits at the same point.
-Whether it refunds every cached leaf or only the leaves whose cached split is
-on the newly used feature decides which tree comes out. cegb.mojo implements
-the arithmetically consistent rule, which is to refund what was charged. That
-choice has not been compared against LightGBM 4.7.0's source.
+**Checked against LightGBM master, and one difference remains.**
+`CostEfficientGradientBoosting::UpdateLeafBestSplits` walks every leaf but the
+one just split, adds `cegb_tradeoff * cegb_penalty_feature_coupled[f]` to that
+leaf's cached candidate *on the newly used feature*, and installs it as the
+leaf's best split when it now beats it. The amount and the "only candidates on
+`f`" condition are what `cegb_stale_cached_gain` implements.
+
+What LightGBM can do and mojotrees cannot: it keeps a candidate per (leaf,
+feature) in `splits_per_leaf_`, sized `num_leaves * num_features` and cleared
+per tree, so a leaf whose best split is on some other feature can still have
+its runner-up on `f` promoted once `f` is free. mojotrees's frontier caches one
+candidate per leaf, so a refund can improve a cached best but cannot resurrect
+a candidate that was not it. On the leaves where the two can differ, mojotrees
+keeps a split whose adjusted gain is no lower than the one LightGBM would have
+promoted only when that promotion would not have won; where it would have won,
+the two trees diverge. Closing it means carrying the per-(leaf, feature) table,
+which is `num_leaves * num_features` split records against the one this grower
+keeps. Recorded in section 10 as a difference, not an open question.
 
 ### 5.2 Continued training
 
@@ -175,15 +191,22 @@ search does not always see that id.
   feature's first use pay for every feature bundled with it, which would
   couple penalties across features that have nothing to do with each other.
 
-`cegb_dataset_feature` performs that recovery. A multi-member bundle's shared
-bin belongs to every member at once and cannot be attributed to one feature,
-so it is refused rather than charged to an arbitrary member. A validated
-bundling plan never puts a threshold there, since the shared bin is where
-every member's default value lands, so this is a guard on an inconsistent plan
-and not a case a caller has to handle.
+`efb.FeatureBundling.charged_feature` performs that recovery. It lives on the
+bundling plan rather than in cegb.mojo because it is a pure bundling query and
+because cegb.mojo imports nothing from the package: `binning` and `categorical`
+both import `tree_parameters_extra`, which now imports `cegb`, so an import in
+the other direction would close a cycle. A multi-member bundle's shared bin
+belongs to every member at once and cannot be attributed to one feature, so it
+is refused rather than charged to an arbitrary member. A validated bundling
+plan never puts a threshold there, since the shared bin is where every member's
+default value lands, so this is a guard on an inconsistent plan and not a case
+a caller has to handle.
 
-EFB itself is disabled by default and unconnected (`efb.check_bundling_supported`
-still accepts only LightGBM's "off"), so this path is written and unexercised.
+No grower calls it today, and none has to: `tree.grow_tree` expands a bundled
+histogram back to one slice per original feature before searching it
+(`_hist_full`) and partitions rows by the original matrix, so the feature a
+split names there is already a dataset feature. The function is what a grower
+that searched bundles directly would need.
 
 ## 7. Active rows: bagging and GOSS
 
@@ -214,38 +237,59 @@ lists `partition_rows_into` derives from it.
 
 | Path | split | coupled | lazy | Where |
 | --- | --- | --- | --- | --- |
-| Dense CPU grower (`tree.grow_tree`) | reachable now | needs the ledger threaded | needs the ledger plus node row ids | `tree._search` -> `split.find_best_split` |
-| Sparse grower (`tree_sparse.grow_tree_sparse`) | reachable now | needs the ledger threaded | needs the ledger plus node row ids | same `_search` |
-| GPU, host split search | reachable now | needs the ledger threaded | needs a device-resident bitset | same `_search` |
+| Dense CPU grower (`tree.grow_tree_with_cegb`) | applied | applied | applied | `tree._search` -> `split.find_best_split` |
+| Dense CPU grower (`tree.grow_tree`) | applied | refused | refused | inert ledger, `check_cegb_grower_support` |
+| Sparse grower (`tree_sparse.grow_tree_sparse`) | applied | refused | refused | same `_search` |
+| GPU, host split search | applied | refused | refused | same `_search` |
 | GPU, device split search | refused | refused | refused | `check_cegb_device_split_search` |
-| Distributed (`distributed.grow_tree_distributed`) | reachable now | rank-consistent, needs the ledger | refused | `check_cegb_distributed` |
+| Distributed (`distributed.grow_tree_distributed`) | applied | refused | refused | `find_best_split`'s guard |
 
-"Reachable now" means the term is a function of inputs those callers already
-pass. It does **not** mean a public parameter reaches it; see the status line
-at the top.
+`grow_tree` and `grow_tree_with_cegb` are the same grower; the first calls the
+second with `CegbLedger.none()`. A `mut` argument cannot be defaulted, which is
+why the ledger-carrying form is a second entry point rather than a defaulted
+parameter, and the split is useful in its own right: the sixteen `grow_tree`
+call sites across the trainers are unchanged and opt in one at a time.
+
+Which trainers opt in today: `boosting.train`/`train_with_valid` (through
+`_boost_rounds`) and `boosting.train_multiclass`/`train_multiclass_with_valid`
+(through `_boost_rounds_multiclass`). The ranking, random-forest, DART,
+custom-objective, and sparse trainers keep the split cost and refuse the other
+two, which is the honest state rather than a silent zero.
 
 Three refusals, each for a specific reason:
 
+- **A grower with no ledger.** The coupled cost needs a per-feature flag
+  threaded through every tree of the ensemble, and the lazy cost needs the
+  node's row ids as well. Both are refused rather than charged as zero:
+  `CegbLedger`'s inert form answers "already paid" to every question, which is
+  the right answer when nothing is configured and the wrong one when something
+  is, so `prepare_cegb_node` checks each half of the ledger against the half of
+  the configuration that reads it.
 - **GPU device split search.** Candidates are ranked inside the kernel and the
   host downloads one record per node (`train_gpu._search_leaf_device`). A
   host-side cost applied after the winner is chosen ranks nothing. The lazy
   penalty is further out of reach still, since its bitset would have to be
   device-resident and updated from the row-compaction pass.
-- **Distributed, lazy only.** `unread(f, R(N))` counts rows, and the rows are
-  sharded. The true count is a sum over ranks, which needs one integer
+- **Distributed, lazy specifically.** `unread(f, R(N))` counts rows, and the
+  rows are sharded. The true count is a sum over ranks, which needs one integer
   allreduce per (node, feature) scanned. That message does not exist in
   `distributed_transport`, and a rank counting only its own shard could rank
   features differently from its peers, which is a split disagreement and not
   merely a wrong penalty. The split cost is safe there (every rank scores from
   the reduced histogram and the exact global row count), and the coupled cost
-  is safe too once a ledger exists, because every rank commits the same chosen
-  split and so flips the same flag at the same moment with no message.
+  would be safe too once that grower carried a ledger, because every rank
+  commits the same chosen split and so flips the same flag at the same moment
+  with no message. `check_cegb_distributed` states that division.
 - **Continued training from a loaded model.** Section 5.2.
 
 `check_cegb_grower_support(config, carries_ledger, carries_rows)` is the
 general form, and it mirrors `tree._search`'s existing `grower_applies_extra`
 refusal. The repository's rule is that a backend which cannot apply a setting
-says so rather than ignoring it.
+says so rather than ignoring it. It is asked in three places: once per tree in
+`grow_tree_with_cegb`, so a trainer that threaded no ledger is told before the
+first histogram; in `tree._search`, which is what refuses the sparse and GPU
+host callers; and in `split.find_best_split`, which catches every remaining
+direct caller including the distributed grower.
 
 ## 9. Determinism
 
@@ -262,68 +306,79 @@ calls the lazy penalty bit-comparable with LightGBM.
 
 ## 10. Intentional differences from LightGBM
 
-1. Negative costs are rejected rather than accepted (section 2).
-2. The lazy term is `lazy[f] * count` rather than a `count`-long accumulation
-   (section 9).
-3. The cached-candidate refund is restricted to candidates on the newly used
-   feature (section 5.1). **Open**: LightGBM's rule has not been read.
-4. `cegb_penalty_feature_lazy` and `cegb_penalty_feature_coupled` are refused
-   by `check_extra_option_supported` today rather than accepted and ignored.
-   That refusal is correct while nothing consumes them, and it is what has to
-   be removed last, not first.
+1. **Negative costs are rejected rather than accepted** (section 2). LightGBM
+   has no check; a negative cost is a bonus for reading data, which inverts
+   the mechanism.
+2. **The lazy term is `lazy[f] * count`**, one multiplication, rather than a
+   `count`-long accumulation (section 9). LightGBM's `CalculateOndemandCosts`
+   adds `penalty` once per unread row inside its loop, which for a large leaf
+   is a different floating-point number. mojotrees's is the exact one, so the
+   lazy penalty is not bit-comparable with LightGBM's and the parity table
+   must not claim it is.
+3. **The cached-candidate refund cannot promote a runner-up** (section 5.1).
+   LightGBM keeps a candidate per (leaf, feature); mojotrees keeps one per
+   leaf. The refund amount and the condition match; what is missing is the
+   promotion of a candidate that was not the leaf's best.
+4. **The coupled and lazy penalties are refused per grower, not per name.**
+   `check_extra_option_supported` no longer lists them, because they are
+   implemented; `check_cegb_grower_support` refuses them for a backend that
+   cannot carry the ledger, which is the repository's rule for a setting a
+   backend cannot apply.
+5. **One ledger across all classes in a multiclass fit**, not one per class
+   (section 8). A feature computed for class 0's tree is computed for the row,
+   so charging it again per class would make one feature cost `n_classes`
+   times what deploying it costs. This follows from the cost being a property
+   of the served model; it has **not** been compared against LightGBM's
+   multiclass path.
+6. **Resumed training is refused** rather than silently recharging
+   (section 5.2).
 
-## 11. What has to land before each parameter is exposed
+## 11. What is left
 
-In order. Each step is written out as a patch in
-`handoffs/remaining_04_cegb.md`, with the owning file named, because
-`src/mojotrees/cegb.mojo`, this document, and that handoff are the only files
-this lane owns.
-
-1. **Split cost, one home.** `FeaturePenalties` sheds `cegb_tradeoff`,
-   `cegb_penalty_split`, and `cegb_penalty_feature_coupled` and holds a
-   `CegbConfig`; `penalized_gain` keeps only the `contri` multiplier;
-   `split._feature_gain` subtracts through `CegbNodeCosts`. No behavior change
-   and no new parameter, but after it there is exactly one CEGB
-   implementation.
-2. **Ledger threading.** `tree.grow_tree` builds a `CegbLedger`, passes the
-   prepared node costs into `_search`, and calls `cegb_commit_split` plus the
-   frontier refund when it commits a split. This is what makes
-   `cegb_penalty_feature_coupled` correct rather than parsed.
-3. **Ensemble lifetime.** `boosting.fit`/`fit_multiclass` own the ledger and
-   hand the same one to every `grow_tree` call, and refuse a resumed
-   `fit_more`.
-4. **Row ids.** The same threading carries each node's row list, which
-   `grow_tree` already materializes, making `cegb_penalty_feature_lazy`
-   correct.
-5. **Only then** remove the two names from `check_extra_option_supported`, add
-   them to `params` (Mojo API only, since both are per-feature vectors that a
-   whitespace-separated parameter string cannot carry any more than
-   `monotone_constraints` can), export from `src/mojotrees/__init__.mojo`, and
-   move the parity row off `deferred`.
-
-Steps 1 through 4 change no public surface. Step 5 is the only one that does.
-
-The earlier, smaller P5 proposal in
-`handoffs/connect_17_alternate_boosting.md` has been withdrawn. Its plain
-`List[Bool]` first-use ledger did not refund coupled cost from cached leaf
-candidates after another leaf committed the feature, so it could change the
-leaf-wise frontier order relative to the stated formula. The authoritative
-integration is PATCH 1 through PATCH 4 of
-`handoffs/remaining_04_cegb.md`, including `cegb_stale_cached_gain`. P5 must
-not be applied.
+1. **The per-(leaf, feature) candidate table**, which is what closes
+   difference 3. It is `num_leaves * num_features` split records carried
+   through the frontier, and it changes which tree comes out on the leaves
+   where a runner-up would have been promoted. Worth measuring before
+   building: the promotion can only fire on a leaf whose cached best is on a
+   different feature from the one just committed *and* whose runner-up on the
+   committed feature beats it once refunded.
+2. **The Python estimator parameters.** `cegb_penalty_feature_coupled` and
+   `cegb_penalty_feature_lazy` are per-feature vectors and the sklearn
+   estimator has no parameter carrying one for them; the binding reads both
+   buffer addresses already (`_penalties` in `bindings/basic_bindings.mojo`)
+   and `sklearn.py` sends 0 for each. Adding them is two constructor
+   parameters, two validated buffers on the pattern of
+   `_feature_contri_buffer`, and a regenerated `compatibility/api_snapshot.json`.
+3. **Serialization, only if resumed training must work.** `feature_used` is
+   `n_features` bits and is cheap; the lazy read bitset is
+   `n_features * n_rows` bits (12.5 MB for 100 features over 10 million rows)
+   and is meaningless against a different dataset, so it must be written only
+   when the lazy penalty is configured and must refuse to load against a
+   different row count. That is training state in a model file, which is a
+   design question rather than a mechanical addition; a separate resume file
+   keeps the model format clean and is the recommendation. Either way
+   `check_cegb_continued_training` should be relaxed to accept a restored
+   ledger, not deleted.
+4. **The ledger on the remaining growers.** `tree_sparse.grow_tree_sparse`
+   materializes node row lists exactly as the dense grower does, so threading
+   a ledger there is the same three edits. The ranking, random-forest, DART,
+   and custom-objective trainers each need only to own a ledger and call
+   `grow_tree_with_cegb`.
+5. **A differential test against LightGBM**, which is the only thing that can
+   settle differences 3 and 5.
 
 ## 12. Reachability, precisely
 
 | Claim | True today? |
 | --- | --- |
-| Implemented | yes, `src/mojotrees/cegb.mojo` |
-| Imported by a grower | no |
-| Called on a real split decision | no |
-| Publicly reachable | no; `params` accepts `cegb_tradeoff` and `cegb_penalty_split` only, and both flow into `FeaturePenalties`, not into this module |
-| Focused-tested | no. This lane does not write or run tests |
+| Implemented | yes, `src/mojotrees/cegb.mojo`, the only implementation |
+| Imported by a grower | yes, `tree.mojo` and `split.mojo` |
+| Called on a real split decision | yes, `split._feature_gain` on every scanned feature |
+| Ledger carried across an ensemble | yes, `boosting._boost_rounds` and `_boost_rounds_multiclass` |
+| Publicly reachable | `cegb_tradeoff` and `cegb_penalty_split` from a parameter string, the C ABI, and the Python estimator; both vectors from the Mojo API and the binding |
+| Focused-tested | `tests/test_cegb.mojo`, wired into `pixi run test` and `test-cpu`. **Written, not run** |
 | Differential-tested against LightGBM | no |
 | Hardware-validated | not applicable; CPU arithmetic only |
 
-`docs/LIGHTGBM_PARITY.md` line 380 still says `deferred` for the four
-parameters, and that row is correct until step 5 above. Changing it belongs to
-the lane that owns that file, on evidence, not to this one.
+`docs/LIGHTGBM_PARITY.md`'s four `cegb_*` rows are updated with this file as
+their reference.

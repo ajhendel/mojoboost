@@ -26,8 +26,7 @@ Intentional differences from LightGBM
   and never silence. `objective=` values go through
   `_raise_if_unimplemented_objective`, tree options through
   `tree_parameters_extra.check_extra_option_supported` (`linear_tree`,
-  `linear_lambda`, `cegb_penalty_feature_lazy`,
-  `cegb_penalty_feature_coupled`, `forcedsplits_filename`,
+  `linear_lambda`, `forcedsplits_filename`,
   `feature_pre_filter`), and `enable_bundle` through
   `efb.check_bundling_supported`, which accepts it for a CPU run and refuses
   it by name for a device that would ignore it.
@@ -84,11 +83,12 @@ comptime SUPPORTED_KEYS = String(
 # Parameters that name a real LightGBM feature this parser does not cover,
 # reported as unsupported instead of as unknown so the message can say why.
 #
-# `feature_contri` and `cegb_penalty_feature_coupled` are per-feature vectors,
-# which a whitespace-separated parameter string cannot carry any more than it
-# can carry `monotone_constraints`; the first is reachable through
-# `TreeParams.extra.penalties` in the Mojo API and the second is refused
-# outright (see `tree_parameters_extra.check_extra_option_supported`).
+# `feature_contri`, `cegb_penalty_feature_coupled`, and
+# `cegb_penalty_feature_lazy` are per-feature vectors, which a
+# whitespace-separated parameter string cannot carry any more than it can
+# carry `monotone_constraints`. All three are reachable through
+# `TreeParams.extra.penalties` in the Mojo API: the first on `contri`, the
+# other two on `penalties.cegb` (cegb.mojo).
 comptime _MOJO_API_ONLY = String(
     "bagging_fraction bagging_freq bagging_seed pos_bagging_fraction"
     " neg_bagging_fraction top_rate other_rate boosting boosting_type"
@@ -98,7 +98,8 @@ comptime _MOJO_API_ONLY = String(
     " early_stopping_rounds first_metric_only lambdarank_truncation_level"
     " label_gain sigmoid eval_at ndcg_eval_at class_weight is_unbalance"
     " unbalance unbalanced_sets scale_pos_weight feature_contri"
-    " feature_contrib fc fp feature_penalty"
+    " feature_contrib fc fp feature_penalty cegb_penalty_feature_coupled"
+    " cegb_penalty_feature_lazy"
 )
 
 
@@ -565,11 +566,11 @@ def parse_params(spec: String) raises -> TrainConfig:
                 value
             )
         elif key == "cegb_tradeoff":
-            config.booster.tree.extra.penalties.cegb_tradeoff = _parse_f64(
+            config.booster.tree.extra.penalties.cegb.tradeoff = _parse_f64(
                 key, value
             )
         elif key == "cegb_penalty_split":
-            config.booster.tree.extra.penalties.cegb_penalty_split = (
+            config.booster.tree.extra.penalties.cegb.penalty_split = (
                 _parse_f64(key, value)
             )
         elif key == "enable_bundle":

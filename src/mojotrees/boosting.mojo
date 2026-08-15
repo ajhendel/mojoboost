@@ -77,7 +77,8 @@ from .objective_registry import (
     objective_link,
     objective_renews_leaves as _objective_renews_leaves,
 )
-from .tree import Tree, TreeParams, grow_tree, node_bounds
+from .cegb import CegbLedger, check_cegb_continued_training
+from .tree import Tree, TreeParams, grow_tree_with_cegb, node_bounds
 from .tree_parameters_extra import ExtraTreeParams, finish_leaf_output
 from .validation import check_weights
 
@@ -1025,6 +1026,16 @@ def _boost_rounds(
     matrix whenever the plan would not pay for itself.
     """
     var bundling = prepare_bundling(data, params.bundling)
+    # One CEGB ledger for the whole ensemble, handed to every tree. That
+    # lifetime is the mechanism's premise: the model pays for a feature once,
+    # so a later tree reusing a feature an earlier one already needed gets it
+    # free, where a per-tree ledger would be a much harsher regularizer.
+    # `CegbLedger.create` allocates nothing unless a penalty needs it, which
+    # is the default, and `grow_tree_with_cegb` refuses the penalties this
+    # ledger cannot serve rather than charging them as zero.
+    var ledger = CegbLedger.create(
+        params.tree.extra.penalties.cegb, data.n_features, data.n_rows
+    )
     var n = data.n_rows
     var signs = params.tree.monotone.active_signs()
     var renews = objective_renews_leaves(objective)
@@ -1048,8 +1059,8 @@ def _boost_rounds(
             raw, target, objective, sample_weight, alpha, grad, hess
         )
         goss_round(bag, grad, hess, goss, round, learning_rate)
-        var tree = grow_tree(
-            data, grad, hess, params.tree, bag, round, bundling
+        var tree = grow_tree_with_cegb(
+            data, grad, hess, params.tree, ledger, bag, round, bundling
         )
         if renews:
             _renew_leaf_values(
@@ -1212,6 +1223,12 @@ def train_more(
     _check_goss(goss, bagging)
     _check_class_bagging(class_bagging, bagging, goss, booster.objective)
     params.tree.monotone.check_features(data.n_features)
+    # A `Booster` carries the trees a CEGB ledger produced, not the ledger,
+    # so these rounds would start from an empty one and charge every feature
+    # the first run already paid for a second time. Refused rather than
+    # allowed to diverge silently; `cegb_penalty_split` reads no ledger and
+    # survives the boundary untouched.
+    check_cegb_continued_training(params.tree.extra.penalties.cegb, True)
 
     var n = data.n_rows
     var has_init = len(init_score) == n
@@ -1297,6 +1314,13 @@ def train_with_valid(
     # Fitted once, from the training matrix alone: the validation matrix is
     # only ever scored through the trees, which name original features.
     var bundling = prepare_bundling(data, params.bundling)
+    # One ledger for this ensemble, as in `_boost_rounds`. Early stopping
+    # truncates the ensemble afterwards; the ledger is training state and is
+    # not consulted again, so the trees that are kept are the ones this run
+    # grew under it.
+    var ledger = CegbLedger.create(
+        params.tree.extra.penalties.cegb, data.n_features, data.n_rows
+    )
     var n = data.n_rows
     var base_score = _base_score(target, objective, sample_weight, alpha)
     var raw = List[Float64](capacity=n)
@@ -1326,7 +1350,9 @@ def train_with_valid(
             raw, target, objective, sample_weight, alpha, grad, hess
         )
         goss_round(bag, grad, hess, goss, i, params.learning_rate)
-        var tree = grow_tree(data, grad, hess, params.tree, bag, i, bundling)
+        var tree = grow_tree_with_cegb(
+            data, grad, hess, params.tree, ledger, bag, i, bundling
+        )
         if renews:
             _renew_leaf_values(
                 tree, data, target, raw, renew_w, renew_a, bag, signs,
@@ -1595,6 +1621,15 @@ def _boost_rounds_multiclass(
     on the matrix, not on the gradients.
     """
     var bundling = prepare_bundling(data, params.bundling)
+    # ONE ledger across every class, not one per class. A feature computed
+    # for class 0's tree is computed for the row, so charging it again for
+    # class 1 would make one feature cost `n_classes` times what deploying it
+    # costs. This follows from the cost being a property of the served model;
+    # it has not been compared against LightGBM's multiclass path, and
+    # `docs/CEGB.md` records that.
+    var ledger = CegbLedger.create(
+        params.tree.extra.penalties.cegb, data.n_features, data.n_rows
+    )
     var n = data.n_rows
     var prob = List[Float64](capacity=n * n_classes)
     for _ in range(n * n_classes):
@@ -1629,11 +1664,12 @@ def _boost_rounds_multiclass(
             apply_goss_scaling(selection, grad, hess)
             # Feature subsampling draws once per tree, so each class's tree
             # in a round gets its own feature set.
-            var tree = grow_tree(
+            var tree = grow_tree_with_cegb(
                 data,
                 grad,
                 hess,
                 params.tree,
+                ledger,
                 bag,
                 round * n_classes + k,
                 bundling,
@@ -1782,6 +1818,9 @@ def train_multiclass_more(
     check_bagging(bagging)
     _check_goss(goss, bagging)
     params.tree.monotone.check_features(data.n_features)
+    # As in `train_more`: the ledger is training state and is not in the
+    # model, so a resumed run would recharge every first use.
+    check_cegb_continued_training(params.tree.extra.penalties.cegb, True)
 
     # Rebuild the raw scores the existing rounds produce. Accumulating class
     # by class in round order matches the order `_boost_rounds_multiclass`
@@ -1884,6 +1923,12 @@ def train_multiclass_with_valid(
     for k in range(n_classes):
         base_scores.append(log(_clamp_prob(class_w[k] / total_w)))
 
+    # One ledger across every round and every class, as in
+    # `_boost_rounds_multiclass`.
+    var ledger = CegbLedger.create(
+        params.tree.extra.penalties.cegb, data.n_features, data.n_rows
+    )
+
     # Row-major raw scores for both sets: raw[r * n_classes + k].
     var raw = List[Float64](capacity=n * n_classes)
     for _ in range(n):
@@ -1928,11 +1973,12 @@ def train_multiclass_with_valid(
             apply_goss_scaling(selection, grad, hess)
             # Feature subsampling draws once per tree, so each class's tree
             # in a round gets its own feature set.
-            var tree = grow_tree(
+            var tree = grow_tree_with_cegb(
                 data,
                 grad,
                 hess,
                 params.tree,
+                ledger,
                 bag,
                 i * n_classes + k,
                 bundling,
