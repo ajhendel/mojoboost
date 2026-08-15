@@ -231,29 +231,171 @@ def env_strategy() -> Int:
 
 
 def shared_bytes_for(n_bins: Int) -> Int:
-    """Shared memory one threadgroup needs for its partial histogram.
+    """Shared memory one threadgroup needs for one feature slot's partial
+    histogram.
 
-    The footprint of a kernel sized to its bin count. The kernels that
-    actually ship (`gpu_active_rows._range_hist_atomic_kernel` and
-    `_range_hist_partial_kernel`) allocate three `MAX_BINS`-wide Int32 planes
-    whatever `n_bins` is, so their real footprint is this value at 256 bins
-    and larger than it everywhere below. The difference matters only to a
-    residency estimate, and the only one this module makes is the fixed
-    `TARGET_BLOCKS_PER_SM` above, which does not consult this at all. It is
-    still the wrong number to derive residency from until the kernels take a
-    bin-capacity parameter: see `gpu_histogram_specializations.mojo`, which
-    names both footprints, and `apple_histogram_policy.mojo`, which picks
-    whichever is true of the build in hand.
+    Three Int32 planes over the capacity a histogram kernel is instantiated
+    at, which is the footprint one block really occupies now that the kernel
+    family in `gpu_active_rows.mojo` takes a `BIN_CAP` parameter. The capacity
+    rather than `n_bins` itself because that parameter walks a four-value
+    ladder (`histogram_bin_capacity` below), so a 40-bin dataset occupies the
+    64-bin footprint and nothing narrower; the previous rounding error, three
+    `MAX_BINS`-wide planes at every bin count, is gone in the other direction.
 
-    The guard in `derive_tiling` inherits the same optimism: it asks whether
-    a capacity-sized histogram fits, so a device advertising less than the
-    3 KiB the shipping kernels allocate would pass the guard and then fail to
-    launch. No supported backend advertises that little, and the guard is
-    left as it is rather than tightened here, because tightening it would
-    change which shapes `derive_tiling` accepts. The policy layer checks the
-    real footprint.
+    A block that owns several feature slots occupies a multiple of this.
+    `histogram_shared_bytes` is the figure that carries the group width, and
+    it is the one a residency estimate has to use.
+
+    The guard in `derive_tiling` reads this, so it asks whether the
+    allocation a kernel really makes fits rather than whether an idealized
+    `n_bins`-wide one would.
     """
-    return n_bins * BYTES_PER_PARTIAL_CELL
+    return histogram_bin_capacity(n_bins) * BYTES_PER_PARTIAL_CELL
+
+
+# --- The histogram kernel family's two ladders ---
+#
+# `gpu_active_rows._range_hist_atomic_kernel` and `_range_hist_partial_kernel`
+# are parameterized on how many feature slots one threadgroup owns (`GROUP`)
+# and how wide its shared planes are (`BIN_CAP`). Both ladders live here
+# because this is the module that prices a threadgroup, and both are
+# deliberately short: every rung is a kernel instantiation the whole matrix
+# pays compile time for on every backend.
+
+comptime HIST_BIN_CAP_MIN = 32
+"""Narrowest shared plane a histogram kernel is instantiated at. Below 32
+bins the threadgroup memory saved is already small next to the launch, and
+the rung would cost a fifth of the matrix to buy it."""
+
+comptime HIST_BIN_CAP_MAX = 256
+"""Widest, and the bin ceiling itself: a bin id is a byte, which is what
+`gpu_portability.require_bins_supported` refuses more than."""
+
+comptime HIST_FEATURE_GROUP_MAX = 16
+"""Widest ladder rung for feature slots per threadgroup. 1, 2, 4, 8, 16."""
+
+comptime HIST_FEATURE_GROUP_LADDER = 5
+"""Rungs in that ladder, counting 1."""
+
+comptime HIST_BIN_CAP_LADDER = 4
+"""Rungs in the bin-capacity ladder: 32, 64, 128, 256."""
+
+
+def histogram_bin_capacity(n_bins: Int) -> Int:
+    """The shared-plane width a histogram kernel for `n_bins` bins is
+    instantiated at: the smallest ladder value at or above `n_bins`, never
+    below `HIST_BIN_CAP_MIN`.
+
+    Deliberately not raising, because `shared_bytes_for` above is not, and
+    deliberately not saturating at `HIST_BIN_CAP_MAX` either: a bin count past
+    the ceiling has no kernel, and returning the next power of two keeps
+    `shared_bytes_for` growing so `derive_tiling`'s guard still refuses the
+    shape rather than quietly pricing it as a 256-bin one.
+    `require_bins_supported` is the check that names the limit.
+    """
+    var capacity = HIST_BIN_CAP_MIN
+    while capacity < n_bins:
+        capacity *= 2
+    return capacity
+
+
+def histogram_shared_bytes(bin_cap: Int, group: Int) -> Int:
+    """Threadgroup memory one block of the histogram family occupies: three
+    Int32 planes of `group * bin_cap` cells each.
+
+    The whole footprint, and the only number a residency estimate for these
+    kernels may use. `3 * group * bin_cap * 4` is what the `stack_allocation`
+    calls in `gpu_active_rows.mojo` ask for, restated once here so a policy
+    layer does not re-derive it from a bin count it happened to hold.
+    """
+    return group * bin_cap * BYTES_PER_PARTIAL_CELL
+
+
+def is_feature_group_width(group: Int) -> Bool:
+    """Whether `group` is a rung of the feature-group ladder, so a kernel is
+    instantiated at it. 3 is not, and is refused rather than rounded, for the
+    reason every rung is refused: a width with no kernel cannot launch."""
+    var rung = 1
+    for _ in range(HIST_FEATURE_GROUP_LADDER):
+        if rung == group:
+            return True
+        rung *= 2
+    return False
+
+
+def feature_group_for_residency(
+    caps: DeviceCaps, bin_cap: Int, resident_blocks: Int
+) raises -> Int:
+    """The widest ladder `GROUP` whose threadgroup footprint at `bin_cap`
+    still leaves `resident_blocks` blocks able to share one multiprocessor's
+    threadgroup memory.
+
+    The residency question stated in the unit the device reports:
+    `resident_blocks * histogram_shared_bytes(bin_cap, group)` must fit in
+    `caps.max_shared_memory_per_block`. At one resident block this is simply
+    the widest group that launches at all.
+
+    Returns 1 when even a single feature slot does not fit at that residency,
+    because 1 is the narrowest kernel there is; whether it launches is
+    `gpu_portability`'s question and not this one's. Nothing here selects a
+    group. `GpuActiveRows` chooses the default by the free-footprint rule
+    below, and this exists for a policy layer that wants to ask the residency
+    question directly.
+    """
+    if bin_cap < 1:
+        raise Error("a shared plane covers a positive number of bins")
+    if resident_blocks < 1:
+        raise Error("a residency target is a positive number of blocks")
+    var budget = caps.max_shared_memory_per_block
+    var best = 1
+    var rung = 1
+    for _ in range(HIST_FEATURE_GROUP_LADDER):
+        if resident_blocks * histogram_shared_bytes(bin_cap, rung) <= budget:
+            best = rung
+        rung *= 2
+    return best
+
+
+def free_feature_group(bin_cap: Int, baseline_group: Int) raises -> Int:
+    """The widest ladder `GROUP` that costs no more threadgroup memory at
+    `bin_cap` than `baseline_group` already costs at the full 256-bin width.
+
+    This is the rule the default group follows, and the reason it can be a
+    default rather than a knob. Whatever residency the build had before the
+    kernels took a `BIN_CAP` parameter, it had while paying
+    `histogram_shared_bytes(256, baseline_group)` per block, because the old
+    kernels allocated the maximum width at every bin count. A group whose
+    footprint at the real capacity is at or below that number therefore cannot
+    reduce the number of resident blocks, whatever the device's threadgroup
+    budget turns out to be, so widening to it is free in residency terms and
+    provably not a regression on any backend.
+
+    A 64-bin dataset with a baseline of 2 gets 8, and a 32-bin one gets 16,
+    for the same bytes. At 256 bins the rule returns the baseline unchanged,
+    which is what makes it safe to apply everywhere.
+
+    Anything WIDER than this returns is not free: it trades resident blocks
+    for row-side traffic, and that trade is UNMEASURED on every device this
+    project runs on. It stays an explicit `MOJOTREES_GPU_FEATURE_GROUP`
+    request. What would measure it is an interleaved A/B of the two groups at
+    one shape in one process, the protocol `bench_histogram.mojo` already
+    uses, on a dataset binned well below 256.
+    """
+    if bin_cap < 1:
+        raise Error("a shared plane covers a positive number of bins")
+    if not is_feature_group_width(baseline_group):
+        raise Error(
+            "a baseline feature group must be a rung of the ladder: 1, 2, 4,"
+            " 8, or 16"
+        )
+    var budget = histogram_shared_bytes(HIST_BIN_CAP_MAX, baseline_group)
+    var best = 1
+    var rung = 1
+    for _ in range(HIST_FEATURE_GROUP_LADDER):
+        if histogram_shared_bytes(bin_cap, rung) <= budget:
+            best = rung
+        rung *= 2
+    return best
 
 
 def _ceil_div(a: Int, b: Int) -> Int:

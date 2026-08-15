@@ -176,6 +176,7 @@ from .gpu_tiling import (
     DeviceCaps,
     HistogramTiling,
     derive_tiling,
+    free_feature_group,
     query_device_caps,
 )
 from .gpu_runtime import (
@@ -246,9 +247,25 @@ def build_kernel_features() -> KernelFeatures:
     benchmark and no hardware run has compared a batched launch against the
     single-leaf one here, which is exactly why the level that selects it
     (`SPEC_LEVEL_BATCHED`) has to be asked for and never resolves from
-    `auto`. The other two variants do not exist: the shipping kernels
-    allocate the `MAX_BINS` threadgroup width at every bin count and read one
-    bin per load.
+    `auto`. `packed_bin_loads` does not exist: the row loop reads one bin per
+    load.
+
+    `specialized_bin_kernels` stays false, and this is now a deliberate
+    understatement rather than a description. The range histogram family in
+    `gpu_active_rows.mojo` *is* instantiated per bin capacity, so the flag is
+    literally true of the build. It is left false because of what consumes it:
+    `gpu_portability.kernel_shared_request` turns it into a threadgroup
+    footprint of one capacity-sized block, and that expression carries no
+    feature-group width, so at any group past 1 it would report a fraction of
+    what the launch really allocates and the geometry gate would be checking a
+    number that does not bound the launch. Reporting the smaller, more
+    flattering figure to a gate is the wrong direction to be wrong in.
+    Flipping this belongs with a `kernel_shared_request` that takes the group,
+    which is `gpu_portability.mojo`'s to change. Until then the real bound is
+    enforced where the group is known: `GpuActiveRows.set_feature_group`
+    refuses a width whose `gpu_tiling.histogram_shared_bytes` exceeds what the
+    device reported, and the constructor clamps an environment request to the
+    widest rung that fits.
     """
     return KernelFeatures(False, False, True)
 
@@ -497,19 +514,38 @@ struct GpuHistogramBuilder(Movable):
         self.rows = GpuActiveRows(
             self.ctx, data.n_rows, data.n_features, data.n_bins, self.caps
         )
-        # Metal defaults to the paired histogram kernels: measured on an
-        # Apple M4 at 1.39x end to end for a 5M x 50 fit with byte-identical
-        # predictions (see _range_hist_partial_g2_kernel), and pairing
-        # changes no histogram it produces on any backend. An explicit
-        # MOJOTREES_GPU_FEATURE_GROUP still wins in both directions, and
-        # CUDA/HIP/unknown keep one feature per threadgroup until someone
-        # measures them — the shared-memory doubling is exactly the kind of
-        # change that can invert on a different threadgroup budget.
-        if (
-            getenv("MOJOTREES_GPU_FEATURE_GROUP") == ""
-            and parse_api(self.device_api) == API_METAL
-        ):
-            self.rows.set_feature_group(2)
+        # The default feature group, by the one rule that cannot cost
+        # residency. Metal's baseline is the pairing: measured on an Apple M4
+        # at 1.39x end to end for a 5M x 50 fit with byte-identical
+        # predictions (see _range_hist_partial_kernel), and pairing changes no
+        # histogram it produces on any backend. CUDA/HIP/unknown keep the
+        # single slot, because the doubling is exactly the kind of change that
+        # can invert on a different threadgroup budget and nobody has measured
+        # one.
+        #
+        # What is new is that the baseline is a *footprint* rather than a
+        # width. The kernels used to allocate three MAX_BINS-wide Int32 planes
+        # at every bin count, so the baseline group was paid at 256 bins
+        # whatever the dataset was binned at; now that they are sized to the
+        # real capacity, free_feature_group returns the widest rung that costs
+        # no more bytes than that baseline already cost. A 64-bin dataset gets
+        # 8 on Metal for the same 6 KiB, a 32-bin one gets 16, and a 256-bin
+        # one gets the baseline back unchanged. Since the bytes per block do
+        # not rise, the resident blocks per core cannot fall, so this widening
+        # is not an occupancy regression on any device and does not need a
+        # measurement to ship.
+        #
+        # Anything wider than the rule allows does trade residency for
+        # row-side traffic, and that trade is UNMEASURED here. It stays an
+        # explicit MOJOTREES_GPU_FEATURE_GROUP request, which still wins in
+        # both directions.
+        if getenv("MOJOTREES_GPU_FEATURE_GROUP") == "":
+            var baseline = 1
+            if parse_api(self.device_api) == API_METAL:
+                baseline = 2
+            self.rows.set_feature_group(
+                free_feature_group(self.rows.bin_cap, baseline)
+            )
         self.g_scale = 1.0
         self.h_scale = 1.0
         self.has_gradients = False
@@ -575,11 +611,14 @@ struct GpuHistogramBuilder(Movable):
         return self.tiling.strategy
 
     def set_feature_group(mut self, group: Int) raises:
-        """How many features one histogram threadgroup accumulates: 1, the
-        shipping launch, or 2, the paired one (gpu_active_rows.mojo). Both
-        build the same integer histogram, so this is a launch shape and not
-        a numeric option; it exists so a benchmark can hold both arms in one
-        process instead of reading its arm from the environment."""
+        """How many feature slots one histogram threadgroup accumulates: a
+        rung of the ladder 1, 2, 4, 8, 16, each of which the kernel family in
+        gpu_active_rows.mojo is instantiated at. Every rung builds the same
+        integer histogram, so this is a launch shape and not a numeric option;
+        it exists so a benchmark can hold two arms in one process instead of
+        reading its arm from the environment. A rung whose threadgroup
+        footprint at this dataset's bin capacity exceeds what the device
+        reported is refused rather than launched."""
         self.rows.set_feature_group(group)
 
     def feature_group(self) -> Int:

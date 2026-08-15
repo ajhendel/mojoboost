@@ -304,9 +304,12 @@ struct HistogramPlan(Copyable, Movable):
 
     var shared_bytes_per_block: Int
     """Threadgroup memory one block of the kernel that will actually run
-    occupies. The specialized kernels occupy `kernel_shared_bytes(capacity)`;
-    the shipping ones occupy the `MAX_BINS` width at every bin count, and
-    this reports whichever is true of the build in hand."""
+    occupies, for ONE feature slot. The specialized kernels occupy
+    `kernel_shared_bytes(capacity)`; the unspecialized allocation occupies the
+    `MAX_BINS` width at every bin count, and this reports whichever
+    `KernelFeatures` says of the build in hand. It does not carry the feature
+    group, so a launch at group G allocates G times this; see
+    `kernel_block_bytes`."""
 
     var resident_blocks_per_core: Int
     var partial_cell_limit: Int
@@ -409,6 +412,16 @@ def kernel_block_bytes(features: KernelFeatures, capacity: Int) -> Int:
     specialized kernels a block occupies the full `MAX_BINS` width whatever
     `n_bins` is, so planning residency from `n_bins * 12` overstates how many
     blocks fit. With them, the narrower footprint is real.
+
+    Both branches price ONE feature slot. The range histogram family in
+    `gpu_active_rows.mojo` gives a threadgroup `GROUP` of them and allocates
+    `gpu_tiling.histogram_shared_bytes(capacity, group)`, so at any group past
+    1 this figure is a fraction of the launch's real footprint and the
+    residency derived from it is optimistic by exactly that factor. Nothing
+    here knows the group, and this signature is what
+    `gpu_portability.kernel_shared_request` mirrors, so widening it is a
+    change to both. Recorded rather than papered over: a plan from this module
+    is not a bound on what a grouped launch allocates.
     """
     if features.specialized_bin_kernels:
         return kernel_shared_bytes(capacity)
