@@ -970,6 +970,132 @@ def test_paired_feature_group_tiled_builds_the_identical_histogram() raises:
         rows.set_feature_group(1)
 
 
+def test_quad_feature_group_tiled_builds_the_identical_histogram() raises:
+    """Four features per threadgroup changes the launch, not the histogram.
+
+    Five active features is the demanding shape: one full quad block plus a
+    tail block owning a single slot, so a dropped or doubled feature at
+    either end of the grid would show. The slots are a non-identity
+    permutation for the same reason the paired tests use one."""
+    comptime if not has_accelerator():
+        return
+    else:
+        var n_rows = 2048
+        var n_features = 5
+        var n_bins = 16
+        var data = _make_data(n_rows, n_features, n_bins)
+        var grad = List[Float64](capacity=n_rows)
+        var hess = List[Float64](capacity=n_rows)
+        for r in range(n_rows):
+            grad.append(
+                Float64(Int(_splitmix64(UInt64(r) + 7) % 2000)) * 0.001 - 1.0
+            )
+            hess.append(
+                Float64(Int(_splitmix64(UInt64(r) + 991) % 1000)) * 0.001
+                + 0.25
+            )
+
+        var ctx = DeviceContext()
+        var caps = query_device_caps(ctx)
+        var bins = _upload_bins(ctx, data)
+        var rows = GpuActiveRows(ctx, n_rows, n_features, n_bins, caps)
+        rows.begin_tree()
+
+        var g_scale = _fixed_scale(grad)
+        var h_scale = _fixed_scale(hess)
+        var grad32 = ctx.enqueue_create_host_buffer[DType.float32](n_rows)
+        var hess32 = ctx.enqueue_create_host_buffer[DType.float32](n_rows)
+        for r in range(n_rows):
+            grad32.unsafe_ptr().unsafe_store(r, Float32(grad[r]))
+            hess32.unsafe_ptr().unsafe_store(r, Float32(hess[r]))
+        var grad_dev = ctx.enqueue_create_buffer[DType.float32](n_rows)
+        var hess_dev = ctx.enqueue_create_buffer[DType.float32](n_rows)
+        ctx.enqueue_copy(dst_buf=grad_dev, src_ptr=grad32.unsafe_ptr())
+        ctx.enqueue_copy(dst_buf=hess_dev, src_ptr=hess32.unsafe_ptr())
+
+        var feat_dev = ctx.enqueue_create_buffer[DType.int32](n_features)
+        with feat_dev.map_to_host() as host:
+            # Not the identity, so the grouping has to follow `feat_ids`.
+            host.unsafe_ptr().unsafe_store(0, Int32(0))
+            host.unsafe_ptr().unsafe_store(1, Int32(3))
+            host.unsafe_ptr().unsafe_store(2, Int32(1))
+            host.unsafe_ptr().unsafe_store(3, Int32(4))
+            host.unsafe_ptr().unsafe_store(4, Int32(2))
+
+        var hist_size = n_features * n_bins
+        var cells = 3 * hist_size
+        var one_dev = ctx.enqueue_create_buffer[DType.int32](cells)
+        var four_dev = ctx.enqueue_create_buffer[DType.int32](cells)
+        var host_one = ctx.enqueue_create_host_buffer[DType.int32](cells)
+        var host_four = ctx.enqueue_create_host_buffer[DType.int32](cells)
+
+        var routing = RowRouting.numerical(0, 6)
+        _ = rows.partition(bins.unsafe_ptr(), 0, 1, 2, routing)
+        var node = 2
+        assert_true(len(rows.download_range(node)) > 0)
+
+        for step in range(2):
+            # Four active features fills one block exactly; five leaves a
+            # tail block owning a single slot.
+            var slots = 4 + step
+            var tiling = rows.range_tiling(
+                caps, node, slots, STRATEGY_TILED, 1 << 20
+            )
+            assert_equal(tiling.strategy, STRATEGY_TILED)
+            var part_cells = tiling.partial_cells
+            if part_cells < 1:
+                part_cells = 1
+            var part_dev = ctx.enqueue_create_buffer[DType.int32](
+                3 * part_cells
+            )
+
+            rows.set_feature_group(1)
+            rows.enqueue_range_histogram(
+                tiling,
+                node,
+                bins.unsafe_ptr(),
+                grad_dev.unsafe_ptr(),
+                hess_dev.unsafe_ptr(),
+                feat_dev.unsafe_ptr(),
+                one_dev.unsafe_ptr(),
+                part_dev.unsafe_ptr(),
+                slots,
+                g_scale,
+                h_scale,
+            )
+            rows.set_feature_group(4)
+            rows.enqueue_range_histogram(
+                tiling,
+                node,
+                bins.unsafe_ptr(),
+                grad_dev.unsafe_ptr(),
+                hess_dev.unsafe_ptr(),
+                feat_dev.unsafe_ptr(),
+                four_dev.unsafe_ptr(),
+                part_dev.unsafe_ptr(),
+                slots,
+                g_scale,
+                h_scale,
+            )
+            ctx.enqueue_copy(dst_ptr=host_one.unsafe_ptr(), src_buf=one_dev)
+            ctx.enqueue_copy(
+                dst_ptr=host_four.unsafe_ptr(), src_buf=four_dev
+            )
+            ctx.synchronize()
+
+            var a = host_one.unsafe_ptr()
+            var b = host_four.unsafe_ptr()
+            var populated = 0
+            for i in range(cells):
+                assert_equal(Int(a.unsafe_load(i)), Int(b.unsafe_load(i)))
+                if a.unsafe_load(i) != 0:
+                    populated += 1
+            # A comparison of two all-zero buffers would pass for the wrong
+            # reason.
+            assert_true(populated > 0)
+        rows.set_feature_group(1)
+
+
 def test_feature_group_rejects_a_width_it_has_no_kernel_for() raises:
     comptime if not has_accelerator():
         return
@@ -979,6 +1105,8 @@ def test_feature_group_rejects_a_width_it_has_no_kernel_for() raises:
         var rows = GpuActiveRows(ctx, 32, 2, 4, caps)
         with assert_raises():
             rows.set_feature_group(0)
+        with assert_raises():
+            rows.set_feature_group(3)
         with assert_raises():
             rows.set_feature_group(FEATURE_GROUP_MAX + 1)
 
@@ -1139,6 +1267,15 @@ def test_fused_subtract_matches_a_separate_subtraction_paired_tiled() raises:
         return
     else:
         _fused_subtract_case(STRATEGY_TILED, group=2)
+
+
+def test_fused_subtract_matches_a_separate_subtraction_quad_tiled() raises:
+    """Three features under a quad grouping is one tail block owning three
+    slots, which is the tail arithmetic the identity test cannot reach."""
+    comptime if not has_accelerator():
+        return
+    else:
+        _fused_subtract_case(STRATEGY_TILED, group=4)
 
 
 def test_fused_subtract_matches_a_separate_subtraction_paired() raises:

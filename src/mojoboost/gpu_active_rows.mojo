@@ -158,15 +158,18 @@ comptime MAX_ROWS = Int(Int32.MAX)
 # device accepts.
 comptime SCAN_MAX_THREADS = 1024
 
-# Features one histogram threadgroup may accumulate at once. Two is not a
-# tuning constant looking for a third value: the shared histogram is
-# `MAX_BINS` Int32 in each of three planes, so a group of G costs 3 * G KiB
-# of a 32 KiB threadgroup budget, and at G = 4 a device that wants several
-# resident blocks per core has nothing left. Widening this means sizing the
-# shared allocation by the node's real `n_bins` instead of by `MAX_BINS`,
-# which is a different change.
-comptime FEATURE_GROUP_MAX = 2
-comptime GROUPED_BINS = FEATURE_GROUP_MAX * MAX_BINS
+# Features one histogram threadgroup may accumulate at once. The shared
+# histogram is `MAX_BINS` Int32 in each of three planes, so a group of G
+# costs 3 * G KiB of a 32 KiB threadgroup budget: 6 KiB at the pairing,
+# 12 KiB at the quad, which leaves a device wanting several resident blocks
+# per core little room — whether the traffic saving still wins at 4 is a
+# per-device measurement, which is why 3 has no kernel and
+# `set_feature_group` rejects it rather than rounding. The pair constants
+# are deliberately not derived from the maximum: widening the maximum must
+# not resize the paired kernels' shared allocations.
+comptime FEATURE_GROUP_MAX = 4
+comptime GROUPED_BINS = 2 * MAX_BINS
+comptime QUAD_BINS = 4 * MAX_BINS
 
 
 @always_inline
@@ -919,6 +922,136 @@ def _range_hist_partial_g2_kernel(
         b += block_dim.x
 
 
+def _range_hist_partial_g4_kernel(
+    bins: MutPointer[UInt8, MutAnyOrigin],
+    rows: MutPointer[Int32, MutAnyOrigin],
+    grad: MutPointer[Float32, MutAnyOrigin],
+    hess: MutPointer[Float32, MutAnyOrigin],
+    feat_ids: MutPointer[Int32, MutAnyOrigin],
+    partials: MutPointer[Int32, MutAnyOrigin],
+    n_rows: Int32,
+    n_slots: Int32,
+    n_bins: Int32,
+    rows_per_tile: Int32,
+    begin: Int32,
+    count: Int32,
+    g_scale: Float32,
+    h_scale: Float32,
+):
+    """`_range_hist_partial_g2_kernel` widened to four features per block.
+
+    One more halving of the row side: the row index, gradient, hessian, and
+    both quantizations are spent four times instead of twice, so the
+    row-side bytes per (row, feature) visit drop again. What it costs is
+    another shared-memory doubling — 12 KiB of a 32 KiB budget — so at most
+    two such blocks are resident per core, which is why this width is a
+    separate opt-in measurement and not a consequence of the pairing's win.
+
+    The tail block owns however many slots remain (one to four); each owned
+    slot's shared slice sits `k * n_bins` above the first and is written to
+    the same per-slot partial layout, so a feature is never counted twice,
+    never dropped, and `_range_reduce_kernel` combines these partials
+    unchanged. Bit-identical for the reasons the pairing is: fixed-point
+    Int32, same per-(row, feature) quantized adds, and integer addition
+    cannot see the order.
+    """
+    var slot0 = 4 * Int(block_idx.x)
+    var owned = Int(n_slots) - slot0
+    if owned > 4:
+        owned = 4
+    var f0 = Int(feat_ids[unsafe_offset=slot0][0])
+    var f1 = 0
+    var f2 = 0
+    var f3 = 0
+    if owned > 1:
+        f1 = Int(feat_ids[unsafe_offset = slot0 + 1][0])
+    if owned > 2:
+        f2 = Int(feat_ids[unsafe_offset = slot0 + 2][0])
+    if owned > 3:
+        f3 = Int(feat_ids[unsafe_offset = slot0 + 3][0])
+    var t = block_idx.y
+    var tid = thread_idx.x
+    var nb = Int(n_bins)
+    var nr = Int(n_rows)
+    var n = Int(count)
+    var plane = Int(n_slots) * nb
+
+    var sg = stack_allocation[
+        QUAD_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
+    ]()
+    var sh = stack_allocation[
+        QUAD_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
+    ]()
+    var sc = stack_allocation[
+        QUAD_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
+    ]()
+
+    # Owned slots' bins are stacked contiguously, so one zeroing walk covers
+    # exactly the slices this block will write and a tail block never
+    # touches the slices above its last.
+    var span = owned * nb
+    var b = tid
+    while b < span:
+        sg[unsafe_offset=b] = 0
+        sh[unsafe_offset=b] = 0
+        sc[unsafe_offset=b] = 0
+        b += block_dim.x
+    barrier()
+
+    var tile_begin = t * Int(rows_per_tile)
+    var tile_end = tile_begin + Int(rows_per_tile)
+    if tile_end > n:
+        tile_end = n
+
+    var col0 = f0 * nr
+    var col1 = f1 * nr
+    var col2 = f2 * nr
+    var col3 = f3 * nr
+    var j = tile_begin + tid
+    while j < tile_end:
+        var r = Int(rows[unsafe_offset = Int(begin) + j][0])
+        var gq = Int32(round(grad[unsafe_offset=r][0] * g_scale))
+        var hq = Int32(round(hess[unsafe_offset=r][0] * h_scale))
+        var b0 = Int(bins[unsafe_offset = col0 + r])
+        _ = Atomic.fetch_add(sg.unsafe_offset(b0), gq)
+        _ = Atomic.fetch_add(sh.unsafe_offset(b0), hq)
+        _ = Atomic.fetch_add(sc.unsafe_offset(b0), Int32(1))
+        if owned > 1:
+            var b1 = nb + Int(bins[unsafe_offset = col1 + r])
+            _ = Atomic.fetch_add(sg.unsafe_offset(b1), gq)
+            _ = Atomic.fetch_add(sh.unsafe_offset(b1), hq)
+            _ = Atomic.fetch_add(sc.unsafe_offset(b1), Int32(1))
+        if owned > 2:
+            var b2 = 2 * nb + Int(bins[unsafe_offset = col2 + r])
+            _ = Atomic.fetch_add(sg.unsafe_offset(b2), gq)
+            _ = Atomic.fetch_add(sh.unsafe_offset(b2), hq)
+            _ = Atomic.fetch_add(sc.unsafe_offset(b2), Int32(1))
+        if owned > 3:
+            var b3 = 3 * nb + Int(bins[unsafe_offset = col3 + r])
+            _ = Atomic.fetch_add(sg.unsafe_offset(b3), gq)
+            _ = Atomic.fetch_add(sh.unsafe_offset(b3), hq)
+            _ = Atomic.fetch_add(sc.unsafe_offset(b3), Int32(1))
+        j += block_dim.x
+    barrier()
+
+    var k = 0
+    while k < owned:
+        var base = t * 3 * plane + (slot0 + k) * nb
+        var lift = k * nb
+        b = tid
+        while b < nb:
+            var s = lift + b
+            partials[unsafe_offset = base + b] = sg[unsafe_offset=s][0]
+            partials[unsafe_offset = base + plane + b] = sh[
+                unsafe_offset=s
+            ][0]
+            partials[unsafe_offset = base + 2 * plane + b] = sc[
+                unsafe_offset=s
+            ][0]
+            b += block_dim.x
+        k += 1
+
+
 def _range_reduce_kernel(
     partials: MutPointer[Int32, MutAnyOrigin],
     feat_ids: MutPointer[Int32, MutAnyOrigin],
@@ -1352,9 +1485,10 @@ struct GpuActiveRows(Movable):
         arm in. Takes effect on the next `enqueue_range_histogram`, and
         cannot change a histogram, only the launch that builds it.
         """
-        if group < 1 or group > FEATURE_GROUP_MAX:
+        if group < 1 or group > FEATURE_GROUP_MAX or group == 3:
             raise Error(
-                "feature group must be between 1 and ", FEATURE_GROUP_MAX
+                "feature group must be 1, 2, or 4: those are the widths a"
+                " kernel exists for"
             )
         self.feature_group = group
 
@@ -1753,7 +1887,31 @@ struct GpuActiveRows(Movable):
         var do_sub = Int32(1) if subtract else Int32(0)
 
         if tiling.strategy == STRATEGY_TILED:
-            if self.feature_group >= 2 and n_slots >= 2:
+            if self.feature_group >= 4 and n_slots >= 2:
+                # A quarter of the threadgroups, each owning up to four
+                # feature slots; the tail block owns what remains. The
+                # reduce that follows is the same either way because the
+                # partial layout is per slot, not per block.
+                var quad_blocks = (n_slots + 3) // 4
+                self.ctx.enqueue_function[_range_hist_partial_g4_kernel](
+                    bins,
+                    self.rows_dev.unsafe_ptr(),
+                    grad,
+                    hess,
+                    feat_ids,
+                    partials,
+                    Int32(self.n_rows),
+                    Int32(n_slots),
+                    Int32(self.n_bins),
+                    Int32(tiling.rows_per_tile),
+                    Int32(window.begin),
+                    Int32(window.count()),
+                    g_scale,
+                    h_scale,
+                    grid_dim=(quad_blocks, tiling.n_tiles),
+                    block_dim=threads,
+                )
+            elif self.feature_group >= 2 and n_slots >= 2:
                 # Half as many threadgroups, each owning two feature slots,
                 # exactly as the atomic pairing below; the reduce that
                 # follows is the same either way because the partial layout
