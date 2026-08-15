@@ -171,6 +171,7 @@ __all__ = [
     "ValidationPlan",
     "WorldPlan",
     "backend_registered",
+    "check_machine_list",
     "clear_backend",
     "clear_model_cache",
     "dask_available",
@@ -949,6 +950,17 @@ def get_backend():
         "Train on one machine with MojoTreesRegressor, "
         "MojoTreesClassifier, or MojoTreesRanker meanwhile"
     )
+
+
+def check_machine_list(machines, rank=0, job_id=0):
+    """Validate a LightGBM-shaped machine list (`host:port` per line, or a
+    sequence of them) through the native transport and report
+    `world_size`, `rank`, `is_root`, `addresses`, and `schema_digest`.
+    Raises `PartitionError` with the transport's message. Needs no cluster
+    and no dask; see `_dask_runtime.check_machine_list`."""
+    from . import _dask_runtime
+
+    return _dask_runtime.check_machine_list(machines, rank=rank, job_id=job_id)
 
 
 def distributed_status():

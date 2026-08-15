@@ -127,8 +127,10 @@ __all__ = [
     "NativeDistributedBackend",
     "NativeModelRef",
     "RuntimeStatus",
+    "check_machine_list",
     "clear_runtime_provider",
     "describe_runtime",
+    "status_message",
     "native_backend",
     "native_runtime_status",
     "register_runtime_provider",
@@ -557,6 +559,62 @@ def _as_int(value, default=0):
         return default
 
 
+def check_machine_list(machines, rank=0, job_id=0):
+    """Validate a LightGBM-shaped machine list through the transport's own
+    parser (`distributed_check_machine_list`) and report what it means.
+
+    `machines` is the file's text (one `host:port` per line, blank lines
+    skipped, `#` starting a comment) or a sequence of `host:port` strings.
+    Returns a dict with `world_size`, `rank`, `is_root`, `addresses` in
+    rank order, and `schema_digest`, the value every rank must agree on for
+    the handshake to succeed. Raises `PartitionError` carrying the
+    transport's message for a malformed entry, a rank outside the world, or
+    a duplicate address. Validating a machine list costs nothing and needs
+    no cluster, so it is worth doing long before a job runs.
+    """
+    if not isinstance(machines, str):
+        machines = "\n".join(str(entry) for entry in machines)
+    provider, source = _resolve_provider()
+    if provider is None:
+        raise DistributedNotAvailable(source)
+    check = getattr(provider, "distributed_check_machine_list", None)
+    if check is None:
+        raise DistributedNotAvailable(
+            f"{source} does not expose distributed_check_machine_list"
+        )
+    try:
+        record = check(machines, int(rank), int(job_id))
+    except Exception as exc:
+        raise PartitionError(str(exc)) from None
+    return {
+        "world_size": int(record["world_size"]),
+        "rank": int(record["rank"]),
+        "is_root": bool(record["is_root"]),
+        "addresses": [str(a) for a in record["addresses"]],
+        "schema_digest": str(record["schema_digest"]),
+    }
+
+
+def status_message(code, transport=False):
+    """The text for a native status code: a collective status
+    (`distributed_status_message`, what a trainer reports when a shard's
+    input disagrees with the others) or, with `transport=True`, a transport
+    status (`transport_status_message`, what a session reports when it is
+    the connection that broke). The two vocabularies are separate on
+    purpose. Returns None when this build cannot say."""
+    provider, _ = _resolve_provider()
+    if provider is None:
+        return None
+    name = "transport_status_message" if transport else "distributed_status_message"
+    hook = getattr(provider, name, None)
+    if hook is None:
+        return None
+    try:
+        return str(hook(int(code)))
+    except Exception:
+        return None
+
+
 def describe_runtime():
     """One line for a diagnostics report."""
     status = native_runtime_status()
@@ -886,6 +944,17 @@ def _rank_failure(future, futures, plan):
     except BaseException as exc:  # re-raised below as the cause
         cause = exc
     detail = f"{type(cause).__name__}: {cause}" if cause else "no detail"
+    # A rank that failed inside the collective carries the native status
+    # code; say what it means in the transport's own words.
+    for attribute, transport in (
+        ("collective_status", False),
+        ("transport_status", True),
+    ):
+        code = getattr(cause, attribute, None)
+        if isinstance(code, int):
+            text = status_message(code, transport=transport)
+            if text:
+                detail = f"{detail}; {attribute} {code}: {text}"
     error = DistributedRankError(
         f"rank {rank.rank} on {rank.worker} failed, so the fit was "
         f"cancelled on every rank ({detail}). A rank that dies mid-fit "
@@ -986,12 +1055,10 @@ def _transport_addresses(plan, base_port=None):
                 "built for it"
             )
         addresses.append(f"{host}:{base + rank.rank}")
-    if len(set(addresses)) != len(addresses):
-        raise PartitionError(
-            f"two ranks would listen on the same address ({addresses}); "
-            "this is a bug in the rank plan rather than something to "
-            "configure around"
-        )
+    # The transport's own parser is the judge of a machine list: duplicate
+    # addresses, malformed entries, and a world that does not fit are its
+    # rules, applied here once rather than restated in Python.
+    check_machine_list(addresses, rank=0, job_id=0)
     return tuple(addresses)
 
 
