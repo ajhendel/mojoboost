@@ -33,3 +33,11 @@ __pycache__/
 python/dist/
 python/mojotrees.egg-info/
 python/LICENSE
+
+# Instruments captures (bench/apple/metal_capture.sh). A .trace bundle is
+# about 120 MB per four seconds of traced run, and the reader caches its
+# exported XML tables in a sibling directory that is larger still. The reduced
+# text output is what belongs in bench/results/.
+bench/apple/metal_traces/
+*.trace/
+*.trace.export/

@@ -1,0 +1,69 @@
+Metal System Trace captures, 2026-08-15
+=======================================
+
+The first GPU timeline this repository has ever recorded. Protocol, findings,
+and limitations are docs/METAL_TIMELINE.md; the capture and reduction tools
+are bench/apple/metal_capture.sh and bench/apple/metal_timeline.py.
+
+Machine
+    MacBook Air, Apple M4, 10 GPU cores
+    recommended maximum working set 11.84 GiB
+    macOS 26.5.2 (25F84)
+    Xcode 26.6 (17F113), Instruments 16.0, AGX tracecode 3.44.6
+
+Method
+    xcrun xctrace record --template 'Metal System Trace' --no-prompt \
+        --target-stdout - --launch -- ./build/bench_train_gpu R 50 reg 1 gpu
+
+    The benchmark was built to a standalone binary with `mojo build` first, so
+    that the trace contains the run and not a Mojo compile. Nothing here needed
+    root, an entitlement, a signed bundle, or an authorization prompt.
+
+Captures
+    metal_50000_50_reg_gpu.txt     50,000 rows x 50 features, reg, 1 repeat, gpu arm
+    metal_100000_50_reg_gpu.txt   100,000 rows x 50 features, reg, 1 repeat, gpu arm
+    metal_200000_50_reg_gpu.txt   200,000 rows x 50 features, reg, 1 repeat, gpu arm
+    metal_400000_50_reg_gpu.txt   400,000 rows x 50 features, reg, 1 repeat, gpu arm
+
+    All four run 100 boosting rounds at the library defaults.
+
+Conditions, stated rather than met
+    This was not an idle machine by docs/APPLE_GPU_BENCHMARK_PROTOCOL.md.
+    Chrome, Code, Discord, Docker, and Zoom were resident. That is tolerable
+    here because every number reported is a within-run structural measurement
+    rather than a comparison of two wall clocks, and because the traces record
+    what every other process did on the GPU and it is almost nothing: 125
+    dispatches against 22,109 from the benchmark in the 200,000 row capture.
+
+    Instruments costs about 14 percent of wall clock. gpu_train_s at 200,000
+    rows was 2.070 s untraced and 2.363 s traced. GPU-side timestamps come from
+    the GPU's own clock and are not distorted by that; CPU-side ones are
+    measured on an instrumented process and are upper bounds.
+
+CHECK THE CLOCK BEFORE COMPARING ANY TWO OF THESE
+    The 100,000 and 400,000 row captures sat at the device's Minimum GPU
+    performance state for 100 percent of their recorded state time. The 50,000
+    and 200,000 row captures sat at Maximum for 70.7 and 77.9 percent of
+    theirs. Kernel durations differ by the clock as much as by the workload,
+    so only the 50,000 and 200,000 pair may be compared, and the intended
+    scaling experiment across all four failed for this reason.
+
+    This is recorded because it is also the most likely mechanism behind the
+    two-to-three-fold drift this repository sees between time windows on Apple
+    silicon. Every reduction prints the performance state breakdown first, for
+    exactly this reason.
+
+    The 200,000 row capture is the one docs/METAL_TIMELINE.md is written from,
+    because it is the one that ran at the clock a user would get on the shape
+    the round is arguing about.
+
+What these captures cannot show
+    Occupancy, ALU utilization, memory bandwidth, cache behavior. This device
+    exposes Instruments exactly one GPU counter, "RT Unit Active", which
+    reports the raytracing unit and is worthless to a histogram. Requesting the
+    Metal GPU Counters instrument by name is refused by the device and empties
+    the counter tables entirely; do not add it back.
+
+    Kernel names. MAX sets no labels on its Metal encoders, so all 22,109
+    dispatches carry one of two labels. Kernel attribution is by position and
+    duration, and the reduction marks every such claim INFERRED.

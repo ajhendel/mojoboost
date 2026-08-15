@@ -1,0 +1,90 @@
+trace     /private/tmp/claude-501/-Users-andrewhendel-CascadeProjects/4f28875d-531a-4711-accb-ec4ad120d047/scratchpad/traces/mst1.trace
+process   bench_train_gpu (pid 77443) 200000 50 reg 1 gpu
+export    export
+
+GPU counters available on this device
+-------------------------------------
+  RT Unit Active
+  (occupancy, ALU utilization, and bandwidth are not among them,
+   so no kernel here can be called latency- or bandwidth-bound from a counter)
+
+Question 1: is the GPU busy between kernels
+-------------------------------------------
+  dispatches                    22109  (18703 compute, 3406 blit)
+  span, first GPU start to last GPU end     2346.74 ms
+  GPU busy (union of intervals)              552.28 ms  (23.53% of span)
+  GPU idle inside the span                  1794.45 ms  (76.47% of span)
+  compute GPU time                           536.96 ms  (22.88% of span)
+  blit GPU time (bytes actually moving)       15.33 ms  (0.65% of span)
+
+  gaps between busy runs               n= 22108  total=  1794.45 ms  mean=   81.17 us  med=    3.33 us  p90=  413.83 us
+  gap size distribution:
+    <1us      n=  7451  total=     2.83 ms  (0.2% of all idle)
+    1-5us     n=  6889  total=    22.67 ms  (1.3% of all idle)
+    5-20us    n=  1573  total=     9.82 ms  (0.5% of all idle)
+    20-100us  n=  1211  total=    96.77 ms  (5.4% of all idle)
+    0.1-1ms   n=  4980  total=  1655.12 ms  (92.2% of all idle)
+    >1ms      n=     4  total=     7.23 ms  (0.4% of all idle)
+
+  cross-check, GPU hardware Active/Idle for the whole machine over the whole trace:
+    Idle         2793.48 ms
+    Active        565.48 ms
+    (this counts every process, so Active here should exceed the
+     per-process busy above by whatever else touched the GPU)
+
+  GPU performance state over the whole trace (rules out idleness being a clock artifact):
+    Maximum      1862.41 ms
+    Minimum       482.59 ms
+    Medium         44.38 ms
+
+Question 2: what the kernels look like (no counters, so shape only)
+-------------------------------------------------------------------
+  compute kernel duration percentiles, microseconds:
+    p10     2.62   p25     3.46   p50     8.21   p75    17.12   p90    81.46   p99   262.29   max  1883.96
+  where compute GPU time goes, by kernel duration class:
+    <2us       n=     1  total=    0.00 ms  (  0.0% of compute GPU time)
+    2-5us      n=  7005  total=   22.55 ms  (  4.2% of compute GPU time)
+    5-10us     n=  3201  total=   22.52 ms  (  4.2% of compute GPU time)
+    10-25us    n=  4975  total=   74.75 ms  ( 13.9% of compute GPU time)
+    25-50us    n=   592  total=   21.32 ms  (  4.0% of compute GPU time)
+    50-100us   n=  1392  total=   96.15 ms  ( 17.9% of compute GPU time)
+    100-250us  n=  1334  total=  185.82 ms  ( 34.6% of compute GPU time)
+    250-500us  n=    73  total=   22.23 ms  (  4.1% of compute GPU time)
+    0.5-1ms    n=   115  total=   66.74 ms  ( 12.4% of compute GPU time)
+    >1ms       n=    15  total=   24.87 ms  (  4.6% of compute GPU time)
+
+Question 3: what one enqueue costs, and what one host wait costs
+----------------------------------------------------------------
+  command buffers joined across CPU, GPU, and completion tables: 22107
+
+  enqueue: the commit call on CPU      n= 22107  total=   328.44 ms  mean=   14.86 us  med=   12.62 us  p90=   17.83 us
+  commit end -> GPU start              n= 22107  total=  4785.64 ms  mean=  216.48 us  med=  203.54 us  p90=  321.29 us
+  GPU busy per command buffer          n= 22107  total=   552.45 ms  mean=   24.99 us  med=    6.25 us  p90=   65.33 us
+  GPU end -> completion signal         n= 22107  total=  2437.12 ms  mean=  110.24 us  med=  101.33 us  p90=  148.79 us
+  commit N -> commit N+1               n= 22106  total=  2349.84 ms  mean=  106.30 us  med=   14.58 us  p90=  532.38 us
+
+  A serialization point is a command buffer whose successor was committed only
+  after the GPU had finished it. Anything else was already in flight, so the
+  host was pipelining and paid no wait for it.
+    serialization points   3208 of 22107 command buffers (14.5%)
+    host time stalled      924.55 ms (39.4% of the span)
+    Blit       3406 total,   3206 of them serialization points (94.1%)
+    Compute   18701 total,      2 of them serialization points (0.0%)
+
+Per boosting round (100 rounds)
+-------------------------------
+  serialization points per round  32.1
+  dispatches per round            221.1
+
+  the 100 longest kernels are spaced   median 22.36 ms apart
+  one per round would be             23.47 ms apart
+  their own durations                median 574.8 us (min 549.0, max 1884.0)
+  INFERRED: one per round, and the root histogram, because the count and
+  the spacing both match the round count. The trace does not name kernels.
+
+  wall per round        median    22.36 ms
+  GPU busy per round    median     4.92 ms
+  dispatches per round  median      221
+  GPU busy fraction     median     22.9%  (min 15.0%, max 93.6%)
+
+Every number above is a recorded timestamp. Lines marked INFERRED are not.
