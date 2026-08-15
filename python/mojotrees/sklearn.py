@@ -129,9 +129,9 @@ class _Base(_ParamsMixin):
     `skip_drop`, `xgboost_dart_mode`, and `drop_seed` are LightGBM's
     parameters of those names. `uniform_drop` defaults to True here (LightGBM
     defaults to False); the non-uniform variant is refused. "rf" is random
-    forest mode: every tree fits the same gradients at `learning_rate=1.0`
-    (any other rate is refused) and the model averages them, so it needs a
-    source of per-tree randomness, `bagging_fraction < 1` with
+    forest mode: every tree fits the same gradients and the model averages
+    them, so `learning_rate` is ignored (trained at 1.0, as LightGBM does)
+    and it needs a source of per-tree randomness, `bagging_fraction < 1` with
     `bagging_freq > 0` or `feature_fraction < 1`. Both modes train on the
     CPU, on dense input, without `eval_set` or a callable objective, and
     single-output only (a multiclass classifier or a ranker refuses them);
@@ -905,10 +905,10 @@ class _Base(_ParamsMixin):
                 raise ValueError("skip_drop must be in [0, 1]")
             if int(self.drop_seed) < 0:
                 raise ValueError("drop_seed must be nonnegative")
-        if boosting == "rf" and float(self.learning_rate) != 1.0:
-            raise ValueError(
-                "boosting='rf' averages its trees and takes learning_rate=1.0"
-            )
+        # A forest averages its trees, so LightGBM's RF ignores
+        # learning_rate and trains at 1.0; the same here, whatever the
+        # estimator was given, because boosting_rf refuses any other rate.
+        learning_rate = 1.0 if boosting == "rf" else float(self.learning_rate)
         if not 0.0 < float(self.feature_fraction) <= 1.0:
             raise ValueError("feature_fraction must be in (0, 1]")
         if not 0.0 < float(self.feature_fraction_bynode) <= 1.0:
@@ -935,7 +935,7 @@ class _Base(_ParamsMixin):
             # Sent as its canonical name; the binding parses it with the same
             # function the parameter string goes through.
             "grow_policy": _GROW_POLICIES[grow_policy],
-            "learning_rate": float(self.learning_rate),
+            "learning_rate": learning_rate,
             "n_estimators": int(self.n_estimators),
             "min_data_in_leaf": int(min_data_in_leaf),
             "lambda_l2": float(lambda_l2),
