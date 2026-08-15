@@ -388,19 +388,18 @@ def _validate(config: TrainConfig, saw_num_class: Bool) raises:
     parameter string is rejected before any data is read."""
     # The data-independent booster ranges, from the one place that holds
     # them; `callback.check_resettable` applies the same call to a reset.
-    var tree = config.booster.tree
     check_booster_ranges(
         config.booster.n_estimators,
         config.booster.learning_rate,
-        tree.num_leaves,
-        tree.max_depth,
-        tree.min_data_in_leaf,
-        tree.min_child_hess,
-        tree.lambda_l1,
-        tree.lambda_reg,
-        tree.feature_fraction,
-        tree.feature_fraction_bynode,
-        tree.feature_fraction_bylevel,
+        config.booster.tree.num_leaves,
+        config.booster.tree.max_depth,
+        config.booster.tree.min_data_in_leaf,
+        config.booster.tree.min_child_hess,
+        config.booster.tree.lambda_l1,
+        config.booster.tree.lambda_reg,
+        config.booster.tree.feature_fraction,
+        config.booster.tree.feature_fraction_bynode,
+        config.booster.tree.feature_fraction_bylevel,
     )
     # The data-independent half of the remaining tree controls. The per-
     # feature vectors are checked against the dataset later, in
