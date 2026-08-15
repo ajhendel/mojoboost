@@ -4,12 +4,15 @@ This document specifies the device-side sparse and categorical primitives in
 `src/mojotrees/gpu_sparse_layout.mojo`, `src/mojotrees/gpu_sparse.mojo`, and
 `src/mojotrees/gpu_categorical.mojo`.
 
-**Status: primitives only.** Nothing here is wired into training. There is no
-`device="gpu"` path for sparse input, no automatic switch away from the dense
-GPU builder, no threshold on density, and no densification anywhere. A
-`SparseBinnedMatrix` goes to the device compressed and comes back as an
-ordinary `Histogram`. The integration a training path would need is in
-`handoffs/performance_16_sparse_categorical_gpu.md`.
+**Status: wired into training.** `src/mojotrees/train_gpu_sparse.mojo` drives
+these primitives: `model_sparse.fit_csc` on `device="gpu"` reaches
+`train_gpu_sparse`, which grows every tree through one
+`GpuSparseHistogramBuilder` per session and routes categorical splits through
+`gpu_categorical`'s `CatSetPool`. There is still no automatic switch away
+from the CPU sparse trainer under `auto` (section 10: no crossover has been
+measured), no threshold on density, and no densification anywhere. A
+`SparseBinnedMatrix` goes to the device compressed and comes back, per node,
+as an ordinary `Histogram`. `tests/test_gpu_sparse.mojo` is the suite.
 
 The ordinary `Model` representation and CPU prediction are untouched. No
 serialization format changes, and none is proposed below without saying so
@@ -440,15 +443,18 @@ drops a feature.
 | a node id at or past the reserved id | `apply_split` |
 | `max_nodes < 2` | builder construction |
 
-Not supported and not rejected because it cannot arise here: `device="gpu"`
-for sparse input is not exposed at all.
+Rejected by the trainer rather than here: exclusive feature bundling on the
+device path (`train_gpu_sparse._refuse_bundling`; the split kernel routes on
+the stored column bin and knows no bundle's local-bin table).
 
 ## 12. Relationship to the CPU sparse path
 
 `histogram_sparse.mojo` and `tree_sparse.mojo` are unchanged and remain the
-only sparse training path. The device primitives mirror their structure
-deliberately, entry permutation for entry permutation and window for window,
-so the two can be compared directly during integration:
+CPU sparse training path, the one `auto` selects and the reference
+`train_gpu_sparse` is compared against. The device primitives mirror their
+structure deliberately, entry permutation for entry permutation and window
+for window, and `grow_tree_gpu_sparse` mirrors `grow_tree_sparse` the same
+way, so the two are compared directly:
 
 * `SparseEntryOrder` maps to `order` plus `scratch`;
 * `SparseNodeEntries` maps to one node's slice of `ranges`, and the host
@@ -457,5 +463,6 @@ so the two can be compared directly during integration:
 * `_partition_ranges` maps to `_entry_partition_kernel`, and
   `partition_entries_host` is the serial reference both are compared against.
 
-The CPU path remains the fallback for every case section 11 rejects, and for
-every device the primitives have not been validated on.
+The CPU path remains the path for every case section 11 rejects, for
+bundled matrices, and for every device the primitives have not been
+validated on; the device path never falls back to it silently, it raises.

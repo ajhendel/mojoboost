@@ -1146,10 +1146,11 @@ class _Base(_ParamsMixin):
         Everything after `n_outputs` is what the native policy gates on
         beyond the shape, and every one of them changes an answer:
         `objective_code` blocks the GPU for a custom objective and for
-        lambdarank, `sparse` blocks it because there is no sparse GPU
-        histogram, `has_eval_set` blocks it because validation metrics are
-        scored on the host, and `max_bin` (read off the estimator) and
-        `categorical` and `use_missing` are reported. Leaving one
+        lambdarank, `sparse` routes an explicit "gpu" to the sparse GPU
+        trainer and keeps "auto" on the CPU, `has_eval_set` blocks it
+        because validation metrics are scored on the host, and `max_bin`
+        (read off the estimator) and `categorical` and `use_missing` are
+        reported. Leaving one
         undeclared does not make it false, it makes the decision
         incomplete, which the report says. `objective_code=None` is
         undeclared, which is what the multiclass classifier means: its
@@ -1203,8 +1204,9 @@ class _Base(_ParamsMixin):
         Every call site here mirrors a block in
         src/mojotrees/device_policy.mojo, which is what actually decides
         once `_resolve_device` reaches the full native contract:
-        BLOCK_SPARSE_INPUT, BLOCK_VALIDATION_SET, BLOCK_CUSTOM_OBJECTIVE,
-        and BLOCK_RANKING_OBJECTIVE. Against such a build these checks
+        BLOCK_VALIDATION_SET, BLOCK_CUSTOM_OBJECTIVE, and
+        BLOCK_RANKING_OBJECTIVE (BLOCK_SPARSE_INPUT is a prediction-side
+        block now; sparse training has a device path). Against such a build these checks
         never fire, because `device` arrived already refused or already
         resolved to "cpu".
 
@@ -2135,8 +2137,8 @@ class _Base(_ParamsMixin):
         per node over that row's own stored entries.
 
         `device` travels in the params dict so that the refusal for an
-        explicit `"gpu"` is the native one; there is no sparse accelerator
-        kernel, the same way there is no sparse GPU histogram.
+        explicit `"gpu"` is the native one: there is no sparse accelerator
+        prediction kernel (training has one, prediction does not).
         """
         if pred_leaf or pred_contrib:
             raise ValueError(
@@ -2169,14 +2171,16 @@ class _Base(_ParamsMixin):
         column names, the params dict with the buffers folded in, and a
         tuple to keep every referenced buffer alive across the call.
 
-        Sparse training runs on the CPU. The GPU histogram kernels take a
-        dense binned matrix, so rather than densify behind the caller's
-        back, `device="gpu"` is refused and `device="auto"` resolves to the
-        CPU, which is what it would pick anyway. Both of those answers come
-        from the native policy, which is asked with `sparse=True` (that is
-        its BLOCK_SPARSE_INPUT), not decided here; `objective_code` and
-        `n_outputs` are passed so the refusal it writes names every reason
-        the request was blocked, not just this one.
+        Returns the resolved device as well. Sparse training runs on the
+        CPU unless `device="gpu"` is asked for explicitly: the native sparse
+        GPU trainer (`train_gpu_sparse`, reached through `fit_csc`) grows on
+        the compressed matrix, never densifying, and `device="auto"`
+        resolves to the CPU because that path's crossover is unmeasured.
+        Both answers come from the native policy, asked with `sparse=True`;
+        `objective_code` and `n_outputs` are passed so a refusal it writes
+        names every reason. The device name is folded into `params`, and
+        the trainer resolves it again natively, so no decision is made
+        here.
         """
         buffers, n_rows, n_features, names = _arrays.check_X_sparse(X, "csc")
         wb, w_addr = self._weight_buffer(sample_weight, n_rows)
@@ -2192,17 +2196,10 @@ class _Base(_ParamsMixin):
             sparse=True,
             categorical=cat_buf is not None,
         )
-        # Backstop for a shape-only build; see `_gpu_unsupported`.
-        self._gpu_unsupported(
-            device,
-            "sparse input trains on the CPU, and there is no sparse GPU "
-            "kernel yet",
-            "Densify with .toarray() to train on an accelerator.",
-        )
         params = self._params(
-            w_addr, "cpu", ic_flat, ic_offsets, mono_addr, cat_buf, contri_addr
+            w_addr, device, ic_flat, ic_offsets, mono_addr, cat_buf, contri_addr
         )
-        _preflight.native_preflight(params, n_features, "cpu")
+        _preflight.native_preflight(params, n_features, device)
         params.update(buffers.params())
         keep = (
             buffers,
@@ -2213,7 +2210,7 @@ class _Base(_ParamsMixin):
             cat_buf,
             contri_buf,
         )
-        return buffers, n_rows, n_features, names, params, keep
+        return buffers, n_rows, n_features, names, params, keep, device
 
     def _sparse_categorical_buffer(self, X, names, n_features):
         """Categorical columns for a sparse fit.
@@ -2542,12 +2539,12 @@ class MojoTreesRegressor(_Base):
                 )
             self._refuse_alternate_boosting("with sparse input")
             self._reject_sparse_eval_set(eval_set)
-            buffers, n_rows, n_features, names, params, keep = (
+            buffers, n_rows, n_features, names, params, keep, device = (
                 self._sparse_fit_params(X, sample_weight, objective)
             )
             yb = _arrays.check_target(y, n_rows)
             self._model = _mojotrees.fit_csc(_addr(yb), objective, params)
-            self._record_fit(n_features, names, "cpu")
+            self._record_fit(n_features, names, device)
             del keep
             return self
         Xb, n_rows, n_features, names, cat_buf = self._fit_X(X)
@@ -3153,7 +3150,7 @@ class MojoTreesClassifier(_Base):
         sample_weight = self._class_weight_rows(
             yb, X.shape[0], classes, sample_weight
         )
-        buffers, n_rows, n_features, names, params, keep = (
+        buffers, n_rows, n_features, names, params, keep, device = (
             self._sparse_fit_params(
                 X,
                 sample_weight,
@@ -3177,7 +3174,7 @@ class MojoTreesClassifier(_Base):
             _np.asarray(classes) if _np is not None else list(classes)
         )
         self.n_classes_ = n_classes
-        self._record_fit(n_features, names, "cpu")
+        self._record_fit(n_features, names, device)
         del keep
         return self
 

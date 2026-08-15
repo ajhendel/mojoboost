@@ -63,9 +63,12 @@ dense fit of the same matrix with the gaps filled with zeros. Explicitly
 stored zeros mean the same thing as the gaps. NaN is still the missing
 marker, wherever it is stored.
 
-Not available for sparse input: `device="gpu"` (there is no sparse GPU
-kernel), a Python objective callback, `eval_set` and early stopping, and
-ranking. Each raises rather than densifying behind your back.
+Sparse input trains on the accelerator too, on an explicit `device="gpu"`
+(the sparse GPU trainer grows on the compressed matrix; `device="auto"`
+keeps the CPU because that path's crossover is unmeasured). Not available
+for sparse input: a Python objective callback, `eval_set` and early
+stopping, ranking, and GPU prediction. Each raises rather than densifying
+behind your back.
 
 `best_iteration_` is the boosting iteration the model is used at, and
 `n_iter_` the number that were trained. They differ only when a validation

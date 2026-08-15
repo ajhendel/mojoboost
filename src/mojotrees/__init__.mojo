@@ -605,6 +605,20 @@ from .boosting_sparse import (
     train_sparse,
     train_sparse_with_valid,
 )
+from .train_gpu_sparse import (
+    grow_tree_gpu_sparse,
+    train_gpu_sparse,
+    train_gpu_sparse_with_valid,
+    train_multiclass_gpu_sparse,
+)
+from .gpu_sparse import GpuSparseHistogramBuilder, build_histogram_gpu_sparse
+from .gpu_sparse_layout import (
+    SparseGpuCapability,
+    check_sparse_gpu_training,
+    sparse_gpu_capability,
+    sparse_gpu_training_is_wired,
+)
+from .gpu_categorical import CatSetPool, apply_categorical_split_pooled
 from .alternate_boosting import (
     BOOSTING_DART,
     BOOSTING_GBDT,

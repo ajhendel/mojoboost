@@ -105,6 +105,7 @@
       "MOJOTREES_GPU_ROW_TILE",
       "MOJOTREES_GPU_SPLIT_RESIDENT",
       "MOJOTREES_GPU_SPLIT_STRATEGY",
+      "MOJOTREES_GPU_SPLIT_WIDE",
       "MOJOTREES_GPU_STAGING_SLOTS",
       "MOJOTREES_GPU_TRACE",
       "MOJOTREES_GPU_TRANSFER",
@@ -140,6 +141,7 @@
       "MOJOTREES_GPU_PHASE_TRACE",
       "MOJOTREES_GPU_SPLIT_RESIDENT",
       "MOJOTREES_GPU_SPLIT_STRATEGY",
+      "MOJOTREES_GPU_SPLIT_WIDE",
       "MOJOTREES_GPU_TRACE",
       "MOJOTREES_GPU_TRANSFER",
       "MOJOTREES_GPU_TRANSFER_UNPROVEN",
@@ -182,6 +184,7 @@
       "MOJOTREES_GPU_QUANTIZED_GRADS",
       "MOJOTREES_GPU_SPLIT_RESIDENT",
       "MOJOTREES_GPU_SPLIT_STRATEGY",
+      "MOJOTREES_GPU_SPLIT_WIDE",
       "MOJOTREES_GPU_STAGING_SLOTS",
       "MOJOTREES_GPU_TRACE",
       "MOJOTREES_GPU_TRANSFER",
@@ -217,7 +220,7 @@
   },
   "mojo": {
     "abi_promise": "none; Mojo has no stable ABI, so the guarantee is source compatibility only",
-    "export_count": 585,
+    "export_count": 597,
     "export_source": "src/mojotrees/__init__.mojo",
     "exports_by_module": {
       "alternate_boosting": [
@@ -470,6 +473,10 @@
         "check_layout_support",
         "layout_support"
       ],
+      "gpu_categorical": [
+        "CatSetPool",
+        "apply_categorical_split_pooled"
+      ],
       "gpu_frontier": [
         "LeafWorkItem",
         "subtraction_builds_left"
@@ -513,6 +520,16 @@
         "StagingRing",
         "audit_round",
         "bins_fingerprint"
+      ],
+      "gpu_sparse": [
+        "GpuSparseHistogramBuilder",
+        "build_histogram_gpu_sparse"
+      ],
+      "gpu_sparse_layout": [
+        "SparseGpuCapability",
+        "check_sparse_gpu_training",
+        "sparse_gpu_capability",
+        "sparse_gpu_training_is_wired"
       ],
       "gpu_split_search": [
         "GpuSplitParams",
@@ -881,6 +898,12 @@
         "train_gpu",
         "train_gpu_with_valid",
         "train_multiclass_gpu"
+      ],
+      "train_gpu_sparse": [
+        "grow_tree_gpu_sparse",
+        "train_gpu_sparse",
+        "train_gpu_sparse_with_valid",
+        "train_multiclass_gpu_sparse"
       ],
       "trainset": [
         "Dataset",
@@ -1599,6 +1622,16 @@
         "fallback_default": "auto",
         "sites": 1
       },
+      "colsample_bynode": {
+        "canonical": "feature_fraction_bynode",
+        "fallback_default": 1.0,
+        "sites": 2
+      },
+      "colsample_bytree": {
+        "canonical": "feature_fraction",
+        "fallback_default": 1.0,
+        "sites": 2
+      },
       "device_type": {
         "canonical": "device",
         "fallback_default": "cpu",
@@ -1658,6 +1691,8 @@
       "categorical_features": null,
       "cegb_penalty_split": 0.0,
       "cegb_tradeoff": 1.0,
+      "colsample_bynode": null,
+      "colsample_bytree": null,
       "device": "cpu",
       "device_type": null,
       "drop_rate": 0.1,

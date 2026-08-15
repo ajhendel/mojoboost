@@ -321,25 +321,18 @@ class _Config:
         mono_buf, mono_addr = self.base._monotone_buffer(n_features)
         contri_buf, contri_addr = self.base._feature_contri_buffer(n_features)
         keep.extend([ic_flat, ic_offsets, mono_buf, contri_buf])
+        # A sparse dataset is described to the native policy as sparse,
+        # which routes an explicit device='gpu' to the sparse GPU trainer
+        # (fit_csc grows on the compressed matrix, never densifying) and
+        # keeps 'auto' on the CPU. The name resolved here travels in the
+        # params dict and the trainer resolves it again natively, so no
+        # decision is made in Python.
         device = self.base._resolve_device(
             dataset.num_data(),
             n_features,
             self.n_classes if self.task == _eval.MULTICLASS else 1,
+            sparse=bool(getattr(dataset, "is_sparse", False)),
         )
-        if getattr(dataset, "is_sparse", False):
-            # The GPU trainer reads a dense binned matrix, so a sparse
-            # dataset resolves to the CPU rather than being densified. An
-            # explicit device='gpu' is a request that cannot be served and
-            # is refused here, where the caller's own word for it is still
-            # in hand; 'auto' would have picked the CPU anyway on anything
-            # this path can run.
-            if getattr(self.base, "device", "auto") == "gpu":
-                raise RuntimeError(
-                    "sparse input trains on the CPU; there is no sparse GPU "
-                    "kernel yet. Use device='cpu' or device='auto', or "
-                    "densify with .toarray() to train on the GPU."
-                )
-            device = "cpu"
         params = self.base._params(
             0, device, ic_flat, ic_offsets, mono_addr, None, contri_addr
         )

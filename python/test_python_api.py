@@ -1433,15 +1433,21 @@ def test_sparse_validation():
     A, y = make_sparse_regression(200)
     csc = _to_sparse(A, "csc")
 
-    # No sparse GPU kernel, and no silent densification.
-    try:
-        MojoTreesRegressor(device="gpu").fit(csc, y)
-        raise AssertionError("device='gpu' should raise for sparse input")
-    except RuntimeError as exc:
-        # An accelerator-enabled build reaches the sparse capability check;
-        # a CPU-only build correctly refuses the explicit GPU request first.
-        message = str(exc)
-        assert "sparse" in message or "no accelerator" in message
+    # An explicit device='gpu' reaches the sparse GPU trainer on a build
+    # with an accelerator (never densifying), and is refused, not silently
+    # run on the CPU, on a build without one. 'auto' keeps the CPU.
+    from mojotrees import gpu_available
+
+    if gpu_available():
+        on_gpu = MojoTreesRegressor(n_estimators=5, device="gpu").fit(csc, y)
+        assert on_gpu.device_ == "gpu"
+    else:
+        try:
+            MojoTreesRegressor(device="gpu").fit(csc, y)
+            raise AssertionError("device='gpu' should raise with no accelerator")
+        except RuntimeError as exc:
+            assert "accelerator" in str(exc)
+    assert MojoTreesRegressor(n_estimators=2, device="auto").fit(csc, y).device_ == "cpu"
 
     # Custom objectives are dense-only for now.
     try:

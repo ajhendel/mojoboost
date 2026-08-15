@@ -262,22 +262,6 @@ CLASSIFICATION = {
         "LightGBM cegb_* controls, complete and self-contained. Parked until "
         "a trainer accepts the cegb params and the boosting loop hooks it.",
     ),
-    "gpu_categorical": (
-        PENDING,
-        "consolidation_K10",
-        "GPU category statistics; the GPU trainer refuses categoricals. "
-        "Parked until train_gpu accepts categorical specs.",
-    ),
-    "gpu_sparse": (
-        PENDING,
-        "consolidation_K10",
-        "Reached only from gpu_categorical; same unblocker.",
-    ),
-    "gpu_sparse_layout": (
-        PENDING,
-        "consolidation_K10",
-        "Reached only from gpu_sparse; same unblocker.",
-    ),
     "gpu_vendor_policy": (
         EXPERIMENTAL,
         "consolidation_K2",

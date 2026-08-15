@@ -29,7 +29,9 @@ from .binning import BinMapper
 from .boosting import (
     BINARY_LOGISTIC,
     POISSON,
+    Booster,
     BoosterParams,
+    MulticlassBooster,
     _sigmoid,
     _softmax_inplace,
 )
@@ -39,6 +41,7 @@ from .boosting_sparse import (
     train_multiclass_sparse,
     train_sparse,
 )
+from .device import CPU_DEVICE, GPU_DEVICE, resolve_device_full
 from .goss import GossParams
 from .sampling import ClassBaggingParams
 from .model import Model, MulticlassModel
@@ -49,6 +52,7 @@ from .sparse import (
     fit_bins_csc,
     transform_csc,
 )
+from .train_gpu_sparse import train_gpu_sparse, train_multiclass_gpu_sparse
 from .tree import Tree
 
 
@@ -66,10 +70,19 @@ def fit_csc(
     categorical_features: List[Int] = [],
     init_score: List[Float64] = [],
     class_bagging: ClassBaggingParams = ClassBaggingParams.disabled(),
+    device: Int = CPU_DEVICE,
 ) raises -> Model:
     """Fit on a sparse matrix without densifying it. Same arguments and
     semantics as `fit`; the implicit zeros are numerical zeros (see
     sparse.mojo).
+
+    `device` follows the training-time vocabulary in device.mojo. The
+    whole workload is described to the policy (`resolve_device_full`, with
+    `sparse=True`), so an explicit `gpu` that the policy blocks raises with
+    the reason and never falls back; `auto` keeps the CPU for sparse input,
+    since the sparse GPU trainer's crossover is unmeasured. `GPU_DEVICE`
+    reaches `train_gpu_sparse` on the same binned matrix the CPU trainer
+    would get, with the same bags and the same objective layer.
 
     `categorical_features` names the columns to bin as category tables rather
     than quantiles, exactly as in `fit`: `fit_categorical_spec_csc` counts an
@@ -85,25 +98,52 @@ def fit_csc(
     plan is training-time scaffolding and is dropped here, so `mapper` and
     the trees are in the original feature space and nothing about
     `save_model` changes."""
+    var backend = resolve_device_full(
+        device,
+        csc.n_rows,
+        csc.n_features,
+        1,
+        max_bins,
+        objective,
+        sparse=True,
+        categorical=len(categorical_features) > 0,
+        has_missing=use_missing,
+    )
     var mapper = fit_bins_csc(
         csc, max_bins, categorical_features, use_missing
     )
     var prepared = prepare_bundling_csc(
         mapper, transform_csc(mapper, csc), params.bundling
     )
-    var booster = train_sparse(
-        prepared.data,
-        target,
-        objective,
-        params,
-        sample_weight,
-        alpha,
-        bagging,
-        goss,
-        init_score,
-        class_bagging,
-        prepared.bundling,
-    )
+    var booster: Booster
+    if backend == GPU_DEVICE:
+        booster = train_gpu_sparse(
+            prepared.data,
+            target,
+            objective,
+            params,
+            sample_weight,
+            alpha,
+            bagging,
+            goss,
+            init_score,
+            class_bagging,
+            prepared.bundling,
+        )
+    else:
+        booster = train_sparse(
+            prepared.data,
+            target,
+            objective,
+            params,
+            sample_weight,
+            alpha,
+            bagging,
+            goss,
+            init_score,
+            class_bagging,
+            prepared.bundling,
+        )
     return Model(mapper^, booster^)
 
 
@@ -118,28 +158,53 @@ def fit_multiclass_csc(
     use_missing: Bool = True,
     categorical_features: List[Int] = [],
     goss: GossParams = GossParams.disabled(),
+    device: Int = CPU_DEVICE,
 ) raises -> MulticlassModel:
     """Fit a softmax multiclass model on a sparse matrix, labels in
     0..n_classes-1. `goss` draws one gradient-based sample per round, shared
     by every class's tree in that round, as in `fit_multiclass`.
     `params.bundling` carries its `fit_csc` meaning, and the one plan fitted
-    here is shared by every class's tree."""
+    here is shared by every class's tree. `device` carries its `fit_csc`
+    meaning, with `n_classes` trees per round declared to the policy."""
+    var backend = resolve_device_full(
+        device,
+        csc.n_rows,
+        csc.n_features,
+        n_classes,
+        max_bins,
+        sparse=True,
+        categorical=len(categorical_features) > 0,
+        has_missing=use_missing,
+    )
     var mapper = fit_bins_csc(
         csc, max_bins, categorical_features, use_missing
     )
     var prepared = prepare_bundling_csc(
         mapper, transform_csc(mapper, csc), params.bundling
     )
-    var booster = train_multiclass_sparse(
-        prepared.data,
-        labels,
-        n_classes,
-        params,
-        sample_weight,
-        bagging,
-        goss,
-        prepared.bundling,
-    )
+    var booster: MulticlassBooster
+    if backend == GPU_DEVICE:
+        booster = train_multiclass_gpu_sparse(
+            prepared.data,
+            labels,
+            n_classes,
+            params,
+            sample_weight,
+            bagging,
+            goss,
+            prepared.bundling,
+        )
+    else:
+        booster = train_multiclass_sparse(
+            prepared.data,
+            labels,
+            n_classes,
+            params,
+            sample_weight,
+            bagging,
+            goss,
+            prepared.bundling,
+        )
     return MulticlassModel(mapper^, booster^)
 
 

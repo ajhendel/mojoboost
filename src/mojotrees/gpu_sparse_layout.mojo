@@ -951,28 +951,36 @@ def check_bundle_compatibility(
 # elsewhere asserting a fact ("there is no sparse GPU histogram kernel")
 # that stopped being true.
 #
-# The honest distinction it draws, and the reason `training` is a separate
-# field from `histograms`:
+# The distinction it draws, and the reason `training` is a separate field
+# from `histograms`:
 #
-# - the *primitives* are real. `GpuSparseHistogramBuilder` uploads a
-#   compressed matrix, builds a node histogram, and partitions rows and
-#   entries at a split; `gpu_categorical` computes per-category statistics
-#   and routes a categorical split from a device-resident set.
-# - the *training path* is not. No grower drives them, no `device="gpu"`
-#   reaches them, and nothing here will report that it does. A request that
-#   asks for sparse GPU training gets an error naming the missing piece,
-#   never a silent fall back to the CPU trainer while claiming the device.
+# - the *primitives*: `GpuSparseHistogramBuilder` uploads a compressed
+#   matrix, builds a node histogram, and partitions rows and entries at a
+#   split; `gpu_categorical` computes per-category statistics and routes a
+#   categorical split from a device-resident set. `histograms` is whether
+#   they can run on this dataset and device.
+# - the *training path*: `train_gpu_sparse.mojo` drives them, and
+#   `model_sparse.fit_csc` reaches it on `device='gpu'`. `training` is
+#   `histograms` and `sparse_gpu_training_is_wired()` together, so a build
+#   in which the trainer is absent reports the primitives without claiming
+#   the path, and a request for sparse GPU training on a dataset the
+#   primitives cannot take gets an error naming the reason, never a silent
+#   fall back to the CPU trainer while claiming the device.
 
 
 def sparse_gpu_training_is_wired() -> Bool:
     """Whether a sparse GPU *training* path exists.
 
-    Constant `False` today, and deliberately a function rather than a
-    comment: every place that must not claim sparse GPU training reads it,
-    so wiring a trainer is one edit here plus the trainer, and forgetting to
-    flip it fails closed rather than open.
+    True since `train_gpu_sparse.mojo` (`train_gpu_sparse`,
+    `train_gpu_sparse_with_valid`, `train_multiclass_gpu_sparse`) drives the
+    builder and `model_sparse.fit_csc` dispatches to it. Deliberately a
+    function rather than a comment: every place that reports sparse GPU
+    training reads it, so the claim has one source. It was `False` while
+    only the primitives existed, and `check_sparse_gpu_training` raised on
+    every request; the trainer refuses to open a builder whose capability
+    record says `training` is False, so a rollback here fails closed.
     """
-    return False
+    return True
 
 
 @fieldwise_init
@@ -1068,12 +1076,12 @@ def check_sparse_gpu_training(
 ) raises -> SparseGpuCapability:
     """Raise unless a sparse GPU *training* path exists for this dataset.
 
-    This is what an explicit `device="gpu"` request on sparse input must go
-    through. Today it always raises, because `sparse_gpu_training_is_wired`
-    is False: an unsupported shape raises with its own reason, and a
-    perfectly supported one raises saying the primitives exist but nothing
-    drives them. Neither answer is "we ran it on the CPU and called it the
-    device".
+    This is what an explicit `device="gpu"` request on sparse input goes
+    through (`train_gpu_sparse._open_builder` reads the same record off the
+    builder it constructs): an unsupported shape raises with its own reason,
+    and a build without the trainer raises saying the primitives exist but
+    nothing drives them. Neither answer is "we ran it on the CPU and called
+    it the device".
     """
     var capability = check_sparse_gpu_histograms(caps, data)
     if not capability.training:

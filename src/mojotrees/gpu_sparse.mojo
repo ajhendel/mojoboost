@@ -6,19 +6,19 @@ live node owns a contiguous *entry* window per feature as well as a
 contiguous *row* range, and a node's histogram reads only its own stored
 entries plus one sequential pass over its own rows.
 
-Nothing here is wired into training and nothing enables it. There is no
-`device="gpu"` path for sparse input, no automatic switch from the dense
-builder, and no densification anywhere: a `SparseBinnedMatrix` goes to the
-device as a compressed structure and comes back as a `Histogram`. That gap
-is now a value rather than a docstring: `gpu_sparse_layout`'s
-`SparseGpuCapability` records that the primitives are available and the
-training path is not, this builder holds one for its dataset, and
-`check_sparse_gpu_training` is what an explicit sparse `device="gpu"`
-request must go through -- so such a request fails with a reason instead of
-running on the CPU under a device label. See
-`docs/GPU_SPARSE_CATEGORICAL_DESIGN.md` for the design and
-`handoffs/connect_10_sparse_categorical.md` for the integration a training
-path would need.
+`train_gpu_sparse.mojo` drives this builder: `model_sparse.fit_csc` on
+`device="gpu"` reaches `train_gpu_sparse`, which grows every tree through
+one builder per session. There is no automatic switch from the dense
+builder (a sparse matrix is sparse from the caller's first call, and the
+dense GPU trainer never sees one), no `auto` selection of this path (its
+crossover against the CPU sparse trainer is unmeasured, and
+`device_policy` says so), and no densification anywhere: a
+`SparseBinnedMatrix` goes to the device as a compressed structure and comes
+back as a `Histogram`. `gpu_sparse_layout`'s `SparseGpuCapability` is the
+record of what this path can do with one dataset; this builder holds one,
+and the trainer refuses to open a builder whose record says the primitives
+run but training is not wired. See `docs/GPU_SPARSE_CATEGORICAL_DESIGN.md`
+for the design.
 
 Two indexings, both device-resident
 -----------------------------------
@@ -999,9 +999,10 @@ struct GpuSparseHistogramBuilder(Movable):
     var windows: SparseRangeTable
     var capability: SparseGpuCapability
     """What the device path can do with this dataset, recorded at
-    construction. `capability.training` is False, and stays False until a
-    sparse GPU trainer exists: holding the record here means a caller that
-    got a builder still cannot read it as a claim that training is wired."""
+    construction. `capability.training` is what `train_gpu_sparse` reads
+    before it grows anything: holding the record here means a caller that
+    got a builder still cannot read the builder itself as a claim that
+    training is wired."""
     var g_scale: Float64
     var h_scale: Float64
     var has_gradients: Bool

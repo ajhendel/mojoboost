@@ -53,21 +53,21 @@ it, not a second opinion.
 | Module | Kind | Owner | Why it is not reached |
 |---|---|---|---|
 | `backend` | EXPERIMENTAL | connect_01 | A one-function dispatch shim kept as the reference the CPU/GPU equivalence test compares against. Test-only by design |
-| `gpu_categorical` | PENDING | consolidation_K10 | GPU category statistics; the GPU trainer refuses categoricals. Parked until train_gpu accepts categorical specs |
-| `gpu_sparse` | PENDING | consolidation_K10 | Reached only from gpu_categorical; same unblocker |
-| `gpu_sparse_layout` | PENDING | consolidation_K10 | Reached only from gpu_sparse; same unblocker |
 | `gpu_vendor_policy` | EXPERIMENTAL | consolidation_K2 | CUDA and HIP occupancy policy, merged from the gpu_cuda_policy / gpu_amd_policy twins (f23bd1b). Reached only from its test until a discrete-GPU trainer consults it; that is the same status the twins had. handoffs/migration_20_device_policy.md |
 
 Three shapes recur and are worth naming, because they change what a fix
 costs:
 
-- **Chains.** `gpu_sparse_layout` is unreachable only because `gpu_sparse`
-  is. One connecting edge at the head of a chain reaches all of it, so the
-  count of orphans overstates the count of decisions. (`gpu_amd_policy` and
-  `gpu_cuda_policy` were such a chain until the consolidation round merged
-  them into `gpu_vendor_policy`, f23bd1b; `sequence` and `external_memory`
-  were one until the integration round exported both and gave `Dataset` a
-  chunk binding.)
+- **Chains.** One connecting edge at the head of a chain reaches all of
+  it, so the count of orphans overstates the count of decisions.
+  `gpu_categorical` -> `gpu_sparse` -> `gpu_sparse_layout` was the last such
+  chain: `train_gpu_sparse.mojo` (the sparse GPU trainer, reached from
+  `model_sparse.fit_csc` on `device='gpu'` and from the package root)
+  imports the head and the whole chain is now shipped. (`gpu_amd_policy`
+  and `gpu_cuda_policy` were one until the consolidation round merged them
+  into `gpu_vendor_policy`, f23bd1b; `sequence` and `external_memory` were
+  one until the integration round exported both and gave `Dataset` a chunk
+  binding.)
 - **Test-only modules.** `backend` and `gpu_vendor_policy` are imported by
   their own suites and by nothing else. Their tests pass, which is why the
   parity contract can say `focused-tested: yes` and `integrated: no` in the

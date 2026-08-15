@@ -587,11 +587,6 @@ RuntimeError: validation metrics are scored on the CPU; use device='cpu' or devi
 ```
 
 ```text
-RuntimeError: sparse input trains on the CPU; there is no sparse GPU kernel yet.
-Use device='cpu' or device='auto', or densify with .toarray() to train on the GPU.
-```
-
-```text
 RuntimeError: custom objectives train on the CPU; use device='cpu' or device='auto'
 ```
 

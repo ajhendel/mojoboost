@@ -1563,6 +1563,8 @@ def fit_csc(
         _parse_bagging(params),
         _parse_goss(params),
         _parse_use_missing(params),
+        _parse_categorical(params),
+        device=_parse_device(params),
     )
     return PythonObject(alloc=model^)
 
@@ -1588,6 +1590,8 @@ def fit_multiclass_csc(
         weights,
         _parse_bagging(params),
         _parse_use_missing(params),
+        _parse_categorical(params),
+        device=_parse_device(params),
     )
     return PythonObject(alloc=model^)
 

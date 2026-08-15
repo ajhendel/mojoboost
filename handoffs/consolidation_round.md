@@ -514,14 +514,30 @@ What remains, and why (revised 2026-08-15 afternoon, after the GPU session
 committed at aa49cb9 and the second cleanup pass below took the rows that
 had been gated on its files):
 
-- Three native orphans, one chain: `gpu_categorical` -> `gpu_sparse` ->
-  `gpu_sparse_layout`. The GPU trainer refuses categorical specs, so the
-  category-statistics kernels have no caller until `train_gpu` accepts
-  them; that is a feature, not a wiring edit. `gpu_vendor_policy` (no
-  CUDA/HIP device to consult it) and `backend` (the CPU/GPU equivalence
-  reference) stay by design.
-- The audit reports 9 findings and 0 PENDING outside that chain: no
-  duplicate public names, no unused imports, no uncalled bindings.
+- The last orphan chain, `gpu_categorical` -> `gpu_sparse` ->
+  `gpu_sparse_layout`, is shipped (2026-08-15, later the same afternoon):
+  it was the sparse GPU path, not a categorical gap in the dense trainer
+  (which already routed categorical splits). `src/mojotrees/train_gpu_sparse.mojo`
+  mirrors `boosting_sparse.mojo` / `tree_sparse.mojo` over
+  `GpuSparseHistogramBuilder` with categorical splits through `CatSetPool`;
+  `model_sparse.fit_csc` / `fit_multiclass_csc` take `device`;
+  `device_policy` no longer hard-blocks sparse (explicit `gpu` runs it,
+  `auto` keeps the CPU, unmeasured crossover); `sparse_gpu_training_is_wired()`
+  is True; the sparse bindings pass `device` and, a bug found on the way,
+  the categorical indices they had been dropping. `tests/test_gpu_sparse.mojo`
+  13/13 on the M4, `python/tests/test_sparse_gpu.py`, `python/tests`
+  656/656 on a fresh extension build. Refuses bundling by name.
+  `gpu_vendor_policy` (no CUDA/HIP device to consult it) and `backend` (the
+  CPU/GPU equivalence reference) stay by design.
+- The audit reports 6 findings, all EXPERIMENTAL, 0 PENDING: no orphan
+  outside those two, no duplicate public names, no unused imports, no
+  uncalled bindings.
+- Known: `tests/test_gpu_sparse.mojo` takes about twenty minutes under
+  `TestSuite` on the M4 although the same functions called directly run in
+  well under a second each (22 ms against 18 s for one of them); the harness
+  runs host code far slower than a compiled call. That is a property of the
+  harness every suite shares, not of this path, and worth a look by whoever
+  next touches the test runner.
 - Still the GPU session's to decide, none of it a wiring gap: class-batched
   multiclass by default, hybrid leaves reach without the environment
   switches, the distributed GPU device path, the `gpu_frontier`

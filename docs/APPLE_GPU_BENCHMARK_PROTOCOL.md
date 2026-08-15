@@ -107,7 +107,7 @@ what proves it.
 | `w1_small_dense` | 20,000 x 20 | regression | Launch and fixed-cost bound. The shape the GPU is expected to lose on, reported because it is the shape a first-time user tries. |
 | `w2_medium_dense` | 200,000 x 100 | regression | The middle of the range, where the crossover is expected to sit. |
 | `w3_large_dense` | 1,000,000 x 50 | regression | Large enough to matter, small enough for a base-configuration Mac. |
-| `w4_sparse` | 200,000 x 500, 10 nonzeros per row | regression | The sparse path. mojotrees has no sparse GPU kernel, so this workload exists partly to record that as `unsupported`. |
+| `w4_sparse` | 200,000 x 500, 10 nonzeros per row | regression | The sparse path: `train_gpu_sparse` on the device against `train_sparse` on the CPU. Its crossover is unmeasured, which is why `auto` keeps the CPU for sparse input; this workload is the measurement. |
 | `w5_multiclass` | 200,000 x 50, 5 classes | multiclass | Multiplies per-round work and gradient traffic by the class count, which is the shape most sensitive to transfer cost. |
 | `w6_missing_categorical` | 200,000 x 50, 10% missing, 5 categorical columns of 40 levels | regression | The two split paths that are not the plain numerical scan. |
 | `w7_repeated_fit` | 200,000 x 50, 5 fits in one process | regression | Separates one-time cost (library import, kernel compilation, device context, allocation) from steady state. |

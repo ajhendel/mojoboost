@@ -646,8 +646,11 @@ struct DeviceRequest(Copyable, Movable):
     - `n_bins`: the estimator's `max_bin`, or `BINS_UNSPECIFIED`.
     - `objective`: a boosting.mojo objective code, or
       `OBJECTIVE_UNSPECIFIED`.
-    - `sparse`: the input is a sparse matrix. There is no sparse GPU
-      kernel, so this is a hard block.
+    - `sparse`: the input is a sparse matrix. `train_gpu_sparse` grows on
+      the compressed matrix, so an explicit `gpu` runs it; `auto` keeps the
+      CPU, because the sparse path's crossover is unmeasured. Reported and
+      routed, not blocked. Prediction is a different question: there is
+      no sparse device predictor, and `gpu_predict_support` blocks it.
     - `categorical`: the run declares categorical features. The GPU
       grower routes them (`split.is_categorical` in train_gpu.mojo), so
       this is reported, not blocked.
@@ -1149,14 +1152,12 @@ def _collect_blocks(
     # or no features is a caller error and not something the CPU path
     # would have run either.
 
-    if request.sparse:
-        blocks.add(
-            BLOCK_SPARSE_INPUT,
-            String(
-                "sparse input trains on the CPU; there is no sparse GPU"
-                " histogram kernel"
-            ),
-        )
+    # Sparse input is not a block: `train_gpu_sparse` grows on the
+    # compressed matrix through gpu_sparse.mojo. `BLOCK_SPARSE_INPUT` is
+    # kept in the vocabulary because prediction still has no sparse device
+    # kernel (`gpu_predict_support` raises it) and a serialized decision
+    # from an earlier build may name it. Under `auto`, sparse input keeps
+    # the CPU: see `decide_device`.
 
     if request.objective == CUSTOM:
         # `train_custom_gpu` does exist, and it grows trees on the device
@@ -1816,6 +1817,20 @@ def decide_device(
                 request.cells(),
                 " cells, so auto keeps the CPU",
             )
+    elif request.sparse:
+        # The crossover table is measured on dense matrices and the sparse
+        # GPU trainer reads a different structure with different per-node
+        # costs (docs/GPU_SPARSE_CATEGORICAL_DESIGN.md section 10), so no
+        # dense rule transfers to it and none is claimed. Explicit `gpu`
+        # runs it; `MOJOTREES_AUTO_MIN_CELLS` above reaches it, which is
+        # what a crossover benchmark needs.
+        code = DECISION_AUTO_CPU_NO_EVIDENCE
+        message = String(
+            "auto keeps the CPU for sparse input: the sparse GPU trainer's"
+            " crossover against the CPU sparse trainer is unmeasured. Set"
+            " device='gpu' to force it, or MOJOTREES_AUTO_MIN_CELLS to run"
+            " that benchmark"
+        )
     else:
         var rules = crossover_rules()
         var matched = -1
