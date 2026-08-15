@@ -107,13 +107,72 @@ leaves 1.5 seconds of fixed cost per fit that already loses at 250,000 rows.
 **R5, the split gate.** Not measured this session; the 250k and 500k device
 against host comparison is still owed.
 
+## SUPERSEDED IN PART, the same day, by an actual Metal timeline
+
+`docs/METAL_TIMELINE.md` and `bench/results/metal_timeline_2026-08-15/` record
+the first GPU trace this project has ever taken, with `xctrace record` against
+the `Metal System Trace` template. It contradicts the reading of the phase
+shares above, and the contradiction is instructive rather than a defect in
+either instrument.
+
+**The GPU is idle 76.5% of the training span at 200,000 rows, and 87.5% at
+50,000.** Busy time is 552 ms of a 2,347 ms span, confirmed to within 2.4% by
+two independent tables in the trace. It is not a downclock; the device sat at
+its Maximum performance state for 77.9% of the capture.
+
+So the phase shares above are shares of *attributed device work*, not shares of
+wall clock. Compute of every kind is **22.9% of a round**. Reading "histogram
+49.3%" as "half the round is the histogram kernel" was wrong, and it was my
+error rather than the instrument's: the phase profile measures where device
+work is charged, and it cannot see time in which no phase is running at all.
+
+The mechanism is measured, not inferred. The host never blocks on a compute
+kernel, 2 times in 18,701, and blocks on **94.1% of blits**. That is 3,208
+serialization points, **32.1 per round**, which independently reproduces the
+3,100 synchronizations counted above by a completely different instrument. One
+blocking readback costs **606 microseconds** at the median, of which **3.7
+microseconds** is the GPU actually moving bytes. Thirty-two of those is 20.16
+ms of a 23.50 ms round, or **85.8%**.
+
+Which means the `transfer` phase above is not about data movement at all. The
+GPU spends **0.65%** of the span moving bytes. `transfer` is the phase the wait
+gets charged to, and the wait is the product.
+
+**This reorders the plan.** The device-owned tree is not one of two justified
+directions, it is the direction, and its ceiling is higher than the phase
+shares implied. The histogram kernel work drops accordingly: at 22.9% compute,
+a kernel twice as fast buys about a ninth of the round, against a wait that is
+five sixths of it.
+
+Two premises quoted in earlier reviews are refuted from source by the same
+lane. The root grid is 25 feature-pair blocks by 2 row tiles, because Metal
+defaults to feature group 2, not one block per feature. And it is **391 serial
+rows per thread, not roughly 2,000**.
+
+Whether the kernel is latency-bound or bandwidth-bound remains **unanswerable
+on this machine**: Instruments exposes exactly one GPU counter on this M4, `RT
+Unit Active`, which is raytracing. There is no occupancy, ALU, bandwidth or
+cache counter to read.
+
+One incidental finding worth more than it looks. Two of the four captures ran
+**entirely at the Minimum GPU performance state** while the other two ran mostly
+at Maximum, which is the most plausible mechanism anyone has yet identified for
+the two-to-three-fold benchmark drift this repository fights on Apple silicon.
+It is a clock state, not a workload difference, and it means an interleaved
+comparison can still be invalid if the two arms straddle a clock transition.
+
 ## What this profile does not say
 
-- Nothing here is a Metal timeline. Every claim about bubbles between kernels,
+- The Metal timeline above answers what this section originally said was
+  unanswered. What follows is what remains open after it. Every claim about bubbles between kernels,
   occupancy, or whether the histogram kernel is latency-bound rather than
   bandwidth-bound remains arithmetic. A capture is the next cheap thing.
-- The 1.5 second per-fit fixed cost is inferred from three shapes, not
-  attributed. Whether it is session setup, kernel compilation, or per-tree
+- The 1.5 second per-fit fixed cost is now attributed: it is the per-split
+  wait, roughly 3,100 round trips at about 445 microseconds, scaling with trees
+  times leaves rather than with rows. It is not session setup and not kernel
+  compilation, so session reuse and warmup do not touch it.
+- The original text of this bullet, retained so the correction is legible: it
+  was inferred from three shapes, not attributed. Whether it is session setup, kernel compilation, or per-tree
   work is unknown, and `bench/README.md` mentions a 1.6 to 1.9 second session
   setup that may or may not sit inside the timed region.
 - Multiclass, bagging, GOSS, and the real datasets are not in this profile at
