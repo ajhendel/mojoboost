@@ -36,9 +36,10 @@ tier is a property of what the rule needs rather than of the backend:
   `boosting.fit` owns, and refused per grower rather than by name:
   `cegb_penalty_feature_coupled` and `cegb_penalty_feature_lazy`. See
   `cegb.check_cegb_grower_support`.
-- Parsed, validated, and refused by name: `linear_tree`/`linear_lambda` and
-  `feature_pre_filter`. Each names what it would take; see
-  `check_extra_option_supported`.
+- Parsed, validated, and refused by name: `feature_pre_filter`. It names
+  what it would take; see `check_extra_option_supported`. `linear_tree` and
+  `linear_lambda` are `BoosterParams.linear` (linear_tree.mojo), not tree
+  controls, and are live on the metric-path trainers.
 
 `distributed.grow_tree_distributed` keeps private copies of `_search` and
 `_leaf_value` and so honors none of this; `train_gpu`'s device split search
@@ -98,21 +99,15 @@ thread count or the training history. This costs LightGBM-identical streams
 for a given seed, which `sampling.mojo` already documents as an intentional
 difference.
 
-Linear trees are a deferred subsystem, not a missing parameter
---------------------------------------------------------------
-`linear_tree` and `linear_lambda` are deliberately absent, and no flag or
-placeholder for them appears here. A linear tree does not add a control to
-the grower; it changes what a leaf *is*. Each leaf would hold a ridge
-regression over the numerical features on its branch rather than a constant,
-which needs: raw (unbinned) feature values kept alongside the binned matrix,
-a per-leaf normal-equation solve during growth, coefficient storage in
-`Tree` and in the serialized format (a version bump), a different prediction
-path in every predictor including the GPU one, and its own answers for
-missing values, categorical features, and TreeSHAP. That is a subsystem with
-its own task, not a parameter that could be honestly stubbed. Until it
-exists, `check_extra_option_supported` rejects both names by name, which is
-the repository's rule for a real LightGBM feature that is not implemented:
-say so, do not ignore it.
+Linear trees are a subsystem, not a tree control
+------------------------------------------------
+`linear_tree` and `linear_lambda` are deliberately absent here. A linear
+tree does not add a control to the grower; it changes what a leaf *is*.
+That subsystem is `linear_tree.mojo`: `BoosterParams.linear` switches it
+on, the metric-path trainers (`custom_metric.mojo`) fit each grown tree's
+leaves from the raw matrix, `Booster.linear` carries the sidecar, and
+`serialize.mojo` writes it as the v5 `linear` section. Growth itself is
+untouched, which is why nothing in this module knows about it.
 """
 
 from .cegb import CegbConfig
@@ -999,26 +994,6 @@ def check_extra_option_supported(name: String) raises:
     would take, never an "unknown parameter" message and never silence.
     Names this module *does* implement are not listed here.
     """
-    if name == "linear_tree":
-        raise Error(
-            "'linear_tree' is not implemented; a linear tree replaces each"
-            " leaf's constant with a ridge regression over its branch's"
-            " numerical features, which needs raw feature values during"
-            " growth, per-leaf coefficients in the model and in the"
-            " serialized format, and a different prediction path on every"
-            " backend. It is a deferred subsystem, not a tree parameter"
-        )
-    if name == "linear_lambda":
-        raise Error(
-            "'linear_lambda' is not implemented; it regularizes the per-leaf"
-            " regression of 'linear_tree', which is a deferred subsystem"
-        )
-    # The four cegb_* names are implemented (cegb.mojo) and are not refused
-    # here. The two that need the per-ensemble ledger are refused per grower
-    # instead, by `cegb.check_cegb_grower_support` at `tree._search`, because
-    # whether they can be honored is a property of the backend and not of the
-    # name: the dense CPU grower carries the ledger and the node's row ids,
-    # and every other grower says so rather than ignoring the setting.
     if name == "feature_pre_filter":
         raise Error(
             "'feature_pre_filter' is not implemented. It is a Dataset"
