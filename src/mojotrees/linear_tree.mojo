@@ -4,9 +4,9 @@ A linear tree routes exactly as an ordinary tree does and then, at the leaf,
 emits an affine function of a few raw features instead of a constant. This
 module owns that leaf: the sufficient statistics, the regularized solve, the
 eligibility rules, the numerical fallbacks, the prediction arithmetic, and
-the bytes the model format would have to gain. Nothing here is reachable
-from a public entry point; `check_linear_tree_public` says so and names what
-is missing (see "Reachability" below).
+the bytes the model format gained. It is reachable from a public entry
+point now; `linear_tree_available` reports that, and "Reachability" below
+names the consumers that still cannot evaluate a linear leaf.
 
 Why a sidecar and not a field on `Tree`
 ---------------------------------------
@@ -312,7 +312,7 @@ LightGBM differences
   row is included has not been read off its source, so this is stated as a
   mojotrees choice and flagged in `docs/LINEAR_TREES.md` as parity-unverified.
 - **Missing values.** The eligibility rule and the centre substitution above
-  are mojotrees-defined. LightGBM's behaviour here has not been read off its
+  are mojotrees-defined. LightGBM's behavior here has not been read off its
   source.
 - **`ridge_eps`, `max_leaf_features`, `min_data_per_linear_feature`, and
   `max_linear_deviation`** have no LightGBM counterpart. All four default to
@@ -321,15 +321,19 @@ LightGBM differences
 
 Reachability
 ------------
-The feature is not public and must not become public before the
-representation is real. `tree_parameters_extra.check_extra_option_supported`
-refuses `linear_tree` and `linear_lambda` by name, `params.mojo` routes
-through it, and `lgbm_model_io.mojo` refuses `is_linear=1`, `leaf_const`,
-and `leaf_coeff` on the way in. None of that changes here.
-`check_linear_tree_public` is the one gate inside this module: it raises
-with the list of cross-lane changes that are still outstanding, and
-`handoffs/remaining_03_linear_trees.md` carries each of them as a
-ready-to-apply patch.
+The feature is public. `params.mojo` parses `linear_tree` and
+`linear_lambda` into `BoosterParams.linear`, the metric-path trainers fit
+the sidecar, `model.Model` and `MulticlassModel` predict through it,
+`serialize.mojo` writes and reads the v5 `linear` section, and
+`linear_tree_available` reports all of that as a Bool.
+
+What is still refused, and refused by name rather than ignored, is the set
+of consumers that cannot evaluate an affine leaf:
+`check_linear_tree_unconnected` is the gate inside this module, called by
+the binned-only trainers, the ranking trainers, `contrib.mojo`, and
+`gpu_predict.mojo`, and each refusal names the raw-feature entry point to
+use instead. `lgbm_model_io.mojo` separately refuses `is_linear=1`,
+`leaf_const`, and `leaf_coeff` on the way in.
 """
 
 from std.math import isfinite, sqrt
@@ -386,7 +390,7 @@ comptime LINEAR_SECTION_REVISION = 1
 # matrix, `model.Model` / `MulticlassModel` predict through it,
 # `serialize.mojo` writes and reads the v5 `linear` section, and
 # `BoosterParams.linear` (LightGBM's `linear_tree` / `linear_lambda`) is the
-# switch. `check_linear_tree_public` still names what is *not* connected.
+# switch. `check_linear_tree_unconnected` names what is *not* connected.
 comptime LINEAR_TREE_PUBLIC = True
 
 # A column whose in-leaf hessian-weighted variance is at or below this
@@ -984,33 +988,6 @@ def check_continuation_compatible(
             n_features,
             " now",
         )
-
-
-def check_linear_tree_public() raises:
-    """Raise: linear trees are not reachable from a public entry point.
-
-    Called by anything that would expose the feature. The message names what
-    is outstanding, because "not implemented" without a list is what makes a
-    deferred subsystem look like a bug.
-    """
-    if LINEAR_TREE_PUBLIC:
-        return
-    # Kept as the record of what the connection took; every item below
-    # landed except the three named in `check_linear_tree_unconnected`.
-    raise Error(
-        "linear trees are implemented but not connected. The algorithm core"
-        " (linear_tree.mojo) fits, predicts, validates, and serializes"
-        " per-leaf coefficients, but reaching it needs, in other lanes: a"
-        " `linear` field on Booster and MulticlassBooster; the raw feature"
-        " matrix kept alongside the binned one through training and"
-        " continued training; the v4 `linear` section wired into"
-        " serialize.mojo; a linear-aware raw-score pass in boosting.mojo;"
-        " explicit refusals in contrib.mojo, gpu_predict.mojo, and"
-        " lgbm_model_io.mojo; leaf_const/leaf_coeff in model_dump.mojo;"
-        " LinearEnsemble.scale_all beside DART's weight folding in"
-        " alternate_boosting.mojo; and the parameter accepted by params.mojo"
-        " instead of refused. See handoffs/remaining_03_linear_trees.md"
-    )
 
 
 def linear_tree_available() -> Bool:
