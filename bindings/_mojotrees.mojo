@@ -90,6 +90,24 @@ from inspection_bindings import (
     split_values,
     split_values_multiclass,
 )
+from model_editing_bindings import (
+    get_leaf_output,
+    get_leaf_output_multiclass,
+    model_editing_operations,
+    model_editing_status,
+    refit,
+    refit_multiclass,
+    rollback_one_iter,
+    rollback_one_iter_multiclass,
+    rollback_to,
+    rollback_to_multiclass,
+    score_bounds,
+    score_bounds_multiclass,
+    set_leaf_output,
+    set_leaf_output_multiclass,
+    shuffle_models,
+    shuffle_models_multiclass,
+)
 from objective_bindings import (
     check_objective_param,
     metric_code_of_name,
@@ -396,6 +414,29 @@ def PyInit__mojotrees() abi("C") -> PythonObject:
         m.def_function[dump_leaf_index_multiclass](
             "dump_leaf_index_multiclass"
         )
+        # -- editing a fitted model (model_editing_bindings.mojo) ---------
+        m.def_function[model_editing_status]("model_editing_status")
+        m.def_function[model_editing_operations]("model_editing_operations")
+        m.def_function[rollback_one_iter]("rollback_one_iter")
+        m.def_function[rollback_one_iter_multiclass](
+            "rollback_one_iter_multiclass"
+        )
+        m.def_function[rollback_to]("rollback_to")
+        m.def_function[rollback_to_multiclass]("rollback_to_multiclass")
+        m.def_function[get_leaf_output]("get_leaf_output")
+        m.def_function[get_leaf_output_multiclass](
+            "get_leaf_output_multiclass"
+        )
+        m.def_function[set_leaf_output]("set_leaf_output")
+        m.def_function[set_leaf_output_multiclass](
+            "set_leaf_output_multiclass"
+        )
+        m.def_function[shuffle_models]("shuffle_models")
+        m.def_function[shuffle_models_multiclass]("shuffle_models_multiclass")
+        m.def_function[refit]("refit")
+        m.def_function[refit_multiclass]("refit_multiclass")
+        m.def_function[score_bounds]("score_bounds")
+        m.def_function[score_bounds_multiclass]("score_bounds_multiclass")
         m.def_function[dump_model_json]("dump_model_json")
         m.def_function[dump_model_json_multiclass](
             "dump_model_json_multiclass"

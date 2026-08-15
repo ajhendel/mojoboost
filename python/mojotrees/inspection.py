@@ -107,10 +107,13 @@ DUMP_FORMAT_VERSION = 1
 SUPPORTED_MODEL_FORMAT_VERSIONS = (1, 2, 3, 4)
 
 #: Whether this build can edit a fitted model in place. Mirrors
-#: `MODEL_EDITING_SUPPORTED` in src/mojotrees/inspection.mojo, which is
-#: where the decision is stated; `model_editing_support()` gives the
-#: reasons. A consumer branches on this rather than on `hasattr`.
-MODEL_EDITING_SUPPORTED = False
+#: `MODEL_EDITING_SUPPORTED` in src/mojotrees/model_editing.mojo (re-exported
+#: by src/mojotrees/inspection.mojo), which is where the claim is made and
+#: checked; `model_editing_support()` lists the operations. The Python
+#: entry points are `Booster.rollback_one_iter`, `Booster.set_leaf_output`,
+#: `Booster.shuffle_models`, `Booster.refit`, `Booster.lower_bound` and
+#: `Booster.upper_bound`.
+MODEL_EDITING_SUPPORTED = True
 
 #: Objective code to LightGBM's canonical name for it. The codes are the
 #: trainer's, declared in src/mojotrees/boosting.mojo and mirrored by the
@@ -651,39 +654,43 @@ def leaf_outputs(model, tree_index=None, dump=None):
 
 
 def model_editing_support():
-    """Whether a fitted model can be edited in place, and why not.
+    """Whether a fitted model can be edited in place, and which operations
+    that covers.
 
     An explicit status rather than a missing method, so a consumer asking
-    "can I set a leaf value?" gets an answer to branch on. The reasons are
-    the invariants a fitted tree records about the fit that produced it:
-    an arbitrary leaf edit falsifies each one and leaves it in place, and
-    both node covers and split gains are serialized (model format v4), so
-    the contradiction would outlive the session that made it.
-
-    `src/mojotrees/inspection.mojo` states the same status natively, in
-    `model_editing_status_json`; the two move together.
+    "can I set a leaf value?" gets an answer to branch on. The answer is
+    the native one (`model_editing.model_editing_status_json`) when the
+    extension is present: `supported`, the leaf numbering (`leaf_index`
+    is `ordinal`, the numbers `predict(pred_leaf=True)` reports), and one
+    record per operation with `supported` and `reason`. Every mutator keeps
+    the invariants a fitted tree records: routing and node covers are never
+    changed by a leaf write, a monotone claim is re-verified, and every
+    result stays loadable by this build.
     """
+    import json
+
+    from . import _mojotrees
+
+    status = getattr(_mojotrees, "model_editing_status", None)
+    if status is not None:
+        out = json.loads(str(status()))
+        out["supported"] = bool(out.get("supported", MODEL_EDITING_SUPPORTED))
+        return out
     return {
         "supported": MODEL_EDITING_SUPPORTED,
-        "operation": "set_leaf_output",
-        "reason": (
-            "a fitted tree records facts about the fit that produced it; "
-            "an arbitrary leaf edit falsifies them and leaves them in place"
-        ),
-        "invariants": [
-            "node covers are the training rows that reached a node, and "
-            "exact feature contributions condition on them",
-            "an internal node's value is the value it held when it was "
-            "created, not a function of its children",
-            "a split gain was computed from the gradient sums a leaf held "
-            "at growth time, which the tree no longer holds",
+        "leaf_index": "ordinal",
+        "leaf_value_is_shrunk": True,
+        "operations": [
+            {"operation": name, "supported": True, "reason": reason}
+            for name, reason in (
+                ("rollback_one_iter", "drops whole iterations; DART refused"),
+                ("set_leaf_output", "routing and covers unchanged; monotone claim re-verified"),
+                ("shuffle_models", "whole iterations move; softmax rounds stay together"),
+                ("refit", "leaf values only, tree shapes kept"),
+                ("lower_bound", "sound bound from per-tree leaf extremes"),
+                ("upper_bound", "sound bound from per-tree leaf extremes"),
+            )
         ],
-        "serialized_state": ["count", "split_gain"],
-        # The newest format this build reads, which is also the one it
-        # writes: it is what makes the contradiction durable rather than
-        # confined to the session that made the edit.
-        "model_format_version": max(SUPPORTED_MODEL_FORMAT_VERSIONS),
-        "read_only_alternative": "leaf_outputs",
     }
 
 

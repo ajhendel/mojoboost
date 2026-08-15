@@ -1076,6 +1076,220 @@ class Booster:
             f"{self.num_feature()} features)"
         )
 
+    # -- editing ---------------------------------------------------------
+    #
+    # LightGBM's Booster mutators, implemented in
+    # src/mojotrees/model_editing.mojo and reached through
+    # bindings/model_editing_bindings.mojo. Every one of them writes the
+    # handle in place; each checks the invariants a fitted model records
+    # (routing, covers, the monotone claim, loadability) before it returns,
+    # so an edit cannot produce a model this build can hold but not read
+    # back. Leaf values are on LightGBM's scale: what the leaf contributes
+    # to a raw score. Leaf ids are mojotrees's leaf ordinals, the numbers
+    # `predict(pred_leaf=True)` reports.
+
+    _EDIT_MODES = {"gbdt": 0, "rf": 1, "dart": 2}
+
+    def _edit_mode(self):
+        """The boosting mode the ensemble was trained under, which rollback
+        needs: a forest rescales its 1/K rate, DART refuses. A model read
+        back from a file carries no mode and is treated as gbdt."""
+        base = getattr(self._config, "base", None)
+        return self._EDIT_MODES.get(
+            str(getattr(base, "boosting_type", "gbdt") or "gbdt"), 0
+        )
+
+    def _edited(self):
+        self._importance_cache = None
+
+    def rollback_one_iter(self):
+        """Drop the last boosting iteration in place; returns self.
+
+        LightGBM's `rollback_one_iter`. Any `best_iteration` a caller kept
+        from early stopping no longer names the same model afterwards.
+        """
+        mode = self._edit_mode()
+        if self._n_classes:
+            _mojotrees.rollback_one_iter_multiclass(self._handle, mode)
+        else:
+            _mojotrees.rollback_one_iter(self._handle, mode)
+        self._edited()
+        return self
+
+    def rollback_to(self, num_iteration):
+        """Truncate the ensemble to its first `num_iteration` iterations in
+        place; returns self."""
+        mode = self._edit_mode()
+        if self._n_classes:
+            _mojotrees.rollback_to_multiclass(
+                self._handle, int(num_iteration), mode
+            )
+        else:
+            _mojotrees.rollback_to(self._handle, int(num_iteration), mode)
+        self._edited()
+        return self
+
+    def get_leaf_output(self, tree_id, leaf_id):
+        """The value leaf `leaf_id` of tree `tree_id` contributes to a raw
+        score. LightGBM's `get_leaf_output`; for a softmax model `tree_id`
+        indexes the round-major tree list, so tree `i * n_classes + k` is
+        class `k` of iteration `i`."""
+        if self._n_classes:
+            it, cls = divmod(int(tree_id), self._n_classes)
+            return float(
+                _mojotrees.get_leaf_output_multiclass(
+                    self._handle, it, cls, int(leaf_id)
+                )
+            )
+        return float(
+            _mojotrees.get_leaf_output(self._handle, int(tree_id), int(leaf_id))
+        )
+
+    def set_leaf_output(self, tree_id, leaf_id, value, on_monotone="clamp"):
+        """Set the value leaf `leaf_id` of tree `tree_id` contributes to a
+        raw score, in place; returns self.
+
+        LightGBM's `set_leaf_output`. A model trained with monotone
+        constraints keeps its claim: the value is clamped into the leaf's
+        admissible interval (`on_monotone="clamp"`, the default) or the
+        write is refused (`on_monotone="reject"`); `get_leaf_output`
+        reports what was actually stored.
+        """
+        policy = {"clamp": 0, "reject": 1}.get(on_monotone)
+        if policy is None:
+            raise ValueError("on_monotone must be 'clamp' or 'reject'")
+        if self._n_classes:
+            it, cls = divmod(int(tree_id), self._n_classes)
+            _mojotrees.set_leaf_output_multiclass(
+                self._handle, it, cls, int(leaf_id), float(value), policy
+            )
+        else:
+            _mojotrees.set_leaf_output(
+                self._handle, int(tree_id), int(leaf_id), float(value), policy
+            )
+        self._edited()
+        return self
+
+    def shuffle_models(self, start_iteration=0, end_iteration=-1, seed=0):
+        """Shuffle the order of the iterations in
+        `[start_iteration, end_iteration)` in place; returns self.
+
+        LightGBM's `shuffle_models`, seeded so the same call gives the
+        same order on every platform. A negative `end_iteration` means the
+        end. Whole softmax rounds move together, so a tree never changes
+        class.
+        """
+        stop = int(end_iteration)
+        if stop < 0:
+            stop = self.current_iteration()
+        if self._n_classes:
+            _mojotrees.shuffle_models_multiclass(
+                self._handle, int(seed), int(start_iteration), stop
+            )
+        else:
+            _mojotrees.shuffle_models(
+                self._handle, int(seed), int(start_iteration), stop
+            )
+        self._edited()
+        return self
+
+    def refit(
+        self,
+        data,
+        label=None,
+        decay_rate=0.9,
+        weight=None,
+        init_score=None,
+        min_data_in_leaf=1,
+        recount=True,
+        **dataset_kwargs,
+    ):
+        """Refit every leaf value from new data, keeping every tree's shape,
+        in place; returns a dict reporting what changed.
+
+        LightGBM's `Booster.refit`: `data` is a `Dataset` or a matrix with
+        `label`, and the new leaf value is
+        `decay_rate * old + (1 - decay_rate) * fresh`. Node covers are
+        recomputed from the refit data unless `recount=False`. Routing,
+        internal values, split gains, the base score, and the learning rate
+        do not change. `min_data_in_leaf` leaves a leaf alone when fewer
+        rows reach it. A ranking model has no refit: its objective has no
+        per-row Newton step.
+        """
+        if isinstance(data, Dataset):
+            dataset = data
+        else:
+            dataset = Dataset(
+                data,
+                label=label,
+                weight=weight,
+                init_score=init_score,
+                reference=self._train_set,
+                **dataset_kwargs,
+            )
+        if self._train_set is not None and dataset is not self._train_set:
+            dataset._check_reference(self._train_set)
+        base = getattr(self._config, "base", None)
+
+        def _leaf(name, alias, default):
+            if base is None:
+                return default
+            return float(base._resolve_alias(name, alias, default))
+
+        lambda_l2 = _leaf("lambda_l2", "reg_lambda", 1.0)
+        lambda_l1 = _leaf("lambda_l1", "reg_alpha", 0.0)
+        max_delta_step = float(getattr(base, "max_delta_step", 0.0) or 0.0)
+        path_smooth = float(getattr(base, "path_smooth", 0.0) or 0.0)
+        handle = dataset._constructed()
+        if self._n_classes:
+            report = _mojotrees.refit_multiclass(
+                self._handle,
+                handle,
+                float(decay_rate),
+                int(min_data_in_leaf),
+                1 if recount else 0,
+                lambda_l2,
+                lambda_l1,
+                max_delta_step,
+                path_smooth,
+            )
+        else:
+            alpha = float(getattr(self._config, "alpha", 0.9))
+            report = _mojotrees.refit(
+                self._handle,
+                handle,
+                float(decay_rate),
+                int(min_data_in_leaf),
+                1 if recount else 0,
+                lambda_l2,
+                lambda_l1,
+                max_delta_step,
+                path_smooth,
+                alpha,
+            )
+        self._edited()
+        return {str(k): int(v) for k, v in dict(report).items()}
+
+    def lower_bound(self, raw_score=True):
+        """A lower bound on every raw score the model can produce (or on the
+        response when `raw_score=False`). LightGBM's `lower_bound`. For a
+        softmax model, a list with one bound per class."""
+        return self._bounds(raw_score)[0]
+
+    def upper_bound(self, raw_score=True):
+        """The matching upper bound; LightGBM's `upper_bound`."""
+        return self._bounds(raw_score)[1]
+
+    def _bounds(self, raw_score):
+        response = 0 if raw_score else 1
+        if self._n_classes:
+            pairs = _mojotrees.score_bounds_multiclass(self._handle, response)
+            lows = [float(p[0]) for p in pairs]
+            highs = [float(p[1]) for p in pairs]
+            return lows, highs
+        pair = _mojotrees.score_bounds(self._handle, response)
+        return float(pair[0]), float(pair[1])
+
     # -- prediction ------------------------------------------------------
 
     def _predict_data(self, data):
