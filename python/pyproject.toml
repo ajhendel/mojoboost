@@ -32,7 +32,7 @@ name = "mojotrees"
 # python/mojotrees/__init__.py. Release gate item B1 checks that they do.
 # Deliberately not made dynamic from `mojotrees.__version__`: that would
 # delete this row and contradict a policy this file does not own.
-version = "0.1.0"
+version = "0.1.0a3"
 description = "Gradient boosted decision trees in Mojo, with a scikit-learn style Python API"
 readme = "README.md"
 requires-python = ">=3.14"
