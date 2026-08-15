@@ -6,15 +6,33 @@ repository preparation and read-only verification can be automated.
 
 ## Status
 
-As of 2026-08-15, the pipeline in this document has been exercised end to
-end, but under the project's FORMER name. The name `mojotrees` is NOT yet
-claimed on either index. Sections 3 and 4 have to be run again under the
-new name, starting from the pending publishers described below.
+**`mojotrees 0.1.0a2` is live on PyPI as of 2026-08-15T14:14:48Z.** The
+name is claimed, the pending publisher converted to a real one on that
+upload, and the artifact is
+`mojotrees-0.1.0a2-cp314-cp314-macosx_26_0_arm64.whl` (2,237,257 bytes)
+built from tag `v0.1.0a2` at commit `142e32f`, with SBOM and attestations.
+Verified after the fact from a clean CPython 3.14 venv against the real
+index (`pip install --pre mojotrees`, import, train, and
+`packaging/smoke_test.py`, which reports the stdlib fallback path).
+
+**The TestPyPI rehearsal for this name was SKIPPED.** Section 3 was not
+run under `mojotrees`; the release went straight to PyPI at the owner's
+instruction. So the TestPyPI publisher for `mojotrees` is still PENDING
+and has never been exercised, and `mojotrees` does not exist on TestPyPI.
+The next person to run section 3 will be proving that publisher for the
+first time. The justification for skipping was that a rejected upload does
+not consume the version number, so the downside was a retry rather than a
+burned release; that reasoning holds only while the version is one nobody
+depends on.
+
+Note that section 4's sequencing argument below is therefore no longer
+describing what happened. Read it as the intended procedure, not the
+record.
 
 The GitHub environments `testpypi` and `pypi` exist and are restricted to
-the `main` branch. `pypi` requires a review by the owner before its publish
-job runs; `testpypi` does not. No API token exists anywhere and none is
-needed.
+the `main` branch. Neither requires a reviewer: required reviewers were
+removed from `pypi` on 2026-08-15 (see section 1 step 4). No API token
+exists anywhere and none is needed.
 
 THE 2026-08-15 RENAME RESET THE PUBLISHER STATE. The trusted publishers
 that had each published once belong to the `mojoboost` projects and are
@@ -25,8 +43,9 @@ dead. `mojotrees` was registered as a PENDING publisher on both indexes
 (owner `mojotrees`, repository `mojotrees`, workflow
 `release-provenance.yml`, environment `pypi` on PyPI and `testpypi` on
 TestPyPI). A pending publisher is invisible from outside the account and
-becomes real only on first upload, so the section 3 TestPyPI run is the
-first thing that can prove it works.
+becomes real only on first upload. The PyPI one has since been proven by
+the 0.1.0a2 upload and is now a normal publisher; the TestPyPI one is
+still pending and unproven.
 
 `mojoboost 0.1.0.dev1` is live on TestPyPI (the section 3 rehearsal, tag
 `v0.1.0.dev1`) and `mojoboost 0.1.0a1` is live on PyPI (the pre-release
@@ -43,12 +62,19 @@ CPython 3.14 venv against the real index followed by
 bugs (the provenance sidecar path in the SBOM job, and a pypi-publish pin
 too old for Metadata-Version 2.4) before any real version was spent.
 
-The version in the repository is now 0.1.0a2, the first version to be
-published under the `mojotrees` name. `0.1.0a1` was NOT reused: tag
+The version in the repository is back at 0.1.0, which has not been
+published. The 0.1.0a2 version commit was reverted per section 3 step 6;
+the tag `v0.1.0a2` stays, because it records the commit the published
+artifact came from. `0.1.0a1` was NOT reused for this release: tag
 `v0.1.0a1` already marks the commit that produced the published
 `mojoboost` wheel, and pointing it at a different artifact would make the
-provenance record lie. Per section 3 the version commit is reverted back
-to 0.1.0 after the release lands; the tags stay.
+provenance record lie.
+
+Plain `pip install mojotrees` still resolves to nothing installable,
+because 0.1.0a2 is a pre-release and pip skips those. That is intended.
+The install line everywhere in this repository is
+`pip install --pre mojotrees`, and it stays that way until a final version
+ships under the section 12 release gate.
 
 ## What this document does not decide
 
@@ -155,11 +181,25 @@ Do this on **TestPyPI first**, then PyPI, with identical values.
    All five fields are matched exactly on every upload. A rename of the
    workflow file, of the repository, or of the GitHub account breaks
    publishing until the publisher is edited, which is the point.
-4. In GitHub, Settings then Environments, create `pypi` and `testpypi`.
-   On `pypi` set **Required reviewers** to yourself and restrict
-   deployment to the `main` branch and to tags. That turns a production
-   upload into something a human approves in the GitHub UI at the moment
-   it happens, and it is the only interactive gate in this procedure.
+4. In GitHub, Settings then Environments, create `pypi` and `testpypi`,
+   and restrict deployment on both to the `main` branch and to tags, so
+   the release identity cannot be exercised from an arbitrary branch.
+
+   **Required reviewers were removed from `pypi` on 2026-08-15**, at the
+   owner's instruction, after the 0.1.0a2 release. It had been set to the
+   owner, which made a production upload something a human approved in the
+   GitHub UI at the moment it happened. It is gone because on a
+   single-maintainer project the approver and the dispatcher are the same
+   person, so the click authenticated nothing and only added friction to a
+   workflow that is already manual-dispatch-only.
+
+   Know what that costs. A production upload is now a consequence of
+   dispatching the run rather than a separate act. The remaining controls
+   are that the workflow has no `push` or `release` trigger so every
+   publication is still started by a human on purpose, the branch policy
+   above, and trusted publishing itself. If a second maintainer ever gains
+   push access, put required reviewers back: at that point it starts
+   authenticating something real.
 
    The environments hold no secrets. That is the intended end state.
 
@@ -299,7 +339,8 @@ is proved end to end on the real index, and nobody who types
 2. Run `Release provenance` with `publish` set to `pypi`. The tag does not
    trigger it. There is deliberately no `push` or `release` trigger on
    that workflow, so every publication is something a human started.
-3. Approve the `pypi` environment when GitHub asks.
+3. No approval step. Required reviewers were removed on 2026-08-15, so
+   the publish job runs as soon as its dependencies finish.
 4. Verify, as in step 3 but against PyPI:
 
    ```
@@ -342,7 +383,8 @@ Then:
 2. Run `Release provenance` with `publish` set to `testpypi`. Install from
    TestPyPI in a clean venv and confirm it works, exactly as in step 3.
 3. Run it again with `publish` set to `pypi`, from the same commit.
-4. Approve the `pypi` environment. The publish job downloads the wheel
+4. No approval step; required reviewers were removed on 2026-08-15. The
+   publish job runs straight through. It downloads the wheel
    built earlier in that run, checks nothing else is in the directory, and
    uploads. It checks out no source and runs no repository code.
 5. Verify hashes, below.

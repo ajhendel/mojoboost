@@ -120,8 +120,11 @@ and the approval is recorded. That is the only reason the split between the
 The environment is where the controls that cannot live in a workflow file go,
 because a workflow file can be edited by whoever can push:
 
-- required reviewers, so approval is a second action rather than a consequence
-  of dispatching the run
+- required reviewers, REMOVED from `pypi` on 2026-08-15 at the owner's
+  instruction. It had made approval a second action rather than a consequence
+  of dispatching the run. On a single-maintainer project the approver and the
+  dispatcher are the same person, so it authenticated nothing. Restore it the
+  moment a second person has push access
 - a deployment branch rule limiting the environment to `main` and to tags, so
   the release identity cannot be exercised from an arbitrary branch
 - a wait timer, optional, and useful for exactly one reason, which is that it
