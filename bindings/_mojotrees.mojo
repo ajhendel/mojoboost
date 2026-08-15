@@ -72,7 +72,9 @@ from basic_bindings import (
 from distributed_bindings import (
     distributed_capability,
     distributed_check_machine_list,
+    distributed_gpu_status,
     distributed_status_message,
+    train_local_world,
     transport_status_message,
 )
 from inspection_bindings import (
@@ -477,6 +479,8 @@ def PyInit__mojotrees() abi("C") -> PythonObject:
             "distributed_status_message"
         )
         m.def_function[transport_status_message]("transport_status_message")
+        m.def_function[distributed_gpu_status]("distributed_gpu_status")
+        m.def_function[distributed_train_local]("distributed_train_local")
         # -- startup diagnostics -----------------------------------------
         m.def_function[startup_phase_contract]("startup_phase_contract")
         m.def_function[startup_environment]("startup_environment")
@@ -888,6 +892,42 @@ def fit(
         _parse_goss(params),
         use_missing=_parse_use_missing(params),
         categorical_features=_parse_categorical(params),
+    )
+    return PythonObject(alloc=model^)
+
+
+def distributed_train_local(
+    x_addr: PythonObject,
+    n_rows: PythonObject,
+    n_features: PythonObject,
+    y_addr: PythonObject,
+    objective: PythonObject,
+    params: PythonObject,
+) raises -> PythonObject:
+    """Train over a world of `params["num_machines"]` ranks hosted in this
+    process with LightGBM's `tree_learner` (`params["tree_learner"]`:
+    serial, data, feature, voting) and `params["top_k"]`. Same buffers and
+    params dict as `fit` otherwise; CPU only; returns the same Model handle
+    `fit` returns."""
+    var nr = Int(py=n_rows)
+    var nf = Int(py=n_features)
+    var features = _f64_view(Int(py=x_addr), nr * nf)
+    var target = _f64_list(Int(py=y_addr), nr)
+    var bp = _parse_params(params, nf, cpu=True)
+    var weights = _parse_weights(params, nr)
+    var model = train_local_world(
+        features,
+        nr,
+        nf,
+        target,
+        Int(py=objective),
+        bp,
+        Int(py=params["max_bin"]),
+        weights,
+        Float64(py=params["alpha"]),
+        Int(py=params["num_machines"]),
+        String(py=params["tree_learner"]),
+        Int(py=params["top_k"]),
     )
     return PythonObject(alloc=model^)
 

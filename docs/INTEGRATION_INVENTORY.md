@@ -54,8 +54,6 @@ it, not a second opinion.
 |---|---|---|---|
 | `backend` | EXPERIMENTAL | connect_01 | A one-function dispatch shim kept as the reference the CPU/GPU equivalence test compares against. Test-only by design |
 | `cegb` | PENDING | consolidation_K10 | LightGBM cegb_* controls, complete and self-contained. Parked until a trainer accepts the cegb params and the boosting loop hooks it |
-| `distributed_gpu` | EXPERIMENTAL | consolidation_K9 | Host-arithmetic contract for a distributed fixed-point GPU histogram exchange; require_distributed_gpu refuses it until HAS_DEVICE_COLLECTIVE, transport_available(), and GPU_SPEEDUP_GATE_MET all hold. Parked, not superseded; its constants now come from quantized_gradient |
-| `distributed_strategies` | EXPERIMENTAL | consolidation_K9 | Feature-parallel and voting-parallel cores over Collective; self-gated by require_strategy_operational, which refuses both modes until transport_available() is True. Parked, not superseded: distributed.mojo implements only data parallel |
 | `gpu_categorical` | PENDING | consolidation_K10 | GPU category statistics; the GPU trainer refuses categoricals. Parked until train_gpu accepts categorical specs |
 | `gpu_sparse` | PENDING | consolidation_K10 | Reached only from gpu_categorical; same unblocker |
 | `gpu_sparse_layout` | PENDING | consolidation_K10 | Reached only from gpu_sparse; same unblocker |

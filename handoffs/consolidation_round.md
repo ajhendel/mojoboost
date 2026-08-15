@@ -343,3 +343,29 @@ unused because `__init__.mojo` still imports the name from `.validation`
 (swap it to `.sequence` when `__init__.mojo` is free); pyarrow and polars
 are not in the pixi env, so the Arrow/polars smoke ran against a scratch
 install and no CI test covers them.
+
+W6 (distributed strategies): `DistributedRunOptions.tree_learner` (serial |
+data | feature | voting, LightGBM's names as codes) and `top_k` select the
+grower; data parallel is untouched and default. New growers in
+`distributed.mojo` over the `distributed_strategies.mojo` cores: feature
+parallel (every rank holds every row, own feature block plus feature 0,
+candidate all-gather per node, base score and loss read from one copy)
+equals single-node training bit for bit; voting parallel (row partition,
+top_k local votes, one vote reduction, packed reduction over the elected
+features plus feature 0, siblings by local subtraction) is deterministic and
+inexact by design. `require_strategy` no longer refuses the two modes;
+`search_owned_features` refuses only extra_trees. Bindings:
+`distributed_capability` reads `transport_available()`/`transport_validated()`
+and lists `tree_learners`; `distributed_gpu_status()` reports
+`distributed_gpu.mojo`'s closed gates; `distributed_train_local` trains a
+`LocalCollective` world from the fit buffers, reached from every estimator
+by `tree_learner=..., num_machines=N, top_k=K` (three new estimator
+parameters, recorded in the API snapshot). `distributed_strategies` and
+`distributed_gpu` are exported from `__init__.mojo` and left the orphan list.
+Test: `tests/parallel/test_distributed_strategies.mojo` (4 pass);
+`tests/test_distributed.mojo` (21) unchanged; Python smoke through the
+estimator (feature == serial exactly at num_machines 2 and 3). Still gated:
+distributed GPU's device path (needs `train_gpu.mojo`), any multi-process
+run (`transport_validated()` stays False), the `tree_learner` and `top_k`
+rows in `docs/LIGHTGBM_PARITY.md` (file held by another lane; both are now
+implemented for the in-process world). No new handoff file.

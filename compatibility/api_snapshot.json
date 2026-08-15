@@ -1576,6 +1576,7 @@
       "monotone_penalty": 0.0,
       "n_estimators": 100,
       "num_leaves": 31,
+      "num_machines": 1,
       "other_rate": 0.1,
       "path_smooth": 0.0,
       "reg_alpha": null,
@@ -1583,7 +1584,9 @@
       "skip_drop": 0.5,
       "subsample": null,
       "subsample_freq": null,
+      "top_k": 20,
       "top_rate": 0.2,
+      "tree_learner": "serial",
       "uniform_drop": true,
       "use_missing": true,
       "xgboost_dart_mode": false

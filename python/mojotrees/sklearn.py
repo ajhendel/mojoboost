@@ -342,6 +342,9 @@ class _Base(_ParamsMixin):
         min_reduction=0.0,
         bundle_missing=False,
         importance_type="split",
+        tree_learner="serial",
+        num_machines=1,
+        top_k=20,
     ):
         self.num_leaves = num_leaves
         self.max_depth = max_depth
@@ -410,6 +413,9 @@ class _Base(_ParamsMixin):
         self.min_reduction = min_reduction
         self.bundle_missing = bundle_missing
         self.importance_type = importance_type
+        self.tree_learner = tree_learner
+        self.num_machines = num_machines
+        self.top_k = top_k
         self._reset_fitted()
 
     def _interaction_buffers(self, n_features):
@@ -2556,6 +2562,26 @@ class MojoTreesRegressor(_Base):
         elif objective == _CUSTOM:
             self._refuse_alternate_boosting("with a callable objective")
             self._fit_custom(Xb, yb, n_rows, n_features, params, device)
+        elif self._distributed_world() > 1:
+            self._refuse_alternate_boosting("with tree_learner")
+            if device != "cpu":
+                raise ValueError(
+                    "tree_learner other than 'serial' trains on the CPU;"
+                    " set device='cpu'"
+                )
+            self._model = _mojotrees.distributed_train_local(
+                _addr(Xb),
+                n_rows,
+                n_features,
+                _addr(yb),
+                objective,
+                dict(
+                    params,
+                    num_machines=int(self.num_machines),
+                    tree_learner=str(self.tree_learner),
+                    top_k=int(self.top_k),
+                ),
+            )
         else:
             self._model = _mojotrees.fit(
                 _addr(Xb),
@@ -2567,6 +2593,32 @@ class MojoTreesRegressor(_Base):
             )
         self._record_fit(n_features, names, device)
         return self
+
+    def _distributed_world(self):
+        """The world size a fit trains over: 1 for `tree_learner='serial'`
+        (the single-node trainer), `num_machines` otherwise. LightGBM's
+        `tree_learner` names are accepted (`serial`, `data`, `feature`,
+        `voting` and the `_parallel` spellings); the world is hosted in this
+        process over `LocalCollective`, which is the distributed training
+        this build runs (see `_mojotrees.distributed_capability()`)."""
+        learner = str(self.tree_learner)
+        if learner in ("serial", "serial_tree_learner"):
+            return 1
+        if learner not in (
+            "data", "data_parallel", "feature", "feature_parallel",
+            "voting", "voting_parallel",
+        ):
+            raise ValueError(
+                f"unknown tree_learner {self.tree_learner!r}; expected "
+                "serial, data, feature, or voting"
+            )
+        machines = int(self.num_machines)
+        if machines < 2:
+            raise ValueError(
+                f"tree_learner={learner!r} needs num_machines >= 2; a "
+                "single machine is tree_learner='serial'"
+            )
+        return machines
 
     def _custom_base_score(self):
         """Resolve `base_score` for a custom objective into

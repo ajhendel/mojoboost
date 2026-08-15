@@ -59,25 +59,8 @@ from .growth_policy import (
     grow_policy_name,
     parse_grow_policy,
 )
-from .cegb import (
-    CEGB_DEFAULT_TRADEOFF,
-    CegbConfig,
-    CegbLedger,
-    CegbNodeCosts,
-    cegb_adjusted_gain,
-    cegb_commit_split,
-    cegb_delta_gain,
-    cegb_stale_cached_gain,
-    prepare_cegb_node,
-)
 from .split import SplitInfo, find_best_split, soft_threshold_l1
-from .tree import (
-    Tree,
-    TreeParams,
-    grow_tree,
-    grow_tree_with_cegb,
-    node_bounds,
-)
+from .tree import Tree, TreeParams, grow_tree, node_bounds
 from .boosting import (
     BINARY_LOGISTIC,
     CROSS_ENTROPY,
@@ -201,11 +184,44 @@ from .collective import (
 )
 from .distributed import (
     DataShard,
+    DistributedRunOptions,
     allreduce_histogram,
     grow_tree_distributed,
     partition_rows,
     partition_values,
     train_distributed,
+    train_distributed_run,
+)
+# Feature-parallel and voting-parallel cores, selected through
+# `DistributedRunOptions.tree_learner`, and the host-side contract for a
+# distributed GPU histogram exchange (its device path is gated; see
+# `distributed_gpu_available`).
+from .distributed_strategies import (
+    DEFAULT_TOP_K,
+    STRATEGY_DATA_PARALLEL,
+    STRATEGY_FEATURE_PARALLEL,
+    STRATEGY_SERIAL,
+    STRATEGY_VOTING_PARALLEL,
+    FeaturePartition,
+    parse_strategy,
+    strategy_capabilities,
+    strategy_cost_plan,
+    strategy_name,
+    voting_is_exact,
+)
+from .distributed_gpu import (
+    GATE_DEVICE_COLLECTIVE,
+    GATE_DRIVER,
+    GATE_GPU_SPEEDUP,
+    GATE_TRANSPORT,
+    GATE_VALIDATION,
+    distributed_gpu_available,
+    distributed_gpu_gates,
+    distributed_gpu_unavailable_detail,
+    gate_name,
+    gpu_exchange_plan,
+    gpu_round_plan,
+    require_distributed_gpu,
 )
 from .device import (
     AUTO_DEVICE,

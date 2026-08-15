@@ -1,22 +1,26 @@
 # Feature-parallel, voting-parallel, and distributed GPU contracts
 
-Status: design plus strategy cores. Not a shipped feature and not an
-operational one. Nothing in this document has been run across two processes,
-nothing has been run on two devices, and no parallel speedup, scaling, or
-communication measurement is claimed anywhere in it.
+Status (updated 2026-08-15): feature parallel and voting parallel are
+driven and run inside one process; distributed GPU is a contract only.
+Nothing in this document has been run across two processes, nothing has been
+run on two devices, and no parallel speedup, scaling, or communication
+measurement is claimed anywhere in it.
 
 Three separate things are described here and they are at three different
 stages, so they are labeled individually rather than under one status line:
 
 | capability | what exists | what does not |
 |---|---|---|
-| feature parallel | the split-election core, the feature partition, the candidate wire record, the agreement and failure protocol (`src/mojotrees/distributed_strategies.mojo`) | a grower that calls them; any run |
-| voting parallel | the top-k selection, the vote reduction, the feature election, the packed histogram exchange (same file) | a grower that calls them; any run |
-| distributed GPU | the global fixed-point scale agreement, the word staging and its overflow argument, the cost model, the collective seam (`src/mojotrees/distributed_gpu.mojo`) | a device-resident collective; a transport; the single-node GPU speedup that gates the work; any run |
+| feature parallel | the split-election core, the feature partition, the candidate wire record, the agreement and failure protocol (`src/mojotrees/distributed_strategies.mojo`); the grower `_grow_tree_feature_parallel` in `src/mojotrees/distributed.mojo`, selected by `DistributedRunOptions.tree_learner`, reachable from Python as `tree_learner="feature", num_machines=N` on every estimator; the focused test `tests/parallel/test_distributed_strategies.mojo`, which pins bit-identity with single-node training | a run across processes |
+| voting parallel | the top-k selection, the vote reduction, the feature election, the packed histogram exchange (same file); the grower `_grow_tree_voting_parallel`, selected the same way with `top_k`; the same focused test | a run across processes; exactness, by design (`voting_is_exact()` is False) |
+| distributed GPU | the global fixed-point scale agreement, the word staging and its overflow argument, the cost model, the collective seam (`src/mojotrees/distributed_gpu.mojo`), exported and reported through `_mojotrees.distributed_gpu_status()` | a device-resident collective; a transport run; the single-node GPU speedup that gates the work; a driver in `train_gpu.mojo` |
 
-The one mode that does run is data parallel, in `src/mojotrees/distributed.mojo`,
-with every rank inside one process. `docs/distributed.md` is its design and is
-the document this one extends rather than replaces.
+Data parallel remains the default `tree_learner`, in
+`src/mojotrees/distributed.mojo`, with every rank inside one process.
+`docs/distributed.md` is its design and is the document this one extends
+rather than replaces. Every mode runs over `LocalCollective`; the socket
+transport exists but `transport_validated()` is False until the two-process
+procedure in `docs/DISTRIBUTED_TRANSPORT.md` section 7 is run.
 
 ## 0. Why these are cores and not trainers
 
@@ -435,85 +439,87 @@ Note what is deliberately absent: there is no code path anywhere in these two
 modules that silently downgrades a mode, approximates a reduction, or falls
 back from a device path to a host path without saying so.
 
-## 6. What each mode still needs
+## 6. What each mode has, and what it still needs
 
 ### 6.1 Feature parallel
 
-A grower. Concretely, the loop in `tree.grow_tree` with three changes:
+Has its grower: `_grow_tree_feature_parallel` in `src/mojotrees/distributed.mojo`.
+It is the data-parallel loop with the histogram all-reduce replaced by
+`search_owned_features` followed by `elect_split_collective`, once per node.
+Every rank holds every row (the caller passes the whole dataset once per
+rank; `train_local_world` in `bindings/distributed_bindings.mojo` does this
+for Python), builds histograms over `partition.features(rank)` plus feature
+0 (so leaf values and exact counts read off its own histogram as on the
+data-parallel path), routes rows locally, and derives the larger child by
+subtraction. The base score and the training loss are read from one copy of
+the rows and not reduced, so the model is the single-node model bit for bit,
+which is what the focused test pins. `extra_trees` is refused, as it is on
+the data-parallel path.
 
-1. build each node's histogram over `partition.features(rank)` only, which
-   `build_histogram(features=...)` already accepts
-2. replace the per-node `find_best_split` call with `search_owned_features`
-   followed by `elect_split_collective`
-3. leave everything else, the frontier, the subtraction trick, the leaf math,
-   the row routing, exactly as it is
-
-That grower belongs behind the histogram-source refactor
-`docs/distributed.md` section 11 argues for, not in a third copy of the loop.
-Doing it as a fourth copy would be the mistake this lane exists to avoid.
+Still needs: a run across processes.
 
 ### 6.2 Voting parallel
 
-A driver in the data-parallel grower, gated by a strategy code, that replaces
-the one `allreduce_histogram` call per node with the four-call sequence in
-section 2.1. It is a smaller change than feature parallel because it changes
-what is reduced rather than who decides.
+Has its grower: `_grow_tree_voting_parallel`, rows partitioned as in data
+parallel, and per node the four-call sequence of section 2.1: each local
+rank ranks its features by local gain (`select_top_k`), one vote reduction
+(`allreduce_votes`), the election (`elect_voted_features` with `top_k`), and
+one packed reduction over the elected features (`pack_selected`,
+`allreduce_selected`, `unpack_selected`). Feature 0 always rides along in
+the reduced set so leaf values and exact counts read off it. Siblings are
+derived by local subtraction of unreduced local histograms, so voting happens
+once per child, not once per parent.
+
+Still needs: a run across processes. It is not exact by design.
 
 ### 6.3 Distributed GPU
 
 In order, and the order is not negotiable:
 
 1. the discrete-GPU benchmark that closes `GPU_SPEEDUP_GATE_MET`
-2. a socket `ByteEndpoint`, which `docs/DISTRIBUTED_TRANSPORT.md` section 7
-   specifies, and its hermetic two-process test
+2. the hermetic two-process test of the socket endpoint
+   (`docs/DISTRIBUTED_TRANSPORT.md` section 7)
 3. the staged exchange wired between `download_raw` and `histogram_from_host`,
    with the builder taking the agreed global scales instead of computing local
    ones
 4. only then, if the download and upload prove to dominate, a device-resident
    adapter behind `DeviceCollective`
 
-## 7. Validation, none of which has happened
+`_mojotrees.distributed_gpu_status()` reports which of these gates are still
+closed, by name.
 
-Every command below is **UNRUN**. Nothing in this lane has been compiled,
-tested, benchmarked, or executed, and no claim in this document rests on a
-run.
+## 7. Validation
 
-Smallest useful checks, in the order they should be attempted:
+Run on 2026-08-15, one process:
 
 ```
-# UNRUN: does the strategies module compile at all
-pixi run mojo build -I src src/mojotrees/distributed_strategies.mojo -o /dev/null
-
-# UNRUN: does the GPU contract module compile on a CPU-only machine
-pixi run mojo build -I src src/mojotrees/distributed_gpu.mojo -o /dev/null
-
-# UNRUN: the focused test this lane did not write, once someone owns tests
-pixi run mojo run -I src tests/parallel/test_distributed_strategies.mojo
+pixi run mojo run -I src tests/parallel/test_distributed_strategies.mojo   # 4 tests pass
+pixi run mojo run -I src tests/test_distributed.mojo                       # 21 tests, data parallel unchanged
 ```
 
-The assertions a first test owes, none of which exist:
+The focused test asserts: a feature-parallel tree over `LocalCollective`
+at world sizes 2, 3, and 8 (the last wider than the six-feature dataset,
+so two ranks own nothing and contribute not-found candidates) equals
+`grow_tree` bit for bit and issues no histogram-sized reduction; a feature-parallel `train_distributed_run` equals
+single-node `train` tree for tree; voting parallel trains, is deterministic,
+and reduces fewer cells than data parallel on the same data; a parallel mode
+at world size 1, serial at world size 2, and feature parallel over shards
+that do not all hold every row are refused. `require_strategy` no longer
+refuses feature and voting parallel, and still does not refuse a
+`LocalCollective` world of four ranks.
+
+Not validated, and not claimed: any run across processes, any run on two
+devices, the assertions on the wire records below, which remain owed to a
+transport test:
 
 - an encode and decode round trip preserves a numerical split, a categorical
   split with a non-trivial bitset, and a not-found split
-- a candidate exchange over `LocalCollective` at world sizes 1, 2, 3, and 5
-  elects the same split a single-node `find_best_split` over the same
-  histogram elects, including a deliberate two-feature tie
 - a rank proposing a split on a feature it does not own is refused, and the
   message names the rank and the feature
 - a rank answering for another node is refused
-- a world wider than the feature count elects correctly, with the
-  zero-feature ranks contributing not-found candidates
-- `select_top_k` and `elect_voted_features` are exact against a hand-computed
-  ranking, ties included
-- `pack_selected` and `unpack_selected` round trip, and unpacking leaves every
-  unelected feature at zero
 - `fixed_scale_from_total` agrees with `histogram_gpu._fixed_scale` on the
-  same input, which is the one assertion that keeps the duplicated constant
-  honest
+  same input
 - `narrow_words` refuses a word outside `Int32` rather than truncating it
-- `require_strategy` refuses feature and voting parallel, and does **not**
-  refuse a `LocalCollective` world of four ranks, which is the regression that
-  would break existing data-parallel training
 
 ## 8. Differences from LightGBM
 

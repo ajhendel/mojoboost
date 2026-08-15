@@ -1103,8 +1103,14 @@ def distributed_metric[
     raw: List[List[Float64]],
     objective: Int,
     alpha: Float64,
+    replicated: Bool = False,
 ) raises -> Float64:
     """The global training loss, in one reduction.
+
+    `replicated` is the feature-parallel arrangement, where every rank holds
+    every row: then local rank 0's shard is the whole dataset, its mean is
+    the global mean, and nothing is reduced (a reduction would count each
+    row once per rank).
 
     The loss is `boosting._mean_loss`, the same function the single-node
     trainer's early stopping reads, so the two stop on the same quantity rather
@@ -1117,6 +1123,10 @@ def distributed_metric[
     identical on every rank, which is the property a stopping decision needs.
     Empty shards contribute nothing rather than a division by zero.
     """
+    if replicated:
+        if shards[0].data.n_rows <= 0:
+            raise Error("the world holds no rows to score")
+        return _mean_loss(raw[0], shards[0].target, objective, alpha)
     var sums = zeros_f64(2)
     for i in range(len(shards)):
         var n = shards[i].data.n_rows
@@ -2164,20 +2174,30 @@ def _target_statuses[
 def _distributed_base_score[
     C: Collective
 ](
-    mut comm: C, shards: List[DataShard], objective: Int
+    mut comm: C,
+    shards: List[DataShard],
+    objective: Int,
+    replicated: Bool = False,
 ) raises -> Float64:
     """Global base score: one reduction of the weighted target sum and the
     weight sum, then the same link transform the single-node trainer
     applies. Every rank holds identical sums afterwards, so the checks below
-    the reduction raise on every rank or on none."""
+    the reduction raise on every rank or on none.
+
+    Under `replicated` (feature parallel, every rank holds every row) the
+    sums run over local rank 0's shard only and are not reduced, so the
+    accumulation is the single-node one and the base score is bit-identical
+    to it; summing the copies would regroup the addition."""
     var sums = zeros_f64(2)
-    for i in range(len(shards)):
+    var n_shards = 1 if replicated else len(shards)
+    for i in range(n_shards):
         var weighted = len(shards[i].weight) > 0
         for r in range(shards[i].data.n_rows):
             var w = shards[i].weight[r] if weighted else 1.0
             sums[0] += w * shards[i].target[r]
             sums[1] += w
-    comm.allreduce_sum_f64(sums)
+    if not replicated:
+        comm.allreduce_sum_f64(sums)
 
     if sums[1] <= 0.0:
         raise Error("sample_weight must have a positive sum")
@@ -2332,7 +2352,10 @@ def train_distributed_run[
         check_group_alignment(plan, options.groups)
 
     var n_local = len(shards)
-    var base_score = _distributed_base_score(comm, shards, objective)
+    var replicated = options.tree_learner == STRATEGY_FEATURE_PARALLEL
+    var base_score = _distributed_base_score(
+        comm, shards, objective, replicated
+    )
 
     var raw = List[List[Float64]]()
     for i in range(n_local):
@@ -2420,7 +2443,9 @@ def train_distributed_run[
             due = len(trees) % options.metric_every == 0
         if scores_metric and due:
             scored = True
-            var value = distributed_metric(comm, shards, raw, objective, alpha)
+            var value = distributed_metric(
+                comm, shards, raw, objective, alpha, replicated
+            )
             report.metric_rounds.append(len(trees))
             report.metric_values.append(value)
             var improved = not have_best
