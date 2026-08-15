@@ -283,3 +283,29 @@ reach every routed check through `Dataset`, `train_dataset*`,
 `parse_params`), `test_callbacks`, `test_sparse`, `test_trainset` green in a
 HEAD worktree; Python smoke via the in-tree package. Commits 116604c
 18a6323 bff8d7c + audit rows.
+
+W8 (Python readers for the uncalled bindings): 2e10584 deleted the metric
+registry mirror in `_eval.py` (identical to the registry, compared spelling
+for spelling; `resolve()` now asks `metric_code_of_name`, the `L2..MAP`
+constants come off the registry snapshot, and `tools/api_snapshot.py`
+derives `python.eval_metric_names` from `objective_registry.mojo`);
+8b0280c routes regressor objective resolution and the alpha / fair_c /
+tweedie_variance_power range checks through `objective_code_of_name`,
+`objective_name_status`, `check_objective_param`, and reads
+`registry_objective_unimplemented` / `registry_vocabulary`
+(`MojoTreesRegressor._OBJECTIVES` stays as the frozen contract the snapshot
+reads, checked against the registry by `python/tests/test_registry_readers.py`);
+925fd91 `build_info()` gains `model_format_versions` and `startup`
+(`startup_phase_contract`, `startup_environment`, `native_clock_ns`) and
+`diagnostics.check_phase_contract()`; 5706537 `mojotrees.dask.check_machine_list`
+(`distributed_check_machine_list`, also replacing the Python duplicate
+address check) and `_dask_runtime.status_message` (`distributed_status_message`,
+`transport_status_message`); 94f0e35 `Dataset.get_field` through
+`dataset_field_length` + `dataset_copy_field`, `Dataset.feature_num_bin` /
+`bin_upper_bounds` / `missing_bins`, `dataset_num_data` / `dataset_num_feature`
+in `_from_handle`, `Booster.num_trees` native, `Booster.model_to_json`,
+`Booster.file_kind` / `model_file_kind` (and `_load_path` sniffing the header).
+Left uncalled: `gpu_validation_metric_matches_host` (the connect_07
+gpu_validation surface has no Python reader at all) and the connect_07 /
+connect_22 rows (`gpu_predict_capability`, `gpu_validation_*`, `efb_*`,
+`extra_*`, `forced_splits_check`), which are other lanes'.
