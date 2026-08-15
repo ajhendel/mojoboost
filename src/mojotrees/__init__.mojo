@@ -211,7 +211,7 @@ from .distributed_strategies import (
     parse_strategy,
     strategy_capabilities,
     strategy_cost_plan,
-    strategy_name,
+    tree_learner_name,
     voting_is_exact,
 )
 from .distributed_gpu import (

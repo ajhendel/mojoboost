@@ -428,7 +428,7 @@
         "parse_strategy",
         "strategy_capabilities",
         "strategy_cost_plan",
-        "strategy_name",
+        "tree_learner_name",
         "voting_is_exact"
       ],
       "external_memory": [

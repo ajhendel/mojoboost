@@ -75,7 +75,7 @@ from .objective_registry import (
     TWEEDIE as _TWEEDIE,
     check_objective_param,
     objective_link,
-    objective_renews_leaves as _objective_renews_leaves,
+    objective_renews_leaves,
 )
 from .cegb import CegbLedger, check_cegb_continued_training
 from .linear_tree import (
@@ -332,17 +332,10 @@ def _check_class_bagging(
         )
 
 
-def objective_renews_leaves(objective: Int) -> Bool:
-    """Whether this objective replaces its leaf values after each tree, the
-    LightGBM `RenewTreeOutput` rule: the objectives whose Newton step is
-    uninformative because their hessian carries no curvature (it is the row
-    weight itself), so the leaf value comes from a percentile of the
-    residuals instead. See `_renew_leaf_values`.
-
-    The rule itself is in objective_registry.mojo, where
-    `objective_init_kind` also reads it; this is the name the boosting loop
-    and its callers have always used."""
-    return _objective_renews_leaves(objective)
+# `objective_renews_leaves` is objective_registry's rule (LightGBM's
+# `RenewTreeOutput`), imported above and re-exported from here under the
+# name the boosting loop and its callers have always used; the leaf renewal
+# it decides is `_renew_leaf_values` below.
 
 
 def renewal_alpha(objective: Int, alpha: Float64) -> Float64:
