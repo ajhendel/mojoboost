@@ -125,6 +125,11 @@ test_hybrid_replica
 # geometry as pure host arithmetic over synthetic `DeviceCaps` and opens no
 # device, so it belongs in the CPU set where it also guards the rule on a
 # runner that has no accelerator to plan for.
+#
+# `test_gpu_phase_profile` is deliberately NOT above either, despite its name.
+# It exercises the node size classes, the counters, and the CPU grower's
+# charge sites, opens no device, and asserts that the instrument moves no
+# model on the host backend, so it belongs in the CPU set.
 
 # CPU-safe, but exercises a GPU path when one exists, so a GPU runner should
 # see it too.

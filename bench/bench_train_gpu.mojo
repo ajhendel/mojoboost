@@ -31,6 +31,18 @@ is why the summary leads with the minimum rather than the mean.
 Usage: mojo run -I src bench/bench_train_gpu.mojo \\
     [n_rows] [n_features] [reg|binary] [repeats] [arms] [seed]
 
+`MOJOTREES_PHASE_PROFILE=async` on any run prints one `phase_profile` block
+per arm per repeat: wall time, call counts, kernel or dispatch counts, host
+synchronizations, rows, row slots, and histogram cells, per phase and per
+node size class (phase_profile.mojo). It covers the `cpu` arm and the `gpu*`
+arms under the same phase names, so the two backends' histograms, partitions,
+score updates, and split searches sit on the same lines and can be subtracted.
+Use `fenced` instead to separate device execution from enqueue, at the cost of
+two extra waits per split; that changes the schedule, so a fenced number and
+an async number are not comparable and no arm timing should be quoted from a
+fenced run. Both are off by default, and an off run reads no clock, writes no
+counter, and prints nothing.
+
 `arms` is a comma-separated list of cpu, gpu, gpu-host, gpu-device, in the
 order they should run; the first is the baseline every other arm is compared
 against. Any arm takes a `-depth` suffix (`cpu-depth`, `gpu-device-depth`,

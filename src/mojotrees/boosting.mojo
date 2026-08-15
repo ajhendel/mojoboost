@@ -83,7 +83,19 @@ from .linear_tree import (
     LinearParams,
     check_linear_tree_unconnected,
 )
-from .tree import Tree, TreeParams, grow_tree_with_cegb, node_bounds
+from .phase_profile import (
+    PROF_GRAD_FILL,
+    PROF_SCORE_UPDATE,
+    SCOPE_FIT,
+    PhaseProfile,
+)
+from .tree import (
+    Tree,
+    TreeParams,
+    grow_tree_profiled,
+    grow_tree_with_cegb,
+    node_bounds,
+)
 from .tree_parameters_extra import ExtraTreeParams, finish_leaf_output
 from .validation import (
     check_class_code_range,
@@ -1068,19 +1080,42 @@ def _boost_rounds(
     # not. The label pass is one sweep and the labels do not change, so the
     # gate is hoisted out of the round loop.
     var balanced = class_bagging.enabled() and has_positive_rows(target)
+    # One profile for the whole loop rather than one per tree, so a hundred
+    # rounds produce one table to diff instead of a hundred (phase_profile.mojo).
+    # Off unless `MOJOTREES_PHASE_PROFILE` says otherwise, and an off profile
+    # reads no clock and writes no counter, so the ensemble this loop grows is
+    # the same ensemble either way.
+    var profile = PhaseProfile.from_env(SCOPE_FIT, String("train"))
     for i in range(params.n_estimators):
         var round = round_offset + i
+        # The round's wall clock is taken in two brackets, before the tree and
+        # after it, because `grow_tree_profiled` adds the tree's own. One
+        # outer bracket would count the tree twice and understate what the
+        # phases leave unattributed.
+        var pre_started = profile.clock()
         if balanced:
             refresh_class_bag(bag, class_bagging, target, round)
         else:
             refresh_bag(bag, bagging, n, round)
+        var grad_started = profile.clock()
         _fill_grad_hess(
             raw, target, objective, sample_weight, alpha, grad, hess
         )
         goss_round(bag, grad, hess, goss, round, learning_rate)
-        var tree = grow_tree_with_cegb(
-            data, grad, hess, params.tree, ledger, bag, round, bundling
+        # Round-level work belonging to no node, so it is charged at the
+        # tree's root row count and files under `root`. The GOSS rescale is
+        # inside the same charge because it is the same pass over the same
+        # two vectors and separating it would be a distinction without a
+        # phase; it is a no-op when GOSS is off, which is the default.
+        profile.charge(
+            PROF_GRAD_FILL, len(bag) if len(bag) > 0 else n, grad_started
         )
+        profile.note_wall(pre_started)
+        var tree = grow_tree_profiled(
+            profile, data, grad, hess, params.tree, ledger, bag, round,
+            bundling
+        )
+        var post_started = profile.clock()
         if renews:
             _renew_leaf_values(
                 tree, data, target, raw, renew_w, renew_a, bag, signs,
@@ -1093,13 +1128,26 @@ def _boost_rounds(
         # (every sampled row zero-weight, say), so the round is skipped and
         # the next sample gets its turn.
         if tree.n_leaves == 1 and abs(tree.value[0]) < 1e-12:
+            profile.note_wall(post_started)
             if bagging_enabled(bagging) or goss.enabled or balanced:
                 continue
             break
 
+        # One full-tree traversal per training row per round, serial, over
+        # every row whether or not it was in the bag. Its own phase because it
+        # belongs to no node, is invisible to any per-tree instrument, and
+        # would otherwise land in the unattributed remainder where nobody
+        # would look for it. Charged at `n`, the dataset, not at the bag.
+        var update_started = profile.clock()
         for r in range(n):
             raw[r] += learning_rate * tree.predict_row(data, r)
+        profile.charge(PROF_SCORE_UPDATE, n, update_started)
         trees.append(tree^)
+        profile.note_wall(post_started)
+
+    # One block for the whole loop, and nothing at all when the profile is
+    # off, so an unprofiled run's stdout is byte identical to what it was.
+    profile.print_report()
 
 
 def train(

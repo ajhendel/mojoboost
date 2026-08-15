@@ -23,6 +23,19 @@ that outlives a single `fit`:
 - `PhaseCounters` attributes time to compile, allocation, transfer, kernel,
   synchronization, and cleanup phases.
 
+`PhaseCounters` is not the profiler, and the distinction is worth keeping.
+Its phases are a *session's* -- what one `DeviceContext` spent its life on --
+and it has no notion of a node, of a tree, or of the host backend, so it
+cannot say whether a run's kernel time went to four large nodes or to a
+hundred small ones. `phase_profile.mojo` answers that second question, with
+its own grower-shaped vocabulary (histogram, partition, split search,
+transfer, conversion, and the round-level gradient fill and score update),
+each broken down by node size class and carrying dispatch and synchronization
+counts beside the time, and it covers the CPU backend under the same names.
+Neither is derivable from the other and neither should grow into the other.
+`MOJOTREES_GPU_TRACE=1` turns this one on; `MOJOTREES_PHASE_PROFILE` turns
+that one on.
+
 The dependency model
 --------------------
 
@@ -54,7 +67,9 @@ synchronizations the model marks removable and what has to be proven first.
 Environment contract, matching the `MOJOTREES_` convention in parallel.mojo:
 
 - `MOJOTREES_GPU_TRACE=1` turns on the phase counters. Off by default so an
-  untraced session pays no clock reads.
+  untraced session pays no clock reads. Not to be confused with
+  `MOJOTREES_PHASE_PROFILE`, which is the per-node-size profiler in
+  phase_profile.mojo and answers a different question; see above.
 - `MOJOTREES_GPU_STAGING_SLOTS`: staging ring depth, default
   `DEFAULT_STAGING_SLOTS`, clamped to `[1, MAX_STAGING_SLOTS]`. `1`
   reproduces today's single-buffer behavior exactly.

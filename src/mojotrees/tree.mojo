@@ -85,6 +85,19 @@ from .histogram import (
     subtract_histogram_into,
 )
 from .parallel import plan_row_blocks, run_row_blocks
+from .phase_profile import (
+    HOST_HIST_DISPATCHES,
+    HOST_PARTITION_DISPATCHES,
+    HOST_SPLIT_SEARCH_DISPATCHES,
+    HOST_SUBTRACT_DISPATCHES,
+    PROF_HISTOGRAM,
+    PROF_HIST_ALLOC,
+    PROF_PARTITION,
+    PROF_SPLIT_SEARCH,
+    PROF_SUBTRACT,
+    SCOPE_TREE,
+    PhaseProfile,
+)
 from .interaction import InteractionConstraints, extend_branch
 from .monotone import (
     MONOTONE_FREE,
@@ -938,8 +951,49 @@ def grow_tree_with_cegb(
     tree_index: Int = 0,
     bundling: BundledMatrix = BundledMatrix.none(),
 ) raises -> Tree:
+    """`grow_tree_profiled` with a profile of its own, reported per tree.
+
+    The entry point every caller that does not accumulate a profile across a
+    fit uses, which is all of them except `boosting._boost_rounds`. With
+    `MOJOTREES_PHASE_PROFILE` unset -- the default -- the profile is off, this
+    costs one `getenv` and one bucket allocation per tree, prints nothing, and
+    grows exactly the tree it grew before the instrument existed. With it set,
+    one `scope=tree` block is printed per tree; a caller that wants one block
+    per fit owns a `PhaseProfile` and calls `grow_tree_profiled` directly.
+
+    A `mut` argument cannot be defaulted, which is why the profile is a second
+    entry point rather than a defaulted parameter, exactly as the ledger is.
+    """
+    var profile = PhaseProfile.from_env(SCOPE_TREE, String("grow_tree"))
+    var tree = grow_tree_profiled(
+        profile, data, grad, hess, params, ledger, bag, tree_index, bundling
+    )
+    profile.print_report()
+    return tree^
+
+
+def grow_tree_profiled(
+    mut profile: PhaseProfile,
+    data: BinnedMatrix,
+    grad: List[Float64],
+    hess: List[Float64],
+    params: TreeParams,
+    mut ledger: CegbLedger,
+    bag: List[Int] = [],
+    tree_index: Int = 0,
+    bundling: BundledMatrix = BundledMatrix.none(),
+) raises -> Tree:
     """Grow one tree, leaf-wise by default or depth-wise under
     `params.grow_policy == GROW_DEPTHWISE`.
+
+    `profile` is the phase and node-size attribution instrument
+    (phase_profile.mojo), and it is off unless `MOJOTREES_PHASE_PROFILE` says
+    otherwise. An off profile is a Bool test at each of the charge sites below
+    and nothing else: no clock is read and no counter is written, so this
+    grower's arithmetic, allocation, and iteration order are identical whether
+    it is on or off, and so is the tree. What the charges cover is the
+    accumulate, the buffer, the subtraction, the partition, and the scan; what
+    they cannot cover is documented at the sites that could not reach it.
 
     `ledger` is the ensemble's CEGB ledger (cegb.mojo), read once per node to
     cost that node's features and written once per chosen split. It spans the
@@ -1082,6 +1136,16 @@ def grow_tree_with_cegb(
         List[Float64](), List[Float64](), 0,
     )
 
+    # The tree's own root row count is the denominator every node size class
+    # in this tree is taken against (phase_profile.mojo). Under bagging or
+    # GOSS the root holds the sample and not the dataset, and classifying a
+    # sampled tree against the dataset would push every node of it down a
+    # class or two and make two sampling fractions incomparable.
+    var n_root = len(bag) if len(bag) > 0 else data.n_rows
+    var hist_cells = data.n_features * data.n_bins
+    var tree_started = profile.clock()
+    profile.begin_tree(n_root, data.n_rows)
+
     # Every histogram this tree builds comes from one pool and goes back to it
     # when its leaf is split, so growth allocates a handful of buffers rather
     # than three arrays per node. The pool's shape is per feature whether or
@@ -1098,6 +1162,12 @@ def grow_tree_with_cegb(
     # The root's row list is the only thing bagging materializes; the full
     # path builds the same list over every row.
     var root_rows: List[Int]
+    # `take` is a pop off the free list once the pool has warmed, and a whole
+    # `Histogram.zeroed` allocation before that: three arrays of
+    # `n_features * n_bins`, which is where a per-node allocation cost would
+    # live if the pool were not doing its job. Charged per cell rather than
+    # per row, because it is the same work at any node size.
+    var root_alloc_started = profile.clock()
     var root_hist = pool.take()
     if bundling.active:
         # A pooled buffer's contents are undefined and the expansion writes
@@ -1105,24 +1175,64 @@ def grow_tree_with_cegb(
         # here rather than left holding another node's statistics. The
         # unbundled builders zero each slice themselves and need none of this.
         root_hist.reset()
+    profile.charge(
+        PROF_HIST_ALLOC, n_root, root_alloc_started, cells=hist_cells
+    )
     if len(bag) == 0:
+        var root_list_started = profile.clock()
         root_rows = List[Int](capacity=data.n_rows)
         root_rows.resize(data.n_rows, 0)
         for r in range(data.n_rows):
             root_rows[r] = r
+        # The identity permutation is row-list construction, which is the same
+        # kind of work a split's two child lists are, so it goes to the same
+        # phase rather than disappearing into the unattributed remainder.
+        profile.charge(
+            PROF_PARTITION,
+            n_root,
+            root_list_started,
+            dispatches=HOST_PARTITION_DISPATCHES,
+        )
+        var root_hist_started = profile.clock()
         _hist_full(
             root_hist, bundle_scratch, data, bundling, grad, hess,
             tree_features, tree_columns,
+        )
+        profile.note_node()
+        profile.charge(
+            PROF_HISTOGRAM,
+            n_root,
+            root_hist_started,
+            dispatches=HOST_HIST_DISPATCHES,
+            slots_per_row=len(tree_columns),
+            cells=hist_cells,
         )
     else:
         # `sampling.check_row_set` is the one place this property is enforced
         # rather than assumed, and everything downstream of the draw -- the
         # subset accumulate, the partition, the node counts -- relies on it.
         check_row_set(bag, data.n_rows)
+        var root_list_started = profile.clock()
         root_rows = bag.copy()
+        profile.charge(
+            PROF_PARTITION,
+            n_root,
+            root_list_started,
+            dispatches=HOST_PARTITION_DISPATCHES,
+        )
+        var root_hist_started = profile.clock()
         _hist_subset(
             root_hist, bundle_scratch, data, bundling, grad, hess, bag, 0,
             len(bag), tree_features, tree_columns,
+        )
+        profile.note_node()
+        profile.charge(
+            PROF_HISTOGRAM,
+            n_root,
+            root_hist_started,
+            dispatches=HOST_HIST_DISPATCHES,
+            slots_per_row=len(tree_columns),
+            cells=hist_cells,
         )
 
     # The root's own value is computed before its split search, because path
@@ -1170,6 +1280,7 @@ def grow_tree_with_cegb(
         root_rows,
         root_features,
     )
+    var root_search_started = profile.clock()
     var root_split = _search(
         root_hist,
         len(root_rows),
@@ -1186,6 +1297,17 @@ def grow_tree_with_cegb(
         grower_applies_extra=True,
         cegb=root_costs,
         grower_applies_cegb=carries_cegb,
+    )
+    # The scan reads one bin at a time over the node's own feature draw, so
+    # its cells are `len(root_features) * n_bins` and not the buffer's full
+    # shape. That distinction is the whole reason `cells` is recorded per
+    # charge rather than derived from the dataset.
+    profile.charge(
+        PROF_SPLIT_SEARCH,
+        len(root_rows),
+        root_search_started,
+        dispatches=HOST_SPLIT_SEARCH_DISPATCHES,
+        cells=len(root_features) * data.n_bins,
     )
 
     var frontier = List[_LeafState]()
@@ -1275,6 +1397,13 @@ def grow_tree_with_cegb(
         # them by doubling.
         var left_rows = List[Int]()
         var right_rows = List[Int]()
+        # Charged at the *parent's* row count, because that is the work: the
+        # routing walks the parent's list once and the two child lists it
+        # allocates hold exactly those rows between them. Filing it under the
+        # children would split one cost across two classes and make the
+        # per-row column mean nothing.
+        var part_rows = len(frontier[best_i].rows)
+        var part_started = profile.clock()
         partition_rows_into(
             left_rows,
             right_rows,
@@ -1282,6 +1411,12 @@ def grow_tree_with_cegb(
             frontier[best_i].rows,
             split,
             split_missing_bin,
+        )
+        profile.charge(
+            PROF_PARTITION,
+            part_rows,
+            part_started,
+            dispatches=HOST_PARTITION_DISPATCHES,
         )
         if forced_node >= 0 and (
             len(left_rows) == 0 or len(right_rows) == 0
@@ -1311,6 +1446,15 @@ def grow_tree_with_cegb(
         # expansion is linear, so expanding both and subtracting gives what
         # subtracting first and expanding would have: the derived sibling is
         # correct under bundling with no change here.
+        # Two buffers per split, and the zeroing pass when bundling needs one.
+        # Charged twice at `hist_cells` each, because that is two buffers'
+        # worth of allocation and fault-in when the pool is cold, and filed at
+        # the built child's size so a class's `hist_alloc` line can be read
+        # beside its `histogram` line.
+        var builds_left = len(left_rows) <= len(right_rows)
+        var built_rows = len(left_rows) if builds_left else len(right_rows)
+        var derived_rows = len(right_rows) if builds_left else len(left_rows)
+        var alloc_started = profile.clock()
         var left_hist = pool.take()
         var right_hist = pool.take()
         if bundling.active:
@@ -1320,18 +1464,63 @@ def grow_tree_with_cegb(
                 left_hist.reset()
             else:
                 right_hist.reset()
+        profile.charge(
+            PROF_HIST_ALLOC, built_rows, alloc_started, cells=2 * hist_cells
+        )
+        var hist_started = profile.clock()
         if len(left_rows) <= len(right_rows):
             _hist_subset(
                 left_hist, bundle_scratch, data, bundling, grad, hess,
                 left_rows, 0, len(left_rows), tree_features, tree_columns,
             )
+            profile.note_node()
+            profile.charge(
+                PROF_HISTOGRAM,
+                built_rows,
+                hist_started,
+                dispatches=HOST_HIST_DISPATCHES,
+                slots_per_row=len(tree_columns),
+                cells=hist_cells,
+            )
+            var sub_started = profile.clock()
             subtract_histogram_into(right_hist, parent_hist, left_hist)
+            # Filed at the *derived* child's size: it is that child's
+            # histogram that comes out, and the point of the trick is that a
+            # large sibling costs a per-cell subtraction instead of a per-row
+            # accumulate. Reading the two lines side by side is what shows
+            # whether that trade is still winning at each size.
+            profile.note_node()
+            profile.charge(
+                PROF_SUBTRACT,
+                derived_rows,
+                sub_started,
+                dispatches=HOST_SUBTRACT_DISPATCHES,
+                cells=hist_cells,
+            )
         else:
             _hist_subset(
                 right_hist, bundle_scratch, data, bundling, grad, hess,
                 right_rows, 0, len(right_rows), tree_features, tree_columns,
             )
+            profile.note_node()
+            profile.charge(
+                PROF_HISTOGRAM,
+                built_rows,
+                hist_started,
+                dispatches=HOST_HIST_DISPATCHES,
+                slots_per_row=len(tree_columns),
+                cells=hist_cells,
+            )
+            var sub_started = profile.clock()
             subtract_histogram_into(left_hist, parent_hist, right_hist)
+            profile.note_node()
+            profile.charge(
+                PROF_SUBTRACT,
+                derived_rows,
+                sub_started,
+                dispatches=HOST_SUBTRACT_DISPATCHES,
+                cells=hist_cells,
+            )
         pool.give(parent_hist^)
 
         # Child values are clamped into the parent's interval, then the
@@ -1443,6 +1632,7 @@ def grow_tree_with_cegb(
             left_rows,
             left_features,
         )
+        var left_search_started = profile.clock()
         var left_split = _search(
             left_hist,
             len(left_rows),
@@ -1461,6 +1651,13 @@ def grow_tree_with_cegb(
             cegb=left_costs,
             grower_applies_cegb=carries_cegb,
         )
+        profile.charge(
+            PROF_SPLIT_SEARCH,
+            len(left_rows),
+            left_search_started,
+            dispatches=HOST_SPLIT_SEARCH_DISPATCHES,
+            cells=len(left_features) * data.n_bins,
+        )
         var right_features = select_split_features(
             tree_features,
             params.feature_fraction_bylevel,
@@ -1478,6 +1675,7 @@ def grow_tree_with_cegb(
             right_rows,
             right_features,
         )
+        var right_search_started = profile.clock()
         var right_split = _search(
             right_hist,
             len(right_rows),
@@ -1495,6 +1693,13 @@ def grow_tree_with_cegb(
             grower_applies_extra=True,
             cegb=right_costs,
             grower_applies_cegb=carries_cegb,
+        )
+        profile.charge(
+            PROF_SPLIT_SEARCH,
+            len(right_rows),
+            right_search_started,
+            dispatches=HOST_SPLIT_SEARCH_DISPATCHES,
+            cells=len(right_features) * data.n_bins,
         )
 
         frontier[best_i] = _LeafState(
@@ -1522,6 +1727,12 @@ def grow_tree_with_cegb(
         n_leaves += 1
 
     tree.n_leaves = n_leaves
+    # The tree's whole wall clock, so the report can name what no phase
+    # claimed rather than letting the reader assume the phases cover it. What
+    # is deliberately outside every phase here: leaf valuation, the monotone
+    # clamp, the growth policy's frontier scan, the CEGB bookkeeping, and the
+    # per-node feature draws.
+    profile.end_tree(tree_started)
     return tree^
 
 

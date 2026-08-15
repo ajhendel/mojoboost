@@ -125,6 +125,7 @@
       "MOJOTREES_MACOS_DEPLOYMENT_TARGET",
       "MOJOTREES_NUM_WORKERS",
       "MOJOTREES_PARALLEL_MIN_OPS",
+      "MOJOTREES_PHASE_PROFILE",
       "MOJOTREES_STARTUP_REPORT_FD",
       "MOJOTREES_STARTUP_TRACE"
     ],
@@ -141,6 +142,7 @@
       "MOJOTREES_GPU_GRAD_LAYOUT",
       "MOJOTREES_GPU_HIST_SPECIALIZATION",
       "MOJOTREES_GPU_HIST_STRATEGY",
+      "MOJOTREES_GPU_MIN_TILES",
       "MOJOTREES_GPU_OBJECTIVE",
       "MOJOTREES_GPU_PHASE_TRACE",
       "MOJOTREES_GPU_SPLIT_PRIMITIVES",
@@ -156,6 +158,7 @@
       "MOJOTREES_HYBRID_GUARD_TRANSFER",
       "MOJOTREES_HYBRID_LEAVES",
       "MOJOTREES_HYBRID_TRACE",
+      "MOJOTREES_PHASE_PROFILE",
       "MOJOTREES_STARTUP_TRACE"
     ],
     "stale": [],
@@ -207,6 +210,7 @@
       "MOJOTREES_HYBRID_LEAVES",
       "MOJOTREES_HYBRID_TRACE",
       "MOJOTREES_MACOS_DEPLOYMENT_TARGET",
+      "MOJOTREES_PHASE_PROFILE",
       "MOJOTREES_STARTUP_REPORT_FD",
       "MOJOTREES_STARTUP_TRACE"
     ]
@@ -229,7 +233,7 @@
   },
   "mojo": {
     "abi_promise": "none; Mojo has no stable ABI, so the guarantee is source compatibility only",
-    "export_count": 597,
+    "export_count": 612,
     "export_source": "src/mojotrees/__init__.mojo",
     "exports_by_module": {
       "alternate_boosting": [
@@ -795,6 +799,23 @@
         "objective_from_name",
         "params_names_mojo_api_only",
         "parse_params"
+      ],
+      "phase_profile": [
+        "PROF_CONVERT",
+        "PROF_GRAD_FILL",
+        "PROF_HISTOGRAM",
+        "PROF_HIST_ALLOC",
+        "PROF_HOST_SYNC",
+        "PROF_PARTITION",
+        "PROF_SCORE_UPDATE",
+        "PROF_SPLIT_SEARCH",
+        "PROF_SUBTRACT",
+        "PROF_TRANSFER",
+        "PhaseProfile",
+        "classify_node",
+        "env_profile_mode",
+        "node_class_name",
+        "profile_phase_name"
       ],
       "ranking": [
         "DEFAULT_NDCG_EVAL_AT",

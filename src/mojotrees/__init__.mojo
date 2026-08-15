@@ -308,6 +308,23 @@ from .histogram_gpu import (
     build_kernel_features,
     env_batch_slots,
 )
+from .phase_profile import (
+    PROF_CONVERT,
+    PROF_GRAD_FILL,
+    PROF_HISTOGRAM,
+    PROF_HIST_ALLOC,
+    PROF_HOST_SYNC,
+    PROF_PARTITION,
+    PROF_SCORE_UPDATE,
+    PROF_SPLIT_SEARCH,
+    PROF_SUBTRACT,
+    PROF_TRANSFER,
+    PhaseProfile,
+    classify_node,
+    env_profile_mode,
+    node_class_name,
+    profile_phase_name,
+)
 from .gpu_runtime import (
     GpuSession,
     HazardTracker,

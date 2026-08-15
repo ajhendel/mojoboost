@@ -169,6 +169,22 @@ from .hybrid_leaf_scheduler import (
     mode_name,
     plan_split,
 )
+from .phase_profile import (
+    PARTITION_LAUNCHES,
+    PROF_CONVERT,
+    PROF_GRAD_FILL,
+    PROF_HISTOGRAM,
+    PROF_HOST_SYNC,
+    PROF_PARTITION,
+    PROF_SCORE_UPDATE,
+    PROF_SPLIT_SEARCH,
+    PROF_SUBTRACT,
+    PROF_TRANSFER,
+    SCOPE_FIT,
+    SCOPE_TREE,
+    SPLIT_SEARCH_DEVICE_LAUNCHES,
+    PhaseProfile,
+)
 from .objective import (
     GradHessFn,
     _apply_sample_weight,
@@ -789,6 +805,7 @@ def _commit_device_split(
 
 
 def _grow_tree_gpu_device_search(
+    mut profile: PhaseProfile,
     mut builder: GpuHistogramBuilder,
     params: TreeParams,
     bag: List[Int] = [],
@@ -875,6 +892,7 @@ def _grow_tree_gpu_device_search(
         and builder.open_resident(params.num_leaves)
     ):
         return _device_search_resident(
+            profile,
             builder,
             searcher,
             split_params,
@@ -884,6 +902,12 @@ def _grow_tree_gpu_device_search(
             tree_index,
             n_root,
         )
+    # Not instrumented: the incremental loop is the fallback the resident one
+    # replaced and is reachable only when residency declines or
+    # `MOJOTREES_GPU_SPLIT_RESIDENT=0` forces it. A profile of a run that took
+    # this path reports an empty table rather than a wrong one, which is the
+    # honest failure; wiring it is a small job and was left undone rather than
+    # half done.
     return _device_search_incremental(
         builder,
         searcher,
@@ -1062,6 +1086,7 @@ def _device_search_incremental(
 
 
 def _device_search_resident(
+    mut profile: PhaseProfile,
     mut builder: GpuHistogramBuilder,
     mut searcher: GpuSplitSearcher,
     split_params: GpuSplitParams,
@@ -1167,6 +1192,16 @@ def _device_search_resident(
     # separate the phases, paying two extra device waits per split that an
     # untraced run does not.
     var phase_trace = getenv("MOJOTREES_GPU_PHASE_TRACE") == "1"
+    # The per-phase, per-node-size instrument (phase_profile.mojo), which is
+    # the same three phases broken down by node class and carrying launch and
+    # synchronization counts beside the time. Its `fenced` mode inserts the
+    # same drains `phase_trace` does, which is why the two share one flag
+    # here: either instrument asking for a fence gets one, and neither
+    # changes the tree.
+    var fence = phase_trace or profile.fenced()
+    var n_slots = len(builder.active)
+    profile.begin_tree(n_root, builder.n_rows)
+    var profile_t0 = profile.clock()
     var t_partition = 0.0
     var t_hist = 0.0
     var t_search = 0.0
@@ -1181,9 +1216,28 @@ def _device_search_resident(
     if root_slot < 0:
         raise Error("the resident histogram pool is full at the root")
     var hist_t0 = perf_counter_ns()
+    var root_hist_started = profile.clock()
     builder.enqueue_resident_leaf(root, root_slot)
-    if phase_trace:
+    if fence:
         builder.ctx.synchronize()
+    # The launch count comes off the resolved plan rather than a constant,
+    # because the tiled and atomic strategies cost different numbers of them
+    # and the policy is the only thing that knows which ran. Behind
+    # `enabled()` because deriving a plan is real work this run has no other
+    # reason to do.
+    var root_launches = 0
+    if profile.enabled():
+        root_launches = builder.histogram_plan(n_root).gpu_launches()
+    profile.note_node()
+    profile.charge(
+        PROF_HISTOGRAM,
+        n_root,
+        root_hist_started,
+        dispatches=root_launches,
+        syncs=1 if fence else 0,
+        slots_per_row=n_slots,
+        cells=builder.n_features * builder.n_bins,
+    )
     t_hist += Float64(perf_counter_ns() - hist_t0) / 1e9
     var root_batch = List[SplitNodeRequest]()
     root_batch.append(
@@ -1198,6 +1252,7 @@ def _device_search_resident(
     # behind the histogram build with no fence, and they read the pool
     # buffer the build just wrote rather than a copy of it.
     var search_t0 = perf_counter_ns()
+    var root_search_started = profile.clock()
     searcher.enqueue_frontier(
         builder.batcher[0].out_dev,
         root_batch,
@@ -1205,7 +1260,22 @@ def _device_search_resident(
         builder.g_scale,
         builder.h_scale,
     )
+    profile.charge(
+        PROF_SPLIT_SEARCH,
+        n_root,
+        root_search_started,
+        dispatches=SPLIT_SEARCH_DEVICE_LAUNCHES,
+        cells=builder.n_features * builder.n_bins,
+    )
+    # The batch's one wait. `download_frontier` copies the record buffer and
+    # synchronizes inside the same call, so this charge is the copy and the
+    # wait together and the sync count is what separates them. Under `async`
+    # this is also where every kernel enqueued since the last wait actually
+    # finishes, which is why a device arm's `transfer` line is large and its
+    # `histogram` line is small: see the mode note in phase_profile.mojo.
+    var root_dl_started = profile.clock()
     var root_recs = searcher.download_frontier(1)
+    profile.charge(PROF_TRANSFER, n_root, root_dl_started, syncs=1)
     t_search += Float64(perf_counter_ns() - search_t0) / 1e9
     var root_rec = root_recs[0].copy()
     _apply_shape_rules(root_rec, n_root, 0, params)
@@ -1262,8 +1332,11 @@ def _device_search_resident(
             var batch = List[SplitNodeRequest](capacity=2 * (upto - taken))
             var pending = List[_GpuPendingSplit](capacity=upto - taken)
 
+            var batch_rows = 0
             for pick in range(taken, upto):
+                batch_rows += frontier[picks[pick]].n_rows
                 _enqueue_resident_split(
+                    profile,
                     builder,
                     tree,
                     frontier,
@@ -1276,10 +1349,17 @@ def _device_search_resident(
                     pending,
                     t_partition,
                     t_hist,
-                    phase_trace,
+                    fence,
                 )
 
             search_t0 = perf_counter_ns()
+            # A batch is charged at the rows its parents held, so a level's
+            # search lands in the class those parents were in. Two launches
+            # per batch however wide it is, which under leaf-wise growth is
+            # two per split and under depth-wise growth is two per level; that
+            # difference is exactly what a depth-wise comparison would read
+            # off the `dispatches` column.
+            var batch_search_started = profile.clock()
             searcher.enqueue_frontier(
                 builder.batcher[0].out_dev,
                 batch,
@@ -1287,10 +1367,21 @@ def _device_search_resident(
                 builder.g_scale,
                 builder.h_scale,
             )
+            profile.charge(
+                PROF_SPLIT_SEARCH,
+                batch_rows,
+                batch_search_started,
+                dispatches=SPLIT_SEARCH_DEVICE_LAUNCHES,
+                cells=len(batch) * builder.n_features * builder.n_bins,
+            )
             # The batch's one wait, and what upholds the staging contracts on
             # both sides: the batcher's pinned item table and the searcher's
             # pinned node tables are only restaged after this returns.
+            var batch_dl_started = profile.clock()
             var recs = searcher.download_frontier(len(batch))
+            profile.charge(
+                PROF_TRANSFER, batch_rows, batch_dl_started, syncs=1
+            )
             t_search += Float64(perf_counter_ns() - search_t0) / 1e9
 
             for k in range(len(pending)):
@@ -1344,10 +1435,12 @@ def _device_search_resident(
 
     tree.n_leaves = n_leaves
     builder.release_resident_all()
+    profile.end_tree(profile_t0)
     return tree^
 
 
 def _enqueue_resident_split(
+    mut profile: PhaseProfile,
     mut builder: GpuHistogramBuilder,
     mut tree: Tree,
     mut frontier: List[_GpuRecordLeafState],
@@ -1360,7 +1453,7 @@ def _enqueue_resident_split(
     mut pending: List[_GpuPendingSplit],
     mut t_partition: Float64,
     mut t_hist: Float64,
-    phase_trace: Bool,
+    fence: Bool,
 ) raises:
     """Commit one split of `frontier[index]` into `tree` and enqueue the
     device work its two children need, without waiting for any of it.
@@ -1393,6 +1486,11 @@ def _enqueue_resident_split(
     var left_node = tree._add_node(0.0, Float64(n_left))
     var right_node = tree._add_node(0.0, Float64(n_right))
     var part_t0 = perf_counter_ns()
+    # Charged at the parent's rows, because the partition walks the parent's
+    # window and writes it back; filing it under a child would split one cost
+    # across two classes.
+    var part_rows = n_left + n_right
+    var part_started = profile.clock()
     builder.apply_split(
         split.feature,
         split.bin,
@@ -1405,8 +1503,15 @@ def _enqueue_resident_split(
         split.cat_bitset,
         expected_left=n_left,
     )
-    if phase_trace:
+    if fence:
         builder.ctx.synchronize()
+    profile.charge(
+        PROF_PARTITION,
+        part_rows,
+        part_started,
+        dispatches=PARTITION_LAUNCHES,
+        syncs=1 if fence else 0,
+    )
     t_partition += Float64(perf_counter_ns() - part_t0) / 1e9
 
     var children = _commit_device_split(
@@ -1431,6 +1536,9 @@ def _enqueue_resident_split(
     var built_node = left_node if build_left else right_node
     var derived_node = right_node if build_left else left_node
     var hist_t0 = perf_counter_ns()
+    var built_rows = n_left if build_left else n_right
+    var derived_rows = n_right if build_left else n_left
+    var hist_started = profile.clock()
     var built_slot = builder.acquire_resident(built_node)
     if built_slot < 0:
         raise Error(
@@ -1442,8 +1550,29 @@ def _enqueue_resident_split(
         built_node, built_slot, parent_slot
     )
     builder.reown_resident(parent_slot, derived_node)
-    if phase_trace:
+    if fence:
         builder.ctx.synchronize()
+    var hist_launches = 0
+    if profile.enabled():
+        hist_launches = builder.histogram_plan(built_rows).gpu_launches()
+    profile.note_node()
+    profile.charge(
+        PROF_HISTOGRAM,
+        built_rows,
+        hist_started,
+        dispatches=hist_launches,
+        syncs=1 if fence else 0,
+        slots_per_row=len(builder.active),
+        cells=builder.n_features * builder.n_bins,
+    )
+    # The sibling subtraction rides inside that same kernel here rather than
+    # costing a launch of its own, which is why it is charged with no time,
+    # no launch, and only a `calls` entry at the derived child's size. That
+    # zero is the finding: on the host path this phase is a whole per-cell
+    # pass and on this path it is free, and the two profiles put those side
+    # by side under one name.
+    profile.note_node()
+    profile.charge(PROF_SUBTRACT, derived_rows, 0, cells=0)
     t_hist += Float64(perf_counter_ns() - hist_t0) / 1e9
     var left_slot = built_slot if build_left else parent_slot
     var right_slot = parent_slot if build_left else built_slot
@@ -1486,7 +1615,95 @@ def _enqueue_resident_split(
     )
 
 
+def _build_leaf_profiled(
+    mut profile: PhaseProfile,
+    mut builder: GpuHistogramBuilder,
+    leaf: Int,
+    node_rows: Int,
+    fence: Bool,
+) raises -> Histogram:
+    """`builder.build_leaf(leaf)`, with its three parts charged to three
+    phases instead of one.
+
+    `build_leaf` is `enqueue_leaf` then `download_raw` then
+    `histogram_from_host`, and those are a per-row-slot accumulate, a fixed
+    `3 * n_features * n_bins` copy with a host wait inside it, and a per-cell
+    dequantization. Charging them together would say a small node's histogram
+    is expensive without saying that almost none of the expense is the rows,
+    which is the question this instrument exists for.
+
+    An off profile takes the `build_leaf` call itself, unchanged, so the
+    default path is not merely equivalent to what shipped -- it is the same
+    call. The profiled arm is that method's body written out, and if
+    `build_leaf` ever gains a fourth step this function will silently stop
+    matching it. That is the price of not editing histogram_gpu.mojo from
+    this lane, and it is noted here so the next reader can pay it or fix it.
+    """
+    if not profile.enabled():
+        return builder.build_leaf(leaf)
+    var cells = builder.n_features * builder.n_bins
+    var launches = builder.histogram_plan(node_rows).gpu_launches()
+    var acc_started = profile.clock()
+    builder.enqueue_leaf(leaf)
+    if fence:
+        builder.ctx.synchronize()
+    profile.note_node()
+    profile.charge(
+        PROF_HISTOGRAM,
+        node_rows,
+        acc_started,
+        dispatches=launches,
+        syncs=1 if fence else 0,
+        slots_per_row=len(builder.active),
+        cells=cells,
+    )
+    # The copy and the wait it carries. `download_raw` does both in one call,
+    # so this is one charge with a sync count of one rather than two charges;
+    # separating them needs a change inside histogram_gpu.mojo.
+    var dl_started = profile.clock()
+    builder.download_raw()
+    profile.charge(
+        PROF_TRANSFER, node_rows, dl_started, syncs=1, cells=cells
+    )
+    var cv_started = profile.clock()
+    var hist = builder.histogram_from_host()
+    profile.charge(PROF_CONVERT, node_rows, cv_started, cells=cells)
+    return hist^
+
+
 def grow_tree_gpu(
+    mut builder: GpuHistogramBuilder,
+    params: TreeParams,
+    bag: List[Int] = [],
+    tree_index: Int = 0,
+    split_search: Int = SPLIT_SEARCH_AUTO,
+    data: BinnedMatrix = BinnedMatrix(List[UInt8](), 0, 0, 0),
+) raises -> Tree:
+    """`grow_tree_gpu_profiled` with a profile of its own, reported per tree.
+
+    The signature that shipped, unchanged, and the entry point every caller
+    that does not accumulate a profile across a fit uses. With
+    `MOJOTREES_PHASE_PROFILE` unset -- the default -- this costs one `getenv`
+    and one bucket allocation per tree, prints nothing, and grows exactly the
+    tree it grew before the instrument existed. With it set, one `scope=tree`
+    block is printed per tree; `_train_gpu_rounds` owns a `PhaseProfile`
+    across the whole fit and calls the profiled form instead, which is why a
+    `train_gpu` run reports one block and a direct `grow_tree_gpu` caller
+    reports one per tree.
+
+    A `mut` argument cannot be defaulted, which is why the profile is a second
+    entry point rather than a defaulted parameter.
+    """
+    var profile = PhaseProfile.from_env(SCOPE_TREE, String("grow_tree_gpu"))
+    var tree = grow_tree_gpu_profiled(
+        profile, builder, params, bag, tree_index, split_search, data
+    )
+    profile.print_report()
+    return tree^
+
+
+def grow_tree_gpu_profiled(
+    mut profile: PhaseProfile,
     mut builder: GpuHistogramBuilder,
     params: TreeParams,
     bag: List[Int] = [],
@@ -1553,7 +1770,9 @@ def grow_tree_gpu(
         resolve_split_search_for(builder, params, split_search)
         == SPLIT_SEARCH_DEVICE
     ):
-        return _grow_tree_gpu_device_search(builder, params, bag, tree_index)
+        return _grow_tree_gpu_device_search(
+            profile, builder, params, bag, tree_index
+        )
     check_grow_policy(params.grow_policy)
     params.constraints.check_features(builder.n_features)
     params.monotone.check_features(builder.n_features)
@@ -1593,6 +1812,10 @@ def grow_tree_gpu(
     # otherwise absorb it, so a traced run pays one extra device wait per
     # split (~0.15ms) that an untraced run does not.
     var phase_trace = getenv("MOJOTREES_GPU_PHASE_TRACE") == "1"
+    # See `_device_search_resident`: one flag for both instruments' fences, so
+    # a fenced profile and the older trace never disagree about how many
+    # drains a split performed.
+    var fence = phase_trace or profile.fenced()
     var t_partition = 0.0
     var t_hist = 0.0
     var t_search = 0.0
@@ -1600,6 +1823,9 @@ def grow_tree_gpu(
 
     builder.begin_tree(bag)
     var n_root = len(bag) if len(bag) > 0 else builder.n_rows
+    profile.begin_tree(n_root, builder.n_rows)
+    var profile_t0 = profile.clock()
+    var hist_cells = builder.n_features * builder.n_bins
 
     # --- Hybrid leaf scheduling (MOJOTREES_HYBRID_LEAVES) -----------------
     # Off unless the environment asks, and a no-op when it does not: the
@@ -1674,7 +1900,9 @@ def grow_tree_gpu(
 
     var root = tree._add_node(0.0, Float64(n_root))
     var hist_t0 = perf_counter_ns()
-    var root_hist = builder.build_leaf(root)
+    var root_hist = _build_leaf_profiled(
+        profile, builder, root, n_root, fence
+    )
     t_hist += Float64(perf_counter_ns() - hist_t0) / 1e9
     # Valued before the search, because path smoothing makes a candidate's
     # children shrink toward this value; the root smooths toward 0.0.
@@ -1690,6 +1918,7 @@ def grow_tree_gpu(
     )
     var root_branch = List[Int]()
     var search_t0 = perf_counter_ns()
+    var root_search_started = profile.clock()
     var root_split = _search(
         root_hist,
         n_root,
@@ -1712,6 +1941,13 @@ def grow_tree_gpu(
         tree_index=tree_index,
         parent_output=tree.value[root],
         grower_applies_extra=True,
+    )
+    # The host scan, on this path, over the node's own feature draw. Same
+    # phase name the device scan uses, which is the point of a shared
+    # vocabulary: a host-search arm and a device-search arm put their split
+    # selection on the same line.
+    profile.charge(
+        PROF_SPLIT_SEARCH, n_root, root_search_started, cells=hist_cells
     )
     t_search += Float64(perf_counter_ns() - search_t0) / 1e9
 
@@ -1760,6 +1996,7 @@ def grow_tree_gpu(
         var left_node = tree._add_node(0.0, Float64(n_left))
         var right_node = tree._add_node(0.0, Float64(n_right))
         var part_t0 = perf_counter_ns()
+        var part_started = profile.clock()
         builder.apply_split(
             split.feature,
             split.bin,
@@ -1772,8 +2009,16 @@ def grow_tree_gpu(
             split.cat_bitset,
             expected_left=n_left,
         )
-        if phase_trace:
+        if fence:
             builder.ctx.synchronize()
+        # At the parent's rows, which is the window the partition walks.
+        profile.charge(
+            PROF_PARTITION,
+            frontier[best_i].n_rows,
+            part_started,
+            dispatches=PARTITION_LAUNCHES,
+            syncs=1 if fence else 0,
+        )
         t_partition += Float64(perf_counter_ns() - part_t0) / 1e9
 
         # Both children, however the launch policy wants them. Batched,
@@ -1898,9 +2143,30 @@ def grow_tree_gpu(
                     hybrid_live = False
         if not hy_direct_done:
             if builder.batches_nodes(child_nodes):
+                # One launch group for both children, so both are charged to
+                # `histogram` at their own sizes and neither pays a
+                # subtraction. The launch count belongs to the pair, so it is
+                # charged once, against the larger child.
+                var batch_started = profile.clock()
                 var pair = builder.build_leaves(child_nodes)
                 left_hist = pair[0].copy()
                 right_hist = pair[1].copy()
+                var batch_launches = 0
+                if profile.enabled():
+                    batch_launches = builder.histogram_plan(
+                        n_left if n_left > n_right else n_right
+                    ).gpu_launches()
+                profile.note_node()
+                profile.note_node()
+                profile.charge(
+                    PROF_HISTOGRAM,
+                    n_left + n_right,
+                    batch_started,
+                    dispatches=batch_launches,
+                    syncs=1,
+                    slots_per_row=len(builder.active),
+                    cells=2 * hist_cells,
+                )
             elif subtraction_builds_left(n_left, n_right):
                 # Which child is built and which is derived is
                 # `gpu_frontier.subtraction_builds_left`, whose docstring
@@ -1908,14 +2174,28 @@ def grow_tree_gpu(
                 # Written once so a batched grower and this one cannot pick
                 # different children and then disagree about which histogram
                 # a slot holds.
-                left_hist = builder.build_leaf(left_node)
+                left_hist = _build_leaf_profiled(
+                    profile, builder, left_node, n_left, fence
+                )
+                var sub_started = profile.clock()
                 right_hist = subtract_histogram(
                     frontier[best_i].hist, left_hist
                 )
+                profile.note_node()
+                profile.charge(
+                    PROF_SUBTRACT, n_right, sub_started, cells=hist_cells
+                )
             else:
-                right_hist = builder.build_leaf(right_node)
+                right_hist = _build_leaf_profiled(
+                    profile, builder, right_node, n_right, fence
+                )
+                var sub_started = profile.clock()
                 left_hist = subtract_histogram(
                     frontier[best_i].hist, right_hist
+                )
+                profile.note_node()
+                profile.charge(
+                    PROF_SUBTRACT, n_left, sub_started, cells=hist_cells
                 )
         t_hist += Float64(perf_counter_ns() - hist_t0) / 1e9
 
@@ -1974,6 +2254,7 @@ def grow_tree_gpu(
         # Each child draws its own per-node feature set from its node id, the
         # same id the CPU grower would assign it.
         search_t0 = perf_counter_ns()
+        var left_search_started = profile.clock()
         var left_split = _search(
             left_hist,
             n_left,
@@ -1998,6 +2279,10 @@ def grow_tree_gpu(
             parent_output=left_value,
             grower_applies_extra=True,
         )
+        profile.charge(
+            PROF_SPLIT_SEARCH, n_left, left_search_started, cells=hist_cells
+        )
+        var right_search_started = profile.clock()
         var right_split = _search(
             right_hist,
             n_right,
@@ -2021,6 +2306,9 @@ def grow_tree_gpu(
             tree_index=tree_index,
             parent_output=right_value,
             grower_applies_extra=True,
+        )
+        profile.charge(
+            PROF_SPLIT_SEARCH, n_right, right_search_started, cells=hist_cells
         )
         t_search += Float64(perf_counter_ns() - search_t0) / 1e9
 
@@ -2081,6 +2369,7 @@ def grow_tree_gpu(
         )
 
     tree.n_leaves = n_leaves
+    profile.end_tree(profile_t0)
     return tree^
 
 
@@ -2150,6 +2439,12 @@ def _train_gpu_rounds[
         var renew_w = renewal_weights(objective, target, sample_weight)
         var renew_a = renewal_alpha(objective, alpha)
         var trees = List[Tree]()
+        # One profile for the whole fit rather than one per tree, so a
+        # hundred rounds produce one table to diff instead of a hundred
+        # (phase_profile.mojo). Off unless `MOJOTREES_PHASE_PROFILE` says
+        # otherwise, and an off profile reads no clock and writes no counter,
+        # so the ensemble is the same ensemble either way.
+        var profile = PhaseProfile.from_env(SCOPE_FIT, String("train_gpu"))
 
         # Built-in objectives without row sampling generate their gradients
         # on the device and advance the raw scores there too, so a round
@@ -2183,12 +2478,21 @@ def _train_gpu_rounds[
                 # and as the CPU trainer, so round i grows on identical
                 # rows whichever path produced its gradients.
                 refresh_bag(dev_bag, bagging, n, i)
+                var dev_grad_started = profile.clock()
                 builder.fill_gradients_device(state, objective, alpha)
+                # The device objective kernels. Enqueued, not waited for, so
+                # under `async` this charge is the enqueue and the work lands
+                # in whatever waits next; that is the same caveat the device
+                # histogram line carries.
+                profile.charge(PROF_GRAD_FILL, n, dev_grad_started)
+                profile.note_wall(dev_grad_started)
                 life.begin_tree()
-                var tree = grow_tree_gpu(
-                    builder, params.tree, dev_bag, i, split_search, data=data
+                var tree = grow_tree_gpu_profiled(
+                    profile, builder, params.tree, dev_bag, i, split_search,
+                    data=data,
                 )
                 life.end_tree()
+                var dev_post_started = profile.clock()
                 if renews:
                     # Renewal is a host-side weighted percentile, so the
                     # renewing objectives pay one raw-score download per
@@ -2201,6 +2505,7 @@ def _train_gpu_rounds[
                     )
                 if tree.n_leaves == 1 and abs(tree.value[0]) < 1e-12:
                     life.end_round()
+                    profile.note_wall(dev_post_started)
                     # Under bagging a degenerate tree indicts this sample,
                     # not the run, exactly as on the host path.
                     if bagging_enabled(bagging):
@@ -2223,6 +2528,8 @@ def _train_gpu_rounds[
                     )
                 trees.append(tree^)
                 life.end_round()
+                profile.note_wall(dev_post_started)
+            profile.print_report()
             return Booster(
                 trees^,
                 base_score,
@@ -2239,7 +2546,9 @@ def _train_gpu_rounds[
         var bag = List[Int]()
         for i in range(params.n_estimators):
             life.begin_round()
+            var pre_started = profile.clock()
             refresh_bag(bag, bagging, n, i)
+            var grad_started = profile.clock()
             _fill_grad_hess(
                 raw, target, objective, sample_weight, alpha, grad, hess
             )
@@ -2247,12 +2556,20 @@ def _train_gpu_rounds[
             # uploaded, so the device histograms already carry the
             # compensation multiplier.
             goss_round(bag, grad, hess, goss, i, params.learning_rate)
+            profile.charge(PROF_GRAD_FILL, n, grad_started)
+            # The round's one per-row upload, which the device-objective path
+            # above does not pay at all. Its own charge so the two paths can
+            # be told apart by what crosses rather than by which branch ran.
+            var upload_started = profile.clock()
             builder.upload_gradients(grad, hess)
+            profile.charge(PROF_TRANSFER, n, upload_started)
+            profile.note_wall(pre_started)
             life.begin_tree()
-            var tree = grow_tree_gpu(
-                builder, params.tree, bag, i, split_search, data=data
+            var tree = grow_tree_gpu_profiled(
+                profile, builder, params.tree, bag, i, split_search, data=data
             )
             life.end_tree()
+            var post_started = profile.clock()
             if renews:
                 _renew_leaf_values(
                     tree, data, target, raw, renew_w, renew_a, bag, signs,
@@ -2265,15 +2582,24 @@ def _train_gpu_rounds[
             # so the round is skipped and the next sample gets its turn.
             if tree.n_leaves == 1 and abs(tree.value[0]) < 1e-12:
                 life.end_round()
+                profile.note_wall(post_started)
                 if bagging_enabled(bagging) or goss.enabled:
                     continue
                 break
 
+            # The same serial full-tree traversal of every row the CPU
+            # trainer performs, on the arm of the GPU trainer whose raw
+            # scores live on the host. Same phase name, so the two backends'
+            # score updates sit on the same line.
+            var update_started = profile.clock()
             for r in range(n):
                 raw[r] += params.learning_rate * tree.predict_row(data, r)
+            profile.charge(PROF_SCORE_UPDATE, n, update_started)
             trees.append(tree^)
             life.end_round()
+            profile.note_wall(post_started)
 
+        profile.print_report()
         return Booster(
             trees^,
             base_score,
