@@ -63,8 +63,6 @@ round. The rest are O(rows), O(nnz), or O(nodes).
 
 from std.math import isfinite, isnan
 
-from .sequence import CancelToken
-
 
 # ---------------------------------------------------------------------------
 # Ceilings
@@ -1652,10 +1650,10 @@ def check_control_code(code: Int, phase: String, iteration: Int) raises -> Int:
     return code
 
 
-@fieldwise_init
-# `CancelToken` is `sequence.CancelToken`: one token for chunk drivers and
+# `CancelToken` lives in `sequence.mojo`: one token for chunk drivers and
 # training loops alike (`live()`, `cancel(reason)`, `is_cancelled()`,
-# `why()`, `check(where)` are the spellings this module's callers use).
+# `why()`, `check(where)` are the spellings this module's callers use), and
+# the package root exports it from there.
 
 
 def check_cleanup_balanced(

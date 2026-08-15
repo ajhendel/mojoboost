@@ -61,6 +61,10 @@ from .growth_policy import (
 )
 from .split import SplitInfo, find_best_split, soft_threshold_l1
 from .tree import Tree, TreeParams, grow_tree, node_bounds
+# Linear leaves (LightGBM's linear_tree / linear_lambda): the switch a
+# `BoosterParams` carries, the sidecar a fitted `Booster` carries, and the
+# build-level availability query.
+from .linear_tree import LinearEnsemble, LinearParams, linear_tree_available
 from .boosting import (
     BINARY_LOGISTIC,
     CROSS_ENTROPY,
@@ -114,9 +118,10 @@ from .trainset import (
 # Chunked ingestion and external-memory construction: the `Sequence`
 # protocol a source hands its rows through a block at a time, and the
 # two-pass binner that turns one into a cache of binned chunks plus the
-# trainers that read such a cache. `CancelToken` is exported from
-# `.validation` below (it is `sequence.CancelToken`).
+# trainers that read such a cache. `CancelToken` is `sequence.CancelToken`,
+# the one token chunk drivers and training loops share.
 from .sequence import (
+    CancelToken,
     SEQ_BUDGET,
     SEQ_CANCELLED,
     SEQ_NOT_REPEATABLE,
@@ -653,7 +658,6 @@ from .serialize import (
     save_multiclass_model,
 )
 from .validation import (
-    CancelToken,
     check_booster_ranges,
     check_class_codes,
     check_compressed,
