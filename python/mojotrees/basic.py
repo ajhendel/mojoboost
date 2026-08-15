@@ -696,21 +696,36 @@ class Dataset:
     # -- subsets and prepared tables --------------------------------------
 
     @staticmethod
-    def _field_list(handle, field):
-        """One of a constructed dataset's optional columns, read from the
-        native side. Empty means the dataset has none."""
-        return [float(v) for v in _mojotrees.dataset_field(handle, field)]
+    def _field_buffer(handle, field):
+        """One of a constructed dataset's optional columns as the float64
+        buffer this class keeps its columns in, or None when the dataset
+        has none.
+
+        Sized by `dataset_field_length` and filled by `dataset_copy_field`
+        into a buffer this side owns, the preallocated-output convention
+        `feature_importance` uses; `Booster.eval` passes these buffers'
+        addresses, so a dataset this process did not build holds real
+        buffers rather than lists.
+        """
+        n = int(_mojotrees.dataset_field_length(handle, field))
+        if n == 0:
+            return None
+        out = _arrays.out_buffer(n)
+        written = int(
+            _mojotrees.dataset_copy_field(handle, field, _arrays.addr(out), n)
+        )
+        if written != n:
+            raise RuntimeError(
+                f"dataset field {field!r}: {written} values written into a "
+                f"buffer sized for {n}"
+            )
+        return out
 
     @staticmethod
-    def _field_buffer(handle, field):
-        """`_field_list` as the float64 buffer this class keeps its columns
-        in, or None. `Booster.eval` passes their addresses, so a dataset
-        this process did not build has to hold real buffers rather than
-        lists."""
-        values = Dataset._field_list(handle, field)
-        if not values:
-            return None
-        return _arrays.f64_vector(values, len(values), field)
+    def _field_list(handle, field):
+        """One optional column as a list of floats (`dataset_field`, the
+        list-returning read). Empty means the dataset has none."""
+        return [float(v) for v in _mojotrees.dataset_field(handle, field)]
 
     @classmethod
     def _from_handle(cls, handle):
@@ -726,8 +741,8 @@ class Dataset:
         meta = _mojotrees.dataset_metadata(handle)
         self._handle = handle
         self._sparse = bool(meta["is_sparse"])
-        self._n_rows = int(meta["num_data"])
-        self._n_features = int(meta["num_feature"])
+        self._n_rows = int(_mojotrees.dataset_num_data(handle))
+        self._n_features = int(_mojotrees.dataset_num_feature(handle))
         self.params = {
             "max_bin": int(meta["max_bin"]),
             "use_missing": bool(meta["use_missing"]),
@@ -842,6 +857,34 @@ class Dataset:
         since a bin count is a property of fitted bins."""
         return int(_mojotrees.dataset_num_bin(self._constructed()))
 
+    def feature_num_bin(self, feature):
+        """LightGBM's `Dataset.feature_num_bin`: how many bins one feature
+        can take under the fitted binning, read from the bin mapper rather
+        than counted off the data. Constructs the dataset."""
+        return int(
+            _mojotrees.dataset_feature_num_bin(self._constructed(), int(feature))
+        )
+
+    def bin_upper_bounds(self, feature):
+        """The fitted bin edges of one numerical feature, ascending. A
+        feature with `k` edges uses bins `0..k`: a value lands in the first
+        bin whose edge it does not exceed, and a value above every edge in
+        the last. Raises for a categorical feature, whose bins are category
+        codes. Constructs the dataset."""
+        return [
+            float(v)
+            for v in _mojotrees.dataset_bin_upper_bounds(
+                self._constructed(), int(feature)
+            )
+        ]
+
+    def missing_bins(self):
+        """The bin each feature reserves for missing values, or -1 where
+        none is reserved; one entry per feature. Constructs the dataset."""
+        return [
+            int(v) for v in _mojotrees.dataset_missing_bins(self._constructed())
+        ]
+
     @property
     def is_sparse(self):
         """Whether the binned matrix is sparse, which is decided by what the
@@ -904,7 +947,13 @@ class Dataset:
         return self._raw
 
     def get_field(self, field_name):
-        """LightGBM's `get_field`, for the fields mojotrees keeps."""
+        """LightGBM's `get_field`, for the fields mojotrees keeps.
+
+        A constructed dataset answers from the native side, through
+        `dataset_field_length` and `dataset_copy_field`, so what comes back
+        is what the trainer will read; before construction the column as
+        it was passed in is what there is.
+        """
         getters = {
             "label": self.get_label,
             "weight": self.get_weight,
@@ -916,6 +965,13 @@ class Dataset:
                 f"unknown field {field_name!r}; a mojotrees Dataset holds "
                 + ", ".join(sorted(getters))
             )
+        if self._handle is not None:
+            buf = self._field_buffer(self._handle, field_name)
+            if buf is None:
+                return None
+            if field_name == "group":
+                return [int(v) for v in buf]
+            return _finish(buf)
         return getters[field_name]()
 
     def __repr__(self):
@@ -1073,7 +1129,9 @@ class Booster:
 
     def num_trees(self):
         """Trees in the ensemble."""
-        return self.current_iteration() * self.num_model_per_iteration()
+        if self._n_classes:
+            return self.current_iteration() * self.num_model_per_iteration()
+        return int(_mojotrees.num_trees(self._handle))
 
     def num_feature(self):
         """Features the model was trained on."""
@@ -1656,6 +1714,40 @@ class Booster:
 
     # -- model IO --------------------------------------------------------
 
+    def model_to_json(self, feature_names=None):
+        """The `dump_model` schema as a JSON string produced natively
+        (`dump_model_json`), the form the C ABI and the CLI emit.
+
+        `dump_model()` stays the Python answer: its dict carries the model's
+        exact float bits, and JSON floats are decimal, so the two are the
+        same schema at two precisions. Use this when the consumer wants
+        text; the keys are the ones in docs/MODEL_INSPECTION_SCHEMA.md.
+        """
+        names = self._names if feature_names is None else feature_names
+        names = [] if names is None else [str(n) for n in names]
+        if self._n_classes:
+            return str(
+                _mojotrees.dump_model_json_multiclass(
+                    self._handle, names, len(names)
+                )
+            )
+        return str(_mojotrees.dump_model_json(self._handle, names, len(names)))
+
+    @staticmethod
+    def file_kind(path):
+        """What a mojotrees file holds, from its header alone:
+        `"objective"` (a single-output model), `"multiclass"`, or
+        `"dataset"` (a prepared binned dataset, `Dataset.save_binned`)."""
+        return str(_mojotrees.file_kind(str(path)))
+
+    @staticmethod
+    def model_file_kind(path):
+        """Which loader a saved model needs, `"objective"` or
+        `"multiclass"`, from the header alone. Refuses a dataset file by
+        name; `file_kind` is the question for a caller that does not yet
+        know what it was handed."""
+        return str(_mojotrees.model_file_kind(str(path)))
+
     def save_model(self, filename):
         """Write the model to `filename` in mojotrees's versioned text
         format. The format is mojotrees's own and is not LightGBM's.
@@ -1709,13 +1801,16 @@ class Booster:
         them. With neither, `_names` stays None and `feature_name()`
         reports `Column_i`, because the model names nothing.
         """
-        try:
-            self._handle = _mojotrees.load(path)
-            self._n_classes = 0
-        except Exception:
+        # The header says which loader the file needs, so a corrupt file
+        # and the wrong loader are no longer the same exception.
+        kind = self.model_file_kind(path)
+        if kind == "multiclass":
             self._handle = _mojotrees.load_multiclass(path)
             self._n_classes = int(_mojotrees.n_classes(self._handle))
             self._task = _eval.MULTICLASS
+        else:
+            self._handle = _mojotrees.load(path)
+            self._n_classes = 0
         names = list(_mojotrees.model_feature_names(path))
         if names:
             self._names = [str(name) for name in names]

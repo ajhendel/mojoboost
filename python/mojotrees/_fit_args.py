@@ -18,9 +18,10 @@ through `_objective_status`, `_unimplemented_objectives`, and
 
 import operator as _operator
 
-from . import _arrays, _eval
+from . import _arrays, _compat, _eval
 
 _np = _arrays.np
+_mojotrees = _compat.import_extension()
 _as_f64_vector = _arrays.f64_vector
 
 
@@ -61,18 +62,12 @@ _OTHER_ESTIMATOR_OBJECTIVES = {
 }
 
 
-def _registry():
-    from . import _compat
-
-    return _compat.import_extension()
-
-
 def _unimplemented_objectives():
     """LightGBM objectives mojotrees does not implement, alias -> reason,
     read from the compiled registry (`registry_objective_unimplemented`);
     the reason is the trainer's own sentence. Nothing here restates it."""
     out = {}
-    for record in _registry().registry_objective_unimplemented():
+    for record in _mojotrees.registry_objective_unimplemented():
         alias, _canonical, reason = (str(v) for v in record)
         out[alias] = reason
     return out
@@ -81,7 +76,7 @@ def _unimplemented_objectives():
 #: The three answers `objective_name_status` gives, by their registry
 #: names, so a caller branches on a word rather than a number.
 def _objective_status_codes():
-    vocab = _registry().registry_vocabulary()
+    vocab = _mojotrees.registry_vocabulary()
     return {
         "supported": int(vocab["name_supported"]),
         "unimplemented": int(vocab["name_unimplemented"]),
@@ -94,7 +89,7 @@ def _objective_status(name):
     spelling, from the registry, without raising."""
     if not isinstance(name, str):
         return "unknown"
-    code = int(_registry().objective_name_status(name.strip().lower()))
+    code = int(_mojotrees.objective_name_status(name.strip().lower()))
     for word, value in _objective_status_codes().items():
         if value == code:
             return word
@@ -107,7 +102,7 @@ def _objective_code_of_name(name):
     if not isinstance(name, str):
         return None
     try:
-        return int(_registry().objective_code_of_name(name.strip().lower()))
+        return int(_mojotrees.objective_code_of_name(name.strip().lower()))
     except Exception:
         return None
 
@@ -117,7 +112,7 @@ def _check_objective_param(code, value):
     (`alpha`, `fair_c`, `tweedie_variance_power`), as a ValueError carrying
     the trainer's message. There is no second copy of the ranges here."""
     try:
-        _registry().check_objective_param(int(code), float(value))
+        _mojotrees.check_objective_param(int(code), float(value))
     except Exception as exc:
         raise ValueError(str(exc)) from None
 
@@ -129,12 +124,17 @@ def _unimplemented_objective_note(objective):
     if not isinstance(objective, str):
         return ""
     key = objective.strip().lower()
-    reason = _OTHER_ESTIMATOR_OBJECTIVES.get(key)
-    if reason is None:
-        reason = _unimplemented_objectives().get(key)
-    if reason is None:
+    reasons = [
+        r
+        for r in (
+            _unimplemented_objectives().get(key),
+            _OTHER_ESTIMATOR_OBJECTIVES.get(key),
+        )
+        if r
+    ]
+    if not reasons:
         return ""
-    return f". {objective!r} is not available here: {reason}"
+    return f". {objective!r} is not available here: " + "; ".join(reasons)
 
 #: `grow_policy` spellings and the canonical name each resolves to. XGBoost's
 #: names, since LightGBM has no such parameter; "lossguide" is XGBoost's word

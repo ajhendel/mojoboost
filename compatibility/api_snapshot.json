@@ -1269,14 +1269,30 @@
             "importance_type": "split"
           },
           "feature_name": {},
+          "file_kind": {
+            "path": "required"
+          },
+          "get_leaf_output": {
+            "leaf_id": "required",
+            "tree_id": "required"
+          },
           "get_split_value_histogram": {
             "as_frame": false,
             "bins": null,
             "feature": "required"
           },
+          "lower_bound": {
+            "raw_score": true
+          },
+          "model_file_kind": {
+            "path": "required"
+          },
           "model_from_string": {
             "cls": "required",
             "model_str": "required"
+          },
+          "model_to_json": {
+            "feature_names": null
           },
           "model_to_string": {},
           "num_feature": {},
@@ -1288,13 +1304,41 @@
             "raw_score": false,
             "start_iteration": 0
           },
+          "refit": {
+            "**dataset_kwargs": "varkw",
+            "data": "required",
+            "decay_rate": 0.9,
+            "init_score": null,
+            "label": null,
+            "min_data_in_leaf": 1,
+            "recount": true,
+            "weight": null
+          },
+          "rollback_one_iter": {},
+          "rollback_to": {
+            "num_iteration": "required"
+          },
           "save_model": {
             "filename": "required"
+          },
+          "set_leaf_output": {
+            "leaf_id": "required",
+            "on_monotone": "clamp",
+            "tree_id": "required",
+            "value": "required"
+          },
+          "shuffle_models": {
+            "end_iteration": -1,
+            "seed": 0,
+            "start_iteration": 0
           },
           "trees_to_dataframe": {},
           "trees_to_records": {},
           "update": {
             "num_iteration": 1
+          },
+          "upper_bound": {
+            "raw_score": true
           }
         },
         "properties": []
@@ -1305,7 +1349,13 @@
         ],
         "methods": {
           "__repr__": {},
+          "bin_upper_bounds": {
+            "feature": "required"
+          },
           "construct": {},
+          "feature_num_bin": {
+            "feature": "required"
+          },
           "get_data": {},
           "get_field": {
             "field_name": "required"
@@ -1319,6 +1369,7 @@
             "path": "required"
           },
           "metadata": {},
+          "missing_bins": {},
           "nnz": {},
           "num_bin": {},
           "num_data": {},

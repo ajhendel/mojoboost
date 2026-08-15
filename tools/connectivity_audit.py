@@ -558,31 +558,11 @@ CLASSIFICATION = {
         "wraps it, so device_selection.py runs in its degraded mode.",
     ),
     # -- binding exports Python does not call yet (consolidation K6) ---------
-    # Kept as forward surface after the K6 review (handoffs/consolidation_round.md, K6):
-    # each is a documented LightGBM or C ABI query whose Python reader has not
-    # been written; none duplicates one Python calls.
-    "dataset_bin_upper_bounds": (PENDING, "consolidation_K6", "LightGBM Dataset field reader; basic.py's Dataset does not expose it yet."),
-    "dataset_copy_field": (PENDING, "consolidation_K6", "LightGBM Dataset.get_field; basic.py's Dataset does not expose it yet."),
-    "dataset_feature_num_bin": (PENDING, "consolidation_K6", "LightGBM Dataset.feature_num_bin; basic.py's Dataset does not expose it yet."),
-    "dataset_field_length": (PENDING, "consolidation_K6", "Length query paired with dataset_copy_field; connects with it."),
-    "dataset_missing_bins": (PENDING, "consolidation_K6", "LightGBM Dataset field reader; basic.py's Dataset does not expose it yet."),
-    "check_objective_param": (PENDING, "consolidation_K6", "Registry query beside the four hooks _eval reads; _eval prefers its Python mirror when a hook is missing."),
-    "metric_code_of_name": (PENDING, "consolidation_K6", "Registry query; Python resolves metric names through _eval's mirror today."),
-    "objective_name_status": (PENDING, "consolidation_K6", "Registry query; Python resolves objective names through _eval's mirror today."),
-    "registry_objective_unimplemented": (PENDING, "consolidation_K6", "Registry query; _fit_args restates the unimplemented-objective notes today."),
-    "registry_vocabulary": (PENDING, "consolidation_K6", "Registry vocabularies for a reader of the records; no Python reader yet."),
-    "distributed_check_machine_list": (PENDING, "consolidation_K6", "Companion of distributed_capability; a real transport's Python side reads it."),
-    "distributed_status_message": (PENDING, "consolidation_K6", "Companion of distributed_capability; a real transport's Python side reads it."),
-    "transport_status_message": (PENDING, "consolidation_K6", "Companion of distributed_capability; a real transport's Python side reads it."),
-    "dump_model_json": (PENDING, "consolidation_K6", "JSON dump for the C ABI and CLI; Python builds its dict from dump_model instead."),
-    "dump_model_json_multiclass": (PENDING, "consolidation_K6", "JSON dump for the C ABI and CLI; Python builds its dict from dump_model instead."),
-    "model_file_kind": (PENDING, "consolidation_K6", "Loader kind for a saved model, distinct from file_kind by design; Booster._load_path still tries a loader and reads the exception."),
-    "model_format_versions": (PENDING, "consolidation_K6", "Schema versions a consumer branches on; no Python reader yet."),
-    "file_kind": (PENDING, "consolidation_K6", "Header sniff answering objective / multiclass / dataset; no Python reader yet."),
+    # The K6 forward surface got its Python readers in the integration round
+    # (W8: Dataset field/bin readers, registry lookups in _fit_args and
+    # _eval, model_to_json / file kinds, build_info startup and format
+    # versions, dask machine-list and status texts). One remains:
     "gpu_validation_metric_matches_host": (PENDING, "consolidation_K6", "Companion of the connect_07 gpu_validation surface, reached only through a session Python never opens."),
-    "native_clock_ns": (PENDING, "consolidation_K6", "Startup/report contract of basic_bindings; no Python reader yet."),
-    "startup_environment": (PENDING, "consolidation_K6", "Startup/report contract of basic_bindings; no Python reader yet."),
-    "startup_phase_contract": (PENDING, "consolidation_K6", "Startup/report contract of basic_bindings; no Python reader yet."),
 }
 
 
