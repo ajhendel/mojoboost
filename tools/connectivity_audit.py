@@ -966,11 +966,28 @@ def audit_duplicate_registries():
         if text is None:
             continue
         body = strip_mojo_comments(text)
+        imported = set()
+        for names in mojo_imports(path, text).values():
+            imported.update(names)
+        # `from .x import Y as _Y` binds `_Y` locally; `read_import_list`
+        # reports the source name `Y`, so collect the local alias too.
+        for match in MOJO_IMPORT.finditer(body):
+            _names, consumed = read_import_list(body[match.start(2) :])
+            for piece in body[match.start(2) : match.start(2) + consumed].split(","):
+                words = piece.replace("(", " ").replace(")", " ").split()
+                if len(words) == 3 and words[1] == "as":
+                    imported.add(words[2])
         for match in MOJO_DECL.finditer(body):
             symbol = match.group(1)
             if not symbol.startswith("_"):
                 where[symbol].append(name)
         for match in MOJO_CONST.finditer(body):
+            # `comptime NAME = _NAME` where `_NAME` was imported is a
+            # re-export of another module's constant, not a second
+            # definition; the value is bound once, in the source module.
+            rhs = body[match.end() :].split("\n", 1)[0].strip()
+            if re.match(r"^[A-Za-z_][A-Za-z_0-9]*$", rhs) and rhs in imported:
+                continue
             where[match.group(1)].append(name)
 
     for symbol in sorted(where):
