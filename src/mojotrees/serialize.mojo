@@ -104,6 +104,7 @@ from .model import Model, MulticlassModel
 from .sparse import SparseBinnedMatrix
 from .trainset import Dataset
 from .tree import Tree
+from .validation import check_loaded_tree, check_tree_count, check_tree_header
 
 comptime _MAGIC = "mojotrees"
 comptime _VERSION = "v4"
@@ -705,16 +706,18 @@ def _read_trees(
     if r.next() != "trees":
         raise Error("expected 'trees'")
     var n_trees = r.next_int()
-    if n_trees < 0:
-        raise Error("corrupt tree count")
+    check_tree_count(n_trees)
     var trees = List[Tree](capacity=n_trees)
+    # The ensemble's running node total, threaded through
+    # `check_loaded_tree` so the per-model ceiling is enforced as the file
+    # is read and not after it has been allocated.
+    var total_nodes = 0
     for _ in range(n_trees):
         if r.next() != "tree":
             raise Error("expected 'tree'")
         var n_nodes = r.next_int()
         var n_leaves = r.next_int()
-        if n_nodes < 1 or n_leaves < 1:
-            raise Error("corrupt tree header")
+        check_tree_header(n_nodes, n_leaves)
         var feature = List[Int](capacity=n_nodes)
         var threshold = List[Int](capacity=n_nodes)
         var left = List[Int](capacity=n_nodes)
@@ -817,27 +820,13 @@ def _read_trees(
                 cat_bitset.append(_parse_u64(r.next()))
         else:
             cat_offset.resize(n_nodes, -1)
-        for i in range(n_nodes):
-            if feature[i] >= n_features:
-                raise Error("corrupt tree: feature index out of range")
-            if feature[i] >= 0 and (
-                left[i] < 0
-                or left[i] >= n_nodes
-                or right[i] < 0
-                or right[i] >= n_nodes
-            ):
-                raise Error("corrupt tree: child index out of range")
-            # Children must point strictly forward. In range is not enough:
-            # a node naming itself, or an earlier node, is in range and
-            # would send `predict_row` round a cycle forever rather than
-            # down to a leaf. Every tree this library writes grows by
-            # appending, so a child always sits after its parent, which
-            # makes this an invariant of the format and not just a
-            # heuristic against corruption.
-            if feature[i] >= 0 and (left[i] <= i or right[i] <= i):
-                raise Error(
-                    "corrupt tree: child index does not point forward"
-                )
+        # Topology (feature and child indices in range, children strictly
+        # after their parent so every walk terminates, each node a child
+        # exactly once, leaf count matching the header) and the running
+        # node ceiling: validation.mojo's rules, which every loader shares.
+        total_nodes = check_loaded_tree(
+            feature, left, right, n_nodes, n_leaves, n_features, total_nodes
+        )
         trees.append(
             Tree(
                 feature^, threshold^, left^, right^, value^, split_gain^,

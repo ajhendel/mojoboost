@@ -743,6 +743,28 @@ def check_class_codes(
     return out^
 
 
+def check_class_code_range(
+    codes: List[Int], n_classes: Int, name: String = "class label"
+) raises:
+    """Integer class codes already decoded (the softmax trainers take
+    `List[Int]`): every code in `[0, n_classes)`, reported the way
+    `check_class_codes` reports the same fault on a float column. `name`
+    lets a validation column say which column it is."""
+    for r in range(len(codes)):
+        var code = codes[r]
+        if code < 0 or code >= n_classes:
+            raise Error(
+                name,
+                " out of range: row ",
+                r,
+                " is ",
+                code,
+                ", which is outside [0, ",
+                n_classes,
+                ")",
+            )
+
+
 def check_classes_present(codes: List[Int], n_classes: Int) raises:
     """Every class must appear at least once.
 

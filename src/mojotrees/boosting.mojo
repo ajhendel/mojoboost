@@ -85,7 +85,12 @@ from .linear_tree import (
 )
 from .tree import Tree, TreeParams, grow_tree_with_cegb, node_bounds
 from .tree_parameters_extra import ExtraTreeParams, finish_leaf_output
-from .validation import check_weights
+from .validation import (
+    check_class_code_range,
+    check_class_count,
+    check_column_length,
+    check_weights,
+)
 
 # The objective codes, and what they mean, live in objective_registry.mojo.
 # They are bound back here under the names this module has always exported,
@@ -1138,8 +1143,7 @@ def train(
     _check_goss(goss, bagging)
     _check_class_bagging(class_bagging, bagging, goss, objective)
     params.tree.monotone.check_features(data.n_features)
-    if len(init_score) != 0 and len(init_score) != data.n_rows:
-        raise Error("init_score length must equal n_rows")
+    check_column_length(len(init_score), data.n_rows, "init_score")
 
     var n = data.n_rows
     var raw = List[Float64](capacity=n)
@@ -1231,8 +1235,7 @@ def train_more(
         )
     if params.n_estimators < 0:
         raise Error("n_estimators must not be negative")
-    if len(init_score) != 0 and len(init_score) != data.n_rows:
-        raise Error("init_score length must equal n_rows")
+    check_column_length(len(init_score), data.n_rows, "init_score")
     _check_objective(booster.objective, target, alpha)
     _check_sample_weight(sample_weight, data.n_rows)
     check_bagging(bagging)
@@ -1737,8 +1740,8 @@ def train_multiclass(
         check_linear_tree_unconnected("train_multiclass")
     if len(labels) != data.n_rows:
         raise Error("labels length must equal n_rows")
-    if n_classes < 2:
-        raise Error("n_classes must be at least 2")
+    check_class_count(n_classes)
+    check_class_code_range(labels, n_classes)
     _check_sample_weight(sample_weight, data.n_rows)
     check_bagging(bagging)
     _check_goss(goss, bagging)
@@ -1751,8 +1754,6 @@ def train_multiclass(
         class_w.append(0.0)
     var total_w = 0.0
     for r in range(n):
-        if labels[r] < 0 or labels[r] >= n_classes:
-            raise Error("label out of range")
         var w = sample_weight[r] if len(sample_weight) > 0 else 1.0
         class_w[labels[r]] += w
         total_w += w
@@ -1837,9 +1838,7 @@ def train_multiclass_more(
     if params.n_estimators < 0:
         raise Error("n_estimators must not be negative")
     var n_classes = booster.n_classes
-    for r in range(len(labels)):
-        if labels[r] < 0 or labels[r] >= n_classes:
-            raise Error("label out of range")
+    check_class_code_range(labels, n_classes)
     _check_sample_weight(sample_weight, data.n_rows)
     check_bagging(bagging)
     _check_goss(goss, bagging)
@@ -1916,8 +1915,9 @@ def train_multiclass_with_valid(
         raise Error("valid_labels length must equal valid n_rows")
     if valid_data.n_features != data.n_features:
         raise Error("valid_data must have the same features")
-    if n_classes < 2:
-        raise Error("n_classes must be at least 2")
+    check_class_count(n_classes)
+    check_class_code_range(labels, n_classes)
+    check_class_code_range(valid_labels, n_classes, "valid label")
     if early_stopping_rounds < 1:
         raise Error("early_stopping_rounds must be positive")
     _check_sample_weight(sample_weight, data.n_rows)
@@ -1937,16 +1937,11 @@ def train_multiclass_with_valid(
         class_w.append(0.0)
     var total_w = 0.0
     for r in range(n):
-        if labels[r] < 0 or labels[r] >= n_classes:
-            raise Error("label out of range")
         var w = sample_weight[r] if len(sample_weight) > 0 else 1.0
         class_w[labels[r]] += w
         total_w += w
     if total_w <= 0.0:
         raise Error("sample_weight must have a positive sum")
-    for r in range(n_valid):
-        if valid_labels[r] < 0 or valid_labels[r] >= n_classes:
-            raise Error("valid label out of range")
     var base_scores = List[Float64](capacity=n_classes)
     for k in range(n_classes):
         base_scores.append(log(_clamp_prob(class_w[k] / total_w)))
