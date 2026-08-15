@@ -6,22 +6,30 @@ repository preparation and read-only verification can be automated.
 
 ## Status
 
-As of 2026-08-14, the matching GitHub environments `testpypi` and `pypi`
-exist and are restricted to the `main` branch. Neither environment requires
-a reviewer. Pending trusted publishers still need to be configured on
-TestPyPI and PyPI for `mojoboost-ml/mojoboost`, workflow
-`release-provenance.yml`, and the corresponding environment. No API token is
+As of 2026-08-14, the name `mojoboost` is claimed on both indexes by this
+repository through trusted publishing, and the whole pipeline in this
+document has been exercised end to end.
+
+The GitHub environments `testpypi` and `pypi` exist and are restricted to
+the `main` branch. `pypi` requires a review by the owner before its publish
+job runs; `testpypi` does not. Both trusted publishers are configured and
+have each published once, so no API token exists anywhere and none is
 needed.
 
-The release workflow exists at `.github/workflows/release-provenance.yml`,
-all third-party actions are pinned, and its self-hosted Apple-silicon Metal
-runner is registered. The normal CI run for the setup commit passed on both
-x86-64 and ARM Linux. The pending publishers have not been configured or
-exercised yet, so neither index has a `mojoboost` project created by this
-repository.
+`mojoboost 0.1.0.dev1` is live on TestPyPI (the section 3 rehearsal, tag
+`v0.1.0.dev1`) and `mojoboost 0.1.0a1` is live on PyPI (the pre-release
+name claim, tag `v0.1.0a1`). Both were built by
+`.github/workflows/release-provenance.yml` on the self-hosted
+Apple-silicon Metal runner, with the SBOM, provenance sidecar, and GitHub
+attestations attached, and both installs were verified from a clean
+CPython 3.14 venv against the real index followed by
+`packaging/smoke_test.py`. The rehearsal caught and fixed two workflow
+bugs (the provenance sidecar path in the SBOM job, and a pypi-publish pin
+too old for Metadata-Version 2.4) before any real version was spent.
 
-The version in the repository is 0.1.0 and no artifact of it has been
-published anywhere.
+The version in the repository is back at 0.1.0, which has not been
+published. The pre-release version commits were reverted per section 3;
+the tags stay.
 
 ## What this document does not decide
 
