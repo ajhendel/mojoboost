@@ -22,6 +22,16 @@ Division of labor, the same one the dense GPU trainer keeps:
        and the entry permutation, node totals, histogram accumulation, the
        default-bin leftover, and both partitions at every split
 
+The accumulation half of that skips one more bin than it used to. On a
+column where the default bin already holds a majority of the stored entries,
+those entries are not accumulated either and the same leftover recovers
+them, which is LightGBM's `FixHistogramKernel` rule and is exact in this
+fixed point rather than approximate; gpu_sparse.mojo derives it. Nothing
+here has to know: the histograms are unchanged cell for cell, so split
+selection, sibling subtraction, and leaf values all read the same numbers
+they did before. `MOJOTREES_GPU_SPARSE_SKIP_FREQ` is the threshold and 0
+turns it off. Whether it is faster has not been measured on any device.
+
 Categorical splits go through gpu_categorical.mojo: the set the host search
 produced is staged in a `CatSetPool`, checked (`check_cat_bitset`, so a set
 that would reverse the routing of every missing and unseen row is refused
