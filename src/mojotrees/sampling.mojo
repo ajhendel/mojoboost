@@ -88,6 +88,7 @@ rows first.
 """
 
 from .bagging import DEFAULT_BAGGING_SEED
+from .rng import GOLDEN, splitmix64, uniform
 
 # LightGBM's feature_fraction_seed default.
 comptime DEFAULT_FEATURE_FRACTION_SEED = 2
@@ -104,32 +105,18 @@ comptime DEFAULT_NEG_BAGGING_FRACTION = 1.0
 # tagged with node id + 1.
 comptime _TREE_TAG = 0
 
-comptime _GOLDEN = UInt64(0x9E3779B97F4A7C15)
-
 # Separates the per-depth streams from the per-tree and per-node ones, so a
 # depth can never inherit the stream a node id already owns.
 comptime _LEVEL_DOMAIN = UInt64(0xA5A55A5AC3C33C3C)
-
-
-def _splitmix64(state: UInt64) -> UInt64:
-    var z = state + 0x9E3779B97F4A7C15
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EB
-    return z ^ (z >> 31)
-
-
-def _uniform(counter: UInt64) -> Float64:
-    """Uniform in [0, 1) with 53 significant bits, from a counter value."""
-    return Float64(_splitmix64(counter) >> 11) * (1.0 / 9007199254740992.0)
 
 
 def _stream(seed: Int, tree_index: Int, tag: Int) -> UInt64:
     """Start of the counter stream for one selection. Sign bits are masked
     off so negative seeds are accepted (as in LightGBM) without relying on
     signed-to-unsigned conversion."""
-    var h = _splitmix64(UInt64(seed & 0x7FFFFFFFFFFFFFFF))
-    h = _splitmix64(h ^ UInt64(tree_index & 0x7FFFFFFFFFFFFFFF))
-    return _splitmix64(h ^ UInt64(tag & 0x7FFFFFFFFFFFFFFF))
+    var h = splitmix64(UInt64(seed & 0x7FFFFFFFFFFFFFFF))
+    h = splitmix64(h ^ UInt64(tree_index & 0x7FFFFFFFFFFFFFFF))
+    return splitmix64(h ^ UInt64(tag & 0x7FFFFFFFFFFFFFFF))
 
 
 def check_feature_fraction(fraction: Float64, name: String) raises:
@@ -190,7 +177,7 @@ def sample_without_replacement(
         if chosen >= count:
             break
         var prob = Float64(count - chosen) / Float64(n - i)
-        if _uniform(stream + UInt64(i)) < prob:
+        if uniform(stream + UInt64(i)) < prob:
             out.append(pool[i])
             chosen += 1
     return out^
@@ -241,7 +228,7 @@ def _level_stream(seed: Int, tree_index: Int, depth: Int) -> UInt64:
     mixed with a domain constant that keeps depths clear of the per-node tag
     space."""
     var h = _stream(seed, tree_index, _TREE_TAG) ^ _LEVEL_DOMAIN
-    return _splitmix64(h + UInt64(depth & 0x7FFFFFFFFFFFFFFF) * _GOLDEN)
+    return splitmix64(h + UInt64(depth & 0x7FFFFFFFFFFFFFFF) * GOLDEN)
 
 
 def select_level_features(
@@ -461,8 +448,8 @@ def _row_stream(seed: Int, bag_index: Int) -> UInt64:
     function bagging.mojo draws its uniform bags from, so equal positive and
     negative fractions reproduce a uniform bag row for row; each sampler keeps
     its own copy rather than sharing one, as goss.mojo does."""
-    return _splitmix64(
-        UInt64(seed & 0x7FFFFFFFFFFFFFFF) ^ (UInt64(bag_index) * _GOLDEN)
+    return splitmix64(
+        UInt64(seed & 0x7FFFFFFFFFFFFFFF) ^ (UInt64(bag_index) * GOLDEN)
     )
 
 
@@ -502,7 +489,7 @@ def sample_rows_by_class(
     var pos_min_row = 0
     var neg_min_row = 0
     for r in range(n):
-        var u = _uniform(stream + UInt64(r))
+        var u = uniform(stream + UInt64(r))
         var positive = labels[r] > 0.0
         var fraction = params.pos_fraction if positive else params.neg_fraction
         keep.append(u < fraction)
