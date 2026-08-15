@@ -70,11 +70,11 @@ costs:
 
 - **Chains.** `gpu_sparse_layout` is unreachable only because `gpu_sparse`
   is. One connecting edge at the head of a chain reaches all of it, so the
-  count of orphans overstates the count of decisions. (`sequence` and
-  `external_memory` were such a chain until the integration round exported
-  both and gave `Dataset` a chunk binding.) (`gpu_amd_policy` and `gpu_cuda_policy`
-  were such a chain until the consolidation round merged them into
-  `gpu_vendor_policy`, f23bd1b.)
+  count of orphans overstates the count of decisions. (`gpu_amd_policy` and
+  `gpu_cuda_policy` were such a chain until the consolidation round merged
+  them into `gpu_vendor_policy`, f23bd1b; `sequence` and `external_memory`
+  were one until the integration round exported both and gave `Dataset` a
+  chunk binding.)
 - **Test-only modules.** `backend`, `lgbm_model_io`, and `gpu_vendor_policy`
   are imported by their own suites and by nothing else. Their tests pass, which is why the
   parity contract can say `focused-tested: yes` and `integrated: no` in the
