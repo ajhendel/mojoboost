@@ -6,7 +6,10 @@ dependency, and changes no package state: reading it cannot make
 `mojotrees` behave differently, and nothing in the package imports it. It
 is documentation with a shape, not a mechanism, so a test can compare it
 against the real `__all__` and a reader can find the decision behind a
-name without reading 4000 lines.
+name without reading 4000 lines. That test is
+`python/tests/test_public_api_plan.py`: every table below that states a
+fact about the code is compared against the code, so a row here goes
+stale as a failure rather than as a quiet lie.
 
 Two rules it exists to keep:
 
@@ -28,7 +31,10 @@ to apply. Version 2 is the state after that owner applied it and finished
 the surface: `cv` and `CVBooster` are exported, the `__getattr__` is in
 place, and the `inspection` / `device_selection` placeholders have been
 replaced by what those lanes actually shipped. See
-handoffs/connect_07_python_public.md.
+handoffs/connect_07_python_public.md. Version 3 renames the two tables
+that still said `PROPOSED_` after their contents had shipped, adds the
+`lgbm_model_io` lazy submodule the integration round wired, and points
+at the test that now holds all of it to the code.
 """
 
 #: Bumped when the surface below changes, so a handoff can name the version
@@ -36,7 +42,9 @@ handoffs/connect_07_python_public.md.
 #:
 #: 1 -- proposal (cv, CVBooster, the lazy-dask snippet)
 #: 2 -- applied, plus inspection / device_selection / diagnostics
-PLAN_VERSION = 2
+#: 3 -- PROPOSED_* tables renamed to what they are, lgbm_model_io added,
+#:      enforced by python/tests/test_public_api_plan.py
+PLAN_VERSION = 3
 
 #: `mojotrees.__all__` as it stands, sorted (the real one is grouped by
 #: topic). A stale record shows up as a set mismatch against the real
@@ -97,13 +105,14 @@ PREVIOUS_TOP_LEVEL = (
 #: Names added to the top level in version 2, with the import that provides
 #: each. `eager` is whether the name is a real attribute at the end of
 #: `__init__.py`, as opposed to being resolved by `__getattr__` on first
-#: access.
+#: access. All of them shipped; the test checks each name against
+#: `__all__` and each `eager` flag against a fresh `import mojotrees`.
 #:
 #: `mojotrees.dask` stays a submodule and exports nothing: its three
 #: estimators are contracts that cannot train (see `dask.py`), and
 #: exporting them at the top level would put names that raise
 #: `DistributedNotAvailable` next to names that fit a model.
-PROPOSED_ADDITIONS = (
+TOP_LEVEL_ADDITIONS = (
     {
         "name": "cv",
         "source": "mojotrees.cv",
@@ -199,17 +208,22 @@ PROPOSED_ADDITIONS = (
     },
 )
 
-#: Submodules the package should answer for without importing them at
-#: package-import time. `optional_dependency` names the third-party import
-#: the module degrades from; None means the module is pure mojotrees and is
-#: lazy only to keep `import mojotrees` cheap.
+#: Submodules the package answers for without importing them at
+#: package-import time, in the order `_LAZY_SUBMODULES` lists them.
+#: `optional_dependency` names the third-party import the module degrades
+#: from; None means the module is pure mojotrees and is lazy only to keep
+#: `import mojotrees` cheap.
 #:
 #: `mojotrees.dask` is the one that matters: it must be reachable as
 #: `mojotrees.dask` after a plain `import mojotrees`, it must not import
 #: dask to do that, and it cannot be imported from the top of
 #: `__init__.py` because it subclasses estimators that are defined further
 #: down that same file. `__getattr__` answers all three at once.
-PROPOSED_LAZY_SUBMODULES = (
+#:
+#: `cv` is not here. It is eager (`TOP_LEVEL_ADDITIONS`), so the attribute
+#: `mojotrees.cv` is the function and never reaches `__getattr__`; see
+#: `NAME_COLLISIONS`.
+LAZY_SUBMODULES = (
     {
         "name": "dask",
         "optional_dependency": "dask[distributed]",
@@ -219,30 +233,6 @@ PROPOSED_LAZY_SUBMODULES = (
             "the Dask estimators subclass them. Safe under __getattr__, "
             "which runs after __init__.py has finished; unsafe as a "
             "top-of-file import."
-        ),
-    },
-    {
-        "name": "cv",
-        "optional_dependency": None,
-        "owner": "this lane",
-        "note": (
-            "Reached eagerly anyway by PROPOSED_ADDITIONS, so it needs no "
-            "__getattr__ entry. Listed for completeness: after the function "
-            "is exported, the attribute mojotrees.cv is the function."
-        ),
-    },
-    {
-        "name": "inspection",
-        "optional_dependency": "pandas (for the frame output only)",
-        "owner": "handoffs/migration_19_model_inspection.md",
-        "note": (
-            "Reaches pandas from trees_to_dataframe and "
-            "get_split_value_histogram(as_frame=True) and from nowhere "
-            "else, so the module itself imports nothing optional. Lazy to "
-            "keep `import mojotrees` to the extension, and because "
-            "`Booster` (which it inspects) would otherwise be a cycle. "
-            "Four of its names are re-exported; the rest of the schema "
-            "stays here."
         ),
     },
     {
@@ -272,14 +262,41 @@ PROPOSED_LAZY_SUBMODULES = (
             "startup phases."
         ),
     },
+    {
+        "name": "inspection",
+        "optional_dependency": "pandas (for the frame output only)",
+        "owner": "handoffs/migration_19_model_inspection.md",
+        "note": (
+            "Reaches pandas from trees_to_dataframe and "
+            "get_split_value_histogram(as_frame=True) and from nowhere "
+            "else, so the module itself imports nothing optional. Lazy to "
+            "keep `import mojotrees` to the extension, and because "
+            "`Booster` (which it inspects) would otherwise be a cycle. "
+            "Four of its names are re-exported; the rest of the schema "
+            "stays here."
+        ),
+    },
+    {
+        "name": "lgbm_model_io",
+        "optional_dependency": None,
+        "owner": "integration_C0",
+        "note": (
+            "LightGBM model-file conversion, over the four entry points "
+            "in bindings/lgbm_bindings.mojo. Nothing is exported at the "
+            "top level (NOT_EXPORTED): the conversion warns once that no "
+            "file a real LightGBM build wrote has been read, so it is "
+            "asked for by name rather than found next to train()."
+        ),
+    },
 )
 
 #: The shape of the code at the end of `mojotrees/__init__.py`, as a string
 #: so that reading this module cannot run it. Version 1 proposed it for
-#: `dask` alone; what landed resolves four submodules and five attributes,
+#: `dask` alone; what landed resolves five submodules and five attributes,
 #: and the real one carries the comments explaining each. This is the
 #: mechanism, kept here so it can be read without the surrounding 4000
-#: lines -- `__init__.py` is the copy that runs.
+#: lines -- `__init__.py` is the copy that runs, and the test compares the
+#: two tables below against it so this copy cannot rot.
 LAZY_SUBMODULE_SNIPPET = '''
 _LAZY_SUBMODULES = (
     "dask", "device_selection", "diagnostics", "inspection", "lgbm_model_io"
@@ -392,6 +409,19 @@ NOT_EXPORTED = (
             "DistributedNotAvailable on every installation: no transport "
             "ships. A top-level export would read as a feature. Revisit "
             "when handoffs/task17_dask.md's checklist is complete."
+        ),
+    },
+    {
+        "name": "mojotrees.lgbm_model_io.load_lightgbm_model",
+        "why": (
+            "And save_lightgbm_model, convert_to_mojotrees, "
+            "convert_from_mojotrees, interop_status, and unsupported_reason. "
+            "The module carries EXPERIMENTAL = True and warns once that no "
+            "file a real LightGBM build wrote has been read here and no "
+            "file written here has been read back by LightGBM. A top-level "
+            "load_lightgbm_model would read as interop that has been "
+            "proven. Revisit when the status text in "
+            "src/mojotrees/lgbm_model_io.mojo flips."
         ),
     },
     {
