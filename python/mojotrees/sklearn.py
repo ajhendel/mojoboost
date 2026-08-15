@@ -63,6 +63,9 @@ from ._fit_args import (
     _primary_index,
     _store_vector,
     _unimplemented_objective_note,
+    _objective_status,
+    _objective_code_of_name,
+    _check_objective_param,
 )
 from ._ranking import _check_relevance, _group_buffer, ndcg_score
 
@@ -2287,8 +2290,13 @@ class MojoTreesRegressor(_Base):
     # __sklearn_tags__ below. Both are cheap, so both are here.
     _estimator_type = "regressor"
 
-    # The alias set matches src/mojotrees/params.mojo exactly, so a name the
-    # CLI accepts is a name the estimator accepts.
+    # The regression spellings the compiled registry resolves, alias ->
+    # code. `_objective_code` resolves through the registry
+    # (`objective_code_of_name`); this literal is the frozen contract
+    # tools/api_snapshot.py reads and the check that the registry still
+    # resolves every one of them to the same code
+    # (python/tests/test_registry_readers.py). A spelling the registry
+    # gains does not become a regressor objective until it is added here.
     _OBJECTIVES = {
         "regression": _SQUARED_ERROR,
         "regression_l2": _SQUARED_ERROR,
@@ -2340,7 +2348,13 @@ class MojoTreesRegressor(_Base):
     def _objective_code(self):
         if callable(self.objective):
             return _CUSTOM
-        code = self._OBJECTIVES.get(self.objective)
+        code = None
+        if self.objective in self._OBJECTIVES:
+            # The registry is the resolver; the literal says which of its
+            # spellings are regression objectives.
+            code = _objective_code_of_name(self.objective)
+            if code is None:
+                code = self._OBJECTIVES[self.objective]
         if code is None:
             raise ValueError(
                 f"unknown objective {self.objective!r}; expected one of "
@@ -2384,16 +2398,10 @@ class MojoTreesRegressor(_Base):
         if name is None:
             return default
         value = float(getattr(self, name, default))
-        if code == _HUBER and value <= 0.0:
-            raise ValueError("huber requires alpha > 0")
-        if code == _QUANTILE and not 0.0 < value < 1.0:
-            raise ValueError("quantile requires 0 < alpha < 1")
-        if code == _FAIR and value <= 0.0:
-            raise ValueError("fair requires fair_c > 0")
-        if code == _TWEEDIE and not 1.0 < value < 2.0:
-            raise ValueError(
-                "tweedie requires 1 < tweedie_variance_power < 2"
-            )
+        # The trainer's range check and the trainer's sentence
+        # (objective_registry.check_objective_param); no copy of the
+        # bounds lives here.
+        _check_objective_param(code, value)
         return value
 
     def fit(

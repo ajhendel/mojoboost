@@ -230,8 +230,10 @@ moving the other way is breaking.
 
 ### 4.5 The unimplemented-objective register
 
-`_UNIMPLEMENTED_OBJECTIVES` in `python/mojotrees/__init__.py` names the
-LightGBM objectives that are not implemented and says why for each. The
+The compiled registry (`registry_objective_unimplemented` in
+bindings/objective_bindings.mojo, read by `_unimplemented_objectives()` in
+`python/mojotrees/_fit_args.py`) names the LightGBM objectives that are
+not implemented and says why for each. The
 guarantee is that asking for one of them raises with a reason, not that
 the reason's wording is stable. Implementing one and removing it from the
 register is additive.

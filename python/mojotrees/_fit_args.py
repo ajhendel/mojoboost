@@ -8,9 +8,12 @@ Every name is bound back into the package namespace, so `from mojotrees
 import _as_iteration` (basic.py) and `from mojotrees import _metric_specs`
 (cv.py) are unchanged.
 
-The objective codes and `_LAMBDA_L1` / `_LAMBDA_L2` stay in `__init__.py`:
+The objective codes and `_LAMBDA_L1` / `_LAMBDA_L2` live in `sklearn.py`:
 tools/api_snapshot.py resolves estimator defaults and `_OBJECTIVES` from
-that file's literals.
+that file's literals. Objective name status, unimplemented-objective
+reasons, and scalar-parameter ranges come from the compiled registry
+through `_objective_status`, `_unimplemented_objectives`, and
+`_check_objective_param`; Python holds no copy of them.
 """
 
 import operator as _operator
@@ -45,46 +48,90 @@ _NO_DEVICE_PREDICT = (
     "device='cpu' (or leave device unset)."
 )
 
-#: LightGBM objectives mojotrees does not implement, and what to say about
-#: each. They are named rather than lumped into "unknown objective": a user
-#: who asks for one has asked for a real thing. docs/LIGHTGBM_PARITY.md
-#: carries the same list.
-_UNIMPLEMENTED_OBJECTIVES = {
-    "cross_entropy_lambda": (
-        "it parameterizes the rate through log1p(exp(raw)) rather than the "
-        "logistic, so it is a separate link, not an alias of cross_entropy"
-    ),
-    "xentlambda": (
-        "it parameterizes the rate through log1p(exp(raw)) rather than the "
-        "logistic, so it is a separate link, not an alias of cross_entropy"
-    ),
-    "multiclassova": (
-        "one-vs-rest needs an independent binary model per class, which is "
-        "a different trainer from the shared-softmax multiclass one "
-        "MojoTreesClassifier uses"
-    ),
-    "multiclass_ova": (
-        "one-vs-rest needs an independent binary model per class, which is "
-        "a different trainer from the shared-softmax multiclass one "
-        "MojoTreesClassifier uses"
-    ),
-    "ova": "use MojoTreesClassifier, which trains a shared softmax model",
-    "ovr": "use MojoTreesClassifier, which trains a shared softmax model",
-    "rank_xendcg": "lambdarank is the ranking objective mojotrees provides",
-    "xendcg": "lambdarank is the ranking objective mojotrees provides",
+#: LightGBM objectives that resolve here to another estimator: the name is
+#: implemented natively, and the sentence says which estimator owns it.
+#: This is a Python fact (which class trains what), so it lives here.
+_OTHER_ESTIMATOR_OBJECTIVES = {
     "lambdarank": "use MojoTreesRanker, which takes the query groups",
     "multiclass": "use MojoTreesClassifier, which derives the task from y",
     "softmax": "use MojoTreesClassifier, which derives the task from y",
     "binary": "use MojoTreesClassifier, which derives the task from y",
+    "ova": "use MojoTreesClassifier, which trains a shared softmax model",
+    "ovr": "use MojoTreesClassifier, which trains a shared softmax model",
 }
+
+
+def _registry():
+    from . import _compat
+
+    return _compat.import_extension()
+
+
+def _unimplemented_objectives():
+    """LightGBM objectives mojotrees does not implement, alias -> reason,
+    read from the compiled registry (`registry_objective_unimplemented`);
+    the reason is the trainer's own sentence. Nothing here restates it."""
+    out = {}
+    for record in _registry().registry_objective_unimplemented():
+        alias, _canonical, reason = (str(v) for v in record)
+        out[alias] = reason
+    return out
+
+
+#: The three answers `objective_name_status` gives, by their registry
+#: names, so a caller branches on a word rather than a number.
+def _objective_status_codes():
+    vocab = _registry().registry_vocabulary()
+    return {
+        "supported": int(vocab["name_supported"]),
+        "unimplemented": int(vocab["name_unimplemented"]),
+        "unknown": int(vocab["name_unknown"]),
+    }
+
+
+def _objective_status(name):
+    """`"supported"`, `"unimplemented"`, or `"unknown"` for an objective
+    spelling, from the registry, without raising."""
+    if not isinstance(name, str):
+        return "unknown"
+    code = int(_registry().objective_name_status(name.strip().lower()))
+    for word, value in _objective_status_codes().items():
+        if value == code:
+            return word
+    return "unknown"
+
+
+def _objective_code_of_name(name):
+    """The registry's objective code for a spelling, or None when the
+    registry does not resolve it (unknown or unimplemented)."""
+    if not isinstance(name, str):
+        return None
+    try:
+        return int(_registry().objective_code_of_name(name.strip().lower()))
+    except Exception:
+        return None
+
+
+def _check_objective_param(code, value):
+    """The trainer's own range check for an objective's scalar parameter
+    (`alpha`, `fair_c`, `tweedie_variance_power`), as a ValueError carrying
+    the trainer's message. There is no second copy of the ranges here."""
+    try:
+        _registry().check_objective_param(int(code), float(value))
+    except Exception as exc:
+        raise ValueError(str(exc)) from None
 
 
 def _unimplemented_objective_note(objective):
     """The trailing half of an unknown-objective message when the name is a
-    LightGBM objective mojotrees does not implement here; empty otherwise."""
+    LightGBM objective mojotrees does not implement here, or one another
+    estimator owns; empty otherwise."""
     if not isinstance(objective, str):
         return ""
-    reason = _UNIMPLEMENTED_OBJECTIVES.get(objective.strip().lower())
+    key = objective.strip().lower()
+    reason = _OTHER_ESTIMATOR_OBJECTIVES.get(key)
+    if reason is None:
+        reason = _unimplemented_objectives().get(key)
     if reason is None:
         return ""
     return f". {objective!r} is not available here: {reason}"
