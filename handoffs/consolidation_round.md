@@ -232,3 +232,28 @@ Gated, not done, with the exact unblocker:
   `docs/RANDOM_FOREST_MODE.md`, `docs/DISTRIBUTED_STRATEGIES.md` name files
   that were never created (unrun-test names and an old build path); left
   as they read.
+
+## Integration round (2026-08-15)
+
+Wiring lanes; one paragraph per lane.
+
+**W1, boosting_type dart and rf (f41221e, cef4667, 80297ef).**
+`alternate_boosting`, `boosting_dart`, and `boosting_rf` are exported from
+the package root; `_mojotrees.fit` reads a `boosting` key and routes dart
+and rf to `alternate_boosting.fit_boosting` (same `fit_bins`, same `Model`,
+CPU only, a GPU device is refused), leaving gbdt and goss on the exact call
+they made before; `MojoTreesRegressor` / `Classifier` take
+`boosting='dart' | 'rf'` plus `drop_rate`, `max_drop`, `skip_drop`,
+`xgboost_dart_mode`, `uniform_drop` (True, the non-uniform variant is
+refused natively), `drop_seed`; rf ignores `learning_rate` and trains at
+1.0 as LightGBM's RF does. Fit paths that bypass that binding (sparse,
+`eval_set`, callable objective, multiclass, ranker) refuse the two modes by
+name. `tests/test_alternate_boosting.mojo` (6 tests, run: gbdt through the
+dispatcher bit-exact with `model.fit`, dart and rf finite and distinct from
+gbdt, save/load round trip, rf refusals); extension built in a HEAD
+worktree and exercised from Python. Not reached: dart/rf with `eval_set`
+(dart early stopping is unsettled by design in `boosting_dart`; rf's
+`train_forest_with_valid` exists natively but no binding), multiclass rf
+(`train_forest_multiclass` exported, no binding), the sparse trainers, and
+continued training (`train_boosting_more` exported, no binding).
+`params.mojo` still lists `boosting` as Mojo-API-only for parameter strings.
