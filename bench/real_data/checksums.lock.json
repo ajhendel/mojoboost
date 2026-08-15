@@ -77,6 +77,15 @@
       },
       "pinned_at": "2026-08-15T01:39:22Z",
       "pinned_by": "Mac"
+    },
+    "rcv1_train_binary": {
+      "url": "https://www.csie.ntu.edu.tw/~cjlin/libsvmtools/datasets/binary/rcv1_train.binary.bz2",
+      "version": "LIBSVM dataset page, binary section, rcv1_train.binary",
+      "archive_sha256": "dda0c6381811484e284e70dd0641335917debce50948346416fde7fb32fad2e2",
+      "archive_bytes": 13730096,
+      "members": {},
+      "pinned_at": "2026-08-15T01:52:35Z",
+      "pinned_by": "Mac"
     }
   },
   "superseded": {}
