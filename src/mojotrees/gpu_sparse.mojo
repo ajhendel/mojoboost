@@ -80,15 +80,87 @@ Unchanged from `sparse.mojo`, because the structure holds the same numbers:
 - an **absent** entry is the value 0.0 and lands in `default_bin[f]`, via the
   leftover, never by being visited;
 - an **explicitly stored zero**, and any stored value that happens to bin to
-  `default_bin[f]`, is accumulated as a stored entry into that same bin and
-  then *excluded* from the leftover, so storing it or dropping it gives the
-  identical histogram, bit for bit;
+  `default_bin[f]`, either is accumulated as a stored entry into that same bin
+  and then *excluded* from the leftover, or is skipped by the dominant-bin
+  rule below and folded into the leftover instead. Both spellings give the
+  identical histogram, bit for bit, and so does storing the value or dropping
+  it;
 - a stored **NaN** binned into the feature's reserved missing bin is a real,
   non-default bin: it is accumulated like any other entry and routed by the
   node's learned `default_left`, never confused with an absent entry.
+  `SparseBinnedMatrix.validate` forbids `missing_bin[f] == default_bin[f]`,
+  so the skip below can never swallow a missing row.
 
 `zero_as_missing` is not implemented here, in `sparse.mojo`, or anywhere
 else, and no argument accepts it.
+
+Skipping the dominant bin's stored entries
+------------------------------------------
+LightGBM's CUDA histogram constructor never accumulates a feature's most
+frequent bin. `cuda_histogram_constructor.cpp` collects the features whose
+`BinMapper::GetMostFreqBin()` is nonzero into `need_fix_histogram_features_`,
+and `FixHistogramKernel` then recovers each of those bins from the leaf
+totals afterwards, one block per such feature. A feature whose most frequent
+bin *is* bin 0 needs no fixing there, because their multi-value bin layout
+already omits bin 0 from the accumulation.
+
+Our layout is the second case made structural. `default_bin[f]` is never
+accumulated from implicit zeros at all, and `_sparse_default_fill_kernel` is
+`FixHistogramKernel`: the recovery from the node totals, one threadgroup per
+feature. That much has been here since the path was written.
+
+What was still being accumulated is the *stored* entries that happen to bin
+to `default_bin[f]`. On a column whose zero bin also swallows a band of small
+nonzero values, that is a large share of the column, and it is the worst
+possible share to accumulate: every one of those entries hits the same
+shared-memory address, which is the hottest bin in the whole feature, so they
+serialize against each other and against nothing else. Skipping them costs
+one register comparison per entry and nothing else, because the leftover
+recovers them for free:
+
+    default_cell = node_total - sum(accumulated bins of f)
+
+With the skip on, `sum(accumulated bins of f)` loses exactly those entries'
+contributions, so the leftover gains exactly them. In symbols, with `S` the
+node's stored entries for f, `D` the subset of `S` binned to
+`default_bin[f]`, and `R` the node's rows with no stored entry for f:
+
+    without the skip:  default_cell = sum(D) + (total - sum(S))
+    with the skip:     default_cell = 0      + (total - (sum(S) - sum(D)))
+                                    = sum(D) + total - sum(S)
+
+the same value, and every term is an exact fixed-point Int32, so the two
+paths are bit-identical rather than close. The count plane is the same
+statement with every summand 1, and it is exact for the same reason: a row
+of the node owns at most one stored entry per feature, which is what
+`check_entry_row_consistency` and `SparseBinnedMatrix.validate` assert.
+Sibling subtraction survives it too, because totals and accumulated sums are
+each additive over a node's two children and the identity above is linear in
+both.
+
+The trick only pays when `D` is a large share of `S`; on a column whose
+stored values spread evenly over its bins it removes almost no contention
+and still pays the comparison. Which features get it is therefore gated on
+that share, measured once per session over the whole column at construction:
+`MOJOTREES_GPU_SPARSE_SKIP_FREQ` is the threshold in percent, defaulting to
+`DEFAULT_SKIP_FREQ_PERCENT`. **The crossover is unmeasured on every device**,
+this M4 included, so the default is set where the trick cannot plausibly
+lose rather than where it starts to win: at or above 50 percent the default
+bin holds a majority of the column's stored entries, which makes it provably
+the most frequent bin, and the atomics removed outnumber the atomics kept.
+Measuring the real crossover means an interleaved A/B of
+`bench/bench_gpu_sparse.mojo` over columns swept through the share, arms
+selected with `set_skip_freq_percent` rather than the environment so one
+process holds both (`gpu_active_rows.set_feature_group` says why).
+
+`MOJOTREES_GPU_SPARSE_SKIP_FREQ=0` turns the skip off everywhere and restores
+the old accumulation exactly.
+
+The one place this deliberately does not reach is
+`gpu_categorical.enqueue_category_stats`, which accumulates one categorical
+feature's entries into its own plane with its own leftover against the same
+node totals. The identical argument would apply to it, but that kernel is
+not this module's and the pooled categorical path is not measured here.
 
 How a split is applied
 ----------------------
@@ -132,8 +204,10 @@ What is deliberately not here
   implemented. The tiled strategy exists on the dense path to keep many row
   tiles from contending on the same output bins; the sparse path's tiles are
   entry tiles, which are far fewer per feature, and the hottest bin by far
-  (the default one) is never touched by the accumulation at all -- it is
-  filled once, in a separate reducing kernel. The partial-buffer
+  (the default one) is never touched by the accumulation at all on a feature
+  the skip rule above covers -- it is filled once, in a separate reducing
+  kernel -- and on a feature the rule leaves alone, only that feature's own
+  stored entries reach it. The partial-buffer
   variant is a measurement away, not a design change; the handoff says what
   it would look like.
 - **No device split search.** `gpu_split_search.mojo` already scans a
@@ -174,6 +248,7 @@ from .gpu_tiling import (
 )
 from .histogram import Histogram, _zeroed_f64, _zeroed_int
 from .histogram_sparse import SparseNodeEntries
+from .parallel import _env_int
 from .sparse import SparseBinnedMatrix
 
 
@@ -213,6 +288,81 @@ comptime SIDE_RIGHT = UInt8(1)
 comptime TOT_GRAD = 0
 comptime TOT_HESS = 1
 comptime TOT_COUNT = 2
+
+# Per-feature skip code meaning "accumulate every bin of this feature". No
+# real bin can collide with it: a bin index is nonnegative everywhere.
+comptime SKIP_NONE = -1
+
+# Share of a column's stored entries that must land on its default bin before
+# the accumulation stops visiting them (percent, of the whole column, decided
+# once per session).
+#
+# Fifty is chosen for what it *proves* rather than for what it was measured
+# to earn, because it was not measured to earn anything: at or above a
+# majority the default bin is necessarily the column's most frequent bin, so
+# the trick is being applied to exactly the population LightGBM applies it to
+# (`GetMostFreqBin`), and the shared-memory atomics it removes from the single
+# hottest address outnumber the ones it leaves behind. Below a majority the
+# trick is very likely still free -- the cost it adds is one register
+# comparison per entry -- but "very likely free" is not a measurement, and a
+# default that can only be defended by one is the wrong default. See the
+# module docstring for what would measure the real crossover.
+comptime DEFAULT_SKIP_FREQ_PERCENT = 50
+
+
+def env_skip_freq_percent() -> Int:
+    """`MOJOTREES_GPU_SPARSE_SKIP_FREQ` as a percentage threshold.
+
+    0 disables the dominant-bin skip everywhere, which is the escape hatch
+    back to the accumulation this path shipped with; 1 through 100 is the
+    share of a column's stored entries that must land on its default bin
+    before that column is skipped; anything above 100 is clamped to 100, the
+    strictest rule that still admits a column (every stored entry on the
+    default bin). Unset means `DEFAULT_SKIP_FREQ_PERCENT`.
+
+    `_env_int` already returns the default for a negative or unparseable
+    value, so a typo reads as "unset" rather than as "off".
+    """
+    var p = _env_int("MOJOTREES_GPU_SPARSE_SKIP_FREQ", DEFAULT_SKIP_FREQ_PERCENT)
+    return p if p <= 100 else 100
+
+
+def _resolve_skip_bins(
+    col_offsets: List[Int],
+    default_bin: List[Int],
+    default_stored: List[Int],
+    percent: Int,
+) raises -> List[Int]:
+    """Which bin, if any, each feature's accumulation stops visiting.
+
+    `default_stored[f]` is how many of feature f's stored entries bin to
+    `default_bin[f]`, counted once over the whole column at construction. The
+    share is taken against the whole column and not against a node's window
+    because the flag has to be a property of the dataset: a per-node flag
+    would be a per-node launch argument, and a benchmark could no longer say
+    which arm it ran. The histogram is bit-identical either way (the recovery
+    is exact whatever the flag), so nothing is given up by fixing it once.
+
+    The comparison is `100 * stored >= percent * total` in integers rather
+    than a division, so a column is never admitted or refused by a rounding
+    step, and `percent == 0` is answered before it can admit an empty column.
+    """
+    var n_features = len(default_bin)
+    if len(default_stored) != n_features:
+        raise Error("default_stored must have one entry per feature")
+    if len(col_offsets) != n_features + 1:
+        raise Error("col_offsets must have length n_features + 1")
+    var out = List[Int](capacity=n_features)
+    for f in range(n_features):
+        var total = col_offsets[f + 1] - col_offsets[f]
+        if percent <= 0 or total <= 0:
+            out.append(SKIP_NONE)
+            continue
+        if 100 * default_stored[f] >= percent * total:
+            out.append(default_bin[f])
+        else:
+            out.append(SKIP_NONE)
+    return out^
 
 
 # --- Kernels --------------------------------------------------------------
@@ -379,6 +529,7 @@ def _sparse_hist_kernel(
     hess: MutPointer[Float32, MutAnyOrigin],
     feat_ids: MutPointer[Int32, MutAnyOrigin],
     ranges: MutPointer[Int32, MutAnyOrigin],
+    skip_bins: MutPointer[Int32, MutAnyOrigin],
     out_hist: MutPointer[Int32, MutAnyOrigin],
     node: Int32,
     n_features: Int32,
@@ -399,12 +550,23 @@ def _sparse_hist_kernel(
 
     Implicit zeros are not visited here at all. `_sparse_default_fill_kernel`
     puts them in afterwards, in one subtraction per feature.
+
+    `skip_bins[f]` names one more bin this kernel does not visit, or
+    `SKIP_NONE`. It is the dominant-bin rule of the module docstring: on a
+    column whose default bin holds a majority of the stored entries, those
+    entries are dropped here and the same subtraction that recovers the
+    implicit zeros recovers them too, exactly, because it recovers whatever
+    the accumulated bins did not account for. The load is one Int32 per
+    threadgroup, block-uniform, hoisted out of the loop; the test inside the
+    loop is a register comparison against a value that no bin index can equal
+    when the rule is off.
     """
     var slot = Int(block_idx.x)
     var f = Int(feat_ids[unsafe_offset=slot][0])
     var tid = thread_idx.x
     var nb = Int(n_bins)
     var hs = Int(hist_size)
+    var skip = Int(skip_bins[unsafe_offset=f][0])
 
     var rbase = 2 * (Int(node) * Int(n_features) + f)
     var lo = Int(ranges[unsafe_offset=rbase][0])
@@ -436,13 +598,14 @@ def _sparse_hist_kernel(
     var i = tile_begin + tid
     while i < tile_end:
         var e = Int(order[unsafe_offset=i][0])
-        var r = Int(entry_row[unsafe_offset=e][0])
         var bin = Int(entry_bin[unsafe_offset=e])
-        var gq = Int32(round(grad[unsafe_offset=r][0] * g_scale))
-        var hq = Int32(round(hess[unsafe_offset=r][0] * h_scale))
-        _ = Atomic.fetch_add(sg.unsafe_offset(bin), gq)
-        _ = Atomic.fetch_add(sh.unsafe_offset(bin), hq)
-        _ = Atomic.fetch_add(sc.unsafe_offset(bin), Int32(1))
+        if bin != skip:
+            var r = Int(entry_row[unsafe_offset=e][0])
+            var gq = Int32(round(grad[unsafe_offset=r][0] * g_scale))
+            var hq = Int32(round(hess[unsafe_offset=r][0] * h_scale))
+            _ = Atomic.fetch_add(sg.unsafe_offset(bin), gq)
+            _ = Atomic.fetch_add(sh.unsafe_offset(bin), hq)
+            _ = Atomic.fetch_add(sc.unsafe_offset(bin), Int32(1))
         i += block_dim.x
     barrier()
 
@@ -472,7 +635,16 @@ def _sparse_default_fill_kernel(
     n_bins: Int32,
     hist_size: Int32,
 ):
-    """Give each active feature's default bin the node's implicit zeros.
+    """Give each active feature's default bin everything the accumulation
+    left out.
+
+    LightGBM's `FixHistogramKernel`, on our fixed point and with our choice of
+    skipped bin. What it recovers is the node's implicit zeros, and, on a
+    feature the dominant-bin rule covers, that feature's stored entries which
+    bin to the default bin as well. The kernel does not need to be told which:
+    it subtracts the accumulated bins from the node totals, and whatever the
+    accumulation did not visit is exactly what the difference holds. That is
+    why turning the skip on required no change here at all.
 
     One threadgroup per active feature slot, not one thread. The block sums
     that feature's whole bin row in each plane, strided across its threads so
@@ -490,7 +662,11 @@ def _sparse_default_fill_kernel(
 
     The read-modify-write on the default bin is deliberate: it may already
     hold stored entries that happened to bin there, and those must not be
-    counted twice.
+    counted twice. On a feature the skip rule covers the cell is zero when
+    this kernel reads it, and the read-modify-write is then a write; the
+    kernel does not special-case that, because reading a cell it is about to
+    subtract from is free and a special case would be a second rule to keep
+    in step with the accumulation.
 
     Only active slots are touched, so a feature the caller excluded keeps a
     zero slice and sibling subtraction stays exact, exactly as on the dense
@@ -964,6 +1140,8 @@ struct GpuSparseHistogramBuilder(Movable):
     var entry_bin_dev: DeviceBuffer[DType.uint8]
     var col_dev: DeviceBuffer[DType.int32]
     var default_dev: DeviceBuffer[DType.uint8]
+    # Per feature: the one extra bin the accumulation skips, or SKIP_NONE.
+    var skip_dev: DeviceBuffer[DType.int32]
     # The entry permutation, its scatter destination, and the per-(node,
     # feature) windows into it.
     var order_dev: DeviceBuffer[DType.int32]
@@ -990,6 +1168,16 @@ struct GpuSparseHistogramBuilder(Movable):
     var max_nodes: Int
     var col_offsets: List[Int]
     var default_bin: List[Int]
+    var default_stored: List[Int]
+    """Stored entries of each feature that bin to its own `default_bin`,
+    counted once over the whole matrix at construction. The numerator of the
+    dominant-bin share; the denominator is the column's own length."""
+    var skip_bin: List[Int]
+    """The host mirror of `skip_dev`: `default_bin[f]` on a feature the rule
+    covers, `SKIP_NONE` elsewhere."""
+    var skip_percent: Int
+    """The threshold `skip_bin` was resolved at. `set_skip_freq_percent`
+    re-resolves it; 0 means the skip is off everywhere."""
     var missing_bin: List[Int]
     var cats: CategoricalSpec
     var active: List[Int]
@@ -1080,6 +1268,28 @@ struct GpuSparseHistogramBuilder(Movable):
         for f in range(data.n_features):
             self.default_bin.append(Int(data.default_bin[f]))
 
+        # One pass over `nnz`, once per session, to learn how much of each
+        # column its own default bin already holds. Cheap next to the upload
+        # that follows it, and the only place the share is ever measured: a
+        # per-node recount would make the skip a per-node decision, which the
+        # module docstring explains is not wanted.
+        self.default_stored = List[Int](capacity=data.n_features)
+        self.default_stored.resize(data.n_features, 0)
+        for f in range(data.n_features):
+            var db = data.default_bin[f]
+            var hits = 0
+            for i in range(data.col_offsets[f], data.col_offsets[f + 1]):
+                if data.bin[i] == db:
+                    hits += 1
+            self.default_stored[f] = hits
+        self.skip_percent = env_skip_freq_percent()
+        self.skip_bin = _resolve_skip_bins(
+            self.col_offsets,
+            self.default_bin,
+            self.default_stored,
+            self.skip_percent,
+        )
+
         # Every index the kernels dereference was bounded by the validation
         # above, which is what makes this a pure width narrowing: a stored
         # entry naming a row or a bin outside the matrix would read out of
@@ -1111,6 +1321,9 @@ struct GpuSparseHistogramBuilder(Movable):
             data.n_features + 1
         )
         self.default_dev = ctx.enqueue_create_buffer[DType.uint8](
+            data.n_features
+        )
+        self.skip_dev = ctx.enqueue_create_buffer[DType.int32](
             data.n_features
         )
         self.order_dev = ctx.enqueue_create_buffer[DType.int32](entry_cells)
@@ -1174,6 +1387,11 @@ struct GpuSparseHistogramBuilder(Movable):
             var dst = host.unsafe_ptr()
             for f in range(data.n_features):
                 dst.unsafe_store(f, Int32(f))
+
+        with self.skip_dev.map_to_host() as host:
+            var dst = host.unsafe_ptr()
+            for f in range(data.n_features):
+                dst.unsafe_store(f, Int32(self.skip_bin[f]))
 
     # --- small launch helpers --------------------------------------------
 
@@ -1257,6 +1475,83 @@ struct GpuSparseHistogramBuilder(Movable):
             var dst = host.unsafe_ptr()
             for i in range(len(features)):
                 dst.unsafe_store(i, Int32(features[i]))
+
+    # --- the dominant-bin skip -------------------------------------------
+
+    def set_skip_freq_percent(mut self, percent: Int) raises:
+        """Re-resolve which features the accumulation skips their default bin
+        on, at a new threshold.
+
+        An argument rather than only `MOJOTREES_GPU_SPARSE_SKIP_FREQ`, for the
+        reason `gpu_active_rows.set_feature_group` is one: an A/B that reads
+        its arm from the environment can silently run one arm under the
+        other's label, which has happened in this repository once already.
+        Both arms of this one can therefore be held in a single process, which
+        matters more here than usual, because the benchmark harness that would
+        measure the crossover interleaves its arms and the sparse builder is
+        expensive to construct.
+
+        0 turns the skip off everywhere; 100 admits only a column every stored
+        entry of which lands on its default bin; anything above 100 is clamped
+        to 100, and a negative threshold is refused rather than read as off,
+        since "off" already has a spelling.
+
+        Takes effect on the next `enqueue_leaf`. It cannot change a histogram
+        -- the recovery is exact at every threshold, which is the whole point
+        of the module docstring's derivation -- so this is a launch-shape
+        knob and not a numeric option, and a test may assert bit-identity
+        across it.
+        """
+        if percent < 0:
+            raise Error(
+                "skip threshold must be nonnegative; 0 is how the skip is"
+                " turned off"
+            )
+        var p = percent if percent <= 100 else 100
+        if p == self.skip_percent:
+            return
+        self.skip_percent = p
+        self.skip_bin = _resolve_skip_bins(
+            self.col_offsets, self.default_bin, self.default_stored, p
+        )
+        # Any accumulation still reading the flags has to finish before they
+        # are rewritten under it.
+        self.ctx.synchronize()
+        with self.skip_dev.map_to_host() as host:
+            var dst = host.unsafe_ptr()
+            for f in range(self.n_features):
+                dst.unsafe_store(f, Int32(self.skip_bin[f]))
+
+    def skip_freq_percent(self) -> Int:
+        """The threshold the current flags were resolved at."""
+        return self.skip_percent
+
+    def skips_default_bin(self, feature: Int) raises -> Bool:
+        """Whether this feature's accumulation leaves its default bin to the
+        subtraction. Reported so a benchmark can say how much of a dataset an
+        arm actually covers rather than assuming the threshold reached it."""
+        if feature < 0 or feature >= self.n_features:
+            raise Error("feature index out of range")
+        return self.skip_bin[feature] != SKIP_NONE
+
+    def n_skipped_features(self) -> Int:
+        """Features the rule currently covers, out of `n_features`."""
+        var n = 0
+        for f in range(self.n_features):
+            if self.skip_bin[f] != SKIP_NONE:
+                n += 1
+        return n
+
+    def default_bin_share_percent(self, feature: Int) raises -> Int:
+        """Share of this feature's stored entries that bin to its default bin,
+        truncated to a whole percent. An empty column reports 0 and is never
+        admitted, whatever the threshold: there is nothing there to skip."""
+        if feature < 0 or feature >= self.n_features:
+            raise Error("feature index out of range")
+        var total = self.col_offsets[feature + 1] - self.col_offsets[feature]
+        if total <= 0:
+            return 0
+        return (100 * self.default_stored[feature]) // total
 
     # --- gradients --------------------------------------------------------
 
@@ -1458,6 +1753,7 @@ struct GpuSparseHistogramBuilder(Movable):
                 self.hess_dev.unsafe_ptr(),
                 self.feat_dev.unsafe_ptr(),
                 self.ranges_dev.unsafe_ptr(),
+                self.skip_dev.unsafe_ptr(),
                 self.out_dev.unsafe_ptr(),
                 Int32(leaf),
                 Int32(self.n_features),
