@@ -136,8 +136,8 @@ from .gpu_multiclass_batch import GpuClassBatch, MulticlassRoundGuard
 from .gpu_objectives_native import GpuObjectiveState
 from .gpu_output_planes import BatchEligibility
 from .gpu_predict import (
-    METRIC_L1,
-    METRIC_L2,
+    DEVICE_METRIC_L1,
+    DEVICE_METRIC_L2,
     RESPONSE_IDENTITY,
     GpuPredictor,
     flatten_trees,
@@ -2946,9 +2946,9 @@ def device_loss_metric(objective: Int) -> Int:
 
     Two objectives qualify today, and the agreement is exact rather than
     approximate. `_mean_loss`'s squared-error branch sums `(raw - y)^2` and
-    divides by the row count; `METRIC_L2` under `RESPONSE_IDENTITY` sums
+    divides by the row count; `DEVICE_METRIC_L2` under `RESPONSE_IDENTITY` sums
     `w * d * d` and divides by `check_metric_weight([], n)`, which is `n`.
-    `_mean_loss`'s L1 branch and `METRIC_L1` line up the same way. The
+    `_mean_loss`'s L1 branch and `DEVICE_METRIC_L1` line up the same way. The
     remaining difference is the one this whole path already carries: the
     device sums Float32 terms over Float32 labels, so the value agrees to
     Float32 tolerance, not bit for bit.
@@ -2965,9 +2965,9 @@ def device_loss_metric(objective: Int) -> Int:
     expression side by side and see them agree, including the clamps.
     """
     if objective == SQUARED_ERROR:
-        return METRIC_L2
+        return DEVICE_METRIC_L2
     if objective == L1:
-        return METRIC_L1
+        return DEVICE_METRIC_L1
     return -1
 
 

@@ -8,7 +8,7 @@ The claims worth testing here are structural rather than numeric.
 - The partition is *stable*: both sides come out in the relative order they
   had in the parent, so a compacted range is the CPU grower's row list for
   the same node, index for index. That is asserted directly against
-  `tree.partition_rows`, the shipped CPU partition, for numerical splits,
+  `tree.partition_split_rows`, the shipped CPU partition, for numerical splits,
   for both missing-bin directions, and for categorical set splits.
 - Splitting one leaf touches nothing outside its own range, so its siblings'
   rows survive it untouched.
@@ -42,7 +42,7 @@ from mojotrees.gpu_tiling import (
 )
 from mojotrees.histogram import build_histogram_subset
 from mojotrees.split import SplitInfo
-from mojotrees.tree import partition_rows
+from mojotrees.tree import partition_split_rows
 
 
 def _splitmix64(state: UInt64) -> UInt64:
@@ -276,7 +276,7 @@ def test_host_partition_matches_the_cpu_row_lists() raises:
         var missing_bin = -1
         if not split.is_categorical:
             missing_bin = data.missing_bin[split.feature]
-        var want = partition_rows(data, root, split, missing_bin)
+        var want = partition_split_rows(data, root, split, missing_bin)
 
         var rows = _identity_rows(96)
         var scratch = _zeros(96)
@@ -481,15 +481,15 @@ def test_device_partition_matches_the_host_reference() raises:
         var root = List[Int](capacity=n_rows)
         for r in range(n_rows):
             root.append(r)
-        var top = partition_rows(
+        var top = partition_split_rows(
             data, root, SplitInfo(0, 7, 1.0, True, True), 0
         )
         _assert_same(rows.download_range(1), top.left)
-        var right_split = partition_rows(
+        var right_split = partition_split_rows(
             data, top.right, SplitInfo(1, 3, 1.0, True, False), 0
         )
         _assert_same(rows.download_range(3), right_split.left)
-        var deep = partition_rows(
+        var deep = partition_split_rows(
             data, right_split.right, SplitInfo(2, 11, 1.0, True, True), 0
         )
         _assert_same(rows.download_range(5), deep.left)
@@ -543,7 +543,7 @@ def test_device_partition_handles_bags_and_categoricals() raises:
 
         # Out-of-bag rows are simply not in any range: no sentinel, and the
         # bagged node's rows are the CPU grower's bagged row lists.
-        var want = partition_rows(
+        var want = partition_split_rows(
             data, bag, SplitInfo.categorical(1, 1.0, bitset), -1
         )
         _assert_same(rows.download_range(1), want.left)

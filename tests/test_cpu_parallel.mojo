@@ -56,7 +56,7 @@ from mojotrees.parallel import (
     plan_tasks,
 )
 from mojotrees.split import SplitInfo, find_best_split
-from mojotrees.tree import partition_rows
+from mojotrees.tree import partition_split_rows
 
 
 def _splitmix64(state: UInt64) -> UInt64:
@@ -235,9 +235,9 @@ def test_partition_matches_serial_reference() raises:
                 ref_right.append(r)
 
         _serial()
-        var serial = partition_rows(data, rows, split, missing)
+        var serial = partition_split_rows(data, rows, split, missing)
         _forced_parallel()
-        var parallel = partition_rows(data, rows, split, missing)
+        var parallel = partition_split_rows(data, rows, split, missing)
         _auto()
 
         assert_equal(len(serial.left) + len(serial.right), len(rows))

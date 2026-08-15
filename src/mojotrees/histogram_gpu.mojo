@@ -134,7 +134,7 @@ from .apple_histogram_policy import (
 )
 from .binning import BinnedMatrix
 from .categorical import CatBitset, CategoricalSpec, cat_empty
-from .gpu_active_rows import GpuActiveRows, LeafRange, RowRouting
+from .gpu_active_rows import MAX_ROWS, GpuActiveRows, LeafRange, RowRouting
 from .gpu_binned_layout import check_layout_support
 from .gpu_frontier import LeafWorkItem
 from .gpu_multiclass_batch import GpuClassBatch
@@ -172,9 +172,7 @@ from .unified_memory_policy import (
     resolve_from_env,
 )
 from .gpu_tiling import (
-    STRATEGY_ATOMIC,
     STRATEGY_AUTO,
-    STRATEGY_TILED,
     DeviceCaps,
     HistogramTiling,
     derive_tiling,
@@ -202,10 +200,9 @@ from .histogram import (
     build_histogram_subset_replica_into,
 )
 
-comptime MAX_BINS = 256
-
-# Row indices and leaf ids cross into the kernels as Int32.
-comptime MAX_ROWS = Int(Int32.MAX)
+# The bin ceiling the kernels size threadgroup planes by is `binning.MAX_BINS`
+# (imported by gpu_histogram_specializations, which owns the kernels), and the
+# Int32 row-index limit is `gpu_active_rows.MAX_ROWS`, imported above.
 
 # Histogram slots the batched path may hold at once, and the byte budget it
 # is capped against. A slot is a full-width `3 * n_features * n_bins` Int32

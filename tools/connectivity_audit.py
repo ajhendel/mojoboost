@@ -296,48 +296,6 @@ CLASSIFICATION = {
         "Its four entry points are bound in bindings/lgbm_bindings.mojo and "
         "covered by python/tests/test_lgbm_interop.py.",
     ),
-    # -- gated on the GPU files another session holds dirty ----------------
-    # Each of these is one edit inside histogram_gpu.mojo / train_gpu.mojo /
-    # gpu_active_rows.mojo, or a caller in tests/parallel/test_gpu_active_rows
-    # .mojo, all of which the GPU session has uncommitted. The edit itself is
-    # written down in handoffs/consolidation_round.md, "Integration round
-    # close-out". Nothing else blocks them.
-    "MAX_BINS": (
-        PENDING,
-        "gpu-session",
-        "histogram_gpu.MAX_BINS should import binning.MAX_BINS; "
-        "histogram_gpu.mojo is dirty in the GPU session.",
-    ),
-    "MAX_ROWS": (
-        PENDING,
-        "gpu-session",
-        "One MAX_ROWS in gpu_active_rows, imported by histogram_gpu; "
-        "K8 step 3, both files dirty in the GPU session.",
-    ),
-    "METRIC_L1": (
-        PENDING,
-        "gpu-session",
-        "gpu_predict's device metric codes are DEVICE_METRIC_*; the METRIC_* "
-        "aliases go once train_gpu.mojo (dirty) stops importing them.",
-    ),
-    "METRIC_L2": (
-        PENDING,
-        "gpu-session",
-        "Same as METRIC_L1.",
-    ),
-    "partition_rows": (
-        PENDING,
-        "gpu-session",
-        "distributed.partition_rows is the exported one; tree.partition_rows "
-        "becomes partition_split_rows once its caller "
-        "tests/parallel/test_gpu_active_rows.mojo (dirty) can be edited.",
-    ),
-    "gpu_tiling": (
-        PENDING,
-        "gpu-session",
-        "histogram_gpu.mojo imports STRATEGY_ATOMIC and STRATEGY_TILED and "
-        "uses neither; the file is dirty in the GPU session.",
-    ),
     "mojotrees.dask": (
         EXPERIMENTAL,
         "consolidation_K7",

@@ -56,7 +56,8 @@ from mojotrees.gpu_tiling import (
     derive_tiling,
     shared_bytes_for,
 )
-from mojotrees.histogram_gpu import MAX_BINS, MAX_ROWS
+from mojotrees.binning import MAX_BINS
+from mojotrees.gpu_active_rows import MAX_ROWS
 
 # Smallest shared memory per threadgroup guaranteed across the backends.
 # CUDA guarantees 48 KiB per block, AMD LDS is 64 KiB per workgroup, and

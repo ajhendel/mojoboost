@@ -163,12 +163,6 @@ comptime DEVICE_METRIC_MULTICLASS_LOG_LOSS = 3
 comptime DEVICE_METRIC_BINARY_ACCURACY = 4
 comptime DEVICE_METRIC_MULTICLASS_ACCURACY = 5
 
-# Spellings train_gpu.mojo still imports. They are the device codes above,
-# not metrics.mojo's host codes (host METRIC_L1 is 2, device is 1). Remove
-# once train_gpu.mojo imports DEVICE_METRIC_L1 / DEVICE_METRIC_L2.
-comptime METRIC_L2 = DEVICE_METRIC_L2
-comptime METRIC_L1 = DEVICE_METRIC_L1
-
 # Threads per threadgroup for the metric reduction. Fixed, and a power of
 # two, because the shared-memory tree reduction halves the active range and
 # the shared array is sized at compile time. It is a warp multiple on every

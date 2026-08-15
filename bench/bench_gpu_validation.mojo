@@ -73,7 +73,8 @@ from mojotrees.boosting import (
 )
 from mojotrees.binning import BinnedMatrix
 from mojotrees.gpu_tiling import STRATEGY_TILED, strategy_name
-from mojotrees.histogram_gpu import MAX_BINS, GpuHistogramBuilder
+from mojotrees.binning import MAX_BINS
+from mojotrees.histogram_gpu import GpuHistogramBuilder
 from mojotrees.train_gpu import train_gpu
 from mojotrees.tree import TreeParams
 

@@ -57,7 +57,7 @@ from mojotrees.parallel import (
     plan_tasks,
 )
 from mojotrees.split import find_best_split
-from mojotrees.tree import TreeParams, grow_tree, partition_rows
+from mojotrees.tree import TreeParams, grow_tree, partition_split_rows
 
 
 def _splitmix64(state: UInt64) -> UInt64:
@@ -336,12 +336,12 @@ def main() raises:
     t0 = perf_counter_ns()
     _serial()
     for _ in range(part_reps):
-        var p = partition_rows(data, all_rows, best, missing)
+        var p = partition_split_rows(data, all_rows, best, missing)
         _ = len(p.left)
     t1 = perf_counter_ns()
     _auto()
     for _ in range(part_reps):
-        var p2 = partition_rows(data, all_rows, best, missing)
+        var p2 = partition_split_rows(data, all_rows, best, missing)
         _ = len(p2.left)
     t2 = perf_counter_ns()
     _report(

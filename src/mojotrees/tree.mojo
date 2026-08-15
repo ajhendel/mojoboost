@@ -553,7 +553,7 @@ struct RowPartition(Movable):
     var right: List[Int]
 
 
-def partition_rows(
+def partition_split_rows(
     data: BinnedMatrix,
     rows: List[Int],
     split: SplitInfo,
