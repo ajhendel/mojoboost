@@ -27,8 +27,8 @@ queries that a backend does not implement fall back to conservative
 portable constants (Metal, for instance, rejects `WARP_SIZE`), so a missing
 attribute degrades the tiling rather than failing the build.
 
-Two environment variables override the policy for benchmarking and for tests
-that must force one path, matching the `MOJOTREES_` contract in
+Four environment variables override the policy for benchmarking and for
+tests that must force one path, matching the `MOJOTREES_` contract in
 `parallel.mojo`:
 
 - `MOJOTREES_GPU_HIST_STRATEGY`: `atomic` or `tiled` forces that strategy;
@@ -37,6 +37,12 @@ that must force one path, matching the `MOJOTREES_` contract in
   Still clamped to the partial-buffer memory budget.
 - `MOJOTREES_GPU_BLOCK_THREADS`: threads per threadgroup, overriding the
   derived value. Clamped to the device maximum and rounded to a warp.
+- `MOJOTREES_GPU_MIN_TILES`: the row-tile floor, overriding the derived one.
+  Zero or unset means the derived floor. Still clamped by row amortization,
+  by the partial-buffer budget, and by `MAX_GRID_DIM_Y`, so it lowers the
+  tile count freely and raises it only as far as those bounds allow. `1`
+  restores the tile count this module chose before the floor existed, which
+  is the switch a bisection wants. See `row_tile_floor`.
 
 Specialization sits above this module, not inside it. `derive_tiling` stays
 the one geometry every caller gets by default, on every backend;
@@ -96,6 +102,19 @@ comptime WARP_GRANULARITY = 64
 # Resident threadgroups to aim for per multiprocessor. Enough waves that a
 # late-finishing tile does not leave multiprocessors idle, small enough that
 # the per-tile partial histogram stays a minor cost.
+#
+# It is both the default and the ceiling: `blocks_per_sm_for` lowers it when
+# a caller supplies a threadgroup footprint too large to fit this many
+# partials in the reported shared memory, and never raises it above this,
+# because shared memory is the only residency limit `DeviceCaps` carries.
+# Thread slots and the register file bound residency too and are reported by
+# neither, so a small footprint is evidence that 8 blocks are not excluded,
+# not evidence that more than 8 are resident. A kernel that sizes its shared
+# histogram to the bin count rather than to `MAX_BINS` therefore stops
+# lowering this target at low bin counts and does not raise it; raising the
+# ceiling needs an occupancy measurement nobody here has made.
+# `apple_gpu_policy.MAX_RESIDENT_BLOCKS_PER_CORE` is this same constant for
+# the same reason, so the two layers cannot disagree about the ceiling.
 comptime TARGET_BLOCKS_PER_SM = 8
 
 # A tile must scan enough rows to amortize writing (or atomically folding)
@@ -329,10 +348,32 @@ def resolve_tiling(
     - `partial_cell_limit`: cells the partial buffer may use, from
       `partial_cell_limit_for` or from a reported memory budget.
 
-    Everything after that is one rule, applied once: tiles from the tightest
-    of the occupancy, row-amortization, and memory bounds; the
-    `MOJOTREES_GPU_ROW_TILE` override; the grid bound; a re-derivation so the
-    last tile is never empty; and the `STRATEGY_AUTO` resolution.
+    Everything after that is one rule, applied once: a row-tile floor from
+    `row_tile_floor`, clamped down by the row-amortization and memory bounds;
+    the `MOJOTREES_GPU_ROW_TILE` override; the grid bound; a re-derivation so
+    the last tile is never empty; and the `STRATEGY_AUTO` resolution. The
+    tile count is
+
+        floor   = MOJOTREES_GPU_MIN_TILES when set, else target_blocks
+        n_tiles = min(tiles_by_rows,
+                      tiles_by_memory,
+                      MAX_GRID_DIM_Y,
+                      max(floor, ceil(target_blocks / n_slots)))
+
+    which by default is `min(tiles_by_rows, tiles_by_memory, MAX_GRID_DIM_Y,
+    target_blocks)`, since `target_blocks` is never smaller than
+    `ceil(target_blocks / n_slots)`. `row_tile_floor` carries the argument
+    for why the occupancy term is a floor on tiles and not a ceiling on
+    threadgroups, corner by corner. The consequence to hold on to here is
+    that `n_tiles` never exceeds `tiles_by_rows`, so the floor cannot shorten
+    a tile below what the amortization bound alone would have produced.
+
+    None of this can change a histogram. Tiling picks a launch geometry;
+    accumulation is fixed-point Int32 and integer addition is associative, so
+    two geometries over the same rows sum the same bins in a different order
+    to the same value. That is the property the module docstring states and
+    the strategy tests assert bit-exactly, and a floor on the tile count does
+    not touch it.
     """
     if n_rows < 1 or n_slots < 1 or n_bins < 1:
         raise Error("tiling needs positive rows, features, and bins")
@@ -357,11 +398,7 @@ def resolve_tiling(
     if tiles_by_rows < 1:
         tiles_by_rows = 1
 
-    var tiles_by_occupancy = _ceil_div(target_blocks, n_slots)
-    if tiles_by_occupancy < 1:
-        tiles_by_occupancy = 1
-
-    var wanted = tiles_by_occupancy
+    var wanted = row_tile_floor(target_blocks, n_slots)
     if tiles_by_rows < wanted:
         wanted = tiles_by_rows
 
@@ -413,6 +450,167 @@ def resolve_tiling(
     )
 
 
+def env_min_tiles() -> Int:
+    """`MOJOTREES_GPU_MIN_TILES` as a tile count, or 0 for the derived
+    floor. Zero and unset are the same answer, as they are for
+    `MOJOTREES_GPU_ROW_TILE`, so clearing the variable and setting it to
+    zero cannot mean two different things."""
+    return _env_int("MOJOTREES_GPU_MIN_TILES", 0)
+
+
+def row_tile_floor(target_blocks: Int, n_slots: Int) raises -> Int:
+    """Row tiles per feature to reach for before the row, memory, and grid
+    bounds clamp the answer down.
+
+    `target_blocks` is threadgroups wanted device-wide, and `n_slots` is the
+    features already occupying `grid.x`. The floor is `target_blocks`
+    itself: the row dimension alone should be able to fill the device,
+    without the feature count spending the budget first.
+
+    Why a floor rather than a ceiling
+    ---------------------------------
+    This module used to spend the device-wide target across the features,
+    taking `ceil(target_blocks / n_slots)` tiles, which reads as a bound on
+    total threadgroups rather than as a target for them. Two consequences
+    followed, both on the large-node case the GPU backend is weakest at. On
+    the 10-core Apple M4 this project is developed on, `target_blocks` is 80,
+    so a 50-feature million-row root took 2 tiles: 100 threadgroups, each
+    scanning 500,000 rows. Worse, at any feature count at or above 80 the
+    term collapsed to 1 and a node got a single tile whatever its row count,
+    so one threadgroup per feature scanned the whole node.
+
+    LightGBM's CUDA histogram constructor takes the opposite position. In
+    `CalcConstructHistogramKernelDim` it sets `grid_dim_y` to
+    `max(160, ceil(ceil(num_data / 400) / block_dim_y))`, with the 160 a hard
+    minimum that ignores the feature count entirely. It would rather launch
+    threadgroups that finish early than leave multiprocessors idle. The floor
+    here is that position with the constant derived from the device instead
+    of fixed: one device-wide wave of threadgroups from the row dimension
+    alone, which on the M4 is 80 and on a 108-multiprocessor part is 864.
+
+    The `ceil(target_blocks / n_slots)` term survives as a second floor
+    underneath this one, so no shape gets fewer tiles than the previous rule
+    asked for. It is redundant while the floor is derived, since
+    `target_blocks >= ceil(target_blocks / n_slots)` for every positive
+    `n_slots`, and it binds only when `MOJOTREES_GPU_MIN_TILES` supplies a
+    smaller floor by hand. Setting that variable to `1` therefore restores
+    exactly the tile count this module chose before the floor existed.
+
+    What it does at the four corners
+    --------------------------------
+    Worked on the M4 (`target_blocks` 80, 256-thread blocks, 256 bins, so
+    `min_rows_per_tile` is 2,048), reading tiles as tiles per feature and
+    threadgroups as the whole launch:
+
+        features  rows        tiles_by_rows  before -> after   threadgroups
+        4         8,192       4              4      -> 4       16 -> 16
+        4         1,000,000   489            20     -> 80      80 -> 320
+        100       8,192       4              1      -> 4       100 -> 400
+        100       1,000,000   489            1      -> 80      100 -> 8,000
+        50        1,000,000   489            2      -> 80      100 -> 4,000
+
+    Few features and few rows is unchanged, because `tiles_by_rows` is what
+    binds and the floor never pushes past it: a small node cannot be split
+    further without tiles too short to pay for their own partial histogram,
+    and that reasoning is untouched. Few features and many rows gains tiles
+    up to the floor. Many features and few rows gains back the tiles the old
+    term's collapse to 1 had taken away, but only as far as the rows allow.
+    Many features and many rows is the case that changes most, and is the
+    50-feature million-row root in the last line, the shape end-to-end GPU
+    training is slowest on.
+
+    What is not claimed
+    -------------------
+    That any of this is faster. Nothing in this lane was measured, on the M4
+    or anywhere else. The argument is structural: a launch of 100
+    threadgroups on a device with room for 80 resident ones runs one full
+    wave and then a second wave at a quarter occupancy, and the tail is a
+    fifth of the whole node, while the same work in 4,000 threadgroups
+    quantizes into 50 waves whose tail costs a fiftieth. Against that, more
+    tiles mean more partial histograms to zero, write, and fold, which is
+    the cost `MIN_ROWS_PER_TILE_BIN_FACTOR` and
+    `MIN_ROWS_PER_TILE_THREAD_FACTOR` bound and `tiles_by_rows` enforces. The
+    balance between the two is exactly what a benchmark would have to settle,
+    and `MOJOTREES_GPU_MIN_TILES` exists so one can sweep it without a
+    rebuild.
+
+    Raises on a nonpositive target or feature count, matching
+    `resolve_tiling`'s preconditions, so a caller that computed a bound
+    wrongly hears about it here rather than launching an empty grid.
+    """
+    if target_blocks < 1:
+        raise Error("a device wants a positive number of threadgroups")
+    if n_slots < 1:
+        raise Error("a launch covers a positive number of features")
+
+    var by_occupancy = _ceil_div(target_blocks, n_slots)
+    if by_occupancy < 1:
+        by_occupancy = 1
+
+    var floor = env_min_tiles()
+    if floor < 1:
+        floor = target_blocks
+    if floor < by_occupancy:
+        floor = by_occupancy
+    if floor > MAX_GRID_DIM_Y:
+        floor = MAX_GRID_DIM_Y
+    return floor
+
+
+def blocks_per_sm_for(
+    max_shared_memory_per_block: Int, block_shared_bytes: Int
+) -> Int:
+    """Threadgroups this policy aims to keep resident on one multiprocessor,
+    for a block occupying `block_shared_bytes` of shared memory.
+
+    `block_shared_bytes` of zero means the caller has no footprint to offer,
+    which is every caller that has not been taught one, and gets the fixed
+    `TARGET_BLOCKS_PER_SM`. A caller that does know its kernel's footprint
+    gets how many such blocks the reported shared memory holds, capped at
+    `TARGET_BLOCKS_PER_SM` and floored at one.
+
+    The cap is the whole epistemic content of the rule, and the reasoning is
+    written out at `TARGET_BLOCKS_PER_SM`: shared memory is the only
+    residency limit `DeviceCaps` carries, so a footprint can prove that this
+    many blocks do not fit and can never prove that more than this many are
+    resident. The parameter exists so that a kernel sized to its bin count
+    rather than to `MAX_BINS` can be described here without either layer
+    hard-coding the other's footprint, and so that the ceiling can be raised
+    in one place if an occupancy measurement ever justifies it.
+
+    This is `apple_gpu_policy.resident_blocks_for_bytes` for the portable
+    path, over `DeviceCaps` instead of a `GpuProfile` and with the same
+    ceiling, deliberately: the two must not answer differently for the same
+    device and the same footprint.
+    """
+    if block_shared_bytes < 1:
+        return TARGET_BLOCKS_PER_SM
+    var fits = max_shared_memory_per_block // block_shared_bytes
+    if fits > TARGET_BLOCKS_PER_SM:
+        fits = TARGET_BLOCKS_PER_SM
+    if fits < 1:
+        fits = 1
+    return fits
+
+
+def target_blocks_for(caps: DeviceCaps, block_shared_bytes: Int = 0) -> Int:
+    """Threadgroups wanted device-wide: one multiprocessor's worth times the
+    multiprocessor count, floored at one.
+
+    The floor catches a device reporting no multiprocessors, which is a
+    device that answered nothing. `query_device_caps` substitutes the
+    portable constant for a missing attribute, so only a hand-built
+    `DeviceCaps` reaches it, and one threadgroup per feature is what this
+    asked for before the occupancy bound existed.
+    """
+    var target = caps.sm_count * blocks_per_sm_for(
+        caps.max_shared_memory_per_block, block_shared_bytes
+    )
+    if target < 1:
+        target = 1
+    return target
+
+
 def derive_tiling(
     caps: DeviceCaps,
     n_rows: Int,
@@ -420,21 +618,31 @@ def derive_tiling(
     n_bins: Int,
     requested_strategy: Int = STRATEGY_AUTO,
     max_partial_cells: Int = 0,
+    block_shared_bytes: Int = 0,
 ) raises -> HistogramTiling:
     """Resolve the launch geometry for one (rows, features, bins) shape.
 
     Pure host-side arithmetic so the policy is testable without a device.
 
-    Row tiles per feature come from three bounds, whichever is tightest:
-    enough threadgroups to fill the device (`TARGET_BLOCKS_PER_SM` per
-    multiprocessor, spread across the features already in `grid.x`), enough
-    rows per tile to amortize the partial histogram, and the memory the
-    partial buffer may use.
+    Row tiles per feature start at enough threadgroups to fill the device
+    (`TARGET_BLOCKS_PER_SM` per multiprocessor, asked of the row dimension
+    alone rather than divided among the features already in `grid.x`: see
+    `row_tile_floor`) and are clamped down by two bounds, whichever is
+    tighter: enough rows per tile to amortize the partial histogram, and the
+    memory the partial buffer may use.
 
     `max_partial_cells` caps that last bound at an already allocated buffer
     instead of at `PARTIAL_BUDGET_BYTES`. Feature subsampling re-derives the
     tiling for a narrower `grid.x` without reallocating, so it passes the
     capacity it has.
+
+    `block_shared_bytes` is the shared memory one threadgroup of the kernel
+    that will run really occupies. Zero, the default, means the caller has
+    none to offer and the fixed `TARGET_BLOCKS_PER_SM` stands; a caller that
+    knows its kernel's footprint lets `blocks_per_sm_for` lower the target
+    when that many blocks would not fit. It is a parameter rather than a
+    constant so that a kernel sized to its bin count and this policy can meet
+    without either one restating the other's footprint.
 
     The bounds are this module's; the arithmetic over them is
     `resolve_tiling`'s, which is also what the shape-derived policy runs.
@@ -445,21 +653,13 @@ def derive_tiling(
         raise Error(
             "device shared memory too small for a per-threadgroup histogram"
         )
-    # A device reporting no multiprocessors is a device that answered
-    # nothing, and one threadgroup per feature is what this asked for before
-    # the occupancy bound existed. `query_device_caps` substitutes the
-    # portable constant for a missing attribute, so this only catches a
-    # hand-built `DeviceCaps`.
-    var target_blocks = caps.sm_count * TARGET_BLOCKS_PER_SM
-    if target_blocks < 1:
-        target_blocks = 1
     return resolve_tiling(
         n_rows,
         n_features,
         n_bins,
         derive_block_threads(caps),
         n_bins,
-        target_blocks,
+        target_blocks_for(caps, block_shared_bytes),
         partial_cell_limit_for(max_partial_cells),
         requested_strategy,
     )
