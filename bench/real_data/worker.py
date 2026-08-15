@@ -33,6 +33,18 @@ import traceback
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# The mojoboost package this harness measures is the checkout's own
+# python/ tree; the bench environment deliberately does not install it, so
+# the worker puts it on the path itself, after the harness modules so a
+# scenario module can never be shadowed by a package file.
+_REPO_PYTHON = os.path.join(
+    os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    ),
+    "python",
+)
+if os.path.isdir(_REPO_PYTHON) and _REPO_PYTHON not in sys.path:
+    sys.path.insert(1, _REPO_PYTHON)
 
 import engines  # noqa: E402
 import envinfo  # noqa: E402
@@ -119,6 +131,21 @@ def describe(part, name):
     return out
 
 
+def _record_extra(task, train):
+    """The per-dataset parameters the record's translated dicts need.
+
+    The engines derive `num_class` from the loaded data before training;
+    the record has to derive it the same way or a multiclass record cannot
+    even be written (`lightgbm_params` and `mojoboost_params` both require
+    it for a multiclass spec).
+    """
+    if task != "multiclass":
+        return None
+    return {
+        "num_class": int(train.get("n_classes") or (np.max(train["y"]) + 1))
+    }
+
+
 def run_job(job):
     spec = scenarios.resolve(job["scenario"], job["tier"], job["variant"])
     train, test, data_meta = build_data(
@@ -165,11 +192,15 @@ def run_job(job):
         "threads": job["threads"],
         "data": {**data_meta, "train": train_desc, "test": test_desc},
         "params": {
-            "shared": scenarios.shared_params(spec),
+            "shared": scenarios.shared_params(spec, _record_extra(task, train)),
             "engine": (
-                scenarios.mojoboost_params(spec, job["device"])
+                scenarios.mojoboost_params(
+                    spec, job["device"], _record_extra(task, train)
+                )
                 if job["engine"] == "mojoboost"
-                else scenarios.lightgbm_params(spec, job["threads"])
+                else scenarios.lightgbm_params(
+                    spec, job["threads"], _record_extra(task, train)
+                )
             ),
         },
         "caveats": list(spec.get("caveats", [])) + list(result.get("notes", [])),

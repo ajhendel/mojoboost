@@ -17,6 +17,67 @@
     "`superseded` and say which results used which."
   ],
   "version": 1,
-  "pins": {},
+  "pins": {
+    "adult": {
+      "url": "https://archive.ics.uci.edu/static/public/2/adult.zip",
+      "version": "UCI ML Repository id 2, static export endpoint",
+      "archive_sha256": "7537312dd56c2b98035880805ce99e68183a30ee468aa5329d6df0fbb3cc21bb",
+      "archive_bytes": 620237,
+      "members": {
+        "adult.data": {
+          "sha256": "5b00264637dbfec36bdeaab5676b0b309ff9eb788d63554ca0a249491c86603d",
+          "bytes": 3974305
+        },
+        "adult.test": {
+          "sha256": "a2a9044bc167a35b2361efbabec64e89d69ce82d9790d2980119aac5fd7e9c05",
+          "bytes": 2003153
+        }
+      },
+      "pinned_at": "2026-08-15T01:38:45Z",
+      "pinned_by": "Mac"
+    },
+    "bank_marketing": {
+      "url": "https://archive.ics.uci.edu/static/public/222/bank+marketing.zip",
+      "version": "UCI ML Repository id 222, static export endpoint",
+      "archive_sha256": "e0bf5f5de5b846e2f18e9d90606637267d46dfa260e0f17bb12e605db5efbeb4",
+      "archive_bytes": 1023843,
+      "members": {
+        "bank-additional.zip!bank-additional/bank-additional-full.csv": {
+          "sha256": "74adfc578bf77a7ff4bb1ba4a9f8709d9e3c6907342959c2c8416847e0afb4d8",
+          "bytes": 5834924
+        }
+      },
+      "pinned_at": "2026-08-15T01:38:46Z",
+      "pinned_by": "Mac"
+    },
+    "covertype": {
+      "url": "https://archive.ics.uci.edu/static/public/31/covertype.zip",
+      "version": "UCI ML Repository id 31, static export endpoint",
+      "archive_sha256": "89a975c2457cd48e824238ae43c5a3cb762e42c4b4078d9b44a4514055105f6d",
+      "archive_bytes": 11251206,
+      "members": {
+        "covtype.data.gz": {
+          "sha256": "0a9371cef7c964b5475d6053cc3e0894a5aa6f65ad1ed3ecb01c45aa96217945",
+          "bytes": 75169317
+        }
+      },
+      "pinned_at": "2026-08-15T01:38:49Z",
+      "pinned_by": "Mac"
+    },
+    "year_prediction_msd": {
+      "url": "https://archive.ics.uci.edu/static/public/203/yearpredictionmsd.zip",
+      "version": "UCI ML Repository id 203, static export endpoint",
+      "archive_sha256": "06f801af323bb7798e800583acce4ea1ed2697ac12c23f4424aea0a7a3d09e11",
+      "archive_bytes": 211011981,
+      "members": {
+        "YearPredictionMSD.txt": {
+          "sha256": "4b6f8e50235b359e01689ae7fb33ad0f89677e9a15f25f3d6259327a6bb927bb",
+          "bytes": 448576698
+        }
+      },
+      "pinned_at": "2026-08-15T01:39:22Z",
+      "pinned_by": "Mac"
+    }
+  },
   "superseded": {}
 }
