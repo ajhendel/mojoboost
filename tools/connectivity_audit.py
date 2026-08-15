@@ -273,14 +273,6 @@ CLASSIFICATION = {
         "GPU_SPEEDUP_GATE_MET all hold. Parked, not superseded; its "
         "constants now come from quantized_gradient.",
     ),
-    "sequence": (
-        PENDING,
-        "consolidation_K4",
-        "Bounded-memory chunk protocol external_memory.mojo is written "
-        "against; coherent, not a duplicate of python _sequence.py. Parked "
-        "until an export plus external_memory validation connects it "
-        "(handoffs/consolidation_round.md, K4).",
-    ),
     "cegb": (
         PENDING,
         "consolidation_K10",
@@ -330,12 +322,6 @@ CLASSIFICATION = {
         "consolidation_K10",
         "Reached only from gpu_sparse; same unblocker.",
     ),
-    "external_memory": (
-        PENDING,
-        "consolidation_K10",
-        "Streaming Dataset construction over sequence.mojo. Parked with "
-        "sequence until an export and a chunk binding connect them together.",
-    ),
     "gpu_vendor_policy": (
         EXPERIMENTAL,
         "consolidation_K2",
@@ -357,23 +343,6 @@ CLASSIFICATION = {
         "consolidation_K7",
         "Backend contract reached only from dask.py inside functions, by "
         "design.",
-    ),
-    "mojotrees._arrow": (
-        PENDING,
-        "consolidation_K4",
-        "Reached only from the parked _sequence.py; connects with it.",
-    ),
-    "mojotrees._polars": (
-        PENDING,
-        "consolidation_K4",
-        "Reached only from the parked _sequence.py; connects with it.",
-    ),
-    "mojotrees._sequence": (
-        PENDING,
-        "consolidation_K4",
-        "Ecosystem chunk dispatcher _arrow.py and _polars.py are written "
-        "against; parked until connect_07's _arrays.check_X front and a "
-        "chunk binding reach it (handoffs/consolidation_round.md, K4).",
     ),
     "mojotrees._public_api_plan": (
         EXPERIMENTAL,

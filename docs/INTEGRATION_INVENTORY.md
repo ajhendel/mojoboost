@@ -56,7 +56,6 @@ it, not a second opinion.
 | `cegb` | PENDING | consolidation_K10 | LightGBM cegb_* controls, complete and self-contained. Parked until a trainer accepts the cegb params and the boosting loop hooks it |
 | `distributed_gpu` | EXPERIMENTAL | consolidation_K9 | Host-arithmetic contract for a distributed fixed-point GPU histogram exchange; require_distributed_gpu refuses it until HAS_DEVICE_COLLECTIVE, transport_available(), and GPU_SPEEDUP_GATE_MET all hold. Parked, not superseded; its constants now come from quantized_gradient |
 | `distributed_strategies` | EXPERIMENTAL | consolidation_K9 | Feature-parallel and voting-parallel cores over Collective; self-gated by require_strategy_operational, which refuses both modes until transport_available() is True. Parked, not superseded: distributed.mojo implements only data parallel |
-| `external_memory` | PENDING | consolidation_K10 | Streaming Dataset construction over sequence.mojo. Parked with sequence until an export and a chunk binding connect them together |
 | `gpu_categorical` | PENDING | consolidation_K10 | GPU category statistics; the GPU trainer refuses categoricals. Parked until train_gpu accepts categorical specs |
 | `gpu_sparse` | PENDING | consolidation_K10 | Reached only from gpu_categorical; same unblocker |
 | `gpu_sparse_layout` | PENDING | consolidation_K10 | Reached only from gpu_sparse; same unblocker |
@@ -65,15 +64,15 @@ it, not a second opinion.
 | `linear_tree` | PENDING | consolidation_K10 | linear_tree=true ensembles. Parked until Booster holds a LinearEnsemble and model I/O carries it; codes come from objective_registry |
 | `model_editing` | PENDING | consolidation_K10 | In-place leaf editing. Its MODEL_EDITING_SUPPORTED=True is the feature's claim; inspection.mojo's False is what ships. Parked until connected, when inspection re-exports this module's status |
 | `ranking_advanced` | PENDING | consolidation_K10 | Position bias, pair sampling, custom label gain, fold shuffle. Parked until fit_ranker grows those parameters |
-| `sequence` | PENDING | consolidation_K4 | Bounded-memory chunk protocol external_memory.mojo is written against; coherent, not a duplicate of python _sequence.py. Parked until an export plus external_memory validation connects it (handoffs/connect_21_native_interfaces.md) |
 
 Three shapes recur and are worth naming, because they change what a fix
 costs:
 
 - **Chains.** `gpu_sparse_layout` is unreachable only because `gpu_sparse`
-  is, and `sequence` only because `external_memory` is. One connecting edge
-  at the head of a chain reaches all of it, so the count of orphans
-  overstates the count of decisions. (`gpu_amd_policy` and `gpu_cuda_policy`
+  is. One connecting edge at the head of a chain reaches all of it, so the
+  count of orphans overstates the count of decisions. (`sequence` and
+  `external_memory` were such a chain until the integration round exported
+  both and gave `Dataset` a chunk binding.) (`gpu_amd_policy` and `gpu_cuda_policy`
   were such a chain until the consolidation round merged them into
   `gpu_vendor_policy`, f23bd1b.)
 - **Test-only modules.** `backend`, `lgbm_model_io`, and `gpu_vendor_policy`

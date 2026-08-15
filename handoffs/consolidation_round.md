@@ -309,3 +309,37 @@ Left uncalled: `gpu_validation_metric_matches_host` (the connect_07
 gpu_validation surface has no Python reader at all) and the connect_07 /
 connect_22 rows (`gpu_predict_capability`, `gpu_validation_*`, `efb_*`,
 `extra_*`, `forced_splits_check`), which are other lanes'.
+
+**W5, ingestion stack.** `sequence.mojo` and `external_memory.mojo` are
+exported and run: `sequence.mojo` did not compile (a `to_bits` cast, a
+`len(String)`, two partial field moves) and now does; `CancelToken` is one
+struct in `sequence.mojo` with both spellings and `validation.mojo` imports
+it; `tests/test_external_memory.mojo` (in `test` and `test-cpu`) runs the
+checks `docs/EXTERNAL_MEMORY.md` section 14 called unrun: streamed edges
+and bins equal `fit_bins` / `transform` bit for bit, chunks equal their
+slices, the cache reopens through its checksums and refuses the wrong
+mapper, `train_external` predicts identically to `train_dataset`, row
+coverage rejects gaps and overlaps, a cancelled token stops a build.
+`bindings/sequence_bindings.mojo` adds `dataset_chunks_begin` / `push` /
+`num_data` / `finish` (a `ChunkAccumulator` type; column-major batches
+appended and binned once into the same `Dataset` `dataset_create`
+returns). Python: `_arrays` asks `_sequence`'s dispatchers first at
+`feature_names`, `frame_categories`, `check_X`, `f64_vector`, and
+`encode_labels` (lazy import; numpy/pandas/sequence/SciPy inputs take the
+exact old path), so Arrow tables and record batches, polars frames and
+series, `lgb.Sequence` objects, and `_sequence.Batches` are accepted by
+`Dataset` and the estimators; `Dataset(batches)` streams through
+`_sequence.stream_dataset` into the chunk binding one converted batch at a
+time (`reference=` materializes instead); `lgb.Sequence` is read in
+`batch_size` slices as LightGBM reads it. Smoke after `build-python` in a
+HEAD worktree: numpy blocks, an `lgb.Sequence`, a pyarrow table, pyarrow
+record batches, a polars frame, Arrow/polars label columns, and the
+estimator on batches and on polars all predict identically to the
+concatenated array. Not done: `compatibility/api_snapshot.json` needs
+`--write` for the additive `sequence` / `external_memory` export rows
+(entangled with other lanes' additive rows, so left to the coordinator);
+`validation.mojo`'s `CancelToken` import is a re-export the audit flags as
+unused because `__init__.mojo` still imports the name from `.validation`
+(swap it to `.sequence` when `__init__.mojo` is free); pyarrow and polars
+are not in the pixi env, so the Arrow/polars smoke ran against a scratch
+install and no CI test covers them.
