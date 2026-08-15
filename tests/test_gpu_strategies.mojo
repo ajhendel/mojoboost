@@ -428,3 +428,42 @@ def test_env_overrides_change_geometry_not_results() raises:
 
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()
+
+
+def test_open_resident_reuses_its_pool_across_trees() raises:
+    """A second `open_resident` on the same builder allocates nothing.
+
+    `open_resident` is called once per tree by
+    `train_gpu._grow_tree_gpu_device_search`, and until this was guarded it
+    appended a fresh `GpuLeafBatcher` every time while `enqueue_leaf` read
+    only `batcher[0]`. A hundred-round fit therefore allocated a hundred slot
+    pools on the default device path, used the first, and never read or freed
+    the rest. Counting batchers is the whole test: the leak was invisible to
+    every existing assertion because the extra pools were correct, merely
+    unreachable.
+
+    The deeper request declines rather than reusing a pool that cannot hold
+    the frontier, which is the all-or-nothing contract `open_resident`
+    documents. In a single fit the leaf budget does not move, so that branch
+    is unreachable today and is asserted so it stays deliberate.
+    """
+    comptime if not has_accelerator():
+        print("skipped: no accelerator")
+    else:
+        var data = _make_data(600, 4, 32)
+        var builder = GpuHistogramBuilder(data)
+
+        assert_true(builder.open_resident(8))
+        assert_equal(len(builder.batcher), 1)
+        var capacity = builder.batcher[0].pool.capacity
+
+        for _ in range(5):
+            assert_true(builder.open_resident(8))
+        assert_equal(len(builder.batcher), 1)
+        assert_equal(builder.batcher[0].pool.capacity, capacity)
+
+        # Shallower than the open pool reuses it; deeper declines.
+        assert_true(builder.open_resident(4))
+        assert_equal(len(builder.batcher), 1)
+        assert_true(not builder.open_resident(capacity + 1))
+        assert_equal(len(builder.batcher), 1)

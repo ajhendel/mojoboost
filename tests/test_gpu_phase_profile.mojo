@@ -39,6 +39,8 @@ and the device call sites in train_gpu.mojo are covered by the fits in
 tests/test_gpu_training.mojo continuing to produce the same trees.
 """
 
+# run_tests: cpu-safe -- host arithmetic only, opens no device.
+
 from std.os import setenv
 from std.testing import assert_equal, assert_raises, assert_true, TestSuite
 

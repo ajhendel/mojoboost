@@ -1,5 +1,7 @@
 """Pure tests for workload-aware GPU split selection."""
 
+# run_tests: cpu-safe -- host arithmetic only, opens no device.
+
 from std.testing import assert_equal, assert_false, assert_true, TestSuite
 
 from mojotrees.gpu_split_policy import (

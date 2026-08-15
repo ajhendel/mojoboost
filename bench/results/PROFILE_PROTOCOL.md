@@ -35,9 +35,18 @@ repository.
 - Every comparison interleaved within one process where the harness supports
   it (`bench-train-gpu rows feats reg N arm1,arm2`), and alternated across
   processes where it does not.
-- Report min of three with the spread. A pair whose difference is inside the
-  larger arm's spread is **indistinguishable**, and is recorded as such rather
-  than as a small win.
+- Report **median** of three as the decision statistic, with the min and the
+  spread beside it. A pair whose difference is inside the larger arm's spread
+  is **indistinguishable**, and is recorded as such rather than as a small win.
+
+  Median rather than min, and the two documents now agree on it. The minimum is
+  the luckiest sample, and contention is not noise here, it is the finding:
+  our batch prediction runs at parallel efficiency 1.00 against LightGBM's 6.5
+  to 9.5 on the same ten threads, and a statistic that discards contention
+  would hide exactly that. `bench/real_data/run.py` and `report.py` were
+  reconciled onto the median in the same round for the same reason, and a
+  protocol that named a different statistic than the harness stores would put
+  two records in conflict the first time anyone compared them.
 - Header records: toolchain version, machine, thermal state, LightGBM version,
   LightGBM's resolved builder (`force_row_wise` / `force_col_wise` / auto), and
   the thread count given to both sides.

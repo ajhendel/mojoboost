@@ -20,6 +20,8 @@ tests/test_gpu_tiling.mojo owns the invariants the floor did not change and
 is left alone; this file only covers what the floor added.
 """
 
+# run_tests: cpu-safe -- opens no device; see tools/run_tests.sh gpu_by_content.
+
 from std.os import setenv
 from std.testing import assert_equal, assert_raises, assert_true, TestSuite
 

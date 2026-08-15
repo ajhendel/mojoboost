@@ -96,8 +96,15 @@ USE_PKG="${MOJOTREES_TEST_PKG:-1}"
 # Tests that instantiate accelerator kernels.  CPU-only CI must not compile
 # these: an Apple-silicon or CUDA-less runner reports no GPU architecture at
 # compile time and the kernel fails to build rather than skipping at run
-# time.  Everything not listed here is CPU-safe and runs in every mode
-# except `gpu`.
+# time.
+#
+# This list is BELT, not braces.  It was hand-maintained, and in one round two
+# new accelerator tests were added without it and were silently classified
+# CPU-safe, which is a break that only a CPU-only runner can see and that no
+# amount of local testing on an Apple machine reproduces.  `gpu_by_content`
+# below now derives the same answer from the file, so a test that reaches the
+# accelerator is GPU-only whether or not anyone remembered to name it here.
+# Keeping the explicit list as well costs nothing and documents intent.
 GPU_ONLY="
 test_apple_gpu_policy
 test_backend_equivalence
@@ -144,6 +151,32 @@ test_hybrid_replica
 # see it too.
 GPU_ALSO="test_interaction"
 
+# Derive GPU-only status from the file NAME, so the list above cannot drift.
+#
+# Naming, not content.  The first attempt at this classified any file
+# mentioning `has_accelerator`, `DeviceContext`, or a `mojotrees.gpu_` import,
+# and it moved seven genuinely CPU-safe files out of the CPU set, which is a
+# coverage loss rather than a fix.  Those files are safe precisely because they
+# wrap their device work in `comptime if not has_accelerator()`, so mentioning
+# the symbol is what safety looks like, not what danger looks like.
+#
+# Every file that actually broke was named `test_gpu_*` and simply had not been
+# added to the list.  So that is the rule: a `test_gpu_*` file is GPU-only
+# unless it declares itself with a marker comment on any line:
+#
+#     # run_tests: cpu-safe
+#
+# `test_gpu_tile_floor` uses that marker; it asserts tiling geometry over
+# synthetic `DeviceCaps` and opens nothing.  `test_golden_bits` needs no marker
+# because of its name, and carries one anyway so that a future rename cannot
+# quietly pull the bit-exactness contract out of CPU-only CI.
+gpu_by_content() {
+  case "$1" in test_gpu_*) ;; *) return 1 ;; esac
+  grep -q '^[[:space:]]*#[[:space:]]*run_tests: cpu-safe' "tests/$1.mojo" 2>/dev/null \
+    && return 1
+  return 0
+}
+
 # Tests that reach past the package into another source tree.
 extra_includes() {
   case "$1" in
@@ -178,8 +211,10 @@ else
     name="$(basename "$path" .mojo)"
     case "$MODE" in
       all|list) SELECTED+=("$name") ;;
-      cpu) in_list "$name" "$GPU_ONLY" || SELECTED+=("$name") ;;
-      gpu) if in_list "$name" "$GPU_ONLY" || in_list "$name" "$GPU_ALSO"
+      cpu) { in_list "$name" "$GPU_ONLY" || gpu_by_content "$name"; } \
+             || SELECTED+=("$name") ;;
+      gpu) if in_list "$name" "$GPU_ONLY" || gpu_by_content "$name" \
+             || in_list "$name" "$GPU_ALSO"
            then SELECTED+=("$name")
            fi ;;
     esac

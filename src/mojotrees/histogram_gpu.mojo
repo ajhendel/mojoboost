@@ -1477,9 +1477,31 @@ struct GpuHistogramBuilder(Movable):
         A pool already open is reused when it is deep enough, since a builder
         holds at most one batcher for its whole life and a tree's slots are
         released back to it rather than reallocated.
+
+        That last paragraph described an intention rather than the code until
+        this guard was added. `open_resident` is called once per tree from
+        `_grow_tree_gpu_device_search`, and it appended a new `GpuLeafBatcher`
+        every time, while `enqueue_leaf` reads `self.batcher[0]` and nothing
+        reads any other. So a hundred-round fit allocated a hundred slot
+        pools, used the first, and never freed or read the other ninety-nine,
+        each one a full-width `3 * n_features * n_bins` Int32 slot per leaf
+        plus its own partial buffer, on the default device path. The guard is
+        the same one `open_batching` has always had; the two are written the
+        same way now so the difference cannot come back.
+
+        The depth test is what makes reuse safe rather than merely cheap. A
+        pool shallower than this tree's frontier would strand a leaf, which is
+        precisely the failure the all-or-nothing contract above exists to
+        refuse, so a request deeper than the open pool declines rather than
+        reusing it. In a single fit `want_slots` is `params.num_leaves` and
+        does not move, so the deeper-request branch is unreachable today; it
+        is written because a caller that varied the leaf budget between trees
+        would otherwise get a silently stranded leaf instead of a decline.
         """
         if not self.resident_frontier_fits(want_slots):
             return False
+        if len(self.batcher) > 0:
+            return self.batcher[0].pool.capacity >= want_slots
         require_histogram_launchable(
             self.contract,
             self.caps,

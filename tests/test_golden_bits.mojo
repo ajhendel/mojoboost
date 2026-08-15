@@ -105,6 +105,8 @@ This file is accelerator-free by design: a CPU-only runner has to be able to
 enforce the contract. GPU exactness lives in the `gpu` test set.
 """
 
+# run_tests: cpu-safe -- opens no device; see tools/run_tests.sh gpu_by_content.
+
 from std.math import isnan
 from std.memory import bitcast
 from std.sys import argv
