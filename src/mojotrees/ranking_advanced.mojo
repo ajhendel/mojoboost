@@ -146,7 +146,7 @@ from .ranking import (
     label_gain,
     max_dcg,
 )
-from .sampling import _splitmix64, _uniform
+from .rng import GOLDEN, splitmix64, uniform
 from .tree import Tree, grow_tree
 
 # LightGBM's `lambdarank_position_bias_regularization` default: no
@@ -175,8 +175,6 @@ comptime _PAIR_DOMAIN = UInt64(0xD1B54A32D192ED03)
 
 # Domain separator for the fold shuffle, for the same reason.
 comptime _FOLD_DOMAIN = UInt64(0x27BB2EE687B0B0FD)
-
-comptime _GOLDEN = UInt64(0x9E3779B97F4A7C15)
 
 # What to do with a query the `group` array says holds no rows. LightGBM's
 # reader rejects one; `ranking.groups_from_counts` rejects one too. DROP is
@@ -742,17 +740,17 @@ def _pair_stream(seed: Int, iteration: Int, query: Int) -> UInt64:
     (i, j) depends only on (seed, iteration, query, i, j), so it survives
     reordering, threading, bagging, and being replayed from the middle of a
     run. Sign bits are masked off so negative seeds are accepted."""
-    var h = _splitmix64(UInt64(seed & 0x7FFFFFFFFFFFFFFF) ^ _PAIR_DOMAIN)
-    h = _splitmix64(h ^ UInt64(iteration & 0x7FFFFFFFFFFFFFFF))
-    return _splitmix64(h ^ UInt64(query & 0x7FFFFFFFFFFFFFFF))
+    var h = splitmix64(UInt64(seed & 0x7FFFFFFFFFFFFFFF) ^ _PAIR_DOMAIN)
+    h = splitmix64(h ^ UInt64(iteration & 0x7FFFFFFFFFFFFFFF))
+    return splitmix64(h ^ UInt64(query & 0x7FFFFFFFFFFFFFFF))
 
 
 def _pair_kept(stream: UInt64, i: Int, j: Int, rate: Float64) -> Bool:
     """Whether the pair at ranks (i, j) survives the draw. The two ranks are
     mixed rather than added so that (i, j) and (j, i) - and every other pair
     with the same sum - draw independently."""
-    var counter = _splitmix64(stream ^ (UInt64(i) * _GOLDEN)) + UInt64(j)
-    return _uniform(counter) < rate
+    var counter = splitmix64(stream ^ (UInt64(i) * GOLDEN)) + UInt64(j)
+    return uniform(counter) < rate
 
 
 def pair_budget(groups: RankGroups, truncation_level: Int) -> Int:
@@ -1733,9 +1731,9 @@ def _fold_shuffle(n: Int, seed: Int) -> List[Int]:
     var order = List[Int](capacity=n)
     for i in range(n):
         order.append(i)
-    var stream = _splitmix64(UInt64(seed & 0x7FFFFFFFFFFFFFFF) ^ _FOLD_DOMAIN)
+    var stream = splitmix64(UInt64(seed & 0x7FFFFFFFFFFFFFFF) ^ _FOLD_DOMAIN)
     for i in range(n - 1, 0, -1):
-        var j = Int(_uniform(stream + UInt64(i)) * Float64(i + 1))
+        var j = Int(uniform(stream + UInt64(i)) * Float64(i + 1))
         if j > i:
             j = i
         var tmp = order[i]
