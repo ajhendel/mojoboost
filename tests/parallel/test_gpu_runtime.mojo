@@ -19,11 +19,11 @@ from std.os import setenv
 from std.sys import has_accelerator
 from std.testing import assert_equal, assert_true, TestSuite
 
-from mojoboost.binning import bin_equal_width
-from mojoboost.gpu_runtime import GpuSession
-from mojoboost.histogram_gpu import GpuHistogramBuilder
+from mojotrees.binning import bin_equal_width
+from mojotrees.gpu_runtime import GpuSession
+from mojotrees.histogram_gpu import GpuHistogramBuilder
 
-from mojoboost.gpu_runtime import (
+from mojotrees.gpu_runtime import (
     DEFAULT_STAGING_SLOTS,
     KERNEL_HIST_ATOMIC,
     KERNEL_PARTITION,
@@ -817,26 +817,26 @@ def test_names_cover_every_constant() raises:
 def test_env_overrides() raises:
     """One test owns all environment mutation so no other test sees a dirty
     environment regardless of suite ordering; empty string means unset."""
-    _ = setenv("MOJOBOOST_GPU_STAGING_SLOTS", "4")
+    _ = setenv("MOJOTREES_GPU_STAGING_SLOTS", "4")
     assert_equal(env_staging_slots(), 4)
 
-    _ = setenv("MOJOBOOST_GPU_STAGING_SLOTS", "0")
+    _ = setenv("MOJOTREES_GPU_STAGING_SLOTS", "0")
     assert_equal(env_staging_slots(), 1)
 
-    _ = setenv("MOJOBOOST_GPU_STAGING_SLOTS", "9999")
+    _ = setenv("MOJOTREES_GPU_STAGING_SLOTS", "9999")
     assert_equal(env_staging_slots(), MAX_STAGING_SLOTS)
 
-    _ = setenv("MOJOBOOST_GPU_STAGING_SLOTS", "nonsense")
+    _ = setenv("MOJOTREES_GPU_STAGING_SLOTS", "nonsense")
     assert_equal(env_staging_slots(), DEFAULT_STAGING_SLOTS)
 
-    _ = setenv("MOJOBOOST_GPU_STAGING_SLOTS", "")
+    _ = setenv("MOJOTREES_GPU_STAGING_SLOTS", "")
     assert_equal(env_staging_slots(), DEFAULT_STAGING_SLOTS)
 
-    _ = setenv("MOJOBOOST_GPU_TRACE", "1")
+    _ = setenv("MOJOTREES_GPU_TRACE", "1")
     var traced = PhaseCounters.from_env()
     assert_true(traced.enabled)
 
-    _ = setenv("MOJOBOOST_GPU_TRACE", "")
+    _ = setenv("MOJOTREES_GPU_TRACE", "")
     var untraced = PhaseCounters.from_env()
     assert_true(not untraced.enabled)
 

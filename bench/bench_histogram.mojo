@@ -12,9 +12,9 @@ Usage: mojo run -I src bench/bench_histogram.mojo [n_rows] [n_features] [reps]
 from std.sys import argv, has_accelerator
 from std.time import perf_counter_ns
 
-from mojoboost.binning import bin_equal_width
-from mojoboost.histogram import build_histogram
-from mojoboost.histogram_gpu import GpuHistogramBuilder
+from mojotrees.binning import bin_equal_width
+from mojotrees.histogram import build_histogram
+from mojotrees.histogram_gpu import GpuHistogramBuilder
 
 
 def _splitmix64(state: UInt64) -> UInt64:

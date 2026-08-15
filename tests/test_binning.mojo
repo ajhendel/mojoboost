@@ -23,7 +23,7 @@ from std.os import setenv
 from std.testing import TestSuite, assert_equal, assert_true
 from std.utils.numerics import inf, nan
 
-from mojoboost.binning import (
+from mojotrees.binning import (
     SELECT_MIN_ROWS,
     value_from_key,
     BinMapper,
@@ -59,25 +59,25 @@ comptime INF = inf[DType.float64]()
 
 
 def _serial():
-    _ = setenv("MOJOBOOST_NUM_WORKERS", "1")
+    _ = setenv("MOJOTREES_NUM_WORKERS", "1")
 
 
 def _workers(n: Int):
-    _ = setenv("MOJOBOOST_NUM_WORKERS", String(n))
+    _ = setenv("MOJOTREES_NUM_WORKERS", String(n))
 
 
 def _auto():
-    _ = setenv("MOJOBOOST_NUM_WORKERS", "0")
+    _ = setenv("MOJOTREES_NUM_WORKERS", "0")
 
 
 def _force_sorted_path():
     """Push the selection threshold past any column these tests build, so
     `fit_bins` takes the plain sort. Restored by `_restore_paths`."""
-    _ = setenv("MOJOBOOST_BINNING_SELECT_MIN_ROWS", "1000000000")
+    _ = setenv("MOJOTREES_BINNING_SELECT_MIN_ROWS", "1000000000")
 
 
 def _restore_paths():
-    _ = setenv("MOJOBOOST_BINNING_SELECT_MIN_ROWS", "0")
+    _ = setenv("MOJOTREES_BINNING_SELECT_MIN_ROWS", "0")
 
 
 def _assert_same_binning(a: BinMapper, b: BinMapper, what: String) raises:

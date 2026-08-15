@@ -12,7 +12,7 @@ before GOSS existed.
 from std.os import remove
 from std.testing import assert_equal, assert_true, TestSuite
 
-from mojoboost import (
+from mojotrees import (
     BINARY_LOGISTIC,
     CPU_DEVICE,
     QUANTILE,

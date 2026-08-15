@@ -9,7 +9,7 @@ NOT EXECUTED. It has never been compiled or run.
 
 Why this exists. `has_accelerator()` is resolved at compile time, so
 availability is a property of the build rather than of the machine running
-it (src/mojoboost/device.mojo). A wheel compiled where an accelerator was
+it (src/mojotrees/device.mojo). A wheel compiled where an accelerator was
 visible reports one as available wherever it is installed, and a `gpu`
 request on such a build fails when the device is opened rather than when it
 is resolved. That is the one field in the provenance sidecar that changes

@@ -1,4 +1,4 @@
-"""Five minute tour of mojoboost on an Apple Silicon Mac.
+"""Five minute tour of mojotrees on an Apple Silicon Mac.
 
 Run it with the package importable, either from a source checkout
 
@@ -25,8 +25,8 @@ import os
 import tempfile
 import time
 
-import mojoboost
-from mojoboost import MojoBoostRegressor, gpu_available
+import mojotrees
+from mojotrees import MojoTreesRegressor, gpu_available
 
 
 # ----------------------------------------------------------------------
@@ -100,10 +100,10 @@ def rule(title):
 def report_build():
     rule("1. What this build can do")
     available = gpu_available()
-    print(f"mojoboost version        {mojoboost.__version__}")
+    print(f"mojotrees version        {mojotrees.__version__}")
     print(f"gpu_available()          {available}")
-    print(f"MOJOBOOST_DISABLE_GPU    {os.environ.get('MOJOBOOST_DISABLE_GPU', '<unset>')}")
-    print(f"MOJOBOOST_AUTO_MIN_CELLS {os.environ.get('MOJOBOOST_AUTO_MIN_CELLS', '<unset>')}")
+    print(f"MOJOTREES_DISABLE_GPU    {os.environ.get('MOJOTREES_DISABLE_GPU', '<unset>')}")
+    print(f"MOJOTREES_AUTO_MIN_CELLS {os.environ.get('MOJOTREES_AUTO_MIN_CELLS', '<unset>')}")
     print()
     if available:
         print(
@@ -115,13 +115,13 @@ def report_build():
     else:
         print(
             "This build reports no accelerator. Either it was compiled on a\n"
-            "machine without one, or MOJOBOOST_DISABLE_GPU=1 is set. Every\n"
+            "machine without one, or MOJOTREES_DISABLE_GPU=1 is set. Every\n"
             "step below still runs, on the CPU."
         )
     print(
         "\nAvailability is a property of the build and not of this machine.\n"
         "Mojo resolves it at compile time, so a wheel built where a GPU was\n"
-        "present reports one here as well. See src/mojoboost/device.mojo."
+        "present reports one here as well. See src/mojotrees/device.mojo."
     )
     return available
 
@@ -133,12 +133,12 @@ def report_build():
 
 def show_auto(X, y):
     rule("2. device='auto' picks a backend and records what ran")
-    model = MojoBoostRegressor(n_estimators=10, num_leaves=15, device="auto")
+    model = MojoTreesRegressor(n_estimators=10, num_leaves=15, device="auto")
     model.fit(X, y)
     print(f"requested device  auto")
     print(f"model.device_     {model.device_}")
     print(
-        "\n'auto' resolves to the CPU unless MOJOBOOST_AUTO_MIN_CELLS enables\n"
+        "\n'auto' resolves to the CPU unless MOJOTREES_AUTO_MIN_CELLS enables\n"
         "the size heuristic. The threshold is disabled by default because no\n"
         "benchmark on any device has established a workload size where the\n"
         "GPU trainer wins, and shipping a crossover number would be a\n"
@@ -159,7 +159,7 @@ def train_with_validation(X_train, y_train, X_valid, y_valid):
         "device='gpu' raises rather than falling back. This step trains on\n"
         "the CPU deliberately.\n"
     )
-    model = MojoBoostRegressor(
+    model = MojoTreesRegressor(
         n_estimators=300,
         learning_rate=0.05,
         num_leaves=31,
@@ -223,13 +223,13 @@ def predict(model, X_valid, y_valid):
 def explain_device(available, n_rows, n_features):
     rule("5. Why that device was chosen")
     cells = n_rows * n_features
-    threshold = os.environ.get("MOJOBOOST_AUTO_MIN_CELLS")
+    threshold = os.environ.get("MOJOTREES_AUTO_MIN_CELLS")
     print(f"workload           {n_rows} rows x {n_features} features = {cells} cells")
     print(f"accelerator        {'present in this build' if available else 'not available'}")
     print(f"auto threshold     {threshold if threshold else 'disabled (default)'}")
     print(f"objective          squared error, single output, covered by the GPU path")
     print(
-        "\nThe rules, in the words of src/mojoboost/device.mojo.\n"
+        "\nThe rules, in the words of src/mojotrees/device.mojo.\n"
         "  cpu   the dependable path, float64 throughout, every objective.\n"
         "  gpu   device resident tree growth. Raises when no accelerator is\n"
         "        present or when the workload is outside what the GPU path\n"
@@ -248,7 +248,7 @@ def explain_device(available, n_rows, n_features):
         "\nNOT AVAILABLE YET. A structured, machine readable version of this\n"
         "explanation is a separate piece of work. The call below is a\n"
         "placeholder and is deliberately not executed.\n"
-        "\n    # from mojoboost import explain_device_choice   # not implemented\n"
+        "\n    # from mojotrees import explain_device_choice   # not implemented\n"
         "    # report = explain_device_choice(X)              # not implemented"
     )
 
@@ -264,7 +264,7 @@ def save_and_load(model, X_valid, preds):
         path = os.path.join(d, "apple_tour.mbst")
         model.save(path)
         size = os.path.getsize(path)
-        restored = MojoBoostRegressor.load(path)
+        restored = MojoTreesRegressor.load(path)
         again = list(restored.predict(X_valid))
         identical = all(float(a) == float(b) for a, b in zip(preds, again))
         print(f"written to         {os.path.basename(path)} ({size} bytes)")
@@ -295,7 +295,7 @@ def time_backends(X, y, n_estimators):
 
     fit_kwargs = dict(n_estimators=n_estimators, num_leaves=31, device="cpu")
     start = time.perf_counter()
-    MojoBoostRegressor(**fit_kwargs).fit(X, y)
+    MojoTreesRegressor(**fit_kwargs).fit(X, y)
     cpu_seconds = time.perf_counter() - start
     print(f"device='cpu'   {cpu_seconds:8.3f} s")
 
@@ -304,7 +304,7 @@ def time_backends(X, y, n_estimators):
         return
     try:
         start = time.perf_counter()
-        gpu_model = MojoBoostRegressor(
+        gpu_model = MojoTreesRegressor(
             n_estimators=n_estimators, num_leaves=31, device="gpu"
         ).fit(X, y)
         gpu_seconds = time.perf_counter() - start

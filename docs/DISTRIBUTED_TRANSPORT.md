@@ -8,7 +8,7 @@ scalability is claimed anywhere in this document.
 `docs/distributed.md` covers the training algorithm and says what a collective
 has to deliver. This document covers the layer underneath it: how two
 processes on two hosts would actually agree on a reduction. The code is
-`src/mojoboost/distributed_transport.mojo` and the tests are
+`src/mojotrees/distributed_transport.mojo` and the tests are
 `tests/parallel/test_distributed_transport.mojo`.
 
 ## 1. What is implemented and what is not

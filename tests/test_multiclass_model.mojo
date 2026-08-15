@@ -4,7 +4,7 @@ data, and serialization round trips."""
 from std.os import remove
 from std.testing import assert_equal, assert_true, assert_raises, TestSuite
 
-from mojoboost import (
+from mojotrees import (
     BINARY_LOGISTIC,
     BoosterParams,
     MulticlassModel,

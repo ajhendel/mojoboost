@@ -1,6 +1,6 @@
 # Deprecation policy
 
-How a public surface in mojoboost is retired: the states it passes
+How a public surface in mojotrees is retired: the states it passes
 through, the overlap it is owed, where the fact is recorded so a tool can
 read it, and what the release gate does with it.
 
@@ -19,7 +19,7 @@ state may advance, and the checks that read the register so that "we said
 we would remove it in 0.4" is a fact a tool can fail on rather than a
 sentence in a release note nobody grepped.
 
-mojoboost is at version 0.1.0. There is no git tag, no published release,
+mojotrees is at version 0.1.0. There is no git tag, no published release,
 and no PyPI distribution. Every rule here takes effect at the first tagged
 release. Before that, nothing has shipped, so nothing can be owed an
 overlap; section 6 says what that does and does not license.
@@ -74,7 +74,7 @@ move forward.
 | `deprecated` | Works, unchanged | A `DeprecationWarning` naming the replacement and the removal release, where the surface has a warning channel | `since`, `remove_in`, `replacement`, `reason` |
 | `removed` | Gone | The error of section 4 | everything above, plus `removed_in` |
 
-`soft` exists because two of mojoboost's three surfaces have no runtime
+`soft` exists because two of mojotrees's three surfaces have no runtime
 warning channel. A Mojo export cannot raise a `DeprecationWarning` without
 a cost in a loop that may be hot, and a C declaration cannot warn at all
 until the caller recompiles. For those, `soft` and `deprecated` differ

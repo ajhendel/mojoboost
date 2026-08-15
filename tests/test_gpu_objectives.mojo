@@ -28,8 +28,8 @@ from std.os import remove
 from std.sys import has_accelerator
 from std.testing import assert_equal, assert_raises, assert_true, TestSuite
 
-from mojoboost.binning import BinnedMatrix, bin_equal_width, fit_bins
-from mojoboost.boosting import (
+from mojotrees.binning import BinnedMatrix, bin_equal_width, fit_bins
+from mojotrees.boosting import (
     BINARY_LOGISTIC,
     HUBER,
     L1,
@@ -42,11 +42,11 @@ from mojoboost.boosting import (
     train,
     train_multiclass,
 )
-from mojoboost.histogram_gpu import GpuHistogramBuilder
-from mojoboost.model import Model
-from mojoboost.serialize import load_model, save_model
-from mojoboost.train_gpu import train_gpu, train_multiclass_gpu
-from mojoboost.tree import TreeParams
+from mojotrees.histogram_gpu import GpuHistogramBuilder
+from mojotrees.model import Model
+from mojotrees.serialize import load_model, save_model
+from mojotrees.train_gpu import train_gpu, train_multiclass_gpu
+from mojotrees.tree import TreeParams
 
 comptime _TMP_PATH = "./.test_gpu_objectives_roundtrip.tmp"
 

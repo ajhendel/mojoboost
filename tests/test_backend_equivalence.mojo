@@ -10,19 +10,19 @@ from std.os import setenv
 from std.sys import has_accelerator
 from std.testing import assert_equal, assert_true, TestSuite
 
-from mojoboost.backend import CPU, GPU, build_histogram
-from mojoboost.binning import bin_equal_width
-from mojoboost.boosting import (
+from mojotrees.backend import CPU, GPU, build_histogram
+from mojotrees.binning import bin_equal_width
+from mojotrees.boosting import (
     SQUARED_ERROR,
     BoosterParams,
     IterationRange,
     train,
 )
-from mojoboost.train_gpu import train_gpu
-from mojoboost.device import CPU_DEVICE, GPU_DEVICE
-from mojoboost.histogram_gpu import GpuHistogramBuilder
-from mojoboost.model import fit, fit_multiclass
-from mojoboost.tree import TreeParams
+from mojotrees.train_gpu import train_gpu
+from mojotrees.device import CPU_DEVICE, GPU_DEVICE
+from mojotrees.histogram_gpu import GpuHistogramBuilder
+from mojotrees.model import fit, fit_multiclass
+from mojotrees.tree import TreeParams
 
 
 def _splitmix64(state: UInt64) -> UInt64:
@@ -169,7 +169,7 @@ def test_model_predict_batch_matches_across_devices() raises:
 
 
 def test_device_split_search_trains_a_close_deterministic_model() raises:
-    """Device-side split selection (MOJOBOOST_GPU_SPLIT_STRATEGY=device)
+    """Device-side split selection (MOJOTREES_GPU_SPLIT_STRATEGY=device)
     scores gains in Float32, so split decisions can differ from the host
     scan on near-ties and tree shapes are deliberately NOT asserted
     identical. What must hold: the trained model is bit-deterministic run
@@ -193,10 +193,10 @@ def test_device_split_search_trains_a_close_deterministic_model() raises:
         var params = BoosterParams(20, 0.1, TreeParams(15, 20, 1.0, 1e-3))
 
         var cpu = train(data, target, SQUARED_ERROR, params)
-        _ = setenv("MOJOBOOST_GPU_SPLIT_STRATEGY", "device")
+        _ = setenv("MOJOTREES_GPU_SPLIT_STRATEGY", "device")
         var gpu_a = train_gpu(data, target, SQUARED_ERROR, params)
         var gpu_b = train_gpu(data, target, SQUARED_ERROR, params)
-        _ = setenv("MOJOBOOST_GPU_SPLIT_STRATEGY", "")
+        _ = setenv("MOJOTREES_GPU_SPLIT_STRATEGY", "")
 
         # Bit-deterministic run to run: identical structure and values.
         assert_equal(len(gpu_a.trees), len(cpu.trees))

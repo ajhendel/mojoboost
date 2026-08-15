@@ -17,7 +17,7 @@ tolerances.
 
 from std.testing import assert_equal, assert_true, TestSuite
 
-from mojoboost import (
+from mojotrees import (
     SQUARED_ERROR,
     BinnedMatrix,
     BoosterParams,

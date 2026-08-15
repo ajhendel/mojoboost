@@ -23,8 +23,8 @@ drive both sides of a blocking protocol without deadlocking on itself.
 
 from std.testing import assert_equal, assert_true, TestSuite
 
-from mojoboost.collective import agree_equal_ints
-from mojoboost.distributed_transport import (
+from mojotrees.collective import agree_equal_ints
+from mojotrees.distributed_transport import (
     CHECKPOINT_BYTES,
     FRAME_HEADER_BYTES,
     MSG_CONTRIB,

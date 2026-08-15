@@ -1,13 +1,13 @@
-# Random-forest mode in mojoboost
+# Random-forest mode in mojotrees
 
 Random-forest mode is LightGBM's `boosting='rf'`. This document specifies
-what mojoboost implements, what it deliberately refuses, what it deliberately
+what mojotrees implements, what it deliberately refuses, what it deliberately
 does differently, and what has not been verified. It describes
-`src/mojoboost/boosting_rf.mojo`, which is the algorithm core and is not a
+`src/mojotrees/boosting_rf.mojo`, which is the algorithm core and is not a
 public API.
 
 Status, in one line: the core is written and its `boosting='rf'` surface is
-imported by `src/mojoboost/alternate_boosting.mojo`; no random-forest code
+imported by `src/mojotrees/alternate_boosting.mojo`; no random-forest code
 has been compiled or run, and `boosting='rf'` is still rejected by the Python
 layer and by `parse_params`. See `handoffs/remaining_02_rf.md`.
 
@@ -140,7 +140,7 @@ of two calls of 50.
 `bagging_freq > 1` reuses one bag for that many consecutive trees, as in
 LightGBM. Under constant gradients that means those trees differ only in
 their feature draw, which is a weaker forest than `bagging_freq = 1`; it is
-not an error and mojoboost does not warn about it.
+not an error and mojotrees does not warn about it.
 
 ## 6. Aggregation, and the two model representations
 
@@ -231,19 +231,19 @@ precondition `boosting.train_more` already states.
 **Degenerate trees keep their value.** When no split passes the tree
 constraints, LightGBM discards the grown stump and appends a tree whose
 single leaf is 0, which pulls the average toward zero rather than toward the
-objective's own constant. mojoboost renews, biases, and keeps the grown stump
+objective's own constant. mojotrees renews, biases, and keeps the grown stump
 like any other tree, so a forest that can find no split predicts the base
 score rather than nothing.
 
 **GOSS does not corrupt the shared gradients.** LightGBM's GOSS scales the
 sampled rows' gradients in place, and since rf never recomputes them the
-multipliers compound across rounds. Each round in mojoboost scales a copy.
+multipliers compound across rounds. Each round in mojotrees scales a copy.
 
 **The GOSS warmup is keyed to the rf shrinkage.** LightGBM skips sampling for
 `int(1 / config.learning_rate)` rounds, reading the configured
 `learning_rate` even though rf has forced its shrinkage to 1. At the default
 0.1 that is ten full-data rounds, which under constant gradients are ten
-identical trees. mojoboost passes the rf shrinkage of 1.0, so the warmup is
+identical trees. mojotrees passes the rf shrinkage of 1.0, so the warmup is
 one round.
 
 **Balanced bagging counts as randomization.** LightGBM's `CHECK` reads
@@ -261,7 +261,7 @@ the counts, and the distributions match. This is the trade `bagging.mojo` and
 Nothing here has been compiled or run. No test file references
 `boosting_rf.mojo`, no benchmark trains a forest, and no comparison against
 LightGBM's rf output has been made. Every claim above is a reading of
-`src/boosting/rf.hpp` and of the mojoboost modules named, and the parity
+`src/boosting/rf.hpp` and of the mojotrees modules named, and the parity
 claims are claims about intent rather than measurements.
 
 The first checks worth running are listed in section 5 of

@@ -3,7 +3,7 @@
 ## Creator and lead maintainer
 
 **Andrew Hendel** ([@ajhendel](https://github.com/ajhendel)) created
-mojoboost, established its direction as a native Mojo gradient-boosted-tree
+mojotrees, established its direction as a native Mojo gradient-boosted-tree
 library, and is its lead maintainer.
 
 The creator role includes responsibility for the project's product direction,
@@ -24,7 +24,7 @@ relevant. See [CONTRIBUTING.md](CONTRIBUTING.md) and
 
 ## AI-assisted development
 
-mojoboost has been developed with extensive assistance from AI coding tools.
+mojotrees has been developed with extensive assistance from AI coding tools.
 Those tools have helped draft, inspect, and integrate code and documentation;
 they are not legal authors, maintainers, or accountable decision makers.
 
@@ -40,6 +40,6 @@ honest capability claims.
 When referring to the project in articles, talks, or software comparisons, a
 concise attribution is:
 
-> mojoboost, created and maintained by Andrew Hendel.
+> mojotrees, created and maintained by Andrew Hendel.
 
 Academic and archival users should use [CITATION.cff](CITATION.cff).

@@ -3,16 +3,16 @@
 import numpy as np
 import pytest
 
-from mojoboost import MojoBoostClassifier, MojoBoostRegressor, NotFittedError
+from mojotrees import MojoTreesClassifier, MojoTreesRegressor, NotFittedError
 
 X_OK = np.array([[0.0, 1.0], [1.0, 0.0], [0.5, 0.5], [0.25, 0.75]])
 Y_OK = np.array([0.0, 1.0, 0.5, 0.25])
 LABELS_OK = np.array([0, 1, 0, 1])
 
 
-def _fit(cls=MojoBoostRegressor, **kwargs):
+def _fit(cls=MojoTreesRegressor, **kwargs):
     est = cls(n_estimators=2, min_data_in_leaf=1)
-    y = Y_OK if cls is MojoBoostRegressor else LABELS_OK
+    y = Y_OK if cls is MojoTreesRegressor else LABELS_OK
     return est.fit(kwargs.pop("X", X_OK), kwargs.pop("y", y), **kwargs)
 
 
@@ -47,7 +47,7 @@ def test_x_rejects_infinities():
 
 
 def test_x_allows_nan_as_the_missing_marker():
-    """NaN is mojoboost's missing value (src/mojoboost/binning.mojo), so it
+    """NaN is mojotrees's missing value (src/mojotrees/binning.mojo), so it
     must survive validation, unlike an infinity."""
     with_nan = X_OK.copy()
     with_nan[0, 0] = np.nan
@@ -89,26 +89,26 @@ def test_regression_target_must_be_finite():
 
 def test_classifier_needs_at_least_two_classes():
     with pytest.raises(ValueError, match="at least 2 classes"):
-        _fit(MojoBoostClassifier, y=np.zeros(4, dtype=np.int64))
+        _fit(MojoTreesClassifier, y=np.zeros(4, dtype=np.int64))
 
 
 def test_classifier_rejects_mixed_label_types():
     with pytest.raises(ValueError, match="comparable"):
-        _fit(MojoBoostClassifier, y=np.array([0, "a", 1, "b"], dtype=object))
+        _fit(MojoTreesClassifier, y=np.array([0, "a", 1, "b"], dtype=object))
 
 
 def test_classifier_rejects_non_finite_numeric_labels():
     with pytest.raises(ValueError, match="NaN or infinite"):
-        _fit(MojoBoostClassifier, y=np.array([0.0, 1.0, np.nan, 1.0]))
+        _fit(MojoTreesClassifier, y=np.array([0.0, 1.0, np.nan, 1.0]))
 
 
 def test_classifier_accepts_gappy_and_string_labels():
     """Labels of any comparable type work; only `classes_` remembers them."""
-    gappy = _fit(MojoBoostClassifier, y=np.array([3, 7, 3, 7]))
+    gappy = _fit(MojoTreesClassifier, y=np.array([3, 7, 3, 7]))
     assert list(gappy.classes_) == [3, 7]
     assert set(gappy.predict(X_OK)) <= {3, 7}
 
-    strings = _fit(MojoBoostClassifier, y=np.array(["no", "yes", "no", "yes"]))
+    strings = _fit(MojoTreesClassifier, y=np.array(["no", "yes", "no", "yes"]))
     assert list(strings.classes_) == ["no", "yes"]
     assert set(strings.predict(X_OK)) <= {"no", "yes"}
 
@@ -145,17 +145,17 @@ def test_zero_weights_are_allowed_when_some_row_survives():
 
 
 def test_predict_before_fit_raises_not_fitted():
-    est = MojoBoostRegressor()
+    est = MojoTreesRegressor()
     with pytest.raises(NotFittedError):
         est.predict(X_OK)
 
 
 def test_not_fitted_error_is_still_a_runtime_error():
-    """mojoboost raised RuntimeError before it had a named exception, and
+    """mojotrees raised RuntimeError before it had a named exception, and
     callers written against that keep working."""
     assert issubclass(NotFittedError, RuntimeError)
     with pytest.raises(RuntimeError):
-        MojoBoostRegressor().predict(X_OK)
+        MojoTreesRegressor().predict(X_OK)
 
 
 def test_predict_rejects_a_different_feature_count(fitted_regressor):
@@ -172,7 +172,7 @@ def test_predict_validates_like_fit(fitted_regressor):
 
 def test_failed_refit_clears_the_previous_model(regression):
     X, y = regression
-    est = MojoBoostRegressor(n_estimators=3).fit(X, y)
+    est = MojoTreesRegressor(n_estimators=3).fit(X, y)
     with pytest.raises(ValueError):
         est.fit(X, np.full(len(y), np.nan))
     with pytest.raises(NotFittedError):

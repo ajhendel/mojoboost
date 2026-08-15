@@ -31,7 +31,7 @@ section is the authority and this line is the bug.
       `--include` filters, and read every match rather than counting them. A
       detection pattern inside a secret scanner is expected and fine; an
       assignment, a workflow input, or a value is the finding. Section 4.1.
-- [ ] **F5.** `gh secret list --repo mojoboost-ml/mojoboost` and the same for the
+- [ ] **F5.** `gh secret list --repo mojotrees/mojotrees` and the same for the
       `pypi` environment are both empty. A publishing secret existing at all is
       a finding, not a convenience. Section 4.1.
 - [ ] **F6.** No workflow gained a trigger, a permission, or a step since the

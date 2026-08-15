@@ -14,10 +14,10 @@ import pickle
 import numpy as np
 import pytest
 
-from mojoboost import (
-    MojoBoostClassifier,
-    MojoBoostRanker,
-    MojoBoostRegressor,
+from mojotrees import (
+    MojoTreesClassifier,
+    MojoTreesRanker,
+    MojoTreesRegressor,
     gpu_available,
     ndcg_score,
 )
@@ -47,7 +47,7 @@ def test_eval_set_spellings_agree(regression):
         {"eval_set": (Xv, yv)},
         {"eval_X": Xv, "eval_y": yv},
     ):
-        model = MojoBoostRegressor(n_estimators=15).fit(X, y, **kwargs)
+        model = MojoTreesRegressor(n_estimators=15).fit(X, y, **kwargs)
         histories.append(model.evals_result_["valid_0"]["l2"])
     assert histories[0] == histories[1] == histories[2]
 
@@ -55,7 +55,7 @@ def test_eval_set_spellings_agree(regression):
 def test_eval_X_and_eval_set_together_raise(regression):
     X, y, Xv, yv = _split(*regression)
     with pytest.raises(ValueError, match="either eval_set or eval_X"):
-        MojoBoostRegressor(n_estimators=5).fit(
+        MojoTreesRegressor(n_estimators=5).fit(
             X, y, eval_set=[(Xv, yv)], eval_X=Xv, eval_y=yv
         )
 
@@ -63,12 +63,12 @@ def test_eval_X_and_eval_set_together_raise(regression):
 def test_eval_X_without_eval_y_raises(regression):
     X, y, Xv, _ = _split(*regression)
     with pytest.raises(ValueError, match="must be given together"):
-        MojoBoostRegressor(n_estimators=5).fit(X, y, eval_X=Xv)
+        MojoTreesRegressor(n_estimators=5).fit(X, y, eval_X=Xv)
 
 
 def test_several_eval_sets_are_named_and_scored(regression):
     X, y, Xv, yv = _split(*regression)
-    model = MojoBoostRegressor(n_estimators=12).fit(
+    model = MojoTreesRegressor(n_estimators=12).fit(
         X, y, eval_set=[(Xv, yv), (X, y)], eval_names=["holdout", "train"]
     )
     assert set(model.evals_result_) == {"holdout", "train"}
@@ -81,7 +81,7 @@ def test_several_eval_sets_are_named_and_scored(regression):
 
 def test_default_eval_names(regression):
     X, y, Xv, yv = _split(*regression)
-    model = MojoBoostRegressor(n_estimators=5).fit(
+    model = MojoTreesRegressor(n_estimators=5).fit(
         X, y, eval_set=[(Xv, yv), (Xv, yv)]
     )
     assert list(model.evals_result_) == ["valid_0", "valid_1"]
@@ -97,7 +97,7 @@ def test_default_eval_names(regression):
 def test_bad_eval_names_raise(regression, names, message):
     X, y, Xv, yv = _split(*regression)
     with pytest.raises(ValueError, match=message):
-        MojoBoostRegressor(n_estimators=5).fit(
+        MojoTreesRegressor(n_estimators=5).fit(
             X, y, eval_set=[(Xv, yv), (Xv, yv)], eval_names=names
         )
 
@@ -105,27 +105,27 @@ def test_bad_eval_names_raise(regression, names, message):
 def test_malformed_eval_sets_raise(regression):
     X, y, Xv, yv = _split(*regression)
     with pytest.raises(ValueError, match="must not be empty"):
-        MojoBoostRegressor(n_estimators=5).fit(X, y, eval_set=[])
+        MojoTreesRegressor(n_estimators=5).fit(X, y, eval_set=[])
     with pytest.raises(ValueError, match="an .X, y. pair"):
-        MojoBoostRegressor(n_estimators=5).fit(X, y, eval_set=[Xv])
+        MojoTreesRegressor(n_estimators=5).fit(X, y, eval_set=[Xv])
     with pytest.raises(ValueError, match="features, but X has"):
-        MojoBoostRegressor(n_estimators=5).fit(
+        MojoTreesRegressor(n_estimators=5).fit(
             X, y, eval_set=[(Xv[:, :2], yv)]
         )
     with pytest.raises(ValueError, match="shape"):
-        MojoBoostRegressor(n_estimators=5).fit(X, y, eval_set=[(Xv, yv[:-1])])
+        MojoTreesRegressor(n_estimators=5).fit(X, y, eval_set=[(Xv, yv[:-1])])
 
 
 def test_validation_arguments_need_an_eval_set(regression):
     X, y = regression
     with pytest.raises(ValueError, match="eval_metric needs an eval_set"):
-        MojoBoostRegressor(n_estimators=5).fit(X, y, eval_metric="l2")
+        MojoTreesRegressor(n_estimators=5).fit(X, y, eval_metric="l2")
     with pytest.raises(ValueError, match="eval_sample_weight needs"):
-        MojoBoostRegressor(n_estimators=5).fit(
+        MojoTreesRegressor(n_estimators=5).fit(
             X, y, eval_sample_weight=np.ones(len(y))
         )
     with pytest.raises(ValueError, match="early_stopping_rounds needs"):
-        MojoBoostRegressor(n_estimators=5).fit(X, y, early_stopping_rounds=3)
+        MojoTreesRegressor(n_estimators=5).fit(X, y, early_stopping_rounds=3)
 
 
 # -- built-in metrics ----------------------------------------------------
@@ -133,7 +133,7 @@ def test_validation_arguments_need_an_eval_set(regression):
 
 def test_builtin_regression_metrics_match_numpy(regression):
     X, y, Xv, yv = _split(*regression)
-    model = MojoBoostRegressor(n_estimators=20).fit(
+    model = MojoTreesRegressor(n_estimators=20).fit(
         X, y, eval_set=[(Xv, yv)], eval_metric=["l2", "rmse", "l1"]
     )
     pred = model.predict(Xv)
@@ -145,7 +145,7 @@ def test_builtin_regression_metrics_match_numpy(regression):
 
 def test_metric_aliases_resolve_to_one_name(regression):
     X, y, Xv, yv = _split(*regression)
-    model = MojoBoostRegressor(n_estimators=8).fit(
+    model = MojoTreesRegressor(n_estimators=8).fit(
         X, y, eval_set=[(Xv, yv)], eval_metric="mse"
     )
     assert list(model.evals_result_["valid_0"]) == ["l2"]
@@ -159,7 +159,7 @@ def test_default_metric_follows_the_objective(regression):
         ("huber", "huber"),
         ("quantile", "quantile"),
     ):
-        model = MojoBoostRegressor(
+        model = MojoTreesRegressor(
             objective=objective, alpha=0.3, n_estimators=6
         ).fit(X, y, eval_set=[(Xv, yv)])
         assert list(model.evals_result_["valid_0"]) == [metric]
@@ -167,7 +167,7 @@ def test_default_metric_follows_the_objective(regression):
 
 def test_quantile_metric_is_the_pinball_loss(regression):
     X, y, Xv, yv = _split(*regression)
-    model = MojoBoostRegressor(
+    model = MojoTreesRegressor(
         objective="quantile", alpha=0.3, n_estimators=10
     ).fit(X, y, eval_set=[(Xv, yv)])
     pred = model.predict(Xv)
@@ -181,11 +181,11 @@ def test_quantile_metric_is_the_pinball_loss(regression):
 def test_unknown_and_wrong_task_metrics_raise(regression):
     X, y, Xv, yv = _split(*regression)
     with pytest.raises(ValueError, match="unknown eval_metric"):
-        MojoBoostRegressor(n_estimators=5).fit(
+        MojoTreesRegressor(n_estimators=5).fit(
             X, y, eval_set=[(Xv, yv)], eval_metric="nope"
         )
     with pytest.raises(ValueError, match="scores binary models"):
-        MojoBoostRegressor(n_estimators=5).fit(
+        MojoTreesRegressor(n_estimators=5).fit(
             X, y, eval_set=[(Xv, yv)], eval_metric="auc"
         )
 
@@ -196,7 +196,7 @@ def test_builtin_and_callable_metrics_mix(regression):
     def worst(y_true, y_pred):
         return float(np.max(np.abs(np.asarray(y_pred) - y_true)))
 
-    model = MojoBoostRegressor(n_estimators=12).fit(
+    model = MojoTreesRegressor(n_estimators=12).fit(
         X, y, eval_set=[(Xv, yv)], eval_metric=["l2", ("worst", worst)]
     )
     history = model.evals_result_["valid_0"]
@@ -212,7 +212,7 @@ def test_builtin_and_callable_metrics_mix(regression):
 def test_eval_sample_weight_weights_the_metric(regression, rng):
     X, y, Xv, yv = _split(*regression)
     w = rng.uniform(0.5, 2.0, size=len(yv))
-    model = MojoBoostRegressor(n_estimators=12).fit(
+    model = MojoTreesRegressor(n_estimators=12).fit(
         X, y, eval_set=[(Xv, yv)], eval_sample_weight=[w], eval_metric="l2"
     )
     pred = model.predict(Xv)
@@ -220,7 +220,7 @@ def test_eval_sample_weight_weights_the_metric(regression, rng):
         np.average((pred - yv) ** 2, weights=w)
     )
     # A single vector is accepted for a single set, as is a list of one.
-    nested = MojoBoostRegressor(n_estimators=12).fit(
+    nested = MojoTreesRegressor(n_estimators=12).fit(
         X, y, eval_set=[(Xv, yv)], eval_sample_weight=w, eval_metric="l2"
     )
     assert (
@@ -231,10 +231,10 @@ def test_eval_sample_weight_weights_the_metric(regression, rng):
 
 def test_uniform_eval_weights_change_nothing(regression):
     X, y, Xv, yv = _split(*regression)
-    plain = MojoBoostRegressor(n_estimators=10).fit(
+    plain = MojoTreesRegressor(n_estimators=10).fit(
         X, y, eval_set=[(Xv, yv)], eval_metric="l1"
     )
-    weighted = MojoBoostRegressor(n_estimators=10).fit(
+    weighted = MojoTreesRegressor(n_estimators=10).fit(
         X,
         y,
         eval_set=[(Xv, yv)],
@@ -249,18 +249,18 @@ def test_uniform_eval_weights_change_nothing(regression):
 def test_bad_eval_sample_weight_raises(regression):
     X, y, Xv, yv = _split(*regression)
     with pytest.raises(ValueError, match="one entry per eval_set entry"):
-        MojoBoostRegressor(n_estimators=5).fit(
+        MojoTreesRegressor(n_estimators=5).fit(
             X,
             y,
             eval_set=[(Xv, yv), (Xv, yv)],
             eval_sample_weight=[np.ones(len(yv))],
         )
     with pytest.raises(ValueError, match="shape"):
-        MojoBoostRegressor(n_estimators=5).fit(
+        MojoTreesRegressor(n_estimators=5).fit(
             X, y, eval_set=[(Xv, yv)], eval_sample_weight=[np.ones(3)]
         )
     with pytest.raises(ValueError, match="nonnegative"):
-        MojoBoostRegressor(n_estimators=5).fit(
+        MojoTreesRegressor(n_estimators=5).fit(
             X, y, eval_set=[(Xv, yv)], eval_sample_weight=[-np.ones(len(yv))]
         )
 
@@ -268,7 +268,7 @@ def test_bad_eval_sample_weight_raises(regression):
 def test_eval_weights_with_a_callable_metric_raise(regression):
     X, y, Xv, yv = _split(*regression)
     with pytest.raises(ValueError, match="callable metric"):
-        MojoBoostRegressor(n_estimators=5).fit(
+        MojoTreesRegressor(n_estimators=5).fit(
             X,
             y,
             eval_set=[(Xv, yv)],
@@ -282,7 +282,7 @@ def test_eval_weights_with_a_callable_metric_raise(regression):
 
 def test_early_stopping_rolls_back_to_the_best_iteration(regression):
     X, y, Xv, yv = _split(*regression)
-    model = MojoBoostRegressor(n_estimators=200).fit(
+    model = MojoTreesRegressor(n_estimators=200).fit(
         X, y, eval_set=[(Xv, yv)], early_stopping_rounds=5
     )
     assert model.stopped_early_
@@ -293,7 +293,7 @@ def test_early_stopping_rolls_back_to_the_best_iteration(regression):
     assert history[model.best_iteration_] == pytest.approx(model.best_score_)
     # Rolling back is not bookkeeping: the kept ensemble is the one a
     # shorter fit would have produced.
-    truncated = MojoBoostRegressor(
+    truncated = MojoTreesRegressor(
         n_estimators=model.best_iteration_
     ).fit(X, y)
     assert model.predict(Xv) == pytest.approx(truncated.predict(Xv))
@@ -301,7 +301,7 @@ def test_early_stopping_rolls_back_to_the_best_iteration(regression):
 
 def test_without_early_stopping_nothing_is_rolled_back(regression):
     X, y, Xv, yv = _split(*regression)
-    model = MojoBoostRegressor(n_estimators=30).fit(
+    model = MojoTreesRegressor(n_estimators=30).fit(
         X, y, eval_set=[(Xv, yv)], early_stopping_rounds=0
     )
     assert not model.stopped_early_
@@ -313,7 +313,7 @@ def test_without_early_stopping_nothing_is_rolled_back(regression):
 
 def test_n_iter_without_validation(regression):
     X, y = regression
-    model = MojoBoostRegressor(n_estimators=17).fit(X, y)
+    model = MojoTreesRegressor(n_estimators=17).fit(X, y)
     assert model.n_iter_ == 17
     assert model.best_iteration_ == 17
     assert not hasattr(model, "evals_result_")
@@ -321,7 +321,7 @@ def test_n_iter_without_validation(regression):
 
 def test_refit_clears_the_validation_record(regression):
     X, y, Xv, yv = _split(*regression)
-    model = MojoBoostRegressor(n_estimators=25)
+    model = MojoTreesRegressor(n_estimators=25)
     model.fit(X, y, eval_set=[(Xv, yv)], early_stopping_rounds=3)
     model.fit(X, y)
     assert not hasattr(model, "evals_result_")
@@ -332,7 +332,7 @@ def test_refit_clears_the_validation_record(regression):
 def test_ties_are_not_improvements(regression):
     """A metric that never moves stops after exactly the patience."""
     X, y, Xv, yv = _split(*regression)
-    model = MojoBoostRegressor(n_estimators=50).fit(
+    model = MojoTreesRegressor(n_estimators=50).fit(
         X,
         y,
         eval_set=[(Xv, yv)],
@@ -348,8 +348,8 @@ def test_ties_are_not_improvements(regression):
 def test_min_delta_stops_sooner(regression):
     X, y, Xv, yv = _split(*regression)
     kwargs = dict(eval_set=[(Xv, yv)], early_stopping_rounds=3)
-    patient = MojoBoostRegressor(n_estimators=200).fit(X, y, **kwargs)
-    impatient = MojoBoostRegressor(n_estimators=200).fit(
+    patient = MojoTreesRegressor(n_estimators=200).fit(X, y, **kwargs)
+    impatient = MojoTreesRegressor(n_estimators=200).fit(
         X, y, min_delta=0.05, **kwargs
     )
     assert impatient.n_iter_ < patient.n_iter_
@@ -358,7 +358,7 @@ def test_min_delta_stops_sooner(regression):
 
 def test_higher_is_better_metrics_select_the_maximum(binary):
     X, y, Xv, yv = _split(*binary)
-    model = MojoBoostClassifier(n_estimators=40).fit(
+    model = MojoTreesClassifier(n_estimators=40).fit(
         X, y, eval_set=[(Xv, yv)], eval_metric="auc", early_stopping_rounds=5
     )
     history = model.evals_result_["valid_0"]["auc"]
@@ -368,7 +368,7 @@ def test_higher_is_better_metrics_select_the_maximum(binary):
 
 def test_primary_metric_selects_the_round(binary):
     X, y, Xv, yv = _split(*binary)
-    model = MojoBoostClassifier(n_estimators=40).fit(
+    model = MojoTreesClassifier(n_estimators=40).fit(
         X,
         y,
         eval_set=[(Xv, yv)],
@@ -384,7 +384,7 @@ def test_primary_metric_selects_the_round(binary):
 def test_negative_early_stopping_rounds_raise(regression):
     X, y, Xv, yv = _split(*regression)
     with pytest.raises(ValueError, match="must not be negative"):
-        MojoBoostRegressor(n_estimators=5).fit(
+        MojoTreesRegressor(n_estimators=5).fit(
             X, y, eval_set=[(Xv, yv)], early_stopping_rounds=-1
         )
 
@@ -394,7 +394,7 @@ def test_negative_early_stopping_rounds_raise(regression):
 
 def test_binary_metrics_match_an_independent_computation(binary):
     X, y, Xv, yv = _split(*binary)
-    model = MojoBoostClassifier(n_estimators=20).fit(
+    model = MojoTreesClassifier(n_estimators=20).fit(
         X,
         y,
         eval_set=[(Xv, yv)],
@@ -420,7 +420,7 @@ def test_binary_metrics_match_an_independent_computation(binary):
 
 def test_multiclass_validation(multiclass):
     X, y, Xv, yv = _split(*multiclass, n_valid=80)
-    model = MojoBoostClassifier(n_estimators=40).fit(
+    model = MojoTreesClassifier(n_estimators=40).fit(
         X,
         y,
         eval_set=[(Xv, yv)],
@@ -441,11 +441,11 @@ def test_multiclass_validation(multiclass):
 
 def test_multiclass_rollback_matches_a_shorter_fit(multiclass):
     X, y, Xv, yv = _split(*multiclass, n_valid=80)
-    model = MojoBoostClassifier(n_estimators=60).fit(
+    model = MojoTreesClassifier(n_estimators=60).fit(
         X, y, eval_set=[(Xv, yv)], early_stopping_rounds=4
     )
     assert model.best_iteration_ > 0
-    truncated = MojoBoostClassifier(n_estimators=model.best_iteration_).fit(
+    truncated = MojoTreesClassifier(n_estimators=model.best_iteration_).fit(
         X, y
     )
     assert model.predict_proba(Xv) == pytest.approx(
@@ -456,10 +456,10 @@ def test_multiclass_rollback_matches_a_shorter_fit(multiclass):
 def test_string_labels_are_encoded_for_validation(binary):
     X, y, Xv, yv = _split(*binary)
     names = np.array(["no", "yes"])
-    model = MojoBoostClassifier(n_estimators=10).fit(
+    model = MojoTreesClassifier(n_estimators=10).fit(
         X, names[y], eval_set=[(Xv, names[yv])]
     )
-    plain = MojoBoostClassifier(n_estimators=10).fit(
+    plain = MojoTreesClassifier(n_estimators=10).fit(
         X, y, eval_set=[(Xv, yv)]
     )
     assert (
@@ -473,7 +473,7 @@ def test_unseen_validation_label_raises(binary):
     stranger = yv.copy()
     stranger[0] = 7
     with pytest.raises(ValueError, match="not one of the classes"):
-        MojoBoostClassifier(n_estimators=5).fit(
+        MojoTreesClassifier(n_estimators=5).fit(
             X, y, eval_set=[(Xv, stranger)]
         )
 
@@ -484,7 +484,7 @@ def test_unseen_validation_label_raises(binary):
 def test_ranker_validation_scores_ndcg():
     X, y, group = _ranking_data()
     Xv, yv, gv = _ranking_data(n_queries=12, seed=9)
-    model = MojoBoostRanker(n_estimators=30, ndcg_eval_at=3).fit(
+    model = MojoTreesRanker(n_estimators=30, ndcg_eval_at=3).fit(
         X,
         y,
         group=group,
@@ -505,11 +505,11 @@ def test_ranker_eval_group_is_required():
     X, y, group = _ranking_data(n_queries=10)
     Xv, yv, gv = _ranking_data(n_queries=4, seed=9)
     with pytest.raises(ValueError, match="eval_set needs eval_group"):
-        MojoBoostRanker(n_estimators=5).fit(
+        MojoTreesRanker(n_estimators=5).fit(
             X, y, group=group, eval_set=[(Xv, yv)]
         )
     with pytest.raises(ValueError, match="eval_group needs an eval_set"):
-        MojoBoostRanker(n_estimators=5).fit(
+        MojoTreesRanker(n_estimators=5).fit(
             X, y, group=group, eval_group=[gv]
         )
 
@@ -518,7 +518,7 @@ def test_ranker_eval_group_must_cover_its_rows():
     X, y, group = _ranking_data(n_queries=10)
     Xv, yv, gv = _ranking_data(n_queries=4, seed=9)
     with pytest.raises(ValueError, match="group counts sum to"):
-        MojoBoostRanker(n_estimators=5).fit(
+        MojoTreesRanker(n_estimators=5).fit(
             X, y, group=group, eval_set=[(Xv, yv)], eval_group=[gv[:-1]]
         )
 
@@ -527,7 +527,7 @@ def test_ranker_rejects_eval_sample_weight():
     X, y, group = _ranking_data(n_queries=10)
     Xv, yv, gv = _ranking_data(n_queries=4, seed=9)
     with pytest.raises(ValueError, match="no weighted definition"):
-        MojoBoostRanker(n_estimators=5).fit(
+        MojoTreesRanker(n_estimators=5).fit(
             X,
             y,
             group=group,
@@ -543,7 +543,7 @@ def test_ranker_validation_relevance_is_checked():
     bad = yv.astype(np.float64)
     bad[0] = 31.0
     with pytest.raises(ValueError, match="relevance labels"):
-        MojoBoostRanker(n_estimators=5).fit(
+        MojoTreesRanker(n_estimators=5).fit(
             X, y, group=group, eval_set=[(Xv, bad)], eval_group=[gv]
         )
 
@@ -554,8 +554,8 @@ def test_ranker_validation_relevance_is_checked():
 def test_auto_device_matches_cpu(regression):
     X, y, Xv, yv = _split(*regression)
     kwargs = dict(eval_set=[(Xv, yv)], early_stopping_rounds=5)
-    cpu = MojoBoostRegressor(n_estimators=40, device="cpu").fit(X, y, **kwargs)
-    auto = MojoBoostRegressor(n_estimators=40, device="auto").fit(
+    cpu = MojoTreesRegressor(n_estimators=40, device="cpu").fit(X, y, **kwargs)
+    auto = MojoTreesRegressor(n_estimators=40, device="auto").fit(
         X, y, **kwargs
     )
     assert auto.device_ == "cpu"
@@ -569,7 +569,7 @@ def test_gpu_with_an_eval_set_raises_rather_than_falling_back(regression):
     another backend, so it says so instead."""
     X, y, Xv, yv = _split(*regression)
     with pytest.raises(RuntimeError):
-        MojoBoostRegressor(n_estimators=5, device="gpu").fit(
+        MojoTreesRegressor(n_estimators=5, device="gpu").fit(
             X, y, eval_set=[(Xv, yv)]
         )
 
@@ -580,7 +580,7 @@ def test_gpu_availability_is_reported():
 
 def test_validation_record_survives_pickling(regression):
     X, y, Xv, yv = _split(*regression)
-    model = MojoBoostRegressor(n_estimators=40).fit(
+    model = MojoTreesRegressor(n_estimators=40).fit(
         X, y, eval_set=[(Xv, yv)], early_stopping_rounds=5
     )
     revived = pickle.loads(pickle.dumps(model))
@@ -594,11 +594,11 @@ def test_validation_record_survives_pickling(regression):
 
 def test_saved_model_is_the_rolled_back_one(regression, tmp_path):
     X, y, Xv, yv = _split(*regression)
-    model = MojoBoostRegressor(n_estimators=40).fit(
+    model = MojoTreesRegressor(n_estimators=40).fit(
         X, y, eval_set=[(Xv, yv)], early_stopping_rounds=5
     )
     path = tmp_path / "model.mbst"
     model.save(path)
-    loaded = MojoBoostRegressor.load(path)
+    loaded = MojoTreesRegressor.load(path)
     assert loaded.best_iteration_ == model.best_iteration_
     assert loaded.predict(Xv) == pytest.approx(model.predict(Xv))

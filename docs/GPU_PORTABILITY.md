@@ -2,7 +2,7 @@
 
 Written: 2026-08-14
 
-mojoboost has one GPU source. `docs/GPU_VALIDATION.md` states that
+mojotrees has one GPU source. `docs/GPU_VALIDATION.md` states that
 commitment and holds the record of what has actually run on hardware. This
 document is the other half: **what the one source requires of a backend**,
 which of those requirements every supported API specifies, which assumptions
@@ -18,16 +18,16 @@ The Mojo modules that carry this contract are:
 
 | Module | Holds |
 |---|---|
-| `src/mojoboost/gpu_backend_policy.mojo` | Which backend is in front of us, and how far this repository has taken it |
-| `src/mojoboost/gpu_portability.mojo` | The primitive contract, the launch gate, and the specialization gate |
-| `src/mojoboost/gpu_tiling.mojo` | The launch geometry itself, and the three device attributes it is derived from |
-| `src/mojoboost/gpu_histogram_specializations.mojo` | The specialization primitives and the real threadgroup footprints |
-| `src/mojoboost/device_policy.mojo` | Whether training runs on a device at all |
+| `src/mojotrees/gpu_backend_policy.mojo` | Which backend is in front of us, and how far this repository has taken it |
+| `src/mojotrees/gpu_portability.mojo` | The primitive contract, the launch gate, and the specialization gate |
+| `src/mojotrees/gpu_tiling.mojo` | The launch geometry itself, and the three device attributes it is derived from |
+| `src/mojotrees/gpu_histogram_specializations.mojo` | The specialization primitives and the real threadgroup footprints |
+| `src/mojotrees/device_policy.mojo` | Whether training runs on a device at all |
 
 ## 1. The primitive contract
 
 The shared kernels reach for a small, fixed set of device primitives. This
-set was read off the imports of every `src/mojoboost/gpu_*.mojo` and
+set was read off the imports of every `src/mojotrees/gpu_*.mojo` and
 `histogram_gpu.mojo`, not assumed. There is nothing else: no vendor
 intrinsic, no subgroup operation, no cooperative group, no dynamic
 threadgroup memory, no device-side allocation, no float atomic.
@@ -260,7 +260,7 @@ footprint, the selected set faces the validation gate.
 **The gate is only as strong as the backend identification.** An
 unidentified backend (`API_UNKNOWN`) is not refused. It is the value every
 launch carries today, because nothing in the shipping code reads an API name
-before it launches and `MOJOBOOST_GPU_BACKEND` is unset on an ordinary run,
+before it launches and `MOJOTREES_GPU_BACKEND` is unset on an ordinary run,
 so an unidentified device is indistinguishable here from the Apple part this
 repository was developed on. Refusing it would refuse every run that ships,
 including every Metal one. A CUDA device therefore escapes the gate until
@@ -270,10 +270,10 @@ that turns this gate from a declaration into an enforcement.
 
 | Variable | Effect |
 |---|---|
-| `MOJOBOOST_GPU_BACKEND` | Names the API for reporting. Read by `device_policy.env_declared_api`, never a capability number. A declaration, not a detection |
-| `MOJOBOOST_GPU_BACKEND_UNVALIDATED=1` | Acknowledges selecting a specialization on a backend with no validation record, and runs it anyway. Any number measured under it must be reported with it |
+| `MOJOTREES_GPU_BACKEND` | Names the API for reporting. Read by `device_policy.env_declared_api`, never a capability number. A declaration, not a detection |
+| `MOJOTREES_GPU_BACKEND_UNVALIDATED=1` | Acknowledges selecting a specialization on a backend with no validation record, and runs it anyway. Any number measured under it must be reported with it |
 
-The second follows `MOJOBOOST_GPU_TRANSFER_UNPROVEN` in
+The second follows `MOJOTREES_GPU_TRANSFER_UNPROVEN` in
 `unified_memory_policy.mojo` deliberately: the evidence that would lift the
 gate can only be produced by running the thing the gate blocks, so without
 an override the gate is unsatisfiable by construction.

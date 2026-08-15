@@ -1,7 +1,7 @@
-"""Apple silicon benchmark suite for mojoboost.
+"""Apple silicon benchmark suite for mojotrees.
 
 This is the runner for the protocol in docs/APPLE_GPU_BENCHMARK_PROTOCOL.md.
-It fits eight workloads with up to four engines (mojoboost on CPU, mojoboost
+It fits eight workloads with up to four engines (mojotrees on CPU, mojotrees
 on GPU, LightGBM, XGBoost), records every phase, quality, memory, thermal,
 and power quantity the protocol defines, and writes one JSON record per run
 validated against bench/apple/schema.json.
@@ -77,7 +77,7 @@ MASK64 = (1 << 64) - 1
 def _workload(**kw):
     """One catalog entry with the shared fitting parameters filled in.
 
-    The parameters are mojoboost's defaults, which are LightGBM's defaults,
+    The parameters are mojotrees's defaults, which are LightGBM's defaults,
     which is what makes a cross-engine comparison a comparison of
     implementations rather than of configurations. `docs/LIGHTGBM_PARITY.md`
     is the statement of where the two libraries' defaults still differ, and
@@ -126,7 +126,7 @@ WORKLOADS = {
     "w3_large_dense": _workload(rows=1_000_000, features=50, valid_rows=50_000),
 
     # Genuinely sparse, generated the way bench/bench_sparse.mojo does.
-    # mojoboost has no sparse GPU kernel, so this workload's job is to
+    # mojotrees has no sparse GPU kernel, so this workload's job is to
     # record that as `unsupported` rather than to hide it.
     "w4_sparse": _workload(
         kind="sparse", rows=200_000, features=500, nonzeros_per_row=10,
@@ -457,21 +457,21 @@ class Engine:
         raise NotImplementedError
 
 
-class MojoBoostEngine(Engine):
-    name = "mojoboost_cpu"
+class MojoTreesEngine(Engine):
+    name = "mojotrees_cpu"
     device = "cpu"
 
     def _import(self):
         _add_repo_python_path()
-        import mojoboost
+        import mojotrees
 
-        return mojoboost
+        return mojotrees
 
     def env(self, threads):
         e = super().env(threads)
         # The CPU backend takes its thread count from the environment; there
         # is no num_threads parameter. `1` forces the serial path.
-        e["MOJOBOOST_NUM_WORKERS"] = str(threads)
+        e["MOJOTREES_NUM_WORKERS"] = str(threads)
         return e
 
     def supports(self, wl):
@@ -480,7 +480,7 @@ class MojoBoostEngine(Engine):
                 return False, "no sparse GPU kernel; a sparse fit on device would have to densify"
             mb = self._import()
             if not mb.gpu_available():
-                return False, "mojoboost.gpu_available() is False on this build or machine"
+                return False, "mojotrees.gpu_available() is False on this build or machine"
         return True, None
 
     def fit(self, wl, data, threads):
@@ -492,7 +492,7 @@ class MojoBoostEngine(Engine):
         if wl["kind"] == "sparse":
             # Sparse input has no Dataset path, so binning is inside fit and
             # is recorded as such rather than guessed at.
-            est = _mojoboost_estimator(mb, wl, params)
+            est = _mojotrees_estimator(mb, wl, params)
             est.fit(data["X"], data["y"])
             t["binning_s"] = None
             t["train_s"] = None
@@ -521,8 +521,8 @@ class MojoBoostEngine(Engine):
                 "model": model}
 
 
-class MojoBoostGPUEngine(MojoBoostEngine):
-    name = "mojoboost_gpu"
+class MojoTreesGPUEngine(MojoTreesEngine):
+    name = "mojotrees_gpu"
     device = "gpu"
 
 
@@ -623,22 +623,22 @@ class XGBoostGPUEngine(XGBoostEngine):
 
 ENGINES = {
     e.name: e for e in (
-        MojoBoostEngine(), MojoBoostGPUEngine(), LightGBMEngine(),
+        MojoTreesEngine(), MojoTreesGPUEngine(), LightGBMEngine(),
         XGBoostEngine(), XGBoostGPUEngine(),
     )
 }
 
 
-def _mojoboost_estimator(mb, wl, params):
+def _mojotrees_estimator(mb, wl, params):
     kwargs = dict(params)
     kwargs.pop("objective", None)
     kwargs.pop("num_class", None)
     rounds = int(wl["rounds"])
     if wl["task"] == "multiclass":
-        return mb.MojoBoostClassifier(n_estimators=rounds, **kwargs)
+        return mb.MojoTreesClassifier(n_estimators=rounds, **kwargs)
     if wl["task"] == "binary":
-        return mb.MojoBoostClassifier(n_estimators=rounds, **kwargs)
-    return mb.MojoBoostRegressor(n_estimators=rounds, **kwargs)
+        return mb.MojoTreesClassifier(n_estimators=rounds, **kwargs)
+    return mb.MojoTreesRegressor(n_estimators=rounds, **kwargs)
 
 
 def _engine_params(wl, engine_name, threads):
@@ -647,13 +647,13 @@ def _engine_params(wl, engine_name, threads):
 
     Where they do not, the difference is forced onto the engine rather than
     left to its default, and named in `comparability` on the record. The two
-    that matter here are LightGBM's feature bundling (off, mojoboost has no
+    that matter here are LightGBM's feature bundling (off, mojotrees has no
     EFB) and XGBoost's regularization defaults (`lambda` 1.0 matches
-    mojoboost, `min_child_weight` is a different quantity from
+    mojotrees, `min_child_weight` is a different quantity from
     `min_data_in_leaf` and is set to the hessian floor instead).
     """
     common_leaves = int(wl["num_leaves"])
-    if engine_name.startswith("mojoboost"):
+    if engine_name.startswith("mojotrees"):
         p = {
             "objective": {
                 "regression": "regression", "binary": "binary",
@@ -713,8 +713,8 @@ def _engine_params(wl, engine_name, threads):
 #: them is reading a comparison that has been laundered.
 COMPARABILITY = {
     "lightgbm_cpu": [
-        "min_data_in_bin=3 has no mojoboost equivalent, so bin edges can differ",
-        "enable_bundle is forced off because mojoboost has no exclusive feature bundling",
+        "min_data_in_bin=3 has no mojotrees equivalent, so bin edges can differ",
+        "enable_bundle is forced off because mojotrees has no exclusive feature bundling",
     ],
     "xgboost_cpu": [
         "leaf-wise growth is approximated with grow_policy=lossguide and max_depth=0",
@@ -826,9 +826,9 @@ def software_info():
     gpu_build = None
     try:
         _add_repo_python_path()
-        import mojoboost
+        import mojotrees
 
-        gpu_build = bool(mojoboost.gpu_available())
+        gpu_build = bool(mojotrees.gpu_available())
     except Exception:
         pass
     return {
@@ -839,8 +839,8 @@ def software_info():
         "python": platform.python_version(),
         "mojo": (mojo or "").strip() or None,
         "max": max_line,
-        "mojoboost": _module_version("mojoboost"),
-        "mojoboost_gpu_build": gpu_build,
+        "mojotrees": _module_version("mojotrees"),
+        "mojotrees_gpu_build": gpu_build,
         "lightgbm": _module_version("lightgbm"),
         "xgboost": _module_version("xgboost"),
         "numpy": _module_version("numpy"),
@@ -1267,7 +1267,7 @@ def build_plan(args):
     catalog = scaled_workloads(args.scale)
     wanted_workloads = args.workloads or list(catalog)
     wanted_engines = args.engines or [
-        "mojoboost_cpu", "mojoboost_gpu", "lightgbm_cpu", "xgboost_cpu",
+        "mojotrees_cpu", "mojotrees_gpu", "lightgbm_cpu", "xgboost_cpu",
     ]
     plan = []
     for wid in wanted_workloads:
@@ -1487,7 +1487,7 @@ def _idle_baseline(args):
 def _spawn(item, env_overrides):
     env = dict(os.environ)
     env.update(env_overrides)
-    env["MOJOBOOST_APPLE_SUITE_WORKER"] = "1"
+    env["MOJOTREES_APPLE_SUITE_WORKER"] = "1"
     proc = subprocess.run(
         [sys.executable, os.path.abspath(__file__), "--worker"],
         input=json.dumps(item), capture_output=True, text=True, env=env,
@@ -1506,7 +1506,7 @@ def _spawn(item, env_overrides):
     }
 
 
-RESULT_SENTINEL = "MOJOBOOST_APPLE_SUITE_RESULT "
+RESULT_SENTINEL = "MOJOTREES_APPLE_SUITE_RESULT "
 
 
 def _report(record):
@@ -1735,7 +1735,7 @@ def _template_record():
         "software": {
             "os_name": None, "os_version": None, "os_build": None,
             "kernel": None, "python": None, "mojo": None, "max": None,
-            "mojoboost": None, "mojoboost_gpu_build": None,
+            "mojotrees": None, "mojotrees_gpu_build": None,
             "lightgbm": None, "xgboost": None, "numpy": None, "scipy": None,
         },
         "conditions": {
@@ -1751,7 +1751,7 @@ def _template_record():
         "measurements": [{
             "workload": wl,
             "engine": {
-                "name": "mojoboost_cpu", "version": None, "device": "cpu",
+                "name": "mojotrees_cpu", "version": None, "device": "cpu",
                 "requested_threads": 1, "resolved_threads": None,
                 "device_resolved": None, "env": {}, "params": {},
                 "comparability": [],
@@ -1785,7 +1785,7 @@ def default_threads():
 
 def parse_args(argv):
     ap = argparse.ArgumentParser(
-        description="Apple silicon benchmark suite for mojoboost",
+        description="Apple silicon benchmark suite for mojotrees",
         epilog="Read docs/APPLE_GPU_BENCHMARK_PROTOCOL.md before running.",
     )
     mode = ap.add_mutually_exclusive_group()

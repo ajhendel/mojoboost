@@ -37,7 +37,7 @@ import urllib.request
 import loaders
 
 CHUNK = 1 << 20
-USER_AGENT = "mojoboost-bench/0.1 (+https://github.com/mojoboost-ml/mojoboost)"
+USER_AGENT = "mojotrees-bench/0.1 (+https://github.com/mojotrees/mojotrees)"
 
 
 def _sha256_and_size(path):
@@ -125,7 +125,7 @@ def pin(dataset_id, spec, path):
         "archive_bytes": size,
         "members": _member_digests(dataset_id, spec),
         "pinned_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "pinned_by": os.environ.get("MOJOBOOST_BENCH_PINNER") or platform.node(),
+        "pinned_by": os.environ.get("MOJOTREES_BENCH_PINNER") or platform.node(),
     }
     _write_lock(lock)
     print(f"  pinned {dataset_id}: sha256 {digest}, {size} bytes")

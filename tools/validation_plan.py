@@ -2,7 +2,7 @@
 """Decide what to run after a change, and print it. Never run it.
 
     python3 tools/validation_plan.py                       # the working tree
-    python3 tools/validation_plan.py --paths src/mojoboost/split.mojo
+    python3 tools/validation_plan.py --paths src/mojotrees/split.mojo
     python3 tools/validation_plan.py --handoff handoffs/task16_distributed.md
     python3 tools/validation_plan.py --subsystem gpu-training --explain
     python3 tools/validation_plan.py --allow differential --budget-seconds 900
@@ -47,7 +47,7 @@ What keeps a plan from turning into the full suite by accident
    never a broad suite beside a hardware job.
 3. Everything is charged against `--budget-seconds`. What does not fit is
    printed under OVER BUDGET with its cost, so dropping it is a decision.
-4. The emitted shell script refuses to start unless `MOJOBOOST_VALIDATION_OPT_IN=1`
+4. The emitted shell script refuses to start unless `MOJOTREES_VALIDATION_OPT_IN=1`
    is set in the environment, so a stray `sh plan.sh` does nothing.
 5. Heavy jobs are wrapped in `tools/with_build_lock.sh`, the lock this
    repository already uses to keep two sessions from compiling at once.
@@ -102,7 +102,7 @@ KNOWN_NEEDS = {
 PROVENANCE = {"ci", "documented", "unverified"}
 
 # Environment variables a job may set that are not part of this project's
-# MOJOBOOST_* contract.
+# MOJOTREES_* contract.
 ALLOWED_FOREIGN_ENV: set[str] = set()
 
 
@@ -207,7 +207,7 @@ class Manifests:
         Falls back to the single shared lock, which is what the wrapper uses
         today regardless of what this returns. See tiers.toml [locks].
         """
-        shared = self.locks.get("lock_file", "/tmp/mojoboost-build.lock")
+        shared = self.locks.get("lock_file", "/tmp/mojotrees-build.lock")
         if not klass:
             return shared
         return self.locks.get("class_lock_files", {}).get(klass, shared)
@@ -613,7 +613,7 @@ def render_text(plan, selection, explain=False):
     out = []
     add = out.append
 
-    add("mojoboost focused validation plan")
+    add("mojotrees focused validation plan")
     add(f"  change set     {len(plan.change_set)} path(s) from {plan.source}")
     add(
         f"  budget         {plan.spent}s of {plan.args.budget_seconds}s, "
@@ -694,7 +694,7 @@ def render_text(plan, selection, explain=False):
 
     add("NOTHING ABOVE WAS RUN. This tool prints commands and never issues one.")
     add("To collect the evidence: --format sh --out <file>, read the file, then")
-    add("run it yourself with MOJOBOOST_VALIDATION_OPT_IN=1.")
+    add("run it yourself with MOJOTREES_VALIDATION_OPT_IN=1.")
     return "\n".join(out)
 
 
@@ -754,10 +754,10 @@ SCRIPT_HEADER = """\
 # claim is the right one; several of them carry provenance "unverified", which
 # means nobody has run that exact composition.
 #
-# It refuses to start unless MOJOBOOST_VALIDATION_OPT_IN=1 is set, so that a
+# It refuses to start unless MOJOTREES_VALIDATION_OPT_IN=1 is set, so that a
 # stray `sh plan.sh` does nothing:
 #
-#     MOJOBOOST_VALIDATION_OPT_IN=1 sh {out}
+#     MOJOTREES_VALIDATION_OPT_IN=1 sh {out}
 #
 # Jobs run one at a time. Heavy ones take {lock}, the lock this repository
 # already uses to keep two sessions from compiling at once, so a plan running
@@ -774,8 +774,8 @@ SCRIPT_HEADER = """\
 
 set -u
 
-if [ "${{MOJOBOOST_VALIDATION_OPT_IN:-}}" != "1" ]; then
-    echo "refusing: set MOJOBOOST_VALIDATION_OPT_IN=1 to run this plan" >&2
+if [ "${{MOJOTREES_VALIDATION_OPT_IN:-}}" != "1" ]; then
+    echo "refusing: set MOJOTREES_VALIDATION_OPT_IN=1 to run this plan" >&2
     exit 2
 fi
 
@@ -787,7 +787,7 @@ MB_LOCK="{lock}"
 MB_TIMEOUT=$(command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null || true)
 [ -n "$MB_TIMEOUT" ] || echo "note: no timeout(1) or gtimeout on PATH; jobs run unbounded" >&2
 
-MB_LOG=${{MB_LOG:-${{TMPDIR:-/tmp}}/mojoboost-validation-$(date +%Y%m%dT%H%M%S)}}
+MB_LOG=${{MB_LOG:-${{TMPDIR:-/tmp}}/mojotrees-validation-$(date +%Y%m%dT%H%M%S)}}
 mkdir -p "$MB_LOG" || exit 2
 echo "transcripts: $MB_LOG"
 
@@ -857,7 +857,7 @@ def render_sh(plan, out_path):
         # A thread cap only means something to a job that trains or compiles.
         # Setting it on a file reader would be noise pretending to be a limit.
         if job["tier"] not in ("static", "smoke"):
-            env.setdefault("MOJOBOOST_NUM_WORKERS", str(man.threads(job_id)))
+            env.setdefault("MOJOTREES_NUM_WORKERS", str(man.threads(job_id)))
         for name, value in sorted(env.items()):
             exports += f"    {name}={shlex.quote(str(value))}\n"
             exports += f"    export {name}\n"
@@ -940,14 +940,14 @@ def pixi_suites():
 
 
 def repo_corpus():
-    """Text of the files a MOJOBOOST_* name would be defined in."""
+    """Text of the files a MOJOTREES_* name would be defined in."""
     parts = []
     for pattern in (
-        "src/mojoboost/*.mojo",
+        "src/mojotrees/*.mojo",
         "bench/**/*.mojo",
         "bench/**/*.py",
         "bench/**/*.sh",
-        "python/mojoboost/*.py",
+        "python/mojotrees/*.py",
         "packaging/**/*.py",
         "packaging/**/*.sh",
         "docs/*.md",
@@ -1032,8 +1032,8 @@ def self_check(man):
             if dependency not in job_ids:
                 fail(f"jobs: {job_id} depends on {dependency}, which is not a job")
         for name in job.get("env", {}):
-            if not name.startswith("MOJOBOOST_") and name not in ALLOWED_FOREIGN_ENV:
-                fail(f"jobs: {job_id} sets {name}, which is outside this project's MOJOBOOST_* env contract")
+            if not name.startswith("MOJOTREES_") and name not in ALLOWED_FOREIGN_ENV:
+                fail(f"jobs: {job_id} sets {name}, which is outside this project's MOJOTREES_* env contract")
         for path in job.get("requires_files", []):
             if not exists(path):
                 fail(f"jobs: {job_id} requires {path}, which does not exist")
@@ -1090,7 +1090,7 @@ def self_check(man):
     # has not caught up is wrong rather than merely incomplete. It is also the
     # exact case that went unnoticed until it was found by hand:
     # tests/test_binning.mojo was in the test chain and in no job, so a change
-    # to src/mojoboost/binning.mojo planned three suites, none of them the one
+    # to src/mojotrees/binning.mojo planned three suites, none of them the one
     # that tests binning.
     covered_suites = set()
     for job in man.jobs.values():
@@ -1115,8 +1115,8 @@ def self_check(man):
         if klass not in classes:
             fail(f"tiers: [locks.class_lock_files] names {klass!r}, which is not an exclusion class")
     lock_env = man.lock_env()
-    if lock_env and not lock_env.startswith("MOJOBOOST_"):
-        fail(f"tiers: [locks] lock_env is {lock_env!r}, which is outside this project's MOJOBOOST_* env contract")
+    if lock_env and not lock_env.startswith("MOJOTREES_"):
+        fail(f"tiers: [locks] lock_env is {lock_env!r}, which is outside this project's MOJOTREES_* env contract")
     declared = {man.exclusive(job_id) for job_id in man.jobs}
     for klass in sorted(k for k in declared if k):
         if klass not in classes:
@@ -1229,7 +1229,7 @@ def coverage_notes(man):
         named_paths.extend(gap["paths"])
     modules = sorted(
         normalize(p.relative_to(ROOT))
-        for p in (ROOT / "src" / "mojoboost").glob("*.mojo")
+        for p in (ROOT / "src" / "mojotrees").glob("*.mojo")
     )
     unmapped = [
         m for m in modules if not any(path_matches(p, m) for p in named_paths)
@@ -1472,7 +1472,7 @@ def main(argv=None):
         Path(args.out).write_text(text if text.endswith("\n") else text + "\n")
         print(f"wrote {args.out} ({len(plan.scheduled)} jobs, {plan.spent}s)")
         if args.format == "sh":
-            print("Read it, then: MOJOBOOST_VALIDATION_OPT_IN=1 sh " + args.out)
+            print("Read it, then: MOJOTREES_VALIDATION_OPT_IN=1 sh " + args.out)
     else:
         print(text)
     return 0

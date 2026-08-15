@@ -1,16 +1,16 @@
 {
   "kind": "histogram_plan_table",
   "version": "0.1.0",
-  "title": "mojoboost GPU histogram launch plans by device profile and workload shape",
-  "description": "What src/mojoboost/apple_histogram_policy.mojo selects for a set of device profiles and dataset shapes. This is a table of DECISIONS, not of measurements. It contains no timing, no throughput, and no comparison between plans, because none has been taken: every specialization in the table is default-off for exactly that reason. Do not merge, plot, or quote this file alongside a bench/apple/suite.py run record; it is a different artifact with a different schema and it carries no results.",
+  "title": "mojotrees GPU histogram launch plans by device profile and workload shape",
+  "description": "What src/mojotrees/apple_histogram_policy.mojo selects for a set of device profiles and dataset shapes. This is a table of DECISIONS, not of measurements. It contains no timing, no throughput, and no comparison between plans, because none has been taken: every specialization in the table is default-off for exactly that reason. Do not merge, plot, or quote this file alongside a bench/apple/suite.py run record; it is a different artifact with a different schema and it carries no results.",
 
   "provenance": {
     "hand_derived": true,
     "executed": false,
     "note": "Every number below was derived by reading the policy source, not by running it. The lane that wrote this file was not permitted to run Mojo, Pixi, Python, builds, benchmarks, or profilers. Treat each plan as a claim about what the policy computes, to be confirmed by the emitter named under `verification` before anything is built on it.",
-    "policy_source": "src/mojoboost/apple_histogram_policy.mojo",
-    "primitives_source": "src/mojoboost/gpu_histogram_specializations.mojo",
-    "baseline_source": "src/mojoboost/gpu_tiling.mojo",
+    "policy_source": "src/mojotrees/apple_histogram_policy.mojo",
+    "primitives_source": "src/mojotrees/gpu_histogram_specializations.mojo",
+    "baseline_source": "src/mojotrees/gpu_tiling.mojo",
     "handoff": "handoffs/performance_14_gpu_histogram.md"
   },
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Inspect a Linux mojoboost wheel: its label, its contents, and its ELF objects.
+"""Inspect a Linux mojotrees wheel: its label, its contents, and its ELF objects.
 
     python3 packaging/linux/inspect_wheel.py python/dist/<wheel> [...]
 
@@ -283,7 +283,7 @@ def inspect(path: Path, res: Result) -> None:
     with zipfile.ZipFile(path) as zf:
         names = zf.namelist()
         distinfo = f"{match['name']}-{match['version']}.dist-info/"
-        pkg = "mojoboost/"
+        pkg = "mojotrees/"
 
         _check_layout(zf, names, distinfo, pkg, res)
         _check_elf(zf, names, pkg, tag_arch, tag_floor, res)

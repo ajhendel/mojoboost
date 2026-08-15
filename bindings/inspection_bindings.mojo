@@ -1,9 +1,9 @@
 """Structured model inspection, from the native dump.
 
-`src/mojoboost/model_dump.mojo` builds a fitted model's inspection schema
-and `src/mojoboost/inspection.mojo` renders it as JSON. This module hands
+`src/mojotrees/model_dump.mojo` builds a fitted model's inspection schema
+and `src/mojotrees/inspection.mojo` renders it as JSON. This module hands
 the built dump to Python as plain Python objects, which is what lets
-`python/mojoboost/inspection.py` stop rebuilding the schema by parsing
+`python/mojotrees/inspection.py` stop rebuilding the schema by parsing
 `Booster.model_to_string()`.
 
 That parser is a second implementation of facts Mojo already knows: how a
@@ -48,9 +48,9 @@ from binding_support import (
     str_sequence,
 )
 
-from mojoboost.inspection import dump_json
-from mojoboost.model import Model, MulticlassModel
-from mojoboost.model_dump import (
+from mojotrees.inspection import dump_json
+from mojotrees.model import Model, MulticlassModel
+from mojotrees.model_dump import (
     DUMP_FORMAT_VERSION,
     MODEL_FORMAT_VERSION,
     DumpFeature,
@@ -63,7 +63,7 @@ from mojoboost.model_dump import (
     dump_raw_scores as mojo_dump_raw_scores,
     dump_split_values as mojo_dump_split_values,
 )
-from mojoboost.serialize import model_file_kind as mojo_model_file_kind
+from mojotrees.serialize import model_file_kind as mojo_model_file_kind
 
 
 # -- the schema, as Python objects ---------------------------------------
@@ -207,7 +207,7 @@ def dump_model(
 
     `feature_names` is a sequence of `n_names` strings, and an empty one is
     what makes the builder fall back to `Column_0`, `Column_1`, ....
-    `python/mojoboost/inspection.py` resolves the override, the names the
+    `python/mojotrees/inspection.py` resolves the override, the names the
     model carries, and that fallback in that order before calling, and it
     nests the flat node tables on arrival. See
     docs/MODEL_INSPECTION_SCHEMA.md for every key.

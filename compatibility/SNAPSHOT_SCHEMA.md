@@ -18,7 +18,7 @@ section 8 says what changed and why.
    from a break.
 2. **No import, no build.** The tool parses Python with `ast`, and Mojo,
    C, TOML, and YAML with `re` and `tomllib`. It never imports
-   `mojoboost` and never needs a built extension module. A snapshot check
+   `mojotrees` and never needs a built extension module. A snapshot check
    that needs a working build gets skipped the first day it is
    inconvenient.
 3. **Deterministic bytes.** `json.dump(obj, fp, indent=2, sort_keys=True)`
@@ -53,15 +53,15 @@ tool must run identically inside a release tarball with no `.git`.
 
 | Key | Type | Source |
 |---|---|---|
-| `library` | str | `pixi.toml [workspace] version`, `python/pyproject.toml [project] version`, and `python/mojoboost/__init__.py __version__`. **Disagreement is an error, not a merge** |
+| `library` | str | `pixi.toml [workspace] version`, `python/pyproject.toml [project] version`, and `python/mojotrees/__init__.py __version__`. **Disagreement is an error, not a merge** |
 | `library_locations` | dict[str, str] | Each of the three, separately, so a `--check` failure names which one moved |
-| `c_abi` | int | `#define MOJOBOOST_ABI_VERSION` in `capi/mojoboost.h` |
-| `model_format_writer` | int | `comptime CURRENT_FORMAT_VERSION` in `src/mojoboost/serialize.mojo` |
+| `c_abi` | int | `#define MOJOTREES_ABI_VERSION` in `capi/mojotrees.h` |
+| `model_format_writer` | int | `comptime CURRENT_FORMAT_VERSION` in `src/mojotrees/serialize.mojo` |
 | `model_format_writer_token` | str | `comptime _VERSION` in the same file, e.g. `"v4"`. Must equal `"v" + model_format_writer` |
 | `model_format_readable` | list[int] | The versions `_read_version` accepts, parsed from its `if token == "vN"` chain |
-| `model_format_dump_reports` | int | `comptime MODEL_FORMAT_VERSION` in `src/mojoboost/model_dump.mojo` |
-| `model_format_python_reads` | list[int] | `SUPPORTED_MODEL_FORMAT_VERSIONS` in `python/mojoboost/inspection.py` |
-| `dump_format` | int | `DUMP_FORMAT_VERSION` in `python/mojoboost/inspection.py` |
+| `model_format_dump_reports` | int | `comptime MODEL_FORMAT_VERSION` in `src/mojotrees/model_dump.mojo` |
+| `model_format_python_reads` | list[int] | `SUPPORTED_MODEL_FORMAT_VERSIONS` in `python/mojotrees/inspection.py` |
+| `dump_format` | int | `DUMP_FORMAT_VERSION` in `python/mojotrees/inspection.py` |
 | `snapshot_schema` | int | `2` |
 | `requires_python` | str | `python/pyproject.toml` |
 | `mojo_toolchain`, `max_toolchain` | str | `pixi.toml [dependencies]` |
@@ -75,16 +75,16 @@ invariants the tool enforces between them. A schema that recorded one
 
 | Key | Type | Source |
 |---|---|---|
-| `all` | list[str] | The `__all__` assignment in `python/mojoboost/__init__.py`, **in source order**. Order is recorded because a reordering is visible in the diff and is harmless, and sorting would hide a genuine rewrite |
-| `lazy_attributes` | list[str] | Names resolved by the module-level `__getattr__`, parsed from the tuple or set it tests against. A name in `all` but not importable eagerly is a real distinction for a consumer doing `from mojoboost import x` at module scope |
+| `all` | list[str] | The `__all__` assignment in `python/mojotrees/__init__.py`, **in source order**. Order is recorded because a reordering is visible in the diff and is harmless, and sorting would hide a genuine rewrite |
+| `lazy_attributes` | list[str] | Names resolved by the module-level `__getattr__`, parsed from the tuple or set it tests against. A name in `all` but not importable eagerly is a real distinction for a consumer doing `from mojotrees import x` at module scope |
 | `shared_estimator_parameters` | dict[str, value] | `_Base.__init__` keyword arguments and their defaults, with module-level `Name` defaults resolved (section 5.2) |
 | `estimators` | dict | One entry per public estimator class; see 3.1 |
 | `fitted_attributes` | list[str] | `_FITTED_ATTRS` on `_Base`, in source order. Order is the reset order |
 | `parameter_aliases` | dict[str, dict] | One entry per alias; see 3.2 |
 | `callbacks` | dict | See 3.3 |
-| `eval_metric_names` | dict | `_METRICS` and `_ALIASES` keys from `python/mojoboost/_eval.py`, keys only (section 5.1) |
-| `functional_api` | dict | `__all__`, `train`'s signature, and the public method names of `Dataset` and `Booster` in `python/mojoboost/basic.py` |
-| `inspection` | dict | `__all__`, `DUMP_FORMAT_VERSION`, `SUPPORTED_MODEL_FORMAT_VERSIONS`, and the `OBJECTIVE_NAMES` mapping from `python/mojoboost/inspection.py` |
+| `eval_metric_names` | dict | `_METRICS` and `_ALIASES` keys from `python/mojotrees/_eval.py`, keys only (section 5.1) |
+| `functional_api` | dict | `__all__`, `train`'s signature, and the public method names of `Dataset` and `Booster` in `python/mojotrees/basic.py` |
+| `inspection` | dict | `__all__`, `DUMP_FORMAT_VERSION`, `SUPPORTED_MODEL_FORMAT_VERSIONS`, and the `OBJECTIVE_NAMES` mapping from `python/mojotrees/inspection.py` |
 
 ### 3.1 `python.estimators.<Class>`
 
@@ -102,7 +102,7 @@ argument names would pass a release that silently changed `num_leaves`.
 
 ### 3.2 `python.parameter_aliases`
 
-There is no alias table in `python/mojoboost/__init__.py`. The pairs are
+There is no alias table in `python/mojotrees/__init__.py`. The pairs are
 expressed as calls, `self._resolve_alias(canonical, alias, default)`, in
 `_Base._params` and in the continued-training path. The tool walks the
 `_Base` class body for `Call` nodes whose `func.attr` is `_resolve_alias`
@@ -128,10 +128,10 @@ not a merge, and the tool reports both values.
 
 | Key | Type | Meaning |
 |---|---|---|
-| `all` | list[str] | `__all__` of `python/mojoboost/callback.py` |
+| `all` | list[str] | `__all__` of `python/mojotrees/callback.py` |
 | `env_fields` | list[str] | The `CallbackEnv` field list, **in order**. It is a `namedtuple`, so positional unpacking is a caller-visible contract and the order is the contract |
 | `resettable` | list[str] | `RESETTABLE`, in order. The order is a wire format |
-| `reset_slots` | int | `comptime RESET_SLOTS` in `bindings/_mojoboost.mojo` |
+| `reset_slots` | int | `comptime RESET_SLOTS` in `bindings/_mojotrees.mojo` |
 | `reset_aliases` | dict[str, str] | `_RESET_ALIASES` |
 | `integral_slots` | list[str] | `_INTEGRAL`, sorted. A slot that must round trip as a whole number through the float64 buffer |
 | `factories` | dict[str, dict] | Each factory's arguments and defaults |
@@ -148,16 +148,16 @@ produces wrong numbers rather than an error.
 
 | Key | Type | Source |
 |---|---|---|
-| `exports_by_module` | dict[str, list[str]] | The `from .mod import ...` blocks of `src/mojoboost/__init__.mojo`. Names sorted within a module; module keys sorted by the JSON writer |
+| `exports_by_module` | dict[str, list[str]] | The `from .mod import ...` blocks of `src/mojotrees/__init__.mojo`. Names sorted within a module; module keys sorted by the JSON writer |
 | `export_count` | int | Total names. A scalar that moves when any module's list does, so a truncated parse is visible |
-| `objective_codes` | dict[str, int] | `comptime NAME = <int>` in `src/mojoboost/boosting.mojo` and `params.mojo` for the objective constants |
+| `objective_codes` | dict[str, int] | `comptime NAME = <int>` in `src/mojotrees/boosting.mojo` and `params.mojo` for the objective constants |
 
 ### 4.2 `c_abi`
 
 | Key | Type | Source |
 |---|---|---|
-| `abi_version` | int | `MOJOBOOST_ABI_VERSION` |
-| `defines` | dict[str, int] | Every `#define MOJOBOOST_*` with an integer value, parenthesized negatives included |
+| `abi_version` | int | `MOJOTREES_ABI_VERSION` |
+| `defines` | dict[str, int] | Every `#define MOJOTREES_*` with an integer value, parenthesized negatives included |
 | `opaque_types` | list[str] | `typedef struct ... *` handle types |
 | `functions` | list[str] | One normalized declaration per function: return type, name, and parameter list with comments stripped and runs of whitespace collapsed to one space. Sorted by name |
 
@@ -171,7 +171,7 @@ show.
 
 | Key | Type | Source |
 |---|---|---|
-| `supported_keys` | list[str] | `comptime SUPPORTED_KEYS` in `src/mojoboost/params.mojo`, split on commas and stripped. Source order preserved |
+| `supported_keys` | list[str] | `comptime SUPPORTED_KEYS` in `src/mojotrees/params.mojo`, split on commas and stripped. Source order preserved |
 | `mojo_api_only_keys` | list[str] | The keys the parser reports as unsupported-with-a-reason rather than unknown |
 
 ### 4.4 `environment`
@@ -179,15 +179,15 @@ show.
 | Key | Type | Source |
 |---|---|---|
 | `declared` | list[str] | The variables section 9.5 of the compatibility policy documents, parsed from that table |
-| `observed` | list[str] | Every double-quoted `"MOJOBOOST_*"` string literal in code under `src/`, `bindings/`, `python/`, `capi/`, and `cli/` |
+| `observed` | list[str] | Every double-quoted `"MOJOTREES_*"` string literal in code under `src/`, `bindings/`, `python/`, `capi/`, and `cli/` |
 | `read_directly` | list[str] | The subset that is the literal first argument of a `getenv(...)` or `os.environ.get(...)` call |
 | `undeclared` | list[str] | `observed` minus `declared`. **Not an error.** A variable may be a diagnostic knob rather than a public control |
 | `stale` | list[str] | `declared` minus `observed`. **An error.** A documented variable nothing reads is a promise the code does not keep |
 
 `observed` is the double-quoted-literal scan and not the `getenv` call
-scan, and the difference is load-bearing. `MOJOBOOST_NUM_WORKERS` and
-`MOJOBOOST_PARALLEL_MIN_OPS`, two of the seven the policy documents, are
-never passed to `getenv` directly: `src/mojoboost/parallel.mojo` reads
+scan, and the difference is load-bearing. `MOJOTREES_NUM_WORKERS` and
+`MOJOTREES_PARALLEL_MIN_OPS`, two of the seven the policy documents, are
+never passed to `getenv` directly: `src/mojotrees/parallel.mojo` reads
 them through `_env_int(name, default)`, so `getenv` sees a computed name.
 A call scan finds neither, marks both `stale`, and fails invariant I8 on a
 tree that is correct. The literal scan finds both.
@@ -239,7 +239,7 @@ throwaway cross-check; the rest were found by this lane.
    modules. `tools/check_parity.py:mojo_export_names()` already handles
    both, and the tool imports it rather than writing a second parser; see
    section 6.4.
-5. **Negative `#define`s are parenthesized.** `MOJOBOOST_ERROR_IO` is
+5. **Negative `#define`s are parenthesized.** `MOJOTREES_ERROR_IO` is
    `(-3)`, not `-3`. A regex anchored on an optional minus finds `3`.
 6. **`SUPPORTED_KEYS` is one implicitly concatenated string literal split
    across lines**, and the commas that separate keys sit at the ends of
@@ -251,7 +251,7 @@ throwaway cross-check; the rest were found by this lane.
 8. **`__all__` in `__init__.py` is interleaved with comments and is not
    sorted.** Take the `ast.List` elements in order and keep that order.
    Sorting it here would make a rewrite invisible.
-9. **The bare prefix `"MOJOBOOST_"` occurs as a literal.** It is a prefix
+9. **The bare prefix `"MOJOTREES_"` occurs as a literal.** It is a prefix
    filter, not a variable. A scan that keeps it adds a phantom variable to
    `environment.observed` that can never be declared and never goes away.
    Discard any literal equal to the prefix.
@@ -270,7 +270,7 @@ about the tree rather than facts about the file.
 | I4 | `model_format_dump_reports` equals `model_format_writer` | `serialize.mojo` says `model_dump.mojo` has to track it |
 | I5 | `max(model_format_python_reads)` is at least `model_format_writer` | The pure-Python parser must read what the writer writes, or `dump_model` fails on a model the same build just saved |
 | I6 | `len(callbacks.resettable)` equals `callbacks.reset_slots` | A slot count and a name list that disagree misassign parameters silently |
-| I7 | Every name in `callbacks.resettable` appears in the reset slot order in `bindings/_mojoboost.mojo`, in the same position | Compatibility policy section 9.3; a reordering produces wrong numbers |
+| I7 | Every name in `callbacks.resettable` appears in the reset slot order in `bindings/_mojotrees.mojo`, in the same position | Compatibility policy section 9.3; a reordering produces wrong numbers |
 | I8 | `environment.stale` is empty | A documented variable nothing reads |
 | I9 | Every `deprecations.toml` entry in state `removed` names something absent from the snapshot, and every entry in state `soft` or `deprecated` names something present | The register and the tree cannot disagree about existence |
 | I10 | No `deprecations.toml` entry has a `remove_in` that violates the overlap floor against its `since` | Deprecation policy section 1 |
@@ -296,7 +296,7 @@ evaluated, because evaluating it means running the tool.
 calls `mojo_export_names()`. That import is safe: `check_parity` guards
 `main()` behind `if __name__ == "__main__"`, and its module level does
 nothing but define constants and compile regexes. Reusing it is the point.
-Two independent parsers over `src/mojoboost/__init__.mojo` would drift,
+Two independent parsers over `src/mojotrees/__init__.mojo` would drift,
 and invariant I11 is what turns the reuse into a check rather than a
 coincidence. If the import fails for any reason the tool degrades: I11
 goes to `meta.underived` and the run continues, because a snapshot that

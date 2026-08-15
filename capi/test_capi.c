@@ -1,4 +1,4 @@
-/* Tests for the mojoboost C ABI, written as a C caller would use it.
+/* Tests for the mojotrees C ABI, written as a C caller would use it.
  *
  * Covers the three things a C boundary gets wrong that a Mojo test cannot
  * see: handle lifecycle, invalid input from a language with no checks, and
@@ -15,7 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "mojoboost.h"
+#include "mojotrees.h"
 
 static int failures = 0;
 static int checks = 0;
@@ -32,10 +32,10 @@ static int checks = 0;
 #define CHECK_OK(rc, err, what)                                           \
     do {                                                                  \
         checks++;                                                         \
-        if ((rc) != MOJOBOOST_OK) {                                       \
+        if ((rc) != MOJOTREES_OK) {                                       \
             failures++;                                                   \
             printf("FAIL %s:%d: %s: rc=%d %s\n", __FILE__, __LINE__,      \
-                   (what), (int)(rc), mojoboost_error_message(err));      \
+                   (what), (int)(rc), mojotrees_error_message(err));      \
         }                                                                 \
     } while (0)
 
@@ -76,58 +76,58 @@ static void make_data(void) {
 /* ------------------------------------------------------------- lifecycle */
 
 static void test_version(void) {
-    CHECK(mojoboost_abi_version() == MOJOBOOST_ABI_VERSION,
+    CHECK(mojotrees_abi_version() == MOJOTREES_ABI_VERSION,
           "abi version matches the header");
 
     int32_t major = -1, minor = -1, patch = -1;
-    mojoboost_library_version(&major, &minor, &patch);
+    mojotrees_library_version(&major, &minor, &patch);
     CHECK(major >= 0 && minor >= 0 && patch >= 0,
           "library version is populated");
     /* Every out pointer is optional. */
-    mojoboost_library_version(NULL, NULL, NULL);
-    mojoboost_library_version(&major, NULL, NULL);
+    mojotrees_library_version(NULL, NULL, NULL);
+    mojotrees_library_version(&major, NULL, NULL);
 }
 
 static void test_error_lifecycle(void) {
-    MojoBoostError *err = mojoboost_error_create();
+    MojoTreesError *err = mojotrees_error_create();
     CHECK(err != NULL, "error object is created");
-    CHECK(mojoboost_error_message(err) != NULL, "fresh message is not NULL");
-    CHECK(strlen(mojoboost_error_message(err)) == 0, "fresh message is empty");
+    CHECK(mojotrees_error_message(err) != NULL, "fresh message is not NULL");
+    CHECK(strlen(mojotrees_error_message(err)) == 0, "fresh message is empty");
 
     /* A failure fills the message in. */
-    MojoBoostModel *model = NULL;
-    int32_t rc = mojoboost_train_dense(NULL, N_ROWS, N_FEATURES, y_reg, NULL,
+    MojoTreesModel *model = NULL;
+    int32_t rc = mojotrees_train_dense(NULL, N_ROWS, N_FEATURES, y_reg, NULL,
                                        NULL, &model, err);
-    CHECK(rc == MOJOBOOST_ERROR_INVALID_ARGUMENT, "NULL data is rejected");
-    CHECK(strlen(mojoboost_error_message(err)) > 0, "message is set");
+    CHECK(rc == MOJOTREES_ERROR_INVALID_ARGUMENT, "NULL data is rejected");
+    CHECK(strlen(mojotrees_error_message(err)) > 0, "message is set");
 
     /* A later success clears it again. */
-    rc = mojoboost_train_dense(x, N_ROWS, N_FEATURES, y_reg, NULL,
+    rc = mojotrees_train_dense(x, N_ROWS, N_FEATURES, y_reg, NULL,
                                "num_iterations=2", &model, err);
     CHECK_OK(rc, err, "train after a failure");
-    CHECK(strlen(mojoboost_error_message(err)) == 0,
+    CHECK(strlen(mojotrees_error_message(err)) == 0,
           "a successful call clears the message");
-    mojoboost_model_free(model);
+    mojotrees_model_free(model);
 
     /* NULL is accepted everywhere it can be. */
-    CHECK(mojoboost_error_message(NULL) == NULL, "message of NULL is NULL");
-    mojoboost_error_free(NULL);
-    mojoboost_model_free(NULL);
-    mojoboost_error_free(err);
+    CHECK(mojotrees_error_message(NULL) == NULL, "message of NULL is NULL");
+    mojotrees_error_free(NULL);
+    mojotrees_model_free(NULL);
+    mojotrees_error_free(err);
 }
 
 static void test_error_is_optional(void) {
     /* Passing no error object must work on both paths. */
-    MojoBoostModel *model = NULL;
-    int32_t rc = mojoboost_train_dense(x, N_ROWS, N_FEATURES, y_reg, NULL,
+    MojoTreesModel *model = NULL;
+    int32_t rc = mojotrees_train_dense(x, N_ROWS, N_FEATURES, y_reg, NULL,
                                        "num_iterations=2", &model, NULL);
-    CHECK(rc == MOJOBOOST_OK, "train with a NULL error object");
-    mojoboost_model_free(model);
+    CHECK(rc == MOJOTREES_OK, "train with a NULL error object");
+    mojotrees_model_free(model);
 
     model = NULL;
-    rc = mojoboost_train_dense(x, 0, N_FEATURES, y_reg, NULL, NULL, &model,
+    rc = mojotrees_train_dense(x, 0, N_FEATURES, y_reg, NULL, NULL, &model,
                                NULL);
-    CHECK(rc == MOJOBOOST_ERROR_INVALID_ARGUMENT,
+    CHECK(rc == MOJOTREES_ERROR_INVALID_ARGUMENT,
           "failure with a NULL error object");
     CHECK(model == NULL, "out_model is untouched on failure");
 }
@@ -135,9 +135,9 @@ static void test_error_is_optional(void) {
 /* ------------------------------------------------------------- happy path */
 
 static void test_train_predict_regression(void) {
-    MojoBoostError *err = mojoboost_error_create();
-    MojoBoostModel *model = NULL;
-    int32_t rc = mojoboost_train_dense(
+    MojoTreesError *err = mojotrees_error_create();
+    MojoTreesModel *model = NULL;
+    int32_t rc = mojotrees_train_dense(
         x, N_ROWS, N_FEATURES, y_reg, NULL,
         "objective=regression num_iterations=20 learning_rate=0.2"
         " num_leaves=7 min_data_in_leaf=5",
@@ -145,18 +145,18 @@ static void test_train_predict_regression(void) {
     CHECK_OK(rc, err, "train regression");
 
     int64_t n_features = 0, n_classes = 0, n_trees = 0;
-    CHECK_OK(mojoboost_model_num_features(model, &n_features, err), err,
+    CHECK_OK(mojotrees_model_num_features(model, &n_features, err), err,
              "num_features");
-    CHECK_OK(mojoboost_model_num_classes(model, &n_classes, err), err,
+    CHECK_OK(mojotrees_model_num_classes(model, &n_classes, err), err,
              "num_classes");
-    CHECK_OK(mojoboost_model_num_trees(model, &n_trees, err), err,
+    CHECK_OK(mojotrees_model_num_trees(model, &n_trees, err), err,
              "num_trees");
     CHECK(n_features == N_FEATURES, "feature count round-trips");
     CHECK(n_classes == 1, "a single-output model predicts one value");
     CHECK(n_trees == 20, "one tree per iteration");
 
     double pred[N_ROWS];
-    CHECK_OK(mojoboost_predict(model, x, N_ROWS, N_FEATURES, pred, N_ROWS,
+    CHECK_OK(mojotrees_predict(model, x, N_ROWS, N_FEATURES, pred, N_ROWS,
                                err),
              err, "predict");
 
@@ -172,7 +172,7 @@ static void test_train_predict_regression(void) {
     /* For squared error the response scale and the raw score are the
      * same, which is the cheapest check that both entry points run. */
     double raw[N_ROWS];
-    CHECK_OK(mojoboost_predict_raw(model, x, N_ROWS, N_FEATURES, raw, N_ROWS,
+    CHECK_OK(mojotrees_predict_raw(model, x, N_ROWS, N_FEATURES, raw, N_ROWS,
                                    err),
              err, "predict_raw");
     int identical = 1;
@@ -181,24 +181,24 @@ static void test_train_predict_regression(void) {
     }
     CHECK(identical, "regression raw scores equal response-scale values");
 
-    mojoboost_model_free(model);
-    mojoboost_error_free(err);
+    mojotrees_model_free(model);
+    mojotrees_error_free(err);
 }
 
 static void test_train_predict_binary(void) {
-    MojoBoostError *err = mojoboost_error_create();
-    MojoBoostModel *model = NULL;
-    CHECK_OK(mojoboost_train_dense(x, N_ROWS, N_FEATURES, y_bin, NULL,
+    MojoTreesError *err = mojotrees_error_create();
+    MojoTreesModel *model = NULL;
+    CHECK_OK(mojotrees_train_dense(x, N_ROWS, N_FEATURES, y_bin, NULL,
                                    "objective=binary num_iterations=20"
                                    " num_leaves=7 min_data_in_leaf=5",
                                    &model, err),
              err, "train binary");
 
     double proba[N_ROWS], raw[N_ROWS];
-    CHECK_OK(mojoboost_predict(model, x, N_ROWS, N_FEATURES, proba, N_ROWS,
+    CHECK_OK(mojotrees_predict(model, x, N_ROWS, N_FEATURES, proba, N_ROWS,
                                err),
              err, "predict binary");
-    CHECK_OK(mojoboost_predict_raw(model, x, N_ROWS, N_FEATURES, raw, N_ROWS,
+    CHECK_OK(mojotrees_predict_raw(model, x, N_ROWS, N_FEATURES, raw, N_ROWS,
                                    err),
              err, "predict_raw binary");
 
@@ -213,14 +213,14 @@ static void test_train_predict_binary(void) {
     CHECK(matches_sigmoid, "response scale is the sigmoid of the raw score");
     CHECK(correct > (int)(0.9 * N_ROWS), "binary model fits the labels");
 
-    mojoboost_model_free(model);
-    mojoboost_error_free(err);
+    mojotrees_model_free(model);
+    mojotrees_error_free(err);
 }
 
 static void test_train_predict_multiclass(void) {
-    MojoBoostError *err = mojoboost_error_create();
-    MojoBoostModel *model = NULL;
-    CHECK_OK(mojoboost_train_dense(x, N_ROWS, N_FEATURES, y_multi, NULL,
+    MojoTreesError *err = mojotrees_error_create();
+    MojoTreesModel *model = NULL;
+    CHECK_OK(mojotrees_train_dense(x, N_ROWS, N_FEATURES, y_multi, NULL,
                                    "objective=multiclass num_class=3"
                                    " num_iterations=10 num_leaves=7"
                                    " min_data_in_leaf=5",
@@ -228,15 +228,15 @@ static void test_train_predict_multiclass(void) {
              err, "train multiclass");
 
     int64_t n_classes = 0, n_trees = 0;
-    CHECK_OK(mojoboost_model_num_classes(model, &n_classes, err), err,
+    CHECK_OK(mojotrees_model_num_classes(model, &n_classes, err), err,
              "multiclass num_classes");
-    CHECK_OK(mojoboost_model_num_trees(model, &n_trees, err), err,
+    CHECK_OK(mojotrees_model_num_trees(model, &n_trees, err), err,
              "multiclass num_trees");
     CHECK(n_classes == 3, "num_classes is the class count");
     CHECK(n_trees == 30, "one tree per class per iteration");
 
     double proba[N_ROWS * 3];
-    CHECK_OK(mojoboost_predict(model, x, N_ROWS, N_FEATURES, proba,
+    CHECK_OK(mojotrees_predict(model, x, N_ROWS, N_FEATURES, proba,
                                N_ROWS * 3, err),
              err, "predict multiclass");
     int normalized = 1, correct = 0;
@@ -255,39 +255,39 @@ static void test_train_predict_multiclass(void) {
 
     /* An output buffer sized for one value per row is too small here. */
     double narrow[N_ROWS];
-    CHECK(mojoboost_predict(model, x, N_ROWS, N_FEATURES, narrow, N_ROWS,
-                            err) == MOJOBOOST_ERROR_INVALID_ARGUMENT,
+    CHECK(mojotrees_predict(model, x, N_ROWS, N_FEATURES, narrow, N_ROWS,
+                            err) == MOJOTREES_ERROR_INVALID_ARGUMENT,
           "multiclass needs n_rows * num_classes of output space");
 
-    mojoboost_model_free(model);
-    mojoboost_error_free(err);
+    mojotrees_model_free(model);
+    mojotrees_error_free(err);
 }
 
 /* ------------------------------------------------------------- save/load */
 
 static void round_trip(const char *params, const char *path, int width) {
-    MojoBoostError *err = mojoboost_error_create();
-    MojoBoostModel *model = NULL;
+    MojoTreesError *err = mojotrees_error_create();
+    MojoTreesModel *model = NULL;
     const double *labels = width == 1 ? y_reg : y_multi;
-    CHECK_OK(mojoboost_train_dense(x, N_ROWS, N_FEATURES, labels, NULL,
+    CHECK_OK(mojotrees_train_dense(x, N_ROWS, N_FEATURES, labels, NULL,
                                    params, &model, err),
              err, "train for round trip");
 
     double *before = malloc(sizeof(double) * N_ROWS * width);
     double *after = malloc(sizeof(double) * N_ROWS * width);
-    CHECK_OK(mojoboost_predict(model, x, N_ROWS, N_FEATURES, before,
+    CHECK_OK(mojotrees_predict(model, x, N_ROWS, N_FEATURES, before,
                                N_ROWS * width, err),
              err, "predict before save");
-    CHECK_OK(mojoboost_save_model(model, path, err), err, "save");
-    mojoboost_model_free(model);
+    CHECK_OK(mojotrees_save_model(model, path, err), err, "save");
+    mojotrees_model_free(model);
 
-    MojoBoostModel *loaded = NULL;
-    CHECK_OK(mojoboost_load_model(path, &loaded, err), err, "load");
+    MojoTreesModel *loaded = NULL;
+    CHECK_OK(mojotrees_load_model(path, &loaded, err), err, "load");
     int64_t n_classes = 0;
-    CHECK_OK(mojoboost_model_num_classes(loaded, &n_classes, err), err,
+    CHECK_OK(mojotrees_model_num_classes(loaded, &n_classes, err), err,
              "loaded num_classes");
     CHECK(n_classes == width, "the file says which kind of model it holds");
-    CHECK_OK(mojoboost_predict(loaded, x, N_ROWS, N_FEATURES, after,
+    CHECK_OK(mojotrees_predict(loaded, x, N_ROWS, N_FEATURES, after,
                                N_ROWS * width, err),
              err, "predict after load");
 
@@ -299,8 +299,8 @@ static void round_trip(const char *params, const char *path, int width) {
 
     free(before);
     free(after);
-    mojoboost_model_free(loaded);
-    mojoboost_error_free(err);
+    mojotrees_model_free(loaded);
+    mojotrees_error_free(err);
     remove(path);
 }
 
@@ -315,148 +315,148 @@ static void test_save_load(void) {
 /* --------------------------------------------------------- invalid input */
 
 static void test_invalid_training_input(void) {
-    MojoBoostError *err = mojoboost_error_create();
-    MojoBoostModel *model = NULL;
-    MojoBoostModel *sentinel = (MojoBoostModel *)0x1;
+    MojoTreesError *err = mojotrees_error_create();
+    MojoTreesModel *model = NULL;
+    MojoTreesModel *sentinel = (MojoTreesModel *)0x1;
 
-    CHECK(mojoboost_train_dense(x, 0, N_FEATURES, y_reg, NULL, NULL, &model,
-                                err) == MOJOBOOST_ERROR_INVALID_ARGUMENT,
+    CHECK(mojotrees_train_dense(x, 0, N_FEATURES, y_reg, NULL, NULL, &model,
+                                err) == MOJOTREES_ERROR_INVALID_ARGUMENT,
           "n_rows must be positive");
-    CHECK(mojoboost_train_dense(x, N_ROWS, 0, y_reg, NULL, NULL, &model,
-                                err) == MOJOBOOST_ERROR_INVALID_ARGUMENT,
+    CHECK(mojotrees_train_dense(x, N_ROWS, 0, y_reg, NULL, NULL, &model,
+                                err) == MOJOTREES_ERROR_INVALID_ARGUMENT,
           "n_features must be positive");
-    CHECK(mojoboost_train_dense(x, -1, N_FEATURES, y_reg, NULL, NULL, &model,
-                                err) == MOJOBOOST_ERROR_INVALID_ARGUMENT,
+    CHECK(mojotrees_train_dense(x, -1, N_FEATURES, y_reg, NULL, NULL, &model,
+                                err) == MOJOTREES_ERROR_INVALID_ARGUMENT,
           "negative n_rows is rejected");
-    CHECK(mojoboost_train_dense(NULL, N_ROWS, N_FEATURES, y_reg, NULL, NULL,
+    CHECK(mojotrees_train_dense(NULL, N_ROWS, N_FEATURES, y_reg, NULL, NULL,
                                 &model, err) ==
-              MOJOBOOST_ERROR_INVALID_ARGUMENT,
+              MOJOTREES_ERROR_INVALID_ARGUMENT,
           "NULL data is rejected");
-    CHECK(mojoboost_train_dense(x, N_ROWS, N_FEATURES, NULL, NULL, NULL,
+    CHECK(mojotrees_train_dense(x, N_ROWS, N_FEATURES, NULL, NULL, NULL,
                                 &model, err) ==
-              MOJOBOOST_ERROR_INVALID_ARGUMENT,
+              MOJOTREES_ERROR_INVALID_ARGUMENT,
           "NULL labels are rejected");
-    CHECK(mojoboost_train_dense(x, N_ROWS, N_FEATURES, y_reg, NULL, NULL,
+    CHECK(mojotrees_train_dense(x, N_ROWS, N_FEATURES, y_reg, NULL, NULL,
                                 NULL, err) ==
-              MOJOBOOST_ERROR_INVALID_ARGUMENT,
+              MOJOTREES_ERROR_INVALID_ARGUMENT,
           "NULL out_model is rejected");
 
     /* Nothing above may have written a handle anywhere. */
     CHECK(model == NULL, "out_model stays NULL across every failure");
 
     /* Parameter strings. */
-    CHECK(mojoboost_train_dense(x, N_ROWS, N_FEATURES, y_reg, NULL,
+    CHECK(mojotrees_train_dense(x, N_ROWS, N_FEATURES, y_reg, NULL,
                                 "num_leaves", &sentinel, err) ==
-              MOJOBOOST_ERROR_INVALID_ARGUMENT,
+              MOJOTREES_ERROR_INVALID_ARGUMENT,
           "a parameter needs a value");
-    CHECK(mojoboost_train_dense(x, N_ROWS, N_FEATURES, y_reg, NULL,
+    CHECK(mojotrees_train_dense(x, N_ROWS, N_FEATURES, y_reg, NULL,
                                 "not_a_parameter=1", &sentinel, err) ==
-              MOJOBOOST_ERROR_INVALID_ARGUMENT,
+              MOJOTREES_ERROR_INVALID_ARGUMENT,
           "unknown parameters are rejected");
-    CHECK(mojoboost_train_dense(x, N_ROWS, N_FEATURES, y_reg, NULL,
+    CHECK(mojotrees_train_dense(x, N_ROWS, N_FEATURES, y_reg, NULL,
                                 "num_leaves=1", &sentinel, err) ==
-              MOJOBOOST_ERROR_INVALID_ARGUMENT,
+              MOJOTREES_ERROR_INVALID_ARGUMENT,
           "num_leaves is range checked");
-    CHECK(mojoboost_train_dense(x, N_ROWS, N_FEATURES, y_reg, NULL,
+    CHECK(mojotrees_train_dense(x, N_ROWS, N_FEATURES, y_reg, NULL,
                                 "objective=nonesuch", &sentinel, err) ==
-              MOJOBOOST_ERROR_INVALID_ARGUMENT,
+              MOJOTREES_ERROR_INVALID_ARGUMENT,
           "unknown objectives are rejected");
-    CHECK(mojoboost_train_dense(x, N_ROWS, N_FEATURES, y_reg, NULL,
+    CHECK(mojotrees_train_dense(x, N_ROWS, N_FEATURES, y_reg, NULL,
                                 "objective=multiclass", &sentinel, err) ==
-              MOJOBOOST_ERROR_INVALID_ARGUMENT,
+              MOJOTREES_ERROR_INVALID_ARGUMENT,
           "multiclass requires num_class");
-    CHECK(mojoboost_train_dense(x, N_ROWS, N_FEATURES, y_reg, NULL,
+    CHECK(mojotrees_train_dense(x, N_ROWS, N_FEATURES, y_reg, NULL,
                                 "bagging_fraction=0.5", &sentinel, err) ==
-              MOJOBOOST_ERROR_UNSUPPORTED,
+              MOJOTREES_ERROR_UNSUPPORTED,
           "a Mojo-API-only parameter reports unsupported, not unknown");
-    CHECK(mojoboost_train_dense(x, N_ROWS, N_FEATURES, y_reg, NULL,
+    CHECK(mojotrees_train_dense(x, N_ROWS, N_FEATURES, y_reg, NULL,
                                 "objective=lambdarank", &sentinel, err) ==
-              MOJOBOOST_ERROR_UNSUPPORTED,
+              MOJOTREES_ERROR_UNSUPPORTED,
           "ranking needs query groups a parameter string cannot carry");
-    CHECK(sentinel == (MojoBoostModel *)0x1,
+    CHECK(sentinel == (MojoTreesModel *)0x1,
           "a rejected parameter string never writes out_model");
 
     /* Labels the objective cannot accept are a training error, not an
      * argument error: the arguments were well formed. */
     double negative[N_ROWS];
     for (int r = 0; r < N_ROWS; r++) negative[r] = -1.0;
-    CHECK(mojoboost_train_dense(x, N_ROWS, N_FEATURES, negative, NULL,
+    CHECK(mojotrees_train_dense(x, N_ROWS, N_FEATURES, negative, NULL,
                                 "objective=poisson", &sentinel, err) ==
-              MOJOBOOST_ERROR_TRAINING,
+              MOJOTREES_ERROR_TRAINING,
           "poisson rejects negative labels");
-    CHECK(mojoboost_train_dense(x, N_ROWS, N_FEATURES, y_reg, NULL,
+    CHECK(mojotrees_train_dense(x, N_ROWS, N_FEATURES, y_reg, NULL,
                                 "objective=multiclass num_class=3",
-                                &sentinel, err) == MOJOBOOST_ERROR_TRAINING,
+                                &sentinel, err) == MOJOTREES_ERROR_TRAINING,
           "multiclass rejects non-integer labels");
-    CHECK(sentinel == (MojoBoostModel *)0x1,
+    CHECK(sentinel == (MojoTreesModel *)0x1,
           "a failed fit never writes out_model");
 
-    mojoboost_error_free(err);
+    mojotrees_error_free(err);
 }
 
 static void test_invalid_predict_input(void) {
-    MojoBoostError *err = mojoboost_error_create();
-    MojoBoostModel *model = NULL;
-    CHECK_OK(mojoboost_train_dense(x, N_ROWS, N_FEATURES, y_reg, NULL,
+    MojoTreesError *err = mojotrees_error_create();
+    MojoTreesModel *model = NULL;
+    CHECK_OK(mojotrees_train_dense(x, N_ROWS, N_FEATURES, y_reg, NULL,
                                    "num_iterations=5", &model, err),
              err, "train for predict validation");
 
     double out[N_ROWS];
-    CHECK(mojoboost_predict(NULL, x, N_ROWS, N_FEATURES, out, N_ROWS, err) ==
-              MOJOBOOST_ERROR_INVALID_ARGUMENT,
+    CHECK(mojotrees_predict(NULL, x, N_ROWS, N_FEATURES, out, N_ROWS, err) ==
+              MOJOTREES_ERROR_INVALID_ARGUMENT,
           "NULL model is rejected");
-    CHECK(mojoboost_predict(model, NULL, N_ROWS, N_FEATURES, out, N_ROWS,
-                            err) == MOJOBOOST_ERROR_INVALID_ARGUMENT,
+    CHECK(mojotrees_predict(model, NULL, N_ROWS, N_FEATURES, out, N_ROWS,
+                            err) == MOJOTREES_ERROR_INVALID_ARGUMENT,
           "NULL data is rejected");
-    CHECK(mojoboost_predict(model, x, N_ROWS, N_FEATURES, NULL, N_ROWS,
-                            err) == MOJOBOOST_ERROR_INVALID_ARGUMENT,
+    CHECK(mojotrees_predict(model, x, N_ROWS, N_FEATURES, NULL, N_ROWS,
+                            err) == MOJOTREES_ERROR_INVALID_ARGUMENT,
           "NULL output buffer is rejected");
-    CHECK(mojoboost_predict(model, x, N_ROWS, N_FEATURES - 1, out, N_ROWS,
-                            err) == MOJOBOOST_ERROR_INVALID_ARGUMENT,
+    CHECK(mojotrees_predict(model, x, N_ROWS, N_FEATURES - 1, out, N_ROWS,
+                            err) == MOJOTREES_ERROR_INVALID_ARGUMENT,
           "the feature count must match the model");
-    CHECK(mojoboost_predict(model, x, N_ROWS, N_FEATURES, out, N_ROWS - 1,
-                            err) == MOJOBOOST_ERROR_INVALID_ARGUMENT,
+    CHECK(mojotrees_predict(model, x, N_ROWS, N_FEATURES, out, N_ROWS - 1,
+                            err) == MOJOTREES_ERROR_INVALID_ARGUMENT,
           "a short output buffer is rejected");
-    CHECK(mojoboost_predict_raw(NULL, x, N_ROWS, N_FEATURES, out, N_ROWS,
-                                err) == MOJOBOOST_ERROR_INVALID_ARGUMENT,
+    CHECK(mojotrees_predict_raw(NULL, x, N_ROWS, N_FEATURES, out, N_ROWS,
+                                err) == MOJOTREES_ERROR_INVALID_ARGUMENT,
           "predict_raw validates too");
 
     /* A rejected prediction must not have written into the buffer. */
     for (int r = 0; r < N_ROWS; r++) out[r] = -12345.0;
-    (void)mojoboost_predict(model, x, N_ROWS, N_FEATURES, out, N_ROWS - 1,
+    (void)mojotrees_predict(model, x, N_ROWS, N_FEATURES, out, N_ROWS - 1,
                             err);
     CHECK(out[0] == -12345.0, "a rejected prediction writes nothing");
 
     /* Accessors. */
     int64_t value = 0;
-    CHECK(mojoboost_model_num_features(NULL, &value, err) ==
-              MOJOBOOST_ERROR_INVALID_ARGUMENT,
+    CHECK(mojotrees_model_num_features(NULL, &value, err) ==
+              MOJOTREES_ERROR_INVALID_ARGUMENT,
           "accessors reject a NULL model");
-    CHECK(mojoboost_model_num_classes(model, NULL, err) ==
-              MOJOBOOST_ERROR_INVALID_ARGUMENT,
+    CHECK(mojotrees_model_num_classes(model, NULL, err) ==
+              MOJOTREES_ERROR_INVALID_ARGUMENT,
           "accessors reject a NULL out pointer");
 
-    mojoboost_model_free(model);
-    mojoboost_error_free(err);
+    mojotrees_model_free(model);
+    mojotrees_error_free(err);
 }
 
 static void test_invalid_io(void) {
-    MojoBoostError *err = mojoboost_error_create();
-    MojoBoostModel *model = NULL;
-    MojoBoostModel *sentinel = (MojoBoostModel *)0x1;
+    MojoTreesError *err = mojotrees_error_create();
+    MojoTreesModel *model = NULL;
+    MojoTreesModel *sentinel = (MojoTreesModel *)0x1;
 
-    CHECK(mojoboost_load_model("capi_test_no_such_model.mbst", &model,
-                               err) == MOJOBOOST_ERROR_IO,
+    CHECK(mojotrees_load_model("capi_test_no_such_model.mbst", &model,
+                               err) == MOJOTREES_ERROR_IO,
           "loading a missing file is an I/O error");
     CHECK(model == NULL, "a failed load writes no handle");
-    CHECK(mojoboost_load_model(NULL, &model, err) ==
-              MOJOBOOST_ERROR_INVALID_ARGUMENT,
+    CHECK(mojotrees_load_model(NULL, &model, err) ==
+              MOJOTREES_ERROR_INVALID_ARGUMENT,
           "NULL path is rejected");
-    CHECK(mojoboost_load_model("", &model, err) ==
-              MOJOBOOST_ERROR_INVALID_ARGUMENT,
+    CHECK(mojotrees_load_model("", &model, err) ==
+              MOJOTREES_ERROR_INVALID_ARGUMENT,
           "empty path is rejected");
-    CHECK(mojoboost_load_model("x.mbst", NULL, err) ==
-              MOJOBOOST_ERROR_INVALID_ARGUMENT,
+    CHECK(mojotrees_load_model("x.mbst", NULL, err) ==
+              MOJOTREES_ERROR_INVALID_ARGUMENT,
           "NULL out_model is rejected");
 
     /* A file that exists but is not a model. */
@@ -464,34 +464,34 @@ static void test_invalid_io(void) {
     if (f) {
         fputs("this is not a model file\n", f);
         fclose(f);
-        CHECK(mojoboost_load_model("capi_test_garbage.txt", &sentinel, err) ==
-                  MOJOBOOST_ERROR_IO,
+        CHECK(mojotrees_load_model("capi_test_garbage.txt", &sentinel, err) ==
+                  MOJOTREES_ERROR_IO,
               "a file that is not a model is rejected");
-        CHECK(sentinel == (MojoBoostModel *)0x1,
+        CHECK(sentinel == (MojoTreesModel *)0x1,
               "a rejected load leaves out_model alone");
         remove("capi_test_garbage.txt");
     }
 
-    CHECK(mojoboost_save_model(NULL, "x.mbst", err) ==
-              MOJOBOOST_ERROR_INVALID_ARGUMENT,
+    CHECK(mojotrees_save_model(NULL, "x.mbst", err) ==
+              MOJOTREES_ERROR_INVALID_ARGUMENT,
           "saving a NULL model is rejected");
 
-    CHECK_OK(mojoboost_train_dense(x, N_ROWS, N_FEATURES, y_reg, NULL,
+    CHECK_OK(mojotrees_train_dense(x, N_ROWS, N_FEATURES, y_reg, NULL,
                                    "num_iterations=2", &model, err),
              err, "train for save validation");
-    CHECK(mojoboost_save_model(model, NULL, err) ==
-              MOJOBOOST_ERROR_INVALID_ARGUMENT,
+    CHECK(mojotrees_save_model(model, NULL, err) ==
+              MOJOTREES_ERROR_INVALID_ARGUMENT,
           "NULL path is rejected");
-    CHECK(mojoboost_save_model(model, "", err) ==
-              MOJOBOOST_ERROR_INVALID_ARGUMENT,
+    CHECK(mojotrees_save_model(model, "", err) ==
+              MOJOTREES_ERROR_INVALID_ARGUMENT,
           "empty path is rejected");
     /* Saving creates missing parent directories, so an unwritable path
      * has to be one that cannot be a directory at all. */
-    CHECK(mojoboost_save_model(model, "/dev/null/model.mbst", err) ==
-              MOJOBOOST_ERROR_IO,
+    CHECK(mojotrees_save_model(model, "/dev/null/model.mbst", err) ==
+              MOJOTREES_ERROR_IO,
           "an unwritable path is an I/O error");
-    mojoboost_model_free(model);
-    mojoboost_error_free(err);
+    mojotrees_model_free(model);
+    mojotrees_error_free(err);
 }
 
 /* ---------------------------------------------------------------- leaks */
@@ -502,62 +502,62 @@ static void test_handle_churn(void) {
      * assertion; on its own it catches use-after-free and double-free
      * crashes, and allocator growth that would abort the process. */
     for (int i = 0; i < 2000; i++) {
-        MojoBoostError *err = mojoboost_error_create();
+        MojoTreesError *err = mojotrees_error_create();
         /* Write a message on half of them so the message buffer is
          * reallocated and freed, not just the empty initial one. */
         if (i % 2 == 0) {
-            (void)mojoboost_predict(NULL, x, N_ROWS, N_FEATURES, NULL, 0,
+            (void)mojotrees_predict(NULL, x, N_ROWS, N_FEATURES, NULL, 0,
                                     err);
         }
-        mojoboost_error_free(err);
+        mojotrees_error_free(err);
     }
 
     for (int i = 0; i < 25; i++) {
-        MojoBoostError *err = mojoboost_error_create();
-        MojoBoostModel *model = NULL;
-        CHECK_OK(mojoboost_train_dense(x, N_ROWS, N_FEATURES, y_reg, NULL,
+        MojoTreesError *err = mojotrees_error_create();
+        MojoTreesModel *model = NULL;
+        CHECK_OK(mojotrees_train_dense(x, N_ROWS, N_FEATURES, y_reg, NULL,
                                        "num_iterations=3 num_leaves=7",
                                        &model, err),
                  err, "churn: train");
         double out[N_ROWS];
-        CHECK_OK(mojoboost_predict(model, x, N_ROWS, N_FEATURES, out, N_ROWS,
+        CHECK_OK(mojotrees_predict(model, x, N_ROWS, N_FEATURES, out, N_ROWS,
                                    err),
                  err, "churn: predict");
-        CHECK_OK(mojoboost_save_model(model, "capi_test_churn.mbst", err),
+        CHECK_OK(mojotrees_save_model(model, "capi_test_churn.mbst", err),
                  err, "churn: save");
-        MojoBoostModel *loaded = NULL;
-        CHECK_OK(mojoboost_load_model("capi_test_churn.mbst", &loaded, err),
+        MojoTreesModel *loaded = NULL;
+        CHECK_OK(mojotrees_load_model("capi_test_churn.mbst", &loaded, err),
                  err, "churn: load");
-        mojoboost_model_free(loaded);
-        mojoboost_model_free(model);
-        mojoboost_error_free(err);
+        mojotrees_model_free(loaded);
+        mojotrees_model_free(model);
+        mojotrees_error_free(err);
     }
     remove("capi_test_churn.mbst");
 }
 
 static void test_weights(void) {
-    MojoBoostError *err = mojoboost_error_create();
+    MojoTreesError *err = mojotrees_error_create();
     double weights[N_ROWS];
     for (int r = 0; r < N_ROWS; r++) weights[r] = r < N_ROWS / 2 ? 1.0 : 0.0;
 
-    MojoBoostModel *weighted = NULL;
-    MojoBoostModel *unweighted = NULL;
-    CHECK_OK(mojoboost_train_dense(x, N_ROWS, N_FEATURES, y_reg, weights,
+    MojoTreesModel *weighted = NULL;
+    MojoTreesModel *unweighted = NULL;
+    CHECK_OK(mojotrees_train_dense(x, N_ROWS, N_FEATURES, y_reg, weights,
                                    "num_iterations=5 num_leaves=7"
                                    " min_data_in_leaf=2",
                                    &weighted, err),
              err, "train weighted");
-    CHECK_OK(mojoboost_train_dense(x, N_ROWS, N_FEATURES, y_reg, NULL,
+    CHECK_OK(mojotrees_train_dense(x, N_ROWS, N_FEATURES, y_reg, NULL,
                                    "num_iterations=5 num_leaves=7"
                                    " min_data_in_leaf=2",
                                    &unweighted, err),
              err, "train unweighted");
 
     double a[N_ROWS], b[N_ROWS];
-    CHECK_OK(mojoboost_predict(weighted, x, N_ROWS, N_FEATURES, a, N_ROWS,
+    CHECK_OK(mojotrees_predict(weighted, x, N_ROWS, N_FEATURES, a, N_ROWS,
                                err),
              err, "predict weighted");
-    CHECK_OK(mojoboost_predict(unweighted, x, N_ROWS, N_FEATURES, b, N_ROWS,
+    CHECK_OK(mojotrees_predict(unweighted, x, N_ROWS, N_FEATURES, b, N_ROWS,
                                err),
              err, "predict unweighted");
     int differs = 0;
@@ -569,32 +569,32 @@ static void test_weights(void) {
     /* A weight vector of all zeros leaves nothing to fit. */
     double zeros[N_ROWS];
     for (int r = 0; r < N_ROWS; r++) zeros[r] = 0.0;
-    MojoBoostModel *sentinel = (MojoBoostModel *)0x1;
-    CHECK(mojoboost_train_dense(x, N_ROWS, N_FEATURES, y_reg, zeros, NULL,
-                                &sentinel, err) == MOJOBOOST_ERROR_TRAINING,
+    MojoTreesModel *sentinel = (MojoTreesModel *)0x1;
+    CHECK(mojotrees_train_dense(x, N_ROWS, N_FEATURES, y_reg, zeros, NULL,
+                                &sentinel, err) == MOJOTREES_ERROR_TRAINING,
           "all-zero weights are a training error");
 
-    mojoboost_model_free(weighted);
-    mojoboost_model_free(unweighted);
-    mojoboost_error_free(err);
+    mojotrees_model_free(weighted);
+    mojotrees_model_free(unweighted);
+    mojotrees_error_free(err);
 }
 
 /* Importance and the parameter key list, the two calls ABI version 3 added
  * for the R bindings. Both are what a binding needs to avoid keeping its own
  * copy of something the engine already knows. */
 static void test_feature_importance(void) {
-    MojoBoostError *err = mojoboost_error_create();
-    MojoBoostModel *model = NULL;
-    CHECK_OK(mojoboost_train_dense(x, N_ROWS, N_FEATURES, y_reg, NULL,
+    MojoTreesError *err = mojotrees_error_create();
+    MojoTreesModel *model = NULL;
+    CHECK_OK(mojotrees_train_dense(x, N_ROWS, N_FEATURES, y_reg, NULL,
                                    "num_iterations=12 num_leaves=7", &model,
                                    err),
              err, "train for importance");
 
     double split[N_FEATURES], gain[N_FEATURES];
-    CHECK_OK(mojoboost_feature_importance(model, MOJOBOOST_IMPORTANCE_SPLIT,
+    CHECK_OK(mojotrees_feature_importance(model, MOJOTREES_IMPORTANCE_SPLIT,
                                           split, N_FEATURES, err),
              err, "split importance");
-    CHECK_OK(mojoboost_feature_importance(model, MOJOBOOST_IMPORTANCE_GAIN,
+    CHECK_OK(mojotrees_feature_importance(model, MOJOTREES_IMPORTANCE_GAIN,
                                           gain, N_FEATURES, err),
              err, "gain importance");
 
@@ -621,47 +621,47 @@ static void test_feature_importance(void) {
     /* Rejections. Nothing is written when the call fails. */
     double guard[N_FEATURES];
     for (int f = 0; f < N_FEATURES; f++) guard[f] = -7.0;
-    CHECK(mojoboost_feature_importance(model, 2, guard, N_FEATURES, err) ==
-              MOJOBOOST_ERROR_INVALID_ARGUMENT,
+    CHECK(mojotrees_feature_importance(model, 2, guard, N_FEATURES, err) ==
+              MOJOTREES_ERROR_INVALID_ARGUMENT,
           "an unknown importance type is refused");
     CHECK(guard[0] == -7.0, "a refused type writes nothing");
-    CHECK(strlen(mojoboost_error_message(err)) > 0,
+    CHECK(strlen(mojotrees_error_message(err)) > 0,
           "the refusal explains itself");
-    CHECK(mojoboost_feature_importance(model, MOJOBOOST_IMPORTANCE_SPLIT,
+    CHECK(mojotrees_feature_importance(model, MOJOTREES_IMPORTANCE_SPLIT,
                                        guard, N_FEATURES - 1, err) ==
-              MOJOBOOST_ERROR_INVALID_ARGUMENT,
+              MOJOTREES_ERROR_INVALID_ARGUMENT,
           "too small a buffer is refused");
     CHECK(guard[0] == -7.0, "a refused length writes nothing");
-    CHECK(mojoboost_feature_importance(NULL, MOJOBOOST_IMPORTANCE_SPLIT, guard,
+    CHECK(mojotrees_feature_importance(NULL, MOJOTREES_IMPORTANCE_SPLIT, guard,
                                        N_FEATURES, err) ==
-              MOJOBOOST_ERROR_INVALID_ARGUMENT,
+              MOJOTREES_ERROR_INVALID_ARGUMENT,
           "a NULL model is refused");
-    CHECK(mojoboost_feature_importance(model, MOJOBOOST_IMPORTANCE_SPLIT, NULL,
+    CHECK(mojotrees_feature_importance(model, MOJOTREES_IMPORTANCE_SPLIT, NULL,
                                        N_FEATURES, err) ==
-              MOJOBOOST_ERROR_INVALID_ARGUMENT,
+              MOJOTREES_ERROR_INVALID_ARGUMENT,
           "a NULL buffer is refused");
 
-    mojoboost_model_free(model);
-    mojoboost_error_free(err);
+    mojotrees_model_free(model);
+    mojotrees_error_free(err);
 }
 
 static void test_multiclass_importance_sums_over_classes(void) {
-    MojoBoostError *err = mojoboost_error_create();
-    MojoBoostModel *model = NULL;
-    CHECK_OK(mojoboost_train_dense(x, N_ROWS, N_FEATURES, y_multi, NULL,
+    MojoTreesError *err = mojotrees_error_create();
+    MojoTreesModel *model = NULL;
+    CHECK_OK(mojotrees_train_dense(x, N_ROWS, N_FEATURES, y_multi, NULL,
                                    "objective=multiclass num_class=3"
                                    " num_iterations=6",
                                    &model, err),
              err, "train multiclass for importance");
 
     int64_t trees = 0, iterations = 0;
-    CHECK_OK(mojoboost_model_num_trees(model, &trees, err), err, "trees");
-    CHECK_OK(mojoboost_model_num_iterations(model, &iterations, err), err,
+    CHECK_OK(mojotrees_model_num_trees(model, &trees, err), err, "trees");
+    CHECK_OK(mojotrees_model_num_iterations(model, &iterations, err), err,
              "iterations");
     CHECK(trees == iterations * 3, "one tree per class per iteration");
 
     double split[N_FEATURES];
-    CHECK_OK(mojoboost_feature_importance(model, MOJOBOOST_IMPORTANCE_SPLIT,
+    CHECK_OK(mojotrees_feature_importance(model, MOJOTREES_IMPORTANCE_SPLIT,
                                           split, N_FEATURES, err),
              err, "multiclass split importance");
     int total = 0;
@@ -670,14 +670,14 @@ static void test_multiclass_importance_sums_over_classes(void) {
      * per-class count could not exceed the single-class tree count. */
     CHECK(total > 0, "a multiclass model splits on something");
 
-    mojoboost_model_free(model);
-    mojoboost_error_free(err);
+    mojotrees_model_free(model);
+    mojotrees_error_free(err);
 }
 
 static void test_parameter_keys(void) {
-    MojoBoostError *err = mojoboost_error_create();
+    MojoTreesError *err = mojotrees_error_create();
     char *keys = NULL;
-    CHECK_OK(mojoboost_parameter_keys(&keys, err), err, "parameter keys");
+    CHECK_OK(mojotrees_parameter_keys(&keys, err), err, "parameter keys");
     CHECK(keys != NULL, "keys are returned");
     CHECK(strlen(keys) > 0, "keys are not empty");
     /* Spot check a few the parser really does accept, since the point of
@@ -685,12 +685,12 @@ static void test_parameter_keys(void) {
     CHECK(strstr(keys, "objective") != NULL, "objective is listed");
     CHECK(strstr(keys, "num_iterations") != NULL, "num_iterations is listed");
     CHECK(strstr(keys, "learning_rate") != NULL, "learning_rate is listed");
-    mojoboost_string_free(keys);
+    mojotrees_string_free(keys);
 
-    CHECK(mojoboost_parameter_keys(NULL, err) ==
-              MOJOBOOST_ERROR_INVALID_ARGUMENT,
+    CHECK(mojotrees_parameter_keys(NULL, err) ==
+              MOJOTREES_ERROR_INVALID_ARGUMENT,
           "a NULL out pointer is refused");
-    mojoboost_error_free(err);
+    mojotrees_error_free(err);
 }
 
 int main(void) {

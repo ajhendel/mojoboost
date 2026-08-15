@@ -7,7 +7,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thanks for testing mojoboost. It is an experimental public alpha. Please include a minimal reproducer and complete environment details.
+        Thanks for testing mojotrees. It is an experimental public alpha. Please include a minimal reproducer and complete environment details.
   - type: textarea
     id: summary
     attributes:
@@ -52,7 +52,7 @@ body:
     id: comparison
     attributes:
       label: LightGBM or CPU comparison
-      description: If relevant, include aligned LightGBM or mojoboost CPU output and parameters.
+      description: If relevant, include aligned LightGBM or mojotrees CPU output and parameters.
   - type: checkboxes
     id: checks
     attributes:

@@ -1,7 +1,7 @@
-DESTINATION: Modular Forum and Modular Discord community-project channels, and as a pinned GitHub issue on mojoboost-ml/mojoboost titled the same way. Post only after the benchmark suite has completed one smoke run somewhere, so that the first person who volunteers is not the person who discovers the harness is broken.
+DESTINATION: Modular Forum and Modular Discord community-project channels, and as a pinned GitHub issue on mojotrees/mojotrees titled the same way. Post only after the benchmark suite has completed one smoke run somewhere, so that the first person who volunteers is not the person who discovers the harness is broken.
 TITLE: Request: Apple Silicon benchmark and thermal runs on M1 through M5 Macs
 
-MojoBoost trains gradient-boosted trees on the GPU that is already in every Apple Silicon Mac. That is a design goal, not a measured result. Right now this repository has no quotable performance number on any Mac, and it says so in every document that touches the subject. I would like to fix that with real runs on real machines, and I need machines I do not own.
+MojoTrees trains gradient-boosted trees on the GPU that is already in every Apple Silicon Mac. That is a design goal, not a measured result. Right now this repository has no quotable performance number on any Mac, and it says so in every document that touches the subject. I would like to fix that with real runs on real machines, and I need machines I do not own.
 
 What I am asking for is a run of a written protocol, not a screenshot of a number. The protocol is docs/APPLE_GPU_BENCHMARK_PROTOCOL.md for comparative timings and docs/APPLE_THERMAL_ENERGY.md for thermal, energy, and sustained behavior on laptops. Both are in the repository, both define what counts as a result, and both list what a result may and may not be called afterward. Please read the one you are running before you run it.
 
@@ -42,11 +42,11 @@ Be aware of this before you volunteer for it. bench/apple/thermal_capture.sh pla
 
 WHAT I WILL DO WITH YOUR RESULTS
 
-Publish the record file next to any table drawn from it, so anyone can check the table against the record. Name the chip variant, the memory size, the OS build, the commit, and the conditions in the same place as the numbers. Credit you if you want to be credited and not if you do not. Publish results that make MojoBoost look bad on exactly the same terms as results that make it look good, because a benchmark you can only lose by not running is not a benchmark.
+Publish the record file next to any table drawn from it, so anyone can check the table against the record. Name the chip variant, the memory size, the OS build, the commit, and the conditions in the same place as the numbers. Credit you if you want to be credited and not if you do not. Publish results that make MojoTrees look bad on exactly the same terms as results that make it look good, because a benchmark you can only lose by not running is not a benchmark.
 
 WHAT I WILL NOT DO
 
-Present a number from one chip as representative of Apple Silicon. Compare your run against someone else's run on a different machine, a different OS version, or a different commit. Fill in a missing measurement with an estimate. Convert a machine-wide power figure into a claim about what MojoBoost consumed, which is a thing no public Apple tooling supports and which this repository prohibits in writing.
+Present a number from one chip as representative of Apple Silicon. Compare your run against someone else's run on a different machine, a different OS version, or a different commit. Fill in a missing measurement with an estimate. Convert a machine-wide power figure into a claim about what MojoTrees consumed, which is a thing no public Apple tooling supports and which this repository prohibits in writing.
 
 PRIVACY, PLEASE READ THIS PART
 
@@ -72,10 +72,10 @@ WHAT WILL GET A RUN REJECTED, AND WHY THAT IS NOT PERSONAL
 
 A run on a machine that was doing something else. A run from a checkout with uncommitted changes, because then the commit hash does not describe what ran. A run at smoke scale. A run in a virtual machine. A run where the record's own idle gate reports it failed. Every one of these produces a file the protocol says is unquotable, and I would rather tell you that up front than accept a file I will never be able to use.
 
-Repository: https://github.com/mojoboost-ml/mojoboost
-Contributing hardware results: https://github.com/mojoboost-ml/mojoboost/blob/main/docs/HARDWARE_CONTRIBUTORS.md
-Benchmark protocol: https://github.com/mojoboost-ml/mojoboost/blob/main/docs/APPLE_GPU_BENCHMARK_PROTOCOL.md
-Thermal and energy protocol: https://github.com/mojoboost-ml/mojoboost/blob/main/docs/APPLE_THERMAL_ENERGY.md
-GPU validation status: https://github.com/mojoboost-ml/mojoboost/blob/main/docs/GPU_VALIDATION.md
+Repository: https://github.com/mojotrees/mojotrees
+Contributing hardware results: https://github.com/mojotrees/mojotrees/blob/main/docs/HARDWARE_CONTRIBUTORS.md
+Benchmark protocol: https://github.com/mojotrees/mojotrees/blob/main/docs/APPLE_GPU_BENCHMARK_PROTOCOL.md
+Thermal and energy protocol: https://github.com/mojotrees/mojotrees/blob/main/docs/APPLE_THERMAL_ENERGY.md
+GPU validation status: https://github.com/mojotrees/mojotrees/blob/main/docs/GPU_VALIDATION.md
 
-To be explicit about where this stands, since it would be easy to read a benchmark request as a claim. No run under either protocol has been performed. Every cell of the M1 to M5 fleet table is empty. The scattered timings currently in bench/README.md were taken on a loaded development machine and are labeled there as unquotable. MojoBoost is an experimental alpha, and the point of this request is to find out what is actually true on the hardware.
+To be explicit about where this stands, since it would be easy to read a benchmark request as a claim. No run under either protocol has been performed. Every cell of the M1 to M5 fleet table is empty. The scattered timings currently in bench/README.md were taken on a loaded development machine and are labeled there as unquotable. MojoTrees is an experimental alpha, and the point of this request is to find out what is actually true on the hardware.

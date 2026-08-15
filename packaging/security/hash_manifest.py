@@ -4,7 +4,7 @@
 Why this exists rather than `shasum -a 256 *`: the manifest has to be written on
 macOS, checked on Linux, and checked again by whoever downloads the wheel on a
 machine with neither coreutils nor a package manager you can assume. Every
-platform that can run mojoboost has a Python, so the tool that proves what was
+platform that can run mojotrees has a Python, so the tool that proves what was
 downloaded should need nothing else.
 
 The output is the coreutils format, `<64 hex><two spaces><name>`, so

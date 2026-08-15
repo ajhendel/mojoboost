@@ -1,14 +1,14 @@
 # Model inspection schema
 
-This is the normative statement of what a mojoboost model dump contains.
+This is the normative statement of what a mojotrees model dump contains.
 Two implementations produce it, and this document is what holds them to
 each other:
 
 | Implementation | Source | Carries gains |
 | --- | --- | --- |
-| `src/mojoboost/model_dump.mojo` | the in-memory `Model` / `MulticlassModel` | yes |
-| `src/mojoboost/inspection.mojo` | the same dump, rendered as JSON | yes |
-| `python/mojoboost/inspection.py` | the native dump, or `Booster.model_to_string()` parsed | yes from a v4 model either way; a pre-v4 model needs the `split_gains` hook |
+| `src/mojotrees/model_dump.mojo` | the in-memory `Model` / `MulticlassModel` | yes |
+| `src/mojotrees/inspection.mojo` | the same dump, rendered as JSON | yes |
+| `python/mojotrees/inspection.py` | the native dump, or `Booster.model_to_string()` parsed | yes from a v4 model either way; a pre-v4 model needs the `split_gains` hook |
 
 A consumer reads the schema, not either implementation. Everything below
 is part of the contract; anything not below is not.
@@ -21,8 +21,8 @@ survive: a key removed, a key's type changed, or a key's meaning changed.
 Adding an optional key does not bump it, so a consumer must ignore keys it
 does not know.
 
-`model_format_version` is a different number: the version of mojoboost's
-save format (`src/mojoboost/serialize.mojo`) that the model was read from
+`model_format_version` is a different number: the version of mojotrees's
+save format (`src/mojotrees/serialize.mojo`) that the model was read from
 or would serialize to. It is what tells a consumer which optional facts a
 model of that vintage can carry at all. v1 and v2 models predate node
 covers, so a dump built from one reports `has_node_count: false`; v1
@@ -59,8 +59,8 @@ file that says so, rather than as one that claims zeros are real.
 | Key | Type | Meaning |
 | --- | --- | --- |
 | `dump_format_version` | int | this schema's version |
-| `producer` | str | always `"mojoboost"` |
-| `model_format_version` | int | mojoboost save format version, 1 through 4 |
+| `producer` | str | always `"mojotrees"` |
+| `model_format_version` | int | mojotrees save format version, 1 through 4 |
 | `source` | str | where the dump was built from: `"model_to_string"`, `"model_to_string+split_gains"`, or `"native"` |
 | `objective` | str or null | resolved objective name, LightGBM's spelling; `"multiclass"` for a softmax model. The native dump leaves this null and reports the code alone |
 | `objective_code` | int or null | the trainer's objective code; null for a multiclass model, which has no single-output code |
@@ -82,7 +82,7 @@ file that says so, rather than as one that claims zeros are real.
 
 ### Leaf values
 
-mojoboost stores unshrunk leaf values and multiplies by the shrinkage when
+mojotrees stores unshrunk leaf values and multiplies by the shrinkage when
 it predicts. LightGBM folds the shrinkage into the leaf value instead, so
 a reader porting code from LightGBM has to know which convention is in
 front of it. That is what `leaf_value_is_shrunk: false` says, and the
@@ -93,7 +93,7 @@ raw_score[k] = base_score[k] + sum over trees of (shrinkage * leaf_value)
 ```
 
 with each tree's `shrinkage` on its own record, equal to the top level
-`learning_rate`. `mojoboost.inspection.raw_scores(dump, row)` is this sum,
+`learning_rate`. `mojotrees.inspection.raw_scores(dump, row)` is this sum,
 and `python/tests/parallel/test_inspection.py` checks it against the
 model's own `predict(raw_score=True)` to the last bit.
 
@@ -172,7 +172,7 @@ is no type tag.
 | `leaf_count` | float | training rows that reached this leaf; 0.0 when `has_node_count` is false |
 | `depth` | int | edges from the root; the root is 0 |
 
-`leaf_index` is mojoboost's own leaf ordinal: leaves ranked in node-array
+`leaf_index` is mojotrees's own leaf ordinal: leaves ranked in node-array
 order. It is exactly what `predict(pred_leaf=True)` reports, it is fixed
 once a tree is grown, and a saved and reloaded model assigns the same
 ordinals. It is not LightGBM's leaf id, and the two agree only by
@@ -230,12 +230,12 @@ counts the sampled rows, which are the rows the node's value was fitted
 from.
 
 There is no `weight` key. LightGBM's node weight is a sum of hessians;
-mojoboost records the row cover and not the hessian sum, so a weight is
+mojotrees records the row cover and not the hessian sum, so a weight is
 not something this schema can report rather than something it declines to.
 
 ## Derived shapes
 
-`python/mojoboost/inspection.py` builds five things from the dump, and
+`python/mojotrees/inspection.py` builds five things from the dump, and
 none of them adds a dependency:
 
 - `trees_to_records(model)` returns one dict per node, in
@@ -244,7 +244,7 @@ none of them adds a dependency:
 - `trees_to_dataframe(model)` is the same rows as a pandas DataFrame, with
   LightGBM's column names. Raises `ImportError` naming
   `trees_to_records` when pandas is absent, since pandas is not a
-  mojoboost dependency.
+  mojotrees dependency.
 - `get_split_value_histogram(model, feature, bins=None, as_frame=False)`
   returns `(counts, bin_edges)`, the data behind LightGBM's
   `plot_split_value_histogram`. No plotting dependency is introduced, and
@@ -254,7 +254,7 @@ none of them adds a dependency:
   tree's list. Unshrunk, as they are stored.
 - `feature_importance(model, importance_type="split")` delegates to
   `Booster.feature_importance`, which is
-  `src/mojoboost/importance.mojo`. It is here so that the inspection
+  `src/mojotrees/importance.mojo`. It is here so that the inspection
   surface answers the question without becoming a second answer to it:
   the dump's per-feature `split_gain` sums equal the `"gain"` importance
   by construction, and that identity is the check worth writing.
@@ -274,8 +274,8 @@ count of distinct split values, gives one bin per distinct value.
 
 LightGBM's `Booster.set_leaf_output` has no counterpart here, and this is
 a decision rather than a gap. It is also a reported decision rather than
-a discovered one: `mojoboost.inspection.model_editing_support()` returns
-the status, and `src/mojoboost/inspection.mojo` states the same one
+a discovered one: `mojotrees.inspection.model_editing_support()` returns
+the status, and `src/mojotrees/inspection.mojo` states the same one
 natively, in `model_editing_status_json`. A consumer branches on it
 instead of catching an `AttributeError`.
 
@@ -289,15 +289,15 @@ instead of catching an `AttributeError`.
 | `model_format_version` | int | the format that carries them, 4 |
 | `read_only_alternative` | str | `"leaf_outputs"` |
 
-A grown mojoboost tree satisfies invariants that an arbitrary leaf edit
+A grown mojotrees tree satisfies invariants that an arbitrary leaf edit
 falsifies with nothing left to detect it:
 
 - `internal_count` is the training rows that reached a node, and exact
-  feature contributions (`src/mojoboost/contrib.mojo`) condition on it as
+  feature contributions (`src/mojotrees/contrib.mojo`) condition on it as
   the background weighting.
 - `internal_value` is the value a node held when it was created, which is
   what recovers the monotonic output intervals of a constrained model
-  (`src/mojoboost/monotone.mojo`).
+  (`src/mojotrees/monotone.mojo`).
 - `split_gain` was computed from the gradient and hessian sums the leaf
   held at growth time.
 
@@ -321,19 +321,19 @@ from format v4 on, the text carries the gains, the covers, and the
 feature names, so a text-built dump reports the same capability flags a
 native one does.
 
-- `_mojoboost.dump_model(handle, names, n_names)` and
-  `_mojoboost.dump_model_multiclass(...)` build the schema natively, from
-  `src/mojoboost/model_dump.mojo`, and are what `source: "native"` means.
-- `_mojoboost.dump_model_json(...)` and
-  `_mojoboost.dump_model_json_multiclass(...)` return the same schema as a
-  JSON string from `src/mojoboost/inspection.mojo`, for a consumer outside
+- `_mojotrees.dump_model(handle, names, n_names)` and
+  `_mojotrees.dump_model_multiclass(...)` build the schema natively, from
+  `src/mojotrees/model_dump.mojo`, and are what `source: "native"` means.
+- `_mojotrees.dump_model_json(...)` and
+  `_mojotrees.dump_model_json_multiclass(...)` return the same schema as a
+  JSON string from `src/mojotrees/inspection.mojo`, for a consumer outside
   Python that would rather not parse a token stream.
-- `_mojoboost.split_gains(handle)` and
-  `_mojoboost.split_gains_multiclass(handle)`, each returning
+- `_mojotrees.split_gains(handle)` and
+  `_mojotrees.split_gains_multiclass(handle)`, each returning
   `list[list[float]]`, are optional and are asked only when the text is
   older than v4: a live handle still holds the gains that an older file
   dropped, which is the one case that flips `has_split_gain` to true
   without the text. `source` is then
   `"model_to_string+split_gains"`.
-- `_mojoboost.model_feature_names(path)` reads a file's names without
+- `_mojotrees.model_feature_names(path)` reads a file's names without
   loading it, and returns an empty sequence for a pre-v4 file.

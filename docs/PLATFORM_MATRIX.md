@@ -1,6 +1,6 @@
 # Platform and release matrix
 
-Where mojoboost can be installed, what the artifact for each place is called,
+Where mojotrees can be installed, what the artifact for each place is called,
 which interpreter it targets, and, for every row, what evidence exists that any
 of it is true.
 
@@ -38,12 +38,12 @@ which is the one automated defense against this document aging into marketing.
 
 | Target id | Artifact | Expected filename | Status | Index-publishable |
 |---|---|---|---|---|
-| `macos-arm64-cp314` | wheel | `mojoboost-0.1.0-cp314-cp314-macosx_26_0_arm64.whl` | `designed` | yes |
-| `macos-arm64-cp314-lowered` | wheel | `mojoboost-0.1.0-cp314-cp314-macosx_12_0_arm64.whl` | `designed` | yes |
-| `linux-x86_64-cp314` | wheel | `mojoboost-0.1.0-cp314-cp314-linux_x86_64.whl` | `designed` | no |
-| `linux-aarch64-cp314` | wheel | `mojoboost-0.1.0-cp314-cp314-linux_aarch64.whl` | `designed` | no |
-| `linux-x86_64-cp314-manylinux` | wheel | `mojoboost-0.1.0-cp314-cp314-manylinux_2_28_x86_64.whl` | `designed` | yes, once measured |
-| `linux-aarch64-cp314-manylinux` | wheel | `mojoboost-0.1.0-cp314-cp314-manylinux_2_28_aarch64.whl` | `designed` | yes, once measured |
+| `macos-arm64-cp314` | wheel | `mojotrees-0.1.0-cp314-cp314-macosx_26_0_arm64.whl` | `designed` | yes |
+| `macos-arm64-cp314-lowered` | wheel | `mojotrees-0.1.0-cp314-cp314-macosx_12_0_arm64.whl` | `designed` | yes |
+| `linux-x86_64-cp314` | wheel | `mojotrees-0.1.0-cp314-cp314-linux_x86_64.whl` | `designed` | no |
+| `linux-aarch64-cp314` | wheel | `mojotrees-0.1.0-cp314-cp314-linux_aarch64.whl` | `designed` | no |
+| `linux-x86_64-cp314-manylinux` | wheel | `mojotrees-0.1.0-cp314-cp314-manylinux_2_28_x86_64.whl` | `designed` | yes, once measured |
+| `linux-aarch64-cp314-manylinux` | wheel | `mojotrees-0.1.0-cp314-cp314-manylinux_2_28_aarch64.whl` | `designed` | yes, once measured |
 | `macos-x86_64` | none | none | `unsupported` | n/a |
 | `sdist` | none | none | `unsupported` | n/a |
 
@@ -56,7 +56,7 @@ and never as an upload. The two `-manylinux` rows are the same builder run with
 renaming a file.
 
 And the source install, which is how every current user actually installs
-mojoboost:
+mojotrees:
 
 | Source install | Platform | Status | Evidence |
 |---|---|---|---|
@@ -101,13 +101,13 @@ version above it.
 
 ## The easy macOS wheel path
 
-The Apple product story is a Mac user typing `pip install mojoboost` and
+The Apple product story is a Mac user typing `pip install mojotrees` and
 getting a working GBDT library that uses the GPU already in their machine, with
 no Mojo, no MAX, no conda, and no compiler. Two thirds of that already works.
 The remaining third is a version number.
 
 **What works.** `packaging/build_wheel.sh` builds the extension, copies the
-four MAX runtime dylibs into `mojoboost/.dylibs`, rewrites the extension's
+four MAX runtime dylibs into `mojotrees/.dylibs`, rewrites the extension's
 rpath from the build machine's pixi environment to `@loader_path/.dylibs`, and
 re-signs everything, because `install_name_tool` invalidates a signature on
 arm64. That is a delocate-style self-contained wheel, and it is the reason an
@@ -132,7 +132,7 @@ match it. The easy path follows directly:
    `MACOSX_DEPLOYMENT_TARGET` in the environment `bindings/build.sh` runs in.
    **Whether the Mojo compiler honors it has not been tested.** This is the
    entire risk in the plan, and it is one command to find out.
-2. Confirm with `otool -l python/mojoboost/_mojoboost.so | grep -A 4
+2. Confirm with `otool -l python/mojotrees/_mojotrees.so | grep -A 4
    LC_BUILD_VERSION` that `minos` actually moved. If it did not, stop. Do not
    relabel a binary whose `minos` says otherwise: the wheel would install and
    then fail to load, which is worse than pip refusing it.
@@ -165,7 +165,7 @@ them apart.
    Xcode component and a separate installation from the Command Line Tools.
 3. **The build deciding whether to compile the GPU path in at all.** Mojo
    resolves `has_accelerator()` at compile time
-   (`src/mojoboost/device.mojo`), so this is decided on the build machine and
+   (`src/mojotrees/device.mojo`), so this is decided on the build machine and
    frozen into the artifact.
 
 The consequences, in order of how much trouble they cause:
@@ -186,8 +186,8 @@ The consequences, in order of how much trouble they cause:
   open a device, the failure arrives when the device is opened rather than when
   it is resolved. Today that gap is invisible, because `auto` never selects the
   GPU on its own, and `device="gpu"` raises rather than falling back. It becomes
-  reachable the moment `MOJOBOOST_AUTO_MIN_CELLS` is set on a redistributed
-  build. `MOJOBOOST_DISABLE_GPU=1` is the way to pin such a build to the CPU.
+  reachable the moment `MOJOTREES_AUTO_MIN_CELLS` is set on a redistributed
+  build. `MOJOTREES_DISABLE_GPU=1` is the way to pin such a build to the CPU.
 - **A wheel built where no accelerator was visible has no GPU path in it at
   all**, and `device="gpu"` raises everywhere it is installed, including on
   machines with a perfectly good GPU. This is why the provenance sidecar records
@@ -206,13 +206,13 @@ A Linux wheel builder exists. `packaging/linux/build_wheel_linux.sh` is a
 separate program from the macOS one rather than a port of it, which is what the
 platforms require: `packaging/build_wheel.sh` calls `install_name_tool` and
 `codesign`, neither of which has a Linux counterpart, and the ELF side instead
-walks the extension's `DT_NEEDED` closure, stages it into `mojoboost/.libs`, and
+walks the extension's `DT_NEEDED` closure, stages it into `mojotrees/.libs`, and
 sets an `$ORIGIN` RUNPATH. `.github/workflows/release-linux.yml` runs it on a
 runner per architecture, with a clean-install job in a container that is
 deliberately not the build image.
 
 What that builder does **not** do is decide the tag for you. It reads
-`MOJOBOOST_TAG_POLICY`, defaults to `plain`, and emits `linux_<arch>`. The
+`MOJOTREES_TAG_POLICY`, defaults to `plain`, and emits `linux_<arch>`. The
 workflow's `tag_policy` input defaults to `plain` for the same reason. This is
 the point of the split rows in the table above, and it was worth writing down
 because this document previously claimed the opposite in both directions: it
@@ -259,7 +259,7 @@ document read as more complete than it is.
 Neither of the other two is redistributable today, and the reason is worth
 writing down because it is the same reason the wheel needed a bundling step.
 `capi/build.sh` runs `mojo build --emit shared-lib` and stops there. The
-resulting `capi/libmojoboost.dylib` in a working copy carries `minos 26.0` and
+resulting `capi/libmojotrees.dylib` in a working copy carries `minos 26.0` and
 a single rpath pointing at an absolute path inside the build machine's pixi
 environment, so it resolves its MAX runtime dependencies only on the machine
 that built it, at that exact path. Copy it anywhere else and it fails to load.
@@ -276,7 +276,7 @@ top of the C ABI. An R package that links a library with an absolute rpath into
 somebody else's home directory is not distributable, so the bundling question
 has to be answered before the binding work is worth starting, not after. The
 same `validate_artifact.py` rules apply almost unchanged: R5b, R5c, R5d, and R6
-are exactly the checks a shippable `libmojoboost.dylib` would need to pass.
+are exactly the checks a shippable `libmojotrees.dylib` would need to pass.
 
 Out of scope until the wheel path is real, and recorded here so that scoping is
 a decision rather than an oversight.
@@ -325,8 +325,8 @@ mistake is, loudly, rather than somewhere convenient and quietly.
 | The cp314 wheel on Python 3.10 to 3.13 | Tag mismatch, so pip declines. The code would have run: this is a missing artifact, not an incompatibility, and the fix is to build a wheel per interpreter | `cp314` tag |
 | Any wheel on Python 3.9 or older | Tag mismatch, and `requires-python = ">=3.10"` refuses it too. Here the code genuinely would not run: the extension aborts on `Py_NewRef` | `cp3XX` tag, and the floor |
 | Any wheel on a free-threaded interpreter | Same tag mismatch. The ABI tags differ | `cp314` vs `cp314t` |
-| `pip install mojoboost` on Linux, today | "no matching distribution found". No sdist is published, so pip cannot fall back to a source build that would fail with a compiler error instead | no sdist |
-| `device="gpu"` with no accelerator in the build | Raises. It never falls back to the CPU silently | `src/mojoboost/device.mojo` |
+| `pip install mojotrees` on Linux, today | "no matching distribution found". No sdist is published, so pip cannot fall back to a source build that would fail with a compiler error instead | no sdist |
+| `device="gpu"` with no accelerator in the build | Raises. It never falls back to the CPU silently | `src/mojotrees/device.mojo` |
 | `device="gpu"` on a redistributed build whose host has no usable device | Raises when the device is opened, later than the resolve | `has_accelerator()` is compile time |
 | `device="gpu"` for multiclass | Raises. Multiclass grows one tree per class per round on the CPU | `device.mojo`, `fit_multiclass` |
 | `device="auto"` anywhere | Chooses the CPU. The size heuristic is disabled until a measured crossover exists | `AUTO_MIN_CELLS = -1` |
@@ -392,10 +392,10 @@ The macOS facts quoted above were read with `otool` and `ls` out of files
 already present in a working copy, all of them build products of earlier local
 runs:
 
-- `python/mojoboost/_mojoboost.so`: Mach-O arm64, `minos 26.0`, `sdk 26.5`
+- `python/mojotrees/_mojotrees.so`: Mach-O arm64, `minos 26.0`, `sdk 26.5`
 - the four bundled MAX dylibs in the pixi environment: `minos 11.0`
-- `capi/libmojoboost.dylib`: `minos 26.0`, one rpath, absolute, into the build
+- `capi/libmojotrees.dylib`: `minos 26.0`, one rpath, absolute, into the build
   machine's pixi environment
-- `python/dist/mojoboost-0.1.0-cp314-cp314-macosx_26_0_arm64.whl` exists
+- `python/dist/mojotrees-0.1.0-cp314-cp314-macosx_26_0_arm64.whl` exists
 
 The toolchain facts were read out of `pixi.lock`. Everything else is design.

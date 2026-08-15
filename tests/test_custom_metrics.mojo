@@ -1,4 +1,4 @@
-"""Tests for custom validation metrics (src/mojoboost/custom_metric.mojo).
+"""Tests for custom validation metrics (src/mojotrees/custom_metric.mojo).
 
 The equivalence anchor is `train_with_valid`: a custom metric that computes
 the objective's own loss must stop at the same round and produce the same
@@ -10,7 +10,7 @@ from std.math import exp, log
 from std.os import remove
 from std.testing import assert_equal, assert_raises, assert_true, TestSuite
 
-from mojoboost import (
+from mojotrees import (
     BINARY_LOGISTIC,
     SQUARED_ERROR,
     BinnedMatrix,
@@ -22,7 +22,7 @@ from mojoboost import (
     train_custom_with_valid,
     train_with_valid,
 )
-from mojoboost.custom_metric import (
+from mojotrees.custom_metric import (
     CustomMetric,
     MetricSuite,
     RawValidSet,
@@ -37,8 +37,8 @@ from mojoboost.custom_metric import (
     train_with_metric,
     train_with_metrics,
 )
-from mojoboost.ranking import groups_from_counts, ndcg
-from mojoboost.objective import (
+from mojotrees.ranking import groups_from_counts, ndcg
+from mojotrees.objective import (
     mean_label,
     squared_error_grad_hess,
     squared_error_loss,

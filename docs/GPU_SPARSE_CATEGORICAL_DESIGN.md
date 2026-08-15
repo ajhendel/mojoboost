@@ -1,8 +1,8 @@
 # Sparse and categorical GPU primitives
 
 This document specifies the device-side sparse and categorical primitives in
-`src/mojoboost/gpu_sparse_layout.mojo`, `src/mojoboost/gpu_sparse.mojo`, and
-`src/mojoboost/gpu_categorical.mojo`.
+`src/mojotrees/gpu_sparse_layout.mojo`, `src/mojotrees/gpu_sparse.mojo`, and
+`src/mojotrees/gpu_categorical.mojo`.
 
 **Status: primitives only.** Nothing here is wired into training. There is no
 `device="gpu"` path for sparse input, no automatic switch away from the dense
@@ -92,7 +92,7 @@ Unchanged from `sparse.mojo`, because the device holds the same numbers.
   `default_left`. Absence is not missingness and there is no way to express
   missingness by leaving an entry out.
 
-`zero_as_missing` is not implemented in mojoboost and no argument accepts it.
+`zero_as_missing` is not implemented in mojotrees and no argument accepts it.
 
 ## 4. The histogram
 

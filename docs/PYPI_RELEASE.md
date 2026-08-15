@@ -1,24 +1,40 @@
-# Publishing mojoboost to PyPI
+# Publishing mojotrees to PyPI
 
-The exact steps to claim the name `mojoboost`, publish an artifact, and
+The exact steps to claim the name `mojotrees`, publish an artifact, and
 undo a bad one. Account enrollment and approval steps require the owner;
 repository preparation and read-only verification can be automated.
 
 ## Status
 
-As of 2026-08-14, the name `mojoboost` is claimed on both indexes by this
-repository through trusted publishing, and the whole pipeline in this
-document has been exercised end to end.
+As of 2026-08-15, the pipeline in this document has been exercised end to
+end, but under the project's FORMER name. The name `mojotrees` is NOT yet
+claimed on either index. Sections 3 and 4 have to be run again under the
+new name, starting from the pending publishers described below.
 
 The GitHub environments `testpypi` and `pypi` exist and are restricted to
 the `main` branch. `pypi` requires a review by the owner before its publish
-job runs; `testpypi` does not. Both trusted publishers are configured and
-have each published once, so no API token exists anywhere and none is
+job runs; `testpypi` does not. No API token exists anywhere and none is
 needed.
+
+THE 2026-08-15 RENAME RESET THE PUBLISHER STATE. The trusted publishers
+that had each published once belong to the `mojoboost` projects and are
+scoped to the literal path `mojoboost-ml/mojoboost`, which no longer
+exists; trusted-publisher matching is on literal owner and repository
+strings, and GitHub's redirects do not apply to it. Those publishers are
+dead. `mojotrees` was registered as a PENDING publisher on both indexes
+(owner `mojotrees`, repository `mojotrees`, workflow
+`release-provenance.yml`, environment `pypi` on PyPI and `testpypi` on
+TestPyPI). A pending publisher is invisible from outside the account and
+becomes real only on first upload, so the section 3 TestPyPI run is the
+first thing that can prove it works.
 
 `mojoboost 0.1.0.dev1` is live on TestPyPI (the section 3 rehearsal, tag
 `v0.1.0.dev1`) and `mojoboost 0.1.0a1` is live on PyPI (the pre-release
-name claim, tag `v0.1.0a1`). Both were built by
+name claim, tag `v0.1.0a1`). Those are the FORMER name and must not be
+deleted: a deleted PyPI name is reclaimable by anyone, and
+`pip install mojoboost` is a live code path, so holding the old project
+is the squat. Neither tag may be reused or moved, because each marks the
+commit that produced a published artifact. Both were built by
 `.github/workflows/release-provenance.yml` on the self-hosted
 Apple-silicon Metal runner, with the SBOM, provenance sidecar, and GitHub
 attestations attached, and both installs were verified from a clean
@@ -27,9 +43,12 @@ CPython 3.14 venv against the real index followed by
 bugs (the provenance sidecar path in the SBOM job, and a pypi-publish pin
 too old for Metadata-Version 2.4) before any real version was spent.
 
-The version in the repository is back at 0.1.0, which has not been
-published. The pre-release version commits were reverted per section 3;
-the tags stay.
+The version in the repository is now 0.1.0a2, the first version to be
+published under the `mojotrees` name. `0.1.0a1` was NOT reused: tag
+`v0.1.0a1` already marks the commit that produced the published
+`mojoboost` wheel, and pointing it at a different artifact would make the
+provenance record lie. Per section 3 the version commit is reverted back
+to 0.1.0 after the release lands; the tags stay.
 
 ## What this document does not decide
 
@@ -97,7 +116,7 @@ that publisher creates the project and makes it yours.
 
 Be clear about what this buys. A pending publisher does not hold the name
 against anyone else. Until the first upload lands, another account can
-still take `mojoboost` and your pending publisher becomes inert. What it
+still take `mojotrees` and your pending publisher becomes inert. What it
 buys is that when you do claim the name, you claim it through OIDC with no
 token in existence, and there is never a window in which a long-lived
 credential could have published as you.
@@ -121,9 +140,9 @@ Do this on **TestPyPI first**, then PyPI, with identical values.
 
    | Field | Value |
    |---|---|
-   | PyPI Project Name | `mojoboost` |
-   | Owner | `mojoboost-ml` |
-   | Repository name | `mojoboost` |
+   | PyPI Project Name | `mojotrees` |
+   | Owner | `mojotrees` |
+   | Repository name | `mojotrees` |
    | Workflow name | `release-provenance.yml` |
    | Environment name | `pypi` on PyPI, `testpypi` on TestPyPI |
 
@@ -165,9 +184,9 @@ network:
 
 ```
 pixi run -e pkg python -m twine check python/dist/*.whl
-unzip -p python/dist/mojoboost-*.whl \
-    'mojoboost-*.dist-info/METADATA' | head -40
-unzip -l python/dist/mojoboost-*.whl
+unzip -p python/dist/mojotrees-*.whl \
+    'mojotrees-*.dist-info/METADATA' | head -40
+unzip -l python/dist/mojotrees-*.whl
 ```
 
 What to look for, in order:
@@ -177,11 +196,11 @@ What to look for, in order:
   rejects all three at upload, and finding out then means burning a
   version number.
 - The filename is a tag that appears in `packaging/matrix/platform_matrix.toml`.
-  Today the only one is `mojoboost-0.1.0-cp314-cp314-macosx_26_0_arm64.whl`.
-- `unzip -l` lists `mojoboost/__init__.py`, every other module in
-  `python/mojoboost/`, `mojoboost/_mojoboost.so`, four
-  `mojoboost/.dylibs/*.dylib`, and
-  `mojoboost-*.dist-info/licenses/LICENSE`. Nothing else. No `tests/`, no
+  Today the only one is `mojotrees-0.1.0-cp314-cp314-macosx_26_0_arm64.whl`.
+- `unzip -l` lists `mojotrees/__init__.py`, every other module in
+  `python/mojotrees/`, `mojotrees/_mojotrees.so`, four
+  `mojotrees/.dylibs/*.dylib`, and
+  `mojotrees-*.dist-info/licenses/LICENSE`. Nothing else. No `tests/`, no
   `__pycache__`, no `.pytest_cache`. Check C9 of
   `packaging/macos/inspect_wheel.py` is the automated form of this.
 - The METADATA `Requires-Dist` lines are extras only. A bare
@@ -191,13 +210,13 @@ What to look for, in order:
 
 Confirm the deployment target in the tag matches the binary. The tag comes
 from `DEFAULT_MACOS_TARGET` in `python/setup.py`, or from
-`MOJOBOOST_MACOS_DEPLOYMENT_TARGET` when it is set, and neither is a
+`MOJOTREES_MACOS_DEPLOYMENT_TARGET` when it is set, and neither is a
 measurement of anything. Check C1 of `packaging/macos/inspect_wheel.py` is
 what compares the two, and `packaging/macos/build_release_wheel.sh` runs
 it. By hand:
 
 ```
-otool -l python/mojoboost/_mojoboost.so | grep -A4 LC_BUILD_VERSION
+otool -l python/mojotrees/_mojotrees.so | grep -A4 LC_BUILD_VERSION
 ```
 
 The `minos` there must equal the version in the wheel filename. If they
@@ -223,7 +242,7 @@ even after deletion, so burn dev versions freely and never a real one.
 
 1. Set the version to `0.1.0.dev1` in the three locations of
    compatibility policy section 1.1 (`pixi.toml`, `python/pyproject.toml`,
-   `python/mojoboost/__init__.py`) and in
+   `python/mojotrees/__init__.py`) and in
    `packaging/matrix/platform_matrix.toml`, whose `version` and `filename`
    rows must agree with the wheel or `validate_artifact.py` rule R1b fails
    the build. Run `python3 packaging/matrix/validate_matrix.py` to check.
@@ -240,14 +259,14 @@ even after deletion, so burn dev versions freely and never a real one.
 4. Approve the `testpypi` environment if it is gated.
 5. Verify against the installed package, never against the source tree.
    Run this from a directory that is not the checkout, so that
-   `import mojoboost` cannot resolve to `python/mojoboost/`:
+   `import mojotrees` cannot resolve to `python/mojotrees/`:
 
    ```
    REPO=$PWD
    cd /tmp && python -m venv tpv && tpv/bin/pip install \
        --index-url https://test.pypi.org/simple/ \
        --extra-index-url https://pypi.org/simple/ \
-       "mojoboost==0.1.0.dev1"
+       "mojotrees==0.1.0.dev1"
    tpv/bin/python "$REPO/packaging/smoke_test.py"
    ```
 
@@ -265,17 +284,17 @@ TestPyPI upload as disposable.
 This step creates the PyPI project and permanently associates the name
 with the account. It is deliberately not the production release.
 
-Publish a **pre-release**: `0.1.0a1`. pip will not install a pre-release
+Publish a **pre-release**: `0.1.0a2`. pip will not install a pre-release
 unless the user passes `--pre` or pins the exact version, so the name is
 claimed, the trusted publisher stops being pending, the provenance chain
 is proved end to end on the real index, and nobody who types
-`pip install mojoboost` gets an alpha they did not ask for.
+`pip install mojotrees` gets an alpha they did not ask for.
 
 1. Set the four version locations (the three of compatibility policy
    section 1.1, plus `packaging/matrix/platform_matrix.toml` and its
-   `filename` rows) to `0.1.0a1`. Commit to `main` and tag
-   `v0.1.0a1`. `packaging/macos/build_release_wheel.sh` refuses to build
-   an untagged commit unless `MOJOBOOST_ALLOW_UNTAGGED=1` is set, and a
+   `filename` rows) to `0.1.0a2`. Commit to `main` and tag
+   `v0.1.0a2`. `packaging/macos/build_release_wheel.sh` refuses to build
+   an untagged commit unless `MOJOTREES_ALLOW_UNTAGGED=1` is set, and a
    published artifact should never be built with that set.
 2. Run `Release provenance` with `publish` set to `pypi`. The tag does not
    trigger it. There is deliberately no `push` or `release` trigger on
@@ -285,7 +304,7 @@ is proved end to end on the real index, and nobody who types
 
    ```
    REPO=$PWD
-   cd /tmp && python -m venv pv && pv/bin/pip install "mojoboost==0.1.0a1"
+   cd /tmp && python -m venv pv && pv/bin/pip install "mojotrees==0.1.0a2"
    pv/bin/python "$REPO/packaging/smoke_test.py"
    ```
 
@@ -297,7 +316,7 @@ is proved end to end on the real index, and nobody who types
    account.
 7. Restore the version in the repository to what it was.
 
-After this, `pip install mojoboost` resolves to nothing installable, which
+After this, `pip install mojotrees` resolves to nothing installable, which
 is the correct state until there is a release worth installing.
 
 ## 5. The production release
@@ -384,9 +403,9 @@ Verify what is verifiable, from a clean directory:
 
 ```
 mkdir -p /tmp/verify && cd /tmp/verify
-pip download --no-deps --only-binary :all: "mojoboost==X.Y.Z"
+pip download --no-deps --only-binary :all: "mojotrees==X.Y.Z"
 pip download --no-deps --only-binary :all: \
-    --index-url https://test.pypi.org/simple/ "mojoboost==X.Y.Z"
+    --index-url https://test.pypi.org/simple/ "mojotrees==X.Y.Z"
 shasum -a 256 *.whl
 ```
 
@@ -397,7 +416,7 @@ different build and is not expected to match, per the caveat above. PyPI
 also publishes the digest it recorded:
 
 ```
-curl -s https://pypi.org/pypi/mojoboost/X.Y.Z/json \
+curl -s https://pypi.org/pypi/mojotrees/X.Y.Z/json \
     | python3 -c 'import json,sys; [print(f["filename"], f["digests"]["sha256"]) for f in json.load(sys.stdin)["urls"]]'
 ```
 
@@ -409,7 +428,7 @@ yanked rather than investigated in place.
 Then check provenance, which is the stronger claim:
 
 ```
-bash packaging/security/verify_release.sh mojoboost-X.Y.Z-*.whl
+bash packaging/security/verify_release.sh mojotrees-X.Y.Z-*.whl
 ```
 
 Put the digests in the release note. Together with the attestation they
@@ -521,7 +540,7 @@ inconvenience to route around.
 
 ## If the name is already taken
 
-Check before doing any of this. If `mojoboost` is registered by someone
+Check before doing any of this. If `mojotrees` is registered by someone
 else and unused, PyPI's name-retention policy (PEP 541) is the only route
 and it is slow. Plan on the alternative name rather than on winning the
 dispute, and decide the name before publishing anything, because the

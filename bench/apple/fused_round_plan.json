@@ -1,15 +1,15 @@
 {
   "plan_version": "1.0.0",
   "parent_protocol_version": "1.0.0",
-  "title": "mojoboost fused round-start measurement plan",
-  "description": "A plan, not a result. It records what would have to be measured, on what hardware, with what instrument, before any of the three round-start designs in src/mojoboost/gpu_fused_round.mojo may be called faster or slower than another. Every number under cost_model is an arithmetic prediction from the model in that module, computed by hand from its formulas and carrying no measurement whatsoever. A reader who wants a timing takes this file as the recipe and writes a record against bench/apple/schema.json; this file is never the record.",
+  "title": "mojotrees fused round-start measurement plan",
+  "description": "A plan, not a result. It records what would have to be measured, on what hardware, with what instrument, before any of the three round-start designs in src/mojotrees/gpu_fused_round.mojo may be called faster or slower than another. Every number under cost_model is an arithmetic prediction from the model in that module, computed by hand from its formulas and carrying no measurement whatsoever. A reader who wants a timing takes this file as the recipe and writes a record against bench/apple/schema.json; this file is never the record.",
   "created_utc": "2026-08-14T00:00:00Z",
   "is_plan": true,
   "measurements": null,
   "measurements_null_reason": "No benchmark, profiler, build, or training run was executed for this lane. The lane was static reasoning and isolated implementation only, and a plan that carried a number it did not measure would be indistinguishable from a result.",
   "owner_files": [
-    "src/mojoboost/gpu_fused_round.mojo",
-    "src/mojoboost/gpu_gradient_stream.mojo",
+    "src/mojotrees/gpu_fused_round.mojo",
+    "src/mojotrees/gpu_gradient_stream.mojo",
     "bench/apple/fused_round_plan.json",
     "handoffs/algorithm_23_fused_round.md"
   ],
@@ -19,10 +19,10 @@
     "record_schema": "bench/apple/schema.json",
     "handoff": "handoffs/algorithm_23_fused_round.md",
     "code_under_test": [
-      "src/mojoboost/gpu_objectives_native.mojo",
-      "src/mojoboost/histogram_gpu.mojo",
-      "src/mojoboost/gpu_active_rows.mojo",
-      "src/mojoboost/train_gpu.mojo"
+      "src/mojotrees/gpu_objectives_native.mojo",
+      "src/mojotrees/histogram_gpu.mojo",
+      "src/mojotrees/gpu_active_rows.mojo",
+      "src/mojotrees/train_gpu.mojo"
     ]
   },
 
@@ -73,7 +73,7 @@
       "structural_argument": "GpuObjectiveState.magnitude_sums performs the kernel, the copy, and the synchronization in one call, which forces the round's device-to-host wait to happen before anything else in the round is enqueued. The reduction order, the block count, the shared-memory tree, and the host-side Float64 finish are unchanged, so the partials, the totals, the scales, and every histogram derived from them are bit-identical.",
       "evidence_required": [
         "A Metal System Trace of one round showing the GPU idle interval between the magnitude kernel and the first root histogram kernel, before and after the seeding launch is moved ahead of the wait. The win is bounded by that interval and is zero if it is already zero.",
-        "MOJOBOOST_GPU_TRACE=1 PHASE_SYNC totals per round, before and after, on the same machine in the same thermal state."
+        "MOJOTREES_GPU_TRACE=1 PHASE_SYNC totals per round, before and after, on the same machine in the same thermal state."
       ]
     },
     {
@@ -112,7 +112,7 @@
       "statement": "Store the two derivatives as one interleaved plane so a row's pair is gh[2r] and gh[2r+1], eight aligned bytes inside one cache line, instead of two four-byte loads from two planes n_rows apart.",
       "structural_argument": "Below the root the row indices are a permutation, so the derivative reads are a gather: a warp of 32 threads touches up to 32 cache lines in the gradient plane and 32 more in the hessian plane. Interleaved, each thread's pair is inside one line, so the same warp touches 32 lines instead of 64. That halving holds whether the accesses hit or miss: on a miss it halves the lines fetched from memory, on a hit it halves the lookups. The root is the one node where it is neutral rather than a win, since the unbagged root's permutation is the identity and both layouts coalesce.",
       "correction": "An earlier draft of this plan said the case rested entirely on a memory-bandwidth counter reading. That was overstated. The transaction count halves unconditionally; what the counter decides is how much wall clock that is worth at a given shape, which is a different and smaller question.",
-      "implementation_note": "Built additively in gpu_gradient_stream.mojo rather than by editing the histogram kernels in gpu_active_rows.mojo, which belong to another lane and were mid-flight. The two accumulation kernels are those kernels with exactly two lines changed, the two derivative loads; the reduction and zeroing kernels are imported and reused rather than copied. Selected by MOJOBOOST_GPU_GRAD_LAYOUT=interleaved, defaulting to the shipped split layout, so both layouts are runnable from one build, which is what comparing them requires.",
+      "implementation_note": "Built additively in gpu_gradient_stream.mojo rather than by editing the histogram kernels in gpu_active_rows.mojo, which belong to another lane and were mid-flight. The two accumulation kernels are those kernels with exactly two lines changed, the two derivative loads; the reduction and zeroing kernels are imported and reused rather than copied. Selected by MOJOTREES_GPU_GRAD_LAYOUT=interleaved, defaulting to the shipped split layout, so both layouts are runnable from one build, which is what comparing them requires.",
       "costs": "8 * n_rows bytes of device memory for the plane, and one 16 * n_rows byte pack pass per round to fill it. The pack is paid once per round against a gather paid once per (node, feature); at fifty features and six histogram passes per tree it is under one percent of what it reorganizes. It disappears entirely if the derivative kernels are taught to write pairs directly, which is a change to gpu_objectives_native.mojo.",
       "evidence_required": [
         "Bit-identity of the histograms built both ways on the same gradients. The pack is a pure copy and the accumulation is unchanged, so any difference at all is a defect, not a precision result. This is the first thing to check and it needs no timing.",
@@ -124,7 +124,7 @@
   ],
 
   "cost_model": {
-    "source": "src/mojoboost/gpu_fused_round.mojo, materialized_round_traffic / streamed_round_traffic / fused_round_traffic",
+    "source": "src/mojotrees/gpu_fused_round.mojo, materialized_round_traffic / streamed_round_traffic / fused_round_traffic",
     "units": "bytes issued by kernels, reads plus writes, for one tree's round start plus its root histogram",
     "assumptions": [
       "No cache is modeled. The question fusion asks is whether re-reading the derivative planes once per feature costs anything, and a model that assumed those reads were served from cache would answer the question by assumption. Read the numbers as an upper bound and as a ratio between designs.",
@@ -283,8 +283,8 @@
 
   "instrumentation": {
     "phase_timers": {
-      "env": "MOJOBOOST_GPU_TRACE=1",
-      "source": "src/mojoboost/gpu_runtime.mojo",
+      "env": "MOJOTREES_GPU_TRACE=1",
+      "source": "src/mojotrees/gpu_runtime.mojo",
       "phases_of_interest": ["PHASE_KERNEL", "PHASE_SYNC", "PHASE_TRANSFER"],
       "what_it_answers": "How much of a round is spent waiting rather than computing, which is the only quantity the deferred-magnitude split can move.",
       "what_it_cannot_answer": "Bytes moved. It counts host-observed intervals, not memory traffic."
@@ -299,9 +299,9 @@
       "why_it_is_required": "Every design comparison in this file that is not settled structurally reduces to what fraction of the derivative-plane re-reads reach memory. Nothing in the source can answer that."
     },
     "environment_switches": [
-      "MOJOBOOST_GPU_OBJECTIVE=host|device, to run the same configuration on both gradient sources",
-      "MOJOBOOST_GPU_HIST_STRATEGY=atomic|tiled, so a comparison is not silently made across two accumulation strategies",
-      "MOJOBOOST_GPU_BLOCK_THREADS and MOJOBOOST_GPU_ROW_TILE, pinned rather than derived, so two runs share a launch geometry"
+      "MOJOTREES_GPU_OBJECTIVE=host|device, to run the same configuration on both gradient sources",
+      "MOJOTREES_GPU_HIST_STRATEGY=atomic|tiled, so a comparison is not silently made across two accumulation strategies",
+      "MOJOTREES_GPU_BLOCK_THREADS and MOJOTREES_GPU_ROW_TILE, pinned rather than derived, so two runs share a launch geometry"
     ]
   },
 
@@ -331,7 +331,7 @@
     },
     {
       "claim": "The interleaved derivative plane is correct.",
-      "decided_by": "Bit-identity of histograms built both ways from the same gradients, on the same build, switched with MOJOBOOST_GPU_GRAD_LAYOUT.",
+      "decided_by": "Bit-identity of histograms built both ways from the same gradients, on the same build, switched with MOJOTREES_GPU_GRAD_LAYOUT.",
       "threshold": "Any difference is a defect. The pack is a pure Float32 copy and the accumulation order, rounding, and atomics are unchanged, so there is no tolerance to allow here."
     },
     {

@@ -15,18 +15,18 @@ from std.os import setenv
 from std.sys import has_accelerator
 from std.testing import assert_equal, assert_true, TestSuite
 
-from mojoboost.bagging import BaggingParams
-from mojoboost.binning import BinnedMatrix
-from mojoboost.boosting import SQUARED_ERROR, BoosterParams
-from mojoboost.histogram import (
+from mojotrees.bagging import BaggingParams
+from mojotrees.binning import BinnedMatrix
+from mojotrees.boosting import SQUARED_ERROR, BoosterParams
+from mojotrees.histogram import (
     Histogram,
     build_histogram_subset_into,
     build_histogram_subset_replica_into,
 )
-from mojoboost.histogram_gpu import GpuHistogramBuilder
-from mojoboost.hybrid_leaf_scheduler import REPLICA_VERIFIED
-from mojoboost.train_gpu import grow_tree_gpu, train_gpu
-from mojoboost.tree import TreeParams
+from mojotrees.histogram_gpu import GpuHistogramBuilder
+from mojotrees.hybrid_leaf_scheduler import REPLICA_VERIFIED
+from mojotrees.train_gpu import grow_tree_gpu, train_gpu
+from mojotrees.tree import TreeParams
 
 
 def _splitmix64(state: UInt64) -> UInt64:
@@ -218,21 +218,21 @@ def test_hybrid_replica_training_is_bit_identical() raises:
         # names, so these fits actually exercise the host builds.
         var bagging = BaggingParams(0.8, 1, 7)
 
-        _ = setenv("MOJOBOOST_HYBRID_LEAVES", "")
-        _ = setenv("MOJOBOOST_HYBRID_COSTS", "")
+        _ = setenv("MOJOTREES_HYBRID_LEAVES", "")
+        _ = setenv("MOJOTREES_HYBRID_COSTS", "")
         var baseline = train_gpu(
             data, target, SQUARED_ERROR, params, bagging=bagging
         )
 
-        _ = setenv("MOJOBOOST_HYBRID_LEAVES", "replica")
-        _ = setenv("MOJOBOOST_HYBRID_COSTS", "apple-m4")
+        _ = setenv("MOJOTREES_HYBRID_LEAVES", "replica")
+        _ = setenv("MOJOTREES_HYBRID_COSTS", "apple-m4")
         var hybrid = train_gpu(
             data, target, SQUARED_ERROR, params, bagging=bagging
         )
 
         # Mirror mode must also change nothing: the device's histogram is
         # the one consumed by construction.
-        _ = setenv("MOJOBOOST_HYBRID_LEAVES", "mirror")
+        _ = setenv("MOJOTREES_HYBRID_LEAVES", "mirror")
         var mirrored = train_gpu(
             data, target, SQUARED_ERROR, params, bagging=bagging
         )
@@ -241,7 +241,7 @@ def test_hybrid_replica_training_is_bit_identical() raises:
         # a mirror comparison ran, passed, and flipped the builder to
         # verified. Checked on a directly grown tree so the builder is
         # observable.
-        _ = setenv("MOJOBOOST_HYBRID_LEAVES", "replica")
+        _ = setenv("MOJOTREES_HYBRID_LEAVES", "replica")
         var builder = GpuHistogramBuilder(data)
         var grad = List[Float64](capacity=n_rows)
         var hess = List[Float64](capacity=n_rows)
@@ -258,7 +258,7 @@ def test_hybrid_replica_training_is_bit_identical() raises:
         # tree, node for node, as the pure-device grower's.
         builder.begin_tree()
         var t_hybrid = grow_tree_gpu(builder, params.tree, [], 1, data=data)
-        _ = setenv("MOJOBOOST_HYBRID_LEAVES", "")
+        _ = setenv("MOJOTREES_HYBRID_LEAVES", "")
         builder.begin_tree()
         var t_plain = grow_tree_gpu(builder, params.tree, [], 1)
         assert_equal(t_hybrid.n_leaves, t_plain.n_leaves)
@@ -268,8 +268,8 @@ def test_hybrid_replica_training_is_bit_identical() raises:
             assert_equal(t_hybrid.left[i], t_plain.left[i])
             assert_equal(t_hybrid.right[i], t_plain.right[i])
 
-        _ = setenv("MOJOBOOST_HYBRID_LEAVES", "")
-        _ = setenv("MOJOBOOST_HYBRID_COSTS", "")
+        _ = setenv("MOJOTREES_HYBRID_LEAVES", "")
+        _ = setenv("MOJOTREES_HYBRID_COSTS", "")
 
         for r in range(n_rows):
             var pb = baseline.predict_raw_row(data, r)

@@ -17,9 +17,9 @@ Three kinds of check:
 from std.os import remove, setenv
 from std.testing import assert_equal, assert_true, assert_false, TestSuite
 
-from mojoboost.bagging import BaggingParams
-from mojoboost.binning import BinMapper, fit_bins
-from mojoboost.boosting import (
+from mojotrees.bagging import BaggingParams
+from mojotrees.binning import BinMapper, fit_bins
+from mojotrees.boosting import (
     BINARY_LOGISTIC,
     L1,
     MAPE,
@@ -32,37 +32,37 @@ from mojoboost.boosting import (
     train_multiclass_with_valid,
     train_with_valid,
 )
-from mojoboost.boosting_sparse import (
+from mojotrees.boosting_sparse import (
     train_multiclass_sparse,
     train_sparse,
     train_sparse_with_valid,
 )
-from mojoboost.histogram import build_histogram, build_histogram_subset
-from mojoboost.histogram_sparse import (
+from mojotrees.histogram import build_histogram, build_histogram_subset
+from mojotrees.histogram_sparse import (
     SparseEntryOrder,
     SparseNodeEntries,
     build_histogram_sparse,
     build_histogram_sparse_subset,
     sum_all,
 )
-from mojoboost.model import fit
-from mojoboost.model_sparse import (
+from mojotrees.model import fit
+from mojotrees.model_sparse import (
     fit_csc,
     fit_multiclass_csc,
     predict_csr,
     predict_proba_csr,
     predict_raw_csr,
 )
-from mojoboost.serialize import load_model, save_model
-from mojoboost.sparse import (
+from mojotrees.serialize import load_model, save_model
+from mojotrees.sparse import (
     CscMatrix,
     CsrMatrix,
     csc_from_dense,
     fit_bins_csc,
     transform_csc,
 )
-from mojoboost.tree import Tree, TreeParams, grow_tree
-from mojoboost.tree_sparse import grow_tree_sparse, predict_row_sparse
+from mojotrees.tree import Tree, TreeParams, grow_tree
+from mojotrees.tree_sparse import grow_tree_sparse, predict_row_sparse
 
 
 comptime _TMP_PATH = "./.test_sparse_roundtrip.tmp"
@@ -1057,7 +1057,7 @@ def test_worker_settings_do_not_change_results() raises:
     var grad = _grads(n_rows, UInt64(2_100_000))
     var hess = _hessians(n_rows, UInt64(2_200_000))
 
-    _ = setenv("MOJOBOOST_NUM_WORKERS", "1")
+    _ = setenv("MOJOTREES_NUM_WORKERS", "1")
     var mapper = fit_bins_csc(csc, 16)
     var sparse = transform_csc(mapper, csc)
     var serial_hist = build_histogram_sparse(sparse, grad, hess)
@@ -1065,8 +1065,8 @@ def test_worker_settings_do_not_change_results() raises:
     var serial_model = fit_csc(csc, target, SQUARED_ERROR, params, 16)
 
     for workers in ["2", "8", ""]:
-        _ = setenv("MOJOBOOST_NUM_WORKERS", workers)
-        _ = setenv("MOJOBOOST_PARALLEL_MIN_OPS", "1")
+        _ = setenv("MOJOTREES_NUM_WORKERS", workers)
+        _ = setenv("MOJOTREES_PARALLEL_MIN_OPS", "1")
         var m = fit_bins_csc(csc, 16)
         for i in range(len(m.edges)):
             assert_equal(m.edges[i], mapper.edges[i])
@@ -1087,8 +1087,8 @@ def test_worker_settings_do_not_change_results() raises:
             var row = _row(dense, n_rows, n_features, r)
             assert_equal(model.predict(row), serial_model.predict(row))
 
-    _ = setenv("MOJOBOOST_NUM_WORKERS", "")
-    _ = setenv("MOJOBOOST_PARALLEL_MIN_OPS", "")
+    _ = setenv("MOJOTREES_NUM_WORKERS", "")
+    _ = setenv("MOJOTREES_PARALLEL_MIN_OPS", "")
 
 
 def main() raises:

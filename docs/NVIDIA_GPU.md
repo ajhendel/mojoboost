@@ -5,7 +5,7 @@ Written: 2026-08-14
 **No NVIDIA device has ever executed a line of this code.** Not in CI, not on
 a workstation, not once. `docs/GPU_VALIDATION.md` is the record and every
 CUDA row in it reads "not run". Nothing in this file is a claim about how
-mojoboost behaves or performs on NVIDIA hardware.
+mojotrees behaves or performs on NVIDIA hardware.
 
 What this file is: how the portable contract in `docs/GPU_PORTABILITY.md`
 reads on CUDA, what to look at first when someone finally runs it, and which
@@ -23,7 +23,7 @@ That level does not block training. The portable kernels compile for
 whatever device MAX opens, and a CUDA device will run them. What it blocks
 is specialization, through
 `gpu_portability.require_specializations_allowed`, and the refusal names
-`MOJOBOOST_GPU_BACKEND_UNVALIDATED=1` as the acknowledged override.
+`MOJOTREES_GPU_BACKEND_UNVALIDATED=1` as the acknowledged override.
 
 ## What the contract says here
 
@@ -63,7 +63,7 @@ profiler rather than a prediction.
    `derive_tiling` already prefers `STRATEGY_TILED` whenever there is more
    than one tile to reduce, which is the contention-avoiding path, so the
    atomic strategy is reached mainly on small nodes. Confirm that is what
-   happens rather than assuming it: `MOJOBOOST_GPU_HIST_STRATEGY=atomic` and
+   happens rather than assuming it: `MOJOTREES_GPU_HIST_STRATEGY=atomic` and
    `=tiled` force either path for a sweep, and both must produce the
    identical integers.
 

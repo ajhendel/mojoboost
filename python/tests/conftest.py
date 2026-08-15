@@ -18,7 +18,7 @@ import sys
 import pytest
 
 _PYTHON_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if os.path.isdir(os.path.join(_PYTHON_DIR, "mojoboost")):
+if os.path.isdir(os.path.join(_PYTHON_DIR, "mojotrees")):
     sys.path.insert(0, _PYTHON_DIR)
 
 np = pytest.importorskip("numpy")
@@ -67,23 +67,23 @@ def multiclass():
 
 @pytest.fixture(scope="session")
 def fitted_regressor(regression):
-    from mojoboost import MojoBoostRegressor
+    from mojotrees import MojoTreesRegressor
 
     X, y = regression
-    return MojoBoostRegressor(n_estimators=20).fit(X, y)
+    return MojoTreesRegressor(n_estimators=20).fit(X, y)
 
 
 @pytest.fixture(scope="session")
 def fitted_binary(binary):
-    from mojoboost import MojoBoostClassifier
+    from mojotrees import MojoTreesClassifier
 
     X, y = binary
-    return MojoBoostClassifier(n_estimators=20).fit(X, y)
+    return MojoTreesClassifier(n_estimators=20).fit(X, y)
 
 
 @pytest.fixture(scope="session")
 def fitted_multiclass(multiclass):
-    from mojoboost import MojoBoostClassifier
+    from mojotrees import MojoTreesClassifier
 
     X, y = multiclass
-    return MojoBoostClassifier(n_estimators=15).fit(X, y)
+    return MojoTreesClassifier(n_estimators=15).fit(X, y)

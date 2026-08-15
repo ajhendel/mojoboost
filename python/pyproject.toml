@@ -1,4 +1,4 @@
-# Distribution metadata for the `mojoboost` package on PyPI.
+# Distribution metadata for the `mojotrees` package on PyPI.
 #
 # Everything a release publishes about itself is declared here. setup.py
 # holds only the two facts PEP 621 cannot express (the wheel is not pure
@@ -12,7 +12,7 @@
 #      optional dependency below is backed by something in the repository:
 #      packaging/matrix/platform_matrix.toml for what is installable where,
 #      docs/COMPATIBILITY_POLICY.md for what a release promises, and a
-#      guarded import in python/mojoboost/ for every extra.
+#      guarded import in python/mojotrees/ for every extra.
 #   2. The release procedure that consumes this file is
 #      docs/PYPI_RELEASE.md. A change here that changes what gets
 #      published is a change there too.
@@ -26,13 +26,13 @@ build-backend = "setuptools.build_meta"
 # packaging/build_wheel.sh runs in.
 
 [project]
-name = "mojoboost"
+name = "mojotrees"
 # Version lives in three places that must agree, per section 1.1 of
 # docs/COMPATIBILITY_POLICY.md: pixi.toml, this file, and
-# python/mojoboost/__init__.py. Release gate item B1 checks that they do.
-# Deliberately not made dynamic from `mojoboost.__version__`: that would
+# python/mojotrees/__init__.py. Release gate item B1 checks that they do.
+# Deliberately not made dynamic from `mojotrees.__version__`: that would
 # delete this row and contradict a policy this file does not own.
-version = "0.1.0"
+version = "0.1.0a2"
 description = "Gradient boosted decision trees in Mojo, with a scikit-learn style Python API"
 readme = "README.md"
 requires-python = ">=3.14"
@@ -113,7 +113,7 @@ classifiers = [
 #                             alongside the `license` expression above,
 #                             and setuptools>=77 rejects the combination.
 #   Typing :: Typed           there is no py.typed marker and no .pyi
-#                             stub in python/mojoboost/.
+#                             stub in python/mojotrees/.
 #   Environment :: GPU ...    no NVIDIA or AMD device has ever run this
 #                             code. See docs/GPU_VALIDATION.md.
 #   Operating System ::
@@ -127,8 +127,8 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-# Every extra corresponds to an import that python/mojoboost/ guards and
-# degrades from. None is required to import mojoboost or to fit a model.
+# Every extra corresponds to an import that python/mojotrees/ guards and
+# degrades from. None is required to import mojotrees or to fit a model.
 numpy = ["numpy"]
 # Categorical columns carried as labels, and inspection.py's frame output.
 pandas = ["pandas"]
@@ -136,35 +136,35 @@ pandas = ["pandas"]
 # imports nothing from scipy; scipy is what a caller uses to build the
 # matrix in the first place.
 scipy = ["scipy"]
-# The `__sklearn_tags__` hook in python/mojoboost/_sklearn.py, which only
-# scikit-learn itself ever calls. mojoboost is scikit-learn *style* and
+# The `__sklearn_tags__` hook in python/mojotrees/_sklearn.py, which only
+# scikit-learn itself ever calls. mojotrees is scikit-learn *style* and
 # does not claim scikit-learn compliance; see section 6.1 of
 # docs/COMPATIBILITY_POLICY.md.
 scikit-learn = ["scikit-learn"]
-# Spelled to match the ImportError that python/mojoboost/dask.py raises.
+# Spelled to match the ImportError that python/mojotrees/dask.py raises.
 # dask.dataframe is dask's own optional extra and the module treats it as
 # optional, so it is not pulled in here.
 dask = ["dask[distributed]"]
 # Self-referential so the union cannot drift out of step with the rows
 # above. pip has resolved this form since 21.2, which every interpreter
 # `requires-python` admits ships with.
-all = ["mojoboost[numpy,pandas,scipy,scikit-learn,dask]"]
+all = ["mojotrees[numpy,pandas,scipy,scikit-learn,dask]"]
 
 [project.urls]
-Homepage = "https://github.com/mojoboost-ml/mojoboost"
-Repository = "https://github.com/mojoboost-ml/mojoboost"
-Issues = "https://github.com/mojoboost-ml/mojoboost/issues"
+Homepage = "https://github.com/mojotrees/mojotrees"
+Repository = "https://github.com/mojotrees/mojotrees"
+Issues = "https://github.com/mojotrees/mojotrees/issues"
 # The docs are in the repository, not on a docs site, and this points at
 # them rather than at a host that does not exist. No Changelog entry:
 # there is no CHANGELOG file to point at yet.
-Documentation = "https://github.com/mojoboost-ml/mojoboost/tree/main/docs"
+Documentation = "https://github.com/mojotrees/mojotrees/tree/main/docs"
 Creator = "https://github.com/ajhendel"
 
 [tool.setuptools]
 # Listed explicitly rather than discovered. Discovery on this directory
 # would also find `tests`, and an explicit list makes a new subpackage a
 # deliberate edit instead of a silent addition to the wheel.
-packages = ["mojoboost"]
+packages = ["mojotrees"]
 # setuptools defaults this to true when the project is configured from
 # pyproject.toml, and it is turned off here on purpose. Left on, the
 # wheel's contents would be decided by the sdist file finders and by
@@ -174,7 +174,7 @@ packages = ["mojoboost"]
 # below and nothing else can drift into a published artifact.
 #
 # Turning this back on without also deleting MANIFEST.in would ship a
-# wheel with no `_mojoboost.so` in it.
+# wheel with no `_mojotrees.so` in it.
 include-package-data = false
 
 [tool.setuptools.package-data]
@@ -197,4 +197,4 @@ include-package-data = false
 # machine. This list is checked by `check_package_data` in
 # packaging/linux/check_metadata_ready.py against the exact names that
 # builder stages.
-mojoboost = ["*.so", ".dylibs/*.dylib", ".libs/*.so", ".libs/*.so.*"]
+mojotrees = ["*.so", ".dylibs/*.dylib", ".libs/*.so", ".libs/*.so.*"]

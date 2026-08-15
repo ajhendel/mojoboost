@@ -5,7 +5,7 @@
   "library_version": "0.1.0",
   "source_commit": null,
   "about": [
-    "A record of mojoboost's public surface, as defined by section 2 of",
+    "A record of mojotrees's public surface, as defined by section 2 of",
     "docs/COMPATIBILITY_POLICY.md, in a form two releases can be diffed in.",
     "Section 11.2 of that document classifies every kind of diff.",
     "PROPOSED, NOT GENERATED. This file was written by hand from a reading",
@@ -20,7 +20,7 @@
     "code. It may be evidence that the hand pass missed it."
   ],
   "verification": {
-    "method": "throwaway ast and regex cross-check, no build and no import of mojoboost, run against the working tree after this file was written",
+    "method": "throwaway ast and regex cross-check, no build and no import of mojotrees, run against the working tree after this file was written",
     "result": "no drift in any block listed under checked",
     "checked": [
       "mojo.exports_by_module, module set and every module's name set",
@@ -30,9 +30,9 @@
       "python.estimators.*.own_parameters",
       "python.estimators.*.methods fit, predict, predict_proba argument names and defaults",
       "python.callbacks.all, callback_env_fields, resettable, reset_aliases, reset_slots",
-      "len(RESETTABLE) equals RESET_SLOTS in bindings/_mojoboost.mojo",
+      "len(RESETTABLE) equals RESET_SLOTS in bindings/_mojotrees.mojo",
       "python.eval_metric_names.documented is a subset of _METRICS",
-      "c_abi.functions against the declarations in capi/mojoboost.h",
+      "c_abi.functions against the declarations in capi/mojotrees.h",
       "versions.library against all three of its locations",
       "versions.model_format against serialize.mojo, versions.c_abi against the header",
       "platforms.declared against pixi.toml"
@@ -47,7 +47,7 @@
       "platforms tiers above tier 1, artifacts, numerical_contracts"
     ],
     "note": "the checked list is a fact about the tree at the time of the check, not a substitute for tools/api_snapshot.py. Nothing re-runs it.",
-    "amended_after_the_check": "the inspection block was rewritten after mojoboost.inspection landed mid-round; its all list and dump_format_version were read from python/mojoboost/inspection.py directly rather than by the cross-check script"
+    "amended_after_the_check": "the inspection block was rewritten after mojotrees.inspection landed mid-round; its all list and dump_format_version were read from python/mojotrees/inspection.py directly rather than by the cross-check script"
   },
   "versions": {
     "library": "0.1.0",
@@ -61,13 +61,13 @@
     "max_toolchain": ">=26.5.0,<27"
   },
   "python": {
-    "module": "mojoboost",
+    "module": "mojotrees",
     "all": [
       "Booster",
       "Dataset",
-      "MojoBoostRegressor",
-      "MojoBoostClassifier",
-      "MojoBoostRanker",
+      "MojoTreesRegressor",
+      "MojoTreesClassifier",
+      "MojoTreesRanker",
       "NotFittedError",
       "train",
       "gpu_available",
@@ -81,7 +81,7 @@
       "record_evaluation",
       "reset_parameter"
     ],
-    "supported_import_paths": ["mojoboost", "mojoboost.callback"],
+    "supported_import_paths": ["mojotrees", "mojotrees.callback"],
     "optional_dependencies": ["numpy", "scipy", "scikit-learn", "pandas"],
     "shared_estimator_parameters": {
       "num_leaves": 31,
@@ -152,7 +152,7 @@
     ],
     "unfitted_access": "NotFittedError",
     "estimators": {
-      "MojoBoostRegressor": {
+      "MojoTreesRegressor": {
         "bases": ["_Base"],
         "estimator_type": "regressor",
         "own_parameters": {
@@ -209,7 +209,7 @@
         "properties": ["booster_", "feature_importances_"],
         "protocols": ["get_params", "set_params", "__getstate__", "__setstate__", "__sklearn_tags__", "__sklearn_is_fitted__"]
       },
-      "MojoBoostClassifier": {
+      "MojoTreesClassifier": {
         "bases": ["_Base"],
         "estimator_type": "classifier",
         "own_parameters": {"objective": null, "class_weight": null},
@@ -257,7 +257,7 @@
         "properties": ["booster_", "feature_importances_"],
         "protocols": ["get_params", "set_params", "__getstate__", "__setstate__", "__sklearn_tags__", "__sklearn_is_fitted__"]
       },
-      "MojoBoostRanker": {
+      "MojoTreesRanker": {
         "bases": ["_Base"],
         "estimator_type": "ranker",
         "own_parameters": {
@@ -302,7 +302,7 @@
       }
     },
     "functional_api": {
-      "module": "mojoboost.basic",
+      "module": "mojotrees.basic",
       "all": ["Booster", "Dataset", "train"],
       "train": {
         "params": "required",
@@ -387,7 +387,7 @@
       "EarlyStopException": {"attributes": ["best_iteration", "best_score"]}
     },
     "callbacks": {
-      "module": "mojoboost.callback",
+      "module": "mojotrees.callback",
       "all": [
         "CallbackEnv",
         "EarlyStopException",
@@ -420,7 +420,7 @@
         "feature_fraction_bynode"
       ],
       "reset_slots": 9,
-      "reset_slot_owner": "bindings/_mojoboost.mojo RESET_SLOTS, _write_reset, _read_reset",
+      "reset_slot_owner": "bindings/_mojotrees.mojo RESET_SLOTS, _write_reset, _read_reset",
       "reset_aliases": {
         "min_child_samples": "min_data_in_leaf",
         "min_child_weight": "min_sum_hessian_in_leaf",
@@ -435,18 +435,18 @@
         "eta": "learning_rate"
       },
       "factories": {
-        "early_stopping": {"signature_source": "python/mojoboost/callback.py"},
+        "early_stopping": {"signature_source": "python/mojotrees/callback.py"},
         "log_evaluation": {"period": 1, "show_stdv": true},
         "record_evaluation": {"eval_result": "required"},
         "reset_parameter": {"kwargs": "one schedule per resettable parameter"}
       },
-      "supported_by": ["MojoBoostRegressor", "MojoBoostClassifier (binary)"],
-      "refused_by": ["MojoBoostClassifier (softmax)", "MojoBoostRanker"],
+      "supported_by": ["MojoTreesRegressor", "MojoTreesClassifier (binary)"],
+      "refused_by": ["MojoTreesClassifier (softmax)", "MojoTreesRanker"],
       "requires": ["eval_set"]
     },
     "eval_metric_names": {
-      "source": "python/mojoboost/_eval.py",
-      "computed_by": "src/mojoboost/metrics.mojo",
+      "source": "python/mojotrees/_eval.py",
+      "computed_by": "src/mojotrees/metrics.mojo",
       "documented": ["l2", "rmse", "l1", "quantile", "huber", "binary_logloss", "binary_error", "auc", "multi_logloss", "multi_error", "ndcg"],
       "note": "aliases resolve through the same registry; a callable f(y_true, y_pred) -> float is also accepted, with ('name', f, True) for higher-is-better"
     },
@@ -459,8 +459,8 @@
     }
   },
   "mojo": {
-    "package": "mojoboost",
-    "export_source": "src/mojoboost/__init__.mojo",
+    "package": "mojotrees",
+    "export_source": "src/mojotrees/__init__.mojo",
     "abi_promise": "none; Mojo has no stable ABI, so the guarantee is source compatibility only",
     "exports_by_module": {
       "bagging": ["DEFAULT_BAGGING_SEED", "BaggingParams", "bagging_enabled", "check_bagging", "refresh_bag", "sample_rows"],
@@ -498,7 +498,7 @@
       "serialize": ["load_feature_names", "load_model", "load_multiclass_model", "model_file_kind", "save_model", "save_multiclass_model"]
     },
     "internal_frozen_helpers": {
-      "module": "src/mojoboost/boosting.mojo",
+      "module": "src/mojotrees/boosting.mojo",
       "names": ["_fill_grad_hess", "_base_score", "_check_objective", "_check_sample_weight", "_renew_leaf_values"],
       "note": "frozen for in-tree callers only; not public and not covered by the compatibility policy"
     },
@@ -520,42 +520,42 @@
     }
   },
   "c_abi": {
-    "header": "capi/mojoboost.h",
+    "header": "capi/mojotrees.h",
     "abi_version": 1,
     "status_codes": {
-      "MOJOBOOST_OK": 0,
-      "MOJOBOOST_ERROR_INVALID_ARGUMENT": -1,
-      "MOJOBOOST_ERROR_TRAINING": -2,
-      "MOJOBOOST_ERROR_IO": -3,
-      "MOJOBOOST_ERROR_UNSUPPORTED": -4
+      "MOJOTREES_OK": 0,
+      "MOJOTREES_ERROR_INVALID_ARGUMENT": -1,
+      "MOJOTREES_ERROR_TRAINING": -2,
+      "MOJOTREES_ERROR_IO": -3,
+      "MOJOTREES_ERROR_UNSUPPORTED": -4
     },
-    "opaque_types": ["MojoBoostModel", "MojoBoostError"],
+    "opaque_types": ["MojoTreesModel", "MojoTreesError"],
     "functions": [
-      "int32_t mojoboost_abi_version(void)",
-      "void mojoboost_library_version(int32_t *major, int32_t *minor, int32_t *patch)",
-      "MojoBoostError *mojoboost_error_create(void)",
-      "void mojoboost_error_free(MojoBoostError *error)",
-      "const char *mojoboost_error_message(const MojoBoostError *error)",
-      "int32_t mojoboost_train_dense(const double *data, int64_t n_rows, int64_t n_features, const double *labels, const double *weights, const char *parameters, MojoBoostModel **out_model, MojoBoostError *error)",
-      "int32_t mojoboost_predict(const MojoBoostModel *model, const double *data, int64_t n_rows, int64_t n_features, double *out_values, int64_t out_len, MojoBoostError *error)",
-      "int32_t mojoboost_predict_raw(const MojoBoostModel *model, const double *data, int64_t n_rows, int64_t n_features, double *out_values, int64_t out_len, MojoBoostError *error)",
-      "int32_t mojoboost_save_model(const MojoBoostModel *model, const char *path, MojoBoostError *error)",
-      "int32_t mojoboost_load_model(const char *path, MojoBoostModel **out_model, MojoBoostError *error)",
-      "int32_t mojoboost_model_num_features(const MojoBoostModel *model, int64_t *out_value, MojoBoostError *error)",
-      "int32_t mojoboost_model_num_classes(const MojoBoostModel *model, int64_t *out_value, MojoBoostError *error)",
-      "int32_t mojoboost_model_num_trees(const MojoBoostModel *model, int64_t *out_value, MojoBoostError *error)",
-      "void mojoboost_model_free(MojoBoostModel *model)"
+      "int32_t mojotrees_abi_version(void)",
+      "void mojotrees_library_version(int32_t *major, int32_t *minor, int32_t *patch)",
+      "MojoTreesError *mojotrees_error_create(void)",
+      "void mojotrees_error_free(MojoTreesError *error)",
+      "const char *mojotrees_error_message(const MojoTreesError *error)",
+      "int32_t mojotrees_train_dense(const double *data, int64_t n_rows, int64_t n_features, const double *labels, const double *weights, const char *parameters, MojoTreesModel **out_model, MojoTreesError *error)",
+      "int32_t mojotrees_predict(const MojoTreesModel *model, const double *data, int64_t n_rows, int64_t n_features, double *out_values, int64_t out_len, MojoTreesError *error)",
+      "int32_t mojotrees_predict_raw(const MojoTreesModel *model, const double *data, int64_t n_rows, int64_t n_features, double *out_values, int64_t out_len, MojoTreesError *error)",
+      "int32_t mojotrees_save_model(const MojoTreesModel *model, const char *path, MojoTreesError *error)",
+      "int32_t mojotrees_load_model(const char *path, MojoTreesModel **out_model, MojoTreesError *error)",
+      "int32_t mojotrees_model_num_features(const MojoTreesModel *model, int64_t *out_value, MojoTreesError *error)",
+      "int32_t mojotrees_model_num_classes(const MojoTreesModel *model, int64_t *out_value, MojoTreesError *error)",
+      "int32_t mojotrees_model_num_trees(const MojoTreesModel *model, int64_t *out_value, MojoTreesError *error)",
+      "void mojotrees_model_free(MojoTreesModel *model)"
     ],
     "not_covered": ["error message wording", "shared library file name and soname"]
   },
   "cli": {
-    "binary": "cli/mojoboost",
+    "binary": "cli/mojotrees",
     "commands": ["train", "predict"],
     "exit_status": {"0": "success", "1": "runtime failure", "2": "usage error"},
     "not_covered": ["human-readable stderr text"]
   },
   "parameter_string": {
-    "parser": "src/mojoboost/params.mojo parse_params",
+    "parser": "src/mojotrees/params.mojo parse_params",
     "used_by": ["capi", "cli"],
     "shape": "whitespace separated key=value pairs, LightGBM names",
     "supported_keys": [
@@ -583,7 +583,7 @@
     "mojo_api_only_key": "reported as unsupported with a reason, not as unknown"
   },
   "model_format": {
-    "magic": "mojoboost",
+    "magic": "mojotrees",
     "version": "v4",
     "encoding": "plain text tokens; floats as IEEE-754 bit patterns in decimal UInt64",
     "kind_token": ["objective", "multiclass"],
@@ -598,10 +598,10 @@
     "absent_by_design": ["num_leaves", "regularization", "interaction constraints", "subsampling", "training device"]
   },
   "inspection": {
-    "module": "mojoboost.inspection",
+    "module": "mojotrees.inspection",
     "dump_format_version": 1,
     "schema_document": "docs/MODEL_INSPECTION_SCHEMA.md",
-    "implementations": ["python/mojoboost/inspection.py", "src/mojoboost/inspection.mojo"],
+    "implementations": ["python/mojotrees/inspection.py", "src/mojotrees/inspection.mojo"],
     "all": [
       "DUMP_FORMAT_VERSION",
       "SUPPORTED_MODEL_FORMAT_VERSIONS",
@@ -626,7 +626,7 @@
       "best_score_of"
     ],
     "reexported_at_top_level": false,
-    "open_question": "not in mojoboost.__all__ and not a supported import path under compatibility policy section 6.1; release gate item C5",
+    "open_question": "not in mojotrees.__all__ and not a supported import path under compatibility policy section 6.1; release gate item C5",
     "pandas_required_for": ["trees_to_dataframe"],
     "capability_flags": ["has_split_gain", "has_node_count"],
     "available": [
@@ -639,7 +639,7 @@
       "booster_ accessors",
       "Dataset accessors"
     ],
-    "leaf_id_numbering": "ordinal within its own tree in [0, num_leaves), node order, mojoboost's own and not LightGBM's",
+    "leaf_id_numbering": "ordinal within its own tree in [0, num_leaves), node order, mojotrees's own and not LightGBM's",
     "contrib_shapes": {
       "single_output": "(n_samples, n_features + 1)",
       "multiclass": "(n_samples, n_classes * (n_features + 1)), class-major blocks"
@@ -651,13 +651,13 @@
     "evals_result_shape": "{valid_name: {metric_name: [round 0, round 1, ...]}}, index 0 is the base-score-only model"
   },
   "environment_variables": {
-    "MOJOBOOST_NUM_WORKERS": "1 serial, N>1 forced chunked and takes precedence over the threshold, 0 or unset automatic",
-    "MOJOBOOST_PARALLEL_MIN_OPS": "overrides the parallel dispatch threshold",
-    "MOJOBOOST_DISABLE_GPU": "device selection behaves as though no accelerator were present",
-    "MOJOBOOST_GPU_HIST_STRATEGY": "selects the GPU histogram strategy",
-    "MOJOBOOST_GPU_BLOCK_THREADS": "overrides GPU launch block width",
-    "MOJOBOOST_GPU_ROW_TILE": "overrides GPU row tile size",
-    "MOJOBOOST_AUTO_MIN_CELLS": "threshold for automatic device selection",
+    "MOJOTREES_NUM_WORKERS": "1 serial, N>1 forced chunked and takes precedence over the threshold, 0 or unset automatic",
+    "MOJOTREES_PARALLEL_MIN_OPS": "overrides the parallel dispatch threshold",
+    "MOJOTREES_DISABLE_GPU": "device selection behaves as though no accelerator were present",
+    "MOJOTREES_GPU_HIST_STRATEGY": "selects the GPU histogram strategy",
+    "MOJOTREES_GPU_BLOCK_THREADS": "overrides GPU launch block width",
+    "MOJOTREES_GPU_ROW_TILE": "overrides GPU row tile size",
+    "MOJOTREES_AUTO_MIN_CELLS": "threshold for automatic device selection",
     "covered": "semantics",
     "not_covered": "default numeric values, which are tuning constants"
   },

@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from mojoboost import MojoBoostClassifier, MojoBoostRegressor
+from mojotrees import MojoTreesClassifier, MojoTreesRegressor
 
 
 def test_predict_shape(fitted_regressor, regression):
@@ -39,8 +39,8 @@ def test_proba_columns_follow_classes_order(binary):
     """Column k is the probability of classes_[k], so relabeling must
     permute the columns and nothing else."""
     X, y = binary
-    plain = MojoBoostClassifier(n_estimators=10).fit(X, y)
-    renamed = MojoBoostClassifier(n_estimators=10).fit(
+    plain = MojoTreesClassifier(n_estimators=10).fit(X, y)
+    renamed = MojoTreesClassifier(n_estimators=10).fit(
         X, np.where(y == 1, "b", "a")
     )
     assert list(renamed.classes_) == ["a", "b"]
@@ -80,7 +80,7 @@ def test_regressor_score_matches_sklearn(fitted_regressor, regression):
 def test_r2_of_a_constant_target():
     X = np.array([[0.0], [1.0], [2.0], [3.0]])
     y = np.full(4, 2.0)
-    est = MojoBoostRegressor(n_estimators=3, min_data_in_leaf=1).fit(X, y)
+    est = MojoTreesRegressor(n_estimators=3, min_data_in_leaf=1).fit(X, y)
     # Fitting a constant lands exactly on it, which is the one case where a
     # zero total sum of squares still counts as a perfect score.
     assert est.score(X, y) == 1.0
@@ -105,7 +105,7 @@ def test_classifier_score_weighted(fitted_binary, binary):
 def test_classifier_score_on_string_labels(binary):
     X, y = binary
     labels = np.where(y == 1, "yes", "no")
-    est = MojoBoostClassifier(n_estimators=10).fit(X, labels)
+    est = MojoTreesClassifier(n_estimators=10).fit(X, labels)
     assert est.score(X, labels) == pytest.approx(
         (np.asarray(est.predict(X)) == labels).mean()
     )
@@ -133,7 +133,7 @@ def test_nan_is_predicted_as_missing():
     """NaN trains and predicts as a missing value, so a target driven by
     missingness alone is learnable and an unseen NaN follows the same route."""
     X, y = _missingness_data()
-    est = MojoBoostRegressor(
+    est = MojoTreesRegressor(
         num_leaves=4, n_estimators=60, learning_rate=0.3,
         min_data_in_leaf=1, max_bin=16,
     ).fit(X, y)
@@ -147,7 +147,7 @@ def test_use_missing_false_treats_nan_as_zero():
     """LightGBM's use_missing=false: NaN becomes the value 0.0, so it can no
     longer be told apart from an observed 0.0."""
     X, y = _missingness_data()
-    est = MojoBoostRegressor(
+    est = MojoTreesRegressor(
         num_leaves=4, n_estimators=60, learning_rate=0.3,
         min_data_in_leaf=1, max_bin=16, use_missing=False,
     ).fit(X, y)
@@ -200,8 +200,8 @@ def test_num_iteration_matches_a_shorter_ensemble(regression):
     20-round model are the trees of a k-round model: slicing must reproduce
     the shorter fit exactly."""
     X, y = regression
-    full = MojoBoostRegressor(n_estimators=20).fit(X, y)
-    short = MojoBoostRegressor(n_estimators=7).fit(X, y)
+    full = MojoTreesRegressor(n_estimators=20).fit(X, y)
+    short = MojoTreesRegressor(n_estimators=7).fit(X, y)
     assert np.allclose(np.asarray(full.predict(X, num_iteration=7)),
                        np.asarray(short.predict(X)))
 
@@ -236,12 +236,12 @@ def test_num_iteration_none_uses_every_kept_iteration(fitted_regressor,
 
 
 def test_num_iteration_default_follows_best_iteration(regression):
-    """LightGBM's default is best_iteration, not n_estimators. mojoboost
+    """LightGBM's default is best_iteration, not n_estimators. mojotrees
     truncates the ensemble at its best iteration when training stops early,
     so the default and best_iteration_ agree by construction."""
     X, y = regression
     noise = np.random.default_rng(3).permutation(y)
-    est = MojoBoostRegressor(n_estimators=40).fit(
+    est = MojoTreesRegressor(n_estimators=40).fit(
         X, y,
         eval_set=[(X, noise)],
         eval_metric=lambda truth, pred: float(np.mean((truth - pred) ** 2)),
@@ -288,8 +288,8 @@ def test_negative_start_iteration_clamps_to_zero(fitted_regressor,
 
 def test_multiclass_iteration_slice_is_a_truncated_softmax(multiclass):
     X, y = multiclass
-    full = MojoBoostClassifier(n_estimators=12).fit(X, y)
-    short = MojoBoostClassifier(n_estimators=5).fit(X, y)
+    full = MojoTreesClassifier(n_estimators=12).fit(X, y)
+    short = MojoTreesClassifier(n_estimators=5).fit(X, y)
     sliced = np.asarray(full.predict_proba(X, num_iteration=5))
     assert sliced.shape == (len(X), full.n_classes_)
     assert np.allclose(sliced.sum(axis=1), 1.0)
@@ -380,7 +380,7 @@ def test_pred_leaf_survives_save_and_load(fitted_regressor, regression,
     X, _ = regression
     path = tmp_path / "model.txt"
     fitted_regressor.save(path)
-    loaded = MojoBoostRegressor.load(path)
+    loaded = MojoTreesRegressor.load(path)
     assert loaded.best_iteration_ == fitted_regressor.best_iteration_
     assert np.array_equal(
         np.asarray(loaded.predict(X, pred_leaf=True)),
@@ -417,7 +417,7 @@ def test_validate_features_raises_where_it_would_warn(regression):
     pd = pytest.importorskip("pandas")
     X, y = regression
     names = [f"f{i}" for i in range(X.shape[1])]
-    est = MojoBoostRegressor(n_estimators=5).fit(pd.DataFrame(X, columns=names),
+    est = MojoTreesRegressor(n_estimators=5).fit(pd.DataFrame(X, columns=names),
                                                  y)
     # Without the flag a nameless matrix only warns.
     with pytest.warns(UserWarning):
@@ -431,7 +431,7 @@ def test_validate_features_accepts_matching_names(regression):
     X, y = regression
     names = [f"f{i}" for i in range(X.shape[1])]
     frame = pd.DataFrame(X, columns=names)
-    est = MojoBoostRegressor(n_estimators=5).fit(frame, y)
+    est = MojoTreesRegressor(n_estimators=5).fit(frame, y)
     assert np.allclose(np.asarray(est.predict(frame, validate_features=True)),
                        np.asarray(est.predict(frame)))
 
@@ -440,7 +440,7 @@ def test_mismatched_names_raise_with_or_without_validation(regression):
     pd = pytest.importorskip("pandas")
     X, y = regression
     names = [f"f{i}" for i in range(X.shape[1])]
-    est = MojoBoostRegressor(n_estimators=5).fit(pd.DataFrame(X, columns=names),
+    est = MojoTreesRegressor(n_estimators=5).fit(pd.DataFrame(X, columns=names),
                                                  y)
     renamed = pd.DataFrame(X, columns=[n.upper() for n in names])
     for flag in (False, True):
@@ -502,13 +502,13 @@ def test_numpy_integers_are_accepted(fitted_regressor, regression):
 
 
 def test_ranker_supports_the_same_options(regression):
-    from mojoboost import MojoBoostRanker
+    from mojotrees import MojoTreesRanker
 
     X, _ = regression
     gen = np.random.default_rng(5)
     y = gen.integers(0, 3, size=len(X))
     group = [len(X) // 4] * 4
-    est = MojoBoostRanker(n_estimators=8).fit(X, y, group=group)
+    est = MojoTreesRanker(n_estimators=8).fit(X, y, group=group)
     plain = np.asarray(est.predict(X))
     # Lambdarank has no inverse link, so raw and response coincide.
     assert np.array_equal(np.asarray(est.predict(X, raw_score=True)), plain)
@@ -522,12 +522,12 @@ def test_ranker_supports_the_same_options(regression):
 def test_gpu_trained_model_slices_and_reports_leaves(regression):
     """The device chooses the trainer, not the model: a GPU-trained ensemble
     must answer the same prediction contract."""
-    from mojoboost import gpu_available
+    from mojotrees import gpu_available
 
     if not gpu_available():
         pytest.skip("no accelerator available for training")
     X, y = regression
-    est = MojoBoostRegressor(n_estimators=10, device="gpu").fit(X, y)
+    est = MojoTreesRegressor(n_estimators=10, device="gpu").fit(X, y)
     assert est.device_ == "gpu"
     whole = np.asarray(est.predict(X, raw_score=True))
     head = np.asarray(est.predict(X, raw_score=True, num_iteration=4))

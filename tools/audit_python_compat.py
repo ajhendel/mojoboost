@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Audit which CPython versions mojoboost could be built for and run on.
+"""Audit which CPython versions mojotrees could be built for and run on.
 
     python3 tools/audit_python_compat.py
 
-Standard library only. It imports nothing from `mojoboost`, never loads the
+Standard library only. It imports nothing from `mojotrees`, never loads the
 compiled extension, and builds nothing, so it runs on a bare checkout and,
-more to the point, it runs under an interpreter that mojoboost does not yet
+more to the point, it runs under an interpreter that mojotrees does not yet
 support. That is the whole reason it exists: the question this script serves
 is "could this package run on 3.12", and a script that has to import the
 package to answer it cannot be run on 3.12.
@@ -16,13 +16,13 @@ than 3.8 here, and do not import `tomllib`.
 
 Five independent sections, each printing its own verdict:
 
-    source       AST feature scan of python/mojoboost, which gives a lower
+    source       AST feature scan of python/mojotrees, which gives a lower
                  bound on the interpreter the pure-Python half needs
     metadata     requires-python and the Python classifiers in
                  python/pyproject.toml, checked against that lower bound
     toolchain    what pixi.lock records about the interpreter the pinned
                  Mojo and MAX packages were solved against
-    extension    a byte scan of a built _mojoboost.so for the CPython entry
+    extension    a byte scan of a built _mojotrees.so for the CPython entry
                  point names the Mojo runtime resolves, and for the ones it
                  says it resolves conditionally
     interpreter  facts about the interpreter running this script
@@ -55,10 +55,10 @@ import sysconfig
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-PKG = ROOT / "python" / "mojoboost"
+PKG = ROOT / "python" / "mojotrees"
 PYPROJECT = ROOT / "python" / "pyproject.toml"
 LOCK = ROOT / "pixi.lock"
-EXTENSION = PKG / "_mojoboost.so"
+EXTENSION = PKG / "_mojotrees.so"
 
 # ---------------------------------------------------------------------------
 # Version-gated constructs
@@ -354,7 +354,7 @@ def _has_future_annotations(tree):
 
 
 def scan_source(res):
-    print("\nsource: version-gated constructs in python/mojoboost")
+    print("\nsource: version-gated constructs in python/mojotrees")
     if not PKG.is_dir():
         res.fail("source", "%s does not exist" % PKG.relative_to(ROOT))
         return None
@@ -717,7 +717,7 @@ def scan_interpreter(res, declared):
         res.note(
             "interpreter",
             "this is a free-threaded build. Every max 26.5.0 variant depends "
-            "on python-gil, so no mojoboost extension exists for it",
+            "on python-gil, so no mojotrees extension exists for it",
         )
     if declared is not None and version < declared:
         res.note(

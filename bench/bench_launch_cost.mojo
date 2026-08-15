@@ -113,7 +113,7 @@ def main() raises:
             )
             ctx.synchronize()
 
-        print("mojoboost launch cost bench: reps", reps, "trials", trials)
+        print("mojotrees launch cost bench: reps", reps, "trials", trials)
         var launch_us = List[Float64](capacity=trials)
         var wait_us = List[Float64](capacity=trials)
         for t in range(trials):

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build a self-contained Linux wheel for the mojoboost Python API.
+# Build a self-contained Linux wheel for the mojotrees Python API.
 #
 #     pixi run -e pkg packaging/linux/build_wheel_linux.sh
 #
@@ -15,7 +15,7 @@
 #   2. refuse to run while the Python metadata cannot describe a Linux wheel
 #   3. build the extension with the Mojo toolchain
 #   4. walk the extension's DT_NEEDED closure and stage every object that
-#      resolves inside the pixi environment into python/mojoboost/.libs
+#      resolves inside the pixi environment into python/mojotrees/.libs
 #   5. rewrite RUNPATH so the loader finds them relative to the wheel
 #   6. build the wheel with an explicit, honest platform tag
 #   7. write a SHA-256 manifest and a provenance sidecar
@@ -27,16 +27,16 @@
 # a release.
 #
 # Environment:
-#   MOJOBOOST_TAG_POLICY     plain (default) | manylinux
-#   MOJOBOOST_MANYLINUX      glibc floor for the manylinux policy, default 2_28
-#   MOJOBOOST_ALLOW_DIRTY    set to 1 to build from a dirty tree (never for a release)
+#   MOJOTREES_TAG_POLICY     plain (default) | manylinux
+#   MOJOTREES_MANYLINUX      glibc floor for the manylinux policy, default 2_28
+#   MOJOTREES_ALLOW_DIRTY    set to 1 to build from a dirty tree (never for a release)
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 ROOT=$(pwd)
 
-TAG_POLICY=${MOJOBOOST_TAG_POLICY:-plain}
-MANYLINUX_FLOOR=${MOJOBOOST_MANYLINUX:-2_28}
-PKG=python/mojoboost
+TAG_POLICY=${MOJOTREES_TAG_POLICY:-plain}
+MANYLINUX_FLOOR=${MOJOTREES_MANYLINUX:-2_28}
+PKG=python/mojotrees
 LIBDIR=$PKG/.libs
 DIST=python/dist
 
@@ -68,26 +68,26 @@ release build without recording its version in the provenance sidecar."
 
 command -v readelf >/dev/null 2>&1 || die "readelf not found (binutils)."
 
-if [ "${MOJOBOOST_ALLOW_DIRTY:-0}" != "1" ] && ! git diff --quiet HEAD 2>/dev/null; then
+if [ "${MOJOTREES_ALLOW_DIRTY:-0}" != "1" ] && ! git diff --quiet HEAD 2>/dev/null; then
     die "working tree is dirty.
 A release artifact has to be attributable to a commit. Commit, or set
-MOJOBOOST_ALLOW_DIRTY=1 for a throwaway build you will not publish."
+MOJOTREES_ALLOW_DIRTY=1 for a throwaway build you will not publish."
 fi
 
 # An accelerator visible at compile time changes the product, not just the
-# build: has_accelerator() in src/mojoboost/device.mojo resolves at compile
+# build: has_accelerator() in src/mojotrees/device.mojo resolves at compile
 # time, so a wheel built here would tell every user that a GPU is available and
 # then fail when the device is opened.
 ACCEL=no
 if command -v nvidia-smi >/dev/null 2>&1 || command -v rocm-smi >/dev/null 2>&1; then
     ACCEL=unknown
-    [ "${MOJOBOOST_ALLOW_ACCEL_HOST:-0}" = "1" ] || die \
+    [ "${MOJOTREES_ALLOW_ACCEL_HOST:-0}" = "1" ] || die \
 "an accelerator tool is on PATH (nvidia-smi or rocm-smi).
 Build release wheels on a machine with no visible accelerator, because
 has_accelerator() resolves at compile time and this host would bake a GPU claim
 into every install of the resulting file. If this host genuinely has no device
 and only the vendor tooling is installed, re-run with
-MOJOBOOST_ALLOW_ACCEL_HOST=1 and expect has_accelerator_at_build to be recorded
+MOJOTREES_ALLOW_ACCEL_HOST=1 and expect has_accelerator_at_build to be recorded
 as 'unknown', which is what it is."
 fi
 
@@ -109,7 +109,7 @@ case "$TAG_POLICY" in
         PLAT="manylinux_${MANYLINUX_FLOOR}_${HOST_ARCH}"
         ;;
     *)
-        die "MOJOBOOST_TAG_POLICY must be 'plain' or 'manylinux', got '$TAG_POLICY'"
+        die "MOJOTREES_TAG_POLICY must be 'plain' or 'manylinux', got '$TAG_POLICY'"
         ;;
 esac
 
@@ -136,10 +136,10 @@ VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' python/pyproject.toml | head -1)
 # --- 3. Build the extension ------------------------------------------------
 
 note "building the extension"
-rm -rf "$LIBDIR" python/build "$DIST" python/mojoboost.egg-info
+rm -rf "$LIBDIR" python/build "$DIST" python/mojotrees.egg-info
 bindings/build.sh
 
-EXT=$PKG/_mojoboost.so
+EXT=$PKG/_mojotrees.so
 [ -f "$EXT" ] || die "bindings/build.sh did not produce $EXT"
 
 # --- 4. Stage the runtime closure ------------------------------------------
@@ -264,7 +264,7 @@ export SOURCE_DATE_EPOCH
         --config-setting=--build-option=--plat-name="$PLAT"
 )
 
-WHEEL=$(ls "$DIST"/mojoboost-*.whl 2>/dev/null | head -1)
+WHEEL=$(ls "$DIST"/mojotrees-*.whl 2>/dev/null | head -1)
 [ -n "$WHEEL" ] || die "no wheel in $DIST"
 BASE=$(basename "$WHEEL")
 
@@ -276,7 +276,7 @@ from the build and renaming it makes the label a lie rather than a mistake.
 Fix python/setup.py (see check_metadata_ready.py) and rebuild." ;;
 esac
 case "$BASE" in
-    mojoboost-"$VERSION"-*) ;;
+    mojotrees-"$VERSION"-*) ;;
     *) die "wheel version does not match python/pyproject.toml ($VERSION): $BASE" ;;
 esac
 
@@ -309,7 +309,7 @@ cat > "$DIST/$BASE.provenance.json" <<EOF
   "platform_tag": "$PLAT",
   "bundled": "$BUNDLED",
   "external_left_to_target": "$(echo "$external" | tr -s ' ')",
-  "container_image_digest": "${MOJOBOOST_BUILD_IMAGE_DIGEST:-none (native runner)}",
+  "container_image_digest": "${MOJOTREES_BUILD_IMAGE_DIGEST:-none (native runner)}",
   "source_date_epoch": "$SOURCE_DATE_EPOCH",
   "validated": "no. This file records how the wheel was built. It is not evidence that the wheel works anywhere."
 }

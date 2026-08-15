@@ -14,10 +14,10 @@ Run with `mojo run -I src -I capi tests/test_capi.mojo`.
 from std.os import remove
 from std.testing import assert_equal, assert_raises, assert_true, TestSuite
 
-from mojoboost.boosting import BoosterParams, L1, QUANTILE, SQUARED_ERROR
-from mojoboost.device import CPU_DEVICE
-from mojoboost.model import fit, fit_multiclass
-from mojoboost.params import (
+from mojotrees.boosting import BoosterParams, L1, QUANTILE, SQUARED_ERROR
+from mojotrees.device import CPU_DEVICE
+from mojotrees.model import fit, fit_multiclass
+from mojotrees.params import (
     MULTICLASS,
     objective_display_name,
     objective_from_name,
@@ -25,7 +25,7 @@ from mojoboost.params import (
     parse_params,
 )
 
-from mojoboost_capi import (
+from mojotrees_capi import (
     ABI_VERSION,
     ERROR_INVALID_ARGUMENT,
     ERROR_IO,
@@ -35,20 +35,20 @@ from mojoboost_capi import (
     _ErrorPtr,
     _ModelOutPtr,
     _ModelPtr,
-    mojoboost_abi_version,
-    mojoboost_error_create,
-    mojoboost_error_free,
-    mojoboost_error_message,
-    mojoboost_library_version,
-    mojoboost_load_model,
-    mojoboost_model_free,
-    mojoboost_model_num_classes,
-    mojoboost_model_num_features,
-    mojoboost_model_num_trees,
-    mojoboost_predict,
-    mojoboost_predict_raw,
-    mojoboost_save_model,
-    mojoboost_train_dense,
+    mojotrees_abi_version,
+    mojotrees_error_create,
+    mojotrees_error_free,
+    mojotrees_error_message,
+    mojotrees_library_version,
+    mojotrees_load_model,
+    mojotrees_model_free,
+    mojotrees_model_num_classes,
+    mojotrees_model_num_features,
+    mojotrees_model_num_trees,
+    mojotrees_predict,
+    mojotrees_predict_raw,
+    mojotrees_save_model,
+    mojotrees_train_dense,
 )
 
 comptime _MODEL_PATH = "./.test_capi_model.tmp"
@@ -83,7 +83,7 @@ def _c_ptr(mut bytes: List[UInt8]) -> _CharPtr:
 def _message(error: _ErrorPtr) -> String:
     """The error text, read back the way C reads it: a NUL terminated
     string at the address the ABI hands out."""
-    var address = mojoboost_error_message(error)
+    var address = mojotrees_error_message(error)
     if address == 0:
         return String("")
     var p = _CharPtr(unsafe_from_address=address)
@@ -100,7 +100,7 @@ def _message(error: _ErrorPtr) -> String:
 
 struct _Slot(Movable):
     """One pointer-sized cell to receive a handle, which is how a C caller
-    passes `MojoBoostModel **`."""
+    passes `MojoTreesModel **`."""
 
     var cell: List[Int]
 
@@ -296,7 +296,7 @@ def test_params_multiclass_requires_num_class() raises:
 
 
 def test_params_separates_unsupported_from_unknown() raises:
-    # Real LightGBM features that mojoboost has, reachable from the Mojo API
+    # Real LightGBM features that mojotrees has, reachable from the Mojo API
     # but not from a parameter string.
     assert_true(params_names_mojo_api_only(String("bagging_fraction=0.5")))
     assert_true(params_names_mojo_api_only(String("objective=lambdarank")))
@@ -330,33 +330,33 @@ def _header_define(source: String, name: String) raises -> Int:
             var inner = String(text[byte = 1 : text.byte_length() - 1])
             text = inner^
         return Int(text)
-    raise Error("capi/mojoboost.h does not define ", name)
+    raise Error("capi/mojotrees.h does not define ", name)
 
 
 def test_header_and_implementation_agree() raises:
     """The header is the contract a compiled caller was built against, so
     drift between it and the exported constants is a defect even though
     nothing links the two."""
-    var header = open("capi/mojoboost.h", "r").read()
+    var header = open("capi/mojotrees.h", "r").read()
     assert_equal(
-        _header_define(header, String("MOJOBOOST_ABI_VERSION")),
+        _header_define(header, String("MOJOTREES_ABI_VERSION")),
         Int(ABI_VERSION),
     )
-    assert_equal(Int(mojoboost_abi_version()), Int(ABI_VERSION))
-    assert_equal(_header_define(header, String("MOJOBOOST_OK")), Int(OK))
+    assert_equal(Int(mojotrees_abi_version()), Int(ABI_VERSION))
+    assert_equal(_header_define(header, String("MOJOTREES_OK")), Int(OK))
     assert_equal(
-        _header_define(header, String("MOJOBOOST_ERROR_INVALID_ARGUMENT")),
+        _header_define(header, String("MOJOTREES_ERROR_INVALID_ARGUMENT")),
         Int(ERROR_INVALID_ARGUMENT),
     )
     assert_equal(
-        _header_define(header, String("MOJOBOOST_ERROR_TRAINING")),
+        _header_define(header, String("MOJOTREES_ERROR_TRAINING")),
         Int(ERROR_TRAINING),
     )
     assert_equal(
-        _header_define(header, String("MOJOBOOST_ERROR_IO")), Int(ERROR_IO)
+        _header_define(header, String("MOJOTREES_ERROR_IO")), Int(ERROR_IO)
     )
     assert_equal(
-        _header_define(header, String("MOJOBOOST_ERROR_UNSUPPORTED")),
+        _header_define(header, String("MOJOTREES_ERROR_UNSUPPORTED")),
         Int(ERROR_UNSUPPORTED),
     )
 
@@ -364,7 +364,7 @@ def test_header_and_implementation_agree() raises:
 def test_library_version_fills_every_out_pointer() raises:
     var parts: List[Int32] = [0, 0, 0]
     var base = Int(parts.unsafe_ptr())
-    mojoboost_library_version(
+    mojotrees_library_version(
         _I32Ptr(unsafe_from_address=base),
         _I32Ptr(unsafe_from_address=base + 4),
         _I32Ptr(unsafe_from_address=base + 8),
@@ -403,12 +403,12 @@ def test_capi_regression_matches_the_mojo_api() raises:
         config.alpha,
     )
 
-    var error = mojoboost_error_create()
+    var error = mojotrees_error_create()
     var params = _c_bytes(spec)
     var slot = _Slot()
     assert_equal(
         Int(
-            mojoboost_train_dense(
+            mojotrees_train_dense(
                 _f64_ptr(features),
                 Int64(n_rows),
                 Int64(n_features),
@@ -426,17 +426,17 @@ def test_capi_regression_matches_the_mojo_api() raises:
 
     var counts: List[Int64] = [0]
     assert_equal(
-        Int(mojoboost_model_num_features(model, _int_out(counts), error)),
+        Int(mojotrees_model_num_features(model, _int_out(counts), error)),
         Int(OK),
     )
     assert_equal(Int(counts[0]), n_features)
     assert_equal(
-        Int(mojoboost_model_num_classes(model, _int_out(counts), error)),
+        Int(mojotrees_model_num_classes(model, _int_out(counts), error)),
         Int(OK),
     )
     assert_equal(Int(counts[0]), 1)
     assert_equal(
-        Int(mojoboost_model_num_trees(model, _int_out(counts), error)),
+        Int(mojotrees_model_num_trees(model, _int_out(counts), error)),
         Int(OK),
     )
     assert_equal(Int(counts[0]), len(reference.booster.trees))
@@ -446,7 +446,7 @@ def test_capi_regression_matches_the_mojo_api() raises:
         predictions.append(0.0)
     assert_equal(
         Int(
-            mojoboost_predict(
+            mojotrees_predict(
                 model,
                 _f64_ptr(features),
                 Int64(n_rows),
@@ -469,7 +469,7 @@ def test_capi_regression_matches_the_mojo_api() raises:
         raw.append(0.0)
     assert_equal(
         Int(
-            mojoboost_predict_raw(
+            mojotrees_predict_raw(
                 model,
                 _f64_ptr(features),
                 Int64(n_rows),
@@ -487,8 +487,8 @@ def test_capi_regression_matches_the_mojo_api() raises:
             row.append(features[f * n_rows + r])
         assert_equal(raw[r], reference.predict_raw(row))
 
-    mojoboost_model_free(model)
-    mojoboost_error_free(error)
+    mojotrees_model_free(model)
+    mojotrees_error_free(error)
     # The ABI takes addresses, and Mojo frees a value at its last use, so
     # every buffer whose address crossed the boundary is named once more
     # here to keep it alive for the calls above.
@@ -529,12 +529,12 @@ def test_capi_multiclass_matches_the_mojo_api() raises:
         weights,
     )
 
-    var error = mojoboost_error_create()
+    var error = mojotrees_error_create()
     var params = _c_bytes(spec)
     var slot = _Slot()
     assert_equal(
         Int(
-            mojoboost_train_dense(
+            mojotrees_train_dense(
                 _f64_ptr(features),
                 Int64(n_rows),
                 Int64(n_features),
@@ -551,7 +551,7 @@ def test_capi_multiclass_matches_the_mojo_api() raises:
 
     var counts: List[Int64] = [0]
     assert_equal(
-        Int(mojoboost_model_num_classes(model, _int_out(counts), error)),
+        Int(mojotrees_model_num_classes(model, _int_out(counts), error)),
         Int(OK),
     )
     assert_equal(Int(counts[0]), 3)
@@ -561,7 +561,7 @@ def test_capi_multiclass_matches_the_mojo_api() raises:
         proba.append(0.0)
     assert_equal(
         Int(
-            mojoboost_predict(
+            mojotrees_predict(
                 model,
                 _f64_ptr(features),
                 Int64(n_rows),
@@ -587,7 +587,7 @@ def test_capi_multiclass_matches_the_mojo_api() raises:
         narrow.append(0.0)
     assert_equal(
         Int(
-            mojoboost_predict(
+            mojotrees_predict(
                 model,
                 _f64_ptr(features),
                 Int64(n_rows),
@@ -600,8 +600,8 @@ def test_capi_multiclass_matches_the_mojo_api() raises:
         Int(ERROR_INVALID_ARGUMENT),
     )
 
-    mojoboost_model_free(model)
-    mojoboost_error_free(error)
+    mojotrees_model_free(model)
+    mojotrees_error_free(error)
     # The ABI takes addresses, and Mojo frees a value at its last use, so
     # every buffer whose address crossed the boundary is named once more
     # here to keep it alive for the calls above.
@@ -621,12 +621,12 @@ def test_capi_save_load_round_trip() raises:
     var target = _regression_target(n_rows, features)
     var weights = _ones(n_rows)
 
-    var error = mojoboost_error_create()
+    var error = mojotrees_error_create()
     var params = _c_bytes(String("num_iterations=8 num_leaves=7"))
     var slot = _Slot()
     assert_equal(
         Int(
-            mojoboost_train_dense(
+            mojotrees_train_dense(
                 _f64_ptr(features),
                 Int64(n_rows),
                 Int64(n_features),
@@ -644,7 +644,7 @@ def test_capi_save_load_round_trip() raises:
     var before = List[Float64](capacity=n_rows)
     for _ in range(n_rows):
         before.append(0.0)
-    _ = mojoboost_predict(
+    _ = mojotrees_predict(
         model,
         _f64_ptr(features),
         Int64(n_rows),
@@ -656,14 +656,14 @@ def test_capi_save_load_round_trip() raises:
 
     var path = _c_bytes(String(_MODEL_PATH))
     assert_equal(
-        Int(mojoboost_save_model(model, _c_ptr(path), error)), Int(OK)
+        Int(mojotrees_save_model(model, _c_ptr(path), error)), Int(OK)
     )
-    mojoboost_model_free(model)
+    mojotrees_model_free(model)
 
     var loaded_slot = _Slot()
     assert_equal(
         Int(
-            mojoboost_load_model(
+            mojotrees_load_model(
                 _c_ptr(path), loaded_slot.out_ptr(), error
             )
         ),
@@ -676,7 +676,7 @@ def test_capi_save_load_round_trip() raises:
         after.append(0.0)
     assert_equal(
         Int(
-            mojoboost_predict(
+            mojotrees_predict(
                 loaded,
                 _f64_ptr(features),
                 Int64(n_rows),
@@ -691,8 +691,8 @@ def test_capi_save_load_round_trip() raises:
     for r in range(n_rows):
         assert_equal(after[r], before[r])
 
-    mojoboost_model_free(loaded)
-    mojoboost_error_free(error)
+    mojotrees_model_free(loaded)
+    mojotrees_error_free(error)
     remove(_MODEL_PATH)
     # The ABI takes addresses, and Mojo frees a value at its last use, so
     # every buffer whose address crossed the boundary is named once more
@@ -714,14 +714,14 @@ def test_capi_status_codes_and_messages() raises:
     var features = _dataset(n_rows, n_features)
     var target = _regression_target(n_rows, features)
     var weights = _ones(n_rows)
-    var error = mojoboost_error_create()
+    var error = mojotrees_error_create()
 
     # A typo is an invalid argument.
     var bad = _c_bytes(String("num_leavs=7"))
     var slot = _Slot()
     assert_equal(
         Int(
-            mojoboost_train_dense(
+            mojotrees_train_dense(
                 _f64_ptr(features),
                 Int64(n_rows),
                 Int64(n_features),
@@ -741,7 +741,7 @@ def test_capi_status_codes_and_messages() raises:
     var unsupported = _c_bytes(String("bagging_fraction=0.5"))
     assert_equal(
         Int(
-            mojoboost_train_dense(
+            mojotrees_train_dense(
                 _f64_ptr(features),
                 Int64(n_rows),
                 Int64(n_features),
@@ -764,7 +764,7 @@ def test_capi_status_codes_and_messages() raises:
     var poisson = _c_bytes(String("objective=poisson num_iterations=2"))
     assert_equal(
         Int(
-            mojoboost_train_dense(
+            mojotrees_train_dense(
                 _f64_ptr(features),
                 Int64(n_rows),
                 Int64(n_features),
@@ -782,7 +782,7 @@ def test_capi_status_codes_and_messages() raises:
     # A missing file is an I/O failure.
     var missing = _c_bytes(String("./.test_capi_no_such_model.tmp"))
     assert_equal(
-        Int(mojoboost_load_model(_c_ptr(missing), slot.out_ptr(), error)),
+        Int(mojotrees_load_model(_c_ptr(missing), slot.out_ptr(), error)),
         Int(ERROR_IO),
     )
     assert_equal(slot.address(), 0)
@@ -791,7 +791,7 @@ def test_capi_status_codes_and_messages() raises:
     var good = _c_bytes(String("num_iterations=2 num_leaves=7"))
     assert_equal(
         Int(
-            mojoboost_train_dense(
+            mojotrees_train_dense(
                 _f64_ptr(features),
                 Int64(n_rows),
                 Int64(n_features),
@@ -814,7 +814,7 @@ def test_capi_status_codes_and_messages() raises:
         out.append(0.0)
     assert_equal(
         Int(
-            mojoboost_predict(
+            mojotrees_predict(
                 model,
                 _f64_ptr(features),
                 Int64(n_rows),
@@ -829,7 +829,7 @@ def test_capi_status_codes_and_messages() raises:
     assert_true(_message(error).find("trained on") >= 0)
     assert_equal(
         Int(
-            mojoboost_predict(
+            mojotrees_predict(
                 model,
                 _f64_ptr(features),
                 Int64(n_rows),
@@ -843,8 +843,8 @@ def test_capi_status_codes_and_messages() raises:
     )
     assert_equal(out[0], 0.0)
 
-    mojoboost_model_free(model)
-    mojoboost_error_free(error)
+    mojotrees_model_free(model)
+    mojotrees_error_free(error)
     # The ABI takes addresses, and Mojo frees a value at its last use, so
     # every buffer whose address crossed the boundary is named once more
     # here to keep it alive for the calls above.
@@ -865,8 +865,8 @@ def test_capi_handle_churn() raises:
     double free shows up here rather than in a caller. capi/test_capi.c runs
     the same shape under a leak checker."""
     for _ in range(200):
-        var error = mojoboost_error_create()
-        mojoboost_error_free(error)
+        var error = mojotrees_error_create()
+        mojotrees_error_free(error)
 
     var n_rows = 40
     var n_features = 2
@@ -875,11 +875,11 @@ def test_capi_handle_churn() raises:
     var weights = _ones(n_rows)
     var params = _c_bytes(String("num_iterations=2 num_leaves=4"))
     for _ in range(10):
-        var error = mojoboost_error_create()
+        var error = mojotrees_error_create()
         var slot = _Slot()
         assert_equal(
             Int(
-                mojoboost_train_dense(
+                mojotrees_train_dense(
                     _f64_ptr(features),
                     Int64(n_rows),
                     Int64(n_features),
@@ -892,8 +892,8 @@ def test_capi_handle_churn() raises:
             ),
             Int(OK),
         )
-        mojoboost_model_free(slot.handle())
-        mojoboost_error_free(error)
+        mojotrees_model_free(slot.handle())
+        mojotrees_error_free(error)
     # The ABI takes addresses, and Mojo frees a value at its last use, so
     # every buffer whose address crossed the boundary is named once more
     # here to keep it alive for the calls above.

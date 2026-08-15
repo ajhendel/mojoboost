@@ -1,6 +1,6 @@
 # Automated contributor access
 
-MojoBoost can promote contributors from public pull-request history without a
+MojoTrees can promote contributors from public pull-request history without a
 maintainer manually tracking activity. The automation is intentionally
 transparent: the thresholds live in
 `.github/governance-access-policy.json`, the evaluator lives in
@@ -42,11 +42,11 @@ The repository's normal `GITHUB_TOKEN` can read pull requests but cannot grant
 repository access. Create a GitHub App so the automation is not tied to a
 personal access token.
 
-1. Open the `mojoboost-ml` organization and go to **Settings → Developer
+1. Open the `mojotrees` organization and go to **Settings → Developer
    settings → GitHub Apps → New GitHub App**. If Developer settings appears
    only under the personal account, create the app there and install it on the
    organization.
-2. Name it `mojoboost-contributor-access`. The homepage may be the repository
+2. Name it `mojotrees-contributor-access`. The homepage may be the repository
    URL. Webhooks are not required; clear **Active** under Webhook.
 3. Give it these repository permissions:
    - **Administration: Read and write** — required to invite collaborators and
@@ -54,9 +54,9 @@ personal access token.
    - **Metadata: Read-only** — GitHub includes this automatically.
    - **Pull requests: Read-only** — used to evaluate contribution history.
 4. Give it **no organization permissions**. This automation grants access only
-   to `mojoboost`; it does not invite organization members.
-5. Install the app on `mojoboost-ml`, choosing **Only select repositories** and
-   selecting only `mojoboost`.
+   to `mojotrees`; it does not invite organization members.
+5. Install the app on `mojotrees`, choosing **Only select repositories** and
+   selecting only `mojotrees`.
 6. Generate a private key on the app settings page and download the `.pem`
    file.
 7. In the repository, open **Settings → Secrets and variables → Actions**:
@@ -91,7 +91,7 @@ Evaluation is read-only and uses only the standard library:
 
 ```sh
 GH_TOKEN="$(gh auth token)" python3 tools/governance_access.py \
-  --repository mojoboost-ml/mojoboost
+  --repository mojotrees/mojotrees
 ```
 
 Never pass `--apply` with a personal owner token merely to test the script.

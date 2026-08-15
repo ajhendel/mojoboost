@@ -17,18 +17,18 @@ import pytest
 
 np = pytest.importorskip("numpy")
 
-from mojoboost import (  # noqa: E402
+from mojotrees import (  # noqa: E402
     Booster,
-    MojoBoostClassifier,
-    MojoBoostRegressor,
+    MojoTreesClassifier,
+    MojoTreesRegressor,
 )
-from mojoboost import inspection  # noqa: E402
+from mojotrees import inspection  # noqa: E402
 
 
 @pytest.fixture(scope="module")
 def fitted(regression):
     X, y = regression
-    return MojoBoostRegressor(n_estimators=8, num_leaves=7).fit(X, y), X
+    return MojoTreesRegressor(n_estimators=8, num_leaves=7).fit(X, y), X
 
 
 @pytest.fixture(scope="module")
@@ -42,7 +42,7 @@ def dump(fitted):
 
 def test_dump_reports_its_own_version_and_source(dump):
     assert dump["dump_format_version"] == inspection.DUMP_FORMAT_VERSION
-    assert dump["producer"] == "mojoboost"
+    assert dump["producer"] == "mojotrees"
     assert dump["model_format_version"] == 4
     # Whichever built it: the native dump reads the model, and the model
     # text carries gains and covers itself from format v4 on.
@@ -64,7 +64,7 @@ def test_dump_describes_the_ensemble(dump, fitted):
     assert dump["feature_names"] == [f"Column_{i}" for i in range(X.shape[1])]
     assert dump["learning_rate"] == pytest.approx(0.1)
     assert len(dump["base_score"]) == 1
-    # mojoboost stores unshrunk leaf values and multiplies by the shrinkage
+    # mojotrees stores unshrunk leaf values and multiplies by the shrinkage
     # when it predicts; LightGBM folds the shrinkage into the leaf.
     assert dump["leaf_value_is_shrunk"] is False
     assert all(
@@ -187,7 +187,7 @@ def test_missing_values_route_as_the_model_routes_them():
     X = gen.random((300, 3))
     X[::5, 0] = np.nan
     y = np.where(np.isnan(X[:, 0]), 5.0, X[:, 0]) + 0.5 * X[:, 1]
-    model = MojoBoostRegressor(n_estimators=6, num_leaves=5).fit(X, y)
+    model = MojoTreesRegressor(n_estimators=6, num_leaves=5).fit(X, y)
     dump = inspection.dump_model(model)
 
     info = dump["feature_infos"][0]
@@ -205,7 +205,7 @@ def test_categorical_splits_report_their_category_codes():
     codes = gen.integers(0, 6, size=400).astype(float)
     X = np.column_stack([codes, gen.random(400)])
     y = np.where(codes % 2 == 0, 1.0, -1.0) + 0.1 * X[:, 1]
-    model = MojoBoostRegressor(
+    model = MojoTreesRegressor(
         n_estimators=5, num_leaves=5, categorical_feature=[0]
     ).fit(X, y)
     dump = inspection.dump_model(model)
@@ -239,7 +239,7 @@ def test_categorical_splits_report_their_category_codes():
 
 def test_multiclass_dump_is_round_major(multiclass):
     X, y = multiclass
-    model = MojoBoostClassifier(n_estimators=4).fit(X, y)
+    model = MojoTreesClassifier(n_estimators=4).fit(X, y)
     dump = inspection.dump_model(model)
 
     assert dump["objective"] == "multiclass"
@@ -296,10 +296,10 @@ def test_feature_names_can_be_supplied(fitted):
 
 
 def test_dump_rejects_text_that_is_not_a_model():
-    with pytest.raises(ValueError, match="not a mojoboost model"):
+    with pytest.raises(ValueError, match="not a mojotrees model"):
         inspection.dump_model("lightgbm v3\n")
     with pytest.raises(ValueError, match="newer than this build reads"):
-        inspection.dump_model("mojoboost v99\n")
+        inspection.dump_model("mojotrees v99\n")
 
 
 # -- derived shapes ------------------------------------------------------
@@ -320,7 +320,7 @@ def test_trees_to_records_has_lightgbm_columns(fitted, dump):
     assert root["parent_index"] is None
     assert root["decision_type"] == "<="
     assert root["missing_direction"] in ("left", "right")
-    # mojoboost records covers, not hessian sums, so there is no weight.
+    # mojotrees records covers, not hessian sums, so there is no weight.
     assert all(row["weight"] is None for row in rows)
     # A gain belongs to a split, so a leaf row has none and every internal
     # row has one. Before format v4 carried gains, every row was None.
@@ -404,7 +404,7 @@ def test_categorical_features_have_no_split_value_histogram():
     codes = gen.integers(0, 6, size=300).astype(float)
     X = np.column_stack([codes, gen.random(300)])
     y = np.where(codes % 2 == 0, 1.0, -1.0)
-    model = MojoBoostRegressor(
+    model = MojoTreesRegressor(
         n_estimators=3, num_leaves=5, categorical_feature=[0]
     ).fit(X, y)
     with pytest.raises(ValueError, match="is categorical"):
@@ -418,7 +418,7 @@ def test_objective_names_track_the_estimator_table():
     """`OBJECTIVE_NAMES` is a second copy of the trainer's objective codes,
     so it is checked against the table the estimators validate against."""
     by_code = {}
-    for name, code in MojoBoostRegressor._OBJECTIVES.items():
+    for name, code in MojoTreesRegressor._OBJECTIVES.items():
         by_code.setdefault(code, set()).add(name)
     for code, names in by_code.items():
         assert inspection.OBJECTIVE_NAMES[code] in names
@@ -446,7 +446,7 @@ def test_objective_is_resolved_not_echoed(regression):
     """An alias in, the canonical name out: the answer comes from the code
     the model carries, not from the string the estimator was given."""
     X, y = regression
-    model = MojoBoostRegressor(objective="mae", n_estimators=3).fit(X, y)
+    model = MojoTreesRegressor(objective="mae", n_estimators=3).fit(X, y)
     assert model.objective == "mae"
     assert inspection.objective_of(model) == "regression_l1"
 
@@ -456,7 +456,7 @@ def test_best_score_is_a_fit_time_record(fitted, regression):
     with pytest.raises(AttributeError, match="fitted without a validation"):
         inspection.best_score_of(model)
     X, y = regression
-    scored = MojoBoostRegressor(n_estimators=5).fit(
+    scored = MojoTreesRegressor(n_estimators=5).fit(
         X, y, eval_set=[(X, y)], eval_metric="l2"
     )
     assert inspection.best_score_of(scored) == pytest.approx(
@@ -465,10 +465,10 @@ def test_best_score_is_a_fit_time_record(fitted, regression):
 
 
 def test_unfitted_estimators_have_nothing_to_inspect():
-    from mojoboost import NotFittedError
+    from mojotrees import NotFittedError
 
     with pytest.raises(NotFittedError):
-        inspection.dump_model(MojoBoostRegressor())
+        inspection.dump_model(MojoTreesRegressor())
 
 
 def test_leaf_editing_is_not_offered():
@@ -498,7 +498,7 @@ def test_the_refusal_to_edit_is_reported_rather_than_discovered():
 
 def test_split_gains_sum_to_the_gain_importance(fitted, dump):
     """The dump's gains and `feature_importance("gain")` are the same
-    numbers read two ways: `src/mojoboost/importance.mojo` sums
+    numbers read two ways: `src/mojotrees/importance.mojo` sums
     `Tree.split_gain`, and so does the dump. Nothing recomputes gain
     importance from a dump, and this is what pins that."""
     model, _ = fitted

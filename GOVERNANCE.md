@@ -1,7 +1,7 @@
-# mojoboost governance
+# mojotrees governance
 
 This document says who decides what, how contributors get commit access, and
-how disagreements end. It is short on purpose. mojoboost is an experimental
+how disagreements end. It is short on purpose. mojotrees is an experimental
 public alpha maintained by volunteers, and process that outweighs the project
 is worse than no process at all.
 
@@ -13,7 +13,7 @@ is honest about what it can do.
 Three commitments follow from that.
 
 1. **A familiar surface.** LightGBM-shaped API and semantics, so that a person
-   who knows LightGBM can read mojoboost code without a translation guide.
+   who knows LightGBM can read mojotrees code without a translation guide.
    Deliberate differences are documented in
    [docs/LIGHTGBM_PARITY.md](docs/LIGHTGBM_PARITY.md), which is the behavior
    contract.
@@ -28,7 +28,7 @@ Three commitments follow from that.
 
 ## What this project is not
 
-mojoboost is not a company, a product, or a funded program. `mojoboost-ml` is a
+mojotrees is not a company, a product, or a funded program. `mojotrees` is a
 GitHub organization that exists so the repository has a neutral home, so more
 than one person can hold administrative access, and so the project outlives any
 single account. There is no legal entity behind it, nobody is employed by it,
@@ -40,7 +40,7 @@ maintainers. Response times below are intentions, not commitments.
 
 ## License and copyright
 
-mojoboost is licensed under [Apache License 2.0](LICENSE), and that governs
+mojotrees is licensed under [Apache License 2.0](LICENSE), and that governs
 both directions.
 
 - **Inbound equals outbound.** Every contribution is offered under Apache-2.0
@@ -62,8 +62,8 @@ both directions.
 
 ## Who decides
 
-During the alpha, mojoboost uses a benevolent maintainer model. Andrew Hendel
-([@ajhendel](https://github.com/ajhendel)) created mojoboost, serves as lead
+During the alpha, mojotrees uses a benevolent maintainer model. Andrew Hendel
+([@ajhendel](https://github.com/ajhendel)) created mojotrees, serves as lead
 maintainer, and holds the final call on technical direction, scope, and
 anything unresolved.
 
@@ -92,7 +92,7 @@ not maintainer prerogatives.
 
 **No contribution needs a human approval to merge.** Waiting on a maintainer to
 click a button is the single most common way an alpha loses a contributor, so
-mojoboost does not do it. Two paths exist, and both end in merged code without
+mojotrees does not do it. Two paths exist, and both end in merged code without
 a review queue.
 
 ### If you have Write access
@@ -292,7 +292,7 @@ Two changes are expected rather than hypothetical.
 - **The lightweight merge policy tightens when the alpha ends.** Automatic
   merging on a machine check is right for a project where reverting is cheap
   and nothing depends on the current release. It stops being right the moment
-  people run mojoboost on something that matters. The trigger to revisit it is
+  people run mojotrees on something that matters. The trigger to revisit it is
   a stable release, not a contributor count.
 
 Governance that outgrows the project is a failure mode, so a change that

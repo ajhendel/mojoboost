@@ -1,11 +1,11 @@
 """Objective and metric registry queries, for the Python facade.
 
-`src/mojoboost/objective_registry.mojo` is the one native registry of what
+`src/mojotrees/objective_registry.mojo` is the one native registry of what
 objectives and metrics exist, what they are called, what they need, what
 they optimize, and which backends can train them. Python holds a second
 copy of most of it today (`_METRICS`, `_ALIASES`, `_DEFAULTS` and
-`_TASK_DEFAULTS` in `python/mojoboost/_eval.py`, `_OBJECTIVES` and
-`_UNIMPLEMENTED_OBJECTIVES` in `python/mojoboost/__init__.py`). These
+`_TASK_DEFAULTS` in `python/mojotrees/_eval.py`, `_OBJECTIVES` and
+`_UNIMPLEMENTED_OBJECTIVES` in `python/mojotrees/__init__.py`). These
 functions are the seam that lets those tables be deleted:
 `handoffs/migration_21_objective_metric_registry.md` section 4 specified
 them and this module implements that specification.
@@ -34,8 +34,8 @@ from std.python import Python, PythonObject
 
 from binding_support import py_dict, py_pair
 
-from mojoboost.boosting import CUSTOM
-from mojoboost.objective_registry import (
+from mojotrees.boosting import CUSTOM
+from mojotrees.objective_registry import (
     N_BUILTIN_METRICS,
     NAME_SUPPORTED,
     NAME_UNIMPLEMENTED,
@@ -116,7 +116,7 @@ def registry_objectives() raises -> PythonObject:
 
 def registry_objective_aliases() raises -> PythonObject:
     """Every objective spelling the registry resolves, as `[alias, code]`
-    pairs. Replaces `MojoBoostRegressor._OBJECTIVES`."""
+    pairs. Replaces `MojoTreesRegressor._OBJECTIVES`."""
     var names = objective_alias_names()
     var out = Python.list()
     for i in range(len(names)):
@@ -130,7 +130,7 @@ def registry_objective_aliases() raises -> PythonObject:
 
 
 def registry_objective_unimplemented() raises -> PythonObject:
-    """Every LightGBM objective mojoboost reports by name as not
+    """Every LightGBM objective mojotrees reports by name as not
     implemented, as `[alias, canonical, reason]`.
 
     Python keeps its own sentence about which estimator to use instead,
@@ -158,7 +158,7 @@ def registry_metrics() raises -> PythonObject:
 
     `[code, canonical_name, task_name, higher_is_better, needs, transform]`
 
-    Replaces `_METRICS` in `python/mojoboost/_eval.py`.
+    Replaces `_METRICS` in `python/mojotrees/_eval.py`.
     """
     var out = Python.list()
     for code in range(N_BUILTIN_METRICS):
@@ -176,7 +176,7 @@ def registry_metrics() raises -> PythonObject:
 
 def registry_metric_aliases() raises -> PythonObject:
     """Every metric spelling the registry resolves, as `[alias, code]`
-    pairs. Replaces `_ALIASES` in `python/mojoboost/_eval.py`."""
+    pairs. Replaces `_ALIASES` in `python/mojotrees/_eval.py`."""
     var names = metric_alias_names()
     var out = Python.list()
     for i in range(len(names)):
@@ -220,7 +220,7 @@ def objective_code_of_name(name: PythonObject) raises -> PythonObject:
     handoff.
 
     Raises for a name the registry does not resolve, including a real
-    LightGBM objective mojoboost has not implemented, whose message names
+    LightGBM objective mojotrees has not implemented, whose message names
     it and says why.
     """
     return PythonObject(objective_code_from_name(String(py=name)))

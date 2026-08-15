@@ -1,7 +1,7 @@
 from std.math import log, sqrt
 from std.testing import assert_equal, assert_raises, assert_true, TestSuite
 
-from mojoboost.metrics import (
+from mojotrees.metrics import (
     average_precision,
     binary_error,
     check_metric_weight,
@@ -20,7 +20,7 @@ from mojoboost.metrics import (
     tweedie_loss,
 )
 
-from mojoboost import (
+from mojotrees import (
     BoosterParams,
     TreeParams,
     binary_accuracy,

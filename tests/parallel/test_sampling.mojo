@@ -10,9 +10,9 @@ those dense forms have to preserve, against goss.mojo's own selection.
 
 from std.testing import assert_almost_equal, assert_equal, assert_true, TestSuite
 
-from mojoboost.bagging import BaggingParams, DEFAULT_BAGGING_SEED, sample_rows
-from mojoboost.goss import GossParams, goss_select
-from mojoboost.sampling import (
+from mojotrees.bagging import BaggingParams, DEFAULT_BAGGING_SEED, sample_rows
+from mojotrees.goss import GossParams, goss_select
+from mojotrees.sampling import (
     ClassBaggingParams,
     DEFAULT_FEATURE_FRACTION_BYLEVEL,
     canonical_data_sample_strategy,
@@ -161,7 +161,7 @@ def test_alias_table_accepts_the_spellings_the_audit_flags() raises:
     assert_equal(
         canonical_sampling_param("colsample_bynode"), "feature_fraction_bynode"
     )
-    # XGBoost's per-level name, which mojoboost adds.
+    # XGBoost's per-level name, which mojotrees adds.
     assert_equal(
         canonical_sampling_param("colsample_bylevel"),
         "feature_fraction_bylevel",

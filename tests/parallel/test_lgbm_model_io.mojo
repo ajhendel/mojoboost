@@ -14,15 +14,15 @@ indented to sit inside their functions and stay readable.
 from std.os import remove
 from std.testing import assert_equal, assert_raises, assert_true, TestSuite
 
-from mojoboost.boosting import (
+from mojotrees.boosting import (
     BINARY_LOGISTIC,
     CUSTOM,
     SQUARED_ERROR,
     Booster,
     BoosterParams,
 )
-from mojoboost.categorical import CAT_BITSET_WORDS
-from mojoboost.lgbm_model_io import (
+from mojotrees.categorical import CAT_BITSET_WORDS
+from mojotrees.lgbm_model_io import (
     dump_lgbm_model,
     dump_lgbm_multiclass_model,
     lgbm_model_file_kind,
@@ -34,8 +34,8 @@ from mojoboost.lgbm_model_io import (
     parse_lgbm_multiclass_model,
     save_lgbm_model,
 )
-from mojoboost.model import Model, fit
-from mojoboost.tree import Tree, TreeParams
+from mojotrees.model import Model, fit
+from mojotrees.tree import Tree, TreeParams
 
 comptime _TMP_PATH = "./.test_lgbm_model_io.tmp"
 
@@ -291,7 +291,7 @@ def test_node_counts_come_from_leaf_and_internal_count() raises:
     assert_equal(tree.count[2], 3.0)
     assert_equal(tree.count[3], 4.0)
     assert_equal(tree.count[4], 5.0)
-    # Parents precede children, which every top-down pass in mojoboost needs.
+    # Parents precede children, which every top-down pass in mojotrees needs.
     assert_equal(tree.left[0], 1)
     assert_equal(tree.right[0], 4)
     assert_equal(tree.n_leaves, 3)
@@ -456,7 +456,7 @@ def test_rejects_averaged_output() raises:
 
 def test_rejects_mixed_missing_type_on_one_feature() raises:
     # Two nodes on feature 0 disagreeing about missing_type (2 vs 10);
-    # mojoboost reserves a missing bin per feature, so they must agree.
+    # mojotrees reserves a missing bin per feature, so they must agree.
     var text = String(
         """tree
         version=v4
@@ -538,7 +538,7 @@ def test_rejects_unsupported_version() raises:
 
 def test_rejects_text_that_is_not_a_lgbm_model() raises:
     with assert_raises():
-        _ = parse_lgbm_model(String("mojoboost v3\nobjective 0\n"))
+        _ = parse_lgbm_model(String("mojotrees v3\nobjective 0\n"))
 
 
 def test_objective_mapping_and_its_rejections() raises:

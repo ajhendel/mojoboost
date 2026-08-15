@@ -3,7 +3,7 @@ weights, clipping, and the device-resident raw-score update.
 
 `tests/test_gpu_objectives.mojo` covers GPU *training* per objective, end to
 end, where the gradients are still computed on the host. This file covers
-`src/mojoboost/gpu_objectives_native.mojo`, which moves that computation onto
+`src/mojotrees/gpu_objectives_native.mojo`, which moves that computation onto
 the device, and so tests the derivatives directly rather than through a
 trained model:
 
@@ -45,7 +45,7 @@ from std.sys import has_accelerator
 from std.testing import assert_equal, assert_raises, assert_true, TestSuite
 from max.gpu.host import DeviceContext
 
-from mojoboost.boosting import (
+from mojotrees.boosting import (
     BINARY_LOGISTIC,
     CROSS_ENTROPY,
     CUSTOM,
@@ -62,7 +62,7 @@ from mojoboost.boosting import (
     _softmax_inplace,
     fill_grad_hess,
 )
-from mojoboost.gpu_objectives_native import (
+from mojotrees.gpu_objectives_native import (
     GpuObjectiveState,
     device_fixed_scale,
     supports_device_objective,

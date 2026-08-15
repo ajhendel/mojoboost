@@ -1,8 +1,8 @@
 # Project origin and stewardship
 
-## Why mojoboost exists
+## Why mojotrees exists
 
-Andrew Hendel created mojoboost to explore a concrete systems question:
+Andrew Hendel created mojotrees to explore a concrete systems question:
 
 > Can a modern, Mojo-native gradient-boosted-tree implementation provide a
 > familiar Python experience while using the CPU and GPU already present in
@@ -65,13 +65,13 @@ systems project spanning:
 - packaging and compatibility contracts;
 - transparent capability and benchmark evidence.
 
-If mojoboost becomes useful, credit belongs both to its creator and to the
+If mojotrees becomes useful, credit belongs both to its creator and to the
 contributors whose work makes it reliable. Git history records individual
 changes; [AUTHORS.md](../AUTHORS.md) records project-level attribution.
 
 ## Current status
 
-mojoboost remains an experimental alpha. Broad implementation work and an
+mojotrees remains an experimental alpha. Broad implementation work and an
 ambitious architecture are not substitutes for clean installation, focused
 correctness evidence, reproducible performance results, or operating history.
 The repository deliberately records those distinctions in

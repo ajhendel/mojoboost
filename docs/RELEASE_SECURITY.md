@@ -1,6 +1,6 @@
 # Release security and provenance
 
-How a mojoboost release is built, recorded, published, and revoked, and what a
+How a mojotrees release is built, recorded, published, and revoked, and what a
 stranger can check about an artifact without trusting the person who published
 it.
 
@@ -31,11 +31,11 @@ are not files, are listed in
 ## 1. What is actually at risk
 
 Take the threat model seriously and it stays short, because most of the usual
-answers do not apply here. mojoboost has no server, no service, no account
+answers do not apply here. mojotrees has no server, no service, no account
 system, no credential handling, and no network access at runtime.
 
 What it does have is the thing that matters most in a supply chain, which is
-that **`pip install mojoboost` runs a compiled native library inside somebody
+that **`pip install mojotrees` runs a compiled native library inside somebody
 else's process, with their privileges, usually on a machine that also holds
 their data.** Nobody reads a `.so`. Whatever ships in the wheel is what runs.
 
@@ -103,7 +103,7 @@ One person, named, with a named alternate when one exists.
 
 | Role | Today | Responsibility |
 |---|---|---|
-| Release owner | Andrew Hendel (`ajhendel`), an owner of `mojoboost-ml` | Approves the environment gate, and is accountable for what got published |
+| Release owner | Andrew Hendel (`ajhendel`), an owner of `mojotrees` | Approves the environment gate, and is accountable for what got published |
 | Backup owner | None | Nobody else can publish, and nobody else can revoke |
 | Security contact | The same person | Triage under SECURITY.md |
 
@@ -183,8 +183,8 @@ rather than a manual upload that establishes the project.
 
 | Field | Value |
 |---|---|
-| Owner | `mojoboost-ml` |
-| Repository | `mojoboost` |
+| Owner | `mojotrees` |
+| Repository | `mojotrees` |
 | Workflow | `release-provenance.yml` |
 | Environment | `pypi` |
 
@@ -351,7 +351,7 @@ enabled here, and the reason is not a general nervousness about automation.
 passing is not a review of it.** A pull request that edits
 `.github/workflows/` can add a step that reads a secret, request extra
 permissions, add a trigger, or point an action at a different SHA, and the test
-suite will pass, because the test suite tests mojoboost and not the workflow.
+suite will pass, because the test suite tests mojotrees and not the workflow.
 The signal auto-merge consumes does not measure the risk auto-merge takes.
 
 The same is true of `packaging/`. A change to `build_wheel.sh` changes what
@@ -424,7 +424,7 @@ supplemented by
 and attested to the same digest as the wheel.
 
 The supplement is not tidying. A scanner reads a wheel as a Python
-distribution, finds `mojoboost 0.1.0`, and stops. It does not report that the
+distribution, finds `mojotrees 0.1.0`, and stops. It does not report that the
 artifact contains a compiled Mojo extension and four MAX runtime libraries
 copied out of a conda environment, which is most of the wheel by bytes and all
 of it by risk. An SBOM that omits the shipped native runtime is worse than no
@@ -666,12 +666,12 @@ python3 packaging/matrix/validate_matrix.py
 Artifact side, after a build and before publishing:
 
 ```sh
-WHEEL=$(ls python/dist/mojoboost-*.whl)
+WHEEL=$(ls python/dist/mojotrees-*.whl)
 
 # What is in the wheel, and what it links
 python3 packaging/matrix/validate_artifact.py "$WHEEL"
 unzip -l "$WHEEL"
-otool -l python/mojoboost/_mojoboost.so | grep -A 4 LC_BUILD_VERSION
+otool -l python/mojotrees/_mojotrees.so | grep -A 4 LC_BUILD_VERSION
 
 # The manifest, and a re-check of it
 python3 packaging/security/hash_manifest.py write python/dist/SHA256SUMS \
@@ -683,17 +683,17 @@ Consumer side, after a release exists:
 
 ```sh
 # Both questions, in order, with an explanation of which is which
-bash packaging/security/verify_release.sh ./mojoboost-0.1.0-cp314-cp314-macosx_26_0_arm64.whl ./SHA256SUMS
+bash packaging/security/verify_release.sh ./mojotrees-0.1.0-cp314-cp314-macosx_26_0_arm64.whl ./SHA256SUMS
 
 # Provenance on its own. --signer-workflow is not optional: without it, any
 # workflow in the repository satisfies the check
-gh attestation verify ./mojoboost-0.1.0-cp314-cp314-macosx_26_0_arm64.whl \
-    --repo mojoboost-ml/mojoboost \
-    --signer-workflow mojoboost-ml/mojoboost/.github/workflows/release-provenance.yml
+gh attestation verify ./mojotrees-0.1.0-cp314-cp314-macosx_26_0_arm64.whl \
+    --repo mojotrees/mojotrees \
+    --signer-workflow mojotrees/mojotrees/.github/workflows/release-provenance.yml
 
 # The attested SBOM, as JSON
-gh attestation verify ./mojoboost-0.1.0-cp314-cp314-macosx_26_0_arm64.whl \
-    --repo mojoboost-ml/mojoboost \
+gh attestation verify ./mojotrees-0.1.0-cp314-cp314-macosx_26_0_arm64.whl \
+    --repo mojotrees/mojotrees \
     --predicate-type https://cyclonedx.org/bom \
     --format json
 
@@ -705,13 +705,13 @@ Incident side:
 
 ```sh
 # What was published, and when
-gh api /repos/mojoboost-ml/mojoboost/actions/workflows/release-provenance.yml/runs \
+gh api /repos/mojotrees/mojotrees/actions/workflows/release-provenance.yml/runs \
     --jq '.workflow_runs[] | {id, created_at, event, actor: .actor.login, conclusion}'
 
 # Every attestation this repository holds for a digest
-gh api /repos/mojoboost-ml/mojoboost/attestations/sha256:<digest>
+gh api /repos/mojotrees/mojotrees/attestations/sha256:<digest>
 
 # Confirm no publishing secret exists. Expected: an empty list
-gh secret list --repo mojoboost-ml/mojoboost
-gh secret list --repo mojoboost-ml/mojoboost --env pypi
+gh secret list --repo mojotrees/mojotrees
+gh secret list --repo mojotrees/mojotrees --env pypi
 ```

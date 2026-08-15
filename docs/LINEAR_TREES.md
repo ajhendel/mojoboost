@@ -1,7 +1,7 @@
 # Linear trees
 
 Status: **implemented, not reachable.** The algorithm core lives in
-`src/mojoboost/linear_tree.mojo`. Nothing public reaches it:
+`src/mojotrees/linear_tree.mojo`. Nothing public reaches it:
 `params.mojo` refuses `linear_tree` and `linear_lambda` by name through
 `tree_parameters_extra.check_extra_option_supported`, `lgbm_model_io.mojo`
 refuses `is_linear=1` / `leaf_const` / `leaf_coeff` on the way in, and
@@ -10,7 +10,7 @@ that are still outstanding. `handoffs/remaining_03_linear_trees.md` carries
 each of them as a ready-to-apply patch.
 
 This document is the normative statement of what a linear leaf is in
-mojoboost, what it refuses to do, and what the model format has to gain.
+mojotrees, what it refuses to do, and what the model format has to gain.
 
 ## What a linear tree is
 
@@ -46,7 +46,7 @@ the distributed merge, `serialize._read_trees`, and the LightGBM importer)
 and read by `contrib.mojo`, `model_dump.mojo`, `gpu_predict.mojo`, and the C
 ABI. All of that would change for a feature most models never use.
 
-The representation mojoboost defines instead is a **sidecar** keyed by
+The representation mojotrees defines instead is a **sidecar** keyed by
 `(tree index, leaf ordinal)`:
 
 | Type | Holds |
@@ -161,8 +161,8 @@ split on between the root and it, LightGBM's rule) and removes, in order:
 | categorical features | a coefficient on an integer category code is meaningless; bins are set members, not magnitudes |
 | features with a non-finite raw value on any row of the leaf | see "Missing values" |
 | features whose in-leaf hessian-weighted variance is at or below `1e-12` of their scale | a constant column is a zero row and column of `A` |
-| features beyond `max_leaf_features` | mojoboost extension, off by default |
-| features the leaf has too few rows to afford (`min_data_per_linear_feature`) | mojoboost extension, off by default |
+| features beyond `max_leaf_features` | mojotrees extension, off by default |
+| features the leaf has too few rows to afford (`min_data_per_linear_feature`) | mojotrees extension, off by default |
 
 The last two trim from the bottom of one ranking: the univariate objective
 reduction `q[j]^2 / (A[j][j] + linear_lambda)`, descending, ties broken by
@@ -236,7 +236,7 @@ why `center` is stored rather than folded into the intercept.
 Routing is untouched by both. A missing value still follows `default_left`
 to a leaf exactly as in a constant-leaf tree.
 
-Both rules are **mojoboost-defined**. LightGBM's behaviour here has not been
+Both rules are **mojotrees-defined**. LightGBM's behaviour here has not been
 read off its source; see "Parity-unverified" below.
 
 ### Categorical features
@@ -305,13 +305,13 @@ that is neither the renewed constant nor the linear least-squares fit.
 
 `LAMBDARANK` produces gradients from query-group pairs. The leaf solve is
 well-defined on them, but a per-leaf regression on pairwise gradients is not
-a combination LightGBM documents or mojoboost has checked. Refused rather
+a combination LightGBM documents or mojotrees has checked. Refused rather
 than guessed at.
 
 The four codes above are **mirrored** in `linear_tree.mojo` as `_QUANTILE`,
 `_L1`, `_LAMBDARANK`, and `_MAPE` rather than imported. `Booster` is what
 holds the sidecar, so `boosting.mojo` will import `linear_tree.mojo`, and
-`src/mojoboost` has no mutual imports anywhere; the reverse edge would be
+`src/mojotrees` has no mutual imports anywhere; the reverse edge would be
 the first one. The codes are part of a stable public numbering (serialized
 in every model file, crossing the C ABI), so they do not move, and the
 handoff asks the boosting lane for a compile-time cross-check anyway. This
@@ -435,7 +435,7 @@ because a leaf it cannot reconstruct is a leaf it cannot predict from.
 
 `lgbm_model_io.mojo` refuses LightGBM linear trees on the way in today
 (`is_linear=1`, `leaf_const`, `leaf_coeff`) and that does not change here:
-mojoboost's leaf function is centered and LightGBM's is not, so an imported
+mojotrees's leaf function is centered and LightGBM's is not, so an imported
 `leaf_coeff` would need `leaf_const` reinterpreted against a centroid the
 file does not carry. Export is refused for the mirror-image reason.
 
@@ -451,10 +451,10 @@ for a missing value.
 | --- | --- | --- | --- |
 | `enabled` | `linear_tree` | `false` | |
 | `linear_lambda` | `linear_lambda` | `0.0` | L2 on the coefficients only |
-| `max_leaf_features` | none | `-1` | mojoboost extension; `-1` is no cap |
-| `min_data_per_linear_feature` | none | `0` | mojoboost extension; `0` is off |
-| `ridge_eps` | none | `1e-10` | mojoboost extension; relative diagonal jitter |
-| `max_linear_deviation` | none | `0.0` | mojoboost extension; `0.0` is off |
+| `max_leaf_features` | none | `-1` | mojotrees extension; `-1` is no cap |
+| `min_data_per_linear_feature` | none | `0` | mojotrees extension; `0` is off |
+| `ridge_eps` | none | `1e-10` | mojotrees extension; relative diagonal jitter |
+| `max_linear_deviation` | none | `0.0` | mojotrees extension; `0.0` is off |
 
 All four extensions default to inactive, so a default `LinearParams` is the
 LightGBM-shaped configuration.
@@ -463,14 +463,14 @@ LightGBM-shaped configuration.
 
 - **Split gains ignore the linear fit.** LightGBM evaluates candidate splits
   under the per-leaf regression, so its trees differ in *shape* from
-  constant-leaf ones. mojoboost grows the constant-leaf tree and refits its
+  constant-leaf ones. mojotrees grows the constant-leaf tree and refits its
   leaves. The fitted leaves are optimal for the tree that was grown; the tree
   is not the one LightGBM would have grown. This is the largest and most
   visible difference and it is not a rounding matter.
   `accumulate_leaf_stats` and `solve_leaf_coefficients` are the pieces a
   linear-aware split search would reuse; the cost is one solve per candidate
   rather than one per leaf.
-- **Centered parameterization.** mojoboost stores `center[]` and expresses
+- **Centered parameterization.** mojotrees stores `center[]` and expresses
   the leaf as `intercept + sum coef * (x - center)`. LightGBM stores
   `leaf_const` and `leaf_coeff` in raw coordinates. The two describe the same
   function family; the difference is why import and export are refused
@@ -478,7 +478,7 @@ LightGBM-shaped configuration.
 - **Regularization placement.** `linear_lambda` is applied to the
   coefficients and not to the intercept.
 - **Missing values.** Both the eligibility rule and the centre substitution
-  are mojoboost-defined.
+  are mojotrees-defined.
 - **`ridge_eps`, `max_leaf_features`, `min_data_per_linear_feature`,
   `max_linear_deviation`** have no LightGBM counterpart.
 
@@ -491,7 +491,7 @@ pattern) before any parity row moves off `deferred`:
 
 1. **Whether LightGBM's `linear_lambda` penalizes its intercept row.** It
    adds the value to the diagonal of an `(m+1)`-square system; whether the
-   intercept position is included has not been confirmed. mojoboost does not
+   intercept position is included has not been confirmed. mojotrees does not
    penalize it.
 2. **What LightGBM does with missing values in a linear leaf**, both at fit
    time and at prediction time.
@@ -508,7 +508,7 @@ document is implemented.
 Every command below is **UNRUN**. Nothing in this round was built, run, or
 tested.
 
-- `pixi run mojo build src/mojoboost/linear_tree.mojo` -- compiles the module
+- `pixi run mojo build src/mojotrees/linear_tree.mojo` -- compiles the module
   alone. **UNRUN.**
 - A focused test that a leaf fitted with `linear_lambda` large reproduces
   `Tree.value` to the last bit. **UNRUN.**

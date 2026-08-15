@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/mojoboost-ml/mojoboost/blob/main/bench/apple/schema.json",
-  "title": "mojoboost Apple silicon benchmark run record",
+  "$id": "https://github.com/mojotrees/mojotrees/blob/main/bench/apple/schema.json",
+  "title": "mojotrees Apple silicon benchmark run record",
   "description": "One file per run of bench/apple/suite.py on one machine. A record is a complete description of what was measured, under what conditions, with every quantity that was not measured explicitly null and carrying a reason. Absence of a number is a fact the record must state, never a zero. The protocol these fields come from is docs/APPLE_GPU_BENCHMARK_PROTOCOL.md.",
   "type": "object",
   "additionalProperties": false,
@@ -151,7 +151,7 @@
       "description": "Everything whose version can move a number. A null version means the component was absent, and a measurement that needed it carries status unsupported.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["os_name", "os_version", "python", "mojo", "max", "mojoboost", "lightgbm", "xgboost", "numpy"],
+      "required": ["os_name", "os_version", "python", "mojo", "max", "mojotrees", "lightgbm", "xgboost", "numpy"],
       "properties": {
         "os_name": { "$ref": "#/$defs/nullable_string" },
         "os_version": { "$ref": "#/$defs/nullable_string" },
@@ -160,9 +160,9 @@
         "python": { "$ref": "#/$defs/nullable_string" },
         "mojo": { "$ref": "#/$defs/nullable_string" },
         "max": { "$ref": "#/$defs/nullable_string" },
-        "mojoboost": { "$ref": "#/$defs/nullable_string" },
-        "mojoboost_gpu_build": {
-          "description": "mojoboost.gpu_available(), which is a property of the build and the machine together. False means the GPU rows of this record are unsupported, not slow.",
+        "mojotrees": { "$ref": "#/$defs/nullable_string" },
+        "mojotrees_gpu_build": {
+          "description": "mojotrees.gpu_available(), which is a property of the build and the machine together. False means the GPU rows of this record are unsupported, not slow.",
           "type": ["boolean", "null"]
         },
         "lightgbm": { "$ref": "#/$defs/nullable_string" },
@@ -333,7 +333,7 @@
       "required": ["name", "device", "requested_threads", "resolved_threads"],
       "properties": {
         "name": {
-          "enum": ["mojoboost_cpu", "mojoboost_gpu", "lightgbm_cpu", "xgboost_cpu", "xgboost_gpu"]
+          "enum": ["mojotrees_cpu", "mojotrees_gpu", "lightgbm_cpu", "xgboost_cpu", "xgboost_gpu"]
         },
         "version": { "$ref": "#/$defs/nullable_string" },
         "device": { "enum": ["cpu", "gpu"] },
@@ -347,7 +347,7 @@
           "$ref": "#/$defs/nullable_integer"
         },
         "device_resolved": {
-          "description": "The backend that actually ran, from the library itself, for example mojoboost's device_ attribute. A gpu row whose device_resolved is cpu is a bug in the record, not a fast CPU.",
+          "description": "The backend that actually ran, from the library itself, for example mojotrees's device_ attribute. A gpu row whose device_resolved is cpu is a bug in the record, not a fast CPU.",
           "$ref": "#/$defs/nullable_string"
         },
         "env": {
@@ -360,7 +360,7 @@
           "type": "object"
         },
         "comparability": {
-          "description": "How the engine's semantics differ from mojoboost's on this workload, when they do. A note here means timings are comparable but the fitted models are not the same model.",
+          "description": "How the engine's semantics differ from mojotrees's on this workload, when they do. A note here means timings are comparable but the fitted models are not the same model.",
           "type": "array",
           "items": { "type": "string" }
         }
@@ -375,7 +375,7 @@
         "workload": { "$ref": "#/$defs/workload" },
         "engine": { "$ref": "#/$defs/engine" },
         "status": {
-          "description": "ok when every repetition completed. unsupported when the engine cannot express the workload, for example mojoboost_gpu on sparse input. skipped when the plan excluded it. error when a repetition raised, in which case message carries the exception text.",
+          "description": "ok when every repetition completed. unsupported when the engine cannot express the workload, for example mojotrees_gpu on sparse input. skipped when the plan excluded it. error when a repetition raised, in which case message carries the exception text.",
           "enum": ["ok", "unsupported", "skipped", "error"]
         },
         "message": { "$ref": "#/$defs/nullable_string" },
@@ -422,7 +422,7 @@
           "$ref": "#/$defs/nullable_number"
         },
         "binning_s": {
-          "description": "Quantile binning of the training matrix, host side, before any tree is grown. mojoboost exposes it as Dataset.construct(); LightGBM as lgb.Dataset.construct(); XGBoost as QuantileDMatrix construction.",
+          "description": "Quantile binning of the training matrix, host side, before any tree is grown. mojotrees exposes it as Dataset.construct(); LightGBM as lgb.Dataset.construct(); XGBoost as QuantileDMatrix construction.",
           "$ref": "#/$defs/nullable_number"
         },
         "warmup_compile_s": {
@@ -532,7 +532,7 @@
           "$ref": "#/$defs/nullable_string"
         },
         "max_abs_diff_vs_cpu": {
-          "description": "Largest absolute difference between this engine's held-out raw predictions and the mojoboost CPU predictions on the same workload, when that reference ran.",
+          "description": "Largest absolute difference between this engine's held-out raw predictions and the mojotrees CPU predictions on the same workload, when that reference ran.",
           "$ref": "#/$defs/nullable_number"
         }
       }

@@ -3,7 +3,7 @@
 Normative. What a reader must do with a file of each version, what is
 recoverable and what is not, and what a new version is allowed to change.
 
-The format itself is defined by `src/mojoboost/serialize.mojo`, whose
+The format itself is defined by `src/mojotrees/serialize.mojo`, whose
 version history is the source this document is written from. Section 7 of
 [docs/COMPATIBILITY_POLICY.md](../docs/COMPATIBILITY_POLICY.md) is the
 promise; this document is the per-step rule that makes the promise
@@ -133,11 +133,11 @@ to disagree.
 
 | Constant | File | Says |
 |---|---|---|
-| `_VERSION` | `src/mojoboost/serialize.mojo` | The token the writer writes |
+| `_VERSION` | `src/mojotrees/serialize.mojo` | The token the writer writes |
 | `CURRENT_FORMAT_VERSION` | same | That token as an integer |
 | the `_read_version` chain | same | Which tokens the reader accepts |
-| `MODEL_FORMAT_VERSION` | `src/mojoboost/model_dump.mojo` | What a dump reports |
-| `SUPPORTED_MODEL_FORMAT_VERSIONS` | `python/mojoboost/inspection.py` | What the pure-Python fallback parser accepts |
+| `MODEL_FORMAT_VERSION` | `src/mojotrees/model_dump.mojo` | What a dump reports |
+| `SUPPORTED_MODEL_FORMAT_VERSIONS` | `python/mojotrees/inspection.py` | What the pure-Python fallback parser accepts |
 
 The invariants are I2 through I5 in
 [SNAPSHOT_SCHEMA.md](SNAPSHOT_SCHEMA.md) section 6, and
@@ -161,10 +161,10 @@ Adding a version is not complete until:
    The old fixtures are not regenerated. Regenerating them destroys the
    only evidence that the backward promise holds, and it is the single
    most likely mistake in this whole directory.
-3. `SUPPORTED_MODEL_FORMAT_VERSIONS` in `python/mojoboost/inspection.py`
+3. `SUPPORTED_MODEL_FORMAT_VERSIONS` in `python/mojotrees/inspection.py`
    includes the new version, or the pure-Python parser cannot read what
    the same build just wrote (invariant I5).
-4. `MODEL_FORMAT_VERSION` in `src/mojoboost/model_dump.mojo` matches
+4. `MODEL_FORMAT_VERSION` in `src/mojotrees/model_dump.mojo` matches
    (invariant I4).
 5. The read-back table in section 7.2 of the compatibility policy gains a
    row, which is release gate item B3.

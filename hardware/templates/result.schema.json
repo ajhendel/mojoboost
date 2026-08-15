@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/mojoboost-ml/mojoboost/blob/main/hardware/templates/result.schema.json",
-  "title": "mojoboost outside hardware validation record",
+  "$id": "https://github.com/mojotrees/mojotrees/blob/main/hardware/templates/result.schema.json",
+  "title": "mojotrees outside hardware validation record",
   "description": "One file per device per session, written by an outside contributor and reviewed by a maintainer before anything in the repository changes. A record describes what was run, on what, and what happened. Every quantity that was not measured is null and carries a reason. Absence of a number is a fact the record states, never a zero and never an estimate. The procedures these fields come from are docs/GPU_VALIDATION.md and, for Apple timing and energy, docs/APPLE_GPU_BENCHMARK_PROTOCOL.md. The contributor protocol is docs/HARDWARE_CONTRIBUTORS.md. Nothing has ever been validated against this schema; it is a specification, not a tested program.",
   "type": "object",
   "additionalProperties": false,
@@ -84,7 +84,7 @@
       "required": ["grant", "spdx", "attribution_required"],
       "properties": {
         "grant": {
-          "description": "True means: this record, its raw output, and the numbers in it may be committed to the mojoboost repository, quoted in its documentation, and redistributed with it.",
+          "description": "True means: this record, its raw output, and the numbers in it may be committed to the mojotrees repository, quoted in its documentation, and redistributed with it.",
           "type": "boolean"
         },
         "spdx": {
@@ -93,7 +93,7 @@
           "enum": ["Apache-2.0", "CC0-1.0", "other"]
         },
         "attribution_required": {
-          "description": "True by default. mojoboost attributes every contributed record whether or not the contributor requires it; setting this false only waives the requirement, it does not request anonymity.",
+          "description": "True by default. mojotrees attributes every contributed record whether or not the contributor requires it; setting this false only waives the requirement, it does not request anonymity.",
           "type": "boolean",
           "default": true
         },
@@ -139,7 +139,7 @@
           "$ref": "#/$defs/nullable_number"
         },
         "device_count": {
-          "description": "How many accelerators were visible. mojoboost uses one. A record from a multi-GPU host says so, because it changes nothing in the code and everything in how a timing is read.",
+          "description": "How many accelerators were visible. mojotrees uses one. A record from a multi-GPU host says so, because it changes nothing in the code and everything in how a timing is read.",
           "$ref": "#/$defs/nullable_number"
         },
         "machine_kind": {
@@ -159,7 +159,7 @@
       }
     },
     "host": {
-      "description": "The machine around the accelerator. mojoboost bins on the CPU and stages every transfer through host memory, so the host is part of every timing.",
+      "description": "The machine around the accelerator. mojotrees bins on the CPU and stages every transfer through host memory, so the host is part of every timing.",
       "type": "object",
       "additionalProperties": false,
       "required": ["os_name", "os_version", "arch"],
@@ -203,7 +203,7 @@
           "$ref": "#/$defs/nullable_string"
         },
         "toolkit_version": {
-          "description": "nvcc or hipcc version. Not required to run mojoboost; required only for the profilers.",
+          "description": "nvcc or hipcc version. Not required to run mojotrees; required only for the profilers.",
           "$ref": "#/$defs/nullable_string"
         },
         "present": {
@@ -245,7 +245,7 @@
       }
     },
     "source": {
-      "description": "Which mojoboost was run. A commit is not optional; a timing without one describes nothing anybody can return to.",
+      "description": "Which mojotrees was run. A commit is not optional; a timing without one describes nothing anybody can return to.",
       "type": "object",
       "additionalProperties": false,
       "required": ["commit"],
@@ -335,7 +335,7 @@
         "repeat_runs_identical": { "type": ["boolean", "null"], "default": null },
         "repeat_count": { "$ref": "#/$defs/nullable_number" },
         "strategies_agree": {
-          "description": "MOJOBOOST_GPU_HIST_STRATEGY=atomic against tiled, on the same shape. A divergence is a correctness bug, not a tuning result.",
+          "description": "MOJOTREES_GPU_HIST_STRATEGY=atomic against tiled, on the same shape. A divergence is a correctness bug, not a tuning result.",
           "type": ["boolean", "null"],
           "default": null
         },
@@ -561,12 +561,12 @@
           "type": ["object", "null"],
           "additionalProperties": false,
           "properties": {
-            "MOJOBOOST_NUM_WORKERS": { "$ref": "#/$defs/nullable_string" },
-            "MOJOBOOST_PARALLEL_MIN_OPS": { "$ref": "#/$defs/nullable_string" },
-            "MOJOBOOST_GPU_HIST_STRATEGY": { "$ref": "#/$defs/nullable_string" },
-            "MOJOBOOST_GPU_ROW_TILE": { "$ref": "#/$defs/nullable_string" },
-            "MOJOBOOST_GPU_BLOCK_THREADS": { "$ref": "#/$defs/nullable_string" },
-            "MOJOBOOST_DISABLE_GPU": { "$ref": "#/$defs/nullable_string" }
+            "MOJOTREES_NUM_WORKERS": { "$ref": "#/$defs/nullable_string" },
+            "MOJOTREES_PARALLEL_MIN_OPS": { "$ref": "#/$defs/nullable_string" },
+            "MOJOTREES_GPU_HIST_STRATEGY": { "$ref": "#/$defs/nullable_string" },
+            "MOJOTREES_GPU_ROW_TILE": { "$ref": "#/$defs/nullable_string" },
+            "MOJOTREES_GPU_BLOCK_THREADS": { "$ref": "#/$defs/nullable_string" },
+            "MOJOTREES_DISABLE_GPU": { "$ref": "#/$defs/nullable_string" }
           }
         },
         "repetitions": {

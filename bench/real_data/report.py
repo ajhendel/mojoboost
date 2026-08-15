@@ -225,18 +225,18 @@ def render(records, config, out):
 
 
 def _ratios(rows, min_repeats, out):
-    """mojoboost against lightgbm at matched device and thread count."""
+    """mojotrees against lightgbm at matched device and thread count."""
     pairs = []
     for key, cell in rows.items():
         scenario, engine, device, threads = key
-        if engine != "mojoboost":
+        if engine != "mojotrees":
             continue
         other = rows.get((scenario, "lightgbm", device, threads))
         if other:
             pairs.append((device, threads, cell, other))
     if not pairs:
         return
-    out("\n| device | threads | train mojoboost / lightgbm | binning | predict |")
+    out("\n| device | threads | train mojotrees / lightgbm | binning | predict |")
     out("| --- | --- | --- | --- | --- |")
     for device, threads, mine, theirs in sorted(pairs, key=lambda p: (p[0], p[1])):
         cols = []
@@ -252,7 +252,7 @@ def _ratios(rows, min_repeats, out):
         out(f"| {device} | {threads} | " + " | ".join(cols) + " |")
     out(
         f"\nRatios are medians over at least {min_repeats} repeats, and read as "
-        "mojoboost divided by lightgbm, so below 1.00 is mojoboost being "
+        "mojotrees divided by lightgbm, so below 1.00 is mojotrees being "
         "quicker. They describe this machine on this day under the conditions "
         "named above. Nothing here is a claim about either library in general.\n"
     )

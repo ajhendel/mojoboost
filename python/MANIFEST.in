@@ -1,4 +1,4 @@
-# mojoboost publishes no source distribution.
+# mojotrees publishes no source distribution.
 #
 # The `sdist` row of packaging/matrix/platform_matrix.toml is
 # `unsupported` and the reason is not squeamishness: an sdist cannot build
@@ -23,8 +23,8 @@
 # Build outputs, staged into the package by packaging/build_wheel.sh.
 # Never in an sdist under any circumstances: they are unlabeled by
 # platform and by interpreter once outside a tagged wheel.
-exclude mojoboost/_mojoboost.so
-prune mojoboost/.dylibs
+exclude mojotrees/_mojotrees.so
+prune mojotrees/.dylibs
 
 # The test suites are run from the checkout and from a clean venv against
 # an installed wheel (packaging/test_wheel.sh). Neither reads them from a

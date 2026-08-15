@@ -1,5 +1,5 @@
 #!/bin/sh
-# mojoboost environment capture: Apple silicon, Metal.
+# mojotrees environment capture: Apple silicon, Metal.
 #
 # Prints the machine, Metal toolchain, and thermal metadata that
 # hardware/templates/result_apple.json asks for. Run it once, keep the output,
@@ -14,7 +14,7 @@
 #
 # What this script does not do, by construction: install anything, run a
 # package manager, use sudo, write any file, set any variable outside its own
-# shell, contact the network, upload anything, or build any part of mojoboost.
+# shell, contact the network, upload anything, or build any part of mojotrees.
 # It never runs powermetrics, which needs root. Read it before you run it; it is
 # short on purpose.
 #
@@ -30,7 +30,7 @@
 # than from `system_profiler SPHardwareDataType`, because that report contains
 # the serial number and the hardware UUID and this record needs neither. The
 # display report is asked for at `-detailLevel mini` for the same reason. The
-# only environment variables printed are the named mojoboost and threading ones
+# only environment variables printed are the named mojotrees and threading ones
 # below. Absolute paths in tool output can still contain your username, so read
 # the file before you attach it, and say what you changed if you change
 # anything.
@@ -71,15 +71,15 @@ run() {
 }
 
 show_var() {
-    eval "value=\"\${$1-__mojoboost_unset__}\""
-    if [ "$value" = "__mojoboost_unset__" ]; then
+    eval "value=\"\${$1-__mojotrees_unset__}\""
+    if [ "$value" = "__mojotrees_unset__" ]; then
         printf '%s=<unset>\n' "$1"
     else
         printf '%s=%s\n' "$1" "$value"
     fi
 }
 
-printf 'mojoboost hardware capture\n'
+printf 'mojotrees hardware capture\n'
 printf 'vendor:           apple\n'
 printf 'api:              metal\n'
 printf 'capture script:   hardware/capture/capture_apple.sh\n'
@@ -125,7 +125,7 @@ run 'mojo --version'
 run 'command -v python3'
 run 'python3 --version'
 
-section "mojoboost source"
+section "mojotrees source"
 run 'git rev-parse HEAD'
 run 'git rev-parse --abbrev-ref HEAD'
 run 'git status --porcelain'
@@ -135,13 +135,13 @@ if [ "$COMMANDS_ONLY" -eq 1 ]; then
     printf '\n(the fixed variable allowlist, printed one per line)\n'
 else
     printf '\n'
-    show_var MOJOBOOST_NUM_WORKERS
-    show_var MOJOBOOST_PARALLEL_MIN_OPS
-    show_var MOJOBOOST_DISABLE_GPU
-    show_var MOJOBOOST_GPU_HIST_STRATEGY
-    show_var MOJOBOOST_GPU_ROW_TILE
-    show_var MOJOBOOST_GPU_BLOCK_THREADS
-    show_var MOJOBOOST_AUTO_MIN_CELLS
+    show_var MOJOTREES_NUM_WORKERS
+    show_var MOJOTREES_PARALLEL_MIN_OPS
+    show_var MOJOTREES_DISABLE_GPU
+    show_var MOJOTREES_GPU_HIST_STRATEGY
+    show_var MOJOTREES_GPU_ROW_TILE
+    show_var MOJOTREES_GPU_BLOCK_THREADS
+    show_var MOJOTREES_AUTO_MIN_CELLS
     show_var OMP_NUM_THREADS
     show_var MKL_NUM_THREADS
     show_var VECLIB_MAXIMUM_THREADS

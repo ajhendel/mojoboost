@@ -26,7 +26,7 @@ become false and a deferred row cannot quietly stay false:
 Check 9 exists because check 7 has a blind spot: it only looks at rows that
 say `deferred` or `unsupported`, so a `partial` row can keep claiming a
 capability is out of reach long after the name landed in
-`mojoboost.__all__`. Reachability is not a claim about quality, so it is
+`mojotrees.__all__`. Reachability is not a claim about quality, so it is
 the one cell a script can decide outright rather than referring to a human.
 
 Reachability of a *module* is a different question, and this script does not
@@ -36,10 +36,10 @@ it. Two import graphs would be the duplication all three exist to find.
 
 Check 7 deserves a word, because it is the one that can be got wrong in a
 way that produces a false claim. A watch is a list of public names: an entry
-in `mojoboost.__all__` or in a submodule's `__all__`, a method on a public
+in `mojotrees.__all__` or in a submodule's `__all__`, a method on a public
 class, an argument of a public method, a fitted attribute, or a name
-re-exported from `src/mojoboost/__init__.mojo`. **A file path is never a
-probe.** A module can sit in `src/mojoboost/` fully implemented, fully
+re-exported from `src/mojotrees/__init__.mojo`. **A file path is never a
+probe.** A module can sit in `src/mojotrees/` fully implemented, fully
 tested, and reachable by nobody, which is exactly the state several modules
 are in today; upgrading a row because a file appeared would turn this script
 into a generator of false claims rather than a defense against them. When
@@ -65,10 +65,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 CONTRACT = ROOT / "docs" / "LIGHTGBM_PARITY.md"
 LEVELS_DOC = ROOT / "docs" / "CAPABILITY_LEVELS.md"
-PY_PKG = ROOT / "python" / "mojoboost"
+PY_PKG = ROOT / "python" / "mojotrees"
 PY_API = PY_PKG / "__init__.py"
 PY_BASIC = PY_PKG / "basic.py"
-MOJO_INIT = ROOT / "src" / "mojoboost" / "__init__.mojo"
+MOJO_INIT = ROOT / "src" / "mojotrees" / "__init__.mojo"
 PIXI = ROOT / "pixi.toml"
 
 STATUSES = {"supported", "partial", "different", "deferred", "unsupported"}
@@ -216,9 +216,9 @@ REQUIRED_PY_ALL = [
     "Booster",
     "Dataset",
     "train",
-    "MojoBoostRegressor",
-    "MojoBoostClassifier",
-    "MojoBoostRanker",
+    "MojoTreesRegressor",
+    "MojoTreesClassifier",
+    "MojoTreesRanker",
     "NotFittedError",
     "gpu_available",
     "group_from_query_ids",
@@ -226,8 +226,8 @@ REQUIRED_PY_ALL = [
 ]
 
 REQUIRED_PY_METHODS = {
-    "MojoBoostRegressor": ["fit", "predict", "score", "save", "load"],
-    "MojoBoostClassifier": [
+    "MojoTreesRegressor": ["fit", "predict", "score", "save", "load"],
+    "MojoTreesClassifier": [
         "fit",
         "predict",
         "predict_proba",
@@ -235,7 +235,7 @@ REQUIRED_PY_METHODS = {
         "save",
         "load",
     ],
-    "MojoBoostRanker": ["fit", "predict", "score", "save", "load"],
+    "MojoTreesRanker": ["fit", "predict", "score", "save", "load"],
 }
 
 # Hyperparameters the contract lists as supported or as accepted aliases.
@@ -282,7 +282,7 @@ REQUIRED_BASE_PARAMS = [
 
 # Validation-set arguments the contract lists as supported.
 REQUIRED_FIT_ARGS = {
-    "MojoBoostRegressor": [
+    "MojoTreesRegressor": [
         "sample_weight",
         "eval_set",
         "eval_names",
@@ -292,7 +292,7 @@ REQUIRED_FIT_ARGS = {
         "min_delta",
         "callbacks",
     ],
-    "MojoBoostClassifier": [
+    "MojoTreesClassifier": [
         "sample_weight",
         "eval_set",
         "eval_names",
@@ -302,7 +302,7 @@ REQUIRED_FIT_ARGS = {
         "min_delta",
         "callbacks",
     ],
-    "MojoBoostRanker": [
+    "MojoTreesRanker": [
         "group",
         "sample_weight",
         "eval_set",
@@ -313,7 +313,7 @@ REQUIRED_FIT_ARGS = {
 
 # Prediction options the contract lists as supported.
 REQUIRED_PREDICT_ARGS = {
-    "MojoBoostRegressor": [
+    "MojoTreesRegressor": [
         "raw_score",
         "start_iteration",
         "num_iteration",
@@ -321,7 +321,7 @@ REQUIRED_PREDICT_ARGS = {
         "pred_contrib",
         "validate_features",
     ],
-    "MojoBoostClassifier": [
+    "MojoTreesClassifier": [
         "raw_score",
         "start_iteration",
         "num_iteration",
@@ -329,7 +329,7 @@ REQUIRED_PREDICT_ARGS = {
         "pred_contrib",
         "validate_features",
     ],
-    "MojoBoostRanker": [
+    "MojoTreesRanker": [
         "raw_score",
         "start_iteration",
         "num_iteration",
@@ -390,7 +390,7 @@ REQUIRED_FITTED_ATTRS = [
 ]
 
 # Public Mojo names the supported rows depend on, as exported from
-# src/mojoboost/__init__.mojo.
+# src/mojotrees/__init__.mojo.
 REQUIRED_MOJO_EXPORTS = [
     "Model",
     "MulticlassModel",
@@ -460,16 +460,16 @@ REQUIRED_MOJO_EXPORTS = [
 # fails loudly instead of aging into a false claim.
 #
 # Probe grammar, all symbol based and never path based:
-#   pyall:NAME              NAME in mojoboost.__all__
-#   pysub:MODULE:NAME       NAME in python/mojoboost/MODULE.py's __all__
+#   pyall:NAME              NAME in mojotrees.__all__
+#   pysub:MODULE:NAME       NAME in python/mojotrees/MODULE.py's __all__
 #   pymethod:CLASS.METHOD   METHOD defined on CLASS (__init__.py or basic.py)
 #   pyarg:CLASS.METHOD:ARG  ARG is a parameter of CLASS.METHOD
 #   pyattr:NAME             NAME in _Base._FITTED_ATTRS
-#   mojo:NAME               NAME re-exported from src/mojoboost/__init__.mojo
-#   env:MOJOBOOST_NAME      the variable is read by a shipping source file
+#   mojo:NAME               NAME re-exported from src/mojotrees/__init__.mojo
+#   env:MOJOTREES_NAME      the variable is read by a shipping source file
 #
 # `env:` is the one probe that is not a name a caller writes, and it is here
-# because section 2 of docs/COMPATIBILITY_POLICY.md makes the MOJOBOOST_*
+# because section 2 of docs/COMPATIBILITY_POLICY.md makes the MOJOTREES_*
 # variables public: a capability a user turns on that way is reachable, and
 # a row claiming otherwise is as wrong as one that misses an export. See
 # env_var_names for what counts as reading one.
@@ -479,16 +479,16 @@ REQUIRED_MOJO_EXPORTS = [
 STALE_DEFERRED_WATCHES = {
     "Sequence": ["pyall:Sequence"],
     "DaskLGBMRegressor / DaskLGBMClassifier / DaskLGBMRanker": [
-        "pyall:DaskMojoBoostRegressor",
+        "pyall:DaskMojoTreesRegressor",
     ],
     "register_logger": ["pyall:register_logger"],
     "plot_importance": ["pyall:plot_importance"],
     "plot_metric": ["pyall:plot_metric"],
     "plot_split_value_histogram": ["pyall:plot_split_value_histogram"],
     "plot_tree / create_tree_digraph": ["pyall:plot_tree"],
-    "fit(init_score=)": ["pyarg:MojoBoostRegressor.fit:init_score"],
-    "fit(eval_init_score=)": ["pyarg:MojoBoostRegressor.fit:eval_init_score"],
-    "fit(init_model=)": ["pyarg:MojoBoostRegressor.fit:init_model"],
+    "fit(init_score=)": ["pyarg:MojoTreesRegressor.fit:init_score"],
+    "fit(eval_init_score=)": ["pyarg:MojoTreesRegressor.fit:eval_init_score"],
+    "fit(init_model=)": ["pyarg:MojoTreesRegressor.fit:init_model"],
     "objective_": ["pyattr:objective_"],
     "Booster.rollback_one_iter / reset_parameter": [
         "pymethod:Booster.rollback_one_iter",
@@ -521,8 +521,8 @@ STALE_DEFERRED_WATCHES = {
     "Distributed transport": ["mojo:RankAddress"],
     "Remaining tree-parameter rules": ["mojo:passes_min_gain"],
     "Per-level feature sampling": ["mojo:select_level_features"],
-    "Dask adapter (`mojoboost.dask`)": ["pyall:DaskMojoBoostRegressor"],
-    "Explainable device selection (`mojoboost.device_selection`)": [
+    "Dask adapter (`mojotrees.dask`)": ["pyall:DaskMojoTreesRegressor"],
+    "Explainable device selection (`mojotrees.device_selection`)": [
         "pyall:explain_device_choice",
     ],
 }
@@ -532,7 +532,7 @@ STALE_DEFERRED_WATCHES = {
 #
 # STALE_DEFERRED_WATCHES only fires on `deferred` and `unsupported` rows, so
 # a row that says `partial` can carry `publicly reachable: no` forever while
-# the symbol behind it quietly lands in `mojoboost.__all__`. Three rows rot
+# the symbol behind it quietly lands in `mojotrees.__all__`. Three rows rot
 # that way before this check existed: `cv`, `inspection`, and
 # `device_selection` all became reachable in one afternoon and all three
 # tables still said they were not.
@@ -545,7 +545,7 @@ STALE_DEFERRED_WATCHES = {
 #
 # Every probe here is `pyall:`, deliberately. A capability is watchable this
 # way only when one public name decides it, and on the Python side that
-# holds: a name is in `mojoboost.__all__` or it is not. On the Mojo side it
+# holds: a name is in `mojotrees.__all__` or it is not. On the Mojo side it
 # does not. Section 2 of `docs/COMPATIBILITY_POLICY.md` makes the parameter
 # string `parse_params` accepts public too, so a capability can be reachable
 # through `enable_bundle=true` with no exported symbol anywhere, and a probe
@@ -553,20 +553,20 @@ STALE_DEFERRED_WATCHES = {
 # can already ask for. Those rows stay under STALE_DEFERRED_WATCHES, which
 # asks a human rather than deciding.
 PUBLIC_REACHABILITY_PROBES = {
-    "Cross-validation (mojoboost.cv)": ["pyall:cv", "pyall:CVBooster"],
-    "Model inspection and dump (mojoboost.inspection)": [
+    "Cross-validation (mojotrees.cv)": ["pyall:cv", "pyall:CVBooster"],
+    "Model inspection and dump (mojotrees.inspection)": [
         "pyall:dump_model",
         "pyall:trees_to_dataframe",
         "pyall:trees_to_records",
         "pyall:get_split_value_histogram",
     ],
-    "Explainable device selection (mojoboost.device_selection)": [
+    "Explainable device selection (mojotrees.device_selection)": [
         "pyall:explain_device_choice",
     ],
-    "Startup diagnostics (mojoboost.diagnostics)": ["pyall:describe_install"],
-    "Dask adapter (mojoboost.dask)": ["pyall:DaskMojoBoostRegressor"],
+    "Startup diagnostics (mojotrees.diagnostics)": ["pyall:describe_install"],
+    "Dask adapter (mojotrees.dask)": ["pyall:DaskMojoTreesRegressor"],
     "Class-batched GPU multiclass rounds": [
-        "env:MOJOBOOST_GPU_CLASS_BATCH",
+        "env:MOJOTREES_GPU_CLASS_BATCH",
     ],
 }
 
@@ -854,7 +854,7 @@ def check_reachability_cells(text, problems):
 
 
 def mojo_export_names():
-    """Names re-exported from src/mojoboost/__init__.mojo."""
+    """Names re-exported from src/mojotrees/__init__.mojo."""
     text = MOJO_INIT.read_text()
     names = set()
     for block in re.findall(r"import\s*\(([^)]*)\)", text):
@@ -868,20 +868,20 @@ def mojo_export_names():
 
 
 def env_var_names():
-    """`MOJOBOOST_*` names a shipping source file reads.
+    """`MOJOTREES_*` names a shipping source file reads.
 
     Section 2 of `docs/COMPATIBILITY_POLICY.md` makes these part of the
     public surface, so a capability whose only route is an environment
     variable is still publicly reachable, and that claim needs the same kind
     of evidence as an exported name. A variable named only in a comment or a
     document is not a route: the name has to appear inside a string literal
-    in a file under `src/mojoboost`, `bindings`, or `python/mojoboost`,
+    in a file under `src/mojotrees`, `bindings`, or `python/mojotrees`,
     which is where every reader of one lives.
     """
     names = set()
-    quoted = re.compile(r"[\"'](MOJOBOOST_[A-Z0-9_]+)[\"']")
+    quoted = re.compile(r"[\"'](MOJOTREES_[A-Z0-9_]+)[\"']")
     for base, pattern in (
-        (ROOT / "src" / "mojoboost", "*.mojo"),
+        (ROOT / "src" / "mojotrees", "*.mojo"),
         (ROOT / "bindings", "*.mojo"),
         (PY_PKG, "*.py"),
     ):
@@ -1203,27 +1203,27 @@ def python_runtime(problems):
     """The same names again from the built package, when it imports."""
     sys.path.insert(0, str(ROOT / "python"))
     try:
-        import mojoboost  # noqa: PLC0415
+        import mojotrees  # noqa: PLC0415
     except Exception as exc:  # pragma: no cover - depends on the build
         print(f"  (skipped live import: {type(exc).__name__}: {exc})")
         return
     finally:
         sys.path.pop(0)
     for name in REQUIRED_PY_ALL:
-        if not hasattr(mojoboost, name):
+        if not hasattr(mojotrees, name):
             fail(problems, f"python: the built package has no {name}")
     print("  (live import checked)")
 
 
 def mojo_exports(problems):
-    """Names re-exported from src/mojoboost/__init__.mojo."""
+    """Names re-exported from src/mojotrees/__init__.mojo."""
     names = mojo_export_names()
     for name in REQUIRED_MOJO_EXPORTS:
         if name not in names:
             fail(
                 problems,
                 f"mojo: {name} is no longer exported from "
-                "src/mojoboost/__init__.mojo",
+                "src/mojotrees/__init__.mojo",
             )
 
 
@@ -1277,7 +1277,7 @@ def _monotone_carriers():
     reading does not scale to the next one.
     """
     carriers = {}
-    for path in sorted((ROOT / "src" / "mojoboost").glob("*.mojo")):
+    for path in sorted((ROOT / "src" / "mojotrees").glob("*.mojo")):
         text = path.read_text()
         for name, block in _struct_blocks(text):
             stores = re.search(
@@ -1326,7 +1326,7 @@ def monotone_passthrough(problems):
         )
         return
     seen_exempt = set()
-    roots = [ROOT / "src" / "mojoboost", ROOT / "bindings"]
+    roots = [ROOT / "src" / "mojotrees", ROOT / "bindings"]
     for base in roots:
         if not base.is_dir():
             continue

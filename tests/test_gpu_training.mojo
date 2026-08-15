@@ -11,21 +11,21 @@ machines.
 from std.sys import has_accelerator
 from std.testing import assert_equal, assert_true, TestSuite
 
-from mojoboost.bagging import BaggingParams, sample_rows
-from mojoboost.binning import bin_equal_width
-from mojoboost.boosting import (
+from mojotrees.bagging import BaggingParams, sample_rows
+from mojotrees.binning import bin_equal_width
+from mojotrees.boosting import (
     BINARY_LOGISTIC,
     SQUARED_ERROR,
     BoosterParams,
     train,
 )
-from mojoboost.goss import GossParams
-from mojoboost.histogram import build_histogram_subset
-from mojoboost.histogram_gpu import GpuHistogramBuilder
-from mojoboost.monotone import MonotoneConstraints
-from mojoboost.sampling import select_tree_features, selection_count
-from mojoboost.train_gpu import train_gpu
-from mojoboost.tree import TreeParams
+from mojotrees.goss import GossParams
+from mojotrees.histogram import build_histogram_subset
+from mojotrees.histogram_gpu import GpuHistogramBuilder
+from mojotrees.monotone import MonotoneConstraints
+from mojotrees.sampling import select_tree_features, selection_count
+from mojotrees.train_gpu import train_gpu
+from mojotrees.tree import TreeParams
 
 
 def _splitmix64(state: UInt64) -> UInt64:

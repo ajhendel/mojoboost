@@ -12,7 +12,7 @@ gain and to the gradient sum in the Newton leaf value.
 
 from std.testing import assert_equal, assert_true, assert_false, TestSuite
 
-from mojoboost import (
+from mojotrees import (
     L1,
     SQUARED_ERROR,
     BinnedMatrix,

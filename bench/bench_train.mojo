@@ -1,4 +1,4 @@
-"""Training benchmark for mojoboost.
+"""Training benchmark for mojotrees.
 
 Generates a deterministic synthetic dataset with counter-based splitmix64
 (bit-identical to bench_lightgbm.py), then times quantile binning and
@@ -12,8 +12,8 @@ from std.math import exp, log
 from std.sys import argv
 from std.time import perf_counter_ns
 
-from mojoboost.binning import fit_bins
-from mojoboost.boosting import (
+from mojotrees.binning import fit_bins
+from mojotrees.boosting import (
     BINARY_LOGISTIC,
     SQUARED_ERROR,
     BoosterParams,
@@ -86,7 +86,7 @@ def main() raises:
             target.append(signal + 0.1 * (u - 0.5))
 
     print(
-        "mojoboost bench:", n_rows, "rows x", n_features, "features,",
+        "mojotrees bench:", n_rows, "rows x", n_features, "features,",
         obj_name, "seed", seed,
     )
 

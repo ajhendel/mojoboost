@@ -1,13 +1,13 @@
 # Ecosystem inputs: Arrow, polars, and batches
 
-What mojoboost does with an Arrow table, a polars frame, or data that
-arrives in pieces. The code is `python/mojoboost/_arrow.py`,
-`python/mojoboost/_polars.py`, and `python/mojoboost/_sequence.py`; the
+What mojotrees does with an Arrow table, a polars frame, or data that
+arrives in pieces. The code is `python/mojotrees/_arrow.py`,
+`python/mojotrees/_polars.py`, and `python/mojotrees/_sequence.py`; the
 integration state, and the patches that finish it, are in
 `handoffs/remaining_10_ecosystem_inputs.md`.
 
 **Status.** The adapters are written and self-contained. They are not yet
-reachable from `mojoboost.Dataset`, from the estimators, or from any public
+reachable from `mojotrees.Dataset`, from the estimators, or from any public
 name, because the four dispatch points that would reach them live in files
 this lane does not own. Read every "converts to" below as a statement about
 the adapter, not about `mb.Dataset(arrow_table)`, until the handoff's
@@ -15,9 +15,9 @@ patches land. Nothing here has been executed: see "What has not been run".
 
 ## 1. The shape of the thing
 
-mojoboost's extension module reads one thing: a contiguous float64 buffer,
+mojotrees's extension module reads one thing: a contiguous float64 buffer,
 column-major, whose address crosses the boundary
-(`dataset_create` in `bindings/_mojoboost.mojo`). `_arrays.py` is what
+(`dataset_create` in `bindings/_mojotrees.mojo`). `_arrays.py` is what
 turns numpy arrays, pandas frames, plain sequences, and SciPy sparse
 matrices into that. The three adapters add Arrow, polars, and batches in
 exactly the same currency, mirroring the `_arrays` functions by name and by
@@ -41,22 +41,22 @@ do not each grow their own.
 
 Neither adapter imports pyarrow or polars, at import time or lazily.
 Recognition is structural (does this object answer `column_names`? does it
-answer `to_arrow`?) the way `mojoboost.dask.is_dask_collection()` is, and
+answer `to_arrow`?) the way `mojotrees.dask.is_dask_collection()` is, and
 every operation is a method the object itself offers. `arrow_available()`
 and `polars_available()` answer the "is it installed" question with
 `importlib.util.find_spec`, which does not execute the package either.
 
 Two consequences worth stating:
 
-- `import mojoboost` stays cheap and total, which is the rule in
-  `python/mojoboost/_public_api_plan.py`.
+- `import mojotrees` stays cheap and total, which is the rule in
+  `python/mojotrees/_public_api_plan.py`.
 - The adapters work against the Arrow and polars *protocols*, so they do
   not have to track a library version to keep working.
 
 ## 3. Zero copy: what is true
 
 Arrow columns are already flat, typed, contiguous buffers, so the obvious
-question is whether mojoboost trains on them in place. It does not, and
+question is whether mojotrees trains on them in place. It does not, and
 these modules never say it does. Two independent things stand in the way.
 
 **The Arrow side is often ineligible.** A column could be read in place only
@@ -73,7 +73,7 @@ and length the column does expose, as a `BufferPlan`:
 | `n_chunks`, `null_count`, `dictionary_size` | why it is or is not eligible |
 | `zero_copy_eligible`, `blocked_by` | the verdict and the reason |
 
-**The mojoboost side is not ready for it in any case.** `dataset_create`
+**The mojotrees side is not ready for it in any case.** `dataset_create`
 takes one address for the whole matrix and copies it element by element
 into a `List[Float64]` through `_f64_list`. There is no path that reads N
 per-column pointers and none that reads a validity bitmap. So today an
@@ -83,7 +83,7 @@ numpy path too and is not an Arrow tax.
 
 `BufferPlan.zero_copy_eligible` therefore means "the Arrow buffer could be
 read in place by a reader that accepted per-column pointers". It never
-means "mojoboost read it in place". The binding change that would make the
+means "mojotrees read it in place". The binding change that would make the
 first meaning matter is request **B1** in the handoff.
 
 ## 4. Arrow types
@@ -124,7 +124,7 @@ deliberately stricter than the pandas path.
 
 ### Nulls
 
-A null becomes NaN, which is mojoboost's missing marker end to end: the
+A null becomes NaN, which is mojotrees's missing marker end to end: the
 binner reserves a bin for it, each node carries a default direction, and
 `use_missing` (on by default) controls the whole business. A numpy float
 column of NaN and an Arrow column of nulls describe the same rows to the
@@ -159,13 +159,13 @@ the pandas path.
 |---|---|
 | `Array`, `ChunkedArray` | a single column, so not a feature matrix. Refused as `X` with the message naming `label` / `weight` / `init_score`, which is where a single column belongs. Accepted *as* those, through `arrow_f64_vector` |
 | `pyarrow.dataset.Dataset`, `RecordBatchReader` | streaming. Refused rather than materialized behind your back: call `.to_table()` if it fits, or hand the batches to `_sequence` |
-| `SparseCSRMatrix`, `SparseCSCMatrix` | bridged by `_arrow.sparse_to_scipy`, which returns the SciPy matrix mojoboost's sparse path already takes. Nothing is densified |
+| `SparseCSRMatrix`, `SparseCSCMatrix` | bridged by `_arrow.sparse_to_scipy`, which returns the SciPy matrix mojotrees's sparse path already takes. Nothing is densified |
 | `SparseCOOTensor`, `SparseCSFTensor` | refused; convert to CSR or CSC first |
 
 ## 5. polars
 
 A polars frame is Arrow underneath, so `_polars` is thin on purpose: it
-decides what it was handed, refuses what polars can express and mojoboost
+decides what it was handed, refuses what polars can express and mojotrees
 cannot train on, and hands `to_arrow()` to `_arrow`, which owns the
 conversion, the null rule, the dictionary unification, the 2**53 check, and
 the layout. There is one implementation of each of those and it is not in
@@ -213,13 +213,13 @@ free. Everything after it copies, exactly as in section 3.
 assembles it:
 
 ```python
-from mojoboost import _sequence   # internal today; see handoff request P1
+from mojotrees import _sequence   # internal today; see handoff request P1
 
 data = _sequence.materialize(
     _sequence.Batches(record_batches),
     label_column="target",
 )
-train_set = mojoboost.Dataset(**data.dataset_kwargs())
+train_set = mojotrees.Dataset(**data.dataset_kwargs())
 ```
 
 A batch may be an Arrow table or record batch, a polars frame, a pandas
@@ -246,7 +246,7 @@ What is checked, batch by batch, before anything is converted:
 without converting anything, and caches the schema check and the unified
 category tables, so a fit that asks for the names, then the categories,
 then the matrix pays for the first two once. Answering `shape` is also what
-puts a batched input into `mojoboost.device_selection.Workload.from_data`
+puts a batched input into `mojotrees.device_selection.Workload.from_data`
 and `explain_device_choice`, which read a two-element `shape` off whatever
 they are given; an Arrow table and a polars frame already have one.
 
@@ -270,7 +270,7 @@ being blunt about, because the LightGBM feature it resembles,
 Bounded memory needs a binner that accepts data in pieces: two passes over
 the batches, quantiles built incrementally, bins fixed before any row is
 written. That is a native question, and the core is
-`src/mojoboost/sequence.mojo` with `src/mojoboost/external_memory.mojo`
+`src/mojotrees/sequence.mojo` with `src/mojotrees/external_memory.mojo`
 (task 07). The Python side of it is a thin loop over `Batches`, which is
 shaped for it: the batches, their row counts (`row_counts()`), and their
 offsets (`offsets()`) are all available separately from the assembly step.

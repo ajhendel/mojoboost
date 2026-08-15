@@ -18,7 +18,7 @@ runs nothing can and cannot claim.
 The manifests were audited against the tree by hand, with `grep`, because the
 planner may not be run. Three defects were found. `tests/test_binning.mojo` was
 in the pixi test chain and named by no job, so a plan for a change to
-`src/mojoboost/binning.mojo` returned three suites and none of them was the
+`src/mojotrees/binning.mojo` returned three suites and none of them was the
 binning suite. `tests/parallel/test_gpu_split_policy.mojo` is on disk and run by
 nothing, and two separate checks were each structurally unable to notice. And 42
 `[[handoff]]` entries named files under `handoffs/`, which commit `21ff9fa`
@@ -60,10 +60,10 @@ gate lane.
 `validation/manifests/tiers.toml` already exist and the emitted script already
 exports the variable, so this patch is the only missing half.
 
-**State flow today.** `--format sh` exports `MOJOBOOST_BUILD_LOCK` with the
+**State flow today.** `--format sh` exports `MOJOTREES_BUILD_LOCK` with the
 job's class lock path before every exclusive job, and the wrapper does not read
 it, so all three classes (`cpu`, `gpu`, `build`) take
-`/tmp/mojoboost-build.lock`. The export is inert. That is the current behavior
+`/tmp/mojotrees-build.lock`. The export is inert. That is the current behavior
 and it is safe; the cost is that a CPU job and a GPU job which could overlap do
 not.
 
@@ -76,12 +76,12 @@ current path so behavior is unchanged when nothing sets it:
 # macOS has no flock(1), so this blocks on a Python fcntl lock without polling.
 # Usage: tools/with_build_lock.sh <command> [args...]
 #
-# MOJOBOOST_BUILD_LOCK picks the lock file. Unset means the single machine-wide
+# MOJOTREES_BUILD_LOCK picks the lock file. Unset means the single machine-wide
 # lock this script has always taken, so a caller that does not set it keeps the
 # old behavior exactly. tools/validation_plan.py sets it per exclusion class.
 exec /usr/bin/python3 -c '
 import fcntl, os, subprocess, sys
-path = os.environ.get("MOJOBOOST_BUILD_LOCK") or "/tmp/mojoboost-build.lock"
+path = os.environ.get("MOJOTREES_BUILD_LOCK") or "/tmp/mojotrees-build.lock"
 f = open(path, "w")
 fcntl.flock(f, fcntl.LOCK_EX)
 sys.exit(subprocess.call(sys.argv[1:]))
@@ -99,7 +99,7 @@ share one lock, and `--self-check` keeps printing its note.
 **Serialization effect** none. **Public API effect** none.
 
 **Validation, UNRUN.** `python3 tools/validation_plan.py --self-check` should
-stop printing the `MOJOBOOST_BUILD_LOCK` note, because that note is produced by
+stop printing the `MOJOTREES_BUILD_LOCK` note, because that note is produced by
 reading this script's text for the variable name rather than by grepping the
 tree. Its disappearance is the check.
 
@@ -117,7 +117,7 @@ tree. Its disappearance is the check.
 pytest, scikit-learn, pandas, pyarrow, and polars, and no scipy.
 `pixi run -e pytest test-estimators` is the only task that collects those files.
 So the sparse paths skip, the run reports green, and the scipy conversion code
-in `python/mojoboost/_validation.py` and `python/mojoboost/_arrow.py` has no
+in `python/mojotrees/_validation.py` and `python/mojotrees/_arrow.py` has no
 covering test that ever executes. A skip nobody reads is a pass.
 
 **Patch.** Add one line to `[feature.pytest.dependencies]`:
@@ -151,7 +151,7 @@ count for those two files rather than the exit status.
 **Dependency** none.
 
 **Problem.** `pixi.toml:35` defines `test-c` as `capi/run_c_tests.sh`, which
-compiles `capi/test_capi.c` against `capi/mojoboost.h`. Nothing under
+compiles `capi/test_capi.c` against `capi/mojotrees.h`. Nothing under
 `.github/workflows/` invokes it, and the script skips itself when no C compiler
 is present. So whether the public C header compiles under an actual C compiler
 is unproven on every platform in the matrix.
@@ -167,7 +167,7 @@ The matrix is `ubuntu-latest` and `ubuntu-24.04-arm`, both of which have a
 system C compiler, so the self-skip should not trigger. If it does, the script
 printing its skip reason is the finding.
 
-**Errors.** A compile failure here is a real defect in `capi/mojoboost.h` and
+**Errors.** A compile failure here is a real defect in `capi/mojotrees.h` and
 should fail the job.
 
 **Fallback** if not applied: the job stays in `jobs.toml` as
@@ -235,17 +235,17 @@ this lane's ownership.
 
 ---
 
-### P5. Document `MOJOBOOST_BINNING_SELECT_MIN_ROWS` in the README
+### P5. Document `MOJOTREES_BINNING_SELECT_MIN_ROWS` in the README
 
 **Target** `README.md`, the parallelism bullet that currently reads
-"`MOJOBOOST_NUM_WORKERS` and `MOJOBOOST_PARALLEL_MIN_OPS` pin the scheduler for
+"`MOJOTREES_NUM_WORKERS` and `MOJOTREES_PARALLEL_MIN_OPS` pin the scheduler for
 reproducible runs" (around line 270).
 **Owner** README / docs lane.
 **Dependency** none.
 
-**Problem.** `src/mojoboost/binning.mojo` reads
-`MOJOBOOST_BINNING_SELECT_MIN_ROWS`, and both that module and
-`src/mojoboost/parallel.mojo` document it in their docstrings, but the README
+**Problem.** `src/mojotrees/binning.mojo` reads
+`MOJOTREES_BINNING_SELECT_MIN_ROWS`, and both that module and
+`src/mojotrees/parallel.mojo` document it in their docstrings, but the README
 list does not have it. `--self-check` validates every variable a job sets
 against the corpus, and no job sets this one, so nothing here is broken by the
 omission. It is recorded because the next person to look for a documented knob
@@ -255,8 +255,8 @@ treats as the env contract.
 **Patch.** Extend that sentence:
 
 ```
-`MOJOBOOST_NUM_WORKERS` and `MOJOBOOST_PARALLEL_MIN_OPS` pin the scheduler for
-reproducible runs, and `MOJOBOOST_BINNING_SELECT_MIN_ROWS` picks between the
+`MOJOTREES_NUM_WORKERS` and `MOJOTREES_PARALLEL_MIN_OPS` pin the scheduler for
+reproducible runs, and `MOJOTREES_BINNING_SELECT_MIN_ROWS` picks between the
 two ways a quantile fit resolves its order statistics, rank selection or a full
 sort; both resolve the same values, so it moves no edge and no bin
 ```

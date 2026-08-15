@@ -1,8 +1,8 @@
 """Multicore-threshold sweep for histogram accumulation.
 
-At each shape, times the forced-serial path (MOJOBOOST_NUM_WORKERS=1)
+At each shape, times the forced-serial path (MOJOTREES_NUM_WORKERS=1)
 against the forced-parallel path (auto workers with
-MOJOBOOST_PARALLEL_MIN_OPS=1) on identical data, then restores auto mode.
+MOJOTREES_PARALLEL_MIN_OPS=1) on identical data, then restores auto mode.
 The row where the speedup crosses 1.0 is the measured threshold candidate
 for this machine; PARALLEL_MIN_OPS should sit near that crossover's
 features * rows, tuned by broad CPU family rather than individual chip.
@@ -14,8 +14,8 @@ from std.os import setenv
 from std.sys import argv
 from std.time import perf_counter_ns
 
-from mojoboost.binning import bin_equal_width, BinnedMatrix
-from mojoboost.histogram import build_histogram
+from mojotrees.binning import bin_equal_width, BinnedMatrix
+from mojotrees.histogram import build_histogram
 
 
 def _splitmix64(state: UInt64) -> UInt64:
@@ -72,15 +72,15 @@ def main() raises:
         if reps < 5:
             reps = 5
 
-        _ = setenv("MOJOBOOST_NUM_WORKERS", "1")
+        _ = setenv("MOJOTREES_NUM_WORKERS", "1")
         var serial_s = _timed_builds(data, grad, hess, reps)
 
-        _ = setenv("MOJOBOOST_NUM_WORKERS", "0")
-        _ = setenv("MOJOBOOST_PARALLEL_MIN_OPS", "1")
+        _ = setenv("MOJOTREES_NUM_WORKERS", "0")
+        _ = setenv("MOJOTREES_PARALLEL_MIN_OPS", "1")
         var parallel_s = _timed_builds(data, grad, hess, reps)
-        _ = setenv("MOJOBOOST_PARALLEL_MIN_OPS", "")
+        _ = setenv("MOJOTREES_PARALLEL_MIN_OPS", "")
 
         print(n_rows, "|", ops, "|", serial_s, "|", parallel_s, "|", serial_s / parallel_s)
         n_rows *= 2
 
-    _ = setenv("MOJOBOOST_NUM_WORKERS", "")
+    _ = setenv("MOJOTREES_NUM_WORKERS", "")

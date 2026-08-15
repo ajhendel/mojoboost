@@ -2,7 +2,7 @@
 
 setuptools compiles nothing here. `bindings/build.sh` builds the extension
 with the Mojo toolchain and `packaging/build_wheel.sh` stages it, plus the
-four MAX runtime dylibs it links through @rpath, into python/mojoboost/
+four MAX runtime dylibs it links through @rpath, into python/mojotrees/
 before this file ever runs. There is no source build, and there is no way
 to make one that works without the Mojo toolchain, which is why
 packaging/matrix/platform_matrix.toml publishes no sdist.
@@ -39,7 +39,7 @@ from setuptools.dist import Distribution
 # The macOS deployment target the Mojo compile step produces, as it appears
 # in a wheel tag. This must equal the `minos` that
 #
-#     otool -l python/mojoboost/_mojoboost.so
+#     otool -l python/mojotrees/_mojotrees.so
 #
 # reports for LC_BUILD_VERSION. Nothing here reads the Mach-O header, so
 # the two are kept in step by the release procedure, not by this file.
@@ -50,7 +50,7 @@ DEFAULT_MACOS_TARGET = "26.0"
 # otool confirms the rebuilt extension actually carries the lower floor;
 # lowering the tag alone produces a wheel that installs and then fails to
 # import.
-TARGET_ENV_VAR = "MOJOBOOST_MACOS_DEPLOYMENT_TARGET"
+TARGET_ENV_VAR = "MOJOTREES_MACOS_DEPLOYMENT_TARGET"
 
 # MACOSX_DEPLOYMENT_TARGET is deliberately not consulted. conda-style
 # environments, which is what pixi gives this build, export it for their
@@ -78,7 +78,7 @@ def macos_plat_name():
     arch = platform.machine().lower()
     if arch != "arm64":
         raise SystemExit(
-            "mojoboost builds no macOS wheel for {!r}. The `macos-x86_64` "
+            "mojotrees builds no macOS wheel for {!r}. The `macos-x86_64` "
             "target of packaging/matrix/platform_matrix.toml is "
             "`unsupported`: pixi.toml declares no osx-64 platform and the "
             "pinned channel ships no Intel macOS toolchain, so there is "

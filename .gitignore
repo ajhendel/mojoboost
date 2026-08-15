@@ -19,7 +19,7 @@ build/
 
 # Built binaries (capi/build.sh, cli/build.sh, capi/run_c_tests.sh)
 capi/test_capi
-cli/mojoboost
+cli/mojotrees
 capi_test_*.mbst
 
 # macOS
@@ -30,5 +30,5 @@ __pycache__/
 
 # Wheel build artifacts (packaging/build_wheel.sh)
 python/dist/
-python/mojoboost.egg-info/
+python/mojotrees.egg-info/
 python/LICENSE

@@ -76,7 +76,7 @@
   },
 
   "source": {
-    "repo_url": "https://github.com/mojoboost-ml/mojoboost",
+    "repo_url": "https://github.com/mojotrees/mojotrees",
     "commit": "",
     "branch": null,
     "dirty": null,
@@ -111,7 +111,7 @@
       "notes": "If this prints `skipped: no accelerator` on a Mac with a GPU, the status is skipped and the build did not see the device. That belongs in findings.failures."
     },
     {
-      "command": "MOJOBOOST_DISABLE_GPU=1 pixi run test",
+      "command": "MOJOTREES_DISABLE_GPU=1 pixi run test",
       "status": "not-run",
       "skipped_reason": null,
       "failure_text": null,

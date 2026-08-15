@@ -1,5 +1,5 @@
-"""Tests for per-iteration training callbacks (src/mojoboost/callback.mojo
-and `train_with_callbacks` in src/mojoboost/custom_metric.mojo).
+"""Tests for per-iteration training callbacks (src/mojotrees/callback.mojo
+and `train_with_callbacks` in src/mojotrees/custom_metric.mojo).
 
 The equivalence anchor is `train_with_metrics`: a callback that only watches
 must leave the model exactly as it was, because `train_with_metrics` is now
@@ -13,14 +13,14 @@ the unbaked ones times the original rate, exactly, with no tolerance.
 
 from std.testing import assert_equal, assert_raises, assert_true, TestSuite
 
-from mojoboost import (
+from mojotrees import (
     SQUARED_ERROR,
     BinnedMatrix,
     BoosterParams,
     TreeParams,
     bin_equal_width,
 )
-from mojoboost.callback import (
+from mojotrees.callback import (
     ABORT,
     AFTER_ITERATION,
     BEFORE_ITERATION,
@@ -30,7 +30,7 @@ from mojoboost.callback import (
     check_resettable,
     scale_tree_values,
 )
-from mojoboost.custom_metric import (
+from mojotrees.custom_metric import (
     CustomMetric,
     MetricSuite,
     ValidSet,

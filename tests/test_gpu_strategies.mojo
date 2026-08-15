@@ -14,15 +14,15 @@ from std.os import setenv
 from std.sys import has_accelerator
 from std.testing import assert_equal, assert_true, TestSuite
 
-from mojoboost.apple_gpu_policy import API_METAL, parse_api
-from mojoboost.binning import bin_equal_width, BinnedMatrix
-from mojoboost.gpu_tiling import STRATEGY_ATOMIC, STRATEGY_TILED
-from mojoboost.histogram import (
+from mojotrees.apple_gpu_policy import API_METAL, parse_api
+from mojotrees.binning import bin_equal_width, BinnedMatrix
+from mojotrees.gpu_tiling import STRATEGY_ATOMIC, STRATEGY_TILED
+from mojotrees.histogram import (
     Histogram,
     build_histogram,
     build_histogram_subset,
 )
-from mojoboost.histogram_gpu import GpuHistogramBuilder
+from mojotrees.histogram_gpu import GpuHistogramBuilder
 
 
 def _splitmix64(state: UInt64) -> UInt64:
@@ -85,7 +85,7 @@ def test_device_capabilities_are_usable() raises:
 
 def test_metal_defaults_to_paired_histograms() raises:
     """On Metal the builder raises the feature group to 2 on its own; an
-    explicit MOJOBOOST_GPU_FEATURE_GROUP wins in both directions. Pairing
+    explicit MOJOTREES_GPU_FEATURE_GROUP wins in both directions. Pairing
     produces bit-identical histograms (the active-rows tests pin that), so
     the default is a launch-shape decision only, which is why this asserts
     the knob and not a histogram."""
@@ -94,21 +94,21 @@ def test_metal_defaults_to_paired_histograms() raises:
     else:
         var data = _make_data(1_000, 2, 16)
 
-        _ = setenv("MOJOBOOST_GPU_FEATURE_GROUP", "")
+        _ = setenv("MOJOTREES_GPU_FEATURE_GROUP", "")
         var default_builder = GpuHistogramBuilder(data)
         if parse_api(default_builder.device_api) == API_METAL:
             assert_equal(default_builder.rows.feature_group, 2)
         else:
             assert_equal(default_builder.rows.feature_group, 1)
 
-        _ = setenv("MOJOBOOST_GPU_FEATURE_GROUP", "1")
+        _ = setenv("MOJOTREES_GPU_FEATURE_GROUP", "1")
         var forced_single = GpuHistogramBuilder(data)
         assert_equal(forced_single.rows.feature_group, 1)
 
-        _ = setenv("MOJOBOOST_GPU_FEATURE_GROUP", "2")
+        _ = setenv("MOJOTREES_GPU_FEATURE_GROUP", "2")
         var forced_paired = GpuHistogramBuilder(data)
         assert_equal(forced_paired.rows.feature_group, 2)
-        _ = setenv("MOJOBOOST_GPU_FEATURE_GROUP", "")
+        _ = setenv("MOJOTREES_GPU_FEATURE_GROUP", "")
 
 
 def test_strategies_agree_bit_exactly() raises:
@@ -384,33 +384,33 @@ def test_env_overrides_change_geometry_not_results() raises:
 
         # A forced row tile splits the rows differently and still sums the
         # same integers.
-        _ = setenv("MOJOBOOST_GPU_ROW_TILE", "997")
+        _ = setenv("MOJOTREES_GPU_ROW_TILE", "997")
         var forced = GpuHistogramBuilder(data, STRATEGY_TILED)
         # The request sets the tile count; rows per tile is then rebalanced
         # so no trailing tile is short, which can only shrink it.
         assert_true(forced.tiling.rows_per_tile <= 997)
         assert_true(forced.tiling.n_tiles > default_builder.tiling.n_tiles)
         _assert_identical(expected, forced.build(gh[0], gh[1]))
-        _ = setenv("MOJOBOOST_GPU_ROW_TILE", "")
+        _ = setenv("MOJOTREES_GPU_ROW_TILE", "")
 
         # A forced block size changes how many rows each thread walks.
-        _ = setenv("MOJOBOOST_GPU_BLOCK_THREADS", "64")
+        _ = setenv("MOJOTREES_GPU_BLOCK_THREADS", "64")
         var narrow = GpuHistogramBuilder(data, STRATEGY_TILED)
         assert_equal(narrow.tiling.block_threads, 64)
         _assert_identical(expected, narrow.build(gh[0], gh[1]))
-        _ = setenv("MOJOBOOST_GPU_BLOCK_THREADS", "")
+        _ = setenv("MOJOTREES_GPU_BLOCK_THREADS", "")
 
         # The strategy override reaches the builder through AUTO.
-        _ = setenv("MOJOBOOST_GPU_HIST_STRATEGY", "atomic")
+        _ = setenv("MOJOTREES_GPU_HIST_STRATEGY", "atomic")
         var forced_atomic = GpuHistogramBuilder(data)
         assert_equal(forced_atomic.strategy(), STRATEGY_ATOMIC)
         _assert_identical(expected, forced_atomic.build(gh[0], gh[1]))
 
-        _ = setenv("MOJOBOOST_GPU_HIST_STRATEGY", "tiled")
+        _ = setenv("MOJOTREES_GPU_HIST_STRATEGY", "tiled")
         var forced_tiled = GpuHistogramBuilder(data)
         assert_equal(forced_tiled.strategy(), STRATEGY_TILED)
         _assert_identical(expected, forced_tiled.build(gh[0], gh[1]))
-        _ = setenv("MOJOBOOST_GPU_HIST_STRATEGY", "")
+        _ = setenv("MOJOTREES_GPU_HIST_STRATEGY", "")
 
 
 def main() raises:

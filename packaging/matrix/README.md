@@ -1,6 +1,6 @@
 # packaging/matrix
 
-The release matrix: which platforms mojoboost claims, what the artifact for
+The release matrix: which platforms mojotrees claims, what the artifact for
 each is called, and what evidence exists behind every claim.
 
 [`docs/PLATFORM_MATRIX.md`](../../docs/PLATFORM_MATRIX.md) is the prose. This
@@ -19,7 +19,7 @@ smoke/probe_platform.py     prints the platform facts a record has to contain
 ## What runs and what does not
 
 `validate_matrix.py` runs anywhere, in under a second, with the standard
-library. It builds nothing and imports no part of mojoboost, so it is cheap
+library. It builds nothing and imports no part of mojotrees, so it is cheap
 enough to run on every change and it works on a bare checkout. Wiring it into
 pixi and CI is specified in
 [`handoffs/task18_platform.md`](../../handoffs/task18_platform.md).

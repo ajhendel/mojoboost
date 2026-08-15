@@ -4,20 +4,20 @@
 # compiler is installed: the Mojo suite covers the same behavior, so a
 # machine without a toolchain should not fail the build.
 #
-# Set MOJOBOOST_CC to choose a compiler. Set MOJOBOOST_LEAK_CHECK=1 to run
+# Set MOJOTREES_CC to choose a compiler. Set MOJOTREES_LEAK_CHECK=1 to run
 # the test under the platform leak checker instead of directly.
 set -e
 cd "$(dirname "$0")/.."
 
-cc_bin="${MOJOBOOST_CC:-cc}"
+cc_bin="${MOJOTREES_CC:-cc}"
 if ! command -v "$cc_bin" >/dev/null 2>&1; then
     echo "no C compiler ($cc_bin); skipping the C ABI tests"
     exit 0
 fi
 
 case "$(uname -s)" in
-    Darwin) lib="capi/libmojoboost.dylib" ;;
-    *) lib="capi/libmojoboost.so" ;;
+    Darwin) lib="capi/libmojotrees.dylib" ;;
+    *) lib="capi/libmojotrees.so" ;;
 esac
 
 capi/build.sh
@@ -31,7 +31,7 @@ prefix="$(pixi run printenv CONDA_PREFIX)"
     -Icapi "$lib" -lm \
     -Wl,-rpath,"$prefix/lib" -Wl,-rpath,"$(pwd)/capi"
 
-if [ "${MOJOBOOST_LEAK_CHECK:-0}" = "1" ]; then
+if [ "${MOJOTREES_LEAK_CHECK:-0}" = "1" ]; then
     case "$(uname -s)" in
         Darwin) exec leaks --atExit -- ./capi/test_capi ;;
         *) exec valgrind --leak-check=full --error-exitcode=1 \

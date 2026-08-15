@@ -10,11 +10,11 @@ stages, so they are labeled individually rather than under one status line:
 
 | capability | what exists | what does not |
 |---|---|---|
-| feature parallel | the split-election core, the feature partition, the candidate wire record, the agreement and failure protocol (`src/mojoboost/distributed_strategies.mojo`) | a grower that calls them; any run |
+| feature parallel | the split-election core, the feature partition, the candidate wire record, the agreement and failure protocol (`src/mojotrees/distributed_strategies.mojo`) | a grower that calls them; any run |
 | voting parallel | the top-k selection, the vote reduction, the feature election, the packed histogram exchange (same file) | a grower that calls them; any run |
-| distributed GPU | the global fixed-point scale agreement, the word staging and its overflow argument, the cost model, the collective seam (`src/mojoboost/distributed_gpu.mojo`) | a device-resident collective; a transport; the single-node GPU speedup that gates the work; any run |
+| distributed GPU | the global fixed-point scale agreement, the word staging and its overflow argument, the cost model, the collective seam (`src/mojotrees/distributed_gpu.mojo`) | a device-resident collective; a transport; the single-node GPU speedup that gates the work; any run |
 
-The one mode that does run is data parallel, in `src/mojoboost/distributed.mojo`,
+The one mode that does run is data parallel, in `src/mojotrees/distributed.mojo`,
 with every rank inside one process. `docs/distributed.md` is its design and is
 the document this one extends rather than replaces.
 
@@ -248,7 +248,7 @@ together:
   another unsearched, and the tree would still look plausible.
 
 Worker loss, cancellation, deadlines, and checkpoint boundaries are the
-transport's, unchanged, in `src/mojoboost/distributed_transport.mojo`. Nothing
+transport's, unchanged, in `src/mojotrees/distributed_transport.mojo`. Nothing
 here re-implements them and nothing here weakens them.
 
 ## 4. Distributed GPU
@@ -482,10 +482,10 @@ Smallest useful checks, in the order they should be attempted:
 
 ```
 # UNRUN: does the strategies module compile at all
-pixi run mojo build -I src src/mojoboost/distributed_strategies.mojo -o /dev/null
+pixi run mojo build -I src src/mojotrees/distributed_strategies.mojo -o /dev/null
 
 # UNRUN: does the GPU contract module compile on a CPU-only machine
-pixi run mojo build -I src src/mojoboost/distributed_gpu.mojo -o /dev/null
+pixi run mojo build -I src src/mojotrees/distributed_gpu.mojo -o /dev/null
 
 # UNRUN: the focused test this lane did not write, once someone owns tests
 pixi run mojo run -I src tests/parallel/test_distributed_strategies.mojo
@@ -517,7 +517,7 @@ The assertions a first test owes, none of which exist:
 
 ## 8. Differences from LightGBM
 
-- LightGBM selects a mode with `tree_learner`. mojoboost has no such
+- LightGBM selects a mode with `tree_learner`. mojotrees has no such
   parameter, and adding one is a decision for whoever owns the parameter
   surface. `parse_strategy` accepts LightGBM's spellings so that the mapping
   exists when it is wanted.

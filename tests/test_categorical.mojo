@@ -26,9 +26,9 @@ from std.testing import (
     TestSuite,
 )
 
-from mojoboost.binning import fit_bins
-from mojoboost.boosting import SQUARED_ERROR, BoosterParams, train
-from mojoboost.categorical import (
+from mojotrees.binning import fit_bins
+from mojotrees.boosting import SQUARED_ERROR, BoosterParams, train
+from mojotrees.categorical import (
     CAT_BITSET_WORDS,
     CategoricalParams,
     CategoricalSpec,
@@ -38,18 +38,18 @@ from mojoboost.categorical import (
     cat_pool_contains,
     fit_categorical_spec,
 )
-from mojoboost.histogram import Histogram
-from mojoboost.model import Model, fit, fit_multiclass
-from mojoboost.ranking import (
+from mojotrees.histogram import Histogram
+from mojotrees.model import Model, fit, fit_multiclass
+from mojotrees.ranking import (
     RankerParams,
     fit_ranker,
     groups_from_counts,
     ndcg,
 )
-from mojoboost.serialize import load_model, save_model
-from mojoboost.split import find_best_split
-from mojoboost.train_gpu import train_gpu
-from mojoboost.tree import TreeParams, grow_tree
+from mojotrees.serialize import load_model, save_model
+from mojotrees.split import find_best_split
+from mojotrees.train_gpu import train_gpu
+from mojotrees.tree import TreeParams, grow_tree
 
 comptime _TMP_PATH = "./.test_categorical_roundtrip.tmp"
 

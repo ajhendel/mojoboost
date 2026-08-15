@@ -1,4 +1,4 @@
-"""Cross-validation: `mojoboost.cv.cv` and `CVBooster`.
+"""Cross-validation: `mojotrees.cv.cv` and `CVBooster`.
 
 The load-bearing tests here are the leakage ones and the equivalence one.
 `cv()` builds each fold's data from the raw matrix so every fold bins itself
@@ -12,11 +12,11 @@ import pytest
 
 np = pytest.importorskip("numpy")
 
-import mojoboost
-from mojoboost import Dataset, train
-from mojoboost import _eval
-from mojoboost.cv import CVBooster, cv
-from mojoboost.cv import _fold_dataset, _generated_splits, _query_of_row
+import mojotrees
+from mojotrees import Dataset, train
+from mojotrees import _eval
+from mojotrees.cv import CVBooster, cv
+from mojotrees.cv import _fold_dataset, _generated_splits, _query_of_row
 
 
 REG = {"objective": "regression", "num_leaves": 7, "learning_rate": 0.2}
@@ -429,7 +429,7 @@ def test_ranking_refuses_the_knobs_it_cannot_honor():
            early_stopping_rounds=2)
     with pytest.raises(NotImplementedError, match="per-round history"):
         cv(params, dataset, num_boost_round=4, nfold=3,
-           callbacks=[mojoboost.log_evaluation(period=0)])
+           callbacks=[mojotrees.log_evaluation(period=0)])
 
 
 # -- callbacks -----------------------------------------------------------
@@ -449,7 +449,7 @@ def test_callbacks_see_the_across_fold_means(regression):
         Dataset(X, label=y),
         num_boost_round=4,
         nfold=3,
-        callbacks=[mojoboost.record_evaluation(history), spy],
+        callbacks=[mojotrees.record_evaluation(history), spy],
     )
     assert [iteration for iteration, _, _ in seen] == [0, 1, 2, 3]
     assert all(end == 4 for _, end, _ in seen)
@@ -489,7 +489,7 @@ def test_a_callback_that_stops_truncates_the_history(regression):
 
     def stop_at_two(env):
         if env.iteration == 2:
-            raise mojoboost.EarlyStopException(1, 0.0)
+            raise mojotrees.EarlyStopException(1, 0.0)
 
     results = cv(REG, Dataset(X, label=y), num_boost_round=8, nfold=2,
                  callbacks=[stop_at_two])
@@ -504,7 +504,7 @@ def test_reset_parameter_is_refused_rather_than_ignored(regression):
             Dataset(X, label=y),
             num_boost_round=3,
             nfold=2,
-            callbacks=[mojoboost.reset_parameter(learning_rate=[0.1] * 3)],
+            callbacks=[mojotrees.reset_parameter(learning_rate=[0.1] * 3)],
         )
 
 
@@ -624,7 +624,7 @@ def test_the_early_stopping_callback_and_the_argument_are_one_knob(regression):
             num_boost_round=10,
             nfold=2,
             early_stopping_rounds=3,
-            callbacks=[mojoboost.early_stopping(3, verbose=False)],
+            callbacks=[mojotrees.early_stopping(3, verbose=False)],
         )
 
 

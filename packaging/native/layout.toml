@@ -1,4 +1,4 @@
-# Declarative layout of the mojoboost native artifact: the C ABI shared
+# Declarative layout of the mojotrees native artifact: the C ABI shared
 # library, its public header, and the command line tool.
 #
 # This file is the machine-readable half of packaging/native/README.md. The
@@ -11,59 +11,59 @@
 # than inventing a second one.
 
 schema = 1
-project = "mojoboost"
+project = "mojotrees"
 version = "0.1.0"
 
 # The C ABI version the header in this release declares. Cumulative: a
 # caller built against N works against any library reporting >= N. Keep in
-# sync with MOJOBOOST_ABI_VERSION in capi/mojoboost.h.
+# sync with MOJOTREES_ABI_VERSION in capi/mojotrees.h.
 abi_version = 2
 
 # ---------------------------------------------------------------------------
 # Installed tree
 #
 # A GNU-style prefix, so a consumer's existing `-I$PREFIX/include
-# -L$PREFIX/lib -lmojoboost` works with no mojoboost-specific knowledge, and
+# -L$PREFIX/lib -lmojotrees` works with no mojotrees-specific knowledge, and
 # so a distribution can drop the tree under /usr/local or /opt without
 # rearranging it.
 # ---------------------------------------------------------------------------
 [tree]
-include = "include/mojoboost/mojoboost.h"
+include = "include/mojotrees/mojotrees.h"
 lib = "lib/"
-bin = "bin/mojoboost"
-runtime = "lib/mojoboost-runtime/"
-licenses = "share/doc/mojoboost/"
+bin = "bin/mojotrees"
+runtime = "lib/mojotrees-runtime/"
+licenses = "share/doc/mojotrees/"
 
 # The header is installed one directory deep so the include is
-# `#include <mojoboost/mojoboost.h>` from an installed prefix. In-tree it is
-# capi/mojoboost.h and `#include "mojoboost.h"`, which is what
+# `#include <mojotrees/mojotrees.h>` from an installed prefix. In-tree it is
+# capi/mojotrees.h and `#include "mojotrees.h"`, which is what
 # capi/test_capi.c does; both spellings must keep working.
 [tree.header]
-source = "capi/mojoboost.h"
-installed = "include/mojoboost/mojoboost.h"
+source = "capi/mojotrees.h"
+installed = "include/mojotrees/mojotrees.h"
 status = "designed"
 
 # ---------------------------------------------------------------------------
 # Library names
 #
 # One SONAME/install-name field per platform, carrying the ABI version and
-# not the release version: a caller links against an ABI, and two mojoboost
+# not the release version: a caller links against an ABI, and two mojotrees
 # releases with the same ABI must be swappable without relinking.
 # ---------------------------------------------------------------------------
 [library.macos]
-built = "capi/libmojoboost.dylib"
-installed = "lib/libmojoboost.2.dylib"
-symlink = "lib/libmojoboost.dylib"
-install_name = "@rpath/libmojoboost.2.dylib"
-loader_path = "@loader_path/mojoboost-runtime"
+built = "capi/libmojotrees.dylib"
+installed = "lib/libmojotrees.2.dylib"
+symlink = "lib/libmojotrees.dylib"
+install_name = "@rpath/libmojotrees.2.dylib"
+loader_path = "@loader_path/mojotrees-runtime"
 status = "designed"
 
 [library.linux]
-built = "capi/libmojoboost.so"
-installed = "lib/libmojoboost.so.2"
-symlink = "lib/libmojoboost.so"
-soname = "libmojoboost.so.2"
-loader_path = "$ORIGIN/mojoboost-runtime"
+built = "capi/libmojotrees.so"
+installed = "lib/libmojotrees.so.2"
+symlink = "lib/libmojotrees.so"
+soname = "libmojotrees.so.2"
+loader_path = "$ORIGIN/mojotrees-runtime"
 status = "designed"
 
 [library.windows]
@@ -78,11 +78,11 @@ a dllexport story this ABI has not specified.
 # Command line tool
 # ---------------------------------------------------------------------------
 [binary.cli]
-source = "cli/mojoboost_cli.mojo"
-built = "cli/mojoboost"
-installed = "bin/mojoboost"
-loader_path_macos = "@executable_path/../lib/mojoboost-runtime"
-loader_path_linux = "$ORIGIN/../lib/mojoboost-runtime"
+source = "cli/mojotrees_cli.mojo"
+built = "cli/mojotrees"
+installed = "bin/mojotrees"
+loader_path_macos = "@executable_path/../lib/mojotrees-runtime"
+loader_path_linux = "$ORIGIN/../lib/mojotrees-runtime"
 status = "designed"
 
 # ---------------------------------------------------------------------------
@@ -99,11 +99,11 @@ status = "designed"
 # ---------------------------------------------------------------------------
 [runtime]
 source = "the Mojo toolchain (.pixi/envs/default/lib in a dev checkout)"
-destination = "lib/mojoboost-runtime/"
+destination = "lib/mojotrees-runtime/"
 status = "designed"
 
 [runtime.macos]
-verified_from = "otool -L on capi/libmojoboost.dylib and its dependencies"
+verified_from = "otool -L on capi/libmojotrees.dylib and its dependencies"
 direct = ["libKGENCompilerRTShared.dylib", "libAsyncRTMojoBindings.dylib"]
 transitive = ["libMSupportGlobals.dylib", "libAsyncRTRuntimeGlobals.dylib"]
 # Resolved by the OS, never shipped.
@@ -139,32 +139,32 @@ status = "designed"
 [[defect]]
 id = "install-name-is-a-relative-build-path"
 severity = "blocking"
-observed = "LC_ID_DYLIB of capi/libmojoboost.dylib is `capi/libmojoboost.dylib`"
+observed = "LC_ID_DYLIB of capi/libmojotrees.dylib is `capi/libmojotrees.dylib`"
 consequence = """
 Anything linking the library records that relative path as the thing to
 load, so it resolves only when the process happens to run from the directory
 above `capi/`. capi/run_c_tests.sh hides this by adding an absolute -rpath to
 the build tree, which is why the in-tree C test passes.
 """
-fix = "post-link `install_name_tool -id @rpath/libmojoboost.2.dylib`, or the linker equivalent if `mojo build` grows one"
+fix = "post-link `install_name_tool -id @rpath/libmojotrees.2.dylib`, or the linker equivalent if `mojo build` grows one"
 
 [[defect]]
 id = "rpath-points-into-the-developer-checkout"
 severity = "blocking"
 observed = "LC_RPATH of the built library is an absolute path into .pixi/envs/default/lib"
 consequence = "A shipped copy searches a directory that exists only on the machine that built it."
-fix = "strip that LC_RPATH and add `@loader_path/mojoboost-runtime`"
+fix = "strip that LC_RPATH and add `@loader_path/mojotrees-runtime`"
 
 [[defect]]
 id = "no-runtime-is-shipped"
 severity = "blocking"
 observed = "the four Mojo runtime libraries under [runtime.macos] are not copied anywhere by capi/build.sh"
 consequence = "The library loads only inside a pixi environment that already has them."
-fix = "stage them into lib/mojoboost-runtime/ and rewrite their install names too, since they reference each other by @rpath"
+fix = "stage them into lib/mojotrees-runtime/ and rewrite their install names too, since they reference each other by @rpath"
 
 [[defect]]
 id = "no-linux-artifact-has-been-built"
 severity = "blocking"
-observed = "capi/libmojoboost.so does not exist in this checkout"
+observed = "capi/libmojotrees.so does not exist in this checkout"
 consequence = "Every Linux row above is a design, not a description."
 fix = "build one, read it with `readelf -d`, and replace the expected lists with observed ones"

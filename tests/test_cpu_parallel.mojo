@@ -16,7 +16,7 @@ histogram builders):
    bins.
 
 3. `plan_tasks` obeys its documented rules: the grain floor, the per-core cap,
-   and the `MOJOBOOST_NUM_WORKERS` override.
+   and the `MOJOTREES_NUM_WORKERS` override.
 
 Shapes are deliberately odd against every plausible SIMD width (2, 4, 8, 16,
 32 lanes) so the vector loops leave a scalar tail on NEON, AVX2, and AVX-512
@@ -29,8 +29,8 @@ from std.os import setenv
 from std.sys.info import CompilationTarget, simd_width_of
 from std.testing import assert_equal, assert_true, TestSuite
 
-from mojoboost.binning import BinnedMatrix, bin_equal_width, fit_bins
-from mojoboost.boosting import (
+from mojotrees.binning import BinnedMatrix, bin_equal_width, fit_bins
+from mojotrees.boosting import (
     BINARY_LOGISTIC,
     HUBER,
     L1,
@@ -39,7 +39,7 @@ from mojoboost.boosting import (
     SQUARED_ERROR,
     fill_grad_hess,
 )
-from mojoboost.histogram import (
+from mojotrees.histogram import (
     Histogram,
     SIMD_LANES,
     build_histogram,
@@ -49,14 +49,14 @@ from mojoboost.histogram import (
     subtract_histogram,
     subtract_histogram_into,
 )
-from mojoboost.parallel import (
+from mojotrees.parallel import (
     PARALLEL_MIN_OPS,
     TASKS_PER_CORE,
     plan_row_blocks,
     plan_tasks,
 )
-from mojoboost.split import SplitInfo, find_best_split
-from mojoboost.tree import partition_rows
+from mojotrees.split import SplitInfo, find_best_split
+from mojotrees.tree import partition_rows
 
 
 def _splitmix64(state: UInt64) -> UInt64:
@@ -71,17 +71,17 @@ def _uniform(counter: UInt64) -> Float64:
 
 
 def _serial():
-    _ = setenv("MOJOBOOST_NUM_WORKERS", "1")
+    _ = setenv("MOJOTREES_NUM_WORKERS", "1")
 
 
 def _forced_parallel():
     # Workers > 1 forces the parallel path whatever the size, which is the
     # only way to exercise it on a shape small enough to keep a test fast.
-    _ = setenv("MOJOBOOST_NUM_WORKERS", "4")
+    _ = setenv("MOJOTREES_NUM_WORKERS", "4")
 
 
 def _auto():
-    _ = setenv("MOJOBOOST_NUM_WORKERS", "")
+    _ = setenv("MOJOTREES_NUM_WORKERS", "")
 
 
 def _make_data(

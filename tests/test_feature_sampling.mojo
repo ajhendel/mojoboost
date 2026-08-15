@@ -10,19 +10,19 @@ importance follows the features a tree was actually allowed to use.
 
 from std.testing import assert_almost_equal, assert_equal, assert_true, TestSuite
 
-from mojoboost.binning import bin_equal_width
-from mojoboost.boosting import SQUARED_ERROR, BoosterParams, train
-from mojoboost.histogram import build_histogram, build_histogram_subset
-from mojoboost.importance import gain_importance, split_importance
-from mojoboost.sampling import (
+from mojotrees.binning import bin_equal_width
+from mojotrees.boosting import SQUARED_ERROR, BoosterParams, train
+from mojotrees.histogram import build_histogram, build_histogram_subset
+from mojotrees.importance import gain_importance, split_importance
+from mojotrees.sampling import (
     DEFAULT_FEATURE_FRACTION_SEED,
     sample_without_replacement,
     select_node_features,
     select_tree_features,
     selection_count,
 )
-from mojoboost.split import find_best_split
-from mojoboost.tree import TreeParams, grow_tree
+from mojotrees.split import find_best_split
+from mojotrees.tree import TreeParams, grow_tree
 
 
 def _splitmix64(state: UInt64) -> UInt64:

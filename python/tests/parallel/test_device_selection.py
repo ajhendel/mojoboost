@@ -1,7 +1,7 @@
 """Focused tests for the Python seam over Mojo's device policy.
 
 Policy, capability detection, crossover rules, and memory estimates belong to
-``src/mojoboost/device_policy.mojo``.  These tests deliberately do not rebuild
+``src/mojotrees/device_policy.mojo``.  These tests deliberately do not rebuild
 that policy in Python.  Synthetic native responses exercise parsing and error
 translation; a small CPU request proves the compiled binding is connected.
 """
@@ -10,7 +10,7 @@ import json
 
 import pytest
 
-from mojoboost import device_selection as ds
+from mojotrees import device_selection as ds
 
 
 class _FakePolicy:

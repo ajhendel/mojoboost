@@ -1,21 +1,21 @@
 <!--
-STAGED COPY. This file is the GitHub organization profile for mojoboost-ml.
+STAGED COPY. This file is the GitHub organization profile for mojotrees.
 
 GitHub renders an organization profile from a repository named `.github`
 owned by the organization, at the path `profile/README.md`. It is NOT
-rendered from this path inside the mojoboost repository, where nothing
+rendered from this path inside the mojotrees repository, where nothing
 displays it.
 
-To publish it, create `mojoboost-ml/.github` (public) and copy this file to
+To publish it, create `mojotrees/.github` (public) and copy this file to
 `profile/README.md` there. Keep this staged copy as the source of truth so the
 profile text is reviewable alongside the project it describes.
 -->
 
-# mojoboost
+# mojotrees
 
 **Gradient-boosted decision trees, written natively in [Mojo](https://www.modular.com/mojo), with first-class support for the GPU already inside an Apple Silicon Mac.**
 
-[**mojoboost**](https://github.com/mojoboost-ml/mojoboost) is the project. It
+[**mojotrees**](https://github.com/mojotrees/mojotrees) is the project. It
 is a from-scratch library in the LightGBM family, using histogram-based split
 finding and leaf-wise tree growth, with a familiar Python API on top and
 histogram accumulation that runs on the CPU or on the GPU from the same source.

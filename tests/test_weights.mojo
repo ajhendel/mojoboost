@@ -1,6 +1,6 @@
 from std.testing import assert_equal, assert_true, TestSuite
 
-from mojoboost import (
+from mojotrees import (
     BINARY_LOGISTIC,
     SQUARED_ERROR,
     BoosterParams,

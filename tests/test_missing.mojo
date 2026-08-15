@@ -13,15 +13,15 @@ from std.math import isinf, isnan
 from std.sys import has_accelerator
 from std.testing import assert_equal, assert_false, assert_true, TestSuite
 
-from mojoboost.binning import BinnedMatrix, bin_equal_width, fit_bins
-from mojoboost.boosting import SQUARED_ERROR, BoosterParams, train
-from mojoboost.histogram import Histogram
-from mojoboost.histogram_gpu import GpuHistogramBuilder
-from mojoboost.model import Model, fit
-from mojoboost.serialize import load_model, save_model
-from mojoboost.split import find_best_split
-from mojoboost.train_gpu import train_gpu
-from mojoboost.tree import TreeParams, grow_tree
+from mojotrees.binning import BinnedMatrix, bin_equal_width, fit_bins
+from mojotrees.boosting import SQUARED_ERROR, BoosterParams, train
+from mojotrees.histogram import Histogram
+from mojotrees.histogram_gpu import GpuHistogramBuilder
+from mojotrees.model import Model, fit
+from mojotrees.serialize import load_model, save_model
+from mojotrees.split import find_best_split
+from mojotrees.train_gpu import train_gpu
+from mojotrees.tree import TreeParams, grow_tree
 
 from std.utils.numerics import inf, nan
 
@@ -547,7 +547,7 @@ def test_v1_file_still_loads_and_routes_nothing() raises:
     # load, route no missing values, and bin NaN as 0.0.
     var path = String(".test_missing_v1.tmp")
     var content = String(
-        "mojoboost v1\n"
+        "mojotrees v1\n"
         "objective 0\n"
         # learning_rate 1.0, base_score 0.0 as IEEE-754 bit patterns.
         "learning_rate 4607182418800017408\n"

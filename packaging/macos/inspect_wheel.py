@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Describe a macOS arm64 mojoboost wheel, and check the release-only rules.
+"""Describe a macOS arm64 mojotrees wheel, and check the release-only rules.
 
     python3 packaging/macos/inspect_wheel.py python/dist/<wheel> [--json out.json]
                                              [--report-only]
@@ -102,7 +102,7 @@ SYSTEM_DYLIB_PREFIXES = ("/usr/lib/", "/System/Library/")
 
 # A screen, not a proof. It catches a credential pasted into a file that got
 # packaged; it cannot catch an encoded or unusual one. The real defense is that
-# the wheel contains only python/mojoboost, which is why C9 exists.
+# the wheel contains only python/mojotrees, which is why C9 exists.
 SECRET_PATTERNS = (
     (re.compile(rb"AKIA[0-9A-Z]{16}"), "AWS access key id"),
     (re.compile(rb"ghp_[A-Za-z0-9]{36}"), "GitHub personal access token"),
@@ -272,7 +272,7 @@ def inspect(path: Path, rep: Report) -> dict:
              "failure with several names: the wheel was packaged from a working",
              "directory rather than from a declared file list. python/",
              "pyproject.toml names the package and its package-data, so a stray",
-             "here means something was copied into python/mojoboost/ and left."]
+             "here means something was copied into python/mojotrees/ and left."]
             if strays else [],
         )
 
@@ -334,7 +334,7 @@ def inspect(path: Path, rep: Report) -> dict:
             n for n in names
             if n.startswith(pkg) and n.endswith((".so", ".dylib"))
         )
-        ext_name = f"{pkg}_mojoboost.so"
+        ext_name = f"{pkg}_mojotrees.so"
         bundled = {
             Path(n).name: n
             for n in names
@@ -391,7 +391,7 @@ def inspect(path: Path, rep: Report) -> dict:
                     "could have run it. packaging/matrix/validate_artifact.py rule",
                     "R5b only rejects the first of those, which is why this check",
                     "is equality. The tag comes from",
-                    "MOJOBOOST_MACOS_DEPLOYMENT_TARGET in python/setup.py and the",
+                    "MOJOTREES_MACOS_DEPLOYMENT_TARGET in python/setup.py and the",
                     "binary comes from the Mojo compile step; set both together",
                     "(packaging/macos/build_release_wheel.sh) or neither.",
                 ],
@@ -539,7 +539,7 @@ def inspect(path: Path, rep: Report) -> dict:
             "C8",
             not host_hits,
             f"no build-machine paths in any member: {host_hits or 'none found'}",
-            ["A hit in _mojoboost.so is this project's bug: the rpath rewrite or",
+            ["A hit in _mojotrees.so is this project's bug: the rpath rewrite or",
              "the build did not clean up. Exact, reviewed product literals in",
              "vendored MAX libraries are handled by validate_artifact.py; any",
              "other machine-specific string still blocks the release."]
@@ -567,7 +567,7 @@ def fmt_version(v) -> str:
 
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(
-        description="Inspect a macOS mojoboost wheel and check the release rules.",
+        description="Inspect a macOS mojotrees wheel and check the release rules.",
     )
     ap.add_argument("wheel", type=Path)
     ap.add_argument("--json", type=Path, default=None,

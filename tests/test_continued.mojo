@@ -34,9 +34,9 @@ from std.testing import (
     TestSuite,
 )
 
-from mojoboost.bagging import BaggingParams
-from mojoboost.binning import BinnedMatrix, fit_bins
-from mojoboost.boosting import (
+from mojotrees.bagging import BaggingParams
+from mojotrees.binning import BinnedMatrix, fit_bins
+from mojotrees.boosting import (
     BINARY_LOGISTIC,
     SQUARED_ERROR,
     Booster,
@@ -47,18 +47,18 @@ from mojoboost.boosting import (
     train_multiclass,
     train_multiclass_more,
 )
-from mojoboost.goss import GossParams
-from mojoboost.trainset import (
+from mojotrees.goss import GossParams
+from mojotrees.trainset import (
     Dataset,
     train_dataset,
     train_dataset_multiclass,
     update_dataset,
     update_dataset_multiclass,
 )
-from mojoboost.model import Model, fit
-from mojoboost.monotone import MonotoneConstraints
-from mojoboost.serialize import load_model, save_model
-from mojoboost.tree import TreeParams
+from mojotrees.model import Model, fit
+from mojotrees.monotone import MonotoneConstraints
+from mojotrees.serialize import load_model, save_model
+from mojotrees.tree import TreeParams
 
 comptime _TMP_PATH = "./.test_continued_roundtrip.tmp"
 

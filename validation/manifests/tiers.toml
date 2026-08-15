@@ -18,7 +18,7 @@
 #    it. See `docs/FOCUSED_VALIDATION_PLAN.md` section 6.
 
 schema = 1
-project = "mojoboost"
+project = "mojotrees"
 
 # ---------------------------------------------------------------------------
 # Machine budget
@@ -34,7 +34,7 @@ max_jobs = 12
 # At most one broad suite per plan, ever. A plan with two of them is not a
 # focused plan, it is the full suite with extra steps.
 max_broad_jobs = 1
-# Threads a job may ask for when it does not say. Feeds MOJOBOOST_NUM_WORKERS
+# Threads a job may ask for when it does not say. Feeds MOJOTREES_NUM_WORKERS
 # in the emitted script; the repository's env contract is in README.md.
 default_threads = 4
 default_timeout_seconds = 900
@@ -57,7 +57,7 @@ default_timeout_seconds = 900
 # ---------------------------------------------------------------------------
 [locks]
 wrapper = "tools/with_build_lock.sh"
-lock_file = "/tmp/mojoboost-build.lock"
+lock_file = "/tmp/mojotrees-build.lock"
 classes = ["cpu", "gpu", "build"]
 note = "One lock file for all three classes today. See patch P1."
 
@@ -67,12 +67,12 @@ note = "One lock file for all three classes today. See patch P1."
 # classes keep sharing `lock_file`, which is the current behavior and is safe.
 # The day P1 lands and the wrapper honors this variable, the classes separate
 # with no further change to any file in this directory or to the planner.
-lock_env = "MOJOBOOST_BUILD_LOCK"
+lock_env = "MOJOTREES_BUILD_LOCK"
 
 [locks.class_lock_files]
-cpu = "/tmp/mojoboost-cpu.lock"
-gpu = "/tmp/mojoboost-gpu.lock"
-build = "/tmp/mojoboost-build.lock"
+cpu = "/tmp/mojotrees-cpu.lock"
+gpu = "/tmp/mojotrees-gpu.lock"
+build = "/tmp/mojotrees-build.lock"
 
 # `--measure` plans carry timings that contention would invalidate, so they
 # may contain jobs from only one exclusion class.
@@ -139,7 +139,7 @@ opt_in = false
 exclusive = "cpu"
 description = """
 The scikit-learn facing surface: one pytest file at a time, plus the
-dependency-free API script. Every job here needs `python/mojoboost/_mojoboost.so`
+dependency-free API script. Every job here needs `python/mojotrees/_mojotrees.so`
 to exist, which is a build, which is why `python:build-ext` is a job in its own
 right with its own exclusion class rather than a hidden prerequisite.
 """

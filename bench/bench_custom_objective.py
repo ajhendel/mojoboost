@@ -33,7 +33,7 @@ sys.path.insert(
     0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python")
 )
 
-from mojoboost import MojoBoostRegressor  # noqa: E402
+from mojotrees import MojoTreesRegressor  # noqa: E402
 
 _MASK = (1 << 64) - 1
 
@@ -88,16 +88,16 @@ def main():
 
     X, y = make_dataset(args.rows, args.features)
     print(
-        f"mojoboost python-callback bench: {args.rows} rows x "
+        f"mojotrees python-callback bench: {args.rows} rows x "
         f"{args.features} features, {args.rounds} rounds, "
         f"best of {args.repeat}"
     )
 
     builtin_s, builtin_model = _time_fit(
-        lambda: MojoBoostRegressor(n_estimators=args.rounds), X, y, args.repeat
+        lambda: MojoTreesRegressor(n_estimators=args.rounds), X, y, args.repeat
     )
     callback_s, callback_model = _time_fit(
-        lambda: MojoBoostRegressor(
+        lambda: MojoTreesRegressor(
             objective=squared_error,
             base_score="mean",
             n_estimators=args.rounds,

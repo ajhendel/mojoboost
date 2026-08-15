@@ -26,7 +26,7 @@ tiling suite already covers for `derive_tiling`:
 
 from std.testing import assert_equal, assert_false, assert_true, TestSuite
 
-from mojoboost.apple_gpu_policy import (
+from mojotrees.apple_gpu_policy import (
     API_CUDA,
     API_HIP,
     API_METAL,
@@ -71,7 +71,7 @@ from mojoboost.apple_gpu_policy import (
 
 # The source of every mirrored constant. Aliased because both modules
 # deliberately spell these the same way.
-from mojoboost.gpu_tiling import (
+from mojotrees.gpu_tiling import (
     BYTES_PER_PARTIAL_CELL as TILING_BYTES_PER_PARTIAL_CELL,
     FALLBACK_MAX_THREADS_PER_BLOCK as TILING_FALLBACK_MAX_THREADS,
     FALLBACK_SHARED_MEMORY_PER_BLOCK as TILING_FALLBACK_SHARED,

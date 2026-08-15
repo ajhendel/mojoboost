@@ -61,8 +61,8 @@ def _tiny_like(spec):
     return x, x[:, 0].copy(), None, 0
 
 
-class MojoBoostEngine:
-    name = "mojoboost"
+class MojoTreesEngine:
+    name = "mojotrees"
 
     def __init__(self, threads, device="cpu"):
         self.threads = int(threads)
@@ -75,27 +75,27 @@ class MojoBoostEngine:
     def load(self):
         """Import the extension, having already set the thread count.
 
-        MOJOBOOST_NUM_WORKERS is read by the Mojo side, and the runner sets
+        MOJOTREES_NUM_WORKERS is read by the Mojo side, and the runner sets
         it before this process starts. It is asserted here rather than set
         here, because setting it after an import that may already have
         cached a worker count would be a silent lie in the record.
         """
         want = str(self.threads)
-        got = os.environ.get("MOJOBOOST_NUM_WORKERS")
+        got = os.environ.get("MOJOTREES_NUM_WORKERS")
         if got != want:
             raise EngineError(
-                f"MOJOBOOST_NUM_WORKERS is {got!r} but this run wants {want!r}; "
+                f"MOJOTREES_NUM_WORKERS is {got!r} but this run wants {want!r}; "
                 "the runner must set it before the worker process starts"
             )
         phase = measure.Phase("import")
         with phase:
-            import mojoboost
-        self.module = mojoboost
+            import mojotrees
+        self.module = mojotrees
         self.import_phase = phase
-        self.version = getattr(mojoboost, "__version__", "unknown")
-        if self.device in ("gpu", "auto") and not mojoboost.gpu_available():
+        self.version = getattr(mojotrees, "__version__", "unknown")
+        if self.device in ("gpu", "auto") and not mojotrees.gpu_available():
             raise EngineError(
-                "device='gpu' was requested and mojoboost.gpu_available() is "
+                "device='gpu' was requested and mojotrees.gpu_available() is "
                 "False; this build or this machine has no accelerator"
             )
         return self
@@ -103,7 +103,7 @@ class MojoBoostEngine:
     def warmup(self, spec):
         x, y, group, n_classes = _tiny_like(spec)
         extra = {"num_class": n_classes} if n_classes else None
-        params = scenarios.mojoboost_params(spec, self.device, extra)
+        params = scenarios.mojotrees_params(spec, self.device, extra)
         params["n_estimators"] = 1
 
         def _fit():
@@ -133,7 +133,7 @@ class MojoBoostEngine:
         extra = None
         if spec["task"] == "multiclass":
             extra = {"num_class": int(train.get("n_classes") or (train["y"].max() + 1))}
-        params = scenarios.mojoboost_params(spec, self.device, extra)
+        params = scenarios.mojotrees_params(spec, self.device, extra)
         params["n_estimators"] = scenarios.BASE_PARAMS["n_estimators"]
 
         dataset = self._dataset(spec, train, scenarios.dataset_params(spec))
@@ -173,9 +173,9 @@ class MojoBoostEngine:
                 "size": size,
             },
             "transfers": measure.unavailable(
-                "mojoboost does not expose host-to-device transfer time to "
+                "mojotrees does not expose host-to-device transfer time to "
                 "Python. Instrumenting it is a change to "
-                "src/mojoboost/histogram_gpu.mojo and train_gpu.mojo, listed "
+                "src/mojotrees/histogram_gpu.mojo and train_gpu.mojo, listed "
                 "in the handoff."
             ),
             "peak_rss_bytes": measure.peak_rss_bytes(),
@@ -197,9 +197,9 @@ class MojoBoostEngine:
                 f"the sparse path here covers binary classification, not "
                 f"{spec['task']}"
             )
-        params = scenarios.mojoboost_params(spec, "cpu")
+        params = scenarios.mojotrees_params(spec, "cpu")
         params.pop("device", None)
-        estimator = self.module.MojoBoostClassifier(
+        estimator = self.module.MojoTreesClassifier(
             n_estimators=scenarios.BASE_PARAMS["n_estimators"],
             max_bin=scenarios.BASE_PARAMS["max_bin"],
             use_missing=scenarios.BASE_PARAMS["use_missing"],
@@ -267,7 +267,7 @@ class LightGBMEngine:
             raise EngineError(
                 "this harness runs LightGBM on the CPU only. Its GPU builds "
                 "are a compile-time option that the bench environment does "
-                "not install, and comparing a mojoboost accelerator run "
+                "not install, and comparing a mojotrees accelerator run "
                 "against a LightGBM CPU run is a comparison of two "
                 "different things unless it is labelled as one."
             )
@@ -355,7 +355,7 @@ class LightGBMEngine:
         }
 
 
-ENGINES = {"mojoboost": MojoBoostEngine, "lightgbm": LightGBMEngine}
+ENGINES = {"mojotrees": MojoTreesEngine, "lightgbm": LightGBMEngine}
 
 
 def build(name, threads, device):

@@ -1,6 +1,6 @@
 # Security policy
 
-mojoboost is an experimental public alpha maintained by one person. This
+mojotrees is an experimental public alpha maintained by one person. This
 document says how to report a vulnerability privately, what is in scope, which
 versions get a fix, and what you can expect back and when.
 
@@ -10,7 +10,7 @@ signed, attested, and revoked, is in
 
 ## Status
 
-No mojoboost release has been published. There is no git tag, no PyPI
+No mojotrees release has been published. There is no git tag, no PyPI
 distribution, and no artifact that anyone can install by name. One macOS wheel
 has been built locally and never distributed
 ([docs/PLATFORM_MATRIX.md](docs/PLATFORM_MATRIX.md)).
@@ -27,7 +27,7 @@ vulnerability.**
 
 Use GitHub private vulnerability reporting, which is the preferred channel:
 
-1. Go to <https://github.com/mojoboost-ml/mojoboost/security/advisories/new>
+1. Go to <https://github.com/mojotrees/mojotrees/security/advisories/new>
 2. Or from the repository, Security, Advisories, Report a vulnerability
 
 That form creates a private draft advisory visible only to you and the
@@ -36,7 +36,7 @@ request, and coordinated publication, which is why it is preferred over email.
 
 If that page returns a 404, private reporting has not been enabled on the
 repository yet. In that case, and only in that case, email
-**ajhendel@gmail.com**, the address in `pixi.toml`, with `mojoboost security`
+**ajhendel@gmail.com**, the address in `pixi.toml`, with `mojotrees security`
 in the subject line, and say in the first line that the report is private. No
 PGP key is published, so treat email as a plaintext channel and send only what
 is needed to establish the issue, holding a full exploit until a private
@@ -55,7 +55,7 @@ A report that has these is triaged faster and misjudged less often.
   if the report involves a build. For a wheel, the exact filename and its
   SHA-256.
 - The trust boundary you believe is crossed. Which input is attacker
-  controlled, and who the attacker is relative to whoever runs mojoboost.
+  controlled, and who the attacker is relative to whoever runs mojotrees.
 - The smallest reproduction you have, as a command and a file. A dataset that
   is smaller and synthetic is more useful than a real one that is large.
 - The impact you claim, and how confident you are of it. A suspected
@@ -159,7 +159,7 @@ issue rather than a private advisory.
   than security properties.
 - Unpickling a model from an untrusted source. Python pickle executes arbitrary
   code by design and no library can make that safe. Do not do it, with
-  mojoboost or with anything else.
+  mojotrees or with anything else.
 - Missing hardening that has no demonstrated impact, results from an automated
   scanner with no analysis attached, or amounts to a version number being lower
   than the newest one.
@@ -198,7 +198,7 @@ chain that automated tooling cannot see are in
 configuration in [.github/dependabot.yml](.github/dependabot.yml).
 
 A vulnerability in Mojo, MAX, CPython, or any other dependency is reported to
-that project, not here. Report it here as well when mojoboost's use of it makes
-the impact materially worse, or when mojoboost ships the affected component
+that project, not here. Report it here as well when mojotrees's use of it makes
+the impact materially worse, or when mojotrees ships the affected component
 inside an artifact, which is true of the four MAX runtime libraries bundled in
 the macOS wheel.

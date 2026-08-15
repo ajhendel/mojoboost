@@ -5,8 +5,8 @@
   "status": "unmeasured",
   "status_note": "Nothing in this file has been run. Every measured quantity is null, and null means 'not measured', never zero. The plan exists so that gpu_binned_layout.decide_layout can be given real numbers; until those numbers exist the verdict is LAYOUT_UNDECIDED by construction and no default threshold is permitted anywhere in the source.",
   "owns": [
-    "src/mojoboost/gpu_binned_layout.mojo",
-    "src/mojoboost/gpu_bin_packing.mojo",
+    "src/mojotrees/gpu_binned_layout.mojo",
+    "src/mojotrees/gpu_bin_packing.mojo",
     "bench/apple/bin_layout_plan.json",
     "handoffs/algorithm_25_binned_layout.md"
   ],
@@ -98,7 +98,7 @@
   ],
 
   "cost_model": {
-    "source": "src/mojoboost/gpu_binned_layout.mojo",
+    "source": "src/mojotrees/gpu_binned_layout.mojo",
     "structs": ["LayoutNodeCost", "LayoutBuildCost", "MeasuredLayoutCosts"],
     "units": [
       {

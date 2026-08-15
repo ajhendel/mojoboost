@@ -30,14 +30,14 @@ Defaults: 500000 rows, 50 features, 255 bins, 5 trials.
 from std.sys import argv, has_accelerator
 from std.time import perf_counter_ns
 
-from mojoboost.binning import BinnedMatrix
-from mojoboost.gpu_active_rows import (
+from mojotrees.binning import BinnedMatrix
+from mojotrees.gpu_active_rows import (
     LeafRange,
     RowRouting,
     partition_range_host,
 )
-from mojoboost.histogram import Histogram, build_histogram_subset_into
-from mojoboost.histogram_gpu import GpuHistogramBuilder
+from mojotrees.histogram import Histogram, build_histogram_subset_into
+from mojotrees.histogram_gpu import GpuHistogramBuilder
 
 
 def _splitmix64(state: UInt64) -> UInt64:

@@ -16,10 +16,10 @@ import pickle
 
 import pytest
 
-from mojoboost import (
-    MojoBoostClassifier,
-    MojoBoostRanker,
-    MojoBoostRegressor,
+from mojotrees import (
+    MojoTreesClassifier,
+    MojoTreesRanker,
+    MojoTreesRegressor,
 )
 
 np = pytest.importorskip("numpy")
@@ -98,7 +98,7 @@ def test_auto_marks_every_pandas_category_column():
     """LightGBM's default: 'auto' means the pandas `category` columns and
     nothing else."""
     X, y, _, _ = _frame_data()
-    est = MojoBoostRegressor(**CAT_KWARGS).fit(X, y)
+    est = MojoTreesRegressor(**CAT_KWARGS).fit(X, y)
     assert est.categorical_feature_ == [0]
 
 
@@ -106,23 +106,23 @@ def test_auto_marks_nothing_on_an_array():
     """A numpy matrix carries no dtype to read, so 'auto' is no columns and
     the default estimator trains exactly as it did before."""
     X, y = _numeric_data()
-    est = MojoBoostRegressor(n_estimators=5).fit(X, y)
+    est = MojoTreesRegressor(n_estimators=5).fit(X, y)
     assert est.categorical_feature_ == []
 
 
 def test_indices_mark_columns_of_an_array():
     X, y = _numeric_data()
-    est = MojoBoostRegressor(categorical_feature=[0], **CAT_KWARGS).fit(X, y)
+    est = MojoTreesRegressor(categorical_feature=[0], **CAT_KWARGS).fit(X, y)
     assert est.categorical_feature_ == [0]
 
 
 @needs_pandas
 def test_a_name_and_its_index_resolve_to_the_same_model():
     X, y, _, _ = _frame_data()
-    by_name = MojoBoostRegressor(
+    by_name = MojoTreesRegressor(
         categorical_feature=["color"], **CAT_KWARGS
     ).fit(X, y)
-    by_index = MojoBoostRegressor(
+    by_index = MojoTreesRegressor(
         categorical_feature=[0], **CAT_KWARGS
     ).fit(X, y)
     assert by_name.categorical_feature_ == by_index.categorical_feature_ == [0]
@@ -133,7 +133,7 @@ def test_a_name_and_its_index_resolve_to_the_same_model():
 def test_names_and_indices_can_be_mixed():
     X, y, codes, x = _frame_data()
     X = X.assign(other=codes.astype(float))
-    est = MojoBoostRegressor(
+    est = MojoTreesRegressor(
         categorical_feature=["color", 2], **CAT_KWARGS
     ).fit(X, y)
     assert est.categorical_feature_ == [0, 2]
@@ -141,13 +141,13 @@ def test_names_and_indices_can_be_mixed():
 
 def test_the_plural_alias_is_accepted():
     X, y = _numeric_data()
-    est = MojoBoostRegressor(categorical_features=[0], **CAT_KWARGS).fit(X, y)
+    est = MojoTreesRegressor(categorical_features=[0], **CAT_KWARGS).fit(X, y)
     assert est.categorical_feature_ == [0]
 
 
 def test_conflicting_aliases_raise():
     X, y = _numeric_data()
-    est = MojoBoostRegressor(
+    est = MojoTreesRegressor(
         categorical_feature=[0], categorical_features=[1], **CAT_KWARGS
     )
     with pytest.raises(ValueError, match="aliases"):
@@ -156,7 +156,7 @@ def test_conflicting_aliases_raise():
 
 def test_none_means_no_categorical_feature():
     X, y = _numeric_data()
-    est = MojoBoostRegressor(categorical_feature=None, n_estimators=5)
+    est = MojoTreesRegressor(categorical_feature=None, n_estimators=5)
     assert est.fit(X, y).categorical_feature_ == []
 
 
@@ -174,14 +174,14 @@ def test_none_means_no_categorical_feature():
 )
 def test_bad_categorical_feature_raises(spec, match):
     X, y = _numeric_data(n_rows=60)
-    est = MojoBoostRegressor(categorical_feature=spec, n_estimators=3)
+    est = MojoTreesRegressor(categorical_feature=spec, n_estimators=3)
     with pytest.raises(ValueError, match=match):
         est.fit(X, y)
 
 
 def test_a_name_needs_a_matrix_that_carries_names():
     X, y = _numeric_data(n_rows=60)
-    est = MojoBoostRegressor(categorical_feature=["color"], n_estimators=3)
+    est = MojoTreesRegressor(categorical_feature=["color"], n_estimators=3)
     with pytest.raises(ValueError, match="carries no feature names"):
         est.fit(X, y)
 
@@ -189,7 +189,7 @@ def test_a_name_needs_a_matrix_that_carries_names():
 @needs_pandas
 def test_an_unknown_name_raises():
     X, y, _, _ = _frame_data(n_rows=60)
-    est = MojoBoostRegressor(categorical_feature=["shade"], n_estimators=3)
+    est = MojoTreesRegressor(categorical_feature=["shade"], n_estimators=3)
     with pytest.raises(ValueError, match="not a column of X"):
         est.fit(X, y)
 
@@ -197,7 +197,7 @@ def test_an_unknown_name_raises():
 @needs_pandas
 def test_a_name_listed_twice_by_name_and_index_raises():
     X, y, _, _ = _frame_data(n_rows=60)
-    est = MojoBoostRegressor(
+    est = MojoTreesRegressor(
         categorical_feature=["color", 0], n_estimators=3
     )
     with pytest.raises(ValueError, match="twice"):
@@ -209,7 +209,7 @@ def test_a_category_column_left_out_of_the_list_raises():
     """LightGBM would feed its codes to the numerical scan. A declared
     category is never an ordered number, so this is an error."""
     X, y, _, _ = _frame_data(n_rows=60)
-    est = MojoBoostRegressor(categorical_feature=[], n_estimators=3)
+    est = MojoTreesRegressor(categorical_feature=[], n_estimators=3)
     with pytest.raises(ValueError, match="not in categorical_feature"):
         est.fit(X, y)
 
@@ -226,8 +226,8 @@ def test_declared_categories_are_not_treated_as_ordered():
     y = _effect(codes)
     X = codes.astype(float).reshape(-1, 1)
     kwargs = dict(CAT_KWARGS, num_leaves=4, n_estimators=20)
-    as_cat = MojoBoostRegressor(categorical_feature=[0], **kwargs).fit(X, y)
-    as_num = MojoBoostRegressor(categorical_feature=None, **kwargs).fit(X, y)
+    as_cat = MojoTreesRegressor(categorical_feature=[0], **kwargs).fit(X, y)
+    as_num = MojoTreesRegressor(categorical_feature=None, **kwargs).fit(X, y)
     cat_sse = float(np.sum((np.asarray(as_cat.predict(X)) - y) ** 2))
     num_sse = float(np.sum((np.asarray(as_num.predict(X)) - y) ** 2))
     assert cat_sse / n_rows < 0.02
@@ -238,7 +238,7 @@ def test_unseen_missing_and_negative_codes_share_one_route():
     """All three land in the reserved unknown bin, which is in no split's
     category set, so all three route right at every categorical node."""
     X, y = _numeric_data()
-    est = MojoBoostRegressor(categorical_feature=[0], **CAT_KWARGS).fit(X, y)
+    est = MojoTreesRegressor(categorical_feature=[0], **CAT_KWARGS).fit(X, y)
     rows = np.array(
         [[99.0, 0.5], [-1.0, 0.5], [-12345.0, 0.5], [np.nan, 0.5]]
     )
@@ -256,7 +256,7 @@ def test_oversized_codes_are_rejected(bad):
     Rejecting them at both ends beats binning them as unseen at predict
     time and raising at fit time."""
     X, y = _numeric_data(n_rows=120)
-    est = MojoBoostRegressor(categorical_feature=[0], **CAT_KWARGS)
+    est = MojoTreesRegressor(categorical_feature=[0], **CAT_KWARGS)
     with pytest.raises(ValueError, match="2\\*\\*31"):
         est.fit(np.column_stack([np.full(120, bad), X[:, 1]]), y)
     est.fit(X, y)
@@ -268,7 +268,7 @@ def test_fractional_codes_are_rejected():
     """`bin_of` truncates toward zero, so 1.5 and 1 would be one category.
     Merging them silently is worse than saying so."""
     X, y = _numeric_data(n_rows=120)
-    est = MojoBoostRegressor(categorical_feature=[0], **CAT_KWARGS)
+    est = MojoTreesRegressor(categorical_feature=[0], **CAT_KWARGS)
     with pytest.raises(ValueError, match="not a category code"):
         est.fit(np.column_stack([X[:, 0] + 0.5, X[:, 1]]), y)
     est.fit(X, y)
@@ -280,7 +280,7 @@ def test_a_numerical_column_is_left_alone():
     """Fractional and huge values are only rejected in a declared
     categorical column; the numerical column beside it is untouched."""
     X, y = _numeric_data(n_rows=120)
-    est = MojoBoostRegressor(categorical_feature=[0], **CAT_KWARGS).fit(X, y)
+    est = MojoTreesRegressor(categorical_feature=[0], **CAT_KWARGS).fit(X, y)
     assert len(est.predict(np.array([[0.0, 1e30], [1.0, 0.25]]))) == 2
 
 
@@ -290,7 +290,7 @@ def test_a_numerical_column_is_left_alone():
 @needs_pandas
 def test_a_category_column_trains_on_its_labels():
     X, y, codes, x = _frame_data()
-    est = MojoBoostRegressor(**CAT_KWARGS).fit(X, y)
+    est = MojoTreesRegressor(**CAT_KWARGS).fit(X, y)
     # The alternating effect is recovered per label, which no threshold on
     # the codes could do.
     pred = np.asarray(est.predict(X))
@@ -304,7 +304,7 @@ def test_prediction_re_encodes_through_the_fitted_categories():
     """The same label must reach the same category whatever the prediction
     frame numbers it, which is the whole reason the tables are kept."""
     X, y, codes, x = _frame_data()
-    est = MojoBoostRegressor(**CAT_KWARGS).fit(X, y)
+    est = MojoTreesRegressor(**CAT_KWARGS).fit(X, y)
     reordered = _frame(codes, x, categories=list(reversed(LABELS)))
     # The frame's own codes really are different, so a model that trusted
     # them would predict something else here.
@@ -319,7 +319,7 @@ def test_a_prediction_frame_may_carry_plain_labels():
     """A column of the labels themselves, not yet a category dtype, is
     encoded through the same tables."""
     X, y, codes, x = _frame_data()
-    est = MojoBoostRegressor(**CAT_KWARGS).fit(X, y)
+    est = MojoTreesRegressor(**CAT_KWARGS).fit(X, y)
     plain = pd.DataFrame({"color": [LABELS[c] for c in codes], "x": x})
     assert list(est.predict(plain)) == list(est.predict(X))
 
@@ -327,7 +327,7 @@ def test_a_prediction_frame_may_carry_plain_labels():
 @needs_pandas
 def test_a_label_never_seen_predicts_as_unseen():
     X, y, codes, x = _frame_data()
-    est = MojoBoostRegressor(**CAT_KWARGS).fit(X, y)
+    est = MojoTreesRegressor(**CAT_KWARGS).fit(X, y)
     new = pd.DataFrame({"color": ["zzz"] * len(codes), "x": x})
     missing = pd.DataFrame({"color": [None] * len(codes), "x": x})
     assert list(est.predict(new)) == list(est.predict(missing))
@@ -338,7 +338,7 @@ def test_a_label_fitted_model_refuses_an_array():
     """Only a frame carries labels, and the codes of an array are not the
     ones the model was fitted on."""
     X, y, codes, x = _frame_data()
-    est = MojoBoostRegressor(**CAT_KWARGS).fit(X, y)
+    est = MojoTreesRegressor(**CAT_KWARGS).fit(X, y)
     with pytest.raises(ValueError, match="DataFrame"):
         est.predict(np.column_stack([codes.astype(float), x]))
 
@@ -347,7 +347,7 @@ def test_a_label_fitted_model_refuses_an_array():
 def test_a_code_fitted_model_refuses_a_category_frame():
     """The reverse: a model with no label mapping cannot be handed one."""
     X, y = _numeric_data()
-    est = MojoBoostRegressor(categorical_feature=[0], **CAT_KWARGS).fit(X, y)
+    est = MojoTreesRegressor(categorical_feature=[0], **CAT_KWARGS).fit(X, y)
     frame, _, _, _ = _frame_data()
     with pytest.raises(ValueError, match="no category mapping"):
         est.predict(frame)
@@ -360,7 +360,7 @@ def test_a_code_fitted_model_refuses_a_category_frame():
 def test_the_classifier_takes_categorical_columns():
     X, y, codes, _ = _frame_data()
     labels = (codes % 3).astype(np.int64)
-    est = MojoBoostClassifier(**CAT_KWARGS).fit(X, labels)
+    est = MojoTreesClassifier(**CAT_KWARGS).fit(X, labels)
     assert est.categorical_feature_ == [0]
     assert est.n_classes_ == 3
     assert np.mean(np.asarray(est.predict(X)) == labels) > 0.95
@@ -381,10 +381,10 @@ def test_the_ranker_takes_categorical_columns():
     y = (codes % 2 == 0).astype(np.int64)
     group = [per_query] * n_queries
     kwargs = dict(CAT_KWARGS, num_leaves=4, n_estimators=1, ndcg_eval_at=4)
-    as_cat = MojoBoostRanker(categorical_feature=[0], **kwargs).fit(
+    as_cat = MojoTreesRanker(categorical_feature=[0], **kwargs).fit(
         X, y, group=group
     )
-    as_num = MojoBoostRanker(categorical_feature=None, **kwargs).fit(
+    as_num = MojoTreesRanker(categorical_feature=None, **kwargs).fit(
         X, y, group=group
     )
     assert as_cat.categorical_feature_ == [0]
@@ -398,7 +398,7 @@ def test_the_ranker_takes_categorical_columns():
 @needs_pandas
 def test_pickle_keeps_the_label_mapping():
     X, y, _, _ = _frame_data()
-    est = MojoBoostRegressor(**CAT_KWARGS).fit(X, y)
+    est = MojoTreesRegressor(**CAT_KWARGS).fit(X, y)
     clone = pickle.loads(pickle.dumps(est))
     assert clone.categorical_feature_ == [0]
     assert list(clone.predict(X)) == list(est.predict(X))
@@ -408,10 +408,10 @@ def test_save_and_load_keep_the_category_tables(tmp_path):
     """The model file carries the tables, so a loaded model splits and
     routes exactly as it did; what it cannot carry is a label encoding."""
     X, y = _numeric_data()
-    est = MojoBoostRegressor(categorical_feature=[0], **CAT_KWARGS).fit(X, y)
+    est = MojoTreesRegressor(categorical_feature=[0], **CAT_KWARGS).fit(X, y)
     path = tmp_path / "model.mbst"
     est.save(path)
-    loaded = MojoBoostRegressor.load(path)
+    loaded = MojoTreesRegressor.load(path)
     assert loaded.categorical_feature_ == [0]
     assert list(loaded.predict(X)) == list(est.predict(X))
     rows = np.array([[99.0, 0.5], [np.nan, 0.5]])
@@ -421,10 +421,10 @@ def test_save_and_load_keep_the_category_tables(tmp_path):
 @needs_pandas
 def test_a_loaded_model_has_no_labels_to_encode_with(tmp_path):
     X, y, codes, x = _frame_data()
-    est = MojoBoostRegressor(**CAT_KWARGS).fit(X, y)
+    est = MojoTreesRegressor(**CAT_KWARGS).fit(X, y)
     path = tmp_path / "model.mbst"
     est.save(path)
-    loaded = MojoBoostRegressor.load(path)
+    loaded = MojoTreesRegressor.load(path)
     assert loaded.categorical_feature_ == [0]
     with pytest.raises(ValueError, match="no category mapping"):
         loaded.predict(X)
@@ -441,7 +441,7 @@ def test_refitting_replaces_the_mapping():
     """Training again is training from scratch, so the second fit's
     categories are the ones prediction encodes through."""
     X, y, codes, x = _frame_data()
-    est = MojoBoostRegressor(**CAT_KWARGS).fit(X, y)
+    est = MojoTreesRegressor(**CAT_KWARGS).fit(X, y)
     renamed = [label.upper() for label in LABELS]
     other = pd.DataFrame(
         {
@@ -465,7 +465,7 @@ def test_refitting_replaces_the_mapping():
 
 def test_refitting_without_categorical_features_clears_the_state():
     X, y = _numeric_data()
-    est = MojoBoostRegressor(categorical_feature=[0], **CAT_KWARGS).fit(X, y)
+    est = MojoTreesRegressor(categorical_feature=[0], **CAT_KWARGS).fit(X, y)
     assert est.categorical_feature_ == [0]
     est.set_params(categorical_feature=None).fit(X, y)
     assert est.categorical_feature_ == []

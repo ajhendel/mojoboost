@@ -1,4 +1,4 @@
-"""End-to-end CPU vs GPU training benchmark for mojoboost.
+"""End-to-end CPU vs GPU training benchmark for mojotrees.
 
 Generates the same deterministic synthetic dataset as bench_train.mojo
 (counter-based splitmix64), bins it once, then times complete boosted
@@ -17,12 +17,12 @@ decimal places they print, so the summary reports each arm's own spread and
 refuses to call a gap smaller than that spread a result.
 
 Each arm names its split-search strategy as an argument to `train_gpu`, not
-through MOJOBOOST_GPU_SPLIT_STRATEGY, so a mistyped or word-split shell
+through MOJOTREES_GPU_SPLIT_STRATEGY, so a mistyped or word-split shell
 export cannot leave one arm running the other arm's code path under the
 wrong label. `gpu` is whatever SPLIT_SEARCH_AUTO resolves to for the
 workload; `gpu-host` and `gpu-device` pin the choice.
 
-CPU-side threading honors MOJOBOOST_NUM_WORKERS / MOJOBOOST_PARALLEL_MIN_OPS
+CPU-side threading honors MOJOTREES_NUM_WORKERS / MOJOTREES_PARALLEL_MIN_OPS
 (see parallel.mojo), so pin those for reproducible comparisons.
 
 The first repeat of the first GPU arm also pays one-time device setup, which
@@ -42,16 +42,16 @@ from std.math import exp, log
 from std.sys import argv, has_accelerator
 from std.time import perf_counter_ns
 
-from mojoboost.binning import fit_bins
-from mojoboost.boosting import (
+from mojotrees.binning import fit_bins
+from mojotrees.boosting import (
     BINARY_LOGISTIC,
     SQUARED_ERROR,
     Booster,
     BoosterParams,
     train,
 )
-from mojoboost.binning import BinnedMatrix
-from mojoboost.train_gpu import (
+from mojotrees.binning import BinnedMatrix
+from mojotrees.train_gpu import (
     SPLIT_SEARCH_AUTO,
     SPLIT_SEARCH_DEVICE,
     SPLIT_SEARCH_HOST,
@@ -312,7 +312,7 @@ def main() raises:
                 target.append(signal + 0.1 * (u - 0.5))
 
         print(
-            "mojoboost gpu-vs-cpu bench:",
+            "mojotrees gpu-vs-cpu bench:",
             n_rows,
             "rows x",
             n_features,

@@ -1,5 +1,5 @@
 #!/bin/sh
-# mojoboost environment capture: AMD, HIP.
+# mojotrees environment capture: AMD, HIP.
 #
 # Prints the machine, driver, and toolchain metadata that
 # hardware/templates/result_amd.json asks for. Run it once, keep the output,
@@ -14,7 +14,7 @@
 #
 # What this script does not do, by construction: install anything, run a
 # package manager, use sudo, write any file, set any variable outside its own
-# shell, contact the network, upload anything, or build any part of mojoboost.
+# shell, contact the network, upload anything, or build any part of mojotrees.
 # Read it before you run it; it is short on purpose.
 #
 # It does not call `pixi run` either. `pixi run` solves and installs the
@@ -28,7 +28,7 @@
 # that has been known to carry an access token. It does print your group names,
 # because render-group membership is the single most common cause of a machine
 # with a working card reporting no accelerator. The only environment variables
-# printed are the named mojoboost and threading ones below. Absolute paths in
+# printed are the named mojotrees and threading ones below. Absolute paths in
 # tool output can still contain your username, so read the file before you
 # attach it, and say what you changed if you change anything.
 #
@@ -68,15 +68,15 @@ run() {
 }
 
 show_var() {
-    eval "value=\"\${$1-__mojoboost_unset__}\""
-    if [ "$value" = "__mojoboost_unset__" ]; then
+    eval "value=\"\${$1-__mojotrees_unset__}\""
+    if [ "$value" = "__mojotrees_unset__" ]; then
         printf '%s=<unset>\n' "$1"
     else
         printf '%s=%s\n' "$1" "$value"
     fi
 }
 
-printf 'mojoboost hardware capture\n'
+printf 'mojotrees hardware capture\n'
 printf 'vendor:           amd\n'
 printf 'api:              hip\n'
 printf 'capture script:   hardware/capture/capture_amd.sh\n'
@@ -116,7 +116,7 @@ section "device node permissions, the usual cause of a false skip"
 run 'ls -l /dev/kfd /dev/dri'
 run 'id -nG'
 
-section "hip toolchain and profilers, none of which are required to run mojoboost"
+section "hip toolchain and profilers, none of which are required to run mojotrees"
 run 'command -v hipcc'
 run 'hipcc --version'
 run 'command -v rocprofv3'
@@ -130,7 +130,7 @@ run 'mojo --version'
 run 'command -v python3'
 run 'python3 --version'
 
-section "mojoboost source"
+section "mojotrees source"
 run 'git rev-parse HEAD'
 run 'git rev-parse --abbrev-ref HEAD'
 run 'git status --porcelain'
@@ -140,13 +140,13 @@ if [ "$COMMANDS_ONLY" -eq 1 ]; then
     printf '\n(the fixed variable allowlist, printed one per line)\n'
 else
     printf '\n'
-    show_var MOJOBOOST_NUM_WORKERS
-    show_var MOJOBOOST_PARALLEL_MIN_OPS
-    show_var MOJOBOOST_DISABLE_GPU
-    show_var MOJOBOOST_GPU_HIST_STRATEGY
-    show_var MOJOBOOST_GPU_ROW_TILE
-    show_var MOJOBOOST_GPU_BLOCK_THREADS
-    show_var MOJOBOOST_AUTO_MIN_CELLS
+    show_var MOJOTREES_NUM_WORKERS
+    show_var MOJOTREES_PARALLEL_MIN_OPS
+    show_var MOJOTREES_DISABLE_GPU
+    show_var MOJOTREES_GPU_HIST_STRATEGY
+    show_var MOJOTREES_GPU_ROW_TILE
+    show_var MOJOTREES_GPU_BLOCK_THREADS
+    show_var MOJOTREES_AUTO_MIN_CELLS
     show_var OMP_NUM_THREADS
     show_var MKL_NUM_THREADS
     show_var HIP_VISIBLE_DEVICES

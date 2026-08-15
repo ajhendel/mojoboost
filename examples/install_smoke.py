@@ -1,4 +1,4 @@
-"""First five minutes with mojoboost, and a check that the install works.
+"""First five minutes with mojotrees, and a check that the install works.
 
 Run it against an installed package
 
@@ -35,33 +35,33 @@ import tempfile
 # ----------------------------------------------------------------------
 
 try:
-    import mojoboost
-    from mojoboost import MojoBoostRegressor, gpu_available
+    import mojotrees
+    from mojotrees import MojoTreesRegressor, gpu_available
 except ModuleNotFoundError as exc:
-    if exc.name == "mojoboost":
+    if exc.name == "mojotrees":
         sys.exit(
-            "mojoboost is not importable at all. Either install a wheel,\n"
+            "mojotrees is not importable at all. Either install a wheel,\n"
             "or from a source checkout run `pixi run build-python` and\n"
             "rerun this with PYTHONPATH=python. See docs/INSTALLATION.md."
         )
-    sys.exit(f"a module mojoboost needs is missing:\n\n    {exc}")
+    sys.exit(f"a module mojotrees needs is missing:\n\n    {exc}")
 except ImportError as exc:
     # Two very different failures arrive here as the same exception type.
-    # A missing `_mojoboost.so` is swallowed as a ModuleNotFoundError by
+    # A missing `_mojotrees.so` is swallowed as a ModuleNotFoundError by
     # the import machinery's fromlist handling and comes back out of
-    # `from . import ... _mojoboost ...` as "cannot import name"; a .so
+    # `from . import ... _mojotrees ...` as "cannot import name"; a .so
     # that exists but cannot resolve its MAX runtime libraries fails in
     # dlopen and keeps the loader's own message.
-    if "cannot import name '_mojoboost'" in str(exc):
+    if "cannot import name '_mojotrees'" in str(exc):
         sys.exit(
-            "the mojoboost package imported but its compiled extension is\n"
+            "the mojotrees package imported but its compiled extension is\n"
             "missing. In a source checkout, build it with\n"
             "\n    pixi run build-python\n\n"
             "and rerun this script with PYTHONPATH=python. See\n"
             "docs/INSTALLATION.md, state 3."
         )
     sys.exit(
-        "the mojoboost extension is present but failed to load, which\n"
+        "the mojotrees extension is present but failed to load, which\n"
         "usually means its bundled MAX runtime libraries were not found:\n"
         f"\n    {exc}\n\n"
         "From a source checkout, run through `pixi run` so the toolchain\n"
@@ -136,24 +136,24 @@ def rmse(y_true, y_pred):
 
 def diagnostics():
     rule("1. Diagnostics")
-    if hasattr(mojoboost, "show_versions"):
-        mojoboost.show_versions()
+    if hasattr(mojotrees, "show_versions"):
+        mojotrees.show_versions()
     else:
         # Installs from before show_versions() existed. Same facts, by
         # hand, so this script stays useful against an older wheel.
-        print(f"mojoboost                {mojoboost.__version__}")
-        print(f"package path             {mojoboost.__file__}")
-        print(f"extension                {mojoboost._mojoboost.__file__}")
+        print(f"mojotrees                {mojotrees.__version__}")
+        print(f"package path             {mojotrees.__file__}")
+        print(f"extension                {mojotrees._mojotrees.__file__}")
         print(f"python                   {sys.version.split()[0]}")
         print(f"executable               {sys.executable}")
         print(f"platform                 {platform.platform()}")
         print(f"machine                  {platform.machine()}")
         print(f"gpu_available()          {gpu_available()}")
         for name in sorted(os.environ):
-            if name.startswith(("MOJOBOOST_", "MODULAR_")):
+            if name.startswith(("MOJOTREES_", "MODULAR_")):
                 print(f"{name:<24} {os.environ[name]}")
         print(
-            "\nThis install predates mojoboost.show_versions(), so it cannot\n"
+            "\nThis install predates mojotrees.show_versions(), so it cannot\n"
             "say whether a GPU path was compiled into it. Upgrade to answer\n"
             "that question."
         )
@@ -175,7 +175,7 @@ def tiny_regression():
     X = [[0.0], [1.0], [2.0], [3.0], [4.0], [5.0]]
     y = [0.0, 1.0, 4.0, 9.0, 16.0, 25.0]
 
-    model = MojoBoostRegressor(
+    model = MojoTreesRegressor(
         n_estimators=20, num_leaves=7, min_data_in_leaf=1
     )
     model.fit(X, y)
@@ -208,7 +208,7 @@ def validation_and_early_stopping():
         "device='gpu' raises rather than falling back. This step asks for\n"
         "the CPU deliberately.\n"
     )
-    model = MojoBoostRegressor(
+    model = MojoTreesRegressor(
         n_estimators=400,
         learning_rate=0.05,
         num_leaves=31,
@@ -249,7 +249,7 @@ def save_and_load(model, X_valid, preds):
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "install_smoke.mbst")
         model.save(path)
-        restored = MojoBoostRegressor.load(path)
+        restored = MojoTreesRegressor.load(path)
         again = list(restored.predict(X_valid))
         identical = all(float(a) == float(b) for a, b in zip(preds, again))
         print(f"written          {os.path.basename(path)}"
@@ -276,10 +276,10 @@ def device_selection():
     X, y = make_data(2000, 6)
     fixed = dict(n_estimators=20, num_leaves=15)
 
-    cpu_model = MojoBoostRegressor(device="cpu", **fixed).fit(X, y)
+    cpu_model = MojoTreesRegressor(device="cpu", **fixed).fit(X, y)
     print(f"device='cpu'     ran on {cpu_model.device_}")
 
-    auto_model = MojoBoostRegressor(device="auto", **fixed).fit(X, y)
+    auto_model = MojoTreesRegressor(device="auto", **fixed).fit(X, y)
     print(f"device='auto'    ran on {auto_model.device_}")
 
     if not gpu_available():
@@ -289,7 +289,7 @@ def device_selection():
         )
     else:
         try:
-            gpu_model = MojoBoostRegressor(device="gpu", **fixed).fit(X, y)
+            gpu_model = MojoTreesRegressor(device="gpu", **fixed).fit(X, y)
         except Exception as exc:
             print(f"device='gpu'     refused, {type(exc).__name__}: {exc}")
             print(
@@ -300,12 +300,12 @@ def device_selection():
         else:
             print(f"device='gpu'     ran on {gpu_model.device_}")
 
-    threshold = os.environ.get("MOJOBOOST_AUTO_MIN_CELLS")
+    threshold = os.environ.get("MOJOTREES_AUTO_MIN_CELLS")
     shown = threshold if threshold else "disabled (the default)"
     print(f"\nauto threshold   {shown}")
     print(
         "\ndevice='auto' resolves to the CPU on every machine and every\n"
-        "workload unless MOJOBOOST_AUTO_MIN_CELLS is set. The crossover\n"
+        "workload unless MOJOTREES_AUTO_MIN_CELLS is set. The crossover\n"
         "table is empty because no benchmark has established a workload\n"
         "size where end-to-end GPU training beats the multicore CPU\n"
         "trainer, and shipping a threshold before that measurement would\n"
@@ -318,7 +318,7 @@ def device_selection():
 
 
 def main():
-    print("mojoboost installation smoke test")
+    print("mojotrees installation smoke test")
     print("=" * 33)
     print(
         "\nThe first five minutes from docs/INSTALLATION.md, in five steps.\n"
@@ -340,7 +340,7 @@ def main():
         )
         return 1
     print(
-        "Every step succeeded. mojoboost is installed and working on this\n"
+        "Every step succeeded. mojotrees is installed and working on this\n"
         "machine, on the CPU at least.\n"
         "\nNext: docs/LIGHTGBM_PARITY.md for what the library promises,\n"
         "docs/GPU_VALIDATION.md before believing anything about an\n"

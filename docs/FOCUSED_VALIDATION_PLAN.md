@@ -45,7 +45,7 @@ on purpose.
 The working rule this project already had is the right one. After changing a
 module, run the one suite that imports it. The problem with the rule is purely
 mechanical. Nobody remembers which of the 47 suites imports
-`src/mojoboost/gpu_split_search.mojo`, the answer changes every time a lane
+`src/mojotrees/gpu_split_search.mojo`, the answer changes every time a lane
 lands, and looking it up by hand costs more attention than just running
 everything. So people run everything, or they run nothing.
 
@@ -99,14 +99,14 @@ Every file in `tests/` was read for its import block, specifically for lines of
 the form
 
 ```mojo
-from mojoboost.<module> import <names>
+from mojotrees.<module> import <names>
 ```
 
 That gives a map from suite to the modules it names. Inverting it gives, for
-each module in `src/mojoboost/`, the set of suites that import it directly.
+each module in `src/mojotrees/`, the set of suites that import it directly.
 That inverted map is the whole of the targeting signal. When
-`src/mojoboost/goss.mojo` changes, the plan is the suites that name
-`mojoboost.goss`, plus whatever `escalate` says for that subsystem, and nothing
+`src/mojotrees/goss.mojo` changes, the plan is the suites that name
+`mojotrees.goss`, plus whatever `escalate` says for that subsystem, and nothing
 else.
 
 ### 3.1 Why direct imports and not transitive reach
@@ -114,7 +114,7 @@ else.
 The obvious refinement is to close the import graph transitively, on the theory
 that a suite importing `train.mojo` which imports `gain.mojo` is also a test of
 `gain.mojo`. That was computed and then thrown away, because it destroys the
-thing being built. Under transitive reach, `src/mojoboost/gain.mojo` is reached
+thing being built. Under transitive reach, `src/mojotrees/gain.mojo` is reached
 by 34 of the 47 suites. A tool that answers "you changed gain.mojo, run 34
 suites" has given the same answer as `pixi run test` while costing more to
 maintain.
@@ -131,7 +131,7 @@ and the planner uses it and says so rather than pretending to more.
 - **Runtime dispatch.** A module selected through a registry, a function
   pointer, or a string parameter has no import edge, so a suite that exercises
   it through that seam does not appear in the map.
-- **Behavior with no suite.** 18 modules under `src/mojoboost/` are imported by
+- **Behavior with no suite.** 18 modules under `src/mojotrees/` are imported by
   no suite at all. They are not silently absent. They are `[[gap]]` entries in
   `subsystems.toml`, each with a `reason`, a `would_close_it`, and
   `fallback = ["native:compile-package"]`, which is the honest floor. Compiling
@@ -200,7 +200,7 @@ change set, and passing `--paths` skips even that.
 
 ```
 python3 tools/validation_plan.py                      # plan for the working tree
-python3 tools/validation_plan.py --paths src/mojoboost/goss.mojo
+python3 tools/validation_plan.py --paths src/mojotrees/goss.mojo
 python3 tools/validation_plan.py --since main
 python3 tools/validation_plan.py --handoff remaining_12_validation
 python3 tools/validation_plan.py --subsystem gpu-histogram --explain
@@ -218,7 +218,7 @@ exclusion class. Output is `--format text|json|sh`, optionally to `--out`, with
 Three checks act on the manifests rather than on the tree.
 `--self-check` validates every cross-reference, every `requires_files` path,
 every `pixi run` task name against the tasks actually declared in `pixi.toml`,
-every `MOJOBOOST_*` variable against the documented env contract, and that every
+every `MOJOTREES_*` variable against the documented env contract, and that every
 Mojo suite the pixi task chain runs is named by some job, and exits 1 on any
 problem. `--coverage` reports what the manifests do not name, as notes, never as
 failures. `--list-tiers`, `--list-jobs`, and `--list-subsystems` dump the
@@ -235,7 +235,7 @@ push.
 
 That is not hypothetical. `tests/test_binning.mojo` was added to the test chain,
 and until it was found by hand it was named by no job, so a plan for a change to
-`src/mojoboost/binning.mojo` returned `native:kernels`, `native:trainset`, and
+`src/mojotrees/binning.mojo` returned `native:kernels`, `native:trainset`, and
 `native:histogram-reference`, and not one of them is the binning suite. The rule
 exists so the next one costs a failing `--self-check` instead of an audit.
 
@@ -244,22 +244,22 @@ exists so the next one costs a failing `--self-check` instead of an audit.
 `--format sh` writes a POSIX shell script. It is meant to be read before it is
 run, and it is built so that running it by accident is hard.
 
-- It refuses to start unless `MOJOBOOST_VALIDATION_OPT_IN=1` is set in the
+- It refuses to start unless `MOJOTREES_VALIDATION_OPT_IN=1` is set in the
   environment. Nothing sets that anywhere in this repository.
-- It sets `ulimit -c 0`, exports `MOJOBOOST_NUM_WORKERS` for every tier except
+- It sets `ulimit -c 0`, exports `MOJOTREES_NUM_WORKERS` for every tier except
   `static` and `smoke`, which read files and do not need threads, and applies a
   per-job timeout through `timeout(1)` or `gtimeout(1)`, whichever exists.
   macOS ships neither by default, and the script says so and continues without
   the timeout rather than failing.
 - Every job with a non-empty exclusion class is wrapped in
   `tools/with_build_lock.sh`, so a plan run here serializes against a build
-  started in another terminal. It also exports `MOJOBOOST_BUILD_LOCK` with that
+  started in another terminal. It also exports `MOJOTREES_BUILD_LOCK` with that
   class's own lock path, which the wrapper does not read yet; see section 7.
 - Each job's exit status is captured through a status file rather than through
   `PIPESTATUS`, which is not POSIX. The tee'd log would otherwise report a
   failing suite as a pass. There is a comment in the emitted script saying so,
   because that bug is invisible and it comes back.
-- Logs go to `${TMPDIR:-/tmp}/mojoboost-validation-<stamp>/`, one file per job,
+- Logs go to `${TMPDIR:-/tmp}/mojotrees-validation-<stamp>/`, one file per job,
   plus the status files.
 
 ### 5.2 The five mechanisms against a full-suite run
@@ -311,13 +311,13 @@ both call `pytest.importorskip("scipy.sparse")`. `[feature.pytest.dependencies]`
 in `pixi.toml` declares pytest, scikit-learn, pandas, pyarrow, and polars, and
 does not declare scipy. `pixi run -e pytest test-estimators` is the only task
 that collects those files. So the sparse paths report as skipped, the run
-reports green, and the scipy conversion code in `python/mojoboost/_validation.py`
-and `python/mojoboost/_arrow.py` has no covering test that ever executes. A
+reports green, and the scipy conversion code in `python/mojotrees/_validation.py`
+and `python/mojotrees/_arrow.py` has no covering test that ever executes. A
 skip that nobody reads is indistinguishable from a pass. Patch P2.
 
 **`pixi run test-c` is in no CI job.** `pixi.toml:35` defines it as
 `capi/run_c_tests.sh`, which compiles `capi/test_capi.c` against
-`capi/mojoboost.h`. Nothing under `.github/workflows/` invokes it, and the
+`capi/mojotrees.h`. Nothing under `.github/workflows/` invokes it, and the
 script skips itself when no C compiler is present, so the C header's
 compilability under an actual C compiler is unproven on every platform in the
 matrix. The job exists in `jobs.toml` as `native:c-abi-from-c`, carrying
@@ -342,7 +342,7 @@ alternative was a second implementation of fcntl locking inside the planner,
 which is the kind of duplicate that later disagrees with itself.
 
 What was done inside ownership is the seam, not the fix. `[locks]` in
-`tiers.toml` now carries `lock_env = "MOJOBOOST_BUILD_LOCK"` and a
+`tiers.toml` now carries `lock_env = "MOJOTREES_BUILD_LOCK"` and a
 `[locks.class_lock_files]` table, and the emitted script exports that variable
 with the job's class lock path before every exclusive job. The wrapper reads no
 environment today, so the export is inert and all three classes keep sharing one
@@ -368,9 +368,9 @@ Giving it a command in this file was the wrong fix, because a job that invents
 its own way to run a test is one the next person will not find from `pixi.toml`.
 Patch P4 adds it to the test chain, after which the entry becomes ordinary.
 
-**`MOJOBOOST_BINNING_SELECT_MIN_ROWS` is not in the README env contract.**
-`src/mojoboost/binning.mojo` reads it and both that module and
-`src/mojoboost/parallel.mojo` document it in their docstrings, but the README
+**`MOJOTREES_BINNING_SELECT_MIN_ROWS` is not in the README env contract.**
+`src/mojotrees/binning.mojo` reads it and both that module and
+`src/mojotrees/parallel.mojo` document it in their docstrings, but the README
 list that `--self-check` treats as the contract does not have it. It is
 scheduling-only, in the sense that both paths it selects between resolve the
 same edges, and `tests/test_binning.mojo` asserts that on both sides of the

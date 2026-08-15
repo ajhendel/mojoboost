@@ -482,7 +482,7 @@ if [[ "$PRINT_PLAN" -eq 1 ]]; then
     exit 0
 fi
 
-emit "mojoboost thermal capture plan"
+emit "mojotrees thermal capture plan"
 emit "=============================="
 emit ""
 emit "script            thermal_capture.sh ${SCRIPT_VERSION}"
@@ -590,11 +590,11 @@ for p in "${SELECTED_PHASES[@]}"; do
             emit "    is enough to move a histogram timing, and this form is stoppable"
             emit "    by pid rather than by a pattern match over every process on the"
             emit "    machine, which is why it is written this way:"
-            emit_cmd sh -c 'yes > /dev/null & echo $! > /tmp/mojoboost_thermal_load.pid'
+            emit_cmd sh -c 'yes > /dev/null & echo $! > /tmp/mojotrees_thermal_load.pid'
             emit "    then re-run the idle gate. It MUST fail. A gate that passes here"
             emit "    proves nothing about any other phase in this record."
-            emit_cmd sh -c 'kill "$(cat /tmp/mojoboost_thermal_load.pid)"'
-            emit_cmd rm -f /tmp/mojoboost_thermal_load.pid
+            emit_cmd sh -c 'kill "$(cat /tmp/mojotrees_thermal_load.pid)"'
+            emit_cmd rm -f /tmp/mojotrees_thermal_load.pid
             ;;
         cold_fit|warm_fit|repeat_series|sustained|throttle_probe)
             case "$p" in
@@ -612,7 +612,7 @@ for p in "${SELECTED_PHASES[@]}"; do
             emit "    Environment the driver would set before importing anything."
             emit "    PCORES stands in for sysctl -n hw.perflevel0.physicalcpu when"
             emit "    --threads was not given; the protocol matches at 1 and at that count."
-            emit_cmd env "MOJOBOOST_NUM_WORKERS=${THREADS:-PCORES}" \
+            emit_cmd env "MOJOTREES_NUM_WORKERS=${THREADS:-PCORES}" \
                 "OMP_NUM_THREADS=${THREADS:-PCORES}" \
                 "MKL_NUM_THREADS=${THREADS:-PCORES}" \
                 "VECLIB_MAXIMUM_THREADS=${THREADS:-PCORES}"

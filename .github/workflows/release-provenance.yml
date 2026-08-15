@@ -124,7 +124,7 @@ jobs:
 
       - name: Build and test the wheel
         env:
-          MOJOBOOST_MACOS_TARGET: ${{ inputs.macos_target }}
+          MOJOTREES_MACOS_TARGET: ${{ inputs.macos_target }}
         run: packaging/macos/build_release_wheel.sh
 
       # The provenance sidecar is written by the build, not by this workflow
@@ -133,7 +133,7 @@ jobs:
       # rather than a field left empty or invented here.
       - name: Provenance sidecar exists
         run: |
-          WHEEL=$(ls python/dist/mojoboost-*.whl)
+          WHEEL=$(ls python/dist/mojotrees-*.whl)
           test -f "$WHEEL.provenance.json" || {
             echo "missing $WHEEL.provenance.json"
             echo "packaging/build_wheel.sh must write it; see handoffs/task18_platform.md edit 4"
@@ -149,7 +149,7 @@ jobs:
       - name: Clean install smoke test
         run: |
           env -u CONDA_PREFIX bash packaging/matrix/smoke/clean_install_macos.sh \
-            "$(ls python/dist/mojoboost-*.whl)" clean-install.txt
+            "$(ls python/dist/mojotrees-*.whl)" clean-install.txt
 
       # The digest is computed here, on the machine that produced the file, and
       # carried forward as a job output. Every later job checks what it
@@ -158,7 +158,7 @@ jobs:
       - name: Hash manifest
         id: digest
         run: |
-          WHEEL=$(ls python/dist/mojoboost-*.whl)
+          WHEEL=$(ls python/dist/mojotrees-*.whl)
           python3 packaging/security/hash_manifest.py write \
             python/dist/SHA256SUMS "$WHEEL" "$WHEEL.provenance.json"
           cat python/dist/SHA256SUMS
@@ -298,7 +298,7 @@ jobs:
     timeout-minutes: 15
     environment:
       name: ${{ inputs.publish }}
-      url: https://pypi.org/p/mojoboost
+      url: https://pypi.org/p/mojotrees
     permissions:
       # id-token only. No contents, because this job does not check the
       # repository out. There is no PyPI API token in this workflow, in a

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate and check mojoboost's public API snapshot.
+"""Generate and check mojotrees's public API snapshot.
 
     python3 tools/api_snapshot.py --check   # exit 0 if the snapshot matches
     python3 tools/api_snapshot.py --write   # regenerate it in place
@@ -17,7 +17,7 @@ it is inconvenient.
 
 - **Standard library only.** `ast` for Python sources, `re` for Mojo and C,
   `tomllib` for TOML. Nothing installed, nothing vendored.
-- **Builds nothing, imports no part of mojoboost.** It parses text. It
+- **Builds nothing, imports no part of mojotrees.** It parses text. It
   never needs a compiled extension module and runs on a bare runner in
   seconds. The one module it does import is `check_parity`, a sibling in
   this directory, and section "Reuse" below says why.
@@ -28,7 +28,7 @@ it is inconvenient.
 Reuse
 -----
 `mojo_export_names()` in `check_parity.py` already parses
-`src/mojoboost/__init__.mojo`, and it already handles both spellings of
+`src/mojotrees/__init__.mojo`, and it already handles both spellings of
 the import block. This tool needs the same names grouped by module, so it
 has its own parser for the grouping and then checks the flattened result
 against `check_parity`'s (invariant I11). Two independent parsers over one
@@ -72,7 +72,7 @@ SNAPSHOT = ROOT / "compatibility" / "api_snapshot.json"
 LEGACY_SNAPSHOT = ROOT / "tests" / "parallel" / "api_snapshot_manifest.json"
 DEPRECATIONS = ROOT / "compatibility" / "deprecations.toml"
 
-PY_PKG = ROOT / "python" / "mojoboost"
+PY_PKG = ROOT / "python" / "mojotrees"
 PY_API = PY_PKG / "__init__.py"
 PY_BASIC = PY_PKG / "basic.py"
 PY_CALLBACK = PY_PKG / "callback.py"
@@ -80,26 +80,26 @@ PY_EVAL = PY_PKG / "_eval.py"
 PY_INSPECTION = PY_PKG / "inspection.py"
 PYPROJECT = ROOT / "python" / "pyproject.toml"
 
-MOJO_INIT = ROOT / "src" / "mojoboost" / "__init__.mojo"
-MOJO_BOOSTING = ROOT / "src" / "mojoboost" / "boosting.mojo"
-MOJO_PARAMS = ROOT / "src" / "mojoboost" / "params.mojo"
-MOJO_SERIALIZE = ROOT / "src" / "mojoboost" / "serialize.mojo"
-MOJO_DUMP = ROOT / "src" / "mojoboost" / "model_dump.mojo"
-BINDINGS = ROOT / "bindings" / "_mojoboost.mojo"
+MOJO_INIT = ROOT / "src" / "mojotrees" / "__init__.mojo"
+MOJO_BOOSTING = ROOT / "src" / "mojotrees" / "boosting.mojo"
+MOJO_PARAMS = ROOT / "src" / "mojotrees" / "params.mojo"
+MOJO_SERIALIZE = ROOT / "src" / "mojotrees" / "serialize.mojo"
+MOJO_DUMP = ROOT / "src" / "mojotrees" / "model_dump.mojo"
+BINDINGS = ROOT / "bindings" / "_mojotrees.mojo"
 
-CAPI_HEADER = ROOT / "capi" / "mojoboost.h"
+CAPI_HEADER = ROOT / "capi" / "mojotrees.h"
 PIXI = ROOT / "pixi.toml"
 CI = ROOT / ".github" / "workflows" / "ci.yml"
 POLICY = ROOT / "docs" / "COMPATIBILITY_POLICY.md"
 
-# Directories scanned for MOJOBOOST_* string literals. `tools/`, `bench/`,
+# Directories scanned for MOJOTREES_* string literals. `tools/`, `bench/`,
 # and `packaging/` are deliberately absent: a variable only a benchmark
 # reads is not a surface of the library.
 ENV_SCAN_DIRS = ("src", "bindings", "python", "capi", "cli")
 ENV_SCAN_SUFFIXES = (".mojo", ".py", ".h", ".c")
 
 # The estimator classes whose surface is public under policy section 2.
-ESTIMATORS = ("MojoBoostRegressor", "MojoBoostClassifier", "MojoBoostRanker")
+ESTIMATORS = ("MojoTreesRegressor", "MojoTreesClassifier", "MojoTreesRanker")
 
 # The Mojo side of the reset slot contract spells two parameters
 # differently from the Python side. The pair is a wire format (policy
@@ -329,10 +329,10 @@ def public_methods(cls, consts: dict) -> tuple:
 def python_block(d: Deriver) -> dict:
     tree = parse_py(PY_API, d)
     if tree is None:
-        d.gap("python", "python/mojoboost/__init__.py did not parse")
+        d.gap("python", "python/mojotrees/__init__.py did not parse")
         return {}
     consts = module_constants(tree)
-    out = {"module": "mojoboost"}
+    out = {"module": "mojotrees"}
     out["all"] = dunder_all(tree, d, "python")
 
     lazy_subs = value_of(assign_in(tree.body, "_LAZY_SUBMODULES"), consts)
@@ -460,7 +460,7 @@ def callbacks_block(d: Deriver) -> dict:
         d.gap("python.callbacks", "callback.py did not parse")
         return {}
     consts = module_constants(tree)
-    out = {"module": "mojoboost.callback"}
+    out = {"module": "mojotrees.callback"}
     out["all"] = dunder_all(tree, d, "python.callbacks")
 
     # Parsing rule 3: CallbackEnv is a namedtuple() call, not a class, so
@@ -543,7 +543,7 @@ def functional_block(d: Deriver) -> dict:
         d.gap("python.functional_api", "basic.py did not parse")
         return {}
     consts = module_constants(tree)
-    out = {"module": "mojoboost.basic"}
+    out = {"module": "mojotrees.basic"}
     out["all"] = dunder_all(tree, d, "python.functional_api")
     train = func_named(tree.body, "train")
     out["train"] = signature(train, consts) if train else {}
@@ -567,7 +567,7 @@ def inspection_block(d: Deriver) -> dict:
         d.gap("python.inspection", "inspection.py did not parse")
         return {}
     consts = module_constants(tree)
-    out = {"module": "mojoboost.inspection"}
+    out = {"module": "mojotrees.inspection"}
     out["all"] = dunder_all(tree, d, "python.inspection")
     for key, name in (
         ("dump_format_version", "DUMP_FORMAT_VERSION"),
@@ -608,7 +608,7 @@ def mojo_comptime_str(path: Path, name: str, d: Deriver):
 
 
 def mojo_exports_by_module(d: Deriver) -> dict:
-    """The `from .mod import ...` blocks of src/mojoboost/__init__.mojo.
+    """The `from .mod import ...` blocks of src/mojotrees/__init__.mojo.
 
     Parsing rule 4: exports come in two spellings. Most are parenthesized
     and span lines; some are a single bare line, with one name or with
@@ -659,7 +659,7 @@ def mojo_objective_codes(d: Deriver) -> dict:
 
 
 def mojo_reset_slot_order(d: Deriver) -> list:
-    """The slot order of `_write_reset` in bindings/_mojoboost.mojo,
+    """The slot order of `_write_reset` in bindings/_mojotrees.mojo,
     translated into the Python side's spelling.
 
     Each line is `p.unsafe_store(<i>, <expr>)`, and the parameter is the
@@ -729,13 +729,13 @@ def c_abi_block(d: Deriver) -> dict:
 
     defines = {}
     for name, value in re.findall(
-        r"#define\s+(MOJOBOOST_[A-Z0-9_]+)\s+\(?\s*(-?\d+)\s*\)?\s*$",
+        r"#define\s+(MOJOTREES_[A-Z0-9_]+)\s+\(?\s*(-?\d+)\s*\)?\s*$",
         stripped,
         re.MULTILINE,
     ):
         defines[name] = int(value)
-    if "MOJOBOOST_ABI_VERSION" not in defines:
-        d.gap("c_abi.abi_version", "MOJOBOOST_ABI_VERSION not found")
+    if "MOJOTREES_ABI_VERSION" not in defines:
+        d.gap("c_abi.abi_version", "MOJOTREES_ABI_VERSION not found")
 
     opaque = sorted(
         set(re.findall(r"typedef\s+struct\s+\w+\s+(\w+)\s*;", stripped))
@@ -743,7 +743,7 @@ def c_abi_block(d: Deriver) -> dict:
 
     functions = []
     for match in re.finditer(
-        r"(?<![\w*])((?:const\s+)?\w+[\w\s*]*?)\b(mojoboost_\w+)\s*\("
+        r"(?<![\w*])((?:const\s+)?\w+[\w\s*]*?)\b(mojotrees_\w+)\s*\("
         r"([^;{]*?)\)\s*;",
         stripped,
         re.DOTALL,
@@ -758,7 +758,7 @@ def c_abi_block(d: Deriver) -> dict:
 
     return {
         "header": rel(CAPI_HEADER),
-        "abi_version": defines.get("MOJOBOOST_ABI_VERSION"),
+        "abi_version": defines.get("MOJOTREES_ABI_VERSION"),
         "defines": dict(sorted(defines.items())),
         "opaque_types": opaque,
         "functions": sorted(set(functions)),
@@ -779,7 +779,7 @@ def parameter_string_block(d: Deriver) -> dict:
     joined = "".join(re.findall(r'"([^"]*)"', m.group(1)))
     keys = [k.strip() for k in joined.split(",") if k.strip()]
     return {
-        "parser": "src/mojoboost/params.mojo parse_params",
+        "parser": "src/mojotrees/params.mojo parse_params",
         "used_by": ["capi", "cli"],
         "supported_keys": keys,
     }
@@ -796,7 +796,7 @@ def environment_block(d: Deriver) -> dict:
     which is a filter and not a variable.
     """
     declared = sorted(
-        set(re.findall(r"`(MOJOBOOST_[A-Z0-9_]+)`", read(POLICY, d)))
+        set(re.findall(r"`(MOJOTREES_[A-Z0-9_]+)`", read(POLICY, d)))
     )
     observed: set = set()
     direct: set = set()
@@ -808,15 +808,15 @@ def environment_block(d: Deriver) -> dict:
             if not path.is_file() or path.suffix not in ENV_SCAN_SUFFIXES:
                 continue
             text = path.read_text(errors="replace")
-            observed.update(re.findall(r'"(MOJOBOOST_[A-Z0-9_]+)"', text))
+            observed.update(re.findall(r'"(MOJOTREES_[A-Z0-9_]+)"', text))
             direct.update(
                 re.findall(
-                    r'(?:getenv|environ\.get)\(\s*"(MOJOBOOST_[A-Z0-9_]+)"',
+                    r'(?:getenv|environ\.get)\(\s*"(MOJOTREES_[A-Z0-9_]+)"',
                     text,
                 )
             )
-    observed.discard("MOJOBOOST_")
-    direct.discard("MOJOBOOST_")
+    observed.discard("MOJOTREES_")
+    direct.discard("MOJOTREES_")
     if not declared:
         d.gap("environment.declared", "no backtick names found in the policy")
     return {
@@ -852,7 +852,7 @@ def versions_block(d: Deriver, inspection: dict) -> dict:
             pyproject,
             "library_locations.pyproject",
         ),
-        "python/mojoboost/__init__.py": first(
+        "python/mojotrees/__init__.py": first(
             r'^__version__\s*=\s*"([^"]+)"',
             init,
             "library_locations.dunder",
@@ -1084,7 +1084,7 @@ def present_names(snap: dict) -> set:
         out.update(names)
         out.update(f"{module}.{n}" for n in names)
     for decl in snap.get("c_abi", {}).get("functions", []):
-        m = re.search(r"\b(mojoboost_\w+)\s*\(", decl)
+        m = re.search(r"\b(mojotrees_\w+)\s*\(", decl)
         if m:
             out.add(m.group(1))
     out.update(snap.get("c_abi", {}).get("defines", {}))
@@ -1094,7 +1094,7 @@ def present_names(snap: dict) -> set:
 
 
 def check_mojo_export_agreement(snap: dict, d: Deriver) -> None:
-    """I11. Two parsers over src/mojoboost/__init__.mojo must agree, or one
+    """I11. Two parsers over src/mojotrees/__init__.mojo must agree, or one
     of them is dropping a module. Degrades to a recorded gap rather than a
     failure if check_parity cannot be imported."""
     try:
@@ -1115,7 +1115,7 @@ def check_mojo_export_agreement(snap: dict, d: Deriver) -> None:
         only_ours = sorted(ours - theirs)
         only_theirs = sorted(theirs - ours)
         d.problem(
-            "I11: the two parsers of src/mojoboost/__init__.mojo disagree; "
+            "I11: the two parsers of src/mojotrees/__init__.mojo disagree; "
             f"only here: {only_ours or 'none'}; "
             f"only in check_parity: {only_theirs or 'none'}"
         )
@@ -1237,7 +1237,7 @@ def build(commit: str | None) -> tuple:
     snap: dict = {}
     snap["python"] = python_block(d)
     snap["mojo"] = {
-        "package": "mojoboost",
+        "package": "mojotrees",
         "export_source": rel(MOJO_INIT),
         "abi_promise": (
             "none; Mojo has no stable ABI, so the guarantee is source "
@@ -1334,7 +1334,7 @@ def report(d: Deriver) -> None:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
-        description="Generate or check mojoboost's public API snapshot."
+        description="Generate or check mojotrees's public API snapshot."
     )
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--check", action="store_true")

@@ -48,7 +48,7 @@ trap 'rm -rf "$WORK"' EXIT
 "$WORK/venv/bin/pip" install --no-index --no-cache-dir "$WHEEL"
 
 PKG=$("$WORK/venv/bin/python" -c \
-    'import mojoboost, pathlib; print(pathlib.Path(mojoboost.__file__).parent)')
+    'import mojotrees, pathlib; print(pathlib.Path(mojotrees.__file__).parent)')
 
 "$HERE/inspect_elf.sh" "$PKG" "$OUT"
 

@@ -1,6 +1,6 @@
 # packaging/security
 
-The checks and fixtures behind a mojoboost release. What an artifact has to
+The checks and fixtures behind a mojotrees release. What an artifact has to
 prove about itself before it is published, and what a stranger can check about
 it afterwards.
 
@@ -20,7 +20,7 @@ release_checklist.md     the release gate, items F through I
 
 ## What runs and what does not
 
-**Nothing here has ever been executed.** No mojoboost release exists, so there
+**Nothing here has ever been executed.** No mojotrees release exists, so there
 is no artifact to hash, no attestation to verify, and no SBOM to supplement.
 These were written before the first publication on purpose, so that the
 acceptance criteria for a release are settled and reviewable now rather than
@@ -56,7 +56,7 @@ which, because a green digest check reads like more assurance than it is.
 
 ## The SBOM, and why it needs help
 
-A dependency scanner reads a mojoboost wheel as a Python distribution, finds
+A dependency scanner reads a mojotrees wheel as a Python distribution, finds
 one component, and stops. It does not report the compiled Mojo extension or the
 four MAX runtime libraries copied into the wheel by
 `packaging/build_wheel.sh`, which are most of the artifact by bytes and all of

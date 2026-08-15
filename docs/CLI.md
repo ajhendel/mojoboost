@@ -1,26 +1,26 @@
 # Command line tool
 
-`mojoboost` trains a model and scores data from text files, without writing
+`mojotrees` trains a model and scores data from text files, without writing
 any code. `cli/README.md` is the practical guide; this document is the
 reference for the interface itself and for what each command reaches inside
-mojoboost.
+mojotrees.
 
 ```sh
-mojoboost train --data train.csv --model model.mbst \
+mojotrees train --data train.csv --model model.mbst \
     --params "objective=binary num_iterations=200"
-mojoboost predict --model model.mbst --data test.csv --output pred.csv
-mojoboost info --model model.mbst --json
+mojotrees predict --model model.mbst --data test.csv --output pred.csv
+mojotrees info --model model.mbst --json
 ```
 
-## It is a mojoboost interface, not a LightGBM one
+## It is a mojotrees interface, not a LightGBM one
 
 LightGBM's command line tool is driven by a config file of `key=value`
 lines, with the verb itself as one of them (`task=train`), the data path as
 another, and no distinction between a hyperparameter and an instruction
-about where a file lives. mojoboost does not reproduce that surface, and
+about where a file lives. mojotrees does not reproduce that surface, and
 adding it later would be a mistake rather than a compatibility win:
 
-- **Commands are subcommands.** `mojoboost train`, not `task=train`. The
+- **Commands are subcommands.** `mojotrees train`, not `task=train`. The
   verb decides which options are meaningful, so it belongs where a reader
   and a shell completion can both see it first.
 - **Options are flags.** Where a file is, which column is the label, where
@@ -35,7 +35,7 @@ adding it later would be a mistake rather than a compatibility win:
   has a way to reuse a long command line.
 
 The single genuine loss is that a LightGBM config file cannot be handed to
-`mojoboost` unchanged. The hyperparameters inside it can, as a `--params`
+`mojotrees` unchanged. The hyperparameters inside it can, as a `--params`
 string.
 
 ## Everything is computed elsewhere
@@ -119,7 +119,7 @@ Without `--json`: the kind, the objective, the feature count, the tree
 count, the iteration count, and the learning rate. With `--json`: the model
 in the schema documented in
 [MODEL_INSPECTION_SCHEMA.md](MODEL_INSPECTION_SCHEMA.md), from the same Mojo
-implementation the Python `mojoboost.inspection.dump_model` reaches on its
+implementation the Python `mojotrees.inspection.dump_model` reaches on its
 native path.
 
 A model file carries no feature names, so the dump names features
@@ -128,7 +128,7 @@ override that; the Python entry point does.
 
 ### version, help
 
-`version` prints the mojoboost version. `help`, `--help`, and `-h` print
+`version` prints the mojotrees version. `help`, `--help`, and `-h` print
 usage.
 
 ## Scoring part of an ensemble
@@ -138,7 +138,7 @@ boosting iterations, which is how to see what a shorter run would have
 predicted without retraining:
 
 ```sh
-mojoboost predict --model model.mbst --data test.csv --num-iteration 50
+mojotrees predict --model model.mbst --data test.csv --num-iteration 50
 ```
 
 The unit is boosting iterations, not trees. For a multiclass model one
@@ -155,7 +155,7 @@ than a slice of the full model's.
 ## Devices
 
 `--device cpu|gpu|auto` chooses where `predict` runs, using the same
-vocabulary as everything else in mojoboost; see
+vocabulary as everything else in mojotrees; see
 [DEVICE_SELECTION.md](DEVICE_SELECTION.md).
 
 `gpu` fails with the reason when no accelerator is available or the workload
@@ -197,13 +197,13 @@ because a data file is exactly where that kind of typo hides.
 | 1 | the command failed: a bad file, a shape mismatch, an unusable parameter, a refused device |
 | 2 | a usage error: no command, an unknown command |
 
-Failures print to stderr, results to stdout, so `mojoboost predict` without
+Failures print to stderr, results to stdout, so `mojotrees predict` without
 `--output` composes in a pipeline.
 
 ## Building
 
 ```sh
-pixi run build-cli      # builds cli/mojoboost
+pixi run build-cli      # builds cli/mojotrees
 pixi run test-cli       # the Mojo tests for it
 ```
 

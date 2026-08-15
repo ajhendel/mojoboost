@@ -71,13 +71,13 @@ jobs:
       - name: GPU equivalence and determinism suites
         run: pixi run test-gpu
 
-      # MOJOBOOST_DISABLE_GPU makes device.mojo report no accelerator on a
+      # MOJOTREES_DISABLE_GPU makes device.mojo report no accelerator on a
       # machine that has one. Only a GPU runner can exercise that branch, so
       # this is the only place the pin-to-CPU path is actually tested.
       - name: Device selection with the accelerator disabled
         run: pixi run test
         env:
-          MOJOBOOST_DISABLE_GPU: "1"
+          MOJOTREES_DISABLE_GPU: "1"
 
       - name: Validation report
         run: pixi run gpu-validate ${{ inputs.rounds }} | tee gpu-validation.txt
@@ -126,7 +126,7 @@ jobs:
       - name: Device selection with the accelerator disabled
         run: pixi run test
         env:
-          MOJOBOOST_DISABLE_GPU: "1"
+          MOJOTREES_DISABLE_GPU: "1"
 
       - name: Validation report
         run: pixi run gpu-validate ${{ inputs.rounds }} | tee gpu-validation.txt

@@ -24,10 +24,10 @@ Findings are ordered by consequence, not by discovery.
 
 | Where | Says |
 |---|---|
-| `src/mojoboost/serialize.mojo:84` | `comptime _VERSION = "v4"` |
-| `src/mojoboost/serialize.mojo:89` | `comptime CURRENT_FORMAT_VERSION = 4` |
-| `src/mojoboost/serialize.mojo:_read_version` | accepts `v1`, `v2`, `v3`, `v4` |
-| `python/mojoboost/inspection.py:93` | `SUPPORTED_MODEL_FORMAT_VERSIONS = (1, 2, 3)` |
+| `src/mojotrees/serialize.mojo:84` | `comptime _VERSION = "v4"` |
+| `src/mojotrees/serialize.mojo:89` | `comptime CURRENT_FORMAT_VERSION = 4` |
+| `src/mojotrees/serialize.mojo:_read_version` | accepts `v1`, `v2`, `v3`, `v4` |
+| `python/mojotrees/inspection.py:93` | `SUPPORTED_MODEL_FORMAT_VERSIONS = (1, 2, 3)` |
 
 `parse_model_string` raises on any version outside that tuple, with the
 message "model format v4 is newer than this build reads". So a model saved
@@ -36,7 +36,7 @@ by the same build that wrote it.
 
 The path this reaches is `dump_model`'s fallback, `_dump_from_text`, which
 is what runs when the native dump binding is not available. `dump_model`
-is in `mojoboost.__all__` as of the current tree, so this is a public
+is in `mojotrees.__all__` as of the current tree, so this is a public
 surface failing on a model the public API just produced.
 
 This is invariant **I5** in [SNAPSHOT_SCHEMA.md](SNAPSHOT_SCHEMA.md)
@@ -46,7 +46,7 @@ section 6, and it is the reason I5 exists.
 additions handled in `_parse_trees`: per-node split gains, the covers
 presence flag, and the optional `feature_names` section. The tuple change
 alone is not enough and would turn a clean refusal into a misparse, which
-is worse. Owner: whoever owns `python/mojoboost/inspection.py`.
+is worse. Owner: whoever owns `python/mojotrees/inspection.py`.
 
 **Not verified.** No parser was run and no model was saved. The claim is
 that the constant excludes 4 and that the writer emits `v4`, both of which
@@ -61,9 +61,9 @@ which dump path is taken at runtime, which was not exercised.
 
 | Where | Says |
 |---|---|
-| `src/mojoboost/model_dump.mojo:68` | `comptime MODEL_FORMAT_VERSION = 3` |
-| `src/mojoboost/serialize.mojo:87` | comment: `MODEL_FORMAT_VERSION` in model_dump.mojo "reports this number to a dump consumer and has to track it" |
-| `src/mojoboost/serialize.mojo:89` | `CURRENT_FORMAT_VERSION = 4` |
+| `src/mojotrees/model_dump.mojo:68` | `comptime MODEL_FORMAT_VERSION = 3` |
+| `src/mojotrees/serialize.mojo:87` | comment: `MODEL_FORMAT_VERSION` in model_dump.mojo "reports this number to a dump consumer and has to track it" |
+| `src/mojotrees/serialize.mojo:89` | `CURRENT_FORMAT_VERSION = 4` |
 
 The two constants are documented as coupled and they are not equal. A
 native dump therefore reports `model_format_version: 3` for a model that
@@ -76,7 +76,7 @@ present and skips them, on a model that has them.
 
 Nothing raises. This is invariant **I4**.
 
-**Fix.** `MODEL_FORMAT_VERSION = 4` in `src/mojoboost/model_dump.mojo`,
+**Fix.** `MODEL_FORMAT_VERSION = 4` in `src/mojotrees/model_dump.mojo`,
 and check `has_split_gain` is reported true where gains exist. Owner:
 whoever owns `model_dump.mojo`.
 
@@ -110,11 +110,11 @@ to paste.
 
 **Severity: the snapshot's whole purpose, demonstrated on itself.**
 
-`capi/mojoboost.h:83` is `#define MOJOBOOST_ABI_VERSION 2`. Both documents
+`capi/mojotrees.h:83` is `#define MOJOTREES_ABI_VERSION 2`. Both documents
 that state the ABI version say 1:
 
 - `docs/COMPATIBILITY_POLICY.md` section 1.4 table, and section 6.3,
-  "`MOJOBOOST_ABI_VERSION` is 1"
+  "`MOJOTREES_ABI_VERSION` is 1"
 - `tests/parallel/api_snapshot_manifest.json`, `versions.c_abi: 1` and
   `c_abi.abi_version: 1`
 
@@ -123,13 +123,13 @@ does not cover. Four new functions and two new constant groups:
 
 | Added | Kind |
 |---|---|
-| `mojoboost_gpu_available` | function |
-| `mojoboost_predict_ex` | function |
-| `mojoboost_model_num_iterations` | function |
-| `mojoboost_model_dump_json` | function |
-| `mojoboost_string_free` | function |
-| `MOJOBOOST_DEVICE_CPU`, `_GPU`, `_AUTO` | `#define` |
-| `MOJOBOOST_PREDICT_RESPONSE`, `_RAW` | `#define` |
+| `mojotrees_gpu_available` | function |
+| `mojotrees_predict_ex` | function |
+| `mojotrees_model_num_iterations` | function |
+| `mojotrees_model_dump_json` | function |
+| `mojotrees_string_free` | function |
+| `MOJOTREES_DEVICE_CPU`, `_GPU`, `_AUTO` | `#define` |
+| `MOJOTREES_PREDICT_RESPONSE`, `_RAW` | `#define` |
 
 Adding a function is additive under compatibility policy section 6.3 and
 needs no ABI bump. Something in this set was judged to need one, and
@@ -148,11 +148,11 @@ caller compiled against 1 sees.
 
 ---
 
-## F5. `mojoboost.__all__` grew by nine names, and gate item C5 is resolved
+## F5. `mojotrees.__all__` grew by nine names, and gate item C5 is resolved
 
 **Severity: additive, and one release gate item can be closed.**
 
-The manifest lists seventeen names. `python/mojoboost/__init__.py:274` now
+The manifest lists seventeen names. `python/mojotrees/__init__.py:274` now
 lists twenty-six. Added:
 
 `cv`, `CVBooster`, `build_info`, `show_versions`, `explain_device_choice`,
@@ -163,11 +163,11 @@ Every one is additive and lands correctly in a minor release. Two things
 follow that are not just a bigger list.
 
 **Gate item C5 is resolved, and section 6.1 has not caught up.** C5 asked
-that `mojoboost.inspection` be either re-exported at the top level or
+that `mojotrees.inspection` be either re-exported at the top level or
 added to the supported import paths. It was re-exported: four inspection
 names are in `__all__`, resolved lazily through `_LAZY_ATTRS`. Section 6.1
 of the compatibility policy still says no submodule other than
-`mojoboost.callback` is a supported import path, and section 8.1 still
+`mojotrees.callback` is a supported import path, and section 8.1 still
 describes the question as open. Both should now describe the resolution.
 
 **Five names in `__all__` are resolved by `__getattr__`, not bound
@@ -190,15 +190,15 @@ becoming lazy a no-op, and it is not.
 **Severity: an undocumented surface people will find and use.**
 
 Compatibility policy section 9.5 documents seven. A scan for double-quoted
-`MOJOBOOST_*` literals under `src/`, `bindings/`, `python/`, `capi/`, and
+`MOJOTREES_*` literals under `src/`, `bindings/`, `python/`, `capi/`, and
 `cli/` finds forty-four distinct names.
 
 **All seven declared variables are found, so `environment.stale` is empty
 and invariant I8 passes.** Two of the seven,
-`MOJOBOOST_GPU_BLOCK_THREADS` and `MOJOBOOST_GPU_ROW_TILE`, are read
+`MOJOTREES_GPU_BLOCK_THREADS` and `MOJOTREES_GPU_ROW_TILE`, are read
 through `_env_int(name, default)` in `gpu_tiling.mojo` and
 `apple_histogram_policy.mojo` rather than passed to `getenv` directly, as
-are `MOJOBOOST_NUM_WORKERS` and `MOJOBOOST_PARALLEL_MIN_OPS` in
+are `MOJOTREES_NUM_WORKERS` and `MOJOTREES_PARALLEL_MIN_OPS` in
 `parallel.mojo`. A scan of `getenv` call sites alone finds nineteen names
 and misses four of the seven documented ones, which is why the snapshot
 schema defines `observed` as the literal scan and keeps `read_directly` as
@@ -209,18 +209,18 @@ groups:
 
 | Group | Variables |
 |---|---|
-| CPU policy | `MOJOBOOST_CPU_COMPACT_MIN_ROWS`, `MOJOBOOST_CPU_CORE_POOL`, `MOJOBOOST_CPU_FEATURE_GROUP`, `MOJOBOOST_CPU_TASKS_PER_CORE`, `MOJOBOOST_HIST_CACHE_BYTES` |
-| Distributed | `MOJOBOOST_DIST_JOB_ID`, `MOJOBOOST_DIST_MACHINES`, `MOJOBOOST_DIST_MODE`, `MOJOBOOST_DIST_RANK`, `MOJOBOOST_DIST_RESTART_EPOCH`, `MOJOBOOST_DIST_TIMEOUT_S`, `MOJOBOOST_DIST_WORLD_SIZE`, `MOJOBOOST_DISTRIBUTED_BASE_PORT`, `MOJOBOOST_DISTRIBUTED_CONNECT_TIMEOUT`, `MOJOBOOST_DISTRIBUTED_PROVIDER`, `MOJOBOOST_DASK_BACKEND` |
-| GPU tuning | `MOJOBOOST_GPU_BATCH_SLOTS`, `MOJOBOOST_GPU_CLASS_BATCH`, `MOJOBOOST_GPU_CLASS_BATCH_BYTES`, `MOJOBOOST_GPU_GRAD_LAYOUT`, `MOJOBOOST_GPU_HIST_SPECIALIZATION`, `MOJOBOOST_GPU_OBJECTIVE`, `MOJOBOOST_GPU_SPLIT_STRATEGY`, `MOJOBOOST_GPU_STAGING_SLOTS`, `MOJOBOOST_GPU_TRANSFER`, `MOJOBOOST_GPU_VALID_SCORING`, `MOJOBOOST_GPU_WARMUP`, `MOJOBOOST_HYBRID_LEAVES` |
-| Diagnostics and tracing | `MOJOBOOST_GPU_TRACE`, `MOJOBOOST_GPU_VERIFY_ROWS`, `MOJOBOOST_HYBRID_TRACE`, `MOJOBOOST_STARTUP_TRACE`, `MOJOBOOST_STARTUP_REPORT_FD` |
-| Escape hatches, and build | `MOJOBOOST_GPU_BACKEND`, `MOJOBOOST_GPU_BACKEND_UNVALIDATED`, `MOJOBOOST_GPU_TRANSFER_UNPROVEN`, `MOJOBOOST_MACOS_DEPLOYMENT_TARGET` |
+| CPU policy | `MOJOTREES_CPU_COMPACT_MIN_ROWS`, `MOJOTREES_CPU_CORE_POOL`, `MOJOTREES_CPU_FEATURE_GROUP`, `MOJOTREES_CPU_TASKS_PER_CORE`, `MOJOTREES_HIST_CACHE_BYTES` |
+| Distributed | `MOJOTREES_DIST_JOB_ID`, `MOJOTREES_DIST_MACHINES`, `MOJOTREES_DIST_MODE`, `MOJOTREES_DIST_RANK`, `MOJOTREES_DIST_RESTART_EPOCH`, `MOJOTREES_DIST_TIMEOUT_S`, `MOJOTREES_DIST_WORLD_SIZE`, `MOJOTREES_DISTRIBUTED_BASE_PORT`, `MOJOTREES_DISTRIBUTED_CONNECT_TIMEOUT`, `MOJOTREES_DISTRIBUTED_PROVIDER`, `MOJOTREES_DASK_BACKEND` |
+| GPU tuning | `MOJOTREES_GPU_BATCH_SLOTS`, `MOJOTREES_GPU_CLASS_BATCH`, `MOJOTREES_GPU_CLASS_BATCH_BYTES`, `MOJOTREES_GPU_GRAD_LAYOUT`, `MOJOTREES_GPU_HIST_SPECIALIZATION`, `MOJOTREES_GPU_OBJECTIVE`, `MOJOTREES_GPU_SPLIT_STRATEGY`, `MOJOTREES_GPU_STAGING_SLOTS`, `MOJOTREES_GPU_TRANSFER`, `MOJOTREES_GPU_VALID_SCORING`, `MOJOTREES_GPU_WARMUP`, `MOJOTREES_HYBRID_LEAVES` |
+| Diagnostics and tracing | `MOJOTREES_GPU_TRACE`, `MOJOTREES_GPU_VERIFY_ROWS`, `MOJOTREES_HYBRID_TRACE`, `MOJOTREES_STARTUP_TRACE`, `MOJOTREES_STARTUP_REPORT_FD` |
+| Escape hatches, and build | `MOJOTREES_GPU_BACKEND`, `MOJOTREES_GPU_BACKEND_UNVALIDATED`, `MOJOTREES_GPU_TRANSFER_UNPROVEN`, `MOJOTREES_MACOS_DEPLOYMENT_TARGET` |
 
 An undeclared variable is not a bug, and this lane does not propose
 declaring all thirty-seven. Section 2 of the compatibility policy already
 says only what is listed is public, and most of these are tuning and
 tracing knobs whose whole value is that they can be retuned in a patch
-release. Two of them, `MOJOBOOST_GPU_BACKEND_UNVALIDATED` and
-`MOJOBOOST_GPU_TRANSFER_UNPROVEN`, name in their own spelling the reason
+release. Two of them, `MOJOTREES_GPU_BACKEND_UNVALIDATED` and
+`MOJOTREES_GPU_TRANSFER_UNPROVEN`, name in their own spelling the reason
 nobody should rely on them.
 
 What is worth acting on is the ratio. Seven documented against forty-four
@@ -230,7 +230,7 @@ project to depend on accidentally: it needs no import, no link, and no
 recompile.
 
 **Fix.** Not a policy change. One sentence in section 9.5 saying that the
-table is the public set and that other `MOJOBOOST_*` variables are
+table is the public set and that other `MOJOTREES_*` variables are
 diagnostics and tuning controls carrying no promise. The snapshot's
 `environment.undeclared` block then keeps the count visible without
 turning every new knob into a documentation change, and
@@ -238,7 +238,7 @@ turning every new knob into a documentation change, and
 read.
 
 **A parsing note for the tool author.** The scan also finds the bare
-prefix literal `"MOJOBOOST_"`, which is a prefix filter rather than a
+prefix literal `"MOJOTREES_"`, which is a prefix filter rather than a
 variable name. Discard any literal that is exactly the prefix, or the
 snapshot gains a phantom forty-fifth variable that can never be declared
 and can never go away.
@@ -249,7 +249,7 @@ and can never go away.
 
 **Severity: additive, and the record is stale.**
 
-`src/mojoboost/params.mojo:66` now lists thirty-two keys. The manifest
+`src/mojotrees/params.mojo:66` now lists thirty-two keys. The manifest
 lists nineteen. The thirteen added:
 
 `feature_fraction_bylevel`, `min_gain_to_split`, `max_delta_step`,
@@ -273,9 +273,9 @@ parsing rule 6 in the snapshot schema.
 
 **Severity: cosmetic, and it sits on the one contract that fails silently.**
 
-`bindings/_mojoboost.mojo:622` says the slot order is "the contract the
+`bindings/_mojotrees.mojo:622` says the slot order is "the contract the
 Python side mirrors in `_RESET_SLOTS`". The Python side names it
-`RESETTABLE`, in `python/mojoboost/callback.py:105`. There is no
+`RESETTABLE`, in `python/mojotrees/callback.py:105`. There is no
 `_RESET_SLOTS` anywhere under `python/`.
 
 The ordering itself agrees, entry for entry, and `RESET_SLOTS` is 9 while
@@ -325,7 +325,7 @@ at.
 |---|---|
 | The three library version locations | All three are `0.1.0` |
 | `len(RESETTABLE)` against `RESET_SLOTS` | Both 9 |
-| `RESETTABLE` order against the slot order in `bindings/_mojoboost.mojo` | Agrees, entry for entry |
+| `RESETTABLE` order against the slot order in `bindings/_mojotrees.mojo` | Agrees, entry for entry |
 | `CallbackEnv` field list and order | Six fields, unchanged from the manifest |
 | `_RESET_ALIASES` | Eleven entries, unchanged |
 | `_FITTED_ATTRS` | Eleven names, unchanged |

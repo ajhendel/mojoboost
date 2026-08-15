@@ -26,9 +26,9 @@ default differently and a default of 0 would exercise only one of the two.
 from std.testing import assert_equal, assert_false, assert_raises, assert_true
 from std.testing import TestSuite
 
-from mojoboost.binning import BinMapper
-from mojoboost.categorical import CategoricalSpec
-from mojoboost.efb import (
+from mojotrees.binning import BinMapper
+from mojotrees.categorical import CategoricalSpec
+from mojotrees.efb import (
     EFB_NONE,
     EFB_SHARED_BIN,
     EfbParams,
@@ -41,7 +41,7 @@ from mojoboost.efb import (
     pairwise_conflict,
     unbundle_histogram,
 )
-from mojoboost.sparse import SparseBinnedMatrix
+from mojotrees.sparse import SparseBinnedMatrix
 
 
 def _mapper(

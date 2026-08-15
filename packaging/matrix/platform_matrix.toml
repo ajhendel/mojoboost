@@ -1,4 +1,4 @@
-# Declarative release matrix for mojoboost artifacts.
+# Declarative release matrix for mojotrees artifacts.
 #
 # This file is the machine-readable half of docs/PLATFORM_MATRIX.md. The prose
 # there explains the reasoning; this file is what a script may read, and
@@ -14,8 +14,8 @@
 # validated by it.
 
 schema = 1
-project = "mojoboost"
-version = "0.1.0"
+project = "mojotrees"
+version = "0.1.0a2"
 
 # The status vocabulary, used by every target, python row, and accelerator row.
 # validate_matrix.py rejects any other word.
@@ -154,7 +154,7 @@ The extension does not fail here, it aborts during module initialization:
 
 Py_NewRef is a CPython 3.10 addition, and three other 3.10 additions sit in the
 same entry point table. Below the toolchain's own floor as well, so there is
-nothing to build with either. python/mojoboost/_compat.py refuses in front of
+nothing to build with either. python/mojotrees/_compat.py refuses in front of
 the import, because an abort cannot be caught.
 """
 evidence = "docs/PYTHON_SUPPORT.md"
@@ -211,7 +211,7 @@ arch = "arm64"
 python = "cp314"
 artifact = "wheel"
 wheel_tag = "cp314-cp314-macosx_26_0_arm64"
-filename = "mojoboost-0.1.0-cp314-cp314-macosx_26_0_arm64.whl"
+filename = "mojotrees-0.1.0a2-cp314-cp314-macosx_26_0_arm64.whl"
 status = "designed"
 build_host = "Apple silicon Mac with the pinned pixi environment"
 builder = "packaging/build_wheel.sh"
@@ -244,7 +244,7 @@ arch = "arm64"
 python = "cp314"
 artifact = "wheel"
 wheel_tag = "cp314-cp314-macosx_12_0_arm64"
-filename = "mojoboost-0.1.0-cp314-cp314-macosx_12_0_arm64.whl"
+filename = "mojotrees-0.1.0a2-cp314-cp314-macosx_12_0_arm64.whl"
 status = "designed"
 build_host = "Apple silicon Mac with the pinned pixi environment"
 builder = "packaging/build_wheel.sh with a lowered deployment target"
@@ -302,10 +302,10 @@ arch = "x86_64"
 python = "cp314"
 artifact = "wheel"
 wheel_tag = "cp314-cp314-linux_x86_64"
-filename = "mojoboost-0.1.0-cp314-cp314-linux_x86_64.whl"
+filename = "mojotrees-0.1.0a2-cp314-cp314-linux_x86_64.whl"
 status = "designed"
 build_host = "glibc 2.28 or newer x86_64 host with the pinned pixi environment"
-builder = "packaging/linux/build_wheel_linux.sh, default MOJOBOOST_TAG_POLICY=plain"
+builder = "packaging/linux/build_wheel_linux.sh, default MOJOTREES_TAG_POLICY=plain"
 builder_script = "packaging/linux/build_wheel_linux.sh"
 workflow = ".github/workflows/release-linux.yml"
 publishable = false
@@ -320,7 +320,7 @@ smoke = "packaging/matrix/smoke/clean_install_linux.sh"
 evidence = ""
 notes = """
 This row is the wheel that actually gets built. The builder defaults to
-MOJOBOOST_TAG_POLICY=plain and the release workflow's `tag_policy` input
+MOJOTREES_TAG_POLICY=plain and the release workflow's `tag_policy` input
 defaults to `plain`, so a dispatch that accepts every default produces exactly
 this filename.
 
@@ -352,10 +352,10 @@ arch = "x86_64"
 python = "cp314"
 artifact = "wheel"
 wheel_tag = "cp314-cp314-manylinux_2_28_x86_64"
-filename = "mojoboost-0.1.0-cp314-cp314-manylinux_2_28_x86_64.whl"
+filename = "mojotrees-0.1.0a2-cp314-cp314-manylinux_2_28_x86_64.whl"
 status = "designed"
 build_host = "manylinux_2_28 image, or a glibc 2.28 host with the pinned pixi environment"
-builder = "packaging/linux/build_wheel_linux.sh with MOJOBOOST_TAG_POLICY=manylinux"
+builder = "packaging/linux/build_wheel_linux.sh with MOJOTREES_TAG_POLICY=manylinux"
 builder_script = "packaging/linux/build_wheel_linux.sh"
 workflow = ".github/workflows/release-linux.yml"
 publishable = true
@@ -393,10 +393,10 @@ arch = "aarch64"
 python = "cp314"
 artifact = "wheel"
 wheel_tag = "cp314-cp314-linux_aarch64"
-filename = "mojoboost-0.1.0-cp314-cp314-linux_aarch64.whl"
+filename = "mojotrees-0.1.0a2-cp314-cp314-linux_aarch64.whl"
 status = "designed"
 build_host = "glibc 2.28 or newer ARM64 host with the pinned pixi environment"
-builder = "packaging/linux/build_wheel_linux.sh, default MOJOBOOST_TAG_POLICY=plain"
+builder = "packaging/linux/build_wheel_linux.sh, default MOJOTREES_TAG_POLICY=plain"
 builder_script = "packaging/linux/build_wheel_linux.sh"
 workflow = ".github/workflows/release-linux.yml"
 publishable = false
@@ -423,10 +423,10 @@ arch = "aarch64"
 python = "cp314"
 artifact = "wheel"
 wheel_tag = "cp314-cp314-manylinux_2_28_aarch64"
-filename = "mojoboost-0.1.0-cp314-cp314-manylinux_2_28_aarch64.whl"
+filename = "mojotrees-0.1.0a2-cp314-cp314-manylinux_2_28_aarch64.whl"
 status = "designed"
 build_host = "manylinux_2_28 aarch64 image, or a glibc 2.28 ARM64 host"
-builder = "packaging/linux/build_wheel_linux.sh with MOJOBOOST_TAG_POLICY=manylinux"
+builder = "packaging/linux/build_wheel_linux.sh with MOJOTREES_TAG_POLICY=manylinux"
 builder_script = "packaging/linux/build_wheel_linux.sh"
 workflow = ".github/workflows/release-linux.yml"
 publishable = true
@@ -474,7 +474,7 @@ instead of "no matching distribution found". Publish wheels only.
 # ---------------------------------------------------------------------------
 # Source installs
 #
-# Not artifacts, but they are the supported way to use mojoboost today and the
+# Not artifacts, but they are the supported way to use mojotrees today and the
 # matrix is dishonest without them.
 # ---------------------------------------------------------------------------
 

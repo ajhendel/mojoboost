@@ -81,7 +81,7 @@ question is about the trainer rather than about the estimator API.
   same build. A CPU number from one commit next to a GPU number from another
   is not a comparison.
 - The CPU column is the multicore CPU trainer at its default worker count
-  unless the notes say otherwise. If `MOJOBOOST_NUM_WORKERS` was set, say so.
+  unless the notes say otherwise. If `MOJOTREES_NUM_WORKERS` was set, say so.
 - A ratio below 1.0 means the GPU took less time. Write the ratio, not an
   adjective.
 - An empty cell stays empty. Nothing is more useful than a fabricated

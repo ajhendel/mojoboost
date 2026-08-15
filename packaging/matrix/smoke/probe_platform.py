@@ -7,7 +7,7 @@ directory that is not the source tree:
 
     python packaging/matrix/smoke/probe_platform.py
 
-Standard library only, and it imports mojoboost only if mojoboost is installed,
+Standard library only, and it imports mojotrees only if mojotrees is installed,
 so it also runs on a machine that is being checked *before* an install.
 
 Everything printed here is something a person would otherwise retype from
@@ -40,7 +40,7 @@ def main() -> int:
     print(f"implementation: {platform.python_implementation()}")
     # The free-threaded build is a different ABI and a different wheel tag.
     # max 26.5.0 depends on python-gil, so a True here means this interpreter
-    # cannot be a mojoboost target at all.
+    # cannot be a mojotrees target at all.
     gil_disabled = getattr(sys, "_is_gil_enabled", None)
     if gil_disabled is None:
         print("free-threaded: no (interpreter has no GIL toggle)")
@@ -77,15 +77,15 @@ def main() -> int:
     print("'not a supported wheel on this platform'. That is the correct")
     print("failure, and it is a tag problem, not an install problem.")
 
-    section("mojoboost")
+    section("mojotrees")
     try:
-        import mojoboost
+        import mojotrees
     except ImportError as exc:
         print(f"not installed: {exc}")
         return 0
 
-    origin = getattr(mojoboost, "__file__", "unknown")
-    print(f"version:      {getattr(mojoboost, '__version__', 'unknown')}")
+    origin = getattr(mojotrees, "__file__", "unknown")
+    print(f"version:      {getattr(mojotrees, '__version__', 'unknown')}")
     print(f"origin:       {origin}")
     if "site-packages" not in str(origin):
         print("WARNING: not imported from site-packages. Whatever this run")
@@ -102,12 +102,12 @@ def main() -> int:
                 shown = name if rel == "." else os.path.join(rel, name)
                 print(f"  {shown}  {size} bytes")
 
-    section("mojoboost environment overrides in effect")
+    section("mojotrees environment overrides in effect")
     # These change what the library does. A record taken without them noted is
     # a record of an unknown configuration.
     any_set = False
     for key, value in sorted(os.environ.items()):
-        if key.startswith("MOJOBOOST_"):
+        if key.startswith("MOJOTREES_"):
             print(f"  {key}={value}")
             any_set = True
     if not any_set:

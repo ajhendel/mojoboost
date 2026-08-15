@@ -17,7 +17,7 @@
 # taking the newest release.
 #
 # Why the runner is self-hosted. `has_accelerator()` is resolved at compile time
-# (src/mojoboost/device.mojo), so the machine that builds the wheel decides what
+# (src/mojotrees/device.mojo), so the machine that builds the wheel decides what
 # the wheel says about GPUs on every machine that installs it. A GitHub-hosted
 # Apple silicon runner reports an accelerator and has no Metal toolchain, so it
 # produces exactly the artifact nobody can reason about: a wheel that claims a
@@ -183,14 +183,14 @@ jobs:
       # the reports that say why.
       - name: Build, verify, and hash
         env:
-          MOJOBOOST_MACOS_TARGET: ${{ inputs.macos_deployment_target }}
+          MOJOTREES_MACOS_TARGET: ${{ inputs.macos_deployment_target }}
         run: packaging/macos/build_release_wheel.sh
 
       - name: Identify the artifact
         id: identify
         run: |
           set -euo pipefail
-          wheel=$(ls python/dist/mojoboost-*.whl)
+          wheel=$(ls python/dist/mojotrees-*.whl)
           echo "wheel=$(basename "$wheel")" >>"$GITHUB_OUTPUT"
           echo "sha256=$(shasum -a 256 "$wheel" | cut -d' ' -f1)" >>"$GITHUB_OUTPUT"
           {
@@ -217,7 +217,7 @@ jobs:
         run: |
           env -u CONDA_PREFIX PYTHON="$PYTHON" \
             bash packaging/matrix/smoke/clean_install_macos.sh \
-              "$(ls python/dist/mojoboost-*.whl)" \
+              "$(ls python/dist/mojotrees-*.whl)" \
               "$PWD/python/dist/clean-install.txt"
 
       # The manifest is written by the build script, before the clean-install
@@ -276,7 +276,7 @@ jobs:
     # handoff.
     environment:
       name: testpypi
-      url: https://test.pypi.org/project/mojoboost/
+      url: https://test.pypi.org/project/mojotrees/
     permissions:
       # The whole reason trusted publishing needs no API token: a short-lived
       # OIDC token minted for this job, exchanged with TestPyPI for an upload

@@ -1,10 +1,10 @@
-# mojoboost
+# mojotrees
 
 Gradient boosted decision trees in [Mojo](https://www.modular.com/mojo),
 with a scikit-learn style Python API backed by a CPython extension module
 built from the same Mojo code.
 
-mojoboost is a from-scratch GBDT library in the LightGBM family. It uses
+mojotrees is a from-scratch GBDT library in the LightGBM family. It uses
 histogram-based split finding, leaf-wise (best-first) tree growth, and
 defaults matched to LightGBM. Objectives include squared error, binary
 logistic, Poisson, and multiclass softmax, with sample weights and
@@ -13,9 +13,9 @@ bit-exact model save/load.
 > **Experimental public alpha.** The feature surface is broad and training
 > works end to end, but this is not yet a production replacement for
 > LightGBM or XGBoost. Treat every capability according to the evidence in
-> [docs/LIGHTGBM_PARITY.md](https://github.com/mojoboost-ml/mojoboost/blob/main/docs/LIGHTGBM_PARITY.md)
+> [docs/LIGHTGBM_PARITY.md](https://github.com/mojotrees/mojotrees/blob/main/docs/LIGHTGBM_PARITY.md)
 > and
-> [docs/GPU_VALIDATION.md](https://github.com/mojoboost-ml/mojoboost/blob/main/docs/GPU_VALIDATION.md),
+> [docs/GPU_VALIDATION.md](https://github.com/mojotrees/mojotrees/blob/main/docs/GPU_VALIDATION.md),
 > report failures, and do not rely on unvalidated hardware or parameter
 > combinations in production. The parity contract scores each capability on
 > seven independent axes rather than one, because several things in the
@@ -27,40 +27,40 @@ bit-exact model save/load.
 The first public alpha is on PyPI:
 
 ```sh
-pip install mojoboost
+pip install mojotrees
 ```
 
-The current `0.1.0a1` wheel supports **CPython 3.14 on Apple Silicon running
+The current `0.1.0a2` wheel supports **CPython 3.14 on Apple Silicon running
 macOS 26 or newer**. It includes its runtime dependencies and requires no
 Mojo, MAX, Pixi, or compiler. Unsupported interpreters and platforms fail
 cleanly with `No matching distribution found`.
 
 | State | What you type | Status today |
 |---|---|---|
-| Published alpha | `pip install --only-binary=:all: mojoboost` | **Available:** `0.1.0a1`, CPython 3.14, Apple Silicon, macOS 26+ |
-| A release wheel file | `pip install ./mojoboost-<version>-<tags>.whl` | **Available** from the release workflow |
+| Published alpha | `pip install --only-binary=:all: mojotrees` | **Available:** `0.1.0a2`, CPython 3.14, Apple Silicon, macOS 26+ |
+| A release wheel file | `pip install ./mojotrees-<version>-<tags>.whl` | **Available** from the release workflow |
 | Source checkout with Pixi | `git clone`, `pixi install`, `pixi run build-python` | **Available** for contributors |
 
 ```sh
-git clone https://github.com/mojoboost-ml/mojoboost.git
-cd mojoboost
+git clone https://github.com/mojotrees/mojotrees.git
+cd mojotrees
 pixi install
 pixi run build-python
-PYTHONPATH=python python -c "import mojoboost; print(mojoboost.__version__)"
+PYTHONPATH=python python -c "import mojotrees; print(mojotrees.__version__)"
 ```
 
 [pixi](https://pixi.sh) resolves the pinned Mojo and MAX versions, so no
 separate Mojo or MAX installation is needed. The published wheel bundles
 the runtime libraries it links and needs no toolchain at all.
 
-mojoboost publishes no source distribution, deliberately, so
-`pip install mojoboost` can never turn into a Mojo compile on a machine with
+mojotrees publishes no source distribution, deliberately, so
+`pip install mojotrees` can never turn into a Mojo compile on a machine with
 no Mojo toolchain. It resolves to a wheel that matches your machine or it
 refuses with "no matching distribution found".
 
 The whole picture, with the wheel filename per platform, the first five
 minutes step by step, and every error an install can produce, is in
-[docs/INSTALLATION.md](https://github.com/mojoboost-ml/mojoboost/blob/main/docs/INSTALLATION.md).
+[docs/INSTALLATION.md](https://github.com/mojotrees/mojotrees/blob/main/docs/INSTALLATION.md).
 
 ## The first five minutes
 
@@ -77,9 +77,9 @@ The diagnostics it prints first are what an installation bug report needs,
 and they are one call on their own.
 
 ```python
-import mojoboost
+import mojotrees
 
-mojoboost.show_versions()      # or build_info() for the same facts as a dict
+mojotrees.show_versions()      # or build_info() for the same facts as a dict
 ```
 
 That includes the one thing no other call can tell you: whether a GPU path
@@ -87,19 +87,19 @@ was compiled into this build. Availability is decided when the extension is
 compiled rather than on the machine that runs it, so one wheel carries one
 answer to everybody who installs it, and `gpu_available()` alone returns
 `False` both for a build without a GPU path and for a GPU build with
-`MOJOBOOST_DISABLE_GPU=1` set.
+`MOJOTREES_DISABLE_GPU=1` set.
 
 ## Usage
 
 ```python
-from mojoboost import MojoBoostRegressor, MojoBoostClassifier
+from mojotrees import MojoTreesRegressor, MojoTreesClassifier
 
-model = MojoBoostRegressor(num_leaves=31, n_estimators=100).fit(X, y)
+model = MojoTreesRegressor(num_leaves=31, n_estimators=100).fit(X, y)
 pred = model.predict(X)          # numpy in/out when numpy is available
 model.save("model.mbst")
-model = MojoBoostRegressor.load("model.mbst")
+model = MojoTreesRegressor.load("model.mbst")
 
-clf = MojoBoostClassifier().fit(X, labels)   # binary or multiclass by labels
+clf = MojoTreesClassifier().fit(X, labels)   # binary or multiclass by labels
 proba = clf.predict_proba(X)
 ```
 
@@ -127,7 +127,7 @@ row bagging.
 LightGBM's functional API is here too, over the same trainer:
 
 ```python
-import mojoboost as mb
+import mojotrees as mb
 
 train_set = mb.Dataset(X, label=y)            # binned once, reused
 booster = mb.train({"objective": "regression", "num_leaves": 31},
@@ -165,7 +165,7 @@ from sklearn.model_selection import GridSearchCV
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
-pipe = Pipeline([("scale", StandardScaler()), ("gbdt", MojoBoostRegressor())])
+pipe = Pipeline([("scale", StandardScaler()), ("gbdt", MojoTreesRegressor())])
 search = GridSearchCV(pipe, {"gbdt__num_leaves": [15, 31]}, cv=3).fit(X, y)
 ```
 
@@ -185,7 +185,7 @@ for no categorical feature, or LightGBM's default `"auto"`: every pandas
 `category` column of `X`, and nothing else.
 
 ```python
-model = MojoBoostRegressor(categorical_feature=["city"]).fit(df, y)
+model = MojoTreesRegressor(categorical_feature=["city"]).fit(df, y)
 model.categorical_feature_          # [0]
 ```
 
@@ -241,7 +241,7 @@ single-output estimators and `(n_samples, num_iteration * n_classes)` for
 the multiclass classifier, whose column `i * n_classes + k` is class k's
 tree in iteration i. Leaves are numbered per tree in node order, in
 `[0, num_leaves)`, stably across `save`/`load` and pickling; the numbering
-is mojoboost's own, not LightGBM's leaf id.
+is mojotrees's own, not LightGBM's leaf id.
 
 `raw_score=True` and `pred_leaf=True` together raise rather than letting one
 win silently.
@@ -257,7 +257,7 @@ set, where LightGBM sets it only when early stopping ran.
 Every estimator takes them, in LightGBM's spelling:
 
 ```python
-model = MojoBoostRegressor(n_estimators=500).fit(
+model = MojoTreesRegressor(n_estimators=500).fit(
     X, y,
     eval_set=[(X_valid, y_valid)],   # or (X_valid, y_valid), or eval_X/eval_y
     eval_names=["holdout"],          # valid_0, valid_1, ... by default
@@ -282,7 +282,7 @@ the regressor takes the regression metrics, the classifier the binary or
 multiclass ones, the ranker `ndcg` and `map`. Predictions reach a built-in
 metric through the objective's own inverse link, so `l2` on a poisson model
 scores expected counts and `binary_logloss` scores probabilities. A name is computed by
-`src/mojoboost/metrics.mojo`, so it agrees with the Mojo API by
+`src/mojotrees/metrics.mojo`, so it agrees with the Mojo API by
 construction, and `eval_sample_weight` weights it. A callable is
 `f(y_true, y_pred) -> float`, called once per metric per validation set per
 round with raw scores in `y_pred`; declare its direction with
@@ -310,7 +310,7 @@ The ensemble as structured data, in LightGBM's shapes, at the top level of
 the package:
 
 ```python
-import mojoboost as mb
+import mojotrees as mb
 
 schema = mb.dump_model(model)                  # the documented dump schema
 frame = mb.trees_to_dataframe(model)           # one pandas row per node
@@ -322,7 +322,7 @@ hist = mb.get_split_value_histogram(model, "age", bins=10)
 `Booster.model_to_string()` produces, so a model read back from a file can
 be inspected without refitting. `feature_names=` names the features of a
 model that carries none. Every key of the dump is documented in
-[docs/MODEL_INSPECTION_SCHEMA.md](https://github.com/mojoboost-ml/mojoboost/blob/main/docs/MODEL_INSPECTION_SCHEMA.md);
+[docs/MODEL_INSPECTION_SCHEMA.md](https://github.com/mojotrees/mojotrees/blob/main/docs/MODEL_INSPECTION_SCHEMA.md);
 the two to branch on are `has_split_gain` and `has_node_count`.
 
 One thing worth knowing before you build on it. A model this version wrote
@@ -335,7 +335,7 @@ wrote carries none, and every node reports `split_gain: None` with
 measured gain was zero. `trees_to_dataframe` and `trees_to_records` inherit
 whichever of the two the dump was built from. The state of the native dump
 seam is in
-[docs/INTEGRATION_INVENTORY.md](https://github.com/mojoboost-ml/mojoboost/blob/main/docs/INTEGRATION_INVENTORY.md).
+[docs/INTEGRATION_INVENTORY.md](https://github.com/mojotrees/mojotrees/blob/main/docs/INTEGRATION_INVENTORY.md).
 
 ## Cross-validation
 
@@ -358,9 +358,9 @@ binned from its own training rows rather than sliced out of one constructed
 ## Device selection
 
 ```python
-from mojoboost import MojoBoostRegressor, gpu_available
+from mojotrees import MojoTreesRegressor, gpu_available
 
-model = MojoBoostRegressor(device="auto").fit(X, y)
+model = MojoTreesRegressor(device="auto").fit(X, y)
 model.device_          # the backend that actually ran: "cpu" or "gpu"
 ```
 
@@ -406,10 +406,10 @@ sparse. Nothing is densified at any point.
 
 ```python
 from scipy import sparse
-from mojoboost import MojoBoostRegressor
+from mojotrees import MojoTreesRegressor
 
 X = sparse.random(100_000, 500, density=0.01, format="csr")
-model = MojoBoostRegressor().fit(X, y)      # converted to CSC to fit
+model = MojoTreesRegressor().fit(X, y)      # converted to CSC to fit
 pred = model.predict(X)                     # converted to CSR to predict
 ```
 
@@ -442,7 +442,7 @@ The declared interpreter is CPython 3.14, which is the only one anything has
 run on rather than a toolchain requirement; 3.13 is expected but unproven and
 3.12 and earlier are blocked by an entry point added in 3.13, all worked
 through in
-[docs/PYTHON_SUPPORT.md](https://github.com/mojoboost-ml/mojoboost/blob/main/docs/PYTHON_SUPPORT.md).
+[docs/PYTHON_SUPPORT.md](https://github.com/mojotrees/mojotrees/blob/main/docs/PYTHON_SUPPORT.md).
 The Linux platform tag is likewise unsettled: the default `linux_x86_64` and
 `linux_aarch64` tags are rejected by every index, and a `manylinux` tag needs
 a measured glibc floor first.
@@ -450,7 +450,7 @@ a measured glibc floor first.
 The CPython 3.14 Apple Silicon wheel has now been published and clean-install
 validated. Every target, its artifact name, and the evidence behind its
 status is in
-[docs/PLATFORM_MATRIX.md](https://github.com/mojoboost-ml/mojoboost/blob/main/docs/PLATFORM_MATRIX.md),
+[docs/PLATFORM_MATRIX.md](https://github.com/mojotrees/mojotrees/blob/main/docs/PLATFORM_MATRIX.md),
 where the rule is that a platform counts as validated when hardware ran the
 artifact and somebody wrote down what happened.
 
@@ -461,10 +461,10 @@ using the instructions above.
 
 | What you see | What it means |
 |---|---|
-| `No matching distribution found for mojoboost` | PyPI has no wheel matching your Python, operating system, and architecture. Use the supported target or build from source |
+| `No matching distribution found for mojotrees` | PyPI has no wheel matching your Python, operating system, and architecture. Use the supported target or build from source |
 | `Requires-Python >=3.14` in pip's output | Your interpreter is older than the declared floor |
 | `... is not a supported wheel on this platform` | The wheel's tags do not describe your machine. Do not force it |
-| `ImportError: cannot import name '_mojoboost' from 'mojoboost'` | Source checkout without a built extension. Run `pixi run build-python` |
+| `ImportError: cannot import name '_mojotrees' from 'mojotrees'` | Source checkout without a built extension. Run `pixi run build-python` |
 | `ImportError: ... Library not loaded: @rpath/libKGENCompilerRTShared.dylib` | The MAX runtime libraries were not found. Run through `pixi run`, or install a self-contained wheel |
 | `RuntimeError: device 'gpu' requested but no accelerator is available` | This build has no GPU path. Availability is fixed when the extension is compiled, not at runtime |
 | `RuntimeError: validation metrics are scored on the CPU` | An `eval_set` with `device="gpu"`. Use `device="cpu"` or `"auto"` |
@@ -472,25 +472,25 @@ using the instructions above.
 | `device="auto"` chose the CPU and said nothing | Expected. The crossover table is empty, so `auto` keeps the CPU everywhere |
 
 Each case, with the full message and what to do about it, is in
-[docs/INSTALLATION.md](https://github.com/mojoboost-ml/mojoboost/blob/main/docs/INSTALLATION.md#when-something-goes-wrong).
+[docs/INSTALLATION.md](https://github.com/mojotrees/mojotrees/blob/main/docs/INSTALLATION.md#when-something-goes-wrong).
 Installation problems are in scope for the
-[bug report template](https://github.com/mojoboost-ml/mojoboost/issues/new?template=bug_report.yml);
+[bug report template](https://github.com/mojotrees/mojotrees/issues/new?template=bug_report.yml);
 accelerator results belong in the
-[hardware validation template](https://github.com/mojoboost-ml/mojoboost/issues/new?template=hardware_validation.yml).
+[hardware validation template](https://github.com/mojotrees/mojotrees/issues/new?template=hardware_validation.yml).
 
 ## Links
 
 - Source, benchmarks against LightGBM, and the native Mojo API:
-  [github.com/mojoboost-ml/mojoboost](https://github.com/mojoboost-ml/mojoboost)
-- [Installation](https://github.com/mojoboost-ml/mojoboost/blob/main/docs/INSTALLATION.md)
-- [LightGBM parity contract](https://github.com/mojoboost-ml/mojoboost/blob/main/docs/LIGHTGBM_PARITY.md)
-- [Capability levels](https://github.com/mojoboost-ml/mojoboost/blob/main/docs/CAPABILITY_LEVELS.md),
+  [github.com/mojotrees/mojotrees](https://github.com/mojotrees/mojotrees)
+- [Installation](https://github.com/mojotrees/mojotrees/blob/main/docs/INSTALLATION.md)
+- [LightGBM parity contract](https://github.com/mojotrees/mojotrees/blob/main/docs/LIGHTGBM_PARITY.md)
+- [Capability levels](https://github.com/mojotrees/mojotrees/blob/main/docs/CAPABILITY_LEVELS.md),
   the seven words the parity contract scores against
-- [Integration inventory](https://github.com/mojoboost-ml/mojoboost/blob/main/docs/INTEGRATION_INVENTORY.md),
+- [Integration inventory](https://github.com/mojotrees/mojotrees/blob/main/docs/INTEGRATION_INVENTORY.md),
   what is written here and reachable by nobody
-- [GPU validation record](https://github.com/mojoboost-ml/mojoboost/blob/main/docs/GPU_VALIDATION.md)
-- [Device selection policy](https://github.com/mojoboost-ml/mojoboost/blob/main/docs/DEVICE_SELECTION.md)
-- [Contributing](https://github.com/mojoboost-ml/mojoboost/blob/main/CONTRIBUTING.md)
+- [GPU validation record](https://github.com/mojotrees/mojotrees/blob/main/docs/GPU_VALIDATION.md)
+- [Device selection policy](https://github.com/mojotrees/mojotrees/blob/main/docs/DEVICE_SELECTION.md)
+- [Contributing](https://github.com/mojotrees/mojotrees/blob/main/CONTRIBUTING.md)
 
 ## License
 

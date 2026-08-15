@@ -2,7 +2,7 @@
 
 Generates the same synthetic dataset as bench_train.mojo (counter-based
 splitmix64, bit-identical values) and trains LightGBM with parameters
-matching mojoboost's defaults, so wall time and train loss are directly
+matching mojotrees's defaults, so wall time and train loss are directly
 comparable.
 
 Usage: python bench/bench_lightgbm.py [--rows N] [--features N]
@@ -82,7 +82,7 @@ def main():
         "max_bin": 255,
         "num_threads": args.threads,
         "verbose": -1,
-        # mojoboost has no feature bundling; keep the comparison honest.
+        # mojotrees has no feature bundling; keep the comparison honest.
         "enable_bundle": False,
         "force_row_wise": True,
     }

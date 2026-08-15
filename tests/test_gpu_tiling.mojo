@@ -15,7 +15,7 @@ has to get it.
 from std.os import setenv
 from std.testing import assert_equal, assert_true, TestSuite
 
-from mojoboost.gpu_tiling import (
+from mojotrees.gpu_tiling import (
     MAX_GRID_DIM_Y,
     STRATEGY_ATOMIC,
     STRATEGY_AUTO,
@@ -165,13 +165,13 @@ def test_env_overrides() raises:
     # environment regardless of suite ordering; empty string means unset.
     var caps = _small_gpu()
 
-    _ = setenv("MOJOBOOST_GPU_HIST_STRATEGY", "atomic")
+    _ = setenv("MOJOTREES_GPU_HIST_STRATEGY", "atomic")
     assert_equal(env_strategy(), STRATEGY_ATOMIC)
     assert_equal(
         derive_tiling(caps, 100_000, 10, 255).strategy, STRATEGY_ATOMIC
     )
 
-    _ = setenv("MOJOBOOST_GPU_HIST_STRATEGY", "tiled")
+    _ = setenv("MOJOTREES_GPU_HIST_STRATEGY", "tiled")
     assert_equal(env_strategy(), STRATEGY_TILED)
     assert_equal(
         derive_tiling(caps, 100_000, 10, 255).strategy, STRATEGY_TILED
@@ -183,26 +183,26 @@ def test_env_overrides() raises:
         STRATEGY_ATOMIC,
     )
 
-    _ = setenv("MOJOBOOST_GPU_HIST_STRATEGY", "nonsense")
+    _ = setenv("MOJOTREES_GPU_HIST_STRATEGY", "nonsense")
     assert_equal(env_strategy(), STRATEGY_AUTO)
-    _ = setenv("MOJOBOOST_GPU_HIST_STRATEGY", "")
+    _ = setenv("MOJOTREES_GPU_HIST_STRATEGY", "")
 
     # A forced row tile still has to cover the rows and stay in budget.
-    _ = setenv("MOJOBOOST_GPU_ROW_TILE", "1000")
+    _ = setenv("MOJOTREES_GPU_ROW_TILE", "1000")
     var forced = derive_tiling(caps, 100_000, 4, 255)
     assert_equal(forced.rows_per_tile, 1000)
     assert_equal(forced.n_tiles, 100)
     _assert_covers_rows(100_000, forced.n_tiles, forced.rows_per_tile)
-    _ = setenv("MOJOBOOST_GPU_ROW_TILE", "")
+    _ = setenv("MOJOTREES_GPU_ROW_TILE", "")
 
-    _ = setenv("MOJOBOOST_GPU_BLOCK_THREADS", "128")
+    _ = setenv("MOJOTREES_GPU_BLOCK_THREADS", "128")
     assert_equal(derive_block_threads(caps), 128)
     # Still clamped to the device maximum and rounded to a warp.
-    _ = setenv("MOJOBOOST_GPU_BLOCK_THREADS", "100000")
+    _ = setenv("MOJOTREES_GPU_BLOCK_THREADS", "100000")
     assert_equal(derive_block_threads(caps), 1024)
-    _ = setenv("MOJOBOOST_GPU_BLOCK_THREADS", "3")
+    _ = setenv("MOJOTREES_GPU_BLOCK_THREADS", "3")
     assert_equal(derive_block_threads(caps), WARP_GRANULARITY)
-    _ = setenv("MOJOBOOST_GPU_BLOCK_THREADS", "")
+    _ = setenv("MOJOTREES_GPU_BLOCK_THREADS", "")
 
 
 def main() raises:

@@ -19,17 +19,17 @@ from std.math import exp, log
 from std.sys import argv
 from std.time import perf_counter_ns
 
-from mojoboost.bagging import BaggingParams
-from mojoboost.binning import fit_bins
-from mojoboost.boosting import (
+from mojotrees.bagging import BaggingParams
+from mojotrees.binning import fit_bins
+from mojotrees.boosting import (
     BINARY_LOGISTIC,
     SQUARED_ERROR,
     Booster,
     BoosterParams,
     train,
 )
-from mojoboost.binning import BinnedMatrix
-from mojoboost.goss import GossParams
+from mojotrees.binning import BinnedMatrix
+from mojotrees.goss import GossParams
 
 
 def _splitmix64(state: UInt64) -> UInt64:
@@ -123,7 +123,7 @@ def main() raises:
             target.append(signal + 0.1 * (u - 0.5))
 
     print(
-        "mojoboost goss bench:",
+        "mojotrees goss bench:",
         n_rows,
         "rows x",
         n_features,

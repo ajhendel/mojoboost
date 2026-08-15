@@ -4,7 +4,7 @@ and cross-entropy objectives."""
 from std.math import exp, log
 from std.testing import assert_true, TestSuite
 
-from mojoboost import (
+from mojotrees import (
     BINARY_LOGISTIC,
     CROSS_ENTROPY,
     FAIR,
@@ -21,7 +21,7 @@ from mojoboost import (
     bin_equal_width,
     train,
 )
-from mojoboost.boosting import fill_grad_hess
+from mojotrees.boosting import fill_grad_hess
 
 
 def _params(n_rounds: Int) -> BoosterParams:

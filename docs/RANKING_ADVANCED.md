@@ -1,11 +1,11 @@
 # Advanced ranking: unbiased LambdaRank and the query-level contracts
 
-`src/mojoboost/ranking.mojo` is mojoboost's LambdaRank. It is the
+`src/mojotrees/ranking.mojo` is mojotrees's LambdaRank. It is the
 authoritative implementation, it is tested, it is benchmarked against
 LightGBM by `bench/compare_ranking.py`, and nothing in this document
 replaces any part of it.
 
-`src/mojoboost/ranking_advanced.mojo` is the layer above it, and it holds
+`src/mojotrees/ranking_advanced.mojo` is the layer above it, and it holds
 the ranking features that could not be expressed as a call into the existing
 one. This document says what those are, what each one means precisely, what
 is connected today, and - the part that matters most - what is **not
@@ -19,11 +19,11 @@ only. Concretely, as of this document:
 
 | Claim | Status |
 | --- | --- |
-| mojoboost implements unbiased LambdaRank | **No.** Not claimed, not supported, and `docs/LIGHTGBM_PARITY.md` keeps `lambdarank_position_bias_regularization` and `Dataset.position` at `deferred` |
+| mojotrees implements unbiased LambdaRank | **No.** Not claimed, not supported, and `docs/LIGHTGBM_PARITY.md` keeps `lambdarank_position_bias_regularization` and `Dataset.position` at `deferred` |
 | The position-bias update matches LightGBM's `UpdatePositionBiasFactors` | Transcribed from it, term for term, and argued in section 2. **Unverified** |
 | The generalized pair loop reduces to `ranking._fill_query_lambdas` | Argued in section 3. **Unverified**, and the check that would verify it is listed UNRUN in `handoffs/remaining_05_ranking.md` |
 | `ndcg_eval` agrees with `ranking.ndcg_at_cutoffs` | Argued in section 5. **Unverified** |
-| The module is reachable from Python, the C API, or the CLI | No. It is not exported from `src/mojoboost/__init__.mojo` and no binding names it |
+| The module is reachable from Python, the C API, or the CLI | No. It is not exported from `src/mojotrees/__init__.mojo` and no binding names it |
 
 The module is deliberately unexported. `tools/check_parity.py` resolves
 *public symbols* to decide whether a `deferred` row has gone stale, and a
@@ -37,19 +37,19 @@ The task allowed for `ranking_advanced.mojo` to be created **only if no
 equivalent module already existed**. The repository was inspected before
 anything was written:
 
-- `src/mojoboost/ranking.mojo` - LambdaRank, NDCG, MAP, the ranker trainers.
+- `src/mojotrees/ranking.mojo` - LambdaRank, NDCG, MAP, the ranker trainers.
   Its own docstring lists "positional/unbiased-lambdarank extensions" under
   *INTENTIONAL DIFFERENCES FROM LightGBM*, i.e. as something it does not do.
-- `src/mojoboost/custom_metric.mojo` - `train_ranker_with_metrics`, a
+- `src/mojotrees/custom_metric.mojo` - `train_ranker_with_metrics`, a
   metric-callback trainer that imports `ranking`'s internals and adds no
   ranking mathematics of its own.
-- `src/mojoboost/metrics.mojo` - `METRIC_NDCG` and `METRIC_MAP` are numbered
+- `src/mojotrees/metrics.mojo` - `METRIC_NDCG` and `METRIC_MAP` are numbered
   here, but `eval_metric_by_code` explicitly refuses both and points at
   `ranking.mojo`.
-- `src/mojoboost/objective_registry.mojo` - `TASK_RANKING`, `NEEDS_GROUPS`,
+- `src/mojotrees/objective_registry.mojo` - `TASK_RANKING`, `NEEDS_GROUPS`,
   `NEEDS_CUTOFF`, `GRAD_LAMBDARANK`, `INIT_ZERO`: metadata about ranking,
   no ranking implementation.
-- `python/mojoboost/cv.py` - group-safe folds, in Python, for the Python
+- `python/mojotrees/cv.py` - group-safe folds, in Python, for the Python
   `cv()` entry point only.
 
 No module implements position bias, a custom gain vector, multiple
@@ -96,7 +96,7 @@ by zero, and leaves its bias where it was.
 
 Step 2 is the load-bearing design decision: **position bias is a score
 offset, so it needs no new pair loop.** `PositionBiasState.adjust_scores`
-produces the offset vector and `ranking._fill_lambdas` - mojoboost's one
+produces the offset vector and `ranking._fill_lambdas` - mojotrees's one
 LambdaRank kernel - consumes it. This is also how LightGBM factors it
 (`RankingObjective::GetGradients` builds `score_adjusted` and calls the
 unmodified `GetGradientsForOneQuery`).
@@ -185,7 +185,7 @@ long queries spends its round enumerating pairs. `pair_sampling_rate` in
 `(0, 1]` keeps each admissible pair with that probability and rescales the
 kept ones by `1 / rate`, so the expected lambda is unchanged.
 
-The draw is counter based, like every other draw in mojoboost:
+The draw is counter based, like every other draw in mojotrees:
 
 ```
 stream = splitmix64(splitmix64(splitmix64(seed ^ PAIR_DOMAIN) ^ iteration) ^ query)
@@ -306,7 +306,7 @@ held-out half is normalized against a maxDCG computed from documents the
 model was trained on.
 
 Fold `f` holds queries `[f * Q // K, (f + 1) * Q // K)` of the query order -
-the same contiguous chunking `python/mojoboost/cv.py::_chunk_folds` does, so
+the same contiguous chunking `python/mojotrees/cv.py::_chunk_folds` does, so
 the Mojo and Python paths agree fold for fold when given the same order.
 `shuffle=True` permutes the **query** indices, never the rows, with a
 counter-based Fisher-Yates. Each `QueryFold` carries both sides' rows *and*
@@ -373,7 +373,7 @@ order, and a minimal later validation marked UNRUN:
 4. `distributed.mojo` - `partition_rows_at`
 5. `params.mojo` - the parameter names, still Mojo-API-only
 6. `objective_registry.mojo` - `eval_at` as a `NEEDS_CUTOFF` list
-7. `bindings/_mojoboost.mojo` - `position_addr` / `n_positions` / `eval_at`
-8. `python/mojoboost/__init__.py` - `MojoBoostRanker(position=...)`
-9. `python/mojoboost/cv.py` - point the ranking folds at `query_folds`
+7. `bindings/_mojotrees.mojo` - `position_addr` / `n_positions` / `eval_at`
+8. `python/mojotrees/__init__.py` - `MojoTreesRanker(position=...)`
+9. `python/mojotrees/cv.py` - point the ranking folds at `query_folds`
 10. `docs/LIGHTGBM_PARITY.md` - and **only after** the evidence exists

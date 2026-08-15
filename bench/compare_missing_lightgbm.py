@@ -1,4 +1,4 @@
-"""Missing-value semantics: mojoboost against LightGBM.
+"""Missing-value semantics: mojotrees against LightGBM.
 
 Probes the four decisions that define missing-value handling and prints what
 each library does, side by side, so a difference shows up as a difference in
@@ -12,8 +12,8 @@ the table rather than in prose:
 4. +inf and -inf: missing, or finite-side extremes?
 
 The LightGBM side reads the answers out of `dump_model`, whose `default_left`
-and `missing_type` fields name the same concepts mojoboost stores per node.
-The mojoboost side runs `bench/missing_reference.mojo`, which trains on the
+and `missing_type` fields name the same concepts mojotrees stores per node.
+The mojotrees side runs `bench/missing_reference.mojo`, which trains on the
 identical data (generated from the same closed form on both sides, so no file
 is exchanged) and prints its own answers in the same format.
 
@@ -130,7 +130,7 @@ def lightgbm_report():
     return out
 
 
-def mojoboost_report():
+def mojotrees_report():
     proc = subprocess.run(
         ["pixi", "run", "mojo", "run", "-I", "src", "bench/missing_reference.mojo"],
         cwd=REPO,
@@ -139,12 +139,12 @@ def mojoboost_report():
     )
     if proc.returncode != 0:
         sys.stderr.write(proc.stdout + proc.stderr)
-        raise SystemExit("mojoboost reference driver failed")
+        raise SystemExit("mojotrees reference driver failed")
     for line in proc.stdout.splitlines():
         if line.startswith("{"):
             return json.loads(line)
     sys.stderr.write(proc.stdout)
-    raise SystemExit("no JSON line in the mojoboost reference output")
+    raise SystemExit("no JSON line in the mojotrees reference output")
 
 
 def row(label, a, b, agrees, must_match=True):
@@ -162,10 +162,10 @@ def row(label, a, b, agrees, must_match=True):
 
 def main():
     lgbm = lightgbm_report()
-    mojo = mojoboost_report()
+    mojo = mojotrees_report()
 
-    print(f"LightGBM {lgb.__version__} vs mojoboost, one tree, identical data")
-    print(f"  {'':<34} {'LightGBM':<18} {'mojoboost':<18}")
+    print(f"LightGBM {lgb.__version__} vs mojotrees, one tree, identical data")
+    print(f"  {'':<34} {'LightGBM':<18} {'mojotrees':<18}")
 
     print("\n1. missingness alone predicts the target")
     a, b = lgbm["predictive"], mojo["predictive"]
@@ -218,7 +218,7 @@ def main():
 
     print(
         "\nNote. The two leaf-value rows are reported for context, not as a"
-        "\ncontract. mojoboost's lambda_l2 defaults to 1.0 where LightGBM's"
+        "\ncontract. mojotrees's lambda_l2 defaults to 1.0 where LightGBM's"
         "\ndefaults to 0.0, and the Newton step -G/(H+lambda_l2) shrinks by"
         "\nexactly that much: with 100 missing rows the step is 666.7/101"
         "\nrather than 666.7/100. Pass lambda_l2=0 on both sides to close it."

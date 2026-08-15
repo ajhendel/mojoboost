@@ -2,7 +2,7 @@
 
     pixi run -e pytest python bench/bench_callbacks.py
 
-The claim this measures is the one in python/mojoboost/callback.py: a
+The claim this measures is the one in python/mojotrees/callback.py: a
 callback costs one crossing of the Python boundary per phase per round, and
 nothing per row. Two things are reported, because a timing alone would not
 establish it:
@@ -15,7 +15,7 @@ establish it:
 
 The baseline is a fit with `callbacks=None`, which does not cross the
 boundary at all: the Mojo bridge checks a captured flag and returns without
-touching Python (see `py_callback` in bindings/_mojoboost.mojo). The gap
+touching Python (see `py_callback` in bindings/_mojotrees.mojo). The gap
 between that and an inert callback is the cost of the boundary itself; the
 gap to `log_evaluation(period=0)` and `record_evaluation` is what a real
 callback adds on top.
@@ -46,8 +46,8 @@ sys.path.insert(
     0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python")
 )
 
-from mojoboost import MojoBoostRegressor  # noqa: E402
-from mojoboost.callback import (  # noqa: E402
+from mojotrees import MojoTreesRegressor  # noqa: E402
+from mojotrees.callback import (  # noqa: E402
     log_evaluation,
     record_evaluation,
 )
@@ -76,7 +76,7 @@ def mse(y_true, y_pred):
 
 
 def run(X, y, Xv, yv, callbacks):
-    model = MojoBoostRegressor(n_estimators=ROUNDS)
+    model = MojoTreesRegressor(n_estimators=ROUNDS)
     start = time.perf_counter()
     model.fit(
         X,

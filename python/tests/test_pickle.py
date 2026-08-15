@@ -8,7 +8,7 @@ import tempfile
 import numpy as np
 import pytest
 
-from mojoboost import MojoBoostClassifier, MojoBoostRegressor, NotFittedError
+from mojotrees import MojoTreesClassifier, MojoTreesRegressor, NotFittedError
 
 
 def _round_trip(est):
@@ -16,7 +16,7 @@ def _round_trip(est):
 
 
 def test_unfitted_estimator_pickles():
-    est = MojoBoostRegressor(num_leaves=7)
+    est = MojoTreesRegressor(num_leaves=7)
     twin = _round_trip(est)
     assert twin.get_params() == est.get_params()
     with pytest.raises(NotFittedError):
@@ -51,7 +51,7 @@ def test_pickling_keeps_the_fitted_state(fitted_multiclass):
 def test_pickling_keeps_string_class_labels(binary):
     X, y = binary
     labels = np.where(y == 1, "yes", "no")
-    est = MojoBoostClassifier(n_estimators=10).fit(X, labels)
+    est = MojoTreesClassifier(n_estimators=10).fit(X, labels)
     twin = _round_trip(est)
     assert list(twin.classes_) == ["no", "yes"]
     assert np.array_equal(twin.predict(X), est.predict(X))
@@ -62,7 +62,7 @@ def test_pickling_keeps_both_importances(regression, importance_type):
     """Split gains are not in the serialized model, so this is the thing
     pickle preserves that save()/load() cannot."""
     X, y = regression
-    est = MojoBoostRegressor(
+    est = MojoTreesRegressor(
         n_estimators=10, importance_type=importance_type
     ).fit(X, y)
     twin = _round_trip(est)
@@ -91,7 +91,7 @@ def test_save_load_restores_predictions(fitted_regressor, regression):
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "model.mbst")
         fitted_regressor.save(path)
-        loaded = MojoBoostRegressor.load(path)
+        loaded = MojoTreesRegressor.load(path)
     assert np.array_equal(loaded.predict(X), fitted_regressor.predict(X))
     assert loaded.n_features_in_ == fitted_regressor.n_features_in_
     assert loaded.best_iteration_ == fitted_regressor.best_iteration_
@@ -102,7 +102,7 @@ def test_loaded_multiclass_model_knows_its_shape(fitted_multiclass, multiclass):
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "model.mbst")
         fitted_multiclass.save(path)
-        loaded = MojoBoostClassifier.load(path)
+        loaded = MojoTreesClassifier.load(path)
     assert loaded.n_classes_ == 3
     assert loaded.n_features_in_ == 4
     assert loaded.best_iteration_ == fitted_multiclass.best_iteration_
@@ -113,11 +113,11 @@ def test_loaded_model_reports_codes_not_original_labels(binary):
     """The label mapping is not part of the model file. This is the gap
     pickle exists to cover, and it is documented on load()."""
     X, y = binary
-    est = MojoBoostClassifier(n_estimators=10).fit(X, np.where(y == 1, "b", "a"))
+    est = MojoTreesClassifier(n_estimators=10).fit(X, np.where(y == 1, "b", "a"))
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "model.mbst")
         est.save(path)
-        loaded = MojoBoostClassifier.load(path)
+        loaded = MojoTreesClassifier.load(path)
     assert list(loaded.classes_) == [0, 1]
     assert np.array_equal(
         np.asarray(loaded.predict(X)),
@@ -129,7 +129,7 @@ def test_loaded_model_preserves_gain_importance(fitted_regressor):
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "model.mbst")
         fitted_regressor.save(path)
-        loaded = MojoBoostRegressor.load(path)
+        loaded = MojoTreesRegressor.load(path)
     # Model format v4 serializes both split counts and split gains.
     assert np.allclose(
         loaded.feature_importances_, fitted_regressor.feature_importances_

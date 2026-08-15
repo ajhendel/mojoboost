@@ -1,8 +1,8 @@
 """Device selection: parsing, resolution policy, and trainer equivalence.
 
-Resolution is exercised on any machine: `MOJOBOOST_DISABLE_GPU` simulates a
+Resolution is exercised on any machine: `MOJOTREES_DISABLE_GPU` simulates a
 CPU-only build so the unavailable-GPU path is covered on accelerators too,
-and `MOJOBOOST_AUTO_MIN_CELLS` enables the otherwise-disabled `auto` size
+and `MOJOTREES_AUTO_MIN_CELLS` enables the otherwise-disabled `auto` size
 heuristic so both sides of it are covered. Tests that actually train on the
 GPU skip (passing) when no accelerator is present.
 """
@@ -17,8 +17,8 @@ from std.testing import (
     TestSuite,
 )
 
-from mojoboost.boosting import BoosterParams, SQUARED_ERROR
-from mojoboost.device import (
+from mojotrees.boosting import BoosterParams, SQUARED_ERROR
+from mojotrees.device import (
     AUTO_DEVICE,
     CPU_DEVICE,
     GPU_DEVICE,
@@ -28,12 +28,12 @@ from mojoboost.device import (
     parse_device,
     resolve_device,
 )
-from mojoboost.model import fit, fit_multiclass
-from mojoboost.serialize import load_model, save_model
-from mojoboost.tree import TreeParams
+from mojotrees.model import fit, fit_multiclass
+from mojotrees.serialize import load_model, save_model
+from mojotrees.tree import TreeParams
 
-comptime _DISABLE_GPU = "MOJOBOOST_DISABLE_GPU"
-comptime _AUTO_MIN_CELLS = "MOJOBOOST_AUTO_MIN_CELLS"
+comptime _DISABLE_GPU = "MOJOTREES_DISABLE_GPU"
+comptime _AUTO_MIN_CELLS = "MOJOTREES_AUTO_MIN_CELLS"
 comptime _TMP_PATH = "./.test_device_roundtrip.tmp"
 
 

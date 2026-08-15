@@ -3,7 +3,7 @@
 ## Our pledge
 
 We as members, contributors, and maintainers pledge to make participation in
-mojoboost a harassment-free experience for everyone, regardless of age, body
+mojotrees a harassment-free experience for everyone, regardless of age, body
 size, visible or invisible disability, ethnicity, sex characteristics, gender
 identity and expression, level of experience, education, socioeconomic status,
 nationality, personal appearance, race, caste, color, religion, or sexual
@@ -34,7 +34,7 @@ Most conduct problems on a project like this one do not look like abuse. They
 look like impatience wearing technical clothing, so it is worth naming what is
 expected.
 
-- **Nobody is required to know things.** mojoboost sits at the intersection of
+- **Nobody is required to know things.** mojotrees sits at the intersection of
   gradient boosting, Mojo, GPU programming, and Python packaging, and almost
   everyone arrives strong in one of those and new to the rest. Treating a gap
   as a deficiency, rather than as the ordinary state of a contributor, is the
@@ -57,9 +57,9 @@ expected.
 
 This Code of Conduct applies in all project spaces, which currently means
 issues, pull requests, Discussions, commit messages, and code comments in the
-repository, and any organization space under `mojoboost-ml`. It also applies
+repository, and any organization space under `mojotrees`. It also applies
 when an individual is officially representing the project in public, such as
-posting from an official account or speaking about mojoboost at an event.
+posting from an official account or speaking about mojotrees at an event.
 
 Conduct outside project spaces is not policed here, with one exception. Where
 behavior elsewhere makes someone unsafe participating in this project, it may
@@ -69,7 +69,7 @@ be considered.
 
 Report abusive, harassing, or otherwise unacceptable behavior to the
 maintainers at **ajhendel@gmail.com**, the same address published in
-[SECURITY.md](SECURITY.md). Put "mojoboost conduct" in the subject line. This
+[SECURITY.md](SECURITY.md). Put "mojotrees conduct" in the subject line. This
 is an ordinary mailbox and not an encrypted channel, so send what establishes
 the problem and hold anything sensitive until you know who is reading.
 
@@ -133,4 +133,4 @@ The enforcement guidelines are adapted from
 [Mozilla's code of conduct enforcement ladder](https://github.com/mozilla/inclusion).
 The section on what this means for a technical project, and the parts of the
 enforcement section describing this project's specific limitations, are
-mojoboost's own additions and are not part of the Contributor Covenant.
+mojotrees's own additions and are not part of the Contributor Covenant.

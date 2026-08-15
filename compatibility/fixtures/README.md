@@ -38,7 +38,7 @@ Everything else in this document follows from that rule.
 `tests/test_missing.mojo:test_v1_file_still_loads_and_routes_nothing`
 writes a hand-authored v1 file to `.test_missing_v1.tmp`, loads it, checks
 that it routes no missing values, and throws it away. That is the whole of
-mojoboost's backward-compatibility evidence today: one version, one shape,
+mojotrees's backward-compatibility evidence today: one version, one shape,
 one assertion, inline in a test, and gitignored so it never lands in a
 commit.
 
@@ -68,7 +68,7 @@ specified, which is the strongest claim available before there is a
 release, and it is exactly the claim `test_missing.mojo` already makes.
 
 A `synthetic` fixture's `authored_from` names the section of
-`src/mojoboost/serialize.mojo` or of
+`src/mojotrees/serialize.mojo` or of
 [../MODEL_FORMAT_MIGRATIONS.md](../MODEL_FORMAT_MIGRATIONS.md) the bytes
 were written against, so that a later reader can tell whether the fixture
 encodes the format or encodes a misreading of it.

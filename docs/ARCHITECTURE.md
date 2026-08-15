@@ -4,7 +4,7 @@ Written: 2026-08-14
 
 What this repository is shaped like, where each decision is made, and which
 paths a user can actually reach. It is a map of the *call graph*, not of the
-directory listing: a file existing in `src/mojoboost/` says nothing about
+directory listing: a file existing in `src/mojotrees/` says nothing about
 whether anything runs it, and this document is careful never to imply that
 it does.
 
@@ -21,10 +21,10 @@ Three companion files carry the parts that move:
 **Mojo decides; Python asks and formats.**
 
 Training, prediction, objectives, metrics, the data representation, trees,
-serialization, and device policy are decided in `src/mojoboost/`. The
+serialization, and device policy are decided in `src/mojotrees/`. The
 Python package validates its inputs, marshals buffers, calls the extension
 module, and renders what comes back. A rule that exists in
-`python/mojoboost/` and not in `src/mojoboost/` is a rule the Mojo API, the
+`python/mojotrees/` and not in `src/mojotrees/` is a rule the Mojo API, the
 C ABI, and the command line tool do not have, which means the same
 parameters produce different behavior depending on which door the caller
 came through.
@@ -36,15 +36,15 @@ work, and each one is listed in `docs/INTEGRATION_INVENTORY.md` under
 ## Entry points
 
 Five roots. Everything reachable is reachable from one of these, and
-everything else in `src/mojoboost/` is written but not connected.
+everything else in `src/mojotrees/` is written but not connected.
 
 | Root | Surface | Public per `docs/COMPATIBILITY_POLICY.md` |
 |---|---|---|
-| `python/mojoboost/__init__.py` | the Python package | the names in `__all__` |
-| `bindings/_mojoboost.mojo` | the CPython extension module | not itself public; its `def_function` table is the entire Python-to-native surface |
-| `src/mojoboost/__init__.mojo` | the native Mojo package | the names it re-exports |
-| `capi/mojoboost_capi.mojo` | the C ABI | the declarations in `capi/mojoboost.h` |
-| `cli/mojoboost_cli.mojo` | the command line tool | its arguments and exit statuses |
+| `python/mojotrees/__init__.py` | the Python package | the names in `__all__` |
+| `bindings/_mojotrees.mojo` | the CPython extension module | not itself public; its `def_function` table is the entire Python-to-native surface |
+| `src/mojotrees/__init__.mojo` | the native Mojo package | the names it re-exports |
+| `capi/mojotrees_capi.mojo` | the C ABI | the declarations in `capi/mojotrees.h` |
+| `cli/mojotrees_cli.mojo` | the command line tool | its arguments and exit statuses |
 
 The three native roots are peers. `capi/` and `cli/` do not go through the
 Python package, so a capability that only Python knows about is a
@@ -52,7 +52,7 @@ capability the C ABI and the CLI silently lack.
 
 ## The layers
 
-Bottom to top, within `src/mojoboost/`. A layer may call downward and
+Bottom to top, within `src/mojotrees/`. A layer may call downward and
 sideways within itself, never upward.
 
 **Data.** `binning` (quantile bin edges and the `uint8` binned matrix),
@@ -103,7 +103,7 @@ capability can be implemented on one side and unreachable from the other.
 
 ### 1. Python to native
 
-`bindings/_mojoboost.mojo` builds one `PythonModuleBuilder` and registers
+`bindings/_mojotrees.mojo` builds one `PythonModuleBuilder` and registers
 one flat table of functions plus three types (`Model`, `MulticlassModel`,
 `Dataset`). Buffers cross as an integer address plus a length, never as a
 Python object the native side has to understand. Errors cross as raised
@@ -112,10 +112,10 @@ Mojo errors and are re-raised as `ValueError` or `RuntimeError`.
 **The table is the surface.** A native function that is not in the
 `def_function` table cannot be called from Python, no matter how public it
 is in Mojo. The Python package handles that gracefully in several places:
-it probes for a hook with `getattr(_mojoboost, name, None)` and falls back
+it probes for a hook with `getattr(_mojotrees, name, None)` and falls back
 to a slower path when the hook is absent. A probe is not the same thing as
 a disconnection, and the difference is which extension you built. Most of
-these hooks are registered as of this revision: `_mojoboost.mojo` imports
+these hooks are registered as of this revision: `_mojotrees.mojo` imports
 the inspection, objective-registry, dataset, and distributed binding
 modules, so a package built from this tree takes the native route and the
 probe is what keeps it working against an extension built before the
@@ -125,14 +125,14 @@ is a missing implementation rather than an unregistered one.
 
 ### 2. Native to C
 
-`capi/mojoboost_capi.mojo` exports C-ABI functions declared in
-`capi/mojoboost.h`, over opaque handles, an error object, and a documented
-ownership table (`capi/README.md`). It is mojoboost's own interface and is
+`capi/mojotrees_capi.mojo` exports C-ABI functions declared in
+`capi/mojotrees.h`, over opaque handles, an error object, and a documented
+ownership table (`capi/README.md`). It is mojotrees's own interface and is
 deliberately not source compatible with LightGBM's `c_api.h`.
 
 ### 3. Native to the command line
 
-`cli/mojoboost_cli.mojo` reads CSV and the same LightGBM-style parameter
+`cli/mojotrees_cli.mojo` reads CSV and the same LightGBM-style parameter
 string the C ABI takes, through `params.mojo`. It reads no configuration
 file.
 
@@ -152,13 +152,13 @@ today, the table names it and says which is meant to win.
 
 | Question | Authoritative | Second implementation, if any |
 |---|---|---|
-| Which backend runs this training job | `src/mojoboost/device_policy.mojo` | `python/mojoboost/device_selection.py` is a formatter over the native decision, and degrades to a narrower report when the full binding is absent |
-| What launch geometry a kernel gets | `src/mojoboost/gpu_tiling.mojo` | `src/mojoboost/apple_gpu_policy.mojo` derives Apple-shaped geometry, consulted only by the opt-in histogram specializations |
-| What an objective or metric is called, and what it accepts | `src/mojoboost/objective_registry.mojo` | `python/mojoboost/_eval.py` carries mirror tables it uses whenever the registry is not bound |
-| How class weights become row weights | `src/mojoboost/class_weight.mojo` | `python/mojoboost/__init__.py` computes them in Python for the estimators |
-| What a model dump contains | `src/mojoboost/inspection.mojo` and `model_dump.mojo` | `python/mojoboost/inspection.py` parses `Booster.model_to_string()` |
-| What the model file contains | `src/mojoboost/serialize.mojo` | none |
-| What a parameter string means | `src/mojoboost/params.mojo` | none |
+| Which backend runs this training job | `src/mojotrees/device_policy.mojo` | `python/mojotrees/device_selection.py` is a formatter over the native decision, and degrades to a narrower report when the full binding is absent |
+| What launch geometry a kernel gets | `src/mojotrees/gpu_tiling.mojo` | `src/mojotrees/apple_gpu_policy.mojo` derives Apple-shaped geometry, consulted only by the opt-in histogram specializations |
+| What an objective or metric is called, and what it accepts | `src/mojotrees/objective_registry.mojo` | `python/mojotrees/_eval.py` carries mirror tables it uses whenever the registry is not bound |
+| How class weights become row weights | `src/mojotrees/class_weight.mojo` | `python/mojotrees/__init__.py` computes them in Python for the estimators |
+| What a model dump contains | `src/mojotrees/inspection.mojo` and `model_dump.mojo` | `python/mojotrees/inspection.py` parses `Booster.model_to_string()` |
+| What the model file contains | `src/mojotrees/serialize.mojo` | none |
+| What a parameter string means | `src/mojotrees/params.mojo` | none |
 
 Every "second implementation" in that table is a disconnection, not a
 design, and they are in two different states. For the dump, the registry,
@@ -166,7 +166,7 @@ and the device report the binding has landed, so the second implementation
 is now a compatibility path rather than the path, and the risk has moved
 with it: keeping a fallback after its binding lands is how two answers to
 one question start, and the deletion is what is owed next. Two things keep
-them alive for now. `python/mojoboost/inspection.py` still parses for split
+them alive for now. `python/mojotrees/inspection.py` still parses for split
 gains, because no `split_gains` hook exists to ask, and
 `_Base._resolve_device` still calls `resolve_device` directly rather than
 the fuller `decide_device` the same extension now registers, so a report
@@ -194,6 +194,6 @@ package:
   graph. Two parity checkers would be exactly the duplication all three
   exist to find.
 
-A module appearing under `src/mojoboost/` is never evidence of anything.
+A module appearing under `src/mojotrees/` is never evidence of anything.
 The evidence is a chain of imports from a root, plus a call site, plus a
 test, and the three are independent.

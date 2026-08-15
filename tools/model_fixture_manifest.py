@@ -29,13 +29,13 @@ overwrite a checksum that already exists unless `--accept-new` says so.
 
 Constraints, the same three as `tools/api_snapshot.py` and
 `tools/check_parity.py`. Standard library only, builds nothing and imports
-no part of mojoboost, deterministic output.
+no part of mojotrees, deterministic output.
 
 Shared implementation
 ---------------------
 The model format version constants are parsed by
 `api_snapshot.model_format_block`, imported from the sibling module rather
-than reimplemented. Two parsers of `src/mojoboost/serialize.mojo` would
+than reimplemented. Two parsers of `src/mojotrees/serialize.mojo` would
 drift, and the whole point of check F1 below is that the versions in this
 repository already disagree with each other in three places.
 """

@@ -1,17 +1,17 @@
 # External memory and the streaming dataset core
 
-`src/mojoboost/trainset.mojo` builds a `Dataset` by holding the whole matrix.
+`src/mojotrees/trainset.mojo` builds a `Dataset` by holding the whole matrix.
 That is the right implementation when the data fits, and nothing in this
 document replaces it.
 
 This document describes the two modules that exist for the case where it does
 not fit:
 
-- `src/mojoboost/sequence.mojo` - the chunk protocol. A `Sequence` hands out
+- `src/mojotrees/sequence.mojo` - the chunk protocol. A `Sequence` hands out
   `RawChunk`s in ascending row order. Nothing in it holds the whole matrix,
   and the one function that materializes takes a byte budget and raises
   rather than exceeding it.
-- `src/mojoboost/external_memory.mojo` - the multi-pass binner, the chunk
+- `src/mojotrees/external_memory.mojo` - the multi-pass binner, the chunk
   cache, and the trainers over it. It turns a `Sequence` into an
   `ExternalDataset`: a fitted `BinMapper` plus a directory of binned chunk
   files plus a manifest that says what they are and what their bytes hash to.
@@ -25,7 +25,7 @@ validation these modules owe is listed, all marked UNRUN, in
 
 | Claim | Status |
 | --- | --- |
-| mojoboost supports external-memory training | **Not claimed as delivered.** The code exists; it is not exported from `src/mojoboost/__init__.mojo`, no binding names it, and `docs/LIGHTGBM_PARITY.md` is unchanged by this lane |
+| mojotrees supports external-memory training | **Not claimed as delivered.** The code exists; it is not exported from `src/mojotrees/__init__.mojo`, no binding names it, and `docs/LIGHTGBM_PARITY.md` is unchanged by this lane |
 | The bin edges equal the resident path's, bit for bit | Argued in section 3, and it is a structural argument rather than a numerical one: the same `binning.fit_bins` is called on the same values. **Unverified** |
 | The chunk files round trip exactly | Argued in section 7 (IEEE-754 bit patterns, no decimal formatting). **Unverified** |
 | Training runs without materializing | **No.** Explicitly no. See section 11 |
@@ -377,7 +377,7 @@ its dataset is built by its own parser: `two_round`, `header`,
 `data=/path/to/file`.
 
 None of those appear in `ExternalMemoryParams`, and none should be added.
-Parsing in mojoboost lives in the caller, which is what makes an Arrow batch,
+Parsing in mojotrees lives in the caller, which is what makes an Arrow batch,
 a NumPy view, and a CSV reader equally valid sources of a chunk. A parameter
 named `two_round` with no parser behind it would be spelling for its own
 sake, and `docs/LIGHTGBM_PARITY.md` already classifies that whole family as

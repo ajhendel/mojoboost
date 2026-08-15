@@ -1,6 +1,6 @@
 # First-use and compile latency
 
-What a cold process pays before mojoboost answers the first question, how
+What a cold process pays before mojotrees answers the first question, how
 that cost is divided, and how each division would be measured.
 
 The rule this document is built around:
@@ -32,7 +32,7 @@ the commands. Filling in the tables is the next lane's work, and
 
 "Wired into a call site" is `no` for every row because the files that would
 call in (`gpu_runtime.mojo`, `train_gpu.mojo`, `histogram_gpu.mojo`,
-`bindings/_mojoboost.mojo`, `python/mojoboost/__init__.py`) belong to other
+`bindings/_mojotrees.mojo`, `python/mojotrees/__init__.py`) belong to other
 lanes. The instrumentation exists, imports nothing from them, and changes
 no behavior on its own.
 
@@ -41,7 +41,7 @@ no behavior on its own.
 A slow steady-state fit and a slow first fit are different problems with
 different fixes, and today the repository cannot tell them apart.
 `bench/bench_train_gpu.mojo` times whole fits. `PhaseCounters` in
-`src/mojoboost/gpu_runtime.mojo` attributes time *within* a fit across
+`src/mojotrees/gpu_runtime.mojo` attributes time *within* a fit across
 compile, alloc, transfer, kernel, sync, and cleanup. Neither separates the
 cost of arriving at a usable trainer from the cost of using one.
 
@@ -55,8 +55,8 @@ it has one plausible owner and one plausible fix.
 
 | # | Phase | The cost is | Fixed by | Measured by |
 |---|---|---|---|---|
-| 0 | `py_import` | executing `mojoboost/__init__.py` and its module graph | deferring imports | host harness |
-| 1 | `ext_load` | `dlopen` of `_mojoboost.so` and its dependency closure | fewer or smaller dylibs, better rpaths | host harness |
+| 0 | `py_import` | executing `mojotrees/__init__.py` and its module graph | deferring imports | host harness |
+| 1 | `ext_load` | `dlopen` of `_mojotrees.so` and its dependency closure | fewer or smaller dylibs, better rpaths | host harness |
 | 2 | `runtime_load` | MAX async runtime initialization during that load | nothing local; a toolchain property | host harness |
 | 3 | `device_discovery` | enumerating accelerators | not opening a device you will not use | native |
 | 4 | `context_create` | `DeviceContext()` and driver context setup | one session per process, not per fit | native |
@@ -69,7 +69,7 @@ it has one plausible owner and one plausible fix.
 Phases 0 to 2 are **supplied**. They are over before any Mojo code runs, so
 nothing native can time them; a host harness measures them and hands the
 values in through `StartupTrace.supply`. `phase_origin` in
-`src/mojoboost/initialization.mojo` is the authority on which is which, and
+`src/mojotrees/initialization.mojo` is the authority on which is which, and
 every report marks supplied values so a reader never mistakes a number
 somebody typed for a number a process observed.
 
@@ -105,7 +105,7 @@ startup.warm_ns <ns>
 ```
 
 `cold_ns` is the first occurrence of every one-time phase, summed;
-`warm_ns` is the mean recorded `warm_fit`. `python/mojoboost/diagnostics.py`
+`warm_ns` is the mean recorded `warm_fit`. `python/mojotrees/diagnostics.py`
 recomputes both from the per-phase lines rather than trusting them, so a
 report and its summary cannot disagree.
 
@@ -193,18 +193,18 @@ measurements of different things.
 ### Phase 0, `py_import`
 
 ```sh
-python -X importtime -c "import mojoboost" 2>&1 | tail -30
+python -X importtime -c "import mojotrees" 2>&1 | tail -30
 ```
 
 `-X importtime` prints cumulative microseconds per module, so the
-`mojoboost` line is the phase and the lines above it say which submodule
-owns it. The extension is imported by `python/mojoboost/__init__.py` at
+`mojotrees` line is the phase and the lines above it say which submodule
+owns it. The extension is imported by `python/mojotrees/__init__.py` at
 module scope, so this number *contains* phases 1 and 2; subtract them.
 
 ### Phases 1 and 2, `ext_load` and `runtime_load`
 
 ```sh
-python -X importtime -c "import mojoboost._mojoboost" 2>&1 | tail -5
+python -X importtime -c "import mojotrees._mojotrees" 2>&1 | tail -5
 ```
 
 That isolates the extension from the rest of the package's module graph.
@@ -213,10 +213,10 @@ initialization inside it needs the loader's own accounting:
 
 ```sh
 # macOS
-DYLD_PRINT_STATISTICS=1 python -c "import mojoboost._mojoboost" 2>&1
+DYLD_PRINT_STATISTICS=1 python -c "import mojotrees._mojotrees" 2>&1
 
 # Linux
-LD_DEBUG=statistics python -c "import mojoboost._mojoboost" 2>&1
+LD_DEBUG=statistics python -c "import mojotrees._mojotrees" 2>&1
 ```
 
 **The split between phases 1 and 2 is unverified.** Loader statistics
@@ -257,9 +257,9 @@ These need call sites that do not exist yet. Once the integration lane has
 wired `StartupTrace` in per the handoff:
 
 ```sh
-MOJOBOOST_STARTUP_TRACE=1 pixi run bench-startup
-MOJOBOOST_STARTUP_TRACE=1 MOJOBOOST_GPU_WARMUP=train pixi run bench-startup
-MOJOBOOST_STARTUP_TRACE=1 MOJOBOOST_DISABLE_GPU=1 pixi run bench-startup
+MOJOTREES_STARTUP_TRACE=1 pixi run bench-startup
+MOJOTREES_STARTUP_TRACE=1 MOJOTREES_GPU_WARMUP=train pixi run bench-startup
+MOJOTREES_STARTUP_TRACE=1 MOJOTREES_DISABLE_GPU=1 pixi run bench-startup
 ```
 
 `bench/bench_startup.mojo` and the `bench-startup` pixi task **do not
@@ -269,7 +269,7 @@ have to do.
 Pair the startup trace with the per-fit trace, which does exist:
 
 ```sh
-MOJOBOOST_STARTUP_TRACE=1 MOJOBOOST_GPU_TRACE=1 pixi run bench-train-gpu
+MOJOTREES_STARTUP_TRACE=1 MOJOTREES_GPU_TRACE=1 pixi run bench-train-gpu
 ```
 
 For any GPU phase attribution to mean anything, force synchronous
@@ -277,7 +277,7 @@ execution first. Enqueues return immediately, so an unsynchronized "kernel
 create" measurement times the enqueue and not the compile:
 
 ```sh
-MODULAR_DEBUG=device-sync-mode MOJOBOOST_STARTUP_TRACE=1 pixi run bench-startup
+MODULAR_DEBUG=device-sync-mode MOJOTREES_STARTUP_TRACE=1 pixi run bench-startup
 ```
 
 That changes what is being measured (it serializes the queue), so record it
@@ -374,7 +374,7 @@ wheel, and which directory it is names the builder.
 |---|---|---|---|
 | Produced by | `bindings/build.sh` | `packaging/build_wheel.sh` | `packaging/linux/build_wheel_linux.sh` |
 | Platform | any | macOS arm64 | Linux |
-| MAX runtime | in the pixi environment | four dylibs in `mojoboost/.dylibs` | the ELF closure in `mojoboost/.libs`, staged by soname |
+| MAX runtime | in the pixi environment | four dylibs in `mojotrees/.dylibs` | the ELF closure in `mojotrees/.libs`, staged by soname |
 | Search path | absolute rpath to `$CONDA_PREFIX/lib` | `@loader_path/.dylibs` | `$ORIGIN/.libs` |
 | Signature | as linked | re-signed ad hoc after `install_name_tool` | not applicable |
 | Breaks when | the pixi environment moves or is removed | a bundled dylib is stripped by a repacker | a closure member is missed at staging time |
@@ -418,7 +418,7 @@ follows is the specification any such cache would have to satisfy, written
 down now because the failure mode of getting it wrong is a silently stale
 kernel producing wrong numbers, and that is worth more than a paragraph of
 warning later. The struct is `BuildIdentity` in
-`src/mojoboost/initialization.mojo`.
+`src/mojotrees/initialization.mojo`.
 
 ### The key
 
@@ -452,7 +452,7 @@ up; if it were, every incomplete identity would collide with every other.
 
 - **Location.** Follow the toolchain's own precedence rather than inventing
   one: `$MODULAR_HOME/cache`, else `$HOME/.modular`, else
-  `$XDG_CACHE_HOME/modular`, else `$HOME/.cache/modular`. A mojoboost
+  `$XDG_CACHE_HOME/modular`, else `$HOME/.cache/modular`. A mojotrees
   subdirectory under whichever wins. Never inside the installed package: a
   wheel directory may be read-only, may be shared between users, and may be
   on a filesystem that is remounted read-only in production.
@@ -545,7 +545,7 @@ checked. They are the first thing to test.
    with CUDA in exactly these phases.
 8. **`-X importtime` accounting is assumed additive.** It attributes
    cumulative time per module; whether the extension's `dlopen` lands
-   entirely inside the `mojoboost._mojoboost` row has not been checked.
+   entirely inside the `mojotrees._mojotrees` row has not been checked.
 9. **`inspect_startup_artifacts.py` has never been run.** Its ELF reader
    was written from the format definition and has parsed no file, and its
    adapter over `macho_info` assumes that function's dict keys
@@ -555,9 +555,9 @@ checked. They are the first thing to test.
 
 ## Related
 
-- [`src/mojoboost/initialization.mojo`](../src/mojoboost/initialization.mojo)
+- [`src/mojotrees/initialization.mojo`](../src/mojotrees/initialization.mojo)
   is the contract in code.
-- [`python/mojoboost/diagnostics.py`](../python/mojoboost/diagnostics.py)
+- [`python/mojotrees/diagnostics.py`](../python/mojotrees/diagnostics.py)
   formats a report from measured values.
 - [`tools/inspect_startup_artifacts.py`](../tools/inspect_startup_artifacts.py)
   reads the artifacts that fix `ext_load`.

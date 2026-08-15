@@ -25,8 +25,8 @@ has to pass.
 
 from std.testing import assert_almost_equal, assert_equal, assert_true, TestSuite
 
-from mojoboost.binning import BinnedMatrix, bin_equal_width, fit_bins
-from mojoboost.boosting import (
+from mojotrees.binning import BinnedMatrix, bin_equal_width, fit_bins
+from mojotrees.boosting import (
     BINARY_LOGISTIC,
     HUBER,
     L1,
@@ -36,7 +36,7 @@ from mojoboost.boosting import (
     BoosterParams,
     train,
 )
-from mojoboost.collective import (
+from mojotrees.collective import (
     STATUS_OK,
     STATUS_SHAPE_MISMATCH,
     Collective,
@@ -47,17 +47,17 @@ from mojoboost.collective import (
     status_message,
     zeros_int,
 )
-from mojoboost.distributed import (
+from mojotrees.distributed import (
     DataShard,
     grow_tree_distributed,
     partition_rows,
     partition_values,
     train_distributed,
 )
-from mojoboost.serialize import load_model, save_model
-from mojoboost.model import Model
-from mojoboost.monotone import MonotoneConstraints
-from mojoboost.tree import Tree, TreeParams, grow_tree
+from mojotrees.serialize import load_model, save_model
+from mojotrees.model import Model
+from mojotrees.monotone import MonotoneConstraints
+from mojotrees.tree import Tree, TreeParams, grow_tree
 
 
 comptime _TMP_PATH = "./.test_distributed_roundtrip.tmp"

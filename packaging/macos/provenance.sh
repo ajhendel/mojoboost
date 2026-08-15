@@ -13,7 +13,7 @@
 #
 # Why a sidecar at all. None of this is recoverable from the wheel afterwards,
 # and one field changes what the artifact does on the user's machine:
-# has_accelerator() is resolved at compile time (src/mojoboost/device.mojo), so
+# has_accelerator() is resolved at compile time (src/mojotrees/device.mojo), so
 # a wheel built where an accelerator was visible reports one as available, and
 # a `device="gpu"` request on that build fails when the device is opened rather
 # than when it is resolved. Two wheels with the same filename and different
@@ -75,7 +75,7 @@ esac
 # What was emitted is in the binary, and inspect_wheel.py check C1 reads it
 # there. Recording the request separately is how a compiler that ignores the
 # variable becomes visible instead of confusing.
-REQUESTED_TARGET=${MOJOBOOST_MACOS_TARGET:-sdk-default}
+REQUESTED_TARGET=${MOJOTREES_MACOS_TARGET:-sdk-default}
 
 # What the wheel's zip entries were stamped from. Recorded because it is the
 # one input a later rebuild has to match before its digest can be compared with
@@ -117,12 +117,12 @@ cat "$OUT"
 # built and tested there, and the failure surfaces on the user's machine when
 # the device is opened. Refuse it here rather than publish it.
 #
-# MOJOBOOST_ALLOW_INCONSISTENT_GPU_BUILD=1 overrides, for the case where the
+# MOJOTREES_ALLOW_INCONSISTENT_GPU_BUILD=1 overrides, for the case where the
 # artifact is being produced deliberately to study that failure. The override is
 # not recorded in the sidecar on purpose: an artifact built with it is not a
 # release artifact, and the sidecar should not be made to look like it is.
 if [ "$ACCEL" = "true" ] && [ "$METAL" = "absent" ]; then
-    if [ "${MOJOBOOST_ALLOW_INCONSISTENT_GPU_BUILD:-0}" = "1" ]; then
+    if [ "${MOJOTREES_ALLOW_INCONSISTENT_GPU_BUILD:-0}" = "1" ]; then
         echo "warning: accelerator visible at compile time and no Metal toolchain."
         echo "warning: override set. This artifact must not be published."
     else
@@ -133,7 +133,7 @@ if [ "$ACCEL" = "true" ] && [ "$METAL" = "absent" ]; then
         echo "That is the GitHub-hosted Apple silicon runner's configuration and" >&2
         echo "it produces a wheel whose GPU story cannot be tested on the machine" >&2
         echo "that built it. Build on a Mac with Xcode and the Metal toolchain" >&2
-        echo "installed, or set MOJOBOOST_ALLOW_INCONSISTENT_GPU_BUILD=1 for an" >&2
+        echo "installed, or set MOJOTREES_ALLOW_INCONSISTENT_GPU_BUILD=1 for an" >&2
         echo "artifact that is explicitly not for publication." >&2
         exit 3
     fi

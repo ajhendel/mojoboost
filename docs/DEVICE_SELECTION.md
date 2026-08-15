@@ -4,8 +4,8 @@
 it has to be able to say why. This document describes the policy, the
 evidence rule behind it, and the report it produces.
 
-The policy lives in `python/mojoboost/device_selection.py`. The device
-vocabulary it implements is the one in `src/mojoboost/device.mojo`, which
+The policy lives in `python/mojotrees/device_selection.py`. The device
+vocabulary it implements is the one in `src/mojotrees/device.mojo`, which
 is the authority; this layer adds explanation, Python-level feature gates,
 a memory estimate, and a versioned table of measured crossovers.
 
@@ -27,7 +27,7 @@ information; a fallback destroys it.
 ## What `auto` currently does, and why
 
 **`auto` resolves to the CPU on every machine and every workload, unless
-`MOJOBOOST_AUTO_MIN_CELLS` is set.**
+`MOJOTREES_AUTO_MIN_CELLS` is set.**
 
 `CROSSOVER_RULES` is empty. Nothing in this repository has measured a
 workload size where GPU training beats CPU training. The one end-to-end
@@ -54,7 +54,7 @@ Why
   [no-validated-rule] the crossover table (version 1) is empty: no
   benchmark has established a workload size where GPU training beats CPU
   training, so auto conservatively keeps the CPU. Set
-  MOJOBOOST_AUTO_MIN_CELLS to run that benchmark, or device='gpu' to force
+  MOJOTREES_AUTO_MIN_CELLS to run that benchmark, or device='gpu' to force
   the accelerator
 ```
 
@@ -68,14 +68,14 @@ raises on it and `"auto"` takes the CPU:
 
 | Block | Reason code | Enforced by |
 |---|---|---|
-| No accelerator for this build | `no-accelerator` | `gpu_available` in `src/mojoboost/device.mojo` |
-| `MOJOBOOST_DISABLE_GPU=1` | `gpu-disabled-env` | the same function |
-| Sparse input | `unsupported-feature` | `_fit_sparse` in `python/mojoboost/__init__.py` |
+| No accelerator for this build | `no-accelerator` | `gpu_available` in `src/mojotrees/device.mojo` |
+| `MOJOTREES_DISABLE_GPU=1` | `gpu-disabled-env` | the same function |
+| Sparse input | `unsupported-feature` | `_fit_sparse` in `python/mojotrees/__init__.py` |
 | A custom objective callable | `unsupported-feature` | `_fit_custom` in the same file |
 | An `eval_set` (validation is scored on the CPU) | `unsupported-feature` | `_fit_with_metrics` in the same file |
 | `lambdarank` | `unsupported-feature` | the ranker's `fit` |
 | Multiclass on a build whose GPU path lacks it | `unsupported-feature` | `gpu_supports` in `device.mojo` |
-| More rows than the kernels can index | `workload-limit` | `MAX_ROWS` in `src/mojoboost/histogram_gpu.mojo` |
+| More rows than the kernels can index | `workload-limit` | `MAX_ROWS` in `src/mojotrees/histogram_gpu.mojo` |
 | `max_bin` outside [2, 256] | `workload-limit` | `MAX_BINS` there and the binner |
 | The memory estimate does not fit the budget | `insufficient-memory` | the estimate below |
 
@@ -92,11 +92,11 @@ same reason: no crossover rule can be scoped to a device nobody can name.
 
 | Variable | Effect |
 |---|---|
-| `MOJOBOOST_DISABLE_GPU=1` | Reports no accelerator. `"gpu"` raises, `"auto"` takes the CPU on a machine that does have one. |
-| `MOJOBOOST_AUTO_MIN_CELLS` | Cells (`n_rows * n_features`) at or above which `auto` selects the GPU. `0` means "whenever the GPU path covers the workload". Unset, negative, or unparsable means the heuristic is off, which is the default. |
-| `MOJOBOOST_GPU_BACKEND` | Names the backend when detection cannot. Only scopes crossover rules; it never enables or disables anything. |
+| `MOJOTREES_DISABLE_GPU=1` | Reports no accelerator. `"gpu"` raises, `"auto"` takes the CPU on a machine that does have one. |
+| `MOJOTREES_AUTO_MIN_CELLS` | Cells (`n_rows * n_features`) at or above which `auto` selects the GPU. `0` means "whenever the GPU path covers the workload". Unset, negative, or unparsable means the heuristic is off, which is the default. |
+| `MOJOTREES_GPU_BACKEND` | Names the backend when detection cannot. Only scopes crossover rules; it never enables or disables anything. |
 
-`MOJOBOOST_AUTO_MIN_CELLS` is parsed here exactly as `env_auto_min_cells`
+`MOJOTREES_AUTO_MIN_CELLS` is parsed here exactly as `env_auto_min_cells`
 parses it in `device.mojo`, so the two layers cannot disagree about what a
 given environment does. It is the knob for running the crossover benchmark
 that would justify a default. A GPU choice reached through it is reported
@@ -136,9 +136,9 @@ Adding a rule is a benchmarking result, not a code change:
 1. Run the sweep. `pixi run gpu-validate` for the phase breakdown and
    `bench/bench_train_gpu.mojo` for end-to-end training, on the device the
    rule will claim, following the procedure in `docs/GPU_VALIDATION.md`.
-   Pin CPU threading (`MOJOBOOST_NUM_WORKERS`, `MOJOBOOST_PARALLEL_MIN_OPS`)
+   Pin CPU threading (`MOJOTREES_NUM_WORKERS`, `MOJOTREES_PARALLEL_MIN_OPS`)
    so the CPU side of the comparison is reproducible.
-2. Find the crossover with `MOJOBOOST_AUTO_MIN_CELLS`, which exists so the
+2. Find the crossover with `MOJOTREES_AUTO_MIN_CELLS`, which exists so the
    sweep needs no rebuild.
 3. Record the output in the record section of `docs/GPU_VALIDATION.md`,
    loss numbers next to throughput numbers.
@@ -154,7 +154,7 @@ bring evidence.
 
 Every report carries an estimate of what one GPU training session would
 allocate, derived term by term from the buffers
-`GpuHistogramBuilder.__init__` creates in `src/mojoboost/histogram_gpu.mojo`:
+`GpuHistogramBuilder.__init__` creates in `src/mojotrees/histogram_gpu.mojo`:
 
 | Term | Bytes | Buffer |
 |---|---|---|
@@ -171,7 +171,7 @@ copy of the histogram buffer.
 The tiled accumulation strategy also allocates a partial-histogram buffer
 whose size comes from device attributes read at runtime, so it cannot be
 computed host-side without a device. `PARTIAL_BUDGET_BYTES` in
-`src/mojoboost/gpu_tiling.mojo` caps it at 64 MiB, and that cap is what
+`src/mojotrees/gpu_tiling.mojo` caps it at 64 MiB, and that cap is what
 `upper_bound_bytes` adds.
 
 It is an estimate and it is labeled one everywhere it appears. It counts
@@ -195,7 +195,7 @@ would `device='gpu'` do here" is answerable without try/except.
 `report.raise_if_unsupported()` turns it back into the raise.
 
 ```python
-from mojoboost.device_selection import explain_device_choice
+from mojotrees.device_selection import explain_device_choice
 
 report = explain_device_choice(X, y, device="auto")
 print(report)                            # the prose explanation
@@ -237,7 +237,7 @@ tests cover CUDA and HIP devices nobody here owns, and it is how a user
 can ask "would a bigger GPU change this answer".
 
 ```python
-from mojoboost.device_selection import Capabilities, Workload, select_device
+from mojotrees.device_selection import Capabilities, Workload, select_device
 
 caps = Capabilities(
     gpu_available=True,
@@ -252,7 +252,7 @@ report = select_device("auto", Workload(5_000_000, 200), capabilities=caps)
 the compiled extension whether an accelerator is available, reads the
 three environment variables, and identifies the backend and chip when the
 platform will name them. Backend detection is a heuristic and says so
-through `backend_source`; `MOJOBOOST_GPU_BACKEND` overrides it. Anything
+through `backend_source`; `MOJOTREES_GPU_BACKEND` overrides it. Anything
 it cannot determine comes back None and the report prints "unknown"
 rather than a plausible value.
 
@@ -261,13 +261,13 @@ running machine: Mojo resolves `has_accelerator()` at compile time. A
 redistributed wheel built where a device was present reports one as
 available, so a `"gpu"` request there fails when the device is opened
 rather than when it is resolved. `build_has_accelerator` records what the
-build claimed, and `MOJOBOOST_DISABLE_GPU=1` is the way to pin such a
+build claimed, and `MOJOTREES_DISABLE_GPU=1` is the way to pin such a
 build to the CPU.
 
 ## Status
 
 This module is the policy and report layer. It is not yet wired into the
-estimators; `MojoBoostRegressor(device="auto")` still resolves through
+estimators; `MojoTreesRegressor(device="auto")` still resolves through
 `_resolve_device`, which calls the native `resolve_device` directly. The
 exact wiring, including why the estimators must keep passing a resolved
 concrete device name to the native layer rather than `"auto"`, is in

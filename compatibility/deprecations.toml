@@ -16,8 +16,8 @@ schema_version = 1
 #
 # This is a fact about the project and not an omission. A grep for
 # `DeprecationWarning`, `deprecated`, and `Deprecated` across
-# python/mojoboost/, src/mojoboost/, bindings/, and capi/mojoboost.h
-# returns nothing: no surface in mojoboost has ever been deprecated,
+# python/mojotrees/, src/mojotrees/, bindings/, and capi/mojotrees.h
+# returns nothing: no surface in mojotrees has ever been deprecated,
 # because no release has ever shipped one to deprecate.
 #
 # Every removal so far is covered by exemption `never_released`
@@ -32,7 +32,7 @@ schema_version = 1
 #   [[deprecation]]
 #   id = "estimator-best-score-scalar"
 #   surface = "python"                  # python|mojo|c_abi|parameter|env|cli|model_format|dump_schema
-#   name = "MojoBoostRegressor.best_score_"
+#   name = "MojoTreesRegressor.best_score_"
 #   state = "deprecated"                # soft|deprecated|removed
 #   since = "0.4.0"
 #   announced_at = "2026-11-02"
@@ -73,10 +73,10 @@ note = "The equivalent grid already exists as evals_result_, so the dict shape w
 [[candidate]]
 id = "inspection-submodule-import-path"
 surface = "python"
-name = "mojoboost.inspection"
+name = "mojotrees.inspection"
 owed_by = "the first tagged release"
 gate_item = "C5"
-question = "Is `import mojoboost.inspection` a supported path, or is the top-level re-export the only one."
+question = "Is `import mojotrees.inspection` a supported path, or is the top-level re-export the only one."
 current = "both work, and only one is documented"
-why_now = "Four inspection names are now in mojoboost.__all__, resolved lazily through _LAZY_ATTRS, which is how gate item C5 was answered. Compatibility policy section 6.1 still says no submodule other than mojoboost.callback is a supported import path, so the submodule spelling works and is formally outside the surface. Whichever way it is settled, settling it after the tag costs a window, because callers will have written both."
-note = "See DRIFT_REPORT.md finding F5. The same question applies to mojoboost.cv, mojoboost.dask, mojoboost.device_selection, and mojoboost.diagnostics, all four of which are in _LAZY_SUBMODULES."
+why_now = "Four inspection names are now in mojotrees.__all__, resolved lazily through _LAZY_ATTRS, which is how gate item C5 was answered. Compatibility policy section 6.1 still says no submodule other than mojotrees.callback is a supported import path, so the submodule spelling works and is formally outside the surface. Whichever way it is settled, settling it after the tag costs a window, because callers will have written both."
+note = "See DRIFT_REPORT.md finding F5. The same question applies to mojotrees.cv, mojotrees.dask, mojotrees.device_selection, and mojotrees.diagnostics, all four of which are in _LAZY_SUBMODULES."

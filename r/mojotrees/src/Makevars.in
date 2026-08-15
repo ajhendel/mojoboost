@@ -1,0 +1,5 @@
+# Generated from Makevars.in by ./configure. MOJOTREES_HOME points at the
+# mojotrees checkout holding capi/mojotrees.h and the built C ABI library.
+PKG_CPPFLAGS = -I@MOJOTREES_HOME@/capi
+PKG_LIBS = -L@MOJOTREES_HOME@/capi -lmojotrees \
+           -Wl,-rpath,@MOJOTREES_HOME@/capi

@@ -1,0 +1,81 @@
+#!/bin/sh
+# Locate the mojotrees C ABI and generate src/Makevars.
+#
+# The package normally sits inside a mojotrees checkout at r/mojotrees, so the
+# default is to walk up from here looking for capi/mojotrees.h. That also
+# covers R CMD check, which unpacks the tarball into r/mojotrees.Rcheck/. Set
+# MOJOTREES_HOME to point at a checkout somewhere else entirely.
+#
+# Either way the library must already be built:
+#
+#     capi/build.sh
+#
+# The library is loaded by rpath rather than copied, so rebuilding the C ABI
+# takes effect without reinstalling the package.
+set -e
+
+start=$(cd "$(dirname "$0")" && pwd)
+
+find_home() {
+    candidate=$1
+    level=0
+    while [ "$level" -lt 8 ]; do
+        if [ -f "$candidate/capi/mojotrees.h" ]; then
+            echo "$candidate"
+            return 0
+        fi
+        parent=$(dirname "$candidate")
+        if [ "$parent" = "$candidate" ]; then
+            return 1
+        fi
+        candidate=$parent
+        level=$((level + 1))
+    done
+    return 1
+}
+
+if [ -z "$MOJOTREES_HOME" ]; then
+    MOJOTREES_HOME=$(find_home "$start") || {
+        echo "configure: no capi/mojotrees.h above $start" >&2
+        echo "configure: set MOJOTREES_HOME to your mojotrees checkout" >&2
+        exit 1
+    }
+elif [ ! -f "$MOJOTREES_HOME/capi/mojotrees.h" ]; then
+    echo "configure: MOJOTREES_HOME=$MOJOTREES_HOME has no capi/mojotrees.h" >&2
+    exit 1
+fi
+
+found=""
+for candidate in \
+    "$MOJOTREES_HOME/capi/libmojotrees.dylib" \
+    "$MOJOTREES_HOME/capi/libmojotrees.so"; do
+    if [ -f "$candidate" ]; then
+        found=$candidate
+        break
+    fi
+done
+if [ -z "$found" ]; then
+    echo "configure: no libmojotrees in $MOJOTREES_HOME/capi" >&2
+    echo "configure: build it first with $MOJOTREES_HOME/capi/build.sh" >&2
+    exit 1
+fi
+
+# The package calls mojotrees_feature_importance and
+# mojotrees_parameter_keys, which arrived in ABI version 3. Checking the
+# header here turns an old checkout into a message at configure time rather
+# than an undefined symbol at link time.
+required=3
+declared=$(sed -n 's/^#define MOJOTREES_ABI_VERSION \([0-9]*\).*/\1/p' \
+    "$MOJOTREES_HOME/capi/mojotrees.h")
+if [ -z "$declared" ]; then
+    echo "configure: cannot read MOJOTREES_ABI_VERSION from the header" >&2
+    exit 1
+fi
+if [ "$declared" -lt "$required" ]; then
+    echo "configure: this package needs mojotrees ABI >= $required, but" >&2
+    echo "configure: $MOJOTREES_HOME/capi/mojotrees.h declares $declared" >&2
+    exit 1
+fi
+
+sed "s|@MOJOTREES_HOME@|$MOJOTREES_HOME|g" src/Makevars.in > src/Makevars
+echo "configure: linking against $found (ABI $declared)"

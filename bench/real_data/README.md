@@ -1,6 +1,6 @@
 # Real-data differential harness
 
-A reproducible comparison of mojoboost against LightGBM across six problem
+A reproducible comparison of mojotrees against LightGBM across six problem
 shapes, on pinned public datasets or deterministic generators, measuring
 quality, time, memory, and model size, and separating the numbers that can
 fail a build from the numbers that cannot.
@@ -85,26 +85,26 @@ whose two engines report different digests before it looks at anything else.
 
 **The parameters are aligned deliberately, and the alignment is written
 down.** `scenarios.py` sets `lambda_l2` explicitly because the two defaults
-differ, disables exclusive feature bundling because mojoboost has none,
+differ, disables exclusive feature bundling because mojotrees has none,
 disables LightGBM's feature pre-filter because it deletes columns at Dataset
 build time, and raises `bin_construct_sample_cnt` to the training row count
 because LightGBM otherwise builds its bin edges from a 200000-row subsample
-while mojoboost bins from every row. Each one is justified where it is set.
+while mojotrees bins from every row. Each one is justified where it is set.
 Threads are matched by count rather than by parameter name: LightGBM reads
-`num_threads`, mojoboost reads `MOJOBOOST_NUM_WORKERS`, and the runner sets
+`num_threads`, mojotrees reads `MOJOTREES_NUM_WORKERS`, and the runner sets
 both from one number before either library is imported.
 
 **Where alignment is impossible, the record says so.** Scenario caveats are
 copied into every record they touch and reprinted under every table.
 LightGBM reads its pairwise ranking sigmoid from a lookup table where
-mojoboost evaluates it, so ranking models diverge from the first pair; the
+mojotrees evaluates it, so ranking models diverge from the first pair; the
 ranking thresholds are correspondingly loose and say why.
 
 ## Correctness and performance are separated on purpose
 
 `verify.py` gates on quality and exits non-zero. It checks completeness,
 input agreement, dataset pinning, bit-identical repeat training, the
-mojoboost-against-LightGBM differential in the direction the metric runs, a
+mojotrees-against-LightGBM differential in the direction the metric runs, a
 floor against the trivial model, and accelerator-against-CPU agreement on
 the predictions themselves. Every tolerance lives in `thresholds.json` with
 its reasoning attached.
@@ -134,19 +134,19 @@ figure attributable and the warmup figure real.
 Two measurements are recorded as unavailable rather than estimated.
 Host-to-device transfer time is not exposed to Python by either engine;
 instrumenting it is a change to the Mojo accelerator sources and is listed
-in the handoff. And on the sparse path, mojoboost bins inside `fit`, so
+in the handoff. And on the sparse path, mojotrees bins inside `fit`, so
 binning time cannot be separated from training time there. Both appear as a
 null with a reason, which is the only form a missing measurement takes in
 this harness.
 
 ## Accelerator mode
 
-`--device gpu` runs mojoboost on the accelerator. LightGBM stays on the CPU:
+`--device gpu` runs mojotrees on the accelerator. LightGBM stays on the CPU:
 its GPU support is a compile-time option the bench environment does not
-install, so a mojoboost accelerator row against a LightGBM CPU row would be
+install, so a mojotrees accelerator row against a LightGBM CPU row would be
 a comparison of two different things. The harness therefore treats
-CPU-against-accelerator as a mojoboost-internal check, records it as such,
+CPU-against-accelerator as a mojotrees-internal check, records it as such,
 and skips the cross-engine cell with that reason attached.
 
-The sparse scenario is CPU only on both sides, because mojoboost's CSC path
+The sparse scenario is CPU only on both sides, because mojotrees's CSC path
 reports `cpu` whatever device it is given.

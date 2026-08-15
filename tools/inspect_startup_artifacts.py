@@ -9,7 +9,7 @@ whether the loader can find them without leaving the package. All of that
 is readable from the files themselves.
 
 So this script reads them. It parses the Mach-O or ELF headers of
-`_mojoboost.so` and of any runtime libraries bundled beside it, and prints
+`_mojotrees.so` and of any runtime libraries bundled beside it, and prints
 the dependency list, the search paths, the platform minimum, the code
 signature status, and the sizes.
 
@@ -83,11 +83,11 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_PACKAGE_DIR = ROOT / "python" / "mojoboost"
+DEFAULT_PACKAGE_DIR = ROOT / "python" / "mojotrees"
 
 # The four MAX runtime libraries packaging/build_wheel.sh bundles. Keep in
 # sync with the LIBS array there and with BUNDLED_RUNTIME_LIBS in
-# python/mojoboost/diagnostics.py.
+# python/mojotrees/diagnostics.py.
 #
 # macOS only, and checked only against the `.dylibs` layout. The Linux
 # builder stages an ELF closure by soname, so this fixed set of four would
@@ -158,7 +158,7 @@ def _load_macho_info():
         import importlib.util
 
         spec = importlib.util.spec_from_file_location(
-            "_mojoboost_validate_artifact", VALIDATE_ARTIFACT
+            "_mojotrees_validate_artifact", VALIDATE_ARTIFACT
         )
         if spec is None or spec.loader is None:
             return None
@@ -381,7 +381,7 @@ def find_extension(package_dir: Path):
     if not package_dir.is_dir():
         return None
     for entry in sorted(package_dir.iterdir()):
-        if not entry.name.startswith("_mojoboost"):
+        if not entry.name.startswith("_mojotrees"):
             continue
         if entry.suffix in (".so", ".pyd", ".dylib"):
             return entry

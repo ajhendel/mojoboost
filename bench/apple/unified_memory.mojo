@@ -13,7 +13,7 @@ What it asks
 
 Apple silicon has one physical memory pool shared by the CPU and the GPU.
 That is a hardware fact and it is not in question. What is in question is
-whether the routes MAX/Mojo actually exposes let mojoboost *use* that pool
+whether the routes MAX/Mojo actually exposes let mojotrees *use* that pool
 without paying for a second copy of the data. Those are different claims
 (`docs/APPLE_UNIFIED_MEMORY.md`, "Two claims, only one of which is free"),
 and only the second one would change how `histogram_gpu.mojo` moves the
@@ -27,7 +27,7 @@ device saw the right bytes. The kernel is deliberately dumb: it exists only
 so the routes are compared under an identical consumer.
 
 The route vocabulary (`ROUTE_*`, `STATUS_*`, and their names) is imported
-from `mojoboost.unified_memory_policy` rather than defined here, so a route
+from `mojotrees.unified_memory_policy` rather than defined here, so a route
 cannot be called one thing in the experiment and another in the policy that
 would eventually act on the experiment's answer. That module is also what
 prints the shipped default and the evidence a route would have to earn before
@@ -97,7 +97,7 @@ elsewhere.
 Modes: what the payload's lifetime looks like
 ---------------------------------------------
 
-`MOJOBOOST_UM_MODE` selects which of mojoboost's two transfer shapes a run
+`MOJOTREES_UM_MODE` selects which of mojotrees's two transfer shapes a run
 models. They are not variations on a theme; they ask different questions.
 
 - `rewrite` (default) rewrites the whole payload every round, which is the
@@ -143,14 +143,14 @@ owes one, and that difference is part of what the route would buy rather than
 an artifact to be corrected away. Every route's host writes happen after the
 previous round's drain, so no route in this driver writes memory the device
 might still be reading. A trainer integration does not get that for free, and
-`src/mojoboost/unified_memory_policy.mojo`'s `SyncContract` is where that
+`src/mojotrees/unified_memory_policy.mojo`'s `SyncContract` is where that
 obligation is written down.
 
 Copies issued, versus copies that happened
 ------------------------------------------
 
 `copy_bytes_issued_total` counts the bytes *this driver* handed to
-`enqueue_copy`. Zero there means mojoboost issued no copy. It does not mean
+`enqueue_copy`. Zero there means mojotrees issued no copy. It does not mean
 no copy happened: the runtime remains free to migrate pages, blit behind the
 enqueue, or hold a second physical copy, and none of that is visible from
 inside the process. That is why the doc's external capture is mandatory and
@@ -180,26 +180,26 @@ Usage
 
 Environment:
 
-    MOJOBOOST_UM_MODE=rewrite|resident
+    MOJOTREES_UM_MODE=rewrite|resident
                                   payload lifetime to model, default rewrite
-    MOJOBOOST_UM_CONTEND=1        host mutates an unrelated buffer while
+    MOJOTREES_UM_CONTEND=1        host mutates an unrelated buffer while
                                   device work is in flight, to estimate
                                   CPU/GPU contention on the shared pool
-    MOJOBOOST_UM_HOLD_MIB         hold an extra device-resident buffer of
+    MOJOTREES_UM_HOLD_MIB         hold an extra device-resident buffer of
                                   this size for the whole run, modeling a
                                   validation matrix kept resident during
                                   training; default 0, which allocates none
-    MOJOBOOST_UM_LADDER=1         after the fixed-size run, double the
+    MOJOTREES_UM_LADDER=1         after the fixed-size run, double the
                                   payload until a route fails or per-byte
                                   round time regresses, to find the maximum
                                   practical dataset size on this machine
-    MOJOBOOST_UM_LADDER_MAX_MIB   ladder ceiling, default 8192
-    MOJOBOOST_UM_LADDER_PCT       regression cutoff in percent of the
+    MOJOTREES_UM_LADDER_MAX_MIB   ladder ceiling, default 8192
+    MOJOTREES_UM_LADDER_PCT       regression cutoff in percent of the
                                   smallest size's ns/byte, default 200
 
 The ladder is the memory-pressure part of the experiment and is off by
 default on purpose: it is the mode that can push a machine into the
-compressor and swap. `MOJOBOOST_UM_HOLD_MIB` interacts with it directly, by
+compressor and swap. `MOJOTREES_UM_HOLD_MIB` interacts with it directly, by
 design: a ladder run with a held buffer is the closest this driver gets to
 the memory state of a fit that is also holding a resident validation matrix.
 """
@@ -216,7 +216,7 @@ from max.gpu.host import (
     HostBuffer,
 )
 
-from mojoboost.unified_memory_policy import (
+from mojotrees.unified_memory_policy import (
     DEFAULT_ROUTE,
     ENABLE_LEVEL,
     N_ROLES,
@@ -254,7 +254,7 @@ comptime MAX_BLOCKS = 4096
 comptime MIB = 1024 * 1024
 
 # Payload lifetimes the driver can model. See the module docstring: these
-# are the two shapes mojoboost actually has, not two settings of one knob.
+# are the two shapes mojotrees actually has, not two settings of one knob.
 comptime MODE_REWRITE = 0
 comptime MODE_RESIDENT = 1
 
@@ -1213,7 +1213,7 @@ def _report(result: RouteResult, n_bytes: Int):
     print(p + "host_alloc_bytes:", result.host_bytes)
     print(p + "device_alloc_bytes:", result.device_bytes)
     print(p + "allocated_bytes:", result.host_bytes + result.device_bytes)
-    # Bytes this driver handed to enqueue_copy. Zero means mojoboost issued
+    # Bytes this driver handed to enqueue_copy. Zero means mojotrees issued
     # no copy; it does not mean no copy happened, and nothing in this file
     # can tell the difference. See the module docstring.
     print(p + "copy_bytes_issued_total:", result.copy_bytes_total)
@@ -1264,7 +1264,7 @@ def _report_policy():
     measurements so a reader sees the gate before the numbers.
 
     The route a run makes look good is not the route the library uses. That
-    decision lives in `src/mojoboost/unified_memory_policy.mojo`, it defaults
+    decision lives in `src/mojotrees/unified_memory_policy.mojo`, it defaults
     to the staged copy for every buffer role, and it needs evidence at
     `ENABLE_LEVEL` (an end-to-end training result) before it will select
     anything else without an explicit acknowledgment."""
@@ -1338,7 +1338,7 @@ def _ladder(
 
     This is the memory-pressure mode. Run it on an idle machine with the
     doc's `vm_stat` capture bracketing it, or its answer is about whatever
-    else was running. With `MOJOBOOST_UM_HOLD_MIB` set, the held buffer is
+    else was running. With `MOJOTREES_UM_HOLD_MIB` set, the held buffer is
     still resident throughout, which lowers the ceiling this reports and is
     the point of running the two together.
     """
@@ -1419,15 +1419,15 @@ def main() raises:
         raise Error("rounds must be at least 2 (round 0 is reported alone)")
 
     var n_bytes = payload_mib * MIB
-    var contend = getenv("MOJOBOOST_UM_CONTEND") == "1"
-    var ladder = getenv("MOJOBOOST_UM_LADDER") == "1"
+    var contend = getenv("MOJOTREES_UM_CONTEND") == "1"
+    var ladder = getenv("MOJOTREES_UM_LADDER") == "1"
     var mode = MODE_REWRITE
-    var mode_env = getenv("MOJOBOOST_UM_MODE")
+    var mode_env = getenv("MOJOTREES_UM_MODE")
     if mode_env == "resident":
         mode = MODE_RESIDENT
     elif mode_env.byte_length() != 0 and mode_env != "rewrite":
         raise Error(
-            "MOJOBOOST_UM_MODE must be 'rewrite' or 'resident', got '",
+            "MOJOTREES_UM_MODE must be 'rewrite' or 'resident', got '",
             mode_env,
             "'",
         )
@@ -1435,7 +1435,7 @@ def main() raises:
         # Round 0 writes, the midpoint retouches, and a steady state is
         # wanted on both sides of it.
         raise Error("resident mode needs at least 4 rounds")
-    var hold_bytes = _env_int("MOJOBOOST_UM_HOLD_MIB", 0) * MIB
+    var hold_bytes = _env_int("MOJOTREES_UM_HOLD_MIB", 0) * MIB
 
     print("um.driver: unified_memory")
     print("um.executed_before: no")
@@ -1580,8 +1580,8 @@ def main() raises:
             _ladder(
                 ctx,
                 MIB,
-                _env_int("MOJOBOOST_UM_LADDER_MAX_MIB", 8192) * MIB,
-                _env_int("MOJOBOOST_UM_LADDER_PCT", 200),
+                _env_int("MOJOTREES_UM_LADDER_MAX_MIB", 8192) * MIB,
+                _env_int("MOJOTREES_UM_LADDER_PCT", 200),
                 4 if mode == MODE_RESIDENT else 3,
                 mode,
             )

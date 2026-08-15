@@ -17,8 +17,8 @@ from std.testing import assert_almost_equal, assert_equal, assert_true
 from std.testing import TestSuite
 from std.utils.numerics import nan
 
-from mojoboost.binning import BinnedMatrix, fit_bins
-from mojoboost.boosting import (
+from mojotrees.binning import BinnedMatrix, fit_bins
+from mojotrees.boosting import (
     BINARY_LOGISTIC,
     SQUARED_ERROR,
     BoosterParams,
@@ -26,7 +26,7 @@ from mojoboost.boosting import (
     train,
     train_multiclass,
 )
-from mojoboost.gpu_predict import (
+from mojotrees.gpu_predict import (
     METRIC_BINARY_LOG_LOSS,
     METRIC_L1,
     METRIC_L2,
@@ -40,8 +40,8 @@ from mojoboost.gpu_predict import (
     flatten_trees,
     response_for_objective,
 )
-from mojoboost.metrics import binary_log_loss, l1, l2, multiclass_log_loss
-from mojoboost.tree import Tree, TreeParams
+from mojotrees.metrics import binary_log_loss, l1, l2, multiclass_log_loss
+from mojotrees.tree import Tree, TreeParams
 
 
 # Float32 accumulation over a few dozen trees: predictions of order 1 agree

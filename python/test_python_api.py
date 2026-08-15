@@ -1,4 +1,4 @@
-"""End-to-end tests for the mojoboost Python API.
+"""End-to-end tests for the mojotrees Python API.
 
 Runs with or without numpy (the wrapper falls back to stdlib buffers).
 Usage: build the extension with bindings/build.sh, then
@@ -12,10 +12,10 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from mojoboost import (
-    MojoBoostClassifier,
-    MojoBoostRanker,
-    MojoBoostRegressor,
+from mojotrees import (
+    MojoTreesClassifier,
+    MojoTreesRanker,
+    MojoTreesRegressor,
     gpu_available,
     group_from_query_ids,
     ndcg_score,
@@ -55,7 +55,7 @@ def make_classification(n_rows, n_classes, n_features=4, seed=11):
 
 def test_regressor():
     X, y = make_regression(800)
-    model = MojoBoostRegressor(n_estimators=50)
+    model = MojoTreesRegressor(n_estimators=50)
     assert model.fit(X, y) is model
     pred = model.predict(X)
     mse = sum((p - t) ** 2 for p, t in zip(pred, y)) / len(y)
@@ -64,7 +64,7 @@ def test_regressor():
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "reg.mbst")
         model.save(path)
-        loaded = MojoBoostRegressor.load(path)
+        loaded = MojoTreesRegressor.load(path)
         pred2 = loaded.predict(X)
     assert all(a == b for a, b in zip(pred, pred2)), "round-trip not exact"
     print(f"regressor ok (train MSE {mse:.5f})")
@@ -72,7 +72,7 @@ def test_regressor():
 
 def test_binary_classifier():
     X, y = make_classification(800, 2)
-    model = MojoBoostClassifier(n_estimators=50).fit(X, y)
+    model = MojoTreesClassifier(n_estimators=50).fit(X, y)
     assert model.n_classes_ == 2
     pred = list(model.predict(X))
     acc = sum(int(p == t) for p, t in zip(pred, y)) / len(y)
@@ -84,7 +84,7 @@ def test_binary_classifier():
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "bin.mbst")
         model.save(path)
-        loaded = MojoBoostClassifier.load(path)
+        loaded = MojoTreesClassifier.load(path)
         assert loaded.n_classes_ == 2
         assert list(loaded.predict(X)) == pred, "round-trip not exact"
     print(f"binary classifier ok (train acc {acc:.3f})")
@@ -92,7 +92,7 @@ def test_binary_classifier():
 
 def test_multiclass_classifier():
     X, y = make_classification(900, 3)
-    model = MojoBoostClassifier(n_estimators=30).fit(X, y)
+    model = MojoTreesClassifier(n_estimators=30).fit(X, y)
     assert model.n_classes_ == 3
     pred = list(model.predict(X))
     acc = sum(int(p == t) for p, t in zip(pred, y)) / len(y)
@@ -104,7 +104,7 @@ def test_multiclass_classifier():
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "multi.mbst")
         model.save(path)
-        loaded = MojoBoostClassifier.load(path)
+        loaded = MojoTreesClassifier.load(path)
         assert loaded.n_classes_ == 3
         assert list(loaded.predict(X)) == pred, "round-trip not exact"
     print(f"multiclass classifier ok (train acc {acc:.3f})")
@@ -117,8 +117,8 @@ def test_sample_weight():
     X, y = make_regression(300)
 
     # All-ones weights must be bit-identical to no weights.
-    plain = MojoBoostRegressor(n_estimators=20).fit(X, y)
-    ones = MojoBoostRegressor(n_estimators=20).fit(
+    plain = MojoTreesRegressor(n_estimators=20).fit(X, y)
+    ones = MojoTreesRegressor(n_estimators=20).fit(
         X, y, sample_weight=[1.0] * len(y)
     )
     pa = list(plain.predict(X[:50]))
@@ -127,7 +127,7 @@ def test_sample_weight():
 
     # Non-uniform weights must change the fit.
     w = [10.0 if r[0] > 0.5 else 0.1 for r in X]
-    skewed = MojoBoostRegressor(n_estimators=20).fit(X, y, sample_weight=w)
+    skewed = MojoTreesRegressor(n_estimators=20).fit(X, y, sample_weight=w)
     pc = list(skewed.predict(X[:50]))
     assert any(a != c for a, c in zip(pa, pc)), "weights had no effect"
     print("sample_weight ok")
@@ -137,13 +137,13 @@ def test_regression_objectives():
     X, y = make_regression(600)
 
     for objective in ("huber", "mae", "regression_l1"):
-        model = MojoBoostRegressor(objective=objective, n_estimators=40)
+        model = MojoTreesRegressor(objective=objective, n_estimators=40)
         pred = model.fit(X, y).predict(X)
         mse = sum((p - t) ** 2 for p, t in zip(pred, y)) / len(y)
         assert mse < 0.02, f"{objective} train MSE too high: {mse}"
 
     # A 0.9-quantile fit should predict above most training targets.
-    q = MojoBoostRegressor(objective="quantile", alpha=0.9, n_estimators=40)
+    q = MojoTreesRegressor(objective="quantile", alpha=0.9, n_estimators=40)
     pred = q.fit(X, y).predict(X)
     frac_below = sum(int(t <= p) for p, t in zip(pred, y)) / len(y)
     assert 0.8 < frac_below <= 1.0, f"quantile coverage off: {frac_below}"
@@ -152,7 +152,7 @@ def test_regression_objectives():
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "quantile.mbst")
         q.save(path)
-        loaded = MojoBoostRegressor.load(path)
+        loaded = MojoTreesRegressor.load(path)
         pred2 = loaded.predict(X)
     assert all(a == b for a, b in zip(pred, pred2)), "round-trip not exact"
     print(f"regression objectives ok (q90 coverage {frac_below:.3f})")
@@ -163,15 +163,15 @@ def test_lambda_l1():
     mean_y = sum(y) / len(y)
 
     # The default is 0, so passing it explicitly must not change the fit.
-    default = MojoBoostRegressor(n_estimators=30).fit(X, y)
-    explicit = MojoBoostRegressor(n_estimators=30, lambda_l1=0.0).fit(X, y)
+    default = MojoTreesRegressor(n_estimators=30).fit(X, y)
+    explicit = MojoTreesRegressor(n_estimators=30, lambda_l1=0.0).fit(X, y)
     pa = list(default.predict(X))
     pb = list(explicit.predict(X))
     assert all(a == b for a, b in zip(pa, pb)), "lambda_l1=0 changed the fit"
 
     # A moderate penalty shrinks every leaf's Newton step, so the fitted
     # predictions stay closer to the base score and fit the target less well.
-    reg = MojoBoostRegressor(n_estimators=30, lambda_l1=5.0).fit(X, y)
+    reg = MojoTreesRegressor(n_estimators=30, lambda_l1=5.0).fit(X, y)
     pc = list(reg.predict(X))
     assert any(a != c for a, c in zip(pa, pc)), "lambda_l1 had no effect"
     travel_plain = sum(abs(p - mean_y) for p in pa)
@@ -184,7 +184,7 @@ def test_lambda_l1():
     # A penalty larger than any gradient sum zeroes every candidate gain and
     # the root value, so training stops with an empty ensemble that predicts
     # the base score (the target mean) everywhere.
-    huge = MojoBoostRegressor(n_estimators=30, lambda_l1=1e6).fit(X, y)
+    huge = MojoTreesRegressor(n_estimators=30, lambda_l1=1e6).fit(X, y)
     for p in list(huge.predict(X))[:50]:
         assert abs(p - mean_y) < 1e-9, f"expected base score, got {p}"
     print(f"lambda_l1 ok (train MSE {mse_plain:.5f} -> {mse_reg:.5f})")
@@ -194,7 +194,7 @@ def test_lightgbm_sklearn_aliases():
     """Native LightGBM names stay canonical; its sklearn wrapper's names
     are accepted as strict aliases and produce the same model."""
     X, y = make_regression(500)
-    native = MojoBoostRegressor(
+    native = MojoTreesRegressor(
         n_estimators=20,
         min_data_in_leaf=8,
         min_child_hess=0.01,
@@ -205,7 +205,7 @@ def test_lightgbm_sklearn_aliases():
         bagging_seed=19,
         device="cpu",
     ).fit(X, y)
-    sklearn_names = MojoBoostRegressor(
+    sklearn_names = MojoTreesRegressor(
         n_estimators=20,
         min_child_samples=8,
         min_child_weight=0.01,
@@ -219,7 +219,7 @@ def test_lightgbm_sklearn_aliases():
     assert list(native.predict(X)) == list(sklearn_names.predict(X))
     assert sklearn_names.device_ == "cpu"
 
-    params = MojoBoostRegressor().get_params()
+    params = MojoTreesRegressor().get_params()
     for name in (
         "min_child_samples",
         "min_child_weight",
@@ -231,7 +231,7 @@ def test_lightgbm_sklearn_aliases():
     ):
         assert name in params, f"get_params omitted alias {name}"
 
-    updated = MojoBoostRegressor().set_params(
+    updated = MojoTreesRegressor().set_params(
         min_child_samples=7, subsample=0.8, device_type="cpu"
     )
     resolved = updated._params(0, updated._resolve_device(100, 4, 1))
@@ -249,7 +249,7 @@ def test_lightgbm_sklearn_aliases():
     )
     for bad in conflicts:
         try:
-            MojoBoostRegressor(n_estimators=2, **bad).fit(X, y)
+            MojoTreesRegressor(n_estimators=2, **bad).fit(X, y)
             raise AssertionError(f"conflicting aliases should raise: {bad}")
         except ValueError:
             pass
@@ -260,18 +260,18 @@ def test_bagging():
     X, y = make_regression(600)
 
     # The defaults disable bagging, and so does either switch on its own.
-    base = MojoBoostRegressor(n_estimators=30).fit(X, y)
+    base = MojoTreesRegressor(n_estimators=30).fit(X, y)
     pa = list(base.predict(X))
     for kwargs in ({"bagging_fraction": 1.0, "bagging_freq": 1},
                    {"bagging_fraction": 0.5, "bagging_freq": 0}):
-        off = MojoBoostRegressor(n_estimators=30, **kwargs).fit(X, y)
+        off = MojoTreesRegressor(n_estimators=30, **kwargs).fit(X, y)
         assert all(a == b for a, b in zip(pa, off.predict(X))), (
             f"bagging changed the fit when disabled: {kwargs}"
         )
 
     # Same seed, same model, bit for bit; a different seed moves it.
     def bagged(seed):
-        return MojoBoostRegressor(
+        return MojoTreesRegressor(
             n_estimators=30,
             bagging_fraction=0.6,
             bagging_freq=1,
@@ -293,7 +293,7 @@ def test_bagging():
     for bad in ({"bagging_fraction": 0.0}, {"bagging_fraction": 1.5},
                 {"bagging_freq": -1}):
         try:
-            MojoBoostRegressor(n_estimators=5, **bad).fit(X, y)
+            MojoTreesRegressor(n_estimators=5, **bad).fit(X, y)
         except ValueError:
             pass
         else:
@@ -301,7 +301,7 @@ def test_bagging():
 
     # Classifiers take the same parameters.
     Xc, yc = make_classification(400, 3)
-    clf = MojoBoostClassifier(
+    clf = MojoTreesClassifier(
         n_estimators=20, bagging_fraction=0.7, bagging_freq=2
     ).fit(Xc, yc)
     acc = sum(int(p == t) for p, t in zip(clf.predict(Xc), yc)) / len(yc)
@@ -313,9 +313,9 @@ def test_goss():
     X, y = make_regression(600)
 
     # gbdt is the default, and naming it explicitly changes nothing.
-    base = MojoBoostRegressor(n_estimators=30).fit(X, y)
+    base = MojoTreesRegressor(n_estimators=30).fit(X, y)
     pa = list(base.predict(X))
-    explicit = MojoBoostRegressor(n_estimators=30, boosting="gbdt").fit(X, y)
+    explicit = MojoTreesRegressor(n_estimators=30, boosting="gbdt").fit(X, y)
     assert all(a == b for a, b in zip(pa, explicit.predict(X))), (
         "boosting='gbdt' is not the default path"
     )
@@ -323,7 +323,7 @@ def test_goss():
     # GOSS with the automatic warmup (int(1 / learning_rate) = 10 rounds of
     # the 30 here) still samples, so the fit moves.
     def goss(seed=3, **kwargs):
-        return MojoBoostRegressor(
+        return MojoTreesRegressor(
             n_estimators=30, boosting="goss", goss_seed=seed, **kwargs
         ).fit(X, y)
 
@@ -339,7 +339,7 @@ def test_goss():
     )
 
     # A warmup covering every round is full-data training.
-    warmed = MojoBoostRegressor(
+    warmed = MojoTreesRegressor(
         n_estimators=30, boosting="goss", goss_warmup_rounds=30
     ).fit(X, y)
     assert all(a == b for a, b in zip(pa, warmed.predict(X))), (
@@ -347,7 +347,7 @@ def test_goss():
     )
 
     # boosting_type is LightGBM's scikit-learn spelling of the same thing.
-    aliased = MojoBoostRegressor(
+    aliased = MojoTreesRegressor(
         n_estimators=30, boosting_type="goss", goss_seed=3
     ).fit(X, y)
     assert all(a == b for a, b in zip(pb, aliased.predict(X))), (
@@ -368,7 +368,7 @@ def test_goss():
         {"boosting": "goss", "bagging_fraction": 0.5, "bagging_freq": 1},
     ):
         try:
-            MojoBoostRegressor(n_estimators=5, **bad).fit(X, y)
+            MojoTreesRegressor(n_estimators=5, **bad).fit(X, y)
         except ValueError:
             pass
         else:
@@ -376,7 +376,7 @@ def test_goss():
 
     # Classifiers take the same parameters.
     Xc, yc = make_classification(400, 3)
-    clf = MojoBoostClassifier(
+    clf = MojoTreesClassifier(
         n_estimators=20, boosting="goss", goss_warmup_rounds=0
     ).fit(Xc, yc)
     acc = sum(int(p == t) for p, t in zip(clf.predict(Xc), yc)) / len(yc)
@@ -389,19 +389,19 @@ def test_feature_fraction():
 
     # The defaults disable subsampling, and so does an explicit 1.0 whatever
     # the seed: selecting every feature is not a random event.
-    base = MojoBoostRegressor(n_estimators=30).fit(X, y)
+    base = MojoTreesRegressor(n_estimators=30).fit(X, y)
     pa = list(base.predict(X))
     for kwargs in ({"feature_fraction": 1.0},
                    {"feature_fraction_bynode": 1.0},
                    {"feature_fraction": 1.0, "feature_fraction_seed": 999}):
-        off = MojoBoostRegressor(n_estimators=30, **kwargs).fit(X, y)
+        off = MojoTreesRegressor(n_estimators=30, **kwargs).fit(X, y)
         assert all(a == b for a, b in zip(pa, off.predict(X))), (
             f"feature subsampling changed the fit when disabled: {kwargs}"
         )
 
     # Same seed, same model, bit for bit; a different seed moves it.
     def sampled(seed, bynode=1.0):
-        return MojoBoostRegressor(
+        return MojoTreesRegressor(
             n_estimators=30,
             feature_fraction=0.4,
             feature_fraction_bynode=bynode,
@@ -439,7 +439,7 @@ def test_feature_fraction():
                 {"feature_fraction_bynode": 0.0},
                 {"feature_fraction_bynode": 2.0}):
         try:
-            MojoBoostRegressor(n_estimators=5, **bad).fit(X, y)
+            MojoTreesRegressor(n_estimators=5, **bad).fit(X, y)
         except ValueError:
             pass
         else:
@@ -447,7 +447,7 @@ def test_feature_fraction():
 
     # Classifiers take the same parameters.
     Xc, yc = make_classification(400, 3, n_features=8)
-    clf = MojoBoostClassifier(
+    clf = MojoTreesClassifier(
         n_estimators=20, feature_fraction=0.5, feature_fraction_bynode=0.8
     ).fit(Xc, yc)
     acc = sum(int(p == t) for p, t in zip(clf.predict(Xc), yc)) / len(yc)
@@ -464,11 +464,11 @@ def test_max_depth():
 
     # The default is unlimited, and every non-positive value means the same
     # thing, so all three must produce the identical ensemble.
-    default = MojoBoostRegressor(n_estimators=40).fit(X, y)
+    default = MojoTreesRegressor(n_estimators=40).fit(X, y)
     assert default.max_depth == -1, "default max_depth must be -1"
     base = list(default.predict(X))
     for unlimited in (-1, 0, -5):
-        other = MojoBoostRegressor(
+        other = MojoTreesRegressor(
             n_estimators=40, max_depth=unlimited
         ).fit(X, y)
         assert all(
@@ -476,27 +476,27 @@ def test_max_depth():
         ), f"max_depth={unlimited} should mean unlimited"
 
     # A limit far above the natural depth is also a no-op.
-    loose = MojoBoostRegressor(n_estimators=40, max_depth=100).fit(X, y)
+    loose = MojoTreesRegressor(n_estimators=40, max_depth=100).fit(X, y)
     assert all(
         a == b for a, b in zip(base, loose.predict(X))
     ), "a max_depth above the tree's depth changed the fit"
 
     # Stumps are strictly weaker than unlimited depth, and relaxing the
     # limit recovers some of the fit.
-    stumps = MojoBoostRegressor(n_estimators=40, max_depth=1).fit(X, y)
+    stumps = MojoTreesRegressor(n_estimators=40, max_depth=1).fit(X, y)
     mse_stumps = mse(stumps)
     mse_deep = mse(default)
-    mse_mid = mse(MojoBoostRegressor(n_estimators=40, max_depth=3).fit(X, y))
+    mse_mid = mse(MojoTreesRegressor(n_estimators=40, max_depth=3).fit(X, y))
     assert mse_stumps > mse_deep, "max_depth=1 did not constrain the fit"
     assert mse_mid < mse_stumps, "raising max_depth did not improve the fit"
 
     # num_leaves=2 permits exactly one split, so the tree is already a stump
     # and max_depth cannot bind further: the two limits compose rather than
     # one overriding the other.
-    by_leaves = MojoBoostRegressor(
+    by_leaves = MojoTreesRegressor(
         n_estimators=40, num_leaves=2, max_depth=-1
     ).fit(X, y)
-    by_depth = MojoBoostRegressor(
+    by_depth = MojoTreesRegressor(
         n_estimators=40, num_leaves=2, max_depth=1
     ).fit(X, y)
     assert all(
@@ -507,7 +507,7 @@ def test_max_depth():
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "depth.mbst")
         stumps.save(path)
-        loaded = MojoBoostRegressor.load(path)
+        loaded = MojoTreesRegressor.load(path)
         assert all(
             a == b for a, b in zip(stumps.predict(X), loaded.predict(X))
         ), "depth-limited model did not round-trip"
@@ -535,8 +535,8 @@ def test_interaction_constraints():
     X, y = make_interaction_regression(700)
 
     # No constraints and one group holding every feature are the same model.
-    plain = MojoBoostRegressor(n_estimators=30).fit(X, y)
-    allowed_all = MojoBoostRegressor(
+    plain = MojoTreesRegressor(n_estimators=30).fit(X, y)
+    allowed_all = MojoTreesRegressor(
         n_estimators=30, interaction_constraints=[[0, 1, 2, 3]]
     ).fit(X, y)
     pa = list(plain.predict(X))
@@ -546,7 +546,7 @@ def test_interaction_constraints():
     ), "one all-feature group changed the fit"
 
     # Splitting the features into two groups must change the fit.
-    split = MojoBoostRegressor(
+    split = MojoTreesRegressor(
         n_estimators=30, interaction_constraints=[[0, 1], [2, 3]]
     ).fit(X, y)
     pc = list(split.predict(X))
@@ -554,7 +554,7 @@ def test_interaction_constraints():
 
     # Constrained to feature 0 alone, every other feature is unlisted and so
     # never split on: predictions cannot move when they change.
-    only_0 = MojoBoostRegressor(
+    only_0 = MojoTreesRegressor(
         n_estimators=30, interaction_constraints=[[0]]
     ).fit(X, y)
     base = list(only_0.predict(X))
@@ -569,14 +569,14 @@ def test_interaction_constraints():
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "constrained.mbst")
         split.save(path)
-        loaded = MojoBoostRegressor.load(path)
+        loaded = MojoTreesRegressor.load(path)
         assert all(
             a == b for a, b in zip(pc, list(loaded.predict(X)))
         ), "round-trip not exact"
 
     # And a classifier takes the same parameter.
     Xc, yc = make_classification(500, 2)
-    clf = MojoBoostClassifier(
+    clf = MojoTreesClassifier(
         n_estimators=25, interaction_constraints=[[0, 1], [2, 3]]
     ).fit(Xc, yc)
     assert len(list(clf.predict(Xc))) == len(yc)
@@ -594,7 +594,7 @@ def test_interaction_constraint_validation():
         [0, 1],            # groups, not a flat list
     ):
         try:
-            MojoBoostRegressor(
+            MojoTreesRegressor(
                 n_estimators=5, interaction_constraints=bad
             ).fit(X, y)
             raise AssertionError(f"{bad!r} should raise")
@@ -633,7 +633,7 @@ def test_monotone_constraints():
 
     # Unconstrained, the fit must break both orderings, so the checks below
     # are not passing on data that was already monotone.
-    plain = MojoBoostRegressor(n_estimators=30).fit(X, y)
+    plain = MojoTreesRegressor(n_estimators=30).fit(X, y)
     pg = _predict_probe_grid(plain, xs)
     assert any(
         pg[i][j] > pg[i + 1][j]
@@ -641,7 +641,7 @@ def test_monotone_constraints():
         for i in range(len(xs) - 1)
     ), "unconstrained fit was already nondecreasing in feature 0"
 
-    model = MojoBoostRegressor(
+    model = MojoTreesRegressor(
         n_estimators=30, monotone_constraints=[1, -1]
     ).fit(X, y)
     grid = _predict_probe_grid(model, xs)
@@ -657,7 +657,7 @@ def test_monotone_constraints():
             )
 
     # An all-zero vector is unconstrained, bit for bit.
-    zeros = MojoBoostRegressor(
+    zeros = MojoTreesRegressor(
         n_estimators=30, monotone_constraints=[0, 0]
     ).fit(X, y)
     assert all(
@@ -669,7 +669,7 @@ def test_monotone_constraints():
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "monotone.mbst")
         model.save(path)
-        loaded = MojoBoostRegressor.load(path)
+        loaded = MojoTreesRegressor.load(path)
         before = list(model.predict(X))
         after = list(loaded.predict(X))
     assert all(a == b for a, b in zip(before, after)), "round-trip not exact"
@@ -678,7 +678,7 @@ def test_monotone_constraints():
     # carries the guarantee through to the probability.
     Xc = [list(r) for r in X]
     yc = [1 if t > 0.0 else 0 for t in y]
-    clf = MojoBoostClassifier(
+    clf = MojoTreesClassifier(
         n_estimators=25, monotone_constraints=[1, -1]
     ).fit(Xc, yc)
     proba = [list(p) for p in clf.predict_proba([[a, 0.5] for a in xs])]
@@ -697,7 +697,7 @@ def test_monotone_constraint_validation():
         "1,-1",            # LightGBM's string form is not accepted
     ):
         try:
-            MojoBoostRegressor(
+            MojoTreesRegressor(
                 n_estimators=5, monotone_constraints=bad
             ).fit(X, y)
             raise AssertionError(f"{bad!r} should raise")
@@ -708,23 +708,23 @@ def test_monotone_constraint_validation():
 
 def test_device_cpu_and_auto():
     X, y = make_regression(400)
-    cpu = MojoBoostRegressor(n_estimators=20, device="cpu").fit(X, y)
+    cpu = MojoTreesRegressor(n_estimators=20, device="cpu").fit(X, y)
     assert cpu.device_ == "cpu"
 
     # auto resolves to the CPU today (the size heuristic ships disabled),
     # so it must be bit-identical to an explicit cpu fit.
-    auto = MojoBoostRegressor(n_estimators=20, device="auto").fit(X, y)
+    auto = MojoTreesRegressor(n_estimators=20, device="auto").fit(X, y)
     assert auto.device_ == "cpu", f"auto chose {auto.device_}"
     assert all(
         a == b for a, b in zip(cpu.predict(X), auto.predict(X))
     ), "auto and cpu disagree"
 
     # The default is cpu, and it survives a refit.
-    default = MojoBoostRegressor(n_estimators=20).fit(X, y)
+    default = MojoTreesRegressor(n_estimators=20).fit(X, y)
     assert default.device == "cpu" and default.device_ == "cpu"
     assert all(a == b for a, b in zip(cpu.predict(X), default.predict(X)))
 
-    clf = MojoBoostClassifier(n_estimators=20, device="auto").fit(
+    clf = MojoTreesClassifier(n_estimators=20, device="auto").fit(
         *make_classification(400, 3)
     )
     assert clf.device_ == "cpu"
@@ -735,18 +735,18 @@ def test_device_gpu():
     X, y = make_regression(300)
     if not gpu_available():
         try:
-            MojoBoostRegressor(n_estimators=10, device="gpu").fit(X, y)
+            MojoTreesRegressor(n_estimators=10, device="gpu").fit(X, y)
             raise AssertionError("gpu without an accelerator should raise")
         except RuntimeError:
             pass
         print("device gpu ok (no accelerator: explicit gpu raises)")
         return
 
-    gpu = MojoBoostRegressor(n_estimators=10, device="gpu").fit(X, y)
+    gpu = MojoTreesRegressor(n_estimators=10, device="gpu").fit(X, y)
     assert gpu.device_ == "gpu"
-    cpu = MojoBoostRegressor(n_estimators=10, device="cpu").fit(X, y)
+    cpu = MojoTreesRegressor(n_estimators=10, device="cpu").fit(X, y)
     # GPU histograms are Float32 fixed-point, so agreement with the Float64
-    # CPU trainer is tolerance-based (see src/mojoboost/train_gpu.mojo).
+    # CPU trainer is tolerance-based (see src/mojotrees/train_gpu.mojo).
     worst = max(
         abs(a - b) for a, b in zip(gpu.predict(X), cpu.predict(X))
     )
@@ -754,15 +754,15 @@ def test_device_gpu():
 
     # Binary is single-output, so it has a GPU path.
     Xb, yb = make_classification(300, 2)
-    binary = MojoBoostClassifier(n_estimators=10, device="gpu").fit(Xb, yb)
+    binary = MojoTreesClassifier(n_estimators=10, device="gpu").fit(Xb, yb)
     assert binary.device_ == "gpu"
 
     # Multiclass trains one class per round through the GPU trainer, so it
     # gets the same tolerance-based CPU agreement as the regressor above.
     Xc, yc = make_classification(300, 3)
-    multi = MojoBoostClassifier(n_estimators=5, device="gpu").fit(Xc, yc)
+    multi = MojoTreesClassifier(n_estimators=5, device="gpu").fit(Xc, yc)
     assert multi.device_ == "gpu"
-    multi_cpu = MojoBoostClassifier(n_estimators=5, device="cpu").fit(Xc, yc)
+    multi_cpu = MojoTreesClassifier(n_estimators=5, device="cpu").fit(Xc, yc)
     worst_mc = max(
         abs(a - b)
         for gpu_row, cpu_row in zip(
@@ -777,26 +777,26 @@ def test_device_gpu():
 
 
 def test_device_gpu_unavailable():
-    """MOJOBOOST_DISABLE_GPU makes the library report no accelerator, so the
+    """MOJOTREES_DISABLE_GPU makes the library report no accelerator, so the
     unavailable path is covered on GPU machines too."""
     X, y = make_regression(200)
-    previous = os.environ.get("MOJOBOOST_DISABLE_GPU")
-    os.environ["MOJOBOOST_DISABLE_GPU"] = "1"
+    previous = os.environ.get("MOJOTREES_DISABLE_GPU")
+    os.environ["MOJOTREES_DISABLE_GPU"] = "1"
     try:
         assert not gpu_available()
         try:
-            MojoBoostRegressor(n_estimators=5, device="gpu").fit(X, y)
+            MojoTreesRegressor(n_estimators=5, device="gpu").fit(X, y)
             raise AssertionError("unavailable gpu should raise")
         except RuntimeError:
             pass
         # auto stays usable and picks the CPU.
-        auto = MojoBoostRegressor(n_estimators=5, device="auto").fit(X, y)
+        auto = MojoTreesRegressor(n_estimators=5, device="auto").fit(X, y)
         assert auto.device_ == "cpu"
     finally:
         if previous is None:
-            del os.environ["MOJOBOOST_DISABLE_GPU"]
+            del os.environ["MOJOTREES_DISABLE_GPU"]
         else:
-            os.environ["MOJOBOOST_DISABLE_GPU"] = previous
+            os.environ["MOJOTREES_DISABLE_GPU"] = previous
     print("device unavailable-gpu ok")
 
 
@@ -804,13 +804,13 @@ def test_device_invalid():
     X, y = make_regression(100)
     for bad in ("cuda", "", None, 1, "gpu ", "CPU!"):
         try:
-            MojoBoostRegressor(n_estimators=5, device=bad).fit(X, y)
+            MojoTreesRegressor(n_estimators=5, device=bad).fit(X, y)
             raise AssertionError(f"device={bad!r} should raise")
         except ValueError:
             pass
 
     # Names are case-insensitive, as LightGBM treats device_type.
-    upper = MojoBoostRegressor(n_estimators=5, device="CPU").fit(X, y)
+    upper = MojoTreesRegressor(n_estimators=5, device="CPU").fit(X, y)
     assert upper.device_ == "cpu"
     print("device validation ok")
 
@@ -821,13 +821,13 @@ def test_device_serialization():
     X, y = make_regression(300)
     devices = ["cpu"] + (["gpu"] if gpu_available() else [])
     for device in devices:
-        model = MojoBoostRegressor(n_estimators=10, device=device).fit(X, y)
+        model = MojoTreesRegressor(n_estimators=10, device=device).fit(X, y)
         assert model.device_ == device
         pred = list(model.predict(X))
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, f"{device}.mbst")
             model.save(path)
-            loaded = MojoBoostRegressor.load(path)
+            loaded = MojoTreesRegressor.load(path)
             assert list(loaded.predict(X)) == pred, "round-trip not exact"
             assert not hasattr(loaded, "device_"), (
                 "a loaded model should carry no training device"
@@ -849,8 +849,8 @@ def test_custom_objective_matches_builtin():
     """A custom objective that computes the built-in objective's derivatives,
     started from the same base score, must reproduce it bit for bit."""
     X, y = make_regression(600)
-    builtin = MojoBoostRegressor(n_estimators=40).fit(X, y)
-    custom = MojoBoostRegressor(
+    builtin = MojoTreesRegressor(n_estimators=40).fit(X, y)
+    custom = MojoTreesRegressor(
         objective=_custom_squared_error, base_score="mean", n_estimators=40
     ).fit(X, y)
     pa = list(builtin.predict(X))
@@ -865,8 +865,8 @@ def test_custom_objective_matches_builtin():
     # weighted fits match too.
     w = [1.0 + (i % 5) for i in range(len(y))]
     w[3] = 0.0
-    bw = MojoBoostRegressor(n_estimators=40).fit(X, y, sample_weight=w)
-    cw = MojoBoostRegressor(
+    bw = MojoTreesRegressor(n_estimators=40).fit(X, y, sample_weight=w)
+    cw = MojoTreesRegressor(
         objective=_custom_squared_error, base_score="mean", n_estimators=40
     ).fit(X, y, sample_weight=w)
     assert list(bw.predict(X)) == list(cw.predict(X)), (
@@ -878,27 +878,27 @@ def test_custom_objective_matches_builtin():
 def test_custom_objective_base_score():
     """base_score defaults to 0 and is the raw score training starts from."""
     X, y = make_regression(300)
-    zero = MojoBoostRegressor(
+    zero = MojoTreesRegressor(
         objective=_custom_squared_error, n_estimators=0
     ).fit(X, y)
     for p in list(zero.predict(X))[:20]:
         assert p == 0.0, f"expected base score 0.0, got {p}"
 
-    fixed = MojoBoostRegressor(
+    fixed = MojoTreesRegressor(
         objective=_custom_squared_error, base_score=2.5, n_estimators=0
     ).fit(X, y)
     for p in list(fixed.predict(X))[:20]:
         assert p == 2.5, f"expected base score 2.5, got {p}"
 
     mean_y = sum(y) / len(y)
-    averaged = MojoBoostRegressor(
+    averaged = MojoTreesRegressor(
         objective=_custom_squared_error, base_score="mean", n_estimators=0
     ).fit(X, y)
     for p in list(averaged.predict(X))[:20]:
         assert abs(p - mean_y) < 1e-12, f"expected {mean_y}, got {p}"
 
     try:
-        MojoBoostRegressor(
+        MojoTreesRegressor(
             objective=_custom_squared_error, base_score="median"
         ).fit(X, y)
         raise AssertionError("unknown base_score should raise")
@@ -939,7 +939,7 @@ def test_custom_objective_validation():
         (explodes, "callback blew up"),
     ):
         try:
-            MojoBoostRegressor(objective=objective, n_estimators=5).fit(X, y)
+            MojoTreesRegressor(objective=objective, n_estimators=5).fit(X, y)
             raise AssertionError(f"{objective.__name__} should raise")
         except AssertionError:
             raise
@@ -955,7 +955,7 @@ def test_custom_objective_is_single_output():
     takes no objective and says why."""
     X, y = make_classification(300, 3)
     try:
-        MojoBoostClassifier(
+        MojoTreesClassifier(
             objective=_custom_squared_error, n_estimators=5
         ).fit(X, y)
         raise AssertionError("classifier should reject a custom objective")
@@ -964,7 +964,7 @@ def test_custom_objective_is_single_output():
 
     Xb, yb = make_classification(300, 2)
     try:
-        MojoBoostClassifier(
+        MojoTreesClassifier(
             objective=_custom_squared_error, n_estimators=5
         ).fit(Xb, yb)
         raise AssertionError("classifier should reject a custom objective")
@@ -977,14 +977,14 @@ def test_custom_objective_serialization():
     """A custom-objective model is an ordinary tree ensemble on disk, and a
     loaded one predicts identically."""
     X, y = make_regression(300)
-    model = MojoBoostRegressor(
+    model = MojoTreesRegressor(
         objective=_custom_squared_error, base_score="mean", n_estimators=20
     ).fit(X, y)
     pred = list(model.predict(X))
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "custom.mbst")
         model.save(path)
-        loaded = MojoBoostRegressor.load(path)
+        loaded = MojoTreesRegressor.load(path)
         assert list(loaded.predict(X)) == pred, "round-trip not exact"
     print("custom objective serialization ok")
 
@@ -1002,7 +1002,7 @@ def test_custom_objective_sees_current_predictions():
             return raw - _np.asarray(labels), _np.ones(len(raw))
         return [a - b for a, b in zip(raw, labels)], [1.0] * len(raw)
 
-    MojoBoostRegressor(
+    MojoTreesRegressor(
         objective=record_first, base_score="mean", n_estimators=10
     ).fit(X, y)
     assert len(seen) == 10, f"expected one call per round, got {len(seen)}"
@@ -1011,7 +1011,7 @@ def test_custom_objective_sees_current_predictions():
 
 
 def test_input_validation():
-    model = MojoBoostRegressor()
+    model = MojoTreesRegressor()
     try:
         model.predict([[1.0]])
         raise AssertionError("predict before fit should raise")
@@ -1019,13 +1019,13 @@ def test_input_validation():
         pass
     # Gappy labels are no longer an error: they are encoded to 0..k-1 and
     # remembered on classes_, the way a scikit-learn classifier does it.
-    gappy = MojoBoostClassifier(min_data_in_leaf=1).fit(
+    gappy = MojoTreesClassifier(min_data_in_leaf=1).fit(
         [[1.0], [2.0]], [1, 3]
     )
     assert list(gappy.classes_) == [1, 3]
     assert set(gappy.predict([[1.0], [2.0]])) <= {1, 3}
     try:
-        MojoBoostClassifier().fit([[1.0], [2.0]], [1, 1])
+        MojoTreesClassifier().fit([[1.0], [2.0]], [1, 1])
         raise AssertionError("a single class should raise")
     except ValueError:
         pass
@@ -1041,12 +1041,12 @@ def test_input_validation():
         dict(max_bin=1),
     ):
         try:
-            MojoBoostRegressor(**bad).fit([[1.0], [2.0]], [1.0, 2.0])
+            MojoTreesRegressor(**bad).fit([[1.0], [2.0]], [1.0, 2.0])
             raise AssertionError(f"{bad} should raise")
         except ValueError:
             pass
     try:
-        MojoBoostRegressor().fit(
+        MojoTreesRegressor().fit(
             [[1.0], [2.0]], [1.0, 2.0], sample_weight=[0.0, 0.0]
         )
         raise AssertionError("all-zero sample_weight should raise")
@@ -1063,7 +1063,7 @@ def test_input_validation():
         "mean_absolute_error",
         "mean_absolute_percentage_error",
     ):
-        MojoBoostRegressor(
+        MojoTreesRegressor(
             objective=ok, n_estimators=2, min_data_in_leaf=1
         ).fit([[1.0], [2.0], [3.0]], [1.0, 2.0, 3.0])
     print("validation ok")
@@ -1090,7 +1090,7 @@ def make_ranking(n_queries, docs=6, n_features=4, seed=23):
 
 def test_ranker():
     X, y, group = make_ranking(120)
-    model = MojoBoostRanker(n_estimators=40, min_data_in_leaf=5)
+    model = MojoTreesRanker(n_estimators=40, min_data_in_leaf=5)
     assert model.fit(X, y, group=group) is model
     assert model.n_features_in_ == 4
 
@@ -1108,7 +1108,7 @@ def test_ranker():
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "rank.mbst")
         model.save(path)
-        loaded = MojoBoostRanker.load(path)
+        loaded = MojoTreesRanker.load(path)
         pred2 = list(loaded.predict(X))
     assert all(a == b for a, b in zip(pred, pred2)), "round-trip not exact"
     print(f"ranker ok (train NDCG@5 {trained:.5f})")
@@ -1117,10 +1117,10 @@ def test_ranker():
 def test_ranker_query_bagging_and_weights():
     X, y, group = make_ranking(80)
 
-    plain = MojoBoostRanker(n_estimators=20, min_data_in_leaf=5).fit(
+    plain = MojoTreesRanker(n_estimators=20, min_data_in_leaf=5).fit(
         X, y, group=group
     )
-    ones = MojoBoostRanker(n_estimators=20, min_data_in_leaf=5).fit(
+    ones = MojoTreesRanker(n_estimators=20, min_data_in_leaf=5).fit(
         X, y, group=group, sample_weight=[1.0] * len(y)
     )
     pa = list(plain.predict(X[:40]))
@@ -1129,7 +1129,7 @@ def test_ranker_query_bagging_and_weights():
 
     # Query bagging is reproducible from the seed and still learns.
     bagged = [
-        MojoBoostRanker(
+        MojoTreesRanker(
             n_estimators=20,
             min_data_in_leaf=5,
             bagging_fraction=0.5,
@@ -1177,19 +1177,19 @@ def test_ranker_validation():
     n_rows = len(y)
 
     try:
-        MojoBoostRanker().fit(X, y)
+        MojoTreesRanker().fit(X, y)
         raise AssertionError("missing group should raise")
     except ValueError:
         pass
     for bad in ([n_rows - 1], [0] * 4, [2.5] * (n_rows // 2), []):
         try:
-            MojoBoostRanker().fit(X, y, group=bad)
+            MojoTreesRanker().fit(X, y, group=bad)
             raise AssertionError(f"group {bad} should raise")
         except ValueError:
             pass
     for bad_y in ([-1] + y[1:], [31] + y[1:], [0.5] + y[1:]):
         try:
-            MojoBoostRanker().fit(X, bad_y, group=group)
+            MojoTreesRanker().fit(X, bad_y, group=group)
             raise AssertionError("bad relevance labels should raise")
         except ValueError:
             pass
@@ -1199,12 +1199,12 @@ def test_ranker_validation():
         dict(ndcg_eval_at=0),
     ):
         try:
-            MojoBoostRanker(**bad).fit(X, y, group=group)
+            MojoTreesRanker(**bad).fit(X, y, group=group)
             raise AssertionError(f"{bad} should raise")
         except ValueError:
             pass
     try:
-        MojoBoostRanker().predict(X)
+        MojoTreesRanker().predict(X)
         raise AssertionError("predict before fit should raise")
     except RuntimeError:
         pass
@@ -1334,8 +1334,8 @@ def test_sparse_regressor_matches_dense():
     csc = _to_sparse(A, "csc")
     csr = _to_sparse(A, "csr")
 
-    dense = MojoBoostRegressor(n_estimators=25, num_leaves=10).fit(A, y)
-    sparse = MojoBoostRegressor(n_estimators=25, num_leaves=10).fit(csc, y)
+    dense = MojoTreesRegressor(n_estimators=25, num_leaves=10).fit(A, y)
+    sparse = MojoTreesRegressor(n_estimators=25, num_leaves=10).fit(csc, y)
     assert sparse.n_features_in_ == 10
     assert sparse.device_ == "cpu"
 
@@ -1353,7 +1353,7 @@ def test_sparse_does_not_mutate_input():
     messy = _to_sparse(A, "csc")
     messy.has_canonical_format = False
     before = list(messy.indices)
-    MojoBoostRegressor(n_estimators=3).fit(messy, y)
+    MojoTreesRegressor(n_estimators=3).fit(messy, y)
     assert list(messy.indices) == before, "fit mutated the caller's matrix"
     print("sparse input not mutated ok")
 
@@ -1364,16 +1364,16 @@ def test_sparse_classifier_matches_dense():
     csr = _to_sparse(A, "csr")
 
     binary = [1 if t > 0.0 else 0 for t in y]
-    dense = MojoBoostClassifier(n_estimators=20, num_leaves=8).fit(A, binary)
-    sparse = MojoBoostClassifier(n_estimators=20, num_leaves=8).fit(csc, binary)
+    dense = MojoTreesClassifier(n_estimators=20, num_leaves=8).fit(A, binary)
+    sparse = MojoTreesClassifier(n_estimators=20, num_leaves=8).fit(csc, binary)
     assert sparse.n_classes_ == 2
     for a, b in zip(dense.predict_proba(A), sparse.predict_proba(csr)):
         assert _max_gap(a, b) < 1e-9
     assert list(dense.predict(A)) == list(sparse.predict(csr))
 
     three = [0 if t < -1.0 else (1 if t < 1.0 else 2) for t in y]
-    dense3 = MojoBoostClassifier(n_estimators=12, num_leaves=8).fit(A, three)
-    sparse3 = MojoBoostClassifier(n_estimators=12, num_leaves=8).fit(csc, three)
+    dense3 = MojoTreesClassifier(n_estimators=12, num_leaves=8).fit(A, three)
+    sparse3 = MojoTreesClassifier(n_estimators=12, num_leaves=8).fit(csc, three)
     assert sparse3.n_classes_ == 3
     for a, b in zip(dense3.predict_proba(A), sparse3.predict_proba(csr)):
         assert _max_gap(a, b) < 1e-9
@@ -1386,8 +1386,8 @@ def test_sparse_sample_weight_and_missing():
     csc = _to_sparse(A, "csc")
     csr = _to_sparse(A, "csr")
     w = [0.5 + (i % 7) / 7.0 for i in range(len(y))]
-    dense = MojoBoostRegressor(n_estimators=15).fit(A, y, sample_weight=w)
-    sparse = MojoBoostRegressor(n_estimators=15).fit(csc, y, sample_weight=w)
+    dense = MojoTreesRegressor(n_estimators=15).fit(A, y, sample_weight=w)
+    sparse = MojoTreesRegressor(n_estimators=15).fit(csc, y, sample_weight=w)
     assert _max_gap(dense.predict(A), sparse.predict(csr)) < 1e-9
 
     # NaN is still the missing marker; the implicit zeros are not missing.
@@ -1400,8 +1400,8 @@ def test_sparse_sample_weight_and_missing():
                 k += 1
                 if k % 5 == 0:
                     row[f] = nan
-    dense_n = MojoBoostRegressor(n_estimators=15).fit(An, y)
-    sparse_n = MojoBoostRegressor(n_estimators=15).fit(
+    dense_n = MojoTreesRegressor(n_estimators=15).fit(An, y)
+    sparse_n = MojoTreesRegressor(n_estimators=15).fit(
         _to_sparse(An, "csc"), y
     )
     assert (
@@ -1415,12 +1415,12 @@ def test_sparse_save_load():
     A, y = make_sparse_regression(300)
     csc = _to_sparse(A, "csc")
     csr = _to_sparse(A, "csr")
-    model = MojoBoostRegressor(n_estimators=15).fit(csc, y)
+    model = MojoTreesRegressor(n_estimators=15).fit(csc, y)
     before = list(model.predict(csr))
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "sparse.mbst")
         model.save(path)
-        loaded = MojoBoostRegressor.load(path)
+        loaded = MojoTreesRegressor.load(path)
         after = list(loaded.predict(csr))
     # A sparse fit produces an ordinary model: nothing about the serialized
     # format changes, and the round trip stays bit-exact.
@@ -1434,7 +1434,7 @@ def test_sparse_validation():
 
     # No sparse GPU kernel, and no silent densification.
     try:
-        MojoBoostRegressor(device="gpu").fit(csc, y)
+        MojoTreesRegressor(device="gpu").fit(csc, y)
         raise AssertionError("device='gpu' should raise for sparse input")
     except RuntimeError as exc:
         # An accelerator-enabled build reaches the sparse capability check;
@@ -1444,13 +1444,13 @@ def test_sparse_validation():
 
     # Custom objectives are dense-only for now.
     try:
-        MojoBoostRegressor(objective=lambda raw, t: (raw, raw)).fit(csc, y)
+        MojoTreesRegressor(objective=lambda raw, t: (raw, raw)).fit(csc, y)
         raise AssertionError("custom objective should raise for sparse input")
     except TypeError as exc:
         assert "sparse" in str(exc)
 
     # Prediction still checks the feature count.
-    model = MojoBoostRegressor(n_estimators=5).fit(csc, y)
+    model = MojoTreesRegressor(n_estimators=5).fit(csc, y)
     narrow = _to_sparse([row[:3] for row in A], "csr")
     try:
         model.predict(narrow)

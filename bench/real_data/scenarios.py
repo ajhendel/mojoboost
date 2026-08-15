@@ -9,18 +9,18 @@ one place, with the reason written next to it.
 
 The alignment, and why each entry is here:
 
-- `lambda_l2 = 1.0`. mojoboost defaults to 1.0 and LightGBM to 0.0, so this
+- `lambda_l2 = 1.0`. mojotrees defaults to 1.0 and LightGBM to 0.0, so this
   has to be set explicitly on both sides or the comparison is between two
   different regularisers. The rest of bench/ uses 1.0 and so does this.
 - `enable_bundle = false` for LightGBM. Exclusive feature bundling merges
-  sparse features before binning. mojoboost has no EFB, so leaving it on
+  sparse features before binning. mojotrees has no EFB, so leaving it on
   compares two different feature spaces.
 - `feature_pre_filter = false` for LightGBM. On by default, it deletes
   features that cannot satisfy `min_data_in_leaf` at Dataset construction
-  time. That is a data change, not a training change, and mojoboost does
+  time. That is a data change, not a training change, and mojotrees does
   not do it.
 - `bin_construct_sample_cnt` raised to the training row count. LightGBM
-  builds bin edges from a 200000-row subsample by default; mojoboost bins
+  builds bin edges from a 200000-row subsample by default; mojotrees bins
   from every row. Left alone this is the largest single source of split
   divergence on anything above 200000 rows, and it also makes LightGBM's
   binning time look better than a like-for-like measurement would.
@@ -34,7 +34,7 @@ The alignment, and why each entry is here:
 - `deterministic = true` and a fixed `seed` for LightGBM, so a repeat run
   is a repeat run.
 - Threads are matched by count, not by parameter name: LightGBM reads
-  `num_threads`, mojoboost reads the MOJOBOOST_NUM_WORKERS environment
+  `num_threads`, mojotrees reads the MOJOTREES_NUM_WORKERS environment
   variable, and the runner sets both from one number before either library
   is imported.
 
@@ -46,7 +46,7 @@ difference is the failure mode this file exists to prevent.
 import copy
 
 #: Parameters both engines get, under the names both engines accept.
-#: These are LightGBM's defaults except for lambda_l2, which is mojoboost's.
+#: These are LightGBM's defaults except for lambda_l2, which is mojotrees's.
 BASE_PARAMS = {
     "num_leaves": 31,
     "max_depth": -1,
@@ -104,7 +104,7 @@ def _scenario(**kw):
     kw.setdefault("params", {})
     kw.setdefault("caveats", [])
     kw.setdefault("devices", ["cpu"])
-    kw.setdefault("engines", ["mojoboost", "lightgbm"])
+    kw.setdefault("engines", ["mojotrees", "lightgbm"])
     return kw
 
 
@@ -198,7 +198,7 @@ SCENARIOS = {
         ),
         caveats=[
             "Ranking models are the least likely to match closely. LightGBM "
-            "reads its pairwise sigmoid from a lookup table where mojoboost "
+            "reads its pairwise sigmoid from a lookup table where mojotrees "
             "evaluates it, so the two diverge at the first tie and the "
             "thresholds for this scenario are correspondingly loose.",
             "The real dataset is acquired manually, so a run without it "
@@ -253,12 +253,12 @@ SCENARIOS = {
             "entries from one that does not."
         ),
         caveats=[
-            "mojoboost trains on sparse input through the estimator's CSC "
+            "mojotrees trains on sparse input through the estimator's CSC "
             "path, which does not take an eval_set and reports device 'cpu' "
             "whatever the device parameter says. So this scenario is CPU "
             "only on both sides and has no early stopping.",
             "The estimator bins inside fit on this path, so binning time "
-            "cannot be separated from training time for mojoboost here. The "
+            "cannot be separated from training time for mojotrees here. The "
             "record carries binning_s = null with that reason, rather than "
             "an estimate.",
         ],
@@ -308,7 +308,7 @@ def lightgbm_params(spec, threads, extra=None):
 
     `bin_construct_sample_cnt` is filled in by the caller through `extra`
     once the training row count is known, because it has to be at least
-    that count for LightGBM to bin from every row the way mojoboost does.
+    that count for LightGBM to bin from every row the way mojotrees does.
     """
     shared = shared_params(spec, extra)
     params = {
@@ -340,12 +340,12 @@ def lightgbm_params(spec, threads, extra=None):
     return params
 
 
-def mojoboost_params(spec, device, extra=None):
-    """`shared_params` translated into a mojoboost parameter dict for
-    `mojoboost.train`.
+def mojotrees_params(spec, device, extra=None):
+    """`shared_params` translated into a mojotrees parameter dict for
+    `mojotrees.train`.
 
-    Thread count is deliberately absent. mojoboost takes it from
-    MOJOBOOST_NUM_WORKERS, which the runner sets in the environment before
+    Thread count is deliberately absent. mojotrees takes it from
+    MOJOTREES_NUM_WORKERS, which the runner sets in the environment before
     the extension is imported, and a parameter here would suggest there are
     two ways to set it.
     """

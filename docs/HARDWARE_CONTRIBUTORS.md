@@ -5,7 +5,7 @@ Contributor protocol version 1.0.0. Record schema
 version 1.0.0. Capture scripts
 [`hardware/capture/`](../hardware/capture/), version 1.0.0.
 
-mojoboost has one GPU source for Metal, CUDA, and HIP. No CUDA file, no HIP
+mojotrees has one GPU source for Metal, CUDA, and HIP. No CUDA file, no HIP
 file, no Metal file, and no vendor branch anywhere in it. That is a design
 commitment, and it is worth exactly as much as the evidence that the one source
 is correct on every backend it claims to target.
@@ -63,7 +63,7 @@ repeated here, because a copy would drift.
 **1. Get the code.** A clean tree at a commit you can name.
 
 ```sh
-git clone https://github.com/mojoboost-ml/mojoboost && cd mojoboost
+git clone https://github.com/mojotrees/mojotrees && cd mojotrees
 curl -fsSL https://pixi.sh/install.sh | sh
 pixi install
 git rev-parse HEAD
@@ -96,10 +96,10 @@ terminal scrollback into one. Do not summarize it, do not round a number, do not
 retype a figure from memory.
 
 **6. Submit.** Open the
-[hardware result issue](https://github.com/mojoboost-ml/mojoboost/issues/new?template=hardware_result.yml),
+[hardware result issue](https://github.com/mojotrees/mojotrees/issues/new?template=hardware_result.yml),
 paste the record, and attach the raw output files by dragging them into the
 issue. If you would rather write prose than JSON, the older
-[accelerator validation report](https://github.com/mojoboost-ml/mojoboost/issues/new?template=hardware_validation.yml)
+[accelerator validation report](https://github.com/mojotrees/mojotrees/issues/new?template=hardware_validation.yml)
 form is still there and still accepted; the machine-readable form exists because
 it makes conflicting results comparable, not because prose is unwelcome.
 
@@ -113,7 +113,7 @@ the missing field.
   `gfx1100`, compute capability 8.9, `4-metal4`. The marketing name does not
   transfer between boards; the architecture does.
 - **Host.** CPU model, core count, memory, OS name and version, OS build or
-  distribution release, kernel, architecture. mojoboost bins on the CPU and
+  distribution release, kernel, architecture. mojotrees bins on the CPU and
   stages every transfer through host memory, so the host is part of every
   timing.
 - **Driver.** Version, from `nvidia-smi`, `rocm-smi`, or the macOS build for
@@ -190,7 +190,7 @@ anybody, including maintainers.
 ## Failures and unsupported are results
 
 The most valuable submission this project could receive right now is somebody
-reporting that mojoboost does not build on their card, with the exact error and
+reporting that mojotrees does not build on their card, with the exact error and
 the ROCm or driver version that produced it. Nobody has filed one, and the reason
 is that failure feels like a non-result. It is not.
 
@@ -219,7 +219,7 @@ Contributed records are committed to this repository and redistributed with it,
 so a grant is required before anything can be accepted.
 
 By submitting a record you license it, its raw output, and the numbers in it for
-inclusion in mojoboost under the **Apache License 2.0**, the repository's
+inclusion in mojotrees under the **Apache License 2.0**, the repository's
 license, with attribution to the account you submitted from. The issue form
 carries this as a required checkbox and the record carries it as the `license`
 block.

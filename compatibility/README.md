@@ -1,6 +1,6 @@
 # compatibility/
 
-The machine-readable half of mojoboost's compatibility contract. The prose
+The machine-readable half of mojotrees's compatibility contract. The prose
 half is [docs/COMPATIBILITY_POLICY.md](../docs/COMPATIBILITY_POLICY.md)
 and [docs/DEPRECATION_POLICY.md](../docs/DEPRECATION_POLICY.md); those two
 say what is promised, and the files here are what a tool can fail on.

@@ -22,14 +22,14 @@ imports the package or builds anything.
 ## How a module gets counted
 
 `tools/connectivity_audit.py` computes the import closure of
-`src/mojoboost/*.mojo` from four shipping roots:
+`src/mojotrees/*.mojo` from four shipping roots:
 
 | Root | Label |
 |---|---|
-| `src/mojoboost/__init__.mojo` | `mojo-api` |
-| `bindings/_mojoboost.mojo` | `bindings` |
-| `capi/mojoboost_capi.mojo` | `c-abi` |
-| `cli/mojoboost_cli.mojo` | `cli` |
+| `src/mojotrees/__init__.mojo` | `mojo-api` |
+| `bindings/_mojotrees.mojo` | `bindings` |
+| `capi/mojotrees_capi.mojo` | `c-abi` |
+| `cli/mojotrees_cli.mojo` | `cli` |
 
 A module no root reaches is an **orphan**. `tests/` and `bench/` are
 followed too, but only to annotate: a module reached from a test and from
@@ -87,23 +87,23 @@ costs:
   parity contract can say `focused-tested: yes` and `integrated: no` in the
   same row without contradicting itself.
 - **Named but not imported.** `linear_tree` and `cegb` have their parameter
-  names parsed in `src/mojoboost/params.mojo`, so a user can set them and
+  names parsed in `src/mojotrees/params.mojo`, so a user can set them and
   nothing happens. A parameter that parses is not a capability that runs,
   and this is the failure mode the `integrated` column exists to catch.
 
 Between commit `860b1cf` and this snapshot a connecting lane reached seven
 modules that were orphans in the previous revision: `gpu_binned_layout` and
-`gpu_bin_packing` (now imported by `src/mojoboost/histogram_gpu.mojo` and
-re-exported from `src/mojoboost/__init__.mojo`), `gpu_portability` and
+`gpu_bin_packing` (now imported by `src/mojotrees/histogram_gpu.mojo` and
+re-exported from `src/mojotrees/__init__.mojo`), `gpu_portability` and
 `gpu_backend_policy`, `gpu_multiclass_batch`, and `hybrid_leaf_scheduler`
 with `histogram_cache_policy` (now imported by
-`src/mojoboost/gpu_runtime.mojo`). Reached is not called, so each was read
+`src/mojotrees/gpu_runtime.mojo`). Reached is not called, so each was read
 for a call site rather than promoted as a group, and they did not land in
 the same place. `gpu_portability` is called: `histogram_gpu` opens its
 builder through `require_bins_supported`,
 `require_device_can_host_kernels`, and `require_histogram_launchable`, which
 replaced hand-rolled checks, and `gpu_backend_policy` answers underneath it.
-`gpu_multiclass_batch` is called, behind `MOJOBOOST_GPU_CLASS_BATCH`, and
+`gpu_multiclass_batch` is called, behind `MOJOTREES_GPU_CLASS_BATCH`, and
 its parity row moved from `deferred` to `partial` for that reason. The other
 four are reached and not exercised: `gpu_binned_layout` contributes one
 overflow guard and no packed plan, `gpu_bin_packing` nothing at all,
@@ -116,7 +116,7 @@ longer findings, and removing them is a patch for that file's owner.
 
 ## Binding modules the extension does not register
 
-`_mojoboost.mojo` builds the only `PythonModuleBuilder` in the repository,
+`_mojotrees.mojo` builds the only `PythonModuleBuilder` in the repository,
 so a module it does not import defines nothing a user can call.
 
 | File | What it defines | What stays blocked |
@@ -134,7 +134,7 @@ fallbacks is now three thin formatters over native answers, with the
 fallbacks kept behind `getattr` for an extension built before the change.
 
 One name did not survive that pass. `split_gains` still appears nowhere in
-`bindings/`, so the gain hook `python/mojoboost/inspection.py` probes for
+`bindings/`, so the gain hook `python/mojotrees/inspection.py` probes for
 has no implementation on either side of the seam; it is a missing
 implementation rather than an unregistered one, and the row below is what is
 left of this section.
@@ -142,7 +142,7 @@ left of this section.
 ## Native names Python reaches for that no binding registers
 
 Every one of these is a *degraded path*, not a failure: Python probes with
-`getattr(_mojoboost, name, None)`, gets `None`, and takes a documented
+`getattr(_mojotrees, name, None)`, gets `None`, and takes a documented
 slower route. The fallback is the honest way to ship an unfinished seam.
 It is also the mechanism by which the same question ends up with two
 answers, so each row is a disconnection to close rather than a design to
@@ -150,14 +150,14 @@ keep.
 
 | Native name | Python caller | What happens without it |
 |---|---|---|
-| `split_gains`, `split_gains_multiclass` | `python/mojoboost/inspection.py` | every dumped node carries `split_gain: None` and `has_split_gain: False`, because gains are recorded during growth and never serialized. `_native_split_gains` probes for the hook, finds nothing on either side of the seam, and the dump reports its source as `model_to_string` rather than `model_to_string+split_gains` |
+| `split_gains`, `split_gains_multiclass` | `python/mojotrees/inspection.py` | every dumped node carries `split_gain: None` and `has_split_gain: False`, because gains are recorded during growth and never serialized. `_native_split_gains` probes for the hook, finds nothing on either side of the seam, and the dump reports its source as `model_to_string` rather than `model_to_string+split_gains` |
 
 The rest of this table is gone, and the reason is worth recording rather
 than deleting. At `860b1cf` it held eight rows: `decide_device`,
 `dump_model`, `split_values`, `dump_leaf_index`, `dump_raw_scores`,
 `objective_code`, and the four `registry_*` names. All of them are now in
-the `def_function` table of `bindings/_mojoboost.mojo`. The `getattr` probes
-in `python/mojoboost/inspection.py`, `device_selection.py`, and `_eval.py`
+the `def_function` table of `bindings/_mojotrees.mojo`. The `getattr` probes
+in `python/mojotrees/inspection.py`, `device_selection.py`, and `_eval.py`
 remain, which is correct: they are the compatibility path for an extension
 built from an older tree, and `_eval.registry_source()` and
 `report.contract` still say which implementation answered. A probe that
@@ -171,25 +171,25 @@ finished. Listed here so that a reader of either side finds the other.
 
 | Question | Native, authoritative | Python, in force today |
 |---|---|---|
-| Which backend runs this job | `src/mojoboost/device_policy.mojo` | `explain_device_choice` reaches the full native report now that `decide_device` is bound, but `_Base._resolve_device` still calls `_mojoboost.resolve_device` directly, so what a `fit` actually does is decided by the narrower of the two entry points |
-| What an objective or metric is called | `src/mojoboost/objective_registry.mojo` | the mirror tables in `python/mojoboost/_eval.py` are still present and still the code path when the hooks are absent; `registry_source()` returns `"native"` or `"compat"` and is the only honest way to say which one answered |
-| What a model dump contains | `src/mojoboost/inspection.mojo`, `src/mojoboost/model_dump.mojo` | `python/mojoboost/inspection.py` keeps its `model_to_string` parser as the fallback, and uses it unconditionally for split gains, which no native hook supplies |
-| How class weights become row weights | `src/mojoboost/class_weight.mojo` | `_Base._class_weight_rows` in `python/mojoboost/__init__.py` computes them in Python. This one is not a fallback: no binding is probed, and the Mojo module has no caller anywhere in `src/` |
+| Which backend runs this job | `src/mojotrees/device_policy.mojo` | `explain_device_choice` reaches the full native report now that `decide_device` is bound, but `_Base._resolve_device` still calls `_mojotrees.resolve_device` directly, so what a `fit` actually does is decided by the narrower of the two entry points |
+| What an objective or metric is called | `src/mojotrees/objective_registry.mojo` | the mirror tables in `python/mojotrees/_eval.py` are still present and still the code path when the hooks are absent; `registry_source()` returns `"native"` or `"compat"` and is the only honest way to say which one answered |
+| What a model dump contains | `src/mojotrees/inspection.mojo`, `src/mojotrees/model_dump.mojo` | `python/mojotrees/inspection.py` keeps its `model_to_string` parser as the fallback, and uses it unconditionally for split gains, which no native hook supplies |
+| How class weights become row weights | `src/mojotrees/class_weight.mojo` | `_Base._class_weight_rows` in `python/mojotrees/__init__.py` computes them in Python. This one is not a fallback: no binding is probed, and the Mojo module has no caller anywhere in `src/` |
 
 `class_weight` is the sharpest of the four, and the only one where no seam
-is even open. `src/mojoboost/class_weight.mojo` is re-exported from
-`src/mojoboost/__init__.mojo`, so it counts as reachable, and nothing in
-`src/` imports it: a Mojo caller can use it, a `MojoBoostClassifier` never
+is even open. `src/mojotrees/class_weight.mojo` is re-exported from
+`src/mojotrees/__init__.mojo`, so it counts as reachable, and nothing in
+`src/` imports it: a Mojo caller can use it, a `MojoTreesClassifier` never
 does, and the two implementations can disagree without any test noticing.
 `README.md` says which one runs.
 
 There is also a name collision worth knowing about:
-`derive_block_threads` is defined twice, in `src/mojoboost/gpu_tiling.mojo`
-(taking `DeviceCaps`) and in `src/mojoboost/apple_gpu_policy.mojo` (taking
+`derive_block_threads` is defined twice, in `src/mojotrees/gpu_tiling.mojo`
+(taking `DeviceCaps`) and in `src/mojotrees/apple_gpu_policy.mojo` (taking
 a `GpuProfile` and a row count). Both are live. `gpu_tiling`'s is the
 policy in force for every default launch; `apple_gpu_policy`'s is consulted
 only by `apple_histogram_policy`, which only departs from the baseline when
-`MOJOBOOST_GPU_HIST_SPECIALIZATION` asks it to.
+`MOJOTREES_GPU_HIST_SPECIALIZATION` asks it to.
 
 ## Reachable, but with no default effect
 
@@ -200,13 +200,13 @@ to describe them as behavior a user gets.
 
 | Module | Reached from | Default outcome | What turns it on |
 |---|---|---|---|
-| `apple_histogram_policy` | `histogram_gpu` | `SPEC_LEVEL_BASELINE`, which is `derive_tiling` verbatim | `MOJOBOOST_GPU_HIST_SPECIALIZATION` set to `shape`, `packed`, or `batched` |
+| `apple_histogram_policy` | `histogram_gpu` | `SPEC_LEVEL_BASELINE`, which is `derive_tiling` verbatim | `MOJOTREES_GPU_HIST_SPECIALIZATION` set to `shape`, `packed`, or `batched` |
 | `apple_gpu_policy` | `device_policy`, `apple_histogram_policy` | supplies the device profile and the memory estimate; its tuning derivations are consulted only through the line above | as above |
-| `gpu_split_search` | `train_gpu` | the host scan, because Float32 device gains can flip near-tie decisions and the measured difference (a few percent either way, `docs/LIGHTGBM_PARITY.md`) does not pay for that | `MOJOBOOST_GPU_SPLIT_STRATEGY=device` |
-| `unified_memory_policy` | `device_policy`, `histogram_gpu` | one live route; the others it scores are not implemented in any trainer | `MOJOBOOST_GPU_TRANSFER` |
-| `device_policy` crossover table | `device`, and through it every `fit` | empty, so `auto` resolves to the CPU on every machine and every workload | `MOJOBOOST_AUTO_MIN_CELLS` |
-| `gpu_multiclass_batch` | `train_gpu`, `histogram_gpu` | a sequential schedule, so multiclass GPU training stays one tree per class per round and `_train_multiclass_gpu_batched` is not entered | `MOJOBOOST_GPU_CLASS_BATCH` above one, or a caller passing its own batch |
-| `hybrid_leaf_scheduler` | `gpu_runtime` | a report and nothing else. `GpuSession.note_hybrid` records what was asked for and why it was declined; no histogram changes device | nothing. `MOJOBOOST_HYBRID_LEAVES` and `MOJOBOOST_HYBRID_TRACE` change what is reported, not where a histogram is built |
+| `gpu_split_search` | `train_gpu` | the host scan, because Float32 device gains can flip near-tie decisions and the measured difference (a few percent either way, `docs/LIGHTGBM_PARITY.md`) does not pay for that | `MOJOTREES_GPU_SPLIT_STRATEGY=device` |
+| `unified_memory_policy` | `device_policy`, `histogram_gpu` | one live route; the others it scores are not implemented in any trainer | `MOJOTREES_GPU_TRANSFER` |
+| `device_policy` crossover table | `device`, and through it every `fit` | empty, so `auto` resolves to the CPU on every machine and every workload | `MOJOTREES_AUTO_MIN_CELLS` |
+| `gpu_multiclass_batch` | `train_gpu`, `histogram_gpu` | a sequential schedule, so multiclass GPU training stays one tree per class per round and `_train_multiclass_gpu_batched` is not entered | `MOJOTREES_GPU_CLASS_BATCH` above one, or a caller passing its own batch |
+| `hybrid_leaf_scheduler` | `gpu_runtime` | a report and nothing else. `GpuSession.note_hybrid` records what was asked for and why it was declined; no histogram changes device | nothing. `MOJOTREES_HYBRID_LEAVES` and `MOJOTREES_HYBRID_TRACE` change what is reported, not where a histogram is built |
 
 Two of those rows are held off by default because they were measured and did
 not pay, not because the connecting work is outstanding, and the difference
@@ -232,7 +232,7 @@ least once.
 
 ## Python package modules
 
-| Module | In `mojoboost.__all__` | Notes |
+| Module | In `mojotrees.__all__` | Notes |
 |---|---|---|
 | `basic` | `Booster`, `Dataset`, `train` | the only submodule `docs/COMPATIBILITY_POLICY.md` allows importing by path |
 | `callback` | six callback names | re-exported at the top level as LightGBM does |

@@ -1,7 +1,7 @@
-# Installing mojoboost
+# Installing mojotrees
 
 > [!IMPORTANT]
-> mojoboost is an experimental public alpha. It trains, predicts, saves, and
+> mojotrees is an experimental public alpha. It trains, predicts, saves, and
 > loads today, and people can use it for real work on the platform below.
 > It is not yet a drop-in production replacement for LightGBM or XGBoost.
 > The first wheel is published for the narrow platform described below. Read
@@ -12,10 +12,10 @@
 The first public alpha is available from PyPI:
 
 ```sh
-pip install mojoboost
+pip install mojotrees
 ```
 
-The current release is `0.1.0a1`. Its wheel supports **CPython 3.14 on Apple
+The current release is `0.1.0a2`. Its wheel supports **CPython 3.14 on Apple
 Silicon running macOS 26 or newer**. No Mojo installation, MAX installation,
 Pixi environment, or compiler is required to use that wheel.
 
@@ -23,8 +23,8 @@ Pixi environment, or compiler is required to use that wheel.
 
 | State | What you type | Status today |
 |---|---|---|
-| 1. Published alpha from PyPI | `pip install mojoboost` | **Available** for CPython 3.14, Apple Silicon, macOS 26+ |
-| 2. A release wheel file | `pip install ./mojoboost-<version>-<tags>.whl` | **Available** from the release workflow |
+| 1. Published alpha from PyPI | `pip install mojotrees` | **Available** for CPython 3.14, Apple Silicon, macOS 26+ |
+| 2. A release wheel file | `pip install ./mojotrees-<version>-<tags>.whl` | **Available** from the release workflow |
 | 3. Source checkout with Pixi | `git clone`, `pixi install`, `pixi run build-python` | **Available** for contributors and unsupported targets |
 
 Pick by what you are trying to do.
@@ -38,7 +38,7 @@ Pick by what you are trying to do.
 
 One thing that will never appear on this page is a command that looks like a
 plain pip install and quietly turns into a Mojo compile on a machine with no
-Mojo toolchain. mojoboost publishes no source distribution, deliberately, so
+Mojo toolchain. mojotrees publishes no source distribution, deliberately, so
 pip cannot fall back to building from source and cannot fail an hour later
 with a compiler error. See
 [Why there is no sdist](#why-there-is-no-sdist).
@@ -50,7 +50,7 @@ with a compiler error. See
 Install the published binary wheel directly from PyPI.
 
 ```sh
-python -m pip install --only-binary=:all: mojoboost
+python -m pip install --only-binary=:all: mojotrees
 ```
 
 `--only-binary=:all:` is not decoration. It tells pip to refuse anything that
@@ -60,8 +60,8 @@ publish for.
 
 What that install contains.
 
-- The `mojoboost` Python package and one compiled extension module,
-  `_mojoboost`, built from the same Mojo sources as the rest of the library.
+- The `mojotrees` Python package and one compiled extension module,
+  `_mojotrees`, built from the same Mojo sources as the rest of the library.
 - The Mojo and MAX runtime libraries the extension links, bundled inside the
   wheel with loader-relative paths. **No Mojo installation, no MAX
   installation, no conda, and no compiler are required to run it.**
@@ -74,7 +74,7 @@ What it requires today.
 |---|---|---|
 | Python | 3.14 | `requires-python` in `python/pyproject.toml`, which follows the interpreter the environment was solved against |
 | Platform | macOS on Apple silicon first, Linux x86_64 and aarch64 after that | [docs/PLATFORM_MATRIX.md](PLATFORM_MATRIX.md) |
-| numpy | optional | plain Python sequences work without it; `pip install "mojoboost[numpy]"` pulls it in |
+| numpy | optional | plain Python sequences work without it; `pip install "mojotrees[numpy]"` pulls it in |
 
 The Python floor is likely to broaden in a future release, and it is worth
 knowing why it reads the way it does.
@@ -90,23 +90,23 @@ Nothing has run on any interpreter other than 3.14, so `>=3.14` stays until
 an experiment says otherwise. Treat it as the current declared value with a
 reason behind it, not as a settled decision and not as a permanent one.
 
-### What `pip install mojoboost` does right now
+### What `pip install mojotrees` does right now
 
-On the supported target, pip downloads and installs `0.1.0a1`. On any other
+On the supported target, pip downloads and installs `0.1.0a2`. On any other
 target, pip reports `No matching distribution found` because no compatible
 wheel exists. That refusal is intentional; pip never falls back to compiling
 Mojo source.
 
 ### Why there is no sdist
 
-A source distribution would let pip download mojoboost on any machine, start
+A source distribution would let pip download mojotrees on any machine, start
 a build, and then fail deep inside a toolchain the user never asked for and
 does not have. The compile needs Mojo and MAX from a pinned Pixi environment,
 so a source build on an ordinary Python machine cannot succeed, and an
 install that fails after eight minutes of confusing output is worse than one
 that refuses in a second.
 
-So `pip install mojoboost` will only ever resolve to a wheel that matches the
+So `pip install mojotrees` will only ever resolve to a wheel that matches the
 machine, or to a clean "no matching distribution found". If you want to build
 from source, that is state 3, and it is a deliberate, documented act rather
 than a silent fallback.
@@ -130,9 +130,9 @@ it. There is one wheel per row, and no row is a near enough match for another.
 
 | Your machine | The wheel | Where that stands |
 |---|---|---|
-| Apple silicon Mac, Python 3.14 | `mojoboost-0.1.0a1-cp314-cp314-macosx_26_0_arm64.whl` | Published and clean-install validated |
-| Linux x86_64, Python 3.14 | `mojoboost-0.1.0a1-cp314-cp314-linux_x86_64.whl` | Matrix row `linux-x86_64-cp314`, not index-publishable. See below |
-| Linux aarch64, Python 3.14 | `mojoboost-0.1.0a1-cp314-cp314-linux_aarch64.whl` | Matrix row `linux-aarch64-cp314`, not index-publishable. See below |
+| Apple silicon Mac, Python 3.14 | `mojotrees-0.1.0a2-cp314-cp314-macosx_26_0_arm64.whl` | Published and clean-install validated |
+| Linux x86_64, Python 3.14 | `mojotrees-0.1.0a2-cp314-cp314-linux_x86_64.whl` | Matrix row `linux-x86_64-cp314`, not index-publishable. See below |
+| Linux aarch64, Python 3.14 | `mojotrees-0.1.0a2-cp314-cp314-linux_aarch64.whl` | Matrix row `linux-aarch64-cp314`, not index-publishable. See below |
 | Intel Mac | none, and there will not be one | The pinned channel ships no Intel macOS toolchain |
 | Windows | none | No toolchain in the pinned channel |
 | Free-threaded Python (`3.14t`) | none | A different ABI tag; the extension cannot load |
@@ -184,12 +184,12 @@ sha256sum -c SHA256SUMS-x86_64.txt             # Linux x86_64
 # 2. Install into a fresh virtual environment, from the file itself.
 python3.14 -m venv .venv
 . .venv/bin/activate
-python -m pip install ./mojoboost-0.1.0a1-cp314-cp314-macosx_26_0_arm64.whl
+python -m pip install ./mojotrees-0.1.0a2-cp314-cp314-macosx_26_0_arm64.whl
 
 # 3. Confirm it imports and can train, from a directory that is not a
-#    mojoboost checkout, so a stray source tree cannot make this pass.
+#    mojotrees checkout, so a stray source tree cannot make this pass.
 cd ~
-python -c "import mojoboost; print(mojoboost.__version__, mojoboost.__file__)"
+python -c "import mojotrees; print(mojotrees.__version__, mojotrees.__file__)"
 ```
 
 Installing the file path rather than the package name is the point. pip
@@ -199,7 +199,7 @@ it, and there is nothing for it to substitute.
 ### Uninstalling
 
 ```sh
-python -m pip uninstall mojoboost
+python -m pip uninstall mojotrees
 ```
 
 The bundled runtime libraries live inside the package directory, so they go
@@ -216,20 +216,20 @@ the C ABI, the CLI, the tests, and the benchmarks. You do not need to install
 Mojo or MAX separately; Pixi resolves the exact versions this repository pins.
 
 ```sh
-git clone https://github.com/mojoboost-ml/mojoboost.git
-cd mojoboost
+git clone https://github.com/mojotrees/mojotrees.git
+cd mojotrees
 pixi install
 pixi run build-python
 ```
 
 `pixi run build-python` compiles the CPython extension into
-`python/mojoboost/_mojoboost.so`. It is the step that takes the time, and it
+`python/mojotrees/_mojotrees.so`. It is the step that takes the time, and it
 has to be rerun whenever the Mojo sources under `src/` or `bindings/` change.
 
 The package is then importable with the `python` directory on the path.
 
 ```sh
-PYTHONPATH=python python -c "import mojoboost; print(mojoboost.__version__)"
+PYTHONPATH=python python -c "import mojotrees; print(mojotrees.__version__)"
 ```
 
 If you would rather not set `PYTHONPATH` on every command, install the built
@@ -260,7 +260,7 @@ produced, so it is for you and not for redistribution.
 
 ## The first five minutes
 
-Everything below assumes mojoboost imports, by whichever state got you there.
+Everything below assumes mojotrees imports, by whichever state got you there.
 If you are in state 3, prefix each command with `PYTHONPATH=python`.
 
 All of it runs in one script, which prints each step with its result.
@@ -278,15 +278,15 @@ the two import failures a bad install produces.
 ### 1. Import, and know what you imported
 
 ```python
-import mojoboost
-from mojoboost import MojoBoostRegressor, gpu_available
+import mojotrees
+from mojotrees import MojoTreesRegressor, gpu_available
 
-print(mojoboost.__version__)   # 0.1.0a1
-print(mojoboost.__file__)      # where this package actually came from
+print(mojotrees.__version__)   # 0.1.0a2
+print(mojotrees.__file__)      # where this package actually came from
 print(gpu_available())         # True if this build has an accelerator path
 ```
 
-`mojoboost.__file__` is worth printing once. A source checkout on
+`mojotrees.__file__` is worth printing once. A source checkout on
 `PYTHONPATH` shadows an installed wheel, and the two can be different builds.
 
 ### 2. Train a tiny regression
@@ -295,7 +295,7 @@ print(gpu_available())         # True if this build has an accelerator path
 X = [[0.0], [1.0], [2.0], [3.0], [4.0], [5.0]]
 y = [0.0, 1.0, 4.0, 9.0, 16.0, 25.0]
 
-model = MojoBoostRegressor(n_estimators=20, num_leaves=7, min_data_in_leaf=1)
+model = MojoTreesRegressor(n_estimators=20, num_leaves=7, min_data_in_leaf=1)
 model.fit(X, y)
 print(model.predict([[1.5], [4.5]]))
 print(model.device_)           # the backend that actually ran
@@ -308,7 +308,7 @@ is installed.
 ### 3. Add a validation set and early stopping
 
 ```python
-model = MojoBoostRegressor(n_estimators=500, learning_rate=0.05, device="cpu")
+model = MojoTreesRegressor(n_estimators=500, learning_rate=0.05, device="cpu")
 model.fit(
     X_train, y_train,
     eval_set=[(X_valid, y_valid)],
@@ -336,7 +336,7 @@ Validation metrics are scored on the CPU, so `device="gpu"` with an
 
 ```python
 model.save("model.mbst")
-restored = MojoBoostRegressor.load("model.mbst")
+restored = MojoTreesRegressor.load("model.mbst")
 assert list(restored.predict(X_valid)) == list(model.predict(X_valid))
 ```
 
@@ -348,9 +348,9 @@ it. Pickle the estimator when you want those.
 ### 5. Choose a device
 
 ```python
-MojoBoostRegressor(device="cpu")    # default, dependable, every objective
-MojoBoostRegressor(device="gpu")    # accelerator or an exception, never a fallback
-MojoBoostRegressor(device="auto")   # picks for you, and today always picks the CPU
+MojoTreesRegressor(device="cpu")    # default, dependable, every objective
+MojoTreesRegressor(device="gpu")    # accelerator or an exception, never a fallback
+MojoTreesRegressor(device="auto")   # picks for you, and today always picks the CPU
 ```
 
 `device="gpu"` is a request that gets honored or refused. It never quietly
@@ -367,17 +367,17 @@ One call, and it answers most of what an installation bug report would
 otherwise need a conversation to establish.
 
 ```python
-import mojoboost
+import mojotrees
 
-mojoboost.show_versions()
+mojotrees.show_versions()
 ```
 
 ```text
-mojoboost 0.1.0a1
-  package                /.../site-packages/mojoboost/__init__.py
+mojotrees 0.1.0a2
+  package                /.../site-packages/mojotrees/__init__.py
   install                wheel
-  extension              /.../site-packages/mojoboost/_mojoboost.so
-  bundled runtime        4 in /.../site-packages/mojoboost/.dylibs
+  extension              /.../site-packages/mojotrees/_mojotrees.so
+  bundled runtime        4 in /.../site-packages/mojotrees/.dylibs
   gpu path compiled in   yes
   gpu_available()        True
 
@@ -392,10 +392,10 @@ optional dependencies
   ...
 
 environment
-  (none set)             MOJOBOOST_* and MODULAR_* are unset
+  (none set)             MOJOTREES_* and MODULAR_* are unset
 ```
 
-`mojoboost.build_info()` returns the same facts as a JSON-serializable dict
+`mojotrees.build_info()` returns the same facts as a JSON-serializable dict
 when you want to attach them to something rather than read them.
 
 Three of those rows are worth knowing how to read.
@@ -405,7 +405,7 @@ Whether an accelerator is usable is decided when the extension is compiled,
 not on the machine that runs it, so one wheel carries one answer to every
 user who installs it. `gpu_available()` alone cannot tell you which answer
 yours has, because it returns `False` both for a build with no GPU path and
-for a perfectly good GPU build with `MOJOBOOST_DISABLE_GPU=1` set. This row
+for a perfectly good GPU build with `MOJOTREES_DISABLE_GPU=1` set. This row
 separates them, and prints `unknown` rather than guessing when the variable
 is masking the answer. A `no` here means `device="gpu"` will raise on every
 machine this wheel is installed on, including machines with a working
@@ -416,7 +416,7 @@ your side.
 `source` install resolves its runtime libraries through an absolute path into
 the Pixi environment that built it; a `wheel` carries them inside the package.
 
-**`environment`** lists every `MOJOBOOST_*` and `MODULAR_*` variable that is
+**`environment`** lists every `MOJOTREES_*` and `MODULAR_*` variable that is
 set, discovered by scanning rather than from a fixed list, so a knob added
 after this page was written still shows up in your report.
 
@@ -460,9 +460,9 @@ rather than the punctuation.
 ### Unsupported Python
 
 ```text
-ERROR: Ignored the following versions that require a different python version: 0.1.0a1 Requires-Python >=3.14
-ERROR: Could not find a version that satisfies the requirement mojoboost
-ERROR: No matching distribution found for mojoboost
+ERROR: Ignored the following versions that require a different python version: 0.1.0a2 Requires-Python >=3.14
+ERROR: Could not find a version that satisfies the requirement mojotrees
+ERROR: No matching distribution found for mojotrees
 ```
 
 Your interpreter is older than the declared floor. Check with
@@ -479,7 +479,7 @@ mismatch below instead, because the filename carries `cp314`.
 ### Wrong architecture, wrong operating system, or too old a macOS
 
 ```text
-ERROR: mojoboost-0.1.0a1-cp314-cp314-macosx_26_0_arm64.whl is not a supported wheel on this platform.
+ERROR: mojotrees-0.1.0a2-cp314-cp314-macosx_26_0_arm64.whl is not a supported wheel on this platform.
 ```
 
 pip compared the filename tags against the machine and they did not match.
@@ -503,9 +503,9 @@ is a statement about the binary inside.
 The install succeeded and the import does not.
 
 ```text
-ImportError: dlopen(.../site-packages/mojoboost/_mojoboost.so, 0x0002):
+ImportError: dlopen(.../site-packages/mojotrees/_mojotrees.so, 0x0002):
   Library not loaded: @rpath/libKGENCompilerRTShared.dylib
-  Reason: tried: '.../site-packages/mojoboost/.dylibs/libKGENCompilerRTShared.dylib' (no such file)
+  Reason: tried: '.../site-packages/mojotrees/.dylibs/libKGENCompilerRTShared.dylib' (no such file)
 ```
 
 or, on Linux,
@@ -524,7 +524,7 @@ From a source checkout it means something more ordinary. Either the extension
 was never built, which produces a different message,
 
 ```text
-ImportError: cannot import name '_mojoboost' from 'mojoboost' (.../python/mojoboost/__init__.py)
+ImportError: cannot import name '_mojotrees' from 'mojotrees' (.../python/mojotrees/__init__.py)
 ```
 
 and the fix is `pixi run build-python`; or it was built and you are running
@@ -533,7 +533,7 @@ case run through `pixi run`, or build a self-contained wheel with
 `pixi run build-wheel` and install that instead.
 
 Those two are worth telling apart, because they arrive as the same exception
-type and mean opposite things. A missing `_mojoboost.so` is reported as
+type and mean opposite things. A missing `_mojotrees.so` is reported as
 "cannot import name", not as "no module named", because the import machinery
 swallows the underlying `ModuleNotFoundError` for a submodule named in a
 `from . import ...` list and the attribute lookup fails afterward
@@ -548,8 +548,8 @@ prints the right fix for each.
 RuntimeError: device 'gpu' requested but no accelerator is available; use device 'cpu' or 'auto'
 ```
 
-The build has no accelerator path in it, or `MOJOBOOST_DISABLE_GPU=1` is set.
-`mojoboost.show_versions()` tells you which, on the `gpu path compiled in`
+The build has no accelerator path in it, or `MOJOTREES_DISABLE_GPU=1` is set.
+`mojotrees.show_versions()` tells you which, on the `gpu path compiled in`
 row; `gpu_available()` alone cannot, because it returns `False` for both.
 
 The part that surprises people is that availability is a property of the
@@ -599,7 +599,7 @@ This is not an error and there is no message. It is the current, deliberate
 behavior on every machine and every workload.
 
 ```python
-model = MojoBoostRegressor(device="auto").fit(X, y)
+model = MojoTreesRegressor(device="auto").fit(X, y)
 model.device_        # "cpu", on an M4 with a working Metal GPU
 ```
 
@@ -612,26 +612,26 @@ implying an evaluation happened that did not.
 Two ways forward, depending on what you want.
 
 ```python
-MojoBoostRegressor(device="gpu")     # force it, and get an exception if it cannot
+MojoTreesRegressor(device="gpu")     # force it, and get an exception if it cannot
 ```
 
 ```sh
-MOJOBOOST_AUTO_MIN_CELLS=10000000 python your_benchmark.py
+MOJOTREES_AUTO_MIN_CELLS=10000000 python your_benchmark.py
 ```
 
-`MOJOBOOST_AUTO_MIN_CELLS` is the cell count (`n_rows * n_features`) at or
+`MOJOTREES_AUTO_MIN_CELLS` is the cell count (`n_rows * n_features`) at or
 above which `auto` selects the GPU, and it is the knob for running the
 crossover benchmark that would justify a shipped default. It is device
 independent on purpose; there are no per vendor or per chip special cases
 anywhere in the policy. If you run that benchmark, the result belongs in an
 issue, filed with the
-[accelerator validation template](https://github.com/mojoboost-ml/mojoboost/issues/new?template=hardware_validation.yml).
+[accelerator validation template](https://github.com/mojotrees/mojotrees/issues/new?template=hardware_validation.yml).
 
 ### Anything else
 
 Open a bug report with the
-[bug template](https://github.com/mojoboost-ml/mojoboost/issues/new?template=bug_report.yml)
-and include the output of `mojoboost.show_versions()`, the complete error
+[bug template](https://github.com/mojotrees/mojotrees/issues/new?template=bug_report.yml)
+and include the output of `mojotrees.show_versions()`, the complete error
 text, and the device you requested. Installation problems are explicitly in scope for that
 template. An alpha with quiet failures is worse than one with loud ones, so a
 report about a confusing install is useful, not noise.
@@ -642,7 +642,7 @@ report about a confusing install is useful, not noise.
 
 | Document | What it settles |
 |---|---|
-| [docs/LIGHTGBM_PARITY.md](LIGHTGBM_PARITY.md) | What mojoboost supports, what LightGBM has that it does not, and which differences are deliberate. Authoritative on behavior |
+| [docs/LIGHTGBM_PARITY.md](LIGHTGBM_PARITY.md) | What mojotrees supports, what LightGBM has that it does not, and which differences are deliberate. Authoritative on behavior |
 | [docs/GPU_VALIDATION.md](GPU_VALIDATION.md) | Which hardware has actually run this code, and the procedure for adding a device |
 | [docs/PLATFORM_MATRIX.md](PLATFORM_MATRIX.md) | Every install target, its artifact name, and the evidence behind its status |
 | [docs/PYTHON_SUPPORT.md](PYTHON_SUPPORT.md) | Why the floor is 3.14, what each older interpreter would take, and what has actually run |
@@ -653,9 +653,9 @@ report about a confusing install is useful, not noise.
 
 Issue templates.
 
-- [Bug report](https://github.com/mojoboost-ml/mojoboost/issues/new?template=bug_report.yml),
+- [Bug report](https://github.com/mojotrees/mojotrees/issues/new?template=bug_report.yml),
   including installation problems.
-- [Accelerator validation report](https://github.com/mojoboost-ml/mojoboost/issues/new?template=hardware_validation.yml),
+- [Accelerator validation report](https://github.com/mojotrees/mojotrees/issues/new?template=hardware_validation.yml),
   for correctness, determinism, or performance evidence from real hardware.
   Failures are useful evidence too.
 
@@ -666,7 +666,7 @@ executed, and no error message on this page was produced by running the
 command above it in this session.
 
 The messages quoted verbatim were read out of the source that raises them,
-`src/mojoboost/device.mojo` and `python/mojoboost/__init__.py`. The filenames
+`src/mojotrees/device.mojo` and `python/mojotrees/__init__.py`. The filenames
 and platform tags were read out of
 [docs/PLATFORM_MATRIX.md](PLATFORM_MATRIX.md) and
 `packaging/matrix/platform_matrix.toml`. The pip and dynamic-loader messages

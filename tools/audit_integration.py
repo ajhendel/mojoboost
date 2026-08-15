@@ -30,7 +30,7 @@ Two severities, because they are not the same kind of wrong:
 
     ERROR   The inventory states something false: it calls a module an
             orphan that a root now reaches, says a binding module is
-            unregistered when `_mojoboost.mojo` imports it, or says a native
+            unregistered when `_mojotrees.mojo` imports it, or says a native
             name is unbound when the table exports it. Always exits 1.
     GAP     The tree has something the inventory has not caught up with: a
             new orphan, a new unregistered binding module, a new unbound
@@ -38,7 +38,7 @@ Two severities, because they are not the same kind of wrong:
             several lanes in flight a gap is a few minutes old and is a
             to-do rather than a false claim.
 
-Nothing here imports the mojoboost package, builds anything, or runs Mojo.
+Nothing here imports the mojotrees package, builds anything, or runs Mojo.
 It reads text.
 
     python3 tools/audit_integration.py             # report; ERROR exits 1
@@ -206,8 +206,8 @@ def computed_orphans():
 
 
 def registered_binding_modules():
-    """Modules under bindings/ that `_mojoboost.mojo` imports."""
-    path = os.path.join(ca.BINDINGS_DIR, "_mojoboost.mojo")
+    """Modules under bindings/ that `_mojotrees.mojo` imports."""
+    path = os.path.join(ca.BINDINGS_DIR, "_mojotrees.mojo")
     text = ca.must_read(path)
     body = ca.strip_mojo_comments(text)
     names = set()
@@ -222,7 +222,7 @@ def binding_module_files():
     """Every bindings/*.mojo file except the extension module itself."""
     out = []
     for path in ca.walk(ca.BINDINGS_DIR, ".mojo"):
-        if os.path.basename(path) != "_mojoboost.mojo":
+        if os.path.basename(path) != "_mojotrees.mojo":
             out.append(path)
     return sorted(out)
 
@@ -230,7 +230,7 @@ def binding_module_files():
 def base_name(name):
     """A native hook name without its multiclass suffix.
 
-    `python/mojoboost/inspection.py` composes `dump_model_multiclass` at
+    `python/mojotrees/inspection.py` composes `dump_model_multiclass` at
     call time from a literal `dump_model`, so the regexes in
     `connectivity_audit` see only the base. The inventory lists both, and
     comparing on the base is what lets the two agree.
@@ -318,7 +318,7 @@ def check_binding_modules(rows, problems):
                     ERROR,
                     path,
                     "%s says the extension does not register it, but "
-                    "bindings/_mojoboost.mojo imports it. Drop the row and "
+                    "bindings/_mojotrees.mojo imports it. Drop the row and "
                     "re-audit the capability it said was blocked."
                     % INVENTORY,
                 )
@@ -334,7 +334,7 @@ def check_binding_modules(rows, problems):
             Problem(
                 GAP,
                 path,
-                "bindings/_mojoboost.mojo does not import it and %s does "
+                "bindings/_mojotrees.mojo does not import it and %s does "
                 "not list it" % INVENTORY,
             )
         )
@@ -353,7 +353,7 @@ def check_unbound_hooks(rows, problems):
                         ERROR,
                         name,
                         "%s says no binding registers it, but the "
-                        "def_function table in bindings/_mojoboost.mojo "
+                        "def_function table in bindings/_mojotrees.mojo "
                         "exports it. Drop it from the row, and delete the "
                         "Python fallback that row describes." % INVENTORY,
                     )
@@ -367,7 +367,7 @@ def check_unbound_hooks(rows, problems):
             Problem(
                 GAP,
                 finding.subject,
-                "python/mojoboost reaches for _mojoboost.%s and no binding "
+                "python/mojotrees reaches for _mojotrees.%s and no binding "
                 "registers it; %s does not list it"
                 % (finding.subject, INVENTORY),
             )

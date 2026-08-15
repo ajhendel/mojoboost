@@ -1,6 +1,6 @@
 # Benchmarks
 
-Reproducible mojoboost vs LightGBM comparison on identical synthetic data.
+Reproducible mojotrees vs LightGBM comparison on identical synthetic data.
 
 Both drivers generate the dataset from the same counter-based splitmix64
 stream, so every feature value and label is bit-identical between the two
@@ -8,19 +8,19 @@ stream, so every feature value and label is bit-identical between the two
 interaction, and quadratic terms of the first four features plus uniform
 noise; the remaining features are pure noise.
 
-Parameters match on both sides (mojoboost defaults): 100 boosting rounds,
+Parameters match on both sides (mojotrees defaults): 100 boosting rounds,
 `num_leaves=31`, `learning_rate=0.1`, `min_data_in_leaf=20`,
 `min_sum_hessian_in_leaf=1e-3`, `lambda_l2=1.0`, `max_bin=255`. LightGBM
-additionally runs with `enable_bundle=false` (mojoboost has no EFB yet) and
+additionally runs with `enable_bundle=false` (mojotrees has no EFB yet) and
 `force_row_wise=true`. The table below records the original single-threaded
-mojoboost baseline. The current implementation parallelizes histogram
+mojotrees baseline. The current implementation parallelizes histogram
 accumulation across features, so new runs should record available CPU cores
 and compare against both 1-thread and machine-wide LightGBM.
 
 ## Running
 
 ```sh
-pixi run bench                 # mojoboost, defaults: 100000 rows x 100 features, reg
+pixi run bench                 # mojotrees, defaults: 100000 rows x 100 features, reg
 pixi run bench 100000 100 binary
 pixi run bench 100000 100 reg 1             # final argument is the data seed
 pixi run -e bench bench-lgbm --rows 100000 --features 100 --objective reg --threads 1
@@ -34,7 +34,7 @@ pixi run bench-hist
 LightGBM 4.x via conda-forge. Times in seconds (binning + training reported
 separately; loss is on the training set).
 
-| | mojoboost (1 thread) | LightGBM (1 thread) | LightGBM (10 threads) |
+| | mojotrees (1 thread) | LightGBM (1 thread) | LightGBM (10 threads) |
 |---|---|---|---|
 | Regression: binning | 0.55 | 0.81 | 0.20 |
 | Regression: training | 3.53 | 2.41 | 1.06 |
@@ -58,7 +58,7 @@ different.
 
 `bench_profile.mojo` is the driver for the CPU backend itself. It times every
 stage a boosting round spends real work in, each one twice on identical data:
-once with `MOJOBOOST_NUM_WORKERS=1` and once in auto mode. The ratio isolates
+once with `MOJOTREES_NUM_WORKERS=1` and once in auto mode. The ratio isolates
 what the scheduler is worth for that stage; the serial column is what
 single-core work moves.
 
@@ -84,7 +84,7 @@ pixi run bench-profile                  # 100000 rows x 100 features, 3 reps
 pixi run bench-profile 200000 50 5      # rows, features, reps
 ```
 
-Sweeping `TASKS_PER_CORE` in `src/mojoboost/parallel.mojo` and rerunning this
+Sweeping `TASKS_PER_CORE` in `src/mojotrees/parallel.mojo` and rerunning this
 is how that constant should be settled; it is currently an unmeasured starting
 value of 4.
 
@@ -102,7 +102,7 @@ that scale their estimate: gradient generation divides by 16 (a few flops on
 sequential arrays), row partitioning multiplies by 3 (two passes, each an
 indirect load). Task count then follows two rules, both in `plan_tasks`:
 
-- below one grain (`MOJOBOOST_PARALLEL_MIN_OPS`, default 65536) of estimated
+- below one grain (`MOJOTREES_PARALLEL_MIN_OPS`, default 65536) of estimated
   work, stay serial;
 - above it, never give a task less than a grain, and never exceed
   `TASKS_PER_CORE` tasks per physical core.
@@ -111,17 +111,17 @@ The grain cap is the rule that matters for cheap stages. Without it, 100k rows
 of elementwise gradient work asked for one task per core, and the profiler
 timed that fan-out well below the serial path.
 
-`MOJOBOOST_NUM_WORKERS` overrides both rules, which is how the tests force a
+`MOJOTREES_NUM_WORKERS` overrides both rules, which is how the tests force a
 particular path, and is what to pin when comparing runs.
 
-## mojoboost vs LightGBM at matched thread counts
+## mojotrees vs LightGBM at matched thread counts
 
 The comparison the CPU work is aimed at needs four runs, back to back on an
-idle machine. `MOJOBOOST_NUM_WORKERS=1` is what makes the mojoboost side
+idle machine. `MOJOTREES_NUM_WORKERS=1` is what makes the mojotrees side
 genuinely single-threaded; without it, auto mode uses the machine.
 
 ```sh
-MOJOBOOST_NUM_WORKERS=1 pixi run bench 100000 100 reg
+MOJOTREES_NUM_WORKERS=1 pixi run bench 100000 100 reg
 pixi run -e bench bench-lgbm --rows 100000 --features 100 --objective reg --threads 1
 pixi run bench 100000 100 reg                 # auto: machine-wide
 pixi run -e bench bench-lgbm --rows 100000 --features 100 --objective reg --threads 10
@@ -169,8 +169,8 @@ pixi run bench-hist-scaling                    # small, medium, large shapes
 pixi run bench-hist-scaling 20 1000000 50      # reps, then (rows, features)
 ```
 
-`MOJOBOOST_GPU_HIST_STRATEGY`, `MOJOBOOST_GPU_ROW_TILE`, and
-`MOJOBOOST_GPU_BLOCK_THREADS` (see `src/mojoboost/gpu_tiling.mojo`) sweep the
+`MOJOTREES_GPU_HIST_STRATEGY`, `MOJOTREES_GPU_ROW_TILE`, and
+`MOJOTREES_GPU_BLOCK_THREADS` (see `src/mojotrees/gpu_tiling.mojo`) sweep the
 tiling by hand, which is how the defaults in that module were chosen. Pin
 them when comparing runs.
 
@@ -210,7 +210,7 @@ is dominated by the binned matrix upload, ran 0.14 s at 20,000 x 20 and
 1.6 s to 1.9 s at 1,000,000 x 50. Binning itself, on the CPU, cost 11.4 s at
 the largest shape and dwarfs everything the GPU does.
 
-Not yet measured: a sweep of `MOJOBOOST_GPU_ROW_TILE` at the largest shape,
+Not yet measured: a sweep of `MOJOTREES_GPU_ROW_TILE` at the largest shape,
 which is what would confirm or move `TARGET_BLOCKS_PER_SM` in
 `gpu_tiling.mojo`. The default of 8 threadgroups per multiprocessor gives
 only 2 tiles and 100 threadgroups at 1,000,000 x 50 on this device, and
@@ -350,7 +350,7 @@ row here.
 builds synthetic queries, splits them into train and validation by query,
 and reports two things:
 
-- the NDCG metric cross-check: mojoboost's `ndcg_score` applied to
+- the NDCG metric cross-check: mojotrees's `ndcg_score` applied to
   LightGBM's own validation predictions, against the `ndcg@k` LightGBM
   reports for those same scores. Same scores, same labels, same
   boundaries, so a disagreement is a disagreement about the metric. Expect
@@ -380,7 +380,7 @@ pixi run -e bench compare-missing
 ```
 
 As of LightGBM 4.7 every routing decision matches. Leaf values differ by the
-factor `H / (H + lambda_l2)`, because mojoboost defaults `lambda_l2` to 1.0
+factor `H / (H + lambda_l2)`, because mojotrees defaults `lambda_l2` to 1.0
 where LightGBM defaults it to 0.0; the script prints those two rows for
 context and says so rather than counting them as disagreements.
 
@@ -435,10 +435,10 @@ exist.
 
 ## Caveats
 
-- LightGBM's `min_data_in_bin=3` (its default) has no mojoboost equivalent;
+- LightGBM's `min_data_in_bin=3` (its default) has no mojotrees equivalent;
   both still fit 255-bin quantile histograms.
 - Losses differ slightly because tree growth diverges after the first
-  floating-point tie; the ~4% MSE gap in mojoboost's favor is within
+  floating-point tie; the ~4% MSE gap in mojotrees's favor is within
   seed-to-seed variation, not a quality claim.
 - Single machine, single run; rerun both commands back to back on an idle
   machine before quoting numbers.

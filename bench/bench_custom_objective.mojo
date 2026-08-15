@@ -21,14 +21,14 @@ Usage:
 from std.sys import argv
 from std.time import perf_counter_ns
 
-from mojoboost.binning import fit_bins
-from mojoboost.boosting import SQUARED_ERROR, BoosterParams, train
-from mojoboost.objective import (
+from mojotrees.binning import fit_bins
+from mojotrees.boosting import SQUARED_ERROR, BoosterParams, train
+from mojotrees.objective import (
     mean_label,
     squared_error_grad_hess,
     train_custom,
 )
-from mojoboost.tree import TreeParams
+from mojotrees.tree import TreeParams
 
 
 def _splitmix64(state: UInt64) -> UInt64:
@@ -88,7 +88,7 @@ def main() raises:
             hess.append(scale)
 
     print(
-        "mojoboost custom-objective bench:",
+        "mojotrees custom-objective bench:",
         n_rows,
         "rows x",
         n_features,

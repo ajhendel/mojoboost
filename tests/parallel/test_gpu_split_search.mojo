@@ -31,20 +31,20 @@ from std.testing import (
     TestSuite,
 )
 
-from mojoboost.categorical import (
+from mojotrees.categorical import (
     CategoricalParams,
     CategoricalSpec,
     cat_contains,
 )
-from mojoboost.gpu_split_search import (
+from mojotrees.gpu_split_search import (
     GpuSplitParams,
     GpuSplitRecord,
     GpuSplitSearcher,
     reference_search,
 )
-from mojoboost.histogram import Histogram
-from mojoboost.monotone import OutputBounds
-from mojoboost.split import find_best_split
+from mojotrees.histogram import Histogram
+from mojotrees.monotone import OutputBounds
+from mojotrees.split import find_best_split
 
 comptime _TOL = 1e-4
 

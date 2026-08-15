@@ -10,8 +10,8 @@ callback spelling of early stopping lines up with the keyword one.
 import numpy as np
 import pytest
 
-from mojoboost import MojoBoostClassifier, MojoBoostRegressor
-from mojoboost.callback import (
+from mojotrees import MojoTreesClassifier, MojoTreesRegressor
+from mojotrees.callback import (
     CallbackEnv,
     EarlyStopException,
     RESETTABLE,
@@ -32,7 +32,7 @@ def _split(X, y, n_valid=100):
 
 def _fit(regression, callbacks, n_estimators=20, **kwargs):
     X, y, Xv, yv = _split(*regression)
-    return MojoBoostRegressor(n_estimators=n_estimators).fit(
+    return MojoTreesRegressor(n_estimators=n_estimators).fit(
         X,
         y,
         eval_set=[(Xv, yv)],
@@ -81,7 +81,7 @@ def test_the_handle_is_one_object_for_the_run(regression):
 
     _fit(regression, [watch], n_estimators=4)
     assert all(h is handles[0] for h in handles)
-    assert handles[0].estimator.__class__ is MojoBoostRegressor
+    assert handles[0].estimator.__class__ is MojoTreesRegressor
 
 
 def test_after_phase_values_match_evals_result(regression):
@@ -299,11 +299,11 @@ def test_reset_outside_the_before_phase_raises(regression):
 
 def test_early_stopping_callback_matches_the_keyword(regression):
     X, y, Xv, yv = _split(*regression)
-    by_keyword = MojoBoostRegressor(n_estimators=200).fit(
+    by_keyword = MojoTreesRegressor(n_estimators=200).fit(
         X, y, eval_set=[(Xv, yv)], eval_metric=("mse", mse),
         early_stopping_rounds=5,
     )
-    by_callback = MojoBoostRegressor(n_estimators=200).fit(
+    by_callback = MojoTreesRegressor(n_estimators=200).fit(
         X, y, eval_set=[(Xv, yv)], eval_metric=("mse", mse),
         callbacks=[early_stopping(5, verbose=False)],
     )
@@ -370,10 +370,10 @@ def test_callback_exception_propagates_by_type(regression):
 
 
 def test_a_failed_fit_leaves_the_estimator_unfitted(regression):
-    from mojoboost import NotFittedError
+    from mojotrees import NotFittedError
 
     X, y, Xv, yv = _split(*regression)
-    model = MojoBoostRegressor(n_estimators=10)
+    model = MojoTreesRegressor(n_estimators=10)
 
     def boom(env):
         raise Boom("stop")
@@ -390,7 +390,7 @@ def test_a_failed_fit_leaves_the_estimator_unfitted(regression):
 
 def test_a_failed_refit_does_not_keep_the_old_model(regression):
     X, y, Xv, yv = _split(*regression)
-    model = MojoBoostRegressor(n_estimators=10).fit(X, y)
+    model = MojoTreesRegressor(n_estimators=10).fit(X, y)
     assert model.__sklearn_is_fitted__()
 
     def boom(env):
@@ -420,7 +420,7 @@ def test_a_failing_before_callback_also_propagates(regression):
 def test_callbacks_need_an_eval_set(regression):
     X, y = regression
     with pytest.raises(ValueError, match="callbacks need an eval_set"):
-        MojoBoostRegressor(n_estimators=5).fit(
+        MojoTreesRegressor(n_estimators=5).fit(
             X, y, callbacks=[log_evaluation(period=1)]
         )
 
@@ -438,7 +438,7 @@ def test_no_callbacks_is_unchanged(regression):
 def test_binary_classifier_callbacks(binary):
     X, y, Xv, yv = _split(*binary)
     history = {}
-    model = MojoBoostClassifier(n_estimators=8).fit(
+    model = MojoTreesClassifier(n_estimators=8).fit(
         X, y, eval_set=[(Xv, yv)], eval_metric=("mse", mse),
         callbacks=[record_evaluation(history)],
     )
@@ -448,7 +448,7 @@ def test_binary_classifier_callbacks(binary):
 def test_multiclass_callbacks_are_refused(multiclass):
     X, y, Xv, yv = _split(*multiclass, n_valid=90)
     with pytest.raises(NotImplementedError, match="multiclass"):
-        MojoBoostClassifier(n_estimators=5).fit(
+        MojoTreesClassifier(n_estimators=5).fit(
             X, y, eval_set=[(Xv, yv)], eval_metric=("mse", mse),
             callbacks=[log_evaluation(period=1)],
         )

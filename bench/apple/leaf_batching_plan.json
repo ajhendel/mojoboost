@@ -2,8 +2,8 @@
   "plan_version": "1.0.0",
   "lane": "algorithm_22_leaf_batching",
   "modules": [
-    "src/mojoboost/gpu_frontier.mojo",
-    "src/mojoboost/gpu_leaf_batching.mojo"
+    "src/mojotrees/gpu_frontier.mojo",
+    "src/mojotrees/gpu_leaf_batching.mojo"
   ],
   "handoff": "handoffs/algorithm_22_leaf_batching.md",
   "status": "planned",
@@ -157,7 +157,7 @@
     "inherits": "docs/APPLE_GPU_BENCHMARK_PROTOCOL.md",
     "requirements": [
       "AC power, idle machine, warmup repetition discarded but kept in the record, thermal samples before and after, as the Apple protocol already requires.",
-      "MOJOBOOST_GPU_VERIFY_ROWS=1 for the correctness rows and unset for the timing rows, since the verification download adds a synchronization per split.",
+      "MOJOTREES_GPU_VERIFY_ROWS=1 for the correctness rows and unset for the timing rows, since the verification download adds a synchronization per split.",
       "Every timing row must be accompanied by the planner verdict for the same plan. A time without the verdict cannot be attributed to occupancy, memory, or anything else.",
       "A batched row and a serial row must be grown from the same seed on the same data, and their models compared, or the timing is comparing two different amounts of work."
     ]

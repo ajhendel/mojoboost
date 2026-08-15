@@ -11,7 +11,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-WHEEL=$(ls python/dist/mojoboost-*.whl)
+WHEEL=$(ls python/dist/mojotrees-*.whl)
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 

@@ -1,17 +1,17 @@
 cff-version: 1.2.0
-message: "If you use mojoboost, please cite the software and its creator."
+message: "If you use mojotrees, please cite the software and its creator."
 type: software
-title: "mojoboost: Native gradient-boosted trees in Mojo"
+title: "mojotrees: Native gradient-boosted trees in Mojo"
 authors:
   - family-names: Hendel
     given-names: Andrew
     alias: ajhendel
 version: 0.1.0
 license: Apache-2.0
-repository-code: "https://github.com/mojoboost-ml/mojoboost"
-url: "https://github.com/mojoboost-ml/mojoboost"
+repository-code: "https://github.com/mojotrees/mojotrees"
+url: "https://github.com/mojotrees/mojotrees"
 abstract: >-
-  mojoboost is an experimental gradient-boosted decision-tree library written
+  mojotrees is an experimental gradient-boosted decision-tree library written
   in Mojo, with a LightGBM-familiar Python interface and a focus on native CPU
   execution and Apple Silicon GPU acceleration.
 keywords:

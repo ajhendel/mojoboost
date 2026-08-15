@@ -1,6 +1,6 @@
-# Contributing to mojoboost
+# Contributing to mojotrees
 
-mojoboost is an experimental public alpha. Contributions that improve
+mojotrees is an experimental public alpha. Contributions that improve
 correctness, integration, portability, documentation, and reproducible
 performance evidence are welcome.
 

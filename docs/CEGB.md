@@ -1,6 +1,6 @@
 # Cost-effective gradient boosting (CEGB)
 
-Status: **implemented, not yet reachable.** `src/mojoboost/cegb.mojo` is the
+Status: **implemented, not yet reachable.** `src/mojotrees/cegb.mojo` is the
 authoritative implementation of all four of LightGBM's `cegb_*` controls. No
 grower calls it yet, and no public parameter reaches it, so setting a CEGB
 option through `params.parse_params` today still does what it did before this
@@ -257,7 +257,7 @@ first.
 One intentional numerical difference. `unread` is counted as an integer and
 multiplied once: `lazy[f] * count`. LightGBM accumulates `lazy[f]` once per
 unread row, which for a large leaf is a different floating-point number.
-mojoboost's is the exact one. This must be confirmed before the parity table
+mojotrees's is the exact one. This must be confirmed before the parity table
 calls the lazy penalty bit-comparable with LightGBM.
 
 ## 10. Intentional differences from LightGBM
@@ -276,7 +276,7 @@ calls the lazy penalty bit-comparable with LightGBM.
 
 In order. Each step is written out as a patch in
 `handoffs/remaining_04_cegb.md`, with the owning file named, because
-`src/mojoboost/cegb.mojo`, this document, and that handoff are the only files
+`src/mojotrees/cegb.mojo`, this document, and that handoff are the only files
 this lane owns.
 
 1. **Split cost, one home.** `FeaturePenalties` sheds `cegb_tradeoff`,
@@ -298,7 +298,7 @@ this lane owns.
 5. **Only then** remove the two names from `check_extra_option_supported`, add
    them to `params` (Mojo API only, since both are per-feature vectors that a
    whitespace-separated parameter string cannot carry any more than
-   `monotone_constraints` can), export from `src/mojoboost/__init__.mojo`, and
+   `monotone_constraints` can), export from `src/mojotrees/__init__.mojo`, and
    move the parity row off `deferred`.
 
 Steps 1 through 4 change no public surface. Step 5 is the only one that does.
@@ -316,7 +316,7 @@ not be applied.
 
 | Claim | True today? |
 | --- | --- |
-| Implemented | yes, `src/mojoboost/cegb.mojo` |
+| Implemented | yes, `src/mojotrees/cegb.mojo` |
 | Imported by a grower | no |
 | Called on a real split decision | no |
 | Publicly reachable | no; `params` accepts `cegb_tradeoff` and `cegb_penalty_split` only, and both flow into `FeaturePenalties`, not into this module |

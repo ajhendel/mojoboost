@@ -21,7 +21,7 @@
 #   env               table of environment variables the command needs
 #   budget_seconds    what the planner charges against the machine budget
 #   timeout_seconds   wall clock ceiling the emitted script enforces
-#   threads           value for MOJOBOOST_NUM_WORKERS
+#   threads           value for MOJOTREES_NUM_WORKERS
 #   exclusive         "", "cpu", "gpu", or "build"; overrides the tier
 #   needs             preconditions: toolchain, extension, wheel, gpu, numpy,
 #                     pytest, network, two-hosts, sudo, outside-pixi
@@ -224,7 +224,7 @@ proves = "That pixi resolves an environment and the Mojo compiler answers."
 id = "smoke:import"
 tier = "smoke"
 title = "Extension imports from the source tree"
-command = "PYTHONPATH=python python -c 'import mojoboost; print(mojoboost.gpu_available())'"
+command = "PYTHONPATH=python python -c 'import mojotrees; print(mojotrees.gpu_available())'"
 needs = ["extension"]
 budget_seconds = 10
 provenance = "unverified"
@@ -272,8 +272,8 @@ evidence = "packaging/matrix/accelerators/"
 id = "native:core"
 tier = "native"
 title = "Core training API"
-command = "pixi run mojo run -I src tests/test_mojoboost.mojo"
-requires_files = ["tests/test_mojoboost.mojo"]
+command = "pixi run mojo run -I src tests/test_mojotrees.mojo"
+requires_files = ["tests/test_mojotrees.mojo"]
 provenance = "ci"
 proves = "That the package's front door still fits and predicts."
 
@@ -448,10 +448,10 @@ requires_files = ["tests/test_missing.mojo"]
 provenance = "ci"
 proves = "That NaN routes to the learned default direction on both backends and survives serialization."
 
-# The only suite that imports mojoboost.binning directly. It carries its own
+# The only suite that imports mojotrees.binning directly. It carries its own
 # path toggle: `_fit_both_ways` fits every fixture twice, once through rank
 # selection and once through the full sort, by moving
-# MOJOBOOST_BINNING_SELECT_MIN_ROWS, and asserts the two agree edge for edge.
+# MOJOTREES_BINNING_SELECT_MIN_ROWS, and asserts the two agree edge for edge.
 # So one job covers both implementations and there is no second entry for the
 # sort path. It also sweeps worker counts, which is why it is dearer than a
 # native job's default guess.
@@ -542,7 +542,7 @@ id = "native:capi"
 tier = "native"
 title = "C ABI"
 command = "pixi run test-capi"
-requires_files = ["tests/test_capi.mojo", "capi/mojoboost_capi.mojo"]
+requires_files = ["tests/test_capi.mojo", "capi/mojotrees_capi.mojo"]
 provenance = "ci"
 proves = "That the twelve exported C functions and the ABI version query behave, from Mojo."
 
@@ -551,7 +551,7 @@ id = "native:cli"
 tier = "native"
 title = "Command line tool"
 command = "pixi run test-cli"
-requires_files = ["tests/test_cli.mojo", "cli/mojoboost_cli.mojo"]
+requires_files = ["tests/test_cli.mojo", "cli/mojotrees_cli.mojo"]
 provenance = "ci"
 proves = "That the CLI parses its flags, trains, and writes a model the library can load."
 
@@ -561,9 +561,9 @@ tier = "native"
 title = "C ABI from a C compiler"
 command = "pixi run test-c"
 needs = ["toolchain"]
-requires_files = ["capi/run_c_tests.sh", "capi/test_capi.c", "capi/mojoboost.h"]
+requires_files = ["capi/run_c_tests.sh", "capi/test_capi.c", "capi/mojotrees.h"]
 provenance = "documented"
-proves = "That capi/mojoboost.h compiles under a C compiler and the library links. Skips itself when no compiler is installed, and no CI job runs it."
+proves = "That capi/mojotrees.h compiles under a C compiler and the library links. Skips itself when no compiler is installed, and no CI job runs it."
 
 [[job]]
 id = "native:apple-gpu-policy"
@@ -692,17 +692,17 @@ proves = "That min_gain_to_split, path_smooth, and the penalty primitives comput
 id = "native:compile-package"
 tier = "native"
 title = "Type-check the whole package"
-command = "pixi run mojo package src/mojoboost -o ${TMPDIR:-/tmp}/mojoboost.mojopkg"
+command = "pixi run mojo package src/mojotrees -o ${TMPDIR:-/tmp}/mojotrees.mojopkg"
 needs = ["toolchain"]
 budget_seconds = 90
 provenance = "unverified"
-proves = "That every module in src/mojoboost compiles, including the ones no suite imports. This is the only check some modules have."
+proves = "That every module in src/mojotrees compiles, including the ones no suite imports. This is the only check some modules have."
 
 [[job]]
 id = "native:compile-module"
 tier = "native"
 title = "Type-check one module"
-command = "pixi run mojo build -I src src/mojoboost/MODULE.mojo -o ${TMPDIR:-/tmp}/MODULE"
+command = "pixi run mojo build -I src src/mojotrees/MODULE.mojo -o ${TMPDIR:-/tmp}/MODULE"
 needs = ["toolchain"]
 budget_seconds = 45
 provenance = "unverified"
@@ -720,9 +720,9 @@ command = "pixi run build-python"
 exclusive = "build"
 needs = ["toolchain"]
 budget_seconds = 180
-requires_files = ["bindings/build.sh", "bindings/_mojoboost.mojo"]
+requires_files = ["bindings/build.sh", "bindings/_mojotrees.mojo"]
 provenance = "ci"
-proves = "That the bindings compile into python/mojoboost/_mojoboost.so. Every other job in this tier needs this to have happened."
+proves = "That the bindings compile into python/mojotrees/_mojotrees.so. Every other job in this tier needs this to have happened."
 
 [[job]]
 id = "python:api"
@@ -887,7 +887,7 @@ depends_on = ["python:build-ext"]
 needs = ["pytest"]
 requires_files = ["python/tests/parallel/test_cv.py"]
 provenance = "ci"
-proves = "That mojoboost.cv folds, re-bins per fold, early stops, and returns a CVBooster."
+proves = "That mojotrees.cv folds, re-bins per fold, early stops, and returns a CVBooster."
 
 [[job]]
 id = "python:inspection"
@@ -981,7 +981,7 @@ id = "differential:cpu-pinned"
 tier = "differential"
 title = "Device routing with the accelerator disabled"
 command = "pixi run mojo run -I src tests/test_device.mojo"
-env = { MOJOBOOST_DISABLE_GPU = "1" }
+env = { MOJOTREES_DISABLE_GPU = "1" }
 needs = ["gpu"]
 requires_files = ["tests/test_device.mojo"]
 provenance = "documented"
@@ -992,7 +992,7 @@ id = "differential:threads-1"
 tier = "differential"
 title = "Single worker"
 command = "pixi run mojo run -I src tests/test_cpu_parallel.mojo"
-env = { MOJOBOOST_NUM_WORKERS = "1" }
+env = { MOJOTREES_NUM_WORKERS = "1" }
 threads = 1
 exclusive = "cpu"
 requires_files = ["tests/test_cpu_parallel.mojo"]
@@ -1004,7 +1004,7 @@ id = "differential:threads-max"
 tier = "differential"
 title = "Many workers"
 command = "pixi run mojo run -I src tests/test_cpu_parallel.mojo"
-env = { MOJOBOOST_NUM_WORKERS = "8", MOJOBOOST_PARALLEL_MIN_OPS = "65536" }
+env = { MOJOTREES_NUM_WORKERS = "8", MOJOTREES_PARALLEL_MIN_OPS = "65536" }
 threads = 8
 exclusive = "cpu"
 requires_files = ["tests/test_cpu_parallel.mojo"]
@@ -1051,7 +1051,7 @@ proves = "That the wheel installs into two venvs and its suites pass, with the M
 id = "wheel:validate-artifact"
 tier = "wheel"
 title = "Wheel matches its label"
-command = "python3 packaging/matrix/validate_artifact.py python/dist/mojoboost-*.whl"
+command = "python3 packaging/matrix/validate_artifact.py python/dist/mojotrees-*.whl"
 depends_on = ["wheel:build"]
 budget_seconds = 20
 requires_files = ["packaging/matrix/validate_artifact.py"]
@@ -1062,7 +1062,7 @@ proves = "That the wheel's tag, its Mach-O load commands, and its bundled librar
 id = "wheel:clean-install-macos"
 tier = "wheel"
 title = "Clean install, macOS"
-command = "bash packaging/matrix/smoke/clean_install_macos.sh python/dist/mojoboost-*.whl packaging/matrix/accelerators/record.txt"
+command = "bash packaging/matrix/smoke/clean_install_macos.sh python/dist/mojotrees-*.whl packaging/matrix/accelerators/record.txt"
 needs = ["wheel", "outside-pixi"]
 budget_seconds = 240
 requires_files = ["packaging/matrix/smoke/clean_install_macos.sh"]
@@ -1074,7 +1074,7 @@ evidence = "packaging/matrix/accelerators/"
 id = "wheel:clean-install-linux"
 tier = "wheel"
 title = "Clean install, Linux"
-command = "bash packaging/matrix/smoke/clean_install_linux.sh python/dist/mojoboost-*.whl"
+command = "bash packaging/matrix/smoke/clean_install_linux.sh python/dist/mojotrees-*.whl"
 needs = ["wheel", "outside-pixi"]
 budget_seconds = 240
 requires_files = ["packaging/matrix/smoke/clean_install_linux.sh"]
@@ -1086,7 +1086,7 @@ evidence = "packaging/matrix/accelerators/"
 id = "wheel:elf-report"
 tier = "wheel"
 title = "ELF inspection"
-command = "bash packaging/linux/inspect_elf.sh python/dist/mojoboost-*.whl"
+command = "bash packaging/linux/inspect_elf.sh python/dist/mojotrees-*.whl"
 needs = ["wheel"]
 budget_seconds = 60
 requires_files = ["packaging/linux/inspect_elf.sh"]
@@ -1097,7 +1097,7 @@ proves = "Which shared libraries the Linux extension needs and what symbol versi
 id = "wheel:hash"
 tier = "wheel"
 title = "Release hash manifest"
-command = "python3 packaging/security/hash_manifest.py write python/dist/SHA256SUMS python/dist/mojoboost-*.whl"
+command = "python3 packaging/security/hash_manifest.py write python/dist/SHA256SUMS python/dist/mojotrees-*.whl"
 depends_on = ["wheel:build"]
 budget_seconds = 15
 requires_files = ["packaging/security/hash_manifest.py"]
@@ -1210,7 +1210,7 @@ tier = "hardware"
 title = "GPU validation sweep"
 command = "pixi run gpu-validate 20 100000 100"
 needs = ["gpu"]
-env = { MOJOBOOST_NUM_WORKERS = "8", MOJOBOOST_PARALLEL_MIN_OPS = "65536" }
+env = { MOJOTREES_NUM_WORKERS = "8", MOJOTREES_PARALLEL_MIN_OPS = "65536" }
 budget_seconds = 900
 requires_files = ["bench/bench_gpu_validation.mojo", "docs/GPU_VALIDATION.md"]
 provenance = "ci"
@@ -1232,7 +1232,7 @@ evidence = "docs/GPU_VALIDATION.md"
 id = "hardware:hist-strategy-sweep"
 tier = "hardware"
 title = "Histogram strategy sweep"
-command = "MOJOBOOST_GPU_HIST_STRATEGY=atomic pixi run gpu-validate 20 100000 100 && MOJOBOOST_GPU_HIST_STRATEGY=tiled pixi run gpu-validate 20 100000 100"
+command = "MOJOTREES_GPU_HIST_STRATEGY=atomic pixi run gpu-validate 20 100000 100 && MOJOTREES_GPU_HIST_STRATEGY=tiled pixi run gpu-validate 20 100000 100"
 needs = ["gpu"]
 budget_seconds = 1800
 requires_files = ["docs/GPU_VALIDATION.md"]
@@ -1305,7 +1305,7 @@ id = "broad:cpu-pinned-full"
 tier = "broad"
 title = "Every suite with the accelerator disabled"
 command = "pixi run test"
-env = { MOJOBOOST_DISABLE_GPU = "1" }
+env = { MOJOTREES_DISABLE_GPU = "1" }
 broad = true
 needs = ["gpu"]
 budget_seconds = 2400
@@ -1321,7 +1321,7 @@ broad = true
 budget_seconds = 1200
 requires_files = ["bench/bench_threshold.mojo"]
 provenance = "ci"
-proves = "Where parallel work starts paying for itself on this machine, which is what MOJOBOOST_PARALLEL_MIN_OPS is set from."
+proves = "Where parallel work starts paying for itself on this machine, which is what MOJOTREES_PARALLEL_MIN_OPS is set from."
 
 [[job]]
 id = "broad:bench-hist-scaling"
@@ -1357,5 +1357,5 @@ needs = ["numpy"]
 budget_seconds = 1800
 requires_files = ["bench/compare_missing_lightgbm.py", "bench/compare_categorical_lightgbm.py", "bench/compare_ranking.py"]
 provenance = "documented"
-proves = "Whether mojoboost and LightGBM 4.7.0 agree on missing-value routing, categorical splits, and ranking. This is the only evidence behind several parity rows that currently rest on a v1 audit."
+proves = "Whether mojotrees and LightGBM 4.7.0 agree on missing-value routing, categorical splits, and ranking. This is the only evidence behind several parity rows that currently rest on a v1 audit."
 evidence = "docs/LIGHTGBM_PARITY.md"

@@ -8,7 +8,7 @@ A laptop is not a server. The number a MacBook produces in the first thirty
 seconds of a fit is not the number it produces in the twentieth minute, the
 number it produces on battery is not the number it produces on AC, and the
 number it produces on a desk is not the number it produces on a duvet. This
-document defines how mojoboost measures that, what each measurement is allowed
+document defines how mojotrees measures that, what each measurement is allowed
 to be called afterward, and which quantities this repository refuses to
 estimate.
 
@@ -31,7 +31,7 @@ It is a procedure, not a result. No run has been performed under it.
 
 Nothing here has been executed. `bench/apple/thermal_capture.sh` has never
 taken a sample, and in this version it cannot. No thermal record file exists.
-No sentence about mojoboost's power consumption, thermal behavior, or sustained
+No sentence about mojotrees's power consumption, thermal behavior, or sustained
 throughput on any Mac is currently supported by this repository.
 
 ## Relationship to the parent protocol
@@ -68,7 +68,7 @@ machine was in.
 
 ## The boundary that matters most
 
-Apple's power tooling reports the machine. It does not report mojoboost.
+Apple's power tooling reports the machine. It does not report mojotrees.
 
 `powermetrics` samples package, CPU, GPU, and ANE power for the whole system.
 Every process running contributes to every joule it reports, including the
@@ -82,19 +82,19 @@ composite of CPU time, wakeups, disk and GPU activity, computed by a model
 whose weights Apple does not publish and which changes across releases. The
 schema has a field for it, the field is labeled as a heuristic, and it carries
 a `joules_claimable` flag that is always false. It may be used to see whether
-mojoboost was in fact the dominant consumer during a window. It may never be
+mojotrees was in fact the dominant consumer during a window. It may never be
 converted to energy, compared against another machine, or printed with a unit.
 
 So there are exactly three legitimate energy statements this protocol can
 support, and one it cannot.
 
 1. "On this machine, in this window, the whole system drew a mean of X watts
-   while mojoboost fit this model, against Y watts idle immediately before."
+   while mojotrees fit this model, against Y watts idle immediately before."
 2. "Energy above idle for this fit was Z joules on this machine, under an idle
    gate that recorded no competing process."
 3. "At matched held-out quality, the GPU path used less energy above idle than
    the matched-thread CPU path on the same machine in the same session."
-4. Not supportable. "mojoboost used Z joules." No public Apple silicon tooling
+4. Not supportable. "mojotrees used Z joules." No public Apple silicon tooling
    attributes energy to a process, and this repository does not pretend
    otherwise.
 
@@ -180,7 +180,7 @@ Not used, and why.
   GPU die temperature on Apple silicon. Third-party tools that display one read
   undocumented SMC keys. This protocol does not read them, does not ship a
   table of them, and treats any temperature in degrees Celsius appearing in a
-  mojoboost record as a defect unless it came from a thermometer the operator
+  mojotrees record as a defect unless it came from a thermometer the operator
   names in `ambient_source`.
 - **Battery charge deltas as energy.** Charge percentage is quantized, is
   temperature dependent, and is reported through a gauge that is itself
@@ -288,7 +288,7 @@ change that must be argued for in a pull request rather than made quietly in a
 parser.
 
 The rule holds in the other direction too. If energy is available, it is
-recorded whether or not it flatters mojoboost, and a run whose energy numbers
+recorded whether or not it flatters mojotrees, and a run whose energy numbers
 are unfavorable is published on the same terms as one whose numbers are good.
 
 ## Result attribution
@@ -300,7 +300,7 @@ What a given number in a record is permitted to be about.
 | `fit_s` in any phase | This machine, this commit, this workload, this engine, this thread count, this condition set, at this point in the thermal history of the run | Apple silicon in general, another chip variant, another OS version, another surface |
 | Sustained ratio | The machine's ability to hold clocks under this specific load | The library, unless a matched contrast on the same machine shows a different ratio for a different engine |
 | Time to first throttle | This chassis under this load in this ambient environment | Any other ambient environment, since ambient is usually unrecorded and always uncontrolled |
-| Mean power over a window | The whole machine during that window | mojoboost |
+| Mean power over a window | The whole machine during that window | mojotrees |
 | Energy above idle | The workload plus whatever else was running, bounded by what the idle gate saw | A process |
 | Energy impact score | Which process dominated the window | Joules, watts, or any comparison across machines |
 | Cold minus warm | One-time cost paid in this process on this machine, including compilation and device setup | A breakdown of that cost, which needs the native phase counters described in `handoffs/apple_a8_benchmarks.md` and separately specified by the startup-latency lane |
@@ -356,7 +356,7 @@ measurement under this one.
   a machine. "M4 Pro, 24 GB, macOS 15.6, lid open, hard desk, AC" is.
 - State the window length beside every average power figure and the bucket size
   beside every throughput figure.
-- Never present a machine-wide power figure as mojoboost's power consumption,
+- Never present a machine-wide power figure as mojotrees's power consumption,
   in a README, a chart axis, a slide, or a forum post. If the sentence has a
   process as its subject and joules as its object, it is wrong.
 - Never publish an energy comparison between two engines that reached different
@@ -408,7 +408,7 @@ so that this can be checked before anything is collected rather than after.
   protocol, and not to be pasted into an issue.
 - `sysdiagnose` collects logs, network names, and installed software inventory
   across the whole system. It is never required by this protocol and must not
-  be attached to a mojoboost issue or pull request.
+  be attached to a mojotrees issue or pull request.
 - Ambient temperature and location notes are a person's whereabouts. Room
   descriptions belong in a record only when the person who ran it chose to put
   them there.

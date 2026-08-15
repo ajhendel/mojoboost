@@ -14,7 +14,7 @@ converts a Python call into the native call and the native answer back.
 
 Argument shape. Several of these describe a workload or a parameter set
 with a dozen fields, and they cross as a Python mapping the way
-`_parse_params` in `_mojoboost.mojo` already reads one, rather than as a
+`_parse_params` in `_mojotrees.mojo` already reads one, rather than as a
 dozen positional arguments. Eight positional arguments are proven to
 register (`predict_range`); more is untested, and a mapping also lets a
 field be added without every caller's call site moving.
@@ -31,14 +31,14 @@ from std.python import Python, PythonObject
 
 from binding_support import f64_buffer, flag, py_dict
 
-from mojoboost.device import decide_device_report
-from mojoboost.device_policy import BINS_UNSPECIFIED, OBJECTIVE_UNSPECIFIED
-from mojoboost.efb import (
+from mojotrees.device import decide_device_report
+from mojotrees.device_policy import BINS_UNSPECIFIED, OBJECTIVE_UNSPECIFIED
+from mojotrees.efb import (
     EfbParams,
     EfbSettings,
     check_bundling_supported,
 )
-from mojoboost.initialization import (
+from mojotrees.initialization import (
     N_STARTUP_PHASES,
     StartupTrace,
     env_warmup_level,
@@ -48,7 +48,7 @@ from mojoboost.initialization import (
     phase_origin,
     warmup_level_name,
 )
-from mojoboost.tree_parameters_extra import (
+from mojotrees.tree_parameters_extra import (
     ExtraTreeParams,
     FeaturePenalties,
     check_extra_option_supported,
@@ -69,7 +69,7 @@ def decide_device_workload(
     **This is the one device decision entry point.** It is registered as
     `decide_device`, which is the name `device_selection.py` looks for.
     `handoffs/connect_05_device_policy.md` section 5.1 asked for a
-    ten-argument version written directly in `_mojoboost.mojo` instead;
+    ten-argument version written directly in `_mojotrees.mojo` instead;
     this form was taken over it because a workload has a dozen fields and
     sending them positionally would fix their order in two languages and
     bet on an argument count nothing in the module has tried (eight are
@@ -94,7 +94,7 @@ def decide_device_workload(
 
     Returns the `key=value` lines `DeviceDecision.serialize` produces; see
     `serialize` in device_policy.mojo for the format and
-    `python/mojoboost/device_selection.py` for the reader.
+    `python/mojotrees/device_selection.py` for the reader.
 
     It does **not** raise for a workload the GPU path refuses: that
     refusal is `blocked=true` with `message=` saying why, which is what
@@ -172,7 +172,7 @@ def extra_params_from_mapping(
     """The extra tree bundle from the params mapping. Reads only; every
     range check is `ExtraTreeParams.check`'s.
 
-    Public because `_mojoboost.mojo` calls it too: `_parse_params` folds the
+    Public because `_mojotrees.mojo` calls it too: `_parse_params` folds the
     result into the `TreeParams` it builds, so the bundle a fit is trained
     with and the bundle `extra_params_check` validates are parsed by the same
     function from the same keys. Two parsers over one mapping is how the
@@ -203,7 +203,7 @@ def extra_params_check(
     """Validate the extra tree parameters against the run they belong to,
     and report what honoring them would require.
 
-    `params` carries the bundle in `src/mojoboost/tree_parameters_extra.mojo`:
+    `params` carries the bundle in `src/mojotrees/tree_parameters_extra.mojo`:
     `min_gain_to_split`, `max_delta_step`, `path_smooth`, `extra_trees`
     (0/1), `extra_seed`, `monotone_penalty`,
     `monotone_constraints_method` (LightGBM's name for it),
@@ -290,7 +290,7 @@ def efb_settings_from_mapping(params: PythonObject) raises -> EfbSettings:
     every reachability check is the caller's.
 
     Public for the same reason `extra_params_from_mapping` is:
-    `_parse_params` in `_mojoboost.mojo` calls it to fill
+    `_parse_params` in `_mojotrees.mojo` calls it to fill
     `BoosterParams.bundling`, so the settings a fit is trained with and the
     settings `efb_check` validates come from one function reading one set
     of keys. It is a Mojo-side helper rather than a registered binding
@@ -359,7 +359,7 @@ def startup_phase_contract() raises -> PythonObject:
     """The startup phases, in report order, as
     `[index, name, origin, one_time]` records.
 
-    The names are the schema `python/mojoboost/diagnostics.py` parses and
+    The names are the schema `python/mojotrees/diagnostics.py` parses and
     docs/STARTUP_LATENCY.md documents, so this is how that table is
     checked against the native one rather than kept in step by hand.
     `origin` is `"supplied"` for the phases that are over before any Mojo
@@ -380,8 +380,8 @@ def startup_phase_contract() raises -> PythonObject:
 def startup_environment() raises -> PythonObject:
     """What the process's environment asked of startup.
 
-    `trace_enabled` is `MOJOBOOST_STARTUP_TRACE`, and `warmup_level` is
-    `MOJOBOOST_GPU_WARMUP` as its name (`off`, `train`, or `all`), with an
+    `trace_enabled` is `MOJOTREES_STARTUP_TRACE`, and `warmup_level` is
+    `MOJOTREES_GPU_WARMUP` as its name (`off`, `train`, or `all`), with an
     unset or unrecognized value reading as `off` so an unknown value never
     silently front-loads work.
 
@@ -403,7 +403,7 @@ def native_clock_ns() raises -> PythonObject:
 
     The same clock a `StartupTrace` times phases with, read through an
     enabled trace so it provably is that clock and not a second one. A
-    harness calls this immediately after `import mojoboost` to bound the
+    harness calls this immediately after `import mojotrees` to bound the
     extension load it cannot measure from inside.
     """
     return PythonObject(StartupTrace(True).clock())

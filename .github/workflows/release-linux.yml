@@ -58,7 +58,7 @@ on:
       publish_testpypi:
         description: >-
           Attempt TestPyPI trusted publishing. Also requires the repository
-          variable MOJOBOOST_TESTPYPI_ENABLED to be 'true', and a manylinux tag.
+          variable MOJOTREES_TESTPYPI_ENABLED to be 'true', and a manylinux tag.
         type: boolean
         default: false
 
@@ -190,8 +190,8 @@ jobs:
 
       - name: Build the wheel
         env:
-          MOJOBOOST_TAG_POLICY: ${{ inputs.tag_policy }}
-          MOJOBOOST_MANYLINUX: ${{ inputs.manylinux_floor }}
+          MOJOTREES_TAG_POLICY: ${{ inputs.tag_policy }}
+          MOJOTREES_MANYLINUX: ${{ inputs.manylinux_floor }}
         run: pixi run -e pkg packaging/linux/build_wheel_linux.sh
 
       # Runs again here even though the builder calls it, because the builder
@@ -339,7 +339,7 @@ jobs:
   # matters: a filename published to an index can be yanked but never reused.
   #
   #   1. publish_testpypi defaults to false
-  #   2. the repository variable MOJOBOOST_TESTPYPI_ENABLED must be 'true',
+  #   2. the repository variable MOJOTREES_TESTPYPI_ENABLED must be 'true',
   #      which is a setting in the repository rather than a field in a dispatch
   #      form, so enabling it is a decision with an owner and an audit trail
   #   3. the `testpypi` environment should carry required reviewers, which is a
@@ -355,7 +355,7 @@ jobs:
     if: >-
       inputs.publish_testpypi &&
       inputs.tag_policy == 'manylinux' &&
-      vars.MOJOBOOST_TESTPYPI_ENABLED == 'true'
+      vars.MOJOTREES_TESTPYPI_ENABLED == 'true'
     runs-on: ubuntu-latest
     environment: testpypi
     permissions:

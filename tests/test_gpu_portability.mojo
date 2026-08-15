@@ -37,9 +37,9 @@ copies of a portability floor is exactly the drift the file exists to catch.
 
 from std.testing import assert_equal, assert_raises, assert_true, TestSuite
 
-from mojoboost.apple_gpu_policy import API_CUDA, API_HIP, API_METAL, API_UNKNOWN
-from mojoboost.gpu_histogram_specializations import KernelFeatures
-from mojoboost.gpu_portability import (
+from mojotrees.apple_gpu_policy import API_CUDA, API_HIP, API_METAL, API_UNKNOWN
+from mojotrees.gpu_histogram_specializations import KernelFeatures
+from mojotrees.gpu_portability import (
     GRID_AXES,
     MIN_SHARED_MEMORY_PER_BLOCK,
     N_REQUIREMENTS,
@@ -48,7 +48,7 @@ from mojoboost.gpu_portability import (
     require_device_can_host_kernels,
     require_histogram_launchable,
 )
-from mojoboost.gpu_tiling import (
+from mojotrees.gpu_tiling import (
     MAX_GRID_DIM_Y,
     STRATEGY_ATOMIC,
     STRATEGY_TILED,
@@ -56,7 +56,7 @@ from mojoboost.gpu_tiling import (
     derive_tiling,
     shared_bytes_for,
 )
-from mojoboost.histogram_gpu import MAX_BINS, MAX_ROWS
+from mojotrees.histogram_gpu import MAX_BINS, MAX_ROWS
 
 # Smallest shared memory per threadgroup guaranteed across the backends.
 # CUDA guarantees 48 KiB per block, AMD LDS is 64 KiB per workgroup, and

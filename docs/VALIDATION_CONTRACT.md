@@ -5,7 +5,7 @@ be written twice.
 
 ## Status of this document
 
-`src/mojoboost/validation.mojo` and `python/mojoboost/_validation.py` both
+`src/mojotrees/validation.mojo` and `python/mojotrees/_validation.py` both
 exist and hold the checks described below. What does not yet exist is the
 set of call sites: the modules that own the current fragments have not been
 edited, so at the time of writing every rule below is stated once in the
@@ -18,7 +18,7 @@ a rule is currently enforced somewhere else, the table says so.
 
 ## 1. The two layers, and why the line falls there
 
-There are two validation layers in mojoboost and they are divided by *what
+There are two validation layers in mojotrees and they are divided by *what
 a check needs to know*, not by which language it is written in.
 
 **Structure** is a property of a Python object. Is this two-dimensional. Does
@@ -26,11 +26,11 @@ it have as many rows as the label claims. Are the columns named with strings.
 Is the scipy matrix canonical. Can this dtype become float64 at all. None of
 that survives the crossing into Mojo, because what crosses is an address and
 a length, so it has to be settled on the Python side, in
-`python/mojoboost/_validation.py`.
+`python/mojotrees/_validation.py`.
 
 **Domain** is a property of the numbers. Finite. Nonnegative. In range.
 Whole. Summing to something positive. All of it survives the crossing
-intact, so it is settled once, natively, in `src/mojoboost/validation.mojo`,
+intact, so it is settled once, natively, in `src/mojotrees/validation.mojo`,
 next to the loops that depend on it.
 
 The practical test: `_validation.py` never calls `np.isfinite`, `np.isinf`,
@@ -49,7 +49,7 @@ The concrete case that motivated this: the Python layer rejects a
 not positive. Those are the same rule until `[1e-320, -1e-320]` arrives, at
 which point one accepts and the other does not, and which error a caller sees
 depends on whether they came through the estimators or through
-`mojoboost.Dataset`.
+`mojotrees.Dataset`.
 
 ### 1.2 The one deliberate overlap
 
@@ -64,7 +64,7 @@ and that duplication is intentional and documented here so it is not
 ## 2. What `validation.mojo` owns
 
 The module imports nothing from the package and takes primitives, never
-mojoboost structs. That is what lets `boosting`, `trainset`, `serialize`,
+mojotrees structs. That is what lets `boosting`, `trainset`, `serialize`,
 `sparse`, `params`, `callback`, and the bindings all call into it without
 closing an import cycle. A caller unpacks its struct at the call site.
 
@@ -103,7 +103,7 @@ Collapsing these into one "must be finite" helper is what produced the
 earlier drift, where a feature matrix and a label vector were checked by the
 same predicate and one of the two was wrong.
 
-- `check_features_finite` allows NaN because NaN is mojoboost's missing
+- `check_features_finite` allows NaN because NaN is mojotrees's missing
   marker: the binner excludes it from the quantiles and reserves a bin for it.
   An infinity is neither a value nor a marker, cannot sit between two quantile
   edges, and is the reason `binning._avoid_inf` exists.
@@ -230,7 +230,7 @@ This is the one rule in the module that is not currently enforced anywhere.
 `0 <= left[i] < n_nodes` and the same for `right[i]`. It does **not** require
 `left[i] > i`.
 
-Every grower in mojoboost appends nodes as it splits them, so a child always
+Every grower in mojotrees appends nodes as it splits them, so a child always
 sits at a higher index than its parent. `lgbm_model_io` emits in preorder for
 the same reason and says so. Both `predict_raw_row` and the exact
 contribution recursion rely on it: the first walks down with a `while` loop
@@ -401,7 +401,7 @@ same bad input always produces the same message, and a message can be
 asserted on.
 
 No check warns, clamps, or repairs. LightGBM clamps several parameters into
-range; mojoboost rejects them, on the repository's standing rule that a
+range; mojotrees rejects them, on the repository's standing rule that a
 configuration which would quietly ignore half of itself is reported. A caller
 who wants tolerance gets it by not calling.
 

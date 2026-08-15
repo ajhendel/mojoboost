@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate and optionally apply MojoBoost contributor access policy.
+"""Evaluate and optionally apply MojoTrees contributor access policy.
 
 This deliberately counts merged pull requests rather than commits or lines.
 It uses only Python's standard library and GitHub's REST API. The normal
@@ -41,7 +41,7 @@ class GitHub:
                 "Accept": "application/vnd.github+json",
                 "Authorization": f"Bearer {self.token}",
                 "X-GitHub-Api-Version": "2022-11-28",
-                "User-Agent": "mojoboost-governance-access",
+                "User-Agent": "mojotrees-governance-access",
             },
         )
         try:

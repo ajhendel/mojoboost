@@ -114,7 +114,7 @@ artifact changes rather than re-derived from scratch:
 
 Two situations flip this decision, and neither is true today. Shipping a
 downloadable installer or a standalone binary (a `.pkg`, a `.dmg`, or the
-`cli/mojoboost` executable offered as a release download) puts a quarantine
+`cli/mojotrees` executable offered as a release download) puts a quarantine
 attribute on something a user launches directly, and that needs Developer ID and
 notarization. And a user who downloads the `.whl` in a browser gets a quarantined
 *wheel file*; the assumption here is that the attribute does not propagate to the
@@ -124,7 +124,7 @@ it has not been run.
 
 ## The one thing to check before trusting any of this
 
-`has_accelerator()` is resolved at compile time (`src/mojoboost/device.mojo`), so
+`has_accelerator()` is resolved at compile time (`src/mojotrees/device.mojo`), so
 a wheel built on a machine with a visible accelerator is a different product from
 the same commit built on a machine without one, under the same filename.
 `provenance.sh` records the answer, and refuses to certify a build whose

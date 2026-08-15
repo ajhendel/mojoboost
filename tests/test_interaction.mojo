@@ -20,11 +20,11 @@ from std.testing import (
     TestSuite,
 )
 
-from mojoboost.binning import bin_equal_width
-from mojoboost.boosting import SQUARED_ERROR, BoosterParams, train
-from mojoboost.interaction import InteractionConstraints, extend_branch
-from mojoboost.train_gpu import train_gpu
-from mojoboost.tree import Tree, TreeParams
+from mojotrees.binning import bin_equal_width
+from mojotrees.boosting import SQUARED_ERROR, BoosterParams, train
+from mojotrees.interaction import InteractionConstraints, extend_branch
+from mojotrees.train_gpu import train_gpu
+from mojotrees.tree import Tree, TreeParams
 
 
 def _groups(

@@ -1,6 +1,6 @@
-# Getting help with mojoboost
+# Getting help with mojotrees
 
-mojoboost is an experimental public alpha maintained by volunteers. Questions
+mojotrees is an experimental public alpha maintained by volunteers. Questions
 are welcome, including ones that turn out to be about your own code. If
 something in the documentation was misleading enough to send you here, saying
 so is a useful contribution by itself.
@@ -9,11 +9,11 @@ so is a useful contribution by itself.
 
 | You want to | Go here |
 | --- | --- |
-| Ask how to do something, or why mojoboost behaves a certain way | [Discussions, Q&A](https://github.com/mojoboost-ml/mojoboost/discussions/categories/q-a) |
-| Report something broken or wrong | [Bug report issue](https://github.com/mojoboost-ml/mojoboost/issues/new?template=bug_report.yml) |
-| Share a benchmark or a result from real hardware | [docs/HARDWARE_CONTRIBUTORS.md](docs/HARDWARE_CONTRIBUTORS.md) first, then the [hardware result form](https://github.com/mojoboost-ml/mojoboost/issues/new?template=hardware_result.yml) |
-| Propose a feature or an API change | [Discussions, Ideas](https://github.com/mojoboost-ml/mojoboost/discussions/categories/ideas) |
-| Show what you built with it | [Discussions, Show and tell](https://github.com/mojoboost-ml/mojoboost/discussions/categories/show-and-tell) |
+| Ask how to do something, or why mojotrees behaves a certain way | [Discussions, Q&A](https://github.com/mojotrees/mojotrees/discussions/categories/q-a) |
+| Report something broken or wrong | [Bug report issue](https://github.com/mojotrees/mojotrees/issues/new?template=bug_report.yml) |
+| Share a benchmark or a result from real hardware | [docs/HARDWARE_CONTRIBUTORS.md](docs/HARDWARE_CONTRIBUTORS.md) first, then the [hardware result form](https://github.com/mojotrees/mojotrees/issues/new?template=hardware_result.yml) |
+| Propose a feature or an API change | [Discussions, Ideas](https://github.com/mojotrees/mojotrees/discussions/categories/ideas) |
+| Show what you built with it | [Discussions, Show and tell](https://github.com/mojotrees/mojotrees/discussions/categories/show-and-tell) |
 | Report a security vulnerability | Privately, per [SECURITY.md](SECURITY.md). Never in a public issue. |
 | Report a Code of Conduct problem | [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) |
 
@@ -27,7 +27,7 @@ reading a question that did not.
 Two documents answer most questions faster than a thread will.
 
 - [docs/LIGHTGBM_PARITY.md](docs/LIGHTGBM_PARITY.md) is the behavior contract.
-  If mojoboost differs from LightGBM, this file says whether the difference is
+  If mojotrees differs from LightGBM, this file says whether the difference is
   deliberate. It is authoritative where it and the README disagree.
 - [docs/GPU_VALIDATION.md](docs/GPU_VALIDATION.md) covers accelerator status.
   Before reporting that the GPU path is slow, absent, or refusing to run, check
@@ -80,12 +80,12 @@ performance questions without a reproducible benchmark.
 
 ## Commercial support
 
-There is none. mojoboost has no company behind it, no support contract, no
+There is none. mojotrees has no company behind it, no support contract, no
 service level agreement, and no paid tier. It is Apache-2.0 software provided
 as-is. See [GOVERNANCE.md](GOVERNANCE.md) if you want the longer version of
 what the project is and is not.
 
-If you depend on mojoboost for something that matters, the practical answers
+If you depend on mojotrees for something that matters, the practical answers
 are to pin a commit, keep your own tests against your own data, and contribute
 the fixes you need. Write access is available to anyone contributing regularly,
 and [GOVERNANCE.md](GOVERNANCE.md) says how.

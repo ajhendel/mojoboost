@@ -17,7 +17,7 @@ changed rule rather than as a changed golden value.
 from std.testing import assert_equal, assert_false, assert_raises, assert_true
 from std.testing import TestSuite
 
-from mojoboost.tree_parameters_extra import (
+from mojotrees.tree_parameters_extra import (
     DEFAULT_EXTRA_SEED,
     MONOTONE_ADVANCED,
     MONOTONE_BASIC,
@@ -641,7 +641,7 @@ def test_bundle_validation_rejects_rather_than_clamps() raises:
     with assert_raises():
         delta.check(4, 31, -1, 20)
 
-    # LightGBM raises min_data_in_leaf to 2 with a warning here; mojoboost
+    # LightGBM raises min_data_in_leaf to 2 with a warning here; mojotrees
     # says so instead of changing a number the caller set.
     var smooth = ExtraTreeParams()
     smooth.path_smooth = 5.0

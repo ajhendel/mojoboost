@@ -17,8 +17,8 @@ monotone.
 from std.os import remove
 from std.testing import assert_equal, assert_raises, assert_true, TestSuite
 
-from mojoboost.binning import bin_equal_width
-from mojoboost.boosting import (
+from mojotrees.binning import bin_equal_width
+from mojotrees.boosting import (
     BINARY_LOGISTIC,
     L1,
     QUANTILE,
@@ -27,11 +27,11 @@ from mojoboost.boosting import (
     train,
     train_multiclass,
 )
-from mojoboost.histogram import build_histogram
-from mojoboost.model import Model, fit, fit_multiclass
-from mojoboost.model_sparse import fit_csc
-from mojoboost.sparse import csc_from_dense
-from mojoboost.monotone import (
+from mojotrees.histogram import build_histogram
+from mojotrees.model import Model, fit, fit_multiclass
+from mojotrees.model_sparse import fit_csc
+from mojotrees.sparse import csc_from_dense
+from mojotrees.monotone import (
     MONOTONE_DECREASING,
     MONOTONE_FREE,
     MONOTONE_INCREASING,
@@ -40,9 +40,9 @@ from mojoboost.monotone import (
     child_bounds,
     violates,
 )
-from mojoboost.serialize import load_model, save_model
-from mojoboost.split import find_best_split
-from mojoboost.tree import Tree, TreeParams, grow_tree, node_bounds
+from mojotrees.serialize import load_model, save_model
+from mojotrees.split import find_best_split
+from mojotrees.tree import Tree, TreeParams, grow_tree, node_bounds
 
 comptime _TMP_PATH = "./.test_monotone_roundtrip.tmp"
 

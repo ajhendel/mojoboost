@@ -5,10 +5,10 @@ import inspect
 import numpy as np
 import pytest
 
-from mojoboost import MojoBoostClassifier, MojoBoostRegressor
-from mojoboost import _sklearn
+from mojotrees import MojoTreesClassifier, MojoTreesRegressor
+from mojotrees import _sklearn
 
-ESTIMATORS = [MojoBoostRegressor, MojoBoostClassifier]
+ESTIMATORS = [MojoTreesRegressor, MojoTreesClassifier]
 
 
 @pytest.mark.parametrize("cls", ESTIMATORS)
@@ -89,7 +89,7 @@ def test_repr_shows_only_non_defaults(cls):
 
 @pytest.mark.parametrize("cls", ESTIMATORS)
 def test_set_params_after_fit_leaves_the_model_alone(cls, regression, binary):
-    X, y = regression if cls is MojoBoostRegressor else binary
+    X, y = regression if cls is MojoTreesRegressor else binary
     est = cls(n_estimators=5).fit(X, y)
     before = list(est.predict(X[:10]))
     est.set_params(n_estimators=500)
@@ -105,28 +105,28 @@ def test_regularization_aliases_train_the_same_model(native, alias, regression):
     """LightGBM's scikit-learn estimators spell lambda_l1 and lambda_l2
     reg_alpha and reg_lambda. Either spelling must reach the trainer."""
     X, y = regression
-    named = MojoBoostRegressor(n_estimators=5, **{native: 3.0}).fit(X, y)
-    aliased = MojoBoostRegressor(n_estimators=5, **{alias: 3.0}).fit(X, y)
+    named = MojoTreesRegressor(n_estimators=5, **{native: 3.0}).fit(X, y)
+    aliased = MojoTreesRegressor(n_estimators=5, **{alias: 3.0}).fit(X, y)
     assert list(named.predict(X[:20])) == list(aliased.predict(X[:20]))
     # Regularizing that hard has to move the fit, or the test above would
     # pass for a parameter that goes nowhere.
-    plain = MojoBoostRegressor(n_estimators=5).fit(X, y)
+    plain = MojoTreesRegressor(n_estimators=5).fit(X, y)
     assert list(plain.predict(X[:20])) != list(aliased.predict(X[:20]))
 
 
 @pytest.mark.parametrize("native, alias", REG_ALIASES)
 def test_agreeing_regularization_aliases_are_accepted(native, alias, regression):
     X, y = regression
-    est = MojoBoostRegressor(n_estimators=5, **{native: 3.0, alias: 3.0})
+    est = MojoTreesRegressor(n_estimators=5, **{native: 3.0, alias: 3.0})
     assert list(est.fit(X, y).predict(X[:20]))
 
 
 @pytest.mark.parametrize("native, alias", REG_ALIASES)
 def test_conflicting_regularization_aliases_raise(native, alias, regression):
-    """LightGBM warns and keeps one value; mojoboost raises, so a typo
+    """LightGBM warns and keeps one value; mojotrees raises, so a typo
     cannot quietly train a different model."""
     X, y = regression
-    est = MojoBoostRegressor(n_estimators=5, **{native: 3.0, alias: 1.0})
+    est = MojoTreesRegressor(n_estimators=5, **{native: 3.0, alias: 1.0})
     with pytest.raises(ValueError, match="aliases"):
         est.fit(X, y)
     # Stored unmodified either way, so the clash surfaces at fit time and
@@ -139,22 +139,22 @@ def test_boosting_alias_selects_goss(regression):
     """`boosting` is LightGBM's native name and `boosting_type` its
     scikit-learn spelling; both must reach the sampler."""
     X, y = regression
-    named = MojoBoostRegressor(
+    named = MojoTreesRegressor(
         n_estimators=10, boosting="goss", goss_warmup_rounds=0
     ).fit(X, y)
-    aliased = MojoBoostRegressor(
+    aliased = MojoTreesRegressor(
         n_estimators=10, boosting_type="goss", goss_warmup_rounds=0
     ).fit(X, y)
     assert list(named.predict(X[:20])) == list(aliased.predict(X[:20]))
     # Sampling has to move the fit, or the equality above would hold for a
     # parameter that goes nowhere.
-    plain = MojoBoostRegressor(n_estimators=10).fit(X, y)
+    plain = MojoTreesRegressor(n_estimators=10).fit(X, y)
     assert list(plain.predict(X[:20])) != list(named.predict(X[:20]))
 
 
 def test_conflicting_boosting_aliases_raise(regression):
     X, y = regression
-    est = MojoBoostRegressor(
+    est = MojoTreesRegressor(
         n_estimators=5, boosting="goss", boosting_type="gbdt"
     )
     with pytest.raises(ValueError, match="aliases"):
@@ -180,7 +180,7 @@ def test_conflicting_boosting_aliases_raise(regression):
 def test_goss_parameter_validation(kwargs, regression):
     X, y = regression
     with pytest.raises(ValueError):
-        MojoBoostRegressor(n_estimators=5, **kwargs).fit(X, y)
+        MojoTreesRegressor(n_estimators=5, **kwargs).fit(X, y)
 
 
 def test_categorical_feature_alias_trains_the_same_model(regression):
@@ -192,21 +192,21 @@ def test_categorical_feature_alias_trains_the_same_model(regression):
     # Categorical columns must hold whole-number codes, and the labels are
     # permuted so no ordinal threshold can reproduce the categorical splits.
     X[:, 0] = (np.floor(X[:, 0] * 8) * 5) % 8
-    named = MojoBoostRegressor(
+    named = MojoTreesRegressor(
         n_estimators=5, categorical_feature=[0]
     ).fit(X, y)
-    aliased = MojoBoostRegressor(
+    aliased = MojoTreesRegressor(
         n_estimators=5, categorical_features=[0]
     ).fit(X, y)
     assert list(named.predict(X[:20])) == list(aliased.predict(X[:20]))
 
-    plain = MojoBoostRegressor(n_estimators=5).fit(X, y)
+    plain = MojoTreesRegressor(n_estimators=5).fit(X, y)
     assert list(plain.predict(X[:20])) != list(aliased.predict(X[:20]))
 
 
 def test_conflicting_categorical_aliases_raise(regression):
     X, y = regression
-    est = MojoBoostRegressor(
+    est = MojoTreesRegressor(
         n_estimators=5, categorical_feature=[0], categorical_features=[1]
     )
     with pytest.raises(ValueError, match="aliases"):
@@ -230,8 +230,8 @@ def test_categorical_columns_are_split_by_category_not_threshold(regression):
         min_data_per_group=5,
         cat_smooth=2.0,
     )
-    as_cat = MojoBoostRegressor(categorical_feature=[0], **common).fit(X, y)
-    as_num = MojoBoostRegressor(**common).fit(X, y)
+    as_cat = MojoTreesRegressor(categorical_feature=[0], **common).fit(X, y)
+    as_num = MojoTreesRegressor(**common).fit(X, y)
 
     cat_mse = float(np.mean((np.asarray(as_cat.predict(X)) - y) ** 2))
     num_mse = float(np.mean((np.asarray(as_num.predict(X)) - y) ** 2))
@@ -247,7 +247,7 @@ def test_unseen_and_missing_categories_route_together(regression):
     y = np.where(codes % 2 == 0, 1.0, -1.0)
     X = codes.astype(float).reshape(-1, 1)
 
-    model = MojoBoostRegressor(
+    model = MojoTreesRegressor(
         num_leaves=8,
         n_estimators=20,
         learning_rate=0.2,
@@ -280,7 +280,7 @@ def test_unseen_and_missing_categories_route_together(regression):
 def test_categorical_parameter_validation(kwargs, regression):
     X, y = regression
     with pytest.raises(ValueError):
-        MojoBoostRegressor(n_estimators=5, **kwargs).fit(X, y)
+        MojoTreesRegressor(n_estimators=5, **kwargs).fit(X, y)
 
 
 def test_var_positional_init_is_rejected():
@@ -315,7 +315,7 @@ def test_var_positional_init_is_rejected():
 def test_objective_names_resolve(objective):
     """Every documented name maps to a code without touching data."""
     assert isinstance(
-        MojoBoostRegressor(objective=objective)._objective_code(), int
+        MojoTreesRegressor(objective=objective)._objective_code(), int
     )
 
 
@@ -325,22 +325,22 @@ def test_objective_names_resolve(objective):
         ("cross_entropy_lambda", "cross_entropy"),
         ("multiclassova", "one-vs-rest"),
         ("rank_xendcg", "lambdarank"),
-        ("multiclass", "MojoBoostClassifier"),
+        ("multiclass", "MojoTreesClassifier"),
     ],
 )
 def test_unimplemented_objectives_are_named_not_merely_unknown(
     objective, label
 ):
-    """A LightGBM objective mojoboost does not implement says so, and says
+    """A LightGBM objective mojotrees does not implement says so, and says
     what to use instead; it is not lumped in with a typo."""
     with pytest.raises(ValueError) as excinfo:
-        MojoBoostRegressor(objective=objective)._objective_code()
+        MojoTreesRegressor(objective=objective)._objective_code()
     assert label in str(excinfo.value)
 
 
 def test_unknown_objective_still_lists_the_known_ones():
     with pytest.raises(ValueError, match="unknown objective"):
-        MojoBoostRegressor(objective="regresion")._objective_code()
+        MojoTreesRegressor(objective="regresion")._objective_code()
 
 
 @pytest.mark.parametrize(
@@ -357,18 +357,18 @@ def test_unknown_objective_still_lists_the_known_ones():
 )
 def test_objective_parameter_ranges(kwargs):
     with pytest.raises(ValueError):
-        MojoBoostRegressor(**kwargs)._objective_code()
+        MojoTreesRegressor(**kwargs)._objective_code()
 
 
 def test_objective_parameter_defaults_follow_lightgbm():
-    assert MojoBoostRegressor(objective="fair")._objective_param() == 1.0
+    assert MojoTreesRegressor(objective="fair")._objective_param() == 1.0
     assert (
-        MojoBoostRegressor(objective="tweedie")._objective_param() == 1.5
+        MojoTreesRegressor(objective="tweedie")._objective_param() == 1.5
     )
-    assert MojoBoostRegressor(objective="quantile")._objective_param() == 0.9
+    assert MojoTreesRegressor(objective="quantile")._objective_param() == 0.9
     # An objective with no scalar parameter still reports something for the
     # trainer's slot, and never fails on it.
-    assert MojoBoostRegressor(objective="poisson")._objective_param() == 0.9
+    assert MojoTreesRegressor(objective="poisson")._objective_param() == 0.9
 
 
 @pytest.mark.parametrize(
@@ -385,13 +385,13 @@ def test_a_scalar_parameter_from_another_objective_is_rejected(kwargs):
     they share the trainer's one slot, so setting the wrong one would
     quietly do nothing. LightGBM ignores it; this reports it."""
     with pytest.raises(ValueError, match="does not apply to objective"):
-        MojoBoostRegressor(**kwargs)._objective_code()
+        MojoTreesRegressor(**kwargs)._objective_code()
 
 
 def test_alpha_stays_lenient_for_the_objectives_that_ignore_it():
     """`alpha` is the shared default name several objectives ignore, and
     passing it alongside any objective is long-standing usage."""
-    assert MojoBoostRegressor(
+    assert MojoTreesRegressor(
         objective="regression", alpha=0.3
     )._objective_code() == 0
 
@@ -412,7 +412,7 @@ def test_link_objectives_predict_on_the_response_scale(
     back through the objective's inverse link rather than as a raw score."""
     X = np.array([[0.0], [1.0], [2.0], [3.0]])
     y = np.full(4, label)
-    model = MojoBoostRegressor(
+    model = MojoTreesRegressor(
         objective=objective, n_estimators=5, num_leaves=2
     ).fit(X, y)
     assert model.predict(X) == pytest.approx(np.full(4, expected), rel=1e-6)
@@ -434,16 +434,16 @@ def test_link_objectives_validate_their_labels(objective, y, message):
     every fit-time Mojo error arrives today."""
     X = np.array([[0.0], [1.0], [2.0], [3.0]])
     with pytest.raises(Exception, match=message):
-        MojoBoostRegressor(objective=objective, n_estimators=3).fit(X, y)
+        MojoTreesRegressor(objective=objective, n_estimators=3).fit(X, y)
 
 
 # -- class_weight ---------------------------------------------------------
 
 
 def test_class_weight_is_a_constructor_parameter():
-    est = MojoBoostClassifier(class_weight={0: 1.0, 1: 3.0})
+    est = MojoTreesClassifier(class_weight={0: 1.0, 1: 3.0})
     assert est.get_params()["class_weight"] == {0: 1.0, 1: 3.0}
-    assert MojoBoostClassifier().get_params()["class_weight"] is None
+    assert MojoTreesClassifier().get_params()["class_weight"] is None
 
 
 def _unbalanced():
@@ -455,8 +455,8 @@ def _unbalanced():
 
 def test_balanced_class_weight_raises_the_minority_probability():
     X, y = _unbalanced()
-    plain = MojoBoostClassifier(n_estimators=5, num_leaves=2).fit(X, y)
-    balanced = MojoBoostClassifier(
+    plain = MojoTreesClassifier(n_estimators=5, num_leaves=2).fit(X, y)
+    balanced = MojoTreesClassifier(
         n_estimators=5, num_leaves=2, class_weight="balanced"
     ).fit(X, y)
     # Weighting moves the whole probability scale toward the rare class,
@@ -471,10 +471,10 @@ def test_class_weight_dict_equals_the_same_sample_weight():
     train the identical model."""
     X, y = _unbalanced()
     weights = np.where(y == 1, 5.0, 1.0)
-    by_dict = MojoBoostClassifier(
+    by_dict = MojoTreesClassifier(
         n_estimators=8, num_leaves=3, class_weight={0: 1.0, 1: 5.0}
     ).fit(X, y)
-    by_hand = MojoBoostClassifier(n_estimators=8, num_leaves=3).fit(
+    by_hand = MojoTreesClassifier(n_estimators=8, num_leaves=3).fit(
         X, y, sample_weight=weights
     )
     assert by_dict.predict_proba(X) == pytest.approx(
@@ -486,10 +486,10 @@ def test_class_weight_multiplies_sample_weight():
     X, y = _unbalanced()
     given = np.full(len(y), 2.0)
     combined = np.where(y == 1, 6.0, 2.0)
-    with_both = MojoBoostClassifier(
+    with_both = MojoTreesClassifier(
         n_estimators=6, num_leaves=3, class_weight={1: 3.0}
     ).fit(X, y, sample_weight=given)
-    by_hand = MojoBoostClassifier(n_estimators=6, num_leaves=3).fit(
+    by_hand = MojoTreesClassifier(n_estimators=6, num_leaves=3).fit(
         X, y, sample_weight=combined
     )
     assert with_both.predict_proba(X) == pytest.approx(
@@ -510,6 +510,6 @@ def test_class_weight_multiplies_sample_weight():
 def test_class_weight_validation(class_weight, error):
     X, y = _unbalanced()
     with pytest.raises(error):
-        MojoBoostClassifier(
+        MojoTreesClassifier(
             n_estimators=3, class_weight=class_weight
         ).fit(X, y)

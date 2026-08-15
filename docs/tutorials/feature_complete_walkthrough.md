@@ -1,4 +1,4 @@
-# A walk through everything mojoboost can do
+# A walk through everything mojotrees can do
 
 One dataset, one session, and every feature the Python API exposes, in the
 order you would meet them. Validation, early stopping, callbacks,
@@ -11,7 +11,7 @@ if there is one. A tutorial that only shows the happy path is a sales
 document, and it costs the reader an afternoon to find out.
 
 **Status of this document.** The code here was written against the source
-of `python/mojoboost` and against `docs/LIGHTGBM_PARITY.md`. It has not
+of `python/mojotrees` and against `docs/LIGHTGBM_PARITY.md`. It has not
 been executed end to end as one script by the pass that wrote it, so treat
 it as a careful reading rather than as a transcript. Turning it into a
 script that CI runs is tracked in `handoffs/task20_compatibility.md`.
@@ -34,8 +34,8 @@ walkthrough uses numpy because the shapes are easier to read.
 
 ```python
 import numpy as np
-import mojoboost as mb
-from mojoboost import MojoBoostRegressor, MojoBoostClassifier, MojoBoostRanker
+import mojotrees as mb
+from mojotrees import MojoTreesRegressor, MojoTreesClassifier, MojoTreesRanker
 
 rng = np.random.default_rng(0)
 n, p = 4000, 12
@@ -52,13 +52,13 @@ Defaults are LightGBM's, deliberately, so a comparison measures the
 implementation and not the configuration.
 
 ```python
-model = MojoBoostRegressor().fit(X_train, y_train)
+model = MojoTreesRegressor().fit(X_train, y_train)
 pred = model.predict(X_valid)
 ```
 
 `num_leaves=31`, `learning_rate=0.1`, `n_estimators=100`,
 `min_data_in_leaf=20`, and `max_bin=255` are LightGBM's values. Two are
-mojoboost's own and worth knowing: `lambda_l2` defaults to 1.0 and
+mojotrees's own and worth knowing: `lambda_l2` defaults to 1.0 and
 `min_child_hess` to 1e-3.
 
 `X` may hold `NaN`, which is the missing-value marker. It may not hold
@@ -71,7 +71,7 @@ LightGBM's scikit-learn wrapper, which validates with
 Every estimator takes LightGBM's validation arguments.
 
 ```python
-model = MojoBoostRegressor(n_estimators=200).fit(
+model = MojoTreesRegressor(n_estimators=200).fit(
     X_train, y_train,
     eval_set=[(X_valid, y_valid)],
     eval_names=["holdout"],
@@ -85,8 +85,8 @@ separate `eval_X=` and `eval_y=` arguments. Unnamed sets are `valid_0`,
 set.
 
 `eval_metric` takes built-in names, callables, or a mix. The names resolve
-through `python/mojoboost/_eval.py` to codes that
-`src/mojoboost/metrics.mojo` computes, so a named metric agrees with the
+through `python/mojotrees/_eval.py` to codes that
+`src/mojotrees/metrics.mojo` computes, so a named metric agrees with the
 Mojo API by construction rather than by a second Python implementation.
 
 | Task | Names |
@@ -111,7 +111,7 @@ def top_decile_error(y_true, y_pred):
     idx = np.argsort(y_pred)[-k:]
     return float(np.mean((y_true[idx] - y_pred[idx]) ** 2))
 
-model = MojoBoostRegressor(n_estimators=200).fit(
+model = MojoTreesRegressor(n_estimators=200).fit(
     X_train, y_train,
     eval_set=[(X_valid, y_valid)],
     eval_metric=["l2", ("top_decile", top_decile_error, False)],
@@ -146,7 +146,7 @@ Section 5.4 of the compatibility policy records that this is not settled.
 ## 3. Early stopping
 
 ```python
-model = MojoBoostRegressor(n_estimators=2000).fit(
+model = MojoTreesRegressor(n_estimators=2000).fit(
     X_train, y_train,
     eval_set=[(X_valid, y_valid)],
     eval_metric=["l2", "l1"],
@@ -182,13 +182,13 @@ and says so.
 ## 4. Callbacks
 
 LightGBM's four factories are here, importable from the top level or from
-`mojoboost.callback`.
+`mojotrees.callback`.
 
 ```python
-from mojoboost import log_evaluation, record_evaluation, reset_parameter
+from mojotrees import log_evaluation, record_evaluation, reset_parameter
 
 recorded = {}
-model = MojoBoostRegressor(n_estimators=100).fit(
+model = MojoTreesRegressor(n_estimators=100).fit(
     X_train, y_train,
     eval_set=[(X_valid, y_valid)],
     eval_metric=["l2"],
@@ -233,7 +233,7 @@ learning-rate schedule today.
 
 ```python
 model.feature_importances_          # importance_type="split" by default
-MojoBoostRegressor(importance_type="gain").fit(X_train, y_train).feature_importances_
+MojoTreesRegressor(importance_type="gain").fit(X_train, y_train).feature_importances_
 
 booster = model.booster_
 booster.num_trees()
@@ -241,7 +241,7 @@ booster.current_iteration()
 booster.num_model_per_iteration()
 booster.num_feature()
 booster.feature_name()
-text = booster.model_to_string()    # the whole model, in mojoboost's format
+text = booster.model_to_string()    # the whole model, in mojotrees's format
 ```
 
 `booster_` is the same model object the functional API returns, so there
@@ -250,7 +250,7 @@ is one model type in this package rather than one per door.
 Structured inspection lives in its own module.
 
 ```python
-from mojoboost.inspection import dump_model, trees_to_dataframe
+from mojotrees.inspection import dump_model, trees_to_dataframe
 
 dump = dump_model(model)             # the schema, as a dict
 frame = trees_to_dataframe(model)    # one row per node, LightGBM's columns
@@ -272,10 +272,10 @@ model read from a file written before v4 reports `has_split_gain: false`,
 because those formats dropped the gains and a fitted tree cannot recompute
 them, and a v1 or v2 model reports `has_node_count: false`.
 
-**Two caveats.** `trees_to_dataframe` needs pandas, which mojoboost does
+**Two caveats.** `trees_to_dataframe` needs pandas, which mojotrees does
 not depend on; `trees_to_records` is the dependency-free form. And as of
 this writing the inspection names are not re-exported from the package
-top level, so `mojoboost.inspection` is a submodule import rather than one
+top level, so `mojotrees.inspection` is a submodule import rather than one
 of the guaranteed import paths. Section 8.1 of the compatibility policy
 carries that as an open question for the first release, not as a
 statement that the module is unstable.
@@ -286,7 +286,7 @@ Three ways to move a model, carrying three different amounts.
 
 ```python
 model.save("model.mbst")
-reloaded = MojoBoostRegressor.load("model.mbst")
+reloaded = MojoTreesRegressor.load("model.mbst")
 
 import pickle
 blob = pickle.dumps(model)
@@ -308,7 +308,7 @@ precision, or endianness pitfall. Every release reads every file any
 earlier release wrote. An older release does **not** read a newer file,
 and says so rather than misparsing.
 
-It is mojoboost's format, not LightGBM's. The two are not interchangeable
+It is mojotrees's format, not LightGBM's. The two are not interchangeable
 in either direction.
 
 ## 7. Continued training
@@ -381,7 +381,7 @@ split-gain heuristic.
 
 A leaf is named by its ordinal within its own tree, in
 `[0, num_leaves)`, in node order. The numbering is fixed once a tree is
-grown and survives `save`, `load`, and pickle. It is mojoboost's own
+grown and survives `save`, `load`, and pickle. It is mojotrees's own
 numbering and not LightGBM's, and the two agree only by coincidence, so
 leaf ids used as a categorical feature downstream cannot be transferred
 between the two libraries.
@@ -408,7 +408,7 @@ from scipy import sparse
 Xs = sparse.random(4000, 200, density=0.01, format="csr", random_state=0)
 ys = rng.normal(size=4000)
 
-model = MojoBoostRegressor().fit(Xs, ys)
+model = MojoTreesRegressor().fit(Xs, ys)
 pred = model.predict(Xs)
 ```
 
@@ -452,7 +452,7 @@ import pandas as pd
 frame = pd.DataFrame(X_train, columns=[f"f{i}" for i in range(p)])
 frame["city"] = pd.Categorical(rng.choice(["a", "b", "c"], size=len(frame)))
 
-model = MojoBoostClassifier().fit(frame, (y_train > 0).astype(int))
+model = MojoTreesClassifier().fit(frame, (y_train > 0).astype(int))
 model.categorical_feature_
 ```
 
@@ -485,7 +485,7 @@ dtype to read.
 ```python
 mb.gpu_available()                       # can this build train on an accelerator
 
-model = MojoBoostRegressor(device="cpu").fit(X_train, y_train)     # the default
+model = MojoTreesRegressor(device="cpu").fit(X_train, y_train)     # the default
 model.device_                            # the backend that actually ran
 ```
 
@@ -497,8 +497,8 @@ for you and **currently always picks the CPU**. Fitting records what ran
 on `device_`.
 
 CPU parallelism is controlled by two environment variables.
-`MOJOBOOST_NUM_WORKERS` is 1 for serial, N above 1 to force chunked
-dispatch, and 0 or unset for automatic. `MOJOBOOST_PARALLEL_MIN_OPS`
+`MOJOTREES_NUM_WORKERS` is 1 for serial, N above 1 to force chunked
+dispatch, and 0 or unset for automatic. `MOJOTREES_PARALLEL_MIN_OPS`
 overrides the built-in threshold below which dispatch stays serial.
 Neither changes a result. Each feature owns its output slice during
 histogram accumulation, so the worker count is a speed control and not a
@@ -528,7 +528,7 @@ The classifier picks binary or softmax from the labels, which may be of
 any single comparable type.
 
 ```python
-clf = MojoBoostClassifier(class_weight="balanced").fit(X_train, y_train > 0)
+clf = MojoTreesClassifier(class_weight="balanced").fit(X_train, y_train > 0)
 clf.classes_
 clf.predict_proba(X_valid)          # (n, n_classes), columns in classes_ order
 clf.predict(X_valid)                # labels from classes_, the argmax of the above
@@ -542,7 +542,7 @@ Weighting is not calibration: a class-weighted model's probabilities are
 probabilities under the reweighted sample.
 
 The classifier takes no `objective`. Custom objectives are single-output
-only, so pass yours to `MojoBoostRegressor` and apply your own link to the
+only, so pass yours to `MojoTreesRegressor` and apply your own link to the
 raw predictions. `objective=` is accepted on the classifier solely so that
 passing one raises that message instead of a bare `TypeError`.
 
@@ -550,7 +550,7 @@ The ranker takes query groups.
 
 ```python
 group = mb.group_from_query_ids(query_ids)     # per-query row counts
-rnk = MojoBoostRanker(ndcg_eval_at=10).fit(X_train, rel_train, group=group)
+rnk = MojoTreesRanker(ndcg_eval_at=10).fit(X_train, rel_train, group=group)
 scores = rnk.predict(X_valid)                  # sort within a query, descending
 mb.ndcg_score(scores, rel_valid, valid_group, at=10)
 ```
@@ -566,7 +566,7 @@ def logcosh(raw, y):
     d = raw - y
     return np.tanh(d), 1.0 - np.tanh(d) ** 2
 
-model = MojoBoostRegressor(objective=logcosh, base_score="mean").fit(X_train, y_train)
+model = MojoTreesRegressor(objective=logcosh, base_score="mean").fit(X_train, y_train)
 ```
 
 The callback is called once per boosting round over whole arrays, never
@@ -593,16 +593,16 @@ Measure before reaching for it. The measured cost on an M4 was about 8.9
 ms per round at 100k by 20 over 100 rounds, roughly 36 percent, and about
 0.81 ms per round at 20k by 10. `bench/bench_custom_objective.py` is the
 harness. When the objective sits on a hot path, write it in Mojo against
-`src/mojoboost/objective.mojo` instead.
+`src/mojotrees/objective.mojo` instead.
 
 ## 14. What this walkthrough could not show
 
 Collected in one place, because a reader deciding whether to adopt
-mojoboost should not have to assemble this list from thirteen sections.
+mojotrees should not have to assemble this list from thirteen sections.
 
 | Missing | Where it bites | Workaround |
 |---|---|---|
-| Inspection names at the package top level | `import mojoboost; mojoboost.dump_model` | `from mojoboost.inspection import dump_model`, which works today |
+| Inspection names at the package top level | `import mojotrees; mojotrees.dump_model` | `from mojotrees.inspection import dump_model`, which works today |
 | `trees_to_dataframe` without pandas | Dependency-free environments | `trees_to_records`, the same rows as dicts |
 | Continued training from an estimator | `fit` has no `init_model` | The functional API, `Dataset` plus `train(init_model=...)` |
 | Early stopping in the functional API | `train()` keeps no per-round history | The estimators' `fit` |

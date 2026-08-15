@@ -16,7 +16,7 @@
     "commit that says so; editing one to make today's run green is how a",
     "suite stops meaning anything.",
     "",
-    "Directions. `max_worse` is how much worse mojoboost may be than",
+    "Directions. `max_worse` is how much worse mojotrees may be than",
     "LightGBM on the primary metric. Being better is not capped, but being",
     "much better is checked too: `implausible_better` catches the case where",
     "the two engines were not actually given the same problem, which looks",
@@ -25,7 +25,7 @@
   "version": 1,
   "defaults": {
     "determinism": {
-      "mojoboost": {
+      "mojotrees": {
         "require_identical_predictions": true,
         "scope": "same scenario, device, and thread count",
         "rationale": "Repeat training is bit-identical by design, including on the accelerator, where the histogram reduction stays in fixed point precisely so that it is. A digest that moves is a regression in that property and is worth failing over even when the metrics are unchanged."
@@ -64,7 +64,7 @@
         "kind": "relative_improvement",
         "metric": "rmse",
         "min": 0.15,
-        "rationale": "A model that cannot beat the training mean did not fit; two engines agreeing on a non-model would otherwise pass the differential check. Loosened from 0.20 after the first executed run (20260815T014842Z): YearPredictionMSD at the aligned budget yields 16.2% from LightGBM and 16.1% from mojoboost, so the pre-run fifth measured the dataset's difficulty, not the fit. Fifteen percent still fails a non-model while passing the fit both engines agree on."
+        "rationale": "A model that cannot beat the training mean did not fit; two engines agreeing on a non-model would otherwise pass the differential check. Loosened from 0.20 after the first executed run (20260815T014842Z): YearPredictionMSD at the aligned budget yields 16.2% from LightGBM and 16.1% from mojotrees, so the pre-run fifth measured the dataset's difficulty, not the fit. Fifteen percent still fails a non-model while passing the fit both engines agree on."
       }
     },
     "imbalanced_binary": {
@@ -108,7 +108,7 @@
         "kind": "absolute",
         "max_worse": 0.02,
         "implausible_better": 0.05,
-        "rationale": "The loosest threshold in the file, and the caveats on the scenario say why: LightGBM reads its pairwise sigmoid from a lookup table where mojoboost evaluates it, so the two models diverge from the first pair rather than from the first tie. Comparable NDCG is the claim being tested, not identical models."
+        "rationale": "The loosest threshold in the file, and the caveats on the scenario say why: LightGBM reads its pairwise sigmoid from a lookup table where mojotrees evaluates it, so the two models diverge from the first pair rather than from the first tie. Comparable NDCG is the claim being tested, not identical models."
       },
       "secondary": {"ndcg@5": {"kind": "absolute", "max_worse": 0.025}},
       "baseline": {

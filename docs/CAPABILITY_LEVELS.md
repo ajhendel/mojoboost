@@ -47,7 +47,7 @@ integrated. Nothing else is entailed, so nothing else may be assumed.
 **`n/a` is a real answer and needs a reason.** Hardware validation is
 `n/a` for a capability with no device dependence. Differential testing is
 `n/a` where LightGBM has no counterpart to compare against, which is the
-usual case for a mojoboost extension.
+usual case for a mojotrees extension.
 
 **Skipped is not passed.** A test that runs its process and prints
 "skipped: no accelerator" has not exercised the behavior. A suite that
@@ -101,6 +101,6 @@ support.
 
 ## Citing this file
 
-> mojoboost states capabilities at seven levels (implemented,
+> mojotrees states capabilities at seven levels (implemented,
 > integrated, publicly reachable, focused-tested, differential-tested,
 > hardware-validated, release-packaged). See docs/CAPABILITY_LEVELS.md.

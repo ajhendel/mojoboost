@@ -1,8 +1,8 @@
 # GPU backend specializations: NVIDIA and AMD
 
 Written: 2026-08-14
-Policy source: `src/mojoboost/gpu_cuda_policy.mojo`,
-`src/mojoboost/gpu_amd_policy.mojo`
+Policy source: `src/mojotrees/gpu_cuda_policy.mojo`,
+`src/mojotrees/gpu_amd_policy.mojo`
 
 ## Status, stated first
 
@@ -19,9 +19,9 @@ Against `docs/CAPABILITY_LEVELS.md`, the two modules described here are:
 
 | Level | NVIDIA policy | AMD policy | Evidence |
 |---|---|---|---|
-| implemented | yes | yes | `src/mojoboost/gpu_cuda_policy.mojo`, `src/mojoboost/gpu_amd_policy.mojo` |
+| implemented | yes | yes | `src/mojotrees/gpu_cuda_policy.mojo`, `src/mojotrees/gpu_amd_policy.mojo` |
 | integrated | no | no | no shipping code path imports either module; see "Exact integration requests" |
-| publicly reachable | no | no | not exported from `src/mojoboost/__init__.mojo` |
+| publicly reachable | no | no | not exported from `src/mojotrees/__init__.mojo` |
 | focused-tested | no | no | no test file exists; this lane was forbidden to write or run one |
 | differential-tested | n/a | n/a | LightGBM has no counterpart to a per-backend launch policy |
 | hardware-validated | no | no | no NVIDIA or AMD device has ever run this project's kernels |
@@ -239,7 +239,7 @@ the packed path itself is gated twice over: the kernel variant must be
 compiled in (`KernelFeatures.packed_bin_loads`, false in every build today)
 and the backend must have been exercised
 (`gpu_portability.require_specializations_allowed`, which refuses CUDA and
-HIP unless `MOJOBOOST_GPU_BACKEND_UNVALIDATED=1`).
+HIP unless `MOJOTREES_GPU_BACKEND_UNVALIDATED=1`).
 
 ### 8. Allocation
 
@@ -319,7 +319,7 @@ fact is not portable.
 that did not name its API might be NVIDIA and might not, and planning a
 48 KiB static ceiling and a 32-lane rounding granularity for an
 unidentified device is a guess. The portable path already covers it; an
-operator who knows better declares `MOJOBOOST_GPU_BACKEND`.
+operator who knows better declares `MOJOTREES_GPU_BACKEND`.
 
 ## The default-off guarantee
 
@@ -337,8 +337,8 @@ without re-deriving anything.
 
 The environment overrides reach every plan, because the arithmetic that
 honors them is the shared `gpu_tiling.resolve_tiling`:
-`MOJOBOOST_GPU_ROW_TILE`, `MOJOBOOST_GPU_BLOCK_THREADS`, and
-`MOJOBOOST_GPU_HIST_STRATEGY`. Neither module introduces an environment
+`MOJOTREES_GPU_ROW_TILE`, `MOJOTREES_GPU_BLOCK_THREADS`, and
+`MOJOTREES_GPU_HIST_STRATEGY`. Neither module introduces an environment
 variable of its own.
 
 ## Exact integration requests
@@ -349,7 +349,7 @@ mechanically applicable form of each, with signatures and call sites, is in
 
 ### Shared kernels and the GPU dataflow lane
 
-1. `src/mojoboost/gpu_portability.mojo`: accept the relocation of the
+1. `src/mojotrees/gpu_portability.mojo`: accept the relocation of the
    backend-neutral half of `gpu_cuda_policy.mojo` (`DeviceReport`,
    `Occupancy`, `BackendLaunchPlan`, `BackendSpecialization`,
    `StrategyInputs`, `resident_blocks_from_reported`,
@@ -357,13 +357,13 @@ mechanically applicable form of each, with signatures and call sites, is in
    `require_shared_reported_fits`, `derive_plan_for`, and the two
    `describe_*`), and re-point both backend modules' imports at it. This
    removes the `gpu_amd_policy -> gpu_cuda_policy` edge.
-2. `src/mojoboost/gpu_tiling.mojo`: add `query_full_device_report(ctx)`
+2. `src/mojotrees/gpu_tiling.mojo`: add `query_full_device_report(ctx)`
    beside `query_device_caps`, reading the ten attributes
    `bench/bench_gpu_validation._report_device` already reads and returning
    a `DeviceReport`. It is the only new device-touching code any of this
    needs, and it is four lines per attribute over the existing
    `_attribute_or`.
-3. `src/mojoboost/apple_histogram_policy.mojo`: give
+3. `src/mojotrees/apple_histogram_policy.mojo`: give
    `derive_histogram_plan` optional `resident_override` and
    `granularity_override` parameters so `SPEC_LEVEL_SHAPE` can be handed a
    residency derived from the per-multiprocessor attributes and a rounding
@@ -372,24 +372,24 @@ mechanically applicable form of each, with signatures and call sites, is in
 
 ### Trainer
 
-4. `src/mojoboost/histogram_gpu.mojo`: hold a `DeviceReport` beside
+4. `src/mojotrees/histogram_gpu.mojo`: hold a `DeviceReport` beside
    `DeviceCaps` on `GpuHistogramBuilder`, and call the backend gate
    (`require_cuda_launchable` or `require_amd_launchable`, selected by the
    profile's API code, with `apple_histogram_policy` unchanged for Metal)
    once per launch. On today's path the report is `unreported()`, the
    contract is the `API_UNKNOWN` one, and every gate passes, so this is
    inert until a report is filled in.
-5. `src/mojoboost/train_gpu.mojo`: no change requested. Device selection
+5. `src/mojotrees/train_gpu.mojo`: no change requested. Device selection
    happens before a backend is known and belongs to `device_policy.mojo`.
 
 ### Device policy
 
-6. `src/mojoboost/device_policy.mojo`: extend
+6. `src/mojotrees/device_policy.mojo`: extend
    `capabilities_from_reported` to take the six additional attributes and
    record them, so `decide_device_report_reported` can report a backend's
    answered-attribute count. A decision does not gate on any of them; the
    value is that a support ticket carries the device's own answers.
-7. `src/mojoboost/device_policy.mojo`: when a crossover rule is eventually
+7. `src/mojotrees/device_policy.mojo`: when a crossover rule is eventually
    installed for CUDA or HIP, `CrossoverEvidence.api` already scopes it and
    `POLICY_VERSION` already versions it. No change needed now, and none
    should be made from reasoning.
@@ -398,10 +398,10 @@ mechanically applicable form of each, with signatures and call sites, is in
 
 8. `packaging/`: no artifact change. Both modules are pure host arithmetic
    with no new dependency, so they are included by whatever includes
-   `src/mojoboost/*.mojo`. The request is only that the manifest check that
+   `src/mojotrees/*.mojo`. The request is only that the manifest check that
    lists modules gains these two, so a wheel that silently drops them is
    caught.
-9. `packaging/`: `MOJOBOOST_GPU_BACKEND_UNVALIDATED` is an existing knob
+9. `packaging/`: `MOJOTREES_GPU_BACKEND_UNVALIDATED` is an existing knob
    owned by `gpu_backend_policy.mojo`; document it in the installation
    notes as "acknowledges running an unvalidated specialization", not as a
    performance switch.

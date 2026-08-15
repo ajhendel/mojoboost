@@ -14,14 +14,14 @@ every architecture CI runs on.
 from std.os import setenv
 from std.testing import assert_equal, assert_true, TestSuite
 
-from mojoboost.binning import bin_equal_width, BinnedMatrix
-from mojoboost.histogram import (
+from mojotrees.binning import bin_equal_width, BinnedMatrix
+from mojotrees.histogram import (
     build_histogram,
     build_histogram_subset,
     subtract_histogram,
     Histogram,
 )
-from mojoboost.parallel import PARALLEL_MIN_OPS
+from mojotrees.parallel import PARALLEL_MIN_OPS
 
 
 def _splitmix64(state: UInt64) -> UInt64:
@@ -225,23 +225,23 @@ def test_env_worker_and_threshold_overrides() raises:
 
     # Lowered threshold forces the per-feature parallel path on a shape
     # that would otherwise run serial.
-    _ = setenv("MOJOBOOST_PARALLEL_MIN_OPS", "1")
+    _ = setenv("MOJOTREES_PARALLEL_MIN_OPS", "1")
     _assert_same(expected, build_histogram(data, grad, hess))
 
     # Explicit worker count takes the chunked path (2 tasks over 3 features).
-    _ = setenv("MOJOBOOST_NUM_WORKERS", "2")
+    _ = setenv("MOJOTREES_NUM_WORKERS", "2")
     _assert_same(expected, build_histogram(data, grad, hess))
 
     # More workers than features clamps to one feature per task.
-    _ = setenv("MOJOBOOST_NUM_WORKERS", "8")
+    _ = setenv("MOJOTREES_NUM_WORKERS", "8")
     _assert_same(expected, build_histogram(data, grad, hess))
 
     # workers=1 forces serial even with the threshold floored.
-    _ = setenv("MOJOBOOST_NUM_WORKERS", "1")
+    _ = setenv("MOJOTREES_NUM_WORKERS", "1")
     _assert_same(expected, build_histogram(data, grad, hess))
 
-    _ = setenv("MOJOBOOST_NUM_WORKERS", "")
-    _ = setenv("MOJOBOOST_PARALLEL_MIN_OPS", "")
+    _ = setenv("MOJOTREES_NUM_WORKERS", "")
+    _ = setenv("MOJOTREES_PARALLEL_MIN_OPS", "")
 
 
 def main() raises:

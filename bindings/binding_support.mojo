@@ -1,12 +1,12 @@
-"""Boundary helpers shared by the mojoboost extension modules.
+"""Boundary helpers shared by the mojotrees extension modules.
 
-`bindings/_mojoboost.mojo` is the CPython entry point; the modules beside
+`bindings/_mojotrees.mojo` is the CPython entry point; the modules beside
 it (`objective_bindings`, `dataset_bindings`, `inspection_bindings`,
 `distributed_bindings`, `basic_bindings`) hold one capability each and are
 registered from there. This module holds what all of them need to cross
 the boundary and nothing else: no policy, no algorithm, no table.
 
-Conventions, all of them the ones `_mojoboost.mojo` already established:
+Conventions, all of them the ones `_mojotrees.mojo` already established:
 
 - Bulk numeric data crosses as a raw buffer address (an integer) plus its
   length. The Python caller keeps the buffer alive for the call; nothing
@@ -25,7 +25,7 @@ The only direction an address travels is in.
 
 from std.python import Python, PythonObject
 
-from mojoboost.sparse import CscMatrix, CsrMatrix
+from mojotrees.sparse import CscMatrix, CsrMatrix
 
 
 # -- building Python values ----------------------------------------------
@@ -80,7 +80,7 @@ def py_pair(first: PythonObject, second: PythonObject) raises -> PythonObject:
 def f64_buffer(addr: Int, n: Int) raises -> List[Float64]:
     """Copy a float64 buffer into a Mojo list.
 
-    The same read `_f64_list` in `_mojoboost.mojo` does, and the intended
+    The same read `_f64_list` in `_mojotrees.mojo` does, and the intended
     single home for it: see `handoffs/connect_14_bindings.md` for the patch
     that retires that copy.
     """

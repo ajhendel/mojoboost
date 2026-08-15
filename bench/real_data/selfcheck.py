@@ -148,11 +148,11 @@ def check_params():
             spec = dict(spec)
         extra = {"num_class": 3} if spec["task"] == "multiclass" else None
         lgb = scenarios.lightgbm_params(spec, 4, dict(extra or {}, bin_construct_sample_cnt=1000))
-        mb = scenarios.mojoboost_params(spec, "cpu", extra)
+        mb = scenarios.mojotrees_params(spec, "cpu", extra)
         check(lgb["num_threads"] == 4, f"{name}: lightgbm thread count did not survive translation")
         check(
             "num_threads" not in mb and "n_jobs" not in mb,
-            f"{name}: mojoboost params carry a thread setting, which belongs in the environment",
+            f"{name}: mojotrees params carry a thread setting, which belongs in the environment",
         )
         for key, alias in (("lambda_l2", "lambda_l2"), ("min_child_hess", "min_sum_hessian_in_leaf")):
             check(
@@ -179,7 +179,7 @@ def check_params():
             lgb["feature_pre_filter"] is False,
             f"{name}: lightgbm feature pre-filter was left on, which deletes columns",
         )
-        check(mb["device"] == "cpu", f"{name}: mojoboost device did not survive translation")
+        check(mb["device"] == "cpu", f"{name}: mojotrees device did not survive translation")
 
 
 def check_metrics():

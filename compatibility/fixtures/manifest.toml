@@ -53,7 +53,7 @@ proves = "the oldest format still loads and predicts; no fact beyond the tree st
 
 [fixture.provenance]
 kind = "synthetic"
-authored_from = "src/mojoboost/serialize.mojo version history, v1 entry"
+authored_from = "src/mojotrees/serialize.mojo version history, v1 entry"
 authored_by = "compatibility lane, remaining round task 13"
 produced_at = ""
 note = "Model the token stream on the hand-written file in tests/test_missing.mojo:test_v1_file_still_loads_and_routes_nothing, which is the only v1 file the repository has ever built."
@@ -73,7 +73,7 @@ proves = "the objective code round trips; a v1 binary model still applies its si
 
 [fixture.provenance]
 kind = "synthetic"
-authored_from = "src/mojoboost/serialize.mojo version history, v1 entry"
+authored_from = "src/mojotrees/serialize.mojo version history, v1 entry"
 authored_by = "compatibility lane, remaining round task 13"
 produced_at = ""
 
@@ -92,7 +92,7 @@ proves = "the kind token dispatches from the header alone, at the oldest version
 
 [fixture.provenance]
 kind = "synthetic"
-authored_from = "src/mojoboost/serialize.mojo version history, v1 entry"
+authored_from = "src/mojotrees/serialize.mojo version history, v1 entry"
 authored_by = "compatibility lane, remaining round task 13"
 produced_at = ""
 
@@ -117,7 +117,7 @@ proves = "per-node default_left and missing_bin round trip, so a reloaded model 
 
 [fixture.provenance]
 kind = "synthetic"
-authored_from = "src/mojoboost/serialize.mojo version history, v2 entry"
+authored_from = "src/mojotrees/serialize.mojo version history, v2 entry"
 authored_by = "compatibility lane, remaining round task 13"
 produced_at = ""
 
@@ -136,7 +136,7 @@ proves = "the optional monotone section loads; its constraint vector is a proper
 
 [fixture.provenance]
 kind = "synthetic"
-authored_from = "src/mojoboost/serialize.mojo version history, v2 entry; src/mojoboost/monotone.mojo"
+authored_from = "src/mojotrees/serialize.mojo version history, v2 entry; src/mojotrees/monotone.mojo"
 authored_by = "compatibility lane, remaining round task 13"
 produced_at = ""
 
@@ -155,7 +155,7 @@ proves = "the categorical section and the per-tree cat sections load, without wh
 
 [fixture.provenance]
 kind = "synthetic"
-authored_from = "src/mojoboost/serialize.mojo version history, v2 entry; src/mojoboost/categorical.mojo"
+authored_from = "src/mojotrees/serialize.mojo version history, v2 entry; src/mojotrees/categorical.mojo"
 authored_by = "compatibility lane, remaining round task 13"
 produced_at = ""
 
@@ -178,7 +178,7 @@ proves = "covers travel unconditionally at v3, so has_node_count is true and fea
 
 [fixture.provenance]
 kind = "synthetic"
-authored_from = "src/mojoboost/serialize.mojo version history, v3 entry"
+authored_from = "src/mojotrees/serialize.mojo version history, v3 entry"
 authored_by = "compatibility lane, remaining round task 13"
 produced_at = ""
 
@@ -197,7 +197,7 @@ proves = "the multiclass shape at v3, so the covers addition is checked on both 
 
 [fixture.provenance]
 kind = "synthetic"
-authored_from = "src/mojoboost/serialize.mojo version history, v3 entry"
+authored_from = "src/mojotrees/serialize.mojo version history, v3 entry"
 authored_by = "compatibility lane, remaining round task 13"
 produced_at = ""
 
@@ -216,7 +216,7 @@ proves = "the contribution sum identity holds on a loaded v3 model: every pred_c
 
 [fixture.provenance]
 kind = "synthetic"
-authored_from = "src/mojoboost/serialize.mojo version history, v3 entry; src/mojoboost/contrib.mojo"
+authored_from = "src/mojotrees/serialize.mojo version history, v3 entry; src/mojotrees/contrib.mojo"
 authored_by = "compatibility lane, remaining round task 13"
 produced_at = ""
 note = "The only fixture whose expected file is not enough on its own: the contribution assertion is a property of the row, checked by the suite, not a stored vector."
@@ -241,7 +241,7 @@ proves = "gains travel, so gain importance on a loaded model is the trained mode
 
 [fixture.provenance]
 kind = "synthetic"
-authored_from = "src/mojoboost/serialize.mojo version history, v4 entry"
+authored_from = "src/mojotrees/serialize.mojo version history, v4 entry"
 authored_by = "compatibility lane, remaining round task 13"
 produced_at = ""
 note = "Replace with a `built_at_commit` or `released` row as soon as a build that writes v4 is available to the fixture producer. v4 is the version the current writer emits, so this is the one row that does not have to be synthetic."
@@ -261,7 +261,7 @@ proves = "the optional feature_names section round trips, including the escape c
 
 [fixture.provenance]
 kind = "synthetic"
-authored_from = "src/mojoboost/serialize.mojo version history, v4 entry; the _escape_name codec and the _EMPTY_NAME_TOKEN constant"
+authored_from = "src/mojotrees/serialize.mojo version history, v4 entry; the _escape_name codec and the _EMPTY_NAME_TOKEN constant"
 authored_by = "compatibility lane, remaining round task 13"
 produced_at = ""
 
@@ -281,7 +281,7 @@ proves = "migration rule R4: a v1 model re-saved at v4 is a v4 file that still h
 [fixture.provenance]
 kind = "synthetic"
 derived_from = "v1/single_regression"
-authored_from = "src/mojoboost/serialize.mojo version history, v4 entry, the covers presence flag"
+authored_from = "src/mojotrees/serialize.mojo version history, v4 entry, the covers presence flag"
 authored_by = "compatibility lane, remaining round task 13"
 produced_at = ""
 note = "Its predictions must equal v1/single_regression's exactly. That equality is the assertion; the file being larger is not."

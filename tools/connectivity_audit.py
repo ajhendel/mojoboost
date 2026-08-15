@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Static reachability audit: what in this repository is actually connected.
 
-mojoboost grew as many parallel lanes, and a lane can finish a capability
+mojotrees grew as many parallel lanes, and a lane can finish a capability
 without the capability ever becoming reachable. A module compiles, its tests
 pass, its handoff is written, and no production entry point ever names it.
 This script finds that state and nothing else. It answers one question, in
@@ -10,18 +10,18 @@ what code does the repository get to, and what does it not?**
 
 The entry points, which are the roots of every graph below:
 
-- `python/mojoboost/__init__.py` - the public Python package.
-- `bindings/_mojoboost.mojo` - the CPython extension, whose `def_function`
+- `python/mojotrees/__init__.py` - the public Python package.
+- `bindings/_mojotrees.mojo` - the CPython extension, whose `def_function`
   table is the entire Python-to-native surface.
-- `src/mojoboost/__init__.mojo` - the native package's own re-export block,
+- `src/mojotrees/__init__.mojo` - the native package's own re-export block,
   which is the public Mojo API.
-- `capi/mojoboost_capi.mojo` - the C ABI, whose `@export`ed functions are the
+- `capi/mojotrees_capi.mojo` - the C ABI, whose `@export`ed functions are the
   entire C surface.
-- `cli/mojoboost_cli.mojo` - the `mojoboost` command line tool.
+- `cli/mojotrees_cli.mojo` - the `mojotrees` command line tool.
 
 What it reports:
 
-1.  **Orphan native modules.** A `.mojo` file under `src/mojoboost/` that no
+1.  **Orphan native modules.** A `.mojo` file under `src/mojotrees/` that no
     root reaches through any chain of imports. Annotated with whether a test
     or a benchmark reaches it, which is the difference between "dead" and
     "written, exercised, and never wired in".
@@ -38,10 +38,10 @@ What it reports:
     sets.
 5.  **Binding functions with no Python caller**, and, before that, **binding
     modules the extension entry point never imports** - a sibling under
-    `bindings/` that `_mojoboost.mojo` does not import is compiled by nothing
+    `bindings/` that `_mojotrees.mojo` does not import is compiled by nothing
     and reachable from nothing, however many functions it defines.
 6.  **Python APIs with no native call.** The mirror: a native function name
-    that Python reaches for - `_mojoboost.foo`, `getattr(_mojoboost, "foo")` -
+    that Python reaches for - `_mojotrees.foo`, `getattr(_mojotrees, "foo")` -
     that the binding table does not export. These are the degraded paths,
     where Python reimplements in Python what Mojo already computes.
 7.  **Serialization fields written but not read, or read but not written.**
@@ -51,7 +51,7 @@ What it reports:
 8.  **Referenced paths that do not exist.** Every repository-relative path
     named by a document or by a pixi task, checked for existence. Parity
     evidence lives here as a special case.
-9.  **C ABI drift.** `mojoboost.h` declarations against `@export`ed
+9.  **C ABI drift.** `mojotrees.h` declarations against `@export`ed
     definitions, in both directions.
 
 What it deliberately does not do:
@@ -62,13 +62,13 @@ What it deliberately does not do:
   only that paths named as evidence exist as files, and defers everything
   about what the evidence means. Two parity checkers would be exactly the
   duplication this script exists to find.
-- **It does not import mojoboost, build anything, or run Mojo.** It reads
+- **It does not import mojotrees, build anything, or run Mojo.** It reads
   text. A finding here is a statement about the source, never about a running
   program: this script cannot tell you that a connected path is *correct*,
   only that it exists.
 - **It does not parse Mojo.** It matches import statements and top-level
   declarations with regular expressions tuned to this repository's style
-  (`from .x import (...)`, `from mojoboost.x import ...`, `def name(`,
+  (`from .x import (...)`, `from mojotrees.x import ...`, `def name(`,
   `struct Name(`, `comptime NAME =`). A file written in some other style is
   under-reported, not mis-reported: unknown text contributes no edges.
 
@@ -117,8 +117,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Layout. Everything this script knows about where things live.
 # --------------------------------------------------------------------------
 
-NATIVE_PKG = os.path.join("src", "mojoboost")
-PY_PKG = os.path.join("python", "mojoboost")
+NATIVE_PKG = os.path.join("src", "mojotrees")
+PY_PKG = os.path.join("python", "mojotrees")
 BINDINGS_DIR = "bindings"
 CAPI_DIR = "capi"
 CLI_DIR = "cli"
@@ -131,9 +131,9 @@ NATIVE_ROOT = os.path.join(NATIVE_PKG, "__init__.mojo")
 #: (path, label). A native module is an orphan when no root reaches it.
 NATIVE_ROOTS = [
     (NATIVE_ROOT, "mojo-api"),
-    (os.path.join(BINDINGS_DIR, "_mojoboost.mojo"), "bindings"),
-    (os.path.join(CAPI_DIR, "mojoboost_capi.mojo"), "c-abi"),
-    (os.path.join(CLI_DIR, "mojoboost_cli.mojo"), "cli"),
+    (os.path.join(BINDINGS_DIR, "_mojotrees.mojo"), "bindings"),
+    (os.path.join(CAPI_DIR, "mojotrees_capi.mojo"), "c-abi"),
+    (os.path.join(CLI_DIR, "mojotrees_cli.mojo"), "cli"),
 ]
 
 #: Directories whose files reach native modules but are not entry points.
@@ -185,7 +185,7 @@ KIND_ORDER = [CONNECTED, EXPERIMENTAL, PENDING, DEAD]
 
 #: How to read a finding about a specific module or name. Keys are either a
 #: native module name (`gpu_leaf_batching`), a Python dotted name
-#: (`mojoboost.inspection`), or a binding function name. The value is
+#: (`mojotrees.inspection`), or a binding function name. The value is
 #: (kind, owning lane, one-line reason).
 #:
 #: Rules for editing this table:
@@ -212,10 +212,10 @@ KIND_ORDER = [CONNECTED, EXPERIMENTAL, PENDING, DEAD]
 #: nothing, since an unclassified finding defaults to `PENDING` and lands
 #: back in the queue. Deleted in the connect_22 fix pass, all three now
 #: reachable and all three verifiable by reading the imports named here:
-#: `gpu_portability` (imported by `src/mojoboost/histogram_gpu.mojo`, which
+#: `gpu_portability` (imported by `src/mojotrees/histogram_gpu.mojo`, which
 #: also calls `require_bins_supported` and `require_histogram_launchable`),
-#: `gpu_backend_policy` (reached through it), and `mojoboost._compat`
-#: (called from `python/mojoboost/__init__.py` before the extension import).
+#: `gpu_backend_policy` (reached through it), and `mojotrees._compat`
+#: (called from `python/mojotrees/__init__.py` before the extension import).
 CLASSIFICATION = {
     # -- native modules no entry point reaches -----------------------------
     "alternate_boosting": (
@@ -304,7 +304,7 @@ CLASSIFICATION = {
         "any trainer, so the decision it returns has one live outcome.",
     ),
     # -- Python modules ----------------------------------------------------
-    "mojoboost._public_api_plan": (
+    "mojotrees._public_api_plan": (
         EXPERIMENTAL,
         "connect_07",
         "A plan expressed as data. Its own docstring states that nothing in "
@@ -454,19 +454,19 @@ CLASSIFICATION = {
         PENDING,
         "connect_06",
         "Implemented in bindings/inspection_bindings.mojo, which "
-        "bindings/_mojoboost.mojo neither imports nor registers.",
+        "bindings/_mojotrees.mojo neither imports nor registers.",
     ),
     "objective_code": (
         PENDING,
         "connect_06",
         "Implemented in bindings/inspection_bindings.mojo, which "
-        "bindings/_mojoboost.mojo neither imports nor registers.",
+        "bindings/_mojotrees.mojo neither imports nor registers.",
     ),
     "registry_metrics": (
         PENDING,
         "connect_06",
         "Implemented in bindings/objective_bindings.mojo, which "
-        "bindings/_mojoboost.mojo neither imports nor registers.",
+        "bindings/_mojotrees.mojo neither imports nor registers.",
     ),
     "decide_device": (
         PENDING,
@@ -555,10 +555,10 @@ def expand_globs(patterns):
 # Mojo: imports, declarations, exports.
 # --------------------------------------------------------------------------
 
-#: `from .module import ...` and `from mojoboost.module import ...`, with the
+#: `from .module import ...` and `from mojotrees.module import ...`, with the
 #: import list either on one line or parenthesized across many.
 MOJO_IMPORT = re.compile(
-    r"^from\s+(?:\.|mojoboost\.)([A-Za-z_][A-Za-z_0-9]*)\s+import\s+(.*)$",
+    r"^from\s+(?:\.|mojotrees\.)([A-Za-z_][A-Za-z_0-9]*)\s+import\s+(.*)$",
     re.MULTILINE,
 )
 
@@ -580,13 +580,13 @@ DEF_FUNCTION = re.compile(
     r"\"([A-Za-z_][A-Za-z_0-9]*)\""
 )
 
-#: A C ABI definition: `@export` then `def mojoboost_name(` ... `abi("C")`.
+#: A C ABI definition: `@export` then `def mojotrees_name(` ... `abi("C")`.
 CAPI_EXPORT = re.compile(
-    r"@export\s*\n\s*(?:def|fn)\s+(mojoboost_[A-Za-z_0-9]*)\s*\(", re.MULTILINE
+    r"@export\s*\n\s*(?:def|fn)\s+(mojotrees_[A-Za-z_0-9]*)\s*\(", re.MULTILINE
 )
 
 #: A declaration in the C header, which is what a C caller can link against.
-CAPI_HEADER_DECL = re.compile(r"\b(mojoboost_[a-z_0-9]+)\s*\(")
+CAPI_HEADER_DECL = re.compile(r"\b(mojotrees_[a-z_0-9]+)\s*\(")
 
 #: A CLI command, dispatched by string comparison in `run`.
 CLI_COMMAND = re.compile(r"command\s*==\s*\"([a-z][a-z_-]*)\"")
@@ -716,7 +716,7 @@ def mojo_imports(path, text=None):
 
 
 def native_modules():
-    """Every module name under src/mojoboost, `__init__` excluded."""
+    """Every module name under src/mojotrees, `__init__` excluded."""
     names = []
     for path in walk(NATIVE_PKG, ".mojo"):
         stem = os.path.splitext(os.path.basename(path))[0]
@@ -726,7 +726,7 @@ def native_modules():
 
 
 def native_import_graph():
-    """{module: set(modules it imports)} over src/mojoboost only."""
+    """{module: set(modules it imports)} over src/mojotrees only."""
     graph = {}
     for name in native_modules():
         path = os.path.join(NATIVE_PKG, name + ".mojo")
@@ -757,14 +757,14 @@ PY_FROM = re.compile(
     r"^\s*from\s+\.([A-Za-z_][A-Za-z_0-9]*)?\s+import\s+(.*)$", re.MULTILINE
 )
 PY_IMPORT_PKG = re.compile(
-    r"^\s*(?:from|import)\s+mojoboost\.([A-Za-z_][A-Za-z_0-9]*)", re.MULTILINE
+    r"^\s*(?:from|import)\s+mojotrees\.([A-Za-z_][A-Za-z_0-9]*)", re.MULTILINE
 )
 
-#: `_mojoboost.name` and `getattr(_mojoboost, "name")`, the only two ways
+#: `_mojotrees.name` and `getattr(_mojotrees, "name")`, the only two ways
 #: Python in this package reaches the extension module.
-NATIVE_ATTR = re.compile(r"_mojoboost\.([A-Za-z_][A-Za-z_0-9]*)")
+NATIVE_ATTR = re.compile(r"_mojotrees\.([A-Za-z_][A-Za-z_0-9]*)")
 NATIVE_GETATTR = re.compile(
-    r"getattr\(\s*_mojoboost\s*,\s*\"([A-Za-z_][A-Za-z_0-9]*)\""
+    r"getattr\(\s*_mojotrees\s*,\s*\"([A-Za-z_][A-Za-z_0-9]*)\""
 )
 
 #: The keyword arguments of a Python estimator's `__init__`, taken from the
@@ -776,7 +776,7 @@ PY_SELF_ASSIGN = re.compile(
 
 
 def python_modules():
-    """Every module under python/mojoboost, build outputs excluded."""
+    """Every module under python/mojotrees, build outputs excluded."""
     names = []
     for path in walk(PY_PKG, ".py"):
         stem = os.path.splitext(os.path.basename(path))[0]
@@ -786,11 +786,11 @@ def python_modules():
 
 
 def python_import_graph():
-    """{module: set(sibling modules it imports)} over python/mojoboost.
+    """{module: set(sibling modules it imports)} over python/mojotrees.
 
     Both the eager `from . import x` at the top of a file and the lazy
     `from . import x` inside a function body count as edges: the second is
-    this package's deliberate way of keeping `import mojoboost` cheap, not a
+    this package's deliberate way of keeping `import mojotrees` cheap, not a
     weaker kind of dependency.
     """
     graph = {}
@@ -944,7 +944,7 @@ def audit_unused_imports():
 
 # -- 3. duplicate registries and policies ----------------------------------
 
-#: Names that mean "a table of the things mojoboost supports". When one of
+#: Names that mean "a table of the things mojotrees supports". When one of
 #: these is defined by two modules, there are two tables, and they will drift.
 REGISTRY_SHAPED = re.compile(
     r"^(?:"
@@ -1040,7 +1040,7 @@ def audit_dead_parameters():
 
 def binding_exports():
     """{public name: mojo symbol} from the `def_function` table."""
-    path = os.path.join(BINDINGS_DIR, "_mojoboost.mojo")
+    path = os.path.join(BINDINGS_DIR, "_mojotrees.mojo")
     text = must_read(path)
     out = {}
     for match in DEF_FUNCTION.finditer(text):
@@ -1073,8 +1073,8 @@ def audit_unused_bindings():
                 Finding(
                     "unused-bindings",
                     name,
-                    "exported by bindings/_mojoboost.mojo; no module under "
-                    "python/mojoboost calls it",
+                    "exported by bindings/_mojotrees.mojo; no module under "
+                    "python/mojotrees calls it",
                 )
             )
     return findings
@@ -1083,10 +1083,10 @@ def audit_unused_bindings():
 def audit_binding_modules():
     """Binding modules the extension entry point never imports.
 
-    `bindings/_mojoboost.mojo` is the whole extension: the
+    `bindings/_mojotrees.mojo` is the whole extension: the
     `PythonModuleBuilder` block in it is the only thing that becomes an
     attribute of
-    `mojoboost._mojoboost`. A sibling module under `bindings/` that it does
+    `mojotrees._mojotrees`. A sibling module under `bindings/` that it does
     not import is compiled by nothing and callable from nothing, however many
     `def`s it holds - and `bindings/build.sh` compiles only the entry point,
     so a sibling is not even on the include path.
@@ -1096,14 +1096,14 @@ def audit_binding_modules():
     inferred from the Python side.
     """
     findings = []
-    entry = os.path.join(BINDINGS_DIR, "_mojoboost.mojo")
+    entry = os.path.join(BINDINGS_DIR, "_mojotrees.mojo")
     text = must_read(entry)
     body = strip_mojo_comments(text)
     build = read(os.path.join(BINDINGS_DIR, "build.sh")) or ""
 
     for path in walk(BINDINGS_DIR, ".mojo"):
         stem = os.path.splitext(os.path.basename(path))[0]
-        if stem == "_mojoboost":
+        if stem == "_mojotrees":
             continue
         imported = re.search(
             r"^from\s+%s\s+import" % re.escape(stem), body, re.MULTILINE
@@ -1138,7 +1138,7 @@ def audit_binding_modules():
         siblings = [
             p
             for p in walk(BINDINGS_DIR, ".mojo")
-            if not p.endswith("_mojoboost.mojo")
+            if not p.endswith("_mojotrees.mojo")
         ]
         if siblings:
             findings.append(
@@ -1177,7 +1177,7 @@ def audit_missing_bindings():
             Finding(
                 "missing-bindings",
                 name,
-                "python/mojoboost reaches for _mojoboost.%s; the binding "
+                "python/mojotrees reaches for _mojotrees.%s; the binding "
                 "table does not export it" % name,
                 kind=PENDING,
                 owner="connect_14",
@@ -1208,7 +1208,7 @@ def audit_serialization():
     findings = []
     text = read(os.path.join(NATIVE_PKG, "serialize.mojo"))
     if text is None:
-        raise AuditError("missing src/mojoboost/serialize.mojo")
+        raise AuditError("missing src/mojotrees/serialize.mojo")
 
     written = set(WRITE_KEYWORD.findall(text))
     read_back = set(READ_KEYWORD.findall(text))
@@ -1341,8 +1341,8 @@ def source_is_parity(sources):
 def audit_c_abi():
     """Header declarations against `@export`ed definitions, both ways."""
     findings = []
-    mojo = read(os.path.join(CAPI_DIR, "mojoboost_capi.mojo"))
-    header = read(os.path.join(CAPI_DIR, "mojoboost.h"))
+    mojo = read(os.path.join(CAPI_DIR, "mojotrees_capi.mojo"))
+    header = read(os.path.join(CAPI_DIR, "mojotrees.h"))
     if mojo is None or header is None:
         raise AuditError("capi/ is incomplete")
 
@@ -1353,7 +1353,7 @@ def audit_c_abi():
             Finding(
                 "c-abi",
                 name,
-                "declared in capi/mojoboost.h with no @export definition; "
+                "declared in capi/mojotrees.h with no @export definition; "
                 "a C caller linking against it fails at load",
                 kind=DEAD,
                 owner="connect_21",
@@ -1377,7 +1377,7 @@ def audit_c_abi():
 
 
 def audit_python_orphans():
-    """Modules under python/mojoboost that the package root never reaches."""
+    """Modules under python/mojotrees that the package root never reaches."""
     findings = []
     graph = python_import_graph()
     reached = reachable_from(["__init__"], graph)
@@ -1387,8 +1387,8 @@ def audit_python_orphans():
         findings.append(
             Finding(
                 "python-orphans",
-                "mojoboost." + module,
-                "no import chain from python/mojoboost/__init__.py reaches "
+                "mojotrees." + module,
+                "no import chain from python/mojotrees/__init__.py reaches "
                 "it; only an explicit submodule import does",
             )
         )
@@ -1401,9 +1401,9 @@ def audit_python_orphans():
 def audit_cli():
     """CLI commands the tool dispatches, against what its docs promise."""
     findings = []
-    text = read(os.path.join(CLI_DIR, "mojoboost_cli.mojo"))
+    text = read(os.path.join(CLI_DIR, "mojotrees_cli.mojo"))
     if text is None:
-        raise AuditError("missing cli/mojoboost_cli.mojo")
+        raise AuditError("missing cli/mojotrees_cli.mojo")
     commands = set(CLI_COMMAND.findall(text))
     docs = read(os.path.join("docs", "CLI.md")) or ""
     readme = read(os.path.join(CLI_DIR, "README.md")) or ""
@@ -1426,7 +1426,7 @@ def audit_cli():
                 Finding(
                     "cli",
                     command,
-                    "dispatched by cli/mojoboost_cli.mojo and named by no "
+                    "dispatched by cli/mojotrees_cli.mojo and named by no "
                     "document",
                     kind=PENDING,
                     owner="connect_21",
@@ -1534,7 +1534,7 @@ def report(results, stream):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="Static reachability audit of the mojoboost repository."
+        description="Static reachability audit of the mojotrees repository."
     )
     parser.add_argument(
         "--section",

@@ -1,4 +1,4 @@
-"""mojoboost's half of the LightGBM missing-value comparison.
+"""mojotrees's half of the LightGBM missing-value comparison.
 
 Trains the four probe datasets of `bench/compare_missing_lightgbm.py` and
 prints the routing decisions as one JSON line. The datasets are closed forms
@@ -11,10 +11,10 @@ Run through the comparison driver:
 
 from std.utils.numerics import inf, nan
 
-from mojoboost.binning import fit_bins
-from mojoboost.boosting import SQUARED_ERROR, BoosterParams, train
-from mojoboost.model import fit
-from mojoboost.tree import TreeParams
+from mojotrees.binning import fit_bins
+from mojotrees.boosting import SQUARED_ERROR, BoosterParams, train
+from mojotrees.model import fit
+from mojotrees.tree import TreeParams
 
 comptime NAN = nan[DType.float64]()
 comptime INF = inf[DType.float64]()

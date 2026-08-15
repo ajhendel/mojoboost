@@ -11,10 +11,10 @@ from std.math import log2
 from std.os import remove
 from std.testing import assert_equal, assert_true, assert_raises, TestSuite
 
-from mojoboost.bagging import BaggingParams
-from mojoboost.binning import bin_equal_width
-from mojoboost.boosting import BoosterParams
-from mojoboost.ranking import (
+from mojotrees.bagging import BaggingParams
+from mojotrees.binning import bin_equal_width
+from mojotrees.boosting import BoosterParams
+from mojotrees.ranking import (
     LAMBDARANK,
     RankerParams,
     _refresh_query_bag,
@@ -32,8 +32,8 @@ from mojoboost.ranking import (
     train_ranker,
     train_ranker_with_valid,
 )
-from mojoboost.serialize import load_model, save_model
-from mojoboost.tree import TreeParams
+from mojotrees.serialize import load_model, save_model
+from mojotrees.tree import TreeParams
 
 comptime _TMP_PATH = "./.test_ranker_roundtrip.tmp"
 

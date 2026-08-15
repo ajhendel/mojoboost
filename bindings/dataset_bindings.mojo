@@ -1,14 +1,14 @@
 """`Dataset` construction beyond the dense case, and its prepared data.
 
-A `Dataset` handle (see `src/mojoboost/trainset.mojo`) owns a binned
+A `Dataset` handle (see `src/mojotrees/trainset.mojo`) owns a binned
 feature matrix, dense or sparse, the fitted `BinMapper` that produced it,
-and the columns that describe its rows. `bindings/_mojoboost.mojo` builds
+and the columns that describe its rows. `bindings/_mojotrees.mojo` builds
 the dense case (`dataset_create`) and exposes its shape
 (`dataset_num_data`, `dataset_num_feature`, `dataset_num_bin`); this
 module carries the three constructors that shape has no room for and the
 reads that answer from the constructed object.
 
-Why the reads matter: `python/mojoboost/basic.py` keeps its own copy of
+Why the reads matter: `python/mojotrees/basic.py` keeps its own copy of
 the label, the weights, the groups, the init scores, the names, and the
 categorical declaration, and answers `get_field` from those. That is
 correct for a dataset built in this process and cannot be right for one
@@ -45,9 +45,9 @@ from binding_support import (
     write_f64_buffer,
 )
 
-from mojoboost.efb import feature_bin_count
-from mojoboost.raw_data import RawData
-from mojoboost.trainset import Dataset
+from mojotrees.efb import feature_bin_count
+from mojotrees.raw_data import RawData
+from mojotrees.trainset import Dataset
 
 
 def _field_values(d: Dataset, field: String) raises -> List[Float64]:
@@ -55,7 +55,7 @@ def _field_values(d: Dataset, field: String) raises -> List[Float64]:
 
     `group` holds per-query row counts, which are integers; they cross as
     float64 like every other integer column at this boundary (see
-    `_int_list_from_f64` in `_mojoboost.mojo`), so one accessor serves all
+    `_int_list_from_f64` in `_mojotrees.mojo`), so one accessor serves all
     four fields and a caller does not need a second buffer protocol for
     one of them.
 

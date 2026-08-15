@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Clean-install smoke test for a macOS arm64 mojoboost wheel.
+# Clean-install smoke test for a macOS arm64 mojotrees wheel.
 #
 # NOT WIRED INTO ANYTHING AND NOT EXECUTED. This is a fixture: it is the
 # procedure a release run should follow, written down so the procedure is
@@ -78,7 +78,7 @@ run "$WORK/bare/bin/pip" list
 
 # Everything below runs from the temp directory, so an accidental import of a
 # source checkout cannot make this pass. probe_platform.py and smoke_test.py
-# both report where mojoboost was imported from; an import outside
+# both report where mojotrees was imported from; an import outside
 # site-packages invalidates the whole run.
 cd "$WORK"
 
@@ -94,30 +94,30 @@ run ./bare/bin/python smoke_test.py
 # summarized.
 say "=== device selection ==="
 ./bare/bin/python - 2>&1 <<'PY' | tee -a "$LOG"
-from mojoboost import MojoBoostRegressor
+from mojotrees import MojoTreesRegressor
 
 X = [[i / 20.0, (i % 5) / 5.0] for i in range(20)]
 y = [3.0 * r[0] + r[1] for r in X]
 
-m = MojoBoostRegressor(n_estimators=5, min_data_in_leaf=2, device="cpu").fit(X, y)
+m = MojoTreesRegressor(n_estimators=5, min_data_in_leaf=2, device="cpu").fit(X, y)
 print("cpu device_:", m.device_)
 
 try:
-    g = MojoBoostRegressor(n_estimators=5, min_data_in_leaf=2, device="gpu").fit(X, y)
+    g = MojoTreesRegressor(n_estimators=5, min_data_in_leaf=2, device="gpu").fit(X, y)
     print("gpu device_:", g.device_)
 except Exception as exc:
     print(f"gpu raised: {type(exc).__name__}: {exc}")
 PY
 
 say "=== device selection, GPU pinned off ==="
-MOJOBOOST_DISABLE_GPU=1 ./bare/bin/python - 2>&1 <<'PY' | tee -a "$LOG"
-from mojoboost import MojoBoostRegressor
+MOJOTREES_DISABLE_GPU=1 ./bare/bin/python - 2>&1 <<'PY' | tee -a "$LOG"
+from mojotrees import MojoTreesRegressor
 
 X = [[i / 20.0, (i % 5) / 5.0] for i in range(20)]
 y = [3.0 * r[0] + r[1] for r in X]
 try:
-    MojoBoostRegressor(n_estimators=5, min_data_in_leaf=2, device="gpu").fit(X, y)
-    print("FAIL: device=gpu succeeded with MOJOBOOST_DISABLE_GPU=1")
+    MojoTreesRegressor(n_estimators=5, min_data_in_leaf=2, device="gpu").fit(X, y)
+    print("FAIL: device=gpu succeeded with MOJOTREES_DISABLE_GPU=1")
 except Exception as exc:
     print(f"ok, gpu raised: {type(exc).__name__}: {exc}")
 PY

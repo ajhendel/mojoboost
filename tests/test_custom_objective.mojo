@@ -13,8 +13,8 @@ from std.os import remove
 from std.sys import has_accelerator
 from std.testing import assert_equal, assert_raises, assert_true, TestSuite
 
-from mojoboost.binning import BinnedMatrix, bin_equal_width
-from mojoboost.boosting import (
+from mojotrees.binning import BinnedMatrix, bin_equal_width
+from mojotrees.boosting import (
     CUSTOM,
     HUBER,
     SQUARED_ERROR,
@@ -22,8 +22,8 @@ from mojoboost.boosting import (
     train,
     train_with_valid,
 )
-from mojoboost.model import fit, fit_custom
-from mojoboost.objective import (
+from mojotrees.model import fit, fit_custom
+from mojotrees.objective import (
     check_custom_grad_hess,
     mean_label,
     squared_error_grad_hess,
@@ -31,9 +31,9 @@ from mojoboost.objective import (
     train_custom,
     train_custom_with_valid,
 )
-from mojoboost.serialize import load_model, save_model
-from mojoboost.train_gpu import train_custom_gpu, train_gpu
-from mojoboost.tree import TreeParams
+from mojotrees.serialize import load_model, save_model
+from mojotrees.train_gpu import train_custom_gpu, train_gpu
+from mojotrees.tree import TreeParams
 
 comptime _TMP_PATH = "./.test_custom_objective_roundtrip.tmp"
 

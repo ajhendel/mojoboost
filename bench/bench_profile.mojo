@@ -1,7 +1,7 @@
 """Per-stage CPU profile of a boosting round.
 
 Times every stage the CPU backend spends real work in, each one twice on
-identical data: once with `MOJOBOOST_NUM_WORKERS=1` (forced serial) and once
+identical data: once with `MOJOTREES_NUM_WORKERS=1` (forced serial) and once
 in auto mode (the shipped scheduler). The ratio of the two is the multicore
 speedup attributable to that stage alone, which is what tuning the scheduler
 moves; the serial column is what single-core optimization moves.
@@ -41,23 +41,23 @@ from std.sys.info import (
 )
 from std.time import perf_counter_ns
 
-from mojoboost.binning import BinMapper, BinnedMatrix, fit_bins
-from mojoboost.boosting import SQUARED_ERROR, fill_grad_hess
-from mojoboost.histogram import (
+from mojotrees.binning import BinMapper, BinnedMatrix, fit_bins
+from mojotrees.boosting import SQUARED_ERROR, fill_grad_hess
+from mojotrees.histogram import (
     Histogram,
     SIMD_LANES,
     build_histogram,
     build_histogram_subset,
     subtract_histogram,
 )
-from mojoboost.parallel import (
+from mojotrees.parallel import (
     PARALLEL_MIN_OPS,
     TASKS_PER_CORE,
     env_parallel_min_ops,
     plan_tasks,
 )
-from mojoboost.split import find_best_split
-from mojoboost.tree import TreeParams, grow_tree, partition_rows
+from mojotrees.split import find_best_split
+from mojotrees.tree import TreeParams, grow_tree, partition_rows
 
 
 def _splitmix64(state: UInt64) -> UInt64:
@@ -72,11 +72,11 @@ def _uniform(counter: UInt64) -> Float64:
 
 
 def _serial():
-    _ = setenv("MOJOBOOST_NUM_WORKERS", "1")
+    _ = setenv("MOJOTREES_NUM_WORKERS", "1")
 
 
 def _auto():
-    _ = setenv("MOJOBOOST_NUM_WORKERS", "0")
+    _ = setenv("MOJOTREES_NUM_WORKERS", "0")
 
 
 def _report(name: String, serial_s: Float64, auto_s: Float64):
@@ -392,4 +392,4 @@ def main() raises:
         Float64(t2 - t1) / 1e9 / Float64(pred_reps),
     )
 
-    _ = setenv("MOJOBOOST_NUM_WORKERS", "")
+    _ = setenv("MOJOTREES_NUM_WORKERS", "")

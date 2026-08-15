@@ -1,27 +1,27 @@
-# mojoboost
+# mojotrees
 
-[![PyPI](https://img.shields.io/pypi/v/mojoboost.svg)](https://pypi.org/project/mojoboost/)
-[![CI](https://github.com/mojoboost-ml/mojoboost/actions/workflows/ci.yml/badge.svg)](https://github.com/mojoboost-ml/mojoboost/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/mojotrees.svg)](https://pypi.org/project/mojotrees/)
+[![CI](https://github.com/mojotrees/mojotrees/actions/workflows/ci.yml/badge.svg)](https://github.com/mojotrees/mojotrees/actions/workflows/ci.yml)
 
 Native gradient-boosted trees accelerated by the GPU already inside Apple
 Silicon Macs, written in [Mojo](https://www.modular.com/mojo).
 
 > [!IMPORTANT]
-> mojoboost is an experimental public alpha. Its feature surface is broad,
+> mojotrees is an experimental public alpha. Its feature surface is broad,
 > but it is not yet a production replacement for LightGBM or XGBoost. Treat
 > every capability according to the evidence in
 > [docs/LIGHTGBM_PARITY.md](docs/LIGHTGBM_PARITY.md) and
 > [docs/GPU_VALIDATION.md](docs/GPU_VALIDATION.md), report failures, and do
 > not rely on unvalidated hardware or parameter combinations in production.
 
-mojoboost is a from-scratch GBDT library in the LightGBM family. It uses
+mojotrees is a from-scratch GBDT library in the LightGBM family. It uses
 histogram-based split finding and leaf-wise (best-first) tree growth. Its
 benchmark configuration aligns important parameters with LightGBM for
 reproducible comparisons.
 
 ## Creator and stewardship
 
-mojoboost was created by [Andrew Hendel](https://github.com/ajhendel), who
+mojotrees was created by [Andrew Hendel](https://github.com/ajhendel), who
 originated the project, set its product and technical direction, and serves as
 lead maintainer. The project is developed in public under Apache-2.0 and
 welcomes contributors without transferring their copyright.
@@ -34,8 +34,8 @@ who or what typed a change—as the standard for correctness and performance.
 - [Authors and attribution](AUTHORS.md)
 - [Project origin and stewardship](docs/PROJECT_ORIGIN.md)
 - [Architecture](docs/ARCHITECTURE.md)
-- [Technical article draft](docs/technical/BUILDING_MOJOBOOST.md)
-- [How to cite mojoboost](CITATION.cff)
+- [Technical article draft](docs/technical/BUILDING_MOJOTREES.md)
+- [How to cite mojotrees](CITATION.cff)
 - [Governance](GOVERNANCE.md)
 
 ## Installation
@@ -43,10 +43,10 @@ who or what typed a change—as the standard for correctness and performance.
 The first public alpha is on PyPI:
 
 ```sh
-pip install mojoboost
+pip install mojotrees
 ```
 
-The current `0.1.0a1` wheel supports **CPython 3.14 on Apple Silicon running
+The current `0.1.0a2` wheel supports **CPython 3.14 on Apple Silicon running
 macOS 26 or newer**. It is self-contained: using the wheel does not require
 Mojo, MAX, Pixi, or a compiler. Other interpreter and platform combinations
 will correctly receive `No matching distribution found` until matching
@@ -54,8 +54,8 @@ wheels have been built and validated.
 
 | State | What you type | Status today |
 |---|---|---|
-| Published alpha | `pip install mojoboost` | **Available:** `0.1.0a1`, CPython 3.14, Apple Silicon, macOS 26+ |
-| Release wheel file | `pip install ./mojoboost-<version>-<tags>.whl` | **Available** from the release workflow |
+| Published alpha | `pip install mojotrees` | **Available:** `0.1.0a2`, CPython 3.14, Apple Silicon, macOS 26+ |
+| Release wheel file | `pip install ./mojotrees-<version>-<tags>.whl` | **Available** from the release workflow |
 | Source checkout with Pixi | the four commands below | **Available** for contributors and development |
 
 [docs/INSTALLATION.md](docs/INSTALLATION.md) is the full version of this,
@@ -63,8 +63,8 @@ with what each state will require, the wheel filename for each platform, the
 first five minutes step by step, and the error messages an install can
 produce with what each one means.
 
-mojoboost publishes no source distribution, deliberately, so `pip install
-mojoboost` can never turn into a Mojo compile on a machine with no Mojo
+mojotrees publishes no source distribution, deliberately, so `pip install
+mojotrees` can never turn into a Mojo compile on a machine with no Mojo
 toolchain. It resolves to a wheel that matches your machine or it refuses.
 
 ### Source installation for contributors
@@ -73,20 +73,20 @@ A Mojo or MAX installation is not required separately; pixi resolves the
 versions pinned by this repository.
 
 ```sh
-git clone https://github.com/mojoboost-ml/mojoboost.git
-cd mojoboost
+git clone https://github.com/mojotrees/mojotrees.git
+cd mojotrees
 pixi install
 pixi run build-python
 ```
 
 ```sh
 PYTHONPATH=python python - <<'PY'
-from mojoboost import MojoBoostRegressor
+from mojotrees import MojoTreesRegressor
 
 X = [[0.0], [1.0], [2.0], [3.0], [4.0], [5.0]]
 y = [0.0, 1.0, 4.0, 9.0, 16.0, 25.0]
 
-model = MojoBoostRegressor(n_estimators=20, num_leaves=7, min_data_in_leaf=1)
+model = MojoTreesRegressor(n_estimators=20, num_leaves=7, min_data_in_leaf=1)
 model.fit(X, y)
 print(model.predict([[1.5], [4.5]]))
 print("backend:", model.device_)
@@ -121,9 +121,9 @@ evidence establishes a trustworthy threshold. Read
 [Device selection](#device-selection) before using it.
 
 If any of this fails, open a
-[bug report](https://github.com/mojoboost-ml/mojoboost/issues/new?template=bug_report.yml),
+[bug report](https://github.com/mojotrees/mojotrees/issues/new?template=bug_report.yml),
 which covers installation problems, and paste the output of
-`mojoboost.show_versions()` plus, from a source checkout,
+`mojotrees.show_versions()` plus, from a source checkout,
 `pixi run mojo --version`. `show_versions()` reports what this install is,
 which environment variables are in effect, and whether a GPU path was
 compiled into the build, which is decided on the build machine and cannot be
@@ -146,13 +146,13 @@ Experimental public alpha. Training works end to end and the repository has
 a broad LightGBM-shaped feature surface. That is not the same as verified
 behavioral or production parity: combinations, edge cases, installation
 targets, and non-Apple accelerators remain less mature. The list below is
-what works today, each piece with tests; for what LightGBM has that mojoboost does not,
+what works today, each piece with tests; for what LightGBM has that mojotrees does not,
 and for the semantics that differ deliberately, read the parity contract in
 [docs/LIGHTGBM_PARITY.md](docs/LIGHTGBM_PARITY.md), which is authoritative
 where this list and it disagree.
 
 One caution that the size of the list makes worth stating plainly. A file
-in `src/mojoboost/` is not a feature. Several capabilities in this
+in `src/mojotrees/` is not a feature. Several capabilities in this
 repository are written, compile, and are reached by no entry point, so
 nothing you can call behaves differently because they exist.
 [docs/INTEGRATION_INVENTORY.md](docs/INTEGRATION_INVENTORY.md) is the
@@ -214,7 +214,7 @@ implementations the item says which one runs.
   framework-applied sample weights, and a Python callback path with a
   measured per-round cost (see [Custom objectives](#custom-objectives))
 - learning to rank with LambdaRank (`train_ranker`, `fit_ranker`,
-  `MojoBoostRanker`): LightGBM's NDCG-weighted pairwise lambdas and
+  `MojoTreesRanker`): LightGBM's NDCG-weighted pairwise lambdas and
   hessians, `lambdarank_truncation_level`, `sigmoid`, and `lambdarank_norm`;
   query boundaries from LightGBM's `group` array or from a query id column,
   which is rejected when a query's rows are not contiguous; NDCG at any
@@ -223,7 +223,7 @@ implementations the item says which one runs.
 - validation-set early stopping with `min_delta` for every objective,
   truncating to the best round
 - custom validation metrics (`train_with_metrics`, `fit_with_metrics`,
-  `MojoBoostRegressor.fit(eval_set=..., eval_metric=...)`), independent of
+  `MojoTreesRegressor.fit(eval_set=..., eval_metric=...)`), independent of
   the objective: each metric has a name, a direction, and a flag for
   whether early stopping watches it, several may run against several
   validation sets, and an explicit primary metric picks the round the
@@ -237,12 +237,12 @@ implementations the item says which one runs.
   (`eval_metric="auc"`) and callable directly from Mojo
 - class weighting: `class_weight="balanced"` or a per-class dict on the
   Python classifier, and LightGBM's `scale_pos_weight` / `is_unbalance`
-  under their own names in `src/mojoboost/class_weight.mojo`. Each is
+  under their own names in `src/mojotrees/class_weight.mojo`. Each is
   folded into the row weights before training rather than into the
   objective, so it composes with `sample_weight` instead of competing with
   it. Two implementations of that folding exist today, one in Mojo and one
   in the Python estimator, and only the Python one runs for a
-  `MojoBoostClassifier`; see
+  `MojoTreesClassifier`; see
   [docs/INTEGRATION_INVENTORY.md](docs/INTEGRATION_INVENTORY.md)
 - sample weights for every objective, LightGBM semantics (weighted
   gradients, hessians, and base scores; zero-weight rows are ignored)
@@ -270,7 +270,7 @@ implementations the item says which one runs.
   where scheduling costs more than the work. Every path is bit-identical to
   the serial one at any worker count: feature tasks keep each feature's sum
   inside one task and row blocks are used only where nothing is summed across
-  rows. `MOJOBOOST_NUM_WORKERS` and `MOJOBOOST_PARALLEL_MIN_OPS` pin the
+  rows. `MOJOTREES_NUM_WORKERS` and `MOJOTREES_PARALLEL_MIN_OPS` pin the
   scheduler for reproducible runs; `pixi run bench-profile` times each stage
   serial against parallel
 - a data-parallel distributed training prototype: rows partitioned across
@@ -302,8 +302,8 @@ implementations the item says which one runs.
   format that stores floats as raw bit patterns, so loaded models predict
   bit-exactly; multiclass models via `save_multiclass_model` and
   `load_multiclass_model`
-- scikit-learn style Python API (`MojoBoostRegressor`,
-  `MojoBoostClassifier`, `MojoBoostRanker`) backed by a CPython extension
+- scikit-learn style Python API (`MojoTreesRegressor`,
+  `MojoTreesClassifier`, `MojoTreesRanker`) backed by a CPython extension
   module built from the same Mojo code, with sample weights and exact
   save/load
 - LightGBM-native parameter names as the canonical Python vocabulary, with
@@ -322,7 +322,7 @@ implementations the item says which one runs.
   [Sparse input](#sparse-input)
 
 ```mojo
-from mojoboost import BINARY_LOGISTIC, BoosterParams, TreeParams, fit
+from mojotrees import BINARY_LOGISTIC, BoosterParams, TreeParams, fit
 
 def main() raises:
     # features is column-major: features[f * n_rows + r]
@@ -343,8 +343,8 @@ feature-oriented; prediction takes CSR, because it is row-oriented, and the
 two convert into each other in O(nnz).
 
 ```mojo
-from mojoboost import SQUARED_ERROR, BoosterParams, CscMatrix, fit_csc
-from mojoboost import predict_csr
+from mojotrees import SQUARED_ERROR, BoosterParams, CscMatrix, fit_csc
+from mojotrees import predict_csr
 
 def main() raises:
     # Feature f owns entries [col_offsets[f], col_offsets[f + 1]).
@@ -391,17 +391,17 @@ Each raises rather than densifying silently.
 
 Build the extension once with `pixi run build-python` (which runs
 `bindings/build.sh`; see [Installation](#installation)), then use the
-scikit-learn style estimators in `python/mojoboost`:
+scikit-learn style estimators in `python/mojotrees`:
 
 ```python
-from mojoboost import MojoBoostRegressor, MojoBoostClassifier
+from mojotrees import MojoTreesRegressor, MojoTreesClassifier
 
-model = MojoBoostRegressor(num_leaves=31, n_estimators=100).fit(X, y)
+model = MojoTreesRegressor(num_leaves=31, n_estimators=100).fit(X, y)
 pred = model.predict(X)          # numpy in/out when numpy is available
 model.save("model.mbst")
-model = MojoBoostRegressor.load("model.mbst")
+model = MojoTreesRegressor.load("model.mbst")
 
-clf = MojoBoostClassifier().fit(X, labels)   # binary or multiclass by labels
+clf = MojoTreesClassifier().fit(X, labels)   # binary or multiclass by labels
 proba = clf.predict_proba(X)
 ```
 
@@ -424,7 +424,7 @@ The estimators are one door. The other is LightGBM's functional API, which
 gives you the model object itself:
 
 ```python
-import mojoboost as mb
+import mojotrees as mb
 
 train_set = mb.Dataset(X, label=y)
 booster = mb.train({"objective": "regression", "num_leaves": 31},
@@ -479,7 +479,7 @@ adding your own offset back, which is what LightGBM does too.
 The estimators hold the same object on `booster_`:
 
 ```python
-model = MojoBoostRegressor(n_estimators=100).fit(X, y)
+model = MojoTreesRegressor(n_estimators=100).fit(X, y)
 model.booster_.num_trees()
 model.booster_.model_to_string()
 ```
@@ -511,7 +511,7 @@ from sklearn.model_selection import GridSearchCV
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
-pipe = Pipeline([("scale", StandardScaler()), ("gbdt", MojoBoostRegressor())])
+pipe = Pipeline([("scale", StandardScaler()), ("gbdt", MojoTreesRegressor())])
 search = GridSearchCV(pipe, {"gbdt__num_leaves": [15, 31]}, cv=3).fit(X, y)
 ```
 
@@ -560,7 +560,7 @@ with `num_iteration=k` reproduces a `k`-round fit exactly, and `[0, k)` and
 raise; a non-integer bound is a `TypeError`.
 
 `num_iteration=None` predicts with `best_iteration_` iterations, LightGBM's
-documented default. mojoboost gets there structurally: early stopping
+documented default. mojotrees gets there structurally: early stopping
 truncates the ensemble at its best iteration, so the trees the model still
 holds are the best iteration and there is nothing later to exclude.
 
@@ -570,7 +570,7 @@ single-output estimators (regressor, ranker, binary classifier) and
 whose column `i * n_classes + k` holds class k's tree in iteration i. A leaf
 is named by its ordinal within its own tree, in `[0, num_leaves)`, numbered
 in node order; the numbering is fixed once a tree is grown and survives
-`save`/`load` and pickling. It is mojoboost's own numbering and not
+`save`/`load` and pickling. It is mojotrees's own numbering and not
 LightGBM's leaf id.
 
 `pred_contrib` returns exact per-feature contributions: shape
@@ -644,7 +644,7 @@ reports zero gain importance (with a warning), which
 `dump_model()["has_split_gain"]` tells apart from a measured zero.
 
 Two documented differences from what a scikit-learn estimator is supposed
-to be, both of which are why mojoboost says "scikit-learn style" and does
+to be, both of which are why mojotrees says "scikit-learn style" and does
 not claim `check_estimator` passes:
 
 - the estimators forward their shared hyperparameters through `**kwargs`,
@@ -684,7 +684,7 @@ one will look like is in [docs/INSTALLATION.md](docs/INSTALLATION.md).
 ## Device selection
 
 The same three values everywhere, in Mojo (`fit(..., device=CPU_DEVICE)`)
-and in Python (`MojoBoostRegressor(device="cpu")`):
+and in Python (`MojoTreesRegressor(device="cpu")`):
 
 | `device` | Behavior |
 |---|---|
@@ -707,7 +707,7 @@ advances those raw scores from its leaf ranges, so nothing per-row crosses
 the host/device boundary in a plain round; bagging and GOSS rank their
 samples host-side and keep the host gradient path. Per-node split selection
 runs on the host over downloaded histograms by default, which is what keeps
-CPU and GPU split decisions identical; `MOJOBOOST_GPU_SPLIT_STRATEGY=device`
+CPU and GPU split decisions identical; `MOJOTREES_GPU_SPLIT_STRATEGY=device`
 moves the scan onto the device (one 136-byte record per node instead of the
 histogram, Float32 gains that can flip near-tie decisions, bit-deterministic
 run to run), growing over a device-resident frontier so that a split builds
@@ -755,10 +755,10 @@ two backends sample identically.
 resolves to the CPU. No benchmark on any device has established a
 workload size where end-to-end GPU training beats the CPU trainer, and
 shipping a crossover threshold before then would be a performance claim
-with nothing behind it. `MOJOBOOST_AUTO_MIN_CELLS` enables it as an
+with nothing behind it. `MOJOTREES_AUTO_MIN_CELLS` enables it as an
 integer cell count (`n_rows * n_features`) at or above which `auto`
 chooses the GPU, which is the knob for running the crossover benchmark
-that would justify a default. `MOJOBOOST_DISABLE_GPU=1` makes the library
+that would justify a default. `MOJOTREES_DISABLE_GPU=1` makes the library
 report no accelerator, so `gpu` raises and `auto` chooses the CPU on a
 machine that has one; it pins a mixed fleet to the CPU and exercises the
 unavailable-GPU path in tests.
@@ -769,7 +769,7 @@ so the serialization format is unchanged and a loaded estimator carries no
 `device_`.
 
 LightGBM difference: LightGBM spells this `device_type` with `cpu`, `gpu`,
-and `cuda`, and has no `auto`. mojoboost has one portable GPU backend
+and `cuda`, and has no `auto`. mojotrees has one portable GPU backend
 rather than separate OpenCL and CUDA ones, so `gpu` covers every supported
 accelerator, and `auto` is an addition.
 
@@ -801,7 +801,7 @@ asserts that directly rather than to a tolerance, on full-dataset builds,
 leaf-filtered builds, and under feature subsampling.
 
 The launch geometry is derived at runtime from the device's own reported
-capabilities (`src/mojoboost/gpu_tiling.mojo`), not fixed at compile time,
+capabilities (`src/mojotrees/gpu_tiling.mojo`), not fixed at compile time,
 because the same source targets Metal, CUDA, and HIP across multiprocessor
 counts spanning more than an order of magnitude. Threads per group come
 from the device maximum rounded to a warp; row tiles per feature are the
@@ -818,14 +818,14 @@ vendor intrinsics, and no per-architecture code paths. Only the tiling
 numbers differ per device.
 
 Three environment variables override the policy, for benchmarking and for
-tests that must force one path, matching the `MOJOBOOST_` contract in
+tests that must force one path, matching the `MOJOTREES_` contract in
 `parallel.mojo`:
 
 | Variable | Effect |
 |---|---|
-| `MOJOBOOST_GPU_HIST_STRATEGY` | `atomic` or `tiled` forces that strategy; `auto` or unset lets the policy decide |
-| `MOJOBOOST_GPU_ROW_TILE` | rows per tile, still clamped to the memory budget |
-| `MOJOBOOST_GPU_BLOCK_THREADS` | threads per threadgroup, still clamped to the device maximum and rounded to a warp |
+| `MOJOTREES_GPU_HIST_STRATEGY` | `atomic` or `tiled` forces that strategy; `auto` or unset lets the policy decide |
+| `MOJOTREES_GPU_ROW_TILE` | rows per tile, still clamped to the memory budget |
+| `MOJOTREES_GPU_BLOCK_THREADS` | threads per threadgroup, still clamped to the device maximum and rounded to a warp |
 
 These are tuning and test knobs rather than model parameters: they change
 how a histogram is computed, never what it equals, so they are deliberately
@@ -839,7 +839,7 @@ been run.
 
 LightGBM difference: LightGBM's GPU histogram builder is written against
 specific vendor toolchains and tunes itself with vendor-specific constants.
-mojoboost has one kernel source for every backend and moves all
+mojotrees has one kernel source for every backend and moves all
 device-specific choice into the tiling policy, which is why the strategy and
 tile size are runtime values here rather than compile-time ones.
 
@@ -873,7 +873,7 @@ tile size are runtime values here rather than compile-time ones.
    [docs/PLATFORM_MATRIX.md](docs/PLATFORM_MATRIX.md)
 5. Broader benchmark suite (XGBoost and real datasets)
 6. R bindings on top of the C ABI in `capi/`, which exists so that the R
-   package (and any other language binding) never has to track a mojoboost
+   package (and any other language binding) never has to track a mojotrees
    internal layout
 
 ## Defaults
@@ -961,7 +961,7 @@ grown on that bag. `bagging_freq=0` or `bagging_fraction=1` means no
 bagging, which is the default.
 
 ```python
-MojoBoostRegressor(
+MojoTreesRegressor(
     bagging_fraction=0.8, bagging_freq=1, bagging_seed=3
 ).fit(X, y)
 ```
@@ -1019,7 +1019,7 @@ smaller sample still estimates the full-data histogram. Ordinary GBDT
 remains the default.
 
 ```python
-MojoBoostRegressor(
+MojoTreesRegressor(
     boosting="goss", top_rate=0.2, other_rate=0.1, goss_seed=3
 ).fit(X, y)
 ```
@@ -1055,7 +1055,7 @@ Three intentional differences from LightGBM:
 
 - LightGBM splits the rows into blocks and gives each block its own 15-bit
   LCG, so its sample depends on the block layout and consecutive rounds
-  start their streams at nearby states. mojoboost draws from the same
+  start their streams at nearby states. mojotrees draws from the same
   counter-based splitmix64 scheme bagging uses, keyed by
   `(goss_seed, round, row index)`, so a row's draw depends on nothing that
   happened before it. The threshold rule, the sampled counts, and the
@@ -1078,7 +1078,7 @@ two. Both draws are without replacement and both default to 1.0, which
 selects every feature and makes the seed irrelevant.
 
 ```python
-MojoBoostRegressor(
+MojoTreesRegressor(
     feature_fraction=0.8, feature_fraction_bynode=0.5, feature_fraction_seed=2
 ).fit(X, y)
 ```
@@ -1117,19 +1117,19 @@ Two intentional differences from LightGBM:
 
 - LightGBM draws from a single linear-congruential stream that advances as
   training proceeds, so a tree's feature set depends on how many draws came
-  before it. mojoboost keys an independent counter-based splitmix64 stream on
+  before it. mojotrees keys an independent counter-based splitmix64 stream on
   `(feature_fraction_seed, tree index, node id)`, so a selection is
   reproducible per tree and per node regardless of history or backend, and
   sets do not match LightGBM's at equal seeds. The count formula and the
   selection algorithm (Knuth's Algorithm S, as in LightGBM's
   `Random::Sample`) are the same, so the distribution matches
 - LightGBM builds each node's histograms over that node's by-node set;
-  mojoboost builds over the tree's set and applies the by-node set to the
+  mojotrees builds over the tree's set and applies the by-node set to the
   split search. Split decisions are identical, and building the superset is
   what keeps histogram subtraction exact when the by-node sets differ
   between a parent and its children
 - with interaction constraints also configured, LightGBM draws the by-node
-  set from the features the branch already allows; mojoboost draws from the
+  set from the features the branch already allows; mojotrees draws from the
   tree's set and then applies the allow mask, so a node can end up with fewer
   candidates than LightGBM would give it. Both restrict to the same features;
   only how many survive the draw differs
@@ -1159,7 +1159,7 @@ is learnable on its own.
 
 ```python
 X = np.array([[1.0], [np.nan], [3.0]])
-model = MojoBoostRegressor().fit(X, y)
+model = MojoTreesRegressor().fit(X, y)
 model.predict(np.array([[np.nan]]))     # follows each node's default direction
 ```
 
@@ -1189,7 +1189,7 @@ Differences from LightGBM, all deliberate:
   0 and route right, which is LightGBM's `CategoricalDecision` behavior.
 
 `pixi run -e bench compare-missing` is the reproducible comparison: it prints
-mojoboost's and LightGBM's routing decisions side by side on the same data.
+mojotrees's and LightGBM's routing decisions side by side on the same data.
 Against LightGBM 4.7 every one of them matches.
 
 ### Categorical features
@@ -1200,9 +1200,9 @@ Mark the columns whose integer codes are unordered categories with
 column names, a mix of the two, or LightGBM's default `"auto"`:
 
 ```python
-model = MojoBoostRegressor(categorical_feature=[0, 3]).fit(X, y)
-model = MojoBoostRegressor(categorical_feature=["city", "device"]).fit(df, y)
-model = MojoBoostRegressor().fit(df, y)   # "auto": every category column
+model = MojoTreesRegressor(categorical_feature=[0, 3]).fit(X, y)
+model = MojoTreesRegressor(categorical_feature=["city", "device"]).fit(df, y)
+model = MojoTreesRegressor().fit(df, y)   # "auto": every category column
 ```
 
 or, from Mojo:
@@ -1216,8 +1216,8 @@ var model = fit(
 
 The parameter lives on the constructor rather than on `fit`, unlike
 LightGBM, because scikit-learn's clone contract keeps hyperparameters on the
-estimator. It works the same on `MojoBoostRegressor`,
-`MojoBoostClassifier`, and `MojoBoostRanker`, and on the Mojo `fit`,
+estimator. It works the same on `MojoTreesRegressor`,
+`MojoTreesClassifier`, and `MojoTreesRanker`, and on the Mojo `fit`,
 `fit_multiclass`, `fit_custom`, and `fit_ranker`.
 
 #### pandas categorical columns
@@ -1231,7 +1231,7 @@ differently still lands on the categories the model was fitted with:
 
 ```python
 train = pd.DataFrame({"city": pd.Categorical(["nyc", "sfo", ...])})
-model = MojoBoostRegressor().fit(train, y)
+model = MojoTreesRegressor().fit(train, y)
 model.categorical_feature_          # [0]
 model.predict(other_frame)          # 'nyc' is 'nyc' whatever its code there
 ```
@@ -1291,14 +1291,14 @@ categorical node, matching LightGBM's `CategoricalDecision`:
 **Intentional differences from LightGBM.**
 
 - Row counts are exact. LightGBM estimates a bin's count from its Hessian sum
-  because its histograms carry no counts; mojoboost's do, so
+  because its histograms carry no counts; mojotrees's do, so
   `min_data_in_leaf`, `min_data_per_group`, and the `cat_smooth` count filter
   use exact counts.
 - One-vs-rest is selected on the number of categories, matching the
   documented meaning of `max_cat_to_onehot`, rather than on an internal bin
   count that may or may not include the unknown bin.
 - LightGBM keeps the most frequent categories covering 99% of rows and drops
-  categories below `min_data_in_bin`; mojoboost keeps the `max_bins - 1` most
+  categories below `min_data_in_bin`; mojotrees keeps the `max_bins - 1` most
   frequent and drops nothing else, leaving rare categories to the
   `cat_smooth` filter during split search.
 - LightGBM's `kEpsilon` (1e-15) Hessian nudges are omitted.
@@ -1333,7 +1333,7 @@ both, and transitively everything else already on that path. That is what
 restricts a model to additive or low-order-interaction structure.
 
 ```python
-MojoBoostRegressor(interaction_constraints=[[0, 1], [2, 3]]).fit(X, y)
+MojoTreesRegressor(interaction_constraints=[[0, 1], [2, 3]]).fit(X, y)
 ```
 
 ```mojo
@@ -1386,7 +1386,7 @@ Three further notes:
 nondecreasing, `-1` for nonincreasing, `0` for unconstrained.
 
 ```python
-MojoBoostRegressor(monotone_constraints=[1, 0, -1]).fit(X, y)
+MojoTreesRegressor(monotone_constraints=[1, 0, -1]).fit(X, y)
 ```
 
 ```mojo
@@ -1419,18 +1419,18 @@ of trees.
 Notes and deliberate differences:
 
 - LightGBM decides constraints are in play by checking that the vector is
-  non-empty; mojoboost also treats an all-zero vector as inactive, so split
+  non-empty; mojotrees also treats an all-zero vector as inactive, so split
   search keeps its unconstrained path and the fit is bit-identical to one
   with no vector at all (there is a test for exactly this)
 - only the `basic` method is implemented; LightGBM's `intermediate` and
   `advanced` methods buy back some of the accuracy `basic` gives up, and are
   not attempted here
 - quantile and L1 rewrite every leaf value after the tree is grown, which
-  knows nothing about monotonicity, so mojoboost clamps the renewed value
+  knows nothing about monotonicity, so mojotrees clamps the renewed value
   back into its leaf's interval. That keeps the guarantee for those
   objectives at the cost of biasing the renewed percentile. We have not
   verified LightGBM's behavior at this step, so treat the clamp as
-  mojoboost-defined rather than matched
+  mojotrees-defined rather than matched
 - for multiclass, constraints apply to every per-class tree, so each class's
   **raw score** is monotone. Softmax probabilities are **not** guaranteed
   monotone, because a class's probability also moves with the other classes'
@@ -1456,7 +1456,7 @@ per-round call is direct and inlinable, with nothing dynamic in the boosting
 loop:
 
 ```mojo
-from mojoboost import BoosterParams, TreeParams, mean_label, train_custom
+from mojotrees import BoosterParams, TreeParams, mean_label, train_custom
 
 def my_objective(
     raw: List[Float64],
@@ -1519,19 +1519,19 @@ boosting round with the whole array of raw predictions, never per row:
 
 ```python
 import numpy as np
-from mojoboost import MojoBoostRegressor
+from mojotrees import MojoTreesRegressor
 
 def squared_error(raw, y):
     return raw - y, np.ones_like(raw)
 
-model = MojoBoostRegressor(
+model = MojoTreesRegressor(
     objective=squared_error, base_score="mean", n_estimators=100
 ).fit(X, y)
 pred = model.predict(X)          # raw scores: apply your own link
 ```
 
 `base_score` accepts a number or `"mean"` for the weighted label mean.
-`MojoBoostClassifier` takes no objective and says so; use the regressor and
+`MojoTreesClassifier` takes no objective and says so; use the regressor and
 apply your own link. The Python callback is convenient, not free:
 `bench/bench_custom_objective.py` measures it, and on 100,000 rows x 20
 features x 100 rounds (Apple M4, best of 3) it added 8.9 ms per round, 36%
@@ -1550,7 +1550,7 @@ can still use the older single-loss path (`train_with_valid`,
 `train_custom_with_valid`).
 
 ```mojo
-from mojoboost import (
+from mojotrees import (
     SQUARED_ERROR, BoosterParams, TreeParams, CustomMetric, MetricSuite,
     ValidSet, rmse, train_with_metric, train_with_metrics,
 )
@@ -1630,7 +1630,7 @@ query boundaries, since the trainer has no use for them.
 From Python, pass `eval_set` and friends to `fit`, in LightGBM's spelling:
 
 ```python
-model = MojoBoostRegressor(n_estimators=500).fit(
+model = MojoTreesRegressor(n_estimators=500).fit(
     X, y,
     eval_set=[(X_valid, y_valid)],   # or (X_valid, y_valid), or eval_X/eval_y
     eval_names=["holdout"],          # valid_0, valid_1, ... by default
@@ -1651,7 +1651,7 @@ defaults to the objective's own loss. The names are `l2`, `rmse`, `l1`,
 `multi_logloss`, `multi_error`, and `ndcg`, plus LightGBM's aliases
 (`mse`, `mae`, `l2_root`, `binary`, `multiclass`, ...). Each belongs to one
 task, so `auc` on a regressor is an error rather than a number nobody can
-read; their values come from `src/mojoboost/metrics.mojo`, so Python and
+read; their values come from `src/mojotrees/metrics.mojo`, so Python and
 Mojo cannot disagree, and `eval_sample_weight` weights them.
 
 A callable is `f(y_true, y_pred) -> float` (LightGBM's
@@ -1676,13 +1676,13 @@ them with `train_custom_with_metrics`.
 LightGBM's contract, so a callback list written for LightGBM runs here:
 
 ```python
-from mojoboost import MojoBoostRegressor
-from mojoboost.callback import (
+from mojotrees import MojoTreesRegressor
+from mojotrees.callback import (
     early_stopping, log_evaluation, record_evaluation, reset_parameter,
 )
 
 history = {}
-model = MojoBoostRegressor(n_estimators=500).fit(
+model = MojoTreesRegressor(n_estimators=500).fit(
     X, y,
     eval_set=[(X_valid, y_valid)],
     eval_metric="l2",
@@ -1709,7 +1709,7 @@ list rather than accepting it and doing nothing. `early_stopping_rounds=`
 works for every task either way.
 
 `reset_parameter` schedules the nine hyperparameters the loop re-reads each
-round (`mojoboost.callback.RESETTABLE`); anything else raises, rather than
+round (`mojotrees.callback.RESETTABLE`); anything else raises, rather than
 being ignored the way LightGBM ignores it. A learning-rate schedule cannot
 be represented by the single rate `Booster` applies at predict time, so the
 shrinkage is baked into the leaf values instead and the stored rate becomes
@@ -1729,8 +1729,8 @@ The training loop is Mojo, so a callback costs one crossing of the Python
 boundary per phase per round and nothing per row;
 `bench/bench_callbacks.py` measures that and asserts the crossing count.
 With no callbacks the bridge does not cross the boundary at all. See
-`python/mojoboost/callback.py` for the full contract and
-`src/mojoboost/callback.mojo` for the loop's side of it, including
+`python/mojotrees/callback.py` for the full contract and
+`src/mojotrees/callback.mojo` for the loop's side of it, including
 `train_with_callbacks` for native callers.
 
 ### Learning to rank
@@ -1741,10 +1741,10 @@ for one search, and the label is graded relevance, an integer in [0, 30]
 with 0 meaning irrelevant. Rows of a query must be contiguous.
 
 ```python
-from mojoboost import MojoBoostRanker, group_from_query_ids, ndcg_score
+from mojotrees import MojoTreesRanker, group_from_query_ids, ndcg_score
 
 # `group` is LightGBM's: the number of rows in each query, in row order.
-model = MojoBoostRanker(n_estimators=100).fit(X, y, group=[6, 4, 9])
+model = MojoTreesRanker(n_estimators=100).fit(X, y, group=[6, 4, 9])
 scores = model.predict(X)                  # rank each query by these
 print(model.score(X, y, group=[6, 4, 9]))  # mean NDCG@5
 
@@ -1753,7 +1753,7 @@ print(ndcg_score(scores, y, group, at=10))
 ```
 
 ```mojo
-from mojoboost import BoosterParams, groups_from_counts, ndcg, train_ranker
+from mojotrees import BoosterParams, groups_from_counts, ndcg, train_ranker
 
 var groups = groups_from_counts(group_counts)
 var booster = train_ranker(data, labels, groups, params)
@@ -1780,7 +1780,7 @@ boundaries are training data and not model state. `predict` returns raw
 scores whose order is the only meaningful thing about them: they are not
 comparable between queries.
 
-`src/mojoboost/ranking.mojo` documents the intentional differences from
+`src/mojotrees/ranking.mojo` documents the intentional differences from
 LightGBM (an exactly evaluated pairwise sigmoid instead of a lookup table,
 a fixed `label_gain`, query-level bagging, and no unbiased-lambdarank
 extensions). `pixi run -e bench compare-ranking` checks the NDCG metric
@@ -1793,24 +1793,24 @@ ranking quality on held-out queries.
 bindings in any language that speaks C. Full documentation, including the
 parameter string both it and the CLI take, is in
 [capi/README.md](capi/README.md); the header
-[capi/mojoboost.h](capi/mojoboost.h) is the contract.
+[capi/mojotrees.h](capi/mojotrees.h) is the contract.
 
 ```c
-MojoBoostError *err = mojoboost_error_create();
-MojoBoostModel *model = NULL;
-if (mojoboost_train_dense(x, n_rows, n_features, y, NULL,
+MojoTreesError *err = mojotrees_error_create();
+MojoTreesModel *model = NULL;
+if (mojotrees_train_dense(x, n_rows, n_features, y, NULL,
                           "objective=binary num_iterations=200",
-                          &model, err) != MOJOBOOST_OK) {
-    fprintf(stderr, "%s\n", mojoboost_error_message(err));
+                          &model, err) != MOJOTREES_OK) {
+    fprintf(stderr, "%s\n", mojotrees_error_message(err));
 }
-mojoboost_predict(model, x, n_rows, n_features, pred, n_rows, err);
-mojoboost_save_model(model, "model.mbst", err);
-mojoboost_model_free(model);
-mojoboost_error_free(err);
+mojotrees_predict(model, x, n_rows, n_features, pred, n_rows, err);
+mojotrees_save_model(model, "model.mbst", err);
+mojotrees_model_free(model);
+mojotrees_error_free(err);
 ```
 
 Only C scalars, C strings, caller-owned buffers, and opaque handles cross
-the boundary, so no mojoboost type is exposed and internal layouts can
+the boundary, so no mojotrees type is exposed and internal layouts can
 change without breaking a compiled caller. Hyperparameters travel as a
 LightGBM style parameter string rather than a struct for the same reason.
 Errors go to an explicit error object instead of a thread-local global,
@@ -1818,7 +1818,7 @@ which is a deliberate difference from LightGBM's `LGBM_GetLastError`, so
 concurrent use is well defined.
 
 ```sh
-pixi run build-capi     # capi/libmojoboost.{dylib,so}
+pixi run build-capi     # capi/libmojotrees.{dylib,so}
 pixi run test-capi      # Mojo tests: ABI matches the Mojo API exactly
 pixi run test-c         # C tests: lifecycle, invalid input, handle churn
 ```
@@ -1831,10 +1831,10 @@ documented in [cli/README.md](cli/README.md).
 
 ```sh
 pixi run build-cli
-cli/mojoboost train --data train.csv --model model.mbst \
+cli/mojotrees train --data train.csv --model model.mbst \
     --params "objective=binary num_iterations=200"
-cli/mojoboost predict --model model.mbst --data test.csv --output pred.csv
-cli/mojoboost info --model model.mbst
+cli/mojotrees predict --model model.mbst --data test.csv --output pred.csv
+cli/mojotrees info --model model.mbst
 ```
 
 Data files are comma separated numbers, one example per line, with `#`
@@ -1868,7 +1868,7 @@ the code: it fails when a row that claims support is deleted or downgraded,
 when the contract cites a file that no longer exists, when a public Python or
 Mojo symbol those rows depend on disappears, when a test suite the
 contract offers as evidence is not run by any task, or when a row claims a
-capability is out of reach after its name landed in `mojoboost.__all__`. It
+capability is out of reach after its name landed in `mojotrees.__all__`. It
 builds nothing and needs only the standard library, so it also runs in CI.
 
 ```sh
@@ -1882,7 +1882,7 @@ import graph from the four entry points and reports orphan modules, unused
 imports, duplicate policies, public parameters nothing reads, and native
 functions Python asks for that no binding exports. The second checks
 [docs/INTEGRATION_INVENTORY.md](docs/INTEGRATION_INVENTORY.md) against that
-graph. Neither imports mojoboost or builds anything, so both run on a bare
+graph. Neither imports mojotrees or builds anything, so both run on a bare
 checkout.
 
 ## Benchmarks
@@ -1894,7 +1894,7 @@ parameters. The table below preserves the original single-thread baseline;
 rerun the commands for current multicore results. 100,000 rows x 100
 features, 100 rounds, Apple M4:
 
-| | mojoboost (1 thread) | LightGBM (1 thread) |
+| | mojotrees (1 thread) | LightGBM (1 thread) |
 |---|---|---|
 | Regression: training | 3.53 s | 2.41 s |
 | Regression: binning | 0.55 s | 0.81 s |
@@ -1906,7 +1906,7 @@ The original implementation was within 1.5x of single-threaded LightGBM on
 training and faster at binning, before multicore histogram accumulation.
 
 ```sh
-pixi run bench                 # mojoboost
+pixi run bench                 # mojotrees
 pixi run -e bench bench-lgbm --threads 1
 pixi run bench-hist            # CPU/GPU histogram microbenchmark
 pixi run bench-hist-scaling    # GPU strategy and phase breakdown

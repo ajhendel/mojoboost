@@ -22,7 +22,7 @@ ones a script can check, so that a status cannot quietly become false:
    cannot drift away from the data
 
 Standard library only. It builds nothing, installs nothing, and imports no part
-of mojoboost, so it runs on a bare checkout and in CPU-only CI in well under a
+of mojotrees, so it runs on a bare checkout and in CPU-only CI in well under a
 second. It deliberately does NOT check whether a wheel exists: a matrix is a
 statement of intent plus evidence, and it has to be checkable before any
 artifact is built.
@@ -174,7 +174,7 @@ def check_tags(targets: list[dict], pythons: list[dict], matrix: dict) -> None:
         # It required every Linux row to carry a `manylinux_` tag. That sounds
         # strict and is the opposite: it made the honest artifact
         # unrepresentable. packaging/linux/build_wheel_linux.sh defaults to
-        # MOJOBOOST_TAG_POLICY=plain and emits `linux_<arch>`, and the release
+        # MOJOTREES_TAG_POLICY=plain and emits `linux_<arch>`, and the release
         # workflow defaults to `plain` too, so the wheel that actually gets
         # built had no row to match and validate_artifact.py failed R1 on it.
         # The rule forced the matrix to name a manylinux file nobody builds.

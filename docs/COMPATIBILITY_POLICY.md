@@ -1,11 +1,11 @@
 # Compatibility and release contract
 
-What a mojoboost release promises, what it does not promise, and what has
+What a mojotrees release promises, what it does not promise, and what has
 to be true before one is cut.
 
 ## Status of this document
 
-mojoboost is at version 0.1.0. There is no git tag, no published release,
+mojotrees is at version 0.1.0. There is no git tag, no published release,
 and no PyPI distribution. Nothing in this document is a statement that the
 project is ready for 1.0, and no rule here should be read as one. This is
 the contract the project intends to keep from its first tagged release
@@ -25,7 +25,7 @@ means a release is blocked, not that a parity row changed.
 
 ### 1.1 The scheme
 
-mojoboost versions are [Semantic Versioning 2.0.0](https://semver.org).
+mojotrees versions are [Semantic Versioning 2.0.0](https://semver.org).
 The version lives in three places that must agree, and a release where
 they disagree is not a release.
 
@@ -33,7 +33,7 @@ they disagree is not a release.
 |---|---|
 | `pixi.toml` | `[workspace] version` |
 | `python/pyproject.toml` | `[project] version` |
-| `python/mojoboost/__init__.py` | `__version__` |
+| `python/mojotrees/__init__.py` | `__version__` |
 
 ### 1.2 What the numbers mean after 1.0
 
@@ -48,7 +48,7 @@ signature moves. Section 8 states which numeric results are covered.
 
 ### 1.3 What the numbers mean before 1.0
 
-Under SemVer, 0.x makes no compatibility promise at all. mojoboost narrows
+Under SemVer, 0.x makes no compatibility promise at all. mojotrees narrows
 that voluntarily. While the major version is 0:
 
 - a breaking change may land in a minor bump, `0.N` to `0.N+1`
@@ -67,9 +67,9 @@ others, and a release note that changes any of them says so explicitly.
 | Number | Where | Current | Bumps when |
 |---|---|---|---|
 | Library version | `pixi.toml`, `pyproject.toml`, `__version__` | 0.1.0 | Any release |
-| C ABI version | `MOJOBOOST_ABI_VERSION` in `capi/mojoboost.h` | 1 | A declaration in the header changes incompatibly |
-| Model format version | `_VERSION` in `src/mojoboost/serialize.mojo` | v4 | The file format gains or changes a section |
-| Dump schema version | `DUMP_FORMAT_VERSION` in `python/mojoboost/inspection.py` | 1 | A dump key is removed, retyped, or given a new meaning |
+| C ABI version | `MOJOTREES_ABI_VERSION` in `capi/mojotrees.h` | 1 | A declaration in the header changes incompatibly |
+| Model format version | `_VERSION` in `src/mojotrees/serialize.mojo` | v4 | The file format gains or changes a section |
+| Dump schema version | `DUMP_FORMAT_VERSION` in `python/mojotrees/inspection.py` | 1 | A dump key is removed, retyped, or given a new meaning |
 | Snapshot schema version | `schema_version` in `tests/parallel/api_snapshot_manifest.json` | 1 | The manifest's own shape changes |
 
 The model format version and the dump schema version are independent and
@@ -84,32 +84,32 @@ may change in any release, including a patch release.
 
 **Public.**
 
-1. The names in `mojoboost.__all__` and their documented behavior
-   (`python/mojoboost/__init__.py`).
-2. The public methods and attributes of `MojoBoostRegressor`,
-   `MojoBoostClassifier`, `MojoBoostRanker`, `Booster`, and `Dataset`,
+1. The names in `mojotrees.__all__` and their documented behavior
+   (`python/mojotrees/__init__.py`).
+2. The public methods and attributes of `MojoTreesRegressor`,
+   `MojoTreesClassifier`, `MojoTreesRanker`, `Booster`, and `Dataset`,
    excluding any name that starts with an underscore.
 3. The fitted attributes of section 5.
-4. The names re-exported from `src/mojoboost/__init__.mojo`.
-5. The declarations in `capi/mojoboost.h`.
-6. The command line interface of `cli/mojoboost`, including its exit
+4. The names re-exported from `src/mojotrees/__init__.mojo`.
+5. The declarations in `capi/mojotrees.h`.
+6. The command line interface of `cli/mojotrees`, including its exit
    statuses.
 7. The LightGBM style parameter string accepted by `parse_params`, which
    is the training surface of both the C ABI and the CLI.
 8. The model file format written by `save_model` and its variants.
-9. The `MOJOBOOST_*` environment variables of section 9.5.
+9. The `MOJOTREES_*` environment variables of section 9.5.
 
 **Internal, explicitly.**
 
 - Every name beginning with `_`, in Python and in Mojo, wherever it lives.
-  This includes `python/mojoboost/_arrays.py`, `_eval.py`, and `_sklearn.py`
+  This includes `python/mojotrees/_arrays.py`, `_eval.py`, and `_sklearn.py`
   in their entirety, and the frozen internal helpers in
-  `src/mojoboost/boosting.mojo` (`_fill_grad_hess`, `_base_score`,
+  `src/mojotrees/boosting.mojo` (`_fill_grad_hess`, `_base_score`,
   `_check_objective`, `_check_sample_weight`, `_renew_leaf_values`), which
   are frozen for the benefit of in-tree callers and not for external ones.
 - Anything under `bench/`, `tools/`, `packaging/`, and `launch/`.
-- Module layout inside `src/mojoboost/` and inside `python/mojoboost/`.
-  Importing `mojoboost.basic` is supported because `Booster`, `Dataset`,
+- Module layout inside `src/mojotrees/` and inside `python/mojotrees/`.
+  Importing `mojotrees.basic` is supported because `Booster`, `Dataset`,
   and `train` are re-exported at the top level; importing any other
   submodule by path is not.
 - Benchmark numbers. Every performance figure in this repository describes
@@ -145,7 +145,7 @@ binding now.
   so the note is the mechanism.
 - **C ABI.** The old declaration stays in the header, keeps working, and
   is marked deprecated in its comment. Removing it is a major release and
-  a `MOJOBOOST_ABI_VERSION` bump.
+  a `MOJOTREES_ABI_VERSION` bump.
 - **Parameter names.** The old name keeps working and reports the
   replacement. A parameter string containing a removed name reports the
   replacement rather than the generic unknown-key message, for as long as
@@ -174,7 +174,7 @@ API, in the docstring of the surviving surface.
 
 LightGBM's native parameter names are canonical everywhere: in the
 estimator constructors, in the `params` dict of the functional API, and in
-the parameter string that the C ABI and the CLI parse. Where mojoboost has
+the parameter string that the C ABI and the CLI parse. Where mojotrees has
 its own spelling for something LightGBM also names, LightGBM's name is the
 one that is guaranteed.
 
@@ -188,7 +188,7 @@ in force today are `min_child_samples` for `min_data_in_leaf`,
 `bagging_fraction` and `bagging_freq`, `device_type` for `device`,
 `boosting_type` for `boosting`, and `categorical_features` for
 `categorical_feature`. The callback reset path accepts a wider alias set,
-listed in `_RESET_ALIASES` in `python/mojoboost/callback.py`, and it is
+listed in `_RESET_ALIASES` in `python/mojotrees/callback.py`, and it is
 covered too.
 
 Three rules hold for aliases.
@@ -198,7 +198,7 @@ Three rules hold for aliases.
    are fixed, in the same release.
 3. Setting both members of a pair to different non-default values raises,
    and that behavior is itself part of the contract. LightGBM warns and
-   keeps one; mojoboost refuses, because a silently dropped
+   keeps one; mojotrees refuses, because a silently dropped
    hyperparameter is not recoverable from the output.
 
 New aliases may be added in a minor release. Adding one is additive and
@@ -216,7 +216,7 @@ A default may change only in a major release, or in a minor release before
 1.0, and only with all four of these in the release notes: the old value,
 the new value, why, and how to pin the old behavior explicitly.
 
-Two defaults are mojoboost's own rather than LightGBM's and are called out
+Two defaults are mojotrees's own rather than LightGBM's and are called out
 because a reader may expect otherwise. `lambda_l2` defaults to 1.0, and
 `min_child_hess` defaults to 1e-3. They are frozen on the same terms.
 
@@ -230,7 +230,7 @@ moving the other way is breaking.
 
 ### 4.5 The unimplemented-objective register
 
-`_UNIMPLEMENTED_OBJECTIVES` in `python/mojoboost/__init__.py` names the
+`_UNIMPLEMENTED_OBJECTIVES` in `python/mojotrees/__init__.py` names the
 LightGBM objectives that are not implemented and says why for each. The
 guarantee is that asking for one of them raises with a reason, not that
 the reason's wording is stable. Implementing one and removing it from the
@@ -310,10 +310,10 @@ The policy from the first release onward:
 - The `requires-python` floor and the wheel tags shipped are stated in
   every release note.
 
-**Import surface.** `import mojoboost` gives the names in `__all__`, and
-`mojoboost.callback` gives the callback factories under their own module,
+**Import surface.** `import mojotrees` gives the names in `__all__`, and
+`mojotrees.callback` gives the callback factories under their own module,
 as LightGBM does. No other submodule is a supported import path.
-`mojoboost.inspection` is the open case; see section 8.1.
+`mojotrees.inspection` is the open case; see section 8.1.
 
 **numpy.** Optional. Every documented path works with plain Python
 sequences, and this stays true. numpy is never a hard dependency.
@@ -333,10 +333,10 @@ stopping ran.
 ### 6.2 Mojo
 
 **There is no Mojo ABI promise, and none is possible today.** Mojo does
-not have a stable ABI, so a mojoboost built with one toolchain and a
+not have a stable ABI, so a mojotrees built with one toolchain and a
 caller built with another are not interoperable in general. Mojo
 compatibility here means source compatibility: code that imported a name
-from `mojoboost` and compiled against release N compiles against release
+from `mojotrees` and compiled against release N compiles against release
 N+1 within a major version.
 
 **Toolchain range.** `mojo >=1.0.0,<2` and `max >=26.5.0,<27` in
@@ -345,8 +345,8 @@ raising the floor, is a breaking change for anyone pinned below the new
 floor and is treated as one.
 
 **Export surface.** The names re-exported from
-`src/mojoboost/__init__.mojo` are the public Mojo API. A module that
-exists in `src/mojoboost/` but is not re-exported is internal, whatever
+`src/mojotrees/__init__.mojo` are the public Mojo API. A module that
+exists in `src/mojotrees/` but is not re-exported is internal, whatever
 its contents. Reachability by path is not an export.
 
 **Signatures.** A trailing parameter with a default may be added to a
@@ -356,20 +356,20 @@ type is breaking.
 
 ### 6.3 C ABI
 
-`capi/mojoboost.h` is the surface most likely to be consumed by compiled
-callers that cannot be rebuilt in step with mojoboost, so it carries the
+`capi/mojotrees.h` is the surface most likely to be consumed by compiled
+callers that cannot be rebuilt in step with mojotrees, so it carries the
 strictest rules. The header's own design rules are normative and are not
 restated here.
 
-`MOJOBOOST_ABI_VERSION` is 1. It is bumped only for a change that breaks a
-compiled caller. Query it with `mojoboost_abi_version()` when loading the
+`MOJOTREES_ABI_VERSION` is 1. It is bumped only for a change that breaks a
+compiled caller. Query it with `mojotrees_abi_version()` when loading the
 library dynamically, and compare it against the constant the caller was
 compiled with.
 
 **Additive, minor release, no ABI bump.**
 
 - A new function.
-- A new negative `MOJOBOOST_ERROR_*` code. Callers are required to treat
+- A new negative `MOJOTREES_ERROR_*` code. Callers are required to treat
   any negative return as a failure and to read the message from the error
   object, so a new code is not a break. Callers that switch exhaustively
   on the known codes and assume a default is impossible are outside the
@@ -383,17 +383,17 @@ compiled with.
 - Changing the numeric value of an existing status code.
 - Changing an ownership or lifetime rule, including which calls clear the
   error object and how long a returned message pointer stays valid.
-- Making a handle non-opaque, or exposing any mojoboost struct layout.
+- Making a handle non-opaque, or exposing any mojotrees struct layout.
 
 **Not covered.** The exact wording of an error message, and the shared
 library's file name and soname, which are build outputs of `capi/build.sh`
 rather than declarations in the header. Anyone loading the library
-dynamically should key on `mojoboost_abi_version()` and not on a file
+dynamically should key on `mojotrees_abi_version()` and not on a file
 name.
 
 ### 6.4 Command line interface
 
-`cli/mojoboost train` and `cli/mojoboost predict`, their flags, their CSV
+`cli/mojotrees train` and `cli/mojotrees predict`, their flags, their CSV
 input and output shapes, and their exit statuses (0 for success, 1 for a
 runtime failure, 2 for a usage error) are public on the terms of section
 1.2. Adding a flag is additive. Changing what an existing flag does, or
@@ -404,7 +404,7 @@ for humans is not covered.
 
 ### 7.1 What the format is
 
-A versioned plain-text token stream, magic `mojoboost`, current version
+A versioned plain-text token stream, magic `mojotrees`, current version
 `v4`. Floats travel as their IEEE-754 bit patterns rendered as decimal
 `UInt64`, so a save and load round trip is bit-exact and the file has no
 locale or precision pitfalls and no endianness dependence. The token after
@@ -412,7 +412,7 @@ the version distinguishes a single-output file (`objective`) from a
 multiclass file (`multiclass`), so a reader determines the kind from the
 file rather than from the call.
 
-It is mojoboost's format. It is not LightGBM's text model format, and the
+It is mojotrees's format. It is not LightGBM's text model format, and the
 two are not interchangeable in either direction.
 
 ### 7.2 Backward compatibility, which is guaranteed
@@ -482,7 +482,7 @@ Adding one of these to the format later is a format change under section
 ### 8.1 What structured inspection exists
 
 Structured inspection landed while this document was being written, as
-`python/mojoboost/inspection.py` and `src/mojoboost/inspection.mojo`,
+`python/mojotrees/inspection.py` and `src/mojotrees/inspection.mojo`,
 with `dump_model`, `trees_to_dataframe`, `trees_to_records`,
 `split_values`, `get_split_value_histogram`, `leaf_index_of`,
 `raw_scores`, and `booster_of`. Its normative schema is
@@ -497,13 +497,13 @@ keep rather than this one's.
 
 **One thing is unresolved, and it is a section 2 question.** `inspection`
 is a submodule with its own `__all__`. Nothing in it is re-exported from
-`python/mojoboost/__init__.py`, and section 6.1 says no submodule except
-`mojoboost.callback` is a supported import path. So as the tree stands,
-`mojoboost.inspection.dump_model` is real, documented, and formally
+`python/mojotrees/__init__.py`, and section 6.1 says no submodule except
+`mojotrees.callback` is a supported import path. So as the tree stands,
+`mojotrees.inspection.dump_model` is real, documented, and formally
 outside the public surface. Two ways to close that, and one of them has
 to happen before the first tagged release: re-export the inspection names
 at the top level the way the callback names are, or add
-`mojoboost.inspection` to the supported import paths in section 6.1. The
+`mojotrees.inspection` to the supported import paths in section 6.1. The
 release gate carries it as item C5.
 
 The rest of what a fitted model will tell you, and what each part
@@ -530,9 +530,9 @@ A leaf is named by its ordinal within its own tree, in `[0, num_leaves)`,
 numbered in node order. The numbering is fixed once a tree is grown and
 survives save, load, and pickle.
 
-It is mojoboost's numbering and not LightGBM's, and the two agree only by
+It is mojotrees's numbering and not LightGBM's, and the two agree only by
 coincidence. Anything that consumes leaf ids as a categorical feature, as
-LightGBM users do, is consuming a mojoboost-specific encoding and must be
+LightGBM users do, is consuming a mojotrees-specific encoding and must be
 refit rather than transferred.
 
 ### 8.3 Numerical guarantees that are part of the contract
@@ -566,7 +566,7 @@ signature moves.
 
 CPU histogram accumulation is dispatched per feature and each feature owns
 its output slice, so the worker count does not change the result.
-`MOJOBOOST_NUM_WORKERS` and `MOJOBOOST_PARALLEL_MIN_OPS` are performance
+`MOJOTREES_NUM_WORKERS` and `MOJOTREES_PARALLEL_MIN_OPS` are performance
 controls and changing either does not change a model.
 
 GPU histogram accumulation is fixed-point Int32 throughout, with the
@@ -607,7 +607,7 @@ which is a guarantee about state and not only about the exception.
 
 The four factories LightGBM ships are `early_stopping`,
 `log_evaluation`, `record_evaluation`, and `reset_parameter`, importable
-from `mojoboost` and from `mojoboost.callback`. Their signatures follow
+from `mojotrees` and from `mojotrees.callback`. Their signatures follow
 LightGBM's.
 
 Known limits, which are documented rather than fixed. Callbacks need an
@@ -618,10 +618,10 @@ reverse is breaking.
 
 ### 9.3 Resettable parameters
 
-`RESETTABLE` in `python/mojoboost/callback.py` names the hyperparameters a
+`RESETTABLE` in `python/mojotrees/callback.py` names the hyperparameters a
 before-iteration callback may change, and the tuple order is the slot
 order the Mojo bridge reads. It is coupled to `RESET_SLOTS` and to
-`_write_reset` and `_read_reset` in `bindings/_mojoboost.mojo`.
+`_write_reset` and `_read_reset` in `bindings/_mojotrees.mojo`.
 
 The order is therefore a wire format between two files in this repository,
 and a change to one side alone reassigns parameters silently. Both sides
@@ -641,22 +641,22 @@ measured overhead is not.
 
 | Variable | Meaning |
 |---|---|
-| `MOJOBOOST_NUM_WORKERS` | 1 is serial, N above 1 forces chunked dispatch and takes precedence over the threshold, 0 or unset is automatic |
-| `MOJOBOOST_PARALLEL_MIN_OPS` | Overrides the built-in parallel dispatch threshold |
-| `MOJOBOOST_DISABLE_GPU` | Makes device selection behave as though no accelerator were present |
-| `MOJOBOOST_GPU_HIST_STRATEGY` | Selects the GPU histogram strategy |
-| `MOJOBOOST_GPU_BLOCK_THREADS` | Overrides GPU launch block width |
-| `MOJOBOOST_GPU_ROW_TILE` | Overrides GPU row tile size |
-| `MOJOBOOST_AUTO_MIN_CELLS` | Threshold for automatic device selection |
+| `MOJOTREES_NUM_WORKERS` | 1 is serial, N above 1 forces chunked dispatch and takes precedence over the threshold, 0 or unset is automatic |
+| `MOJOTREES_PARALLEL_MIN_OPS` | Overrides the built-in parallel dispatch threshold |
+| `MOJOTREES_DISABLE_GPU` | Makes device selection behave as though no accelerator were present |
+| `MOJOTREES_GPU_HIST_STRATEGY` | Selects the GPU histogram strategy |
+| `MOJOTREES_GPU_BLOCK_THREADS` | Overrides GPU launch block width |
+| `MOJOTREES_GPU_ROW_TILE` | Overrides GPU row tile size |
+| `MOJOTREES_AUTO_MIN_CELLS` | Threshold for automatic device selection |
 
 The variables are public on the terms of section 2. Their **semantics**
 are covered by this policy: what a value means, and the precedence of
-`MOJOBOOST_NUM_WORKERS` over the threshold. Their **default numeric
+`MOJOTREES_NUM_WORKERS` over the threshold. Their **default numeric
 values** are tuning constants derived from measurements and are not
 covered. A default threshold may be retuned in a patch release, and has
 been, because a retune changes speed and not results (section 8.4).
 
-`MOJOBOOST_DISABLE_GPU` is the exception in one direction: it changes
+`MOJOTREES_DISABLE_GPU` is the exception in one direction: it changes
 which backend runs, and CPU and GPU are not bit-identical to each other,
 so it changes results within the documented tolerance.
 
@@ -813,7 +813,7 @@ without renumbering a reference somewhere else in this document.
 **B. Versions**
 
 - **B1.** The three library version locations of section 1.1 agree.
-- **B2.** `MOJOBOOST_ABI_VERSION` bumped if and only if a header
+- **B2.** `MOJOTREES_ABI_VERSION` bumped if and only if a header
   declaration changed incompatibly.
 - **B3.** The model format `_VERSION` bumped if and only if the format
   changed, with section 7.2's read-back matrix extended and a test that
@@ -825,9 +825,9 @@ without renumbering a reference somewhere else in this document.
 
 **C. Surface**
 
-- **C1.** `RESETTABLE` in `python/mojoboost/callback.py` checked against
+- **C1.** `RESETTABLE` in `python/mojotrees/callback.py` checked against
   the bridge: its length equals `RESET_SLOTS` in
-  `bindings/_mojoboost.mojo`, and its order matches the slot order of
+  `bindings/_mojotrees.mojo`, and its order matches the slot order of
   `_write_reset` and `_read_reset` there, entry by entry.
 - **C2.** Every deprecation whose period has elapsed either removed with a
   break note or explicitly extended.
@@ -836,7 +836,7 @@ without renumbering a reference somewhere else in this document.
 - **C4.** `best_score_` resolved for this release, either as the scalar
   this policy documents or as the LightGBM-shaped dict, with the decision
   in the release notes. Section 5.4.
-- **C5.** `mojoboost.inspection` resolved for this release, either
+- **C5.** `mojotrees.inspection` resolved for this release, either
   re-exported at the top level or added to the supported import paths of
   section 6.1. Section 8.1.
 

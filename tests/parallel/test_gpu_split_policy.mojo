@@ -2,7 +2,7 @@
 
 from std.testing import assert_equal, assert_false, assert_true, TestSuite
 
-from mojoboost.gpu_split_policy import (
+from mojotrees.gpu_split_policy import (
     M4_EVIDENCE_ID,
     SPLIT_POLICY_DEVICE_RESIDENT,
     SPLIT_POLICY_HOST,

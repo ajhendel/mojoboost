@@ -36,7 +36,7 @@ xcodebuild -version               <version and build, or "not installed">
 ```
 
 If `xcrun --find metal` fails, the Metal compiler component is missing.
-Installing it is an Xcode operation, not a mojoboost one, and the exact
+Installing it is an Xcode operation, not a mojotrees one, and the exact
 component name has moved between Xcode releases, so confirm it against the
 Xcode version on the box rather than against this file. Record the fix you
 used, so the next person on the same macOS version does not rediscover it.
@@ -63,7 +63,7 @@ metal:         <xcrun metal --version>
 
 pixi run test                            <pass | fail, with the failing assertion>
 pixi run test-gpu                        <pass | fail>
-MOJOBOOST_DISABLE_GPU=1 pixi run test    <pass | fail>
+MOJOTREES_DISABLE_GPU=1 pixi run test    <pass | fail>
 
 Device header, verbatim from `pixi run gpu-validate`:
 
@@ -89,8 +89,8 @@ Attributes this backend refused:
 every timing>
 
 Strategy pair (the two must produce bit-identical histograms):
-MOJOBOOST_GPU_HIST_STRATEGY=atomic   <output>
-MOJOBOOST_GPU_HIST_STRATEGY=tiled    <output>
+MOJOTREES_GPU_HIST_STRATEGY=atomic   <output>
+MOJOTREES_GPU_HIST_STRATEGY=tiled    <output>
 
 Profiler:      <not run, or the Metal capture: occupancy, threadgroup memory
                 limiter, and where kernel time went>
@@ -118,6 +118,6 @@ out whether it is true on this chip.
   recorded M4. If this chip answers the query, say so: it changes which code
   path derived the launch geometry, and therefore what the timings mean.
 - **The wheel angle.** If you are on the machine that builds release wheels,
-  record `otool -l python/mojoboost/_mojoboost.so | grep -A 4 LC_BUILD_VERSION`
+  record `otool -l python/mojotrees/_mojotrees.so | grep -A 4 LC_BUILD_VERSION`
   in the same session. The build's `minos` is what the wheel's platform tag has
   to match, and it is the single number the macOS install story turns on.

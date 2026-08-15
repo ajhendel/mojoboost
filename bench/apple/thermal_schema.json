@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/mojoboost-ml/mojoboost/blob/main/bench/apple/thermal_schema.json",
-  "title": "mojoboost Apple silicon thermal, energy, and sustained-performance record",
+  "$id": "https://github.com/mojotrees/mojotrees/blob/main/bench/apple/thermal_schema.json",
+  "title": "mojotrees Apple silicon thermal, energy, and sustained-performance record",
   "description": "One file per run of the thermal protocol in docs/APPLE_THERMAL_ENERGY.md on one machine under one condition set. A record ties a thermal and energy observation to the exact commit, chip variant, memory size, OS build, toolchain, workload, quality result, and benchmark record it came from, so that nothing in it has to be reconstructed later from memory. Every measured quantity is nullable and every null carries a reason. Absence of a number is a fact the record states; it is never a zero and never an estimate. This schema is a sibling of bench/apple/schema.json, not a replacement for it: that one records comparative timings, this one records the state of the machine that produced them.",
   "type": "object",
   "additionalProperties": false,
@@ -106,7 +106,7 @@
         "git_describe": { "$ref": "#/$defs/nullable_string" },
         "repo_url": { "$ref": "#/$defs/nullable_string" },
         "build_source": {
-          "description": "Whether the measured mojoboost came from a build of this checkout or from an installed wheel. A wheel run measures the wheel, not the commit.",
+          "description": "Whether the measured mojotrees came from a build of this checkout or from an installed wheel. A wheel run measures the wheel, not the commit.",
           "enum": ["checkout_build", "wheel", "unknown"]
         }
       }
@@ -182,7 +182,7 @@
       "description": "Everything whose version can move a number. A null version means the component was absent, and a phase that needed it carries a status other than ok.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["os_name", "os_version", "os_build", "mojo", "max", "mojoboost"],
+      "required": ["os_name", "os_version", "os_build", "mojo", "max", "mojotrees"],
       "properties": {
         "os_name": { "$ref": "#/$defs/nullable_string" },
         "os_version": {
@@ -198,9 +198,9 @@
         "max": { "$ref": "#/$defs/nullable_string" },
         "pixi": { "$ref": "#/$defs/nullable_string" },
         "python": { "$ref": "#/$defs/nullable_string" },
-        "mojoboost": { "$ref": "#/$defs/nullable_string" },
-        "mojoboost_gpu_build": {
-          "description": "mojoboost.gpu_available(), a property of the build and the machine together. False means a gpu workload in this record is unsupported, not slow.",
+        "mojotrees": { "$ref": "#/$defs/nullable_string" },
+        "mojotrees_gpu_build": {
+          "description": "mojotrees.gpu_available(), a property of the build and the machine together. False means a gpu workload in this record is unsupported, not slow.",
           "type": ["boolean", "null"]
         },
         "powermetrics_available": { "type": ["boolean", "null"] }
@@ -378,7 +378,7 @@
           "$ref": "#/$defs/nullable_string"
         },
         "requested_threads": {
-          "description": "MOJOBOOST_NUM_WORKERS for the run. Thread count changes both power draw and how quickly a chassis reaches its limit, so it is part of the workload here rather than an aside.",
+          "description": "MOJOTREES_NUM_WORKERS for the run. Thread count changes both power draw and how quickly a chassis reaches its limit, so it is part of the workload here rather than an aside.",
           "type": "integer",
           "minimum": 1
         },
@@ -677,7 +677,7 @@
     },
 
     "energy": {
-      "description": "Machine-level power and energy over a measured window. This sampler reports the whole machine and not a process, which is why an idle baseline is recorded separately and why no field here may be attributed to mojoboost. Energy is measured or it is null: there is no estimated method value, and deriving a number here from CPU time, core count, thread count, TDP, or a battery percentage delta is prohibited by the protocol.",
+      "description": "Machine-level power and energy over a measured window. This sampler reports the whole machine and not a process, which is why an idle baseline is recorded separately and why no field here may be attributed to mojotrees. Energy is measured or it is null: there is no estimated method value, and deriving a number here from CPU time, core count, thread count, TDP, or a battery percentage delta is prohibited by the protocol.",
       "type": "object",
       "additionalProperties": false,
       "required": ["available", "reason", "method", "scope"],
@@ -743,7 +743,7 @@
     },
 
     "process_attribution": {
-      "description": "Per-process figures from powermetrics --samplers tasks --show-process-energy. These are energy impact scores, a weighted composite of CPU time, wakeups, and device activity computed by a model whose weights Apple does not publish and which changes across releases. They are useful for one thing only, checking whether mojoboost was in fact the dominant consumer during a window. They are not joules, they carry no unit, and they may not be compared across machines or converted into an energy claim.",
+      "description": "Per-process figures from powermetrics --samplers tasks --show-process-energy. These are energy impact scores, a weighted composite of CPU time, wakeups, and device activity computed by a model whose weights Apple does not publish and which changes across releases. They are useful for one thing only, checking whether mojotrees was in fact the dominant consumer during a window. They are not joules, they carry no unit, and they may not be compared across machines or converted into an energy claim.",
       "type": "object",
       "additionalProperties": false,
       "required": ["available", "reason", "joules_claimable"],
@@ -765,7 +765,7 @@
           "$ref": "#/$defs/nullable_number"
         },
         "target_share": {
-          "description": "target_energy_impact_score divided by total_energy_impact_score. A share near 1 supports the sentence \"mojoboost dominated this window\". It supports no sentence containing a joule.",
+          "description": "target_energy_impact_score divided by total_energy_impact_score. A share near 1 supports the sentence \"mojotrees dominated this window\". It supports no sentence containing a joule.",
           "$ref": "#/$defs/nullable_number"
         },
         "other_top_processes": {

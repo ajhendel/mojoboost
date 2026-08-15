@@ -38,7 +38,7 @@ MAX:           <pixi list --environment default | grep -Ei '^(mojo|max)'>
 
 pixi run test                            <pass | fail, with the failing assertion>
 pixi run test-gpu                        <pass | fail>
-MOJOBOOST_DISABLE_GPU=1 pixi run test    <pass | fail>
+MOJOTREES_DISABLE_GPU=1 pixi run test    <pass | fail>
 
 Device header, verbatim from `pixi run gpu-validate`:
 
@@ -61,15 +61,15 @@ Attributes this backend refused:
 <list every query that raised, by name, or "none">
 
 CPU threading pinned for the comparison:
-MOJOBOOST_NUM_WORKERS=<value>
-MOJOBOOST_PARALLEL_MIN_OPS=<value>
+MOJOTREES_NUM_WORKERS=<value>
+MOJOTREES_PARALLEL_MIN_OPS=<value>
 
 <paste the full gpu-validate sweep, every shape, with training MSE next to
 every timing>
 
 Strategy pair (the two must produce bit-identical histograms):
-MOJOBOOST_GPU_HIST_STRATEGY=atomic   <output>
-MOJOBOOST_GPU_HIST_STRATEGY=tiled    <output>
+MOJOTREES_GPU_HIST_STRATEGY=atomic   <output>
+MOJOTREES_GPU_HIST_STRATEGY=tiled    <output>
 
 Profiler (rocprofv3 / ROCm Compute Profiler):
   Wave occupancy              <occupancy panel>

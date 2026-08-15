@@ -5,7 +5,7 @@ Written: 2026-08-14
 **No AMD device has ever executed a line of this code.** Not in CI, not on a
 workstation, not once. `docs/GPU_VALIDATION.md` is the record and every HIP
 row in it reads "not run". Nothing in this file is a claim about how
-mojoboost behaves or performs on AMD hardware.
+mojotrees behaves or performs on AMD hardware.
 
 What this file is: how the portable contract in `docs/GPU_PORTABILITY.md`
 reads on HIP, what to look at first when someone finally runs it, and which
@@ -20,10 +20,10 @@ it, and this repository has run nothing on it.
 
 Training is not blocked by that level. Specialization is, through
 `gpu_portability.require_specializations_allowed`, whose refusal names
-`MOJOBOOST_GPU_BACKEND_UNVALIDATED=1` as the acknowledged override.
+`MOJOTREES_GPU_BACKEND_UNVALIDATED=1` as the acknowledged override.
 
 `parse_api` recognizes both spellings, `hip` and `rocm`, so
-`MOJOBOOST_GPU_BACKEND=rocm` and `=hip` both name this backend.
+`MOJOTREES_GPU_BACKEND=rocm` and `=hip` both name this backend.
 
 ## CDNA and RDNA are two targets, not one
 
@@ -73,7 +73,7 @@ per-backend bound, read from the device rather than assumed, to lift.
    by writing each partial to a slot nothing else writes.
    `derive_tiling` prefers tiled whenever there is more than one tile, so
    the atomic path is reached mainly on small nodes.
-   `MOJOBOOST_GPU_HIST_STRATEGY=atomic` and `=tiled` force either for a
+   `MOJOTREES_GPU_HIST_STRATEGY=atomic` and `=tiled` force either for a
    sweep, and both must produce the identical integers.
 
 3. **Determinism.** Fixed-point Int32 accumulation is what makes repeat runs

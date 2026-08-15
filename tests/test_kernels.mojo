@@ -7,14 +7,14 @@ and their scalar tails both execute.
 
 from std.testing import assert_equal, assert_true, TestSuite
 
-from mojoboost.binning import BinnedMatrix
-from mojoboost.histogram import (
+from mojotrees.binning import BinnedMatrix
+from mojotrees.histogram import (
     Histogram,
     build_histogram,
     build_histogram_subset,
     subtract_histogram,
 )
-from mojoboost.split import find_best_split
+from mojotrees.split import find_best_split
 
 
 def _splitmix64(state: UInt64) -> UInt64:

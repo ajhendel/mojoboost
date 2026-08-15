@@ -5,7 +5,7 @@ wired into a trainer, no parameter exposes it, and no benchmark has been run
 for it. The shipped growers are unchanged.
 
 This is a proposal for a **second growth algorithm**, not a faster route to
-the trees mojoboost already grows. A level-wise tree and a leaf-wise tree
+the trees mojotrees already grows. A level-wise tree and a leaf-wise tree
 built from the same data with the same parameters are different models. The
 document is written so that claim stays in front of every performance
 argument in it.
@@ -115,7 +115,7 @@ leaves, so the budget caps depth at `floor(log2(num_leaves)) + 1`.
 `levelwise_policy.effective_max_depth` computes whichever binds first.
 
 The practical consequence is worth stating plainly, because it is the easiest
-way to run a meaningless comparison. **A level-wise run at mojoboost's
+way to run a meaningless comparison. **A level-wise run at mojotrees's
 default `num_leaves = 31` and `max_depth = -1` grows depth-5 trees with 16
 full leaves and a partial fifth level.** A leaf-wise run at the same
 parameters grows a tree that is much deeper on one branch and much shallower
@@ -451,11 +451,11 @@ The comparison must be **time to matched quality**:
 Implemented, host-side and free of device imports so it builds without an
 accelerator:
 
-- `src/mojoboost/levelwise_policy.mojo`: `LevelwiseParams`, the budget modes,
+- `src/mojotrees/levelwise_policy.mojo`: `LevelwiseParams`, the budget modes,
   `LevelCandidate`, `rank_level`, `admit_level`, `level_stop_reason`, the two
   shape-rule mirrors, `level_capacity`, `full_level_depth`,
   `effective_max_depth`, and the launch profiles.
-- `src/mojoboost/gpu_levelwise.mojo`: `LevelNode`, `LevelFrontier`,
+- `src/mojotrees/gpu_levelwise.mojo`: `LevelNode`, `LevelFrontier`,
   `ChildSums` and `child_sums`, `child_leaf_value`, `CommittedSplit`,
   `LevelCommit`, `level_candidates`, `plan_level`, `decide_level`,
   `check_child_ids`, and the sizing helpers.
@@ -469,7 +469,7 @@ Not implemented, and required before any of this trains a tree:
 - The grower loop itself, and its entry point in `train_gpu.mojo`.
 - Tests. This lane wrote none by instruction.
 
-Neither module is registered in `src/mojoboost/__init__.mojo`, on purpose:
+Neither module is registered in `src/mojotrees/__init__.mojo`, on purpose:
 the package surface is not this lane's to change, and nothing should be able
 to reach this mode by accident. See
 `handoffs/algorithm_24_levelwise.md` for the integration steps in order.

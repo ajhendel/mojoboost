@@ -3,23 +3,23 @@
 Builds a synthetic dataset whose signal lives entirely in unordered category
 groupings, then fits four models on the identical matrix:
 
-- mojoboost with the columns marked categorical
+- mojotrees with the columns marked categorical
 - LightGBM with the same columns marked categorical
-- mojoboost treating the columns as ordinary numerical features
+- mojotrees treating the columns as ordinary numerical features
 - LightGBM treating the columns as ordinary numerical features
 
 The numerical fits are the control. Category codes are assigned so that no
 `code <= t` threshold separates the groups, so a model that treats the codes
 as ordinal has to carve out one code at a time; the gap between the two rows
 of each library is what native categorical support buys, and the gap between
-the two libraries is how closely mojoboost tracks LightGBM.
+the two libraries is how closely mojotrees tracks LightGBM.
 
 Both libraries get matched hyperparameters, including LightGBM's categorical
 ones (`max_cat_to_onehot`, `max_cat_threshold`, `cat_smooth`, `cat_l2`,
 `min_data_per_group`). Predictions are not expected to match bit for bit:
-mojoboost keeps exact row counts where LightGBM estimates them from Hessian
+mojotrees keeps exact row counts where LightGBM estimates them from Hessian
 sums, and their category-dropping rules for very high cardinality differ (see
-`src/mojoboost/categorical.mojo`). Held-out error is the comparison.
+`src/mojotrees/categorical.mojo`). Held-out error is the comparison.
 
 Usage: python bench/compare_categorical_lightgbm.py
        [--rows N] [--low-cardinality K] [--high-cardinality K]
@@ -44,10 +44,10 @@ except ImportError:  # pragma: no cover - environment guard
     )
 
 try:
-    from mojoboost import MojoBoostRegressor
+    from mojotrees import MojoTreesRegressor
 except ImportError:  # pragma: no cover - environment guard
     sys.exit(
-        "mojoboost is not importable; build the extension first:\n"
+        "mojotrees is not importable; build the extension first:\n"
         "    pixi run build-python"
     )
 
@@ -83,8 +83,8 @@ def rmse(pred, y):
     return float(np.sqrt(np.mean((np.asarray(pred) - y) ** 2)))
 
 
-def fit_mojoboost(X_tr, y_tr, X_te, args, categorical):
-    model = MojoBoostRegressor(
+def fit_mojotrees(X_tr, y_tr, X_te, args, categorical):
+    model = MojoTreesRegressor(
         objective="regression",
         num_leaves=args.num_leaves,
         n_estimators=args.n_estimators,
@@ -117,7 +117,7 @@ def fit_lightgbm(X_tr, y_tr, X_te, args, categorical):
         "max_bin": 255,
         "num_threads": 1,
         "verbose": -1,
-        # mojoboost has no feature bundling; keep the comparison honest.
+        # mojotrees has no feature bundling; keep the comparison honest.
         "enable_bundle": False,
         "force_row_wise": True,
         "max_cat_to_onehot": args.max_cat_to_onehot,
@@ -182,7 +182,7 @@ def main():
         ("categorical", categorical),
         ("numerical (control)", []),
     ):
-        mb_pred, mb_s = fit_mojoboost(X_tr, y_tr, X_te, args, categorical_arg)
+        mb_pred, mb_s = fit_mojotrees(X_tr, y_tr, X_te, args, categorical_arg)
         lgb_pred, lgb_s = fit_lightgbm(X_tr, y_tr, X_te, args, categorical_arg)
         rows.append(
             (
@@ -196,7 +196,7 @@ def main():
         )
 
     header = (
-        f"{'treatment':<22}{'mojoboost':>12}{'fit_s':>9}"
+        f"{'treatment':<22}{'mojotrees':>12}{'fit_s':>9}"
         f"{'lightgbm':>12}{'fit_s':>9}{'mean|diff|':>12}"
     )
     print(header)
@@ -214,12 +214,12 @@ def main():
     if cat_row[1] < num_row[1]:
         gain = 100.0 * (1.0 - cat_row[1] / num_row[1])
         print(
-            f"\nmojoboost: native categorical splits cut test RMSE by"
+            f"\nmojotrees: native categorical splits cut test RMSE by"
             f" {gain:.1f}% against the ordinal control."
         )
     else:
         print(
-            "\nmojoboost: native categorical splits did not beat the ordinal"
+            "\nmojotrees: native categorical splits did not beat the ordinal"
             " control on this configuration."
         )
 

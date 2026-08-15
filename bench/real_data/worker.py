@@ -33,7 +33,7 @@ import traceback
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-# The mojoboost package this harness measures is the checkout's own
+# The mojotrees package this harness measures is the checkout's own
 # python/ tree; the bench environment deliberately does not install it, so
 # the worker puts it on the path itself, after the harness modules so a
 # scenario module can never be shadowed by a package file.
@@ -136,7 +136,7 @@ def _record_extra(task, train):
 
     The engines derive `num_class` from the loaded data before training;
     the record has to derive it the same way or a multiclass record cannot
-    even be written (`lightgbm_params` and `mojoboost_params` both require
+    even be written (`lightgbm_params` and `mojotrees_params` both require
     it for a multiclass spec).
     """
     if task != "multiclass":
@@ -194,10 +194,10 @@ def run_job(job):
         "params": {
             "shared": scenarios.shared_params(spec, _record_extra(task, train)),
             "engine": (
-                scenarios.mojoboost_params(
+                scenarios.mojotrees_params(
                     spec, job["device"], _record_extra(task, train)
                 )
-                if job["engine"] == "mojoboost"
+                if job["engine"] == "mojotrees"
                 else scenarios.lightgbm_params(
                     spec, job["threads"], _record_extra(task, train)
                 )

@@ -70,7 +70,7 @@
   },
 
   "source": {
-    "repo_url": "https://github.com/mojoboost-ml/mojoboost",
+    "repo_url": "https://github.com/mojotrees/mojotrees",
     "commit": "",
     "branch": null,
     "dirty": null,
@@ -105,7 +105,7 @@
       "notes": "If this prints `skipped: no accelerator` on a machine rocm-smi can see, the usual causes are that the user is not in the render or video group, or that the installed ROCm does not list this card as a supported target. Record which, under findings."
     },
     {
-      "command": "MOJOBOOST_DISABLE_GPU=1 pixi run test",
+      "command": "MOJOTREES_DISABLE_GPU=1 pixi run test",
       "status": "not-run",
       "skipped_reason": null,
       "failure_text": null,
@@ -123,7 +123,7 @@
       "notes": null
     },
     {
-      "command": "MOJOBOOST_GPU_HIST_STRATEGY=atomic pixi run gpu-validate 20 100000 100",
+      "command": "MOJOTREES_GPU_HIST_STRATEGY=atomic pixi run gpu-validate 20 100000 100",
       "status": "not-run",
       "skipped_reason": null,
       "failure_text": null,
@@ -132,7 +132,7 @@
       "notes": "Pairs with the tiled run below. LDS integer atomics on RDNA and CDNA are the most plausible place for bit-identical repeats to stop being bit-identical, which makes this pair the most valuable thing in a first AMD record."
     },
     {
-      "command": "MOJOBOOST_GPU_HIST_STRATEGY=tiled pixi run gpu-validate 20 100000 100",
+      "command": "MOJOTREES_GPU_HIST_STRATEGY=tiled pixi run gpu-validate 20 100000 100",
       "status": "not-run",
       "skipped_reason": null,
       "failure_text": null,

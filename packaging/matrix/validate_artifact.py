@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check a built mojoboost wheel against the release matrix.
+"""Check a built mojotrees wheel against the release matrix.
 
     python3 packaging/matrix/validate_artifact.py python/dist/<wheel> [...]
 
@@ -240,7 +240,7 @@ def check_wheel(path: Path, matrix: dict, res: Result) -> None:
         # claim is that it installs without a Mojo or MAX toolchain, and the
         # bundled runtime is what makes that true.
         ext = [n for n in names if n.endswith((".so", ".pyd"))]
-        res.rule("R2a", len(ext) == 1 and ext[0] == f"{pkg}_mojoboost.so",
+        res.rule("R2a", len(ext) == 1 and ext[0] == f"{pkg}_mojotrees.so",
                  f"extension module: {ext or 'MISSING'}")
 
         expected = set(target.get("bundled_dylibs", []))
@@ -273,7 +273,7 @@ def check_wheel(path: Path, matrix: dict, res: Result) -> None:
     # R7. Provenance. The wheel cannot tell you what toolchain built it, which
     # macOS it was built on, or whether an accelerator was visible at compile
     # time, and that last one changes the binary's behavior on the user's
-    # machine (src/mojoboost/device.mojo: has_accelerator() is resolved at
+    # machine (src/mojotrees/device.mojo: has_accelerator() is resolved at
     # compile time, so a wheel built on a GPU machine reports a GPU as
     # available and fails later, when the device is opened).
     sidecar = path.with_suffix(path.suffix + ".provenance.json")

@@ -9,7 +9,7 @@ what `evals_result_` holds, and which combinations raise.
 import numpy as np
 import pytest
 
-from mojoboost import MojoBoostClassifier, MojoBoostRegressor
+from mojotrees import MojoTreesClassifier, MojoTreesRegressor
 
 
 def mse(y_true, y_pred):
@@ -28,7 +28,7 @@ def test_metric_drives_early_stopping(regression):
     X, y, Xv, yv = _split(*regression)
     # The default learning rate keeps improving on this fixture for all 200
     # rounds, so overfit faster to guarantee a five-round plateau.
-    model = MojoBoostRegressor(n_estimators=200, learning_rate=0.3).fit(
+    model = MojoTreesRegressor(n_estimators=200, learning_rate=0.3).fit(
         X,
         y,
         eval_set=[(Xv, yv)],
@@ -50,10 +50,10 @@ def test_metric_drives_early_stopping(regression):
 
 def test_direction_declared_by_the_tuple_form(regression):
     X, y, Xv, yv = _split(*regression)
-    lower = MojoBoostRegressor(n_estimators=60).fit(
+    lower = MojoTreesRegressor(n_estimators=60).fit(
         X, y, eval_set=[(Xv, yv)], eval_metric=mse, early_stopping_rounds=5
     )
-    higher = MojoBoostRegressor(n_estimators=60).fit(
+    higher = MojoTreesRegressor(n_estimators=60).fit(
         X,
         y,
         eval_set=[(Xv, yv)],
@@ -75,7 +75,7 @@ def test_several_metrics_and_an_explicit_primary(regression):
         ("mse", mse),
         {"name": "frozen", "func": frozen, "early_stopping": False},
     ]
-    by_mse = MojoBoostRegressor(n_estimators=40).fit(
+    by_mse = MojoTreesRegressor(n_estimators=40).fit(
         X,
         y,
         eval_set=[(Xv, yv)],
@@ -83,7 +83,7 @@ def test_several_metrics_and_an_explicit_primary(regression):
         early_stopping_rounds=5,
         primary_metric="mse",
     )
-    by_frozen = MojoBoostRegressor(n_estimators=40).fit(
+    by_frozen = MojoTreesRegressor(n_estimators=40).fit(
         X,
         y,
         eval_set=[(Xv, yv)],
@@ -105,7 +105,7 @@ def test_several_metrics_and_an_explicit_primary(regression):
 
 def test_several_validation_sets_are_named_and_recorded(regression):
     X, y, Xv, yv = _split(*regression)
-    model = MojoBoostRegressor(n_estimators=25).fit(
+    model = MojoTreesRegressor(n_estimators=25).fit(
         X,
         y,
         eval_set=[(Xv, yv), (X, y)],
@@ -132,7 +132,7 @@ def test_callback_receives_raw_scores_from_the_classifier(binary):
         seen["y_pred"] = np.asarray(y_pred).copy()
         return float(np.mean(np.asarray(y_pred)))
 
-    model = MojoBoostClassifier(n_estimators=5).fit(
+    model = MojoTreesClassifier(n_estimators=5).fit(
         X, y, eval_set=[(X, y)], eval_metric=capture
     )
     # Labels arrive encoded, predictions as log-odds: the sigmoid of the
@@ -149,7 +149,7 @@ def test_lightgbm_style_tuple_return_is_accepted(regression):
     def feval(y_true, y_pred):
         return "mse", mse(y_true, y_pred), False
 
-    model = MojoBoostRegressor(n_estimators=10).fit(
+    model = MojoTreesRegressor(n_estimators=10).fit(
         X, y, eval_set=[(Xv, yv)], eval_metric=("mse", feval)
     )
     assert model.evals_result_["valid_0"]["mse"][-1] == pytest.approx(
@@ -164,14 +164,14 @@ def test_callback_errors_propagate(regression):
         raise ValueError("metric callback exploded")
 
     with pytest.raises(ValueError, match="metric callback exploded"):
-        MojoBoostRegressor(n_estimators=10).fit(
+        MojoTreesRegressor(n_estimators=10).fit(
             X, y, eval_set=[(Xv, yv)], eval_metric=boom
         )
 
 
 def test_refit_without_eval_set_clears_the_record(regression):
     X, y, Xv, yv = _split(*regression)
-    model = MojoBoostRegressor(n_estimators=10)
+    model = MojoTreesRegressor(n_estimators=10)
     model.fit(X, y, eval_set=[(Xv, yv)], eval_metric=mse)
     assert hasattr(model, "evals_result_")
     model.fit(X, y)
@@ -181,7 +181,7 @@ def test_refit_without_eval_set_clears_the_record(regression):
 
 def test_validation_errors(regression, multiclass):
     X, y, Xv, yv = _split(*regression)
-    reg = MojoBoostRegressor(n_estimators=5)
+    reg = MojoTreesRegressor(n_estimators=5)
 
     with pytest.raises(ValueError, match="eval_metric needs an eval_set"):
         reg.fit(X, y, eval_metric=mse)
@@ -225,7 +225,7 @@ def test_validation_errors(regression, multiclass):
         return raw - target, np.ones_like(raw)
 
     with pytest.raises(ValueError, match="cannot be combined"):
-        MojoBoostRegressor(objective=grad_hess, n_estimators=5).fit(
+        MojoTreesRegressor(objective=grad_hess, n_estimators=5).fit(
             X, y, eval_set=[(Xv, yv)], eval_metric=mse
         )
 
@@ -233,7 +233,7 @@ def test_validation_errors(regression, multiclass):
     # raw scores per row rather than one number, so a single-output
     # callable like `mse` cannot score it.
     Xm, ym = multiclass
-    scored = MojoBoostClassifier(n_estimators=5).fit(
+    scored = MojoTreesClassifier(n_estimators=5).fit(
         Xm, ym, eval_set=[(Xm, ym)], eval_metric="multi_logloss"
     )
     assert len(scored.evals_result_["valid_0"]["multi_logloss"]) == 6

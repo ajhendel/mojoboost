@@ -46,7 +46,7 @@ DEFAULT_RESULTS = os.path.join(HERE, "results")
 #: own pool is pinned to the same number, so a background BLAS pool cannot
 #: quietly help one engine.
 THREAD_ENV = (
-    "MOJOBOOST_NUM_WORKERS",
+    "MOJOTREES_NUM_WORKERS",
     "OMP_NUM_THREADS",
     "OPENBLAS_NUM_THREADS",
     "MKL_NUM_THREADS",
@@ -85,7 +85,7 @@ def build_matrix(args):
                             _skip(
                                 scenario_id, engine, device, args,
                                 "LightGBM runs on the CPU in this harness; a "
-                                "cpu-vs-gpu row is a mojoboost-internal "
+                                "cpu-vs-gpu row is a mojotrees-internal "
                                 "comparison and is labelled as one",
                             )
                         )
@@ -150,9 +150,9 @@ def run_job(job, run_dir, run_id, timeout):
         # A cpu row must be a cpu row even on a machine with an
         # accelerator, whatever the device parameter would otherwise
         # resolve to.
-        env["MOJOBOOST_DISABLE_GPU"] = "1"
+        env["MOJOTREES_DISABLE_GPU"] = "1"
     else:
-        env.pop("MOJOBOOST_DISABLE_GPU", None)
+        env.pop("MOJOTREES_DISABLE_GPU", None)
 
     started = time.time()
     proc = subprocess.run(
@@ -281,7 +281,7 @@ def main(argv=None):
     parser.add_argument("--tier", choices=scenarios.TIERS, default="standard")
     parser.add_argument("--variant", choices=("auto", "real", "synthetic"), default="auto")
     parser.add_argument(
-        "--engine", action="append", choices=("mojoboost", "lightgbm"),
+        "--engine", action="append", choices=("mojotrees", "lightgbm"),
         help="repeatable; both by default",
     )
     parser.add_argument(
@@ -313,7 +313,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     args.scenario = args.scenario or sorted(scenarios.SCENARIOS)
-    args.engine = args.engine or ["mojoboost", "lightgbm"]
+    args.engine = args.engine or ["mojotrees", "lightgbm"]
     args.device = args.device or ["cpu"]
     args.threads = args.threads or [default_threads()]
 

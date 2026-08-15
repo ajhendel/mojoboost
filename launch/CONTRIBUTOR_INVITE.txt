@@ -2,9 +2,9 @@ PURPOSE: Copy-and-paste invitations for individual people. Six variants, each pl
 
 HOW TO USE: Pick one variant, copy the text under it, replace every <PLACEHOLDER>, and delete the USE WHEN and CHANNEL lines before sending. Send these to people individually. The broadcast announcements are the six posts in this directory; these are the messages that actually recruit somebody, and they only work because they are addressed to a person and reference something that person did.
 
-The repository is live at github.com/mojoboost-ml/mojoboost.
+The repository is live at github.com/mojotrees/mojotrees.
 
-WHAT NOT TO DO: do not send more than one of these to the same person, do not send a cold invite to somebody who has never expressed interest in Mojo or in gradient boosting, and do not describe mojoboost as anything other than an experimental alpha. The project's whole credibility rests on not overstating, and a recruiting message is the easiest place to lose that.
+WHAT NOT TO DO: do not send more than one of these to the same person, do not send a cold invite to somebody who has never expressed interest in Mojo or in gradient boosting, and do not describe mojotrees as anything other than an experimental alpha. The project's whole credibility rests on not overstating, and a recruiting message is the easiest place to lose that.
 
 
 VARIANT 1: COLD INVITE, MOJO OR GPU PROGRAMMING BACKGROUND
@@ -15,11 +15,11 @@ Hi <NAME>,
 
 I saw <SPECIFIC THING THEY WROTE, BUILT, OR ANSWERED> and thought you might find this interesting.
 
-I have been building mojoboost, a gradient-boosted decision tree library written natively in Mojo. It is in the LightGBM family, histogram-based split finding with leaf-wise growth, with a familiar Python API and a GPU path that runs on the Metal GPU already inside an Apple Silicon Mac. Training works end to end on CPU and GPU. It is an experimental alpha, not a production replacement for LightGBM, and the repository is explicit about which parts are validated and which are not.
+I have been building mojotrees, a gradient-boosted decision tree library written natively in Mojo. It is in the LightGBM family, histogram-based split finding with leaf-wise growth, with a familiar Python API and a GPU path that runs on the Metal GPU already inside an Apple Silicon Mac. Training works end to end on CPU and GPU. It is an experimental alpha, not a production replacement for LightGBM, and the repository is explicit about which parts are validated and which are not.
 
 The reason I am writing to you specifically is <THE OPEN PROBLEM THAT MATCHES THEIR BACKGROUND, for example: the Metal histogram kernel needs order-preserving active-row compaction and I would value a second opinion on the approach / split search still happens on the host and moving it to the device is the next real speedup / I would like someone who knows Mojo's parallelism primitives better than I do to look at the multicore threshold>.
 
-If any of that appeals, the repository is https://github.com/mojoboost-ml/mojoboost and the five-minute example in the README is genuinely five minutes. Contributing is deliberately low friction: nothing waits on my approval, and once someone has landed a couple of changes they get direct push access. GOVERNANCE.md has the details.
+If any of that appeals, the repository is https://github.com/mojotrees/mojotrees and the five-minute example in the README is genuinely five minutes. Contributing is deliberately low friction: nothing waits on my approval, and once someone has landed a couple of changes they get direct push access. GOVERNANCE.md has the details.
 
 Entirely fine to ignore this. If it is not your thing, a pointer to somebody it might suit would be just as useful.
 
@@ -32,14 +32,14 @@ CHANNEL: email or direct message.
 
 Hi <NAME>,
 
-I am building mojoboost, a gradient-boosted decision tree library written from scratch in Mojo, and I am looking for people who know what LightGBM actually does rather than what its documentation says it does.
+I am building mojotrees, a gradient-boosted decision tree library written from scratch in Mojo, and I am looking for people who know what LightGBM actually does rather than what its documentation says it does.
 
 The shape is familiar: quantile binning into uint8, histogram accumulation with the sibling subtraction trick, leaf-wise growth, the standard second-order gain. What is different is that the hot loop is written in a language with explicit SIMD and compile-time specialization, and the same source targets the GPU. The bet is a substantially simpler codebase at competitive speed. That bet is not settled yet.
 
 Where I could use somebody with your background is differential testing against LightGBM, and the parity contract in docs/LIGHTGBM_PARITY.md, which is the file that states what is supported and which differences are deliberate. Every gap you find in it is a real gap. Categorical handling, ranking objectives, and missing-value semantics are the areas where I would least trust my own reading of LightGBM's behavior.
 
-Repository: https://github.com/mojoboost-ml/mojoboost
-Parity contract: https://github.com/mojoboost-ml/mojoboost/blob/main/docs/LIGHTGBM_PARITY.md
+Repository: https://github.com/mojotrees/mojotrees
+Parity contract: https://github.com/mojotrees/mojotrees/blob/main/docs/LIGHTGBM_PARITY.md
 
 It is an experimental alpha and I would rather hear that something is wrong than that it looks nice. Filing an issue that says "LightGBM does X here and this does Y" is a complete contribution and needs no code.
 
@@ -54,9 +54,9 @@ Hi <NAME>,
 
 You mentioned you have <SPECIFIC HARDWARE>. Would you be willing to run one validation pass on it?
 
-mojoboost is a gradient-boosted tree library written in Mojo, with a GPU path. Its correctness has been exercised on an Apple M4 and on nothing else. NVIDIA and AMD have never been validated on real hardware, and the repository says so rather than implying otherwise. A single run from a machine I do not own is worth more to this project right now than almost anything I could write myself.
+mojotrees is a gradient-boosted tree library written in Mojo, with a GPU path. Its correctness has been exercised on an Apple M4 and on nothing else. NVIDIA and AMD have never been validated on real hardware, and the repository says so rather than implying otherwise. A single run from a machine I do not own is worth more to this project right now than almost anything I could write myself.
 
-The protocol is https://github.com/mojoboost-ml/mojoboost/blob/main/docs/HARDWARE_CONTRIBUTORS.md and it was written for exactly this, meaning somebody who has the hardware and no interest in learning Mojo. There is a capture script for your vendor under hardware/capture/, a JSON record template it fills in, and an issue form that takes the result. A clone, a pixi install, one script. Perhaps an hour, most of it waiting.
+The protocol is https://github.com/mojotrees/mojotrees/blob/main/docs/HARDWARE_CONTRIBUTORS.md and it was written for exactly this, meaning somebody who has the hardware and no interest in learning Mojo. There is a capture script for your vendor under hardware/capture/, a JSON record template it fills in, and an issue form that takes the result. A clone, a pixi install, one script. Perhaps an hour, most of it waiting.
 
 A failure is a better result than a success and I would rather have it. If it does not build, does not run, or produces the wrong numbers, that is the finding, and pasting the unedited output into an issue is the whole contribution. Worth saying because it trips people up: a GPU suite that reports "skipped, no accelerator" on a machine that has an accelerator is not a pass, it is one of the more interesting failures you could send me.
 
@@ -67,7 +67,7 @@ VARIANT 4: SHORT FORM
 USE WHEN: a chat channel, a reply in a thread, or anywhere a long message would be out of place.
 CHANNEL: Discord, forum reply, social direct message.
 
-I have been building mojoboost, a gradient-boosted tree library written natively in Mojo with an Apple Silicon GPU path. Experimental alpha, training works end to end, and the repository is honest about what is validated and what is not. If <GPU kernels / GBDT internals / packaging / testing against LightGBM> is your thing, I would value the help, and contributing is low friction by design. https://github.com/mojoboost-ml/mojoboost
+I have been building mojotrees, a gradient-boosted tree library written natively in Mojo with an Apple Silicon GPU path. Experimental alpha, training works end to end, and the repository is honest about what is validated and what is not. If <GPU kernels / GBDT internals / packaging / testing against LightGBM> is your thing, I would value the help, and contributing is low friction by design. https://github.com/mojotrees/mojotrees
 
 
 VARIANT 5: AFTER SOMEBODY'S FIRST CONTRIBUTION LANDS

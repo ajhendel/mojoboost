@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/mojoboost-ml/mojoboost/bench/real_data/schema.json",
-  "title": "mojoboost real-data differential result record",
+  "$id": "https://github.com/mojotrees/mojotrees/bench/real_data/schema.json",
+  "title": "mojotrees real-data differential result record",
   "description": "One record per measured run. run.py writes one file per run under records/ and concatenates them into records.json; records.csv is a flat projection of the same records and is derived, never authoritative. Two conventions run through the schema. A measurement that could not be taken is an object with a null value and an unavailable_reason, never an omitted field and never an estimate. And a timing is always a list of samples or a single measured phase, never a pre-averaged number, so the reader can see the spread that produced it.",
   "type": "object",
   "required": ["schema_version", "status", "scenario", "engine"],
@@ -20,7 +20,7 @@
     "task": {"enum": ["regression", "binary", "multiclass", "ranking"]},
     "primary_metric": {"type": "string"},
     "threads": {"type": "integer", "minimum": 1},
-    "engine": {"enum": ["mojoboost", "lightgbm"]},
+    "engine": {"enum": ["mojotrees", "lightgbm"]},
     "engine_version": {"type": ["string", "null"]},
     "device_requested": {"enum": ["cpu", "gpu", "auto"]},
     "device_used": {

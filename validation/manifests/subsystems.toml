@@ -7,7 +7,7 @@
 # thing to consider.
 #
 # How the `jobs` lists were derived. Every Mojo suite in `tests/` was parsed for
-# its `from mojoboost.<module> import` lines, which gives, per module, the exact
+# its `from mojotrees.<module> import` lines, which gives, per module, the exact
 # set of suites that import it. Where that set is small, it is the job list.
 # Where it is large (`boosting.mojo` is imported by 22 suites, `tree.mojo` by
 # 20), a representative subset is listed and `escalate` carries the rest, on the
@@ -35,13 +35,13 @@ schema = 1
 id = "core-boosting"
 title = "The boosting loop, the model, and the tree"
 paths = [
-    "src/mojoboost/boosting.mojo",
-    "src/mojoboost/model.mojo",
-    "src/mojoboost/tree.mojo",
-    "src/mojoboost/gain.mojo",
-    "src/mojoboost/initialization.mojo",
-    "src/mojoboost/params.mojo",
-    "src/mojoboost/__init__.mojo",
+    "src/mojotrees/boosting.mojo",
+    "src/mojotrees/model.mojo",
+    "src/mojotrees/tree.mojo",
+    "src/mojotrees/gain.mojo",
+    "src/mojotrees/initialization.mojo",
+    "src/mojotrees/params.mojo",
+    "src/mojotrees/__init__.mojo",
 ]
 jobs = ["native:core", "native:objectives", "native:serialize", "native:regularization"]
 escalate = ["broad:full-suite"]
@@ -51,21 +51,21 @@ note = "boosting.mojo is imported by 22 suites and tree.mojo by 20. A change her
 id = "binning"
 title = "Binning and dataset construction"
 paths = [
-    "src/mojoboost/binning.mojo",
-    "src/mojoboost/trainset.mojo",
-    "src/mojoboost/raw_data.mojo",
+    "src/mojotrees/binning.mojo",
+    "src/mojotrees/trainset.mojo",
+    "src/mojotrees/raw_data.mojo",
 ]
 jobs = ["native:binning", "native:sparse", "native:kernels", "native:trainset", "native:histogram-reference"]
 escalate = ["native:categorical", "native:missing", "native:continued"]
-note = "Bin boundaries move every downstream number, so the histogram reference is part of the minimum here rather than an escalation. native:binning is the only suite that imports mojoboost.binning directly and it was missing from this list until it was noticed by hand. native:sparse was promoted out of the escalations for a demonstrated reason rather than a suspected one: sparse.fit_bins_csc reimplements the rank walk over an implied dense column, so a rule added to the dense binner and not to that one makes the two disagree, and test_sparse_binning_matches_dense_exactly is the only thing in the tree that notices. It caught exactly that on 2026-08-14, when the level rule landed dense-only. A change to binning.mojo that does not touch sparse.mojo is precisely the change this catches, so it cannot be an escalation the operator has to remember to ask for."
+note = "Bin boundaries move every downstream number, so the histogram reference is part of the minimum here rather than an escalation. native:binning is the only suite that imports mojotrees.binning directly and it was missing from this list until it was noticed by hand. native:sparse was promoted out of the escalations for a demonstrated reason rather than a suspected one: sparse.fit_bins_csc reimplements the rank walk over an implied dense column, so a rule added to the dense binner and not to that one makes the two disagree, and test_sparse_binning_matches_dense_exactly is the only thing in the tree that notices. It caught exactly that on 2026-08-14, when the level rule landed dense-only. A change to binning.mojo that does not touch sparse.mojo is precisely the change this catches, so it cannot be an escalation the operator has to remember to ask for."
 
 [[subsystem]]
 id = "histogram-cpu"
 title = "CPU histogram construction and the parallel runtime"
 paths = [
-    "src/mojoboost/histogram.mojo",
-    "src/mojoboost/parallel.mojo",
-    "src/mojoboost/histogram_cache_policy.mojo",
+    "src/mojotrees/histogram.mojo",
+    "src/mojotrees/parallel.mojo",
+    "src/mojotrees/histogram_cache_policy.mojo",
 ]
 jobs = ["native:histogram-reference", "native:cpu-parallel", "native:binning"]
 escalate = ["differential:threads-1", "differential:threads-max", "broad:bench-threshold"]
@@ -75,9 +75,9 @@ note = "The two thread-count jobs are the ones that catch a race that only shows
 id = "split"
 title = "Split selection and constraints"
 paths = [
-    "src/mojoboost/split.mojo",
-    "src/mojoboost/monotone.mojo",
-    "src/mojoboost/interaction.mojo",
+    "src/mojotrees/split.mojo",
+    "src/mojotrees/monotone.mojo",
+    "src/mojotrees/interaction.mojo",
 ]
 jobs = ["native:kernels", "native:monotone", "native:interaction"]
 escalate = ["native:gpu-split-search", "differential:backend-equivalence"]
@@ -87,11 +87,11 @@ note = "gpu_split_search.mojo reimplements this rule on the device, so a rule ch
 id = "objectives"
 title = "Objectives, metrics, and their registries"
 paths = [
-    "src/mojoboost/objective.mojo",
-    "src/mojoboost/objective_registry.mojo",
-    "src/mojoboost/custom_metric.mojo",
-    "src/mojoboost/metrics.mojo",
-    "src/mojoboost/class_weight.mojo",
+    "src/mojotrees/objective.mojo",
+    "src/mojotrees/objective_registry.mojo",
+    "src/mojotrees/custom_metric.mojo",
+    "src/mojotrees/metrics.mojo",
+    "src/mojotrees/class_weight.mojo",
 ]
 jobs = ["native:objectives", "native:metrics", "native:custom-objective", "native:custom-metrics"]
 escalate = ["native:gpu-objectives-native", "differential:gpu-objectives", "python:eval-set"]
@@ -101,10 +101,10 @@ note = "class_weight.mojo is imported by no suite. A change to it gets native:co
 id = "sampling"
 title = "Row and column sampling"
 paths = [
-    "src/mojoboost/bagging.mojo",
-    "src/mojoboost/goss.mojo",
-    "src/mojoboost/sampling.mojo",
-    "src/mojoboost/importance.mojo",
+    "src/mojotrees/bagging.mojo",
+    "src/mojotrees/goss.mojo",
+    "src/mojotrees/sampling.mojo",
+    "src/mojotrees/importance.mojo",
 ]
 jobs = ["native:sampling", "native:bagging", "native:goss", "native:feature-sampling"]
 escalate = ["differential:gpu-training"]
@@ -113,7 +113,7 @@ note = "Reproducibility for a seed is the property that breaks silently here, an
 [[subsystem]]
 id = "categorical"
 title = "Categorical features and feature bundling"
-paths = ["src/mojoboost/categorical.mojo", "src/mojoboost/efb.mojo"]
+paths = ["src/mojotrees/categorical.mojo", "src/mojotrees/efb.mojo"]
 jobs = ["native:categorical", "native:efb"]
 escalate = ["native:gpu-split-search", "broad:lightgbm-compare"]
 note = "The categorical split rule is a parity claim against LightGBM 4.7.0 and broad:lightgbm-compare is the only job that checks it."
@@ -121,7 +121,7 @@ note = "The categorical split rule is a parity claim against LightGBM 4.7.0 and 
 [[subsystem]]
 id = "ranking"
 title = "Ranking"
-paths = ["src/mojoboost/ranking.mojo"]
+paths = ["src/mojotrees/ranking.mojo"]
 jobs = ["native:ranking", "native:custom-metrics"]
 escalate = ["native:metrics", "broad:lightgbm-compare"]
 
@@ -129,11 +129,11 @@ escalate = ["native:metrics", "broad:lightgbm-compare"]
 id = "sparse"
 title = "The sparse chain"
 paths = [
-    "src/mojoboost/sparse.mojo",
-    "src/mojoboost/boosting_sparse.mojo",
-    "src/mojoboost/histogram_sparse.mojo",
-    "src/mojoboost/model_sparse.mojo",
-    "src/mojoboost/tree_sparse.mojo",
+    "src/mojotrees/sparse.mojo",
+    "src/mojotrees/boosting_sparse.mojo",
+    "src/mojotrees/histogram_sparse.mojo",
+    "src/mojotrees/model_sparse.mojo",
+    "src/mojotrees/tree_sparse.mojo",
 ]
 jobs = ["native:sparse", "native:binning", "native:monotone"]
 escalate = ["python:validation", "python:contrib"]
@@ -143,10 +143,10 @@ note = "native:binning is here for the same reason native:sparse is in the binni
 id = "serialization"
 title = "Model persistence and inspection"
 paths = [
-    "src/mojoboost/serialize.mojo",
-    "src/mojoboost/lgbm_model_io.mojo",
-    "src/mojoboost/model_dump.mojo",
-    "src/mojoboost/inspection.mojo",
+    "src/mojotrees/serialize.mojo",
+    "src/mojotrees/lgbm_model_io.mojo",
+    "src/mojotrees/model_dump.mojo",
+    "src/mojotrees/inspection.mojo",
 ]
 jobs = ["native:serialize", "native:lgbm-model-io"]
 escalate = ["python:inspection", "python:pickle", "native:continued"]
@@ -155,14 +155,14 @@ note = "model_dump.mojo and inspection.mojo are imported by no suite; their reac
 [[subsystem]]
 id = "contributions"
 title = "TreeSHAP contributions"
-paths = ["src/mojoboost/contrib.mojo"]
+paths = ["src/mojotrees/contrib.mojo"]
 jobs = ["native:contrib"]
 escalate = ["python:contrib", "native:serialize"]
 
 [[subsystem]]
 id = "callbacks"
 title = "Callbacks"
-paths = ["src/mojoboost/callback.mojo"]
+paths = ["src/mojotrees/callback.mojo"]
 jobs = ["native:callbacks"]
 escalate = ["python:callbacks"]
 
@@ -170,13 +170,13 @@ escalate = ["python:callbacks"]
 id = "device-policy"
 title = "Backend and device selection"
 paths = [
-    "src/mojoboost/device.mojo",
-    "src/mojoboost/device_policy.mojo",
-    "src/mojoboost/backend.mojo",
+    "src/mojotrees/device.mojo",
+    "src/mojotrees/device_policy.mojo",
+    "src/mojotrees/backend.mojo",
 ]
 jobs = ["native:device"]
 escalate = ["differential:cpu-pinned", "differential:backend-equivalence", "python:device-selection"]
-note = "differential:cpu-pinned is the only job that exercises MOJOBOOST_DISABLE_GPU on a machine that has an accelerator, so it is the only one that can catch a broken pin-to-CPU branch."
+note = "differential:cpu-pinned is the only job that exercises MOJOTREES_DISABLE_GPU on a machine that has an accelerator, so it is the only one that can catch a broken pin-to-CPU branch."
 
 # ---------------------------------------------------------------------------
 # GPU
@@ -186,11 +186,11 @@ note = "differential:cpu-pinned is the only job that exercises MOJOBOOST_DISABLE
 id = "gpu-histogram"
 title = "GPU histogram construction"
 paths = [
-    "src/mojoboost/histogram_gpu.mojo",
-    "src/mojoboost/gpu_tiling.mojo",
-    "src/mojoboost/gpu_histogram_specializations.mojo",
-    "src/mojoboost/gpu_bin_packing.mojo",
-    "src/mojoboost/gpu_binned_layout.mojo",
+    "src/mojotrees/histogram_gpu.mojo",
+    "src/mojotrees/gpu_tiling.mojo",
+    "src/mojotrees/gpu_histogram_specializations.mojo",
+    "src/mojotrees/gpu_bin_packing.mojo",
+    "src/mojotrees/gpu_binned_layout.mojo",
 ]
 jobs = ["differential:gpu-tiling", "differential:gpu-strategies", "differential:backend-equivalence"]
 escalate = ["hardware:gpu-suites", "hardware:hist-strategy-sweep"]
@@ -200,12 +200,12 @@ note = "gpu_bin_packing.mojo and gpu_binned_layout.mojo are imported by no suite
 id = "gpu-training"
 title = "End-to-end GPU training"
 paths = [
-    "src/mojoboost/train_gpu.mojo",
-    "src/mojoboost/gpu_frontier.mojo",
-    "src/mojoboost/gpu_fused_round.mojo",
-    "src/mojoboost/gpu_active_rows.mojo",
-    "src/mojoboost/gpu_gradient_stream.mojo",
-    "src/mojoboost/gpu_output_planes.mojo",
+    "src/mojotrees/train_gpu.mojo",
+    "src/mojotrees/gpu_frontier.mojo",
+    "src/mojotrees/gpu_fused_round.mojo",
+    "src/mojotrees/gpu_active_rows.mojo",
+    "src/mojotrees/gpu_gradient_stream.mojo",
+    "src/mojotrees/gpu_output_planes.mojo",
 ]
 jobs = ["native:gpu-active-rows", "differential:gpu-training"]
 escalate = ["differential:backend-equivalence", "differential:gpu-objectives", "hardware:gpu-validate"]
@@ -214,21 +214,21 @@ note = "Row compaction must stay order-preserving; native:gpu-active-rows is the
 [[subsystem]]
 id = "gpu-split"
 title = "Device-side split selection"
-paths = ["src/mojoboost/gpu_split_search.mojo"]
+paths = ["src/mojotrees/gpu_split_search.mojo"]
 jobs = ["native:gpu-split-search"]
 escalate = ["differential:backend-equivalence", "native:monotone", "native:categorical"]
 
 [[subsystem]]
 id = "gpu-objectives"
 title = "Device-resident objectives"
-paths = ["src/mojoboost/gpu_objectives_native.mojo"]
+paths = ["src/mojotrees/gpu_objectives_native.mojo"]
 jobs = ["native:gpu-objectives-native"]
 escalate = ["differential:gpu-objectives"]
 
 [[subsystem]]
 id = "gpu-predict"
 title = "Device-side prediction"
-paths = ["src/mojoboost/gpu_predict.mojo"]
+paths = ["src/mojotrees/gpu_predict.mojo"]
 jobs = ["native:gpu-predict"]
 escalate = ["differential:backend-equivalence"]
 
@@ -236,9 +236,9 @@ escalate = ["differential:backend-equivalence"]
 id = "gpu-runtime"
 title = "GPU session, portability, and backend policy"
 paths = [
-    "src/mojoboost/gpu_runtime.mojo",
-    "src/mojoboost/gpu_backend_policy.mojo",
-    "src/mojoboost/gpu_portability.mojo",
+    "src/mojotrees/gpu_runtime.mojo",
+    "src/mojotrees/gpu_backend_policy.mojo",
+    "src/mojotrees/gpu_portability.mojo",
 ]
 jobs = ["native:gpu-runtime", "differential:gpu-portability"]
 escalate = ["hardware:gpu-suites"]
@@ -248,10 +248,10 @@ note = "gpu_backend_policy.mojo and gpu_portability.mojo are imported by no suit
 id = "apple-policy"
 title = "Apple silicon policy modules"
 paths = [
-    "src/mojoboost/apple_cpu_policy.mojo",
-    "src/mojoboost/apple_gpu_policy.mojo",
-    "src/mojoboost/apple_histogram_policy.mojo",
-    "src/mojoboost/unified_memory_policy.mojo",
+    "src/mojotrees/apple_cpu_policy.mojo",
+    "src/mojotrees/apple_gpu_policy.mojo",
+    "src/mojotrees/apple_histogram_policy.mojo",
+    "src/mojotrees/unified_memory_policy.mojo",
 ]
 jobs = ["native:apple-gpu-policy"]
 escalate = ["differential:gpu-tiling", "hardware:apple-suite-smoke"]
@@ -265,9 +265,9 @@ note = "Three of these four are imported by no suite. A policy change that only 
 id = "distributed"
 title = "Distributed training and its transport"
 paths = [
-    "src/mojoboost/distributed.mojo",
-    "src/mojoboost/collective.mojo",
-    "src/mojoboost/distributed_transport.mojo",
+    "src/mojotrees/distributed.mojo",
+    "src/mojotrees/collective.mojo",
+    "src/mojotrees/distributed_transport.mojo",
 ]
 jobs = ["distributed:in-process", "distributed:transport"]
 escalate = ["distributed:two-process", "distributed:dask-contract"]
@@ -276,7 +276,7 @@ note = "distributed:two-process is blocked and will print as blocked. That is th
 [[subsystem]]
 id = "tree-parameters-extra"
 title = "Tree-parameter primitives no grower calls"
-paths = ["src/mojoboost/tree_parameters_extra.mojo"]
+paths = ["src/mojotrees/tree_parameters_extra.mojo"]
 jobs = ["native:tree-parameters-extra"]
 note = "This suite proves the primitive computes its rule. It cannot prove the parameter does anything, because no grower calls it. Wiring one up is a change to core-boosting and takes that subsystem's jobs too."
 
@@ -296,10 +296,10 @@ note = "Every python-tier job depends on python:build-ext, so a bindings change 
 id = "python-api"
 title = "The public Python API"
 paths = [
-    "python/mojoboost/__init__.py",
-    "python/mojoboost/basic.py",
-    "python/mojoboost/_compat.py",
-    "python/mojoboost/_public_api_plan.py",
+    "python/mojotrees/__init__.py",
+    "python/mojotrees/basic.py",
+    "python/mojotrees/_compat.py",
+    "python/mojotrees/_public_api_plan.py",
 ]
 jobs = ["python:basic", "python:params", "python:attributes"]
 escalate = ["static:parity", "python:api", "broad:estimators"]
@@ -308,47 +308,47 @@ note = "static:parity is not optional here: adding a name to __all__ can fire a 
 [[subsystem]]
 id = "python-eval"
 title = "Validation sets, metrics, and early stopping"
-paths = ["python/mojoboost/_eval.py", "python/mojoboost/callback.py"]
+paths = ["python/mojotrees/_eval.py", "python/mojotrees/callback.py"]
 jobs = ["python:eval-set", "python:custom-metrics", "python:callbacks"]
 
 [[subsystem]]
 id = "python-arrays"
 title = "Array conversion and input validation"
-paths = ["python/mojoboost/_arrays.py"]
+paths = ["python/mojotrees/_arrays.py"]
 jobs = ["python:validation", "python:no-numpy", "python:predict"]
 escalate = ["python:categorical", "broad:estimators"]
 
 [[subsystem]]
 id = "python-sklearn"
 title = "scikit-learn compatibility"
-paths = ["python/mojoboost/_sklearn.py"]
+paths = ["python/mojotrees/_sklearn.py"]
 jobs = ["python:sklearn"]
 escalate = ["python:basic", "broad:estimators"]
 
 [[subsystem]]
 id = "python-cv"
 title = "Cross validation"
-paths = ["python/mojoboost/cv.py"]
+paths = ["python/mojotrees/cv.py"]
 jobs = ["python:cv"]
 
 [[subsystem]]
 id = "python-dask"
 title = "The Dask adapter"
-paths = ["python/mojoboost/dask.py", "python/mojoboost/_dask_runtime.py"]
+paths = ["python/mojotrees/dask.py", "python/mojotrees/_dask_runtime.py"]
 jobs = ["distributed:dask-contract"]
 escalate = ["distributed:in-process"]
 
 [[subsystem]]
 id = "python-inspection"
 title = "Model inspection from Python"
-paths = ["python/mojoboost/inspection.py"]
+paths = ["python/mojotrees/inspection.py"]
 jobs = ["python:inspection"]
 escalate = ["native:serialize"]
 
 [[subsystem]]
 id = "python-device"
 title = "Device selection and diagnostics from Python"
-paths = ["python/mojoboost/device_selection.py", "python/mojoboost/diagnostics.py"]
+paths = ["python/mojotrees/device_selection.py", "python/mojotrees/diagnostics.py"]
 jobs = ["python:device-selection"]
 escalate = ["smoke:install-example", "native:device"]
 
@@ -506,27 +506,27 @@ escalate = ["native:serialize", "python:pickle", "static:parity"]
 
 [[gap]]
 paths = [
-    "src/mojoboost/alternate_boosting.mojo",
-    "src/mojoboost/boosting_dart.mojo",
-    "src/mojoboost/boosting_rf.mojo",
+    "src/mojotrees/alternate_boosting.mojo",
+    "src/mojotrees/boosting_dart.mojo",
+    "src/mojotrees/boosting_rf.mojo",
 ]
 fallback = ["native:compile-package"]
 reason = "Alternative boosting modes. No trainer calls them and no suite imports them."
 would_close_it = "A suite under tests/ that imports the module, plus a trainer that calls it. Until both exist, a passing compile is the whole of the evidence."
 
 [[gap]]
-paths = ["src/mojoboost/class_weight.mojo"]
+paths = ["src/mojotrees/class_weight.mojo"]
 fallback = ["native:compile-package"]
 reason = "Class weighting. No suite imports it."
 would_close_it = "Reaching it from fit(class_weight=) and asserting the weighted gradient in tests/test_weights.mojo."
 
 [[gap]]
 paths = [
-    "src/mojoboost/gpu_bin_packing.mojo",
-    "src/mojoboost/gpu_binned_layout.mojo",
-    "src/mojoboost/gpu_categorical.mojo",
-    "src/mojoboost/gpu_sparse.mojo",
-    "src/mojoboost/gpu_sparse_layout.mojo",
+    "src/mojotrees/gpu_bin_packing.mojo",
+    "src/mojotrees/gpu_binned_layout.mojo",
+    "src/mojotrees/gpu_categorical.mojo",
+    "src/mojotrees/gpu_sparse.mojo",
+    "src/mojotrees/gpu_sparse_layout.mojo",
 ]
 fallback = ["native:compile-package"]
 reason = "GPU data layouts. No suite imports them. The sparse GPU path raises for device='gpu' today, so there is nothing to run even if a suite existed."
@@ -534,12 +534,12 @@ would_close_it = "A layout suite that builds each layout from a fixture and comp
 
 [[gap]]
 paths = [
-    "src/mojoboost/gpu_leaf_batching.mojo",
-    "src/mojoboost/gpu_levelwise.mojo",
-    "src/mojoboost/gpu_multiclass_batch.mojo",
-    "src/mojoboost/hybrid_leaf_scheduler.mojo",
-    "src/mojoboost/levelwise_policy.mojo",
-    "src/mojoboost/histogram_cache_policy.mojo",
+    "src/mojotrees/gpu_leaf_batching.mojo",
+    "src/mojotrees/gpu_levelwise.mojo",
+    "src/mojotrees/gpu_multiclass_batch.mojo",
+    "src/mojotrees/hybrid_leaf_scheduler.mojo",
+    "src/mojotrees/levelwise_policy.mojo",
+    "src/mojotrees/histogram_cache_policy.mojo",
 ]
 fallback = ["native:compile-package"]
 reason = "Scheduling policies. Pure arithmetic over device limits, imported by no suite."
@@ -547,8 +547,8 @@ would_close_it = "A policy suite in the shape of tests/parallel/test_apple_gpu_p
 
 [[gap]]
 paths = [
-    "src/mojoboost/gpu_backend_policy.mojo",
-    "src/mojoboost/gpu_portability.mojo",
+    "src/mojotrees/gpu_backend_policy.mojo",
+    "src/mojotrees/gpu_portability.mojo",
 ]
 fallback = ["native:compile-package", "differential:gpu-portability"]
 reason = "Backend selection and the portability contract. No suite imports either module; tests/test_gpu_portability.mojo checks the kernels against the contract rather than the modules that state it."
@@ -556,8 +556,8 @@ would_close_it = "Asserting the policy's choice for a table of device capability
 
 [[gap]]
 paths = [
-    "src/mojoboost/inspection.mojo",
-    "src/mojoboost/model_dump.mojo",
+    "src/mojotrees/inspection.mojo",
+    "src/mojotrees/model_dump.mojo",
 ]
 fallback = ["native:compile-package", "python:inspection"]
 reason = "No Mojo suite imports either. Their reachable behavior is covered from Python, one layer up, and split_gains has no binding at all."

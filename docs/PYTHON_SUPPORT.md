@@ -1,6 +1,6 @@
 # Python version support
 
-Why mojoboost declares `requires-python = ">=3.14"`, how much of that floor
+Why mojotrees declares `requires-python = ">=3.14"`, how much of that floor
 is real, and what would have to run before it could honestly be lowered.
 
 ## Status of this document
@@ -50,7 +50,7 @@ and why.
 
 `python/pyproject.toml` says `requires-python = ">=3.14"`. Section 6.1 of the
 compatibility policy calls that "a hard floor rather than a preference". If
-that is right, mojoboost's first release reaches only the interpreter that
+that is right, mojotrees's first release reaches only the interpreter that
 shipped most recently, which for a library whose users are scikit-learn and
 LightGBM users is a small fraction of the installed base.
 
@@ -63,13 +63,13 @@ has to come from somewhere. This document goes and finds where.
 
 | Source | What it gave |
 |---|---|
-| `python/mojoboost/*.py` | Every version-gated construct in the pure-Python half, by `ast` |
+| `python/mojotrees/*.py` | Every version-gated construct in the pure-Python half, by `ast` |
 | `python/pyproject.toml`, `python/setup.py` | The declared floor, the classifiers, and how the wheel tag is decided |
 | `pixi.toml`, `pixi.lock` | Which conda packages pin an interpreter, and which do not |
 | `.pixi/envs/*/conda-meta/*.json` | Which package owns which installed file |
 | The local rattler repodata cache | Which `max` build variants the pinned channel publishes |
-| `python/mojoboost/_mojoboost.so` | Linkage, load commands, and the CPython entry points named inside it |
-| `python/mojoboost/.dylibs/*.dylib` | Linkage of the four bundled MAX runtime libraries |
+| `python/mojotrees/_mojotrees.so` | Linkage, load commands, and the CPython entry points named inside it |
+| `python/mojotrees/.dylibs/*.dylib` | Linkage of the four bundled MAX runtime libraries |
 | `.github/workflows/ci.yml` | Which interpreters CI has ever run |
 
 The repodata cache is the one source that is not in the repository. It is the
@@ -81,7 +81,7 @@ confirm it directly.
 
 ## 3. Finding: the Python source imposes no floor above 3.7
 
-An `ast` scan of every module in `python/mojoboost/` finds:
+An `ast` scan of every module in `python/mojotrees/` finds:
 
 - no `match` statement, no `except*`, no PEP 695 type parameters, no walrus
   operator, and no positional-only parameters
@@ -119,12 +119,12 @@ finding. Run the tool; do not cite this paragraph.
 
 This is the load-bearing finding.
 
-`otool -L python/mojoboost/_mojoboost.so` lists three dependencies:
+`otool -L python/mojotrees/_mojotrees.so` lists three dependencies:
 `@rpath/libKGENCompilerRTShared.dylib`, `@rpath/libAsyncRTMojoBindings.dylib`,
 and `/usr/lib/libSystem.B.dylib`. No libpython. `nm -u` on the same file
 lists no undefined `Py*` symbol at all: the only undefined symbols are the
 Modular runtime's own `AsyncRT_*` and `KGEN_CompilerRT_*` entry points plus
-libc. `otool -L` on all four bundled dylibs in `python/mojoboost/.dylibs/`
+libc. `otool -L` on all four bundled dylibs in `python/mojotrees/.dylibs/`
 finds no libpython either.
 
 The binary does contain the names. `strings -a -t d` finds 109 of them, 107 of
@@ -207,7 +207,7 @@ imports it, other than `bench/real_data/envinfo.py:119`, which runs
 `import max; print(max.__version__)` to record a version string.
 
 So the dependency that carries the entire Python pin is a dependency on a
-Python API mojoboost does not call. Whether the right fix is to pin Python
+Python API mojotrees does not call. Whether the right fix is to pin Python
 explicitly or to depend on `max-core` is a `pixi.toml` decision and belongs to
 whoever owns that file; the handoff states it as a question rather than as an
 instruction, because dropping `max` also drops the environment `bench` and
@@ -222,7 +222,7 @@ running the build. There is no `Extension()` object, no `py_limited_api`, and
 nothing that binds the wheel to 3.14 other than which Python invoked
 `python -m build`.
 
-The wheel on disk, `mojoboost-0.1.0-cp314-cp314-macosx_26_0_arm64.whl`, is
+The wheel on disk, `mojotrees-0.1.0-cp314-cp314-macosx_26_0_arm64.whl`, is
 therefore labeled `cp314` because it was built by a 3.14, not because
 anything in it is 3.14-specific. The same source built in an environment
 solved against 3.13 would produce `cp313-cp313-macosx_26_0_arm64.whl` with no
@@ -235,15 +235,15 @@ platform matrix's business, not this document's.
 ## 7. Finding: `Py_LIMITED_API` is not a lever this repository has
 
 `Py_LIMITED_API` is a C preprocessor macro defined before including
-`Python.h`. mojoboost has no C source in the extension path, no `Python.h`
+`Python.h`. mojotrees has no C source in the extension path, no `Python.h`
 include, and no compile step where the macro could be set: the extension is
-emitted by `mojo build --emit shared-lib` from `bindings/_mojoboost.mojo`, and
+emitted by `mojo build --emit shared-lib` from `bindings/_mojotrees.mojo`, and
 the CPython glue is `std.python.bindings` inside Modular's `std.mojoc`.
 `setup.py` has no `Extension()` to pass `py_limited_api=True` to. Whether an
 abi3 build is ever possible is a question for Modular's toolchain, and no
 answer to it can be implemented here.
 
-More usefully: **the limited API is not the mechanism mojoboost would need
+More usefully: **the limited API is not the mechanism mojotrees would need
 anyway.** abi3 exists so that one binary can serve many interpreters despite
 being linked against libpython. This binary is not linked against libpython.
 If one extension can serve several interpreters, it is already able to, and
@@ -267,7 +267,7 @@ The failure mode matters. pip refuses a `cp314` wheel on a `cp314t`
 interpreter by tag mismatch, which is correct and needs no code. A source
 checkout gets no such protection, and CPython does not refuse to load an
 extension that declares no free-threaded support; it re-enables the GIL and
-warns. `python/mojoboost/_compat.py` exists for exactly that case, and for
+warns. `python/mojotrees/_compat.py` exists for exactly that case, and for
 the below-the-floor case that a source checkout can also reach.
 
 ## 9. The proposed support matrix
@@ -332,14 +332,14 @@ symbol not found: Py_NewRef
 same table (`Py_Is`, `PyModule_AddObjectRef`, and `Py_NewRef` itself), so
 3.10 is where the extension stops regardless of which one is reached first.
 
-That failure mode is the reason `python/mojoboost/_compat.py` checks the
+That failure mode is the reason `python/mojotrees/_compat.py` checks the
 interpreter *before* importing the extension rather than catching around it.
 `ABORT` ends the process. There is no exception to catch, and buffered stdout
 is lost with it.
 
 ### 9.2 Optional dependencies
 
-Nothing in `python/mojoboost/` touches a numpy C API. `_arrays.py:41` takes
+Nothing in `python/mojotrees/` touches a numpy C API. `_arrays.py:41` takes
 buffer addresses through `numpy.ndarray.ctypes.data`, which is a Python-level
 attribute, and every other numpy call is `asarray`, `ascontiguousarray`,
 `asfortranarray`, `empty`, `unique`, `isfinite`, `isinf`, `floor`, and
@@ -350,7 +350,7 @@ bare-venv install in `packaging/test_wheel.sh` keep it that way.
 
 scikit-learn is used through `__sklearn_tags__`, which is scikit-learn 1.6 and
 newer, and scikit-learn 1.6 supports CPython 3.9 and newer. Lowering
-mojoboost's floor to any version in this document's matrix does not put the
+mojotrees's floor to any version in this document's matrix does not put the
 tags hook out of reach.
 
 For reference, the stack the pinned environments resolved on 3.14 is numpy
@@ -402,10 +402,10 @@ The decisive one, and the cheapest. It needs no rebuild, because section 4
 established that the entry point table does not vary with the interpreter the
 build ran under. The interpreter must not be the pixi one, and it needs the
 four MAX runtime dylibs reachable, which they are when
-`python/mojoboost/.dylibs/` is populated.
+`python/mojotrees/.dylibs/` is populated.
 
 **Host.** Apple M4, macOS 26, osx-arm64. Artifact:
-`python/mojoboost/_mojoboost.so` as built by `bindings/build.sh` under
+`python/mojotrees/_mojotrees.so` as built by `bindings/build.sh` under
 CPython 3.14.6, 1453392 bytes, unmodified between runs. Interpreters:
 homebrew for 3.12, 3.13, and 3.14; `pixi exec` cached environments for 3.9,
 3.10, and 3.11.
@@ -436,7 +436,7 @@ reached from all of them and is not 3.14-specific either.
 #### M1b. The floor
 
 ```
-pixi exec --spec "python==3.9.*" -- python -c "import mojoboost"
+pixi exec --spec "python==3.9.*" -- python -c "import mojotrees"
 ```
 
 ```
@@ -446,7 +446,7 @@ symbol not found: Py_NewRef
 
 Not an exception. The process aborts during module initialization and
 buffered stdout is discarded with it, which is why the guard in
-`python/mojoboost/_compat.py` runs in front of the import rather than around
+`python/mojotrees/_compat.py` runs in front of the import rather than around
 it. `Py_NewRef` is a CPython 3.10 addition.
 
 #### M1c. A failure that is not about interpreter version
@@ -498,9 +498,9 @@ On a branch, with `python = "==3.13.*"` added to `[dependencies]` in
 ```
 pixi install
 pixi run build-python
-python3 tools/audit_python_compat.py python/mojoboost/_mojoboost.so
-otool -l python/mojoboost/_mojoboost.so | grep -A4 LC_BUILD_VERSION   # macOS
-readelf -d python/mojoboost/_mojoboost.so                             # Linux
+python3 tools/audit_python_compat.py python/mojotrees/_mojotrees.so
+otool -l python/mojotrees/_mojotrees.so | grep -A4 LC_BUILD_VERSION   # macOS
+readelf -d python/mojotrees/_mojotrees.so                             # Linux
 ```
 
 Settles: whether the build succeeds, and whether the entry point table is
@@ -555,7 +555,7 @@ python3.13 tools/audit_python_compat.py
 python3.14 tools/audit_python_compat.py
 ```
 
-Settles: that no module in `python/mojoboost/` fails to parse under any
+Settles: that no module in `python/mojotrees/` fails to parse under any
 candidate interpreter, which is a direct measurement rather than a scan. The
 tool is written to run on CPython 3.8 and newer so it can be the thing that
 runs first on a machine where nothing else can.
@@ -590,7 +590,7 @@ never on reasoning. Section 9.1 is the worked example of why.
 - Do not add a `<3.15` cap to `requires-python`. It would have to be edited
   on every release the toolchain permits, and `python/pyproject.toml` already
   says why it is absent.
-- Do not add shims to `python/mojoboost/_compat.py` for constructs the source
+- Do not add shims to `python/mojotrees/_compat.py` for constructs the source
   does not use. Section 3 found none, and the module's docstring says what
   would justify a new one.
 - Do not read the five `proven` rows as claims about Linux or about wheels.
@@ -609,7 +609,7 @@ replacement in
 2. `packaging/matrix/platform_matrix.toml`, `[toolchain]`, and the same claim
    restated in `docs/PLATFORM_MATRIX.md` and `packaging/linux/README.md`:
    that the `python 3.14.*` pin "is what makes cp314 the only interpreter
-   mojoboost builds against". It is the variant the solver chose with no pin
+   mojotrees builds against". It is the variant the solver chose with no pin
    present, not a constraint the toolchain imposes.
 3. `docs/COMPATIBILITY_POLICY.md` section 6.1: "`requires-python = ">=3.14"`
    today, and that is a hard floor rather than a preference." It is not a

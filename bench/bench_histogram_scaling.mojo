@@ -47,14 +47,14 @@ representative of another.
 from std.sys import argv, has_accelerator
 from std.time import perf_counter_ns
 
-from mojoboost.binning import bin_equal_width, BinnedMatrix
-from mojoboost.gpu_tiling import (
+from mojotrees.binning import bin_equal_width, BinnedMatrix
+from mojotrees.gpu_tiling import (
     STRATEGY_ATOMIC,
     STRATEGY_TILED,
     strategy_name,
 )
-from mojoboost.histogram import Histogram, build_histogram
-from mojoboost.histogram_gpu import GpuHistogramBuilder
+from mojotrees.histogram import Histogram, build_histogram
+from mojotrees.histogram_gpu import GpuHistogramBuilder
 
 
 def _splitmix64(state: UInt64) -> UInt64:
@@ -313,6 +313,6 @@ def main() raises:
             rows.append(1_000_000)
             features.append(50)
 
-        print("mojoboost gpu histogram scaling bench, reps:", reps)
+        print("mojotrees gpu histogram scaling bench, reps:", reps)
         for s in range(len(rows)):
             _run_shape(rows[s], features[s], reps)

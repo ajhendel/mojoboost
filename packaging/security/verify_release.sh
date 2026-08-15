@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Verify a downloaded mojoboost wheel before installing it.
+# Verify a downloaded mojotrees wheel before installing it.
 #
 #   bash packaging/security/verify_release.sh <wheel> [SHA256SUMS]
 #
@@ -14,13 +14,13 @@
 #      truncated download and an accidental substitution, and no attacker.
 #
 #   2. Provenance. Did this exact file come out of a run of
-#      .github/workflows/release-provenance.yml in github.com/mojoboost-ml/mojoboost?
+#      .github/workflows/release-provenance.yml in github.com/mojotrees/mojotrees?
 #      That is what `gh attestation verify` checks, against a certificate issued
 #      to that workflow's OIDC identity and logged in a public transparency log.
 #      This is the question worth asking, and it is the one an attacker with
 #      write access to a download page cannot forge.
 #
-# NOTHING HERE HAS EVER RUN. No mojoboost release exists, so there is no wheel
+# NOTHING HERE HAS EVER RUN. No mojotrees release exists, so there is no wheel
 # to verify and no attestation to verify it against. This script is written now
 # so that the acceptance criteria are settled before the first artifact, rather
 # than invented afterwards to fit whatever was published.
@@ -30,7 +30,7 @@
 # log, unless you pass `--bundle` with a bundle you downloaded earlier.
 set -euo pipefail
 
-REPO=mojoboost-ml/mojoboost
+REPO=mojotrees/mojotrees
 WORKFLOW=.github/workflows/release-provenance.yml
 
 WHEEL=${1:-}

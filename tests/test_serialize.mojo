@@ -7,7 +7,7 @@ bit-exactly, since floats are stored as raw IEEE-754 bit patterns.
 from std.os import remove
 from std.testing import assert_equal, assert_true, assert_raises, TestSuite
 
-from mojoboost.boosting import (
+from mojotrees.boosting import (
     BINARY_LOGISTIC,
     CROSS_ENTROPY,
     FAIR,
@@ -18,10 +18,10 @@ from mojoboost.boosting import (
     BoosterParams,
     IterationRange,
 )
-from mojoboost.contrib import predict_contrib
-from mojoboost.model import Model, fit
-from mojoboost.serialize import load_model, save_model
-from mojoboost.tree import TreeParams
+from mojotrees.contrib import predict_contrib
+from mojotrees.model import Model, fit
+from mojotrees.serialize import load_model, save_model
+from mojotrees.tree import TreeParams
 
 comptime _TMP_PATH = "./.test_model_roundtrip.tmp"
 
@@ -237,7 +237,7 @@ def _write(content: String) raises:
 
 def _v1_prefix() -> String:
     """A well-formed v1 header, up to but not including the mapper."""
-    var s = String("mojoboost v1\nobjective 0\n")
+    var s = String("mojotrees v1\nobjective 0\n")
     s += "learning_rate " + _bits(0.1) + "\n"
     s += "base_score " + _bits(0.0) + "\n"
     return s^
@@ -245,7 +245,7 @@ def _v1_prefix() -> String:
 
 def test_loads_v1_file() raises:
     """Version-1 files stay readable: no missing routing, no categories."""
-    var s = String("mojoboost v1\nobjective 0\n")
+    var s = String("mojotrees v1\nobjective 0\n")
     s += "learning_rate " + _bits(0.5) + "\n"
     s += "base_score " + _bits(1.0) + "\n"
     s += "mapper 1 4 1\n"
@@ -273,7 +273,7 @@ def test_loads_v1_file() raises:
 
 
 def test_load_rejects_unknown_version() raises:
-    _write(String("mojoboost v99\nobjective 0\n"))
+    _write(String("mojotrees v99\nobjective 0\n"))
     with assert_raises():
         _ = load_model(_TMP_PATH)
     remove(_TMP_PATH)

@@ -28,13 +28,13 @@
 #   6. hash everything that ships
 #
 # Environment:
-#   MOJOBOOST_MACOS_TARGET   macOS deployment target for the extension, e.g.
+#   MOJOTREES_MACOS_TARGET   macOS deployment target for the extension, e.g.
 #                            "12.0". Empty means the SDK default, which is
 #                            today's behavior and today's macosx_26_0 tag.
-#   MOJOBOOST_ALLOW_UNTAGGED set to 1 to build from an untagged commit. The
+#   MOJOTREES_ALLOW_UNTAGGED set to 1 to build from an untagged commit. The
 #                            wheel is then a test artifact and must never be
 #                            published; provenance records git_tag as "none".
-#   MOJOBOOST_RELEASE_PYTHON not used here. It belongs to the clean-install
+#   MOJOTREES_RELEASE_PYTHON not used here. It belongs to the clean-install
 #                            fixture, which runs outside pixi.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
@@ -92,13 +92,13 @@ if TAG=$(git describe --exact-match --tags HEAD 2>/dev/null); then
     [ "$TAG" = "v$VERSION" ] || die "HEAD is tagged $TAG but
 python/pyproject.toml says version $VERSION. Expected tag v$VERSION. Fix one of
 the two; do not publish an artifact whose tag and metadata disagree."
-elif [ "${MOJOBOOST_ALLOW_UNTAGGED:-0}" = "1" ]; then
+elif [ "${MOJOTREES_ALLOW_UNTAGGED:-0}" = "1" ]; then
     TAG=none
     echo "warning: building from an untagged commit. This artifact is a test"
     echo "build. Do not publish it to any index."
 else
     die "HEAD is not a tag. Check out v$VERSION, or set
-MOJOBOOST_ALLOW_UNTAGGED=1 for a test build that must not be published."
+MOJOTREES_ALLOW_UNTAGGED=1 for a test build that must not be published."
 fi
 echo "tag:     $TAG"
 echo "commit:  $(git rev-parse HEAD)"
@@ -110,7 +110,7 @@ echo "version: $VERSION"
 #
 #   MACOSX_DEPLOYMENT_TARGET          what the Mojo compile step is asked to
 #                                     emit as LC_BUILD_VERSION minos
-#   MOJOBOOST_MACOS_DEPLOYMENT_TARGET what python/setup.py writes into the
+#   MOJOTREES_MACOS_DEPLOYMENT_TARGET what python/setup.py writes into the
 #                                     wheel's platform tag
 #
 # python/setup.py deliberately does not read MACOSX_DEPLOYMENT_TARGET, because a
@@ -138,11 +138,11 @@ say "build"
 export SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-$(git log -1 --pretty=%ct HEAD)}
 echo "SOURCE_DATE_EPOCH: $SOURCE_DATE_EPOCH"
 
-if [ -n "${MOJOBOOST_MACOS_TARGET:-}" ]; then
-    echo "requested deployment target: $MOJOBOOST_MACOS_TARGET"
+if [ -n "${MOJOTREES_MACOS_TARGET:-}" ]; then
+    echo "requested deployment target: $MOJOTREES_MACOS_TARGET"
     echo "(a request. C1 below checks what the compiler actually emitted.)"
-    export MACOSX_DEPLOYMENT_TARGET="$MOJOBOOST_MACOS_TARGET"
-    export MOJOBOOST_MACOS_DEPLOYMENT_TARGET="$MOJOBOOST_MACOS_TARGET"
+    export MACOSX_DEPLOYMENT_TARGET="$MOJOTREES_MACOS_TARGET"
+    export MOJOTREES_MACOS_DEPLOYMENT_TARGET="$MOJOTREES_MACOS_TARGET"
 else
     echo "deployment target: SDK default (expect macosx_26_0 on a current Xcode)"
 fi
@@ -156,7 +156,7 @@ fi
 pixi run -e pkg test-wheel
 
 shopt -s nullglob
-WHEELS=("$DIST"/mojoboost-*.whl)
+WHEELS=("$DIST"/mojotrees-*.whl)
 shopt -u nullglob
 [ "${#WHEELS[@]}" -eq 1 ] || die "expected exactly one wheel in $DIST, found
 ${#WHEELS[@]}: ${WHEELS[*]:-none}."
@@ -210,10 +210,10 @@ py "$MACOS_DIR/inspect_wheel.py" "$WHEEL" --json "$DIST/inspection.json" || rc=1
 # library; a disagreement between these two files is worth more than either.
 say "otool record"
 {
-    echo "=== _mojoboost.so ==="
-    otool -l python/mojoboost/_mojoboost.so | grep -A 4 -E 'LC_BUILD_VERSION|LC_RPATH|LC_ID_DYLIB' || true
-    otool -L python/mojoboost/_mojoboost.so || true
-    for lib in python/mojoboost/.dylibs/*.dylib; do
+    echo "=== _mojotrees.so ==="
+    otool -l python/mojotrees/_mojotrees.so | grep -A 4 -E 'LC_BUILD_VERSION|LC_RPATH|LC_ID_DYLIB' || true
+    otool -L python/mojotrees/_mojotrees.so || true
+    for lib in python/mojotrees/.dylibs/*.dylib; do
         echo "=== $(basename "$lib") ==="
         otool -l "$lib" | grep -A 4 -E 'LC_BUILD_VERSION|LC_RPATH|LC_ID_DYLIB' || true
         otool -L "$lib" || true

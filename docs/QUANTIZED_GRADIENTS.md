@@ -1,7 +1,7 @@
-# Quantized gradient training, and mojoboost's numerical policy for it
+# Quantized gradient training, and mojotrees's numerical policy for it
 
 Status: **implemented, not integrated, not publicly reachable.** The policy
-lives in `src/mojoboost/quantized_gradient.mojo`. No trainer, histogram
+lives in `src/mojotrees/quantized_gradient.mojo`. No trainer, histogram
 builder, split search, parameter surface, binding, or Python entry point
 reaches it, `quantized_gradient.CONNECTED` is `False`, and every decision
 procedure in the module returns the float path while it is. Nothing in this
@@ -37,12 +37,12 @@ all-reduce over Float64 histograms depends on the rank count.
 and a histogram bin becomes 16 or 32 bits instead of 64. That is a memory
 traffic and bandwidth argument, and this repository has not measured it.
 
-mojoboost already relies on the first property and has since the GPU
-histogram landed. `src/mojoboost/histogram_gpu.mojo` quantizes gradients to
+mojotrees already relies on the first property and has since the GPU
+histogram landed. `src/mojotrees/histogram_gpu.mojo` quantizes gradients to
 a 2^30 fixed-point lattice and accumulates with Int32 integer atomics,
 because Metal has no float atomic add and because integer accumulation is
 the only order-independent option portable across CUDA, ROCm, and Metal. So
-mojoboost has shipped quantized accumulation on one backend for as long as
+mojotrees has shipped quantized accumulation on one backend for as long as
 it has had a GPU. What it has never had is a *choice* of lattice.
 `quantized_gradient.mojo` is that choice, expressed once, for both backends.
 
@@ -56,11 +56,11 @@ it has had a GPU. What it has never had is a *choice* of lattice.
 | `num_grad_quant_bins` | `num_grad_quant_bins` | `4` | Lattice width. Gradients occupy `[-B/2, B/2]`, hessians `[-B, B]` |
 | `stochastic_rounding` | `stochastic_rounding` | `true` | Unbiased rounding instead of round-to-nearest |
 | `renew_leaf` | `quant_train_renew_leaf` | `false` | Recompute leaf values from unquantized sums after growth |
-| `seed` | none | `11` | Seeds the stochastic rounding stream. mojoboost only |
-| `scale_rule` | none | `SCALE_MAX_ABS` | Which lattice rule. mojoboost only |
+| `seed` | none | `11` | Seeds the stochastic rounding stream. mojotrees only |
+| `scale_rule` | none | `SCALE_MAX_ABS` | Which lattice rule. mojotrees only |
 | `max_width` | none | `WIDTH_64` | Widest integer accumulator this caller can provide |
 
-The last three are mojoboost's. `seed` exists because LightGBM's stochastic
+The last three are mojotrees's. `seed` exists because LightGBM's stochastic
 rounding draws from a per-thread engine and is therefore not reproducible
 across thread counts, which would break the CPU/GPU agreement this package
 tests. `scale_rule` exists because the GPU path already has a rule of its
@@ -71,7 +71,7 @@ documented fallback rather than a wrapped accumulation.
 One deliberate refusal: an **odd** `num_grad_quant_bins` is rejected.
 LightGBM computes `num_grad_quant_bins_ / 2` in integer arithmetic, so an
 odd count truncates and the positive and negative halves of the gradient
-lattice stop matching. mojoboost raises instead.
+lattice stop matching. mojotrees raises instead.
 
 ---
 

@@ -3,7 +3,7 @@
 What in this repository is reachable from something a user can call, and
 what is not.
 
-mojoboost was built by many parallel lanes. A lane can finish a capability
+mojotrees was built by many parallel lanes. A lane can finish a capability
 completely - module written, tests passing, handoff filed - without the
 capability ever becoming reachable, because the edit that would reach it
 lives in a file the lane does not own. This document is the map of that
@@ -38,15 +38,15 @@ where it does, the script is the one looking at today's tree.
 
 ## 1. The entry points
 
-Five, and only five, things can start a call into mojoboost:
+Five, and only five, things can start a call into mojotrees:
 
 | Root | What it is | Reaches |
 | --- | --- | --- |
-| `python/mojoboost/__init__.py` | the public Python package | native code only through the extension |
-| `bindings/_mojoboost.mojo` | the CPython extension | 63 `def_function` registrations |
-| `src/mojoboost/__init__.mojo` | the public Mojo API | 32 re-exported modules |
-| `capi/mojoboost_capi.mojo` | the C ABI | 14 `@export`ed functions |
-| `cli/mojoboost_cli.mojo` | the `mojoboost` command | `train`, `predict`, `info`, `help`, `version` |
+| `python/mojotrees/__init__.py` | the public Python package | native code only through the extension |
+| `bindings/_mojotrees.mojo` | the CPython extension | 63 `def_function` registrations |
+| `src/mojotrees/__init__.mojo` | the public Mojo API | 32 re-exported modules |
+| `capi/mojotrees_capi.mojo` | the C ABI | 14 `@export`ed functions |
+| `cli/mojotrees_cli.mojo` | the `mojotrees` command | `train`, `predict`, `info`, `help`, `version` |
 
 Everything else in the repository is reachable, or is not, through one of
 these. A module reached only from `tests/` or `bench/` is exercised, not
@@ -61,7 +61,7 @@ at runtime
 
 | File | Public functions | Lines |
 | --- | ---: | ---: |
-| `_mojoboost.mojo` | 64 registrations | 1,846 |
+| `_mojotrees.mojo` | 64 registrations | 1,846 |
 | `basic_bindings.mojo` | 9 | 357 |
 | `binding_support.mojo` | 12 (helpers) | 184 |
 | `dataset_bindings.mojo` | 9 | 208 |
@@ -69,14 +69,14 @@ at runtime
 | `inspection_bindings.mojo` | 13 | 397 |
 | `objective_bindings.mojo` | 10 | 256 |
 
-`_mojoboost.mojo` imports **none** of the other six. The
+`_mojotrees.mojo` imports **none** of the other six. The
 `PythonModuleBuilder` block inside it is the entire Python-facing surface of
 the extension, so the 45 functions in the five `*_bindings.mojo` files are
 attributes of nothing. `bindings/build.sh` compiles only
 
 ```sh
 pixi run mojo build --emit shared-lib -I src \
-    bindings/_mojoboost.mojo -o python/mojoboost/_mojoboost.so
+    bindings/_mojotrees.mojo -o python/mojotrees/_mojotrees.so
 ```
 
 which does not put `bindings/` on the include path either, so
@@ -88,10 +88,10 @@ names and already falling back:
 
 | Python asks for | Where | Implemented in | Falls back to |
 | --- | --- | --- | --- |
-| `_mojoboost.dump_model` | `inspection.py` | `inspection_bindings.mojo` | re-parsing the saved text model in Python |
-| `_mojoboost.objective_code` | `inspection.py:696` | `inspection_bindings.mojo` | `None`, then a Python-side guess |
-| `_mojoboost.registry_metrics` | `_eval.py` | `objective_bindings.mojo` | a hand-maintained code table |
-| `_mojoboost.decide_device` | `device_selection.py` | `basic_bindings.mojo` | the `"narrow"` mode, using `resolve_device` |
+| `_mojotrees.dump_model` | `inspection.py` | `inspection_bindings.mojo` | re-parsing the saved text model in Python |
+| `_mojotrees.objective_code` | `inspection.py:696` | `inspection_bindings.mojo` | `None`, then a Python-side guess |
+| `_mojotrees.registry_metrics` | `_eval.py` | `objective_bindings.mojo` | a hand-maintained code table |
+| `_mojotrees.decide_device` | `device_selection.py` | `basic_bindings.mojo` | the `"narrow"` mode, using `resolve_device` |
 
 All four are now written. All four are unreachable for the same single
 reason. `handoffs/connect_05_device_policy.md` §5.1 independently asked lane
@@ -104,7 +104,7 @@ the rest"; this audit agrees and extends it to the other four modules.
 the Python route to the extra tree parameters of section 5 and to the startup
 tracing of `initialization.mojo`, and it is behind the same one edit.
 
-`python/mojoboost/inspection.py` carries a `# DELETION POINT` banner naming
+`python/mojotrees/inspection.py` carries a `# DELETION POINT` banner naming
 the precise set - `dump_model`, `dump_model_multiclass`, `split_values*`,
 `dump_raw_scores*`, `dump_leaf_index*` - and roughly 580 lines of Python
 below it exist only until those names appear. They now exist in Mojo. They
@@ -113,14 +113,14 @@ are still not in the table.
 One edit in one file closes most of this, and that file belongs to lane 06.
 See the patch queue in `handoffs/connect_22_audit.md`.
 
-> **Closed, by lane 06, the same evening.** `bindings/_mojoboost.mojo` now
+> **Closed, by lane 06, the same evening.** `bindings/_mojotrees.mojo` now
 > imports all five capability modules (`dataset_bindings`, `basic_bindings`,
 > `distributed_bindings`, `inspection_bindings`, `objective_bindings`) and
 > the registration table is at 116 entries, up from the 63 counted above.
 > All four names in the table above are registered:
 > `decide_device_workload` under the name `decide_device`, plus `dump_model`,
 > `objective_code`, and `registry_metrics`. The `# DELETION POINT` block in
-> `python/mojoboost/inspection.py` is now a fallback with a live native path
+> `python/mojotrees/inspection.py` is now a fallback with a live native path
 > in front of it rather than the only implementation; deleting it is lane
 > 07's call and is not this audit's to make.
 
@@ -128,7 +128,7 @@ See the patch queue in `handoffs/connect_22_audit.md`.
 
 ## 3. The mirror: a GPU surface with no Python caller
 
-The extension exports functions no module under `python/mojoboost/` mentions:
+The extension exports functions no module under `python/mojotrees/` mentions:
 
 ```
 gpu_predict_capability
@@ -144,7 +144,7 @@ predict_raw
 ```
 
 The first thirteen are a complete GPU prediction and GPU validation surface,
-registered and unreachable. `MojoBoostRegressor.predict` calls
+registered and unreachable. `MojoTreesRegressor.predict` calls
 `predict_range`; nothing calls `gpu_predict_capability`, so a fitted model
 never learns whether GPU prediction covers it and never takes that path. The
 last six are older entries that Python outgrew - `predict` and
@@ -173,7 +173,7 @@ which is why they are grouped.
 | `gpu_portability` | `gpu_backend_policy` | 20 | **Closed.** `tests/test_gpu_portability.mojo` imported `gpu_tiling` and `histogram_gpu`, not this module - the test named for it did not exercise it |
 
 > **`gpu_portability` closed in the second pass.**
-> `src/mojoboost/histogram_gpu.mojo` imports it, holds a `BackendContract`
+> `src/mojotrees/histogram_gpu.mojo` imports it, holds a `BackendContract`
 > field, and calls `require_bins_supported` once before binning and
 > `require_histogram_launchable` at each of the three launch sites. The
 > contract is the thing being connected, not the import: the launch bound
@@ -206,13 +206,13 @@ It is also a warning. An import is the weakest evidence of connection there
 is: `inspection.mojo` is now imported by `inspection_bindings.mojo`, which
 the extension does not import, which means `inspection.mojo` gained an edge
 and gained no reachability from Python. The script's `orphans` section uses
-only `_mojoboost.mojo` as the bindings root for exactly this reason.
+only `_mojotrees.mojo` as the bindings root for exactly this reason.
 
 ---
 
 ## 5. Two parameter surfaces, one of them unreachable from Python
 
-`src/mojoboost/params.mojo` parses LightGBM's text parameter spec into a
+`src/mojotrees/params.mojo` parses LightGBM's text parameter spec into a
 `TrainConfig`. It is the only production writer of `ExtraTreeParams`:
 
 ```
@@ -221,9 +221,9 @@ extra_trees         extra_seed       monotone_penalty
 monotone_method     penalties        forced (splits)
 ```
 
-`parse_params` is imported by `capi/mojoboost_capi.mojo` and
-`cli/mojoboost_cli.mojo`. It is **not** imported by
-`bindings/_mojoboost.mojo`, which builds its argument list from explicit
+`parse_params` is imported by `capi/mojotrees_capi.mojo` and
+`cli/mojotrees_cli.mojo`. It is **not** imported by
+`bindings/_mojotrees.mojo`, which builds its argument list from explicit
 positional parameters instead. So the C ABI and the CLI can set nine tree
 parameters that the Python estimators cannot express at all - they are not
 in `_Base.__init__`, and there is no `**params` passthrough that would reach
@@ -248,7 +248,7 @@ them - the resolution is a cross-lane edit, because lane 09 owns
 > subscripts the mapping rather than testing for a key.
 >
 > `bindings/basic_bindings.mojo` grew `extra_params_from_mapping`, and
-> `_parse_params` in `bindings/_mojoboost.mojo` calls it and folds the result
+> `_parse_params` in `bindings/_mojotrees.mojo` calls it and folds the result
 > into `TreeParams.extra`. It is the same function `extra_params_check`
 > validates with, which is the point: one parser over one mapping, so what a
 > caller can ask about and what a fit is trained with cannot come apart.
@@ -269,7 +269,7 @@ them - the resolution is a cross-lane edit, because lane 09 owns
 
 ### EFB is a guard with no engine behind it
 
-`src/mojoboost/efb.mojo` is reachable, through `params.mojo` and
+`src/mojotrees/efb.mojo` is reachable, through `params.mojo` and
 `dataset_bindings.mojo`. What is reachable is `check_bundling_supported`
 and `check_bundling_params`, which raise when a caller asks for bundling.
 The machinery - `fit_bundles`, `bundle_csc`, `unbundle_histogram`,
@@ -319,7 +319,7 @@ audit exists to separate, and EFB is its clearest instance.
 
 ## 6. Python package
 
-`python/mojoboost/` holds fourteen modules. Two are not reached from
+`python/mojotrees/` holds fourteen modules. Two are not reached from
 `__init__.py` by any import chain:
 
 - **`_public_api_plan.py`** - a proposal expressed as data. Its own docstring
@@ -329,25 +329,25 @@ audit exists to separate, and EFB is its clearest instance.
 
 - **`_compat.py`** - **PENDING, and it is a live defect.** The module holds
   `unsupported_interpreter()` and `import_extension()`, the checks that must
-  run *before* `mojoboost._mojoboost` is imported. Its docstring explains
+  run *before* `mojotrees._mojotrees` is imported. Its docstring explains
   why, and the explanation is measured: on CPython 3.9 the Mojo runtime
   resolves `Py_NewRef` out of libpython at load time, fails to find it, and
   **aborts the process**. An abort cannot be caught, so a `try` around the
   import cannot help; the only place a check can do any good is in front of
-  the import. Nothing calls it. `python/mojoboost/__init__.py:260` does
-  `from . import _arrays, _eval, _mojoboost, ...` with no guard ahead of it.
+  the import. Nothing calls it. `python/mojotrees/__init__.py:260` does
+  `from . import _arrays, _eval, _mojotrees, ...` with no guard ahead of it.
   A user on an unsupported interpreter gets `ABORT: symbol not found:
   Py_NewRef` instead of the message this module was written to print.
 
-  **Closed in the second pass.** `python/mojoboost/__init__.py` now does
+  **Closed in the second pass.** `python/mojotrees/__init__.py` now does
   `from . import _compat` and binds the extension with
-  `_mojoboost = _compat.import_extension()`, which is the only import of it
+  `_mojotrees = _compat.import_extension()`, which is the only import of it
   in the package, so the guard runs in front of the load it guards. The
   ordering is the whole fix and it is fragile by nature: any later edit that
-  imports `_mojoboost` directly, above that line, restores the abort. The
+  imports `_mojotrees` directly, above that line, restores the abort. The
   comment above the call says so, which is the cheapest defense there is.
 
-`python/build/lib.macosx-11.0-arm64-cpython-314/mojoboost/__init__.py` is a
+`python/build/lib.macosx-11.0-arm64-cpython-314/mojotrees/__init__.py` is a
 stale copy of the package from an earlier build. It is not an orphan so much
 as debris, and it will confuse any grep run over `python/` that does not
 exclude it. The script skips `build/` by name.
@@ -402,8 +402,8 @@ recurs:
   `objective.mojo`, `custom_metric.mojo`, `gpu_objectives_native.mojo`,
   `lgbm_model_io.mojo`, and `objective_bindings.mojo`. `params.mojo` still
   carries its own `objective_from_name` and `objective_display_name`, and
-  `python/mojoboost/_eval.py` still carries a metric-code table its own
-  comment describes as "the mirror of the table in bindings/_mojoboost.mojo".
+  `python/mojotrees/_eval.py` still carries a metric-code table its own
+  comment describes as "the mirror of the table in bindings/_mojotrees.mojo".
   Three tables, one of them in another language, and the Python one is
   mirrored by hand because `registry_metrics` is unreachable (section 2).
 
@@ -493,10 +493,10 @@ reported; this is the index.
 
 | Finding | Section | Closed by | Files |
 | --- | --- | --- | --- |
-| The five binding modules the extension did not import | 2 | lane 06 | `bindings/_mojoboost.mojo` |
-| `gpu_portability` unreachable, and its own test aimed elsewhere | 4 | this lane | `src/mojoboost/histogram_gpu.mojo`, `tests/test_gpu_portability.mojo` |
-| Nine `ExtraTreeParams` fields settable from C and the CLI and not from Python, and `enable_bundle` with them | 5 | this lane | `python/mojoboost/__init__.py`, `python/mojoboost/basic.py`, `bindings/basic_bindings.mojo`, `bindings/_mojoboost.mojo` |
-| `_compat.py`'s interpreter guard never running | 6 | this lane | `python/mojoboost/__init__.py` |
+| The five binding modules the extension did not import | 2 | lane 06 | `bindings/_mojotrees.mojo` |
+| `gpu_portability` unreachable, and its own test aimed elsewhere | 4 | this lane | `src/mojotrees/histogram_gpu.mojo`, `tests/test_gpu_portability.mojo` |
+| Nine `ExtraTreeParams` fields settable from C and the CLI and not from Python, and `enable_bundle` with them | 5 | this lane | `python/mojotrees/__init__.py`, `python/mojotrees/basic.py`, `bindings/basic_bindings.mojo`, `bindings/_mojotrees.mojo` |
+| `_compat.py`'s interpreter guard never running | 6 | this lane | `python/mojotrees/__init__.py` |
 
 Two things are worth carrying forward from how they were fixed.
 

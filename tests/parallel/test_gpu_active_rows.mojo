@@ -25,9 +25,9 @@ from std.sys import has_accelerator
 from std.testing import assert_equal, assert_raises, assert_true, TestSuite
 from max.gpu.host import DeviceBuffer, DeviceContext
 
-from mojoboost.binning import BinnedMatrix
-from mojoboost.categorical import CategoricalSpec, cat_add, cat_empty
-from mojoboost.gpu_active_rows import (
+from mojotrees.binning import BinnedMatrix
+from mojotrees.categorical import CategoricalSpec, cat_add, cat_empty
+from mojotrees.gpu_active_rows import (
     FEATURE_GROUP_MAX,
     GpuActiveRows,
     LeafRange,
@@ -35,14 +35,14 @@ from mojoboost.gpu_active_rows import (
     RowRouting,
     partition_range_host,
 )
-from mojoboost.gpu_tiling import (
+from mojotrees.gpu_tiling import (
     STRATEGY_ATOMIC,
     STRATEGY_TILED,
     query_device_caps,
 )
-from mojoboost.histogram import build_histogram_subset
-from mojoboost.split import SplitInfo
-from mojoboost.tree import partition_rows
+from mojotrees.histogram import build_histogram_subset
+from mojotrees.split import SplitInfo
+from mojotrees.tree import partition_rows
 
 
 def _splitmix64(state: UInt64) -> UInt64:

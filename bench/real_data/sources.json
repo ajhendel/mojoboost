@@ -20,7 +20,7 @@
     "is labelled `synthetic` in the result record and is never described as",
     "a real-data result."
   ],
-  "cache_env": "MOJOBOOST_BENCH_DATA",
+  "cache_env": "MOJOTREES_BENCH_DATA",
   "cache_default": "bench/real_data/data",
   "datasets": {
     "year_prediction_msd": {
@@ -144,7 +144,7 @@
         "test_member": "Fold1/vali.txt",
         "note": "Queries are whole on one side of the split by construction, since the fold files are split by query."
       },
-      "notes": "Acquisition is manual on purpose. The download is behind a redirecting link that changes, so pinning a URL would be pinning a lie. Point MOJOBOOST_BENCH_DATA at a directory holding Fold1 and fetch.py --pin will checksum the two files it reads. Until then the ranking scenario runs on its generator."
+      "notes": "Acquisition is manual on purpose. The download is behind a redirecting link that changes, so pinning a URL would be pinning a lie. Point MOJOTREES_BENCH_DATA at a directory holding Fold1 and fetch.py --pin will checksum the two files it reads. Until then the ranking scenario runs on its generator."
     },
     "higgs": {
       "task": "binary",

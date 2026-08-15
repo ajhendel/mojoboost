@@ -27,11 +27,11 @@ configuration; rerun on your own hardware before quoting any of it.
 from std.sys import argv
 from std.time import perf_counter_ns
 
-from mojoboost.binning import fit_bins
-from mojoboost.boosting import SQUARED_ERROR, BoosterParams, train
-from mojoboost.boosting_sparse import train_sparse
-from mojoboost.sparse import CscMatrix, fit_bins_csc, transform_csc
-from mojoboost.tree import TreeParams
+from mojotrees.binning import fit_bins
+from mojotrees.boosting import SQUARED_ERROR, BoosterParams, train
+from mojotrees.boosting_sparse import train_sparse
+from mojotrees.sparse import CscMatrix, fit_bins_csc, transform_csc
+from mojotrees.tree import TreeParams
 
 
 def _splitmix64(state: UInt64) -> UInt64:
@@ -107,7 +107,7 @@ def main() raises:
     var csc = CscMatrix(row_index^, values^, col_offsets^, n_rows, n_features)
 
     print(
-        "mojoboost sparse bench:",
+        "mojotrees sparse bench:",
         n_rows,
         "rows x",
         n_features,

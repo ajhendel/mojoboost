@@ -3,13 +3,13 @@
 Three native modules stand behind this one, and they are at three
 different stages:
 
-- `src/mojoboost/collective.mojo` defines what a collective owes a
+- `src/mojotrees/collective.mojo` defines what a collective owes a
   distributed trainer, and `LocalCollective`, which delivers it inside one
   process. Real, reachable, and single-process by construction.
-- `src/mojoboost/distributed.mojo` grows trees and trains over shards
+- `src/mojotrees/distributed.mojo` grows trees and trains over shards
   against any `Collective`. Real, and generic over the collective, so it
   runs today with the local one.
-- `src/mojoboost/distributed_transport.mojo` is the wire protocol two
+- `src/mojotrees/distributed_transport.mojo` is the wire protocol two
   processes would agree on: framing, checksums, sequence and epoch
   numbering, the handshake, deadlines, cancellation, worker loss, and the
   restart record. All of it is implemented over `List[UInt8]` and none of
@@ -33,8 +33,8 @@ from std.python import PythonObject
 
 from binding_support import nonnegative, py_dict, py_str_list
 
-from mojoboost.collective import status_message as collective_status_message
-from mojoboost.distributed_transport import (
+from mojotrees.collective import status_message as collective_status_message
+from mojotrees.distributed_transport import (
     TRANSPORT_PROTOCOL_VERSION,
     parse_machine_list,
     transport_status_message as mojo_transport_status_message,
@@ -54,7 +54,7 @@ comptime _HAS_WIRE_TRANSPORT = False
 
 comptime _NO_TRANSPORT_REASON = String(
     "multi-process distributed training is not available in this build: the"
-    " wire protocol in src/mojoboost/distributed_transport.mojo is"
+    " wire protocol in src/mojotrees/distributed_transport.mojo is"
     " implemented and exercised in process, but it has no socket endpoint"
     " to run over, so no rank can reach another. Single-process training"
     " over LocalCollective is what this build can run"

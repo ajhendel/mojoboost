@@ -1,7 +1,7 @@
 # Hybrid CPU/GPU leaf scheduling and histogram reuse
 
-Design note for `src/mojoboost/hybrid_leaf_scheduler.mojo` and
-`src/mojoboost/histogram_cache_policy.mojo`. Nothing described here is
+Design note for `src/mojotrees/hybrid_leaf_scheduler.mojo` and
+`src/mojotrees/histogram_cache_policy.mojo`. Nothing described here is
 enabled, and nothing described here has been measured. The modules are
 policy and bookkeeping only: they accumulate no histogram, own no buffer,
 open no device, and are not called from any trainer.
@@ -491,7 +491,7 @@ Wired, default off, and off unless *two* switches opt in.
 - **E1 ran** (`pixi run bench-hybrid-costs`, `bench/bench_hybrid_costs.mojo`),
   and `HybridCosts.apple_m4()` cites its output
   (`bench/results/apple_m4_hybrid_costs_2026-08-14.md`). The costs are
-  selected only by an explicit `MOJOBOOST_HYBRID_COSTS=apple-m4`, never
+  selected only by an explicit `MOJOTREES_HYBRID_COSTS=apple-m4`, never
   inferred from the hardware; without it every leaf still declines with
   `DECLINE_COSTS_UNMEASURED`.
 - **The §8.2 replica builder exists**

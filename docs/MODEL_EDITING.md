@@ -1,13 +1,13 @@
 # Model editing
 
-This is the normative statement of what a fitted mojoboost model may be
-changed into, and what it may not. `src/mojoboost/model_editing.mojo` is
+This is the normative statement of what a fitted mojotrees model may be
+changed into, and what it may not. `src/mojotrees/model_editing.mojo` is
 the only implementation; everything below is part of the contract, and
 anything not below is not offered.
 
 Editing exists because LightGBM offers it: `rollback_one_iter`,
 `lower_bound`, `upper_bound`, `get_leaf_output`, `set_leaf_output`,
-`shuffle_models`, and `refit`. mojoboost offers the same operations under
+`shuffle_models`, and `refit`. mojotrees offers the same operations under
 one added rule, which is the reason this document exists:
 
 > **An edited model must still load, and must still be a true description
@@ -30,7 +30,7 @@ operation below is judged by whether it leaves each one true.
 | Internal values | `Tree.value[i]` for `feature[i] >= 0`: the value the node held when it was created | writing one |
 | Monotone claim | `Booster.monotone`: predictions are monotone in the constrained features | a leaf value outside its node's monotone interval |
 | Gains | `Tree.split_gain[i]`: what the split earned from the gradient sums the node held at growth time | writing one; refit and leaf edits make it *stale in meaning*, not false |
-| Loadability | `_read_trees` in `src/mojoboost/serialize.mojo` | a zero cover on a tree that reports covers, a feature index past the model's feature count, a missing bin outside the bin range, a category offset that does not start a set |
+| Loadability | `_read_trees` in `src/mojotrees/serialize.mojo` | a zero cover on a tree that reports covers, a feature index past the model's feature count, a missing bin outside the bin range, a category offset that does not start a set |
 
 `check_tree_structure`, `check_tree_serializable`, `monotone_claim_holds`,
 and `check_monotone_claim` are the runnable form of that table. Every
@@ -46,7 +46,7 @@ iteration and rollback removes whole blocks, because dropping any other
 number would shift which class every remaining tree scores.
 
 The **base score is untouched**. It belongs to iteration 0 (see
-`IterationRange` in `src/mojoboost/boosting.mojo`), so an ensemble rolled
+`IterationRange` in `src/mojotrees/boosting.mojo`), so an ensemble rolled
 back to nothing predicts the base score alone, which is exactly what a
 zero-iteration ensemble has always predicted. LightGBM reaches the same
 place by a different route: it folds its base score into the first
@@ -126,12 +126,12 @@ does.
 
 Two differences from LightGBM that a caller has to know:
 
-1. **Leaf addressing.** Leaves are named by mojoboost's *leaf ordinal*: a
+1. **Leaf addressing.** Leaves are named by mojotrees's *leaf ordinal*: a
    leaf's rank among the tree's leaves in node order, which is what
    `predict(pred_leaf=True)` reports and what `Tree.leaf_ordinals`
    documents. It is not LightGBM's leaf id, and the two agree only by
    coincidence.
-2. **Value scale.** mojoboost stores the value a leaf was fitted at and
+2. **Value scale.** mojotrees stores the value a leaf was fitted at and
    multiplies by `learning_rate` when it predicts; the dump reports the rate
    as `shrinkage` and states `leaf_value_is_shrunk: false`. LightGBM folds
    shrinkage into the stored value. So a number read here is the LightGBM

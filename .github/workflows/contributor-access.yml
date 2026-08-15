@@ -44,7 +44,7 @@ jobs:
           app-id: ${{ vars.GOVERNANCE_APP_ID }}
           private-key: ${{ secrets.GOVERNANCE_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
-          repositories: mojoboost
+          repositories: mojotrees
 
       - name: Apply eligible promotions
         if: steps.app-token.outcome == 'success'

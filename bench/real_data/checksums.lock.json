@@ -10,7 +10,7 @@
     "the digest of each extracted file the loader reads, so a re-zipped",
     "archive with the same contents still verifies at the member level.",
     "`pinned_at` is the UTC date of the fetch that recorded the entry and",
-    "`pinned_by` is the value of MOJOBOOST_BENCH_PINNER or the hostname.",
+    "`pinned_by` is the value of MOJOTREES_BENCH_PINNER or the hostname.",
     "",
     "When a pin stops matching, the dataset changed underneath us. That is a",
     "finding, not a nuisance: record the new digest as a second entry under",

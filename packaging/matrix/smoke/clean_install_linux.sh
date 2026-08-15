@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Clean-install smoke test for a Linux mojoboost wheel, x86_64 or aarch64.
+# Clean-install smoke test for a Linux mojotrees wheel, x86_64 or aarch64.
 #
 # NOT EXECUTED. The builder it was waiting for now exists:
 # packaging/linux/build_wheel_linux.sh, run by the build job of
@@ -96,9 +96,9 @@ run ./bare/bin/python probe_platform.py
 #
 # Both are recorded here rather than asserted, because the first Linux wheel
 # that exists is the one that establishes what these values are.
-PKG=$(./bare/bin/python -c 'import mojoboost, pathlib; print(pathlib.Path(mojoboost.__file__).parent)')
+PKG=$(./bare/bin/python -c 'import mojotrees, pathlib; print(pathlib.Path(mojotrees.__file__).parent)')
 say "=== ELF inspection: $PKG ==="
-for so in "$PKG"/*.so "$PKG"/.libs/*.so* "$PKG"/mojoboost.libs/*.so*; do
+for so in "$PKG"/*.so "$PKG"/.libs/*.so* "$PKG"/mojotrees.libs/*.so*; do
     [ -e "$so" ] || continue
     say "--- $so"
     run readelf -d "$so" | grep -Ei 'runpath|rpath|needed' || true
@@ -119,16 +119,16 @@ run ./bare/bin/python smoke_test.py
 # is a property of the build machine, not of this machine.
 say "=== device selection ==="
 ./bare/bin/python - 2>&1 <<'PY' | tee -a "$LOG"
-from mojoboost import MojoBoostRegressor
+from mojotrees import MojoTreesRegressor
 
 X = [[i / 20.0, (i % 5) / 5.0] for i in range(20)]
 y = [3.0 * r[0] + r[1] for r in X]
 
-m = MojoBoostRegressor(n_estimators=5, min_data_in_leaf=2, device="cpu").fit(X, y)
+m = MojoTreesRegressor(n_estimators=5, min_data_in_leaf=2, device="cpu").fit(X, y)
 print("cpu device_:", m.device_)
 
 try:
-    g = MojoBoostRegressor(n_estimators=5, min_data_in_leaf=2, device="gpu").fit(X, y)
+    g = MojoTreesRegressor(n_estimators=5, min_data_in_leaf=2, device="gpu").fit(X, y)
     print("gpu device_:", g.device_)
 except Exception as exc:
     print(f"gpu raised: {type(exc).__name__}: {exc}")

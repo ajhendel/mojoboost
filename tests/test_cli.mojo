@@ -1,6 +1,6 @@
 """Tests for the command line tool.
 
-The commands are ordinary functions (see cli/mojoboost_cli.mojo), so these
+The commands are ordinary functions (see cli/mojotrees_cli.mojo), so these
 call them directly instead of shelling out to a built binary: the same code
 runs, and a failure points at a line rather than at a process exit status.
 
@@ -10,9 +10,9 @@ Run with `mojo run -I src -I cli tests/test_cli.mojo`.
 from std.os import remove
 from std.testing import assert_equal, assert_raises, assert_true, TestSuite
 
-from mojoboost.serialize import load_model, load_multiclass_model
+from mojotrees.serialize import load_model, load_multiclass_model
 
-from mojoboost_cli import (
+from mojotrees_cli import (
     column_major_features,
     command_info,
     command_predict,

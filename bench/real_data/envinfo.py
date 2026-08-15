@@ -27,10 +27,10 @@ REPO_ROOT = os.path.abspath(
 
 #: Environment variables that change what is being measured.
 WATCHED_ENV = (
-    "MOJOBOOST_NUM_WORKERS",
-    "MOJOBOOST_PARALLEL_MIN_OPS",
-    "MOJOBOOST_DISABLE_GPU",
-    "MOJOBOOST_BENCH_DATA",
+    "MOJOTREES_NUM_WORKERS",
+    "MOJOTREES_PARALLEL_MIN_OPS",
+    "MOJOTREES_DISABLE_GPU",
+    "MOJOTREES_BENCH_DATA",
     "OMP_NUM_THREADS",
     "OPENBLAS_NUM_THREADS",
     "MKL_NUM_THREADS",
@@ -130,13 +130,13 @@ def _git():
 
 
 def _accelerator():
-    """What mojoboost thinks it can train on, asked of the built extension
+    """What mojotrees thinks it can train on, asked of the built extension
     rather than guessed from the platform."""
     out = {"gpu_available": None, "probe_error": None, "backend": None}
     try:
-        import mojoboost
+        import mojotrees
 
-        out["gpu_available"] = bool(mojoboost.gpu_available())
+        out["gpu_available"] = bool(mojotrees.gpu_available())
     except Exception as exc:
         out["probe_error"] = f"{type(exc).__name__}: {exc}"
     if platform.system() == "Darwin" and platform.machine() == "arm64":

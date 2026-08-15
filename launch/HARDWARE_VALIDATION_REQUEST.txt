@@ -14,20 +14,20 @@ If somebody reports a failure, thank them for it in public. Failure records are 
 
 --- SHORT VERSION: Modular Discord, chat channels, and anywhere a long post would be rude ---
 
-MojoBoost is a gradient-boosted tree library written natively in Mojo, with one GPU source shared by Metal, CUDA, and HIP. No CUDA file, no HIP file, no Metal file, no vendor branch anywhere in it.
+MojoTrees is a gradient-boosted tree library written natively in Mojo, with one GPU source shared by Metal, CUDA, and HIP. No CUDA file, no HIP file, no Metal file, no vendor branch anywhere in it.
 
 That design commitment is worth exactly as much as the evidence behind it, and the evidence is one Apple M4. No NVIDIA device and no AMD device has ever executed this code, on a desk or in CI. No Apple chip other than that M4 has either.
 
 If you have a GPU and an hour, you can change that. There is a read-only environment capture script, a record template, and a procedure that says exactly what to run and what counts as a result. Correctness only is a complete contribution and takes about thirty minutes, most of it the build. A machine where it fails to build is the single most useful thing anyone could send right now, and nobody has sent one.
 
-Protocol: https://github.com/mojoboost-ml/mojoboost/blob/main/docs/HARDWARE_CONTRIBUTORS.md
-Repository: https://github.com/mojoboost-ml/mojoboost
+Protocol: https://github.com/mojotrees/mojotrees/blob/main/docs/HARDWARE_CONTRIBUTORS.md
+Repository: https://github.com/mojotrees/mojotrees
 
 Experimental public alpha. Attribution for every accepted record, and that is the whole of what is on offer.
 
 --- LONG VERSION: GitHub Discussions, the Modular forum, and mailing lists ---
 
-MojoBoost is a gradient-boosted decision tree library written natively in Mojo, with a LightGBM-familiar Python API. It has one GPU source spanning every backend it targets: the histogram and partition kernels, the device-resident tree growth, and a tiling policy that derives launch geometry from device attributes at runtime. There is no CUDA file, no HIP file, no Metal file, and no vendor branch anywhere in it.
+MojoTrees is a gradient-boosted decision tree library written natively in Mojo, with a LightGBM-familiar Python API. It has one GPU source spanning every backend it targets: the histogram and partition kernels, the device-resident tree growth, and a tiling policy that derives launch geometry from device attributes at runtime. There is no CUDA file, no HIP file, no Metal file, and no vendor branch anywhere in it.
 
 That is a design commitment, and it is worth exactly as much as the evidence that the one source is correct on every backend it claims to target. Here is the evidence. One Apple M4, correctness and determinism passing, phase timings printing but not recorded as a sweep, no profiler trace. That is the entire body of hardware evidence this project has. No NVIDIA device and no AMD device has ever executed this code, on a laptop or in CI, and no Apple chip other than that M4 has either. The status tables in the repository say "not run" in most cells because most cells have not been run, and they will keep saying it until somebody with the hardware runs them.
 
@@ -39,9 +39,9 @@ The rules that make a record worth having, in case they tell you whether this is
 
 Everything is Apache 2.0, attribution is automatic and is the only thing on offer, and a withdrawal request is honored.
 
-Contributor protocol: https://github.com/mojoboost-ml/mojoboost/blob/main/docs/HARDWARE_CONTRIBUTORS.md
-Validation procedure: https://github.com/mojoboost-ml/mojoboost/blob/main/docs/GPU_VALIDATION.md
-Repository: https://github.com/mojoboost-ml/mojoboost
+Contributor protocol: https://github.com/mojotrees/mojotrees/blob/main/docs/HARDWARE_CONTRIBUTORS.md
+Validation procedure: https://github.com/mojotrees/mojotrees/blob/main/docs/GPU_VALIDATION.md
+Repository: https://github.com/mojotrees/mojotrees
 
 This is an experimental public alpha, not a production or performance claim.
 
@@ -53,17 +53,17 @@ The honest status is that it has run on exactly one GPU, an Apple M4. Nothing NV
 
 What I am asking for is validation from people who own the hardware I do not. There is a written procedure, a read-only capture script that installs nothing and uploads nothing, a record template, and a review process that will not turn your one board into a claim about a vendor. Correctness only is about thirty minutes and counts as a complete contribution. A machine where the build fails is the most useful record anyone could file and nobody has filed one yet.
 
-Protocol and what an hour actually involves: https://github.com/mojoboost-ml/mojoboost/blob/main/docs/HARDWARE_CONTRIBUTORS.md
+Protocol and what an hour actually involves: https://github.com/mojotrees/mojotrees/blob/main/docs/HARDWARE_CONTRIBUTORS.md
 
 Experimental alpha. Apache 2.0. Attribution for accepted records, which is the entire compensation on offer, and I would rather say that plainly than dress it up.
 
 --- DIRECT OUTREACH: email or a direct message, one person, edit before sending ---
 
-Subject: One hour on your <device> would settle something MojoBoost cannot settle alone
+Subject: One hour on your <device> would settle something MojoTrees cannot settle alone
 
 Hello <name>,
 
-I maintain MojoBoost, a gradient-boosted tree library written natively in Mojo. It has one GPU source for Metal, CUDA, and HIP, with no vendor branch anywhere in it, and the launch geometry derived from device attributes at runtime rather than hard-coded per chip.
+I maintain MojoTrees, a gradient-boosted tree library written natively in Mojo. It has one GPU source for Metal, CUDA, and HIP, with no vendor branch anywhere in it, and the launch geometry derived from device attributes at runtime rather than hard-coded per chip.
 
 I am writing because you have a <device> and this code has never run on one. It has run on exactly one GPU, an Apple M4. Every NVIDIA and AMD row in the repository says "not run", accurately.
 
@@ -71,7 +71,7 @@ What I would ask, if you are willing, is about thirty minutes: clone, `pixi inst
 
 The one thing I would like to be clear about up front: I will not turn your result into a claim about your vendor. A record about a <device> becomes a statement about that board and nothing wider. You are credited by name or handle, the record and its raw output are published under Apache 2.0 alongside the code, and I will remove it on request.
 
-The protocol, which says exactly what the hour involves: https://github.com/mojoboost-ml/mojoboost/blob/main/docs/HARDWARE_CONTRIBUTORS.md
+The protocol, which says exactly what the hour involves: https://github.com/mojotrees/mojotrees/blob/main/docs/HARDWARE_CONTRIBUTORS.md
 
 No obligation, and no follow-up if this is not a good use of your time.
 

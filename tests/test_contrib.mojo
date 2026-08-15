@@ -31,14 +31,14 @@ from std.testing import (
     TestSuite,
 )
 
-from mojoboost.boosting import (
+from mojotrees.boosting import (
     BINARY_LOGISTIC,
     SQUARED_ERROR,
     Booster,
     BoosterParams,
     IterationRange,
 )
-from mojoboost.contrib import (
+from mojotrees.contrib import (
     ContribExplainer,
     predict_contrib,
     predict_contrib_bins,
@@ -46,8 +46,8 @@ from mojoboost.contrib import (
     predict_contrib_multiclass,
     tree_expected_value,
 )
-from mojoboost.model import Model, fit, fit_multiclass
-from mojoboost.tree import Tree, TreeParams
+from mojotrees.model import Model, fit, fit_multiclass
+from mojotrees.tree import Tree, TreeParams
 
 comptime _TOL = 1e-9
 comptime NAN = nan[DType.float64]()

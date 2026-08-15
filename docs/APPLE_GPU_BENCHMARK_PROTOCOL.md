@@ -3,7 +3,7 @@
 Protocol version 1.0.0. Result schema `bench/apple/schema.json`, version
 1.0.0. Runner `bench/apple/suite.py`, version 1.0.0.
 
-mojoboost trains gradient-boosted trees on the GPU that is already in every
+mojotrees trains gradient-boosted trees on the GPU that is already in every
 Apple Silicon Mac. This document is how that claim gets tested, on which
 machines, against which alternatives, and what has to be true before a
 number from it is allowed to leave the repository.
@@ -64,7 +64,7 @@ of them stays in the record file and stays out of the README.
   works and is never quoted.
 - The comparison it makes is between rows of one record file. Two records
   from two machines, two OS versions, or two protocol versions are not
-  comparable, and neither is a mojoboost number from one day against a
+  comparable, and neither is a mojotrees number from one day against a
   LightGBM number from another.
 
 ## The fleet
@@ -107,7 +107,7 @@ what proves it.
 | `w1_small_dense` | 20,000 x 20 | regression | Launch and fixed-cost bound. The shape the GPU is expected to lose on, reported because it is the shape a first-time user tries. |
 | `w2_medium_dense` | 200,000 x 100 | regression | The middle of the range, where the crossover is expected to sit. |
 | `w3_large_dense` | 1,000,000 x 50 | regression | Large enough to matter, small enough for a base-configuration Mac. |
-| `w4_sparse` | 200,000 x 500, 10 nonzeros per row | regression | The sparse path. mojoboost has no sparse GPU kernel, so this workload exists partly to record that as `unsupported`. |
+| `w4_sparse` | 200,000 x 500, 10 nonzeros per row | regression | The sparse path. mojotrees has no sparse GPU kernel, so this workload exists partly to record that as `unsupported`. |
 | `w5_multiclass` | 200,000 x 50, 5 classes | multiclass | Multiplies per-round work and gradient traffic by the class count, which is the shape most sensitive to transfer cost. |
 | `w6_missing_categorical` | 200,000 x 50, 10% missing, 5 categorical columns of 40 levels | regression | The two split paths that are not the plain numerical scan. |
 | `w7_repeated_fit` | 200,000 x 50, 5 fits in one process | regression | Separates one-time cost (library import, kernel compilation, device context, allocation) from steady state. |
@@ -116,7 +116,7 @@ what proves it.
 All eight or none. A suite run that reports only `w3_large_dense` is a
 marketing exercise and this protocol does not authorize it.
 
-Shared fitting parameters are mojoboost's defaults, which are LightGBM's
+Shared fitting parameters are mojotrees's defaults, which are LightGBM's
 defaults: 100 rounds, `num_leaves=31`, `learning_rate=0.1`,
 `min_data_in_leaf=20`, `min_sum_hessian_in_leaf=1e-3`, `lambda_l2=1.0`,
 `max_bin=255`. The point is to compare implementations, not
@@ -126,8 +126,8 @@ configurations.
 
 | Engine | Device | Notes |
 |---|---|---|
-| `mojoboost_cpu` | CPU | Threads set by `MOJOBOOST_NUM_WORKERS`, which is the only control; there is no thread parameter. |
-| `mojoboost_gpu` | GPU | `device="gpu"` never falls back. Unavailable means `unsupported` on the record, not a CPU number in a GPU row. |
+| `mojotrees_cpu` | CPU | Threads set by `MOJOTREES_NUM_WORKERS`, which is the only control; there is no thread parameter. |
+| `mojotrees_gpu` | GPU | `device="gpu"` never falls back. Unavailable means `unsupported` on the record, not a CPU number in a GPU row. |
 | `lightgbm_cpu` | CPU | `num_threads`, `enable_bundle=false`, `force_row_wise=true`, `deterministic=true`. |
 | `xgboost_cpu` | CPU | `tree_method="hist"`, `grow_policy="lossguide"`, `max_depth=0`, `nthread`. |
 | `xgboost_gpu` | GPU | Always `unsupported` on Apple silicon. XGBoost's GPU tree method targets CUDA and there is no Metal backend. The row exists so the record states this rather than leaving a blank a reader can misread. |
@@ -136,9 +136,9 @@ Parameter matching cannot make the engines identical, and the record does
 not pretend otherwise. Every measurement carries a `comparability` list
 naming the differences that survive:
 
-- LightGBM's `min_data_in_bin=3` has no mojoboost equivalent, so bin edges
+- LightGBM's `min_data_in_bin=3` has no mojotrees equivalent, so bin edges
   can differ.
-- LightGBM's exclusive feature bundling is forced off, because mojoboost
+- LightGBM's exclusive feature bundling is forced off, because mojotrees
   has none.
 - XGBoost grows depth-wise by default; leaf-wise growth is approximated
   with `grow_policy=lossguide` and `max_depth=0`, which is close but not
@@ -165,10 +165,10 @@ than the physical and logical distinction does on x86.
 - A third point at performance plus efficiency cores may be recorded, and
   when it is, it is recorded as its own row rather than replacing the
   performance-core row.
-- `MOJOBOOST_NUM_WORKERS=1` is what makes the mojoboost side genuinely
+- `MOJOTREES_NUM_WORKERS=1` is what makes the mojotrees side genuinely
   single threaded. Without it, auto mode uses the machine and the
   comparison is not the comparison it claims to be.
-- `MOJOBOOST_PARALLEL_MIN_OPS` is left at its default and recorded. Pin it
+- `MOJOTREES_PARALLEL_MIN_OPS` is left at its default and recorded. Pin it
   explicitly if a run sweeps it.
 - `OMP_NUM_THREADS`, `MKL_NUM_THREADS`, and `VECLIB_MAXIMUM_THREADS` are
   set in the worker environment before the library is imported, which is
@@ -240,14 +240,14 @@ overlap.
 |---|---|
 | `import_s` | Importing the engine library in a fresh process. First repetition only. |
 | `data_gen_s` | Synthetic data construction. Not part of any comparison; recorded so a long total can be attributed. |
-| `binning_s` | Quantile binning of the training matrix, before any tree is grown. `Dataset.construct()` for mojoboost and LightGBM, `QuantileDMatrix` construction for XGBoost. |
+| `binning_s` | Quantile binning of the training matrix, before any tree is grown. `Dataset.construct()` for mojotrees and LightGBM, `QuantileDMatrix` construction for XGBoost. |
 | `train_s` | Boosting with the binned dataset already built. |
 | `fit_s` | Binning plus training, which is what a user calling `fit()` waits for. The headline metric for most workloads. |
 | `first_fit_s`, `steady_fit_s` | `w7` only. The first fit in a process against the median of the later ones. |
 | `predict_s`, `predict_rows_per_s` | Scoring the held-out matrix. The headline metric for `w8`. |
 | `total_s` | Everything the worker spent on the measured region, data generation excluded. |
 
-Sparse input has no separable binning step in mojoboost, because there is
+Sparse input has no separable binning step in mojotrees, because there is
 no `Dataset` path for it, so `binning_s` is null there rather than guessed
 at.
 
@@ -297,7 +297,7 @@ digests are expected to differ, because the device accumulates in Float32,
 and what is checked there is `max_abs_diff_vs_cpu` against the documented
 tolerance rather than equality.
 
-Losses between mojoboost and LightGBM differ slightly because tree growth
+Losses between mojotrees and LightGBM differ slightly because tree growth
 diverges after the first floating-point tie. A gap of a few percent is
 seed-to-seed variation and is not a quality claim in either direction.
 
@@ -336,7 +336,7 @@ govern how these numbers may be read:
    machine that used no power.
 
 The comparison worth making is energy per fit at equal quality, between
-`mojoboost_gpu` and the matched-thread CPU engines on the same machine in
+`mojotrees_gpu` and the matched-thread CPU engines on the same machine in
 the same run. Energy per fit against a different machine is not a
 comparison, and average power without a window length is not a number.
 
@@ -359,7 +359,7 @@ well.
 Captured automatically into every record: chip brand string, `hw.model`,
 physical, performance, efficiency, and logical core counts, GPU core count
 and name, memory size, macOS version and build, kernel, Python, Mojo, MAX,
-mojoboost, `mojoboost.gpu_available()`, LightGBM, XGBoost, numpy, scipy,
+mojotrees, `mojotrees.gpu_available()`, LightGBM, XGBoost, numpy, scipy,
 the git commit, and whether the tree was dirty.
 
 A run from a dirty tree is fine for exploration and is not quotable.
@@ -439,7 +439,7 @@ Named here so the gaps are visible rather than implied.
 - `resolved_threads` is null for every engine, because none of the three
   libraries exposes what it actually used. Thread matching is therefore
   requested and not verified.
-- Sparse GPU training does not exist, so `w4` has no `mojoboost_gpu` row
+- Sparse GPU training does not exist, so `w4` has no `mojotrees_gpu` row
   and will not until a sparse kernel does.
 - Energy attribution is machine-wide. Per-process energy is not available
   from `powermetrics` on Apple silicon and this protocol does not claim it.

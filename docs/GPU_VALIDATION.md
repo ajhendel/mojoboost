@@ -1,6 +1,6 @@
 # Cross-vendor GPU validation
 
-mojoboost has one GPU source. `histogram_gpu.mojo` holds the histogram and
+mojotrees has one GPU source. `histogram_gpu.mojo` holds the histogram and
 partition kernels, `train_gpu.mojo` drives device-resident tree growth, and
 `gpu_tiling.mojo` derives launch geometry from device attributes at runtime.
 There is no CUDA file, no HIP file, and no Metal file. That is a design
@@ -82,7 +82,7 @@ Identical on both vendors. Only the driver-reporting command differs, because
 `nvidia-smi` and `rocm-smi` are different programs.
 
 ```sh
-git clone https://github.com/mojoboost-ml/mojoboost && cd mojoboost
+git clone https://github.com/mojotrees/mojotrees && cd mojotrees
 curl -fsSL https://pixi.sh/install.sh | sh
 pixi install
 ```
@@ -121,7 +121,7 @@ Then confirm the pin-to-CPU path works on a machine that does have a device,
 which is the only place that branch is reachable:
 
 ```sh
-MOJOBOOST_DISABLE_GPU=1 pixi run test
+MOJOTREES_DISABLE_GPU=1 pixi run test
 ```
 
 ### 3. Shapes and phases
@@ -137,8 +137,8 @@ capability attributes, and per shape the launch geometry and the phase
 breakdown. Pin CPU threading first so the CPU comparison is reproducible:
 
 ```sh
-export MOJOBOOST_NUM_WORKERS=8
-export MOJOBOOST_PARALLEL_MIN_OPS=65536
+export MOJOTREES_NUM_WORKERS=8
+export MOJOTREES_PARALLEL_MIN_OPS=65536
 ```
 
 Phases the harness reports, and what each covers:
@@ -212,8 +212,8 @@ differ only in how partials combine, so the pair isolates atomic cost from
 everything else:
 
 ```sh
-MOJOBOOST_GPU_HIST_STRATEGY=atomic pixi run gpu-validate 20 100000 100
-MOJOBOOST_GPU_HIST_STRATEGY=tiled  pixi run gpu-validate 20 100000 100
+MOJOTREES_GPU_HIST_STRATEGY=atomic pixi run gpu-validate 20 100000 100
+MOJOTREES_GPU_HIST_STRATEGY=tiled  pixi run gpu-validate 20 100000 100
 ```
 
 `tiled` issues no global atomics at all, so the gap between the two is the
@@ -256,7 +256,7 @@ OS:            <uname -a>
 
 pixi run test        <pass | fail, with the failing assertion>
 pixi run test-gpu    <pass | fail>
-MOJOBOOST_DISABLE_GPU=1 pixi run test   <pass | fail>
+MOJOTREES_DISABLE_GPU=1 pixi run test   <pass | fail>
 
 <paste the full gpu-validate output>
 
@@ -380,8 +380,8 @@ Before a branch is justified, all four:
    demonstrably device-specific rather than a property of the workload that
    happened to be measured once.
 
-The `MOJOBOOST_GPU_HIST_STRATEGY`, `MOJOBOOST_GPU_ROW_TILE`, and
-`MOJOBOOST_GPU_BLOCK_THREADS` environment overrides exist so a sweep can be
+The `MOJOTREES_GPU_HIST_STRATEGY`, `MOJOTREES_GPU_ROW_TILE`, and
+`MOJOTREES_GPU_BLOCK_THREADS` environment overrides exist so a sweep can be
 run without editing or rebuilding anything. Use them to find the crossover
 before hard-coding one.
 
@@ -404,7 +404,7 @@ machine with a working driver:
 mkdir actions-runner && cd actions-runner
 curl -o actions-runner.tar.gz -L <url from that page>
 tar xzf actions-runner.tar.gz
-./config.sh --url https://github.com/mojoboost-ml/mojoboost \
+./config.sh --url https://github.com/mojotrees/mojotrees \
             --token <token from that page> \
             --labels self-hosted,linux,gpu,cuda   # or ...,gpu,rocm
 ./run.sh

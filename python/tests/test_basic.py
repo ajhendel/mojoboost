@@ -15,9 +15,9 @@ import pytest
 
 np = pytest.importorskip("numpy")
 
-import mojoboost
-from mojoboost import Booster, Dataset, MojoBoostClassifier
-from mojoboost import MojoBoostRanker, MojoBoostRegressor, train
+import mojotrees
+from mojotrees import Booster, Dataset, MojoTreesClassifier
+from mojotrees import MojoTreesRanker, MojoTreesRegressor, train
 
 
 def _ranking_data(n_queries=12, per_query=6, n_features=4, seed=3):
@@ -131,7 +131,7 @@ def test_train_matches_the_regressor(regression):
     X, y = regression
     params = {"objective": "regression", "num_leaves": 8, "max_depth": 4}
     booster = train(params, Dataset(X, label=y), num_boost_round=20)
-    estimator = MojoBoostRegressor(
+    estimator = MojoTreesRegressor(
         num_leaves=8, max_depth=4, n_estimators=20
     ).fit(X, y)
     np.testing.assert_array_equal(booster.predict(X), estimator.predict(X))
@@ -143,7 +143,7 @@ def test_train_matches_the_binary_classifier(binary):
     booster = train(
         {"objective": "binary", "num_leaves": 8}, Dataset(X, label=y), 15
     )
-    estimator = MojoBoostClassifier(num_leaves=8, n_estimators=15).fit(X, y)
+    estimator = MojoTreesClassifier(num_leaves=8, n_estimators=15).fit(X, y)
     np.testing.assert_array_equal(
         booster.predict(X), estimator.predict_proba(X)[:, 1]
     )
@@ -156,7 +156,7 @@ def test_train_matches_the_multiclass_classifier(multiclass):
         Dataset(X, label=y),
         12,
     )
-    estimator = MojoBoostClassifier(num_leaves=8, n_estimators=12).fit(X, y)
+    estimator = MojoTreesClassifier(num_leaves=8, n_estimators=12).fit(X, y)
     np.testing.assert_array_equal(
         booster.predict(X), estimator.predict_proba(X)
     )
@@ -171,7 +171,7 @@ def test_train_matches_the_ranker():
         Dataset(X, label=y, group=group),
         10,
     )
-    estimator = MojoBoostRanker(num_leaves=8, n_estimators=10).fit(
+    estimator = MojoTreesRanker(num_leaves=8, n_estimators=10).fit(
         X, y, group=group
     )
     np.testing.assert_array_equal(booster.predict(X), estimator.predict(X))
@@ -470,7 +470,7 @@ def test_booster_needs_exactly_one_source(regression):
 
 def test_estimator_booster_is_the_same_model(regression):
     X, y = regression
-    estimator = MojoBoostRegressor(n_estimators=12).fit(X, y)
+    estimator = MojoTreesRegressor(n_estimators=12).fit(X, y)
     booster = estimator.booster_
     assert isinstance(booster, Booster)
     assert booster is estimator.booster_
@@ -484,7 +484,7 @@ def test_estimator_booster_is_the_same_model(regression):
 
 def test_estimator_booster_reports_class_shape(multiclass):
     X, y = multiclass
-    estimator = MojoBoostClassifier(n_estimators=10).fit(X, y)
+    estimator = MojoTreesClassifier(n_estimators=10).fit(X, y)
     booster = estimator.booster_
     assert booster.num_model_per_iteration() == 3
     np.testing.assert_array_equal(
@@ -496,25 +496,25 @@ def test_estimator_booster_carries_feature_names(regression):
     pd = pytest.importorskip("pandas")
     X, y = regression
     frame = pd.DataFrame(X, columns=[f"f{i}" for i in range(X.shape[1])])
-    estimator = MojoBoostRegressor(n_estimators=5).fit(frame, y)
+    estimator = MojoTreesRegressor(n_estimators=5).fit(frame, y)
     assert estimator.booster_.feature_name() == list(frame.columns)
 
 
 def test_estimator_booster_cannot_continue_training(regression):
     X, y = regression
-    estimator = MojoBoostRegressor(n_estimators=5).fit(X, y)
+    estimator = MojoTreesRegressor(n_estimators=5).fit(X, y)
     with pytest.raises(ValueError, match="no training set"):
         estimator.booster_.update()
 
 
 def test_unfitted_estimator_has_no_booster(regression):
-    with pytest.raises(mojoboost.NotFittedError):
-        MojoBoostRegressor().booster_
+    with pytest.raises(mojotrees.NotFittedError):
+        MojoTreesRegressor().booster_
 
 
 def test_refit_replaces_the_booster(regression):
     X, y = regression
-    estimator = MojoBoostRegressor(n_estimators=5).fit(X, y)
+    estimator = MojoTreesRegressor(n_estimators=5).fit(X, y)
     first = estimator.booster_
     estimator.fit(X, y)
     assert estimator.booster_ is not first
@@ -523,7 +523,7 @@ def test_refit_replaces_the_booster(regression):
 
 def test_estimator_still_pickles(regression):
     X, y = regression
-    estimator = MojoBoostRegressor(n_estimators=8).fit(X, y)
+    estimator = MojoTreesRegressor(n_estimators=8).fit(X, y)
     revived = pickle.loads(pickle.dumps(estimator))
     np.testing.assert_array_equal(revived.predict(X), estimator.predict(X))
     assert isinstance(revived.booster_, Booster)

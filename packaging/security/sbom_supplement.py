@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Add the shipped native runtime to a CycloneDX SBOM of a mojoboost wheel.
+"""Add the shipped native runtime to a CycloneDX SBOM of a mojotrees wheel.
 
 A dependency scanner reads a wheel the way a package manager does. It finds one
-Python distribution called mojoboost and, correctly by its own lights, stops.
+Python distribution called mojotrees and, correctly by its own lights, stops.
 What it does not find is that the wheel contains a compiled Mojo extension and
 four MAX runtime libraries copied out of a conda environment
 (`packaging/build_wheel.sh`), that those libraries are the largest thing in the
@@ -76,14 +76,14 @@ def version_of(raw: object) -> str:
 
 
 def prop(name: str, value: object) -> dict:
-    return {"name": f"mojoboost:{name}", "value": str(value)}
+    return {"name": f"mojotrees:{name}", "value": str(value)}
 
 
 def component(name: str, version: str, purl: str, role: str, sha256: str | None,
               extra: list[dict]) -> dict:
     body = {
         "type": "library",
-        "bom-ref": f"mojoboost:{role}:{name}@{version}",
+        "bom-ref": f"mojotrees:{role}:{name}@{version}",
         "name": name,
         "version": version,
         "purl": purl,
@@ -155,7 +155,7 @@ def main(argv: list[str]) -> int:
     if not extensions:
         print(
             f"{wheel_path} contains no compiled extension. Either this is not a "
-            "mojoboost wheel or the build produced a pure Python one.",
+            "mojotrees wheel or the build produced a pure Python one.",
             file=sys.stderr,
         )
         return 1

@@ -1,13 +1,13 @@
-# DART in mojoboost
+# DART in mojotrees
 
 DART is LightGBM's `boosting='dart'`: Dropouts meet Multiple Additive
 Regression Trees (Rashmi and Gilad-Bachrach, 2015). This document specifies
-what mojoboost implements, what it deliberately refuses, and what has not
-been verified. It describes `src/mojoboost/boosting_dart.mojo`, which is the
+what mojotrees implements, what it deliberately refuses, and what has not
+been verified. It describes `src/mojotrees/boosting_dart.mojo`, which is the
 algorithm core and is not a public API.
 
 Status, in one line: the core is written and is imported by
-`src/mojoboost/alternate_boosting.mojo`; no DART code has been compiled or
+`src/mojotrees/alternate_boosting.mojo`; no DART code has been compiled or
 run, and `boosting='dart'` is still rejected by the Python layer and by
 `parse_params`. See `handoffs/remaining_01_dart.md`.
 
@@ -96,7 +96,7 @@ property `train_more` already promises for bagging and GOSS.
 Within a round the stream is laid out so nothing collides: offset 0 is the
 skip decision, offset `1 + i` is iteration `i`'s draw.
 
-Two rules are mojoboost's own, not reproductions of LightGBM's order, and are
+Two rules are mojotrees's own, not reproductions of LightGBM's order, and are
 called out as differences rather than parity:
 
 - **Cap by smallest draw.** When more iterations are selected than `max_drop`

@@ -1,7 +1,7 @@
 """The Dask adapter's contracts, against fakes rather than a cluster.
 
 Nothing here starts a scheduler, a worker, or a Dask collection. What it
-covers is everything `mojoboost.dask` is responsible for on its own side of
+covers is everything `mojotrees.dask` is responsible for on its own side of
 the backend protocol: import safety without dask installed, partition
 metadata validation, the rank plan, categorical schema agreement, the
 ranking partition rules, capability negotiation, model reference ownership,
@@ -22,11 +22,11 @@ import types
 import numpy as np
 import pytest
 
-import mojoboost.dask as mbd
-from mojoboost import (
-    MojoBoostClassifier,
-    MojoBoostRanker,
-    MojoBoostRegressor,
+import mojotrees.dask as mbd
+from mojotrees import (
+    MojoTreesClassifier,
+    MojoTreesRanker,
+    MojoTreesRegressor,
 )
 
 
@@ -93,7 +93,7 @@ def meta(index, worker="tcp://a:1", n_rows=10, **kwargs):
 def clean_backend(monkeypatch):
     """No registered backend and no environment hook leaks between
     tests."""
-    monkeypatch.delenv("MOJOBOOST_DASK_BACKEND", raising=False)
+    monkeypatch.delenv("MOJOTREES_DASK_BACKEND", raising=False)
     mbd.clear_backend()
     mbd.clear_model_cache()
     yield
@@ -115,7 +115,7 @@ def local_regressor():
     gen = np.random.default_rng(5)
     X = gen.random((120, 4))
     y = X[:, 0] * 2.0 + X[:, 1]
-    est = MojoBoostRegressor(n_estimators=5, num_leaves=7).fit(X, y)
+    est = MojoTreesRegressor(n_estimators=5, num_leaves=7).fit(X, y)
     return est, X, y
 
 
@@ -124,7 +124,7 @@ def local_binary():
     gen = np.random.default_rng(6)
     X = gen.random((120, 4))
     y = (X[:, 0] > 0.5).astype(np.int64)
-    est = MojoBoostClassifier(n_estimators=5, num_leaves=7).fit(X, y)
+    est = MojoTreesClassifier(n_estimators=5, num_leaves=7).fit(X, y)
     return est, X, y
 
 
@@ -133,7 +133,7 @@ def local_multiclass():
     gen = np.random.default_rng(7)
     X = gen.random((120, 4))
     y = np.digitize(X[:, 0], [0.33, 0.66])
-    est = MojoBoostClassifier(n_estimators=5, num_leaves=7).fit(X, y)
+    est = MojoTreesClassifier(n_estimators=5, num_leaves=7).fit(X, y)
     return est, X, y
 
 
@@ -156,7 +156,7 @@ def test_is_dask_collection_needs_no_dask():
 
 
 def test_estimators_construct_and_clone_without_a_cluster():
-    est = mbd.DaskMojoBoostRegressor(num_leaves=9, one_rank_per_worker=False)
+    est = mbd.DaskMojoTreesRegressor(num_leaves=9, one_rank_per_worker=False)
     params = est.get_params()
     assert params["num_leaves"] == 9
     assert params["client"] is None
@@ -421,21 +421,21 @@ def test_registration_rejects_an_unknown_capability():
 
 
 def test_environment_hook_resolves_a_backend(monkeypatch):
-    module = types.ModuleType("fake_mojoboost_backend")
+    module = types.ModuleType("fake_mojotrees_backend")
     module.BACKEND = FakeBackend()
-    monkeypatch.setitem(sys.modules, "fake_mojoboost_backend", module)
+    monkeypatch.setitem(sys.modules, "fake_mojotrees_backend", module)
     monkeypatch.setenv(
-        "MOJOBOOST_DASK_BACKEND", "fake_mojoboost_backend:BACKEND"
+        "MOJOTREES_DASK_BACKEND", "fake_mojotrees_backend:BACKEND"
     )
     assert mbd.get_backend() is module.BACKEND
 
 
 def test_environment_hook_instantiates_a_class(monkeypatch):
-    module = types.ModuleType("fake_mojoboost_backend_cls")
+    module = types.ModuleType("fake_mojotrees_backend_cls")
     module.Backend = FakeBackend
-    monkeypatch.setitem(sys.modules, "fake_mojoboost_backend_cls", module)
+    monkeypatch.setitem(sys.modules, "fake_mojotrees_backend_cls", module)
     monkeypatch.setenv(
-        "MOJOBOOST_DASK_BACKEND", "fake_mojoboost_backend_cls:Backend"
+        "MOJOTREES_DASK_BACKEND", "fake_mojotrees_backend_cls:Backend"
     )
     assert isinstance(mbd.get_backend(), FakeBackend)
 
@@ -444,12 +444,12 @@ def test_environment_hook_instantiates_a_class(monkeypatch):
     "spec, message",
     [
         ("nonsense", "package.module:attribute"),
-        ("mojoboost.dask:no_such_attribute", "no 'no_such_attribute'"),
-        ("mojoboost_not_a_module:x", "cannot be imported"),
+        ("mojotrees.dask:no_such_attribute", "no 'no_such_attribute'"),
+        ("mojotrees_not_a_module:x", "cannot be imported"),
     ],
 )
 def test_environment_hook_reports_a_bad_spec(monkeypatch, spec, message):
-    monkeypatch.setenv("MOJOBOOST_DASK_BACKEND", spec)
+    monkeypatch.setenv("MOJOTREES_DASK_BACKEND", spec)
     with pytest.raises(mbd.DistributedNotAvailable, match=message):
         mbd.get_backend()
 
@@ -513,7 +513,7 @@ def test_take_model_bytes_accepts_a_bytearray():
 
 def test_fit_fails_before_the_cluster_when_no_backend_is_registered():
     runtime = FakeRuntime(fail=True)
-    est = mbd.DaskMojoBoostRegressor()
+    est = mbd.DaskMojoTreesRegressor()
     with pytest.raises(mbd.DistributedNotAvailable):
         est.fit(FakeCollection([]), FakeCollection([]), runtime=runtime)
     assert runtime.calls == []
@@ -531,7 +531,7 @@ def test_regressor_fit_plans_the_world_and_installs_the_model(
         meta(1, worker="tcp://b:1", n_rows=60),
     ]
     runtime = FakeRuntime(parts)
-    est = mbd.DaskMojoBoostRegressor(num_leaves=7, n_estimators=5)
+    est = mbd.DaskMojoTreesRegressor(num_leaves=7, n_estimators=5)
     fitted = est.fit(
         FakeCollection([]), FakeCollection([]), runtime=runtime
     )
@@ -559,7 +559,7 @@ def test_fit_refuses_validation_arguments(local_regressor):
     mbd.register_backend(
         FakeBackend(blob=model_bytes(local), capabilities=("regression",))
     )
-    est = mbd.DaskMojoBoostRegressor()
+    est = mbd.DaskMojoTreesRegressor()
     with pytest.raises(TypeError, match="early_stopping_rounds"):
         est.fit(
             FakeCollection([]),
@@ -575,7 +575,7 @@ def test_fit_asks_for_the_capabilities_the_settings_need(local_regressor):
         blob=model_bytes(local), capabilities=("regression",)
     )
     mbd.register_backend(backend)
-    est = mbd.DaskMojoBoostRegressor(bagging_fraction=0.5)
+    est = mbd.DaskMojoTreesRegressor(bagging_fraction=0.5)
     with pytest.raises(mbd.UnsupportedByBackend, match="bagging"):
         est.fit(
             FakeCollection([]),
@@ -589,7 +589,7 @@ def test_fit_asks_for_quantile_leaf_renewal(local_regressor):
     mbd.register_backend(
         FakeBackend(blob=model_bytes(local), capabilities=("regression",))
     )
-    est = mbd.DaskMojoBoostRegressor(objective="quantile")
+    est = mbd.DaskMojoTreesRegressor(objective="quantile")
     with pytest.raises(mbd.UnsupportedByBackend, match="quantile_l1"):
         est.fit(
             FakeCollection([]),
@@ -603,7 +603,7 @@ def test_fit_asks_for_categorical_support(local_regressor):
     mbd.register_backend(
         FakeBackend(blob=model_bytes(local), capabilities=("regression",))
     )
-    est = mbd.DaskMojoBoostRegressor()
+    est = mbd.DaskMojoTreesRegressor()
     parts = [meta(0, categories=((1, ("x", "y")),))]
     with pytest.raises(mbd.UnsupportedByBackend, match="categorical"):
         est.fit(
@@ -617,7 +617,7 @@ def test_classifier_fit_takes_the_global_class_list(local_binary):
         blob=model_bytes(local), capabilities=("binary",)
     )
     mbd.register_backend(backend)
-    est = mbd.DaskMojoBoostClassifier(n_estimators=5, num_leaves=7)
+    est = mbd.DaskMojoTreesClassifier(n_estimators=5, num_leaves=7)
     est.fit(
         FakeCollection([]),
         FakeCollection([]),
@@ -632,7 +632,7 @@ def test_classifier_fit_takes_the_global_class_list(local_binary):
 
 def test_classifier_fit_rejects_a_degenerate_class_list():
     mbd.register_backend(FakeBackend())
-    est = mbd.DaskMojoBoostClassifier()
+    est = mbd.DaskMojoTreesClassifier()
     with pytest.raises(ValueError, match="at least 2 classes"):
         est.fit(FakeCollection([]), FakeCollection([]), classes=[1])
     with pytest.raises(ValueError, match="repeats"):
@@ -641,7 +641,7 @@ def test_classifier_fit_rejects_a_degenerate_class_list():
 
 def test_classifier_asks_for_multiclass_when_the_labels_say_so():
     mbd.register_backend(FakeBackend(capabilities=("binary",)))
-    est = mbd.DaskMojoBoostClassifier()
+    est = mbd.DaskMojoTreesClassifier()
     with pytest.raises(mbd.UnsupportedByBackend, match="multiclass"):
         est.fit(
             FakeCollection([]),
@@ -660,7 +660,7 @@ def test_classifier_refuses_a_model_with_the_wrong_class_count(
             blob=model_bytes(local), capabilities=("binary", "multiclass")
         )
     )
-    est = mbd.DaskMojoBoostClassifier()
+    est = mbd.DaskMojoTreesClassifier()
     with pytest.raises(mbd.ModelOwnershipError, match="classes"):
         est.fit(
             FakeCollection([]),
@@ -677,7 +677,7 @@ def test_classifier_carries_string_labels_through_a_distributed_fit(
     mbd.register_backend(
         FakeBackend(blob=model_bytes(local), capabilities=("multiclass",))
     )
-    est = mbd.DaskMojoBoostClassifier()
+    est = mbd.DaskMojoTreesClassifier()
     est.fit(
         FakeCollection([]),
         FakeCollection([]),
@@ -693,7 +693,7 @@ def test_classifier_carries_string_labels_through_a_distributed_fit(
 
 def test_ranker_fit_needs_query_ids():
     mbd.register_backend(FakeBackend(capabilities=("ranking",)))
-    est = mbd.DaskMojoBoostRanker()
+    est = mbd.DaskMojoTreesRanker()
     with pytest.raises(ValueError, match="query_ids"):
         est.fit(FakeCollection([]), FakeCollection([]), query_ids=None)
 
@@ -706,7 +706,7 @@ def test_ranker_fit_checks_the_query_partitioning():
         meta(1, worker="tcp://b:1", n_rows=2, group=(2,),
              first_query=1, last_query=1),
     ]
-    est = mbd.DaskMojoBoostRanker()
+    est = mbd.DaskMojoTreesRanker()
     with pytest.raises(mbd.PartitionError, match="spans partitions"):
         est.fit(
             FakeCollection([]),
@@ -720,7 +720,7 @@ def test_ranker_fit_passes_the_ranking_objective():
     gen = np.random.default_rng(9)
     X = gen.random((40, 4))
     y = gen.integers(0, 3, size=40)
-    local = MojoBoostRanker(n_estimators=3, num_leaves=5).fit(
+    local = MojoTreesRanker(n_estimators=3, num_leaves=5).fit(
         X, y, group=[10] * 4
     )
     mbd.register_backend(
@@ -732,7 +732,7 @@ def test_ranker_fit_passes_the_ranking_objective():
         meta(1, worker="tcp://b:1", n_rows=20, group=(10, 10),
              first_query=3, last_query=4),
     ]
-    est = mbd.DaskMojoBoostRanker(n_estimators=3, num_leaves=5)
+    est = mbd.DaskMojoTreesRanker(n_estimators=3, num_leaves=5)
     est.fit(
         FakeCollection([]),
         FakeCollection([]),
@@ -754,7 +754,7 @@ def _fitted_dask_regressor(local, parts=None):
     mbd.register_backend(
         FakeBackend(blob=model_bytes(local), capabilities=("regression",))
     )
-    est = mbd.DaskMojoBoostRegressor()
+    est = mbd.DaskMojoTreesRegressor()
     est.fit(
         FakeCollection([]),
         FakeCollection([]),
@@ -805,7 +805,7 @@ def test_predict_proba_asks_for_a_column_per_class(local_binary):
     mbd.register_backend(
         FakeBackend(blob=model_bytes(local), capabilities=("binary",))
     )
-    est = mbd.DaskMojoBoostClassifier()
+    est = mbd.DaskMojoTreesClassifier()
     runtime = FakeRuntime([meta(0, n_rows=120)])
     est.fit(
         FakeCollection([]), FakeCollection([]), classes=[0, 1],
@@ -817,9 +817,9 @@ def test_predict_proba_asks_for_a_column_per_class(local_binary):
 
 
 def test_prediction_needs_a_fitted_model():
-    from mojoboost import NotFittedError
+    from mojotrees import NotFittedError
 
-    est = mbd.DaskMojoBoostRegressor()
+    est = mbd.DaskMojoTreesRegressor()
     with pytest.raises(NotFittedError):
         est.predict(FakeCollection([np.zeros((2, 4))]))
 
@@ -847,7 +847,7 @@ def test_to_local_returns_a_single_machine_estimator(local_regressor):
     local, X, _ = local_regressor
     est = _fitted_dask_regressor(local)
     plain = est.to_local()
-    assert type(plain) is MojoBoostRegressor
+    assert type(plain) is MojoTreesRegressor
     assert np.allclose(plain.predict(X), local.predict(X))
 
 

@@ -14,17 +14,17 @@ after it:
    anything and the rest of the checks are skipped for that scenario.
 3. Pinning. A real-data row whose bytes were never verified against the
    lock is not a real-data result.
-4. Determinism. mojoboost trains bit-identically on a repeat, on the CPU
+4. Determinism. mojotrees trains bit-identically on a repeat, on the CPU
    and on the accelerator alike. Two repeats with different prediction
    digests fail even when every metric matches.
-5. The differential. mojoboost against LightGBM on the primary metric,
+5. The differential. mojotrees against LightGBM on the primary metric,
    in the direction and by the tolerance thresholds.json gives, plus a
-   check that mojoboost is not implausibly better, which is what a
+   check that mojotrees is not implausibly better, which is what a
    mismatched problem looks like from the outside.
 6. The baseline floor. Each engine separately has to beat the trivial
    model. Two engines that agree because both produced rubbish pass the
    differential check and fail here.
-7. Device agreement. mojoboost on the accelerator against mojoboost on the
+7. Device agreement. mojotrees on the accelerator against mojotrees on the
    CPU, compared row by row on the predictions themselves rather than on a
    summary of them.
 
@@ -220,11 +220,11 @@ def check_differential(ok, config, verdict, skip_scenarios):
         if scenario in skip_scenarios:
             verdict.add(SKIP, "differential", f"{scenario}/t{threads}", "inputs did not agree")
             continue
-        mine = by_engine.get(("mojoboost", "cpu"))
+        mine = by_engine.get(("mojotrees", "cpu"))
         theirs = by_engine.get(("lightgbm", "cpu"))
         scope = f"{scenario}/t{threads}"
         if not mine or not theirs:
-            verdict.add(SKIP, "differential", scope, "no mojoboost and lightgbm cpu pair")
+            verdict.add(SKIP, "differential", scope, "no mojotrees and lightgbm cpu pair")
             continue
         a, b = _representative(mine), _representative(theirs)
         rules = scenario_rules(config, a)
@@ -243,7 +243,7 @@ def check_differential(ok, config, verdict, skip_scenarios):
             worse = _worse_by(name, got, want, spec["kind"])
             unit = "x" if spec["kind"] == "relative" else ""
             detail = (
-                f"mojoboost {got:.6g} vs lightgbm {want:.6g}, "
+                f"mojotrees {got:.6g} vs lightgbm {want:.6g}, "
                 f"{'worse' if worse > 0 else 'better'} by {abs(worse):.4g}{unit} "
                 f"(limit {spec['max_worse']}{unit})"
             )
@@ -308,7 +308,7 @@ def check_device_agreement(ok, config, verdict, run_dir):
     rule = config["defaults"]["device_agreement"]
     cells = {}
     for record in ok:
-        if record["engine"] != "mojoboost":
+        if record["engine"] != "mojotrees":
             continue
         device = record.get("device_used") or record.get("device_requested")
         cells.setdefault((record["scenario"], record["threads"]), {})[device] = record

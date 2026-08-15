@@ -1,7 +1,7 @@
 DESTINATION: Reddit r/ClaudeAI project showcase thread, or a separate personal post about the development process
 TITLE: I used parallel Claude Code sessions to build a native Mojo gradient-boosted tree library
 
-I have been using parallel Claude Code sessions to help build MojoBoost, an open-source gradient-boosted tree library written natively in Mojo.
+I have been using parallel Claude Code sessions to help build MojoTrees, an open-source gradient-boosted tree library written natively in Mojo.
 
 The repository is now substantial and covers dense and sparse training, CPU and GPU tree growth, categorical and missing-value handling, regression, classification, ranking, callbacks, serialization, Python estimators, and model explanations.
 
@@ -11,6 +11,6 @@ I now require each workstream to run only its smallest focused test and a whites
 
 The project is an experimental public alpha and I am not presenting AI-generated volume as proof of correctness. The repository has explicit parity and GPU-validation documents so claims can be tied to tests and hardware evidence.
 
-Repository: https://github.com/mojoboost-ml/mojoboost
+Repository: https://github.com/mojotrees/mojotrees
 
 I would be interested in hearing from others who have managed genuinely parallel coding agents on one evolving systems project, especially around merge boundaries, test budgeting, and independent verification.

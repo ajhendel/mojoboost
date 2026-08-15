@@ -180,7 +180,7 @@ note = "Adding split_gains to the bindings flips has_split_gain in every dump, w
 paths = ["handoffs/connect_12_dataset_cv.md", "handoffs/task15_cv.md"]
 jobs = ["python:cv", "native:trainset"]
 escalate = ["native:continued", "broad:estimators", "static:parity"]
-note = "static:parity because exporting cv from mojoboost.__all__ fires the Dask watch in check_parity.py and moves several contract rows at once."
+note = "static:parity because exporting cv from mojotrees.__all__ fires the Dask watch in check_parity.py and moves several contract rows at once."
 
 [[handoff]]
 paths = ["handoffs/connect_17_alternate_boosting.md", "handoffs/remaining_01_dart.md"]
@@ -305,7 +305,7 @@ note = "This lane. The planner has never been run; --self-check is the first thi
 [[lane]]
 id = "remaining-01-dart"
 path = "handoffs/remaining_01_dart.md"
-owns = ["src/mojoboost/boosting_dart.mojo", "docs/DART.md"]
+owns = ["src/mojotrees/boosting_dart.mojo", "docs/DART.md"]
 jobs = ["native:compile-package"]
 escalate = ["native:core", "native:serialize"]
 note = "Dropout changes which trees exist at prediction time, so serialization is in the escalation."
@@ -313,14 +313,14 @@ note = "Dropout changes which trees exist at prediction time, so serialization i
 [[lane]]
 id = "remaining-02-rf"
 path = "handoffs/remaining_02_rf.md"
-owns = ["src/mojoboost/boosting_rf.mojo", "docs/RANDOM_FOREST_MODE.md"]
+owns = ["src/mojotrees/boosting_rf.mojo", "docs/RANDOM_FOREST_MODE.md"]
 jobs = ["native:compile-package"]
 escalate = ["native:core", "native:bagging"]
 
 [[lane]]
 id = "remaining-03-linear-trees"
 path = "handoffs/remaining_03_linear_trees.md"
-owns = ["src/mojoboost/linear_tree.mojo", "docs/LINEAR_TREES.md"]
+owns = ["src/mojotrees/linear_tree.mojo", "docs/LINEAR_TREES.md"]
 jobs = ["native:compile-package"]
 escalate = ["native:serialize", "native:contrib", "native:core"]
 note = "A leaf that holds a linear model changes the model format and what a contribution means. Both escalations are load-bearing."
@@ -328,21 +328,21 @@ note = "A leaf that holds a linear model changes the model format and what a con
 [[lane]]
 id = "remaining-04-cegb"
 path = "handoffs/remaining_04_cegb.md"
-owns = ["src/mojoboost/cegb.mojo", "docs/CEGB.md"]
+owns = ["src/mojotrees/cegb.mojo", "docs/CEGB.md"]
 jobs = ["native:compile-package"]
 escalate = ["native:tree-parameters-extra", "native:core"]
 
 [[lane]]
 id = "remaining-05-ranking"
 path = "handoffs/remaining_05_ranking.md"
-owns = ["src/mojoboost/ranking_advanced.mojo", "docs/RANKING_ADVANCED.md"]
+owns = ["src/mojotrees/ranking_advanced.mojo", "docs/RANKING_ADVANCED.md"]
 jobs = ["native:ranking", "native:metrics"]
 escalate = ["broad:lightgbm-compare"]
 
 [[lane]]
 id = "remaining-06-quantized-gradients"
 path = "handoffs/remaining_06_quantized_gradients.md"
-owns = ["src/mojoboost/quantized_gradient.mojo", "docs/QUANTIZED_GRADIENTS.md"]
+owns = ["src/mojotrees/quantized_gradient.mojo", "docs/QUANTIZED_GRADIENTS.md"]
 jobs = ["native:compile-package"]
 escalate = ["native:histogram-reference", "differential:backend-equivalence"]
 note = "Quantized accumulation is a numerics change. native:histogram-reference is the job that compares an optimized path against its definition."
@@ -350,14 +350,14 @@ note = "Quantized accumulation is a numerics change. native:histogram-reference 
 [[lane]]
 id = "remaining-07-external-memory"
 path = "handoffs/remaining_07_external_memory.md"
-owns = ["src/mojoboost/external_memory.mojo", "src/mojoboost/sequence.mojo", "docs/EXTERNAL_MEMORY.md"]
+owns = ["src/mojotrees/external_memory.mojo", "src/mojotrees/sequence.mojo", "docs/EXTERNAL_MEMORY.md"]
 jobs = ["native:compile-package"]
 escalate = ["native:trainset", "native:kernels", "python:no-numpy"]
 
 [[lane]]
 id = "remaining-08-model-editing"
 path = "handoffs/remaining_08_model_editing.md"
-owns = ["src/mojoboost/model_editing.mojo", "docs/MODEL_EDITING.md"]
+owns = ["src/mojotrees/model_editing.mojo", "docs/MODEL_EDITING.md"]
 jobs = ["native:compile-package"]
 escalate = ["native:serialize", "python:inspection", "static:parity"]
 note = "refit, rollback, and the bounds are five watched rows in check_parity.py. Landing any of them without editing the contract fails static:parity, which is the check working."
@@ -365,14 +365,14 @@ note = "refit, rollback, and the bounds are five watched rows in check_parity.py
 [[lane]]
 id = "remaining-09-distributed-strategies"
 path = "handoffs/remaining_09_distributed_strategies.md"
-owns = ["src/mojoboost/distributed_strategies.mojo", "src/mojoboost/distributed_gpu.mojo"]
+owns = ["src/mojotrees/distributed_strategies.mojo", "src/mojotrees/distributed_gpu.mojo"]
 jobs = ["distributed:in-process", "distributed:transport"]
 escalate = ["distributed:two-process", "differential:gpu-training"]
 
 [[lane]]
 id = "remaining-10-ecosystem-inputs"
 path = "handoffs/remaining_10_ecosystem_inputs.md"
-owns = ["python/mojoboost/_arrow.py", "python/mojoboost/_polars.py", "python/mojoboost/_sequence.py"]
+owns = ["python/mojotrees/_arrow.py", "python/mojotrees/_polars.py", "python/mojotrees/_sequence.py"]
 jobs = ["python:validation", "python:no-numpy"]
 escalate = ["python:basic", "broad:estimators"]
 note = "pyarrow and polars are already in the pytest environment, so these tests will not skip themselves the way the scipy ones do."
@@ -380,7 +380,7 @@ note = "pyarrow and polars are already in the pytest environment, so these tests
 [[lane]]
 id = "remaining-11-gpu-backends"
 path = "handoffs/remaining_11_gpu_backends.md"
-owns = ["src/mojoboost/gpu_cuda_policy.mojo", "src/mojoboost/gpu_amd_policy.mojo"]
+owns = ["src/mojotrees/gpu_cuda_policy.mojo", "src/mojotrees/gpu_amd_policy.mojo"]
 jobs = ["differential:gpu-portability", "native:compile-package"]
 escalate = ["hardware:gpu-suites", "hardware:capture-nvidia", "hardware:capture-amd"]
 note = "Neither vendor's device exists in this project's CI or on the development machine. The hardware escalations are the only evidence that would ever exist for this lane."
@@ -388,7 +388,7 @@ note = "Neither vendor's device exists in this project's CI or on the developmen
 [[lane]]
 id = "remaining-12-validation"
 path = "handoffs/remaining_12_validation.md"
-owns = ["src/mojoboost/validation.mojo", "python/mojoboost/_validation.py"]
+owns = ["src/mojotrees/validation.mojo", "python/mojotrees/_validation.py"]
 jobs = ["python:validation", "native:core"]
 escalate = ["broad:estimators", "broad:full-suite"]
 note = "A central validation layer changes what raises, which is the one kind of change that can break every suite at once."

@@ -1,4 +1,4 @@
-# Five minutes with mojoboost on Apple Silicon
+# Five minutes with mojotrees on Apple Silicon
 
 **Native gradient-boosted trees accelerated by the GPU already inside every
 Apple Silicon Mac.**
@@ -6,7 +6,7 @@ Apple Silicon Mac.**
 ### Read this before you quote that line
 
 That headline is the goal of the Apple Silicon work, and part of it is real
-today. mojoboost trains a complete model on the Metal GPU through
+today. mojotrees trains a complete model on the Metal GPU through
 `device="gpu"`, with device resident tree growth and bit deterministic
 histograms. What is not established is the acceleration. The only end to end
 Apple measurement in this repository (Apple M4, `bench/bench_train_gpu.mojo`)
@@ -53,7 +53,7 @@ xcodebuild -downloadComponent MetalToolchain
 ### Placeholder, not published yet
 
 ```sh
-pip install mojoboost          # PLACEHOLDER. Not on PyPI. Do not run.
+pip install mojotrees          # PLACEHOLDER. Not on PyPI. Do not run.
 ```
 
 The package is not published. The name is not reserved, no release exists,
@@ -63,7 +63,7 @@ block becomes real at the first release, and not before.
 ### Placeholder, a wheel exists but is not distributed
 
 ```sh
-pip install mojoboost-0.1.0-cp314-cp314-macosx_26_0_arm64.whl   # PLACEHOLDER
+pip install mojotrees-0.1.0-cp314-cp314-macosx_26_0_arm64.whl   # PLACEHOLDER
 ```
 
 `pixi run build-wheel` really does build a self contained arm64 wheel with
@@ -74,8 +74,8 @@ this is a placeholder for a release asset that does not exist yet.
 ### Works today, from source
 
 ```sh
-git clone https://github.com/mojoboost-ml/mojoboost.git
-cd mojoboost
+git clone https://github.com/mojotrees/mojotrees.git
+cd mojotrees
 pixi install
 pixi run build-python
 PYTHONPATH=python python examples/apple_silicon/five_minute_tour.py
@@ -86,13 +86,13 @@ PYTHONPATH=python python examples/apple_silicon/five_minute_tour.py
 ## Step 1. Does this build have a GPU
 
 ```python
-import mojoboost
+import mojotrees
 
-mojoboost.gpu_available()
+mojotrees.gpu_available()
 ```
 
 `True` means an accelerator was present when the extension was compiled and
-`MOJOBOOST_DISABLE_GPU=1` is not set. Two things about that answer are worth
+`MOJOTREES_DISABLE_GPU=1` is not set. Two things about that answer are worth
 knowing before you rely on it.
 
 It is a property of the build and not of the machine. Mojo resolves
@@ -101,16 +101,16 @@ reports one wherever it is installed. On a redistributed build the mismatch
 surfaces when the device is actually opened rather than when the request is
 resolved.
 
-It is also the switch for pinning a mixed fleet. `MOJOBOOST_DISABLE_GPU=1`
+It is also the switch for pinning a mixed fleet. `MOJOTREES_DISABLE_GPU=1`
 makes this build report no accelerator at all, so `device="gpu"` raises and
 `device="auto"` chooses the CPU on a machine that does have one.
 
 ## Step 2. `device="auto"`
 
 ```python
-from mojoboost import MojoBoostRegressor
+from mojotrees import MojoTreesRegressor
 
-model = MojoBoostRegressor(n_estimators=100, device="auto").fit(X, y)
+model = MojoTreesRegressor(n_estimators=100, device="auto").fit(X, y)
 model.device_          # the backend that actually ran
 ```
 
@@ -122,7 +122,7 @@ Fitting records the backend that ran on `device_`.
 workloads to the GPU is disabled by default, because no measurement on any
 device has established a shape where the GPU trainer wins and a shipped
 crossover threshold would be a performance claim with nothing behind it. To
-run the experiment that would justify one, set `MOJOBOOST_AUTO_MIN_CELLS` to
+run the experiment that would justify one, set `MOJOTREES_AUTO_MIN_CELLS` to
 a number of cells (`n_rows * n_features`) at or above which `auto` should
 pick the GPU. `0` means whenever the GPU path covers the workload.
 
@@ -133,7 +133,7 @@ behind your back.
 ## Step 3. Validation and early stopping
 
 ```python
-model = MojoBoostRegressor(n_estimators=300, learning_rate=0.05, device="cpu")
+model = MojoTreesRegressor(n_estimators=300, learning_rate=0.05, device="cpu")
 model.fit(
     X_train, y_train,
     eval_set=[(X_valid, y_valid)],
@@ -145,7 +145,7 @@ model.n_iter_, model.best_iteration_, model.best_score_, model.stopped_early_
 model.evals_result_["holdout"]["l2"]
 ```
 
-Metric names are LightGBM's and are computed by `src/mojoboost/metrics.mojo`,
+Metric names are LightGBM's and are computed by `src/mojotrees/metrics.mojo`,
 so they agree with the Mojo API by construction. `evals_result_[set][metric][i]`
 is the score after `i` trees, so index `0` is the base score alone.
 
@@ -176,7 +176,7 @@ model.predict(X_valid, device="gpu")     # NOT IMPLEMENTED
 ## Step 5. Why that device
 
 The tour prints the inputs that decide the backend, in the vocabulary of
-`src/mojoboost/device.mojo`.
+`src/mojotrees/device.mojo`.
 
 | Value | Meaning |
 | --- | --- |
@@ -194,7 +194,7 @@ explanation, with the crossover rules it applied and the reason for the
 answer, is separate work.
 
 ```python
-from mojoboost import explain_device_choice     # NOT IMPLEMENTED
+from mojotrees import explain_device_choice     # NOT IMPLEMENTED
 report = explain_device_choice(X)               # NOT IMPLEMENTED
 ```
 
@@ -202,11 +202,11 @@ report = explain_device_choice(X)               # NOT IMPLEMENTED
 
 ```python
 model.save("model.mbst")
-restored = MojoBoostRegressor.load("model.mbst")
+restored = MojoTreesRegressor.load("model.mbst")
 restored.predict(X_valid)        # identical to the original, bit for bit
 ```
 
-The file holds the model and not the estimator, in mojoboost's versioned text
+The file holds the model and not the estimator, in mojotrees's versioned text
 format. Hyperparameters, feature names, split gains, and the training device
 do not travel with it, and a loaded estimator has no `device_` for that
 reason. The trained ensemble is the same whichever backend produced it.
@@ -283,7 +283,7 @@ when you want the dependable path.
 ### I want the CPU on a machine that has a GPU
 
 ```sh
-export MOJOBOOST_DISABLE_GPU=1
+export MOJOTREES_DISABLE_GPU=1
 ```
 
 This build then reports no accelerator at all. It is also how the unavailable
@@ -291,9 +291,9 @@ GPU path gets exercised in tests.
 
 ### The CPU path feels single threaded
 
-`MOJOBOOST_NUM_WORKERS` controls it. `1` forces serial, `N > 1` forces the
+`MOJOTREES_NUM_WORKERS` controls it. `1` forces serial, `N > 1` forces the
 work into at most that many chunks whatever its size, and `0` or unset means
-automatic. `MOJOBOOST_PARALLEL_MIN_OPS` overrides the amount of work below
+automatic. `MOJOTREES_PARALLEL_MIN_OPS` overrides the amount of work below
 which the automatic path stays serial. Both reach every parallel dispatch in
 the library, which is binning, histogram accumulation, gradient generation,
 row partitioning, and prediction.
@@ -303,9 +303,9 @@ independent of the task count, so output is bit identical to the serial path
 at every worker setting. They are for reproducible benchmarking and for
 pinning a machine, not for tuning accuracy.
 
-### `ModuleNotFoundError: mojoboost`
+### `ModuleNotFoundError: mojotrees`
 
-The extension module is built into `python/mojoboost`, so a source checkout
+The extension module is built into `python/mojotrees`, so a source checkout
 needs `pixi run build-python` and `PYTHONPATH=python`. From an installed
 wheel neither is needed, and running from inside the checkout root can
 shadow the installed package.
@@ -323,10 +323,10 @@ work when they are present.
 
 | Shown as a placeholder | State |
 | --- | --- |
-| `pip install mojoboost` | Not published. No PyPI release, no downloadable wheel. |
+| `pip install mojotrees` | Not published. No PyPI release, no downloadable wheel. |
 | `predict(..., device="gpu")` | Not implemented. Prediction is CPU only. |
 | `explain_device_choice(X)` | Not implemented. |
-| `device="auto"` choosing the GPU | Implemented but disabled. Needs `MOJOBOOST_AUTO_MIN_CELLS`, and a measured crossover before any default changes. |
+| `device="auto"` choosing the GPU | Implemented but disabled. Needs `MOJOTREES_AUTO_MIN_CELLS`, and a measured crossover before any default changes. |
 | Early stopping with `device="gpu"` | Raises. Validation is scored on the CPU. |
 | Multiclass on the GPU | Raises. One tree per class per round is CPU only. |
 | Sparse input on the GPU | Raises. There is no sparse GPU kernel. |

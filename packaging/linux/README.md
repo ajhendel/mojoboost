@@ -23,7 +23,7 @@ Related, and owned elsewhere:
 
 | File | What it does |
 | --- | --- |
-| [`packaging/matrix/platform_matrix.toml`](../matrix/platform_matrix.toml) | Four Linux target rows, all `designed`: `linux-{x86_64,aarch64}-cp314` are the plain-tag wheels this builder produces by default and are `publishable = false`; the two `-manylinux` rows are the same builder with `MOJOBOOST_TAG_POLICY=manylinux` and are gated on a measured glibc floor |
+| [`packaging/matrix/platform_matrix.toml`](../matrix/platform_matrix.toml) | Four Linux target rows, all `designed`: `linux-{x86_64,aarch64}-cp314` are the plain-tag wheels this builder produces by default and are `publishable = false`; the two `-manylinux` rows are the same builder with `MOJOTREES_TAG_POLICY=manylinux` and are gated on a measured glibc floor |
 | [`packaging/matrix/smoke/clean_install_linux.sh`](../matrix/smoke/clean_install_linux.sh) | The clean-install acceptance fixture. This directory produces the wheel it is waiting for |
 | [`packaging/matrix/validate_artifact.py`](../matrix/validate_artifact.py) | Matrix conformance for a built wheel. Its ELF branch is a byte scan and says so; `inspect_wheel.py` here is the dynamic-section parse it defers to |
 | [`packaging/build_wheel.sh`](../build_wheel.sh) | The macOS builder. Not portable, see below |
@@ -53,7 +53,7 @@ Do not let the first sentence be used as evidence for the second one.
 
 ## Why the macOS builder does not port
 
-`packaging/build_wheel.sh` copies four MAX dylibs into `python/mojoboost/.dylibs`,
+`packaging/build_wheel.sh` copies four MAX dylibs into `python/mojotrees/.dylibs`,
 rewrites the extension's `LC_RPATH` with `install_name_tool`, and re-signs
 everything with `codesign`. None of those three steps has a Linux equivalent
 that is a flag away:
@@ -81,7 +81,7 @@ architecture, no promise about the distribution". Consequences, both intended:
 
 - PyPI and TestPyPI **reject** these tags on upload. There is no way to publish
   an unaudited Linux wheel to an index by accident.
-- `pip install ./mojoboost-...-linux_x86_64.whl` from a local file or a GitHub
+- `pip install ./mojotrees-...-linux_x86_64.whl` from a local file or a GitHub
   release asset works normally.
 
 So stage 0 artifacts are distributed as GitHub release assets, and only to people
@@ -142,7 +142,7 @@ problem `gpu-validation.yml` already has: a job that cannot run until someone
 registers a runner.
 
 **Whichever host is used, it must have no accelerator visible.**
-`has_accelerator()` in `src/mojoboost/device.mojo` resolves at compile time, so a
+`has_accelerator()` in `src/mojotrees/device.mojo` resolves at compile time, so a
 wheel built on a machine with a working CUDA or ROCm stack ships a different
 product under the same filename: it reports a GPU as available and then fails
 when the device is opened. This is recorded in the provenance sidecar as
@@ -152,21 +152,21 @@ file for Linux.
 ## What goes inside the wheel
 
 ```
-mojoboost/
+mojotrees/
     __init__.py, estimator modules, ...
-    _mojoboost.so             the Mojo-built extension, RUNPATH $ORIGIN/.libs
+    _mojotrees.so             the Mojo-built extension, RUNPATH $ORIGIN/.libs
     .libs/
         lib*.so*              the MAX runtime closure, RUNPATH $ORIGIN
-mojoboost-0.1.0.dist-info/
+mojotrees-0.1.0.dist-info/
     METADATA, WHEEL, RECORD, licenses/LICENSE
 ```
 
-`.libs/` rather than auditwheel's `mojoboost.libs/` because
+`.libs/` rather than auditwheel's `mojotrees.libs/` because
 `clean_install_linux.sh` already looks in both and `.libs/` sits inside the
 package, which keeps the `$ORIGIN` relationship trivial. Bundled libraries are
 **not** renamed with a content hash. auditwheel does that to prevent two
 independently vendored copies of the same soname from colliding in one process.
-mojoboost bundles one proprietary runtime that nothing else on PyPI vendors, so
+mojotrees bundles one proprietary runtime that nothing else on PyPI vendors, so
 the hash suffix would buy nothing and cost the ability to compare two wheels
 byte for byte. Revisit if a second package ever ships the MAX runtime.
 

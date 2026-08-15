@@ -87,7 +87,7 @@ def check_package_data(data: dict, rep: Report) -> None:
         data.get("tool", {})
         .get("setuptools", {})
         .get("package-data", {})
-        .get("mojoboost", [])
+        .get("mojotrees", [])
     )
     uncovered = [
         staged
@@ -106,7 +106,7 @@ appear as an ImportError on a user's machine, not here. Required edit, in
 python/pyproject.toml (Task 01 owns this file):
 
     [tool.setuptools.package-data]
-    mojoboost = ["*.so", ".dylibs/*.dylib", ".libs/*.so", ".libs/*.so.*"]
+    mojotrees = ["*.so", ".dylibs/*.dylib", ".libs/*.so", ".libs/*.so.*"]
 
 Both .libs patterns are needed: sonames carry version suffixes and "*.so" does
 not match "libfoo.so.1".

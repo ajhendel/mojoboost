@@ -5,7 +5,7 @@ hardware fact, it is not in dispute, and it is also not, by itself, a reason
 to change a single line of `histogram_gpu.mojo`.
 
 What would be a reason is a different statement: that a route MAX and Mojo
-actually expose lets mojoboost hand the GPU a buffer the CPU already filled,
+actually expose lets mojotrees hand the GPU a buffer the CPU already filled,
 with no second copy and no second resident allocation, and get the right
 answer back. That statement is unproven here. This document is the experiment
 that would settle it, the rules for running it honestly, the policy seam that
@@ -31,7 +31,7 @@ included, is a measurement of unified-memory behavior or a performance claim
 of any kind. Every cell above stays **none** until someone runs the protocol
 below and pastes real output into the record section at the end.
 
-`src/mojoboost/unified_memory_policy.mojo` encodes the same emptiness in code:
+`src/mojotrees/unified_memory_policy.mojo` encodes the same emptiness in code:
 `EvidenceLedger.installed()` reports `none` for every route, and the shipped
 default is the staged copy for every buffer in the system.
 
@@ -44,7 +44,7 @@ everywhere else in the repository.
 True on Apple silicon by construction. It costs nothing to say and it implies
 nothing about any particular API.
 
-**Claim 2, no duplication for our data.** The specific buffer mojoboost fills
+**Claim 2, no duplication for our data.** The specific buffer mojotrees fills
 on the host is the same physical bytes the kernel reads, with no staging
 allocation, no blit, and no page migration on first device touch.
 
@@ -58,7 +58,7 @@ only way to know is to measure it.
 There is a third statement that sits between them and is the one this
 experiment can actually produce on its own:
 
-**Claim 1.5, mojoboost issued no copy.** No `enqueue_copy` was called for this
+**Claim 1.5, mojotrees issued no copy.** No `enqueue_copy` was called for this
 payload. This is a fact about our source code. It is reported as
 `copy_bytes_issued_total: 0` and it is *not* evidence for Claim 2: the runtime
 may still migrate pages, blit behind an enqueue, or hold two physical copies,
@@ -169,9 +169,9 @@ policy module refuses this route for `ROLE_HIST_OUT` structurally
 (`BLOCK_DEVICE_WRITTEN_ATOMICS`) until the driver answers it, and why the
 checksum gate is load-bearing on this route in a way it is not elsewhere.
 
-### Modes: which of mojoboost's two transfer shapes is being modeled
+### Modes: which of mojotrees's two transfer shapes is being modeled
 
-`MOJOBOOST_UM_MODE` picks one. They ask different questions and both are worth
+`MOJOTREES_UM_MODE` picks one. They ask different questions and both are worth
 asking; neither is a variation on the other.
 
 - `rewrite` (default) rewrites the whole payload every round. This is the
@@ -197,7 +197,7 @@ copy. **Run `rewrite` first.** A `resident` run alone is not a substitute.
 
 ### Holding a second resident buffer
 
-`MOJOBOOST_UM_HOLD_MIB` allocates a device-resident buffer of that size,
+`MOJOTREES_UM_HOLD_MIB` allocates a device-resident buffer of that size,
 writes it once so it is genuinely committed rather than merely requested, and
 holds it for the whole run. It models a validation matrix a session keeps
 resident while it trains, which is a real configuration (`ROLE_VALID_BINS`) and
@@ -304,7 +304,7 @@ round total instead. A near-zero `sync_ns` under contention is therefore not
 evidence that the device was unaffected.
 
 Because of that, the contention question can only be answered by comparing two
-whole runs, one with `MOJOBOOST_UM_CONTEND=1` and one without, on the same
+whole runs, one with `MOJOTREES_UM_CONTEND=1` and one without, on the same
 payload size and in the same mode. Read `round_mean_ns` and `kernel_ns +
 sync_ns` across the pair. Never read contention out of a single run.
 
@@ -332,7 +332,7 @@ buffer I write next" are two questions, and `sync_contract` answers them
 per route family rather than deriving both from one flag.
 
 Those obligations are written down in
-`src/mojoboost/unified_memory_policy.mojo` as `SyncContract`, returned with
+`src/mojotrees/unified_memory_policy.mojo` as `SyncContract`, returned with
 every route decision so the two cannot be separated, and the consequences for
 `StagingRing` are in the handoff.
 
@@ -409,14 +409,14 @@ state is part of the procedure, not a footnote.
 7. **Repeat each configuration three times**, as three separate process
    launches, and report the spread. A single run of a memory experiment on a
    general-purpose OS is an anecdote.
-8. **Contention.** Run the full set twice, once with `MOJOBOOST_UM_CONTEND=1`.
+8. **Contention.** Run the full set twice, once with `MOJOTREES_UM_CONTEND=1`.
    Report the two side by side. Do not mix them.
-9. **Resident hold, once.** One set with `MOJOBOOST_UM_HOLD_MIB` at a realistic
+9. **Resident hold, once.** One set with `MOJOTREES_UM_HOLD_MIB` at a realistic
    validation-matrix size, to see what a resident second matrix does to the
    rest. Report it as its own configuration, never merged into the others.
-10. **Ladder last, and deliberately.** `MOJOBOOST_UM_LADDER=1` doubles the
+10. **Ladder last, and deliberately.** `MOJOTREES_UM_LADDER=1` doubles the
     payload until a route fails or per-byte round time regresses past
-    `MOJOBOOST_UM_LADDER_PCT` (default 200) percent of the smallest size's.
+    `MOJOTREES_UM_LADDER_PCT` (default 200) percent of the smallest size's.
     This is the mode that can push a machine into the compressor and into swap.
     Run it alone, on an idle machine, with the `vm_stat` capture bracketing it,
     and treat its answer as a property of that machine in that memory state.
@@ -432,20 +432,20 @@ after.
 |---|---|---|
 | `host_direct` status `unsupported` | "This Mojo version does not accept a host-buffer pointer as a kernel argument." | Anything about Apple hardware. |
 | `host_direct` status `wrong` | "The pointer is accepted but the device does not see host writes through it." Record the message; this is a correctness trap worth documenting loudly. | Nothing else. Do not report its timings. |
-| `host_direct` status `ok`, `copy_bytes_issued_total` zero | Claim 1.5: "The device read the correct bytes with no copy issued by mojoboost." | **Not** Claim 2. The runtime may have migrated pages or blitted behind the enqueue. |
+| `host_direct` status `ok`, `copy_bytes_issued_total` zero | Claim 1.5: "The device read the correct bytes with no copy issued by mojotrees." | **Not** Claim 2. The runtime may have migrated pages or blitted behind the enqueue. |
 | The above, plus peak RSS showing one payload-sized allocation, not two, with no compressor or swap movement | Strong evidence for Claim 2. | Still not proof on its own; pair it with the trace. |
 | The above, plus a Metal System Trace with no blit encoder between write and kernel | This is the evidence. Claim 2 is now earned, for this Mojo version, this OS, and this chip. | Any other chip, OS, or Mojo version. Say which one it was measured on. |
 | `map_write` `publish_ns` near zero and `sync_ns` unchanged from baseline | The block exit is cheap here. | That no copy happened. Cheap is not free and free is not absent. |
 | `out_host_direct` status `wrong` | "A global integer atomic against host-visible memory does not produce the right answer here." This is the most valuable negative result available and it closes the histogram-output question outright. | Anything about the input direction. |
 | `out_host_direct` status `ok` and a lower `round_mean_ns` than `copy_staged` | That skipping the readback copy and one of the two drains was cheaper *in this driver*. | That the histogram download is safe to move. The driver's accumulator is four bytes; a real histogram is `3 * n_features * n_bins`, contended by many more threads. |
 | `round0_over_steady` near 1.0 | First touch cost nothing measurable at this size. | That there is no page migration; it may simply be small relative to the write. |
-| `round0_over_steady` large | Something one-time and expensive happens on first touch. Worth chasing, since mojoboost uploads the binned matrix exactly once per session. | Which of allocation, fault, or migration it was. That needs the trace. |
+| `round0_over_steady` large | Something one-time and expensive happens on first touch. Worth chasing, since mojotrees uploads the binned matrix exactly once per session. | Which of allocation, fault, or migration it was. That needs the trace. |
 | `retouch_over_steady` near 1.0 in `resident` mode | A host write to settled memory costs nothing measurable on this route. | That nothing moved; a small payload write can hide a page migration. |
 | `retouch_over_steady` large in `resident` mode | The CPU-writes-after-GPU-reads transition is expensive on this route, which matters directly for gradients, which pay it every round. | Which mechanism it was. Trace it. |
-| Any route faster than `copy_staged` | That route was faster **in this driver, on this payload, on this machine, at this drain count**. | That mojoboost would get faster. See below. |
+| Any route faster than `copy_staged` | That route was faster **in this driver, on this payload, on this machine, at this drain count**. | That mojotrees would get faster. See below. |
 
 That last row is the one most likely to be over-read, so it gets stated
-plainly. This driver measures a transfer under a synthetic consumer. mojoboost
+plainly. This driver measures a transfer under a synthetic consumer. mojotrees
 training moves a binned matrix once per session, gradients once per round, and
 a histogram once per node, and the current end-to-end GPU measurement on an M4
 is *slower* than the CPU trainer, with per-node kernel launches and
@@ -457,7 +457,7 @@ rung.
 
 ## The policy seam
 
-`src/mojoboost/unified_memory_policy.mojo` is where a result would eventually
+`src/mojotrees/unified_memory_policy.mojo` is where a result would eventually
 be acted on. It is a pure policy layer, in the shape of `apple_gpu_policy.mojo`:
 no device, no allocation, no pointer, so all of it is testable on a machine
 with no accelerator. It answers one question per buffer role, and it answers
@@ -506,7 +506,7 @@ The three duplication shapes are recorded in the policy module so nobody has to
 re-derive them: `training_bins_duplication()` and `validation_bins_duplication()`
 are two copies each (caller list plus device buffer, no staging), and
 `batch_scoring_bins_duplication()` is three. A fit that also scores a held-out
-set holds the first two at once, which is what `MOJOBOOST_UM_HOLD_MIB` models.
+set holds the first two at once, which is what `MOJOTREES_UM_HOLD_MIB` models.
 
 ### The evidence ladder
 
@@ -518,13 +518,13 @@ evidence about a route that has not been shown correct counts for nothing.
 | `none` | the state of every route in this repository |
 | `compiled` | the route compiles in this Mojo version |
 | `checksum` | the device read or wrote the right bytes, round after round |
-| `no_copy_issued` | mojoboost enqueued no copy. Claim 1.5 |
+| `no_copy_issued` | mojotrees enqueued no copy. Claim 1.5 |
 | `no_second_allocation` | the external capture shows one payload-sized resident allocation, no compressor or swap movement |
 | `no_blit` | a Metal System Trace shows no blit encoder between the host write and the kernel. Claim 2 |
 | `trainer` | `bench/bench_train_gpu.mojo` on the route beats the same benchmark on `copy_staged`, repeated, with identical models out |
 
 `ENABLE_LEVEL` is `trainer`. A route below it is refused unless
-`MOJOBOOST_GPU_TRANSFER_UNPROVEN=1` is set, and a decision taken that way
+`MOJOTREES_GPU_TRANSFER_UNPROVEN=1` is set, and a decision taken that way
 carries `ack_unproven`, which any number measured under it must be reported
 with. The override exists because the top rung cannot be climbed without
 running the trainer on the route, so without it the gate would be
@@ -535,8 +535,8 @@ default.
 
 | Variable | Effect |
 |---|---|
-| `MOJOBOOST_GPU_TRANSFER` | `staged` (default), `direct`, `mapped`, `host_direct`, `wrapped`. An unparsable value raises rather than falling back, as `device.mojo` does for an impossible `gpu` request |
-| `MOJOBOOST_GPU_TRANSFER_UNPROVEN=1` | run a route that has not earned `ENABLE_LEVEL`, and mark every decision it produces |
+| `MOJOTREES_GPU_TRANSFER` | `staged` (default), `direct`, `mapped`, `host_direct`, `wrapped`. An unparsable value raises rather than falling back, as `device.mojo` does for an impossible `gpu` request |
+| `MOJOTREES_GPU_TRANSFER_UNPROVEN=1` | run a route that has not earned `ENABLE_LEVEL`, and mark every decision it produces |
 
 Two entry points, deliberately different. `resolve_route` (and
 `resolve_from_env`) is for code that is about to allocate: it raises when the
@@ -591,12 +591,12 @@ Defaults are 256 MiB and 8 rounds.
 
 | Variable | Effect |
 |---|---|
-| `MOJOBOOST_UM_MODE` | `rewrite` (default) or `resident` |
-| `MOJOBOOST_UM_CONTEND=1` | host mutates an unrelated payload-sized buffer inside the launch window |
-| `MOJOBOOST_UM_HOLD_MIB` | hold a device-resident buffer of this size for the whole run; default 0 |
-| `MOJOBOOST_UM_LADDER=1` | run the size ladder after the fixed-size run |
-| `MOJOBOOST_UM_LADDER_MAX_MIB` | ladder ceiling, default 8192 |
-| `MOJOBOOST_UM_LADDER_PCT` | per-byte regression cutoff in percent, default 200 |
+| `MOJOTREES_UM_MODE` | `rewrite` (default) or `resident` |
+| `MOJOTREES_UM_CONTEND=1` | host mutates an unrelated payload-sized buffer inside the launch window |
+| `MOJOTREES_UM_HOLD_MIB` | hold a device-resident buffer of this size for the whole run; default 0 |
+| `MOJOTREES_UM_LADDER=1` | run the size ladder after the fixed-size run |
+| `MOJOTREES_UM_LADDER_MAX_MIB` | ladder ceiling, default 8192 |
+| `MOJOTREES_UM_LADDER_PCT` | per-byte regression cutoff in percent, default 200 |
 
 The driver has no build-lock wrapper of its own. On a machine running parallel
 lanes it must be serialized like every other heavy job, and its results are

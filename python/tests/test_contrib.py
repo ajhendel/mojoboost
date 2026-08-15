@@ -20,7 +20,7 @@ import pytest
 
 np = pytest.importorskip("numpy")
 
-from mojoboost import MojoBoostClassifier, MojoBoostRegressor
+from mojotrees import MojoTreesClassifier, MojoTreesRegressor
 
 
 # ----------------------------------------------------------------------
@@ -66,13 +66,13 @@ class _Tree:
 
 
 class _ReferenceModel:
-    """A mojoboost model file, read and explained in pure Python."""
+    """A mojotrees model file, read and explained in pure Python."""
 
     def __init__(self, path):
         tokens = open(path).read().split()
         self._t = tokens
         self._i = 0
-        assert self._next() == "mojoboost"
+        assert self._next() == "mojotrees"
         version = self._next()
         assert version == "v4", f"expected a v4 file, got {version}"
         self.version = int(version[1:])
@@ -275,7 +275,7 @@ def _fitted_regressor(n_features=4, **kwargs):
     params = dict(n_estimators=8, learning_rate=0.3, num_leaves=8,
                   min_child_samples=5, max_bin=32)
     params.update(kwargs)
-    return MojoBoostRegressor(**params).fit(X, y), X, y
+    return MojoTreesRegressor(**params).fit(X, y), X, y
 
 
 # ----------------------------------------------------------------------
@@ -296,7 +296,7 @@ def test_binary_classifier_explains_the_log_odds():
     rng = np.random.default_rng(3)
     X = rng.uniform(size=(200, 4))
     y = (X[:, 0] + X[:, 1] > 1.0).astype(int)
-    model = MojoBoostClassifier(
+    model = MojoTreesClassifier(
         n_estimators=10, learning_rate=0.3, num_leaves=8,
         min_child_samples=5, max_bin=32,
     ).fit(X, y)
@@ -312,7 +312,7 @@ def test_multiclass_shape_is_class_major_blocks():
     rng = np.random.default_rng(5)
     X = rng.uniform(size=(180, 3))
     y = rng.integers(0, 3, size=180)
-    model = MojoBoostClassifier(
+    model = MojoTreesClassifier(
         n_estimators=6, learning_rate=0.3, num_leaves=8,
         min_child_samples=5, max_bin=32,
     ).fit(X, y)
@@ -329,7 +329,7 @@ def test_classifier_predict_passes_contributions_through():
     rng = np.random.default_rng(11)
     X = rng.uniform(size=(120, 3))
     y = (X[:, 0] > 0.5).astype(int)
-    model = MojoBoostClassifier(
+    model = MojoTreesClassifier(
         n_estimators=6, num_leaves=8, min_child_samples=5, max_bin=32
     ).fit(X, y)
     # `predict` cannot return a label for a contribution request, so as in
@@ -341,13 +341,13 @@ def test_classifier_predict_passes_contributions_through():
 
 
 def test_ranker_shape_and_sum():
-    from mojoboost import MojoBoostRanker
+    from mojotrees import MojoTreesRanker
 
     rng = np.random.default_rng(13)
     X = rng.uniform(size=(120, 3))
     y = rng.integers(0, 3, size=120)
     group = [30, 30, 30, 30]
-    model = MojoBoostRanker(
+    model = MojoTreesRanker(
         n_estimators=6, num_leaves=8, min_child_samples=5, max_bin=32
     ).fit(X, y, group=group)
     contrib = model.predict(X, pred_contrib=True)
@@ -379,7 +379,7 @@ def test_matches_python_reference_with_missing_values(tmp_path):
     X = X.copy()
     X[::4, 0] = np.nan
     X[::6, 1] = np.nan
-    model = MojoBoostRegressor(
+    model = MojoTreesRegressor(
         n_estimators=8, learning_rate=0.3, num_leaves=8,
         min_child_samples=5, max_bin=32,
     ).fit(X, y)
@@ -406,7 +406,7 @@ def test_matches_python_reference_with_categorical_features(tmp_path):
     )
     effect = np.array([3.0, -2.0, 0.5, -1.5, 2.0, -3.0])
     y = effect[(np.arange(n_rows) % 6)] + 0.8 * X[:, 1]
-    model = MojoBoostRegressor(
+    model = MojoTreesRegressor(
         n_estimators=8, learning_rate=0.3, num_leaves=8,
         min_child_samples=5, max_bin=32, categorical_feature=[0],
     ).fit(X, y)
@@ -525,7 +525,7 @@ def test_unfitted_estimator_is_rejected():
 
     X, _ = _regression_data()
     with pytest.raises(NotFittedError):
-        MojoBoostRegressor().predict(X, pred_contrib=True)
+        MojoTreesRegressor().predict(X, pred_contrib=True)
 
 
 # ----------------------------------------------------------------------
@@ -538,7 +538,7 @@ def test_contributions_survive_save_and_load(tmp_path):
     before = model.predict(X, pred_contrib=True)
     path = tmp_path / "model.txt"
     model.save(path)
-    loaded = MojoBoostRegressor.load(path)
+    loaded = MojoTreesRegressor.load(path)
     np.testing.assert_allclose(
         loaded.predict(X, pred_contrib=True), before, atol=0.0
     )
@@ -561,7 +561,7 @@ def _downgrade_to_v2(path, out_path):
     while i < len(lines):
         line = lines[i]
         if i == 0:
-            out.append(line.replace("mojoboost v4", "mojoboost v2"))
+            out.append(line.replace("mojotrees v4", "mojotrees v2"))
             i += 1
             continue
         out.append(line)
@@ -584,7 +584,7 @@ def test_v2_files_still_load_and_predict_but_refuse_contributions(tmp_path):
     v2 = tmp_path / "model_v2.txt"
     _downgrade_to_v2(v3, v2)
 
-    loaded = MojoBoostRegressor.load(v2)
+    loaded = MojoTreesRegressor.load(v2)
     # Prediction is unaffected: covers never entered it.
     np.testing.assert_allclose(
         loaded.predict(X), model.predict(X), atol=0.0
@@ -610,7 +610,7 @@ def test_single_row_and_single_feature():
     rng = np.random.default_rng(31)
     X = rng.uniform(size=(80, 1))
     y = 2.0 * X[:, 0]
-    model = MojoBoostRegressor(
+    model = MojoTreesRegressor(
         n_estimators=5, num_leaves=4, min_child_samples=5, max_bin=16
     ).fit(X, y)
     contrib = model.predict(X[:1], pred_contrib=True)
@@ -625,7 +625,7 @@ def test_constant_target_puts_everything_in_the_expected_value():
     # score alone and no feature can carry anything.
     X = np.random.default_rng(41).uniform(size=(60, 3))
     y = np.full(60, 2.5)
-    model = MojoBoostRegressor(
+    model = MojoTreesRegressor(
         n_estimators=5, num_leaves=4, min_child_samples=5, max_bin=16
     ).fit(X, y)
     contrib = model.predict(X, pred_contrib=True)

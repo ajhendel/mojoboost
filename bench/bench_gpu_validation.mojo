@@ -45,10 +45,10 @@ The one thing the harness cannot see is where time goes *inside* a kernel,
 which is what the vendor profiler is for.
 
 Both trainers report training MSE, so throughput is never read apart from fit
-quality. CPU-side threading honors MOJOBOOST_NUM_WORKERS and
-MOJOBOOST_PARALLEL_MIN_OPS (see parallel.mojo); pin them for reproducible
-comparisons. MOJOBOOST_GPU_HIST_STRATEGY, MOJOBOOST_GPU_ROW_TILE, and
-MOJOBOOST_GPU_BLOCK_THREADS override the tiling policy, so a sweep needs no
+quality. CPU-side threading honors MOJOTREES_NUM_WORKERS and
+MOJOTREES_PARALLEL_MIN_OPS (see parallel.mojo); pin them for reproducible
+comparisons. MOJOTREES_GPU_HIST_STRATEGY, MOJOTREES_GPU_ROW_TILE, and
+MOJOTREES_GPU_BLOCK_THREADS override the tiling policy, so a sweep needs no
 rebuild.
 
 Usage:
@@ -64,18 +64,18 @@ from std.time import perf_counter_ns
 
 from max.gpu.host import DeviceAttribute, DeviceContext
 
-from mojoboost.binning import fit_bins
-from mojoboost.boosting import (
+from mojotrees.binning import fit_bins
+from mojotrees.boosting import (
     SQUARED_ERROR,
     Booster,
     BoosterParams,
     train,
 )
-from mojoboost.binning import BinnedMatrix
-from mojoboost.gpu_tiling import STRATEGY_TILED, strategy_name
-from mojoboost.histogram_gpu import MAX_BINS, GpuHistogramBuilder
-from mojoboost.train_gpu import train_gpu
-from mojoboost.tree import TreeParams
+from mojotrees.binning import BinnedMatrix
+from mojotrees.gpu_tiling import STRATEGY_TILED, strategy_name
+from mojotrees.histogram_gpu import MAX_BINS, GpuHistogramBuilder
+from mojotrees.train_gpu import train_gpu
+from mojotrees.tree import TreeParams
 
 # Bins requested from the binner. 255 is the library default and the value
 # every cross-device record should use unless it is explicitly sweeping bins.

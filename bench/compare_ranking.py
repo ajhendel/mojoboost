@@ -3,7 +3,7 @@
 Two independent checks on the same synthetic ranking data, with matched
 parameters on both sides:
 
-1. The NDCG metric. mojoboost's `ndcg_score` is applied to LightGBM's own
+1. The NDCG metric. mojotrees's `ndcg_score` is applied to LightGBM's own
    validation predictions and compared against the ndcg@k LightGBM reports
    for that same iteration. Same scores, same labels, same query
    boundaries, so any difference is a difference in the metric itself. The
@@ -14,7 +14,7 @@ parameters on both sides:
    on held-out queries at several cutoffs. These are not expected to match
    exactly: tree growth diverges after the first floating-point tie, the
    binners break ties differently, and LightGBM reads its pairwise sigmoid
-   from a lookup table where mojoboost evaluates it. Comparable NDCG is the
+   from a lookup table where mojotrees evaluates it. Comparable NDCG is the
    claim, not identical models.
 
 Queries are split into train and validation by query, never by row.
@@ -37,12 +37,12 @@ sys.path.insert(
     0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python")
 )
 
-from mojoboost import MojoBoostRanker, ndcg_score  # noqa: E402
+from mojotrees import MojoTreesRanker, ndcg_score  # noqa: E402
 
 MASK = np.uint64(0xFFFFFFFFFFFFFFFF)
 INV_2_53 = 1.0 / 9007199254740992.0
 
-# LightGBM's defaults for the parameters mojoboost also has.
+# LightGBM's defaults for the parameters mojotrees also has.
 TRUNCATION_LEVEL = 30
 SIGMOID = 1.0
 EVAL_AT = (1, 3, 5, 10)
@@ -152,7 +152,7 @@ def main():
         "lambdarank_truncation_level": TRUNCATION_LEVEL,
         "sigmoid": SIGMOID,
         "lambdarank_norm": True,
-        # mojoboost has no feature bundling; keep the comparison honest.
+        # mojotrees has no feature bundling; keep the comparison honest.
         "enable_bundle": False,
         "force_row_wise": True,
         "num_threads": 1,
@@ -183,7 +183,7 @@ def main():
     # 1. Metric cross-check on LightGBM's own predictions.
     reported = evals["valid"]
     print("\nmetric cross-check (same scores, both NDCG implementations)")
-    print(f"{'cutoff':>8} {'lightgbm':>12} {'mojoboost':>12} {'abs diff':>10}")
+    print(f"{'cutoff':>8} {'lightgbm':>12} {'mojotrees':>12} {'abs diff':>10}")
     worst = 0.0
     for k in EVAL_AT:
         theirs = reported[f"ndcg@{k}"][-1]
@@ -193,7 +193,7 @@ def main():
     print(f"largest disagreement: {worst:.2e}")
 
     # 2. Quality comparison.
-    model = MojoBoostRanker(
+    model = MojoTreesRanker(
         lambdarank_truncation_level=TRUNCATION_LEVEL,
         sigmoid=SIGMOID,
         lambdarank_norm=True,
@@ -204,13 +204,13 @@ def main():
     our_pred = model.predict(Xv)
 
     print("\nvalidation NDCG (independently trained models)")
-    print(f"{'cutoff':>8} {'lightgbm':>12} {'mojoboost':>12} {'delta':>10}")
+    print(f"{'cutoff':>8} {'lightgbm':>12} {'mojotrees':>12} {'delta':>10}")
     for k in EVAL_AT:
         theirs = ndcg_score(lgb_pred, yv, gv, at=k)
         ours = ndcg_score(our_pred, yv, gv, at=k)
         print(f"{k:>8} {theirs:>12.6f} {ours:>12.6f} {ours - theirs:>+10.6f}")
     print(f"\nlightgbm trees: {lgb_booster.num_trees()}")
-    print(f"mojoboost trees: {model.best_iteration_}")
+    print(f"mojotrees trees: {model.best_iteration_}")
 
 
 if __name__ == "__main__":

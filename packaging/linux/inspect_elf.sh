@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Inspect installed mojoboost ELF objects on the machine they have to run on.
+# Inspect installed mojotrees ELF objects on the machine they have to run on.
 #
 #     packaging/linux/inspect_elf.sh <directory or object> [record file]
 #
 # Typically the installed package inside a clean container:
 #
-#     inspect_elf.sh "$(python -c 'import mojoboost,pathlib;print(pathlib.Path(mojoboost.__file__).parent)')"
+#     inspect_elf.sh "$(python -c 'import mojotrees,pathlib;print(pathlib.Path(mojotrees.__file__).parent)')"
 #
 # THIS SCRIPT HAS NEVER BEEN EXECUTED. Nothing it prints has been observed.
 #
