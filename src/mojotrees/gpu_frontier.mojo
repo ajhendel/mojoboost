@@ -93,13 +93,32 @@ grower never keeps a second parallel list of any of it:
                           and `partitioned` (whether its rows are already
                           split by its own candidate).
 
+The device mirror of this frontier
+----------------------------------
+`gpu_tree_tables.mojo` holds the same frontier in device memory, six Int32
+words per live leaf, alongside the tree under construction and a device copy
+of the histogram slot pool, and its `_pick_and_commit_kernel` performs
+`select_best` and `plan_commit`/`apply_commit` in one launch with no host
+round trip. That module is gated off (`MOJOTREES_GPU_TREE_RESIDENT`) and
+wired to nothing; it exists so a later lane can move the per-split host wait
+that a stage profile measured at 31 synchronizations per tree.
+
+Three rules stated here are the ones it had to reproduce exactly, and they
+are the reason they are stated here at all rather than left implicit in a
+loop: the slot convention (`apply_commit`, left child into the parent's slot
+and right child appended), the tie-break (`select_best`, a strict comparison
+over an ascending scan, so ties go to the lowest slot), and the subtraction
+choice (`subtraction_builds_left`, `n_left <= n_right`). A device kernel that
+got any of the three wrong would grow a different tree and raise no error.
+
 Scope
 -----
 Host-side bookkeeping only. No `DeviceContext`, no buffer, no kernel, no
 environment read, so the whole frontier story is reasonable, and later
 testable, on a machine with no accelerator. The device half is
 `gpu_leaf_batching.mojo`, which consumes the `LeafWorkItem` list this module
-produces, and `gpu_active_rows.mojo`, which consumes the `CommitPlan`.
+produces, `gpu_active_rows.mojo`, which consumes the `CommitPlan`, and
+`gpu_tree_tables.mojo`, which mirrors the frontier itself.
 """
 
 from .interaction import extend_branch
