@@ -81,6 +81,7 @@ either backend, at any batch size. A batching scheme that cannot hold that
 invariant is not admissible, and there is no parameter here that relaxes it.
 """
 
+from .binning import MAX_BINS
 from .parallel import _env_int
 
 
@@ -107,9 +108,6 @@ comptime BYTES_PER_ROW_INDEX_SET = 12
 # A histogram cell is one Int32 in one of the three planes.
 comptime BYTES_PER_HIST_CELL = 4
 
-# The bin cap the histogram kernels are written to, mirroring
-# `histogram_gpu.MAX_BINS` and `gpu_active_rows.MAX_BINS`.
-comptime MAX_BINS = 256
 
 # Mirrors `gpu_objectives_native.SUM_BLOCKS`. Duplicated rather than
 # imported so this module stays free of the device imports that module

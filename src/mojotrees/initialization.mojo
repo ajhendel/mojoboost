@@ -187,7 +187,7 @@ def phase_origin(phase: Int) -> Int:
     return ORIGIN_NATIVE
 
 
-def origin_name(origin: Int) -> String:
+def startup_origin_name(origin: Int) -> String:
     if origin == ORIGIN_SUPPLIED:
         return String("supplied")
     if origin == ORIGIN_NATIVE:
@@ -482,7 +482,7 @@ struct StartupTrace(Copyable, Movable):
             out += " " + String(self.calls[p])
             out += " " + String(self.nanos[p])
             out += " " + String(self.first_nanos[p])
-            out += " " + origin_name(phase_origin(p))
+            out += " " + startup_origin_name(phase_origin(p))
             if self.calls[p] > 0:
                 out += " 1\n"
             else:

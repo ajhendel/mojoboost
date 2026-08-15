@@ -2265,7 +2265,7 @@ struct TransportCollective[E: ByteEndpoint & Copyable & Deinitable](
 
 
 @fieldwise_init
-struct HistogramPlan(Copyable, Movable):
+struct HistogramWirePlan(Copyable, Movable):
     """What one tree node costs on the wire, from docs/distributed.md section
     8. Computed rather than asserted so a test can pin the cost model against
     the wire format instead of against a comment."""
@@ -2278,7 +2278,7 @@ struct HistogramPlan(Copyable, Movable):
     var framing_bytes_per_node: Int
 
 
-def histogram_plan(n_features: Int, n_bins: Int) raises -> HistogramPlan:
+def histogram_plan(n_features: Int, n_bins: Int) raises -> HistogramWirePlan:
     """The three-buffer schedule `allreduce_histogram` actually issues.
 
     Three reductions per node, not one, because gradients, hessians, and
@@ -2294,13 +2294,13 @@ def histogram_plan(n_features: Int, n_bins: Int) raises -> HistogramPlan:
             "a histogram needs at least one feature and one bin",
         )
     var cells = n_features * n_bins
-    return HistogramPlan(
+    return HistogramWirePlan(
         n_features, n_bins, cells, 3, 3 * cells * 8, 3 * FRAME_HEADER_BYTES
     )
 
 
 def check_histogram_buffers(
-    plan: HistogramPlan, n_grad: Int, n_hess: Int, n_count: Int
+    plan: HistogramWirePlan, n_grad: Int, n_hess: Int, n_count: Int
 ) raises:
     """Refuse a histogram whose three buffers do not describe the same grid.
 

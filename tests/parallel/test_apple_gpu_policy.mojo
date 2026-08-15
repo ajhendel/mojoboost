@@ -58,7 +58,7 @@ from mojotrees.apple_gpu_policy import (
     apple_synthetic,
     api_name,
     derive_policy,
-    describe_policy,
+    describe_gpu_policy,
     parse_api,
     parse_apple_generation,
     partial_budget_bytes,
@@ -550,7 +550,7 @@ def test_crossover_inputs_are_reported_but_no_threshold_is_invented() raises:
 
 def test_description_distinguishes_a_reading_from_a_fixture() raises:
     var observed = apple_m4_observed()
-    var line = describe_policy(
+    var line = describe_gpu_policy(
         observed, derive_policy(observed, 1_000_000, 8, 255)
     )
     assert_true(line.find("api=metal") >= 0)
@@ -558,7 +558,7 @@ def test_description_distinguishes_a_reading_from_a_fixture() raises:
     assert_true(line.find("(reported)") >= 0)
 
     var fixture = apple_synthetic(APPLE_GEN_M2)
-    var fixture_line = describe_policy(
+    var fixture_line = describe_gpu_policy(
         fixture, derive_policy(fixture, 1_000_000, 8, 255)
     )
     assert_true(fixture_line.find("(synthetic)") >= 0)

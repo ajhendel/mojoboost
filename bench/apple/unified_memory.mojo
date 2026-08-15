@@ -221,22 +221,22 @@ from max.gpu.host import (
 from mojotrees.unified_memory_policy import (
     DEFAULT_ROUTE,
     ENABLE_LEVEL,
-    N_ROLES,
+    N_TRANSFER_ROLES,
     N_ROUTES,
     ROUTE_COPY_DIRECT,
     ROUTE_COPY_STAGED,
     ROUTE_HOST_DIRECT,
     ROUTE_MAP_WRITE,
     ROUTE_WRAPPED_HOST,
-    STATUS_NOT_PROBED,
-    STATUS_OK,
-    STATUS_UNSUPPORTED,
-    STATUS_WRONG,
+    TRANSFER_STATUS_NOT_PROBED,
+    TRANSFER_STATUS_OK,
+    TRANSFER_STATUS_UNSUPPORTED,
+    TRANSFER_STATUS_WRONG,
     EvidenceLedger,
-    block_reason_name,
+    transfer_block_name,
     evidence_name,
     explain_route,
-    role_name,
+    transfer_role_name,
     route_name,
     status_name,
 )
@@ -749,8 +749,8 @@ def _finish(
     """Assemble one route's result. A route whose device checksum missed is
     `wrong`, never `ok`: a route that skipped publishing entirely would post
     the best timings in the run and be worthless."""
-    var status = STATUS_OK if checksum == expected else STATUS_WRONG
-    var detail = String("") if status == STATUS_OK else wrong_detail
+    var status = TRANSFER_STATUS_OK if checksum == expected else TRANSFER_STATUS_WRONG
+    var detail = String("") if status == TRANSFER_STATUS_OK else wrong_detail
     return RouteResult(
         scope,
         route,
@@ -1168,12 +1168,12 @@ def _run_route(
             scope,
             route,
             plan,
-            STATUS_NOT_PROBED,
+            TRANSFER_STATUS_NOT_PROBED,
             "no runner is compiled for this route",
         )
     except e:
         return RouteResult.failed(
-            scope, route, plan, STATUS_UNSUPPORTED, String(e)
+            scope, route, plan, TRANSFER_STATUS_UNSUPPORTED, String(e)
         )
 
 
@@ -1182,7 +1182,7 @@ def _report(result: RouteResult, n_bytes: Int):
     print(p + "status:", status_name(result.status))
     if result.detail.byte_length() != 0:
         print(p + "detail:", result.detail)
-    var measured = result.status == STATUS_OK or result.status == STATUS_WRONG
+    var measured = result.status == TRANSFER_STATUS_OK or result.status == TRANSFER_STATUS_WRONG
     if not measured:
         # `unsupported` and `not_probed` produced no measurements, so they
         # print their status and their reason and nothing that could be
@@ -1192,7 +1192,7 @@ def _report(result: RouteResult, n_bytes: Int):
     # broken route behaved is useful, but it is flagged uncomparable so no
     # reader and no downstream schema treats those numbers as a route
     # comparison. A route that never published would win on every timing.
-    print(p + "comparable:", 1 if result.status == STATUS_OK else 0)
+    print(p + "comparable:", 1 if result.status == TRANSFER_STATUS_OK else 0)
     print(p + "input_route:", route_name(result.route))
     var out_route = String("copy")
     if result.plan.out_shared:
@@ -1289,21 +1289,21 @@ def _report_policy():
     # evidence from the platform. This is the part of the experiment's
     # subject that no run can change, and printing it beside the timings
     # keeps a reader from concluding that a fast route is an available one.
-    for role in range(N_ROLES):
+    for role in range(N_TRANSFER_ROLES):
         var key = (
-            String("um.policy.role.") + role_name(role) + ".host_direct:"
+            String("um.policy.role.") + transfer_role_name(role) + ".host_direct:"
         )
         try:
             var decision = explain_route(
                 role, ROUTE_HOST_DIRECT, True, ledger
             )
-            print(key, block_reason_name(decision.reason))
+            print(key, transfer_block_name(decision.reason))
         except:
             print(key, "unreadable")
 
 
 def _report_not_probed(scope: String, detail: String):
-    print(scope + ".status:", status_name(STATUS_NOT_PROBED))
+    print(scope + ".status:", status_name(TRANSFER_STATUS_NOT_PROBED))
     print(scope + ".detail:", detail)
 
 
@@ -1381,7 +1381,7 @@ def _ladder(
             )
             var pfx = scope + "." + String(n) + "."
             print(pfx + "status:", status_name(r.status))
-            if r.status != STATUS_OK:
+            if r.status != TRANSFER_STATUS_OK:
                 all_inside = False
                 continue
             var per_byte = Float64(r.round_mean_ns) / Float64(n)
@@ -1462,13 +1462,13 @@ def main() raises:
         for route in range(ROUTE_COPY_STAGED, ROUTE_WRAPPED_HOST):
             print(
                 String("um.") + route_name(route) + ".status:",
-                status_name(STATUS_UNSUPPORTED),
+                status_name(TRANSFER_STATUS_UNSUPPORTED),
             )
             print(
                 String("um.") + route_name(route) + ".detail:",
                 "no accelerator in this build",
             )
-        print("um.out_host_direct.status:", status_name(STATUS_UNSUPPORTED))
+        print("um.out_host_direct.status:", status_name(TRANSFER_STATUS_UNSUPPORTED))
         print("um.out_host_direct.detail:", "no accelerator in this build")
         # The unprobed routes stay unprobed here rather than becoming
         # unsupported: the build having no accelerator says nothing about

@@ -475,5 +475,5 @@ def subtract_ops(n_cells: Int) -> Int:
     return 3 * n_cells
 
 
-def describe_policy(profile: CpuProfile, plan: AccumulationPlan) -> String:
+def describe_cpu_policy(profile: CpuProfile, plan: AccumulationPlan) -> String:
     return String(profile.describe(), " | ", plan.describe())

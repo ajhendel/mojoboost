@@ -98,7 +98,7 @@ from .distributed_strategies import (
     STRATEGY_FEATURE_PARALLEL,
     STRATEGY_SERIAL,
     STRATEGY_VOTING_PARALLEL,
-    strategy_name,
+    tree_learner_name,
 )
 from .distributed_transport import transport_available
 from .quantized_gradient import FIXED_ONE, magnitude_sum
@@ -263,7 +263,7 @@ def check_gpu_strategy(strategy: Int) raises:
         raise Error(
             String(
                 "the ",
-                strategy_name(strategy),
+                tree_learner_name(strategy),
                 "-parallel strategy has no GPU histogram exchange: only data"
                 " parallelism reduces a fixed histogram grid every rank"
                 " agrees on. See docs/DISTRIBUTED_STRATEGIES.md",

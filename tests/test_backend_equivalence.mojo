@@ -10,7 +10,7 @@ from std.os import setenv
 from std.sys import has_accelerator
 from std.testing import assert_equal, assert_true, TestSuite
 
-from mojotrees.backend import CPU, GPU, build_histogram
+from mojotrees.backend import CPU, GPU, build_histogram_on
 from mojotrees.binning import bin_equal_width
 from mojotrees.boosting import (
     SQUARED_ERROR,
@@ -68,8 +68,8 @@ def test_gpu_matches_cpu_histogram() raises:
             g_mag += abs(g)
             h_mag += abs(h)
 
-        var cpu = build_histogram[CPU](data, grad, hess)
-        var gpu = build_histogram[GPU](data, grad, hess)
+        var cpu = build_histogram_on[CPU](data, grad, hess)
+        var gpu = build_histogram_on[GPU](data, grad, hess)
 
         assert_equal(cpu.n_features, gpu.n_features)
         assert_equal(cpu.n_bins, gpu.n_bins)

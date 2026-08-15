@@ -26,7 +26,7 @@ comptime CPU = 0
 comptime GPU = 1
 
 
-def build_histogram[
+def build_histogram_on[
     backend: Int = CPU
 ](
     data: BinnedMatrix, grad: List[Float64], hess: List[Float64]

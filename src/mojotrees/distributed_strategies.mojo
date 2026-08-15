@@ -163,7 +163,7 @@ comptime STRATEGY_VOTING_PARALLEL = 3
 """Data parallel filtered by a vote over features. Cores here only."""
 
 
-def strategy_name(strategy: Int) -> String:
+def tree_learner_name(strategy: Int) -> String:
     if strategy == STRATEGY_SERIAL:
         return "serial"
     if strategy == STRATEGY_DATA_PARALLEL:
@@ -240,7 +240,7 @@ struct StrategyCapabilities(Copyable, Movable):
     var supports_ranking_groups: Bool
 
     def describe(self) -> String:
-        var text = String(strategy_name(self.strategy))
+        var text = String(tree_learner_name(self.strategy))
         if self.implemented:
             text += ": implemented"
         else:
@@ -1266,7 +1266,7 @@ struct StrategyCostPlan(Copyable, Movable):
     modes against these functions instead of against a comment, exactly as
     `histogram_plan` in distributed_transport.mojo does for data parallel.
     The byte counts are payload only: framing is the transport's, and
-    `HistogramPlan.framing_bytes_per_node` is where it is accounted.
+    `HistogramWirePlan.framing_bytes_per_node` is where it is accounted.
     """
 
     var strategy: Int

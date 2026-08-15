@@ -129,7 +129,7 @@ def _elapsed_since(started: Int) -> Int:
     return elapsed
 
 
-def phase_name(phase: Int) -> String:
+def session_phase_name(phase: Int) -> String:
     if phase == PHASE_COMPILE:
         return String("compile")
     if phase == PHASE_ALLOC:
@@ -221,7 +221,7 @@ struct PhaseCounters(Copyable, Movable):
         every phase when tracing is off, and that is not a measurement."""
         var out = String("")
         for p in range(N_PHASES):
-            out += phase_name(p) + " " + String(self.calls[p])
+            out += session_phase_name(p) + " " + String(self.calls[p])
             out += " " + String(self.nanos[p]) + "\n"
         return out
 
@@ -515,10 +515,10 @@ struct StagingRing(Copyable, Movable):
 
 comptime ROLE_TRAIN = 0
 comptime ROLE_VALID = 1
-comptime N_ROLES = 2
+comptime N_SESSION_ROLES = 2
 
 
-def role_name(role: Int) -> String:
+def session_role_name(role: Int) -> String:
     if role == ROLE_TRAIN:
         return String("train")
     if role == ROLE_VALID:
@@ -597,9 +597,9 @@ struct ResidencyLedger(Copyable, Movable):
     var evictions: Int
 
     def __init__(out self):
-        self.identity = List[MatrixIdentity](capacity=N_ROLES)
-        self.resident = List[Bool](capacity=N_ROLES)
-        for _ in range(N_ROLES):
+        self.identity = List[MatrixIdentity](capacity=N_SESSION_ROLES)
+        self.resident = List[Bool](capacity=N_SESSION_ROLES)
+        for _ in range(N_SESSION_ROLES):
             self.identity.append(MatrixIdentity.empty())
             self.resident.append(False)
         self.uploads = 0
@@ -607,11 +607,11 @@ struct ResidencyLedger(Copyable, Movable):
         self.evictions = 0
 
     def _check(self, role: Int) raises:
-        if role < 0 or role >= N_ROLES:
+        if role < 0 or role >= N_SESSION_ROLES:
             raise Error("unknown residency role ", role)
 
     def is_resident(self, role: Int, identity: MatrixIdentity) -> Bool:
-        if role < 0 or role >= N_ROLES:
+        if role < 0 or role >= N_SESSION_ROLES:
             return False
         if not self.resident[role]:
             return False
@@ -645,12 +645,12 @@ struct ResidencyLedger(Copyable, Movable):
         self.identity[role] = MatrixIdentity.empty()
 
     def clear(mut self) raises:
-        for role in range(N_ROLES):
+        for role in range(N_SESSION_ROLES):
             self.evict(role)
 
     def resident_cells(self) -> Int:
         var total = 0
-        for role in range(N_ROLES):
+        for role in range(N_SESSION_ROLES):
             if self.resident[role]:
                 total += self.identity[role].cells()
         return total

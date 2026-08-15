@@ -93,6 +93,7 @@ from max.gpu.host import DeviceBuffer, DeviceContext, HostBuffer
 from max.gpu.memory import AddressSpace
 from max.gpu.sync import barrier
 
+from .binning import MAX_BINS
 from .goss import GossSelection
 from .gpu_active_rows import (
     GpuActiveRows,
@@ -108,10 +109,6 @@ from .gpu_tiling import (
 )
 from .histogram_gpu import GpuHistogramBuilder
 
-# The widest histogram a threadgroup's shared partial holds, as in
-# histogram_gpu.mojo and gpu_active_rows.mojo. Each of those defines it
-# for itself; this follows that rather than reaching for one of theirs.
-comptime MAX_BINS = 256
 
 # Which layout the derivative planes are in when a histogram reads them.
 # SPLIT is the shipped one, two Float32 planes indexed by row. INTERLEAVED
@@ -131,7 +128,7 @@ def env_grad_layout() -> Int:
     return LAYOUT_SPLIT
 
 
-def layout_name(layout: Int) -> String:
+def stream_layout_name(layout: Int) -> String:
     if layout == LAYOUT_INTERLEAVED:
         return String("interleaved")
     return String("split")

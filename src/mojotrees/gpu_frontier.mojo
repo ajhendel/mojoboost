@@ -129,7 +129,7 @@ comptime CAND_PENDING = 1
 pending leaf is not eligible for commitment, because its gain is not known."""
 
 comptime CAND_READY = 2
-"""A split was found. `LeafCandidate.split.gain` ranks it."""
+"""A split was found. `FrontierCandidate.split.gain` ranks it."""
 
 comptime CAND_NONE = 3
 """The search ran and admitted no split (every candidate failed
@@ -203,7 +203,7 @@ struct LeafStats(Copyable, Movable):
         return self.count <= 0
 
 
-struct LeafCandidate(Copyable, Movable):
+struct FrontierCandidate(Copyable, Movable):
     """One leaf's best split and everything a commit needs from it.
 
     The child row counts are exact integers, taken from the parent
@@ -236,9 +236,9 @@ struct LeafCandidate(Copyable, Movable):
         self.parent_value = 0.0
 
     @staticmethod
-    def none(parent_value: Float64 = 0.0) -> LeafCandidate:
+    def none(parent_value: Float64 = 0.0) -> FrontierCandidate:
         """The searched-and-found-nothing candidate."""
-        var c = LeafCandidate()
+        var c = FrontierCandidate()
         c.state = CAND_NONE
         c.parent_value = parent_value
         return c^
@@ -251,8 +251,8 @@ struct LeafCandidate(Copyable, Movable):
         left_value: Float64,
         right_value: Float64,
         parent_value: Float64,
-    ) raises -> LeafCandidate:
-        var c = LeafCandidate()
+    ) raises -> FrontierCandidate:
+        var c = FrontierCandidate()
         if not split.found:
             raise Error("a ready candidate must carry a found split")
         if n_left < 0 or n_right < 0:
@@ -320,7 +320,7 @@ struct FrontierLeaf(Copyable, Movable):
     var bounds: OutputBounds
     var hist_slot: Int
     var partitioned: Bool
-    var candidate: LeafCandidate
+    var candidate: FrontierCandidate
     var stats: LeafStats
     """This leaf's gradient sum, hessian sum, and row count. `count` is
     maintained by the frontier itself and always equals `row_count`; the two
@@ -345,7 +345,7 @@ struct FrontierLeaf(Copyable, Movable):
         self.bounds = bounds^
         self.hist_slot = NO_SLOT
         self.partitioned = False
-        self.candidate = LeafCandidate()
+        self.candidate = FrontierCandidate()
         self.stats = LeafStats(0.0, 0.0, row_count)
         self.stats_known = False
 
@@ -594,7 +594,7 @@ struct LeafFrontier(Movable):
         return self.leaves[slot].copy()
 
     def set_candidate(
-        mut self, slot: Int, var candidate: LeafCandidate
+        mut self, slot: Int, var candidate: FrontierCandidate
     ) raises:
         """Record the candidate a search produced for `slot`. Refuses a
         candidate whose child counts do not add up to the leaf's own rows,

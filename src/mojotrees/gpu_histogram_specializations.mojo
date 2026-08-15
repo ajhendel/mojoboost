@@ -92,12 +92,13 @@ Two constants used to be mirrored from `gpu_tiling.mojo` so this module could
 stand alone while it landed alongside concurrent work on that file. That was
 the pre-integration arrangement handoffs/performance_14_gpu_histogram.md
 recorded; `BYTES_PER_PARTIAL_CELL` is now imported from `gpu_tiling.mojo`
-rather than copied. `MAX_BINS` stays defined here because this is the lowest
-module of the GPU dataflow lane, and `gpu_active_rows.mojo`,
-`gpu_leaf_batching.mojo`, and `gpu_binned_layout.mojo` now import it from
-here instead of each declaring their own 256.
+rather than copied. `MAX_BINS` is `binning.MAX_BINS`, the one bin ceiling
+(a bin index is a byte); it is imported here and re-exported to
+`gpu_active_rows.mojo`, `gpu_leaf_batching.mojo`, and
+`gpu_binned_layout.mojo`, which import it from this module.
 """
 
+from .binning import MAX_BINS
 from .gpu_tiling import BYTES_PER_PARTIAL_CELL
 
 
@@ -105,7 +106,6 @@ from .gpu_tiling import BYTES_PER_PARTIAL_CELL
 # kernels allocate in threadgroup memory unconditionally. This is the lane's
 # single definition; `gpu_active_rows`, `gpu_leaf_batching`, and
 # `gpu_binned_layout` import it from here.
-comptime MAX_BINS = 256
 
 
 # A histogram is three planes (gradient, hessian, count), each one Int32 per

@@ -315,13 +315,13 @@ this order:
 
 | Reason | When |
 |---|---|
-| `REASON_NOT_REQUESTED` | `enabled` is false. The ordinary case |
-| `REASON_NOT_CONNECTED` | `CONNECTED` is false. Every case today |
-| `REASON_BACKEND` | The caller's accumulation path does not exist |
-| `REASON_NO_ROWS` | Nothing to quantize |
-| `REASON_NON_FINITE` | A gradient or hessian is not finite |
-| `REASON_DEGENERATE` | Every magnitude is below `MAGNITUDE_FLOOR` |
-| `REASON_OVERFLOW` | No allowed accumulator width holds the bound |
+| `QUANT_REASON_NOT_REQUESTED` | `enabled` is false. The ordinary case |
+| `QUANT_REASON_NOT_CONNECTED` | `CONNECTED` is false. Every case today |
+| `QUANT_REASON_BACKEND` | The caller's accumulation path does not exist |
+| `QUANT_REASON_NO_ROWS` | Nothing to quantize |
+| `QUANT_REASON_NON_FINITE` | A gradient or hessian is not finite |
+| `QUANT_REASON_DEGENERATE` | Every magnitude is below `MAGNITUDE_FLOOR` |
+| `QUANT_REASON_OVERFLOW` | No allowed accumulator width holds the bound |
 
 Every fallback keeps training, at the numerics that ship today.
 

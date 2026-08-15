@@ -170,12 +170,12 @@ from .objective_registry import (
 # ends up naming a route refusal as the reason a GPU request was denied.
 from .unified_memory_policy import (
     SessionMemoryPlan,
-    block_reason_name as transfer_block_name,
     evidence_name as transfer_evidence_name,
     plan_session_routes,
     retire_event_name,
-    role_name as transfer_role_name,
     route_name as transfer_route_name,
+    transfer_block_name,
+    transfer_role_name,
 )
 
 

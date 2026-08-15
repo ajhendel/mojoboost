@@ -77,6 +77,7 @@ honest: nothing here reports GPU support and then runs on the CPU.
 
 from .categorical import CAT_MAX_BINS, CategoricalSpec
 from .efb import FeatureBundling
+from .gpu_objectives_native import DEFAULT_MAX_NODES
 from .gpu_tiling import (
     DeviceCaps,
     HistogramTiling,
@@ -100,10 +101,9 @@ comptime BYTES_INDEX = 4
 comptime BYTES_BIN = 1
 comptime BYTES_SIDE = 1
 
-# Default ceiling on the node ids a tree may use, matching
-# `gpu_objectives_native.DEFAULT_MAX_NODES`. The device range table is sized
-# by it at construction, since a split must not allocate.
-comptime DEFAULT_MAX_NODES = 2048
+# Default ceiling on the node ids a tree may use, `gpu_objectives_native`'s.
+# The device range table is sized by it at construction, since a split must
+# not allocate.
 
 
 # --- Kernel block sizes and their shared-memory cost ----------------------
@@ -473,7 +473,7 @@ comptime SPARSE_PREFER_DENSE = 2
 comptime SPARSE_UNSUPPORTED = 3
 
 
-def verdict_name(verdict: Int) -> String:
+def sparse_verdict_name(verdict: Int) -> String:
     if verdict == SPARSE_UNDECIDED:
         return String("undecided")
     if verdict == SPARSE_PREFER_SPARSE:

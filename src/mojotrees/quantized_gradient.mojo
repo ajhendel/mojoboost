@@ -164,7 +164,7 @@ STATUS
 ------
 Disabled, and not reachable from any public entry point. `CONNECTED` is
 False, `QuantGradParams.default()` is disabled, and `decide` returns
-`MODE_FLOAT` with `REASON_NOT_CONNECTED` for any request while `CONNECTED`
+`MODE_FLOAT` with `QUANT_REASON_NOT_CONNECTED` for any request while `CONNECTED`
 is False, whatever the parameters say. A caller that explicitly asked for
 quantized training gets `check_supported`'s error rather than a silent
 downgrade, which is the same rule `unified_memory_policy` applies to a
@@ -259,16 +259,16 @@ comptime RENEW_BY_OBJECTIVE = 2
 (`mae`, `quantile`, `mape`). That renewal supersedes both of the above and
 must not be doubled up with `RENEW_FROM_FLOAT`."""
 
-# Decision reasons. `REASON_OK` is the only one that accompanies
+# Decision reasons. `QUANT_REASON_OK` is the only one that accompanies
 # `MODE_QUANTIZED`; every other value names why the float path was chosen.
-comptime REASON_OK = 0
-comptime REASON_NOT_REQUESTED = 1
-comptime REASON_NOT_CONNECTED = 2
-comptime REASON_NO_ROWS = 3
-comptime REASON_NON_FINITE = 4
-comptime REASON_DEGENERATE = 5
-comptime REASON_OVERFLOW = 6
-comptime REASON_BACKEND = 7
+comptime QUANT_REASON_OK = 0
+comptime QUANT_REASON_NOT_REQUESTED = 1
+comptime QUANT_REASON_NOT_CONNECTED = 2
+comptime QUANT_REASON_NO_ROWS = 3
+comptime QUANT_REASON_NON_FINITE = 4
+comptime QUANT_REASON_DEGENERATE = 5
+comptime QUANT_REASON_OVERFLOW = 6
+comptime QUANT_REASON_BACKEND = 7
 
 
 def describe_mode(mode: Int) -> String:
@@ -292,30 +292,30 @@ def describe_rounding(mode: Int) -> String:
 def describe_reason(reason: Int) -> String:
     """One line per reason, phrased so it can be concatenated into a
     trainer's error or trace without further wording."""
-    if reason == REASON_OK:
+    if reason == QUANT_REASON_OK:
         return "quantized gradient accumulation is in use"
-    if reason == REASON_NOT_REQUESTED:
+    if reason == QUANT_REASON_NOT_REQUESTED:
         return "quantized gradient training was not requested"
-    if reason == REASON_NOT_CONNECTED:
+    if reason == QUANT_REASON_NOT_CONNECTED:
         return (
             "quantized gradient training is not connected to a trainer in"
             " this build"
         )
-    if reason == REASON_NO_ROWS:
+    if reason == QUANT_REASON_NO_ROWS:
         return "there are no rows to quantize"
-    if reason == REASON_NON_FINITE:
+    if reason == QUANT_REASON_NON_FINITE:
         return "a gradient or hessian is not finite"
-    if reason == REASON_DEGENERATE:
+    if reason == QUANT_REASON_DEGENERATE:
         return (
             "every gradient and hessian magnitude is below the quantization"
             " floor"
         )
-    if reason == REASON_OVERFLOW:
+    if reason == QUANT_REASON_OVERFLOW:
         return (
             "no supported integer accumulator width holds this round's"
             " accumulation bound"
         )
-    if reason == REASON_BACKEND:
+    if reason == QUANT_REASON_BACKEND:
         return "this backend has no quantized accumulation path"
     return "unknown reason"
 
@@ -1169,25 +1169,25 @@ def decide(
     """
     params.validate()
     if not params.enabled:
-        return QuantDecision.floating(REASON_NOT_REQUESTED)
+        return QuantDecision.floating(QUANT_REASON_NOT_REQUESTED)
     if not CONNECTED:
-        return QuantDecision.floating(REASON_NOT_CONNECTED)
+        return QuantDecision.floating(QUANT_REASON_NOT_CONNECTED)
     if not backend_supported:
-        return QuantDecision.floating(REASON_BACKEND)
+        return QuantDecision.floating(QUANT_REASON_BACKEND)
     if stats.n_rows <= 0 or max_node_rows <= 0:
-        return QuantDecision.floating(REASON_NO_ROWS)
+        return QuantDecision.floating(QUANT_REASON_NO_ROWS)
     if not stats.finite:
-        return QuantDecision.floating(REASON_NON_FINITE)
+        return QuantDecision.floating(QUANT_REASON_NON_FINITE)
     if stats.is_degenerate():
-        return QuantDecision.floating(REASON_DEGENERATE)
+        return QuantDecision.floating(QUANT_REASON_DEGENERATE)
 
     var scales = derive_scales(stats, params)
     if not scales.is_usable():
-        return QuantDecision.floating(REASON_DEGENERATE)
+        return QuantDecision.floating(QUANT_REASON_DEGENERATE)
     var width = accumulator_width(max_node_rows, scales, params)
     if width == WIDTH_NONE:
-        return QuantDecision.floating(REASON_OVERFLOW)
-    return QuantDecision(MODE_QUANTIZED, REASON_OK, width, scales)
+        return QuantDecision.floating(QUANT_REASON_OVERFLOW)
+    return QuantDecision(MODE_QUANTIZED, QUANT_REASON_OK, width, scales)
 
 
 def check_supported(params: QuantGradParams) raises:
@@ -1210,7 +1210,7 @@ def check_supported(params: QuantGradParams) raises:
         raise Error(
             String(
                 "use_quantized_grad is not available in this build, ",
-                describe_reason(REASON_NOT_CONNECTED),
+                describe_reason(QUANT_REASON_NOT_CONNECTED),
             )
         )
 
@@ -1808,11 +1808,11 @@ def lattice_resolution_bits(scales: QuantScales) -> Float64:
     return bits
 
 
-def describe_decision(
+def describe_quantization_decision(
     decision: QuantDecision, params: QuantGradParams
 ) -> String:
     """One line naming the mode, the reason, the rule, the rounding, and the
-    accumulator width. The shape `unified_memory_policy.describe_decision`
+    accumulator width. The shape `unified_memory_policy.describe_quantization_decision`
     uses, so a trace of a training run reads the same whichever policy
     produced the line."""
     if not decision.is_quantized():

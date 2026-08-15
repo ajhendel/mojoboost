@@ -65,7 +65,7 @@ What this module deliberately refuses to encode
   policy layer that tried to find out itself would need a device, and would
   turn a testable function into an untestable one.
 - **No timing.** Nothing here reads a clock or holds a measurement. A route
-  is enabled by recorded evidence at `EVIDENCE_TRAINER`, which is an
+  is enabled by recorded evidence at `TRANSFER_EVIDENCE_TRAINER`, which is an
   end-to-end training result, not by a microbenchmark this module could be
   handed.
 - **No inference from `no_copy_issued`.** That flag means mojotrees enqueued
@@ -157,20 +157,20 @@ def parse_route(name: String) raises -> Int:
 # and raised at runtime; `not_probed` means it was never compiled. In Mojo a
 # missing method is a compile error rather than a catchable one, so those two
 # are genuinely different facts and neither is ever smoothed into `ok`.
-comptime STATUS_OK = 0
-comptime STATUS_UNSUPPORTED = 1
-comptime STATUS_WRONG = 2
-comptime STATUS_NOT_PROBED = 3
+comptime TRANSFER_STATUS_OK = 0
+comptime TRANSFER_STATUS_UNSUPPORTED = 1
+comptime TRANSFER_STATUS_WRONG = 2
+comptime TRANSFER_STATUS_NOT_PROBED = 3
 
 
 def status_name(status: Int) -> String:
-    if status == STATUS_OK:
+    if status == TRANSFER_STATUS_OK:
         return String("ok")
-    if status == STATUS_UNSUPPORTED:
+    if status == TRANSFER_STATUS_UNSUPPORTED:
         return String("unsupported")
-    if status == STATUS_WRONG:
+    if status == TRANSFER_STATUS_WRONG:
         return String("wrong")
-    if status == STATUS_NOT_PROBED:
+    if status == TRANSFER_STATUS_NOT_PROBED:
         return String("not_probed")
     return String("unknown")
 
@@ -223,10 +223,10 @@ The only role whose bytes already sit in a runtime allocation the session owns
 before they reach the device, which is what makes it the only bins-shaped role
 a shared route is structurally able to serve. See `structural_support`."""
 
-comptime N_ROLES = 8
+comptime N_TRANSFER_ROLES = 8
 
 
-def role_name(role: Int) -> String:
+def transfer_role_name(role: Int) -> String:
     if role == ROLE_BINS:
         return String("bins")
     if role == ROLE_GRAD:
@@ -263,7 +263,7 @@ def role_direction(role: Int) raises -> Int:
     """
     if role == ROLE_HIST_OUT or role == ROLE_PREDICT_OUT:
         return DIR_DEVICE_TO_HOST
-    if role >= 0 and role < N_ROLES:
+    if role >= 0 and role < N_TRANSFER_ROLES:
         return DIR_HOST_TO_DEVICE
     raise Error("unknown buffer role ", role)
 
@@ -309,7 +309,7 @@ comptime BLOCK_DIRECTION = 7
 """The route is defined for the other transfer direction."""
 
 
-def block_reason_name(reason: Int) -> String:
+def transfer_block_name(reason: Int) -> String:
     if reason == ELIGIBLE:
         return String("eligible")
     if reason == BLOCK_SOURCE_NOT_DEVICE_VISIBLE:
@@ -347,7 +347,7 @@ def publishes_by_copy(route: Int) raises -> Bool:
     `host_direct` and the unprobed wrapped route and of nothing else. Even
     then it is a statement about what *this library* does. The runtime remains
     free to migrate pages or run a blit of its own, which is why
-    `EVIDENCE_NO_COPY_ISSUED` is a low rung on the ladder rather than the
+    `TRANSFER_EVIDENCE_NO_COPY_ISSUED` is a low rung on the ladder rather than the
     answer.
     """
     if route == ROUTE_COPY_STAGED or route == ROUTE_COPY_DIRECT:
@@ -405,7 +405,7 @@ def structural_support(role: Int, route: Int) raises -> Int:
       resident copies to two. It is still gated on evidence like everything
       else.
     """
-    if role < 0 or role >= N_ROLES:
+    if role < 0 or role >= N_TRANSFER_ROLES:
         raise Error("unknown buffer role ", role)
     if route < 0 or route >= N_ROUTES:
         raise Error("unknown transfer route ", route)
@@ -451,35 +451,35 @@ def structural_support(role: Int, route: Int) raises -> Int:
 
 # Rungs, in the order they must be climbed. A route's level is the highest
 # rung with every rung below it satisfied, so a run that produced a Metal
-# trace but no checksum scores `EVIDENCE_NONE`, which is correct: an
+# trace but no checksum scores `TRANSFER_EVIDENCE_NONE`, which is correct: an
 # unverified route's trace is not evidence about a route that works.
-comptime EVIDENCE_NONE = 0
-comptime EVIDENCE_COMPILED = 1
+comptime TRANSFER_EVIDENCE_NONE = 0
+comptime TRANSFER_EVIDENCE_COMPILED = 1
 """The route compiles in this Mojo version. Distinguishes a real route from
 one that only exists in a document."""
 
-comptime EVIDENCE_CHECKSUM = 2
+comptime TRANSFER_EVIDENCE_CHECKSUM = 2
 """The device read or wrote the correct bytes, round after round, against a
 host reference. Necessary for any timing to mean anything."""
 
-comptime EVIDENCE_NO_COPY_ISSUED = 3
+comptime TRANSFER_EVIDENCE_NO_COPY_ISSUED = 3
 """mojotrees enqueued no copy. A fact about this library, not about the
 hardware or the runtime."""
 
-comptime EVIDENCE_NO_SECOND_ALLOCATION = 4
+comptime TRANSFER_EVIDENCE_NO_SECOND_ALLOCATION = 4
 """An external capture shows one payload-sized resident allocation rather
 than two, with no swap or compressor movement during the run."""
 
-comptime EVIDENCE_NO_BLIT = 5
+comptime TRANSFER_EVIDENCE_NO_BLIT = 5
 """A Metal System Trace shows no blit encoder between the host write and the
 kernel. This is the rung that separates 'we issued no copy' from 'no copy
 happened', and no timing number substitutes for it."""
 
-comptime EVIDENCE_TRAINER = 6
+comptime TRANSFER_EVIDENCE_TRAINER = 6
 """`bench/bench_train_gpu.mojo` on the route beats the same benchmark on
 `copy_staged`, on the same machine, repeated, with identical models out."""
 
-comptime ENABLE_LEVEL = EVIDENCE_TRAINER
+comptime ENABLE_LEVEL = TRANSFER_EVIDENCE_TRAINER
 """What a route needs before it may be selected without an explicit
 acknowledgment.
 
@@ -496,19 +496,19 @@ trainer.
 
 
 def evidence_name(level: Int) -> String:
-    if level == EVIDENCE_NONE:
+    if level == TRANSFER_EVIDENCE_NONE:
         return String("none")
-    if level == EVIDENCE_COMPILED:
+    if level == TRANSFER_EVIDENCE_COMPILED:
         return String("compiled")
-    if level == EVIDENCE_CHECKSUM:
+    if level == TRANSFER_EVIDENCE_CHECKSUM:
         return String("checksum")
-    if level == EVIDENCE_NO_COPY_ISSUED:
+    if level == TRANSFER_EVIDENCE_NO_COPY_ISSUED:
         return String("no_copy_issued")
-    if level == EVIDENCE_NO_SECOND_ALLOCATION:
+    if level == TRANSFER_EVIDENCE_NO_SECOND_ALLOCATION:
         return String("no_second_allocation")
-    if level == EVIDENCE_NO_BLIT:
+    if level == TRANSFER_EVIDENCE_NO_BLIT:
         return String("no_blit")
-    if level == EVIDENCE_TRAINER:
+    if level == TRANSFER_EVIDENCE_TRAINER:
         return String("trainer")
     return String("unknown")
 
@@ -533,7 +533,7 @@ struct RouteEvidence(Copyable, Movable):
     var trainer_confirmed: Bool
     var record: String
     """Identifier of the run in the document's record section, empty when
-    there is none. A route whose level is above `EVIDENCE_NONE` with an empty
+    there is none. A route whose level is above `TRANSFER_EVIDENCE_NONE` with an empty
     record is a bug, which `audit` reports."""
 
     @staticmethod
@@ -551,18 +551,18 @@ struct RouteEvidence(Copyable, Movable):
         it rather than being averaged away.
         """
         if not self.compiled:
-            return EVIDENCE_NONE
+            return TRANSFER_EVIDENCE_NONE
         if not self.checksum_ok:
-            return EVIDENCE_COMPILED
+            return TRANSFER_EVIDENCE_COMPILED
         if not self.no_copy_issued:
-            return EVIDENCE_CHECKSUM
+            return TRANSFER_EVIDENCE_CHECKSUM
         if not self.single_resident_allocation:
-            return EVIDENCE_NO_COPY_ISSUED
+            return TRANSFER_EVIDENCE_NO_COPY_ISSUED
         if not self.no_blit_in_trace:
-            return EVIDENCE_NO_SECOND_ALLOCATION
+            return TRANSFER_EVIDENCE_NO_SECOND_ALLOCATION
         if not self.trainer_confirmed:
-            return EVIDENCE_NO_BLIT
-        return EVIDENCE_TRAINER
+            return TRANSFER_EVIDENCE_NO_BLIT
+        return TRANSFER_EVIDENCE_TRAINER
 
     def enables(self) -> Bool:
         return self.level() >= ENABLE_LEVEL
@@ -570,7 +570,7 @@ struct RouteEvidence(Copyable, Movable):
     def audit(self) -> String:
         """Empty when the evidence is internally consistent, otherwise what
         is wrong with it."""
-        if self.level() > EVIDENCE_NONE and self.record.byte_length() == 0:
+        if self.level() > TRANSFER_EVIDENCE_NONE and self.record.byte_length() == 0:
             return String(
                 "route ",
                 route_name(self.route),
@@ -877,7 +877,7 @@ def role_element_bytes(role: Int) raises -> Int:
         return 1
     if role == ROLE_ROW_SEED:
         return 4
-    if role < 0 or role >= N_ROLES:
+    if role < 0 or role >= N_TRANSFER_ROLES:
         raise Error("unknown buffer role ", role)
     return 4
 
@@ -1100,7 +1100,7 @@ def route_block_reason(
     Raises only on an unknown role or route, which is a programming error
     rather than a policy answer.
     """
-    if role < 0 or role >= N_ROLES:
+    if role < 0 or role >= N_TRANSFER_ROLES:
         raise Error("unknown buffer role ", role)
     if requested < 0 or requested >= N_ROUTES:
         raise Error("unknown transfer route ", requested)
@@ -1208,9 +1208,9 @@ def resolve_route(
             "transfer route '",
             route_name(requested),
             "' cannot serve the '",
-            role_name(role),
+            transfer_role_name(role),
             "' buffer: ",
-            block_reason_name(reason),
+            transfer_block_name(reason),
             "; see docs/APPLE_UNIFIED_MEMORY.md",
         )
     return explain_route(
@@ -1318,8 +1318,8 @@ struct SessionMemoryPlan(Copyable, Movable):
         module was written to prevent.
         """
         var contract = sync_contract(DEFAULT_ROUTE)
-        var decisions = List[RouteDecision](capacity=N_ROLES)
-        for role in range(N_ROLES):
+        var decisions = List[RouteDecision](capacity=N_TRANSFER_ROLES)
+        for role in range(N_TRANSFER_ROLES):
             decisions.append(
                 RouteDecision(
                     role,
@@ -1327,7 +1327,7 @@ struct SessionMemoryPlan(Copyable, Movable):
                     DEFAULT_ROUTE,
                     ELIGIBLE,
                     False,
-                    EVIDENCE_NONE,
+                    TRANSFER_EVIDENCE_NONE,
                     contract.copy(),
                 )
             )
@@ -1394,10 +1394,10 @@ struct SessionMemoryPlan(Copyable, Movable):
         var out = String("")
         for role in range(len(self.decisions)):
             var d = self.decisions[role].copy()
-            out += "transfer." + role_name(d.role)
+            out += "transfer." + transfer_role_name(d.role)
             out += " " + route_name(d.requested)
             out += " " + route_name(d.selected)
-            out += " " + block_reason_name(d.reason)
+            out += " " + transfer_block_name(d.reason)
             out += " " + evidence_name(d.evidence_level)
             out += " " + retire_event_name(d.contract.retire_event)
             if d.ack_unproven:
@@ -1431,8 +1431,8 @@ def plan_session_routes(unified_memory: Bool) raises -> SessionMemoryPlan:
     var requested = env_requested_route()
     var ack = env_ack_unproven()
     var ledger = EvidenceLedger.installed()
-    var decisions = List[RouteDecision](capacity=N_ROLES)
-    for role in range(N_ROLES):
+    var decisions = List[RouteDecision](capacity=N_TRANSFER_ROLES)
+    for role in range(N_TRANSFER_ROLES):
         decisions.append(
             explain_route(role, requested, unified_memory, ledger, ack)
         )
@@ -1473,7 +1473,7 @@ def describe_decision(decision: RouteDecision) -> String:
     is not the same event as one that was asked for."""
     var out = String(
         "role=",
-        role_name(decision.role),
+        transfer_role_name(decision.role),
         " requested=",
         route_name(decision.requested),
         " selected=",
@@ -1484,7 +1484,7 @@ def describe_decision(decision: RouteDecision) -> String:
         retire_event_name(decision.contract.retire_event),
     )
     if decision.reason != ELIGIBLE:
-        out += " blocked=" + block_reason_name(decision.reason)
+        out += " blocked=" + transfer_block_name(decision.reason)
     if decision.ack_unproven:
         out += " ack_unproven=1"
     return out

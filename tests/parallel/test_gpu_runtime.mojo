@@ -31,7 +31,7 @@ from mojotrees.gpu_runtime import (
     N_KERNELS,
     N_PHASES,
     N_POOL_SLOTS,
-    N_ROLES,
+    N_SESSION_ROLES,
     N_STATES,
     PHASE_ALLOC,
     PHASE_CLEANUP,
@@ -75,10 +75,10 @@ from mojotrees.gpu_runtime import (
     model_build_leaf,
     model_set_features,
     model_upload_gradients,
-    phase_name,
+    session_phase_name,
     pool_action_name,
     resource_name,
-    role_name,
+    session_role_name,
     state_name,
     sync_reason_name,
 )
@@ -658,7 +658,7 @@ def test_residency_rejects_unknown_roles_and_empty_matrices() raises:
     var ledger = ResidencyLedger()
     var raised = False
     try:
-        _ = ledger.admit(N_ROLES, MatrixIdentity(10, 2, 8, UInt64(1)))
+        _ = ledger.admit(N_SESSION_ROLES, MatrixIdentity(10, 2, 8, UInt64(1)))
     except:
         raised = True
     assert_true(raised)
@@ -670,7 +670,7 @@ def test_residency_rejects_unknown_roles_and_empty_matrices() raises:
         raised = True
     assert_true(raised)
 
-    assert_true(not ledger.is_resident(N_ROLES, MatrixIdentity.empty()))
+    assert_true(not ledger.is_resident(N_SESSION_ROLES, MatrixIdentity.empty()))
 
 
 def _same_fingerprint(a: UInt64, b: UInt64) -> Bool:
@@ -788,9 +788,9 @@ def test_counters_reject_unknown_phases() raises:
 def test_names_cover_every_constant() raises:
     """A trace is read by a person, so every id has to have a name and an
     unknown id has to say so rather than print a number."""
-    assert_equal(phase_name(PHASE_COMPILE), "compile")
-    assert_equal(phase_name(PHASE_CLEANUP), "cleanup")
-    assert_equal(phase_name(N_PHASES), "unknown")
+    assert_equal(session_phase_name(PHASE_COMPILE), "compile")
+    assert_equal(session_phase_name(PHASE_CLEANUP), "cleanup")
+    assert_equal(session_phase_name(N_PHASES), "unknown")
 
     assert_equal(resource_name(RES_BINS), "bins")
     assert_equal(resource_name(RES_FEAT), "feat")
@@ -809,9 +809,9 @@ def test_names_cover_every_constant() raises:
     assert_equal(kernel_name(KERNEL_PARTITION), "partition")
     assert_equal(kernel_name(N_KERNELS), "unknown")
 
-    assert_equal(role_name(ROLE_TRAIN), "train")
-    assert_equal(role_name(ROLE_VALID), "valid")
-    assert_equal(role_name(N_ROLES), "unknown")
+    assert_equal(session_role_name(ROLE_TRAIN), "train")
+    assert_equal(session_role_name(ROLE_VALID), "valid")
+    assert_equal(session_role_name(N_SESSION_ROLES), "unknown")
 
 
 def test_env_overrides() raises:

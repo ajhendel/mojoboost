@@ -127,6 +127,7 @@ from max.gpu.host import DeviceBuffer, DeviceContext, HostBuffer
 from max.gpu.memory import AddressSpace
 from max.gpu.sync import barrier
 
+from .gpu_active_rows import MAX_ROWS
 from .gpu_objectives_native import (
     HESS_FLOOR,
     SUM_BLOCKS,
@@ -153,9 +154,6 @@ from .gpu_tiling import (
 )
 from .histogram import Histogram, _zeroed_f64, _zeroed_int
 
-# Row indices cross into the kernels as Int32, as everywhere else on the
-# device path.
-comptime MAX_ROWS = Int(Int32.MAX)
 
 # Round phases the guard walks through. A round is IDLE before it opens,
 # PROBS once the probability snapshot is fresh, and stays there while

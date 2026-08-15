@@ -670,7 +670,7 @@ def derive_policy(
     )
 
 
-def describe_policy(profile: GpuProfile, policy: TuningPolicy) -> String:
+def describe_gpu_policy(profile: GpuProfile, policy: TuningPolicy) -> String:
     """One line for benchmark output and bug reports: which device the plan
     was made for, whether that device was real, and what it decided."""
     var origin = String("reported")

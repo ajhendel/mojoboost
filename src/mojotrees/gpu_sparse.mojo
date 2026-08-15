@@ -176,7 +176,6 @@ from .histogram import Histogram, _zeroed_f64, _zeroed_int
 from .histogram_sparse import SparseNodeEntries
 from .sparse import SparseBinnedMatrix
 
-comptime MAX_BINS = SPARSE_MAX_BINS
 
 # The scan buffers hold one Int32 per thread, so the block size the segmented
 # partition can be launched with is bounded by the allocation rather than by
@@ -412,13 +411,13 @@ def _sparse_hist_kernel(
     var hi = Int(ranges[unsafe_offset = rbase + 1][0])
 
     var sg = stack_allocation[
-        MAX_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
+        SPARSE_MAX_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
     ]()
     var sh = stack_allocation[
-        MAX_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
+        SPARSE_MAX_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
     ]()
     var sc = stack_allocation[
-        MAX_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
+        SPARSE_MAX_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
     ]()
 
     var b = tid

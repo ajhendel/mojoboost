@@ -115,7 +115,6 @@ from .distributed_strategies import (
     parse_strategy,
     search_owned_features,
     select_top_k,
-    strategy_name,
     unpack_selected,
 )
 from .distributed_transport import (

@@ -42,7 +42,7 @@ from mojotrees.initialization import (
     N_STARTUP_PHASES,
     StartupTrace,
     env_warmup_level,
-    origin_name,
+    startup_origin_name,
     phase_is_one_time,
     phase_name,
     phase_origin,
@@ -380,7 +380,7 @@ def startup_phase_contract() raises -> PythonObject:
         var record = Python.list()
         record.append(PythonObject(phase))
         record.append(PythonObject(phase_name(phase)))
-        record.append(PythonObject(origin_name(phase_origin(phase))))
+        record.append(PythonObject(startup_origin_name(phase_origin(phase))))
         record.append(PythonObject(Int(phase_is_one_time(phase))))
         out.append(record^)
     return out^
