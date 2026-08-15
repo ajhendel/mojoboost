@@ -33,9 +33,20 @@ Usage: mojo run -I src bench/bench_train_gpu.mojo \\
 
 `arms` is a comma-separated list of cpu, gpu, gpu-host, gpu-device, in the
 order they should run; the first is the baseline every other arm is compared
-against. Defaults: 100000 rows, 100 features, reg, 1 repeat, `cpu,gpu`.
+against. Any arm takes a `-depth` suffix (`cpu-depth`, `gpu-device-depth`,
+...) to train the same configuration under `grow_policy=depthwise`; the
+leaf budget is unchanged, so a depth-wise arm commits the same number of
+splits and issues the same number of GPU launch groups as its leaf-wise
+twin, and the pair measures the per-split cost of the order alone. That is
+the comparison the depth-wise lane owes before any per-level launch
+batching is written (docs/design/GPU_LEVELWISE.md): if the twins are
+indistinguishable, batching has only the launch count to attack, and
+`MOJOTREES_GPU_PHASE_TRACE=1` on a single arm at two row counts gives the
+row-independent share of a tree's time, which is the ceiling of that
+attack. Defaults: 100000 rows, 100 features, reg, 1 repeat, `cpu,gpu`.
 
     pixi run bench-train-gpu 50000 100 reg 5 gpu-host,gpu-device
+    pixi run bench-train-gpu 250000 50 reg 5 gpu-device,gpu-device-depth
 """
 
 from std.math import exp, log
@@ -51,6 +62,7 @@ from mojotrees.boosting import (
     train,
 )
 from mojotrees.binning import BinnedMatrix
+from mojotrees.growth_policy import GROW_DEPTHWISE
 from mojotrees.train_gpu import (
     SPLIT_SEARCH_AUTO,
     SPLIT_SEARCH_DEVICE,
@@ -109,6 +121,8 @@ comptime ARM_CPU = 0
 comptime ARM_GPU = 1
 comptime ARM_GPU_HOST = 2
 comptime ARM_GPU_DEVICE = 3
+# Added to any of the above: the same arm under `grow_policy=depthwise`.
+comptime ARM_DEPTHWISE = 4
 
 
 struct ArmRun(Copyable, Movable):
@@ -124,23 +138,31 @@ struct ArmRun(Copyable, Movable):
         self.n_trees = n_trees
 
 
+def _arm_base(arm: Int) -> Int:
+    return arm & (ARM_DEPTHWISE - 1)
+
+
+def _arm_depthwise(arm: Int) -> Bool:
+    return (arm & ARM_DEPTHWISE) != 0
+
+
 def _arm_name(arm: Int) -> String:
-    if arm == ARM_CPU:
-        return String("cpu")
-    if arm == ARM_GPU_HOST:
-        return String("gpu-host")
-    if arm == ARM_GPU_DEVICE:
-        return String("gpu-device")
-    return String("gpu")
+    var base = _arm_base(arm)
+    var name = String("gpu")
+    if base == ARM_CPU:
+        name = String("cpu")
+    elif base == ARM_GPU_HOST:
+        name = String("gpu-host")
+    elif base == ARM_GPU_DEVICE:
+        name = String("gpu-device")
+    if _arm_depthwise(arm):
+        name += "-depth"
+    return name
 
 
 def _arm_key(arm: Int) -> String:
-    """`_arm_name` with the hyphen removed, for `key: value` output lines."""
-    if arm == ARM_GPU_HOST:
-        return String("gpu_host")
-    if arm == ARM_GPU_DEVICE:
-        return String("gpu_device")
-    return _arm_name(arm)
+    """`_arm_name` with the hyphens replaced, for `key: value` output lines."""
+    return _arm_name(arm).replace("-", "_")
 
 
 def _parse_arms(spec: String) raises -> List[Int]:
@@ -150,20 +172,25 @@ def _parse_arms(spec: String) raises -> List[Int]:
         var name = String(part)
         if name.byte_length() == 0:
             continue
+        var flags = 0
+        if name.endswith("-depth"):
+            flags = ARM_DEPTHWISE
+            name = String(name[: name.byte_length() - 6])
         if name == "cpu":
-            arms.append(ARM_CPU)
+            arms.append(ARM_CPU | flags)
         elif name == "gpu":
-            arms.append(ARM_GPU)
+            arms.append(ARM_GPU | flags)
         elif name == "gpu-host":
-            arms.append(ARM_GPU_HOST)
+            arms.append(ARM_GPU_HOST | flags)
         elif name == "gpu-device":
-            arms.append(ARM_GPU_DEVICE)
+            arms.append(ARM_GPU_DEVICE | flags)
         else:
             raise Error(
                 String(
                     "unknown arm '",
                     name,
-                    "'; use cpu, gpu, gpu-host, or gpu-device",
+                    "'; use cpu, gpu, gpu-host, or gpu-device, each with an"
+                    " optional -depth suffix",
                 )
             )
     if len(arms) == 0:
@@ -186,7 +213,10 @@ def _run_arm(
     measure training.
     """
     var params = BoosterParams.default()
-    if arm == ARM_CPU:
+    if _arm_depthwise(arm):
+        params.tree.grow_policy = GROW_DEPTHWISE
+    var base = _arm_base(arm)
+    if base == ARM_CPU:
         var cpu_t0 = perf_counter_ns()
         var cpu_model = train(data, target, objective, params)
         var cpu_s = Float64(perf_counter_ns() - cpu_t0) / 1e9
@@ -196,9 +226,9 @@ def _run_arm(
         return ArmRun(cpu_s, cpu_loss, len(cpu_model.trees))
 
     var strategy = SPLIT_SEARCH_AUTO
-    if arm == ARM_GPU_HOST:
+    if base == ARM_GPU_HOST:
         strategy = SPLIT_SEARCH_HOST
-    elif arm == ARM_GPU_DEVICE:
+    elif base == ARM_GPU_DEVICE:
         strategy = SPLIT_SEARCH_DEVICE
     # Includes GpuHistogramBuilder construction and every transfer.
     var gpu_t0 = perf_counter_ns()
