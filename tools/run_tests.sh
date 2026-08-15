@@ -103,6 +103,7 @@ test_apple_gpu_policy
 test_backend_equivalence
 test_device
 test_gpu_active_rows
+test_gpu_fma_consistency
 test_gpu_kernel_family
 test_gpu_objectives
 test_gpu_objectives_native
