@@ -217,7 +217,7 @@
   },
   "mojo": {
     "abi_promise": "none; Mojo has no stable ABI, so the guarantee is source compatibility only",
-    "export_count": 483,
+    "export_count": 582,
     "export_source": "src/mojotrees/__init__.mojo",
     "exports_by_module": {
       "alternate_boosting": [
@@ -309,6 +309,17 @@
         "find_best_categorical_split",
         "fit_categorical_spec"
       ],
+      "cegb": [
+        "CEGB_DEFAULT_TRADEOFF",
+        "CegbConfig",
+        "CegbLedger",
+        "CegbNodeCosts",
+        "cegb_adjusted_gain",
+        "cegb_commit_split",
+        "cegb_delta_gain",
+        "cegb_stale_cached_gain",
+        "prepare_cegb_node"
+      ],
       "class_weight": [
         "balanced_class_weights",
         "balanced_sample_weight",
@@ -385,11 +396,64 @@
       ],
       "distributed": [
         "DataShard",
+        "DistributedRunOptions",
         "allreduce_histogram",
         "grow_tree_distributed",
         "partition_rows",
         "partition_values",
-        "train_distributed"
+        "train_distributed",
+        "train_distributed_run"
+      ],
+      "distributed_gpu": [
+        "GATE_DEVICE_COLLECTIVE",
+        "GATE_DRIVER",
+        "GATE_GPU_SPEEDUP",
+        "GATE_TRANSPORT",
+        "GATE_VALIDATION",
+        "distributed_gpu_available",
+        "distributed_gpu_gates",
+        "distributed_gpu_unavailable_detail",
+        "gate_name",
+        "gpu_exchange_plan",
+        "gpu_round_plan",
+        "require_distributed_gpu"
+      ],
+      "distributed_strategies": [
+        "DEFAULT_TOP_K",
+        "FeaturePartition",
+        "STRATEGY_DATA_PARALLEL",
+        "STRATEGY_FEATURE_PARALLEL",
+        "STRATEGY_SERIAL",
+        "STRATEGY_VOTING_PARALLEL",
+        "parse_strategy",
+        "strategy_capabilities",
+        "strategy_cost_plan",
+        "strategy_name",
+        "voting_is_exact"
+      ],
+      "external_memory": [
+        "CacheLayout",
+        "DEFAULT_BIN_MEMORY_BUDGET",
+        "DEFAULT_CHUNK_ROWS",
+        "EXT_VERSION",
+        "ExternalCapabilities",
+        "ExternalDataset",
+        "ExternalManifest",
+        "ExternalMemoryParams",
+        "build_external_dataset",
+        "build_external_dataset_from_raw",
+        "check_external_supported",
+        "external_groups",
+        "fit_mapper_external",
+        "open_external_dataset",
+        "spill_source",
+        "train_external",
+        "train_external_multiclass",
+        "train_external_ranker",
+        "train_external_sparse",
+        "train_external_sparse_multiclass",
+        "update_external",
+        "update_external_multiclass"
       ],
       "gain": [
         "leaf_score"
@@ -737,6 +801,34 @@
         "select_tree_features",
         "selection_count"
       ],
+      "sequence": [
+        "CategoryTally",
+        "ChunkPlan",
+        "ChunkSchema",
+        "CscSequence",
+        "MemorySequence",
+        "RawChunk",
+        "RowFields",
+        "RowIdRange",
+        "SEQ_BUDGET",
+        "SEQ_CANCELLED",
+        "SEQ_NOT_REPEATABLE",
+        "SEQ_OK",
+        "SEQ_ROW_ORDER",
+        "SEQ_SCHEMA_MISMATCH",
+        "Sequence",
+        "SequenceStats",
+        "check_row_coverage",
+        "csc_sequence_from_raw",
+        "feature_block_width",
+        "gather_dense_block",
+        "gather_row_fields",
+        "gather_sparse_block",
+        "materialize_dense",
+        "memory_sequence_from_raw",
+        "require_chunk_schema",
+        "sequence_status_message"
+      ],
       "serialize": [
         "file_kind",
         "load_dataset",
@@ -796,12 +888,31 @@
         "Tree",
         "TreeParams",
         "grow_tree",
+        "grow_tree_with_cegb",
         "node_bounds"
       ],
       "tree_sparse": [
         "SparseTreeResult",
         "grow_tree_sparse",
         "predict_row_sparse"
+      ],
+      "validation": [
+        "CancelToken",
+        "check_booster_ranges",
+        "check_class_codes",
+        "check_compressed",
+        "check_dataset_columns",
+        "check_features_finite",
+        "check_group_counts",
+        "check_labels_finite",
+        "check_loaded_tree",
+        "check_multiclass_inputs",
+        "check_ranking_inputs",
+        "check_relevance_labels",
+        "check_shape",
+        "check_training_inputs",
+        "check_valid_set",
+        "check_weights"
       ]
     },
     "objective_codes": {},
@@ -845,6 +956,8 @@
       "monotone_constraints_method",
       "cegb_tradeoff",
       "cegb_penalty_split",
+      "linear_tree",
+      "linear_lambda",
       "enable_bundle",
       "max_conflict_rate",
       "data_sample_strategy",
@@ -1079,6 +1192,7 @@
             "eval_y": null,
             "group": null,
             "min_delta": 0.0,
+            "position": null,
             "primary_metric": 0,
             "sample_weight": null,
             "y": "required"
@@ -1110,9 +1224,14 @@
         "objective_names": [],
         "own_parameters": {
           "**kwargs": "varkw",
+          "label_gain": null,
           "lambdarank_norm": true,
+          "lambdarank_position_bias_regularization": 0.0,
           "lambdarank_truncation_level": 30,
+          "max_dcg_cutoff": 0,
           "ndcg_eval_at": 5,
+          "pair_sampling_rate": 1.0,
+          "pair_sampling_seed": 5,
           "sigmoid": 1.0
         },
         "properties": []
@@ -1531,8 +1650,6 @@
       "categorical_feature": "auto",
       "categorical_features": null,
       "cegb_penalty_split": 0.0,
-      "linear_tree": false,
-      "linear_lambda": 0.0,
       "cegb_tradeoff": 1.0,
       "device": "cpu",
       "device_type": null,
@@ -1554,6 +1671,8 @@
       "lambda_l1": 0.0,
       "lambda_l2": 1.0,
       "learning_rate": 0.1,
+      "linear_lambda": 0.0,
+      "linear_tree": false,
       "max_bin": 255,
       "max_bundle_bins": 256,
       "max_bundle_size": 0,
