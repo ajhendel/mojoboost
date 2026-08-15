@@ -56,7 +56,7 @@ metric sees them, so `l2` on a poisson model scores expected counts and
 objective, as in LightGBM; a metric never applies a second one.
 
 Where these facts belong
-------------------------
+
 Names, aliases, directions, tasks, and per-objective defaults are *not*
 Python's to know. They are one registry in Mojo,
 src/mojotrees/objective_registry.mojo, alongside the objective facts that
@@ -64,8 +64,10 @@ go with them (links, scalar parameters, leaf renewal, backend support), so
 that a metric added to metrics.mojo cannot be invisible from Python and a
 direction cannot disagree with the code that computes the number.
 
-This module is a facade over that registry, with two implementations
-behind one indirection, `_TABLE`, whose six methods are one-for-one with
+This module is a facade over that registry. `_TABLE` is one snapshot of it,
+taken at import through `_mojotrees.registry_metrics`,
+`registry_metric_aliases`, `registry_objectives`, and
+`registry_objective_aliases`, and its methods are one-for-one with
 registry queries:
 
     _TABLE.metric_code(name)         metric_code_from_name
@@ -75,72 +77,25 @@ registry queries:
     _TABLE.names_for_task(task)      metric_names_for_task
     _TABLE.default_metric(task, o)   objective_default_metric
 
-`_NativeTable` answers them from one snapshot of the native registry,
-taken once at import through `_mojotrees.registry_metrics`,
-`registry_metric_aliases`, `registry_objectives`, and
-`registry_objective_aliases` (the binding API in section 4 of
-handoffs/migration_21_objective_metric_registry.md). `_CompatTable`
-answers them from the mirrored dicts in the marked block below, and is
-what runs on a build that does not expose those four functions -- which
-is every build today, because the binding has not landed. `_selected()`
-picks the native one when the whole snapshot is available and internally
-consistent, and falls back to the mirror otherwise rather than answering
-half from each. `registry_source()` reports which one is live.
+`resolve()` asks the registry itself for the one name it holds, through
+`_mojotrees.metric_code_of_name`, and reads the rest off the snapshot; the
+two cannot disagree because the snapshot is derived from the same
+registry. There is no Python mirror of any of it any more: the mirrored
+tables this module carried while the binding was landing were compared
+against the native answers, spelling for spelling, and deleted. A build
+whose extension cannot answer the registry queries fails at import with
+a message that says so, rather than answering from a copy that could
+drift.
 
-When the binding lands and the native table has been validated, the
-deletion is the marked block plus `_CompatTable` plus the fallback branch
-of `_selected()`; nothing public moves.
+The metric code constants below (`L2` ... `MAP`) are read off the same
+snapshot, so they are names for the registry's numbers, not a second
+statement of them. `REGRESSION`, `BINARY`, `MULTICLASS`, `RANKING` are the
+task spellings `objective_registry.task_name` uses.
 
-One deliberate difference between the two, and the reason the switch is
-not silent: `_DEFAULTS` below is keyed on the objective *name the user
-typed*, so an objective alias missing from it has no default metric even
-though the objective does. The registry keys the same rule on the
-objective code and so has no such hole, and `_NativeTable` closes it.
-`registry_source()` is how a test tells which behavior it is looking at.
-
-What stays in Python either way: turning a Python callable into a metric
-spec (python/mojotrees/__init__.py), and formatting the ValueErrors below.
+What stays in Python: turning a Python callable into a metric spec
+(python/mojotrees/_fit_args.py), and formatting the ValueErrors below.
 Both are presentation, not semantics.
-
-handoffs/migration_21_objective_metric_registry.md carries the binding API
-this needs, the lines that get deleted, and the disagreements found between
-this file, the Mojo tables, the README, and docs/LIGHTGBM_PARITY.md.
-handoffs/connect_07_python_public.md carries the switch.
 """
-
-# ===========================================================================
-# Compatibility table. Mirrors src/mojotrees/objective_registry.mojo.
-#
-# Nothing outside this block reads these dicts: `_CompatTable` below is the
-# only consumer, so deleting the block means deleting `_CompatTable` with
-# it. Do not add a fact here that the registry does not carry, and do not
-# change one here alone.
-# ===========================================================================
-
-# Metric codes: the mirror of the table in bindings/_mojotrees.mojo and of
-# `METRIC_*` in src/mojotrees/objective_registry.mojo. The three are one
-# contract and must move together.
-L2 = 0
-RMSE = 1
-L1 = 2
-QUANTILE = 3
-HUBER = 4
-BINARY_LOGLOSS = 5
-BINARY_ERROR = 6
-AUC = 7
-MULTI_LOGLOSS = 8
-MULTI_ERROR = 9
-NDCG = 10
-MAPE = 11
-FAIR = 12
-POISSON = 13
-GAMMA = 14
-GAMMA_DEVIANCE = 15
-TWEEDIE = 16
-CROSS_ENTROPY = 17
-KLDIV = 18
-AVERAGE_PRECISION = 19
-MAP = 20
 
 # Task names, `objective_registry.task_name` spelling for spelling.
 REGRESSION = "regression"
@@ -148,148 +103,19 @@ BINARY = "binary"
 MULTICLASS = "multiclass"
 RANKING = "ranking"
 
-#: canonical name -> (code, higher_is_better, task)
-_METRICS = {
-    "l2": (L2, False, REGRESSION),
-    "rmse": (RMSE, False, REGRESSION),
-    "l1": (L1, False, REGRESSION),
-    "quantile": (QUANTILE, False, REGRESSION),
-    "huber": (HUBER, False, REGRESSION),
-    "mape": (MAPE, False, REGRESSION),
-    "fair": (FAIR, False, REGRESSION),
-    "poisson": (POISSON, False, REGRESSION),
-    "gamma": (GAMMA, False, REGRESSION),
-    "gamma_deviance": (GAMMA_DEVIANCE, False, REGRESSION),
-    "tweedie": (TWEEDIE, False, REGRESSION),
-    "cross_entropy": (CROSS_ENTROPY, False, REGRESSION),
-    "kullback_leibler": (KLDIV, False, REGRESSION),
-    "binary_logloss": (BINARY_LOGLOSS, False, BINARY),
-    "binary_error": (BINARY_ERROR, False, BINARY),
-    "auc": (AUC, True, BINARY),
-    "average_precision": (AVERAGE_PRECISION, True, BINARY),
-    "multi_logloss": (MULTI_LOGLOSS, False, MULTICLASS),
-    "multi_error": (MULTI_ERROR, False, MULTICLASS),
-    "ndcg": (NDCG, True, RANKING),
-    "map": (MAP, True, RANKING),
-}
-
-#: alias -> canonical name
-_ALIASES = {
-    "mean_squared_error": "l2",
-    "mse": "l2",
-    "regression_l2": "l2",
-    "regression": "l2",
-    "root_mean_squared_error": "rmse",
-    "l2_root": "rmse",
-    "mean_absolute_error": "l1",
-    "mae": "l1",
-    "regression_l1": "l1",
-    "mean_absolute_percentage_error": "mape",
-    "gamma_dev": "gamma_deviance",
-    "xentropy": "cross_entropy",
-    "kldiv": "kullback_leibler",
-    "binary": "binary_logloss",
-    "multiclass": "multi_logloss",
-    "softmax": "multi_logloss",
-    "lambdarank": "ndcg",
-    "mean_average_precision": "map",
-}
-
-#: The metric LightGBM scores when none is named, by objective. A custom
-#: objective has no default: only its author knows what it optimizes.
-#:
-#: Keyed by the objective *name the user typed*, which is why an objective
-#: alias missing from this table has no default even though the objective
-#: itself does; the registry keys the same rule on the objective code and so
-#: has no such hole. Closing it changes behavior, so it is a handoff item
-#: rather than an edit here.
-_DEFAULTS = {
-    "regression": "l2",
-    "huber": "huber",
-    "quantile": "quantile",
-    "mae": "l1",
-    "regression_l1": "l1",
-    "poisson": "poisson",
-    "gamma": "gamma",
-    "tweedie": "tweedie",
-    "mape": "mape",
-    "fair": "fair",
-    "cross_entropy": "cross_entropy",
-    "xentropy": "cross_entropy",
-}
-
-#: The task defaults that do not depend on the objective name: a classifier
-#: scores its log loss and a ranker its NDCG whatever spelling reached them.
-_TASK_DEFAULTS = {
-    BINARY: "binary_logloss",
-    MULTICLASS: "multi_logloss",
-    RANKING: "ndcg",
-}
-
-
-class _CompatTable:
-    """The registry queries, answered from the mirrored dicts above.
-
-    One method per registry function, taking and returning what the native
-    call will take and return, so `_NativeTable` can replace this class
-    without touching a caller. `metric_code` returns None rather than
-    raising for an unknown name because the caller builds the message.
-    """
-
-    #: Which of the two implementations answered. See `registry_source`.
-    source = "compat"
-
-    def metric_code(self, canonical):
-        spec = _METRICS.get(canonical)
-        return None if spec is None else spec[0]
-
-    def canonical_name(self, name):
-        """The alias resolution, which the native side folds into
-        `metric_code_from_name`; kept separate here because the ValueError
-        below names the canonical spelling, not the one that was typed."""
-        return _ALIASES.get(name, name)
-
-    def metric_task(self, code):
-        for _, (metric_code, _higher, task) in _METRICS.items():
-            if metric_code == code:
-                return task
-        raise ValueError(f"unknown metric code {code!r}")
-
-    def higher_is_better(self, code):
-        for _, (metric_code, higher, _task) in _METRICS.items():
-            if metric_code == code:
-                return higher
-        raise ValueError(f"unknown metric code {code!r}")
-
-    def names_for_task(self, task):
-        return sorted(
-            name for name, spec in _METRICS.items() if spec[2] == task
-        )
-
-    def default_metric(self, task, objective):
-        """The metric name for a task and objective, or None when the
-        objective has no default loss to score."""
-        by_task = _TASK_DEFAULTS.get(task)
-        if by_task is not None:
-            return by_task
-        if callable(objective):
-            return None
-        return _DEFAULTS.get(objective)
-
 
 # ===========================================================================
 # The native table. Reads the registry, holds no facts of its own.
 # ===========================================================================
 
-#: The four registry entry points, in the spelling section 4 of
-#: handoffs/migration_21_objective_metric_registry.md specifies. All four
-#: are needed: answering half the queries natively and half from the mirror
-#: is exactly the drift this module exists to prevent.
+#: The four registry snapshot entry points, plus the single lookup
+#: `resolve()` makes per name. All are required of the extension.
 _REGISTRY_HOOKS = (
     "registry_metrics",
     "registry_metric_aliases",
     "registry_objectives",
     "registry_objective_aliases",
+    "metric_code_of_name",
 )
 
 #: Field positions in the registry tuples, so a reader can check them
@@ -362,32 +188,27 @@ class _NativeTable:
 
 
 def _native_snapshot():
-    """The registry as the three dicts `_NativeTable` needs, or None when
-    this build cannot answer all four queries or answers them
-    inconsistently.
+    """The registry as the dicts `_NativeTable` needs.
 
-    None is the normal answer today: no build binds the registry. Every
-    failure here is a fallback to the mirror rather than an exception,
-    because a registry that cannot be read is not a reason for `import
-    mojotrees` to fail.
+    Raises `_RegistryUnavailable` when this build cannot answer the queries
+    or answers them inconsistently; `_selected()` turns that into the
+    import-time error, since there is no other source to fall back on.
     """
-    try:
-        from . import _mojotrees
-    except Exception:  # pragma: no cover - the extension is required above
-        return None
+    from . import _mojotrees
+
     hooks = {}
     for name in _REGISTRY_HOOKS:
         hook = getattr(_mojotrees, name, None)
         if hook is None:
-            return None
+            raise _RegistryUnavailable(f"the extension lacks {name}")
         hooks[name] = hook
     try:
         metric_records = list(hooks["registry_metrics"]())
         metric_aliases = list(hooks["registry_metric_aliases"]())
         objective_records = list(hooks["registry_objectives"]())
         objective_aliases = list(hooks["registry_objective_aliases"]())
-    except Exception:
-        return None
+    except Exception as exc:
+        raise _RegistryUnavailable(f"a registry query failed: {exc}")
 
     metrics = {}
     name_of_code = {}
@@ -401,13 +222,16 @@ def _native_snapshot():
         )
         name_of_code[code] = name
     if not metrics:
-        return None
+        raise _RegistryUnavailable("registry_metrics returned no metrics")
 
     aliases = {name: name for name in metrics}
     for alias, code in metric_aliases:
         canonical = name_of_code.get(int(code))
         if canonical is None:
-            return None  # an alias for a metric the registry did not list
+            raise _RegistryUnavailable(
+                f"metric alias {alias!r} names code {code!r}, which "
+                "registry_metrics did not list"
+            )
         aliases[str(alias)] = canonical
 
     # The per-task default, derived rather than mirrored: every builtin
@@ -447,32 +271,72 @@ def _native_snapshot():
         if canonical is not None:
             objective_defaults[str(alias)] = canonical
 
-    return _NativeTable(metrics, aliases, task_defaults, objective_defaults)
+    table = _NativeTable(metrics, aliases, task_defaults, objective_defaults)
+    table.lookup = hooks["metric_code_of_name"]
+    return table
+
+
+class _RegistryUnavailable(RuntimeError):
+    """The compiled registry could not be read; there is no fallback."""
 
 
 def _selected():
-    """The live table: native when the whole registry is readable, the
-    mirror otherwise. Never a mixture of the two."""
+    """The live table: the native registry, or an ImportError that says
+    what the extension is missing."""
     try:
-        native = _native_snapshot()
-    except Exception:
-        native = None
-    return _CompatTable() if native is None else native
+        return _native_snapshot()
+    except _RegistryUnavailable as exc:
+        raise ImportError(
+            "mojotrees._mojotrees cannot answer the metric registry queries "
+            f"({exc}); the Python package and the extension are different "
+            "builds. Rebuild the extension (pixi run build-python)."
+        ) from None
 
 
-#: The one indirection. Deleting the mirrored block above means deleting
-#: `_CompatTable` and the fallback branch of `_selected()` with it.
+#: The one indirection.
 _TABLE = _selected()
+
+# The metric codes, as names. Read off the registry so they are the
+# registry's numbers; nothing here states a code.
+L2 = _TABLE.metric_code("l2")
+RMSE = _TABLE.metric_code("rmse")
+L1 = _TABLE.metric_code("l1")
+QUANTILE = _TABLE.metric_code("quantile")
+HUBER = _TABLE.metric_code("huber")
+BINARY_LOGLOSS = _TABLE.metric_code("binary_logloss")
+BINARY_ERROR = _TABLE.metric_code("binary_error")
+AUC = _TABLE.metric_code("auc")
+MULTI_LOGLOSS = _TABLE.metric_code("multi_logloss")
+MULTI_ERROR = _TABLE.metric_code("multi_error")
+NDCG = _TABLE.metric_code("ndcg")
+MAPE = _TABLE.metric_code("mape")
+FAIR = _TABLE.metric_code("fair")
+POISSON = _TABLE.metric_code("poisson")
+GAMMA = _TABLE.metric_code("gamma")
+GAMMA_DEVIANCE = _TABLE.metric_code("gamma_deviance")
+TWEEDIE = _TABLE.metric_code("tweedie")
+CROSS_ENTROPY = _TABLE.metric_code("cross_entropy")
+KLDIV = _TABLE.metric_code("kullback_leibler")
+AVERAGE_PRECISION = _TABLE.metric_code("average_precision")
+MAP = _TABLE.metric_code("map")
 
 
 def registry_source():
-    """`"native"` when the metric facts come from the compiled registry and
-    `"compat"` when they come from the mirrored block above.
-
-    A diagnostic, and the assertion a test uses to say which of the two
-    behaviors documented in the module docstring it is looking at.
-    """
+    """`"native"`: the metric facts come from the compiled registry. Kept
+    for the tests that asserted which of two sources was live while a
+    Python mirror existed; there is one source now."""
     return _TABLE.source
+
+
+def metric_names():
+    """Every canonical metric name the registry knows, sorted."""
+    return sorted(_TABLE._metrics)
+
+
+def metric_aliases():
+    """Every accepted spelling mapped to its canonical name, aliases and
+    canonical names alike, as the registry reports them."""
+    return dict(sorted(_TABLE._aliases.items()))
 
 
 # ===========================================================================
@@ -491,9 +355,12 @@ def resolve(name, task):
     """`(canonical_name, code, higher_is_better)` for a metric name, or a
     ValueError naming what this task does accept."""
     key = str(name).strip().lower()
+    try:
+        code = int(_TABLE.lookup(key))
+    except Exception:
+        code = None
     canonical = _TABLE.canonical_name(key)
-    code = _TABLE.metric_code(canonical)
-    if code is None:
+    if code is None or _TABLE.metric_code(canonical) != code:
         raise ValueError(
             f"unknown eval_metric {name!r}; expected one of "
             + ", ".join(task_metrics(task))

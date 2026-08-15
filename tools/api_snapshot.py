@@ -85,6 +85,7 @@ MOJO_BOOSTING = ROOT / "src" / "mojotrees" / "boosting.mojo"
 MOJO_PARAMS = ROOT / "src" / "mojotrees" / "params.mojo"
 MOJO_SERIALIZE = ROOT / "src" / "mojotrees" / "serialize.mojo"
 MOJO_DUMP = ROOT / "src" / "mojotrees" / "model_dump.mojo"
+MOJO_REGISTRY = ROOT / "src" / "mojotrees" / "objective_registry.mojo"
 BINDINGS = ROOT / "bindings" / "_mojotrees.mojo"
 
 CAPI_HEADER = ROOT / "capi" / "mojotrees.h"
@@ -531,36 +532,56 @@ def callbacks_block(d: Deriver) -> dict:
 
 
 def eval_block(d: Deriver) -> dict:
-    tree = parse_py(PY_EVAL, d)
-    if tree is None:
-        d.gap("python.eval_metric_names", "_eval.py did not parse")
-        return {}
-    consts = module_constants(tree)
-    out = {"source": rel(PY_EVAL)}
+    """The metric names and aliases the Python estimators accept.
 
-    # Parsing rule 1: _METRICS is not literal_eval-able. Its values are
-    # module-level integer constants, so the dict raises as a whole. The
-    # keys are what the snapshot needs, and they read fine individually.
-    metrics = assign_in(tree.body, "_METRICS")
-    if metrics is None or not hasattr(metrics, "keys"):
-        d.gap("python.eval_metric_names.metrics", "_METRICS not a dict")
-        out["metrics"] = []
-    else:
-        names = []
-        for key in metrics.keys:
-            value = value_of(key, consts)
-            if value is UNDERIVED:
-                d.gap("python.eval_metric_names.metrics", "non-literal key")
-                continue
-            names.append(value)
-        out["metrics"] = names
+    Read from the registry itself, src/mojotrees/objective_registry.mojo:
+    `metric_code_from_name` is a chain of `if name == "..." or name ==
+    "...": return METRIC_X` and `metric_canonical_name` a chain of `if
+    metric == METRIC_X: return String("...")`. python/mojotrees/_eval.py
+    holds no copy of either any more; it reads the compiled registry at
+    import, and this derives the same facts from the source that compiled
+    into it. The block's shape (`metrics` in registry order, `aliases` as
+    alias -> canonical for the non-canonical spellings) is unchanged from
+    when it was read off the Python mirror, so the frozen values compare
+    like for like.
+    """
+    text = read(MOJO_REGISTRY, d)
+    out = {"source": rel(MOJO_REGISTRY)}
 
-    aliases = value_of(assign_in(tree.body, "_ALIASES"), consts)
-    if aliases is UNDERIVED or aliases is None:
-        d.gap("python.eval_metric_names.aliases", "_ALIASES not a literal")
-        out["aliases"] = {}
-    else:
-        out["aliases"] = dict(sorted(aliases.items()))
+    def body_of(fn):
+        m = re.search(rf"^def {fn}\(.*?\n(?=^def |^comptime |\Z)", text, re.S | re.M)
+        return m.group(0) if m else ""
+
+    canonical_of = {}
+    for m in re.finditer(
+        r'if metric == (METRIC_[A-Z_0-9]+):\s*\n\s*return String\("([^"]+)"\)',
+        body_of("metric_canonical_name"),
+    ):
+        canonical_of[m.group(1)] = m.group(2)
+    if not canonical_of:
+        d.gap("python.eval_metric_names.metrics", "metric_canonical_name not parsed")
+
+    metrics = []
+    aliases = {}
+    chain = body_of("metric_code_from_name")
+    for m in re.finditer(
+        r"if\s*\(?((?:\s*(?:or\s+)?name == \"[^\"]+\"\s*)+)\)?:\s*\n\s*return (METRIC_[A-Z_0-9]+)",
+        chain,
+    ):
+        names = re.findall(r'name == "([^"]+)"', m.group(1))
+        code = m.group(2)
+        canonical = canonical_of.get(code)
+        if canonical is None:
+            d.gap("python.eval_metric_names.metrics", f"{code} has no canonical name")
+            continue
+        metrics.append(canonical)
+        for name in names:
+            if name != canonical:
+                aliases[name] = canonical
+    if not metrics:
+        d.gap("python.eval_metric_names.metrics", "metric_code_from_name not parsed")
+    out["metrics"] = metrics
+    out["aliases"] = dict(sorted(aliases.items()))
     return out
 
 

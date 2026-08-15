@@ -1220,7 +1220,7 @@
         "ndcg",
         "map"
       ],
-      "source": "python/mojotrees/_eval.py"
+      "source": "src/mojotrees/objective_registry.mojo"
     },
     "fitted_attributes": [
       "n_features_in_",
