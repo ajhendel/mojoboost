@@ -236,6 +236,16 @@ from .objective_registry import (
     objective_default_metric,
     objective_link,
 )
+from .ranking_advanced import (
+    AdvancedRankParams,
+    PositionBiasState,
+    PositionMap,
+    advanced_lambdarank_gradients,
+    advanced_ranking_requested,
+    check_advanced_rank_params,
+    check_labels_within_gain,
+    check_positions,
+)
 from .ranking import (
     DEFAULT_NDCG_EVAL_AT,
     LAMBDARANK,
@@ -1662,6 +1672,8 @@ def train_ranker_with_builtin_metrics(
     rank_params: RankerParams = RankerParams.default(),
     sample_weight: List[Float64] = [],
     bagging: BaggingParams = BaggingParams.disabled(),
+    advanced: AdvancedRankParams = AdvancedRankParams.default(),
+    positions: PositionMap = PositionMap.absent(),
 ) raises -> MetricTrainResult:
     """`train_ranker_with_metrics` driven by built-in metric codes.
 
@@ -1714,6 +1726,8 @@ def train_ranker_with_builtin_metrics(
         rank_params,
         sample_weight,
         bagging,
+        advanced,
+        positions,
     )
 
 
@@ -2179,11 +2193,10 @@ def train_ranker_with_metrics[F: MetricSetFn & Copyable](
     rank_params: RankerParams = RankerParams.default(),
     sample_weight: List[Float64] = [],
     bagging: BaggingParams = BaggingParams.disabled(),
+    advanced: AdvancedRankParams = AdvancedRankParams.default(),
+    positions: PositionMap = PositionMap.absent(),
 ) raises -> MetricTrainResult:
-    """
-    if params.linear.is_active():
-        check_objective_compatible(LAMBDARANK)
-Train a LambdaRank ensemble while scoring caller-supplied metrics.
+    """Train a LambdaRank ensemble while scoring caller-supplied metrics.
 
     Same training contract as `train_ranker_with_valid` (base score 0,
     query-wise bagging, weights on training rows only); the difference is
@@ -2200,12 +2213,31 @@ Train a LambdaRank ensemble while scoring caller-supplied metrics.
     beat", round 0 is evaluated and recorded like any other round, so a
     `best_iteration` of 0 means no tree beat the all-zero scores the
     ensemble starts from.
+
+    `advanced` and `positions` are the LightGBM extras `ranking_advanced.mojo`
+    implements (custom `label_gain`, a decoupled maxDCG cutoff, pair
+    sampling, position bias from a position column). When
+    `advanced_ranking_requested(advanced, positions)` is True the round's
+    lambdas come from `advanced_lambdarank_gradients` and `advanced.base`
+    is the ranker parameter set (`rank_params` is then ignored, so a caller
+    builds `advanced` around the same base); otherwise this is byte for
+    byte the loop it was before those arguments existed. The learned
+    position biases are training state (as in `train_ranker_advanced`) and
+    are not part of the returned model.
     """
+    if params.linear.is_active():
+        check_objective_compatible(LAMBDARANK)
+    var use_advanced = advanced_ranking_requested(advanced, positions)
     if len(labels) != data.n_rows:
         raise Error("labels length must equal n_rows")
     check_groups(groups, data.n_rows)
-    check_labels(labels)
-    check_ranker_params(rank_params)
+    if use_advanced:
+        check_labels_within_gain(labels, advanced.gain)
+        check_advanced_rank_params(advanced)
+        check_positions(positions, data.n_rows)
+    else:
+        check_labels(labels)
+        check_ranker_params(rank_params)
     _check_sample_weight(sample_weight, data.n_rows)
     check_bagging(bagging)
     _check_valid_sets(valid_sets, data.n_features)
@@ -2221,6 +2253,7 @@ Train a LambdaRank ensemble while scoring caller-supplied metrics.
         labels, groups, rank_params.truncation_level
     )
     var discounts = _discounts(groups.max_size())
+    var bias = PositionBiasState.for_positions(positions)
 
     var history = _new_history(metrics.metrics, valid_sets)
     var stop = _StopState(len(valid_sets), metrics.n_metrics())
@@ -2235,17 +2268,32 @@ Train a LambdaRank ensemble while scoring caller-supplied metrics.
     var stopped_early = False
     for i in range(params.n_estimators):
         _refresh_query_bag(query_bag, row_bag, groups, bagging, i)
-        _fill_lambdas(
-            raw,
-            labels,
-            groups,
-            inverse_max_dcg,
-            discounts,
-            rank_params,
-            sample_weight,
-            grad,
-            hess,
-        )
+        if use_advanced:
+            advanced_lambdarank_gradients(
+                raw,
+                labels,
+                groups,
+                positions,
+                bias,
+                grad,
+                hess,
+                advanced,
+                sample_weight,
+                i,
+                params.learning_rate,
+            )
+        else:
+            _fill_lambdas(
+                raw,
+                labels,
+                groups,
+                inverse_max_dcg,
+                discounts,
+                rank_params,
+                sample_weight,
+                grad,
+                hess,
+            )
         var tree = grow_tree(data, grad, hess, params.tree, row_bag, i)
         # No pair left to separate; under bagging that is a statement about
         # this bag, so the round is skipped and the next bag gets its turn.
@@ -2412,9 +2460,12 @@ def fit_ranker_with_metrics[
     bagging: BaggingParams = BaggingParams.disabled(),
     use_missing: Bool = True,
     categorical_features: List[Int] = [],
+    advanced: AdvancedRankParams = AdvancedRankParams.default(),
+    positions: PositionMap = PositionMap.absent(),
 ) raises -> MetricFitResult:
     """`train_ranker_with_metrics` on raw, column-major features
-    (`features[f * n_rows + r]`), the `fit_ranker` counterpart. CPU only."""
+    (`features[f * n_rows + r]`), the `fit_ranker` counterpart. CPU only.
+    `advanced` and `positions` are passed through unchanged."""
     var groups = groups_from_counts(group_counts)
     var mapper = fit_bins(
         features,
@@ -2438,6 +2489,8 @@ def fit_ranker_with_metrics[
         rank_params,
         sample_weight,
         bagging,
+        advanced,
+        positions,
     )
     return MetricFitResult(
         Model(mapper^, result.booster.copy()),

@@ -13,6 +13,12 @@ from std.testing import assert_equal, assert_true, assert_raises, TestSuite
 
 from mojotrees.binning import bin_equal_width
 from mojotrees.boosting import BoosterParams
+from mojotrees.custom_metric import (
+    CustomMetric,
+    MetricSuite,
+    ValidSet,
+    train_ranker_with_metrics,
+)
 from mojotrees.ranking import (
     LAMBDARANK,
     RankerParams,
@@ -110,6 +116,63 @@ def test_custom_label_gain_changes_the_ensemble_and_still_ranks() raises:
     short.gain = LabelGain(g2^)
     with assert_raises():
         _ = train_ranker_advanced(data, labels, groups, _params(3), short)
+
+
+def test_metric_trainer_honors_the_advanced_parameters() raises:
+    """`custom_metric.train_ranker_with_metrics` (the eval_set path) uses the
+    advanced lambdas when they are requested, so a custom label_gain there
+    trains the ensemble `train_ranker_advanced` trains, and the default
+    call is still the baseline loop."""
+    var features = List[Float64]()
+    var labels = List[Int]()
+    var counts = _ranking_dataset(6, features, labels)
+    var groups = groups_from_counts(counts)
+    var data = bin_equal_width(features, 24, 1, 8)
+    var targets = List[Float64](capacity=24)
+    for r in range(24):
+        targets.append(Float64(labels[r]))
+
+    def constant_metric(
+        metric: Int, valid: Int, pred: List[Float64], y: List[Float64]
+    ) raises -> Float64:
+        return 0.0
+
+    def run(
+        advanced: AdvancedRankParams,
+    ) raises {imm data, imm labels, imm groups, imm targets} -> List[Float64]:
+        var valid_sets: List[ValidSet] = [
+            ValidSet("valid", data.copy(), targets.copy())
+        ]
+        var metrics: List[CustomMetric] = [CustomMetric("zero")]
+        var result = train_ranker_with_metrics(
+            data,
+            labels,
+            groups,
+            valid_sets^,
+            _params(30),
+            MetricSuite(metrics^, constant_metric, 0),
+            advanced=advanced,
+        )
+        var out = List[Float64](capacity=24)
+        for r in range(24):
+            out.append(result.booster.predict_raw_row(data, r))
+        return out^
+
+    var base = train_ranker(data, labels, groups, _params(30))
+    var plain = run(AdvancedRankParams.default())
+    for r in range(24):
+        assert_equal(plain[r], base.predict_row(data, r))
+
+    var adv = train_ranker_advanced(
+        data, labels, groups, _params(30), _custom_gain()
+    )
+    var gained = run(_custom_gain())
+    var differs = False
+    for r in range(24):
+        assert_equal(gained[r], adv.booster.predict_row(data, r))
+        if gained[r] != plain[r]:
+            differs = True
+    assert_true(differs)
 
 
 def test_position_column_learns_a_bias_and_trains() raises:

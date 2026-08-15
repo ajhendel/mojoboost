@@ -893,6 +893,49 @@ def fit(
             categorical_features=_parse_categorical(params),
         )
         return PythonObject(alloc=routed^)
+    if bp.linear.is_active():
+        # linear_tree=True: the leaves are fitted on the raw rows, which
+        # only the metric trainer keeps beside the binned matrix
+        # (custom_metric.fit_with_metrics), so a plain fit is that trainer
+        # scoring the training set with a metric that costs nothing and
+        # never stops early. CPU only: train_gpu reads bins alone.
+        if device != CPU_DEVICE:
+            raise Error(
+                "linear_tree=True trains on the CPU only; set device='cpu'"
+            )
+        var train_set = List[RawValidSet]()
+        train_set.append(
+            RawValidSet(
+                "train", _f64_list(Int(py=x_addr), nr * nf), nr, target.copy()
+            )
+        )
+
+        def no_metric(
+            metric: Int, valid: Int, pred: List[Float64], labels: List[Float64]
+        ) raises -> Float64:
+            return 0.0
+
+        var metrics: List[CustomMetric] = [CustomMetric("linear_tree_fit")]
+        var fitted = mojo_fit_with_metrics(
+            features,
+            nr,
+            nf,
+            target,
+            train_set^,
+            Int(py=objective),
+            bp,
+            MetricSuite(metrics^, no_metric, 0),
+            0,
+            0.0,
+            Int(py=params["max_bin"]),
+            weights,
+            Float64(py=params["alpha"]),
+            _parse_bagging(params),
+            _parse_goss(params),
+            use_missing=_parse_use_missing(params),
+            categorical_features=_parse_categorical(params),
+        )
+        return PythonObject(alloc=fitted.model.copy())
     var model = mojo_fit(
         features,
         nr,
@@ -1360,7 +1403,8 @@ def fit_ranker_with_metrics(
     var features = _f64_view(Int(py=x_addr), nr * nf)
     var labels = _int_list_from_f64(Int(py=y_addr), nr)
     var bp = _parse_params(params, nf, unbundled="fit_ranker_with_metrics")
-    _refuse_advanced_ranking(params, nr, "fit_ranker_with_metrics")
+    var advanced = _parse_advanced_rank_params(params)
+    var positions = _parse_positions(params, nr)
     var weights = _parse_weights(params, nr)
     var pred_p = _pred_pointer(params)
     var valid_sets = _parse_valid_sets(params, nf)
@@ -1387,12 +1431,14 @@ def fit_ranker_with_metrics(
         MetricSuite(metrics^, py_metric, Int(py=params["primary_metric"])),
         Int(py=params["early_stopping_rounds"]),
         Float64(py=params["min_delta"]),
-        _parse_rank_params(params),
+        advanced.base,
         Int(py=params["max_bin"]),
         weights,
         _parse_bagging(params),
         use_missing=_parse_use_missing(params),
         categorical_features=_parse_categorical(params),
+        advanced=advanced,
+        positions=positions,
     )
 
     var model = result.model.copy()
@@ -1725,22 +1771,6 @@ def _parse_positions(params: PythonObject, n_rows: Int) raises -> PositionMap:
         )
     var codes = _int_list_from_f64(Int(py=params["position_addr"]), n)
     return positions_from_codes(codes).positions.copy()
-
-
-def _refuse_advanced_ranking(params: PythonObject, n_rows: Int, where: String) raises:
-    """The metric-driven ranker loop (custom_metric.train_ranker_with_metrics)
-    computes the baseline lambdas only, so the advanced parameters cannot be
-    honored there yet; refuse rather than silently train the plain model."""
-    if advanced_ranking_requested(
-        _parse_advanced_rank_params(params), _parse_positions(params, n_rows)
-    ):
-        raise Error(
-            where,
-            ": label_gain, lambdarank_position_bias_regularization,"
-            " pair_sampling_rate, max_dcg_cutoff and position are not"
-            " supported together with eval_set yet; fit without eval_set"
-            " to use them",
-        )
 
 
 def _group_counts(params: PythonObject) raises -> List[Int]:
