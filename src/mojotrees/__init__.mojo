@@ -493,6 +493,22 @@ from .boosting_sparse import (
     train_sparse,
     train_sparse_with_valid,
 )
+from .alternate_boosting import (
+    BOOSTING_DART,
+    BOOSTING_GBDT,
+    BOOSTING_GOSS,
+    BOOSTING_RF,
+    AlternateBoostingParams,
+    boosting_name,
+    fit_boosting,
+    parse_boosting,
+    train_boosting,
+    train_boosting_more,
+    train_boosting_multiclass,
+    train_boosting_with_valid,
+)
+from .boosting_dart import DartParams
+from .boosting_rf import RfParams, train_forest, train_forest_multiclass
 from .model_sparse import (
     fit_csc,
     fit_multiclass_csc,

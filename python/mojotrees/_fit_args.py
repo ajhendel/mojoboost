@@ -24,7 +24,7 @@ _as_f64_vector = _arrays.f64_vector
 _IMPORTANCE_TYPES = {"split": 0, "gain": 1}
 
 _DEVICES = ("cpu", "gpu", "auto")
-_BOOSTING_TYPES = ("gbdt", "goss")
+_BOOSTING_TYPES = ("gbdt", "goss", "dart", "rf")
 
 #: What to say when a caller asks a prediction to run somewhere and this
 #: build has no entry point that can. The alternative -- running on the CPU

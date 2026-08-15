@@ -52,10 +52,7 @@ it, not a second opinion.
 
 | Module | Kind | Owner | Why it is not reached |
 |---|---|---|---|
-| `alternate_boosting` | PENDING | connect_17 | DART and random-forest dispatch. Nothing imports it, so neither mode has a route; boosting.mojo still owns the only round loop |
 | `backend` | EXPERIMENTAL | connect_01 | A one-function dispatch shim kept as the reference the CPU/GPU equivalence test compares against. Test-only by design |
-| `boosting_dart` | PENDING | connect_17 | Reached only from alternate_boosting, itself unreachable |
-| `boosting_rf` | PENDING | connect_17 | Reached only from alternate_boosting, itself unreachable |
 | `cegb` | PENDING | consolidation_K10 | LightGBM cegb_* controls, complete and self-contained. Parked until a trainer accepts the cegb params and the boosting loop hooks it |
 | `distributed_gpu` | EXPERIMENTAL | consolidation_K9 | Host-arithmetic contract for a distributed fixed-point GPU histogram exchange; require_distributed_gpu refuses it until HAS_DEVICE_COLLECTIVE, transport_available(), and GPU_SPEEDUP_GATE_MET all hold. Parked, not superseded; its constants now come from quantized_gradient |
 | `distributed_strategies` | EXPERIMENTAL | consolidation_K9 | Feature-parallel and voting-parallel cores over Collective; self-gated by require_strategy_operational, which refuses both modes until transport_available() is True. Parked, not superseded: distributed.mojo implements only data parallel |

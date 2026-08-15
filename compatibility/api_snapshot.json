@@ -205,7 +205,7 @@
       "platforms.tiers"
     ],
     "generated_by": "tools/api_snapshot.py",
-    "library_version": "0.1.0a2",
+    "library_version": "0.1.0",
     "schema_version": 2,
     "source_commit": null,
     "status": "generated",
@@ -217,9 +217,23 @@
   },
   "mojo": {
     "abi_promise": "none; Mojo has no stable ABI, so the guarantee is source compatibility only",
-    "export_count": 467,
+    "export_count": 483,
     "export_source": "src/mojotrees/__init__.mojo",
     "exports_by_module": {
+      "alternate_boosting": [
+        "AlternateBoostingParams",
+        "BOOSTING_DART",
+        "BOOSTING_GBDT",
+        "BOOSTING_GOSS",
+        "BOOSTING_RF",
+        "boosting_name",
+        "fit_boosting",
+        "parse_boosting",
+        "train_boosting",
+        "train_boosting_more",
+        "train_boosting_multiclass",
+        "train_boosting_with_valid"
+      ],
       "apple_histogram_policy": [
         "HistogramWorkload",
         "SPEC_LEVEL_BASELINE",
@@ -270,6 +284,14 @@
         "train_multiclass_more",
         "train_multiclass_with_valid",
         "train_with_valid"
+      ],
+      "boosting_dart": [
+        "DartParams"
+      ],
+      "boosting_rf": [
+        "RfParams",
+        "train_forest",
+        "train_forest_multiclass"
       ],
       "boosting_sparse": [
         "train_multiclass_sparse",
@@ -433,6 +455,12 @@
         "GpuSplitRecord",
         "GpuSplitSearcher"
       ],
+      "growth_policy": [
+        "GROW_DEPTHWISE",
+        "GROW_LEAFWISE",
+        "grow_policy_name",
+        "parse_grow_policy"
+      ],
       "histogram": [
         "Histogram",
         "build_histogram",
@@ -488,12 +516,6 @@
       "interaction": [
         "InteractionConstraints",
         "extend_branch"
-      ],
-      "levelwise_policy": [
-        "GROW_DEPTHWISE",
-        "GROW_LEAFWISE",
-        "grow_policy_name",
-        "parse_grow_policy"
       ],
       "metrics": [
         "DEFAULT_BINARY_THRESHOLD",
@@ -1461,6 +1483,8 @@
       "cegb_tradeoff": 1.0,
       "device": "cpu",
       "device_type": null,
+      "drop_rate": 0.1,
+      "drop_seed": 4,
       "enable_bundle": false,
       "extra_seed": 6,
       "extra_trees": false,
@@ -1485,6 +1509,7 @@
       "max_conflict_rate": 0.0,
       "max_delta_step": 0.0,
       "max_depth": -1,
+      "max_drop": 50,
       "max_nondefault_rate": 0.95,
       "min_child_hess": 0.001,
       "min_child_samples": null,
@@ -1504,20 +1529,23 @@
       "path_smooth": 0.0,
       "reg_alpha": null,
       "reg_lambda": null,
+      "skip_drop": 0.5,
       "subsample": null,
       "subsample_freq": null,
       "top_rate": 0.2,
-      "use_missing": true
+      "uniform_drop": true,
+      "use_missing": true,
+      "xgboost_dart_mode": false
     }
   },
   "versions": {
     "c_abi": 3,
     "dump_format": 1,
-    "library": "0.1.0a2",
+    "library": "0.1.0",
     "library_locations": {
-      "pixi.toml": "0.1.0a2",
-      "python/mojotrees/__init__.py": "0.1.0a2",
-      "python/pyproject.toml": "0.1.0a2"
+      "pixi.toml": "0.1.0",
+      "python/mojotrees/__init__.py": "0.1.0",
+      "python/pyproject.toml": "0.1.0"
     },
     "max_toolchain": ">=26.5.0,<27",
     "model_format_dump_reports": 4,

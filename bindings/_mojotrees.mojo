@@ -173,6 +173,14 @@ from mojotrees.gpu_predict import (
     validation_host_metric,
 )
 from mojotrees.goss import GossParams
+from mojotrees.alternate_boosting import (
+    BOOSTING_DART,
+    BOOSTING_RF,
+    AlternateBoostingParams,
+    fit_boosting,
+    parse_boosting,
+)
+from mojotrees.boosting_dart import DartParams
 from mojotrees.importance import gain_importance, split_importance
 from mojotrees.interaction import InteractionConstraints
 from mojotrees.monotone import MonotoneConstraints
@@ -699,6 +707,30 @@ def _parse_goss(params: PythonObject) raises -> GossParams:
     )
 
 
+def _parse_boosting(params: PythonObject) raises -> AlternateBoostingParams:
+    """LightGBM's `boosting` from the params dict: the mode by name, and the
+    DART bundle from the `drop_*` keys when the mode is dart. `goss` keeps
+    arriving as its own flag (`_parse_goss`), so a `boosting` of "goss" or
+    "gbdt" resolves to the plain bundle and the ordinary trainer; only dart
+    and rf change which trainer runs. The dispatcher validates the bundle
+    again, so the rules in alternate_boosting.mojo stay the only ones."""
+    var mode = parse_boosting(String(py=params["boosting"]))
+    if mode == BOOSTING_DART:
+        return AlternateBoostingParams.dart_with(
+            DartParams.enable(
+                drop_rate=Float64(py=params["drop_rate"]),
+                max_drop=Int(py=params["max_drop"]),
+                skip_drop=Float64(py=params["skip_drop"]),
+                uniform_drop=Int(py=params["uniform_drop"]) != 0,
+                xgboost_dart_mode=Int(py=params["xgboost_dart_mode"]) != 0,
+                seed=Int(py=params["drop_seed"]),
+            )
+        )
+    if mode == BOOSTING_RF:
+        return AlternateBoostingParams.rf()
+    return AlternateBoostingParams()
+
+
 def _parse_categorical(params: PythonObject) raises -> List[Int]:
     """Categorical feature indices from the params dict, as one float64
     entry per index at `categorical_addr`, or a zero address for none. The
@@ -757,6 +789,35 @@ def fit(
     var device = _parse_device(params)
     var bp = _parse_params(params, nf, cpu=device == CPU_DEVICE)
     var weights = _parse_weights(params, nr)
+    var boosting = _parse_boosting(params)
+    if boosting.mode == BOOSTING_DART or boosting.mode == BOOSTING_RF:
+        # dart and rf run through alternate_boosting's dispatcher, which
+        # bins with the same fit_bins and returns the same Model; it is CPU
+        # only (train_gpu has no dropout or forest loop), and the wrapper
+        # sends a device it already resolved, so a GPU here is refused
+        # rather than downgraded.
+        if device != CPU_DEVICE:
+            raise Error(
+                "boosting='dart' and boosting='rf' train on the CPU only;"
+                " set device='cpu'"
+            )
+        var routed = fit_boosting(
+            features,
+            nr,
+            nf,
+            target,
+            Int(py=objective),
+            bp,
+            boosting,
+            Int(py=params["max_bin"]),
+            weights,
+            Float64(py=params["alpha"]),
+            _parse_bagging(params),
+            GossParams.disabled(),
+            use_missing=_parse_use_missing(params),
+            categorical_features=_parse_categorical(params),
+        )
+        return PythonObject(alloc=routed^)
     var model = mojo_fit(
         features,
         nr,

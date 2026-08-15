@@ -218,22 +218,6 @@ KIND_ORDER = [CONNECTED, EXPERIMENTAL, PENDING, DEAD]
 #: (called from `python/mojotrees/__init__.py` before the extension import).
 CLASSIFICATION = {
     # -- native modules no entry point reaches -----------------------------
-    "alternate_boosting": (
-        PENDING,
-        "connect_17",
-        "DART and random-forest dispatch. Nothing imports it, so neither "
-        "mode has a route; boosting.mojo still owns the only round loop.",
-    ),
-    "boosting_dart": (
-        PENDING,
-        "connect_17",
-        "Reached only from alternate_boosting, itself unreachable.",
-    ),
-    "boosting_rf": (
-        PENDING,
-        "connect_17",
-        "Reached only from alternate_boosting, itself unreachable.",
-    ),
     "gpu_binned_layout": (
         PENDING,
         "connect_02",

@@ -119,6 +119,22 @@ class _Base(_ParamsMixin):
     sampling (-1, the default, keeps LightGBM's rule). GOSS cannot be
     combined with row bagging.
 
+    "dart" (Dropouts meet Multiple Additive Regression Trees) drops a random
+    subset of the trees already built before each round, fits the new tree
+    to the residual of what is left, and rescales the dropped trees and the
+    new one so the ensemble is not overshot; `drop_rate`, `max_drop`,
+    `skip_drop`, `xgboost_dart_mode`, and `drop_seed` are LightGBM's
+    parameters of those names. `uniform_drop` defaults to True here (LightGBM
+    defaults to False); the non-uniform variant is refused. "rf" is random
+    forest mode: every tree fits the same gradients at `learning_rate=1.0`
+    (any other rate is refused) and the model averages them, so it needs a
+    source of per-tree randomness, `bagging_fraction < 1` with
+    `bagging_freq > 0` or `feature_fraction < 1`. Both modes train on the
+    CPU, on dense input, without `eval_set` or a callable objective, and
+    single-output only (a multiclass classifier or a ranker refuses them);
+    the fitted model is an ordinary one for prediction, saving, and
+    inspection.
+
     `feature_fraction` samples that share of the features once per tree and
     `feature_fraction_bynode` samples again at every node from the tree's own
     set, both without replacement and both reproducible from
@@ -282,6 +298,12 @@ class _Base(_ParamsMixin):
         other_rate=0.1,
         goss_seed=3,
         goss_warmup_rounds=-1,
+        drop_rate=0.1,
+        max_drop=50,
+        skip_drop=0.5,
+        xgboost_dart_mode=False,
+        uniform_drop=True,
+        drop_seed=4,
         feature_fraction=1.0,
         feature_fraction_bynode=1.0,
         feature_fraction_seed=2,
@@ -344,6 +366,12 @@ class _Base(_ParamsMixin):
         self.other_rate = other_rate
         self.goss_seed = goss_seed
         self.goss_warmup_rounds = goss_warmup_rounds
+        self.drop_rate = drop_rate
+        self.max_drop = max_drop
+        self.skip_drop = skip_drop
+        self.xgboost_dart_mode = xgboost_dart_mode
+        self.uniform_drop = uniform_drop
+        self.drop_seed = drop_seed
         self.feature_fraction = feature_fraction
         self.feature_fraction_bynode = feature_fraction_bynode
         self.feature_fraction_seed = feature_fraction_seed
@@ -731,6 +759,24 @@ class _Base(_ParamsMixin):
         self.categorical_feature_ = list(indices)
         return Xb, n_rows, n_features, names, cat_buf
 
+    def _refuse_alternate_boosting(self, where):
+        """Raise when `boosting` is dart or rf and `where` names a fit path
+        that only the plain trainer serves.
+
+        Only `_mojotrees.fit` (dense, single-output, CPU, no eval_set, no
+        callable objective) reads the `boosting` key and routes dart and rf
+        to `alternate_boosting.fit_boosting`. Every other native entry point
+        would train gbdt and say nothing, so those paths refuse by name here
+        instead of quietly fitting a different model than the one asked for.
+        """
+        boosting = self._resolve_boosting()
+        if boosting in ("dart", "rf"):
+            raise ValueError(
+                f"boosting={boosting!r} is not available {where}; it trains "
+                "dense, single-output models on the CPU without eval_set or "
+                "a callable objective"
+            )
+
     def _resolve_boosting(self):
         """The effective boosting strategy, "gbdt" or "goss".
 
@@ -849,6 +895,17 @@ class _Base(_ParamsMixin):
                     "boosting='goss' cannot be combined with row bagging; "
                     "leave bagging_freq at 0 or bagging_fraction at 1.0"
                 )
+        if boosting == "dart":
+            if not 0.0 <= float(self.drop_rate) <= 1.0:
+                raise ValueError("drop_rate must be in [0, 1]")
+            if not 0.0 <= float(self.skip_drop) <= 1.0:
+                raise ValueError("skip_drop must be in [0, 1]")
+            if int(self.drop_seed) < 0:
+                raise ValueError("drop_seed must be nonnegative")
+        if boosting == "rf" and float(self.learning_rate) != 1.0:
+            raise ValueError(
+                "boosting='rf' averages its trees and takes learning_rate=1.0"
+            )
         if not 0.0 < float(self.feature_fraction) <= 1.0:
             raise ValueError("feature_fraction must be in (0, 1]")
         if not 0.0 < float(self.feature_fraction_bynode) <= 1.0:
@@ -898,6 +955,17 @@ class _Base(_ParamsMixin):
             "other_rate": float(self.other_rate),
             "goss_seed": int(self.goss_seed),
             "goss_warmup_rounds": int(self.goss_warmup_rounds),
+            # LightGBM's `boosting` by name; the binding routes dart and rf
+            # to alternate_boosting.fit_boosting and leaves gbdt and goss on
+            # the trainer they always used. The dart bundle is read only
+            # when the mode is dart; ints, not bools, as everywhere here.
+            "boosting": boosting,
+            "drop_rate": float(self.drop_rate),
+            "max_drop": int(self.max_drop),
+            "skip_drop": float(self.skip_drop),
+            "xgboost_dart_mode": int(bool(self.xgboost_dart_mode)),
+            "uniform_drop": int(bool(self.uniform_drop)),
+            "drop_seed": int(self.drop_seed),
             "feature_fraction": float(self.feature_fraction),
             "feature_fraction_bynode": float(self.feature_fraction_bynode),
             "feature_fraction_seed": int(self.feature_fraction_seed),
@@ -2378,6 +2446,7 @@ class MojoTreesRegressor(_Base):
                     "a Python objective callback does not take sparse input "
                     "yet; densify with .toarray() or use a built-in objective"
                 )
+            self._refuse_alternate_boosting("with sparse input")
             self._reject_sparse_eval_set(eval_set)
             buffers, n_rows, n_features, names, params, keep = (
                 self._sparse_fit_params(X, sample_weight, objective)
@@ -2417,6 +2486,7 @@ class MojoTreesRegressor(_Base):
                     "metrics cannot be combined yet; the Mojo API pairs them "
                     "with train_custom_with_metrics"
                 )
+            self._refuse_alternate_boosting("with eval_set")
             self._fit_with_metrics(
                 Xb,
                 yb,
@@ -2435,6 +2505,7 @@ class MojoTreesRegressor(_Base):
                 callbacks=callbacks,
             )
         elif objective == _CUSTOM:
+            self._refuse_alternate_boosting("with a callable objective")
             self._fit_custom(Xb, yb, n_rows, n_features, params, device)
         else:
             self._model = _mojotrees.fit(
@@ -2847,7 +2918,10 @@ class MojoTreesClassifier(_Base):
             has_eval_set=eval_set is not None,
         )
         self._multiclass = n_classes > 2
+        if n_classes > 2:
+            self._refuse_alternate_boosting("for a multiclass classifier")
         if eval_set is not None:
+            self._refuse_alternate_boosting("with eval_set")
 
             def encode(y_valid, n_valid_rows, label):
                 return _encode_like(y_valid, n_valid_rows, classes, label)
@@ -2943,6 +3017,7 @@ class MojoTreesClassifier(_Base):
         )
         if n_rows != len(yb):
             raise ValueError("X and y must have the same number of rows")
+        self._refuse_alternate_boosting("with sparse input")
         self._multiclass = n_classes > 2
         if n_classes == 2:
             self._model = _mojotrees.fit_csc(
@@ -3318,6 +3393,7 @@ class MojoTreesRanker(_Base):
                 )
         elif eval_group is not None:
             raise ValueError("eval_group needs an eval_set to describe")
+        self._refuse_alternate_boosting("for a ranker")
         self._reset_fitted()
         Xb, n_rows, n_features, names, cat_buf = self._fit_X(X)
         yb = _arrays.check_target(y, n_rows)
