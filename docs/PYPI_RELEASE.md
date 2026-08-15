@@ -6,24 +6,39 @@ repository preparation and read-only verification can be automated.
 
 ## Status
 
-**`mojotrees 0.1.0a2` is live on PyPI as of 2026-08-15T14:14:48Z.** The
-name is claimed, the pending publisher converted to a real one on that
-upload, and the artifact is
-`mojotrees-0.1.0a2-cp314-cp314-macosx_26_0_arm64.whl` (2,237,257 bytes)
-built from tag `v0.1.0a2` at commit `142e32f`, with SBOM and attestations.
-Verified after the fact from a clean CPython 3.14 venv against the real
-index (`pip install --pre mojotrees`, import, train, and
-`packaging/smoke_test.py`, which reports the stdlib fallback path).
+**`mojotrees 0.1.0a3` is live on PyPI as of 2026-08-15T20:18:40Z.** The
+artifact is `mojotrees-0.1.0a3-cp314-cp314-macosx_26_0_arm64.whl`,
+sha256 `b8f6a56ef43ab94cd91dfcbe9fdc8ff572a00ecf8122f872ef2798f9937b7483`,
+built from tag `v0.1.0a3` at commit `1efee5b`, with SBOM and attestations,
+published by the now-real trusted publisher with no credential in the
+repository. The digest on the simple index matches the digest in the
+attestation. `0.1.0a2` remains up and is not yanked.
 
-**The TestPyPI rehearsal for this name was SKIPPED.** Section 3 was not
-run under `mojotrees`; the release went straight to PyPI at the owner's
-instruction. So the TestPyPI publisher for `mojotrees` is still PENDING
-and has never been exercised, and `mojotrees` does not exist on TestPyPI.
-The next person to run section 3 will be proving that publisher for the
-first time. The justification for skipping was that a rejected upload does
-not consume the version number, so the downside was a retry rather than a
-burned release; that reasoning holds only while the version is one nobody
-depends on.
+`0.1.0a2` went live on PyPI at 2026-08-15T14:14:48Z from tag `v0.1.0a2` at
+commit `142e32f`, which is the upload that converted the pending PyPI
+publisher into a real one.
+
+**The TestPyPI rehearsal is BLOCKED, and not for the reason this section
+used to give.** The a3 release ran section 5 step 2 first, and the
+TestPyPI publish failed with `invalid-pending-publisher: valid token, but
+project already exists`. The claim that `mojotrees` does not exist on
+TestPyPI was wrong: `mojotrees 0.1.0a2` is on TestPyPI, so the publisher
+registered there cannot be a *pending* one, since a pending publisher only
+authorizes creating a project that does not yet exist. Unblocking it is an
+owner action on the index and nothing in this repository can do it. At
+https://test.pypi.org/manage/project/mojotrees/settings/publishing/, add a
+project-scoped publisher for owner `mojotrees`, repository `mojotrees`,
+workflow `release-provenance.yml`, environment `testpypi`, and delete the
+pending registration that cannot fire.
+
+Because that failure happens at the token exchange, before any upload, it
+consumes no version number and leaves no partial artifact. What was lost
+is the rehearsal, not the release. For a3 its substance was recovered from
+the build job, which installs the wheel into a clean CPython 3.14 venv and
+runs `packaging/smoke_test.py` before anything is published; that run
+reported `smoke test ok: mojotrees 0.1.0a3, numpy 2.5.2`. That is a
+weaker check than installing from a real index, and it stops being an
+acceptable substitute once a version is one that anybody depends on.
 
 Note that section 4's sequencing argument below is therefore no longer
 describing what happened. Read it as the intended procedure, not the
@@ -44,8 +59,11 @@ dead. `mojotrees` was registered as a PENDING publisher on both indexes
 `release-provenance.yml`, environment `pypi` on PyPI and `testpypi` on
 TestPyPI). A pending publisher is invisible from outside the account and
 becomes real only on first upload. The PyPI one has since been proven by
-the 0.1.0a2 upload and is now a normal publisher; the TestPyPI one is
-still pending and unproven.
+the 0.1.0a2 upload and is now a normal publisher, and it published 0.1.0a3
+as well. The TestPyPI one is still pending, and the a3 attempt showed that
+it can never fire, because a pending publisher only authorizes creating a
+project and `mojotrees 0.1.0a2` already exists on TestPyPI. It has to be
+replaced with a project-scoped publisher; see the Status section.
 
 `mojoboost 0.1.0.dev1` is live on TestPyPI (the section 3 rehearsal, tag
 `v0.1.0.dev1`) and `mojoboost 0.1.0a1` is live on PyPI (the pre-release
