@@ -32,6 +32,17 @@ What this module encodes
   interleave is bounded by an assumed L1 data-cache size, so the interleaved
   group's histogram slices stay resident. The bound is derived from
   `n_bins` and the histogram's bytes-per-cell, not from a fixed feature count.
+  The width is then floored to a rung of the ladder `histogram.mojo`
+  instantiates its accumulation kernel at (1, 2, 4, 8, 16), because a width
+  with no instantiation cannot run.
+- **A group width the schedule can actually deliver.** The interleave only
+  happens if one task holds a whole group, so the dispatch is over *groups*
+  rather than over features and the width is additionally capped so the group
+  count does not fall below the core count. Both halves matter: before this,
+  `parallel.plan_tasks` fanned 50 features over 40 tasks, 30 of which held a
+  single feature and therefore could not interleave anything, so a nominal
+  width of 2 ran at an effective 1.25 and the knob that changed the task count
+  silently changed the width too.
 - **Work estimates that include zeroing.** A tree node's histogram build
   costs one write of the whole `n_features * n_bins` output plus one
   accumulate per (active feature, row). On a small node the first term
@@ -65,15 +76,33 @@ some locality while overestimating it produces a plan that thrashes. They are
 named, not inlined, so a machine that turns out to differ has one place to
 change and the handoff has something to point a measurement at.
 
+`ASSUMED_L1D_BYTES` stays at its 64 KiB floor, and that is a decision rather
+than an oversight. The development M4's L1 data cache is widely reported to be
+larger, and raising the constant would widen the interleave a rung at 255
+bins. Two things stop it. The number is not read from any API this project
+calls, so raising it would replace a stated assumption with a remembered
+figure; and there is no CPU equivalent of the device report that
+`gpu_split_policy._is_observed_m4` guards its hardware-specific threshold
+with, because nothing portable in `std.sys.info` identifies the part. Guessing
+the part from core counts is exactly the per-chip table the section above
+refuses. So the floor stands, the ladder is selected against it, and
+`MOJOTREES_CPU_FEATURE_GROUP` is the way to run the wider rungs the floor
+declines to choose. A measurement that resolves this belongs in
+`bench/apple/cpu_plan.json`, not in a constant nobody verified.
+
 Environment contract (all optional, all scheduling-only)
 --------------------------------------------------------
 - `MOJOTREES_CPU_TASKS_PER_CORE`: positive integer, auto-mode fan-out per
   core. Default `DEFAULT_TASKS_PER_CORE`.
 - `MOJOTREES_CPU_CORE_POOL`: `all` (default) counts every physical core;
   `performance` counts only the reported performance cores.
-- `MOJOTREES_CPU_FEATURE_GROUP`: `1` or `2`, how many features one
-  accumulation loop interleaves. Default `DEFAULT_FEATURE_GROUP`, further
-  clamped by the L1 estimate.
+- `MOJOTREES_CPU_FEATURE_GROUP`: a rung of the ladder (`1`, `2`, `4`, `8`,
+  `16`), how many features one accumulation loop interleaves. Unset means the
+  derived width: `DEFAULT_FEATURE_GROUP` clamped by the L1 estimate, by the
+  active feature count, and by the core count. An explicit request overrides
+  all three, because the estimate is the thing the knob exists to test; an
+  off-ladder value (`3`, `32`, a word) is *refused*, not rounded, because no
+  kernel is instantiated at it.
 - `MOJOTREES_CPU_COMPACT_MIN_ROWS`: row count below which a subset
   accumulation skips the gradient/hessian gather. Default
   `DEFAULT_COMPACT_MIN_ROWS`.
@@ -107,15 +136,37 @@ comptime DEFAULT_TASKS_PER_CORE = 4
 comptime CORE_POOL_ALL = 0
 comptime CORE_POOL_PERFORMANCE = 1
 
-# How many features one accumulation inner loop interleaves. Two independent
-# features give the out-of-order engine two independent read-modify-write
-# chains into two disjoint histogram slices, which is what hides the
-# store-to-load latency of consecutive rows landing in the same bin, and it
-# halves the number of times the shared row index and gradient pair are
-# loaded. Above two the resident slices start to crowd L1 and the register
-# pressure rises; `plan_feature_group` clamps by the cache estimate anyway.
-comptime DEFAULT_FEATURE_GROUP = 2
-comptime MAX_FEATURE_GROUP = 2
+# How many features one accumulation inner loop interleaves. N independent
+# features give the out-of-order engine N independent read-modify-write chains
+# into N disjoint histogram slices, which is what hides the store-to-load
+# latency of consecutive rows landing in the same bin, and -- the reason this
+# ladder exists at all -- it divides by N the number of times the node's
+# gradient and hessian stream is walked. Feature-major accumulation reads that
+# stream once per group, so at 50 features and 1M rows a width of 1 streams
+# 50 * 16 MB = 800 MB of gradient traffic per node histogram against the
+# 50 MB of binned data it actually needs; a width of 4 streams 208 MB.
+# That ratio is why LightGBM's `force_row_wise` builder reads each row's
+# gradient exactly once (`src/io/multi_val_dense_bin.hpp`), and widening this
+# is the cheapest available probe of how much of the gap that accounts for.
+#
+# The rungs are 1, 2, 4, 8, 16, matching the GPU histogram family's ladder in
+# `gpu_tiling.HIST_FEATURE_GROUP_LADDER` for the same reason: the accumulation
+# kernel is instantiated once per width, and a width with no instantiation
+# cannot run. `MAX_FEATURE_GROUP` is the top of the ladder, not a policy
+# ceiling; `plan_feature_group` is where the width is actually decided, and it
+# is bounded by the L1 estimate rather than by a hand-set number.
+#
+# Nothing here is measured. Wider is strictly less gradient traffic and
+# strictly more live histogram slices and register pressure, and where those
+# two cross on any particular core is a benchmark's answer, not this comment's.
+comptime FEATURE_GROUP_LADDER = 5
+"""Rungs in the feature-group ladder, counting 1."""
+
+comptime MAX_FEATURE_GROUP = 16
+comptime DEFAULT_FEATURE_GROUP = MAX_FEATURE_GROUP
+"""What the policy asks for before the clamps: the widest rung there is. The
+L1 estimate, the active feature count, and the core count are what actually
+choose, which is the point of deriving a width instead of naming one."""
 
 # Below this many rows a node's gradients and hessians are small enough to
 # stay in cache across every feature's pass, so gathering them into a
@@ -198,8 +249,84 @@ def env_core_pool() -> Int:
     return CORE_POOL_ALL
 
 
-def env_feature_group() -> Int:
-    return _env_int("MOJOTREES_CPU_FEATURE_GROUP", DEFAULT_FEATURE_GROUP)
+def is_feature_group_width(group: Int) -> Bool:
+    """Whether `group` is a rung of the ladder, so `histogram.mojo` has an
+    accumulation kernel instantiated at it. 3 is not, and is refused rather
+    than rounded, for the same reason `gpu_tiling.is_feature_group_width`
+    refuses it: a width with no instantiation cannot run, and silently running
+    a different one loses whatever experiment asked for it."""
+    var rung = 1
+    for _ in range(FEATURE_GROUP_LADDER):
+        if rung == group:
+            return True
+        rung *= 2
+    return False
+
+
+def feature_group_floor(n: Int) -> Int:
+    """The widest rung at or below `n`, never below 1.
+
+    Rounding *down* is the only safe direction for every clamp below: a rung
+    above the bound would violate the bound the clamp was expressing, while a
+    rung below it merely leaves some of the budget unused. `feature_group_floor(5)`
+    is 4, which is what the L1 estimate at 255 bins comes to.
+    """
+    var best = 1
+    var rung = 1
+    for _ in range(FEATURE_GROUP_LADDER):
+        if rung <= n:
+            best = rung
+        rung *= 2
+    return best
+
+
+def feature_group_count(n_active: Int, group: Int) -> Int:
+    """How many groups `n_active` features split into at this width.
+
+    The dispatch unit of a histogram build. Stated here rather than derived at
+    each call site because it is the number that has to match between the
+    policy, the kernel's group loop, and the task split: a task holds whole
+    groups, so a group is the smallest thing that can be scheduled, and the
+    last group owning fewer than `group` features is the ragged tail the
+    kernel handles with the same code path as a full one.
+    """
+    if n_active <= 0 or group <= 0:
+        return 0
+    return (n_active + group - 1) // group
+
+
+def env_feature_group() raises -> Int:
+    """The requested interleave width, or 0 when nothing is requested.
+
+    Zero rather than `DEFAULT_FEATURE_GROUP` because the two answers mean
+    different things downstream: an explicit request bypasses the derived
+    clamps (it exists to test the estimate those clamps encode) while the
+    default does not.
+
+    Raises on anything that is not a rung. That includes an unparsable value,
+    which the other knobs in this file quietly ignore. The difference is
+    deliberate and narrow: the others are scheduling numbers where any value
+    produces some valid plan, whereas this one names a kernel instantiation,
+    and a benchmark arm that asked for 3 and silently got 2 has recorded a
+    result under the wrong label. That has happened in this repository before,
+    with the GPU split strategy, and `gpu_active_rows.set_feature_group`
+    refuses for the same reason.
+    """
+    var s = getenv("MOJOTREES_CPU_FEATURE_GROUP")
+    if s.byte_length() == 0:
+        return 0
+    try:
+        var n = Int(s)
+        if not is_feature_group_width(n):
+            raise Error("off the ladder")
+        return n
+    except:
+        raise Error(
+            'MOJOTREES_CPU_FEATURE_GROUP must be 1, 2, 4, 8, or 16: those are'
+            ' the widths an accumulation kernel is instantiated at. Got "',
+            s,
+            '"',
+        )
 
 
 def env_compact_min_rows() -> Int:
@@ -342,29 +469,89 @@ def feature_slice_bytes(n_bins: Int) -> Int:
     return n_bins * HISTOGRAM_BYTES_PER_CELL
 
 
-def plan_feature_group(profile: CpuProfile, n_bins: Int) -> Int:
-    """How many features one accumulation inner loop may interleave.
+def cache_feature_group(profile: CpuProfile, n_bins: Int) -> Int:
+    """The widest rung whose group of histogram slices fits the L1 budget.
 
     Interleaving is only useful while every slice in the group stays in L1:
-    the whole point is that the two read-modify-write chains do not stall on
-    memory. The group is therefore bounded by the assumed L1 budget, and by
-    the environment knob, and by `MAX_FEATURE_GROUP`.
+    the whole point is that the N read-modify-write chains do not stall on
+    memory. `L1_GROUP_DIVISOR` leaves the rest of the assumed cache for the
+    row index stream, the gradient pairs, and the N binned columns the loop
+    walks, all of which stream through the same cache.
+
+    At the default shape this is the arithmetic that decides everything:
+    `feature_slice_bytes(255)` is 6120, the budget is `65536 / 2 = 32768`,
+    32768 / 6120 = 5 slices fit, and `feature_group_floor(5)` is 4. Every one
+    of those numbers is an assumption or a floor, none is measured, and
+    `ASSUMED_L1D_BYTES` in particular is a portable floor rather than this
+    machine's cache; the module docstring says why it stays that way.
     """
-    var wanted = env_feature_group()
-    if wanted > MAX_FEATURE_GROUP:
-        wanted = MAX_FEATURE_GROUP
-    if wanted < 1:
-        wanted = 1
     var slice_bytes = feature_slice_bytes(n_bins)
     if slice_bytes <= 0:
         return 1
     var budget = profile.l1d_bytes // L1_GROUP_DIVISOR
-    var fits = budget // slice_bytes
-    if fits < wanted:
-        wanted = fits
-    if wanted < 1:
-        wanted = 1
-    return wanted
+    return feature_group_floor(budget // slice_bytes)
+
+
+def schedule_feature_group(profile: CpuProfile, n_active: Int) -> Int:
+    """The widest rung that still leaves one group per dispatch core.
+
+    A group is the dispatch unit, so `n_active` features at width N offer
+    `feature_group_count(n_active, N)` units of parallelism and no more.
+    Widening past the point where that count drops below the core count trades
+    cores for gradient traffic, and a barrier-synchronized fan-out that leaves
+    cores idle loses in a way that is predictable rather than hypothetical, so
+    the conservative direction is to stop widening there.
+
+    `dispatch_cores()` and not `max_auto_tasks()`: the 4x over-decomposition
+    exists to hide the cost of a task landing on an efficiency core, and
+    applying it here would cap the width at 1 on every shape this project
+    cares about (50 features over 40 tasks leaves one feature per task). One
+    group per core is the floor; whether over-decomposition is worth more than
+    interleave width above that floor is unmeasured, and
+    `MOJOTREES_CPU_FEATURE_GROUP` is how the other arm gets run.
+
+    Fewer features than cores gives 1, which is exactly today's behaviour on
+    such a shape and gives up nothing: there was never a second feature for a
+    task to interleave.
+    """
+    var cores = profile.dispatch_cores()
+    if cores < 1:
+        return 1
+    return feature_group_floor(n_active // cores)
+
+
+def plan_feature_group(
+    profile: CpuProfile, n_bins: Int, n_active: Int
+) raises -> Int:
+    """How many features one accumulation inner loop interleaves.
+
+    An explicit `MOJOTREES_CPU_FEATURE_GROUP` is returned as asked, having
+    been checked against the ladder. It deliberately bypasses all three clamps
+    below: those encode an assumed cache size and an unmeasured guess about
+    what parallelism is worth, and a knob that could not exceed them could not
+    be used to test them. It may exceed `n_active`, which costs nothing: the
+    kernel's tail group owns only the features that remain.
+
+    Otherwise the width is the narrowest of what the cache estimate allows,
+    what the core count leaves parallel, and what `n_active` features can fill,
+    floored to a rung throughout. Whatever it returns, the result is
+    bit-identical: the width changes how many features share one walk of the
+    rows, never the order in which any one feature's bins are summed.
+    """
+    var requested = env_feature_group()
+    if requested > 0:
+        return requested
+    var group = DEFAULT_FEATURE_GROUP
+    var by_cache = cache_feature_group(profile, n_bins)
+    if by_cache < group:
+        group = by_cache
+    var by_schedule = schedule_feature_group(profile, n_active)
+    if by_schedule < group:
+        group = by_schedule
+    var by_active = feature_group_floor(n_active)
+    if by_active < group:
+        group = by_active
+    return group if group >= 1 else 1
 
 
 @fieldwise_init
@@ -380,7 +567,14 @@ struct AccumulationPlan(Copyable, Movable):
 
     var group_width: Int
     """Features one inner loop interleaves; 1 is the plain per-feature
-    loop."""
+    loop. Always a rung of the ladder, because the kernel is instantiated per
+    rung."""
+
+    var group_count: Int
+    """Groups the active features split into, and therefore the number of
+    units the accumulation dispatches over. A task takes whole groups, which
+    is what stops the task splitter from handing a task fewer features than
+    the width it was told to interleave."""
 
     var compact_rows: Bool
     """Whether to gather the node's (gradient, hessian) pairs into a
@@ -408,6 +602,8 @@ struct AccumulationPlan(Copyable, Movable):
         return String(
             "group_width=",
             self.group_width,
+            " group_count=",
+            self.group_count,
             " compact_rows=",
             compact,
             " active_ops=",
@@ -426,7 +622,7 @@ def derive_accumulation_plan(
     n_bins: Int,
     n_rows_touched: Int,
     rows_are_indirect: Bool,
-) -> AccumulationPlan:
+) raises -> AccumulationPlan:
     """Plan one histogram build.
 
     `n_active` is how many features will be accumulated (all of them unless
@@ -438,6 +634,9 @@ def derive_accumulation_plan(
     the node's rows and saves the remaining features an indirect load of the
     gradient and the hessian per row, so it wants at least two active
     features and enough rows that the pass is not pure overhead.
+
+    Raises only for an off-ladder `MOJOTREES_CPU_FEATURE_GROUP`; every
+    workload shape, including a degenerate one, produces a plan.
     """
     var active = n_active if n_active > 0 else 0
     var rows = n_rows_touched if n_rows_touched > 0 else 0
@@ -451,14 +650,11 @@ def derive_accumulation_plan(
         and active >= COMPACT_MIN_FEATURES
         and rows >= env_compact_min_rows()
     )
-    var group = plan_feature_group(profile, bins)
-    if group > active and active > 0:
-        group = active
-    if group < 1:
-        group = 1
+    var group = plan_feature_group(profile, bins, active)
 
     return AccumulationPlan(
         group,
+        feature_group_count(active, group),
         compact,
         active * (bins + rows),
         excluded * bins,
