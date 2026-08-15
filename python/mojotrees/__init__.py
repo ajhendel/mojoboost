@@ -504,7 +504,16 @@ from .cv import CVBooster, cv  # noqa: E402 - the estimators must exist first
 #: - `inspection`, `device_selection`, and `diagnostics` are pure mojotrees
 #:   and are lazy only to keep this import cheap. `inspection` reaches
 #:   pandas from `trees_to_dataframe` alone, and never at import.
-_LAZY_SUBMODULES = ("dask", "device_selection", "diagnostics", "inspection")
+#: - `lgbm_model_io` is experimental LightGBM model-file interop, converted
+#:   natively and gated by its own `interop_status()`. It exports nothing at
+#:   top level: a conversion is asked for by name, never reached by accident.
+_LAZY_SUBMODULES = (
+    "dask",
+    "device_selection",
+    "diagnostics",
+    "inspection",
+    "lgbm_model_io",
+)
 
 #: Top-level names that live in a lazy submodule, and the submodule each
 #: comes from. They are in `__all__`: the module they come from is an

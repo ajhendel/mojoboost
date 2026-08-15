@@ -2832,10 +2832,10 @@ def import_lgbm_file(
         save_multiclass_model(
             multi.model, model_path, multi.report.feature_names
         )
-        return multi.report^
+        return multi.report.copy()
     var single = import_lgbm_model(text)
     save_model(single.model, model_path, single.report.feature_names)
-    return single.report^
+    return single.report.copy()
 
 
 def export_lgbm_file(
@@ -2861,9 +2861,9 @@ def export_lgbm_file(
         var multi_out = export_lgbm_multiclass_model(multi, names)
         with open(lgbm_path, "w") as f:
             f.write(multi_out.text)
-        return multi_out.report^
+        return multi_out.report.copy()
     var single = load_model(model_path)
     var single_out = export_lgbm_model(single, names)
     with open(lgbm_path, "w") as f:
         f.write(single_out.text)
-    return single_out.report^
+    return single_out.report.copy()

@@ -92,6 +92,12 @@ from inspection_bindings import (
     split_values,
     split_values_multiclass,
 )
+from lgbm_bindings import (
+    lgbm_export_file,
+    lgbm_file_unsupported_reason,
+    lgbm_import_file,
+    lgbm_interop_status,
+)
 from model_editing_bindings import (
     get_leaf_output,
     get_leaf_output_multiclass,
@@ -171,7 +177,6 @@ from mojotrees.trainset import (
     Dataset,
     train_dataset as mojo_train_dataset,
     train_dataset_multiclass as mojo_train_dataset_multiclass,
-    train_dataset_ranker as mojo_train_dataset_ranker,
     train_dataset_ranker_advanced as mojo_train_dataset_ranker_advanced,
     update_dataset as mojo_update_dataset,
     update_dataset_multiclass as mojo_update_dataset_multiclass,
@@ -425,6 +430,13 @@ def PyInit__mojotrees() abi("C") -> PythonObject:
         m.def_function[dump_leaf_index_multiclass](
             "dump_leaf_index_multiclass"
         )
+        # -- LightGBM model-file interop (lgbm_bindings.mojo) -------------
+        m.def_function[lgbm_interop_status]("lgbm_interop_status")
+        m.def_function[lgbm_file_unsupported_reason](
+            "lgbm_file_unsupported_reason"
+        )
+        m.def_function[lgbm_import_file]("lgbm_import_file")
+        m.def_function[lgbm_export_file]("lgbm_export_file")
         # -- editing a fitted model (model_editing_bindings.mojo) ---------
         m.def_function[model_editing_status]("model_editing_status")
         m.def_function[rollback_one_iter]("rollback_one_iter")

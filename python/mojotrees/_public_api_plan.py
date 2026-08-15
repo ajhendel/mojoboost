@@ -281,7 +281,9 @@ PROPOSED_LAZY_SUBMODULES = (
 #: mechanism, kept here so it can be read without the surrounding 4000
 #: lines -- `__init__.py` is the copy that runs.
 LAZY_SUBMODULE_SNIPPET = '''
-_LAZY_SUBMODULES = ("dask", "device_selection", "diagnostics", "inspection")
+_LAZY_SUBMODULES = (
+    "dask", "device_selection", "diagnostics", "inspection", "lgbm_model_io"
+)
 
 _LAZY_ATTRS = {
     "explain_device_choice": "device_selection",
