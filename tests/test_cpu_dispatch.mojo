@@ -477,12 +477,20 @@ def test_resolved_policy_matches_a_fresh_detection() raises:
     assert_equal(resolved.core_pool, env_core_pool())
     assert_equal(resolved.dispatch_cores(), fresh.dispatch_cores())
     assert_equal(resolved.max_auto_tasks(), fresh.max_auto_tasks())
+    # The width rule now takes the active feature count too, because the
+    # balance clamp bounds it by how many groups the dispatch can spread
+    # over the cores. Both counts are swept: the snapshot and the live path
+    # must agree at every (bins, active) pair, since a disagreement would
+    # size the accumulation kernel and the plan that allocated its buffers
+    # differently and nothing else checks those two against each other.
     var bin_counts = [1, 15, 32, 255, 256, 4096, 100_000]
+    var active_counts = [1, 2, 7, 19, 50, 200, 1000]
     for i in range(len(bin_counts)):
-        assert_equal(
-            resolved.feature_group_for(bin_counts[i]),
-            plan_feature_group(fresh, bin_counts[i]),
-        )
+        for j in range(len(active_counts)):
+            assert_equal(
+                resolved.feature_group_for(bin_counts[i], active_counts[j]),
+                plan_feature_group(fresh, bin_counts[i], active_counts[j]),
+            )
 
 
 def test_resolved_policy_tracks_every_pool_and_fan_out_setting() raises:
