@@ -90,6 +90,7 @@ second list of blockers that could drift from it.
 from std.math import log
 from std.os import getenv
 from std.sys import has_accelerator
+from std.time import perf_counter_ns
 from max.gpu.host import DeviceContext
 
 from .apple_histogram_policy import ClassSchedule
@@ -1255,10 +1256,23 @@ def grow_tree_gpu(
         List[Float64](), List[Float64](), 0,
     )
 
+    # Wall-clock phase attribution, printed per tree under
+    # `MOJOBOOST_GPU_PHASE_TRACE=1`. The traced sync after `apply_split` is
+    # what separates partition time from the histogram build that would
+    # otherwise absorb it, so a traced run pays one extra device wait per
+    # split (~0.15ms) that an untraced run does not.
+    var phase_trace = getenv("MOJOBOOST_GPU_PHASE_TRACE") == "1"
+    var t_partition = 0.0
+    var t_hist = 0.0
+    var t_search = 0.0
+    var tree_t0 = perf_counter_ns()
+
     builder.begin_tree(bag)
     var n_root = len(bag) if len(bag) > 0 else builder.n_rows
     var root = tree._add_node(0.0, Float64(n_root))
+    var hist_t0 = perf_counter_ns()
     var root_hist = builder.build_leaf(root)
+    t_hist += Float64(perf_counter_ns() - hist_t0) / 1e9
     # Valued before the search, because path smoothing makes a candidate's
     # children shrink toward this value; the root smooths toward 0.0.
     tree.value[root] = _leaf_value(
@@ -1272,6 +1286,7 @@ def grow_tree_gpu(
         path_smooth,
     )
     var root_branch = List[Int]()
+    var search_t0 = perf_counter_ns()
     var root_split = _search(
         root_hist,
         n_root,
@@ -1295,6 +1310,7 @@ def grow_tree_gpu(
         parent_output=tree.value[root],
         grower_applies_extra=True,
     )
+    t_search += Float64(perf_counter_ns() - search_t0) / 1e9
 
     var frontier = List[_GpuLeafState]()
     frontier.append(
@@ -1330,6 +1346,7 @@ def grow_tree_gpu(
         # match across backends.
         var left_node = tree._add_node(0.0, Float64(n_left))
         var right_node = tree._add_node(0.0, Float64(n_right))
+        var part_t0 = perf_counter_ns()
         builder.apply_split(
             split.feature,
             split.bin,
@@ -1342,6 +1359,9 @@ def grow_tree_gpu(
             split.cat_bitset,
             expected_left=n_left,
         )
+        if phase_trace:
+            builder.ctx.synchronize()
+        t_partition += Float64(perf_counter_ns() - part_t0) / 1e9
 
         # Both children, however the launch policy wants them. Batched,
         # they go up in one packed launch over exactly their own row ranges
@@ -1357,6 +1377,7 @@ def grow_tree_gpu(
         var left_hist: Histogram
         var right_hist: Histogram
         var child_nodes: List[Int] = [left_node, right_node]
+        hist_t0 = perf_counter_ns()
         if builder.batches_nodes(child_nodes):
             var pair = builder.build_leaves(child_nodes)
             left_hist = pair[0].copy()
@@ -1372,6 +1393,7 @@ def grow_tree_gpu(
         else:
             right_hist = builder.build_leaf(right_node)
             left_hist = subtract_histogram(frontier[best_i].hist, right_hist)
+        t_hist += Float64(perf_counter_ns() - hist_t0) / 1e9
 
         # Same clamp-and-divide as the CPU grower: no-ops when unconstrained.
         # The cap and the smoothing come first and the interval is enforced on
@@ -1427,6 +1449,7 @@ def grow_tree_gpu(
         var child_depth = frontier[best_i].depth + 1
         # Each child draws its own per-node feature set from its node id, the
         # same id the CPU grower would assign it.
+        search_t0 = perf_counter_ns()
         var left_split = _search(
             left_hist,
             n_left,
@@ -1475,6 +1498,7 @@ def grow_tree_gpu(
             parent_output=right_value,
             grower_applies_extra=True,
         )
+        t_search += Float64(perf_counter_ns() - search_t0) / 1e9
 
         frontier[best_i] = _GpuLeafState(
             left_node,
@@ -1497,6 +1521,23 @@ def grow_tree_gpu(
             )
         )
         n_leaves += 1
+
+    if phase_trace:
+        var tree_s = Float64(perf_counter_ns() - tree_t0) / 1e9
+        print(
+            "phase_trace tree",
+            tree_index,
+            "total_s",
+            tree_s,
+            "hist_s",
+            t_hist,
+            "partition_s",
+            t_partition,
+            "search_s",
+            t_search,
+            "other_s",
+            tree_s - t_hist - t_partition - t_search,
+        )
 
     tree.n_leaves = n_leaves
     return tree^

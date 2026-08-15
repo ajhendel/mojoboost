@@ -1,5 +1,6 @@
 # mojoboost
 
+[![PyPI](https://img.shields.io/pypi/v/mojoboost.svg)](https://pypi.org/project/mojoboost/)
 [![CI](https://github.com/mojoboost-ml/mojoboost/actions/workflows/ci.yml/badge.svg)](https://github.com/mojoboost-ml/mojoboost/actions/workflows/ci.yml)
 
 Native gradient-boosted trees accelerated by the GPU already inside Apple
@@ -39,21 +40,23 @@ who or what typed a change—as the standard for correctness and performance.
 
 ## Installation
 
-The command this project is building toward is one line.
+The first public alpha is on PyPI:
 
 ```sh
 pip install mojoboost
 ```
 
-**It does not work yet.** Nothing has been published to PyPI and no release
-wheel exists to download, so today there is exactly one way to install
-mojoboost, and it is a source checkout with [pixi](https://pixi.sh).
+The current `0.1.0a1` wheel supports **CPython 3.14 on Apple Silicon running
+macOS 26 or newer**. It is self-contained: using the wheel does not require
+Mojo, MAX, Pixi, or a compiler. Other interpreter and platform combinations
+will correctly receive `No matching distribution found` until matching
+wheels have been built and validated.
 
 | State | What you type | Status today |
 |---|---|---|
-| Stable pip install | `pip install mojoboost` | **Not available.** No PyPI release exists |
-| A published release wheel | `pip install ./mojoboost-<version>-<tags>.whl` | **Not available.** No release has been built or published |
-| Source checkout with pixi | the four commands below | **Works today** |
+| Published alpha | `pip install mojoboost` | **Available:** `0.1.0a1`, CPython 3.14, Apple Silicon, macOS 26+ |
+| Release wheel file | `pip install ./mojoboost-<version>-<tags>.whl` | **Available** from the release workflow |
+| Source checkout with Pixi | the four commands below | **Available** for contributors and development |
 
 [docs/INSTALLATION.md](docs/INSTALLATION.md) is the full version of this,
 with what each state will require, the wheel filename for each platform, the
@@ -64,7 +67,7 @@ mojoboost publishes no source distribution, deliberately, so `pip install
 mojoboost` can never turn into a Mojo compile on a machine with no Mojo
 toolchain. It resolves to a wheel that matches your machine or it refuses.
 
-### The source install, which is the one that works
+### Source installation for contributors
 
 A Mojo or MAX installation is not required separately; pixi resolves the
 versions pinned by this repository.
@@ -862,12 +865,12 @@ tile size are runtime values here rather than compile-time ones.
    ([procedure](docs/GPU_VALIDATION.md); neither has been run). The kernels
    already scale past one threadgroup per feature and tile themselves from
    device capabilities, but every measurement so far is Apple Metal
-4. Publish the Python API to PyPI. A self-contained macOS arm64 wheel builds
-   locally today, but no wheel has been published or clean-install validated
-   anywhere, and the Linux tag is unsettled: the release workflow's default
-   `linux_x86_64` is rejected by every index, and a `manylinux` tag needs a
-   measured glibc floor first. See [docs/INSTALLATION.md](docs/INSTALLATION.md)
-   and [docs/PLATFORM_MATRIX.md](docs/PLATFORM_MATRIX.md)
+4. Expand the published wheel matrix beyond the validated CPython 3.14,
+   Apple Silicon, macOS 26+ alpha. Linux needs a measured glibc floor before
+   any `manylinux` claim, and additional Python versions require their own
+   build and clean-install evidence. See
+   [docs/INSTALLATION.md](docs/INSTALLATION.md) and
+   [docs/PLATFORM_MATRIX.md](docs/PLATFORM_MATRIX.md)
 5. Broader benchmark suite (XGBoost and real datasets)
 6. R bindings on top of the C ABI in `capi/`, which exists so that the R
    package (and any other language binding) never has to track a mojoboost

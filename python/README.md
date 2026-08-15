@@ -24,21 +24,22 @@ bit-exact model save/load.
 
 ## Installing
 
-The command this project is building toward is one line.
+The first public alpha is on PyPI:
 
 ```sh
 pip install mojoboost
 ```
 
-**It does not work yet.** Nothing has been published to PyPI and no release
-wheel exists to download. There are three states, and only the third one
-exists today.
+The current `0.1.0a1` wheel supports **CPython 3.14 on Apple Silicon running
+macOS 26 or newer**. It includes its runtime dependencies and requires no
+Mojo, MAX, Pixi, or compiler. Unsupported interpreters and platforms fail
+cleanly with `No matching distribution found`.
 
 | State | What you type | Status today |
 |---|---|---|
-| Stable pip install | `pip install --only-binary=:all: mojoboost` | **Not available.** No PyPI release exists |
-| A published release wheel | `pip install ./mojoboost-<version>-<tags>.whl` | **Not available.** No release has been built or published |
-| Source checkout with pixi | `git clone`, `pixi install`, `pixi run build-python` | **Works today** |
+| Published alpha | `pip install --only-binary=:all: mojoboost` | **Available:** `0.1.0a1`, CPython 3.14, Apple Silicon, macOS 26+ |
+| A release wheel file | `pip install ./mojoboost-<version>-<tags>.whl` | **Available** from the release workflow |
+| Source checkout with Pixi | `git clone`, `pixi install`, `pixi run build-python` | **Available** for contributors |
 
 ```sh
 git clone https://github.com/mojoboost-ml/mojoboost.git
@@ -49,8 +50,8 @@ PYTHONPATH=python python -c "import mojoboost; print(mojoboost.__version__)"
 ```
 
 [pixi](https://pixi.sh) resolves the pinned Mojo and MAX versions, so no
-separate Mojo or MAX installation is needed. A published wheel will bundle
-the runtime libraries it links and need no toolchain at all.
+separate Mojo or MAX installation is needed. The published wheel bundles
+the runtime libraries it links and needs no toolchain at all.
 
 mojoboost publishes no source distribution, deliberately, so
 `pip install mojoboost` can never turn into a Mojo compile on a machine with
@@ -446,20 +447,21 @@ The Linux platform tag is likewise unsettled: the default `linux_x86_64` and
 `linux_aarch64` tags are rejected by every index, and a `manylinux` tag needs
 a measured glibc floor first.
 
-None of that has been published or validated yet. Every target, its expected
-artifact name, and the evidence behind its status is in
+The CPython 3.14 Apple Silicon wheel has now been published and clean-install
+validated. Every target, its artifact name, and the evidence behind its
+status is in
 [docs/PLATFORM_MATRIX.md](https://github.com/mojoboost-ml/mojoboost/blob/main/docs/PLATFORM_MATRIX.md),
 where the rule is that a platform counts as validated when hardware ran the
 artifact and somebody wrote down what happened.
 
-Until then, build from source with [pixi](https://pixi.sh) using the
-instructions above.
+For unsupported targets, build from source with [pixi](https://pixi.sh)
+using the instructions above.
 
 ## When something goes wrong
 
 | What you see | What it means |
 |---|---|
-| `No matching distribution found for mojoboost` | The package is not on PyPI yet. Build from source |
+| `No matching distribution found for mojoboost` | PyPI has no wheel matching your Python, operating system, and architecture. Use the supported target or build from source |
 | `Requires-Python >=3.14` in pip's output | Your interpreter is older than the declared floor |
 | `... is not a supported wheel on this platform` | The wheel's tags do not describe your machine. Do not force it |
 | `ImportError: cannot import name '_mojoboost' from 'mojoboost'` | Source checkout without a built extension. Run `pixi run build-python` |

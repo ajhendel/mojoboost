@@ -3,39 +3,36 @@
 > [!IMPORTANT]
 > mojoboost is an experimental public alpha. It trains, predicts, saves, and
 > loads today, and people can use it for real work on the platform below.
-> It is not yet a drop-in production replacement for LightGBM or XGBoost,
-> and no wheel has been published anywhere. Read
+> It is not yet a drop-in production replacement for LightGBM or XGBoost.
+> The first wheel is published for the narrow platform described below. Read
 > [docs/LIGHTGBM_PARITY.md](LIGHTGBM_PARITY.md) for what the library
 > promises and [docs/GPU_VALIDATION.md](GPU_VALIDATION.md) before believing
 > anything about an accelerator.
 
-The command this project is building toward is one line.
+The first public alpha is available from PyPI:
 
 ```sh
 pip install mojoboost
 ```
 
-**That command does not work yet.** Nothing has been published to PyPI, the
-name has not been reserved, and no release wheel exists to download. This
-page separates the command we want from the two things that are actually
-available, so nobody spends an afternoon on an install path that was never
-going to work.
+The current release is `0.1.0a1`. Its wheel supports **CPython 3.14 on Apple
+Silicon running macOS 26 or newer**. No Mojo installation, MAX installation,
+Pixi environment, or compiler is required to use that wheel.
 
-## Three states, and which one you are in
+## Three installation paths
 
 | State | What you type | Status today |
 |---|---|---|
-| 1. Stable pip install | `pip install mojoboost` | **Not available.** No PyPI release exists |
-| 2. A published release wheel | `pip install ./mojoboost-<version>-<tags>.whl` | **Not available.** No release has been built or published |
-| 3. Source checkout with Pixi | `git clone`, `pixi install`, `pixi run build-python` | **Works today.** This is how every current user installs mojoboost |
+| 1. Published alpha from PyPI | `pip install mojoboost` | **Available** for CPython 3.14, Apple Silicon, macOS 26+ |
+| 2. A release wheel file | `pip install ./mojoboost-<version>-<tags>.whl` | **Available** from the release workflow |
+| 3. Source checkout with Pixi | `git clone`, `pixi install`, `pixi run build-python` | **Available** for contributors and unsupported targets |
 
 Pick by what you are trying to do.
 
-- You want to use mojoboost in an ordinary Python project, today. Only state
-  3 exists, and it needs a Pixi environment and a few minutes of build time.
-  There is no way around that yet.
-- You want to use mojoboost in an ordinary Python project once it ships.
-  Read state 1 for the contract, then watch the repository releases.
+- You use CPython 3.14 on an Apple Silicon Mac with macOS 26 or newer. State
+  1 is the ordinary install path.
+- You use another interpreter or platform. No matching public wheel exists
+  yet; use state 3 if the pinned Mojo toolchain supports your system.
 - You are contributing, or you want the Mojo API, the C ABI, or the CLI.
   State 3 is the only one that gives you those at all.
 
@@ -48,10 +45,9 @@ with a compiler error. See
 
 ---
 
-## State 1. Stable pip install (not available yet)
+## State 1. Published alpha from PyPI
 
-This is the target, written down now so the contract is fixed before the
-first release rather than after it.
+Install the published binary wheel directly from PyPI.
 
 ```sh
 python -m pip install --only-binary=:all: mojoboost
@@ -62,7 +58,7 @@ is not a prebuilt wheel, which is exactly the guarantee this project wants to
 make, and it makes an install fail fast and legibly on a platform we do not
 publish for.
 
-What that install will contain, when it exists.
+What that install contains.
 
 - The `mojoboost` Python package and one compiled extension module,
   `_mojoboost`, built from the same Mojo sources as the rest of the library.
@@ -72,7 +68,7 @@ What that install will contain, when it exists.
 - Nothing else. numpy is optional, scikit-learn is optional, scipy is never
   imported.
 
-What it will require.
+What it requires today.
 
 | Requirement | Value today | Where it is decided |
 |---|---|---|
@@ -80,8 +76,8 @@ What it will require.
 | Platform | macOS on Apple silicon first, Linux x86_64 and aarch64 after that | [docs/PLATFORM_MATRIX.md](PLATFORM_MATRIX.md) |
 | numpy | optional | plain Python sequences work without it; `pip install "mojoboost[numpy]"` pulls it in |
 
-The Python floor is the most likely of these to move before the first
-release, and it is worth knowing why it reads the way it does.
+The Python floor is likely to broaden in a future release, and it is worth
+knowing why it reads the way it does.
 [docs/PYTHON_SUPPORT.md](PYTHON_SUPPORT.md) takes the question apart and
 finds that 3.14 is not a toolchain requirement at all: the pinned MAX
 publishes builds for CPython 3.10 through 3.14, and the wheel is labeled
@@ -96,16 +92,10 @@ reason behind it, not as a settled decision and not as a permanent one.
 
 ### What `pip install mojoboost` does right now
 
-It fails, and the failure is the correct one.
-
-```text
-ERROR: Could not find a version that satisfies the requirement mojoboost (from versions: none)
-ERROR: No matching distribution found for mojoboost
-```
-
-That is pip saying the package does not exist on the index. It is not a
-network problem, a proxy problem, or a pip version problem, and no flag fixes
-it. Go to state 3.
+On the supported target, pip downloads and installs `0.1.0a1`. On any other
+target, pip reports `No matching distribution found` because no compatible
+wheel exists. That refusal is intentional; pip never falls back to compiling
+Mojo source.
 
 ### Why there is no sdist
 
@@ -123,18 +113,15 @@ than a silent fallback.
 
 ---
 
-## State 2. A published release wheel (not available yet)
+## State 2. Install a release wheel file
 
 This is the path for anyone who wants the artifact before or without PyPI,
 or who mirrors artifacts internally.
 
-**No release has been built or published.** The release workflows exist
-(`.github/workflows/release-macos.yml` and `release-linux.yml`), and neither
-has been run. They produce a wheel, a SHA-256 manifest, and a provenance
-sidecar as workflow artifacts from a tagged commit. How those artifacts then
-reach a user, a GitHub release attachment or an index, is not decided yet, so
-do not read the steps below as a download link that exists. They are the
-contract the machinery is being built against.
+The macOS release workflow has produced and published the first alpha
+artifact through PyPI trusted publishing. Release workflows also produce a
+wheel, SHA-256 manifest, provenance, and software bill of materials from a
+tagged commit. Linux artifacts remain unvalidated and unpublished.
 
 ### Pick the wheel for your exact platform
 
@@ -143,9 +130,9 @@ it. There is one wheel per row, and no row is a near enough match for another.
 
 | Your machine | The wheel | Where that stands |
 |---|---|---|
-| Apple silicon Mac, Python 3.14 | `mojoboost-0.1.0-cp314-cp314-macosx_26_0_arm64.whl` | The first target. Tag not yet produced by a release run |
-| Linux x86_64, Python 3.14 | `mojoboost-0.1.0-cp314-cp314-linux_x86_64.whl` | Matrix row `linux-x86_64-cp314`, not index-publishable. See below |
-| Linux aarch64, Python 3.14 | `mojoboost-0.1.0-cp314-cp314-linux_aarch64.whl` | Matrix row `linux-aarch64-cp314`, not index-publishable. See below |
+| Apple silicon Mac, Python 3.14 | `mojoboost-0.1.0a1-cp314-cp314-macosx_26_0_arm64.whl` | Published and clean-install validated |
+| Linux x86_64, Python 3.14 | `mojoboost-0.1.0a1-cp314-cp314-linux_x86_64.whl` | Matrix row `linux-x86_64-cp314`, not index-publishable. See below |
+| Linux aarch64, Python 3.14 | `mojoboost-0.1.0a1-cp314-cp314-linux_aarch64.whl` | Matrix row `linux-aarch64-cp314`, not index-publishable. See below |
 | Intel Mac | none, and there will not be one | The pinned channel ships no Intel macOS toolchain |
 | Windows | none | No toolchain in the pinned channel |
 | Free-threaded Python (`3.14t`) | none | A different ABI tag; the extension cannot load |
@@ -197,7 +184,7 @@ sha256sum -c SHA256SUMS-x86_64.txt             # Linux x86_64
 # 2. Install into a fresh virtual environment, from the file itself.
 python3.14 -m venv .venv
 . .venv/bin/activate
-python -m pip install ./mojoboost-0.1.0-cp314-cp314-macosx_26_0_arm64.whl
+python -m pip install ./mojoboost-0.1.0a1-cp314-cp314-macosx_26_0_arm64.whl
 
 # 3. Confirm it imports and can train, from a directory that is not a
 #    mojoboost checkout, so a stray source tree cannot make this pass.
@@ -221,9 +208,9 @@ registered with the system.
 
 ---
 
-## State 3. Source checkout with Pixi (works today)
+## State 3. Source checkout with Pixi
 
-This is the real install path right now. It needs [Pixi](https://pixi.sh) and
+This is the contributor and unsupported-target path. It needs [Pixi](https://pixi.sh) and
 about a gigabyte of toolchain, and it gives you the Python API, the Mojo API,
 the C ABI, the CLI, the tests, and the benchmarks. You do not need to install
 Mojo or MAX separately; Pixi resolves the exact versions this repository pins.
@@ -260,8 +247,8 @@ produced, so it is for you and not for redistribution.
 
 ### What state 3 does not give you
 
-- A package other people can `pip install`. The checkout is a build
-  environment.
+- A redistributable artifact. The checkout is a build environment; use the
+  release workflow for published wheels.
 - Any accelerator guarantee. Whether the GPU path is compiled in at all is
   decided on the machine that builds, because Mojo resolves
   `has_accelerator()` at compile time. See
@@ -294,7 +281,7 @@ the two import failures a bad install produces.
 import mojoboost
 from mojoboost import MojoBoostRegressor, gpu_available
 
-print(mojoboost.__version__)   # 0.1.0
+print(mojoboost.__version__)   # 0.1.0a1
 print(mojoboost.__file__)      # where this package actually came from
 print(gpu_available())         # True if this build has an accelerator path
 ```
@@ -386,7 +373,7 @@ mojoboost.show_versions()
 ```
 
 ```text
-mojoboost 0.1.0
+mojoboost 0.1.0a1
   package                /.../site-packages/mojoboost/__init__.py
   install                wheel
   extension              /.../site-packages/mojoboost/_mojoboost.so
@@ -473,7 +460,7 @@ rather than the punctuation.
 ### Unsupported Python
 
 ```text
-ERROR: Ignored the following versions that require a different python version: 0.1.0 Requires-Python >=3.14
+ERROR: Ignored the following versions that require a different python version: 0.1.0a1 Requires-Python >=3.14
 ERROR: Could not find a version that satisfies the requirement mojoboost
 ERROR: No matching distribution found for mojoboost
 ```
@@ -492,7 +479,7 @@ mismatch below instead, because the filename carries `cp314`.
 ### Wrong architecture, wrong operating system, or too old a macOS
 
 ```text
-ERROR: mojoboost-0.1.0-cp314-cp314-macosx_26_0_arm64.whl is not a supported wheel on this platform.
+ERROR: mojoboost-0.1.0a1-cp314-cp314-macosx_26_0_arm64.whl is not a supported wheel on this platform.
 ```
 
 pip compared the filename tags against the machine and they did not match.
