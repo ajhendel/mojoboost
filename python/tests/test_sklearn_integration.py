@@ -57,7 +57,27 @@ def test_tags_report_what_the_estimators_actually_accept():
     tags = get_tags(MojoTreesRegressor())
     assert tags.estimator_type == "regressor"
     assert tags.input_tags.allow_nan is True
-    assert tags.input_tags.sparse is False
+    # True because fit and predict take SciPy sparse and keep it sparse. A
+    # scikit-learn utility that reads this tag as False densifies before
+    # calling us, which is what the sparse path exists to avoid.
+    assert tags.input_tags.sparse is True
+
+
+@pytest.mark.parametrize("cls", ESTIMATORS)
+def test_sparse_input_survives_a_meta_estimator(cls, regression, binary):
+    """The sparse tag is a promise about a code path, so exercise the path.
+
+    `cross_val_score` splits, refits, and scores through scikit-learn's own
+    validation and indexing, which is where a False `sparse` tag would have
+    turned the matrix dense on the way in.
+    """
+    sparse = pytest.importorskip("scipy.sparse")
+    X, y = regression if cls is MojoTreesRegressor else binary
+    scores = cross_val_score(
+        cls(n_estimators=3, num_leaves=7), sparse.csr_matrix(X), y, cv=3
+    )
+    assert scores.shape == (3,)
+    assert np.isfinite(scores).all()
 
 
 @pytest.mark.parametrize("cls", ESTIMATORS)

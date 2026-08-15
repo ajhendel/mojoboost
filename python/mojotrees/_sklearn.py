@@ -46,10 +46,19 @@ def estimator_tags(kind):
     mixin = ClassifierMixin if kind == "classifier" else RegressorMixin
     proxy = type("_MojoTreesTagProxy", (mixin, BaseEstimator), {})()
     tags = proxy.__sklearn_tags__()
-    # NaN is the missing-value marker (src/mojotrees/binning.mojo); sparse
-    # input is rejected; training is deterministic given the same inputs.
+    # NaN is the missing-value marker (src/mojotrees/binning.mojo); SciPy
+    # sparse input is accepted and stays sparse (python/mojotrees/_arrays.py
+    # converts to the layout each side needs, CSC to fit and CSR to
+    # predict); training is deterministic given the same inputs.
+    #
+    # `sparse` is True because a scikit-learn utility that respects the tag
+    # densifies before calling us when it is False, which is the one thing
+    # the sparse path exists to avoid. The tag says what the input may be,
+    # not what every option combination supports: the sparse path takes no
+    # eval_set, trains on the CPU whatever `device` says, and has no
+    # `predict(pred_contrib=True)`. Those refuse by name when asked.
     tags.input_tags.allow_nan = True
-    tags.input_tags.sparse = False
+    tags.input_tags.sparse = True
     tags.non_deterministic = False
     return tags
 
