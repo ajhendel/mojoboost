@@ -98,7 +98,41 @@ The search runs as two kernels and never allocates per node:
 - `_reduce_slots_kernel`, one thread per node, folds that node's per-slot
   records into one record in ascending slot order and fills in the child
   statistics, child leaf values, the parent's leaf value, and the node's
-  runner-up gain.
+  runner-up gain. `_reduce_slots_block_kernel` is the same fold on a
+  threadgroup, which is what runs unless
+  `MOJOTREES_GPU_SPLIT_PRIMITIVES=0`.
+
+Two launches cover a whole frontier, not two per node and not one per
+feature: the grid is `(widest feature slot, node)`, which is the shape
+LightGBM's CUDA best-split finder uses when it runs the frontier's tasks as
+one grid of `num_tasks_` blocks. There is no per-feature or per-leaf launch
+left in this module to merge away.
+
+Collective primitives, and where they are not allowed
+----------------------------------------------------
+The reductions here are `gpu.primitives.block` collectives (`sum`, `max`,
+`min`, `prefix_sum`) rather than hand-rolled shared-memory loops, which is
+portable across NVIDIA, AMD, and Apple Metal and so keeps this module's
+one-source rule. A collective may replace a loop here only where
+reassociation cannot move a bit:
+
+- Every quantity accumulated along a feature's bins is fixed-point Int32,
+  and integer addition is associative, so `block.sum` over a feature's
+  totals and `block.prefix_sum[exclusive=True]` over the per-thread chunk
+  sums return the serial walk's words exactly.
+- Gains are only ever *compared* across threads, never summed, and `max`
+  and `min` are associative and commutative on the values these kernels
+  produce, so a tree-shaped argmax returns the serial walk's winner exactly
+  once the tie-break is carried alongside it (highest gain, then lowest
+  candidate ordinal inside a feature and lowest feature slot across
+  features).
+
+What is deliberately left serial: the gain arithmetic itself, and the
+per-thread walk along a chunk of bins. A gain is a difference of three
+Float32 quotients, and no collective reassociates one. There is no
+floating-point atomic and no floating-point sum crossing a thread boundary
+anywhere in this module, which is what keeps the device path
+bit-deterministic run to run.
 
 The scan is sequential within a feature because the candidate order *is* the
 tie-breaking rule, and because a threshold scan is a prefix sum. Features are
@@ -167,8 +201,10 @@ an interleaved benchmark resolves it and not before.
 from std.gpu import block_idx, thread_idx
 from std.memory import stack_allocation
 from std.os import getenv
+from std.sys import has_accelerator
 from max.gpu.host import DeviceBuffer, DeviceContext, HostBuffer
 from max.gpu.memory import AddressSpace
+from max.gpu.primitives import block
 from max.gpu.sync import barrier
 
 from .categorical import (
@@ -390,6 +426,63 @@ def gpu_split_gain(
         + gpu_output_score(right_g, right_h, lambda_l2, right_out)
         - parent_score
     )
+
+
+# --- Collective primitives, and the switch that holds both arms -----------
+#
+# Mojo's `gpu.primitives.block` collectives (`sum`, `max`, `min`,
+# `prefix_sum`) are supported on NVIDIA, AMD, and Apple Metal alike, so using
+# them keeps this module's one-portable-source rule intact: there is still no
+# per-backend code path here, and there are still no floating-point atomics.
+#
+# What they are allowed to replace is decided by associativity and nothing
+# else. Every quantity these kernels accumulate along a feature's bins is
+# fixed-point Int32, and integer addition is associative, so a tree-shaped
+# `prefix_sum` or `sum` over those returns the serial walk's value bit for
+# bit. The Float32 quantities are only ever *compared*, never summed across
+# threads: `max` and `min` are associative and commutative on the values
+# these kernels produce (no NaN, no signed zero), so a tree-shaped `max` over
+# gains also returns the serial walk's value bit for bit. No collective in
+# this module reassociates a floating-point sum, and none may: a gain is a
+# difference of three Float32 quotients, and reassociating that would move a
+# last bit and therefore, at a near tie, move a decision.
+
+comptime NO_CANDIDATE = Int32(2147483647)
+"""The identity a thread holding no candidate contributes to a `block.min`
+over candidate positions. `Int32.MAX`, spelled out because every real
+position is a candidate ordinal or a feature slot, both of which are far
+below it."""
+
+comptime REDUCE_SLOT_THREADS = 64
+"""Threads per threadgroup in the primitive cross-feature reduction. A warp
+multiple on every supported backend (it is `gpu_tiling.WARP_GRANULARITY`),
+which is what `block.max` and `block.min` want; the collectives allocate
+their own threadgroup scratch, one word per warp, so this kernel reserves no
+shared memory of its own and raises no device floor."""
+
+
+def split_primitives_requested() -> Bool:
+    """`MOJOTREES_GPU_SPLIT_PRIMITIVES=0`, the switch back to the
+    hand-rolled reductions.
+
+    On unless refused, which is the opposite posture from
+    `MOJOTREES_GPU_SPLIT_WIDE` and for a reason: the wide scan changes which
+    kernel shape does the scanning, while the collectives change only how a
+    reduction is spelled. Both arms return the same record by construction
+    (integer sums and float maxima are both associative), and
+    `tests/test_gpu_split_scan.mojo` asserts field for field that they do,
+    so what the switch preserves is a measurement handle and an escape
+    hatch, not a doubt about the answer.
+
+    Read once, at construction, and stored on the searcher, where
+    `GpuSplitSearcher.set_primitives` can override it. A benchmark that wants
+    to hold both arms in one process sets the field rather than re-execing
+    with a different environment, which is the same shape
+    `MOJOTREES_GPU_SPLIT_RESIDENT` and `MOJOTREES_GPU_SPLIT_WIDE` already
+    have: one environment variable that decides the default, one explicit
+    handle that overrides it.
+    """
+    return getenv("MOJOTREES_GPU_SPLIT_PRIMITIVES") != "0"
 
 
 # --- Kernels --------------------------------------------------------------
@@ -1243,6 +1336,338 @@ def _scan_slot_wide_kernel(
     out_f[unsafe_offset = fo + FREC_RIGHT_HESS] = total_h - lhf
 
 
+def _scan_slot_wide_primitive_kernel(
+    hist: MutPointer[Int32, MutAnyOrigin],
+    node_tab: MutPointer[Int32, MutAnyOrigin],
+    feat_ids: MutPointer[Int32, MutAnyOrigin],
+    allow: MutPointer[Int32, MutAnyOrigin],
+    missing: MutPointer[Int32, MutAnyOrigin],
+    mono: MutPointer[Int32, MutAnyOrigin],
+    fparams: MutPointer[Float32, MutAnyOrigin],
+    out_i: MutPointer[Int32, MutAnyOrigin],
+    out_f: MutPointer[Float32, MutAnyOrigin],
+    n_bins: Int32,
+    hist_size: Int32,
+    record_base: Int32,
+    feat_stride: Int32,
+    min_data_in_leaf: Int32,
+    constrained: Int32,
+):
+    """`_scan_slot_wide_kernel` with its four hand-rolled reductions written
+    as `gpu.primitives.block` collectives, and returning its record bit for
+    bit.
+
+    The four, and why each substitution is exact:
+
+    - The feature's totals were a strided partial sum per thread followed by
+      a shared-memory halving tree. They are now `block.sum` over the same
+      per-thread partials. The accumulated quantity is fixed-point Int32 and
+      integer addition is associative, so the tree the collective happens to
+      use returns the same word the halving tree did.
+    - The running left sums across chunk boundaries were an exclusive prefix
+      each thread computed by walking every lower thread's chunk sum out of
+      shared memory. They are now `block.prefix_sum[exclusive=True]` over
+      the same chunk sums. Int32 again, so again exact.
+    - The winner across threads was a serial walk on thread 0 over a shared
+      array of per-thread bests, taking the highest gain and, among equal
+      gains, the lowest candidate ordinal. It is now `block.max` over the
+      gains followed by `block.min` over the ordinals of the threads holding
+      the maximum. `max` and `min` reassociate exactly on these values, and
+      the pair (gain, ordinal) reproduces the serial rule exactly, because
+      candidate ordinals ascend with the scan and are unique across threads:
+      one thread and only one holds the maximum gain at the minimum ordinal,
+      and it is the thread the serial walk would have stopped on.
+    - The node's runner-up was a serial top-two merge over the same shared
+      array. `runner_gain` is the second largest, counted with multiplicity,
+      of the union of every thread's best and every thread's own runner-up.
+      Removing one occurrence of the maximum is the same as excluding the
+      winning thread's best, so the second largest is
+      `max(max over non-winning threads of their best, max over all threads
+      of their runner-up)`, which is two more `block.max` calls.
+
+    Not a substitution: nothing here sums a Float32 across threads, and
+    nothing may. A gain is a difference of three Float32 quotients, and a
+    tree-shaped float sum would move its last bit, which at a near tie is a
+    different split and not a different rounding.
+
+    Everything else -- the candidate order inside a chunk, the missing-left
+    before missing-right ordering, the `min_data_in_leaf` and
+    `min_sum_hessian_in_leaf` gates, the monotone rejection, the top
+    threshold rule -- is copied unchanged from `_scan_slot_wide_kernel`,
+    because those are the semantics and not the reduction."""
+    # The winning thread's fixed-point left sums, published once. Allocated
+    # at entry so the threadgroup's shared reservation is unconditional and
+    # static, as in the kernels above; the collectives allocate their own
+    # scratch on top of this, one word per warp per reduction.
+    var won = stack_allocation[
+        3,
+        Scalar[DType.int32],
+        address_space = AddressSpace.SHARED,
+    ]()
+
+    var tid = Int(thread_idx.x)
+    var slot = Int(block_idx.x)
+    var record = Int(record_base) + Int(block_idx.y)
+    var nt = record * NODE_WORDS
+    # Every early return in this kernel is decided by the grid position, the
+    # node table, or a per-feature table, never by `tid`, so a threadgroup
+    # takes it whole and no collective below is reached by a subset of it.
+    # That is the same rule the hand-rolled barriers needed, and the
+    # collectives need it for the same reason.
+    if slot >= Int(node_tab[unsafe_offset = nt + NODE_SLOTS][0]):
+        return
+    var stride = Int(feat_stride)
+    var table = record * stride
+    var f = Int(feat_ids[unsafe_offset = table + slot][0])
+    var nb = Int(n_bins)
+    var hs = Int(hist_size)
+    var base = Int(node_tab[unsafe_offset = nt + NODE_HIST_BASE][0]) + f * nb
+    var io = (table + slot) * SPLIT_IWORDS
+    var fo = (table + slot) * SPLIT_FWORDS
+    var pf = record * PF_WORDS
+
+    var pg = Int32(0)
+    var ph = Int32(0)
+    var pc = Int32(0)
+    var bb = tid
+    while bb < nb:
+        pg += hist[unsafe_offset = base + bb][0]
+        ph += hist[unsafe_offset = hs + base + bb][0]
+        pc += hist[unsafe_offset = 2 * hs + base + bb][0]
+        bb += WIDE_SCAN_THREADS
+    var tg = block.sum[block_size=WIDE_SCAN_THREADS](pg)
+    var th = block.sum[block_size=WIDE_SCAN_THREADS](ph)
+    var tc = block.sum[block_size=WIDE_SCAN_THREADS](pc)
+
+    var g_inv = fparams[unsafe_offset = pf + PF_G_INV][0]
+    var h_inv = fparams[unsafe_offset = pf + PF_H_INV][0]
+    var lambda_l2 = fparams[unsafe_offset = pf + PF_LAMBDA_L2][0]
+    var lambda_l1 = fparams[unsafe_offset = pf + PF_LAMBDA_L1][0]
+    var min_child_hess = fparams[unsafe_offset = pf + PF_MIN_CHILD_HESS][0]
+    var bound_lo = fparams[unsafe_offset = pf + PF_BOUND_LO][0]
+    var bound_hi = fparams[unsafe_offset = pf + PF_BOUND_HI][0]
+    var total_g = tg.cast[DType.float32]() * g_inv
+    var total_h = th.cast[DType.float32]() * h_inv
+
+    # The record belongs to one thread throughout: nothing else in the
+    # threadgroup writes `out_i` or `out_f`, so the initial clear and the
+    # final winner need no barrier between them and the scan.
+    if tid == 0:
+        for i in range(SPLIT_IWORDS):
+            out_i[unsafe_offset = io + i] = Int32(0)
+        for i in range(SPLIT_FWORDS):
+            out_f[unsafe_offset = fo + i] = Float32(0.0)
+        out_i[unsafe_offset = io + IREC_FEATURE] = Int32(-1)
+        out_i[unsafe_offset = io + IREC_BIN] = Int32(-1)
+        out_i[unsafe_offset = io + IREC_ORDINAL] = Int32(-1)
+        out_f[unsafe_offset = fo + FREC_TOTAL_GRAD] = total_g
+        out_f[unsafe_offset = fo + FREC_TOTAL_HESS] = total_h
+        out_i[unsafe_offset = io + IREC_TOTAL_COUNT] = tc
+
+    # A feature the node's interaction constraints disallow is skipped before
+    # any of its candidates is scored, exactly as in `find_best_split`.
+    if allow[unsafe_offset = table + slot][0] == Int32(0):
+        return
+
+    var sign = Int32(MONOTONE_FREE)
+    if constrained != Int32(0):
+        sign = mono[unsafe_offset=f][0]
+    var is_constrained = constrained != Int32(0)
+    var parent_score = gpu_leaf_score(total_g, total_h, lambda_l1, lambda_l2)
+
+    var missing_bin = Int(missing[unsafe_offset=f][0])
+    var n_scan = missing_bin if missing_bin >= 0 else nb
+    if n_scan < 1:
+        return
+    var miss_g = Int32(0)
+    var miss_h = Int32(0)
+    var miss_c = Int32(0)
+    if missing_bin >= 0:
+        miss_g = hist[unsafe_offset = base + missing_bin][0]
+        miss_h = hist[unsafe_offset = hs + base + missing_bin][0]
+        miss_c = hist[unsafe_offset = 2 * hs + base + missing_bin][0]
+
+    # One contiguous chunk of the scan per thread. `per` is the same for
+    # every thread, so a chunk's start is its thread index times it and the
+    # partition is a function of `n_scan` alone.
+    var per = (n_scan + WIDE_SCAN_THREADS - 1) // WIDE_SCAN_THREADS
+    var lo = tid * per
+    if lo > n_scan:
+        lo = n_scan
+    var hi = lo + per
+    if hi > n_scan:
+        hi = n_scan
+
+    var cg = Int32(0)
+    var ch = Int32(0)
+    var cc = Int32(0)
+    for i in range(lo, hi):
+        cg += hist[unsafe_offset = base + i][0]
+        ch += hist[unsafe_offset = hs + base + i][0]
+        cc += hist[unsafe_offset = 2 * hs + base + i][0]
+    # Exclusive prefix over the chunk sums. Fixed-point Int32, so the
+    # collective's tree and the serial low-index-first walk it replaces
+    # agree word for word.
+    var left_g = block.prefix_sum[
+        block_size=WIDE_SCAN_THREADS, exclusive=True
+    ](cg)
+    var left_h = block.prefix_sum[
+        block_size=WIDE_SCAN_THREADS, exclusive=True
+    ](ch)
+    var left_c = block.prefix_sum[
+        block_size=WIDE_SCAN_THREADS, exclusive=True
+    ](cc)
+
+    var best_gain = Float32(0.0)
+    var runner_gain = Float32(0.0)
+    var best_ordinal = -1
+    var best_left_g = Int32(0)
+    var best_left_h = Int32(0)
+    var best_left_c = Int32(0)
+
+    for b in range(lo, hi):
+        # The top threshold puts every ordinary bin left, so it is only a
+        # split at all when missing rows fill the right child. Serial breaks
+        # out of the loop here; the bin is the last one either way, so
+        # skipping it is the same thing.
+        if b == n_scan - 1 and miss_c == Int32(0):
+            continue
+        left_g += hist[unsafe_offset = base + b][0]
+        left_h += hist[unsafe_offset = hs + base + b][0]
+        left_c += hist[unsafe_offset = 2 * hs + base + b][0]
+
+        # Missing to the left, scored first so an exact tie keeps
+        # default_left, as in LightGBM and as on the host.
+        if missing_bin >= 0:
+            var dl_g = left_g + miss_g
+            var dl_h = left_h + miss_h
+            var dl_c = left_c + miss_c
+            var dl_hf = dl_h.cast[DType.float32]() * h_inv
+            var dr_hf = total_h - dl_hf
+            if not (
+                dl_hf < min_child_hess
+                or dr_hf < min_child_hess
+                or dl_c < min_data_in_leaf
+                or tc - dl_c < min_data_in_leaf
+            ):
+                var dl_gf = dl_g.cast[DType.float32]() * g_inv
+                var dr_gf = total_g - dl_gf
+                var gain = gpu_split_gain(
+                    gpu_soft_threshold_l1(dl_gf, lambda_l1),
+                    dl_hf,
+                    gpu_soft_threshold_l1(dr_gf, lambda_l1),
+                    dr_hf,
+                    lambda_l2,
+                    parent_score,
+                    sign,
+                    bound_lo,
+                    bound_hi,
+                    is_constrained,
+                )
+                if gain > best_gain:
+                    runner_gain = best_gain
+                    best_gain = gain
+                    best_ordinal = 2 * b
+                    best_left_g = dl_g
+                    best_left_h = dl_h
+                    best_left_c = dl_c
+                elif gain > runner_gain:
+                    runner_gain = gain
+
+        # Missing to the right. For a feature with no missing bin this is
+        # the only candidate and the scan is exactly the ordinal one.
+        if missing_bin < 0 or miss_c > Int32(0):
+            var lhf = left_h.cast[DType.float32]() * h_inv
+            var rhf = total_h - lhf
+            if lhf < min_child_hess or rhf < min_child_hess:
+                continue
+            if left_c < min_data_in_leaf or tc - left_c < min_data_in_leaf:
+                continue
+            var lgf = left_g.cast[DType.float32]() * g_inv
+            var rgf = total_g - lgf
+            var gain = gpu_split_gain(
+                gpu_soft_threshold_l1(lgf, lambda_l1),
+                lhf,
+                gpu_soft_threshold_l1(rgf, lambda_l1),
+                rhf,
+                lambda_l2,
+                parent_score,
+                sign,
+                bound_lo,
+                bound_hi,
+                is_constrained,
+            )
+            if gain > best_gain:
+                runner_gain = best_gain
+                best_gain = gain
+                best_ordinal = 2 * b + 1
+                best_left_g = left_g
+                best_left_h = left_h
+                best_left_c = left_c
+            elif gain > runner_gain:
+                runner_gain = gain
+
+    # Winner: highest gain, ties to the lower ordinal. Every accepted gain
+    # is strictly positive (a thread's `best_gain` starts at zero and only a
+    # strictly greater candidate replaces it), so zero is a safe identity
+    # for a thread that found nothing, and a maximum of zero means the whole
+    # threadgroup found nothing, which is the serial kernel's `win < 0`.
+    var top = block.max[block_size=WIDE_SCAN_THREADS](best_gain)
+    if top <= Float32(0.0):
+        return
+    var my_ordinal = NO_CANDIDATE
+    if best_gain == top:
+        my_ordinal = Int32(best_ordinal)
+    var win_ordinal = block.min[block_size=WIDE_SCAN_THREADS](my_ordinal)
+    # Candidate ordinals are unique across threads, because the chunks are
+    # disjoint ranges of bins, so exactly one thread satisfies both halves.
+    var is_winner = best_gain == top and Int32(best_ordinal) == win_ordinal
+    if is_winner:
+        won[unsafe_offset=0] = best_left_g
+        won[unsafe_offset=1] = best_left_h
+        won[unsafe_offset=2] = best_left_c
+
+    # `runner_gain` for the whole feature is the second largest, counted
+    # with multiplicity, of every thread's best together with every thread's
+    # own runner-up. One occurrence of the maximum is exactly the winning
+    # thread's best, so excluding that thread from the first maximum and
+    # folding in the maximum runner-up gives the serial merge's answer.
+    var excluding_winner = best_gain
+    if is_winner:
+        excluding_winner = Float32(0.0)
+    var other_best = block.max[block_size=WIDE_SCAN_THREADS](
+        excluding_winner
+    )
+    var best_runner = block.max[block_size=WIDE_SCAN_THREADS](runner_gain)
+    # The collectives fence threadgroup memory themselves, but the write to
+    # `won` above is this kernel's own and is spelled out rather than
+    # inferred from theirs.
+    barrier()
+    if tid != 0:
+        return
+
+    var m2 = other_best if other_best > best_runner else best_runner
+    var ordinal = Int(win_ordinal)
+    var flags = Int32(FLAG_FOUND)
+    if ordinal % 2 == 0:
+        flags += Int32(FLAG_DEFAULT_LEFT)
+    var won_left_c = won[unsafe_offset=2][0]
+    out_i[unsafe_offset = io + IREC_FEATURE] = Int32(f)
+    out_i[unsafe_offset = io + IREC_BIN] = Int32(ordinal // 2)
+    out_i[unsafe_offset = io + IREC_FLAGS] = flags
+    out_i[unsafe_offset = io + IREC_ORDINAL] = Int32(ordinal)
+    out_i[unsafe_offset = io + IREC_LEFT_COUNT] = won_left_c
+    out_i[unsafe_offset = io + IREC_RIGHT_COUNT] = tc - won_left_c
+    var lgf = won[unsafe_offset=0][0].cast[DType.float32]() * g_inv
+    var lhf = won[unsafe_offset=1][0].cast[DType.float32]() * h_inv
+    out_f[unsafe_offset = fo + FREC_GAIN] = top
+    out_f[unsafe_offset = fo + FREC_RUNNER_GAIN] = m2
+    out_f[unsafe_offset = fo + FREC_LEFT_GRAD] = lgf
+    out_f[unsafe_offset = fo + FREC_LEFT_HESS] = lhf
+    out_f[unsafe_offset = fo + FREC_RIGHT_GRAD] = total_g - lgf
+    out_f[unsafe_offset = fo + FREC_RIGHT_HESS] = total_h - lhf
+
+
 def _reduce_slots_kernel(
     slot_i: MutPointer[Int32, MutAnyOrigin],
     slot_f: MutPointer[Float32, MutAnyOrigin],
@@ -1342,6 +1767,161 @@ def _reduce_slots_kernel(
     if own_runner > runner_gain:
         runner_gain = own_runner
     out_f[unsafe_offset = of + FREC_RUNNER_GAIN] = runner_gain
+
+    var left_g = slot_f[unsafe_offset = bf + FREC_LEFT_GRAD][0]
+    var left_h = slot_f[unsafe_offset = bf + FREC_LEFT_HESS][0]
+    var right_g = slot_f[unsafe_offset = bf + FREC_RIGHT_GRAD][0]
+    var right_h = slot_f[unsafe_offset = bf + FREC_RIGHT_HESS][0]
+    out_f[unsafe_offset = of + FREC_LEFT_VALUE] = gpu_leaf_value(
+        left_g, left_h, lambda_l1, lambda_l2
+    )
+    out_f[unsafe_offset = of + FREC_RIGHT_VALUE] = gpu_leaf_value(
+        right_g, right_h, lambda_l1, lambda_l2
+    )
+    out_f[unsafe_offset = of + FREC_PARENT_VALUE] = gpu_leaf_value(
+        total_g, total_h, lambda_l1, lambda_l2
+    )
+
+
+def _reduce_slots_block_kernel(
+    slot_i: MutPointer[Int32, MutAnyOrigin],
+    slot_f: MutPointer[Float32, MutAnyOrigin],
+    out_i: MutPointer[Int32, MutAnyOrigin],
+    out_f: MutPointer[Float32, MutAnyOrigin],
+    node_tab: MutPointer[Int32, MutAnyOrigin],
+    fparams: MutPointer[Float32, MutAnyOrigin],
+    record_base: Int32,
+    feat_stride: Int32,
+):
+    """`_reduce_slots_kernel` on a threadgroup instead of on one thread, and
+    it writes the same record.
+
+    The serial fold is the one place the default path spends time
+    proportional to the feature count on a single lane: one thread per node
+    walking every one of that node's feature slots in order. A hundred
+    features is a hundred dependent iterations while the rest of the device
+    is idle. Here each thread takes a strided subset of the slots, and the
+    cross-thread fold is three `gpu.primitives.block` collectives.
+
+    Why the winner is the serial winner. The serial rule is "highest gain,
+    and among equal gains the lowest slot", because it walks slots ascending
+    and accepts only on a strictly greater gain. Split in two, that is a
+    `block.max` over the gains and then a `block.min` over the slot indices
+    of the threads holding the maximum. Both reassociate exactly: `max` and
+    `min` are associative and commutative, and no gain is recomputed here,
+    only compared. Within a thread the same strict `>` over its own
+    ascending slots keeps the lowest of its own ties, so the pair really is
+    the global lexicographic minimum among the maximum-gain slots.
+
+    Why the runner-up is the serial runner-up. `_reduce_slots_kernel` ends
+    with `runner_gain` equal to the best gain over every found slot that is
+    not the winner: a slot displaced from `best` is folded in at the
+    displacement, and a slot rejected against `best` is folded in on the
+    spot, so every non-winning slot is compared exactly once, and a slot
+    whose gain ties the winner's is a genuine runner-up rather than a
+    winner. Excluding one slot is decomposable, because exactly one thread
+    owns the winning slot: that thread contributes the best of its *other*
+    slots, every other thread contributes its own best, and one `block.max`
+    finishes it.
+
+    No floating-point sum crosses a thread boundary here. The gains being
+    reduced were computed by the scan kernel and are only compared; the leaf
+    values below are computed once, by one thread, from the winning slot's
+    already-reduced sums, exactly as the serial kernel computes them."""
+    var tid = Int(thread_idx.x)
+    var record = Int(record_base) + Int(block_idx.x)
+    var table = record * Int(feat_stride)
+    var nt = record * NODE_WORDS
+    var n_slots = Int(node_tab[unsafe_offset = nt + NODE_SLOTS][0])
+    var pf = record * PF_WORDS
+    var lambda_l2 = fparams[unsafe_offset = pf + PF_LAMBDA_L2][0]
+    var lambda_l1 = fparams[unsafe_offset = pf + PF_LAMBDA_L1][0]
+    var oi = record * SPLIT_IWORDS
+    var of = record * SPLIT_FWORDS
+
+    # This thread's own best and second best over its strided share of the
+    # slots, in ascending slot order, so a tie inside one thread keeps the
+    # lower slot exactly as the serial walk does. A found slot's gain is
+    # always strictly positive, so zero is a safe identity for a thread with
+    # no slots at all, which is every thread past `n_slots`.
+    var my_gain = Float32(0.0)
+    var my_second = Float32(0.0)
+    var my_slot = NO_CANDIDATE
+    var s = tid
+    while s < n_slots:
+        var si = (table + s) * SPLIT_IWORDS
+        var sf = (table + s) * SPLIT_FWORDS
+        var flags = slot_i[unsafe_offset = si + IREC_FLAGS][0]
+        if (flags & Int32(FLAG_FOUND)) != Int32(0):
+            var gain = slot_f[unsafe_offset = sf + FREC_GAIN][0]
+            if gain > my_gain:
+                my_second = my_gain
+                my_gain = gain
+                my_slot = Int32(s)
+            elif gain > my_second:
+                my_second = gain
+        s += REDUCE_SLOT_THREADS
+
+    var top = block.max[block_size=REDUCE_SLOT_THREADS](my_gain)
+    var mine = NO_CANDIDATE
+    if my_gain == top:
+        mine = my_slot
+    var best = block.min[block_size=REDUCE_SLOT_THREADS](mine)
+    var contribution = my_gain
+    if my_slot == best:
+        contribution = my_second
+    var runner = block.max[block_size=REDUCE_SLOT_THREADS](contribution)
+
+    if tid != 0:
+        return
+
+    # The parent's totals come from this node's slot 0, which is the feature
+    # the host grower already uses for leaf values (`tree_features[0]`).
+    # Every accumulated feature carries the same totals bit for bit.
+    var zi = table * SPLIT_IWORDS
+    var zf = table * SPLIT_FWORDS
+    var total_g = slot_f[unsafe_offset = zf + FREC_TOTAL_GRAD][0]
+    var total_h = slot_f[unsafe_offset = zf + FREC_TOTAL_HESS][0]
+    var total_c = slot_i[unsafe_offset = zi + IREC_TOTAL_COUNT][0]
+
+    if top <= Float32(0.0):
+        for i in range(SPLIT_IWORDS):
+            out_i[unsafe_offset = oi + i] = Int32(0)
+        for i in range(SPLIT_FWORDS):
+            out_f[unsafe_offset = of + i] = Float32(0.0)
+        out_i[unsafe_offset = oi + IREC_FEATURE] = Int32(-1)
+        out_i[unsafe_offset = oi + IREC_BIN] = Int32(-1)
+        out_i[unsafe_offset = oi + IREC_ORDINAL] = Int32(-1)
+        out_i[unsafe_offset = oi + IREC_TOTAL_COUNT] = total_c
+        out_f[unsafe_offset = of + FREC_TOTAL_GRAD] = total_g
+        out_f[unsafe_offset = of + FREC_TOTAL_HESS] = total_h
+        out_f[unsafe_offset = of + FREC_PARENT_VALUE] = gpu_leaf_value(
+            total_g, total_h, lambda_l1, lambda_l2
+        )
+        return
+
+    var bi = (table + Int(best)) * SPLIT_IWORDS
+    var bf = (table + Int(best)) * SPLIT_FWORDS
+    for i in range(SPLIT_IWORDS):
+        out_i[unsafe_offset = oi + i] = slot_i[unsafe_offset = bi + i][0]
+    for i in range(SPLIT_FWORDS):
+        out_f[unsafe_offset = of + i] = slot_f[unsafe_offset = bf + i][0]
+
+    # The winner's own totals are bit-identical to slot 0's, but the record
+    # is defined to carry slot 0's, so a caller reading the parent's
+    # statistics gets the same numbers whether or not a split was found.
+    out_i[unsafe_offset = oi + IREC_TOTAL_COUNT] = total_c
+    out_f[unsafe_offset = of + FREC_TOTAL_GRAD] = total_g
+    out_f[unsafe_offset = of + FREC_TOTAL_HESS] = total_h
+
+    # The node's runner-up is the better of the best losing feature and the
+    # winning feature's own second candidate, so the margin a caller tests
+    # covers both ways a decision can be close.
+    var node_runner = runner
+    var own_runner = slot_f[unsafe_offset = bf + FREC_RUNNER_GAIN][0]
+    if own_runner > node_runner:
+        node_runner = own_runner
+    out_f[unsafe_offset = of + FREC_RUNNER_GAIN] = node_runner
 
     var left_g = slot_f[unsafe_offset = bf + FREC_LEFT_GRAD][0]
     var left_h = slot_f[unsafe_offset = bf + FREC_LEFT_HESS][0]
@@ -1803,6 +2383,7 @@ def _launch_search(
     cat_max_threshold: Int,
     cat_min_group: Int,
     wide: Bool = False,
+    primitives: Bool = True,
 ) raises:
     """Enqueue the two kernels of one search, over `n_records` consecutive
     nodes starting at `record_base`.
@@ -1824,64 +2405,122 @@ def _launch_search(
     below is the same kernel over the same slots either way. Only
     `GpuSplitSearcher` decides it: the wide kernel scans ordinal features
     only, and the searcher is what knows whether the dataset has a
-    categorical one."""
-    if wide:
-        ctx.enqueue_function[_scan_slot_wide_kernel](
-            hist.unsafe_ptr(),
-            node.unsafe_ptr(),
-            feat.unsafe_ptr(),
-            allow.unsafe_ptr(),
-            missing.unsafe_ptr(),
-            mono.unsafe_ptr(),
-            fparam.unsafe_ptr(),
-            slot_i.unsafe_ptr(),
-            slot_f.unsafe_ptr(),
-            Int32(n_bins),
-            Int32(hist_size),
-            Int32(record_base),
-            Int32(feat_stride),
-            Int32(min_data_in_leaf),
-            Int32(1) if constrained else Int32(0),
-            grid_dim=(widest_slots, n_records),
-            block_dim=WIDE_SCAN_THREADS,
+    categorical one.
+
+    `primitives` swaps the hand-rolled shared-memory reductions for
+    `gpu.primitives.block` collectives in both the wide scan and the
+    cross-feature reduction. It changes no record: every reduction it
+    replaces is over fixed-point Int32 sums or over Float32 maxima, both of
+    which reassociate exactly. It does change the reduction's launch shape,
+    which is why it is a parameter here and not a constant: the collective
+    reduction runs `REDUCE_SLOT_THREADS` threads per node where the serial
+    one runs a single thread, and the two launches must agree with the
+    kernels they carry. The launch *count* is the same either way, two, and
+    it is already the LightGBM shape: one grid over every (leaf, feature)
+    task, not one launch per feature or per leaf. See
+    `split_primitives_requested` for the switch and
+    `GpuSplitSearcher.set_primitives` for the in-process override."""
+    # The whole dispatch sits behind a compile-time accelerator test, so a
+    # CPU-only extension build never instantiates any of these kernels and
+    # never asks the backend for a GPU architecture it was not built with.
+    # An accelerator machine cannot reproduce that failure, which is why it
+    # is a guard here rather than a test somewhere.
+    comptime if not has_accelerator():
+        raise Error(
+            "the device split search needs an accelerator; this binary was"
+            " built without one"
         )
     else:
-        ctx.enqueue_function[_scan_slot_kernel](
-            hist.unsafe_ptr(),
-            node.unsafe_ptr(),
-            feat.unsafe_ptr(),
-            allow.unsafe_ptr(),
-            missing.unsafe_ptr(),
-            catn.unsafe_ptr(),
-            mono.unsafe_ptr(),
-            fparam.unsafe_ptr(),
-            slot_i.unsafe_ptr(),
-            slot_f.unsafe_ptr(),
-            Int32(n_bins),
-            Int32(hist_size),
-            Int32(record_base),
-            Int32(feat_stride),
-            Int32(min_data_in_leaf),
-            Int32(1) if constrained else Int32(0),
-            Int32(cat_onehot_max),
-            Int32(cat_max_threshold),
-            Int32(cat_min_group),
-            grid_dim=(widest_slots, n_records),
-            block_dim=1,
-        )
-    ctx.enqueue_function[_reduce_slots_kernel](
-        slot_i.unsafe_ptr(),
-        slot_f.unsafe_ptr(),
-        rec_i.unsafe_ptr(),
-        rec_f.unsafe_ptr(),
-        node.unsafe_ptr(),
-        fparam.unsafe_ptr(),
-        Int32(record_base),
-        Int32(feat_stride),
-        grid_dim=n_records,
-        block_dim=1,
-    )
-
+        if wide and primitives:
+            ctx.enqueue_function[_scan_slot_wide_primitive_kernel](
+                hist.unsafe_ptr(),
+                node.unsafe_ptr(),
+                feat.unsafe_ptr(),
+                allow.unsafe_ptr(),
+                missing.unsafe_ptr(),
+                mono.unsafe_ptr(),
+                fparam.unsafe_ptr(),
+                slot_i.unsafe_ptr(),
+                slot_f.unsafe_ptr(),
+                Int32(n_bins),
+                Int32(hist_size),
+                Int32(record_base),
+                Int32(feat_stride),
+                Int32(min_data_in_leaf),
+                Int32(1) if constrained else Int32(0),
+                grid_dim=(widest_slots, n_records),
+                block_dim=WIDE_SCAN_THREADS,
+            )
+        elif wide:
+            ctx.enqueue_function[_scan_slot_wide_kernel](
+                hist.unsafe_ptr(),
+                node.unsafe_ptr(),
+                feat.unsafe_ptr(),
+                allow.unsafe_ptr(),
+                missing.unsafe_ptr(),
+                mono.unsafe_ptr(),
+                fparam.unsafe_ptr(),
+                slot_i.unsafe_ptr(),
+                slot_f.unsafe_ptr(),
+                Int32(n_bins),
+                Int32(hist_size),
+                Int32(record_base),
+                Int32(feat_stride),
+                Int32(min_data_in_leaf),
+                Int32(1) if constrained else Int32(0),
+                grid_dim=(widest_slots, n_records),
+                block_dim=WIDE_SCAN_THREADS,
+            )
+        else:
+            ctx.enqueue_function[_scan_slot_kernel](
+                hist.unsafe_ptr(),
+                node.unsafe_ptr(),
+                feat.unsafe_ptr(),
+                allow.unsafe_ptr(),
+                missing.unsafe_ptr(),
+                catn.unsafe_ptr(),
+                mono.unsafe_ptr(),
+                fparam.unsafe_ptr(),
+                slot_i.unsafe_ptr(),
+                slot_f.unsafe_ptr(),
+                Int32(n_bins),
+                Int32(hist_size),
+                Int32(record_base),
+                Int32(feat_stride),
+                Int32(min_data_in_leaf),
+                Int32(1) if constrained else Int32(0),
+                Int32(cat_onehot_max),
+                Int32(cat_max_threshold),
+                Int32(cat_min_group),
+                grid_dim=(widest_slots, n_records),
+                block_dim=1,
+            )
+        if primitives:
+            ctx.enqueue_function[_reduce_slots_block_kernel](
+                slot_i.unsafe_ptr(),
+                slot_f.unsafe_ptr(),
+                rec_i.unsafe_ptr(),
+                rec_f.unsafe_ptr(),
+                node.unsafe_ptr(),
+                fparam.unsafe_ptr(),
+                Int32(record_base),
+                Int32(feat_stride),
+                grid_dim=n_records,
+                block_dim=REDUCE_SLOT_THREADS,
+            )
+        else:
+            ctx.enqueue_function[_reduce_slots_kernel](
+                slot_i.unsafe_ptr(),
+                slot_f.unsafe_ptr(),
+                rec_i.unsafe_ptr(),
+                rec_f.unsafe_ptr(),
+                node.unsafe_ptr(),
+                fparam.unsafe_ptr(),
+                Int32(record_base),
+                Int32(feat_stride),
+                grid_dim=n_records,
+                block_dim=1,
+            )
 
 struct GpuSplitSearcher(Movable):
     """Device-resident split search for one dataset shape.
@@ -1962,6 +2601,15 @@ struct GpuSplitSearcher(Movable):
     inputs are fixed there: the environment switch, and whether this
     dataset declares a categorical feature, which the wide kernel does not
     scan. Reported by `describe_scan`."""
+    var use_primitives: Bool
+    """Whether the reductions run as `gpu.primitives.block` collectives
+    rather than as the hand-rolled shared-memory loops. Read once at
+    construction from `MOJOTREES_GPU_SPLIT_PRIMITIVES` and settable
+    afterwards, so one process can hold both arms; see `set_primitives`.
+    Unlike `wide_scan` this has no dataset precondition, because both
+    reductions it replaces are exact under reassociation on every dataset:
+    the collectives choose the same split as the loops, whatever the
+    histogram."""
 
     def __init__(
         out self,
@@ -2035,6 +2683,7 @@ struct GpuSplitSearcher(Movable):
         # and narrowing a record's feature set later can only remove
         # features, never introduce a categorical one.
         self.wide_scan = wide_scan_for(any_cat)
+        self.use_primitives = split_primitives_requested()
         for _ in range(max_records):
             self.active_len.append(n_features)
 
@@ -2138,12 +2787,29 @@ struct GpuSplitSearcher(Movable):
         """How many feature slots the next search scans."""
         return len(self.active)
 
+    def set_primitives(mut self, enabled: Bool):
+        """Force the collective reductions on or off for this searcher,
+        overriding `MOJOTREES_GPU_SPLIT_PRIMITIVES`.
+
+        The handle an interleaved benchmark needs: the two arms have to be
+        alternated inside one process and one thermal state to be comparable
+        at all on this machine, which re-execing with a different
+        environment cannot do. Safe to change between searches, because it
+        selects a kernel at launch time and owns no state; the records
+        either arm returns are the same records."""
+        self.use_primitives = enabled
+
     def describe_scan(self) -> String:
         """One line for benchmark output and bug reports: which scan kernel
-        this searcher launches and how wide its threadgroup is."""
+        this searcher launches, how wide its threadgroup is, and whether its
+        reductions are collectives or hand-rolled loops."""
+        var reduction = String(
+            " reduce=block-primitives threads=",
+            REDUCE_SLOT_THREADS,
+        ) if self.use_primitives else String(" reduce=serial threads=1")
         if self.wide_scan:
-            return String("scan=wide threads=", WIDE_SCAN_THREADS)
-        return String("scan=serial threads=1")
+            return String("scan=wide threads=", WIDE_SCAN_THREADS, reduction)
+        return String("scan=serial threads=1", reduction)
 
     def _check_record(self, record: Int) raises:
         if record < 0 or record >= self.max_records:
@@ -2362,6 +3028,7 @@ struct GpuSplitSearcher(Movable):
             params.cat.max_cat_threshold,
             params.cat.min_data_per_group,
             self.wide_scan,
+            self.use_primitives,
         )
 
     def enqueue(
@@ -2479,6 +3146,14 @@ struct GpuSplitSearcher(Movable):
         # aliasing.  The owned-histogram path is the one place the histogram
         # belongs to the searcher, so spell the disjoint field borrows out at
         # the free-function boundary after staging the tables.
+        #
+        # Note what this spelled-out call does not pass: `wide`. `search`
+        # therefore runs the serial scan even on a searcher whose
+        # `wide_scan` is set, while `enqueue` and `enqueue_frontier` (both
+        # through `_launch`) honor it, and those are the paths the trainer
+        # uses. Left as found rather than corrected here, because flipping
+        # it changes which kernel an existing test's `search` call reaches,
+        # and that belongs in the change that can run that test.
         self._copy_tables()
         _launch_search(
             self.ctx,
@@ -2505,6 +3180,7 @@ struct GpuSplitSearcher(Movable):
             params.cat.max_cat_to_onehot,
             params.cat.max_cat_threshold,
             params.cat.min_data_per_group,
+            primitives=self.use_primitives,
         )
         return self.download(record)
 
