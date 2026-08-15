@@ -31,7 +31,8 @@ objectives are added; the Python layer keeps LightGBM's parameter names
 and maps them here.
 """
 
-from std.math import exp, log
+from std.math import exp, fma, log
+from std.os import getenv
 
 from .binning import BinnedMatrix
 from .efb import EfbSettings, prepare_bundling
@@ -90,9 +91,12 @@ from .phase_profile import (
     PhaseProfile,
 )
 from .tree import (
+    GrowScratch,
+    LeafMembership,
     Tree,
     TreeParams,
-    grow_tree_profiled,
+    grow_tree_leaves,
+    grow_tree_leaves_profiled,
     grow_tree_with_cegb,
     node_bounds,
 )
@@ -982,6 +986,60 @@ struct Booster(Copyable, Movable):
         """Response-scale prediction from the iterations in `rng` alone."""
         return self.response(self.predict_raw_bins_range(bins, rng))
 
+    def predict_batch_range(
+        self,
+        data: BinnedMatrix,
+        rng: IterationRange,
+        raw_score: Bool = False,
+    ) raises -> List[Float64]:
+        """One prediction per row of an already binned matrix, over row
+        blocks.
+
+        The body is the per-row body `Model.predict_batch` ran serially, moved
+        here unchanged: gather the row's bins, then call the same
+        `predict_raw_bins_range` or `predict_bins_range` this ensemble has
+        always been asked. `data.bin_at(r, f)` is `bins[f * n_rows + r]`,
+        which is the value that loop gathered.
+
+        Splitting it over blocks cannot change a number. A row reads the
+        ensemble, which no block writes, and writes output slot `r`, which no
+        other row touches; nothing is accumulated across rows. So the outputs
+        are bit-identical to the serial loop's by construction, at any block
+        count, and there is nothing here to argue about ordering.
+
+        Batch prediction was the one phase of the LightGBM head-to-head that
+        ran at parallel efficiency 1.00 on every dataset measured, against 6.5
+        to 9.5 for LightGBM on the same ten threads, because this loop was
+        serial. What that becomes is not measured here and this docstring
+        claims no number.
+        """
+        var n = data.n_rows
+        var n_features = data.n_features
+        var out = List[Float64](capacity=n)
+        out.resize(n, 0.0)
+        var out_p = out.unsafe_ptr()
+
+        # Per block, not per row: the same reuse the serial loop had.
+        def apply(start: Int, end: Int) {imm}:
+            var bins = List[Int](capacity=n_features)
+            for r in range(start, end):
+                bins.clear()
+                for f in range(n_features):
+                    bins.append(data.bin_at(r, f))
+                if raw_score:
+                    out_p.unsafe_store(
+                        r, self.predict_raw_bins_range(bins, rng)
+                    )
+                else:
+                    out_p.unsafe_store(r, self.predict_bins_range(bins, rng))
+
+        dispatch_rows(
+            apply,
+            n,
+            n * (n_features + rng.n_iterations() * _TRAVERSAL_ROW_OPS),
+        )
+        return out^
+
     def leaf_ordinals_range(self, rng: IterationRange) -> List[List[Int]]:
         """The per-node leaf ordinal table (see `Tree.leaf_ordinals`) of each
         tree in `rng`, in range order. Build this once and index it with
@@ -1011,6 +1069,173 @@ def _same_signs(a: List[Int], b: List[Int]) -> Bool:
         if a[i] != b[i]:
             return False
     return True
+
+
+# How much work one row of a score update is worth, in the histogram-op
+# equivalents `parallel.plan_tasks` compares against its grain. A leaf-window
+# row is one indirect load of a row id and one read-modify-write of a Float64
+# at a scattered address; a traversal row is that plus a dependent walk down
+# the tree, which is several loads deep for a 31-leaf tree. Both numbers are
+# scheduling estimates and nothing more: every block writes only its own
+# slots, so the result is the same at one task and at sixty, and these can be
+# retuned without changing an output. Neither has been measured.
+comptime _LEAF_ROW_OPS = 2
+comptime _TRAVERSAL_ROW_OPS = 8
+
+
+def _leaf_score_update_enabled() -> Bool:
+    """Whether a round may add a tree's contribution by leaf membership.
+
+    `MOJOTREES_LEAF_SCORE_UPDATE=0` forces the full-tree traversal every
+    trainer here used before the membership was kept, the way
+    `MOJOTREES_GPU_SPLIT_RESIDENT=0` forces the device split search's old
+    loop. The two routes are meant to leave bit-identical raw scores, and a
+    switch is what lets one build train both ways and compare, instead of
+    comparing across two builds and hoping nothing else moved. It is not a
+    tuning knob: there is no workload on which the traversal is the better
+    route, and none has been measured either way.
+    """
+    return getenv("MOJOTREES_LEAF_SCORE_UPDATE") != "0"
+
+
+def _add_by_traversal(
+    mut raw: List[Float64],
+    tree: Tree,
+    data: BinnedMatrix,
+    learning_rate: Float64,
+    stride: Int,
+    offset: Int,
+) raises:
+    """`raw[r * stride + offset] += learning_rate * tree.predict_row(data, r)`
+    for every row of `data`.
+
+    The pre-existing update, spread over row blocks. Every row reads and
+    writes one slot of its own and nothing else, and `data` and `tree` are
+    read-only throughout, so the blocks are independent and the result does
+    not depend on how many there are: this is bit-identical to the serial loop
+    by construction rather than by argument.
+
+    The arithmetic is left as the expression the trainers always wrote, rather
+    than fused by hand as in `_add_by_leaf`, so that it keeps tracking
+    whatever the compiler does with `raw[r] += learning_rate *
+    tree.predict_row(...)` -- which is the same expression the trainers this
+    lane did not touch still write. It was observed to contract into a fused
+    multiply-add, and `test_round_overhead` compares this against that loop
+    written out by hand.
+
+    `stride` and `offset` are 1 and 0 for a single-output ensemble and
+    `n_classes` and the class index for the row-major multiclass scores.
+    """
+    var n = data.n_rows
+    var raw_p = raw.unsafe_ptr()
+
+    def apply(start: Int, end: Int) {imm}:
+        for r in range(start, end):
+            var slot = r * stride + offset
+            raw_p.unsafe_store(
+                slot,
+                raw_p.unsafe_load(slot)
+                + learning_rate * tree.predict_row(data, r),
+            )
+
+    dispatch_rows(apply, n, n * _TRAVERSAL_ROW_OPS)
+
+
+def _add_by_leaf(
+    mut raw: List[Float64],
+    tree: Tree,
+    leaves: LeafMembership,
+    learning_rate: Float64,
+    n_rows: Int,
+    stride: Int,
+    offset: Int,
+) raises:
+    """The same update, routed through the leaf membership growth handed back
+    (see `tree.LeafMembership`).
+
+    A leaf contributes one value, `tree.value[node]`, to every row that landed
+    in it. `Tree.predict_row` returns `value[node]` for exactly those rows --
+    the partition that built the row lists and the routing `predict_row` walks
+    are the same three tests on the same bins, since `Tree._set_split` records
+    the very `SplitInfo` and missing bin `partition_rows_into` was handed --
+    so the leaf route and the traversal have the same two Float64 operands for
+    every row.
+
+    Having the same operands is not yet having the same answer, and this is
+    the one place in the change where that mattered. `raw[r] += learning_rate
+    * tree.predict_row(...)` compiles to a fused multiply-add: the product is
+    never rounded to a Float64 of its own. Hoisting `learning_rate * value`
+    out of the loop, which is the obvious way to write the leaf update, rounds
+    it, and lands one ulp away on the rows where it matters -- a difference
+    that feeds the next round's gradients and gives a different second tree.
+    So the multiply and the add are fused here explicitly rather than left to
+    whatever the compiler does with the expression, because the compiler was
+    observed to contract the traversal's expression and not this loop's.
+    `test_round_overhead` pins the result against the pre-existing update
+    written out by hand, so a compiler that ever stopped contracting there
+    would be caught rather than silently accepted.
+
+    Rows are independent accumulators and each appears in exactly one leaf, so
+    a row is added to once here as it was once there. Leaves are handed out to
+    blocks, and blocks touch disjoint sets of rows, so the block count changes
+    nothing.
+
+    The caller must have checked `leaves.covers_all_rows`; this adds nothing
+    to a row no leaf holds.
+    """
+    var n_leaves = leaves.n_leaves()
+    var raw_p = raw.unsafe_ptr()
+
+    def apply(l_start: Int, l_end: Int) {imm}:
+        for l in range(l_start, l_end):
+            var value = tree.value[leaves.node[l]]
+            # A `ref` binding, because `leaves.rows[l]` in an expression
+            # materializes a copy of the row list and a pointer taken from
+            # that copy dangles the moment the expression ends. The bound
+            # reference is the list the grower handed back.
+            ref rows = leaves.rows[l]
+            var rows_p = rows.unsafe_ptr()
+            for i in range(len(rows)):
+                var slot = Int(rows_p.unsafe_load(i)) * stride + offset
+                raw_p.unsafe_store(
+                    slot, fma(learning_rate, value, raw_p.unsafe_load(slot))
+                )
+
+    # The index space split over blocks is the leaves, not the rows, because a
+    # leaf's rows are the contiguous unit here. Leaf-wise growth does not make
+    # equal leaves, so the blocks are not equal work; that imbalance has not
+    # been measured and is the obvious thing to revisit.
+    dispatch_rows(apply, n_leaves, n_rows * _LEAF_ROW_OPS)
+
+
+def _add_tree_scores(
+    mut raw: List[Float64],
+    tree: Tree,
+    leaves: LeafMembership,
+    data: BinnedMatrix,
+    learning_rate: Float64,
+    by_leaf: Bool,
+    stride: Int = 1,
+    offset: Int = 0,
+) raises:
+    """End a boosting round: add `learning_rate` times this tree's output to
+    the raw score of every training row.
+
+    Takes the leaf route when the caller allows it and the membership covers
+    the whole dataset, and the traversal otherwise. There are two paths rather
+    than one because a bagged, GOSS-sampled, or class-balanced round grows its
+    tree on a subset while every row of the dataset still needs the tree's
+    contribution: the membership names the sampled rows alone, and a row
+    outside the sample has no leaf to be found in. Those rounds keep the
+    traversal, unchanged, so what a row receives does not depend on how the
+    round was sampled.
+    """
+    if by_leaf and leaves.covers_all_rows:
+        _add_by_leaf(
+            raw, tree, leaves, learning_rate, data.n_rows, stride, offset
+        )
+        return
+    _add_by_traversal(raw, tree, data, learning_rate, stride, offset)
 
 
 def _boost_rounds(
@@ -1086,12 +1311,18 @@ def _boost_rounds(
     # reads no clock and writes no counter, so the ensemble this loop grows is
     # the same ensemble either way.
     var profile = PhaseProfile.from_env(SCOPE_FIT, String("train"))
+    # One histogram pool and one gather buffer for the whole fit rather than
+    # per tree (see `tree.GrowScratch`), and one membership record refilled
+    # each round (see `tree.LeafMembership`).
+    var scratch = GrowScratch(data.n_features, data.n_bins)
+    var leaves = LeafMembership()
+    var by_leaf = _leaf_score_update_enabled()
     for i in range(params.n_estimators):
         var round = round_offset + i
         # The round's wall clock is taken in two brackets, before the tree and
-        # after it, because `grow_tree_profiled` adds the tree's own. One
-        # outer bracket would count the tree twice and understate what the
-        # phases leave unattributed.
+        # after it, because `grow_tree_leaves_profiled` adds the tree's own.
+        # One outer bracket would count the tree twice and understate what
+        # the phases leave unattributed.
         var pre_started = profile.clock()
         if balanced:
             refresh_class_bag(bag, class_bagging, target, round)
@@ -1111,9 +1342,18 @@ def _boost_rounds(
             PROF_GRAD_FILL, len(bag) if len(bag) > 0 else n, grad_started
         )
         profile.note_wall(pre_started)
-        var tree = grow_tree_profiled(
-            profile, data, grad, hess, params.tree, ledger, bag, round,
-            bundling
+        var tree = grow_tree_leaves_profiled(
+            profile,
+            leaves,
+            ledger,
+            scratch,
+            data,
+            grad,
+            hess,
+            params.tree,
+            bag,
+            round,
+            bundling,
         )
         var post_started = profile.clock()
         if renews:
@@ -1133,14 +1373,16 @@ def _boost_rounds(
                 continue
             break
 
-        # One full-tree traversal per training row per round, serial, over
-        # every row whether or not it was in the bag. Its own phase because it
-        # belongs to no node, is invisible to any per-tree instrument, and
-        # would otherwise land in the unattributed remainder where nobody
-        # would look for it. Charged at `n`, the dataset, not at the bag.
+        # One pass over every training row per round, serial, over every row
+        # whether or not it was in the bag. Its own phase because it belongs
+        # to no node, is invisible to any per-tree instrument, and would
+        # otherwise land in the unattributed remainder where nobody would look
+        # for it. Charged at `n`, the dataset, not at the bag, which is what
+        # lets the two routes `_add_tree_scores` chooses between -- the leaf
+        # walk when the membership covers the dataset, the full-tree traversal
+        # per row otherwise -- be read against the same denominator.
         var update_started = profile.clock()
-        for r in range(n):
-            raw[r] += learning_rate * tree.predict_row(data, r)
+        _add_tree_scores(raw, tree, leaves, data, learning_rate, by_leaf)
         profile.charge(PROF_SCORE_UPDATE, n, update_started)
         trees.append(tree^)
         profile.note_wall(post_started)
@@ -1410,6 +1652,9 @@ def train_with_valid(
     var best_n_trees = 0
     var bag = List[Int]()
     var balanced = class_bagging.enabled() and has_positive_rows(target)
+    var scratch = GrowScratch(data.n_features, data.n_bins)
+    var leaves = LeafMembership()
+    var by_leaf = _leaf_score_update_enabled()
     for i in range(params.n_estimators):
         if balanced:
             refresh_class_bag(bag, class_bagging, target, i)
@@ -1419,8 +1664,17 @@ def train_with_valid(
             raw, target, objective, sample_weight, alpha, grad, hess
         )
         goss_round(bag, grad, hess, goss, i, params.learning_rate)
-        var tree = grow_tree_with_cegb(
-            data, grad, hess, params.tree, ledger, bag, i, bundling
+        var tree = grow_tree_leaves(
+            leaves,
+            ledger,
+            scratch,
+            data,
+            grad,
+            hess,
+            params.tree,
+            bag,
+            i,
+            bundling,
         )
         if renews:
             _renew_leaf_values(
@@ -1434,12 +1688,15 @@ def train_with_valid(
                 continue
             break
 
-        for r in range(n):
-            raw[r] += params.learning_rate * tree.predict_row(data, r)
-        for r in range(valid_data.n_rows):
-            valid_raw[r] += (
-                params.learning_rate * tree.predict_row(valid_data, r)
-            )
+        _add_tree_scores(
+            raw, tree, leaves, data, params.learning_rate, by_leaf
+        )
+        # The validation matrix has no membership and cannot: growth
+        # partitioned the training rows and knows nothing about these. It
+        # keeps the traversal, now over row blocks.
+        _add_by_traversal(
+            valid_raw, tree, valid_data, params.learning_rate, 1, 0
+        )
         trees.append(tree^)
 
         var loss = _mean_loss(valid_raw, valid_target, objective, alpha)
@@ -1637,6 +1894,55 @@ struct MulticlassBooster(Copyable, Movable):
         _softmax_inplace(raw, 0, self.n_classes)
         return raw^
 
+    def predict_batch_range(
+        self,
+        data: BinnedMatrix,
+        rng: IterationRange,
+        raw_score: Bool = False,
+    ) raises -> List[Float64]:
+        """Per-class predictions for every row of an already binned matrix,
+        row-major (`out[r * n_classes + k]`), over row blocks.
+
+        The single-output `Booster.predict_batch_range` with a class stride:
+        the per-row body is the one `MulticlassModel.predict_batch` ran
+        serially, calling the same `predict_raw_bins_range` or
+        `predict_proba_bins_range`, so the softmax is still taken over one
+        row's own scores and nothing crosses a row boundary. Rows write
+        disjoint slots and read only the ensemble, so the block count changes
+        no number.
+        """
+        var n = data.n_rows
+        var n_features = data.n_features
+        var n_classes = self.n_classes
+        var out = List[Float64](capacity=n * n_classes)
+        out.resize(n * n_classes, 0.0)
+        var out_p = out.unsafe_ptr()
+
+        def apply(start: Int, end: Int) {imm}:
+            var bins = List[Int](capacity=n_features)
+            for r in range(start, end):
+                bins.clear()
+                for f in range(n_features):
+                    bins.append(data.bin_at(r, f))
+                var scores: List[Float64]
+                if raw_score:
+                    scores = self.predict_raw_bins_range(bins, rng)
+                else:
+                    scores = self.predict_proba_bins_range(bins, rng)
+                for k in range(n_classes):
+                    out_p.unsafe_store(r * n_classes + k, scores[k])
+
+        dispatch_rows(
+            apply,
+            n,
+            n
+            * (
+                n_features
+                + rng.n_iterations() * n_classes * _TRAVERSAL_ROW_OPS
+            ),
+        )
+        return out^
+
     def leaf_ordinals_range(self, rng: IterationRange) -> List[List[Int]]:
         """The per-node leaf ordinal table of every tree in `rng`, flattened
         round-major as the ensemble stores them: entry `i * n_classes + k` is
@@ -1712,6 +2018,11 @@ def _boost_rounds_multiclass(
     var hess = List[Float64](capacity=n)
     var bag = List[Int]()
     var grown = 0
+    # Shared by every class's tree in every round: the histogram shape is the
+    # dataset's, not the class's, so one pool serves them all.
+    var scratch = GrowScratch(data.n_features, data.n_bins)
+    var leaves = LeafMembership()
+    var by_leaf = _leaf_score_update_enabled()
     for i in range(params.n_estimators):
         var round = round_offset + i
         refresh_bag(bag, bagging, n, round)
@@ -1737,22 +2048,28 @@ def _boost_rounds_multiclass(
             apply_goss_scaling(selection, grad, hess)
             # Feature subsampling draws once per tree, so each class's tree
             # in a round gets its own feature set.
-            var tree = grow_tree_with_cegb(
+            var tree = grow_tree_leaves(
+                leaves,
+                ledger,
+                scratch,
                 data,
                 grad,
                 hess,
                 params.tree,
-                ledger,
                 bag,
                 round * n_classes + k,
                 bundling,
             )
             if tree.n_leaves > 1 or abs(tree.value[0]) >= 1e-12:
                 made_progress = True
-            for r in range(n):
-                raw[r * n_classes + k] += (
-                    learning_rate * tree.predict_row(data, r)
-                )
+            # Class k owns slot `r * n_classes + k` of the row-major scores,
+            # so the update is the single-output one with a stride. The rounds
+            # this loop later drops (no class made progress) have already
+            # updated `raw`, exactly as they did before: the trees are popped
+            # and the scores are not, and this changes nothing about that.
+            _add_tree_scores(
+                raw, tree, leaves, data, learning_rate, by_leaf, n_classes, k
+            )
             trees.append(tree^)
 
         # No class made progress: with bagging or GOSS that is a statement
@@ -1907,11 +2224,14 @@ def train_multiclass_more(
     var n_rounds = len(booster.trees) // n_classes
     for i in range(n_rounds):
         for k in range(n_classes):
-            ref tree = booster.trees[i * n_classes + k]
-            for r in range(n):
-                raw[r * n_classes + k] += (
-                    booster.learning_rate * tree.predict_row(data, r)
-                )
+            _add_by_traversal(
+                raw,
+                booster.trees[i * n_classes + k],
+                data,
+                booster.learning_rate,
+                n_classes,
+                k,
+            )
 
     # Grown into a list of its own and merged only once the loop has
     # returned, so a round that raises leaves the ensemble as it was.
@@ -2020,6 +2340,9 @@ def train_multiclass_with_valid(
     var best_n_rounds = 0
     var n_rounds = 0
     var bag = List[Int]()
+    var scratch = GrowScratch(data.n_features, data.n_bins)
+    var leaves = LeafMembership()
+    var by_leaf = _leaf_score_update_enabled()
     for i in range(params.n_estimators):
         refresh_bag(bag, bagging, n, i)
         for r in range(n):
@@ -2044,26 +2367,40 @@ def train_multiclass_with_valid(
             apply_goss_scaling(selection, grad, hess)
             # Feature subsampling draws once per tree, so each class's tree
             # in a round gets its own feature set.
-            var tree = grow_tree_with_cegb(
+            var tree = grow_tree_leaves(
+                leaves,
+                ledger,
+                scratch,
                 data,
                 grad,
                 hess,
                 params.tree,
-                ledger,
                 bag,
                 i * n_classes + k,
                 bundling,
             )
             if tree.n_leaves > 1 or abs(tree.value[0]) >= 1e-12:
                 made_progress = True
-            for r in range(n):
-                raw[r * n_classes + k] += (
-                    params.learning_rate * tree.predict_row(data, r)
-                )
-            for r in range(n_valid):
-                valid_raw[r * n_classes + k] += (
-                    params.learning_rate * tree.predict_row(valid_data, r)
-                )
+            _add_tree_scores(
+                raw,
+                tree,
+                leaves,
+                data,
+                params.learning_rate,
+                by_leaf,
+                n_classes,
+                k,
+            )
+            # The validation rows were never partitioned, so they keep the
+            # traversal; see `train_with_valid`.
+            _add_by_traversal(
+                valid_raw,
+                tree,
+                valid_data,
+                params.learning_rate,
+                n_classes,
+                k,
+            )
             trees.append(tree^)
 
         # Popped trees are all single-leaf with value ~0, so the score

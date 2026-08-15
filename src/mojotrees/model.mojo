@@ -160,17 +160,12 @@ struct Model(Copyable, Movable, Writable):
             if raw_score:
                 return predict_raw_gpu(self.booster, data, rng)
             return predict_gpu(self.booster, data, rng)
-        var out = List[Float64](capacity=n_rows)
-        var bins = List[Int](capacity=self.mapper.n_features)
-        for r in range(n_rows):
-            bins.clear()
-            for f in range(self.mapper.n_features):
-                bins.append(Int(data.bins[f * n_rows + r]))
-            if raw_score:
-                out.append(self.booster.predict_raw_bins_range(bins, rng))
-            else:
-                out.append(self.booster.predict_bins_range(bins, rng))
-        return out^
+        # One prediction per row, over row blocks. The per-row body used to
+        # live here and now lives in `Booster.predict_batch_range`, which is
+        # the same gather of `bins[f * n_rows + r]` followed by the same
+        # range call; rows write disjoint output slots, so the outputs are
+        # bit-identical to this loop's at any block count.
+        return self.booster.predict_batch_range(data, rng, raw_score)
 
 
 @fieldwise_init
@@ -289,37 +284,37 @@ struct MulticlassModel(Copyable, Movable, Writable):
             if raw_score:
                 return predict_raw_multiclass_gpu(self.booster, data, rng)
             return predict_proba_gpu(self.booster, data, rng)
+        if not linear:
+            # The constant-leaf path, over row blocks; see
+            # `MulticlassBooster.predict_batch_range`. Linear leaves keep the
+            # loop below because they are evaluated on the raw row rather than
+            # on the bins, which the bins-only ensemble methods cannot see.
+            return self.booster.predict_batch_range(data, rng, raw_score)
+        # Linear leaves only, from here down: they read the raw row as well as
+        # the bins, which is why they are not in the batch entry point above.
         var n_classes = self.booster.n_classes
         var out = List[Float64](capacity=n_rows * n_classes)
         var bins = List[Int](capacity=self.mapper.n_features)
         var row = List[Float64]()
-        if linear:
-            row.resize(self.mapper.n_features, 0.0)
+        row.resize(self.mapper.n_features, 0.0)
         for r in range(n_rows):
             bins.clear()
             for f in range(self.mapper.n_features):
                 bins.append(Int(data.bins[f * n_rows + r]))
-            var scores: List[Float64]
-            if linear:
-                for f in range(self.mapper.n_features):
-                    row[f] = features[f * n_rows + r]
-                scores = predict_multiclass_raw(
-                    self.booster.trees,
-                    self.booster.linear,
-                    self.booster.base_scores,
-                    self.booster.learning_rate,
-                    n_classes,
-                    bins,
-                    row,
-                    rng.start,
-                    rng.stop,
-                )
-                if not raw_score:
-                    _softmax_list(scores)
-            elif raw_score:
-                scores = self.booster.predict_raw_bins_range(bins, rng)
-            else:
-                scores = self.booster.predict_proba_bins_range(bins, rng)
+                row[f] = features[f * n_rows + r]
+            var scores = predict_multiclass_raw(
+                self.booster.trees,
+                self.booster.linear,
+                self.booster.base_scores,
+                self.booster.learning_rate,
+                n_classes,
+                bins,
+                row,
+                rng.start,
+                rng.stop,
+            )
+            if not raw_score:
+                _softmax_list(scores)
             for k in range(n_classes):
                 out.append(scores[k])
         return out^

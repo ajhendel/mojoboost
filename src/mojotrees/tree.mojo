@@ -81,7 +81,7 @@ from .efb import (
 from .histogram import (
     Histogram,
     build_histogram_into,
-    build_histogram_subset_into,
+    build_histogram_subset_into_scratch,
     subtract_histogram_into,
 )
 from .parallel import plan_row_blocks, run_row_blocks
@@ -556,6 +556,70 @@ struct _LeafState(Movable):
         swap(out, self.hist)
         return out^
 
+    def take_rows(mut self) raises -> List[Int]:
+        """Move this leaf's row ids out, leaving an empty list behind.
+
+        Used when growth finishes: the frontier's row lists are exactly the
+        leaf membership a score update wants (see `LeafMembership`), and
+        moving them out is what lets a caller have them without copying.
+        Mojo 1.0 forbids partial field moves, so this is a swap, the same
+        shape `take_hist` uses for the histogram."""
+        var out = List[Int]()
+        swap(out, self.rows)
+        return out^
+
+
+struct LeafMembership(Movable):
+    """Which training rows each leaf of a freshly grown tree holds.
+
+    `node[l]` is the tree node id of the l-th leaf and `rows[l]` is that
+    leaf's training row ids in ascending order, the order
+    `partition_rows_into` produces. Both lists have `tree.n_leaves` entries,
+    and the row lists partition the rows the tree was grown on: each such row
+    appears in exactly one of them, exactly once.
+
+    The grower already had this and used to drop it. A trainer that keeps it
+    adds a tree's contribution to the raw scores leaf by leaf --
+    `raw[r] += learning_rate * tree.value[node[l]]` for every r in `rows[l]`
+    -- instead of walking the whole tree once per row to recover the leaf the
+    partition already named. The added quantity is the same Float64 product
+    added to the same accumulator, so the raw scores are bit-identical to the
+    traversal's; only the route to the leaf changes.
+
+    The leaf value is read from the tree at update time rather than cached
+    here, because leaf renewal (`boosting._renew_leaf_values`, for QUANTILE,
+    L1, and MAPE) rewrites `tree.value` after growth and before the update.
+    Renewal rewrites leaves in place and never renumbers a node, so the node
+    ids stay the ones growth handed back.
+
+    `covers_all_rows` is False when the tree was grown on a bag (bagging,
+    GOSS, balanced bagging): the row lists then cover the bag alone while
+    every row of the dataset still needs the tree's contribution, so a caller
+    must fall back to traversal for that tree. It is not a hint. A caller
+    that ignores it silently leaves the unbagged rows unscored.
+    """
+
+    var node: List[Int]
+    var rows: List[List[Int]]
+    var covers_all_rows: Bool
+
+    def __init__(out self):
+        self.node = List[Int]()
+        self.rows = List[List[Int]]()
+        self.covers_all_rows = False
+
+    @always_inline
+    def n_leaves(self) -> Int:
+        return len(self.node)
+
+    def clear(mut self):
+        """Drop the previous tree's membership. A trainer keeps one of these
+        across a whole fit and refills it each round, so the row lists it
+        already grew are freed here rather than accumulating."""
+        self.node.clear()
+        self.rows.clear()
+        self.covers_all_rows = False
+
 
 @fieldwise_init
 struct RowPartition(Movable):
@@ -700,6 +764,53 @@ struct _HistPool(Movable):
         mismatched hand-back can never corrupt a later `take`."""
         if hist.matches(self.n_features, self.n_bins):
             self.free.append(hist^)
+
+
+struct GrowScratch(Movable):
+    """The working memory one grower call reuses across every node, and one
+    booster reuses across every tree.
+
+    Two buffers live here:
+
+    - `pool`, the histogram free list. `_HistPool`'s own argument is that a
+      buffer is three arrays of `n_features * n_bins` -- around 300 KB at 100
+      features and 255 bins -- so the allocator hands back fresh pages and
+      faults them in every time one is created. Constructing the pool per
+      tree defeats exactly that argument: a 100-round fit rebuilt it 100
+      times and paid the first-few-nodes cost 100 times. Held here, one pool
+      serves a whole fit.
+    - `pairs`, the gradient/hessian gather buffer
+      `histogram.build_histogram_subset_into_scratch` fills. The non-scratch
+      form allocates and frees it per node, which its own docstring says a
+      grower should not do.
+
+    Neither buffer carries meaning between uses. A pooled histogram's
+    contents are undefined on `take` and every `_into` builder writes every
+    cell it will read before reading it; `pairs` is written for the current
+    node's rows before it is read for them and is only ever grown. So the
+    same growth that recycles these within a tree recycles them across trees
+    on identical terms: no node can observe another node's leftovers, and a
+    fit that shares one scratch produces the tree a fit that allocated a
+    fresh one produces, cell for cell.
+
+    `prepare` makes a scratch safe to hand to a different matrix. It rebuilds
+    the pool when the histogram shape changes, so the free list can never
+    hold buffers of a shape the new data would misread. `pairs` needs no such
+    check: it is sized by row count alone and only grows.
+    """
+
+    var pool: _HistPool
+    var pairs: List[Float64]
+
+    def __init__(out self, n_features: Int, n_bins: Int):
+        self.pool = _HistPool(n_features, n_bins)
+        self.pairs = List[Float64]()
+
+    def prepare(mut self, n_features: Int, n_bins: Int) raises:
+        """Point this scratch at a histogram shape, discarding pooled buffers
+        of any other shape."""
+        if self.pool.n_features != n_features or self.pool.n_bins != n_bins:
+            self.pool = _HistPool(n_features, n_bins)
 
 
 def _leaf_value(
@@ -886,6 +997,7 @@ def _hist_full(
 def _hist_subset(
     mut hist: Histogram,
     mut scratch: Histogram,
+    mut pairs: List[Float64],
     data: BinnedMatrix,
     bundled: BundledMatrix,
     grad: List[Float64],
@@ -898,14 +1010,24 @@ def _hist_subset(
 ) raises:
     """`_hist_full` for a row subset. Row ids index the original matrix and the
     bundled one identically, because bundling rearranges columns and never
-    rows."""
+    rows.
+
+    `pairs` is the grower's gradient/hessian gather buffer, held for the whole
+    tree (see `GrowScratch`). `build_histogram_subset_into` is the same call
+    with a fresh empty list in its place -- it allocates one, hands it over,
+    and frees it -- and its docstring says a grower visiting hundreds of nodes
+    should hold one instead. Its contents on entry are irrelevant: the gather
+    pass writes `[0, 2 * count)` before the accumulation pass reads any of it,
+    and `ensure_pair_capacity` only ever grows the buffer. So the histogram
+    that comes out is the one the allocating form produces, cell for cell.
+    """
     if not bundled.active:
-        build_histogram_subset_into(
-            hist, data, grad, hess, rows, start, count, features
+        build_histogram_subset_into_scratch(
+            hist, pairs, data, grad, hess, rows, start, count, features
         )
         return
-    build_histogram_subset_into(
-        scratch, bundled.data, grad, hess, rows, start, count, columns
+    build_histogram_subset_into_scratch(
+        scratch, pairs, bundled.data, grad, hess, rows, start, count, columns
     )
     _expand_bundled(hist, scratch, bundled, features)
 
@@ -951,18 +1073,37 @@ def grow_tree_with_cegb(
     tree_index: Int = 0,
     bundling: BundledMatrix = BundledMatrix.none(),
 ) raises -> Tree:
-    """`grow_tree_profiled` with a profile of its own, reported per tree.
+    """`grow_tree_leaves_profiled` with a profile, a leaf membership, and a
+    scratch of its own, the profile reported per tree.
 
-    The entry point every caller that does not accumulate a profile across a
-    fit uses, which is all of them except `boosting._boost_rounds`. With
-    `MOJOTREES_PHASE_PROFILE` unset -- the default -- the profile is off, this
-    costs one `getenv` and one bucket allocation per tree, prints nothing, and
-    grows exactly the tree it grew before the instrument existed. With it set,
-    one `scope=tree` block is printed per tree; a caller that wants one block
-    per fit owns a `PhaseProfile` and calls `grow_tree_profiled` directly.
+    The signature that shipped, unchanged, and the entry point every caller
+    that accumulates nothing across a fit uses, which is all of them except
+    `boosting._boost_rounds`. It owns the three things a boosting loop would
+    rather own itself:
 
-    A `mut` argument cannot be defaulted, which is why the profile is a second
-    entry point rather than a defaulted parameter, exactly as the ledger is.
+    - a `PhaseProfile`. With `MOJOTREES_PHASE_PROFILE` unset -- the default
+      -- it is off, this costs one `getenv` and one bucket allocation per
+      tree, prints nothing, and grows exactly the tree it grew before the
+      instrument existed. With it set, one `scope=tree` block is printed per
+      tree;
+    - a `LeafMembership`. The membership is grown either way -- it is the
+      frontier's own row lists, which growth has always built -- so
+      discarding it here saves nothing and costs nothing. It exists because
+      most trainers only ever wanted the tree, and their call sites are
+      unchanged;
+    - a `GrowScratch`. This entry point pays one pool construction and one
+      gather buffer per tree, which is what growth did before the scratch was
+      threaded at all.
+
+    Each of the three has its own further entry point rather than being a
+    defaulted parameter, because a `mut` argument cannot be defaulted, which
+    is also why the ledger is a second entry point beside `grow_tree`. A
+    caller that wants one profile block per fit calls `grow_tree_profiled`; a
+    trainer that ends its round by adding the tree's contribution to a raw
+    score per row calls `grow_tree_leaves` and adds by leaf instead; a
+    boosting loop that wants both holds all three across the fit and calls
+    `grow_tree_leaves_profiled`. The four paths differ in nothing a tree can
+    observe.
     """
     var profile = PhaseProfile.from_env(SCOPE_TREE, String("grow_tree"))
     var tree = grow_tree_profiled(
@@ -983,6 +1124,85 @@ def grow_tree_profiled(
     tree_index: Int = 0,
     bundling: BundledMatrix = BundledMatrix.none(),
 ) raises -> Tree:
+    """`grow_tree_leaves_profiled` with a caller-owned profile, and a leaf
+    membership and scratch of its own.
+
+    The entry point a caller takes when it accumulates a profile across a fit
+    but wants neither the membership nor a scratch that outlives the tree.
+    The membership is grown either way and dropped when this returns; the
+    scratch is one pool construction and one gather buffer per call, which is
+    what growth did before the scratch was threaded at all.
+    """
+    var leaves = LeafMembership()
+    var scratch = GrowScratch(data.n_features, data.n_bins)
+    return grow_tree_leaves_profiled(
+        profile,
+        leaves,
+        ledger,
+        scratch,
+        data,
+        grad,
+        hess,
+        params,
+        bag,
+        tree_index,
+        bundling,
+    )
+
+
+def grow_tree_leaves(
+    mut leaves: LeafMembership,
+    mut ledger: CegbLedger,
+    mut scratch: GrowScratch,
+    data: BinnedMatrix,
+    grad: List[Float64],
+    hess: List[Float64],
+    params: TreeParams,
+    bag: List[Int] = [],
+    tree_index: Int = 0,
+    bundling: BundledMatrix = BundledMatrix.none(),
+) raises -> Tree:
+    """`grow_tree_leaves_profiled` with a profile of its own, reported per
+    tree.
+
+    The entry point a caller takes when it wants the leaf membership back and
+    a scratch that outlives the tree, but does not accumulate a profile
+    across the fit. With `MOJOTREES_PHASE_PROFILE` unset -- the default --
+    the profile is off, this costs one `getenv` and one bucket allocation per
+    tree, and prints nothing; with it set, one `scope=tree` block is printed
+    per tree.
+    """
+    var profile = PhaseProfile.from_env(SCOPE_TREE, String("grow_tree"))
+    var tree = grow_tree_leaves_profiled(
+        profile,
+        leaves,
+        ledger,
+        scratch,
+        data,
+        grad,
+        hess,
+        params,
+        bag,
+        tree_index,
+        bundling,
+    )
+    profile.print_report()
+    return tree^
+
+
+def grow_tree_leaves_profiled(
+    mut profile: PhaseProfile,
+    mut leaves: LeafMembership,
+    mut ledger: CegbLedger,
+    mut scratch: GrowScratch,
+    data: BinnedMatrix,
+    grad: List[Float64],
+    hess: List[Float64],
+    params: TreeParams,
+    bag: List[Int] = [],
+    tree_index: Int = 0,
+    bundling: BundledMatrix = BundledMatrix.none(),
+) raises -> Tree:
     """Grow one tree, leaf-wise by default or depth-wise under
     `params.grow_policy == GROW_DEPTHWISE`.
 
@@ -994,6 +1214,24 @@ def grow_tree_profiled(
     it is on or off, and so is the tree. What the charges cover is the
     accumulate, the buffer, the subtraction, the partition, and the scan; what
     they cannot cover is documented at the sites that could not reach it.
+
+    `leaves` is filled with the finished frontier's leaf membership (see
+    `LeafMembership`) and its previous contents are dropped. Growth partitions
+    rows into the children of every split it takes, so at the end the frontier
+    holds each leaf's rows already; handing them back costs a move per leaf
+    and no copy. A trainer that has them does not have to walk the tree once
+    per row to find out where a row landed.
+
+    `scratch` is the caller's histogram pool and gather buffer. Passing the
+    same one to every tree of a fit is the point of the argument: see
+    `GrowScratch` for why sharing it changes nothing about the trees. The
+    `grow_tree`, `grow_tree_with_cegb`, and `grow_tree_profiled` entry points
+    construct a fresh one per call, which is what growth did before.
+
+    All three, and `ledger` beside them, are leading `mut` arguments because
+    Mojo cannot default a `mut` parameter, so they cannot sit beside `bag`
+    and `bundling` at the end. That is also why the grower has four entry
+    points rather than one with optional arguments.
 
     `ledger` is the ensemble's CEGB ledger (cegb.mojo), read once per node to
     cost that node's features and written once per chosen split. It spans the
@@ -1146,13 +1384,15 @@ def grow_tree_profiled(
     var tree_started = profile.clock()
     profile.begin_tree(n_root, data.n_rows)
 
-    # Every histogram this tree builds comes from one pool and goes back to it
-    # when its leaf is split, so growth allocates a handful of buffers rather
-    # than three arrays per node. The pool's shape is per feature whether or
-    # not bundling is on: a bundled accumulation lands in `bundle_scratch`
-    # first and is expanded into a pooled buffer, so sibling subtraction, leaf
-    # values, and split search all read the shape they always read.
-    var pool = _HistPool(data.n_features, data.n_bins)
+    # Every histogram this tree builds comes from the caller's pool and goes
+    # back to it when its leaf is split, so growth allocates a handful of
+    # buffers rather than three arrays per node -- and, when the caller keeps
+    # one scratch for a whole fit, a handful per fit rather than per tree. The
+    # pool's shape is per feature whether or not bundling is on: a bundled
+    # accumulation lands in `bundle_scratch` first and is expanded into a
+    # pooled buffer, so sibling subtraction, leaf values, and split search all
+    # read the shape they always read.
+    scratch.prepare(data.n_features, data.n_bins)
     var bundle_scratch = Histogram.zeroed(0, 0)
     if bundling.active:
         bundle_scratch = Histogram.zeroed(
@@ -1166,9 +1406,11 @@ def grow_tree_profiled(
     # `Histogram.zeroed` allocation before that: three arrays of
     # `n_features * n_bins`, which is where a per-node allocation cost would
     # live if the pool were not doing its job. Charged per cell rather than
-    # per row, because it is the same work at any node size.
+    # per row, because it is the same work at any node size. A caller-owned
+    # pool warms once for a whole fit rather than once per tree, so this line
+    # is a pop from the first node of the second tree onwards.
     var root_alloc_started = profile.clock()
-    var root_hist = pool.take()
+    var root_hist = scratch.pool.take()
     if bundling.active:
         # A pooled buffer's contents are undefined and the expansion writes
         # only the sampled features' slices, so the excluded ones are zeroed
@@ -1222,8 +1464,8 @@ def grow_tree_profiled(
         )
         var root_hist_started = profile.clock()
         _hist_subset(
-            root_hist, bundle_scratch, data, bundling, grad, hess, bag, 0,
-            len(bag), tree_features, tree_columns,
+            root_hist, bundle_scratch, scratch.pairs, data, bundling, grad,
+            hess, bag, 0, len(bag), tree_features, tree_columns,
         )
         profile.note_node()
         profile.charge(
@@ -1455,8 +1697,8 @@ def grow_tree_profiled(
         var built_rows = len(left_rows) if builds_left else len(right_rows)
         var derived_rows = len(right_rows) if builds_left else len(left_rows)
         var alloc_started = profile.clock()
-        var left_hist = pool.take()
-        var right_hist = pool.take()
+        var left_hist = scratch.pool.take()
+        var right_hist = scratch.pool.take()
         if bundling.active:
             # Only the directly built child needs zeroing; the derived one is
             # fully written by the subtraction.
@@ -1470,8 +1712,9 @@ def grow_tree_profiled(
         var hist_started = profile.clock()
         if len(left_rows) <= len(right_rows):
             _hist_subset(
-                left_hist, bundle_scratch, data, bundling, grad, hess,
-                left_rows, 0, len(left_rows), tree_features, tree_columns,
+                left_hist, bundle_scratch, scratch.pairs, data, bundling,
+                grad, hess, left_rows, 0, len(left_rows), tree_features,
+                tree_columns,
             )
             profile.note_node()
             profile.charge(
@@ -1499,8 +1742,9 @@ def grow_tree_profiled(
             )
         else:
             _hist_subset(
-                right_hist, bundle_scratch, data, bundling, grad, hess,
-                right_rows, 0, len(right_rows), tree_features, tree_columns,
+                right_hist, bundle_scratch, scratch.pairs, data, bundling,
+                grad, hess, right_rows, 0, len(right_rows), tree_features,
+                tree_columns,
             )
             profile.note_node()
             profile.charge(
@@ -1521,7 +1765,7 @@ def grow_tree_profiled(
                 dispatches=HOST_SUBTRACT_DISPATCHES,
                 cells=hist_cells,
             )
-        pool.give(parent_hist^)
+        scratch.pool.give(parent_hist^)
 
         # Child values are clamped into the parent's interval, then the
         # interval is divided between the children at their midpoint. Both are
@@ -1727,11 +1971,29 @@ def grow_tree_profiled(
         n_leaves += 1
 
     tree.n_leaves = n_leaves
+
+    # The frontier is the leaf set: growth replaces a split leaf's state with
+    # its left child and appends its right, so `len(frontier) == n_leaves` at
+    # every step and nothing that is still a leaf has left it. Its row lists
+    # are moved out rather than copied, and its histograms go back to the pool
+    # here rather than being freed with the states, which is what lets a
+    # booster-scoped scratch keep serving the next tree.
+    leaves.clear()
+    leaves.covers_all_rows = len(bag) == 0
+    leaves.node = List[Int](capacity=len(frontier))
+    leaves.rows = List[List[Int]](capacity=len(frontier))
+    for i in range(len(frontier)):
+        leaves.node.append(frontier[i].node)
+        leaves.rows.append(frontier[i].take_rows())
+        scratch.pool.give(frontier[i].take_hist())
+
     # The tree's whole wall clock, so the report can name what no phase
-    # claimed rather than letting the reader assume the phases cover it. What
-    # is deliberately outside every phase here: leaf valuation, the monotone
-    # clamp, the growth policy's frontier scan, the CEGB bookkeeping, and the
-    # per-node feature draws.
+    # claimed rather than letting the reader assume the phases cover it. Taken
+    # after the membership drain above so that the drain is inside the tree's
+    # wall time rather than falling off the end of it. What is deliberately
+    # outside every phase here: leaf valuation, the monotone clamp, the growth
+    # policy's frontier scan, the CEGB bookkeeping, the per-node feature
+    # draws, and that drain.
     profile.end_tree(tree_started)
     return tree^
 
