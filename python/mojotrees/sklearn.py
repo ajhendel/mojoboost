@@ -16,7 +16,7 @@ import os as _os
 import tempfile as _tempfile
 import warnings as _warnings
 
-from . import _arrays, _compat, _eval, callback as _callback
+from . import _arrays, _compat, _eval, _validation, callback as _callback
 from ._sklearn import NotFittedError, ParamsMixin as _ParamsMixin
 from ._sklearn import estimator_tags as _estimator_tags
 from .basic import Booster
@@ -761,6 +761,38 @@ class _Base(_ParamsMixin):
         self._cat_encoders = encoders
         self.categorical_feature_ = list(indices)
         return Xb, n_rows, n_features, names, cat_buf
+
+    def _check_fit_structure(
+        self, X, y, n_rows, n_features, sample_weight=None, group=None
+    ):
+        """`_validation`'s structure checks for a fit call, run once the
+        matrix has a shape.
+
+        Shape ceilings and one entry per row for `y`, `sample_weight`, and
+        the query counts. Every rule here is one the buffer conversions
+        below would also refuse, so the checks add an earlier and named
+        error, not a new rejection; the pandas index-alignment check is
+        deliberately not run, because a positional `y` against a frame `X`
+        is accepted here as it is in LightGBM.
+        """
+        _validation.check_shape(n_rows, n_features)
+        _validation.check_length(y, n_rows, "y")
+        _validation.check_optional_length(sample_weight, n_rows, "sample_weight")
+        if group is not None:
+            try:
+                n_queries = len(group)
+            except TypeError:
+                raise TypeError(
+                    "group must be a sequence of per-query row counts, got "
+                    f"{type(group).__name__}"
+                ) from None
+            if n_queries < 1:
+                raise ValueError("group must contain at least one query")
+            if n_queries > n_rows:
+                raise ValueError(
+                    f"group has {n_queries} queries but X has only {n_rows} "
+                    "rows, and every query needs at least one row"
+                )
 
     def _refuse_alternate_boosting(self, where):
         """Raise when `boosting` is dart or rf and `where` names a fit path
@@ -2465,6 +2497,7 @@ class MojoTreesRegressor(_Base):
             del keep
             return self
         Xb, n_rows, n_features, names, cat_buf = self._fit_X(X)
+        self._check_fit_structure(X, y, n_rows, n_features, sample_weight)
         yb = _arrays.check_target(y, n_rows)
         wb, w_addr = self._weight_buffer(sample_weight, n_rows)
         ic_flat, ic_offsets = self._interaction_buffers(n_features)
@@ -2904,6 +2937,7 @@ class MojoTreesClassifier(_Base):
             self._reject_sparse_eval_set(eval_set)
             return self._fit_sparse(X, y, sample_weight)
         Xb, n_rows, n_features, names, cat_buf = self._fit_X(X)
+        self._check_fit_structure(X, y, n_rows, n_features, sample_weight)
         yb, classes = _arrays.encode_labels(y, n_rows)
         n_classes = len(classes)
         # class_weight becomes ordinary row weights before anything else
@@ -3404,6 +3438,9 @@ class MojoTreesRanker(_Base):
         self._refuse_alternate_boosting("for a ranker")
         self._reset_fitted()
         Xb, n_rows, n_features, names, cat_buf = self._fit_X(X)
+        self._check_fit_structure(
+            X, y, n_rows, n_features, sample_weight, group
+        )
         yb = _arrays.check_target(y, n_rows)
         _check_relevance(yb, n_rows)
         gb = _group_buffer(group, n_rows)
