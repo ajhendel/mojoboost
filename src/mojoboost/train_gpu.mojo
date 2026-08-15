@@ -87,7 +87,7 @@ and `device_gradients` below is the trainer's binding of it rather than a
 second list of blockers that could drift from it.
 """
 
-from std.math import log
+from std.math import log, min
 from std.os import getenv
 from std.sys import has_accelerator
 from std.time import perf_counter_ns
@@ -147,6 +147,21 @@ from .gpu_split_policy import decide_split_search
 from .gpu_tiling import DeviceCaps
 from .histogram import Histogram, subtract_histogram
 from .histogram_gpu import GpuHistogramBuilder
+from .hybrid_leaf_scheduler import (
+    MODE_MIRROR,
+    MODE_OFF,
+    MODE_REPLICA,
+    PLACE_BOTH,
+    REPLICA_REFUTED,
+    REPLICA_UNTESTED,
+    REPLICA_VERIFIED,
+    HybridContext,
+    HybridCosts,
+    env_hybrid_costs,
+    env_hybrid_mode,
+    mode_name,
+    plan_split,
+)
 from .objective import (
     GradHessFn,
     _apply_sample_weight,
@@ -204,6 +219,34 @@ struct _GpuLeafState(Movable):
         self.branch = branch^
         self.depth = depth
         self.bounds = bounds^
+
+
+def _histograms_match(a: Histogram, b: Histogram) -> Bool:
+    """Whether two histograms carry exactly the same numbers, cell for cell.
+
+    The mirror comparison behind the replica claim (HYBRID_TRAINING.md §4):
+    both sides dequantize with the same `Float64(Int32) * (1 / scale)`, so
+    equal Float64 planes here is equivalent to equal Int32 planes there —
+    the multiply is injective over the Int32 range for any positive scale.
+    Exact equality on purpose; a tolerance would verify nothing.
+    """
+    if a.n_features != b.n_features or a.n_bins != b.n_bins:
+        return False
+    var size = a.n_features * a.n_bins
+    var ag = a.grad.unsafe_ptr()
+    var bg = b.grad.unsafe_ptr()
+    var ah = a.hess.unsafe_ptr()
+    var bh = b.hess.unsafe_ptr()
+    var ac = a.count.unsafe_ptr()
+    var bc = b.count.unsafe_ptr()
+    for i in range(size):
+        if (
+            ag.unsafe_load(i) != bg.unsafe_load(i)
+            or ah.unsafe_load(i) != bh.unsafe_load(i)
+            or ac.unsafe_load(i) != bc.unsafe_load(i)
+        ):
+            return False
+    return True
 
 
 def _count_left(
@@ -1214,6 +1257,7 @@ def grow_tree_gpu(
     bag: List[Int] = [],
     tree_index: Int = 0,
     split_search: Int = SPLIT_SEARCH_AUTO,
+    data: BinnedMatrix = BinnedMatrix(List[UInt8](), 0, 0, 0),
 ) raises -> Tree:
     """Grow one tree, leaf-wise, with histogram accumulation and row
     partitioning on the GPU. Gradients for this round must already be
@@ -1262,7 +1306,14 @@ def grow_tree_gpu(
     from one batched launch or builds the smaller one and subtracts. The two
     produce the same pair of histograms exactly, since fixed-point Int32
     accumulation under one scale makes a parent's bins the exact integer sum
-    of its children's, so no split decision can tell which ran."""
+    of its children's, so no split decision can tell which ran.
+
+    `data` is the caller's host-resident binned matrix, and passing it is
+    what makes hybrid CPU/GPU leaf scheduling possible at all
+    (`MOJOBOOST_HYBRID_LEAVES` + `MOJOBOOST_HYBRID_COSTS`; see
+    hybrid_leaf_scheduler.mojo). The default is an empty matrix, under which
+    hybrid scheduling stays off and this grower is exactly the pure-device
+    one — as it also is whenever the environment does not opt in."""
     if (
         resolve_split_search_for(builder, params, split_search)
         == SPLIT_SEARCH_DEVICE
@@ -1313,6 +1364,51 @@ def grow_tree_gpu(
 
     builder.begin_tree(bag)
     var n_root = len(bag) if len(bag) > 0 else builder.n_rows
+
+    # --- Hybrid leaf scheduling (MOJOBOOST_HYBRID_LEAVES) -----------------
+    # Off unless the environment asks, and a no-op when it does not: the
+    # branch below is the only cost an ordinary tree pays. This grower wires
+    # the two fit-preserving modes only. `mirror` builds a host replica
+    # alongside accepted device builds and compares them bit for bit, with
+    # the device's histogram always the one consumed; `replica` substitutes
+    # host builds — but only after a mirror comparison on this builder has
+    # verified the replica (`replica_state`), so a substituted tree is
+    # bit-identical to the one the pure-device grower grows. `float64`
+    # changes the fit and is deliberately not wired here.
+    #
+    # Rows for a host build come from a fresh whole-permutation snapshot
+    # taken per host-elected split (`snapshot_rows`), never from a
+    # maintained mirror: at the measured `host_partition_nanos_per_krow`,
+    # mirroring every split's partition (HYBRID_TRAINING.md §8.3 step 4)
+    # costs more per tree than the builds it enables, which is the outcome
+    # §9 E6 anticipated and answers with exactly this retake. The context
+    # below therefore never sets `snapshot_taken`, so every accepted leaf
+    # must pay for a full snapshot out of its own saving
+    # (DECLINE_SNAPSHOT_NOT_PAID) — conservative by construction: a host
+    # placement can never make a tree slower than the pure-device path.
+    var hy_mode = env_hybrid_mode()
+    var hy_costs = HybridCosts.unmeasured()
+    var hybrid_live = False
+    if hy_mode == MODE_MIRROR or hy_mode == MODE_REPLICA:
+        hy_costs = env_hybrid_costs()
+        hybrid_live = (
+            hy_costs.measured
+            and builder.gradients_host
+            and builder.replica_state != REPLICA_REFUTED
+            and data.n_rows == builder.n_rows
+            and data.n_features == builder.n_features
+            and data.n_bins == builder.n_bins
+        )
+    var hy_rows = List[Int32]()
+    var hy_fixed = List[Int32]()
+    var hy_hist = Histogram.zeroed(1, 1)
+    if hybrid_live:
+        hy_hist = Histogram.zeroed(builder.n_features, builder.n_bins)
+    var hy_host_builds = 0
+    var hy_mirror_matches = 0
+    var hy_mirror_mismatches = 0
+    var hybrid_trace = getenv("MOJOBOOST_HYBRID_TRACE") == "1"
+
     var root = tree._add_node(0.0, Float64(n_root))
     var hist_t0 = perf_counter_ns()
     var root_hist = builder.build_leaf(root)
@@ -1418,25 +1514,132 @@ def grow_tree_gpu(
         # its children's, so subtracting one built child and building both
         # children agree bin for bin. Which one runs is therefore a launch
         # decision no split can observe.
-        var left_hist: Histogram
-        var right_hist: Histogram
+        var left_hist = Histogram.zeroed(1, 1)
+        var right_hist = Histogram.zeroed(1, 1)
         var child_nodes: List[Int] = [left_node, right_node]
         hist_t0 = perf_counter_ns()
-        if builder.batches_nodes(child_nodes):
-            var pair = builder.build_leaves(child_nodes)
-            left_hist = pair[0].copy()
-            right_hist = pair[1].copy()
-        elif subtraction_builds_left(n_left, n_right):
-            # Which child is built and which is derived is
-            # `gpu_frontier.subtraction_builds_left`, whose docstring names
-            # this test and `grow_tree`'s as the two it matches. Written once
-            # so a batched grower and this one cannot pick different children
-            # and then disagree about which histogram a slot holds.
-            left_hist = builder.build_leaf(left_node)
-            right_hist = subtract_histogram(frontier[best_i].hist, left_hist)
-        else:
-            right_hist = builder.build_leaf(right_node)
-            left_hist = subtract_histogram(frontier[best_i].hist, right_hist)
+        var hy_direct_done = False
+        if hybrid_live and not builder.batches_nodes(child_nodes):
+            var verified = builder.replica_state == REPLICA_VERIFIED
+            # While the replica claim is untested, a `replica` run places as
+            # a mirror: its first accepted leaf is the comparison that can
+            # verify the claim, and the device's histogram is still the one
+            # consumed, so the tree cannot depend on the outcome.
+            var eff_mode = hy_mode
+            if hy_mode == MODE_REPLICA and not verified:
+                eff_mode = MODE_MIRROR
+            var hy_ctx = HybridContext(
+                eff_mode,
+                False,  # this is the host-search path
+                True,  # gradients are host-staged (gated at tree start)
+                True,  # the caller's binned matrix is in hand
+                verified,
+                True,
+                n_root,
+                False,  # no maintained snapshot: every leaf pays for one
+                hy_costs.copy(),
+            )
+            # `plan_split`'s direct child is `n_left <= n_right`, the same
+            # tie `subtraction_builds_left` breaks, so the host builds
+            # exactly the child the device would have built.
+            var hy_plan = plan_split(
+                hy_ctx,
+                left_node,
+                n_left,
+                right_node,
+                n_right,
+                len(builder.active),
+                builder.n_features,
+                builder.n_bins,
+                builder.n_rows,
+                gpu_launches=builder.histogram_plan(
+                    min(n_left, n_right)
+                ).tiling().launches(),
+                parent_materialized=True,
+            )
+            if hy_plan.placement.builds_on_host():
+                # Fresh snapshot: the partition just enqueued is drained by
+                # the copy's synchronize, so the children's ranges index it
+                # exactly.
+                builder.snapshot_rows(hy_rows)
+                var hy_win = builder.range_of(hy_plan.direct_node)
+                if hy_win.count() == hy_plan.direct_rows:
+                    builder.build_leaf_host_replica(
+                        hy_hist,
+                        hy_fixed,
+                        data,
+                        hy_rows,
+                        hy_win.begin,
+                        hy_win.count(),
+                    )
+                    hy_host_builds += 1
+                    if hy_plan.placement.device == PLACE_BOTH:
+                        # Mirror: the host build is compared and discarded;
+                        # the device's histogram is the one consumed, so a
+                        # mismatch is a diagnostic, not a fork in the tree.
+                        var dev_hist = builder.build_leaf(hy_plan.direct_node)
+                        if _histograms_match(dev_hist, hy_hist):
+                            hy_mirror_matches += 1
+                            if builder.replica_state == REPLICA_UNTESTED:
+                                builder.replica_state = REPLICA_VERIFIED
+                        else:
+                            hy_mirror_mismatches += 1
+                            builder.replica_state = REPLICA_REFUTED
+                            hybrid_live = False
+                        if hy_plan.direct_is_left:
+                            left_hist = dev_hist^
+                            right_hist = subtract_histogram(
+                                frontier[best_i].hist, left_hist
+                            )
+                        else:
+                            right_hist = dev_hist^
+                            left_hist = subtract_histogram(
+                                frontier[best_i].hist, right_hist
+                            )
+                    else:
+                        # Verified replica: the host histogram substitutes,
+                        # and the launch, download, synchronize, and
+                        # conversion the device build would have cost never
+                        # happen. Bit-identical by the verified claim, so
+                        # the sibling subtraction is the same arithmetic it
+                        # always was.
+                        if hy_plan.direct_is_left:
+                            left_hist = hy_hist.copy()
+                            right_hist = subtract_histogram(
+                                frontier[best_i].hist, left_hist
+                            )
+                        else:
+                            right_hist = hy_hist.copy()
+                            left_hist = subtract_histogram(
+                                frontier[best_i].hist, right_hist
+                            )
+                    hy_direct_done = True
+                else:
+                    # The device's range table and the plan disagree about
+                    # this node — nothing has been consumed yet, so fall
+                    # back to the device path and stop scheduling.
+                    hybrid_live = False
+        if not hy_direct_done:
+            if builder.batches_nodes(child_nodes):
+                var pair = builder.build_leaves(child_nodes)
+                left_hist = pair[0].copy()
+                right_hist = pair[1].copy()
+            elif subtraction_builds_left(n_left, n_right):
+                # Which child is built and which is derived is
+                # `gpu_frontier.subtraction_builds_left`, whose docstring
+                # names this test and `grow_tree`'s as the two it matches.
+                # Written once so a batched grower and this one cannot pick
+                # different children and then disagree about which histogram
+                # a slot holds.
+                left_hist = builder.build_leaf(left_node)
+                right_hist = subtract_histogram(
+                    frontier[best_i].hist, left_hist
+                )
+            else:
+                right_hist = builder.build_leaf(right_node)
+                left_hist = subtract_histogram(
+                    frontier[best_i].hist, right_hist
+                )
         t_hist += Float64(perf_counter_ns() - hist_t0) / 1e9
 
         # Same clamp-and-divide as the CPU grower: no-ops when unconstrained.
@@ -1581,6 +1784,23 @@ def grow_tree_gpu(
             t_search,
             "other_s",
             tree_s - t_hist - t_partition - t_search,
+        )
+    if hybrid_trace and hy_mode != MODE_OFF:
+        print(
+            "hybrid_trace tree",
+            tree_index,
+            "mode",
+            mode_name(hy_mode),
+            "live",
+            hybrid_live,
+            "host_builds",
+            hy_host_builds,
+            "mirror_matches",
+            hy_mirror_matches,
+            "mirror_mismatches",
+            hy_mirror_mismatches,
+            "replica_state",
+            builder.replica_state,
         )
 
     tree.n_leaves = n_leaves
@@ -1753,7 +1973,7 @@ def _train_gpu_rounds[
             builder.upload_gradients(grad, hess)
             life.begin_tree()
             var tree = grow_tree_gpu(
-                builder, params.tree, bag, i, split_search
+                builder, params.tree, bag, i, split_search, data=data
             )
             life.end_tree()
             if renews:
@@ -1964,7 +2184,9 @@ def _train_custom_gpu_rounds[
             _apply_sample_weight(grad, hess, sample_weight)
             builder.upload_gradients(grad, hess)
             life.begin_tree()
-            var tree = grow_tree_gpu(builder, params.tree, [], i, split_search)
+            var tree = grow_tree_gpu(
+                builder, params.tree, [], i, split_search, data=data
+            )
             life.end_tree()
 
             # A single-leaf tree with a near-zero value means the objective
@@ -2387,7 +2609,12 @@ def _train_multiclass_gpu_rounds[
                 # feature sets.
                 life.begin_tree()
                 var tree = grow_tree_gpu(
-                    builder, params.tree, bag, i * n_classes + k, split_search
+                    builder,
+                    params.tree,
+                    bag,
+                    i * n_classes + k,
+                    split_search,
+                    data=data,
                 )
                 life.end_tree()
                 guard.note_tree(k)
@@ -2834,7 +3061,7 @@ def _train_gpu_valid_rounds[
             goss_round(bag, grad, hess, goss, i, params.learning_rate)
             builder.upload_gradients(grad, hess)
             var tree = grow_tree_gpu(
-                builder, params.tree, bag, i, split_search
+                builder, params.tree, bag, i, split_search, data=data
             )
             if renews:
                 _renew_leaf_values(

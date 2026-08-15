@@ -486,8 +486,43 @@ the snapshot should be retaken instead of maintained.
 
 ## 10. Status
 
-Not enabled. Not called. Not measured.
+Wired, default off, and off unless *two* switches opt in.
 
-`MOJOBOOST_HYBRID_LEAVES` selects a mode and every mode is still declined for
-want of a measured cost model — deliberately, so that the decline reason is
-observable through `describe_placement` before any numbers exist.
+- **E1 ran** (`pixi run bench-hybrid-costs`, `bench/bench_hybrid_costs.mojo`),
+  and `HybridCosts.apple_m4()` cites its output
+  (`bench/results/apple_m4_hybrid_costs_2026-08-14.md`). The costs are
+  selected only by an explicit `MOJOBOOST_HYBRID_COSTS=apple-m4`, never
+  inferred from the hardware; without it every leaf still declines with
+  `DECLINE_COSTS_UNMEASURED`.
+- **The §8.2 replica builder exists**
+  (`histogram.build_histogram_subset_replica_into`, reached through
+  `GpuHistogramBuilder.build_leaf_host_replica`), with the quantization
+  hoisted to once per row — the per-(row, feature) form measured twenty
+  times slower than the Float64 builder, the hoisted form within 1.7x.
+- **E2 runs in-process**: a `replica` run's first accepted leaf executes as
+  a mirror, and the bitwise comparison sets
+  `GpuHistogramBuilder.replica_state`. Verified, later accepted leaves
+  substitute; refuted, hybrid scheduling retires for the fit and the
+  pure-device path continues. `tests/parallel/test_hybrid_replica.mojo`
+  makes the same comparison over adversarial gradients and holds a hybrid
+  fit bit-identical to the pure-device fit.
+- **The §8.3 integration deviates in one measured place.** Step 4's
+  maintained snapshot (mirror every later split with
+  `partition_range_host`) prices at `host_partition_nanos_per_krow` =
+  15,485 on the calibration machine — tens of milliseconds per tree at
+  500k rows, more than the builds it enables. So `grow_tree_gpu` retakes a
+  fresh whole-permutation snapshot per host-elected split
+  (`GpuHistogramBuilder.snapshot_rows`) and maintains nothing, the
+  alternative §9 E6 names. The context never sets `snapshot_taken`, so
+  every accepted leaf must pay for a full snapshot out of its own saving —
+  strictly more conservative than the amortized design, and it keeps the
+  guarantee that a host placement can never make a tree slower than the
+  pure-device path.
+- **`MODE_HOST_FLOAT64` stays unwired** in the grower, exactly because §7
+  allows it no per-node fallback: it is a different algorithm, and nothing
+  in the trainer should reach one through an environment variable that
+  looks like an optimization switch.
+
+E3 through E6 remain open; E6's first question (how often the snapshot goes
+unpaid) is now the binding one, since at ≳200k active rows no single leaf's
+saving covers a snapshot and the scheduler correctly sits out.

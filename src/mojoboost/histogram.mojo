@@ -58,6 +58,7 @@ None of that changes a value or an order: each feature still sums its bins
 over rows in ascending order inside a single task.
 """
 
+from std.math import round
 from std.sys.info import simd_width_of
 
 from .apple_cpu_policy import (
@@ -66,7 +67,7 @@ from .apple_cpu_policy import (
     subtract_ops,
 )
 from .binning import BinnedMatrix
-from .parallel import dispatch_feature_ranges, dispatch_rows
+from .parallel import dispatch_feature_ranges, dispatch_features, dispatch_rows
 
 comptime SIMD_LANES = 4 * simd_width_of[DType.float64]()
 
@@ -589,6 +590,190 @@ def _accumulate_subset(
             i += 1
 
     dispatch_feature_ranges(accumulate_range, n_active, plan.active_ops)
+
+
+def build_histogram_subset_replica_into[
+    grad_origin: ImmOrigin, hess_origin: ImmOrigin, //
+](
+    mut out: Histogram,
+    mut fixed: List[Int32],
+    data: BinnedMatrix,
+    grad_f32: Span[Float32, grad_origin],
+    hess_f32: Span[Float32, hess_origin],
+    rows: List[Int32],
+    row_start: Int,
+    row_count: Int,
+    g_scale: Float64,
+    h_scale: Float64,
+    features: List[Int] = [],
+) raises:
+    """The host replica of the device's fixed-point histogram build, over
+    the window `rows[row_start : row_start + row_count]`.
+
+    This is the builder `docs/design/HYBRID_TRAINING.md` §8.2 specifies: it
+    must reproduce the device pipeline number for number, so a histogram it
+    produces can substitute for a downloaded one without changing a split.
+    Per (row, feature) it computes
+
+        gq = Int32(round(grad_f32[r] * Float32(g_scale)))
+
+    exactly as `_range_hist_atomic_kernel` does — the *same* Float32 inputs
+    the kernel reads (the staged conversions, not the Float64 originals) and
+    the same Float32 scale — accumulates in Int32, and dequantizes with the
+    same `Float64(sum) * (1.0 / scale)` as `histogram_from_host`. Integer
+    addition is associative and commutative, so the per-feature tasks and
+    their order cannot change a sum; whether the host's multiply-and-round
+    matches the device's bit for bit is a hardware claim this function
+    cannot make, and `MODE_MIRROR` in hybrid_leaf_scheduler.mojo is how it
+    is established before a replica is allowed to substitute.
+
+    `fixed` is the caller-owned Int32 scratch holding the three planes in
+    the device's `[grad | hess | count]` layout, followed by the node's
+    quantized (g, h) pairs; it is grown to
+    `3 * n_features * n_bins + 2 * row_count` as needed and its contents on
+    entry are irrelevant. Excluded features' output slices are zeroed, as every
+    builder here guarantees, so the result has the full dataset shape.
+    """
+    var n_rows = data.n_rows
+    var n_bins = data.n_bins
+    var n_features = data.n_features
+    if len(grad_f32) != n_rows or len(hess_f32) != n_rows:
+        raise Error("gradient/hessian length must equal n_rows")
+    if not out.matches(n_features, n_bins):
+        raise Error("output histogram shape must match the data")
+    if row_start < 0 or row_count < 0 or row_start + row_count > len(rows):
+        raise Error("row window out of range")
+    if g_scale <= 0.0 or h_scale <= 0.0:
+        raise Error("fixed-point scales must be positive")
+    _check_features(features, n_features)
+    for j in range(row_start, row_start + row_count):
+        var r = Int(rows[j])
+        if r < 0 or r >= n_rows:
+            raise Error("row id out of range")
+
+    var hist_size = n_features * n_bins
+    if len(fixed) < 3 * hist_size + 2 * row_count:
+        fixed.resize(3 * hist_size + 2 * row_count, Int32(0))
+
+    var use_all = len(features) == 0
+    var n_active = n_features if use_all else len(features)
+    _zero_excluded(
+        out.grad, out.hess, out.count,
+        n_features, n_bins, features,
+        (n_features - n_active) * n_bins,
+    )
+
+    # The three output buffers are passed as separate `mut` lists rather than
+    # reached through `out`, exactly as `build_histogram_into` explains: a
+    # pointer taken from a struct field carries that field's origin, which a
+    # worker closure cannot capture.
+    _accumulate_replica(
+        out.grad, out.hess, out.count, fixed,
+        data, grad_f32, hess_f32, rows, row_start, row_count,
+        g_scale, h_scale, features,
+    )
+
+
+def _accumulate_replica[
+    grad_origin: ImmOrigin, hess_origin: ImmOrigin, //
+](
+    mut out_grad: List[Float64],
+    mut out_hess: List[Float64],
+    mut out_count: List[Int],
+    mut fixed: List[Int32],
+    data: BinnedMatrix,
+    grad_f32: Span[Float32, grad_origin],
+    hess_f32: Span[Float32, hess_origin],
+    rows: List[Int32],
+    row_start: Int,
+    row_count: Int,
+    g_scale: Float64,
+    h_scale: Float64,
+    features: List[Int],
+) raises:
+    var n_rows = data.n_rows
+    var n_bins = data.n_bins
+    var n_features = data.n_features
+    var hist_size = n_features * n_bins
+    var use_all = len(features) == 0
+    var n_active = n_features if use_all else len(features)
+
+    var gsf = Float32(g_scale)
+    var hsf = Float32(h_scale)
+    var g_inv = 1.0 / g_scale
+    var h_inv = 1.0 / h_scale
+    var gp = out_grad.unsafe_ptr()
+    var hp = out_hess.unsafe_ptr()
+    var cp = out_count.unsafe_ptr()
+    var fixed_p = fixed.unsafe_ptr()
+    var grad_p = grad_f32.unsafe_ptr()
+    var hess_p = hess_f32.unsafe_ptr()
+    var rows_p = rows.unsafe_ptr().unsafe_offset(row_start)
+    var bins_all_p = data.bins.unsafe_ptr()
+    var feat_p = features.unsafe_ptr()
+
+    # Quantize once per row, not once per (row, feature). The kernel rounds
+    # inside its accumulation loop, but the rounded value is a pure function
+    # of the row, so hoisting it changes no Int32 the sums are made of --
+    # while removing 2 * (n_active - 1) multiply-and-rounds per row, which
+    # measured as the difference between this builder running at the Float64
+    # builder's rate and running twenty times slower. The pairs land in the
+    # tail of the caller's scratch, interleaved like the gather in
+    # `_accumulate_subset`.
+    var pairs_off = 3 * hist_size
+
+    def fill_quantized(start: Int, end: Int) {imm}:
+        for i in range(start, end):
+            var r = Int(rows_p.unsafe_load(i))
+            fixed_p.unsafe_store(
+                pairs_off + 2 * i,
+                Int32(round(grad_p.unsafe_load(r) * gsf)),
+            )
+            fixed_p.unsafe_store(
+                pairs_off + 2 * i + 1,
+                Int32(round(hess_p.unsafe_load(r) * hsf)),
+            )
+
+    dispatch_rows(fill_quantized, row_count, row_count)
+
+    def accumulate_feature(i: Int) {imm}:
+        var f = i if use_all else feat_p.unsafe_load(i)
+        var base = f * n_bins
+        for b in range(n_bins):
+            fixed_p.unsafe_store(base + b, Int32(0))
+            fixed_p.unsafe_store(hist_size + base + b, Int32(0))
+            fixed_p.unsafe_store(2 * hist_size + base + b, Int32(0))
+        var col = bins_all_p.unsafe_offset(f * n_rows)
+        for j in range(row_count):
+            var r = Int(rows_p.unsafe_load(j))
+            var slot = base + Int(col.unsafe_load(r))
+            var gq = fixed_p.unsafe_load(pairs_off + 2 * j)
+            var hq = fixed_p.unsafe_load(pairs_off + 2 * j + 1)
+            fixed_p.unsafe_store(slot, fixed_p.unsafe_load(slot) + gq)
+            fixed_p.unsafe_store(
+                hist_size + slot, fixed_p.unsafe_load(hist_size + slot) + hq
+            )
+            fixed_p.unsafe_store(
+                2 * hist_size + slot,
+                fixed_p.unsafe_load(2 * hist_size + slot) + Int32(1),
+            )
+        for b in range(n_bins):
+            gp.unsafe_store(
+                base + b, Float64(fixed_p.unsafe_load(base + b)) * g_inv
+            )
+            hp.unsafe_store(
+                base + b,
+                Float64(fixed_p.unsafe_load(hist_size + base + b)) * h_inv,
+            )
+            cp.unsafe_store(
+                base + b, Int(fixed_p.unsafe_load(2 * hist_size + base + b))
+            )
+
+    dispatch_features(
+        accumulate_feature,
+        n_active,
+        row_count * n_active + 2 * n_active * n_bins,
+    )
 
 
 def feature_totals(hist: Histogram, feature: Int) raises -> FeatureTotals:

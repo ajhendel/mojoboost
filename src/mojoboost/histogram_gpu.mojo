@@ -115,6 +115,7 @@ shipped. Nothing here defaults to a claim no benchmark has made.
 """
 
 from std.math import isfinite
+from std.memory import unsafe_memcpy
 from std.os import getenv
 from max.gpu.host import DeviceBuffer, DeviceContext, HostBuffer
 
@@ -194,7 +195,12 @@ from .gpu_runtime import (
     MatrixIdentity,
     bins_fingerprint,
 )
-from .histogram import Histogram, _zeroed_f64, _zeroed_int
+from .histogram import (
+    Histogram,
+    _zeroed_f64,
+    _zeroed_int,
+    build_histogram_subset_replica_into,
+)
 
 comptime MAX_BINS = 256
 
@@ -304,6 +310,17 @@ struct GpuHistogramBuilder(Movable):
     var g_scale: Float64
     var h_scale: Float64
     var has_gradients: Bool
+    # Whether this round's gradients came through `stage_gradients`, so the
+    # Float32 conversions the kernels read are still sitting in `stage_g` /
+    # `stage_h` on the host. False on the device-objective paths, where the
+    # gradients never exist host-side; a host replica build
+    # (`build_leaf_host_replica`) is only possible when this is True.
+    var gradients_host: Bool
+    # Whether the host fixed-point replica has been shown to reproduce this
+    # device's histograms bit for bit: 0 untested, 1 verified, 2 refuted.
+    # Set by the grower's mirror comparison (see hybrid_leaf_scheduler.mojo)
+    # and kept on the builder so one fit verifies once, not once per tree.
+    var replica_state: Int
     # The batched multi-leaf launcher, held as a zero-or-one list so a
     # builder that never batches allocates none of its buffers. `List` is
     # what holds a move-only value here; there is no second batcher and no
@@ -498,6 +515,8 @@ struct GpuHistogramBuilder(Movable):
         self.g_scale = 1.0
         self.h_scale = 1.0
         self.has_gradients = False
+        self.gradients_host = False
+        self.replica_state = 0
         self.round_epoch = 0
         self.feat_epoch = 0
         self.batch_feat_stamp = -1
@@ -667,6 +686,7 @@ struct GpuHistogramBuilder(Movable):
         for r in range(self.n_rows):
             dst_g.unsafe_store(r, Float32(src_g.unsafe_load(r)))
             dst_h.unsafe_store(r, Float32(src_h.unsafe_load(r)))
+        self.gradients_host = True
 
     def upload_staged(mut self) raises:
         """Copy the staged gradients and hessians to the device."""
@@ -719,6 +739,7 @@ struct GpuHistogramBuilder(Movable):
         self.g_scale = Float64(device_fixed_scale(sums.grad))
         self.h_scale = Float64(device_fixed_scale(sums.hess))
         self.has_gradients = True
+        self.gradients_host = False
         self.round_epoch += 1
 
     def fill_softmax_gradients_device(
@@ -735,6 +756,7 @@ struct GpuHistogramBuilder(Movable):
         self.g_scale = Float64(device_fixed_scale(sums.grad))
         self.h_scale = Float64(device_fixed_scale(sums.hess))
         self.has_gradients = True
+        self.gradients_host = False
         self.round_epoch += 1
 
     def class_schedule(
@@ -812,6 +834,7 @@ struct GpuHistogramBuilder(Movable):
         self.g_scale = batch.scale_of(slot)
         self.h_scale = batch.hess_scale_of(slot)
         self.has_gradients = True
+        self.gradients_host = False
         self.round_epoch += 1
 
     def update_raw_device(
@@ -1035,6 +1058,88 @@ struct GpuHistogramBuilder(Movable):
         self.enqueue_leaf(leaf)
         self.download_raw()
         return self.histogram_from_host()
+
+    def build_leaf_host_replica(
+        self,
+        mut out: Histogram,
+        mut fixed_scratch: List[Int32],
+        data: BinnedMatrix,
+        rows: List[Int32],
+        row_start: Int,
+        row_count: Int,
+    ) raises:
+        """The host build of one node's histogram through the device's exact
+        fixed-point pipeline: this round's staged Float32 gradients, this
+        round's scales, Int32 accumulation, the same dequantization. Same
+        output contract as `build_leaf` — full dataset shape, the active
+        feature set accumulated, inactive slices zero.
+
+        `rows[row_start : row_start + row_count]` must be the node's rows in
+        the device's compacted order (a host mirror of the permutation, or a
+        `download_rows` snapshot; see docs/design/HYBRID_TRAINING.md §3).
+        Only legal while the staged gradients are this round's host uploads:
+        on the device-objective paths (`gradients_host` False) the Float32
+        values the kernels read never existed host-side, and this raises
+        rather than accumulating a stale round.
+
+        Whether the result is bit-identical to `build_leaf`'s is a claim
+        about this device's multiply-and-round, established by the grower's
+        mirror comparison and recorded in `replica_state`, never assumed.
+        """
+        if not self.has_gradients or not self.gradients_host:
+            raise Error(
+                "host replica build needs this round's host-staged gradients"
+            )
+        if (
+            data.n_rows != self.n_rows
+            or data.n_features != self.n_features
+            or data.n_bins != self.n_bins
+        ):
+            raise Error("binned matrix does not match this builder")
+        var grad_span = Span(
+            unsafe_ptr=self.stage_g.unsafe_ptr(), length=self.n_rows
+        )
+        var hess_span = Span(
+            unsafe_ptr=self.stage_h.unsafe_ptr(), length=self.n_rows
+        )
+        build_histogram_subset_replica_into(
+            out,
+            fixed_scratch,
+            data,
+            grad_span,
+            hess_span,
+            rows,
+            row_start,
+            row_count,
+            self.g_scale,
+            self.h_scale,
+            self.active,
+        )
+
+    def snapshot_rows(mut self, mut out: List[Int32]) raises:
+        """The whole active-row permutation into `out`, resized to `n_rows`.
+
+        The hybrid grower's once-per-tree snapshot
+        (docs/design/HYBRID_TRAINING.md §3): one whole-buffer copy through
+        the row machinery's pinned staging buffer, one synchronize, one
+        memcpy into the caller's list. `GpuActiveRows.download_rows` answers
+        the same question but builds its result a row at a time, which
+        measured at an order of magnitude over the copy itself -- fine for
+        the tests it serves, and the wrong price for a cost the scheduler
+        charges to a single leaf.
+        """
+        self.ctx.enqueue_copy(
+            dst_ptr=self.rows.host_rows.unsafe_ptr(),
+            src_buf=self.rows.rows_dev,
+        )
+        self.ctx.synchronize()
+        if len(out) != self.n_rows:
+            out.resize(self.n_rows, Int32(0))
+        unsafe_memcpy(
+            dest=out.unsafe_ptr(),
+            src=self.rows.host_rows.unsafe_ptr(),
+            count=self.n_rows,
+        )
 
     # -- batched multi-leaf construction ----------------------------------
 

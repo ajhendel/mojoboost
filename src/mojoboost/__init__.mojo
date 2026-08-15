@@ -25,6 +25,7 @@ from .histogram import (
     Histogram,
     build_histogram,
     build_histogram_subset,
+    build_histogram_subset_replica_into,
     subtract_histogram,
 )
 from .goss import (
@@ -249,12 +250,20 @@ from .gpu_leaf_batching import (
 )
 from .gpu_multiclass_batch import MulticlassRoundGuard
 from .hybrid_leaf_scheduler import (
+    REPLICA_REFUTED,
+    REPLICA_UNTESTED,
+    REPLICA_VERIFIED,
     HybridContext,
+    HybridCosts,
     LeafWork,
     Placement,
+    SplitPlan,
     decline_name,
     decline_reason,
+    env_hybrid_costs,
+    env_hybrid_mode,
     place_leaf,
+    plan_split,
 )
 from .initialization import (
     FitLatency,

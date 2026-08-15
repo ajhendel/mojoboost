@@ -255,6 +255,36 @@ def env_hybrid_mode() -> Int:
     return MODE_OFF
 
 
+def env_hybrid_costs() raises -> HybridCosts:
+    """The cost model `MOJOBOOST_HYBRID_COSTS` selects: `apple-m4` for the
+    calibrated Apple M4 coefficients, anything else (the default included)
+    for the unmeasured model that declines every leaf.
+
+    A separate switch from `MOJOBOOST_HYBRID_LEAVES` on purpose: the mode
+    says what a host build would be allowed to do, the costs say whether one
+    is worth running, and a run that sets the mode without the costs gets
+    the observable `DECLINE_COSTS_UNMEASURED` rather than a placement made
+    from another machine's numbers."""
+    var s = getenv("MOJOBOOST_HYBRID_COSTS")
+    if s == "apple-m4":
+        return HybridCosts.apple_m4()
+    return HybridCosts.unmeasured()
+
+
+# --- The replica claim, as builder state ----------------------------------
+#
+# `GpuHistogramBuilder.replica_state` records whether the host fixed-point
+# replica has been shown to reproduce that device's histograms bit for bit.
+# The grower's mirror comparison sets it; `MODE_REPLICA` substitutes only at
+# `REPLICA_VERIFIED`, and `REPLICA_REFUTED` retires hybrid scheduling for
+# the rest of the fit. Held on the builder rather than here so one fit
+# verifies once, and so a placement stays a pure function of its arguments.
+
+comptime REPLICA_UNTESTED = 0
+comptime REPLICA_VERIFIED = 1
+comptime REPLICA_REFUTED = 2
+
+
 # --- Placement and refusals -----------------------------------------------
 
 comptime PLACE_GPU = 0
@@ -525,14 +555,39 @@ struct HybridCosts(Copyable, Movable):
 
     @staticmethod
     def unmeasured() -> HybridCosts:
-        """The only cost model this repository can construct today.
+        """The cost model for a machine nobody has calibrated.
 
         Every coefficient is zero and `measured` is False, so no comparison
-        is attempted and every leaf stays on the device. Replacing this with
-        real coefficients is a deliberate edit that must cite a benchmark;
-        see `docs/design/HYBRID_TRAINING.md`.
+        is attempted and every leaf stays on the device. The only measured
+        alternative is `apple_m4` below, and adding another must cite a
+        benchmark the same way; see `docs/design/HYBRID_TRAINING.md`.
         """
         return HybridCosts()
+
+    @staticmethod
+    def apple_m4() raises -> HybridCosts:
+        """Experiment E1 of docs/design/HYBRID_TRAINING.md §9, run on an
+        Apple M4: `pixi run bench-hybrid-costs` at 500k rows x 50 features
+        x 255 bins, minimum over five interleaved trials, 2026-08-14. Full
+        output in the evidence file.
+
+        Selected only by an explicit `MOJOBOOST_HYBRID_COSTS=apple-m4`
+        (see `env_hybrid_costs`), never inferred from the hardware: on any
+        other machine these numbers are a guess, and a guessed cost model
+        can misplace work even though it can never change a tree.
+        """
+        return HybridCosts(
+            59153,  # launch_nanos
+            20320,  # sync_nanos
+            321,  # transfer_nanos_per_kib
+            107,  # device_nanos_per_krow_slot
+            1343,  # host_nanos_per_krow_slot
+            15485,  # host_partition_nanos_per_krow
+            13,  # host_zero_nanos_per_kcell
+            10122,  # convert_nanos_per_kcell
+            String("bench/results/apple_m4_hybrid_costs_2026-08-14.md"),
+            String("Apple M4, macOS, 500k x 50 x 255"),
+        )
 
     def cite(self) -> String:
         if not self.measured:
@@ -1338,8 +1393,8 @@ def plan_split(
         other_node,
         other_rows,
         direct_is_left,
-        direct,
-        sibling,
+        direct^,
+        sibling^,
     )
 
 
