@@ -479,3 +479,61 @@ and drop the two aliases). Not done: the "imports unused" rows the lanes
 left behind (each lane's own file), and `validation.MAX_ROWS` (a different
 ceiling, `1 << 44`, not flagged, but the same name; a rename to
 `MAX_INPUT_ROWS` is a one-file edit for whoever next touches validation).
+
+### Integration round close-out (2026-08-15, C0)
+
+Nine lanes (W1 dart/rf, W2 linear trees, W3 model editing + advanced
+ranking, W5 ingestion, W6 distributed strategies, W7 validation, W8 binding
+readers, D1 duplicates + remaining readers, D2 follow-ups), plus cegb from a
+peer session (0ef2115). All on origin/main; top of round 6b8dca9.
+
+| Audit | pre-round e3d2de6 | after consolidation | after integration |
+|---|---|---|---|
+| findings | 292 | 136 | 45 |
+| native orphans | 21 | 18 | 6 |
+| python modules unreached | 8 | 8 | 4 |
+| binding exports uncalled | 59 | 22 | 0 |
+| duplicate public names | 119 | 28 | 6 |
+
+Reachable now from the estimators or `Booster` / `Dataset`: `boosting_type`
+dart and rf (binary and multiclass), `cegb_*`, `linear_tree` /
+`linear_lambda` (v5 file section), `rollback_one_iter` / `rollback_to` /
+`get_leaf_output` / `set_leaf_output` / `shuffle_models` / `refit` /
+`lower_bound` / `upper_bound`, `label_gain` / position bias / pair sampling
+/ `fit(position=)`, Arrow / polars / `lgb.Sequence` / batch inputs through
+a chunk binding, `tree_learner` feature and voting over a local collective,
+`Dataset.get_field` / `feature_num_bin` / bin edges, `Booster.model_to_json`
+/ `file_kind`, `Booster.eval(device="gpu")`, native pre-flight checks and
+the compiled objective and metric registries (Python mirrors deleted), the
+validation layer under every trainer, dataset build, and estimator fit.
+`pixi run check-parity`, `tools/api_snapshot.py --check`,
+`tools/audit_integration.py` all green; the new tests are in the `test` and
+`test-cpu` pixi suites.
+
+What remains, and why:
+
+- Six native orphans: `gpu_categorical` -> `gpu_sparse` ->
+  `gpu_sparse_layout` need `train_gpu.mojo` / `histogram_gpu.mojo`, which
+  another session held dirty (and non-parsing) for the whole round;
+  `lgbm_model_io` waits on that session's untracked
+  `python/mojotrees/lgbm_model_io.py`; `gpu_vendor_policy` has no CUDA/HIP
+  device to be consulted by; `backend` is the CPU/GPU equivalence
+  reference by design.
+- Six duplicate names, every one with a definition in the same held files:
+  `MAX_BINS` / `MAX_ROWS` / `describe_decision` in `histogram_gpu.mojo`,
+  `METRIC_L1` / `L2` aliases in `gpu_predict` until `train_gpu.mojo`
+  imports `DEVICE_METRIC_*`, `partition_rows` (tree vs distributed; rename
+  tree's to `partition_split_rows`, its caller is
+  `tests/parallel/test_gpu_active_rows.mojo`, held).
+- The same session gates: GPU categoricals, class-batched multiclass by
+  default, hybrid leaves reach, distributed GPU device path, `MAX_ROWS`
+  single site, `gpu_frontier` speculation trim, the `_mojotrees.mojo`
+  `_f64_list` / `_int_list` / `_csc` / `_csr` helpers vs
+  `binding_support`. Each is a short edit once `git status` is clean.
+- 22 "imports unused" rows are mechanical (some are re-export files such
+  as `device.mojo`); not touched this round.
+- No LightGBM numeric differential ran for the newly reached features; the
+  parity rows say so. `docs/LIGHTGBM_PARITY.md` rows for dart/rf, cegb,
+  linear_tree, tree_learner, advanced ranking, and ingestion were not
+  rewritten (D2 stopped at the spend limit before them); check-parity
+  passes because it only enforces rows whose symbols it tracks.
