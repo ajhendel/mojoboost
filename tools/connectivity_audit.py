@@ -270,27 +270,6 @@ CLASSIFICATION = {
         "connect_04",
         "Reached only from hybrid_leaf_scheduler, itself unreachable.",
     ),
-    "gpu_categorical": (
-        PENDING,
-        "connect_10",
-        "GPU category statistics; the GPU trainer refuses categoricals.",
-    ),
-    "gpu_sparse": (
-        PENDING,
-        "connect_10",
-        "Reached only from gpu_categorical, itself unreachable.",
-    ),
-    "gpu_sparse_layout": (
-        PENDING,
-        "connect_10",
-        "Reached only from gpu_sparse, itself unreachable.",
-    ),
-    "lgbm_model_io": (
-        PENDING,
-        "connect_16",
-        "LightGBM text model reader/writer; no entry point offers it. "
-        "Reached from its own test only.",
-    ),
     "backend": (
         EXPERIMENTAL,
         "connect_01",
@@ -329,7 +308,105 @@ CLASSIFICATION = {
         "until an export plus external_memory validation connects it "
         "(handoffs/connect_21_native_interfaces.md).",
     ),
+    "cegb": (
+        PENDING,
+        "consolidation_K10",
+        "LightGBM cegb_* controls, complete and self-contained. Parked until "
+        "a trainer accepts the cegb params and the boosting loop hooks it.",
+    ),
+    "linear_tree": (
+        PENDING,
+        "consolidation_K10",
+        "linear_tree=true ensembles. Parked until Booster holds a "
+        "LinearEnsemble and model I/O carries it; codes come from "
+        "objective_registry.",
+    ),
+    "model_editing": (
+        PENDING,
+        "consolidation_K10",
+        "In-place leaf editing. Its MODEL_EDITING_SUPPORTED=True is the "
+        "feature's claim; inspection.mojo's False is what ships. Parked "
+        "until connected, when inspection re-exports this module's status.",
+    ),
+    "ranking_advanced": (
+        PENDING,
+        "consolidation_K10",
+        "Position bias, pair sampling, custom label gain, fold shuffle. "
+        "Parked until fit_ranker grows those parameters.",
+    ),
+    "validation": (
+        PENDING,
+        "remaining_12",
+        "Central validation layer named by python _validation.py's manifest. "
+        "Parked until the manifest lane routes trainers through it.",
+    ),
+    "lgbm_model_io": (
+        EXPERIMENTAL,
+        "consolidation_K10",
+        "LightGBM text model interop, quarantined by its own "
+        "LGBM_INTEROP_STATUS and reached only from its test. Parked until a "
+        "binding exists and the status flips.",
+    ),
+    "gpu_categorical": (
+        PENDING,
+        "consolidation_K10",
+        "GPU category statistics; the GPU trainer refuses categoricals. "
+        "Parked until train_gpu accepts categorical specs.",
+    ),
+    "gpu_sparse": (
+        PENDING,
+        "consolidation_K10",
+        "Reached only from gpu_categorical; same unblocker.",
+    ),
+    "gpu_sparse_layout": (
+        PENDING,
+        "consolidation_K10",
+        "Reached only from gpu_sparse; same unblocker.",
+    ),
+    "external_memory": (
+        PENDING,
+        "consolidation_K10",
+        "Streaming Dataset construction over sequence.mojo. Parked with "
+        "sequence until an export and a chunk binding connect them together.",
+    ),
+    "gpu_vendor_policy": (
+        EXPERIMENTAL,
+        "consolidation_K2",
+        "CUDA and HIP occupancy policy, merged from the gpu_cuda_policy / "
+        "gpu_amd_policy twins (f23bd1b). Reached only from its test until a "
+        "discrete-GPU trainer consults it; that is the same status the twins "
+        "had. handoffs/migration_20_device_policy.md.",
+    ),
     # -- Python modules ----------------------------------------------------
+    "mojotrees.dask": (
+        EXPERIMENTAL,
+        "consolidation_K7",
+        "Intentional PEP 562 lazy submodule (_LAZY_SUBMODULES): importing "
+        "the package must not import dask, and it exports nothing at top "
+        "level by decision (_public_api_plan.NOT_EXPORTED).",
+    ),
+    "mojotrees._dask_runtime": (
+        EXPERIMENTAL,
+        "consolidation_K7",
+        "Backend contract reached only from dask.py inside functions, by "
+        "design.",
+    ),
+    "mojotrees._arrow": (
+        PENDING,
+        "consolidation_K4",
+        "Reached only from the parked _sequence.py; connects with it.",
+    ),
+    "mojotrees._polars": (
+        PENDING,
+        "consolidation_K4",
+        "Reached only from the parked _sequence.py; connects with it.",
+    ),
+    "mojotrees._validation": (
+        PENDING,
+        "connect_07",
+        "Structure checks nothing in the package imports; _arrays.check_X "
+        "may absorb them. connect_07's call.",
+    ),
     "mojotrees._sequence": (
         PENDING,
         "consolidation_K4",
