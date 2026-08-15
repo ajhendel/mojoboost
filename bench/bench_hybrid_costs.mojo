@@ -161,6 +161,31 @@ def main() raises:
         builder.build_leaf_host_replica(
             host_hist, fixed, data, host_rows, 0, n_rows
         )
+        # A scattered leaf: every 128th row, so with the feature-major bin
+        # layout (`bin_at` reads `bins[feature * n_rows + row]`) each of its
+        # bin reads lands on a fresh cache line. This is what a small leaf
+        # of a large dataset looks like to the host, and it is not the rate
+        # the contiguous root measures.
+        # Several gaps, because the rate keeps rising past one line per
+        # read (prefetch and TLB reach stop helping); the model takes the
+        # widest gap's rate as its scattered endpoint.
+        var gaps: List[Int] = [64, 512, 4096]
+        var scat_lists = List[List[Int32]]()
+        for gi in range(len(gaps)):
+            var gap = gaps[gi]
+            var scat_rows = n_rows // gap
+            var scat = List[Int32](capacity=scat_rows)
+            for j in range(scat_rows):
+                scat.append(Int32(j * gap))
+            builder.build_leaf_host_replica(
+                host_hist, fixed, data, scat, 0, scat_rows
+            )
+            scat_lists.append(scat^)
+        # And a one-row build, which is the fixed price of a host build:
+        # the zeroing pass, the quantization dispatch, the per-feature task
+        # fan-out and its dequantization, before any row is accumulated.
+        var one_row: List[Int32] = [Int32(0)]
+        builder.build_leaf_host_replica(host_hist, fixed, data, one_row, 0, 1)
 
         var sync_ns = List[Float64]()
         var launch_ns = List[Float64]()
@@ -168,6 +193,10 @@ def main() raises:
         var convert_ns = List[Float64]()
         var device_build_ns = List[Float64]()
         var host_build_ns = List[Float64]()
+        var host_scatter_ns = List[List[Float64]]()
+        for _ in range(len(gaps)):
+            host_scatter_ns.append(List[Float64]())
+        var host_one_ns = List[Float64]()
         var host_f64_ns = List[Float64]()
         var zero_ns = List[Float64]()
         var partition_ns = List[Float64]()
@@ -216,6 +245,26 @@ def main() raises:
                 )
             host_build_ns.append(Float64(perf_counter_ns() - t0) / 5.0)
 
+            # The host replica over each scattered leaf.
+            for gi in range(len(gaps)):
+                var n_scat = len(scat_lists[gi])
+                t0 = perf_counter_ns()
+                for _ in range(5):
+                    builder.build_leaf_host_replica(
+                        host_hist, fixed, data, scat_lists[gi], 0, n_scat
+                    )
+                host_scatter_ns[gi].append(
+                    Float64(perf_counter_ns() - t0) / 5.0
+                )
+
+            # The one-row host build.
+            t0 = perf_counter_ns()
+            for _ in range(REPS):
+                builder.build_leaf_host_replica(
+                    host_hist, fixed, data, one_row, 0, 1
+                )
+            host_one_ns.append(Float64(perf_counter_ns() - t0) / Float64(REPS))
+
             # The Float64 host builder on the same node, as a reference: if
             # the replica is far slower than this, the replica loop and not
             # the host is what needs work.
@@ -249,6 +298,7 @@ def main() raises:
         var convert = _min_of(convert_ns)
         var device_total = _min_of(device_build_ns)
         var host_total = _min_of(host_build_ns)
+        var host_one = _min_of(host_one_ns)
         var zero = _min_of(zero_ns)
         var partition = _min_of(partition_ns)
 
@@ -267,7 +317,10 @@ def main() raises:
             - sync
             - convert
         )
-        var host_accum = host_total - zero
+        # Everything a host build pays before its rows: the one-row build
+        # less the (negligible) work of that row.
+        var host_fixed = host_one - zero
+        var host_accum = host_total - zero - host_fixed
 
         print("")
         print("raw minima (nanoseconds):")
@@ -277,6 +330,17 @@ def main() raises:
         print("  convert            ", Int(convert))
         print("  device build_leaf  ", Int(device_total))
         print("  host replica build ", Int(host_total))
+        for gi in range(len(gaps)):
+            print(
+                "  host replica build, scattered leaf",
+                Int(_min_of(host_scatter_ns[gi])),
+                "(",
+                len(scat_lists[gi]),
+                "rows, gap",
+                gaps[gi],
+                ")",
+            )
+        print("  host replica build, one row", Int(host_one))
         print("  host float64 build ", Int(host_f64))
         print("  host zero pass     ", Int(zero))
         print("  host partition     ", Int(partition))
@@ -293,6 +357,18 @@ def main() raises:
             "  host_nanos_per_krow_slot    =",
             _per_unit(host_accum, krow_slots),
         )
+        print("  host_fixed_nanos            =", Int(host_fixed))
+        var scatter_max = 0
+        for gi in range(len(gaps)):
+            var n_scat = len(scat_lists[gi])
+            var accum = _min_of(host_scatter_ns[gi]) - zero - host_fixed
+            var rate = _per_unit(accum, Float64(n_scat * n_features) / 1000.0)
+            if rate > scatter_max:
+                scatter_max = rate
+            print(
+                "  host rate at row gap", gaps[gi], "=", rate,
+            )
+        print("  host_scatter_nanos_per_krow_slot =", scatter_max, "(max over gaps)")
         print(
             "  host_partition_nanos_per_krow =", _per_unit(partition, krows)
         )

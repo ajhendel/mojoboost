@@ -114,10 +114,21 @@ Two invariants follow, and both are checkable:
 
 ### Where a host build gets its rows
 
-The obvious mechanism is not available, and this is the design's sharpest
-constraint.
+> **Superseded (2026-08-15).** The premise of this subsection was wrong:
+> `DeviceBuffer.create_sub_buffer(offset, size)` views a window of the row
+> buffer, and `enqueue_copy` from that view moves exactly `4 * node_rows`
+> bytes with no allocation and no kernel. `GpuHistogramBuilder.readback_range`
+> is that call, and the shipped grower plans every leaf as
+> `ROWS_DEVICE_COPY`: each elected leaf pays only for its own rows, nothing
+> is amortized, and the election no longer depends on the dataset's size.
+> The snapshot machinery below is kept in the vocabulary and the cost model
+> (`snapshot_nanos`, `ROWS_HOST_SNAPSHOT`, `partition_range_host`) but the
+> GPU grower does not use it. See §10.
 
-**A per-range readback is not expressible.** `DeviceContext.enqueue_copy`
+The obvious mechanism was believed not to be available, and this was the
+design's sharpest constraint.
+
+**A per-range readback is not expressible** (wrong, see above). `DeviceContext.enqueue_copy`
 copies the whole source buffer — confirmed by `download_grad_hess` in
 `gpu_objectives_native.mojo`, which copies an `n_rows` buffer into an
 `n_rows * n_classes` host buffer and gets `n_rows` elements. So
@@ -354,24 +365,26 @@ touch and what it needs.
 
 ### 8.1 `gpu_active_rows.mojo` — nothing required
 
-`download_rows` as it exists today is the snapshot. The integration calls it
-once per tree, at the first leaf that can pay for it, and maintains the result
-with `partition_range_host`, which also already exists and is already the
-tested reference model for the device partition.
+`download_rows` as it exists today is the snapshot. The integration was to
+call it once per tree, at the first leaf that can pay for it, and maintain the
+result with `partition_range_host`, which also already exists and is already
+the tested reference model for the device partition.
 
-An optional optimization, not a dependency: a genuine per-range readback would
-let a single elected leaf skip the whole-buffer cost. It is not expressible
-against today's `enqueue_copy` (§3), so it would need one of
+A genuine per-range readback lets a single elected leaf skip the whole-buffer
+cost. Three ways were listed:
 
 1. a `node_rows`-sized `DeviceBuffer` allocated per call, then a compaction
-   kernel in the shape of the existing `_copy_back_kernel` — portable, needs
-   no new API, costs an allocation per elected leaf (poolable by rounding the
-   size up to a power of two);
+   kernel in the shape of the existing `_copy_back_kernel`;
 2. `enqueue_copy` gaining an element-count or offset parameter; or
 3. a `create_sub_buffer`-style view on `DeviceBuffer`.
 
-Option 1 is the only one available without upstream changes, and it is worth
-doing only if E6 shows the per-tree snapshot is what limits the design.
+**Option 3 already exists** (`DeviceBuffer.create_sub_buffer[dtype](offset,
+size)`), and it is what shipped: `GpuHistogramBuilder.readback_range(begin,
+count, out)` in `histogram_gpu.mojo`. No allocation, no kernel, one copy of
+`4 * count` bytes and one synchronize. With it the snapshot, the mirror, and
+`DECLINE_SNAPSHOT_NOT_PAID` are all unnecessary in the GPU grower, and the
+per-leaf transfer term (`host_transfer_nanos` under `ROWS_DEVICE_COPY`) is the
+one the scheduler actually charges.
 
 ### 8.2 `histogram.mojo` — the fixed-point replica builder
 
@@ -510,10 +523,20 @@ Wired, default off, and off unless *two* switches opt in.
 
 - **E1 ran** (`pixi run bench-hybrid-costs`, `bench/bench_hybrid_costs.mojo`),
   and `HybridCosts.apple_m4()` cites its output
-  (`bench/results/apple_m4_hybrid_costs_2026-08-14.md`). The costs are
-  selected only by an explicit `MOJOTREES_HYBRID_COSTS=apple-m4`, never
-  inferred from the hardware; without it every leaf still declines with
+  (`bench/results/apple_m4_hybrid_costs_2026-08-15.md`; the 2026-08-14 run
+  is kept, but it lacked the scattered-leaf rate below and coefficients
+  from two time windows are not mixed). The costs are selected only by an
+  explicit `MOJOTREES_HYBRID_COSTS=apple-m4`, never inferred from the
+  hardware; without it every leaf still declines with
   `DECLINE_COSTS_UNMEASURED`.
+- **The host rate depends on row density.** Bins are feature-major, so a
+  small leaf of a large dataset reads one cache line per bin — measured
+  ~3x the contiguous root's per-slot rate (`host_scatter_nanos_per_krow_slot`
+  vs `host_nanos_per_krow_slot`). Priced with the contiguous rate alone the
+  scheduler elected leaves at 500k–1M rows that lost; `host_slot_nanos_per_k`
+  now interpolates by the node's mean row gap (`LeafWork.dataset_rows`,
+  carried for exactly this), which is what keeps the never-slower guarantee
+  at large row counts.
 - **The §8.2 replica builder exists**
   (`histogram.build_histogram_subset_replica_into`, reached through
   `GpuHistogramBuilder.build_leaf_host_replica`), with the quantization
@@ -526,23 +549,28 @@ Wired, default off, and off unless *two* switches opt in.
   pure-device path continues. `tests/parallel/test_hybrid_replica.mojo`
   makes the same comparison over adversarial gradients and holds a hybrid
   fit bit-identical to the pure-device fit.
-- **The §8.3 integration deviates in one measured place.** Step 4's
-  maintained snapshot (mirror every later split with
+- **The §8.3 integration uses the per-range readback, not the snapshot.**
+  Step 4's maintained snapshot (mirror every later split with
   `partition_range_host`) prices at `host_partition_nanos_per_krow` =
   15,485 on the calibration machine — tens of milliseconds per tree at
-  500k rows, more than the builds it enables. So `grow_tree_gpu` retakes a
-  fresh whole-permutation snapshot per host-elected split
-  (`GpuHistogramBuilder.snapshot_rows`) and maintains nothing, the
-  alternative §9 E6 names. The context never sets `snapshot_taken`, so
-  every accepted leaf must pay for a full snapshot out of its own saving —
-  strictly more conservative than the amortized design, and it keeps the
-  guarantee that a host placement can never make a tree slower than the
-  pure-device path.
+  500k rows, more than the builds it enables — and the first shipped
+  integration retook a whole-permutation snapshot per elected leaf instead,
+  which meant no leaf could pay above ≈200k active rows. Both are moot:
+  §8.1's option 3 exists (`DeviceBuffer.create_sub_buffer`), so
+  `grow_tree_gpu` plans every leaf as `ROWS_DEVICE_COPY` and
+  `GpuHistogramBuilder.readback_range` moves exactly that leaf's window
+  before the host replica runs. Each leaf is charged its own transfer and
+  nothing is amortized, so a host placement can never make a tree slower
+  than the pure-device path, and the election depends only on the leaf's
+  size, not the dataset's. `guard_transfer_dominates` is off in the grower
+  (`MOJOTREES_HYBRID_GUARD_TRANSFER=1` restores it), because under a
+  per-range readback the "transfer" is the fixed synchronize the device
+  path also pays; measurements in
+  `bench/results/apple_m4_hybrid_costs_2026-08-14.md`.
 - **`MODE_HOST_FLOAT64` stays unwired** in the grower, exactly because §7
   allows it no per-node fallback: it is a different algorithm, and nothing
   in the trainer should reach one through an environment variable that
   looks like an optimization switch.
 
-E3 through E6 remain open; E6's first question (how often the snapshot goes
-unpaid) is now the binding one, since at ≳200k active rows no single leaf's
-saving covers a snapshot and the scheduler correctly sits out.
+E3 through E5 remain open. E6 is answered by construction: there is no
+snapshot to go unpaid.

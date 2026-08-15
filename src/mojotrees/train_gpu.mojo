@@ -161,6 +161,7 @@ from .hybrid_leaf_scheduler import (
     REPLICA_REFUTED,
     REPLICA_UNTESTED,
     REPLICA_VERIFIED,
+    ROWS_DEVICE_COPY,
     HybridContext,
     HybridCosts,
     env_hybrid_costs,
@@ -1405,28 +1406,54 @@ def grow_tree_gpu(
     # bit-identical to the one the pure-device grower grows. `float64`
     # changes the fit and is deliberately not wired here.
     #
-    # Rows for a host build come from a fresh whole-permutation snapshot
-    # taken per host-elected split (`snapshot_rows`), never from a
-    # maintained mirror: at the measured `host_partition_nanos_per_krow`,
-    # mirroring every split's partition (HYBRID_TRAINING.md §8.3 step 4)
-    # costs more per tree than the builds it enables, which is the outcome
-    # §9 E6 anticipated and answers with exactly this retake. The context
-    # below therefore never sets `snapshot_taken`, so every accepted leaf
-    # must pay for a full snapshot out of its own saving
-    # (DECLINE_SNAPSHOT_NOT_PAID) — conservative by construction: a host
-    # placement can never make a tree slower than the pure-device path.
+    # Rows for a host build are read back per node
+    # (`builder.readback_range`, a sub-buffer view of exactly the node's
+    # window: `4 * node_rows` bytes and one synchronize), never from a
+    # maintained mirror and never from a whole-permutation snapshot. The
+    # design (HYBRID_TRAINING.md §3, §8.1) assumed a per-range readback was
+    # not expressible and built the snapshot around that; it is, so every
+    # leaf is planned as `ROWS_DEVICE_COPY` and charged only its own
+    # transfer. Nothing is amortized across leaves, so a host placement can
+    # never make a tree slower than the pure-device path, and the election
+    # no longer depends on the dataset's size at all — only on the leaf's.
+    #
+    # `guard_transfer_dominates` is off here: under a per-range readback the
+    # "transfer" is the fixed synchronize plus a few bytes, and the device
+    # path pays that same synchronize on its histogram download, so the
+    # guard would only refuse the small leaves the comparison exists to
+    # move (measured either way in
+    # bench/results/apple_m4_hybrid_costs_2026-08-15.md; predictions are
+    # identical either way, only the time differs).
     var hy_mode = env_hybrid_mode()
     var hy_costs = HybridCosts.unmeasured()
     var hybrid_live = False
     if hy_mode == MODE_MIRROR or hy_mode == MODE_REPLICA:
         hy_costs = env_hybrid_costs()
-        hybrid_live = (
-            hy_costs.measured
-            and builder.gradients_host
-            and builder.replica_state != REPLICA_REFUTED
-            and data.n_rows == builder.n_rows
+        var hy_shape_ok = (
+            data.n_rows == builder.n_rows
             and data.n_features == builder.n_features
             and data.n_bins == builder.n_bins
+        )
+        if (
+            hy_costs.measured
+            and hy_shape_ok
+            and builder.replica_state != REPLICA_REFUTED
+            and builder.has_gradients
+            and not builder.gradients_host
+        ):
+            # Device-produced gradients (the unbagged built-in objectives,
+            # the native softmax paths): read the exact Float32 the kernels
+            # use back into the staging buffers once per tree, so the host
+            # replica has the same inputs it has on the upload path. That
+            # is `2 * 4 * n_rows` bytes and one synchronize per tree, the
+            # only price this path pays for host builds; a `replica` run
+            # that never elects a leaf is slower by exactly that.
+            builder.stage_from_device()
+        hybrid_live = (
+            hy_costs.measured
+            and hy_shape_ok
+            and builder.gradients_host
+            and builder.replica_state != REPLICA_REFUTED
         )
     var hy_rows = List[Int32]()
     var hy_fixed = List[Int32]()
@@ -1437,6 +1464,7 @@ def grow_tree_gpu(
     var hy_mirror_matches = 0
     var hy_mirror_mismatches = 0
     var hybrid_trace = getenv("MOJOTREES_HYBRID_TRACE") == "1"
+    var hy_guard_transfer = getenv("MOJOTREES_HYBRID_GUARD_TRANSFER") == "1"
 
     var root = tree._add_node(0.0, Float64(n_root))
     var hist_t0 = perf_counter_ns()
@@ -1573,9 +1601,9 @@ def grow_tree_gpu(
                 True,  # gradients are host-staged (gated at tree start)
                 True,  # the caller's binned matrix is in hand
                 verified,
-                True,
+                hy_guard_transfer,
                 n_root,
-                False,  # no maintained snapshot: every leaf pays for one
+                False,  # no snapshot exists or is ever taken
                 hy_costs.copy(),
             )
             # `plan_split`'s direct child is `n_left <= n_right`, the same
@@ -1591,24 +1619,28 @@ def grow_tree_gpu(
                 builder.n_features,
                 builder.n_bins,
                 builder.n_rows,
+                left_row_source=ROWS_DEVICE_COPY,
+                right_row_source=ROWS_DEVICE_COPY,
                 gpu_launches=builder.histogram_plan(
                     min(n_left, n_right)
                 ).tiling().launches(),
                 parent_materialized=True,
             )
             if hy_plan.placement.builds_on_host():
-                # Fresh snapshot: the partition just enqueued is drained by
-                # the copy's synchronize, so the children's ranges index it
-                # exactly.
-                builder.snapshot_rows(hy_rows)
+                # Per-range readback: the partition just enqueued is drained
+                # by the copy's synchronize, so the child's range indexes the
+                # device permutation exactly and only its window moves.
                 var hy_win = builder.range_of(hy_plan.direct_node)
                 if hy_win.count() == hy_plan.direct_rows:
+                    builder.readback_range(
+                        hy_win.begin, hy_win.count(), hy_rows
+                    )
                     builder.build_leaf_host_replica(
                         hy_hist,
                         hy_fixed,
                         data,
                         hy_rows,
-                        hy_win.begin,
+                        0,
                         hy_win.count(),
                     )
                     hy_host_builds += 1
@@ -1948,7 +1980,7 @@ def _train_gpu_rounds[
                 builder.fill_gradients_device(state, objective, alpha)
                 life.begin_tree()
                 var tree = grow_tree_gpu(
-                    builder, params.tree, dev_bag, i, split_search
+                    builder, params.tree, dev_bag, i, split_search, data=data
                 )
                 life.end_tree()
                 if renews:
@@ -2367,6 +2399,7 @@ def _train_multiclass_gpu_batched[
     mut builder: GpuHistogramBuilder,
     mut life: S,
     mut state: GpuObjectiveState,
+    data: BinnedMatrix,
     n_classes: Int,
     params: BoosterParams,
     var base_scores: List[Float64],
@@ -2445,6 +2478,7 @@ def _train_multiclass_gpu_batched[
                         [],
                         i * n_classes + k,
                         split_search,
+                        data=data,
                     )
                     life.end_tree()
                     guard.note_tree(k)
@@ -2545,6 +2579,7 @@ def _train_multiclass_gpu_rounds[
                     builder,
                     life,
                     state,
+                    data,
                     n_classes,
                     params,
                     base_scores^,
@@ -2569,6 +2604,7 @@ def _train_multiclass_gpu_rounds[
                         [],
                         i * n_classes + k,
                         split_search,
+                        data=data,
                     )
                     life.end_tree()
                     guard.note_tree(k)

@@ -1058,6 +1058,136 @@ def test_paired_feature_group_tiled_builds_the_identical_histogram() raises:
         rows.set_feature_group(1)
 
 
+def test_quantized_gradients_build_the_identical_paired_histogram() raises:
+    """The pre-quantized interleaved gradient buffer changes what the paired
+    tiled kernel gathers, not what it accumulates: `_quantize_grad_hess_kernel`
+    computes the same `Int32(round(g * scale))` once per row that the Float32
+    path computes per visit, so the histogram is bit-identical at both an
+    even and an odd active-feature count. Then a new round's gradients are
+    uploaded and `begin_tree` is called, and the quantized copy has to be
+    rebuilt rather than reused: the same comparison holds against the new
+    Float32 planes, and it would fail against the old ones."""
+    comptime if not has_accelerator():
+        return
+    else:
+        var n_rows = 2048
+        var n_features = 3
+        var n_bins = 16
+        var data = _make_data(n_rows, n_features, n_bins)
+        var ctx = DeviceContext()
+        var caps = query_device_caps(ctx)
+        var bins = _upload_bins(ctx, data)
+        var rows = GpuActiveRows(ctx, n_rows, n_features, n_bins, caps)
+
+        var grad32 = ctx.enqueue_create_host_buffer[DType.float32](n_rows)
+        var hess32 = ctx.enqueue_create_host_buffer[DType.float32](n_rows)
+        var grad_dev = ctx.enqueue_create_buffer[DType.float32](n_rows)
+        var hess_dev = ctx.enqueue_create_buffer[DType.float32](n_rows)
+        var feat_dev = ctx.enqueue_create_buffer[DType.int32](n_features)
+        with feat_dev.map_to_host() as host:
+            host.unsafe_ptr().unsafe_store(0, Int32(0))
+            host.unsafe_ptr().unsafe_store(1, Int32(2))
+            host.unsafe_ptr().unsafe_store(2, Int32(1))
+        var hist_size = n_features * n_bins
+        var cells = 3 * hist_size
+        var one_dev = ctx.enqueue_create_buffer[DType.int32](cells)
+        var two_dev = ctx.enqueue_create_buffer[DType.int32](cells)
+        var host_one = ctx.enqueue_create_host_buffer[DType.int32](cells)
+        var host_two = ctx.enqueue_create_host_buffer[DType.int32](cells)
+        var routing = RowRouting.numerical(0, 6)
+        var node = 2
+
+        for round in range(2):
+            # Round 1 draws different gradients, so a stale quantized copy
+            # from round 0 would disagree with the Float32 planes.
+            var grad = List[Float64](capacity=n_rows)
+            var hess = List[Float64](capacity=n_rows)
+            for r in range(n_rows):
+                var salt = UInt64(round * 4099)
+                grad.append(
+                    Float64(Int(_splitmix64(UInt64(r) + 7 + salt) % 2000))
+                    * 0.001
+                    - 1.0
+                )
+                hess.append(
+                    Float64(Int(_splitmix64(UInt64(r) + 991 + salt) % 1000))
+                    * 0.001
+                    + 0.25
+                )
+            var g_scale = _fixed_scale(grad)
+            var h_scale = _fixed_scale(hess)
+            ctx.synchronize()
+            for r in range(n_rows):
+                grad32.unsafe_ptr().unsafe_store(r, Float32(grad[r]))
+                hess32.unsafe_ptr().unsafe_store(r, Float32(hess[r]))
+            ctx.enqueue_copy(dst_buf=grad_dev, src_ptr=grad32.unsafe_ptr())
+            ctx.enqueue_copy(dst_buf=hess_dev, src_ptr=hess32.unsafe_ptr())
+            rows.begin_tree()
+            _ = rows.partition(bins.unsafe_ptr(), 0, 1, 2, routing)
+            assert_true(len(rows.download_range(node)) > 0)
+
+            for step in range(2):
+                var slots = 2 + step
+                var tiling = rows.range_tiling(
+                    caps, node, slots, STRATEGY_TILED, 1 << 20
+                )
+                assert_equal(tiling.strategy, STRATEGY_TILED)
+                var part_cells = tiling.partial_cells
+                if part_cells < 1:
+                    part_cells = 1
+                var part_dev = ctx.enqueue_create_buffer[DType.int32](
+                    3 * part_cells
+                )
+                rows.set_feature_group(2)
+                rows.set_quantized_gradients(False)
+                rows.enqueue_range_histogram(
+                    tiling,
+                    node,
+                    bins.unsafe_ptr(),
+                    grad_dev.unsafe_ptr(),
+                    hess_dev.unsafe_ptr(),
+                    feat_dev.unsafe_ptr(),
+                    one_dev.unsafe_ptr(),
+                    part_dev.unsafe_ptr(),
+                    slots,
+                    g_scale,
+                    h_scale,
+                )
+                rows.set_quantized_gradients(True)
+                rows.enqueue_range_histogram(
+                    tiling,
+                    node,
+                    bins.unsafe_ptr(),
+                    grad_dev.unsafe_ptr(),
+                    hess_dev.unsafe_ptr(),
+                    feat_dev.unsafe_ptr(),
+                    two_dev.unsafe_ptr(),
+                    part_dev.unsafe_ptr(),
+                    slots,
+                    g_scale,
+                    h_scale,
+                )
+                ctx.enqueue_copy(
+                    dst_ptr=host_one.unsafe_ptr(), src_buf=one_dev
+                )
+                ctx.enqueue_copy(
+                    dst_ptr=host_two.unsafe_ptr(), src_buf=two_dev
+                )
+                ctx.synchronize()
+                var a = host_one.unsafe_ptr()
+                var b = host_two.unsafe_ptr()
+                var populated = 0
+                for i in range(cells):
+                    assert_equal(
+                        Int(a.unsafe_load(i)), Int(b.unsafe_load(i))
+                    )
+                    if a.unsafe_load(i) != 0:
+                        populated += 1
+                assert_true(populated > 0)
+        rows.set_quantized_gradients(False)
+        rows.set_feature_group(1)
+
+
 def test_quad_feature_group_tiled_builds_the_identical_histogram() raises:
     """Four features per threadgroup changes the launch, not the histogram.
 

@@ -930,6 +930,137 @@ def _range_hist_partial_g2_kernel(
         b += block_dim.x
 
 
+def _quantize_grad_hess_kernel(
+    grad: MutPointer[Float32, MutAnyOrigin],
+    hess: MutPointer[Float32, MutAnyOrigin],
+    gq: MutPointer[Int32, MutAnyOrigin],
+    n_rows: Int32,
+    g_scale: Float32,
+    h_scale: Float32,
+):
+    """Quantize this round's gradients once, into one interleaved buffer.
+
+    `gq[2r]` and `gq[2r + 1]` are exactly the `Int32(round(grad[r] *
+    g_scale))` and `Int32(round(hess[r] * h_scale))` every histogram kernel
+    computes per (row, feature) visit: same Float32 product, same rounding,
+    so a histogram accumulated from this buffer is bit-identical to one
+    accumulated from the Float32 planes. What changes is the traffic. The
+    histogram kernels gather `grad[r]` and `hess[r]` by row id, so at a leaf
+    whose rows are sparse in the dataset each is a separate cache line per
+    row per threadgroup, and a 50-feature histogram at the pairing gathers
+    both 25 times per row. Interleaving the two quantized words puts them in
+    one line, halving those gathers, and moves the two multiplies and
+    rounds off the inner loop. One streaming pass per tree over `n_rows`
+    (16 bytes each), against `n_features` gathered passes per node.
+    """
+    var r = global_idx.x
+    if r < Int(n_rows):
+        gq[unsafe_offset = 2 * r] = Int32(round(grad[unsafe_offset=r][0] * g_scale))
+        gq[unsafe_offset = 2 * r + 1] = Int32(
+            round(hess[unsafe_offset=r][0] * h_scale)
+        )
+
+
+def _range_hist_partial_g2q_kernel(
+    bins: MutPointer[UInt8, MutAnyOrigin],
+    rows: MutPointer[Int32, MutAnyOrigin],
+    gq: MutPointer[Int32, MutAnyOrigin],
+    feat_ids: MutPointer[Int32, MutAnyOrigin],
+    partials: MutPointer[Int32, MutAnyOrigin],
+    n_rows: Int32,
+    n_slots: Int32,
+    n_bins: Int32,
+    rows_per_tile: Int32,
+    begin: Int32,
+    count: Int32,
+):
+    """`_range_hist_partial_g2_kernel` reading the pre-quantized interleaved
+    gradient buffer `_quantize_grad_hess_kernel` writes, instead of the two
+    Float32 planes. Same threadgroup shape, same shared layout, same
+    per-slot partial slices, same fixed-point adds of the same values, so
+    `_range_reduce_kernel` and the fused subtraction consume it unchanged
+    and the histogram is bit-identical. Per row per pair the block gathers
+    three lines (one `gq` pair, two bins) instead of four."""
+    var slot0 = 2 * Int(block_idx.x)
+    var slot1 = slot0 + 1
+    var paired = slot1 < Int(n_slots)
+    var f0 = Int(feat_ids[unsafe_offset=slot0][0])
+    var f1 = 0
+    if paired:
+        f1 = Int(feat_ids[unsafe_offset=slot1][0])
+    var t = block_idx.y
+    var tid = thread_idx.x
+    var nb = Int(n_bins)
+    var nr = Int(n_rows)
+    var n = Int(count)
+    var plane = Int(n_slots) * nb
+
+    var sg = stack_allocation[
+        GROUPED_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
+    ]()
+    var sh = stack_allocation[
+        GROUPED_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
+    ]()
+    var sc = stack_allocation[
+        GROUPED_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
+    ]()
+
+    var span = 2 * nb if paired else nb
+    var b = tid
+    while b < span:
+        sg[unsafe_offset=b] = 0
+        sh[unsafe_offset=b] = 0
+        sc[unsafe_offset=b] = 0
+        b += block_dim.x
+    barrier()
+
+    var tile_begin = t * Int(rows_per_tile)
+    var tile_end = tile_begin + Int(rows_per_tile)
+    if tile_end > n:
+        tile_end = n
+
+    var col0 = f0 * nr
+    var col1 = f1 * nr
+    var j = tile_begin + tid
+    while j < tile_end:
+        var r = Int(rows[unsafe_offset = Int(begin) + j][0])
+        var gq_r = gq[unsafe_offset = 2 * r][0]
+        var hq_r = gq[unsafe_offset = 2 * r + 1][0]
+        var b0 = Int(bins[unsafe_offset = col0 + r])
+        _ = Atomic.fetch_add(sg.unsafe_offset(b0), gq_r)
+        _ = Atomic.fetch_add(sh.unsafe_offset(b0), hq_r)
+        _ = Atomic.fetch_add(sc.unsafe_offset(b0), Int32(1))
+        if paired:
+            var b1 = nb + Int(bins[unsafe_offset = col1 + r])
+            _ = Atomic.fetch_add(sg.unsafe_offset(b1), gq_r)
+            _ = Atomic.fetch_add(sh.unsafe_offset(b1), hq_r)
+            _ = Atomic.fetch_add(sc.unsafe_offset(b1), Int32(1))
+        j += block_dim.x
+    barrier()
+
+    var base0 = t * 3 * plane + slot0 * nb
+    b = tid
+    while b < nb:
+        partials[unsafe_offset = base0 + b] = sg[unsafe_offset=b][0]
+        partials[unsafe_offset = base0 + plane + b] = sh[unsafe_offset=b][0]
+        partials[unsafe_offset = base0 + 2 * plane + b] = sc[
+            unsafe_offset=b
+        ][0]
+        b += block_dim.x
+    if not paired:
+        return
+    var base1 = t * 3 * plane + slot1 * nb
+    b = tid
+    while b < nb:
+        var s = nb + b
+        partials[unsafe_offset = base1 + b] = sg[unsafe_offset=s][0]
+        partials[unsafe_offset = base1 + plane + b] = sh[unsafe_offset=s][0]
+        partials[unsafe_offset = base1 + 2 * plane + b] = sc[
+            unsafe_offset=s
+        ][0]
+        b += block_dim.x
+
+
 def _range_hist_partial_g4_kernel(
     bins: MutPointer[UInt8, MutAnyOrigin],
     rows: MutPointer[Int32, MutAnyOrigin],
@@ -1403,6 +1534,18 @@ struct GpuActiveRows(Movable):
     # kernel, 2 the paired one. Never read by anything but
     # `enqueue_range_histogram`, and it changes no histogram it produces.
     var feature_group: Int
+    # The interleaved pre-quantized gradient buffer (`_quantize_grad_hess_kernel`),
+    # 2 * n_rows Int32, and the state that says whether it describes the
+    # gradients the next histogram will be asked to read. It is invalidated by
+    # `begin_tree`, which every gradient refill in train_gpu.mojo is followed
+    # by, and by a change of scale, which any refill that changed a value
+    # changes with overwhelming likelihood; the two together are what make it
+    # safe to key on rather than on a round counter this module cannot see.
+    var gq_dev: DeviceBuffer[DType.int32]
+    var quantized_gradients: Bool
+    var quant_valid: Bool
+    var quant_g_scale: Float32
+    var quant_h_scale: Float32
 
     def __init__(
         out self,
@@ -1473,6 +1616,17 @@ struct GpuActiveRows(Movable):
         if group > FEATURE_GROUP_MAX:
             group = FEATURE_GROUP_MAX
         self.feature_group = group
+        # Pre-quantized interleaved gradients for the paired tiled kernel.
+        # Off until measured per device; `MOJOTREES_GPU_QUANTIZED_GRADS=1`
+        # or `set_quantized_gradients` turns it on. Cannot change a
+        # histogram, only what the kernel gathers per row.
+        self.gq_dev = self.ctx.enqueue_create_buffer[DType.int32](2 * n_rows)
+        self.quantized_gradients = (
+            _env_int("MOJOTREES_GPU_QUANTIZED_GRADS", 0) != 0
+        )
+        self.quant_valid = False
+        self.quant_g_scale = 0.0
+        self.quant_h_scale = 0.0
 
         # A bagged tree stages only its bag's slots, and the copy that
         # follows takes the whole buffer, so the tail is zeroed once here
@@ -1509,6 +1663,15 @@ struct GpuActiveRows(Movable):
             )
         self.feature_group = group
 
+    def set_quantized_gradients(mut self, on: Bool):
+        """Whether the paired tiled histogram reads the pre-quantized
+        interleaved gradient buffer instead of the two Float32 planes. An
+        argument for the same reason `set_feature_group` is one: an A/B
+        passes its arm in. Takes effect on the next `enqueue_range_histogram`
+        and cannot change a histogram."""
+        self.quantized_gradients = on
+        self.quant_valid = False
+
     def begin_tree(mut self, bag: List[Int] = []) raises:
         """Seed the root's rows and make node 0 own all of them.
 
@@ -1521,6 +1684,9 @@ struct GpuActiveRows(Movable):
         """
         if len(bag) > self.n_rows:
             raise Error("bag is larger than the dataset")
+        # A new tree may carry a new round's gradients; the quantized copy
+        # is rebuilt on the first histogram that asks for it.
+        self.quant_valid = False
         if len(bag) == 0:
             var blocks = (
                 self.n_rows + self.block_threads - 1
@@ -1917,6 +2083,30 @@ struct GpuActiveRows(Movable):
                     grid_dim=(quad_blocks, tiling.n_tiles),
                     block_dim=threads,
                 )
+            elif (
+                self.feature_group >= 2
+                and n_slots >= 2
+                and self.quantized_gradients
+            ):
+                # The pairing over the pre-quantized interleaved gradients:
+                # one gathered line per row for the row side instead of two.
+                self._ensure_quantized(grad, hess, g_scale, h_scale)
+                var grouped_blocks = (n_slots + 1) // 2
+                self.ctx.enqueue_function[_range_hist_partial_g2q_kernel](
+                    bins,
+                    self.rows_dev.unsafe_ptr(),
+                    self.gq_dev.unsafe_ptr(),
+                    feat_ids,
+                    partials,
+                    Int32(self.n_rows),
+                    Int32(n_slots),
+                    Int32(self.n_bins),
+                    Int32(tiling.rows_per_tile),
+                    Int32(window.begin),
+                    Int32(window.count()),
+                    grid_dim=(grouped_blocks, tiling.n_tiles),
+                    block_dim=threads,
+                )
             elif self.feature_group >= 2 and n_slots >= 2:
                 # Half as many threadgroups, each owning two feature slots,
                 # exactly as the atomic pairing below; the reduce that
@@ -2023,6 +2213,42 @@ struct GpuActiveRows(Movable):
                 grid_dim=(n_slots, tiling.n_tiles),
                 block_dim=threads,
             )
+
+    def _ensure_quantized[
+        grad_origin: MutOrigin,
+        hess_origin: MutOrigin, //
+    ](
+        mut self,
+        grad: MutPointer[Float32, grad_origin],
+        hess: MutPointer[Float32, hess_origin],
+        g_scale: Float32,
+        h_scale: Float32,
+    ) raises:
+        """Rebuild the interleaved quantized gradient buffer unless it was
+        built for this tree at these scales already. One streaming launch
+        over `n_rows`, ordered before the histogram that reads it by the
+        queue."""
+        if (
+            self.quant_valid
+            and self.quant_g_scale == g_scale
+            and self.quant_h_scale == h_scale
+        ):
+            return
+        var threads = self.block_threads
+        var blocks = (self.n_rows + threads - 1) // threads
+        self.ctx.enqueue_function[_quantize_grad_hess_kernel](
+            grad,
+            hess,
+            self.gq_dev.unsafe_ptr(),
+            Int32(self.n_rows),
+            g_scale,
+            h_scale,
+            grid_dim=blocks,
+            block_dim=threads,
+        )
+        self.quant_valid = True
+        self.quant_g_scale = g_scale
+        self.quant_h_scale = h_scale
 
     def download_rows(mut self) raises -> List[Int32]:
         """The whole active-row buffer, host side. Synchronizes, and is for

@@ -6,7 +6,9 @@ determinism). The replica reproduces the device's histograms bit for bit on
 this hardware — experiment E2 of docs/design/HYBRID_TRAINING.md §9, the
 claim `MODE_REPLICA` substitutes under. And a fit grown with hybrid
 scheduling enabled is bit-identical to the pure-device fit, which is the
-whole safety contract of the integration in `grow_tree_gpu`.
+whole safety contract of the integration in `grow_tree_gpu`. A fourth
+extends the third to device-produced gradients (`stage_from_device`), the
+path the unbagged built-in objectives take.
 
 GPU cases skip (passing) when no accelerator is present.
 """
@@ -188,6 +190,27 @@ def test_replica_matches_device_bitwise() raises:
         for r in range(n_rows):
             assert_equal(Int(snapshot[r]), r)
 
+        # The per-range readback is that same permutation, one window at a
+        # time: exactly `count` rows, in buffer order, from any offset; an
+        # empty window is legal and moves nothing; a window past the buffer
+        # is refused.
+        var window = List[Int32]()
+        builder.readback_range(1234, 777, window)
+        assert_equal(len(window), 777)
+        for j in range(777):
+            assert_equal(window[j], snapshot[1234 + j])
+        builder.readback_range(n_rows - 5, 5, window)
+        assert_equal(len(window), 5)
+        assert_equal(Int(window[4]), n_rows - 1)
+        builder.readback_range(40, 0, window)
+        assert_equal(len(window), 0)
+        var refused = False
+        try:
+            builder.readback_range(n_rows - 4, 5, window)
+        except:
+            refused = True
+        assert_true(refused)
+
 
 def test_hybrid_replica_training_is_bit_identical() raises:
     """A fit with hybrid scheduling on (replica mode, measured costs) grows
@@ -275,6 +298,72 @@ def test_hybrid_replica_training_is_bit_identical() raises:
             var pb = baseline.predict_raw_row(data, r)
             assert_equal(pb, hybrid.predict_raw_row(data, r))
             assert_equal(pb, mirrored.predict_raw_row(data, r))
+
+
+def test_hybrid_reaches_device_gradients() raises:
+    """The unbagged built-in objective computes its gradients on the device;
+    `stage_from_device` reads the exact Float32 back, so the replica has the
+    same inputs as the kernels, and a hybrid fit on that path is still
+    bit-identical to the pure-device fit."""
+    comptime if not has_accelerator():
+        pass
+    else:
+        var n_rows = 6000
+        var n_features = 8
+        var n_bins = 63
+        var data = BinnedMatrix(
+            _make_bins(n_rows, n_features, n_bins), n_rows, n_features, n_bins
+        )
+        var target = List[Float64](capacity=n_rows)
+        for r in range(n_rows):
+            var b0 = Float64(data.bin_at(r, 0))
+            var b1 = Float64(data.bin_at(r, 1))
+            target.append(
+                0.15 * b0 - 0.07 * b1 + _uniform(UInt64(r) + 0x991) * 0.1
+            )
+
+        # The builder-level contract: a device fill leaves the gradients
+        # device-only, the readback makes them host-side, and the replica
+        # then reproduces the device build over device-made gradients.
+        var builder = GpuHistogramBuilder(data)
+        var state = builder.objective_state(target, [], 1, 64)
+        state.init_raw(builder.ctx, [0.0])
+        builder.fill_gradients_device(state, SQUARED_ERROR, 0.0)
+        assert_true(not builder.gradients_host)
+        var refused = False
+        var rows = List[Int32](capacity=n_rows)
+        for r in range(n_rows):
+            rows.append(Int32(r))
+        var host = Histogram.zeroed(n_features, n_bins)
+        var fixed = List[Int32]()
+        try:
+            builder.build_leaf_host_replica(host, fixed, data, rows, 0, n_rows)
+        except:
+            refused = True
+        assert_true(refused)
+        builder.stage_from_device()
+        assert_true(builder.gradients_host)
+        builder.begin_tree()
+        var device = builder.build_leaf(0)
+        builder.build_leaf_host_replica(host, fixed, data, rows, 0, n_rows)
+        _histograms_equal(device, host)
+
+        # And the fit: unbagged, so `train_gpu` takes the device-objective
+        # path, which hybrid scheduling could not reach before the readback.
+        var params = BoosterParams(8, 0.1, TreeParams(31, 5, 1.0, 1e-3))
+        _ = setenv("MOJOTREES_HYBRID_LEAVES", "")
+        _ = setenv("MOJOTREES_HYBRID_COSTS", "")
+        var baseline = train_gpu(data, target, SQUARED_ERROR, params)
+        _ = setenv("MOJOTREES_HYBRID_LEAVES", "replica")
+        _ = setenv("MOJOTREES_HYBRID_COSTS", "apple-m4")
+        var hybrid = train_gpu(data, target, SQUARED_ERROR, params)
+        _ = setenv("MOJOTREES_HYBRID_LEAVES", "")
+        _ = setenv("MOJOTREES_HYBRID_COSTS", "")
+        for r in range(n_rows):
+            assert_equal(
+                baseline.predict_raw_row(data, r),
+                hybrid.predict_raw_row(data, r),
+            )
 
 
 def main() raises:

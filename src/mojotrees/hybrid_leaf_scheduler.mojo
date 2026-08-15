@@ -403,11 +403,13 @@ def row_source_is_host(source: Int) -> Bool:
     the snapshot is a per-tree cost (see `snapshot_nanos`).
 
     `ROWS_DEVICE_COPY` is the only source that charges a transfer to the
-    node itself, and §7.1 of the handoff records why it is not currently
-    expressible: `enqueue_copy` copies the whole source buffer, so a
-    per-range readback needs either a new buffer per call or an API this
-    project does not have. The snapshot exists so the design does not depend
-    on it.
+    node itself: a per-range readback of exactly the node's window
+    (`GpuHistogramBuilder.readback_range`, a `create_sub_buffer` view plus
+    one `enqueue_copy` and one synchronize). The design was written believing
+    that readback was not expressible and built the snapshot sources around
+    that; it is, and the GPU grower plans every leaf as `ROWS_DEVICE_COPY`,
+    which charges each leaf its own `4 * node_rows` bytes and nothing
+    amortized across the tree.
     """
     return source != ROWS_DEVICE_COPY
 
@@ -476,8 +478,29 @@ struct HybridCosts(Copyable, Movable):
     """Device accumulation, per thousand (row, active-feature) pairs."""
 
     var host_nanos_per_krow_slot: Int
-    """Host accumulation, per thousand (row, active-feature) pairs: the
-    scattered-add inner loop of `_accumulate_subset`."""
+    """Host accumulation, per thousand (row, active-feature) pairs, over a
+    *contiguous* node (the root): the scattered-add inner loop of
+    `_accumulate_subset` with its bin reads streaming."""
+
+    var host_scatter_nanos_per_krow_slot: Int
+    """The same accumulation over a *scattered* node: rows far enough apart
+    that, in the feature-major bin layout (`bin_at` reads
+    `bins[feature * n_rows + row]`), every bin read is a fresh cache line
+    and the prefetcher has nothing to follow. The calibration measures
+    leaves at several row gaps and this is the *largest* rate it saw
+    (memory-latency bound, roughly five times the contiguous rate on the
+    calibration machine). A small leaf of a large dataset looks like this
+    to the host and not like the root, which is why the contiguous rate
+    alone misplaced such leaves; `host_slot_nanos_per_k` ramps between the
+    two by the node's mean row gap."""
+
+    var host_fixed_nanos: Int
+    """What a host build costs before it touches a row: the quantization
+    dispatch, the per-feature task fan-out, and the dequantization pass
+    (`histogram.build_histogram_subset_replica_into`). Measured as a
+    one-row build less the zeroing pass. Tens of microseconds on the
+    calibration machine, which is a real fraction of the device's fixed
+    cost and is what stops a tiny leaf from being modelled as free."""
 
     var host_partition_nanos_per_krow: Int
     """Host mirror of one split's stable partition, per thousand rows of the
@@ -516,6 +539,8 @@ struct HybridCosts(Copyable, Movable):
         self.transfer_nanos_per_kib = _NANOS_UNMEASURED
         self.device_nanos_per_krow_slot = _NANOS_UNMEASURED
         self.host_nanos_per_krow_slot = _NANOS_UNMEASURED
+        self.host_scatter_nanos_per_krow_slot = _NANOS_UNMEASURED
+        self.host_fixed_nanos = _NANOS_UNMEASURED
         self.host_partition_nanos_per_krow = _NANOS_UNMEASURED
         self.host_zero_nanos_per_kcell = _NANOS_UNMEASURED
         self.convert_nanos_per_kcell = _NANOS_UNMEASURED
@@ -530,6 +555,8 @@ struct HybridCosts(Copyable, Movable):
         transfer_nanos_per_kib: Int,
         device_nanos_per_krow_slot: Int,
         host_nanos_per_krow_slot: Int,
+        host_scatter_nanos_per_krow_slot: Int,
+        host_fixed_nanos: Int,
         host_partition_nanos_per_krow: Int,
         host_zero_nanos_per_kcell: Int,
         convert_nanos_per_kcell: Int,
@@ -547,16 +574,25 @@ struct HybridCosts(Copyable, Movable):
             or transfer_nanos_per_kib < 0
             or device_nanos_per_krow_slot < 0
             or host_nanos_per_krow_slot < 0
+            or host_scatter_nanos_per_krow_slot < 0
+            or host_fixed_nanos < 0
             or host_partition_nanos_per_krow < 0
             or host_zero_nanos_per_kcell < 0
             or convert_nanos_per_kcell < 0
         ):
             raise Error("cost coefficients must be nonnegative")
+        if host_scatter_nanos_per_krow_slot < host_nanos_per_krow_slot:
+            raise Error(
+                "a scattered node cannot accumulate faster than a contiguous"
+                " one; the two host rates are swapped or mismeasured"
+            )
         self.launch_nanos = launch_nanos
         self.sync_nanos = sync_nanos
         self.transfer_nanos_per_kib = transfer_nanos_per_kib
         self.device_nanos_per_krow_slot = device_nanos_per_krow_slot
         self.host_nanos_per_krow_slot = host_nanos_per_krow_slot
+        self.host_scatter_nanos_per_krow_slot = host_scatter_nanos_per_krow_slot
+        self.host_fixed_nanos = host_fixed_nanos
         self.host_partition_nanos_per_krow = host_partition_nanos_per_krow
         self.host_zero_nanos_per_kcell = host_zero_nanos_per_kcell
         self.convert_nanos_per_kcell = convert_nanos_per_kcell
@@ -579,8 +615,10 @@ struct HybridCosts(Copyable, Movable):
     def apple_m4() raises -> HybridCosts:
         """Experiment E1 of docs/design/HYBRID_TRAINING.md §9, run on an
         Apple M4: `pixi run bench-hybrid-costs` at 500k rows x 50 features
-        x 255 bins, minimum over five interleaved trials, 2026-08-14. Full
-        output in the evidence file.
+        x 255 bins, minimum over five interleaved trials, 2026-08-15 (the
+        2026-08-14 run lacked the scattered-leaf rate; all coefficients
+        come from one run because this machine's timings drift between
+        time windows). Full output in the evidence file.
 
         Selected only by an explicit `MOJOTREES_HYBRID_COSTS=apple-m4`
         (see `env_hybrid_costs`), never inferred from the hardware: on any
@@ -588,15 +626,17 @@ struct HybridCosts(Copyable, Movable):
         can misplace work even though it can never change a tree.
         """
         return HybridCosts(
-            59153,  # launch_nanos
-            20320,  # sync_nanos
-            321,  # transfer_nanos_per_kib
-            107,  # device_nanos_per_krow_slot
-            1343,  # host_nanos_per_krow_slot
-            15485,  # host_partition_nanos_per_krow
-            13,  # host_zero_nanos_per_kcell
-            10122,  # convert_nanos_per_kcell
-            String("bench/results/apple_m4_hybrid_costs_2026-08-14.md"),
+            62128,  # launch_nanos
+            20560,  # sync_nanos
+            334,  # transfer_nanos_per_kib
+            160,  # device_nanos_per_krow_slot
+            1178,  # host_nanos_per_krow_slot
+            5516,  # host_scatter_nanos_per_krow_slot
+            41280,  # host_fixed_nanos
+            15374,  # host_partition_nanos_per_krow
+            11,  # host_zero_nanos_per_kcell
+            10024,  # convert_nanos_per_kcell
+            String("bench/results/apple_m4_hybrid_costs_2026-08-15.md"),
             String("Apple M4, macOS, 500k x 50 x 255"),
         )
 
@@ -630,10 +670,9 @@ struct LeafWork(Copyable, Movable):
     var n_bins: Int
 
     var dataset_rows: Int
-    """The binned matrix's column stride. Carried because it decides how far
-    apart a host build's bin reads land, which is the difference between a
-    cache-resident scan and a scattered one; no term below uses it yet, and
-    a fitted cost model may need it."""
+    """The binned matrix's column stride. It decides how far apart a host
+    build's bin reads land, which is the difference between a streaming scan
+    and one cache miss per read; `host_slot_nanos_per_k` prices that."""
 
     var row_source: Int
 
@@ -801,11 +840,13 @@ struct HybridContext(Copyable, Movable):
     says that is not a trade worth making on a first integration, and a
     benchmark that disagrees can clear the flag rather than edit the model.
 
-    Inert under the snapshot design, and kept for that reason rather than in
-    spite of it: every source `tree_row_source` produces charges the node no
-    transfer at all, so the guard can only bite on `ROWS_DEVICE_COPY`, which
-    is the per-range readback that is not currently expressible. It is the
-    check that would have to hold if that mechanism ever arrives.
+    Inert under the snapshot sources, which charge the node no transfer at
+    all; it bites only on `ROWS_DEVICE_COPY`, the per-range readback the GPU
+    grower actually uses. There the "transfer" is a fixed synchronize plus
+    four bytes a row, and the device path pays that same synchronize on its
+    histogram download, so the guard refuses exactly the small leaves the
+    comparison exists to move: the grower clears it by default and
+    `MOJOTREES_HYBRID_GUARD_TRANSFER=1` restores it for an A/B.
     """
 
     var n_active_rows: Int
@@ -933,12 +974,11 @@ def snapshot_nanos(n_active_rows: Int, costs: HybridCosts) raises -> Int:
     node created after it costs one host partition of its parent's range
     (`host_materialize_nanos`).
 
-    This is what makes the design implementable against the row API that
-    exists. `enqueue_copy` copies the whole source buffer, so there is no
-    per-range readback to be had without a per-call allocation; the snapshot
-    pays the whole-buffer price *once per tree* instead of per node, which is
-    strictly better than the per-node readback would have been from the
-    second host leaf onward.
+    Priced so a grower that maintains a snapshot can compare it against the
+    per-range readback (`ROWS_DEVICE_COPY`, `host_transfer_nanos`). The GPU
+    grower uses the readback and never takes a snapshot: per node it moves
+    `4 * node_rows` bytes instead of `4 * n_active_rows`, and nothing is
+    amortized across leaves.
     """
     if n_active_rows < 1:
         raise Error("a tree must grow on at least one row")
@@ -969,15 +1009,53 @@ def host_materialize_nanos(work: LeafWork, costs: HybridCosts) -> Int:
     )
 
 
+comptime _SCATTER_SATURATION_GAP = 256
+"""Mean row gap, in rows, at which a node is charged the full scattered
+rate. Bins are one byte and feature-major, so at a gap of 64 every bin read
+is a fresh cache line and at a few hundred the prefetcher and the
+translation cache have stopped helping; the calibration's per-gap rates
+(bench/bench_hybrid_costs.mojo) sit under the ramp this fixes at every gap
+it measured, so the ramp is conservative for the host."""
+
+
+def host_slot_nanos_per_k(work: LeafWork, costs: HybridCosts) -> Int:
+    """Host accumulation rate for *this* node, per thousand (row, feature)
+    pairs: from the contiguous rate up to the scattered rate as the node's
+    rows thin out.
+
+    The node's rows sit in the device's stable buffer order, and a stable
+    partition of an identity (or bag) permutation keeps them ascending, so
+    per feature the host reads `node_rows` bytes spread over a
+    `dataset_rows`-byte column. Mean gap `dataset_rows / node_rows` rows;
+    the rate ramps linearly from the contiguous rate at gap one to the
+    scattered rate at `_SCATTER_SATURATION_GAP` and stays there. A model,
+    not a measurement of every gap; its endpoints are what E1 measures, and
+    it is fitted to sit above the intermediate points E1 also measures.
+    """
+    if work.node_rows < 1:
+        return costs.host_nanos_per_krow_slot
+    var gap_permille = _ceil_div(
+        1000 * work.dataset_rows, work.node_rows * _SCATTER_SATURATION_GAP
+    )
+    if gap_permille > 1000:
+        gap_permille = 1000
+    var spread = (
+        costs.host_scatter_nanos_per_krow_slot - costs.host_nanos_per_krow_slot
+    )
+    return costs.host_nanos_per_krow_slot + spread * gap_permille // 1000
+
+
 def host_build_nanos(work: LeafWork, costs: HybridCosts) raises -> Int:
     """Modelled cost of the host accumulation itself, transfer excluded: the
-    zeroing pass over every cell plus the scattered adds over the node's own
-    rows."""
+    fixed dispatch price of a host build, the zeroing pass over every cell,
+    and the scattered adds over the node's own rows at the rate the node's
+    row density earns it (`host_slot_nanos_per_k`)."""
     if not costs.measured:
         return 0
     return (
-        work.cell_kcells() * costs.host_zero_nanos_per_kcell
-        + work.row_slot_kops() * costs.host_nanos_per_krow_slot
+        costs.host_fixed_nanos
+        + work.cell_kcells() * costs.host_zero_nanos_per_kcell
+        + work.row_slot_kops() * host_slot_nanos_per_k(work, costs)
     )
 
 
@@ -1439,10 +1517,11 @@ def tree_row_source(is_root: Bool, bagged: Bool) -> Int:
     (`DECLINE_SNAPSHOT_NOT_PAID` decides whether a leaf can afford it), not a
     different source.
 
-    `ROWS_DEVICE_COPY` is therefore never produced here. It stays in the
-    vocabulary for the alternative design -- a genuine per-range readback --
-    which is not expressible against today's `enqueue_copy` and is recorded in
-    the handoff as an optimization rather than a dependency.
+    `ROWS_DEVICE_COPY` is therefore never produced here: this is the row
+    source under the *snapshot* design. The GPU grower does not use it; it
+    passes `ROWS_DEVICE_COPY` for every leaf to `plan_split`, because the
+    per-range readback this function was written believing impossible
+    (`GpuHistogramBuilder.readback_range`) exists and needs no snapshot.
     """
     if is_root:
         if bagged:

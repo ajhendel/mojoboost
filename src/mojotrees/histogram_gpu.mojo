@@ -310,10 +310,11 @@ struct GpuHistogramBuilder(Movable):
     var g_scale: Float64
     var h_scale: Float64
     var has_gradients: Bool
-    # Whether this round's gradients came through `stage_gradients`, so the
-    # Float32 conversions the kernels read are still sitting in `stage_g` /
-    # `stage_h` on the host. False on the device-objective paths, where the
-    # gradients never exist host-side; a host replica build
+    # Whether the Float32 gradients the kernels read this round are also
+    # sitting in `stage_g` / `stage_h` on the host: True after
+    # `stage_gradients` (the host produced them) or `stage_from_device` (the
+    # device produced them and the host read them back), False after a
+    # device fill until one of those runs. A host replica build
     # (`build_leaf_host_replica`) is only possible when this is True.
     var gradients_host: Bool
     # Whether the host fixed-point replica has been shown to reproduce this
@@ -705,6 +706,37 @@ struct GpuHistogramBuilder(Movable):
         boosting round, not per node)."""
         self.stage_gradients(grad, hess)
         self.upload_staged()
+
+    def stage_from_device(mut self) raises:
+        """Read this round's device-produced Float32 gradients and hessians
+        back into the pinned staging buffers, so a host replica build can
+        run on a device-objective round.
+
+        The values that land are the exact Float32 the kernels read (a copy,
+        no arithmetic), and `g_scale`/`h_scale` were already set by the
+        device fill, so `build_leaf_host_replica` afterwards accumulates
+        exactly what `build_leaf` does — the same replica claim
+        `replica_state` records, no new one. Costs `2 * 4 * n_rows` bytes
+        and one synchronize per round (per class, on a softmax round), which
+        is the price of reaching the built-in-objective path with hybrid
+        leaf scheduling at all; the grower pays it only when that scheduling
+        is switched on and measured.
+
+        A no-op when the gradients are already host-side. Refused before any
+        gradients exist.
+        """
+        if not self.has_gradients:
+            raise Error("no gradients to read back this round")
+        if self.gradients_host:
+            return
+        self.ctx.enqueue_copy(
+            dst_ptr=self.stage_g.unsafe_ptr(), src_buf=self.grad_dev
+        )
+        self.ctx.enqueue_copy(
+            dst_ptr=self.stage_h.unsafe_ptr(), src_buf=self.hess_dev
+        )
+        self.ctx.synchronize()
+        self.gradients_host = True
 
     def objective_state(
         mut self,
@@ -1116,11 +1148,42 @@ struct GpuHistogramBuilder(Movable):
             self.active,
         )
 
+    def readback_range(
+        mut self, begin: Int, count: Int, mut out: List[Int32]
+    ) raises:
+        """One node's rows — `rows_dev[begin : begin + count]` — into `out`,
+        resized to `count`, in the device's compacted order.
+
+        The per-range readback docs/design/HYBRID_TRAINING.md §3 assumed was
+        not expressible: `DeviceBuffer.create_sub_buffer` views a window of
+        the row buffer without allocating or launching anything, and
+        `enqueue_copy` moves exactly that window, so a host build of a
+        four-row leaf reads back sixteen bytes and not the whole permutation.
+        One synchronize, which also drains the partition that produced the
+        window, so the caller may take the range from `range_of` immediately
+        after `split`.
+
+        A whole-permutation snapshot (`snapshot_rows`) is the same copy at
+        `begin=0, count=n_rows`.
+        """
+        if begin < 0 or count < 0 or begin + count > self.n_rows:
+            raise Error("readback window is outside the active-row buffer")
+        if len(out) != count:
+            out.resize(count, Int32(0))
+        if count == 0:
+            return
+        var window = self.rows.rows_dev.create_sub_buffer[DType.int32](
+            begin, count
+        )
+        self.ctx.enqueue_copy(dst_ptr=out.unsafe_ptr(), src_buf=window)
+        self.ctx.synchronize()
+
     def snapshot_rows(mut self, mut out: List[Int32]) raises:
         """The whole active-row permutation into `out`, resized to `n_rows`.
 
-        The hybrid grower's once-per-tree snapshot
-        (docs/design/HYBRID_TRAINING.md §3): one whole-buffer copy through
+        The whole-permutation snapshot of docs/design/HYBRID_TRAINING.md §3,
+        which the grower no longer needs (`readback_range` moves one node's
+        window instead) and tests still use: one whole-buffer copy through
         the row machinery's pinned staging buffer, one synchronize, one
         memcpy into the caller's list. `GpuActiveRows.download_rows` answers
         the same question but builds its result a row at a time, which
