@@ -18,6 +18,7 @@ from mojotrees import (
     BoosterParams,
     TreeParams,
     fit,
+    fit_multiclass,
     load_model,
     save_model,
 )
@@ -28,6 +29,7 @@ from mojotrees.alternate_boosting import (
     AlternateBoostingParams,
     boosting_name,
     fit_boosting,
+    fit_boosting_multiclass,
     parse_boosting,
 )
 from mojotrees.boosting_dart import DartParams
@@ -182,6 +184,57 @@ def test_rf_trains_predicts_and_round_trips() raises:
     for r in range(0, _N_ROWS, 5):
         var row = _row(features, r)
         assert_equal(back.predict(row), rf.predict(row))
+
+
+def test_multiclass_dart_and_rf_train_through_the_raw_entry() raises:
+    var features = _features()
+    var y = _target(features)
+    var labels = List[Int](capacity=_N_ROWS)
+    for r in range(_N_ROWS):
+        labels.append(0 if y[r] < 0.5 else (1 if y[r] < 1.5 else 2))
+    var gbdt = fit_multiclass(
+        Span(features), _N_ROWS, _N_FEATURES, labels, 3, _params(0.1)
+    )
+    var dart = fit_boosting_multiclass(
+        Span(features),
+        _N_ROWS,
+        _N_FEATURES,
+        labels,
+        3,
+        _params(0.1),
+        AlternateBoostingParams.named("dart"),
+    )
+    var rf = fit_boosting_multiclass(
+        Span(features),
+        _N_ROWS,
+        _N_FEATURES,
+        labels,
+        3,
+        _params(1.0),
+        AlternateBoostingParams.named("rf"),
+        bagging=BaggingParams(0.7, 1, 3),
+    )
+    assert_equal(dart.booster.n_classes, 3)
+    assert_equal(rf.booster.n_classes, 3)
+    var dart_differs = False
+    var rf_differs = False
+    for r in range(0, _N_ROWS, 5):
+        var row = _row(features, r)
+        var base = gbdt.predict_proba(row)
+        var pd = dart.predict_proba(row)
+        var pr = rf.predict_proba(row)
+        var sd = 0.0
+        var sr = 0.0
+        for k in range(3):
+            assert_true(_is_finite(pd[k]) and _is_finite(pr[k]))
+            sd += pd[k]
+            sr += pr[k]
+            if pd[k] != base[k]:
+                dart_differs = True
+            if pr[k] != base[k]:
+                rf_differs = True
+        assert_true(abs(sd - 1.0) < 1e-9 and abs(sr - 1.0) < 1e-9)
+    assert_true(dart_differs and rf_differs)
 
 
 def test_rf_binary_response_is_a_probability() raises:

@@ -928,7 +928,7 @@ def symbol_index():
                     }
         return set()
 
-    for path in (PY_API, PY_BASIC):
+    for path in (PY_API, PY_BASIC, PY_PKG / "sklearn.py"):
         tree = read_module(path)
         if tree is None:
             continue
@@ -1036,13 +1036,20 @@ def stale_deferred(text, problems):
 def python_api(problems):
     """Public Python names, parsed rather than imported."""
     tree = ast.parse(PY_API.read_text())
+    # The estimators and the helpers the contract names moved out of
+    # __init__.py in the consolidation round (mojotrees.sklearn,
+    # _environment, _ranking) and are re-exported from it; the contract is
+    # about the package surface, so read the definitions where they live.
+    bodies = list(tree.body)
+    for extra in ("sklearn.py", "_environment.py", "_ranking.py"):
+        path = PY_PKG / extra
+        if path.exists():
+            bodies.extend(ast.parse(path.read_text()).body)
     classes = {
-        node.name: node
-        for node in tree.body
-        if isinstance(node, ast.ClassDef)
+        node.name: node for node in bodies if isinstance(node, ast.ClassDef)
     }
     functions = {
-        node.name for node in tree.body if isinstance(node, ast.FunctionDef)
+        node.name for node in bodies if isinstance(node, ast.FunctionDef)
     }
 
     exported = []

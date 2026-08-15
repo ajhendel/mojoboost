@@ -189,7 +189,7 @@ from .boosting_rf import (
 from .device import CPU_DEVICE
 from .efb import prepare_bundling
 from .goss import GossParams
-from .model import Model
+from .model import Model, MulticlassModel
 from .sampling import ClassBaggingParams
 from .tree import Tree, grow_tree
 
@@ -1778,3 +1778,39 @@ def fit_boosting[
         class_bagging,
     )
     return Model(mapper^, booster^)
+
+
+def fit_boosting_multiclass[
+    features_origin: ImmOrigin, //
+](
+    features: Span[Float64, features_origin],
+    n_rows: Int,
+    n_features: Int,
+    labels: List[Int],
+    n_classes: Int,
+    params: BoosterParams,
+    boosting: AlternateBoostingParams = AlternateBoostingParams(),
+    max_bins: Int = 255,
+    sample_weight: List[Float64] = [],
+    bagging: BaggingParams = BaggingParams.disabled(),
+    goss: GossParams = GossParams.disabled(),
+    use_missing: Bool = True,
+    categorical_features: List[Int] = [],
+) raises -> MulticlassModel:
+    """`model.fit_multiclass` with a `boosting` mode: `fit_boosting`'s
+    softmax counterpart, the same `fit_bins`, the same mapper, the same
+    `MulticlassModel`. CPU only, for the reason `fit_boosting` gives.
+    """
+    var mapper = fit_bins(
+        features,
+        n_rows,
+        n_features,
+        max_bins,
+        use_missing=use_missing,
+        categorical_features=categorical_features,
+    )
+    var data = mapper.transform(features, n_rows)
+    var booster = train_boosting_multiclass(
+        data, labels, n_classes, params, boosting, sample_weight, bagging, goss
+    )
+    return MulticlassModel(mapper^, booster^)
