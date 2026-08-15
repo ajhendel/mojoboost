@@ -7,9 +7,9 @@ does differently, and what has not been verified. It describes
 public API.
 
 Status, in one line: the core is written and its `boosting='rf'` surface is
-imported by `src/mojotrees/alternate_boosting.mojo`; no random-forest code
-has been compiled or run, and `boosting='rf'` is still rejected by the Python
-layer and by `parse_params`. See `handoffs/remaining_02_rf.md`.
+imported by `src/mojotrees/alternate_boosting.mojo`; every entry point
+compiles, nothing has been run, and `boosting='rf'` is still rejected by the
+Python layer and by `parse_params`. See section 10.
 
 ## 1. What random-forest mode is, and what it is not
 
@@ -54,8 +54,11 @@ Then, for tree `i` of `n_estimators`:
 
 3. Draw the row sample for round `i` (section 4).
 4. Grow the tree with `tree.grow_tree(data, grad0, hess0, params.tree, bag,
-   i)`. The grower is unmodified: every tree control applies to a forest as
-   it does to a boosted ensemble.
+   i, bundling)`. The grower is unmodified: every tree control applies to a
+   forest as it does to a boosted ensemble, `enable_bundle` included.
+   `RfParams.bundling` is `BoosterParams.bundling` and the plan is fitted
+   once per training call, as in `boosting._boost_rounds`, because a bundle
+   is a property of the matrix and every tree in a forest sees the same one.
 5. For `quantile`, `mae`, and `mape`, replace the leaf values with a
    percentile of the residuals (section 3).
 6. Add `base_score` to every node value, so the tree predicts on the raw
@@ -112,6 +115,17 @@ not accepted as the only source, matching LightGBM. They do decorrelate
 trees, but accepting a configuration LightGBM aborts on would be a silent
 difference in the accepting direction, and the error names the three
 parameters that do work.
+
+One source can be accepted from the parameters and then fail to apply to the
+data, and only one: balanced bagging needs a positive row (LightGBM's second
+condition for turning it on, `sampling.has_positive_rows`), and a target with
+none leaves the round loop drawing no bag at all. A boosted run survives that
+because its gradients move anyway; a forest would silently become
+`n_estimators` copies of one tree, which is the exact outcome this check
+exists to prevent. So `_rf_rounds` refuses it, naming the labels, when
+`rf_randomizer_name` reports balanced bagging as the only source. That test is
+`rf_randomizer_name` itself rather than a second reading of the fields, so
+"the only source" means here what it means to `check_rf_params`.
 
 `RfParams.default()` is 100 trees on 80% row bags redrawn every round.
 LightGBM has no default that satisfies its own check: `bagging_fraction`
@@ -198,11 +212,13 @@ comparable; each class's tree still draws its own feature set.
 `RfMulticlassBooster.to_multiclass_booster()` bridges on the same terms as
 the single-output case.
 
-Multiclass is reachable from `train_forest_multiclass` only.
-`alternate_boosting.mojo` refuses multiclass for both alternate modes, so
-`boosting='rf'` with `objective='multiclass'` is not trainable through the
-mode surface yet. That is a wiring gap, not an algorithm gap; the handoff
-records it.
+`alternate_boosting.train_boosting_multiclass` and
+`train_boosting_multiclass_with_valid` dispatch `rf` here and bridge the
+result back. Continuation is the exception: a bridged `MulticlassBooster` has
+folded its class log priors away and there is no bridged multiclass
+continuation to dispatch to, so `train_boosting_multiclass_more` refuses `rf`
+by name and points at `train_forest_multiclass_more`, which carries its own
+base scores and needs no precondition at all.
 
 ## 8. What is refused
 
@@ -213,6 +229,7 @@ records it.
 | `init_score` | `check_rf_init_score` | a per-row offset moves the point each row's gradient is taken at, and a forest takes every gradient at one shared constant. LightGBM `CHECK_EQ(train_data->metadata().init_score(), nullptr)` |
 | `learning_rate` other than 1.0 | `check_rf_learning_rate` | LightGBM accepts it and overrides it, so the number the user set is not the number the model trains with |
 | no randomization | `check_rf_params` | section 4 |
+| balanced bagging as the only randomizer, on a target with no positive row | `_rf_rounds` | section 4: it is accepted from the parameters and then draws no bag, so every tree would be identical |
 | two row samplers at once | `boosting._check_goss`, `boosting._check_class_bagging` | both own the row list a tree is grown on. Unchanged from GBDT |
 | balanced bagging outside binary | `boosting._check_class_bagging` | LightGBM reads `pos_bagging_fraction` for binary classification only |
 
@@ -258,14 +275,27 @@ the counts, and the distributions match. This is the trade `bagging.mojo` and
 
 ## 10. What has not been verified
 
-Nothing here has been compiled or run. No test file references
-`boosting_rf.mojo`, no benchmark trains a forest, and no comparison against
-LightGBM's rf output has been made. Every claim above is a reading of
-`src/boosting/rf.hpp` and of the mojotrees modules named, and the parity
+Every entry point here has been compiled, by a throwaway driver that calls
+each one so that `mojo build` elaborates its body rather than only its
+signature. Nothing has been run. No test file references `boosting_rf.mojo`,
+no benchmark trains a forest, and no comparison against LightGBM's rf output
+has been made. Every claim above is a reading of `src/boosting/rf.hpp`
+(master, read 2026-08-15) and of the mojotrees modules named, and the parity
 claims are claims about intent rather than measurements.
 
-The first checks worth running are listed in section 5 of
-`handoffs/remaining_02_rf.md`. The cheapest of them is also the sharpest: a
-forest of `T` identical trees is what an unrandomized run would produce, so
-`check_rf_params` refusing that configuration is the one invariant the whole
-mode rests on.
+The first checks worth writing, cheapest first:
+
+1. An unrandomized forest is `T` copies of one tree. That is what
+   `check_rf_params` refuses, and building it deliberately (by reaching
+   `_rf_rounds` past the check) is the one invariant the whole mode rests
+   on: if the copies are not identical, some draw is reading state it should
+   not.
+2. `train_forest` with `n_estimators = 40` then `train_forest_more` with 60
+   is `train_forest` with 100, tree for tree. The gradients are constant, so
+   this must be exact, unlike the boosted continuation.
+3. `RfBooster.predict_raw_row` equals `to_booster().predict_raw_row` for the
+   full range, and differs from it on a slice. Both halves matter: the first
+   is the bridge, the second is what section 6 warns about.
+4. An L1 forest's leaves are the median of the labels in the leaf, which is
+   section 3's identity and the sharpest check on the renewal-then-bias
+   order.

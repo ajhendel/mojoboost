@@ -18,7 +18,8 @@ algorithm and defines no model:
   `(trees, weights, raw)` and grows no tree. `train_dart` below is the loop
   that drives it, and it is here rather than in `boosting.mojo` only because
   this lane does not own `boosting.mojo`. That is a temporary address, not a
-  design; see `handoffs/connect_17_alternate_boosting.md`.
+  design; the `alternate_boosting` row in `tools/connectivity_audit.py`
+  records it.
 - `boosting_rf.mojo` is the whole of random-forest mode, single-output and
   multiclass, including its own continuation, early stopping, and the
   `Booster` adapter. This module only routes `rf` into it.
@@ -79,9 +80,10 @@ checks `boosting_rf.is_forest` before either touches anything.
 
 Combinations that are refused rather than resolved
 --------------------------------------------------
-- `dart` with GOSS, on a non-CPU device, with ranking, with
-  `uniform_drop=False`, or with a configuration that never drops
-  (`boosting_dart.check_dart_supported`, `DartParams.validate`).
+- `dart` with GOSS, on a non-CPU device, with ranking, or with a
+  configuration that never drops (`boosting_dart.check_dart_supported`,
+  `DartParams.validate`). Both of LightGBM's drop rules are implemented,
+  `uniform_drop` either way.
 - `rf` with a learning rate other than 1.0
   (`boosting_rf.check_rf_learning_rate`), with `init_score`
   (`check_rf_init_score`), with a custom objective or `lambdarank`
@@ -93,11 +95,6 @@ Combinations that are refused rather than resolved
   that cannot take one.
 - `dart` mode with a disabled `DartParams`, and an enabled one under any
   other mode.
-- Multiclass under `dart`, from `train_boosting_multiclass` and its two
-  relatives. `boosting_rf` implements multiclass forests
-  (`train_forest_multiclass`), so only DART is single-output here;
-  `boosting_dart` is written for the round-major multiclass layout, so that
-  gap is a loop rather than a redesign.
 - Continuing a **bridged multiclass forest** (`train_boosting_multiclass_more`
   under `rf`), because the class log priors its trees were fitted at are
   folded away and `boosting_rf` exposes no bridged multiclass continuation to
@@ -108,20 +105,22 @@ The four entry points and what each mode does
 | | `gbdt` / `goss` | `dart` | `rf` |
 | `train_boosting` | `boosting.train` | here | `train_rf` |
 | `train_boosting_more` | `train_more` | here | `train_rf_more` |
-| `..._with_valid` | `train_with_valid` | REFUSED | `train_forest_with_valid` |
-| `..._multiclass` | `train_multiclass` | REFUSED | `train_forest_multiclass` |
+| `..._with_valid` | `train_with_valid` | here | `train_forest_with_valid` |
+| `..._multiclass` | `train_multiclass` | here | `train_forest_multiclass` |
 
 `..._multiclass_more` and `..._multiclass_with_valid` follow the multiclass
 row, except that `rf` continuation is refused as above.
 
-DART validation-set early stopping is NOT connected. `boosting_dart` provides
+DART early stopping does not truncate. `boosting_dart` provides
 `DartBestState`, `dart_record_best`, and `dart_restore_best` precisely because
 truncating a DART ensemble to its best round is wrong: a later round may have
 rescaled a tree the best round contained, so popping trees recovers the right
-tree set with the wrong weights. So `train_boosting_with_valid` refuses `dart`
-rather than truncating and quietly getting the weights wrong. Truncation *is*
-exact for a forest, whose trees are independent, which is why the same
-function dispatches `rf` to `boosting_rf.train_forest_with_valid`.
+tree set with the wrong weights. `train_dart_with_valid` therefore snapshots
+the weight vector on every improvement and restores it at the end, which is
+exact because a tree's node values are not touched until
+`fold_weights_into_trees` runs once at the end of the fit. Truncation alone
+*is* exact for a forest, whose trees are independent, which is why the same
+dispatcher sends `rf` to `boosting_rf.train_forest_with_valid`.
 """
 
 from .bagging import (
@@ -139,7 +138,11 @@ from .boosting import (
     _check_objective,
     _check_sample_weight,
     _fill_grad_hess,
+    _fill_softmax_grad_hess,
+    _mean_loss,
+    _multiclass_mean_loss,
     _renew_leaf_values,
+    _softmax_inplace,
     objective_renews_leaves,
     renewal_alpha,
     renewal_weights,
@@ -151,17 +154,29 @@ from .boosting import (
     train_with_valid,
 )
 from .boosting_dart import (
+    DartBestState,
     DartParams,
     check_dart_supported,
+    dart_advance_scores,
     dart_begin_round,
     dart_commit_round,
     dart_normalization,
     dart_recompute_raw,
+    dart_record_best,
+    dart_restore_best,
     dart_uniform_weights,
     select_drop,
 )
 from .boosting_rf import (
     RfParams,
+    # The per-class log priors a softmax run starts from. Imported rather
+    # than copied for the reason `boosting_rf` gives where it defines them:
+    # `train_multiclass` computes the same quantity inline and boosting.mojo
+    # does not expose it, so there are two copies already and a third here
+    # would be the one that drifts. The dependency is the wrong way round
+    # (dart reaching into rf), and it goes away when this is lifted into
+    # boosting.mojo, which is where both callers should be reading it from.
+    _class_log_priors,
     check_rf_learning_rate,
     is_rf_boosting,
     train_forest_multiclass,
@@ -171,6 +186,7 @@ from .boosting_rf import (
     train_rf_more,
 )
 from .device import CPU_DEVICE
+from .efb import prepare_bundling
 from .goss import GossParams
 from .model import Model
 from .sampling import ClassBaggingParams
@@ -433,9 +449,20 @@ def _dart_rounds(
     bag, and the per-tree feature sample all read the absolute round index and
     a continued run follows the schedule an uninterrupted one would.
 
-    Single output only: `n_classes` is 1 at every call into `boosting_dart`,
-    which is itself written for the round-major multiclass layout as well.
+    `weights` is handed to `select_drop` as well as maintained by it, because
+    LightGBM's default drop rule (`uniform_drop=false`) picks an iteration
+    with a probability proportional to what it currently weighs.
+
+    `params.bundling` is fitted once here and shared by every round, as in
+    `boosting._boost_rounds`. A bundled fit differs from an unbundled one in
+    cost and not in result: the trees name original features, so the dropped
+    trees' contributions and the leaf renewal below read the original matrix
+    either way.
+
+    Single output only: `n_classes` is 1 at every call into `boosting_dart`;
+    `_dart_rounds_multiclass` is the round-major counterpart.
     """
+    var bundling = prepare_bundling(data, params.bundling)
     var n = data.n_rows
     var signs = params.tree.monotone.active_signs()
     var renews = objective_renews_leaves(objective)
@@ -450,14 +477,16 @@ def _dart_rounds(
 
     for i in range(params.n_estimators):
         var round = round_offset + i
-        var drop = select_drop(dart, len(trees), round)
+        var drop = select_drop(dart, len(trees), round, weights, 1)
         dart_begin_round(data, trees, weights, drop, 1, raw, contribution)
 
         refresh_bag(bag, bagging, n, round)
         _fill_grad_hess(
             raw, target, objective, sample_weight, alpha, grad, hess
         )
-        var tree = grow_tree(data, grad, hess, params.tree, bag, round)
+        var tree = grow_tree(
+            data, grad, hess, params.tree, bag, round, bundling
+        )
         if renews:
             # Renewal takes residuals against the score the tree was actually
             # fitted to, which under DART is the dropped-out score. That is
@@ -596,11 +625,24 @@ def train_dart_more(
     - `params.learning_rate` is the rate the CONTINUED rounds use and is not
       checked against the ensemble, because a folded DART ensemble's stored
       factor is 1.0 and no longer records the rate it was trained with. It is
-      the caller's job to pass the same one. This is the one place the fold
-      gives something up.
+      the caller's job to pass the same one.
+    - Under `uniform_drop=false`, the drop probabilities of the trees that
+      were already there are equalized. That rule reads each iteration's
+      weight, the fold has put every weight inside a tree's node values, and
+      lifting the ensemble back gives all of them 1.0, so the first continued
+      rounds cannot tell an iteration that was rescaled to nothing from one
+      that was never dropped. Rounds grown here weigh what they weigh and are
+      distinguished normally. LightGBM sidesteps this by never dropping an
+      iteration from before the continuation at all: its `tree_weight_` holds
+      only the current session's iterations and its drop loop runs over
+      `iter_`, this session's count.
     - The existing trees are rewritten, not just appended to. A round that
       drops a tree rescales it, so the ensemble handed back is not the
       ensemble handed in plus new trees.
+
+    The first two are what the fold costs. Both are properties of continuing
+    a saved model, not of DART, and both go away with a weight vector on
+    `Booster`.
 
     Resuming rebuilds the raw scores from the model with
     `dart_recompute_raw`. This is NOT bit-identical to training the same
@@ -666,6 +708,578 @@ def train_dart_more(
     )
     fold_weights_into_trees(booster.trees, weights)
     return len(booster.trees) - before
+
+
+def train_dart_with_valid(
+    data: BinnedMatrix,
+    target: List[Float64],
+    valid_data: BinnedMatrix,
+    valid_target: List[Float64],
+    objective: Int,
+    params: BoosterParams,
+    early_stopping_rounds: Int,
+    dart: DartParams = DartParams.enable(),
+    min_delta: Float64 = 0.0,
+    sample_weight: List[Float64] = [],
+    alpha: Float64 = 0.9,
+    bagging: BaggingParams = BaggingParams.disabled(),
+) raises -> Booster:
+    """Train a DART ensemble with validation-set early stopping.
+
+    The loop is `_dart_rounds` with two additions, and it is written out
+    rather than shared because both of them are per-round observations the
+    round loop has no reason to make.
+
+    **A second score cache.** The validation rows go through the identical
+    round: `dart_begin_round` on the validation matrix removes the same
+    dropped iterations from `valid_raw`, and `dart_advance_scores` puts back
+    the same fraction and adds the new tree at the same weight. Sharing those
+    two functions with the training cache is what makes the two caches
+    provably the same arithmetic on different rows. Validation rows are never
+    bagged and never weighted, as in `boosting.train_with_valid`.
+
+    **A snapshot instead of a truncation.** A GBDT run records its best round
+    and pops trees off the end, which works because the trees it keeps were
+    untouched by the rounds it discards. A DART round rescales the trees it
+    dropped, so the surviving trees at the end of a run carry weights that
+    later rounds gave them, and popping recovers the right tree set with the
+    wrong weights. So `dart_record_best` snapshots the weight vector on every
+    improvement and `dart_restore_best` truncates and then overwrites. The
+    trees themselves need no snapshot: their node values are not touched
+    until `fold_weights_into_trees` runs, once, here at the end.
+
+    LightGBM has no counterpart to this function. Its DART overrides
+    `EvalAndCheckEarlyStopping` to return false unconditionally, so
+    `early_stopping_round` is silently inert under `boosting='dart'` there.
+    This trains the same rounds and additionally stops on them.
+    """
+    if len(target) != data.n_rows:
+        raise Error("target length must equal n_rows")
+    if len(valid_target) != valid_data.n_rows:
+        raise Error("valid_target length must equal valid n_rows")
+    if valid_data.n_features != data.n_features:
+        raise Error("valid_data must have the same features")
+    if params.n_estimators < 0:
+        raise Error("num_iterations must be nonnegative")
+    if params.learning_rate <= 0.0:
+        raise Error("learning_rate must be positive")
+    if early_stopping_rounds < 1:
+        raise Error("early_stopping_rounds must be positive")
+    if not dart.enabled:
+        raise Error(
+            "train_dart_with_valid needs an enabled DartParams; use"
+            " DartParams.enable()"
+        )
+    check_dart_supported(dart, CPU_DEVICE, False, False, 1)
+    check_bagging(bagging)
+    _check_objective(objective, target, alpha)
+    _check_sample_weight(sample_weight, data.n_rows)
+    params.tree.monotone.check_features(data.n_features)
+
+    var bundling = prepare_bundling(data, params.bundling)
+    var n = data.n_rows
+    var n_valid = valid_data.n_rows
+    var base_score = _base_score(target, objective, sample_weight, alpha)
+    var raw = List[Float64](capacity=n)
+    for _ in range(n):
+        raw.append(base_score)
+    var valid_raw = List[Float64](capacity=n_valid)
+    for _ in range(n_valid):
+        valid_raw.append(base_score)
+
+    var signs = params.tree.monotone.active_signs()
+    var renews = objective_renews_leaves(objective)
+    var renew_w = renewal_weights(objective, target, sample_weight)
+    var renew_a = renewal_alpha(objective, alpha)
+    var grad = List[Float64](capacity=n)
+    var hess = List[Float64](capacity=n)
+    var bag = List[Int]()
+    var contribution = List[Float64]()
+    var valid_contribution = List[Float64]()
+
+    var trees = List[Tree]()
+    var weights = List[Float64]()
+    var best = DartBestState.initial(
+        _mean_loss(valid_raw, valid_target, objective, alpha)
+    )
+
+    for i in range(params.n_estimators):
+        var drop = select_drop(dart, len(trees), i, weights, 1)
+        dart_begin_round(data, trees, weights, drop, 1, raw, contribution)
+        dart_begin_round(
+            valid_data, trees, weights, drop, 1, valid_raw, valid_contribution
+        )
+
+        refresh_bag(bag, bagging, n, i)
+        _fill_grad_hess(
+            raw, target, objective, sample_weight, alpha, grad, hess
+        )
+        var tree = grow_tree(data, grad, hess, params.tree, bag, i, bundling)
+        if renews:
+            _renew_leaf_values(
+                tree, data, target, raw, renew_w, renew_a, bag, signs,
+                params.tree.extra,
+            )
+
+        if tree.n_leaves == 1 and abs(tree.value[0]) < 1e-12:
+            # Abandoned whole, as in `_dart_rounds`: both caches go back to
+            # what they held before the drop and no weight is recorded for a
+            # tree that was never kept.
+            for j in range(n):
+                raw[j] += contribution[j]
+            for j in range(n_valid):
+                valid_raw[j] += valid_contribution[j]
+            if bagging_enabled(bagging) or not drop.is_empty():
+                continue
+            break
+
+        var norm = dart_normalization(
+            drop.count(), params.learning_rate, dart.xgboost_dart_mode
+        )
+        var grown = List[Tree]()
+        grown.append(tree^)
+        # The validation cache first, while `grown` is still readable: the
+        # commit below consumes it.
+        dart_advance_scores(
+            valid_data, drop, norm, 1, valid_contribution, grown, valid_raw
+        )
+        dart_commit_round(
+            data, drop, norm, 1, contribution, grown^, trees, weights, raw
+        )
+
+        var loss = _mean_loss(valid_raw, valid_target, objective, alpha)
+        if not dart_record_best(best, weights, loss, min_delta):
+            if len(trees) - best.n_trees >= early_stopping_rounds:
+                break
+
+    dart_restore_best(best, trees, weights)
+    fold_weights_into_trees(trees, weights)
+    return Booster(
+        trees^,
+        base_score,
+        1.0,
+        objective,
+        params.tree.monotone.copy(),
+    )
+
+
+def _dart_rounds_multiclass(
+    data: BinnedMatrix,
+    labels: List[Int],
+    n_classes: Int,
+    params: BoosterParams,
+    sample_weight: List[Float64],
+    bagging: BaggingParams,
+    dart: DartParams,
+    learning_rate: Float64,
+    round_offset: Int,
+    mut raw: List[Float64],
+    mut trees: List[Tree],
+    mut weights: List[Float64],
+) raises -> Int:
+    """The softmax DART loop, and the multiclass counterpart of
+    `_dart_rounds`. Returns the number of rounds grown.
+
+    `raw` is row-major (`raw[r * n_classes + k]`) and `trees` is round-major
+    (`trees[i * n_classes + k]`), which are the layouts
+    `_boost_rounds_multiclass` and `MulticlassBooster` already use, and which
+    `boosting_dart` was written for: every entry point there takes
+    `n_classes` and walks the same layout.
+
+    **A round drops whole iterations.** All `n_classes` trees of a dropped
+    iteration come out together and go back together at one factor, because
+    dropping one class's tree alone would tilt the softmax toward the classes
+    whose trees survived. That is `DartDrop`'s definition, and it is also
+    LightGBM's: `DroppingTrees` selects an iteration index and then loops
+    `cur_tree_id` over `num_tree_per_iteration_`.
+
+    The round's probabilities come from the dropped-out `raw`, so every
+    class's gradient describes the ensemble the round's trees are actually
+    added to. One bag serves the whole round, as in
+    `_boost_rounds_multiclass`, and each class's tree still draws its own
+    feature set from `round * n_classes + k`.
+
+    Softmax is not a leaf-renewing objective, so a multiclass round has no
+    renewal step and needs none of `_dart_rounds`'s renewal state.
+    """
+    var bundling = prepare_bundling(data, params.bundling)
+    var n = data.n_rows
+    var prob = List[Float64](capacity=n * n_classes)
+    for _ in range(n * n_classes):
+        prob.append(0.0)
+    var grad = List[Float64](capacity=n)
+    var hess = List[Float64](capacity=n)
+    var bag = List[Int]()
+    var contribution = List[Float64]()
+    var grown_rounds = 0
+
+    for i in range(params.n_estimators):
+        var round = round_offset + i
+        var n_iterations = len(trees) // n_classes
+        var drop = select_drop(dart, n_iterations, round, weights, n_classes)
+        dart_begin_round(
+            data, trees, weights, drop, n_classes, raw, contribution
+        )
+
+        refresh_bag(bag, bagging, n, round)
+        for r in range(n):
+            for k in range(n_classes):
+                prob[r * n_classes + k] = raw[r * n_classes + k]
+            _softmax_inplace(prob, r * n_classes, n_classes)
+
+        var grown = List[Tree](capacity=n_classes)
+        var made_progress = False
+        for k in range(n_classes):
+            _fill_softmax_grad_hess(
+                prob, labels, k, n_classes, sample_weight, grad, hess
+            )
+            var tree = grow_tree(
+                data,
+                grad,
+                hess,
+                params.tree,
+                bag,
+                round * n_classes + k,
+                bundling,
+            )
+            if tree.n_leaves > 1 or abs(tree.value[0]) >= 1e-12:
+                made_progress = True
+            grown.append(tree^)
+
+        if not made_progress:
+            # No class had anything to add, so the whole round is abandoned
+            # and the dropped iterations go back at the weights they had.
+            for j in range(len(raw)):
+                raw[j] += contribution[j]
+            if bagging_enabled(bagging) or not drop.is_empty():
+                continue
+            break
+
+        var norm = dart_normalization(
+            drop.count(), learning_rate, dart.xgboost_dart_mode
+        )
+        dart_commit_round(
+            data,
+            drop,
+            norm,
+            n_classes,
+            contribution,
+            grown^,
+            trees,
+            weights,
+            raw,
+        )
+        grown_rounds += 1
+    return grown_rounds
+
+
+def train_dart_multiclass(
+    data: BinnedMatrix,
+    labels: List[Int],
+    n_classes: Int,
+    params: BoosterParams,
+    dart: DartParams = DartParams.enable(),
+    sample_weight: List[Float64] = [],
+    bagging: BaggingParams = BaggingParams.disabled(),
+) raises -> MulticlassBooster:
+    """Train a softmax DART ensemble, LightGBM's `boosting='dart'` with
+    `objective='multiclass'`.
+
+    Every argument other than `dart` carries the meaning it has in
+    `boosting.train_multiclass`, including the base scores, which are the log
+    class priors weighted by `sample_weight`. The returned
+    `MulticlassBooster` has a `learning_rate` of 1.0 because every tree's
+    weight has been folded into its node values; see the module docstring.
+    """
+    if len(labels) != data.n_rows:
+        raise Error("labels length must equal n_rows")
+    if n_classes < 2:
+        raise Error("n_classes must be at least 2")
+    if params.n_estimators < 0:
+        raise Error("num_iterations must be nonnegative")
+    if params.learning_rate <= 0.0:
+        raise Error("learning_rate must be positive")
+    if not dart.enabled:
+        raise Error(
+            "train_dart_multiclass needs an enabled DartParams; use"
+            " DartParams.enable()"
+        )
+    check_dart_supported(dart, CPU_DEVICE, False, False, n_classes)
+    check_bagging(bagging)
+    _check_sample_weight(sample_weight, data.n_rows)
+    params.tree.monotone.check_features(data.n_features)
+
+    var base_scores = _class_log_priors(labels, n_classes, sample_weight)
+    var raw = List[Float64](capacity=data.n_rows * n_classes)
+    for _ in range(data.n_rows):
+        for k in range(n_classes):
+            raw.append(base_scores[k])
+
+    var trees = List[Tree]()
+    var weights = List[Float64]()
+    _ = _dart_rounds_multiclass(
+        data,
+        labels,
+        n_classes,
+        params,
+        sample_weight,
+        bagging,
+        dart,
+        params.learning_rate,
+        0,
+        raw,
+        trees,
+        weights,
+    )
+    fold_weights_into_trees(trees, weights)
+    return MulticlassBooster(
+        trees^,
+        base_scores^,
+        n_classes,
+        1.0,
+        params.tree.monotone.copy(),
+    )
+
+
+def train_dart_multiclass_more(
+    mut booster: MulticlassBooster,
+    data: BinnedMatrix,
+    labels: List[Int],
+    params: BoosterParams,
+    dart: DartParams = DartParams.enable(),
+    sample_weight: List[Float64] = [],
+    bagging: BaggingParams = BaggingParams.disabled(),
+) raises -> Int:
+    """Grow `params.n_estimators` more softmax DART rounds and return how many
+    rounds were added.
+
+    The single-output continuation's reasoning, unchanged (`train_dart_more`):
+    a folded ensemble lifts back into the weighted form as
+    `dart_uniform_weights(n_trees, 1.0)`, the rate the continued rounds use is
+    the caller's to supply because the folded ensemble no longer records one,
+    `uniform_drop=false` cannot tell the pre-existing iterations apart by
+    weight for the same reason, the existing trees are rewritten rather than
+    only appended to, and the resumed run agrees with a single call on the
+    trees it grows but not on the last bits of the scores.
+
+    The base scores are the forest's own, not re-derived from the labels in
+    hand, for the reason `boosting.train_multiclass_more` gives: they are the
+    priors of the data the ensemble was first fitted on.
+    """
+    if len(labels) != data.n_rows:
+        raise Error("labels length must equal n_rows")
+    if params.n_estimators < 0:
+        raise Error("num_iterations must be nonnegative")
+    if params.learning_rate <= 0.0:
+        raise Error("learning_rate must be positive")
+    if booster.learning_rate != 1.0:
+        raise Error(
+            "train_dart_multiclass_more expects an ensemble trained by"
+            " train_dart_multiclass: its shrinkage factor must be 1.0,"
+            " because a dart round folds each tree's weight into that tree's"
+            " node values. Continuing a gbdt ensemble, or a random forest"
+            " bridged by RfMulticlassBooster.to_multiclass_booster, here"
+            " would discard the factor it carries"
+        )
+    if not dart.enabled:
+        raise Error(
+            "train_dart_multiclass_more needs an enabled DartParams; use"
+            " DartParams.enable()"
+        )
+    check_dart_supported(dart, CPU_DEVICE, False, False, booster.n_classes)
+    check_bagging(bagging)
+    _check_sample_weight(sample_weight, data.n_rows)
+    params.tree.monotone.check_features(data.n_features)
+    for r in range(len(labels)):
+        if labels[r] < 0 or labels[r] >= booster.n_classes:
+            raise Error("label out of range")
+
+    var weights = dart_uniform_weights(len(booster.trees), 1.0)
+    var raw = dart_recompute_raw(
+        data,
+        booster.trees,
+        weights,
+        booster.base_scores,
+        booster.n_classes,
+    )
+    var before = booster.n_iterations()
+    var added = _dart_rounds_multiclass(
+        data,
+        labels,
+        booster.n_classes,
+        params,
+        sample_weight,
+        bagging,
+        dart,
+        params.learning_rate,
+        before,
+        raw,
+        booster.trees,
+        weights,
+    )
+    fold_weights_into_trees(booster.trees, weights)
+    return added
+
+
+def train_dart_multiclass_with_valid(
+    data: BinnedMatrix,
+    labels: List[Int],
+    valid_data: BinnedMatrix,
+    valid_labels: List[Int],
+    n_classes: Int,
+    params: BoosterParams,
+    early_stopping_rounds: Int,
+    dart: DartParams = DartParams.enable(),
+    min_delta: Float64 = 0.0,
+    sample_weight: List[Float64] = [],
+    bagging: BaggingParams = BaggingParams.disabled(),
+) raises -> MulticlassBooster:
+    """Train a softmax DART ensemble with validation-set early stopping.
+
+    `train_dart_with_valid` over the round-major layout: the same second
+    score cache maintained by the same two functions, and the same weight
+    snapshot in place of a truncation. The signal is the multiclass log loss
+    of the whole ensemble, and a snapshot is taken only between rounds, so
+    the tree count it records is always a whole number of rounds and
+    restoring keeps the per-class trees in step.
+    """
+    if len(labels) != data.n_rows:
+        raise Error("labels length must equal n_rows")
+    if len(valid_labels) != valid_data.n_rows:
+        raise Error("valid_labels length must equal valid n_rows")
+    if valid_data.n_features != data.n_features:
+        raise Error("valid_data must have the same features")
+    if n_classes < 2:
+        raise Error("n_classes must be at least 2")
+    if params.n_estimators < 0:
+        raise Error("num_iterations must be nonnegative")
+    if params.learning_rate <= 0.0:
+        raise Error("learning_rate must be positive")
+    if early_stopping_rounds < 1:
+        raise Error("early_stopping_rounds must be positive")
+    if not dart.enabled:
+        raise Error(
+            "train_dart_multiclass_with_valid needs an enabled DartParams;"
+            " use DartParams.enable()"
+        )
+    check_dart_supported(dart, CPU_DEVICE, False, False, n_classes)
+    check_bagging(bagging)
+    _check_sample_weight(sample_weight, data.n_rows)
+    params.tree.monotone.check_features(data.n_features)
+    for r in range(len(valid_labels)):
+        if valid_labels[r] < 0 or valid_labels[r] >= n_classes:
+            raise Error("valid label out of range")
+
+    var bundling = prepare_bundling(data, params.bundling)
+    var n = data.n_rows
+    var n_valid = valid_data.n_rows
+    var base_scores = _class_log_priors(labels, n_classes, sample_weight)
+    var raw = List[Float64](capacity=n * n_classes)
+    for _ in range(n):
+        for k in range(n_classes):
+            raw.append(base_scores[k])
+    var valid_raw = List[Float64](capacity=n_valid * n_classes)
+    for _ in range(n_valid):
+        for k in range(n_classes):
+            valid_raw.append(base_scores[k])
+
+    var prob = List[Float64](capacity=n * n_classes)
+    for _ in range(n * n_classes):
+        prob.append(0.0)
+    var grad = List[Float64](capacity=n)
+    var hess = List[Float64](capacity=n)
+    var bag = List[Int]()
+    var contribution = List[Float64]()
+    var valid_contribution = List[Float64]()
+
+    var trees = List[Tree]()
+    var weights = List[Float64]()
+    var best = DartBestState.initial(
+        _multiclass_mean_loss(valid_raw, valid_labels, n_classes)
+    )
+
+    for i in range(params.n_estimators):
+        var n_iterations = len(trees) // n_classes
+        var drop = select_drop(dart, n_iterations, i, weights, n_classes)
+        dart_begin_round(
+            data, trees, weights, drop, n_classes, raw, contribution
+        )
+        dart_begin_round(
+            valid_data,
+            trees,
+            weights,
+            drop,
+            n_classes,
+            valid_raw,
+            valid_contribution,
+        )
+
+        refresh_bag(bag, bagging, n, i)
+        for r in range(n):
+            for k in range(n_classes):
+                prob[r * n_classes + k] = raw[r * n_classes + k]
+            _softmax_inplace(prob, r * n_classes, n_classes)
+
+        var grown = List[Tree](capacity=n_classes)
+        var made_progress = False
+        for k in range(n_classes):
+            _fill_softmax_grad_hess(
+                prob, labels, k, n_classes, sample_weight, grad, hess
+            )
+            var tree = grow_tree(
+                data, grad, hess, params.tree, bag, i * n_classes + k, bundling
+            )
+            if tree.n_leaves > 1 or abs(tree.value[0]) >= 1e-12:
+                made_progress = True
+            grown.append(tree^)
+
+        if not made_progress:
+            for j in range(len(raw)):
+                raw[j] += contribution[j]
+            for j in range(len(valid_raw)):
+                valid_raw[j] += valid_contribution[j]
+            if bagging_enabled(bagging) or not drop.is_empty():
+                continue
+            break
+
+        var norm = dart_normalization(
+            drop.count(), params.learning_rate, dart.xgboost_dart_mode
+        )
+        dart_advance_scores(
+            valid_data,
+            drop,
+            norm,
+            n_classes,
+            valid_contribution,
+            grown,
+            valid_raw,
+        )
+        dart_commit_round(
+            data,
+            drop,
+            norm,
+            n_classes,
+            contribution,
+            grown^,
+            trees,
+            weights,
+            raw,
+        )
+
+        var loss = _multiclass_mean_loss(valid_raw, valid_labels, n_classes)
+        if not dart_record_best(best, weights, loss, min_delta):
+            if len(trees) - best.n_trees >= early_stopping_rounds * n_classes:
+                break
+
+    dart_restore_best(best, trees, weights)
+    fold_weights_into_trees(trees, weights)
+    return MulticlassBooster(
+        trees^,
+        base_scores^,
+        n_classes,
+        1.0,
+        params.tree.monotone.copy(),
+    )
 
 
 def train_boosting(
@@ -846,19 +1460,34 @@ def train_boosting_with_valid(
     because averaging removes variance, so the answer is "how many trees are
     enough", not "has this converged".
 
-    `dart` is refused. `boosting_dart` supplies `DartBestState`,
-    `dart_record_best`, and `dart_restore_best` for the version that records
-    and replays the best state instead, which is what DART needs and which
-    nothing calls yet; see the module docstring.
+    `dart` goes to `train_dart_with_valid`, which does NOT truncate: a round
+    after the best one may have rescaled a tree the best round contained, so
+    it snapshots the weight vector on every improvement
+    (`boosting_dart.dart_record_best`) and restores it at the end
+    (`dart_restore_best`).
     """
     boosting.validate(goss)
     if boosting.mode == BOOSTING_DART:
-        raise Error(
-            "boosting='dart' has no validation-set entry point: a round after"
-            " the best one may have rescaled a tree the best round contained,"
-            " so truncating to the best round recovers the right tree set with"
-            " the wrong weights. Use boosting_dart.dart_record_best /"
-            " dart_restore_best to hold the best state instead"
+        if class_bagging.enabled():
+            raise Error(
+                "boosting='dart' does not support balanced bagging;"
+                " pos_bagging_fraction / neg_bagging_fraction draw a"
+                " class-conditional bag, which no dart round has been written"
+                " to take"
+            )
+        return train_dart_with_valid(
+            data,
+            target,
+            valid_data,
+            valid_target,
+            objective,
+            params,
+            early_stopping_rounds,
+            boosting.dart,
+            min_delta,
+            sample_weight,
+            alpha,
+            bagging,
         )
     if boosting.mode == BOOSTING_RF:
         _check_rf_uniform_args(class_bagging)
@@ -916,18 +1545,20 @@ def train_boosting_multiclass(
     `neg_bagging_fraction` are binary-classification controls, which is what
     `boosting_rf.check_rf_params` says for a forest.
 
-    `dart` is refused, and the gap is a loop rather than a redesign;
-    see the module docstring.
+    `dart` goes to `train_dart_multiclass`, whose rounds drop whole
+    iterations so that a round's per-class trees are hidden and restored
+    together.
     """
     boosting.validate(goss)
     if boosting.mode == BOOSTING_DART:
-        raise Error(
-            "boosting='dart' is single-output in this build: boosting_dart is"
-            " already written for the round-major multiclass layout"
-            " (n_classes reaches select_drop, dart_begin_round,"
-            " dart_commit_round, and dart_recompute_raw, and a round drops"
-            " whole iterations so a round's class group goes together), but"
-            " no multiclass round loop drives it yet"
+        return train_dart_multiclass(
+            data,
+            labels,
+            n_classes,
+            params,
+            boosting.dart,
+            sample_weight,
+            bagging,
         )
     if boosting.mode == BOOSTING_RF:
         check_rf_learning_rate(params.learning_rate)
@@ -967,7 +1598,9 @@ def train_boosting_multiclass_more(
     `RfMulticlassBooster` through `train_forest_multiclass_more`, which
     carries its own base scores and needs no precondition at all.
 
-    `dart` is refused for the same reason `train_boosting_multiclass` is.
+    `dart` goes to `train_dart_multiclass_more`, which checks the ensemble's
+    unit shrinkage factor first, exactly as the single-output continuation
+    does, and rewrites the existing trees rather than only appending to them.
     """
     boosting.validate(goss)
     if boosting.mode == BOOSTING_RF:
@@ -980,9 +1613,14 @@ def train_boosting_multiclass_more(
             " boosting_rf.train_forest_multiclass_more"
         )
     if boosting.mode == BOOSTING_DART:
-        raise Error(
-            "boosting='dart' is single-output in this build; see"
-            " train_boosting_multiclass"
+        return train_dart_multiclass_more(
+            booster,
+            data,
+            labels,
+            params,
+            boosting.dart,
+            sample_weight,
+            bagging,
         )
     return train_multiclass_more(
         booster, data, labels, params, sample_weight, bagging, goss
@@ -1008,16 +1646,24 @@ def train_boosting_multiclass_with_valid(
 
     `rf` goes to `boosting_rf.train_forest_multiclass_with_valid`, whose
     truncation drops whole rounds so the per-class trees stay in step, and is
-    bridged back the same way `train_boosting_multiclass` bridges. `dart` is
-    refused on both counts: it is single-output here, and truncation is wrong
-    for it (`train_boosting_with_valid`).
+    bridged back the same way `train_boosting_multiclass` bridges. `dart`
+    goes to `train_dart_multiclass_with_valid`, which snapshots weights
+    rather than truncating, for the reason `train_boosting_with_valid` gives.
     """
     boosting.validate(goss)
     if boosting.mode == BOOSTING_DART:
-        raise Error(
-            "boosting='dart' is single-output in this build, and truncating a"
-            " dart ensemble to its best round is wrong in any case; see"
-            " train_boosting_multiclass and train_boosting_with_valid"
+        return train_dart_multiclass_with_valid(
+            data,
+            labels,
+            valid_data,
+            valid_labels,
+            n_classes,
+            params,
+            early_stopping_rounds,
+            boosting.dart,
+            min_delta,
+            sample_weight,
+            bagging,
         )
     if boosting.mode == BOOSTING_RF:
         check_rf_learning_rate(params.learning_rate)

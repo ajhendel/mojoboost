@@ -6,10 +6,10 @@ what mojotrees implements, what it deliberately refuses, and what has not
 been verified. It describes `src/mojotrees/boosting_dart.mojo`, which is the
 algorithm core and is not a public API.
 
-Status, in one line: the core is written and is imported by
-`src/mojotrees/alternate_boosting.mojo`; no DART code has been compiled or
-run, and `boosting='dart'` is still rejected by the Python layer and by
-`parse_params`. See `handoffs/remaining_01_dart.md`.
+Status, in one line: the core is written, every entry point in it and in
+`src/mojotrees/alternate_boosting.mojo` compiles, nothing has been run, and
+`boosting='dart'` is still rejected by the Python layer and by
+`parse_params`. See section 11 for exactly what "compiles" is worth here.
 
 ## 1. The problem DART solves
 
@@ -32,9 +32,10 @@ training row. One round, with the module function that performs each step:
 
 1. **Select the drop set** (`select_drop`). A skip draw fires with
    probability `skip_drop`; if it does, the round drops nothing and is an
-   ordinary GBDT round. Otherwise each already-grown iteration is a candidate
-   with probability `drop_rate`, the set is capped at `max_drop`, and it is
-   forced non-empty.
+   ordinary GBDT round. Otherwise each already-grown iteration is drawn at a
+   probability that `max_drop` has already capped, and selection stops at
+   `max_drop` entries (section 4.1). The set may legitimately come out
+   empty, which normalizes to an ordinary GBDT round.
 2. **Uncache the dropped trees** (`dart_begin_round`). Subtract each dropped
    iteration's weighted contribution from `raw`, keeping what was subtracted
    so the round does not have to walk those trees twice.
@@ -73,16 +74,20 @@ on them:
   `Booster.monotone` records survives DART. Monotone constraints are allowed
   under DART for exactly this reason.
 - **`k = 0` reproduces GBDT bit for bit.** A DART run whose every round skips
-  produces the GBDT ensemble, weight for weight. That makes `skip_drop=1`
-  with `drop_rate=0` a degenerate configuration, which `DartParams.validate`
-  rejects rather than silently training plain GBDT under DART's name.
+  produces the GBDT ensemble, weight for weight. That makes `skip_drop = 1`,
+  and equally `drop_rate = 0`, degenerate configurations, which
+  `DartParams.validate` rejects rather than silently training plain GBDT
+  under DART's name.
 
-> **UNVERIFIED.** Whether LightGBM's factor is `lr / (k + 1)` or `1 / (k + 1)`
-> (that is, whether normalization multiplies the shrinkage or replaces it) has
-> not been checked against LightGBM's `dart.hpp`. The table is what the DART
-> paper implies once shrinkage is applied. It is isolated in
-> `dart_normalization` so that settling the question is a one-line change. Do
-> not claim LightGBM parity for DART on the strength of this table.
+> **VERIFIED** against LightGBM `src/boosting/dart.hpp` (master, read
+> 2026-08-15). The question an earlier revision of this section left open,
+> whether normalization multiplies the shrinkage or replaces it, is settled:
+> it multiplies. `DART::DroppingTrees` ends with `shrinkage_rate_ =
+> learning_rate / (1.0f + k)`, or `learning_rate / (learning_rate + k)` in
+> XGBoost mode with an explicit `k == 0` branch back to `learning_rate`, and
+> `DART::Normalize` leaves each dropped iteration at `k / (k + 1)` (or
+> `k / (k + learning_rate)`) of what it weighed. The table above is those
+> factors.
 
 ## 4. Determinism
 
@@ -94,19 +99,50 @@ what an uninterrupted 100-round run would have drawn at round 40. That is the
 property `train_more` already promises for bagging and GOSS.
 
 Within a round the stream is laid out so nothing collides: offset 0 is the
-skip decision, offset `1 + i` is iteration `i`'s draw.
+skip decision, offset `1 + i` is iteration `i`'s draw. LightGBM draws the
+same two things in the same order from one sequential generator.
 
-Two rules are mojotrees's own, not reproductions of LightGBM's order, and are
-called out as differences rather than parity:
+### 4.1 The selection rule
 
-- **Cap by smallest draw.** When more iterations are selected than `max_drop`
-  allows, the `max_drop` with the smallest draws are kept. LightGBM truncates
-  a shuffled list. Ranking by the same draws that made the selection needs no
-  second random stream and is reproducible from the seed alone.
-- **Forced non-empty.** An unskipped round with no candidate drops the single
-  iteration with the smallest draw. A dropout round that drops nothing is
-  indistinguishable from a skipped one, which would make `skip_drop` mean two
-  different things at once.
+`select_drop` is `DART::DroppingTrees`, rule for rule. After the skip draw:
+
+1. `max_drop`, when positive, caps the rate before anything is drawn, so a
+   round is unlikely to reach the cap rather than merely being truncated at
+   it.
+2. Iteration `i` is dropped when its draw falls below its probability.
+3. Selection stops at `max_drop` entries, in ascending iteration order.
+
+The probability, and the rate cap, depend on `uniform_drop`:
+
+| | `uniform_drop=true` | `uniform_drop=false` (LightGBM's default) |
+|---|---|---|
+| probability of dropping iteration `i` | `drop_rate` | `drop_rate * w_i / mean(w)` |
+| rate cap under `max_drop` | `min(drop_rate, max_drop / n_iterations)` | `min(drop_rate, max_drop * inv_average_weight / sum_weight)` |
+
+`w_i` is what iteration `i` currently weighs, which is the vector the
+trainer already carries, so the non-uniform rule costs one argument to
+`select_drop` and no new bookkeeping. With every weight equal the two rules
+coincide exactly. The non-uniform cap is LightGBM's expression verbatim; it
+does not reduce to a probability by dimensions and with realistic weights it
+comes out far above 1, so under that rule the hard stop at `max_drop` is
+effectively all `max_drop` does. It is reproduced rather than corrected
+because matching LightGBM's drop-set sizes is the point.
+
+Three differences from LightGBM, none of which changes what a rule means:
+
+- **The bits.** The draws come from counter-based splitmix64 rather than
+  LightGBM's sequential generator, so equal seeds select different sets. This
+  is the trade `bagging.mojo` and `goss.mojo` already make, and it is what
+  makes offset `1 + i` independent of whether the loop stopped early.
+- **`max_drop <= 0` is uncapped.** LightGBM's break tests
+  `size() >= size_t(max_drop)`, so its `max_drop = 0` stops after one drop
+  and its negative values wrap to no cap at all.
+- **No forced drop.** An earlier revision of this module forced an unskipped
+  round to drop at least one iteration. LightGBM
+  does not, and does not need to: `k = 0` normalizes to exactly
+  `learning_rate`, which is an ordinary GBDT round. Forcing raised the
+  effective drop rate well above the configured one early in a run, when
+  candidates are few.
 
 ## 5. Multiclass
 
@@ -116,9 +152,16 @@ dropping one class's tree alone would tilt the softmax toward the classes
 whose trees survived. So `DartDrop.iterations` holds iteration indices, and
 every entry point takes `n_classes` and walks the round-major layout.
 `n_classes = 1` is the single-output case, where an iteration is a tree.
+LightGBM drops the same way: `DroppingTrees` selects an iteration index and
+then loops `cur_tree_id` over `num_tree_per_iteration_`.
 
-The core is written for multiclass throughout. No multiclass DART loop is
-connected.
+`alternate_boosting._dart_rounds_multiclass` is the loop that drives it, and
+`train_dart_multiclass`, `train_dart_multiclass_more`, and
+`train_dart_multiclass_with_valid` are its three entry points. The round is
+the single-output round with the softmax probabilities recomputed from the
+dropped-out scores, one bag for the whole round, and one feature draw per
+class per round (`round * n_classes + k`). Softmax is not a leaf-renewing
+objective, so a multiclass round has no renewal step.
 
 ## 6. Early stopping
 
@@ -137,10 +180,22 @@ So the weights are snapshotted whenever the validation loss improves
 (`DartBestState`, `dart_record_best`), and restoring truncates and then
 overwrites the weights (`dart_restore_best`). The cost is one Float64 per
 tree per improvement, against the alternative of keeping every round's
-vector, which is quadratic in the round count.
+vector, which is quadratic in the round count. Restoring is exact because a
+tree's node values are not touched until `fold_weights_into_trees` runs, once,
+at the end of the fit (section 10): until then the trees are the grower's
+output and the round's rescalings live entirely in the weight vector.
 
-No `train_dart_with_valid` exists. The pieces are provided; the loop is not
-connected.
+`alternate_boosting.train_dart_with_valid` and
+`train_dart_multiclass_with_valid` are that loop. Both maintain a second
+score cache over the validation rows through the same two functions the
+training cache goes through (`dart_begin_round`, then `dart_advance_scores`),
+which is what makes the two caches provably the same arithmetic on different
+rows.
+
+LightGBM has no counterpart: `DART::EvalAndCheckEarlyStopping` returns false
+unconditionally, so `early_stopping_round` is silently inert under
+`boosting='dart'` there. These functions train the rounds LightGBM would and
+additionally stop on them.
 
 ## 7. Parameters
 
@@ -149,7 +204,7 @@ connected.
 | `drop_rate` | 0.1 | Per-iteration drop probability in a dropping round |
 | `max_drop` | 50 | Cap on one round's drop set; `<= 0` is uncapped |
 | `skip_drop` | 0.5 | Probability a round drops nothing |
-| `uniform_drop` | see below | Select the drop set by an independent draw per iteration |
+| `uniform_drop` | false | Draw every iteration at the same rate rather than in proportion to its weight (section 4.1) |
 | `xgboost_dart_mode` | false | Use XGBoost's normalization constant |
 | `drop_seed` | 4 | Counter-stream seed, distinct from `bagging_seed` (3) |
 
@@ -160,12 +215,6 @@ downgraded to GBDT or trained as something the parameter names do not
 describe. That is the rule `params.mojo` and
 `tree_parameters_extra.check_extra_option_supported` already follow.
 
-- **`uniform_drop=false`**, which is LightGBM's default. LightGBM selects the
-  drop set by a non-uniform rule this module has not reproduced, and
-  approximating it with the uniform draw would train a different model than
-  the parameter names promise. `DartParams.disabled()` therefore defaults
-  `uniform_drop` to true, which is a deliberate inversion of LightGBM's
-  default and is the one parameter default that does not match LightGBM.
 - **GPU.** `train_gpu` advances device-resident raw scores by one shrinkage
   factor per round and has no path for undoing a dropped tree's contribution
   on the device.
@@ -202,14 +251,51 @@ so a DART ensemble is not representable by it directly.
 `alternate_boosting.mojo` reconciles this by folding each tree's weight into
 that tree's node values at the end of training and leaving the ensemble's
 factor at 1.0, which is what LightGBM's `Tree::Shrinkage` does. That avoids a
-serialization format change. Its consequences, including the one place the
-weight has to be readable back off a model, are recorded in
-`handoffs/remaining_01_dart.md` section 4.
+serialization format change.
+
+The fold gives up exactly one thing: a tree's weight cannot be read back off
+a saved model. That costs continued training two things, and nothing else
+anything:
+
+- the rate the earlier rounds used, which `train_dart_more` and
+  `train_dart_multiclass_more` therefore take from the caller, checking only
+  what a folded ensemble can prove about itself, that its stored factor is
+  1.0;
+- the ability of `uniform_drop=false` to tell the pre-existing iterations
+  apart, since lifting the ensemble back gives every one of them a weight of
+  1.0. LightGBM sidesteps this by never dropping an iteration from before the
+  continuation: its `tree_weight_` holds only the current session's
+  iterations.
+
+Everything else, prediction included, is exact:
+`Booster.predict_raw_row` computes `learning_rate * leaf` with a
+`learning_rate` of 1.0 and the weight already inside `leaf`, which is the
+same product the weighted form would have rounded once.
 
 ## 11. Verification status
 
-Nothing in this document has been executed. No Mojo was compiled, no test was
-written or run, no benchmark was taken, and LightGBM was not consulted at the
-source level. Every claim here is a claim about code as written, not about
-code as observed. The checks that would change that are listed, marked
-`UNRUN`, in `handoffs/remaining_01_dart.md` section 7.
+What has been done: LightGBM's `src/boosting/dart.hpp` was read at the source
+level (master, 2026-08-15) and every rule in sections 3 and 4 is a reading of
+it, quoted where it matters. Every function named in this document has been
+compiled, by a throwaway driver that calls each entry point so that `mojo
+build` elaborates its body rather than only its signature.
+
+What has not: nothing has been executed. No test file references
+`boosting_dart.mojo` or the DART entry points in `alternate_boosting.mojo`,
+no benchmark trains a DART model, and no output has been compared against
+LightGBM's. Compiling proves the types line up, and nothing else.
+
+The cheapest checks, in the order they are worth writing:
+
+1. `dart_recompute_raw` equals the incrementally maintained `raw` after every
+   round. That one identity covers `dart_begin_round`,
+   `dart_advance_scores`, `dart_commit_round`, and the weight vector at once.
+2. A DART run whose every round skips (`skip_drop` just under 1, checked by
+   the drop counts rather than by the parameter) is the GBDT ensemble, tree
+   for tree and weight for weight.
+3. `select_drop` drop-set sizes against the rate: at `uniform_drop=true` the
+   count is binomial in `(n_iterations, drop_rate)` until `max_drop` binds,
+   and at `uniform_drop=false` an ensemble with equal weights reproduces the
+   uniform counts exactly.
+4. `train_dart_with_valid` restores a model whose validation loss is the
+   best one it reported, which truncation alone would not.

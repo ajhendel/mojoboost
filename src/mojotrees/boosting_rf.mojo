@@ -145,8 +145,7 @@ serialization, prediction, contributions, or importance today.
 The bridge is exact for a full-model prediction and lossy for two things
 only, both listed on `to_booster`: iteration ranges, and the base score a
 continuation needs. Neither is repairable without a flag on the model saying
-"average these trees", which is the first patch in
-`handoffs/remaining_02_rf.md`.
+"average these trees"; see docs/RANDOM_FOREST_MODE.md section 6.
 
 Reachability
 ------------
@@ -193,6 +192,7 @@ from .boosting import (
     renewal_alpha,
     renewal_weights,
 )
+from .efb import EfbSettings, prepare_bundling
 from .goss import GossParams, GossSelection, apply_goss_scaling, goss_round
 from .monotone import MonotoneConstraints
 from .objective_registry import LAMBDARANK
@@ -283,6 +283,15 @@ struct RfParams(Copyable, Movable):
     least one of them, or `tree.feature_fraction < 1`, must randomize the run;
     see `check_rf_params`.
 
+    `bundling` is `BoosterParams.bundling`, LightGBM's `enable_bundle` (see
+    efb.mojo). It is here for the same reason it is there rather than on
+    `TreeParams`: a bundling plan is a property of the training matrix,
+    fitted once per training call and shared by every tree, and a forest's
+    trees come off the same grower as a boosted ensemble's. Carrying it is
+    what keeps `from_booster_params` from dropping the setting on the floor,
+    which would leave a caller with an unbundled fit that looks exactly like
+    a bundled one.
+
     There is no `learning_rate`: see `RF_SHRINKAGE`.
     """
 
@@ -291,6 +300,7 @@ struct RfParams(Copyable, Movable):
     var bagging: BaggingParams
     var goss: GossParams
     var class_bagging: ClassBaggingParams
+    var bundling: EfbSettings
 
     @staticmethod
     def default() -> RfParams:
@@ -310,6 +320,7 @@ struct RfParams(Copyable, Movable):
             BaggingParams(0.8, 1, DEFAULT_BAGGING_SEED),
             GossParams.disabled(),
             ClassBaggingParams.disabled(),
+            EfbSettings.disabled(),
         )
 
     @staticmethod
@@ -322,7 +333,8 @@ struct RfParams(Copyable, Movable):
         select the mode separately, which is how `boosting=rf` arrives from
         `alternate_boosting.train_boosting`. `params.learning_rate` is not
         read: `check_rf_learning_rate` is what says so out loud, and the
-        adapters below call it.
+        adapters below call it. Everything else on the pair is carried,
+        `params.bundling` included.
         """
         return RfParams(
             params.n_estimators,
@@ -330,6 +342,7 @@ struct RfParams(Copyable, Movable):
             bagging.copy(),
             GossParams.disabled(),
             ClassBaggingParams.disabled(),
+            params.bundling.copy(),
         )
 
     def booster_params(self) -> BoosterParams:
@@ -337,7 +350,12 @@ struct RfParams(Copyable, Movable):
         LightGBM forces. Only for handing to code that takes a `BoosterParams`
         and reads the tree half of it; the boosting loops here do not use it,
         since summing at rate 1 is not what a forest does."""
-        return BoosterParams(self.n_estimators, RF_SHRINKAGE, self.tree.copy())
+        return BoosterParams(
+            self.n_estimators,
+            RF_SHRINKAGE,
+            self.tree.copy(),
+            self.bundling.copy(),
+        )
 
 
 def rf_randomizer_name(params: RfParams) -> String:
@@ -697,7 +715,12 @@ def _rf_rounds(
     of the forest's average, so dropping a tree would rescale every prediction
     the model makes; and with constant gradients a degenerate tree says
     nothing about convergence, only about the sample it was grown on.
+
+    `params.bundling` is fitted once here and shared by every tree, as in
+    `boosting._boost_rounds`: the plan depends on the matrix, and every tree
+    in a forest is grown on the same one.
     """
+    var bundling = prepare_bundling(data, params.bundling)
     var n = data.n_rows
     var signs = params.tree.monotone.active_signs()
     var renews = objective_renews_leaves(objective)
@@ -712,6 +735,29 @@ def _rf_rounds(
     # As in `_boost_rounds`: balanced bagging needs a positive row to apply
     # at all, and the labels do not change, so the test is hoisted out.
     var balanced = params.class_bagging.enabled() and has_positive_rows(target)
+    if params.class_bagging.enabled() and not balanced:
+        # `check_rf_params` accepted this configuration because balanced
+        # bagging is a source of randomness (`rf_randomizer_name`), but with
+        # no positive row it draws no bag at all and the loop below falls
+        # through to the disabled uniform sampler. Every tree would then fit
+        # the same gradients on the same rows with the same features, and the
+        # forest would be `n_rounds` copies of one tree averaged back to that
+        # tree -- the exact outcome the randomization check exists to
+        # prevent, arrived at from the data rather than from the parameters.
+        # A boosted run survives this (its gradients move anyway); a forest
+        # cannot, so it is refused here, where the labels are in hand. The
+        # test is `rf_randomizer_name` itself rather than a second reading of
+        # the fields, so "balanced bagging was the only source" means here
+        # exactly what it means to `check_rf_params`.
+        if rf_randomizer_name(params) == RF_RANDOM_CLASS_BAGGING:
+            raise Error(
+                "boosting='rf' was randomized only by pos_bagging_fraction /"
+                " neg_bagging_fraction, and this target has no positive row,"
+                " so no bag is drawn and every tree in the forest would be"
+                " identical. Set feature_fraction < 1, or"
+                " bagging_fraction < 1 with bagging_freq > 0, or check the"
+                " labels"
+            )
     # GOSS rescales the rows it samples, so it needs a fresh copy of the
     # gradients every round; without one the multipliers would compound over a
     # run that never refills them. Every other sampler leaves grad/hess alone,
@@ -737,7 +783,9 @@ def _rf_rounds(
         else:
             refresh_bag(bag, params.bagging, n, round)
 
-        var tree = grow_tree(data, grad, hess, params.tree, bag, round)
+        var tree = grow_tree(
+            data, grad, hess, params.tree, bag, round, bundling
+        )
         if renews:
             _renew_leaf_values(
                 tree, data, target, init_raw, renew_w, renew_a, bag, signs,
@@ -1347,7 +1395,11 @@ def _rf_rounds_multiclass(
     One bag serves a whole round, as in `_boost_rounds_multiclass`, so the
     per-class trees of a round stay comparable; each class's tree still draws
     its own feature set, from `tree_index = round * n_classes + k`.
+
+    `params.bundling` is fitted once here and shared by every class's tree in
+    every round, as in `_rf_rounds` and `_boost_rounds_multiclass`.
     """
+    var bundling = prepare_bundling(data, params.bundling)
     var n = data.n_rows
     var bag = List[Int]()
     var resamples = params.goss.enabled
@@ -1374,11 +1426,17 @@ def _rf_rounds_multiclass(
                 var hess = hesses[k].copy()
                 apply_goss_scaling(selection, grad, hess)
                 tree = grow_tree(
-                    data, grad, hess, params.tree, bag, tree_index
+                    data, grad, hess, params.tree, bag, tree_index, bundling
                 )
             else:
                 tree = grow_tree(
-                    data, grads[k], hesses[k], params.tree, bag, tree_index
+                    data,
+                    grads[k],
+                    hesses[k],
+                    params.tree,
+                    bag,
+                    tree_index,
+                    bundling,
                 )
             # Softmax is not one of the renewing objectives, so a multiclass
             # tree goes straight from the grower to its bias, as it does in

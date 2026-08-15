@@ -17,7 +17,7 @@ Everything is expressed over `(trees, weights, raw)`, the state a boosting
 loop already carries, plus one weight per tree that the current model
 representation does not yet have. That missing weight is the whole reason
 DART is not reachable from any public entry point; see "Model state" below
-and handoffs/remaining_01_dart.md.
+and docs/DART.md section 10.
 
 Why a weight per tree
 ---------------------
@@ -49,17 +49,29 @@ an uninterrupted 100-round run would have drawn at round 40, which is the
 property `train_more` already promises for bagging and GOSS.
 
 Within a round the counter stream is laid out so nothing collides: offset 0
-is the skip decision and offset `1 + i` is iteration i's draw.
+is the skip decision and offset `1 + i` is iteration i's draw. LightGBM
+draws the same two things in the same order from one sequential generator,
+so the stream layout is the same decision tree over different bits.
+
+What this reproduces, and from where
+------------------------------------
+
+Every rule here was read off LightGBM's `src/boosting/dart.hpp` (master,
+read 2026-08-15) rather than inferred from the DART paper, and the places
+that matter cite the function they came from: `DroppingTrees` for the drop
+set and the shrinkage the new tree enters at, `Normalize` for what the
+dropped iterations keep. Both drop rules are implemented, including
+`uniform_drop=False`, which is LightGBM's default and which selects each
+iteration with a probability proportional to what it currently weighs.
+That rule needs the weight vector, which is exactly the state this module
+already carries, so it costs one argument and no new bookkeeping.
 
 What is deliberately refused
 ----------------------------
 
-`uniform_drop=False`, LightGBM's default, selects the drop set with a
-non-uniform rule this module does not implement. It is refused by name
-rather than silently approximated by the uniform draw, the same way
-`params.mojo` refuses `multiclassova` instead of quietly training something
-else. Ranking, GPU training, and GOSS are refused for the reasons in
-`check_dart_supported`.
+Ranking, GPU training, and GOSS, for the reasons in
+`check_dart_supported`. Nothing about the drop rule itself is refused any
+more.
 
 Model state
 -----------
@@ -79,11 +91,14 @@ from .tree import Tree
 
 # LightGBM's DART defaults. `drop_seed` is LightGBM's own default of 4, which
 # keeps the seed distinct from `bagging_seed` (3) and the feature-fraction
-# seed, so two samplers in one run never share a stream.
+# seed, so two samplers in one run never share a stream. `uniform_drop`
+# defaults to False as it does in LightGBM: the drop probability is
+# proportional to what an iteration currently weighs (`select_drop`).
 comptime DEFAULT_DROP_RATE = 0.1
 comptime DEFAULT_MAX_DROP = 50
 comptime DEFAULT_SKIP_DROP = 0.5
 comptime DEFAULT_DROP_SEED = 4
+comptime DEFAULT_UNIFORM_DROP = False
 
 
 
@@ -94,10 +109,11 @@ struct DartParams(Copyable, Movable):
     `drop_rate` is the per-iteration probability of being dropped in a round
     that drops at all, `skip_drop` the probability that a round drops
     nothing, and `max_drop` a cap on the size of one round's drop set with
-    values <= 0 meaning uncapped. `uniform_drop` selects the drop set by an
-    independent draw per iteration; see the module docstring for why the
-    non-uniform variant is refused. `xgboost_dart_mode` selects XGBoost's
-    normalization constant instead of the DART paper's; see
+    values <= 0 meaning uncapped. `uniform_drop` chooses between the two
+    selection rules in `select_drop`: an independent draw per iteration at
+    the same rate, or LightGBM's default, a draw at a rate proportional to
+    what the iteration currently weighs. `xgboost_dart_mode` selects
+    XGBoost's normalization constant instead of the DART paper's; see
     `dart_normalization`.
     """
 
@@ -112,15 +128,14 @@ struct DartParams(Copyable, Movable):
     @staticmethod
     def disabled() -> DartParams:
         """Ordinary GBDT (the library default). The other fields hold
-        LightGBM's defaults so that flipping `enabled` alone gives LightGBM's
-        configuration, except `uniform_drop`, which is True here because the
-        False branch is unimplemented and refused."""
+        LightGBM's defaults, every one of them, so that flipping `enabled`
+        alone gives LightGBM's own DART configuration."""
         return DartParams(
             False,
             DEFAULT_DROP_RATE,
             DEFAULT_MAX_DROP,
             DEFAULT_SKIP_DROP,
-            True,
+            DEFAULT_UNIFORM_DROP,
             False,
             DEFAULT_DROP_SEED,
         )
@@ -130,12 +145,11 @@ struct DartParams(Copyable, Movable):
         drop_rate: Float64 = DEFAULT_DROP_RATE,
         max_drop: Int = DEFAULT_MAX_DROP,
         skip_drop: Float64 = DEFAULT_SKIP_DROP,
-        uniform_drop: Bool = True,
+        uniform_drop: Bool = DEFAULT_UNIFORM_DROP,
         xgboost_dart_mode: Bool = False,
         seed: Int = DEFAULT_DROP_SEED,
     ) -> DartParams:
-        """DART with LightGBM's defaults, save `uniform_drop`; see
-        `disabled`."""
+        """DART with LightGBM's defaults; see `disabled`."""
         return DartParams(
             True,
             drop_rate,
@@ -157,21 +171,16 @@ struct DartParams(Copyable, Movable):
             raise Error("dart skip_drop must be in [0, 1]")
         if self.seed < 0:
             raise Error("dart drop_seed must be nonnegative")
-        if not self.uniform_drop:
+        # A run that can never drop is plain GBDT wearing DART's parameter
+        # names, and each of these two settings is enough on its own to
+        # guarantee it: no round selects a candidate at `drop_rate = 0`
+        # (under either selection rule, since the non-uniform rule scales
+        # that same rate), and no round gets as far as selecting at
+        # `skip_drop = 1`. That is a configuration mistake worth naming: the
+        # caller asked for dropout and would silently get none.
+        if self.drop_rate == 0.0 or self.skip_drop >= 1.0:
             raise Error(
-                "dart uniform_drop=false is not implemented; LightGBM selects"
-                " the drop set by a non-uniform rule that mojotrees has not"
-                " reproduced, and approximating it with the uniform draw"
-                " would train a different model than the parameter names"
-                " promise. Set uniform_drop=true"
-            )
-        # `drop_rate=0` with `skip_drop=1` is a DART run that never drops,
-        # which is plain GBDT wearing DART's parameter names. That is a
-        # configuration mistake worth naming: the caller asked for dropout
-        # and would silently get none.
-        if self.drop_rate == 0.0 and self.skip_drop >= 1.0:
-            raise Error(
-                "dart with drop_rate=0 and skip_drop=1 never drops a tree,"
+                "dart with drop_rate=0 or skip_drop=1 never drops a tree,"
                 " which is ordinary gbdt; select boosting='gbdt' instead"
             )
 
@@ -183,6 +192,14 @@ def _stream(seed: Int, round: Int) -> UInt64:
     return splitmix64(
         UInt64(seed & 0x7FFFFFFFFFFFFFFF) ^ (UInt64(round) * GOLDEN)
     )
+
+
+@always_inline
+def _slot(iteration: Int, class_index: Int, n_classes: Int) -> Int:
+    """The tree index of `(iteration, class_index)` in the round-major layout
+    `MulticlassBooster` uses: `trees[i * n_classes + k]`. With `n_classes` 1
+    this is the single-output layout, where a slot is its iteration."""
+    return iteration * n_classes + class_index
 
 
 struct DartDrop(Copyable, Movable):
@@ -222,64 +239,67 @@ struct DartDrop(Copyable, Movable):
         return len(self.iterations) == 0
 
 
-def _insert_by_key(
-    mut keys: List[Float64], mut values: List[Int], key: Float64, value: Int,
-    cap: Int,
-):
-    """Insert `(key, value)` into a list kept ascending by key and truncated
-    to `cap` entries, with `cap <= 0` meaning uncapped. Used to keep the
-    `max_drop` most eligible candidates without sorting the whole ensemble.
-
-    Written with append and index assignment only, which is the list surface
-    the rest of the library uses.
-    """
-    var pos = len(keys)
-    for i in range(len(keys)):
-        if key < keys[i]:
-            pos = i
-            break
-    if cap > 0 and pos >= cap:
-        return
-    # Grow by one, then shift the tail right to open a slot at `pos`.
-    keys.append(key)
-    values.append(value)
-    var slot = len(keys) - 1
-    while slot > pos:
-        keys[slot] = keys[slot - 1]
-        values[slot] = values[slot - 1]
-        slot -= 1
-    keys[pos] = key
-    values[pos] = value
-    if cap > 0 and len(keys) > cap:
-        _ = keys.pop()
-        _ = values.pop()
-
-
 def select_drop(
-    params: DartParams, n_iterations: Int, round: Int
+    params: DartParams,
+    n_iterations: Int,
+    round: Int,
+    weights: List[Float64] = [],
+    n_classes: Int = 1,
 ) raises -> DartDrop:
     """Draw the set of iterations dropped in `round`.
 
-    Deterministic in `(params.seed, round, n_iterations)` alone. The draw
-    reads the absolute round index, so a continued run resumes the schedule
-    an uninterrupted run would have followed, matching `refresh_bag` and
-    `goss_round`.
+    Deterministic in `(params.seed, round, n_iterations)`, and under
+    `uniform_drop=False` also in the weights the ensemble currently carries.
+    The draw reads the absolute round index, so a continued run resumes the
+    schedule an uninterrupted run would have followed, matching `refresh_bag`
+    and `goss_round`.
 
-    The rule, in order:
+    This is LightGBM's `DART::DroppingTrees`, rule for rule:
 
     1. Offset 0 of the round's stream is the skip draw. Below `skip_drop`
        the round drops nothing and returns `skipped=True`.
-    2. Offset `1 + i` is iteration i's draw. Iteration i is a candidate when
-       its draw is below `drop_rate`.
-    3. If no iteration was drawn and the ensemble is not empty, the single
-       iteration with the smallest draw is dropped anyway. A dropout round
-       that drops nothing is indistinguishable from a skipped one, which
-       would make `skip_drop` mean two different things at once.
-    4. If more iterations were drawn than `max_drop` allows, the `max_drop`
-       with the smallest draws are kept. LightGBM truncates a shuffled list
-       instead; this rule is deterministic in the same draws that selected
-       the set, so it needs no second random stream. It is a documented
-       mojotrees difference, not a reproduction of LightGBM's order.
+    2. `max_drop`, when positive, first caps the rate itself, so that a round
+       is not merely truncated at the cap but is unlikely to reach it:
+       `drop_rate` becomes `min(drop_rate, max_drop / n_iterations)` under
+       the uniform rule, and LightGBM's own expression (below) under the
+       other.
+    3. Offset `1 + i` is iteration i's draw, and i is dropped when the draw
+       comes in below its probability. Under `uniform_drop` that probability
+       is the capped rate itself; otherwise it is that rate scaled by the
+       iteration's share of the average weight, `w_i / mean(w)`, so the
+       iterations that currently count for most are the likeliest to be
+       hidden. With every weight equal the two rules coincide exactly.
+    4. Selection stops at `max_drop` entries. LightGBM breaks out of the same
+       ascending loop, so the set that survives the cap is the earliest
+       iterations that were drawn, not the ones drawn hardest.
+
+    The result is ascending and duplicate free because it is built in
+    iteration order, so the raw-score arithmetic that consumes it accumulates
+    in a fixed order without a sort.
+
+    Three deliberate differences from LightGBM, none of which changes what a
+    rule means:
+
+    - The draws come from splitmix64 over a counter rather than LightGBM's
+      sequential generator, so equal seeds pick different sets. That is the
+      trade bagging.mojo and goss.mojo already make, and it is what makes
+      offset `1 + i` independent of whether the loop broke early.
+    - `max_drop <= 0` is uncapped here. LightGBM's break tests
+      `size() >= size_t(max_drop)`, so its `max_drop = 0` stops after one
+      drop and its negative values wrap to no cap at all; neither reading is
+      a cap the parameter's name would suggest.
+    - An unskipped round may legitimately drop nothing, in which case
+      `dart_normalization(0, ...)` makes it an ordinary GBDT round. LightGBM
+      does the same (`k = 0` gives it a shrinkage of exactly
+      `learning_rate`), and an earlier revision of this module forced the
+      set non-empty instead, which raised the effective drop rate well above
+      the configured one early in a run.
+
+    `weights` is one weight per TREE in the round-major layout (so
+    `n_iterations * n_classes` of them), not one per iteration: it is the
+    vector the trainer already holds. Each class's tree in an iteration
+    carries that iteration's weight, so class 0's slot is read as the
+    iteration's weight. It is required only under `uniform_drop=False`.
 
     An empty ensemble yields an empty, unskipped drop: there is nothing to
     drop before the first tree exists, and reporting that as a skip would
@@ -294,41 +314,59 @@ def select_drop(
         return DartDrop.none(True)
 
     var cap = params.max_drop if params.max_drop > 0 else 0
-    var keys = List[Float64]()
+    var rate = params.drop_rate
     var picked = List[Int]()
-    var best_key = 0.0
-    var best_iter = -1
-    for i in range(n_iterations):
-        var u = uniform(base + UInt64(i + 1))
-        if best_iter < 0 or u < best_key:
-            best_key = u
-            best_iter = i
-        if u < params.drop_rate:
-            _insert_by_key(keys, picked, u, i, cap)
 
-    if len(picked) == 0:
-        # Rule 3: guarantee a non-empty drop set for an unskipped round.
-        picked.append(best_iter)
+    if params.uniform_drop:
+        if cap > 0:
+            var by_cap = Float64(cap) / Float64(n_iterations)
+            if by_cap < rate:
+                rate = by_cap
+        for i in range(n_iterations):
+            if uniform(base + UInt64(i + 1)) < rate:
+                picked.append(i)
+                if cap > 0 and len(picked) >= cap:
+                    break
         return DartDrop(picked^, False)
 
-    # `picked` is ordered by draw, not by iteration. The raw-score arithmetic
-    # accumulates in this order, so sort it ascending by iteration to keep the
-    # sum reproducible independent of which draws selected it. The set is at
-    # most `max_drop` long, so an insertion sort is the right shape here.
-    var ordered = List[Int](capacity=len(picked))
-    var taken = List[Bool](capacity=len(picked))
-    for _ in range(len(picked)):
-        taken.append(False)
-    for _ in range(len(picked)):
-        var best = -1
-        var best_pos = -1
-        for j in range(len(picked)):
-            if not taken[j] and (best_pos < 0 or picked[j] < best):
-                best = picked[j]
-                best_pos = j
-        taken[best_pos] = True
-        ordered.append(best)
-    return DartDrop(ordered^, False)
+    if n_classes < 1:
+        raise Error("dart n_classes must be at least 1")
+    if len(weights) != n_iterations * n_classes:
+        raise Error(
+            "dart uniform_drop=false selects by tree weight and so needs one"
+            " weight per tree: expected n_iterations * n_classes of them"
+        )
+    var sum_weight = 0.0
+    for i in range(n_iterations):
+        sum_weight += weights[_slot(i, 0, n_classes)]
+    if not (sum_weight > 0.0):
+        raise Error(
+            "dart uniform_drop=false needs a positive total tree weight; a"
+            " weight vector summing to zero makes every drop probability"
+            " zero or undefined"
+        )
+    # LightGBM's `inv_average_weight`: the reciprocal of the mean weight, so
+    # `weight * inv_average_weight` is an iteration's share of the average.
+    var inv_average = Float64(n_iterations) / sum_weight
+    if cap > 0:
+        # LightGBM's expression verbatim: `max_drop * inv_average_weight /
+        # sum_weight`. It is not `max_drop / n_iterations`, and it does not
+        # reduce to a probability by dimensions either -- with weights near
+        # `learning_rate / (k + 1)` it comes out far above 1 and the cap
+        # never binds, leaving the hard stop in the loop below as the only
+        # thing `max_drop` does under this rule. Reproduced as written,
+        # because drop sets distributed as LightGBM's are the point; the
+        # oddity is named here rather than corrected in silence.
+        var by_cap = Float64(cap) * inv_average / sum_weight
+        if by_cap < rate:
+            rate = by_cap
+    for i in range(n_iterations):
+        var p = rate * weights[_slot(i, 0, n_classes)] * inv_average
+        if uniform(base + UInt64(i + 1)) < p:
+            picked.append(i)
+            if cap > 0 and len(picked) >= cap:
+                break
+    return DartDrop(picked^, False)
 
 
 @fieldwise_init
@@ -369,15 +407,24 @@ def dart_normalization(
     and nothing is rescaled, so a DART run whose every round skips produces
     exactly the GBDT ensemble, weight for weight. That identity is what makes
     `skip_drop=1` degenerate rather than merely unusual, and it is the
-    cheapest correctness check there is.
+    cheapest correctness check there is. LightGBM reaches it two different
+    ways: `learning_rate / (1 + k)` is already `learning_rate` at `k = 0`,
+    while the XGBoost branch would give `learning_rate / learning_rate = 1`
+    and so is special-cased to `learning_rate` there.
 
-    NOTE: whether LightGBM's factor is `learning_rate / (k + 1)` or
-    `1 / (k + 1)` (that is, whether normalization multiplies the shrinkage or
-    replaces it) has NOT been verified against LightGBM's `dart.hpp` in this
-    lane, which ran no code and fetched nothing. The convention above is the
-    one the DART paper implies once shrinkage is applied, and it is isolated
-    to this function so that settling the question is a one-line change. Do
-    not claim LightGBM parity for DART on the strength of this function.
+    VERIFIED against LightGBM `src/boosting/dart.hpp` (master, read
+    2026-08-15). The question an earlier revision of this docstring left open
+    -- whether normalization multiplies the shrinkage or replaces it -- is
+    settled: it multiplies. `DroppingTrees` ends with
+
+        shrinkage_rate_ = config_->learning_rate / (1.0f + k)          // and
+        shrinkage_rate_ = config_->learning_rate / (config_->learning_rate + k)
+
+    and `Normalize` scales each dropped iteration by `k / (k + 1)` (default)
+    or `k / (k + learning_rate)` (XGBoost mode), which it reaches in two
+    steps because it is also repairing two score caches; the note above its
+    body states the end state as "tree weight = (k / (k + 1)) * old_weight".
+    Both factors here are those factors.
     """
     if k <= 0:
         return DartNormalization(learning_rate, 1.0)
@@ -443,14 +490,6 @@ def check_dart_supported(
         )
     if n_classes < 1:
         raise Error("dart n_classes must be at least 1")
-
-
-@always_inline
-def _slot(iteration: Int, class_index: Int, n_classes: Int) -> Int:
-    """The tree index of `(iteration, class_index)` in the round-major layout
-    `MulticlassBooster` uses: `trees[i * n_classes + k]`. With `n_classes` 1
-    this is the single-output layout, where a slot is its iteration."""
-    return iteration * n_classes + class_index
 
 
 def dart_begin_round(
@@ -526,19 +565,64 @@ def dart_commit_round(
     for a single-output model is a list of one. `contribution` is what
     `dart_begin_round` removed, and `raw` is the dropped-out score it left.
 
-    Three things happen, in the order that keeps `raw` exact:
+    Three things happen:
 
-    1. Each dropped iteration's weight is scaled by `norm.dropped_scale`, and
-       the same fraction of `contribution` goes back into `raw`. Scaling the
-       stored weight and the cached score by one factor is what keeps the
-       cache equal to a fresh sum over the trees, rather than drifting from
-       it a round at a time.
-    2. The new trees are appended at `norm.new_weight`.
-    3. `raw` takes the new trees' contribution at that weight.
+    1. `dart_advance_scores` moves `raw`: the dropped iterations come back at
+       `norm.dropped_scale` of what was removed, and the new trees are added
+       at `norm.new_weight`.
+    2. Each dropped iteration's stored weight is scaled by the same
+       `norm.dropped_scale`. Scaling the stored weight and the cached score
+       by one factor is what keeps the cache equal to a fresh sum over the
+       trees, rather than drifting from it a round at a time.
+    3. The new trees are appended at `norm.new_weight`.
 
     After this returns, `raw[r * n_classes + k]` equals the base score plus
     `sum_j weights[j] * trees[j].predict_row(data, r)` over class k's trees,
     to floating-point association. `dart_recompute_raw` is the check.
+    """
+    if len(weights) != len(trees):
+        raise Error("dart needs one weight per tree")
+
+    dart_advance_scores(
+        data, drop, norm, n_classes, contribution, new_trees, raw
+    )
+
+    for d in range(drop.count()):
+        var it = drop.iterations[d]
+        for k in range(n_classes):
+            weights[_slot(it, k, n_classes)] *= norm.dropped_scale
+    for k in range(n_classes):
+        trees.append(new_trees[k].copy())
+        weights.append(norm.new_weight)
+
+
+def dart_advance_scores(
+    data: BinnedMatrix,
+    drop: DartDrop,
+    norm: DartNormalization,
+    n_classes: Int,
+    contribution: List[Float64],
+    new_trees: List[Tree],
+    mut raw: List[Float64],
+) raises:
+    """Move one cached raw-score vector through a committed round.
+
+    The half of `dart_commit_round` that touches scores rather than model
+    state, split out because a run with a validation set holds a second
+    cache over rows the model never trains on. That cache goes through the
+    identical two steps, against the same `drop` and the same `norm`, so
+    doing it by calling this is the only way to be sure the two caches
+    cannot drift apart in their arithmetic.
+
+    `contribution` must be what `dart_begin_round` removed from THIS `raw`
+    over THIS `data`, which for a validation set means calling
+    `dart_begin_round` on the validation matrix with its own buffer.
+
+    Two steps, in the order that keeps `raw` exact:
+
+    1. The dropped iterations come back at `norm.dropped_scale` of what they
+       weighed, which is the same fraction of what was removed.
+    2. The round's new trees are added at `norm.new_weight`.
     """
     var n = data.n_rows
     var total = n * n_classes
@@ -548,25 +632,15 @@ def dart_commit_round(
         raise Error("dart contribution length must equal n_rows * n_classes")
     if len(raw) != total:
         raise Error("raw length must equal n_rows * n_classes")
-    if len(weights) != len(trees):
-        raise Error("dart needs one weight per tree")
 
-    for d in range(drop.count()):
-        var it = drop.iterations[d]
-        for k in range(n_classes):
-            weights[_slot(it, k, n_classes)] *= norm.dropped_scale
     if not drop.is_empty():
         for i in range(total):
             raw[i] += norm.dropped_scale * contribution[i]
-
     for k in range(n_classes):
         for r in range(n):
             raw[r * n_classes + k] += (
                 norm.new_weight * new_trees[k].predict_row(data, r)
             )
-    for k in range(n_classes):
-        trees.append(new_trees[k].copy())
-        weights.append(norm.new_weight)
 
 
 def dart_recompute_raw(
