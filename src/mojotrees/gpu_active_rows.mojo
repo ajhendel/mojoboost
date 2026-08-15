@@ -41,6 +41,25 @@ integer prefix sums, so no atomic decides where a row lands and no run-to-run
 scheduling difference can reorder the output. The prefix sums are exact
 Int32 sums over 0/1 flags, so they cannot round.
 
+Collective primitives, and a rule this module repeals
+-----------------------------------------------------
+The scan inside a threadgroup is `max.gpu.primitives.block.prefix_sum`, warp
+shuffles plus a single shared round, in place of the hand-rolled
+Hillis-Steele scan that cost two barriers per doubling step. That repeals the
+standing project rule against warp-level primitives, on the grounds that the
+block and warp modules are portable across NVIDIA, AMD, and Metal and are
+Modular's to tune, so calling them inherits their improvements instead of
+maintaining a scan here forever. The two rules that stay are untouched: there
+is still one portable source with no per-backend branch, and the scan is
+still integer-only, so the determinism above is unaffected, `prefix_sum` over
+Int32 being exact in whatever order it sums. The hand-rolled kernels are kept
+as a fallback arm, selected by `MOJOTREES_GPU_SCAN_PRIMITIVES=0` or
+`set_scan_primitives(False)`, so a backend where the primitive misbehaves has
+somewhere to go and a benchmark can hold both arms in one process. The two
+arms produce the identical permutation, asserted element for element in
+tests/test_gpu_scan_primitives.mojo. Neither arm has been timed against the
+other on any device, so nothing here claims one is faster.
+
 What the partition costs, and what does not help
 ------------------------------------------------
 Measured on an M4 with an interleaved A/B against the same buffers: a
@@ -146,8 +165,11 @@ from std.atomic import Atomic
 from std.gpu import block_dim, block_idx, global_idx, thread_idx
 from std.math import round
 from std.memory import stack_allocation
+from std.sys import has_accelerator
 from max.gpu.host import DeviceBuffer, DeviceContext, HostBuffer
 from max.gpu.memory import AddressSpace
+from max.gpu.primitives.block import broadcast as block_broadcast
+from max.gpu.primitives.block import prefix_sum as block_prefix_sum
 from max.gpu.sync import barrier
 
 from .binning import BinnedMatrix
@@ -173,6 +195,39 @@ comptime MAX_ROWS = Int(Int32.MAX)
 # per-threadgroup budget, and 1024 is also the largest block any supported
 # device accepts.
 comptime SCAN_MAX_THREADS = 1024
+
+
+def _scan_primitive_width_supported(threads: Int) -> Bool:
+    """Whether the primitive scan arm has a kernel instantiated at this
+    threadgroup width.
+
+    `block.prefix_sum` takes its block size as a *compile-time* parameter, so
+    the primitive kernels cannot read `block_dim.x` the way the hand-rolled
+    ones do: each width is a separate instantiation and the host has to pick
+    one. Two constraints bound the menu. The primitive itself carries
+    `constrained` "Block size must be a multiple of warp size", which
+    `gpu_tiling.clamp_block_threads` already satisfies unconditionally by
+    rounding every width down to a multiple of `WARP_GRANULARITY` (64, which
+    is a multiple of the 32-wide warp on NVIDIA and Metal and is AMD's
+    wavefront exactly). And every instantiation is compile time spent, so the
+    menu is the four powers of two from 128 up, which is every width
+    `derive_block_threads` produces on a supported device: the target is 256
+    and the clamp only lowers it on a device whose maximum threadgroup is
+    smaller than that, which none of the three backends has.
+
+    A width outside the menu is reachable only through an explicit
+    `MOJOTREES_GPU_BLOCK_THREADS` override (192 and 320 are legal widths that
+    are not on it). That is not an error and is not silently rounded, because
+    rounding the width would change the block count and the block count is
+    what `block_sums_dev` was sized for: such a width simply runs the
+    hand-rolled arm, which reads its width from `block_dim.x` and serves any
+    of them. Both arms produce the same permutation, so this changes nothing
+    a caller can observe.
+    """
+    return threads == 128 or threads == 256 or threads == 512 or (
+        threads == 1024
+    )
+
 
 # Features one histogram threadgroup may accumulate at once. The shared
 # histogram is `MAX_BINS` Int32 in each of three planes, so a group of G
@@ -281,6 +336,14 @@ def _flag_scan_kernel(
     Hillis-Steele shared-memory scan: two barriers per doubling step, with
     the read separated from the write so no thread reads a slot another has
     already advanced.
+
+    This is the *fallback* arm. `_flag_scan_prim_kernel` is the default and
+    scans with `block.prefix_sum` instead; see the module docstring for which
+    rule that repeals and why. This kernel is kept rather than deleted
+    because it reads its width from `block_dim.x` and so serves any
+    threadgroup width, including the ones no primitive instantiation exists
+    for, and because a benchmark wanting both arms in one process needs both
+    to be present. It produces the identical offsets and block sums.
     """
     var tid = thread_idx.x
     var nthreads = block_dim.x
@@ -390,6 +453,144 @@ def _scan_block_sums_kernel(
         # may now overwrite the shared buffer.
         barrier()
         base += nthreads
+
+    if tid == 0:
+        total[unsafe_offset=0] = carry
+
+
+def _flag_scan_prim_kernel[block_size: Int](
+    bins: MutPointer[UInt8, MutAnyOrigin],
+    rows: MutPointer[Int32, MutAnyOrigin],
+    offsets: MutPointer[Int32, MutAnyOrigin],
+    block_sums: MutPointer[Int32, MutAnyOrigin],
+    n_rows: Int32,
+    begin: Int32,
+    count: Int32,
+    feature: Int32,
+    threshold_bin: Int32,
+    missing_bin: Int32,
+    default_left: Int32,
+    is_categorical: Int32,
+    cat0: UInt64,
+    cat1: UInt64,
+    cat2: UInt64,
+    cat3: UInt64,
+):
+    """Stage one, scanned with `block.prefix_sum` instead of by hand.
+
+    Everything a later stage reads is byte for byte what `_flag_scan_kernel`
+    writes: `offsets[j]` is still `(exclusive_prefix_within_j's_block << 1) |
+    flag`, and `block_sums[b]` is still block b's left count, so
+    `_scatter_kernel` is shared between the two arms unchanged. The
+    difference is only how the intra-block scan is computed.
+    `block.prefix_sum` is warp shuffles plus one shared round rather than a
+    doubling loop with two barriers per step, and it sums exact Int32 flags,
+    so the permutation cannot differ; the test file asserts that against the
+    hand-rolled arm rather than asserting it here in a comment.
+
+    Signature, checked against the installed toolchain rather than
+    remembered: `block.prefix_sum[dtype: DType, //, *, block_size: Int,
+    exclusive: Bool = False](val: Scalar[dtype]) -> Scalar[dtype]`. The
+    inclusive form is asked for because both things this kernel needs come
+    out of it: the exclusive prefix is the inclusive one minus the thread's
+    own flag, exactly as the hand-rolled arm derives it, and the last
+    thread's inclusive value is the block total. Asking for the exclusive
+    form instead would need a second collective to recover the total.
+
+    `block_size` is a compile-time parameter of the primitive, not a
+    `block_dim.x` read, which is why this kernel is parametric and why the
+    launch has to pass the matching `block_dim`; see
+    `_scan_primitive_width_supported` for the menu of widths and why a width
+    outside it falls back rather than being rounded. The primitive is a
+    collective, so every thread of the threadgroup reaches it: the flag is
+    computed as zero for threads past the end of the range and the call sits
+    outside the `j < n` guard, which is also what keeps a partial tail block
+    summing correctly.
+    """
+    var tid = thread_idx.x
+    var j = block_idx.x * block_size + tid
+    var n = Int(count)
+    var col = Int(feature) * Int(n_rows)
+
+    var flag = Int32(0)
+    if j < n:
+        var row = rows[unsafe_offset = Int(begin) + j][0]
+        var bin = Int32(bins[unsafe_offset = col + Int(row)])
+        if _row_goes_left(
+            bin,
+            threshold_bin,
+            missing_bin,
+            default_left,
+            is_categorical,
+            cat0,
+            cat1,
+            cat2,
+            cat3,
+        ):
+            flag = Int32(1)
+
+    var inclusive = block_prefix_sum[block_size=block_size, exclusive=False](
+        flag
+    )
+
+    if j < n:
+        offsets[unsafe_offset=j] = ((inclusive - flag) * Int32(2)) + flag
+    if tid == block_size - 1:
+        block_sums[unsafe_offset = block_idx.x] = inclusive
+
+
+def _scan_block_sums_prim_kernel[block_size: Int](
+    block_sums: MutPointer[Int32, MutAnyOrigin],
+    total: MutPointer[Int32, MutAnyOrigin],
+    n_blocks: Int32,
+):
+    """Stage two on the primitive arm. Same output as
+    `_scan_block_sums_kernel`: the block sums become block starting offsets
+    in place and the range's total left count lands in `total`.
+
+    One threadgroup still walks the block sums in chunks of its own width and
+    still carries the running total across chunks in a register, but the
+    per-chunk scan is `block.prefix_sum` and the chunk total reaches every
+    thread through `block.broadcast[block_size=block_size](inclusive,
+    src_thread=block_size - 1)` rather than through a shared slot every
+    thread re-reads. Signature, again checked against the toolchain:
+    `block.broadcast[dtype: DType, width: SIMDLength, //, *, block_size:
+    Int](val: SIMD[dtype, width], src_thread: Int = 0) -> SIMD[dtype,
+    width]`. Broadcasting from the last thread is what keeps `carry`
+    bit-identical on every thread, which is what makes the chunk-to-chunk
+    carry deterministic; summing over exact Int32 in a fixed chunk order, it
+    cannot depend on scheduling.
+
+    The trailing `barrier()` is deliberate and is not the primitive's job to
+    supply: the next iteration calls the same collectives again, and this
+    kernel does not get to assume anything about whether a primitive fences
+    its own scratch on exit. One barrier per chunk is what the hand-rolled
+    arm already paid, and a chunk is a whole threadgroup's worth of block
+    sums, so the count of them is tiny.
+    """
+    var tid = thread_idx.x
+    var nb = Int(n_blocks)
+
+    var carry = Int32(0)
+    var base = 0
+    while base < nb:
+        var idx = base + tid
+        var own = Int32(0)
+        if idx < nb:
+            own = block_sums[unsafe_offset=idx][0]
+
+        var inclusive = block_prefix_sum[
+            block_size=block_size, exclusive=False
+        ](own)
+        var chunk_total = block_broadcast[block_size=block_size](
+            inclusive, src_thread = block_size - 1
+        )
+
+        if idx < nb:
+            block_sums[unsafe_offset=idx] = carry + inclusive - own
+        carry += chunk_total
+        barrier()
+        base += block_size
 
     if tid == 0:
         total[unsafe_offset=0] = carry
@@ -1546,6 +1747,11 @@ struct GpuActiveRows(Movable):
     var quant_valid: Bool
     var quant_g_scale: Float32
     var quant_h_scale: Float32
+    # scan-primitives lane: whether the two scan stages run on
+    # `block.prefix_sum` (the default) or on the hand-rolled Hillis-Steele
+    # kernels. A launch-shape knob and nothing else, because the two arms
+    # produce the identical permutation and the identical left count.
+    var scan_primitives: Bool
 
     def __init__(
         out self,
@@ -1627,6 +1833,14 @@ struct GpuActiveRows(Movable):
         self.quant_valid = False
         self.quant_g_scale = 0.0
         self.quant_h_scale = 0.0
+        # The primitive scan arm is the default: it computes the same
+        # permutation with strictly less work, so it does not need a
+        # measurement to justify being on. `MOJOTREES_GPU_SCAN_PRIMITIVES=0`
+        # takes it off, and a width the primitive has no instantiation for
+        # takes it off here rather than at every launch.
+        self.scan_primitives = _env_int(
+            "MOJOTREES_GPU_SCAN_PRIMITIVES", 1
+        ) != 0 and _scan_primitive_width_supported(threads)
 
         # A bagged tree stages only its bag's slots, and the copy that
         # follows takes the whole buffer, so the tail is zeroed once here
@@ -1671,6 +1885,31 @@ struct GpuActiveRows(Movable):
         and cannot change a histogram."""
         self.quantized_gradients = on
         self.quant_valid = False
+
+    def set_scan_primitives(mut self, on: Bool) raises:
+        """Whether the partition's two scan stages run on `block.prefix_sum`
+        or on the hand-rolled Hillis-Steele kernels.
+
+        An argument as well as an environment variable for the reason
+        `set_feature_group` gives: an A/B that reads its arm from the
+        environment can run one arm under the other's label, which has
+        happened in this repository once, so a benchmark holding both arms in
+        one process passes the arm in instead of re-execing. Takes effect on
+        the next `enqueue_partition`. It cannot change the permutation or the
+        left count, only which kernel computes the prefix sums, and the two
+        being identical is what tests/test_gpu_scan_primitives.mojo asserts.
+
+        Turning it on at a threadgroup width no primitive instantiation
+        exists for raises rather than silently leaving the fallback arm
+        selected, because a benchmark told to run the primitive arm must not
+        quietly measure the other one.
+        """
+        if on and not _scan_primitive_width_supported(self.block_threads):
+            raise Error(
+                "the primitive scan arm has no kernel at this threadgroup"
+                " width: 128, 256, 512, and 1024 are the widths instantiated"
+            )
+        self.scan_primitives = on
 
     def begin_tree(mut self, bag: List[Int] = []) raises:
         """Seed the root's rows and make node 0 own all of them.
@@ -1735,33 +1974,68 @@ struct GpuActiveRows(Movable):
         var default_left = Int32(1) if routing.default_left else Int32(0)
         var is_cat = Int32(1) if routing.is_categorical else Int32(0)
 
-        self.ctx.enqueue_function[_flag_scan_kernel](
-            bins,
-            self.rows_dev.unsafe_ptr(),
-            self.offsets_dev.unsafe_ptr(),
-            self.block_sums_dev.unsafe_ptr(),
-            Int32(self.n_rows),
-            Int32(window.begin),
-            Int32(n),
-            Int32(routing.feature),
-            Int32(routing.threshold_bin),
-            Int32(routing.missing_bin),
-            default_left,
-            is_cat,
-            cat[0],
-            cat[1],
-            cat[2],
-            cat[3],
-            grid_dim=blocks,
-            block_dim=threads,
-        )
-        self.ctx.enqueue_function[_scan_block_sums_kernel](
-            self.block_sums_dev.unsafe_ptr(),
-            self.total_dev.unsafe_ptr(),
-            Int32(blocks),
-            grid_dim=1,
-            block_dim=threads,
-        )
+        # The two scan stages, on whichever arm is selected. The primitive
+        # kernels are instantiated per width, so the dispatch is an if-chain
+        # over the menu rather than a runtime block size; the whole chain
+        # sits inside a `comptime if has_accelerator()` because a build with
+        # no accelerator target has no warp size for `block.prefix_sum` to
+        # constrain against, and pruning the branch is what keeps those
+        # instantiations out of a CPU-only extension build entirely.
+        var scanned = False
+        comptime if has_accelerator():
+            if self.scan_primitives:
+                scanned = True
+                if threads == 128:
+                    self._enqueue_scan_primitives[128](
+                        bins, window, routing, n, blocks
+                    )
+                elif threads == 256:
+                    self._enqueue_scan_primitives[256](
+                        bins, window, routing, n, blocks
+                    )
+                elif threads == 512:
+                    self._enqueue_scan_primitives[512](
+                        bins, window, routing, n, blocks
+                    )
+                elif threads == 1024:
+                    self._enqueue_scan_primitives[1024](
+                        bins, window, routing, n, blocks
+                    )
+                else:
+                    # `__init__` and `set_scan_primitives` both refuse to
+                    # select the arm at an uninstantiated width, so this is
+                    # unreachable; falling back rather than raising keeps a
+                    # width that slipped through producing correct rows.
+                    scanned = False
+
+        if not scanned:
+            self.ctx.enqueue_function[_flag_scan_kernel](
+                bins,
+                self.rows_dev.unsafe_ptr(),
+                self.offsets_dev.unsafe_ptr(),
+                self.block_sums_dev.unsafe_ptr(),
+                Int32(self.n_rows),
+                Int32(window.begin),
+                Int32(n),
+                Int32(routing.feature),
+                Int32(routing.threshold_bin),
+                Int32(routing.missing_bin),
+                default_left,
+                is_cat,
+                cat[0],
+                cat[1],
+                cat[2],
+                cat[3],
+                grid_dim=blocks,
+                block_dim=threads,
+            )
+            self.ctx.enqueue_function[_scan_block_sums_kernel](
+                self.block_sums_dev.unsafe_ptr(),
+                self.total_dev.unsafe_ptr(),
+                Int32(blocks),
+                grid_dim=1,
+                block_dim=threads,
+            )
         # Same block size as the flag pass: the scatter looks its block
         # offset up by `block_idx.x`.
         self.ctx.enqueue_function[_scatter_kernel](
@@ -1782,6 +2056,59 @@ struct GpuActiveRows(Movable):
             Int32(n),
             grid_dim=blocks,
             block_dim=threads,
+        )
+
+    def _enqueue_scan_primitives[
+        width: Int, bins_origin: MutOrigin
+    ](
+        mut self,
+        bins: MutPointer[UInt8, bins_origin],
+        window: LeafRange,
+        routing: RowRouting,
+        n: Int,
+        blocks: Int,
+    ) raises:
+        """The flag pass and the block-sum scan, on the primitive arm, at one
+        compile-time threadgroup width.
+
+        Split out only so `enqueue_partition` can name the width once per
+        menu entry instead of repeating sixteen kernel arguments per entry.
+        `block_dim` is `width` and not `self.block_threads`: the two are equal
+        wherever this is reached, and writing the compile-time one is what
+        makes a mismatch between the parameter and the launch impossible to
+        introduce later. `grid_dim` is the caller's block count, computed
+        from `self.block_threads`, so the block count and therefore the
+        `block_sums_dev` footprint are exactly what the fallback arm uses.
+        """
+        var cat = routing.cat_bitset
+        var default_left = Int32(1) if routing.default_left else Int32(0)
+        var is_cat = Int32(1) if routing.is_categorical else Int32(0)
+        self.ctx.enqueue_function[_flag_scan_prim_kernel[width]](
+            bins,
+            self.rows_dev.unsafe_ptr(),
+            self.offsets_dev.unsafe_ptr(),
+            self.block_sums_dev.unsafe_ptr(),
+            Int32(self.n_rows),
+            Int32(window.begin),
+            Int32(n),
+            Int32(routing.feature),
+            Int32(routing.threshold_bin),
+            Int32(routing.missing_bin),
+            default_left,
+            is_cat,
+            cat[0],
+            cat[1],
+            cat[2],
+            cat[3],
+            grid_dim=blocks,
+            block_dim=width,
+        )
+        self.ctx.enqueue_function[_scan_block_sums_prim_kernel[width]](
+            self.block_sums_dev.unsafe_ptr(),
+            self.total_dev.unsafe_ptr(),
+            Int32(blocks),
+            grid_dim=1,
+            block_dim=width,
         )
 
     def download_left_count(mut self) raises -> Int:
