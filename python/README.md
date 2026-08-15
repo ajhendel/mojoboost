@@ -27,7 +27,7 @@ bit-exact model save/load.
 The first public alpha is on PyPI:
 
 ```sh
-pip install mojotrees
+pip install --pre mojotrees
 ```
 
 The current `0.1.0a2` wheel supports **CPython 3.14 on Apple Silicon running
@@ -37,7 +37,7 @@ cleanly with `No matching distribution found`.
 
 | State | What you type | Status today |
 |---|---|---|
-| Published alpha | `pip install --only-binary=:all: mojotrees` | **Available:** `0.1.0a2`, CPython 3.14, Apple Silicon, macOS 26+ |
+| Published alpha | `pip install --pre --only-binary=:all: mojotrees` | **Available:** `0.1.0a2`, CPython 3.14, Apple Silicon, macOS 26+ |
 | A release wheel file | `pip install ./mojotrees-<version>-<tags>.whl` | **Available** from the release workflow |
 | Source checkout with Pixi | `git clone`, `pixi install`, `pixi run build-python` | **Available** for contributors |
 

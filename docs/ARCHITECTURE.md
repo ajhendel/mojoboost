@@ -145,6 +145,30 @@ Device selection is decided before any of that, by `device_policy`. A
 silently, because a silent fallback turns "my GPU run" into "a CPU run that
 took the same wall clock and I never knew".
 
+The division of labor across this seam is fixed, and it is not "GPU first,
+CPU as a fallback." **The GPU owns the data plane. The CPU owns the control
+plane, small data, and verification.**
+
+| Owner | What | Why it lives there |
+|---|---|---|
+| GPU | binned matrix, gradients and hessians, active-row permutation and leaf ranges, histogram accumulation, stable row partitioning, native objective evaluation and score advancement, device split search when selected | every one of these scales with `n_rows`, and none of it crosses the boundary during a fit (`train_gpu.mojo`, `gpu_active_rows.mojo`, `gpu_objectives_native.mojo`, `gpu_frontier.mojo`) |
+| CPU | boosting coordination, split selection over histograms of `n_features x n_bins` cells, the tree model, leaf-value renewal, prediction, host row sampling for bagging and GOSS | latency-bound scalar work over data that does not scale with `n_rows`; the host scan of a 50 x 255 histogram costs microseconds and a device scan of it costs a launch and a synchronization |
+| CPU | the entire fit below the launch-cost crossover, and individual small leaves above it (`hybrid_leaf_scheduler.mojo`) | a kernel launch plus a synchronization is a fixed cost per node; a node that owns a few hundred rows is cheaper to build where no launch is paid |
+| CPU | the reference implementation the GPU path is verified against | the host fixed-point replica has been shown bit-identical to the device build in-run, and the CPU trainer is the oracle every GPU test compares to |
+
+Two things follow. First, the CPU trainer is a permanent part of the design,
+not a compatibility layer to be retired once the GPU path is complete; it is
+where the small end of the workload runs and where correctness is
+established. Second, what remains host-side in the data plane is a short,
+explicit list rather than a legacy: row sampling under bagging and GOSS,
+which draws its ranked sample on the host and uploads gradients per round;
+validation scoring, which walks the tree on the host; and the binning pass
+itself. Each is named in `train_gpu.mojo`'s module docstring with the switch
+that selects it. `bench/results/apple_m4_large_scaling_2026-08-14.md` is
+the end-to-end measurement of the split as it stands (Metal 2.6x the CPU
+trainer at one million rows and 3.3x at five million, at half the resident
+memory).
+
 ## Where each policy lives
 
 One authoritative implementation per question. Where a second one exists

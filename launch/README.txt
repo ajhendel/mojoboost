@@ -4,7 +4,9 @@ Every file in this directory is plain UTF-8 text with Unix LF line endings. The 
 
 The Modular Forum and Discord announcements went up on 2026-08-14 under the project's former name, MojoBoost, and drew no readers before the 2026-08-15 rename to MojoTrees. 01_MODULAR_DISCORD.txt and 02_MODULAR_FORUM.txt carry the new name, URLs, and install command, and are written to replace those posts in place rather than to announce a rename.
 
-BLOCKER BEFORE POSTING 01 OR 02: both files instruct readers to run `pip install mojotrees`, and that package does not exist on PyPI until the renamed wheel is published. Publish first, confirm the install works from a clean environment, then post. The old `mojoboost` package stays on PyPI and must not be deleted.
+BLOCKER BEFORE POSTING ANY FILE HERE: the install line must actually work. Publish 0.1.0a2 to PyPI first, confirm the install from a clean environment, then post. The old `mojoboost` package stays on PyPI and must not be deleted.
+
+WHY EVERY FILE SAYS `pip install --pre mojotrees` AND NOT `pip install mojotrees`: 0.1.0a2 is a pre-release, and pip ignores pre-releases unless asked. Plain `pip install mojotrees` reports "No matching distribution found" even on a supported Mac. Do not simplify the install line in any of these drafts before a final (non-alpha) version is published, or the announcement ships an install command that fails for everyone who tries it. When 0.1.0 ships, drop the `--pre` everywhere and the line becomes true.
 
 Remaining optional outreach:
 

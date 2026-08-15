@@ -11,7 +11,7 @@ This is a substantial public alpha, not a production replacement for LightGBM. F
 
 The first self-contained wheel is live on PyPI. On CPython 3.14, Apple Silicon, and macOS 26 or newer, installation is simply
 
-pip install mojotrees
+pip install --pre mojotrees
 
 The platform support is intentionally narrow for this first alpha; unsupported combinations fail cleanly rather than attempting a surprise source build.
 

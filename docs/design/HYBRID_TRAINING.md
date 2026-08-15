@@ -474,6 +474,26 @@ achieved overlap before claiming it; the `synchronize()` inside the snapshot
 serializes more than it looks, though it is paid once per tree rather than per
 node.
 
+A constraint on E5 that the substitution design does not have, stated here
+so the experiment is read correctly. On unified memory the CPU and the GPU
+draw on one memory bus, so overlap adds throughput only while the device
+work in flight is *not* bandwidth-bound. A histogram accumulation over a
+large node is bandwidth-bound by construction (every row's `n_slots` bins
+are gathered once); a host build racing it competes for the same bytes per
+second and can slow the device kernel by as much as it gains. What overlap
+can add is the launch-bound tail: small leaves, partitions, the per-node
+fixed costs the substitution scheduler already targets. So the shipped
+1.20x on a bagged 20k-row fit
+(`bench/results/apple_m4_hybrid_costs_2026-08-14.md`) came from *removing*
+fixed device costs on small leaves, not from adding CPU throughput to a
+bandwidth-bound phase, and it is the first thing E5 must reproduce before
+overlap is credited with anything more. The measurement E5 owes is
+therefore per phase, not per fit: device kernel time with and without a
+concurrent host build over a node large enough to saturate the bus, and
+again over one small enough not to. A design that shows overlap paying on
+the second and costing on the first has learned the same lesson the
+substitution rule already encodes, and should keep the rule.
+
 **E6 — Is the snapshot the limit?** Two questions, and they decide where the
 next effort goes. First: how often does the first candidate leaf fail
 `DECLINE_SNAPSHOT_NOT_PAID` — that is, how often does a tree have savings

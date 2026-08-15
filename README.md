@@ -43,7 +43,7 @@ who or what typed a change—as the standard for correctness and performance.
 The first public alpha is on PyPI:
 
 ```sh
-pip install mojotrees
+pip install --pre mojotrees
 ```
 
 The current `0.1.0a2` wheel supports **CPython 3.14 on Apple Silicon running
@@ -54,7 +54,7 @@ wheels have been built and validated.
 
 | State | What you type | Status today |
 |---|---|---|
-| Published alpha | `pip install mojotrees` | **Available:** `0.1.0a2`, CPython 3.14, Apple Silicon, macOS 26+ |
+| Published alpha | `pip install --pre mojotrees` | **Available:** `0.1.0a2`, CPython 3.14, Apple Silicon, macOS 26+ |
 | Release wheel file | `pip install ./mojotrees-<version>-<tags>.whl` | **Available** from the release workflow |
 | Source checkout with Pixi | the four commands below | **Available** for contributors and development |
 
@@ -119,6 +119,22 @@ resolves to the CPU on every machine and every workload today, because its
 crossover heuristic is deliberately disabled until end-to-end benchmark
 evidence establishes a trustworthy threshold. Read
 [Device selection](#device-selection) before using it.
+
+The two backends are not a primary and a port. On an accelerator the GPU
+owns the data plane, and the CPU owns the control plane, small data, and
+verification. Every per-row structure of a fit (binned features, gradients
+and hessians, the leaf assignment, histogram accumulation, row partitioning,
+and for the built-in objectives the gradient generation and the score
+update) lives on the device and stays there for the whole fit; the CPU
+coordinates boosting, selects splits over histograms of `n_features x
+n_bins` cells, holds the tree model, and is the bit-exact reference the GPU
+path is verified against. Below the launch-cost crossover (small datasets
+and the small leaves deep in a tree) the CPU is also the faster place to do
+the work, which is why the CPU trainer is a permanent part of the design
+rather than a fallback. [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#4-host-to-device)
+states the division precisely, and
+[bench/results](bench/results/apple_m4_large_scaling_2026-08-14.md) holds
+the measurement behind it.
 
 If any of this fails, open a
 [bug report](https://github.com/mojotrees/mojotrees/issues/new?template=bug_report.yml),

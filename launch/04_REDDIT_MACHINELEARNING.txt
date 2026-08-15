@@ -9,7 +9,7 @@ The current repository has dense and sparse leaf-wise training, numerical and na
 
 The important caveat is maturity. This is a public alpha with a broad LightGBM-shaped feature surface, not verified behavioral or production parity. Edge cases, feature combinations, packaging breadth, and differential validation remain active work. GPU correctness has been exercised on an Apple M4. NVIDIA and AMD have not been validated. The repository separates supported, partial, deferred, and intentionally different behavior in a parity contract.
 
-The first PyPI wheel supports CPython 3.14 on Apple Silicon with macOS 26 or newer: `pip install mojotrees`. Other combinations do not yet have published wheels.
+The first PyPI wheel supports CPython 3.14 on Apple Silicon with macOS 26 or newer: `pip install --pre mojotrees`. Other combinations do not yet have published wheels.
 
 Repository: https://github.com/mojotrees/mojotrees
 PyPI: https://pypi.org/project/mojotrees/

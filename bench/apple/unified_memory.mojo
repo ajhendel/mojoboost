@@ -358,7 +358,7 @@ def _make_payload(n_bytes: Int) -> List[UInt8]:
     var out = List[UInt8](capacity=n_bytes)
     for i in range(n_bytes):
         out.append(UInt8(Int(_splitmix64(UInt64(i)) >> 56) & 0xFF))
-    return out
+    return out^
 
 
 @fieldwise_init
@@ -484,7 +484,7 @@ struct RouteResult(Copyable, Movable):
             route,
             status,
             detail,
-            plan,
+            plan.copy(),
             0,  # alloc_ns
             FirstTouch.empty(),
             FirstTouch.empty(),
@@ -754,10 +754,10 @@ def _finish(
         route,
         status,
         detail,
-        plan,
+        plan.copy(),
         alloc_ns,
-        first,
-        retouch,
+        first.copy(),
+        retouch.copy(),
         phase.mean(phase.write_ns),
         phase.mean(phase.publish_ns),
         phase.mean(phase.kernel_ns),
@@ -884,7 +884,7 @@ def _run_copy_route(
         # the transfer. Neither number alone is a transfer time.
         var t2 = perf_counter_ns()
 
-        var tail = consumer.run(ctx, dev.unsafe_ptr(), scratch, plan.contend)
+        var tail = consumer.run(ctx, dev.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin](), scratch, plan.contend)
         checksum = tail.checksum
 
         if rnd == 0:
@@ -987,7 +987,7 @@ def _run_map_write(
                 t1 = perf_counter_ns()
         var t2 = perf_counter_ns()
 
-        var tail = consumer.run(ctx, dev.unsafe_ptr(), scratch, plan.contend)
+        var tail = consumer.run(ctx, dev.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin](), scratch, plan.contend)
         checksum = tail.checksum
 
         if rnd == 0:
@@ -1089,7 +1089,7 @@ def _run_host_direct(
         var t2 = t1
 
         var tail = consumer.run(
-            ctx, shared.unsafe_ptr(), scratch, plan.contend
+            ctx, shared.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin](), scratch, plan.contend
         )
         checksum = tail.checksum
 

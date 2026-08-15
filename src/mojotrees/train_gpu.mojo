@@ -17,11 +17,17 @@ small: n_features * n_bins). The grower hands the partition its exact left
 count from the parent histogram's integer counts, so a split enqueues
 without a host synchronization.
 
-Division of labor:
+Division of labor (the GPU owns the data plane; the CPU owns the control
+plane, small data, and verification; see docs/ARCHITECTURE.md seam 4):
   CPU  boosting coordination, split selection over downloaded histograms,
-       leaf-value renewal (quantile/L1), prediction, the tree model itself
+       leaf-value renewal (quantile/L1), prediction, the tree model itself,
+       host row sampling under bagging/GOSS, validation scoring, and the
+       bit-exact reference the device path is verified against; below the
+       launch-cost crossover the CPU also builds individual small leaves
+       (hybrid_leaf_scheduler.mojo) or the whole fit (device_policy.mojo)
   GPU  binned features, gradients/hessians, leaf assignments, histogram
-       accumulation, row partitioning
+       accumulation, row partitioning, native objective evaluation and
+       score advancement, and the split scan when selected
 
 `train_custom_gpu` is the same loop with the gradients coming from a
 caller-supplied callable instead of a built-in objective (see

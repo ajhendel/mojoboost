@@ -1,0 +1,23 @@
+Mach Virtual Memory Statistics: (page size of 16384 bytes)
+Pages free:                                   343277.
+Pages active:                                  61432.
+Pages inactive:                               105608.
+Pages speculative:                              4643.
+Pages throttled:                                   0.
+Pages wired down:                             161099.
+Pages purgeable:                                  18.
+"Translation faults":                     3980816689.
+Pages copy-on-write:                       202591092.
+Pages zero filled:                        1071570272.
+Pages reactivated:                         797938090.
+Pages purged:                               33707502.
+File-backed pages:                             81698.
+Anonymous pages:                               89985.
+Pages stored in compressor:                  1603134.
+Pages occupied by compressor:                 320174.
+Decompressions:                           1473172681.
+Compressions:                             1654677054.
+Pageins:                                    63444276.
+Pageouts:                                     932457.
+Swapins:                                    41729256.
+Swapouts:                                   48459005.

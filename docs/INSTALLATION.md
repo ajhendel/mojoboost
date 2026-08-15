@@ -12,7 +12,7 @@
 The first public alpha is available from PyPI:
 
 ```sh
-pip install mojotrees
+pip install --pre mojotrees
 ```
 
 The current release is `0.1.0a2`. Its wheel supports **CPython 3.14 on Apple
@@ -23,7 +23,7 @@ Pixi environment, or compiler is required to use that wheel.
 
 | State | What you type | Status today |
 |---|---|---|
-| 1. Published alpha from PyPI | `pip install mojotrees` | **Available** for CPython 3.14, Apple Silicon, macOS 26+ |
+| 1. Published alpha from PyPI | `pip install --pre mojotrees` | **Available** for CPython 3.14, Apple Silicon, macOS 26+ |
 | 2. A release wheel file | `pip install ./mojotrees-<version>-<tags>.whl` | **Available** from the release workflow |
 | 3. Source checkout with Pixi | `git clone`, `pixi install`, `pixi run build-python` | **Available** for contributors and unsupported targets |
 
@@ -50,7 +50,7 @@ with a compiler error. See
 Install the published binary wheel directly from PyPI.
 
 ```sh
-python -m pip install --only-binary=:all: mojotrees
+python -m pip install --pre --only-binary=:all: mojotrees
 ```
 
 `--only-binary=:all:` is not decoration. It tells pip to refuse anything that
@@ -92,10 +92,27 @@ reason behind it, not as a settled decision and not as a permanent one.
 
 ### What `pip install mojotrees` does right now
 
-On the supported target, pip downloads and installs `0.1.0a2`. On any other
+Nothing, and that is deliberate. `0.1.0a2` is a **pre-release**, and pip
+ignores pre-releases unless you ask for one. Plain `pip install mojotrees`
+reports `No matching distribution found` on every machine, including a
+supported one, because the only version on the index is an alpha.
+
+To install the alpha, ask for it by name:
+
+```sh
+pip install --pre mojotrees        # newest pre-release
+pip install mojotrees==0.1.0a2     # or pin it exactly
+```
+
+On the supported target that downloads and installs `0.1.0a2`. On any other
 target, pip reports `No matching distribution found` because no compatible
 wheel exists. That refusal is intentional; pip never falls back to compiling
 Mojo source.
+
+This is the property that makes claiming the name safe. Nobody who types
+`pip install mojotrees` on a whim ends up running an experimental alpha they
+did not ask for. When the first final version ships, plain
+`pip install mojotrees` starts working and this section goes away.
 
 ### Why there is no sdist
 

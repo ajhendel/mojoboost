@@ -8,7 +8,7 @@ It already includes end-to-end dense and sparse training, numerical and categori
 
 The first self-contained wheel is live for CPython 3.14 on Apple Silicon with macOS 26 or newer.
 
-pip install mojotrees
+pip install --pre mojotrees
 
 I am looking for technical feedback, reproducible bug reports, Apple hardware results, and contributors, especially around persistent GPU execution, additional wheel targets, broader real-data benchmarks, and cross-device validation.
 

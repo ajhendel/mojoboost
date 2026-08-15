@@ -161,6 +161,17 @@ launches the policy will issue, and decides nothing about them.
 
 What this module does not do
 ----------------------------
+It does not race the host against the device. A placement is a
+*substitution*: the leaf is built on the host instead of the device, never
+on both for throughput (`MODE_MIRROR` builds on both, but for comparison,
+and it is documented as strictly slower). That is a design choice and not
+an omission. On unified memory the two share one memory bus, so a host
+build running concurrently with a bandwidth-bound device accumulation
+competes for the same bytes per second; the only work concurrency could
+add is the launch-bound small-leaf tail, which is exactly what the
+substitution already captures without the contention. The overlap
+experiment and the constraint on it are HYBRID_TRAINING.md §9 E5.
+
 It does not accumulate a histogram, own a buffer, touch a device, or edit a
 grower. It does not decide CPU-versus-GPU *training* -- that is
 `device_policy.mojo`, and a hybrid leaf schedule presupposes the GPU trainer

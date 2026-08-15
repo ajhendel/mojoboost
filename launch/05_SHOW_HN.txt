@@ -7,7 +7,7 @@ The project is an attempt to provide a familiar LightGBM-style Python experience
 
 The repository includes dense and sparse leaf-wise training, numerical and categorical data, missing values, regression, classification, ranking, validation and early stopping, callbacks, serialization, TreeSHAP contributions, Dataset and Booster APIs, Python estimators, and end-to-end GPU tree growth.
 
-This is an experimental public alpha rather than a claim of production parity with LightGBM or XGBoost. The repository publishes its known gaps and hardware evidence. Apple M4 Metal correctness has been exercised; NVIDIA and AMD remain unvalidated. The first PyPI wheel supports CPython 3.14 on Apple Silicon with macOS 26 or newer: `pip install mojotrees`.
+This is an experimental public alpha rather than a claim of production parity with LightGBM or XGBoost. The repository publishes its known gaps and hardware evidence. Apple M4 Metal correctness has been exercised; NVIDIA and AMD remain unvalidated. The first PyPI wheel supports CPython 3.14 on Apple Silicon with macOS 26 or newer: `pip install --pre mojotrees`.
 
 Repository: https://github.com/mojotrees/mojotrees
 PyPI: https://pypi.org/project/mojotrees/
