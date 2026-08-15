@@ -74,17 +74,37 @@ Three requested devices, and what each one means
   says the GPU is the faster choice for that shape on that device. With no
   such evidence it chooses the CPU and says so.
 
-Why `auto` is the CPU everywhere today
---------------------------------------
-`crossover_rules()` is empty. Nothing in this repository has measured a
-workload size where GPU training beats CPU training: the one end-to-end
-measurement that exists (Apple M4, bench/bench_train_gpu.mojo) came out
-slower than the CPU trainer, and no NVIDIA or AMD device has run this code
-at all (docs/GPU_VALIDATION.md). A threshold invented here would be a
-performance claim with nothing under it, so the table ships empty and
-`auto` conservatively resolves to the CPU. Adding a rule is a benchmarking
-result, not a code change: it carries its `evidence` identifier, and
+Where `auto` reaches the GPU, and where it still does not
+---------------------------------------------------------
+`crossover_rules()` holds exactly one rule, and it is as narrow as the two
+records behind it. Both measure end-to-end training on an Apple M4 over
+Metal at 1,000,000 rows by 50 dense features, 255 bins, 31 leaves, 100
+rounds, squared error, in interleaved CPU/GPU arms:
+`bench/results/apple_m4_large_scaling_2026-08-14.md` (GPU 4.289-4.382 s
+against CPU 11.094-11.706 s over three seeds) and the 2026-08-15 section of
+`docs/GPU_VALIDATION.md` (GPU 4.10 s against CPU 11.36 s over five
+repeats). So the rule fires from that shape up, on that device, for that
+objective, and nowhere else. Every other backend, every other Apple
+generation, every other objective, every smaller shape, and multiclass all
+keep returning "no rule covered this", because nothing here measured them.
+
+That the table was empty for longer than the evidence warranted was a bug,
+not conservatism: `auto` selected the CPU at every size on every machine,
+so the GPU trainer was reachable only by asking for it by name. What has
+not changed is the standard. A rule is a benchmarking result, not a code
+change: it carries its `evidence_id` and its `measured_on`, and
 `POLICY_VERSION` is bumped with it.
+
+One structural consequence, and it is the reason `auto` still keeps the CPU
+on the very machine the rule was measured on when it is asked through
+`resolve_device`. A hardware-scoped rule can match only a profile that
+names the hardware, and `DeviceCapabilities.detect` opens no device, so it
+yields `PROFILE_FALLBACK` (or `PROFILE_DECLARED`, which carries an API name
+and no generation). Only `from_profile`, fed by a caller holding an open
+`DeviceContext`, reaches `PROFILE_REPORTED`. Until the trainers pass what
+they read (handoffs/connect_05_device_policy.md), a defaulted `fit` gets
+`WARN_UNKNOWN_HARDWARE` and the CPU, which is the honest answer to "I do
+not know what device this is" and not an accident.
 
 `MOJOTREES_AUTO_MIN_CELLS` is the escape hatch for running that benchmark:
 an integer cell count (`n_rows * n_features`) at or above which `auto`
@@ -130,7 +150,9 @@ from std.os import getenv
 from std.sys import has_accelerator
 
 from .apple_gpu_policy import (
+    API_METAL,
     API_UNKNOWN,
+    APPLE_GEN_M4,
     BYTES_PER_PARTIAL_CELL,
     CROSSOVER_DISABLED,
     GpuProfile,
@@ -158,6 +180,7 @@ from .initialization import SessionState, warmup_level_name
 # reaches neither `model.mojo` nor the GPU kernel stack and closes no cycle.
 from .objective_registry import (
     LAMBDARANK,
+    SQUARED_ERROR,
     objective_gradients_on_device,
     objective_is_builtin,
 )
@@ -235,15 +258,21 @@ comptime BINS_UNSPECIFIED = 0
 
 # Cells (`n_rows * n_features`) at or above which `auto` chooses the GPU
 # with no rule behind it. Negative disables the heuristic, which is the
-# default: see the module docstring for why there is no measured crossover
-# to ship. Deliberately the same sentinel apple_gpu_policy.mojo reports on
+# default and stays the default now that a rule exists: this knob is how a
+# crossover benchmark reaches the GPU on a device no rule covers, and a
+# measured rule for one device is not a reason to start guessing on the
+# rest. Deliberately the same sentinel apple_gpu_policy.mojo reports on
 # `CrossoverInputs.min_cells`.
 comptime AUTO_MIN_CELLS = CROSSOVER_DISABLED
 
 # Bumped whenever a crossover rule is added, removed, or retuned, or
 # whenever a gate below changes what it admits. A decision carries it so a
 # report from one release can be told apart from a report from another.
-comptime POLICY_VERSION = 1
+#
+# 2: the first crossover rule, `apple-m4-metal-dense-regression`. Version 1
+# shipped an empty table, so `auto` was the CPU at every size on every
+# machine.
+comptime POLICY_VERSION = 2
 
 # `DeviceDecision.evidence_id` values that are not a crossover rule name.
 comptime EVIDENCE_NONE = String("none")
@@ -1014,6 +1043,59 @@ def estimate_gpu_memory(
 
 # --- Crossover evidence -----------------------------------------------
 
+# The one installed rule, spelled out as constants so the numbers in it and
+# the numbers in `crossover_rules()` cannot drift apart, and so a test can
+# assert against the same values the rule was built from.
+#
+# Two records, both Apple M4 over Metal, both end-to-end training with the
+# CPU and GPU arms alternated on an otherwise idle machine, both at
+# 1,000,000 rows x 50 dense Float64 features, 255 bins, 31 leaves, 100
+# rounds, squared error, single output:
+#
+#   bench/results/apple_m4_large_scaling_2026-08-14.md
+#     three seeds, three alternating CPU/GPU repeats each, minimum reported
+#     GPU  4.289, 4.382, 4.378 s
+#     CPU 11.094, 11.346, 11.706 s
+#
+#   docs/GPU_VALIDATION.md, "Apple M4, 2026-08-15: the five-lane GPU
+#   performance round"
+#     five repeats, minimum reported, each figure reproduced twice in the
+#     same window
+#     GPU  4.10 s (spread 5.8 percent)
+#     CPU 11.36 s (spread 3.8 percent)
+#
+# So the GPU is between 2.6 and 2.8 times the CPU at this shape, measured
+# twice a day apart. That margin is what makes the rule installable at the
+# measured point rather than at a multiple of it: gpu_split_policy.mojo
+# doubles its threshold because its win was about 2 percent, smaller than
+# this machine's noise, and this one is not.
+#
+# The same 2026-08-14 record has 5,000,000 x 50 at 17.162 s against 56.902
+# s, 3.32x, so the advantage grows with rows rather than closing. Nothing
+# below 1,000,000 rows has been measured CPU against GPU end to end, which
+# is why the floor is the measured point and not an extrapolation down
+# toward one.
+comptime M4_TRAINING_RULE_NAME = String("apple-m4-metal-dense-regression")
+comptime M4_TRAINING_EVIDENCE_ID = String(
+    "bench/results/apple_m4_large_scaling_2026-08-14.md +"
+    " docs/GPU_VALIDATION.md 'Apple M4, 2026-08-15'"
+)
+comptime M4_TRAINING_MEASURED_ON = String(
+    "Apple M4, 10 GPU cores, Metal, macOS 26.5.2 arm64, Mojo 1.0.0, MAX"
+    " 26.5.0; 1,000,000 x 50 dense, 255 bins, 31 leaves, 100 rounds,"
+    " squared error, single output"
+)
+
+# The thresholds themselves. `M4_TRAINING_MIN_CELLS` is the product of the
+# two above and so constrains nothing on its own; it is stated because
+# cells is the size measure `MOJOTREES_AUTO_MIN_CELLS` and
+# `CrossoverInputs` are written in, and a reader comparing this rule
+# against those should not have to multiply.
+comptime M4_TRAINING_MIN_ROWS = 1_000_000
+comptime M4_TRAINING_MIN_FEATURES = 50
+comptime M4_TRAINING_MIN_CELLS = 50_000_000
+comptime M4_TRAINING_MAX_OUTPUTS = 1
+
 
 struct CrossoverEvidence(Copyable, Movable):
     """One benchmark-derived rule saying "the GPU wins from here up".
@@ -1101,17 +1183,104 @@ struct CrossoverEvidence(Copyable, Movable):
             return False
         return True
 
+    def cite(self) -> String:
+        """Where the numbers came from and what they were taken on.
+
+        The form `HybridCosts.cite` uses, for the same reason: a decision
+        that says "the GPU, on evidence" is worth what the reader can go
+        and check, so the identifier and the device travel together.
+        """
+        return String(self.evidence_id, " on ", self.measured_on)
+
 
 def crossover_rules() raises -> List[CrossoverEvidence]:
     """The benchmark-derived crossover rules, in priority order.
 
-    Empty, and the module docstring says why: no measurement in this
-    repository has found a shape where GPU training beats CPU training,
-    and the only device that has ever run the GPU trainer end to end came
-    out slower. Do not add a rule from reasoning. Add one from a recorded
-    sweep, cite it in `evidence_id`, and bump `POLICY_VERSION`.
+    One rule, and it is the smallest claim the records support.
+
+    The rule, as arithmetic. `auto` selects the GPU when *all* of:
+
+        profile.api             == metal
+        profile.apple_generation == m4
+        request.objective       == squared error
+        request.n_outputs       <= 1
+        request.n_rows          >= 1,000,000
+        request.n_features      >= 50
+        request.cells()         >= 50,000,000
+
+    and the GPU path is otherwise unblocked and the input is dense. Every
+    other (device, workload) pair falls through to
+    `DECISION_AUTO_CPU_BELOW_EVIDENCE` and keeps the CPU.
+
+    The evidence is the two Apple M4 records named in
+    `M4_TRAINING_EVIDENCE_ID` and quoted above this function: interleaved
+    CPU/GPU arms at exactly that shape, a day apart, GPU 2.6x to 2.8x the
+    CPU both times, and 3.3x at five million rows. The floor is the
+    measured point, not a fraction of it, because nothing smaller has been
+    measured CPU against GPU end to end. Extrapolating down would be the
+    thing this module exists to refuse: below a million rows the GPU's
+    fixed per-round and per-node costs are a growing fraction of a tree
+    (see `hybrid_leaf_scheduler.mojo`, whose whole domain is that regime),
+    so the crossover is somewhere below here and its location is a
+    measurement nobody has taken.
+
+    Why every scope field is set, and what stays "no evidence":
+
+    - `api` and `apple_generation`. Metal on an M4 is the only device this
+      code has ever run on (docs/GPU_VALIDATION.md, whose CUDA and HIP rows
+      are `not run`). An M3 or an M5 shares neither the core count nor the
+      synchronization costs the round was tuned against, and a rule that
+      inherited to them would be a performance claim about hardware nobody
+      owns. `gpu_split_policy._is_observed_m4` draws the same line and for
+      the same reason.
+    - `objective`. The record's target is a synthetic regression; squared
+      error is the objective both arms ran. Other objectives differ in
+      where their gradients are computed, and
+      `WARN_HOST_GRADIENT_PATH` exists precisely because some of them come
+      back to the host every round. Unmeasured, so declined.
+    - `max_outputs`. Multiclass grows one tree per class per round through
+      a different trainer. Unmeasured, so declined.
+    - `min_rows` and `min_features` together, rather than cells alone. A
+      5,000,000 x 10 matrix has the same cell count as the measured shape
+      and a tenth of its features, which is a different ratio of per-node
+      launch cost to per-node work. The record has nothing to say about it.
+
+    What would falsify the threshold. Any of these, and the rule is wrong
+    and should be narrowed or withdrawn rather than patched:
+
+    - an interleaved CPU/GPU pair at 1,000,000 x 50 on an M4 where the GPU
+      is not faster, run in one window on an idle machine;
+    - the same at 5,000,000 x 50, where the record claims a larger margin;
+    - a bin count or leaf budget far from the measured 255 and 31 that
+      reverses the sign. Neither is in the rule, because neither was swept,
+      and that is a gap in the evidence rather than a claim of invariance.
+
+    A profiling session is imminent (see `phase_profile.mojo` and the
+    2026-08-15 round in docs/GPU_VALIDATION.md, which retired the earlier
+    0.56x figure). It may well find the real crossover well below a million
+    rows, at which point this floor comes down. It comes down by
+    measurement and a `POLICY_VERSION` bump, the way it went in.
+
+    Do not add a rule from reasoning. Add one from a recorded sweep, cite
+    it in `evidence_id`, name the device in `measured_on`, and bump
+    `POLICY_VERSION`.
     """
-    return List[CrossoverEvidence]()
+    var rules = List[CrossoverEvidence]()
+    rules.append(
+        CrossoverEvidence(
+            M4_TRAINING_RULE_NAME,
+            M4_TRAINING_EVIDENCE_ID,
+            M4_TRAINING_MEASURED_ON,
+            API_METAL,
+            APPLE_GEN_M4,
+            SQUARED_ERROR,
+            M4_TRAINING_MIN_ROWS,
+            M4_TRAINING_MIN_FEATURES,
+            M4_TRAINING_MIN_CELLS,
+            M4_TRAINING_MAX_OUTPUTS,
+        )
+    )
+    return rules^
 
 
 # --- The engine -------------------------------------------------------
@@ -1435,6 +1604,14 @@ struct DeviceDecision(Copyable, Movable):
     var memory: MemoryEstimate
     var policy_version: Int
     var evidence_id: String
+    var crossover_citation: String
+    """`CrossoverEvidence.cite()` for the rule that selected the GPU, and
+    empty for every decision no rule decided.
+
+    `evidence_id` alone says which record; this says which record *and*
+    what device and shape it was taken on, which is the difference between
+    a reader being able to check the claim and having to go looking for the
+    measurement that backs it."""
 
     def __init__(
         out self,
@@ -1448,6 +1625,7 @@ struct DeviceDecision(Copyable, Movable):
         var warnings: ReasonList,
         var memory: MemoryEstimate,
         var evidence_id: String,
+        var crossover_citation: String = String(""),
     ):
         self.request = request^
         self.capabilities = capabilities^
@@ -1460,6 +1638,7 @@ struct DeviceDecision(Copyable, Movable):
         self.memory = memory^
         self.policy_version = POLICY_VERSION
         self.evidence_id = evidence_id^
+        self.crossover_citation = crossover_citation^
 
     def validated(self) -> Bool:
         """Whether a GPU selection rests on benchmark-derived evidence.
@@ -1489,6 +1668,19 @@ struct DeviceDecision(Copyable, Movable):
         """
         var out = String("policy_version=", self.policy_version, "\n")
         out += String("evidence_id=", self.evidence_id, "\n")
+        # How many rules this build ships, which is a property of the build
+        # and not of this decision, and so is reported for every decision
+        # including the ones that never consulted the table. It is what
+        # tells a report reading `no-validated-rule` whether the table was
+        # empty or whether it was consulted and declined.
+        out += String(
+            "crossover_rules_installed=", len(crossover_rules()), "\n"
+        )
+        # Present only when a rule decided this run. An empty line here
+        # would read as "a rule fired and cited nothing", which is exactly
+        # what `CrossoverEvidence` refuses to let happen.
+        if self.crossover_citation.byte_length() > 0:
+            out += String("crossover_rule=", self.crossover_citation, "\n")
         out += String(
             "requested=", device_name(self.request.requested_device), "\n"
         )
@@ -1746,6 +1938,7 @@ def decide_device(
     var code: Int = DECISION_EXPLICIT_CPU
     var message = String("")
     var evidence: String = EVIDENCE_NONE
+    var citation = String("")
 
     if request.requested_device == CPU_DEVICE:
         message = String(
@@ -1842,10 +2035,15 @@ def decide_device(
             selected = GPU_DEVICE
             code = DECISION_AUTO_GPU_EVIDENCE
             evidence = rules[matched].evidence_id.copy()
+            citation = rules[matched].cite()
             message = String(
                 "crossover rule '",
                 rules[matched].name,
-                "' covers this device and workload, so auto selects the GPU",
+                "' covers this device and workload, so auto selects the"
+                " GPU; measured on ",
+                rules[matched].measured_on,
+                " and recorded in ",
+                rules[matched].evidence_id,
             )
         elif len(rules) > 0:
             code = DECISION_AUTO_CPU_BELOW_EVIDENCE
@@ -1856,6 +2054,37 @@ def decide_device(
                 POLICY_VERSION,
                 " covers this device and workload, so auto keeps the CPU",
             )
+            # Which half of "does not cover" applies is the first thing a
+            # reader wants and the last thing they can work out from the
+            # sentence above, because a fallback profile fails the hardware
+            # scope of every rule before the shape is ever compared.
+            if (
+                caps.profile_source == PROFILE_FALLBACK
+                or caps.profile_source == PROFILE_DECLARED
+            ):
+                message += String(
+                    ". No device attributes were read (profile source '",
+                    profile_source_name(caps.profile_source),
+                    "'), so every hardware-scoped rule was out of reach"
+                    " whatever the shape; a caller holding an open"
+                    " DeviceContext should read its attributes and go"
+                    " through decide_device_report_reported",
+                )
+            else:
+                message += String(
+                    ". The device was identified (api '",
+                    api_name(caps.profile.api),
+                    "', apple generation '",
+                    apple_generation_name(caps.profile.apple_generation),
+                    "'), so what no rule covers is this device with this"
+                    " objective at ",
+                    request.n_rows,
+                    " x ",
+                    request.n_features,
+                    " and ",
+                    request.n_outputs,
+                    " tree(s) per round",
+                )
         else:
             code = DECISION_AUTO_CPU_NO_EVIDENCE
             message = String(
@@ -1879,6 +2108,7 @@ def decide_device(
         warnings^,
         memory^,
         evidence^,
+        citation^,
     )
 
 
@@ -2139,7 +2369,16 @@ def describe_device_decision(decision: DeviceDecision) raises -> String:
 
     The prose report belongs to whoever is formatting for a human;
     `serialize()` is what they should parse. This is the terse form for a
-    log line that has one line to spend."""
+    log line that has one line to spend.
+
+    `evidence=` is the bare identifier for every decision no crossover rule
+    decided, and the full citation (identifier plus the device and shape it
+    was measured on) for the ones a rule did. A GPU chosen automatically is
+    the one answer here a reader is entitled to check, so it is the one
+    that spends the extra characters."""
+    var cited = decision.evidence_id.copy()
+    if decision.crossover_citation.byte_length() > 0:
+        cited = decision.crossover_citation.copy()
     var out = String(
         "device ",
         device_name(decision.request.requested_device),
@@ -2150,7 +2389,7 @@ def describe_device_decision(decision: DeviceDecision) raises -> String:
         ") policy=",
         decision.policy_version,
         " evidence=",
-        decision.evidence_id,
+        cited,
         " rows=",
         decision.request.n_rows,
         " features=",
