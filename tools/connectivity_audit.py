@@ -771,7 +771,10 @@ PY_IMPORT_PKG = re.compile(
 
 #: `_mojotrees.name` and `getattr(_mojotrees, "name")`, the only two ways
 #: Python in this package reaches the extension module.
-NATIVE_ATTR = re.compile(r"_mojotrees\.(?!mojo\b)([A-Za-z_][A-Za-z_0-9]*)")
+#: `_mojotrees.name` or `ext.name`; `ext` is the conventional local the
+#: package binds the extension module to (`_sequence.stream_dataset`,
+#: `device_selection`).
+NATIVE_ATTR = re.compile(r"\b(?:_mojotrees|ext)\.(?!mojo\b)([A-Za-z_][A-Za-z_0-9]*)")
 NATIVE_GETATTR = re.compile(
     r"getattr\(\s*_mojotrees\s*,\s*\"([A-Za-z_][A-Za-z_0-9]*)\""
 )
@@ -1271,10 +1274,18 @@ def audit_missing_bindings():
 
 #: A section keyword the writer emits, as a literal at the start of a written
 #: token run: `out += "monotone " + ...`.
-WRITE_KEYWORD = re.compile(r"out\s*\+=\s*\"([a-z_]+)[\" ]")
+#: `out += "kw ..."` on one line, or a `"kw "` string continuation on the
+#: next line of a multi-line concatenation.
+WRITE_KEYWORD = re.compile(
+    r"out\s*\+=\s*\(?\s*(?:\"[^\"\n]*\"[^\n]*\n\s*\+?\s*)*\"([a-z_]+) "
+    r"|out\s*\+=\s*\"([a-z_]+)[\" ]"
+)
 
-#: A keyword the reader consumes or peeks at.
-READ_KEYWORD = re.compile(r"r\.(?:next|peek)\(\)\s*[!=]=\s*\"([a-z_]+)\"")
+#: A keyword the reader consumes or peeks at, directly or through
+#: `_read_kind`, which returns the token after the version.
+READ_KEYWORD = re.compile(
+    r"(?:r\.(?:next|peek)\(\)|_read_kind\(r\))\s*[!=]=\s*\"([a-z_]+)\""
+)
 
 
 def audit_serialization():
@@ -1291,7 +1302,9 @@ def audit_serialization():
     if text is None:
         raise AuditError("missing src/mojotrees/serialize.mojo")
 
-    written = set(WRITE_KEYWORD.findall(text))
+    written = set()
+    for match in WRITE_KEYWORD.finditer(text):
+        written.add(match.group(1) or match.group(2))
     read_back = set(READ_KEYWORD.findall(text))
     for keyword in sorted(written - read_back):
         findings.append(
