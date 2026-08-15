@@ -22,9 +22,9 @@ Conventions, shared with `inspection_bindings.mojo`:
   Python because only the native ensemble knows its own rate.
 
 Refit reads the leaf-shaping parameters (`lambda_l2`, `lambda_l1`,
-`max_delta_step`, `path_smooth`) as plain scalars rather than through the
-full parameter parser, because a refit never grows anything and those four
-are all a leaf formula consumes.
+`max_delta_step`, `path_smooth`) from a small mapping rather than through
+the full parameter parser, because a refit never grows anything and those
+four are all a leaf formula consumes.
 """
 
 from std.python import Python, PythonObject
@@ -233,25 +233,22 @@ def shuffle_models_multiclass(
 # -- refit ------------------------------------------------------------------
 
 
-def _refit_params(
-    decay_rate: PythonObject,
-    min_leaf_rows: PythonObject,
-    recount: PythonObject,
-    lambda_l2: PythonObject,
-    lambda_l1: PythonObject,
-    max_delta_step: PythonObject,
-    path_smooth: PythonObject,
-) raises -> RefitParams:
+def _refit_params(params: PythonObject) raises -> RefitParams:
+    """`RefitParams` from a mapping: `refit_decay_rate`, `min_data_in_leaf`,
+    `recount` (0/1), and the four leaf-shaping tree parameters `lambda_l2`,
+    `lambda_l1`, `max_delta_step`, `path_smooth`. A mapping rather than
+    positional scalars because `def_function` is proven to eight arguments
+    and a refit needs more than that."""
     var tree = TreeParams.default()
-    tree.lambda_reg = Float64(py=lambda_l2)
-    tree.lambda_l1 = Float64(py=lambda_l1)
-    tree.extra.max_delta_step = Float64(py=max_delta_step)
-    tree.extra.path_smooth = Float64(py=path_smooth)
+    tree.lambda_reg = Float64(py=params["lambda_l2"])
+    tree.lambda_l1 = Float64(py=params["lambda_l1"])
+    tree.extra.max_delta_step = Float64(py=params["max_delta_step"])
+    tree.extra.path_smooth = Float64(py=params["path_smooth"])
     return RefitParams(
-        Float64(py=decay_rate),
+        Float64(py=params["refit_decay_rate"]),
         tree^,
-        Int(py=min_leaf_rows),
-        Int(py=recount) != 0,
+        Int(py=params["min_data_in_leaf"]),
+        Int(py=params["recount"]) != 0,
     )
 
 
@@ -266,64 +263,26 @@ def _py_report(report: RefitReport) raises -> PythonObject:
 
 
 def refit(
-    model: PythonObject,
-    dataset: PythonObject,
-    decay_rate: PythonObject,
-    min_leaf_rows: PythonObject,
-    recount: PythonObject,
-    lambda_l2: PythonObject,
-    lambda_l1: PythonObject,
-    max_delta_step: PythonObject,
-    path_smooth: PythonObject,
-    alpha: PythonObject,
+    model: PythonObject, dataset: PythonObject, params: PythonObject
 ) raises -> PythonObject:
     """Rebuild every leaf value from `dataset`, keeping every tree's shape.
-    Returns the refit report as a dict. LightGBM's `Booster.refit`."""
+    `params` is the mapping `_refit_params` reads plus `alpha`, the
+    objective's scalar parameter. Returns the refit report as a dict.
+    LightGBM's `Booster.refit`."""
     var m = model.downcast_value_ptr[Model]()
     var d = dataset.downcast_value_ptr[Dataset]()
     var report = mojo_refit_dataset(
-        m[],
-        d[],
-        _refit_params(
-            decay_rate,
-            min_leaf_rows,
-            recount,
-            lambda_l2,
-            lambda_l1,
-            max_delta_step,
-            path_smooth,
-        ),
-        Float64(py=alpha),
+        m[], d[], _refit_params(params), Float64(py=params["alpha"])
     )
     return _py_report(report)
 
 
 def refit_multiclass(
-    model: PythonObject,
-    dataset: PythonObject,
-    decay_rate: PythonObject,
-    min_leaf_rows: PythonObject,
-    recount: PythonObject,
-    lambda_l2: PythonObject,
-    lambda_l1: PythonObject,
-    max_delta_step: PythonObject,
-    path_smooth: PythonObject,
+    model: PythonObject, dataset: PythonObject, params: PythonObject
 ) raises -> PythonObject:
     var m = model.downcast_value_ptr[MulticlassModel]()
     var d = dataset.downcast_value_ptr[Dataset]()
-    var report = mojo_refit_dataset_multiclass(
-        m[],
-        d[],
-        _refit_params(
-            decay_rate,
-            min_leaf_rows,
-            recount,
-            lambda_l2,
-            lambda_l1,
-            max_delta_step,
-            path_smooth,
-        ),
-    )
+    var report = mojo_refit_dataset_multiclass(m[], d[], _refit_params(params))
     return _py_report(report)
 
 

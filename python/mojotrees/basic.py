@@ -69,7 +69,7 @@ See docs/LIGHTGBM_PARITY.md for the full row-by-row statement.
 import os as _os
 import tempfile as _tempfile
 
-from . import _arrays, _eval, _mojotrees
+from . import _arrays, _eval, _mojotrees, _sequence
 
 _np = _arrays.np
 _addr = _arrays.addr
@@ -416,12 +416,27 @@ class Dataset:
         # Sparse input takes the sparse binner, which reads the three CSC
         # arrays directly; the dense entry point refuses it rather than
         # densifying behind the caller (see `_arrays.column_major`).
+        # Batched input (an `lgb.Sequence`, a `_sequence.Batches`) is kept
+        # as batches and streamed into the native binner on `construct`,
+        # one converted batch at a time; with `reference=` it is
+        # materialized instead, because binning by a reference mapper
+        # takes one matrix.
         self._sparse = _arrays.is_sparse(data)
+        self._batched = (
+            not self._sparse
+            and reference is None
+            and _sequence.input_kind(data) == "batches"
+        )
         if self._sparse:
             buffers, n_rows, n_features, frame_names = _arrays.check_X_sparse(
                 data, "csc"
             )
             self._x = buffers
+        elif self._batched:
+            batches = _sequence.wrap(data)
+            frame_names, n_features = batches.schema("data")
+            n_rows = batches.num_data()
+            self._x = batches
         else:
             Xb, n_rows, n_features, frame_names = _arrays.check_X(data)
             self._x = Xb
@@ -660,6 +675,10 @@ class Dataset:
         elif self._sparse:
             params.update(self._x.params())
             self._handle = _mojotrees.dataset_create_csc(params)
+        elif self._batched:
+            self._handle = _sequence.stream_dataset(
+                self._x, params, _mojotrees, "data"
+            )
         else:
             self._handle = _mojotrees.dataset_create(
                 _addr(self._x), self._n_rows, self._n_features, params
@@ -1241,32 +1260,22 @@ class Booster:
         max_delta_step = float(getattr(base, "max_delta_step", 0.0) or 0.0)
         path_smooth = float(getattr(base, "path_smooth", 0.0) or 0.0)
         handle = dataset._constructed()
+        refit_params = {
+            "refit_decay_rate": float(decay_rate),
+            "min_data_in_leaf": int(min_data_in_leaf),
+            "recount": 1 if recount else 0,
+            "lambda_l2": lambda_l2,
+            "lambda_l1": lambda_l1,
+            "max_delta_step": max_delta_step,
+            "path_smooth": path_smooth,
+            "alpha": float(getattr(self._config, "alpha", 0.9)),
+        }
         if self._n_classes:
             report = _mojotrees.refit_multiclass(
-                self._handle,
-                handle,
-                float(decay_rate),
-                int(min_data_in_leaf),
-                1 if recount else 0,
-                lambda_l2,
-                lambda_l1,
-                max_delta_step,
-                path_smooth,
+                self._handle, handle, refit_params
             )
         else:
-            alpha = float(getattr(self._config, "alpha", 0.9))
-            report = _mojotrees.refit(
-                self._handle,
-                handle,
-                float(decay_rate),
-                int(min_data_in_leaf),
-                1 if recount else 0,
-                lambda_l2,
-                lambda_l1,
-                max_delta_step,
-                path_smooth,
-                alpha,
-            )
+            report = _mojotrees.refit(self._handle, handle, refit_params)
         self._edited()
         return {str(k): int(v) for k, v in dict(report).items()}
 
