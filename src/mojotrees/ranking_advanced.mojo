@@ -2167,4 +2167,4 @@ def fit_ranker_advanced[
         bagging,
     )
     var model = Model(mapper^, trained.booster.copy())
-    return FittedAdvancedRanker(model^, trained.bias^)
+    return FittedAdvancedRanker(model^, trained.bias.copy())
