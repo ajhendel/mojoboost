@@ -1,8 +1,11 @@
 # GPU backend specializations: NVIDIA and AMD
 
 Written: 2026-08-14
-Policy source: `src/mojotrees/gpu_cuda_policy.mojo`,
-`src/mojotrees/gpu_amd_policy.mojo`
+Policy source: `src/mojotrees/gpu_vendor_policy.mojo` (the
+`gpu_cuda_policy.mojo` and `gpu_amd_policy.mojo` twins this document was
+written against were merged into it on 2026-08-15, f23bd1b; the names below
+that still say `gpu_cuda_policy` / `gpu_amd_policy` describe that history
+and now resolve to `gpu_vendor_policy`)
 
 ## Status, stated first
 
@@ -19,7 +22,7 @@ Against `docs/CAPABILITY_LEVELS.md`, the two modules described here are:
 
 | Level | NVIDIA policy | AMD policy | Evidence |
 |---|---|---|---|
-| implemented | yes | yes | `src/mojotrees/gpu_cuda_policy.mojo`, `src/mojotrees/gpu_amd_policy.mojo` |
+| implemented | yes | yes | `src/mojotrees/gpu_vendor_policy.mojo` (formerly `gpu_cuda_policy.mojo` + `gpu_amd_policy.mojo`) |
 | integrated | no | no | no shipping code path imports either module; see "Exact integration requests" |
 | publicly reachable | no | no | not exported from `src/mojotrees/__init__.mojo` |
 | focused-tested | no | no | no test file exists; this lane was forbidden to write or run one |
