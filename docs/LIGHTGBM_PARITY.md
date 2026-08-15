@@ -320,7 +320,7 @@ no longer holds. Every field is a constructor argument instead.
 | 2-D numpy array | supported | Converted to column-major float64 |
 | pandas `DataFrame` | supported | Column names recorded as `feature_names_in_` |
 | Python lists / sequences | supported | Works with numpy absent, which is also how the wheel is smoke-tested |
-| `scipy.sparse` CSR | partial | `fit` and `predict` take any SciPy sparse matrix or array and keep it sparse: CSC to fit because histogram accumulation is feature-oriented, CSR to predict because prediction is row-oriented, converted without densifying and without mutating the caller's matrix. An implicit zero is the numerical value 0.0, matching LightGBM's default `zero_as_missing=false`, so a sparse fit equals the dense fit of the same matrix with the gaps filled with zeros. `device="gpu"` trains on the accelerator through the sparse GPU trainer (section 12) and `device="auto"` keeps the CPU. What raises rather than densifying behind your back: a Python objective callable, `eval_set` and early stopping, ranking, GPU prediction, `pred_leaf`, `pred_contrib`, and iteration slicing. Two loose ends recorded in "Known gaps": the scikit-learn tag still declares `input_tags.sparse` False, and scipy is not in the `pytest` pixi environment, so the Python-side sparse tests skip in CI. Section 0 |
+| `scipy.sparse` CSR | partial | `fit` and `predict` take any SciPy sparse matrix or array and keep it sparse: CSC to fit because histogram accumulation is feature-oriented, CSR to predict because prediction is row-oriented, converted without densifying and without mutating the caller's matrix. An implicit zero is the numerical value 0.0, matching LightGBM's default `zero_as_missing=false`, so a sparse fit equals the dense fit of the same matrix with the gaps filled with zeros. `device="gpu"` trains on the accelerator through the sparse GPU trainer (section 12) and `device="auto"` keeps the CPU. What raises rather than densifying behind your back: a Python objective callable, `eval_set` and early stopping, ranking, GPU prediction, `pred_leaf`, `pred_contrib`, and iteration slicing. The two loose ends recorded in "Known gaps" are both closed: the scikit-learn tag declares `input_tags.sparse` True and a meta-estimator test runs a sparse matrix through `cross_val_score`, and scipy is declared in the `pytest` pixi environment rather than inherited from scikit-learn, so the Python-side sparse cases run in CI. What holds the row at `partial` is the list above, the entry points that raise instead of taking sparse. Section 0 |
 | `scipy.sparse` CSC | partial | Same path, same limits |
 | `Dataset` from a file path | unsupported | Part of the file-based configuration surface mojotrees does not implement. `cli/mojotrees` reads CSV, which is a different thing (section 13) |
 | `Sequence` / batched construction | supported | An `lgb.Sequence`, a `mojotrees._sequence.Batches` of arrays or frames, or a list of them, streamed a batch at a time into the same native `Dataset` a dense matrix builds; `python/tests/test_preflight_readers.py` checks the chunk count and the fit |
@@ -414,7 +414,7 @@ Aliases are omitted; section 2 lists the aliases mojotrees accepts.
 | `enable_bundle` | partial | Exclusive Feature Bundling. `src/mojotrees/boosting.mojo` fits one plan per training run with `prepare_bundling` and hands the bundled matrix to every tree, and `src/mojotrees/params.mojo` parses `enable_bundle` and `max_conflict_rate`. No Python estimator parameter reaches it. Section 0 |
 | `use_missing` | supported | |
 | `zero_as_missing` | deferred | Section 6 |
-| `feature_pre_filter` | different | mojotrees does not drop features during binning, so there is nothing to disable. A constant feature simply never yields a positive-gain split |
+| `feature_pre_filter` | different | mojotrees does not drop features during binning, so there is nothing to disable. A constant feature simply never yields a positive-gain split. The key itself is refused in a parameter string, by name and for any value, by `tree_parameters_extra.check_extra_option_supported`: the fitted model already equals LightGBM's at `feature_pre_filter=false`, so what the refusal is about is the speed-up mojotrees does not have. One consequence is recorded in "Known gaps": porting a LightGBM configuration that spells out `feature_pre_filter=false`, which is the behavior mojotrees matches, raises rather than being accepted |
 | `pre_partition` | deferred | Distributed, task 16 |
 | `two_round` / `header` / `label_column` / `weight_column` / `group_column` / `ignore_column` / `parser_config_file` / `precise_float_parser` / `forcedbins_filename` / `save_binary` | unsupported | LightGBM's text-parsing parameters. mojotrees's own CLI has `--header`, `--label`, and `--weight` flags over its own CSV reader (`cli/README.md`); they are not these parameters and are not accepted in a parameter string |
 | `categorical_feature` | supported | Indices, names, or `"auto"`. pandas `category` columns are label-encoded by the estimator, and the encoding is kept for prediction; the model file carries the category tables but not the labels, so a model read back from disk takes integer codes |
@@ -604,19 +604,32 @@ Findings from the audit that are not LightGBM parity items but that make the
 matrix less trustworthy than it looks. They are recorded here rather than
 quietly fixed, because each is somebody's in-flight work:
 
-1. **The scikit-learn sparse tag contradicts the sparse path.**
+1. ~~**The scikit-learn sparse tag contradicts the sparse path.**
    `python/mojotrees/_sklearn.py` reports `input_tags.sparse` False, and
    `python/tests/test_sklearn_integration.py` asserts that it does, while
    `fit` and `predict` accept SciPy sparse matrices. A scikit-learn utility
    that respects the tag will densify before calling mojotrees, which is
-   the thing the sparse path exists to avoid.
-2. **The Python sparse tests cannot run in the environment CI uses.**
+   the thing the sparse path exists to avoid.~~ Closed in `d03a75c`;
+   `python/mojotrees/_sklearn.py` sets `tags.input_tags.sparse = True` and
+   the test asserts True, with a second test that runs a sparse matrix
+   through `cross_val_score` so the tag is checked against the path it
+   promises rather than on its own.
+2. ~~**The Python sparse tests cannot run in the environment CI uses.**
    `python/tests/test_validation.py` and `python/tests/test_contrib.py`
    guard their sparse cases with `pytest.importorskip("scipy.sparse")`, and
    `pixi.toml` does not list scipy under `[feature.pytest.dependencies]`.
    Both cases skip in `pixi run -e pytest test-estimators`, which is the
    only Python test run CI performs, so section 6's rows are `partial`
-   rather than `supported`.
+   rather than `supported`.~~ Withdrawn in this revision, because it was
+   not true. scipy was already in that environment transitively, since
+   scikit-learn requires it, and `pixi.lock` resolves scipy 1.18.0 under
+   the `pytest` environment on all three platforms. The guarded cases have
+   been running in CI all along. What was real is narrower and is now
+   fixed rather than recorded: that coverage rested on somebody else's
+   dependency, so a scikit-learn release that dropped scipy would have
+   turned those cases back into silent skips with CI still green.
+   `pixi.toml` declares `scipy` under `[feature.pytest.dependencies]`
+   directly, which makes it a contract instead of an accident.
 3. ~~**`colsample_bytree` and `colsample_bynode` are not accepted** as
    aliases even though the rest of the scikit-learn spellings are.~~ Closed
    in this revision; `_Base.__init__` takes both and section 2 says so.
