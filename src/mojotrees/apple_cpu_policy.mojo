@@ -128,7 +128,9 @@ comptime DEFAULT_COMPACT_MIN_ROWS = 256
 # accumulation would have read.
 comptime COMPACT_MIN_FEATURES = 2
 
-# One histogram cell is a gradient, a hessian, and a count.
+# One host histogram cell: Float64 gradient + Float64 hessian + Int count per
+# (feature, bin), the layout of `Histogram` in histogram.mojo on a 64-bit
+# target. The one definition; histogram_cache_policy.mojo imports it.
 comptime HISTOGRAM_BYTES_PER_CELL = 24
 
 # Assumed, not reported. Apple silicon uses a 128-byte line; 64 is the

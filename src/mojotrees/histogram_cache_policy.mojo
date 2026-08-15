@@ -104,6 +104,7 @@ leaf-wise growth holds one per frontier leaf, and during a split the parent
 is still live while both children exist, which is the peak.
 """
 
+from .apple_cpu_policy import HISTOGRAM_BYTES_PER_CELL
 from .parallel import _env_int
 
 
@@ -199,9 +200,10 @@ def staleness_name(code: Int) -> String:
 
 # --- Sizes ----------------------------------------------------------------
 
-# Float64 gradient + Float64 hessian + Int count per (feature, bin) cell, the
-# layout of `Histogram` in histogram.mojo on a 64-bit target.
-comptime HISTOGRAM_BYTES_PER_CELL = 24
+# `HISTOGRAM_BYTES_PER_CELL` (Float64 gradient + Float64 hessian + Int count
+# per (feature, bin) cell, the layout of `Histogram` in histogram.mojo on a
+# 64-bit target) is imported from apple_cpu_policy.mojo, the CPU histogram
+# policy layer, so the host cell size has one definition.
 
 # The device-side fixed-point planes are Int32 rather than Float64/Int, so a
 # download is half the host footprint: `[grad | hess | count]`, 4 bytes each.
