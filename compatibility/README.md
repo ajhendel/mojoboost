@@ -52,10 +52,11 @@ touches all three.
 
 ## Why this directory exists rather than living under tests/
 
-`tests/parallel/api_snapshot_manifest.json` is the hand-written draft this
+`compatibility/api_snapshot_manifest_v1.json` is the hand-written draft this
 work supersedes. Its own handoff (`handoffs/task20_compatibility.md`) says
 the location was a round convention rather than a choice, that
-`tests/parallel/` holds no other JSON, and that no test runner reads it.
+`tests/` holds no JSON at all now that this moved, and no test
+runner reads it.
 
 Three reasons the artifacts belong here instead.
 

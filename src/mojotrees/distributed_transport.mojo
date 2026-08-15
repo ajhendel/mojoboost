@@ -63,7 +63,7 @@ works". `MemoryEndpoint` remains a fake, named as one, and is not a transport.
 
 from std.memory import bitcast
 from std.os import getenv
-from std.sys.ffi import external_call
+from std.ffi import external_call
 from std.sys.info import CompilationTarget
 from std.time import perf_counter_ns, sleep
 
@@ -1571,9 +1571,15 @@ def _errno() -> Int:
     which is the whole reason this exists.
     """
     comptime if _IS_MACOS:
-        return Int(external_call["__error", UnsafePointer[Int32]]()[])
+        return Int(
+            external_call["__error", MutPointer[Int32, MutAnyOrigin]]()[]
+        )
     comptime if _IS_LINUX:
-        return Int(external_call["__errno_location", UnsafePointer[Int32]]()[])
+        return Int(
+            external_call[
+                "__errno_location", MutPointer[Int32, MutAnyOrigin]
+            ]()[]
+        )
     return 0
 
 
@@ -3128,7 +3134,7 @@ def _worker_rendezvous(
 ) raises -> WorldConnection:
     """Reach the root, announce this rank, and take the world it reports."""
     var local = local_handshake(config, spec.restart_epoch)
-    var root = config.addresses[ROOT_RANK]
+    var root = config.addresses[ROOT_RANK].copy()
     var fd = connect_to_root(root.host, root.port, config.rank, deadline_ns)
     var endpoint = SocketEndpoint(ROOT_RANK, fd)
     var expected = config.world_size - 1

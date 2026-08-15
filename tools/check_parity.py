@@ -11,8 +11,9 @@ become false and a deferred row cannot quietly stay false:
    row fails here, which is the point)
 4. the public Python symbols those rows depend on still exist
 5. the public Mojo symbols those rows depend on are still exported
-6. the Mojo test suites the contract cites are wired into a pixi task,
-   except for the ones the contract itself lists as known gaps
+6. the Mojo test suites the contract cites are where `tools/run_tests.sh`
+   looks for them, and so are run by `pixi run test`, except for the ones
+   the contract itself lists as known gaps
 7. no `deferred` or `unsupported` row has gone stale, judged by resolving
    the *public symbols* behind it
 8. the capability-level table in section 0 uses exactly the seven levels
@@ -58,6 +59,7 @@ Exit status is 0 when every check passes and 1 otherwise.
 from __future__ import annotations
 
 import ast
+import fnmatch
 import re
 import sys
 from pathlib import Path
@@ -69,7 +71,6 @@ PY_PKG = ROOT / "python" / "mojotrees"
 PY_API = PY_PKG / "__init__.py"
 PY_BASIC = PY_PKG / "basic.py"
 MOJO_INIT = ROOT / "src" / "mojotrees" / "__init__.mojo"
-PIXI = ROOT / "pixi.toml"
 
 STATUSES = {"supported", "partial", "different", "deferred", "unsupported"}
 
@@ -119,8 +120,10 @@ REQUIRED_SUPPORTED = [
     "n_estimators",
     "min_child_weight",
     "min_child_samples",
+    "min_split_gain",
     "subsample",
     "subsample_freq",
+    "colsample_bytree",
     "reg_alpha",
     "reg_lambda",
     "importance_type",
@@ -164,6 +167,7 @@ REQUIRED_SUPPORTED = [
     "feature_fraction",
     "feature_fraction_bynode",
     "feature_fraction_seed",
+    "min_gain_to_split",
     "early_stopping_round",
     "early_stopping_min_delta",
     "lambda_l1",
@@ -268,8 +272,12 @@ REQUIRED_BASE_PARAMS = [
     "other_rate",
     "goss_seed",
     "feature_fraction",
+    "colsample_bytree",
     "feature_fraction_bynode",
+    "colsample_bynode",
     "feature_fraction_seed",
+    "min_gain_to_split",
+    "min_split_gain",
     "use_missing",
     "categorical_feature",
     "max_cat_to_onehot",
@@ -504,7 +512,6 @@ STALE_DEFERRED_WATCHES = {
     # the six implemented-but-unintegrated Mojo modules, watched by the name
     # an integrator would have to export to reach them
     "enable_bundle": ["mojo:fit_bundles"],
-    "min_gain_to_split": ["mojo:passes_min_gain"],
     "extra_trees / extra_seed": ["mojo:extra_split_stream"],
     "path_smooth": ["mojo:smooth_leaf_output"],
     "feature_contri": ["mojo:FeaturePenalties"],
@@ -1368,17 +1375,28 @@ def monotone_passthrough(problems):
 
 
 def unwired_tests(text, problems):
-    """Cited Mojo suites that no pixi task runs."""
+    """Cited Mojo suites that no pixi task runs.
+
+    "Wired" used to mean "named in pixi.toml", because `pixi run test` was
+    sixty `mojo run` commands chained with `&&` and a suite was in the run
+    only if someone had typed its path. It now means "matches the glob
+    `tools/run_tests.sh` discovers", which is `tests/test_*.mojo`. That is a
+    weaker check by design: under a chain a suite could exist, pass, and be
+    named nowhere, which is what `tests/test_gpu_split_policy.mojo` did, and
+    a glob cannot leave one out. What is still worth catching is a contract
+    citing a suite that is not there at all, or sitting somewhere the runner
+    does not look.
+    """
     cited = {
         path
         for path in set(PATH_RE.findall(text))
         if path.startswith("tests/") and path.endswith(".mojo")
     }
-    pixi = PIXI.read_text()
     wired = {
         path
         for path in cited
-        if re.search(r"\b" + re.escape(path) + r"\b", pixi)
+        if fnmatch.fnmatch(path, "tests/test_*.mojo")
+        and (ROOT / path).exists()
     }
     unwired = cited - wired
     if unwired != KNOWN_UNWIRED_TESTS:

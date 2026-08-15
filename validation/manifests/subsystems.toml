@@ -543,7 +543,7 @@ paths = [
 ]
 fallback = ["native:compile-package"]
 reason = "Scheduling policies. Pure arithmetic over device limits, imported by no suite."
-would_close_it = "A policy suite in the shape of tests/parallel/test_apple_gpu_policy.mojo, which is the one policy module that does have one. These are the cheapest gaps in this file to close: they need no accelerator."
+would_close_it = "A policy suite in the shape of tests/test_apple_gpu_policy.mojo, which is the one policy module that does have one. These are the cheapest gaps in this file to close: they need no accelerator."
 
 [[gap]]
 paths = [

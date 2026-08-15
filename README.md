@@ -833,7 +833,7 @@ loads and stores. No warp shuffles, no float atomics (Metal has none), no
 vendor intrinsics, and no per-architecture code paths. Only the tiling
 numbers differ per device.
 
-Three environment variables override the policy, for benchmarking and for
+Four environment variables override the policy, for benchmarking and for
 tests that must force one path, matching the `MOJOTREES_` contract in
 `parallel.mojo`:
 
@@ -842,10 +842,14 @@ tests that must force one path, matching the `MOJOTREES_` contract in
 | `MOJOTREES_GPU_HIST_STRATEGY` | `atomic` or `tiled` forces that strategy; `auto` or unset lets the policy decide |
 | `MOJOTREES_GPU_ROW_TILE` | rows per tile, still clamped to the memory budget |
 | `MOJOTREES_GPU_BLOCK_THREADS` | threads per threadgroup, still clamped to the device maximum and rounded to a warp |
+| `MOJOTREES_GPU_SPLIT_WIDE` | `1` scans each feature's bins on a threadgroup rather than on one thread; unset keeps the one-thread scan. Ignored for a dataset with any categorical feature, whose search the wide kernel does not implement |
 
 These are tuning and test knobs rather than model parameters: they change
 how a histogram is computed, never what it equals, so they are deliberately
-absent from the Python API and from the serialization format.
+absent from the Python API and from the serialization format. The same is
+true of the wide scan: it returns the one-thread scan's records bit for bit,
+which `tests/test_gpu_split_search.mojo` asserts, and it is off by default
+only because no benchmark has priced it.
 
 `pixi run bench-hist-scaling` reports the two strategies side by side with
 kernel time separated from conversion, upload, download, and setup time. Every
@@ -1895,8 +1899,16 @@ Requires [pixi](https://pixi.sh).
 
 ```sh
 pixi install
-pixi run test
+pixi run test          # all suites
+pixi run test-cpu      # everything that needs no accelerator
+pixi run test-gpu      # the accelerator subset
+pixi run test-list     # what would run, without running it
 ```
+
+`pixi run test` builds the package once with `mojo precompile` and then runs
+`tests/test_*.mojo` through a bounded pool of processes, reporting every
+failure rather than stopping at the first. `tools/run_tests.sh` is the runner
+and documents the knobs; `MOJOTREES_TEST_JOBS` is the one most people want.
 
 During ordinary development, run only the smallest test file covering the
 change. The full suite is an integration or release check and should not be

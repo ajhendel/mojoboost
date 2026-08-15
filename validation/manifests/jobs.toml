@@ -265,7 +265,7 @@ proves = "Where the import came from, which is how a wheel test that accidentall
 evidence = "packaging/matrix/accelerators/"
 
 # ===========================================================================
-# native: one Mojo suite each, ordered as tests/ then tests/parallel/
+# native: one Mojo suite each, ordered as tests/
 # ===========================================================================
 
 [[job]]
@@ -569,8 +569,8 @@ proves = "That capi/mojotrees.h compiles under a C compiler and the library link
 id = "native:apple-gpu-policy"
 tier = "native"
 title = "Apple GPU policy"
-command = "pixi run mojo run -I src tests/parallel/test_apple_gpu_policy.mojo"
-requires_files = ["tests/parallel/test_apple_gpu_policy.mojo"]
+command = "pixi run mojo run -I src tests/test_apple_gpu_policy.mojo"
+requires_files = ["tests/test_apple_gpu_policy.mojo"]
 provenance = "ci"
 proves = "That the Apple tiling policy derives block and thread counts within the device limits it is given."
 
@@ -578,8 +578,8 @@ proves = "That the Apple tiling policy derives block and thread counts within th
 id = "native:distributed-transport"
 tier = "native"
 title = "Distributed wire protocol"
-command = "pixi run mojo run -I src tests/parallel/test_distributed_transport.mojo"
-requires_files = ["tests/parallel/test_distributed_transport.mojo"]
+command = "pixi run mojo run -I src tests/test_distributed_transport.mojo"
+requires_files = ["tests/test_distributed_transport.mojo"]
 provenance = "ci"
 proves = "That the frame, the codecs, the handshake, and the session state machine hold, all in one process."
 
@@ -587,8 +587,8 @@ proves = "That the frame, the codecs, the handshake, and the session state machi
 id = "native:efb"
 tier = "native"
 title = "Exclusive feature bundling"
-command = "pixi run mojo run -I src tests/parallel/test_efb.mojo"
-requires_files = ["tests/parallel/test_efb.mojo"]
+command = "pixi run mojo run -I src tests/test_efb.mojo"
+requires_files = ["tests/test_efb.mojo"]
 provenance = "ci"
 proves = "That bundling groups mutually exclusive features and that unbundling recovers the original bins."
 
@@ -596,8 +596,8 @@ proves = "That bundling groups mutually exclusive features and that unbundling r
 id = "native:gpu-active-rows"
 tier = "native"
 title = "GPU active row compaction"
-command = "pixi run mojo run -I src tests/parallel/test_gpu_active_rows.mojo"
-requires_files = ["tests/parallel/test_gpu_active_rows.mojo"]
+command = "pixi run mojo run -I src tests/test_gpu_active_rows.mojo"
+requires_files = ["tests/test_gpu_active_rows.mojo"]
 provenance = "ci"
 proves = "That row compaction is order-preserving, which is the property the histogram indices depend on."
 
@@ -605,8 +605,8 @@ proves = "That row compaction is order-preserving, which is the property the his
 id = "native:gpu-objectives-native"
 tier = "native"
 title = "Device-resident objectives"
-command = "pixi run mojo run -I src tests/parallel/test_gpu_objectives_native.mojo"
-requires_files = ["tests/parallel/test_gpu_objectives_native.mojo"]
+command = "pixi run mojo run -I src tests/test_gpu_objectives_native.mojo"
+requires_files = ["tests/test_gpu_objectives_native.mojo"]
 provenance = "ci"
 proves = "That the gradient and hessian kernels compute what the CPU objective computes."
 
@@ -614,8 +614,8 @@ proves = "That the gradient and hessian kernels compute what the CPU objective c
 id = "native:gpu-predict"
 tier = "native"
 title = "GPU prediction"
-command = "pixi run mojo run -I src tests/parallel/test_gpu_predict.mojo"
-requires_files = ["tests/parallel/test_gpu_predict.mojo"]
+command = "pixi run mojo run -I src tests/test_gpu_predict.mojo"
+requires_files = ["tests/test_gpu_predict.mojo"]
 provenance = "ci"
 proves = "That device-side tree traversal returns the CPU predictions."
 
@@ -623,8 +623,8 @@ proves = "That device-side tree traversal returns the CPU predictions."
 id = "native:gpu-runtime"
 tier = "native"
 title = "GPU runtime session"
-command = "pixi run mojo run -I src tests/parallel/test_gpu_runtime.mojo"
-requires_files = ["tests/parallel/test_gpu_runtime.mojo"]
+command = "pixi run mojo run -I src tests/test_gpu_runtime.mojo"
+requires_files = ["tests/test_gpu_runtime.mojo"]
 provenance = "ci"
 proves = "That the persistent device session allocates, reuses, and releases its buffers."
 
@@ -632,41 +632,39 @@ proves = "That the persistent device session allocates, reuses, and releases its
 id = "native:gpu-split-search"
 tier = "native"
 title = "GPU split selection"
-command = "pixi run mojo run -I src tests/parallel/test_gpu_split_search.mojo"
-requires_files = ["tests/parallel/test_gpu_split_search.mojo"]
+command = "pixi run mojo run -I src tests/test_gpu_split_search.mojo"
+requires_files = ["tests/test_gpu_split_search.mojo"]
 provenance = "ci"
 proves = "That device-side split selection picks the split the CPU scan picks, including under monotone and categorical rules."
 
-# Listed rather than omitted so the gap has an entry instead of a silence,
-# which is the same reason distributed:two-process is here. The suite exists
-# on disk and no pixi task runs it, so it has never run in CI and running it
-# by hand is not what this planner is for: a job whose command is not the
-# repository's own entry point would be this file inventing a way to run a
-# test, and the next person would not find it from pixi.toml. Patch P4 in
-# handoffs/remaining_14_validation_plan.md adds it to the test chain, at which
-# point this entry becomes an ordinary native job.
+# This entry was `blocked = true` because the suite was on disk and no pixi
+# task named it, so it had never run here or in CI, and a job whose command
+# was not the repository's own entry point would have been this file
+# inventing a way to run a test. The chain of `mojo run` commands is gone:
+# `tools/run_tests.sh` discovers `tests/test_*.mojo` by glob, so this file is
+# in `pixi run test` and `pixi run test-cpu` by existing, and the entry is an
+# ordinary native job.
 #
-# tools/check_parity.py does not catch this one. Its unwired-suite check reads
-# suites cited in docs/LIGHTGBM_PARITY.md, and nothing cites this file, so an
-# uncited suite that no task runs passes both checks. --self-check now catches
-# the mirror case (a suite the chain runs that no job names); this direction is
-# reported by --coverage.
+# The class of gap it stood for is closed by construction rather than by
+# vigilance. tools/check_parity.py never caught this one: its unwired-suite
+# check reads suites cited in docs/LIGHTGBM_PARITY.md, and nothing cites this
+# file, so an uncited suite that no task ran passed both checks. A glob
+# cannot leave a suite out.
 [[job]]
 id = "native:gpu-split-policy"
 tier = "native"
 title = "GPU split policy"
-blocked = true
-blocked_reason = "tests/parallel/test_gpu_split_policy.mojo is in no pixi task, so there is no repository entry point to call. Patch P4 adds one."
-requires_files = ["tests/parallel/test_gpu_split_policy.mojo"]
-provenance = "unverified"
-proves = "Nothing yet. No task runs this suite, so it has never run here or in CI."
+command = "pixi run test-cpu"
+requires_files = ["tests/test_gpu_split_policy.mojo"]
+provenance = "ci"
+proves = "That the host/device split-search decision gates on semantics and resident memory before profitability, stays on the host for unknown hardware, and reports the evidence id behind the M4 threshold. First run 2026-08-15: 6 passed."
 
 [[job]]
 id = "native:lgbm-model-io"
 tier = "native"
 title = "LightGBM model file interop"
-command = "pixi run mojo run -I src tests/parallel/test_lgbm_model_io.mojo"
-requires_files = ["tests/parallel/test_lgbm_model_io.mojo"]
+command = "pixi run mojo run -I src tests/test_lgbm_model_io.mojo"
+requires_files = ["tests/test_lgbm_model_io.mojo"]
 provenance = "ci"
 proves = "That a LightGBM text model parses into a Tree that predicts the same values."
 
@@ -674,8 +672,8 @@ proves = "That a LightGBM text model parses into a Tree that predicts the same v
 id = "native:sampling"
 tier = "native"
 title = "Sampling primitives"
-command = "pixi run mojo run -I src tests/parallel/test_sampling.mojo"
-requires_files = ["tests/parallel/test_sampling.mojo"]
+command = "pixi run mojo run -I src tests/test_sampling.mojo"
+requires_files = ["tests/test_sampling.mojo"]
 provenance = "ci"
 proves = "That the bagging and GOSS row selectors are reproducible for a seed and unbiased over rounds."
 
@@ -683,8 +681,8 @@ proves = "That the bagging and GOSS row selectors are reproducible for a seed an
 id = "native:tree-parameters-extra"
 tier = "native"
 title = "Remaining tree-parameter rules"
-command = "pixi run mojo run -I src tests/parallel/test_tree_parameters_extra.mojo"
-requires_files = ["tests/parallel/test_tree_parameters_extra.mojo"]
+command = "pixi run mojo run -I src tests/test_tree_parameters_extra.mojo"
+requires_files = ["tests/test_tree_parameters_extra.mojo"]
 provenance = "ci"
 proves = "That min_gain_to_split, path_smooth, and the penalty primitives compute their rule. No grower calls them, so this proves the primitive and not the parameter."
 
@@ -692,11 +690,11 @@ proves = "That min_gain_to_split, path_smooth, and the penalty primitives comput
 id = "native:compile-package"
 tier = "native"
 title = "Type-check the whole package"
-command = "pixi run mojo package src/mojotrees -o ${TMPDIR:-/tmp}/mojotrees.mojopkg"
+command = "pixi run build-pkg"
 needs = ["toolchain"]
 budget_seconds = 90
-provenance = "unverified"
-proves = "That every module in src/mojotrees compiles, including the ones no suite imports. This is the only check some modules have."
+provenance = "ci"
+proves = "That every module in src/mojotrees compiles, including the ones no suite imports. This is the only check some modules have. First run 2026-08-15, and it failed: distributed_transport, histogram_cache_policy, quantized_gradient, and ranking_advanced had not compiled for some time, because no suite reached them and nothing else elaborated them. Now in front of every test run, so it cannot go unrun again."
 
 [[job]]
 id = "native:compile-module"
@@ -1132,8 +1130,8 @@ proves = "That splitting rows across ranks and reducing histograms reproduces th
 id = "distributed:transport"
 tier = "distributed"
 title = "Wire protocol and session state machine"
-command = "pixi run mojo run -I src tests/parallel/test_distributed_transport.mojo"
-requires_files = ["tests/parallel/test_distributed_transport.mojo", "docs/DISTRIBUTED_TRANSPORT.md"]
+command = "pixi run mojo run -I src tests/test_distributed_transport.mojo"
+requires_files = ["tests/test_distributed_transport.mojo", "docs/DISTRIBUTED_TRANSPORT.md"]
 provenance = "ci"
 proves = "That frames encode and decode, checksums catch corruption, epochs and sequences advance, and failure is sticky. MemoryEndpoint is a fake and is named as one."
 

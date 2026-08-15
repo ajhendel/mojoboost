@@ -924,7 +924,7 @@ def pixi_tasks():
     return names
 
 
-SUITE_RE = re.compile(r"tests/(?:parallel/)?test_[A-Za-z0-9_]+\.mojo")
+SUITE_RE = re.compile(r"tests/test_[A-Za-z0-9_]+\.mojo")
 
 
 def pixi_suites():
@@ -1202,10 +1202,13 @@ def coverage_notes(man):
         for path in job.get("requires_files", []):
             covered_files.add(normalize(path))
 
+    # `test_*.mojo`, not `*.mojo`: tests/support.mojo holds the shared data
+    # generators and is not a suite, so a job naming it would be wrong.
+    # tests/parallel/ is gone; the directory was named for the lane that wrote
+    # its files, never for how they run.
     suites = sorted(
         normalize(p.relative_to(ROOT))
-        for p in list((ROOT / "tests").glob("*.mojo"))
-        + list((ROOT / "tests" / "parallel").glob("*.mojo"))
+        for p in (ROOT / "tests").glob("test_*.mojo")
     )
     orphan_suites = [s for s in suites if s not in covered_files]
     if orphan_suites:

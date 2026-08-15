@@ -21,8 +21,15 @@ jobs:
       - uses: prefix-dev/setup-pixi@v0.10.1
         with:
           cache: true
+      - id: cpus
+        run: echo "count=$(nproc)" >> "$GITHUB_OUTPUT"
+      # The runner defaults to two fewer jobs than the CPU count so a suite
+      # run leaves a development machine usable. A CI runner has nothing else
+      # to do, so give it everything.
       - name: Run CPU tests
         run: pixi run test-cpu
+        env:
+          MOJOTREES_TEST_JOBS: ${{ steps.cpus.outputs.count }}
 
   # The Python API: the dependency-free suite in the default environment,
   # then the estimator suite with pytest, scikit-learn, and pandas. Both

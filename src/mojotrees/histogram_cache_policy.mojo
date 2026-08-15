@@ -352,7 +352,7 @@ struct HistogramKey(Copyable, Movable):
         if range_begin < 0 or range_end < range_begin:
             raise Error("active-row window is not a valid range")
         return HistogramKey(
-            epochs,
+            epochs.copy(),
             node,
             range_begin,
             range_end,
@@ -377,7 +377,9 @@ struct HistogramKey(Copyable, Movable):
             raise Error("node id must be nonnegative")
         if n_rows < 0:
             raise Error("row count must be nonnegative")
-        return HistogramKey(epochs, node, 0, 0, n_rows, n_features, n_bins)
+        return HistogramKey(
+            epochs.copy(), node, 0, 0, n_rows, n_features, n_bins
+        )
 
     def shape_matches(self, n_features: Int, n_bins: Int) -> Bool:
         return self.n_features == n_features and self.n_bins == n_bins

@@ -84,7 +84,7 @@ HybridCosts coefficients (nanos per thousand units):
   tree (`8 * n_rows` bytes and one synchronize), so the unbagged built-in
   objectives — which generate gradients on the device — get the same
   replica the upload path gets. Verified bit-identical in
-  `tests/parallel/test_hybrid_replica.mojo` and in every arm below.
+  `tests/test_hybrid_replica.mojo` and in every arm below.
 
 ## Where the scheduler now places work
 

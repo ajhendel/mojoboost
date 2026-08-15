@@ -33,27 +33,9 @@ from mojotrees import (
     train,
     train_multiclass,
 )
+from support import _make_features as _features, _uniform
 
 comptime _TMP_PATH = "./.test_goss_roundtrip.tmp"
-
-
-def _splitmix64(state: UInt64) -> UInt64:
-    var z = state + 0x9E3779B97F4A7C15
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EB
-    return z ^ (z >> 31)
-
-
-def _uniform(counter: UInt64) -> Float64:
-    return Float64(_splitmix64(counter) >> 11) * (1.0 / 9007199254740992.0)
-
-
-def _features(n_rows: Int, n_features: Int) -> List[Float64]:
-    """Column-major deterministic features in [0, 1)."""
-    var features = List[Float64](capacity=n_rows * n_features)
-    for k in range(n_rows * n_features):
-        features.append(_uniform(UInt64(k)))
-    return features^
 
 
 def _regression_target(

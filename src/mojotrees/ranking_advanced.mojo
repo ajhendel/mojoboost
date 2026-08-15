@@ -1960,7 +1960,7 @@ def check_query_partition(
     var expect_q = 0
     var expect_row = 0
     for r in range(len(parts)):
-        var p = parts[r]
+        var p = parts[r].copy()
         if p.query_start != expect_q:
             raise Error(
                 "partition for rank ",

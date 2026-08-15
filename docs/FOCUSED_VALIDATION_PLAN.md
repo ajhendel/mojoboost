@@ -357,7 +357,7 @@ earlier. Patch P1 is the small change to the wrapper that reads it.
 **One distributed job is blocked outright.** `distributed:two-process` has no
 command because no two-process path exists. See section 4.
 
-**`tests/parallel/test_gpu_split_policy.mojo` is run by nothing.** The suite is
+**`tests/test_gpu_split_policy.mojo` is run by nothing.** The suite is
 on disk and no task in `pixi.toml` names it, so it has never run here or in CI.
 `tools/check_parity.py` does not catch it either: its unwired-suite check reads
 the suites cited in `docs/LIGHTGBM_PARITY.md`, nothing cites this file, and

@@ -93,7 +93,7 @@ whoever owns `model_dump.mojo`.
 | `docs/COMPATIBILITY_POLICY.md` | Section 7.2 table | Rows for v1, v2, v3 | A v4 row: split gains, the covers presence flag, and the optional `feature_names` section |
 | `docs/MODEL_INSPECTION_SCHEMA.md` | Versioning section | "current values are `dump_format_version: 1` and `model_format_version: 3`" | `model_format_version: 4` |
 | `docs/MODEL_INSPECTION_SCHEMA.md` | Top level table | "`model_format_version` ... 1, 2, or 3" | 1, 2, 3, or 4 |
-| `tests/parallel/api_snapshot_manifest.json` | `versions.model_format` and the `model_format` block | `v3`, readable `["v1","v2","v3"]` | Superseded by `compatibility/api_snapshot.json` |
+| `compatibility/api_snapshot_manifest_v1.json` | `versions.model_format` and the `model_format` block | `v3`, readable `["v1","v2","v3"]` | Superseded by `compatibility/api_snapshot.json` |
 
 Section 7.2 of the compatibility policy is the read-back matrix, and
 release gate item B3 requires it to be extended whenever the format
@@ -115,7 +115,7 @@ that state the ABI version say 1:
 
 - `docs/COMPATIBILITY_POLICY.md` section 1.4 table, and section 6.3,
   "`MOJOTREES_ABI_VERSION` is 1"
-- `tests/parallel/api_snapshot_manifest.json`, `versions.c_abi: 1` and
+- `compatibility/api_snapshot_manifest_v1.json`, `versions.c_abi: 1` and
   `c_abi.abi_version: 1`
 
 The header also grew, in ways the manifest's fourteen-declaration list
@@ -298,10 +298,11 @@ pass on the tree as read.
 
 **Severity: superseded by this lane.**
 
-`tests/parallel/api_snapshot_manifest.json` has `status: "proposed"`,
+`compatibility/api_snapshot_manifest_v1.json` has `status: "proposed"`,
 `generated_by: null`, and an `about` block explaining that it was written
 by hand. Its own handoff says the location was a round convention, that
-`tests/parallel/` holds no other JSON, and that no test runner reads it.
+`tests/` holds no JSON at all now that this moved, and no test
+runner reads it.
 
 Findings F3 through F7 are all cases where it is now wrong about the tree,
 which is what a hand-written record does over four months of parallel

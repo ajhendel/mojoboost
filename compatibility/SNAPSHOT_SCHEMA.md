@@ -6,7 +6,7 @@ consumer of the snapshot reads; neither the tool nor any past hand-written
 draft is the authority on the shape.
 
 `schema_version` is **2**. Version 1 is
-`tests/parallel/api_snapshot_manifest.json`, hand-written and superseded;
+`compatibility/api_snapshot_manifest_v1.json`, hand-written and superseded;
 section 8 says what changed and why.
 
 ## 0. Rules that hold for the whole file
@@ -323,7 +323,7 @@ complete answer to "what changed for a caller".
 
 ## 8. What changed from schema version 1
 
-Version 1 is `tests/parallel/api_snapshot_manifest.json`: hand-written,
+Version 1 is `compatibility/api_snapshot_manifest_v1.json`: hand-written,
 `status: "proposed"`, cross-checked once by a throwaway script that no
 longer exists. It was a good draft of the shape and it is wrong about the
 contents now, in the ways `DRIFT_REPORT.md` lists.

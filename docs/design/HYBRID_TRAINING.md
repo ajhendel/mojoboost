@@ -546,7 +546,7 @@ Wired, default off, and off unless *two* switches opt in.
   a mirror, and the bitwise comparison sets
   `GpuHistogramBuilder.replica_state`. Verified, later accepted leaves
   substitute; refuted, hybrid scheduling retires for the fit and the
-  pure-device path continues. `tests/parallel/test_hybrid_replica.mojo`
+  pure-device path continues. `tests/test_hybrid_replica.mojo`
   makes the same comparison over adversarial gradients and holds a hybrid
   fit bit-identical to the pure-device fit.
 - **The §8.3 integration uses the per-range readback, not the snapshot.**

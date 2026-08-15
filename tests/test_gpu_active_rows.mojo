@@ -43,13 +43,7 @@ from mojotrees.gpu_tiling import (
 from mojotrees.histogram import build_histogram_subset
 from mojotrees.split import SplitInfo
 from mojotrees.tree import partition_split_rows
-
-
-def _splitmix64(state: UInt64) -> UInt64:
-    var z = state + 0x9E3779B97F4A7C15
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EB
-    return z ^ (z >> 31)
+from support import _splitmix64
 
 
 def _make_data(

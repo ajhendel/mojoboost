@@ -50,19 +50,9 @@ from mojotrees.serialize import load_model, save_model
 from mojotrees.split import find_best_split
 from mojotrees.train_gpu import train_gpu
 from mojotrees.tree import TreeParams, grow_tree
+from support import _uniform
 
 comptime _TMP_PATH = "./.test_categorical_roundtrip.tmp"
-
-
-def _splitmix64(state: UInt64) -> UInt64:
-    var z = state + 0x9E3779B97F4A7C15
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EB
-    return z ^ (z >> 31)
-
-
-def _uniform(counter: UInt64) -> Float64:
-    return Float64(_splitmix64(counter) >> 11) * (1.0 / 9007199254740992.0)
 
 
 def _nan() -> Float64:

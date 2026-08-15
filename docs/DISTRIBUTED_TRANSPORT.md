@@ -9,7 +9,7 @@ scalability is claimed anywhere in this document.
 has to deliver. This document covers the layer underneath it: how two
 processes on two hosts would actually agree on a reduction. The code is
 `src/mojotrees/distributed_transport.mojo` and the tests are
-`tests/parallel/test_distributed_transport.mojo`.
+`tests/test_distributed_transport.mojo`.
 
 ## 1. What is implemented and what is not
 
@@ -389,7 +389,7 @@ written their checkpoints one collective apart.
 
 ## 13. Testing
 
-`tests/parallel/test_distributed_transport.mojo`, 39 tests, all in one process
+`tests/test_distributed_transport.mojo`, 39 tests, all in one process
 against in-memory endpoints and a manual clock.
 
 The interesting ones, in the sense of tests that could fail for a real reason:

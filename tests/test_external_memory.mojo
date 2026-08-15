@@ -33,30 +33,13 @@ from mojotrees.external_memory import (
 )
 from mojotrees.raw_data import RawData
 from mojotrees.sequence import CancelToken, RowIdRange, check_row_coverage
+from support import _make_features as _features
 
 
 # Cache files land in the working directory as `.test_extmem_*.mbx`
 # (`.gitignore` covers `.test_*.tmp` and `*.mbx`); each test discards its
 # cache, which truncates the files.
 comptime _CACHE_PREFIX = ".test_extmem_"
-
-
-def _splitmix64(state: UInt64) -> UInt64:
-    var z = state + 0x9E3779B97F4A7C15
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EB
-    return z ^ (z >> 31)
-
-
-def _uniform(counter: UInt64) -> Float64:
-    return Float64(_splitmix64(counter) >> 11) * (1.0 / 9007199254740992.0)
-
-
-def _features(n_rows: Int, n_features: Int) -> List[Float64]:
-    var out = List[Float64](capacity=n_rows * n_features)
-    for k in range(n_rows * n_features):
-        out.append(_uniform(UInt64(k)))
-    return out^
 
 
 def _target(features: List[Float64], n_rows: Int) -> List[Float64]:

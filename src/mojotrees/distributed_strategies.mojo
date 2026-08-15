@@ -20,7 +20,7 @@ which is what keeps them from becoming a parallel trainer.
 **Status.** Both modes are driven: `distributed.mojo` grows feature-parallel
 and voting-parallel trees over these cores when `DistributedRunOptions.
 tree_learner` selects them (`_grow_tree_feature_parallel`,
-`_grow_tree_voting_parallel`), and tests/parallel/test_distributed_strategies.mojo
+`_grow_tree_voting_parallel`), and tests/test_distributed_strategies.mojo
 runs both over `LocalCollective`. What remains true: nothing in the
 repository has moved a byte between two processes (see `transport_validated`
 in distributed_transport.mojo), so a multi-process run of either mode is

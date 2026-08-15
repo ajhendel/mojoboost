@@ -41,6 +41,8 @@ from mojotrees.gpu_split_search import (
     GpuSplitRecord,
     GpuSplitSearcher,
     reference_search,
+    wide_scan_for,
+    wide_scan_requested,
 )
 from mojotrees.histogram import Histogram
 from mojotrees.monotone import OutputBounds
@@ -230,6 +232,35 @@ def _device_search(
         var searcher = GpuSplitSearcher(
             n_features, n_bins, missing_bins, cats
         )
+        if len(features) > 0:
+            searcher.set_features(features)
+        searcher.set_monotone(monotone)
+        searcher.set_allowed(allowed)
+        searcher.upload_histogram(words)
+        return searcher.search(params, 1.0, 1.0, bounds)
+
+
+def _device_search_wide(
+    words: List[Int32],
+    n_features: Int,
+    n_bins: Int,
+    params: GpuSplitParams,
+    features: List[Int] = [],
+    allowed: List[Bool] = [],
+    missing_bins: List[Int] = [],
+    monotone: List[Int] = [],
+    bounds: OutputBounds = OutputBounds.unbounded(),
+) raises -> GpuSplitRecord:
+    """`_device_search` on the wide scan kernel, forced on rather than asked
+    for through `MOJOTREES_GPU_SPLIT_WIDE`, so both kernels are exercised in
+    one process and the comparison is between them and nothing else. Only
+    ordinal datasets reach this, which is the same bar `wide_scan_for`
+    applies."""
+    comptime if not has_accelerator():
+        raise Error("no accelerator")
+    else:
+        var searcher = GpuSplitSearcher(n_features, n_bins, missing_bins)
+        searcher.wide_scan = True
         if len(features) > 0:
             searcher.set_features(features)
         searcher.set_monotone(monotone)
@@ -771,6 +802,116 @@ def test_device_frontier_pick_best() raises:
         searcher.enqueue_pick_best(2, record=2)
         var best = searcher.download(2)
         _assert_same_record(best, strong_rec, 4)
+
+
+def test_wide_scan_is_refused_for_a_categorical_dataset() raises:
+    # Host-side, so it runs without an accelerator: the wide kernel scans
+    # ordinal features only, and the gate is per dataset rather than per
+    # feature so one launch is one kernel.
+    assert_false(wide_scan_for(True))
+    assert_equal(wide_scan_for(False), wide_scan_requested())
+
+
+def test_wide_scan_matches_the_serial_scan() raises:
+    comptime if not has_accelerator():
+        print("skipped: no accelerator")
+    else:
+        # Every rule the ordinal scan enforces, run through both kernels.
+        # The wide one splits a feature's bins across a threadgroup and the
+        # serial one walks them on a lane, so agreement here is the claim in
+        # `_scan_slot_wide_kernel`'s docstring: the same record, not a
+        # similar one.
+        var plain = _histogram_words(
+            2,
+            4,
+            [-4, -2, 2, 4, -1, -2, 2, 1],
+            [1, 1, 1, 1, 1, 1, 1, 1],
+            [10, 10, 10, 10, 10, 10, 10, 10],
+        )
+        _assert_same_record(
+            _device_search_wide(plain, 2, 4, _params()),
+            _device_search(plain, 2, 4, _params()),
+            4,
+        )
+
+        # Missing bin, so both candidate directions are scored per bin and
+        # the default-left tie rule is exercised.
+        var missing: List[Int] = [2]
+        var miss = _histogram_words(
+            1, 3, [-5, 5, -5], [1, 1, 1], [10, 10, 10]
+        )
+        _assert_same_record(
+            _device_search_wide(miss, 1, 3, _params(), [], [], missing),
+            _device_search(miss, 1, 3, _params(), [], [], missing),
+            3,
+        )
+
+        # Rejection rules and an interaction mask, which skip a feature
+        # before any of its candidates is scored.
+        _assert_same_record(
+            _device_search_wide(
+                plain, 2, 4, _params(min_data_in_leaf=25), [], [False, True]
+            ),
+            _device_search(
+                plain, 2, 4, _params(min_data_in_leaf=25), [], [False, True]
+            ),
+            4,
+        )
+
+        # A monotone constraint, which rejects candidates inside the scan
+        # rather than before it.
+        var mono: List[Int] = [1]
+        _assert_same_record(
+            _device_search_wide(
+                _histogram_words(
+                    1, 4, [4, 2, -2, -4], [1, 1, 1, 1], [10, 10, 10, 10]
+                ),
+                1,
+                4,
+                _params(),
+                [],
+                [],
+                [],
+                mono,
+            ),
+            _device_search(
+                _histogram_words(
+                    1, 4, [4, 2, -2, -4], [1, 1, 1, 1], [10, 10, 10, 10]
+                ),
+                1,
+                4,
+                _params(),
+                [],
+                [],
+                [],
+                mono,
+            ),
+            4,
+        )
+
+        # More bins than the threadgroup is wide, so a thread's chunk is
+        # several bins long and the exclusive prefix over the chunk sums is
+        # what carries the running left totals across the boundaries. This
+        # is the case a one-bin-per-thread scan would never reach.
+        var wide_bins = 200
+        var g = List[Int](capacity=wide_bins)
+        var h = List[Int](capacity=wide_bins)
+        var c = List[Int](capacity=wide_bins)
+        for b in range(wide_bins):
+            # A gradient that changes sign in the middle, so the best split
+            # sits well away from either end, and a few exact ties.
+            g.append(b - wide_bins // 2)
+            h.append(1 + (b % 3))
+            c.append(4 + (b % 5))
+        var many = _histogram_words(1, wide_bins, g, h, c)
+        var wide_rec = _device_search_wide(many, 1, wide_bins, _params())
+        _assert_same_record(
+            wide_rec, _device_search(many, 1, wide_bins, _params()), wide_bins
+        )
+        # The scan really did find a split in the interior, so the case
+        # above is not passing on two empty records.
+        assert_true(wide_rec.found)
+        assert_true(wide_rec.bin > 0 and wide_rec.bin < wide_bins - 1)
 
 
 def main() raises:

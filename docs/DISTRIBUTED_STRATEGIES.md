@@ -11,7 +11,7 @@ stages, so they are labeled individually rather than under one status line:
 
 | capability | what exists | what does not |
 |---|---|---|
-| feature parallel | the split-election core, the feature partition, the candidate wire record, the agreement and failure protocol (`src/mojotrees/distributed_strategies.mojo`); the grower `_grow_tree_feature_parallel` in `src/mojotrees/distributed.mojo`, selected by `DistributedRunOptions.tree_learner`, reachable from Python as `tree_learner="feature", num_machines=N` on every estimator; the focused test `tests/parallel/test_distributed_strategies.mojo`, which pins bit-identity with single-node training | a run across processes |
+| feature parallel | the split-election core, the feature partition, the candidate wire record, the agreement and failure protocol (`src/mojotrees/distributed_strategies.mojo`); the grower `_grow_tree_feature_parallel` in `src/mojotrees/distributed.mojo`, selected by `DistributedRunOptions.tree_learner`, reachable from Python as `tree_learner="feature", num_machines=N` on every estimator; the focused test `tests/test_distributed_strategies.mojo`, which pins bit-identity with single-node training | a run across processes |
 | voting parallel | the top-k selection, the vote reduction, the feature election, the packed histogram exchange (same file); the grower `_grow_tree_voting_parallel`, selected the same way with `top_k`; the same focused test | a run across processes; exactness, by design (`voting_is_exact()` is False) |
 | distributed GPU | the global fixed-point scale agreement, the word staging and its overflow argument, the cost model, the collective seam (`src/mojotrees/distributed_gpu.mojo`), exported and reported through `_mojotrees.distributed_gpu_status()` | a device-resident collective; a transport run; the single-node GPU speedup that gates the work; a driver in `train_gpu.mojo` |
 
@@ -493,7 +493,7 @@ closed, by name.
 Run on 2026-08-15, one process:
 
 ```
-pixi run mojo run -I src tests/parallel/test_distributed_strategies.mojo   # 4 tests pass
+pixi run mojo run -I src tests/test_distributed_strategies.mojo   # 4 tests pass
 pixi run mojo run -I src tests/test_distributed.mojo                       # 21 tests, data parallel unchanged
 ```
 

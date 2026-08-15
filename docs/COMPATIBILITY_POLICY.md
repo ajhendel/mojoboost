@@ -70,7 +70,7 @@ others, and a release note that changes any of them says so explicitly.
 | C ABI version | `MOJOTREES_ABI_VERSION` in `capi/mojotrees.h` | 1 | A declaration in the header changes incompatibly |
 | Model format version | `_VERSION` in `src/mojotrees/serialize.mojo` | v4 | The file format gains or changes a section |
 | Dump schema version | `DUMP_FORMAT_VERSION` in `python/mojotrees/inspection.py` | 1 | A dump key is removed, retyped, or given a new meaning |
-| Snapshot schema version | `schema_version` in `tests/parallel/api_snapshot_manifest.json` | 1 | The manifest's own shape changes |
+| Snapshot schema version | `schema_version` in `compatibility/api_snapshot_manifest_v1.json` | 1 | The manifest's own shape changes |
 
 The model format version and the dump schema version are independent and
 both appear in a dump, which is deliberate. `model_format_version` says
@@ -742,7 +742,7 @@ exact tag, and says plainly which platforms have no artifact.
 
 ### 11.1 What it is
 
-`tests/parallel/api_snapshot_manifest.json` records the public surface of
+`compatibility/api_snapshot_manifest_v1.json` records the public surface of
 section 2 in a machine-readable form so that a diff between two releases
 answers "what changed for a caller" without anybody having to remember.
 

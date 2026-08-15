@@ -1523,7 +1523,7 @@ def _grow_tree_feature_parallel[
     once. Because each rank sees all rows in the dataset's order and the
     election reproduces `find_best_split`'s scan order, the tree equals the
     single-node tree bit for bit, which is what
-    tests/parallel/test_distributed_strategies.mojo pins.
+    tests/test_distributed_strategies.mojo pins.
     """
     var n_features = shards[0].data.n_features
     var n_local = len(shards)

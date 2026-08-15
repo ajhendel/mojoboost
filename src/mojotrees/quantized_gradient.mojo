@@ -1187,7 +1187,9 @@ def decide(
     var width = accumulator_width(max_node_rows, scales, params)
     if width == WIDTH_NONE:
         return QuantDecision.floating(QUANT_REASON_OVERFLOW)
-    return QuantDecision(MODE_QUANTIZED, QUANT_REASON_OK, width, scales)
+    return QuantDecision(
+        MODE_QUANTIZED, QUANT_REASON_OK, width, scales.copy()
+    )
 
 
 def check_supported(params: QuantGradParams) raises:
@@ -1278,7 +1280,7 @@ struct QuantizedHistogram(Copyable, Movable):
             n_features,
             n_bins,
             width,
-            scales,
+            scales.copy(),
         )
 
     def reset(mut self):
@@ -1488,11 +1490,41 @@ def build_quantized_histogram_into(
     if row_start < 0 or row_count < 0 or row_start + row_count > len(rows):
         raise Error("row window out of range")
     var n_features = data.n_features
-    var n_bins = data.n_bins
     for i in range(len(features)):
         if features[i] < 0 or features[i] >= n_features:
             raise Error("feature index out of range")
 
+    _accumulate_quantized_subset(
+        out.grad, out.hess, out.count,
+        data, qgrad, qhess, rows, row_start, row_count, features,
+    )
+
+
+def _accumulate_quantized_subset(
+    mut out_grad: List[Int64],
+    mut out_hess: List[Int64],
+    mut out_count: List[Int],
+    data: BinnedMatrix,
+    qgrad: List[Int64],
+    qhess: List[Int64],
+    rows: List[Int],
+    row_start: Int,
+    row_count: Int,
+    features: List[Int],
+) raises:
+    """The accumulation pass, with the three output slices as their own
+    parameters.
+
+    Splitting it out is not organization: the closure below captures raw
+    pointers into these lists, and a pointer taken through `out.grad` of a
+    `mut out: QuantizedHistogram` carries `origin_of(out.grad)`, which a
+    capture cannot rebind. `histogram._accumulate_subset` is split from
+    `build_histogram_subset_into_scratch` for the same reason and is the
+    shape this mirrors.
+    """
+    var n_rows = data.n_rows
+    var n_features = data.n_features
+    var n_bins = data.n_bins
     var use_all = len(features) == 0
     var n_active = n_features if use_all else len(features)
 
@@ -1507,13 +1539,13 @@ def build_quantized_histogram_into(
             if not active[f]:
                 var base = f * n_bins
                 for b in range(n_bins):
-                    out.grad[base + b] = Int64(0)
-                    out.hess[base + b] = Int64(0)
-                    out.count[base + b] = 0
+                    out_grad[base + b] = Int64(0)
+                    out_hess[base + b] = Int64(0)
+                    out_count[base + b] = 0
 
-    var gp = out.grad.unsafe_ptr()
-    var hp = out.hess.unsafe_ptr()
-    var cp = out.count.unsafe_ptr()
+    var gp = out_grad.unsafe_ptr()
+    var hp = out_hess.unsafe_ptr()
+    var cp = out_count.unsafe_ptr()
     var qg = qgrad.unsafe_ptr()
     var qh = qhess.unsafe_ptr()
     var rows_p = rows.unsafe_ptr().unsafe_offset(row_start)
