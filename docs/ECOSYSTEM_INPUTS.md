@@ -2,16 +2,17 @@
 
 What mojotrees does with an Arrow table, a polars frame, or data that
 arrives in pieces. The code is `python/mojotrees/_arrow.py`,
-`python/mojotrees/_polars.py`, and `python/mojotrees/_sequence.py`; the
-integration state, and the patches that finish it, are in
-`handoffs/remaining_10_ecosystem_inputs.md`.
+`python/mojotrees/_polars.py`, and `python/mojotrees/_sequence.py`.
 
-**Status.** The adapters are written and self-contained. They are not yet
-reachable from `mojotrees.Dataset`, from the estimators, or from any public
-name, because the four dispatch points that would reach them live in files
-this lane does not own. Read every "converts to" below as a statement about
-the adapter, not about `mb.Dataset(arrow_table)`, until the handoff's
-patches land. Nothing here has been executed: see "What has not been run".
+**Status.** Wired since 2026-08-15. `_arrays.feature_names`,
+`frame_categories`, `check_X`, `f64_vector`, and `encode_labels` ask
+`_sequence`'s dispatchers first, so `mojotrees.Dataset(arrow_table)`,
+`Dataset(polars_frame)`, `Dataset(lgb_sequence)`, `Dataset(Batches(...))`,
+and the estimators' `fit(X, y)` on any of them all work; numpy, pandas,
+plain sequences, and SciPy sparse take exactly the path they always took.
+Batched input to `Dataset` streams into the native binner one converted
+batch at a time through `bindings/sequence_bindings.mojo`
+(`_sequence.stream_dataset`). See "What has been run" at the end.
 
 ## 1. The shape of the thing
 
@@ -84,7 +85,7 @@ numpy path too and is not an Arrow tax.
 `BufferPlan.zero_copy_eligible` therefore means "the Arrow buffer could be
 read in place by a reader that accepted per-column pointers". It never
 means "mojotrees read it in place". The binding change that would make the
-first meaning matter is request **B1** in the handoff.
+first meaning matter (a binding taking per-column pointers) is not written.
 
 ## 4. Arrow types
 
@@ -213,7 +214,7 @@ free. Everything after it copies, exactly as in section 3.
 assembles it:
 
 ```python
-from mojotrees import _sequence   # internal today; see handoff request P1
+from mojotrees import _sequence   # internal; Dataset(Batches(...)) is the public route
 
 data = _sequence.materialize(
     _sequence.Batches(record_batches),
@@ -293,14 +294,17 @@ says which happened.
 
 ## 7. What has not been run
 
-Nothing in this lane has been executed. No test was written or run, no
-build was made, no Python was started, and pyarrow and polars were never
-imported. Every behavior above is a reading of the code as written and is
-marked UNRUN in the handoff, which lists the minimal checks that would
-confirm each of them. `pixi.toml`'s `pytest` feature already installs
-pyarrow and polars, so the checks have an environment to run in.
+Run on 2026-08-15 against a built extension, each predicting identically
+to the same data passed as one numpy array: `Dataset` from a list of numpy
+blocks (`Batches`), from an `lgb.Sequence`-style object read in
+`batch_size` slices, from a pyarrow `Table`, from pyarrow record batches
+(`Batches(table.to_batches())`), from a polars `DataFrame`; `label=` as a
+pyarrow array and as a polars series; `MojoTreesRegressor.fit` on
+`Batches` and on a polars frame (with `feature_names_in_` from the frame).
+Not run: Arrow dictionary and polars `Categorical` columns end to end,
+LazyFrame and streaming-source refusals. pyarrow and polars are not in the
+default pixi env, so none of this is in CI yet.
 
-`docs/LIGHTGBM_PARITY.md` still records "pyarrow tables and arrays",
-"polars frames", and "`Sequence` / batched construction" as deferred to
-task 10. That stays correct until the dispatch patches land; the handoff
-carries the replacement rows.
+`docs/LIGHTGBM_PARITY.md` rows for "pyarrow tables and arrays", "polars
+frames", and "`Sequence` / batched construction" are the parity lane's to
+move from deferred.

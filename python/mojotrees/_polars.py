@@ -1,9 +1,9 @@
 """Polars input adapters: DataFrames, Series, and the LazyFrame refusal.
 
 Internal, on the terms of section 2 of `docs/COMPATIBILITY_POLICY.md`.
-`docs/ECOSYSTEM_INPUTS.md` is the prose, and
-`handoffs/remaining_10_ecosystem_inputs.md` holds the patches that wire this
-into `_arrays.check_X`, `Dataset`, and the estimators.
+`docs/ECOSYSTEM_INPUTS.md` is the prose. It is wired: `_arrays` dispatches
+to it through `_sequence.adapter_for` and its siblings, so `Dataset` and the
+estimators accept polars input.
 
 One adapter, not two
 --------------------

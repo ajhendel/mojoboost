@@ -3,9 +3,9 @@
 Internal, on the terms of section 2 of `docs/COMPATIBILITY_POLICY.md`, which
 puts every underscore-prefixed module in `python/mojotrees/` outside the
 public surface in its entirety. `docs/ECOSYSTEM_INPUTS.md` is the prose
-version of everything here, and `handoffs/remaining_10_ecosystem_inputs.md`
-holds the patches that would wire it into `_arrays.check_X`, `Dataset`, and
-the estimators.
+version of everything here. It is wired: `_arrays` dispatches to it through
+`_sequence.adapter_for` and its siblings, so `Dataset` and the estimators
+accept Arrow input.
 
 What this module is
 -------------------

@@ -18,24 +18,21 @@ not fit:
 
 ## 0. Status, in one place
 
-**Nothing in either module has been run.** No test, no build, no benchmark,
-no program, no comparison against LightGBM. Static inspection only. The
-validation these modules owe is listed, all marked UNRUN, in
-`handoffs/remaining_07_external_memory.md`.
+Both modules are exported from `src/mojotrees/__init__.mojo` and are run by
+`tests/test_external_memory.mojo` (in the `test` and `test-cpu` suites)
+since 2026-08-15. What that test establishes, and what it does not:
 
 | Claim | Status |
 | --- | --- |
-| mojotrees supports external-memory training | **Not claimed as delivered.** The code exists; it is not exported from `src/mojotrees/__init__.mojo`, no binding names it, and `docs/LIGHTGBM_PARITY.md` is unchanged by this lane |
-| The bin edges equal the resident path's, bit for bit | Argued in section 3, and it is a structural argument rather than a numerical one: the same `binning.fit_bins` is called on the same values. **Unverified** |
-| The chunk files round trip exactly | Argued in section 7 (IEEE-754 bit patterns, no decimal formatting). **Unverified** |
+| mojotrees supports external-memory training | Delivered natively: `build_external_dataset_from_raw` / `build_external_dataset` plus `train_external*` are public and tested. There is no Python binding for the cache path yet; the Python side's chunked ingestion (`Dataset(lgb.Sequence)`, `bindings/sequence_bindings.mojo`) bins the accumulated float64 matrix once and is documented as not bounded-memory |
+| The bin edges equal the resident path's, bit for bit | **Verified**: `test_streamed_bins_equal_resident_bins` compares `edges` and `edge_offsets` to `binning.fit_bins` on the same matrix, with a block width of one feature |
+| A chunk binned alone equals its slice | **Verified**: the same test compares every `binned_chunk(i)` to its rows of `mapper.transform` |
+| The chunk files round trip exactly | **Verified** for dense caches: `test_cache_reopens_and_refuses_the_wrong_mapper` reopens through the checksums and compares the materialized bins; the wrong mapper is refused by fingerprint |
+| Training from a cache equals resident training | **Verified**: `test_external_training_matches_resident_training` compares `train_external` to `train_dataset` prediction for prediction |
+| Row coverage rejects gaps and overlaps | **Verified**: `test_row_coverage_rejects_gaps_and_overlaps` |
 | Training runs without materializing | **No.** Explicitly no. See section 11 |
-| `ExternalDataset` is a `Dataset` | No. It is a separate type, because `Dataset` is owned by another lane. The patch that would join them is patch 2 of the handoff |
-
-The modules are deliberately unexported. `tools/check_parity.py` resolves
-public symbols to decide whether a `deferred` parity row has gone stale, and a
-module that exists but is exported by nobody resolves to nothing, which is the
-honest answer while the evidence is UNRUN. Patch 1 of the handoff is the
-export, and it is deliberately first-in-line rather than already applied.
+| `ExternalDataset` is a `Dataset` | No. Separate type; `materialize_binned` is the bridge |
+| Sparse cache equals dense cache | Not yet tested |
 
 ## 1. The chunk protocol
 
@@ -215,7 +212,7 @@ Declared categorical columns are tallied during the census pass by
 categorical column without a per-column allocation; `CATEGORY_KEY_STRIDE` and
 `MAX_CATEGORY_CODE` are the two constants that make it unambiguous, and
 `MAX_CATEGORY_CODE` mirrors `categorical._MAX_CATEGORY`, which is private
-today (patch 4 of the handoff asks for it to be shared instead of mirrored).
+today (sharing it instead of mirroring is a one-line follow-up).
 
 The tally counts distinct codes and missing rows per column. On a sparse
 source the implicit zeros are counted as code `0`, which is what
@@ -337,8 +334,7 @@ the returned paths are exactly what a caller's own cleanup removes.
 standard library, a decision about the failure mode when a file is already
 gone or the directory is read-only, and a decision about whether `discard`
 removes the directory itself (it should not: the directory is the caller's,
-and this module never created it). Patch 8 of the handoff is that change,
-sized and marked UNRUN.
+and this module never created it). That change is not made.
 
 Nothing here removes files on destruction. A cache outlives the process
 unless a caller discards it, which is the behavior a cache should have.
@@ -389,9 +385,8 @@ declaration, the feature names) and what changes the memory ceiling
 (`chunk_rows`, `bin_memory_budget`), plus `verify_on_open`.
 
 The corresponding parity rows are `Sequence`, `Dataset.save_binary`, and the
-external-memory entries. This lane does **not** edit
-`docs/LIGHTGBM_PARITY.md` or `tools/check_parity.py`; patch 10 of the handoff
-is the exact edit, held until the validation is no longer UNRUN.
+external-memory entries; moving them is the parity lane's edit to
+`docs/LIGHTGBM_PARITY.md`, now that section 0's checks have run.
 
 ## 13. Future work, sized
 
@@ -412,24 +407,16 @@ is the exact edit, held until the validation is no longer UNRUN.
   pass is IO-bound by construction and single-threaded by choice. This is a
   performance change with no effect on the output, which makes it exactly the
   kind of change to make after there is a benchmark rather than before.
-- **`Dataset` unification.** `ExternalDataset` exists as a separate type
-  because `trainset.Dataset` belongs to another lane. Patch 2 of the handoff
-  is the constructor that would make one out of the other.
+- **`Dataset` unification.** `ExternalDataset` is a separate type;
+  `materialize_binned` plus `Dataset`'s internal assembling constructor is
+  the bridge, and a `Dataset.from_external` that spells it is not written.
 
 ## 14. What is unverified
 
-Everything. Section 0 says it once and it is repeated here because it is the
-most important sentence in this document. The following are arguments, not
-measurements:
-
-- that the multi-pass edges equal the single-pass edges,
-- that a chunk binned alone equals its slice of the matrix binned at once,
-- that the cache round trips exactly,
-- that a sparse cache and a dense cache of the same data train the same model,
-- that the row-coverage check rejects every out-of-order source,
-- that the partial field moves in `memory_sequence_from_raw` and
-  `csc_sequence_from_raw` compile.
-
-Each has a specific, minimal check written out in
-`handoffs/remaining_07_external_memory.md`, and every one of them is marked
-**UNRUN**.
+Section 0's table is the record. Still unrun: that a sparse cache and a
+dense cache of the same data train the same model, and any comparison
+against LightGBM's own external-memory build. The remaining checks the
+original design listed (edges, chunk slices, round trip, row coverage, the
+partial field moves in `memory_sequence_from_raw` and
+`csc_sequence_from_raw`, which are now copies) are in
+`tests/test_external_memory.mojo`.
