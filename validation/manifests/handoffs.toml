@@ -297,13 +297,9 @@ jobs = ["static:plan-selfcheck"]
 note = "This lane. The planner has never been run; --self-check is the first thing anyone should run against it."
 
 # ---------------------------------------------------------------------------
-# Lanes of the current remaining-parity round
-#
-# Source: MOJOBOOST_REMAINING_PARITY_PARALLEL_PROMPTS.txt in the repository
-# root. Each lane owns one or two new modules and a handoff, and every one of
-# them is under instruction not to run anything. `jobs` is what the coordinator
-# should run after applying that lane's READY-TO-APPLY patches, not what the
-# lane itself should run.
+# Historical lane-to-validation mappings retained for the focused validation
+# planner. The session prompts and completed handoffs have been removed;
+# `jobs` records the focused checks that still apply when these modules change.
 # ---------------------------------------------------------------------------
 
 [[lane]]

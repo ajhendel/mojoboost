@@ -7,12 +7,8 @@ rendered from this path inside the mojoboost repository, where nothing
 displays it.
 
 To publish it, create `mojoboost-ml/.github` (public) and copy this file to
-`profile/README.md` there. launch/ORG_MIGRATION_CHECKLIST.txt has the exact
-steps. Keep this staged copy as the source of truth so the profile text is
-reviewable alongside the project it describes.
-
-Links below point at github.com/mojoboost-ml and are live only after the
-repository transfer.
+`profile/README.md` there. Keep this staged copy as the source of truth so the
+profile text is reviewable alongside the project it describes.
 -->
 
 # mojoboost
