@@ -145,20 +145,31 @@ Nothing in the record layout has to change for any of it, which is why the
 record carries child statistics and leaf values rather than making the host
 recompute them from a histogram it no longer has.
 
-On where the device path's remaining cost actually is: it is not the scan
-kernel's shape. Packing feature slots a SIMD group at a time instead of one
-threadgroup each, and moving the categorical sort scratch out of
-threadgroup memory to lift the occupancy that allocation caps, were both
-measured on an M4 at 50000 x 100 and both came back inside noise of the
-one-thread-per-threadgroup launch this module still uses. Whatever the
-per-split overhead is, parallelizing the scan does not touch it, so the
-next attempt on it should start from a profile and not from this shape.
+On where the device path's remaining cost actually is: on the evidence so
+far it is not the scan kernel's shape. Packing feature slots a SIMD group
+at a time instead of one threadgroup each, and moving the categorical sort
+scratch out of threadgroup memory to lift the occupancy that allocation
+caps, were both measured on an M4 at 50000 x 100 and both came back inside
+noise of the one-thread-per-threadgroup launch this module still defaults
+to. Whatever the per-split overhead is, those two did not touch it.
+
+`_scan_slot_wide_kernel` is a third attempt at the same target and it is
+off by default for that reason and not for any doubt about the result: it
+splits one feature's bins across a threadgroup and returns the serial
+kernel's record bit for bit, which `tests/test_gpu_split_search.mojo`
+asserts against the serial kernel on the same histograms. It is reached
+only through `MOJOTREES_GPU_SPLIT_WIDE=1`, and the two measurements above
+are what it has to be read against: a run that cannot separate it from the
+serial scan is the expected outcome, not a surprise. The default flips when
+an interleaved benchmark resolves it and not before.
 """
 
-from std.gpu import block_idx
+from std.gpu import block_idx, thread_idx
 from std.memory import stack_allocation
+from std.os import getenv
 from max.gpu.host import DeviceBuffer, DeviceContext, HostBuffer
 from max.gpu.memory import AddressSpace
+from max.gpu.sync import barrier
 
 from .categorical import (
     CatBitset,
@@ -788,6 +799,450 @@ def _scan_slot_kernel(
     out_f[unsafe_offset = fo + FREC_RIGHT_HESS] = total_h - lhf
 
 
+# Threads per threadgroup in the wide ordinal scan. A warp multiple on every
+# supported backend (it is `gpu_tiling.WARP_GRANULARITY`), and the width the
+# shared-memory budget below is stated at.
+comptime WIDE_SCAN_THREADS = 64
+
+# Threadgroup memory `_scan_slot_wide_kernel` reserves: twelve
+# `WIDE_SCAN_THREADS`-long Int32 or Float32 arrays, which at 64 threads is
+# 3072 bytes, the same reservation the histogram kernels already make. The
+# wide scan therefore raises no device floor, and
+# `gpu_portability.MIN_SHARED_MEMORY_PER_BLOCK` covers it unchanged.
+comptime WIDE_SCAN_SHARED_BYTES = 12 * WIDE_SCAN_THREADS * 4
+
+
+def wide_scan_requested() -> Bool:
+    """`MOJOTREES_GPU_SPLIT_WIDE=1`, the switch for the wide scan.
+
+    Off unless asked for, which is this package's rule for a path no
+    benchmark has priced rather than a doubt about the result: the wide
+    kernel returns the serial kernel's records bit for bit (see
+    `_scan_slot_wide_kernel`) and `tests/parallel/test_gpu_split_search.mojo`
+    asserts that, so what is unmeasured is only whether it is faster. The
+    scan is a small share of a split's cost on the one device this
+    repository has run on -- `bench-launch-cost` prices a split's fixed
+    overhead at roughly 280us -- so the honest expectation is a small win,
+    and the default flips when a run says so and not before.
+    """
+    return getenv("MOJOTREES_GPU_SPLIT_WIDE") == "1"
+
+
+def wide_scan_for(has_categorical: Bool) -> Bool:
+    """Whether a searcher over this dataset scans wide: requested, and no
+    categorical feature to scan.
+
+    The categorical bar is the kernel's, not a policy: `_scan_slot_wide_kernel`
+    implements the ordinal threshold scan and nothing else. Refusing per
+    dataset rather than per feature keeps one kernel per launch, and a
+    dataset that declares a categorical feature is one the serial kernel
+    already serves correctly.
+    """
+    return wide_scan_requested() and not has_categorical
+
+
+def _scan_slot_wide_kernel(
+    hist: MutPointer[Int32, MutAnyOrigin],
+    node_tab: MutPointer[Int32, MutAnyOrigin],
+    feat_ids: MutPointer[Int32, MutAnyOrigin],
+    allow: MutPointer[Int32, MutAnyOrigin],
+    missing: MutPointer[Int32, MutAnyOrigin],
+    mono: MutPointer[Int32, MutAnyOrigin],
+    fparams: MutPointer[Float32, MutAnyOrigin],
+    out_i: MutPointer[Int32, MutAnyOrigin],
+    out_f: MutPointer[Float32, MutAnyOrigin],
+    n_bins: Int32,
+    hist_size: Int32,
+    record_base: Int32,
+    feat_stride: Int32,
+    min_data_in_leaf: Int32,
+    constrained: Int32,
+):
+    """`_scan_slot_kernel`'s ordinal scan, spread over a threadgroup instead
+    of run on one thread, and it writes the same per-slot record.
+
+    Same grid, `WIDE_SCAN_THREADS` threads to a threadgroup rather than one:
+    `_scan_slot_kernel` puts a whole feature on a single lane because a
+    threshold scan is a prefix sum, which is right about the dependency and
+    wrong about it being serial. A prefix sum splits: each thread takes one
+    contiguous chunk of the bins, the chunk sums are combined, and every
+    thread starts its own walk from the exact sum of the chunks before it.
+
+    Why the result is the serial one, bit for bit:
+
+    - The running left sums are fixed-point Int32 and integer addition is
+      associative, so a thread's starting sums are the ones the serial walk
+      would have reached at that bin, whatever order the chunks were summed
+      in. Every candidate is then scored by the same expressions over the
+      same Float32 inputs.
+    - The serial scan takes a candidate on a strict `>`, so its winner is
+      the highest gain and, among equal gains, the earliest in scan order.
+      Candidate order is the ordinal (`2 * bin` for missing-left, `2 * bin +
+      1` for missing-right), which ascends with the scan, so the reduction
+      below picks by gain and breaks ties on the lower ordinal and lands on
+      the same candidate.
+    - `runner_gain` is the second largest accepted gain counted with
+      multiplicity, which is order independent, so merging each thread's top
+      two is the whole-feature top two.
+
+    Categorical features are not scanned here. Their many-vs-many search
+    sorts categories by a gradient ratio and walks prefixes of that order,
+    which is a different algorithm with its own scratch, and it stays in
+    `_scan_slot_kernel`. `GpuSplitSearcher` refuses this kernel outright for
+    a dataset that declares any categorical feature rather than branching
+    per feature inside the launch, so nothing here can meet one.
+    """
+    # Totals reduction and chunk sums use separate arrays, so the read of the
+    # totals and the write of the chunk sums need no barrier between them.
+    var t_g = stack_allocation[
+        WIDE_SCAN_THREADS,
+        Scalar[DType.int32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var t_h = stack_allocation[
+        WIDE_SCAN_THREADS,
+        Scalar[DType.int32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var t_c = stack_allocation[
+        WIDE_SCAN_THREADS,
+        Scalar[DType.int32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var s_g = stack_allocation[
+        WIDE_SCAN_THREADS,
+        Scalar[DType.int32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var s_h = stack_allocation[
+        WIDE_SCAN_THREADS,
+        Scalar[DType.int32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var s_c = stack_allocation[
+        WIDE_SCAN_THREADS,
+        Scalar[DType.int32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var a_gain = stack_allocation[
+        WIDE_SCAN_THREADS,
+        Scalar[DType.float32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var a_runner = stack_allocation[
+        WIDE_SCAN_THREADS,
+        Scalar[DType.float32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var a_ord = stack_allocation[
+        WIDE_SCAN_THREADS,
+        Scalar[DType.int32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var a_lg = stack_allocation[
+        WIDE_SCAN_THREADS,
+        Scalar[DType.int32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var a_lh = stack_allocation[
+        WIDE_SCAN_THREADS,
+        Scalar[DType.int32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var a_lc = stack_allocation[
+        WIDE_SCAN_THREADS,
+        Scalar[DType.int32],
+        address_space = AddressSpace.SHARED,
+    ]()
+
+    var tid = Int(thread_idx.x)
+    var slot = Int(block_idx.x)
+    var record = Int(record_base) + Int(block_idx.y)
+    var nt = record * NODE_WORDS
+    # Every early return in this kernel is decided by the grid position, the
+    # node table, or a per-feature table, never by `tid`, so a threadgroup
+    # takes it whole and no barrier below is reached by a subset of it.
+    if slot >= Int(node_tab[unsafe_offset = nt + NODE_SLOTS][0]):
+        return
+    var stride = Int(feat_stride)
+    var table = record * stride
+    var f = Int(feat_ids[unsafe_offset = table + slot][0])
+    var nb = Int(n_bins)
+    var hs = Int(hist_size)
+    var base = Int(node_tab[unsafe_offset = nt + NODE_HIST_BASE][0]) + f * nb
+    var io = (table + slot) * SPLIT_IWORDS
+    var fo = (table + slot) * SPLIT_FWORDS
+    var pf = record * PF_WORDS
+
+    var pg = Int32(0)
+    var ph = Int32(0)
+    var pc = Int32(0)
+    var bb = tid
+    while bb < nb:
+        pg += hist[unsafe_offset = base + bb][0]
+        ph += hist[unsafe_offset = hs + base + bb][0]
+        pc += hist[unsafe_offset = 2 * hs + base + bb][0]
+        bb += WIDE_SCAN_THREADS
+    t_g[unsafe_offset=tid] = pg
+    t_h[unsafe_offset=tid] = ph
+    t_c[unsafe_offset=tid] = pc
+    barrier()
+    var active = WIDE_SCAN_THREADS // 2
+    while active > 0:
+        if tid < active:
+            t_g[unsafe_offset=tid] = (
+                t_g[unsafe_offset=tid][0] + t_g[unsafe_offset = tid + active][0]
+            )
+            t_h[unsafe_offset=tid] = (
+                t_h[unsafe_offset=tid][0] + t_h[unsafe_offset = tid + active][0]
+            )
+            t_c[unsafe_offset=tid] = (
+                t_c[unsafe_offset=tid][0] + t_c[unsafe_offset = tid + active][0]
+            )
+        barrier()
+        active //= 2
+    var tg = t_g[unsafe_offset=0][0]
+    var th = t_h[unsafe_offset=0][0]
+    var tc = t_c[unsafe_offset=0][0]
+
+    var g_inv = fparams[unsafe_offset = pf + PF_G_INV][0]
+    var h_inv = fparams[unsafe_offset = pf + PF_H_INV][0]
+    var lambda_l2 = fparams[unsafe_offset = pf + PF_LAMBDA_L2][0]
+    var lambda_l1 = fparams[unsafe_offset = pf + PF_LAMBDA_L1][0]
+    var min_child_hess = fparams[unsafe_offset = pf + PF_MIN_CHILD_HESS][0]
+    var bound_lo = fparams[unsafe_offset = pf + PF_BOUND_LO][0]
+    var bound_hi = fparams[unsafe_offset = pf + PF_BOUND_HI][0]
+    var total_g = tg.cast[DType.float32]() * g_inv
+    var total_h = th.cast[DType.float32]() * h_inv
+
+    # The record belongs to one thread throughout: nothing else in the
+    # threadgroup writes `out_i` or `out_f`, so the initial clear and the
+    # final winner need no barrier between them and the scan.
+    if tid == 0:
+        for i in range(SPLIT_IWORDS):
+            out_i[unsafe_offset = io + i] = Int32(0)
+        for i in range(SPLIT_FWORDS):
+            out_f[unsafe_offset = fo + i] = Float32(0.0)
+        out_i[unsafe_offset = io + IREC_FEATURE] = Int32(-1)
+        out_i[unsafe_offset = io + IREC_BIN] = Int32(-1)
+        out_i[unsafe_offset = io + IREC_ORDINAL] = Int32(-1)
+        out_f[unsafe_offset = fo + FREC_TOTAL_GRAD] = total_g
+        out_f[unsafe_offset = fo + FREC_TOTAL_HESS] = total_h
+        out_i[unsafe_offset = io + IREC_TOTAL_COUNT] = tc
+
+    # A feature the node's interaction constraints disallow is skipped before
+    # any of its candidates is scored, exactly as in `find_best_split`.
+    if allow[unsafe_offset = table + slot][0] == Int32(0):
+        return
+
+    var sign = Int32(MONOTONE_FREE)
+    if constrained != Int32(0):
+        sign = mono[unsafe_offset=f][0]
+    var is_constrained = constrained != Int32(0)
+    var parent_score = gpu_leaf_score(total_g, total_h, lambda_l1, lambda_l2)
+
+    var missing_bin = Int(missing[unsafe_offset=f][0])
+    var n_scan = missing_bin if missing_bin >= 0 else nb
+    if n_scan < 1:
+        return
+    var miss_g = Int32(0)
+    var miss_h = Int32(0)
+    var miss_c = Int32(0)
+    if missing_bin >= 0:
+        miss_g = hist[unsafe_offset = base + missing_bin][0]
+        miss_h = hist[unsafe_offset = hs + base + missing_bin][0]
+        miss_c = hist[unsafe_offset = 2 * hs + base + missing_bin][0]
+
+    # One contiguous chunk of the scan per thread. `per` is the same for
+    # every thread, so a chunk's start is its thread index times it and the
+    # partition is a function of `n_scan` alone.
+    var per = (n_scan + WIDE_SCAN_THREADS - 1) // WIDE_SCAN_THREADS
+    var lo = tid * per
+    if lo > n_scan:
+        lo = n_scan
+    var hi = lo + per
+    if hi > n_scan:
+        hi = n_scan
+
+    var cg = Int32(0)
+    var ch = Int32(0)
+    var cc = Int32(0)
+    for i in range(lo, hi):
+        cg += hist[unsafe_offset = base + i][0]
+        ch += hist[unsafe_offset = hs + base + i][0]
+        cc += hist[unsafe_offset = 2 * hs + base + i][0]
+    s_g[unsafe_offset=tid] = cg
+    s_h[unsafe_offset=tid] = ch
+    s_c[unsafe_offset=tid] = cc
+    barrier()
+    # Exclusive prefix over the chunk sums, summed low index first. Every
+    # thread reads the same shared values in the same order, so this is one
+    # integer sum with one answer.
+    var left_g = Int32(0)
+    var left_h = Int32(0)
+    var left_c = Int32(0)
+    for j in range(tid):
+        left_g += s_g[unsafe_offset=j][0]
+        left_h += s_h[unsafe_offset=j][0]
+        left_c += s_c[unsafe_offset=j][0]
+
+    var best_gain = Float32(0.0)
+    var runner_gain = Float32(0.0)
+    var best_ordinal = -1
+    var best_left_g = Int32(0)
+    var best_left_h = Int32(0)
+    var best_left_c = Int32(0)
+
+    for b in range(lo, hi):
+        # The top threshold puts every ordinary bin left, so it is only a
+        # split at all when missing rows fill the right child. Serial breaks
+        # out of the loop here; the bin is the last one either way, so
+        # skipping it is the same thing.
+        if b == n_scan - 1 and miss_c == Int32(0):
+            continue
+        left_g += hist[unsafe_offset = base + b][0]
+        left_h += hist[unsafe_offset = hs + base + b][0]
+        left_c += hist[unsafe_offset = 2 * hs + base + b][0]
+
+        # Missing to the left, scored first so an exact tie keeps
+        # default_left, as in LightGBM and as on the host.
+        if missing_bin >= 0:
+            var dl_g = left_g + miss_g
+            var dl_h = left_h + miss_h
+            var dl_c = left_c + miss_c
+            var dl_hf = dl_h.cast[DType.float32]() * h_inv
+            var dr_hf = total_h - dl_hf
+            if not (
+                dl_hf < min_child_hess
+                or dr_hf < min_child_hess
+                or dl_c < min_data_in_leaf
+                or tc - dl_c < min_data_in_leaf
+            ):
+                var dl_gf = dl_g.cast[DType.float32]() * g_inv
+                var dr_gf = total_g - dl_gf
+                var gain = gpu_split_gain(
+                    gpu_soft_threshold_l1(dl_gf, lambda_l1),
+                    dl_hf,
+                    gpu_soft_threshold_l1(dr_gf, lambda_l1),
+                    dr_hf,
+                    lambda_l2,
+                    parent_score,
+                    sign,
+                    bound_lo,
+                    bound_hi,
+                    is_constrained,
+                )
+                if gain > best_gain:
+                    runner_gain = best_gain
+                    best_gain = gain
+                    best_ordinal = 2 * b
+                    best_left_g = dl_g
+                    best_left_h = dl_h
+                    best_left_c = dl_c
+                elif gain > runner_gain:
+                    runner_gain = gain
+
+        # Missing to the right. For a feature with no missing bin this is
+        # the only candidate and the scan is exactly the ordinal one.
+        if missing_bin < 0 or miss_c > Int32(0):
+            var lhf = left_h.cast[DType.float32]() * h_inv
+            var rhf = total_h - lhf
+            if lhf < min_child_hess or rhf < min_child_hess:
+                continue
+            if left_c < min_data_in_leaf or tc - left_c < min_data_in_leaf:
+                continue
+            var lgf = left_g.cast[DType.float32]() * g_inv
+            var rgf = total_g - lgf
+            var gain = gpu_split_gain(
+                gpu_soft_threshold_l1(lgf, lambda_l1),
+                lhf,
+                gpu_soft_threshold_l1(rgf, lambda_l1),
+                rhf,
+                lambda_l2,
+                parent_score,
+                sign,
+                bound_lo,
+                bound_hi,
+                is_constrained,
+            )
+            if gain > best_gain:
+                runner_gain = best_gain
+                best_gain = gain
+                best_ordinal = 2 * b + 1
+                best_left_g = left_g
+                best_left_h = left_h
+                best_left_c = left_c
+            elif gain > runner_gain:
+                runner_gain = gain
+
+    a_gain[unsafe_offset=tid] = best_gain
+    a_runner[unsafe_offset=tid] = runner_gain
+    a_ord[unsafe_offset=tid] = Int32(best_ordinal)
+    a_lg[unsafe_offset=tid] = best_left_g
+    a_lh[unsafe_offset=tid] = best_left_h
+    a_lc[unsafe_offset=tid] = best_left_c
+    barrier()
+    if tid != 0:
+        return
+
+    # Winner: highest gain, ties to the lower ordinal, which is what the
+    # serial scan's strict `>` over an ascending candidate order gives.
+    var win = -1
+    for j in range(WIDE_SCAN_THREADS):
+        if a_gain[unsafe_offset=j][0] <= Float32(0.0):
+            continue
+        if win < 0:
+            win = j
+        elif a_gain[unsafe_offset=j][0] > a_gain[unsafe_offset=win][0]:
+            win = j
+        elif (
+            a_gain[unsafe_offset=j][0] == a_gain[unsafe_offset=win][0]
+            and a_ord[unsafe_offset=j][0] < a_ord[unsafe_offset=win][0]
+        ):
+            win = j
+    if win < 0:
+        return
+
+    # Top two of the union of the per-thread top twos, which is the top two
+    # of every accepted gain: the serial `runner_gain` counted with
+    # multiplicity.
+    var m1 = Float32(0.0)
+    var m2 = Float32(0.0)
+    for j in range(WIDE_SCAN_THREADS):
+        var v = a_gain[unsafe_offset=j][0]
+        if v > m1:
+            m2 = m1
+            m1 = v
+        elif v > m2:
+            m2 = v
+        var u = a_runner[unsafe_offset=j][0]
+        if u > m1:
+            m2 = m1
+            m1 = u
+        elif u > m2:
+            m2 = u
+
+    var ordinal = Int(a_ord[unsafe_offset=win][0])
+    var flags = Int32(FLAG_FOUND)
+    if ordinal % 2 == 0:
+        flags += Int32(FLAG_DEFAULT_LEFT)
+    var won_left_c = a_lc[unsafe_offset=win][0]
+    out_i[unsafe_offset = io + IREC_FEATURE] = Int32(f)
+    out_i[unsafe_offset = io + IREC_BIN] = Int32(ordinal // 2)
+    out_i[unsafe_offset = io + IREC_FLAGS] = flags
+    out_i[unsafe_offset = io + IREC_ORDINAL] = Int32(ordinal)
+    out_i[unsafe_offset = io + IREC_LEFT_COUNT] = won_left_c
+    out_i[unsafe_offset = io + IREC_RIGHT_COUNT] = tc - won_left_c
+    var lgf = a_lg[unsafe_offset=win][0].cast[DType.float32]() * g_inv
+    var lhf = a_lh[unsafe_offset=win][0].cast[DType.float32]() * h_inv
+    out_f[unsafe_offset = fo + FREC_GAIN] = m1
+    out_f[unsafe_offset = fo + FREC_RUNNER_GAIN] = m2
+    out_f[unsafe_offset = fo + FREC_LEFT_GRAD] = lgf
+    out_f[unsafe_offset = fo + FREC_LEFT_HESS] = lhf
+    out_f[unsafe_offset = fo + FREC_RIGHT_GRAD] = total_g - lgf
+    out_f[unsafe_offset = fo + FREC_RIGHT_HESS] = total_h - lhf
+
+
 def _reduce_slots_kernel(
     slot_i: MutPointer[Int32, MutAnyOrigin],
     slot_f: MutPointer[Float32, MutAnyOrigin],
@@ -1347,6 +1802,7 @@ def _launch_search(
     cat_onehot_max: Int,
     cat_max_threshold: Int,
     cat_min_group: Int,
+    wide: Bool = False,
 ) raises:
     """Enqueue the two kernels of one search, over `n_records` consecutive
     nodes starting at `record_base`.
@@ -1361,30 +1817,58 @@ def _launch_search(
     A free function over the context and the buffers rather than a method,
     so the histogram buffer is an ordinary argument whether it belongs to
     this searcher, to the histogram builder next to it, or to a multi-slot
-    batcher holding a whole level's histograms at once."""
-    ctx.enqueue_function[_scan_slot_kernel](
-        hist.unsafe_ptr(),
-        node.unsafe_ptr(),
-        feat.unsafe_ptr(),
-        allow.unsafe_ptr(),
-        missing.unsafe_ptr(),
-        catn.unsafe_ptr(),
-        mono.unsafe_ptr(),
-        fparam.unsafe_ptr(),
-        slot_i.unsafe_ptr(),
-        slot_f.unsafe_ptr(),
-        Int32(n_bins),
-        Int32(hist_size),
-        Int32(record_base),
-        Int32(feat_stride),
-        Int32(min_data_in_leaf),
-        Int32(1) if constrained else Int32(0),
-        Int32(cat_onehot_max),
-        Int32(cat_max_threshold),
-        Int32(cat_min_group),
-        grid_dim=(widest_slots, n_records),
-        block_dim=1,
-    )
+    batcher holding a whole level's histograms at once.
+
+    `wide` runs the same scan on `WIDE_SCAN_THREADS` threads per feature
+    instead of one, writing the same per-slot records, so the reduction
+    below is the same kernel over the same slots either way. Only
+    `GpuSplitSearcher` decides it: the wide kernel scans ordinal features
+    only, and the searcher is what knows whether the dataset has a
+    categorical one."""
+    if wide:
+        ctx.enqueue_function[_scan_slot_wide_kernel](
+            hist.unsafe_ptr(),
+            node.unsafe_ptr(),
+            feat.unsafe_ptr(),
+            allow.unsafe_ptr(),
+            missing.unsafe_ptr(),
+            mono.unsafe_ptr(),
+            fparam.unsafe_ptr(),
+            slot_i.unsafe_ptr(),
+            slot_f.unsafe_ptr(),
+            Int32(n_bins),
+            Int32(hist_size),
+            Int32(record_base),
+            Int32(feat_stride),
+            Int32(min_data_in_leaf),
+            Int32(1) if constrained else Int32(0),
+            grid_dim=(widest_slots, n_records),
+            block_dim=WIDE_SCAN_THREADS,
+        )
+    else:
+        ctx.enqueue_function[_scan_slot_kernel](
+            hist.unsafe_ptr(),
+            node.unsafe_ptr(),
+            feat.unsafe_ptr(),
+            allow.unsafe_ptr(),
+            missing.unsafe_ptr(),
+            catn.unsafe_ptr(),
+            mono.unsafe_ptr(),
+            fparam.unsafe_ptr(),
+            slot_i.unsafe_ptr(),
+            slot_f.unsafe_ptr(),
+            Int32(n_bins),
+            Int32(hist_size),
+            Int32(record_base),
+            Int32(feat_stride),
+            Int32(min_data_in_leaf),
+            Int32(1) if constrained else Int32(0),
+            Int32(cat_onehot_max),
+            Int32(cat_max_threshold),
+            Int32(cat_min_group),
+            grid_dim=(widest_slots, n_records),
+            block_dim=1,
+        )
     ctx.enqueue_function[_reduce_slots_kernel](
         slot_i.unsafe_ptr(),
         slot_f.unsafe_ptr(),
@@ -1472,6 +1956,12 @@ struct GpuSplitSearcher(Movable):
     var missing_bin: List[Int]
     var cat_n: List[Int]
     var constrained: Bool
+    var wide_scan: Bool
+    """Whether the per-feature scan runs on a threadgroup rather than on one
+    thread. Decided once at construction by `wide_scan_for`, because both
+    inputs are fixed there: the environment switch, and whether this
+    dataset declares a categorical feature, which the wide kernel does not
+    scan. Reported by `describe_scan`."""
 
     def __init__(
         out self,
@@ -1532,12 +2022,19 @@ struct GpuSplitSearcher(Movable):
         self.cat_n = List[Int](capacity=n_features)
         self.active = List[Int](capacity=n_features)
         self.active_len = List[Int](capacity=max_records)
+        var any_cat = False
         for f in range(n_features):
             self.missing_bin.append(
                 missing_bins[f] if len(missing_bins) > 0 else -1
             )
             self.cat_n.append(cats.n_categories(f) if cats.is_cat(f) else 0)
+            if self.cat_n[f] >= 2:
+                any_cat = True
             self.active.append(f)
+        # Fixed here and not revisited: `cats` is a construction-time fact,
+        # and narrowing a record's feature set later can only remove
+        # features, never introduce a categorical one.
+        self.wide_scan = wide_scan_for(any_cat)
         for _ in range(max_records):
             self.active_len.append(n_features)
 
@@ -1640,6 +2137,13 @@ struct GpuSplitSearcher(Movable):
     def n_active(self) -> Int:
         """How many feature slots the next search scans."""
         return len(self.active)
+
+    def describe_scan(self) -> String:
+        """One line for benchmark output and bug reports: which scan kernel
+        this searcher launches and how wide its threadgroup is."""
+        if self.wide_scan:
+            return String("scan=wide threads=", WIDE_SCAN_THREADS)
+        return String("scan=serial threads=1")
 
     def _check_record(self, record: Int) raises:
         if record < 0 or record >= self.max_records:
@@ -1857,6 +2361,7 @@ struct GpuSplitSearcher(Movable):
             params.cat.max_cat_to_onehot,
             params.cat.max_cat_threshold,
             params.cat.min_data_per_group,
+            self.wide_scan,
         )
 
     def enqueue(

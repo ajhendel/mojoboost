@@ -66,17 +66,31 @@ masks, categorical partitioning, and missing-value direction all stay in
 both policies enforce every one of them identically. A policy changes
 *which leaf is split when*, never how a candidate is scored.
 
-What is not here
-----------------
-Batching a depth-wise level into one device launch. On the GPU a depth-wise
-tree today issues the same launch group per split as a leaf-wise one; only
-the order, and so the tree, differs. The design for a batched level is
-`docs/design/GPU_LEVELWISE.md`. Its host-side prototype module
+What a batched level is, and what it is not
+-------------------------------------------
+`plan_level` below hands a grower the whole planned level at once instead of
+one index at a time. It decides nothing new: it calls `next_leaf` and
+returns what `next_leaf` returned, so the admissions, the budget, and the
+order are still this module's and a grower that drains the list splits
+exactly what a grower calling `next_leaf` between splits would have.
+
+What it is for is the GPU. `train_gpu._device_search_resident` enqueues a
+level's partitions and histogram builds back to back and searches every
+child in one launch pair, so a level costs one host wait rather than one per
+split. That is a launch-count change underneath this order, which is where
+`docs/design/GPU_LEVELWISE.md` says batching belongs. The batched histogram
+build of that design (one pass over the active row buffer per level, rather
+than one per node) is still not built; the multi-leaf kernels it would use
+are in `gpu_leaf_batching.mojo`. Its host-side prototype module
 (`gpu_levelwise.mojo`, a second commit path that derived child values from
 the parent histogram) was removed unused: the growers commit through their
 own per-split bodies, and a batched build belongs underneath this order as
 a histogram-phase service both policies can call, not as another growth
 loop.
+
+Leaf-wise growth cannot batch and is not asked to. Its next pick depends on
+the frontier the current split changes, so `plan_level` returns one index
+and the grower is the one-split-at-a-time loop it always was.
 """
 
 
@@ -484,3 +498,53 @@ struct GrowthSchedule(Movable):
         var i = self.queue[self.next]
         self.next += 1
         return i
+
+    def plan_level(
+        mut self,
+        candidates: List[LeafCandidate],
+        n_leaves: Int,
+        num_leaves: Int,
+        max_depth: Int,
+    ) raises -> List[Int]:
+        """Every frontier index this schedule will hand out before it next
+        has to look at the frontier, in `next_leaf`'s order.
+
+        The batched reading of `next_leaf`, for a grower that wants to
+        enqueue a level's device work back to back and wait once rather than
+        wait per split. It is the same order and the same admissions: this
+        calls `next_leaf` and returns what it returned, so a grower that
+        drains the list splits exactly the leaves, in exactly the sequence,
+        that a grower calling `next_leaf` between splits would have.
+
+        The two policies differ in how much can be known ahead:
+
+        - Leaf-wise picks the best gain *anywhere* in the tree, and a split
+          changes the frontier it picks from, so nothing past the first pick
+          is decided yet. The list is one index, and a grower batching over
+          it is the one-split-at-a-time loop it always was.
+        - Depth-wise plans a whole level in `next_leaf` (the admissions, the
+          leaf budget, and the ascending-node-id order are all decided
+          there, once, when the queue is empty) and then hands its queue out
+          one index at a time. Those indices stay valid across the splits in
+          between, because a split replaces its parent's frontier slot with
+          the left child and appends the right, so this returns the level.
+
+        An empty list means growth is finished, which is `next_leaf`
+        answering -1; `stop_reason` records why.
+        """
+        var picks = List[Int]()
+        var first = self.next_leaf(candidates, n_leaves, num_leaves, max_depth)
+        if first < 0:
+            return picks^
+        picks.append(first)
+        if self.policy == GROW_LEAFWISE:
+            return picks^
+        # Drain the level `next_leaf` just planned. Asking again once the
+        # queue is spent would plan the *next* level against a frontier the
+        # caller has not split yet, so the queue bound is the stopping rule
+        # rather than a second -1.
+        while self.next < len(self.queue):
+            picks.append(
+                self.next_leaf(candidates, n_leaves, num_leaves, max_depth)
+            )
+        return picks^

@@ -6,10 +6,25 @@ parameter string `grow_policy=depthwise`) makes every frontier grower
 (`tree.grow_tree`, `tree_sparse.grow_tree_sparse`, the three loops in
 `train_gpu.mojo`) split leaves in the order `growth_policy.GrowthSchedule`
 plans: one depth at a time, `BUDGET_RANK` admission, ascending node id
-within a level. Section 3's parameter semantics are what ships. What is
-**not** built is the launch batching of sections 1, 2, and 6: the GPU
-growers still issue one launch group per split, so depth-wise on the device
-costs what leaf-wise costs today and no benchmark has been run.
+within a level. Section 3's parameter semantics are what ships.
+
+**Half of the launch batching now ships too**, in the resident device-search
+loop (`train_gpu._device_search_resident`) and there only.
+`growth_policy.plan_level` hands that loop a whole planned level, which it
+commits and enqueues back to back and then searches in one launch pair, so a
+level costs **one host wait instead of one per split** and two search
+launches instead of two per split. At the default 31 leaves that is 5 waits
+for a tree rather than 30. The row partition and the histogram build are
+still per node, so of the eight launches a split costs, six remain per split
+and two moved to per level; the table in section 1 is therefore reached for
+synchronizations and not yet for launch groups. Section 2's step 2 (one
+batched histogram pass over the active row buffer per level, using the
+multi-leaf kernels in `gpu_leaf_batching.mojo`) and step 5 (one segmented
+partition per level) are what remains.
+
+No benchmark has been run on any of it. The counts above are counts. What
+they would have to be read against is `pixi run bench-launch-cost`, which
+prices one launch and one wait on the device in hand.
 
 The host-side prototype this document names (`gpu_levelwise.mojo`:
 `LevelFrontier`, `plan_level`, `decide_level`, `LevelCommit`, `child_sums`)

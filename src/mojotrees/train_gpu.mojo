@@ -190,7 +190,12 @@ from .sampling import (
     select_tree_features,
 )
 from .split import SplitInfo
-from .growth_policy import GrowthSchedule, LeafCandidate, check_grow_policy
+from .growth_policy import (
+    GROW_DEPTHWISE,
+    GrowthSchedule,
+    LeafCandidate,
+    check_grow_policy,
+)
 from .tree import Tree, TreeParams, _leaf_value, _search
 
 
@@ -527,6 +532,97 @@ struct _GpuRecordLeafState(Movable):
         self.slot = slot
 
 
+# Ceilings on the searcher's record capacity under depth-wise growth, where
+# one batch is a whole planned level. A level wider than this is searched in
+# several batches, which costs one extra wait apiece and nothing else, so
+# both are budget decisions rather than correctness ones.
+#
+# The record count itself, which bounds `grid.y` of the search launch and the
+# 136 bytes per record `download_frontier` brings home.
+comptime MAX_LEVEL_RECORDS = 512
+# Cells in one per-record table. The searcher strides `feat_dev` and
+# `allow_dev` by `n_features` rather than by a batch's slot count, so their
+# size is `records * n_features` and a wide dataset has to buy its capacity
+# in records. 2^20 cells is 4 MiB per table.
+comptime MAX_LEVEL_TABLE_CELLS = 1 << 20
+
+
+def _search_record_slots(params: TreeParams, n_features: Int) -> Int:
+    """Record slots the device-search searcher is constructed with.
+
+    Two is what a split needs: the resident loop searches a split's two
+    children in one launch pair, and the incremental loop uses the first
+    slot only. Depth-wise growth searches a whole planned level in one pair
+    instead (`GrowthSchedule.plan_level`), so it buys room for one, bounded
+    by both ceilings above and never below the two a single split needs.
+    """
+    if params.grow_policy != GROW_DEPTHWISE:
+        return 2
+    var slots = 2 * params.num_leaves
+    if slots > MAX_LEVEL_RECORDS:
+        slots = MAX_LEVEL_RECORDS
+    var width = n_features if n_features > 0 else 1
+    var by_cells = MAX_LEVEL_TABLE_CELLS // width
+    if slots > by_cells:
+        slots = by_cells
+    if slots < 2:
+        slots = 2
+    return slots
+
+
+struct _GpuPendingSplit(Movable):
+    """A split whose device work is enqueued and whose children's records
+    have not come home yet.
+
+    `_device_search_resident` commits a batch of splits before it waits, so
+    everything the frontier update needs after the wait has to survive the
+    enqueue: which frontier slot the parent held, the two child node ids and
+    their exact row counts, the branch and depth both children inherit, the
+    monotone interval each child's own search must respect, and the pool
+    slot each child's histogram landed in. The two records themselves arrive
+    from `download_frontier` in the order the requests were staged, which is
+    what pairs a pending split with `recs[2 * k]` and `recs[2 * k + 1]`.
+    """
+
+    var index: Int
+    var left_node: Int
+    var right_node: Int
+    var n_left: Int
+    var n_right: Int
+    var depth: Int
+    var branch: List[Int]
+    var left_bounds: OutputBounds
+    var right_bounds: OutputBounds
+    var left_slot: Int
+    var right_slot: Int
+
+    def __init__(
+        out self,
+        index: Int,
+        left_node: Int,
+        right_node: Int,
+        n_left: Int,
+        n_right: Int,
+        depth: Int,
+        var branch: List[Int],
+        var left_bounds: OutputBounds,
+        var right_bounds: OutputBounds,
+        left_slot: Int,
+        right_slot: Int,
+    ):
+        self.index = index
+        self.left_node = left_node
+        self.right_node = right_node
+        self.n_left = n_left
+        self.n_right = n_right
+        self.depth = depth
+        self.branch = branch^
+        self.left_bounds = left_bounds^
+        self.right_bounds = right_bounds^
+        self.left_slot = left_slot
+        self.right_slot = right_slot
+
+
 def _apply_shape_rules(
     mut rec: GpuSplitRecord, n_rows: Int, depth: Int, params: TreeParams
 ):
@@ -754,15 +850,13 @@ def _grow_tree_gpu_device_search(
         tree_index,
     )
     builder.set_features(tree_features)
-    # Two record slots, because the resident loop searches a split's two
-    # children in one launch pair; the incremental loop uses the first only.
     var searcher = GpuSplitSearcher(
         builder.ctx,
         builder.n_features,
         builder.n_bins,
         builder.missing_bin,
         builder.cats,
-        max_records=2,
+        max_records=_search_record_slots(params, builder.n_features),
     )
     searcher.set_monotone(signs)
     var split_params = GpuSplitParams(
@@ -991,32 +1085,53 @@ def _device_search_resident(
     built, the same test `grow_tree` and `grow_tree_gpu` use, so no two
     growers can disagree about which histogram a slot holds.
 
-    The two children are then searched in one `enqueue_frontier` and brought
-    home by one `download_frontier`, so a split costs one host wait rather
-    than one per child. Per split, that is: one histogram build with the
-    sibling subtraction folded into it, one search launch pair, one wait, and
-    272 bytes across the bus. The host-search grower pays one build, one
-    wait, a `3 * n_features * n_bins` download, a host subtraction, and two
-    host scans; the incremental device loop pays two builds and two waits.
+    A batch of splits is committed, enqueued, and searched together, and the
+    batch is what `GrowthSchedule.plan_level` hands over: one split under
+    leaf-wise growth, because the next pick depends on the frontier this one
+    changes, and a whole planned level under depth-wise growth, whose
+    admissions and order are all decided before any of them runs. Each
+    split in a batch costs one histogram build with the sibling subtraction
+    folded into it; the batch as a whole costs one search launch pair, one
+    wait, and 136 bytes per child across the bus. The host-search grower
+    pays one build, one wait, a `3 * n_features * n_bins` download, a host
+    subtraction, and two host scans per split; the incremental device loop
+    pays two builds and two waits per split.
+
+    Batching a level is safe because a level's splits are independent: their
+    parents own disjoint row windows, so no two partitions touch the same
+    rows; each child's histogram lands in its own pool slot; and no split in
+    a batch reads a frontier entry another writes, since the frontier is
+    updated only after the wait. The in-order queue (gpu_runtime.mojo) is
+    what serializes the scratch buffers the partitions share. Nothing about
+    a decision changes, so the tree is the one the same schedule would have
+    grown one split at a time.
 
     What a split's fixed cost actually is
     -------------------------------------
-    Eight launches and one wait, and on an Apple M4 (`pixi run
-    bench-launch-cost`, which measures both directly) that is about 20us of
-    enqueue per launch and about 126us for the wait: roughly 280us a split,
-    or 0.85s of a 3.05s run at 50000 x 100. Read those two numbers before
-    proposing anything whose whole benefit is fewer launches or fewer waits,
-    because they set the price. One launch removed is worth about 60ms over
-    a default run, near 2%, which is inside the benchmark harness's noise
-    floor -- so a fusion has to justify itself as strictly less work for an
-    identical result, not by a measured speedup.
+    Under leaf-wise growth, eight launches and one wait, and on an Apple M4
+    (`pixi run bench-launch-cost`, which measures both directly) that is
+    about 20us of enqueue per launch and about 126us for the wait: roughly
+    280us a split, or 0.85s of a 3.05s run at 50000 x 100. Read those two
+    numbers before proposing anything whose whole benefit is fewer launches
+    or fewer waits, because they set the price. One launch removed is worth
+    about 60ms over a default run, near 2%, which is inside the benchmark
+    harness's noise floor -- so a fusion has to justify itself as strictly
+    less work for an identical result, not by a measured speedup.
 
     The eight are four for the row partition (flag scan, block-sum scan,
     scatter, copy back), two or three for the histogram (a conditional
     zeroing, then either the atomic kernel or the partial and reduce pair),
-    and two for the split search. The wait is not one of the things that can
-    be removed: one per split is the floor while the host chooses the next
-    leaf, writes the tree, and draws per-node feature subsets.
+    and two for the split search. Six of them are per split whatever the
+    batch; the two search launches and the wait are per batch. A depth-wise
+    level of `L` splits therefore pays `6L + 2` launches and one wait rather
+    than `8L` and `L`, which at the default 31 leaves is 5 waits for a tree
+    instead of 30. That is a count, not a measurement: no benchmark of
+    depth-wise growth on the device has been run, and the launch and wait
+    prices above are what it would have to be read against.
+
+    The wait cannot go below one per batch: the host chooses the next
+    leaves, writes the tree, and draws per-node feature subsets from the
+    records the batch brought home.
 
     Three fusions have already been examined and are not open. The output
     zeroing is skipped already whenever the tiled path builds a full feature
@@ -1104,12 +1219,18 @@ def _device_search_resident(
     )
     var n_leaves = 1
     var schedule = GrowthSchedule(params.grow_policy)
+    # A batch is a host wait, so a level wider than the searcher's record
+    # capacity becomes several of them rather than one oversized launch.
+    # Two records per split, since both children are searched.
+    var per_batch = searcher.max_records // 2
+    if per_batch < 1:
+        per_batch = 1
 
     while n_leaves < params.num_leaves:
         # The growth policy picks (growth_policy.mojo), exactly as the
         # host-search loop does: best gain anywhere in the tree, ties to the
-        # lower frontier index, under leaf-wise growth; the planned level's
-        # next node under depth-wise growth.
+        # lower frontier index, under leaf-wise growth; the whole planned
+        # level, in ascending node id, under depth-wise growth.
         var cands = List[LeafCandidate](capacity=len(frontier))
         for i in range(len(frontier)):
             cands.append(
@@ -1120,143 +1241,89 @@ def _device_search_resident(
                     frontier[i].rec.found and frontier[i].rec.gain > 0.0,
                 )
             )
-        var best_i = schedule.next_leaf(
+        var picks = schedule.plan_level(
             cands, n_leaves, params.num_leaves, params.max_depth
         )
-        if best_i < 0:
+        if len(picks) == 0:
             break
 
-        var parent_node = frontier[best_i].node
-        var parent_slot = frontier[best_i].slot
-        var rec = frontier[best_i].rec.copy()
-        var split = rec.to_split_info()
-        var split_missing_bin = -1 if split.is_categorical else (
-            builder.missing_bin[split.feature]
-        )
-        # Exact integers off the record, from the same histogram counts the
-        # host `_count_left` would sum.
-        var n_left = rec.left.count
-        var n_right = rec.right.count
+        # Everything a batch's splits enqueue is independent: their parents
+        # hold disjoint row windows, so the partitions do not overlap, and
+        # each child's histogram lands in its own pool slot. The queue is in
+        # order (gpu_runtime.mojo), so the scratch every partition shares is
+        # drained by one before the next writes it, and no split in a batch
+        # reads a frontier entry another split in the same batch writes: the
+        # frontier updates all happen below, after the batch's one wait.
+        var taken = 0
+        while taken < len(picks):
+            var upto = taken + per_batch
+            if upto > len(picks):
+                upto = len(picks)
+            var batch = List[SplitNodeRequest](capacity=2 * (upto - taken))
+            var pending = List[_GpuPendingSplit](capacity=upto - taken)
 
-        var left_node = tree._add_node(0.0, Float64(n_left))
-        var right_node = tree._add_node(0.0, Float64(n_right))
-        var part_t0 = perf_counter_ns()
-        builder.apply_split(
-            split.feature,
-            split.bin,
-            parent_node,
-            left_node,
-            right_node,
-            split_missing_bin,
-            split.default_left,
-            split.is_categorical,
-            split.cat_bitset,
-            expected_left=n_left,
-        )
-        if phase_trace:
-            builder.ctx.synchronize()
-        t_partition += Float64(perf_counter_ns() - part_t0) / 1e9
+            for pick in range(taken, upto):
+                _enqueue_resident_split(
+                    builder,
+                    tree,
+                    frontier,
+                    picks[pick],
+                    params,
+                    tree_features,
+                    signs,
+                    tree_index,
+                    batch,
+                    pending,
+                    t_partition,
+                    t_hist,
+                    phase_trace,
+                )
 
-        var children = _commit_device_split(
-            tree,
-            rec,
-            split,
-            split_missing_bin,
-            parent_node,
-            left_node,
-            right_node,
-            frontier[best_i].bounds,
-            signs,
-        )
-
-        # The subtraction trick, device side, folded into the build. The
-        # built child gets a fresh slot; the derived one takes over the
-        # parent's, which is what keeps the pool at one slot per live leaf
-        # rather than one per node. The subtraction rides along inside the
-        # histogram kernel, so a split spends one launch here rather than
-        # two and never makes a slot-sized pass over the pool to do it.
-        var build_left = subtraction_builds_left(n_left, n_right)
-        var built_node = left_node if build_left else right_node
-        var derived_node = right_node if build_left else left_node
-        hist_t0 = perf_counter_ns()
-        var built_slot = builder.acquire_resident(built_node)
-        if built_slot < 0:
-            raise Error(
-                "the resident histogram pool ran out mid-tree; it is sized"
-                " for num_leaves slots, so this means the pool and the leaf"
-                " budget disagree"
+            search_t0 = perf_counter_ns()
+            searcher.enqueue_frontier(
+                builder.batcher[0].out_dev,
+                batch,
+                split_params,
+                builder.g_scale,
+                builder.h_scale,
             )
-        builder.enqueue_resident_leaf_subtracting(
-            built_node, built_slot, parent_slot
-        )
-        builder.reown_resident(parent_slot, derived_node)
-        if phase_trace:
-            builder.ctx.synchronize()
-        t_hist += Float64(perf_counter_ns() - hist_t0) / 1e9
-        var left_slot = built_slot if build_left else parent_slot
-        var right_slot = parent_slot if build_left else built_slot
+            # The batch's one wait, and what upholds the staging contracts on
+            # both sides: the batcher's pinned item table and the searcher's
+            # pinned node tables are only restaged after this returns.
+            var recs = searcher.download_frontier(len(batch))
+            t_search += Float64(perf_counter_ns() - search_t0) / 1e9
 
-        # Both children inherit the same branch feature set, so they share
-        # one allow mask, and both sit one edge below the leaf that split.
-        var branch = extend_branch(frontier[best_i].branch, split.feature)
-        var allowed = params.constraints.allowed_features(branch)
-        var child_depth = frontier[best_i].depth + 1
-        var batch = List[SplitNodeRequest](capacity=2)
-        batch.append(
-            SplitNodeRequest(
-                left_slot,
-                _node_features(params, tree_features, tree_index, left_node),
-                allowed.copy(),
-                children.left.copy(),
-            )
-        )
-        batch.append(
-            SplitNodeRequest(
-                right_slot,
-                _node_features(params, tree_features, tree_index, right_node),
-                allowed^,
-                children.right.copy(),
-            )
-        )
-        search_t0 = perf_counter_ns()
-        searcher.enqueue_frontier(
-            builder.batcher[0].out_dev,
-            batch,
-            split_params,
-            builder.g_scale,
-            builder.h_scale,
-        )
-        # The split's one wait, and what upholds the staging contracts on
-        # both sides: the batcher's pinned item table and the searcher's
-        # pinned node tables are only restaged after this returns.
-        var recs = searcher.download_frontier(2)
-        t_search += Float64(perf_counter_ns() - search_t0) / 1e9
-        var left_rec = recs[0].copy()
-        var right_rec = recs[1].copy()
-        _apply_shape_rules(left_rec, n_left, child_depth, params)
-        _apply_shape_rules(right_rec, n_right, child_depth, params)
-
-        frontier[best_i] = _GpuRecordLeafState(
-            left_node,
-            n_left,
-            left_rec^,
-            branch.copy(),
-            depth=child_depth,
-            bounds=children.left.copy(),
-            slot=left_slot,
-        )
-        frontier.append(
-            _GpuRecordLeafState(
-                right_node,
-                n_right,
-                right_rec^,
-                branch^,
-                depth=child_depth,
-                bounds=children.right.copy(),
-                slot=right_slot,
-            )
-        )
-        n_leaves += 1
+            for k in range(len(pending)):
+                var left_rec = recs[2 * k].copy()
+                var right_rec = recs[2 * k + 1].copy()
+                _apply_shape_rules(
+                    left_rec, pending[k].n_left, pending[k].depth, params
+                )
+                _apply_shape_rules(
+                    right_rec, pending[k].n_right, pending[k].depth, params
+                )
+                frontier[pending[k].index] = _GpuRecordLeafState(
+                    pending[k].left_node,
+                    pending[k].n_left,
+                    left_rec^,
+                    pending[k].branch.copy(),
+                    depth=pending[k].depth,
+                    bounds=pending[k].left_bounds.copy(),
+                    slot=pending[k].left_slot,
+                )
+                frontier.append(
+                    _GpuRecordLeafState(
+                        pending[k].right_node,
+                        pending[k].n_right,
+                        right_rec^,
+                        pending[k].branch.copy(),
+                        depth=pending[k].depth,
+                        bounds=pending[k].right_bounds.copy(),
+                        slot=pending[k].right_slot,
+                    )
+                )
+                n_leaves += 1
+            taken = upto
 
     if phase_trace:
         var tree_s = Float64(perf_counter_ns() - tree_t0) / 1e9
@@ -1278,6 +1345,145 @@ def _device_search_resident(
     tree.n_leaves = n_leaves
     builder.release_resident_all()
     return tree^
+
+
+def _enqueue_resident_split(
+    mut builder: GpuHistogramBuilder,
+    mut tree: Tree,
+    mut frontier: List[_GpuRecordLeafState],
+    index: Int,
+    params: TreeParams,
+    tree_features: List[Int],
+    signs: List[Int],
+    tree_index: Int,
+    mut batch: List[SplitNodeRequest],
+    mut pending: List[_GpuPendingSplit],
+    mut t_partition: Float64,
+    mut t_hist: Float64,
+    phase_trace: Bool,
+) raises:
+    """Commit one split of `frontier[index]` into `tree` and enqueue the
+    device work its two children need, without waiting for any of it.
+
+    This is the body of `_device_search_resident`'s loop up to but not
+    including the search: the row partition, the tree write, the built
+    child's histogram with the sibling subtraction folded in, and the two
+    search requests appended to `batch`. What the caller still owes is one
+    `enqueue_frontier` over `batch` and one `download_frontier`, after which
+    `pending` says where each pair of records belongs.
+
+    It is a separate function because a batch calls it several times before
+    it waits, and because the frontier entry it reads must not be one
+    another call in the same batch has written: nothing here writes
+    `frontier` at all, which is what makes that true by construction rather
+    than by reading the loop.
+    """
+    var parent_node = frontier[index].node
+    var parent_slot = frontier[index].slot
+    var rec = frontier[index].rec.copy()
+    var split = rec.to_split_info()
+    var split_missing_bin = -1 if split.is_categorical else (
+        builder.missing_bin[split.feature]
+    )
+    # Exact integers off the record, from the same histogram counts the
+    # host `_count_left` would sum.
+    var n_left = rec.left.count
+    var n_right = rec.right.count
+
+    var left_node = tree._add_node(0.0, Float64(n_left))
+    var right_node = tree._add_node(0.0, Float64(n_right))
+    var part_t0 = perf_counter_ns()
+    builder.apply_split(
+        split.feature,
+        split.bin,
+        parent_node,
+        left_node,
+        right_node,
+        split_missing_bin,
+        split.default_left,
+        split.is_categorical,
+        split.cat_bitset,
+        expected_left=n_left,
+    )
+    if phase_trace:
+        builder.ctx.synchronize()
+    t_partition += Float64(perf_counter_ns() - part_t0) / 1e9
+
+    var children = _commit_device_split(
+        tree,
+        rec,
+        split,
+        split_missing_bin,
+        parent_node,
+        left_node,
+        right_node,
+        frontier[index].bounds,
+        signs,
+    )
+
+    # The subtraction trick, device side, folded into the build. The built
+    # child gets a fresh slot; the derived one takes over the parent's,
+    # which is what keeps the pool at one slot per live leaf rather than one
+    # per node. The subtraction rides along inside the histogram kernel, so
+    # a split spends one launch here rather than two and never makes a
+    # slot-sized pass over the pool to do it.
+    var build_left = subtraction_builds_left(n_left, n_right)
+    var built_node = left_node if build_left else right_node
+    var derived_node = right_node if build_left else left_node
+    var hist_t0 = perf_counter_ns()
+    var built_slot = builder.acquire_resident(built_node)
+    if built_slot < 0:
+        raise Error(
+            "the resident histogram pool ran out mid-tree; it is sized"
+            " for num_leaves slots, so this means the pool and the leaf"
+            " budget disagree"
+        )
+    builder.enqueue_resident_leaf_subtracting(
+        built_node, built_slot, parent_slot
+    )
+    builder.reown_resident(parent_slot, derived_node)
+    if phase_trace:
+        builder.ctx.synchronize()
+    t_hist += Float64(perf_counter_ns() - hist_t0) / 1e9
+    var left_slot = built_slot if build_left else parent_slot
+    var right_slot = parent_slot if build_left else built_slot
+
+    # Both children inherit the same branch feature set, so they share one
+    # allow mask, and both sit one edge below the leaf that split.
+    var branch = extend_branch(frontier[index].branch, split.feature)
+    var allowed = params.constraints.allowed_features(branch)
+    var child_depth = frontier[index].depth + 1
+    batch.append(
+        SplitNodeRequest(
+            left_slot,
+            _node_features(params, tree_features, tree_index, left_node),
+            allowed.copy(),
+            children.left.copy(),
+        )
+    )
+    batch.append(
+        SplitNodeRequest(
+            right_slot,
+            _node_features(params, tree_features, tree_index, right_node),
+            allowed^,
+            children.right.copy(),
+        )
+    )
+    pending.append(
+        _GpuPendingSplit(
+            index,
+            left_node,
+            right_node,
+            n_left,
+            n_right,
+            child_depth,
+            branch^,
+            children.left.copy(),
+            children.right.copy(),
+            left_slot,
+            right_slot,
+        )
+    )
 
 
 def grow_tree_gpu(
