@@ -98,6 +98,26 @@ from .collective import (
     zeros_f64,
     zeros_int,
 )
+from .distributed_strategies import (
+    DEFAULT_TOP_K,
+    STRATEGY_DATA_PARALLEL,
+    STRATEGY_FEATURE_PARALLEL,
+    STRATEGY_SERIAL,
+    STRATEGY_VOTING_PARALLEL,
+    FeaturePartition,
+    allreduce_selected,
+    allreduce_votes,
+    check_strategy_world,
+    check_top_k,
+    elect_split_collective,
+    elect_voted_features,
+    pack_selected,
+    parse_strategy,
+    search_owned_features,
+    select_top_k,
+    strategy_name,
+    unpack_selected,
+)
 from .distributed_transport import (
     RUNTIME_LOCAL,
     RUNTIME_TRANSPORT,
@@ -960,6 +980,12 @@ struct DistributedRunOptions(Copyable, Movable):
     - `job_id` and `schema` stamp the checkpoint records. `run_distributed`
       fills them from the `RuntimeSpec`; a caller driving the run entry point
       itself may set them directly.
+    - `tree_learner` is LightGBM's parameter of that name as a strategy code
+      from distributed_strategies.mojo: `STRATEGY_DATA_PARALLEL` (the
+      default, and the only path a default-constructed instance takes),
+      `STRATEGY_FEATURE_PARALLEL`, `STRATEGY_VOTING_PARALLEL`, or
+      `STRATEGY_SERIAL`, which is data parallel restricted to a world of one.
+      `top_k` is voting parallel's local vote count, LightGBM's `top_k`.
     """
 
     var verify_splits: Bool
@@ -970,6 +996,8 @@ struct DistributedRunOptions(Copyable, Movable):
     var groups: List[Int]
     var job_id: UInt64
     var schema: UInt64
+    var tree_learner: Int
+    var top_k: Int
 
     def __init__(out self):
         self.verify_splits = False
@@ -980,6 +1008,16 @@ struct DistributedRunOptions(Copyable, Movable):
         self.groups = List[Int]()
         self.job_id = 0
         self.schema = 0
+        self.tree_learner = STRATEGY_DATA_PARALLEL
+        self.top_k = DEFAULT_TOP_K
+
+    def with_tree_learner(self, name: String, top_k: Int = DEFAULT_TOP_K) raises -> Self:
+        """A copy selecting `tree_learner` by its LightGBM name (`serial`,
+        `data`, `feature`, `voting`), with voting's `top_k`."""
+        var out = self.copy()
+        out.tree_learner = parse_strategy(name)
+        out.top_k = top_k
+        return out^
 
     def scores_every_round(self) -> Bool:
         return self.early_stopping_rounds > 0
@@ -993,6 +1031,14 @@ struct DistributedRunOptions(Copyable, Movable):
             raise Error("early_stopping_delta must not be negative")
         if self.checkpoint_every < 0:
             raise Error("checkpoint_every must not be negative")
+        if (
+            self.tree_learner != STRATEGY_SERIAL
+            and self.tree_learner != STRATEGY_DATA_PARALLEL
+            and self.tree_learner != STRATEGY_FEATURE_PARALLEL
+            and self.tree_learner != STRATEGY_VOTING_PARALLEL
+        ):
+            raise Error(String("unknown tree_learner code ", self.tree_learner))
+        check_top_k(self.top_k)
 
 
 struct DistributedRunReport(Copyable, Movable):
@@ -1109,6 +1155,42 @@ def model_digest(model: Booster) -> UInt64:
 
 
 def _grow_tree_distributed[
+    C: Collective
+](
+    shards: List[DataShard],
+    grad: List[List[Float64]],
+    hess: List[List[Float64]],
+    params: TreeParams,
+    mut comm: C,
+    options: DistributedRunOptions = DistributedRunOptions(),
+) raises -> Tree:
+    """Grow one tree by the strategy `options.tree_learner` names.
+
+    Data parallel (the default) and serial take `_grow_tree_data_parallel`,
+    which is the path every run took before `tree_learner` existed and is
+    unchanged; feature and voting parallel take their own growers below, over
+    the cores in distributed_strategies.mojo. Serial is data parallel that
+    refuses a world larger than one, so a configuration written for one node
+    cannot silently shard.
+    """
+    if options.tree_learner == STRATEGY_FEATURE_PARALLEL:
+        return _grow_tree_feature_parallel(
+            shards, grad, hess, params, comm, options
+        )
+    if options.tree_learner == STRATEGY_VOTING_PARALLEL:
+        return _grow_tree_voting_parallel(
+            shards, grad, hess, params, comm, options
+        )
+    if options.tree_learner == STRATEGY_SERIAL and comm.world_size() != 1:
+        raise Error(
+            "tree_learner=serial trains on one rank; this world has "
+            + String(comm.world_size())
+            + " ranks. Use data, feature, or voting"
+        )
+    return _grow_tree_data_parallel(shards, grad, hess, params, comm, options)
+
+
+def _grow_tree_data_parallel[
     C: Collective
 ](
     shards: List[DataShard],
@@ -1316,6 +1398,672 @@ def _grow_tree_distributed[
                 right_split^,
                 branch^,
                 n_right,
+            )
+        )
+        n_leaves += 1
+
+    tree.n_leaves = n_leaves
+    return tree^
+
+
+
+# ---------------------------------------------------------------------------
+# Feature-parallel and voting-parallel growers
+# ---------------------------------------------------------------------------
+#
+# Both are the data-parallel loop above with one seam replaced, which is the
+# shape distributed_strategies.mojo was written for. Feature parallel replaces
+# the histogram all-reduce with a candidate all-gather and election; voting
+# parallel keeps the all-reduce but only over the features the ranks elected.
+# Everything else (frontier scan, smaller-child choice, leaf values, stopping)
+# is the data-parallel code, applied to whichever histogram the mode makes
+# global.
+
+
+struct _FeatureLeaf(Movable):
+    """A grown-but-unsplit leaf under feature parallel. `rows` is the one row
+    list every rank holds identically (every rank holds every row); `hists`
+    is one histogram per local rank, each covering that rank's owned features
+    plus feature 0; `split` is the elected split."""
+
+    var node: Int
+    var rows: List[Int]
+    var hists: List[Histogram]
+    var split: SplitInfo
+    var branch: List[Int]
+    var count: Int
+
+    def __init__(
+        out self,
+        node: Int,
+        var rows: List[Int],
+        var hists: List[Histogram],
+        var split: SplitInfo,
+        var branch: List[Int],
+        count: Int,
+    ):
+        self.node = node
+        self.rows = rows^
+        self.hists = hists^
+        self.split = split^
+        self.branch = branch^
+        self.count = count
+
+
+def _built_features(partition: FeaturePartition, rank: Int) raises -> List[Int]:
+    """The features a rank builds histograms for: the ones it owns, plus
+    feature 0 so leaf values and row counts read off its histogram exactly
+    as they do on the data-parallel path (`_leaf_value` and `_total_count`
+    read feature 0's bins). Ascending, as `build_histogram` requires."""
+    var owned = partition.features(rank)
+    if len(owned) > 0 and owned[0] == 0:
+        return owned^
+    var out = List[Int](capacity=len(owned) + 1)
+    out.append(0)
+    for f in range(len(owned)):
+        out.append(owned[f])
+    return out^
+
+
+def _elect[
+    C: Collective
+](
+    mut comm: C,
+    hists: List[Histogram],
+    partition: FeaturePartition,
+    params: TreeParams,
+    n_rows: Int,
+    allowed: List[Bool],
+    parent_output: Float64,
+    node: Int,
+) raises -> SplitInfo:
+    """One node's feature-parallel split: each local rank searches its owned
+    features, one all-gather elects the winner every rank agrees on."""
+    var local = List[SplitInfo](capacity=len(hists))
+    for i in range(len(hists)):
+        local.append(
+            search_owned_features(
+                hists[i],
+                partition,
+                comm.local_rank(i),
+                params,
+                n_rows,
+                allowed=allowed,
+                parent_output=parent_output,
+            )
+        )
+    var elected = elect_split_collective(comm, local, partition, node)
+    return elected.split.copy()
+
+
+def _grow_tree_feature_parallel[
+    C: Collective
+](
+    shards: List[DataShard],
+    grad: List[List[Float64]],
+    hess: List[List[Float64]],
+    params: TreeParams,
+    mut comm: C,
+    options: DistributedRunOptions,
+) raises -> Tree:
+    """Grow one tree feature-parallel: every rank holds every row, builds
+    histograms for its own feature block, and one candidate all-gather per
+    node elects the split.
+
+    Contract on `shards`: one entry per local rank and every entry the whole
+    dataset (same rows, same order), which is LightGBM's arrangement for this
+    mode. The row lists are therefore identical on every rank and are kept
+    once. Because each rank sees all rows in the dataset's order and the
+    election reproduces `find_best_split`'s scan order, the tree equals the
+    single-node tree bit for bit, which is what
+    tests/parallel/test_distributed_strategies.mojo pins.
+    """
+    var n_features = shards[0].data.n_features
+    var n_bins = shards[0].data.n_bins
+    var n_local = len(shards)
+    var n_rows = shards[0].data.n_rows
+    for i in range(n_local):
+        var same = shards[i].data.n_rows == n_rows
+        if same:
+            # The same rows carry the same gradients; a row partition handed
+            # in by mistake fails this on its first row.
+            for r in range(n_rows):
+                if grad[i][r] != grad[0][r] or hess[i][r] != hess[0][r]:
+                    same = False
+                    break
+        if not same:
+            raise Error(
+                "feature-parallel training needs every rank to hold every"
+                " row with the same gradients: local rank "
+                + String(i)
+                + " does not match local rank 0 (partition features, not"
+                " rows: pass the whole dataset once per rank)"
+            )
+    params.extra.check_scalars(params.min_data_in_leaf)
+    params.extra.penalties.check_features(n_features)
+
+    var partition = FeaturePartition(n_features, comm.world_size())
+    check_strategy_world(
+        comm, STRATEGY_FEATURE_PARALLEL, partition, n_features, options.top_k
+    )
+    var built = List[List[Int]](capacity=n_local)
+    for i in range(n_local):
+        built.append(_built_features(partition, comm.local_rank(i)))
+
+    var tree = Tree(
+        List[Int](), List[Int](), List[Int](), List[Int](),
+        List[Float64](), List[Float64](), 0,
+    )
+    var max_delta_step = params.extra.max_delta_step
+    var path_smooth = params.extra.path_smooth
+
+    var root_rows = List[Int](capacity=n_rows)
+    for r in range(n_rows):
+        root_rows.append(r)
+    var root_hists = List[Histogram](capacity=n_local)
+    for i in range(n_local):
+        root_hists.append(
+            build_histogram(shards[i].data, grad[i], hess[i], built[i])
+        )
+    var root_branch = List[Int]()
+    var root = tree._add_node(
+        _leaf_value(
+            root_hists[0],
+            params.lambda_reg,
+            params.lambda_l1,
+            n_rows,
+            0.0,
+            max_delta_step,
+            path_smooth,
+        ),
+        Float64(n_rows),
+    )
+    var root_split = _elect(
+        comm,
+        root_hists,
+        partition,
+        params,
+        n_rows,
+        params.constraints.allowed_features(root_branch),
+        tree.value[root],
+        root,
+    )
+
+    var frontier = List[_FeatureLeaf]()
+    frontier.append(
+        _FeatureLeaf(
+            root, root_rows^, root_hists^, root_split^, root_branch^, n_rows
+        )
+    )
+    var n_leaves = 1
+
+    while n_leaves < params.num_leaves:
+        var best_i = -1
+        var best_gain = 0.0
+        for i in range(len(frontier)):
+            if frontier[i].split.found and frontier[i].split.gain > best_gain:
+                best_gain = frontier[i].split.gain
+                best_i = i
+        if best_i < 0:
+            break
+
+        var parent_node = frontier[best_i].node
+        var split = frontier[best_i].split.copy()
+
+        # Every rank holds every row, so routing is local and identical
+        # everywhere; the counts it yields are the global counts.
+        var left_rows = List[Int]()
+        var right_rows = List[Int]()
+        for k in range(len(frontier[best_i].rows)):
+            var r = frontier[best_i].rows[k]
+            if shards[0].data.bin_at(r, split.feature) <= split.bin:
+                left_rows.append(r)
+            else:
+                right_rows.append(r)
+        var n_left = len(left_rows)
+        var n_right = frontier[best_i].count - n_left
+
+        var left_hists = List[Histogram](capacity=n_local)
+        var right_hists = List[Histogram](capacity=n_local)
+        for i in range(n_local):
+            if n_left <= n_right:
+                var lh = build_histogram_subset(
+                    shards[i].data, grad[i], hess[i], left_rows, built[i]
+                )
+                right_hists.append(
+                    subtract_histogram(frontier[best_i].hists[i], lh)
+                )
+                left_hists.append(lh^)
+            else:
+                var rh = build_histogram_subset(
+                    shards[i].data, grad[i], hess[i], right_rows, built[i]
+                )
+                left_hists.append(
+                    subtract_histogram(frontier[best_i].hists[i], rh)
+                )
+                right_hists.append(rh^)
+
+        var parent_output = tree.value[parent_node]
+        var left_node = tree._add_node(
+            _leaf_value(
+                left_hists[0],
+                params.lambda_reg,
+                params.lambda_l1,
+                n_left,
+                parent_output,
+                max_delta_step,
+                path_smooth,
+            ),
+            Float64(n_left),
+        )
+        var right_node = tree._add_node(
+            _leaf_value(
+                right_hists[0],
+                params.lambda_reg,
+                params.lambda_l1,
+                n_right,
+                parent_output,
+                max_delta_step,
+                path_smooth,
+            ),
+            Float64(n_right),
+        )
+        tree.feature[parent_node] = split.feature
+        tree.threshold_bin[parent_node] = split.bin
+        tree.left[parent_node] = left_node
+        tree.right[parent_node] = right_node
+        tree.split_gain[parent_node] = split.gain
+
+        var branch = extend_branch(frontier[best_i].branch, split.feature)
+        var allowed = params.constraints.allowed_features(branch)
+        var left_split = _elect(
+            comm, left_hists, partition, params, n_left, allowed,
+            tree.value[left_node], left_node,
+        )
+        var right_split = _elect(
+            comm, right_hists, partition, params, n_right, allowed,
+            tree.value[right_node], right_node,
+        )
+
+        frontier[best_i] = _FeatureLeaf(
+            left_node, left_rows^, left_hists^, left_split^, branch.copy(),
+            n_left,
+        )
+        frontier.append(
+            _FeatureLeaf(
+                right_node, right_rows^, right_hists^, right_split^, branch^,
+                n_right,
+            )
+        )
+        n_leaves += 1
+
+    tree.n_leaves = n_leaves
+    return tree^
+
+
+struct _VotingLeaf(Movable):
+    """A grown-but-unsplit leaf under voting parallel. `rows` and `hists`
+    are per local rank and local (unreduced, all features), kept so a
+    child's sibling can be derived by local subtraction; `reduced` is the
+    global histogram over the elected features (plus feature 0) and is
+    identical on every rank, as are `split` and `count`."""
+
+    var node: Int
+    var rows: List[List[Int]]
+    var hists: List[Histogram]
+    var reduced: Histogram
+    var split: SplitInfo
+    var branch: List[Int]
+    var count: Int
+
+    def __init__(
+        out self,
+        node: Int,
+        var rows: List[List[Int]],
+        var hists: List[Histogram],
+        var reduced: Histogram,
+        var split: SplitInfo,
+        var branch: List[Int],
+        count: Int,
+    ):
+        self.node = node
+        self.rows = rows^
+        self.hists = hists^
+        self.reduced = reduced^
+        self.split = split^
+        self.branch = branch^
+        self.count = count
+
+
+def _per_feature_gains(
+    hist: Histogram,
+    n_rows: Int,
+    params: TreeParams,
+    allowed: List[Bool],
+    parent_output: Float64,
+    mut gains: List[Float64],
+    mut found: List[Bool],
+) raises:
+    """This rank's best local gain on every feature, the input to its vote.
+    One `find_best_split` per feature, so the ranking uses exactly the gain
+    the global search would compute on the same bins."""
+    var n_features = hist.n_features
+    for f in range(n_features):
+        gains[f] = 0.0
+        found[f] = False
+        if len(allowed) > 0 and not allowed[f]:
+            continue
+        if n_rows < 2 * params.min_data_in_leaf or n_rows < 2:
+            continue
+        var one: List[Int] = [f]
+        var s = find_best_split(
+            hist,
+            lambda_reg=params.lambda_reg,
+            min_child_hess=params.min_child_hess,
+            min_data_in_leaf=params.min_data_in_leaf,
+            lambda_l1=params.lambda_l1,
+            allowed=allowed,
+            features=one,
+            extra=params.extra,
+            n_rows=n_rows,
+            parent_output=parent_output,
+        )
+        gains[f] = s.gain
+        found[f] = s.found
+
+
+def _with_feature_zero(selected: List[Int]) -> List[Int]:
+    if len(selected) > 0 and selected[0] == 0:
+        return selected.copy()
+    var out = List[Int](capacity=len(selected) + 1)
+    out.append(0)
+    for i in range(len(selected)):
+        out.append(selected[i])
+    return out^
+
+
+def _vote_and_reduce[
+    C: Collective
+](
+    mut comm: C,
+    hists: List[Histogram],
+    row_counts: List[Int],
+    params: TreeParams,
+    allowed: List[Bool],
+    parent_output: Float64,
+    top_k: Int,
+    mut selected_out: List[Int],
+) raises -> Histogram:
+    """One node's voting-parallel exchange: local top-k votes, one vote
+    reduction, then one packed reduction over the elected features.
+
+    Feature 0 always rides along in the reduced set so the leaf value and the
+    exact row counts read off the reduced histogram as they do on the
+    data-parallel path; it costs one feature's bins. The returned histogram
+    is zero outside the elected features and `selected_out` says which they
+    are, ascending, so the caller searches only those.
+    """
+    var n_features = hists[0].n_features
+    var n_bins = hists[0].n_bins
+    var votes = List[List[Int]](capacity=len(hists))
+    var gains = zeros_f64(n_features)
+    var found = List[Bool](capacity=n_features)
+    found.resize(n_features, False)
+    for i in range(len(hists)):
+        _per_feature_gains(
+            hists[i], row_counts[i], params, allowed, parent_output, gains,
+            found,
+        )
+        votes.append(select_top_k(gains, found, top_k))
+    var counts = allreduce_votes(comm, votes, n_features)
+    var selected = _with_feature_zero(elect_voted_features(counts, top_k))
+
+    var local_sum = _zero_histogram(n_features, n_bins)
+    for i in range(len(hists)):
+        _accumulate_histogram(local_sum, hists[i])
+    var packed = pack_selected(local_sum, selected)
+    allreduce_selected(comm, packed)
+    var reduced = _zero_histogram(n_features, n_bins)
+    unpack_selected(reduced, selected, packed)
+    selected_out = selected^
+    return reduced^
+
+
+def _search_selected(
+    hist: Histogram,
+    n_rows: Int,
+    params: TreeParams,
+    allowed: List[Bool],
+    selected: List[Int],
+    parent_output: Float64,
+) raises -> SplitInfo:
+    """`_search` restricted to the elected features, which are the only ones
+    the reduced histogram holds."""
+    if n_rows < 2 * params.min_data_in_leaf or n_rows < 2:
+        return SplitInfo(-1, -1, 0.0, False)
+    return find_best_split(
+        hist,
+        lambda_reg=params.lambda_reg,
+        min_child_hess=params.min_child_hess,
+        min_data_in_leaf=params.min_data_in_leaf,
+        lambda_l1=params.lambda_l1,
+        allowed=allowed,
+        features=selected,
+        extra=params.extra,
+        n_rows=n_rows,
+        parent_output=parent_output,
+    )
+
+
+def _grow_tree_voting_parallel[
+    C: Collective
+](
+    shards: List[DataShard],
+    grad: List[List[Float64]],
+    hess: List[List[Float64]],
+    params: TreeParams,
+    mut comm: C,
+    options: DistributedRunOptions,
+) raises -> Tree:
+    """Grow one tree voting-parallel: rows partitioned as in data parallel,
+    but per node each rank votes for its `top_k` best features, the votes
+    reduce, and only the elected features' histograms are reduced and
+    searched. Not exact by design (`voting_is_exact()` is False): a feature
+    unremarkable on every shard yet best globally is not elected, so the
+    tree may differ from single-node training. Communication per node is one
+    integer reduction of `n_features` votes plus a packed reduction of
+    `(top_k + 1) * n_bins` cells instead of `n_features * n_bins`.
+    """
+    var n_features = shards[0].data.n_features
+    var n_bins = shards[0].data.n_bins
+    var n_local = len(shards)
+    params.extra.check_scalars(params.min_data_in_leaf)
+    params.extra.penalties.check_features(n_features)
+
+    var partition = FeaturePartition(n_features, comm.world_size())
+    check_strategy_world(
+        comm, STRATEGY_VOTING_PARALLEL, partition, n_features, options.top_k
+    )
+    var max_delta_step = params.extra.max_delta_step
+    var path_smooth = params.extra.path_smooth
+
+    var tree = Tree(
+        List[Int](), List[Int](), List[Int](), List[Int](),
+        List[Float64](), List[Float64](), 0,
+    )
+
+    var root_rows = List[List[Int]]()
+    var root_hists = List[Histogram](capacity=n_local)
+    var root_counts = List[Int](capacity=n_local)
+    var local_total: List[Int] = [0]
+    for i in range(n_local):
+        var rows = List[Int](capacity=shards[i].data.n_rows)
+        for r in range(shards[i].data.n_rows):
+            rows.append(r)
+        root_rows.append(rows^)
+        root_hists.append(build_histogram(shards[i].data, grad[i], hess[i]))
+        root_counts.append(shards[i].data.n_rows)
+        local_total[0] += shards[i].data.n_rows
+    comm.allreduce_sum_int(local_total)
+    var root_count = local_total[0]
+
+    var root_branch = List[Int]()
+    var root_allowed = params.constraints.allowed_features(root_branch)
+    var root_selected = List[Int]()
+    var root_reduced = _vote_and_reduce(
+        comm, root_hists, root_counts, params, root_allowed, 0.0,
+        options.top_k, root_selected,
+    )
+    var root = tree._add_node(
+        _leaf_value(
+            root_reduced,
+            params.lambda_reg,
+            params.lambda_l1,
+            root_count,
+            0.0,
+            max_delta_step,
+            path_smooth,
+        ),
+        Float64(root_count),
+    )
+    var root_split = _search_selected(
+        root_reduced, root_count, params, root_allowed, root_selected,
+        tree.value[root],
+    )
+    if options.verify_splits:
+        _agree_split(comm, root_split, root)
+
+    var frontier = List[_VotingLeaf]()
+    frontier.append(
+        _VotingLeaf(
+            root, root_rows^, root_hists^, root_reduced^, root_split^,
+            root_branch^, root_count,
+        )
+    )
+    var n_leaves = 1
+
+    while n_leaves < params.num_leaves:
+        var best_i = -1
+        var best_gain = 0.0
+        for i in range(len(frontier)):
+            if frontier[i].split.found and frontier[i].split.gain > best_gain:
+                best_gain = frontier[i].split.gain
+                best_i = i
+        if best_i < 0:
+            break
+
+        var parent_node = frontier[best_i].node
+        var split = frontier[best_i].split.copy()
+
+        var left_rows = List[List[Int]]()
+        var right_rows = List[List[Int]]()
+        var left_counts = List[Int](capacity=n_local)
+        var right_counts = List[Int](capacity=n_local)
+        for i in range(n_local):
+            var lr = List[Int]()
+            var rr = List[Int]()
+            for k in range(len(frontier[best_i].rows[i])):
+                var r = frontier[best_i].rows[i][k]
+                if shards[i].data.bin_at(r, split.feature) <= split.bin:
+                    lr.append(r)
+                else:
+                    rr.append(r)
+            left_counts.append(len(lr))
+            right_counts.append(len(rr))
+            left_rows.append(lr^)
+            right_rows.append(rr^)
+
+        # The split feature was elected, so its bins are in the reduced
+        # parent histogram and the exact global left count reads off them.
+        var n_left = _left_count(
+            frontier[best_i].reduced, split.feature, split.bin
+        )
+        var n_right = frontier[best_i].count - n_left
+
+        var left_hists = List[Histogram](capacity=n_local)
+        var right_hists = List[Histogram](capacity=n_local)
+        for i in range(n_local):
+            if n_left <= n_right:
+                var lh = build_histogram_subset(
+                    shards[i].data, grad[i], hess[i], left_rows[i]
+                )
+                right_hists.append(
+                    subtract_histogram(frontier[best_i].hists[i], lh)
+                )
+                left_hists.append(lh^)
+            else:
+                var rh = build_histogram_subset(
+                    shards[i].data, grad[i], hess[i], right_rows[i]
+                )
+                left_hists.append(
+                    subtract_histogram(frontier[best_i].hists[i], rh)
+                )
+                right_hists.append(rh^)
+
+        var parent_output = tree.value[parent_node]
+        var branch = extend_branch(frontier[best_i].branch, split.feature)
+        var allowed = params.constraints.allowed_features(branch)
+        var left_selected = List[Int]()
+        var left_reduced = _vote_and_reduce(
+            comm, left_hists, left_counts, params, allowed, parent_output,
+            options.top_k, left_selected,
+        )
+        var right_selected = List[Int]()
+        var right_reduced = _vote_and_reduce(
+            comm, right_hists, right_counts, params, allowed, parent_output,
+            options.top_k, right_selected,
+        )
+
+        var left_node = tree._add_node(
+            _leaf_value(
+                left_reduced,
+                params.lambda_reg,
+                params.lambda_l1,
+                n_left,
+                parent_output,
+                max_delta_step,
+                path_smooth,
+            ),
+            Float64(n_left),
+        )
+        var right_node = tree._add_node(
+            _leaf_value(
+                right_reduced,
+                params.lambda_reg,
+                params.lambda_l1,
+                n_right,
+                parent_output,
+                max_delta_step,
+                path_smooth,
+            ),
+            Float64(n_right),
+        )
+        tree.feature[parent_node] = split.feature
+        tree.threshold_bin[parent_node] = split.bin
+        tree.left[parent_node] = left_node
+        tree.right[parent_node] = right_node
+        tree.split_gain[parent_node] = split.gain
+
+        var left_split = _search_selected(
+            left_reduced, n_left, params, allowed, left_selected,
+            tree.value[left_node],
+        )
+        var right_split = _search_selected(
+            right_reduced, n_right, params, allowed, right_selected,
+            tree.value[right_node],
+        )
+        if options.verify_splits:
+            _agree_split(comm, left_split, left_node)
+            _agree_split(comm, right_split, right_node)
+
+        frontier[best_i] = _VotingLeaf(
+            left_node, left_rows^, left_hists^, left_reduced^, left_split^,
+            branch.copy(), n_left,
+        )
+        frontier.append(
+            _VotingLeaf(
+                right_node, right_rows^, right_hists^, right_reduced^,
+                right_split^, branch^, n_right,
             )
         )
         n_leaves += 1

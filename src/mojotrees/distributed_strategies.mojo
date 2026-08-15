@@ -17,12 +17,14 @@ voting calls `select_top_k`, `allreduce_votes`, and `elect_voted_features`
 and then reduces a smaller histogram. Both seams are one function call wide,
 which is what keeps them from becoming a parallel trainer.
 
-**Status. Neither mode is operational, and `require_strategy_operational`
-refuses both.** The cores are written and the reasoning below is meant to be
-checkable, but no grower in this repository calls them, no test has run them,
-and nothing in the repository has moved a byte between two processes: see
-`transport_available` in distributed_transport.mojo, which is False in every
-build today. No parallel speedup, scaling, or communication measurement is
+**Status.** Both modes are driven: `distributed.mojo` grows feature-parallel
+and voting-parallel trees over these cores when `DistributedRunOptions.
+tree_learner` selects them (`_grow_tree_feature_parallel`,
+`_grow_tree_voting_parallel`), and tests/parallel/test_distributed_strategies.mojo
+runs both over `LocalCollective`. What remains true: nothing in the
+repository has moved a byte between two processes (see `transport_validated`
+in distributed_transport.mojo), so a multi-process run of either mode is
+unproven, and no parallel speedup, scaling, or communication measurement is
 claimed here or anywhere else.
 
 ## The three modes, and what each one costs
@@ -144,10 +146,8 @@ from .tree import TreeParams
 # ---------------------------------------------------------------------------
 #
 # The names are LightGBM's `tree_learner` values, so a configuration written
-# against LightGBM means here what it means there, or is refused. mojotrees has
-# no `tree_learner` parameter today (docs/LIGHTGBM_PARITY.md section 11 records
-# that as a difference), and adding one is a decision for whoever owns the
-# parameter surface, not for this file.
+# against LightGBM means here what it means there, or is refused.
+# `DistributedRunOptions.tree_learner` in distributed.mojo carries one of them.
 
 comptime STRATEGY_SERIAL = 0
 """Single node. Not a distributed mode; accepted so a caller can name it."""
@@ -361,7 +361,6 @@ def voting_is_exact() -> Bool:
 # configuration with the same message, and a refusal is never a rank-local
 # decision.
 
-comptime UNSUPPORTED_NO_DRIVER = 1
 comptime UNSUPPORTED_NO_TRANSPORT = 2
 comptime UNSUPPORTED_WORLD_TOO_SMALL = 4
 comptime UNSUPPORTED_STRATEGY_UNKNOWN = 8
@@ -402,11 +401,6 @@ def strategy_unsupported_mask(
         return mask
     if world_size < 2:
         mask |= UNSUPPORTED_WORLD_TOO_SMALL
-    if (
-        strategy == STRATEGY_FEATURE_PARALLEL
-        or strategy == STRATEGY_VOTING_PARALLEL
-    ):
-        mask |= UNSUPPORTED_NO_DRIVER
     if multi_process and not transport_ready:
         mask |= UNSUPPORTED_NO_TRANSPORT
     return mask
@@ -420,18 +414,6 @@ def raise_strategy_unsupported(strategy: Int, mask: Int) raises:
     """
     if mask & UNSUPPORTED_STRATEGY_UNKNOWN != 0:
         raise Error(String("unknown parallel strategy code ", strategy))
-    if mask & UNSUPPORTED_NO_DRIVER != 0:
-        raise Error(
-            String(
-                "the ",
-                strategy_name(strategy),
-                "-parallel strategy is not operational: this module supplies"
-                " the split-election and voting cores, and no grower in this"
-                " repository calls them. See docs/DISTRIBUTED_STRATEGIES.md"
-                " for the driver each mode still needs. Train with"
-                " train_distributed (data parallel) or on a single node",
-            )
-        )
     if mask & UNSUPPORTED_NO_TRANSPORT != 0:
         raise Error(
             "distributed training cannot reach another process in this build:"
@@ -459,10 +441,10 @@ def require_strategy_operational(
 ) raises:
     """The gate, as a pure function of what it is told.
 
-    Raises for feature and voting parallel unconditionally, and for any mode
-    whose world spans processes this build cannot reach. That is deliberate: a
-    core that has never been driven, never run across processes, and never
-    measured is not a mode a caller should be able to select by accident.
+    Raises for a mode whose world spans processes this build cannot reach,
+    for a parallel mode at world size 1, and for the serial mode at any
+    larger world size. A world hosted in one process (`LocalCollective`)
+    passes for every mode: the drivers in distributed.mojo run there.
     """
     var mask = strategy_unsupported_mask(
         strategy, world_size, multi_process, transport_ready
@@ -878,7 +860,7 @@ def elect_split(
     var best = SplitInfo(-1, -1, 0.0, False)
     var owner = -1
     for r in range(len(candidates)):
-        var c = candidates[r]
+        var c = candidates[r].copy()
         if c.rank != r:
             raise Error("candidates must be in ascending rank order")
         if not c.present:
@@ -980,9 +962,11 @@ def search_owned_features(
     here because a rank that skipped them would propose a split its peers
     would have refused, and the election cannot tell the difference.
 
-    `params.extra.needs_grower_support()` is refused rather than forwarded:
-    `extra_trees`, `max_delta_step`, and `path_smooth` are applied by the
-    grower, and there is no feature-parallel grower to be trusted with them.
+    `extra_trees` is refused rather than forwarded: its threshold draw is
+    keyed by node and tree identity that this forward does not carry.
+    `max_delta_step` and `path_smooth` are the grower's, and the
+    feature-parallel grower in distributed.mojo applies them in its leaf
+    values exactly as the data-parallel one does.
     """
     partition._check_rank(rank)
     if hist.n_features != partition.n_features:
@@ -990,10 +974,9 @@ def search_owned_features(
             "the histogram and the feature partition disagree about the"
             " feature count"
         )
-    if params.extra.needs_grower_support():
+    if params.extra.needs_node_identity():
         raise Error(
-            "extra_trees, max_delta_step, and path_smooth are applied by the"
-            " grower, and no feature-parallel grower exists to apply them"
+            "extra_trees is not supported by feature-parallel split search"
         )
     if params.max_depth > 0 and depth >= params.max_depth:
         return SplitInfo(-1, -1, 0.0, False)
@@ -1109,7 +1092,7 @@ def allreduce_votes[
         raise Error("allreduce_votes needs one vote list per local rank")
     var counts = zeros_int(n_features)
     for i in range(len(local_votes)):
-        var votes = local_votes[i]
+        var votes = local_votes[i].copy()
         var previous = -1
         for j in range(len(votes)):
             var f = votes[j]
