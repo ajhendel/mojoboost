@@ -448,6 +448,97 @@ def _range_add_raw_kernel(
         )
 
 
+# One device-side range descriptor, in Int32 words. `SEG_START` is where this
+# segment's rows begin in the flattened thread index space (the running sum of
+# the preceding segments' counts), `SEG_BEGIN` is where they begin in the
+# active-row permutation, and `SEG_NODE` is the tree node whose value they
+# take. The fourth word is unused and exists only to keep the stride a power
+# of two, so a descriptor never straddles a cache line.
+comptime SEG_WORDS = 4
+comptime SEG_START = 0
+comptime SEG_BEGIN = 1
+comptime SEG_NODE = 2
+
+
+def _range_table_add_raw_kernel(
+    rows: MutPointer[Int32, MutAnyOrigin],
+    raw: MutPointer[Float32, MutAnyOrigin],
+    steps: MutPointer[Float32, MutAnyOrigin],
+    segs: MutPointer[Int32, MutAnyOrigin],
+    n_segments: Int32,
+    total: Int32,
+    n_classes: Int32,
+    k: Int32,
+):
+    """`_range_add_raw_kernel` for every live leaf of a compacted tree at
+    once, from a device-resident table of that tree's ranges.
+
+    The per-leaf kernel above needs one launch per leaf because the leaf's
+    `begin`, `count`, and `node` arrive as launch arguments. Here the same
+    three numbers arrive as a table the host staged once, so a thread can
+    find its own leaf and the whole tree closes in one launch. At the
+    31-leaf tree the trainer grows by default that is 1 launch where there
+    were 31.
+
+    Thread `t` covers the `t`-th row of the concatenation of the live
+    ranges, in the order the host staged them. It finds its segment by
+    binary search for the last descriptor whose `SEG_START` is at or below
+    `t`, which is exact because the host writes `SEG_START` as the running
+    sum of the counts and therefore strictly ascending (empty ranges are
+    never staged). With at most a few hundred live leaves that is at most
+    nine iterations over a table of a few kilobytes, and every thread of a
+    threadgroup that lies inside one leaf, which is all but at most one per
+    leaf, searches to the same descriptor.
+
+    Why this takes a step and not a value and a learning rate
+    ---------------------------------------------------------
+    The per-leaf kernel computes `raw[i] + learning_rate * value[node]`.
+    Writing the same expression here produced a different last bit, and the
+    reason is instructive: in the per-leaf kernel `node` is a launch
+    argument, so `learning_rate * value[node]` is uniform across the launch
+    and is computed and rounded to Float32 on its own; here `node` is
+    per-thread, and the device compiler contracted the multiply and the add
+    into a single fused multiply-add, which rounds once instead of twice.
+    Both are legitimate Float32 evaluations of the same expression and they
+    differ by one unit in the last place, which is enough to make a model
+    not byte-identical to the one this lane started from.
+
+    Rather than fight the contraction, the multiply is moved to the host,
+    where `Float32(learning_rate) * Float32(value)` is the same IEEE 754
+    single-precision multiply the per-leaf kernel performs, with the same
+    rounding, and is therefore the same bits. What reaches the device is
+    already the step, so the kernel contains no multiply at all and there is
+    nothing left for a compiler to fuse. The result is equal to the per-leaf
+    kernel's by construction rather than by the optimizer's agreement,
+    which is the stronger of the two guarantees.
+
+    Ranges are pairwise disjoint (`LeafRangeTable` checks that invariant),
+    so no row is written by two threads and no row is written twice; a row
+    in no range keeps its old score, which is the out-of-bag contract both
+    kernels have.
+    """
+    var t = Int(global_idx.x)
+    if t >= Int(total):
+        return
+    var lo = 0
+    var hi = Int(n_segments) - 1
+    while lo < hi:
+        var mid = (lo + hi + 1) // 2
+        if Int(segs[unsafe_offset = mid * SEG_WORDS + SEG_START][0]) <= t:
+            lo = mid
+        else:
+            hi = mid - 1
+    var base = lo * SEG_WORDS
+    var j = t - Int(segs[unsafe_offset = base + SEG_START][0])
+    var slot = Int(segs[unsafe_offset = base + SEG_BEGIN][0]) + j
+    var node = Int(segs[unsafe_offset = base + SEG_NODE][0])
+    var r = Int(rows[unsafe_offset=slot][0])
+    var i = r * Int(n_classes) + Int(k)
+    raw[unsafe_offset=i] = (
+        raw[unsafe_offset=i][0] + steps[unsafe_offset=node][0]
+    )
+
+
 def _abs_sum_kernel(
     grad: MutPointer[Float32, MutAnyOrigin],
     hess: MutPointer[Float32, MutAnyOrigin],
@@ -587,10 +678,28 @@ struct GpuObjectiveState(Movable):
     `n_classes == 1`."""
     var value_dev: DeviceBuffer[DType.float32]
     """The current tree's node values, the lookup table `update_raw` reads."""
+    var seg_dev: DeviceBuffer[DType.int32]
+    """The current tree's live-range descriptors, `SEG_WORDS` Int32 apiece,
+    which is what lets `update_raw_ranges` close a whole tree in one launch.
+    Sized once at construction from `max_nodes`, never per tree."""
     var part_dev: DeviceBuffer[DType.float32]
     var base_dev: DeviceBuffer[DType.float32]
     var host_part: HostBuffer[DType.float32]
     var host_raw: HostBuffer[DType.float32]
+    var step_dev: DeviceBuffer[DType.float32]
+    """The current tree's per-node steps, `learning_rate * value[node]`
+    already multiplied and rounded on the host. Read by the range-table
+    kernel, which is why that kernel contains no multiply; see it for the
+    rounding argument."""
+    var stage_value: HostBuffer[DType.float32]
+    """Pinned staging for the node-value table. `map_to_host` copies in both
+    directions on every use and blocks (the reasoning is written out in
+    histogram_gpu.mojo), so the per-tree upload goes through an ordinary
+    one-way asynchronous copy out of this buffer instead."""
+    var stage_step: HostBuffer[DType.float32]
+    """Pinned staging for `step_dev`, on the same grounds."""
+    var stage_seg: HostBuffer[DType.int32]
+    """Pinned staging for `seg_dev`, on the same grounds."""
     var n_rows: Int
     var n_classes: Int
     var max_nodes: Int
@@ -655,6 +764,10 @@ struct GpuObjectiveState(Movable):
             n_scores if n_classes > 1 else 1
         )
         self.value_dev = ctx.enqueue_create_buffer[DType.float32](max_nodes)
+        self.seg_dev = ctx.enqueue_create_buffer[DType.int32](
+            max_nodes * SEG_WORDS
+        )
+        self.step_dev = ctx.enqueue_create_buffer[DType.float32](max_nodes)
         self.base_dev = ctx.enqueue_create_buffer[DType.float32](n_classes)
         self.part_dev = ctx.enqueue_create_buffer[DType.float32](
             2 * SUM_BLOCKS
@@ -663,6 +776,15 @@ struct GpuObjectiveState(Movable):
             2 * SUM_BLOCKS
         )
         self.host_raw = ctx.enqueue_create_host_buffer[DType.float32](n_scores)
+        self.stage_value = ctx.enqueue_create_host_buffer[DType.float32](
+            max_nodes
+        )
+        self.stage_step = ctx.enqueue_create_host_buffer[DType.float32](
+            max_nodes
+        )
+        self.stage_seg = ctx.enqueue_create_host_buffer[DType.int32](
+            max_nodes * SEG_WORDS
+        )
 
         # One-time uploads. Both buffers are written through the mapping
         # rather than staged, because this runs once per session and the
@@ -878,24 +1000,11 @@ struct GpuObjectiveState(Movable):
             block_dim=self.block_threads,
         )
 
-    def update_raw_ranges(
-        mut self,
-        ctx: DeviceContext,
-        mut rows: GpuActiveRows,
-        values: List[Float64],
-        learning_rate: Float64,
-        k: Int = 0,
+    def _check_range_update(
+        self, values: List[Float64], learning_rate: Float64, k: Int
     ) raises:
-        """`update_raw` for a compacted tree: advance the raw scores from
-        the leaf ranges the grown tree left in `rows` instead of a per-row
-        leaf-assignment array.
-
-        Call after `grow_tree_gpu` returns and before the next tree's
-        `begin_tree`, which is what resets the ranges. Every live range
-        belongs to a leaf of the finished tree, so the update is one small
-        launch per leaf over exactly that leaf's rows; rows outside every
-        range (out of bag) keep their old scores, the same contract
-        `update_raw` has for unrouted rows."""
+        """The preconditions both range-update arms share, so the two
+        cannot drift apart on what they refuse."""
         if len(values) < 1:
             raise Error("node values must not be empty")
         if len(values) > self.max_nodes:
@@ -912,10 +1021,146 @@ struct GpuObjectiveState(Movable):
         for i in range(len(values)):
             if not isfinite(values[i]):
                 raise Error("node values must be finite")
-        with self.value_dev.map_to_host() as host:
-            var dst = host.unsafe_ptr()
-            for i in range(len(values)):
-                dst.unsafe_store(i, Float32(values[i]))
+
+    def _stage_values(mut self, ctx: DeviceContext, values: List[Float64]
+    ) raises:
+        """Upload the tree's node values through pinned staging.
+
+        This replaces a `map_to_host` on `value_dev`. The two are not the
+        same transfer: a mapping is bidirectional and blocks until the
+        device is idle, so it cost a hidden host synchronization every time
+        it was opened, once per tree here. A staged copy is one-way and
+        asynchronous, which is the convention histogram_gpu.mojo documents
+        and the split searcher already follows for its per-node tables.
+
+        The staging contract that buys is the usual one: the pinned buffer
+        must not be rewritten while a copy out of it is in flight. It is
+        rewritten once per tree, and the next tree's growth blocks on the
+        device well before it reaches this point (the round's magnitude
+        reduction alone synchronizes), so the copy has long retired.
+
+        Words past `len(values)` are whatever the previous tree left, which
+        is exactly what the mapping left there too: no kernel reads a node
+        id at or beyond the current tree's node count.
+        """
+        var dst = self.stage_value.unsafe_ptr()
+        for i in range(len(values)):
+            dst.unsafe_store(i, Float32(values[i]))
+        ctx.enqueue_copy(dst_buf=self.value_dev, src_ptr=dst)
+
+    def update_raw_ranges(
+        mut self,
+        ctx: DeviceContext,
+        mut rows: GpuActiveRows,
+        values: List[Float64],
+        learning_rate: Float64,
+        k: Int = 0,
+    ) raises:
+        """`update_raw` for a compacted tree: advance the raw scores from
+        the leaf ranges the grown tree left in `rows` instead of a per-row
+        leaf-assignment array.
+
+        Call after `grow_tree_gpu` returns and before the next tree's
+        `begin_tree`, which is what resets the ranges. Every live range
+        belongs to a leaf of the finished tree; rows outside every range
+        (out of bag) keep their old scores, the same contract `update_raw`
+        has for unrouted rows.
+
+        One launch, not one per leaf
+        ----------------------------
+        This used to open a `map_to_host` mapping on the node-value buffer
+        and then issue one small launch per live leaf. On the default
+        31-leaf tree that was 31 launches and one hidden host
+        synchronization per tree; it is now one launch, two small staged
+        copies (the per-node steps and the range descriptors, both a few
+        hundred bytes), and no synchronization of its own. The descriptors
+        are read by `_range_table_add_raw_kernel`, which finds a thread's
+        leaf by binary search over them.
+
+        What did not change is the arithmetic. Each row still receives
+        `learning_rate * value[leaf]` added to its own Float32 raw score,
+        with the multiply rounded to Float32 before the add exactly as the
+        per-leaf kernel rounds it, and the ranges are disjoint, so each row
+        is still written exactly once by exactly one thread. That the
+        multiply now happens on the host is what makes the equality
+        structural rather than dependent on how the device compiler chooses
+        to contract; the kernel's docstring gives that argument in full,
+        including the one-bit divergence that prompted it.
+        `update_raw_ranges_per_leaf` keeps the old shape in the process so a
+        test can assert the agreement rather than a docstring asserting it.
+        """
+        self._check_range_update(values, learning_rate, k)
+        # `Float32(lr) * Float32(value)` here is the same IEEE 754 single
+        # multiply the per-leaf kernel performs on the device, so the step
+        # that crosses is bit-identical to the one that kernel would have
+        # computed; the kernel then does nothing but add it. See
+        # `_range_table_add_raw_kernel` for why the multiply had to leave
+        # the kernel at all.
+        var step_dst = self.stage_step.unsafe_ptr()
+        var lr32 = Float32(learning_rate)
+        for i in range(len(values)):
+            step_dst.unsafe_store(i, lr32 * Float32(values[i]))
+        ctx.enqueue_copy(dst_buf=self.step_dev, src_ptr=step_dst)
+
+        # Flatten the live ranges into ascending descriptors. Empty ranges
+        # are the tree's internal nodes, whose rows their children own; the
+        # per-leaf loop skipped them the same way.
+        var dst = self.stage_seg.unsafe_ptr()
+        var n_segments = 0
+        var total = 0
+        for node in range(rows.ranges.n_nodes()):
+            if node >= len(values):
+                break
+            var window = rows.ranges.get(node)
+            var n = window.count()
+            if n <= 0:
+                continue
+            var base = n_segments * SEG_WORDS
+            dst.unsafe_store(base + SEG_START, Int32(total))
+            dst.unsafe_store(base + SEG_BEGIN, Int32(window.begin))
+            dst.unsafe_store(base + SEG_NODE, Int32(node))
+            dst.unsafe_store(base + SEG_WORDS - 1, Int32(0))
+            n_segments += 1
+            total += n
+        if n_segments == 0:
+            return
+        ctx.enqueue_copy(dst_buf=self.seg_dev, src_ptr=dst)
+        var blocks = (
+            total + self.block_threads - 1
+        ) // self.block_threads
+        ctx.enqueue_function[_range_table_add_raw_kernel](
+            rows.rows_dev.unsafe_ptr(),
+            self.raw_dev.unsafe_ptr(),
+            self.step_dev.unsafe_ptr(),
+            self.seg_dev.unsafe_ptr(),
+            Int32(n_segments),
+            Int32(total),
+            Int32(self.n_classes),
+            Int32(k),
+            grid_dim=blocks,
+            block_dim=self.block_threads,
+        )
+
+    def update_raw_ranges_per_leaf(
+        mut self,
+        ctx: DeviceContext,
+        mut rows: GpuActiveRows,
+        values: List[Float64],
+        learning_rate: Float64,
+        k: Int = 0,
+    ) raises:
+        """The launch-per-leaf range update, kept as the reference arm.
+
+        This is what `update_raw_ranges` issued before the range table
+        existed, minus the `map_to_host` on the node-value buffer, which the
+        staged copy replaces here as well so that the only difference
+        between the two arms is the launch shape. Nothing in the trainer
+        calls it; it exists so a test can run both over the same state and
+        compare the resulting raw scores bit for bit, which is a stronger
+        statement about the rewrite than any argument about it.
+        """
+        self._check_range_update(values, learning_rate, k)
+        self._stage_values(ctx, values)
         for node in range(rows.ranges.n_nodes()):
             if node >= len(values):
                 break

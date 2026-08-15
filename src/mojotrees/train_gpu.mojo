@@ -149,7 +149,15 @@ from .gpu_split_search import (
     GpuSplitSearcher,
     SplitNodeRequest,
 )
-from .gpu_split_policy import decide_split_search
+from .gpu_split_policy import (
+    SPLIT_POLICY_DEVICE_RESIDENT,
+    SPLIT_POLICY_HOST,
+    SPLIT_REASON_ENVIRONMENT_REQUEST,
+    SPLIT_REASON_EXPLICIT_REQUEST,
+    SplitSearchDecision,
+    decide_split_search,
+    normalized_split_work,
+)
 from .gpu_tiling import DeviceCaps
 from .histogram import Histogram, subtract_histogram
 from .histogram_gpu import GpuHistogramBuilder
@@ -369,6 +377,108 @@ def _estimated_active_features(params: TreeParams, n_features: Int) -> Int:
     return active
 
 
+def split_search_decision_for(
+    builder: GpuHistogramBuilder, params: TreeParams
+) raises -> SplitSearchDecision:
+    """The workload-aware AUTO decision, kept whole rather than reduced to a
+    path constant.
+
+    This is the call `resolve_split_search_for` has always made; what is new
+    is that the reason, the normalized work, the threshold, and the evidence
+    id survive it. They are the only record of *why* a fit took the path it
+    took, and until now they were computed and dropped one line later, which
+    left a user with no way to tell a device run from a host run except by
+    timing it.
+    """
+    return decide_split_search(
+        builder.device_api,
+        builder.device_arch,
+        builder.n_rows,
+        _estimated_active_features(params, builder.n_features),
+        builder.n_bins,
+        params.num_leaves,
+        _device_search_semantics_supported(params),
+        builder.resident_frontier_fits(params.num_leaves),
+    )
+
+
+def split_search_decision_for(
+    builder: GpuHistogramBuilder, params: TreeParams, strategy: Int
+) raises -> SplitSearchDecision:
+    """The resolved decision including a path the caller named outright.
+
+    A named path skips the policy entirely, which is the behavior it has
+    always had. It still comes back as a `SplitSearchDecision` so that one
+    accessor answers "what is this fit doing and why" in every case; the
+    reason is then `explicit-request` or `environment-request` rather than
+    anything about a crossover, and the normalized work is reported for
+    context without having been compared to anything.
+    """
+    var requested = strategy
+    var reason = SPLIT_REASON_EXPLICIT_REQUEST
+    if requested == SPLIT_SEARCH_AUTO:
+        requested = env_split_search()
+        reason = SPLIT_REASON_ENVIRONMENT_REQUEST
+    if requested == SPLIT_SEARCH_DEVICE or requested == SPLIT_SEARCH_HOST:
+        return SplitSearchDecision(
+            SPLIT_POLICY_DEVICE_RESIDENT
+            if requested == SPLIT_SEARCH_DEVICE
+            else SPLIT_POLICY_HOST,
+            reason,
+            normalized_split_work(
+                builder.n_rows,
+                _estimated_active_features(params, builder.n_features),
+                builder.n_bins,
+                params.num_leaves,
+            ),
+        )
+    return split_search_decision_for(builder, params)
+
+
+def describe_split_search(
+    builder: GpuHistogramBuilder,
+    params: TreeParams,
+    strategy: Int = SPLIT_SEARCH_AUTO,
+) raises -> String:
+    """One line naming the split-search path this shape resolves to, and
+    why, without growing a tree.
+
+    The accessor a benchmark prints in its header and a bug report quotes.
+    It answers from the same call the trainer makes, so what it prints is
+    what a fit at that shape will do, and it includes the boundary marker
+    when the workload sits exactly on the measured crossover. Reading it
+    costs a policy evaluation and no device work.
+    """
+    var decision = split_search_decision_for(builder, params, strategy)
+    return String(
+        decision.describe(),
+        " rows=",
+        builder.n_rows,
+        " active_features=",
+        _estimated_active_features(params, builder.n_features),
+        " bins=",
+        builder.n_bins,
+        " leaves=",
+        params.num_leaves,
+        " margin=",
+        decision.margin(),
+    )
+
+
+def split_trace_enabled() -> Bool:
+    """Whether to print the resolved split-search decision per tree.
+
+    `MOJOTREES_GPU_SPLIT_TRACE=1` asks for it directly;
+    `MOJOTREES_GPU_PHASE_TRACE=1` also turns it on, because a phase trace
+    that does not say which split path produced the phases it is attributing
+    is a trace of an unnamed run.
+    """
+    return (
+        getenv("MOJOTREES_GPU_SPLIT_TRACE") == "1"
+        or getenv("MOJOTREES_GPU_PHASE_TRACE") == "1"
+    )
+
+
 def resolve_split_search_for(
     builder: GpuHistogramBuilder, params: TreeParams
 ) raises -> Int:
@@ -379,16 +489,7 @@ def resolve_split_search_for(
     matrix shape, tree budget, semantic eligibility, and the builder's own
     resident-memory calculation.  Unknown or marginal cases stay on host.
     """
-    var decision = decide_split_search(
-        builder.device_api,
-        builder.device_arch,
-        builder.n_rows,
-        _estimated_active_features(params, builder.n_features),
-        builder.n_bins,
-        params.num_leaves,
-        _device_search_semantics_supported(params),
-        builder.resident_frontier_fits(params.num_leaves),
-    )
+    var decision = split_search_decision_for(builder, params)
     return (
         SPLIT_SEARCH_DEVICE if decision.uses_device() else SPLIT_SEARCH_HOST
     )
@@ -398,14 +499,10 @@ def resolve_split_search_for(
     builder: GpuHistogramBuilder, params: TreeParams, strategy: Int
 ) raises -> Int:
     """Explicit request wrapper around workload-aware AUTO."""
-    var requested = strategy
-    if requested == SPLIT_SEARCH_AUTO:
-        requested = env_split_search()
-    if requested == SPLIT_SEARCH_DEVICE:
-        return SPLIT_SEARCH_DEVICE
-    if requested == SPLIT_SEARCH_HOST:
-        return SPLIT_SEARCH_HOST
-    return resolve_split_search_for(builder, params)
+    var decision = split_search_decision_for(builder, params, strategy)
+    return (
+        SPLIT_SEARCH_DEVICE if decision.uses_device() else SPLIT_SEARCH_HOST
+    )
 
 
 # Where a round's gradients come from. DEVICE generates them on the device
@@ -804,9 +901,125 @@ def _commit_device_split(
     return children^
 
 
+struct GpuSplitSearcherCache(Movable):
+    """One `GpuSplitSearcher` held across a fit's trees instead of rebuilt
+    per tree.
+
+    What a searcher's shape depends on is the dataset and the tree budget:
+    `n_features`, `n_bins`, the missing-bin table, the categorical spec, and
+    the record capacity `_search_record_slots` derives from the growth
+    policy and the leaf budget. None of those move between the trees of one
+    fit, yet the device-search grower constructed a fresh searcher for every
+    tree. That construction is not free. Counted from the constructor: twelve
+    device buffers and six pinned host buffers, so eighteen allocations;
+    three staged table copies; three `map_to_host` mappings, each of which
+    blocks until the device is idle; and one explicit `synchronize`. The
+    `set_monotone` call the grower makes immediately afterwards is a fourth
+    mapping and a fourth hidden block. At the shipped 100-round default that
+    was 100 rebuilds of an object whose contents were about to be
+    overwritten node by node anyway.
+
+    One of those eighteen is dead weight on this path in particular.
+    `hist_dev` is `3 * n_features * n_bins` Int32, about 150 KB at 50
+    features and 255 bins, and it is read by exactly two methods,
+    `upload_histogram` and `search`, which exist so the searcher is
+    exercisable on its own. Neither device-search loop calls either: both go
+    through `enqueue`/`enqueue_frontier` against the histogram builder's own
+    buffer. Hoisting takes that allocation from once per tree to once per
+    fit; removing it outright means making it lazy inside
+    `GpuSplitSearcher`, which is a different file and a different lane.
+
+    Reuse is exact, not approximate. Every table a search reads is restaged
+    before every launch: `enqueue` and `enqueue_frontier` write each
+    record's feature slots, allow mask, float parameters, and histogram base
+    themselves, and `download` clears the base again. The only searcher
+    state that outlives a launch is the monotone vector, which is a property
+    of the fit rather than of the tree, and `reset_for_tree` restages it
+    whenever it differs from what this cache last uploaded. To make the
+    equivalence obvious rather than merely true, the reset also rebroadcasts
+    the tree's feature set to every record slot, which is the same
+    "every listed feature, all allowed" state a fresh construction leaves
+    behind and costs host stores only.
+
+    A shape mismatch rebuilds rather than raising, so a caller that reuses
+    one cache across two builders or two leaf budgets gets a correct
+    searcher and pays what it would have paid anyway.
+    """
+
+    var searchers: List[GpuSplitSearcher]
+    var n_features: Int
+    var n_bins: Int
+    var max_records: Int
+    var signs: List[Int]
+    var signs_staged: Bool
+
+    def __init__(out self):
+        """An empty cache. The first tree builds the searcher."""
+        self.searchers = List[GpuSplitSearcher]()
+        self.n_features = 0
+        self.n_bins = 0
+        self.max_records = 0
+        self.signs = List[Int]()
+        self.signs_staged = False
+
+    def _same_signs(self, signs: List[Int]) -> Bool:
+        if not self.signs_staged or len(self.signs) != len(signs):
+            return False
+        for f in range(len(signs)):
+            if self.signs[f] != signs[f]:
+                return False
+        return True
+
+    def reset_for_tree(
+        mut self,
+        mut builder: GpuHistogramBuilder,
+        params: TreeParams,
+        tree_features: List[Int],
+        signs: List[Int],
+    ) raises:
+        """Make the held searcher ready for this tree, building it only if
+        this cache holds nothing usable for the shape.
+
+        The monotone upload is skipped when the vector is the one already on
+        the device. That is the one place reuse removes work a fresh
+        searcher would still have done, and it is sound because `mono_dev`
+        is written by nothing else: `set_monotone` is its only writer, and
+        the vector comes from `params.monotone`, which does not change
+        within a fit.
+        """
+        var want_records = _search_record_slots(params, builder.n_features)
+        if (
+            len(self.searchers) == 0
+            or self.n_features != builder.n_features
+            or self.n_bins != builder.n_bins
+            or self.max_records != want_records
+        ):
+            self.searchers.clear()
+            self.searchers.append(
+                GpuSplitSearcher(
+                    builder.ctx,
+                    builder.n_features,
+                    builder.n_bins,
+                    builder.missing_bin,
+                    builder.cats,
+                    max_records=want_records,
+                )
+            )
+            self.n_features = builder.n_features
+            self.n_bins = builder.n_bins
+            self.max_records = want_records
+            self.signs_staged = False
+        if not self._same_signs(signs):
+            self.searchers[0].set_monotone(signs)
+            self.signs = signs.copy()
+            self.signs_staged = True
+        self.searchers[0].set_features(tree_features)
+
+
 def _grow_tree_gpu_device_search(
     mut profile: PhaseProfile,
     mut builder: GpuHistogramBuilder,
+    mut cache: GpuSplitSearcherCache,
     params: TreeParams,
     bag: List[Int] = [],
     tree_index: Int = 0,
@@ -867,15 +1080,9 @@ def _grow_tree_gpu_device_search(
         tree_index,
     )
     builder.set_features(tree_features)
-    var searcher = GpuSplitSearcher(
-        builder.ctx,
-        builder.n_features,
-        builder.n_bins,
-        builder.missing_bin,
-        builder.cats,
-        max_records=_search_record_slots(params, builder.n_features),
-    )
-    searcher.set_monotone(signs)
+    # Hoisted out of the per-tree loop: see `GpuSplitSearcherCache` for why
+    # a searcher may be reused and what the reset restores.
+    cache.reset_for_tree(builder, params, tree_features, signs)
     var split_params = GpuSplitParams(
         params.lambda_reg,
         params.lambda_l1,
@@ -894,7 +1101,7 @@ def _grow_tree_gpu_device_search(
         return _device_search_resident(
             profile,
             builder,
-            searcher,
+            cache.searchers[0],
             split_params,
             params,
             tree_features,
@@ -910,7 +1117,7 @@ def _grow_tree_gpu_device_search(
     # half done.
     return _device_search_incremental(
         builder,
-        searcher,
+        cache.searchers[0],
         split_params,
         params,
         tree_features,
@@ -1679,24 +1886,43 @@ def grow_tree_gpu(
     split_search: Int = SPLIT_SEARCH_AUTO,
     data: BinnedMatrix = BinnedMatrix(List[UInt8](), 0, 0, 0),
 ) raises -> Tree:
-    """`grow_tree_gpu_profiled` with a profile of its own, reported per tree.
+    """`grow_tree_gpu` for a caller that grows one tree and keeps nothing.
 
-    The signature that shipped, unchanged, and the entry point every caller
-    that does not accumulate a profile across a fit uses. With
-    `MOJOTREES_PHASE_PROFILE` unset -- the default -- this costs one `getenv`
-    and one bucket allocation per tree, prints nothing, and grows exactly the
-    tree it grew before the instrument existed. With it set, one `scope=tree`
-    block is printed per tree; `_train_gpu_rounds` owns a `PhaseProfile`
-    across the whole fit and calls the profiled form instead, which is why a
-    `train_gpu` run reports one block and a direct `grow_tree_gpu` caller
-    reports one per tree.
+    The signature that shipped, unchanged. It owns both of the things a
+    boosting loop would rather own itself: a searcher cache, which lives for
+    exactly this call so the device-search path builds and tears down a
+    searcher as it always did, and a phase profile, which reports one
+    `scope=tree` block. `_train_gpu_rounds` holds both across a whole fit and
+    calls `grow_tree_gpu_profiled` directly, which is why a `train_gpu` run
+    reports one table and a direct caller reports one per tree.
 
-    A `mut` argument cannot be defaulted, which is why the profile is a second
-    entry point rather than a defaulted parameter.
+    Neither is a defaulted parameter, because a `mut` argument cannot be
+    defaulted. Hence the chain of three entry points rather than one with
+    optional arguments. The two paths differ in nothing a tree can observe.
+    """
+    var cache = GpuSplitSearcherCache()
+    return grow_tree_gpu(
+        builder, cache, params, bag, tree_index, split_search, data=data
+    )
+
+
+def grow_tree_gpu(
+    mut builder: GpuHistogramBuilder,
+    mut cache: GpuSplitSearcherCache,
+    params: TreeParams,
+    bag: List[Int] = [],
+    tree_index: Int = 0,
+    split_search: Int = SPLIT_SEARCH_AUTO,
+    data: BinnedMatrix = BinnedMatrix(List[UInt8](), 0, 0, 0),
+) raises -> Tree:
+    """`grow_tree_gpu` with a caller-owned searcher cache, profiled per tree.
+
+    The overload a loop takes when it wants the searcher to outlive the tree
+    but does not accumulate a profile across the fit.
     """
     var profile = PhaseProfile.from_env(SCOPE_TREE, String("grow_tree_gpu"))
     var tree = grow_tree_gpu_profiled(
-        profile, builder, params, bag, tree_index, split_search, data
+        profile, builder, cache, params, bag, tree_index, split_search, data
     )
     profile.print_report()
     return tree^
@@ -1705,6 +1931,7 @@ def grow_tree_gpu(
 def grow_tree_gpu_profiled(
     mut profile: PhaseProfile,
     mut builder: GpuHistogramBuilder,
+    mut cache: GpuSplitSearcherCache,
     params: TreeParams,
     bag: List[Int] = [],
     tree_index: Int = 0,
@@ -1766,12 +1993,17 @@ def grow_tree_gpu_profiled(
     hybrid_leaf_scheduler.mojo). The default is an empty matrix, under which
     hybrid scheduling stays off and this grower is exactly the pure-device
     one — as it also is whenever the environment does not opt in."""
-    if (
-        resolve_split_search_for(builder, params, split_search)
-        == SPLIT_SEARCH_DEVICE
-    ):
+    # Resolved once, kept whole, and printed under trace. The reason, the
+    # normalized work, the threshold, and whether the workload sits exactly
+    # on the crossover are the only record of why this fit is taking the
+    # path it is taking, and they used to be discarded on the line that
+    # computed them.
+    var decision = split_search_decision_for(builder, params, split_search)
+    if split_trace_enabled():
+        print("split_trace tree", tree_index, decision.describe())
+    if decision.uses_device():
         return _grow_tree_gpu_device_search(
-            profile, builder, params, bag, tree_index
+            profile, builder, cache, params, bag, tree_index
         )
     check_grow_policy(params.grow_policy)
     params.constraints.check_features(builder.n_features)
@@ -2445,6 +2677,12 @@ def _train_gpu_rounds[
         # otherwise, and an off profile reads no clock and writes no counter,
         # so the ensemble is the same ensemble either way.
         var profile = PhaseProfile.from_env(SCOPE_FIT, String("train_gpu"))
+        # One searcher for the fit, not one per tree. Its shape comes from
+        # the builder and the tree budget, neither of which moves between the
+        # rounds below; `GpuSplitSearcherCache` states what the per-tree reset
+        # restores and why reuse cannot change a tree. Stays empty, and
+        # allocates nothing, on the host-search path.
+        var searcher_cache = GpuSplitSearcherCache()
 
         # Built-in objectives without row sampling generate their gradients
         # on the device and advance the raw scores there too, so a round
@@ -2488,7 +2726,13 @@ def _train_gpu_rounds[
                 profile.note_wall(dev_grad_started)
                 life.begin_tree()
                 var tree = grow_tree_gpu_profiled(
-                    profile, builder, params.tree, dev_bag, i, split_search,
+                    profile,
+                    builder,
+                    searcher_cache,
+                    params.tree,
+                    dev_bag,
+                    i,
+                    split_search,
                     data=data,
                 )
                 life.end_tree()
@@ -2566,7 +2810,14 @@ def _train_gpu_rounds[
             profile.note_wall(pre_started)
             life.begin_tree()
             var tree = grow_tree_gpu_profiled(
-                profile, builder, params.tree, bag, i, split_search, data=data
+                profile,
+                builder,
+                searcher_cache,
+                params.tree,
+                bag,
+                i,
+                split_search,
+                data=data,
             )
             life.end_tree()
             var post_started = profile.clock()
@@ -2778,6 +3029,12 @@ def _train_custom_gpu_rounds[
             raw.append(base_score)
 
         var trees = List[Tree]()
+        # One searcher for the fit, not one per tree. Its shape comes from
+        # the builder and the tree budget, neither of which moves between the
+        # rounds below; `GpuSplitSearcherCache` states what the per-tree reset
+        # restores and why reuse cannot change a tree. Stays empty, and
+        # allocates nothing, on the host-search path.
+        var searcher_cache = GpuSplitSearcherCache()
         var grad = List[Float64](capacity=n)
         var hess = List[Float64](capacity=n)
         for i in range(params.n_estimators):
@@ -2788,7 +3045,13 @@ def _train_custom_gpu_rounds[
             builder.upload_gradients(grad, hess)
             life.begin_tree()
             var tree = grow_tree_gpu(
-                builder, params.tree, [], i, split_search, data=data
+                builder,
+                searcher_cache,
+                params.tree,
+                [],
+                i,
+                split_search,
+                data=data,
             )
             life.end_tree()
 
@@ -2973,6 +3236,12 @@ def _train_multiclass_gpu_batched[
         raise Error("GPU training requires an accelerator")
     else:
         var trees = List[Tree]()
+        # One searcher for the fit, not one per tree. Its shape comes from
+        # the builder and the tree budget, neither of which moves between the
+        # rounds below; `GpuSplitSearcherCache` states what the per-tree reset
+        # restores and why reuse cannot change a tree. Stays empty, and
+        # allocates nothing, on the host-search path.
+        var searcher_cache = GpuSplitSearcherCache()
         var plan = schedule.batches.copy()
         var batch = GpuClassBatch.for_plan(
             builder.ctx,
@@ -3006,6 +3275,7 @@ def _train_multiclass_gpu_batched[
                     life.begin_tree()
                     var tree = grow_tree_gpu(
                         builder,
+                        searcher_cache,
                         params.tree,
                         [],
                         i * n_classes + k,
@@ -3073,6 +3343,12 @@ def _train_multiclass_gpu_rounds[
     else:
         var n = data.n_rows
         var trees = List[Tree]()
+        # One searcher for the fit, not one per tree. Its shape comes from
+        # the builder and the tree budget, neither of which moves between the
+        # rounds below; `GpuSplitSearcherCache` states what the per-tree reset
+        # restores and why reuse cannot change a tree. Stays empty, and
+        # allocates nothing, on the host-search path.
+        var searcher_cache = GpuSplitSearcherCache()
 
         # Softmax without row sampling runs the whole objective on the
         # device: probabilities refresh once per round, each class's
@@ -3132,6 +3408,7 @@ def _train_multiclass_gpu_rounds[
                     life.begin_tree()
                     var tree = grow_tree_gpu(
                         builder,
+                        searcher_cache,
                         params.tree,
                         [],
                         i * n_classes + k,
@@ -3217,6 +3494,7 @@ def _train_multiclass_gpu_rounds[
                 life.begin_tree()
                 var tree = grow_tree_gpu(
                     builder,
+                    searcher_cache,
                     params.tree,
                     bag,
                     i * n_classes + k,
@@ -3653,6 +3931,12 @@ def _train_gpu_valid_rounds[
         var renew_w = renewal_weights(objective, target, sample_weight)
         var renew_a = renewal_alpha(objective, alpha)
         var trees = List[Tree]()
+        # One searcher for the fit, not one per tree. Its shape comes from
+        # the builder and the tree budget, neither of which moves between the
+        # rounds below; `GpuSplitSearcherCache` states what the per-tree reset
+        # restores and why reuse cannot change a tree. Stays empty, and
+        # allocates nothing, on the host-search path.
+        var searcher_cache = GpuSplitSearcherCache()
         var grad = List[Float64](capacity=n)
         var hess = List[Float64](capacity=n)
         # The base-score-only model is the run's incumbent, exactly as it is on
@@ -3668,7 +3952,13 @@ def _train_gpu_valid_rounds[
             goss_round(bag, grad, hess, goss, i, params.learning_rate)
             builder.upload_gradients(grad, hess)
             var tree = grow_tree_gpu(
-                builder, params.tree, bag, i, split_search, data=data
+                builder,
+                searcher_cache,
+                params.tree,
+                bag,
+                i,
+                split_search,
+                data=data,
             )
             if renews:
                 _renew_leaf_values(
