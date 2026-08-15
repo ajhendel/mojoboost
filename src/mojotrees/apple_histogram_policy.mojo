@@ -122,6 +122,7 @@ from .apple_gpu_policy import (
     MAX_RESIDENT_BLOCKS_PER_CORE,
     GpuProfile,
     partial_budget_bytes,
+    resident_blocks_for_bytes,
     shape_block_threads,
 )
 from .gpu_histogram_specializations import (
@@ -415,25 +416,21 @@ def kernel_block_bytes(features: KernelFeatures, capacity: Int) -> Int:
     return unspecialized_kernel_shared_bytes()
 
 
-def resident_blocks_per_core(
+def resident_blocks_for_kernel(
     profile: GpuProfile, features: KernelFeatures, capacity: Int
 ) raises -> Int:
     """Threadgroups the policy expects resident on one core: how many really
     fit in the advertised threadgroup memory, capped at
     `MAX_RESIDENT_BLOCKS_PER_CORE` and floored at one.
 
-    Same rule as `apple_gpu_policy.resident_blocks_per_core`, against the
-    footprint the compiled kernel has instead of the modeled one.
+    `apple_gpu_policy.resident_blocks_for_bytes`, the one residency rule,
+    against the footprint the compiled kernel has instead of the modeled
+    one that `apple_gpu_policy.resident_blocks_per_core` uses.
     """
     var per_block = kernel_block_bytes(features, capacity)
     if per_block < 1:
         raise Error("a histogram block occupies a positive number of bytes")
-    var fits = profile.max_shared_memory_per_block // per_block
-    if fits > MAX_RESIDENT_BLOCKS_PER_CORE:
-        fits = MAX_RESIDENT_BLOCKS_PER_CORE
-    if fits < 1:
-        fits = 1
-    return fits
+    return resident_blocks_for_bytes(profile, per_block)
 
 
 def baseline_partial_cell_limit(max_partial_cells: Int) -> Int:
@@ -576,7 +573,7 @@ def derive_histogram_plan(
             profile, max_partial_cells
         )
         block_threads = _shape_block_threads(profile, rows)
-        resident = resident_blocks_per_core(profile, features, capacity)
+        resident = resident_blocks_for_kernel(profile, features, capacity)
         block_bytes = kernel_block_bytes(features, capacity)
 
         # The same tile arithmetic the baseline runs, over the three bounds

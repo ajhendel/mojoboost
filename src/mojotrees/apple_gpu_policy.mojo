@@ -440,24 +440,39 @@ def partial_budget_bytes(profile: GpuProfile) -> Int:
     return bytes
 
 
-def resident_blocks_per_core(profile: GpuProfile, n_bins: Int) raises -> Int:
-    """Threadgroups the policy expects to be resident on one core.
+def resident_blocks_for_bytes(profile: GpuProfile, per_block: Int) raises -> Int:
+    """Threadgroups the policy expects to be resident on one core, for a
+    block that occupies `per_block` bytes of threadgroup memory.
 
-    Bounded by the thing that actually limits residency and is reported:
-    how many `n_bins`-wide partial histograms fit in the advertised
-    threadgroup memory. Capped at `MAX_RESIDENT_BLOCKS_PER_CORE` so a narrow
+    The one residency rule: how many such blocks fit in the advertised
+    threadgroup memory, capped at `MAX_RESIDENT_BLOCKS_PER_CORE` so a narrow
     histogram does not ask for unbounded residency, and floored at one so a
-    histogram that only just fits still gets a block.
+    block that only just fits still gets scheduled. `resident_blocks_per_core`
+    below applies it to the modeled `n_bins * BYTES_PER_PARTIAL_CELL`
+    footprint; `apple_histogram_policy.resident_blocks_for_kernel` applies
+    it to the footprint the compiled kernel really has.
     """
-    var per_block = shared_bytes_for_bins(n_bins)
     if per_block < 1:
-        raise Error("histogram needs a positive bin count")
+        raise Error("a histogram block occupies a positive number of bytes")
     var fits = profile.max_shared_memory_per_block // per_block
     if fits > MAX_RESIDENT_BLOCKS_PER_CORE:
         fits = MAX_RESIDENT_BLOCKS_PER_CORE
     if fits < 1:
         fits = 1
     return fits
+
+
+def resident_blocks_per_core(profile: GpuProfile, n_bins: Int) raises -> Int:
+    """Threadgroups the policy expects to be resident on one core.
+
+    Bounded by the thing that actually limits residency and is reported:
+    how many `n_bins`-wide partial histograms fit in the advertised
+    threadgroup memory. `resident_blocks_for_bytes` over the modeled
+    per-block footprint.
+    """
+    if n_bins < 1:
+        raise Error("histogram needs a positive bin count")
+    return resident_blocks_for_bytes(profile, shared_bytes_for_bins(n_bins))
 
 
 def shape_block_threads(profile: GpuProfile, n_rows: Int) -> Int:
