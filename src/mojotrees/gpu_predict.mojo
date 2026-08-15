@@ -109,6 +109,7 @@ from .gpu_runtime import (
     bins_fingerprint,
 )
 from .gpu_tiling import DeviceCaps, derive_block_threads, query_device_caps
+from .linear_tree import check_linear_tree_unconnected
 from .metrics import (
     METRIC_BINARY_ERROR as HOST_METRIC_BINARY_ERROR,
     METRIC_BINARY_LOGLOSS as HOST_METRIC_BINARY_LOGLOSS,
@@ -868,7 +869,11 @@ def flatten_trees(
 
 
 def flatten_booster(booster: Booster) raises -> FlatEnsemble:
-    """Flatten a fitted single-output ensemble."""
+    """Flatten a fitted single-output ensemble. A booster with linear
+    leaves is refused: the kernel reads `Tree.value` only and would predict
+    the constant fallback (linear_tree.mojo)."""
+    if booster.linear.is_active():
+        check_linear_tree_unconnected("GPU prediction")
     var base: List[Float64] = [booster.base_score]
     return flatten_trees(booster.trees, base, 1, booster.learning_rate)
 
@@ -876,6 +881,8 @@ def flatten_booster(booster: Booster) raises -> FlatEnsemble:
 def flatten_multiclass(booster: MulticlassBooster) raises -> FlatEnsemble:
     """Flatten a fitted softmax ensemble. `MulticlassBooster` already stores
     its trees round-major, which is the layout the kernel expects."""
+    if booster.linear.is_active():
+        check_linear_tree_unconnected("GPU prediction")
     return flatten_trees(
         booster.trees,
         booster.base_scores,

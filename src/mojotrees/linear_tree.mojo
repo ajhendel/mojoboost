@@ -379,10 +379,15 @@ comptime LINEAR_MODEL_FORMAT_VERSION = 5
 comptime LINEAR_SECTION_TAG = "linear"
 comptime LINEAR_SECTION_REVISION = 1
 
-# Whether the feature is reachable from a public entry point. It is not, and
-# `check_linear_tree_public` is what says so. Flipping this constant is not
-# what makes the feature real; the handoff's patches are.
-comptime LINEAR_TREE_PUBLIC = False
+# Whether the feature is reachable from a public entry point. It is, since
+# the integration round of 2026-08-15: `Booster` and `MulticlassBooster`
+# carry a `linear` sidecar, `custom_metric.train_with_callbacks` and
+# `train_multiclass_with_metrics` fit it one tree at a time from the raw
+# matrix, `model.Model` / `MulticlassModel` predict through it,
+# `serialize.mojo` writes and reads the v5 `linear` section, and
+# `BoosterParams.linear` (LightGBM's `linear_tree` / `linear_lambda`) is the
+# switch. `check_linear_tree_public` still names what is *not* connected.
+comptime LINEAR_TREE_PUBLIC = True
 
 # A column whose in-leaf hessian-weighted variance is at or below this
 # fraction of its mean-square is treated as constant on the leaf and dropped
@@ -990,6 +995,8 @@ def check_linear_tree_public() raises:
     """
     if LINEAR_TREE_PUBLIC:
         return
+    # Kept as the record of what the connection took; every item below
+    # landed except the three named in `check_linear_tree_unconnected`.
     raise Error(
         "linear trees are implemented but not connected. The algorithm core"
         " (linear_tree.mojo) fits, predicts, validates, and serializes"
@@ -1007,9 +1014,90 @@ def check_linear_tree_public() raises:
 
 
 def linear_tree_available() -> Bool:
-    """Whether a public caller can ask for linear trees. False, and it stays
-    False until the handoff's patches land."""
+    """Whether a public caller can ask for linear trees."""
     return LINEAR_TREE_PUBLIC
+
+
+def check_linear_tree_unconnected(what: String) raises:
+    """Raise for the consumers that still cannot evaluate a linear leaf.
+
+    Called by `boosting.train` / `train_more` (they take a binned matrix and
+    no raw one), by the ranking trainers (`check_objective_compatible`
+    refuses LAMBDARANK anyway), by `contrib.mojo` (TreeSHAP over an affine
+    leaf is not the constant-leaf algorithm), and by `gpu_predict.mojo` (the
+    kernel reads `Tree.value` only). Each says which raw-feature entry point
+    to use instead. `what` names the caller.
+    """
+    raise Error(
+        "linear trees are not supported by ",
+        what,
+        ": the linear leaves need the raw feature matrix, which this entry"
+        " point does not take. Train and predict through model.fit /"
+        " custom_metric.fit_with_metrics and Model.predict*, or leave"
+        " linear_tree off",
+    )
+
+
+def add_tree_scores(
+    mut scores: List[Float64],
+    tree: Tree,
+    entry: LinearTree,
+    data: BinnedMatrix,
+    raw: List[Float64],
+    step: Float64,
+    stride: Int = 1,
+    offset: Int = 0,
+) raises:
+    """`scores[r * stride + offset] += step * leaf(r)` for every row of
+    `data`, through the linear leaves in `entry`.
+
+    This is the boosting loop's per-round update. With an inactive `entry`
+    it is exactly `step * tree.predict_row(data, r)`, the constant-leaf
+    update, so the constant path is untouched. `raw` is the column-major raw
+    matrix `data` was binned from; it is read only when `entry` is active.
+    `stride` and `offset` address the softmax trainer's row-major
+    `[row * n_classes + class]` score layout; the defaults are one score per
+    row.
+    """
+    if stride < 1 or offset < 0 or offset >= stride:
+        raise Error("linear update: bad stride or offset")
+    if len(scores) != data.n_rows * stride:
+        raise Error("linear update: scores must have stride entries per row")
+    if not entry.is_active():
+        for r in range(data.n_rows):
+            scores[r * stride + offset] += step * tree.predict_row(data, r)
+        return
+    if len(raw) != data.n_rows * data.n_features:
+        raise Error(
+            "linear update: raw matrix has ",
+            len(raw),
+            " values for ",
+            data.n_rows,
+            " rows and ",
+            data.n_features,
+            " features",
+        )
+    entry.check_against(tree)
+    var ordinals = tree.leaf_ordinals()
+    for r in range(data.n_rows):
+        var node = tree.leaf_index_row(data, r)
+        scores[r * stride + offset] += step * entry.leaf[
+            ordinals[node]
+        ].predict_column_major(raw, data.n_rows, r)
+
+
+def scale_linear_tree(mut entry: LinearTree, factor: Float64):
+    """Multiply one tree's linear leaves by `factor`, intercepts and
+    coefficients together; the per-tree form of `LinearEnsemble.scale`, for a
+    tree that has not been appended to the sidecar yet. A factor of exactly
+    1.0 leaves the entry bit-identical."""
+    if factor == 1.0:
+        return
+    for o in range(len(entry.leaf)):
+        ref lf = entry.leaf[o]
+        lf.intercept = lf.intercept * factor
+        for j in range(len(lf.coef)):
+            lf.coef[j] = lf.coef[j] * factor
 
 
 # ---------------------------------------------------------------------------

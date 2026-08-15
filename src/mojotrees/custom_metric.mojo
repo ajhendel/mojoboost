@@ -188,6 +188,15 @@ from .boosting import (
     renewal_weights,
 )
 from .goss import GossParams, GossSelection, apply_goss_scaling, goss_round
+from .linear_tree import (
+    LinearEnsemble,
+    LinearTree,
+    add_tree_scores,
+    check_monotone_compatible,
+    check_objective_compatible,
+    refit_linear_tree,
+    scale_linear_tree,
+)
 from .metrics import (
     METRIC_MAP,
     METRIC_MULTI_ERROR,
@@ -288,13 +297,31 @@ struct CustomMetric(Copyable, Movable, Writable):
         self.write_to(writer)
 
 
-@fieldwise_init
 struct ValidSet(Copyable, Movable):
-    """A named validation set of pre-binned features and labels."""
+    """A named validation set of pre-binned features and labels.
+
+    `raw` is the column-major raw matrix `data` was binned from, kept only
+    when the run fits linear leaves (`BoosterParams.linear`), which are
+    evaluated on raw values; empty otherwise, and empty is what every
+    constant-leaf run passes.
+    """
 
     var name: String
     var data: BinnedMatrix
     var target: List[Float64]
+    var raw: List[Float64]
+
+    def __init__(
+        out self,
+        var name: String,
+        var data: BinnedMatrix,
+        var target: List[Float64],
+        var raw: List[Float64] = [],
+    ):
+        self.name = name^
+        self.data = data^
+        self.target = target^
+        self.raw = raw^
 
 
 @fieldwise_init
@@ -898,17 +925,56 @@ def _base_scores(valid_sets: List[ValidSet], base: Float64) -> List[
     return out^
 
 
+def _check_linear_run(
+    params: BoosterParams,
+    objective: Int,
+    data: BinnedMatrix,
+    raw_features: List[Float64],
+    valid_sets: List[ValidSet],
+) raises:
+    """Everything a linear-leaf run must satisfy before its first tree:
+    finite parameters, a compatible objective and constraint set, and the raw
+    matrices the leaves are fitted and evaluated on."""
+    params.linear.check()
+    check_objective_compatible(objective)
+    check_monotone_compatible(params.tree.monotone)
+    if len(raw_features) != data.n_rows * data.n_features:
+        raise Error(
+            "linear_tree needs the raw feature matrix beside the binned one;"
+            " train through fit_with_metrics / fit_with_callbacks (or"
+            " model.fit), which keep it, rather than a binned-only entry"
+            " point"
+        )
+    for v in range(len(valid_sets)):
+        if len(valid_sets[v].raw) != (
+            valid_sets[v].data.n_rows * valid_sets[v].data.n_features
+        ):
+            raise Error(
+                String(
+                    "linear_tree: validation set ",
+                    valid_sets[v].name,
+                    " has no raw feature matrix to evaluate linear leaves"
+                    " on",
+                )
+            )
+
+
 def _update_valid_raw(
     mut valid_raw: List[List[Float64]],
     valid_sets: List[ValidSet],
     tree: Tree,
     learning_rate: Float64,
-):
+    entry: LinearTree = LinearTree.constant(),
+) raises:
     for v in range(len(valid_sets)):
-        for r in range(valid_sets[v].data.n_rows):
-            valid_raw[v][r] += (
-                learning_rate * tree.predict_row(valid_sets[v].data, r)
-            )
+        add_tree_scores(
+            valid_raw[v],
+            tree,
+            entry,
+            valid_sets[v].data,
+            valid_sets[v].raw,
+            learning_rate,
+        )
 
 
 def _eval_round[F: MetricSetFn & Copyable](
@@ -1014,8 +1080,15 @@ def train_with_callbacks[
     alpha: Float64 = 0.9,
     bagging: BaggingParams = BaggingParams.disabled(),
     goss: GossParams = GossParams.disabled(),
+    raw_features: List[Float64] = [],
 ) raises -> MetricTrainResult:
     """`train_with_metrics` with a per-iteration callback.
+
+    `raw_features` is the column-major raw matrix `data` was binned from and
+    is required only when `params.linear` asks for linear leaves
+    (linear_tree.mojo); it is what those leaves are fitted on and evaluated
+    against. Every constant-leaf run passes nothing and takes exactly the
+    path it took before linear trees existed.
 
     `callback` runs twice per round, before the tree is grown and after the
     metrics are scored, and can steer the run: change the next round's
@@ -1038,6 +1111,10 @@ def train_with_callbacks[
     _check_early_stopping(metrics.metrics, early_stopping_rounds, min_delta)
 
     var n = data.n_rows
+    var linear_active = params.linear.is_active()
+    if linear_active:
+        _check_linear_run(params, objective, data, raw_features, valid_sets)
+    var linear_trees = List[LinearTree]()
     var base_score = _base_score(target, objective, sample_weight, alpha)
     var raw = List[Float64](capacity=n)
     for _ in range(n):
@@ -1093,6 +1170,8 @@ def train_with_callbacks[
         if not baked and lr != lr0:
             for t in range(len(trees)):
                 scale_tree_values(trees[t], lr0)
+                if linear_active:
+                    scale_linear_tree(linear_trees[t], lr0)
             baked = True
 
         refresh_bag(bag, bagging, n, i)
@@ -1105,6 +1184,15 @@ def train_with_callbacks[
             _renew_leaf_values(
                 tree, data, target, raw, renew_w, renew_a, bag, signs,
                 current.tree.extra,
+            )
+        # The linear leaves are fitted from the same rows, gradients, and
+        # hessians the tree was grown on, after growth (linear_tree.mojo,
+        # "The algorithm"). An inactive configuration yields a constant
+        # entry and the update below is the constant-leaf one.
+        var entry = LinearTree.constant()
+        if linear_active:
+            entry = refit_linear_tree(
+                tree, data, raw_features, grad, hess, params.linear, bag
             )
         # Under bagging or GOSS a degenerate tree indicts the sample, not
         # the run, exactly as in train_with_valid. Tested before any
@@ -1120,11 +1208,12 @@ def train_with_callbacks[
         var step = lr0
         if baked:
             scale_tree_values(tree, lr)
+            scale_linear_tree(entry, lr)
             step = 1.0
-        for r in range(n):
-            raw[r] += step * tree.predict_row(data, r)
-        _update_valid_raw(valid_raw, valid_sets, tree, step)
+        add_tree_scores(raw, tree, entry, data, raw_features, step)
+        _update_valid_raw(valid_raw, valid_sets, tree, step, entry)
         trees.append(tree^)
+        linear_trees.append(entry^)
 
         var round = len(trees)
         _eval_round(metrics, valid_sets, valid_raw, round, history)
@@ -1162,6 +1251,10 @@ def train_with_callbacks[
     if early_stopping_rounds > 0 or callback_stopped:
         while len(trees) > best:
             _ = trees.pop()
+            _ = linear_trees.pop()
+    var linear = LinearEnsemble.inactive()
+    if linear_active:
+        linear = LinearEnsemble(linear_trees^, data.n_features)
     return MetricTrainResult(
         Booster(
             trees^,
@@ -1169,6 +1262,7 @@ def train_with_callbacks[
             1.0 if baked else lr0,
             objective,
             params.tree.monotone.copy(),
+            linear^,
         ),
         history^,
         best,
@@ -1190,6 +1284,7 @@ def train_with_metrics[F: MetricSetFn & Copyable](
     alpha: Float64 = 0.9,
     bagging: BaggingParams = BaggingParams.disabled(),
     goss: GossParams = GossParams.disabled(),
+    raw_features: List[Float64] = [],
 ) raises -> MetricTrainResult:
     """Train a built-in objective while scoring caller-supplied metrics.
 
@@ -1216,6 +1311,7 @@ def train_with_metrics[F: MetricSetFn & Copyable](
         alpha,
         bagging,
         goss,
+        raw_features,
     )
 
 
@@ -1714,7 +1810,8 @@ def fit_with_callbacks[
         categorical_features=categorical_features,
     )
     var data = mapper.transform(features, n_rows)
-    var binned = _bin_valid_sets(mapper, valid_sets, n_features)
+    var keep_raw = params.linear.is_active()
+    var binned = _bin_valid_sets(mapper, valid_sets, n_features, keep_raw)
     var result = train_with_callbacks(
         data,
         target,
@@ -1729,6 +1826,7 @@ def fit_with_callbacks[
         alpha,
         bagging,
         goss,
+        _raw_copy(features, keep_raw),
     )
     return MetricFitResult(
         Model(mapper^, result.booster.copy()),
@@ -1882,12 +1980,19 @@ def _update_multiclass_valid_raw(
     learning_rate: Float64,
     n_classes: Int,
     k: Int,
-):
+    entry: LinearTree = LinearTree.constant(),
+) raises:
     for v in range(len(valid_sets)):
-        for r in range(valid_sets[v].data.n_rows):
-            valid_raw[v][r * n_classes + k] += (
-                learning_rate * tree.predict_row(valid_sets[v].data, r)
-            )
+        add_tree_scores(
+            valid_raw[v],
+            tree,
+            entry,
+            valid_sets[v].data,
+            valid_sets[v].raw,
+            learning_rate,
+            n_classes,
+            k,
+        )
 
 
 def train_multiclass_with_metrics[F: MetricSetFn & Copyable](
@@ -1902,6 +2007,7 @@ def train_multiclass_with_metrics[F: MetricSetFn & Copyable](
     sample_weight: List[Float64] = [],
     bagging: BaggingParams = BaggingParams.disabled(),
     goss: GossParams = GossParams.disabled(),
+    raw_features: List[Float64] = [],
 ) raises -> MetricMulticlassTrainResult:
     """Train a softmax ensemble while scoring caller-supplied metrics.
 
@@ -1932,6 +2038,10 @@ def train_multiclass_with_metrics[F: MetricSetFn & Copyable](
 
     var n = data.n_rows
     var base_scores = _multiclass_base_scores(labels, n_classes, sample_weight)
+    var linear_active = params.linear.is_active()
+    if linear_active:
+        _check_linear_run(params, MULTICLASS, data, raw_features, valid_sets)
+    var linear_trees = List[LinearTree]()
     var raw = List[Float64](capacity=n * n_classes)
     for _ in range(n):
         for k in range(n_classes):
@@ -1970,6 +2080,7 @@ def train_multiclass_with_metrics[F: MetricSetFn & Copyable](
 
         var made_progress = False
         var round_trees = List[Tree]()
+        var round_linear = List[LinearTree]()
         for k in range(n_classes):
             _fill_softmax_grad_hess(
                 prob, labels, k, n_classes, sample_weight, grad, hess
@@ -1980,7 +2091,15 @@ def train_multiclass_with_metrics[F: MetricSetFn & Copyable](
             )
             if tree.n_leaves > 1 or abs(tree.value[0]) >= 1e-12:
                 made_progress = True
+            # Each class's leaves are fitted from that class's own gradients
+            # and hessians (linear_tree.mojo, "Multiclass").
+            var entry = LinearTree.constant()
+            if linear_active:
+                entry = refit_linear_tree(
+                    tree, data, raw_features, grad, hess, params.linear, bag
+                )
             round_trees.append(tree^)
+            round_linear.append(entry^)
 
         # A round that moved nothing indicts this sample under bagging or
         # GOSS and the run otherwise, exactly as in train_multiclass. The
@@ -1992,10 +2111,16 @@ def train_multiclass_with_metrics[F: MetricSetFn & Copyable](
             break
 
         for k in range(n_classes):
-            for r in range(n):
-                raw[r * n_classes + k] += (
-                    params.learning_rate * round_trees[k].predict_row(data, r)
-                )
+            add_tree_scores(
+                raw,
+                round_trees[k],
+                round_linear[k],
+                data,
+                raw_features,
+                params.learning_rate,
+                n_classes,
+                k,
+            )
             _update_multiclass_valid_raw(
                 valid_raw,
                 valid_sets,
@@ -2003,8 +2128,10 @@ def train_multiclass_with_metrics[F: MetricSetFn & Copyable](
                 params.learning_rate,
                 n_classes,
                 k,
+                round_linear[k],
             )
             trees.append(round_trees[k].copy())
+            linear_trees.append(round_linear[k].copy())
         n_rounds += 1
 
         _eval_round(metrics, valid_sets, valid_raw, n_rounds, history)
@@ -2020,6 +2147,10 @@ def train_multiclass_with_metrics[F: MetricSetFn & Copyable](
     if early_stopping_rounds > 0:
         while len(trees) > best * n_classes:
             _ = trees.pop()
+            _ = linear_trees.pop()
+    var linear = LinearEnsemble.inactive()
+    if linear_active:
+        linear = LinearEnsemble(linear_trees^, data.n_features)
     return MetricMulticlassTrainResult(
         MulticlassBooster(
             trees^,
@@ -2027,6 +2158,7 @@ def train_multiclass_with_metrics[F: MetricSetFn & Copyable](
             n_classes,
             params.learning_rate,
             params.tree.monotone.copy(),
+            linear^,
         ),
         history^,
         best,
@@ -2048,7 +2180,10 @@ def train_ranker_with_metrics[F: MetricSetFn & Copyable](
     sample_weight: List[Float64] = [],
     bagging: BaggingParams = BaggingParams.disabled(),
 ) raises -> MetricTrainResult:
-    """Train a LambdaRank ensemble while scoring caller-supplied metrics.
+    """
+    if params.linear.is_active():
+        check_objective_compatible(LAMBDARANK)
+Train a LambdaRank ensemble while scoring caller-supplied metrics.
 
     Same training contract as `train_ranker_with_valid` (base score 0,
     query-wise bagging, weights on training rows only); the difference is
@@ -2153,13 +2288,30 @@ def train_ranker_with_metrics[F: MetricSetFn & Copyable](
     )
 
 
+def _raw_copy[
+    features_origin: ImmOrigin, //
+](features: Span[Float64, features_origin], keep: Bool) -> List[Float64]:
+    """The raw matrix as a list when a linear-leaf run needs it beside the
+    binned one, and an empty list otherwise, so a constant-leaf run pays no
+    copy."""
+    var out = List[Float64]()
+    if not keep:
+        return out^
+    out = List[Float64](capacity=len(features))
+    for i in range(len(features)):
+        out.append(features[i])
+    return out^
+
+
 def _bin_valid_sets(
     mapper: BinMapper,
     valid_sets: List[RawValidSet],
     n_features: Int,
+    keep_raw: Bool = False,
 ) raises -> List[ValidSet]:
     """Bin every raw validation set with the mapper fitted on the training
-    data, which is what a deployed model would do to them."""
+    data, which is what a deployed model would do to them. `keep_raw` keeps
+    each set's raw matrix on the `ValidSet` for a linear-leaf run."""
     var binned = List[ValidSet]()
     for v in range(len(valid_sets)):
         if len(valid_sets[v].features) != valid_sets[v].n_rows * n_features:
@@ -2170,11 +2322,15 @@ def _bin_valid_sets(
                     " must have n_rows * n_features feature values",
                 )
             )
+        var raw = List[Float64]()
+        if keep_raw:
+            raw = valid_sets[v].features.copy()
         binned.append(
             ValidSet(
                 valid_sets[v].name,
                 mapper.transform(valid_sets[v].features, valid_sets[v].n_rows),
                 valid_sets[v].target.copy(),
+                raw^,
             )
         )
     return binned^
@@ -2212,7 +2368,8 @@ def fit_multiclass_with_metrics[
         categorical_features=categorical_features,
     )
     var data = mapper.transform(features, n_rows)
-    var binned = _bin_valid_sets(mapper, valid_sets, n_features)
+    var keep_raw = params.linear.is_active()
+    var binned = _bin_valid_sets(mapper, valid_sets, n_features, keep_raw)
     var result = train_multiclass_with_metrics(
         data,
         labels,
@@ -2225,6 +2382,7 @@ def fit_multiclass_with_metrics[
         sample_weight,
         bagging,
         goss,
+        _raw_copy(features, keep_raw),
     )
     return MetricMulticlassFitResult(
         MulticlassModel(mapper^, result.booster.copy()),

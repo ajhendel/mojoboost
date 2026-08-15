@@ -16,11 +16,18 @@ from .boosting import (
     BoosterParams,
     IterationRange,
     MulticlassBooster,
+    _softmax_inplace,
     train,
     train_multiclass,
 )
 from .device import CPU_DEVICE, GPU_DEVICE, resolve_device
 from .goss import GossParams
+from .linear_tree import (
+    check_linear_tree_unconnected,
+    predict_batch_raw,
+    predict_ensemble_raw,
+    predict_multiclass_raw,
+)
 from .gpu_predict import (
     predict_gpu,
     predict_proba_gpu,
@@ -44,11 +51,26 @@ struct Model(Copyable, Movable, Writable):
 
     def predict(self, row: List[Float64]) raises -> Float64:
         """Response-scale prediction for one raw example (length n_features)."""
-        return self.booster.predict_bins(self.mapper.bin_row(row))
+        return self.booster.response(self.predict_raw(row))
 
     def predict_raw(self, row: List[Float64]) raises -> Float64:
-        """Raw-score prediction (log-odds for BINARY_LOGISTIC)."""
-        return self.booster.predict_raw_bins(self.mapper.bin_row(row))
+        """Raw-score prediction (log-odds for BINARY_LOGISTIC).
+
+        A model with linear leaves (`Booster.linear`, linear_tree.mojo)
+        evaluates them here, on the raw row; the bins-only `Booster` methods
+        see the constant fallback. Every raw-row entry point on `Model` goes
+        through the same test, so a linear model predicts one way."""
+        var bins = self.mapper.bin_row(row)
+        if self.booster.linear.is_active():
+            return predict_ensemble_raw(
+                self.booster.trees,
+                self.booster.linear,
+                self.booster.base_score,
+                self.booster.learning_rate,
+                bins,
+                row,
+            )
+        return self.booster.predict_raw_bins(bins)
 
     def n_iterations(self) -> Int:
         """Boosting iterations the fitted ensemble kept."""
@@ -60,15 +82,25 @@ struct Model(Copyable, Movable, Writable):
         """Response-scale prediction from the boosting iterations in `rng`
         alone. See IterationRange for how the range is interpreted, including
         where the base score sits."""
-        return self.booster.predict_bins_range(self.mapper.bin_row(row), rng)
+        return self.booster.response(self.predict_raw_range(row, rng))
 
     def predict_raw_range(
         self, row: List[Float64], rng: IterationRange
     ) raises -> Float64:
         """Raw-score prediction from the iterations in `rng` alone."""
-        return self.booster.predict_raw_bins_range(
-            self.mapper.bin_row(row), rng
-        )
+        var bins = self.mapper.bin_row(row)
+        if self.booster.linear.is_active():
+            return predict_ensemble_raw(
+                self.booster.trees,
+                self.booster.linear,
+                self.booster.base_score,
+                self.booster.learning_rate,
+                bins,
+                row,
+                rng.start,
+                rng.stop,
+            )
+        return self.booster.predict_raw_bins_range(bins, rng)
 
     def leaf_indices(
         self, row: List[Float64], rng: IterationRange
@@ -103,6 +135,27 @@ struct Model(Copyable, Movable, Writable):
             device, n_rows, self.mapper.n_features, 1
         )
         var data = self.mapper.transform(features, n_rows)
+        if self.booster.linear.is_active():
+            if resolved == GPU_DEVICE:
+                check_linear_tree_unconnected("GPU prediction")
+            var raw_copy = List[Float64](capacity=len(features))
+            for i in range(len(features)):
+                raw_copy.append(features[i])
+            var raw_out = predict_batch_raw(
+                self.booster.trees,
+                self.booster.linear,
+                self.booster.base_score,
+                self.booster.learning_rate,
+                data,
+                raw_copy,
+                rng.start,
+                rng.stop,
+            )
+            if raw_score:
+                return raw_out^
+            for r in range(len(raw_out)):
+                raw_out[r] = self.booster.response(raw_out[r])
+            return raw_out^
         if resolved == GPU_DEVICE:
             if raw_score:
                 return predict_raw_gpu(self.booster, data, rng)
@@ -139,11 +192,27 @@ struct MulticlassModel(Copyable, Movable, Writable):
 
     def predict_proba(self, row: List[Float64]) raises -> List[Float64]:
         """Class probabilities for one raw example (length n_features)."""
+        if self.booster.linear.is_active():
+            var raw = self.predict_raw(row)
+            _softmax_list(raw)
+            return raw^
         return self.booster.predict_proba_bins(self.mapper.bin_row(row))
 
     def predict_raw(self, row: List[Float64]) raises -> List[Float64]:
-        """Raw per-class scores before the softmax."""
-        return self.booster.predict_raw_bins(self.mapper.bin_row(row))
+        """Raw per-class scores before the softmax. Linear leaves
+        (`MulticlassBooster.linear`) are evaluated here, on the raw row."""
+        var bins = self.mapper.bin_row(row)
+        if self.booster.linear.is_active():
+            return predict_multiclass_raw(
+                self.booster.trees,
+                self.booster.linear,
+                self.booster.base_scores,
+                self.booster.learning_rate,
+                self.booster.n_classes,
+                bins,
+                row,
+            )
+        return self.booster.predict_raw_bins(bins)
 
     def n_iterations(self) -> Int:
         """Boosting iterations the fitted ensemble kept: one iteration grows
@@ -154,6 +223,10 @@ struct MulticlassModel(Copyable, Movable, Writable):
         self, row: List[Float64], rng: IterationRange
     ) raises -> List[Float64]:
         """Class probabilities from the boosting iterations in `rng` alone."""
+        if self.booster.linear.is_active():
+            var raw = self.predict_raw_range(row, rng)
+            _softmax_list(raw)
+            return raw^
         return self.booster.predict_proba_bins_range(
             self.mapper.bin_row(row), rng
         )
@@ -162,9 +235,20 @@ struct MulticlassModel(Copyable, Movable, Writable):
         self, row: List[Float64], rng: IterationRange
     ) raises -> List[Float64]:
         """Per-class raw scores from the iterations in `rng` alone."""
-        return self.booster.predict_raw_bins_range(
-            self.mapper.bin_row(row), rng
-        )
+        var bins = self.mapper.bin_row(row)
+        if self.booster.linear.is_active():
+            return predict_multiclass_raw(
+                self.booster.trees,
+                self.booster.linear,
+                self.booster.base_scores,
+                self.booster.learning_rate,
+                self.booster.n_classes,
+                bins,
+                row,
+                rng.start,
+                rng.stop,
+            )
+        return self.booster.predict_raw_bins_range(bins, rng)
 
     def leaf_indices(
         self, row: List[Float64], rng: IterationRange
@@ -198,6 +282,9 @@ struct MulticlassModel(Copyable, Movable, Writable):
             device, n_rows, self.mapper.n_features, self.booster.n_classes
         )
         var data = self.mapper.transform(features, n_rows)
+        var linear = self.booster.linear.is_active()
+        if linear and resolved == GPU_DEVICE:
+            check_linear_tree_unconnected("GPU prediction")
         if resolved == GPU_DEVICE:
             if raw_score:
                 return predict_raw_multiclass_gpu(self.booster, data, rng)
@@ -205,12 +292,31 @@ struct MulticlassModel(Copyable, Movable, Writable):
         var n_classes = self.booster.n_classes
         var out = List[Float64](capacity=n_rows * n_classes)
         var bins = List[Int](capacity=self.mapper.n_features)
+        var row = List[Float64]()
+        if linear:
+            row.resize(self.mapper.n_features, 0.0)
         for r in range(n_rows):
             bins.clear()
             for f in range(self.mapper.n_features):
                 bins.append(Int(data.bins[f * n_rows + r]))
             var scores: List[Float64]
-            if raw_score:
+            if linear:
+                for f in range(self.mapper.n_features):
+                    row[f] = features[f * n_rows + r]
+                scores = predict_multiclass_raw(
+                    self.booster.trees,
+                    self.booster.linear,
+                    self.booster.base_scores,
+                    self.booster.learning_rate,
+                    n_classes,
+                    bins,
+                    row,
+                    rng.start,
+                    rng.stop,
+                )
+                if not raw_score:
+                    _softmax_list(scores)
+            elif raw_score:
                 scores = self.booster.predict_raw_bins_range(bins, rng)
             else:
                 scores = self.booster.predict_proba_bins_range(bins, rng)
@@ -226,6 +332,12 @@ struct MulticlassModel(Copyable, Movable, Writable):
             if raw[k] > raw[argmax]:
                 argmax = k
         return argmax
+
+
+def _softmax_list(mut scores: List[Float64]):
+    """In-place softmax over a per-class score list; the same arithmetic as
+    `boosting._softmax_inplace` on a whole list."""
+    _softmax_inplace(scores, 0, len(scores))
 
 
 def fit[
@@ -259,6 +371,14 @@ def fit[
     feature indices to treat as integer-coded categoricals: they are split by
     category set rather than by threshold, and missing, unseen, and dropped
     categories route right (see categorical.mojo)."""
+    if params.linear.is_active():
+        # The binned-only trainers under this entry point do not carry the
+        # raw matrix; the metric path does. Refusing is the rule for a
+        # parameter that would otherwise parse and do nothing.
+        check_linear_tree_unconnected(
+            "model.fit (use custom_metric.fit_with_metrics, which fits and"
+            " predicts linear leaves)"
+        )
     var backend = resolve_device(device, n_rows, n_features, 1)
     var mapper = fit_bins(
         features,
@@ -321,6 +441,10 @@ def fit_multiclass[
     same once-per-round schedule; both draw identical rows on either device.
     `use_missing` and `categorical_features` carry the same meaning as in
     `fit`."""
+    if params.linear.is_active():
+        check_linear_tree_unconnected(
+            "model.fit_multiclass (use custom_metric.fit_multiclass_with_metrics)"
+        )
     var backend = resolve_device(device, n_rows, n_features, n_classes)
     var mapper = fit_bins(
         features,
@@ -367,6 +491,8 @@ def fit_custom[
     no `device` argument, use `train_custom_gpu` on a pre-binned matrix for
     GPU tree growth. `use_missing` and `categorical_features` carry the same
     meaning as in `fit`."""
+    if params.linear.is_active():
+        check_linear_tree_unconnected("model.fit_custom")
     var mapper = fit_bins(
         features,
         n_rows,

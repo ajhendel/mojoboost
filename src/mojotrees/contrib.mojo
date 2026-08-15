@@ -64,6 +64,7 @@ feature, and each range's own contributions sum to that range's raw score.
 """
 
 from .boosting import Booster, IterationRange, MulticlassBooster
+from .linear_tree import check_linear_tree_unconnected
 from .model import Model, MulticlassModel
 from .tree import Tree
 
@@ -466,6 +467,11 @@ def predict_contrib_bins(
 ) raises -> List[Float64]:
     """One example's exact contributions from its per-feature bin ids,
     length `n_features + 1` with the expected value last."""
+    if booster.linear.is_active():
+        # TreeSHAP over an affine leaf is not the constant-leaf algorithm;
+        # the sidecar's constant fallback would sum to a different raw score
+        # from the one the model predicts (linear_tree.mojo).
+        check_linear_tree_unconnected("predict_contrib")
     var explainer = ContribExplainer.for_booster(booster, n_features)
     var out = List[Float64](capacity=explainer.width())
     out.resize(explainer.width(), 0.0)
@@ -481,6 +487,8 @@ def predict_contrib_bins_multiclass(
 ) raises -> List[Float64]:
     """One example's exact per-class contributions from its bin ids, length
     `n_classes * (n_features + 1)` in class-major blocks."""
+    if booster.linear.is_active():
+        check_linear_tree_unconnected("predict_contrib_multiclass")
     var explainer = ContribExplainer.for_multiclass(booster, n_features)
     var out = List[Float64](capacity=explainer.width())
     out.resize(explainer.width(), 0.0)

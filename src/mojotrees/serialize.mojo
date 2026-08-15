@@ -93,6 +93,12 @@ from std.memory import bitcast
 from .binning import MAX_BINS, BinMapper, BinnedMatrix, no_missing_bins
 from .categorical import CAT_BITSET_WORDS, CategoricalSpec
 from .boosting import Booster, MulticlassBooster
+from .linear_tree import (
+    LINEAR_MODEL_FORMAT_VERSION,
+    LinearEnsemble,
+    linear_section_text,
+    read_linear_section,
+)
 from .monotone import MonotoneConstraints
 from .model import Model, MulticlassModel
 from .sparse import SparseBinnedMatrix
@@ -101,6 +107,12 @@ from .tree import Tree
 
 comptime _MAGIC = "mojotrees"
 comptime _VERSION = "v4"
+# A model with linear leaves (linear_tree.mojo) carries one more section,
+# `linear`, after the trees, and declares v5 so an older reader refuses it
+# rather than predicting the constant fallback. A model without linear
+# leaves still writes v4, byte for byte what it wrote before; see
+# `linear_tree.linear_model_format_version`.
+comptime _LINEAR_VERSION = "v5"
 
 # Prepared tables are a different kind of file and say so in their first
 # token, so no loader can be handed one and start reading it as a model.
@@ -522,7 +534,7 @@ def save_model(
     var out = String("")
     out += _MAGIC
     out += " "
-    out += _VERSION
+    out += _model_version(model.booster.linear)
     out += "\n"
 
     _write_feature_names(out, feature_names)
@@ -536,9 +548,18 @@ def save_model(
     _write_categorical(out, model.mapper.cats)
     _write_monotone(out, model.booster.monotone)
     _write_trees(out, model.booster.trees)
+    out += linear_section_text(model.booster.linear)
 
     with open(path, "w") as f:
         f.write(out)
+
+
+def _model_version(linear: LinearEnsemble) -> String:
+    """The version token a model file declares: v5 with linear leaves, v4
+    without."""
+    if linear.is_active():
+        return String(_LINEAR_VERSION)
+    return String(_VERSION)
 
 
 def save_multiclass_model(
@@ -552,7 +573,7 @@ def save_multiclass_model(
     var out = String("")
     out += _MAGIC
     out += " "
-    out += _VERSION
+    out += _model_version(model.booster.linear)
     out += "\n"
 
     _write_feature_names(out, feature_names)
@@ -569,6 +590,7 @@ def save_multiclass_model(
     _write_categorical(out, model.mapper.cats)
     _write_monotone(out, model.booster.monotone)
     _write_trees(out, model.booster.trees)
+    out += linear_section_text(model.booster.linear)
 
     with open(path, "w") as f:
         f.write(out)
@@ -842,6 +864,8 @@ def _read_version(mut r: _TokenReader) raises -> Int:
         return 3
     if token == "v4":
         return 4
+    if token == _LINEAR_VERSION:
+        return LINEAR_MODEL_FORMAT_VERSION
     raise Error("unsupported model format version")
 
 
@@ -937,10 +961,24 @@ def load_model(path: String) raises -> Model:
     _check_feature_names(names, mapper.n_features)
     var monotone = _read_monotone(r, mapper.n_features)
     var trees = _read_trees(r, mapper.n_features, version, mapper.n_bins)
+    var linear = _read_linear(r, version, trees, mapper.n_features)
     var booster = Booster(
-        trees^, base_score, learning_rate, objective, monotone^
+        trees^, base_score, learning_rate, objective, monotone^, linear^
     )
     return Model(mapper^, booster^)
+
+
+def _read_linear(
+    mut r: _TokenReader, version: Int, trees: List[Tree], n_features: Int
+) raises -> LinearEnsemble:
+    """The optional `linear` section (linear_tree.mojo), present only in a
+    v5 file; a file without it leaves the reader where it was and yields
+    the inactive sidecar."""
+    if version < LINEAR_MODEL_FORMAT_VERSION:
+        return LinearEnsemble.inactive()
+    var result = read_linear_section(r.tokens, r.pos, trees, n_features)
+    r.pos = result.next_pos
+    return result.linear.copy()
 
 
 def load_multiclass_model(path: String) raises -> MulticlassModel:
@@ -973,8 +1011,9 @@ def load_multiclass_model(path: String) raises -> MulticlassModel:
     var trees = _read_trees(r, mapper.n_features, version, mapper.n_bins)
     if len(trees) % n_classes != 0:
         raise Error("corrupt model file: tree count not divisible by classes")
+    var linear = _read_linear(r, version, trees, mapper.n_features)
     var booster = MulticlassBooster(
-        trees^, base_scores^, n_classes, learning_rate, monotone^
+        trees^, base_scores^, n_classes, learning_rate, monotone^, linear^
     )
     return MulticlassModel(mapper^, booster^)
 
