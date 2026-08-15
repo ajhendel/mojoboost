@@ -106,6 +106,10 @@ compare-missing = "python bench/compare_missing_lightgbm.py"
 compare-categorical = "python bench/compare_categorical_lightgbm.py"
 bench-custom-py = "python bench/bench_custom_objective.py"
 compare-ranking = "python bench/compare_ranking.py"
+# The numeric differential against LightGBM for the features whose parity
+# rows say `partial` only because no differential has ever run. Needs both
+# libraries, hence this environment. See docs/DIFFERENTIAL_TESTING.md.
+lgbm-differential = "python tools/lgbm_differential.py"
 
 [feature.pkg.dependencies]
 python-build = "*"
