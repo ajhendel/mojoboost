@@ -295,7 +295,7 @@ CLASSIFICATION = {
         "Bounded-memory chunk protocol external_memory.mojo is written "
         "against; coherent, not a duplicate of python _sequence.py. Parked "
         "until an export plus external_memory validation connects it "
-        "(handoffs/connect_21_native_interfaces.md).",
+        "(handoffs/consolidation_round.md, K4).",
     ),
     "cegb": (
         PENDING,
@@ -401,7 +401,7 @@ CLASSIFICATION = {
         "consolidation_K4",
         "Ecosystem chunk dispatcher _arrow.py and _polars.py are written "
         "against; parked until connect_07's _arrays.check_X front and a "
-        "chunk binding reach it (handoffs/connect_21_native_interfaces.md).",
+        "chunk binding reach it (handoffs/consolidation_round.md, K4).",
     ),
     "mojotrees._public_api_plan": (
         EXPERIMENTAL,
@@ -574,7 +574,7 @@ CLASSIFICATION = {
         "wraps it, so device_selection.py runs in its degraded mode.",
     ),
     # -- binding exports Python does not call yet (consolidation K6) ---------
-    # Kept as forward surface after the K6 review (handoffs/consolidation_K6.md):
+    # Kept as forward surface after the K6 review (handoffs/consolidation_round.md, K6):
     # each is a documented LightGBM or C ABI query whose Python reader has not
     # been written; none duplicates one Python calls.
     "dataset_bin_upper_bounds": (PENDING, "consolidation_K6", "LightGBM Dataset field reader; basic.py's Dataset does not expose it yet."),

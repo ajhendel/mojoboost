@@ -22,7 +22,7 @@ is the shape any batching must keep: batch the histogram builds of a level
 can feed) underneath the existing order, rather than adding a growth loop.
 Sections 1, 2, 6, and 10 remain the design for that; references below to
 `gpu_levelwise.*` names describe the removed prototype and are kept as the
-record of what was proposed. `handoffs/consolidation_K8.md` records the
+record of what was proposed. `handoffs/consolidation_round.md` (K8) records the
 disposition.
 
 This is a proposal for a **second growth algorithm**, not a faster route to

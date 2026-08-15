@@ -1,10 +1,12 @@
 # Consolidation round (started 2026-08-14, coordinator C0)
 
 No feature work. One authority per fact, orphans dispositioned, behavior
-frozen. Lanes K1..K12; this file is the coordinator's record for the lanes
-whose original handoff files no longer exist (21ff9fa removed 84 handoffs on
-2026-08-14). K1 and K5 wrote to handoffs/connect_22_audit.md; K4 wrote to
-handoffs/connect_21_native_interfaces.md.
+frozen. Lanes K1..K12; this file is the one record for the round. K1 and K5
+wrote to handoffs/connect_22_audit.md and K2 to
+handoffs/migration_20_device_policy.md; every other lane's notes were folded
+into the sections below and their files removed (see handoffs/INDEX.md for
+the rule going forward: decisions live in tools/connectivity_audit.py's
+CLASSIFICATION table, not in per-lane prose).
 
 ## K11 objective and metric code authority
 
@@ -72,6 +74,112 @@ vocabularies (parallel strategy vs histogram tiling strategy); left as is.
 
 sequence.mojo and python _sequence.py parked, connect later; both now carry
 an owner and reason in the audit table instead of "unassigned".
+
+## K4 sequence: native `sequence.mojo` vs python `_sequence.py`
+
+Audit only, nothing edited. They are two layers of one design, not
+competitors: `_sequence.py` is the Python recognition of `lgb.Sequence`
+plus the Arrow/polars dispatcher `_arrow.py` / `_polars.py` are written
+against (materialize-then-train, not bounded memory); `sequence.mojo` is
+the native chunk protocol `external_memory.mojo` builds the two-pass binner
+on (LightGBM's push-rows analogue). No function exists in both. Neither
+meets the deletion bar in either direction. Both PARKED: connect
+`sequence` via export + `external_memory` validation, `_sequence.py` via
+connect_07's `_arrays.check_X` front and a chunk binding. Recorded, not
+touched: `CancelToken` is defined in `sequence.mojo` (`cancelled`, `polls`,
+`none()`) and `validation.mojo` (`cancelled`, `reason`, `live()`); merge
+into one token carrying both when either module connects.
+
+## K6 bindings boundary
+
+- Deleted (e98d4eb): whole-model `predict`, `predict_raw`, `predict_proba`
+  bindings; full-range twins of `predict_range` / `predict_proba_range`,
+  which are what Python calls. No test or C ABI route. Verified with one
+  extension build in a HEAD worktree plus a fit/predict smoke check.
+- `binding_support.mojo` is not dead: every capability module the entry
+  point imports imports it (`-I bindings`). Audit made transitive (428bea8).
+- 19 exports are reached by string dispatch (`_eval._REGISTRY_HOOKS`,
+  `inspection._hook` + `_multiclass`, `sklearn._predict_batch` entry/legacy
+  pairs, `_dask_runtime` provider probes, `device_selection getattr`). Audit
+  now counts quoted export names as reads (888c3f9).
+- 22 exports remain uncalled and are kept as forward surface, one PENDING
+  row each in `CLASSIFICATION` (LightGBM Dataset field readers, registry
+  queries beside the hooks, distributed/transport status companions,
+  inspection JSON/kind/version queries, basic_bindings startup contract).
+  12 more are connect_07's, 5 connect_22's.
+- Only exact-duplicate binding: `_f64_list` / `_int_list` / `_csc` / `_csr`
+  in `_mojotrees.mojo` vs `binding_support`'s helpers (different error text,
+  memcpy vs loop). Build-gated two-file edit; deferred (see Close-out).
+- `split_gains` / `split_gains_multiclass` are named by inspection.py with a
+  graceful None fallback and have no binding at all: connect_11's plumbing.
+
+## K7 Python package split
+
+Snapshot first (c66b997, `tools/api_snapshot.py --write` once on the
+untouched tree; never regenerated). Then, one commit per extraction with
+`--check` showing zero rows after each: `_environment.py` (087f1a7:
+`gpu_available`, `build_info`, `show_versions`, provenance helpers),
+`_fit_args.py` (ccfe358: the `_IMPORTANCE_TYPES` / `_DEVICES` /
+`_BOOSTING_TYPES` vocabularies, `_as_iteration`, `_metric_specs`,
+`_check_eval_arguments`, ...), `_ranking.py` (d7044e3:
+`group_from_query_ids`, `ndcg_score`, ...). Every moved name is bound back
+by an explicit `from ._x import (...)` so `mojotrees.<name>` and in-package
+`from . import _x` are unchanged. Phase 2 needed a tools/ change (8e214a2:
+the snapshot resolves `_Base` and each estimator against `sklearn.py`, and
+`MOJOTREES_ABI_VERSION`, a C macro, stops counting as an env var), then
+`_Base` + `MojoTreesRegressor` / `Classifier` / `Ranker` + the objective
+code literals moved to `mojotrees/sklearn.py` in one commit (2e1b26a).
+`__init__.py` 4,615 -> 545 lines, snapshot diff zero. pytest is not in the
+default pixi env, so no python test file was run; import smoke and direct
+calls of moved functions were. `_public_api_plan.py` kept (see Close-out).
+
+## K8 GPU round and scheduler authority
+
+Decision (47e2173, read-only): `train_gpu.mojo`'s leaf-wise grower is the
+one growth architecture; `gpu_frontier`, `gpu_fused_round`,
+`gpu_multiclass_batch`, `hybrid_leaf_scheduler`, `gpu_leaf_batching`
+(through `histogram_gpu`) and the grow-policy module are consulted
+planners, kept. The one competing grower, `gpu_levelwise`, was parked
+"superseded only if connect_02 records per-level batched launches are not
+wanted as a replacement grower"; connect_02 recorded exactly that the same
+day and deleted it (f4651d1), renaming `levelwise_policy` to
+`growth_policy` with `GrowthSchedule(policy)` making the leaf pick for every
+grower. `docs/design/GPU_LEVELWISE.md` stays as the design record for the
+batching; its `gpu_levelwise.*` names describe the removed prototype.
+Step 3 (edits, all gated on connect_04's files, see Close-out): `MAX_ROWS`
+single site across `gpu_active_rows` / `gpu_multiclass_batch` /
+`gpu_predict` / `histogram_gpu`; trim `gpu_frontier`'s uncalled
+`SpeculationLedger` / `speculative_order` / `verify_speculation` /
+`leaves_per_launch` after confirming connect_04's pending edits do not pick
+them up. No edit to `train_gpu.mojo`; the CPU/GPU differential tests stay.
+
+## K10 orphan feature dispositions and duplicate rewires
+
+Parked with a named unblocker, nothing deleted: `cegb` (trainer must accept
+cegb params), `linear_tree` (Booster holds a LinearEnsemble; codes now from
+`objective_registry`), `model_editing` (its `MODEL_EDITING_SUPPORTED=True`
+is the claim, inspection's `False` ships; on connect, inspection re-exports
+it), `ranking_advanced` (`fit_ranker` grows the params), `lgbm_model_io`
+(binding + `LGBM_INTEROP_STATUS` flips), `gpu_categorical` ->
+`gpu_sparse` -> `gpu_sparse_layout` chain (train_gpu accepts categorical
+specs), `external_memory` (with `sequence`). `validation` is
+remaining_12's, `alternate_boosting` / `boosting_dart` / `boosting_rf`
+connect_17's. Bit-exact rewires so orphans import the authority instead of
+mirroring it: `boosting_dart` (c6a39ae), `model_editing` (96184c5),
+`ranking_advanced` (747b2fc) take `splitmix64` / `uniform` / `GOLDEN` from
+`rng.mojo` (the latter two imported from `sampling`, which K1 removed, so
+they did not compile before); `linear_tree` takes its objective codes and
+renewal rule from `objective_registry` and its `LeafStats` is renamed
+`LinearLeafStats` because it is not gpu_frontier's record (e3ed5ab);
+`boosting_rf` takes `LAMBDARANK` from `objective_registry` (26f04f3,
+8b8cc53); `model_dump` takes `_MAX_CATEGORY` from `categorical` (5f21ac8);
+`model_editing` takes `_F64_MAX` from `inspection`. One scratchpad
+compile-and-value check covered all seven modules; no repository test
+reaches any of them. Deferred on purpose: `MODEL_EDITING_SUPPORTED` (the two
+values disagree by design), `check_relevance_labels` (name collision, not a
+duplicate; python `_validation.py:592` names validation's by string, so
+rename on that side), `CancelToken` (K4), the byte-identical
+`_stream(seed, index)` in bagging / goss / boosting_dart (needs `rng.mojo`).
 
 ## Close-out (2026-08-15)
 
