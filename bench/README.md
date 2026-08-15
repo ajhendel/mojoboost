@@ -293,6 +293,171 @@ full procedure, and the record of which devices have actually been run. As of
 this writing that record is Apple Metal only: no NVIDIA or AMD device has
 executed this code, so no CUDA or HIP number should appear anywhere.
 
+## The two GPU training crossovers
+
+`src/mojotrees/device_policy.mojo` resolves `auto` to the CPU for every
+workload, because `crossover_rules()` is empty. Two measurements would fill
+it and neither has been taken. This section is the protocol for taking them.
+
+**No crossover rule may be written into `device_policy.mojo` until these
+numbers exist.** A rule is a performance claim that carries an
+`evidence_id`, and a threshold derived from reasoning rather than from a
+recorded run is the one thing that module refuses to ship. Adding a rule is
+a benchmarking result, not a code change, and it is out of order before the
+sweeps below have been run and recorded, whatever anyone expects the numbers
+to be.
+
+Both drivers call the trainers directly, so neither run needs
+`MOJOTREES_AUTO_MIN_CELLS`. That variable exists for exercising the policy
+path itself and has no part in these measurements.
+
+Two rules govern every command here.
+
+- Arms are compared only inside one invocation. This machine drifts by a
+  factor of 2 to 3 across time windows, so a number from one run and a
+  number from another are not comparable even when the two commands were
+  identical. Both drivers interleave their arms for that reason, one repeat
+  running every arm before the next repeat starts, and both report each
+  arm's own spread as the noise floor a delta has to clear.
+- Five repeats, and never fewer than three. Each driver prints a warning
+  below three and refuses to call anything resolved at one repeat, because a
+  single sample has a spread of zero by construction rather than a noise
+  floor of zero.
+
+Pin the CPU side before the first command. `MOJOTREES_NUM_WORKERS` takes the
+performance-core count from `sysctl hw.perflevel0.physicalcpu`, per the
+thread-matching rule in
+[docs/APPLE_GPU_BENCHMARK_PROTOCOL.md](../docs/APPLE_GPU_BENCHMARK_PROTOCOL.md),
+and `MOJOTREES_PARALLEL_MIN_OPS` stays at its default and is recorded with
+the result.
+
+### Dense crossover
+
+`bench_train_gpu.mojo`, arguments
+`[n_rows] [n_features] [reg|binary] [repeats] [arms] [seed]`. Two steps,
+because the GPU side has two split-search strategies and racing the slower
+one against the CPU answers a question nobody asked.
+
+Step one settles the strategy at each row count.
+
+```sh
+pixi run bench-train-gpu 250000 100 reg 5 gpu-host,gpu-device
+pixi run bench-train-gpu 1000000 100 reg 5 gpu-host,gpu-device
+```
+
+Step two races the winner of step one against the CPU. The commands below
+assume `gpu-device` won; substitute `gpu-host` at any row count where it did
+not. The 50,000 row point is included because it is the shape the device
+path is already known to lose, and a sweep with no losing shape in it has
+not bracketed anything.
+
+```sh
+pixi run bench-train-gpu 50000 100 reg 5 cpu,gpu-device
+pixi run bench-train-gpu 250000 100 reg 5 cpu,gpu-device
+pixi run bench-train-gpu 1000000 100 reg 5 cpu,gpu-device
+```
+
+Then repeat every row count that came back `resolved` in the GPU's favor at
+two more data seeds, which is the sixth argument, and once under `binary` so
+the verdict is not read as objective independent when only one objective was
+measured.
+
+```sh
+pixi run bench-train-gpu 250000 100 reg 5 cpu,gpu-device 1
+pixi run bench-train-gpu 250000 100 reg 5 cpu,gpu-device 2
+pixi run bench-train-gpu 250000 100 binary 5 cpu,gpu-device
+```
+
+### Sparse crossover, `w4_sparse`
+
+`bench_train_gpu_sparse.mojo`, arguments
+`[n_rows] [n_features] [density_pct] [reg|binary] [repeats] [arms] [seed]`.
+It races `train_sparse` on the CPU against `train_gpu_sparse` on the device
+over one `SparseBinnedMatrix`, binned once outside the timed region, and it
+reports the same spread and the same resolved-versus-indistinguishable
+verdict the dense driver does. There is no `gpu-host` or `gpu-device` arm
+here, because the sparse grower always searches splits on the host.
+
+Density is an argument because the crossover moves with it. The sparse
+accumulator costs O(nnz in node) per node against the dense
+O(rows x features), so where the device starts winning depends on how many
+entries a node holds and not on the row count alone. One row count at three
+densities is therefore the minimum useful sweep, and a single density is not
+a crossover.
+
+The first command is the `w4_sparse` shape of the Apple protocol exactly,
+since 500 features at 2.0% is 10 nonzeros per row.
+
+```sh
+pixi run bench-train-gpu-sparse 200000 500 2.0 reg 5 cpu,gpu
+pixi run bench-train-gpu-sparse 200000 500 1.0 reg 5 cpu,gpu
+pixi run bench-train-gpu-sparse 200000 500 5.0 reg 5 cpu,gpu
+pixi run bench-train-gpu-sparse 1000000 500 2.0 reg 5 cpu,gpu
+```
+
+Then two more data seeds, which is the seventh argument, at every
+(rows, density) point that came back `resolved` in the GPU's favor.
+
+```sh
+pixi run bench-train-gpu-sparse 200000 500 2.0 reg 5 cpu,gpu 1
+pixi run bench-train-gpu-sparse 200000 500 2.0 reg 5 cpu,gpu 2
+```
+
+Without the pixi task, the driver runs directly.
+
+```sh
+pixi run mojo run -I src bench/bench_train_gpu_sparse.mojo 200000 500 2.0 reg 5 cpu,gpu
+```
+
+The driver never configures exclusive feature bundling, a custom objective,
+or an eval set, and it must not be changed to. `train_gpu_sparse` refuses
+all three by name rather than approximating them, so a harness that
+configured one would measure a refusal.
+
+At `seed 0` the generated dataset is entry for entry the one
+`bench_sparse.mojo` builds at the same shape, so a sparse number from this
+driver and the CPU sparse-versus-dense table above describe the same data.
+The CSC arrays are built by counting sort rather than from a materialized
+dense matrix, which is what makes the 1,000,000 x 500 point runnable.
+
+### What each verdict licenses
+
+| Verdict | What it means | What may be written |
+|---|---|---|
+| `resolved`, GPU faster | The gap cleared the wider of the two arms' spreads | A candidate crossover rule, once the conditions below all hold |
+| `resolved`, CPU faster | Also a result, and worth recording | Nothing, and it forbids a rule at that shape and below |
+| `indistinguishable` | The gap is inside the noise floor of the run | Nothing for either backend |
+| `unresolvable` | One repeat was used | Nothing, rerun with five |
+
+A crossover rule is justified only when all four of these hold together.
+
+1. The shape reports `resolved` with the GPU arm faster.
+2. The same shape resolves the same way at three data seeds, in three
+   separate invocations. Only the verdict carries across time windows; the
+   seconds do not.
+3. The two arms' training losses agree to the precision the driver prints.
+   Device histograms are fixed-point, so Float32-level agreement is what to
+   expect; a materially different loss means the arms did not fit the same
+   model and the wall clocks are not a comparison.
+4. Some smaller shape in the same sweep came back either
+   `indistinguishable` or `resolved` the other way, so the crossover is
+   bracketed from below rather than assumed to sit under the smallest shape
+   measured.
+
+The rule that may then be written is the narrowest one the sweep supports.
+Its `min_rows` and `min_cells` are the smallest measured shape that passed
+all four conditions, never an interpolated or extrapolated one. Its `api`
+and `apple_generation` are the device that was measured, its `objective` is
+the objective that was measured, its `evidence_id` names the result file,
+and `POLICY_VERSION` is bumped with it. Widening any of those fields past
+what was run is the same unearned claim as writing the rule with no run at
+all.
+
+Record every sweep under `results/` beside the existing files, one per
+crossover, carrying the machine, the OS version, the Mojo version, the
+resolved worker count, and the full command lines. **No numbers are recorded
+here yet**, and `crossover_rules()` is empty for that reason.
+
 ## Custom objectives
 
 Two drivers, because the two paths cost different things.

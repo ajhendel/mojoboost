@@ -175,7 +175,8 @@ def _parse_arms(spec: String) raises -> List[Int]:
         var flags = 0
         if name.endswith("-depth"):
             flags = ARM_DEPTHWISE
-            name = String(name[: name.byte_length() - 6])
+            var trimmed = String(name[byte= : name.byte_length() - 6])
+            name = trimmed^
         if name == "cpu":
             arms.append(ARM_CPU | flags)
         elif name == "gpu":
