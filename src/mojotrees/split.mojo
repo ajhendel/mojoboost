@@ -66,9 +66,38 @@ constraint is rejected whatever its gain. The bounds apply to candidates on
 every feature, constrained or not, because a node under a constrained split
 owes its interval no matter which feature it goes on to split. An empty
 vector keeps the original unconstrained scoring path (see monotone.mojo).
+
+Scanning features in parallel
+-----------------------------
+Features are independent: one feature's candidates are scored entirely from
+its own histogram slice, and nothing a feature computes is read by another.
+The scan is therefore dispatched across features under the usual contract in
+`parallel.mojo`, and each feature's own scan runs start to finish inside one
+task. That placement is not incidental. Every floating-point sum in this file
+(a feature's bin totals, the running prefix sums that make a threshold's left
+child) is accumulated in ascending bin order within a single feature, and no
+sum crosses a task boundary, so no addition is reassociated and no gain moves
+by an ulp at any task count or on any machine.
+
+What does cross the task boundary is the choice among features, and that is a
+maximum rather than a sum. It is still not reduced in parallel here. Each
+feature writes its own best candidate into its own slot, and the slots are
+folded afterwards in ascending scan order by the same strict `>` comparison
+the serial loop used. The fold costs one compare per feature against a scan
+that costs bins times features, so nothing is bought by making it clever, and
+writing it as the serial fold means the tie-break is the serial tie-break by
+construction rather than by reconstruction: among candidates of exactly equal
+gain the first in scan order wins, which is the lowest feature id when the
+caller's feature list is ascending (`find_best_split` requires that it be). A
+parallel max carrying the feature index and resolving ties toward the lower
+index would answer the same, and would be a second rule to keep in step with
+the first.
 """
 
+from .apple_cpu_policy import split_scan_ops
+from .parallel import dispatch_features
 from .categorical import (
+    CAT_BITSET_WORDS,
     CatBitset,
     CategoricalParams,
     CategoricalSpec,
@@ -102,6 +131,16 @@ from .tree_parameters_extra import (
     finish_leaf_output,
     passes_min_gain,
 )
+
+
+# How a scanned feature's slot records the two booleans a `SplitInfo` needs,
+# so that a task writes only scalars through unsafe pointers. Absence of both
+# is a numerical split routing missing rows right, which is also what a
+# feature that produced nothing leaves behind; the fold never reads the flags
+# of a feature whose gain did not win, so the two cases never have to be
+# told apart.
+comptime _FLAG_DEFAULT_LEFT = 1
+comptime _FLAG_CATEGORICAL = 2
 
 
 struct SplitInfo(Copyable, Movable, Writable):
@@ -439,12 +478,54 @@ def find_best_split(
     var grad_p = hist.grad.unsafe_ptr()
     var hess_p = hist.hess.unsafe_ptr()
     var count_p = hist.count.unsafe_ptr()
-    for i_feature in range(n_active):
+
+    # One slot per scanned feature. A feature that yields no candidate leaves
+    # its gain at 0.0, which the fold below cannot accept because `best.gain`
+    # starts at 0.0 and the comparison is strict: exactly the outcome the
+    # serial loop reached by never touching `best` for that feature. The
+    # slots are plain scalars rather than a `List[SplitInfo]` so that a task
+    # writes through an unsafe pointer, which is how every other parallel
+    # kernel in this package writes its output.
+    var res_gain = List[Float64](capacity=n_active)
+    res_gain.resize(n_active, 0.0)
+    var res_feature = List[Int](capacity=n_active)
+    res_feature.resize(n_active, -1)
+    var res_bin = List[Int](capacity=n_active)
+    res_bin.resize(n_active, -1)
+    var res_flag = List[Int](capacity=n_active)
+    res_flag.resize(n_active, 0)
+    # A categorical winner also carries its bitset. Allocated only when the
+    # matrix has a categorical feature at all, because the common case is a
+    # wholly numerical matrix and this runs once per node.
+    var any_cat = cats.any_categorical()
+    var res_bits = List[UInt64]()
+    if any_cat:
+        res_bits.resize(CAT_BITSET_WORDS * n_active, UInt64(0))
+
+    # A task cannot raise: the dispatch shapes in `parallel.mojo` take a
+    # non-raising body, because an exception escaping one worker while the
+    # others are still running has nowhere to go. A feature whose scan raises
+    # therefore records that it did and stops, and the fold below re-runs it
+    # serially so the error surfaces with its own message, raised from the
+    # lowest-indexed feature that failed. That is one wasted scan on a path
+    # that ends in an exception, and it keeps the message exact instead of
+    # reducing every failure to a flag.
+    var res_fail = List[UInt8](capacity=n_active)
+    res_fail.resize(n_active, UInt8(0))
+
+    var gain_out = res_gain.unsafe_ptr()
+    var feature_out = res_feature.unsafe_ptr()
+    var bin_out = res_bin.unsafe_ptr()
+    var flag_out = res_flag.unsafe_ptr()
+    var bits_out = res_bits.unsafe_ptr()
+    var fail_out = res_fail.unsafe_ptr()
+
+    def scan_feature(i_feature: Int) raises {imm}:
         var f = i_feature if use_all else features[i_feature]
         if f < 0 or f >= hist.n_features:
-            continue
+            return
         if masked and (f >= len(allowed) or not allowed[f]):
-            continue
+            return
         var sign = monotone_sign(monotone, f) if constrained else MONOTONE_FREE
         var missing_bin = -1
         if len(missing_bins) > 0:
@@ -521,9 +602,14 @@ def find_best_split(
                     node_rows,
                     costs,
                 )
-                if g > best.gain:
-                    best = SplitInfo.categorical(f, g, cs.bitset)
-            continue
+                gain_out.unsafe_store(i_feature, g)
+                feature_out.unsafe_store(i_feature, f)
+                flag_out.unsafe_store(i_feature, _FLAG_CATEGORICAL)
+                for w in range(CAT_BITSET_WORDS):
+                    bits_out.unsafe_store(
+                        CAT_BITSET_WORDS * i_feature + w, cs.bitset[w]
+                    )
+            return
 
         var parent_g = soft_threshold_l1(total_g, lambda_l1)
         var parent_score = parent_g * parent_g / (total_h + lambda_reg)
@@ -550,7 +636,7 @@ def find_best_split(
                 n_candidates, extra.extra_seed, tree_index, node, f
             )
             if pick < 0:
-                continue
+                return
 
         var left_g = 0.0
         var left_h = 0.0
@@ -661,7 +747,50 @@ def find_best_split(
                 node_rows,
                 costs,
             )
-            if g > best.gain:
-                best = SplitInfo(f, f_bin, g, True, f_default_left)
+            gain_out.unsafe_store(i_feature, g)
+            feature_out.unsafe_store(i_feature, f)
+            bin_out.unsafe_store(i_feature, f_bin)
+            if f_default_left:
+                flag_out.unsafe_store(i_feature, _FLAG_DEFAULT_LEFT)
+
+    def scan_one(i_feature: Int) {imm}:
+        try:
+            scan_feature(i_feature)
+        except:
+            fail_out.unsafe_store(i_feature, UInt8(1))
+
+    dispatch_features(
+        scan_one,
+        n_active,
+        split_scan_ops(n_active, hist.n_bins, len(missing_bins) > 0),
+    )
+
+    # The serial fold. Ascending scan order and a strict `>`, which is the
+    # comparison the loop above used to make inline, so the winner and the
+    # tie-break are the ones this function has always chosen.
+    for i_feature in range(n_active):
+        if res_fail[i_feature] != UInt8(0):
+            scan_feature(i_feature)
+            raise Error("split scan failed on feature ", i_feature)
+        var g = gain_out.unsafe_load(i_feature)
+        if g > best.gain:
+            var flag = flag_out.unsafe_load(i_feature)
+            if (flag & _FLAG_CATEGORICAL) != 0:
+                var bits = cat_empty()
+                for w in range(CAT_BITSET_WORDS):
+                    bits[w] = bits_out.unsafe_load(
+                        CAT_BITSET_WORDS * i_feature + w
+                    )
+                best = SplitInfo.categorical(
+                    feature_out.unsafe_load(i_feature), g, bits
+                )
+            else:
+                best = SplitInfo(
+                    feature_out.unsafe_load(i_feature),
+                    bin_out.unsafe_load(i_feature),
+                    g,
+                    True,
+                    (flag & _FLAG_DEFAULT_LEFT) != 0,
+                )
 
     return best^
