@@ -25,9 +25,8 @@ Intentional differences from LightGBM
   gets its own error saying what it would take, never "unknown parameter"
   and never silence. `objective=` values go through
   `_raise_if_unimplemented_objective`, tree options through
-  `tree_parameters_extra.check_extra_option_supported` (`linear_tree`,
-  `linear_lambda`, `forcedsplits_filename`,
-  `feature_pre_filter`), and `enable_bundle` through
+  `tree_parameters_extra.check_extra_option_supported`
+  (`forcedsplits_filename`, `feature_pre_filter`), and `enable_bundle` through
   `efb.check_bundling_supported`, which accepts it for a CPU run and refuses
   it by name for a device that would ignore it.
 """
@@ -75,7 +74,8 @@ comptime SUPPORTED_KEYS = String(
     " feature_fraction_bylevel, feature_fraction_seed, min_gain_to_split,"
     " max_delta_step, path_smooth, extra_trees, extra_seed,"
     " monotone_penalty, monotone_constraints_method, cegb_tradeoff,"
-    " cegb_penalty_split, enable_bundle, max_conflict_rate,"
+    " cegb_penalty_split, linear_tree, linear_lambda, enable_bundle,"
+    " max_conflict_rate,"
     " data_sample_strategy, max_bin, alpha, fair_c,"
     " tweedie_variance_power, device, use_missing"
 )
@@ -573,6 +573,13 @@ def parse_params(spec: String) raises -> TrainConfig:
             config.booster.tree.extra.penalties.cegb.penalty_split = (
                 _parse_f64(key, value)
             )
+        elif key == "linear_tree":
+            # Linear leaves (linear_tree.mojo): fitted by the metric-path
+            # trainers, which keep the raw matrix; the binned-only trainers
+            # refuse the switch by name rather than dropping it.
+            config.booster.linear.enabled = _parse_bool(key, value)
+        elif key == "linear_lambda":
+            config.booster.linear.linear_lambda = _parse_f64(key, value)
         elif key == "enable_bundle":
             # Exclusive feature bundling, applied by the dense CPU trainers
             # (efb.mojo). Off by default, unlike LightGBM. The device check

@@ -369,3 +369,30 @@ distributed GPU's device path (needs `train_gpu.mojo`), any multi-process
 run (`transport_validated()` stays False), the `tree_learner` and `top_k`
 rows in `docs/LIGHTGBM_PARITY.md` (file held by another lane; both are now
 implemented for the in-process world). No new handoff file.
+
+**W2, linear trees.** `linear_tree.mojo` is reachable: `BoosterParams.linear`
+(`LinearParams`, LightGBM's `linear_tree` / `linear_lambda`) switches it on
+from the Mojo API, the parameter string (`params.mojo`), and the estimators
+(`linear_tree=`, `linear_lambda=`, sent through the params mapping and read by
+`_parse_params`). `custom_metric.train_with_callbacks` and
+`train_multiclass_with_metrics` fit each grown tree's leaves after growth
+from the round's gradients, hessians, and rows (`refit_linear_tree`), update
+training and validation scores through the leaves (`add_tree_scores`;
+`ValidSet` keeps its raw matrix), scale the sidecar under a learning-rate
+schedule, and truncate it with early stopping; the raw matrix is copied only
+when the switch is on, so constant-leaf runs are byte-identical to before.
+`Booster` / `MulticlassBooster` carry `linear: LinearEnsemble`;
+`Model` / `MulticlassModel` `predict*` evaluate it on the raw row;
+`serialize` writes v5 with the `linear` section only when active (constant
+models still write v4) and reads it back. Refused by name, not dropped: the
+binned-only trainers (`boosting.train*`, `model.fit*`), `predict_contrib`,
+GPU prediction, `train_more` on a linear booster (continued training needs
+the raw matrix through the resume pass; `linear_tree.resume_raw_scores`
+exists for it), and LAMBDARANK (`check_objective_compatible`). Not done:
+`model_dump` does not emit `leaf_const` / `leaf_coeff` (a dump of a linear
+model shows the constant fallback), `alternate_boosting.fold_weights_into_trees`
+does not yet call `LinearEnsemble.scale_all` (DART + linear_tree is a W1
+follow-up), and `lgbm_model_io` still refuses `is_linear=1`. Test:
+`tests/test_linear_tree.mojo` (3 passed). Commits b353bfd 4ab237d 7d7985e and
+the params.mojo / tree_parameters_extra.mojo follow-up. CEGB (Task A of the
+lane) was found mid-integration by another session (0ef2115) and left to it.
