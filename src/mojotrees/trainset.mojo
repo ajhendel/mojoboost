@@ -103,7 +103,7 @@ from .ranking_advanced import (
 )
 from .raw_data import RawData
 from .sparse import CscMatrix, CsrMatrix, SparseBinnedMatrix, transform_csc
-from .train_gpu import train_gpu
+from .train_gpu import train_gpu, train_multiclass_gpu
 from .validation import (
     check_categorical_features,
     check_class_codes,
@@ -965,9 +965,25 @@ def train_dataset_multiclass(
     bagging: BaggingParams = BaggingParams.disabled(),
     goss: GossParams = GossParams.disabled(),
 ) raises -> MulticlassModel:
-    """Train a softmax model on an already binned dataset. Multiclass
-    training is CPU-only, so GPU_DEVICE raises and AUTO_DEVICE resolves to
-    the CPU, exactly as in `model.fit_multiclass`.
+    """Train a softmax model on an already binned dataset, on the backend
+    `device` resolves to, exactly as in `model.fit_multiclass`.
+
+    That sentence used to read "multiclass training is CPU-only, so
+    GPU_DEVICE raises and AUTO_DEVICE resolves to the CPU", and the code
+    matched it: the resolved backend was discarded and the CPU trainer was
+    called unconditionally. It stopped being true when `train_multiclass_gpu`
+    landed and `model.fit_multiclass` began dispatching on it, and the two
+    entry points then disagreed in silence. A caller reaching multiclass
+    through a `Dataset` got the CPU whatever it asked for, while the same
+    request through `fit_multiclass` got the device.
+
+    The evidence that this was real rather than theoretical is in the
+    benchmark record: in `bench/real_data/results/20260815T023123Z`, the
+    covertype scenario's CPU and GPU arms carry byte-identical
+    `predictions_sha256`, while `dense_regression` and `imbalanced_binary`,
+    which reach the device through the single-output path, do not. A
+    multiclass GPU timing taken through this function was a CPU timing
+    wearing a GPU label.
 
     A sparse dataset trains through `train_multiclass_sparse`, which does
     not implement GOSS; asking for it raises rather than training every row
@@ -998,18 +1014,30 @@ def train_dataset_multiclass(
         )
         return MulticlassModel(dataset.mapper.copy(), sparse_booster^)
 
-    _ = resolve_device(
+    var backend = resolve_device(
         device, dataset.n_rows, dataset.n_features, n_classes
     )
-    var booster = train_multiclass(
-        dataset.data,
-        _int_labels(dataset.label, n_classes),
-        n_classes,
-        params,
-        dataset.weight,
-        bagging,
-        goss,
-    )
+    var booster: MulticlassBooster
+    if backend == GPU_DEVICE:
+        booster = train_multiclass_gpu(
+            dataset.data,
+            _int_labels(dataset.label, n_classes),
+            n_classes,
+            params,
+            dataset.weight,
+            bagging,
+            goss,
+        )
+    else:
+        booster = train_multiclass(
+            dataset.data,
+            _int_labels(dataset.label, n_classes),
+            n_classes,
+            params,
+            dataset.weight,
+            bagging,
+            goss,
+        )
     return MulticlassModel(dataset.mapper.copy(), booster^)
 
 
