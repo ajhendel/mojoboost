@@ -29,12 +29,12 @@ where the schema doc says they are.
 
 Editing
 -------
-Nothing here writes to a model, and `model_editing_status_json` says so in
-a form a consumer can read rather than leaving the absence to be
-discovered. The invariants that would have to be restated after an
-arbitrary leaf edit are named there and in
-`docs/MODEL_INSPECTION_SCHEMA.md`; until they can be, the dump is a report
-and not a handle.
+Nothing here writes to a model. Writing lives in `model_editing.mojo`
+(rollback, leaf outputs, shuffling, refit, bounds), which checks the
+invariants a fitted tree records before every write; its
+`MODEL_EDITING_SUPPORTED` and `model_editing_status_json` are re-exported
+here so a consumer that asks this module "can I edit?" gets that module's
+answer.
 """
 
 from std.math import isnan
@@ -65,6 +65,10 @@ from .model_dump import (
     threshold_value,
 )
 from .tree import Tree
+from .model_editing import (
+    MODEL_EDITING_SUPPORTED as _MODEL_EDITING_SUPPORTED,
+    model_editing_status_json as _model_editing_status_json,
+)
 
 # Larger than any finite Float64, so a comparison against it detects the
 # infinities without reaching for an `isinf`.
@@ -311,47 +315,14 @@ def dump_json(dump: ModelDump) raises -> String:
     return out^
 
 
-# Whether this build can edit a fitted model in place. False, and the one
-# place that says so: `model_editing_status_json` reports it, and
-# `python/mojotrees/inspection.py` mirrors it as `MODEL_EDITING_SUPPORTED`.
-# Flipping it is not a flag change; it is the work the status names.
-comptime MODEL_EDITING_SUPPORTED = False
-
-
-def model_editing_status_json() -> String:
-    """Whether a fitted model can be edited, and if not, what would have to
-    hold first.
-
-    An explicit status rather than a missing function, so a consumer asking
-    "can I set a leaf value here?" gets an answer it can branch on instead
-    of an `AttributeError`. The three invariants are the reason the answer
-    is no: each is a fact a fitted tree records about the fit that produced
-    it, and an arbitrary leaf edit falsifies all three while leaving them in
-    place, where nothing downstream could tell the edit from corruption.
-
-    Serialization is the fourth reason, and it is the one this build could
-    not paper over: a v4 file carries node covers and split gains, so an
-    edited leaf would be saved alongside the sums and counts that contradict
-    it.
-    """
-    var out = String("{\"supported\":false")
-    out += ",\"operation\":\"set_leaf_output\""
-    out += ",\"reason\":\"a fitted tree records facts about the fit that"
-    out += " produced it; an arbitrary leaf edit falsifies them and leaves"
-    out += " them in place\""
-    out += ",\"invariants\":["
-    out += "\"node covers are the training rows that reached a node, and"
-    out += " exact feature contributions condition on them\""
-    out += ",\"an internal node's value is the value it held when it was"
-    out += " created, not a function of its children\""
-    out += ",\"a split gain was computed from the gradient sums a leaf held"
-    out += " at growth time, which the tree no longer holds\""
-    out += "]"
-    out += ",\"serialized_state\":[\"count\",\"split_gain\"]"
-    out += ",\"model_format_version\":" + String(MODEL_FORMAT_VERSION)
-    out += ",\"read_only_alternative\":\"leaf_outputs\""
-    out += "}"
-    return out^
+# Whether this build can edit a fitted model in place, and the status that
+# says which operations that covers. Both are `model_editing.mojo`'s: it is
+# the implementation, so it is the one place the claim is made, and this
+# module re-exports it so a consumer that reached the status here keeps
+# reaching it. `python/mojotrees/inspection.py` mirrors the flag as
+# `MODEL_EDITING_SUPPORTED`.
+comptime MODEL_EDITING_SUPPORTED = _MODEL_EDITING_SUPPORTED
+comptime model_editing_status_json = _model_editing_status_json
 
 
 def dump_model(
