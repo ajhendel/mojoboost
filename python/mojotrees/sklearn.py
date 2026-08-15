@@ -144,7 +144,8 @@ class _Base(_ParamsMixin):
     set, both without replacement and both reproducible from
     `feature_fraction_seed`. Fractions must be in (0, 1]; 1.0 (the default)
     means no subsampling. As in LightGBM, at least 2 features are selected
-    whenever the data has that many.
+    whenever the data has that many. XGBoost's `colsample_bytree` and
+    `colsample_bynode` are accepted as aliases of the two fractions.
 
     `use_missing` is LightGBM's parameter of the same name. With it (the
     default), `NaN` is a missing value: a feature that has any in training
@@ -312,7 +313,9 @@ class _Base(_ParamsMixin):
         uniform_drop=True,
         drop_seed=4,
         feature_fraction=1.0,
+        colsample_bytree=None,
         feature_fraction_bynode=1.0,
+        colsample_bynode=None,
         feature_fraction_seed=2,
         use_missing=True,
         categorical_feature="auto",
@@ -385,7 +388,9 @@ class _Base(_ParamsMixin):
         self.uniform_drop = uniform_drop
         self.drop_seed = drop_seed
         self.feature_fraction = feature_fraction
+        self.colsample_bytree = colsample_bytree
         self.feature_fraction_bynode = feature_fraction_bynode
+        self.colsample_bynode = colsample_bynode
         self.feature_fraction_seed = feature_fraction_seed
         self.use_missing = use_missing
         self.categorical_feature = categorical_feature
@@ -901,6 +906,15 @@ class _Base(_ParamsMixin):
         monotone_penalty = self._resolve_alias(
             "monotone_penalty", "monotone_constraints_penalty", 0.0
         )
+        # XGBoost's spellings of the two feature-sampling fractions.
+        # LightGBM accepts both as aliases of `feature_fraction` and
+        # `feature_fraction_bynode`, and so does this estimator.
+        feature_fraction = self._resolve_alias(
+            "feature_fraction", "colsample_bytree", 1.0
+        )
+        feature_fraction_bynode = self._resolve_alias(
+            "feature_fraction_bynode", "colsample_bynode", 1.0
+        )
         # Same ranges src/mojotrees/params.mojo and callback.mojo enforce,
         # so an estimator cannot construct a configuration the trainer
         # rejects (or, worse, quietly degenerates on).
@@ -955,9 +969,9 @@ class _Base(_ParamsMixin):
         # learning_rate and trains at 1.0; the same here, whatever the
         # estimator was given, because boosting_rf refuses any other rate.
         learning_rate = 1.0 if boosting == "rf" else float(self.learning_rate)
-        if not 0.0 < float(self.feature_fraction) <= 1.0:
+        if not 0.0 < float(feature_fraction) <= 1.0:
             raise ValueError("feature_fraction must be in (0, 1]")
-        if not 0.0 < float(self.feature_fraction_bynode) <= 1.0:
+        if not 0.0 < float(feature_fraction_bynode) <= 1.0:
             raise ValueError("feature_fraction_bynode must be in (0, 1]")
         grow_policy = str(self.grow_policy)
         if grow_policy not in _GROW_POLICIES:
@@ -1017,8 +1031,8 @@ class _Base(_ParamsMixin):
             "xgboost_dart_mode": int(bool(self.xgboost_dart_mode)),
             "uniform_drop": int(bool(self.uniform_drop)),
             "drop_seed": int(self.drop_seed),
-            "feature_fraction": float(self.feature_fraction),
-            "feature_fraction_bynode": float(self.feature_fraction_bynode),
+            "feature_fraction": float(feature_fraction),
+            "feature_fraction_bynode": float(feature_fraction_bynode),
             "feature_fraction_seed": int(self.feature_fraction_seed),
             "interaction_flat_addr": 0 if ic_flat is None else _addr(ic_flat),
             "interaction_flat_len": 0 if ic_flat is None else len(ic_flat),
@@ -1363,8 +1377,16 @@ class _Base(_ParamsMixin):
             "lambda_l2": float(
                 self._resolve_alias("lambda_l2", "reg_lambda", _LAMBDA_L2)
             ),
-            "feature_fraction": float(self.feature_fraction),
-            "feature_fraction_bynode": float(self.feature_fraction_bynode),
+            "feature_fraction": float(
+                self._resolve_alias(
+                    "feature_fraction", "colsample_bytree", 1.0
+                )
+            ),
+            "feature_fraction_bynode": float(
+                self._resolve_alias(
+                    "feature_fraction_bynode", "colsample_bynode", 1.0
+                )
+            ),
         }
 
     def _fit_with_metrics(
