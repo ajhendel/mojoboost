@@ -55,6 +55,19 @@ jobs:
       - name: Parity contract
         run: python3 tools/check_parity.py
 
+  # Informational only. Logs the reachable-surface report so a lane's claim
+  # that its audit section improved can be checked from the PR. Non-blocking
+  # until docs/INTEGRATION_INVENTORY.md is caught up.
+  connectivity-audit:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Connectivity audit
+        run: python3 tools/connectivity_audit.py
+      - name: Integration inventory audit
+        run: python3 tools/audit_integration.py
+
   # Manual benchmark profiles (workflow_dispatch) on x86-64 and ARM64.
   # lscpu flags show whether the x86 runner has avx2/avx512f, which is the
   # input for any future width-specific fast path.
