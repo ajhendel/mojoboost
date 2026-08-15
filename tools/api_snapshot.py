@@ -326,6 +326,33 @@ def public_methods(cls, consts: dict) -> tuple:
 # -- Python blocks -------------------------------------------------------
 
 
+#: Where the estimator classes may live. `__init__.py` is where they were
+#: written; the package split moves `_Base` and the estimators to
+#: `sklearn.py` and re-binds the names at the root. The public surface is
+#: the same either way, so the snapshot reads whichever file holds the
+#: class and resolves defaults against that file's own module constants.
+ESTIMATOR_SOURCES = (PY_API, PY_PKG / "sklearn.py")
+
+
+def find_class(name: str, d: Deriver, primary_tree, primary_consts):
+    """(class node, module constants of the file it lives in), searching
+    `__init__.py` first and then the estimator submodule; (None, {}) if it
+    is in neither."""
+    cls = class_named(primary_tree, name)
+    if cls is not None:
+        return cls, primary_consts
+    for path in ESTIMATOR_SOURCES[1:]:
+        if not path.is_file():
+            continue
+        tree = parse_py(path, d)
+        if tree is None:
+            continue
+        cls = class_named(tree, name)
+        if cls is not None:
+            return cls, module_constants(tree)
+    return None, {}
+
+
 def python_block(d: Deriver) -> dict:
     tree = parse_py(PY_API, d)
     if tree is None:
@@ -346,7 +373,7 @@ def python_block(d: Deriver) -> dict:
     out["lazy_submodules"] = sorted(lazy_subs)
     out["lazy_attributes"] = dict(sorted(lazy_attrs.items()))
 
-    base = class_named(tree, "_Base")
+    base, base_consts = find_class("_Base", d, tree, consts)
     if base is None:
         d.gap("python.shared_estimator_parameters", "_Base is gone")
         out["shared_estimator_parameters"] = {}
@@ -358,29 +385,29 @@ def python_block(d: Deriver) -> dict:
             d.gap("python.shared_estimator_parameters", "_Base.__init__ gone")
             out["shared_estimator_parameters"] = {}
         else:
-            out["shared_estimator_parameters"] = signature(init, consts)
-        fitted = value_of(assign_in(base.body, "_FITTED_ATTRS"), consts)
+            out["shared_estimator_parameters"] = signature(init, base_consts)
+        fitted = value_of(assign_in(base.body, "_FITTED_ATTRS"), base_consts)
         if fitted is UNDERIVED or fitted is None:
             d.gap("python.fitted_attributes", "_FITTED_ATTRS not a literal")
             out["fitted_attributes"] = []
         else:
             out["fitted_attributes"] = list(fitted)
-        out["parameter_aliases"] = alias_pairs(base, consts, d)
+        out["parameter_aliases"] = alias_pairs(base, base_consts, d)
 
     out["estimators"] = {}
     for name in ESTIMATORS:
-        cls = class_named(tree, name)
+        cls, cls_consts = find_class(name, d, tree, consts)
         if cls is None:
             d.gap(f"python.estimators.{name}", "class is gone")
             continue
         init = func_named(cls.body, "__init__")
-        methods, properties, classmethods = public_methods(cls, consts)
-        objectives = value_of(assign_in(cls.body, "_OBJECTIVES"), consts)
+        methods, properties, classmethods = public_methods(cls, cls_consts)
+        objectives = value_of(assign_in(cls.body, "_OBJECTIVES"), cls_consts)
         entry = {
             "bases": [
                 b.id for b in cls.bases if isinstance(b, ast.Name)
             ],
-            "own_parameters": signature(init, consts) if init else {},
+            "own_parameters": signature(init, cls_consts) if init else {},
             "methods": methods,
             "properties": properties,
             "classmethods": classmethods,
@@ -795,8 +822,13 @@ def environment_block(d: Deriver) -> dict:
     on a correct tree. Parsing rule 9: discard the bare prefix literal,
     which is a filter and not a variable.
     """
+    # The policy also backticks C preprocessor names (MOJOTREES_ABI_VERSION);
+    # a `#define` in the header is a macro, not an environment variable.
+    macros = set(
+        re.findall(r"^#define\s+(MOJOTREES_[A-Z0-9_]+)", read(CAPI_HEADER, d), re.MULTILINE)
+    )
     declared = sorted(
-        set(re.findall(r"`(MOJOTREES_[A-Z0-9_]+)`", read(POLICY, d)))
+        set(re.findall(r"`(MOJOTREES_[A-Z0-9_]+)`", read(POLICY, d))) - macros
     )
     observed: set = set()
     direct: set = set()

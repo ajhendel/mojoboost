@@ -62,7 +62,6 @@
   },
   "environment": {
     "declared": [
-      "MOJOTREES_ABI_VERSION",
       "MOJOTREES_AUTO_MIN_CELLS",
       "MOJOTREES_DISABLE_GPU",
       "MOJOTREES_GPU_BLOCK_THREADS",
@@ -152,9 +151,7 @@
       "MOJOTREES_HYBRID_TRACE",
       "MOJOTREES_STARTUP_TRACE"
     ],
-    "stale": [
-      "MOJOTREES_ABI_VERSION"
-    ],
+    "stale": [],
     "undeclared": [
       "MOJOTREES_BINNING_SELECT_MIN_ROWS",
       "MOJOTREES_CPU_COMPACT_MIN_ROWS",
