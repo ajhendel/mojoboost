@@ -86,6 +86,32 @@ change that quietly reassociates a Float64 sum, and this one does not.
   The two dispatch shapes preserve it in the same way `parallel.mojo` states:
   a group is never split across tasks, and a feature is never split across
   groups.
+
+**Why the group width, and not row blocks.** Widening the group divides both
+the gradient traffic and the task count by the same factor, so it trades
+memory traffic against parallel slack and neither term can be made large
+without shrinking the other. The decomposition that removes the trade is the
+obvious one: split a group's rows into blocks, give each block a private
+histogram, and fold the partials. Both counts go up together, and it is what
+the GPU tiled kernel already does.
+
+It is ruled out here, and the reason is the bit-identity proof above rather
+than a preference. A fold over contiguous ascending row blocks gives cell
+`(f, b)` the value
+
+    (sum of block 0's rows in b) + (sum of block 1's rows in b) + ...
+
+and Float64 addition is not associative, so that is a *different value* from
+adding the same rows one at a time in ascending order. It is not less
+accurate, and for many inputs it is more so; it is simply not the same bytes,
+and this project's histograms are bit-identical across every backend and every
+worker setting by construction rather than by tolerance. The block count would
+enter the result, `MOJOTREES_NUM_WORKERS` would stop being a scheduling knob,
+and sibling subtraction would stop being exact. Anyone reaching for row blocks
+is proposing to give all of that up, and should say so explicitly rather than
+discover it by breaking parity. The GPU path escapes the same argument only
+because it accumulates in fixed-point Int32, where addition *is* associative;
+see `_range_hist_partial_kernel` in `gpu_active_rows.mojo`.
 """
 
 from std.math import round
@@ -395,6 +421,15 @@ def _accumulate_full_at[
     arrive through a row-id list, so `grad[r]` and `hess[r]` are two separate
     lines *per row* rather than two streams, and gathering turns 2 * n_active
     indirect loads per row into two.
+
+    That refutation is about the gradient INPUT and says nothing about the
+    histogram OUTPUT. Interleaving the output cells, so that a bin's gradient
+    and hessian are adjacent and one update touches one line instead of two,
+    and narrowing `count` from a 64-bit `Int`, are separate proposals about
+    `Histogram`'s layout. They are exact, they are not refuted here, and they
+    are not this lane's to make: the layout is read by every consumer,
+    including the GPU download path and the C ABI, so it is its own change
+    behind its own profile.
     """
     var n_rows = data.n_rows
     var n_bins = data.n_bins

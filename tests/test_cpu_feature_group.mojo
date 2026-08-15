@@ -51,10 +51,13 @@ from mojotrees.apple_cpu_policy import (
     DEFAULT_FEATURE_GROUP,
     FEATURE_GROUP_LADDER,
     MAX_FEATURE_GROUP,
+    TASK_BALANCE_FACTOR,
     cache_feature_group,
     cpu_profile,
     derive_accumulation_plan,
     describe_cpu_policy,
+    dispatch_rounds,
+    dispatch_utilization_percent,
     env_feature_group,
     feature_group_count,
     feature_group_floor,
@@ -274,43 +277,97 @@ def test_derived_width_is_always_a_rung() raises:
             assert_true(is_feature_group_width(group))
             assert_true(group <= MAX_FEATURE_GROUP)
             assert_true(group <= cache_feature_group(machine, bins[b]))
+            assert_true(group <= schedule_feature_group(machine, actives[a]))
 
 
-def test_the_l1_estimate_binds_at_the_default_shape() raises:
-    """The number this lane turns on, pinned so a later edit to
-    `ASSUMED_L1D_BYTES` or `L1_GROUP_DIVISOR` has to come here and say so.
+def test_the_balance_rule_binds_before_the_cache_estimate() raises:
+    """The width this lane actually ships, pinned with both of the bounds that
+    could have chosen it, so a later edit to `ASSUMED_L1D_BYTES`,
+    `L1_GROUP_DIVISOR` or `TASK_BALANCE_FACTOR` has to come here and say so.
 
     At 255 bins a feature's slice is 255 * 24 = 6120 bytes, the assumed budget
     is 65536 / 2 = 32768, five slices fit, and the widest rung at or below
-    five is 4. On a ten-core profile with 50 active features the schedule
-    clamp allows 50 // 10 = 5, which floors to the same 4, so the two bounds
-    agree here and the width is 4.
+    five is 4. The balance rule is narrower: ten cores at
+    `TASK_BALANCE_FACTOR` 2 want 20 groups, `50 // 20 = 2`, so the width is 2
+    and not the 4 the cache estimate would have allowed. That is the
+    correction that keeps a byte count from choosing alone.
     """
     _reset_env()
     var machine = CpuProfile.synthetic(10, 4)
+    assert_equal(TASK_BALANCE_FACTOR, 2)
     assert_equal(cache_feature_group(machine, 255), 4)
-    assert_equal(schedule_feature_group(machine, 50), 4)
-    assert_equal(plan_feature_group(machine, 255, 50), 4)
-    # Low-cardinality data buys the width the cache estimate no longer
-    # denies: 32 bins is 768 bytes a slice, so the cache allows 16 and the
-    # ten-core schedule clamp is what binds.
+    assert_equal(schedule_feature_group(machine, 50), 2)
+    assert_equal(plan_feature_group(machine, 255, 50), 2)
+    # Low-cardinality data does not change the answer, because the cache
+    # estimate was never what bound: 32 bins is 768 bytes a slice, so the
+    # cache allows 16 and the balance rule still says 2.
     assert_equal(cache_feature_group(machine, 32), 16)
-    assert_equal(plan_feature_group(machine, 32, 50), 4)
-    assert_equal(plan_feature_group(machine, 32, 160), 16)
+    assert_equal(plan_feature_group(machine, 32, 50), 2)
+    # The rungs unlock at width * TASK_BALANCE_FACTOR * cores features.
+    assert_equal(plan_feature_group(machine, 32, 39), 1)
+    assert_equal(plan_feature_group(machine, 32, 40), 2)
+    assert_equal(plan_feature_group(machine, 32, 79), 2)
+    assert_equal(plan_feature_group(machine, 32, 80), 4)
+    assert_equal(plan_feature_group(machine, 32, 160), 8)
+    assert_equal(plan_feature_group(machine, 32, 320), 16)
+    # At 255 bins the cache estimate takes over above width 4, so a very wide
+    # matrix stops at 4 however many features it has.
+    assert_equal(plan_feature_group(machine, 255, 320), 4)
 
 
-def test_the_core_pool_no_longer_moves_the_width_at_255_bins() raises:
-    """`MOJOTREES_CPU_CORE_POOL=performance` used to change the interleave as
-    a side effect, because it changed the task count and a task holding one
-    feature could not pair. It changes the schedule clamp still, but at the
-    default bin count the cache estimate binds first, so the knob measures
-    core pools again rather than core pools and widths at once."""
+def test_utilization_is_the_number_the_byte_table_cannot_see() raises:
+    """The cost side of the width, computed the way the balance rule prices
+    it. 13 tasks on 10 cores is two rounds with seven cores idle through the
+    second; that is what width 4 would have bought at 50 features, and it is
+    why the balance rule exists."""
+    _reset_env()
+    assert_equal(dispatch_rounds(0, 10), 0)
+    assert_equal(dispatch_rounds(13, 10), 2)
+    assert_equal(dispatch_rounds(25, 10), 3)
+    assert_equal(dispatch_rounds(40, 10), 4)
+    assert_equal(dispatch_utilization_percent(0, 10), 0)
+    assert_equal(dispatch_utilization_percent(50, 10), 100)
+    assert_equal(dispatch_utilization_percent(40, 10), 100)
+    assert_equal(dispatch_utilization_percent(25, 10), 83)
+    assert_equal(dispatch_utilization_percent(13, 10), 65)
+    assert_equal(dispatch_utilization_percent(7, 10), 70)
+    assert_equal(dispatch_utilization_percent(4, 10), 40)
+    # The guaranteed floor for `n_tasks >= F * cores` is at `F * cores + 1`,
+    # one task past a whole number of rounds. On ten cores that is 70% at
+    # F = 2 and 82% at F = 4: what the factor buys is real but shallow, and
+    # weaker than the 83% the chosen shape happens to get.
+    assert_equal(
+        dispatch_utilization_percent(TASK_BALANCE_FACTOR * 10 + 1, 10), 70
+    )
+    assert_equal(dispatch_utilization_percent(41, 10), 82)
+
+
+def test_the_core_pool_still_moves_the_width_but_says_so() raises:
+    """A correction to an earlier claim in this file.
+
+    `MOJOTREES_CPU_CORE_POOL=performance` used to change the interleave as a
+    silent side effect, because it changed the task count and a task holding
+    one feature could not pair. It still changes the width, now through the
+    balance rule and in the stated direction: fewer dispatch cores means fewer
+    groups are needed, so a wider group is affordable. Four performance cores
+    want 8 groups, `50 // 8 = 6`, which floors to 4, against 2 on all ten
+    cores. That is a documented consequence of the rule rather than an
+    artefact of the splitter, but it is still a confound in a core-pool A/B,
+    and the way to hold the width fixed across that A/B is to set
+    `MOJOTREES_CPU_FEATURE_GROUP` explicitly for both arms.
+    """
     _reset_env()
     var machine = CpuProfile.synthetic(10, 4)
-    var all_cores = plan_feature_group(machine, 255, 50)
+    assert_equal(plan_feature_group(machine, 32, 50), 2)
     _ = setenv("MOJOTREES_CPU_CORE_POOL", "performance")
-    var perf_only = plan_feature_group(machine, 255, 50)
-    assert_equal(all_cores, perf_only)
+    assert_equal(schedule_feature_group(machine, 50), 4)
+    assert_equal(plan_feature_group(machine, 32, 50), 4)
+    # Pinning the knob holds the width across both arms, which is what a
+    # core-pool sweep has to do to be measuring one thing.
+    _set_group(2)
+    var perf_pinned = plan_feature_group(machine, 32, 50)
+    _ = setenv("MOJOTREES_CPU_CORE_POOL", "")
+    assert_equal(plan_feature_group(machine, 32, 50), perf_pinned)
     _reset_env()
 
 

@@ -35,14 +35,20 @@ What this module encodes
   The width is then floored to a rung of the ladder `histogram.mojo`
   instantiates its accumulation kernel at (1, 2, 4, 8, 16), because a width
   with no instantiation cannot run.
-- **A group width the schedule can actually deliver.** The interleave only
-  happens if one task holds a whole group, so the dispatch is over *groups*
-  rather than over features and the width is additionally capped so the group
-  count does not fall below the core count. Both halves matter: before this,
-  `parallel.plan_tasks` fanned 50 features over 40 tasks, 30 of which held a
-  single feature and therefore could not interleave anything, so a nominal
-  width of 2 ran at an effective 1.25 and the knob that changed the task count
-  silently changed the width too.
+- **A group width the schedule can actually deliver, and can afford.** The
+  interleave only happens if one task holds a whole group, so the dispatch is
+  over *groups* rather than over features. Before that, `parallel.plan_tasks`
+  fanned 50 features over 40 tasks, 30 of which held a single feature and
+  therefore could not interleave anything, so a nominal width of 2 ran at an
+  effective 1.25 and the knob that changed the task count silently changed the
+  width too.
+  Dispatching over groups makes the width real and makes its cost real with
+  it: the task count is now divided by exactly the factor the memory traffic
+  is. `TASK_BALANCE_FACTOR` is the price of that, a floor on how many groups
+  the width must leave per core, because a width chosen from bytes alone would
+  have put 13 tasks on a 10-core machine and idled seven of them through the
+  second barrier round. Both numbers are reported by `describe_cpu_policy`,
+  since a width without its utilization is half a decision.
 - **Work estimates that include zeroing.** A tree node's histogram build
   costs one write of the whole `n_features * n_bins` output plus one
   accumulate per (active feature, row). On a small node the first term
@@ -159,14 +165,51 @@ comptime CORE_POOL_PERFORMANCE = 1
 # Nothing here is measured. Wider is strictly less gradient traffic and
 # strictly more live histogram slices and register pressure, and where those
 # two cross on any particular core is a benchmark's answer, not this comment's.
+#
+# And wider is NOT free even before the hardware is consulted, which is the
+# correction that produced `TASK_BALANCE_FACTOR` below. A group is the dispatch
+# unit, so widening divides the task count by exactly the factor it divides the
+# traffic by. Byte counts cannot see that, and a plan chosen from byte counts
+# alone would have shipped 13 tasks on a 10-core machine here.
 comptime FEATURE_GROUP_LADDER = 5
 """Rungs in the feature-group ladder, counting 1."""
 
 comptime MAX_FEATURE_GROUP = 16
 comptime DEFAULT_FEATURE_GROUP = MAX_FEATURE_GROUP
 """What the policy asks for before the clamps: the widest rung there is. The
-L1 estimate, the active feature count, and the core count are what actually
+L1 estimate, the core count, and the active feature count are what actually
 choose, which is the point of deriving a width instead of naming one."""
+
+# Groups per dispatch core the resolved width must leave, when the feature
+# count allows it. The balance rule, and the reason width is not chosen from
+# memory traffic alone.
+#
+# The arithmetic. `T` equal-cost tasks over `C` cores under a barrier finish
+# in `ceil(T / C)` rounds, so utilization is `T / (C * ceil(T / C))`. That is
+# 100% only when C divides T, and over all `T >= F * C` its worst case is at
+# `T = F * C + 1`, one task past a whole number of rounds, giving
+# `(F * C + 1) / ((F + 1) * C)`. On ten cores that is 70% at F = 2, 77% at
+# F = 3 and 82% at F = 4; as C grows it tends to `F / (F + 1)`. So the factor
+# buys a floor on how much of the machine the last round can waste, and the
+# floor is not steep: going from 2 to 4 buys twelve points of guarantee.
+#
+# Why 2 and not 4. The floor is a guarantee, not the typical case, and at the
+# shape this lane exists for it is not what binds: 50 features on 10 cores at
+# width 2 is 25 groups, 3 rounds, 25/30 = 83%. Raising the factor to 4 would
+# demand 40 groups and force width 1 on that same shape, which is to say it
+# would revert the lane on the only shape it was written for. 3 would demand
+# 30 groups and force width 1 as well. 2 is therefore the largest factor that
+# leaves any interleave at all at 50 features on this machine, and that is the
+# whole of its derivation: it is a boundary, not an optimum.
+#
+# It is unmeasured in both directions. Two things it does not model: cores here
+# are not equal (a task on an efficiency core sets the pace of its round, so
+# the real cost of a partial round is worse than the fraction suggests), and
+# the accumulation may be memory-bound well before every core is busy (in which
+# case idle cores cost less than this rule prices them at). Only an interleaved
+# wall-time A/B settles it. `MOJOTREES_CPU_FEATURE_GROUP` is how it is swept,
+# and `bench/apple/cpu_plan.json` states the comparison that would move it.
+comptime TASK_BALANCE_FACTOR = 2
 
 # Below this many rows a node's gradients and hessians are small enough to
 # stay in cache across every feature's pass, so gathering them into a
@@ -492,32 +535,68 @@ def cache_feature_group(profile: CpuProfile, n_bins: Int) -> Int:
     return feature_group_floor(budget // slice_bytes)
 
 
+def dispatch_rounds(n_tasks: Int, cores: Int) -> Int:
+    """Barrier rounds `n_tasks` equal-cost tasks take on `cores` cores.
+
+    The crude model the balance rule is priced with, written down so it can be
+    disagreed with: greedy scheduling, equal task costs, equal cores, one
+    barrier at the end. Real cores here are not equal, so this understates the
+    cost of a partial round rather than overstating it.
+    """
+    if n_tasks <= 0 or cores <= 0:
+        return 0
+    return (n_tasks + cores - 1) // cores
+
+
+def dispatch_utilization_percent(n_tasks: Int, cores: Int) -> Int:
+    """Core-seconds used over core-seconds elapsed, as a percentage.
+
+    `n_tasks / (cores * dispatch_rounds(...))`, truncated. 13 tasks on 10
+    cores is 65: two rounds, seven cores idle through the second. 25 on 10 is
+    83, 40 on 10 is 100. This is the number a memory-traffic table cannot see,
+    and reporting a width without it is how a change that halves traffic and
+    halves the task count gets recorded as a win.
+    """
+    var rounds = dispatch_rounds(n_tasks, cores)
+    if rounds <= 0:
+        return 0
+    return (100 * n_tasks) // (cores * rounds)
+
+
 def schedule_feature_group(profile: CpuProfile, n_active: Int) -> Int:
-    """The widest rung that still leaves one group per dispatch core.
+    """The widest rung that still leaves `TASK_BALANCE_FACTOR` groups per core.
 
     A group is the dispatch unit, so `n_active` features at width N offer
     `feature_group_count(n_active, N)` units of parallelism and no more.
-    Widening past the point where that count drops below the core count trades
-    cores for gradient traffic, and a barrier-synchronized fan-out that leaves
-    cores idle loses in a way that is predictable rather than hypothetical, so
-    the conservative direction is to stop widening there.
+    Widening divides the task count by the same factor it divides the gradient
+    traffic by, and under a barrier that is a real and predictable loss, so the
+    width is bounded by what the schedule can still balance.
 
-    `dispatch_cores()` and not `max_auto_tasks()`: the 4x over-decomposition
-    exists to hide the cost of a task landing on an efficiency core, and
-    applying it here would cap the width at 1 on every shape this project
-    cares about (50 features over 40 tasks leaves one feature per task). One
-    group per core is the floor; whether over-decomposition is worth more than
-    interleave width above that floor is unmeasured, and
-    `MOJOTREES_CPU_FEATURE_GROUP` is how the other arm gets run.
+    Worked, on the shape this lane exists for: 50 active features on a 10-core
+    profile. The rule asks for `2 * 10 = 20` groups, `50 // 20 = 2`, and 2 is a
+    rung, so the width is 2 and the dispatch is 25 groups in 3 rounds at 83%
+    utilization. Width 4 would have been 13 groups in 2 rounds at 65%, and
+    width 8 seven groups in one round at 70%. The rungs unlock at
+    `n_active >= width * TASK_BALANCE_FACTOR * cores`, which on this machine is
+    40 features for width 2, 80 for width 4, 160 for width 8, and 320 for 16.
 
-    Fewer features than cores gives 1, which is exactly today's behaviour on
-    such a shape and gives up nothing: there was never a second feature for a
-    task to interleave.
+    `dispatch_cores()` and not `max_auto_tasks()`: the 4x over-decomposition is
+    itself a balance device against unequal cores, and counting it here as well
+    would demand 400 groups and cap the width at 1 on every shape this project
+    cares about. The two floors are for the same problem and applying both
+    would double-charge for it.
+
+    Fewer features than `TASK_BALANCE_FACTOR * cores` gives 1, which is what
+    the dispatch already did on such a shape and gives up nothing measurable:
+    there was never a wide group for a task to hold.
     """
     var cores = profile.dispatch_cores()
     if cores < 1:
         return 1
-    return feature_group_floor(n_active // cores)
+    var wanted_groups = TASK_BALANCE_FACTOR * cores
+    if wanted_groups < 1:
+        wanted_groups = 1
+    return feature_group_floor(n_active // wanted_groups)
 
 
 def plan_feature_group(
@@ -533,10 +612,16 @@ def plan_feature_group(
     kernel's tail group owns only the features that remain.
 
     Otherwise the width is the narrowest of what the cache estimate allows,
-    what the core count leaves parallel, and what `n_active` features can fill,
-    floored to a rung throughout. Whatever it returns, the result is
-    bit-identical: the width changes how many features share one walk of the
-    rows, never the order in which any one feature's bins are summed.
+    what the balance rule leaves schedulable, and what `n_active` features can
+    fill, floored to a rung throughout. The three are independent bounds and
+    which one binds depends on the shape: at 255 bins and 50 features on ten
+    cores the balance rule binds at 2 while the cache estimate would have
+    allowed 4, and at 32 bins the cache estimate allows 16 while the balance
+    rule still says 2.
+
+    Whatever it returns, the result is bit-identical: the width changes how
+    many features share one walk of the rows, never the order in which any one
+    feature's bins are summed.
     """
     var requested = env_feature_group()
     if requested > 0:
@@ -672,4 +757,22 @@ def subtract_ops(n_cells: Int) -> Int:
 
 
 def describe_cpu_policy(profile: CpuProfile, plan: AccumulationPlan) -> String:
-    return String(profile.describe(), " | ", plan.describe())
+    """One line carrying both halves of the width decision.
+
+    The utilization figure is appended here rather than in
+    `AccumulationPlan.describe` because it needs the core count, which the plan
+    does not carry. It is the number that makes a wide group's cost visible
+    next to its benefit; a benchmark header that prints only the width is
+    reporting half of the trade.
+    """
+    var cores = profile.dispatch_cores()
+    return String(
+        profile.describe(),
+        " | ",
+        plan.describe(),
+        " rounds=",
+        dispatch_rounds(plan.group_count, cores),
+        " utilization=",
+        dispatch_utilization_percent(plan.group_count, cores),
+        "%",
+    )
