@@ -79,6 +79,7 @@ from .objective_registry import (
 )
 from .tree import Tree, TreeParams, grow_tree, node_bounds
 from .tree_parameters_extra import ExtraTreeParams, finish_leaf_output
+from .validation import check_weights
 
 # The objective codes, and what they mean, live in objective_registry.mojo.
 # They are bound back here under the names this module has always exported,
@@ -271,13 +272,9 @@ def _check_sample_weight(weights: List[Float64], n: Int) raises:
         return
     if len(weights) != n:
         raise Error("sample_weight length must equal n_rows")
-    var total = 0.0
-    for r in range(n):
-        if weights[r] < 0.0:
-            raise Error("sample_weight entries must be nonnegative")
-        total += weights[r]
-    if total <= 0.0:
-        raise Error("sample_weight must have a positive sum")
+    # Finite, nonnegative, positive sum: `validation.check_weights` is the
+    # rule; the length message above is kept because callers match on it.
+    _ = check_weights(weights, n)
 
 
 def _check_goss(goss: GossParams, bagging: BaggingParams) raises:

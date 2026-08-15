@@ -53,6 +53,7 @@ from .device import CPU_DEVICE, parse_device
 from .objective_registry import MULTICLASS as _MULTICLASS
 from .efb import check_bundling_supported
 from .sampling import canonical_data_sample_strategy
+from .validation import check_booster_ranges, check_max_bin
 from .growth_policy import parse_grow_policy
 from .tree import TreeParams
 from .tree_parameters_extra import (
@@ -385,35 +386,22 @@ def _validate(config: TrainConfig, saw_num_class: Bool) raises:
     specific checks on the label values stay in boosting.mojo, which sees
     the labels; the `alpha` range checks are here as well as there, so a
     parameter string is rejected before any data is read."""
-    if config.booster.n_estimators < 0:
-        raise Error("num_iterations must be nonnegative")
-    if config.booster.learning_rate <= 0.0:
-        raise Error("learning_rate must be positive")
-    if config.booster.tree.num_leaves < 2:
-        raise Error("num_leaves must be at least 2")
-    if config.booster.tree.min_data_in_leaf < 0:
-        raise Error("min_data_in_leaf must be nonnegative")
-    if config.booster.tree.min_child_hess < 0.0:
-        raise Error("min_sum_hessian_in_leaf must be nonnegative")
-    if config.booster.tree.lambda_l1 < 0.0:
-        raise Error("lambda_l1 must be nonnegative")
-    if config.booster.tree.lambda_reg < 0.0:
-        raise Error("lambda_l2 must be nonnegative")
-    if (
-        config.booster.tree.feature_fraction <= 0.0
-        or config.booster.tree.feature_fraction > 1.0
-    ):
-        raise Error("feature_fraction must be in (0, 1]")
-    if (
-        config.booster.tree.feature_fraction_bynode <= 0.0
-        or config.booster.tree.feature_fraction_bynode > 1.0
-    ):
-        raise Error("feature_fraction_bynode must be in (0, 1]")
-    if (
-        config.booster.tree.feature_fraction_bylevel <= 0.0
-        or config.booster.tree.feature_fraction_bylevel > 1.0
-    ):
-        raise Error("feature_fraction_bylevel must be in (0, 1]")
+    # The data-independent booster ranges, from the one place that holds
+    # them; `callback.check_resettable` applies the same call to a reset.
+    var tree = config.booster.tree
+    check_booster_ranges(
+        config.booster.n_estimators,
+        config.booster.learning_rate,
+        tree.num_leaves,
+        tree.max_depth,
+        tree.min_data_in_leaf,
+        tree.min_child_hess,
+        tree.lambda_l1,
+        tree.lambda_reg,
+        tree.feature_fraction,
+        tree.feature_fraction_bynode,
+        tree.feature_fraction_bylevel,
+    )
     # The data-independent half of the remaining tree controls. The per-
     # feature vectors are checked against the dataset later, in
     # `tree.grow_tree`, because a parameter string cannot carry one.
@@ -428,8 +416,7 @@ def _validate(config: TrainConfig, saw_num_class: Bool) raises:
         config.booster.bundling.enabled, config.device == CPU_DEVICE
     )
     config.booster.bundling.check()
-    if config.max_bin < 2:
-        raise Error("max_bin must be at least 2")
+    check_max_bin(config.max_bin)
 
     if config.objective == HUBER and config.alpha <= 0.0:
         raise Error("alpha must be positive for objective 'huber'")

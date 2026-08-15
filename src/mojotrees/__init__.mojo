@@ -562,3 +562,21 @@ from .serialize import (
     save_model,
     save_multiclass_model,
 )
+from .validation import (
+    CancelToken,
+    check_booster_ranges,
+    check_class_codes,
+    check_compressed,
+    check_dataset_columns,
+    check_features_finite,
+    check_group_counts,
+    check_labels_finite,
+    check_loaded_tree,
+    check_multiclass_inputs,
+    check_ranking_inputs,
+    check_relevance_labels,
+    check_shape,
+    check_training_inputs,
+    check_valid_set,
+    check_weights,
+)
