@@ -52,13 +52,10 @@ INTENTIONAL DIFFERENCES FROM LightGBM
   degenerate round. LightGBM has no such guard.
 """
 
+from .rng import GOLDEN, splitmix64, uniform
+
 # LightGBM's bagging_seed default.
 comptime DEFAULT_BAGGING_SEED = 3
-
-comptime _GOLDEN = UInt64(0x9E3779B97F4A7C15)
-
-# 2^-53, scaling a 53-bit integer into [0, 1).
-comptime _TWO_POW_NEG_53 = 1.0 / 9007199254740992.0
 
 
 @fieldwise_init
@@ -81,26 +78,12 @@ struct BaggingParams(Copyable, Movable):
         return BaggingParams(1.0, 0, DEFAULT_BAGGING_SEED)
 
 
-def _splitmix64(state: UInt64) -> UInt64:
-    """splitmix64's mixing function: a bijection with full avalanche, so
-    consecutive counter values produce independent-looking draws."""
-    var z = state + _GOLDEN
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EB
-    return z ^ (z >> 31)
-
-
-def _uniform(counter: UInt64) -> Float64:
-    """Uniform in [0, 1) with 53 significant bits, from a counter value."""
-    return Float64(_splitmix64(counter) >> 11) * _TWO_POW_NEG_53
-
-
 def _stream(seed: Int, bag_index: Int) -> UInt64:
     """Start of the counter stream for one bag. The sign bit is masked off
     so negative seeds are accepted (as in LightGBM) without relying on
     signed-to-unsigned conversion."""
-    return _splitmix64(
-        UInt64(seed & 0x7FFFFFFFFFFFFFFF) ^ (UInt64(bag_index) * _GOLDEN)
+    return splitmix64(
+        UInt64(seed & 0x7FFFFFFFFFFFFFFF) ^ (UInt64(bag_index) * GOLDEN)
     )
 
 
@@ -135,7 +118,7 @@ def sample_rows(
     var min_draw = 2.0
     var min_row = 0
     for r in range(n_rows):
-        var u = _uniform(stream + UInt64(r))
+        var u = uniform(stream + UInt64(r))
         if u < params.fraction:
             rows.append(r)
         if u < min_draw:
