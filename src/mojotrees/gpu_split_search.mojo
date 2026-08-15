@@ -2560,7 +2560,20 @@ struct GpuSplitSearcher(Movable):
     # The histogram this searcher owns, in `GpuHistogramBuilder`'s layout, for
     # callers that stage a histogram through the host. The zero-copy path
     # passes the builder's own buffer to `enqueue` instead.
+    #
+    # Allocated on first use rather than at construction, because neither
+    # device search path touches it: `enqueue` and `enqueue_frontier` are
+    # handed the builder's buffer, and only `upload_histogram` and `search`,
+    # which exist so the search is exercisable on its own, read this one.
+    # At the default 255 bins and a 50-feature fit that is 153 KB of device
+    # memory per searcher that a fit allocated and never addressed. Until
+    # `_ensure_hist` runs it holds a single placeholder element, since a
+    # zero-length device buffer is not portable.
     var hist_dev: DeviceBuffer[DType.int32]
+    var hist_owned: Bool
+    """Whether `hist_dev` has been sized for a `3 * n_features * n_bins`
+    histogram yet. False on a searcher that has only ever been driven by the
+    trainer."""
     # Per-record tables. `feat_dev` and `allow_dev` are strided by
     # `n_features` rather than by a batch's slot count, so narrowing one
     # node's feature set never moves another node's row, which is the same
@@ -2687,11 +2700,11 @@ struct GpuSplitSearcher(Movable):
         for _ in range(max_records):
             self.active_len.append(n_features)
 
-        var hist_size = n_features * n_bins
         var table_cells = max_records * n_features
-        self.hist_dev = self.ctx.enqueue_create_buffer[DType.int32](
-            3 * hist_size
-        )
+        # A placeholder until `_ensure_hist` sizes it, because a
+        # zero-length device buffer is not portable. See the field.
+        self.hist_dev = self.ctx.enqueue_create_buffer[DType.int32](1)
+        self.hist_owned = False
         self.node_dev = self.ctx.enqueue_create_buffer[DType.int32](
             max_records * NODE_WORDS
         )
@@ -2947,6 +2960,21 @@ struct GpuSplitSearcher(Movable):
                 var s = signs[f] if len(signs) > 0 else MONOTONE_FREE
                 dst.unsafe_store(f, Int32(s))
 
+    def _ensure_hist(mut self) raises:
+        """Size the searcher's own histogram buffer, once, on first use.
+
+        Both callers are the standalone path (`upload_histogram` and
+        `search`); a searcher the trainer drives never reaches either and
+        therefore never pays for the buffer. Sizing is a construction-time
+        fact (`n_features` and `n_bins` never change), so this can only run
+        once, and it runs before the copy or the launch that needs it."""
+        if self.hist_owned:
+            return
+        self.hist_dev = self.ctx.enqueue_create_buffer[DType.int32](
+            3 * self.n_features * self.n_bins
+        )
+        self.hist_owned = True
+
     def upload_histogram(mut self, words: List[Int32]) raises:
         """Stage a fixed-point `[grad | hess | count]` histogram into this
         searcher's own buffer. The trainer integration uses the zero-copy
@@ -2956,6 +2984,7 @@ struct GpuSplitSearcher(Movable):
             raise Error(
                 "histogram must hold 3 * n_features * n_bins Int32 words"
             )
+        self._ensure_hist()
         self.ctx.enqueue_copy(
             dst_buf=self.hist_dev, src_ptr=words.unsafe_ptr()
         )
@@ -3136,6 +3165,10 @@ struct GpuSplitSearcher(Movable):
         """Search the histogram staged by `upload_histogram` and return its
         record."""
         self._check_record(record)
+        # Ordinarily a no-op, since `upload_histogram` has run and sized the
+        # buffer; it is here so that this method never launches against the
+        # placeholder, whatever order a caller uses.
+        self._ensure_hist()
         self._stage_params(params, g_scale, h_scale, bounds, record)
         self.stage_node.unsafe_ptr().unsafe_store(
             record * NODE_WORDS + NODE_HIST_BASE, Int32(0)

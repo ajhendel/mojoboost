@@ -267,7 +267,7 @@ restructuring that removes the multiply from the neighborhood of the add
 entirely. The GPU incident took the second option and it is the better one,
 because the result then holds independently of what any optimizer decides.
 
-## 4. The two incidents from this round
+## 4. The three incidents from this round
 
 ### 4.1 CPU, the score update
 
@@ -323,6 +323,55 @@ there is nothing left for any compiler to fuse, on any backend, at any release.
 
 That is the strongest form of the fix available and it is the pattern to copy.
 
+### 4.3 GPU, the score update and prediction, found by audit rather than by accident
+
+The first two incidents were found because somebody restructured code and a
+test that compared bits caught the consequence. The third was found the other
+way round: this document's own fragility ranking named two sites as possibly
+already inconsistent, and a test was written to settle it. They were
+inconsistent.
+
+The same arithmetic, `raw[i] + learning_rate * value[node]`, existed in
+`gpu_objectives_native.mojo` in three spellings. `_update_raw_kernel` read
+`node` per-thread out of the leaf-assignment array, so its product varied
+across the launch and the Metal compiler contracted it. `_range_add_raw_kernel`
+took `node` as a launch argument, so its product was uniform, was hoisted, and
+was rounded on its own. `_range_table_add_raw_kernel` had no multiply at all,
+because an earlier fix in the same round moved it to the host.
+
+Measured on an Apple M4, one four-split tree over 3,000 rows, driving all three
+arms over the same partition and the same node values: the per-thread arm
+disagreed with both range arms on **2,225 of 3,000 rows**, every one by exactly
+one unit in the last place. Classified against host references built so that the
+unfused reference itself could not contract, the per-thread arm matched the
+**fused** answer on all 2,225 separable rows and the unfused answer only on the
+775 where the two roundings coincide. It was fused, not intermittently fused.
+
+`gpu_predict.mojo`'s kernel had the same shape and disagreed on **992 of 2,000**
+rows in the same way.
+
+The consequence is what makes this an incident rather than a curiosity. A device
+fit's raw scores depended on nothing but whether the run was bagged, because the
+bagging and all-rows arm reached the contracting kernel and the device-resident
+arm did not. And a device prediction disagreed with the raw-score update the
+trainer had applied to that same tree. Neither is a defensible thing for a
+library to do, whichever of the two answers is preferred.
+
+Both kernels now take a precomputed step and contain no multiply, so there is
+nothing left to fuse at either site on any backend at any release.
+`_range_add_raw_kernel` deliberately keeps its inline product: no trainer
+reaches it, it is the reference arm, and its device-computed unfused answer is
+what pins the host-side multiply as bit-equal to the device one. Fixing it too
+would leave the table arm compared only against itself.
+
+This moved what the GPU computes, by one unit in the last place per tree, which
+on the training arm compounds into a different model rather than a different
+last digit. It was landed deliberately, on the argument that two paths which
+must agree and do not is a defect, that the fix direction removes the dependence
+on an optimizer rather than relocating it, and that the CPU golden fixture is
+untouched. There is no GPU golden fixture yet; there should be, and that is the
+obvious next piece of enforcement.
+
 ## 5. The convention at each kind of site
 
 What follows is an audit of every place on the numerics path where a floating
@@ -354,8 +403,8 @@ is structurally immune.
 | `linear_tree.mojo:1045, 1061, 1915` | same shape for linear trees | fused | fused | **different model** |
 | `gpu_objectives_native.mojo:537` `_range_table_add_raw_kernel` | add only, step precomputed on host | no multiply | **unfused product, computed on the host** | nothing, structurally immune |
 | `gpu_objectives_native.mojo:445` `_range_add_raw_kernel` | inline product, `node` is a launch argument | unfused, because the product is launch-uniform and gets hoisted | unfused, to match the host-computed step | **different model.** Held only by launch uniformity |
-| `gpu_objectives_native.mojo:413` `_update_raw_kernel` | inline product, `node` is per-thread | **fused** | unstated | **different model.** See section 8 |
-| `gpu_predict.mojo:274` | `acc += learning_rate * values[node]`, `node` per-thread | **fused** | unstated | **different predictions.** See section 8 |
+| `gpu_objectives_native.mojo:413` `_update_raw_kernel` | takes a precomputed step; no multiply | none to fuse | unfused by construction | fixed. Was fused, and measurably disagreed; see section 4.3 |
+| `gpu_predict.mojo:274` | accumulates a precomputed step; no multiply | none to fuse | unfused by construction | fixed. Was fused, and measurably disagreed; see section 4.3 |
 
 The convention here is plain, even though it is not currently stated anywhere in
 the source. **The score update is fused.** Every host-side variant of `raw[r] +=
@@ -677,18 +726,21 @@ These are ranked by the product of how likely the optimizer is to change its min
 and how bad it would be if it did. None of them is asserted to be wrong today.
 They are the places where "wrong tomorrow" is cheapest.
 
-1. **`gpu_objectives_native.mojo:413`, `_update_raw_kernel`.** An inline Float32
-   multiply feeding an add, with `node` read per-thread from `leaf_ids[r]`. This
-   is the exact shape that the kernel at `:495` documents as having produced the
-   wrong last bit, and it did not receive the host-multiply fix. It is reached
-   from `train_gpu.mojo:2772` and from `gpu_fused_round.mojo:553`, so it is the
-   bagging and all-rows arm of the device round. Its answer can differ by one ulp
-   from the range-table arm that was fixed. **This is the site to look at first,
-   and it may already be inconsistent rather than merely fragile.**
+1. **Resolved, and it was not fragile, it was broken.** The first two entries in
+   this list were `gpu_objectives_native.mojo:413` and `gpu_predict.mojo:274`,
+   both flagged here as "may already be inconsistent rather than merely
+   fragile". They were. `tests/test_gpu_fma_consistency.mojo` measured it on the
+   M4: over one four-split tree on 3,000 rows, the per-thread arm disagreed with
+   both range arms on 2,225 of them, every time by one unit in the last place,
+   and matched the fused host reference on every separable row. The predict
+   kernel disagreed on 992 of 2,000. Both now take a precomputed step and
+   contain no multiply. See section 4.3.
 
-2. **`gpu_predict.mojo:274`.** `acc += learning_rate * values[node]` inside the
-   2D-grid predict kernel, with `node` walked per-thread. Same shape, and it is
-   on the prediction path and on the `accumulate != 0` training path.
+   The lesson worth keeping is about this document rather than about those two
+   sites: when an audit classifies a site as "fragile" from its source shape, it
+   is stating a hypothesis, and the cost of testing it here was one test file.
+   Two of the first two entries in a fragility ranking turned out to be live
+   defects. Rank by cost of being wrong, then measure the top of the list.
 
 3. **`gpu_objectives_native.mojo:445`, `_range_add_raw_kernel`.** The reference
    kernel the fixed one is pinned against. Its unfused answer is held **only** by

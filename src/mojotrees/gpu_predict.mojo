@@ -206,7 +206,7 @@ def _sigmoid32(x: Float32) -> Float32:
 def _predict_kernel(
     bins: MutPointer[UInt8, MutAnyOrigin],
     nodes: MutPointer[Int32, MutAnyOrigin],
-    values: MutPointer[Float32, MutAnyOrigin],
+    steps: MutPointer[Float32, MutAnyOrigin],
     cat_pool: MutPointer[UInt64, MutAnyOrigin],
     tree_root: MutPointer[Int32, MutAnyOrigin],
     base: MutPointer[Float32, MutAnyOrigin],
@@ -215,7 +215,6 @@ def _predict_kernel(
     n_outputs: Int32,
     iter_begin: Int32,
     iter_end: Int32,
-    learning_rate: Float32,
     include_base: Int32,
     accumulate: Int32,
 ):
@@ -232,6 +231,20 @@ def _predict_kernel(
     (see `IterationRange`), and `accumulate` adds into the output buffer
     instead of overwriting it, which is how a training loop folds one round's
     trees into a resident raw-score vector.
+
+    Why this takes steps and not values and a learning rate
+    -------------------------------------------------------
+    The accumulation used to read `acc += learning_rate * values[node]`, and
+    since `node` is where a per-thread walk ended, the product varied across
+    the launch and the device compiler contracted it into the accumulator.
+    That made a prediction disagree with the raw-score update the trainer
+    applies to the same tree, whose device kernels do not contract, by one
+    unit in the last place per tree. `upload_ensemble` therefore multiplies
+    the leaf values by the ensemble's shrinkage on the host, in Float32, and
+    ships the products; this kernel has no multiply left in it and cannot
+    fuse anything, on any backend, at any release. See
+    `gpu_objectives_native.mojo`'s `_range_table_add_raw_kernel` for the
+    rounding argument in full and for the incident that established it.
     """
     var r = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
     var nr = Int(n_rows)
@@ -271,7 +284,7 @@ def _predict_kernel(
                 node = Int(nodes[unsafe_offset = nb + NODE_LEFT][0])
             else:
                 node = Int(nodes[unsafe_offset = nb + NODE_RIGHT][0])
-        acc += learning_rate * values[unsafe_offset=node][0]
+        acc += steps[unsafe_offset=node][0]
 
     var idx = r * n_out + k
     if accumulate != 0:
@@ -924,12 +937,18 @@ struct GpuPredictor(Movable):
     var ctx: DeviceContext
     # Flat ensemble, device side.
     var nodes_dev: DeviceBuffer[DType.int32]
-    var values_dev: DeviceBuffer[DType.float32]
+    var steps_dev: DeviceBuffer[DType.float32]
+    """One `learning_rate * value` per ensemble node, shrunk on the host at
+    upload so the walk kernel has no multiply to contract. Only leaf entries
+    are ever read."""
     var cat_dev: DeviceBuffer[DType.uint64]
     var root_dev: DeviceBuffer[DType.int32]
     var base_dev: DeviceBuffer[DType.float32]
     var n_trees: Int
     var learning_rate: Float64
+    """The shrinkage of the uploaded ensemble. No kernel reads it: it is
+    already folded into `steps_dev`, and it is recorded here so a caller can
+    see which ensemble the device holds."""
     # Batch scoring buffers, grown on demand. Transfers are sized by the
     # buffer, not by the batch, so a batch smaller than the high-water mark
     # stages through a pinned host buffer of the buffer's own size rather
@@ -1012,7 +1031,7 @@ struct GpuPredictor(Movable):
         # Zero-length device buffers are not portable, so every buffer that
         # is not sized yet holds a single placeholder element.
         self.nodes_dev = self.ctx.enqueue_create_buffer[DType.int32](1)
-        self.values_dev = self.ctx.enqueue_create_buffer[DType.float32](1)
+        self.steps_dev = self.ctx.enqueue_create_buffer[DType.float32](1)
         self.cat_dev = self.ctx.enqueue_create_buffer[DType.uint64](1)
         self.root_dev = self.ctx.enqueue_create_buffer[DType.int32](1)
         self.base_dev = self.ctx.enqueue_create_buffer[DType.float32](n_outputs)
@@ -1060,7 +1079,7 @@ struct GpuPredictor(Movable):
         self.nodes_dev = self.ctx.enqueue_create_buffer[DType.int32](
             len(flat.nodes)
         )
-        self.values_dev = self.ctx.enqueue_create_buffer[DType.float32](
+        self.steps_dev = self.ctx.enqueue_create_buffer[DType.float32](
             len(flat.values)
         )
         self.cat_dev = self.ctx.enqueue_create_buffer[DType.uint64](pool_len)
@@ -1068,11 +1087,21 @@ struct GpuPredictor(Movable):
             len(flat.tree_root)
         )
 
+        # The shrinkage is applied here, not in the kernel. `Float32(lr) *
+        # Float32(value)` is one single-precision multiply that feeds a
+        # store, so it cannot contract, and the walk then only ever adds;
+        # `_predict_kernel` says why that matters and what it cost when the
+        # multiply lived on the device instead.
+        var lr32 = Float32(flat.learning_rate)
+        var steps = List[Float32](capacity=len(flat.values))
+        for i in range(len(flat.values)):
+            steps.append(lr32 * flat.values[i])
+
         self.ctx.enqueue_copy(
             dst_buf=self.nodes_dev, src_ptr=flat.nodes.unsafe_ptr()
         )
         self.ctx.enqueue_copy(
-            dst_buf=self.values_dev, src_ptr=flat.values.unsafe_ptr()
+            dst_buf=self.steps_dev, src_ptr=steps.unsafe_ptr()
         )
         self.ctx.enqueue_copy(
             dst_buf=self.root_dev, src_ptr=flat.tree_root.unsafe_ptr()
@@ -1084,9 +1113,14 @@ struct GpuPredictor(Movable):
             self.ctx.enqueue_copy(
                 dst_buf=self.cat_dev, src_ptr=flat.cat_pool.unsafe_ptr()
             )
-        # The copies read host memory owned by the caller's `flat`, so they
-        # have to complete before this returns.
+        # The copies read host memory owned by the caller's `flat`, and one
+        # of them reads the `steps` list built above, so they have to
+        # complete before this returns. `steps` is kept alive explicitly
+        # across the synchronize: its last ordinary use is the `unsafe_ptr`
+        # the copy took, and a value whose last use has passed is free to be
+        # destroyed.
         self.ctx.synchronize()
+        _ = steps^
 
     def reserve_rows(mut self, n_rows: Int) raises:
         """Size the batch buffers for `n_rows`. Grows only: a smaller batch
@@ -1168,7 +1202,7 @@ struct GpuPredictor(Movable):
         self.ctx.enqueue_function[_predict_kernel](
             bins_ptr,
             self.nodes_dev.unsafe_ptr(),
-            self.values_dev.unsafe_ptr(),
+            self.steps_dev.unsafe_ptr(),
             self.cat_dev.unsafe_ptr(),
             self.root_dev.unsafe_ptr(),
             self.base_dev.unsafe_ptr(),
@@ -1177,7 +1211,6 @@ struct GpuPredictor(Movable):
             Int32(self.n_outputs),
             Int32(rng.start),
             Int32(rng.stop),
-            Float32(self.learning_rate),
             Int32(1) if include_base else Int32(0),
             Int32(1) if accumulate else Int32(0),
             grid_dim=(self._row_blocks(n_rows), self.n_outputs),
