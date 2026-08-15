@@ -130,6 +130,7 @@ status word, and the row in the sections below is the whole story.
 | LightGBM model file interop | partial | yes | yes | yes | yes | no | n/a | n/a | `src/mojotrees/lgbm_model_io.mojo` is the converter; `bindings/lgbm_bindings.mojo` binds its four file-level entry points (`lgbm_interop_status`, `lgbm_file_unsupported_reason`, `lgbm_import_file`, `lgbm_export_file`) and `python/mojotrees/lgbm_model_io.py` (a lazy submodule, `mojotrees.lgbm_model_io`) wraps them as `interop_status`, `unsupported_reason`, `convert_to_mojotrees`, `convert_from_mojotrees`, `load_lightgbm_model`, `save_lightgbm_model`; every conversion goes through a mojotrees model file. `tests/test_lgbm_model_io.mojo` in `pixi run test`; `python/tests/test_lgbm_interop.py` round-trips a fitted booster. `partial` because the status text says what it says: no file a real LightGBM build wrote has been read and no file written here has been read back by LightGBM (the first use warns once), monotone constraints are not read out of the file (the two booster constructions in this file stay exempted from check 10 in `tools/check_parity.py`), and `is_linear=1` is refused |
 | Remaining tree-parameter rules | partial | yes | yes | yes | yes | n/a | n/a | n/a | `src/mojotrees/tree_parameters_extra.mojo`, with `tests/test_tree_parameters_extra.mojo`. Most of the bundle is wired as of this revision. `src/mojotrees/split.mojo` imports and calls `passes_min_gain`, `apply_monotone_penalty`, `extra_threshold_index`, and `finish_leaf_output`, which covers `min_gain_to_split`, `monotone_penalty`, `extra_trees` with `extra_seed`, `max_delta_step`, and `path_smooth`; forced splits reach the grower through `binning.map_forced_splits`; and `src/mojotrees/params.mojo` parses each of those keys, so they are reachable through the parameter string. `feature_contri` and the CEGB penalties are live too as of this revision: `split._feature_gain` applies `FeaturePenalties.penalized_gain` for the multiplier and `cegb.CegbNodeCosts.adjusted_gain_at` for every CEGB term, one line apart. `feature_contri` is reachable from the Python estimator; the two CEGB vectors are Mojo-API-only (see the CEGB rows) |
 | Apple GPU tuning policy | partial | yes | yes | no | yes | n/a | yes | n/a | `src/mojotrees/apple_gpu_policy.mojo` with `tests/test_apple_gpu_policy.mojo`. It is read now, in two places: `src/mojotrees/device_policy.mojo` takes `GpuProfile` and `partial_budget_bytes` from it for the device profile and the session memory estimate, and `src/mojotrees/apple_histogram_policy.mojo` takes its `derive_block_threads`. What it still does not do is decide any default launch: `apple_histogram_policy` resolves to `SPEC_LEVEL_BASELINE` unless `MOJOTREES_GPU_HIST_SPECIALIZATION` asks otherwise, so `src/mojotrees/gpu_tiling.mojo` remains the tiling policy in force. Note that `derive_block_threads` now names two different functions, one per module, with different signatures |
+| NVIDIA and AMD GPU backend policy | deferred | yes | no | no | yes | n/a | no | n/a | `src/mojotrees/gpu_vendor_policy.mojo`, the merge of the two former per-vendor twins (f23bd1b), with `tests/test_gpu_vendor_policy.mojo` in `pixi run test`. Nothing reads it. `src/mojotrees/gpu_tiling.mojo` is still the geometry in force, and no NVIDIA or AMD device has ever run this project's kernels, so every function that would select a specialized kernel variant refuses unless `MOJOTREES_GPU_BACKEND_UNVALIDATED=1` acknowledges that. The test is host arithmetic over reported numbers and opens no device, which is the only way any of it can be exercised here. `docs/GPU_BACKEND_SPECIALIZATIONS.md`, `docs/GPU_VALIDATION.md` |
 | Per-level feature sampling | partial | yes | yes | yes | yes | n/a | n/a | n/a | `select_split_features` in `src/mojotrees/sampling.mojo`, with `tests/test_sampling.mojo`. `TreeParams.feature_fraction_bylevel` is carried through `src/mojotrees/tree.mojo`, `src/mojotrees/tree_sparse.mojo`, and `src/mojotrees/train_gpu.mojo`, `src/mojotrees/params.mojo` parses it under LightGBM's spelling and XGBoost's `colsample_bylevel`, and the distributed and device split-search paths refuse it by name rather than ignoring it. `select_level_features` itself still has no caller. It is XGBoost's parameter, so it is an extension rather than a parity row, and no Python estimator parameter reaches it |
 | GPU packed-bin layout | deferred | yes | no | no | no | n/a | n/a | n/a | `src/mojotrees/gpu_binned_layout.mojo` plans a packed layout over the bit primitives in `src/mojotrees/gpu_bin_packing.mojo`. The module is reached as of this revision and the layout is still not planned: `src/mojotrees/histogram_gpu.mojo` imports `check_layout_support` and calls it when the builder opens, which refuses a feature count or an `n_rows * n_features` cell count that would wrap an Int32 index. That is one guard, not a packed plan: no caller builds a `BinLayoutPlan` (`plan_feature_major`, `plan_row_major`, `plan_feature_blocked` are named only in prose elsewhere), nothing calls `pack_binned_matrix` or a `gpu_bin_packing` primitive, and no suite imports either module. `docs/INTEGRATION_INVENTORY.md` |
 | Depth-wise (level-wise) growth | different | yes | yes | yes | yes | n/a | n/a | n/a | `TreeParams.grow_policy` / Python `grow_policy=` / parameter string `grow_policy` (`leafwise` default, `depthwise`; XGBoost's names, LightGBM has no such switch). Order decided by `src/mojotrees/growth_policy.mojo` `GrowthSchedule` (the one pick both policies go through), followed by `tree.grow_tree` (`src/mojotrees/tree.mojo`), `tree_sparse.grow_tree_sparse` (`src/mojotrees/tree_sparse.mojo`), and all three loops in `src/mojotrees/train_gpu.mojo`; the distributed prototype rejects it. `tests/test_grow_policy.mojo`. The batched per-level device launch the design doc argues for (`docs/design/GPU_LEVELWISE.md`) is unbuilt: depth-wise on the GPU costs the same launches as leaf-wise today |
@@ -161,8 +162,8 @@ package during the version 1 audit.
 | `Booster` | supported | `mojotrees.Booster`: prediction, evaluation, feature importance, model IO, iteration counts, and continued training with `update()`. The estimators hold one on `booster_`, so there is a single model object. `dump_model` is not a method; `mojotrees.inspection.dump_model(model)` is the dump, section 0 | `python/mojotrees/basic.py`, `python/tests/test_basic.py` |
 | `Dataset` | supported | `mojotrees.Dataset`, over the Mojo `Dataset` in `src/mojotrees/trainset.mojo`: data, label, weight, group, init score, feature names, categorical declaration, and binning metadata, binned once and reused. Immutable once constructed; see section 5 for the mutators mojotrees does not have | `python/mojotrees/basic.py`, `src/mojotrees/trainset.mojo`, `tests/test_trainset.mojo` |
 | `train` | supported | `mojotrees.train(params, train_set, num_boost_round, valid_sets, valid_names, init_model)`. Trains the same trees the estimators train, which `python/tests/test_basic.py` asserts bit for bit. `init_model` continues from a fitted booster. No per-round history or early stopping here; those are on the estimators' `fit` | `python/mojotrees/basic.py` |
-| `cv` | partial | `python/mojotrees/cv.py` implements it: folds, `stratified`, `shuffle`, caller-supplied `folds` or a scikit-learn splitter, `metrics`, `feval`, `fpreproc`, `init_model`, `eval_train_metric`, `return_cvbooster`, and early stopping, returning LightGBM's `{metric-mean, metric-stdv}` history. It re-bins per fold rather than slicing a constructed `Dataset`, so fold binning cannot leak. Reachable only as `from mojotrees.cv import cv`: it is not in `mojotrees.__all__`, which section 2 of `docs/COMPATIBILITY_POLICY.md` makes the definition of public. Section 0 | `python/mojotrees/cv.py`, `python/tests/parallel/test_cv.py` |
-| `CVBooster` | partial | With `cv`, and reachable the same narrow way | `python/mojotrees/cv.py` |
+| `cv` | partial | `python/mojotrees/cv.py` implements it: folds, `stratified`, `shuffle`, caller-supplied `folds` or a scikit-learn splitter, `metrics`, `feval`, `fpreproc`, `init_model`, `eval_train_metric`, `return_cvbooster`, and early stopping, returning LightGBM's `{metric-mean, metric-stdv}` history. It re-bins per fold rather than slicing a constructed `Dataset`, so fold binning cannot leak. `mojotrees.cv(params, train_set, ...)` is the call: the name is in `mojotrees.__all__`, which section 2 of `docs/COMPATIBILITY_POLICY.md` makes the definition of public, and the attribute resolves to the function rather than to the submodule of the same name (`_public_api_plan.NAME_COLLISIONS`). `partial` is about the parameter space exercised, not the reach. Section 0 | `python/mojotrees/cv.py`, `python/tests/parallel/test_cv.py` |
+| `CVBooster` | partial | With `cv`, and public the same way: `mojotrees.CVBooster` is in `__all__`, so an isinstance check on what `cv(return_cvbooster=True)` returns needs no submodule import | `python/mojotrees/cv.py` |
 | `early_stopping` | supported | `fit(callbacks=[early_stopping(rounds, first_metric_only=, verbose=, min_delta=)])`, and the `fit(early_stopping_rounds=, min_delta=)` spelling. The callback configures the trainer's own stopper rather than reimplementing the rule; passing both spellings raises. Differs in which round survives: the primary metric's best on the first validation set, not the pair that ran out of patience first | `python/mojotrees/callback.py`, `src/mojotrees/callback.mojo`, `src/mojotrees/custom_metric.mojo` |
 | `log_evaluation` | supported | `log_evaluation(period=, show_stdv=)`. `period<=0` is silent. `show_stdv` is accepted and inert on `fit`: it formats a cross-validation fold's spread, and `fit` has no folds | `python/mojotrees/callback.py`, `src/mojotrees/callback.mojo` |
 | `record_evaluation` | supported | `record_evaluation(dict)` fills the dict in place. `evals_result_` is still populated directly too; it starts one round earlier, at the base-score-only model | `python/mojotrees/callback.py`, `src/mojotrees/callback.mojo`, `python/mojotrees/__init__.py` |
@@ -616,36 +617,64 @@ quietly fixed, because each is somebody's in-flight work:
    Both cases skip in `pixi run -e pytest test-estimators`, which is the
    only Python test run CI performs, so section 6's rows are `partial`
    rather than `supported`.
-3. **`colsample_bytree` and `colsample_bynode` are not accepted** as aliases
-   even though the rest of the scikit-learn spellings are. Re-confirmed
-   against `_Base.__init__` in this audit.
-4. **Six modules are implemented, individually tested, and wired to
-   nothing.** `src/mojotrees/efb.mojo`, `src/mojotrees/inspection.mojo`, `src/mojotrees/lgbm_model_io.mojo`,
-   `src/mojotrees/distributed_transport.mojo`, `src/mojotrees/apple_gpu_policy.mojo`, and
-   `src/mojotrees/tree_parameters_extra.mojo` have no importer in `src/mojotrees/` and no
-   export from `src/mojotrees/__init__.mojo`. Their suites run in
-   `pixi run test`, which makes them look supported from the test output
-   alone. Section 0 scores each one.
-5. **Five Python modules are reachable only by an import the compatibility
-   policy calls private.** `python/mojotrees/cv.py`,
-   `python/mojotrees/inspection.py`, `python/mojotrees/dask.py`,
-   `python/mojotrees/device_selection.py`, and
-   `python/mojotrees/diagnostics.py` work when imported by path, and
-   section 2 of `docs/COMPATIBILITY_POLICY.md` says importing a `mojotrees`
-   submodule other than `basic` is not public. Either the names move into
-   `mojotrees.__all__` or the policy grows an exception; until one of those
-   happens their rows stay `partial` or `deferred`.
-   `python/mojotrees/_public_api_plan.py` is a lane's written proposal for
-   that export block. It is data, nothing imports it, and no name has moved
-   yet, which is why the rows above still read as they do.
-6. **Two docstrings outrank their code and are wrong.** The module
+3. ~~**`colsample_bytree` and `colsample_bynode` are not accepted** as
+   aliases even though the rest of the scikit-learn spellings are.~~ Closed
+   in this revision; `_Base.__init__` takes both and section 2 says so.
+4. **Two native modules are implemented, individually tested, and wired
+   to nothing.** `src/mojotrees/backend.mojo` and
+   `src/mojotrees/gpu_vendor_policy.mojo` have no importer outside
+   `tests/` and no export from `src/mojotrees/__init__.mojo`. Their suites
+   run in `pixi run test`, which makes them look supported from the test
+   output alone. Section 0 scores each one.
+
+   This item named six modules before 2026-08-15.
+   `src/mojotrees/efb.mojo`, `src/mojotrees/inspection.mojo`,
+   `src/mojotrees/lgbm_model_io.mojo`,
+   `src/mojotrees/distributed_transport.mojo`,
+   `src/mojotrees/apple_gpu_policy.mojo`, and
+   `src/mojotrees/tree_parameters_extra.mojo` were
+   wired by the integration round and each now has importers in
+   `src/mojotrees/` or `bindings/`.
+   `python3 tools/connectivity_audit.py` is the check, and its first
+   section is the live list; this item names only what that list has held
+   long enough to be a contract question rather than a lane in flight.
+5. **The names moved; the policy sentence did not.** `cv` and `CVBooster`
+   are in `mojotrees.__all__`, and so are `explain_device_choice`,
+   `dump_model`, `trees_to_dataframe`, `trees_to_records`, and
+   `get_split_value_histogram`, which `__getattr__` resolves out of
+   `device_selection` and `inspection` on first access. That closes this
+   item for the two modules it was written about.
+
+   What is left is three submodules that `_LAZY_SUBMODULES` in
+   `python/mojotrees/__init__.py` makes reachable as `mojotrees.dask`,
+   `mojotrees.diagnostics`, and `mojotrees.lgbm_model_io` after a plain
+   `import mojotrees`, and that export nothing at the top level on
+   purpose: dask's estimators raise `DistributedNotAvailable`, and the
+   LightGBM converter warns that no file a real LightGBM build wrote has
+   been read here. Section 6.1 of `docs/COMPATIBILITY_POLICY.md` still
+   reads "No other submodule is a supported import path", which is now a
+   sentence about three modules the package deliberately answers for.
+   Either it names them as supported-but-experimental or it says the
+   attribute is not a promise; their rows stay `partial` or `deferred`
+   either way, for reasons that are about what they can do, not about how
+   they are reached.
+
+   `python/mojotrees/_public_api_plan.py` is the record of all of it as
+   data, with the decision behind each name. Nothing imports it, which is
+   deliberate, and `python/tests/test_public_api_plan.py` compares every
+   factual table in it against the package so the record cannot drift
+   from the code without failing.
+6. ~~**Two docstrings outrank their code and are wrong.** The module
    docstring of `src/mojotrees/device.mojo` says multiclass is CPU only,
-   which `gpu_supports` in the same file contradicts. The
-   `prediction options` section of `python/mojotrees/__init__.py` says
-   "There are no built-in validation metrics in the Python API yet", which
-   the `validation sets and early stopping` section of the same docstring
-   contradicts and `python/mojotrees/_eval.py` refutes. Both are in files
-   this audit does not own.
+   and the `prediction options` section of
+   `python/mojotrees/__init__.py` says "There are no built-in validation
+   metrics in the Python API yet".~~ Closed in this revision; neither
+   sentence survives. `src/mojotrees/device.mojo` is now a re-export
+   facade over `src/mojotrees/device_policy.mojo` and describes
+   `gpu_supports_outputs` as covering "the class count for multiclass",
+   and the claim about validation metrics is gone from
+   `python/mojotrees/__init__.py`, which `python/mojotrees/_eval.py`
+   always refuted.
 7. **Split gains are absent from every dump**, because
    `src/mojotrees/serialize.mojo` does not write them and
    `bindings/_mojotrees.mojo` exposes no `split_gains` hook. Anything built

@@ -341,11 +341,23 @@ def histogram_capabilities(
     """The capability record `apple_histogram_policy.derive_histogram_plan`
     consumes, built from a backend contract.
 
-    The one way a non-Metal device reaches the existing specialization
-    planner. Until now `DeviceHistogramCapabilities.portable()` was the only
-    constructor anything called, so every device planned as if it had
-    reported nothing, and the specialization layer was reachable in practice
-    only through the Apple-named module that constructs the profile.
+    The way a non-Metal device would reach the existing specialization
+    planner, and it does not reach it yet. This is the only constructor of
+    a `DeviceHistogramCapabilities` that carries a reported number, and its
+    only caller is `gpu_vendor_policy.vendor_histogram_capabilities`, which
+    no entry point reaches. Every construction in the shipping path is
+    `DeviceHistogramCapabilities.portable()` (`histogram_gpu.mojo`, the
+    builder and `histogram_plan`), so every device still plans as if it had
+    reported nothing.
+
+    What blocks it is upstream of this function and is not a subgroup width
+    that went missing. `histogram_gpu` builds its contract from
+    `apple_histogram_policy.profile_from_caps`, which hardcodes
+    `API_UNKNOWN`, while the builder already holds the real `ctx.api()` and
+    uses it for the Metal-only feature-group default. Until the profile
+    carries the API the builder knows, a contract built from it cannot say
+    which backend it is, and the portable floor is the honest answer rather
+    than a missed opportunity.
 
     `wide_byte_loads` stays False on every backend. It is the one field that
     is a measurement rather than a specification, no measurement exists on

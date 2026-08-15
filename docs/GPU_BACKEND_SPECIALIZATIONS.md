@@ -25,14 +25,15 @@ Against `docs/CAPABILITY_LEVELS.md`, the two modules described here are:
 | implemented | yes | yes | `src/mojotrees/gpu_vendor_policy.mojo` (formerly `gpu_cuda_policy.mojo` + `gpu_amd_policy.mojo`) |
 | integrated | no | no | no shipping code path imports either module; see "Exact integration requests" |
 | publicly reachable | no | no | not exported from `src/mojotrees/__init__.mojo` |
-| focused-tested | no | no | no test file exists; this lane was forbidden to write or run one |
+| focused-tested | yes | yes | `tests/test_gpu_vendor_policy.mojo`, in `pixi run test`, 35 assertions over both traits through one set of cases, all host arithmetic, no device opened |
 | differential-tested | n/a | n/a | LightGBM has no counterpart to a per-backend launch policy |
 | hardware-validated | no | no | no NVIDIA or AMD device has ever run this project's kernels |
 | release-packaged | no | no | nothing in `packaging/` references either module |
 
-`docs/LIGHTGBM_PARITY.md` should carry these two rows as `deferred`, which
-is the status that file defines for an implemented and unintegrated module.
-The exact row text is in `handoffs/remaining_11_gpu_backends.md`.
+`docs/LIGHTGBM_PARITY.md` carries this as one `deferred` row, "NVIDIA and
+AMD GPU backend policy", which is the status that file defines for an
+implemented and unintegrated module. The two rows became one when the
+twins merged.
 
 ## Why a per-backend policy exists at all
 
@@ -346,9 +347,12 @@ variable of its own.
 
 ## Exact integration requests
 
-None of these were applied. Each one is another lane's file, and the
-mechanically applicable form of each, with signatures and call sites, is in
-`handoffs/remaining_11_gpu_backends.md`.
+None of these were applied. Each one is another lane's file. The handoff
+that held the mechanically applicable form of each, with signatures and
+call sites, was `handoffs/remaining_11_gpu_backends.md`, deleted in
+21ff9fa with the rest of that round's handoffs; `git show
+21ff9fa^:handoffs/remaining_11_gpu_backends.md` is where it lives now, and
+its symbol names predate the mojoboost -> mojotrees rename.
 
 ### Shared kernels and the GPU dataflow lane
 

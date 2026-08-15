@@ -315,7 +315,25 @@ The policy from the first release onward:
 **Import surface.** `import mojotrees` gives the names in `__all__`, and
 `mojotrees.callback` gives the callback factories under their own module,
 as LightGBM does. No other submodule is a supported import path.
-`mojotrees.inspection` is the open case; see section 8.1.
+
+`mojotrees.inspection` was the open case and is closed: `dump_model`,
+`trees_to_dataframe`, `trees_to_records`, and `get_split_value_histogram`
+are in `__all__`, resolved out of the submodule by `__getattr__` on first
+access, so the names are public and the module that holds them is still
+layout. `explain_device_choice` reaches `mojotrees.device_selection` the
+same way, and `cv` and `CVBooster` are imported eagerly. Section 8.1.
+
+Three submodules answer to `__getattr__` without exporting anything:
+`mojotrees.dask`, `mojotrees.diagnostics`, and
+`mojotrees.lgbm_model_io`. The attribute resolving is a convenience for a
+reader, not a promise under this section, and each is experimental on its
+own terms. dask's estimators raise `DistributedNotAvailable`, and the
+LightGBM converter carries `EXPERIMENTAL = True` and warns on first use.
+`python/mojotrees/_public_api_plan.py` records why each name stayed out,
+and `python/tests/test_public_api_plan.py` holds that record to the code.
+Naming them as supported, or saying in as many words that the attribute
+is not a promise, is the successor to the inspection question; the
+release gate carries it as item C5.
 
 **numpy.** Optional. Every documented path works with plain Python
 sequences, and this stays true. numpy is never a hard dependency.
@@ -497,16 +515,18 @@ and adding an optional key does not bump it, so a consumer must ignore
 keys it does not know. That is the rule, and it is the schema doc's to
 keep rather than this one's.
 
-**One thing is unresolved, and it is a section 2 question.** `inspection`
-is a submodule with its own `__all__`. Nothing in it is re-exported from
-`python/mojotrees/__init__.py`, and section 6.1 says no submodule except
-`mojotrees.callback` is a supported import path. So as the tree stands,
-`mojotrees.inspection.dump_model` is real, documented, and formally
-outside the public surface. Two ways to close that, and one of them has
-to happen before the first tagged release: re-export the inspection names
-at the top level the way the callback names are, or add
-`mojotrees.inspection` to the supported import paths in section 6.1. The
-release gate carries it as item C5.
+**That section 2 question is resolved.** `inspection` is a submodule with
+its own `__all__`, and until 2026-08-15 nothing in it was re-exported
+from `python/mojotrees/__init__.py`, which left
+`mojotrees.inspection.dump_model` real, documented, and formally outside
+the public surface. It closed by the first of the two ways this section
+offered: `dump_model`, `trees_to_dataframe`, `trees_to_records`, and
+`get_split_value_histogram` are in `mojotrees.__all__` and resolve the
+submodule lazily on first access, so the four names are public under
+section 2 and the module stays layout. The rest of `inspection.__all__`,
+and `parse_model_string` behind the DELETION POINT banner, are reachable
+as `mojotrees.inspection.<name>` and are not public;
+`python/mojotrees/_public_api_plan.py` says why for each.
 
 The rest of what a fitted model will tell you, and what each part
 guarantees:
@@ -838,9 +858,13 @@ without renumbering a reference somewhere else in this document.
 - **C4.** `best_score_` resolved for this release, either as the scalar
   this policy documents or as the LightGBM-shaped dict, with the decision
   in the release notes. Section 5.4.
-- **C5.** `mojotrees.inspection` resolved for this release, either
-  re-exported at the top level or added to the supported import paths of
-  section 6.1. Section 8.1.
+- **C5.** The lazy submodules resolved for this release. `inspection` and
+  `device_selection` are done: their user-facing names are in `__all__`,
+  which is the first of the two ways section 8.1 offered. What is left is
+  `mojotrees.dask`, `mojotrees.diagnostics`, and
+  `mojotrees.lgbm_model_io`, which `__getattr__` answers for and which
+  export nothing: section 6.1 either names them as supported import paths
+  or says the attribute is not a promise. Sections 6.1 and 8.1.
 
 **D. Honesty**
 
