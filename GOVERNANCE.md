@@ -183,7 +183,7 @@ merged pull requests over time, substantive review activity, and reliability
 work; it does not count raw commits or lines changed. Every run publishes an
 audit table, never demotes anyone, and can be disabled by removing one
 repository variable. During the public alpha, configured automation may grant
-Triage, Write, Maintain, and Admin without a human approval.
+Triage, Write, and Maintain without human approval. It never grants Admin.
 
 Write access does not mean ownership of an area, an obligation to keep
 contributing, or a duty to review other people's work. Contributors who go
@@ -197,12 +197,11 @@ or three is the target before the alpha ends, because a single administrator is
 a real risk to the project rather than a governance style.
 
 **Adding a maintainer.** A maintainer may be added through the public proposal
-process below or through the configured automated-access policy. For a manual
-addition, the maintainer proposes an active contributor in public, names what
-the person has done and why the access is warranted, and leaves seven days for
-responses. Automated promotion instead follows the measurable thresholds and
-audit trail in [docs/AUTOMATED_ACCESS.md](docs/AUTOMATED_ACCESS.md). Either
-route grants real administrative authority and is deliberately reversible.
+process below. The maintainer proposes an active contributor in public, names
+what the person has done and why the access is warranted, and leaves seven days
+for responses. Automated access stops at Maintain; its measurable history and
+audit trail in [docs/AUTOMATED_ACCESS.md](docs/AUTOMATED_ACCESS.md) can inform
+the decision but never grants administrative authority.
 
 What is being assessed is judgment under uncertainty and care with other
 people's trust, not volume of code. Somebody who reviews carefully, reproduces

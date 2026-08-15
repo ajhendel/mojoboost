@@ -20,7 +20,6 @@ The initial ladder is:
 | Triage | 2 | 2 | 14 days | 0 | no |
 | Write (`push`) | 4 | 3 | 30 days | 0 | no |
 | Maintain | 8 | 5 | 60 days | 2 | yes |
-| Admin | 12 | 8 | 90 days | 4 | yes |
 
 Every level also requires a GitHub account at least 90 days old. The evaluator
 does not count bots, unmerged pull requests, excluded/reverted changes, tiny
@@ -30,12 +29,12 @@ or documentation contribution `governance-credit`; the labels
 
 A reliability contribution touches tests, validation, packaging, workflows,
 CI tooling, or Python tests. This is only an abuse-resistant approximation of
-judgment. Because this project explicitly accepts alpha-stage governance risk,
-the configured workflow may promote through Admin without human approval.
+judgment, so automatic promotion stops at Maintain. The report makes sustained
+contributors visible, but an existing Admin must grant Admin explicitly.
 
-Promotions are monotonic. The automation never demotes or removes somebody.
-Access can be revoked manually at any time under repository **Settings →
-Collaborators and teams**.
+Promotions are monotonic. The automation never grants Admin, demotes, or
+removes somebody. Access can be changed or revoked manually at any time under
+repository **Settings → Collaborators and teams**.
 
 ## One-time GitHub App setup
 

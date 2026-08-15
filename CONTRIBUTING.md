@@ -70,7 +70,7 @@ results.
 
 The public repository accepts pull requests from anyone without an invitation.
 Sustained contributors may be promoted automatically through Triage, Write,
-Maintain, and Admin according to the public, auditable policy in
+and Maintain according to the public, auditable policy in
 [docs/AUTOMATED_ACCESS.md](docs/AUTOMATED_ACCESS.md). The policy uses merged
 pull requests over time and review/reliability work, not raw commit or line
-counts.
+counts. Admin access is always granted explicitly by an existing Admin.

@@ -37,14 +37,6 @@
       "minimum_span_days": 60,
       "minimum_reviews": 2,
       "require_reliability_contribution": true
-    },
-    {
-      "permission": "admin",
-      "minimum_merged_pull_requests": 12,
-      "minimum_distinct_contribution_days": 8,
-      "minimum_span_days": 90,
-      "minimum_reviews": 4,
-      "require_reliability_contribution": true
     }
   ]
 }
