@@ -95,7 +95,6 @@ from inspection_bindings import (
 from model_editing_bindings import (
     get_leaf_output,
     get_leaf_output_multiclass,
-    model_editing_operations,
     model_editing_status,
     refit,
     refit_multiclass,
@@ -428,7 +427,6 @@ def PyInit__mojotrees() abi("C") -> PythonObject:
         )
         # -- editing a fitted model (model_editing_bindings.mojo) ---------
         m.def_function[model_editing_status]("model_editing_status")
-        m.def_function[model_editing_operations]("model_editing_operations")
         m.def_function[rollback_one_iter]("rollback_one_iter")
         m.def_function[rollback_one_iter_multiclass](
             "rollback_one_iter_multiclass"

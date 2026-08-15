@@ -262,19 +262,6 @@ CLASSIFICATION = {
         "LightGBM cegb_* controls, complete and self-contained. Parked until "
         "a trainer accepts the cegb params and the boosting loop hooks it.",
     ),
-    "model_editing": (
-        PENDING,
-        "consolidation_K10",
-        "In-place leaf editing. Its MODEL_EDITING_SUPPORTED=True is the "
-        "feature's claim; inspection.mojo's False is what ships. Parked "
-        "until connected, when inspection re-exports this module's status.",
-    ),
-    "ranking_advanced": (
-        PENDING,
-        "consolidation_K10",
-        "Position bias, pair sampling, custom label gain, fold shuffle. "
-        "Parked until fit_ranker grows those parameters.",
-    ),
     "lgbm_model_io": (
         EXPERIMENTAL,
         "consolidation_K10",
@@ -944,10 +931,18 @@ def audit_unused_imports():
         # its own use.
         imports = mojo_imports(path, text)
         without_imports = strip_mojo_import_block(body)
+        # `X as _Y` binds the local name `_Y`; a use of `_Y` is a use of `X`.
+        aliases = dict(
+            re.findall(
+                r"\b([A-Za-z_][A-Za-z_0-9]*)\s+as\s+([A-Za-z_][A-Za-z_0-9]*)",
+                body,
+            )
+        )
         for module, names in sorted(imports.items()):
             unused = []
             for name in names:
-                if not re.search(r"\b%s\b" % re.escape(name), without_imports):
+                local = aliases.get(name, name)
+                if not re.search(r"\b%s\b" % re.escape(local), without_imports):
                     unused.append(name)
             if unused and len(unused) == len(names) and names:
                 findings.append(

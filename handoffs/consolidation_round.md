@@ -396,3 +396,35 @@ follow-up), and `lgbm_model_io` still refuses `is_linear=1`. Test:
 `tests/test_linear_tree.mojo` (3 passed). Commits b353bfd 4ab237d 7d7985e and
 the params.mojo / tree_parameters_extra.mojo follow-up. CEGB (Task A of the
 lane) was found mid-integration by another session (0ef2115) and left to it.
+
+W3, model editing and advanced ranking. `model_editing.mojo` is wired:
+`bindings/model_editing_bindings.mojo` (registered from `_mojotrees.mojo`)
+exposes rollback_one_iter / rollback_to, get_leaf_output / set_leaf_output,
+shuffle_models, refit (parameters as a mapping, since def_function is proven
+to eight arguments), and score_bounds, each with a `_multiclass` twin; leaf
+values cross on LightGBM's shrunk scale. `Booster` in basic.py gains
+LightGBM's rollback_one_iter, rollback_to, get_leaf_output, set_leaf_output,
+shuffle_models, refit, lower_bound, upper_bound; inspection.py's
+MODEL_EDITING_SUPPORTED is True and model_editing_support() returns the
+native status. The purposeful duplicate is gone: inspection.mojo re-exports
+model_editing's MODEL_EDITING_SUPPORTED and model_editing_status_json.
+Test: tests/test_model_editing.mojo (5 tests) plus a Python smoke run.
+`ranking_advanced.mojo` is wired through `advanced_ranking_requested`:
+`trainset.train_dataset_ranker_advanced` and the fit_ranker /
+train_dataset_ranker bindings route to train_ranker_advanced only when
+label_gain, lambdarank_position_bias_regularization (with a position
+column), pair_sampling_rate, or max_dcg_cutoff is set; a default run is the
+old call byte for byte. MojoTreesRanker exposes the five parameters and
+fit(position=...); Dataset(position=...) carries the column for the Booster
+path. ranking_advanced's check_relevance_labels is renamed
+check_labels_within_gain (validation.mojo's is the one python
+_validation.py names). Test: tests/test_ranking_advanced.mojo (4 tests) plus
+a Python smoke run. Left: fit with eval_set plus advanced ranking params is
+refused with a message (custom_metric.train_ranker_with_metrics computes the
+baseline lambdas; that file was held by W2 during this lane); labels above
+30 stay refused by trainset._relevance_labels even with a longer label_gain;
+no LightGBM differential for unbiased LambdaRank exists yet, so the parity
+row must not claim numeric parity. The audit's unused-import check now
+honors `X as _Y` aliases (it flagged aliased binding imports as unused).
+compatibility/api_snapshot.json needs one coordinator --write for the new
+additive Booster methods and Ranker parameters.
