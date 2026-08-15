@@ -382,26 +382,45 @@ def _init_raw_kernel(
 def _update_raw_kernel(
     raw: MutPointer[Float32, MutAnyOrigin],
     leaf_ids: MutPointer[Int32, MutAnyOrigin],
-    values: MutPointer[Float32, MutAnyOrigin],
+    steps: MutPointer[Float32, MutAnyOrigin],
     n_rows: Int32,
     n_classes: Int32,
     k: Int32,
     n_nodes: Int32,
-    learning_rate: Float32,
 ):
     """The device-resident prediction update: each row's raw score for class
-    `k` advances by `learning_rate * value[leaf]`, where `leaf` is the node
-    the row already sits in on the device.
+    `k` advances by `step[leaf]`, the already-shrunk value of the node the
+    row sits in on the device.
 
     This is the whole reason the leaf-assignment array is worth keeping
     around after a tree is grown. Every row ends a tree assigned to a leaf,
-    and leaf ids are node ids, so the tree's own `value` array is the lookup
+    and leaf ids are node ids, so the tree's own per-node step is the lookup
     table; no traversal, no feature reads, no host round trip.
 
     A row whose id is out of range (`OUT_OF_BAG`, or any id at or past the
     tree's node count) is left untouched: tree growth never routed it, so the
     device does not know its leaf. Under row bagging that is every
     out-of-bag row, and the caller has to score those rows some other way.
+
+    Why this takes a step and not a value and a learning rate
+    ---------------------------------------------------------
+    It used to compute `raw[i] + learning_rate * value[node]` inline, and
+    because `node` is read per-thread out of `leaf_ids` the product varied
+    across the launch and the device compiler contracted it into the add.
+    The two range kernels below do not contract: the per-leaf one takes
+    `node` as a launch argument, so its product is uniform and gets hoisted
+    and rounded on its own, and the range-table one has no multiply left in
+    it at all. So the same arithmetic on the same tree produced one answer
+    from this kernel and a different one, by one unit in the last place,
+    from either range kernel, and which one a fit got depended on nothing
+    but whether it was bagged.
+
+    The multiply now happens on the host, exactly as
+    `_range_table_add_raw_kernel` documents at length: `Float32(lr) *
+    Float32(value)` there is the same IEEE 754 single-precision multiply the
+    per-leaf kernel performs, with the same rounding, so the step that
+    crosses is the same bits. This kernel contains no multiply and there is
+    nothing left for any compiler to fuse, on any backend, at any release.
     """
     var r = global_idx.x
     if r >= Int(n_rows):
@@ -411,8 +430,7 @@ def _update_raw_kernel(
         return
     var i = r * Int(n_classes) + Int(k)
     raw[unsafe_offset=i] = (
-        raw[unsafe_offset=i][0]
-        + learning_rate * values[unsafe_offset = Int(node)][0]
+        raw[unsafe_offset=i][0] + steps[unsafe_offset = Int(node)][0]
     )
 
 
@@ -677,7 +695,10 @@ struct GpuObjectiveState(Movable):
     """Softmax probabilities in the same layout, or a placeholder when
     `n_classes == 1`."""
     var value_dev: DeviceBuffer[DType.float32]
-    """The current tree's node values, the lookup table `update_raw` reads."""
+    """The current tree's node values, the lookup table the per-leaf range
+    kernel reads. It is the only kernel that still applies the learning rate
+    itself, and it may because its `node` is a launch argument; every other
+    update arm reads `step_dev` instead."""
     var seg_dev: DeviceBuffer[DType.int32]
     """The current tree's live-range descriptors, `SEG_WORDS` Int32 apiece,
     which is what lets `update_raw_ranges` close a whole tree in one launch.
@@ -689,8 +710,10 @@ struct GpuObjectiveState(Movable):
     var step_dev: DeviceBuffer[DType.float32]
     """The current tree's per-node steps, `learning_rate * value[node]`
     already multiplied and rounded on the host. Read by the range-table
-    kernel, which is why that kernel contains no multiply; see it for the
-    rounding argument."""
+    kernel and by `_update_raw_kernel`, which is why neither contains a
+    multiply; see either for the rounding argument. The two never hold the
+    same tree's steps at once, since a round closes by one arm or the
+    other."""
     var stage_value: HostBuffer[DType.float32]
     """Pinned staging for the node-value table. `map_to_host` copies in both
     directions on every use and blocks (the reasoning is written out in
@@ -957,9 +980,18 @@ struct GpuObjectiveState(Movable):
 
         `leaf_dev` is the leaf-assignment array tree growth left behind (the
         histogram builder's), and `values` is the tree's node-value array,
-        already renewed and not yet shrunk: the kernel applies
-        `learning_rate` itself, so it consumes exactly `tree.value` and the
+        already renewed and not yet shrunk: this method applies
+        `learning_rate`, so it consumes exactly `tree.value` and the
         booster's learning rate.
+
+        The shrinkage is applied here on the host rather than in the kernel,
+        which is what makes this arm's answer equal to the two range arms'
+        rather than one unit in the last place away from it. `Float32(lr) *
+        Float32(value)` is the same single-precision multiply the per-leaf
+        range kernel performs on the device, so the step that crosses is the
+        same bits, and the kernel then does nothing but add it.
+        `_update_raw_kernel` and `_range_table_add_raw_kernel` both give the
+        argument in full.
 
         Only rows the device routed are updated. With no row bagging that is
         every row and the update is complete. Under bagging the out-of-bag
@@ -983,19 +1015,19 @@ struct GpuObjectiveState(Movable):
         for i in range(len(values)):
             if not isfinite(values[i]):
                 raise Error("node values must be finite")
-        with self.value_dev.map_to_host() as host:
+        var lr32 = Float32(learning_rate)
+        with self.step_dev.map_to_host() as host:
             var dst = host.unsafe_ptr()
             for i in range(len(values)):
-                dst.unsafe_store(i, Float32(values[i]))
+                dst.unsafe_store(i, lr32 * Float32(values[i]))
         ctx.enqueue_function[_update_raw_kernel](
             self.raw_dev.unsafe_ptr(),
             leaf_dev.unsafe_ptr(),
-            self.value_dev.unsafe_ptr(),
+            self.step_dev.unsafe_ptr(),
             Int32(self.n_rows),
             Int32(self.n_classes),
             Int32(k),
             Int32(len(values)),
-            Float32(learning_rate),
             grid_dim=self._row_blocks(),
             block_dim=self.block_threads,
         )
