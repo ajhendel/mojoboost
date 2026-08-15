@@ -19,9 +19,9 @@ tiling suite already covers for `derive_tiling`:
   on all five.
 - No crossover threshold is invented. `min_cells` is disabled everywhere,
   matching device.mojo, until a benchmark says otherwise.
-- The constants mirrored from gpu_tiling.mojo still equal their source, so
-  the two layers cannot silently disagree about a warp, a budget, or a
-  strategy code while the mirrors exist.
+- The portable geometry names this layer re-exports are gpu_tiling.mojo's
+  own, so the two layers cannot disagree about a warp, a budget, or a
+  strategy code.
 """
 
 from std.testing import assert_equal, assert_false, assert_true, TestSuite
@@ -57,20 +57,20 @@ from mojotrees.apple_gpu_policy import (
     apple_m4_observed,
     apple_synthetic,
     api_name,
-    derive_block_threads,
     derive_policy,
     describe_policy,
     parse_api,
     parse_apple_generation,
     partial_budget_bytes,
     resident_blocks_per_core,
+    shape_block_threads,
     shared_bytes_for_bins,
     strategy_name,
     synthetic_apple_core_count,
 )
 
-# The source of every mirrored constant. Aliased because both modules
-# deliberately spell these the same way.
+# The source of every re-exported constant. Aliased because both modules
+# spell these the same way.
 from mojotrees.gpu_tiling import (
     BYTES_PER_PARTIAL_CELL as TILING_BYTES_PER_PARTIAL_CELL,
     FALLBACK_MAX_THREADS_PER_BLOCK as TILING_FALLBACK_MAX_THREADS,
@@ -127,8 +127,9 @@ def _assert_covers_rows(n_rows: Int, n_tiles: Int, rows_per_tile: Int) raises:
 
 
 def test_mirrored_constants_match_gpu_tiling() raises:
-    """The mirrors exist so this layer stands alone while it lands. They
-    have to stay honest until they collapse into imports."""
+    """These names were once copies pinned equal to their source; they are
+    now re-exports of gpu_tiling.mojo, and this asserts the re-export path
+    resolves to the same values under this layer's spellings."""
     assert_equal(STRATEGY_AUTO, TILING_STRATEGY_AUTO)
     assert_equal(STRATEGY_ATOMIC, TILING_STRATEGY_ATOMIC)
     assert_equal(STRATEGY_TILED, TILING_STRATEGY_TILED)
@@ -362,7 +363,7 @@ def test_block_threads_are_launchable_and_shape_aware() raises:
         GpuProfile.from_reported("metal", "apple-m1", 7, 128, 16384),
     ]
     for i in range(len(profiles)):
-        var threads = derive_block_threads(profiles[i], 1_000_000)
+        var threads = shape_block_threads(profiles[i], 1_000_000)
         assert_equal(threads % WARP_GRANULARITY, 0)
         assert_true(threads >= WARP_GRANULARITY)
         assert_true(threads <= profiles[i].max_threads_per_block)
@@ -370,10 +371,10 @@ def test_block_threads_are_launchable_and_shape_aware() raises:
     # Narrow datasets do not launch a block whose lanes have no rows: 100
     # rows rounds down to one warp, not to the 256-thread target.
     var m4 = apple_m4_observed()
-    assert_equal(derive_block_threads(m4, 1_000_000), TARGET_BLOCK_THREADS)
-    assert_equal(derive_block_threads(m4, 100), WARP_GRANULARITY)
-    assert_equal(derive_block_threads(m4, 1), WARP_GRANULARITY)
-    assert_equal(derive_block_threads(m4, 200), 192)
+    assert_equal(shape_block_threads(m4, 1_000_000), TARGET_BLOCK_THREADS)
+    assert_equal(shape_block_threads(m4, 100), WARP_GRANULARITY)
+    assert_equal(shape_block_threads(m4, 1), WARP_GRANULARITY)
+    assert_equal(shape_block_threads(m4, 200), 192)
 
 
 def test_unified_memory_gets_a_tighter_partial_budget() raises:

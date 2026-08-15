@@ -121,8 +121,8 @@ from .apple_gpu_policy import (
     APPLE_GEN_UNKNOWN,
     MAX_RESIDENT_BLOCKS_PER_CORE,
     GpuProfile,
-    derive_block_threads,
     partial_budget_bytes,
+    shape_block_threads,
 )
 from .gpu_histogram_specializations import (
     WINDOW_NOT_A_RUN,
@@ -473,7 +473,7 @@ def _shape_block_threads(profile: GpuProfile, node_rows: Int) -> Int:
     warp multiple, at least one warp, and never above the device maximum."""
     var requested = _env_int("MOJOTREES_GPU_BLOCK_THREADS", 0)
     if requested < 1:
-        return derive_block_threads(profile, node_rows)
+        return shape_block_threads(profile, node_rows)
     return clamp_block_threads(requested, profile.max_threads_per_block)
 
 

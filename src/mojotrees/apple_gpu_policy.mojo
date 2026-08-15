@@ -51,10 +51,13 @@ What this module deliberately does NOT encode:
   the disabled sentinel has one definition rather than two.
 
 Where this module sits. It is the leaf of the device layer: it imports
-nothing, opens nothing, and is imported by `device_policy.mojo`, which
-turns a `GpuProfile` into the hardware half of a device decision. Keeping
-the dependency in that direction is what lets the whole policy stack be
-exercised on a machine with no accelerator.
+only `gpu_tiling.mojo` (for the portable geometry constants and the block
+clamp; that module opens no device either, its `DeviceContext` use is
+behind `query_device_caps`, which nothing here calls), opens nothing, and
+is imported by `device_policy.mojo`, which turns a `GpuProfile` into the
+hardware half of a device decision. Keeping the dependency in that
+direction is what lets the whole policy stack be exercised on a machine
+with no accelerator.
 
 The synthetic fixtures. `apple_synthetic()` returns a deliberately
 conservative capability profile per M-series generation, and every one of
@@ -69,48 +72,54 @@ generation range on a machine that has none of them, and each should be
 replaced by a reading from real hardware, clearing `synthetic`, as that
 hardware becomes available.
 
-Constants mirrored from `gpu_tiling.mojo` are marked below. They are copied
-rather than imported so this layer stands alone while it is being landed
-alongside other work on the tiling module; test_apple_gpu_policy.mojo
-asserts every mirror still equals its source, and handoffs/apple_a6_policy.md
-records that the mirrors should collapse into imports at integration.
+The portable geometry constants (`STRATEGY_*`, `TARGET_BLOCK_THREADS`,
+`WARP_GRANULARITY`, `BYTES_PER_PARTIAL_CELL`, `MAX_GRID_DIM_Y`, the
+`FALLBACK_*` reporting defaults, the `MIN_ROWS_PER_TILE_*` factors) and
+`strategy_name` are `gpu_tiling.mojo`'s, imported here and re-exported
+under the same names; earlier revisions carried copies, pinned equal by
+test_apple_gpu_policy.mojo, until the consolidation round of 2026-08
+collapsed them into these imports. What this module defines itself is only
+what is Apple-specific or profile-specific: the API and generation
+vocabulary, `GpuProfile` and its fixtures, the unified-memory partial
+budget, the residency estimate, the row-bounded block width, and the
+tuning plan over them.
 """
 
 
-# --- Mirrors of gpu_tiling.mojo. Pinned by test_apple_gpu_policy.mojo. ---
+from .gpu_tiling import (
+    BYTES_PER_PARTIAL_CELL,
+    FALLBACK_MAX_THREADS_PER_BLOCK,
+    FALLBACK_SHARED_MEMORY_PER_BLOCK,
+    FALLBACK_SM_COUNT,
+    MAX_GRID_DIM_Y,
+    MIN_ROWS_PER_TILE_BIN_FACTOR,
+    MIN_ROWS_PER_TILE_THREAD_FACTOR,
+    PARTIAL_BUDGET_BYTES,
+    STRATEGY_ATOMIC,
+    STRATEGY_AUTO,
+    STRATEGY_TILED,
+    TARGET_BLOCK_THREADS,
+    TARGET_BLOCKS_PER_SM,
+    WARP_GRANULARITY,
+    clamp_block_threads,
+    strategy_name,
+)
 
-comptime STRATEGY_AUTO = 0
-comptime STRATEGY_ATOMIC = 1
-comptime STRATEGY_TILED = 2
-
-# Threads per threadgroup to aim for: a warp multiple everywhere.
-comptime TARGET_BLOCK_THREADS = 256
-
-# AMD's wavefront, and a multiple of the 32-wide warp on NVIDIA and Apple.
-comptime WARP_GRANULARITY = 64
-
-# Int32 gradient + Int32 hessian + UInt32 count per (tile, feature, bin).
-comptime BYTES_PER_PARTIAL_CELL = 12
-
-# Smallest portable grid.y bound (CUDA's).
-comptime MAX_GRID_DIM_Y = 65535
+# The portable geometry constants above are gpu_tiling.mojo's, imported and
+# re-exported rather than restated: the strategy codes, the block target and
+# warp granularity, the partial-cell size, the grid.y bound, the reporting
+# fallbacks, and the rows-per-tile factors have one definition. The three
+# below are the same facts under the names this layer has always used.
 
 # Absolute ceiling on the partial-histogram buffer, whatever the device
 # budget is: past this the tiled strategy trades more memory than the atomic
 # one saves.
-comptime PARTIAL_BUDGET_CEILING_BYTES = 64 << 20
+comptime PARTIAL_BUDGET_CEILING_BYTES = PARTIAL_BUDGET_BYTES
 
 # Used when a backend reports nothing. Low rather than typical, for the
-# reason given in gpu_tiling.mojo.
-comptime FALLBACK_CORE_COUNT = 16
-comptime FALLBACK_MAX_THREADS_PER_BLOCK = 1024
-comptime FALLBACK_SHARED_MEMORY_PER_BLOCK = 16384
-
-# A tile must scan enough rows to amortize its partial histogram.
-comptime MIN_ROWS_PER_TILE_BIN_FACTOR = 8
-comptime MIN_ROWS_PER_TILE_THREAD_FACTOR = 4
-
-# --- End mirrors. ---
+# reason given in gpu_tiling.mojo. Cores on Apple, multiprocessors elsewhere:
+# the same reported quantity.
+comptime FALLBACK_CORE_COUNT = FALLBACK_SM_COUNT
 
 
 comptime API_UNKNOWN = 0
@@ -127,10 +136,10 @@ comptime APPLE_GEN_M5 = 5
 
 # Ceiling on threadgroups resident per core. The real bound is derived from
 # the reported threadgroup memory; this caps it so a narrow histogram cannot
-# ask for unbounded residency. Same value gpu_tiling.mojo uses as its fixed
-# target, so a device whose shared memory fits eight partials plans exactly
-# as it does today.
-comptime MAX_RESIDENT_BLOCKS_PER_CORE = 8
+# ask for unbounded residency. It is gpu_tiling.mojo's fixed target, so a
+# device whose shared memory fits that many partials plans exactly as the
+# portable rule does.
+comptime MAX_RESIDENT_BLOCKS_PER_CORE = TARGET_BLOCKS_PER_SM
 
 # Fraction of the reported memory budget the partial buffer may claim.
 # Unified memory gets the tighter one: that budget is also holding the
@@ -451,25 +460,26 @@ def resident_blocks_per_core(profile: GpuProfile, n_bins: Int) raises -> Int:
     return fits
 
 
-def derive_block_threads(profile: GpuProfile, n_rows: Int) -> Int:
+def shape_block_threads(profile: GpuProfile, n_rows: Int) -> Int:
     """Threads per threadgroup: a warp multiple, at least one warp, never
     above the device maximum, and never so wide that most lanes would sit
     idle over the rows available.
 
-    The row bound is the shape-driven part. A 256-thread block scanning 40
-    rows leaves seven eighths of its lanes with nothing to accumulate, which
-    matters most on the small core counts Apple reports, where those idle
-    lanes are a large fraction of the device.
+    The row bound is the shape-driven part, and the only part that is this
+    layer's: a 256-thread block scanning 40 rows leaves seven eighths of its
+    lanes with nothing to accumulate, which matters most on the small core
+    counts Apple reports, where those idle lanes are a large fraction of the
+    device. The clamp itself is `gpu_tiling.clamp_block_threads`, the one
+    rule for a launchable width, so a width this layer would produce is
+    never one the portable layer would refuse. (Formerly named
+    `derive_block_threads` here; renamed so the portable
+    `gpu_tiling.derive_block_threads`, which takes a `DeviceCaps` and reads
+    the block-threads override, is the only function of that name.)
     """
     var threads = TARGET_BLOCK_THREADS
-    if threads > profile.max_threads_per_block:
-        threads = profile.max_threads_per_block
     if n_rows > 0 and n_rows < threads:
         threads = n_rows
-    threads = (threads // WARP_GRANULARITY) * WARP_GRANULARITY
-    if threads < WARP_GRANULARITY:
-        threads = WARP_GRANULARITY
-    return threads
+    return clamp_block_threads(threads, profile.max_threads_per_block)
 
 
 @fieldwise_init
@@ -559,7 +569,7 @@ def derive_policy(
             "device shared memory too small for a per-threadgroup histogram"
         )
 
-    var block_threads = derive_block_threads(profile, n_rows)
+    var block_threads = shape_block_threads(profile, n_rows)
     var resident = resident_blocks_per_core(profile, n_bins)
 
     # Enough threadgroups to fill the device. The features are already
@@ -643,14 +653,6 @@ def derive_policy(
             CROSSOVER_DISABLED,
         ),
     )
-
-
-def strategy_name(strategy: Int) -> String:
-    if strategy == STRATEGY_ATOMIC:
-        return String("atomic")
-    if strategy == STRATEGY_TILED:
-        return String("tiled")
-    return String("auto")
 
 
 def describe_policy(profile: GpuProfile, policy: TuningPolicy) -> String:
