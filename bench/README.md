@@ -245,6 +245,33 @@ kernel fusion here has to justify itself as strictly less work for a
 bit-identical result, not by a measured speedup. Numbers from one GPU family
 say nothing about another; rerun this before quoting it elsewhere.
 
+## What a transfer costs on unified memory
+
+`bench/apple/unified_memory.mojo` runs one bandwidth-bound checksum kernel
+over the same payload through every host-to-device delivery route this Mojo
+version exposes (pinned staged copy, heap copy, mapped write, host pointer
+passed straight to the kernel) and one device-to-host route, and reports
+per route where the time went, whether the device saw the right bytes, and
+how many bytes mojotrees asked the runtime to copy. The methodology, the
+protocol a run must follow, and what each outcome licenses are in
+[docs/APPLE_UNIFIED_MEMORY.md](../docs/APPLE_UNIFIED_MEMORY.md).
+
+```sh
+pixi run bench-unified-memory              # 256 MiB, 8 rounds, rewrite mode
+pixi run bench-unified-memory 1024 8
+MOJOTREES_UM_MODE=resident pixi run bench-unified-memory 1024 8
+```
+
+The first run, UM-2026-08-15-M4-01, is
+[`results/apple_m4_unified_memory_2026-08-15.md`](results/apple_m4_unified_memory_2026-08-15.md).
+On that stack the staged copy ran at 75 to 85 GB/s (1 GiB in 12 to 14 ms),
+the host write of the payload was 85% to 90% of a round, the mapped-write
+route was correct and issued no copy and was 45% to 60% slower, and both
+host-pointer routes read or wrote the wrong bytes. The transfer is not where
+a GPU round's time goes on this machine, which is what the doc's "read a
+route win as a reason to run the trainer, not a substitute for it" was
+written to make explicit.
+
 ## Per-device GPU validation report
 
 `bench_gpu_validation.mojo` is the cross-vendor driver. It prints device

@@ -483,12 +483,15 @@ comptime ENABLE_LEVEL = EVIDENCE_TRAINER
 """What a route needs before it may be selected without an explicit
 acknowledgment.
 
-Deliberately the top rung. The transfer is one part of a boosting round, the
-only end-to-end GPU training measurement in this repository (M4,
-`bench/bench_train_gpu.mojo`) is slower than the CPU trainer, and it is
-dominated by per-node launches and full-dataset scans rather than by
-transfers. A driver win is therefore a reason to run the trainer, never a
-reason to change the trainer.
+Deliberately the top rung. The transfer is one part of a boosting round.
+The end-to-end GPU training measurement in this repository (M4,
+`bench/results/apple_m4_large_scaling_2026-08-14.md`) has the device
+trainer 2.6x to 3.3x ahead of the CPU trainer and still dominated by
+per-node launches and synchronizations rather than by transfers, and the
+driver's first run (UM-2026-08-15-M4-01) put the staged copy at 75 to 85
+GB/s, under a millisecond for a 1,000,000 x 50 binned matrix. A driver win
+is therefore a reason to run the trainer, never a reason to change the
+trainer.
 """
 
 
@@ -597,15 +600,87 @@ struct EvidenceLedger(Copyable, Movable):
 
     @staticmethod
     def installed() -> EvidenceLedger:
-        """What this repository has established about these routes: nothing.
+        """What this repository has established about these routes.
 
-        `bench/apple/unified_memory.mojo` has never been compiled and never
-        been run. When that changes, the rungs get set here, one at a time,
-        each with the record identifier of the run that earned it, and each
-        change is a change to a shipped default that a reviewer can see in a
-        diff.
+        One run so far, UM-2026-08-15-M4-01 (Apple M4, 16 GB, macOS 26.5.2,
+        Mojo 1.0.0, MAX 26.5.0; `bench/results/apple_m4_unified_memory_2026-08-15.md`
+        and the record section of `docs/APPLE_UNIFIED_MEMORY.md`). Every rung
+        below carries that identifier, and every rung it does not set stays
+        False: no route reached `no_second_allocation`, `no_blit`, or
+        `trainer`, so nothing here opens the `ENABLE_LEVEL` gate and the
+        shipped default is unchanged.
+
+        - `copy_staged`, `copy_direct`: compiled, checksum correct in every
+          launch. They issue copies by construction, so `checksum` is their
+          ceiling.
+        - `map_write`: compiled, checksum correct, no copy issued (Claim 1.5).
+          Also measured 45% to 60% slower per round than the staged copy in
+          `rewrite` mode, which the ladder does not encode and the record
+          does; a rung is evidence of correctness, not of a win.
+        - `host_direct`: compiled, and `wrong` in every launch (the kernel
+          reads zeros through the host-buffer pointer), so `compiled` is
+          all it earns.
+        - `wrapped_host_buffer`: not probed, `none`.
+
+        Each later change here is a change to a shipped default that a
+        reviewer can see in a diff, and must name the run that earned it.
         """
-        return EvidenceLedger()
+        var record = String("UM-2026-08-15-M4-01")
+        var ledger = EvidenceLedger()
+        try:
+            ledger.set_route(
+                RouteEvidence(
+                    ROUTE_COPY_STAGED,
+                    True,  # compiled
+                    True,  # checksum_ok
+                    False,  # no_copy_issued
+                    False,  # single_resident_allocation
+                    False,  # no_blit_in_trace
+                    False,  # trainer_confirmed
+                    record,
+                )
+            )
+            ledger.set_route(
+                RouteEvidence(
+                    ROUTE_COPY_DIRECT,
+                    True,
+                    True,
+                    False,
+                    False,
+                    False,
+                    False,
+                    record,
+                )
+            )
+            ledger.set_route(
+                RouteEvidence(
+                    ROUTE_MAP_WRITE,
+                    True,
+                    True,
+                    True,
+                    False,
+                    False,
+                    False,
+                    record,
+                )
+            )
+            ledger.set_route(
+                RouteEvidence(
+                    ROUTE_HOST_DIRECT,
+                    True,
+                    False,
+                    False,
+                    False,
+                    False,
+                    False,
+                    record,
+                )
+            )
+        except:
+            # The route constants above are the module's own and in range;
+            # `set_route` cannot raise on them.
+            pass
+        return ledger^
 
     def for_route(self, route: Int) raises -> RouteEvidence:
         if route < 0 or route >= N_ROUTES:

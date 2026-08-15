@@ -1,12 +1,14 @@
 """Unified-memory experiment driver: explicit copying versus mapped, shared,
 and device-written routes.
 
-UNEXECUTED. This file is the experiment, not a result. Nothing in this
-repository has yet run it, so it has not been compiled, and no number it
-would print exists anywhere. Do not cite it as evidence that a transfer was
-elided, that a route is free, or that anything got faster. See
-`docs/APPLE_UNIFIED_MEMORY.md` for the methodology, the measurement protocol
-that must accompany a run, and what each result would and would not license.
+This file is the experiment, not a result. Its first execution is
+UM-2026-08-15-M4-01 (`bench/results/apple_m4_unified_memory_2026-08-15.md`),
+and what that run did and did not establish is in the record section of
+`docs/APPLE_UNIFIED_MEMORY.md`. Do not cite this driver as evidence that a
+transfer was elided, that a route is free, or that anything got faster; the
+record is the citation, and it says which claims it licenses. See the doc
+for the methodology, the measurement protocol that must accompany a run,
+and what each result would and would not license.
 
 What it asks
 ------------

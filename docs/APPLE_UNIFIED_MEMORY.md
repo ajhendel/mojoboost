@@ -16,24 +16,31 @@ outcome licenses.
 
 | Route | Direction | Implemented in the driver | Compiled | Executed | Result |
 |---|---|---|---|---|---|
-| `copy_staged` (baseline) | host to device | yes | **no** | **no** | **none** |
-| `copy_direct` | host to device | yes | **no** | **no** | **none** |
-| `map_write` | host to device | yes | **no** | **no** | **none** |
-| `host_direct` | host to device | yes | **no** | **no** | **none** |
-| `wrapped_host_buffer` | host to device | no | **no** | **no** | **none** |
-| `out_copy` (baseline) | device to host | yes | **no** | **no** | **none** |
-| `out_host_direct` | device to host | yes | **no** | **no** | **none** |
-| `out_wrapped_host_buffer` | device to host | no | **no** | **no** | **none** |
+| `copy_staged` (baseline) | host to device | yes | yes | yes | correct; the baseline. Copy at 75 to 85 GB/s, the host write of the payload is 85% to 90% of a round |
+| `copy_direct` | host to device | yes | yes | yes | correct; within 2% to 3% of the baseline (pinning is worth that much) |
+| `map_write` | host to device | yes | yes | yes | correct, no copy issued, **slower**: host stores through the mapping cost 1.5x to 1.6x, so 45% to 60% slower per round in `rewrite`; equal within noise in `resident` |
+| `host_direct` | host to device | yes | yes | yes | **wrong**: the kernel accepts the host-buffer pointer and reads zeros |
+| `wrapped_host_buffer` | host to device | no | **no** | **no** | **none** (`not_probed`) |
+| `out_copy` (baseline) | device to host | yes | yes | yes | correct; the baseline |
+| `out_host_direct` | device to host | yes | yes | yes | **wrong**: a global integer atomic into a host buffer does not produce the right answer |
+| `out_wrapped_host_buffer` | device to host | no | **no** | **no** | **none** (`not_probed`) |
 
-`bench/apple/unified_memory.mojo` has never been compiled and never been run.
-No number it would print exists. Nothing in this repository, this document
-included, is a measurement of unified-memory behavior or a performance claim
-of any kind. Every cell above stays **none** until someone runs the protocol
-below and pastes real output into the record section at the end.
+First run: **UM-2026-08-15-M4-01**, recorded in full in
+[`bench/results/apple_m4_unified_memory_2026-08-15.md`](../bench/results/apple_m4_unified_memory_2026-08-15.md)
+and summarized in the record section at the end of this file. Apple M4,
+16 GB, macOS 26.5.2, Mojo 1.0.0, MAX 26.5.0, 256 and 1024 MiB, both modes,
+three process launches per configuration, contention and resident-hold sets
+included, ladder and Instruments trace not run, machine not idle (see the
+record's caveats). Every result above is scoped to that stack.
 
-`src/mojotrees/unified_memory_policy.mojo` encodes the same emptiness in code:
-`EvidenceLedger.installed()` reports `none` for every route, and the shipped
-default is the staged copy for every buffer in the system.
+`src/mojotrees/unified_memory_policy.mojo` records the same state in code:
+`EvidenceLedger.installed()` names UM-2026-08-15-M4-01 and puts
+`copy_staged` and `copy_direct` at `checksum`, `map_write` at
+`no_copy_issued`, `host_direct` at `compiled`, and the wrapped routes at
+`none`. All of them are below `ENABLE_LEVEL`, and the shipped default is
+still the staged copy for every buffer in the system. Nothing in the trainer
+changed on the strength of this run, and the run's own fourth finding says
+why nothing should: the copy is not where the time goes.
 
 ## Two claims, only one of which is free
 
@@ -447,13 +454,17 @@ after.
 That last row is the one most likely to be over-read, so it gets stated
 plainly. This driver measures a transfer under a synthetic consumer. mojotrees
 training moves a binned matrix once per session, gradients once per round, and
-a histogram once per node, and the current end-to-end GPU measurement on an M4
-is *slower* than the CPU trainer, with per-node kernel launches and
-full-dataset scans dominating. Making every transfer free would not by itself
-change that verdict. A route win here is a reason to run
-`bench/bench_train_gpu.mojo`, not a substitute for it, which is exactly why
-`unified_memory_policy.ENABLE_LEVEL` is the trainer rung and not the driver
-rung.
+a histogram once per node. The end-to-end GPU measurement on an M4
+(`bench/results/apple_m4_large_scaling_2026-08-14.md`) has Metal 2.6x faster
+than the CPU trainer at one million rows and 3.3x at five million, and still
+behind ten-thread LightGBM, with per-node kernel launches and synchronizations
+dominating what remains. The first run of this driver measured the staged copy
+at 75 to 85 GB/s, which puts a 1,000,000 x 50 binned matrix under a
+millisecond and a round's gradient planes under that, so making every transfer
+free would not move the end-to-end number measurably. A route win here is a
+reason to run `bench/bench_train_gpu.mojo`, not a substitute for it, which is
+exactly why `unified_memory_policy.ENABLE_LEVEL` is the trainer rung and not
+the driver rung.
 
 ## The policy seam
 
@@ -610,14 +621,80 @@ invalidation rules, the measurable hypotheses, and the required external edits
 are written up in `handoffs/performance_18_unified_memory.md`. That file is a
 proposal contingent on evidence that does not exist yet, and it says so.
 
+## Capacity, the claim this experiment does not reach
+
+There is a second reason unified memory matters for a GBDT, and it is worth
+separating from the transfer question above because it is the larger of the
+two and this driver cannot measure it.
+
+A histogram GBDT keeps its binned matrix resident on the device for the whole
+fit. On a discrete GPU that matrix has to fit in device memory, and when it
+does not the established implementations fall back to streaming it over the
+bus per round (external-memory modes), which is a different and much slower
+algorithm. Apple silicon parts ship with 16 to 512 GB of memory that the GPU
+addresses directly, so the size of dataset that trains with the matrix
+resident is bounded by system memory, not by a device-memory tier that on
+consumer discrete parts is 8 to 24 GB.
+
+What is measured on this side of that argument is the trainer's footprint,
+not its ceiling. `bench/results/apple_m4_large_scaling_2026-08-14.md` recorded
+a process maximum RSS of 0.84 to 0.96 GB at 1,000,000 x 50 and 2.88 to 3.04 GB
+at 5,000,000 x 50 for the mojotrees process (LightGBM CPU: 1.66 GB and 6.0 to
+6.5 GB on the same fits). Read that as about 0.6 GB per million rows at 50
+features for the whole process, binned matrix included, on this build. A
+Mac Studio with 512 GB is not in this repository and neither is any run
+above 5,000,000 rows, so the extrapolation "a few hundred million rows resident
+on one desk machine" is arithmetic, not a measurement, and must be labeled as
+such wherever it appears. What is settled is that memory, not device memory,
+is the bound, and that the copy into device-side buffers is cheap enough
+(this record) that the resident design does not pay for it per round.
+
+The experiment that would earn the capacity claim is a run of
+`bench-train-gpu` on a large-memory Apple part at a row count that exceeds a
+24 GB discrete card's resident capacity for the same shape, against LightGBM
+CUDA and XGBoost `device=cuda` on that card, with their external-memory modes
+engaged. `hardware/README.md` is where a contributor with such a machine
+would record it. Until then, the honest sentence is "the binned matrix is
+device-resident and bounded by system memory," and not a number.
+
 ## Record
 
-Empty. No run has been performed.
+### UM-2026-08-15-M4-01
 
-When the first run happens, append to this section: date, chip, core counts,
-RAM, free RAM at start, macOS version, Mojo version, MAX version, the mode, the
-full `um.*` output, the `/usr/bin/time -l` peak resident set size, the `vm_stat`
-deltas, and whether an Instruments trace was taken. Three repeats per
-configuration or it does not go in. Give each accepted run an identifier and
-put that identifier in `RouteEvidence.record` when a rung is set, so a flag in
-the policy module can always be traced back to the run that earned it.
+First run. Full tables, raw `um.*` output for all 21 launches, `/usr/bin/time
+-l` captures, and bracketing `vm_stat` captures are in
+[`bench/results/apple_m4_unified_memory_2026-08-15.md`](../bench/results/apple_m4_unified_memory_2026-08-15.md)
+and its directory.
+
+- Apple M4, 10 CPU cores, 10 GPU multiprocessors, 16 GB. macOS 26.5.2.
+  Mojo 1.0.0 (ed45d567), MAX 26.5.0.
+- 256 and 1024 MiB, 8 rounds, `rewrite` and `resident`, three process
+  launches each; `MOJOTREES_UM_CONTEND=1` set at both sizes in `rewrite`;
+  `MOJOTREES_UM_HOLD_MIB=512` set once at 1024 MiB. Ladder not run.
+  Instruments trace not taken.
+- Machine not idle (load 2.5 at start; VS Code, Docker Desktop, and an idle
+  CI runner resident) and under memory pressure (compressor at 345k pages at
+  start; swapouts advanced by about 110k pages across the first 1024 MiB
+  `rewrite` launch; peak RSS 4.1 to 4.6 GB on the 1024 MiB configurations).
+  Route ordering is large and stable across all 21 launches; absolute times
+  are provisional.
+- Findings, each scoped to this stack: `host_direct` and `out_host_direct`
+  are `wrong` (checksum 0, every launch); `map_write` is correct with no copy
+  issued and 45% to 60% slower per round in `rewrite`, equal within noise in
+  `resident`; the staged copy runs at 75 to 85 GB/s and the host write of the
+  payload is 85% to 90% of a `rewrite` round; pinning is worth 2% to 3%;
+  contention costs 3% to 6% on every route; a 512 MiB resident hold costs
+  nothing measurable.
+- Rungs set in `EvidenceLedger.installed()` under this identifier:
+  `copy_staged` `checksum`, `copy_direct` `checksum`, `map_write`
+  `no_copy_issued`, `host_direct` `compiled`. No route reached
+  `no_second_allocation` or above.
+
+When a later run happens, append to this section in the same shape: date,
+chip, core counts, RAM, free RAM at start, macOS version, Mojo version, MAX
+version, the mode, the full `um.*` output (or a link to it), the
+`/usr/bin/time -l` peak resident set size, the `vm_stat` deltas, and whether
+an Instruments trace was taken. Three repeats per configuration or it does
+not go in. Give each accepted run an identifier and put that identifier in
+`RouteEvidence.record` when a rung is set, so a flag in the policy module can
+always be traced back to the run that earned it.
