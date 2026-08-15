@@ -245,14 +245,15 @@ CLASSIFICATION = {
         "Reached only from gpu_binned_layout, itself unreachable.",
     ),
     "gpu_levelwise": (
-        PENDING,
-        "connect_02",
-        "Level-wise GPU growth; no trainer offers a level-wise mode.",
-    ),
-    "levelwise_policy": (
-        PENDING,
-        "connect_02",
-        "Reached only from gpu_levelwise, itself unreachable.",
+        EXPERIMENTAL,
+        "consolidation_K8",
+        "A level-batched replacement grower (plan_level / LevelCommit) "
+        "competing with train_gpu.mojo's leaf-wise grower, which is the one "
+        "architecture authority. Parked, not deleted: the shipped "
+        "depth-wise grow_policy (bceec09) orders the same frontier grower "
+        "and does not demonstrably cover level batching; delete only when "
+        "connect_02 records supersession, together with "
+        "docs/design/GPU_LEVELWISE.md. handoffs/consolidation_K8.md.",
     ),
     "gpu_multiclass_batch": (
         PENDING,
