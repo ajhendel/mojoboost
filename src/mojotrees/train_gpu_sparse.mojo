@@ -523,84 +523,85 @@ def train_gpu_sparse(
     """
     comptime if not has_accelerator():
         raise Error("GPU training requires an accelerator")
-    if len(target) != data.n_rows:
-        raise Error("target length must equal n_rows")
-    data.validate()
-    _refuse_bundling(bundling, params, "train_gpu_sparse")
-    var n_features = data.n_features
-    _check_objective(objective, target, alpha)
-    _check_sample_weight(sample_weight, data.n_rows)
-    check_bagging(bagging)
-    _check_goss(goss, bagging)
-    _check_class_bagging(class_bagging, bagging, goss, objective)
-    params.tree.monotone.check_features(n_features)
-    if len(init_score) != 0 and len(init_score) != data.n_rows:
-        raise Error("init_score length must equal n_rows")
-
-    var builder = _open_builder(data, params.tree.num_leaves)
-    var pool = CatSetPool(builder.ctx, params.tree.num_leaves)
-
-    var n = data.n_rows
-    var raw = List[Float64](capacity=n)
-    var base_score = 0.0
-    if len(init_score) == n:
-        for r in range(n):
-            raw.append(init_score[r])
     else:
-        base_score = _base_score(target, objective, sample_weight, alpha)
-        for _ in range(n):
-            raw.append(base_score)
+        if len(target) != data.n_rows:
+            raise Error("target length must equal n_rows")
+        data.validate()
+        _refuse_bundling(bundling, params, "train_gpu_sparse")
+        var n_features = data.n_features
+        _check_objective(objective, target, alpha)
+        _check_sample_weight(sample_weight, data.n_rows)
+        check_bagging(bagging)
+        _check_goss(goss, bagging)
+        _check_class_bagging(class_bagging, bagging, goss, objective)
+        params.tree.monotone.check_features(n_features)
+        if len(init_score) != 0 and len(init_score) != data.n_rows:
+            raise Error("init_score length must equal n_rows")
 
-    var signs = params.tree.monotone.active_signs()
-    var renews = objective_renews_leaves(objective)
-    var renew_w = renewal_weights(objective, target, sample_weight)
-    var renew_a = renewal_alpha(objective, alpha)
-    var trees = List[Tree]()
-    var grad = List[Float64](capacity=n)
-    var hess = List[Float64](capacity=n)
-    var bag = List[Int]()
-    var balanced = class_bagging.enabled() and has_positive_rows(target)
-    for i in range(params.n_estimators):
-        if balanced:
-            refresh_class_bag(bag, class_bagging, target, i)
+        var builder = _open_builder(data, params.tree.num_leaves)
+        var pool = CatSetPool(builder.ctx, params.tree.num_leaves)
+
+        var n = data.n_rows
+        var raw = List[Float64](capacity=n)
+        var base_score = 0.0
+        if len(init_score) == n:
+            for r in range(n):
+                raw.append(init_score[r])
         else:
-            refresh_bag(bag, bagging, n, i)
-        _fill_grad_hess(
-            raw, target, objective, sample_weight, alpha, grad, hess
-        )
-        goss_round(bag, grad, hess, goss, i, params.learning_rate)
-        var grown = grow_tree_gpu_sparse(
-            builder, pool, data, grad, hess, params.tree, bag, i
-        )
-        if renews:
-            _renew_leaf_values_sparse(
-                grown.tree,
-                grown.row_leaf,
-                target,
-                raw,
-                renew_w,
-                renew_a,
-                signs,
-                params.tree.extra,
+            base_score = _base_score(target, objective, sample_weight, alpha)
+            for _ in range(n):
+                raw.append(base_score)
+
+        var signs = params.tree.monotone.active_signs()
+        var renews = objective_renews_leaves(objective)
+        var renew_w = renewal_weights(objective, target, sample_weight)
+        var renew_a = renewal_alpha(objective, alpha)
+        var trees = List[Tree]()
+        var grad = List[Float64](capacity=n)
+        var hess = List[Float64](capacity=n)
+        var bag = List[Int]()
+        var balanced = class_bagging.enabled() and has_positive_rows(target)
+        for i in range(params.n_estimators):
+            if balanced:
+                refresh_class_bag(bag, class_bagging, target, i)
+            else:
+                refresh_bag(bag, bagging, n, i)
+            _fill_grad_hess(
+                raw, target, objective, sample_weight, alpha, grad, hess
             )
+            goss_round(bag, grad, hess, goss, i, params.learning_rate)
+            var grown = grow_tree_gpu_sparse(
+                builder, pool, data, grad, hess, params.tree, bag, i
+            )
+            if renews:
+                _renew_leaf_values_sparse(
+                    grown.tree,
+                    grown.row_leaf,
+                    target,
+                    raw,
+                    renew_w,
+                    renew_a,
+                    signs,
+                    params.tree.extra,
+                )
 
-        if grown.tree.n_leaves == 1 and abs(grown.tree.value[0]) < 1e-12:
-            if bagging_enabled(bagging) or goss.enabled or balanced:
-                continue
-            break
+            if grown.tree.n_leaves == 1 and abs(grown.tree.value[0]) < 1e-12:
+                if bagging_enabled(bagging) or goss.enabled or balanced:
+                    continue
+                break
 
-        _add_tree_scores(
-            raw, params.learning_rate, grown.tree, grown.row_leaf, data
+            _add_tree_scores(
+                raw, params.learning_rate, grown.tree, grown.row_leaf, data
+            )
+            trees.append(grown.tree.copy())
+
+        return Booster(
+            trees^,
+            base_score,
+            params.learning_rate,
+            objective,
+            params.tree.monotone.copy(),
         )
-        trees.append(grown.tree.copy())
-
-    return Booster(
-        trees^,
-        base_score,
-        params.learning_rate,
-        objective,
-        params.tree.monotone.copy(),
-    )
 
 
 def train_gpu_sparse_with_valid(
@@ -625,106 +626,107 @@ def train_gpu_sparse_with_valid(
     judged by are the CPU trainer's."""
     comptime if not has_accelerator():
         raise Error("GPU training requires an accelerator")
-    if len(target) != data.n_rows:
-        raise Error("target length must equal n_rows")
-    if len(valid_target) != valid_data.n_rows:
-        raise Error("valid_target length must equal valid n_rows")
-    data.validate()
-    valid_data.validate()
-    _refuse_bundling(bundling, params, "train_gpu_sparse_with_valid")
-    var n_features = data.n_features
-    if valid_data.n_features != n_features:
-        raise Error("valid_data must have the same features")
-    if valid_data.n_bins != data.n_bins:
-        raise Error("valid_data must be binned with the same bin count")
-    _check_objective(objective, target, alpha)
-    if early_stopping_rounds < 1:
-        raise Error("early_stopping_rounds must be positive")
-    _check_sample_weight(sample_weight, data.n_rows)
-    check_bagging(bagging)
-    _check_goss(goss, bagging)
-    _check_class_bagging(class_bagging, bagging, goss, objective)
-    params.tree.monotone.check_features(n_features)
+    else:
+        if len(target) != data.n_rows:
+            raise Error("target length must equal n_rows")
+        if len(valid_target) != valid_data.n_rows:
+            raise Error("valid_target length must equal valid n_rows")
+        data.validate()
+        valid_data.validate()
+        _refuse_bundling(bundling, params, "train_gpu_sparse_with_valid")
+        var n_features = data.n_features
+        if valid_data.n_features != n_features:
+            raise Error("valid_data must have the same features")
+        if valid_data.n_bins != data.n_bins:
+            raise Error("valid_data must be binned with the same bin count")
+        _check_objective(objective, target, alpha)
+        if early_stopping_rounds < 1:
+            raise Error("early_stopping_rounds must be positive")
+        _check_sample_weight(sample_weight, data.n_rows)
+        check_bagging(bagging)
+        _check_goss(goss, bagging)
+        _check_class_bagging(class_bagging, bagging, goss, objective)
+        params.tree.monotone.check_features(n_features)
 
-    var builder = _open_builder(data, params.tree.num_leaves)
-    var pool = CatSetPool(builder.ctx, params.tree.num_leaves)
+        var builder = _open_builder(data, params.tree.num_leaves)
+        var pool = CatSetPool(builder.ctx, params.tree.num_leaves)
 
-    var n = data.n_rows
-    var n_valid = valid_data.n_rows
-    var valid_rows = valid_data.to_rows()
-    var base_score = _base_score(target, objective, sample_weight, alpha)
-    var raw = List[Float64](capacity=n)
-    for _ in range(n):
-        raw.append(base_score)
-    var valid_raw = List[Float64](capacity=n_valid)
-    for _ in range(n_valid):
-        valid_raw.append(base_score)
+        var n = data.n_rows
+        var n_valid = valid_data.n_rows
+        var valid_rows = valid_data.to_rows()
+        var base_score = _base_score(target, objective, sample_weight, alpha)
+        var raw = List[Float64](capacity=n)
+        for _ in range(n):
+            raw.append(base_score)
+        var valid_raw = List[Float64](capacity=n_valid)
+        for _ in range(n_valid):
+            valid_raw.append(base_score)
 
-    var signs = params.tree.monotone.active_signs()
-    var renews = objective_renews_leaves(objective)
-    var renew_w = renewal_weights(objective, target, sample_weight)
-    var renew_a = renewal_alpha(objective, alpha)
-    var trees = List[Tree]()
-    var grad = List[Float64](capacity=n)
-    var hess = List[Float64](capacity=n)
-    var best_loss = _mean_loss(valid_raw, valid_target, objective, alpha)
-    var best_n_trees = 0
-    var bag = List[Int]()
-    var balanced = class_bagging.enabled() and has_positive_rows(target)
-    for i in range(params.n_estimators):
-        if balanced:
-            refresh_class_bag(bag, class_bagging, target, i)
-        else:
-            refresh_bag(bag, bagging, n, i)
-        _fill_grad_hess(
-            raw, target, objective, sample_weight, alpha, grad, hess
-        )
-        goss_round(bag, grad, hess, goss, i, params.learning_rate)
-        var grown = grow_tree_gpu_sparse(
-            builder, pool, data, grad, hess, params.tree, bag, i
-        )
-        if renews:
-            _renew_leaf_values_sparse(
-                grown.tree,
-                grown.row_leaf,
-                target,
-                raw,
-                renew_w,
-                renew_a,
-                signs,
-                params.tree.extra,
+        var signs = params.tree.monotone.active_signs()
+        var renews = objective_renews_leaves(objective)
+        var renew_w = renewal_weights(objective, target, sample_weight)
+        var renew_a = renewal_alpha(objective, alpha)
+        var trees = List[Tree]()
+        var grad = List[Float64](capacity=n)
+        var hess = List[Float64](capacity=n)
+        var best_loss = _mean_loss(valid_raw, valid_target, objective, alpha)
+        var best_n_trees = 0
+        var bag = List[Int]()
+        var balanced = class_bagging.enabled() and has_positive_rows(target)
+        for i in range(params.n_estimators):
+            if balanced:
+                refresh_class_bag(bag, class_bagging, target, i)
+            else:
+                refresh_bag(bag, bagging, n, i)
+            _fill_grad_hess(
+                raw, target, objective, sample_weight, alpha, grad, hess
             )
-        if grown.tree.n_leaves == 1 and abs(grown.tree.value[0]) < 1e-12:
-            if bagging_enabled(bagging) or goss.enabled or balanced:
-                continue
-            break
-
-        _add_tree_scores(
-            raw, params.learning_rate, grown.tree, grown.row_leaf, data
-        )
-        for r in range(n_valid):
-            valid_raw[r] += (
-                params.learning_rate
-                * predict_row_sparse(grown.tree, valid_rows, r)
+            goss_round(bag, grad, hess, goss, i, params.learning_rate)
+            var grown = grow_tree_gpu_sparse(
+                builder, pool, data, grad, hess, params.tree, bag, i
             )
-        trees.append(grown.tree.copy())
+            if renews:
+                _renew_leaf_values_sparse(
+                    grown.tree,
+                    grown.row_leaf,
+                    target,
+                    raw,
+                    renew_w,
+                    renew_a,
+                    signs,
+                    params.tree.extra,
+                )
+            if grown.tree.n_leaves == 1 and abs(grown.tree.value[0]) < 1e-12:
+                if bagging_enabled(bagging) or goss.enabled or balanced:
+                    continue
+                break
 
-        var loss = _mean_loss(valid_raw, valid_target, objective, alpha)
-        if loss < best_loss - min_delta:
-            best_loss = loss
-            best_n_trees = len(trees)
-        elif len(trees) - best_n_trees >= early_stopping_rounds:
-            break
+            _add_tree_scores(
+                raw, params.learning_rate, grown.tree, grown.row_leaf, data
+            )
+            for r in range(n_valid):
+                valid_raw[r] += (
+                    params.learning_rate
+                    * predict_row_sparse(grown.tree, valid_rows, r)
+                )
+            trees.append(grown.tree.copy())
 
-    while len(trees) > best_n_trees:
-        _ = trees.pop()
-    return Booster(
-        trees^,
-        base_score,
-        params.learning_rate,
-        objective,
-        params.tree.monotone.copy(),
-    )
+            var loss = _mean_loss(valid_raw, valid_target, objective, alpha)
+            if loss < best_loss - min_delta:
+                best_loss = loss
+                best_n_trees = len(trees)
+            elif len(trees) - best_n_trees >= early_stopping_rounds:
+                break
+
+        while len(trees) > best_n_trees:
+            _ = trees.pop()
+        return Booster(
+            trees^,
+            base_score,
+            params.learning_rate,
+            objective,
+            params.tree.monotone.copy(),
+        )
 
 
 def train_multiclass_gpu_sparse(
@@ -742,104 +744,105 @@ def train_multiclass_gpu_sparse(
     same rows, the shared GOSS sample drawn once per round as on the CPU."""
     comptime if not has_accelerator():
         raise Error("GPU training requires an accelerator")
-    if len(labels) != data.n_rows:
-        raise Error("labels length must equal n_rows")
-    if n_classes < 2:
-        raise Error("n_classes must be at least 2")
-    data.validate()
-    _refuse_bundling(bundling, params, "train_multiclass_gpu_sparse")
-    _check_sample_weight(sample_weight, data.n_rows)
-    check_bagging(bagging)
-    _check_goss(goss, bagging)
-    params.tree.monotone.check_features(data.n_features)
-    var n = data.n_rows
+    else:
+        if len(labels) != data.n_rows:
+            raise Error("labels length must equal n_rows")
+        if n_classes < 2:
+            raise Error("n_classes must be at least 2")
+        data.validate()
+        _refuse_bundling(bundling, params, "train_multiclass_gpu_sparse")
+        _check_sample_weight(sample_weight, data.n_rows)
+        check_bagging(bagging)
+        _check_goss(goss, bagging)
+        params.tree.monotone.check_features(data.n_features)
+        var n = data.n_rows
 
-    var class_w = List[Float64](capacity=n_classes)
-    for _ in range(n_classes):
-        class_w.append(0.0)
-    var total_w = 0.0
-    for r in range(n):
-        if labels[r] < 0 or labels[r] >= n_classes:
-            raise Error("label out of range")
-        var w = sample_weight[r] if len(sample_weight) > 0 else 1.0
-        class_w[labels[r]] += w
-        total_w += w
-    if total_w <= 0.0:
-        raise Error("sample_weight must have a positive sum")
-    var base_scores = List[Float64](capacity=n_classes)
-    for k in range(n_classes):
-        base_scores.append(log(_clamp_prob(class_w[k] / total_w)))
-
-    var builder = _open_builder(data, params.tree.num_leaves)
-    var pool = CatSetPool(builder.ctx, params.tree.num_leaves)
-
-    var raw = List[Float64](capacity=n * n_classes)
-    for _ in range(n):
-        for k in range(n_classes):
-            raw.append(base_scores[k])
-    var prob = List[Float64](capacity=n * n_classes)
-    for _ in range(n * n_classes):
-        prob.append(0.0)
-
-    var trees = List[Tree]()
-    var grad = List[Float64](capacity=n)
-    var hess = List[Float64](capacity=n)
-    var bag = List[Int]()
-    for i in range(params.n_estimators):
-        refresh_bag(bag, bagging, n, i)
+        var class_w = List[Float64](capacity=n_classes)
+        for _ in range(n_classes):
+            class_w.append(0.0)
+        var total_w = 0.0
         for r in range(n):
-            for k in range(n_classes):
-                prob[r * n_classes + k] = raw[r * n_classes + k]
-            _softmax_inplace(prob, r * n_classes, n_classes)
-
-        var selection = GossSelection.all_rows()
-        if goss.active(i, params.learning_rate):
-            selection = _multiclass_goss_select(
-                prob, labels, n_classes, sample_weight, goss, i
-            )
-            bag = selection.rows.copy()
-
-        var made_progress = False
+            if labels[r] < 0 or labels[r] >= n_classes:
+                raise Error("label out of range")
+            var w = sample_weight[r] if len(sample_weight) > 0 else 1.0
+            class_w[labels[r]] += w
+            total_w += w
+        if total_w <= 0.0:
+            raise Error("sample_weight must have a positive sum")
+        var base_scores = List[Float64](capacity=n_classes)
         for k in range(n_classes):
-            _fill_softmax_grad_hess(
-                prob, labels, k, n_classes, sample_weight, grad, hess
-            )
-            apply_goss_scaling(selection, grad, hess)
-            var grown = grow_tree_gpu_sparse(
-                builder,
-                pool,
-                data,
-                grad,
-                hess,
-                params.tree,
-                bag,
-                i * n_classes + k,
-            )
-            if grown.tree.n_leaves > 1 or abs(grown.tree.value[0]) >= 1e-12:
-                made_progress = True
-            _add_tree_scores(
-                raw,
-                params.learning_rate,
-                grown.tree,
-                grown.row_leaf,
-                data,
-                SparseBundling.none(),
-                n_classes,
-                k,
-            )
-            trees.append(grown.tree.copy())
+            base_scores.append(log(_clamp_prob(class_w[k] / total_w)))
 
-        if not made_progress:
-            for _ in range(n_classes):
-                _ = trees.pop()
-            if bagging_enabled(bagging) or goss.enabled:
-                continue
-            break
+        var builder = _open_builder(data, params.tree.num_leaves)
+        var pool = CatSetPool(builder.ctx, params.tree.num_leaves)
 
-    return MulticlassBooster(
-        trees^,
-        base_scores^,
-        n_classes,
-        params.learning_rate,
-        params.tree.monotone.copy(),
-    )
+        var raw = List[Float64](capacity=n * n_classes)
+        for _ in range(n):
+            for k in range(n_classes):
+                raw.append(base_scores[k])
+        var prob = List[Float64](capacity=n * n_classes)
+        for _ in range(n * n_classes):
+            prob.append(0.0)
+
+        var trees = List[Tree]()
+        var grad = List[Float64](capacity=n)
+        var hess = List[Float64](capacity=n)
+        var bag = List[Int]()
+        for i in range(params.n_estimators):
+            refresh_bag(bag, bagging, n, i)
+            for r in range(n):
+                for k in range(n_classes):
+                    prob[r * n_classes + k] = raw[r * n_classes + k]
+                _softmax_inplace(prob, r * n_classes, n_classes)
+
+            var selection = GossSelection.all_rows()
+            if goss.active(i, params.learning_rate):
+                selection = _multiclass_goss_select(
+                    prob, labels, n_classes, sample_weight, goss, i
+                )
+                bag = selection.rows.copy()
+
+            var made_progress = False
+            for k in range(n_classes):
+                _fill_softmax_grad_hess(
+                    prob, labels, k, n_classes, sample_weight, grad, hess
+                )
+                apply_goss_scaling(selection, grad, hess)
+                var grown = grow_tree_gpu_sparse(
+                    builder,
+                    pool,
+                    data,
+                    grad,
+                    hess,
+                    params.tree,
+                    bag,
+                    i * n_classes + k,
+                )
+                if grown.tree.n_leaves > 1 or abs(grown.tree.value[0]) >= 1e-12:
+                    made_progress = True
+                _add_tree_scores(
+                    raw,
+                    params.learning_rate,
+                    grown.tree,
+                    grown.row_leaf,
+                    data,
+                    SparseBundling.none(),
+                    n_classes,
+                    k,
+                )
+                trees.append(grown.tree.copy())
+
+            if not made_progress:
+                for _ in range(n_classes):
+                    _ = trees.pop()
+                if bagging_enabled(bagging) or goss.enabled:
+                    continue
+                break
+
+        return MulticlassBooster(
+            trees^,
+            base_scores^,
+            n_classes,
+            params.learning_rate,
+            params.tree.monotone.copy(),
+        )
