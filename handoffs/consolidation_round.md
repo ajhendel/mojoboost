@@ -257,3 +257,29 @@ worktree and exercised from Python. Not reached: dart/rf with `eval_set`
 (`train_forest_multiclass` exported, no binding), the sparse trainers, and
 continued training (`train_boosting_more` exported, no binding).
 `params.mojo` still lists `boosting` as Mojo-API-only for parameter strings.
+
+W7 validation layer: `validation.mojo` is now the check every trainer runs.
+`trainset._check_columns` / `_int_labels` / `_relevance_labels`,
+`sparse._check_compressed`, `params._validate`, `callback.check_resettable`,
+and `boosting._check_sample_weight` call `check_shape`, `check_column_length`,
+`check_group_counts`, `check_categorical_features`, `check_class_codes`,
+`check_relevance_labels`, `check_compressed`, `check_booster_ranges`,
+`check_max_bin`, and `check_weights` instead of their local copies (same
+conditions, plus finiteness and the size ceilings; the messages keep their
+old prefixes and now name the row and value; `boosting` keeps its own
+length message because `tests/test_custom_objective.mojo` matches it). The
+package root exports validation's entry points. Python:
+`sklearn._Base._check_fit_structure` runs `_validation.check_shape`,
+`check_length(y)`, `check_optional_length(sample_weight)` and the group
+structure rules in all three `fit` paths, before the buffer conversions,
+which would refuse the same inputs later with a vaguer message; the pandas
+index-alignment check is deliberately not run (positional `y` stays
+accepted). Left as they are: `boosting.mojo`'s multiclass / target-length
+checks around lines 1112, 1197, 1286, 1682 (`_check_labels`-style, messages
+tests match on) and `serialize`'s load path (`check_loaded_tree` is exported
+but the loader still bounds nodes its own way; a serialize lane's edit).
+`CancelToken` was left to W5. Tests: `tests/test_validation.mojo` (8, new,
+reach every routed check through `Dataset`, `train_dataset*`,
+`parse_params`), `test_callbacks`, `test_sparse`, `test_trainset` green in a
+HEAD worktree; Python smoke via the in-tree package. Commits 116604c
+18a6323 bff8d7c + audit rows.

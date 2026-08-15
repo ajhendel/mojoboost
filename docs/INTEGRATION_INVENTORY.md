@@ -66,7 +66,6 @@ it, not a second opinion.
 | `model_editing` | PENDING | consolidation_K10 | In-place leaf editing. Its MODEL_EDITING_SUPPORTED=True is the feature's claim; inspection.mojo's False is what ships. Parked until connected, when inspection re-exports this module's status |
 | `ranking_advanced` | PENDING | consolidation_K10 | Position bias, pair sampling, custom label gain, fold shuffle. Parked until fit_ranker grows those parameters |
 | `sequence` | PENDING | consolidation_K4 | Bounded-memory chunk protocol external_memory.mojo is written against; coherent, not a duplicate of python _sequence.py. Parked until an export plus external_memory validation connects it (handoffs/connect_21_native_interfaces.md) |
-| `validation` | PENDING | remaining_12 | Central validation layer named by python _validation.py's manifest. Parked until the manifest lane routes trainers through it |
 
 Three shapes recur and are worth naming, because they change what a fix
 costs:

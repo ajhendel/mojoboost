@@ -307,12 +307,6 @@ CLASSIFICATION = {
         "Position bias, pair sampling, custom label gain, fold shuffle. "
         "Parked until fit_ranker grows those parameters.",
     ),
-    "validation": (
-        PENDING,
-        "remaining_12",
-        "Central validation layer named by python _validation.py's manifest. "
-        "Parked until the manifest lane routes trainers through it.",
-    ),
     "lgbm_model_io": (
         EXPERIMENTAL,
         "consolidation_K10",
@@ -373,12 +367,6 @@ CLASSIFICATION = {
         PENDING,
         "consolidation_K4",
         "Reached only from the parked _sequence.py; connects with it.",
-    ),
-    "mojotrees._validation": (
-        PENDING,
-        "connect_07",
-        "Structure checks nothing in the package imports; _arrays.check_X "
-        "may absorb them. connect_07's call.",
     ),
     "mojotrees._sequence": (
         PENDING,
