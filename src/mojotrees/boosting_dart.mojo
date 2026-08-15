@@ -74,6 +74,7 @@ when the vector carries no information.
 
 from .binning import BinnedMatrix
 from .device import CPU_DEVICE
+from .rng import GOLDEN, splitmix64, uniform
 from .tree import Tree
 
 # LightGBM's DART defaults. `drop_seed` is LightGBM's own default of 4, which
@@ -84,8 +85,6 @@ comptime DEFAULT_MAX_DROP = 50
 comptime DEFAULT_SKIP_DROP = 0.5
 comptime DEFAULT_DROP_SEED = 4
 
-comptime _GOLDEN = UInt64(0x9E3779B97F4A7C15)
-comptime _TWO_POW_NEG_53 = 1.0 / 9007199254740992.0
 
 
 @fieldwise_init
@@ -177,26 +176,12 @@ struct DartParams(Copyable, Movable):
             )
 
 
-def _splitmix64(state: UInt64) -> UInt64:
-    """splitmix64's mixing function, as in bagging.mojo: a bijection with
-    full avalanche, so consecutive counter values look independent."""
-    var z = state + _GOLDEN
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EB
-    return z ^ (z >> 31)
-
-
-def _uniform(counter: UInt64) -> Float64:
-    """Uniform in [0, 1) with 53 significant bits, from a counter value."""
-    return Float64(_splitmix64(counter) >> 11) * _TWO_POW_NEG_53
-
-
 def _stream(seed: Int, round: Int) -> UInt64:
     """Start of the counter stream for one round. The sign bit is masked off
     so negative seeds are accepted without relying on signed conversion, the
     same rule bagging.mojo uses."""
-    return _splitmix64(
-        UInt64(seed & 0x7FFFFFFFFFFFFFFF) ^ (UInt64(round) * _GOLDEN)
+    return splitmix64(
+        UInt64(seed & 0x7FFFFFFFFFFFFFFF) ^ (UInt64(round) * GOLDEN)
     )
 
 
@@ -305,7 +290,7 @@ def select_drop(
         return DartDrop.none(False)
 
     var base = _stream(params.seed, round)
-    if _uniform(base) < params.skip_drop:
+    if uniform(base) < params.skip_drop:
         return DartDrop.none(True)
 
     var cap = params.max_drop if params.max_drop > 0 else 0
@@ -314,7 +299,7 @@ def select_drop(
     var best_key = 0.0
     var best_iter = -1
     for i in range(n_iterations):
-        var u = _uniform(base + UInt64(i + 1))
+        var u = uniform(base + UInt64(i + 1))
         if best_iter < 0 or u < best_key:
             best_key = u
             best_iter = i
