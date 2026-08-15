@@ -1,8 +1,16 @@
 # Depth-batched (level-wise) GPU tree growth
 
-Status: design and host-side primitives only. Nothing in this document is
-wired into a trainer, no parameter exposes it, and no benchmark has been run
-for it. The shipped growers are unchanged.
+Status (Aug 15 2026): the **growth order** is wired and exposed.
+`TreeParams.grow_policy = GROW_DEPTHWISE` (Python `grow_policy="depthwise"`,
+parameter string `grow_policy=depthwise`) makes every frontier grower
+(`tree.grow_tree`, `tree_sparse.grow_tree_sparse`, the three loops in
+`train_gpu.mojo`) split leaves in the order `levelwise_policy.LevelSchedule`
+plans: one depth at a time, `BUDGET_RANK` admission, ascending node id
+within a level. Section 3's parameter semantics are what ships. What is
+**not** built is the launch batching of sections 1, 2, and 6: the GPU
+growers still issue one launch group per split, so depth-wise on the device
+costs what leaf-wise costs today and no benchmark has been run. Section 10
+still governs how one must be built.
 
 This is a proposal for a **second growth algorithm**, not a faster route to
 the trees mojotrees already grows. A level-wise tree and a leaf-wise tree

@@ -121,6 +121,7 @@ from .histogram import (
 )
 from .interaction import extend_branch
 from .split import SplitInfo, find_best_split, soft_threshold_l1
+from .levelwise_policy import GROW_LEAFWISE
 from .tree import Tree, TreeParams
 from .tree_parameters_extra import finish_leaf_output
 
@@ -143,6 +144,7 @@ comptime _UNSUPPORTED_FEATURE_FRACTION_BYLEVEL = 64
 comptime _UNSUPPORTED_EXTRA_TREES = 128
 comptime _UNSUPPORTED_FORCED_SPLITS = 256
 comptime _UNSUPPORTED_RANKING = 512
+comptime _UNSUPPORTED_GROW_POLICY = 1024
 
 
 struct DataShard(Copyable, Movable):
@@ -646,6 +648,8 @@ def _unsupported_mask(params: TreeParams, shards: List[DataShard]) -> Int:
         mask |= _UNSUPPORTED_EXTRA_TREES
     if not params.extra.forced.is_empty():
         mask |= _UNSUPPORTED_FORCED_SPLITS
+    if params.grow_policy != GROW_LEAFWISE:
+        mask |= _UNSUPPORTED_GROW_POLICY
     for i in range(len(shards)):
         if shards[i].data.cats.any_categorical():
             mask |= _UNSUPPORTED_CATEGORICAL
@@ -703,6 +707,12 @@ def _raise_unsupported(mask: Int) raises:
         raise Error(
             "distributed training does not support forced splits; applying"
             " one needs the bin mapper, which this grower is not given"
+        )
+    if mask & _UNSUPPORTED_GROW_POLICY != 0:
+        raise Error(
+            "distributed training does not support grow_policy='depthwise';"
+            " the distributed grower tracks no node depth to schedule levels"
+            " by"
         )
     if mask & _UNSUPPORTED_RANKING != 0:
         raise Error(

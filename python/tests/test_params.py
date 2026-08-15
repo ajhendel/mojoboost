@@ -513,3 +513,43 @@ def test_class_weight_validation(class_weight, error):
         MojoTreesClassifier(
             n_estimators=3, class_weight=class_weight
         ).fit(X, y)
+
+
+# -- grow_policy ---------------------------------------------------------
+
+
+def test_grow_policy_default_is_leafwise_and_names_resolve(regression):
+    """The default trains the leaf-wise model exactly; XGBoost's alias
+    spellings resolve to it; depth-wise is a different, balanced model."""
+    from mojotrees.inspection import dump_model
+
+    X, y = regression
+    kw = dict(num_leaves=8, n_estimators=5, min_data_in_leaf=5)
+    plain = MojoTreesRegressor(**kw).fit(X, y)
+    assert plain.grow_policy == "leafwise"
+    for alias in ("leafwise", "lossguide", "leaf_wise"):
+        same = MojoTreesRegressor(grow_policy=alias, **kw).fit(X, y)
+        np.testing.assert_array_equal(same.predict(X), plain.predict(X))
+
+    deep = MojoTreesRegressor(grow_policy="depthwise", **kw).fit(X, y)
+    assert not np.array_equal(deep.predict(X), plain.predict(X))
+    # 8 leaves out of 300 rows at min_data_in_leaf=5: three complete levels,
+    # so every leaf of every tree sits at depth 3.
+    for tree in dump_model(deep)["tree_info"]:
+        leaves = []
+        stack = [tree["tree_structure"]]
+        while stack:
+            node = stack.pop()
+            if "leaf_index" in node:
+                leaves.append(node)
+            else:
+                stack.append(node["left_child"])
+                stack.append(node["right_child"])
+        assert len(leaves) == 8
+        assert {leaf["depth"] for leaf in leaves} == {3}
+
+
+def test_grow_policy_rejects_unknown_names(regression):
+    X, y = regression
+    with pytest.raises(ValueError, match="grow_policy"):
+        MojoTreesRegressor(grow_policy="sideways", n_estimators=2).fit(X, y)

@@ -52,6 +52,7 @@ from .boosting import (
 from .device import CPU_DEVICE, parse_device
 from .efb import check_bundling_supported
 from .sampling import canonical_data_sample_strategy
+from .levelwise_policy import parse_grow_policy
 from .tree import TreeParams
 from .tree_parameters_extra import (
     check_extra_option_supported,
@@ -68,7 +69,7 @@ comptime MULTICLASS = -1
 comptime SUPPORTED_KEYS = String(
     "objective, num_class, num_iterations, learning_rate, num_leaves,"
     " min_data_in_leaf, min_sum_hessian_in_leaf, lambda_l1, lambda_l2,"
-    " max_depth, feature_fraction, feature_fraction_bynode,"
+    " max_depth, grow_policy, feature_fraction, feature_fraction_bynode,"
     " feature_fraction_bylevel, feature_fraction_seed, min_gain_to_split,"
     " max_delta_step, path_smooth, extra_trees, extra_seed,"
     " monotone_penalty, monotone_constraints_method, cegb_tradeoff,"
@@ -515,6 +516,11 @@ def parse_params(spec: String) raises -> TrainConfig:
             config.booster.tree.lambda_reg = _parse_f64(key, value)
         elif key == "max_depth":
             config.booster.tree.max_depth = _parse_int(key, value)
+        elif key == "grow_policy":
+            # XGBoost's name and spellings; LightGBM has no such switch, so
+            # this is an extension rather than a parity row
+            # (levelwise_policy.mojo). `depthwise` commits a depth at a time.
+            config.booster.tree.grow_policy = parse_grow_policy(value)
         elif (
             key == "feature_fraction"
             or key == "sub_feature"

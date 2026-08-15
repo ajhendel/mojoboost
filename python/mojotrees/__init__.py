@@ -485,6 +485,17 @@ def _unimplemented_objective_note(objective):
 _LAMBDA_L1 = 0.0
 _LAMBDA_L2 = 1.0
 
+#: `grow_policy` spellings and the canonical name each resolves to. XGBoost's
+#: names, since LightGBM has no such parameter; "lossguide" is XGBoost's word
+#: for leaf-wise growth (src/mojotrees/levelwise_policy.mojo).
+_GROW_POLICIES = {
+    "leafwise": "leafwise",
+    "leaf_wise": "leafwise",
+    "lossguide": "leafwise",
+    "depthwise": "depthwise",
+    "depth_wise": "depthwise",
+}
+
 # The largest relevance label a ranker accepts, the range of LightGBM's
 # default label_gain (src/mojotrees/ranking.mojo).
 _MAX_RELEVANCE_LABEL = 30
@@ -1049,8 +1060,21 @@ class _Base(_ParamsMixin):
 
     `max_depth` bounds the depth of any leaf, counted in edges from the root,
     so `max_depth=1` gives stumps; `max_depth<=0` (the default, -1) means
-    unlimited. Growth stays leaf-wise, so a depth-bounded tree is still
+    unlimited. Under the default growth a depth-bounded tree is still
     unbalanced and usually has fewer than `2**max_depth` leaves.
+
+    `grow_policy` is XGBoost's parameter of that name (LightGBM has no
+    equivalent). "leafwise", the default and LightGBM's growth, splits the
+    leaf with the largest gain anywhere in the tree next; "depthwise" splits
+    every leaf at one depth before any deeper one, so a tree fills level by
+    level and is balanced. `num_leaves` stays a hard bound in both: a
+    depth-wise level that would overrun it is admitted as its highest-gain
+    prefix, so at the default `num_leaves=31` and unlimited `max_depth` a
+    depth-wise tree fills four levels (16 leaves) and half of a fifth. Set
+    `max_depth` deliberately for depth-wise runs; a leaf-wise configuration
+    is not a sensible one to inherit. "lossguide" is accepted as XGBoost's
+    alias for "leafwise". Depth-wise growth is honored on the CPU and GPU
+    trainers alike (dense and sparse); the distributed prototype rejects it.
 
     `bagging_fraction` and `bagging_freq` are LightGBM's row bagging: every
     `bagging_freq` rounds, each row is kept independently with probability
@@ -1206,6 +1230,7 @@ class _Base(_ParamsMixin):
         self,
         num_leaves=31,
         max_depth=-1,
+        grow_policy="leafwise",
         learning_rate=0.1,
         n_estimators=100,
         min_data_in_leaf=20,
@@ -1267,6 +1292,7 @@ class _Base(_ParamsMixin):
     ):
         self.num_leaves = num_leaves
         self.max_depth = max_depth
+        self.grow_policy = grow_policy
         self.learning_rate = learning_rate
         self.n_estimators = n_estimators
         self.min_data_in_leaf = min_data_in_leaf
@@ -1802,6 +1828,12 @@ class _Base(_ParamsMixin):
             raise ValueError("feature_fraction must be in (0, 1]")
         if not 0.0 < float(self.feature_fraction_bynode) <= 1.0:
             raise ValueError("feature_fraction_bynode must be in (0, 1]")
+        grow_policy = str(self.grow_policy)
+        if grow_policy not in _GROW_POLICIES:
+            raise ValueError(
+                "grow_policy must be 'leafwise' (alias 'lossguide') or "
+                f"'depthwise', got {self.grow_policy!r}"
+            )
         if int(self.max_cat_to_onehot) < 0:
             raise ValueError("max_cat_to_onehot must be nonnegative")
         if int(self.max_cat_threshold) < 1:
@@ -1815,6 +1847,9 @@ class _Base(_ParamsMixin):
         return {
             "num_leaves": int(self.num_leaves),
             "max_depth": int(self.max_depth),
+            # Sent as its canonical name; the binding parses it with the same
+            # function the parameter string goes through.
+            "grow_policy": _GROW_POLICIES[grow_policy],
             "learning_rate": float(self.learning_rate),
             "n_estimators": int(self.n_estimators),
             "min_data_in_leaf": int(min_data_in_leaf),

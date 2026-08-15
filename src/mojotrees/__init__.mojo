@@ -53,6 +53,12 @@ from .sampling import (
     select_tree_features,
     selection_count,
 )
+from .levelwise_policy import (
+    GROW_DEPTHWISE,
+    GROW_LEAFWISE,
+    grow_policy_name,
+    parse_grow_policy,
+)
 from .split import SplitInfo, find_best_split, soft_threshold_l1
 from .tree import Tree, TreeParams, grow_tree, node_bounds
 from .boosting import (

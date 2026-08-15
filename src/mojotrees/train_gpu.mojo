@@ -189,6 +189,12 @@ from .sampling import (
     select_tree_features,
 )
 from .split import SplitInfo
+from .levelwise_policy import (
+    GROW_DEPTHWISE,
+    LevelCandidate,
+    LevelSchedule,
+    check_grow_policy,
+)
 from .tree import Tree, TreeParams, _leaf_value, _search
 
 
@@ -741,6 +747,7 @@ def _grow_tree_gpu_device_search(
     refused here and the caller is pointed at the host scan, which honors all
     of it. `_check_device_search_supported` is that refusal."""
     _check_device_search_supported(params)
+    check_grow_policy(params.grow_policy)
     params.constraints.check_features(builder.n_features)
     params.monotone.check_features(builder.n_features)
     var signs = params.monotone.active_signs()
@@ -849,16 +856,35 @@ def _device_search_incremental(
         _GpuRecordLeafState(root, n_root, root_rec^, root_branch^, depth=0)
     )
     var n_leaves = 1
+    var depthwise = params.grow_policy == GROW_DEPTHWISE
+    var schedule = LevelSchedule()
 
     while n_leaves < params.num_leaves:
         # Pick the leaf with the best gain anywhere in the tree, ties to
-        # the lower frontier index, exactly as the host-search loop does.
+        # the lower frontier index, exactly as the host-search loop does;
+        # under depth-wise growth the schedule picks (levelwise_policy.mojo).
         var best_i = -1
-        var best_gain = 0.0
-        for i in range(len(frontier)):
-            if frontier[i].rec.found and frontier[i].rec.gain > best_gain:
-                best_gain = frontier[i].rec.gain
-                best_i = i
+        if depthwise:
+            var cands = List[LevelCandidate](capacity=len(frontier))
+            var depths = List[Int](capacity=len(frontier))
+            for i in range(len(frontier)):
+                cands.append(
+                    LevelCandidate(
+                        frontier[i].node,
+                        frontier[i].rec.gain,
+                        frontier[i].rec.found and frontier[i].rec.gain > 0.0,
+                    )
+                )
+                depths.append(frontier[i].depth)
+            best_i = schedule.next_leaf(
+                cands, depths, n_leaves, params.num_leaves, params.max_depth
+            )
+        else:
+            var best_gain = 0.0
+            for i in range(len(frontier)):
+                if frontier[i].rec.found and frontier[i].rec.gain > best_gain:
+                    best_gain = frontier[i].rec.gain
+                    best_i = i
         if best_i < 0:
             break
 
@@ -1090,16 +1116,35 @@ def _device_search_resident(
         )
     )
     var n_leaves = 1
+    var depthwise = params.grow_policy == GROW_DEPTHWISE
+    var schedule = LevelSchedule()
 
     while n_leaves < params.num_leaves:
         # Pick the leaf with the best gain anywhere in the tree, ties to
-        # the lower frontier index, exactly as the host-search loop does.
+        # the lower frontier index, exactly as the host-search loop does;
+        # under depth-wise growth the schedule picks (levelwise_policy.mojo).
         var best_i = -1
-        var best_gain = 0.0
-        for i in range(len(frontier)):
-            if frontier[i].rec.found and frontier[i].rec.gain > best_gain:
-                best_gain = frontier[i].rec.gain
-                best_i = i
+        if depthwise:
+            var cands = List[LevelCandidate](capacity=len(frontier))
+            var depths = List[Int](capacity=len(frontier))
+            for i in range(len(frontier)):
+                cands.append(
+                    LevelCandidate(
+                        frontier[i].node,
+                        frontier[i].rec.gain,
+                        frontier[i].rec.found and frontier[i].rec.gain > 0.0,
+                    )
+                )
+                depths.append(frontier[i].depth)
+            best_i = schedule.next_leaf(
+                cands, depths, n_leaves, params.num_leaves, params.max_depth
+            )
+        else:
+            var best_gain = 0.0
+            for i in range(len(frontier)):
+                if frontier[i].rec.found and frontier[i].rec.gain > best_gain:
+                    best_gain = frontier[i].rec.gain
+                    best_i = i
         if best_i < 0:
             break
 
@@ -1325,6 +1370,7 @@ def grow_tree_gpu(
         == SPLIT_SEARCH_DEVICE
     ):
         return _grow_tree_gpu_device_search(builder, params, bag, tree_index)
+    check_grow_policy(params.grow_policy)
     params.constraints.check_features(builder.n_features)
     params.monotone.check_features(builder.n_features)
     check_feature_fractions(
@@ -1465,15 +1511,38 @@ def grow_tree_gpu(
         )
     )
     var n_leaves = 1
+    var depthwise = params.grow_policy == GROW_DEPTHWISE
+    var schedule = LevelSchedule()
 
     while n_leaves < params.num_leaves:
-        # Pick the leaf with the best gain anywhere in the tree.
+        # Pick the leaf with the best gain anywhere in the tree, or under
+        # depth-wise growth the one the schedule names (levelwise_policy.mojo).
         var best_i = -1
-        var best_gain = 0.0
-        for i in range(len(frontier)):
-            if frontier[i].split.found and frontier[i].split.gain > best_gain:
-                best_gain = frontier[i].split.gain
-                best_i = i
+        if depthwise:
+            var cands = List[LevelCandidate](capacity=len(frontier))
+            var depths = List[Int](capacity=len(frontier))
+            for i in range(len(frontier)):
+                cands.append(
+                    LevelCandidate(
+                        frontier[i].node,
+                        frontier[i].split.gain,
+                        frontier[i].split.found
+                        and frontier[i].split.gain > 0.0,
+                    )
+                )
+                depths.append(frontier[i].depth)
+            best_i = schedule.next_leaf(
+                cands, depths, n_leaves, params.num_leaves, params.max_depth
+            )
+        else:
+            var best_gain = 0.0
+            for i in range(len(frontier)):
+                if (
+                    frontier[i].split.found
+                    and frontier[i].split.gain > best_gain
+                ):
+                    best_gain = frontier[i].split.gain
+                    best_i = i
         if best_i < 0:
             break
 

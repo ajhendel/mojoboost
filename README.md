@@ -937,6 +937,37 @@ values, the CPU and GPU trainers cut growth at exactly the same leaves;
 both go through the same `_search` entry point, which is where the check
 lives.
 
+### Growth policy
+
+`grow_policy` selects how a tree spends its leaf budget. It is XGBoost's
+parameter (LightGBM has no equivalent), with XGBoost's spellings:
+
+| value | growth |
+| --- | --- |
+| `leafwise` (default; alias `lossguide`) | LightGBM's: the highest-gain leaf anywhere in the tree splits next |
+| `depthwise` | every eligible leaf at one depth splits before any deeper one, so the tree fills level by level |
+
+`num_leaves` stays a hard bound under both. A depth-wise level that would
+overrun it is admitted as its highest-gain prefix (ties broken by node id),
+so at the default `num_leaves=31` with unlimited `max_depth` a depth-wise
+tree fills four levels and half of a fifth; set `max_depth` deliberately
+for depth-wise runs, since it is the natural control there. Leaves that
+run out of rows or gain drop out of a level independently, so depth-wise
+trees can still be ragged at the bottom, only never deeper on one branch
+while a shallower leaf still had a split to offer.
+
+The mode changes only which leaf is split next: partitioning, sibling
+subtraction, leaf values, and every constraint go through the same code, so
+the CPU dense and sparse growers and all three GPU growers make the same
+choice on the same inputs (`tests/test_grow_policy.mojo`). The distributed
+prototype rejects it. On the GPU the depth-wise order is not yet batched
+into one launch per level (`docs/design/GPU_LEVELWISE.md` describes that
+step); it costs what leaf-wise growth costs today.
+
+```python
+MojoTreesRegressor(grow_policy="depthwise", max_depth=6, num_leaves=64)
+```
+
 `max_depth` is a training parameter only. It constrains which trees get
 built, but adds nothing to a fitted model, so the serialization format is
 unchanged and models saved before it round-trip as they always did.

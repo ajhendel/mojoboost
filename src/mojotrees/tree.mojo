@@ -97,6 +97,13 @@ from .sampling import (
     select_split_features,
     select_tree_features,
 )
+from .levelwise_policy import (
+    GROW_DEPTHWISE,
+    GROW_LEAFWISE,
+    LevelCandidate,
+    LevelSchedule,
+    check_grow_policy,
+)
 from .split import SplitInfo, find_best_split, soft_threshold_l1
 from .tree_parameters_extra import ExtraTreeParams, finish_leaf_output
 
@@ -131,7 +138,15 @@ struct TreeParams(Copyable, Movable):
     `ExtraTreeParams.is_active()` is what the grower and the split search test
     once per node rather than multiplying by 1.0 per candidate. The two fields
     are appended so that every positional caller of this constructor keeps
-    working unchanged."""
+    working unchanged.
+
+    `grow_policy` is XGBoost's `grow_policy` (levelwise_policy.mojo):
+    `GROW_LEAFWISE`, the default and LightGBM's growth, commits the best
+    split anywhere in the tree next; `GROW_DEPTHWISE` commits every admitted
+    split at one depth before any deeper one, `num_leaves` staying a hard
+    bound and the last level admitted as a gain-ranked prefix. LightGBM has
+    no such switch, so it is an extension rather than a parity row. The
+    default leaves every fit bit-identical."""
 
     var num_leaves: Int
     var min_data_in_leaf: Int
@@ -147,6 +162,7 @@ struct TreeParams(Copyable, Movable):
     var cat: CategoricalParams
     var feature_fraction_bylevel: Float64
     var extra: ExtraTreeParams
+    var grow_policy: Int
 
     def __init__(
         out self,
@@ -164,6 +180,7 @@ struct TreeParams(Copyable, Movable):
         var cat: CategoricalParams = CategoricalParams.default(),
         feature_fraction_bylevel: Float64 = DEFAULT_FEATURE_FRACTION_BYLEVEL,
         var extra: ExtraTreeParams = ExtraTreeParams(),
+        grow_policy: Int = GROW_LEAFWISE,
     ):
         self.num_leaves = num_leaves
         self.min_data_in_leaf = min_data_in_leaf
@@ -179,6 +196,7 @@ struct TreeParams(Copyable, Movable):
         self.cat = cat^
         self.feature_fraction_bylevel = feature_fraction_bylevel
         self.extra = extra^
+        self.grow_policy = grow_policy
 
     @staticmethod
     def default() -> TreeParams:
@@ -873,7 +891,8 @@ def grow_tree(
     tree_index: Int = 0,
     bundling: BundledMatrix = BundledMatrix.none(),
 ) raises -> Tree:
-    """Grow one tree, leaf-wise.
+    """Grow one tree, leaf-wise by default or depth-wise under
+    `params.grow_policy == GROW_DEPTHWISE`.
 
     A non-empty `bag` of row indices (see bagging.mojo) restricts growth to
     those rows: the root histogram covers the bag alone, so every count,
@@ -931,7 +950,16 @@ def grow_tree(
     expansion is linear; and the `Tree` that comes out is the tree an
     unbundled fit produces, so no consumer of it can tell which matrix built
     the histograms.
+
+    Depth-wise growth changes one thing in this loop: which frontier leaf is
+    split next. `LevelSchedule` (levelwise_policy.mojo) plans a depth at a
+    time, admits its positive-gain splits against the leaf budget, and hands
+    them out in ascending node id order; the body below (partition, sibling
+    subtraction, child values, monotone intervals, child search) is the same
+    code either way, so a depth-wise tree enforces every constraint exactly
+    as a leaf-wise one does. Forced splits still go first in both modes.
     """
+    check_grow_policy(params.grow_policy)
     params.constraints.check_features(data.n_features)
     params.monotone.check_features(data.n_features)
     check_feature_fractions(
@@ -1093,6 +1121,8 @@ def grow_tree(
         )
     )
     var n_leaves = 1
+    var depthwise = params.grow_policy == GROW_DEPTHWISE
+    var schedule = LevelSchedule()
 
     while n_leaves < params.num_leaves:
         # Forced splits go first, in forced-node order. A parent always
@@ -1108,7 +1138,26 @@ def grow_tree(
             ):
                 forced_node = frontier[i].forced
                 best_i = i
-        if best_i < 0:
+        if best_i < 0 and depthwise:
+            # Depth-wise: the schedule owns the order (levelwise_policy.mojo).
+            var cands = List[LevelCandidate](capacity=len(frontier))
+            var depths = List[Int](capacity=len(frontier))
+            for i in range(len(frontier)):
+                cands.append(
+                    LevelCandidate(
+                        frontier[i].node,
+                        frontier[i].split.gain,
+                        frontier[i].split.found
+                        and frontier[i].split.gain > 0.0,
+                    )
+                )
+                depths.append(frontier[i].depth)
+            best_i = schedule.next_leaf(
+                cands, depths, n_leaves, params.num_leaves, params.max_depth
+            )
+            if best_i < 0:
+                break
+        elif best_i < 0:
             # Nothing forced: pick the leaf with the best gain anywhere in the
             # tree, which is leaf-wise growth exactly as it was.
             var best_gain = 0.0

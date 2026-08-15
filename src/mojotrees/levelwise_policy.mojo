@@ -71,13 +71,66 @@ level-wise grower enforces every one of them identically to the leaf-wise
 growers. Level-wise growth changes *which nodes are searched when* and
 *which of the results are taken*, never how a candidate is scored.
 
-Nothing here is registered as a user-facing parameter. `LevelwiseParams` is
-held apart from `tree.TreeParams` the way `tree_parameters_extra` holds its
-own bundle, so this lane changes no shared struct and adds nothing to
-`params.mojo`, the CLI, the C API, the Python layer, or any serialized model.
-Level-wise growth is a training-time algorithm choice; a tree it produces is
-an ordinary `tree.Tree` and carries no record of the mode that grew it.
+How the mode is reached
+----------------------
+`TreeParams.grow_policy` selects it: `GROW_LEAFWISE` (the default, LightGBM's
+growth and every fit before this parameter existed) or `GROW_DEPTHWISE`
+(XGBoost's `grow_policy=depthwise`; the parameter name and both spellings
+are XGBoost's, `lossguide` being accepted as an alias for leaf-wise). It
+reaches `params.mojo` as `grow_policy`, the Python estimators as
+`grow_policy=`, and the C API through the parameter string. Every grower
+that keeps a frontier (`tree.grow_tree`, `tree_sparse.grow_tree_sparse`, and
+the three loops in `train_gpu.mojo`) asks `LevelSchedule.next_leaf` which
+leaf to split next instead of scanning for the best gain, so all of them
+grow the same depth-wise tree from the same inputs; the distributed
+prototype tracks no depth and rejects the policy. A tree it produces is an
+ordinary `tree.Tree` and carries no record of the mode that grew it.
+
+`LevelSchedule` is the frontier-order half of the design: it commits a
+level's admitted splits one at a time, in ascending node id order, through
+the growers' existing per-split bodies. Batching a whole level into one
+device launch (the design doc's launch argument) is a separate step that
+would sit underneath this same order, and it has not been built.
 """
+
+
+# `TreeParams.grow_policy`. Leaf-wise is LightGBM's growth and the default;
+# depth-wise commits every admitted split of one depth before any deeper one.
+comptime GROW_LEAFWISE = 0
+comptime GROW_DEPTHWISE = 1
+
+
+def parse_grow_policy(name: String) raises -> Int:
+    """The policy code for a name. XGBoost's spellings: `depthwise`, and
+    `lossguide` for leaf-wise; `leafwise` and `leaf_wise`/`depth_wise` are
+    accepted so the LightGBM-flavored spelling works too."""
+    if name == "leafwise" or name == "leaf_wise" or name == "lossguide":
+        return GROW_LEAFWISE
+    if name == "depthwise" or name == "depth_wise":
+        return GROW_DEPTHWISE
+    raise Error(
+        "grow_policy must be 'leafwise' (alias 'lossguide') or 'depthwise',"
+        " got '",
+        name,
+        "'",
+    )
+
+
+def grow_policy_name(policy: Int) -> String:
+    if policy == GROW_LEAFWISE:
+        return String("leafwise")
+    if policy == GROW_DEPTHWISE:
+        return String("depthwise")
+    return String("unknown")
+
+
+def check_grow_policy(policy: Int) raises:
+    if policy != GROW_LEAFWISE and policy != GROW_DEPTHWISE:
+        raise Error(
+            "grow_policy must be GROW_LEAFWISE (0) or GROW_DEPTHWISE (1),"
+            " got ",
+            policy,
+        )
 
 
 # How a level whose eligible splits would overrun the leaf budget is handled.
@@ -544,3 +597,114 @@ def levelwise_profile(
         else:
             groups += 1
     return LaunchProfile(groups, groups)
+
+
+struct LevelSchedule(Movable):
+    """The order a depth-wise grower splits its frontier in.
+
+    Every grower keeps a frontier list in which a split replaces the parent's
+    slot with the left child and appends the right child, so a slot that has
+    not been split keeps its index while other slots are split. This
+    schedule relies on that: it plans one level at a time as a queue of
+    frontier indices and hands them out one per call, and the indices stay
+    valid across the splits in between.
+
+    A level is planned when the queue is empty. The level's depth is the
+    smallest depth of any eligible frontier leaf (a leaf offering a
+    positive-gain split); every eligible leaf at that depth is a candidate,
+    `admit_level` decides which are committed under the leaf budget, and the
+    admitted ones are queued in ascending node id order, which is what makes
+    child ids breadth first (`rank_level` decides membership, never layout).
+    Leaves at that depth that were not admitted are terminal, and so are
+    eligible leaves at a shallower depth, which can only exist once the
+    budget is spent. `stop_reason` records why the last planned level ended
+    growth, for tracing and tests.
+
+    Forced splits are outside this order: a grower applies them before it
+    asks, so by the time the first level is planned the forced tree is
+    exhausted and every frontier leaf owes nothing.
+    """
+
+    var budget_mode: Int
+    var queue: List[Int]
+    var next: Int
+    var level: Int
+    var stop_reason: Int
+
+    def __init__(out self, budget_mode: Int = BUDGET_RANK):
+        self.budget_mode = budget_mode
+        self.queue = List[Int]()
+        self.next = 0
+        self.level = -1
+        self.stop_reason = STOP_RUNNING
+
+    def next_leaf(
+        mut self,
+        candidates: List[LevelCandidate],
+        depths: List[Int],
+        n_leaves: Int,
+        num_leaves: Int,
+        max_depth: Int,
+    ) raises -> Int:
+        """The frontier index to split next, or -1 when the tree is
+        finished. `candidates` is parallel to the frontier (node id, best
+        gain, and whether a positive-gain split was found) and `depths`
+        holds each leaf's depth in edges from the root."""
+        if len(candidates) != len(depths):
+            raise Error("level candidates and depths must be parallel")
+        if self.next < len(self.queue):
+            var i = self.queue[self.next]
+            self.next += 1
+            return i
+        # Plan the next level: the shallowest depth with anything to offer.
+        var level = -1
+        for i in range(len(candidates)):
+            if candidates[i].eligible and (
+                level < 0 or depths[i] < level
+            ):
+                level = depths[i]
+        if level < 0:
+            self.stop_reason = STOP_DRY_LEVEL
+            return -1
+        var at_level = List[LevelCandidate](capacity=len(candidates))
+        for i in range(len(candidates)):
+            if depths[i] == level:
+                at_level.append(candidates[i].copy())
+            else:
+                at_level.append(LevelCandidate.terminal(candidates[i].node))
+        var admitted = admit_level(
+            at_level, n_leaves, num_leaves, self.budget_mode
+        )
+        var n_eligible = count_eligible(at_level)
+        var n_admitted = count_admitted(admitted)
+        self.level = level
+        self.stop_reason = level_stop_reason(
+            level,
+            max_depth,
+            leaves_after_level(n_leaves, n_admitted),
+            num_leaves,
+            n_eligible,
+            n_admitted,
+        )
+        if n_admitted == 0:
+            return -1
+        # Ascending node id: repeatedly take the smallest admitted id not yet
+        # queued. Levels are at most `num_leaves` wide, so quadratic is fine
+        # and it keeps the rule checkable by eye, as `rank_level` does.
+        self.queue = List[Int](capacity=n_admitted)
+        self.next = 0
+        var last_node = -1
+        while len(self.queue) < n_admitted:
+            var best = -1
+            for i in range(len(at_level)):
+                if not admitted[i] or at_level[i].node <= last_node:
+                    continue
+                if best < 0 or at_level[i].node < at_level[best].node:
+                    best = i
+            if best < 0:
+                break
+            last_node = at_level[best].node
+            self.queue.append(best)
+        var i = self.queue[self.next]
+        self.next += 1
+        return i
