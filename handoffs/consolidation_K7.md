@@ -100,3 +100,28 @@ one coordinator commit.
 - Unused stdlib imports left in `__init__.py` (`_json`, `_tempfile`,
   `_array`, `_warnings`, `_operator`) were not audited for use inside the
   estimator bodies; a linter pass belongs with the estimator move.
+
+## Phase 2 (after C0's 8e214a2 fixed both tools/ blockers)
+
+- 2e1b26a `python/mojotrees/sklearn.py`: `_Base`, `MojoTreesRegressor`,
+  `MojoTreesClassifier`, `MojoTreesRanker`, the objective-code literals
+  (`_SQUARED_ERROR` .. `_CROSS_ENTROPY`) and `_LAMBDA_L1` / `_LAMBDA_L2`.
+  `__init__.py` re-binds all of them at the root; `__all__` unchanged. The
+  six stdlib imports only the estimators used (`array`, `json`,
+  `operator`, `os`, `tempfile`, `warnings`) were dropped from
+  `__init__.py` after confirming nothing reaches them through the package.
+- `__init__.py`: 545 lines (from 4,615 at the start of the lane).
+- `python3 tools/api_snapshot.py --check`: no `python.*` difference rows.
+  The remaining rows on the tree (`versions.*` 0.1.0a2 -> 0.1.0 and
+  `mojo.exports_by_module` growth_policy / levelwise_policy) are a live
+  peer's uncommitted work, per C0; the snapshot was not regenerated.
+- Verified: `import mojotrees`, the classes at the root and in
+  `mojotrees.sklearn` are the same objects, a fresh estimator pickles and
+  unpickles, `CURRENT_TOP_LEVEL == __all__` still holds.
+- One observable, non-contract change to know about: the classes'
+  `__module__` is now `mojotrees.sklearn`, so a pickle written from this
+  build names `mojotrees.sklearn.MojoTreesRegressor` (a pickle written
+  before names `mojotrees.MojoTreesRegressor`, which still resolves through
+  the root binding). Snapshot does not record `__module__`; reprs use
+  `__name__` only.
+- `_public_api_plan.py` left in place for C0.
