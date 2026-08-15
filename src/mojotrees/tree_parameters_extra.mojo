@@ -36,10 +36,13 @@ tier is a property of what the rule needs rather than of the backend:
   `boosting.fit` owns, and refused per grower rather than by name:
   `cegb_penalty_feature_coupled` and `cegb_penalty_feature_lazy`. See
   `cegb.check_cegb_grower_support`.
-- Parsed, validated, and refused by name: `feature_pre_filter`. It names
-  what it would take; see `check_extra_option_supported`. `linear_tree` and
-  `linear_lambda` are `BoosterParams.linear` (linear_tree.mojo), not tree
-  controls, and are live on the metric-path trainers.
+- Refused by name, and the only such option left: `feature_pre_filter`. It
+  names what it would take; see `check_extra_option_supported`. Every other
+  name that checker knows is refused for how it is spelled rather than for
+  being missing, which is the `forcedsplits_filename` case above.
+  `linear_tree` and `linear_lambda` are `BoosterParams.linear`
+  (linear_tree.mojo), not tree controls, and are live on the metric-path
+  trainers.
 
 `distributed.grow_tree_distributed` keeps private copies of `_search` and
 `_leaf_value` and so honors none of this; `train_gpu`'s device split search

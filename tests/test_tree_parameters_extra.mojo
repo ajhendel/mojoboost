@@ -593,18 +593,34 @@ def test_forced_splits_reject_malformed_documents() raises:
 
 
 def test_deferred_options_are_rejected_by_name() raises:
+    # `feature_pre_filter` is a Dataset construction step mojotrees does not
+    # perform, so the name is refused rather than ignored.
     with assert_raises():
-        check_extra_option_supported("linear_tree")
+        check_extra_option_supported("feature_pre_filter")
+    # Forced splits are implemented and reachable from the Mojo API, but a
+    # parameter string cannot carry a document, so every LightGBM spelling of
+    # the key is refused with that path named.
     with assert_raises():
-        check_extra_option_supported("linear_lambda")
+        check_extra_option_supported("forcedsplits_filename")
+    with assert_raises():
+        check_extra_option_supported("forced_splits_filename")
+    with assert_raises():
+        check_extra_option_supported("forced_splits")
+    with assert_raises():
+        check_extra_option_supported("fs")
     # An implemented name passes through; this checker speaks only to the
     # options it refuses. All four cegb_* names are implemented now
     # (cegb.mojo); the two that need the per-ensemble ledger are refused per
     # grower, by `cegb.check_cegb_grower_support`, not by name here.
+    # `linear_tree` and `linear_lambda` are implemented as well, as
+    # `BoosterParams.linear` (linear_tree.mojo) rather than as tree controls,
+    # so they pass through here and `params.parse_params` accepts them.
     check_extra_option_supported("path_smooth")
     check_extra_option_supported("cegb_penalty_split")
     check_extra_option_supported("cegb_penalty_feature_coupled")
     check_extra_option_supported("cegb_penalty_feature_lazy")
+    check_extra_option_supported("linear_tree")
+    check_extra_option_supported("linear_lambda")
 
 
 def test_defaults_are_lightgbms_and_are_inactive() raises:
