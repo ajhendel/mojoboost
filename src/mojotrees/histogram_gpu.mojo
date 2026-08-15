@@ -163,7 +163,7 @@ from .gpu_objectives_native import (
     GpuObjectiveState,
     device_fixed_scale,
 )
-from .parallel import _env_int
+from .parallel import _env_int, dispatch_rows
 from .quantized_gradient import fixed_point_scale, magnitude_sum
 from .unified_memory_policy import (
     ROLE_BINS,
@@ -196,6 +196,7 @@ from .gpu_runtime import (
 )
 from .histogram import (
     Histogram,
+    SIMD_LANES,
     _zeroed_f64,
     _zeroed_int,
     build_histogram_subset_replica_into,
@@ -1101,7 +1102,63 @@ struct GpuHistogramBuilder(Movable):
 
     def histogram_from_host(self) raises -> Histogram:
         """Convert the downloaded fixed-point planes into the Float64
-        `Histogram`. Host work only; call after `download_raw`."""
+        `Histogram`. Host work only; call after `download_raw`.
+
+        Which path this is on, and which it is not
+        ------------------------------------------
+        This runs once per node on the **host-search** path only. The
+        device-resident split search never calls it: the histogram stays in
+        device memory and is scanned there, and only a 136-byte record
+        crosses, which is the whole point of that path. So this conversion
+        is a cost of the host scan and of nothing else.
+
+        That matters for how a change here may be described, because our
+        headline benchmark does not take this path. At 1,000,000 rows, 50
+        features, 255 bins and 31 leaves `normalized_split_work` is exactly
+        50,000,000.0, which is not less than `M4_MIN_NORMALIZED_WORK`, so
+        `gpu_split_policy` resolves that shape to the device-resident
+        search and this function is never reached. Nothing done here can
+        move that number, and nothing here claims to.
+
+        What it does reach is everything on the other side of that
+        crossover, which is a knife edge rather than a broad margin: one
+        row fewer, one feature fewer, one leaf fewer, or any
+        `feature_fraction` below 1 all fall back to the host scan and start
+        paying this per node. `SplitSearchDecision.uses_device` is exactly
+        the predicate "this function is off the path"; `margin` and
+        `on_crossover_boundary` say how far a shape is from flipping it,
+        and `tests/test_gpu_split_launch_overhead.mojo` pins both at the
+        shapes either side of the edge.
+
+        On the host-scan path the cost is real. It covers
+        `3 * n_features * n_bins` cells, and the hybrid scheduler's
+        calibrated cost model prices the conversion at
+        `convert_nanos_per_kcell = 10024`, about 10 ns per cell, against a
+        modeled device fixed cost per node of roughly 263 microseconds.
+        Nothing here has been measured by this lane, and no speedup is
+        claimed on either path; what changed is only the shape of the loop.
+
+        Why the shape may change freely. Every output cell is a function of
+        exactly one input cell: `Float64(Int32) * (1.0 / scale)` for the two
+        Float64 planes and a widening integer conversion for the count
+        plane. There is no accumulation, no reassociation, and no
+        cross-cell dependence, so the same value lands in the same slot
+        whatever the lane width and whatever the task count. That is a
+        property of the arithmetic, not of the schedule, which is what makes
+        both the SIMD body and the block split exactness-neutral by
+        construction rather than by measurement.
+
+        Two things do change. The body loads `SIMD_LANES` cells at a time
+        and falls back to a scalar tail, which applies at every size. The
+        block split goes through `dispatch_rows` under the ordinary
+        `MOJOTREES_NUM_WORKERS` / `MOJOTREES_PARALLEL_MIN_OPS` contract, and
+        that contract is deliberately not bent here: the work estimate is
+        the honest `3 * hist_size` cell conversions, so a 50-feature, 255-bin
+        node (38,250 ops) sits below the default 65,536-op grain and stays
+        serial exactly as it did before. Forcing workers is how the parallel
+        arm is reached at that shape. Moving the grain is a measured
+        decision and is not taken here.
+        """
         var hist_size = self.n_features * self.n_bins
         var g = _zeroed_f64(hist_size)
         var h = _zeroed_f64(hist_size)
@@ -1112,10 +1169,38 @@ struct GpuHistogramBuilder(Movable):
         var hp = h.unsafe_ptr()
         var cp = c.unsafe_ptr()
         var src = self.host_out.unsafe_ptr()
-        for i in range(hist_size):
-            gp.unsafe_store(i, Float64(src.unsafe_load(i)) * g_inv)
-            hp.unsafe_store(i, Float64(src.unsafe_load(hist_size + i)) * h_inv)
-            cp.unsafe_store(i, Int(src.unsafe_load(2 * hist_size + i)))
+
+        def decode(start: Int, end: Int) {imm}:
+            comptime W = SIMD_LANES
+            var i = start
+            while i + W <= end:
+                gp.unsafe_store(
+                    i,
+                    src.unsafe_load[width=W](i).cast[DType.float64]() * g_inv,
+                )
+                hp.unsafe_store(
+                    i,
+                    src.unsafe_load[width=W](hist_size + i).cast[
+                        DType.float64
+                    ]()
+                    * h_inv,
+                )
+                cp.unsafe_store(
+                    i,
+                    src.unsafe_load[width=W](2 * hist_size + i).cast[
+                        DType.int
+                    ](),
+                )
+                i += W
+            while i < end:
+                gp.unsafe_store(i, Float64(src.unsafe_load(i)) * g_inv)
+                hp.unsafe_store(
+                    i, Float64(src.unsafe_load(hist_size + i)) * h_inv
+                )
+                cp.unsafe_store(i, Int(src.unsafe_load(2 * hist_size + i)))
+                i += 1
+
+        dispatch_rows(decode, hist_size, 3 * hist_size)
         return Histogram(g^, h^, c^, self.n_features, self.n_bins)
 
     def build_leaf(mut self, leaf: Int) raises -> Histogram:

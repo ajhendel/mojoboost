@@ -22,6 +22,14 @@ comptime SPLIT_REASON_RESIDENT_MEMORY = 2
 comptime SPLIT_REASON_UNKNOWN_HARDWARE = 3
 comptime SPLIT_REASON_BELOW_CROSSOVER = 4
 comptime SPLIT_REASON_VALIDATED_WORKLOAD = 5
+# Reasons this module never returns, because they describe a decision that
+# was taken before the workload was ever weighed. The trainer builds a
+# decision carrying one of these when a caller asked for a path by name or
+# through `MOJOTREES_GPU_SPLIT_STRATEGY`, so that everything a user or a
+# benchmark reads about the resolved path comes back in one shape whether or
+# not the policy was consulted.
+comptime SPLIT_REASON_EXPLICIT_REQUEST = 6
+comptime SPLIT_REASON_ENVIRONMENT_REQUEST = 7
 
 # Normalization makes unlike shapes comparable without pretending rows alone
 # determine the cost.  The measured workload used 255 bins and 31 leaves.
@@ -40,6 +48,32 @@ comptime SPLIT_REFERENCE_LEAVES = 31
 # normalized work because the win at the measured point was only ~2%, smaller
 # than ordinary thermal noise.  This threshold is intentionally conservative:
 # explicit device selection remains available for measurement and tuning.
+#
+# A knife edge worth knowing about, and deliberately not filed off. The
+# headline benchmark shape (1,000,000 rows, 50 features, 255 bins, 31 leaves)
+# normalizes to exactly 50,000,000.0, so it clears this threshold by
+# floating-point equality and nothing else: the gate below is `work <
+# threshold`, so equal means device. One fewer row, one fewer feature, or any
+# `feature_fraction` under 1 puts the same run on the host scan instead. The
+# threshold is not moved here, because where it sits is a measured crossover
+# and moving it from an argument is exactly what this module refuses to do.
+#
+# What the edge decides is not only which scan runs. The host scan pays, per
+# node, a full `3 * n_features * n_bins` histogram download and a host
+# synchronization, and then dequantizes those cells into a Float64
+# `Histogram` (`GpuHistogramBuilder.histogram_from_host`), which the hybrid
+# scheduler's calibrated model prices at about 10 ns per cell. The
+# device-resident scan pays none of that: the histogram is scanned where it
+# lives and a 136-byte record crosses instead. So a single row, a single
+# feature, or a `feature_fraction` of 0.99 is the difference between paying
+# a per-node download, block, and conversion and paying none of them.
+# `SplitSearchDecision.uses_device` is the predicate for it.
+#
+# What is done instead is to make the decision, and this proximity, legible:
+# `SplitSearchDecision.margin` and `on_crossover_boundary` report it,
+# `describe` prints it, and `tests/test_gpu_split_launch_overhead.mojo` pins
+# it so that a later change to the comparison or the formula cannot move the
+# benchmark's path in silence.
 comptime M4_MIN_NORMALIZED_WORK = 50_000_000.0
 comptime M4_EVIDENCE_ID = String("apple-m4-resident-split-2026-08-14-v1")
 
@@ -55,6 +89,10 @@ def split_reason_name(reason: Int) -> String:
         return String("below-crossover")
     if reason == SPLIT_REASON_VALIDATED_WORKLOAD:
         return String("validated-workload")
+    if reason == SPLIT_REASON_EXPLICIT_REQUEST:
+        return String("explicit-request")
+    if reason == SPLIT_REASON_ENVIRONMENT_REQUEST:
+        return String("environment-request")
     return String("unknown")
 
 
@@ -129,7 +167,52 @@ struct SplitSearchDecision(Copyable, Movable):
     def uses_device(self) -> Bool:
         return self.selected == SPLIT_POLICY_DEVICE_RESIDENT
 
+    def weighed_workload(self) -> Bool:
+        """Whether this decision came from comparing work to a threshold.
+
+        False for the eligibility refusals, for unknown hardware, and for a
+        path a caller named outright: in all of those the threshold and the
+        margin below say nothing.
+        """
+        return (
+            self.reason == SPLIT_REASON_BELOW_CROSSOVER
+            or self.reason == SPLIT_REASON_VALIDATED_WORKLOAD
+        )
+
+    def margin(self) -> Float64:
+        """Normalized work minus the threshold it was compared against.
+
+        Zero means the workload sits exactly on the crossover and the
+        selected path was decided by a single strict comparison of two
+        Float64 values that are equal. Positive means device, negative means
+        host, and the size says how far the shape would have to move to
+        change the answer. Zero for a decision that weighed no workload.
+        """
+        if not self.weighed_workload():
+            return 0.0
+        return self.normalized_work - self.threshold
+
+    def on_crossover_boundary(self) -> Bool:
+        """Whether the workload lands exactly on the threshold.
+
+        This is a fact worth surfacing rather than a condition worth acting
+        on. The gate is `work < threshold`, so a workload at exactly the
+        threshold takes the device path by floating-point equality alone,
+        and a shape one row, one feature, or one `feature_fraction` step
+        smaller takes the host path instead. The headline 1,000,000 x 50
+        benchmark at 255 bins and 31 leaves is such a workload. Reporting it
+        is not a claim that either side is faster; it is a claim that the
+        measurement is standing on an edge and should be read knowing that.
+        """
+        return self.weighed_workload() and (
+            self.normalized_work == self.threshold
+        )
+
     def describe(self) -> String:
+        var edge = (
+            " boundary=exact-threshold" if self.on_crossover_boundary()
+            else String("")
+        )
         return String(
             "split_strategy=",
             "device-resident" if self.uses_device() else "host",
@@ -141,6 +224,7 @@ struct SplitSearchDecision(Copyable, Movable):
             self.threshold,
             " evidence=",
             self.evidence_id,
+            edge,
         )
 
 
