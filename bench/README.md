@@ -22,7 +22,9 @@ and compare against both 1-thread and machine-wide LightGBM.
 ```sh
 pixi run bench                 # mojoboost, defaults: 100000 rows x 100 features, reg
 pixi run bench 100000 100 binary
+pixi run bench 100000 100 reg 1             # final argument is the data seed
 pixi run -e bench bench-lgbm --rows 100000 --features 100 --objective reg --threads 1
+pixi run -e bench bench-lgbm --rows 100000 --features 100 --objective reg --threads 1 --seed 1
 pixi run bench-hist
 ```
 
@@ -44,6 +46,13 @@ separately; loss is on the training set).
 Headline for this original baseline: a from-scratch Mojo GBDT is within 1.5x
 of single-threaded LightGBM on training, faster at binning, and matches its
 accuracy, before multicore histogram accumulation and without GOSS or EFB.
+
+The current large-data comparison, including three matched data seeds at one
+and five million rows, is recorded in
+[`results/apple_m4_large_scaling_2026-08-14.md`](results/apple_m4_large_scaling_2026-08-14.md).
+It supersedes extrapolations from this original 100,000-row baseline; it does
+not replace the baseline because the shapes and implementation revisions are
+different.
 
 ## CPU stage profile
 

@@ -29,7 +29,7 @@ The first repeat of the first GPU arm also pays one-time device setup, which
 is why the summary leads with the minimum rather than the mean.
 
 Usage: mojo run -I src bench/bench_train_gpu.mojo \\
-    [n_rows] [n_features] [reg|binary] [repeats] [arms]
+    [n_rows] [n_features] [reg|binary] [repeats] [arms] [seed]
 
 `arms` is a comma-separated list of cpu, gpu, gpu-host, gpu-device, in the
 order they should run; the first is the baseline every other arm is compared
@@ -262,6 +262,7 @@ def main() raises:
         var objective = SQUARED_ERROR
         var obj_name = String("reg")
         var repeats = 1
+        var seed = 0
         var arms = List[Int]()
         arms.append(ARM_CPU)
         arms.append(ARM_GPU)
@@ -282,15 +283,18 @@ def main() raises:
                 raise Error("repeats must be at least 1")
         if len(args) > 5:
             arms = _parse_arms(String(args[5]))
+        if len(args) > 6:
+            seed = Int(String(args[6]))
         if n_features < 4:
             raise Error("need at least 4 features")
 
         # Same data as bench_train.mojo: column-major features, target from
         # features 0..3 plus a noise stream at counters >= n_rows * n_features.
         var features = List[Float64](capacity=n_rows * n_features)
+        var seed_offset = UInt64(seed) * 0x9E3779B97F4A7C15
         for k in range(n_rows * n_features):
-            features.append(_uniform(UInt64(k)))
-        var noise_base = UInt64(n_rows * n_features)
+            features.append(_uniform(seed_offset + UInt64(k)))
+        var noise_base = seed_offset + UInt64(n_rows * n_features)
         var target = List[Float64](capacity=n_rows)
         for r in range(n_rows):
             var x0 = features[0 * n_rows + r]
@@ -314,6 +318,8 @@ def main() raises:
             n_features,
             "features,",
             obj_name,
+            "seed",
+            seed,
         )
 
         var t0 = perf_counter_ns()

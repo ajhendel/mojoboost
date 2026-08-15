@@ -35,15 +35,20 @@ def sigmoid(x: np.ndarray) -> np.ndarray:
     return np.where(x >= 0.0, 1.0 / (1.0 + np.exp(-x)), np.exp(x) / (1.0 + np.exp(x)))
 
 
-def make_data(n_rows: int, n_features: int, objective: str):
+def make_data(n_rows: int, n_features: int, objective: str, seed: int = 0):
     # Value at (row r, feature f) is uniform(f * n_rows + r), matching the
     # column-major counters in bench_train.mojo.
-    k = np.arange(n_rows * n_features, dtype=np.uint64)
+    seed_offset = np.uint64((seed * 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF)
+    k = np.arange(n_rows * n_features, dtype=np.uint64) + seed_offset
     X = uniform(k).reshape(n_features, n_rows).T.copy()
 
     x0, x1, x2, x3 = X[:, 0], X[:, 1], X[:, 2], X[:, 3]
     signal = 5.0 * x0 + 4.0 * x1 * x2 + 3.0 * (x3 - 0.5) * (x3 - 0.5)
-    u = uniform(np.arange(n_rows, dtype=np.uint64) + np.uint64(n_rows * n_features))
+    u = uniform(
+        np.arange(n_rows, dtype=np.uint64)
+        + seed_offset
+        + np.uint64(n_rows * n_features)
+    )
     if objective == "binary":
         p = sigmoid(2.0 * (signal - 3.0))
         y = (u < p).astype(np.float64)
@@ -58,12 +63,13 @@ def main():
     ap.add_argument("--features", type=int, default=100)
     ap.add_argument("--objective", choices=["reg", "binary"], default="reg")
     ap.add_argument("--threads", type=int, default=1)
+    ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
-    X, y = make_data(args.rows, args.features, args.objective)
+    X, y = make_data(args.rows, args.features, args.objective, args.seed)
     print(
         f"lightgbm bench: {args.rows} rows x {args.features} features, "
-        f"{args.objective}, {args.threads} thread(s)"
+        f"{args.objective}, {args.threads} thread(s), seed {args.seed}"
     )
 
     params = {
