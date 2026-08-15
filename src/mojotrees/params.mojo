@@ -50,6 +50,7 @@ from .boosting import (
     TWEEDIE,
 )
 from .device import CPU_DEVICE, parse_device
+from .objective_registry import MULTICLASS as _MULTICLASS
 from .efb import check_bundling_supported
 from .sampling import canonical_data_sample_strategy
 from .levelwise_policy import parse_grow_policy
@@ -60,10 +61,11 @@ from .tree_parameters_extra import (
 )
 
 # `TrainConfig.objective` when the parameter string selects softmax
-# multiclass, which `fit_multiclass` handles instead of `fit`. Multiclass is
-# not one of the single-output objective codes in boosting.mojo, so it needs
-# a value of its own; it is negative to keep it out of that space forever.
-comptime MULTICLASS = -1
+# multiclass, which `fit_multiclass` handles instead of `fit`. Defined once
+# in objective_registry.mojo with the other codes (negative to stay out of
+# the single-output space forever) and bound here under the name this
+# module's callers import.
+comptime MULTICLASS = _MULTICLASS
 
 # Every key `parse_params` accepts, primary names only, for error messages.
 comptime SUPPORTED_KEYS = String(
