@@ -181,6 +181,7 @@ from .binning import BinnedMatrix
 from .gain import leaf_score, soft_threshold_l1
 from .histogram import Histogram, _zeroed_f64, _zeroed_int
 from .parallel import dispatch_feature_ranges
+from .rng import GOLDEN, splitmix64, uniform
 from .tree_parameters_extra import raw_leaf_output
 
 
@@ -364,32 +365,14 @@ comptime INT64_LIMIT = Int64(9223372036854775807)
 # ---------------------------------------------------------------------------
 # Counter-based rounding streams
 # ---------------------------------------------------------------------------
-
-comptime _GOLDEN = UInt64(0x9E3779B97F4A7C15)
-comptime _TWO_POW_NEG_53 = 1.0 / 9007199254740992.0
-
-
-def _mix64(state: UInt64) -> UInt64:
-    """splitmix64's finalizer, the same mixing `bagging._splitmix64`,
-    `goss._splitmix64`, `sampling._splitmix64`, and
-    `tree_parameters_extra._mix64` apply.
-
-    Repeated here rather than imported so this module stays free of another
-    module's private names, which is the reason `tree_parameters_extra`
-    gives for its own copy. There are now five, which is four too many; the
-    handoff carries the consolidation patch, and this is the copy that
-    should survive it only if the shared home ends up being a module every
-    one of the five can already import.
-    """
-    var z = state + 0x9E3779B97F4A7C15
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EB
-    return z ^ (z >> 31)
+# The mixer is rng.mojo's splitmix64, the one every sampler draws from; this
+# module owns only how (seed, round, class, plane) becomes a stream start.
 
 
 def quant_uniform(counter: UInt64) -> Float64:
-    """Uniform in [0, 1) with 53 significant bits, from a counter value."""
-    return Float64(_mix64(counter) >> 11) * _TWO_POW_NEG_53
+    """Uniform in [0, 1) with 53 significant bits, from a counter value:
+    rng.mojo's `uniform`, under the name the rounding code calls it by."""
+    return uniform(counter)
 
 
 def quant_stream(
@@ -406,10 +389,10 @@ def quant_stream(
     ratio rather than by XOR, so the two planes are far apart in the mixing
     input rather than one bit apart.
     """
-    var h = _mix64(UInt64(seed & 0x7FFFFFFFFFFFFFFF))
-    h = _mix64(h ^ UInt64(round_index & 0x7FFFFFFFFFFFFFFF))
-    h = _mix64(h ^ UInt64((class_index + 1) & 0x7FFFFFFFFFFFFFFF))
-    return _mix64(h ^ (UInt64(plane) * _GOLDEN))
+    var h = splitmix64(UInt64(seed & 0x7FFFFFFFFFFFFFFF))
+    h = splitmix64(h ^ UInt64(round_index & 0x7FFFFFFFFFFFFFFF))
+    h = splitmix64(h ^ UInt64((class_index + 1) & 0x7FFFFFFFFFFFFFFF))
+    return splitmix64(h ^ (UInt64(plane) * GOLDEN))
 
 
 @fieldwise_init
