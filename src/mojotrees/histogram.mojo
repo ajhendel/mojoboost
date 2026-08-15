@@ -49,13 +49,69 @@ what still needs measuring):
   feature into two sequential loads per feature and leaves one gather for
   the whole node. The threshold and the scratch reuse are the caller's, via
   the scratch form.
-- **Two features are accumulated in one inner loop.** Their slices are
-  disjoint, so the two read-modify-write chains are independent, and the row
-  id and the gradient pair are loaded once for both. Whether the hardware
-  actually overlaps them is a claim for a profiler, not for this comment.
+- **N features are accumulated in one inner loop.** Their slices are
+  disjoint, so the N read-modify-write chains are independent, and the row id
+  and the gradient pair are loaded once for all N. Whether the hardware
+  actually overlaps them is a claim for a profiler, not for this comment; the
+  traffic arithmetic is not, and it is the reason the width is a ladder rather
+  than a constant. Feature-major accumulation walks the node's gradient and
+  hessian stream once per group, so at 50 features and a million rows the
+  16 MB of (g, h) pairs is streamed 50 times at width 1 (800 MB), 13 times at
+  width 4 (208 MB), and 4 times at width 16 (64 MB), against 50 MB of binned
+  data that is read once at every width. `apple_cpu_policy.plan_feature_group`
+  chooses the width and says what bounds it.
 
 None of that changes a value or an order: each feature still sums its bins
-over rows in ascending order inside a single task.
+over rows in ascending order inside a single task. The argument is worth
+stating precisely, because widening an interleave is exactly the kind of
+change that quietly reassociates a Float64 sum, and this one does not.
+
+  A histogram cell `(f, b)` receives one `+= grad[r]` for every row `r` of the
+  node whose bin for feature `f` is `b`. Which cells exist, and which rows
+  land in each, is fixed by the data. What a schedule can change is the ORDER
+  of those additions, and Float64 addition is not associative, so the order is
+  part of the result.
+
+  Feature `f` is owned by exactly one group, the group is owned by exactly one
+  task, and that task walks `i_row` from 0 to the node's row count in
+  ascending order, adding into `f`'s slice as it goes. So the sequence of
+  additions into `(f, b)` is the node's rows in ascending order, filtered to
+  those that fall in bin `b`. That sentence contains no reference to the group
+  width, to which other features share the group, to how many groups a task
+  holds, or to how many tasks there are, and that is the whole proof: the same
+  sequence of additions in the same order at every width, hence the same
+  bytes. It rests on the feature ids being distinct, which is the contract
+  stated above, since two copies of one feature would share a slice.
+
+  The two dispatch shapes preserve it in the same way `parallel.mojo` states:
+  a group is never split across tasks, and a feature is never split across
+  groups.
+
+**Why the group width, and not row blocks.** Widening the group divides both
+the gradient traffic and the task count by the same factor, so it trades
+memory traffic against parallel slack and neither term can be made large
+without shrinking the other. The decomposition that removes the trade is the
+obvious one: split a group's rows into blocks, give each block a private
+histogram, and fold the partials. Both counts go up together, and it is what
+the GPU tiled kernel already does.
+
+It is ruled out here, and the reason is the bit-identity proof above rather
+than a preference. A fold over contiguous ascending row blocks gives cell
+`(f, b)` the value
+
+    (sum of block 0's rows in b) + (sum of block 1's rows in b) + ...
+
+and Float64 addition is not associative, so that is a *different value* from
+adding the same rows one at a time in ascending order. It is not less
+accurate, and for many inputs it is more so; it is simply not the same bytes,
+and this project's histograms are bit-identical across every backend and every
+worker setting by construction rather than by tolerance. The block count would
+enter the result, `MOJOTREES_NUM_WORKERS` would stop being a scheduling knob,
+and sibling subtraction would stop being exact. Anyone reaching for row blocks
+is proposing to give all of that up, and should say so explicitly rather than
+discover it by breaking parity. The GPU path escapes the same argument only
+because it accumulates in fixed-point Int32, where addition *is* associative;
+see `_range_hist_partial_kernel` in `gpu_active_rows.mojo`.
 """
 
 from std.math import round
@@ -283,6 +339,101 @@ def _accumulate_full(
         n_features, n_bins, features, plan.excluded_ops,
     )
 
+    # The ladder, dispatched from the host exactly as the GPU histogram family
+    # is dispatched in `gpu_active_rows._enqueue_atomic_family`: one static
+    # arm per instantiated width, `>=` rather than `==` so a width that is
+    # somehow off the ladder still lands on a kernel that exists rather than
+    # on none. The policy floors to a rung, so in practice each arm is hit
+    # exactly.
+    var group = plan.group_width
+    if group >= 16:
+        _accumulate_full_at[16](
+            out_grad, out_hess, out_count, data, grad, hess, features,
+            n_active, plan.group_count, plan.active_ops,
+        )
+    elif group >= 8:
+        _accumulate_full_at[8](
+            out_grad, out_hess, out_count, data, grad, hess, features,
+            n_active, plan.group_count, plan.active_ops,
+        )
+    elif group >= 4:
+        _accumulate_full_at[4](
+            out_grad, out_hess, out_count, data, grad, hess, features,
+            n_active, plan.group_count, plan.active_ops,
+        )
+    elif group >= 2:
+        _accumulate_full_at[2](
+            out_grad, out_hess, out_count, data, grad, hess, features,
+            n_active, plan.group_count, plan.active_ops,
+        )
+    else:
+        _accumulate_full_at[1](
+            out_grad, out_hess, out_count, data, grad, hess, features,
+            n_active, plan.group_count, plan.active_ops,
+        )
+
+
+def _accumulate_full_at[
+    GROUP: Int
+](
+    mut out_grad: List[Float64],
+    mut out_hess: List[Float64],
+    mut out_count: List[Int],
+    data: BinnedMatrix,
+    grad: List[Float64],
+    hess: List[Float64],
+    features: List[Int],
+    n_active: Int,
+    n_groups: Int,
+    active_ops: Int,
+) raises:
+    """The full-dataset accumulation at one interleave width.
+
+    `GROUP` features share one ascending walk of every row, so the gradient
+    and the hessian are loaded once and spent `GROUP` times. The dispatch is
+    over groups rather than over features, which is what guarantees a task
+    holds whole groups and can therefore actually interleave what the policy
+    asked for; splitting by feature let the task splitter hand a task a single
+    feature and silently drop the interleave for it.
+
+    A tail group owning fewer than `GROUP` features is not a second code path:
+    `owned` bounds the unrolled body, exactly as the `owned` guard does in the
+    device kernels in `gpu_active_rows.mojo`. The slot arrays are SIMD lanes
+    rather than a stack array so that a comptime lane index stays in a
+    register instead of becoming a load the compiler cannot prove does not
+    alias the histogram it is storing into.
+
+    Bit-identity across widths is argued in this module's docstring. Nothing
+    in this function reads `GROUP` except to decide how many features share a
+    walk; the per-feature summation order is the row order either way.
+
+    **Why this builder does not gather (g, h) into an interleaved buffer, the
+    way the subset builder does.** It was proposed on the grounds that the
+    root reads two 8 MB Float64 streams per group rather than one 16 MB
+    stream, and the arithmetic does not support it. Here `r` is the loop
+    counter, so both reads are sequential: `grad` and `hess` each supply 8
+    bytes per row, one 64-byte line per eight rows, 16 bytes of traffic per
+    row in total. An interleaved buffer supplies the same 16 bytes per row as
+    one line per four rows. Identical traffic, identical line count, and the
+    interleaving would additionally cost a full 16 MB write and one more pass
+    over the data. The gather earns its pass in `_accumulate_subset_at` for a
+    different reason entirely, which does not apply here: there the rows
+    arrive through a row-id list, so `grad[r]` and `hess[r]` are two separate
+    lines *per row* rather than two streams, and gathering turns 2 * n_active
+    indirect loads per row into two.
+
+    That refutation is about the gradient INPUT and says nothing about the
+    histogram OUTPUT. Interleaving the output cells, so that a bin's gradient
+    and hessian are adjacent and one update touches one line instead of two,
+    and narrowing `count` from a 64-bit `Int`, are separate proposals about
+    `Histogram`'s layout. They are exact, they are not refuted here, and they
+    are not this lane's to make: the layout is read by every consumer,
+    including the GPU download path and the C ABI, so it is its own change
+    behind its own profile.
+    """
+    var n_rows = data.n_rows
+    var n_bins = data.n_bins
+    var use_all = len(features) == 0
     var gp = out_grad.unsafe_ptr()
     var hp = out_hess.unsafe_ptr()
     var cp = out_count.unsafe_ptr()
@@ -290,80 +441,59 @@ def _accumulate_full(
     var hess_p = hess.unsafe_ptr()
     var bins_p = data.bins.unsafe_ptr()
     var feat_p = features.unsafe_ptr()
-    var pair_features = plan.group_width >= 2
     comptime W = SIMD_LANES
 
-    def accumulate_range(i_start: Int, i_end: Int) {imm}:
-        var i = i_start
-        while i < i_end:
-            # Two features share one walk of the row range when the policy
-            # allows it and the task has two left. Every row of the dataset is
-            # visited in ascending order either way, which is the whole of the
-            # ordering invariant.
-            if pair_features and i + 1 < i_end:
-                var f0 = i if use_all else feat_p.unsafe_load(i)
-                var f1 = (i + 1) if use_all else feat_p.unsafe_load(i + 1)
-                var base0 = f0 * n_bins
-                var base1 = f1 * n_bins
-                var zb = 0
-                while zb + W <= n_bins:
-                    gp.unsafe_store(base0 + zb, SIMD[DType.float64, W](0.0))
-                    hp.unsafe_store(base0 + zb, SIMD[DType.float64, W](0.0))
-                    cp.unsafe_store(base0 + zb, SIMD[DType.int, W](0))
-                    gp.unsafe_store(base1 + zb, SIMD[DType.float64, W](0.0))
-                    hp.unsafe_store(base1 + zb, SIMD[DType.float64, W](0.0))
-                    cp.unsafe_store(base1 + zb, SIMD[DType.int, W](0))
-                    zb += W
-                while zb < n_bins:
-                    gp.unsafe_store(base0 + zb, 0.0)
-                    hp.unsafe_store(base0 + zb, 0.0)
-                    cp.unsafe_store(base0 + zb, 0)
-                    gp.unsafe_store(base1 + zb, 0.0)
-                    hp.unsafe_store(base1 + zb, 0.0)
-                    cp.unsafe_store(base1 + zb, 0)
-                    zb += 1
-                var col0 = bins_p.unsafe_offset(f0 * n_rows)
-                var col1 = bins_p.unsafe_offset(f1 * n_rows)
-                for r in range(n_rows):
-                    # Contiguous: the whole dataset is one ascending walk, so
-                    # the gradients, the hessians, and both binned columns are
-                    # sequential streams.
-                    var g = grad_p.unsafe_load(r)
-                    var h = hess_p.unsafe_load(r)
-                    var b0 = base0 + Int(col0.unsafe_load(r))
-                    var b1 = base1 + Int(col1.unsafe_load(r))
-                    gp.unsafe_store(b0, gp.unsafe_load(b0) + g)
-                    hp.unsafe_store(b0, hp.unsafe_load(b0) + h)
-                    cp.unsafe_store(b0, cp.unsafe_load(b0) + 1)
-                    gp.unsafe_store(b1, gp.unsafe_load(b1) + g)
-                    hp.unsafe_store(b1, hp.unsafe_load(b1) + h)
-                    cp.unsafe_store(b1, cp.unsafe_load(b1) + 1)
-                i += 2
-            else:
-                var f = i if use_all else feat_p.unsafe_load(i)
-                var base = f * n_bins
-                var zb = 0
-                while zb + W <= n_bins:
-                    gp.unsafe_store(base + zb, SIMD[DType.float64, W](0.0))
-                    hp.unsafe_store(base + zb, SIMD[DType.float64, W](0.0))
-                    cp.unsafe_store(base + zb, SIMD[DType.int, W](0))
-                    zb += W
-                while zb < n_bins:
-                    gp.unsafe_store(base + zb, 0.0)
-                    hp.unsafe_store(base + zb, 0.0)
-                    cp.unsafe_store(base + zb, 0)
-                    zb += 1
-                var col = bins_p.unsafe_offset(f * n_rows)
-                for r in range(n_rows):
-                    var g = grad_p.unsafe_load(r)
-                    var h = hess_p.unsafe_load(r)
-                    var b = base + Int(col.unsafe_load(r))
-                    gp.unsafe_store(b, gp.unsafe_load(b) + g)
-                    hp.unsafe_store(b, hp.unsafe_load(b) + h)
-                    cp.unsafe_store(b, cp.unsafe_load(b) + 1)
-                i += 1
+    def accumulate_groups(g_start: Int, g_end: Int) {imm}:
+        for grp in range(g_start, g_end):
+            var slot0 = grp * GROUP
+            var owned = n_active - slot0
+            if owned > GROUP:
+                owned = GROUP
+            var base = SIMD[DType.int, GROUP](0)
+            var col = SIMD[DType.int, GROUP](0)
+            comptime for k in range(GROUP):
+                if k < owned:
+                    var f = (
+                        (slot0 + k) if use_all
+                        else feat_p.unsafe_load(slot0 + k)
+                    )
+                    base[k] = f * n_bins
+                    col[k] = f * n_rows
 
-    dispatch_feature_ranges(accumulate_range, n_active, plan.active_ops)
+            # Zeroing stays fused into the pass that fills the slice, as the
+            # module docstring explains, and now covers the whole group before
+            # the shared row walk begins.
+            comptime for k in range(GROUP):
+                if k < owned:
+                    var z0 = Int(base[k])
+                    var zb = 0
+                    while zb + W <= n_bins:
+                        gp.unsafe_store(z0 + zb, SIMD[DType.float64, W](0.0))
+                        hp.unsafe_store(z0 + zb, SIMD[DType.float64, W](0.0))
+                        cp.unsafe_store(z0 + zb, SIMD[DType.int, W](0))
+                        zb += W
+                    while zb < n_bins:
+                        gp.unsafe_store(z0 + zb, 0.0)
+                        hp.unsafe_store(z0 + zb, 0.0)
+                        cp.unsafe_store(z0 + zb, 0)
+                        zb += 1
+
+            for r in range(n_rows):
+                # Contiguous: the whole dataset is one ascending walk, so the
+                # gradients, the hessians, and all `GROUP` binned columns are
+                # sequential streams.
+                var g = grad_p.unsafe_load(r)
+                var h = hess_p.unsafe_load(r)
+                comptime for k in range(GROUP):
+                    if k < owned:
+                        var b = Int(base[k]) + Int(
+                            bins_p.unsafe_load(Int(col[k]) + r)
+                        )
+                        gp.unsafe_store(b, gp.unsafe_load(b) + g)
+                        hp.unsafe_store(b, hp.unsafe_load(b) + h)
+                        cp.unsafe_store(b, cp.unsafe_load(b) + 1)
+
+    dispatch_feature_ranges(accumulate_groups, n_groups, active_ops)
 
 
 def build_histogram_subset(
@@ -467,7 +597,6 @@ def _accumulate_subset(
     row_count: Int,
     features: List[Int],
 ) raises:
-    var n_rows = data.n_rows
     var n_bins = data.n_bins
     var n_features = data.n_features
     var n_sub = row_count
@@ -484,18 +613,10 @@ def _accumulate_subset(
     if plan.compact_rows:
         ensure_pair_capacity(pairs, n_sub)
 
-    var gp = out_grad.unsafe_ptr()
-    var hp = out_hess.unsafe_ptr()
-    var cp = out_count.unsafe_ptr()
     var grad_p = grad.unsafe_ptr()
     var hess_p = hess.unsafe_ptr()
     var rows_p = rows.unsafe_ptr().unsafe_offset(row_start)
-    var bins_all_p = data.bins.unsafe_ptr()
     var pairs_p = pairs.unsafe_ptr()
-    var feat_p = features.unsafe_ptr()
-    var compact = plan.compact_rows
-    var pair_features = plan.group_width >= 2
-    comptime W = SIMD_LANES
 
     # One gather for the whole node instead of one per feature. Disjoint
     # ascending blocks, elementwise, so the buffer comes out the same
@@ -506,75 +627,143 @@ def _accumulate_subset(
             pairs_p.unsafe_store(2 * i, grad_p.unsafe_load(r))
             pairs_p.unsafe_store(2 * i + 1, hess_p.unsafe_load(r))
 
-    if compact:
+    if plan.compact_rows:
         dispatch_rows(fill_pairs, n_sub, plan.gather_ops)
 
-    def accumulate_range(i_start: Int, i_end: Int) {imm}:
-        var i = i_start
-        while i < i_end:
-            if compact and pair_features and i + 1 < i_end:
-                var f0 = i if use_all else feat_p.unsafe_load(i)
-                var f1 = (i + 1) if use_all else feat_p.unsafe_load(i + 1)
-                var base0 = f0 * n_bins
-                var base1 = f1 * n_bins
-                var zb = 0
-                while zb + W <= n_bins:
-                    gp.unsafe_store(base0 + zb, SIMD[DType.float64, W](0.0))
-                    hp.unsafe_store(base0 + zb, SIMD[DType.float64, W](0.0))
-                    cp.unsafe_store(base0 + zb, SIMD[DType.int, W](0))
-                    gp.unsafe_store(base1 + zb, SIMD[DType.float64, W](0.0))
-                    hp.unsafe_store(base1 + zb, SIMD[DType.float64, W](0.0))
-                    cp.unsafe_store(base1 + zb, SIMD[DType.int, W](0))
-                    zb += W
-                while zb < n_bins:
-                    gp.unsafe_store(base0 + zb, 0.0)
-                    hp.unsafe_store(base0 + zb, 0.0)
-                    cp.unsafe_store(base0 + zb, 0)
-                    gp.unsafe_store(base1 + zb, 0.0)
-                    hp.unsafe_store(base1 + zb, 0.0)
-                    cp.unsafe_store(base1 + zb, 0)
-                    zb += 1
-                var col0 = bins_all_p.unsafe_offset(f0 * n_rows)
-                var col1 = bins_all_p.unsafe_offset(f1 * n_rows)
+    # The ladder, dispatched as in `_accumulate_full` above.
+    var group = plan.group_width
+    if group >= 16:
+        _accumulate_subset_at[16](
+            out_grad, out_hess, out_count, pairs, data, grad, hess,
+            rows, row_start, row_count, features,
+            plan.compact_rows, n_active, plan.group_count, plan.active_ops,
+        )
+    elif group >= 8:
+        _accumulate_subset_at[8](
+            out_grad, out_hess, out_count, pairs, data, grad, hess,
+            rows, row_start, row_count, features,
+            plan.compact_rows, n_active, plan.group_count, plan.active_ops,
+        )
+    elif group >= 4:
+        _accumulate_subset_at[4](
+            out_grad, out_hess, out_count, pairs, data, grad, hess,
+            rows, row_start, row_count, features,
+            plan.compact_rows, n_active, plan.group_count, plan.active_ops,
+        )
+    elif group >= 2:
+        _accumulate_subset_at[2](
+            out_grad, out_hess, out_count, pairs, data, grad, hess,
+            rows, row_start, row_count, features,
+            plan.compact_rows, n_active, plan.group_count, plan.active_ops,
+        )
+    else:
+        _accumulate_subset_at[1](
+            out_grad, out_hess, out_count, pairs, data, grad, hess,
+            rows, row_start, row_count, features,
+            plan.compact_rows, n_active, plan.group_count, plan.active_ops,
+        )
+
+
+def _accumulate_subset_at[
+    GROUP: Int
+](
+    mut out_grad: List[Float64],
+    mut out_hess: List[Float64],
+    mut out_count: List[Int],
+    pairs: List[Float64],
+    data: BinnedMatrix,
+    grad: List[Float64],
+    hess: List[Float64],
+    rows: List[Int],
+    row_start: Int,
+    row_count: Int,
+    features: List[Int],
+    compact: Bool,
+    n_active: Int,
+    n_groups: Int,
+    active_ops: Int,
+) raises:
+    """The subset accumulation at one interleave width.
+
+    The twin of `_accumulate_full_at`, over `rows[row_start : row_start +
+    row_count]` instead of over every row, and with two row loops instead of
+    one. `compact` selects between the gathered `(g, h)` pair buffer and the
+    two indirect loads through the row id; they read the same Float64 values
+    in the same order, so which one runs cannot change a bin. They are two
+    loops rather than one loop with a branch so the branch is not re-evaluated
+    a million times, which is the shape `gpu_active_rows`'s `use_quant` pair
+    uses for the same reason.
+
+    The gather decision and the interleave width are now independent, where
+    before the pairing branch also required `compact` and so a small node ran
+    one feature at a time whatever the policy said. Widening the non-gathered
+    path is strictly less work: the two indirect loads per row are spent
+    `GROUP` times instead of once.
+
+    Tail groups, the SIMD-lane slot arrays, and the bit-identity argument are
+    as in `_accumulate_full_at`.
+    """
+    var n_rows = data.n_rows
+    var n_bins = data.n_bins
+    var n_sub = row_count
+    var use_all = len(features) == 0
+    var gp = out_grad.unsafe_ptr()
+    var hp = out_hess.unsafe_ptr()
+    var cp = out_count.unsafe_ptr()
+    var grad_p = grad.unsafe_ptr()
+    var hess_p = hess.unsafe_ptr()
+    var rows_p = rows.unsafe_ptr().unsafe_offset(row_start)
+    var bins_all_p = data.bins.unsafe_ptr()
+    var pairs_p = pairs.unsafe_ptr()
+    var feat_p = features.unsafe_ptr()
+    comptime W = SIMD_LANES
+
+    def accumulate_groups(g_start: Int, g_end: Int) {imm}:
+        for grp in range(g_start, g_end):
+            var slot0 = grp * GROUP
+            var owned = n_active - slot0
+            if owned > GROUP:
+                owned = GROUP
+            var base = SIMD[DType.int, GROUP](0)
+            var col = SIMD[DType.int, GROUP](0)
+            comptime for k in range(GROUP):
+                if k < owned:
+                    var f = (
+                        (slot0 + k) if use_all
+                        else feat_p.unsafe_load(slot0 + k)
+                    )
+                    base[k] = f * n_bins
+                    col[k] = f * n_rows
+
+            comptime for k in range(GROUP):
+                if k < owned:
+                    var z0 = Int(base[k])
+                    var zb = 0
+                    while zb + W <= n_bins:
+                        gp.unsafe_store(z0 + zb, SIMD[DType.float64, W](0.0))
+                        hp.unsafe_store(z0 + zb, SIMD[DType.float64, W](0.0))
+                        cp.unsafe_store(z0 + zb, SIMD[DType.int, W](0))
+                        zb += W
+                    while zb < n_bins:
+                        gp.unsafe_store(z0 + zb, 0.0)
+                        hp.unsafe_store(z0 + zb, 0.0)
+                        cp.unsafe_store(z0 + zb, 0)
+                        zb += 1
+
+            if compact:
                 for i_row in range(n_sub):
                     var r = rows_p.unsafe_load(i_row)
                     # Adjacent, so one cache line carries both.
                     var g = pairs_p.unsafe_load(2 * i_row)
                     var h = pairs_p.unsafe_load(2 * i_row + 1)
-                    var b0 = base0 + Int(col0.unsafe_load(r))
-                    var b1 = base1 + Int(col1.unsafe_load(r))
-                    gp.unsafe_store(b0, gp.unsafe_load(b0) + g)
-                    hp.unsafe_store(b0, hp.unsafe_load(b0) + h)
-                    cp.unsafe_store(b0, cp.unsafe_load(b0) + 1)
-                    gp.unsafe_store(b1, gp.unsafe_load(b1) + g)
-                    hp.unsafe_store(b1, hp.unsafe_load(b1) + h)
-                    cp.unsafe_store(b1, cp.unsafe_load(b1) + 1)
-                i += 2
-                continue
-
-            var f = i if use_all else feat_p.unsafe_load(i)
-            var base = f * n_bins
-            var zb = 0
-            while zb + W <= n_bins:
-                gp.unsafe_store(base + zb, SIMD[DType.float64, W](0.0))
-                hp.unsafe_store(base + zb, SIMD[DType.float64, W](0.0))
-                cp.unsafe_store(base + zb, SIMD[DType.int, W](0))
-                zb += W
-            while zb < n_bins:
-                gp.unsafe_store(base + zb, 0.0)
-                hp.unsafe_store(base + zb, 0.0)
-                cp.unsafe_store(base + zb, 0)
-                zb += 1
-            var col = bins_all_p.unsafe_offset(f * n_rows)
-            if compact:
-                for i_row in range(n_sub):
-                    var r = rows_p.unsafe_load(i_row)
-                    var g = pairs_p.unsafe_load(2 * i_row)
-                    var h = pairs_p.unsafe_load(2 * i_row + 1)
-                    var b = base + Int(col.unsafe_load(r))
-                    gp.unsafe_store(b, gp.unsafe_load(b) + g)
-                    hp.unsafe_store(b, hp.unsafe_load(b) + h)
-                    cp.unsafe_store(b, cp.unsafe_load(b) + 1)
+                    comptime for k in range(GROUP):
+                        if k < owned:
+                            var b = Int(base[k]) + Int(
+                                bins_all_p.unsafe_load(Int(col[k]) + r)
+                            )
+                            gp.unsafe_store(b, gp.unsafe_load(b) + g)
+                            hp.unsafe_store(b, hp.unsafe_load(b) + h)
+                            cp.unsafe_store(b, cp.unsafe_load(b) + 1)
             else:
                 # Small node, or one active feature: the gather would cost a
                 # pass and save nothing, so the gradients are read through the
@@ -583,13 +772,16 @@ def _accumulate_subset(
                     var r = rows_p.unsafe_load(i_row)
                     var g = grad_p.unsafe_load(r)
                     var h = hess_p.unsafe_load(r)
-                    var b = base + Int(col.unsafe_load(r))
-                    gp.unsafe_store(b, gp.unsafe_load(b) + g)
-                    hp.unsafe_store(b, hp.unsafe_load(b) + h)
-                    cp.unsafe_store(b, cp.unsafe_load(b) + 1)
-            i += 1
+                    comptime for k in range(GROUP):
+                        if k < owned:
+                            var b = Int(base[k]) + Int(
+                                bins_all_p.unsafe_load(Int(col[k]) + r)
+                            )
+                            gp.unsafe_store(b, gp.unsafe_load(b) + g)
+                            hp.unsafe_store(b, hp.unsafe_load(b) + h)
+                            cp.unsafe_store(b, cp.unsafe_load(b) + 1)
 
-    dispatch_feature_ranges(accumulate_range, n_active, plan.active_ops)
+    dispatch_feature_ranges(accumulate_groups, n_groups, active_ops)
 
 
 def build_histogram_subset_replica_into[

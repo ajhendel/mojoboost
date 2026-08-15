@@ -36,7 +36,7 @@ from std.os import getenv
 
 from .binning import BinnedMatrix
 from .efb import EfbSettings, prepare_bundling
-from .parallel import dispatch_rows
+from .parallel import dispatch_rows, elementwise_row_ops
 from .metrics import _argsort
 from .bagging import (
     BaggingParams,
@@ -591,7 +591,7 @@ def _fill_grad_hess_into(
     # the unscaled count, 100k rows asked for one task per core and
     # bench/bench_profile.mojo timed the fan-out well below the serial path,
     # the work per task being far too small to pay for scheduling it.
-    dispatch_rows(block, n, n // 16)
+    dispatch_rows(block, n, elementwise_row_ops(n))
 
 
 def _fill_grad_hess(

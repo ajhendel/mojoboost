@@ -1,5 +1,5 @@
 {
-  "plan_version": "1.0.0",
+  "plan_version": "1.1.0",
   "title": "Apple silicon CPU measurement plan for the histogram, binning, and scheduling lane",
   "status": "unmeasured",
   "description": "A plan, not a record. Nothing in this file is a measurement: it states what the CPU changes in src/mojotrees/{histogram,binning,parallel,apple_cpu_policy}.mojo are expected to do, the command that would show each one, and what result would falsify it. Run records for the Apple GPU suite live under bench/apple/ against schema.json; this file deliberately does not claim that schema, because it describes work to be done rather than a run that happened. When these are measured, the numbers belong in a run record or in docs, not here.",
@@ -12,7 +12,7 @@
     "MOJOTREES_PARALLEL_MIN_OPS": "grain floor in histogram-op equivalents; default 65536.",
     "MOJOTREES_CPU_TASKS_PER_CORE": "auto-mode fan-out per core; default 4.",
     "MOJOTREES_CPU_CORE_POOL": "all (default) or performance; which cores auto mode counts.",
-    "MOJOTREES_CPU_FEATURE_GROUP": "1 or 2; features interleaved in one accumulation loop. Default 2.",
+    "MOJOTREES_CPU_FEATURE_GROUP": "1, 2, 4, 8 or 16; features interleaved in one accumulation loop, and the rungs a kernel is instantiated at. Unset means the derived width (L1 estimate, then the task-balance floor, then the active feature count). An explicit value bypasses all three derived clamps, which is what makes it usable as a sweep axis; an off-ladder value is refused rather than rounded.",
     "MOJOTREES_CPU_COMPACT_MIN_ROWS": "rows below which a node skips the gradient/hessian gather. Default 256."
   },
 
@@ -39,11 +39,32 @@
       "falsified_if": "Subset build time at 1M rows, 100 features, 50% node does not improve against MOJOTREES_CPU_COMPACT_MIN_ROWS set above the node size."
     },
     {
-      "id": "feature-pairing",
+      "id": "feature-group-ladder",
       "file": "src/mojotrees/histogram.mojo",
-      "claim": "Accumulating two features in one inner loop gives the core two independent read-modify-write chains and halves the loads of the shared row id and gradient pair.",
-      "expected_effect": "A modest gain that comes from overlapping the store-to-load latency of repeated bins. This is the claim in this lane most likely to be wrong: it depends on how the hardware disambiguates two stores the compiler cannot prove disjoint.",
-      "falsified_if": "MOJOTREES_CPU_FEATURE_GROUP=2 is not faster than 1 at equal compaction. Then set DEFAULT_FEATURE_GROUP to 1 and delete the paired loops."
+      "supersedes": "feature-pairing",
+      "claim": "Accumulating N features in one inner loop divides by N the number of times a node's (gradient, hessian) stream is walked, and gives the core N independent read-modify-write chains into N disjoint histogram slices. The width is a comptime ladder (1, 2, 4, 8, 16) and the accumulation dispatches over groups rather than over features, so a task always holds whole groups.",
+      "unresolved_question": "Whether the memory traffic a wider group saves is worth the parallelism it costs. A group is the dispatch unit, so the width divides the task count by exactly the factor it divides the traffic by. NOBODY HAS RUN THIS. It is the open question this entry exists for, and it is not answerable from either table below alone.",
+      "traffic_and_schedule_table": {
+        "shape": "1,000,000 rows x 50 features, 255 bins, 10 dispatch cores, whole-dataset (root) build",
+        "fixed_costs": {
+          "gradient_hessian_pairs_MB": 16,
+          "binned_data_read_once_MB": 50,
+          "histogram_output_MB": 0.306
+        },
+        "note": "Task count is min(group_count, TASKS_PER_CORE * cores = 40, work / grain). Utilization is tasks / (cores * ceil(tasks / cores)), an equal-cost equal-core model that understates the cost of a partial round on a 4P+6E part, where the straggler decides the round.",
+        "rows": [
+          {"width": "1.25 (pre-ladder, effective)", "row_stream_passes": 40, "gradient_traffic_MB": 640, "groups": 50, "tasks": 40, "rounds": 4, "utilization_pct": 100, "note": "What actually shipped before this lane: the nominal width was 2, but plan_tasks split 50 features over 40 tasks and 30 of those held a single feature and could not pair."},
+          {"width": 1, "row_stream_passes": 50, "gradient_traffic_MB": 800, "groups": 50, "tasks": 40, "rounds": 4, "utilization_pct": 100},
+          {"width": 2, "row_stream_passes": 25, "gradient_traffic_MB": 400, "groups": 25, "tasks": 25, "rounds": 3, "utilization_pct": 83, "note": "The derived default on this profile."},
+          {"width": 4, "row_stream_passes": 13, "gradient_traffic_MB": 208, "groups": 13, "tasks": 13, "rounds": 2, "utilization_pct": 65, "note": "What the L1 estimate alone would have chosen. Seven of ten cores idle through the second round."},
+          {"width": 8, "row_stream_passes": 7, "gradient_traffic_MB": 112, "groups": 7, "tasks": 7, "rounds": 1, "utilization_pct": 70, "note": "Three cores never start."},
+          {"width": 16, "row_stream_passes": 4, "gradient_traffic_MB": 64, "groups": 4, "tasks": 4, "rounds": 1, "utilization_pct": 40}
+        ]
+      },
+      "why_it_matters": "LightGBM's force_row_wise builder reads each row's gradient exactly once and updates every feature from it (src/io/multi_val_dense_bin.hpp lines 92-101). Our feature-major accumulation reads it once per group. At the shape above that is 640 MB against 16 MB, and it is the cheapest available probe of how much of the single-thread gap (11.4s against LightGBM's 8.9s at one thread) the layout accounts for. A negative result here is what would justify the much larger row-major rewrite being ruled out rather than attempted.",
+      "falsified_if": "Width 4 is not faster than width 2 on the root build at 1M x 50 x 255. That is the comparison this entry now turns on, and it must be an INTERLEAVED A/B in one process (bench harness protocol from fa3c49b), because this machine's timings drift several-fold between time windows. If width 4 loses, TASK_BALANCE_FACTOR = 2 is vindicated and the trade is real; if width 4 wins, lower the factor or drop the balance clamp and say what replaced it. If width 2 is not faster than width 1 either, the interleave buys nothing at all on this core and DEFAULT_FEATURE_GROUP should become 1.",
+      "second_falsification": "Sweep the feature count at a fixed width. The balance clamp unlocks width 4 at 80 features and width 8 at 160 on ten cores, so if the width is worth anything the gain should grow with the feature count and appear at those thresholds. If a forced width 8 at 50 features beats the derived width 2, the balance model is wrong in the direction of caring too much about idle cores, which would mean the accumulation is memory-bound well before the machine is full.",
+      "unmeasured_constants": ["TASK_BALANCE_FACTOR (2, chosen as the largest factor that leaves any interleave at 50 features on 10 cores, not as an optimum)", "ASSUMED_L1D_BYTES (65536, a portable floor, deliberately not the development M4's real L1)", "L1_GROUP_DIVISOR (2)"]
     },
     {
       "id": "parallel-subtraction",
@@ -97,7 +118,7 @@
     {
       "id": "hist-scaling",
       "command": "pixi run bench-hist-scaling",
-      "measures": ["fused-zeroing", "gradient-gather", "feature-pairing"],
+      "measures": ["fused-zeroing", "gradient-gather", "feature-group-ladder"],
       "note": "Existing driver, not owned by this lane and not modified by it. Read its output for the full and subset builders before touching anything else."
     },
     {
@@ -128,14 +149,30 @@
   "sweeps": [
     {
       "id": "compaction-and-pairing",
-      "goal": "Attribute the subset-builder gain to the gather and to the pairing separately.",
-      "note": "The two are coupled on purpose in the kernel: pairing is only used on the compacted path, so the cell (compaction off, group 2) does not exist. These three cells still separate the effects.",
+      "goal": "Attribute the subset-builder gain to the gather and to the interleave separately.",
+      "note": "The two used to be coupled in the kernel, because the paired loop was only reachable on the compacted path and the cell (compaction off, group 2) did not exist. They are independent now, so the full 2x2 is available and the fourth cell is what says whether the interleave needs the gather.",
       "cells": [
         {"MOJOTREES_CPU_COMPACT_MIN_ROWS": "1000000000", "MOJOTREES_CPU_FEATURE_GROUP": "1", "label": "baseline: neither"},
         {"MOJOTREES_CPU_COMPACT_MIN_ROWS": "256", "MOJOTREES_CPU_FEATURE_GROUP": "1", "label": "gather only"},
-        {"MOJOTREES_CPU_COMPACT_MIN_ROWS": "256", "MOJOTREES_CPU_FEATURE_GROUP": "2", "label": "gather and pairing"}
+        {"MOJOTREES_CPU_COMPACT_MIN_ROWS": "1000000000", "MOJOTREES_CPU_FEATURE_GROUP": "2", "label": "interleave only (new cell)"},
+        {"MOJOTREES_CPU_COMPACT_MIN_ROWS": "256", "MOJOTREES_CPU_FEATURE_GROUP": "2", "label": "gather and interleave"}
       ],
       "commands": ["hist-scaling", "train"]
+    },
+    {
+      "id": "feature-group-width",
+      "goal": "Settle the trade in feature-group-ladder: memory traffic against parallel slack. This is the sweep that decides TASK_BALANCE_FACTOR and whether the derived default of 2 is right.",
+      "note": "Interleave the arms in one process; this machine's timings drift several-fold between time windows and only interleaved repeats compare. Record the machine line and the plan line (describe_cpu_policy now prints rounds and utilization alongside the width) with every cell. Every cell produces bit-identical histograms, so any model difference between cells is a bug and stops the sweep.",
+      "cells": [
+        {"MOJOTREES_CPU_FEATURE_GROUP": "1"},
+        {"MOJOTREES_CPU_FEATURE_GROUP": "2"},
+        {"MOJOTREES_CPU_FEATURE_GROUP": "4"},
+        {"MOJOTREES_CPU_FEATURE_GROUP": "8"},
+        {"MOJOTREES_CPU_FEATURE_GROUP": "16"}
+      ],
+      "commands": ["hist-scaling", "train"],
+      "second_axis": "Repeat at 25, 50, 100 and 200 features. The traffic saving is proportional to the width at every feature count, but the parallelism cost falls as the feature count rises, so the crossover should move right. If it does not move, the model behind TASK_BALANCE_FACTOR is wrong.",
+      "third_axis": "Repeat the 50-feature column at MOJOTREES_CPU_TASKS_PER_CORE 1 and 4. If the width's cost is really about barrier rounds, halving the over-decomposition should change where the crossover sits."
     },
     {
       "id": "compaction-threshold",
@@ -171,7 +208,8 @@
         {"MOJOTREES_CPU_CORE_POOL": "performance"}
       ],
       "commands": ["profile", "train"],
-      "note": "Run both at each of MOJOTREES_CPU_TASKS_PER_CORE 1 and 4: the answer is expected to depend on whether over-decomposition is already hiding the slow cores."
+      "note": "Run both at each of MOJOTREES_CPU_TASKS_PER_CORE 1 and 4: the answer is expected to depend on whether over-decomposition is already hiding the slow cores.",
+      "confound": "The core pool moves the interleave width, because the task-balance floor is stated per dispatch core: four performance cores want 8 groups against ten cores wanting 20, so 50 features resolve to width 4 under `performance` and width 2 under `all`. Pin MOJOTREES_CPU_FEATURE_GROUP explicitly on BOTH arms or this sweep measures two changes at once. It used to do so silently, through the task splitter; it now does so through a stated rule, which is an improvement and still a confound."
     },
     {
       "id": "grain",
@@ -189,7 +227,8 @@
     "note": "Run before any timing is believed, and after any knob is changed. These are existing tests, owned by other lanes; this lane runs them and does not edit them.",
     "commands": [
       "pixi run mojo run -I src tests/test_cpu_parallel.mojo",
-      "pixi run mojo run -I src tests/test_histogram_reference.mojo"
+      "pixi run mojo run -I src tests/test_histogram_reference.mojo",
+      "pixi run mojo run -I src -I tests tests/test_cpu_feature_group.mojo"
     ],
     "expectation": "Bit-identical results between forced-serial and parallel paths, and between the allocating and the _into builders, at every setting in this plan."
   },
@@ -197,6 +236,7 @@
   "evidence_required": [
     "Any claim that a loop vectorized, or that a particular ARM instruction was emitted, needs disassembly. Nothing in this lane has been compiled, let alone disassembled.",
     "Any claim about which of two memory streams is the bottleneck needs a profiler with cache-miss counters, not a wall-clock delta.",
-    "Any claim about efficiency-core scheduling needs a run on a machine whose performance and efficiency core counts differ, recorded with both counts."
+    "Any claim about efficiency-core scheduling needs a run on a machine whose performance and efficiency core counts differ, recorded with both counts.",
+    "Any claim that a change reduced memory traffic needs the task count and the utilization reported next to it. A byte table cannot see a barrier. The feature-group ladder is the worked example: it divides gradient traffic and task count by the same factor, and the first version of it was very nearly shipped at width 4 on the strength of the bytes alone, which would have put 13 tasks on a 10-core machine."
   ]
 }

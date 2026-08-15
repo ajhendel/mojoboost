@@ -51,8 +51,15 @@ setting:
 - `dispatch_feature_ranges` hands each task a contiguous half-open range of
   independent units (conventionally features). A unit's accumulation runs
   start to finish inside one task, so no sum is ever reassociated, and a
-  kernel that wants to interleave two units for instruction-level
-  parallelism gets them in the same call rather than in two.
+  kernel that wants to interleave N units for instruction-level parallelism
+  gets them in the same call rather than in N.
+  Histogram accumulation passes *groups* of N features as the unit rather
+  than features, which is what guarantees a task holds whole groups: at one
+  feature per unit the splitter could hand a task fewer features than the
+  width it was told to interleave, and did (50 features over 40 tasks left
+  thirty tasks holding one feature each). The unit count is therefore the
+  parallelism a wide interleave has left, and `apple_cpu_policy` bounds the
+  width against it.
 - `dispatch_features` is the one-unit-at-a-time form of the same thing,
   written in terms of it.
 - `dispatch_feature_rows` splits by feature *and*, when there are fewer
@@ -267,8 +274,12 @@ struct DispatchSettings(Copyable, Movable):
     var min_task_ops: Int
 
     @staticmethod
-    def resolve() -> DispatchSettings:
-        """One detection of the machine and one read of each variable."""
+    def resolve() raises -> DispatchSettings:
+        """One detection of the machine and one read of each variable.
+
+        Raises with `ResolvedCpuPolicy.resolve`, for an off-ladder
+        `MOJOTREES_CPU_FEATURE_GROUP`. Taking the snapshot is the one place
+        that refusal can be reported once per fit instead of once per node."""
         return DispatchSettings(
             ResolvedCpuPolicy.resolve(),
             env_num_workers(),
