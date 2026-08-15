@@ -139,7 +139,54 @@ def check_registry(documents):
         check(name in sources, f"checksums.lock.json pins unregistered {name!r}")
 
 
+def _routed(name, canonical, side, routing, translated, dataset):
+    """The value a shared parameter has on one side, wherever it lives.
+
+    Returns (found, value). `found` is False for the "engine" destination,
+    where the parameter is a call argument rather than a dict entry and
+    there is nothing here to read; that case is checked differently, by
+    proving there is no competing copy in the dicts.
+    """
+    where, key = routing
+    if where == "train":
+        if key not in translated:
+            FAILURES.append(
+                f"{name}: {canonical} routes to {side} {key!r} in the "
+                f"training dict and is not there"
+            )
+            return False, None
+        return True, translated[key]
+    if where == "dataset":
+        if key not in dataset:
+            FAILURES.append(
+                f"{name}: {canonical} routes to {side} {key!r} in the "
+                f"dataset dict and is not there"
+            )
+            return False, None
+        return True, dataset[key]
+    # "engine": the adapter passes it at the call site from BASE_PARAMS, so
+    # both sides get the same number by construction. What can go wrong is
+    # a second copy appearing in a dict and quietly winning, which is what
+    # this checks instead.
+    check(
+        key not in translated,
+        f"{name}: {canonical} is a call argument on the {side} side, but "
+        f"{key!r} is also in its parameter dict, so there are now two "
+        "sources for one number",
+    )
+    return False, None
+
+
 def check_params():
+    """Every shared parameter, on both sides, under whichever name and in
+    whichever dict it ends up.
+
+    This used to check two of them, which is how LightGBM sat at
+    min_data_in_bin 3 against a binner with no minimum population for as
+    long as it did. A divergence in the alignment should fail here, in a
+    check that runs in under a second and trains nothing, rather than in
+    an audit of the results months later.
+    """
     import scenarios
 
     for name in scenarios.SCENARIOS:
@@ -149,16 +196,59 @@ def check_params():
         extra = {"num_class": 3} if spec["task"] == "multiclass" else None
         lgb = scenarios.lightgbm_params(spec, 4, dict(extra or {}, bin_construct_sample_cnt=1000))
         mb = scenarios.mojotrees_params(spec, "cpu", extra)
+        ds = scenarios.dataset_params(spec)
         check(lgb["num_threads"] == 4, f"{name}: lightgbm thread count did not survive translation")
         check(
             "num_threads" not in mb and "n_jobs" not in mb,
             f"{name}: mojotrees params carry a thread setting, which belongs in the environment",
         )
-        for key, alias in (("lambda_l2", "lambda_l2"), ("min_child_hess", "min_sum_hessian_in_leaf")):
-            check(
-                lgb[alias] == mb[key],
-                f"{name}: {key} differs between the engines after translation",
+
+        for canonical in scenarios.BASE_PARAMS:
+            routing = scenarios.SHARED_PARAM_ROUTING.get(canonical)
+            if routing is None:
+                FAILURES.append(
+                    f"{canonical} is in BASE_PARAMS with no row in "
+                    "SHARED_PARAM_ROUTING, so nothing checks that both "
+                    "engines were given it"
+                )
+                continue
+            lgb_routing, mb_routing = routing
+            # LightGBM's Dataset and train take the one dict, so its
+            # training dict is also its dataset dict. mojotrees's are two.
+            lgb_found, lgb_value = _routed(
+                name, canonical, "lightgbm", lgb_routing, lgb, lgb
             )
+            mb_found, mb_value = _routed(
+                name, canonical, "mojotrees", mb_routing, mb, ds
+            )
+            if lgb_found and mb_found:
+                check(
+                    lgb_value == mb_value,
+                    f"{name}: {canonical} differs between the engines after "
+                    f"translation, {lgb_value!r} against {mb_value!r}",
+                )
+
+        # The categorical block reaches both sides under one set of names,
+        # so it needs no routing table, only the same equality.
+        for canonical in scenarios.CATEGORICAL_PARAMS:
+            if canonical in lgb or canonical in mb:
+                check(
+                    lgb.get(canonical) == mb.get(canonical),
+                    f"{name}: categorical parameter {canonical} differs "
+                    f"between the engines, {lgb.get(canonical)!r} against "
+                    f"{mb.get(canonical)!r}",
+                )
+
+        # mojotrees's numerical binner has no minimum-population rule, so
+        # this is the LightGBM setting that matches it. At LightGBM's
+        # default of 3 the two engines bin low-cardinality columns
+        # differently and mojotrees carries the extra bins.
+        check(
+            lgb["min_data_in_bin"] == 1,
+            f"{name}: lightgbm min_data_in_bin is "
+            f"{lgb['min_data_in_bin']!r}, not 1, so it is merging levels "
+            "that mojotrees keeps as separate bins",
+        )
         if spec["task"] == "ranking":
             for key in ("lambdarank_truncation_level", "sigmoid", "lambdarank_norm"):
                 check(

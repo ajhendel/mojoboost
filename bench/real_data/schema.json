@@ -56,10 +56,30 @@
     "params": {
       "type": "object",
       "required": ["shared", "engine"],
-      "description": "The canonical parameters and the engine's translation of them, both recorded so a reader can check the alignment rather than trust it.",
+      "description": "The canonical parameters and the dicts the engine actually passed, both recorded so a reader can check the alignment rather than trust it. `engine` is returned by the adapter that used it rather than rebuilt from the scenario, because the adapter adds parameters the scenario module cannot know: the row-count-dependent bin_construct_sample_cnt on the LightGBM side and n_estimators on the mojotrees one. A record that rebuilt the dict omitted exactly those.",
       "properties": {
         "shared": {"type": "object"},
-        "engine": {"type": "object"}
+        "engine": {"type": "object"},
+        "dataset": {
+          "type": ["object", "null"],
+          "description": "The separate Dataset dict where the engine takes one. Null with dataset_unavailable_reason where it does not: LightGBM's Dataset and train share one dict, and mojotrees's estimator path takes the binning settings as keywords."
+        },
+        "dataset_unavailable_reason": {"type": ["string", "null"]},
+        "num_boost_round": {
+          "type": ["integer", "null"],
+          "description": "The round count the engine was asked for. A call argument rather than a parameter on the LightGBM side, so it would not otherwise appear anywhere in the record."
+        }
+      }
+    },
+    "histogram_builder": {
+      "type": "object",
+      "description": "Which histogram construction the engine ran. Row-wise and col-wise are different algorithms over the same bins, so a training time is not reproducible without it. `resolved` is a string when the request settles the question and an unavailable measurement when it does not, which is LightGBM's auto mode: 4.7 keeps that choice in the tree learner's share state and exposes no getter.",
+      "properties": {
+        "requested": {"type": ["string", "null"]},
+        "resolved": {
+          "oneOf": [{"type": "string"}, {"$ref": "#/$defs/optional_measurement"}]
+        },
+        "recorded": {"type": "string"}
       }
     },
     "caveats": {
@@ -100,7 +120,29 @@
       "properties": {
         "num_trees": {"type": ["integer", "null"]},
         "current_iteration": {"type": ["integer", "null"]},
-        "num_bin": {"type": ["integer", "null"]},
+        "num_bin": {
+          "type": ["integer", "null"],
+          "description": "Bins reserved per feature. mojotrees reports it directly; LightGBM has no such scalar, so its record carries the largest per-feature count, which is the closest analogue. Null only with num_bin_unavailable_reason beside it."
+        },
+        "num_bin_unavailable_reason": {"type": "string"},
+        "bins": {
+          "oneOf": [
+            {
+              "type": "object",
+              "required": ["n_features", "total", "sha256"],
+              "properties": {
+                "n_features": {"type": "integer"},
+                "total": {"type": "integer"},
+                "max": {"type": "integer"},
+                "min": {"type": "integer"},
+                "mean": {"type": "number"},
+                "sha256": {"type": "string"}
+              }
+            },
+            {"$ref": "#/$defs/optional_measurement"}
+          ],
+          "description": "The per-feature bin counts from Dataset.feature_num_bin, which both libraries expose under that name, reduced to the distribution plus a digest of the exact vector. This is the field that lets the binning alignment be checked by measurement instead of by reading scenarios.py. The counts themselves are not stored: a run with half a million features would put half a million integers in every record."
+        },
         "size": {
           "type": "object",
           "properties": {

@@ -30,6 +30,7 @@ import argparse
 import csv
 import json
 import os
+import statistics
 import subprocess
 import sys
 import time
@@ -202,14 +203,48 @@ def run_job(job, run_dir, run_id, timeout):
 CSV_COLUMNS = (
     "run_id", "scenario", "tier", "task", "data_kind", "dataset", "pinned",
     "engine", "engine_version", "device_requested", "device_used", "threads",
-    "repeat", "status", "primary_metric", "primary_value", "train_s",
-    "train_cpu_s", "binning_s", "predict_batch_s", "predict_row_s",
+    "histogram_builder", "repeat", "status", "primary_metric",
+    "primary_value", "train_s", "train_cpu_s", "train_par_eff", "binning_s",
+    "predict_batch_s", "predict_batch_par_eff", "predict_row_s",
     "warmup_s", "import_s", "peak_rss_bytes", "model_bytes", "num_trees",
+    "num_bin", "bins_total", "bins_sha256",
     "train_rows", "train_features", "predictions_sha256", "data_sha256",
 )
 
 
+def _builder_column(record):
+    """The histogram construction, as one cell.
+
+    The resolved value when there is one, and the request marked as such
+    when there is not, so a spreadsheet row never says "row-wise" about a
+    run where nobody established that. See engines._histogram_builder for
+    when the resolved value is knowable.
+    """
+    builder = record.get("histogram_builder")
+    if not isinstance(builder, dict):
+        return None
+    resolved = builder.get("resolved")
+    if isinstance(resolved, str):
+        return resolved
+    return f"{builder.get('requested')} (unresolved)"
+
+
 def _flat(record):
+    """One record flattened for the CSV.
+
+    Repeated samples are reduced with the median, which is the same
+    reduction report.py's `phase_value` uses, so the CSV column and the
+    table cell are the same number under the same name. They were not:
+    this took the minimum while the table took the median, and a reader
+    who compared the two was comparing two different statistics without
+    being told.
+
+    The median rather than the minimum, because the minimum is the
+    best-case sample and the machine's contention is exactly what these
+    runs are trying to expose rather than to filter out. A benchmark that
+    reports its luckiest sample reports the machine it wishes it had.
+    """
+
     def phase(name, field="elapsed_s"):
         phases = record.get("phases") or {}
         block = phases.get(name)
@@ -217,13 +252,16 @@ def _flat(record):
             return block[field]
         if isinstance(block, dict) and "measured" in block:
             values = [s[field] for s in block["measured"] if s.get(field) is not None]
-            return min(values) if values else None
+            return statistics.median(values) if values else None
         return None
 
     data = record.get("data") or {}
     train = data.get("train") or {}
     quality_block = record.get("quality") or {}
     primary = record.get("primary_metric")
+    model = record.get("model") or {}
+    bins = model.get("bins")
+    bins = bins if isinstance(bins, dict) else {}
     return {
         "run_id": record.get("run_id"),
         "scenario": record.get("scenario"),
@@ -237,20 +275,26 @@ def _flat(record):
         "device_requested": record.get("device_requested"),
         "device_used": record.get("device_used"),
         "threads": record.get("threads"),
+        "histogram_builder": _builder_column(record),
         "repeat": record.get("repeat"),
         "status": record.get("status"),
         "primary_metric": primary,
         "primary_value": quality_block.get(primary),
         "train_s": phase("train"),
         "train_cpu_s": phase("train", "cpu_s"),
+        "train_par_eff": phase("train", "parallel_efficiency"),
         "binning_s": phase("binning"),
         "predict_batch_s": phase("predict_batch"),
+        "predict_batch_par_eff": phase("predict_batch", "parallel_efficiency"),
         "predict_row_s": phase("predict_row"),
         "warmup_s": (record.get("warmup") or {}).get("elapsed_s"),
         "import_s": phase("import"),
         "peak_rss_bytes": record.get("peak_rss_bytes"),
-        "model_bytes": ((record.get("model") or {}).get("size") or {}).get("string_bytes"),
-        "num_trees": (record.get("model") or {}).get("num_trees"),
+        "model_bytes": (model.get("size") or {}).get("string_bytes"),
+        "num_trees": model.get("num_trees"),
+        "num_bin": model.get("num_bin"),
+        "bins_total": bins.get("total"),
+        "bins_sha256": bins.get("sha256"),
         "train_rows": train.get("rows"),
         "train_features": train.get("features"),
         "predictions_sha256": record.get("predictions_sha256"),
