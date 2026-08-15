@@ -1,0 +1,1875 @@
+"""The package's bit-exactness contract: checked-in golden bit patterns.
+
+WHAT THIS FILE IS
+-----------------
+Every other exactness test in this tree compares one change against its own
+baseline inside one build: the new route against the old route, the parallel
+path against the serial one, the device against the host. That is the right
+test for a change in flight, and it is not a contract. It proves each change
+exact against what it replaced; it proves nothing about what the composition
+of five such changes produces, and a merge is exactly where two individually
+exact edits compose into a moved multiply.
+
+This file is the contract. It holds literal IEEE-754 bit patterns for six
+fits, checked in, and it compares against them with integer equality. It
+does not compare against anything computed in the same process, so nothing
+in the package can move without this file saying so. Two lanes in the round
+that produced these values hit fused multiply-add contraction, once on the
+CPU (hoisting `learning_rate * value` out of a loop stopped a fusion and
+moved 98 of 600 rows by one ulp, which changed the next tree) and once on
+the GPU (moving a leaf id from a launch argument to a per-thread value
+started one and moved every score by one ulp). Neither is visible to a
+tolerance. Both are visible here.
+
+WHAT IT COVERS
+--------------
+Six fixtures, chosen because they take different routes through the
+trainer, not because they are different datasets:
+
+  l2        plain L2 regression, dense, every feature, every row.
+  logit     binary logistic: a different gradient, a different base score,
+            and a non-identity link, so raw and response scales differ.
+  multi     three-class softmax: the per-round, per-class tree loop and the
+            row-major raw score buffer.
+  bagged    L2 with `bagging_fraction=0.6, bagging_freq=1`. A bagged round
+            ends by traversing the tree for every row rather than by leaf
+            membership, so this is the score-update path the unbagged
+            fixtures do not reach.
+  ffrac     L2 with `feature_fraction=0.5`: the per-tree feature selection,
+            which changes which features a split search may even see.
+  misscat   L2 over a matrix with a reserved missing bin on one numerical
+            column and an integer-coded categorical column. Covers NaN
+            routing by node default and category-set splits.
+
+For each fixture the recorded state is every tree's `feature`,
+`threshold_bin`, `left`, and `right` arrays, every tree's `value` array as
+bits, and every row's final raw score and prediction as bits. The routing
+metadata a tree also carries (`missing_bin`, `default_left`, `cat_offset`,
+`cat_bitset`) is not listed separately: it is covered through the per-row
+scores, which are what routing decides.
+
+THE INPUT
+---------
+Generated in the test, never loaded from disk, so the fixture is
+reproducible on any machine with no data file. Every feature value is
+`support._uniform(UInt64(k) + seed)`, that is, the top 53 bits of one round
+of SplitMix64 over the column-major index `k = f * n_rows + r` offset by a
+per-fixture seed, scaled into [0, 1). Targets and labels are closed-form
+functions of those features, written out below. Nothing draws on wall clock,
+address, thread count, or environment.
+
+Bit-determinism across worker counts is a separate promise, made by
+`parallel.mojo` and tested in `tests/test_cpu_parallel.mojo`; this file
+relies on it and sets no worker count, so a CI runner with any core count
+must produce these same bits.
+
+HOW THE GOLDEN VALUES WERE GENERATED
+------------------------------------
+From the PRE-MERGE tree at commit `e812f7c`, the parent of the five-lane
+merge into `perf-round-2`, built as its own package and run in generate
+mode:
+
+    mojo precompile -I <pre>/src <pre>/src/mojotrees \\
+        -o <pre>/build/mojotrees.mojopkg
+    mojo run -I <pre>/build -I <pre>/tests tests/test_golden_bits.mojo \\
+        --generate
+
+Generate mode prints the whole block between the GOLDEN BEGIN and GOLDEN END
+markers below, paste-ready. Toolchain: Mojo 1.0.0 (ed45d567). Platform of
+record: arm64-apple-darwin.
+
+CHANGING THESE VALUES
+---------------------
+Bit-determinism is promised per toolchain version. These literals are the
+behavior of the package, not a record of a passing run, so editing them is a
+deliberate reviewed act that needs a stated reason in the commit message.
+There are exactly two admissible reasons:
+
+  1. A toolchain bump, where the new compiler contracts or splits a
+     floating-point operation differently. Say which version, and update the
+     version recorded above in the same commit.
+  2. A numerics change that was chosen, argued for, and reviewed on its own
+     merits, with the ulp movement stated.
+
+"The test failed and I regenerated it" is not one of them. A failure here
+means the package moved; the finding is the failure, and the fix belongs in
+the source. Regenerating to make it pass destroys the only evidence that
+anything changed.
+
+A lane preparing a performance change should run this file first on its
+branch point and last before merge, and a merge that composes two lanes
+should run it on the merge commit even when both lanes ran it green on their
+own, because that composition is what neither lane tested.
+
+This file is accelerator-free by design: a CPU-only runner has to be able to
+enforce the contract. GPU exactness lives in the `gpu` test set.
+"""
+
+from std.math import isnan
+from std.memory import bitcast
+from std.sys import argv
+from std.testing import TestSuite
+from std.utils.numerics import nan
+
+from mojotrees.bagging import BaggingParams
+from mojotrees.binning import BinnedMatrix, bin_equal_width, fit_bins
+from mojotrees.boosting import (
+    BINARY_LOGISTIC,
+    SQUARED_ERROR,
+    Booster,
+    BoosterParams,
+    MulticlassBooster,
+    train,
+    train_multiclass,
+)
+from mojotrees.categorical import CategoricalParams
+from mojotrees.tree import Tree, TreeParams
+
+from support import _uniform
+
+comptime NAN = nan[DType.float64]()
+
+
+# --- GOLDEN BEGIN ---
+# Generated by `mojo run ... tests/test_golden_bits.mojo --generate`.
+# Do not hand-edit; see this file's docstring before changing.
+
+comptime _L2_INTS = """
+8 15 0 13 1 2 1 16 5 6 1 19
+3 4 0 27 7 8 0 23 13 14 0 7
+9 10 0 9 11 12 -1 -1 -1 -1 -1 -1
+-1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+-1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+-1 -1 15 0 17 1 2 1 13 3 4 1
+15 5 6 0 5 9 10 0 5 7 8 0
+23 13 14 0 26 11 12 -1 -1 -1 -1 -1
+-1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+-1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+-1 -1 -1 15 0 13 1 2 1 17 5 6
+1 19 3 4 0 26 7 8 -1 -1 -1 -1
+1 4 11 12 0 9 13 14 1 8 9 10
+-1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+-1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+-1 -1 -1 -1 15 0 17 1 2 1 21 3
+4 1 10 5 6 0 7 7 8 0 8 13
+14 -1 -1 -1 -1 0 23 9 10 -1 -1 -1
+-1 1 8 11 12 -1 -1 -1 -1 -1 -1 -1
+-1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+-1 -1 -1 -1 -1 15 0 19 1 2 1 10
+3 4 1 18 5 6 0 8 9 10 0 3
+7 8 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+-1 -1 1 25 11 12 -1 -1 -1 -1 2 23
+13 14 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+-1 -1 -1 -1 -1 -1 15 0 12 1 2 1
+21 9 10 0 28 3 4 1 26 5 6 -1
+-1 -1 -1 2 23 7 8 -1 -1 -1 -1 -1
+-1 -1 -1 -1 -1 -1 -1 0 2 11 12 -1
+-1 -1 -1 -1 -1 -1 -1 7 24 13 14 -1
+-1 -1 -1 -1 -1 -1 -1 15 0 20 1 2
+1 3 3 4 1 6 5 6 -1 -1 -1 -1
+2 9 7 8 -1 -1 -1 -1 2 13 13 14
+-1 -1 -1 -1 3 13 9 10 1 27 11 12
+-1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+-1 -1 -1 -1 -1 -1 -1 -1 15 0 24 1
+2 1 21 3 4 1 9 5 6 0 4 7
+8 3 22 11 12 -1 -1 -1 -1 -1 -1 -1
+-1 -1 -1 -1 -1 2 22 9 10 -1 -1 -1
+-1 -1 -1 -1 -1 1 27 13 14 -1 -1 -1
+-1 -1 -1 -1 -1 -1 -1 -1 -1
+"""
+
+comptime _L2_VALS = """
+bca1d4b24ef715a7 bfeea415a6083a6d 3fe55f158d9e7a81 3ff03fbeb7290041
+bfa6a81241fbaf73 bfd901e7647be98b bff6d6e8f0dbac87 3fe801a605a21e6e
+3ffa3fd128101d4a bfe6d16e5e7ae780 3f998431b754a1b5 bff9c0ca9cc0b2b9
+bfe95cac40d643d7 bfd1b9e5c39ddc1f 3fd49df14d08011e bf5000310d785b62
+bfe24a110dd65beb 3fe23a2523ff735d bfa76efa51a0ef88 bfebfe449fced02b
+3fed7785cf78db55 3fc8b165d8423cac bff3beae4a5bf097 bfe494b1ce1be05b
+bfdda65c50e1d857 3fc21c3c5a94ddce 3fb0a1b0d6f1693c 3fe48017b6f4cf4a
+3fe4fce2719eacd1 3ff291c176f0505f bf2a675605716870 bfdfa1617eacf21f
+3fd60a2da51da967 3fe0efd80fc566ba bfa16f2a05514aca bfc9137b22b57650
+bfe8225455686c61 3fd7ee48c538c47f 3feacd55aeb21d7b 3fe2ce53706d42cc
+3fc9d81fd4ab5b0f 3fc3ee3e348f6ffb bfd3648b06189833 bfeb8ceff6f23bd8
+bfd97497f97426f8 3f221f20e173ee2b bfd33c66f4ca3bd7 3fd340e8ff2ff115
+bfc02fb5a5bc27f2 bfe25f0c5e248c1f 3fe24b993499e7a4 3fc302b125e5d8f2
+bfd42429ed18813d 3fabc27a9f5963dd bf9849acd97a661c 3fd2bbc421fff295
+3fd0ae3bc7cfc569 bfbc91882ff862c7 bfe74ee16de5bb17 bfd7e54deddd9435
+bf41b28b561f02de bfc71078fdfa55d6 3fd0caa7d9fe02f2 3fb4882e45d84353
+bfd3edcd7908429a 3fd962b532bbf5d0 3faf4c7d7053811e bfe2c2e181997cd4
+bfcde37214e191e2 bfc337eb931aff2e 3fc8a43c3cb067be bfc1fccc09607249
+bfd9291c147d9a43 3fb6b5dea345cf52 3fd9b6e203b2bc6b bf4c209995cce3fb
+bfca13baba49575a 3fbe73afcf92a022 3fab90a5a10daeba 3fd7ab4302314404
+3fb8d420d7dd85f7 bfc9f857d658f100 3fa27386857521f5 3fd4406b7262230f
+bfbae8b4de2ce8ba bfd647fdad4a761d bfd2d195fb590ba5 bfa31d81dfbc5268
+bfbd2b667c5ed1e6 3fc1f11e9b5bc43d bf486949995c6a82 bfb90dbc18ae7c39
+3fc279edf057ef8e 3fc34d394bfeb33f bfc246c7582a9941 3fd95f958e68cbd0
+3fb71f0e838a4008 bfcf3664f6067544 bfb1b751cee314aa bfca4560162b800b
+3fa6f862448da6eb bfbfec3f576e11fc bfdb75b2f9ee3b1a 3f81c0ed929a970f
+3fc5faa4e039b742 bf4250db365790a3 bfa935e731660aab 3fc50fc150316908
+3f84179b2a506887 bfc3d27c80078ea7 3fd43beeb8f986d6 3fb4bb48996631d9
+bfc1abde2433c6ca 3fa64b1bc4621699 bf5d2122ccc97c84 3fc24cac758754f9
+bfc9236c8e11c3a7 bf6378fdf91b7380 bfc08591d3838c82 bfd4590d63412c0e
+"""
+
+comptime _L2_RAW = """
+40037177989032fc 3fe5042b4e697b10 3fd4ae5f8e5e48d0 bfec23c7e6cdb852
+3ff105e0d93b455b 3fb2ccc21e571eda 3ff9730ac9e8cc6a 3fe0517de71e79a7
+3ff75db271aebedd 3fe83b86d9965509 bff06ff5526b6b17 bfb0907461c902f9
+3ffb3c20747a5ba1 3ff821c4dbaa7e56 3feaff5b1b0743c5 3fc3f9347befb94a
+bfbd114d8a17f373 3fc84877f7904152 3f956fe59bfffa48 3fe4b77c92c3eace
+3fe3183d962d4f21 bf97dac6344f6bab 3ff5b4b5ba8aded9 3ff54604ed6ca487
+3ffd328862d5d20a 3ff530b65e0c7edb 3ff47b13182b487f 3ff2d5e96dc5fb68
+3ff21470700be952 3ffb5604204c52b5 3fe9cc3880845613 3ffecc72897cee83
+4001f22e0f41524c 3fc896283bb26a4a 3fdabfdc7e516552 3fe5694e6ea12a34
+40041c5bcbe46a08 3fef85c25537a28b 3ff54604ed6ca487 3ff1b0d28c29a725
+bfe354e58437a9b7 bfef18bdc50062e9 3ff9730ac9e8cc6a 3ffb5604204c52b5
+4001f22e0f41524c 40032e19aa9faa5d 3ffc4eba2e04dba3 3fefe3b5907e8f43
+bfed4899e5fa13a4 bff06ff5526b6b17 3fe8935f55df968f 3fdb47f7b3bf714f
+40039246145b2a9f 400092b4062db187 3fe6482e39b1ebd8 3fe9da891bdae873
+3ff2d5e96dc5fb68 3fb094dcb9e6f724 3ff693ebb3b5cd62 3fddc7cc22517734
+3fe83a0dec371e39 3ff11230add886d8 bfe95904c5733ad2 3ff693ebb3b5cd62
+3ffb853007628e93 bfd23c99f9676f5f bfeb6de7422babbb 400125196099391b
+3f956fe59bfffa48 3fdb47f7b3bf714f bfb3eabd90b518e3 3ffbbf5a140f0a4e
+3fe85b6218ab081e 3ff67d0e8e01df5e bfe4295ff51f7f41 3fe31576c39cdfaf
+40041c5bcbe46a08 bfd34c91e4fd1f14 3ff3363c6fd51efc 3fefe3b5907e8f43
+3fe83a0dec371e39 3fddc7cc22517734 bfec53345add3efc bfec1139a8b48af0
+40013efa390ad315 3fc6128ac34e8b79 3ff0e879b8b2a6a0 4002565a78fcd28e
+3fb9bb6cb349d1b4 3ff67d0e8e01df5e 40041c5bcbe46a08 4000b2b937efa297
+3ffe1561a105842f 3ff54604ed6ca487 4002565a78fcd28e 40041c5bcbe46a08
+3fecd19d1012ee6b bfdcb8a4dd6106b7 40029d9bcb867760 bfe95904c5733ad2
+3fb330db6f4e672c 3ff08b39fe12d1ca bfe8e112ba5509b3 3fce709f21771da5
+bfe1c4ca5f2dcba7 3ffc1e5cf3c3533a bfd8bde062595f67 bfb117cf57393db9
+3fff48e3c9d1e3b9 3fe702adaef19585 3ff8a554c495bb02 400116e5a1ab22d9
+3fde59dde640237f 3ff768a23d2a1a33 3fe5fbf844176ebe bfe2593c16192ffc
+40003df876614f10 3ff3b86743a3be8b 3ff3202c448bcf44 bfdd95007091d645
+3fd1b96f86f7442d bfed3e0b2131fb00 3f956fe59bfffa48 3ffd328862d5d20a
+3ff08b39fe12d1ca 3ff1b0d28c29a725 3ff768a23d2a1a33 3fdb88618e78d04e
+3ff22de6592282e8 3ff2d5e96dc5fb68 3fefe3b5907e8f43 3ff4aefc2ad59bdd
+3fe4b77c92c3eace bfe7bc40bb28ae61 40041c5bcbe46a08 3fc84877f7904152
+bfe08f5c1a1485ca 3fd207a6a73e61cf 3ff22de6592282e8 bfe08f5c1a1485ca
+40041c5bcbe46a08 3ff3ca2f8fe30688 3ffd328862d5d20a 3fe83b86d9965509
+3f5c00f677f171e0 bfb0907461c902f9 3fb094dcb9e6f724 bfe49ce2076a1cf6
+bfbe1d8aaeef828e bfe8a85dd80887ce 4002565a78fcd28e 3fff3cf0ef948441
+400048c1064ae109 bfe163d68afc5b55 3fe3cb5223c4bb8c 40039246145b2a9f
+3ffe1561a105842f 3ff26e501d87602a 3fb094dcb9e6f724 3ff185d655ce69ff
+3ffbb92b7ab9bad2 3ffe1561a105842f bfd04a2ea43c5689 3fefccb5c894673f
+3ff207401d7b7742 3ff54604ed6ca487 3fefccb5c894673f 3fe9cabf93251f43
+3ff04d94dda5feb4 3ff54604ed6ca487 3feb2f7a8ed37f11 3ffbbf5a140f0a4e
+3fdbc1f5ed9b4621 bfed4899e5fa13a4 3f5c00f677f171e0 3fe2e758b3bd9b89
+bfbc2969212129e4 3ff693ebb3b5cd62 3ff937bdc42be8ab bfe8e112ba5509b3
+3ffa4451a146296c 3fbda838f4de1fdc 3ffa1f090745650a bfc52846f9680b9d
+3fce709f21771da5 3fd3069963119d54 bfe8e112ba5509b3 3fbe37670db32cf5
+3ffa8a444d75ec87 3ff5b4b5ba8aded9 bfe94bb03e916703 400048c1064ae109
+40041c5bcbe46a08 bfe1ba2353f1aad3 3ff22de6592282e8 3fe2a3c5047e0647
+3fd1b96f86f7442d 3ff024cb484d2323 3ffa8a444d75ec87 bfed4899e5fa13a4
+"""
+
+comptime _L2_PRED = """
+40037177989032fc 3fe5042b4e697b10 3fd4ae5f8e5e48d0 bfec23c7e6cdb852
+3ff105e0d93b455b 3fb2ccc21e571eda 3ff9730ac9e8cc6a 3fe0517de71e79a7
+3ff75db271aebedd 3fe83b86d9965509 bff06ff5526b6b17 bfb0907461c902f9
+3ffb3c20747a5ba1 3ff821c4dbaa7e56 3feaff5b1b0743c5 3fc3f9347befb94a
+bfbd114d8a17f373 3fc84877f7904152 3f956fe59bfffa48 3fe4b77c92c3eace
+3fe3183d962d4f21 bf97dac6344f6bab 3ff5b4b5ba8aded9 3ff54604ed6ca487
+3ffd328862d5d20a 3ff530b65e0c7edb 3ff47b13182b487f 3ff2d5e96dc5fb68
+3ff21470700be952 3ffb5604204c52b5 3fe9cc3880845613 3ffecc72897cee83
+4001f22e0f41524c 3fc896283bb26a4a 3fdabfdc7e516552 3fe5694e6ea12a34
+40041c5bcbe46a08 3fef85c25537a28b 3ff54604ed6ca487 3ff1b0d28c29a725
+bfe354e58437a9b7 bfef18bdc50062e9 3ff9730ac9e8cc6a 3ffb5604204c52b5
+4001f22e0f41524c 40032e19aa9faa5d 3ffc4eba2e04dba3 3fefe3b5907e8f43
+bfed4899e5fa13a4 bff06ff5526b6b17 3fe8935f55df968f 3fdb47f7b3bf714f
+40039246145b2a9f 400092b4062db187 3fe6482e39b1ebd8 3fe9da891bdae873
+3ff2d5e96dc5fb68 3fb094dcb9e6f724 3ff693ebb3b5cd62 3fddc7cc22517734
+3fe83a0dec371e39 3ff11230add886d8 bfe95904c5733ad2 3ff693ebb3b5cd62
+3ffb853007628e93 bfd23c99f9676f5f bfeb6de7422babbb 400125196099391b
+3f956fe59bfffa48 3fdb47f7b3bf714f bfb3eabd90b518e3 3ffbbf5a140f0a4e
+3fe85b6218ab081e 3ff67d0e8e01df5e bfe4295ff51f7f41 3fe31576c39cdfaf
+40041c5bcbe46a08 bfd34c91e4fd1f14 3ff3363c6fd51efc 3fefe3b5907e8f43
+3fe83a0dec371e39 3fddc7cc22517734 bfec53345add3efc bfec1139a8b48af0
+40013efa390ad315 3fc6128ac34e8b79 3ff0e879b8b2a6a0 4002565a78fcd28e
+3fb9bb6cb349d1b4 3ff67d0e8e01df5e 40041c5bcbe46a08 4000b2b937efa297
+3ffe1561a105842f 3ff54604ed6ca487 4002565a78fcd28e 40041c5bcbe46a08
+3fecd19d1012ee6b bfdcb8a4dd6106b7 40029d9bcb867760 bfe95904c5733ad2
+3fb330db6f4e672c 3ff08b39fe12d1ca bfe8e112ba5509b3 3fce709f21771da5
+bfe1c4ca5f2dcba7 3ffc1e5cf3c3533a bfd8bde062595f67 bfb117cf57393db9
+3fff48e3c9d1e3b9 3fe702adaef19585 3ff8a554c495bb02 400116e5a1ab22d9
+3fde59dde640237f 3ff768a23d2a1a33 3fe5fbf844176ebe bfe2593c16192ffc
+40003df876614f10 3ff3b86743a3be8b 3ff3202c448bcf44 bfdd95007091d645
+3fd1b96f86f7442d bfed3e0b2131fb00 3f956fe59bfffa48 3ffd328862d5d20a
+3ff08b39fe12d1ca 3ff1b0d28c29a725 3ff768a23d2a1a33 3fdb88618e78d04e
+3ff22de6592282e8 3ff2d5e96dc5fb68 3fefe3b5907e8f43 3ff4aefc2ad59bdd
+3fe4b77c92c3eace bfe7bc40bb28ae61 40041c5bcbe46a08 3fc84877f7904152
+bfe08f5c1a1485ca 3fd207a6a73e61cf 3ff22de6592282e8 bfe08f5c1a1485ca
+40041c5bcbe46a08 3ff3ca2f8fe30688 3ffd328862d5d20a 3fe83b86d9965509
+3f5c00f677f171e0 bfb0907461c902f9 3fb094dcb9e6f724 bfe49ce2076a1cf6
+bfbe1d8aaeef828e bfe8a85dd80887ce 4002565a78fcd28e 3fff3cf0ef948441
+400048c1064ae109 bfe163d68afc5b55 3fe3cb5223c4bb8c 40039246145b2a9f
+3ffe1561a105842f 3ff26e501d87602a 3fb094dcb9e6f724 3ff185d655ce69ff
+3ffbb92b7ab9bad2 3ffe1561a105842f bfd04a2ea43c5689 3fefccb5c894673f
+3ff207401d7b7742 3ff54604ed6ca487 3fefccb5c894673f 3fe9cabf93251f43
+3ff04d94dda5feb4 3ff54604ed6ca487 3feb2f7a8ed37f11 3ffbbf5a140f0a4e
+3fdbc1f5ed9b4621 bfed4899e5fa13a4 3f5c00f677f171e0 3fe2e758b3bd9b89
+bfbc2969212129e4 3ff693ebb3b5cd62 3ff937bdc42be8ab bfe8e112ba5509b3
+3ffa4451a146296c 3fbda838f4de1fdc 3ffa1f090745650a bfc52846f9680b9d
+3fce709f21771da5 3fd3069963119d54 bfe8e112ba5509b3 3fbe37670db32cf5
+3ffa8a444d75ec87 3ff5b4b5ba8aded9 bfe94bb03e916703 400048c1064ae109
+40041c5bcbe46a08 bfe1ba2353f1aad3 3ff22de6592282e8 3fe2a3c5047e0647
+3fd1b96f86f7442d 3ff024cb484d2323 3ffa8a444d75ec87 bfed4899e5fa13a4
+"""
+
+comptime _LOGIT_INTS = """
+8 11 0 18 1 2 1 4 7 8 1 24
+3 4 -1 -1 -1 -1 0 27 5 6 -1 -1
+-1 -1 -1 -1 -1 -1 0 9 9 10 -1 -1
+-1 -1 -1 -1 -1 -1 -1 -1 -1 -1 15 0
+18 1 2 1 4 7 8 1 24 3 4 -1
+-1 -1 -1 0 27 5 6 -1 -1 -1 -1 -1
+-1 -1 -1 2 12 9 10 3 28 13 14 -1
+-1 -1 -1 6 15 11 12 -1 -1 -1 -1 -1
+-1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 15
+0 17 1 2 1 4 7 8 1 24 3 4
+7 6 11 12 0 27 5 6 -1 -1 -1 -1
+-1 -1 -1 -1 3 19 9 10 -1 -1 -1 -1
+-1 -1 -1 -1 -1 -1 -1 -1 1 14 13 14
+-1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+15 0 16 1 2 3 25 13 14 1 14 3
+4 -1 -1 -1 -1 0 25 5 6 3 10 7
+8 2 8 11 12 -1 -1 -1 -1 1 22 9
+10 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+-1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+-1 15 0 16 1 2 2 20 7 8 1 24
+3 4 0 20 11 12 2 8 5 6 -1 -1
+-1 -1 -1 -1 -1 -1 -1 -1 -1 -1 3 21
+9 10 -1 -1 -1 -1 -1 -1 -1 -1 1 7
+13 14 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+-1 -1 15 0 18 1 2 1 7 5 6 1
+24 3 4 -1 -1 -1 -1 2 8 9 10 2
+12 7 8 -1 -1 -1 -1 -1 -1 -1 -1 3
+8 11 12 5 11 13 14 -1 -1 -1 -1 -1
+-1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+-1 -1 -1 15 0 16 1 2 6 24 9 10
+1 14 3 4 -1 -1 -1 -1 0 25 5 6
+3 10 7 8 -1 -1 -1 -1 -1 -1 -1 -1
+1 22 13 14 -1 -1 -1 -1 6 26 11 12
+-1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+-1 -1 -1 -1 15 0 16 1 2 3 25 7
+8 1 14 3 4 -1 -1 -1 -1 0 25 5
+6 3 10 11 12 -1 -1 -1 -1 -1 -1 -1
+-1 2 19 9 10 -1 -1 -1 -1 -1 -1 -1
+-1 -1 -1 -1 -1 1 22 13 14 -1 -1 -1
+-1 -1 -1 -1 -1
+"""
+
+comptime _LOGIT_VALS = """
+bdf482e0c6ec6437 bff56aaab39ca35d 3ffa7912c24835e8 4001b01434d41c0b
+bfcb8ab7625051cd bff01c4059ea2264 3fef35ffd2db43fd bfd1838e4c74d79a
+bff7faffd6ece819 bfe9f2fce2ef2245 3fdd925b71a63041 bf952e8f4a74c1f8
+bff1a7c6ae9c89e6 3ff26af894392647 3ff84f989655a1f1 bfc52170f7bb1c0d
+bfead568cccfda7a 3fe84119dd03a4db bfcc56d38343bfd4 bff40664aec761bf
+bfedaa151e81cf43 3fd648132b9b9815 bfd767fdcf60e48b 3fec46f384d9ca29
+bff4a80ed977e7ad bfdb9b2e587386b9 bf9e72af46a84fec bff06058e3377920
+3feb50f9a94ed683 3ff30bc9f8dd5258 bfcd56bf4a1a51a2 bfe9135429a5f9d0
+3fe35d856e493e2c bfd453f7f5ca5999 bff264cf247fad9c bfe7ff8874c68109
+3fde2f729a2ac3f5 3fe2b44e315a96c6 3ff6191667024b50 3ff1b14e73e4346a
+bfc0d884eeff531a bf9755123ec1c58d bfee55379fe9a6c4 3fe60f0c12df446f
+3ff3b5bafbf01276 3fc4d7fdecd38c80 bfdbdfda9d0394e9 3fe7edb59ef7aa66
+bff1456f33410bae 3fcf6c91f95a4dbb 3fec2041b62a1a37 bfe5bda25d58cd20
+bf818f6fa4ea601b 3ff25999ab75ff88 bff167ac916619df bfbf4ab90b739770
+bf935354bd101e44 bfeae2cf107d66a1 3fe2b728789f88dc 3feb3fa94170c8fe
+bfc9c76ce35a15e0 bfe41135db49a771 3fd90729cfc99a14 bff10063bf167505
+bfce1d8704e3b99f bfeb86bf064f2ccb 3fe9f67818ee2b7c 3fcd0f0db224cee1
+3ff0ea96a1fb4776 3ff08f5cd9b5634e bfe6e1d843b16238 bf928f0a1034d299
+bfe53050f7fa66d3 3fe2931edd44d4d6 3feac0527a676ebe bfb3efff371e9b97
+bfa8ea616c58772e bfed307c0861cf23 bfe58e2719da1439 3fd888897f0026d5
+bfdfd718c06b6b6e 3fde455d70e895fa bfd0f3a80793e6fb 3fe53d05ef762d0e
+3fba529b928f6a7b bfeb2cbd4d30c5af bf9ad946d2b0a4e6 bfe6378f5ed10787
+3fdb44d9a721b0bc 3fee1d412b44a1f5 3f973cc1c739de92 bfe028e7f312f025
+3fe043fdf3c409a3 bfefd08b6ca1c0ae 3fbfe3d83365b97b bfecdae027c83f9f
+3fafdcfb53feacdf 3fe9a4826c698be6 bfe319344275c777 3fe48d0de0f2ab94
+bfe17e367fa44d05 bf9aec4e5bc70507 bfe39ddc5243227e 3fd6a3e5d0bc8466
+3feb10f84d0c480f 3f679398553eaf57 bfdc965f76902f9c 3fd97a3dee8ef618
+bfeaab999c619d5a 3fc641865bfb44d4 bfe0e5612c69ecfc 3fe933fd18d6c2d0
+bfeb2d2e6bd5c0b1 3fbb83c5d80a99a9 3fe2b8f0dd6b4008 bfe005b59e105dc0
+"""
+
+comptime _LOGIT_RAW = """
+c007c9262c57cc67 c007ceafbea36b2b c0086142ea20cc63 4002541cc0b1de77
+c007a5ef9f543694 4004a550b0f62f4f bfd5c06587d3d1e6 3ffd6560ffecacd3
+c0086142ea20cc63 c0086142ea20cc63 4004a550b0f62f4f 3ff267faef4f61f1
+c007e4e8adf02afe 4004a550b0f62f4f 3fd8c8c4445a0aed c0041cb221bff814
+bfee189e6f887a27 c0086142ea20cc63 4004a550b0f62f4f 4003fc25e6181246
+4003ee76d4da6340 c0086142ea20cc63 4002541cc0b1de77 3fdf63df5e9f7aba
+4004a550b0f62f4f c007a5ef9f543694 c0086142ea20cc63 c004990c5df09979
+c007a5ef9f543694 3fe98afa0f4bf151 4004a550b0f62f4f 4004a550b0f62f4f
+400497a19fb88049 4003fc25e6181246 4004a550b0f62f4f 3ff7d990097fed24
+c0086142ea20cc63 c007a5ef9f543694 bfd5c06587d3d1e6 4004a550b0f62f4f
+400497a19fb88049 c0034427a4532300 4004a550b0f62f4f 4004a550b0f62f4f
+c00729956323952f c0018284b8d08fbc c00729956323952f bff1a5e3402dd3ae
+c00557affe8ca251 4003fc25e6181246 c007e4e8adf02afe bffd52d5dbb2b8bf
+c0086142ea20cc63 c0044ae85236a9ed 3ffda6783ab58d23 c0086142ea20cc63
+3ffc67764e39d2ad 3ffd6560ffecacd3 c007a5ef9f543694 c0086142ea20cc63
+400274a85e164e9f c0086142ea20cc63 4003fc25e6181246 c007ceafbea36b2b
+bfdb9d8c856f3a52 c007e4e8adf02afe bfc7f9af3e1f1023 4003fc25e6181246
+c0086142ea20cc63 c007e4e8adf02afe c00144bd4249efc7 c0016867e7d11d7f
+c0016867e7d11d7f 400497a19fb88049 bff794facb1c1a38 c007e4e8adf02afe
+4002541cc0b1de77 c0001bda2bee4904 4004a550b0f62f4f c0039786c32beb25
+c003e1eaf1fec460 c0086142ea20cc63 4002541cc0b1de77 c0086142ea20cc63
+bfff88b6d2525d5e c007ceafbea36b2b c0086142ea20cc63 3fd60a9218bba238
+c007ceafbea36b2b 400274a85e164e9f c007e4e8adf02afe 3ff267faef4f61f1
+4002541cc0b1de77 4003ee76d4da6340 4004a550b0f62f4f c0086142ea20cc63
+c007e4e8adf02afe bff1a5e3402dd3ae c007c9262c57cc67 c0018284b8d08fbc
+c00288d459868d30 4003fc25e6181246 400497a19fb88049 bff391ca97715d8a
+c0086142ea20cc63 3fba054f45c817ba c0044ae85236a9ed c0086142ea20cc63
+c0086142ea20cc63 c0086142ea20cc63 4002541cc0b1de77 3ff267faef4f61f1
+3fba054f45c817ba c000a8fb6e3b6d51 c0086142ea20cc63 4002541cc0b1de77
+c0065735ad97fa85 c0086142ea20cc63 c007a5ef9f543694 c007c9262c57cc67
+c007a5ef9f543694 4004a550b0f62f4f c007e4e8adf02afe c003e1eaf1fec460
+3ff7d990097fed24 3fccd9e42d935bb4 bfc7f9af3e1f1023 4004a550b0f62f4f
+c00452da0df880f4 3fd8c8c4445a0aed c0034427a4532300 3fff1c688af6fd40
+c005545821a0ca4c 4004a550b0f62f4f c003e1eaf1fec460 c003e1eaf1fec460
+c0086142ea20cc63 c007e4e8adf02afe 400274a85e164e9f 4004a550b0f62f4f
+4003fc25e6181246 4004a550b0f62f4f c0086142ea20cc63 c003d34d4d1134a0
+c00161be1807524a bff6e991e395a73d 3ff267faef4f61f1 400497a19fb88049
+3ffda6783ab58d23 4004a550b0f62f4f c007c9262c57cc67 c0044755701c6cc2
+4004a550b0f62f4f c0086142ea20cc63 c0034427a4532300 c007ceafbea36b2b
+c007a5ef9f543694 c00161be1807524a c0086142ea20cc63 4004a550b0f62f4f
+c007e4e8adf02afe 3fe95eb9ccb52edf c0086142ea20cc63 c005545821a0ca4c
+c007e4e8adf02afe c0016867e7d11d7f 400274a85e164e9f c0086142ea20cc63
+4004a550b0f62f4f c0034427a4532300 c00144bd4249efc7 3ffc67764e39d2ad
+c001fe6761bf6c22 c0086142ea20cc63 c00557affe8ca251 3fe3d2e6e03e0280
+c00452da0df880f4 c004c1c4f6236914 3fe21f0c84f8078c c0086142ea20cc63
+c0086142ea20cc63 4004a550b0f62f4f 4004a550b0f62f4f c007e4e8adf02afe
+c0022c0aa93bf050 4004a550b0f62f4f 4004a550b0f62f4f c0044755701c6cc2
+400274a85e164e9f c007e4e8adf02afe c0044ae85236a9ed 4004a550b0f62f4f
+c00729956323952f bff1a5e3402dd3ae c0086142ea20cc63 c0086142ea20cc63
+c007a5ef9f543694 4004a550b0f62f4f 3ff721e62cd4beb2 4003ee76d4da6340
+"""
+
+comptime _LOGIT_PRED = """
+3fa8e8bb1e37b1e3 3fa8d8592b18d739 3fa734f58eeb705f 3fed0f70b2f9d2c2
+3fa951d9d0fa4938 3fedbf5e58866c2c 3fda9d25e2dc4b83 3feb9a9c07b5f9cc
+3fa734f58eeb705f 3fa734f58eeb705f 3fedbf5e58866c2c 3fe84e7d9a83dde3
+3fa89700d84d7627 3fedbf5e58866c2c 3fe30f54b13be633 3fb32b72faff1bda
+3fd1f8996d617f73 3fa734f58eeb705f 3fedbf5e58866c2c 3fed917d20c03e9d
+3fed8da274b476b1 3fa734f58eeb705f 3fed0f70b2f9d2c2 3fe3d8d1fdeb7b64
+3fedbf5e58866c2c 3fa951d9d0fa4938 3fa734f58eeb705f 3fb21ecdc136485f
+3fa951d9d0fa4938 3fe611244fe29956 3fedbf5e58866c2c 3fedbf5e58866c2c
+3fedbbc6d185ba3e 3fed917d20c03e9d 3fedbf5e58866c2c 3fea1e120146921f
+3fa734f58eeb705f 3fa951d9d0fa4938 3fda9d25e2dc4b83 3fedbf5e58866c2c
+3fedbbc6d185ba3e 3fb5219367aad07d 3fedbf5e58866c2c 3fedbf5e58866c2c
+3faad25c23fab86a 3fb9cbe013a525b2 3faad25c23fab86a 3fcfe5126a5afc9b
+3fb09d3ed4e8b7c7 3fed917d20c03e9d 3fa89700d84d7627 3fc1a72bbab13d55
+3fa734f58eeb705f 3fb2c5fc494a5d6d 3feba9f2a6e7a852 3fa734f58eeb705f
+3feb5d10b175ac15 3feb9a9c07b5f9cc 3fa951d9d0fa4938 3fa734f58eeb705f
+3fed1a3b049dbcec 3fa734f58eeb705f 3fed917d20c03e9d 3fa8d8592b18d739
+3fd9338888f5554c 3fa89700d84d7627 3fdd030650128a06 3fed917d20c03e9d
+3fa734f58eeb705f 3fa89700d84d7627 3fba812e5c73e141 3fba17fa694ce026
+3fba17fa694ce026 3fedbbc6d185ba3e 3fc7da7966a9f7ea 3fa89700d84d7627
+3fed0f70b2f9d2c2 3fbe26fd0b900544 3fedbf5e58866c2c 3fb45af0708656e0
+3fb3af58fbc21f54 3fa734f58eeb705f 3fed0f70b2f9d2c2 3fa734f58eeb705f
+3fbf4eb4110c2147 3fa8d8592b18d739 3fa734f58eeb705f 3fe2ba6e802eee99
+3fa8d8592b18d739 3fed1a3b049dbcec 3fa89700d84d7627 3fe84e7d9a83dde3
+3fed0f70b2f9d2c2 3fed8da274b476b1 3fedbf5e58866c2c 3fa734f58eeb705f
+3fa89700d84d7627 3fcfe5126a5afc9b 3fa8e8bb1e37b1e3 3fb9cbe013a525b2
+3fb6f936a64a8f6a 3fed917d20c03e9d 3fedbbc6d185ba3e 3fcd1b327cdf22e1
+3fa734f58eeb705f 3fe0cffca4e7c217 3fb2c5fc494a5d6d 3fa734f58eeb705f
+3fa734f58eeb705f 3fa734f58eeb705f 3fed0f70b2f9d2c2 3fe84e7d9a83dde3
+3fe0cffca4e7c217 3fbc5def5d0f4bf0 3fa734f58eeb705f 3fed0f70b2f9d2c2
+3fad8e4d4ffa8092 3fa734f58eeb705f 3fa951d9d0fa4938 3fa8e8bb1e37b1e3
+3fa951d9d0fa4938 3fedbf5e58866c2c 3fa89700d84d7627 3fb3af58fbc21f54
+3fea1e120146921f 3fe1cbac786541c5 3fdd030650128a06 3fedbf5e58866c2c
+3fb2b4bd13d21ba9 3fe30f54b13be633 3fb5219367aad07d 3febfead98681279
+3fb0a3be18db21e9 3fedbf5e58866c2c 3fb3af58fbc21f54 3fb3af58fbc21f54
+3fa734f58eeb705f 3fa89700d84d7627 3fed1a3b049dbcec 3fedbf5e58866c2c
+3fed917d20c03e9d 3fedbf5e58866c2c 3fa734f58eeb705f 3fb3d0a580148819
+3fba2b85a1a3f056 3fc8ad217e0d4bdb 3fe84e7d9a83dde3 3fedbbc6d185ba3e
+3feba9f2a6e7a852 3fedbf5e58866c2c 3fa8e8bb1e37b1e3 3fb2cdc341e98d1f
+3fedbf5e58866c2c 3fa734f58eeb705f 3fb5219367aad07d 3fa8d8592b18d739
+3fa951d9d0fa4938 3fba2b85a1a3f056 3fa734f58eeb705f 3fedbf5e58866c2c
+3fa89700d84d7627 3fe607a8f706924e 3fa734f58eeb705f 3fb0a3be18db21e9
+3fa89700d84d7627 3fba17fa694ce026 3fed1a3b049dbcec 3fa734f58eeb705f
+3fedbf5e58866c2c 3fb5219367aad07d 3fba812e5c73e141 3feb5d10b175ac15
+3fb86d3ad05b83aa 3fa734f58eeb705f 3fb09d3ed4e8b7c7 3fe4cda62cec9575
+3fb2b4bd13d21ba9 3fb1c9d352ca087d 3fe469bb53532bfc 3fa734f58eeb705f
+3fa734f58eeb705f 3fedbf5e58866c2c 3fedbf5e58866c2c 3fa89700d84d7627
+3fb7f04f4a6a92c3 3fedbf5e58866c2c 3fedbf5e58866c2c 3fb2cdc341e98d1f
+3fed1a3b049dbcec 3fa89700d84d7627 3fb2c5fc494a5d6d 3fedbf5e58866c2c
+3faad25c23fab86a 3fcfe5126a5afc9b 3fa734f58eeb705f 3fa734f58eeb705f
+3fa951d9d0fa4938 3fedbf5e58866c2c 3fe9e62cc9bbfdb2 3fed8da274b476b1
+"""
+
+comptime _MULTI_INTS = """
+12 11 0 6 1 2 1 16 3 4 1 4
+5 6 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+-1 -1 2 8 7 8 1 13 9 10 -1 -1
+-1 -1 -1 -1 -1 -1 -1 -1 -1 -1 11 0
+5 1 2 1 16 5 6 0 27 3 4 1
+4 7 8 -1 -1 -1 -1 -1 -1 -1 -1 -1
+-1 -1 -1 -1 -1 -1 -1 0 19 9 10 -1
+-1 -1 -1 -1 -1 -1 -1 7 0 19 1 2
+-1 -1 -1 -1 1 16 3 4 1 12 5 6
+-1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+11 0 6 1 2 1 16 5 6 1 4 3
+4 -1 -1 -1 -1 2 8 7 8 -1 -1 -1
+-1 -1 -1 -1 -1 0 13 9 10 -1 -1 -1
+-1 -1 -1 -1 -1 -1 -1 -1 -1 11 0 28
+1 2 0 6 3 4 -1 -1 -1 -1 1 16
+5 6 1 4 7 8 -1 -1 -1 -1 -1 -1
+-1 -1 -1 -1 -1 -1 1 23 9 10 -1 -1
+-1 -1 -1 -1 -1 -1 9 0 19 1 2 -1
+-1 -1 -1 1 12 3 4 -1 -1 -1 -1 2
+10 5 6 2 5 7 8 -1 -1 -1 -1 -1
+-1 -1 -1 -1 -1 -1 -1 11 0 15 1 2
+1 13 3 4 -1 -1 -1 -1 2 13 5 6
+0 4 9 10 -1 -1 -1 -1 0 5 7 8
+-1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+-1 -1 -1 -1 11 0 27 1 2 0 6 3
+4 -1 -1 -1 -1 1 16 5 6 1 2 7
+8 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+-1 0 19 9 10 -1 -1 -1 -1 -1 -1 -1
+-1 9 0 19 1 2 -1 -1 -1 -1 1 17
+3 4 4 21 5 6 2 9 7 8 -1 -1
+-1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+-1 -1 11 0 15 1 2 2 13 3 4 -1
+-1 -1 -1 1 24 9 10 1 9 5 6 0
+5 7 8 -1 -1 -1 -1 -1 -1 -1 -1 -1
+-1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 11
+0 28 1 2 0 6 3 4 -1 -1 -1 -1
+2 24 5 6 5 11 7 8 -1 -1 -1 -1
+-1 -1 -1 -1 -1 -1 -1 -1 2 6 9 10
+-1 -1 -1 -1 -1 -1 -1 -1 9 0 19 1
+2 -1 -1 -1 -1 1 17 3 4 4 21 5
+6 2 9 7 8 -1 -1 -1 -1 -1 -1 -1
+-1 -1 -1 -1 -1 -1 -1 -1 -1
+"""
+
+comptime _MULTI_VALS = """
+bda4e83ff0f3d970 3ff9144c31b55dd3 bfe04da04e9a8f02 40017682bdc86817
+bfc1ca4617da468d 3ff05bb49843c1c9 bfe663f37cb28b1a bfd2a462a027cba6
+bfeb416a9ab46d9a 3fe87e54246ad799 bfe8a052a6653501 bdd2a74bf978e7a9
+bfea9ca3587c329f 3fcd7adf99e04d1a 3fdeca2f1ad2154a bff0e4a6596704da
+bff401b977f556ae 3fd895e4e0ca1ba8 bfdb4a3a8ad180a8 3fe33d255b5ba846
+3feb22c909ebb829 3f9cdfa022b9f48e 3de09724d40de8f6 bfe92aba7a7a1dac
+3ffb1124f74f7325 bfcb324e6253f291 4004d66c41f22b6b bfe2bf06b329ba3c
+3fdfeb9231e65be4 bf82510b41583ff5 3fed697e4ca50718 bfdaecf03dcb8d1f
+3fe53b9c47e6b11f bfe366507a1515d9 3ff315b5b957b673 bfb7e89483458106
+bfc80c631ce12854 bfe8e3dc3b94645a 3fe811cd5bcb0dcc bfe6cda593fd7001
+3f96f36a8db19f95 3fc1739380e83d97 bfea97a9659d428a bfe0b111a6a1f832
+3fd839bdab771ce1 bfec650ed4765e5b 3fd9072dc8f2092f bfd2ce211b626eb5
+3fde6e001bcd841d 3fe60091422fa164 3f985c969ad122e4 bf9919c28034922b
+bfe78e3ad40b4e75 3fecdce4279d207d bfe215427407d370 3ff367cea148b898
+3fdd0154cff1a7a2 3ff78feb4b257f6f 3feb789ce23570dd bfa7d828420f5fcb
+bf8c3fa61710d04f 3fd81718b85d9f51 bfe7fc765e06735d 3fe80844f36c4c3f
+bfd6e655fa995e97 3ff34e77e03dca23 3fc9b86bfd23687b 3fe6ccb29a09c12c
+bfe49160fa2d9968 3fdba743172b4689 bfe5fd66e93a5f63 3f97d79ef4ee5137
+3fc00fb157fbd8ca bfe39695093b7c46 bfd93cd57358bc36 3fd41b0718faccb6
+bfe66694b90456d2 3fd3099845f9a542 bfd03e3c8fb1c8e8 3fd8f7dae1e17f61
+3fe20114b2bbaa63 3faf5d59cb1298be bf94f68dbca78df1 bfe65e4c5a92fc55
+3fe56e137132b87c bfca8a4b127b01a0 3ff0649c3b4ed5f5 bfe422db81417a43
+3fe19e67730f6834 3fdaf57821f33f3e 3ff2e49d360f3392 bf91fbb932c95610
+3fd49ef521959436 bfe6d4f2bdd352ba 3fe73da9d2636558 bfc3fde65bad9542
+3fd51f52a0cf9293 bfe74d285febe15e 3fe79888d4eb04ac bfe19e80581f283e
+3fec20f9634e7f51 bfdb1b38e5ef3f45 3f99828c88beb0ce 3fba73319e9e0dfd
+bfe20e23acec8564 bfd38962260bcb6d 3fcec467515b88cb bfe0eb692e65fd70
+3fe02bfe72bff596 3fdffbf9e9b5d066 3fa9156545291033 bfe125eed0a699ad
+3fd0b4b8bd3474a1 bf93cc9ed7ffc768 bfe54f4d2d08ee91 3fe0873b18db9416
+bfcd0f5681fe982a 3fea4e4bf755c074 bfe331c52c1dd47d 3fda8e164132a14c
+3fd3cb78d121a75b 3fef1249d8d324aa
+"""
+
+comptime _MULTI_RAW = """
+c002681b2e35275c bff7fafd2df29227 3fc85c09294e4783 bffc2991a1bdb247
+bfbc72954d53687c c0045b84a1b46648 bffcdeaa39203903 3fc060a92ba416f2
+c0045b84a1b46648 3fb31984ed227c13 bff96fb61bee2e76 c0045b84a1b46648
+c0020d8ee283e3fe bff7fafd2df29227 bfe6238261055888 bfd2b1364ac7b0a7
+bfbc72954d53687c c0045b84a1b46648 bffcdeaa39203903 3fc98b69dff1b468
+c0045b84a1b46648 3fb31984ed227c13 bff96fb61bee2e76 c0045b84a1b46648
+bffb623d44508a72 3f3c68d30d94e59a c0045b84a1b46648 c002681b2e35275c
+bfd12d7ee31b008a bfd0fd30e199a25c bffde0bd466c584a bfd1c24a1a0e28b6
+c0045b84a1b46648 c002681b2e35275c bfddec199e507586 3fc85c09294e4783
+c002681b2e35275c bff7fafd2df29227 3fc85c09294e4783 c002681b2e35275c
+bff7fafd2df29227 3fc85c09294e4783 bffcdeaa39203903 3fc060a92ba416f2
+c0045b84a1b46648 c002681b2e35275c bff7fafd2df29227 3fc85c09294e4783
+c002681b2e35275c 3fc98b69dff1b468 c0045b84a1b46648 bfceebc16bb2355e
+bfe71b7742f3561f c0045b84a1b46648 bff0ca76f1379630 bfdaaa3142f88ee9
+c0045b84a1b46648 c002681b2e35275c bfd12d7ee31b008a bff74ab3fc9bf7cf
+c0024acad8014a28 3fc060a92ba416f2 c0045b84a1b46648 c002681b2e35275c
+bfddec199e507586 bfe6238261055888 c0024acad8014a28 3fc98b69dff1b468
+c0045b84a1b46648 bff881626819f17d bfbb3d65ef872795 c0045b84a1b46648
+bff3c7839fab5477 3fc98b69dff1b468 c0045b84a1b46648 3fd0fb9641623411
+bfeeba5a39b5a4e0 c0045b84a1b46648 c002681b2e35275c bfc9303d11e8639e
+c00323b1db2ff6b0 c0020d8ee283e3fe bfb23918958da607 c0045b84a1b46648
+c002681b2e35275c bfefd50fb6e6c74f 3fc85c09294e4783 bffb623d44508a72
+3f3c68d30d94e59a c0045b84a1b46648 bfd75d09179eb7ce bff479002a287d35
+c0045b84a1b46648 bff881626819f17d bfbb3d65ef872795 c0045b84a1b46648
+bfceebc16bb2355e bfe18fb1be73c5d5 c0045b84a1b46648 c002681b2e35275c
+bfd12d7ee31b008a c00323b1db2ff6b0 c0020d8ee283e3fe bff7fafd2df29227
+bfdae68b84a3a68e 3fd0fb9641623411 bff96fb61bee2e76 c0045b84a1b46648
+bffcbceb269bc616 bfc9303d11e8639e bffbbead9fd1ec3c c002681b2e35275c
+bfddec199e507586 3fc85c09294e4783 3fd0fb9641623411 bff96fb61bee2e76
+c0045b84a1b46648 c0020d8ee283e3fe 3f3c68d30d94e59a c0045b84a1b46648
+c002681b2e35275c bff7fafd2df29227 3fc85c09294e4783 bffcbceb269bc616
+bfc9303d11e8639e c00323b1db2ff6b0 3fb31984ed227c13 bff96fb61bee2e76
+c0045b84a1b46648 c001c264324a93d3 3fc060a92ba416f2 c0045b84a1b46648
+c0022f7d9946bb4f 3fc060a92ba416f2 c0045b84a1b46648 3fb31984ed227c13
+bff479002a287d35 c0045b84a1b46648 c0020d8ee283e3fe 3f3c68d30d94e59a
+c0045b84a1b46648 bff39abcf26019db bfe18fb1be73c5d5 c0045b84a1b46648
+c002681b2e35275c bfddec199e507586 3fc85c09294e4783 c0024acad8014a28
+bfb23918958da607 c0045b84a1b46648 bff881626819f17d bfdaaa3142f88ee9
+c0045b84a1b46648 bfceebc16bb2355e bfe71b7742f3561f c0045b84a1b46648
+c002681b2e35275c 3fc060a92ba416f2 c0045b84a1b46648 bffcbceb269bc616
+bfe03d3c6620f311 c00323b1db2ff6b0 c0020d8ee283e3fe bfd3db400e8a4f1a
+c0045b84a1b46648 c002681b2e35275c bff7fafd2df29227 bfe983fbcc1bed55
+bfd2b1364ac7b0a7 3fc060a92ba416f2 c0045b84a1b46648 3fd0fb9641623411
+bff96fb61bee2e76 c0045b84a1b46648 c002681b2e35275c 3fc98b69dff1b468
+c0045b84a1b46648 c0024acad8014a28 3fc060a92ba416f2 c0045b84a1b46648
+3fb31984ed227c13 bff96fb61bee2e76 c0045b84a1b46648 bff881626819f17d
+bfbb3d65ef872795 c0045b84a1b46648 3fb31984ed227c13 bff96fb61bee2e76
+c0045b84a1b46648 bff0ca76f1379630 bfdaaa3142f88ee9 c0045b84a1b46648
+3fa0e33aa6c1e87e bff96fb61bee2e76 c0045b84a1b46648 c0020d8ee283e3fe
+bfe69c89c3bbad8f bfdae68b84a3a68e 3fd0fb9641623411 bff96fb61bee2e76
+c0045b84a1b46648 c0020d8ee283e3fe bfd956b94429a6cb bfe6238261055888
+c002681b2e35275c bfddec199e507586 3fc85c09294e4783 c0024acad8014a28
+3fc98b69dff1b468 c0045b84a1b46648 c0024acad8014a28 bfb23918958da607
+c0045b84a1b46648 c0024acad8014a28 3fc98b69dff1b468 c0045b84a1b46648
+c002681b2e35275c bff7fafd2df29227 3fc85c09294e4783 c0020d8ee283e3fe
+3fc98b69dff1b468 c0045b84a1b46648 3fb31984ed227c13 bff96fb61bee2e76
+c0045b84a1b46648 3fd0fb9641623411 bff96fb61bee2e76 c0045b84a1b46648
+c0022f7d9946bb4f 3fc060a92ba416f2 c0045b84a1b46648 c0022f7d9946bb4f
+3fc98b69dff1b468 c0045b84a1b46648 c0024acad8014a28 3fc060a92ba416f2
+c0045b84a1b46648 bff39abcf26019db bfe966277006bd7c c0045b84a1b46648
+c002681b2e35275c bfd12d7ee31b008a bff74ab3fc9bf7cf 3fb31984ed227c13
+bff479002a287d35 c0045b84a1b46648 c0024acad8014a28 3fc98b69dff1b468
+c0045b84a1b46648 c002681b2e35275c bfddec199e507586 3fc85c09294e4783
+3fb31984ed227c13 bff96fb61bee2e76 c0045b84a1b46648 c0020d8ee283e3fe
+bfe69c89c3bbad8f bfdae68b84a3a68e c002681b2e35275c bff7fafd2df29227
+c00323b1db2ff6b0 c0020d8ee283e3fe 3f3c68d30d94e59a c0045b84a1b46648
+bff521a6ca92d29b bfbc72954d53687c c0045b84a1b46648 bffde0bd466c584a
+bfd1c24a1a0e28b6 c0045b84a1b46648 c0022f7d9946bb4f 3fc060a92ba416f2
+c0045b84a1b46648 c0020d8ee283e3fe 3fc060a92ba416f2 c0045b84a1b46648
+bfd2b1364ac7b0a7 bfbc72954d53687c c0045b84a1b46648 bfceebc16bb2355e
+bff08652324d1824 c0045b84a1b46648 c0020d8ee283e3fe bfc9303d11e8639e
+bffa3d630ad266b5 c002681b2e35275c bfd12d7ee31b008a c00323b1db2ff6b0
+bfceebc16bb2355e bfe71b7742f3561f c0045b84a1b46648 c002681b2e35275c
+3f3c68d30d94e59a c0045b84a1b46648 bfceebc16bb2355e bff08652324d1824
+c0045b84a1b46648 c002681b2e35275c bff7fafd2df29227 3fc85c09294e4783
+c002681b2e35275c bfc9303d11e8639e c00323b1db2ff6b0 c001c264324a93d3
+3fc060a92ba416f2 c0045b84a1b46648 3fa0e33aa6c1e87e bff96fb61bee2e76
+c0045b84a1b46648 bffcdeaa39203903 3fc060a92ba416f2 c0045b84a1b46648
+c001c264324a93d3 3fc060a92ba416f2 c0045b84a1b46648 c001c264324a93d3
+3fc98b69dff1b468 c0045b84a1b46648 c002681b2e35275c bfd12d7ee31b008a
+bffbbead9fd1ec3c bffb623d44508a72 3f3c68d30d94e59a c0045b84a1b46648
+c002681b2e35275c 3fc98b69dff1b468 c0045b84a1b46648 c002681b2e35275c
+bfd12d7ee31b008a c00323b1db2ff6b0 c002681b2e35275c bfe72b122c38a574
+c00323b1db2ff6b0 c001c264324a93d3 3fc98b69dff1b468 c0045b84a1b46648
+c002681b2e35275c bfd956b94429a6cb 3fc85c09294e4783 c002681b2e35275c
+bff7fafd2df29227 bfc531a5ab6f826f bff4e62aea3540ec bfe71b7742f3561f
+c0045b84a1b46648 c0020d8ee283e3fe bfbc72954d53687c c0045b84a1b46648
+3fb31984ed227c13 bff96fb61bee2e76 c0045b84a1b46648 c002681b2e35275c
+bfddec199e507586 3fc85c09294e4783 c001c264324a93d3 3fc060a92ba416f2
+c0045b84a1b46648 c002681b2e35275c bff7fafd2df29227 3fc85c09294e4783
+3fd0fb9641623411 bfeeba5a39b5a4e0 c0045b84a1b46648 c002681b2e35275c
+bfd12d7ee31b008a bff479b8298c22f9 c001c264324a93d3 3fc98b69dff1b468
+c0045b84a1b46648 3fd0fb9641623411 bff96fb61bee2e76 c0045b84a1b46648
+3fb31984ed227c13 bff96fb61bee2e76 c0045b84a1b46648 bfd2b1364ac7b0a7
+bfbc72954d53687c c0045b84a1b46648 c0022f7d9946bb4f 3fc060a92ba416f2
+c0045b84a1b46648 c002681b2e35275c 3fc98b69dff1b468 c0045b84a1b46648
+c0020d8ee283e3fe bfd12d7ee31b008a bfe6238261055888 bfd2b1364ac7b0a7
+3fc98b69dff1b468 c0045b84a1b46648 bff629d1cf89fcfd bfdaaa3142f88ee9
+c0045b84a1b46648 c0024acad8014a28 3f3c68d30d94e59a c0045b84a1b46648
+3fb31984ed227c13 bff96fb61bee2e76 c0045b84a1b46648 c002681b2e35275c
+bfd12d7ee31b008a 3fc85c09294e4783 c0024acad8014a28 3fc060a92ba416f2
+c0045b84a1b46648 bffc6a684947b4d4 bfdaaa3142f88ee9 c0045b84a1b46648
+bfceebc16bb2355e bff08652324d1824 c0045b84a1b46648 c002681b2e35275c
+bfd956b94429a6cb 3fc85c09294e4783 c002681b2e35275c bff7fafd2df29227
+bfe983fbcc1bed55 3fd0fb9641623411 bff96fb61bee2e76 c0045b84a1b46648
+c0024acad8014a28 bfb23918958da607 c0045b84a1b46648 c0024acad8014a28
+bfb23918958da607 c0045b84a1b46648 bffcdeaa39203903 3fc060a92ba416f2
+c0045b84a1b46648 3fb31984ed227c13 bff96fb61bee2e76 c0045b84a1b46648
+bff4e62aea3540ec bfe71b7742f3561f c0045b84a1b46648 bff3c7839fab5477
+3fc98b69dff1b468 c0045b84a1b46648 bffb623d44508a72 3f3c68d30d94e59a
+c0045b84a1b46648 bfe76870d3b997ab 3fc98b69dff1b468 c0045b84a1b46648
+c002681b2e35275c bfefd50fb6e6c74f 3fc85c09294e4783 c0020d8ee283e3fe
+bff7fafd2df29227 bfdae68b84a3a68e
+"""
+
+comptime _MULTI_PRED = """
+3fb0b9f31564c459 3fc2a6a2c7fdebd1 3fe93f18eb53ec81 3fc3396c33a6bd30
+3fe900320c3bd324 3fb18b9736d3ec8d 3fbe8a4654413dc4 3fea5c975a56d86c
+3fad21fdb20ffdab 3fe95a7365625e0f 3fc332c512cb3f26 3fad8db55ead2296
+3fc02bd1f8cd5e3c 3fd140816413ea74 3fe354cacfc2b337 3fdbc8bf50a9a36b
+3fe0a5c4ac5341e4 3fa75dbab57ec667 3fbcc7a6b0c27971 3feaafc9087aa6e1
+3fab742216d09f0b 3fe95a7365625e0f 3fc332c512cb3f26 3fad8db55ead2296
+3fc25a70a5fb5e3c 3fe96ad6f80265a7 3fafe8cde7ec2c98 3faf6f42d6c37c4e
+3fddfdb620d0ef01 3fde14618456a176 3fc3f7166bb6ae7a 3fe8792625ebc684
+3fb448a1f9346ee4 3faa7ceb3e785cc6 3fd4b56376c2eb54 3fe3fd7f90b70489
+3fb0b9f31564c459 3fc2a6a2c7fdebd1 3fe93f18eb53ec81 3fb0b9f31564c459
+3fc2a6a2c7fdebd1 3fe93f18eb53ec81 3fbe8a4654413dc4 3fea5c975a56d86c
+3fad21fdb20ffdab 3fb0b9f31564c459 3fc2a6a2c7fdebd1 3fe93f18eb53ec81
+3fb252de72e6fc15 3febea2b59b34322 3facb78d7efdd5be 3fe29f395c373dac
+3fd7089d2c30e91d 3fadc780db04dc6d 3fd4992aa74f710f 3fe364517e805082
+3fb278c96ebfb7b7 3fb75b1d658b99f2 3fe6488a19344dc1 3fcb3048e868fc06
+3fb3c23baf13c99b 3feb9f4e7786b623 3fae86a1296d0a92 3fb4e4e1a7a6de6f
+3fe055cec4576341 3fda1b2a0d6781e5 3fb29196bfb13914 3febe2cd8fe2dfca
+3facaff9826f9129 3fc72e652fdcf755 3fe819b7d40c9810 3fb0d576ffe150cf
+3fc7630ed8495bb4 3fe892c34d961183 3fa9478fc57978f4 3fe7a331299c2180
+3fcbc20ba3f753a7 3fa6c4bed6609962 3fb95128cace578d 3fe9f29e7f2d65d0
+3fb719e33bc679f2 3fb80cf1a835b88e 3feabd63ea242d60 3fb207ef06a8dc6e
+3fae89653c8bf6dc 3fcc2ec7ada8e50f 3fe70bb7c0cd074f 3fc25a70a5fb5e3c
+3fe96ad6f80265a7 3fafe8cde7ec2c98 3fe523879c6fce2b 3fd0f10951915c39
+3fb31f9dd63c1dc6 3fc72e652fdcf755 3fe819b7d40c9810 3fb0d576ffe150cf
+3fe16f3f66195652 3fd9a55469d291ca 3fabe1664fd60c80 3fbad1ef6adcceb7
+3fe996a289530e03 3fb878fc4a8ac139 3fbb36c4233377fe 3fcd0863fbf32606
+3fe5570e7c9cc77e 3fea4d531f8b7da9 3fc07540278f3f87 3fa955cd690b2770
+3fc23ff00b53ee3a 3fe6953c95b2f303 3fc36b1d9de045ba 3faa7ceb3e785cc6
+3fd4b56376c2eb54 3fe3fd7f90b70489 3fea4d531f8b7da9 3fc07540278f3f87
+3fa955cd690b2770 3fb6a54838158db5 3feb0c0da999ddb0 3fb0fa4a7b1b84d1
+3fb0b9f31564c459 3fc2a6a2c7fdebd1 3fe93f18eb53ec81 3fc3b0c477e9f005
+3fe85da413475722 3fb5b15675f166ea 3fe95a7365625e0f 3fc332c512cb3f26
+3fad8db55ead2296 3fb50201b2bed4d7 3feb79ead3c29012 3fae5d4f5e595532
+3fb400cfb70288a5 3feb97fd56f742bf 3fae7e8b2286c2c0 3fe80aac6c006fd0
+3fc8d3bade6a83d3 3fac064dc64ef3c3 3fb6a54838158db5 3feb0c0da999ddb0
+3fb0fa4a7b1b84d1 3fd3c9c82504b554 3fe3761596159c7c 3fb52832bb4046d8
+3faa7ceb3e785cc6 3fd4b56376c2eb54 3fe3fd7f90b70489 3fb768297472c3ca
+3fead063083a7a79 3fb214be49b9686c 3fcd022938cf3431 3fe61d5d51744031
+3fb510c302bf961e 3fe29f395c373dac 3fd7089d2c30e91d 3fadc780db04dc6d
+3fb37fd2e370c35c 3feba71244e1150f 3fae8f35eb0d284b 3fc8b76ed8c1c5ce
+3fe66ac97a5d764e 3fbb3ad67b90c1ea 3fbd3f5c58b63058 3fe99a68d84c5295
+3fb5ed5ce4e73afa 3fc0907ef234abca 3fd27869992c49b3 3fe29fab76dcb033
+3fd85c832db7c3df 3fe289f12dba39fb 3fa47cd3b69e415d 3fea4d531f8b7da9
+3fc07540278f3f87 3fa955cd690b2770 3fb252de72e6fc15 3febea2b59b34322
+3facb78d7efdd5be 3fb3c23baf13c99b 3feb9f4e7786b623 3fae86a1296d0a92
+3fe95a7365625e0f 3fc332c512cb3f26 3fad8db55ead2296 3fc72e652fdcf755
+3fe819b7d40c9810 3fb0d576ffe150cf 3fe95a7365625e0f 3fc332c512cb3f26
+3fad8db55ead2296 3fd4992aa74f710f 3fe364517e805082 3fb278c96ebfb7b7
+3fe921a729204e4d 3fc3d6d337b1d73e 3fae8a408f33be36 3fb55c425a877d42
+3fd928f5938e1167 3fe0bffceae807a4 3fea4d531f8b7da9 3fc07540278f3f87
+3fa955cd690b2770 3fb4f772eeabc516 3fe0d8e95655b545 3fd9105097a9a42e
+3faa7ceb3e785cc6 3fd4b56376c2eb54 3fe3fd7f90b70489 3fb29196bfb13914
+3febe2cd8fe2dfca 3facaff9826f9129 3fb768297472c3ca 3fead063083a7a79
+3fb214be49b9686c 3fb29196bfb13914 3febe2cd8fe2dfca 3facaff9826f9129
+3fb0b9f31564c459 3fc2a6a2c7fdebd1 3fe93f18eb53ec81 3fb3171b2d8b7674
+3febd31f1f3800e9 3fac9fd7b1690480 3fe95a7365625e0f 3fc332c512cb3f26
+3fad8db55ead2296 3fea4d531f8b7da9 3fc07540278f3f87 3fa955cd690b2770
+3fb400cfb70288a5 3feb97fd56f742bf 3fae7e8b2286c2c0 3fb2ccb2b7192c2d
+3febdbdc55d6987f 3faca8d534641fb0 3fb3c23baf13c99b 3feb9f4e7786b623
+3fae86a1296d0a92 3fd6ccf21058f3f5 3fe18d70620c7845 3fb860b4ae386df9
+3fb75b1d658b99f2 3fe6488a19344dc1 3fcb3048e868fc06 3fe80aac6c006fd0
+3fc8d3bade6a83d3 3fac064dc64ef3c3 3fb29196bfb13914 3febe2cd8fe2dfca
+3facaff9826f9129 3faa7ceb3e785cc6 3fd4b56376c2eb54 3fe3fd7f90b70489
+3fe95a7365625e0f 3fc332c512cb3f26 3fad8db55ead2296 3fb55c425a877d42
+3fd928f5938e1167 3fe0bffceae807a4 3fcee603fa84a90e 3fe13a1365c5d408
+3fcc31ae6e6406d2 3fb6a54838158db5 3feb0c0da999ddb0 3fb0fa4a7b1b84d1
+3fcb8cadc04ebba1 3fe7165a33005cd1 3fb033d2e75fa23c 3fc3f7166bb6ae7a
+3fe8792625ebc684 3fb448a1f9346ee4 3fb400cfb70288a5 3feb97fd56f742bf
+3fae7e8b2286c2c0 3fb44f93413bdc31 3feb8ec7bc91d3d6 3fae745db46b0a3d
+3fdbc8bf50a9a36b 3fe0a5c4ac5341e4 3fa75dbab57ec667 3fe49a25dfd49b3d
+3fd2ad6f70ae4e00 3fb079133ea1ee1e 3fb7ee5f20fd9c57 3fe7776d8b160bb7
+3fc62b1a432902f7 3fbad1ef6adcceb7 3fe996a289530e03 3fb878fc4a8ac139
+3fe29f395c373dac 3fd7089d2c30e91d 3fadc780db04dc6d 3fb5bfda5283e9ea
+3feb26a5405f2843 3fb10afbaa82d3fd 3fe49a25dfd49b3d 3fd2ad6f70ae4e00
+3fb079133ea1ee1e 3fb0b9f31564c459 3fc2a6a2c7fdebd1 3fe93f18eb53ec81
+3fb95128cace578d 3fe9f29e7f2d65d0 3fb719e33bc679f2 3fb50201b2bed4d7
+3feb79ead3c29012 3fae5d4f5e595532 3fe921a729204e4d 3fc3d6d337b1d73e
+3fae8a408f33be36 3fbe8a4654413dc4 3fea5c975a56d86c 3fad21fdb20ffdab
+3fb50201b2bed4d7 3feb79ead3c29012 3fae5d4f5e595532 3fb3bfb6956b1333
+3febbf51a50bfcbc 3fac8b78846a0dd5 3fb8a0720bb0aece 3fe77eee1d88c047
+3fc5b40e8404a781 3fc25a70a5fb5e3c 3fe96ad6f80265a7 3fafe8cde7ec2c98
+3fb252de72e6fc15 3febea2b59b34322 3facb78d7efdd5be 3fbad1ef6adcceb7
+3fe996a289530e03 3fb878fc4a8ac139 3fc2f50cff7ea408 3fe6efaabec4619d
+3fc14c48056fd585 3fb3bfb6956b1333 3febbf51a50bfcbc 3fac8b78846a0dd5
+3fa9ddd74689d4e4 3fd5b961fb991bde 3fe385718dcad4c3 3fb5e67b033c6de2
+3fc86b91a8b73c6e 3fe7284c356aa328 3fd4c1fe92464c25 3fe29cf34b1acc46
+3fb8106b5e106d3d 3fb8dd31198fcab2 3fea8fd7f4f6df2b 3fb2a40f3eb93c01
+3fe95a7365625e0f 3fc332c512cb3f26 3fad8db55ead2296 3faa7ceb3e785cc6
+3fd4b56376c2eb54 3fe3fd7f90b70489 3fb50201b2bed4d7 3feb79ead3c29012
+3fae5d4f5e595532 3fb0b9f31564c459 3fc2a6a2c7fdebd1 3fe93f18eb53ec81
+3fe7a331299c2180 3fcbc20ba3f753a7 3fa6c4bed6609962 3fb67047d8f59d76
+3fe5687d4ad05fed 3fcf25e6e843b192 3fb3bfb6956b1333 3febbf51a50bfcbc
+3fac8b78846a0dd5 3fea4d531f8b7da9 3fc07540278f3f87 3fa955cd690b2770
+3fe95a7365625e0f 3fc332c512cb3f26 3fad8db55ead2296 3fdbc8bf50a9a36b
+3fe0a5c4ac5341e4 3fa75dbab57ec667 3fb400cfb70288a5 3feb97fd56f742bf
+3fae7e8b2286c2c0 3fb252de72e6fc15 3febea2b59b34322 3facb78d7efdd5be
+3fb390cdda9d56d4 3fe1dc1b375fdae8 3fd763961a98f47b 3fd75b53b0c2f43c
+3fe3180d8edaed5e 3fa3a4898c39883f 3fd03620915be285 3fe55a17962b3054
+3fb456c10936f355 3fb6093620172cac 3feb1e249110f652 3fb105a5576120c0
+3fe95a7365625e0f 3fc332c512cb3f26 3fad8db55ead2296 3fa8b9a2289bc723
+3fd796f61d8c3159 3fe2a8eaceb02ae1 3fb3c23baf13c99b 3feb9f4e7786b623
+3fae86a1296d0a92 3fc7e4960e68ddf8 3fe741ec65ea85df 3fb62770b3da1519
+3fe49a25dfd49b3d 3fd2ad6f70ae4e00 3fb079133ea1ee1e 3fa9ddd74689d4e4
+3fd5b961fb991bde 3fe385718dcad4c3 3fc0907ef234abca 3fd27869992c49b3
+3fe29fab76dcb033 3fea4d531f8b7da9 3fc07540278f3f87 3fa955cd690b2770
+3fb768297472c3ca 3fead063083a7a79 3fb214be49b9686c 3fb768297472c3ca
+3fead063083a7a79 3fb214be49b9686c 3fbe8a4654413dc4 3fea5c975a56d86c
+3fad21fdb20ffdab 3fe95a7365625e0f 3fc332c512cb3f26 3fad8db55ead2296
+3fd4c1fe92464c25 3fe29cf34b1acc46 3fb8106b5e106d3d 3fc7630ed8495bb4
+3fe892c34d961183 3fa9478fc57978f4 3fc25a70a5fb5e3c 3fe96ad6f80265a7
+3fafe8cde7ec2c98 3fd14bb19f9a1092 3fe5f10038bc67d5 3fa6926f7768fe21
+3fae89653c8bf6dc 3fcc2ec7ada8e50f 3fe70bb7c0cd074f 3fbb36c4233377fe
+3fcd0863fbf32606 3fe5570e7c9cc77e
+"""
+
+comptime _BAG_INTS = """
+8 15 0 13 1 2 1 16 5 6 1 19
+3 4 0 26 7 8 -1 -1 -1 -1 0 7
+9 10 0 9 13 14 2 23 11 12 -1 -1
+-1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+-1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+-1 -1 15 0 17 1 2 1 11 5 6 1
+15 3 4 0 23 11 12 0 23 9 10 0
+9 13 14 0 5 7 8 -1 -1 -1 -1 -1
+-1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+-1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+-1 -1 -1 15 0 8 1 2 1 21 5 6
+1 19 3 4 1 8 7 8 0 19 11 12
+-1 -1 -1 -1 -1 -1 -1 -1 0 18 13 14
+0 19 9 10 -1 -1 -1 -1 -1 -1 -1 -1
+-1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+-1 -1 -1 -1 15 0 13 1 2 1 12 5
+6 0 28 3 4 1 16 7 8 -1 -1 -1
+-1 0 5 11 12 0 3 9 10 -1 -1 -1
+-1 1 26 13 14 -1 -1 -1 -1 -1 -1 -1
+-1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+-1 -1 -1 -1 -1 15 0 17 1 2 1 14
+5 6 0 27 3 4 1 13 7 8 -1 -1
+-1 -1 1 4 9 10 2 28 11 12 -1 -1
+-1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+-1 -1 1 24 13 14 -1 -1 -1 -1 -1 -1
+-1 -1 -1 -1 -1 -1 15 0 6 1 2 1
+15 11 12 1 10 3 4 0 23 5 6 2
+22 7 8 -1 -1 -1 -1 -1 -1 -1 -1 0
+22 9 10 -1 -1 -1 -1 -1 -1 -1 -1 1
+24 13 14 -1 -1 -1 -1 -1 -1 -1 -1 -1
+-1 -1 -1 -1 -1 -1 -1 15 0 12 1 2
+2 23 5 6 1 9 3 4 3 7 9 10
+1 26 7 8 1 28 13 14 -1 -1 -1 -1
+3 18 11 12 -1 -1 -1 -1 -1 -1 -1 -1
+-1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+-1 -1 -1 -1 -1 -1 -1 -1 15 1 20 1
+2 0 2 5 6 0 19 3 4 -1 -1 -1
+-1 -1 -1 -1 -1 -1 -1 -1 -1 3 18 7
+8 1 9 9 10 -1 -1 -1 -1 2 11 13
+14 0 21 11 12 -1 -1 -1 -1 -1 -1 -1
+-1 -1 -1 -1 -1 -1 -1 -1 -1
+"""
+
+comptime _BAG_VALS = """
+3f83d5f2d2d94189 bfec3502435c00ea 3fe46351789c2996 3ff00f894808d47f
+bfb3e4199993ff51 bfd9eeaaeeda27e0 bff6c47564b24de7 3fe6afa2a2b845d7
+3ff87e00a0e1aa5d bfe63896e034228f bfb0fe0119a4a916 3fe10c64418f780f
+3ff1997f02c13169 bff949a44daa198c bfe6d2ff875a66a3 3f75d410ee45a502
+bfe25828e0a61033 3fe2aeb8733c73d2 3fee0a13e8cf57ff 3fc21f4dc75fe338
+3fb1f117928e0378 bfe993fcb2dab0cd bff30388fa2ebde4 bfe241b406635c33
+bfc0347db46e7dc6 3fe161abee99e4c0 3fe56cc94998e5e2 3ff2a848f9b61ddf
+bfcaa604262d9c69 3fd080f147fbf822 bfac8528c84e154b bfe701739b89ee29
+3fce92252d39b9fd 3fdac811171c7116 bfc53c1328b23f73 bfda643436fcd514
+bfef899c04b872c5 3fe3387d8798a055 3fce012f8ad260a9 bf9ccd35e7271202
+3fdaf7fee447307b bfd5f4b47602c28e 3fb73cf59c2aa7ab 3fdbd590ebcc311a
+3fe8b0b9d3e49d58 3f9373690da678c6 bfd5c71cbe0cff07 3fd0a053d765ebdd
+3fc2b3fc533ddc34 3fe657d2a885c217 bf8e6b8831a08e4a bfe03b19fa723140
+3fd3ded8bd8742f0 bfa9dbc200782abf bfea37abd233c7b7 bfd89a09b15162d9
+bfd0d753622361c4 3fc371cb089b499b 3fafd92922289ede bfd00dba07ec613a
+3f7ba16527157a3f bfcfc40c6b58f739 3fd1d859ab2cdd66 3fbefef8cee7adf3
+3fe29292dbf50e48 bf9a53f8184e5df0 bfda83e7b214b3c2 3fd3178ba6e73d74
+3f66fad5407fc3ae 3fccc84079026019 bfc18f353ab52ee2 bfde97f3aff7ed0f
+bfb4fedf190fb6aa bfd3e5ce8fbe444b bfe2cd188d411e75 3f313d2840e76348
+bfd51298e0e737ee 3fba4fafe2f6f540 3fd3d6f960d8ba0a bf87401da51728d9
+3fc5f96a79a500cf 3fe0d6d89693725f bfb0567b7948aafd 3fc4b779e60ddab7
+bfc34f0188828001 3fa371d41438920e bfc715cc4eb99fbb bfdb7fb0899938fb
+3fbd9937834b71bb bfc28c868629c615 3f5e2e28391c2bb0 bfc55f4fda93719e
+3fb8fe492294c161 3fd1cd0fc6de5a52 3f904b094577f4ff bfcc790c85289781
+3fb8ba67161704b2 3faf21a38f046ca7 bfc6e03032fd2f26 3fbade5a3afa092b
+3fd87252f309c999 bf6e7382abe7dc20 3fc5bfc276ca5004 bfc6087b2ca43640
+bfdbf685ea1bdceb 3f806de9189a07dc 3fb121f838c841cc bfb9365475595e2a
+bfc7b2e7a1b98e77 3f971388c8c5eaf4 bfc2bd0bcfdb357b 3fb765c4bcc51c22
+3fa49a33484da6ee 3fc67e62377618cc 3fbebc377b391bfa bfa19b9622302786
+bfbc5a79bf4a265d 3fb37224314a0842 3fa1dad7c917bf20 3fcaea5feb74d73d
+"""
+
+comptime _BAG_RAW = """
+40038503bc10ab8d 3fe2a54db457950c 3fda7e2351de6bb9 bfea0b279e27b061
+3ff338deb87b7758 bfa58e26cc43fbb5 3ffb794ae722c59b 3fd6b38963cd6fc2
+3ff7ce996d4925c5 3fe89a5e4e858d77 bff0e9172d0ea9e4 3fc9ba2a37b207a4
+3ffb5bfbe0c6b0e2 3ff841d42e4316dd 3ff2538714aff10f 3fba8a2d51966e25
+bfc002f8065360e6 3fd0015d014ce105 3fc244f615939a81 3fe3763f6b7ad9c3
+3fe2080411439abc bfb219a067012774 3ff6811bdaffb5e9 3ff44615c4c65418
+3ffba545275a6c42 3ff4255f83feaef7 3ff69ffd3583f5bc 3ff4fc896a12f195
+3ff2aa7e5603adca 3ffacdbb9468a9fa 3fe817123b5b0829 400081fb30bf293a
+4001758ad3e938c4 3fc93ae3696a58e1 3fd6beba94d78ae7 3fe2e520886c45fa
+4003727f82f04dc1 3fe9e4493a314e38 3ff65d4455c76b0b 3ff089fd849d73a4
+bfe284600ce01add bff0e9172d0ea9e4 3ffa0e2c7434b42a 3ffc22234f218286
+40021d8570843a71 4003727f82f04dc1 3ffb855d86453d6f 3fecb97dfe2c78b2
+bfec9f94b8bb44a0 bfef47704d8bdd1e 3feb178eb072a891 3fe0611f57a8a305
+4003071cb84781b6 40001bfd5a1d5eaa 3fe66825d9ff05d3 3ff2d0653c770753
+3ff43242e0e1d1ff 3fb82372a4e749a7 3ff6dbf0057d31fb 3fe03f8e1e06d644
+3fec50a8ddd3fe63 3feb709bcc30f79a bfe297ce871d1f1c 3ff6dbf0057d31fb
+3ffb6a54c2588a08 bfd319a713a30ae6 bfeb1aa49c4889a1 40012f4a916277fe
+3fc244f615939a81 3fdc5d37d9462c0f bfa58e26cc43fbb5 3ffc399ed4a9be28
+3fe84eb405ee16a3 3ff55007fc4df261 bfddbd8a5b7c1876 3fe2caa3b7c1c7e9
+4003de444c692ee5 bfca2df038993b93 3ff4062222bc2b24 3fecb97dfe2c78b2
+3fe9d05fe53e0810 3fda7e2351de6bb9 bfecb30332f848df bfef47704d8bdd1e
+4001e440df15449d 3fba2c04f0942ca9 3ff15f595645396c 40021d8570843a71
+bfa1e0fc90324d72 3ff55007fc4df261 4004733e9b326e00 40009ecdc9c140b7
+3ffe5e429e5875df 3ff732a0276f30d3 400239eccdffc7e0 4004887829c59b2c
+3fed0b93d738d4d6 bfd8a80e42592b20 400271d1c05f92ae bfe20942db908aad
+3fc93ae3696a58e1 3fecd62fa8b57a48 bfe6bfb076392eaf 3fd47aa5c109f4af
+bfe27f014416b468 3ffba545275a6c42 bfe23b4ed9583239 bfc253a35c8de8c8
+40007288950312a2 3fe817123b5b0829 3ff9300a931c160e 4000bb35273cce27
+3fe1864198e3c1f5 3ff65a9f72afbe1e 3fea7726bca54097 bfd8a80e42592b20
+4002d7b45b6d5cc9 3ff19efcc5279b85 3ff1ad97f633ed64 bfdef67908d2b772
+3fd015ffe5beef7f bfeda562a8da004c 3fc244f615939a81 3ffacdbb9468a9fa
+3fe9e4493a314e38 3ff15f595645396c 3ff890046eceef25 3fdc0fc9299502c4
+3fefd847a4e9aa4b 3ff43242e0e1d1ff 3fecb97dfe2c78b2 3ff51f0ecebfe96b
+3fe367a964e7656b bfe6bfb076392eaf 4004733e9b326e00 3fd0015d014ce105
+bfdfae4b5e8c37d5 3fbfe29e983a103b 3fefd847a4e9aa4b bfe284600ce01add
+4004733e9b326e00 3ff49a0c2cda7f0a 3ffc22234f218286 3fe6cf7ec8b3321e
+3f81410a3eb94b76 bfc002f8065360e6 3f8116ffeb84ad51 bfe27f014416b468
+bfc3cb0a6e6f634a bfeb1aa49c4889a1 400191f23164c633 3ffe5e429e5875df
+4000133a8aa1cc7a bfddbd8a5b7c1876 3fe1ee7a7f62d89a 4003b15095a3edfd
+3ffe14f957c4ba7f 3ff4e792467f7756 3faa2028bebb1a87 3ff1e46202809ebd
+3ffaacf62dad54ab 3fffb2aa59114e6b bfd7b2b991e69a4f 3ff089fd849d73a4
+3ff0c2cc3f948e83 3ff44615c4c65418 3ff089fd849d73a4 3fe9c1c9deaa93b8
+3ff29178784c06ad 3ff44615c4c65418 3fed2fca024111ad 3ffae9a99b73bacd
+3fd6b38963cd6fc2 bfec9f94b8bb44a0 3f81410a3eb94b76 3fe3763f6b7ad9c3
+bfa106f202a4a7d1 3ff83057c0360a87 3ffacdbb9468a9fa bfe6bfb076392eaf
+3ffa1c55487d372d 3fcea39717c59863 3ffb966bacff7c15 bfb4788ddb52be6f
+3fcea39717c59863 3fd749dc9dd1815d bfe71eedbf904228 3fba8a2d51966e25
+3ffa84724dd4ee9a 3ff7d1111435b944 bfe7d8a433222363 4000bb35273cce27
+4003de444c692ee5 bfdc566311679adc 3ff368f84e28bb82 3fd489411c40dd04
+3fd015ffe5beef7f 3fe9e4493a314e38 3ffa0794260dd856 bfec9f94b8bb44a0
+"""
+
+comptime _BAG_PRED = """
+40038503bc10ab8d 3fe2a54db457950c 3fda7e2351de6bb9 bfea0b279e27b061
+3ff338deb87b7758 bfa58e26cc43fbb5 3ffb794ae722c59b 3fd6b38963cd6fc2
+3ff7ce996d4925c5 3fe89a5e4e858d77 bff0e9172d0ea9e4 3fc9ba2a37b207a4
+3ffb5bfbe0c6b0e2 3ff841d42e4316dd 3ff2538714aff10f 3fba8a2d51966e25
+bfc002f8065360e6 3fd0015d014ce105 3fc244f615939a81 3fe3763f6b7ad9c3
+3fe2080411439abc bfb219a067012774 3ff6811bdaffb5e9 3ff44615c4c65418
+3ffba545275a6c42 3ff4255f83feaef7 3ff69ffd3583f5bc 3ff4fc896a12f195
+3ff2aa7e5603adca 3ffacdbb9468a9fa 3fe817123b5b0829 400081fb30bf293a
+4001758ad3e938c4 3fc93ae3696a58e1 3fd6beba94d78ae7 3fe2e520886c45fa
+4003727f82f04dc1 3fe9e4493a314e38 3ff65d4455c76b0b 3ff089fd849d73a4
+bfe284600ce01add bff0e9172d0ea9e4 3ffa0e2c7434b42a 3ffc22234f218286
+40021d8570843a71 4003727f82f04dc1 3ffb855d86453d6f 3fecb97dfe2c78b2
+bfec9f94b8bb44a0 bfef47704d8bdd1e 3feb178eb072a891 3fe0611f57a8a305
+4003071cb84781b6 40001bfd5a1d5eaa 3fe66825d9ff05d3 3ff2d0653c770753
+3ff43242e0e1d1ff 3fb82372a4e749a7 3ff6dbf0057d31fb 3fe03f8e1e06d644
+3fec50a8ddd3fe63 3feb709bcc30f79a bfe297ce871d1f1c 3ff6dbf0057d31fb
+3ffb6a54c2588a08 bfd319a713a30ae6 bfeb1aa49c4889a1 40012f4a916277fe
+3fc244f615939a81 3fdc5d37d9462c0f bfa58e26cc43fbb5 3ffc399ed4a9be28
+3fe84eb405ee16a3 3ff55007fc4df261 bfddbd8a5b7c1876 3fe2caa3b7c1c7e9
+4003de444c692ee5 bfca2df038993b93 3ff4062222bc2b24 3fecb97dfe2c78b2
+3fe9d05fe53e0810 3fda7e2351de6bb9 bfecb30332f848df bfef47704d8bdd1e
+4001e440df15449d 3fba2c04f0942ca9 3ff15f595645396c 40021d8570843a71
+bfa1e0fc90324d72 3ff55007fc4df261 4004733e9b326e00 40009ecdc9c140b7
+3ffe5e429e5875df 3ff732a0276f30d3 400239eccdffc7e0 4004887829c59b2c
+3fed0b93d738d4d6 bfd8a80e42592b20 400271d1c05f92ae bfe20942db908aad
+3fc93ae3696a58e1 3fecd62fa8b57a48 bfe6bfb076392eaf 3fd47aa5c109f4af
+bfe27f014416b468 3ffba545275a6c42 bfe23b4ed9583239 bfc253a35c8de8c8
+40007288950312a2 3fe817123b5b0829 3ff9300a931c160e 4000bb35273cce27
+3fe1864198e3c1f5 3ff65a9f72afbe1e 3fea7726bca54097 bfd8a80e42592b20
+4002d7b45b6d5cc9 3ff19efcc5279b85 3ff1ad97f633ed64 bfdef67908d2b772
+3fd015ffe5beef7f bfeda562a8da004c 3fc244f615939a81 3ffacdbb9468a9fa
+3fe9e4493a314e38 3ff15f595645396c 3ff890046eceef25 3fdc0fc9299502c4
+3fefd847a4e9aa4b 3ff43242e0e1d1ff 3fecb97dfe2c78b2 3ff51f0ecebfe96b
+3fe367a964e7656b bfe6bfb076392eaf 4004733e9b326e00 3fd0015d014ce105
+bfdfae4b5e8c37d5 3fbfe29e983a103b 3fefd847a4e9aa4b bfe284600ce01add
+4004733e9b326e00 3ff49a0c2cda7f0a 3ffc22234f218286 3fe6cf7ec8b3321e
+3f81410a3eb94b76 bfc002f8065360e6 3f8116ffeb84ad51 bfe27f014416b468
+bfc3cb0a6e6f634a bfeb1aa49c4889a1 400191f23164c633 3ffe5e429e5875df
+4000133a8aa1cc7a bfddbd8a5b7c1876 3fe1ee7a7f62d89a 4003b15095a3edfd
+3ffe14f957c4ba7f 3ff4e792467f7756 3faa2028bebb1a87 3ff1e46202809ebd
+3ffaacf62dad54ab 3fffb2aa59114e6b bfd7b2b991e69a4f 3ff089fd849d73a4
+3ff0c2cc3f948e83 3ff44615c4c65418 3ff089fd849d73a4 3fe9c1c9deaa93b8
+3ff29178784c06ad 3ff44615c4c65418 3fed2fca024111ad 3ffae9a99b73bacd
+3fd6b38963cd6fc2 bfec9f94b8bb44a0 3f81410a3eb94b76 3fe3763f6b7ad9c3
+bfa106f202a4a7d1 3ff83057c0360a87 3ffacdbb9468a9fa bfe6bfb076392eaf
+3ffa1c55487d372d 3fcea39717c59863 3ffb966bacff7c15 bfb4788ddb52be6f
+3fcea39717c59863 3fd749dc9dd1815d bfe71eedbf904228 3fba8a2d51966e25
+3ffa84724dd4ee9a 3ff7d1111435b944 bfe7d8a433222363 4000bb35273cce27
+4003de444c692ee5 bfdc566311679adc 3ff368f84e28bb82 3fd489411c40dd04
+3fd015ffe5beef7f 3fe9e4493a314e38 3ffa0794260dd856 bfec9f94b8bb44a0
+"""
+
+comptime _FFRAC_INTS = """
+8 15 1 24 1 2 1 4 3 4 1 30
+5 6 -1 -1 -1 -1 3 16 9 10 2 3
+7 8 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+-1 -1 7 13 11 12 3 22 13 14 -1 -1
+-1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+-1 -1 15 0 13 1 2 0 6 5 6 0
+21 3 4 9 27 7 8 0 26 9 10 -1
+-1 -1 -1 6 4 11 12 -1 -1 -1 -1 -1
+-1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+-1 -1 -1 9 18 13 14 -1 -1 -1 -1 -1
+-1 -1 -1 15 0 13 1 2 1 13 3 4
+1 18 5 6 -1 -1 -1 -1 0 8 9 10
+0 24 11 12 0 18 7 8 -1 -1 -1 -1
+3 10 13 14 -1 -1 -1 -1 -1 -1 -1 -1
+-1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+-1 -1 -1 -1 15 1 12 1 2 1 4 7
+8 1 25 3 4 2 12 5 6 1 29 9
+10 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+-1 -1 -1 -1 -1 10 24 11 12 -1 -1 -1
+-1 10 5 13 14 -1 -1 -1 -1 -1 -1 -1
+-1 -1 -1 -1 -1 15 0 13 1 2 0 4
+5 6 0 24 3 4 7 12 9 10 -1 -1
+-1 -1 -1 -1 -1 -1 2 12 7 8 -1 -1
+-1 -1 -1 -1 -1 -1 0 16 11 12 -1 -1
+-1 -1 -1 -1 -1 -1 7 7 13 14 -1 -1
+-1 -1 -1 -1 -1 -1 15 1 15 1 2 1
+1 7 8 1 27 3 4 3 26 5 6 -1
+-1 -1 -1 1 19 9 10 -1 -1 -1 -1 -1
+-1 -1 -1 9 19 11 12 -1 -1 -1 -1 -1
+-1 -1 -1 -1 -1 -1 -1 5 21 13 14 -1
+-1 -1 -1 -1 -1 -1 -1 15 1 12 1 2
+-1 -1 -1 -1 1 25 3 4 7 21 5 6
+6 17 9 10 7 8 7 8 -1 -1 -1 -1
+-1 -1 -1 -1 -1 -1 -1 -1 9 19 13 14
+7 19 11 12 -1 -1 -1 -1 -1 -1 -1 -1
+-1 -1 -1 -1 -1 -1 -1 -1 15 0 17 1
+2 0 4 3 4 0 26 5 6 -1 -1 -1
+-1 0 12 7 8 10 11 13 14 -1 -1 -1
+-1 8 18 9 10 -1 -1 -1 -1 -1 -1 -1
+-1 7 6 11 12 -1 -1 -1 -1 -1 -1 -1
+-1 -1 -1 -1 -1 -1 -1 -1 -1
+"""
+
+comptime _FFRAC_VALS = """
+bcb5a6d884752c94 3fd1ac4cb6227777 bfe97d6ea43b8ecf 3fee5c08a55ec0e1
+3fbeebce85938181 bfe43c700a7205d3 bff9edac7860dfbe bff75baf5d330ef5
+bfda7efe1f9790ea bfbe0988fa08ac5b 3fd42ab6c4965eff 3fceb90dacd21c4e
+bfdbd7b946b7ee3c 3fe51aea3bb941f6 3fb97a22fc1f3d8c bf683ab0071144c7
+bfe5f111a02fd18f 3fe71746be587ee6 3fdaa5f8f8f89089 3fefd49548e9c8e9
+bfedb6f2bbc39dbe bfd9e7b86def9c1b 3fdde5bc33223aa5 bf913fcfc0620040
+3fe895859e47df38 3ff273ceb0daae2b bfb0daecd870190f bfdc38bf567df691
+bfe18064086891a7 bfcdfc95aea42871 bf535763db8ac263 bfdf0bd09423c3c1
+3fe0655f81041ecb bfa85fafa46eac13 bfe8fb705b0dd816 3fe98b40738229ba
+3fc0677c1ab515ad bfd4cce6ba862bb0 3fd2d25de7e3faf2 bfee07a64348d440
+bfde3c1b702bed84 3fe44074dacd59fd 3ff107548a8513fc bf74a214b8499580
+3fdb89ccc08da317 bf3500901b013ae8 3fd4ce49f3acc61e bfcb5a990e6a255e
+bfaeaba0fbf518c2 bfdddb2f8aeaddc1 bfd011c4a2c382de 3fa8c22c367270f1
+3fe056bda86400d3 3fcc485cf4885e02 bfd7d95c7871f8ff bfe671c99a9bf340
+bfde7e569eb09693 bfc12540ee812789 bfc7766833161977 bfe3921a4fd5555a
+bf5e9bdfcba35ad3 bfd523b1d990528b 3fd6303e57f4e15e 3fcb73e2ee626f20
+3fe1e25ebd979b0b bfe0bb44fc9556d7 bfcb12f249200852 bfd634cf8d08828d
+bfb4e56785093aa1 3fb2089e6f140497 3fd3d5339889c416 bfc2a673101416c8
+3fc43108a39ce450 3fd27bf169870c55 bfadfd7ee0021b0c bf55618b945f89f3
+3fc9ba3ea6b75d21 bfc6424fb440d564 bfb931c01d61e42e bfd83d30be3c1ba1
+bfc2eb1d2afa3cd6 3fc3017d572d65af 3fdbc071190f56d6 3fc3bf89bdfc2906
+bf8e8e142325d0ac bfca7a389706375d 3fb6e8b4526bfa3d 3fcf9254cf358998
+3fc495ff784f8814 3fdefa4a726ece91 3f245328f5109555 3fc548fa9d1de359
+bfbbd9757b00fe11 bfa212f00961e725 bfcd5e02783b20e3 3f8ef6dc58f5c4a8
+bfc4bda973740989 bfbd00b59de5870e 3fb6f06a1f2e9177 bfc279f629eafe0a
+bfd5ef8380212940 bfdc0d0f479bc7e5 bfb00a9dbaa0c0cf bfa70787a883472c
+bfd2ce0c18b32350 bf533b7167d5be91 bfc678c3c7df4214 3fd1ab268b0ba16b
+bfd5be654e2e466b bfb95c2f6b1e0346 3fc850ca5e4c6933 3fdb13331208866b
+bfc242aa1573af4b 3f8aa9bed995b2ca bfc8324d14dc17f2 bfb2389e8d6689b0
+bfc7c3d46334469f 3f3752ab828f91e2 3fd2c6cb30b30b43 3fc2cc79e1695c77
+"""
+
+comptime _FFRAC_RAW = """
+3ff10604c1d270b6 bfdbf42442576630 3fb8cae8d3001266 3ffd5ed9c75223f5
+bfeaeff86b3ace7f bfcf4081ce8a3850 3feefeaf742baffa bfe5baf63014df1d
+3fddb2e5ee8d53ad 3fc995d5d977d59a bfd4a76e63333981 bfc4afbff7a802a7
+3ffb9d062f54865a bfd56010c08a7473 3ff3d443c9b2f365 3fd227bff8c226db
+bfe457e8e90b933a 3feb709848dc61ca 3fecc5a4bd8b7d83 3ffa85b216cdfcc8
+3fea129a65a6d137 3ffb39fd637decdb 3ff36c59dec9581c 3fee7d8e50bb652f
+3ff832b75a82deed bfed069f049f1f52 bfd15f73089d27f3 3ff9390b28c30d51
+3fe35360652e3028 3fd227bff8c226db 3fe65b975aceee69 3ffa53c95f680a32
+bfece9f87ad8bb19 3fef29359c7d7fe0 3ff224f58eab2355 3ffaf88ddc96531b
+3fdadd8ac458df82 3fd0c91a6017eb9c 3fd15a4a5584b3ed bfe8dc0f5c7f81aa
+3ffcf0afbade10d0 3ffb5b5a5b3e3b1f bfe18045afff4ee3 3ffe462168ebd344
+3fc9d8f2bc032c7a bff0b5de2d6f75f9 3ffb5b5a5b3e3b1f 3fd41eda2525bedb
+3ffb19a4fc4eb6af 3fe8832e5126b179 3fd0d41c3a4bbfb8 3fc59ae6f4fc4de2
+3fd0c91a6017eb9c 3ff5a52f9865c454 3ff8a0e3162ae6c8 3fd37bb3671b7e70
+3fc11bc4c1a37417 bfc7e1b4684aaa04 3fff1178161d8acf 3ff265d5a69cc0bf
+3fe6a11dcc3fa3cc 3fc995d5d977d59a 3fd42674b06f1b3b bfb3bb9017ec0ce2
+3ff088f70ba06d2c bfc09d5128e988f5 3fc9faacc48ed736 bfecd5e6219bcee7
+3ff7868cf53a0bb4 3ffcb8fbce734c13 3ffa904d30451287 3fb685b5c8047345
+3fecac1bd5893134 3fff1178161d8acf 3ff83a97a06d1f7b 3fd70e6521a8a3af
+3ff29bfa8c351824 3fd5568c5649033b 3ff9dc428511fec0 bfdfa38af5772d56
+bfd836f69b7b6064 3fd6d53f6a7424ba 3ff967efb2a01869 3ff3394071b443bd
+3fbf91170f55b7e3 3ff36c59dec9581c 4001bfcd5b314a21 3fee7d8e50bb652f
+3fddb4b32e35bcd4 3ffd0df8aa09a1f9 3fe7724aed5f8fd4 3ff9f6277bcbcc88
+3fe49cd3e91b924a 3fe16d5d968f770e 3ff0c09c36333034 bff1e99e00ce32b1
+3fe3d7c1f4c42fed 3fe31b9701110062 bfb4bfd926fe3be9 3ffbbfd06911c539
+3fbacd9e6485d9db 3ff1461f4b4f977f 3fbc894b35b40934 bfdbd7fb5b1e73ad
+3fe5450edb0ddbe3 3ff40ab8df66177d 3ff2658eab84655f 3fee452555119cfd
+bfde09d690e467a3 3fd0c91a6017eb9c 3ffc5110da879a21 3ff27ebc51e8223d
+bff1e99e00ce32b1 3fea2ff425239269 3fd0d8a613d11d92 3fc7ce964382056d
+3ff0370d2f54c944 3fee7d8e50bb652f 3ff215814c255526 3ff2bb60fe141e83
+3fe3cf78e771336d 3fe6a11dcc3fa3cc 3fe73e6d7d5af11e bfcf5ef57a9c72c2
+3fe91e1122f7ae2a 3fc6c65b6e678f0a 4001bfcd5b314a21 3ff166c23417dea8
+3fe7670c089cbb6a bfaf51818c0d728a 3fe4b3afe2582238 bff138175d498cc0
+3ffd0df8aa09a1f9 3fedf7c092c0d145 3fd9c0fe28ac3683 bfd15f73089d27f3
+3ff2a5a681c255f6 3fba1680acaccae9 4001bfcd5b314a21 3fef643d298577f1
+3ff2d0d2576133f9 3fe3169523e8c044 bfe76e8e63719d17 3ffd0f05b66ff03c
+bfc722fad1929bd9 3fe57e5566475b3d 3fe04b3de7b260b2 3fc15e190d3b2fee
+3fd68d4662f3c188 3fecb464e2dc2db4 3ff0e32ed1610b48 3ff45a96404633b0
+bfbf53df3916b002 bfcdb191a06aa880 3fe71d93fc1091ef 3ff8c8b8e08b3d25
+3ff5117f2c41c648 3fd0c91a6017eb9c 3fde72e674b870bc 3ff5d6d8719c4b75
+3fd1dde459cbc18c 3fc6b768a128e521 3fa18647d1392637 3fe277473990fb34
+3ff48575f6b656a9 3ffc73db1444d900 3fed775fab5243de bfe9a86c81a508b4
+3fee54975713358f 3ff967efb2a01869 3ff5c597c65dce68 3fbf91170f55b7e3
+3ffaf88ddc96531b bfd15f73089d27f3 3ffae7f6966fa156 3fe7fba8674236a3
+3ff113363f65c613 bfd71f42e1e2803f 3fe614a67f5816e2 bfd595a20e6f2ca1
+3ff951af290d9949 3ff6db281987bef9 3ff2a5a681c255f6 3ff3d78e329fcf41
+3fee9731c5d3c262 bfd50ed9bbbcef19 3fdd5b7799f5adf6 3ffd4b82da924e23
+bfd9f05fc858f254 3fb5bec4c63d1799 bfcd1b04866bd363 3ffd65a2103430c8
+3ff58a71f29851f1 3fdd8547a10e54e6 bff0045789ead007 3fead58f6b2554b8
+3ff68a6b3c5149a6 bfee40cdecc39368 bfd83292c052cdee bfd5a398a458e91c
+"""
+
+comptime _FFRAC_PRED = """
+3ff10604c1d270b6 bfdbf42442576630 3fb8cae8d3001266 3ffd5ed9c75223f5
+bfeaeff86b3ace7f bfcf4081ce8a3850 3feefeaf742baffa bfe5baf63014df1d
+3fddb2e5ee8d53ad 3fc995d5d977d59a bfd4a76e63333981 bfc4afbff7a802a7
+3ffb9d062f54865a bfd56010c08a7473 3ff3d443c9b2f365 3fd227bff8c226db
+bfe457e8e90b933a 3feb709848dc61ca 3fecc5a4bd8b7d83 3ffa85b216cdfcc8
+3fea129a65a6d137 3ffb39fd637decdb 3ff36c59dec9581c 3fee7d8e50bb652f
+3ff832b75a82deed bfed069f049f1f52 bfd15f73089d27f3 3ff9390b28c30d51
+3fe35360652e3028 3fd227bff8c226db 3fe65b975aceee69 3ffa53c95f680a32
+bfece9f87ad8bb19 3fef29359c7d7fe0 3ff224f58eab2355 3ffaf88ddc96531b
+3fdadd8ac458df82 3fd0c91a6017eb9c 3fd15a4a5584b3ed bfe8dc0f5c7f81aa
+3ffcf0afbade10d0 3ffb5b5a5b3e3b1f bfe18045afff4ee3 3ffe462168ebd344
+3fc9d8f2bc032c7a bff0b5de2d6f75f9 3ffb5b5a5b3e3b1f 3fd41eda2525bedb
+3ffb19a4fc4eb6af 3fe8832e5126b179 3fd0d41c3a4bbfb8 3fc59ae6f4fc4de2
+3fd0c91a6017eb9c 3ff5a52f9865c454 3ff8a0e3162ae6c8 3fd37bb3671b7e70
+3fc11bc4c1a37417 bfc7e1b4684aaa04 3fff1178161d8acf 3ff265d5a69cc0bf
+3fe6a11dcc3fa3cc 3fc995d5d977d59a 3fd42674b06f1b3b bfb3bb9017ec0ce2
+3ff088f70ba06d2c bfc09d5128e988f5 3fc9faacc48ed736 bfecd5e6219bcee7
+3ff7868cf53a0bb4 3ffcb8fbce734c13 3ffa904d30451287 3fb685b5c8047345
+3fecac1bd5893134 3fff1178161d8acf 3ff83a97a06d1f7b 3fd70e6521a8a3af
+3ff29bfa8c351824 3fd5568c5649033b 3ff9dc428511fec0 bfdfa38af5772d56
+bfd836f69b7b6064 3fd6d53f6a7424ba 3ff967efb2a01869 3ff3394071b443bd
+3fbf91170f55b7e3 3ff36c59dec9581c 4001bfcd5b314a21 3fee7d8e50bb652f
+3fddb4b32e35bcd4 3ffd0df8aa09a1f9 3fe7724aed5f8fd4 3ff9f6277bcbcc88
+3fe49cd3e91b924a 3fe16d5d968f770e 3ff0c09c36333034 bff1e99e00ce32b1
+3fe3d7c1f4c42fed 3fe31b9701110062 bfb4bfd926fe3be9 3ffbbfd06911c539
+3fbacd9e6485d9db 3ff1461f4b4f977f 3fbc894b35b40934 bfdbd7fb5b1e73ad
+3fe5450edb0ddbe3 3ff40ab8df66177d 3ff2658eab84655f 3fee452555119cfd
+bfde09d690e467a3 3fd0c91a6017eb9c 3ffc5110da879a21 3ff27ebc51e8223d
+bff1e99e00ce32b1 3fea2ff425239269 3fd0d8a613d11d92 3fc7ce964382056d
+3ff0370d2f54c944 3fee7d8e50bb652f 3ff215814c255526 3ff2bb60fe141e83
+3fe3cf78e771336d 3fe6a11dcc3fa3cc 3fe73e6d7d5af11e bfcf5ef57a9c72c2
+3fe91e1122f7ae2a 3fc6c65b6e678f0a 4001bfcd5b314a21 3ff166c23417dea8
+3fe7670c089cbb6a bfaf51818c0d728a 3fe4b3afe2582238 bff138175d498cc0
+3ffd0df8aa09a1f9 3fedf7c092c0d145 3fd9c0fe28ac3683 bfd15f73089d27f3
+3ff2a5a681c255f6 3fba1680acaccae9 4001bfcd5b314a21 3fef643d298577f1
+3ff2d0d2576133f9 3fe3169523e8c044 bfe76e8e63719d17 3ffd0f05b66ff03c
+bfc722fad1929bd9 3fe57e5566475b3d 3fe04b3de7b260b2 3fc15e190d3b2fee
+3fd68d4662f3c188 3fecb464e2dc2db4 3ff0e32ed1610b48 3ff45a96404633b0
+bfbf53df3916b002 bfcdb191a06aa880 3fe71d93fc1091ef 3ff8c8b8e08b3d25
+3ff5117f2c41c648 3fd0c91a6017eb9c 3fde72e674b870bc 3ff5d6d8719c4b75
+3fd1dde459cbc18c 3fc6b768a128e521 3fa18647d1392637 3fe277473990fb34
+3ff48575f6b656a9 3ffc73db1444d900 3fed775fab5243de bfe9a86c81a508b4
+3fee54975713358f 3ff967efb2a01869 3ff5c597c65dce68 3fbf91170f55b7e3
+3ffaf88ddc96531b bfd15f73089d27f3 3ffae7f6966fa156 3fe7fba8674236a3
+3ff113363f65c613 bfd71f42e1e2803f 3fe614a67f5816e2 bfd595a20e6f2ca1
+3ff951af290d9949 3ff6db281987bef9 3ff2a5a681c255f6 3ff3d78e329fcf41
+3fee9731c5d3c262 bfd50ed9bbbcef19 3fdd5b7799f5adf6 3ffd4b82da924e23
+bfd9f05fc858f254 3fb5bec4c63d1799 bfcd1b04866bd363 3ffd65a2103430c8
+3ff58a71f29851f1 3fdd8547a10e54e6 bff0045789ead007 3fead58f6b2554b8
+3ff68a6b3c5149a6 bfee40cdecc39368 bfd83292c052cdee bfd5a398a458e91c
+"""
+
+comptime _MISSCAT_INTS = """
+8 15 2 -1 1 2 0 5 5 6 0 22
+3 4 4 23 7 8 2 -1 13 14 -1 -1
+-1 -1 4 1 11 12 3 25 9 10 -1 -1
+-1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+-1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+-1 -1 15 2 -1 1 2 0 24 7 8 2
+-1 3 4 0 8 9 10 0 17 5 6 1
+14 13 14 -1 -1 -1 -1 0 11 11 12 -1
+-1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+-1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+-1 -1 -1 15 2 -1 1 2 0 29 7 8
+2 -1 3 4 0 17 9 10 0 11 5 6
+-1 -1 -1 -1 -1 -1 -1 -1 1 17 11 12
+-1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+0 8 13 14 -1 -1 -1 -1 -1 -1 -1 -1
+-1 -1 -1 -1 15 2 -1 1 2 0 25 7
+8 2 -1 3 4 0 14 11 12 0 18 5
+6 1 16 13 14 1 5 9 10 -1 -1 -1
+-1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+-1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+-1 -1 -1 -1 -1 15 2 -1 1 2 0 8
+9 10 2 -1 3 4 0 22 13 14 0 18
+5 6 0 5 11 12 1 12 7 8 -1 -1
+-1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+-1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+-1 -1 -1 -1 -1 -1 15 2 -1 1 2 0
+23 5 6 2 -1 3 4 -1 -1 -1 -1 0
+5 9 10 2 -1 7 8 1 18 13 14 -1
+-1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 1
+16 11 12 -1 -1 -1 -1 -1 -1 -1 -1 -1
+-1 -1 -1 -1 -1 -1 -1 15 2 -1 1 2
+1 18 5 6 2 -1 3 4 1 16 7 8
+1 24 9 10 0 20 11 12 -1 -1 -1 -1
+-1 -1 -1 -1 -1 -1 -1 -1 0 10 13 14
+-1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+-1 -1 -1 -1 -1 -1 -1 -1 15 2 -1 1
+2 1 14 5 6 0 9 3 4 1 16 7
+8 1 21 9 10 0 18 11 12 0 23 13
+14 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+-1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
+-1 -1 -1 -1 -1 -1 -1 -1 -1
+"""
+
+comptime _MISSCAT_VALS = """
+3ce2f1fd73e68701 3ff49bd3fd6af5f6 bff49bd3fd6af5e2 bff9917fe3813eaa
+bfd54641c296d4f1 3fd21c82b5a59bda 3ff7cf2bb32a057b bff4f4a00571e3e8
+c001584477898ce7 bff7d4f97e2ab9c6 bfd8d0e62d4b4d30 3fdc79a3510ecc3d
+3ff8c687b81a93c6 3fd3d36e9a446aef bfecf5b06a074086 bf6ce80bb1778a08
+bff66e0d796064d0 3fe4a3dbe8d336d1 3ff49ddedb8bb545 3f579c9ac22ab075
+bfd6a91c066ea44f 3fd77e1434d190aa bff936f430163907 bfe085cd65ea90ed
+3fe5441045807f31 3ff832a60c97bcdf bffdab836382b515 bff42d543579d615
+bfe25d17781a677e bfc0487d0de0e67a bf750da4bbb31c38 bfeff25572a39e51
+3fdd270ae5f1be6a bf3bb2e67cd4accd 3fed2a8e1b49ebed 3fe14a41ef9de2c1
+3ff231d28fafb637 bff1413b85041963 bfa6b523980a5770 bfd03c7f324ba05e
+3fd0a5678d49e2d8 bff4461220a795bb bfe8ad239d85ca56 bffae0bff26f1490
+bfee4c8b33594de3 bf797c966867e075 bfe6e1039e2b3919 3fd4a41af279e69d
+3fee6ef50bb27005 3fb2fc797c5faff5 bfc40c7b6c8d544f 3fd453311b03a5db
+bfe9969b84a40151 bfc6c2326b073258 bfc7115407e6dee3 3fd9e8cd7bb29fdd
+3fe634271681a2a3 3ff2921b6026c24e bfd1ebc70f0e0d67 3fa3e32e0a706c7a
+bf6928d924bbdb76 bfeced4caa0db9ba 3fc483a173e0fb76 3fe5c288cec36c42
+3f7b4792dd667ed4 bfc4ba286b8d34a7 3fcc4512be8d4b98 bf6336491c9879cd
+3fd4ec8db5a4cd06 bff353173a7e2778 bfe674f7500a0133 bfd3eecf9eee1c35
+bfb2432f32985814 3fe20aaa4daa3e56 3ff0131f8f9070fd bf667e6621db2eb0
+3fd09d6cf9f2a62f bfd0f6f48b629772 bfe4d7184d2d2dba bfb7bcc412c210eb
+3fc434fae7367028 3fe0376ae85ec4bc bfa141cfcf8dfe42 3fd9e13a47c763a3
+bfd6ab5e475a66bc bf96d1fc1a922604 bfc33a6fe9717dc4 3fbd96ed38ffac72
+3fd78033c2689857 3fea789c5f07b7b0 bf52a742d83bfcc7 3fd163287909d16f
+bfc242e02e9b9e06 bfdd94648e92b484 bfa719670e43c81d 3fc5f5b6f459e554
+3fe0d5e64c04a922 bfe5ca97adb3a3c5 bfd27117dff989ca bfb7c40f198423ad
+3fc2a44d302bec8a 3fb18b8d7be39fb9 3fd4fb10ac645e1a bfcc700c1a755c0b
+bf9ea96d73b9b1d3 bf50cd574061fc75 3fc8db0b96d6fc3d bfba2fd4029276c7
+bfd04b1c1abd6b51 bfa16f611f69f4c2 3fa89a902f034adf 3fd2bd6277a5c82a
+bfd979fef3c7581f bfbcd160f3c66b29 bfb49bab3c9e390d 3fbc5df8c3f662a8
+bfb51cc2400cb7bc 3fc8ce308616afc3 3fcb75f84028eaf6 3fddb39a1dedf0dc
+"""
+
+comptime _MISSCAT_RAW = """
+400a1f1874411237 400eb57f27a599e2 bfef3e76c0963a3b 4007f6792217a279
+401073140c305d65 3ffa5690b307748a bfd2fcb75965f039 400a1f1874411237
+4010200b367c1dba 3fca07761b685efa 4002dcc86e1849e2 400f09d6b5582b99
+400f09d6b5582b99 3fef42f9c0d87076 400d755f7978872d 40065f1a85a59bc4
+3fda0b33fb97d5ed 400ea8c035c20f2c 4000e1d735251e67 400d411f497868ff
+3ff494c4835e1aae 3feb133a8f3f5940 40065b8748991956 4003ca68861b00d3
+bfc05c6a6d8d742b 40113d4faa202f9b 400211a37dfdc04b 3fe142aa5b30abee
+bfadd399ed907b83 40091b4a98aae014 400007b4a41a0303 400a1f1874411237
+400a1f1874411237 3fe51577c8558130 400fcea1802fd112 400d755f7978872d
+3fb4c54454f36e7b 4010200b367c1dba 40003a9eae8d94e9 400b0ead1ab4516a
+3ff494c4835e1aae 3ffab250b634ab13 bfc882995e56ba80 bfef3e76c0963a3b
+3fb72cb71a0e0b2d 3fca07761b685efa 4000e1d735251e67 3feea7ca1ca476b3
+400f09d6b5582b99 400198527bbf9aef 3ff76548602759c6 bfc05c6a6d8d742b
+40034857f9bc7ebb bfba7b8c306400bf bfd535ae24aa6085 3fcbea6fd9767264
+3fe269431117f386 bfef3e76c0963a3b bfba7b8c306400bf 3fb9a257872a9901
+40086c7b95e5f182 3fcbea6fd9767264 3fda0b33fb97d5ed 400c27fcf0ee31cf
+bfef3e76c0963a3b 3ff381272a489eb8 40030018bd02adb4 400a9d8989c7e0f2
+40113d4faa202f9b 3fe842cea510fe04 bfe8bb6705d8e7c4 3ffbe8a614f8612f
+400f480eb57616ce 3fe89b23f2a75009 400c5f8fae865ecd 3fe61aac8750c20b
+400fcea1802fd112 3fed1bbf0ead788c 4001aeb9fa529407 400007b4a41a0303
+40021a9aae7f3cad bfc4966b7eaeb154 400c04fe04f7b4b8 4005f943c373894c
+400d755f7978872d 400c27fcf0ee31cf 4000e1d735251e67 400b7181aa53b547
+400687c4e4e91e8c 4006706d284808ee 400ce035e7823934 3ff1b5fc5a392df6
+3ff9281e75504133 3ffba16dc7c7c740 3fc9b60ff0376829 3fda0b33fb97d5ed
+bfdec4113a4f22e3 3ff48a09c28a7393 4008acf468b21f01 40035252c48014f2
+3ff381272a489eb8 3fb4c54454f36e7b 4004afcc74ec5281 3fe61aac8750c20b
+3fc882568daa19d0 3ff1c9ad95a766f6 3fc882568daa19d0 400007b4a41a0303
+3fef42f9c0d87076 3fc882568daa19d0 4003be3378acbd98 3ff5193409bcaa90
+bf846c2bd1868b83 4000e1d735251e67 40071595cc40184c 3ff5193409bcaa90
+4003755ce8e6dfef 3ff6579a9887021b 40065b8748991956 4006706d284808ee
+3fca07761b685efa 4005a61d5f2fb5cf 3fb4c54454f36e7b 400007b4a41a0303
+40082eb824ca4f7c 3ff3e835c459c772 40071595cc40184c 400eafd386a6ecec
+400eb57f27a599e2 4005a61d5f2fb5cf 400d411f497868ff 400dff03e10b1d5a
+400b7181aa53b547 3ff88e2070acaa76 bfc4966b7eaeb154 3fdfee0e09656ed1
+3fb374e971762065 3ff5451db6aeab0b 400fcea1802fd112 3ffdd9818c433469
+3ffec5b6b04fef6e 3ff494c4835e1aae 4004afcc74ec5281 4003755ce8e6dfef
+400f09d6b5582b99 4003be3378acbd98 bfc0547d230c3cab bf846c2bd1868b83
+3ff710287df88441 bfc05c6a6d8d742b 3fe142aa5b30abee 400f480eb57616ce
+4001303873694c95 4010200b367c1dba 400b466d55fc279d 400c04fe04f7b4b8
+bfe8baba49a46703 bfe8baba49a46703 400be5bbd5b02f3f 3ffec5b6b04fef6e
+bfef3e76c0963a3b 40023978e86229e8 3fe61aac8750c20b 40102b7688fc4b23
+400ccf4dce1007d7 400007b4a41a0303 bfb3ee8aef66622f 400ce035e7823934
+40057a1c3e04a5a0 bfc4966b7eaeb154 4005a61d5f2fb5cf 4006706d284808ee
+4001a5c2c9d117a5 3ff4eb500facfd60 4009689d2da695af 401073140c305d65
+bfcb55b498dfb598 3fdf2de020bddda7 3ffa24af889254dc 3ff9281e75504133
+4007f6792217a279 400fcea1802fd112 3fe269431117f386 3ffa24af889254dc
+4009689d2da695af 3ffbe8a614f8612f 3ffec5b6b04fef6e 4001392fa3eac8f7
+3fda0b33fb97d5ed 40028f570ca97361 400f480eb57616ce bfdec4113a4f22e3
+400be5bbd5b02f3f 3fea71e45a5cd802 4006706d284808ee 3ff4eb500facfd60
+40023978e86229e8 4003be3378acbd98 bfe8baba49a46703 3ffdd9818c433469
+"""
+
+comptime _MISSCAT_PRED = """
+400a1f1874411237 400eb57f27a599e2 bfef3e76c0963a3b 4007f6792217a279
+401073140c305d65 3ffa5690b307748a bfd2fcb75965f039 400a1f1874411237
+4010200b367c1dba 3fca07761b685efa 4002dcc86e1849e2 400f09d6b5582b99
+400f09d6b5582b99 3fef42f9c0d87076 400d755f7978872d 40065f1a85a59bc4
+3fda0b33fb97d5ed 400ea8c035c20f2c 4000e1d735251e67 400d411f497868ff
+3ff494c4835e1aae 3feb133a8f3f5940 40065b8748991956 4003ca68861b00d3
+bfc05c6a6d8d742b 40113d4faa202f9b 400211a37dfdc04b 3fe142aa5b30abee
+bfadd399ed907b83 40091b4a98aae014 400007b4a41a0303 400a1f1874411237
+400a1f1874411237 3fe51577c8558130 400fcea1802fd112 400d755f7978872d
+3fb4c54454f36e7b 4010200b367c1dba 40003a9eae8d94e9 400b0ead1ab4516a
+3ff494c4835e1aae 3ffab250b634ab13 bfc882995e56ba80 bfef3e76c0963a3b
+3fb72cb71a0e0b2d 3fca07761b685efa 4000e1d735251e67 3feea7ca1ca476b3
+400f09d6b5582b99 400198527bbf9aef 3ff76548602759c6 bfc05c6a6d8d742b
+40034857f9bc7ebb bfba7b8c306400bf bfd535ae24aa6085 3fcbea6fd9767264
+3fe269431117f386 bfef3e76c0963a3b bfba7b8c306400bf 3fb9a257872a9901
+40086c7b95e5f182 3fcbea6fd9767264 3fda0b33fb97d5ed 400c27fcf0ee31cf
+bfef3e76c0963a3b 3ff381272a489eb8 40030018bd02adb4 400a9d8989c7e0f2
+40113d4faa202f9b 3fe842cea510fe04 bfe8bb6705d8e7c4 3ffbe8a614f8612f
+400f480eb57616ce 3fe89b23f2a75009 400c5f8fae865ecd 3fe61aac8750c20b
+400fcea1802fd112 3fed1bbf0ead788c 4001aeb9fa529407 400007b4a41a0303
+40021a9aae7f3cad bfc4966b7eaeb154 400c04fe04f7b4b8 4005f943c373894c
+400d755f7978872d 400c27fcf0ee31cf 4000e1d735251e67 400b7181aa53b547
+400687c4e4e91e8c 4006706d284808ee 400ce035e7823934 3ff1b5fc5a392df6
+3ff9281e75504133 3ffba16dc7c7c740 3fc9b60ff0376829 3fda0b33fb97d5ed
+bfdec4113a4f22e3 3ff48a09c28a7393 4008acf468b21f01 40035252c48014f2
+3ff381272a489eb8 3fb4c54454f36e7b 4004afcc74ec5281 3fe61aac8750c20b
+3fc882568daa19d0 3ff1c9ad95a766f6 3fc882568daa19d0 400007b4a41a0303
+3fef42f9c0d87076 3fc882568daa19d0 4003be3378acbd98 3ff5193409bcaa90
+bf846c2bd1868b83 4000e1d735251e67 40071595cc40184c 3ff5193409bcaa90
+4003755ce8e6dfef 3ff6579a9887021b 40065b8748991956 4006706d284808ee
+3fca07761b685efa 4005a61d5f2fb5cf 3fb4c54454f36e7b 400007b4a41a0303
+40082eb824ca4f7c 3ff3e835c459c772 40071595cc40184c 400eafd386a6ecec
+400eb57f27a599e2 4005a61d5f2fb5cf 400d411f497868ff 400dff03e10b1d5a
+400b7181aa53b547 3ff88e2070acaa76 bfc4966b7eaeb154 3fdfee0e09656ed1
+3fb374e971762065 3ff5451db6aeab0b 400fcea1802fd112 3ffdd9818c433469
+3ffec5b6b04fef6e 3ff494c4835e1aae 4004afcc74ec5281 4003755ce8e6dfef
+400f09d6b5582b99 4003be3378acbd98 bfc0547d230c3cab bf846c2bd1868b83
+3ff710287df88441 bfc05c6a6d8d742b 3fe142aa5b30abee 400f480eb57616ce
+4001303873694c95 4010200b367c1dba 400b466d55fc279d 400c04fe04f7b4b8
+bfe8baba49a46703 bfe8baba49a46703 400be5bbd5b02f3f 3ffec5b6b04fef6e
+bfef3e76c0963a3b 40023978e86229e8 3fe61aac8750c20b 40102b7688fc4b23
+400ccf4dce1007d7 400007b4a41a0303 bfb3ee8aef66622f 400ce035e7823934
+40057a1c3e04a5a0 bfc4966b7eaeb154 4005a61d5f2fb5cf 4006706d284808ee
+4001a5c2c9d117a5 3ff4eb500facfd60 4009689d2da695af 401073140c305d65
+bfcb55b498dfb598 3fdf2de020bddda7 3ffa24af889254dc 3ff9281e75504133
+4007f6792217a279 400fcea1802fd112 3fe269431117f386 3ffa24af889254dc
+4009689d2da695af 3ffbe8a614f8612f 3ffec5b6b04fef6e 4001392fa3eac8f7
+3fda0b33fb97d5ed 40028f570ca97361 400f480eb57616ce bfdec4113a4f22e3
+400be5bbd5b02f3f 3fea71e45a5cd802 4006706d284808ee 3ff4eb500facfd60
+40023978e86229e8 4003be3378acbd98 bfe8baba49a46703 3ffdd9818c433469
+"""
+
+# --- GOLDEN END ---
+
+
+# --------------------------------------------------------------------------
+# Bits
+# --------------------------------------------------------------------------
+
+
+def _bits(v: Float64) -> UInt64:
+    """The IEEE-754 bit pattern, which is what is compared. `==` on Float64
+    would call +0.0 and -0.0 equal and would say nothing about a NaN
+    payload; the claim under test is that the same double arrives, so the
+    bits are the comparison."""
+    return v.to_bits().cast[DType.uint64]()
+
+
+def _f64(u: UInt64) -> Float64:
+    return bitcast[DType.float64, 1](SIMD[DType.uint64, 1](u))
+
+
+def _order_key_bits(u: UInt64) -> UInt64:
+    """`binning.order_key` applied to a bit pattern rather than a value, so
+    a mismatch can be reported in ulps without routing a possible NaN
+    through a Float64."""
+    if (u >> 63) != 0:
+        return u ^ 0xFFFF_FFFF_FFFF_FFFF
+    return u | 0x8000_0000_0000_0000
+
+
+def _ulps(a: UInt64, b: UInt64) -> UInt64:
+    """Representable doubles between two patterns. 1 is the smallest
+    non-zero distance a moved multiply can produce, and it is the distance
+    both of this round's FMA findings produced."""
+    var ka = _order_key_bits(a)
+    var kb = _order_key_bits(b)
+    return ka - kb if ka >= kb else kb - ka
+
+
+def _hex16(u: UInt64) -> String:
+    var out = String("")
+    for i in range(16):
+        var d = Int((u >> UInt64((15 - i) * 4)) & 0xF)
+        out += chr(48 + d) if d < 10 else chr(87 + d)
+    return out^
+
+
+# --------------------------------------------------------------------------
+# Parsing the checked-in literals
+# --------------------------------------------------------------------------
+
+
+def _parse_hex(text: String) -> List[UInt64]:
+    """Whitespace-separated 16-digit hex words. Anything that is not a hex
+    digit is a separator, so newlines and indentation carry no meaning."""
+    var out = List[UInt64]()
+    var b = text.as_bytes()
+    var acc = UInt64(0)
+    var have = False
+    for i in range(len(b)):
+        var c = Int(b[i])
+        var d = -1
+        if c >= 48 and c <= 57:
+            d = c - 48
+        elif c >= 97 and c <= 102:
+            d = c - 87
+        elif c >= 65 and c <= 70:
+            d = c - 55
+        if d >= 0:
+            acc = acc * 16 + UInt64(d)
+            have = True
+        else:
+            if have:
+                out.append(acc)
+            acc = 0
+            have = False
+    if have:
+        out.append(acc)
+    return out^
+
+
+def _parse_ints(text: String) -> List[Int]:
+    """Whitespace-separated signed decimals."""
+    var out = List[Int]()
+    var b = text.as_bytes()
+    var acc = 0
+    var have = False
+    var neg = False
+    for i in range(len(b)):
+        var c = Int(b[i])
+        if c >= 48 and c <= 57:
+            acc = acc * 10 + (c - 48)
+            have = True
+        elif c == 45 and not have:
+            neg = True
+        else:
+            if have:
+                out.append(-acc if neg else acc)
+            acc = 0
+            have = False
+            neg = False
+    if have:
+        out.append(-acc if neg else acc)
+    return out^
+
+
+# --------------------------------------------------------------------------
+# One fixture's recorded state
+# --------------------------------------------------------------------------
+
+
+@fieldwise_init
+struct _Record(Movable):
+    """Everything a fixture pins.
+
+    `ints` is a flat stream: the tree count, then per tree the node count
+    followed by (feature, threshold_bin, left, right) per node. Flat because
+    a golden file is read as a diff, and one stream of integers diffs
+    legibly while four parallel arrays per tree do not.
+    """
+
+    var name: String
+    var ints: List[Int]
+    var vals: List[UInt64]
+    var raw: List[UInt64]
+    var pred: List[UInt64]
+
+
+def _record_trees(
+    trees: List[Tree], mut ints: List[Int], mut vals: List[UInt64]
+):
+    ints.append(len(trees))
+    for t in range(len(trees)):
+        var n_nodes = len(trees[t].feature)
+        ints.append(n_nodes)
+        for i in range(n_nodes):
+            ints.append(trees[t].feature[i])
+            ints.append(trees[t].threshold_bin[i])
+            ints.append(trees[t].left[i])
+            ints.append(trees[t].right[i])
+            vals.append(_bits(trees[t].value[i]))
+
+
+def _record(var name: String, b: Booster, data: BinnedMatrix) -> _Record:
+    var ints = List[Int]()
+    var vals = List[UInt64]()
+    _record_trees(b.trees, ints, vals)
+    var raw = List[UInt64](capacity=data.n_rows)
+    var pred = List[UInt64](capacity=data.n_rows)
+    for r in range(data.n_rows):
+        raw.append(_bits(b.predict_raw_row(data, r)))
+        pred.append(_bits(b.predict_row(data, r)))
+    return _Record(name^, ints^, vals^, raw^, pred^)
+
+
+def _record_multiclass(
+    var name: String, b: MulticlassBooster, data: BinnedMatrix
+) -> _Record:
+    var ints = List[Int]()
+    var vals = List[UInt64]()
+    _record_trees(b.trees, ints, vals)
+    var k = b.n_classes
+    var raw = List[UInt64](capacity=data.n_rows * k)
+    var pred = List[UInt64](capacity=data.n_rows * k)
+    var bins = List[Int](capacity=data.n_features)
+    for r in range(data.n_rows):
+        bins.clear()
+        for f in range(data.n_features):
+            bins.append(Int(data.bins[f * data.n_rows + r]))
+        var row_raw = b.predict_raw_bins(bins)
+        var row_pred = b.predict_proba_bins(bins)
+        for c in range(k):
+            raw.append(_bits(row_raw[c]))
+            pred.append(_bits(row_pred[c]))
+    return _Record(name^, ints^, vals^, raw^, pred^)
+
+
+# --------------------------------------------------------------------------
+# Comparison
+# --------------------------------------------------------------------------
+
+
+def _check_length(
+    fixture: String, array: String, got: Int, want: Int
+) raises:
+    if got != want:
+        raise Error(
+            "golden shape changed in fixture '",
+            fixture,
+            "', array '",
+            array,
+            "': the run produced ",
+            got,
+            " entries, the checked-in golden holds ",
+            want,
+            ". A length change is a structural change (a different number of",
+            " trees, nodes, or rows), not a rounding change.",
+        )
+
+
+def _check_ints(fixture: String, got: List[Int], want_text: String) raises:
+    var want = _parse_ints(want_text)
+    _check_length(fixture, "tree_structure", len(got), len(want))
+    for i in range(len(got)):
+        if got[i] != want[i]:
+            raise Error(
+                "golden mismatch in fixture '",
+                fixture,
+                "', array 'tree_structure' (flat stream of tree count, then",
+                " per tree the node count and (feature, threshold_bin,",
+                " left, right) per node), index ",
+                i,
+                ": expected ",
+                want[i],
+                ", got ",
+                got[i],
+                ". Tree structure moved, so this is not a rounding",
+                " difference: a split was chosen differently.",
+            )
+
+
+def _check_bits(
+    fixture: String, array: String, got: List[UInt64], want_text: String
+) raises:
+    var want = _parse_hex(want_text)
+    _check_length(fixture, array, len(got), len(want))
+    for i in range(len(got)):
+        if got[i] != want[i]:
+            raise Error(
+                "golden mismatch in fixture '",
+                fixture,
+                "', array '",
+                array,
+                "', index ",
+                i,
+                ": expected bits 0x",
+                _hex16(want[i]),
+                " (",
+                _f64(want[i]),
+                "), got bits 0x",
+                _hex16(got[i]),
+                " (",
+                _f64(got[i]),
+                "), ulp distance ",
+                _ulps(want[i], got[i]),
+                ". Do NOT regenerate the golden values to clear this; see",
+                " this file's docstring.",
+            )
+
+
+def _verify(
+    rec: _Record,
+    ints: String,
+    vals: String,
+    raw: String,
+    pred: String,
+) raises:
+    _check_ints(rec.name, rec.ints, ints)
+    _check_bits(rec.name, "tree_values", rec.vals, vals)
+    _check_bits(rec.name, "row_raw_score", rec.raw, raw)
+    _check_bits(rec.name, "row_prediction", rec.pred, pred)
+
+
+# --------------------------------------------------------------------------
+# The fixtures
+# --------------------------------------------------------------------------
+
+
+def _features(n_rows: Int, n_features: Int, seed: UInt64) -> List[Float64]:
+    """Column-major `_uniform(k + seed)` over `k = f * n_rows + r`."""
+    var out = List[Float64](capacity=n_rows * n_features)
+    for k in range(n_rows * n_features):
+        out.append(_uniform(UInt64(k) + seed))
+    return out^
+
+
+def _regression_target(x: List[Float64], n_rows: Int) -> List[Float64]:
+    """`3*x0 - 2*x1 + x2*x3 + 0.5*(x2 - 0.5)^2`: linear in two features,
+    an interaction, and a curve, so a shallow tree has something to split
+    on at every depth."""
+    var y = List[Float64](capacity=n_rows)
+    for r in range(n_rows):
+        var x0 = x[0 * n_rows + r]
+        var x1 = x[1 * n_rows + r]
+        var x2 = x[2 * n_rows + r]
+        var x3 = x[3 * n_rows + r]
+        y.append(3.0 * x0 - 2.0 * x1 + x2 * x3 + 0.5 * (x2 - 0.5) * (x2 - 0.5))
+    return y^
+
+
+def _fixture_l2() raises -> _Record:
+    comptime n_rows = 200
+    comptime n_features = 8
+    var x = _features(n_rows, n_features, 0)
+    var y = _regression_target(x, n_rows)
+    var data = bin_equal_width(x, n_rows, n_features, 32)
+    var params = BoosterParams(8, 0.3, TreeParams(8, 5, 1.0, 1e-3))
+    var booster = train(data, y, SQUARED_ERROR, params)
+    return _record("l2", booster, data)
+
+
+def _fixture_logit() raises -> _Record:
+    comptime n_rows = 200
+    comptime n_features = 8
+    var x = _features(n_rows, n_features, 10_000)
+    var labels = List[Float64](capacity=n_rows)
+    for r in range(n_rows):
+        var s = (
+            2.0 * x[0 * n_rows + r]
+            - x[1 * n_rows + r]
+            + x[2 * n_rows + r] * x[3 * n_rows + r]
+        )
+        labels.append(1.0 if s > 1.0 else 0.0)
+    var data = bin_equal_width(x, n_rows, n_features, 32)
+    var params = BoosterParams(8, 0.3, TreeParams(8, 5, 1.0, 1e-3))
+    var booster = train(data, labels, BINARY_LOGISTIC, params)
+    return _record("logit", booster, data)
+
+
+def _fixture_multi() raises -> _Record:
+    comptime n_rows = 150
+    comptime n_features = 6
+    comptime n_classes = 3
+    var x = _features(n_rows, n_features, 20_000)
+    var labels = List[Int](capacity=n_rows)
+    for r in range(n_rows):
+        var s = (
+            0.5 * x[0 * n_rows + r]
+            + 0.3 * x[1 * n_rows + r]
+            + 0.2 * x[2 * n_rows + r]
+        )
+        var k = Int(s * Float64(n_classes))
+        labels.append(n_classes - 1 if k >= n_classes else k)
+    var data = bin_equal_width(x, n_rows, n_features, 32)
+    var params = BoosterParams(4, 0.3, TreeParams(6, 5, 1.0, 1e-3))
+    var booster = train_multiclass(data, labels, n_classes, params)
+    return _record_multiclass("multi", booster, data)
+
+
+def _fixture_bagged() raises -> _Record:
+    comptime n_rows = 200
+    comptime n_features = 8
+    var x = _features(n_rows, n_features, 0)
+    var y = _regression_target(x, n_rows)
+    var data = bin_equal_width(x, n_rows, n_features, 32)
+    var params = BoosterParams(8, 0.3, TreeParams(8, 5, 1.0, 1e-3))
+    var booster = train(
+        data, y, SQUARED_ERROR, params, bagging=BaggingParams(0.6, 1, 7)
+    )
+    return _record("bagged", booster, data)
+
+
+def _fixture_ffrac() raises -> _Record:
+    comptime n_rows = 200
+    comptime n_features = 12
+    var x = _features(n_rows, n_features, 30_000)
+    var y = _regression_target(x, n_rows)
+    var data = bin_equal_width(x, n_rows, n_features, 32)
+    var tree = TreeParams(8, 5, 1.0, 1e-3, 0.0, feature_fraction=0.5)
+    var params = BoosterParams(8, 0.3, tree^)
+    var booster = train(data, y, SQUARED_ERROR, params)
+    return _record("ffrac", booster, data)
+
+
+def _cat_weight(code: Int) -> Float64:
+    var table: List[Float64] = [0.0, 1.5, -1.0, 0.7, -2.0, 2.5]
+    return table[code]
+
+
+def _fixture_misscat() raises -> _Record:
+    """Feature 1 is missing on every seventh row, feature 2 is an
+    integer-coded categorical with six categories, and the target depends on
+    both, so a split search that mishandles either produces a different
+    tree."""
+    comptime n_rows = 200
+    comptime n_features = 5
+    comptime seed = UInt64(40_000)
+    var x = List[Float64](capacity=n_rows * n_features)
+    for f in range(n_features):
+        for r in range(n_rows):
+            var u = _uniform(UInt64(f * n_rows + r) + seed)
+            if f == 1 and r % 7 == 0:
+                x.append(NAN)
+            elif f == 2:
+                x.append(Float64(Int(u * 6.0)))
+            else:
+                x.append(u)
+
+    var y = List[Float64](capacity=n_rows)
+    for r in range(n_rows):
+        var x1 = x[1 * n_rows + r]
+        var v = 2.0 * x[0 * n_rows + r]
+        v += 0.5 if isnan(x1) else x1
+        v += _cat_weight(Int(x[2 * n_rows + r]))
+        y.append(v)
+
+    var mapper = fit_bins(
+        x,
+        n_rows,
+        n_features,
+        max_bins=32,
+        categorical_features=[2],
+        use_missing=True,
+    )
+    var data = mapper.transform(x, n_rows)
+    var tree = TreeParams(
+        8, 5, 1.0, 1e-3, 0.0, cat=CategoricalParams(4, 32, 2.0, 10.0, 5)
+    )
+    var params = BoosterParams(8, 0.3, tree^)
+    var booster = train(data, y, SQUARED_ERROR, params)
+    return _record("misscat", booster, data)
+
+
+# --------------------------------------------------------------------------
+# Tests
+# --------------------------------------------------------------------------
+
+
+def test_golden_l2_regression() raises:
+    _verify(_fixture_l2(), _L2_INTS, _L2_VALS, _L2_RAW, _L2_PRED)
+
+
+def test_golden_binary_logistic() raises:
+    _verify(_fixture_logit(), _LOGIT_INTS, _LOGIT_VALS, _LOGIT_RAW, _LOGIT_PRED)
+
+
+def test_golden_multiclass() raises:
+    _verify(_fixture_multi(), _MULTI_INTS, _MULTI_VALS, _MULTI_RAW, _MULTI_PRED)
+
+
+def test_golden_bagged() raises:
+    _verify(_fixture_bagged(), _BAG_INTS, _BAG_VALS, _BAG_RAW, _BAG_PRED)
+
+
+def test_golden_feature_fraction() raises:
+    _verify(_fixture_ffrac(), _FFRAC_INTS, _FFRAC_VALS, _FFRAC_RAW, _FFRAC_PRED)
+
+
+def test_golden_missing_and_categorical() raises:
+    _verify(
+        _fixture_misscat(),
+        _MISSCAT_INTS,
+        _MISSCAT_VALS,
+        _MISSCAT_RAW,
+        _MISSCAT_PRED,
+    )
+
+
+# --------------------------------------------------------------------------
+# Generate mode
+# --------------------------------------------------------------------------
+
+
+def _emit_ints(name: String, values: List[Int]):
+    print("comptime " + name + ' = """')
+    var line = String("")
+    for i in range(len(values)):
+        if line.byte_length() > 0:
+            line += " "
+        line += String(values[i])
+        if (i + 1) % 12 == 0:
+            print(line)
+            line = String("")
+    if line.byte_length() > 0:
+        print(line)
+    print('"""')
+    print("")
+
+
+def _emit_bits(name: String, values: List[UInt64]):
+    print("comptime " + name + ' = """')
+    var line = String("")
+    for i in range(len(values)):
+        if line.byte_length() > 0:
+            line += " "
+        line += _hex16(values[i])
+        if (i + 1) % 4 == 0:
+            print(line)
+            line = String("")
+    if line.byte_length() > 0:
+        print(line)
+    print('"""')
+    print("")
+
+
+def _emit(prefix: String, rec: _Record):
+    _emit_ints(prefix + "_INTS", rec.ints)
+    _emit_bits(prefix + "_VALS", rec.vals)
+    _emit_bits(prefix + "_RAW", rec.raw)
+    _emit_bits(prefix + "_PRED", rec.pred)
+
+
+def _generate() raises:
+    print("# --- GOLDEN BEGIN ---")
+    print(
+        "# Generated by `mojo run ... tests/test_golden_bits.mojo"
+        " --generate`."
+    )
+    print("# Do not hand-edit; see this file's docstring before changing.")
+    print("")
+    _emit("_L2", _fixture_l2())
+    _emit("_LOGIT", _fixture_logit())
+    _emit("_MULTI", _fixture_multi())
+    _emit("_BAG", _fixture_bagged())
+    _emit("_FFRAC", _fixture_ffrac())
+    _emit("_MISSCAT", _fixture_misscat())
+    print("# --- GOLDEN END ---")
+
+
+def main() raises:
+    var args = argv()
+    for i in range(1, len(args)):
+        if args[i] == "--generate":
+            _generate()
+            return
+    TestSuite.discover_tests[__functions_in_module()]().run()

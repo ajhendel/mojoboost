@@ -126,6 +126,14 @@ test_hybrid_replica
 # device, so it belongs in the CPU set where it also guards the rule on a
 # runner that has no accelerator to plan for.
 #
+# `test_golden_bits` is deliberately NOT above, and must never be added to
+# it. It is the package's bit-exactness contract: checked-in IEEE-754 bit
+# patterns for six fits, compared as integers. A CPU-only runner has to be
+# able to enforce that contract, so the file opens no device and runs in
+# both the `cpu` and `all` sets, which the glob above already selects it
+# into. Accelerator exactness is a separate claim and belongs in the GPU
+# files.
+#
 # `test_gpu_phase_profile` is deliberately NOT above either, despite its name.
 # It exercises the node size classes, the counters, and the CPU grower's
 # charge sites, opens no device, and asserts that the instrument moves no
