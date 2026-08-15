@@ -166,7 +166,7 @@ which is why they are grouped.
 | --- | --- | --- | --- |
 | `alternate_boosting` | `boosting_dart`, `boosting_rf` | 17 | DART and random forest have no route; `boosting.mojo` still owns the only round loop |
 | `gpu_binned_layout` | `gpu_bin_packing` | 02 | `train_gpu` never asks for a packed-bin plan |
-| `gpu_levelwise` | `levelwise_policy` | 02 | no trainer offers a level-wise mode |
+| `gpu_levelwise` | `levelwise_policy` | 02 | resolved Aug 15 2026: `levelwise_policy` became `growth_policy` (the leaf pick every grower calls under both `grow_policy` values); `gpu_levelwise` was removed unused (handoffs/consolidation_K8.md) |
 | `gpu_multiclass_batch` | (`gpu_output_planes` is also reached via `apple_histogram_policy`) | 04 | multiclass GPU training is still per-class |
 | `hybrid_leaf_scheduler` | `histogram_cache_policy` | 04 | no trainer consults per-leaf CPU/GPU placement |
 | `gpu_categorical` | `gpu_sparse`, `gpu_sparse_layout` | 10 | the GPU trainer refuses categoricals, so its category kernels are unused |

@@ -208,7 +208,7 @@ from mojotrees.serialize import (
     save_model,
     save_multiclass_model,
 )
-from mojotrees.levelwise_policy import parse_grow_policy
+from mojotrees.growth_policy import parse_grow_policy
 from mojotrees.tree import Tree, TreeParams
 
 
@@ -644,7 +644,7 @@ def _parse_params(
         # `extra_params_check` validates with, so what is checked and what is
         # trained cannot come apart.
         extra=extra_params_from_mapping(params, n_features),
-        # XGBoost's grow_policy (src/mojotrees/levelwise_policy.mojo); the
+        # XGBoost's grow_policy (src/mojotrees/growth_policy.mojo); the
         # wrapper sends the name, and the same parser the parameter string
         # goes through resolves it, so the two front doors cannot disagree.
         grow_policy=parse_grow_policy(String(py=params["grow_policy"])),

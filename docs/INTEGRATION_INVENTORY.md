@@ -63,10 +63,8 @@ it, not a second opinion.
 | `gpu_amd_policy` | PENDING | unassigned | HIP launch policy. Reached only from `gpu_cuda_policy`, itself unreachable |
 | `gpu_cuda_policy` | PENDING | unassigned | CUDA launch policy. Nothing on the shipping GPU path selects a backend-specific policy |
 | `gpu_categorical` | PENDING | connect_10 | GPU category statistics; the GPU trainer refuses categoricals |
-| `gpu_levelwise` | PENDING | connect_02 | Level-wise GPU growth; no trainer offers a level-wise mode |
 | `gpu_sparse` | PENDING | connect_10 | Reached only from `gpu_categorical`, itself unreachable |
 | `gpu_sparse_layout` | PENDING | connect_10 | Reached only from `gpu_sparse`, itself unreachable |
-| `levelwise_policy` | PENDING | connect_02 | Reached only from `gpu_levelwise`, itself unreachable |
 | `lgbm_model_io` | PENDING | connect_16 | LightGBM text model reader and writer; no entry point offers it. Reached from `tests/parallel/test_lgbm_model_io.mojo` only |
 | `linear_tree` | PENDING | unassigned | Linear leaves as an algorithm core. `params.mojo` parses `linear_tree` and `tree_parameters_extra.mojo` names it, but no grower imports this module |
 | `model_editing` | PENDING | unassigned | `rollback_one_iter`, `set_leaf_output`, `shuffle_models`, `refit`, prediction bounds. No binding and no native caller |
@@ -226,9 +224,10 @@ one. It batches histogram builds across leaves, which is worth doing under
 level-wise growth where a whole level is built at once. The shipping grower
 is leaf-wise and now derives a sibling by subtraction, so a split builds one
 histogram and computes the other, and there is at most one build per split
-left to batch. That specialization is waiting on `gpu_levelwise`, not on a
-switch, and reading it as a free win off this table is a mistake made at
-least once.
+left to batch. That specialization is waiting on a level-batched
+histogram phase under `grow_policy=depthwise` (`growth_policy.mojo` orders
+the level; nothing batches its builds yet), not on a switch, and reading it
+as a free win off this table is a mistake made at least once.
 
 ## Python package modules
 

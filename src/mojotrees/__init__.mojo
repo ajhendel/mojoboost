@@ -53,7 +53,7 @@ from .sampling import (
     select_tree_features,
     selection_count,
 )
-from .levelwise_policy import (
+from .growth_policy import (
     GROW_DEPTHWISE,
     GROW_LEAFWISE,
     grow_policy_name,

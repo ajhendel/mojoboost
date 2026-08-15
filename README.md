@@ -864,8 +864,8 @@ tile size are runtime values here rather than compile-time ones.
 1. Connect what is already written. The repository has grown faster than
    its call graph: several capability families are implemented, compile,
    and are reached by no entry point at all, including packed-bin GPU
-   layout, level-wise GPU growth, class-batched multiclass rounds, hybrid
-   CPU and GPU leaf placement, the sparse and categorical GPU kernels,
+   layout, class-batched multiclass rounds, hybrid CPU and GPU leaf
+   placement, the sparse and categorical GPU kernels,
    DART and random forest, CEGB, and LightGBM model file interop. The
    current list, with what blocks each one, is
    [docs/INTEGRATION_INVENTORY.md](docs/INTEGRATION_INVENTORY.md).

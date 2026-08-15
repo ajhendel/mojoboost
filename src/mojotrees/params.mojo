@@ -53,7 +53,7 @@ from .device import CPU_DEVICE, parse_device
 from .objective_registry import MULTICLASS as _MULTICLASS
 from .efb import check_bundling_supported
 from .sampling import canonical_data_sample_strategy
-from .levelwise_policy import parse_grow_policy
+from .growth_policy import parse_grow_policy
 from .tree import TreeParams
 from .tree_parameters_extra import (
     check_extra_option_supported,
@@ -521,7 +521,7 @@ def parse_params(spec: String) raises -> TrainConfig:
         elif key == "grow_policy":
             # XGBoost's name and spellings; LightGBM has no such switch, so
             # this is an extension rather than a parity row
-            # (levelwise_policy.mojo). `depthwise` commits a depth at a time.
+            # (growth_policy.mojo). `depthwise` commits a depth at a time.
             config.booster.tree.grow_policy = parse_grow_policy(value)
         elif (
             key == "feature_fraction"

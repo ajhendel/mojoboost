@@ -97,11 +97,10 @@ from .sampling import (
     select_split_features,
     select_tree_features,
 )
-from .levelwise_policy import (
-    GROW_DEPTHWISE,
+from .growth_policy import (
     GROW_LEAFWISE,
-    LevelCandidate,
-    LevelSchedule,
+    GrowthSchedule,
+    LeafCandidate,
     check_grow_policy,
 )
 from .split import SplitInfo, find_best_split, soft_threshold_l1
@@ -140,7 +139,7 @@ struct TreeParams(Copyable, Movable):
     are appended so that every positional caller of this constructor keeps
     working unchanged.
 
-    `grow_policy` is XGBoost's `grow_policy` (levelwise_policy.mojo):
+    `grow_policy` is XGBoost's `grow_policy` (growth_policy.mojo):
     `GROW_LEAFWISE`, the default and LightGBM's growth, commits the best
     split anywhere in the tree next; `GROW_DEPTHWISE` commits every admitted
     split at one depth before any deeper one, `num_leaves` staying a hard
@@ -951,13 +950,15 @@ def grow_tree(
     unbundled fit produces, so no consumer of it can tell which matrix built
     the histograms.
 
-    Depth-wise growth changes one thing in this loop: which frontier leaf is
-    split next. `LevelSchedule` (levelwise_policy.mojo) plans a depth at a
-    time, admits its positive-gain splits against the leaf budget, and hands
-    them out in ascending node id order; the body below (partition, sibling
-    subtraction, child values, monotone intervals, child search) is the same
-    code either way, so a depth-wise tree enforces every constraint exactly
-    as a leaf-wise one does. Forced splits still go first in both modes.
+    The growth policy decides one thing in this loop: which frontier leaf is
+    split next. `GrowthSchedule` (growth_policy.mojo) takes the best gain
+    anywhere in the tree under leaf-wise growth, and under depth-wise growth
+    plans a depth at a time, admits its positive-gain splits against the
+    leaf budget, and hands them out in ascending node id order; the body
+    below (partition, sibling subtraction, child values, monotone intervals,
+    child search) is the same code either way, so a depth-wise tree enforces
+    every constraint exactly as a leaf-wise one does. Forced splits still go
+    first in both modes.
     """
     check_grow_policy(params.grow_policy)
     params.constraints.check_features(data.n_features)
@@ -1121,8 +1122,7 @@ def grow_tree(
         )
     )
     var n_leaves = 1
-    var depthwise = params.grow_policy == GROW_DEPTHWISE
-    var schedule = LevelSchedule()
+    var schedule = GrowthSchedule(params.grow_policy)
 
     while n_leaves < params.num_leaves:
         # Forced splits go first, in forced-node order. A parent always
@@ -1138,36 +1138,24 @@ def grow_tree(
             ):
                 forced_node = frontier[i].forced
                 best_i = i
-        if best_i < 0 and depthwise:
-            # Depth-wise: the schedule owns the order (levelwise_policy.mojo).
-            var cands = List[LevelCandidate](capacity=len(frontier))
-            var depths = List[Int](capacity=len(frontier))
+        if best_i < 0:
+            # Nothing forced: the growth policy picks (growth_policy.mojo),
+            # best gain anywhere in the tree under leaf-wise growth, the
+            # planned level's next node under depth-wise growth.
+            var cands = List[LeafCandidate](capacity=len(frontier))
             for i in range(len(frontier)):
                 cands.append(
-                    LevelCandidate(
+                    LeafCandidate(
                         frontier[i].node,
+                        frontier[i].depth,
                         frontier[i].split.gain,
                         frontier[i].split.found
                         and frontier[i].split.gain > 0.0,
                     )
                 )
-                depths.append(frontier[i].depth)
             best_i = schedule.next_leaf(
-                cands, depths, n_leaves, params.num_leaves, params.max_depth
+                cands, n_leaves, params.num_leaves, params.max_depth
             )
-            if best_i < 0:
-                break
-        elif best_i < 0:
-            # Nothing forced: pick the leaf with the best gain anywhere in the
-            # tree, which is leaf-wise growth exactly as it was.
-            var best_gain = 0.0
-            for i in range(len(frontier)):
-                if (
-                    frontier[i].split.found
-                    and frontier[i].split.gain > best_gain
-                ):
-                    best_gain = frontier[i].split.gain
-                    best_i = i
             if best_i < 0:
                 break
 

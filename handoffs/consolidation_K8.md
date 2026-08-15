@@ -68,3 +68,35 @@ levelwise_policy: tests/test_grow_policy.mojo (12 tests, in `test` and
 Sign-off requested from C0 on: (1) levelwise_policy is a consulted planner
 now, not an orphan chain; (2) gpu_levelwise is parked, not deleted; (3) all
 other modules keep-as-consulted-planner with no code change this round.
+
+## connect_02 note (Aug 15 2026, later the same day): supersession recorded
+
+Per-level batched launches, if ever built, are wanted as a histogram-phase
+service underneath the shipped frontier growers (feed
+`gpu_leaf_batching.mojo`'s multi-leaf kernels with a level's builds under
+`grow_policy=depthwise`, or with both children under leaf-wise device
+search), not as a replacement grower with its own commit path. That is the
+supersession the K8 disposition line asked for, so:
+
+- `src/mojotrees/gpu_levelwise.mojo` deleted (unused, untested; `git log`
+  keeps it). `docs/design/GPU_LEVELWISE.md` kept, header rewritten: it is
+  the design record for the batching, and its `gpu_levelwise.*` names now
+  describe the removed prototype.
+- `src/mojotrees/levelwise_policy.mojo` renamed `growth_policy.mojo` and
+  trimmed to what the growers call. `LevelSchedule` became
+  `GrowthSchedule(policy)`, which now makes the leaf-wise pick too (strict
+  `>` best gain, ties to the lower slot, unchanged), so every grower
+  (`tree.grow_tree`, `tree_sparse.grow_tree_sparse`, the three
+  `train_gpu.mojo` loops) builds one `LeafCandidate` list and calls
+  `next_leaf` once, with no policy branch of its own. Dropped as dead once
+  `gpu_levelwise` went: `LevelwiseParams`, `LaunchProfile`,
+  `leafwise_profile`, `levelwise_profile`, `prefilter_level`,
+  `depth_permits_split`, `rows_permit_split`, `level_capacity`,
+  `full_level_depth`, `effective_max_depth`, `UNLIMITED_LEVEL_NODES`.
+- `tools/connectivity_audit.py` CLASSIFICATION: `gpu_levelwise` entry
+  removed with the module. `docs/INTEGRATION_INVENTORY.md`,
+  `docs/CONNECTION_AUDIT.md`, `docs/LIGHTGBM_PARITY.md`, README roadmap
+  updated.
+- `train_gpu.mojo` was touched (the three pick blocks and the import line
+  only), against K8's "no edit" line; the hunks are disjoint from
+  connect_04's hybrid edits in the same file and were committed by hunk.

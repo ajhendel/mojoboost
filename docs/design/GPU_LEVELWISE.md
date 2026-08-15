@@ -4,13 +4,26 @@ Status (Aug 15 2026): the **growth order** is wired and exposed.
 `TreeParams.grow_policy = GROW_DEPTHWISE` (Python `grow_policy="depthwise"`,
 parameter string `grow_policy=depthwise`) makes every frontier grower
 (`tree.grow_tree`, `tree_sparse.grow_tree_sparse`, the three loops in
-`train_gpu.mojo`) split leaves in the order `levelwise_policy.LevelSchedule`
+`train_gpu.mojo`) split leaves in the order `growth_policy.GrowthSchedule`
 plans: one depth at a time, `BUDGET_RANK` admission, ascending node id
 within a level. Section 3's parameter semantics are what ships. What is
 **not** built is the launch batching of sections 1, 2, and 6: the GPU
 growers still issue one launch group per split, so depth-wise on the device
-costs what leaf-wise costs today and no benchmark has been run. Section 10
-still governs how one must be built.
+costs what leaf-wise costs today and no benchmark has been run.
+
+The host-side prototype this document names (`gpu_levelwise.mojo`:
+`LevelFrontier`, `plan_level`, `decide_level`, `LevelCommit`, `child_sums`)
+was removed the same day, unused and untested. It was a second commit path,
+deriving child values from the parent histogram so a level could be
+committed before its children's histograms existed. The shipped growers
+commit through their own per-split bodies under `GrowthSchedule`, and that
+is the shape any batching must keep: batch the histogram builds of a level
+(the multi-leaf kernels in `gpu_leaf_batching.mojo`, which both policies
+can feed) underneath the existing order, rather than adding a growth loop.
+Sections 1, 2, 6, and 10 remain the design for that; references below to
+`gpu_levelwise.*` names describe the removed prototype and are kept as the
+record of what was proposed. `handoffs/consolidation_K8.md` records the
+disposition.
 
 This is a proposal for a **second growth algorithm**, not a faster route to
 the trees mojotrees already grows. A level-wise tree and a leaf-wise tree

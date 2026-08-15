@@ -83,12 +83,7 @@ from .sampling import (
 )
 from .sparse import SparseBinnedMatrix, SparseBinnedRows
 from .split import SplitInfo
-from .levelwise_policy import (
-    GROW_DEPTHWISE,
-    LevelCandidate,
-    LevelSchedule,
-    check_grow_policy,
-)
+from .growth_policy import GrowthSchedule, LeafCandidate, check_grow_policy
 from .tree import Tree, TreeParams, _leaf_value, _search
 
 
@@ -527,7 +522,7 @@ def grow_tree_sparse(
     bundling: SparseBundling = SparseBundling.none(),
 ) raises -> SparseTreeResult:
     """Grow one tree on sparse data, leaf-wise by default or depth-wise
-    under `params.grow_policy == GROW_DEPTHWISE` (the same `LevelSchedule`
+    under `params.grow_policy == GROW_DEPTHWISE` (the same `GrowthSchedule`
     order the dense grower follows, so both growers make the same choice).
 
     Arguments and semantics match `grow_tree`: a non-empty `bag` restricts
@@ -693,36 +688,25 @@ def grow_tree_sparse(
         )
     )
     var n_leaves = 1
-    var depthwise = params.grow_policy == GROW_DEPTHWISE
-    var schedule = LevelSchedule()
+    var schedule = GrowthSchedule(params.grow_policy)
 
     while n_leaves < params.num_leaves:
-        var best_i = -1
-        if depthwise:
-            var cands = List[LevelCandidate](capacity=len(frontier))
-            var depths = List[Int](capacity=len(frontier))
-            for i in range(len(frontier)):
-                cands.append(
-                    LevelCandidate(
-                        frontier[i].node,
-                        frontier[i].split.gain,
-                        frontier[i].split.found
-                        and frontier[i].split.gain > 0.0,
-                    )
+        # The growth policy picks (growth_policy.mojo): best gain anywhere in
+        # the tree under leaf-wise growth, the planned level's next node
+        # under depth-wise growth.
+        var cands = List[LeafCandidate](capacity=len(frontier))
+        for i in range(len(frontier)):
+            cands.append(
+                LeafCandidate(
+                    frontier[i].node,
+                    frontier[i].depth,
+                    frontier[i].split.gain,
+                    frontier[i].split.found and frontier[i].split.gain > 0.0,
                 )
-                depths.append(frontier[i].depth)
-            best_i = schedule.next_leaf(
-                cands, depths, n_leaves, params.num_leaves, params.max_depth
             )
-        else:
-            var best_gain = 0.0
-            for i in range(len(frontier)):
-                if (
-                    frontier[i].split.found
-                    and frontier[i].split.gain > best_gain
-                ):
-                    best_gain = frontier[i].split.gain
-                    best_i = i
+        var best_i = schedule.next_leaf(
+            cands, n_leaves, params.num_leaves, params.max_depth
+        )
         if best_i < 0:
             break
 

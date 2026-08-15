@@ -2,7 +2,7 @@
 
 Depth-wise growth commits every admitted split at one depth before any
 deeper one, `num_leaves` staying a hard bound and the last level admitted as
-a gain-ranked prefix (src/mojotrees/levelwise_policy.mojo). These tests pin
+a gain-ranked prefix (src/mojotrees/growth_policy.mojo). These tests pin
 the properties that make the mode well defined rather than any comparison
 against a reference implementation, since none exists:
 
@@ -46,12 +46,12 @@ from mojotrees import (
     parse_grow_policy,
     train,
 )
-from mojotrees.levelwise_policy import (
+from mojotrees.growth_policy import (
     BUDGET_WHOLE_LEVEL,
     STOP_LEAF_BUDGET,
     STOP_MAX_DEPTH,
-    LevelCandidate,
-    LevelSchedule,
+    GrowthSchedule,
+    LeafCandidate,
 )
 from mojotrees.sparse import csc_from_dense, fit_bins_csc, transform_csc
 from mojotrees.train_gpu import (
@@ -131,76 +131,92 @@ def assert_same_tree(got: Tree, want: Tree) raises:
 # ------------------------------------------------------------ the schedule
 
 
+def test_schedule_leafwise_takes_the_best_gain_ties_to_the_lower_slot() raises:
+    """The leaf-wise rule every grower ran before the schedule existed:
+    strict `>` over the frontier, so equal gains keep the earlier slot, and
+    depth plays no part."""
+    var schedule = GrowthSchedule(GROW_LEAFWISE)
+    var cands: List[LeafCandidate] = [
+        LeafCandidate(5, 2, 2.0, True),
+        LeafCandidate(3, 1, 9.0, True),
+        LeafCandidate(4, 1, 9.0, True),
+        LeafCandidate(6, 2, 0.5, False),
+    ]
+    assert_equal(schedule.next_leaf(cands, 4, 31, -1), 1)
+    cands[1] = LeafCandidate.terminal(7, 2)
+    assert_equal(schedule.next_leaf(cands, 5, 31, -1), 2)
+    cands[2] = LeafCandidate.terminal(9, 2)
+    assert_equal(schedule.next_leaf(cands, 6, 31, -1), 0)
+    cands[0] = LeafCandidate.terminal(11, 3)
+    # An unfound split, and a found split of zero gain, are both terminal.
+    cands[3] = LeafCandidate(6, 2, 0.0, True)
+    assert_equal(schedule.next_leaf(cands, 7, 31, -1), -1)
+
+
 def test_schedule_commits_a_level_in_node_order_then_the_next() raises:
     """Membership is gain ranked; order within a level is ascending node id;
     a deeper leaf waits for the shallower level to finish."""
-    var schedule = LevelSchedule()
+    var schedule = GrowthSchedule(GROW_DEPTHWISE)
     # Frontier: node 5 (depth 2), node 3 (depth 1, gain 1), node 4 (depth 1,
     # gain 9), node 6 (depth 2). Level 1 is planned first, node 3 before 4
     # whatever their gains, then level 2.
-    var cands: List[LevelCandidate] = [
-        LevelCandidate(5, 2.0, True),
-        LevelCandidate(3, 1.0, True),
-        LevelCandidate(4, 9.0, True),
-        LevelCandidate(6, 0.5, True),
+    var cands: List[LeafCandidate] = [
+        LeafCandidate(5, 2, 2.0, True),
+        LeafCandidate(3, 1, 1.0, True),
+        LeafCandidate(4, 1, 9.0, True),
+        LeafCandidate(6, 2, 0.5, True),
     ]
-    var depths: List[Int] = [2, 1, 1, 2]
-    assert_equal(schedule.next_leaf(cands, depths, 4, 31, -1), 1)
+    assert_equal(schedule.next_leaf(cands, 4, 31, -1), 1)
     assert_equal(schedule.level, 1)
-    assert_equal(schedule.next_leaf(cands, depths, 5, 31, -1), 2)
+    assert_equal(schedule.next_leaf(cands, 5, 31, -1), 2)
     # A grower replaces a split leaf's slot with its left child and appends
     # the right one; here the two slots become depth-2 leaves with nothing
     # to offer, and the level-2 nodes are next, node 5 first.
-    cands[1] = LevelCandidate.terminal(7)
-    cands[2] = LevelCandidate.terminal(9)
-    depths[1] = 2
-    depths[2] = 2
-    assert_equal(schedule.next_leaf(cands, depths, 6, 31, -1), 0)
+    cands[1] = LeafCandidate.terminal(7, 2)
+    cands[2] = LeafCandidate.terminal(9, 2)
+    assert_equal(schedule.next_leaf(cands, 6, 31, -1), 0)
     assert_equal(schedule.level, 2)
-    assert_equal(schedule.next_leaf(cands, depths, 7, 31, -1), 3)
+    assert_equal(schedule.next_leaf(cands, 7, 31, -1), 3)
     # Nothing eligible remains once every candidate is marked terminal.
-    var dry: List[LevelCandidate] = [
-        LevelCandidate.terminal(5),
-        LevelCandidate.terminal(3),
-        LevelCandidate.terminal(4),
-        LevelCandidate.terminal(6),
+    var dry: List[LeafCandidate] = [
+        LeafCandidate.terminal(5, 2),
+        LeafCandidate.terminal(3, 2),
+        LeafCandidate.terminal(4, 2),
+        LeafCandidate.terminal(6, 2),
     ]
-    assert_equal(schedule.next_leaf(dry, depths, 8, 31, -1), -1)
+    assert_equal(schedule.next_leaf(dry, 8, 31, -1), -1)
 
 
 def test_schedule_admits_the_highest_gain_prefix_under_the_budget() raises:
     """Four candidates, room for two: the two best gains, handed out in node
     order (not gain order), and the stop reason names the budget."""
-    var schedule = LevelSchedule()
-    var cands: List[LevelCandidate] = [
-        LevelCandidate(3, 1.0, True),
-        LevelCandidate(4, 4.0, True),
-        LevelCandidate(5, 3.0, True),
-        LevelCandidate(6, 2.0, True),
+    var schedule = GrowthSchedule(GROW_DEPTHWISE)
+    var cands: List[LeafCandidate] = [
+        LeafCandidate(3, 2, 1.0, True),
+        LeafCandidate(4, 2, 4.0, True),
+        LeafCandidate(5, 2, 3.0, True),
+        LeafCandidate(6, 2, 2.0, True),
     ]
-    var depths: List[Int] = [2, 2, 2, 2]
     # 4 leaves now, 6 allowed: two splits.
-    assert_equal(schedule.next_leaf(cands, depths, 4, 6, -1), 1)
-    assert_equal(schedule.next_leaf(cands, depths, 5, 6, -1), 2)
+    assert_equal(schedule.next_leaf(cands, 4, 6, -1), 1)
+    assert_equal(schedule.next_leaf(cands, 5, 6, -1), 2)
     assert_equal(schedule.stop_reason, STOP_LEAF_BUDGET)
 
 
 def test_schedule_whole_level_refuses_a_level_that_does_not_fit() raises:
-    var schedule = LevelSchedule(BUDGET_WHOLE_LEVEL)
-    var cands: List[LevelCandidate] = [
-        LevelCandidate(3, 1.0, True),
-        LevelCandidate(4, 4.0, True),
-        LevelCandidate(5, 3.0, True),
+    var schedule = GrowthSchedule(GROW_DEPTHWISE, BUDGET_WHOLE_LEVEL)
+    var cands: List[LeafCandidate] = [
+        LeafCandidate(3, 2, 1.0, True),
+        LeafCandidate(4, 2, 4.0, True),
+        LeafCandidate(5, 2, 3.0, True),
     ]
-    var depths: List[Int] = [2, 2, 2]
-    assert_equal(schedule.next_leaf(cands, depths, 4, 6, -1), -1)
+    assert_equal(schedule.next_leaf(cands, 4, 6, -1), -1)
 
 
 def test_schedule_reports_max_depth() raises:
-    var schedule = LevelSchedule()
-    var cands: List[LevelCandidate] = [LevelCandidate(0, 1.0, True)]
-    var depths: List[Int] = [0]
-    assert_equal(schedule.next_leaf(cands, depths, 1, 31, 1), 0)
+    var schedule = GrowthSchedule(GROW_DEPTHWISE)
+    var cands: List[LeafCandidate] = [LeafCandidate(0, 0, 1.0, True)]
+    assert_equal(schedule.next_leaf(cands, 1, 31, 1), 0)
     assert_equal(schedule.stop_reason, STOP_MAX_DEPTH)
 
 

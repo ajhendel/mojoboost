@@ -121,7 +121,7 @@ from .histogram import (
 )
 from .interaction import extend_branch
 from .split import SplitInfo, find_best_split, soft_threshold_l1
-from .levelwise_policy import GROW_LEAFWISE
+from .growth_policy import GROW_LEAFWISE
 from .tree import Tree, TreeParams
 from .tree_parameters_extra import finish_leaf_output
 
