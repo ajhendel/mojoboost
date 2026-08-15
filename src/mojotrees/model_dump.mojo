@@ -52,7 +52,12 @@ edit.
 from std.math import isnan
 
 from .binning import BinMapper
-from .categorical import CAT_MAX_BINS, UNKNOWN_BIN, cat_pool_contains
+from .categorical import (
+    CAT_MAX_BINS,
+    UNKNOWN_BIN,
+    _MAX_CATEGORY,
+    cat_pool_contains,
+)
 from .model import Model, MulticlassModel
 from .monotone import MonotoneConstraints
 from .tree import Tree
@@ -69,11 +74,10 @@ comptime DUMP_FORMAT_VERSION = 1
 # gains, so a model saved by this build keeps them.
 comptime MODEL_FORMAT_VERSION = 4
 
-# Codes a categorical feature can represent, mirroring the private
-# `_MAX_CATEGORY` in categorical.mojo. The dump interpreter reproduces that
-# module's binning rule rather than calling into it, for the reason the
-# header gives.
-comptime _MAX_CATEGORY = 1 << 31
+# `_MAX_CATEGORY`, the codes a categorical feature can represent, is imported
+# from categorical.mojo, which defines it once. The dump interpreter still
+# reproduces that module's binning rule rather than calling into it, for the
+# reason the header gives; only the bound is shared.
 
 
 struct DumpFeature(Copyable, Movable):
