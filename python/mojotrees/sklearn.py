@@ -3408,6 +3408,11 @@ class MojoTreesRanker(_Base):
         sigmoid=1.0,
         lambdarank_norm=True,
         ndcg_eval_at=5,
+        label_gain=None,
+        lambdarank_position_bias_regularization=0.0,
+        pair_sampling_rate=1.0,
+        pair_sampling_seed=5,
+        max_dcg_cutoff=0,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -3415,6 +3420,13 @@ class MojoTreesRanker(_Base):
         self.sigmoid = sigmoid
         self.lambdarank_norm = lambdarank_norm
         self.ndcg_eval_at = ndcg_eval_at
+        self.label_gain = label_gain
+        self.lambdarank_position_bias_regularization = (
+            lambdarank_position_bias_regularization
+        )
+        self.pair_sampling_rate = pair_sampling_rate
+        self.pair_sampling_seed = pair_sampling_seed
+        self.max_dcg_cutoff = max_dcg_cutoff
 
     @staticmethod
     def _objective_code():
@@ -3442,7 +3454,41 @@ class MojoTreesRanker(_Base):
         params["ndcg_eval_at"] = int(self.ndcg_eval_at)
         params["group_addr"] = _addr(gb)
         params["n_groups"] = len(gb)
+        # The advanced ranking parameters (src/mojotrees/ranking_advanced.mojo).
+        # Defaults route to the plain LambdaRank trainer unchanged; anything
+        # else routes to the advanced loop. The gain buffer is kept on self
+        # so its address stays valid for the duration of the native call.
+        if self.label_gain is None:
+            self._label_gain_buffer = None
+            params["n_label_gain"] = 0
+            params["label_gain_addr"] = 0
+        else:
+            gains = _arrays.f64_vector(
+                self.label_gain, len(list(self.label_gain)), "label_gain"
+            )
+            self._label_gain_buffer = gains
+            params["n_label_gain"] = int(len(gains))
+            params["label_gain_addr"] = _addr(gains)
+        params["lambdarank_position_bias_regularization"] = float(
+            self.lambdarank_position_bias_regularization
+        )
+        params["pair_sampling_rate"] = float(self.pair_sampling_rate)
+        params["pair_sampling_seed"] = int(self.pair_sampling_seed)
+        params["max_dcg_cutoff"] = int(self.max_dcg_cutoff)
         return params
+
+    @staticmethod
+    def _position_params(params, position, n_rows):
+        """LightGBM's `Dataset.position`: a per-row integer code for the
+        slot each document was shown in. Returns the buffer to keep alive."""
+        if position is None:
+            params["n_position_rows"] = 0
+            params["position_addr"] = 0
+            return None
+        pos = _arrays.f64_vector(position, int(n_rows), "position")
+        params["n_position_rows"] = int(n_rows)
+        params["position_addr"] = _addr(pos)
+        return pos
 
     def fit(
         self,
@@ -3461,9 +3507,13 @@ class MojoTreesRanker(_Base):
         eval_X=None,
         eval_y=None,
         callbacks=None,
+        position=None,
     ):
         """Fit on `X` (n_samples, n_features), relevance labels `y`, and
-        `group`, the row count of each query in row order.
+        `group`, the row count of each query in row order. `position` is
+        LightGBM's `Dataset.position`: the slot each row was shown in when
+        the labels were collected, which turns on unbiased LambdaRank
+        (with `lambdarank_position_bias_regularization`).
 
         The validation arguments work as they do on `MojoTreesRegressor`,
         with `eval_group` carrying each validation set's own query
@@ -3531,6 +3581,7 @@ class MojoTreesRanker(_Base):
             ),
             gb,
         )
+        position_buffer = self._position_params(params, position, n_rows)
         if eval_set is not None:
 
             def check_grades(y_valid, n_valid_rows, label):
@@ -3561,6 +3612,7 @@ class MojoTreesRanker(_Base):
             self._model = _mojotrees.fit_ranker(
                 _addr(Xb), n_rows, n_features, _addr(yb), params
             )
+        del position_buffer
         self._record_fit(n_features, names, device)
         return self
 

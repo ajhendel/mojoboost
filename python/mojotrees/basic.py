@@ -340,8 +340,14 @@ class _Config:
         if self.task == _eval.RANKING:
             # The ranker validates its own parameters here; the group it
             # writes is the dataset's, which the trainer reads from the
-            # dataset itself.
+            # dataset itself. A position column (LightGBM's
+            # Dataset.position) rides in the params like group does.
             params = self.base._rank_params(params, dataset._group)
+            keep.append(
+                self.base._position_params(
+                    params, getattr(dataset, "_position", None), dataset.num_data()
+                )
+            )
         return params, keep, device
 
 
@@ -400,6 +406,7 @@ class Dataset:
         label=None,
         weight=None,
         group=None,
+        position=None,
         init_score=None,
         feature_name=None,
         categorical_feature=None,
@@ -411,6 +418,7 @@ class Dataset:
         self.params = self._binning_params(params)
         self.free_raw_data = bool(free_raw_data)
         self.keep_raw = bool(keep_raw)
+        self._position = position
         self._handle = None
 
         # Sparse input takes the sparse binner, which reads the three CSC

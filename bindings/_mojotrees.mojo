@@ -173,6 +173,7 @@ from mojotrees.trainset import (
     train_dataset as mojo_train_dataset,
     train_dataset_multiclass as mojo_train_dataset_multiclass,
     train_dataset_ranker as mojo_train_dataset_ranker,
+    train_dataset_ranker_advanced as mojo_train_dataset_ranker_advanced,
     update_dataset as mojo_update_dataset,
     update_dataset_multiclass as mojo_update_dataset_multiclass,
 )
@@ -226,6 +227,14 @@ from mojotrees.sparse import CscMatrix, CsrMatrix
 from mojotrees.model import fit_custom as mojo_fit_custom
 from mojotrees.model import fit_multiclass as mojo_fit_multiclass
 from mojotrees.objective import mean_label
+from mojotrees.ranking_advanced import (
+    AdvancedRankParams,
+    LabelGain,
+    PositionMap,
+    advanced_ranking_requested,
+    fit_ranker_advanced as mojo_fit_ranker_advanced,
+    positions_from_codes,
+)
 from mojotrees.ranking import (
     RankerParams,
     fit_ranker as mojo_fit_ranker,
@@ -1344,6 +1353,7 @@ def fit_ranker_with_metrics(
     var features = _f64_view(Int(py=x_addr), nr * nf)
     var labels = _int_list_from_f64(Int(py=y_addr), nr)
     var bp = _parse_params(params, nf, unbundled="fit_ranker_with_metrics")
+    _refuse_advanced_ranking(params, nr, "fit_ranker_with_metrics")
     var weights = _parse_weights(params, nr)
     var pred_p = _pred_pointer(params)
     var valid_sets = _parse_valid_sets(params, nf)
@@ -1662,6 +1672,70 @@ def _parse_rank_params(params: PythonObject) raises -> RankerParams:
     )
 
 
+def _parse_advanced_rank_params(
+    params: PythonObject,
+) raises -> AdvancedRankParams:
+    """The advanced ranking config from the params dict, on top of
+    `_parse_rank_params`: `label_gain` (a float64 buffer of `n_label_gain`
+    entries; 0 keeps LightGBM's default table),
+    `lambdarank_position_bias_regularization`, `pair_sampling_rate`,
+    `pair_sampling_seed`, `max_dcg_cutoff`. Every key is optional so a
+    caller that never heard of them gets `AdvancedRankParams.default()` with
+    the base parameters, which routes to `ranking.train_ranker` unchanged.
+    The trainer validates; see ranking_advanced.check_advanced_rank_params.
+    """
+    var out = AdvancedRankParams.default()
+    out.base = _parse_rank_params(params)
+    var n_gain = Int(py=params.get("n_label_gain", PythonObject(0)))
+    if n_gain > 0:
+        out.gain = LabelGain(_f64_list(Int(py=params["label_gain_addr"]), n_gain))
+    out.position_bias_regularization = Float64(
+        py=params.get(
+            "lambdarank_position_bias_regularization", PythonObject(0.0)
+        )
+    )
+    out.pair_sampling_rate = Float64(
+        py=params.get("pair_sampling_rate", PythonObject(1.0))
+    )
+    out.pair_sampling_seed = Int(
+        py=params.get("pair_sampling_seed", PythonObject(5))
+    )
+    out.max_dcg_cutoff = Int(py=params.get("max_dcg_cutoff", PythonObject(0)))
+    return out^
+
+
+def _parse_positions(params: PythonObject, n_rows: Int) raises -> PositionMap:
+    """LightGBM's `Dataset.position`: a per-row integer code buffer of
+    `n_position_rows` entries (float64 at this boundary, like every other
+    column), densified by first appearance. 0 rows means no position column,
+    the ordinary LambdaRank case."""
+    var n = Int(py=params.get("n_position_rows", PythonObject(0)))
+    if n == 0:
+        return PositionMap.absent()
+    if n != n_rows:
+        raise Error(
+            "position must have one entry per row; got ", n, " for ", n_rows
+        )
+    var codes = _int_list_from_f64(Int(py=params["position_addr"]), n)
+    return positions_from_codes(codes).positions.copy()
+
+
+def _refuse_advanced_ranking(params: PythonObject, n_rows: Int, where: String) raises:
+    """The metric-driven ranker loop (custom_metric.train_ranker_with_metrics)
+    computes the baseline lambdas only, so the advanced parameters cannot be
+    honored there yet; refuse rather than silently train the plain model."""
+    if advanced_ranking_requested(
+        _parse_advanced_rank_params(params), _parse_positions(params, n_rows)
+    ):
+        raise Error(
+            where,
+            ": label_gain, lambdarank_position_bias_regularization,"
+            " pair_sampling_rate, max_dcg_cutoff and position are not"
+            " supported together with eval_set yet; fit without eval_set"
+            " to use them",
+        )
+
+
 def _group_counts(params: PythonObject) raises -> List[Int]:
     """Per-query row counts (LightGBM's `group`) from the params dict. They
     travel as float64 like every other buffer at this boundary."""
@@ -1686,6 +1760,28 @@ def fit_ranker(
     var labels = _int_list_from_f64(Int(py=y_addr), nr)
     var bp = _parse_params(params, nf, unbundled="fit_ranker")
     var weights = _parse_weights(params, nr)
+    var advanced = _parse_advanced_rank_params(params)
+    var positions = _parse_positions(params, nr)
+    if advanced_ranking_requested(advanced, positions):
+        # Custom label_gain, position bias, pair sampling, or a decoupled
+        # maxDCG cutoff: ranking_advanced's loop. The learned position
+        # biases are training state and are not part of the model.
+        var fitted = mojo_fit_ranker_advanced(
+            features,
+            nr,
+            nf,
+            labels,
+            _group_counts(params),
+            bp,
+            advanced,
+            positions,
+            Int(py=params["max_bin"]),
+            weights,
+            _parse_bagging(params),
+            use_missing=_parse_use_missing(params),
+            categorical_features=_parse_categorical(params),
+        )
+        return PythonObject(alloc=fitted.model.copy())
     var model = mojo_fit_ranker(
         features,
         nr,
@@ -1693,7 +1789,7 @@ def fit_ranker(
         labels,
         _group_counts(params),
         bp,
-        _parse_rank_params(params),
+        advanced.base,
         Int(py=params["max_bin"]),
         weights,
         _parse_bagging(params),
@@ -2984,14 +3080,15 @@ def train_dataset_ranker(
     """Train a LambdaRank model on a constructed dataset, whose `group`
     holds the per-query row counts."""
     var d = dataset.downcast_value_ptr[Dataset]()
-    var model = mojo_train_dataset_ranker(
+    var model = mojo_train_dataset_ranker_advanced(
         d[],
         _parse_params(
             params,
             d[].num_feature(),
             unbundled="train_dataset_ranker",
         ),
-        _parse_rank_params(params),
+        _parse_advanced_rank_params(params),
+        _parse_positions(params, d[].num_data()),
         _parse_bagging(params),
     )
     return PythonObject(alloc=model^)
