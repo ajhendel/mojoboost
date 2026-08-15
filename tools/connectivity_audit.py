@@ -861,7 +861,7 @@ PY_IMPORT_PKG = re.compile(
 
 #: `_mojotrees.name` and `getattr(_mojotrees, "name")`, the only two ways
 #: Python in this package reaches the extension module.
-NATIVE_ATTR = re.compile(r"_mojotrees\.([A-Za-z_][A-Za-z_0-9]*)")
+NATIVE_ATTR = re.compile(r"_mojotrees\.(?!mojo\b)([A-Za-z_][A-Za-z_0-9]*)")
 NATIVE_GETATTR = re.compile(
     r"getattr\(\s*_mojotrees\s*,\s*\"([A-Za-z_][A-Za-z_0-9]*)\""
 )
@@ -1007,6 +1007,12 @@ def audit_unused_imports():
     paths = walk(NATIVE_PKG, ".mojo")
     paths += walk(BINDINGS_DIR, ".mojo")
     for path in paths:
+        if os.path.basename(path) == "__init__.mojo":
+            # The package root imports in order to re-export; every name in
+            # its import block is the public surface, not an unused import.
+            # Whether a re-exported module is reached is the orphan section's
+            # question, not this one's.
+            continue
         text = read(path)
         if text is None:
             continue
@@ -1217,14 +1223,32 @@ def audit_binding_modules():
     body = strip_mojo_comments(text)
     build = read(os.path.join(BINDINGS_DIR, "build.sh")) or ""
 
+    # Reachability is transitive: a sibling the entry point imports may
+    # itself import a helper module (binding_support is reached that way by
+    # every capability module), and build.sh's `-I bindings` puts the whole
+    # directory on the include path.
+    reached = set()
+    frontier = ["_mojotrees"]
+    while frontier:
+        stem = frontier.pop()
+        if stem in reached:
+            continue
+        reached.add(stem)
+        src = read(os.path.join(BINDINGS_DIR, stem + ".mojo"))
+        if src is None:
+            continue
+        for dep in re.findall(
+            r"^from\s+([A-Za-z_][A-Za-z_0-9]*)\s+import",
+            strip_mojo_comments(src),
+            re.MULTILINE,
+        ):
+            frontier.append(dep)
+
     for path in walk(BINDINGS_DIR, ".mojo"):
         stem = os.path.splitext(os.path.basename(path))[0]
         if stem == "_mojotrees":
             continue
-        imported = re.search(
-            r"^from\s+%s\s+import" % re.escape(stem), body, re.MULTILINE
-        )
-        if imported:
+        if stem in reached:
             continue
         defined = 0
         sibling = read(path)

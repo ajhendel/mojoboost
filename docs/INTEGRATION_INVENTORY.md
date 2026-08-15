@@ -52,36 +52,36 @@ it, not a second opinion.
 
 | Module | Kind | Owner | Why it is not reached |
 |---|---|---|---|
-| `alternate_boosting` | PENDING | connect_17 | DART and random-forest dispatch. Nothing imports it, so neither mode has a route; `boosting.mojo` still owns the only round loop |
-| `backend` | EXPERIMENTAL | connect_01 | A one-function dispatch shim kept as the reference `tests/test_backend_equivalence.mojo` compares against. Test-only by design |
-| `boosting_dart` | PENDING | connect_17 | Reached only from `alternate_boosting`, itself unreachable |
-| `boosting_rf` | PENDING | connect_17 | Reached only from `alternate_boosting`, itself unreachable |
-| `cegb` | PENDING | unassigned | LightGBM's four `cegb_*` controls as a gain adjustment. No grower charges a split, and no parameter turns it on |
-| `distributed_gpu` | PENDING | unassigned | Contracts for distributed GPU histogram exchange. Nothing joins `train_gpu` to `distributed`, and its own docstring says so |
-| `distributed_strategies` | PENDING | unassigned | Feature-parallel and voting-parallel cores. `distributed.mojo` implements data-parallel only and never dispatches to these |
-| `external_memory` | PENDING | unassigned | Streaming dataset construction over `sequence`. No entry point offers an out-of-core fit |
-| `gpu_amd_policy` | PENDING | unassigned | HIP launch policy. Reached only from `gpu_cuda_policy`, itself unreachable |
-| `gpu_cuda_policy` | PENDING | unassigned | CUDA launch policy. Nothing on the shipping GPU path selects a backend-specific policy |
-| `gpu_categorical` | PENDING | connect_10 | GPU category statistics; the GPU trainer refuses categoricals |
-| `gpu_sparse` | PENDING | connect_10 | Reached only from `gpu_categorical`, itself unreachable |
-| `gpu_sparse_layout` | PENDING | connect_10 | Reached only from `gpu_sparse`, itself unreachable |
-| `lgbm_model_io` | PENDING | connect_16 | LightGBM text model reader and writer; no entry point offers it. Reached from `tests/parallel/test_lgbm_model_io.mojo` only |
-| `linear_tree` | PENDING | unassigned | Linear leaves as an algorithm core. `params.mojo` parses `linear_tree` and `tree_parameters_extra.mojo` names it, but no grower imports this module |
-| `model_editing` | PENDING | unassigned | `rollback_one_iter`, `set_leaf_output`, `shuffle_models`, `refit`, prediction bounds. No binding and no native caller |
-| `ranking_advanced` | PENDING | unassigned | The ranking layer above `ranking.mojo`. Nothing imports it, so the extras have no route |
-| `sequence` | PENDING | unassigned | The chunk protocol every streaming path is written against. Reached only from `external_memory`, itself unreachable |
-| `validation` | PENDING | unassigned | The central validation layer. Call sites still re-derive their own checks; nothing imports this module |
+| `alternate_boosting` | PENDING | connect_17 | DART and random-forest dispatch. Nothing imports it, so neither mode has a route; boosting.mojo still owns the only round loop |
+| `backend` | EXPERIMENTAL | connect_01 | A one-function dispatch shim kept as the reference the CPU/GPU equivalence test compares against. Test-only by design |
+| `boosting_dart` | PENDING | connect_17 | Reached only from alternate_boosting, itself unreachable |
+| `boosting_rf` | PENDING | connect_17 | Reached only from alternate_boosting, itself unreachable |
+| `cegb` | PENDING | consolidation_K10 | LightGBM cegb_* controls, complete and self-contained. Parked until a trainer accepts the cegb params and the boosting loop hooks it |
+| `distributed_gpu` | EXPERIMENTAL | consolidation_K9 | Host-arithmetic contract for a distributed fixed-point GPU histogram exchange; require_distributed_gpu refuses it until HAS_DEVICE_COLLECTIVE, transport_available(), and GPU_SPEEDUP_GATE_MET all hold. Parked, not superseded; its constants now come from quantized_gradient |
+| `distributed_strategies` | EXPERIMENTAL | consolidation_K9 | Feature-parallel and voting-parallel cores over Collective; self-gated by require_strategy_operational, which refuses both modes until transport_available() is True. Parked, not superseded: distributed.mojo implements only data parallel |
+| `external_memory` | PENDING | consolidation_K10 | Streaming Dataset construction over sequence.mojo. Parked with sequence until an export and a chunk binding connect them together |
+| `gpu_categorical` | PENDING | consolidation_K10 | GPU category statistics; the GPU trainer refuses categoricals. Parked until train_gpu accepts categorical specs |
+| `gpu_sparse` | PENDING | consolidation_K10 | Reached only from gpu_categorical; same unblocker |
+| `gpu_sparse_layout` | PENDING | consolidation_K10 | Reached only from gpu_sparse; same unblocker |
+| `gpu_vendor_policy` | EXPERIMENTAL | consolidation_K2 | CUDA and HIP occupancy policy, merged from the gpu_cuda_policy / gpu_amd_policy twins (f23bd1b). Reached only from its test until a discrete-GPU trainer consults it; that is the same status the twins had. handoffs/migration_20_device_policy.md |
+| `lgbm_model_io` | EXPERIMENTAL | consolidation_K10 | LightGBM text model interop, quarantined by its own LGBM_INTEROP_STATUS and reached only from its test. Parked until a binding exists and the status flips |
+| `linear_tree` | PENDING | consolidation_K10 | linear_tree=true ensembles. Parked until Booster holds a LinearEnsemble and model I/O carries it; codes come from objective_registry |
+| `model_editing` | PENDING | consolidation_K10 | In-place leaf editing. Its MODEL_EDITING_SUPPORTED=True is the feature's claim; inspection.mojo's False is what ships. Parked until connected, when inspection re-exports this module's status |
+| `ranking_advanced` | PENDING | consolidation_K10 | Position bias, pair sampling, custom label gain, fold shuffle. Parked until fit_ranker grows those parameters |
+| `sequence` | PENDING | consolidation_K4 | Bounded-memory chunk protocol external_memory.mojo is written against; coherent, not a duplicate of python _sequence.py. Parked until an export plus external_memory validation connects it (handoffs/connect_21_native_interfaces.md) |
+| `validation` | PENDING | remaining_12 | Central validation layer named by python _validation.py's manifest. Parked until the manifest lane routes trainers through it |
 
 Three shapes recur and are worth naming, because they change what a fix
 costs:
 
 - **Chains.** `gpu_sparse_layout` is unreachable only because `gpu_sparse`
-  is, `sequence` only because `external_memory` is, and `gpu_amd_policy`
-  only because `gpu_cuda_policy` is. One connecting edge at the head of a
-  chain reaches all of it, so the count of orphans overstates the count of
-  decisions.
-- **Test-only modules.** `backend` and `lgbm_model_io` are imported by
-  their own suites and by nothing else. Their tests pass, which is why the
+  is, and `sequence` only because `external_memory` is. One connecting edge
+  at the head of a chain reaches all of it, so the count of orphans
+  overstates the count of decisions. (`gpu_amd_policy` and `gpu_cuda_policy`
+  were such a chain until the consolidation round merged them into
+  `gpu_vendor_policy`, f23bd1b.)
+- **Test-only modules.** `backend`, `lgbm_model_io`, and `gpu_vendor_policy`
+  are imported by their own suites and by nothing else. Their tests pass, which is why the
   parity contract can say `focused-tested: yes` and `integrated: no` in the
   same row without contradicting itself.
 - **Named but not imported.** `linear_tree` and `cegb` have their parameter
