@@ -159,7 +159,6 @@ from .callback import (
     ABORT,
     AFTER_ITERATION,
     BEFORE_ITERATION,
-    CONTINUE,
     IterationEnv,
     IterationFn,
     STOP,

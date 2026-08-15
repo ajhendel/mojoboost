@@ -53,7 +53,6 @@ from .efb import check_bundling_supported
 from .sampling import canonical_data_sample_strategy
 from .validation import check_booster_ranges, check_max_bin
 from .growth_policy import parse_grow_policy
-from .tree import TreeParams
 from .tree_parameters_extra import (
     check_extra_option_supported,
     parse_monotone_method,

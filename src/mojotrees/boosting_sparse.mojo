@@ -75,7 +75,6 @@ from .boosting import (
     _fill_softmax_grad_hess,
     _mean_loss,
     _multiclass_goss_select,
-    _multiclass_mean_loss,
     _percentile,
     _softmax_inplace,
     _weighted_percentile,
@@ -97,7 +96,7 @@ from .sampling import (
     has_positive_rows,
     refresh_class_bag,
 )
-from .sparse import SparseBinnedMatrix, SparseBinnedRows
+from .sparse import SparseBinnedMatrix
 from .tree import Tree, node_bounds
 from .tree_parameters_extra import ExtraTreeParams, finish_leaf_output
 from .tree_sparse import (

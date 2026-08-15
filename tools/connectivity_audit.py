@@ -262,13 +262,6 @@ CLASSIFICATION = {
         "LightGBM cegb_* controls, complete and self-contained. Parked until "
         "a trainer accepts the cegb params and the boosting loop hooks it.",
     ),
-    "lgbm_model_io": (
-        EXPERIMENTAL,
-        "consolidation_K10",
-        "LightGBM text model interop, quarantined by its own "
-        "LGBM_INTEROP_STATUS and reached only from its test. Parked until a "
-        "binding exists and the status flips.",
-    ),
     "gpu_categorical": (
         PENDING,
         "consolidation_K10",
@@ -294,6 +287,57 @@ CLASSIFICATION = {
         "had. handoffs/migration_20_device_policy.md.",
     ),
     # -- Python modules ----------------------------------------------------
+    "mojotrees.lgbm_model_io": (
+        EXPERIMENTAL,
+        "integration_C0",
+        "Lazy submodule (_LAZY_SUBMODULES) like dask: reachable as "
+        "mojotrees.lgbm_model_io after a plain import, exporting nothing at "
+        "top level so a LightGBM model-file conversion is asked for by name. "
+        "Its four entry points are bound in bindings/lgbm_bindings.mojo and "
+        "covered by python/tests/test_lgbm_interop.py.",
+    ),
+    # -- gated on the GPU files another session holds dirty ----------------
+    # Each of these is one edit inside histogram_gpu.mojo / train_gpu.mojo /
+    # gpu_active_rows.mojo, or a caller in tests/parallel/test_gpu_active_rows
+    # .mojo, all of which the GPU session has uncommitted. The edit itself is
+    # written down in handoffs/consolidation_round.md, "Integration round
+    # close-out". Nothing else blocks them.
+    "MAX_BINS": (
+        PENDING,
+        "gpu-session",
+        "histogram_gpu.MAX_BINS should import binning.MAX_BINS; "
+        "histogram_gpu.mojo is dirty in the GPU session.",
+    ),
+    "MAX_ROWS": (
+        PENDING,
+        "gpu-session",
+        "One MAX_ROWS in gpu_active_rows, imported by histogram_gpu; "
+        "K8 step 3, both files dirty in the GPU session.",
+    ),
+    "METRIC_L1": (
+        PENDING,
+        "gpu-session",
+        "gpu_predict's device metric codes are DEVICE_METRIC_*; the METRIC_* "
+        "aliases go once train_gpu.mojo (dirty) stops importing them.",
+    ),
+    "METRIC_L2": (
+        PENDING,
+        "gpu-session",
+        "Same as METRIC_L1.",
+    ),
+    "partition_rows": (
+        PENDING,
+        "gpu-session",
+        "distributed.partition_rows is the exported one; tree.partition_rows "
+        "becomes partition_split_rows once its caller "
+        "tests/parallel/test_gpu_active_rows.mojo (dirty) can be edited.",
+    ),
+    "gpu_tiling": (
+        PENDING,
+        "gpu-session",
+        "histogram_gpu.mojo imports STRATEGY_ATOMIC and STRATEGY_TILED and "
+        "uses neither; the file is dirty in the GPU session.",
+    ),
     "mojotrees.dask": (
         EXPERIMENTAL,
         "consolidation_K7",
@@ -791,6 +835,24 @@ class Finding(object):
 # -- 1. orphan native modules ----------------------------------------------
 
 
+#: `from <name> import ...` where `<name>` is a top-level module, as the
+#: bindings entry point imports its capability modules.
+TOP_LEVEL_IMPORT = re.compile(
+    r"^from\s+([A-Za-z_][A-Za-z_0-9]*)\s+import\b", re.MULTILINE
+)
+
+
+def sibling_modules(path, text):
+    """Files next to `path` that it imports as top-level modules."""
+    directory = os.path.dirname(path)
+    out = []
+    for name in TOP_LEVEL_IMPORT.findall(strip_mojo_comments(text)):
+        sibling = os.path.join(directory, name + ".mojo")
+        if os.path.exists(os.path.join(ROOT, sibling)):
+            out.append(sibling)
+    return out
+
+
 def audit_orphans():
     """Native modules no entry point reaches, annotated with what does."""
     findings = []
@@ -802,6 +864,14 @@ def audit_orphans():
         if text is None:
             raise AuditError("missing entry point: " + path)
         seeds = set(mojo_imports(path, text).keys()) & set(graph)
+        # The extension entry point is split across bindings/*.mojo: a
+        # capability module it imports (`from x_bindings import ...`) is
+        # part of the same shared library, so what that module imports from
+        # the package is reached by the bindings root too. Which capability
+        # modules the entry point forgets to import is the binding-modules
+        # section's finding, not this one's.
+        for sibling in sibling_modules(path, text):
+            seeds |= set(mojo_imports(sibling).keys()) & set(graph)
         for module in reachable_from(seeds, graph):
             reached_by[module].add(label)
 
@@ -830,6 +900,25 @@ def audit_orphans():
 # -- 2. imported but never called ------------------------------------------
 
 
+#: Modules whose import block IS their surface. Each one says so in its own
+#: docstring: device.mojo "defines nothing" and re-exports device_policy's
+#: vocabulary unchanged; inspection.mojo re-exports model_dump's schema
+#: primitives "so a caller that reaches for inspection finds them where the
+#: schema doc says they are"; apple_gpu_policy.mojo imports gpu_tiling's
+#: geometry constants "and re-exported under the same names" where earlier
+#: revisions carried copies. Names they import and never mention are the
+#: point, not a fake connection, so the unused-import check skips them. Any
+#: other file that wants the same exemption has to earn it with a docstring
+#: and a row here.
+REEXPORT_FACADES = frozenset(
+    [
+        os.path.join(NATIVE_PKG, "apple_gpu_policy.mojo"),
+        os.path.join(NATIVE_PKG, "device.mojo"),
+        os.path.join(NATIVE_PKG, "inspection.mojo"),
+    ]
+)
+
+
 def audit_unused_imports():
     """Symbols a file imports and never mentions again.
 
@@ -846,6 +935,8 @@ def audit_unused_imports():
             # its import block is the public surface, not an unused import.
             # Whether a re-exported module is reached is the orphan section's
             # question, not this one's.
+            continue
+        if path in REEXPORT_FACADES:
             continue
         text = read(path)
         if text is None:
@@ -1293,10 +1384,14 @@ def struct_fields(module, struct_name):
 
 # -- 8. referenced paths that do not exist ---------------------------------
 
+#: A repository path as prose cites it. The lookbehind keeps a longer path
+#: from being read as one of ours (`r/mojotrees/src/mojotrees_r.c` is not
+#: `src/mojotrees_r.c`); the lookahead keeps `.h` from matching the front of
+#: LightGBM's `.hpp` files.
 REPO_PATH = re.compile(
-    r"\b((?:docs|tests|bench|tools|src|python|bindings|capi|cli|packaging|"
-    r"examples|hardware|launch)/[A-Za-z0-9_./-]+"
-    r"\.(?:md|py|mojo|toml|sh|yml|yaml|h|c|json|txt))"
+    r"(?<![A-Za-z0-9_./-])((?:docs|tests|bench|tools|src|python|bindings|"
+    r"capi|cli|packaging|examples|hardware|launch)/[A-Za-z0-9_./-]+"
+    r"\.(?:md|py|mojo|toml|sh|yml|yaml|h|c|json|txt))(?![A-Za-z0-9])"
 )
 
 

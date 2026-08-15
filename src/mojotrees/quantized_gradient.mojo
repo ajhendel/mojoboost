@@ -178,7 +178,7 @@ policy in prose.
 from std.math import floor, isfinite, round
 
 from .binning import BinnedMatrix
-from .gain import leaf_score, soft_threshold_l1
+from .gain import leaf_score
 from .histogram import Histogram, _zeroed_f64, _zeroed_int
 from .parallel import dispatch_feature_ranges
 from .rng import GOLDEN, splitmix64, uniform

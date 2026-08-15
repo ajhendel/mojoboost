@@ -262,9 +262,9 @@ MOJOTREES_STARTUP_TRACE=1 MOJOTREES_GPU_WARMUP=train pixi run bench-startup
 MOJOTREES_STARTUP_TRACE=1 MOJOTREES_DISABLE_GPU=1 pixi run bench-startup
 ```
 
-`bench/bench_startup.mojo` and the `bench-startup` pixi task **do not
-exist**. They belong to the benchmark lane; the handoff specifies what they
-have to do.
+A startup benchmark under `bench/` and the `bench-startup` pixi task **do
+not exist**. They belong to the benchmark lane; the handoff specifies what
+they have to do.
 
 Pair the startup trace with the per-fit trace, which does exist:
 

@@ -119,7 +119,6 @@ from std.os import getenv
 from .apple_gpu_policy import (
     API_UNKNOWN,
     APPLE_GEN_UNKNOWN,
-    MAX_RESIDENT_BLOCKS_PER_CORE,
     GpuProfile,
     partial_budget_bytes,
     resident_blocks_for_bytes,

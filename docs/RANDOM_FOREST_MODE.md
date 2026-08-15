@@ -6,10 +6,12 @@ does differently, and what has not been verified. It describes
 `src/mojotrees/boosting_rf.mojo`, which is the algorithm core and is not a
 public API.
 
-Status, in one line: the core is written and its `boosting='rf'` surface is
-imported by `src/mojotrees/alternate_boosting.mojo`; every entry point
-compiles, nothing has been run, and `boosting='rf'` is still rejected by the
-Python layer and by `parse_params`. See section 10.
+Status, in one line (2026-08-15): `boosting='rf'` is reachable from the
+estimators, from `_mojotrees.fit`, and from `alternate_boosting.fit_boosting`
+/ `fit_boosting_multiclass` on the Mojo API; it trains at learning rate 1.0
+and refuses an unrandomized run; `tests/test_alternate_boosting.mojo` and
+`python/tests/test_params.py` run it. Not compared against LightGBM's rf
+output. See section 10.
 
 ## 1. What random-forest mode is, and what it is not
 
@@ -275,13 +277,16 @@ the counts, and the distributions match. This is the trade `bagging.mojo` and
 
 ## 10. What has not been verified
 
-Every entry point here has been compiled, by a throwaway driver that calls
-each one so that `mojo build` elaborates its body rather than only its
-signature. Nothing has been run. No test file references `boosting_rf.mojo`,
-no benchmark trains a forest, and no comparison against LightGBM's rf output
-has been made. Every claim above is a reading of `src/boosting/rf.hpp`
-(master, read 2026-08-15) and of the mojotrees modules named, and the parity
-claims are claims about intent rather than measurements.
+Run since the integration round (2026-08-15):
+`tests/test_alternate_boosting.mojo` trains rf single-output and multiclass
+models through `alternate_boosting`, checks the binary response is a
+probability, round-trips a forest through the model file, and checks the
+unrandomized and shrunk refusals; `python/tests/test_params.py` fits
+`boosting_type="rf"` through `MojoTreesRegressor`. Not done: no benchmark
+trains a forest and no comparison against LightGBM's rf output has been
+made. Every claim above is a reading of `src/boosting/rf.hpp` (master, read
+2026-08-15) and of the mojotrees modules named, and the parity claims about
+LightGBM's numbers are claims about intent rather than measurements.
 
 The first checks worth writing, cheapest first:
 

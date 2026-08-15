@@ -80,11 +80,11 @@ values in tests/test_ranking.mojo.
 from std.math import exp, log2
 
 from .bagging import BaggingParams, bagging_enabled, check_bagging, sample_rows
-from .binning import BinMapper, BinnedMatrix, fit_bins
+from .binning import BinnedMatrix, fit_bins
 from .boosting import Booster, BoosterParams, _check_sample_weight
 from .model import Model
 from .objective_registry import LAMBDARANK as _LAMBDARANK
-from .tree import Tree, TreeParams, grow_tree
+from .tree import Tree, grow_tree
 
 # Objective code for a LambdaRank booster, defined once in
 # objective_registry.mojo with the other codes and bound here under the name

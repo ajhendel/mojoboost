@@ -34,7 +34,7 @@ and maps them here.
 from std.math import exp, log
 
 from .binning import BinnedMatrix
-from .efb import BundledMatrix, EfbSettings, prepare_bundling
+from .efb import EfbSettings, prepare_bundling
 from .parallel import dispatch_rows
 from .metrics import _argsort
 from .bagging import (

@@ -467,19 +467,24 @@ The comparison must be **time to matched quality**:
    bandwidth-bound workload showing no gain is the expected outcome there,
    not a failure of the experiment.
 
-## 11. What this lane implemented, and what it did not
+## 11. What this lane implemented, and what became of it
 
-Implemented, host-side and free of device imports so it builds without an
-accelerator:
+Implemented at the time, host-side and free of device imports, in two
+modules that no longer exist under those names (commit `f4651d1`):
 
-- `src/mojotrees/levelwise_policy.mojo`: `LevelwiseParams`, the budget modes,
+- A levelwise policy module: `LevelwiseParams`, the budget modes,
   `LevelCandidate`, `rank_level`, `admit_level`, `level_stop_reason`, the two
   shape-rule mirrors, `level_capacity`, `full_level_depth`,
-  `effective_max_depth`, and the launch profiles.
-- `src/mojotrees/gpu_levelwise.mojo`: `LevelNode`, `LevelFrontier`,
-  `ChildSums` and `child_sums`, `child_leaf_value`, `CommittedSplit`,
-  `LevelCommit`, `level_candidates`, `plan_level`, `decide_level`,
-  `check_child_ids`, and the sizing helpers.
+  `effective_max_depth`, and the launch profiles. The surviving parts are
+  `src/mojotrees/growth_policy.mojo`, which is now the one leaf pick for
+  both growth policies; the launch profiles and capacity helpers went with
+  the grower below.
+- A `gpu_levelwise` grower: `LevelNode`, `LevelFrontier`, `ChildSums` and
+  `child_sums`, `child_leaf_value`, `CommittedSplit`, `LevelCommit`,
+  `level_candidates`, `plan_level`, `decide_level`, `check_child_ids`, and
+  the sizing helpers. Deleted as a second commit path nothing imported or
+  tested; the header of this document says what a rebuilt version would
+  sit underneath.
 
 Not implemented, and required before any of this trains a tree:
 
@@ -490,10 +495,10 @@ Not implemented, and required before any of this trains a tree:
 - The grower loop itself, and its entry point in `train_gpu.mojo`.
 - Tests. This lane wrote none by instruction.
 
-Neither module is registered in `src/mojotrees/__init__.mojo`, on purpose:
-the package surface is not this lane's to change, and nothing should be able
-to reach this mode by accident. See
-`handoffs/algorithm_24_levelwise.md` for the integration steps in order.
+Nothing here is registered in `src/mojotrees/__init__.mojo`, on purpose:
+nothing should be able to reach this mode by accident. The integration
+steps, in order, are recorded in `handoffs/consolidation_round.md` under
+K8.
 
 ## 12. Open questions
 

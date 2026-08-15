@@ -347,8 +347,9 @@ audit exists to separate, and EFB is its clearest instance.
   imports `_mojotrees` directly, above that line, restores the abort. The
   comment above the call says so, which is the cheapest defense there is.
 
-`python/build/lib.macosx-11.0-arm64-cpython-314/mojotrees/__init__.py` is a
-stale copy of the package from an earlier build. It is not an orphan so much
+A stale copy of the package from an earlier build lived under
+`python/build/` when this was written (a `lib.macosx-*` directory holding
+its own `mojotrees/__init__.py`); it has since been removed. It is not an orphan so much
 as debris, and it will confuse any grep run over `python/` that does not
 exclude it. The script skips `build/` by name.
 
@@ -420,7 +421,7 @@ there:
 
 | Path | Named by | Reading |
 | --- | --- | --- |
-| `bench/bench_startup.mojo` | `docs/STARTUP_LATENCY.md:265` | the doc says it "does not exist" in the same sentence, so this is honest prose, not a broken claim |
+| a startup benchmark under `bench/` | `docs/STARTUP_LATENCY.md:265` | the doc says it "does not exist" in the same sentence, so this is honest prose, not a broken claim; the sentence no longer spells a path so the script does not read it as one |
 | `tools/api_snapshot.py` | `docs/COMPATIBILITY_POLICY.md:770` | the doc calls itself the specification for a script that has not been written; `tests/parallel/api_snapshot_manifest.json` exists and nothing reads it |
 
 Parity evidence is in better shape than that ratio suggests, and the reason

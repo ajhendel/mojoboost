@@ -10,7 +10,7 @@ which is the same tree ensemble either way and serializes identically.
 """
 
 from .bagging import BaggingParams
-from .binning import BinMapper, BinnedMatrix, fit_bins
+from .binning import BinMapper, fit_bins
 from .boosting import (
     Booster,
     BoosterParams,

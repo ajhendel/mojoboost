@@ -85,7 +85,6 @@ from .binning import BinMapper, BinnedMatrix, fit_bins
 from .boosting import (
     Booster,
     BoosterParams,
-    MulticlassBooster,
     train,
     train_more,
     train_multiclass,

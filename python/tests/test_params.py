@@ -166,7 +166,6 @@ def test_conflicting_boosting_aliases_raise(regression):
 @pytest.mark.parametrize(
     "kwargs",
     [
-        {"boosting": "dart"},
         {"boosting": "goss", "top_rate": 1.5},
         {"boosting": "goss", "other_rate": -0.1},
         {"boosting": "goss", "top_rate": 0.7, "other_rate": 0.4},
@@ -178,6 +177,40 @@ def test_conflicting_boosting_aliases_raise(regression):
     ],
 )
 def test_goss_parameter_validation(kwargs, regression):
+    X, y = regression
+    with pytest.raises(ValueError):
+        MojoTreesRegressor(n_estimators=5, **kwargs).fit(X, y)
+
+
+def test_dart_and_rf_train_through_the_estimator(regression):
+    """`boosting="dart"` and `"rf"` reach `alternate_boosting.fit_boosting`
+    from the plain fit path; both must move the fit off gbdt."""
+    X, y = regression
+    gbdt = MojoTreesRegressor(n_estimators=8, num_leaves=5).fit(X, y)
+    dart = MojoTreesRegressor(
+        n_estimators=8, num_leaves=5, boosting="dart", drop_rate=0.5,
+        skip_drop=0.0, drop_seed=3,
+    ).fit(X, y)
+    rf = MojoTreesRegressor(
+        n_estimators=8, num_leaves=5, boosting_type="rf",
+        bagging_fraction=0.6, bagging_freq=1, bagging_seed=3,
+    ).fit(X, y)
+    base = gbdt.predict(X[:20])
+    assert list(dart.predict(X[:20])) != list(base)
+    assert list(rf.predict(X[:20])) != list(base)
+    assert dart.booster_.num_trees() == 8
+    assert rf.booster_.num_trees() == 8
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"boosting": "dart", "drop_rate": 1.5},
+        {"boosting": "dart", "skip_drop": -0.1},
+        {"boosting": "dart", "drop_seed": -1},
+    ],
+)
+def test_dart_parameter_validation(kwargs, regression):
     X, y = regression
     with pytest.raises(ValueError):
         MojoTreesRegressor(n_estimators=5, **kwargs).fit(X, y)

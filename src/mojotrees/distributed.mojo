@@ -77,7 +77,6 @@ from .callback import (
     ABORT,
     AFTER_ITERATION,
     BEFORE_ITERATION,
-    CONTINUE,
     STOP,
     IterationEnv,
     IterationFn,
@@ -86,7 +85,6 @@ from .callback import (
 from .collective import (
     STATUS_INVALID_TARGET,
     STATUS_INVALID_WEIGHT,
-    STATUS_OK,
     STATUS_PARTITION_MISMATCH,
     STATUS_SHAPE_MISMATCH,
     Collective,

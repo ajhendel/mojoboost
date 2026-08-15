@@ -6,10 +6,13 @@ what mojotrees implements, what it deliberately refuses, and what has not
 been verified. It describes `src/mojotrees/boosting_dart.mojo`, which is the
 algorithm core and is not a public API.
 
-Status, in one line: the core is written, every entry point in it and in
-`src/mojotrees/alternate_boosting.mojo` compiles, nothing has been run, and
-`boosting='dart'` is still rejected by the Python layer and by
-`parse_params`. See section 11 for exactly what "compiles" is worth here.
+Status, in one line (2026-08-15): `boosting='dart'` is reachable from the
+estimators, from `_mojotrees.fit`, and from `alternate_boosting.fit_boosting`
+/ `fit_boosting_multiclass` on the Mojo API; both drop rules are read off
+LightGBM's `dart.hpp`; `tests/test_alternate_boosting.mojo` and
+`python/tests/test_params.py` run it. Not done: `eval_set` early stopping
+under dart from any entry point, and any comparison against LightGBM's
+output. Section 11 records what was and was not verified.
 
 ## 1. The problem DART solves
 
@@ -280,10 +283,14 @@ it, quoted where it matters. Every function named in this document has been
 compiled, by a throwaway driver that calls each entry point so that `mojo
 build` elaborates its body rather than only its signature.
 
-What has not: nothing has been executed. No test file references
-`boosting_dart.mojo` or the DART entry points in `alternate_boosting.mojo`,
-no benchmark trains a DART model, and no output has been compared against
-LightGBM's. Compiling proves the types line up, and nothing else.
+What has since been run (integration round, 2026-08-15):
+`tests/test_alternate_boosting.mojo` trains dart single-output and
+multiclass models through `alternate_boosting`, checks them finite and
+distinct from gbdt, and round-trips them through the model file;
+`python/tests/test_params.py` fits `boosting="dart"` through
+`MojoTreesRegressor`. What has not: no benchmark trains a DART model and no
+output has been compared against LightGBM's, so the parity row says
+`partial` and claims no numeric equality.
 
 The cheapest checks, in the order they are worth writing:
 

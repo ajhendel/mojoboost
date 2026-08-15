@@ -29,9 +29,7 @@ from .binning import BinMapper
 from .boosting import (
     BINARY_LOGISTIC,
     POISSON,
-    Booster,
     BoosterParams,
-    MulticlassBooster,
     _sigmoid,
     _softmax_inplace,
 )

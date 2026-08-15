@@ -33,7 +33,7 @@ from std.python import PythonObject
 
 from binding_support import nonnegative, py_dict, py_str_list
 
-from mojotrees.binning import BinnedMatrix, fit_bins
+from mojotrees.binning import fit_bins
 from mojotrees.boosting import BoosterParams
 from mojotrees.callback import no_callback
 from mojotrees.collective import LocalCollective

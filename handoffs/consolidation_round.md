@@ -510,30 +510,67 @@ validation layer under every trainer, dataset build, and estimator fit.
 `tools/audit_integration.py` all green; the new tests are in the `test` and
 `test-cpu` pixi suites.
 
-What remains, and why:
+What remains, and why (revised 2026-08-15 evening, after the cleanup pass
+below):
 
-- Six native orphans: `gpu_categorical` -> `gpu_sparse` ->
+- Five native orphans: `gpu_categorical` -> `gpu_sparse` ->
   `gpu_sparse_layout` need `train_gpu.mojo` / `histogram_gpu.mojo`, which
   another session held dirty (and non-parsing) for the whole round;
-  `lgbm_model_io` waits on that session's untracked
-  `python/mojotrees/lgbm_model_io.py`; `gpu_vendor_policy` has no CUDA/HIP
-  device to be consulted by; `backend` is the CPU/GPU equivalence
-  reference by design.
-- Six duplicate names, every one with a definition in the same held files:
-  `MAX_BINS` / `MAX_ROWS` / `describe_decision` in `histogram_gpu.mojo`,
-  `METRIC_L1` / `L2` aliases in `gpu_predict` until `train_gpu.mojo`
-  imports `DEVICE_METRIC_*`, `partition_rows` (tree vs distributed; rename
-  tree's to `partition_split_rows`, its caller is
-  `tests/parallel/test_gpu_active_rows.mojo`, held).
+  `gpu_vendor_policy` has no CUDA/HIP device to be consulted by; `backend`
+  is the CPU/GPU equivalence reference by design.
+- Five duplicate names, every one with a definition in the same held files:
+  `MAX_BINS` / `MAX_ROWS` in `histogram_gpu.mojo`, `METRIC_L1` / `L2`
+  aliases in `gpu_predict` until `train_gpu.mojo` imports
+  `DEVICE_METRIC_*`, `partition_rows` (tree vs distributed; rename tree's
+  to `partition_split_rows`, its caller is
+  `tests/parallel/test_gpu_active_rows.mojo`, held). One unused import
+  (`STRATEGY_ATOMIC` / `STRATEGY_TILED` in `histogram_gpu.mojo`) is in the
+  same file. Each carries a `gpu-session` row in the audit naming the edit.
 - The same session gates: GPU categoricals, class-batched multiclass by
   default, hybrid leaves reach, distributed GPU device path, `MAX_ROWS`
   single site, `gpu_frontier` speculation trim, the `_mojotrees.mojo`
   `_f64_list` / `_int_list` / `_csc` / `_csr` helpers vs
   `binding_support`. Each is a short edit once `git status` is clean.
-- 22 "imports unused" rows are mechanical (some are re-export files such
-  as `device.mojo`); not touched this round.
 - No LightGBM numeric differential ran for the newly reached features; the
-  parity rows say so. `docs/LIGHTGBM_PARITY.md` rows for dart/rf, cegb,
-  linear_tree, tree_learner, advanced ranking, and ingestion were not
-  rewritten (D2 stopped at the spend limit before them); check-parity
-  passes because it only enforces rows whose symbols it tracks.
+  parity rows say so.
+
+Cleanup pass (2026-08-15 evening, C0), after the close-out above:
+
+- LightGBM model-file interop wired: `bindings/lgbm_bindings.mojo` binds
+  `lgbm_interop_status`, `lgbm_file_unsupported_reason`, `lgbm_import_file`,
+  `lgbm_export_file` (report structs cross as dicts); `mojotrees.lgbm_model_io`
+  is a lazy submodule; four partial field moves in `lgbm_model_io.mojo`'s
+  file-level entry points (`return x.report^`) became `.copy()`, which is why
+  those entry points had never elaborated before; `tests/parallel/test_lgbm_model_io.mojo`
+  29/29 and `python/tests/test_lgbm_interop.py` (round trip through a
+  fitted booster) added. Audit: the bindings root now seeds from the
+  capability modules `_mojotrees.mojo` imports (`sibling_modules`), which is
+  how a module reached only through `bindings/x_bindings.mojo` counts as
+  reached.
+- Dead imports stripped from 15 files (audit rows 22 -> 1, the survivor is
+  in the held `histogram_gpu.mojo`); `device.mojo`, `inspection.mojo`, and
+  `apple_gpu_policy.mojo` are exempted as documented re-export facades
+  (`REEXPORT_FACADES`). After this pass the audit reports 15 findings:
+  5 native orphans, 4 Python modules unreached (all lazy or by design),
+  0 uncalled bindings, 5 duplicate names, 1 unused import.
+- `device_policy.describe_decision` -> `describe_device_decision` (nothing
+  called it; `unified_memory_policy`'s namesake keeps its `histogram_gpu`
+  caller in the held file).
+- Stale-path rows: `REPO_PATH` no longer reads `.h` off `.hpp` or a longer
+  path's tail as one of ours; `docs/design/GPU_LEVELWISE.md` section 11,
+  `docs/STARTUP_LATENCY.md`, and `docs/CONNECTION_AUDIT.md` stopped naming
+  files that were removed.
+- Parity rows rewritten from the tree: LightGBM model file interop, DART
+  and random forest (section 0), `boosting` / `boosting_type`, the six DART
+  parameters, `linear_tree` (new row) / `linear_lambda`, `tree_learner` /
+  `top_k`, feature and voting parallel, `Sequence` (twice), pyarrow, polars,
+  `Dataset.position`, `label_gain`,
+  `lambdarank_position_bias_regularization`; the v1 scope paragraph. Status
+  headers of `docs/LINEAR_TREES.md`, `docs/DART.md`,
+  `docs/RANDOM_FOREST_MODE.md` updated. `pixi run check-parity` ok.
+- Python-side reach tests for what only had native suites:
+  `python/tests/test_wired_features.py` (linear leaves incl. v5 round trip,
+  `tree_learner` data/feature/voting over `num_machines=2`, `label_gain` and
+  `position`, Arrow and polars inputs; 8 pass against the 11:27 extension
+  build) and dart/rf through `MojoTreesRegressor` in
+  `python/tests/test_params.py` (whose stale "dart raises" row was removed).

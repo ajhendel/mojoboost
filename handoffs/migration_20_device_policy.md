@@ -44,8 +44,10 @@ which imports `train_gpu.mojo`, and a peer lane's uncommitted edit to
 it once that lane lands; nothing in device.mojo depends on it.
 
 Not a duplicate, left alone: `EVIDENCE_NONE`, `block_reason_name`, and
-`describe_decision` exist in both `device_policy` and
-`unified_memory_policy` but name different facts (device-decision evidence
+`describe_decision` existed in both `device_policy` and
+`unified_memory_policy` but name different facts (device_policy's is
+`describe_device_decision` since the 2026-08-15 cleanup pass; the transfer
+one keeps the short name for its `histogram_gpu` caller) (device-decision evidence
 identifiers and block codes vs transfer-route evidence levels and block
 codes); device_policy line 166 already says so and imports the transfer
 names under `transfer_*` aliases. connect_05 owns unified_memory_policy.

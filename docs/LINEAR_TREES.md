@@ -1,13 +1,19 @@
 # Linear trees
 
-Status: **implemented, not reachable.** The algorithm core lives in
-`src/mojotrees/linear_tree.mojo`. Nothing public reaches it:
-`params.mojo` refuses `linear_tree` and `linear_lambda` by name through
-`tree_parameters_extra.check_extra_option_supported`, `lgbm_model_io.mojo`
-refuses `is_linear=1` / `leaf_const` / `leaf_coeff` on the way in, and
-`linear_tree.check_linear_tree_public` raises with the list of connections
-that are still outstanding. `handoffs/remaining_03_linear_trees.md` carries
-each of them as a ready-to-apply patch.
+Status (2026-08-15): **implemented and reachable.** The algorithm core
+lives in `src/mojotrees/linear_tree.mojo`; `BoosterParams.linear` switches
+it on from the Mojo API, from the parameter string (`params.mojo` parses
+`linear_tree` and `linear_lambda`), and from the estimators
+(`linear_tree=`, `linear_lambda=`). The metric-path trainers refit each
+grown tree's leaves after growth, the model evaluates the sidecar on the raw
+row, and `serialize` writes format v5 only when a linear ensemble is active.
+Still refused by name: the binned-only trainers, `predict_contrib`, GPU
+prediction, continued training on a linear booster, LambdaRank, and DART
+with linear leaves; `lgbm_model_io.mojo` refuses `is_linear=1` /
+`leaf_const` / `leaf_coeff` on the way in, and `dump_model` shows the
+constant fallback. `tests/test_linear_tree.mojo` and
+`python/tests/test_wired_features.py` are the checks; the parity row in
+`docs/LIGHTGBM_PARITY.md` is the contract.
 
 This document is the normative statement of what a linear leaf is in
 mojotrees, what it refuses to do, and what the model format has to gain.

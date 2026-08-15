@@ -129,7 +129,7 @@ class _Base(_ParamsMixin):
     new one so the ensemble is not overshot; `drop_rate`, `max_drop`,
     `skip_drop`, `xgboost_dart_mode`, and `drop_seed` are LightGBM's
     parameters of those names. `uniform_drop` defaults to True here (LightGBM
-    defaults to False); the non-uniform variant is refused. "rf" is random
+    defaults to False); both drop rules follow LightGBM's `dart.hpp`. "rf" is random
     forest mode: every tree fits the same gradients and the model averages
     them, so `learning_rate` is ignored (trained at 1.0, as LightGBM does)
     and it needs a source of per-tree randomness, `bagging_fraction < 1` with

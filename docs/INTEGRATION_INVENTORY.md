@@ -57,7 +57,6 @@ it, not a second opinion.
 | `gpu_sparse` | PENDING | consolidation_K10 | Reached only from gpu_categorical; same unblocker |
 | `gpu_sparse_layout` | PENDING | consolidation_K10 | Reached only from gpu_sparse; same unblocker |
 | `gpu_vendor_policy` | EXPERIMENTAL | consolidation_K2 | CUDA and HIP occupancy policy, merged from the gpu_cuda_policy / gpu_amd_policy twins (f23bd1b). Reached only from its test until a discrete-GPU trainer consults it; that is the same status the twins had. handoffs/migration_20_device_policy.md |
-| `lgbm_model_io` | EXPERIMENTAL | consolidation_K10 | LightGBM text model interop, quarantined by its own LGBM_INTEROP_STATUS and reached only from its test. Parked until a binding exists and the status flips |
 
 Three shapes recur and are worth naming, because they change what a fix
 costs:
@@ -69,10 +68,14 @@ costs:
   them into `gpu_vendor_policy`, f23bd1b; `sequence` and `external_memory`
   were one until the integration round exported both and gave `Dataset` a
   chunk binding.)
-- **Test-only modules.** `backend`, `lgbm_model_io`, and `gpu_vendor_policy`
-  are imported by their own suites and by nothing else. Their tests pass, which is why the
+- **Test-only modules.** `backend` and `gpu_vendor_policy` are imported by
+  their own suites and by nothing else. Their tests pass, which is why the
   parity contract can say `focused-tested: yes` and `integrated: no` in the
-  same row without contradicting itself.
+  same row without contradicting itself. (`lgbm_model_io` was one until
+  `bindings/lgbm_bindings.mojo` bound its four file-level entry points and
+  `mojotrees.lgbm_model_io` became a lazy submodule; its status text still
+  calls the converter experimental, and that is a claim about validation,
+  not reach.)
 - **Named but not imported.** `linear_tree` and `cegb` have their parameter
   names parsed in `src/mojotrees/params.mojo`, so a user can set them and
   nothing happens. A parameter that parses is not a capability that runs,
@@ -228,6 +231,7 @@ as a free win off this table is a mistake made at least once.
 | `inspection` | `dump_model`, `trees_to_dataframe`, `trees_to_records`, `get_split_value_histogram` | resolved lazily on first attribute access |
 | `device_selection` | `explain_device_choice` | resolved lazily; the rest of the module is not public |
 | `dask` | nothing | no transport ships, so every `fit` raises `DistributedNotAvailable` |
+| `lgbm_model_io` | nothing | resolved lazily; LightGBM model-file import and export through the native converter, experimental by its own `interop_status()` |
 | `diagnostics` | nothing | formats phase durations something else measured; nothing imports it and no suite covers it |
 | `_public_api_plan` | nothing | a plan expressed as data. Its own docstring says nothing in the package imports it, and importing it would be the bug |
 | `_compat` | nothing | holds the pre-import interpreter guard, and nothing calls it, so on an interpreter below the extension floor the process aborts on a missing symbol instead of raising this module's message |

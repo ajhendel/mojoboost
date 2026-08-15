@@ -80,11 +80,8 @@ from .efb import (
 )
 from .histogram import (
     Histogram,
-    build_histogram,
     build_histogram_into,
-    build_histogram_subset,
     build_histogram_subset_into,
-    subtract_histogram,
     subtract_histogram_into,
 )
 from .parallel import plan_row_blocks, run_row_blocks

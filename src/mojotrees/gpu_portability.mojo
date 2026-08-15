@@ -91,7 +91,6 @@ from .apple_gpu_policy import (
     API_CUDA,
     API_HIP,
     API_METAL,
-    API_UNKNOWN,
     GpuProfile,
     api_name,
 )

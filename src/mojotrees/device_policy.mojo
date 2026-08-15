@@ -2119,7 +2119,7 @@ def resolve_device_full(
     return decision.selected_device
 
 
-def describe_decision(decision: DeviceDecision) raises -> String:
+def describe_device_decision(decision: DeviceDecision) raises -> String:
     """One line for benchmark output and bug reports.
 
     The prose report belongs to whoever is formatting for a human;
