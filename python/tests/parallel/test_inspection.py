@@ -471,26 +471,45 @@ def test_unfitted_estimators_have_nothing_to_inspect():
         inspection.dump_model(MojoTreesRegressor())
 
 
-def test_leaf_editing_is_not_offered():
-    """Stated as a test so that adding it is a deliberate act with a place
-    to state its invariants, and not an accident."""
+def test_leaf_editing_lives_on_the_booster_not_here():
+    """This module reads. The mutators are `Booster` methods (basic.py), so
+    they never appear beside the read-only surface."""
+    from mojotrees.basic import Booster
+
     for name in ("set_leaf_output", "set_leaf_value", "edit_leaf"):
         assert not hasattr(inspection, name)
     assert "set_leaf_output" not in inspection.__all__
+    for name in (
+        "set_leaf_output",
+        "get_leaf_output",
+        "rollback_one_iter",
+        "shuffle_models",
+        "refit",
+        "lower_bound",
+        "upper_bound",
+    ):
+        assert callable(getattr(Booster, name))
 
 
-def test_the_refusal_to_edit_is_reported_rather_than_discovered():
-    """The absence above is a decision, so it answers when asked. The
-    reasons are the invariants an edit would falsify, and both of the facts
-    it names are serialized, which is why the contradiction would outlive
-    the session that made it."""
+def test_model_editing_support_reports_each_operation():
+    """The status is the native one and answers per operation, so a
+    consumer branches on a stated fact rather than a missing attribute."""
     status = inspection.model_editing_support()
-    assert status["supported"] is False
-    assert inspection.MODEL_EDITING_SUPPORTED is False
-    assert status["operation"] == "set_leaf_output"
-    assert len(status["invariants"]) == 3
-    assert set(status["serialized_state"]) == {"count", "split_gain"}
-    assert status["read_only_alternative"] == "leaf_outputs"
+    assert status["supported"] is True
+    assert inspection.MODEL_EDITING_SUPPORTED is True
+    assert status["leaf_index"] == "ordinal"
+    by_name = {op["operation"]: op for op in status["operations"]}
+    for name in (
+        "set_leaf_output",
+        "get_leaf_output",
+        "rollback_one_iter",
+        "shuffle_models",
+        "refit",
+        "lower_bound",
+        "upper_bound",
+    ):
+        assert by_name[name]["supported"] is True
+        assert by_name[name]["reason"]
 
 
 # -- gains, importance, and what survives a save -------------------------

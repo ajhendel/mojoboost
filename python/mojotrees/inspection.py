@@ -45,22 +45,19 @@ written by a current build dumps its gains whichever path built the dump.
 A model read from a v1, v2, or v3 file has none to report, and says so
 through `has_split_gain` rather than through a zero.
 
-Not offered
------------
-Leaf editing (LightGBM's `set_leaf_output`). `model_editing_support()`
-reports that as a status with its reasons rather than leaving it to be
-discovered as a missing attribute. A fitted mojotrees tree is consistent
-with a set of invariants this module cannot restate after an arbitrary
-leaf edit: node covers are the training rows that reached a node and are
-what exact TreeSHAP conditions on, internal node values are the values
-those nodes held when they were created, and split gains were computed
-from the sums a leaf held at growth time. An edited leaf value falsifies
-its ancestors' internal values and gains while leaving them in place, and
-no check here could tell an intentional edit from a corrupt one. Both
-covers and gains are now serialized, so the contradiction would outlive
-the session that introduced it. Until those invariants can be stated and
-tested completely, the dump is read only; `leaf_outputs()` is the reading
-half, and there is no writing half.
+Editing
+-------
+This module reads; it does not write. Leaf editing (LightGBM's
+`set_leaf_output`), `rollback_one_iter`, `shuffle_models`, `refit`, and
+the `lower_bound` / `upper_bound` readers live on `Booster` in basic.py
+and are implemented natively in src/mojotrees/model_editing.mojo, which
+keeps every invariant this module reports true across an edit: node
+covers, internal node values, and split gains all describe the tree at
+growth time and are unchanged by a leaf write, and a model recording
+monotone constraints clamps or refuses a value that would break them.
+`model_editing_support()` lists each operation with `supported` and the
+rule it keeps, so a consumer can branch on it rather than probe for a
+method. `leaf_outputs()` is the reading half of a leaf write.
 """
 
 import struct as _struct

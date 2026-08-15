@@ -363,7 +363,8 @@ def test_goss():
     # Two representative rejections; the full validation matrix lives in
     # python/tests/test_params.py.
     for bad in (
-        {"boosting": "dart"},
+        # GOSS's top_rate and other_rate share one unit of rows.
+        {"boosting": "goss", "top_rate": 0.7, "other_rate": 0.5},
         # GOSS and row bagging both own the sampled rows.
         {"boosting": "goss", "bagging_fraction": 0.5, "bagging_freq": 1},
     ):

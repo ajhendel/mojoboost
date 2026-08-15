@@ -19,7 +19,6 @@ prediction runs is still decided in one place, `resolve_device` in
 device.mojo, and nothing here decides it.
 """
 
-from std.memory import unsafe_memcpy
 from std.os import abort
 from std.sys import has_accelerator
 from std.python import Python, PythonObject
@@ -30,6 +29,13 @@ from std.python.bindings import PythonModuleBuilder
 # coherent group and this file is long; they are registered here, in the one
 # `PythonModuleBuilder`, because that is the only place a name becomes
 # reachable from Python.
+from binding_support import (
+    csc_from_params,
+    csr_from_params,
+    f64_buffer,
+    int_buffer,
+    int_buffer_from_f64,
+)
 from sequence_bindings import (
     ChunkAccumulator,
     dataset_chunks_begin,
@@ -228,7 +234,6 @@ from mojotrees.model_sparse import (
     predict_proba_csr as mojo_predict_proba_csr,
     predict_raw_csr as mojo_predict_raw_csr,
 )
-from mojotrees.sparse import CscMatrix, CsrMatrix
 from mojotrees.model import fit_custom as mojo_fit_custom
 from mojotrees.model import fit_multiclass as mojo_fit_multiclass
 from mojotrees.objective import mean_label
@@ -510,38 +515,11 @@ def PyInit__mojotrees() abi("C") -> PythonObject:
         abort(String("failed to create _mojotrees module: ", e))
 
 
-def _f64_list(addr: Int, n: Int) raises -> List[Float64]:
-    """Copy a float64 buffer (NumPy's X, y, weights) into a Mojo list.
-
-    One bulk copy, not an element-by-element append. The caller's buffer and
-    the list hold the same bytes in the same order, so there is nothing per
-    element to decide: `unsafe_uninit_length` skips the zero fill that
-    `resize` would do, and the copy that follows writes every one of those
-    bytes. Measured over 25 million elements, best of three alternating runs
-    in one process: 0.0061 s appending, 0.0043 s copying.
-
-    That is a small share of an ingest, and worth saying so here: for a
-    C-ordered 250,000 x 100 array the NumPy-side `asfortranarray` transpose
-    costs about 0.062 s, ten times this. The transpose is the price of a
-    column-major layout and it belongs on the NumPy side, which does it
-    blocked; handing the trainer a row-major buffer instead would only move
-    the same work into the binner's per-column gather, strided and cold.
-    """
-    if addr == 0 or n < 0:
-        raise Error("invalid buffer")
-    var p = Pointer[Float64, MutUntrackedOrigin](unsafe_from_address=addr)
-    if n == 0:
-        return List[Float64]()
-    var out = List[Float64](unsafe_uninit_length=n)
-    unsafe_memcpy(dest=out.unsafe_ptr(), src=p, count=n)
-    return out^
-
-
 def _f64_view(addr: Int, n: Int) raises -> Span[Float64, ImmUntrackedOrigin]:
     """Borrow a float64 buffer (NumPy's X) instead of copying it.
 
     The feature matrix is the one input where the copy is worth avoiding,
-    and not for the reason it looks like: `_f64_list` moves it at memory
+    and not for the reason it looks like: `f64_buffer` moves it at memory
     speed, a low single-digit percentage of an ingest. What the copy costs
     is *space*. It doubles the resident footprint of the matrix for as long
     as binning runs, so a 5,000,000 x 100 fit holds 4 GB of NumPy plus 4 GB
@@ -556,79 +534,18 @@ def _f64_view(addr: Int, n: Int) raises -> Span[Float64, ImmUntrackedOrigin]:
     whose contract is exactly that) for the whole call.
 
     The origin is untracked because the owner is on the other side of the
-    boundary and Mojo cannot see it. That is the same contract `_f64_list`
+    boundary and Mojo cannot see it. That is the same contract `f64_buffer`
     already relies on for its source pointer; the difference is only how
     long it has to hold, which is the length of one call either way.
 
     Not every input can do this. A buffer that outlives the call must be
-    copied, so `dataset_create` still takes `_f64_list` -- a `Dataset` keeps
+    copied, so `dataset_create` still takes `f64_buffer` -- a `Dataset` keeps
     its matrix -- and so do the validation sets, which `RawValidSet` owns.
     """
     if addr == 0 or n < 0:
         raise Error("invalid buffer")
     var p = Pointer[Float64, ImmUntrackedOrigin](unsafe_from_address=addr)
     return Span[Float64, ImmUntrackedOrigin](unsafe_ptr=p, length=n)
-
-
-def _int_list_from_f64(addr: Int, n: Int) raises -> List[Int]:
-    if addr == 0 or n < 0:
-        raise Error("invalid buffer")
-    var p = Pointer[Float64, MutUntrackedOrigin](unsafe_from_address=addr)
-    var out = List[Int](capacity=n)
-    for i in range(n):
-        out.append(Int(p.unsafe_load(i)))
-    return out^
-
-
-def _int_list(addr: Int, n: Int) raises -> List[Int]:
-    """Copy an int64 buffer (SciPy's indices/indptr) into a Mojo list.
-
-    Same bulk copy as `_f64_list`, for the same reason: int64 in, Int out,
-    identical bytes.
-    """
-    if addr == 0 or n < 0:
-        raise Error("invalid buffer")
-    var p = Pointer[Int, MutUntrackedOrigin](unsafe_from_address=addr)
-    if n == 0:
-        return List[Int]()
-    var out = List[Int](unsafe_uninit_length=n)
-    unsafe_memcpy(dest=out.unsafe_ptr(), src=p, count=n)
-    return out^
-
-
-def _sparse_shape(params: PythonObject) raises -> List[Int]:
-    """(n_rows, n_features, nnz) from the sparse keys of a params dict."""
-    return [
-        Int(py=params["n_rows"]),
-        Int(py=params["n_features"]),
-        Int(py=params["sparse_nnz"]),
-    ]
-
-
-def _csc(params: PythonObject) raises -> CscMatrix:
-    """Rebuild a CSC matrix from the wrapper's buffer addresses. SciPy's
-    arrays are normalized to float64 data and int64 indices on the Python
-    side; the matrix itself is validated by the sparse binner."""
-    var shape = _sparse_shape(params)
-    return CscMatrix(
-        _int_list(Int(py=params["sparse_indices_addr"]), shape[2]),
-        _f64_list(Int(py=params["sparse_data_addr"]), shape[2]),
-        _int_list(Int(py=params["sparse_indptr_addr"]), shape[1] + 1),
-        shape[0],
-        shape[1],
-    )
-
-
-def _csr(params: PythonObject) raises -> CsrMatrix:
-    """Rebuild a CSR matrix from the wrapper's buffer addresses."""
-    var shape = _sparse_shape(params)
-    return CsrMatrix(
-        _int_list(Int(py=params["sparse_indices_addr"]), shape[2]),
-        _f64_list(Int(py=params["sparse_data_addr"]), shape[2]),
-        _int_list(Int(py=params["sparse_indptr_addr"]), shape[0] + 1),
-        shape[0],
-        shape[1],
-    )
 
 
 def _row[
@@ -655,10 +572,10 @@ def _parse_constraints(
     var flat_addr = Int(py=params["interaction_flat_addr"])
     if flat_addr == 0:
         return InteractionConstraints()
-    var flat = _int_list_from_f64(
+    var flat = int_buffer_from_f64(
         flat_addr, Int(py=params["interaction_flat_len"])
     )
-    var offsets = _int_list_from_f64(
+    var offsets = int_buffer_from_f64(
         Int(py=params["interaction_offsets_addr"]),
         Int(py=params["interaction_offsets_len"]),
     )
@@ -677,7 +594,7 @@ def _parse_monotone(
     if addr == 0:
         return MonotoneConstraints()
     return MonotoneConstraints.from_signs(
-        _int_list_from_f64(addr, n_features), n_features
+        int_buffer_from_f64(addr, n_features), n_features
     )
 
 
@@ -826,7 +743,7 @@ def _parse_categorical(params: PythonObject) raises -> List[Int]:
     var addr = Int(py=params["categorical_addr"])
     if addr == 0:
         return List[Int]()
-    return _int_list_from_f64(addr, Int(py=params["categorical_len"]))
+    return int_buffer_from_f64(addr, Int(py=params["categorical_len"]))
 
 
 def _parse_cat_params(params: PythonObject) raises -> CategoricalParams:
@@ -853,7 +770,7 @@ def _parse_weights(params: PythonObject, n_rows: Int) raises -> List[Float64]:
     var weight_addr = Int(py=params["sample_weight_addr"])
     if weight_addr == 0:
         return List[Float64]()
-    return _f64_list(weight_addr, n_rows)
+    return f64_buffer(weight_addr, n_rows)
 
 
 def fit(
@@ -868,7 +785,7 @@ def fit(
     var nr = Int(py=n_rows)
     var nf = Int(py=n_features)
     var features = _f64_view(Int(py=x_addr), nr * nf)
-    var target = _f64_list(Int(py=y_addr), nr)
+    var target = f64_buffer(Int(py=y_addr), nr)
     # The device is read before the parameters because bundling is applied
     # by the dense CPU trainer and not by the GPU one, so `_parse_params`
     # has to know which of the two `mojo_fit` will dispatch to. The wrapper
@@ -918,7 +835,7 @@ def fit(
         var train_set = List[RawValidSet]()
         train_set.append(
             RawValidSet(
-                "train", _f64_list(Int(py=x_addr), nr * nf), nr, target.copy()
+                "train", f64_buffer(Int(py=x_addr), nr * nf), nr, target.copy()
             )
         )
 
@@ -983,7 +900,7 @@ def distributed_train_local(
     var nr = Int(py=n_rows)
     var nf = Int(py=n_features)
     var features = _f64_view(Int(py=x_addr), nr * nf)
-    var target = _f64_list(Int(py=y_addr), nr)
+    var target = f64_buffer(Int(py=y_addr), nr)
     var bp = _parse_params(params, nf, cpu=True)
     var weights = _parse_weights(params, nr)
     var model = train_local_world(
@@ -1026,7 +943,7 @@ def fit_custom(
     var nr = Int(py=n_rows)
     var nf = Int(py=n_features)
     var features = _f64_view(Int(py=x_addr), nr * nf)
-    var target = _f64_list(Int(py=y_addr), nr)
+    var target = f64_buffer(Int(py=y_addr), nr)
     var bp = _parse_params(params, nf, unbundled="fit_custom")
     var weights = _parse_weights(params, nr)
 
@@ -1114,7 +1031,7 @@ def fit_with_metrics(
     var nr = Int(py=n_rows)
     var nf = Int(py=n_features)
     var features = _f64_view(Int(py=x_addr), nr * nf)
-    var target = _f64_list(Int(py=y_addr), nr)
+    var target = f64_buffer(Int(py=y_addr), nr)
     var bp = _parse_params(params, nf, unbundled="fit_with_metrics")
     var weights = _parse_weights(params, nr)
 
@@ -1279,9 +1196,9 @@ def _parse_valid_sets(
         valid_sets.append(
             RawValidSet(
                 String(py=spec[0]),
-                _f64_list(Int(py=spec[1]), rows * n_features),
+                f64_buffer(Int(py=spec[1]), rows * n_features),
                 rows,
-                _f64_list(Int(py=spec[3]), rows),
+                f64_buffer(Int(py=spec[3]), rows),
             )
         )
     return valid_sets^
@@ -1349,7 +1266,7 @@ def fit_multiclass_with_metrics(
     var nf = Int(py=n_features)
     var nc = Int(py=n_classes)
     var features = _f64_view(Int(py=x_addr), nr * nf)
-    var labels = _int_list_from_f64(Int(py=y_addr), nr)
+    var labels = int_buffer_from_f64(Int(py=y_addr), nr)
     var bp = _parse_params(params, nf, unbundled="fit_multiclass_with_metrics")
     var weights = _parse_weights(params, nr)
     var pred_p = _pred_pointer(params)
@@ -1413,7 +1330,7 @@ def fit_ranker_with_metrics(
     var nr = Int(py=n_rows)
     var nf = Int(py=n_features)
     var features = _f64_view(Int(py=x_addr), nr * nf)
-    var labels = _int_list_from_f64(Int(py=y_addr), nr)
+    var labels = int_buffer_from_f64(Int(py=y_addr), nr)
     var bp = _parse_params(params, nf, unbundled="fit_ranker_with_metrics")
     var advanced = _parse_advanced_rank_params(params)
     var positions = _parse_positions(params, nr)
@@ -1518,11 +1435,11 @@ def eval_metric(
     var weight_addr = Int(py=params["weight_addr"])
     var weight = List[Float64]()
     if weight_addr != 0:
-        weight = _f64_list(weight_addr, nr)
+        weight = f64_buffer(weight_addr, nr)
 
     if kind == _METRIC_NDCG or kind == _METRIC_MAP:
-        var scores = _f64_list(Int(py=params["pred_addr"]), nr)
-        var grades = _int_list_from_f64(Int(py=params["y_addr"]), nr)
+        var scores = f64_buffer(Int(py=params["pred_addr"]), nr)
+        var grades = int_buffer_from_f64(Int(py=params["y_addr"]), nr)
         var groups = groups_from_counts(_group_counts(params))
         var cutoff = Int(py=params["ndcg_at"])
         if kind == _METRIC_MAP:
@@ -1533,16 +1450,16 @@ def eval_metric(
 
     if kind == _METRIC_MULTI_LOGLOSS or kind == _METRIC_MULTI_ERROR:
         var nc = Int(py=params["n_classes"])
-        var raw = _f64_list(Int(py=params["pred_addr"]), nr * nc)
-        var codes = _int_list_from_f64(Int(py=params["y_addr"]), nr)
+        var raw = f64_buffer(Int(py=params["pred_addr"]), nr * nc)
+        var codes = int_buffer_from_f64(Int(py=params["y_addr"]), nr)
         for r in range(nr):
             _softmax_inplace(raw, r * nc, nc)
         if kind == _METRIC_MULTI_LOGLOSS:
             return PythonObject(multiclass_log_loss(raw, codes, nc, weight))
         return PythonObject(multiclass_error(raw, codes, nc, weight))
 
-    var raw = _f64_list(Int(py=params["pred_addr"]), nr)
-    var target = _f64_list(Int(py=params["y_addr"]), nr)
+    var raw = f64_buffer(Int(py=params["pred_addr"]), nr)
+    var target = f64_buffer(Int(py=params["y_addr"]), nr)
     var alpha = Float64(py=params["alpha"])
     # One transform for every single-output metric: the objective's own.
     var pred = response_scale(objective, raw)
@@ -1597,7 +1514,7 @@ def fit_multiclass(
     var nr = Int(py=n_rows)
     var nf = Int(py=n_features)
     var features = _f64_view(Int(py=x_addr), nr * nf)
-    var labels = _int_list_from_f64(Int(py=y_addr), nr)
+    var labels = int_buffer_from_f64(Int(py=y_addr), nr)
     # Read the device first, for the reason `fit` does.
     var device = _parse_device(params)
     var bp = _parse_params(params, nf, cpu=device == CPU_DEVICE)
@@ -1630,9 +1547,9 @@ def fit_csc(
     The matrix arrives as CSC buffer addresses in `params`; the model that
     comes back is an ordinary `Model`, indistinguishable from a dense fit.
     """
-    var csc = _csc(params)
+    var csc = csc_from_params(params)
     var nr = csc.n_rows
-    var target = _f64_list(Int(py=y_addr), nr)
+    var target = f64_buffer(Int(py=y_addr), nr)
     var bp = _parse_params(params, csc.n_features)
     var weights = _parse_weights(params, nr)
     var model = mojo_fit_csc(
@@ -1657,9 +1574,9 @@ def fit_multiclass_csc(
 ) raises -> PythonObject:
     """Train a multiclass model on a sparse matrix. Labels arrive as
     float64 in 0..n_classes-1."""
-    var csc = _csc(params)
+    var csc = csc_from_params(params)
     var nr = csc.n_rows
-    var labels = _int_list_from_f64(Int(py=y_addr), nr)
+    var labels = int_buffer_from_f64(Int(py=y_addr), nr)
     var bp = _parse_params(params, csc.n_features)
     var weights = _parse_weights(params, nr)
     var model = mojo_fit_multiclass_csc(
@@ -1694,9 +1611,10 @@ def predict_csr(
     device is the CPU, which is what every caller of this function has
     always meant."""
     var m = model.downcast_value_ptr[Model]()
-    var shape = _sparse_shape(params)
-    _refuse_gpu_sparse(params, shape[0], shape[1], 1)
-    _store(mojo_predict_csr(m[], _csr(params)), out_addr)
+    _refuse_gpu_sparse(
+        params, Int(py=params["n_rows"]), Int(py=params["n_features"]), 1
+    )
+    _store(mojo_predict_csr(m[], csr_from_params(params)), out_addr)
     return PythonObject(None)
 
 
@@ -1706,9 +1624,10 @@ def predict_raw_csr(
     """Raw-score predictions for a sparse matrix (see `predict_csr` on the
     device)."""
     var m = model.downcast_value_ptr[Model]()
-    var shape = _sparse_shape(params)
-    _refuse_gpu_sparse(params, shape[0], shape[1], 1)
-    _store(mojo_predict_raw_csr(m[], _csr(params)), out_addr)
+    _refuse_gpu_sparse(
+        params, Int(py=params["n_rows"]), Int(py=params["n_features"]), 1
+    )
+    _store(mojo_predict_raw_csr(m[], csr_from_params(params)), out_addr)
     return PythonObject(None)
 
 
@@ -1719,9 +1638,13 @@ def predict_proba_csr(
     `[r * n_classes + k]`, into a buffer of length n_rows * n_classes (see
     `predict_csr` on the device)."""
     var m = model.downcast_value_ptr[MulticlassModel]()
-    var shape = _sparse_shape(params)
-    _refuse_gpu_sparse(params, shape[0], shape[1], m[].booster.n_classes)
-    _store(mojo_predict_proba_csr(m[], _csr(params)), out_addr)
+    _refuse_gpu_sparse(
+        params,
+        Int(py=params["n_rows"]),
+        Int(py=params["n_features"]),
+        m[].booster.n_classes,
+    )
+    _store(mojo_predict_proba_csr(m[], csr_from_params(params)), out_addr)
     return PythonObject(None)
 
 
@@ -1753,7 +1676,9 @@ def _parse_advanced_rank_params(
     out.base = _parse_rank_params(params)
     var n_gain = Int(py=params.get("n_label_gain", PythonObject(0)))
     if n_gain > 0:
-        out.gain = LabelGain(_f64_list(Int(py=params["label_gain_addr"]), n_gain))
+        out.gain = LabelGain(
+            f64_buffer(Int(py=params["label_gain_addr"]), n_gain)
+        )
     out.position_bias_regularization = Float64(
         py=params.get(
             "lambdarank_position_bias_regularization", PythonObject(0.0)
@@ -1781,14 +1706,14 @@ def _parse_positions(params: PythonObject, n_rows: Int) raises -> PositionMap:
         raise Error(
             "position must have one entry per row; got ", n, " for ", n_rows
         )
-    var codes = _int_list_from_f64(Int(py=params["position_addr"]), n)
+    var codes = int_buffer_from_f64(Int(py=params["position_addr"]), n)
     return positions_from_codes(codes).positions.copy()
 
 
 def _group_counts(params: PythonObject) raises -> List[Int]:
     """Per-query row counts (LightGBM's `group`) from the params dict. They
     travel as float64 like every other buffer at this boundary."""
-    return _int_list_from_f64(
+    return int_buffer_from_f64(
         Int(py=params["group_addr"]), Int(py=params["n_groups"])
     )
 
@@ -1806,7 +1731,7 @@ def fit_ranker(
     var nr = Int(py=n_rows)
     var nf = Int(py=n_features)
     var features = _f64_view(Int(py=x_addr), nr * nf)
-    var labels = _int_list_from_f64(Int(py=y_addr), nr)
+    var labels = int_buffer_from_f64(Int(py=y_addr), nr)
     var bp = _parse_params(params, nf, unbundled="fit_ranker")
     var weights = _parse_weights(params, nr)
     var advanced = _parse_advanced_rank_params(params)
@@ -1859,8 +1784,8 @@ def ndcg(
     counts. Exposed on its own so callers can score any set of scores, not
     only a mojotrees model's."""
     var nr = Int(py=n_rows)
-    var scores = _f64_list(Int(py=scores_addr), nr)
-    var labels = _int_list_from_f64(Int(py=y_addr), nr)
+    var scores = f64_buffer(Int(py=scores_addr), nr)
+    var labels = int_buffer_from_f64(Int(py=y_addr), nr)
     var groups = groups_from_counts(_group_counts(params))
     return PythonObject(mojo_ndcg(scores, labels, groups, Int(py=k)))
 
@@ -2536,10 +2461,10 @@ def _validation_columns(
     """The label column and the optional weight column of a validation set,
     from the params dict's `y_addr` and `weight_addr` (0 for absent). The
     weight contract is metrics.mojo's, and `set_validation` validates it."""
-    var target = _f64_list(Int(py=params["y_addr"]), n_rows)
+    var target = f64_buffer(Int(py=params["y_addr"]), n_rows)
     var weight = List[Float64]()
     if Int(py=params["weight_addr"]) != 0:
-        weight = _f64_list(Int(py=params["weight_addr"]), n_rows)
+        weight = f64_buffer(Int(py=params["weight_addr"]), n_rows)
     var out = List[List[Float64]]()
     out.append(target^)
     out.append(weight^)
@@ -2634,7 +2559,7 @@ def gpu_validation_reset(
     else:
         var h = handle.downcast_value_ptr[GpuValidation]()
         h[].predictor.reset_validation(
-            _f64_list(Int(py=base_addr), h[].n_outputs)
+            f64_buffer(Int(py=base_addr), h[].n_outputs)
         )
         return PythonObject(None)
 
@@ -2998,17 +2923,17 @@ def dataset_create(
     """
     var nr = Int(py=n_rows)
     var nf = Int(py=n_features)
-    var features = _f64_list(Int(py=x_addr), nr * nf)
+    var features = f64_buffer(Int(py=x_addr), nr * nf)
 
     var label = List[Float64]()
     if Int(py=params["label_addr"]) != 0:
-        label = _f64_list(Int(py=params["label_addr"]), nr)
+        label = f64_buffer(Int(py=params["label_addr"]), nr)
     var weight = List[Float64]()
     if Int(py=params["weight_addr"]) != 0:
-        weight = _f64_list(Int(py=params["weight_addr"]), nr)
+        weight = f64_buffer(Int(py=params["weight_addr"]), nr)
     var init_score = List[Float64]()
     if Int(py=params["init_score_addr"]) != 0:
-        init_score = _f64_list(Int(py=params["init_score_addr"]), nr)
+        init_score = f64_buffer(Int(py=params["init_score_addr"]), nr)
     var group = List[Int]()
     if Int(py=params["group_addr"]) != 0:
         group = _group_counts(params)

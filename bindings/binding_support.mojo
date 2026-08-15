@@ -23,6 +23,7 @@ Nothing in this module hands a raw pointer or a device buffer to Python.
 The only direction an address travels is in.
 """
 
+from std.memory import unsafe_memcpy
 from std.python import Python, PythonObject
 
 from mojotrees.sparse import CscMatrix, CsrMatrix
@@ -78,20 +79,31 @@ def py_pair(first: PythonObject, second: PythonObject) raises -> PythonObject:
 
 
 def f64_buffer(addr: Int, n: Int) raises -> List[Float64]:
-    """Copy a float64 buffer into a Mojo list.
+    """Copy a float64 buffer (NumPy's X, y, weights) into a Mojo list.
 
-    The same read `_f64_list` in `_mojotrees.mojo` does, and the intended
-    single home for it: see `handoffs/connect_14_bindings.md` for the patch
-    that retires that copy.
+    One bulk copy, not an element-by-element append. The caller's buffer and
+    the list hold the same bytes in the same order, so there is nothing per
+    element to decide: `unsafe_uninit_length` skips the zero fill that
+    `resize` would do, and the copy that follows writes every one of those
+    bytes.
+
+    The copy is a small share of an ingest. For a C-ordered array the
+    NumPy-side `asfortranarray` transpose costs far more, and it belongs on
+    the NumPy side, which does it blocked; handing the trainer a row-major
+    buffer instead would only move the same work into the binner's
+    per-column gather, strided and cold. Where the copy is worth avoiding
+    is space, not time; `_f64_view` in `_mojotrees.mojo` borrows the
+    feature matrix for that reason.
     """
     if addr == 0:
         raise Error("null buffer address")
     if n < 0:
         raise Error("buffer length must not be negative, got ", n)
     var p = Pointer[Float64, MutUntrackedOrigin](unsafe_from_address=addr)
-    var out = List[Float64](capacity=n)
-    for i in range(n):
-        out.append(p.unsafe_load(i))
+    if n == 0:
+        return List[Float64]()
+    var out = List[Float64](unsafe_uninit_length=n)
+    unsafe_memcpy(dest=out.unsafe_ptr(), src=p, count=n)
     return out^
 
 
@@ -139,15 +151,17 @@ def write_f64_buffer(
 
 def int_buffer(addr: Int, n: Int) raises -> List[Int]:
     """Copy an int64 buffer (SciPy's `indices` and `indptr`) into a Mojo
-    list."""
+    list. Same bulk copy as `f64_buffer`, for the same reason: int64 in, Int
+    out, identical bytes."""
     if addr == 0:
         raise Error("null buffer address")
     if n < 0:
         raise Error("buffer length must not be negative, got ", n)
     var p = Pointer[Int, MutUntrackedOrigin](unsafe_from_address=addr)
-    var out = List[Int](capacity=n)
-    for i in range(n):
-        out.append(p.unsafe_load(i))
+    if n == 0:
+        return List[Int]()
+    var out = List[Int](unsafe_uninit_length=n)
+    unsafe_memcpy(dest=out.unsafe_ptr(), src=p, count=n)
     return out^
 
 

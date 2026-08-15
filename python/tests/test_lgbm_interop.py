@@ -29,7 +29,6 @@ def _booster(learning_rate):
         "objective": "regression",
         "learning_rate": learning_rate,
         "num_leaves": 7,
-        "verbose": -1,
     }
     return train(params, Dataset(X, label=y), num_boost_round=5), X
 

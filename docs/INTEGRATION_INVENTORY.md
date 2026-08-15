@@ -111,7 +111,15 @@ so a module it does not import defines nothing a user can call.
 
 | File | What it defines | What stays blocked |
 |---|---|---|
-| `bindings/binding_support.mojo` | marshalling helpers (`py_dict`, `f64_buffer`, `csc_from_params`, and the rest) | nothing. It is the substrate the other binding modules are written against, and they import it; the extension module does not need to |
+
+None. The table is kept empty so `tools/audit_integration.py` keeps
+checking it: a binding module the extension stops importing lands here as
+a GAP. `bindings/binding_support.mojo` (marshalling helpers: `py_dict`,
+`f64_buffer`, `csc_from_params`, and the rest) used to be listed as the
+one module the extension did not need; `_mojotrees.mojo` now imports it
+too, since its private copies of the buffer readers (`_f64_list`,
+`_int_list`, `_csc`, `_csr`) were retired in favor of the shared ones,
+whose bulk copy is the single implementation.
 
 This section was the largest disconnection in the previous revision, and it
 is closed. At commit `860b1cf` the extension imported none of the auxiliary

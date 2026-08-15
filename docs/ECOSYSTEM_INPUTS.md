@@ -75,12 +75,12 @@ and length the column does expose, as a `BufferPlan`:
 | `zero_copy_eligible`, `blocked_by` | the verdict and the reason |
 
 **The mojotrees side is not ready for it in any case.** `dataset_create`
-takes one address for the whole matrix and copies it element by element
-into a `List[Float64]` through `_f64_list`. There is no path that reads N
-per-column pointers and none that reads a validity bitmap. So today an
-Arrow column is copied twice on the way in: once by the adapter, into the
-column-major buffer, and once in Mojo. That second copy is paid by the
-numpy path too and is not an Arrow tax.
+takes one address for the whole matrix and copies it in one bulk read
+into a `List[Float64]` through `binding_support.f64_buffer`. There is no
+path that reads N per-column pointers and none that reads a validity
+bitmap. So today an Arrow column is copied twice on the way in: once by
+the adapter, into the column-major buffer, and once in Mojo. That second
+copy is paid by the numpy path too and is not an Arrow tax.
 
 `BufferPlan.zero_copy_eligible` therefore means "the Arrow buffer could be
 read in place by a reader that accepted per-column pointers". It never

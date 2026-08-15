@@ -75,7 +75,7 @@ def test_ragged_rows_are_rejected():
 
 
 def test_y_length_must_match_x():
-    with pytest.raises(ValueError, match="shape"):
+    with pytest.raises(ValueError, match="one entry per row"):
         _fit(y=np.array([1.0, 2.0]))
 
 

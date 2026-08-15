@@ -510,29 +510,53 @@ validation layer under every trainer, dataset build, and estimator fit.
 `tools/audit_integration.py` all green; the new tests are in the `test` and
 `test-cpu` pixi suites.
 
-What remains, and why (revised 2026-08-15 evening, after the cleanup pass
-below):
+What remains, and why (revised 2026-08-15 afternoon, after the GPU session
+committed at aa49cb9 and the second cleanup pass below took the rows that
+had been gated on its files):
 
-- Five native orphans: `gpu_categorical` -> `gpu_sparse` ->
-  `gpu_sparse_layout` need `train_gpu.mojo` / `histogram_gpu.mojo`, which
-  another session held dirty (and non-parsing) for the whole round;
-  `gpu_vendor_policy` has no CUDA/HIP device to be consulted by; `backend`
-  is the CPU/GPU equivalence reference by design.
-- Five duplicate names, every one with a definition in the same held files:
-  `MAX_BINS` / `MAX_ROWS` in `histogram_gpu.mojo`, `METRIC_L1` / `L2`
-  aliases in `gpu_predict` until `train_gpu.mojo` imports
-  `DEVICE_METRIC_*`, `partition_rows` (tree vs distributed; rename tree's
-  to `partition_split_rows`, its caller is
-  `tests/parallel/test_gpu_active_rows.mojo`, held). One unused import
-  (`STRATEGY_ATOMIC` / `STRATEGY_TILED` in `histogram_gpu.mojo`) is in the
-  same file. Each carries a `gpu-session` row in the audit naming the edit.
-- The same session gates: GPU categoricals, class-batched multiclass by
-  default, hybrid leaves reach, distributed GPU device path, `MAX_ROWS`
-  single site, `gpu_frontier` speculation trim, the `_mojotrees.mojo`
-  `_f64_list` / `_int_list` / `_csc` / `_csr` helpers vs
-  `binding_support`. Each is a short edit once `git status` is clean.
+- Three native orphans, one chain: `gpu_categorical` -> `gpu_sparse` ->
+  `gpu_sparse_layout`. The GPU trainer refuses categorical specs, so the
+  category-statistics kernels have no caller until `train_gpu` accepts
+  them; that is a feature, not a wiring edit. `gpu_vendor_policy` (no
+  CUDA/HIP device to consult it) and `backend` (the CPU/GPU equivalence
+  reference) stay by design.
+- The audit reports 9 findings and 0 PENDING outside that chain: no
+  duplicate public names, no unused imports, no uncalled bindings.
+- Still the GPU session's to decide, none of it a wiring gap: class-batched
+  multiclass by default, hybrid leaves reach without the environment
+  switches, the distributed GPU device path, the `gpu_frontier`
+  speculation trim.
 - No LightGBM numeric differential ran for the newly reached features; the
   parity rows say so.
+
+Second cleanup pass (2026-08-15 afternoon, C0), once `git status` was clean:
+
+- `histogram_gpu.mojo` imports `MAX_ROWS` from `gpu_active_rows` and drops
+  its own `MAX_BINS` (only comments read it; `tests/test_gpu_portability.mojo`
+  and `bench/bench_gpu_validation.mojo` now import `binning.MAX_BINS`) and
+  the unused `STRATEGY_ATOMIC` / `STRATEGY_TILED`; `train_gpu.mojo` imports
+  `DEVICE_METRIC_L1` / `DEVICE_METRIC_L2` and the `METRIC_*` aliases in
+  `gpu_predict` are gone; `tree.partition_rows` is `partition_split_rows`
+  (callers: `tests/parallel/test_gpu_active_rows.mojo`,
+  `tests/test_cpu_parallel.mojo`, `bench/bench_profile.mojo`).
+  `tests/parallel/test_gpu_active_rows.mojo` 28/28 on the M4.
+- `_mojotrees.mojo`'s private buffer readers (`_f64_list`, `_int_list`,
+  `_int_list_from_f64`, `_sparse_shape`, `_csc`, `_csr`) are retired for
+  `binding_support`'s `f64_buffer`, `int_buffer`, `int_buffer_from_f64`,
+  `csc_from_params`, `csr_from_params`; the bulk `unsafe_memcpy` read moved
+  into `binding_support`, so it is the one implementation and the other
+  binding modules get it too. The extension was rebuilt at this tree and
+  `python/tests` (630) plus `python/test_python_api.py` pass against it.
+- Stale tests that the fresh build exposed, all asserting a state a lane
+  had since changed: `test_validation.test_y_length_must_match_x` matched
+  the message `bff8d7c` replaced; `test_inspection` asserted model editing
+  is not offered (W3 wired it; the two tests now check the `Booster`
+  methods and the per-operation status, and `inspection.py`'s "Not
+  offered" section is rewritten); `test_python_api.test_goss` and
+  `test_lgbm_interop` (a `verbose` param, which `train` refuses by
+  documented decision).
+- `docs/INTEGRATION_INVENTORY.md`: the unregistered-binding-module table
+  is empty (kept, so the audit keeps checking it).
 
 Cleanup pass (2026-08-15 evening, C0), after the close-out above:
 
