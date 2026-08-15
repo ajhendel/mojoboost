@@ -303,7 +303,39 @@ CLASSIFICATION = {
         "histogram_gpu. The routes it scores are still not implemented in "
         "any trainer, so the decision it returns has one live outcome.",
     ),
+    "distributed_strategies": (
+        EXPERIMENTAL,
+        "consolidation_K9",
+        "Feature-parallel and voting-parallel cores over Collective; "
+        "self-gated by require_strategy_operational, which refuses both "
+        "modes until transport_available() is True. Parked, not superseded: "
+        "distributed.mojo implements only data parallel.",
+    ),
+    "distributed_gpu": (
+        EXPERIMENTAL,
+        "consolidation_K9",
+        "Host-arithmetic contract for a distributed fixed-point GPU "
+        "histogram exchange; require_distributed_gpu refuses it until "
+        "HAS_DEVICE_COLLECTIVE, transport_available(), and "
+        "GPU_SPEEDUP_GATE_MET all hold. Parked, not superseded; its "
+        "constants now come from quantized_gradient.",
+    ),
+    "sequence": (
+        PENDING,
+        "consolidation_K4",
+        "Bounded-memory chunk protocol external_memory.mojo is written "
+        "against; coherent, not a duplicate of python _sequence.py. Parked "
+        "until an export plus external_memory validation connects it "
+        "(handoffs/connect_21_native_interfaces.md).",
+    ),
     # -- Python modules ----------------------------------------------------
+    "mojotrees._sequence": (
+        PENDING,
+        "consolidation_K4",
+        "Ecosystem chunk dispatcher _arrow.py and _polars.py are written "
+        "against; parked until connect_07's _arrays.check_X front and a "
+        "chunk binding reach it (handoffs/connect_21_native_interfaces.md).",
+    ),
     "mojotrees._public_api_plan": (
         EXPERIMENTAL,
         "connect_07",
