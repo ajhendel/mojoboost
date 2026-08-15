@@ -1531,6 +1531,8 @@
       "categorical_feature": "auto",
       "categorical_features": null,
       "cegb_penalty_split": 0.0,
+      "linear_tree": false,
+      "linear_lambda": 0.0,
       "cegb_tradeoff": 1.0,
       "device": "cpu",
       "device_type": null,
