@@ -65,3 +65,12 @@ is better than silent fallback or a placeholder implementation.
 
 Use the hardware validation issue template when contributing accelerator
 results.
+
+## Contributor access
+
+The public repository accepts pull requests from anyone without an invitation.
+Sustained contributors may be promoted automatically through Triage, Write,
+Maintain, and Admin according to the public, auditable policy in
+[docs/AUTOMATED_ACCESS.md](docs/AUTOMATED_ACCESS.md). The policy uses merged
+pull requests over time and review/reliability work, not raw commit or line
+counts.

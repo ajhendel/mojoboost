@@ -177,6 +177,14 @@ The maintainer adds you to the `contributors` team, which carries the Write
 role on the repository. Access is expected to be granted, and a refusal comes
 with the specific reason and what would change it.
 
+Access eligibility and promotion may be automated under the public thresholds
+in [docs/AUTOMATED_ACCESS.md](docs/AUTOMATED_ACCESS.md). The automation counts
+merged pull requests over time, substantive review activity, and reliability
+work; it does not count raw commits or lines changed. Every run publishes an
+audit table, never demotes anyone, and can be disabled by removing one
+repository variable. During the public alpha, configured automation may grant
+Triage, Write, Maintain, and Admin without a human approval.
+
 Write access does not mean ownership of an area, an obligation to keep
 contributing, or a duty to review other people's work. Contributors who go
 quiet are not doing anything wrong.
@@ -188,12 +196,13 @@ teams, publish releases, and act on security reports. Today there is one. Two
 or three is the target before the alpha ends, because a single administrator is
 a real risk to the project rather than a governance style.
 
-**Adding a maintainer.** The maintainer proposes an active contributor, in
-public, on the repository. The proposal names what the person has done and why
-the added administrative access is warranted. Existing maintainers and the
-proposed person have seven days to respond. Absent an unresolved objection, the
-person joins the `maintainers` team. Once more than one maintainer exists,
-adding another requires that all current maintainers agree.
+**Adding a maintainer.** A maintainer may be added through the public proposal
+process below or through the configured automated-access policy. For a manual
+addition, the maintainer proposes an active contributor in public, names what
+the person has done and why the access is warranted, and leaves seven days for
+responses. Automated promotion instead follows the measurable thresholds and
+audit trail in [docs/AUTOMATED_ACCESS.md](docs/AUTOMATED_ACCESS.md). Either
+route grants real administrative authority and is deliberately reversible.
 
 What is being assessed is judgment under uncertainty and care with other
 people's trust, not volume of code. Somebody who reviews carefully, reproduces

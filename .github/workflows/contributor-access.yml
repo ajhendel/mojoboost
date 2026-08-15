@@ -1,0 +1,61 @@
+name: Contributor access
+
+on:
+  schedule:
+    - cron: "17 8 * * *"
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: Apply eligible promotions when automation is enabled
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: contributor-access
+  cancel-in-progress: false
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Evaluate policy
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python3 tools/governance_access.py
+          --repository "${{ github.repository }}"
+          --output governance-access-report.md
+
+      - name: Publish dry-run report
+        run: cat governance-access-report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create GitHub App token
+        if: vars.GOVERNANCE_AUTOMATION_ENABLED == 'true' && (github.event_name == 'schedule' || inputs.apply)
+        id: app-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ vars.GOVERNANCE_APP_ID }}
+          private-key: ${{ secrets.GOVERNANCE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: mojoboost
+
+      - name: Apply eligible promotions
+        if: steps.app-token.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: >-
+          python3 tools/governance_access.py
+          --repository "${{ github.repository }}"
+          --output governance-access-applied.md
+          --apply
+
+      - name: Publish applied report
+        if: steps.app-token.outcome == 'success'
+        run: cat governance-access-applied.md >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,50 @@
+{
+  "version": 1,
+  "minimum_account_age_days": 90,
+  "minimum_changed_lines": 5,
+  "credit_labels": ["governance-credit"],
+  "exclude_labels": ["governance-no-credit", "reverted"],
+  "reliability_paths": [
+    ".github/",
+    "tests/",
+    "validation/",
+    "packaging/",
+    "tools/",
+    "python/tests/"
+  ],
+  "documentation_extensions": [".md", ".txt", ".rst"],
+  "levels": [
+    {
+      "permission": "triage",
+      "minimum_merged_pull_requests": 2,
+      "minimum_distinct_contribution_days": 2,
+      "minimum_span_days": 14,
+      "minimum_reviews": 0,
+      "require_reliability_contribution": false
+    },
+    {
+      "permission": "push",
+      "minimum_merged_pull_requests": 4,
+      "minimum_distinct_contribution_days": 3,
+      "minimum_span_days": 30,
+      "minimum_reviews": 0,
+      "require_reliability_contribution": false
+    },
+    {
+      "permission": "maintain",
+      "minimum_merged_pull_requests": 8,
+      "minimum_distinct_contribution_days": 5,
+      "minimum_span_days": 60,
+      "minimum_reviews": 2,
+      "require_reliability_contribution": true
+    },
+    {
+      "permission": "admin",
+      "minimum_merged_pull_requests": 12,
+      "minimum_distinct_contribution_days": 8,
+      "minimum_span_days": 90,
+      "minimum_reviews": 4,
+      "require_reliability_contribution": true
+    }
+  ]
+}
