@@ -265,11 +265,8 @@ def PyInit__mojotrees() abi("C") -> PythonObject:
         m.def_function[fit_multiclass_csc]("fit_multiclass_csc")
         m.def_function[fit_ranker]("fit_ranker")
         m.def_function[ndcg]("ndcg")
-        m.def_function[predict]("predict")
         m.def_function[predict_csr]("predict_csr")
-        m.def_function[predict_raw]("predict_raw")
         m.def_function[predict_raw_csr]("predict_raw_csr")
-        m.def_function[predict_proba]("predict_proba")
         m.def_function[predict_proba_csr]("predict_proba_csr")
         m.def_function[predict_range]("predict_range")
         m.def_function[predict_proba_range]("predict_proba_range")
@@ -1567,70 +1564,6 @@ def ndcg(
     return PythonObject(mojo_ndcg(scores, labels, groups, Int(py=k)))
 
 
-def predict(
-    model: PythonObject,
-    x_addr: PythonObject,
-    n_rows: PythonObject,
-    n_features: PythonObject,
-    out_addr: PythonObject,
-) raises -> PythonObject:
-    """Response-scale predictions into a preallocated float64 buffer."""
-    var m = model.downcast_value_ptr[Model]()
-    var nr = Int(py=n_rows)
-    var nf = Int(py=n_features)
-    var features = _f64_view(Int(py=x_addr), nr * nf)
-    var out = Pointer[Float64, MutUntrackedOrigin](
-        unsafe_from_address=Int(py=out_addr)
-    )
-    for r in range(nr):
-        out.unsafe_store(r, m[].predict(_row(features, nr, nf, r)))
-    return PythonObject(None)
-
-
-def predict_raw(
-    model: PythonObject,
-    x_addr: PythonObject,
-    n_rows: PythonObject,
-    n_features: PythonObject,
-    out_addr: PythonObject,
-) raises -> PythonObject:
-    """Raw-score predictions into a preallocated float64 buffer."""
-    var m = model.downcast_value_ptr[Model]()
-    var nr = Int(py=n_rows)
-    var nf = Int(py=n_features)
-    var features = _f64_view(Int(py=x_addr), nr * nf)
-    var out = Pointer[Float64, MutUntrackedOrigin](
-        unsafe_from_address=Int(py=out_addr)
-    )
-    for r in range(nr):
-        out.unsafe_store(r, m[].predict_raw(_row(features, nr, nf, r)))
-    return PythonObject(None)
-
-
-def predict_proba(
-    model: PythonObject,
-    x_addr: PythonObject,
-    n_rows: PythonObject,
-    n_features: PythonObject,
-    out_addr: PythonObject,
-) raises -> PythonObject:
-    """Multiclass probabilities, row-major `[r * n_classes + k]`, into a
-    preallocated float64 buffer of size n_rows * n_classes."""
-    var m = model.downcast_value_ptr[MulticlassModel]()
-    var nr = Int(py=n_rows)
-    var nf = Int(py=n_features)
-    var features = _f64_view(Int(py=x_addr), nr * nf)
-    var out = Pointer[Float64, MutUntrackedOrigin](
-        unsafe_from_address=Int(py=out_addr)
-    )
-    var k = m[].booster.n_classes
-    for r in range(nr):
-        var proba = m[].predict_proba(_row(features, nr, nf, r))
-        for c in range(k):
-            out.unsafe_store(r * k + c, proba[c])
-    return PythonObject(None)
-
-
 def _iteration_slice(
     n_iterations: Int, start: PythonObject, stop: PythonObject
 ) raises -> IterationRange:
@@ -1916,10 +1849,13 @@ def predict_contrib_multiclass(
 # the reason from `gpu_predict_support`; it is never quietly served by the
 # CPU.
 #
-# The established path is untouched. `predict`, `predict_raw`,
-# `predict_proba`, `predict_range`, `predict_proba_range`, `predict_leaf`,
-# and `predict_leaf_multiclass` keep their signatures and their host walk,
-# so an estimator that has not moved over behaves exactly as before.
+# The established path is untouched. `predict_range`,
+# `predict_proba_range`, `predict_leaf`, and `predict_leaf_multiclass` keep
+# their signatures and their host walk, so an estimator that has not moved
+# over behaves exactly as before. (The older whole-model `predict`,
+# `predict_raw`, and `predict_proba` entries, full-range twins of the
+# `_range` forms that Python had stopped calling, were removed in the
+# consolidation round.)
 
 
 def _optional_device(params: PythonObject) raises -> Int:
