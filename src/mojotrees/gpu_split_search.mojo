@@ -3147,13 +3147,14 @@ struct GpuSplitSearcher(Movable):
         # belongs to the searcher, so spell the disjoint field borrows out at
         # the free-function boundary after staging the tables.
         #
-        # Note what this spelled-out call does not pass: `wide`. `search`
-        # therefore runs the serial scan even on a searcher whose
-        # `wide_scan` is set, while `enqueue` and `enqueue_frontier` (both
-        # through `_launch`) honor it, and those are the paths the trainer
-        # uses. Left as found rather than corrected here, because flipping
-        # it changes which kernel an existing test's `search` call reaches,
-        # and that belongs in the change that can run that test.
+        # `wide` is passed here, which it was not until the lane merge.
+        # Omitting it made `search` run the serial scan even on a searcher
+        # whose `wide_scan` was set, while `enqueue` and `enqueue_frontier`
+        # (both through `_launch`) honored it. The trainer only ever uses
+        # those two, so no fit was ever affected; what the omission did cost
+        # was a test, because `test_gpu_split_search.test_wide_scan_matches
+        # _the_serial_wide_scan` reaches the wide kernel through `search`
+        # and had therefore been comparing the serial scan against itself.
         self._copy_tables()
         _launch_search(
             self.ctx,
@@ -3180,6 +3181,7 @@ struct GpuSplitSearcher(Movable):
             params.cat.max_cat_to_onehot,
             params.cat.max_cat_threshold,
             params.cat.min_data_per_group,
+            wide=self.wide_scan,
             primitives=self.use_primitives,
         )
         return self.download(record)

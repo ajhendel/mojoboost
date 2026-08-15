@@ -103,12 +103,16 @@ test_apple_gpu_policy
 test_backend_equivalence
 test_device
 test_gpu_active_rows
+test_gpu_kernel_family
 test_gpu_objectives
 test_gpu_objectives_native
 test_gpu_portability
 test_gpu_predict
 test_gpu_runtime
+test_gpu_scan_primitives
 test_gpu_sparse
+test_gpu_sparse_skip
+test_gpu_split_scan
 test_gpu_split_search
 test_gpu_strategies
 test_gpu_tiling
@@ -116,6 +120,11 @@ test_gpu_training
 test_gpu_vendor_policy
 test_hybrid_replica
 "
+
+# `test_gpu_tile_floor` is deliberately NOT above. It asserts the tiling
+# geometry as pure host arithmetic over synthetic `DeviceCaps` and opens no
+# device, so it belongs in the CPU set where it also guards the rule on a
+# runner that has no accelerator to plan for.
 
 # CPU-safe, but exercises a GPU path when one exists, so a GPU runner should
 # see it too.

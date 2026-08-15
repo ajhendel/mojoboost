@@ -16,7 +16,12 @@ from std.testing import assert_equal, assert_true, TestSuite
 
 from mojotrees.apple_gpu_policy import API_METAL, parse_api
 from mojotrees.binning import bin_equal_width, BinnedMatrix
-from mojotrees.gpu_tiling import STRATEGY_ATOMIC, STRATEGY_TILED
+from mojotrees.gpu_tiling import (
+    STRATEGY_ATOMIC,
+    STRATEGY_TILED,
+    free_feature_group,
+    histogram_bin_capacity,
+)
 from mojotrees.histogram import (
     Histogram,
     build_histogram,
@@ -74,22 +79,40 @@ def test_device_capabilities_are_usable() raises:
 
 
 def test_metal_defaults_to_paired_histograms() raises:
-    """On Metal the builder raises the feature group to 2 on its own; an
-    explicit MOJOTREES_GPU_FEATURE_GROUP wins in both directions. Pairing
-    produces bit-identical histograms (the active-rows tests pin that), so
-    the default is a launch-shape decision only, which is why this asserts
-    the knob and not a histogram."""
+    """On Metal the builder raises the feature group above the single-slot
+    baseline on its own; an explicit MOJOTREES_GPU_FEATURE_GROUP wins in both
+    directions. Grouping produces bit-identical histograms (the active-rows
+    and kernel-family tests pin that), so the default is a launch-shape
+    decision only, which is why this asserts the knob and not a histogram.
+
+    The expected width is computed from the rule rather than written down as
+    a literal, because the rule is what the default means. It used to be the
+    literal 2, which was the same thing back when a threadgroup's shared
+    planes were `MAX_BINS` wide at every bin count: 2 was then the widest
+    group that fit the Metal baseline footprint. Now that the planes are
+    sized to the dataset's own bin capacity, this fixture's 16 bins round to
+    the 32-bin rung and the same baseline footprint buys a much wider group.
+    Pinning the literal would assert the old allocation, not the rule.
+    """
     comptime if not has_accelerator():
         print("skipped: no accelerator")
     else:
-        var data = _make_data(1_000, 2, 16)
+        var n_bins = 16
+        var data = _make_data(1_000, 2, n_bins)
+        var cap = histogram_bin_capacity(n_bins)
 
         _ = setenv("MOJOTREES_GPU_FEATURE_GROUP", "")
         var default_builder = GpuHistogramBuilder(data)
         if parse_api(default_builder.device_api) == API_METAL:
-            assert_equal(default_builder.rows.feature_group, 2)
+            var want = free_feature_group(cap, 2)
+            assert_equal(default_builder.rows.feature_group, want)
+            # The point of the rule, asserted rather than assumed: a Metal
+            # default is never narrower than the pairing it replaced.
+            assert_true(want >= 2)
         else:
-            assert_equal(default_builder.rows.feature_group, 1)
+            assert_equal(
+                default_builder.rows.feature_group, free_feature_group(cap, 1)
+            )
 
         _ = setenv("MOJOTREES_GPU_FEATURE_GROUP", "1")
         var forced_single = GpuHistogramBuilder(data)

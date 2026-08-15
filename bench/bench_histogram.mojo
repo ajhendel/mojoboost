@@ -116,10 +116,13 @@ def _feature_group_arms(mut builder: GpuHistogramBuilder, reps: Int) raises:
     windows, which makes two runs minutes apart incomparable; only
     back-to-back interleaved repeats resolve a difference.
 
-    The paired arm only reaches its own kernel on the atomic strategy. On
-    the tiled strategy both arms run the same partial kernel and the
-    comparison should come out flat, which is worth printing rather than
-    hiding: a difference there would mean the arm was not what it said.
+    Both strategies now resolve a real difference. That was not true while
+    the paired arm had its own hand-written kernel and only the atomic
+    strategy dispatched to it, so on the tiled strategy both arms ran the
+    identical partial kernel and the comparison was expected to come out
+    flat. Both strategies now launch one parameterized kernel instantiated
+    at the arm's group width, so a flat result here is a measurement rather
+    than a tautology, and a difference on either strategy is real.
     """
     var one = List[Float64](capacity=reps)
     var two = List[Float64](capacity=reps)

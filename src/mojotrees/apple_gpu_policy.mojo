@@ -102,6 +102,8 @@ from .gpu_tiling import (
     TARGET_BLOCKS_PER_SM,
     WARP_GRANULARITY,
     clamp_block_threads,
+    row_tile_floor,
+    shared_bytes_for as tiling_shared_bytes_for,
     strategy_name,
 )
 
@@ -415,8 +417,22 @@ def apple_m4_observed() -> GpuProfile:
 
 
 def shared_bytes_for_bins(n_bins: Int) -> Int:
-    """Threadgroup memory one block needs for its partial histogram."""
-    return n_bins * BYTES_PER_PARTIAL_CELL
+    """Threadgroup memory one block needs for its partial histogram, for a
+    block that owns one feature slot.
+
+    Delegates rather than restating the arithmetic. The two used to agree by
+    both spelling `n_bins * BYTES_PER_PARTIAL_CELL`, and they stopped
+    agreeing when the histogram kernels became capacity-sized: a launch at
+    63 bins now allocates the 64-bin rung, so the modeled footprint has to
+    round up the same ladder or it under-reports what the kernel really
+    takes. `gpu_tiling.shared_bytes_for` is where that rounding lives.
+
+    One slot, not one block: a threadgroup that owns a feature group of G
+    occupies G times this. Nothing here knows the group, which is why
+    `GpuActiveRows.set_feature_group` is what actually refuses a width the
+    device cannot hold.
+    """
+    return tiling_shared_bytes_for(n_bins)
 
 
 def partial_budget_bytes(profile: GpuProfile) -> Int:
@@ -587,12 +603,15 @@ def derive_policy(
     var block_threads = shape_block_threads(profile, n_rows)
     var resident = resident_blocks_per_core(profile, n_bins)
 
-    # Enough threadgroups to fill the device. The features are already
-    # spread across grid.x, so only the remainder needs row tiles.
+    # Enough threadgroups to fill the device. `row_tile_floor` is the shared
+    # rule, called rather than restated: dividing the device-wide block
+    # target by the feature count, as this used to, makes the feature count a
+    # ceiling on the whole launch instead of a floor under it, so a wide
+    # dataset collapsed to a single row tile however many rows a node held.
+    # This file reaching its own answer was how the specialized Apple path
+    # kept the old geometry after the shared rule was fixed.
     var target_blocks = profile.core_count * resident
-    var tiles_by_occupancy = _ceil_div(target_blocks, n_features)
-    if tiles_by_occupancy < 1:
-        tiles_by_occupancy = 1
+    var tiles_by_occupancy = row_tile_floor(target_blocks, n_features)
 
     # Enough rows per tile to pay for writing or folding the partial.
     var min_rows_per_tile = MIN_ROWS_PER_TILE_BIN_FACTOR * n_bins
