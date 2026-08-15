@@ -195,7 +195,7 @@ from .boosting import (
 )
 from .goss import GossParams, GossSelection, apply_goss_scaling, goss_round
 from .monotone import MonotoneConstraints
-from .objective_registry import LAMBDARANK as _LAMBDARANK
+from .objective_registry import LAMBDARANK
 from .sampling import (
     ClassBaggingParams,
     check_feature_fractions,
@@ -231,7 +231,7 @@ comptime RF_RANDOM_FEATURE_FRACTION = String("feature_fraction")
 # passed rather than leaving a bare `SQUARED_ERROR` in a multiclass call.
 comptime _NOT_BINARY = SQUARED_ERROR
 
-# `_LAMBDARANK` is imported from objective_registry.mojo, which defines the
+# `LAMBDARANK` is imported from objective_registry.mojo, which defines the
 # code once and imports only metrics.mojo, so this does not pull ranking.mojo
 # (and through it model.mojo and the GPU stack) into this module. It used to
 # be mirrored here by value for that reason.
@@ -376,7 +376,7 @@ def check_rf_objective(objective: Int) raises:
             " be evaluated once and never again (LightGBM refuses the same"
             " combination)"
         )
-    if objective == _LAMBDARANK:
+    if objective == LAMBDARANK:
         raise Error(
             "boosting='rf' does not support 'lambdarank': lambda gradients at"
             " a constant score carry no ranking, so every tree in the forest"
