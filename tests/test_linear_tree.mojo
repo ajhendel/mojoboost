@@ -20,8 +20,10 @@ from mojotrees.custom_metric import (
     RawValidSet,
     fit_with_metrics,
 )
+from mojotrees.alternate_boosting import AlternateBoostingParams, fit_boosting
 from mojotrees.linear_tree import LinearParams, linear_tree_available
 from mojotrees.model import Model, fit
+from mojotrees.model_dump import build_dump, dump_raw_scores
 from mojotrees.serialize import load_model, save_model
 
 comptime _N = 64
@@ -143,6 +145,39 @@ def test_linear_model_round_trips_through_a_v5_file() raises:
     assert_true(text_c.find("linear") < 0)
 
 
+def test_dump_carries_linear_leaves_and_reproduces_predictions() raises:
+    var x = _features()
+    var y = _target(x)
+    var linear = _fit(LinearParams(enabled=True, linear_lambda=0.1), x, y)
+    var dump = build_dump(linear)
+    assert_true(dump.linear_tree)
+    assert_equal(dump.model_format_version, 5)
+    var linear_leaves = 0
+    for t in range(len(dump.trees)):
+        for i in range(len(dump.trees[t].nodes)):
+            ref node = dump.trees[t].nodes[i]
+            if node.is_linear:
+                assert_true(node.is_leaf)
+                assert_equal(len(node.leaf_features), len(node.leaf_coeff))
+                assert_true(len(node.leaf_features) > 0)
+                linear_leaves += 1
+    assert_equal(linear_leaves, linear.booster.linear.n_linear_leaves())
+
+    # leaf_const + sum coeff * x reproduces the model on finite rows, up
+    # to the rounding of folding the stored centering into the constant.
+    var full = IterationRange(0, len(linear.booster.trees))
+    var pred = linear.predict_batch(x, _N, full)
+    for r in range(_N):
+        var row: List[Float64] = [x[r], x[_N + r]]
+        var scores = dump_raw_scores(dump, row)
+        assert_true(abs(scores[0] - pred[r]) < 1e-9)
+
+    # A constant-leaf model dumps as before.
+    var constant = build_dump(_fit(LinearParams.disabled(), x, y))
+    assert_true(not constant.linear_tree)
+    assert_equal(constant.model_format_version, 4)
+
+
 def test_binned_only_entry_points_refuse_linear_trees() raises:
     var x = _features()
     var y = _target(x)
@@ -150,6 +185,13 @@ def test_binned_only_entry_points_refuse_linear_trees() raises:
         _ = fit(
             x, _N, 2, y, SQUARED_ERROR,
             _params(LinearParams(enabled=True)),
+        )
+    # dart and rf bin once and never see the raw rows: refused by name.
+    with assert_raises(contains="boosting_type 'rf'"):
+        _ = fit_boosting(
+            x, _N, 2, y, SQUARED_ERROR,
+            _params(LinearParams(enabled=True)),
+            AlternateBoostingParams.rf(),
         )
 
 

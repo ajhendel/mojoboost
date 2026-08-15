@@ -196,6 +196,10 @@ def _write_node(
         out += ",\"leaf_value\":" + _json_f64(rec.value)
         out += ",\"leaf_count\":" + _json_f64(rec.count)
         out += ",\"depth\":" + String(rec.depth)
+        if rec.is_linear:
+            out += ",\"leaf_const\":" + _json_f64(rec.leaf_const)
+            out += ",\"leaf_features\":" + _json_int_list(rec.leaf_features)
+            out += ",\"leaf_coeff\":" + _json_f64_list(rec.leaf_coeff)
         out += "}"
         return
 
@@ -306,6 +310,7 @@ def dump_json(dump: ModelDump) raises -> String:
         out += "null"
     out += ",\"has_split_gain\":" + _json_bool(dump.has_split_gain)
     out += ",\"has_node_count\":" + _json_bool(dump.has_node_count)
+    out += ",\"linear_tree\":" + _json_bool(dump.linear_tree)
     out += ",\"tree_info\":["
     for t in range(len(dump.trees)):
         if t > 0:

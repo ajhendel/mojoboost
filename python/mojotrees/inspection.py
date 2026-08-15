@@ -226,13 +226,20 @@ def _nested_node(nodes, index):
     """
     node = nodes[index]
     if node["is_leaf"]:
-        return {
+        leaf = {
             "node_index": node["node_index"],
             "leaf_index": node["leaf_index"],
             "leaf_value": node["value"],
             "leaf_count": node["count"],
             "depth": node["depth"],
         }
+        if node.get("is_linear"):
+            # LightGBM's linear_tree leaf keys: the leaf's output is
+            # leaf_const + sum(leaf_coeff[j] * x[leaf_features[j]]).
+            leaf["leaf_const"] = node["leaf_const"]
+            leaf["leaf_features"] = list(node["leaf_features"])
+            leaf["leaf_coeff"] = list(node["leaf_coeff"])
+        return leaf
     return {
         "node_index": node["node_index"],
         "split_index": node["split_index"],
@@ -286,6 +293,7 @@ def _schema_from_native(payload):
         "monotone_constraints": payload["monotone_constraints"],
         "has_split_gain": payload["has_split_gain"],
         "has_node_count": payload["has_node_count"],
+        "linear_tree": bool(payload.get("linear_tree", False)),
         "tree_info": [
             {
                 "tree_index": tree["tree_index"],
@@ -1278,6 +1286,9 @@ def _dump_from_text(model, feature_names=None):
         "monotone_constraints": raw["monotone"],
         "has_split_gain": gains is not None,
         "has_node_count": has_count,
+        # The text fallback reads v1 through v4, which have no linear
+        # section; a linear (v5) model is dumped natively.
+        "linear_tree": False,
         "tree_info": trees,
     }
 

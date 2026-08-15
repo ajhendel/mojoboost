@@ -60,7 +60,7 @@ file that says so, rather than as one that claims zeros are real.
 | --- | --- | --- |
 | `dump_format_version` | int | this schema's version |
 | `producer` | str | always `"mojotrees"` |
-| `model_format_version` | int | mojotrees save format version, 1 through 4 |
+| `model_format_version` | int | mojotrees save format version, 1 through 5 (5 = a model with linear leaves) |
 | `source` | str | where the dump was built from: `"model_to_string"`, `"model_to_string+split_gains"`, or `"native"` |
 | `objective` | str or null | resolved objective name, LightGBM's spelling; `"multiclass"` for a softmax model. The native dump leaves this null and reports the code alone |
 | `objective_code` | int or null | the trainer's objective code; null for a multiclass model, which has no single-output code |
@@ -78,6 +78,7 @@ file that says so, rather than as one that claims zeros are real.
 | `monotone_constraints` | list[int] or null | one sign per feature, or null when the model was grown unconstrained |
 | `has_split_gain` | bool | above |
 | `has_node_count` | bool | above |
+| `linear_tree` | bool | true when the model carries linear leaves (`linear_tree=True` at fit time); leaves then carry the three keys below. Native dumps only; the text fallback reads v1 through v4 and reports false |
 | `tree_info` | list[object] | one record per tree, below |
 
 ### Leaf values
@@ -171,6 +172,19 @@ is no type tag.
 | `leaf_value` | float | the unshrunk output |
 | `leaf_count` | float | training rows that reached this leaf; 0.0 when `has_node_count` is false |
 | `depth` | int | edges from the root; the root is 0 |
+| `leaf_const` | float | linear leaves only (`linear_tree` true and this leaf was fitted): the constant term |
+| `leaf_features` | list[int] | linear leaves only: the feature indices of the linear terms, ascending |
+| `leaf_coeff` | list[float] | linear leaves only: one unshrunk coefficient per entry of `leaf_features` |
+
+A linear leaf's output is `leaf_const + sum_j leaf_coeff[j] *
+x[leaf_features[j]]`, LightGBM's `linear_tree` shape and key names, and
+`leaf_value` is the constant the leaf falls back to. The three keys are
+absent on a leaf the fitter left constant (too few rows, rank deficiency,
+no improvement), which happens inside a linear model too. What the dump
+does not carry is the per-feature substitute mojotrees uses for a
+non-finite value at prediction time (the in-leaf mean, folded into
+`leaf_const` here), so re-evaluating a linear leaf from the dump on rows
+with missing values can differ from `predict`.
 
 `leaf_index` is mojotrees's own leaf ordinal: leaves ranked in node-array
 order. It is exactly what `predict(pred_leaf=True)` reports, it is fixed

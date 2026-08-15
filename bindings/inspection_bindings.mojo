@@ -109,6 +109,11 @@ def _py_node(
     out["value"] = PythonObject(node.value)
     out["count"] = PythonObject(node.count)
     if node.is_leaf:
+        out["is_linear"] = PythonObject(node.is_linear)
+        if node.is_linear:
+            out["leaf_const"] = PythonObject(node.leaf_const)
+            out["leaf_features"] = py_int_list(node.leaf_features)
+            out["leaf_coeff"] = py_f64_list(node.leaf_coeff)
         return out^
     out["split_feature"] = PythonObject(node.split_feature)
     out["split_feature_name"] = PythonObject(
@@ -184,6 +189,7 @@ def _py_dump(dump: ModelDump) raises -> PythonObject:
         out["monotone_constraints"] = PythonObject(None)
     out["has_split_gain"] = PythonObject(dump.has_split_gain)
     out["has_node_count"] = PythonObject(dump.has_node_count)
+    out["linear_tree"] = PythonObject(dump.linear_tree)
     var infos = Python.list()
     for f in range(len(dump.features)):
         infos.append(_py_feature(dump.features[f]))

@@ -130,6 +130,7 @@ from .bagging import (
     refresh_bag,
 )
 from .binning import BinnedMatrix, fit_bins
+from .linear_tree import check_linear_tree_unconnected
 from .boosting import (
     Booster,
     BoosterParams,
@@ -384,6 +385,23 @@ def _check_rf_uniform_args(class_bagging: ClassBaggingParams) raises:
             " boosting_rf.train_rf takes no ClassBaggingParams. Build a"
             " boosting_rf.RfParams with the class_bagging field set and call"
             " boosting_rf.train_forest"
+        )
+
+
+def _refuse_linear(params: BoosterParams, boosting: AlternateBoostingParams) raises:
+    """`linear_tree=True` under dart or rf is refused by name rather than
+    silently trained with constant leaves.
+
+    The dart and rf round loops here bin the raw matrix once and never see
+    it again, so they cannot fit linear leaves (`linear_tree.refit_linear_tree`
+    needs the raw rows), and DART's per-tree weights would then have to be
+    folded into the sidecar with `LinearEnsemble.scale_all` in the same call
+    as `fold_weights_into_trees`. Neither is written; gbdt with linear
+    leaves goes through `custom_metric.fit_with_metrics`.
+    """
+    if boosting.mode != BOOSTING_GBDT and params.linear.is_active():
+        check_linear_tree_unconnected(
+            "boosting_type '" + boosting_name(boosting.mode) + "'"
         )
 
 
@@ -1311,6 +1329,7 @@ def train_boosting(
     ignored.
     """
     boosting.validate(goss)
+    _refuse_linear(params, boosting)
     if boosting.mode == BOOSTING_DART:
         if class_bagging.enabled():
             raise Error(
@@ -1387,6 +1406,7 @@ def train_boosting_more(
     such precondition; that is `boosting_rf.train_forest_more`.
     """
     boosting.validate(goss)
+    _refuse_linear(params, boosting)
     if boosting.mode == BOOSTING_RF:
         _check_rf_uniform_args(class_bagging)
         return train_rf_more(
@@ -1467,6 +1487,7 @@ def train_boosting_with_valid(
     (`dart_restore_best`).
     """
     boosting.validate(goss)
+    _refuse_linear(params, boosting)
     if boosting.mode == BOOSTING_DART:
         if class_bagging.enabled():
             raise Error(
@@ -1550,6 +1571,7 @@ def train_boosting_multiclass(
     together.
     """
     boosting.validate(goss)
+    _refuse_linear(params, boosting)
     if boosting.mode == BOOSTING_DART:
         return train_dart_multiclass(
             data,
@@ -1603,6 +1625,7 @@ def train_boosting_multiclass_more(
     does, and rewrites the existing trees rather than only appending to them.
     """
     boosting.validate(goss)
+    _refuse_linear(params, boosting)
     if boosting.mode == BOOSTING_RF:
         raise Error(
             "boosting='rf' cannot continue a bridged MulticlassBooster: the"
@@ -1651,6 +1674,7 @@ def train_boosting_multiclass_with_valid(
     rather than truncating, for the reason `train_boosting_with_valid` gives.
     """
     boosting.validate(goss)
+    _refuse_linear(params, boosting)
     if boosting.mode == BOOSTING_DART:
         return train_dart_multiclass_with_valid(
             data,

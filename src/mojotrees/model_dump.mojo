@@ -51,7 +51,12 @@ edit.
 
 from std.math import isnan
 
+# Larger than any finite Float64; a comparison against it detects the
+# infinities without an `isinf`.
+comptime _F64_MAX = 1.7976931348623157e308
+
 from .binning import BinMapper
+from .linear_tree import LinearEnsemble, linear_model_format_version
 from .categorical import (
     CAT_MAX_BINS,
     UNKNOWN_BIN,
@@ -153,11 +158,24 @@ struct DumpNode(Copyable, Movable):
     var split_gain: Float64
     var value: Float64
     var count: Float64
+    var is_linear: Bool
+    var leaf_const: Float64
+    var leaf_features: List[Int]
+    var leaf_coeff: List[Float64]
 
     def __init__(out self, node_index: Int, depth: Int, parent: Int):
         """A leaf-shaped record that routes nothing. `_node_records` fills
         in the split fields for a node that has one, so every field a leaf
-        does not use has one obvious value rather than a stale one."""
+        does not use has one obvious value rather than a stale one.
+
+        `is_linear`, `leaf_const`, `leaf_features`, `leaf_coeff` are the
+        linear-leaf fields (LightGBM's `linear_tree` dump keys), filled by
+        `_attach_linear` for a leaf the model's `LinearEnsemble` fitted:
+        `leaf(x) = leaf_const + sum_j leaf_coeff[j] * x[leaf_features[j]]`,
+        with the centering `linear_tree.mojo` stores folded into
+        `leaf_const`. A constant leaf keeps `is_linear` False and `value`
+        as its whole output.
+        """
         self.node_index = node_index
         self.depth = depth
         self.parent = parent
@@ -178,6 +196,10 @@ struct DumpNode(Copyable, Movable):
         self.split_gain = 0.0
         self.value = 0.0
         self.count = 0.0
+        self.is_linear = False
+        self.leaf_const = 0.0
+        self.leaf_features = List[Int]()
+        self.leaf_coeff = List[Float64]()
 
 
 struct DumpTree(Copyable, Movable):
@@ -253,6 +275,7 @@ struct ModelDump(Copyable, Movable):
     var monotone_constraints: List[Int]
     var has_split_gain: Bool
     var has_node_count: Bool
+    var linear_tree: Bool
     var features: List[DumpFeature]
     var trees: List[DumpTree]
 
@@ -273,6 +296,7 @@ struct ModelDump(Copyable, Movable):
         self.monotone_constraints = List[Int]()
         self.has_split_gain = False
         self.has_node_count = False
+        self.linear_tree = False
         self.features = List[DumpFeature]()
         self.trees = List[DumpTree]()
 
@@ -549,6 +573,50 @@ def _node_records(mapper: BinMapper, tree: Tree) raises -> List[DumpNode]:
     return out^
 
 
+def _attach_linear(
+    mut nodes: List[DumpNode], linear: LinearEnsemble, t: Int
+) raises:
+    """Fill the linear-leaf fields of tree `t`'s leaf records from the
+    sidecar. A tree the sidecar does not cover (an inactive sidecar, or a
+    constant-leaf tree inside an active one) leaves every record as it is.
+
+    The affine function is reported in LightGBM's shape, `leaf_const +
+    sum coef * x`, so the stored centering is folded into the constant:
+    `leaf_const = intercept - sum_j coef[j] * center[j]`. What is not
+    reported is the per-feature substitute a non-finite value takes at
+    prediction time (`center[j]`; LightGBM falls back to the whole
+    `leaf_value` instead), so a dump consumer that re-evaluates a linear
+    leaf on rows with missing values may differ from `predict` there.
+    """
+    if t >= len(linear.trees) or not linear.trees[t].is_active():
+        return
+    ref entry = linear.trees[t]
+    for i in range(len(nodes)):
+        if not nodes[i].is_leaf:
+            continue
+        var o = nodes[i].leaf_index
+        if o < 0 or o >= len(entry.leaf):
+            raise Error(
+                "linear tree ",
+                t,
+                ": leaf ordinal ",
+                o,
+                " outside its ",
+                len(entry.leaf),
+                " sidecar entries",
+            )
+        ref leaf = entry.leaf[o]
+        if not leaf.is_linear():
+            continue
+        var const = leaf.intercept
+        for j in range(len(leaf.feature)):
+            const -= leaf.coef[j] * leaf.center[j]
+        nodes[i].is_linear = True
+        nodes[i].leaf_const = const
+        nodes[i].leaf_features = leaf.feature.copy()
+        nodes[i].leaf_coeff = leaf.coef.copy()
+
+
 def _build(
     mapper: BinMapper,
     trees: List[Tree],
@@ -560,6 +628,7 @@ def _build(
     objective_code: Int,
     has_objective_code: Bool,
     feature_names: List[String],
+    linear: LinearEnsemble,
 ) raises -> ModelDump:
     """The shared body of the two builders. Everything a single-output and a
     softmax model do not share is an argument, so there is one description
@@ -589,8 +658,14 @@ def _build(
         dump.monotone_constraints = monotone.signs.copy()
     dump.has_split_gain = has_split_gains(trees)
     dump.has_node_count = has_node_counts(trees)
+    dump.linear_tree = linear.is_active()
+    dump.model_format_version = linear_model_format_version(
+        linear, MODEL_FORMAT_VERSION
+    )
     dump.features = _build_features(mapper, names, monotone)
     for t in range(len(trees)):
+        var nodes = _node_records(mapper, trees[t])
+        _attach_linear(nodes, linear, t)
         dump.trees.append(
             DumpTree(
                 t,
@@ -598,7 +673,7 @@ def _build(
                 t % per_iteration,
                 trees[t].n_leaves,
                 learning_rate,
-                _node_records(mapper, trees[t]),
+                nodes^,
             )
         )
     return dump^
@@ -629,6 +704,7 @@ def build_dump(
         model.booster.objective,
         True,
         feature_names,
+        model.booster.linear,
     )
 
 
@@ -654,6 +730,7 @@ def build_multiclass_dump(
         -1,
         False,
         feature_names,
+        model.booster.linear,
     )
 
 
@@ -801,10 +878,30 @@ def dump_raw_scores(
     var per_iteration = dump.num_tree_per_iteration
     for t in range(len(dump.trees)):
         var node = dump_leaf_node(dump, t, row)
-        scores[t % per_iteration] += (
-            dump.trees[t].shrinkage * dump.trees[t].nodes[node].value
+        scores[t % per_iteration] += dump.trees[t].shrinkage * dump_leaf_output(
+            dump.trees[t].nodes[node], row
         )
     return scores^
+
+
+def dump_leaf_output(node: DumpNode, row: List[Float64]) -> Float64:
+    """What a leaf of the dump emits for one raw example: `value` for a
+    constant leaf, and `leaf_const + sum coeff * x` for a linear one whose
+    features are all finite. A linear leaf seeing a non-finite feature falls
+    back to `value`, which is LightGBM's rule for the dump; the model's own
+    `predict` substitutes the in-leaf mean per feature instead (see
+    `_attach_linear`), so the two can differ on such rows and agree
+    elsewhere up to rounding of the folded constant.
+    """
+    if not node.is_linear:
+        return node.value
+    var out = node.leaf_const
+    for j in range(len(node.leaf_features)):
+        var x = row[node.leaf_features[j]]
+        if isnan(x) or x > _F64_MAX or x < -_F64_MAX:
+            return node.value
+        out += node.leaf_coeff[j] * x
+    return out
 
 
 def dump_split_values(
