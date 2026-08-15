@@ -124,10 +124,11 @@ from .boosting import (
 )
 from .categorical import CAT_BITSET_WORDS
 from .gain import soft_threshold_l1
+from .inspection import _F64_MAX
 from .model import Model, MulticlassModel
 from .monotone import MonotoneConstraints, OutputBounds
 from .ranking import LAMBDARANK
-from .sampling import _splitmix64, _uniform
+from .rng import splitmix64, uniform
 from .tree import Tree, TreeParams, node_bounds
 from .tree_parameters_extra import finish_leaf_output
 from .trainset import Dataset, _int_labels
@@ -156,9 +157,9 @@ comptime LEAF_EDIT_REJECT = 1
 # with the bagging or feature-sampling stream of the same integer seed.
 comptime _SHUFFLE_DOMAIN = UInt64(0xC3D2_E1F0_5A69_7B84)
 
-# Larger than any finite Float64, so a comparison against it detects the
-# infinities without an `isinf`. Same constant inspection.mojo uses.
-comptime _F64_MAX = 1.7976931348623157e308
+# `_F64_MAX` (larger than any finite Float64, so a comparison against it
+# detects the infinities without an `isinf`) is imported from inspection.mojo,
+# which defines it once.
 
 
 # -- value hygiene -------------------------------------------------------
@@ -1296,12 +1297,12 @@ def _shuffled_order(start: Int, stop: Int, seed: Int) -> List[Int]:
     var order = List[Int](capacity=stop - start)
     for i in range(start, stop):
         order.append(i)
-    var stream = _splitmix64(
+    var stream = splitmix64(
         UInt64(seed & 0x7FFFFFFFFFFFFFFF) ^ _SHUFFLE_DOMAIN
     )
     var n = len(order)
     for i in range(n - 1, 0, -1):
-        var j = Int(_uniform(stream + UInt64(i)) * Float64(i + 1))
+        var j = Int(uniform(stream + UInt64(i)) * Float64(i + 1))
         if j > i:
             j = i
         var tmp = order[i]
