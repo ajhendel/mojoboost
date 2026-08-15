@@ -214,7 +214,10 @@ def _batch_softmax_grad_kernel(
         y = 1.0
     var out = slot * nr + r
     grad[unsafe_offset=out] = w * (p - y)
-    var h = 2.0 * p * (1.0 - p)
+    # LightGBM's factor_ = k / (k - 1), not the old hardcoded 2 (exact only
+    # at two classes); see _fill_softmax_grad_hess in boosting.mojo.
+    var factor = Float32(Int(n_classes)) / Float32(Int(n_classes) - 1)
+    var h = factor * p * (1.0 - p)
     if h < HESS_FLOOR:
         h = HESS_FLOOR
     hess[unsafe_offset=out] = w * h

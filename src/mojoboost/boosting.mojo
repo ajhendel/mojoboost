@@ -1413,13 +1413,20 @@ def _fill_softmax_grad_hess(
     softmax probabilities."""
     grad.clear()
     hess.clear()
+    var factor = Float64(n_classes) / Float64(n_classes - 1)
     for r in range(len(labels)):
         var p = prob[r * n_classes + k]
         var y = 1.0 if labels[r] == k else 0.0
         var w = weights[r] if len(weights) > 0 else 1.0
         grad.append(w * (p - y))
-        # LightGBM/XGBoost softmax hessian: 2 * p * (1 - p), floored.
-        var h = 2.0 * p * (1.0 - p)
+        # LightGBM softmax hessian: (k / (k - 1)) * p * (1 - p), floored
+        # (multiclass_objective.hpp, factor_). At two classes the factor is
+        # 2, which is where the old hardcoded 2.0 came from; at seven
+        # classes the true factor is 7/6, and the overscaled hessian shrank
+        # every leaf by ~1.7x — the real-data harness caught it as a 14%
+        # multi_logloss gap on covertype. XGBoost's max(2p(1-p), eps) is a
+        # different convention, not this one.
+        var h = factor * p * (1.0 - p)
         if h < 1e-16:
             h = 1e-16
         hess.append(w * h)

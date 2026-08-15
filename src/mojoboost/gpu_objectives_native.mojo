@@ -335,7 +335,7 @@ def _softmax_class_kernel(
 ):
     """One-vs-rest derivatives for class `k` from the probabilities
     `_softmax_prob_kernel` left behind, matching `_fill_softmax_grad_hess`:
-    gradient `p - y`, hessian `2 p (1 - p)` floored.
+    gradient `p - y`, hessian `(k / (k - 1)) p (1 - p)` floored.
 
     `target` holds the integer class label as a Float32. Class counts are far
     below 2^24, so the label is exact in Float32 and the equality test is
@@ -352,7 +352,10 @@ def _softmax_class_kernel(
     if target[unsafe_offset=r][0] == Float32(Int(k)):
         y = 1.0
     grad[unsafe_offset=r] = w * (p - y)
-    var h = 2.0 * p * (1.0 - p)
+    # LightGBM's factor_ = k / (k - 1), not the old hardcoded 2 (exact only
+    # at two classes); see _fill_softmax_grad_hess in boosting.mojo.
+    var factor = Float32(Int(n_classes)) / Float32(Int(n_classes) - 1)
+    var h = factor * p * (1.0 - p)
     if h < HESS_FLOOR:
         h = HESS_FLOOR
     hess[unsafe_offset=r] = w * h
