@@ -225,11 +225,14 @@ correctness bug, not a tuning result.
 Three things the code already predicts, all worth confirming rather than
 assuming:
 
-- The kernels reserve `3 * MAX_BINS * 4` bytes of shared memory regardless of
-  the dataset's bin count, so a 64-bin dataset reserves the same 3072 bytes
-  as a 256-bin one. If the profiler shows shared memory limiting occupancy,
-  sizing the reservation to the actual bin count is the first thing to try,
-  and it is a portable change, not a vendor one.
+- The kernels reserve `3 * GROUP * BIN_CAP * 4` bytes of shared memory, where
+  `BIN_CAP` is the dataset's bin count rounded up the ladder 32, 64, 128,
+  256. They used to reserve `3 * MAX_BINS * 4` at every bin count, so a
+  64-bin dataset reserved the same 3072 bytes as a 256-bin one; sizing the
+  reservation to the bin count was predicted here as the first thing to try
+  if the profiler showed shared memory limiting occupancy, and it has since
+  been done. It is what makes a feature group wider than 2 affordable at low
+  bin counts, since the freed memory buys group width at the same footprint.
 - Every in-range row issues three shared-memory atomics into a bin chosen by
   its feature value. With 256 threads and 64 bins, four threads per bin
   collide on average. High bank-conflict counts point at per-warp
@@ -239,6 +242,57 @@ assuming:
   most threads find no matching row. Low achieved occupancy on the child
   histograms is expected and is what order-preserving row compaction is
   meant to fix.
+
+## Apple M4, 2026-08-15: the five-lane GPU performance round
+
+Recorded here because this file is where device measurements live, and
+because three of the five changes in that round are defaults now and the
+fourth was reverted on the strength of these numbers.
+
+Mojo 1.0.0 (ed45d567). All figures are seconds of GPU training at 100
+boosting rounds on a regression target, reported as the minimum of the
+repeats, taken with `bench/bench_train_gpu.mojo`. Arms inside one process
+are interleaved; arms across processes were alternated and each figure below
+was reproduced at least twice in the same window, because this machine's
+device timings drift two to three times across windows and only back-to-back
+runs compare.
+
+Headline, 1,000,000 rows by 50 features, five repeats:
+
+| arm | seconds | spread |
+|---|---|---|
+| CPU backend | 11.36 | 3.8 percent |
+| GPU, every change on | 4.10 | 5.8 percent |
+| GPU, every escape hatch set to the old path | 4.28 | 0.7 percent |
+
+So the round is worth about 3 to 4 percent end to end at this shape, and the
+GPU backend is about 2.8 times the CPU one. The 0.56x figure that circulated
+before this round is stale by a wide margin and should not be quoted.
+
+Per change, isolated by setting one escape hatch at a time from the
+all-on configuration:
+
+| change | reverting it costs | verdict |
+|---|---|---|
+| pre-quantized gradients (`MOJOTREES_GPU_QUANTIZED_GRADS`) | 5.59 against 5.03 | a win, on by default |
+| block-primitive partition scan (`MOJOTREES_GPU_SCAN_PRIMITIVES`) | 5.12 against 5.03 | a small win, on by default |
+| block-primitive split search (`MOJOTREES_GPU_SPLIT_PRIMITIVES`) | 5.07 against 5.03 | indistinguishable |
+| row-tile floor (`MOJOTREES_GPU_MIN_TILES`) | 4.11 against 5.03 | a LOSS, reverted to opt-in |
+
+The split-search primitives were also measured on the shape they were
+written for, 50,000 rows by 50 features, where the device search loses to
+the host scan. Three alternating pairs gave 2.473, 2.629, 2.685 with the
+primitives and 2.649, 2.476, 2.688 without: indistinguishable. That gap has
+another cause. Note for whoever picks it up that the launch count is not it,
+since the search already runs one grid over every (feature slot, node) task
+and one over every node, which is the shape LightGBM's CUDA best-split
+finder uses.
+
+The row-tile floor is written up in `gpu_tiling.row_tile_floor`, including
+the 100-feature case where it loses by 36 percent, the strategy-forced arms
+showing the loss is not the reduction kernel, and the observation that the
+whole loss happened inside the region `MIN_ROWS_PER_TILE_BIN_FACTOR` calls
+safe.
 
 ## Recording a result
 
@@ -331,13 +385,15 @@ Known already, from reading rather than running:
   models agree to Float32 tolerance rather than bit-exactly. Raising it for
   CUDA and HIP only would be a vendor branch and needs the justification
   below.
-- **Shared memory is reserved by `MAX_BINS`, budgeted by `n_bins`.** The
-  kernels reserve three 256-long Int32 planes whatever the dataset's bin
-  count, so every launch asks the driver for 3072 bytes.
-  `gpu_tiling.shared_bytes_for` budgets `n_bins * 12`, which for a 64-bin
-  dataset is 768. On a device whose per-threadgroup shared memory fell
-  between the two, the policy would accept a shape the launch could not
-  satisfy. No supported backend is anywhere near that range (the smallest
+- **Shared memory is reserved and budgeted by the same bin capacity.** This
+  entry used to record a gap: the kernels reserved three 256-long Int32
+  planes whatever the dataset's bin count while `gpu_tiling.shared_bytes_for`
+  budgeted `n_bins * 12`, so on a device whose per-threadgroup shared memory
+  fell between the two the policy would accept a shape the launch could not
+  satisfy. The gap is closed. Both are now
+  `histogram_bin_capacity(n_bins) * 12` per feature slot. A new and narrower
+  gap replaces it: both price one slot, and a threadgroup owning a group of G
+  occupies G times as much, so the model under-reports at any group past 1. No supported backend is anywhere near that range (the smallest
   guaranteed allocation is 16 KiB), so this is latent rather than live, and
   `tests/test_gpu_portability.mojo` checks the reservation against the
   portable floor so it stays that way. Sizing the reservation to `n_bins`

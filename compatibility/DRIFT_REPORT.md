@@ -204,19 +204,22 @@ and misses four of the seven documented ones, which is why the snapshot
 schema defines `observed` as the literal scan and keeps `read_directly` as
 a separate, narrower field.
 
-The other thirty-seven are read and undeclared, in five recognizable
-groups:
+The other forty-two are read and undeclared, in five recognizable
+groups (the count and the GPU rows below were updated when the GPU
+performance round of 2026-08-15 added five more; the snapshot's
+`environment.undeclared` block is the authority, and this prose is a
+narrative that has to be re-read against it rather than incremented):
 
 | Group | Variables |
 |---|---|
 | CPU policy | `MOJOTREES_CPU_COMPACT_MIN_ROWS`, `MOJOTREES_CPU_CORE_POOL`, `MOJOTREES_CPU_FEATURE_GROUP`, `MOJOTREES_CPU_TASKS_PER_CORE`, `MOJOTREES_HIST_CACHE_BYTES` |
 | Distributed | `MOJOTREES_DIST_JOB_ID`, `MOJOTREES_DIST_MACHINES`, `MOJOTREES_DIST_MODE`, `MOJOTREES_DIST_RANK`, `MOJOTREES_DIST_RESTART_EPOCH`, `MOJOTREES_DIST_TIMEOUT_S`, `MOJOTREES_DIST_WORLD_SIZE`, `MOJOTREES_DISTRIBUTED_BASE_PORT`, `MOJOTREES_DISTRIBUTED_CONNECT_TIMEOUT`, `MOJOTREES_DISTRIBUTED_PROVIDER`, `MOJOTREES_DASK_BACKEND` |
-| GPU tuning | `MOJOTREES_GPU_BATCH_SLOTS`, `MOJOTREES_GPU_CLASS_BATCH`, `MOJOTREES_GPU_CLASS_BATCH_BYTES`, `MOJOTREES_GPU_GRAD_LAYOUT`, `MOJOTREES_GPU_HIST_SPECIALIZATION`, `MOJOTREES_GPU_OBJECTIVE`, `MOJOTREES_GPU_SPLIT_STRATEGY`, `MOJOTREES_GPU_STAGING_SLOTS`, `MOJOTREES_GPU_TRANSFER`, `MOJOTREES_GPU_VALID_SCORING`, `MOJOTREES_GPU_WARMUP`, `MOJOTREES_HYBRID_LEAVES` |
+| GPU tuning | `MOJOTREES_GPU_BATCH_SLOTS`, `MOJOTREES_GPU_CLASS_BATCH`, `MOJOTREES_GPU_CLASS_BATCH_BYTES`, `MOJOTREES_GPU_GRAD_LAYOUT`, `MOJOTREES_GPU_HIST_SPECIALIZATION`, `MOJOTREES_GPU_OBJECTIVE`, `MOJOTREES_GPU_MIN_TILES`, `MOJOTREES_GPU_SCAN_PRIMITIVES`, `MOJOTREES_GPU_SPARSE_SKIP_FREQ`, `MOJOTREES_GPU_SPLIT_PRIMITIVES`, `MOJOTREES_GPU_SPLIT_STRATEGY`, `MOJOTREES_GPU_STAGING_SLOTS`, `MOJOTREES_GPU_TRANSFER`, `MOJOTREES_GPU_VALID_SCORING`, `MOJOTREES_GPU_WARMUP`, `MOJOTREES_HYBRID_LEAVES` |
 | Diagnostics and tracing | `MOJOTREES_GPU_TRACE`, `MOJOTREES_GPU_VERIFY_ROWS`, `MOJOTREES_HYBRID_TRACE`, `MOJOTREES_STARTUP_TRACE`, `MOJOTREES_STARTUP_REPORT_FD` |
 | Escape hatches, and build | `MOJOTREES_GPU_BACKEND`, `MOJOTREES_GPU_BACKEND_UNVALIDATED`, `MOJOTREES_GPU_TRANSFER_UNPROVEN`, `MOJOTREES_MACOS_DEPLOYMENT_TARGET` |
 
 An undeclared variable is not a bug, and this lane does not propose
-declaring all thirty-seven. Section 2 of the compatibility policy already
+declaring all forty-two. Section 2 of the compatibility policy already
 says only what is listed is public, and most of these are tuning and
 tracing knobs whose whole value is that they can be retuned in a patch
 release. Two of them, `MOJOTREES_GPU_BACKEND_UNVALIDATED` and

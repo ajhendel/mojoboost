@@ -60,9 +60,12 @@ per-backend bound, read from the device rather than assumed, to lift.
 ## The things to look at first
 
 1. **Threadgroup memory, called LDS here.** The shipping histogram kernels
-   allocate three `MAX_BINS`-wide Int32 planes, 3072 bytes, at every bin
-   count. AMD parts typically report 64 KiB of LDS per workgroup, so 3 KiB
-   is not near a limit, but LDS allocation granularity and the fixed
+   allocate three `GROUP * BIN_CAP`-wide Int32 planes, where `BIN_CAP` is
+   the bin count rounded up the ladder 32, 64, 128, 256 and `GROUP` is the
+   feature slots one threadgroup owns. That is 3072 bytes for one slot at
+   256 bins and 768 at 64. AMD parts typically report 64 KiB of LDS per
+   workgroup, so this is not near a limit at any group width the ladder
+   allows, but LDS allocation granularity and the fixed
    eight-blocks-per-multiprocessor target in
    `gpu_tiling.TARGET_BLOCKS_PER_SM` interact in ways worth reading off a
    profiler rather than assuming. If occupancy is capped by LDS, the

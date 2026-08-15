@@ -47,10 +47,12 @@ In the order they are most likely to matter, and each is a question for a
 profiler rather than a prediction.
 
 1. **Static threadgroup memory and occupancy.** The shipping histogram
-   kernels allocate three `MAX_BINS`-wide Int32 planes, 3072 bytes, at every
-   bin count. CUDA's static shared-memory limit per block is 48 KiB without
-   an opt-in the shared source does not take, so 3 KiB is not close to a
-   limit. It is still the first thing to read off a trace, because
+   kernels allocate three `GROUP * BIN_CAP`-wide Int32 planes, where
+   `BIN_CAP` is the bin count rounded up the ladder 32, 64, 128, 256 and
+   `GROUP` is the feature slots one threadgroup owns. That is 3072 bytes for
+   one slot at 256 bins and 768 at 64. CUDA's static shared-memory limit per
+   block is 48 KiB without an opt-in the shared source does not take, so even
+   the widest group on the ladder is not close to a limit. It is still the first thing to read off a trace, because
    `gpu_tiling.TARGET_BLOCKS_PER_SM` aims for eight resident blocks per
    multiprocessor as a fixed target rather than deriving it from what the
    device reports, and eight blocks times 3 KiB is a number worth checking

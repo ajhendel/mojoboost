@@ -153,12 +153,22 @@ a name that says so.
 when a backend does not implement the query. That is the entire capability
 surface every shipping GPU module sees.
 
-`gpu_tiling.shared_bytes_for(n_bins)` models a block's threadgroup footprint
-as `n_bins * 12`, which its own docstring records as the footprint of a
-kernel sized to its bin count. The kernels that ship allocate three
-`MAX_BINS`-wide Int32 planes whatever `n_bins` is, which is 3072 bytes. The
-two agree only at 256 bins, so a device advertising less than 3 KiB would
-pass the guard in `derive_tiling` and then fail to launch.
+`gpu_tiling.shared_bytes_for(n_bins)` returns
+`histogram_bin_capacity(n_bins) * 12`, the footprint of one feature slot in a
+kernel sized to its bin capacity. The kernels that ship are now sized that
+way: they take the capacity as a comptime parameter and allocate three
+`GROUP * BIN_CAP`-wide Int32 planes, where `BIN_CAP` is `n_bins` rounded up
+the ladder 32, 64, 128, 256. A 64-bin dataset therefore allocates 768 bytes
+per slot rather than the 3072 it allocated at every bin count before, and the
+model and the launch agree at every bin count rather than only at 256.
+
+One caveat, and it is the reason `KernelFeatures.specialized_bin_kernels` is
+still false: this function and `kernel_shared_request` below both price ONE
+feature slot, and a threadgroup owning a group of G occupies G times as much.
+Neither knows the group. The bound that actually refuses a width the device
+cannot hold is `GpuActiveRows.set_feature_group`, which does know it. Giving
+these two the group is the change that would let the geometry gate check a
+number that bounds the launch.
 
 `gpu_portability.kernel_shared_request(n_bins, features)` returns the
 footprint the compiled kernel really has, choosing between the two according
