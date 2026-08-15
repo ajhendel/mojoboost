@@ -1,0 +1,24 @@
+=== toolchain ===
+Mojo 1.0.0 (ed45d567)
+=== machine ===
+Apple M4
+10
+4
+6
+17179869184
+=== thermal before ===
+mojotrees thermal capture plan
+==============================
+
+script            thermal_capture.sh 1.0.0
+protocol          docs/APPLE_THERMAL_ENERGY.md 1.0.0
+parent protocol   docs/APPLE_GPU_BENCHMARK_PROTOCOL.md 1.0.0
+record schema     bench/apple/thermal_schema.json 1.0.0
+
+run id            thermal-PENDING
+would write       /Users/andrewhendel/CascadeProjects/mojotrees/bench/apple/thermal_results/thermal-PENDING.json
+workload          w2_medium_dense, device cpu, threads unset
+conditions        power ac, lid open, surface hard_desk
+Note: No thermal warning level has been recorded
+Note: No performance warning level has been recorded
+Note: No CPU power status has been recorded

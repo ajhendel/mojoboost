@@ -1,0 +1,8 @@
+### R1: serial CPU, ours vs LightGBM, 1M x 50 ###
+-- LightGBM, 1 thread --
+lightgbm bench: 1000000 rows x 50 features, reg, 1 thread(s), seed 0
+binning_s: 1.207370
+train_s: 8.823065
+total_s: 10.030435
+n_trees: 100
+train_mse: 0.003490098845391396

@@ -1,0 +1,7 @@
+-- mojotrees CPU, 1 worker --
+binning_s: 0.376819
+cpu_train_s: 15.61248
+cpu_train_s_median: 15.959379
+cpu_train_s_max: 16.085385
+cpu_spread_pct: 3.0
+cpu_train_loss: 0.0035182733926987743

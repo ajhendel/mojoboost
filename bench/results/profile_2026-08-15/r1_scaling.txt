@@ -1,0 +1,14 @@
+-- ours CPU auto vs GPU, 1M x 50, interleaved --
+cpu_train_s: 6.488429
+cpu_train_s_median: 6.981735
+cpu_train_s_max: 7.188007
+cpu_spread_pct: 10.8
+gpu_train_s: 3.499507
+gpu_train_s_median: 3.575185
+gpu_train_s_max: 3.587139
+gpu_spread_pct: 2.5
+gpu_speedup_x: 1.8540980200925445
+gpu_vs_cpu: resolved delta_pct -46.1 noise_floor_pct 10.8
+-- LightGBM 10 threads --
+binning_s: 0.302846
+train_s: 2.858046

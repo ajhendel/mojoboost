@@ -1,0 +1,14 @@
+### 250000 x 50 ###
+cpu_train_s_median: 1.663785
+cpu_spread_pct: 11.3
+gpu_train_s_median: 1.892842
+gpu_spread_pct: 1.1
+gpu_speedup_x: 0.8303350335908437
+train_s: 1.002939
+### 50000 x 50 ###
+cpu_train_s_median: 0.563844
+cpu_spread_pct: 11.3
+gpu_train_s_median: 1.634874
+gpu_spread_pct: 2.1
+gpu_speedup_x: 0.3296187501549292
+train_s: 0.594365
