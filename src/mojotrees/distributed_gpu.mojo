@@ -101,6 +101,7 @@ from .distributed_strategies import (
     strategy_name,
 )
 from .distributed_transport import transport_available
+from .quantized_gradient import FIXED_ONE, magnitude_sum
 
 # ---------------------------------------------------------------------------
 # Build-level facts
@@ -124,13 +125,10 @@ at every size tested, and no discrete-GPU run exists. This is the gate
 docs/distributed.md section 9 sets, and it is evidence rather than code: it
 flips when a benchmark says so, not when a feature lands."""
 
-comptime FIXED_ONE = Float64(1 << 30)
-"""The fixed-point budget, which must equal `_FIXED_ONE` in histogram_gpu.mojo.
-
-Restated rather than imported because it is private there. The duplication is
-deliberate and bounded: `check_fixed_point_contract` exists so a caller that
-can see both can assert they agree, and the handoff asks the GPU lane to
-export the constant so this copy can be deleted."""
+# `FIXED_ONE` and `magnitude_sum` are imported from quantized_gradient.mojo,
+# the one definition site histogram_gpu.mojo and gpu_objectives_native.mojo
+# also read; this module used to restate both. `check_fixed_point_contract`
+# stays so a caller holding a builder's own budget can still assert it agrees.
 
 # The largest total row count a fixed-point exchange may cover. Row indices
 # cross into the kernels as Int32 (`MAX_ROWS` in histogram_gpu.mojo), and the
@@ -442,21 +440,6 @@ def fixed_scale_from_total(total: Float64) raises -> Float64:
             " fixed-point histogram"
         )
     return Float64(scale)
-
-
-def magnitude_sum(values: List[Float64]) raises -> Float64:
-    """One rank's contribution to the global magnitude sum.
-
-    Summed in the list's own order, which is the row order, so the reduction
-    that follows sees per-rank partials formed exactly as the single-node
-    builder forms its whole sum.
-    """
-    var total = 0.0
-    for i in range(len(values)):
-        total += abs(values[i])
-    if not isfinite(total):
-        raise Error("gradients and hessians must be finite")
-    return total
 
 
 def agree_fixed_scales[
