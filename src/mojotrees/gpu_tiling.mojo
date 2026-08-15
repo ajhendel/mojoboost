@@ -37,12 +37,15 @@ tests that must force one path, matching the `MOJOTREES_` contract in
   Still clamped to the partial-buffer memory budget.
 - `MOJOTREES_GPU_BLOCK_THREADS`: threads per threadgroup, overriding the
   derived value. Clamped to the device maximum and rounded to a warp.
-- `MOJOTREES_GPU_MIN_TILES`: the row-tile floor, overriding the derived one.
-  Zero or unset means the derived floor. Still clamped by row amortization,
-  by the partial-buffer budget, and by `MAX_GRID_DIM_Y`, so it lowers the
-  tile count freely and raises it only as far as those bounds allow. `1`
-  restores the tile count this module chose before the floor existed, which
-  is the switch a bisection wants. See `row_tile_floor`.
+- `MOJOTREES_GPU_MIN_TILES`: a row-tile floor. Zero or unset means the
+  occupancy term alone, which is what this module has always computed and is
+  the default. The word `device` asks for the device-wide floor instead, and
+  a positive number supplies one by hand. Every value is still clamped by row
+  amortization, by the partial-buffer budget, and by `MAX_GRID_DIM_Y`, and
+  the occupancy term is always a floor underneath, so this raises the tile
+  count only as far as those bounds allow and can never lower it below what
+  the module chose before the knob existed. `device` measured slower at every
+  shape tried, which is why it is a request; see `row_tile_floor`.
 
 Specialization sits above this module, not inside it. `derive_tiling` stays
 the one geometry every caller gets by default, on every backend;
@@ -593,10 +596,21 @@ def resolve_tiling(
 
 
 def env_min_tiles() -> Int:
-    """`MOJOTREES_GPU_MIN_TILES` as a tile count, or 0 for the derived
-    floor. Zero and unset are the same answer, as they are for
+    """`MOJOTREES_GPU_MIN_TILES` as a tile count, or 0 for no floor beyond
+    the occupancy term. Zero and unset are the same answer, as they are for
     `MOJOTREES_GPU_ROW_TILE`, so clearing the variable and setting it to
-    zero cannot mean two different things."""
+    zero cannot mean two different things.
+
+    The word `device` asks for the device-wide floor `row_tile_floor`
+    describes, which is `target_blocks`, and is reported here as -1. It is an
+    opt-in rather than the default because it was measured slower at every
+    shape tried; see `row_tile_floor`. A word rather than a negative number
+    because `parallel._env_int` folds every negative into its default, and
+    because `MOJOTREES_GPU_HIST_STRATEGY` already spells its non-numeric
+    choices as words.
+    """
+    if getenv("MOJOTREES_GPU_MIN_TILES") == "device":
+        return -1
     return _env_int("MOJOTREES_GPU_MIN_TILES", 0)
 
 
@@ -605,9 +619,17 @@ def row_tile_floor(target_blocks: Int, n_slots: Int) raises -> Int:
     bounds clamp the answer down.
 
     `target_blocks` is threadgroups wanted device-wide, and `n_slots` is the
-    features already occupying `grid.x`. The floor is `target_blocks`
-    itself: the row dimension alone should be able to fill the device,
-    without the feature count spending the budget first.
+    features already occupying `grid.x`.
+
+    The default answer is `ceil(target_blocks / n_slots)`, which is what this
+    module has always computed. `MOJOTREES_GPU_MIN_TILES=device` asks instead for
+    `target_blocks` itself, on the argument that the row dimension alone
+    should be able to fill the device without the feature count spending the
+    budget first, and a positive value supplies a floor by hand. That
+    argument reads well and was measured slower at every shape tried, which
+    is why it is a request and not the default; the measurement is below and
+    is the whole reason this function exists as a named thing rather than as
+    an expression inside `resolve_tiling`.
 
     Why a floor rather than a ceiling
     ---------------------------------
@@ -630,16 +652,14 @@ def row_tile_floor(target_blocks: Int, n_slots: Int) raises -> Int:
     of fixed: one device-wide wave of threadgroups from the row dimension
     alone, which on the M4 is 80 and on a 108-multiprocessor part is 864.
 
-    The `ceil(target_blocks / n_slots)` term survives as a second floor
-    underneath this one, so no shape gets fewer tiles than the previous rule
-    asked for. It is redundant while the floor is derived, since
-    `target_blocks >= ceil(target_blocks / n_slots)` for every positive
-    `n_slots`, and it binds only when `MOJOTREES_GPU_MIN_TILES` supplies a
-    smaller floor by hand. Setting that variable to `1` therefore restores
-    exactly the tile count this module chose before the floor existed.
+    The `ceil(target_blocks / n_slots)` term is always a floor underneath
+    whatever is requested, so no shape can be pushed below the tile count
+    this module chose before any of this existed. A hand-supplied value
+    smaller than it is therefore raised to it rather than honored, and
+    `MOJOTREES_GPU_MIN_TILES=1` is the cheapest way to spell "the old rule".
 
-    What it does at the four corners
-    --------------------------------
+    What the requested floor would do at the four corners
+    ----------------------------------------------------
     Worked on the M4 (`target_blocks` 80, 256-thread blocks, 256 bins, so
     `min_rows_per_tile` is 2,048), reading tiles as tiles per feature and
     threadgroups as the whole launch:
@@ -661,20 +681,44 @@ def row_tile_floor(target_blocks: Int, n_slots: Int) raises -> Int:
     50-feature million-row root in the last line, the shape end-to-end GPU
     training is slowest on.
 
-    What is not claimed
-    -------------------
-    That any of this is faster. Nothing in this lane was measured, on the M4
-    or anywhere else. The argument is structural: a launch of 100
-    threadgroups on a device with room for 80 resident ones runs one full
-    wave and then a second wave at a quarter occupancy, and the tail is a
-    fifth of the whole node, while the same work in 4,000 threadgroups
-    quantizes into 50 waves whose tail costs a fiftieth. Against that, more
-    tiles mean more partial histograms to zero, write, and fold, which is
-    the cost `MIN_ROWS_PER_TILE_BIN_FACTOR` and
-    `MIN_ROWS_PER_TILE_THREAD_FACTOR` bound and `tiles_by_rows` enforces. The
-    balance between the two is exactly what a benchmark would have to settle,
-    and `MOJOTREES_GPU_MIN_TILES` exists so one can sweep it without a
-    rebuild.
+    Measured, and off by default because of it
+    ------------------------------------------
+    The paragraph that stood here said the balance between filling the device
+    and paying for more partial histograms was what a benchmark would have to
+    settle. It has now been settled, and it went the other way, so the floor
+    is opt-in and `MOJOTREES_GPU_MIN_TILES=device` is how it is asked for.
+
+    Apple M4, 1,000,000 rows, 256 bins, 100 boosting rounds, three
+    interleaved repeats in one process, spread under 2 percent on every arm,
+    seconds of GPU training:
+
+        shape          floor off   floor on   floor costs
+        50 features    4.11        5.03       22 percent
+        100 features   5.71        7.77       36 percent
+
+    The 100-feature row is the one that matters, because that is the shape
+    the floor was written for: the old term collapses to a single tile there,
+    which is the worst case the structural argument predicted. It lost anyway,
+    and by more than the 50-feature case did. Forcing the accumulation
+    strategy shows the same loss on both arms (atomic 4.07 against 4.89,
+    tiled 4.14 against 5.06), so this is not the reduction kernel folding
+    more partials. It is the per-tile fixed cost: every tile zeroes and then
+    flushes a full `n_bins`-wide shared plane per feature slot, and at 80
+    tiles that fixed cost is paid forty times more often than at 2, against a
+    row scan that was already saturating the device well enough.
+
+    The structural argument was not wrong about occupancy. It was wrong about
+    which term dominates, and it undercounted the fixed cost that
+    `MIN_ROWS_PER_TILE_BIN_FACTOR` exists to bound. Note that the bound was
+    satisfied throughout: at 80 tiles a million-row node still gives 12,500
+    rows per tile against a 2,048 minimum, so the clamp never bound and the
+    loss happened entirely inside the region the amortization rule calls
+    safe. That is evidence `MIN_ROWS_PER_TILE_BIN_FACTOR = 8` is itself too
+    low, which is a separate change and is not made here.
+
+    What is still not claimed: that the floor is wrong on a device other than
+    this one. A part with many more cores has a much larger `target_blocks`
+    and a genuinely different balance, and nothing here was run on one.
 
     Raises on a nonpositive target or feature count, matching
     `resolve_tiling`'s preconditions, so a caller that computed a bound
@@ -689,9 +733,12 @@ def row_tile_floor(target_blocks: Int, n_slots: Int) raises -> Int:
     if by_occupancy < 1:
         by_occupancy = 1
 
-    var floor = env_min_tiles()
-    if floor < 1:
+    var requested = env_min_tiles()
+    var floor = by_occupancy
+    if requested < 0:
         floor = target_blocks
+    elif requested > 0:
+        floor = requested
     if floor < by_occupancy:
         floor = by_occupancy
     if floor > MAX_GRID_DIM_Y:

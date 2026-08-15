@@ -97,35 +97,52 @@ def _previous_tile_count(
     return by_occupancy
 
 
-def test_the_m4_million_row_root_fills_the_device() raises:
-    """The shape end-to-end GPU training is slowest on, asserted exactly.
+def test_the_m4_million_row_root_keeps_the_old_count_by_default() raises:
+    """The shape end-to-end GPU training is slowest on, asserted exactly, in
+    both arms.
 
-    Fifty features and a million-row root on the M4: the old rule spent the
-    80-threadgroup target across 50 features, took 2 row tiles, and launched
-    100 threadgroups each scanning 500,000 rows. The floor asks the row
-    dimension for a full device on its own.
+    Fifty features and a million-row root on the M4. The default rule spends
+    the 80-threadgroup target across 50 features, takes 2 row tiles, and
+    launches 100 threadgroups each scanning 500,000 rows. Requesting the
+    floor takes it to 80 tiles and 4,000 threadgroups instead.
+
+    The default is the old count, and this test exists to pin that it stayed
+    the old count. The floor reads like the obvious fix and measured 22
+    percent SLOWER at exactly this shape on an M4 (4.11 seconds against 5.03,
+    100 rounds, three interleaved repeats), so it is opt-in. See
+    `gpu_tiling.row_tile_floor` for the numbers and for why the per-tile
+    fixed cost beats the occupancy gain.
     """
     var caps = _m4()
     var t = derive_tiling(caps, 1_000_000, 50, 256)
 
     assert_equal(_previous_tile_count(caps, 1_000_000, 50, 256), 2)
-    assert_equal(t.n_tiles, 80)
-    assert_equal(t.rows_per_tile, 12_500)
-    assert_equal(t.n_tiles * 50, 4_000)
-    assert_true(t.n_tiles > _previous_tile_count(caps, 1_000_000, 50, 256))
+    assert_equal(t.n_tiles, 2)
+    assert_equal(t.n_tiles * 50, 100)
 
-    # The row bound is nowhere near binding here, which is what made the old
-    # value a policy choice rather than a physical limit.
+    _ = setenv("MOJOTREES_GPU_MIN_TILES", "device")
+    var floored = derive_tiling(caps, 1_000_000, 50, 256)
+    _ = setenv("MOJOTREES_GPU_MIN_TILES", "")
+    assert_equal(floored.n_tiles, 80)
+    assert_equal(floored.rows_per_tile, 12_500)
+    assert_equal(floored.n_tiles * 50, 4_000)
+
+    # The row bound is nowhere near binding in either arm, which is what
+    # makes both values a policy choice rather than a physical limit, and is
+    # why the measurement rather than the bound had to settle it.
     assert_equal(_tiles_by_rows(caps, 1_000_000, 256), 489)
-    assert_true(t.n_tiles < _tiles_by_rows(caps, 1_000_000, 256))
+    assert_true(floored.n_tiles < _tiles_by_rows(caps, 1_000_000, 256))
 
 
 def test_the_four_corners() raises:
     """Few or many features against few or many rows, on the M4, at 256
-    bins. This table is the argument that the rule is right: it may only
-    raise the tile count, and only where the rows leave room."""
+    bins. The table is what the requested floor does, and its shape is the
+    argument that the rule is at least coherent: it may only raise the tile
+    count, and only where the rows leave room. Whether raising it is an
+    improvement is a separate question that the benchmark answered no to;
+    see `test_the_m4_million_row_root_keeps_the_old_count_by_default`."""
     var caps = _m4()
-    # features, rows, tiles before, tiles after
+    # features, rows, tiles by default, tiles with the floor requested
     var corners = [
         4, 8_192, 4, 4,
         4, 1_000_000, 20, 80,
@@ -140,8 +157,14 @@ def test_the_four_corners() raises:
         assert_equal(
             _previous_tile_count(caps, rows, features, 256), corners[i + 2]
         )
-        assert_equal(t.n_tiles, corners[i + 3])
-        assert_true(t.n_tiles >= corners[i + 2])
+        # The default arm is the previous rule, at every corner.
+        assert_equal(t.n_tiles, corners[i + 2])
+
+        _ = setenv("MOJOTREES_GPU_MIN_TILES", "device")
+        var floored = derive_tiling(caps, rows, features, 256)
+        _ = setenv("MOJOTREES_GPU_MIN_TILES", "")
+        assert_equal(floored.n_tiles, corners[i + 3])
+        assert_true(floored.n_tiles >= corners[i + 2])
         i += 4
 
     # Few features and few rows is the corner that must not move: the row
@@ -152,25 +175,36 @@ def test_the_four_corners() raises:
     )
 
 
-def test_more_features_than_the_block_target_no_longer_collapse() raises:
-    """The pathological case: at or above 80 features on a 10-core device the
-    old occupancy term was `ceil(80 / n_features)`, which is 1 for every one
-    of these, so a node got a single tile whatever its row count."""
+def test_more_features_than_the_block_target_collapse_to_one_tile() raises:
+    """The case the floor was written for, and the case that killed it.
+
+    At or above 80 features on a 10-core device the occupancy term is
+    `ceil(80 / n_features)`, which is 1 for every one of these, so a node
+    gets a single tile whatever its row count. That still happens by
+    default, and it is deliberate: at 100 features and a million rows the
+    requested floor measured 36 percent slower on an M4 (5.71 seconds
+    against 7.77), a larger loss than at 50 features, so the shape with the
+    most obviously wrong-looking geometry is the one the floor helps least.
+
+    A single tile per feature is therefore not on its own evidence of a
+    problem, and this test pins the collapse rather than treating it as a
+    bug. What the floor does when asked is checked separately below.
+    """
     var caps = _m4()
     var features = [80, 100, 200, 500]
     for f in range(len(features)):
         assert_equal(
             _previous_tile_count(caps, 1_000_000, features[f], 256), 1
         )
-        var t = derive_tiling(caps, 1_000_000, features[f], 256)
-        assert_true(t.n_tiles > 1)
-        assert_true(t.rows_per_tile < 1_000_000)
+        assert_equal(derive_tiling(caps, 1_000_000, features[f], 256).n_tiles, 1)
 
-    # 80 features leave the partial buffer plenty of room, so the floor is
-    # reached exactly; 500 features do not, and the memory bound clamps the
-    # floor rather than the floor overriding it.
+    _ = setenv("MOJOTREES_GPU_MIN_TILES", "device")
+    # 80 features leave the partial buffer plenty of room, so the requested
+    # floor is reached exactly; 500 features do not, and the memory bound
+    # clamps the floor rather than the floor overriding it.
     assert_equal(derive_tiling(caps, 1_000_000, 80, 256).n_tiles, 80)
     var wide = derive_tiling(caps, 1_000_000, 500, 256)
+    _ = setenv("MOJOTREES_GPU_MIN_TILES", "")
     var cell_limit = PARTIAL_BUDGET_BYTES // BYTES_PER_PARTIAL_CELL
     assert_true(wide.n_tiles < 80)
     assert_true(wide.partial_cells <= cell_limit)
@@ -282,7 +316,9 @@ def test_the_block_target_is_derivable_from_a_footprint() raises:
     assert_equal(target_blocks_for(caps, 8192), 40)
 
     # A footprint that halves the target halves the floor, and a bin-sized
-    # one leaves the geometry exactly where it was.
+    # one leaves the geometry exactly where it was. Checked against the
+    # requested floor, since that is the arm the target actually moves.
+    _ = setenv("MOJOTREES_GPU_MIN_TILES", "device")
     assert_equal(derive_tiling(caps, 1_000_000, 50, 256).n_tiles, 80)
     var halved = derive_tiling(
         caps, 1_000_000, 50, 256, STRATEGY_TILED, 0, 8192
@@ -293,13 +329,15 @@ def test_the_block_target_is_derivable_from_a_footprint() raises:
     )
     var unchanged = derive_tiling(caps, 1_000_000, 50, 32, STRATEGY_TILED)
     assert_equal(narrow.n_tiles, unchanged.n_tiles)
+    _ = setenv("MOJOTREES_GPU_MIN_TILES", "")
 
 
 def test_row_tile_floor_refuses_impossible_bounds() raises:
     """`resolve_tiling` validates the same two quantities, so the floor
     refusing them keeps a caller that computed a bound wrongly from reaching
     an empty grid by a different route."""
-    assert_equal(row_tile_floor(80, 50), 80)
+    # Default is the occupancy term, not the device-wide floor.
+    assert_equal(row_tile_floor(80, 50), 2)
     with assert_raises():
         _ = row_tile_floor(0, 50)
     with assert_raises():
@@ -312,8 +350,14 @@ def test_env_overrides() raises:
     whatever order the suite runs in. Empty string means unset."""
     var caps = _m4()
 
-    # Unset is zero, which is the derived floor.
+    # Unset is zero, which is no floor beyond the occupancy term.
     assert_equal(env_min_tiles(), 0)
+    assert_equal(derive_tiling(caps, 1_000_000, 50, 256).n_tiles, 2)
+
+    # `-1` is the opt-in request for the device-wide floor.
+    _ = setenv("MOJOTREES_GPU_MIN_TILES", "device")
+    assert_equal(env_min_tiles(), -1)  # the word "device"
+    assert_equal(derive_tiling(caps, 1_000_000, 50, 256).n_tiles, 80)
 
     # A floor supplied by hand replaces the derived one, downward.
     _ = setenv("MOJOTREES_GPU_MIN_TILES", "4")
@@ -322,8 +366,8 @@ def test_env_overrides() raises:
     assert_equal(few.n_tiles, 4)
     assert_equal(few.rows_per_tile, 250_000)
 
-    # `1` restores the tile count the rule chose before the floor existed,
-    # because the old occupancy term survives underneath as a second floor.
+    # `1` is the same as unset, because the occupancy term is always a
+    # floor underneath whatever was asked for.
     _ = setenv("MOJOTREES_GPU_MIN_TILES", "1")
     assert_equal(
         derive_tiling(caps, 1_000_000, 50, 256).n_tiles,
@@ -339,6 +383,7 @@ def test_env_overrides() raises:
     # And the partial buffer clamps it on a wider histogram, where the row
     # bound would have allowed more.
     var by_memory = derive_tiling(caps, 1_000_000, 50, 256)
+    _ = setenv("MOJOTREES_GPU_MIN_TILES", "")
     var cell_limit = PARTIAL_BUDGET_BYTES // BYTES_PER_PARTIAL_CELL
     assert_true(by_memory.n_tiles < _tiles_by_rows(caps, 1_000_000, 256))
     assert_true(by_memory.partial_cells <= cell_limit)
@@ -365,13 +410,17 @@ def test_env_overrides() raises:
     # The strategy override still decides which path a floored tile count
     # runs on, and the atomic path still allocates nothing.
     _ = setenv("MOJOTREES_GPU_HIST_STRATEGY", "atomic")
+    _ = setenv("MOJOTREES_GPU_MIN_TILES", "device")
     var atomic = derive_tiling(caps, 1_000_000, 50, 256)
+    _ = setenv("MOJOTREES_GPU_MIN_TILES", "")
     assert_equal(atomic.strategy, STRATEGY_ATOMIC)
     assert_equal(atomic.partial_cells, 0)
     assert_equal(atomic.n_tiles, 80)
     _ = setenv("MOJOTREES_GPU_HIST_STRATEGY", "")
 
-    assert_equal(derive_tiling(caps, 1_000_000, 50, 256).n_tiles, 80)
+    # Everything restored: back to the occupancy term on its own.
+    assert_equal(env_min_tiles(), 0)
+    assert_equal(derive_tiling(caps, 1_000_000, 50, 256).n_tiles, 2)
 
 
 def main() raises:
