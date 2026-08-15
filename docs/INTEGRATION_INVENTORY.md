@@ -53,15 +53,11 @@ it, not a second opinion.
 | Module | Kind | Owner | Why it is not reached |
 |---|---|---|---|
 | `backend` | EXPERIMENTAL | connect_01 | A one-function dispatch shim kept as the reference the CPU/GPU equivalence test compares against. Test-only by design |
-| `cegb` | PENDING | consolidation_K10 | LightGBM cegb_* controls, complete and self-contained. Parked until a trainer accepts the cegb params and the boosting loop hooks it |
 | `gpu_categorical` | PENDING | consolidation_K10 | GPU category statistics; the GPU trainer refuses categoricals. Parked until train_gpu accepts categorical specs |
 | `gpu_sparse` | PENDING | consolidation_K10 | Reached only from gpu_categorical; same unblocker |
 | `gpu_sparse_layout` | PENDING | consolidation_K10 | Reached only from gpu_sparse; same unblocker |
 | `gpu_vendor_policy` | EXPERIMENTAL | consolidation_K2 | CUDA and HIP occupancy policy, merged from the gpu_cuda_policy / gpu_amd_policy twins (f23bd1b). Reached only from its test until a discrete-GPU trainer consults it; that is the same status the twins had. handoffs/migration_20_device_policy.md |
 | `lgbm_model_io` | EXPERIMENTAL | consolidation_K10 | LightGBM text model interop, quarantined by its own LGBM_INTEROP_STATUS and reached only from its test. Parked until a binding exists and the status flips |
-| `linear_tree` | PENDING | consolidation_K10 | linear_tree=true ensembles. Parked until Booster holds a LinearEnsemble and model I/O carries it; codes come from objective_registry |
-| `model_editing` | PENDING | consolidation_K10 | In-place leaf editing. Its MODEL_EDITING_SUPPORTED=True is the feature's claim; inspection.mojo's False is what ships. Parked until connected, when inspection re-exports this module's status |
-| `ranking_advanced` | PENDING | consolidation_K10 | Position bias, pair sampling, custom label gain, fold shuffle. Parked until fit_ranker grows those parameters |
 
 Three shapes recur and are worth naming, because they change what a fix
 costs:

@@ -333,6 +333,8 @@ class _Base(_ParamsMixin):
         feature_contri=None,
         cegb_tradeoff=1.0,
         cegb_penalty_split=0.0,
+        linear_tree=False,
+        linear_lambda=0.0,
         forced_splits=None,
         enable_bundle=False,
         max_conflict_rate=0.0,
@@ -404,6 +406,8 @@ class _Base(_ParamsMixin):
         self.feature_contri = feature_contri
         self.cegb_tradeoff = cegb_tradeoff
         self.cegb_penalty_split = cegb_penalty_split
+        self.linear_tree = linear_tree
+        self.linear_lambda = linear_lambda
         self.forced_splits = forced_splits
         self.enable_bundle = enable_bundle
         self.max_conflict_rate = max_conflict_rate
@@ -970,6 +974,8 @@ class _Base(_ParamsMixin):
             raise ValueError("cat_l2 must be nonnegative")
         if int(self.min_data_per_group) < 1:
             raise ValueError("min_data_per_group must be positive")
+        if not float(self.linear_lambda) >= 0.0:
+            raise ValueError("linear_lambda must be nonnegative")
         return {
             "num_leaves": int(self.num_leaves),
             "max_depth": int(self.max_depth),
@@ -1057,6 +1063,12 @@ class _Base(_ParamsMixin):
             "feature_contri_addr": int(contri_addr),
             "cegb_tradeoff": float(self.cegb_tradeoff),
             "cegb_penalty_split": float(self.cegb_penalty_split),
+            # LightGBM's linear_tree / linear_lambda
+            # (src/mojotrees/linear_tree.mojo): each leaf emits an affine
+            # function of the numerical features on its branch, fitted after
+            # growth. int, not bool: the binding reads it as an integer.
+            "linear_tree": int(bool(self.linear_tree)),
+            "linear_lambda": float(self.linear_lambda),
             # Both always 0. `cegb_penalty_feature_coupled` and
             # `cegb_penalty_feature_lazy` are applied by the trainer now
             # (src/mojotrees/cegb.mojo, charged against the per-ensemble

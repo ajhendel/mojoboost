@@ -262,13 +262,6 @@ CLASSIFICATION = {
         "LightGBM cegb_* controls, complete and self-contained. Parked until "
         "a trainer accepts the cegb params and the boosting loop hooks it.",
     ),
-    "linear_tree": (
-        PENDING,
-        "consolidation_K10",
-        "linear_tree=true ensembles. Parked until Booster holds a "
-        "LinearEnsemble and model I/O carries it; codes come from "
-        "objective_registry.",
-    ),
     "model_editing": (
         PENDING,
         "consolidation_K10",

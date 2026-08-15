@@ -78,6 +78,11 @@ from .objective_registry import (
     objective_renews_leaves as _objective_renews_leaves,
 )
 from .cegb import CegbLedger, check_cegb_continued_training
+from .linear_tree import (
+    LinearEnsemble,
+    LinearParams,
+    check_linear_tree_unconnected,
+)
 from .tree import Tree, TreeParams, grow_tree_with_cegb, node_bounds
 from .tree_parameters_extra import ExtraTreeParams, finish_leaf_output
 from .validation import check_weights
@@ -758,6 +763,7 @@ struct BoosterParams(Copyable, Movable):
     var learning_rate: Float64
     var tree: TreeParams
     var bundling: EfbSettings
+    var linear: LinearParams
 
     def __init__(
         out self,
@@ -765,11 +771,17 @@ struct BoosterParams(Copyable, Movable):
         learning_rate: Float64,
         var tree: TreeParams,
         var bundling: EfbSettings = EfbSettings.disabled(),
+        var linear: LinearParams = LinearParams(),
     ):
         self.n_estimators = n_estimators
         self.learning_rate = learning_rate
         self.tree = tree^
         self.bundling = bundling^
+        # LightGBM's `linear_tree` / `linear_lambda` (linear_tree.mojo).
+        # Off by default; the metric-path trainers in custom_metric.mojo fit
+        # linear leaves when it is on, and the binned-only trainers here
+        # refuse it because they have no raw matrix to fit them from.
+        self.linear = linear^
 
     @staticmethod
     def default() -> BoosterParams:
@@ -861,6 +873,7 @@ struct Booster(Copyable, Movable):
     var learning_rate: Float64
     var objective: Int
     var monotone: MonotoneConstraints
+    var linear: LinearEnsemble
 
     def __init__(
         out self,
@@ -869,12 +882,18 @@ struct Booster(Copyable, Movable):
         learning_rate: Float64,
         objective: Int,
         var monotone: MonotoneConstraints = MonotoneConstraints(),
+        var linear: LinearEnsemble = LinearEnsemble(),
     ):
         self.trees = trees^
         self.base_score = base_score
         self.learning_rate = learning_rate
         self.objective = objective
         self.monotone = monotone^
+        # The linear-leaf sidecar (linear_tree.mojo), keyed by (tree index,
+        # leaf ordinal); inactive for a constant-leaf model. The bins-only
+        # prediction methods below read `Tree.value` and so see the constant
+        # fallback; `model.Model` evaluates the sidecar on the raw row.
+        self.linear = linear^
 
     def predict_raw_row(self, data: BinnedMatrix, row: Int) -> Float64:
         """Raw ensemble output (log-odds for BINARY_LOGISTIC)."""
@@ -1025,6 +1044,8 @@ def _boost_rounds(
     Disabled by default, and `prepare_bundling` falls back to the unbundled
     matrix whenever the plan would not pay for itself.
     """
+    if params.linear.is_active():
+        check_linear_tree_unconnected("the binned-only boosting trainers")
     var bundling = prepare_bundling(data, params.bundling)
     # One CEGB ledger for the whole ensemble, handed to every tree. That
     # lifetime is the mechanism's premise: the model pays for a feature once,
@@ -1201,6 +1222,8 @@ def train_more(
     mapper the ensemble was trained under (see `BinMapper.matches`), which
     the callers in trainset.mojo check.
     """
+    if booster.linear.is_active() or params.linear.is_active():
+        check_linear_tree_unconnected("train_more")
     if len(target) != data.n_rows:
         raise Error("target length must equal n_rows")
     if params.learning_rate != booster.learning_rate:
@@ -1296,6 +1319,8 @@ def train_with_valid(
     leaves the validation loss untouched in the same way. `class_bagging`
     (see sampling.mojo) is a third, exclusive training-row sampler and is
     likewise never applied to the validation rows."""
+    if params.linear.is_active():
+        check_linear_tree_unconnected("train_with_valid")
     if len(target) != data.n_rows:
         raise Error("target length must equal n_rows")
     if len(valid_target) != valid_data.n_rows:
@@ -1497,6 +1522,7 @@ struct MulticlassBooster(Copyable, Movable):
     var n_classes: Int
     var learning_rate: Float64
     var monotone: MonotoneConstraints
+    var linear: LinearEnsemble
 
     def __init__(
         out self,
@@ -1505,12 +1531,15 @@ struct MulticlassBooster(Copyable, Movable):
         n_classes: Int,
         learning_rate: Float64,
         var monotone: MonotoneConstraints = MonotoneConstraints(),
+        var linear: LinearEnsemble = LinearEnsemble(),
     ):
         self.trees = trees^
         self.base_scores = base_scores^
         self.n_classes = n_classes
         self.learning_rate = learning_rate
         self.monotone = monotone^
+        # Round-major like `trees`; see `Booster.linear`.
+        self.linear = linear^
 
     def predict_raw_bins(self, bins: List[Int]) -> List[Float64]:
         var raw = List[Float64](capacity=self.n_classes)
@@ -1711,6 +1740,8 @@ def train_multiclass(
     on it, so the per-class trees stay comparable. `goss` samples the round's
     rows by summed per-class gradient magnitude instead (see goss.mojo), one
     sample per round for the same reason."""
+    if params.linear.is_active():
+        check_linear_tree_unconnected("train_multiclass")
     if len(labels) != data.n_rows:
         raise Error("labels length must equal n_rows")
     if n_classes < 2:
@@ -1796,6 +1827,8 @@ def train_multiclass_more(
     labels would silently rewrite what every existing tree is measured
     against.
     """
+    if booster.linear.is_active() or params.linear.is_active():
+        check_linear_tree_unconnected("train_multiclass_more")
     if len(labels) != data.n_rows:
         raise Error("labels length must equal n_rows")
     if params.learning_rate != booster.learning_rate:
@@ -1882,6 +1915,8 @@ def train_multiclass_with_valid(
     validation loss is unweighted. `bagging` samples training rows per
     round; validation rows are never bagged. `goss` is the gradient-based
     alternative sampler (see goss.mojo), also drawn once per round."""
+    if params.linear.is_active():
+        check_linear_tree_unconnected("train_multiclass_with_valid")
     if len(labels) != data.n_rows:
         raise Error("labels length must equal n_rows")
     if len(valid_labels) != valid_data.n_rows:

@@ -178,6 +178,7 @@ from mojotrees.trainset import (
     update_dataset_multiclass as mojo_update_dataset_multiclass,
 )
 from mojotrees.binning import BinnedMatrix
+from mojotrees.linear_tree import LinearParams
 from mojotrees.device import (
     CPU_DEVICE,
     GPU_DEVICE,
@@ -737,11 +738,19 @@ def _parse_params(
     else:
         check_bundling_supported(bundling.enabled, cpu)
     bundling.check()
+    # LightGBM's `linear_tree` / `linear_lambda` (src/mojotrees/linear_tree.mojo).
+    # The metric-path trainers fit the linear leaves; every binned-only
+    # trainer refuses the switch by name rather than dropping it.
+    var linear = LinearParams(
+        enabled=Int(py=params["linear_tree"]) != 0,
+        linear_lambda=Float64(py=params["linear_lambda"]),
+    )
     return BoosterParams(
         Int(py=params["n_estimators"]),
         Float64(py=params["learning_rate"]),
         tree^,
         bundling^,
+        linear^,
     )
 
 
