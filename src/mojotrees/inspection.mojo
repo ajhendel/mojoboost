@@ -41,6 +41,7 @@ from std.math import isnan
 
 from .model import Model, MulticlassModel
 from .model_dump import (
+    _F64_MAX,
     DUMP_FORMAT_VERSION,
     MODEL_FORMAT_VERSION,
     DumpFeature,
@@ -70,9 +71,8 @@ from .model_editing import (
     model_editing_status_json as _model_editing_status_json,
 )
 
-# Larger than any finite Float64, so a comparison against it detects the
-# infinities without reaching for an `isinf`.
-comptime _F64_MAX = 1.7976931348623157e308
+# `_F64_MAX` (larger than any finite Float64, so a comparison against it
+# detects the infinities without an `isinf`) is model_dump's, imported above.
 
 
 def _json_f64(x: Float64) -> String:

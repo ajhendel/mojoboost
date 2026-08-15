@@ -17,6 +17,7 @@ import tempfile as _tempfile
 import warnings as _warnings
 
 from . import _arrays, _compat, _eval, _validation, callback as _callback
+from . import preflight as _preflight
 from ._sklearn import NotFittedError, ParamsMixin as _ParamsMixin
 from ._sklearn import estimator_tags as _estimator_tags
 from .basic import Booster
@@ -1093,13 +1094,17 @@ class _Base(_ParamsMixin):
             # boundary, in `_parse_params`, because that is where the
             # trainer about to run is known. A trainer that would ignore it
             # raises instead.
+            # A knob set to None takes the native default
+            # (`efb_defaults`), so LightGBM's numbers have one home.
             "enable_bundle": int(bool(self.enable_bundle)),
-            "max_conflict_rate": float(self.max_conflict_rate),
-            "max_bundle_bins": int(self.max_bundle_bins),
-            "max_bundle_size": int(self.max_bundle_size),
-            "max_nondefault_rate": float(self.max_nondefault_rate),
-            "min_reduction": float(self.min_reduction),
-            "bundle_missing": int(bool(self.bundle_missing)),
+            **_preflight.bundling_knobs(
+                max_conflict_rate=self.max_conflict_rate,
+                max_bundle_bins=self.max_bundle_bins,
+                max_bundle_size=self.max_bundle_size,
+                max_nondefault_rate=self.max_nondefault_rate,
+                min_reduction=self.min_reduction,
+                bundle_missing=self.bundle_missing,
+            ),
         }
 
     def _resolve_device(
@@ -2175,6 +2180,7 @@ class _Base(_ParamsMixin):
         params = self._params(
             w_addr, "cpu", ic_flat, ic_offsets, mono_addr, cat_buf, contri_addr
         )
+        _preflight.native_preflight(params, n_features, "cpu")
         params.update(buffers.params())
         keep = (
             buffers,
@@ -2546,6 +2552,10 @@ class MojoTreesRegressor(_Base):
             cat_buf,
             contri_addr,
         )
+        # The extra tree parameters and the bundling knobs, checked
+        # natively before any data is copied (the same checkers
+        # `_parse_params` runs again at dispatch).
+        _preflight.native_preflight(params, n_features, device)
         if eval_set is not None:
             if objective == _CUSTOM:
                 raise ValueError(
@@ -3593,6 +3603,7 @@ class MojoTreesRanker(_Base):
             ),
             gb,
         )
+        _preflight.native_preflight(params, n_features, device)
         position_buffer = self._position_params(params, position, n_rows)
         if eval_set is not None:
 

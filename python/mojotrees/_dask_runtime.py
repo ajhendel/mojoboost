@@ -130,6 +130,7 @@ __all__ = [
     "check_machine_list",
     "clear_runtime_provider",
     "describe_runtime",
+    "gpu_exchange_status",
     "status_message",
     "native_backend",
     "native_runtime_status",
@@ -615,15 +616,52 @@ def status_message(code, transport=False):
         return None
 
 
+def gpu_exchange_status():
+    """What stands between this build and distributed GPU histogram
+    exchange, from src/mojotrees/distributed_gpu.mojo through the
+    provider's `distributed_gpu_status()`: `{"available": bool, "gates":
+    [closed gate names], "detail": str}`. Never raises: a provider without
+    the query reports unavailable with the reason in `detail`."""
+    provider, source = _resolve_provider()
+    query = None if provider is None else getattr(
+        provider, "distributed_gpu_status", None
+    )
+    if query is None:
+        return {
+            "available": False,
+            "gates": [],
+            "detail": (
+                f"no runtime provider ({source})"
+                if provider is None
+                else f"{source} does not answer distributed_gpu_status()"
+            ),
+        }
+    try:
+        record = query()
+        return {
+            "available": bool(record["available"]),
+            "gates": [str(g) for g in record["gates"]],
+            "detail": str(record["detail"]),
+        }
+    except Exception as exc:  # a capability question never raises
+        return {"available": False, "gates": [], "detail": str(exc)}
+
+
 def describe_runtime():
     """One line for a diagnostics report."""
     status = native_runtime_status()
     if not status.available:
         return f"distributed: unavailable ({status.reason})"
     hosts = "multi-host" if status.multi_host else "single-host"
+    gpu = gpu_exchange_status()
+    gpu_text = (
+        "gpu exchange available"
+        if gpu["available"]
+        else "gpu exchange closed by " + (", ".join(gpu["gates"]) or "no provider")
+    )
     return (
         f"distributed: {status.transport} ({hosts}), capabilities "
-        f"{sorted(status.capabilities)}"
+        f"{sorted(status.capabilities)}, {gpu_text}"
     )
 
 

@@ -323,38 +323,6 @@ CLASSIFICATION = {
     # without a dataset at all. EXPERIMENTAL rather than PENDING because
     # nothing is blocked: a Python caller is a decision about the public API
     # (`docs/COMPATIBILITY_POLICY.md`), not an edit some other lane owes.
-    "efb_check": (
-        EXPERIMENTAL,
-        "connect_22",
-        "Validates a bundling configuration against the device that would "
-        "honor it. A fit validates the same settings through the same "
-        "parser (efb_settings_from_mapping), so this is the early answer.",
-    ),
-    "efb_defaults": (
-        EXPERIMENTAL,
-        "connect_22",
-        "The bundling defaults, so nobody restates LightGBM's numbers in "
-        "Python. The estimator restates them in its signature instead, "
-        "which is what a scikit-learn signature has to do.",
-    ),
-    "extra_params_check": (
-        EXPERIMENTAL,
-        "connect_22",
-        "Validates the extra tree bundle and reports what honoring it "
-        "needs. A fit runs the same check inside tree.grow_tree.",
-    ),
-    "extra_option_supported": (
-        EXPERIMENTAL,
-        "connect_22",
-        "Names a LightGBM tree option this build parses but cannot apply. "
-        "A fit raises the same message when one is actually set.",
-    ),
-    "forced_splits_check": (
-        EXPERIMENTAL,
-        "connect_22",
-        "Validates a forced-splits document on its own, which is worth "
-        "doing long before a fit since the file is written long before one.",
-    ),
     "dataset_num_data": (
         PENDING,
         "connect_07",
@@ -406,52 +374,6 @@ CLASSIFICATION = {
         "connect_07",
         "Batched multiclass leaf indices; no Python estimator routes to it.",
     ),
-    "gpu_predict_capability": (
-        PENDING,
-        "connect_07",
-        "Reports whether GPU prediction covers a model. Python never asks, "
-        "so GPU prediction has no route from the estimators.",
-    ),
-    "gpu_validation_open": (
-        PENDING,
-        "connect_07",
-        "GPU validation session; no Python eval path opens one.",
-    ),
-    "gpu_validation_open_multiclass": (
-        PENDING,
-        "connect_07",
-        "GPU validation session; no Python eval path opens one.",
-    ),
-    "gpu_validation_accumulate": (
-        PENDING,
-        "connect_07",
-        "Reached only through a session Python never opens.",
-    ),
-    "gpu_validation_accumulate_multiclass": (
-        PENDING,
-        "connect_07",
-        "Reached only through a session Python never opens.",
-    ),
-    "gpu_validation_metric": (
-        PENDING,
-        "connect_07",
-        "Reached only through a session Python never opens.",
-    ),
-    "gpu_validation_raw": (
-        PENDING,
-        "connect_07",
-        "Reached only through a session Python never opens.",
-    ),
-    "gpu_validation_reset": (
-        PENDING,
-        "connect_07",
-        "Reached only through a session Python never opens.",
-    ),
-    "gpu_validation_shape": (
-        PENDING,
-        "connect_07",
-        "Reached only through a session Python never opens.",
-    ),
     # -- native names Python reaches for that no table exports --------------
     "dump_model": (
         PENDING,
@@ -482,7 +404,6 @@ CLASSIFICATION = {
     # (W8: Dataset field/bin readers, registry lookups in _fit_args and
     # _eval, model_to_json / file kinds, build_info startup and format
     # versions, dask machine-list and status texts). One remains:
-    "gpu_validation_metric_matches_host": (PENDING, "consolidation_K6", "Companion of the connect_07 gpu_validation surface, reached only through a session Python never opens."),
 }
 
 

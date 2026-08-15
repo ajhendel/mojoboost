@@ -222,6 +222,15 @@ class _Config:
                 )
                 self.objective_code = _BINARY_LOGISTIC
         except TypeError as exc:
+            # A LightGBM option this repository knows and does not
+            # implement gets the native message saying what it would take
+            # (`extra_option_supported`), never "unknown parameter".
+            from . import preflight as _preflight
+
+            for key in given:
+                message = _preflight.unimplemented_option_message(key)
+                if message is not None:
+                    raise ValueError(message) from None
             raise ValueError(
                 f"unknown or unsupported training parameter: {exc}"
             ) from None
@@ -1535,7 +1544,7 @@ class Booster:
         self._valid_sets.append((label, data))
         return self
 
-    def eval(self, data, name, metric=None):
+    def eval(self, data, name, metric=None, device=None):
         """Score `data` and return LightGBM's list of
         `(dataset_name, metric_name, value, is_higher_better)` tuples.
 
@@ -1544,6 +1553,15 @@ class Booster:
         this objective. The value comes from src/mojotrees/metrics.mojo, the
         same code the estimators' `eval_set` scores with, and it is weighted
         by the dataset's own weights when it has any.
+
+        `device="gpu"` scores a dense, unfreed dataset on the accelerator
+        through `mojotrees.gpu_validation.GpuValidation`: the set is binned
+        by the model's mapper, made resident, every iteration is folded in
+        on the device, and the metric is computed there when its kernel
+        matches the host definition, else the resident raw scores come
+        back and the host suite scores them. `None` and `"cpu"` are the
+        established host path. An explicit `"gpu"` that cannot run raises
+        rather than quietly running on the CPU.
 
         A Booster read back from a model file does not know its objective,
         so it needs `metric` named explicitly.
@@ -1564,6 +1582,10 @@ class Booster:
             metric = _eval.default_metric(self._task, self._objective)
         task = self._task or _eval.REGRESSION
         canonical, code, higher = _eval.resolve(metric, task)
+        if device is not None and str(device).lower() == "gpu":
+            value = self._eval_on_device(data, name, canonical)
+            if value is not None:
+                return [(name, canonical, value, higher)]
 
         width = self._n_classes if self._n_classes else 1
         pred = _out_buffer(data.num_data() * width)
@@ -1604,6 +1626,33 @@ class Booster:
             raise ValueError(f"{canonical} needs a Dataset with group")
         value = float(_mojotrees.eval_metric(code, params))
         return [(str(name), canonical, value, higher)]
+
+
+    def _eval_on_device(self, data, name, metric):
+        """`Booster.eval` on the accelerator: the metric value, or None
+        when the metric has no matching device kernel, in which case the
+        caller scores the resident raw scores with the host suite through
+        `predict`'s path (`gpu_validation_raw` is the escape hatch, and the
+        host metric over the same raw scores is the same number)."""
+        from . import gpu_validation as _gpu_validation
+
+        task = self._task or _eval.REGRESSION
+        if not _gpu_validation.metric_scored_on_device(metric, task):
+            return None
+        if data._sparse:
+            raise ValueError(
+                f"evaluation set {name!r} is sparse; device scoring takes a "
+                "dense matrix"
+            )
+        matrix = self._predict_data(data)
+        resident = _gpu_validation.GpuValidation.open(
+            self,
+            matrix,
+            data.get_label(),
+            None if data._weight is None else data._weight,
+        )
+        resident.accumulate(self)
+        return resident.score(metric)
 
     def eval_train(self, metric=None):
         """Score the training set, LightGBM's `eval_train`."""

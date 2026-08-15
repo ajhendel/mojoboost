@@ -87,8 +87,10 @@ __all__ = [
     "NativePolicyUnavailable",
     "Reason",
     "TransferRoute",
+    "PredictSupport",
     "Workload",
     "explain_device_choice",
+    "explain_predict_device",
     "native_contract",
     "select_device",
 ]
@@ -1065,3 +1067,68 @@ def explain_device_choice(X, y=None, device="auto", **workload_kwargs):
     else:
         workload = Workload.from_data(X, y, **workload_kwargs)
     return _report(device, workload)
+
+
+class PredictSupport:
+    """Whether the GPU prediction path covers a request of one shape.
+
+    `supported` is the answer; `block_code` and `reason` are
+    device_policy.mojo's stable refusal vocabulary (0 and "" when
+    supported), and `message` the prose an explicit `device="gpu"` predict
+    would raise with. This is the question form of that refusal, read from
+    the same native record (`gpu_predict_capability`), so an estimator can
+    branch on the code without asking for the device.
+    """
+
+    __slots__ = ("supported", "block_code", "reason", "message", "shape")
+
+    def __init__(self, supported, block_code, reason, message, shape):
+        self.supported = bool(supported)
+        self.block_code = int(block_code)
+        self.reason = str(reason)
+        self.message = str(message)
+        self.shape = dict(shape)
+
+    def to_dict(self):
+        return {
+            "supported": self.supported,
+            "block_code": self.block_code,
+            "reason": self.reason,
+            "message": self.message,
+            "shape": dict(self.shape),
+        }
+
+    def raise_if_unsupported(self):
+        if not self.supported:
+            raise DeviceUnavailableError(self.message)
+        return self
+
+    def __repr__(self):
+        if self.supported:
+            return "PredictSupport(supported=True)"
+        return "PredictSupport(supported=False, reason=%r)" % self.reason
+
+
+def explain_predict_device(X, n_outputs=1, n_bins=0, sparse=None):
+    """Whether predicting on `X` could run on the GPU, without asking it to.
+
+    `X` is the matrix (anything with a two dimensional `shape`, or a
+    sequence of rows); `n_outputs` is 1 for a single-output model or the
+    class count for a multiclass one; `n_bins` the binner's reserved bin
+    count when known (0 otherwise); `sparse` overrides the duck-typed
+    sparsity check. Returns a `PredictSupport`; never raises for an
+    uncovered shape (call `raise_if_unsupported()` for the exception).
+    """
+    n_rows, n_features = _shape_of(X)
+    is_sparse = _is_sparse(X) if sparse is None else bool(sparse)
+    ext = _extension()
+    shape = {
+        "n_rows": int(n_rows),
+        "n_features": int(n_features),
+        "n_outputs": int(n_outputs),
+        "n_bins": int(n_bins),
+        "sparse": 1 if is_sparse else 0,
+    }
+    supported, block_code, reason, message = ext.gpu_predict_capability(shape)
+    return PredictSupport(supported, block_code, reason, message, shape)
+

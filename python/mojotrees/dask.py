@@ -175,6 +175,7 @@ __all__ = [
     "clear_backend",
     "clear_model_cache",
     "dask_available",
+    "distributed_gpu_status",
     "distributed_status",
     "get_backend",
     "is_dask_collection",
@@ -961,6 +962,16 @@ def check_machine_list(machines, rank=0, job_id=0):
     from . import _dask_runtime
 
     return _dask_runtime.check_machine_list(machines, rank=rank, job_id=job_id)
+
+
+def distributed_gpu_status():
+    """What stands between this build and distributed GPU histogram
+    exchange: `{"available", "gates", "detail"}` from
+    src/mojotrees/distributed_gpu.mojo. Never raises and never imports
+    dask."""
+    from . import _dask_runtime
+
+    return _dask_runtime.gpu_exchange_status()
 
 
 def distributed_status():

@@ -428,3 +428,54 @@ row must not claim numeric parity. The audit's unused-import check now
 honors `X as _Y` aliases (it flagged aliased binding imports as unused).
 compatibility/api_snapshot.json needs one coordinator --write for the new
 additive Booster methods and Ranker parameters.
+
+**D1, duplicates and the remaining binding readers.** The audit's "public
+names defined by more than one native module" section went from 24 names to
+the 6 that live in files another session holds. Same fact, now imported:
+`gpu_sparse_layout.DEFAULT_MAX_NODES` from `gpu_objectives_native`;
+`MAX_BINS` from `binning` in `gpu_gradient_stream`,
+`gpu_histogram_specializations` (re-exported to the GPU lane) and
+`gpu_output_planes` (`gpu_sparse` uses `SPARSE_MAX_BINS` directly);
+`MAX_ROWS` from `gpu_active_rows` in `gpu_multiclass_batch` and
+`gpu_predict`; `boosting.objective_renews_leaves` is `objective_registry`'s
+re-exported; `inspection._F64_MAX` is `model_dump`'s. Different facts that
+shared a name, renamed on the specific side: `unified_memory_policy`'s
+transfer vocabulary (`TRANSFER_STATUS_*`, `N_TRANSFER_ROLES`,
+`transfer_role_name`, `transfer_block_name`, `TRANSFER_EVIDENCE_*`),
+`quantized_gradient` (`QUANT_REASON_*`, `describe_quantization_decision`),
+`describe_cpu_policy` / `describe_gpu_policy`, `stream_layout_name`,
+`startup_origin_name`, `session_phase_name` / `session_role_name` /
+`N_SESSION_ROLES`, `sparse_verdict_name`, `HistogramWirePlan`,
+`tree_learner_name` (the package root had exported two `strategy_name`s
+since W6), `FrontierCandidate`, `backend.build_histogram_on`, and
+`gpu_predict`'s device metric codes as `DEVICE_METRIC_*`. Commits 2142587,
+73268e7 (hub, temp index), plus the inspection import. Verified by a
+compile-and-value check over every touched module in a HEAD worktree,
+`tests/test_backend_equivalence.mojo` (4 passed), and an extension build.
+Python readers (commit below): `mojotrees.preflight` (`native_preflight`
+runs `extra_params_check` + `efb_check` in every estimator fit before data
+is converted; `check_forced_splits`; `unimplemented_option_message`, which
+`basic.train` uses so a known LightGBM option gets the native "not
+implemented, here is what it would take" text; `bundling_defaults` /
+`bundling_knobs` so a knob set to `None` takes `efb_defaults`);
+`device_selection.explain_predict_device` (`gpu_predict_capability`);
+`dask.distributed_gpu_status` and `_dask_runtime.gpu_exchange_status`
+(`distributed_gpu_status`, also in `describe_runtime`);
+`_sequence.stream_dataset` checks `dataset_chunks_num_data` against the
+batches' count; `mojotrees.gpu_validation.GpuValidation` wraps the
+`gpu_validation_*` surface and `Booster.eval(..., device="gpu")` scores a
+dense set on the accelerator (device kernel when it matches the host
+definition, else the host suite). `python/tests/test_preflight_readers.py`
+(8 checks, run against a fresh extension built at HEAD; the device eval ran
+on the M4). Left for the GPU lane, all in files another session holds:
+`MAX_BINS` and `MAX_ROWS` in `histogram_gpu.mojo`;
+`unified_memory_policy.describe_decision` (imported by `histogram_gpu.mojo`;
+rename to `describe_transfer_decision` there and in device_policy's
+namesake); `tree.partition_rows` vs `distributed.partition_rows`
+(`tests/parallel/test_gpu_active_rows.mojo` imports tree's; rename tree's
+to `partition_split_rows` with that test); `train_gpu.mojo` importing
+`METRIC_L1` / `METRIC_L2` from `gpu_predict` (switch to `DEVICE_METRIC_*`
+and drop the two aliases). Not done: the "imports unused" rows the lanes
+left behind (each lane's own file), and `validation.MAX_ROWS` (a different
+ceiling, `1 << 44`, not flagged, but the same name; a rename to
+`MAX_INPUT_ROWS` is a one-file edit for whoever next touches validation).

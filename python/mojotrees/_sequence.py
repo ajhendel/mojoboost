@@ -1055,6 +1055,18 @@ def stream_dataset(source, params, ext, name="X", encoders=None):
         del buffer
     if pushed == 0:
         raise ValueError(f"{name} must have at least one row")
+    # The accumulator's own count is the row total the per-row columns in
+    # `params` (label, weight, group) were sized against by the caller;
+    # `Batches.num_data()` counted the same rows in Python, so the two
+    # agreeing is what makes handing those columns to `finish` sound.
+    accumulated = int(ext.dataset_chunks_num_data(acc))
+    described = batches.num_data()
+    if accumulated != described:
+        raise ValueError(
+            f"{name} pushed {accumulated} rows to the extension but its "
+            f"batches described {described}; a batch changed size between "
+            "counting and conversion"
+        )
     return ext.dataset_chunks_finish(acc, params)
 
 

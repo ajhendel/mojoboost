@@ -217,7 +217,7 @@
   },
   "mojo": {
     "abi_promise": "none; Mojo has no stable ABI, so the guarantee is source compatibility only",
-    "export_count": 582,
+    "export_count": 585,
     "export_source": "src/mojotrees/__init__.mojo",
     "exports_by_module": {
       "alternate_boosting": [
@@ -581,6 +581,11 @@
         "InteractionConstraints",
         "extend_branch"
       ],
+      "linear_tree": [
+        "LinearEnsemble",
+        "LinearParams",
+        "linear_tree_available"
+      ],
       "metrics": [
         "DEFAULT_BINARY_THRESHOLD",
         "METRIC_AUC",
@@ -802,6 +807,7 @@
         "selection_count"
       ],
       "sequence": [
+        "CancelToken",
         "CategoryTally",
         "ChunkPlan",
         "ChunkSchema",
@@ -897,7 +903,6 @@
         "predict_row_sparse"
       ],
       "validation": [
-        "CancelToken",
         "check_booster_ranges",
         "check_class_codes",
         "check_compressed",
@@ -1375,6 +1380,7 @@
           },
           "eval": {
             "data": "required",
+            "device": null,
             "metric": null,
             "name": "required"
           },
