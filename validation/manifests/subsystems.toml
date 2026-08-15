@@ -535,14 +535,13 @@ would_close_it = "A layout suite that builds each layout from a fixture and comp
 [[gap]]
 paths = [
     "src/mojotrees/gpu_leaf_batching.mojo",
-    "src/mojotrees/gpu_levelwise.mojo",
     "src/mojotrees/gpu_multiclass_batch.mojo",
+    "src/mojotrees/growth_policy.mojo",
     "src/mojotrees/hybrid_leaf_scheduler.mojo",
-    "src/mojotrees/levelwise_policy.mojo",
     "src/mojotrees/histogram_cache_policy.mojo",
 ]
 fallback = ["native:compile-package"]
-reason = "Scheduling policies. Pure arithmetic over device limits, imported by no suite."
+reason = "Scheduling policies. Pure arithmetic over device limits, imported by no suite. This entry named `gpu_levelwise.mojo` and `levelwise_policy.mojo` until 2026-08-15, two filenames a plan predicted and nobody created: the level-wise work landed in `growth_policy.mojo` and in `gpu_frontier.mojo`, which another gap already covers. A gap naming a file that does not exist is the one thing --self-check will not let through, and it had been failing on these two."
 would_close_it = "A policy suite in the shape of tests/test_apple_gpu_policy.mojo, which is the one policy module that does have one. These are the cheapest gaps in this file to close: they need no accelerator."
 
 [[gap]]
