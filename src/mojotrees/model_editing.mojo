@@ -126,7 +126,6 @@ from .categorical import CAT_BITSET_WORDS
 from .gain import soft_threshold_l1
 from .inspection import _F64_MAX
 from .model import Model, MulticlassModel
-from .monotone import MonotoneConstraints, OutputBounds
 from .ranking import LAMBDARANK
 from .rng import splitmix64, uniform
 from .tree import Tree, TreeParams, node_bounds

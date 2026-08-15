@@ -34,12 +34,9 @@ from binding_support import py_dict, py_f64_list, py_pair
 from mojotrees.boosting import IterationRange
 from mojotrees.model import Model, MulticlassModel
 from mojotrees.model_editing import (
-    EDIT_MODE_GBDT,
-    LEAF_EDIT_CLAMP,
     RefitParams,
     RefitReport,
     ScoreBounds,
-    editing_capabilities,
     get_leaf_output as mojo_get_leaf_output,
     get_leaf_output_multiclass as mojo_get_leaf_output_multiclass,
     model_editing_status_json as mojo_model_editing_status_json,
@@ -69,20 +66,6 @@ def model_editing_status() raises -> PythonObject:
     """The native editing status as JSON text: whether this build edits a
     fitted model in place and which operations that covers."""
     return PythonObject(mojo_model_editing_status_json())
-
-
-def model_editing_operations() raises -> PythonObject:
-    """The operations `editing_capabilities` lists, as a list of
-    `(name, supported, reason)` triples."""
-    var caps = editing_capabilities()
-    var out = Python.list()
-    for i in range(len(caps)):
-        var row = Python.list()
-        row.append(PythonObject(caps[i].operation))
-        row.append(PythonObject(caps[i].supported))
-        row.append(PythonObject(caps[i].reason))
-        out.append(row)
-    return out^
 
 
 # -- rollback ---------------------------------------------------------------
