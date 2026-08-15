@@ -73,6 +73,7 @@ from .categorical import (
     _keep_most_frequent,
 )
 from .parallel import dispatch_features
+from .validation import check_compressed
 
 
 @fieldwise_init
@@ -286,41 +287,14 @@ def _check_compressed(
     outer: String,
     inner: String,
 ) raises:
-    """Shared CSC/CSR structural validation. `outer` is the compressed axis
-    (columns for CSC, rows for CSR) and `inner` the indexed one.
-
-    Every failure a malformed producer can hand over is caught here, before
-    any index is dereferenced: wrong dimensions, a wrong-length or
-    non-monotone offset array, an offset array that does not start at 0 or
-    end at nnz, mismatched index and value arrays, an out-of-range index, and
-    unsorted or duplicated indices within one outer slice.
-    """
-    if n_outer < 1 or n_inner < 1:
-        raise Error(kind + " matrix must have positive dimensions")
-    if len(offsets) != n_outer + 1:
-        raise Error(kind + " offsets must have length n_" + outer + "s + 1")
-    if offsets[0] != 0:
-        raise Error(kind + " offsets must start at 0")
-    if len(indices) != len(values):
-        raise Error(kind + " indices and values must have equal length")
-    if offsets[n_outer] != len(values):
-        raise Error(kind + " offsets must end at nnz")
-    for k in range(n_outer):
-        var lo = offsets[k]
-        var hi = offsets[k + 1]
-        if hi < lo:
-            raise Error(kind + " offsets must be non-decreasing")
-        for i in range(lo, hi):
-            if indices[i] < 0 or indices[i] >= n_inner:
-                raise Error(kind + " " + inner + " index out of range")
-            if i > lo and indices[i] <= indices[i - 1]:
-                raise Error(
-                    kind
-                    + " "
-                    + inner
-                    + " indices must be strictly ascending within each "
-                    + outer
-                )
+    """Shared CSC/CSR structural validation, `validation.check_compressed`
+    with this module's value list unpacked to its length. `outer` is the
+    compressed axis (columns for CSC, rows for CSR) and `inner` the indexed
+    one; every failure a malformed producer can hand over is caught before
+    any index is dereferenced."""
+    check_compressed(
+        offsets, indices, len(values), n_outer, n_inner, kind, outer, inner
+    )
 
 
 def csc_from_dense[

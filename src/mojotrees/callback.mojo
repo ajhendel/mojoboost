@@ -85,6 +85,7 @@ arithmetic rather than an approximation of it.
 
 from .boosting import BoosterParams
 from .tree import Tree
+from .validation import check_booster_ranges
 
 comptime BEFORE_ITERATION = 0
 """Phase: the round's tree has not been grown yet; `params` is mutable."""
@@ -183,28 +184,21 @@ def check_resettable(before: BoosterParams, after: BoosterParams) raises:
     if after.tree.feature_fraction_seed != before.tree.feature_fraction_seed:
         raise Error("feature_fraction_seed is not resettable during training")
 
-    if after.learning_rate <= 0.0:
-        raise Error("learning_rate must be positive")
-    if after.tree.num_leaves < 2:
-        raise Error("num_leaves must be at least 2")
-    if after.tree.min_data_in_leaf < 0:
-        raise Error("min_data_in_leaf must be nonnegative")
-    if after.tree.min_child_hess < 0.0:
-        raise Error("min_sum_hessian_in_leaf must be nonnegative")
-    if after.tree.lambda_l1 < 0.0:
-        raise Error("lambda_l1 must be nonnegative")
-    if after.tree.lambda_reg < 0.0:
-        raise Error("lambda_l2 must be nonnegative")
-    if (
-        after.tree.feature_fraction <= 0.0
-        or after.tree.feature_fraction > 1.0
-    ):
-        raise Error("feature_fraction must be in (0, 1]")
-    if (
-        after.tree.feature_fraction_bynode <= 0.0
-        or after.tree.feature_fraction_bynode > 1.0
-    ):
-        raise Error("feature_fraction_bynode must be in (0, 1]")
+    # The same data-independent ranges `params._validate` applies when a
+    # parameter string is parsed, from the one place that holds them.
+    check_booster_ranges(
+        after.n_estimators,
+        after.learning_rate,
+        after.tree.num_leaves,
+        after.tree.max_depth,
+        after.tree.min_data_in_leaf,
+        after.tree.min_child_hess,
+        after.tree.lambda_l1,
+        after.tree.lambda_reg,
+        after.tree.feature_fraction,
+        after.tree.feature_fraction_bynode,
+        after.tree.feature_fraction_bylevel,
+    )
 
 
 def scale_tree_values(mut tree: Tree, factor: Float64):

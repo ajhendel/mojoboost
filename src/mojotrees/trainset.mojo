@@ -99,40 +99,34 @@ from .ranking import RankerParams, groups_from_counts, train_ranker
 from .raw_data import RawData
 from .sparse import CscMatrix, CsrMatrix, SparseBinnedMatrix, transform_csc
 from .train_gpu import train_gpu
+from .validation import (
+    check_categorical_features,
+    check_class_codes,
+    check_column_length,
+    check_group_counts,
+    check_relevance_labels,
+    check_required_length,
+    check_shape,
+)
 
 
 def _check_labels(label: List[Float64], n_rows: Int) raises:
-    if len(label) != n_rows:
-        raise Error("a dataset needs one label per row to train on")
+    """A trainer needs one label per row. The rule is `validation`'s; this
+    wrapper only names the column."""
+    check_required_length(len(label), n_rows, "label")
 
 
 def _int_labels(label: List[Float64], n_classes: Int) raises -> List[Int]:
-    """Class codes from a float64 label column, which is how labels reach a
-    dataset. Whole numbers in `[0, n_classes)` only: a fractional code would
-    otherwise truncate into a neighboring class."""
-    var out = List[Int](capacity=len(label))
-    for r in range(len(label)):
-        var v = label[r]
-        if v != Float64(Int(v)):
-            raise Error("class labels must be whole numbers")
-        var code = Int(v)
-        if code < 0 or code >= n_classes:
-            raise Error("class label out of range")
-        out.append(code)
-    return out^
+    """Class codes from a float64 label column: `validation.check_class_codes`
+    (whole numbers in `[0, n_classes)`, at least two classes)."""
+    return check_class_codes(label, n_classes)
 
 
 def _relevance_labels(label: List[Float64]) raises -> List[Int]:
-    """Graded relevances from a float64 label column. `train_ranker` checks
-    the range; this only rejects the fractional values that would otherwise
-    truncate silently."""
-    var out = List[Int](capacity=len(label))
-    for r in range(len(label)):
-        var v = label[r]
-        if v != Float64(Int(v)):
-            raise Error("relevance labels must be whole numbers")
-        out.append(Int(v))
-    return out^
+    """Graded relevances from a float64 label column:
+    `validation.check_relevance_labels` (whole numbers in
+    `[0, MAX_RELEVANCE]`, the same range `ranking.train_ranker` enforces)."""
+    return check_relevance_labels(label)
 
 
 def _check_columns(
@@ -152,35 +146,25 @@ def _check_columns(
     reported while the caller still knows which array it passed. An empty
     column means the dataset has none. One implementation, used by every
     constructor, so a dataset built from a CSC matrix rejects exactly what a
-    dataset built from a dense one rejects.
+    dataset built from a dense one rejects. Each rule is `validation.mojo`'s;
+    only the feature-name count stays here, because `validation` takes
+    primitives and this is the one column that is a list of strings.
     """
-    if n_rows < 1:
-        raise Error("a dataset needs at least one row")
-    if n_features < 1:
-        raise Error("a dataset needs at least one feature")
-    if len(label) != 0 and len(label) != n_rows:
-        raise Error("label length must equal n_rows")
-    if len(weight) != 0 and len(weight) != n_rows:
-        raise Error("weight length must equal n_rows")
-    if len(init_score) != 0 and len(init_score) != n_rows:
-        raise Error("init_score length must equal n_rows")
+    check_shape(n_rows, n_features)
+    check_column_length(len(label), n_rows, "label")
+    check_column_length(len(weight), n_rows, "weight")
+    check_column_length(len(init_score), n_rows, "init_score")
     if len(feature_names) != 0 and len(feature_names) != n_features:
-        raise Error("feature_name must have one name per feature")
+        raise Error(
+            "feature_name must have one name per feature: got ",
+            len(feature_names),
+            " for ",
+            n_features,
+            " features",
+        )
     if len(group) != 0:
-        var total = 0
-        for q in range(len(group)):
-            if group[q] < 1:
-                raise Error("group counts must be positive")
-            total += group[q]
-        if total != n_rows:
-            raise Error("group counts must sum to n_rows")
-    for i in range(len(categorical_features)):
-        var f = categorical_features[i]
-        if f < 0 or f >= n_features:
-            raise Error("categorical feature index out of range")
-        for j in range(i):
-            if categorical_features[j] == f:
-                raise Error("categorical feature index listed twice")
+        _ = check_group_counts(group, n_rows)
+    check_categorical_features(categorical_features, n_features)
 
 
 def _empty_binned(n_features: Int) -> BinnedMatrix:
