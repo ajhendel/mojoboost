@@ -60,6 +60,8 @@ Intentional differences from LightGBM:
   zero.
 """
 
+from .rng import GOLDEN, splitmix64, uniform
+
 
 @fieldwise_init
 struct GossParams(Copyable, Movable):
@@ -141,31 +143,15 @@ struct GossSelection(Copyable, Movable):
         return GossSelection(List[Int](), List[Float64](), 1.0, 0, 0)
 
 
-# Counter-based splitmix64, the same scheme bagging.mojo draws its bags
-# from (and sampling.mojo its feature sets), duplicated here rather than
-# shared so each sampler owns its stream.
-comptime _GOLDEN = UInt64(0x9E3779B97F4A7C15)
-comptime _TWO_POW_NEG_53 = 1.0 / 9007199254740992.0
-
-
-def _splitmix64(state: UInt64) -> UInt64:
-    var z = state + _GOLDEN
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EB
-    return z ^ (z >> 31)
-
-
-def _uniform(counter: UInt64) -> Float64:
-    """Uniform in [0, 1) with 53 significant bits, from a counter value."""
-    return Float64(_splitmix64(counter) >> 11) * _TWO_POW_NEG_53
-
-
+# Counter-based splitmix64 from rng.mojo, the same mixer bagging.mojo draws
+# its bags from (and sampling.mojo its feature sets); GOSS owns its stream
+# through this derivation, not through a private copy of the mixer.
 def _stream(seed: Int, round: Int) -> UInt64:
     """Start of the counter stream for one round's sample. The sign bit is
     masked off so the arithmetic never depends on signed-to-unsigned
     conversion."""
-    return _splitmix64(
-        UInt64(seed & 0x7FFFFFFFFFFFFFFF) ^ (UInt64(round) * _GOLDEN)
+    return splitmix64(
+        UInt64(seed & 0x7FFFFFFFFFFFFFFF) ^ (UInt64(round) * GOLDEN)
     )
 
 
@@ -275,7 +261,7 @@ def goss_select(
                 prob = Float64(rest_need) / Float64(rest_all)
             # One draw per row, keyed by the row index, so a row's draw does
             # not depend on how many rows before it happened to be drawn.
-            if _uniform(stream + UInt64(r)) < prob:
+            if uniform(stream + UInt64(r)) < prob:
                 rows.append(r)
                 scale.append(multiplier)
                 n_other += 1
