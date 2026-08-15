@@ -113,6 +113,7 @@ say so, do not ignore it.
 
 from .gain import leaf_score, soft_threshold_l1
 from .monotone import MONOTONE_FREE, output_score
+from .rng import splitmix64, uniform
 
 # LightGBM's extra_seed default. The other seeds already live with the
 # features that use them (`sampling.DEFAULT_FEATURE_FRACTION_SEED`,
@@ -472,19 +473,6 @@ struct FeaturePenalties(Copyable, Movable):
 # ---------------------------------------------------------------------------
 
 
-def _mix64(state: UInt64) -> UInt64:
-    """splitmix64's finalizer, the same mixing `sampling._splitmix64` uses.
-
-    It is repeated here rather than imported so this module stays free of
-    another module's private names; the handoff asks for one shared copy at
-    integration, at which point this one goes away.
-    """
-    var z = state + 0x9E3779B97F4A7C15
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EB
-    return z ^ (z >> 31)
-
-
 def extra_split_stream(
     seed: Int, tree_index: Int, node: Int, feature: Int
 ) -> UInt64:
@@ -496,25 +484,25 @@ def extra_split_stream(
     features were scanned before it: the same tree comes out whatever the
     scan order, the thread count, or the subsampled feature set.
     """
-    var h = _mix64(UInt64(seed & 0x7FFFFFFFFFFFFFFF))
-    h = _mix64(h ^ UInt64(tree_index & 0x7FFFFFFFFFFFFFFF))
-    h = _mix64(h ^ UInt64((node + 1) & 0x7FFFFFFFFFFFFFFF))
-    return _mix64(h ^ UInt64((feature + 1) & 0x7FFFFFFFFFFFFFFF))
+    var h = splitmix64(UInt64(seed & 0x7FFFFFFFFFFFFFFF))
+    h = splitmix64(h ^ UInt64(tree_index & 0x7FFFFFFFFFFFFFFF))
+    h = splitmix64(h ^ UInt64((node + 1) & 0x7FFFFFFFFFFFFFFF))
+    return splitmix64(h ^ UInt64((feature + 1) & 0x7FFFFFFFFFFFFFFF))
 
 
 def extra_candidate_index(n_candidates: Int, stream: UInt64) -> Int:
     """A uniform index in `[0, n_candidates)` from a counter stream, or -1
     when there is nothing to choose from.
 
-    The 53-bit uniform is the one `sampling._uniform` draws, scaled and
-    truncated; the final guard covers the rounding case where the scaled
-    value reaches `n_candidates`.
+    The 53-bit uniform is rng.mojo's `uniform`, the one feature sampling
+    draws, scaled and truncated; the final guard covers the rounding case
+    where the scaled value reaches `n_candidates`.
     """
     if n_candidates <= 0:
         return -1
     if n_candidates == 1:
         return 0
-    var u = Float64(_mix64(stream) >> 11) * (1.0 / 9007199254740992.0)
+    var u = uniform(stream)
     var index = Int(u * Float64(n_candidates))
     if index >= n_candidates:
         index = n_candidates - 1
