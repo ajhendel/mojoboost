@@ -29,8 +29,9 @@ Three requested values, the same vocabulary the Mojo layer uses:
   and evidence says the GPU is the faster choice for that shape on that
   device. With no such evidence it picks the CPU and says so.
 
-Why `auto` is the CPU everywhere today, what `MOJOTREES_AUTO_MIN_CELLS`
-and `MOJOTREES_DISABLE_GPU` do, and what evidence a crossover rule has to
+Where `auto` chooses the GPU (the measured Apple M4 rules) and where it
+still resolves to the CPU, what `MOJOTREES_AUTO_MIN_CELLS` and
+`MOJOTREES_DISABLE_GPU` do, and what evidence a crossover rule has to
 carry are documented in `src/mojotrees/device_policy.mojo`. Do not restate
 those rules here, and do not add a threshold here: a rule that exists in
 this file and not in that one is a rule the Mojo API, the CLI, and the C

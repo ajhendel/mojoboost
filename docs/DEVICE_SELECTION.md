@@ -4,10 +4,13 @@
 it has to be able to say why. This document describes the policy, the
 evidence rule behind it, and the report it produces.
 
-The policy lives in `python/mojotrees/device_selection.py`. The device
-vocabulary it implements is the one in `src/mojotrees/device.mojo`, which
-is the authority; this layer adds explanation, Python-level feature gates,
-a memory estimate, and a versioned table of measured crossovers.
+The policy lives in `src/mojotrees/device_policy.mojo`, one decision
+engine for the Mojo API, the C ABI, the CLI, and Python; the device
+vocabulary is the one in `src/mojotrees/device.mojo`.
+`python/mojotrees/device_selection.py` extracts the workload from `X` and
+`y` and formats the decision the native layer returns, and holds no policy
+of its own. The engine carries the explanation, the feature gates, a memory
+estimate, and a versioned table of measured crossovers.
 
 ## The three values
 
@@ -24,38 +27,64 @@ Why `"gpu"` never falls back: a silent fallback turns "my GPU run" into "a
 CPU run that took the same wall clock and I never knew". A refusal is
 information; a fallback destroys it.
 
-## What `auto` currently does, and why
+## What `auto` does, and why
 
-**`auto` resolves to the CPU on every machine and every workload, unless
-`MOJOTREES_AUTO_MIN_CELLS` is set.**
+**`auto` chooses the GPU where a recorded benchmark says the GPU trainer
+wins, and the CPU everywhere else.** The table it consults,
+`crossover_rules()` in `src/mojotrees/device_policy.mojo` (policy version
+2), holds two rules, both from one interleaved CPU-versus-GPU sweep on the
+development Apple M4
+([`bench/results/apple_m4_crossover_2026-08-15.md`](../bench/results/apple_m4_crossover_2026-08-15.md)):
 
-`CROSSOVER_RULES` is empty. Nothing in this repository has measured a
-workload size where GPU training beats CPU training. The one end-to-end
-measurement that exists is on an Apple M4 (`bench/bench_train_gpu.mojo`)
-and it came out slower than the CPU trainer, and no NVIDIA or AMD device
-has ever executed this code at all (see `docs/GPU_VALIDATION.md`, where
-every CUDA and HIP row still reads **not run**).
+| Rule | Scope | Threshold |
+|---|---|---|
+| `apple-m4-metal-l2-dense` | Metal, M4 generation, one output, squared error | 25,000,000 cells (`n_rows * n_features`) and 200,000 rows |
+| `apple-m4-metal-binary-dense` | Metal, M4 generation, one output, binary logistic | 25,000,000 cells and 200,000 rows |
 
-A threshold written from reasoning rather than measurement would be a
-performance claim with no evidence under it. So the table ships empty,
-`auto` conservatively chooses the CPU, and the report says exactly that
-rather than implying the GPU was evaluated and lost.
+Below 10 million cells the GPU trainer lost to the multicore CPU trainer;
+around 10 million the two were inside the run's own noise; from 25 million
+up the GPU won by more than the noise floor at every shape and both
+objectives measured, which is why the rules start at the first resolved
+win rather than at the estimated break-even. Cells alone did not order the
+marginal shapes (at 10 million cells the row-heavy 500,000 x 20 won 2.4x
+while 100,000 x 100 and 200,000 x 50 sat at or inside the noise), so the
+rules also require 200,000 rows, the smallest row count measured winning.
+Each rule is scoped to
+exactly what was measured. On another Apple generation, on CUDA or HIP,
+for multiclass, or for an objective the sweep did not run, no rule
+matches, `auto` resolves to the CPU, and the report says which rule fell
+short rather than implying the GPU was evaluated and lost. Widening a rule
+is a benchmarking result on that hardware, not a code change.
+
+For a hardware-scoped rule to match, the decision has to know the
+hardware. Every `gpu` or `auto` request therefore probes the device
+(`DeviceCapabilities.detect` with `probe_device`; on the M4 it reports
+`api=metal`, `arch_name=4-metal4`, ten cores) and the report carries
+`profile_source=reported`. A `cpu` request opens nothing. A probe that
+fails degrades to the portable fallback profile, which matches no rule.
+
+```text
+device='auto' resolved to GPU.
+
+Device      accelerator available, metal, m4, 10 cores (reported)
+Workload    1,000,000 rows x 50 features, objective 'regression', 1 output(s) per round, max_bin=255, dense
+Rules       version 2, 2 rule(s), 'apple-m4-metal-l2-dense' matched   (rendering abridged)
+
+Why
+  [auto-gpu-evidence] crossover rule 'apple-m4-metal-l2-dense' covers
+  this device and workload, so auto selects the GPU
+  evidence bench/results/apple_m4_crossover_2026-08-15.md
+```
 
 ```text
 device='auto' resolved to CPU.
 
-Device      accelerator available, metal, Apple M4
-Workload    1,000,000 rows x 100 features, objective 'regression', 1 output(s) per round, max_bin=255, dense
-Memory      107.1 MiB device, 171.1 MiB including the tiled partial-histogram budget, 7.9 MiB pinned host (estimate)
-Budget      16.0 GiB
-Rules       version 1, 0 rule(s), none matched
+Workload    100,000 rows x 50 features, objective 'regression', ...
+Rules       version 2, 2 rule(s), none matched
 
 Why
-  [no-validated-rule] the crossover table (version 1) is empty: no
-  benchmark has established a workload size where GPU training beats CPU
-  training, so auto conservatively keeps the CPU. Set
-  MOJOTREES_AUTO_MIN_CELLS to run that benchmark, or device='gpu' to force
-  the accelerator
+  [auto-cpu-below-evidence] none of the 2 crossover rule(s) in policy
+  version 2 covers this device and workload, so auto keeps the CPU
 ```
 
 ## Hard blocks and soft uncertainty
@@ -93,37 +122,33 @@ same reason: no crossover rule can be scoped to a device nobody can name.
 | Variable | Effect |
 |---|---|
 | `MOJOTREES_DISABLE_GPU=1` | Reports no accelerator. `"gpu"` raises, `"auto"` takes the CPU on a machine that does have one. |
-| `MOJOTREES_AUTO_MIN_CELLS` | Cells (`n_rows * n_features`) at or above which `auto` selects the GPU. `0` means "whenever the GPU path covers the workload". Unset, negative, or unparsable means the heuristic is off, which is the default. |
+| `MOJOTREES_AUTO_MIN_CELLS` | Cells (`n_rows * n_features`) at or above which `auto` selects the GPU regardless of the rule table. `0` means "whenever the GPU path covers the workload". Unset, negative, or unparsable means the override is off, which is the default; the rule table then decides. |
 | `MOJOTREES_GPU_BACKEND` | Names the backend when detection cannot. Only scopes crossover rules; it never enables or disables anything. |
 
 `MOJOTREES_AUTO_MIN_CELLS` is parsed here exactly as `env_auto_min_cells`
 parses it in `device.mojo`, so the two layers cannot disagree about what a
 given environment does. It is the knob for running the crossover benchmark
-that would justify a default. A GPU choice reached through it is reported
-with `validated == False` and a warning saying the choice rests on no
-measurement.
+that would justify a rule on a device the table does not cover. A GPU
+choice reached through it is reported with `validated == False` and a
+warning saying the choice rests on no measurement.
 
 ## The crossover rule table
 
-```python
-RULES_VERSION = 1
-CROSSOVER_RULES = ()
-```
-
-A `CrossoverRule` is a claim about measured performance, so it carries the
-measurement with it. `evidence` is required and the constructor refuses a
-rule without it.
+The table lives in Mojo, `crossover_rules()` in
+`src/mojotrees/device_policy.mojo`, and nowhere else; the Python layer
+formats the decision and holds no rules of its own. A `CrossoverEvidence`
+is a claim about measured performance, so it carries the measurement with
+it, and the constructor refuses a rule without an `evidence_id`.
 
 | Field | Meaning |
 |---|---|
 | `name` | Short identifier, shown in the report. |
-| `evidence` | Where the numbers live: a document section, a benchmark file, a commit. Required. |
+| `evidence_id` | Where the numbers live: a benchmark record, a document section, a commit. Required. |
 | `measured_on` | The device the numbers came from. |
-| `backend`, `chip` | Scope. Unset means the rule is not limited that way. |
-| `objectives` | The objectives that were benchmarked. |
+| `api`, `apple_generation` | Scope. `API_UNKNOWN` and zero mean the rule is not limited that way. |
+| `objective` | The one objective that was benchmarked, or `OBJECTIVE_UNSPECIFIED`. |
 | `min_rows`, `min_features`, `min_cells` | The thresholds themselves. |
-| `max_classes` | Upper bound on classes the measurement covered. |
-| `speedup` | What was actually seen, for the record. |
+| `max_outputs` | Upper bound on trees per round the measurement covered. |
 
 A rule matches only when every field that is set matches, so widening a
 rule to hardware nobody measured takes a deliberate edit rather than an
@@ -133,22 +158,25 @@ oversight.
 
 Adding a rule is a benchmarking result, not a code change:
 
-1. Run the sweep. `pixi run gpu-validate` for the phase breakdown and
-   `bench/bench_train_gpu.mojo` for end-to-end training, on the device the
-   rule will claim, following the procedure in `docs/GPU_VALIDATION.md`.
-   Pin CPU threading (`MOJOTREES_NUM_WORKERS`, `MOJOTREES_PARALLEL_MIN_OPS`)
-   so the CPU side of the comparison is reproducible.
-2. Find the crossover with `MOJOTREES_AUTO_MIN_CELLS`, which exists so the
-   sweep needs no rebuild.
-3. Record the output in the record section of `docs/GPU_VALIDATION.md`,
-   loss numbers next to throughput numbers.
+1. Run the sweep. `bench/bench_train_gpu.mojo` times the CPU and GPU
+   trainers interleaved in one process and refuses to call a gap smaller
+   than the run's own spread a result; `pixi run gpu-validate` gives the
+   phase breakdown. Run it on the device the rule will claim, following
+   the procedure in `docs/GPU_VALIDATION.md`, at several shapes and every
+   objective the rule will name, and pin CPU threading
+   (`MOJOTREES_NUM_WORKERS`, `MOJOTREES_PARALLEL_MIN_OPS`) so the CPU side
+   is reproducible.
+2. `MOJOTREES_AUTO_MIN_CELLS` exists so an end-to-end `auto` run can reach
+   the GPU on a device no rule covers yet, without a rebuild.
+3. Record the output under `bench/results/`, loss numbers next to
+   throughput numbers, the way the M4 record does.
 4. Add the rule scoped to what was measured, cite that record in
-   `evidence`, and bump `RULES_VERSION`.
+   `evidence_id`, and bump `POLICY_VERSION`.
+   `tests/parallel/test_device_policy.mojo` pins the table's shape and is
+   where the new rule's coverage gets asserted.
 
 Do not add a rule from reasoning, from another project's numbers, or from
-a single shape. `python/tests/parallel/test_device_selection.py` asserts
-that the shipped table is empty; that test failing is the reminder to
-bring evidence.
+a single shape.
 
 ## The memory estimate
 

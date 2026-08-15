@@ -226,7 +226,10 @@ def parse_apple_generation(arch_name: String) -> Int:
 
     Only meaningful for Metal, and `GpuProfile.from_reported` only calls it
     there: a CUDA or HIP architecture string is not an Apple part number and
-    must not be mined for one. An ambiguous string that names two
+    must not be mined for one. Two spellings are read: Modular's
+    `<generation>-metal<version>` (`4-metal4` on the development M4, the
+    string `DeviceContext.arch_name()` actually returns) and a
+    human-readable "M4" / "Apple M4". An ambiguous string that names two
     generations resolves to unknown rather than to whichever matched first,
     because a wrong generation is worse than none: none falls back to
     reported capabilities, which are correct by construction.
@@ -235,6 +238,18 @@ def parse_apple_generation(arch_name: String) -> Int:
     Nothing in `derive_policy` branches on it, and nothing should until a
     measurement distinguishes the generations.
     """
+    # Modular's own spelling first: the M4 reports `arch_name=4-metal4`,
+    # the generation digit, a hyphen, and the Metal feature-set version.
+    # It contains no "m4" substring, so the human-readable scan below
+    # cannot see it. The digit before "-metal" is the generation and only
+    # that digit is read; the digits after are the API version.
+    var sep = arch_name.find("-metal")
+    if sep > 0:
+        var prefix = String(arch_name[byte=0:sep])
+        for generation in range(APPLE_GEN_M1, APPLE_GEN_M5 + 1):
+            if prefix == String(generation):
+                return generation
+        return APPLE_GEN_UNKNOWN
     var found = APPLE_GEN_UNKNOWN
     for generation in range(APPLE_GEN_M1, APPLE_GEN_M5 + 1):
         var lower = String("m", generation)

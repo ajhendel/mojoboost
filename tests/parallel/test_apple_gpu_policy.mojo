@@ -181,6 +181,15 @@ def test_apple_generation_parsing() raises:
     assert_equal(parse_apple_generation("apple-m3-max"), APPLE_GEN_M3)
     assert_equal(parse_apple_generation("apple-m4"), APPLE_GEN_M4)
     assert_equal(parse_apple_generation("apple-m5"), APPLE_GEN_M5)
+    # Modular's spelling, the one `DeviceContext.arch_name()` returns: the
+    # generation digit before "-metal", the API version after it. Only the
+    # digit before is read; a version that differs from the generation is
+    # not a second generation.
+    assert_equal(parse_apple_generation("4-metal4"), APPLE_GEN_M4)
+    assert_equal(parse_apple_generation("3-metal3"), APPLE_GEN_M3)
+    assert_equal(parse_apple_generation("5-metal4"), APPLE_GEN_M5)
+    assert_equal(parse_apple_generation("9-metal4"), APPLE_GEN_UNKNOWN)
+    assert_equal(parse_apple_generation("-metal4"), APPLE_GEN_UNKNOWN)
     # Nothing to read, and nothing invented from a string naming two.
     assert_equal(parse_apple_generation(""), APPLE_GEN_UNKNOWN)
     assert_equal(parse_apple_generation("apple-gpu"), APPLE_GEN_UNKNOWN)

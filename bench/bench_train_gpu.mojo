@@ -29,11 +29,11 @@ The first repeat of the first GPU arm also pays one-time device setup, which
 is why the summary leads with the minimum rather than the mean.
 
 Usage: mojo run -I src bench/bench_train_gpu.mojo \\
-    [n_rows] [n_features] [reg|binary] [repeats] [arms] [seed]
+    [n_rows] [n_features] [reg|binary] [repeats] [arms] [seed] [subsample]
 
-`arms` is a comma-separated list of cpu, gpu, gpu-host, gpu-device, in the
-order they should run; the first is the baseline every other arm is compared
-against. Any arm takes a `-depth` suffix (`cpu-depth`, `gpu-device-depth`,
+`arms` is a comma-separated list of cpu, gpu, gpu-host, gpu-device,
+gpu-obj-host, gpu-obj-device, in the order they should run; the first is
+the baseline every other arm is compared against. Any arm takes a `-depth` suffix (`cpu-depth`, `gpu-device-depth`,
 ...) to train the same configuration under `grow_policy=depthwise`; the
 leaf budget is unchanged, so a depth-wise arm commits the same number of
 splits and issues the same number of GPU launch groups as its leaf-wise
@@ -43,10 +43,21 @@ batching is written (docs/design/GPU_LEVELWISE.md): if the twins are
 indistinguishable, batching has only the launch count to attack, and
 `MOJOTREES_GPU_PHASE_TRACE=1` on a single arm at two row counts gives the
 row-independent share of a tree's time, which is the ceiling of that
-attack. Defaults: 100000 rows, 100 features, reg, 1 repeat, `cpu,gpu`.
+attack. Defaults: 100000 rows, 100 features, reg, 1 repeat, `cpu,gpu`,
+seed 0, subsample 1.0.
+
+`subsample` below 1.0 turns on row bagging (that fraction, every tree, the
+run's seed) for every arm, CPU included. The two `gpu-obj-*` arms pin
+`objective_source`: `gpu-obj-host` computes gradients on the host and
+uploads them, `gpu-obj-device` generates them on the device and, under
+bagging, routes every row's raw score through `GpuTreeRouter`. Together
+with `subsample` they are how the bagged device round is measured against
+the bagged host path it replaces
+(bench/results/apple_m4_bagged_round_2026-08-15.md).
 
     pixi run bench-train-gpu 50000 100 reg 5 gpu-host,gpu-device
     pixi run bench-train-gpu 250000 50 reg 5 gpu-device,gpu-device-depth
+    pixi run bench-train-gpu 1000000 50 reg 3 cpu,gpu-obj-host,gpu-obj-device 0 0.8
 """
 
 from std.math import exp, log
@@ -61,9 +72,13 @@ from mojotrees.boosting import (
     BoosterParams,
     train,
 )
+from mojotrees.bagging import BaggingParams
 from mojotrees.binning import BinnedMatrix
 from mojotrees.growth_policy import GROW_DEPTHWISE
 from mojotrees.train_gpu import (
+    OBJECTIVE_SOURCE_AUTO,
+    OBJECTIVE_SOURCE_DEVICE,
+    OBJECTIVE_SOURCE_HOST,
     SPLIT_SEARCH_AUTO,
     SPLIT_SEARCH_DEVICE,
     SPLIT_SEARCH_HOST,
@@ -121,8 +136,10 @@ comptime ARM_CPU = 0
 comptime ARM_GPU = 1
 comptime ARM_GPU_HOST = 2
 comptime ARM_GPU_DEVICE = 3
+comptime ARM_GPU_OBJ_HOST = 4
+comptime ARM_GPU_OBJ_DEVICE = 5
 # Added to any of the above: the same arm under `grow_policy=depthwise`.
-comptime ARM_DEPTHWISE = 4
+comptime ARM_DEPTHWISE = 8
 
 
 struct ArmRun(Copyable, Movable):
@@ -155,6 +172,10 @@ def _arm_name(arm: Int) -> String:
         name = String("gpu-host")
     elif base == ARM_GPU_DEVICE:
         name = String("gpu-device")
+    elif base == ARM_GPU_OBJ_HOST:
+        name = String("gpu-obj-host")
+    elif base == ARM_GPU_OBJ_DEVICE:
+        name = String("gpu-obj-device")
     if _arm_depthwise(arm):
         name += "-depth"
     return name
@@ -175,7 +196,8 @@ def _parse_arms(spec: String) raises -> List[Int]:
         var flags = 0
         if name.endswith("-depth"):
             flags = ARM_DEPTHWISE
-            name = String(name[: name.byte_length() - 6])
+            var stem = String(name[byte=0 : name.byte_length() - 6])
+            name = stem^
         if name == "cpu":
             arms.append(ARM_CPU | flags)
         elif name == "gpu":
@@ -184,13 +206,17 @@ def _parse_arms(spec: String) raises -> List[Int]:
             arms.append(ARM_GPU_HOST | flags)
         elif name == "gpu-device":
             arms.append(ARM_GPU_DEVICE | flags)
+        elif name == "gpu-obj-host":
+            arms.append(ARM_GPU_OBJ_HOST | flags)
+        elif name == "gpu-obj-device":
+            arms.append(ARM_GPU_OBJ_DEVICE | flags)
         else:
             raise Error(
                 String(
                     "unknown arm '",
                     name,
-                    "'; use cpu, gpu, gpu-host, or gpu-device, each with an"
-                    " optional -depth suffix",
+                    "'; use cpu, gpu, gpu-host, gpu-device, gpu-obj-host, or"
+                    " gpu-obj-device, each with an optional -depth suffix",
                 )
             )
     if len(arms) == 0:
@@ -203,6 +229,7 @@ def _run_arm(
     data: BinnedMatrix,
     target: List[Float64],
     objective: Int,
+    bagging: BaggingParams,
     want_loss: Bool,
 ) raises -> ArmRun:
     """Time one complete training run on one arm.
@@ -218,7 +245,9 @@ def _run_arm(
     var base = _arm_base(arm)
     if base == ARM_CPU:
         var cpu_t0 = perf_counter_ns()
-        var cpu_model = train(data, target, objective, params)
+        var cpu_model = train(
+            data, target, objective, params, bagging=bagging
+        )
         var cpu_s = Float64(perf_counter_ns() - cpu_t0) / 1e9
         var cpu_loss = -1.0
         if want_loss:
@@ -226,14 +255,25 @@ def _run_arm(
         return ArmRun(cpu_s, cpu_loss, len(cpu_model.trees))
 
     var strategy = SPLIT_SEARCH_AUTO
+    var source = OBJECTIVE_SOURCE_AUTO
     if base == ARM_GPU_HOST:
         strategy = SPLIT_SEARCH_HOST
     elif base == ARM_GPU_DEVICE:
         strategy = SPLIT_SEARCH_DEVICE
+    elif base == ARM_GPU_OBJ_HOST:
+        source = OBJECTIVE_SOURCE_HOST
+    elif base == ARM_GPU_OBJ_DEVICE:
+        source = OBJECTIVE_SOURCE_DEVICE
     # Includes GpuHistogramBuilder construction and every transfer.
     var gpu_t0 = perf_counter_ns()
     var gpu_model = train_gpu(
-        data, target, objective, params, split_search=strategy
+        data,
+        target,
+        objective,
+        params,
+        bagging=bagging,
+        objective_source=source,
+        split_search=strategy,
     )
     var gpu_s = Float64(perf_counter_ns() - gpu_t0) / 1e9
     var gpu_loss = -1.0
@@ -315,6 +355,14 @@ def main() raises:
             arms = _parse_arms(String(args[5]))
         if len(args) > 6:
             seed = Int(String(args[6]))
+        var subsample = 1.0
+        if len(args) > 7:
+            subsample = Float64(String(args[7]))
+            if subsample <= 0.0 or subsample > 1.0:
+                raise Error("subsample must be in (0, 1]")
+        var bagging = BaggingParams.disabled()
+        if subsample < 1.0:
+            bagging = BaggingParams(subsample, 1, seed)
         if n_features < 4:
             raise Error("need at least 4 features")
 
@@ -351,6 +399,7 @@ def main() raises:
             "seed",
             seed,
         )
+        print("subsample:", subsample)
 
         var t0 = perf_counter_ns()
         var mapper = fit_bins(features, n_rows, n_features, 255)
@@ -387,7 +436,7 @@ def main() raises:
         for rep in range(repeats):
             for a in range(n_arms):
                 var run = _run_arm(
-                    arms[a], data, target, objective, rep == 0
+                    arms[a], data, target, objective, bagging, rep == 0
                 )
                 samples.append(run.seconds)
                 if rep == 0:

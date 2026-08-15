@@ -1,0 +1,48 @@
+mojotrees validation-scoring bench: 1000000 train rows, 200000 valid rows x 50 features, reg seed 0
+n_estimators: 200
+early_stopping_rounds: 10
+arms: cpu,hg-hs,dg-hs,hg-ds,dg-ds
+repeats: 3
+run 1 cpu s: 27.162071 n_trees: 200
+run 1 hg-hs s: 17.701593 n_trees: 200
+run 1 dg-hs s: 10.508834 n_trees: 200
+run 1 hg-ds s: 16.858612 n_trees: 200
+run 1 dg-ds s: 9.574984 n_trees: 200
+run 2 cpu s: 27.805182 n_trees: 200
+run 2 hg-hs s: 18.264005 n_trees: 200
+run 2 dg-hs s: 10.920641 n_trees: 200
+run 2 hg-ds s: 18.109731 n_trees: 200
+run 2 dg-ds s: 10.890856 n_trees: 200
+run 3 cpu s: 29.007362 n_trees: 200
+run 3 hg-hs s: 20.784005 n_trees: 200
+run 3 dg-hs s: 12.088423 n_trees: 200
+run 3 hg-ds s: 17.680888 n_trees: 200
+run 3 dg-ds s: 11.174524 n_trees: 200
+cpu_s: 27.162071
+cpu_spread_pct: 6.8
+cpu_n_trees: 200
+cpu_valid_loss: 0.002759475997825781
+hg_hs_s: 17.701593
+hg_hs_spread_pct: 17.4
+hg_hs_n_trees: 200
+hg_hs_valid_loss: 0.0027751677931162977
+dg_hs_s: 10.508834
+dg_hs_spread_pct: 15.0
+dg_hs_n_trees: 200
+dg_hs_valid_loss: 0.0027751672175554834
+hg_ds_s: 16.858612
+hg_ds_spread_pct: 7.4
+hg_ds_n_trees: 200
+hg_ds_valid_loss: 0.0027751677931162977
+dg_ds_s: 9.574984
+dg_ds_spread_pct: 16.7
+dg_ds_n_trees: 200
+dg_ds_valid_loss: 0.0027751672175554834
+hg_hs_speedup_x: 1.5344421826894339
+hg_hs_vs_cpu: resolved delta_pct -34.8 noise_floor_pct 17.4
+dg_hs_speedup_x: 2.5846893194811145
+dg_hs_vs_cpu: resolved delta_pct -61.3 noise_floor_pct 15.0
+hg_ds_speedup_x: 1.6111688791461598
+hg_ds_vs_cpu: resolved delta_pct -37.9 noise_floor_pct 7.4
+dg_ds_speedup_x: 2.8367745575345085
+dg_ds_vs_cpu: resolved delta_pct -64.7 noise_floor_pct 16.7

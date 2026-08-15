@@ -202,7 +202,7 @@ to describe them as behavior a user gets.
 | `apple_gpu_policy` | `device_policy`, `apple_histogram_policy` | supplies the device profile and the memory estimate; its tuning derivations are consulted only through the line above | as above |
 | `gpu_split_search` | `train_gpu` | the host scan, because Float32 device gains can flip near-tie decisions and the measured difference (a few percent either way, `docs/LIGHTGBM_PARITY.md`) does not pay for that | `MOJOTREES_GPU_SPLIT_STRATEGY=device` |
 | `unified_memory_policy` | `device_policy`, `histogram_gpu` | one live route; the others it scores are not implemented in any trainer | `MOJOTREES_GPU_TRANSFER` |
-| `device_policy` crossover table | `device`, and through it every `fit` | empty, so `auto` resolves to the CPU on every machine and every workload | `MOJOTREES_AUTO_MIN_CELLS` |
+| `device_policy` crossover table | `device`, and through it every `fit` | two Apple M4 rules (dense single-output squared error and binary logistic from 25 million cells and 200,000 rows), so `auto` selects the GPU there and resolves to the CPU on every other device, objective, and multiclass | `MOJOTREES_AUTO_MIN_CELLS` |
 | `gpu_multiclass_batch` | `train_gpu`, `histogram_gpu` | a sequential schedule, so multiclass GPU training stays one tree per class per round and `_train_multiclass_gpu_batched` is not entered | `MOJOTREES_GPU_CLASS_BATCH` above one, or a caller passing its own batch |
 | `hybrid_leaf_scheduler` | `gpu_runtime` | a report and nothing else. `GpuSession.note_hybrid` records what was asked for and why it was declined; no histogram changes device | nothing. `MOJOTREES_HYBRID_LEAVES` and `MOJOTREES_HYBRID_TRACE` change what is reported, not where a histogram is built |
 

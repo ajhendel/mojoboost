@@ -1,0 +1,36 @@
+mojotrees gpu-vs-cpu bench: 200000 rows x 50 features, reg seed 0
+subsample: 0.8
+binning_s: 0.04055
+arms: cpu,gpu-obj-host,gpu-obj-device
+repeats: 3
+run 1 cpu train_s: 3.011349
+run 1 gpu-obj-host train_s: 2.865693
+run 1 gpu-obj-device train_s: 2.054404
+run 2 cpu train_s: 2.920216
+run 2 gpu-obj-host train_s: 2.934907
+run 2 gpu-obj-device train_s: 2.14173
+run 3 cpu train_s: 2.814253
+run 3 gpu-obj-host train_s: 2.937812
+run 3 gpu-obj-device train_s: 2.174011
+cpu_train_s: 2.814253
+cpu_train_s_median: 2.920216
+cpu_train_s_max: 3.011349
+cpu_spread_pct: 7.0
+cpu_n_trees: 100
+cpu_train_loss: 0.0037040562981469384
+gpu_obj_host_train_s: 2.865693
+gpu_obj_host_train_s_median: 2.934907
+gpu_obj_host_train_s_max: 2.937812
+gpu_obj_host_spread_pct: 2.5
+gpu_obj_host_n_trees: 100
+gpu_obj_host_train_loss: 0.003721083847572022
+gpu_obj_device_train_s: 2.054404
+gpu_obj_device_train_s_median: 2.14173
+gpu_obj_device_train_s_max: 2.174011
+gpu_obj_device_spread_pct: 5.8
+gpu_obj_device_n_trees: 100
+gpu_obj_device_train_loss: 0.0037194652130778764
+gpu_obj_host_speedup_x: 0.9820497171190354
+gpu_obj_host_vs_cpu: indistinguishable delta_pct 1.8 noise_floor_pct 7.0
+gpu_obj_device_speedup_x: 1.3698634737860713
+gpu_obj_device_vs_cpu: resolved delta_pct -27.0 noise_floor_pct 7.0

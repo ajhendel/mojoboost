@@ -74,17 +74,27 @@ Three requested devices, and what each one means
   says the GPU is the faster choice for that shape on that device. With no
   such evidence it chooses the CPU and says so.
 
-Why `auto` is the CPU everywhere today
---------------------------------------
-`crossover_rules()` is empty. Nothing in this repository has measured a
-workload size where GPU training beats CPU training: the one end-to-end
-measurement that exists (Apple M4, bench/bench_train_gpu.mojo) came out
-slower than the CPU trainer, and no NVIDIA or AMD device has run this code
-at all (docs/GPU_VALIDATION.md). A threshold invented here would be a
-performance claim with nothing under it, so the table ships empty and
-`auto` conservatively resolves to the CPU. Adding a rule is a benchmarking
-result, not a code change: it carries its `evidence` identifier, and
-`POLICY_VERSION` is bumped with it.
+Where `auto` chooses the GPU, and where it still does not
+---------------------------------------------------------
+`crossover_rules()` holds two rules (policy version 2), both from one
+interleaved sweep on the development Apple M4
+(bench/results/apple_m4_crossover_2026-08-15.md): dense single-output
+squared-error and binary-logistic training from `M4_CROSSOVER_MIN_CELLS`
+cells and `M4_CROSSOVER_MIN_ROWS` rows up, where the GPU trainer beat the
+CPU trainer by more than the run's own noise floor at every shape measured
+(it lost below 10 million cells and was inside the noise around 10
+million). Each rule is scoped to
+what was measured: Metal, an M4 generation part, one output, its own
+objective. On any other device (another Apple generation, CUDA, HIP), any
+other objective, or multiclass, no rule matches and `auto` resolves to the
+CPU, and the decision names the rule count it checked. No NVIDIA or AMD
+device has run this code at all (docs/GPU_VALIDATION.md). Adding or
+widening a rule is a benchmarking result, not a code change: it carries
+its `evidence` identifier, and `POLICY_VERSION` is bumped with it.
+
+For a rule to match at all, the decision has to know the device, so the
+entry points probe it (`DeviceCapabilities.detect` with `probe_device`)
+for every request that is not `cpu`; see that method.
 
 `MOJOTREES_AUTO_MIN_CELLS` is the escape hatch for running that benchmark:
 an integer cell count (`n_rows * n_features`) at or above which `auto`
@@ -128,9 +138,12 @@ for every accelerator, and `auto` is an addition.
 
 from std.os import getenv
 from std.sys import has_accelerator
+from max.gpu.host import DeviceContext
 
 from .apple_gpu_policy import (
+    API_METAL,
     API_UNKNOWN,
+    APPLE_GEN_M4,
     BYTES_PER_PARTIAL_CELL,
     CROSSOVER_DISABLED,
     GpuProfile,
@@ -144,7 +157,12 @@ from .apple_gpu_policy import (
 # so naming them again would be re-establishing the duplicate by hand.
 # `CUSTOM` stays because `_collect_blocks` refuses it by name and gives a
 # reason specific to it.
-from .boosting import CUSTOM
+from .boosting import BINARY_LOGISTIC, CUSTOM, SQUARED_ERROR
+# `query_device_caps` reads the three tiling attributes off an open context
+# and is the same sanitizing read the histogram builder does, so a probed
+# profile here and the builder's own caps cannot disagree about the device.
+# gpu_tiling.mojo imports nothing from this module, so there is no cycle.
+from .gpu_tiling import query_device_caps
 from .initialization import SessionState, warmup_level_name
 
 # The one table of objective facts. Imported rather than restated: this
@@ -243,7 +261,7 @@ comptime AUTO_MIN_CELLS = CROSSOVER_DISABLED
 # Bumped whenever a crossover rule is added, removed, or retuned, or
 # whenever a gate below changes what it admits. A decision carries it so a
 # report from one release can be told apart from a report from another.
-comptime POLICY_VERSION = 1
+comptime POLICY_VERSION = 2
 
 # `DeviceDecision.evidence_id` values that are not a crossover rule name.
 comptime EVIDENCE_NONE = String("none")
@@ -714,6 +732,37 @@ struct DeviceRequest(Copyable, Movable):
 # --- Capabilities -----------------------------------------------------
 
 
+def probe_device_profile() -> GpuProfile:
+    """The profile of the accelerator in front of us, read off a freshly
+    opened `DeviceContext`, or `GpuProfile.generic()` when there is none or
+    the open fails.
+
+    Never raises: a decision must remain reachable on a machine whose
+    driver is unhappy, and the generic profile is the documented fallback
+    for exactly that. The three tiling attributes come from
+    `query_device_caps`, the same read the histogram builder does, and the
+    API and architecture strings from the context itself; on the
+    development M4 they are `metal` and `4-metal4`. The memory budget is
+    left unreported (zero) because no portable attribute answers it.
+    """
+    comptime if not has_accelerator():
+        return GpuProfile.generic()
+    else:
+        try:
+            var ctx = DeviceContext()
+            var caps = query_device_caps(ctx)
+            return GpuProfile.from_reported(
+                ctx.api(),
+                ctx.arch_name(),
+                caps.sm_count,
+                caps.max_threads_per_block,
+                caps.max_shared_memory_per_block,
+                0,
+            )
+        except:
+            return GpuProfile.generic()
+
+
 struct DeviceCapabilities(Copyable, Movable):
     """What the build and the device can do, as one serializable value.
 
@@ -786,16 +835,26 @@ struct DeviceCapabilities(Copyable, Movable):
     @staticmethod
     def detect(
         var session: SessionState = SessionState.cold(),
+        probe_device: Bool = False,
     ) raises -> DeviceCapabilities:
         """Capabilities for the build and process running right now.
 
-        Opens no device. The hardware profile is therefore the portable
-        fallback (`PROFILE_FALLBACK`), or `PROFILE_DECLARED` when an
-        operator named the API through `MOJOTREES_GPU_BACKEND`. A caller
-        that already has a `DeviceContext` open should read its attributes
-        and call `from_profile` instead, which is the only way to reach
-        `PROFILE_REPORTED`, and should hand its own `SessionState` rather
-        than taking the cold default.
+        With `probe_device` False this opens no device: the hardware profile
+        is the portable fallback (`PROFILE_FALLBACK`), or `PROFILE_DECLARED`
+        when an operator named the API through `MOJOTREES_GPU_BACKEND`.
+        With it True, and an accelerator built in and not disabled, the
+        device is opened and its `api()`, `arch_name()`, and tiling
+        attributes are read into a `PROFILE_REPORTED` profile, which is what
+        lets a hardware-scoped crossover rule match the machine actually
+        present. The entry points below probe exactly when the request is
+        not `cpu`: a CPU request never pays for a device it will not use,
+        and a `gpu` or `auto` request is about to open one anyway. A probe
+        that fails for any reason degrades to the fallback profile rather
+        than raising, so the decision is always reachable.
+
+        A caller that already has a `DeviceContext` open should read its
+        attributes and call `from_profile` instead, and should hand its own
+        `SessionState` rather than taking the cold default.
 
         Raises for an unparsable `MOJOTREES_GPU_TRANSFER`, which is
         `plan_session_routes`' rule and the same one this module applies to
@@ -807,7 +866,12 @@ struct DeviceCapabilities(Copyable, Movable):
         var declared = env_declared_api()
         var profile = GpuProfile.generic()
         var source: Int = PROFILE_NONE
-        if available:
+        if available and probe_device:
+            var probed = probe_device_profile()
+            if probed.api != API_UNKNOWN:
+                profile = probed^
+                source = PROFILE_REPORTED
+        if available and source != PROFILE_REPORTED:
             source = PROFILE_FALLBACK
             if declared != API_UNKNOWN:
                 source = PROFILE_DECLARED
@@ -1099,16 +1163,71 @@ struct CrossoverEvidence(Copyable, Movable):
         return True
 
 
+# The Apple M4 dense single-output crossover: cells (rows x features) and
+# rows, both required. Where the numbers come from is
+# `bench/results/apple_m4_crossover_2026-08-15.md` and the module docstring;
+# the short version is that the GPU trainer lost below 10 million cells,
+# was inside the noise around 10 million, and won resolvedly from 25
+# million cells up, so the cell threshold is the first resolved win rather
+# than the estimated break-even. The row floor is there because cells alone
+# did not order the marginal shapes: at 10 million cells the row-heavy shape
+# (500k x 20) won 2.4x while the feature-heavy ones (100k x 100, 200k x 50)
+# were at or inside the noise, and no shape under 200k rows was measured
+# winning. Both floors are what was measured, not a model.
+comptime M4_CROSSOVER_MIN_CELLS = 25_000_000
+comptime M4_CROSSOVER_MIN_ROWS = 200_000
+comptime M4_CROSSOVER_EVIDENCE = String(
+    "bench/results/apple_m4_crossover_2026-08-15.md"
+)
+comptime M4_CROSSOVER_MEASURED_ON = String(
+    "Apple M4, 10 GPU cores, 16 GB, Mojo 1.0.0 / MAX 26.5.0"
+)
+
+
 def crossover_rules() raises -> List[CrossoverEvidence]:
     """The benchmark-derived crossover rules, in priority order.
 
-    Empty, and the module docstring says why: no measurement in this
-    repository has found a shape where GPU training beats CPU training,
-    and the only device that has ever run the GPU trainer end to end came
-    out slower. Do not add a rule from reasoning. Add one from a recorded
-    sweep, cite it in `evidence_id`, and bump `POLICY_VERSION`.
+    Two rules, one device. Both come from the interleaved CPU-versus-GPU
+    sweep recorded in `bench/results/apple_m4_crossover_2026-08-15.md`
+    (driver: bench/bench_train_gpu.mojo, library defaults, 100 rounds, 255
+    bins, 31 leaves): squared error and binary logistic, dense single-output
+    training on the M4 the sweep ran on. Each is scoped to exactly that,
+    Metal on an M4 generation part, one output, its own objective, and the
+    cell count and row count from which the GPU won by more than the run's
+    own noise floor at every shape measured. Nothing here covers another Apple
+    generation, CUDA, HIP, multiclass, or an objective the sweep did not
+    run; those still resolve to the CPU and the decision says which rule
+    fell short. Widening a rule is a benchmarking result on that hardware,
+    cited in `evidence_id`, with `POLICY_VERSION` bumped alongside.
     """
-    return List[CrossoverEvidence]()
+    var rules = List[CrossoverEvidence]()
+    rules.append(
+        CrossoverEvidence(
+            String("apple-m4-metal-l2-dense"),
+            M4_CROSSOVER_EVIDENCE,
+            M4_CROSSOVER_MEASURED_ON,
+            api=API_METAL,
+            apple_generation=APPLE_GEN_M4,
+            objective=SQUARED_ERROR,
+            min_rows=M4_CROSSOVER_MIN_ROWS,
+            min_cells=M4_CROSSOVER_MIN_CELLS,
+            max_outputs=1,
+        )
+    )
+    rules.append(
+        CrossoverEvidence(
+            String("apple-m4-metal-binary-dense"),
+            M4_CROSSOVER_EVIDENCE,
+            M4_CROSSOVER_MEASURED_ON,
+            api=API_METAL,
+            apple_generation=APPLE_GEN_M4,
+            objective=BINARY_LOGISTIC,
+            min_rows=M4_CROSSOVER_MIN_ROWS,
+            min_cells=M4_CROSSOVER_MIN_CELLS,
+            max_outputs=1,
+        )
+    )
+    return rules^
 
 
 # --- The engine -------------------------------------------------------
@@ -1881,7 +2000,9 @@ def resolve_device(
     is what gets them the memory gate, the objective gate, and a report.
     """
     var request = DeviceRequest(device, n_rows, n_features, n_outputs)
-    var caps = DeviceCapabilities.detect()
+    var caps = DeviceCapabilities.detect(
+        SessionState.cold(), probe_device=device != CPU_DEVICE
+    )
     var decision = decide_device(request, caps)
     decision.raise_if_blocked()
     return decision.selected_device
@@ -1995,11 +2116,13 @@ def decide_device_report(
     features, and an unparsable `MOJOTREES_GPU_TRANSFER`: caller and operator
     errors, not policy outcomes.
 
-    Capabilities are detected, so the hardware profile is the portable
-    fallback and the decision says so through `profile_source=fallback`. A
-    caller holding an open `DeviceContext` should use
-    `decide_device_report_reported`, which is the same function over
-    attributes it actually read.
+    Capabilities are detected. For a `gpu` or `auto` request the device is
+    probed (`DeviceCapabilities.detect` with `probe_device`), so the
+    decision carries `profile_source=reported` and a hardware-scoped
+    crossover rule can match; for a `cpu` request nothing is opened and the
+    profile is the portable fallback. A caller holding an open
+    `DeviceContext` should use `decide_device_report_reported`, which is the
+    same function over attributes it already read.
     """
     var request = DeviceRequest(
         parse_device(device),
@@ -2013,7 +2136,10 @@ def decide_device_report(
         has_missing,
         uses_validation,
     )
-    var caps = DeviceCapabilities.detect(SessionState.from_env())
+    var caps = DeviceCapabilities.detect(
+        SessionState.from_env(),
+        probe_device=request.requested_device != CPU_DEVICE,
+    )
     return decide_device(request, caps).serialize()
 
 
@@ -2113,7 +2239,9 @@ def resolve_device_full(
         has_missing,
         uses_validation,
     )
-    var caps = DeviceCapabilities.detect(SessionState.from_env())
+    var caps = DeviceCapabilities.detect(
+        SessionState.from_env(), probe_device=device != CPU_DEVICE
+    )
     var decision = decide_device(request, caps)
     decision.raise_if_blocked()
     return decision.selected_device

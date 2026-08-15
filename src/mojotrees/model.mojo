@@ -19,7 +19,12 @@ from .boosting import (
     train,
     train_multiclass,
 )
-from .device import CPU_DEVICE, GPU_DEVICE, resolve_device
+from .device import (
+    CPU_DEVICE,
+    GPU_DEVICE,
+    resolve_device,
+    resolve_device_full,
+)
 from .goss import GossParams
 from .gpu_predict import (
     predict_gpu,
@@ -93,8 +98,10 @@ struct Model(Copyable, Movable, Writable):
 
         `device` follows the training-time vocabulary in device.mojo:
         CPU_DEVICE walks the trees on the host, GPU_DEVICE walks them on the
-        accelerator and raises when none is available, and AUTO_DEVICE keeps
-        resolving to the CPU until a measured crossover exists. Binning
+        accelerator and raises when none is available, and AUTO_DEVICE
+        resolves to the CPU for prediction (the crossover rules in
+        device_policy.mojo are training rules, and no prediction crossover
+        has been measured). Binning
         always runs on the host (bin edges are Float64; a Float32 edge
         search could move a row a whole bin), so the two devices route every
         row to the same leaf and differ only by the Float32 accumulation of
@@ -259,7 +266,19 @@ def fit[
     feature indices to treat as integer-coded categoricals: they are split by
     category set rather than by threshold, and missing, unseen, and dropped
     categories route right (see categorical.mojo)."""
-    var backend = resolve_device(device, n_rows, n_features, 1)
+    # The whole question, not the shape alone: the crossover rules in
+    # device_policy.mojo are scoped by objective, so `auto` can only reach
+    # the GPU when the request says which objective it is, and an explicit
+    # `gpu` is refused here, with its reason, rather than deeper in.
+    var backend = resolve_device_full(
+        device,
+        n_rows,
+        n_features,
+        1,
+        n_bins=max_bins,
+        objective=objective,
+        categorical=len(categorical_features) > 0,
+    )
     var mapper = fit_bins(
         features,
         n_rows,

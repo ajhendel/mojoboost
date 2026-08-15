@@ -8,9 +8,12 @@ For the built-in objectives without row sampling, the round's gradients are
 generated on the device from device-resident labels and raw scores, and
 each grown tree advances those raw scores from its leaf ranges (see
 gpu_objectives_native.mojo), so nothing per-row crosses the host/device
-boundary in a plain round. Under bagging or GOSS the host generates and
-uploads the gradients instead, because the row sample is ranked and drawn
-host-side. Per split, the device stably partitions the parent's range and
+boundary in a plain round. Under bagging the round stays on the device
+too: the bag is drawn on the host (a counter stream, no gradients needed)
+and seeded into the root's row range, and `GpuTreeRouter` advances every
+row's raw score after the tree, in bag or not. Under GOSS the host
+generates and uploads the gradients instead, because the sample is a
+ranking of them. Per split, the device stably partitions the parent's range and
 builds the smaller child's histogram over exactly that child's rows (the
 sibling comes from the subtraction trick on the host, where histograms are
 small: n_features * n_bins). The grower hands the partition its exact left
@@ -21,7 +24,8 @@ Division of labor (the GPU owns the data plane; the CPU owns the control
 plane, small data, and verification; see docs/ARCHITECTURE.md seam 4):
   CPU  boosting coordination, split selection over downloaded histograms,
        leaf-value renewal (quantile/L1), prediction, the tree model itself,
-       host row sampling under bagging/GOSS, validation scoring, and the
+       drawing the bag and the GOSS sample (and, under GOSS, the round's
+       gradients), validation scoring, and the
        bit-exact reference the device path is verified against; below the
        launch-cost crossover the CPU also builds individual small leaves
        (hybrid_leaf_scheduler.mojo) or the whole fit (device_policy.mojo)
@@ -63,19 +67,24 @@ replaced, and none of them defaults to a claim no benchmark has made:
                  conservatively falls back to the host scan
   validation     `valid_scoring` / `MOJOTREES_GPU_VALID_SCORING`, defaulting
                  to the host tree walk; see `train_gpu_with_valid` and the
-                 VALID_SCORE_* constants
+                 VALID_SCORE_* constants. The training side of an
+                 early-stopping run takes the same `objective_source`
+                 switch as `train_gpu`, so under AUTO a plain run's
+                 gradients and raw scores are device-resident there too;
+                 only the validation scores default to the host
   histograms     `MOJOTREES_GPU_HIST_SPECIALIZATION=batched` asks for
                  several leaves per launch (gpu_leaf_batching.mojo, gated by
                  `apple_histogram_policy`), which the leaf-wise grower can
                  feed with a split's two children. Unset, every histogram is
                  the single-leaf launch that shipped and the sibling still
                  comes from the subtraction trick; see `grow_tree_gpu`.
-  bagged rounds  a bagged run reaches the device objective path only under
+  bagged rounds  a bagged run takes the device round under AUTO and under
                  an explicit `objective_source=OBJECTIVE_SOURCE_DEVICE`,
                  where `GpuTreeRouter` (gpu_fused_round.mojo) advances every
-                 row's raw score, in bag or not. Under AUTO a bagged run
-                 keeps the host path and its Float64 raw scores, which is
-                 what shipped.
+                 row's raw score, in bag or not; `OBJECTIVE_SOURCE_HOST`
+                 (or `MOJOTREES_GPU_OBJECTIVE=host`) is the switch back to
+                 the host path and its Float64 raw scores. The default is
+                 the measured one (`_routes_all_rows`).
   session        each trainer has an overload taking a `GpuSession`
                  (gpu_runtime.mojo). Without one the trainers run on
                  `NoLifecycle` and execute exactly the device calls they did
@@ -455,9 +464,10 @@ def device_gradients(
     `routes_all_rows` is the trainer stating that it advances the raw scores
     with `GpuTreeRouter.update_all_rows`, which covers the rows a bag left
     out and is the one thing that keeps a bagged run off the device round.
-    The trainers below pass it only under an explicit
-    `OBJECTIVE_SOURCE_DEVICE`, so AUTO keeps bagging on the host path and
-    its Float64 raw scores.
+    The trainers below pass what `_routes_all_rows` answers, which is True
+    for a bagged run under AUTO and under an explicit
+    `OBJECTIVE_SOURCE_DEVICE`, so a bagged run takes the device round
+    unless the caller asked for host gradients by name.
 
     GOSS stays blocked either way: its sample is a ranking of
     `|grad * hess|`, and ranking Float32 device scores can put a different
@@ -485,6 +495,35 @@ def device_gradients(
             " gradients and grows the trees on the device exactly as before",
         )
     return False
+
+
+def _routes_all_rows(source: Int, bagging: BaggingParams) -> Bool:
+    """Whether a bagged run advances every row's raw score on the device
+    through `GpuTreeRouter` (and so is eligible for the device round) or
+    keeps the host-gradient path.
+
+    One answer for every trainer entry point, so the AUTO behavior for a
+    bagged run is decided in exactly one place. AUTO and an explicit
+    `OBJECTIVE_SOURCE_DEVICE` both route; only `OBJECTIVE_SOURCE_HOST`
+    keeps a bagged run on the host path and its Float64 raw scores.
+
+    Routing under AUTO is a measured default, not a preference. On the M4
+    (bench/results/apple_m4_bagged_round_2026-08-15.md, subsample 0.8,
+    library defaults, arms interleaved) the device round beat the host
+    path it replaces at every size tried, 1.4x at 200k x 50, 1.8x at 500k
+    x 50, 2.1x at 1M x 50, and the two fitted models' training losses
+    agreed to Float32 tolerance, which is the agreement the whole device
+    path is specified to. The bag itself is unchanged: same sampler, same
+    schedule, same seed, so both backends still grow every round on
+    identical rows.
+
+    An unbagged run never needs the router (the leaf ranges cover every
+    row), so the answer is False for it whatever the source says, and no
+    router is allocated.
+    """
+    if not bagging_enabled(bagging):
+        return False
+    return resolve_objective_source(source) != OBJECTIVE_SOURCE_HOST
 
 
 struct _GpuRecordLeafState(Movable):
@@ -1892,9 +1931,9 @@ def _train_gpu_rounds[
     `route_all_rows` is the bagged device round: the bag comes from the same
     sampler and the same schedule as on the host, and the tree's contribution
     reaches every row's device raw score through `GpuTreeRouter`, in bag or
-    not, which is what the leaf-range update cannot do. It is set only when
-    the caller asked for `OBJECTIVE_SOURCE_DEVICE` explicitly, so the shipped
-    AUTO behavior for a bagged run is unchanged.
+    not, which is what the leaf-range update cannot do. `_routes_all_rows`
+    decides it, and it is True for a bagged run unless the caller asked for
+    host gradients by name.
 
     `life` is `NoLifecycle` for the session-free entry point, which makes
     every hook below two integer increments and no device work, so this loop
@@ -1913,13 +1952,13 @@ def _train_gpu_rounds[
         var renew_a = renewal_alpha(objective, alpha)
         var trees = List[Tree]()
 
-        # Built-in objectives without row sampling generate their gradients
-        # on the device and advance the raw scores there too, so a round
-        # uploads nothing per row: labels and weights cross once at state
-        # construction, and only the tree's node-value table (a few hundred
-        # bytes) crosses per tree. Bagging and GOSS stay on the host path,
-        # which needs the gradients host-side to rank and sample rows, and so
-        # does an explicit `objective_source=OBJECTIVE_SOURCE_HOST`.
+        # Built-in objectives generate their gradients on the device and
+        # advance the raw scores there too, so a round uploads nothing per
+        # row: labels and weights cross once at state construction, and only
+        # the tree's node-value table (a few hundred bytes) crosses per tree,
+        # plus the bag's row list when there is one. GOSS stays on the host
+        # path, which needs the gradients host-side to rank and sample rows,
+        # and so does an explicit `objective_source=OBJECTIVE_SOURCE_HOST`.
         if device_grads:
             var state = builder.objective_state(
                 target, sample_weight, 1, 2 * params.tree.num_leaves
@@ -2083,13 +2122,7 @@ def train_gpu(
             bagging,
             goss,
         )
-        # Only an explicit device request routes every row through
-        # `GpuTreeRouter`; AUTO keeps a bagged run on the host path and its
-        # Float64 raw scores.
-        var routes_all = (
-            resolve_objective_source(objective_source)
-            == OBJECTIVE_SOURCE_DEVICE
-        )
+        var routes_all = _routes_all_rows(objective_source, bagging)
         var device_grads = device_gradients(
             objective, 1, objective_source, bagging, goss, routes_all
         )
@@ -2146,10 +2179,7 @@ def train_gpu(
             bagging,
             goss,
         )
-        var routes_all = (
-            resolve_objective_source(objective_source)
-            == OBJECTIVE_SOURCE_DEVICE
-        )
+        var routes_all = _routes_all_rows(objective_source, bagging)
         var device_grads = device_gradients(
             objective, 1, objective_source, bagging, goss, routes_all
         )
@@ -2813,8 +2843,11 @@ def train_multiclass_gpu(
 
 # Where a validation set's running raw scores are maintained. HOST walks the
 # round's tree over every validation row on the host, which is what
-# `train_with_valid` in boosting.mojo does and what this trainer does until a
-# benchmark says otherwise. DEVICE keeps the validation matrix, its labels,
+# `train_with_valid` in boosting.mojo does and what this trainer defaults to:
+# the device scorer measured 6% to 9% faster on the M4
+# (bench/results/apple_m4_valid_scoring_2026-08-15.md), which does not buy
+# the Float32 stopping-decision risk `_DeviceValidScorer` describes. DEVICE
+# keeps the validation matrix, its labels,
 # and the running raw-score vector resident on the training context and folds
 # each round's tree in with one kernel (see gpu_predict.mojo), downloading the
 # scores for the loss. AUTO reads `MOJOTREES_GPU_VALID_SCORING` (`host` or
@@ -2979,7 +3012,10 @@ struct _DeviceValidScorer(GpuValidScorer, Movable):
     Float32, since Apple GPUs have no Float64. Two rounds within Float32
     noise of each other can therefore order differently than they would on
     the host path and pick a different `best_iteration`. That is why this
-    scorer is not the default.
+    scorer is not the default: it measured 6% to 9% faster than the host
+    walk on the M4 with no stopping decision changed
+    (bench/results/apple_m4_valid_scoring_2026-08-15.md), and that gain
+    does not buy the risk.
     """
 
     var predictor: GpuPredictor
@@ -3042,6 +3078,36 @@ struct _DeviceValidScorer(GpuValidScorer, Movable):
             return _mean_loss(raw, target, objective, alpha)
 
 
+struct _EarlyStop(Movable):
+    """`train_with_valid`'s stopping rule, held once so that the two
+    gradient paths of `_train_gpu_valid_rounds` cannot drift from each
+    other or from the CPU trainer: the base-score-only model is the run's
+    incumbent, a round has to beat the best loss by more than `min_delta`
+    to become the new best, and the run stops once `patience` rounds have
+    passed without one."""
+
+    var best_loss: Float64
+    var best_n_trees: Int
+    var min_delta: Float64
+    var patience: Int
+
+    def __init__(
+        out self, base_loss: Float64, min_delta: Float64, patience: Int
+    ):
+        self.best_loss = base_loss
+        self.best_n_trees = 0
+        self.min_delta = min_delta
+        self.patience = patience
+
+    def observe(mut self, loss: Float64, n_trees: Int) -> Bool:
+        """Record round `n_trees`'s validation loss; True means stop."""
+        if loss < self.best_loss - self.min_delta:
+            self.best_loss = loss
+            self.best_n_trees = n_trees
+            return False
+        return n_trees - self.best_n_trees >= self.patience
+
+
 def _train_gpu_valid_rounds[
     V: GpuValidScorer
 ](
@@ -3060,24 +3126,37 @@ def _train_gpu_valid_rounds[
     bagging: BaggingParams,
     goss: GossParams,
     split_search: Int,
+    device_grads: Bool = False,
+    route_all_rows: Bool = False,
 ) raises -> Booster:
     """`train_with_valid`'s loop with `grow_tree` replaced by
     `grow_tree_gpu`, over whichever scorer the caller chose.
 
     Every decision the loop makes is made from the same numbers as on the
-    CPU: the same `_fill_grad_hess`, the same bags from the same sampler,
-    the same `_mean_loss`, and the same compare-against-best rule with the
-    same `min_delta`. Only the histograms the splits are chosen from carry
+    CPU: the same bags from the same sampler, the same `_mean_loss`, and
+    the same compare-against-best rule with the same `min_delta`
+    (`_EarlyStop`). Only the histograms the splits are chosen from carry
     the GPU's Float32 precision, plus the validation raw scores when the
-    device scorer is selected."""
+    device scorer is selected, plus the training raw scores when
+    `device_grads` is set.
+
+    `device_grads` is the same switch `_train_gpu_rounds` takes, and it
+    means the same thing here: the round's gradients are generated on the
+    device from device-resident labels and raw scores, and the grown tree
+    advances those raw scores there, so nothing per row crosses the
+    boundary in a round. The stopping rule never reads the training raw
+    scores, only the validation loss the scorer reports, which is why the
+    two compose without a host copy of the training scores. Off, the loop
+    is the host-gradient path it shipped with: `_fill_grad_hess` over host
+    Float64 raw scores, `goss_round`, `upload_gradients`, and one
+    `predict_row` per training row per tree. `route_all_rows` is the bagged
+    device round through `GpuTreeRouter`, exactly as in
+    `_train_gpu_rounds`."""
     comptime if not has_accelerator():
         raise Error("GPU training requires an accelerator")
     else:
         var n = data.n_rows
         var base_score = _base_score(target, objective, sample_weight, alpha)
-        var raw = List[Float64](capacity=n)
-        for _ in range(n):
-            raw.append(base_score)
         scorer.start(base_score)
 
         var signs = params.tree.monotone.active_signs()
@@ -3085,51 +3164,103 @@ def _train_gpu_valid_rounds[
         var renew_w = renewal_weights(objective, target, sample_weight)
         var renew_a = renewal_alpha(objective, alpha)
         var trees = List[Tree]()
-        var grad = List[Float64](capacity=n)
-        var hess = List[Float64](capacity=n)
-        # The base-score-only model is the run's incumbent, exactly as it is on
-        # the CPU: a run whose first round does not beat it keeps no trees.
-        var best_loss = scorer.loss(valid_target, objective, alpha)
-        var best_n_trees = 0
-        var bag = List[Int]()
-        for i in range(params.n_estimators):
-            refresh_bag(bag, bagging, n, i)
-            _fill_grad_hess(
-                raw, target, objective, sample_weight, alpha, grad, hess
+        var stop = _EarlyStop(
+            scorer.loss(valid_target, objective, alpha),
+            min_delta,
+            early_stopping_rounds,
+        )
+
+        if device_grads:
+            var state = builder.objective_state(
+                target, sample_weight, 1, 2 * params.tree.num_leaves
             )
-            goss_round(bag, grad, hess, goss, i, params.learning_rate)
-            builder.upload_gradients(grad, hess)
-            var tree = grow_tree_gpu(
-                builder, params.tree, bag, i, split_search, data=data
-            )
-            if renews:
-                _renew_leaf_values(
-                    tree, data, target, raw, renew_w, renew_a, bag, signs,
-                    params.tree.extra,
+            state.init_raw(builder.ctx, [base_score])
+            var router = List[GpuTreeRouter]()
+            if route_all_rows and bagging_enabled(bagging):
+                router.append(
+                    GpuTreeRouter(
+                        builder.ctx, n, 2 * params.tree.num_leaves
+                    )
                 )
+            var dev_bag = List[Int]()
+            for i in range(params.n_estimators):
+                refresh_bag(dev_bag, bagging, n, i)
+                builder.fill_gradients_device(state, objective, alpha)
+                var tree = grow_tree_gpu(
+                    builder, params.tree, dev_bag, i, split_search
+                )
+                if renews:
+                    var raw = state.download_raw(builder.ctx)
+                    _renew_leaf_values(
+                        tree, data, target, raw, renew_w, renew_a, dev_bag,
+                        signs, params.tree.extra,
+                    )
+                if tree.n_leaves == 1 and abs(tree.value[0]) < 1e-12:
+                    if bagging_enabled(bagging):
+                        continue
+                    break
+                if len(router) > 0:
+                    router[0].update_all_rows(
+                        builder.ctx,
+                        state,
+                        tree,
+                        builder.bins_dev,
+                        params.learning_rate,
+                    )
+                else:
+                    builder.update_raw_device(
+                        state, tree.value, params.learning_rate
+                    )
+                scorer.observe(tree, valid_data, params.learning_rate)
+                trees.append(tree^)
+                if stop.observe(
+                    scorer.loss(valid_target, objective, alpha), len(trees)
+                ):
+                    break
+        else:
+            var raw = List[Float64](capacity=n)
+            for _ in range(n):
+                raw.append(base_score)
+            var grad = List[Float64](capacity=n)
+            var hess = List[Float64](capacity=n)
+            var bag = List[Int]()
+            for i in range(params.n_estimators):
+                refresh_bag(bag, bagging, n, i)
+                _fill_grad_hess(
+                    raw, target, objective, sample_weight, alpha, grad, hess
+                )
+                goss_round(bag, grad, hess, goss, i, params.learning_rate)
+                builder.upload_gradients(grad, hess)
+                var tree = grow_tree_gpu(
+                    builder, params.tree, bag, i, split_search, data=data
+                )
+                if renews:
+                    _renew_leaf_values(
+                        tree, data, target, raw, renew_w, renew_a, bag,
+                        signs, params.tree.extra,
+                    )
 
-            # Under bagging or GOSS a degenerate tree indicts the sample, not
-            # the run.
-            if tree.n_leaves == 1 and abs(tree.value[0]) < 1e-12:
-                if bagging_enabled(bagging) or goss.enabled:
-                    continue
-                break
+                # Under bagging or GOSS a degenerate tree indicts the
+                # sample, not the run.
+                if tree.n_leaves == 1 and abs(tree.value[0]) < 1e-12:
+                    if bagging_enabled(bagging) or goss.enabled:
+                        continue
+                    break
 
-            for r in range(n):
-                raw[r] += params.learning_rate * tree.predict_row(data, r)
-            # After renewal, which rewrote the leaf values the scorer
-            # folds in.
-            scorer.observe(tree, valid_data, params.learning_rate)
-            trees.append(tree^)
+                for r in range(n):
+                    raw[r] += params.learning_rate * tree.predict_row(
+                        data, r
+                    )
+                # After renewal, which rewrote the leaf values the scorer
+                # folds in.
+                scorer.observe(tree, valid_data, params.learning_rate)
+                trees.append(tree^)
+                if stop.observe(
+                    scorer.loss(valid_target, objective, alpha), len(trees)
+                ):
+                    break
 
-            var loss = scorer.loss(valid_target, objective, alpha)
-            if loss < best_loss - min_delta:
-                best_loss = loss
-                best_n_trees = len(trees)
-            elif len(trees) - best_n_trees >= early_stopping_rounds:
-                break
-
-        while len(trees) > best_n_trees:
+        while len(trees) > stop.best_n_trees:
             _ = trees.pop()
         return Booster(
             trees^,
@@ -3155,6 +3286,7 @@ def train_gpu_with_valid(
     goss: GossParams = GossParams.disabled(),
     valid_scoring: Int = VALID_SCORE_AUTO,
     split_search: Int = SPLIT_SEARCH_AUTO,
+    objective_source: Int = OBJECTIVE_SOURCE_AUTO,
 ) raises -> Booster:
     """`train_with_valid` with tree growth on the GPU: validation-set early
     stopping, the same stopping rule, and the ensemble truncated to its best
@@ -3169,11 +3301,13 @@ def train_gpu_with_valid(
     walk, byte for byte what `train_with_valid` does, and VALID_SCORE_DEVICE
     keeps them on the training context instead.
 
-    Gradients are host-side here whichever scorer is chosen, because early
-    stopping needs the host raw scores that `_fill_grad_hess` reads. The
-    device objective path (`train_gpu`'s `objective_source`) keeps its raw
-    scores on the device, so composing the two is a further stage, not a
-    parameter this function takes."""
+    `objective_source` is `train_gpu`'s switch with `train_gpu`'s meaning:
+    under AUTO the gradients are generated on the device whenever the
+    objective has device kernels and the run is not sampled, so a plain
+    early-stopping run keeps its training raw scores on the device exactly
+    as a plain `train_gpu` run does, and a bagged or GOSS run keeps the
+    host-gradient path. The stopping rule reads only the validation loss,
+    never the training raw scores, which is what lets the two compose."""
     comptime if not has_accelerator():
         raise Error("GPU training requires an accelerator")
     else:
@@ -3191,6 +3325,10 @@ def train_gpu_with_valid(
         _check_goss(goss, bagging)
         params.tree.monotone.check_features(data.n_features)
 
+        var routes_all = _routes_all_rows(objective_source, bagging)
+        var device_grads = device_gradients(
+            objective, 1, objective_source, bagging, goss, routes_all
+        )
         var builder = GpuHistogramBuilder(data)
         if resolve_valid_scoring(valid_scoring) == VALID_SCORE_DEVICE:
             # On the builder's own context, so the validation kernels queue
@@ -3215,6 +3353,8 @@ def train_gpu_with_valid(
                 bagging,
                 goss,
                 split_search,
+                device_grads,
+                routes_all,
             )
         var on_host = _HostValidScorer(valid_data.n_rows)
         return _train_gpu_valid_rounds(
@@ -3233,4 +3373,6 @@ def train_gpu_with_valid(
             bagging,
             goss,
             split_search,
+            device_grads,
+            routes_all,
         )

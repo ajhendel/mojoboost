@@ -211,8 +211,9 @@ It is widely held that NVIDIA device-memory atomics are cheap at low
 contention and that a tiled reduction wins at high contention. That is
 exactly the kind of claim this repository has no measurement for on any
 NVIDIA or AMD part, and installing it from reasoning is what
-`device_policy.crossover_rules` refuses to do for the CPU/GPU threshold for
-the same reason.
+`device_policy.crossover_rules` refuses to do for the CPU/GPU threshold on
+any device that has not run the sweep (its two rules are Apple M4 rules
+from a recorded sweep, and nothing else is installed) for the same reason.
 
 `StrategyInputs` reports what a measured rule would key on (tile count,
 slot count, bin count, block width, residency, conflict degree, partial

@@ -1,0 +1,25 @@
+mojotrees gpu-vs-cpu bench: 1000000 rows x 50 features, binary seed 0
+subsample: 1.0
+binning_s: 0.166567
+arms: cpu,gpu
+repeats: 3
+run 1 cpu train_s: 16.328446
+run 1 gpu train_s: 5.837231
+run 2 cpu train_s: 27.387682
+run 2 gpu train_s: 11.587301
+run 3 cpu train_s: 36.672005
+run 3 gpu train_s: 7.434713
+cpu_train_s: 16.328446
+cpu_train_s_median: 27.387682
+cpu_train_s_max: 36.672005
+cpu_spread_pct: 124.6
+cpu_n_trees: 100
+cpu_train_loss: 0.2885650158373859
+gpu_train_s: 5.837231
+gpu_train_s_median: 7.434713
+gpu_train_s_max: 11.587301
+gpu_spread_pct: 98.5
+gpu_n_trees: 100
+gpu_train_loss: 0.288544838708095
+gpu_speedup_x: 2.797293100101743
+gpu_vs_cpu: indistinguishable delta_pct -64.3 noise_floor_pct 124.6

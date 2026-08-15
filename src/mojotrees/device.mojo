@@ -42,7 +42,8 @@ device code, and neither one is a different policy:
 A Mojo caller that would rather hold the decision than parse it should
 still go straight to `decide_device` in device_policy.mojo.
 
-Why `auto` is the CPU today, what `MOJOTREES_AUTO_MIN_CELLS` and
+Where `auto` chooses the GPU (the measured Apple M4 rules), where it
+still resolves to the CPU, what `MOJOTREES_AUTO_MIN_CELLS` and
 `MOJOTREES_DISABLE_GPU` do, and why accelerator availability is a
 property of the build rather than of the running machine are all
 documented in device_policy.mojo, where the rules that implement them
@@ -89,9 +90,10 @@ from .device_policy import (
 #     say which; inventing a bin count or an objective to fill the gap is
 #     how a gate silently starts admitting the wrong thing.
 # AUTO_MIN_CELLS
-#     Cells (n_rows * n_features) at or above which `auto` chooses the GPU.
-#     Negative disables the heuristic, which is the default: see
-#     device_policy.mojo for why there is no measured crossover to ship.
+#     Cells (n_rows * n_features) at or above which `auto` chooses the GPU
+#     through the environment override. Negative disables that override,
+#     which is the default; the shipped crossover rules in device_policy.mojo
+#     decide without it.
 # gpu_available
 #     True when training can run on an accelerator: one was present when
 #     this build was compiled and `MOJOTREES_DISABLE_GPU=1` is not set.

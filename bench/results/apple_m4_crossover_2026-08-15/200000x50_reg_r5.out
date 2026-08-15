@@ -1,0 +1,8 @@
+mojotrees gpu-vs-cpu bench: 200000 rows x 50 features, reg seed 0
+binning_s: 0.127027
+arms: cpu,gpu
+repeats: 5
+run 1 cpu train_s: 10.053158
+run 1 gpu train_s: 3.411695
+run 2 cpu train_s: 6.830658
+run 2 gpu train_s: 3.908016

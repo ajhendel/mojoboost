@@ -184,9 +184,10 @@ The consequences, in order of how much trouble they cause:
   it.** A wheel built on a Mac with a working Metal toolchain reports a GPU as
   available on every machine that installs it. On a machine that then cannot
   open a device, the failure arrives when the device is opened rather than when
-  it is resolved. Today that gap is invisible, because `auto` never selects the
-  GPU on its own, and `device="gpu"` raises rather than falling back. It becomes
-  reachable the moment `MOJOTREES_AUTO_MIN_CELLS` is set on a redistributed
+  it is resolved. `auto` selects the GPU on its own only when the device
+  probe reports the hardware a crossover rule names (an Apple M4 today), which
+  a host with no usable device cannot report, so the gap is reachable through
+  `device="gpu"` and through `MOJOTREES_AUTO_MIN_CELLS` on a redistributed
   build. `MOJOTREES_DISABLE_GPU=1` is the way to pin such a build to the CPU.
 - **A wheel built where no accelerator was visible has no GPU path in it at
   all**, and `device="gpu"` raises everywhere it is installed, including on
@@ -329,7 +330,7 @@ mistake is, loudly, rather than somewhere convenient and quietly.
 | `device="gpu"` with no accelerator in the build | Raises. It never falls back to the CPU silently | `src/mojotrees/device.mojo` |
 | `device="gpu"` on a redistributed build whose host has no usable device | Raises when the device is opened, later than the resolve | `has_accelerator()` is compile time |
 | `device="gpu"` for multiclass | Raises. Multiclass grows one tree per class per round on the CPU | `device.mojo`, `fit_multiclass` |
-| `device="auto"` anywhere | Chooses the CPU. The size heuristic is disabled until a measured crossover exists | `AUTO_MIN_CELLS = -1` |
+| `device="auto"` | Chooses the GPU for dense single-output regression and binary classification on an Apple M4 from 25 million cells and 200,000 rows; the CPU everywhere else, since no other device has a measured crossover | `crossover_rules()` in `device_policy.mojo` |
 | GPU tests on a machine with no accelerator | Print `skipped: no accelerator` and pass. A pass that says `skipped` is not a validation | test suites |
 | A wheel whose tag no target declares | `validate_artifact.py` rule R1 fails the release | release check |
 

@@ -511,7 +511,7 @@ numerical one.
 | `device="gpu"` with an `eval_set` | Validation is scored on the CPU |
 | `device="gpu"` for 3 or more classes | Multiclass training is CPU-only |
 | `device="gpu"` with sparse input | No sparse GPU kernel |
-| `device="auto"` selecting the GPU | The policy exists; it always resolves to the CPU today |
+| `device="auto"` selecting the GPU off an Apple M4 | The policy exists; the only measured crossover rules are M4 rules, so elsewhere it resolves to the CPU |
 
 **And the honest part.** GPU training has been run on exactly one device,
 an Apple M4 through Metal, where correctness and repeat-run determinism

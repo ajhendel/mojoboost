@@ -367,16 +367,16 @@ it. Pickle the estimator when you want those.
 ```python
 MojoTreesRegressor(device="cpu")    # default, dependable, every objective
 MojoTreesRegressor(device="gpu")    # accelerator or an exception, never a fallback
-MojoTreesRegressor(device="auto")   # picks for you, and today always picks the CPU
+MojoTreesRegressor(device="auto")   # picks for you, from measured crossover rules
 ```
 
 `device="gpu"` is a request that gets honored or refused. It never quietly
 trains on the CPU while you believe you used the GPU. `device="auto"`
-resolves to the CPU on every machine and every workload right now, because no
-benchmark has established a size where GPU training wins, and shipping a
-crossover threshold before that measurement exists would be a performance
-claim with nothing behind it. [docs/DEVICE_SELECTION.md](DEVICE_SELECTION.md)
-has the whole policy.
+consults a table of measured crossover rules and chooses the GPU only where
+one matches: today, dense single-output regression and binary
+classification on an Apple M4 from 25 million cells (rows times features)
+and 200,000 rows up. Everywhere else it resolves to the CPU and says which
+rule fell short. [docs/DEVICE_SELECTION.md](DEVICE_SELECTION.md) has the whole policy.
 
 ### 6. Print the diagnostics
 
@@ -612,19 +612,22 @@ and `gpu` covers every accelerator rather than naming a vendor.
 
 ### `device="auto"` chose the CPU and said nothing
 
-This is not an error and there is no message. It is the current, deliberate
-behavior on every machine and every workload.
+This is not an error and there is no message. It is the deliberate answer
+whenever no measured crossover rule covers the run.
 
 ```python
 model = MojoTreesRegressor(device="auto").fit(X, y)
-model.device_        # "cpu", on an M4 with a working Metal GPU
+model.device_        # "cpu" below 25 million cells, or off the M4, or multiclass
 ```
 
-The crossover table that `auto` consults is empty. Nothing in this repository
-has measured a workload shape where end-to-end GPU training beats the
-multicore CPU trainer, and the one end-to-end Apple measurement that exists
-came out slower. Until that changes, `auto` keeps the CPU rather than
-implying an evaluation happened that did not.
+The crossover table that `auto` consults holds two rules (policy version 2),
+both from one interleaved CPU-versus-GPU sweep on the development Apple M4
+(`bench/results/apple_m4_crossover_2026-08-15.md`): dense single-output
+squared-error and binary-logistic training from 25 million cells
+(`n_rows * n_features`) and 200,000 rows up. Below that, on another Apple generation, on
+CUDA or HIP, for multiclass, or for any other objective, no rule matches
+and `auto` keeps the CPU rather than implying an evaluation happened that
+did not. `explain_device_choice(X, y)` prints which rule fell short.
 
 Two ways forward, depending on what you want.
 
@@ -637,11 +640,10 @@ MOJOTREES_AUTO_MIN_CELLS=10000000 python your_benchmark.py
 ```
 
 `MOJOTREES_AUTO_MIN_CELLS` is the cell count (`n_rows * n_features`) at or
-above which `auto` selects the GPU, and it is the knob for running the
-crossover benchmark that would justify a shipped default. It is device
-independent on purpose; there are no per vendor or per chip special cases
-anywhere in the policy. If you run that benchmark, the result belongs in an
-issue, filed with the
+above which `auto` selects the GPU regardless of the rule table, and it is
+the knob for running the crossover benchmark that would justify a rule for
+your device. It is device independent on purpose. If you run that
+benchmark, the result belongs in an issue, filed with the
 [accelerator validation template](https://github.com/mojotrees/mojotrees/issues/new?template=hardware_validation.yml).
 
 ### Anything else

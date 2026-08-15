@@ -145,6 +145,10 @@ def test_gpu_accepts_multiclass() raises:
 
 
 def test_auto_chooses_cpu_by_default() raises:
+    """The shape-only `resolve_device` names no objective, and every shipped
+    crossover rule is scoped to one, so it keeps the CPU at any size; the
+    objective-aware `fit` path is where a rule can match (see
+    tests/parallel/test_device_policy.mojo)."""
     assert_equal(env_auto_min_cells(), -1)
     assert_equal(resolve_device(AUTO_DEVICE, 10, 2, 1), CPU_DEVICE)
     assert_equal(
@@ -201,7 +205,8 @@ def test_fit_cpu_and_auto_agree() raises:
         features, n_rows, n_features, target, SQUARED_ERROR, params,
         device=AUTO_DEVICE,
     )
-    # auto resolves to the CPU trainer here, so this is bit-exact.
+    # 2,000 cells is far below every crossover rule, so auto resolves to
+    # the CPU trainer here and this is bit-exact.
     assert_equal(len(cpu.booster.trees), len(auto.booster.trees))
     for r in range(n_rows):
         var row = List[Float64](capacity=n_features)
@@ -227,7 +232,7 @@ def test_fit_multiclass_device_selection() raises:
     var labels = _labels(features, n_rows, 3)
     var params = BoosterParams(5, 0.1, TreeParams.default())
 
-    # auto resolves to the CPU while the size heuristic ships disabled.
+    # No crossover rule covers multiclass, so auto resolves to the CPU.
     var model = fit_multiclass(
         features, n_rows, n_features, labels, 3, params, device=AUTO_DEVICE
     )

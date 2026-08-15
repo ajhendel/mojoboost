@@ -115,10 +115,12 @@ written out, in [docs/INSTALLATION.md](docs/INSTALLATION.md#the-first-five-minut
 `device="cpu"` is the default and the dependable backend. `device="gpu"`
 requires an available supported accelerator and raises on unsupported
 hardware or workloads rather than silently falling back. `device="auto"`
-resolves to the CPU on every machine and every workload today, because its
-crossover heuristic is deliberately disabled until end-to-end benchmark
-evidence establishes a trustworthy threshold. Read
-[Device selection](#device-selection) before using it.
+chooses the GPU only where a recorded benchmark says the GPU trainer wins:
+today that is dense single-output squared-error and binary-logistic
+training on an Apple M4 from 25 million cells (`n_rows * n_features`) and
+200,000 rows up,
+and the CPU everywhere else, with the decision saying which rule matched
+or fell short. Read [Device selection](#device-selection) before using it.
 
 The two backends are not a primary and a port. On an accelerator the GPU
 owns the data plane, and the CPU owns the control plane, small data, and
@@ -762,21 +764,33 @@ gradient sum, so this shows up only in degenerate cases, and
 
 `fit_multiclass` routes by `device` exactly as `fit` does, so `gpu` grows
 multiclass on the device through `train_multiclass_gpu` rather than
-raising, and `auto` may select it. GOSS reaches both trainers
+raising; `auto` keeps the CPU for multiclass, since no crossover rule
+covers it yet. Row bagging on the GPU takes the device round (the bag is
+drawn on the host from a counter stream and `GpuTreeRouter` advances every
+row's score, in bag or not;
+[record](bench/results/apple_m4_bagged_round_2026-08-15.md)). GOSS reaches both trainers
 and every objective they cover: the sample is chosen on the host from
 Float64 gradients and handed to the device as the tree's row list, so the
 two backends sample identically.
 
-`auto`'s size heuristic ships disabled, so `auto` currently always
-resolves to the CPU. No benchmark on any device has established a
-workload size where end-to-end GPU training beats the CPU trainer, and
-shipping a crossover threshold before then would be a performance claim
-with nothing behind it. `MOJOTREES_AUTO_MIN_CELLS` enables it as an
-integer cell count (`n_rows * n_features`) at or above which `auto`
-chooses the GPU, which is the knob for running the crossover benchmark
-that would justify a default. `MOJOTREES_DISABLE_GPU=1` makes the library
-report no accelerator, so `gpu` raises and `auto` chooses the CPU on a
-machine that has one; it pins a mixed fleet to the CPU and exercises the
+`auto` consults a table of measured crossover rules
+(`crossover_rules()` in `src/mojotrees/device_policy.mojo`, policy
+version 2). It holds two rules, both from one interleaved CPU-versus-GPU
+sweep on the development Apple M4
+([record](bench/results/apple_m4_crossover_2026-08-15.md)): dense
+single-output squared-error and binary-logistic training from 25 million
+cells (`n_rows * n_features`) and 200,000 rows up, where the GPU trainer beat the CPU
+trainer by more than the run's own noise floor at every shape measured.
+Each rule is scoped to exactly what was measured (Metal, an M4 generation
+part, one output, its own objective), so on another Apple generation, on
+CUDA or HIP, for multiclass, or for an objective the sweep did not run,
+`auto` resolves to the CPU and the decision says so. Widening a rule is a
+benchmarking result, not a code change. `MOJOTREES_AUTO_MIN_CELLS` is the
+override for running that benchmark: an integer cell count at or above
+which `auto` chooses the GPU regardless of the table, reported as
+unvalidated. `MOJOTREES_DISABLE_GPU=1` makes the library report no
+accelerator, so `gpu` raises and `auto` chooses the CPU on a machine that
+has one; it pins a mixed fleet to the CPU and exercises the
 unavailable-GPU path in tests.
 
 Fitted Python estimators record the backend that actually ran on
@@ -874,9 +888,9 @@ tile size are runtime values here rather than compile-time ones.
 2. Close the remaining v1 gaps in the parity contract
    ([docs/LIGHTGBM_PARITY.md](docs/LIGHTGBM_PARITY.md)). Sparse input
    landed for training and prediction; the gaps left there are a reachable
-   sparse GPU kernel, custom objectives, and `eval_set` from Python. Bring
-   `device="auto"` a measured crossover, so that it may choose the GPU on
-   evidence rather than on a guess
+   sparse GPU kernel, custom objectives, and `eval_set` from Python.
+   `device="auto"` has its first measured crossover (Apple M4, two
+   objectives); every other device and objective still needs its own
 3. Validate the same GPU source on NVIDIA and AMD hardware
    ([procedure](docs/GPU_VALIDATION.md); neither has been run). The kernels
    already scale past one threadgroup per feature and tile themselves from

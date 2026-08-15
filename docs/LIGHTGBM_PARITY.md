@@ -573,7 +573,7 @@ HIP, and no NVIDIA or AMD device has run this code.
 | Sparse input on the GPU | deferred | `_sparse_fit_params` raises for `device="gpu"` rather than densifying, so the refusal a user meets is accurate. Sparse GPU kernels do exist as of this revision, in `src/mojotrees/gpu_sparse.mojo` and `src/mojotrees/gpu_sparse_layout.mojo`, and no entry point reaches either. Downgraded from `unsupported` for that reason: the reason not to build it no longer holds, because it has been built. Section 0 |
 | CUDA (NVIDIA) validation | deferred | The source targets it and `tests/test_gpu_portability.mojo` pins the launch limits CUDA imposes, but **no NVIDIA device has run this code**. `.github/workflows/gpu-validation.yml` is the manual job that would produce a record |
 | HIP (AMD) validation | deferred | Same |
-| GPU speed vs CPU | different | `auto` ships with its size heuristic disabled and always chooses the CPU, because no benchmark on any device has found a crossover. `MOJOTREES_AUTO_MIN_CELLS` is the knob for running that benchmark. Shipping a threshold first would be a performance claim with nothing behind it |
+| GPU speed vs CPU | different | `auto` chooses the GPU only where a recorded benchmark says the GPU trainer wins: dense single-output squared-error and binary-logistic training on an Apple M4 from 25 million cells and 200,000 rows up (`bench/results/apple_m4_crossover_2026-08-15.md`, policy version 2), and the CPU everywhere else. LightGBM has no `auto` at all. `MOJOTREES_AUTO_MIN_CELLS` is the knob for running that benchmark on a device the table does not cover |
 
 ## 13. Packaging and distribution
 

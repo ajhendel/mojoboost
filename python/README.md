@@ -388,10 +388,12 @@ reports.
 raises when no accelerator is available or when the GPU path does not
 cover the workload, rather than falling back silently. Sparse input, an
 `eval_set`, and a Python objective callback are the workloads it does not
-cover today, and each says so by name. `device="auto"` picks for you and
-currently always picks the CPU, because no benchmark has established a
-workload size where end-to-end GPU training wins and no crossover threshold
-ships enabled. `gpu_available()` reports whether this build can train on an
+cover today, and each says so by name. `device="auto"` picks for you from a
+table of measured crossover rules: today it picks the GPU for dense
+single-output regression and binary classification on an Apple M4 from
+25 million cells (rows times features) and 200,000 rows up, and the CPU
+everywhere else,
+with `explain_device_choice` saying which rule matched or fell short. `gpu_available()` reports whether this build can train on an
 accelerator, which is decided when the extension is compiled rather than on
 the machine that runs it.
 
@@ -469,7 +471,7 @@ using the instructions above.
 | `RuntimeError: device 'gpu' requested but no accelerator is available` | This build has no GPU path. Availability is fixed when the extension is compiled, not at runtime |
 | `RuntimeError: validation metrics are scored on the CPU` | An `eval_set` with `device="gpu"`. Use `device="cpu"` or `"auto"` |
 | `RuntimeError: sparse input trains on the CPU` | There is no sparse GPU kernel. Use `device="cpu"`, `"auto"`, or densify |
-| `device="auto"` chose the CPU and said nothing | Expected. The crossover table is empty, so `auto` keeps the CPU everywhere |
+| `device="auto"` chose the CPU and said nothing | Expected below 25 million cells, on any device other than an Apple M4, for multiclass, or for an objective other than regression and binary; `explain_device_choice(X, y)` prints which rule fell short |
 
 Each case, with the full message and what to do about it, is in
 [docs/INSTALLATION.md](https://github.com/mojotrees/mojotrees/blob/main/docs/INSTALLATION.md#when-something-goes-wrong).
