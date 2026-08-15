@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+#
+# Refuse a commit that stages a gate artifact whose gate is failing.
+#
+# Three files in this repository are generated or checked rather than written
+# freehand, and each one has a gate that owns it:
+#
+#   compatibility/api_snapshot.json   python3 tools/api_snapshot.py --check
+#   docs/LIGHTGBM_PARITY.md           python3 tools/check_parity.py
+#   pixi.toml                         python3 tools/check_pixi_tasks.py
+#
+# All three have been committed stale, because nothing made the gate run
+# first. One regeneration then swept in two unrelated drifts that other
+# sessions had committed without regenerating the snapshot, which is how a
+# stale artifact turns into a misattributed one.
+#
+# Deliberately narrow. It runs nothing unless one of those three files is
+# staged, so a commit that touches none of them is not slowed down or
+# blocked by it, and it runs only the gate that owns the staged file. It
+# exits 0 rather than failing when python3 is missing or too old, because a
+# hook that hard-fails on a machine without the interpreter is worse than no
+# hook at all.
+#
+# The gates read the working tree, not the index. If you are committing part
+# of your changes, the verdict is about the tree you are sitting in.
+#
+# Escape hatches, in order of preference:
+#   MOJOTREES_SKIP_GATES=1 git commit ...   skip this hook, keep the others
+#   git commit --no-verify ...              skip every hook
+#
+# Install with tools/install_hooks.sh, remove with tools/install_hooks.sh
+# --uninstall.
+
+set -uo pipefail
+
+if [ "${MOJOTREES_SKIP_GATES:-0}" = "1" ]; then
+  echo "pre-commit: MOJOTREES_SKIP_GATES=1, gate checks skipped" >&2
+  exit 0
+fi
+
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+[ -n "$ROOT" ] || exit 0
+cd "$ROOT" || exit 0
+
+staged="$(git diff --cached --name-only --diff-filter=ACM 2>/dev/null)" || exit 0
+
+gates=""
+want() { case " $gates " in *" $1 "*) ;; *) gates="$gates $1" ;; esac; }
+
+while IFS= read -r path; do
+  case "$path" in
+    compatibility/api_snapshot.json) want api ;;
+    docs/LIGHTGBM_PARITY.md)         want parity ;;
+    pixi.toml)                       want pixi ;;
+  esac
+done <<< "$staged"
+
+# Nothing gate-owned in this commit. Get out of the way.
+[ -n "$gates" ] || exit 0
+
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "pre-commit: python3 not found, skipping the gate checks for:$gates" >&2
+  echo "pre-commit: run them yourself before pushing." >&2
+  exit 0
+fi
+
+if ! python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
+  echo "pre-commit: python3 is older than 3.11, skipping the gate checks for:$gates" >&2
+  exit 0
+fi
+
+if [ ! -r tools/check_gates.sh ]; then
+  echo "pre-commit: tools/check_gates.sh is missing, skipping gate checks" >&2
+  exit 0
+fi
+
+echo "pre-commit: staged gate artifacts, running:$gates"
+# shellcheck disable=SC2086 - $gates is a deliberate word list
+if bash tools/check_gates.sh $gates; then
+  exit 0
+fi
+
+cat >&2 <<'MESSAGE'
+
+pre-commit: a gate artifact is staged and its gate is failing.
+
+Regenerate or fix, then commit again:
+
+  compatibility/api_snapshot.json   python3 tools/api_snapshot.py --write
+  docs/LIGHTGBM_PARITY.md           edit until tools/check_parity.py passes
+  pixi.toml                         edit until tools/check_pixi_tasks.py passes
+
+If the failure is somebody else's drift rather than yours, say so in the
+commit message rather than sweeping it into your snapshot regeneration, and
+commit the artifact by explicit path.
+
+To bypass on purpose:  MOJOTREES_SKIP_GATES=1 git commit ...
+MESSAGE
+exit 1

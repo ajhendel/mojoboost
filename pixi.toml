@@ -27,13 +27,42 @@ test-gpu = "bash tools/run_tests.sh gpu"
 # Print the selection without running it.
 test-list = "bash tools/run_tests.sh list"
 
+# The cheap gates. Every one of these is standard-library Python reading
+# files already in the tree: no Mojo compile, no extension build, no
+# benchmark, no network. That is what makes them safe to run on every change
+# and on a bare CI runner in seconds, and it is the line to keep. Do not add
+# anything to `check-gates` that builds.
+#
+# Each of the first three owns a generated or checked artifact, and the
+# pre-commit hook installed by `install-hooks` runs the owning gate when its
+# artifact is staged. That the artifacts drifted at all is why they exist:
+# all three have been committed stale because nothing made the gate run.
+check-api = "python3 tools/api_snapshot.py --check"
 # Checks docs/LIGHTGBM_PARITY.md against the repository. Standard library
 # only, and it builds nothing, so it is cheap enough to run on every change.
 check-parity = "python3 tools/check_parity.py"
+# Checks pixi.toml itself: every path a task names, every `-I` directory,
+# every suite handed to run_tests.sh, every depends-on, every environment.
+check-pixi = "python3 tools/check_pixi_tasks.py"
+check-connectivity = "python3 tools/connectivity_audit.py"
+check-integration = "python3 tools/audit_integration.py"
+# All of the above, every one run even when an earlier one fails, so the
+# report is the whole state rather than the first thing that broke.
+check-gates = "bash tools/check_gates.sh"
+
+# Installs the pre-commit hook that refuses a stale gate artifact. It is a
+# shim into tools/hooks/pre-commit, so the behavior stays versioned.
+# `bash tools/install_hooks.sh --uninstall` removes it.
+install-hooks = "bash tools/install_hooks.sh"
+
 bench = "mojo run -I src bench/bench_train.mojo"
 bench-hist = "mojo run -I src bench/bench_histogram.mojo"
 bench-hist-scaling = "mojo run -I src bench/bench_histogram_scaling.mojo"
 bench-train-gpu = "mojo run -I src bench/bench_train_gpu.mojo"
+# The sparse crossover (w4_sparse), interleaved the same way. Separate from
+# bench-train-gpu because the sparse arms take a SparseBinnedMatrix and have
+# no split-search strategy to choose. See bench/README.md for the protocol.
+bench-train-gpu-sparse = "mojo run -I src bench/bench_train_gpu_sparse.mojo"
 gpu-validate = "mojo run -I src bench/bench_gpu_validation.mojo"
 bench-threshold = "mojo run -I src bench/bench_threshold.mojo"
 bench-sparse = "mojo run -I src bench/bench_sparse.mojo"
@@ -95,6 +124,15 @@ scikit-learn = "*"
 pandas = "*"
 pyarrow = "*"
 polars = "*"
+# Declared rather than inherited. scipy already arrives here as a
+# scikit-learn dependency, so the five suites that guard their sparse cases
+# with `pytest.importorskip("scipy.sparse")` do run today. They run by
+# accident. The moment scikit-learn stops depending on scipy, or the solver
+# picks a build that does not, those cases start skipping and CI keeps
+# reporting green on a path it no longer executes. A skip is silent, which
+# is what makes this worth a line: the coverage of the CSR and CSC paths
+# should rest on a declared dependency, not on somebody else's.
+scipy = "*"
 
 # The estimator suite (python/tests) needs pytest, and its scikit-learn,
 # pandas, pyarrow, and polars tests skip themselves when those are absent.

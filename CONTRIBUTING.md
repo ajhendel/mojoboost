@@ -56,6 +56,73 @@ When Python bindings change, build once and run the narrowest relevant Python
 test. Avoid multiple concurrent extension builds; they compete for the same
 artifacts.
 
+## Generated files have gates, and the gate runs before the commit
+
+Three files are checked or generated rather than written freehand. Each one
+has exactly one gate that owns it:
+
+| file | gate |
+| --- | --- |
+| `compatibility/api_snapshot.json` | `python3 tools/api_snapshot.py --check` |
+| `docs/LIGHTGBM_PARITY.md` | `python3 tools/check_parity.py` |
+| `pixi.toml` | `python3 tools/check_pixi_tasks.py` |
+
+Do not commit one of those three without running the gate that owns it. All
+three have been committed stale, and the repair is worse than the original
+fault: one regeneration of the snapshot swept in two unrelated drifts that
+other changes had introduced without regenerating, so the diff blamed them on
+the wrong commit. Regenerate the snapshot with
+`python3 tools/api_snapshot.py --write` and read the classification it prints
+before committing, because a line it calls breaking is a decision and not a
+regeneration.
+
+`pixi run check-gates` runs those three plus the two connectivity audits. All
+five are standard-library Python reading files already in the tree. They
+build nothing, so run them freely; they are also the whole of what the bare
+CI runners check.
+
+Install the pre-commit hook once per checkout:
+
+```sh
+pixi run install-hooks       # or: bash tools/install_hooks.sh
+```
+
+It runs a gate only when that gate's artifact is staged, so a commit touching
+none of the three is unaffected. Remove it with
+`bash tools/install_hooks.sh --uninstall`, and bypass it for one commit with
+`MOJOTREES_SKIP_GATES=1 git commit`.
+
+## More than one session in one checkout
+
+One session per checkout. Two agents or two terminals editing the same
+working tree overwrite each other's edits, and the loss is silent, because
+the second writer sees a file that reads as if the first writer never ran.
+
+If you need concurrent sessions, give each one its own tree:
+
+```sh
+git worktree add ../mojotrees-lane-b -b lane-b
+```
+
+Then, in whichever tree you are in:
+
+- Serialize anything heavy. `tools/with_build_lock.sh` takes a lock shared
+  across sessions, so wrap whole builds and suite runs in it, for example
+  `tools/with_build_lock.sh tools/run_tests.sh cpu test_binning`. Concurrent
+  package builds and concurrent extension builds fight over the same output
+  paths. `MOJOTREES_TEST_JOBS` parallelizes within one run; this lock is the
+  opposite concern and the two compose.
+- Commit by explicit path, never `git commit -a` and never `git add .`. Name
+  the files you changed, or you will commit a peer's half-finished work under
+  your message.
+- When a peer is editing a file you also touched, stage hunks rather than the
+  file, with `git add -p`, and re-read the file immediately before committing.
+  An edit anchored to text a peer has already replaced applies somewhere you
+  did not mean.
+- Before committing any of the three gate files above, run its gate in the
+  tree you are about to commit from. Failing gates are usually a peer's drift
+  arriving in your commit; say so in the message rather than absorbing it.
+
 ## Pull requests
 
 Describe:
