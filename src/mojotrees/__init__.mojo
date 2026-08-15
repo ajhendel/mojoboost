@@ -111,6 +111,63 @@ from .trainset import (
     update_dataset,
     update_dataset_multiclass,
 )
+# Chunked ingestion and external-memory construction: the `Sequence`
+# protocol a source hands its rows through a block at a time, and the
+# two-pass binner that turns one into a cache of binned chunks plus the
+# trainers that read such a cache. `CancelToken` is exported from
+# `.validation` below (it is `sequence.CancelToken`).
+from .sequence import (
+    SEQ_BUDGET,
+    SEQ_CANCELLED,
+    SEQ_NOT_REPEATABLE,
+    SEQ_OK,
+    SEQ_ROW_ORDER,
+    SEQ_SCHEMA_MISMATCH,
+    CategoryTally,
+    ChunkPlan,
+    ChunkSchema,
+    CscSequence,
+    MemorySequence,
+    RawChunk,
+    RowFields,
+    RowIdRange,
+    Sequence,
+    SequenceStats,
+    check_row_coverage,
+    csc_sequence_from_raw,
+    feature_block_width,
+    gather_dense_block,
+    gather_row_fields,
+    gather_sparse_block,
+    materialize_dense,
+    memory_sequence_from_raw,
+    require_chunk_schema,
+    sequence_status_message,
+)
+from .external_memory import (
+    DEFAULT_BIN_MEMORY_BUDGET,
+    DEFAULT_CHUNK_ROWS,
+    EXT_VERSION,
+    CacheLayout,
+    ExternalCapabilities,
+    ExternalDataset,
+    ExternalManifest,
+    ExternalMemoryParams,
+    build_external_dataset,
+    build_external_dataset_from_raw,
+    check_external_supported,
+    external_groups,
+    fit_mapper_external,
+    open_external_dataset,
+    spill_source,
+    train_external,
+    train_external_multiclass,
+    train_external_ranker,
+    train_external_sparse,
+    train_external_sparse_multiclass,
+    update_external,
+    update_external_multiclass,
+)
 from .collective import (
     STATUS_INVALID_PARAM,
     STATUS_INVALID_TARGET,

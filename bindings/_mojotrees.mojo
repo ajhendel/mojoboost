@@ -30,6 +30,13 @@ from std.python.bindings import PythonModuleBuilder
 # coherent group and this file is long; they are registered here, in the one
 # `PythonModuleBuilder`, because that is the only place a name becomes
 # reachable from Python.
+from sequence_bindings import (
+    ChunkAccumulator,
+    dataset_chunks_begin,
+    dataset_chunks_finish,
+    dataset_chunks_num_data,
+    dataset_chunks_push,
+)
 from dataset_bindings import (
     dataset_bin_upper_bounds,
     dataset_categorical_features,
@@ -228,6 +235,13 @@ def PyInit__mojotrees() abi("C") -> PythonObject:
         _ = m.add_type[MulticlassModel]("MulticlassModel")
         _ = m.add_type[Dataset]("Dataset")
         _ = m.add_type[GpuValidation]("GpuValidation")
+        # From sequence_bindings.mojo: LightGBM's Sequence path, a Dataset
+        # built from row-major batches pushed one at a time.
+        _ = m.add_type[ChunkAccumulator]("ChunkAccumulator")
+        m.def_function[dataset_chunks_begin]("dataset_chunks_begin")
+        m.def_function[dataset_chunks_push]("dataset_chunks_push")
+        m.def_function[dataset_chunks_num_data]("dataset_chunks_num_data")
+        m.def_function[dataset_chunks_finish]("dataset_chunks_finish")
         m.def_function[dataset_create]("dataset_create")
         m.def_function[dataset_num_data]("dataset_num_data")
         m.def_function[dataset_num_feature]("dataset_num_feature")
