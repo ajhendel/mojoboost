@@ -83,14 +83,16 @@ from .bagging import BaggingParams, bagging_enabled, check_bagging, sample_rows
 from .binning import BinMapper, BinnedMatrix, fit_bins
 from .boosting import Booster, BoosterParams, _check_sample_weight
 from .model import Model
+from .objective_registry import LAMBDARANK as _LAMBDARANK
 from .tree import Tree, TreeParams, grow_tree
 
-# Objective code for a LambdaRank booster. Codes 0..5 are boosting.mojo's
-# built-in objectives and 6 is CUSTOM; this continues that one registry, and
-# a serialized ranker is an ordinary single-output model that carries it.
-# Ranker predictions are raw scores: `Booster.predict_row` has no link
-# function for this code, and only the order of the scores is meaningful.
-comptime LAMBDARANK = 7
+# Objective code for a LambdaRank booster, defined once in
+# objective_registry.mojo with the other codes and bound here under the name
+# this module's callers have always imported. A serialized ranker is an
+# ordinary single-output model that carries it. Ranker predictions are raw
+# scores: `Booster.predict_row` has no link function for this code, and only
+# the order of the scores is meaningful.
+comptime LAMBDARANK = _LAMBDARANK
 
 # The largest relevance label, the range of LightGBM's default label_gain.
 comptime MAX_RELEVANCE_LABEL = 30
