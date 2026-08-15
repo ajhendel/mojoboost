@@ -1312,8 +1312,11 @@ struct GpuActiveRows(Movable):
         self.verify_counts = _env_int("MOJOBOOST_GPU_VERIFY_ROWS", 0) != 0
         # One feature per threadgroup unless asked otherwise. The paired
         # kernel produces the identical histogram, so this is a launch-shape
-        # knob and nothing else; it stays at 1 until a measurement on the
-        # device in question says otherwise.
+        # knob and nothing else. This constructor cannot see which API the
+        # context speaks, so the measured per-device default lives in the
+        # caller: GpuHistogramBuilder raises this to 2 on Metal when the
+        # environment does not choose, and leaves other backends at 1 until
+        # someone measures them.
         var group = _env_int("MOJOBOOST_GPU_FEATURE_GROUP", 1)
         if group < 1:
             group = 1

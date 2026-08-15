@@ -14,6 +14,7 @@ from std.os import setenv
 from std.sys import has_accelerator
 from std.testing import assert_equal, assert_true, TestSuite
 
+from mojoboost.apple_gpu_policy import API_METAL, parse_api
 from mojoboost.binning import bin_equal_width, BinnedMatrix
 from mojoboost.gpu_tiling import STRATEGY_ATOMIC, STRATEGY_TILED
 from mojoboost.histogram import (
@@ -80,6 +81,34 @@ def test_device_capabilities_are_usable() raises:
             <= builder.caps.max_threads_per_block
         )
         assert_true(builder.tiling.n_tiles >= 1)
+
+
+def test_metal_defaults_to_paired_histograms() raises:
+    """On Metal the builder raises the feature group to 2 on its own; an
+    explicit MOJOBOOST_GPU_FEATURE_GROUP wins in both directions. Pairing
+    produces bit-identical histograms (the active-rows tests pin that), so
+    the default is a launch-shape decision only, which is why this asserts
+    the knob and not a histogram."""
+    comptime if not has_accelerator():
+        print("skipped: no accelerator")
+    else:
+        var data = _make_data(1_000, 2, 16)
+
+        _ = setenv("MOJOBOOST_GPU_FEATURE_GROUP", "")
+        var default_builder = GpuHistogramBuilder(data)
+        if parse_api(default_builder.device_api) == API_METAL:
+            assert_equal(default_builder.rows.feature_group, 2)
+        else:
+            assert_equal(default_builder.rows.feature_group, 1)
+
+        _ = setenv("MOJOBOOST_GPU_FEATURE_GROUP", "1")
+        var forced_single = GpuHistogramBuilder(data)
+        assert_equal(forced_single.rows.feature_group, 1)
+
+        _ = setenv("MOJOBOOST_GPU_FEATURE_GROUP", "2")
+        var forced_paired = GpuHistogramBuilder(data)
+        assert_equal(forced_paired.rows.feature_group, 2)
+        _ = setenv("MOJOBOOST_GPU_FEATURE_GROUP", "")
 
 
 def test_strategies_agree_bit_exactly() raises:

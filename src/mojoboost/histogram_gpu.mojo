@@ -115,8 +115,10 @@ shipped. Nothing here defaults to a claim no benchmark has made.
 """
 
 from std.math import isfinite
+from std.os import getenv
 from max.gpu.host import DeviceBuffer, DeviceContext, HostBuffer
 
+from .apple_gpu_policy import API_METAL, parse_api
 from .apple_histogram_policy import (
     REASON_AS_REQUESTED,
     SPEC_LEVEL_BATCHED,
@@ -480,6 +482,19 @@ struct GpuHistogramBuilder(Movable):
         self.rows = GpuActiveRows(
             self.ctx, data.n_rows, data.n_features, data.n_bins, self.caps
         )
+        # Metal defaults to the paired histogram kernels: measured on an
+        # Apple M4 at 1.39x end to end for a 5M x 50 fit with byte-identical
+        # predictions (see _range_hist_partial_g2_kernel), and pairing
+        # changes no histogram it produces on any backend. An explicit
+        # MOJOBOOST_GPU_FEATURE_GROUP still wins in both directions, and
+        # CUDA/HIP/unknown keep one feature per threadgroup until someone
+        # measures them — the shared-memory doubling is exactly the kind of
+        # change that can invert on a different threadgroup budget.
+        if (
+            getenv("MOJOBOOST_GPU_FEATURE_GROUP") == ""
+            and parse_api(self.device_api) == API_METAL
+        ):
+            self.rows.set_feature_group(2)
         self.g_scale = 1.0
         self.h_scale = 1.0
         self.has_gradients = False
