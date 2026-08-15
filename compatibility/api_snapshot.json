@@ -1,0 +1,1545 @@
+{
+  "c_abi": {
+    "abi_version": 3,
+    "defines": {
+      "MOJOTREES_ABI_VERSION": 3,
+      "MOJOTREES_DEVICE_AUTO": 2,
+      "MOJOTREES_DEVICE_CPU": 0,
+      "MOJOTREES_DEVICE_GPU": 1,
+      "MOJOTREES_ERROR_INVALID_ARGUMENT": -1,
+      "MOJOTREES_ERROR_IO": -3,
+      "MOJOTREES_ERROR_TRAINING": -2,
+      "MOJOTREES_ERROR_UNSUPPORTED": -4,
+      "MOJOTREES_IMPORTANCE_GAIN": 1,
+      "MOJOTREES_IMPORTANCE_SPLIT": 0,
+      "MOJOTREES_OK": 0,
+      "MOJOTREES_PREDICT_RAW": 1,
+      "MOJOTREES_PREDICT_RESPONSE": 0
+    },
+    "functions": [
+      "MojoTreesError *mojotrees_error_create(void)",
+      "const char *mojotrees_error_message(const MojoTreesError *error)",
+      "int32_t mojotrees_abi_version(void)",
+      "int32_t mojotrees_feature_importance(const MojoTreesModel *model, int32_t importance_type, double *out_values, int64_t out_len, MojoTreesError *error)",
+      "int32_t mojotrees_gpu_available(void)",
+      "int32_t mojotrees_load_model(const char *path, MojoTreesModel **out_model, MojoTreesError *error)",
+      "int32_t mojotrees_model_dump_json(const MojoTreesModel *model, char **out_text, MojoTreesError *error)",
+      "int32_t mojotrees_model_num_classes(const MojoTreesModel *model, int64_t *out_value, MojoTreesError *error)",
+      "int32_t mojotrees_model_num_features(const MojoTreesModel *model, int64_t *out_value, MojoTreesError *error)",
+      "int32_t mojotrees_model_num_iterations(const MojoTreesModel *model, int64_t *out_value, MojoTreesError *error)",
+      "int32_t mojotrees_model_num_trees(const MojoTreesModel *model, int64_t *out_value, MojoTreesError *error)",
+      "int32_t mojotrees_parameter_keys(char **out_text, MojoTreesError *error)",
+      "int32_t mojotrees_predict(const MojoTreesModel *model, const double *data, int64_t n_rows, int64_t n_features, double *out_values, int64_t out_len, MojoTreesError *error)",
+      "int32_t mojotrees_predict_ex(const MojoTreesModel *model, const double *data, int64_t n_rows, int64_t n_features, int64_t start_iteration, int64_t num_iteration, int32_t flags, int32_t device, double *out_values, int64_t out_len, MojoTreesError *error)",
+      "int32_t mojotrees_predict_raw(const MojoTreesModel *model, const double *data, int64_t n_rows, int64_t n_features, double *out_values, int64_t out_len, MojoTreesError *error)",
+      "int32_t mojotrees_save_model(const MojoTreesModel *model, const char *path, MojoTreesError *error)",
+      "int32_t mojotrees_train_dense(const double *data, int64_t n_rows, int64_t n_features, const double *labels, const double *weights, const char *parameters, MojoTreesModel **out_model, MojoTreesError *error)",
+      "void mojotrees_error_free(MojoTreesError *error)",
+      "void mojotrees_library_version(int32_t *major, int32_t *minor, int32_t *patch)",
+      "void mojotrees_model_free(MojoTreesModel *model)",
+      "void mojotrees_string_free(char *text)"
+    ],
+    "header": "capi/mojotrees.h",
+    "opaque_types": [
+      "MojoTreesError",
+      "MojoTreesModel"
+    ]
+  },
+  "deprecations": {
+    "candidates": [
+      {
+        "gate_item": "C4",
+        "id": "best-score-scalar-or-dict",
+        "name": "_Base.best_score_"
+      },
+      {
+        "gate_item": "C5",
+        "id": "inspection-submodule-import-path",
+        "name": "mojotrees.inspection"
+      }
+    ],
+    "entries": []
+  },
+  "environment": {
+    "declared": [
+      "MOJOTREES_ABI_VERSION",
+      "MOJOTREES_AUTO_MIN_CELLS",
+      "MOJOTREES_DISABLE_GPU",
+      "MOJOTREES_GPU_BLOCK_THREADS",
+      "MOJOTREES_GPU_HIST_STRATEGY",
+      "MOJOTREES_GPU_ROW_TILE",
+      "MOJOTREES_NUM_WORKERS",
+      "MOJOTREES_PARALLEL_MIN_OPS"
+    ],
+    "observed": [
+      "MOJOTREES_AUTO_MIN_CELLS",
+      "MOJOTREES_BINNING_SELECT_MIN_ROWS",
+      "MOJOTREES_CPU_COMPACT_MIN_ROWS",
+      "MOJOTREES_CPU_CORE_POOL",
+      "MOJOTREES_CPU_FEATURE_GROUP",
+      "MOJOTREES_CPU_TASKS_PER_CORE",
+      "MOJOTREES_DASK_BACKEND",
+      "MOJOTREES_DISABLE_GPU",
+      "MOJOTREES_DISTRIBUTED_BASE_PORT",
+      "MOJOTREES_DISTRIBUTED_CONNECT_TIMEOUT",
+      "MOJOTREES_DISTRIBUTED_PROVIDER",
+      "MOJOTREES_DIST_JOB_ID",
+      "MOJOTREES_DIST_MACHINES",
+      "MOJOTREES_DIST_MODE",
+      "MOJOTREES_DIST_RANK",
+      "MOJOTREES_DIST_RESTART_EPOCH",
+      "MOJOTREES_DIST_TIMEOUT_S",
+      "MOJOTREES_DIST_WORLD_SIZE",
+      "MOJOTREES_GPU_BACKEND",
+      "MOJOTREES_GPU_BACKEND_UNVALIDATED",
+      "MOJOTREES_GPU_BATCH_SLOTS",
+      "MOJOTREES_GPU_BLOCK_THREADS",
+      "MOJOTREES_GPU_CLASS_BATCH",
+      "MOJOTREES_GPU_CLASS_BATCH_BYTES",
+      "MOJOTREES_GPU_FEATURE_GROUP",
+      "MOJOTREES_GPU_GRAD_LAYOUT",
+      "MOJOTREES_GPU_HIST_SPECIALIZATION",
+      "MOJOTREES_GPU_HIST_STRATEGY",
+      "MOJOTREES_GPU_OBJECTIVE",
+      "MOJOTREES_GPU_PHASE_TRACE",
+      "MOJOTREES_GPU_QUANTIZED_GRADS",
+      "MOJOTREES_GPU_ROW_TILE",
+      "MOJOTREES_GPU_SPLIT_RESIDENT",
+      "MOJOTREES_GPU_SPLIT_STRATEGY",
+      "MOJOTREES_GPU_STAGING_SLOTS",
+      "MOJOTREES_GPU_TRACE",
+      "MOJOTREES_GPU_TRANSFER",
+      "MOJOTREES_GPU_TRANSFER_UNPROVEN",
+      "MOJOTREES_GPU_VALID_SCORING",
+      "MOJOTREES_GPU_VERIFY_ROWS",
+      "MOJOTREES_GPU_WARMUP",
+      "MOJOTREES_HIST_CACHE_BYTES",
+      "MOJOTREES_HYBRID_COSTS",
+      "MOJOTREES_HYBRID_GUARD_TRANSFER",
+      "MOJOTREES_HYBRID_LEAVES",
+      "MOJOTREES_HYBRID_TRACE",
+      "MOJOTREES_MACOS_DEPLOYMENT_TARGET",
+      "MOJOTREES_NUM_WORKERS",
+      "MOJOTREES_PARALLEL_MIN_OPS",
+      "MOJOTREES_STARTUP_REPORT_FD",
+      "MOJOTREES_STARTUP_TRACE"
+    ],
+    "read_directly": [
+      "MOJOTREES_AUTO_MIN_CELLS",
+      "MOJOTREES_CPU_CORE_POOL",
+      "MOJOTREES_DASK_BACKEND",
+      "MOJOTREES_DISABLE_GPU",
+      "MOJOTREES_DIST_MACHINES",
+      "MOJOTREES_DIST_MODE",
+      "MOJOTREES_GPU_BACKEND",
+      "MOJOTREES_GPU_BACKEND_UNVALIDATED",
+      "MOJOTREES_GPU_FEATURE_GROUP",
+      "MOJOTREES_GPU_GRAD_LAYOUT",
+      "MOJOTREES_GPU_HIST_SPECIALIZATION",
+      "MOJOTREES_GPU_HIST_STRATEGY",
+      "MOJOTREES_GPU_OBJECTIVE",
+      "MOJOTREES_GPU_PHASE_TRACE",
+      "MOJOTREES_GPU_SPLIT_RESIDENT",
+      "MOJOTREES_GPU_SPLIT_STRATEGY",
+      "MOJOTREES_GPU_TRACE",
+      "MOJOTREES_GPU_TRANSFER",
+      "MOJOTREES_GPU_TRANSFER_UNPROVEN",
+      "MOJOTREES_GPU_VALID_SCORING",
+      "MOJOTREES_GPU_WARMUP",
+      "MOJOTREES_HYBRID_COSTS",
+      "MOJOTREES_HYBRID_GUARD_TRANSFER",
+      "MOJOTREES_HYBRID_LEAVES",
+      "MOJOTREES_HYBRID_TRACE",
+      "MOJOTREES_STARTUP_TRACE"
+    ],
+    "stale": [
+      "MOJOTREES_ABI_VERSION"
+    ],
+    "undeclared": [
+      "MOJOTREES_BINNING_SELECT_MIN_ROWS",
+      "MOJOTREES_CPU_COMPACT_MIN_ROWS",
+      "MOJOTREES_CPU_CORE_POOL",
+      "MOJOTREES_CPU_FEATURE_GROUP",
+      "MOJOTREES_CPU_TASKS_PER_CORE",
+      "MOJOTREES_DASK_BACKEND",
+      "MOJOTREES_DISTRIBUTED_BASE_PORT",
+      "MOJOTREES_DISTRIBUTED_CONNECT_TIMEOUT",
+      "MOJOTREES_DISTRIBUTED_PROVIDER",
+      "MOJOTREES_DIST_JOB_ID",
+      "MOJOTREES_DIST_MACHINES",
+      "MOJOTREES_DIST_MODE",
+      "MOJOTREES_DIST_RANK",
+      "MOJOTREES_DIST_RESTART_EPOCH",
+      "MOJOTREES_DIST_TIMEOUT_S",
+      "MOJOTREES_DIST_WORLD_SIZE",
+      "MOJOTREES_GPU_BACKEND",
+      "MOJOTREES_GPU_BACKEND_UNVALIDATED",
+      "MOJOTREES_GPU_BATCH_SLOTS",
+      "MOJOTREES_GPU_CLASS_BATCH",
+      "MOJOTREES_GPU_CLASS_BATCH_BYTES",
+      "MOJOTREES_GPU_FEATURE_GROUP",
+      "MOJOTREES_GPU_GRAD_LAYOUT",
+      "MOJOTREES_GPU_HIST_SPECIALIZATION",
+      "MOJOTREES_GPU_OBJECTIVE",
+      "MOJOTREES_GPU_PHASE_TRACE",
+      "MOJOTREES_GPU_QUANTIZED_GRADS",
+      "MOJOTREES_GPU_SPLIT_RESIDENT",
+      "MOJOTREES_GPU_SPLIT_STRATEGY",
+      "MOJOTREES_GPU_STAGING_SLOTS",
+      "MOJOTREES_GPU_TRACE",
+      "MOJOTREES_GPU_TRANSFER",
+      "MOJOTREES_GPU_TRANSFER_UNPROVEN",
+      "MOJOTREES_GPU_VALID_SCORING",
+      "MOJOTREES_GPU_VERIFY_ROWS",
+      "MOJOTREES_GPU_WARMUP",
+      "MOJOTREES_HIST_CACHE_BYTES",
+      "MOJOTREES_HYBRID_COSTS",
+      "MOJOTREES_HYBRID_GUARD_TRANSFER",
+      "MOJOTREES_HYBRID_LEAVES",
+      "MOJOTREES_HYBRID_TRACE",
+      "MOJOTREES_MACOS_DEPLOYMENT_TARGET",
+      "MOJOTREES_STARTUP_REPORT_FD",
+      "MOJOTREES_STARTUP_TRACE"
+    ]
+  },
+  "meta": {
+    "carried": [
+      "numerical_contracts",
+      "platforms.tiers"
+    ],
+    "generated_by": "tools/api_snapshot.py",
+    "library_version": "0.1.0a2",
+    "schema_version": 2,
+    "source_commit": null,
+    "status": "generated",
+    "tool_version": 1,
+    "underived": [
+      "mojo.objective_codes",
+      "python.callbacks.integral_slots"
+    ]
+  },
+  "mojo": {
+    "abi_promise": "none; Mojo has no stable ABI, so the guarantee is source compatibility only",
+    "export_count": 467,
+    "export_source": "src/mojotrees/__init__.mojo",
+    "exports_by_module": {
+      "apple_histogram_policy": [
+        "HistogramWorkload",
+        "SPEC_LEVEL_BASELINE",
+        "SPEC_LEVEL_BATCHED",
+        "batching_declined_reason",
+        "derive_histogram_plan",
+        "env_specialization_level"
+      ],
+      "bagging": [
+        "BaggingParams",
+        "DEFAULT_BAGGING_SEED",
+        "bagging_enabled",
+        "check_bagging",
+        "refresh_bag",
+        "sample_rows"
+      ],
+      "binning": [
+        "BinMapper",
+        "BinnedMatrix",
+        "bin_equal_width",
+        "fit_bins"
+      ],
+      "boosting": [
+        "BINARY_LOGISTIC",
+        "Booster",
+        "BoosterParams",
+        "CROSS_ENTROPY",
+        "CUSTOM",
+        "DEFAULT_FAIR_C",
+        "DEFAULT_TWEEDIE_VARIANCE_POWER",
+        "FAIR",
+        "GAMMA",
+        "HUBER",
+        "IterationRange",
+        "L1",
+        "MAPE",
+        "MulticlassBooster",
+        "POISSON",
+        "QUANTILE",
+        "SQUARED_ERROR",
+        "TWEEDIE",
+        "objective_renews_leaves",
+        "renewal_alpha",
+        "renewal_weights",
+        "train",
+        "train_more",
+        "train_multiclass",
+        "train_multiclass_more",
+        "train_multiclass_with_valid",
+        "train_with_valid"
+      ],
+      "boosting_sparse": [
+        "train_multiclass_sparse",
+        "train_sparse",
+        "train_sparse_with_valid"
+      ],
+      "categorical": [
+        "CAT_BITSET_WORDS",
+        "CategoricalParams",
+        "CategoricalSpec",
+        "cat_add",
+        "cat_contains",
+        "cat_empty",
+        "cat_pool_contains",
+        "find_best_categorical_split",
+        "fit_categorical_spec"
+      ],
+      "class_weight": [
+        "balanced_class_weights",
+        "balanced_sample_weight",
+        "binary_labels_to_codes",
+        "check_class_balance_params",
+        "check_class_weights",
+        "class_counts",
+        "class_weight_rows",
+        "scale_pos_weight_rows",
+        "unbalance_scale",
+        "unbalanced_sample_weight"
+      ],
+      "collective": [
+        "Collective",
+        "LocalCollective",
+        "STATUS_INVALID_PARAM",
+        "STATUS_INVALID_TARGET",
+        "STATUS_INVALID_WEIGHT",
+        "STATUS_LAYOUT_MISMATCH",
+        "STATUS_OK",
+        "STATUS_SHAPE_MISMATCH",
+        "STATUS_UNSUPPORTED",
+        "agree_equal_ints",
+        "agree_status",
+        "status_message"
+      ],
+      "contrib": [
+        "ContribExplainer",
+        "predict_contrib",
+        "predict_contrib_bins",
+        "predict_contrib_bins_multiclass",
+        "predict_contrib_multiclass",
+        "tree_expected_value"
+      ],
+      "custom_metric": [
+        "BuiltinMetricContext",
+        "CustomMetric",
+        "MetricFitResult",
+        "MetricFn",
+        "MetricHistory",
+        "MetricMulticlassFitResult",
+        "MetricMulticlassTrainResult",
+        "MetricSetFn",
+        "MetricSuite",
+        "MetricTrainResult",
+        "RawValidSet",
+        "ValidSet",
+        "builtin_metric_metadata",
+        "default_metric_codes",
+        "eval_builtin_metric",
+        "fit_multiclass_with_metrics",
+        "fit_ranker_with_metrics",
+        "fit_with_metrics",
+        "resolve_builtin_metrics",
+        "response_scale",
+        "train_custom_with_builtin_metrics",
+        "train_custom_with_metrics",
+        "train_multiclass_with_builtin_metrics",
+        "train_multiclass_with_metrics",
+        "train_ranker_with_builtin_metrics",
+        "train_ranker_with_metrics",
+        "train_with_builtin_metrics",
+        "train_with_metric",
+        "train_with_metrics"
+      ],
+      "device": [
+        "AUTO_DEVICE",
+        "CPU_DEVICE",
+        "GPU_DEVICE",
+        "device_name",
+        "gpu_available",
+        "parse_device",
+        "resolve_device"
+      ],
+      "distributed": [
+        "DataShard",
+        "allreduce_histogram",
+        "grow_tree_distributed",
+        "partition_rows",
+        "partition_values",
+        "train_distributed"
+      ],
+      "gain": [
+        "leaf_score"
+      ],
+      "goss": [
+        "GossParams",
+        "GossSelection",
+        "apply_goss_scaling",
+        "goss_importance",
+        "goss_round",
+        "goss_select"
+      ],
+      "gpu_binned_layout": [
+        "check_layout_support",
+        "layout_support"
+      ],
+      "gpu_frontier": [
+        "LeafWorkItem",
+        "subtraction_builds_left"
+      ],
+      "gpu_fused_round": [
+        "GpuTreeRouter",
+        "ROUND_OK",
+        "round_eligibility",
+        "round_eligibility_reason"
+      ],
+      "gpu_leaf_batching": [
+        "BatchPlan",
+        "GpuLeafBatcher",
+        "plan_batch",
+        "slots_for_budget"
+      ],
+      "gpu_multiclass_batch": [
+        "MulticlassRoundGuard"
+      ],
+      "gpu_predict": [
+        "GpuPredictor",
+        "flatten_booster",
+        "flatten_multiclass",
+        "flatten_trees",
+        "predict_gpu",
+        "predict_proba_gpu",
+        "predict_raw_gpu",
+        "predict_raw_multiclass_gpu",
+        "response_for_objective"
+      ],
+      "gpu_runtime": [
+        "GpuSession",
+        "HazardTracker",
+        "MatrixIdentity",
+        "NoLifecycle",
+        "PhaseCounters",
+        "PoolLedger",
+        "ResidencyLedger",
+        "RoundLifecycle",
+        "SessionLifecycle",
+        "StagingRing",
+        "audit_round",
+        "bins_fingerprint"
+      ],
+      "gpu_split_search": [
+        "GpuSplitParams",
+        "GpuSplitRecord",
+        "GpuSplitSearcher"
+      ],
+      "histogram": [
+        "Histogram",
+        "build_histogram",
+        "build_histogram_subset",
+        "build_histogram_subset_replica_into",
+        "subtract_histogram"
+      ],
+      "histogram_gpu": [
+        "BATCH_POOL_BUDGET_BYTES",
+        "DEFAULT_BATCH_SLOTS",
+        "GpuHistogramBuilder",
+        "MAX_BATCH_SLOTS",
+        "build_histogram_gpu",
+        "build_kernel_features",
+        "env_batch_slots"
+      ],
+      "histogram_sparse": [
+        "NodeTotals",
+        "SparseEntryOrder",
+        "SparseNodeEntries",
+        "build_histogram_sparse",
+        "build_histogram_sparse_node",
+        "build_histogram_sparse_subset"
+      ],
+      "hybrid_leaf_scheduler": [
+        "HybridContext",
+        "HybridCosts",
+        "LeafWork",
+        "Placement",
+        "REPLICA_REFUTED",
+        "REPLICA_UNTESTED",
+        "REPLICA_VERIFIED",
+        "SplitPlan",
+        "decline_name",
+        "decline_reason",
+        "env_hybrid_costs",
+        "env_hybrid_mode",
+        "place_leaf",
+        "plan_split"
+      ],
+      "importance": [
+        "gain_importance",
+        "split_importance"
+      ],
+      "initialization": [
+        "FitLatency",
+        "SessionState",
+        "StartupTrace",
+        "WarmupPlan",
+        "env_warmup_level",
+        "session_state_from_trace"
+      ],
+      "interaction": [
+        "InteractionConstraints",
+        "extend_branch"
+      ],
+      "levelwise_policy": [
+        "GROW_DEPTHWISE",
+        "GROW_LEAFWISE",
+        "grow_policy_name",
+        "parse_grow_policy"
+      ],
+      "metrics": [
+        "DEFAULT_BINARY_THRESHOLD",
+        "METRIC_AUC",
+        "METRIC_AVERAGE_PRECISION",
+        "METRIC_BINARY_ERROR",
+        "METRIC_BINARY_LOGLOSS",
+        "METRIC_CROSS_ENTROPY",
+        "METRIC_FAIR",
+        "METRIC_GAMMA",
+        "METRIC_GAMMA_DEVIANCE",
+        "METRIC_HUBER",
+        "METRIC_KLDIV",
+        "METRIC_L1",
+        "METRIC_L2",
+        "METRIC_MAP",
+        "METRIC_MAPE",
+        "METRIC_MULTI_ERROR",
+        "METRIC_MULTI_LOGLOSS",
+        "METRIC_NDCG",
+        "METRIC_POISSON",
+        "METRIC_QUANTILE",
+        "METRIC_RMSE",
+        "METRIC_TWEEDIE",
+        "N_BUILTIN_METRICS",
+        "average_precision",
+        "binary_accuracy",
+        "binary_auc",
+        "binary_error",
+        "binary_log_loss",
+        "check_metric_weight",
+        "cross_entropy_loss",
+        "eval_metric_by_code",
+        "fair_loss",
+        "gamma_deviance",
+        "gamma_loss",
+        "huber_loss",
+        "kullback_leibler",
+        "l1",
+        "l2",
+        "mape",
+        "multiclass_accuracy",
+        "multiclass_error",
+        "multiclass_log_loss",
+        "poisson_loss",
+        "quantile_loss",
+        "rmse",
+        "tweedie_loss"
+      ],
+      "model": [
+        "Model",
+        "MulticlassModel",
+        "fit",
+        "fit_custom",
+        "fit_multiclass"
+      ],
+      "model_sparse": [
+        "fit_csc",
+        "fit_multiclass_csc",
+        "predict_class_csr",
+        "predict_csr",
+        "predict_proba_csr",
+        "predict_raw_csr"
+      ],
+      "monotone": [
+        "MONOTONE_DECREASING",
+        "MONOTONE_FREE",
+        "MONOTONE_INCREASING",
+        "MonotoneConstraints",
+        "OutputBounds"
+      ],
+      "objective": [
+        "EvalLossFn",
+        "GradHessFn",
+        "apply_sample_weight",
+        "check_custom_base_score",
+        "check_custom_grad_hess",
+        "custom_objective_backends",
+        "matching_base_score",
+        "mean_label",
+        "squared_error_grad_hess",
+        "squared_error_loss",
+        "train_custom",
+        "train_custom_with_valid"
+      ],
+      "objective_registry": [
+        "CLASS_WEIGHT_BINARY",
+        "CLASS_WEIGHT_MULTICLASS",
+        "CLASS_WEIGHT_NONE",
+        "GRAD_BUILTIN",
+        "GRAD_CALLBACK",
+        "GRAD_LAMBDARANK",
+        "GRAD_SOFTMAX",
+        "INIT_CALLER",
+        "INIT_LABEL_PERCENTILE",
+        "INIT_LINK_MEAN",
+        "INIT_LOG_CLASS_PRIOR",
+        "INIT_ZERO",
+        "LINK_EXP",
+        "LINK_IDENTITY",
+        "LINK_SIGMOID",
+        "LINK_SOFTMAX",
+        "MetricSpec",
+        "NAME_SUPPORTED",
+        "NAME_UNIMPLEMENTED",
+        "NAME_UNKNOWN",
+        "NEEDS_CUTOFF",
+        "NEEDS_GROUPS",
+        "NEEDS_NOTHING",
+        "NEEDS_N_CLASSES",
+        "NEEDS_PARAM",
+        "ObjectiveSpec",
+        "PARAM_ALPHA",
+        "PARAM_FAIR_C",
+        "PARAM_NONE",
+        "PARAM_TWEEDIE_VARIANCE_POWER",
+        "ParamDomain",
+        "SUPPORTS_CPU",
+        "SUPPORTS_GPU",
+        "TASK_BINARY",
+        "TASK_MULTICLASS",
+        "TASK_RANKING",
+        "TASK_REGRESSION",
+        "TRANSFORM_OBJECTIVE_LINK",
+        "TRANSFORM_RAW",
+        "TRANSFORM_SOFTMAX",
+        "all_objective_codes",
+        "backend_name",
+        "check_objective_backend",
+        "check_objective_class_weight",
+        "check_objective_metric",
+        "check_objective_param",
+        "metric_alias_names",
+        "metric_canonical_name",
+        "metric_code_for_objective",
+        "metric_code_from_name",
+        "metric_codes_for_task",
+        "metric_higher_is_better",
+        "metric_is_builtin",
+        "metric_names_for_task",
+        "metric_needs",
+        "metric_scoring_param",
+        "metric_spec",
+        "metric_task",
+        "metric_transform",
+        "objective_alias_names",
+        "objective_backends",
+        "objective_canonical_name",
+        "objective_class_weight_kind",
+        "objective_code_from_name",
+        "objective_default_metric",
+        "objective_default_param",
+        "objective_grad_hess_source",
+        "objective_gradients_on_device",
+        "objective_has_default_metric",
+        "objective_init_kind",
+        "objective_is_builtin",
+        "objective_is_known",
+        "objective_is_multi_output",
+        "objective_link",
+        "objective_name_status",
+        "objective_needs_groups",
+        "objective_param",
+        "objective_param_domain",
+        "objective_param_name",
+        "objective_spec",
+        "objective_supports_metric",
+        "objective_supports_scale_pos_weight",
+        "objective_task",
+        "objective_unimplemented_canonical",
+        "objective_unimplemented_reason",
+        "task_from_name",
+        "task_name",
+        "unimplemented_objective_alias_names"
+      ],
+      "params": [
+        "MULTICLASS",
+        "SUPPORTED_KEYS",
+        "TrainConfig",
+        "objective_default_alpha",
+        "objective_display_name",
+        "objective_from_name",
+        "params_names_mojo_api_only",
+        "parse_params"
+      ],
+      "ranking": [
+        "DEFAULT_NDCG_EVAL_AT",
+        "DEFAULT_SIGMOID",
+        "DEFAULT_TRUNCATION_LEVEL",
+        "LAMBDARANK",
+        "MAX_RELEVANCE_LABEL",
+        "RankGroups",
+        "RankerParams",
+        "check_groups",
+        "check_labels",
+        "check_ranker_params",
+        "fit_ranker",
+        "groups_from_counts",
+        "groups_from_query_ids",
+        "label_gain",
+        "lambdarank_gradients",
+        "map_at_cutoffs",
+        "max_dcg",
+        "mean_average_precision",
+        "ndcg",
+        "ndcg_at_cutoffs",
+        "train_ranker",
+        "train_ranker_with_valid"
+      ],
+      "raw_data": [
+        "RawData"
+      ],
+      "sampling": [
+        "DEFAULT_FEATURE_FRACTION_SEED",
+        "check_feature_fraction",
+        "check_feature_fractions",
+        "sample_without_replacement",
+        "select_node_features",
+        "select_tree_features",
+        "selection_count"
+      ],
+      "serialize": [
+        "file_kind",
+        "load_dataset",
+        "load_feature_names",
+        "load_model",
+        "load_multiclass_model",
+        "model_file_kind",
+        "save_dataset",
+        "save_model",
+        "save_multiclass_model"
+      ],
+      "sparse": [
+        "CscMatrix",
+        "CsrMatrix",
+        "SparseBinnedMatrix",
+        "SparseBinnedRows",
+        "csc_from_dense",
+        "default_bins",
+        "fit_bins_csc",
+        "transform_csc"
+      ],
+      "split": [
+        "SplitInfo",
+        "find_best_split",
+        "soft_threshold_l1"
+      ],
+      "train_gpu": [
+        "OBJECTIVE_SOURCE_AUTO",
+        "OBJECTIVE_SOURCE_DEVICE",
+        "OBJECTIVE_SOURCE_HOST",
+        "SPLIT_SEARCH_AUTO",
+        "SPLIT_SEARCH_DEVICE",
+        "SPLIT_SEARCH_HOST",
+        "VALID_SCORE_AUTO",
+        "VALID_SCORE_DEVICE",
+        "VALID_SCORE_HOST",
+        "device_gradients",
+        "device_loss_metric",
+        "grow_tree_gpu",
+        "resolve_objective_source",
+        "resolve_split_search",
+        "resolve_valid_scoring",
+        "train_custom_gpu",
+        "train_gpu",
+        "train_gpu_with_valid",
+        "train_multiclass_gpu"
+      ],
+      "trainset": [
+        "Dataset",
+        "train_dataset",
+        "train_dataset_multiclass",
+        "train_dataset_ranker",
+        "update_dataset",
+        "update_dataset_multiclass"
+      ],
+      "tree": [
+        "Tree",
+        "TreeParams",
+        "grow_tree",
+        "node_bounds"
+      ],
+      "tree_sparse": [
+        "SparseTreeResult",
+        "grow_tree_sparse",
+        "predict_row_sparse"
+      ]
+    },
+    "objective_codes": {},
+    "package": "mojotrees"
+  },
+  "numerical_contracts": [
+    "pred_contrib rows sum to the raw score exactly",
+    "predict(num_iteration=k) equals a k-round fit; [0,k) plus [k,n) equals the whole raw score",
+    "save and load round trips bit-exactly",
+    "all-ones sample_weight equals no sample_weight, bit-identically",
+    "no callbacks means no boundary crossing and a bit-identical model",
+    "a sparse fit equals the dense fit with gaps filled with zeros",
+    "a repeat run on the same device is bit-identical",
+    "worker count does not change a CPU result",
+    "CPU and GPU agree within a Float32 tolerance with exact integer counts, and are not bit-identical to each other"
+  ],
+  "parameter_string": {
+    "parser": "src/mojotrees/params.mojo parse_params",
+    "supported_keys": [
+      "objective",
+      "num_class",
+      "num_iterations",
+      "learning_rate",
+      "num_leaves",
+      "min_data_in_leaf",
+      "min_sum_hessian_in_leaf",
+      "lambda_l1",
+      "lambda_l2",
+      "max_depth",
+      "grow_policy",
+      "feature_fraction",
+      "feature_fraction_bynode",
+      "feature_fraction_bylevel",
+      "feature_fraction_seed",
+      "min_gain_to_split",
+      "max_delta_step",
+      "path_smooth",
+      "extra_trees",
+      "extra_seed",
+      "monotone_penalty",
+      "monotone_constraints_method",
+      "cegb_tradeoff",
+      "cegb_penalty_split",
+      "enable_bundle",
+      "max_conflict_rate",
+      "data_sample_strategy",
+      "max_bin",
+      "alpha",
+      "fair_c",
+      "tweedie_variance_power",
+      "device",
+      "use_missing"
+    ],
+    "used_by": [
+      "capi",
+      "cli"
+    ]
+  },
+  "platforms": {
+    "ci_runners": [
+      "ubuntu-24.04-arm",
+      "ubuntu-latest"
+    ],
+    "declared": [
+      "linux-64",
+      "linux-aarch64",
+      "osx-arm64"
+    ],
+    "tiers": {
+      "amd-gpu-hip": 3,
+      "apple-gpu-metal": 2,
+      "linux-64 CPU": 1,
+      "linux-aarch64 CPU": 1,
+      "nvidia-gpu-cuda": 3,
+      "osx-arm64 CPU": 2
+    }
+  },
+  "python": {
+    "all": [
+      "Booster",
+      "Dataset",
+      "train",
+      "cv",
+      "CVBooster",
+      "MojoTreesRegressor",
+      "MojoTreesClassifier",
+      "MojoTreesRanker",
+      "NotFittedError",
+      "build_info",
+      "gpu_available",
+      "show_versions",
+      "explain_device_choice",
+      "group_from_query_ids",
+      "ndcg_score",
+      "CallbackEnv",
+      "EarlyStopException",
+      "callback",
+      "early_stopping",
+      "log_evaluation",
+      "record_evaluation",
+      "reset_parameter",
+      "dump_model",
+      "trees_to_dataframe",
+      "trees_to_records",
+      "get_split_value_histogram"
+    ],
+    "callbacks": {
+      "all": [
+        "CallbackEnv",
+        "EarlyStopException",
+        "RESETTABLE",
+        "TrainingHandle",
+        "early_stopping",
+        "log_evaluation",
+        "record_evaluation",
+        "reset_parameter"
+      ],
+      "env_fields": [
+        "model",
+        "params",
+        "iteration",
+        "begin_iteration",
+        "end_iteration",
+        "evaluation_result_list"
+      ],
+      "factories": {
+        "canonical_reset_key": {
+          "key": "required"
+        },
+        "early_stopping": {
+          "first_metric_only": false,
+          "min_delta": 0.0,
+          "stopping_rounds": "required",
+          "verbose": true
+        },
+        "log_evaluation": {
+          "period": 1,
+          "show_stdv": true
+        },
+        "record_evaluation": {
+          "eval_result": "required"
+        },
+        "reset_parameter": {
+          "**kwargs": "varkw"
+        },
+        "resolve_early_stopping": {
+          "callbacks": "required",
+          "early_stopping_rounds": "required",
+          "min_delta": "required"
+        }
+      },
+      "integral_slots": [],
+      "module": "mojotrees.callback",
+      "reset_aliases": {
+        "colsample_bynode": "feature_fraction_bynode",
+        "colsample_bytree": "feature_fraction",
+        "eta": "learning_rate",
+        "min_child_hess": "min_sum_hessian_in_leaf",
+        "min_child_samples": "min_data_in_leaf",
+        "min_child_weight": "min_sum_hessian_in_leaf",
+        "min_sum_hessian": "min_sum_hessian_in_leaf",
+        "reg_alpha": "lambda_l1",
+        "reg_lambda": "lambda_l2",
+        "shrinkage_rate": "learning_rate",
+        "sub_feature": "feature_fraction"
+      },
+      "reset_slot_order": [
+        "learning_rate",
+        "num_leaves",
+        "max_depth",
+        "min_data_in_leaf",
+        "min_sum_hessian_in_leaf",
+        "lambda_l1",
+        "lambda_l2",
+        "feature_fraction",
+        "feature_fraction_bynode"
+      ],
+      "reset_slots": 9,
+      "resettable": [
+        "learning_rate",
+        "num_leaves",
+        "max_depth",
+        "min_data_in_leaf",
+        "min_sum_hessian_in_leaf",
+        "lambda_l1",
+        "lambda_l2",
+        "feature_fraction",
+        "feature_fraction_bynode"
+      ]
+    },
+    "estimators": {
+      "MojoTreesClassifier": {
+        "bases": [
+          "_Base"
+        ],
+        "classmethods": [
+          "load"
+        ],
+        "methods": {
+          "__sklearn_tags__": {},
+          "fit": {
+            "X": "required",
+            "callbacks": null,
+            "early_stopping_rounds": 0,
+            "eval_X": null,
+            "eval_metric": null,
+            "eval_names": null,
+            "eval_sample_weight": null,
+            "eval_set": null,
+            "eval_y": null,
+            "min_delta": 0.0,
+            "primary_metric": 0,
+            "sample_weight": null,
+            "y": "required"
+          },
+          "load": {
+            "cls": "required",
+            "path": "required"
+          },
+          "predict": {
+            "X": "required",
+            "device": null,
+            "num_iteration": null,
+            "pred_contrib": false,
+            "pred_leaf": false,
+            "raw_score": false,
+            "start_iteration": 0,
+            "validate_features": false
+          },
+          "predict_proba": {
+            "X": "required",
+            "device": null,
+            "num_iteration": null,
+            "pred_contrib": false,
+            "pred_leaf": false,
+            "raw_score": false,
+            "start_iteration": 0,
+            "validate_features": false
+          },
+          "save": {
+            "path": "required"
+          },
+          "score": {
+            "X": "required",
+            "sample_weight": null,
+            "y": "required"
+          }
+        },
+        "objective_names": [],
+        "own_parameters": {
+          "**kwargs": "varkw",
+          "class_weight": null,
+          "objective": null
+        },
+        "properties": []
+      },
+      "MojoTreesRanker": {
+        "bases": [
+          "_Base"
+        ],
+        "classmethods": [
+          "load"
+        ],
+        "methods": {
+          "fit": {
+            "X": "required",
+            "callbacks": null,
+            "early_stopping_rounds": 0,
+            "eval_X": null,
+            "eval_group": null,
+            "eval_metric": null,
+            "eval_names": null,
+            "eval_sample_weight": null,
+            "eval_set": null,
+            "eval_y": null,
+            "group": null,
+            "min_delta": 0.0,
+            "primary_metric": 0,
+            "sample_weight": null,
+            "y": "required"
+          },
+          "load": {
+            "cls": "required",
+            "path": "required"
+          },
+          "predict": {
+            "X": "required",
+            "device": null,
+            "num_iteration": null,
+            "pred_contrib": false,
+            "pred_leaf": false,
+            "raw_score": false,
+            "start_iteration": 0,
+            "validate_features": false
+          },
+          "save": {
+            "path": "required"
+          },
+          "score": {
+            "X": "required",
+            "group": null,
+            "sample_weight": null,
+            "y": "required"
+          }
+        },
+        "objective_names": [],
+        "own_parameters": {
+          "**kwargs": "varkw",
+          "lambdarank_norm": true,
+          "lambdarank_truncation_level": 30,
+          "ndcg_eval_at": 5,
+          "sigmoid": 1.0
+        },
+        "properties": []
+      },
+      "MojoTreesRegressor": {
+        "bases": [
+          "_Base"
+        ],
+        "classmethods": [
+          "load"
+        ],
+        "methods": {
+          "__sklearn_tags__": {},
+          "fit": {
+            "X": "required",
+            "callbacks": null,
+            "early_stopping_rounds": 0,
+            "eval_X": null,
+            "eval_metric": null,
+            "eval_names": null,
+            "eval_sample_weight": null,
+            "eval_set": null,
+            "eval_y": null,
+            "min_delta": 0.0,
+            "primary_metric": 0,
+            "sample_weight": null,
+            "y": "required"
+          },
+          "load": {
+            "cls": "required",
+            "path": "required"
+          },
+          "predict": {
+            "X": "required",
+            "device": null,
+            "num_iteration": null,
+            "pred_contrib": false,
+            "pred_leaf": false,
+            "raw_score": false,
+            "start_iteration": 0,
+            "validate_features": false
+          },
+          "save": {
+            "path": "required"
+          },
+          "score": {
+            "X": "required",
+            "sample_weight": null,
+            "y": "required"
+          }
+        },
+        "objective_names": [],
+        "own_parameters": {
+          "**kwargs": "varkw",
+          "alpha": 0.9,
+          "base_score": 0.0,
+          "fair_c": 1.0,
+          "objective": "regression",
+          "tweedie_variance_power": 1.5
+        },
+        "properties": []
+      }
+    },
+    "eval_metric_names": {
+      "aliases": {
+        "binary": "binary_logloss",
+        "gamma_dev": "gamma_deviance",
+        "kldiv": "kullback_leibler",
+        "l2_root": "rmse",
+        "lambdarank": "ndcg",
+        "mae": "l1",
+        "mean_absolute_error": "l1",
+        "mean_absolute_percentage_error": "mape",
+        "mean_average_precision": "map",
+        "mean_squared_error": "l2",
+        "mse": "l2",
+        "multiclass": "multi_logloss",
+        "regression": "l2",
+        "regression_l1": "l1",
+        "regression_l2": "l2",
+        "root_mean_squared_error": "rmse",
+        "softmax": "multi_logloss",
+        "xentropy": "cross_entropy"
+      },
+      "metrics": [
+        "l2",
+        "rmse",
+        "l1",
+        "quantile",
+        "huber",
+        "mape",
+        "fair",
+        "poisson",
+        "gamma",
+        "gamma_deviance",
+        "tweedie",
+        "cross_entropy",
+        "kullback_leibler",
+        "binary_logloss",
+        "binary_error",
+        "auc",
+        "average_precision",
+        "multi_logloss",
+        "multi_error",
+        "ndcg",
+        "map"
+      ],
+      "source": "python/mojotrees/_eval.py"
+    },
+    "fitted_attributes": [
+      "n_features_in_",
+      "feature_names_in_",
+      "device_",
+      "classes_",
+      "n_classes_",
+      "best_iteration_",
+      "evals_result_",
+      "best_score_",
+      "stopped_early_",
+      "n_iter_",
+      "categorical_feature_"
+    ],
+    "functional_api": {
+      "Booster": {
+        "classmethods": [
+          "model_from_string"
+        ],
+        "methods": {
+          "__getstate__": {},
+          "__repr__": {},
+          "__setstate__": {
+            "state": "required"
+          },
+          "add_valid": {
+            "data": "required",
+            "name": "required"
+          },
+          "current_iteration": {},
+          "dump_model": {
+            "feature_names": null
+          },
+          "eval": {
+            "data": "required",
+            "metric": null,
+            "name": "required"
+          },
+          "eval_train": {
+            "metric": null
+          },
+          "eval_valid": {
+            "metric": null
+          },
+          "feature_importance": {
+            "importance_type": "split"
+          },
+          "feature_name": {},
+          "get_split_value_histogram": {
+            "as_frame": false,
+            "bins": null,
+            "feature": "required"
+          },
+          "model_from_string": {
+            "cls": "required",
+            "model_str": "required"
+          },
+          "model_to_string": {},
+          "num_feature": {},
+          "num_model_per_iteration": {},
+          "num_trees": {},
+          "predict": {
+            "data": "required",
+            "num_iteration": null,
+            "raw_score": false,
+            "start_iteration": 0
+          },
+          "save_model": {
+            "filename": "required"
+          },
+          "trees_to_dataframe": {},
+          "trees_to_records": {},
+          "update": {
+            "num_iteration": 1
+          }
+        },
+        "properties": []
+      },
+      "Dataset": {
+        "classmethods": [
+          "load_binned"
+        ],
+        "methods": {
+          "__repr__": {},
+          "construct": {},
+          "get_data": {},
+          "get_field": {
+            "field_name": "required"
+          },
+          "get_group": {},
+          "get_init_score": {},
+          "get_label": {},
+          "get_weight": {},
+          "load_binned": {
+            "cls": "required",
+            "path": "required"
+          },
+          "metadata": {},
+          "nnz": {},
+          "num_bin": {},
+          "num_data": {},
+          "num_feature": {},
+          "save_binned": {
+            "path": "required"
+          },
+          "subset": {
+            "rows": "required",
+            "shared_binning": false
+          }
+        },
+        "properties": [
+          "categorical_feature",
+          "feature_name",
+          "is_sparse"
+        ]
+      },
+      "all": [
+        "Booster",
+        "Dataset",
+        "train"
+      ],
+      "module": "mojotrees.basic",
+      "train": {
+        "callbacks": null,
+        "feval": null,
+        "init_model": null,
+        "num_boost_round": null,
+        "params": "required",
+        "train_set": "required",
+        "valid_names": null,
+        "valid_sets": null
+      }
+    },
+    "inspection": {
+      "all": [
+        "DUMP_FORMAT_VERSION",
+        "SUPPORTED_MODEL_FORMAT_VERSIONS",
+        "MODEL_EDITING_SUPPORTED",
+        "OBJECTIVE_NAMES",
+        "dump_model",
+        "parse_model_string",
+        "trees_to_records",
+        "trees_to_dataframe",
+        "split_values",
+        "get_split_value_histogram",
+        "feature_importance",
+        "leaf_outputs",
+        "model_editing_support",
+        "leaf_index_of",
+        "raw_scores",
+        "booster_of",
+        "feature_name_of",
+        "n_features_of",
+        "n_iter_of",
+        "objective_of",
+        "best_score_of"
+      ],
+      "dump_format_version": 1,
+      "module": "mojotrees.inspection",
+      "objective_names": {
+        "0": "regression",
+        "1": "binary",
+        "10": "mape",
+        "11": "fair",
+        "12": "cross_entropy",
+        "2": "poisson",
+        "3": "huber",
+        "4": "quantile",
+        "5": "regression_l1",
+        "6": "custom",
+        "7": "lambdarank",
+        "8": "gamma",
+        "9": "tweedie"
+      },
+      "supported_model_format_versions": [
+        1,
+        2,
+        3,
+        4
+      ]
+    },
+    "lazy_attributes": {
+      "dump_model": "inspection",
+      "explain_device_choice": "device_selection",
+      "get_split_value_histogram": "inspection",
+      "trees_to_dataframe": "inspection",
+      "trees_to_records": "inspection"
+    },
+    "lazy_submodules": [
+      "dask",
+      "device_selection",
+      "diagnostics",
+      "inspection"
+    ],
+    "module": "mojotrees",
+    "parameter_aliases": {
+      "categorical_features": {
+        "canonical": "categorical_feature",
+        "fallback_default": "auto",
+        "sites": 1
+      },
+      "device_type": {
+        "canonical": "device",
+        "fallback_default": "cpu",
+        "sites": 1
+      },
+      "min_child_samples": {
+        "canonical": "min_data_in_leaf",
+        "fallback_default": 20,
+        "sites": 2
+      },
+      "min_child_weight": {
+        "canonical": "min_child_hess",
+        "fallback_default": 0.001,
+        "sites": 2
+      },
+      "min_split_gain": {
+        "canonical": "min_gain_to_split",
+        "fallback_default": 0.0,
+        "sites": 1
+      },
+      "monotone_constraints_penalty": {
+        "canonical": "monotone_penalty",
+        "fallback_default": 0.0,
+        "sites": 1
+      },
+      "reg_alpha": {
+        "canonical": "lambda_l1",
+        "fallback_default": 0.0,
+        "sites": 2
+      },
+      "reg_lambda": {
+        "canonical": "lambda_l2",
+        "fallback_default": 1.0,
+        "sites": 2
+      },
+      "subsample": {
+        "canonical": "bagging_fraction",
+        "fallback_default": 1.0,
+        "sites": 1
+      },
+      "subsample_freq": {
+        "canonical": "bagging_freq",
+        "fallback_default": 0,
+        "sites": 1
+      }
+    },
+    "shared_estimator_parameters": {
+      "bagging_fraction": 1.0,
+      "bagging_freq": 0,
+      "bagging_seed": 3,
+      "boosting": "gbdt",
+      "boosting_type": null,
+      "bundle_missing": false,
+      "cat_l2": 10.0,
+      "cat_smooth": 10.0,
+      "categorical_feature": "auto",
+      "categorical_features": null,
+      "cegb_penalty_split": 0.0,
+      "cegb_tradeoff": 1.0,
+      "device": "cpu",
+      "device_type": null,
+      "enable_bundle": false,
+      "extra_seed": 6,
+      "extra_trees": false,
+      "feature_contri": null,
+      "feature_fraction": 1.0,
+      "feature_fraction_bynode": 1.0,
+      "feature_fraction_seed": 2,
+      "forced_splits": null,
+      "goss_seed": 3,
+      "goss_warmup_rounds": -1,
+      "grow_policy": "leafwise",
+      "importance_type": "split",
+      "interaction_constraints": null,
+      "lambda_l1": 0.0,
+      "lambda_l2": 1.0,
+      "learning_rate": 0.1,
+      "max_bin": 255,
+      "max_bundle_bins": 256,
+      "max_bundle_size": 0,
+      "max_cat_threshold": 32,
+      "max_cat_to_onehot": 4,
+      "max_conflict_rate": 0.0,
+      "max_delta_step": 0.0,
+      "max_depth": -1,
+      "max_nondefault_rate": 0.95,
+      "min_child_hess": 0.001,
+      "min_child_samples": null,
+      "min_child_weight": null,
+      "min_data_in_leaf": 20,
+      "min_data_per_group": 100,
+      "min_gain_to_split": 0.0,
+      "min_reduction": 0.0,
+      "min_split_gain": null,
+      "monotone_constraints": null,
+      "monotone_constraints_method": "basic",
+      "monotone_constraints_penalty": null,
+      "monotone_penalty": 0.0,
+      "n_estimators": 100,
+      "num_leaves": 31,
+      "other_rate": 0.1,
+      "path_smooth": 0.0,
+      "reg_alpha": null,
+      "reg_lambda": null,
+      "subsample": null,
+      "subsample_freq": null,
+      "top_rate": 0.2,
+      "use_missing": true
+    }
+  },
+  "versions": {
+    "c_abi": 3,
+    "dump_format": 1,
+    "library": "0.1.0a2",
+    "library_locations": {
+      "pixi.toml": "0.1.0a2",
+      "python/mojotrees/__init__.py": "0.1.0a2",
+      "python/pyproject.toml": "0.1.0a2"
+    },
+    "max_toolchain": ">=26.5.0,<27",
+    "model_format_dump_reports": 4,
+    "model_format_python_reads": [
+      1,
+      2,
+      3,
+      4
+    ],
+    "model_format_readable": [
+      1,
+      2,
+      3,
+      4
+    ],
+    "model_format_writer": 4,
+    "model_format_writer_token": "v4",
+    "mojo_toolchain": ">=1.0.0,<2",
+    "requires_python": ">=3.14",
+    "snapshot_schema": 2
+  }
+}
