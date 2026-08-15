@@ -80,3 +80,100 @@ policy and are currently promises without a runner.
 - `inspect_startup_artifacts.py` macOS system-path false positive (above).
 - `audit_integration` fold into `connectivity_audit` as a subcommand.
 - Test asserting `_public_api_plan.CURRENT_TOP_LEVEL == mojotrees.__all__`.
+
+# consolidation K1 - RNG authority (splitmix64)
+
+Session K1 of the consolidation round, 2026-08-15. Files touched: new
+`src/mojotrees/rng.mojo`; rewired `sampling.mojo`, `bagging.mojo`,
+`goss.mojo`, `quantized_gradient.mojo`, `tree_parameters_extra.mojo`. One
+commit per rewire (9c3e8be, 3575146, 5ef83ac, 04a7fdf, 2178a6f on main,
+not pushed). No `__init__.mojo`, docs, or off-limits files touched.
+
+## What was chosen
+
+`src/mojotrees/rng.mojo` is the single authority for the mixer and its
+constants: `splitmix64(state)`, `uniform(counter)`, `GOLDEN`,
+`TWO_POW_NEG_53`. Names are public (no leading underscore) because it is
+an authority meant to be imported; the old private names were what forced
+each module to keep "its own copy so it stays free of another module's
+private names" (the reason recorded in the quantized_gradient and
+tree_parameters_extra docstrings).
+
+Stream derivation (`_stream`, `quant_stream`, `extra_split_stream`, the
+per-depth stream in sampling) stays in each module. Those functions differ
+on purpose and are each sampler's reproducibility contract; only the mixer
+and the counter -> uniform helper were duplicated.
+
+## Copy diff before unifying
+
+The prompt asked for a stop if any of the four `_splitmix64` copies
+(bagging, sampling, goss, boosting_dart) differed. They do not differ in
+operations, constants, types, or order. The only difference is textual:
+sampling.mojo (and the `_mix64` copies in quantized_gradient and
+tree_parameters_extra) spell `0x9E3779B97F4A7C15` and
+`(1.0 / 9007199254740992.0)` inline, while bagging/goss/dart name them
+`_GOLDEN` / `_TWO_POW_NEG_53` with the same values. rng.mojo keeps the
+sampling.mojo body (inline golden literal in the mixer) and uses the named
+2^-53 constant in `uniform`, which is what bagging/goss/dart already did.
+Same value either way; 2^-53 is exact in Float64. Not treated as a
+stop-worthy difference; recorded here so the coordinator can disagree.
+
+`quant_uniform` in quantized_gradient was identical to `uniform` and now
+delegates to it (kept as a named function because the rounding code and
+its docstrings call it by that name). `extra_candidate_index` in
+tree_parameters_extra had the same expression inline and now calls
+`uniform(stream)`.
+
+## Verification
+
+- tests/test_feature_sampling.mojo: 17 passed (after sampling rewire)
+- tests/test_bagging.mojo: 23 passed (after bagging rewire)
+- tests/test_goss.mojo: 15 passed (after goss rewire)
+- quantized_gradient: no focused test under tests/ exercises quant_stream /
+  quant_uniform. A scratch probe (not committed) printed quant_stream and
+  quant_uniform values across seeds {0, 3, -7, 123456789}, rounds, classes,
+  and planes, plus extra_split_stream values, before any change to those
+  two modules; output was byte-identical after each rewire.
+- tests/parallel/test_tree_parameters_extra.mojo: 47 passed (after rewire)
+- connectivity_audit before/after: `_GOLDEN` went from 6 modules to 2
+  (boosting_dart, ranking_advanced, both off-limits to this lane);
+  `_TWO_POW_NEG_53` finding gone. Total findings 292 -> 276, though some of
+  that delta is device/device_policy movement from another lane, not K1.
+- pixi run check-parity: ok (parity doc cites sampling.mojo and
+  tree_parameters_extra.mojo by file, not by these symbols).
+
+## Deleted
+
+The private `_splitmix64` / `_mix64` / `_uniform` bodies and the `_GOLDEN`
+/ `_TWO_POW_NEG_53` constants in the five rewired modules. Every caller
+was traced to rng.mojo; no test referenced the private names.
+
+## Deferred / for the coordinator (wave-2 mop-up)
+
+- boosting_dart.mojo still defines `_GOLDEN`, `_TWO_POW_NEG_53`,
+  `_splitmix64`, `_uniform`, `_stream` (connect_17 lane). Rewire is
+  mechanical and identical to the goss.mojo commit 5ef83ac: import
+  `GOLDEN, splitmix64, uniform` from `.rng`, delete the three private
+  definitions and two constants, rename call sites.
+- boosting_rf.mojo: one RNG-related reference (grep hit); check whether it
+  imports from bagging or dart and follow the same rewire.
+- model_editing.mojo (4 hits) and ranking_advanced.mojo (7 hits, defines
+  `_GOLDEN`): both audit-unreachable orphans; rewire when their lanes land
+  or when their disposition is decided.
+- bagging.mojo, goss.mojo, and boosting_dart.mojo have a byte-identical
+  `_stream(seed, index)` (`splitmix64(seed_bits ^ (index * GOLDEN))`).
+  It could move to rng.mojo as a shared `index_stream` after dart lands;
+  left alone this round because the prompt scoped rng.mojo to the mixer
+  and helpers, and each module's docstring presents the derivation as
+  its own contract.
+- Docstrings in tree_parameters_extra and quantized_gradient still cite
+  `sampling._stream` by name as the masking precedent; still accurate,
+  since sampling keeps `_stream`.
+- Export: rng.mojo needs no entry in `src/mojotrees/__init__.mojo`. Nothing
+  outside src/ imports it, and the bindings do not expose raw RNG. My
+  recommendation is NOT to export it: it is an internal authority, and
+  exporting `uniform` / `GOLDEN` at package level invites collisions with
+  std.random names. If C0 prefers every authority module listed, export
+  `splitmix64` only.
+- CLAUDE_CODE_CONSOLIDATION_PROMPTS.txt still says splitmix64 is defined
+  4x; after this lane it is 1x authority + 1 copy in boosting_dart.
