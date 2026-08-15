@@ -195,6 +195,7 @@ from .boosting import (
 )
 from .goss import GossParams, GossSelection, apply_goss_scaling, goss_round
 from .monotone import MonotoneConstraints
+from .objective_registry import LAMBDARANK as _LAMBDARANK
 from .sampling import (
     ClassBaggingParams,
     check_feature_fractions,
@@ -230,13 +231,10 @@ comptime RF_RANDOM_FEATURE_FRACTION = String("feature_fraction")
 # passed rather than leaving a bare `SQUARED_ERROR` in a multiclass call.
 comptime _NOT_BINARY = SQUARED_ERROR
 
-# `ranking.LAMBDARANK`, by value rather than by import. `ranking.mojo` imports
-# `model.mojo`, which imports the whole prediction and GPU stack, and the
-# handoff asks for `model.fit` to gain a boosting mode; importing ranking here
-# would close that loop the moment it does. `boosting._check_objective` also
-# refuses this code, so the only thing lost if the two ever disagree is the
-# better of two error messages.
-comptime _LAMBDARANK = 7
+# `_LAMBDARANK` is imported from objective_registry.mojo, which defines the
+# code once and imports only metrics.mojo, so this does not pull ranking.mojo
+# (and through it model.mojo and the GPU stack) into this module. It used to
+# be mirrored here by value for that reason.
 
 
 def is_rf_boosting(value: String) -> Bool:
