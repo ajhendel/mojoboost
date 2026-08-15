@@ -742,6 +742,35 @@ They are the places where "wrong tomorrow" is cheapest.
 
 Measured, on Mojo 1.0.0 build `ed45d567` on an Apple M4:
 
+- **that contraction is load-bearing across the whole package, not only at the
+  two sites this round patched.** `tests/test_golden_bits.mojo`, whose values
+  were generated at the default `contract=fast`, fails **all six fixtures**
+  when the identical source is run with `--fp-mode contract=off`. The command
+  is one line and it is the cheapest diagnostic in this document:
+
+      pixi run mojo run --fp-mode contract=off -I build -I tests tests/test_golden_bits.mojo
+
+  What moved, and it is worth reading the shape rather than only the count.
+  Three fixtures moved a final raw score by exactly one unit in the last
+  place, which is the direct and expected effect of one fused product per row
+  per round no longer being fused. Three moved a stored leaf value instead,
+  and by more: 93 units in the last place for the bagged fixture, and for the
+  plain regression and feature-fraction fixtures a value so small that the two
+  answers straddle zero and the unit-in-last-place distance is not meaningful.
+  Those two are near-zero leaf values, so a one-bit change upstream in an
+  accumulation is amplified by cancellation into a large relative change in a
+  quantity that is numerically nothing. That is not evidence of a defect; it
+  is evidence that a leaf value on an already-fit residual is noise, and it is
+  a reason to read this fixture's failures by array name before reacting to a
+  distance.
+
+  The consequence for section 1's promise is direct. Bit-determinism here is
+  contingent on the default floating-point mode as well as on the toolchain
+  version, and a build that sets `--fp-mode contract=off` is a different
+  numerical build of this library, not a differently optimized one. Section 8's
+  decision to stay at the default is therefore not a preference. Changing it
+  would move every model this library has ever fitted.
+
 - that `--fp-mode contract=fast|off` exists on `mojo build` and `mojo run`, is
   rejected for any other feature or value, and is absent from `mojo package` and
   `mojo precompile`;
