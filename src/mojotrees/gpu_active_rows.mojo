@@ -164,7 +164,11 @@ from .gpu_tiling import (
 from .parallel import _env_int
 from .split import SplitInfo
 
-# Row indices and leaf ids cross into the kernels as Int32.
+# Row indices and leaf ids cross into the kernels as Int32. This is the one
+# definition on the device path: histogram_gpu, gpu_multiclass_batch, and
+# gpu_predict import it from here (this module is below all three in the
+# import graph), and every "rows past what the kernels can index" gate is
+# the same number.
 comptime MAX_ROWS = Int(Int32.MAX)
 
 # The scan kernels keep one Int32 per thread in shared memory, so the block

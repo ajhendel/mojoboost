@@ -83,6 +83,7 @@ from .boosting import (
     MulticlassBooster,
 )
 from .categorical import CAT_BITSET_WORDS
+from .gpu_active_rows import MAX_ROWS
 from .device_policy import (
     BINS_UNSPECIFIED,
     BLOCK_BIN_LIMIT,
@@ -154,12 +155,12 @@ comptime RESPONSE_SOFTMAX = 3
 # themselves because metrics.mojo defines the error rates as one minus the
 # accuracy, and subtracting once on the host keeps the two definitions the
 # same expression.
-comptime METRIC_L2 = 0
-comptime METRIC_L1 = 1
-comptime METRIC_BINARY_LOG_LOSS = 2
-comptime METRIC_MULTICLASS_LOG_LOSS = 3
-comptime METRIC_BINARY_ACCURACY = 4
-comptime METRIC_MULTICLASS_ACCURACY = 5
+comptime DEVICE_METRIC_L2 = 0
+comptime DEVICE_METRIC_L1 = 1
+comptime DEVICE_METRIC_BINARY_LOG_LOSS = 2
+comptime DEVICE_METRIC_MULTICLASS_LOG_LOSS = 3
+comptime DEVICE_METRIC_BINARY_ACCURACY = 4
+comptime DEVICE_METRIC_MULTICLASS_ACCURACY = 5
 
 # Threads per threadgroup for the metric reduction. Fixed, and a power of
 # two, because the shared-memory tree reduction halves the active range and
@@ -167,8 +168,8 @@ comptime METRIC_MULTICLASS_ACCURACY = 5
 # supported backend.
 comptime REDUCE_BLOCK = 256
 
-# Rows and node ids cross into the kernels as Int32.
-comptime MAX_ROWS = Int(Int32.MAX)
+# Rows and node ids cross into the kernels as Int32; the one definition is
+# gpu_active_rows.MAX_ROWS (imported above).
 
 # Probability floor for the device log losses. metrics.mojo clamps to 1e-15,
 # which Float32 cannot hold away from 1.0: `1 - 1e-15` rounds to exactly 1
@@ -421,27 +422,27 @@ def _metric_kernel(
         var w = Float32(1.0)
         if has_weight != 0:
             w = weight[unsafe_offset=r][0]
-        if m == METRIC_L2:
+        if m == DEVICE_METRIC_L2:
             var d = resp[unsafe_offset = r * n_out][0] - y
             term = w * d * d
-        elif m == METRIC_L1:
+        elif m == DEVICE_METRIC_L1:
             term = w * abs(resp[unsafe_offset = r * n_out][0] - y)
-        elif m == METRIC_BINARY_LOG_LOSS:
+        elif m == DEVICE_METRIC_BINARY_LOG_LOSS:
             var p = _clamp32(resp[unsafe_offset = r * n_out][0])
             if y > Float32(0.5):
                 term = -w * log(p)
             else:
                 term = -w * log(Float32(1.0) - p)
-        elif m == METRIC_MULTICLASS_LOG_LOSS:
+        elif m == DEVICE_METRIC_MULTICLASS_LOG_LOSS:
             var c = Int(y)
             term = -w * log(_clamp32(resp[unsafe_offset = r * n_out + c][0]))
-        elif m == METRIC_BINARY_ACCURACY:
+        elif m == DEVICE_METRIC_BINARY_ACCURACY:
             var predicted = Float32(0.0)
             if resp[unsafe_offset = r * n_out][0] >= Float32(0.5):
                 predicted = Float32(1.0)
             if abs(predicted - y) < Float32(0.5):
                 term = w
-        elif m == METRIC_MULTICLASS_ACCURACY:
+        elif m == DEVICE_METRIC_MULTICLASS_ACCURACY:
             var argmax = 0
             for i in range(1, n_out):
                 if (
@@ -498,8 +499,11 @@ def response_for_objective(objective: Int) -> Int:
 
 # --- Host metric codes on the device ----------------------------------
 #
-# The METRIC_* codes above are this module's own, and nothing outside it
-# speaks them: a caller that already has a metric has metrics.mojo's code,
+# The DEVICE_METRIC_* codes above are this module's own reduction codes,
+# numbered for the kernel's dispatch and different from metrics.mojo's
+# METRIC_* values (the prefix is what keeps the two tables from being read
+# as one). Only `train_gpu.device_loss_metric` and the tests speak them
+# outside this module: a caller that already has a metric has metrics.mojo's code,
 # which is what `eval_metric` in the bindings, the metric suites, and the
 # registry all use. These three functions are the translation, so no caller
 # has to carry a second numbering, and they are the only place where the
@@ -516,17 +520,17 @@ def device_metric_code(metric: Int) -> Int:
     is what keeps their definition the one metrics.mojo ships.
     """
     if metric == HOST_METRIC_L2:
-        return METRIC_L2
+        return DEVICE_METRIC_L2
     if metric == HOST_METRIC_L1:
-        return METRIC_L1
+        return DEVICE_METRIC_L1
     if metric == HOST_METRIC_BINARY_LOGLOSS:
-        return METRIC_BINARY_LOG_LOSS
+        return DEVICE_METRIC_BINARY_LOG_LOSS
     if metric == HOST_METRIC_MULTI_LOGLOSS:
-        return METRIC_MULTICLASS_LOG_LOSS
+        return DEVICE_METRIC_MULTICLASS_LOG_LOSS
     if metric == HOST_METRIC_BINARY_ERROR:
-        return METRIC_BINARY_ACCURACY
+        return DEVICE_METRIC_BINARY_ACCURACY
     if metric == HOST_METRIC_MULTI_ERROR:
-        return METRIC_MULTICLASS_ACCURACY
+        return DEVICE_METRIC_MULTICLASS_ACCURACY
     return -1
 
 
@@ -1527,13 +1531,16 @@ struct GpuPredictor(Movable):
         """
         if self.valid_rows == 0:
             raise Error("call set_validation before validation_metric")
-        if metric < METRIC_L2 or metric > METRIC_MULTICLASS_ACCURACY:
+        if (
+            metric < DEVICE_METRIC_L2
+            or metric > DEVICE_METRIC_MULTICLASS_ACCURACY
+        ):
             raise Error("unknown metric code")
         if response < RESPONSE_IDENTITY or response > RESPONSE_SOFTMAX:
             raise Error("unknown response code")
         if (
-            metric == METRIC_MULTICLASS_LOG_LOSS
-            or metric == METRIC_MULTICLASS_ACCURACY
+            metric == DEVICE_METRIC_MULTICLASS_LOG_LOSS
+            or metric == DEVICE_METRIC_MULTICLASS_ACCURACY
         ) and self.n_outputs < 2:
             raise Error("multiclass metrics need at least two outputs")
 
@@ -1553,11 +1560,11 @@ struct GpuPredictor(Movable):
         mut self, metric: Int, response: Int
     ) raises -> Float64:
         """One minus an accuracy metric, LightGBM's `binary_error` and
-        `multi_error`. `metric` must be METRIC_BINARY_ACCURACY or
-        METRIC_MULTICLASS_ACCURACY."""
+        `multi_error`. `metric` must be DEVICE_METRIC_BINARY_ACCURACY or
+        DEVICE_METRIC_MULTICLASS_ACCURACY."""
         if (
-            metric != METRIC_BINARY_ACCURACY
-            and metric != METRIC_MULTICLASS_ACCURACY
+            metric != DEVICE_METRIC_BINARY_ACCURACY
+            and metric != DEVICE_METRIC_MULTICLASS_ACCURACY
         ):
             raise Error("validation_error takes an accuracy metric")
         return 1.0 - self.validation_metric(metric, response)

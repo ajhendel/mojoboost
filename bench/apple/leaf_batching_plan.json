@@ -56,7 +56,7 @@
       "kind": "feasibility",
       "claim": "Leaf-wise growth as shipped offers one leaf per commit, so batching is worth nothing until the grower changes.",
       "why_decisive": "It is the negative result this lane must not hide. Measuring it first stops every later number from being an answer to a question nobody has.",
-      "measurement": "Count leaves per histogram launch, per tree, under each of the four feeders named in gpu_frontier.leaves_per_launch.",
+      "measurement": "Count leaves per histogram launch, per tree, under each of the four feeders (host search, device search, speculative frontier, level-wise; the arithmetic is in gpu_leaf_batching.mojo's module docstring).",
       "refuted_if": "the shipped host-search grower is observed offering more than one leaf per commit"
     },
     {
@@ -64,7 +64,7 @@
       "kind": "correctness",
       "claim": "A speculative batch changes no tree. The committed split sequence, the node ids, and the fitted model are identical to the serial best-first ones.",
       "why_decisive": "Speculation is what makes batches wider than two possible under best-first growth, and it is only admissible if it is semantically invisible.",
-      "measurement": "Fit the same data with speculation depth 1, 2, 4, 8 and compare the serialized models byte for byte, plus SpeculationLedger hit rate and wasted-histogram counts.",
+      "measurement": "Fit the same data with speculation depth 1, 2, 4, 8 and compare the serialized models byte for byte, plus the speculation hit rate and wasted-histogram counts (a ledger the driver would carry; none exists yet).",
       "refuted_if": "any two depths produce different models"
     }
   ],

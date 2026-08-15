@@ -47,13 +47,13 @@ per-node feature draws come out identical.
 
 Speculation
 -----------
-`speculative_order` names the leaves a batch would cover if the current
-candidate ranking held all the way down. That ranking can be wrong: a child
-created by an early commit can outrank a leaf further down the list. The
-lemma above is what makes being wrong cheap rather than incorrect. Work done
-for a leaf that is not committed yet is not wasted, it is early, because that
-leaf's rows, histogram, and candidate are the same whenever it is committed.
-Two consequences worth stating plainly:
+A batch may cover leaves the serial order has not reached yet, on the
+prediction that the current candidate ranking holds all the way down. That
+ranking can be wrong: a child created by an early commit can outrank a leaf
+further down the list. The lemma above is what makes being wrong cheap
+rather than incorrect. Work done for a leaf that is not committed yet is not
+wasted, it is early, because that leaf's rows, histogram, and candidate are
+the same whenever it is committed. Two consequences worth stating plainly:
 
 - A speculative *partition* of a leaf that is not committed leaves the leaf's
   row *set* unchanged and only reorders rows inside its own range. Histograms
@@ -66,9 +66,14 @@ Two consequences worth stating plainly:
 - A speculative *histogram* stays valid until its leaf is split. It is
   wasted only if `num_leaves` runs out before the leaf is reached.
 
-`SpeculationLedger` counts what actually happened so a benchmark can report
-the miss rate rather than a claim about it. Nothing here decides how deep to
-speculate; that is a policy question a measurement answers.
+No speculative driver exists yet: an earlier draft of this module carried
+the ranking (`speculative_order`), the per-commit check against
+`select_best`, a hit/miss ledger, and a leaves-per-launch table for four
+hypothetical feeders, none of which any grower ever called, and the
+consolidation round removed them (K8 step 3). `search_is_order_free` stays
+because it states the one predicate a future driver would turn on. Nothing
+here decides how deep to speculate; that is a policy question a measurement
+answers, and the measurement is what would bring the driver back.
 
 What the frontier owns
 ----------------------
@@ -768,8 +773,9 @@ struct LeafFrontier(Movable):
         the front rather than by any ranking, so the batch a frontier offers
         is a function of the frontier alone and two runs of the same tree
         offer the same batch. A grower that wants the *best* leaves in a
-        bounded batch ranks them with `speculative_order` and passes that
-        list to `work_items` itself; this is the plain, order-free answer.
+        bounded batch ranks them itself (descending gain, ties by ascending
+        slot, the order repeated `select_best` calls would take) and passes
+        that list to `work_items`; this is the plain, order-free answer.
         """
         if max_items < 1:
             raise Error("a batch holds at least one item")
@@ -1022,183 +1028,3 @@ def search_is_order_free(feature_fraction_bynode: Float64) -> Bool:
     return feature_fraction_bynode >= 1.0
 
 
-def speculative_order(
-    frontier: LeafFrontier, max_commits: Int
-) raises -> List[Int]:
-    """The slots a batch would cover, in the order best-first would take them
-    if no child ever outranked a leaf already on the list.
-
-    Ready candidates sorted by descending gain, ties by ascending slot, which
-    is the order repeated `select_best` calls would produce if the frontier
-    never gained a leaf. Selection sort over a frontier of at most a few
-    hundred leaves, chosen so the tie rule is written out rather than
-    delegated to a comparator's stability.
-
-    The list is a prediction, not a decision. `verify_speculation` is what
-    turns each entry into a commit or a miss.
-    """
-    if max_commits < 0:
-        raise Error("speculation depth must be nonnegative")
-    var ranked = List[Int]()
-    var taken = List[Bool](capacity=frontier.size())
-    for _ in range(frontier.size()):
-        taken.append(False)
-    while len(ranked) < max_commits:
-        var best = -1
-        var best_gain = 0.0
-        for i in range(frontier.size()):
-            if taken[i]:
-                continue
-            if (
-                frontier.leaves[i].candidate.state == CAND_READY
-                and frontier.leaves[i].candidate.split.gain > best_gain
-            ):
-                best_gain = frontier.leaves[i].candidate.split.gain
-                best = i
-        if best < 0:
-            break
-        taken[best] = True
-        ranked.append(best)
-    return ranked^
-
-
-def verify_speculation(frontier: LeafFrontier, expected_slot: Int) -> Bool:
-    """Whether the next commit really is the slot speculation predicted.
-
-    The only honest check is the serial one: ask the frontier, as it stands
-    now, which leaf best-first would take, and compare. A batched grower
-    calls this before every commit in a speculative run and stops the run at
-    the first False, which is what keeps the committed sequence identical to
-    the serial one rather than merely close to it.
-    """
-    return frontier.select_best() == expected_slot
-
-
-struct SpeculationLedger(Copyable, Movable):
-    """What a speculative run actually did, for a benchmark to report.
-
-    `hits` and `misses` are commits that were and were not predicted.
-    `wasted_histograms` counts histograms built for leaves the tree never
-    split, which is the only genuinely lost work in a speculative run, and it
-    is only lost when `num_leaves` cuts growth short. `redundant_partitions`
-    counts partitions enqueued for a leaf already partitioned, which the
-    idempotence of the stable partition makes harmless and merely costly.
-    """
-
-    var batches: Int
-    var items: Int
-    var hits: Int
-    var misses: Int
-    var wasted_histograms: Int
-    var redundant_partitions: Int
-
-    def __init__(out self):
-        self.batches = 0
-        self.items = 0
-        self.hits = 0
-        self.misses = 0
-        self.wasted_histograms = 0
-        self.redundant_partitions = 0
-
-    def note_batch(mut self, n_items: Int):
-        self.batches += 1
-        self.items += n_items
-
-    def note_commit(mut self, predicted: Bool):
-        if predicted:
-            self.hits += 1
-        else:
-            self.misses += 1
-
-    def commits(self) -> Int:
-        return self.hits + self.misses
-
-    def items_per_batch(self) -> Float64:
-        if self.batches == 0:
-            return 0.0
-        return Float64(self.items) / Float64(self.batches)
-
-    def hit_rate(self) -> Float64:
-        var total = self.commits()
-        if total == 0:
-            return 0.0
-        return Float64(self.hits) / Float64(total)
-
-    def report(self) -> String:
-        var out = String("batches ") + String(self.batches) + "\n"
-        out += "items " + String(self.items) + "\n"
-        out += "items_per_batch " + String(self.items_per_batch()) + "\n"
-        out += "hits " + String(self.hits) + "\n"
-        out += "misses " + String(self.misses) + "\n"
-        out += "hit_rate " + String(self.hit_rate()) + "\n"
-        out += "wasted_histograms " + String(self.wasted_histograms) + "\n"
-        out += (
-            "redundant_partitions " + String(self.redundant_partitions) + "\n"
-        )
-        return out
-
-
-# --- How many leaves a grower can actually offer --------------------------
-#
-# The number below is the whole feasibility question for this lane, so it is
-# computed rather than asserted. A batching primitive is worth nothing if the
-# grower above it never has two leaves to hand it at once.
-
-comptime FEEDER_HOST_SEARCH = 0
-"""`grow_tree_gpu`'s default path. One child is built per commit and the
-sibling comes from the host subtraction, so a batch is one leaf and batching
-is a no-op."""
-
-comptime FEEDER_DEVICE_SEARCH = 1
-"""`_grow_tree_gpu_device_search`. Both children are built on the device, so
-every commit offers exactly two leaves."""
-
-comptime FEEDER_SPECULATIVE = 2
-"""A frontier driven by `speculative_order`. Every commit on the speculation
-list offers its children, so a depth-k speculation offers up to 2k leaves,
-bounded by the frontier size and the histogram slot pool."""
-
-comptime FEEDER_LEVELWISE = 3
-"""Level-wise growth (a separate lane). A level offers all of its leaves at
-once, which is the largest batch any grower can produce and the one this
-module's device half is shaped for."""
-
-
-def leaves_per_launch(
-    feeder: Int, frontier_size: Int, speculation_depth: Int
-) raises -> Int:
-    """Leaves one launch can cover under each grower, at a frontier of
-    `frontier_size` live leaves.
-
-    Deliberately arithmetic and not a policy. It answers "is there anything
-    to batch here", which is the question that has to be answered before any
-    benchmark of the kernels below means anything.
-    """
-    if frontier_size < 1:
-        raise Error("a frontier holds at least one leaf")
-    if speculation_depth < 1:
-        raise Error("speculation depth must be at least one commit")
-    if feeder == FEEDER_HOST_SEARCH:
-        return 1
-    if feeder == FEEDER_DEVICE_SEARCH:
-        return 2
-    if feeder == FEEDER_SPECULATIVE:
-        var offered = 2 * speculation_depth
-        if offered > frontier_size:
-            return frontier_size
-        return offered
-    if feeder == FEEDER_LEVELWISE:
-        return frontier_size
-    raise Error("unknown frontier feeder")
-
-
-def feeder_name(feeder: Int) -> String:
-    if feeder == FEEDER_HOST_SEARCH:
-        return String("host_search")
-    if feeder == FEEDER_DEVICE_SEARCH:
-        return String("device_search")
-    if feeder == FEEDER_SPECULATIVE:
-        return String("speculative")
-    if feeder == FEEDER_LEVELWISE:
-        return String("levelwise")
-    return String("unknown")

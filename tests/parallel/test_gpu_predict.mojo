@@ -27,10 +27,10 @@ from mojotrees.boosting import (
     train_multiclass,
 )
 from mojotrees.gpu_predict import (
-    METRIC_BINARY_LOG_LOSS,
-    METRIC_L1,
-    METRIC_L2,
-    METRIC_MULTICLASS_LOG_LOSS,
+    DEVICE_METRIC_BINARY_LOG_LOSS,
+    DEVICE_METRIC_L1,
+    DEVICE_METRIC_L2,
+    DEVICE_METRIC_MULTICLASS_LOG_LOSS,
     RESPONSE_IDENTITY,
     RESPONSE_SIGMOID,
     RESPONSE_SOFTMAX,
@@ -421,14 +421,14 @@ def test_incremental_validation_and_metrics() raises:
         # Squared error is on the raw scale for this objective, so the
         # identity link is the right transform and metrics.mojo's `l2` is
         # the reference.
-        var gpu_l2 = predictor.validation_metric(METRIC_L2, RESPONSE_IDENTITY)
+        var gpu_l2 = predictor.validation_metric(DEVICE_METRIC_L2, RESPONSE_IDENTITY)
         assert_almost_equal(gpu_l2, l2(host_raw, vtarget), atol=1e-3)
-        var gpu_l1 = predictor.validation_metric(METRIC_L1, RESPONSE_IDENTITY)
+        var gpu_l1 = predictor.validation_metric(DEVICE_METRIC_L1, RESPONSE_IDENTITY)
         assert_almost_equal(gpu_l1, l1(host_raw, vtarget), atol=1e-3)
 
         # Scoring twice does not disturb the resident raw scores: the
         # response transform writes to its own buffer.
-        var again = predictor.validation_metric(METRIC_L2, RESPONSE_IDENTITY)
+        var again = predictor.validation_metric(DEVICE_METRIC_L2, RESPONSE_IDENTITY)
         assert_equal(gpu_l2, again)
 
         # And the whole-ensemble path reproduces the incremental one.
@@ -468,7 +468,7 @@ def test_weighted_and_classification_metrics() raises:
             host_prob.append(booster.predict_bins(_bins_of(data, r)))
 
         var gpu_ll = predictor.validation_metric(
-            METRIC_BINARY_LOG_LOSS, RESPONSE_SIGMOID
+            DEVICE_METRIC_BINARY_LOG_LOSS, RESPONSE_SIGMOID
         )
         assert_almost_equal(
             gpu_ll, binary_log_loss(host_prob, target, weight), atol=1e-3
@@ -480,7 +480,7 @@ def test_weighted_and_classification_metrics() raises:
         unweighted.set_validation(data, target)
         unweighted.score_validation(IterationRange.slice(n_iter, 0, n_iter))
         var plain = unweighted.validation_metric(
-            METRIC_BINARY_LOG_LOSS, RESPONSE_SIGMOID
+            DEVICE_METRIC_BINARY_LOG_LOSS, RESPONSE_SIGMOID
         )
         assert_almost_equal(
             plain, binary_log_loss(host_prob, target), atol=1e-3
@@ -522,7 +522,7 @@ def test_multiclass_validation_metric() raises:
         predictor.set_validation(data, label_f64)
         predictor.score_validation(IterationRange.slice(n_iter, 0, n_iter))
         var gpu_ll = predictor.validation_metric(
-            METRIC_MULTICLASS_LOG_LOSS, RESPONSE_SOFTMAX
+            DEVICE_METRIC_MULTICLASS_LOG_LOSS, RESPONSE_SOFTMAX
         )
 
         var host_probs = List[Float64](capacity=n_rows * n_classes)

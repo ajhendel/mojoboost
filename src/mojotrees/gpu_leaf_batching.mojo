@@ -57,9 +57,10 @@ The primitives here are worth exactly as much as the grower above them can
 feed them, and on the trainer's default path today that is one leaf per
 commit: `grow_tree_gpu` builds the smaller child and derives the sibling by
 subtraction, so a batch of one is all there is and this module is a no-op.
-`gpu_frontier.leaves_per_launch` computes the number for each of the four
-growers, and `handoffs/algorithm_22_leaf_batching.md` states the consequence
-plainly rather than burying it: batching is a change to the *grower*, and
+The number per grower is arithmetic (one for host search, two for device
+search, up to twice the speculation depth for a speculative frontier, the
+whole level for level-wise), and `handoffs/algorithm_22_leaf_batching.md`
+states the consequence plainly rather than burying it: batching is a change to the *grower*, and
 these kernels are the half of it that can be built and reasoned about first.
 The three growers that can offer more than one leaf are the device-search
 path (two children per commit), a speculative frontier (up to two per

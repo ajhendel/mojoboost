@@ -134,7 +134,7 @@ from .apple_histogram_policy import (
 )
 from .binning import BinnedMatrix
 from .categorical import CatBitset, CategoricalSpec, cat_empty
-from .gpu_active_rows import GpuActiveRows, LeafRange, RowRouting
+from .gpu_active_rows import MAX_ROWS, GpuActiveRows, LeafRange, RowRouting
 from .gpu_binned_layout import check_layout_support
 from .gpu_frontier import LeafWorkItem
 from .gpu_multiclass_batch import GpuClassBatch
@@ -204,8 +204,9 @@ from .histogram import (
 
 comptime MAX_BINS = 256
 
-# Row indices and leaf ids cross into the kernels as Int32.
-comptime MAX_ROWS = Int(Int32.MAX)
+# Row indices and leaf ids cross into the kernels as Int32. The one
+# definition is gpu_active_rows.MAX_ROWS, imported above and re-exported
+# here, which is the name the tests and the docs use.
 
 # Histogram slots the batched path may hold at once, and the byte budget it
 # is capped against. A slot is a full-width `3 * n_features * n_bins` Int32

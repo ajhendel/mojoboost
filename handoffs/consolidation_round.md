@@ -214,18 +214,40 @@ Decisions taken by C0:
   `LeafCandidate` in gpu_frontier / growth_policy, and so on). They are the
   next round's first list.
 
-Gated, not done, with the exact unblocker:
+Formerly gated on connect_04's dirty files, done 2026-08-15 in the
+auto-crossover lane (worked in a separate worktree, so the gate did not
+apply there; the merge with connect_04's `train_gpu.mojo` edit is that
+lane's landing conflict to resolve):
 
-- K8 step 3 (`MAX_ROWS` single site across gpu_active_rows /
-  gpu_multiclass_batch / gpu_predict / histogram_gpu; gpu_frontier
-  `SpeculationLedger` trim) and K11's deferred `gpu_predict`
-  `DEVICE_METRIC_*` rename: `train_gpu.mojo`, `hybrid_leaf_scheduler.mojo`,
-  `gpu_active_rows.mojo`, `histogram_gpu.mojo` are dirty in the shared
-  checkout (connect_04 / hybrid costs, `train_gpu.mojo` mid-edit and not
-  parsing at close-out). Runnable the moment `git status` shows them clean.
-- K6's `_f64_list` / `_int_list` / `_csc` / `_csr` helpers in
-  `_mojotrees.mojo` duplicating `binding_support`: same gate (needs an
-  extension build).
+- K8 step 3: `MAX_ROWS` has one definition, `gpu_active_rows.MAX_ROWS`
+  (the module below the other three in the import graph);
+  histogram_gpu, gpu_multiclass_batch, and gpu_predict import it, and
+  histogram_gpu re-exports it under the name the tests and docs use. Value
+  unchanged (`Int(Int32.MAX)`). gpu_frontier's never-called speculation
+  API (`speculative_order`, `verify_speculation`, `SpeculationLedger`,
+  `leaves_per_launch` with its four `FEEDER_*` codes and `feeder_name`) is
+  deleted; `search_is_order_free` stays as the one predicate a future
+  driver turns on; the module docstring keeps the lemma and says the
+  driver was removed. gpu_leaf_batching's docstring and
+  bench/apple/leaf_batching_plan.json no longer point at the deleted names.
+- K11's deferred rename: gpu_predict's six device reduction codes are
+  `DEVICE_METRIC_*` (values unchanged; they differ from metrics.mojo's
+  `METRIC_*` and `device_metric_code` remains the host-to-device map, so
+  importing the host codes was not an option). `train_gpu.device_loss_metric`
+  and tests/parallel/test_gpu_predict.mojo follow the rename.
+- K6: `_f64_list`, `_int_list`, `_int_list_from_f64`, `_csc`, `_csr` are
+  gone from `_mojotrees.mojo`; it imports `f64_buffer`, `int_buffer`,
+  `int_buffer_from_f64`, `csc_from_params`, `csr_from_params` from
+  `binding_support`, whose `f64_buffer` / `int_buffer` now carry the entry
+  point's bulk `unsafe_memcpy` copy (and its measurement note) instead of
+  the element-by-element append. Error text is binding_support's ("null
+  buffer address", "buffer length must not be negative, got n"), which is
+  the more specific of the two and what the capability modules already
+  raised; nothing in python/ matched the old "invalid buffer". Verified
+  with one extension build and a dense fit, a classifier fit, and the
+  device report from Python.
+
+Left as they were, not gated:
 - Stale doc pointers to `gpu_levelwise.mojo` / `levelwise_policy.mojo` in
   `docs/design/GPU_LEVELWISE.md` are the growth_policy lane's (f4651d1)
   historical text; `docs/CONNECTION_AUDIT.md`, `docs/C_API.md`,

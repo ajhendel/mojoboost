@@ -151,11 +151,10 @@ from .gpu_tiling import (
     derive_tiling,
     query_device_caps,
 )
-from .histogram import Histogram, _zeroed_f64, _zeroed_int
-
 # Row indices cross into the kernels as Int32, as everywhere else on the
-# device path.
-comptime MAX_ROWS = Int(Int32.MAX)
+# device path; the one definition is gpu_active_rows.MAX_ROWS.
+from .gpu_active_rows import MAX_ROWS
+from .histogram import Histogram, _zeroed_f64, _zeroed_int
 
 # Round phases the guard walks through. A round is IDLE before it opens,
 # PROBS once the probability snapshot is fresh, and stays there while
