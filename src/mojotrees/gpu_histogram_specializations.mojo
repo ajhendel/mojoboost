@@ -9,19 +9,22 @@ story be reasoned about (and later tested) on a machine with no accelerator.
 Three specializations are described here, in increasing order of how much
 they demand of the kernel side:
 
-1. **Bin-capacity classes.** The shipping kernels in `gpu_active_rows.mojo`
-   allocate three `MAX_BINS`-wide Int32 arrays in threadgroup memory
-   regardless of `n_bins`, so a 32-bin histogram occupies exactly as much
-   threadgroup memory as a 256-bin one: 3 KiB. `gpu_tiling.shared_bytes_for`
-   models the footprint as `n_bins * 12`, which is the footprint a kernel
-   sized to its bin count *would* have. The two agree only at 256 bins.
-   `bin_capacity_for` rounds a bin count up to the next power of two (16, 32,
-   64, 128, 256, covering the `max_bin` values 15, 31, 63, 127 and 255 that
-   LightGBM parity keeps this project in), and `kernel_shared_bytes` gives
-   the footprint a kernel instantiated at that capacity really has. Closing
-   that gap is the only one of the three specializations that needs no new
-   device primitive at all, only a comptime parameter on the existing
-   kernels.
+1. **Bin-capacity classes.** This one has landed, and the description below
+   is now a description of the range histogram family rather than of a gap.
+   `gpu_active_rows._range_hist_atomic_kernel` and `_range_hist_partial_kernel`
+   take a `BIN_CAP` comptime parameter and allocate three Int32 planes of
+   `GROUP * BIN_CAP` cells, so a 32-bin histogram no longer occupies the
+   3 KiB a 256-bin one does. That family's ladder is the four capacities in
+   `gpu_tiling` (32, 64, 128, 256) rather than the five here, and its
+   footprint is `gpu_tiling.histogram_shared_bytes`, which carries the
+   feature-group width this module's `kernel_shared_bytes` does not.
+   `bin_capacity_for` here still rounds to the next power of two from 16, and
+   is still what `gpu_portability` and `gpu_vendor_policy` price a
+   single-slot block with; the two ladders differ only at 16, where the
+   kernel family's narrowest rung is 32, so this module's figure is the
+   smaller one and no caller may treat it as an upper bound on a real launch.
+   Reconciling the two ladders is a follow-up, not a correctness bug: nothing
+   here selects a launch.
 
 2. **Packed bin loads.** The row loop reads `bins[f * n_rows + r]` where `r`
    comes from the active-row permutation, so it is a gather and not a
@@ -199,31 +202,43 @@ def kernel_shared_bytes(capacity: Int) -> Int:
 
 
 def unspecialized_kernel_shared_bytes() -> Int:
-    """Threadgroup memory one block of the shipping kernels occupies, at
-    every bin count: three `MAX_BINS`-wide Int32 planes.
+    """Threadgroup memory one block occupies under the pre-parameterization
+    allocation: three `MAX_BINS`-wide Int32 planes, at every bin count.
 
     This is what `_range_hist_atomic_kernel` and `_range_hist_partial_kernel`
-    allocate today, and it does not depend on `n_bins`, which is the whole
-    reason the bin-capacity specialization exists.
+    allocated before they took a `BIN_CAP` parameter, and it is what a build
+    reporting `KernelFeatures.specialized_bin_kernels = False` is priced at.
+    It does not depend on `n_bins`, which was the whole reason the
+    bin-capacity specialization existed. Kept, and kept named for what it is,
+    because it is also the baseline the default feature group is derived
+    against: `gpu_tiling.free_feature_group` widens a group only as far as
+    this many bytes per slot already bought.
     """
     return kernel_shared_bytes(MAX_BINS)
 
 
 def modeled_shared_bytes(n_bins: Int) -> Int:
-    """Threadgroup memory `gpu_tiling.shared_bytes_for` models one block as
-    needing. Mirrored here so the two numbers can be compared without
-    importing the host-side module."""
+    """Threadgroup memory an ideal block sized exactly to `n_bins` would
+    need: `n_bins * 12`.
+
+    An idealization and no longer a mirror of anything.
+    `gpu_tiling.shared_bytes_for` used to compute this and now reports the
+    capacity-rounded footprint the kernel family really allocates for one
+    feature slot, so the two agree only when `n_bins` is itself a ladder
+    value. This survives as the denominator `shared_bytes_unmodeled` measures
+    the old allocation's waste against.
+    """
     return n_bins * BYTES_PER_PARTIAL_CELL
 
 
 def shared_bytes_unmodeled(n_bins: Int) -> Int:
-    """Bytes of threadgroup memory the shipping kernels occupy that the
-    tiling model does not account for, at `n_bins` bins.
+    """Bytes of threadgroup memory the pre-parameterization allocation
+    occupied beyond an ideal `n_bins`-wide one, at `n_bins` bins.
 
-    Zero at 256 bins and 2688 at 32 bins. Any residency figure derived from
-    `modeled_shared_bytes` is optimistic by this much until the kernels take
-    a capacity parameter; `apple_histogram_policy.mojo` uses whichever of the
-    two footprints matches the kernel actually compiled in.
+    Zero at 256 bins and 2688 at 32 bins. This is the waste the `BIN_CAP`
+    parameter removed, stated so a handoff or a benchmark can name it; it is
+    no longer a correction anyone has to apply to a residency figure, because
+    `apple_histogram_policy.mojo` prices the compiled kernel directly.
     """
     var unmodeled = unspecialized_kernel_shared_bytes() - modeled_shared_bytes(
         n_bins
@@ -518,9 +533,12 @@ struct BinStorageDescriptor(Copyable, Movable):
         return self.block_features * kernel_shared_bytes(self.bin_capacity())
 
     def shipping_shared_bytes_per_block(self) -> Int:
-        """Threadgroup memory one block of the kernels compiled in today
-        occupies, which does not depend on the descriptor at all: three
-        `MAX_BINS`-wide Int32 planes."""
+        """Threadgroup memory one block occupied under the
+        pre-parameterization allocation, which did not depend on the
+        descriptor at all: three `MAX_BINS`-wide Int32 planes. The range
+        histogram family allocates
+        `gpu_tiling.histogram_shared_bytes(bin_cap, group)` instead, which
+        this cannot report because a descriptor carries no group width."""
         return unspecialized_kernel_shared_bytes()
 
 

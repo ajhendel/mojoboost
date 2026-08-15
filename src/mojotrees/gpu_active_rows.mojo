@@ -177,11 +177,17 @@ from .categorical import CatBitset, cat_empty
 from .gpu_frontier import CommitPlan, LeafFrontier
 from .gpu_histogram_specializations import MAX_BINS
 from .gpu_tiling import (
+    HIST_FEATURE_GROUP_LADDER,
+    HIST_FEATURE_GROUP_MAX,
     STRATEGY_TILED,
     DeviceCaps,
     HistogramTiling,
     derive_block_threads,
     derive_tiling,
+    free_feature_group,
+    histogram_bin_capacity,
+    histogram_shared_bytes,
+    is_feature_group_width,
 )
 from .parallel import _env_int
 from .split import SplitInfo
@@ -229,18 +235,18 @@ def _scan_primitive_width_supported(threads: Int) -> Bool:
     )
 
 
-# Features one histogram threadgroup may accumulate at once. The shared
-# histogram is `MAX_BINS` Int32 in each of three planes, so a group of G
-# costs 3 * G KiB of a 32 KiB threadgroup budget: 6 KiB at the pairing,
-# 12 KiB at the quad, which leaves a device wanting several resident blocks
-# per core little room — whether the traffic saving still wins at 4 is a
-# per-device measurement, which is why 3 has no kernel and
-# `set_feature_group` rejects it rather than rounding. The pair constants
-# are deliberately not derived from the maximum: widening the maximum must
-# not resize the paired kernels' shared allocations.
-comptime FEATURE_GROUP_MAX = 4
-comptime GROUPED_BINS = 2 * MAX_BINS
-comptime QUAD_BINS = 4 * MAX_BINS
+# Features one histogram threadgroup may accumulate at once, and the top of
+# the ladder the kernel family is instantiated over. One threadgroup's shared
+# histogram is three Int32 planes of `GROUP * BIN_CAP` cells, where `BIN_CAP`
+# is the dataset's bin count rounded up the capacity ladder
+# (`gpu_tiling.histogram_bin_capacity`) rather than fixed at `MAX_BINS`, so a
+# group of G on a 64-bin dataset costs `3 * G * 64 * 4` bytes and not
+# `3 * G * 256 * 4`. That is what makes widths past the pairing affordable at
+# all: group 8 at 64 bins occupies the 6 KiB group 2 used to occupy at every
+# bin count. `set_feature_group` still refuses a width that is not a rung,
+# 3 among them, because a width with no instantiation cannot launch.
+comptime FEATURE_GROUP_MAX = HIST_FEATURE_GROUP_MAX
+comptime FEATURE_GROUP_LADDER = HIST_FEATURE_GROUP_LADDER
 
 
 @always_inline
@@ -653,484 +659,6 @@ def _copy_back_kernel(
         rows[unsafe_offset=i] = scratch[unsafe_offset=i][0]
 
 
-def _range_hist_atomic_kernel(
-    bins: MutPointer[UInt8, MutAnyOrigin],
-    rows: MutPointer[Int32, MutAnyOrigin],
-    grad: MutPointer[Float32, MutAnyOrigin],
-    hess: MutPointer[Float32, MutAnyOrigin],
-    feat_ids: MutPointer[Int32, MutAnyOrigin],
-    out_hist: MutPointer[Int32, MutAnyOrigin],
-    n_rows: Int32,
-    n_bins: Int32,
-    hist_size: Int32,
-    rows_per_tile: Int32,
-    begin: Int32,
-    count: Int32,
-    g_scale: Float32,
-    h_scale: Float32,
-    sub_offset: Int32,
-    do_sub: Int32,
-):
-    """`_hist_leaf_kernel` over a compacted range instead of over every row.
-
-    The differences from the filtering kernel are the two that matter: the
-    row loop covers `count` rows rather than `n_rows`, and there is no leaf
-    id to test, because membership is the range itself. Everything else
-    (shared-memory partial per (feature, tile), fixed-point Int32
-    accumulation, one flush into the shared `[grad | hess | count]` output)
-    is unchanged, so the histogram it produces is the same integer histogram
-    that path produces.
-
-    With `do_sub`, the flush also subtracts what it added from the slot
-    `sub_offset` words away, which is the sibling subtraction folded into the
-    build. The destination is named as a signed offset rather than a second
-    pointer because both slots live in one pool buffer, and two pointers into
-    one buffer is an aliasing the compiler is right to refuse. It is the same
-    arithmetic `_subtract_slice_kernel` performs and exact for the same
-    reason -- both slots are fixed-point Int32 under one scale, so a
-    parent's bins are the exact integer sum of its children's -- but it
-    costs three more global atomics per populated bin per block instead of a
-    second launch that reads and writes every cell of two whole slots. Bins
-    this node never touched are left alone, which is what subtracting zero
-    from them would have done anyway.
-    """
-    var f = Int(feat_ids[unsafe_offset = Int(block_idx.x)][0])
-    var tid = thread_idx.x
-    var nb = Int(n_bins)
-    var nr = Int(n_rows)
-    var hs = Int(hist_size)
-    var n = Int(count)
-
-    var sg = stack_allocation[
-        MAX_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
-    ]()
-    var sh = stack_allocation[
-        MAX_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
-    ]()
-    var sc = stack_allocation[
-        MAX_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
-    ]()
-
-    var b = tid
-    while b < nb:
-        sg[unsafe_offset=b] = 0
-        sh[unsafe_offset=b] = 0
-        sc[unsafe_offset=b] = 0
-        b += block_dim.x
-    barrier()
-
-    var tile_begin = block_idx.y * Int(rows_per_tile)
-    var tile_end = tile_begin + Int(rows_per_tile)
-    if tile_end > n:
-        tile_end = n
-
-    var col = f * nr
-    var j = tile_begin + tid
-    while j < tile_end:
-        var r = Int(rows[unsafe_offset = Int(begin) + j][0])
-        var bin = Int(bins[unsafe_offset = col + r])
-        var gq = Int32(round(grad[unsafe_offset=r][0] * g_scale))
-        var hq = Int32(round(hess[unsafe_offset=r][0] * h_scale))
-        _ = Atomic.fetch_add(sg.unsafe_offset(bin), gq)
-        _ = Atomic.fetch_add(sh.unsafe_offset(bin), hq)
-        _ = Atomic.fetch_add(sc.unsafe_offset(bin), Int32(1))
-        j += block_dim.x
-    barrier()
-
-    var base = f * nb
-    var sub = Int(do_sub) != 0
-    b = tid
-    while b < nb:
-        if sc[unsafe_offset=b][0] != 0:
-            var vg = sg[unsafe_offset=b][0]
-            var vh = sh[unsafe_offset=b][0]
-            var vc = sc[unsafe_offset=b][0]
-            _ = Atomic.fetch_add(out_hist.unsafe_offset(base + b), vg)
-            _ = Atomic.fetch_add(out_hist.unsafe_offset(hs + base + b), vh)
-            _ = Atomic.fetch_add(out_hist.unsafe_offset(2 * hs + base + b), vc)
-            if sub:
-                var so = Int(sub_offset) + base + b
-                _ = Atomic.fetch_add(out_hist.unsafe_offset(so), -vg)
-                _ = Atomic.fetch_add(out_hist.unsafe_offset(hs + so), -vh)
-                _ = Atomic.fetch_add(out_hist.unsafe_offset(2 * hs + so), -vc)
-        b += block_dim.x
-
-
-def _range_hist_atomic_g2_kernel(
-    bins: MutPointer[UInt8, MutAnyOrigin],
-    rows: MutPointer[Int32, MutAnyOrigin],
-    grad: MutPointer[Float32, MutAnyOrigin],
-    hess: MutPointer[Float32, MutAnyOrigin],
-    feat_ids: MutPointer[Int32, MutAnyOrigin],
-    out_hist: MutPointer[Int32, MutAnyOrigin],
-    n_rows: Int32,
-    n_slots: Int32,
-    n_bins: Int32,
-    hist_size: Int32,
-    rows_per_tile: Int32,
-    begin: Int32,
-    count: Int32,
-    g_scale: Float32,
-    h_scale: Float32,
-    sub_offset: Int32,
-    do_sub: Int32,
-):
-    """`_range_hist_atomic_kernel` with two features per threadgroup.
-
-    The row side of the histogram is what this saves. With one feature per
-    block, `rows[begin + j]`, `grad[r]`, and `hess[r]` are read once per
-    feature and the two quantizations are recomputed once per feature, so a
-    (row, feature) visit moves thirteen bytes of which the bin is one
-    (`gpu_binned_layout.mojo` prices the whole family). A block that owns two
-    feature slots reads the row index, the gradient, and the hessian once and
-    spends them twice, which is the `pair_features` walk `histogram.mojo`
-    already does on the CPU, lifted to a threadgroup.
-
-    What it costs is shared memory: two features need two histograms, so the
-    allocation doubles and half as many threadgroups are resident per core.
-    The work per core does not change, since each resident block now covers
-    two features, but the latency hiding does, and which way that lands is a
-    measurement, not an argument. Hence `GpuActiveRows.feature_group`: this
-    kernel runs only when a caller or `MOJOTREES_GPU_FEATURE_GROUP` asks for
-    it.
-
-    Measured on an Apple M4 with `pixi run bench-hist 100000 100 20`, which
-    interleaves the two arms inside one process because this machine's
-    device timings drift several-fold between time windows: one root build
-    takes 0.620 ms at group 1 and 0.531 ms at group 2, a 1.17x difference
-    against a 3.2% band, reproduced across four runs at two shapes. The same
-    bench on a shape that resolves to the tiled strategy comes out flat, as
-    it must, since that path has no paired kernel. The default stays 1
-    anyway: one device is not a device family, and the shared-memory
-    doubling is exactly the kind of change that can invert on a backend
-    with a different threadgroup budget. A CUDA or HIP measurement is what
-    would move the default, not another Apple one.
-
-    The result is bit-identical to the one-feature kernel and not merely
-    close. Accumulation stays fixed-point Int32 in both, integer addition is
-    associative and commutative, and every atomic here adds the same
-    per-(row, feature) quantized value into the same bin, so only the order
-    of the adds differs and the order of integer adds cannot change a sum.
-    An odd active-feature count leaves the last block unpaired; it runs the
-    one-feature body and writes one slice, so a feature is never counted
-    twice and never dropped. `sub_offset`/`do_sub` are the one-feature
-    kernel's fused sibling subtraction, applied to each of the block's
-    slices for the same reason and with the same exactness.
-    """
-    var slot0 = 2 * Int(block_idx.x)
-    var slot1 = slot0 + 1
-    var paired = slot1 < Int(n_slots)
-    var f0 = Int(feat_ids[unsafe_offset=slot0][0])
-    var f1 = 0
-    if paired:
-        f1 = Int(feat_ids[unsafe_offset=slot1][0])
-    var tid = thread_idx.x
-    var nb = Int(n_bins)
-    var nr = Int(n_rows)
-    var hs = Int(hist_size)
-    var n = Int(count)
-
-    var sg = stack_allocation[
-        GROUPED_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
-    ]()
-    var sh = stack_allocation[
-        GROUPED_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
-    ]()
-    var sc = stack_allocation[
-        GROUPED_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
-    ]()
-
-    # The second feature's bins live directly above the first's, so one
-    # zeroing walk covers both and an unpaired block never touches the upper
-    # half.
-    var span = 2 * nb if paired else nb
-    var b = tid
-    while b < span:
-        sg[unsafe_offset=b] = 0
-        sh[unsafe_offset=b] = 0
-        sc[unsafe_offset=b] = 0
-        b += block_dim.x
-    barrier()
-
-    var tile_begin = block_idx.y * Int(rows_per_tile)
-    var tile_end = tile_begin + Int(rows_per_tile)
-    if tile_end > n:
-        tile_end = n
-
-    var col0 = f0 * nr
-    var col1 = f1 * nr
-    var j = tile_begin + tid
-    while j < tile_end:
-        var r = Int(rows[unsafe_offset = Int(begin) + j][0])
-        var gq = Int32(round(grad[unsafe_offset=r][0] * g_scale))
-        var hq = Int32(round(hess[unsafe_offset=r][0] * h_scale))
-        var b0 = Int(bins[unsafe_offset = col0 + r])
-        _ = Atomic.fetch_add(sg.unsafe_offset(b0), gq)
-        _ = Atomic.fetch_add(sh.unsafe_offset(b0), hq)
-        _ = Atomic.fetch_add(sc.unsafe_offset(b0), Int32(1))
-        if paired:
-            var b1 = nb + Int(bins[unsafe_offset = col1 + r])
-            _ = Atomic.fetch_add(sg.unsafe_offset(b1), gq)
-            _ = Atomic.fetch_add(sh.unsafe_offset(b1), hq)
-            _ = Atomic.fetch_add(sc.unsafe_offset(b1), Int32(1))
-        j += block_dim.x
-    barrier()
-
-    var sub = Int(do_sub) != 0
-    var base0 = f0 * nb
-    b = tid
-    while b < nb:
-        if sc[unsafe_offset=b][0] != 0:
-            var vg = sg[unsafe_offset=b][0]
-            var vh = sh[unsafe_offset=b][0]
-            var vc = sc[unsafe_offset=b][0]
-            _ = Atomic.fetch_add(out_hist.unsafe_offset(base0 + b), vg)
-            _ = Atomic.fetch_add(out_hist.unsafe_offset(hs + base0 + b), vh)
-            _ = Atomic.fetch_add(
-                out_hist.unsafe_offset(2 * hs + base0 + b), vc
-            )
-            if sub:
-                var so = Int(sub_offset) + base0 + b
-                _ = Atomic.fetch_add(out_hist.unsafe_offset(so), -vg)
-                _ = Atomic.fetch_add(out_hist.unsafe_offset(hs + so), -vh)
-                _ = Atomic.fetch_add(out_hist.unsafe_offset(2 * hs + so), -vc)
-        b += block_dim.x
-    if not paired:
-        return
-    var base1 = f1 * nb
-    b = tid
-    while b < nb:
-        var s = nb + b
-        if sc[unsafe_offset=s][0] != 0:
-            var vg = sg[unsafe_offset=s][0]
-            var vh = sh[unsafe_offset=s][0]
-            var vc = sc[unsafe_offset=s][0]
-            _ = Atomic.fetch_add(out_hist.unsafe_offset(base1 + b), vg)
-            _ = Atomic.fetch_add(out_hist.unsafe_offset(hs + base1 + b), vh)
-            _ = Atomic.fetch_add(
-                out_hist.unsafe_offset(2 * hs + base1 + b), vc
-            )
-            if sub:
-                var so = Int(sub_offset) + base1 + b
-                _ = Atomic.fetch_add(out_hist.unsafe_offset(so), -vg)
-                _ = Atomic.fetch_add(out_hist.unsafe_offset(hs + so), -vh)
-                _ = Atomic.fetch_add(out_hist.unsafe_offset(2 * hs + so), -vc)
-        b += block_dim.x
-
-
-def _range_hist_partial_kernel(
-    bins: MutPointer[UInt8, MutAnyOrigin],
-    rows: MutPointer[Int32, MutAnyOrigin],
-    grad: MutPointer[Float32, MutAnyOrigin],
-    hess: MutPointer[Float32, MutAnyOrigin],
-    feat_ids: MutPointer[Int32, MutAnyOrigin],
-    partials: MutPointer[Int32, MutAnyOrigin],
-    n_rows: Int32,
-    n_slots: Int32,
-    n_bins: Int32,
-    rows_per_tile: Int32,
-    begin: Int32,
-    count: Int32,
-    g_scale: Float32,
-    h_scale: Float32,
-):
-    """`_hist_partial_kernel` over a compacted range. Same partial-buffer
-    layout (`[grad | hess | count]` per tile, indexed by active-feature
-    slot), same write-once-no-atomics contract, so the existing reduction
-    kernel combines these partials unchanged."""
-    var slot = Int(block_idx.x)
-    var f = Int(feat_ids[unsafe_offset=slot][0])
-    var t = block_idx.y
-    var tid = thread_idx.x
-    var nb = Int(n_bins)
-    var nr = Int(n_rows)
-    var n = Int(count)
-    var plane = Int(n_slots) * nb
-
-    var sg = stack_allocation[
-        MAX_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
-    ]()
-    var sh = stack_allocation[
-        MAX_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
-    ]()
-    var sc = stack_allocation[
-        MAX_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
-    ]()
-
-    var b = tid
-    while b < nb:
-        sg[unsafe_offset=b] = 0
-        sh[unsafe_offset=b] = 0
-        sc[unsafe_offset=b] = 0
-        b += block_dim.x
-    barrier()
-
-    var tile_begin = t * Int(rows_per_tile)
-    var tile_end = tile_begin + Int(rows_per_tile)
-    if tile_end > n:
-        tile_end = n
-
-    var col = f * nr
-    var j = tile_begin + tid
-    while j < tile_end:
-        var r = Int(rows[unsafe_offset = Int(begin) + j][0])
-        var bin = Int(bins[unsafe_offset = col + r])
-        var gq = Int32(round(grad[unsafe_offset=r][0] * g_scale))
-        var hq = Int32(round(hess[unsafe_offset=r][0] * h_scale))
-        _ = Atomic.fetch_add(sg.unsafe_offset(bin), gq)
-        _ = Atomic.fetch_add(sh.unsafe_offset(bin), hq)
-        _ = Atomic.fetch_add(sc.unsafe_offset(bin), Int32(1))
-        j += block_dim.x
-    barrier()
-
-    var base = t * 3 * plane + slot * nb
-    b = tid
-    while b < nb:
-        partials[unsafe_offset = base + b] = sg[unsafe_offset=b][0]
-        partials[unsafe_offset = base + plane + b] = sh[unsafe_offset=b][0]
-        partials[unsafe_offset = base + 2 * plane + b] = sc[
-            unsafe_offset=b
-        ][0]
-        b += block_dim.x
-
-
-def _range_hist_partial_g2_kernel(
-    bins: MutPointer[UInt8, MutAnyOrigin],
-    rows: MutPointer[Int32, MutAnyOrigin],
-    grad: MutPointer[Float32, MutAnyOrigin],
-    hess: MutPointer[Float32, MutAnyOrigin],
-    feat_ids: MutPointer[Int32, MutAnyOrigin],
-    partials: MutPointer[Int32, MutAnyOrigin],
-    n_rows: Int32,
-    n_slots: Int32,
-    n_bins: Int32,
-    rows_per_tile: Int32,
-    begin: Int32,
-    count: Int32,
-    g_scale: Float32,
-    h_scale: Float32,
-):
-    """`_range_hist_partial_kernel` with two features per threadgroup.
-
-    The tiled twin of `_range_hist_atomic_g2_kernel`, and for the same
-    reason: with one feature per block, the row index, the gradient, the
-    hessian, and the two quantizations are spent once per feature, so a
-    (row, feature) visit moves thirteen bytes of which the bin is one. A
-    block that owns two feature slots reads and quantizes the row side once
-    and spends it twice. The tiled strategy is what large nodes resolve to
-    (`resolve_tiling` picks it whenever occupancy wants more than one tile
-    per feature), so this pairing is the one a large-row fit actually runs;
-    at 5M x 50 the histogram build is measured at ~79% of GPU training wall
-    clock, which is what makes the row-side traffic worth halving here too.
-
-    The partial-buffer layout is untouched: a paired block writes the same
-    two per-slot `[grad | hess | count]` slices the one-feature kernel would
-    have written from two blocks, each slice still written by exactly one
-    block, so `_range_reduce_kernel` — and the fused sibling subtraction it
-    carries — combine these partials unchanged. The result is bit-identical,
-    not merely close: accumulation stays fixed-point Int32, every shared
-    atomic adds the same per-(row, feature) quantized value into the same
-    bin, and the order of integer adds cannot change a sum. An odd active
-    count leaves the last block unpaired; it runs the one-feature body and
-    writes one slice, so a feature is never counted twice and never dropped.
-
-    Shared memory doubles (`GROUPED_BINS`), halving resident blocks per
-    core, so whether the traffic saving wins is a measurement per device,
-    not an argument — `GpuActiveRows.feature_group` gates it exactly as it
-    gates the atomic pairing.
-
-    Measured on an Apple M4, three interleaved repeats per arm in one
-    process (setenv between fits, same binned data): a full 100-round
-    `train_gpu` at 5M x 50 runs 15.96s at group 1 and 11.49s at group 2, a
-    1.39x end-to-end difference with the group-2 arm's own spread at 0.03%,
-    and the two models' predictions byte-identical. The default stays 1 for
-    the same reason the atomic pairing's does: one device is not a device
-    family, and the shared-memory doubling can invert on a backend with a
-    different threadgroup budget.
-    """
-    var slot0 = 2 * Int(block_idx.x)
-    var slot1 = slot0 + 1
-    var paired = slot1 < Int(n_slots)
-    var f0 = Int(feat_ids[unsafe_offset=slot0][0])
-    var f1 = 0
-    if paired:
-        f1 = Int(feat_ids[unsafe_offset=slot1][0])
-    var t = block_idx.y
-    var tid = thread_idx.x
-    var nb = Int(n_bins)
-    var nr = Int(n_rows)
-    var n = Int(count)
-    var plane = Int(n_slots) * nb
-
-    var sg = stack_allocation[
-        GROUPED_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
-    ]()
-    var sh = stack_allocation[
-        GROUPED_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
-    ]()
-    var sc = stack_allocation[
-        GROUPED_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
-    ]()
-
-    # The second feature's bins live directly above the first's, so one
-    # zeroing walk covers both and an unpaired block never touches the upper
-    # half.
-    var span = 2 * nb if paired else nb
-    var b = tid
-    while b < span:
-        sg[unsafe_offset=b] = 0
-        sh[unsafe_offset=b] = 0
-        sc[unsafe_offset=b] = 0
-        b += block_dim.x
-    barrier()
-
-    var tile_begin = t * Int(rows_per_tile)
-    var tile_end = tile_begin + Int(rows_per_tile)
-    if tile_end > n:
-        tile_end = n
-
-    var col0 = f0 * nr
-    var col1 = f1 * nr
-    var j = tile_begin + tid
-    while j < tile_end:
-        var r = Int(rows[unsafe_offset = Int(begin) + j][0])
-        var gq = Int32(round(grad[unsafe_offset=r][0] * g_scale))
-        var hq = Int32(round(hess[unsafe_offset=r][0] * h_scale))
-        var b0 = Int(bins[unsafe_offset = col0 + r])
-        _ = Atomic.fetch_add(sg.unsafe_offset(b0), gq)
-        _ = Atomic.fetch_add(sh.unsafe_offset(b0), hq)
-        _ = Atomic.fetch_add(sc.unsafe_offset(b0), Int32(1))
-        if paired:
-            var b1 = nb + Int(bins[unsafe_offset = col1 + r])
-            _ = Atomic.fetch_add(sg.unsafe_offset(b1), gq)
-            _ = Atomic.fetch_add(sh.unsafe_offset(b1), hq)
-            _ = Atomic.fetch_add(sc.unsafe_offset(b1), Int32(1))
-        j += block_dim.x
-    barrier()
-
-    var base0 = t * 3 * plane + slot0 * nb
-    b = tid
-    while b < nb:
-        partials[unsafe_offset = base0 + b] = sg[unsafe_offset=b][0]
-        partials[unsafe_offset = base0 + plane + b] = sh[unsafe_offset=b][0]
-        partials[unsafe_offset = base0 + 2 * plane + b] = sc[
-            unsafe_offset=b
-        ][0]
-        b += block_dim.x
-    if not paired:
-        return
-    var base1 = t * 3 * plane + slot1 * nb
-    b = tid
-    while b < nb:
-        var s = nb + b
-        partials[unsafe_offset = base1 + b] = sg[unsafe_offset=s][0]
-        partials[unsafe_offset = base1 + plane + b] = sh[unsafe_offset=s][0]
-        partials[unsafe_offset = base1 + 2 * plane + b] = sc[
-            unsafe_offset=s
-        ][0]
-        b += block_dim.x
-
-
 def _quantize_grad_hess_kernel(
     grad: MutPointer[Float32, MutAnyOrigin],
     hess: MutPointer[Float32, MutAnyOrigin],
@@ -1142,71 +670,162 @@ def _quantize_grad_hess_kernel(
     """Quantize this round's gradients once, into one interleaved buffer.
 
     `gq[2r]` and `gq[2r + 1]` are exactly the `Int32(round(grad[r] *
-    g_scale))` and `Int32(round(hess[r] * h_scale))` every histogram kernel
-    computes per (row, feature) visit: same Float32 product, same rounding,
-    so a histogram accumulated from this buffer is bit-identical to one
-    accumulated from the Float32 planes. What changes is the traffic. The
-    histogram kernels gather `grad[r]` and `hess[r]` by row id, so at a leaf
-    whose rows are sparse in the dataset each is a separate cache line per
-    row per threadgroup, and a 50-feature histogram at the pairing gathers
-    both 25 times per row. Interleaving the two quantized words puts them in
-    one line, halving those gathers, and moves the two multiplies and
-    rounds off the inner loop. One streaming pass per tree over `n_rows`
-    (16 bytes each), against `n_features` gathered passes per node.
+    g_scale))` and `Int32(round(hess[r] * h_scale))` a histogram kernel would
+    otherwise compute per (row, feature) visit: same Float32 product, same
+    rounding, so a histogram accumulated from this buffer is bit-identical to
+    one accumulated from the Float32 planes. That is an argument from the
+    expression, not a measurement: the two sites evaluate the same Float32
+    multiply and the same `round`, and hoisting an expression out of a loop
+    whose other operands it does not depend on cannot change its value.
+
+    What changes is the traffic. The histogram kernels gather `grad[r]` and
+    `hess[r]` by row id, so at a leaf whose rows are sparse in the dataset
+    each is a separate cache line per row per threadgroup, and a 50-feature
+    histogram at the pairing gathers both 25 times per row. Interleaving the
+    two quantized words puts them in one line, halving those gathers, and
+    moves the two multiplies and rounds off the inner loop entirely. One
+    streaming pass per tree over `n_rows` (16 bytes each), against
+    `n_features` gathered passes per node.
+
+    Because the result is provably identical and the work is strictly less,
+    this is the default source (`MOJOTREES_GPU_QUANTIZED_GRADS`, on unless set
+    to 0). The Float32 arms of the kernels below are kept so a benchmark can
+    hold both, not because either is more correct than the other.
     """
     var r = global_idx.x
     if r < Int(n_rows):
-        gq[unsafe_offset = 2 * r] = Int32(round(grad[unsafe_offset=r][0] * g_scale))
+        gq[unsafe_offset = 2 * r] = Int32(
+            round(grad[unsafe_offset=r][0] * g_scale)
+        )
         gq[unsafe_offset = 2 * r + 1] = Int32(
             round(hess[unsafe_offset=r][0] * h_scale)
         )
 
 
-def _range_hist_partial_g2q_kernel(
+def _range_hist_atomic_kernel[
+    GROUP: Int, BIN_CAP: Int
+](
     bins: MutPointer[UInt8, MutAnyOrigin],
     rows: MutPointer[Int32, MutAnyOrigin],
+    grad: MutPointer[Float32, MutAnyOrigin],
+    hess: MutPointer[Float32, MutAnyOrigin],
     gq: MutPointer[Int32, MutAnyOrigin],
     feat_ids: MutPointer[Int32, MutAnyOrigin],
-    partials: MutPointer[Int32, MutAnyOrigin],
+    out_hist: MutPointer[Int32, MutAnyOrigin],
     n_rows: Int32,
     n_slots: Int32,
     n_bins: Int32,
+    hist_size: Int32,
     rows_per_tile: Int32,
     begin: Int32,
     count: Int32,
+    g_scale: Float32,
+    h_scale: Float32,
+    sub_offset: Int32,
+    do_sub: Int32,
+    use_quant: Int32,
 ):
-    """`_range_hist_partial_g2_kernel` reading the pre-quantized interleaved
-    gradient buffer `_quantize_grad_hess_kernel` writes, instead of the two
-    Float32 planes. Same threadgroup shape, same shared layout, same
-    per-slot partial slices, same fixed-point adds of the same values, so
-    `_range_reduce_kernel` and the fused subtraction consume it unchanged
-    and the histogram is bit-identical. Per row per pair the block gathers
-    three lines (one `gq` pair, two bins) instead of four."""
-    var slot0 = 2 * Int(block_idx.x)
-    var slot1 = slot0 + 1
-    var paired = slot1 < Int(n_slots)
-    var f0 = Int(feat_ids[unsafe_offset=slot0][0])
-    var f1 = 0
-    if paired:
-        f1 = Int(feat_ids[unsafe_offset=slot1][0])
-    var t = block_idx.y
+    """One node's histogram over a compacted row range, accumulated in
+    threadgroup memory and folded into the output with global atomics.
+
+    One kernel for the whole family. The hand-written one-feature and
+    two-feature atomic kernels this replaces differed in exactly two things,
+    how many feature slots a block owned and how wide its shared planes were,
+    and both are now comptime parameters: `GROUP` walks the ladder 1, 2, 4, 8,
+    16 and `BIN_CAP` walks 32, 64, 128, 256. `enqueue_range_histogram` picks
+    the pair, taking `BIN_CAP` from `gpu_tiling.histogram_bin_capacity` and
+    the group from the free-footprint rule in
+    `gpu_tiling.free_feature_group`.
+
+    **What the capacity parameter fixes.** The old kernels allocated three
+    `MAX_BINS`-wide Int32 planes whatever the dataset's bin count was, so a
+    64-bin dataset paid four times the threadgroup memory it needed and a
+    32-bin one eight times. The allocation here is `GROUP * BIN_CAP` per
+    plane, so it is the memory the histogram occupies and nothing more.
+    Threadgroup memory is what bounds resident blocks per core, so this is a
+    residency change and not a bandwidth one, which is why the effect it has
+    on wall clock is a per-device measurement rather than an argument. It is
+    UNMEASURED at every capacity below 256 on every device this project runs
+    on. What would measure it is an interleaved A/B in one process of one
+    shape binned at 64 against the same shape binned at 256 with the same row
+    count, which is not the comparison `bench_histogram.mojo` makes today.
+
+    **What the group parameter buys.** With one feature per block,
+    `rows[begin + j]` and the row's quantized gradient pair are read once per
+    feature. A block owning `GROUP` slots reads them once and spends them
+    `GROUP` times, which is the `pair_features` walk `histogram.mojo` already
+    does on the CPU, lifted to a threadgroup and widened. Measured for the
+    tiled twin below on an Apple M4 at 1.17x for group 2 over group 1 on the
+    atomic path (`pixi run bench-hist 100000 100 20`, arms interleaved in one
+    process because this machine's device timings drift several-fold between
+    time windows). Groups 8 and 16 have never been launched on any device, so
+    nothing is claimed for them.
+
+    **Exactness.** Every instantiation produces the identical integer
+    histogram, and this is structural rather than a tolerance. Accumulation is
+    fixed-point Int32 throughout, integer addition is associative and
+    commutative, and every atomic adds the same per-(row, feature) quantized
+    value into the same bin whatever the block shape, so only the order of the
+    adds differs between instantiations and the order of integer adds cannot
+    change a sum. `GROUP` and `BIN_CAP` change where a partial lives, never
+    what goes into it.
+
+    **Tail blocks.** A block whose `slot0 + GROUP` overruns `n_slots` owns
+    only the slots that remain. It zeroes only its own span, accumulates only
+    into its own slices, and flushes only those, so a feature is never counted
+    twice and never dropped. The owned slices are stacked at `k * n_bins`
+    inside the allocation, so the stacking is bounded by
+    `GROUP * n_bins <= GROUP * BIN_CAP` and the zeroing walk covers exactly
+    the cells the flush will read.
+
+    **The two row loops.** `use_quant` selects between the pre-quantized
+    interleaved buffer `_quantize_grad_hess_kernel` writes and the two Float32
+    planes. They are two loops rather than one loop with a branch in it so the
+    default path spends no floating-point arithmetic in the row loop at all,
+    and one runtime flag rather than a third comptime parameter because
+    doubling forty instantiations to eighty is compile time every build on
+    every backend pays. The two produce bit-identical histograms by
+    construction; see `_quantize_grad_hess_kernel`.
+
+    **Fused subtraction.** With `do_sub`, the flush also subtracts what it
+    added from the slot `sub_offset` words away, which is the sibling
+    subtraction folded into the build. The destination is a signed offset
+    rather than a second pointer because both slots live in one pool buffer,
+    and two pointers into one buffer is an aliasing the compiler is right to
+    refuse. It is the same arithmetic the standalone
+    `gpu_leaf_batching._subtract_slice_kernel` performs and exact for the same
+    reason, both slots being fixed-point Int32
+    under one scale, so a parent's bins are the exact integer sum of its
+    children's. Bins this node never touched are left alone, which is what
+    subtracting zero from them would have done anyway.
+    """
+    var slot0 = GROUP * Int(block_idx.x)
+    var owned = Int(n_slots) - slot0
+    if owned > GROUP:
+        owned = GROUP
     var tid = thread_idx.x
     var nb = Int(n_bins)
     var nr = Int(n_rows)
+    var hs = Int(hist_size)
     var n = Int(count)
-    var plane = Int(n_slots) * nb
 
     var sg = stack_allocation[
-        GROUPED_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
+        GROUP * BIN_CAP,
+        Scalar[DType.int32],
+        address_space = AddressSpace.SHARED,
     ]()
     var sh = stack_allocation[
-        GROUPED_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
+        GROUP * BIN_CAP,
+        Scalar[DType.int32],
+        address_space = AddressSpace.SHARED,
     ]()
     var sc = stack_allocation[
-        GROUPED_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
+        GROUP * BIN_CAP,
+        Scalar[DType.int32],
+        address_space = AddressSpace.SHARED,
     ]()
 
-    var span = 2 * nb if paired else nb
+    var span = owned * nb
     var b = tid
     while b < span:
         sg[unsafe_offset=b] = 0
@@ -1215,58 +834,95 @@ def _range_hist_partial_g2q_kernel(
         b += block_dim.x
     barrier()
 
-    var tile_begin = t * Int(rows_per_tile)
+    # One feature id and one column base per owned slot, read once. The loop
+    # is unrolled so both arrays are indexed by a compile-time constant and
+    # stay in registers rather than spilling to local memory.
+    var fid = stack_allocation[GROUP, Int]()
+    var col = stack_allocation[GROUP, Int]()
+    comptime for k in range(GROUP):
+        fid[unsafe_offset=k] = 0
+        col[unsafe_offset=k] = 0
+        if k < owned:
+            var f = Int(feat_ids[unsafe_offset = slot0 + k][0])
+            fid[unsafe_offset=k] = f
+            col[unsafe_offset=k] = f * nr
+
+    var tile_begin = block_idx.y * Int(rows_per_tile)
     var tile_end = tile_begin + Int(rows_per_tile)
     if tile_end > n:
         tile_end = n
 
-    var col0 = f0 * nr
-    var col1 = f1 * nr
-    var j = tile_begin + tid
-    while j < tile_end:
-        var r = Int(rows[unsafe_offset = Int(begin) + j][0])
-        var gq_r = gq[unsafe_offset = 2 * r][0]
-        var hq_r = gq[unsafe_offset = 2 * r + 1][0]
-        var b0 = Int(bins[unsafe_offset = col0 + r])
-        _ = Atomic.fetch_add(sg.unsafe_offset(b0), gq_r)
-        _ = Atomic.fetch_add(sh.unsafe_offset(b0), hq_r)
-        _ = Atomic.fetch_add(sc.unsafe_offset(b0), Int32(1))
-        if paired:
-            var b1 = nb + Int(bins[unsafe_offset = col1 + r])
-            _ = Atomic.fetch_add(sg.unsafe_offset(b1), gq_r)
-            _ = Atomic.fetch_add(sh.unsafe_offset(b1), hq_r)
-            _ = Atomic.fetch_add(sc.unsafe_offset(b1), Int32(1))
-        j += block_dim.x
+    if Int(use_quant) != 0:
+        var j = tile_begin + tid
+        while j < tile_end:
+            var r = Int(rows[unsafe_offset = Int(begin) + j][0])
+            var gqv = gq[unsafe_offset = 2 * r][0]
+            var hqv = gq[unsafe_offset = 2 * r + 1][0]
+            comptime for k in range(GROUP):
+                if k < owned:
+                    var s = k * nb + Int(
+                        bins[unsafe_offset = col[unsafe_offset=k] + r]
+                    )
+                    _ = Atomic.fetch_add(sg.unsafe_offset(s), gqv)
+                    _ = Atomic.fetch_add(sh.unsafe_offset(s), hqv)
+                    _ = Atomic.fetch_add(sc.unsafe_offset(s), Int32(1))
+            j += block_dim.x
+    else:
+        var j = tile_begin + tid
+        while j < tile_end:
+            var r = Int(rows[unsafe_offset = Int(begin) + j][0])
+            var gqv = Int32(round(grad[unsafe_offset=r][0] * g_scale))
+            var hqv = Int32(round(hess[unsafe_offset=r][0] * h_scale))
+            comptime for k in range(GROUP):
+                if k < owned:
+                    var s = k * nb + Int(
+                        bins[unsafe_offset = col[unsafe_offset=k] + r]
+                    )
+                    _ = Atomic.fetch_add(sg.unsafe_offset(s), gqv)
+                    _ = Atomic.fetch_add(sh.unsafe_offset(s), hqv)
+                    _ = Atomic.fetch_add(sc.unsafe_offset(s), Int32(1))
+            j += block_dim.x
     barrier()
 
-    var base0 = t * 3 * plane + slot0 * nb
-    b = tid
-    while b < nb:
-        partials[unsafe_offset = base0 + b] = sg[unsafe_offset=b][0]
-        partials[unsafe_offset = base0 + plane + b] = sh[unsafe_offset=b][0]
-        partials[unsafe_offset = base0 + 2 * plane + b] = sc[
-            unsafe_offset=b
-        ][0]
-        b += block_dim.x
-    if not paired:
-        return
-    var base1 = t * 3 * plane + slot1 * nb
-    b = tid
-    while b < nb:
-        var s = nb + b
-        partials[unsafe_offset = base1 + b] = sg[unsafe_offset=s][0]
-        partials[unsafe_offset = base1 + plane + b] = sh[unsafe_offset=s][0]
-        partials[unsafe_offset = base1 + 2 * plane + b] = sc[
-            unsafe_offset=s
-        ][0]
-        b += block_dim.x
+    var sub = Int(do_sub) != 0
+    comptime for k in range(GROUP):
+        if k < owned:
+            var base = fid[unsafe_offset=k] * nb
+            var lift = k * nb
+            var c = tid
+            while c < nb:
+                var s = lift + c
+                if sc[unsafe_offset=s][0] != 0:
+                    var vg = sg[unsafe_offset=s][0]
+                    var vh = sh[unsafe_offset=s][0]
+                    var vc = sc[unsafe_offset=s][0]
+                    _ = Atomic.fetch_add(out_hist.unsafe_offset(base + c), vg)
+                    _ = Atomic.fetch_add(
+                        out_hist.unsafe_offset(hs + base + c), vh
+                    )
+                    _ = Atomic.fetch_add(
+                        out_hist.unsafe_offset(2 * hs + base + c), vc
+                    )
+                    if sub:
+                        var so = Int(sub_offset) + base + c
+                        _ = Atomic.fetch_add(out_hist.unsafe_offset(so), -vg)
+                        _ = Atomic.fetch_add(
+                            out_hist.unsafe_offset(hs + so), -vh
+                        )
+                        _ = Atomic.fetch_add(
+                            out_hist.unsafe_offset(2 * hs + so), -vc
+                        )
+                c += block_dim.x
 
 
-def _range_hist_partial_g4_kernel(
+def _range_hist_partial_kernel[
+    GROUP: Int, BIN_CAP: Int
+](
     bins: MutPointer[UInt8, MutAnyOrigin],
     rows: MutPointer[Int32, MutAnyOrigin],
     grad: MutPointer[Float32, MutAnyOrigin],
     hess: MutPointer[Float32, MutAnyOrigin],
+    gq: MutPointer[Int32, MutAnyOrigin],
     feat_ids: MutPointer[Int32, MutAnyOrigin],
     partials: MutPointer[Int32, MutAnyOrigin],
     n_rows: Int32,
@@ -1277,47 +933,44 @@ def _range_hist_partial_g4_kernel(
     count: Int32,
     g_scale: Float32,
     h_scale: Float32,
+    use_quant: Int32,
 ):
-    """`_range_hist_partial_g2_kernel` widened to four features per block.
+    """The tiled twin of `_range_hist_atomic_kernel`: the same threadgroup
+    accumulation, written to a per-(tile, slot) partial slot instead of folded
+    into the output with global atomics.
 
-    One more halving of the row side: the row index, gradient, hessian, and
-    both quantizations are spent four times instead of twice, so the
-    row-side bytes per (row, feature) visit drop again. What it costs is
-    another shared-memory doubling — 12 KiB of a 32 KiB budget — so at most
-    two such blocks are resident per core, which is why this width is a
-    separate opt-in measurement and not a consequence of the pairing's win.
+    Same two comptime parameters and the same rules for them, so everything
+    the atomic kernel's docstring argues about capacity, group width,
+    exactness, tail blocks, and the two row loops holds here unchanged. What
+    is particular to this kernel is the partial layout, and it is untouched:
+    a block owning several slots writes the same per-slot
+    `[grad | hess | count]` slices that as many one-slot blocks would have
+    written, each slice still written by exactly one block and by no atomic at
+    all, so `_range_reduce_kernel` and the fused sibling subtraction it
+    carries combine these partials unchanged whatever `GROUP` and `BIN_CAP`
+    are.
 
-    The tail block owns however many slots remain (one to four); each owned
-    slot's shared slice sits `k * n_bins` above the first and is written to
-    the same per-slot partial layout, so a feature is never counted twice,
-    never dropped, and `_range_reduce_kernel` combines these partials
-    unchanged. Bit-identical for the reasons the pairing is: fixed-point
-    Int32, same per-(row, feature) quantized adds, and integer addition
-    cannot see the order.
-
-    Measured on an Apple M4, three interleaved repeats per arm in one
-    process at 5M x 50, 100 rounds: 12.09s at group 2 against 11.70s at
-    group 4, a 1.034x difference with both arms' spreads under 1% and
-    predictions byte-identical. Resolved, and small: the occupancy halving
-    gives back most of what the traffic halving buys, so the Metal default
-    stays at the pairing — three percent on one part is inside the risk
-    that a different Apple generation inverts it. Group 4 stays the
-    explicit request for whoever measures their own device.
+    This is the kernel a large fit actually runs: `resolve_tiling` picks the
+    tiled strategy whenever occupancy wants more than one tile per feature,
+    and at 5M x 50 the histogram build is measured at about 79% of GPU
+    training wall clock. Two measurements from the hand-written variants this
+    replaces carry over, both on an Apple M4 with three interleaved repeats
+    per arm in one process, same binned data, predictions byte-identical: a
+    full 100-round `train_gpu` at 5M x 50 ran 15.96s at group 1 against 11.49s
+    at group 2 (1.39x, the group-2 arm's own spread 0.03%), and 12.09s at
+    group 2 against 11.70s at group 4 (1.034x, both spreads under 1%). Both
+    were taken with three `MAX_BINS`-wide planes allocated at every bin count,
+    which is what made group 4 nearly a wash: the traffic halving was given
+    back by the occupancy halving. Whether sizing the planes to the real bin
+    count changes that verdict is exactly the thing this parameterization
+    makes measurable and it has NOT been measured. The measurement is an
+    interleaved A/B of group 2 against group 4 at a bin count of 64 or below,
+    in one process, the protocol `bench_histogram.mojo` already implements.
     """
-    var slot0 = 4 * Int(block_idx.x)
+    var slot0 = GROUP * Int(block_idx.x)
     var owned = Int(n_slots) - slot0
-    if owned > 4:
-        owned = 4
-    var f0 = Int(feat_ids[unsafe_offset=slot0][0])
-    var f1 = 0
-    var f2 = 0
-    var f3 = 0
-    if owned > 1:
-        f1 = Int(feat_ids[unsafe_offset = slot0 + 1][0])
-    if owned > 2:
-        f2 = Int(feat_ids[unsafe_offset = slot0 + 2][0])
-    if owned > 3:
-        f3 = Int(feat_ids[unsafe_offset = slot0 + 3][0])
+    if owned > GROUP:
+        owned = GROUP
     var t = block_idx.y
     var tid = thread_idx.x
     var nb = Int(n_bins)
@@ -1326,18 +979,21 @@ def _range_hist_partial_g4_kernel(
     var plane = Int(n_slots) * nb
 
     var sg = stack_allocation[
-        QUAD_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
+        GROUP * BIN_CAP,
+        Scalar[DType.int32],
+        address_space = AddressSpace.SHARED,
     ]()
     var sh = stack_allocation[
-        QUAD_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
+        GROUP * BIN_CAP,
+        Scalar[DType.int32],
+        address_space = AddressSpace.SHARED,
     ]()
     var sc = stack_allocation[
-        QUAD_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
+        GROUP * BIN_CAP,
+        Scalar[DType.int32],
+        address_space = AddressSpace.SHARED,
     ]()
 
-    # Owned slots' bins are stacked contiguously, so one zeroing walk covers
-    # exactly the slices this block will write and a tail block never
-    # touches the slices above its last.
     var span = owned * nb
     var b = tid
     while b < span:
@@ -1347,58 +1003,66 @@ def _range_hist_partial_g4_kernel(
         b += block_dim.x
     barrier()
 
+    var col = stack_allocation[GROUP, Int]()
+    comptime for k in range(GROUP):
+        col[unsafe_offset=k] = 0
+        if k < owned:
+            col[unsafe_offset=k] = (
+                Int(feat_ids[unsafe_offset = slot0 + k][0]) * nr
+            )
+
     var tile_begin = t * Int(rows_per_tile)
     var tile_end = tile_begin + Int(rows_per_tile)
     if tile_end > n:
         tile_end = n
 
-    var col0 = f0 * nr
-    var col1 = f1 * nr
-    var col2 = f2 * nr
-    var col3 = f3 * nr
-    var j = tile_begin + tid
-    while j < tile_end:
-        var r = Int(rows[unsafe_offset = Int(begin) + j][0])
-        var gq = Int32(round(grad[unsafe_offset=r][0] * g_scale))
-        var hq = Int32(round(hess[unsafe_offset=r][0] * h_scale))
-        var b0 = Int(bins[unsafe_offset = col0 + r])
-        _ = Atomic.fetch_add(sg.unsafe_offset(b0), gq)
-        _ = Atomic.fetch_add(sh.unsafe_offset(b0), hq)
-        _ = Atomic.fetch_add(sc.unsafe_offset(b0), Int32(1))
-        if owned > 1:
-            var b1 = nb + Int(bins[unsafe_offset = col1 + r])
-            _ = Atomic.fetch_add(sg.unsafe_offset(b1), gq)
-            _ = Atomic.fetch_add(sh.unsafe_offset(b1), hq)
-            _ = Atomic.fetch_add(sc.unsafe_offset(b1), Int32(1))
-        if owned > 2:
-            var b2 = 2 * nb + Int(bins[unsafe_offset = col2 + r])
-            _ = Atomic.fetch_add(sg.unsafe_offset(b2), gq)
-            _ = Atomic.fetch_add(sh.unsafe_offset(b2), hq)
-            _ = Atomic.fetch_add(sc.unsafe_offset(b2), Int32(1))
-        if owned > 3:
-            var b3 = 3 * nb + Int(bins[unsafe_offset = col3 + r])
-            _ = Atomic.fetch_add(sg.unsafe_offset(b3), gq)
-            _ = Atomic.fetch_add(sh.unsafe_offset(b3), hq)
-            _ = Atomic.fetch_add(sc.unsafe_offset(b3), Int32(1))
-        j += block_dim.x
+    if Int(use_quant) != 0:
+        var j = tile_begin + tid
+        while j < tile_end:
+            var r = Int(rows[unsafe_offset = Int(begin) + j][0])
+            var gqv = gq[unsafe_offset = 2 * r][0]
+            var hqv = gq[unsafe_offset = 2 * r + 1][0]
+            comptime for k in range(GROUP):
+                if k < owned:
+                    var s = k * nb + Int(
+                        bins[unsafe_offset = col[unsafe_offset=k] + r]
+                    )
+                    _ = Atomic.fetch_add(sg.unsafe_offset(s), gqv)
+                    _ = Atomic.fetch_add(sh.unsafe_offset(s), hqv)
+                    _ = Atomic.fetch_add(sc.unsafe_offset(s), Int32(1))
+            j += block_dim.x
+    else:
+        var j = tile_begin + tid
+        while j < tile_end:
+            var r = Int(rows[unsafe_offset = Int(begin) + j][0])
+            var gqv = Int32(round(grad[unsafe_offset=r][0] * g_scale))
+            var hqv = Int32(round(hess[unsafe_offset=r][0] * h_scale))
+            comptime for k in range(GROUP):
+                if k < owned:
+                    var s = k * nb + Int(
+                        bins[unsafe_offset = col[unsafe_offset=k] + r]
+                    )
+                    _ = Atomic.fetch_add(sg.unsafe_offset(s), gqv)
+                    _ = Atomic.fetch_add(sh.unsafe_offset(s), hqv)
+                    _ = Atomic.fetch_add(sc.unsafe_offset(s), Int32(1))
+            j += block_dim.x
     barrier()
 
-    var k = 0
-    while k < owned:
-        var base = t * 3 * plane + (slot0 + k) * nb
-        var lift = k * nb
-        b = tid
-        while b < nb:
-            var s = lift + b
-            partials[unsafe_offset = base + b] = sg[unsafe_offset=s][0]
-            partials[unsafe_offset = base + plane + b] = sh[
-                unsafe_offset=s
-            ][0]
-            partials[unsafe_offset = base + 2 * plane + b] = sc[
-                unsafe_offset=s
-            ][0]
-            b += block_dim.x
-        k += 1
+    comptime for k in range(GROUP):
+        if k < owned:
+            var base = t * 3 * plane + (slot0 + k) * nb
+            var lift = k * nb
+            var c = tid
+            while c < nb:
+                var s = lift + c
+                partials[unsafe_offset = base + c] = sg[unsafe_offset=s][0]
+                partials[unsafe_offset = base + plane + c] = sh[
+                    unsafe_offset=s
+                ][0]
+                partials[unsafe_offset = base + 2 * plane + c] = sc[
+                    unsafe_offset=s
+                ][0]
+                c += block_dim.x
 
 
 def _range_reduce_kernel(
@@ -1731,9 +1395,10 @@ struct GpuActiveRows(Movable):
     var block_threads: Int
     var ranges: LeafRangeTable
     var verify_counts: Bool
-    # Features one histogram threadgroup accumulates: 1 is the shipping
-    # kernel, 2 the paired one. Never read by anything but
-    # `enqueue_range_histogram`, and it changes no histogram it produces.
+    # Feature slots one histogram threadgroup accumulates: a rung of the
+    # ladder 1, 2, 4, 8, 16, each of which has a kernel instantiation. Never
+    # read by anything but `enqueue_range_histogram`, and it changes no
+    # histogram it produces.
     var feature_group: Int
     # The interleaved pre-quantized gradient buffer (`_quantize_grad_hess_kernel`),
     # 2 * n_rows Int32, and the state that says whether it describes the
@@ -1752,6 +1417,19 @@ struct GpuActiveRows(Movable):
     # kernels. A launch-shape knob and nothing else, because the two arms
     # produce the identical permutation and the identical left count.
     var scan_primitives: Bool
+    # --- hist-kernel-family lane ---
+    # The shared-plane width every histogram launch from here instantiates its
+    # kernel at: `histogram_bin_capacity(n_bins)`, one of 32, 64, 128, 256.
+    # Held rather than recomputed per node because it is a property of the
+    # dataset, and read by `set_feature_group` so a width whose footprint the
+    # device cannot hold is refused where it is asked for rather than at the
+    # launch that would fail.
+    var bin_cap: Int
+    # `caps.max_shared_memory_per_block` as reported when this was
+    # constructed. The only device fact this struct keeps, and it keeps it for
+    # one reason: `3 * group * bin_cap * 4` has to be checked against
+    # something before a group is accepted.
+    var max_shared_bytes: Int
 
     def __init__(
         out self,
@@ -1809,26 +1487,45 @@ struct GpuActiveRows(Movable):
         # not a dependency. `MOJOTREES_GPU_VERIFY_ROWS=1` turns it on, which
         # is what tests and a first integration want.
         self.verify_counts = _env_int("MOJOTREES_GPU_VERIFY_ROWS", 0) != 0
-        # One feature per threadgroup unless asked otherwise. The paired
-        # kernel produces the identical histogram, so this is a launch-shape
-        # knob and nothing else. This constructor cannot see which API the
-        # context speaks, so the measured per-device default lives in the
-        # caller: GpuHistogramBuilder raises this to 2 on Metal when the
-        # environment does not choose, and leaves other backends at 1 until
-        # someone measures them.
+        # The shared-plane width every kernel launched from here is
+        # instantiated at, fixed by the dataset's bin count.
+        self.bin_cap = histogram_bin_capacity(n_bins)
+        self.max_shared_bytes = caps.max_shared_memory_per_block
+        # One feature slot per threadgroup unless asked otherwise. Every rung
+        # of the ladder produces the identical histogram, so this is a
+        # launch-shape knob and nothing else. This constructor cannot see
+        # which API the context speaks, so the per-device default lives in the
+        # caller: GpuHistogramBuilder widens it by the free-footprint rule in
+        # `gpu_tiling.free_feature_group` when the environment does not
+        # choose. A request that is not a rung, or one whose footprint this
+        # device cannot hold, is rounded down here rather than raised, because
+        # a constructor is not where an environment variable should fail a
+        # fit; `set_feature_group` raises, because there the width came from a
+        # caller who can be told.
         var group = _env_int("MOJOTREES_GPU_FEATURE_GROUP", 1)
         if group < 1:
             group = 1
         if group > FEATURE_GROUP_MAX:
             group = FEATURE_GROUP_MAX
-        self.feature_group = group
-        # Pre-quantized interleaved gradients for the paired tiled kernel.
-        # Off until measured per device; `MOJOTREES_GPU_QUANTIZED_GRADS=1`
-        # or `set_quantized_gradients` turns it on. Cannot change a
-        # histogram, only what the kernel gathers per row.
+        var rung = 1
+        var chosen = 1
+        for _ in range(FEATURE_GROUP_LADDER):
+            if rung <= group and (
+                histogram_shared_bytes(self.bin_cap, rung)
+                <= self.max_shared_bytes
+            ):
+                chosen = rung
+            rung *= 2
+        self.feature_group = chosen
+        # Pre-quantized interleaved gradients, the default source for every
+        # histogram kernel. `MOJOTREES_GPU_QUANTIZED_GRADS=0` or
+        # `set_quantized_gradients(False)` forces the Float32 planes back, so
+        # a benchmark can hold both arms. Cannot change a histogram, only what
+        # the kernel gathers per row; see `_quantize_grad_hess_kernel` for why
+        # that is an argument from the expression rather than a measurement.
         self.gq_dev = self.ctx.enqueue_create_buffer[DType.int32](2 * n_rows)
         self.quantized_gradients = (
-            _env_int("MOJOTREES_GPU_QUANTIZED_GRADS", 0) != 0
+            _env_int("MOJOTREES_GPU_QUANTIZED_GRADS", 1) != 0
         )
         self.quant_valid = False
         self.quant_g_scale = 0.0
@@ -1861,7 +1558,7 @@ struct GpuActiveRows(Movable):
         return self.ranges.get(node)
 
     def set_feature_group(mut self, group: Int) raises:
-        """How many features one histogram threadgroup accumulates.
+        """How many feature slots one histogram threadgroup accumulates.
 
         An argument rather than only an environment variable, because an A/B
         that reads its arm from the environment can silently run one arm
@@ -1869,20 +1566,52 @@ struct GpuActiveRows(Movable):
         the split-search strategy and the benchmark harness now passes the
         arm in. Takes effect on the next `enqueue_range_histogram`, and
         cannot change a histogram, only the launch that builds it.
+
+        Two refusals, and they are different refusals. A width that is not a
+        rung of the ladder (3, or anything above 16) has no kernel
+        instantiation and could not launch. A width that is a rung but whose
+        three `group * bin_cap` Int32 planes exceed what this device reported
+        for one threadgroup would compile and then fail at the launch, which
+        is a worse place to find out; at 256 bins that is every group past 2
+        on a 32 KiB budget, and at 32 bins it is nothing on the ladder.
         """
-        if group < 1 or group > FEATURE_GROUP_MAX or group == 3:
+        if not is_feature_group_width(group):
             raise Error(
-                "feature group must be 1, 2, or 4: those are the widths a"
-                " kernel exists for"
+                "feature group must be 1, 2, 4, 8, or 16: those are the"
+                " widths a kernel is instantiated at"
+            )
+        var need = histogram_shared_bytes(self.bin_cap, group)
+        if need > self.max_shared_bytes:
+            raise Error(
+                "a feature group of ",
+                group,
+                " at ",
+                self.bin_cap,
+                " bins needs ",
+                need,
+                " bytes of threadgroup memory and this device reported ",
+                self.max_shared_bytes,
             )
         self.feature_group = group
 
     def set_quantized_gradients(mut self, on: Bool):
-        """Whether the paired tiled histogram reads the pre-quantized
-        interleaved gradient buffer instead of the two Float32 planes. An
-        argument for the same reason `set_feature_group` is one: an A/B
-        passes its arm in. Takes effect on the next `enqueue_range_histogram`
-        and cannot change a histogram."""
+        """Whether every histogram kernel reads the pre-quantized interleaved
+        gradient buffer instead of the two Float32 planes.
+
+        On by default, unlike when this was wired into one kernel only. The
+        reason it can be a default is that it is exact by construction rather
+        than by measurement: `gq[2r]` is the same Float32 multiply and the
+        same `round` the row loop would have evaluated, hoisted out of a loop
+        it does not depend on, so the histogram is bit-identical and the row
+        loop does strictly less work. See `_quantize_grad_hess_kernel`.
+
+        It stays an argument, and `MOJOTREES_GPU_QUANTIZED_GRADS=0` stays a
+        way to force the Float32 planes, for the same reason
+        `set_feature_group` is an argument: an A/B holds both arms in one
+        process rather than reading its arm from the environment. Takes
+        effect on the next `enqueue_range_histogram` and cannot change a
+        histogram.
+        """
         self.quantized_gradients = on
         self.quant_valid = False
 
@@ -2352,6 +2081,15 @@ struct GpuActiveRows(Movable):
         `subtract`. An empty node subtracts nothing, which is right: a child
         with no rows leaves its sibling holding the parent's histogram
         unchanged.
+
+        Which kernel instantiation runs is resolved here and nowhere else:
+        `bin_cap` from the dataset's bin count, the group from
+        `feature_group` through `_launch_group`, and the pair through the two
+        static trees below. Every instantiation produces the same integers, so
+        this resolution is a launch shape and never a numeric decision. The
+        pre-quantized gradient buffer is rebuilt here too, once per tree per
+        scale, above the strategy branch because every strategy and every
+        width now reads it.
         """
         if n_slots < 1 or n_slots > self.n_features:
             raise Error("active feature count out of range")
@@ -2385,98 +2123,32 @@ struct GpuActiveRows(Movable):
 
         var do_sub = Int32(1) if subtract else Int32(0)
 
+        # One quantizing pass per tree per scale, ordered before the histogram
+        # that reads it by the queue. Every strategy and every group width
+        # reads the same buffer now, so this sits above the dispatch rather
+        # than inside one arm of it.
+        var use_quant = Int32(0)
+        if self.quantized_gradients:
+            self._ensure_quantized(grad, hess, g_scale, h_scale)
+            use_quant = Int32(1)
+
         if tiling.strategy == STRATEGY_TILED:
-            if self.feature_group >= 4 and n_slots >= 2:
-                # A quarter of the threadgroups, each owning up to four
-                # feature slots; the tail block owns what remains. The
-                # reduce that follows is the same either way because the
-                # partial layout is per slot, not per block.
-                var quad_blocks = (n_slots + 3) // 4
-                self.ctx.enqueue_function[_range_hist_partial_g4_kernel](
-                    bins,
-                    self.rows_dev.unsafe_ptr(),
-                    grad,
-                    hess,
-                    feat_ids,
-                    partials,
-                    Int32(self.n_rows),
-                    Int32(n_slots),
-                    Int32(self.n_bins),
-                    Int32(tiling.rows_per_tile),
-                    Int32(window.begin),
-                    Int32(window.count()),
-                    g_scale,
-                    h_scale,
-                    grid_dim=(quad_blocks, tiling.n_tiles),
-                    block_dim=threads,
-                )
-            elif (
-                self.feature_group >= 2
-                and n_slots >= 2
-                and self.quantized_gradients
-            ):
-                # The pairing over the pre-quantized interleaved gradients:
-                # one gathered line per row for the row side instead of two.
-                self._ensure_quantized(grad, hess, g_scale, h_scale)
-                var grouped_blocks = (n_slots + 1) // 2
-                self.ctx.enqueue_function[_range_hist_partial_g2q_kernel](
-                    bins,
-                    self.rows_dev.unsafe_ptr(),
-                    self.gq_dev.unsafe_ptr(),
-                    feat_ids,
-                    partials,
-                    Int32(self.n_rows),
-                    Int32(n_slots),
-                    Int32(self.n_bins),
-                    Int32(tiling.rows_per_tile),
-                    Int32(window.begin),
-                    Int32(window.count()),
-                    grid_dim=(grouped_blocks, tiling.n_tiles),
-                    block_dim=threads,
-                )
-            elif self.feature_group >= 2 and n_slots >= 2:
-                # Half as many threadgroups, each owning two feature slots,
-                # exactly as the atomic pairing below; the reduce that
-                # follows is the same either way because the partial layout
-                # is per slot, not per block.
-                var grouped_blocks = (n_slots + 1) // 2
-                self.ctx.enqueue_function[_range_hist_partial_g2_kernel](
-                    bins,
-                    self.rows_dev.unsafe_ptr(),
-                    grad,
-                    hess,
-                    feat_ids,
-                    partials,
-                    Int32(self.n_rows),
-                    Int32(n_slots),
-                    Int32(self.n_bins),
-                    Int32(tiling.rows_per_tile),
-                    Int32(window.begin),
-                    Int32(window.count()),
-                    g_scale,
-                    h_scale,
-                    grid_dim=(grouped_blocks, tiling.n_tiles),
-                    block_dim=threads,
-                )
-            else:
-                self.ctx.enqueue_function[_range_hist_partial_kernel](
-                    bins,
-                    self.rows_dev.unsafe_ptr(),
-                    grad,
-                    hess,
-                    feat_ids,
-                    partials,
-                    Int32(self.n_rows),
-                    Int32(n_slots),
-                    Int32(self.n_bins),
-                    Int32(tiling.rows_per_tile),
-                    Int32(window.begin),
-                    Int32(window.count()),
-                    g_scale,
-                    h_scale,
-                    grid_dim=(n_slots, tiling.n_tiles),
-                    block_dim=threads,
-                )
+            self._enqueue_partial_family(
+                bins,
+                grad,
+                hess,
+                feat_ids,
+                partials,
+                n_slots,
+                tiling.rows_per_tile,
+                window.begin,
+                window.count(),
+                g_scale,
+                h_scale,
+                use_quant,
+                tiling.n_tiles,
+                threads,
+            )
             var n_cells = 3 * n_slots * self.n_bins
             var blocks = (n_cells + threads - 1) // threads
             self.ctx.enqueue_function[_range_reduce_kernel](
@@ -2492,52 +2164,530 @@ struct GpuActiveRows(Movable):
                 grid_dim=blocks,
                 block_dim=threads,
             )
-        elif self.feature_group >= 2 and n_slots >= 2:
-            # Half as many threadgroups, each owning two feature slots. The
-            # last one is unpaired when `n_slots` is odd, which the kernel
-            # handles rather than the launch: a block that covers one slot
-            # writes one slice.
-            var grouped_blocks = (n_slots + 1) // 2
-            self.ctx.enqueue_function[_range_hist_atomic_g2_kernel](
+        else:
+            self._enqueue_atomic_family(
+                bins,
+                grad,
+                hess,
+                feat_ids,
+                out_hist,
+                n_slots,
+                hist_size,
+                tiling.rows_per_tile,
+                window.begin,
+                window.count(),
+                g_scale,
+                h_scale,
+                sub_offset,
+                do_sub,
+                use_quant,
+                tiling.n_tiles,
+                threads,
+            )
+
+    def _launch_group(self, n_slots: Int) -> Int:
+        """The group width this launch runs at.
+
+        `feature_group`, except that a single active feature slot runs at 1
+        whatever was asked for. That is the `n_slots >= 2` guard the
+        hand-written variants carried, kept verbatim so the grids this
+        dispatch produces at widths 1, 2, and 4 are the grids the launch site
+        produced before the family was parameterized. Nothing else is
+        narrowed: a request stays the request.
+        """
+        if n_slots < 2:
+            return 1
+        return self.feature_group
+
+    def _enqueue_partial_family[
+        bins_origin: MutOrigin,
+        grad_origin: MutOrigin,
+        hess_origin: MutOrigin,
+        feat_origin: MutOrigin,
+        part_origin: MutOrigin, //
+    ](
+        mut self,
+        bins: MutPointer[UInt8, bins_origin],
+        grad: MutPointer[Float32, grad_origin],
+        hess: MutPointer[Float32, hess_origin],
+        feat_ids: MutPointer[Int32, feat_origin],
+        partials: MutPointer[Int32, part_origin],
+        n_slots: Int,
+        rows_per_tile: Int,
+        begin: Int,
+        count: Int,
+        g_scale: Float32,
+        h_scale: Float32,
+        use_quant: Int32,
+        n_tiles: Int,
+        threads: Int,
+    ) raises:
+        """Pick the `GROUP` rung, then hand off to the rung's own dispatch.
+
+        The (GROUP, BIN_CAP) matrix is resolved as a static tree in two
+        halves, five ways here and four ways in `_enqueue_partial_at`, rather
+        than as twenty branches written out. Both halves are exhaustive over
+        their ladder, so the resolution cannot fall through to a width the
+        launch was not sized for.
+        """
+        var group = self._launch_group(n_slots)
+        if group >= 16:
+            self._enqueue_partial_at[16](
+                bins,
+                grad,
+                hess,
+                feat_ids,
+                partials,
+                n_slots,
+                rows_per_tile,
+                begin,
+                count,
+                g_scale,
+                h_scale,
+                use_quant,
+                n_tiles,
+                threads,
+            )
+        elif group >= 8:
+            self._enqueue_partial_at[8](
+                bins,
+                grad,
+                hess,
+                feat_ids,
+                partials,
+                n_slots,
+                rows_per_tile,
+                begin,
+                count,
+                g_scale,
+                h_scale,
+                use_quant,
+                n_tiles,
+                threads,
+            )
+        elif group >= 4:
+            self._enqueue_partial_at[4](
+                bins,
+                grad,
+                hess,
+                feat_ids,
+                partials,
+                n_slots,
+                rows_per_tile,
+                begin,
+                count,
+                g_scale,
+                h_scale,
+                use_quant,
+                n_tiles,
+                threads,
+            )
+        elif group >= 2:
+            self._enqueue_partial_at[2](
+                bins,
+                grad,
+                hess,
+                feat_ids,
+                partials,
+                n_slots,
+                rows_per_tile,
+                begin,
+                count,
+                g_scale,
+                h_scale,
+                use_quant,
+                n_tiles,
+                threads,
+            )
+        else:
+            self._enqueue_partial_at[1](
+                bins,
+                grad,
+                hess,
+                feat_ids,
+                partials,
+                n_slots,
+                rows_per_tile,
+                begin,
+                count,
+                g_scale,
+                h_scale,
+                use_quant,
+                n_tiles,
+                threads,
+            )
+
+    def _enqueue_partial_at[
+        bins_origin: MutOrigin,
+        grad_origin: MutOrigin,
+        hess_origin: MutOrigin,
+        feat_origin: MutOrigin,
+        part_origin: MutOrigin, //,
+        GROUP: Int,
+    ](
+        mut self,
+        bins: MutPointer[UInt8, bins_origin],
+        grad: MutPointer[Float32, grad_origin],
+        hess: MutPointer[Float32, hess_origin],
+        feat_ids: MutPointer[Int32, feat_origin],
+        partials: MutPointer[Int32, part_origin],
+        n_slots: Int,
+        rows_per_tile: Int,
+        begin: Int,
+        count: Int,
+        g_scale: Float32,
+        h_scale: Float32,
+        use_quant: Int32,
+        n_tiles: Int,
+        threads: Int,
+    ) raises:
+        """The tiled launch at one group width, over the four bin capacities.
+
+        `blocks` is `ceil(n_slots / GROUP)` at every rung, which reproduces
+        the grids the hand-written variants launched exactly: `n_slots` at
+        one, `(n_slots + 1) // 2` at the pairing, `(n_slots + 3) // 4` at the
+        quad. A tail block owns the slots that remain and the kernel handles
+        it, so nothing here rounds the slot count up.
+        """
+        var blocks = (n_slots + GROUP - 1) // GROUP
+        if self.bin_cap <= 32:
+            self.ctx.enqueue_function[_range_hist_partial_kernel[GROUP, 32]](
                 bins,
                 self.rows_dev.unsafe_ptr(),
                 grad,
                 hess,
+                self.gq_dev.unsafe_ptr(),
+                feat_ids,
+                partials,
+                Int32(self.n_rows),
+                Int32(n_slots),
+                Int32(self.n_bins),
+                Int32(rows_per_tile),
+                Int32(begin),
+                Int32(count),
+                g_scale,
+                h_scale,
+                use_quant,
+                grid_dim=(blocks, n_tiles),
+                block_dim=threads,
+            )
+        elif self.bin_cap <= 64:
+            self.ctx.enqueue_function[_range_hist_partial_kernel[GROUP, 64]](
+                bins,
+                self.rows_dev.unsafe_ptr(),
+                grad,
+                hess,
+                self.gq_dev.unsafe_ptr(),
+                feat_ids,
+                partials,
+                Int32(self.n_rows),
+                Int32(n_slots),
+                Int32(self.n_bins),
+                Int32(rows_per_tile),
+                Int32(begin),
+                Int32(count),
+                g_scale,
+                h_scale,
+                use_quant,
+                grid_dim=(blocks, n_tiles),
+                block_dim=threads,
+            )
+        elif self.bin_cap <= 128:
+            self.ctx.enqueue_function[_range_hist_partial_kernel[GROUP, 128]](
+                bins,
+                self.rows_dev.unsafe_ptr(),
+                grad,
+                hess,
+                self.gq_dev.unsafe_ptr(),
+                feat_ids,
+                partials,
+                Int32(self.n_rows),
+                Int32(n_slots),
+                Int32(self.n_bins),
+                Int32(rows_per_tile),
+                Int32(begin),
+                Int32(count),
+                g_scale,
+                h_scale,
+                use_quant,
+                grid_dim=(blocks, n_tiles),
+                block_dim=threads,
+            )
+        else:
+            self.ctx.enqueue_function[_range_hist_partial_kernel[GROUP, 256]](
+                bins,
+                self.rows_dev.unsafe_ptr(),
+                grad,
+                hess,
+                self.gq_dev.unsafe_ptr(),
+                feat_ids,
+                partials,
+                Int32(self.n_rows),
+                Int32(n_slots),
+                Int32(self.n_bins),
+                Int32(rows_per_tile),
+                Int32(begin),
+                Int32(count),
+                g_scale,
+                h_scale,
+                use_quant,
+                grid_dim=(blocks, n_tiles),
+                block_dim=threads,
+            )
+
+    def _enqueue_atomic_family[
+        bins_origin: MutOrigin,
+        grad_origin: MutOrigin,
+        hess_origin: MutOrigin,
+        feat_origin: MutOrigin,
+        out_origin: MutOrigin, //
+    ](
+        mut self,
+        bins: MutPointer[UInt8, bins_origin],
+        grad: MutPointer[Float32, grad_origin],
+        hess: MutPointer[Float32, hess_origin],
+        feat_ids: MutPointer[Int32, feat_origin],
+        out_hist: MutPointer[Int32, out_origin],
+        n_slots: Int,
+        hist_size: Int,
+        rows_per_tile: Int,
+        begin: Int,
+        count: Int,
+        g_scale: Float32,
+        h_scale: Float32,
+        sub_offset: Int,
+        do_sub: Int32,
+        use_quant: Int32,
+        n_tiles: Int,
+        threads: Int,
+    ) raises:
+        """The atomic twin of `_enqueue_partial_family`, same static tree."""
+        var group = self._launch_group(n_slots)
+        if group >= 16:
+            self._enqueue_atomic_at[16](
+                bins,
+                grad,
+                hess,
+                feat_ids,
+                out_hist,
+                n_slots,
+                hist_size,
+                rows_per_tile,
+                begin,
+                count,
+                g_scale,
+                h_scale,
+                sub_offset,
+                do_sub,
+                use_quant,
+                n_tiles,
+                threads,
+            )
+        elif group >= 8:
+            self._enqueue_atomic_at[8](
+                bins,
+                grad,
+                hess,
+                feat_ids,
+                out_hist,
+                n_slots,
+                hist_size,
+                rows_per_tile,
+                begin,
+                count,
+                g_scale,
+                h_scale,
+                sub_offset,
+                do_sub,
+                use_quant,
+                n_tiles,
+                threads,
+            )
+        elif group >= 4:
+            self._enqueue_atomic_at[4](
+                bins,
+                grad,
+                hess,
+                feat_ids,
+                out_hist,
+                n_slots,
+                hist_size,
+                rows_per_tile,
+                begin,
+                count,
+                g_scale,
+                h_scale,
+                sub_offset,
+                do_sub,
+                use_quant,
+                n_tiles,
+                threads,
+            )
+        elif group >= 2:
+            self._enqueue_atomic_at[2](
+                bins,
+                grad,
+                hess,
+                feat_ids,
+                out_hist,
+                n_slots,
+                hist_size,
+                rows_per_tile,
+                begin,
+                count,
+                g_scale,
+                h_scale,
+                sub_offset,
+                do_sub,
+                use_quant,
+                n_tiles,
+                threads,
+            )
+        else:
+            self._enqueue_atomic_at[1](
+                bins,
+                grad,
+                hess,
+                feat_ids,
+                out_hist,
+                n_slots,
+                hist_size,
+                rows_per_tile,
+                begin,
+                count,
+                g_scale,
+                h_scale,
+                sub_offset,
+                do_sub,
+                use_quant,
+                n_tiles,
+                threads,
+            )
+
+    def _enqueue_atomic_at[
+        bins_origin: MutOrigin,
+        grad_origin: MutOrigin,
+        hess_origin: MutOrigin,
+        feat_origin: MutOrigin,
+        out_origin: MutOrigin, //,
+        GROUP: Int,
+    ](
+        mut self,
+        bins: MutPointer[UInt8, bins_origin],
+        grad: MutPointer[Float32, grad_origin],
+        hess: MutPointer[Float32, hess_origin],
+        feat_ids: MutPointer[Int32, feat_origin],
+        out_hist: MutPointer[Int32, out_origin],
+        n_slots: Int,
+        hist_size: Int,
+        rows_per_tile: Int,
+        begin: Int,
+        count: Int,
+        g_scale: Float32,
+        h_scale: Float32,
+        sub_offset: Int,
+        do_sub: Int32,
+        use_quant: Int32,
+        n_tiles: Int,
+        threads: Int,
+    ) raises:
+        """The atomic launch at one group width, over the four bin
+        capacities."""
+        var blocks = (n_slots + GROUP - 1) // GROUP
+        if self.bin_cap <= 32:
+            self.ctx.enqueue_function[_range_hist_atomic_kernel[GROUP, 32]](
+                bins,
+                self.rows_dev.unsafe_ptr(),
+                grad,
+                hess,
+                self.gq_dev.unsafe_ptr(),
                 feat_ids,
                 out_hist,
                 Int32(self.n_rows),
                 Int32(n_slots),
                 Int32(self.n_bins),
                 Int32(hist_size),
-                Int32(tiling.rows_per_tile),
-                Int32(window.begin),
-                Int32(window.count()),
+                Int32(rows_per_tile),
+                Int32(begin),
+                Int32(count),
                 g_scale,
                 h_scale,
                 Int32(sub_offset),
                 do_sub,
-                grid_dim=(grouped_blocks, tiling.n_tiles),
+                use_quant,
+                grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
-        else:
-            self.ctx.enqueue_function[_range_hist_atomic_kernel](
+        elif self.bin_cap <= 64:
+            self.ctx.enqueue_function[_range_hist_atomic_kernel[GROUP, 64]](
                 bins,
                 self.rows_dev.unsafe_ptr(),
                 grad,
                 hess,
+                self.gq_dev.unsafe_ptr(),
                 feat_ids,
                 out_hist,
                 Int32(self.n_rows),
+                Int32(n_slots),
                 Int32(self.n_bins),
                 Int32(hist_size),
-                Int32(tiling.rows_per_tile),
-                Int32(window.begin),
-                Int32(window.count()),
+                Int32(rows_per_tile),
+                Int32(begin),
+                Int32(count),
                 g_scale,
                 h_scale,
                 Int32(sub_offset),
                 do_sub,
-                grid_dim=(n_slots, tiling.n_tiles),
+                use_quant,
+                grid_dim=(blocks, n_tiles),
+                block_dim=threads,
+            )
+        elif self.bin_cap <= 128:
+            self.ctx.enqueue_function[_range_hist_atomic_kernel[GROUP, 128]](
+                bins,
+                self.rows_dev.unsafe_ptr(),
+                grad,
+                hess,
+                self.gq_dev.unsafe_ptr(),
+                feat_ids,
+                out_hist,
+                Int32(self.n_rows),
+                Int32(n_slots),
+                Int32(self.n_bins),
+                Int32(hist_size),
+                Int32(rows_per_tile),
+                Int32(begin),
+                Int32(count),
+                g_scale,
+                h_scale,
+                Int32(sub_offset),
+                do_sub,
+                use_quant,
+                grid_dim=(blocks, n_tiles),
+                block_dim=threads,
+            )
+        else:
+            self.ctx.enqueue_function[_range_hist_atomic_kernel[GROUP, 256]](
+                bins,
+                self.rows_dev.unsafe_ptr(),
+                grad,
+                hess,
+                self.gq_dev.unsafe_ptr(),
+                feat_ids,
+                out_hist,
+                Int32(self.n_rows),
+                Int32(n_slots),
+                Int32(self.n_bins),
+                Int32(hist_size),
+                Int32(rows_per_tile),
+                Int32(begin),
+                Int32(count),
+                g_scale,
+                h_scale,
+                Int32(sub_offset),
+                do_sub,
+                use_quant,
+                grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
 
