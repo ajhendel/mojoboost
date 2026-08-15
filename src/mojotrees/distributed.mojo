@@ -1519,7 +1519,6 @@ def _grow_tree_feature_parallel[
     tests/parallel/test_distributed_strategies.mojo pins.
     """
     var n_features = shards[0].data.n_features
-    var n_bins = shards[0].data.n_bins
     var n_local = len(shards)
     var n_rows = shards[0].data.n_rows
     for i in range(n_local):
@@ -1875,7 +1874,6 @@ def _grow_tree_voting_parallel[
     `(top_k + 1) * n_bins` cells instead of `n_features * n_bins`.
     """
     var n_features = shards[0].data.n_features
-    var n_bins = shards[0].data.n_bins
     var n_local = len(shards)
     params.extra.check_scalars(params.min_data_in_leaf)
     params.extra.penalties.check_features(n_features)

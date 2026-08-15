@@ -33,31 +33,50 @@ from std.python import PythonObject
 
 from binding_support import nonnegative, py_dict, py_str_list
 
+from mojotrees.binning import BinnedMatrix, fit_bins
+from mojotrees.boosting import BoosterParams
+from mojotrees.callback import no_callback
+from mojotrees.collective import LocalCollective
 from mojotrees.collective import status_message as collective_status_message
+from mojotrees.distributed import (
+    DataShard,
+    DistributedRunOptions,
+    partition_rows,
+    train_distributed_run,
+)
+from mojotrees.distributed_gpu import (
+    distributed_gpu_available,
+    distributed_gpu_gates,
+    distributed_gpu_unavailable_detail,
+    gate_name,
+)
+from mojotrees.distributed_strategies import (
+    STRATEGY_FEATURE_PARALLEL,
+    parse_strategy,
+)
 from mojotrees.distributed_transport import (
     TRANSPORT_PROTOCOL_VERSION,
     parse_machine_list,
+    transport_available,
+    transport_validated,
     transport_status_message as mojo_transport_status_message,
 )
+from mojotrees.model import Model
 
 
-# The one fact this module states rather than reads.
-#
-# There is no native predicate for "a wire transport exists" because there
-# is nothing yet to predicate on: a socket `ByteEndpoint` is an absent
-# implementation, not a disabled one. Flipping this to True is not the way
-# to enable distributed training; the way is to add the endpoint and, with
-# it, `distributed_runtime_capability()` in distributed_transport.mojo,
-# which this then reads instead. The exact patch is in
-# `handoffs/connect_14_bindings.md`.
-comptime _HAS_WIRE_TRANSPORT = False
-
+# `multi_process` is read from the transport module, not stated here:
+# `transport_validated()` is the honest answer to "can two processes train
+# together", and it is False until the two-process procedure in
+# docs/DISTRIBUTED_TRANSPORT.md section 7 has been run. `transport_available()`
+# (a socket endpoint is compiled in) is reported beside it so a caller can
+# tell "unbuilt" from "unrun".
 comptime _NO_TRANSPORT_REASON = String(
-    "multi-process distributed training is not available in this build: the"
-    " wire protocol in src/mojotrees/distributed_transport.mojo is"
-    " implemented and exercised in process, but it has no socket endpoint"
-    " to run over, so no rank can reach another. Single-process training"
-    " over LocalCollective is what this build can run"
+    "multi-process distributed training is not validated in this build: the"
+    " wire protocol and a socket endpoint exist in"
+    " src/mojotrees/distributed_transport.mojo, but no two processes have"
+    " trained together yet (transport_validated() is False). Single-process"
+    " training over LocalCollective, with tree_learner data, feature, or"
+    " voting, is what this build runs"
 )
 
 
@@ -85,19 +104,84 @@ def distributed_capability() raises -> PythonObject:
     say no.
     """
     var out = py_dict()
-    out["multi_process"] = PythonObject(_HAS_WIRE_TRANSPORT)
+    var validated = transport_validated()
+    out["multi_process"] = PythonObject(validated)
+    out["transport_available"] = PythonObject(transport_available())
+    out["transport_validated"] = PythonObject(validated)
     out["local_collective"] = PythonObject(True)
     out["protocol_version"] = PythonObject(TRANSPORT_PROTOCOL_VERSION)
-    if _HAS_WIRE_TRANSPORT:
-        # Unreachable today, and left unanswered rather than guessed: a
-        # build with a transport knows its own world limit and must report
-        # it from `distributed_runtime_capability()`, not from here.
+    var learners: List[String] = ["serial", "data", "feature", "voting"]
+    out["tree_learners"] = py_str_list(learners)
+    if validated:
         out["max_world_size"] = PythonObject(-1)
         out["reason"] = PythonObject("")
     else:
         out["max_world_size"] = PythonObject(1)
         out["reason"] = PythonObject(_NO_TRANSPORT_REASON)
     return out^
+
+
+def distributed_gpu_status() raises -> PythonObject:
+    """What stands between this build and distributed GPU histogram
+    exchange, from src/mojotrees/distributed_gpu.mojo: `available`, the
+    `gates` still closed by name, and the `detail` text."""
+    var out = py_dict()
+    out["available"] = PythonObject(distributed_gpu_available())
+    var mask = distributed_gpu_gates()
+    var closed = List[String]()
+    var bit = 1
+    while bit <= mask:
+        if mask & bit != 0:
+            closed.append(gate_name(bit))
+        bit *= 2
+    out["gates"] = py_str_list(closed)
+    out["detail"] = PythonObject(distributed_gpu_unavailable_detail())
+    return out^
+
+
+def train_local_world[
+    features_origin: ImmOrigin, //
+](
+    features: Span[Float64, features_origin],
+    n_rows: Int,
+    n_features: Int,
+    target: List[Float64],
+    objective: Int,
+    params: BoosterParams,
+    max_bins: Int,
+    weights: List[Float64],
+    alpha: Float64,
+    world_size: Int,
+    tree_learner: String,
+    top_k: Int,
+) raises -> Model:
+    """Train over a world of `world_size` ranks hosted in this process, with
+    LightGBM's `tree_learner` by name. Data and voting parallel partition the
+    rows contiguously across ranks; feature parallel hands every rank the
+    whole dataset, which is that mode's arrangement. Binning is the same
+    `fit_bins` the single-node trainer uses, so the returned Model predicts
+    and saves like any other."""
+    if world_size < 1:
+        raise Error("num_machines must be at least 1")
+    var mapper = fit_bins(features, n_rows, n_features, max_bins)
+    var data = mapper.transform(features, n_rows)
+    var options = DistributedRunOptions()
+    options.tree_learner = parse_strategy(tree_learner)
+    options.top_k = top_k
+    var shards: List[DataShard]
+    if options.tree_learner == STRATEGY_FEATURE_PARALLEL:
+        shards = List[DataShard](capacity=world_size)
+        for _ in range(world_size):
+            shards.append(
+                DataShard(data.copy(), target.copy(), weights.copy())
+            )
+    else:
+        shards = partition_rows(data, target, world_size, weights)
+    var comm = LocalCollective(world_size)
+    var outcome = train_distributed_run(
+        shards, objective, params, comm, options, no_callback, alpha
+    )
+    return Model(mapper^, outcome.model.copy())
 
 
 def distributed_check_machine_list(
