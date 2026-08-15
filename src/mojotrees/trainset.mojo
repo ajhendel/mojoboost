@@ -96,6 +96,12 @@ from .device import CPU_DEVICE, GPU_DEVICE, resolve_device
 from .goss import GossParams
 from .model import Model, MulticlassModel
 from .ranking import RankerParams, groups_from_counts, train_ranker
+from .ranking_advanced import (
+    AdvancedRankParams,
+    PositionMap,
+    advanced_ranking_requested,
+    train_ranker_advanced,
+)
 from .raw_data import RawData
 from .sparse import CscMatrix, CsrMatrix, SparseBinnedMatrix, transform_csc
 from .train_gpu import train_gpu
@@ -1043,6 +1049,53 @@ def train_dataset_ranker(
         bagging,
     )
     return Model(dataset.mapper.copy(), booster^)
+
+
+def train_dataset_ranker_advanced(
+    dataset: Dataset,
+    params: BoosterParams,
+    rank_params: AdvancedRankParams,
+    positions: PositionMap = PositionMap.absent(),
+    bagging: BaggingParams = BaggingParams.disabled(),
+) raises -> Model:
+    """`train_dataset_ranker` with the advanced ranking parameters
+    (`label_gain`, position bias, pair sampling, a decoupled maxDCG cutoff).
+
+    Routing is `ranking_advanced.advanced_ranking_requested`: when nothing
+    advanced is asked for this is exactly `train_dataset_ranker` with
+    `rank_params.base`, so a default run trains the same model it always
+    did; otherwise the ensemble comes from `train_ranker_advanced`, whose
+    learned position biases are training state that no model file holds.
+    """
+    if not advanced_ranking_requested(rank_params, positions):
+        return train_dataset_ranker(dataset, params, rank_params.base, bagging)
+    _check_labels(dataset.label, dataset.n_rows)
+    if dataset.is_sparse:
+        raise Error(
+            "LambdaRank has no sparse trainer: train_ranker reads a dense"
+            " binned matrix. Build the dataset from a dense matrix"
+        )
+    if len(dataset.group) == 0:
+        raise Error(
+            "a ranking dataset needs `group`: the number of rows in each"
+            " query, in row order"
+        )
+    if len(dataset.init_score) != 0:
+        raise Error(
+            "init_score is not supported for ranking: lambdas are computed"
+            " within a query and start from a score of 0"
+        )
+    var trained = train_ranker_advanced(
+        dataset.data,
+        _relevance_labels(dataset.label),
+        groups_from_counts(dataset.group),
+        params,
+        rank_params,
+        positions,
+        dataset.weight,
+        bagging,
+    )
+    return Model(dataset.mapper.copy(), trained.booster.copy())
 
 
 def update_dataset(

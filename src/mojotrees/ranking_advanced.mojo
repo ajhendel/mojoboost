@@ -22,15 +22,19 @@ features that cannot be expressed as a call into the existing one:
 
 WHAT IS AND IS NOT VALIDATED
 ----------------------------
-Nothing here has been run. No test, benchmark, or differential comparison
-against LightGBM has been executed for any function in this file, and the
-module is not exported from `src/mojotrees/__init__.mojo`, is not reachable
-from `bindings/_mojotrees.mojo`, and is named by no parity row. **This
-module does not entitle anyone to claim that mojotrees implements unbiased
-LambdaRank.** `docs/LIGHTGBM_PARITY.md` keeps
-`lambdarank_position_bias_regularization` and `Dataset.position` at
-`deferred` until the differential evidence listed in
-`handoffs/remaining_05_ranking.md` exists. See docs/RANKING_ADVANCED.md.
+`tests/test_ranking_advanced.mojo` runs the module: the default
+configuration reproduces `ranking.train_ranker` tree for tree, a custom
+`label_gain` is validated and trains a different ensemble that still ranks,
+a position column trains one bias per position, and the pair-sampling and
+cutoff parameters are validated. The module is reached from the entry
+points through `advanced_ranking_requested`: `trainset.train_dataset_ranker_advanced`
+and the `fit_ranker` / `train_dataset_ranker` bindings route to
+`train_ranker_advanced` only when something advanced is asked for, so a
+default run is `ranking.train_ranker`'s. What has NOT been done is a
+differential comparison against LightGBM's unbiased LambdaRank; until it
+exists `docs/LIGHTGBM_PARITY.md` should keep
+`lambdarank_position_bias_regularization` short of `full`, and no one
+should claim numeric parity for it. See docs/RANKING_ADVANCED.md.
 
 HOW DUPLICATION IS AVOIDED
 --------------------------
@@ -237,7 +241,7 @@ struct LabelGain(Copyable, Movable):
 
     def of(self, label: Int) -> Float64:
         """The gain of `label`. The caller has already validated the label
-        against `max_label`, which `check_relevance_labels` does."""
+        against `max_label`, which `check_labels_within_gain` does."""
         return self.gains[label]
 
 
@@ -273,7 +277,7 @@ def check_label_gain(gain: LabelGain) raises:
             )
 
 
-def check_relevance_labels(labels: List[Int], gain: LabelGain) raises:
+def check_labels_within_gain(labels: List[Int], gain: LabelGain) raises:
     """Relevance labels must index the gain vector.
 
     `ranking.check_labels` fixes the range at `[0, 30]` because the default
@@ -683,6 +687,22 @@ struct AdvancedRankParams(Copyable, Movable):
         )
 
 
+def advanced_ranking_requested(
+    params: AdvancedRankParams, positions: PositionMap
+) -> Bool:
+    """Whether a run needs `train_ranker_advanced` at all.
+
+    The routing predicate the entry points use: a custom gain vector, a
+    decoupled maxDCG cutoff, pair sampling, or a position column each need
+    this module's loop; without them the run is `ranking.train_ranker`'s
+    and is sent there unchanged, so the default path stays the one with the
+    parity evidence behind it. `eval_at`, `weight_queries`, and the
+    empty-query policy shape metrics and group sanitizing, not the loop, so
+    they do not count.
+    """
+    return not params.uses_baseline_lambdas() or not positions.is_absent()
+
+
 def check_advanced_rank_params(params: AdvancedRankParams) raises:
     """Validate everything that does not depend on the data."""
     check_ranker_params(params.base)
@@ -950,7 +970,7 @@ def advanced_lambdarank_gradients(
     check_groups(groups, len(scores))
     if len(labels) != len(scores):
         raise Error("labels length must equal scores length")
-    check_relevance_labels(labels, params.gain)
+    check_labels_within_gain(labels, params.gain)
     check_advanced_rank_params(params)
     check_positions(positions, len(scores))
     _check_sample_weight(sample_weight, len(scores))
@@ -1446,7 +1466,7 @@ def _check_eval_inputs(
     check_groups(groups, len(scores))
     if len(labels) != len(scores):
         raise Error("labels length must equal scores length")
-    check_relevance_labels(labels, params.gain)
+    check_labels_within_gain(labels, params.gain)
     check_advanced_rank_params(params)
     if len(sample_weight) != 0 and len(sample_weight) != len(scores):
         raise Error("sample_weight length must equal n_rows")
@@ -2042,7 +2062,7 @@ def train_ranker_advanced(
     if len(labels) != data.n_rows:
         raise Error("labels length must equal n_rows")
     check_groups(groups, data.n_rows)
-    check_relevance_labels(labels, rank_params.gain)
+    check_labels_within_gain(labels, rank_params.gain)
     check_advanced_rank_params(rank_params)
     check_positions(positions, data.n_rows)
     _check_sample_weight(sample_weight, data.n_rows)
