@@ -63,6 +63,8 @@ round. The rest are O(rows), O(nnz), or O(nodes).
 
 from std.math import isfinite, isnan
 
+from .sequence import CancelToken
+
 
 # ---------------------------------------------------------------------------
 # Ceilings
@@ -1651,63 +1653,9 @@ def check_control_code(code: Int, phase: String, iteration: Int) raises -> Int:
 
 
 @fieldwise_init
-struct CancelToken(Copyable, Movable):
-    """Cooperative cancellation for work that outlives a round boundary.
-
-    The callback protocol can stop a run, but only between rounds: a
-    `STOP` returned from `BEFORE_ITERATION` is not seen again until the round
-    it declined has finished growing. For a long single tree, or a
-    prediction sweep over a large matrix, that is the whole of the work. A
-    token is checked at whatever interior points a caller chooses, and turns
-    a cancellation into the same deterministic `Error` every other rule here
-    raises, rather than a partially written result.
-
-    Cooperative and single-writer by design. It carries a plain flag, not an
-    atomic, and is meant to be set by the thread that owns the loop (a
-    callback, a signal handler that has already marshalled to that thread, a
-    driver that decided to give up) and read by that same loop. A worker
-    thread should not write it; a token copied into parallel workers copies
-    the flag with it, which is a snapshot rather than a channel.
-    """
-
-    var cancelled: Bool
-    var reason: String
-
-    @staticmethod
-    def live() -> CancelToken:
-        """A token that has not been cancelled, which is what a caller that
-        does not care about cancellation passes."""
-        return CancelToken(False, String(""))
-
-    def cancel(mut self, var reason: String):
-        """Request cancellation. The first reason wins, so a token cancelled
-        twice still reports why it was cancelled the first time."""
-        if not self.cancelled:
-            self.cancelled = True
-            self.reason = reason^
-
-    def is_cancelled(self) -> Bool:
-        return self.cancelled
-
-    def why(self) -> String:
-        """The recorded reason, or a stand-in when the caller gave none, so
-        the message is a sentence either way."""
-        if len(self.reason) > 0:
-            return self.reason.copy()
-        return String("no reason given")
-
-    def check(self, where: String) raises:
-        """Raise if cancellation was requested, naming where the run noticed.
-
-        The site is part of the message because a cancellation observed while
-        growing tree 40 and one observed while scoring a validation set leave
-        very different amounts of work behind, and the caller deciding
-        whether to keep a partial ensemble needs to know which it got.
-        """
-        if self.cancelled:
-            raise Error(
-                "training was cancelled at ", where, ": ", self.why()
-            )
+# `CancelToken` is `sequence.CancelToken`: one token for chunk drivers and
+# training loops alike (`live()`, `cancel(reason)`, `is_cancelled()`,
+# `why()`, `check(where)` are the spellings this module's callers use).
 
 
 def check_cleanup_balanced(

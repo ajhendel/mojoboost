@@ -16,6 +16,7 @@ build/
 
 # Test serialization scratch files
 .test_*.tmp
+.test_*.tmp.*.mbx
 
 # Built binaries (capi/build.sh, cli/build.sh, capi/run_c_tests.sh)
 capi/test_capi

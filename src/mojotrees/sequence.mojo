@@ -113,21 +113,34 @@ def sequence_status_message(code: Int) -> String:
 
 
 struct CancelToken(Copyable, Movable):
-    """A cooperative stop request, polled at chunk boundaries.
+    """A cooperative stop request, polled at chunk boundaries and at
+    whatever interior points a training loop chooses.
 
     Single-threaded by construction: the token travels `mut` down one call
     stack, so the only code that can set it is code the pass itself calls
     (a chunk callback, a progress hook) or code that runs between passes.
     `polls` counts the checks, which is how a caller sees that a long pass is
-    in fact checking rather than ignoring the token.
+    in fact checking rather than ignoring the token. `reason` is what the
+    canceller said, so a run stopped while growing tree 40 and one stopped
+    while scoring a validation set both report why.
+
+    This is the one cancellation token in the tree: `validation.mojo` uses
+    it through `live()`, `cancel(reason)`, `is_cancelled()`, `why()`, and
+    `check(where)`; the chunk drivers here use `none()`, `cancel()`,
+    `poll()`, and `check()`. It carries a plain flag, not an atomic, and is
+    meant to be set and read by the thread that owns the loop; a token
+    copied into parallel workers copies the flag with it, which is a
+    snapshot rather than a channel.
     """
 
     var cancelled: Bool
     var polls: Int
+    var reason: String
 
     def __init__(out self):
         self.cancelled = False
         self.polls = 0
+        self.reason = String("")
 
     @staticmethod
     def none() -> CancelToken:
@@ -135,9 +148,34 @@ struct CancelToken(Copyable, Movable):
         from."""
         return CancelToken()
 
+    @staticmethod
+    def live() -> CancelToken:
+        """A token that is not cancelled, for a caller that does not care
+        about cancellation passes. Same value as `none()`; the name is the
+        training loops' spelling."""
+        return CancelToken()
+
     def cancel(mut self):
         """Ask the running pass to stop at its next chunk boundary."""
         self.cancelled = True
+
+    def cancel(mut self, var reason: String):
+        """Ask the loop to stop, and say why. The first reason wins, so
+        cancelling twice still reports why it was cancelled the first
+        time."""
+        if not self.cancelled:
+            self.cancelled = True
+            self.reason = reason^
+
+    def is_cancelled(self) -> Bool:
+        return self.cancelled
+
+    def why(self) -> String:
+        """The reason given at cancellation, or a fixed sentence when none
+        was, so the message is a sentence either way."""
+        if self.reason.byte_length() > 0:
+            return self.reason.copy()
+        return String("no reason given")
 
     def poll(mut self) -> Bool:
         """Whether a stop has been requested, counting the check."""
@@ -145,9 +183,23 @@ struct CancelToken(Copyable, Movable):
         return self.cancelled
 
     def check(mut self) raises:
-        """Raise if a stop has been requested. What every driver calls."""
+        """Raise if a stop has been requested. What every chunk driver
+        calls."""
         if self.poll():
             raise Error(sequence_status_message(SEQ_CANCELLED))
+
+    def check(mut self, where: String) raises:
+        """Raise if cancellation was requested, naming where the run noticed.
+
+        The site is part of the message because a cancellation observed while
+        growing tree 40 and one observed while scoring a validation set leave
+        very different amounts of work behind, and the caller deciding
+        whether to keep a partial ensemble needs to know which it got.
+        """
+        if self.poll():
+            raise Error(
+                "training was cancelled at ", where, ": ", self.why()
+            )
 
 
 def _fnv1a(var h: UInt64, byte: UInt64) -> UInt64:
@@ -187,7 +239,7 @@ def fnv1a_f64(var h: UInt64, value: Float64) -> UInt64:
     """Fold a float's IEEE-754 bit pattern into a running FNV-1a hash. Bits,
     not digits, so the fold is exact and locale-free."""
     var out = h
-    var v = value.to_bits()
+    var v = UInt64(value.to_bits())
     for _ in range(8):
         out = _fnv1a(out, v & 255)
         v = v >> 8
@@ -1183,8 +1235,10 @@ def memory_sequence_from_raw(
         )
     var n_rows = raw.n_rows
     var n_features = raw.n_features
+    # Mojo does not move a field out of a value; the matrix is copied once
+    # here, which is the same cost `RawData.transform_dense` pays.
     return MemorySequence(
-        raw.values^,
+        raw.values.copy(),
         n_rows,
         n_features,
         chunk_rows,
@@ -1217,7 +1271,7 @@ def csc_sequence_from_raw(
             " memory_sequence_from_raw"
         )
     return CscSequence(
-        raw.csc^,
+        raw.csc.copy(),
         chunk_rows,
         label^,
         weight^,
