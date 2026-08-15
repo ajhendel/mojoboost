@@ -12,7 +12,15 @@ benchmarking and for tests that must force one path:
   scheduling).
 - `MOJOTREES_PARALLEL_MIN_OPS`: integer override of the auto-mode work
   threshold (`PARALLEL_MIN_OPS`), compared against the caller's op estimate
-  (conventionally items * rows touched).
+  (conventionally items * rows touched). This is the whole-loop crossover:
+  below it the loop stays serial.
+- `MOJOTREES_PARALLEL_MIN_TASK_OPS`: integer override of the *per-task* floor
+  (`DEFAULT_MIN_TASK_OPS`), the smallest amount of work a task may be given
+  once the loop has cleared the crossover. Its default equals the crossover,
+  which is the value this module has always used for both, so setting
+  nothing changes nothing. It exists as a separate name because the two are
+  separate questions and only the first of them has ever been measured; see
+  "Two grains, not one" below.
 
 `binning.mojo` adds one more of the same kind:
 `MOJOTREES_BINNING_SELECT_MIN_ROWS` chooses between the two ways a quantile
@@ -74,6 +82,40 @@ does (6 tasks over 10 features leaves the sixth with nothing to do), and the
 spread makes the remainder land on different tasks instead of all on the
 last. Which task runs which unit changes nothing about the result.
 
+Two grains, not one
+-------------------
+`plan_tasks` asks two questions and they are not the same question. The first
+is whether the loop is worth parallelizing at all, which is a statement about
+the *total* work against the cost of the first scheduling event. The second
+is how finely the loop may be cut, which is a statement about *one task's*
+work against the cost of one more scheduling event. This module used to
+answer both with `PARALLEL_MIN_OPS`, and the consequence was a rule that
+declared a loop worth parallelizing and then ran it on one task: for any
+total between one grain and two grains, `total_ops // grain` is 1, and a
+one-task fan-out is the serial path with a threshold check attached. That is
+strictly worse than staying serial, and it needed no measurement to see. The
+task count is now floored at `MIN_TASKS_ABOVE_GRAIN` once the crossover has
+been cleared, so clearing the crossover means something.
+
+The second consequence was subtler and is the reason a caller must not
+deflate its own estimate to control the fan-out. A stage whose per-item work
+is cheaper than a histogram op scales its estimate down, which is correct and
+is the documented convention. But under one shared grain that scaling also
+moves the go/no-go decision, so a stage that divided its count by enough to
+stop over-fanning at one size ended up declared not worth parallelizing at a
+size sixteen times larger. Deflating the estimate is the wrong instrument for
+the fan-out: the per-task floor is the right one, and it is now separately
+named and separately overridable. State the honest work; let the two grains
+decide.
+
+Neither grain has been measured against the other. `DEFAULT_MIN_TASK_OPS`
+equals `PARALLEL_MIN_OPS`, which reproduces the fan-out this module has
+always chosen everywhere except the degenerate one-task window above, and
+`MOJOTREES_PARALLEL_MIN_TASK_OPS` is there so a sweep can lower it without a
+rebuild. Lowering it is the single knob that decides how much of an
+asymmetric machine a mid-sized loop reaches, and bench/bench_profile.mojo on
+an idle machine is what would settle it.
+
 Nesting. These dispatches are not reentrant-aware: a `sync_parallelize`
 inside a task would oversubscribe the machine with no scheduler to arbitrate
 it. Every caller in this package dispatches from the single-threaded part of
@@ -85,12 +127,37 @@ example). Anything new that runs inside a task must do the same.
 from max.algorithm import sync_parallelize
 from std.os import getenv
 
-from .apple_cpu_policy import DEFAULT_TASKS_PER_CORE, cpu_profile
+from .apple_cpu_policy import (
+    DEFAULT_TASKS_PER_CORE,
+    ResolvedCpuPolicy,
+    cpu_profile,
+)
 
 # Serial-vs-parallel crossover measured at 25k-50k ops on Apple M4, AMD
 # Zen4, and Neoverse-N2 (bench/bench_threshold.mojo); 1 << 16 sits above
 # all three with 1.2-1.6x parallel speedup at exactly this size.
 comptime PARALLEL_MIN_OPS = 1 << 16
+
+# Smallest work a single task may be given once the crossover above has been
+# cleared. Equal to the crossover, which is the value this module applied to
+# both questions before they were separated, so the default fan-out is
+# unchanged everywhere the old rule produced more than one task. Override
+# with `MOJOTREES_PARALLEL_MIN_TASK_OPS`. Nothing has measured it as a
+# quantity in its own right.
+comptime DEFAULT_MIN_TASK_OPS = PARALLEL_MIN_OPS
+
+# Tasks a loop gets when it has cleared the crossover but does not hold a
+# whole per-task grain per task. One is not an option: a one-task fan-out
+# runs the same work on the same core as the serial path and pays a
+# scheduling event for the privilege, so a rule that answers 1 here has
+# decided nothing. Two is the smallest answer that is actually parallel, and
+# the crossover measurement is evidence for exactly this size, having found a
+# fanned-out loop of `PARALLEL_MIN_OPS` beating the serial path.
+comptime MIN_TASKS_ABOVE_GRAIN = 2
+
+# Denominator of the elementwise per-row cost weight (see
+# `elementwise_row_ops`).
+comptime ELEMENTWISE_ROW_COST_DEN = 4
 
 # Auto-mode fan-out per core. The value, the core pool it multiplies, and the
 # reasoning behind both now live in `apple_cpu_policy.mojo`; this name stays
@@ -122,6 +189,154 @@ def env_parallel_min_ops() -> Int:
     return _env_int("MOJOTREES_PARALLEL_MIN_OPS", PARALLEL_MIN_OPS)
 
 
+def env_parallel_min_task_ops() -> Int:
+    """The per-task floor. 0 or unparsable means the default, which equals
+    the whole-loop crossover."""
+    var n = _env_int("MOJOTREES_PARALLEL_MIN_TASK_OPS", DEFAULT_MIN_TASK_OPS)
+    return n if n > 0 else DEFAULT_MIN_TASK_OPS
+
+
+def elementwise_row_ops(n_rows: Int) -> Int:
+    """Work estimate, in histogram-op equivalents, for a pass that touches
+    `n_rows` rows and does a handful of arithmetic on sequential arrays.
+
+    Gradient and hessian generation, prediction accumulation, and bin lookup
+    are all this shape: two or three sequential loads, a few flops, two
+    sequential stores, no indirection and no scattered write. A histogram op,
+    the unit `plan_tasks` compares against its threshold, is a scattered
+    read-modify-write into three arrays, so an elementwise row is worth a
+    fraction of one and the estimate says so.
+
+    The fraction is `1 / ELEMENTWISE_ROW_COST_DEN` and it is not measured.
+    What is measured bounds it, from one side only: with an *unscaled* count,
+    100k rows of gradient generation asked for one task per core and
+    bench/bench_profile.mojo timed that fan-out well below the serial path, so
+    100k elementwise rows sit below the crossover and the denominator is
+    therefore greater than about 1.5. Any denominator of 2 or more keeps that
+    finding intact, and 4 keeps it intact with a factor of 2.6 to spare. What
+    the denominator does decide, and the only thing it decides, is the row
+    count at which the stage starts to fan out: at 4 that is 262,144 rows,
+    where the smallest legal fan-out gives each of two tasks 131,072 rows,
+    which is thirteen times the 10,000-row task that lost. Nothing here claims
+    a speedup at any size.
+
+    It is a named function rather than a divisor written at the call site
+    because a call site that writes `n // 16` has silently encoded a
+    serial-to-parallel boundary at a million rows, which is inside the shapes
+    this library is asked to train on, and has done it in a place where
+    nobody reading the caller would look for it.
+
+    Callers whose per-row work is dearer than this, an `exp` per row for the
+    Poisson and logistic objectives for instance, are under-counted by it.
+    That is conservative in the direction of staying serial and is left alone
+    until someone measures the difference between the objectives.
+    """
+    if n_rows <= 0:
+        return 0
+    var ops = n_rows // ELEMENTWISE_ROW_COST_DEN
+    return ops if ops > 0 else 1
+
+
+@fieldwise_init
+struct DispatchSettings(Copyable, Movable):
+    """Every value the dispatch rule reads from outside itself, read once.
+
+    A dispatch asks six questions of the environment and one of the machine:
+    `MOJOTREES_NUM_WORKERS`, `MOJOTREES_PARALLEL_MIN_OPS`,
+    `MOJOTREES_PARALLEL_MIN_TASK_OPS`, `MOJOTREES_CPU_TASKS_PER_CORE`,
+    `MOJOTREES_CPU_CORE_POOL`, `MOJOTREES_CPU_FEATURE_GROUP`,
+    `MOJOTREES_CPU_COMPACT_MIN_ROWS`, and the core counts. The tree grower
+    asks them once per dispatch and dispatches several times per node, so a
+    fit of a hundred trees at thirty-one leaves asks them on the order of a
+    hundred thousand times, and every answer is the same. Resolve once, carry
+    the value for the length of the fit, pass it to the `_with` forms below.
+
+    Snapshot semantics, and no cache to invalidate. The value does not
+    observe a `setenv` that happens after `resolve()`, and there is no hidden
+    global that a later reader might get stale. The functions that do not take
+    a settings value still read the environment on every call exactly as they
+    always have, so a test that flips `MOJOTREES_NUM_WORKERS` mid-process and
+    then calls `plan_tasks` or any `dispatch_*` sees the flip. Only code that
+    has explicitly resolved a snapshot holds one, and that code invalidates by
+    resolving again.
+    """
+
+    var policy: ResolvedCpuPolicy
+    var num_workers: Int
+    var min_ops: Int
+    var min_task_ops: Int
+
+    @staticmethod
+    def resolve() -> DispatchSettings:
+        """One detection of the machine and one read of each variable."""
+        return DispatchSettings(
+            ResolvedCpuPolicy.resolve(),
+            env_num_workers(),
+            env_parallel_min_ops(),
+            env_parallel_min_task_ops(),
+        )
+
+    def describe(self) -> String:
+        return String(
+            self.policy.describe(),
+            " workers=",
+            self.num_workers,
+            " min_ops=",
+            self.min_ops,
+            " min_task_ops=",
+            self.min_task_ops,
+        )
+
+
+@always_inline
+def _cap_tasks(total_ops: Int, min_task_ops: Int, max_auto: Int) -> Int:
+    """Task count for a loop that has already cleared the crossover.
+
+    The one copy of the fan-out rule, so the resolved and the unresolved
+    entry points cannot drift. No task holds less than `min_task_ops`, the
+    machine's ceiling is never exceeded, and the answer is never 1, because
+    the caller has already decided this loop is worth parallelizing and one
+    task does not parallelize it.
+    """
+    var by_grain = max_auto
+    if min_task_ops > 0:
+        by_grain = total_ops // min_task_ops
+    if by_grain < MIN_TASKS_ABOVE_GRAIN:
+        by_grain = MIN_TASKS_ABOVE_GRAIN
+    return by_grain if by_grain < max_auto else max_auto
+
+
+def plan_tasks_with(
+    settings: DispatchSettings, n_items: Int, total_ops: Int
+) -> Int:
+    """`plan_tasks` against an already-resolved snapshot.
+
+    The same rule on the same numbers, with nothing read from the
+    environment and nothing detected about the machine. Every caller on the
+    per-node path should be reaching this form; `plan_tasks` remains for
+    callers that have no snapshot to hand and for tests that change a
+    variable between calls.
+    """
+    if n_items <= 1:
+        return 1
+    if settings.num_workers == 1:
+        return 1
+    var n_tasks = settings.num_workers
+    if settings.num_workers == 0:
+        if total_ops < settings.min_ops:
+            return 1
+        n_tasks = _cap_tasks(
+            total_ops,
+            settings.min_task_ops,
+            settings.policy.max_auto_tasks(),
+        )
+    if n_tasks < 1:
+        n_tasks = 1
+    if n_tasks > n_items:
+        n_tasks = n_items
+    return n_tasks
+
+
 def plan_tasks(n_items: Int, total_ops: Int) -> Int:
     """How many parallel tasks to split `n_items` units of work into.
 
@@ -136,17 +351,25 @@ def plan_tasks(n_items: Int, total_ops: Int) -> Int:
     or "features" says nothing about how long a task will run, and the whole
     point of the threshold is to compare work against scheduling overhead.
 
-    Two limits apply in auto mode. Below one grain of work the whole loop
-    stays serial, and above it the task count is capped so that no task holds
-    less than a grain: fanning 100k cheap ops across 40 workers costs far more
-    in scheduling than the 2.5k ops each one would run. An explicit
-    `MOJOTREES_NUM_WORKERS` bypasses both, so tests can force the parallel
-    path at any size.
+    Two limits apply in auto mode, and they are two limits rather than one
+    written twice (see "Two grains, not one" in the module docstring). Below
+    the whole-loop crossover the loop stays serial. Above it the task count is
+    capped so that no task holds less than the per-task floor: fanning 100k
+    cheap ops across 40 workers costs far more in scheduling than the 2.5k ops
+    each one would run. Having cleared the crossover the answer is never 1,
+    because a one-task fan-out is the serial path plus a scheduling event. An
+    explicit `MOJOTREES_NUM_WORKERS` bypasses all of it, so tests can force
+    the parallel path at any size.
 
     The per-core ceiling comes from `apple_cpu_policy`, which decides how many
     cores to count on a machine whose cores are not all the same speed. Its
     default is every physical core times `TASKS_PER_CORE`, which is what this
     line has always computed.
+
+    This form reads the environment on every call, which is what lets a test
+    change a variable between two calls and see the change. Anything on the
+    per-node path should hold a `DispatchSettings` and call `plan_tasks_with`
+    instead; the two compute the same answer from the same numbers.
     """
     if n_items <= 1:
         return 1
@@ -158,12 +381,13 @@ def plan_tasks(n_items: Int, total_ops: Int) -> Int:
         var grain = env_parallel_min_ops()
         if total_ops < grain:
             return 1
-        n_tasks = cpu_profile().max_auto_tasks()
-        var by_grain = total_ops // grain
-        if by_grain < n_tasks:
-            n_tasks = by_grain
-        if n_tasks < 1:
-            n_tasks = 1
+        n_tasks = _cap_tasks(
+            total_ops,
+            env_parallel_min_task_ops(),
+            cpu_profile().max_auto_tasks(),
+        )
+    if n_tasks < 1:
+        n_tasks = 1
     if n_tasks > n_items:
         n_tasks = n_items
     return n_tasks
@@ -188,7 +412,26 @@ def dispatch_feature_ranges[FuncType: def (Int, Int) -> None](
     interleave two features in one inner loop; it changes nothing about which
     feature accumulates what, only how many are in flight.
     """
-    var n_tasks = plan_tasks(n_features, total_ops)
+    _run_feature_ranges(func, n_features, plan_tasks(n_features, total_ops))
+
+
+def dispatch_feature_ranges_with[FuncType: def (Int, Int) -> None](
+    settings: DispatchSettings,
+    func: FuncType,
+    n_features: Int,
+    total_ops: Int,
+) raises:
+    """`dispatch_feature_ranges` against an already-resolved snapshot."""
+    _run_feature_ranges(
+        func, n_features, plan_tasks_with(settings, n_features, total_ops)
+    )
+
+
+def _run_feature_ranges[FuncType: def (Int, Int) -> None](
+    func: FuncType, n_features: Int, n_tasks: Int
+) raises:
+    """The split itself, with the task count already chosen. One copy, so the
+    resolved and unresolved entry points hand out identical ranges."""
     if n_tasks <= 1:
         if n_features > 0:
             func(0, n_features)
@@ -222,6 +465,21 @@ def dispatch_features[FuncType: def (Int) -> None](
             func(f)
 
     dispatch_feature_ranges(do_range, n_features, total_ops)
+
+
+def dispatch_features_with[FuncType: def (Int) -> None](
+    settings: DispatchSettings,
+    func: FuncType,
+    n_features: Int,
+    total_ops: Int,
+) raises:
+    """`dispatch_features` against an already-resolved snapshot."""
+
+    def do_range(start: Int, end: Int) {imm}:
+        for f in range(start, end):
+            func(f)
+
+    dispatch_feature_ranges_with(settings, do_range, n_features, total_ops)
 
 
 def dispatch_feature_rows[FuncType: def (Int, Int, Int) -> None](
@@ -323,11 +581,10 @@ struct RowBlocks(Copyable, Movable):
         return self.n_rows if e > self.n_rows else e
 
 
-def plan_row_blocks(n_rows: Int, total_ops: Int) -> RowBlocks:
-    """Choose the block split for a row range under the env contract."""
+def _blocks_for(n_rows: Int, n_tasks: Int) -> RowBlocks:
+    """The block geometry, with the task count already chosen."""
     if n_rows <= 0:
         return RowBlocks(0, 1, 0)
-    var n_tasks = plan_tasks(n_rows, total_ops)
     if n_tasks <= 1:
         return RowBlocks(1, n_rows, n_rows)
     var chunk = (n_rows + n_tasks - 1) // n_tasks
@@ -335,6 +592,22 @@ def plan_row_blocks(n_rows: Int, total_ops: Int) -> RowBlocks:
     # gives chunk 3, and block 3 would be empty); recount from the chunk so
     # every block has work and `n_blocks` is exact.
     return RowBlocks((n_rows + chunk - 1) // chunk, chunk, n_rows)
+
+
+def plan_row_blocks(n_rows: Int, total_ops: Int) -> RowBlocks:
+    """Choose the block split for a row range under the env contract."""
+    if n_rows <= 0:
+        return RowBlocks(0, 1, 0)
+    return _blocks_for(n_rows, plan_tasks(n_rows, total_ops))
+
+
+def plan_row_blocks_with(
+    settings: DispatchSettings, n_rows: Int, total_ops: Int
+) -> RowBlocks:
+    """`plan_row_blocks` against an already-resolved snapshot."""
+    if n_rows <= 0:
+        return RowBlocks(0, 1, 0)
+    return _blocks_for(n_rows, plan_tasks_with(settings, n_rows, total_ops))
 
 
 def run_row_blocks[FuncType: def (Int) -> None](
@@ -362,6 +635,18 @@ def dispatch_rows[FuncType: def (Int, Int) -> None](
     block gets, so there is only one body to test.
     """
     var blocks = plan_row_blocks(n_rows, total_ops)
+
+    def do_block(b: Int) {imm}:
+        func(blocks.start(b), blocks.end(b))
+
+    run_row_blocks(blocks, do_block)
+
+
+def dispatch_rows_with[FuncType: def (Int, Int) -> None](
+    settings: DispatchSettings, func: FuncType, n_rows: Int, total_ops: Int
+) raises:
+    """`dispatch_rows` against an already-resolved snapshot."""
+    var blocks = plan_row_blocks_with(settings, n_rows, total_ops)
 
     def do_block(b: Int) {imm}:
         func(blocks.start(b), blocks.end(b))

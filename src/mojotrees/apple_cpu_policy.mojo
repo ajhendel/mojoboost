@@ -81,6 +81,26 @@ Environment contract (all optional, all scheduling-only)
 `MOJOTREES_NUM_WORKERS` and `MOJOTREES_PARALLEL_MIN_OPS` keep their meanings
 from `parallel.mojo` and override everything here: an explicit worker count
 still bypasses the grain floor and the core cap.
+
+Resolving the environment once
+------------------------------
+Every function above reads its variable with `getenv` at the moment it is
+asked, and `cpu_profile()` re-detects the machine on every call. That is one
+`getenv` per question and three core-count queries per detection, and the
+tree grower asks these questions once per dispatch, several times per node,
+tens of thousands of times per fit. `ResolvedCpuPolicy.resolve()` answers all
+of them once and hands back a value that can be carried for the length of a
+fit; `parallel.DispatchSettings` wraps it with the two variables that module
+owns. Nothing about a plan changes: the resolved forms below compute the same
+answers from the same numbers, and the unresolved forms are kept and still
+read the environment live, so a test that flips a variable mid-process and
+calls the unresolved form sees the flip exactly as it always did.
+
+A resolved value is a snapshot. It does not observe a later `setenv`, and
+there is deliberately no global cache and no invalidation hook to forget:
+whoever resolves it owns it, and dropping it and resolving again is the
+whole of the invalidation story. A caller that must see a mid-process change
+either resolves again or uses the unresolved form.
 """
 
 from std.sys.info import (
@@ -336,10 +356,125 @@ def cpu_profile() -> CpuProfile:
     return CpuProfile.detect()
 
 
+@fieldwise_init
+struct ResolvedCpuPolicy(Copyable, Movable):
+    """One reading of the machine and of this module's four variables.
+
+    The same four questions `env_tasks_per_core`, `env_core_pool`,
+    `env_feature_group`, and `env_compact_min_rows` answer, plus one
+    `CpuProfile.detect()`, resolved together so a fit pays for them once
+    instead of once per dispatch. Every method here is the resolved twin of a
+    free function above and computes the identical answer from the identical
+    numbers; the difference is only when the environment was read.
+
+    Held by value and copied freely: it is five machine counts and four small
+    integers, so passing it down a call chain costs nothing worth measuring
+    and no lifetime has to be reasoned about. It is a snapshot, so a
+    `setenv` after `resolve()` is not observed by it; that is the documented
+    contract rather than a defect, and it is why the unresolved functions are
+    still here for anything that wants a live read.
+    """
+
+    var profile: CpuProfile
+    var tasks_per_core: Int
+    var core_pool: Int
+    var feature_group: Int
+    var compact_min_rows: Int
+
+    @staticmethod
+    def resolve() -> ResolvedCpuPolicy:
+        """Detect the machine and read all four variables, once."""
+        return ResolvedCpuPolicy(
+            CpuProfile.detect(),
+            env_tasks_per_core(),
+            env_core_pool(),
+            env_feature_group(),
+            env_compact_min_rows(),
+        )
+
+    @staticmethod
+    def of(profile: CpuProfile) -> ResolvedCpuPolicy:
+        """A policy around an already-detected profile, reading the four
+        variables now. For a caller that has a `CpuProfile` in hand (a
+        synthetic one in a test, or one it detected itself) and wants the
+        resolved methods without a second detection."""
+        return ResolvedCpuPolicy(
+            profile.copy(),
+            env_tasks_per_core(),
+            env_core_pool(),
+            env_feature_group(),
+            env_compact_min_rows(),
+        )
+
+    def dispatch_cores(self) -> Int:
+        """`CpuProfile.dispatch_cores` against the resolved pool."""
+        if self.core_pool == CORE_POOL_PERFORMANCE:
+            return _positive_or(self.profile.performance_cores, 1)
+        return _positive_or(self.profile.physical_cores, 1)
+
+    def max_auto_tasks(self) -> Int:
+        """`CpuProfile.max_auto_tasks` against the resolved knobs."""
+        return _positive_or(
+            _positive_or(self.tasks_per_core, DEFAULT_TASKS_PER_CORE)
+            * self.dispatch_cores(),
+            1,
+        )
+
+    def feature_group_for(self, n_bins: Int) -> Int:
+        """`plan_feature_group` against the resolved knob."""
+        return _clamp_feature_group(
+            self.profile.l1d_bytes, self.feature_group, n_bins
+        )
+
+    def describe(self) -> String:
+        """One line naming the snapshot, for benchmark headers. Distinct from
+        `CpuProfile.describe`, which re-reads the environment to print it and
+        so would report a live value next to a resolved plan."""
+        return String(
+            "cores=",
+            self.profile.physical_cores,
+            " (perf ",
+            self.profile.performance_cores,
+            ", eff ",
+            self.profile.efficiency_cores(),
+            ") pool=",
+            core_pool_name(self.core_pool),
+            " tasks_per_core=",
+            self.tasks_per_core,
+            " max_auto_tasks=",
+            self.max_auto_tasks(),
+            " feature_group=",
+            self.feature_group,
+            " compact_min_rows=",
+            self.compact_min_rows,
+        )
+
+
 def feature_slice_bytes(n_bins: Int) -> Int:
     """Bytes one feature's histogram slice occupies across the three
     arrays."""
     return n_bins * HISTOGRAM_BYTES_PER_CELL
+
+
+def _clamp_feature_group(l1d_bytes: Int, wanted_in: Int, n_bins: Int) -> Int:
+    """The group-width rule, with the wanted width already read from wherever
+    it came from. The one copy of the arithmetic, so the resolved and the
+    unresolved forms cannot drift."""
+    var wanted = wanted_in
+    if wanted > MAX_FEATURE_GROUP:
+        wanted = MAX_FEATURE_GROUP
+    if wanted < 1:
+        wanted = 1
+    var slice_bytes = feature_slice_bytes(n_bins)
+    if slice_bytes <= 0:
+        return 1
+    var budget = l1d_bytes // L1_GROUP_DIVISOR
+    var fits = budget // slice_bytes
+    if fits < wanted:
+        wanted = fits
+    if wanted < 1:
+        wanted = 1
+    return wanted
 
 
 def plan_feature_group(profile: CpuProfile, n_bins: Int) -> Int:
@@ -350,21 +485,7 @@ def plan_feature_group(profile: CpuProfile, n_bins: Int) -> Int:
     memory. The group is therefore bounded by the assumed L1 budget, and by
     the environment knob, and by `MAX_FEATURE_GROUP`.
     """
-    var wanted = env_feature_group()
-    if wanted > MAX_FEATURE_GROUP:
-        wanted = MAX_FEATURE_GROUP
-    if wanted < 1:
-        wanted = 1
-    var slice_bytes = feature_slice_bytes(n_bins)
-    if slice_bytes <= 0:
-        return 1
-    var budget = profile.l1d_bytes // L1_GROUP_DIVISOR
-    var fits = budget // slice_bytes
-    if fits < wanted:
-        wanted = fits
-    if wanted < 1:
-        wanted = 1
-    return wanted
+    return _clamp_feature_group(profile.l1d_bytes, env_feature_group(), n_bins)
 
 
 @fieldwise_init
@@ -439,6 +560,56 @@ def derive_accumulation_plan(
     gradient and the hessian per row, so it wants at least two active
     features and enough rows that the pass is not pure overhead.
     """
+    return _derive_plan(
+        profile.l1d_bytes,
+        env_feature_group(),
+        env_compact_min_rows(),
+        n_features,
+        n_active,
+        n_bins,
+        n_rows_touched,
+        rows_are_indirect,
+    )
+
+
+def derive_accumulation_plan_with(
+    policy: ResolvedCpuPolicy,
+    n_features: Int,
+    n_active: Int,
+    n_bins: Int,
+    n_rows_touched: Int,
+    rows_are_indirect: Bool,
+) -> AccumulationPlan:
+    """`derive_accumulation_plan` against an already-resolved policy.
+
+    Identical arithmetic on identical inputs; the only difference is that the
+    two variables come from the snapshot rather than from a fresh `getenv`,
+    and no `CpuProfile.detect()` happens here at all.
+    """
+    return _derive_plan(
+        policy.profile.l1d_bytes,
+        policy.feature_group,
+        policy.compact_min_rows,
+        n_features,
+        n_active,
+        n_bins,
+        n_rows_touched,
+        rows_are_indirect,
+    )
+
+
+def _derive_plan(
+    l1d_bytes: Int,
+    feature_group: Int,
+    compact_min_rows: Int,
+    n_features: Int,
+    n_active: Int,
+    n_bins: Int,
+    n_rows_touched: Int,
+    rows_are_indirect: Bool,
+) -> AccumulationPlan:
+    """The one copy of the plan arithmetic, with both variables already
+    read."""
     var active = n_active if n_active > 0 else 0
     var rows = n_rows_touched if n_rows_touched > 0 else 0
     var bins = n_bins if n_bins > 0 else 0
@@ -449,9 +620,9 @@ def derive_accumulation_plan(
     var compact = (
         rows_are_indirect
         and active >= COMPACT_MIN_FEATURES
-        and rows >= env_compact_min_rows()
+        and rows >= compact_min_rows
     )
-    var group = plan_feature_group(profile, bins)
+    var group = _clamp_feature_group(l1d_bytes, feature_group, bins)
     if group > active and active > 0:
         group = active
     if group < 1:
@@ -473,6 +644,43 @@ def subtract_ops(n_cells: Int) -> Int:
     pass is memory-bound and a single-op estimate keeps it serial well past
     the point where the streams saturate one core."""
     return 3 * n_cells
+
+
+# What one scored split candidate costs, in the histogram-op equivalents
+# `parallel.plan_tasks` compares against its threshold. A histogram op is a
+# scattered read-modify-write into three L1-resident arrays; a split
+# candidate is two Float64 divisions, an L1 soft-threshold on each child, and
+# a handful of compares. A division is the term that dominates and it is the
+# one instruction on this class of core that is neither single-cycle nor well
+# pipelined, so a candidate is counted as several ops rather than one.
+#
+# 8 is an order-of-magnitude reading of that instruction mix, not a
+# measurement: nothing in this repository has timed a split candidate against
+# a histogram op. It matters only through the threshold, so getting it wrong
+# moves the size at which the scan starts fanning out and moves nothing else.
+# bench/bench_threshold.mojo is the harness that would settle it.
+comptime SPLIT_CANDIDATE_OPS = 8
+
+
+def split_scan_ops(n_active: Int, n_bins: Int, two_sided: Bool) -> Int:
+    """Work estimate for one node's split scan over `n_active` features.
+
+    Every ordinary bin of every scanned feature is a threshold, and a feature
+    with a reserved missing bin scores each threshold twice, once with the
+    missing rows left and once with them right (`two_sided`). The totals pass
+    that precedes each feature's scan is one streaming read of the same
+    slice, cheap next to the candidates, and is counted as one op per bin.
+
+    Categorical features are not this shape at all: their candidate count is
+    a sorted partition search over categories rather than a walk over bins.
+    They are estimated here as if they were ordinal, which under-counts a
+    wide categorical node. That only ever makes the scan more conservative
+    about fanning out.
+    """
+    var active = n_active if n_active > 0 else 0
+    var bins = n_bins if n_bins > 0 else 0
+    var per_bin = 2 * SPLIT_CANDIDATE_OPS if two_sided else SPLIT_CANDIDATE_OPS
+    return active * bins * (per_bin + 1)
 
 
 def describe_cpu_policy(profile: CpuProfile, plan: AccumulationPlan) -> String:

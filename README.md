@@ -279,14 +279,19 @@ implementations the item says which one runs.
   two importance types
 - SIMD histogram kernels (pointer-based scatter accumulation, vectorized
   sibling subtraction and split scans)
-- multicore CPU work across independent features (histogram accumulation, bin
-  fitting, bin transform) and across contiguous row blocks (gradient
-  generation, row partitioning), scheduled from a work estimate rather than an
-  item count so cheap elementwise stages are not fanned out below the point
-  where scheduling costs more than the work. Every path is bit-identical to
-  the serial one at any worker count: feature tasks keep each feature's sum
-  inside one task and row blocks are used only where nothing is summed across
-  rows. `MOJOTREES_NUM_WORKERS` and `MOJOTREES_PARALLEL_MIN_OPS` pin the
+- multicore CPU work across independent features (histogram accumulation,
+  split search, bin fitting, bin transform) and across contiguous row blocks
+  (gradient generation, row partitioning), scheduled from a work estimate
+  rather than an item count so cheap elementwise stages are not fanned out
+  below the point where scheduling costs more than the work. Every path is
+  bit-identical to the serial one at any worker count: feature tasks keep each
+  feature's sum inside one task, row blocks are used only where nothing is
+  summed across rows, and the split search folds its per-feature winners in
+  ascending order so the tie-break is the serial one. Two grains govern the
+  fan-out and they are separate: `MOJOTREES_PARALLEL_MIN_OPS` is the
+  whole-loop crossover below which a loop stays serial, and
+  `MOJOTREES_PARALLEL_MIN_TASK_OPS` is the smallest work a single task may be
+  given above it. `MOJOTREES_NUM_WORKERS` overrides both and pins the
   scheduler for reproducible runs; `pixi run bench-profile` times each stage
   serial against parallel
 - a data-parallel distributed training prototype: rows partitioned across
