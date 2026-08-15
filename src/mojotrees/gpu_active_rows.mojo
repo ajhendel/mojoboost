@@ -41,6 +41,22 @@ integer prefix sums, so no atomic decides where a row lands and no run-to-run
 scheduling difference can reorder the output. The prefix sums are exact
 Int32 sums over 0/1 flags, so they cannot round.
 
+What the partition costs, and what does not help
+------------------------------------------------
+Measured on an M4 with an interleaved A/B against the same buffers: a
+leaf-wise chain of seven partitions from 5M rows down to 78k takes about
+4.6 ms of device time in total, so a 100-tree, 31-leaf fit spends roughly a
+second partitioning against ten-plus seconds of histograms; the phase trace
+in train_gpu.mojo charges the phase more than that only because its sync
+after `apply_split` pays queue latency the untraced fit does not. Carrying
+the flag in the offset word so the scatter skips its bin gather measured
+1.05x on that chain, resolved but small, because the flag pass has just
+pulled the same lines into cache. A single-block in-place kernel for ranges
+under one threadgroup (flag, scan, scatter in one launch, no scratch, no
+copy back) measured 1.00x on 256 partitions of 600 rows, 78 us each either
+way: the per-partition cost there is enqueue overhead, not launch count, so
+it was not kept. Do not retry either without a new reason.
+
 Bagging
 -------
 Compaction subsumes the OUT_OF_BAG sentinel: the bag is written into the
@@ -251,8 +267,16 @@ def _flag_scan_kernel(
     the flags within each threadgroup.
 
     `offsets[j]` becomes the number of left-going rows before `j` *inside
-    j's own block*, and `block_sums[b]` the number of left-going rows in
-    block b. Threads past the end of the range contribute a zero flag, so a
+    j's own block*, shifted left one bit, with j's own flag in the low bit;
+    `block_sums[b]` is the number of left-going rows in block b. Carrying the
+    flag in the offset word is what lets the scatter route the row without
+    gathering its bin a second time: the bin loads are the one random-access
+    read of the partition (`bins[feature * n_rows + row]`, one byte from a
+    fresh cache line per row once the leaf's rows are sparse in the
+    dataset), so reading each once instead of twice halves the partition's
+    gathered traffic, and the packed word costs nothing the plain prefix did
+    not. The prefix is bounded by the block size, so the shift cannot
+    overflow. Threads past the end of the range contribute a zero flag, so a
     partial tail block still sums correctly. The scan is the plain
     Hillis-Steele shared-memory scan: two barriers per doubling step, with
     the read separated from the write so no thread reads a slot another has
@@ -303,8 +327,11 @@ def _flag_scan_kernel(
         offset += offset
 
     if j < n:
-        # Inclusive minus own flag is the exclusive prefix.
-        offsets[unsafe_offset=j] = s[unsafe_offset=tid][0] - flag
+        # Inclusive minus own flag is the exclusive prefix; the flag rides
+        # in the low bit for the scatter.
+        offsets[unsafe_offset=j] = (
+            (s[unsafe_offset=tid][0] - flag) * Int32(2)
+        ) + flag
     if tid == nthreads - 1:
         block_sums[unsafe_offset = block_idx.x] = s[unsafe_offset=tid][0]
 
@@ -369,24 +396,13 @@ def _scan_block_sums_kernel(
 
 
 def _scatter_kernel(
-    bins: MutPointer[UInt8, MutAnyOrigin],
     rows: MutPointer[Int32, MutAnyOrigin],
     scratch: MutPointer[Int32, MutAnyOrigin],
     offsets: MutPointer[Int32, MutAnyOrigin],
     block_sums: MutPointer[Int32, MutAnyOrigin],
     total: MutPointer[Int32, MutAnyOrigin],
-    n_rows: Int32,
     begin: Int32,
     count: Int32,
-    feature: Int32,
-    threshold_bin: Int32,
-    missing_bin: Int32,
-    default_left: Int32,
-    is_categorical: Int32,
-    cat0: UInt64,
-    cat1: UInt64,
-    cat2: UInt64,
-    cat3: UInt64,
 ):
     """Stage three: write each row to its compacted slot.
 
@@ -397,6 +413,10 @@ def _scatter_kernel(
     partition is stable. `n_left` is read from the device, so no host round
     trip sits between the scan and the scatter.
 
+    The direction comes out of the low bit of the packed offset stage one
+    wrote, so this stage touches no bin and needs no routing rule: it is a
+    pure permutation of the range from three streamed Int32 reads per row.
+
     Launched with the block size stage one used, because `block_idx.x` is
     what selects this element's block offset.
     """
@@ -405,24 +425,12 @@ def _scatter_kernel(
     if j < n:
         var b = Int(begin)
         var row = rows[unsafe_offset = b + j][0]
-        var bin = Int32(
-            bins[unsafe_offset = Int(feature) * Int(n_rows) + Int(row)]
-        )
-        var p = Int(block_sums[unsafe_offset = block_idx.x][0]) + Int(
-            offsets[unsafe_offset=j][0]
+        var packed = offsets[unsafe_offset=j][0]
+        var p = Int(block_sums[unsafe_offset = block_idx.x][0]) + (
+            Int(packed) >> 1
         )
         var dst: Int
-        if _row_goes_left(
-            bin,
-            threshold_bin,
-            missing_bin,
-            default_left,
-            is_categorical,
-            cat0,
-            cat1,
-            cat2,
-            cat3,
-        ):
+        if (packed & Int32(1)) != 0:
             dst = p
         else:
             dst = Int(total[unsafe_offset=0][0]) + (j - p)
@@ -1591,24 +1599,13 @@ struct GpuActiveRows(Movable):
         # Same block size as the flag pass: the scatter looks its block
         # offset up by `block_idx.x`.
         self.ctx.enqueue_function[_scatter_kernel](
-            bins,
             self.rows_dev.unsafe_ptr(),
             self.scratch_dev.unsafe_ptr(),
             self.offsets_dev.unsafe_ptr(),
             self.block_sums_dev.unsafe_ptr(),
             self.total_dev.unsafe_ptr(),
-            Int32(self.n_rows),
             Int32(window.begin),
             Int32(n),
-            Int32(routing.feature),
-            Int32(routing.threshold_bin),
-            Int32(routing.missing_bin),
-            default_left,
-            is_cat,
-            cat[0],
-            cat[1],
-            cat[2],
-            cat[3],
             grid_dim=blocks,
             block_dim=threads,
         )

@@ -553,6 +553,94 @@ def test_device_partition_handles_bags_and_categoricals() raises:
         )
 
 
+def test_device_partition_agrees_at_the_block_boundary_sizes() raises:
+    """Ranges of exactly one block, one row more (a one-row tail block), one
+    row less, two rows, and one row: the flag pass packs the flag into the
+    offset word and the scatter routes on it alone, so every block shape,
+    including a tail block that scans a single live flag, must land every
+    row where the host reference does and write the left count the caller
+    downloads."""
+    comptime if not has_accelerator():
+        return
+    else:
+        var n_rows = 2600
+        var data = _make_data(n_rows, 3, 16, missing_bin=0)
+        var ctx = DeviceContext()
+        var caps = query_device_caps(ctx)
+        var bins = _upload_bins(ctx, data)
+        var threads = GpuActiveRows(
+            ctx, n_rows, data.n_features, data.n_bins, caps
+        ).block_threads
+        assert_true(threads * 2 <= n_rows)
+
+        var sizes = List[Int]()
+        sizes.append(threads)
+        sizes.append(threads + 1)
+        sizes.append(threads - 1)
+        sizes.append(2)
+        sizes.append(1)
+        for s in range(len(sizes)):
+            var size = sizes[s]
+            # A fresh table per size: the helper compares the whole row
+            # buffer, and a smaller bag staged over a larger one leaves the
+            # slots past its root range holding the earlier bag, which no
+            # kernel reads but the whole-buffer comparison would.
+            var rows = GpuActiveRows(
+                ctx, n_rows, data.n_features, data.n_bins, caps
+            )
+            # A bag of `size` rows, spread through the dataset so the bin
+            # gathers are not one contiguous stripe.
+            var bag = List[Int]()
+            var stride = n_rows // size
+            for i in range(size):
+                bag.append(i * stride)
+            rows.begin_tree(bag)
+            var host_rows = _zeros(n_rows)
+            for i in range(size):
+                host_rows[i] = Int32(bag[i])
+            var scratch = _zeros(n_rows)
+            _assert_device_matches_host(
+                rows,
+                bins,
+                data,
+                host_rows,
+                scratch,
+                0,
+                1,
+                2,
+                RowRouting.numerical(0, 7, missing_bin=0, default_left=True),
+            )
+            # Split the left child again: a range not anchored at 0, and
+            # smaller than the root's, so a root over one block can have a
+            # child under it and both paths run inside one tree.
+            _assert_device_matches_host(
+                rows,
+                bins,
+                data,
+                host_rows,
+                scratch,
+                1,
+                3,
+                4,
+                RowRouting.numerical(
+                    2, 5, missing_bin=0, default_left=False
+                ),
+            )
+            # The right child too, so an empty or one-row range is reached
+            # from a live parent at every size.
+            _assert_device_matches_host(
+                rows,
+                bins,
+                data,
+                host_rows,
+                scratch,
+                2,
+                5,
+                6,
+                RowRouting.numerical(1, 9, missing_bin=0, default_left=True),
+            )
+
+
 def test_device_partition_verifies_a_supplied_left_count() raises:
     comptime if not has_accelerator():
         return
