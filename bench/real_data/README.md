@@ -87,12 +87,26 @@ whose two engines report different digests before it looks at anything else.
 down.** `scenarios.py` sets `lambda_l2` explicitly because the two defaults
 differ, disables exclusive feature bundling because mojotrees has none,
 disables LightGBM's feature pre-filter because it deletes columns at Dataset
-build time, and raises `bin_construct_sample_cnt` to the training row count
+build time, raises `bin_construct_sample_cnt` to the training row count
 because LightGBM otherwise builds its bin edges from a 200000-row subsample
-while mojotrees bins from every row. Each one is justified where it is set.
-Threads are matched by count rather than by parameter name: LightGBM reads
-`num_threads`, mojotrees reads `MOJOTREES_NUM_WORKERS`, and the runner sets
-both from one number before either library is imported.
+while mojotrees bins from every row, and sets `min_data_in_bin` to 1 because
+mojotrees's numerical binner has no minimum-population rule and LightGBM's
+default of 3 would merge low-cardinality levels that mojotrees keeps apart.
+That last one moves LightGBM onto our rule and leaves us with the larger bin
+counts, so it makes the comparison stricter against us rather than laxer.
+Each one is justified where it is set. Threads are matched by count rather
+than by parameter name: LightGBM reads `num_threads`, mojotrees reads
+`MOJOTREES_NUM_WORKERS`, and the runner sets both from one number before
+either library is imported.
+
+**The record holds the dicts that were passed, not a reconstruction of
+them.** Each adapter returns the parameter dict it used, so the additions it
+makes after translation are in the record rather than lost from it. The
+record also carries which histogram construction LightGBM ran, since
+row-wise and col-wise are different algorithms and a training time cannot be
+repeated without knowing which produced it, and the per-feature bin counts
+from both engines, which is what makes the binning alignment checkable by
+measurement instead of by argument.
 
 **Where alignment is impossible, the record says so.** Scenario caveats are
 copied into every record they touch and reprinted under every table.
@@ -114,7 +128,12 @@ repeats with the min and max around it, marks any cell whose spread is wide,
 refuses to print a ratio from fewer than three repeats, refuses to put runs
 from different machines or builds in one table, and reprints the thread
 count, device, data kind, battery state, and thermal state under every
-table. There is no headline number anywhere in it.
+table. Beside each of the two threaded phases it prints parallel efficiency,
+CPU seconds over wall seconds, because a seconds column on its own cannot
+tell a slow engine from a serial one and the mistake runs in a predictable
+direction. `records.csv` reduces repeated samples with the same median the
+table uses, so a column and a cell of the same name are the same number.
+There is no headline number anywhere in it.
 
 The reason for the split is that a quality difference between two engines
 fitting the same objective on the same bins is small, stable, and
@@ -131,13 +150,17 @@ of the process, serialised model size and tree count, and the full
 environment. Each run gets a fresh process, which is what makes the memory
 figure attributable and the warmup figure real.
 
-Two measurements are recorded as unavailable rather than estimated.
+Several measurements are recorded as unavailable rather than estimated.
 Host-to-device transfer time is not exposed to Python by either engine;
 instrumenting it is a change to the Mojo accelerator sources and is listed
-in the handoff. And on the sparse path, mojotrees bins inside `fit`, so
-binning time cannot be separated from training time there. Both appear as a
-null with a reason, which is the only form a missing measurement takes in
-this harness.
+in the handoff. On the sparse path, mojotrees bins inside `fit`, so binning
+time cannot be separated from training time there, and the estimator keeps
+its Dataset to itself, so the bin counts cannot be read back either. And a
+LightGBM run that forces neither histogram builder has no recoverable
+resolved builder, because 4.7 keeps that choice in the tree learner's share
+state and reports it only in a log line this harness silences. Every one of
+them appears as a null with a reason, which is the only form a missing
+measurement takes in this harness.
 
 ## Accelerator mode
 

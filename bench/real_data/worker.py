@@ -132,12 +132,13 @@ def describe(part, name):
 
 
 def _record_extra(task, train):
-    """The per-dataset parameters the record's translated dicts need.
+    """The per-dataset parameters the record's shared block needs.
 
-    The engines derive `num_class` from the loaded data before training;
-    the record has to derive it the same way or a multiclass record cannot
-    even be written (`lightgbm_params` and `mojotrees_params` both require
-    it for a multiclass spec).
+    The engines derive `num_class` from the loaded data before training,
+    and the shared block has to derive it the same way, or the canonical
+    parameters in the record would omit a parameter both engines were
+    given. The engine's own dict is not built here at all: it comes back
+    from the adapter that used it.
     """
     if task != "multiclass":
         return None
@@ -170,6 +171,16 @@ def run_job(job):
     warmup = engine.warmup(spec)
     result = engine.run(spec, train, test, repeats=job.get("predict_repeats", 3))
     predictions = result.pop("predictions")
+    # The engine's own dicts, not a second call to the translators. Each
+    # adapter adds to the translated dict after it gets it, and rebuilding
+    # the dict here dropped exactly those additions: every LightGBM record
+    # written before this was missing bin_construct_sample_cnt and every
+    # mojotrees record was missing n_estimators. Both are alignment
+    # settings, and the records were being read as evidence of alignment.
+    params_used = result.pop("params_used")
+    dataset_params_used = result.pop("dataset_params_used", None)
+    dataset_params_reason = result.pop("dataset_params_unavailable_reason", None)
+    num_boost_round = result.pop("num_boost_round", None)
 
     scores = quality.score(
         task, test["y"], predictions, group=test.get("group")
@@ -193,15 +204,10 @@ def run_job(job):
         "data": {**data_meta, "train": train_desc, "test": test_desc},
         "params": {
             "shared": scenarios.shared_params(spec, _record_extra(task, train)),
-            "engine": (
-                scenarios.mojotrees_params(
-                    spec, job["device"], _record_extra(task, train)
-                )
-                if job["engine"] == "mojotrees"
-                else scenarios.lightgbm_params(
-                    spec, job["threads"], _record_extra(task, train)
-                )
-            ),
+            "engine": params_used,
+            "dataset": dataset_params_used,
+            "dataset_unavailable_reason": dataset_params_reason,
+            "num_boost_round": num_boost_round,
         },
         "caveats": list(spec.get("caveats", [])) + list(result.get("notes", [])),
         "quality": scores,

@@ -19,6 +19,13 @@ travelling further than it deserves:
   mark wherever they go.
 - Every table repeats the conditions underneath it: thread count, device,
   data kind, and whether the machine was on battery or thermally limited.
+- Every timed phase that can be threaded prints its parallel efficiency in
+  the column beside it. A thread count is what a run was asked for and
+  parallel efficiency is what it got, and a table that prints only the
+  first invites a one-core measurement to be read as a slow eight-core one.
+- The histogram construction each engine ran is printed under the table,
+  because two engines building histograms by different strategies is a
+  fact about what the timings mean rather than a footnote.
 
 There is no summary line, no headline speedup, and no "x faster" anywhere
 in this file. If a headline is wanted, a person writes it, having read the
@@ -97,10 +104,24 @@ def fmt_bytes(value):
     return str(value)
 
 
+#: The columns, in order. The two parallel-efficiency columns are CPU
+#: seconds over wall seconds, which is how many cores were busy on average.
+#: They are here because a timing column without them is ambiguous between
+#: a fast engine and a parallel one, and the ambiguity has a direction: a
+#: cell at 1.00 next to a cell at 8.00 is a single-threaded measurement
+#: being read as a slow one, which sends optimization work at the wrong
+#: thing. Both phases carry one because they are separately parallel, and
+#: an engine can be threaded in training and serial in prediction.
 FIELDS = (
     ("train", "train s", lambda r: phase_value(r, "train")),
+    ("cpu_ratio", "train par eff", lambda r: phase_value(r, "train", "parallel_efficiency")),
     ("binning", "bin s", lambda r: phase_value(r, "binning")),
     ("predict_batch", "predict s", lambda r: phase_value(r, "predict_batch")),
+    (
+        "predict_batch_cpu_ratio",
+        "predict par eff",
+        lambda r: phase_value(r, "predict_batch", "parallel_efficiency"),
+    ),
     ("predict_row", "row ms", lambda r: _ms(phase_value(r, "predict_row"))),
     ("warmup", "warmup s", lambda r: (r.get("warmup") or {}).get("elapsed_s")),
     ("import", "import s", lambda r: phase_value(r, "import")),
@@ -125,9 +146,6 @@ def build_cells(records, warn_spread):
             for name, _, getter in FIELDS
         }
         summary["peak_rss"] = summarise([r.get("peak_rss_bytes") for r in group])
-        summary["cpu_ratio"] = summarise(
-            [phase_value(r, "train", "parallel_efficiency") for r in group]
-        )
         first = group[0]
         out[key] = {
             "records": group,
@@ -206,6 +224,16 @@ def render(records, config, out):
 
             out("\nMedian across repeats, with [min, max]. A `!` marks a cell whose "
                 f"spread exceeds {warn_spread:.0%} of its median.\n")
+            out(
+                "The two `par eff` columns are CPU seconds over wall seconds "
+                "for that phase, so they read as the average number of cores "
+                "busy. A phase that ran on one core reports about 1.00 "
+                "whatever the thread count column says, and two seconds "
+                "columns are only comparable when the two par eff columns "
+                "beside them are.\n"
+            )
+            _builders(rows, out)
+            _bins(rows, out)
             _ratios(rows, min_repeats, out)
 
             caveats = sorted({c for cell in rows.values() for c in cell["caveats"]})
@@ -222,6 +250,75 @@ def render(records, config, out):
             }
             for reason in sorted(unavailable):
                 out(f"\nHost-to-device transfer time was not measured: {reason}\n")
+
+
+def _builders(rows, out):
+    """Which histogram construction each engine ran.
+
+    Printed next to the timings rather than left in the records, because
+    it is not a detail: row-wise and col-wise are different algorithms, and
+    a training time is only reproducible if the reader knows which one
+    produced it. A record that has the number and not the builder is not
+    enough to repeat the run from.
+
+    Every repeat is read rather than the first one, so a cell whose repeats
+    did not all use the same builder prints two lines instead of hiding one
+    of them behind the other.
+    """
+    lines = []
+    for key in sorted(rows):
+        for record in rows[key]["records"]:
+            builder = record.get("histogram_builder")
+            if not isinstance(builder, dict):
+                continue
+            resolved = builder.get("resolved")
+            if isinstance(resolved, dict):
+                shown = (
+                    f"requested `{builder.get('requested')}`, resolved value "
+                    f"not recoverable: {resolved.get('unavailable_reason')}"
+                )
+            else:
+                shown = f"`{resolved}`"
+            lines.append(f"- {key[1]} on {key[2]}: {shown}")
+    if lines:
+        out("\nHistogram construction:\n")
+        for line in sorted(set(lines)):
+            out(line)
+        out("")
+
+
+def _bins(rows, out):
+    """The per-feature bin counts each engine ended up with.
+
+    This is the empirical side of the binning alignment that scenarios.py
+    argues for in prose. Equal totals do not prove the edges match, but
+    unequal totals prove they do not, and that is the check this line
+    exists to make cheap. Every repeat is read, so a binning that was not
+    reproducible across repeats shows up as two lines for one engine.
+    """
+    lines = []
+    for key in sorted(rows):
+        for record in rows[key]["records"]:
+            bins = (record.get("model") or {}).get("bins")
+            if not isinstance(bins, dict):
+                continue
+            if "total" not in bins:
+                lines.append(
+                    f"- {key[1]} on {key[2]}: not read "
+                    f"({bins.get('unavailable_reason')})"
+                )
+                continue
+            lines.append(
+                f"- {key[1]} on {key[2]}: {bins['total']} bins over "
+                f"{bins['n_features']} features, per feature "
+                f"min {bins['min']} / mean {bins['mean']:.1f} / "
+                f"max {bins['max']}, vector sha256 {bins['sha256'][:12]}"
+            )
+    if lines:
+        out("\nBins the two binnings produced:\n")
+        for line in sorted(set(lines)):
+            out(line)
+        out("")
 
 
 def _ratios(rows, min_repeats, out):

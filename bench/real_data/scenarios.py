@@ -27,6 +27,16 @@ The alignment, and why each entry is here:
 - `zero_as_missing = false`. Both engines' default, restated because the
   sparse scenario is exactly where the other setting would be tempting.
   A stored zero and an absent entry are both the value zero on both sides.
+- `min_data_in_bin = 1`, against LightGBM's default of 3. mojotrees's
+  numerical binner has no minimum-population rule at all, which is
+  `min_data_in_bin = 1` (`src/mojotrees/binning.mojo`, and the
+  `min_data_in_bin` row of `docs/LIGHTGBM_PARITY.md`). At LightGBM's
+  default the two engines bin low-cardinality columns differently:
+  LightGBM merges levels that mojotrees keeps apart, which leaves
+  mojotrees with more bins and therefore more histogram work per node on
+  exactly those columns. Setting it to 1 moves LightGBM onto our rule,
+  so it makes the timing comparison stricter against us rather than
+  laxer, which is the direction an alignment is allowed to move in.
 - `force_row_wise = true` for LightGBM. Without it LightGBM spends the
   first iterations timing both histogram strategies, which lands in the
   training measurement as a one-off cost that has nothing to do with the
@@ -71,8 +81,57 @@ LIGHTGBM_ALIGNMENT = {
     "verbosity": -1,
     "seed": 190019,
     "min_gain_to_split": 0.0,
-    "min_data_in_bin": 3,
+    # 1, not LightGBM's default of 3: mojotrees's numerical binner has no
+    # minimum-population rule, so 3 would have LightGBM merging levels we
+    # keep. The merge is in LightGBM's favor on speed, so correcting it
+    # costs us and the comparison gets harder, not easier. See the
+    # docstring.
+    "min_data_in_bin": 1,
     "boost_from_average": True,
+}
+
+#: Where each shared parameter ends up on each side, by the name it ends up
+#: under. Three destinations, because the two libraries take the same
+#: quantity in three different places:
+#:
+#:   "train"    the dict handed to the trainer, from `lightgbm_params` or
+#:              `mojotrees_params`
+#:   "dataset"  the dict handed to the Dataset constructor, from
+#:              `dataset_params`. mojotrees takes the binning settings here
+#:              and LightGBM takes them alongside the training ones
+#:   "engine"   neither dict: the engine adapter reads it from BASE_PARAMS
+#:              at the call site, because it is a call argument rather than
+#:              a parameter (`num_boost_round`) or an estimator keyword
+#:
+#: This table exists so that selfcheck.check_params can cross-check every
+#: shared parameter rather than the two it used to. A parameter added to
+#: BASE_PARAMS without a row here fails the self-check, which is the point:
+#: the failure mode being guarded against is a shared parameter that
+#: silently reaches one engine and not the other.
+#:
+#: The routing describes the Dataset path, which is what five of the six
+#: scenarios take. mojotrees's sparse path goes through the estimator
+#: instead and takes max_bin and use_missing as estimator keywords, read
+#: from BASE_PARAMS by the adapter: the same values through a different
+#: door, and the record for that path says which door it was.
+SHARED_PARAM_ROUTING = {
+    #  canonical              lightgbm                            mojotrees
+    "num_leaves": (("train", "num_leaves"), ("train", "num_leaves")),
+    "max_depth": (("train", "max_depth"), ("train", "max_depth")),
+    "learning_rate": (("train", "learning_rate"), ("train", "learning_rate")),
+    "n_estimators": (("engine", "num_boost_round"), ("engine", "n_estimators")),
+    "min_data_in_leaf": (
+        ("train", "min_data_in_leaf"),
+        ("train", "min_data_in_leaf"),
+    ),
+    "min_child_hess": (
+        ("train", "min_sum_hessian_in_leaf"),
+        ("train", "min_child_hess"),
+    ),
+    "lambda_l1": (("train", "lambda_l1"), ("train", "lambda_l1")),
+    "lambda_l2": (("train", "lambda_l2"), ("train", "lambda_l2")),
+    "max_bin": (("train", "max_bin"), ("dataset", "max_bin")),
+    "use_missing": (("train", "use_missing"), ("dataset", "use_missing")),
 }
 
 #: Categorical hyperparameters. Identical defaults on both sides; listed so

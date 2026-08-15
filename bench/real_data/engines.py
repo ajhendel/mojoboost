@@ -28,6 +28,12 @@ The phases, and why they are split where they are:
 Both adapters return the predictions themselves, so the runner can compute
 metrics, hash them for the determinism check, and compare the two engines
 row by row.
+
+They also return `params_used`, which is the dict that was actually handed
+to the library, after the adapter has added whatever the scenario module
+could not know. Rebuilding the dict for the record instead would omit
+exactly those additions, and a record that understates what ran is worse
+than no record, because it reads like evidence.
 """
 
 import os
@@ -59,6 +65,118 @@ def _tiny_like(spec):
         y = (np.arange(rows, dtype=np.float64) % 5.0)
         return x, y, np.full(rows // 8, 8, dtype=np.int64), 0
     return x, x[:, 0].copy(), None, 0
+
+
+def _bin_profile(dataset, n_features):
+    """The per-feature bin counts, reduced to something a record can hold.
+
+    Both libraries expose `Dataset.feature_num_bin(i)`, under that name and
+    with the same meaning: how many bins the fitted binning gave one
+    feature. It is the one field in the record that lets a reader check the
+    binning alignment by measurement instead of by reading scenarios.py and
+    believing it, which is why it is worth the loop.
+
+    The counts themselves are not stored. A run with half a million
+    features would put half a million integers in every record, so what is
+    stored is the shape of the distribution plus a digest of the exact
+    vector: two records with the same digest binned identically, and two
+    that differ can be re-derived from their jobs. The digest goes through
+    measure.digest so there is one hashing convention in this harness
+    rather than two.
+
+    The loop runs after every timed phase and is not inside any of them.
+
+    Returns a dict, or `measure.unavailable(reason)` if the library refused
+    the call, which is what a 4.x LightGBM older than 4.0 would do.
+    """
+    try:
+        counts = np.asarray(
+            [int(dataset.feature_num_bin(i)) for i in range(int(n_features))],
+            dtype=np.int64,
+        )
+    except Exception as exc:  # pragma: no cover - engine-dependent
+        return measure.unavailable(
+            f"feature_num_bin is not callable on this Dataset: "
+            f"{type(exc).__name__}: {exc}"
+        )
+    if counts.size == 0:
+        return measure.unavailable("the Dataset reports no features")
+    return {
+        "n_features": int(counts.size),
+        "total": int(counts.sum()),
+        "max": int(counts.max()),
+        "min": int(counts.min()),
+        "mean": float(counts.mean()),
+        "sha256": measure.digest(counts),
+    }
+
+
+#: mojotrees's side of the same field. It builds histograms feature-major
+#: and has no parameter that selects anything else, which
+#: docs/LIGHTGBM_PARITY.md records in its force_col_wise / force_row_wise
+#: row. Recorded rather than left absent so that a LightGBM record's
+#: builder has something to be compared against, and because the pair being
+#: compared is not the same strategy on both sides once LightGBM is forced
+#: row-wise. What varies on this side is thread dispatch, which is
+#: MOJOTREES_PARALLEL_MIN_OPS and lives in the environment block.
+MOJOTREES_HISTOGRAM_BUILDER = {
+    "requested": "feature_major",
+    "resolved": "feature_major",
+    "recorded": (
+        "resolved; mojotrees has one histogram construction and no "
+        "parameter to select another"
+    ),
+}
+
+
+def _histogram_builder(params):
+    """Which histogram construction LightGBM was asked for, and which it
+    ran.
+
+    This belongs in the record more than most parameters do. Row-wise and
+    col-wise are two different algorithms over the same bins rather than
+    two tunings of one, so a training time without the builder next to it
+    is not a reproducible measurement. `LIGHTGBM_ALIGNMENT` forces
+    row-wise, and a reader who does not know that cannot repeat the run.
+
+    What is knowable: the request always. The resolution only when the
+    request settles it, which is when either force flag is set. With
+    neither set LightGBM times both strategies on the first iterations and
+    keeps the winner in the tree learner's share state; 4.7 exposes no
+    getter for it on the Booster, on the Dataset, or in the model text,
+    and the one report of it is a log line this harness silences with
+    verbosity -1. So the auto case records a null and that reason rather
+    than echoing back the request as though it were an answer.
+    """
+    row = bool(params.get("force_row_wise", False))
+    col = bool(params.get("force_col_wise", False))
+    if row and col:
+        requested = "both_forced"
+        resolved = measure.unavailable(
+            "both force flags were set, which LightGBM resolves internally "
+            "and does not report back. This harness sets one."
+        )
+    elif row:
+        requested = resolved = "force_row_wise"
+    elif col:
+        requested = resolved = "force_col_wise"
+    else:
+        requested = "auto"
+        resolved = measure.unavailable(
+            "neither force flag was set, so LightGBM chose by timing both "
+            "on the first iterations. 4.7 keeps that choice in the tree "
+            "learner's share state and exposes no getter for it, and the "
+            "log line that reports it is suppressed at verbosity -1."
+        )
+    return {
+        "requested": requested,
+        "resolved": resolved,
+        "recorded": (
+            "resolved, which the forced parameter determines"
+            if isinstance(resolved, str)
+            else "requested only; see resolved.unavailable_reason"
+        ),
+    }
 
 
 class MojoTreesEngine:
@@ -136,7 +254,8 @@ class MojoTreesEngine:
         params = scenarios.mojotrees_params(spec, self.device, extra)
         params["n_estimators"] = scenarios.BASE_PARAMS["n_estimators"]
 
-        dataset = self._dataset(spec, train, scenarios.dataset_params(spec))
+        dataset_params = scenarios.dataset_params(spec)
+        dataset = self._dataset(spec, train, dataset_params)
         _, binning = measure.timed(dataset.construct)
 
         rounds = params["n_estimators"]
@@ -166,10 +285,15 @@ class MojoTreesEngine:
                 "predict_batch": predict_batch,
                 "predict_row": predict_row,
             },
+            "params_used": params,
+            "dataset_params_used": dataset_params,
+            "num_boost_round": rounds,
+            "histogram_builder": dict(MOJOTREES_HISTOGRAM_BUILDER),
             "model": {
                 "num_trees": booster.num_trees(),
                 "current_iteration": booster.current_iteration(),
                 "num_bin": dataset.num_bin(),
+                "bins": _bin_profile(dataset, train["X"].shape[1]),
                 "size": size,
             },
             "transfers": measure.unavailable(
@@ -199,12 +323,26 @@ class MojoTreesEngine:
             )
         params = scenarios.mojotrees_params(spec, "cpu")
         params.pop("device", None)
-        estimator = self.module.MojoTreesClassifier(
-            n_estimators=scenarios.BASE_PARAMS["n_estimators"],
-            max_bin=scenarios.BASE_PARAMS["max_bin"],
-            use_missing=scenarios.BASE_PARAMS["use_missing"],
-            **{k: v for k, v in params.items() if k != "objective"},
-        )
+        # Built once and both passed and recorded, so the record is the
+        # call rather than a reconstruction of it. `objective` is dropped
+        # because the classifier implies it; the record's shared block
+        # still carries it. A collision raises rather than resolving
+        # itself, which is what the keyword form this replaced did.
+        estimator_params = {
+            "n_estimators": scenarios.BASE_PARAMS["n_estimators"],
+            "max_bin": scenarios.BASE_PARAMS["max_bin"],
+            "use_missing": scenarios.BASE_PARAMS["use_missing"],
+        }
+        for key, value in params.items():
+            if key == "objective":
+                continue
+            if key in estimator_params:
+                raise EngineError(
+                    f"the translated parameters and the estimator keywords "
+                    f"both set {key!r}, so one of them would silently win"
+                )
+            estimator_params[key] = value
+        estimator = self.module.MojoTreesClassifier(**estimator_params)
         _, training = measure.timed(lambda: estimator.fit(train["X"], train["y"]))
 
         predictions, predict_batch = measure.repeat(
@@ -238,10 +376,27 @@ class MojoTreesEngine:
                 "predict_batch": predict_batch,
                 "predict_row": predict_row,
             },
+            "params_used": estimator_params,
+            "dataset_params_used": None,
+            "dataset_params_unavailable_reason": (
+                "the estimator path takes the binning settings as estimator "
+                "keywords, which are in params_used, rather than through a "
+                "Dataset"
+            ),
+            "num_boost_round": int(estimator_params["n_estimators"]),
+            "histogram_builder": dict(MOJOTREES_HISTOGRAM_BUILDER),
             "model": {
                 "num_trees": booster.num_trees(),
                 "current_iteration": booster.current_iteration(),
                 "num_bin": None,
+                "num_bin_unavailable_reason": (
+                    "the estimator owns its Dataset internally on the CSC "
+                    "path and does not hand it back, so neither num_bin nor "
+                    "the per-feature bin counts can be read after fit"
+                ),
+                "bins": measure.unavailable(
+                    "no Dataset is reachable on the estimator CSC path"
+                ),
                 "size": size,
             },
             "transfers": measure.unavailable("cpu-only path"),
@@ -329,6 +484,30 @@ class LightGBMEngine:
         with tempfile.TemporaryDirectory() as scratch:
             size = measure.model_size(booster, scratch)
 
+        # LightGBM has no single "bins reserved per feature" number the way
+        # mojotrees's Dataset.num_bin() does, so num_bin is recorded as the
+        # largest per-feature count, which is the closest thing it has, with
+        # the whole profile beside it. The two engines' counts are recorded
+        # as each library reports them; whether either counts a bin held for
+        # missing values is not something this harness has established, and
+        # comparing the profiles is how that question gets answered rather
+        # than something this comment gets to assert.
+        bins = _bin_profile(dataset, train["X"].shape[1])
+        num_bin = bins["max"] if isinstance(bins, dict) and "max" in bins else None
+        model = {
+            "num_trees": booster.num_trees(),
+            "current_iteration": booster.current_iteration(),
+            "num_bin": num_bin,
+            "bins": bins,
+            "size": size,
+        }
+        if num_bin is None:
+            model["num_bin_unavailable_reason"] = (
+                "LightGBM exposes bin counts per feature, not per Dataset, "
+                "and the per-feature read failed: "
+                + str(bins.get("unavailable_reason"))
+            )
+
         return {
             "engine": self.name,
             "engine_version": self.version,
@@ -342,12 +521,17 @@ class LightGBMEngine:
                 "predict_batch": predict_batch,
                 "predict_row": predict_row,
             },
-            "model": {
-                "num_trees": booster.num_trees(),
-                "current_iteration": booster.current_iteration(),
-                "num_bin": None,
-                "size": size,
-            },
+            "params_used": params,
+            # LightGBM takes the binning settings in the same dict as the
+            # training ones, so there is no second dict to record here.
+            "dataset_params_used": None,
+            "dataset_params_unavailable_reason": (
+                "LightGBM's Dataset and train take one dict, which is "
+                "params_used"
+            ),
+            "num_boost_round": rounds,
+            "histogram_builder": _histogram_builder(params),
+            "model": model,
             "transfers": measure.unavailable("cpu-only build"),
             "peak_rss_bytes": measure.peak_rss_bytes(),
             "notes": list(self.notes),
