@@ -782,6 +782,143 @@ def _range_hist_partial_kernel(
         b += block_dim.x
 
 
+def _range_hist_partial_g2_kernel(
+    bins: MutPointer[UInt8, MutAnyOrigin],
+    rows: MutPointer[Int32, MutAnyOrigin],
+    grad: MutPointer[Float32, MutAnyOrigin],
+    hess: MutPointer[Float32, MutAnyOrigin],
+    feat_ids: MutPointer[Int32, MutAnyOrigin],
+    partials: MutPointer[Int32, MutAnyOrigin],
+    n_rows: Int32,
+    n_slots: Int32,
+    n_bins: Int32,
+    rows_per_tile: Int32,
+    begin: Int32,
+    count: Int32,
+    g_scale: Float32,
+    h_scale: Float32,
+):
+    """`_range_hist_partial_kernel` with two features per threadgroup.
+
+    The tiled twin of `_range_hist_atomic_g2_kernel`, and for the same
+    reason: with one feature per block, the row index, the gradient, the
+    hessian, and the two quantizations are spent once per feature, so a
+    (row, feature) visit moves thirteen bytes of which the bin is one. A
+    block that owns two feature slots reads and quantizes the row side once
+    and spends it twice. The tiled strategy is what large nodes resolve to
+    (`resolve_tiling` picks it whenever occupancy wants more than one tile
+    per feature), so this pairing is the one a large-row fit actually runs;
+    at 5M x 50 the histogram build is measured at ~79% of GPU training wall
+    clock, which is what makes the row-side traffic worth halving here too.
+
+    The partial-buffer layout is untouched: a paired block writes the same
+    two per-slot `[grad | hess | count]` slices the one-feature kernel would
+    have written from two blocks, each slice still written by exactly one
+    block, so `_range_reduce_kernel` — and the fused sibling subtraction it
+    carries — combine these partials unchanged. The result is bit-identical,
+    not merely close: accumulation stays fixed-point Int32, every shared
+    atomic adds the same per-(row, feature) quantized value into the same
+    bin, and the order of integer adds cannot change a sum. An odd active
+    count leaves the last block unpaired; it runs the one-feature body and
+    writes one slice, so a feature is never counted twice and never dropped.
+
+    Shared memory doubles (`GROUPED_BINS`), halving resident blocks per
+    core, so whether the traffic saving wins is a measurement per device,
+    not an argument — `GpuActiveRows.feature_group` gates it exactly as it
+    gates the atomic pairing.
+
+    Measured on an Apple M4, three interleaved repeats per arm in one
+    process (setenv between fits, same binned data): a full 100-round
+    `train_gpu` at 5M x 50 runs 15.96s at group 1 and 11.49s at group 2, a
+    1.39x end-to-end difference with the group-2 arm's own spread at 0.03%,
+    and the two models' predictions byte-identical. The default stays 1 for
+    the same reason the atomic pairing's does: one device is not a device
+    family, and the shared-memory doubling can invert on a backend with a
+    different threadgroup budget.
+    """
+    var slot0 = 2 * Int(block_idx.x)
+    var slot1 = slot0 + 1
+    var paired = slot1 < Int(n_slots)
+    var f0 = Int(feat_ids[unsafe_offset=slot0][0])
+    var f1 = 0
+    if paired:
+        f1 = Int(feat_ids[unsafe_offset=slot1][0])
+    var t = block_idx.y
+    var tid = thread_idx.x
+    var nb = Int(n_bins)
+    var nr = Int(n_rows)
+    var n = Int(count)
+    var plane = Int(n_slots) * nb
+
+    var sg = stack_allocation[
+        GROUPED_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
+    ]()
+    var sh = stack_allocation[
+        GROUPED_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
+    ]()
+    var sc = stack_allocation[
+        GROUPED_BINS, Scalar[DType.int32], address_space = AddressSpace.SHARED
+    ]()
+
+    # The second feature's bins live directly above the first's, so one
+    # zeroing walk covers both and an unpaired block never touches the upper
+    # half.
+    var span = 2 * nb if paired else nb
+    var b = tid
+    while b < span:
+        sg[unsafe_offset=b] = 0
+        sh[unsafe_offset=b] = 0
+        sc[unsafe_offset=b] = 0
+        b += block_dim.x
+    barrier()
+
+    var tile_begin = t * Int(rows_per_tile)
+    var tile_end = tile_begin + Int(rows_per_tile)
+    if tile_end > n:
+        tile_end = n
+
+    var col0 = f0 * nr
+    var col1 = f1 * nr
+    var j = tile_begin + tid
+    while j < tile_end:
+        var r = Int(rows[unsafe_offset = Int(begin) + j][0])
+        var gq = Int32(round(grad[unsafe_offset=r][0] * g_scale))
+        var hq = Int32(round(hess[unsafe_offset=r][0] * h_scale))
+        var b0 = Int(bins[unsafe_offset = col0 + r])
+        _ = Atomic.fetch_add(sg.unsafe_offset(b0), gq)
+        _ = Atomic.fetch_add(sh.unsafe_offset(b0), hq)
+        _ = Atomic.fetch_add(sc.unsafe_offset(b0), Int32(1))
+        if paired:
+            var b1 = nb + Int(bins[unsafe_offset = col1 + r])
+            _ = Atomic.fetch_add(sg.unsafe_offset(b1), gq)
+            _ = Atomic.fetch_add(sh.unsafe_offset(b1), hq)
+            _ = Atomic.fetch_add(sc.unsafe_offset(b1), Int32(1))
+        j += block_dim.x
+    barrier()
+
+    var base0 = t * 3 * plane + slot0 * nb
+    b = tid
+    while b < nb:
+        partials[unsafe_offset = base0 + b] = sg[unsafe_offset=b][0]
+        partials[unsafe_offset = base0 + plane + b] = sh[unsafe_offset=b][0]
+        partials[unsafe_offset = base0 + 2 * plane + b] = sc[
+            unsafe_offset=b
+        ][0]
+        b += block_dim.x
+    if not paired:
+        return
+    var base1 = t * 3 * plane + slot1 * nb
+    b = tid
+    while b < nb:
+        var s = nb + b
+        partials[unsafe_offset = base1 + b] = sg[unsafe_offset=s][0]
+        partials[unsafe_offset = base1 + plane + b] = sh[unsafe_offset=s][0]
+        partials[unsafe_offset = base1 + 2 * plane + b] = sc[
+            unsafe_offset=s
+        ][0]
+        b += block_dim.x
+
+
 def _range_reduce_kernel(
     partials: MutPointer[Int32, MutAnyOrigin],
     feat_ids: MutPointer[Int32, MutAnyOrigin],
@@ -1613,24 +1750,49 @@ struct GpuActiveRows(Movable):
         var do_sub = Int32(1) if subtract else Int32(0)
 
         if tiling.strategy == STRATEGY_TILED:
-            self.ctx.enqueue_function[_range_hist_partial_kernel](
-                bins,
-                self.rows_dev.unsafe_ptr(),
-                grad,
-                hess,
-                feat_ids,
-                partials,
-                Int32(self.n_rows),
-                Int32(n_slots),
-                Int32(self.n_bins),
-                Int32(tiling.rows_per_tile),
-                Int32(window.begin),
-                Int32(window.count()),
-                g_scale,
-                h_scale,
-                grid_dim=(n_slots, tiling.n_tiles),
-                block_dim=threads,
-            )
+            if self.feature_group >= 2 and n_slots >= 2:
+                # Half as many threadgroups, each owning two feature slots,
+                # exactly as the atomic pairing below; the reduce that
+                # follows is the same either way because the partial layout
+                # is per slot, not per block.
+                var grouped_blocks = (n_slots + 1) // 2
+                self.ctx.enqueue_function[_range_hist_partial_g2_kernel](
+                    bins,
+                    self.rows_dev.unsafe_ptr(),
+                    grad,
+                    hess,
+                    feat_ids,
+                    partials,
+                    Int32(self.n_rows),
+                    Int32(n_slots),
+                    Int32(self.n_bins),
+                    Int32(tiling.rows_per_tile),
+                    Int32(window.begin),
+                    Int32(window.count()),
+                    g_scale,
+                    h_scale,
+                    grid_dim=(grouped_blocks, tiling.n_tiles),
+                    block_dim=threads,
+                )
+            else:
+                self.ctx.enqueue_function[_range_hist_partial_kernel](
+                    bins,
+                    self.rows_dev.unsafe_ptr(),
+                    grad,
+                    hess,
+                    feat_ids,
+                    partials,
+                    Int32(self.n_rows),
+                    Int32(n_slots),
+                    Int32(self.n_bins),
+                    Int32(tiling.rows_per_tile),
+                    Int32(window.begin),
+                    Int32(window.count()),
+                    g_scale,
+                    h_scale,
+                    grid_dim=(n_slots, tiling.n_tiles),
+                    block_dim=threads,
+                )
             var n_cells = 3 * n_slots * self.n_bins
             var blocks = (n_cells + threads - 1) // threads
             self.ctx.enqueue_function[_range_reduce_kernel](

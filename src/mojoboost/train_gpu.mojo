@@ -983,6 +983,17 @@ def _device_search_resident(
     # the way out means an error that escapes mid-tree cannot leak a frontier
     # into the following one.
     builder.release_resident_all()
+    # Wall-clock phase attribution, printed per tree under
+    # `MOJOBOOST_GPU_PHASE_TRACE=1`. The kernels here queue with no fence and
+    # normally collapse into `download_frontier`'s one wait, so a traced run
+    # inserts a sync after the partition and after the histogram build to
+    # separate the phases, paying two extra device waits per split that an
+    # untraced run does not.
+    var phase_trace = getenv("MOJOBOOST_GPU_PHASE_TRACE") == "1"
+    var t_partition = 0.0
+    var t_hist = 0.0
+    var t_search = 0.0
+    var tree_t0 = perf_counter_ns()
     var tree = Tree(
         List[Int](), List[Int](), List[Int](), List[Int](),
         List[Float64](), List[Float64](), 0,
@@ -992,7 +1003,11 @@ def _device_search_resident(
     var root_slot = builder.acquire_resident(root)
     if root_slot < 0:
         raise Error("the resident histogram pool is full at the root")
+    var hist_t0 = perf_counter_ns()
     builder.enqueue_resident_leaf(root, root_slot)
+    if phase_trace:
+        builder.ctx.synchronize()
+    t_hist += Float64(perf_counter_ns() - hist_t0) / 1e9
     var root_batch = List[SplitNodeRequest]()
     root_batch.append(
         SplitNodeRequest(
@@ -1005,6 +1020,7 @@ def _device_search_resident(
     # The searcher shares the builder's context, so these kernels queue
     # behind the histogram build with no fence, and they read the pool
     # buffer the build just wrote rather than a copy of it.
+    var search_t0 = perf_counter_ns()
     searcher.enqueue_frontier(
         builder.batcher[0].out_dev,
         root_batch,
@@ -1013,6 +1029,7 @@ def _device_search_resident(
         builder.h_scale,
     )
     var root_recs = searcher.download_frontier(1)
+    t_search += Float64(perf_counter_ns() - search_t0) / 1e9
     var root_rec = root_recs[0].copy()
     _apply_shape_rules(root_rec, n_root, 0, params)
     tree.value[root] = root_rec.parent_value
@@ -1051,6 +1068,7 @@ def _device_search_resident(
 
         var left_node = tree._add_node(0.0, Float64(n_left))
         var right_node = tree._add_node(0.0, Float64(n_right))
+        var part_t0 = perf_counter_ns()
         builder.apply_split(
             split.feature,
             split.bin,
@@ -1063,6 +1081,9 @@ def _device_search_resident(
             split.cat_bitset,
             expected_left=n_left,
         )
+        if phase_trace:
+            builder.ctx.synchronize()
+        t_partition += Float64(perf_counter_ns() - part_t0) / 1e9
 
         var children = _commit_device_split(
             tree,
@@ -1085,6 +1106,7 @@ def _device_search_resident(
         var build_left = subtraction_builds_left(n_left, n_right)
         var built_node = left_node if build_left else right_node
         var derived_node = right_node if build_left else left_node
+        hist_t0 = perf_counter_ns()
         var built_slot = builder.acquire_resident(built_node)
         if built_slot < 0:
             raise Error(
@@ -1096,6 +1118,9 @@ def _device_search_resident(
             built_node, built_slot, parent_slot
         )
         builder.reown_resident(parent_slot, derived_node)
+        if phase_trace:
+            builder.ctx.synchronize()
+        t_hist += Float64(perf_counter_ns() - hist_t0) / 1e9
         var left_slot = built_slot if build_left else parent_slot
         var right_slot = parent_slot if build_left else built_slot
 
@@ -1121,6 +1146,7 @@ def _device_search_resident(
                 children.right.copy(),
             )
         )
+        search_t0 = perf_counter_ns()
         searcher.enqueue_frontier(
             builder.batcher[0].out_dev,
             batch,
@@ -1132,6 +1158,7 @@ def _device_search_resident(
         # both sides: the batcher's pinned item table and the searcher's
         # pinned node tables are only restaged after this returns.
         var recs = searcher.download_frontier(2)
+        t_search += Float64(perf_counter_ns() - search_t0) / 1e9
         var left_rec = recs[0].copy()
         var right_rec = recs[1].copy()
         _apply_shape_rules(left_rec, n_left, child_depth, params)
@@ -1158,6 +1185,23 @@ def _device_search_resident(
             )
         )
         n_leaves += 1
+
+    if phase_trace:
+        var tree_s = Float64(perf_counter_ns() - tree_t0) / 1e9
+        print(
+            "phase_trace tree",
+            tree_index,
+            "total_s",
+            tree_s,
+            "hist_s",
+            t_hist,
+            "partition_s",
+            t_partition,
+            "search_s",
+            t_search,
+            "other_s",
+            tree_s - t_hist - t_partition - t_search,
+        )
 
     tree.n_leaves = n_leaves
     builder.release_resident_all()
