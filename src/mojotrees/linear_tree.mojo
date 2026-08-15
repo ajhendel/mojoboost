@@ -338,39 +338,23 @@ from std.memory import bitcast
 from .binning import BinnedMatrix
 from .categorical import CategoricalSpec
 from .monotone import MonotoneConstraints
+from .objective_registry import (
+    L1 as _L1,
+    LAMBDARANK as _LAMBDARANK,
+    MAPE as _MAPE,
+    QUANTILE as _QUANTILE,
+    objective_renews_leaves as _objective_renews_leaves,
+)
 from .tree import Tree
 
 # ---------------------------------------------------------------------------
-# Objective codes, mirrored
+# Objective codes
 # ---------------------------------------------------------------------------
 #
-# This module sits *below* `boosting.mojo` in the import graph, because
-# `Booster` is what will hold a `LinearEnsemble` (see the handoff) and
-# `src/mojotrees` has no mutual imports anywhere. So the four objective codes
-# the leaf-compatibility gate needs are mirrored here rather than imported,
-# the way `model_dump.mojo` mirrors `categorical._MAX_CATEGORY` for the same
-# kind of reason.
-#
-# The canonical definitions are `boosting.QUANTILE`, `boosting.L1`,
-# `boosting.MAPE`, and `ranking.LAMBDARANK`. They are part of a stable public
-# numbering (the objective code is serialized in every model file and crosses
-# the C ABI), so they do not move; if one ever does, this block and
-# `boosting.objective_renews_leaves` have to move together, and the handoff
-# asks the boosting lane for a cross-check that would fail if they did not.
-
-comptime _QUANTILE = 4
-comptime _L1 = 5
-comptime _LAMBDARANK = 7
-comptime _MAPE = 10
-
-
-def _objective_renews_leaves(objective: Int) -> Bool:
-    """Mirror of `boosting.objective_renews_leaves`: the objectives that
-    replace every leaf's Newton value with a weighted residual percentile
-    after growth."""
-    return (
-        objective == _QUANTILE or objective == _L1 or objective == _MAPE
-    )
+# The four codes the leaf-compatibility gate needs, and the leaf-renewal rule,
+# come from objective_registry.mojo, which defines them once and imports only
+# metrics.mojo, so this module still sits below `boosting.mojo` in the import
+# graph. They used to be mirrored here by value.
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -1082,7 +1066,7 @@ def _insert_ascending(base: List[Int], value: Int) -> List[Int]:
 # ---------------------------------------------------------------------------
 
 
-struct LeafStats(Copyable, Movable):
+struct LinearLeafStats(Copyable, Movable):
     """One leaf's centered second-order statistics over a candidate feature
     set.
 
@@ -1175,7 +1159,7 @@ def accumulate_leaf_stats(
     n_rows_total: Int,
     grad: List[Float64],
     hess: List[Float64],
-) -> LeafStats:
+) -> LinearLeafStats:
     """Build one leaf's statistics over `features`, in two passes.
 
     Pass one takes the hessian-weighted means; pass two takes the centered
@@ -1195,7 +1179,7 @@ def accumulate_leaf_stats(
     through `sum_hess` and falls back to a constant.
     """
     var m = len(features)
-    var stats = LeafStats()
+    var stats = LinearLeafStats()
     stats.n_rows = len(rows)
 
     var sum_h = 0.0
@@ -1247,7 +1231,7 @@ def accumulate_leaf_stats(
 
 
 def select_leaf_features(
-    stats: LeafStats, params: LinearParams
+    stats: LinearLeafStats, params: LinearParams
 ) -> List[Int]:
     """Which of `stats.feature` survive the variance filter, the cap, and the
     rows-per-feature floor. Returns positions into `stats.feature`, ascending.
@@ -1426,7 +1410,7 @@ def _cholesky_solve(l: List[Float64], n: Int, mut b: List[Float64]):
 
 
 def solve_leaf_coefficients(
-    stats: LeafStats, subset: List[Int], params: LinearParams
+    stats: LinearLeafStats, subset: List[Int], params: LinearParams
 ) -> LinearSolution:
     """Solve `(A + linear_lambda I) c = -q` over `subset`, dropping features
     until it factorizes.
