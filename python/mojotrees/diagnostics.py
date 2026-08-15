@@ -69,6 +69,7 @@ import sys
 __all__ = [
     "BUNDLED_RUNTIME_LIBS",
     "PHASES",
+    "check_phase_contract",
     "PHASE_NAMES",
     "WATCHED_ENV",
     "InstallDescription",
@@ -183,6 +184,37 @@ PHASES = (
 PHASE_NAMES = tuple(phase.name for phase in PHASES)
 
 _BY_NAME = {phase.name: phase for phase in PHASES}
+
+
+def check_phase_contract():
+    """Compare `PHASES` with the extension's `startup_phase_contract()`.
+
+    The index, name, origin, and one-time flag of every phase are one
+    contract in two files (this table and src/mojotrees/initialization.mojo).
+    Returns the list of disagreements, empty when the two agree, so a test
+    or a diagnostics report can say which row drifted rather than that
+    something did. Never raises for a missing extension: it returns one
+    entry saying so.
+    """
+    try:
+        from . import _compat
+
+        native = _compat.import_extension().startup_phase_contract()
+    except Exception as exc:  # pragma: no cover - reported, not raised
+        return [f"extension unavailable: {exc}"]
+    problems = []
+    records = [
+        (int(r[0]), str(r[1]), str(r[2]), bool(int(r[3]))) for r in native
+    ]
+    ours = [(p.index, p.name, p.origin, bool(p.one_time)) for p in PHASES]
+    if len(records) != len(ours):
+        problems.append(
+            f"native reports {len(records)} phases, PHASES has {len(ours)}"
+        )
+    for theirs, mine in zip(records, ours):
+        if theirs != mine:
+            problems.append(f"native {theirs} vs PHASES {mine}")
+    return problems
 
 #: Environment variables that change what a startup measurement means.
 #: Listed, never interpreted: the device ones belong to

@@ -185,9 +185,45 @@ def build_info():
         "env": env,
         "optional_dependencies": _optional_dependency_versions(),
         "build": _build_provenance(),
+        "model_format_versions": model_format_versions(),
+        "startup": startup_contract(),
     }
     info.update(_install_layout())
     return info
+
+
+def model_format_versions():
+    """The two schema versions a consumer of saved models and dumps
+    branches on, as the extension states them: `model_format_version` (the
+    save format a model written by this build serializes to) and
+    `dump_format_version` (the inspection schema's own)."""
+    versions = _mojotrees.model_format_versions()
+    return {str(k): int(versions[k]) for k in versions}
+
+
+def startup_contract():
+    """What the extension says about its startup: the phase table
+    `mojotrees.diagnostics.PHASES` mirrors (`phases`, as `[index, name,
+    origin, one_time]` records in report order), what the environment asked
+    of startup (`environment`: `trace_enabled`, `warmup_level`), and the
+    native monotonic clock in nanoseconds at the moment of the call
+    (`clock_ns`), which a harness reads right after `import mojotrees` to
+    bound the extension load it cannot time from inside."""
+    phases = [
+        {
+            "index": int(record[0]),
+            "name": str(record[1]),
+            "origin": str(record[2]),
+            "one_time": bool(int(record[3])),
+        }
+        for record in _mojotrees.startup_phase_contract()
+    ]
+    environment = _mojotrees.startup_environment()
+    return {
+        "phases": phases,
+        "environment": {str(k): environment[k] for k in environment},
+        "clock_ns": int(_mojotrees.native_clock_ns()),
+    }
 
 
 def show_versions(file=None):
@@ -233,6 +269,17 @@ def show_versions(file=None):
     print("\noptional dependencies", file=out)
     for name, version in info["optional_dependencies"].items():
         line(name, version if version else "not installed")
+
+    versions = info["model_format_versions"]
+    line("model format", versions["model_format_version"])
+    line("dump format", versions["dump_format_version"])
+    startup = info["startup"]
+    line(
+        "startup",
+        f"{len(startup['phases'])} phases, trace "
+        f"{'on' if startup['environment'].get('trace_enabled') else 'off'}, "
+        f"warmup {startup['environment'].get('warmup_level')}",
+    )
 
     if info["build"]:
         print("\nbuild", file=out)
