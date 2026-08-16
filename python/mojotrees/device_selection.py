@@ -494,16 +494,26 @@ CONTRACT_FULL = "full"
 CONTRACT_NARROW = "narrow"
 
 #: Wire sentinels for "the caller did not declare this". The boundary
-#: carries plain ints, so an undeclared value needs a value; the binding
-#: normalizes any negative `n_bins` to the native `BINS_UNSPECIFIED` (which
-#: is 0 natively, so a caller must not send 0 to mean undeclared) and any
-#: negative `objective` to `OBJECTIVE_UNSPECIFIED`.
+#: carries plain ints, so an undeclared value needs a value. The native
+#: side normalizes them in exactly one place, `_normalized_bins` and
+#: `_normalized_objective` in src/mojotrees/device_policy.mojo: any
+#: nonpositive `n_bins` becomes `BINS_UNSPECIFIED`, and any `objective`
+#: *below* -1 becomes `OBJECTIVE_UNSPECIFIED`.
 #:
-#: That second folding takes in the multiclass marker (-1) deliberately.
-#: `MULTICLASS` is not one of the built-in single-output objectives
-#: `device_policy.is_builtin_objective` recognizes, so sending it would
-#: gate the run as "not a built-in objective", which is the wrong reason:
-#: multiclass is a tree count, and `n_outputs` already carries it.
+#: -1 IS NOT UNDECLARED. It is `objective_registry.MULTICLASS`, which is a
+#: real objective code that happens to be negative so it stays out of the
+#: single-output code space forever. `objective_code_of_name("multiclass")`
+#: returns it, `Workload(objective="multiclass")` therefore carries it, and
+#: the native marshaller preserves it. This comment used to say the
+#: opposite and the binding used to implement the opposite (it folded every
+#: negative), so -1 and -2 arrived at the engine as the same value and a
+#: softmax fit could not declare its objective at all.
+#:
+#: Nothing here may test an objective code with `if code:`, `if code < 0:`,
+#: or `if code is None:` and believe it has separated the two. -1 is truthy
+#: and negative; -2 is truthy and negative; None is neither. Only `is None`
+#: for "the caller said nothing" and an equality against -1 for "softmax"
+#: distinguish all three.
 #:
 #: These are transport, not policy: no rule here reads them, and the
 #: native layer decides what an undeclared field means.
