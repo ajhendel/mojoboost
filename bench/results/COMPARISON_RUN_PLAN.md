@@ -72,8 +72,12 @@ first-execution failure costs the cheapest row rather than the decision row.
   *ratio* is unavailable unless those applications are closed for the
   calibration and kept closed through the run. Absent that, the run is five
   repeats and the header states that no baseline could be established and why.
-  One retake remains unspent, per the rule, and it is reserved for the window
-  itself rather than for another calibration attempt.
+  **Decided by Andrew, 2026-08-16: spend the one retake adjacent to the real
+  run, and do not wait on him to close anything.** If the applications happen
+  to be shut by then and the 3 percent bar holds, the baseline is recorded and
+  the run takes twelve repeats. If not, five repeats, and the header says the
+  baseline could not be established and gives this reason. The retake is not
+  spent on another calibration attempt in the meantime.
 - **If the canary refuses the window, wait for a cool box and take it once
   more, and that is the last time.**
 - **Accuracy beside every speed number in the same table. Both or nothing.**
@@ -135,6 +139,22 @@ rule this file applies to the ordered-boosting hole below: the comparison head
 does not take unverified code, under a no-test order, to close a hole the run
 does not touch. That rule applies to this session's own mistakes or it is not a
 rule.
+
+**Decided by Andrew, 2026-08-16: the removal goes after the run.** Both
+sessions recommended it independently and for the same reason, which is the
+rule above rather than convenience. So the block ships in the comparison head,
+knowingly wrong, and this paragraph is the record that it was known. What a
+reader should take from the resulting table: at this head, `device='auto'` on a
+Cosine fit resolved to the CPU. No row in the table asks that of it.
+
+**Also decided: nothing merges from `lane/ordered-device`, including
+`rung_of_position`.** That lane stopped correctly, refusing to build against a
+`2.64n` plane budget that is the value at `n = 1e6` rather than a bound --
+verified from source arithmetic at `n = 204,801`, where the exact count is
+`614,201 = 2.9990n` against a true bound of `3n`. The design goes back for
+another round after the run. Holding `rung_of_position` out is right on its own
+terms as well: it is exported, it moved the api snapshot 629 to 630, and
+nothing calls it, which is this repository's most-repeated defect.
 
 **And that costs almost nothing, which was checked rather than assumed, after
 this session first wrote down that it cost a lot.** `CatBoostEngine.load` in
