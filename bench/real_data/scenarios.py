@@ -1703,6 +1703,17 @@ def catboost_arm_block():
             for name, reason in CATBOOST_SCENARIO_SUPPORT.items()
             if reason
         },
+        # The CatBoost-mode arm skips a scenario the CatBoost arm runs, which
+        # was impossible before it carried row sampling. A reader comparing
+        # the two columns row by row will find rows where only one of them is
+        # present, and this is where that is stated rather than inferred.
+        "mojotrees_catboost_mode_scenarios_not_run": {
+            name: reason
+            for name, reason in (
+                MOJOTREES_CATBOOST_MODE_SCENARIO_SUPPORT.items()
+            )
+            if reason
+        },
         "cost_warnings": dict(CATBOOST_SCENARIO_COST),
         "rows": {
             "us in CatBoost mode vs CatBoost defaults": (
@@ -2687,6 +2698,76 @@ def mojotrees_catboost_mode_params(spec, device, extra=None):
     return params
 
 
+#: Whether each scenario runs the `mojotrees_catboost_mode` arm, and the exact
+#: reason when it does not. Separate from `CATBOOST_SCENARIO_SUPPORT` because
+#: the two arms are blocked by different things: that table is about what
+#: CatBoost can be handed, and this one is about which of our own trainers
+#: honor `MOJOTREES_CATBOOST_MODE`'s row sampling.
+#:
+#: **This table exists because the arm stopped being a pure parameter
+#: override.** Until `bootstrap_type=MVS` was added it was seven keys of tree
+#: shape and regularization, every one of which every trainer reads, so the
+#: arm ran wherever CatBoost ran and no second table was needed. MVS is the
+#: first key our own trainers disagree about, and the disagreement is a
+#: refusal rather than a wrong number: `trainset.train_dataset`'s sparse arm
+#: calls `sampling.check_bootstrap_honored` by name, and
+#: `train_dataset_multiclass` takes no bootstrap bundle at all, so those two
+#: cells raise instead of quietly training on every row under a label that
+#: says otherwise.
+#:
+#: Scheduling them and letting them raise was the alternative and it is worse
+#: in a specific way: a raising cell is an infrastructure failure, and this
+#: harness withholds the quality verdict for the whole matrix on one of those,
+#: so two cells that were never going to run would have suppressed the verdict
+#: on the twenty-two that did.
+#:
+#: The multiclass skip is also the more faithful of the two. CatBoost does not
+#: run MVS for multiclass either: its own defaulting block excludes
+#: multiclass-only losses and falls back to the Bayesian bootstrap. So the
+#: skip is what CatBoost does, not merely what we cannot do.
+MOJOTREES_CATBOOST_MODE_SCENARIO_SUPPORT = {
+    "dense_regression": None,
+    "imbalanced_binary": None,
+    "ordered_boosting_small": None,
+    "high_cardinality_categorical": None,
+    # Both of these are already skipped for the CatBoost arm itself by
+    # CATBOOST_SCENARIO_SUPPORT, so the loop below never consults these two
+    # entries today. They are here because the loop subscripts this table
+    # rather than using `.get`, so every scenario needs a decision and a
+    # scenario added without one raises a KeyError at import instead of
+    # silently defaulting to "runs". That is the same fail-closed rule
+    # CATBOOST_SCENARIO_SUPPORT already states, and it caught a typo in this
+    # very table on the first run.
+    "ranking": (
+        "already skipped for the CatBoost arm. Were it not, the ranker "
+        "trainers refuse the bootstrap bundle by name too "
+        "(trainset.train_dataset_ranker)"
+    ),
+    "categorical_missing": (
+        "already skipped for the CatBoost arm, so the CatBoost-mode row has "
+        "nothing to be read against"
+    ),
+    "multiclass": (
+        "MOJOTREES_CATBOOST_MODE sets bootstrap_type=MVS, and the multiclass "
+        "trainer takes no bootstrap bundle: trainset.train_dataset_multiclass "
+        "has no bootstrap argument, so the binding refuses it by name rather "
+        "than dropping it. CatBoost does not run MVS for multiclass either -- "
+        "its defaulting block excludes multiclass-only losses and falls back "
+        "to Bayesian -- so this cell would not have been the comparison it "
+        "claims to be even if our trainer accepted it. The plain mojotrees "
+        "arm and the CatBoost arm both still run this scenario; what is "
+        "missing is only the CatBoost-mode row"
+    ),
+    "sparse_highdim": (
+        "MOJOTREES_CATBOOST_MODE sets bootstrap_type=MVS, and the sparse "
+        "trainer refuses it by name at trainset.train_dataset's sparse arm "
+        "(sampling.check_bootstrap_honored, 'a sparse Dataset fit "
+        "(boosting_sparse)'). No sparse round loop calls bootstrap_round. "
+        "The plain mojotrees arm and the CatBoost arm both still run this "
+        "scenario"
+    ),
+}
+
 # The peer arms are added to the scenarios they can run, and a scenario that
 # cannot run them says why in `catboost_arm_block()["scenarios_not_run"]`
 # rather than simply not appearing. Written as a loop over
@@ -2695,7 +2776,12 @@ def mojotrees_catboost_mode_params(spec, device, extra=None):
 # defaulting to one.
 for _scenario_id, _reason in CATBOOST_SCENARIO_SUPPORT.items():
     if _reason is None:
-        SCENARIOS[_scenario_id]["engines"] = list(
-            SCENARIOS[_scenario_id]["engines"]
-        ) + list(PEER_ENGINES)
+        _engines = list(SCENARIOS[_scenario_id]["engines"]) + list(
+            CATBOOST_ENGINES
+        )
+        if MOJOTREES_CATBOOST_MODE_SCENARIO_SUPPORT[_scenario_id] is None:
+            _engines.append("mojotrees_catboost_mode")
+        SCENARIOS[_scenario_id]["engines"] = _engines
 del _scenario_id, _reason
+if "_engines" in dir():
+    del _engines

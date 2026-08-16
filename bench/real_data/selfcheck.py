@@ -601,11 +601,36 @@ def check_catboost_arm():
                 f"{name} does not run the CatBoost arm and gives no reason",
             )
             continue
+        # The CatBoost-mode arm pairs with the CatBoost arm wherever it can,
+        # and where it cannot it must say so by name. Until the arm carried
+        # row sampling this was an unconditional check and it was right to be
+        # one: every key in MOJOTREES_CATBOOST_MODE was tree shape or
+        # regularization, and every trainer reads those. `bootstrap_type` is
+        # the first key our own trainers disagree about, and the multiclass
+        # and sparse trainers refuse it by name rather than dropping it.
+        #
+        # The teeth are kept: a missing arm still fails unless
+        # MOJOTREES_CATBOOST_MODE_SCENARIO_SUPPORT gives a reason, and a
+        # scenario the table says should run but that is absent from the
+        # engine list fails too. What is no longer asserted is that the two
+        # arms cover the same scenarios, because they now do not.
+        mode_reason = scenarios.MOJOTREES_CATBOOST_MODE_SCENARIO_SUPPORT[name]
+        mode_listed = "mojotrees_catboost_mode" in spec["engines"]
         check(
-            "mojotrees_catboost_mode" in spec["engines"],
-            f"{name} runs the CatBoost arm with no mojotrees CatBoost-mode "
-            "arm beside it, so 'us in CatBoost mode' has no row",
+            mode_listed == (mode_reason is None),
+            f"{name}: MOJOTREES_CATBOOST_MODE_SCENARIO_SUPPORT says "
+            f"{'runs' if mode_reason is None else 'skipped'} and the "
+            f"scenario's engine list says "
+            f"{'runs' if mode_listed else 'skipped'}",
         )
+        if not mode_listed:
+            check(
+                bool(mode_reason),
+                f"{name} runs the CatBoost arm with no mojotrees "
+                "CatBoost-mode arm beside it and gives no reason, so 'us in "
+                "CatBoost mode' has no row and nothing says why",
+            )
+            continue
         extra = {"num_class": 3} if spec["task"] == "multiclass" else None
         cb = scenarios.catboost_params(spec, 4, dict(extra or {}))
         mb = scenarios.mojotrees_params(spec, "cpu", extra)
