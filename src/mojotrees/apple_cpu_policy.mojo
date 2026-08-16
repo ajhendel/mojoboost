@@ -1171,7 +1171,11 @@ struct ResolvedCpuPolicy(Copyable, Movable):
         )
 
     def feature_group_for(
-        self, n_bins: Int, n_active: Int, row_blocks: Int = 1
+        self,
+        n_bins: Int,
+        n_active: Int,
+        row_blocks: Int = 1,
+        const_h: Bool = False,
     ) raises -> Int:
         """`plan_feature_group` against the resolved knobs.
 
@@ -1182,7 +1186,7 @@ struct ResolvedCpuPolicy(Copyable, Movable):
         """
         if not self.resolved:
             return plan_feature_group(
-                CpuProfile.detect(), n_bins, n_active, row_blocks
+                CpuProfile.detect(), n_bins, n_active, row_blocks, const_h
             )
         return _plan_group(
             self.profile.l1d_bytes,
@@ -1191,6 +1195,7 @@ struct ResolvedCpuPolicy(Copyable, Movable):
             n_bins,
             n_active,
             row_blocks,
+            const_h,
         )
 
     def describe(self) -> String:
@@ -1223,17 +1228,72 @@ struct ResolvedCpuPolicy(Copyable, Movable):
         )
 
 
+def private_cell_bytes(const_h: Bool) -> Int:
+    """Bytes one cell of the **private accumulation** histogram occupies.
+
+    Not `HISTOGRAM_BYTES_PER_CELL`, and the distinction is the whole point of
+    this function existing. That constant is 24 and describes the *output*
+    `Histogram`: Float64 gradient, Float64 hessian, and a separate Int count
+    plane. The cell the accumulation kernels actually read and write is the
+    private one in `histogram._accumulate_blocked_at` and
+    `_accumulate_subset_row_major_blocked`, and it is `stride` floats:
+    `ROW_BLOCK_CELL_FLOATS_CONST_H` (two, LightGBM's exact `hist_t`) under a
+    constant hessian, `ROW_BLOCK_CELL_FLOATS` (three) otherwise.
+
+    Under a constant hessian -- squared error, and every other objective
+    `histogram.objective_has_constant_hessian` admits -- that is **16 bytes
+    and not 24**, so a cache clamp sized with the output cell believes the
+    working set is half again as large as it is.
+
+    Kept separate from `ROW_BLOCK_PLANES`, which stays at 3 unconditionally
+    and deliberately: that one sizes the *allocation*, so that the block
+    count cannot depend on `const_h` and a summation order cannot move when
+    the specialization is switched off. This one sizes only how much of that
+    allocation is addressed, which is a schedule and moves nothing.
+    """
+    var floats = (
+        ROW_BLOCK_CELL_FLOATS_CONST_H if const_h else ROW_BLOCK_CELL_FLOATS
+    )
+    return floats * ROW_BLOCK_PLANE_BYTES
+
+
 def feature_slice_bytes(n_bins: Int) -> Int:
     """Bytes one feature's histogram slice occupies across the three
     arrays."""
     return n_bins * HISTOGRAM_BYTES_PER_CELL
 
 
-def _cache_group(l1d_bytes: Int, n_bins: Int) -> Int:
+def feature_slice_bytes_at(n_bins: Int, cell_bytes: Int) -> Int:
+    """One feature's slice at an explicit cell size, which is what the cache
+    clamp needs. `feature_slice_bytes` is this at the output cell, kept
+    because the reporting and the tests that predate the distinction ask for
+    exactly that number."""
+    return n_bins * cell_bytes
+
+
+def _cache_group(l1d_bytes: Int, n_bins: Int, cell_bytes: Int) -> Int:
     """The cache clamp over raw integers, so the resolved snapshot and the
     live path cannot drift. `cache_feature_group` is the profile-shaped
-    spelling of it."""
-    var slice_bytes = feature_slice_bytes(n_bins)
+    spelling of it.
+
+    `cell_bytes` is `private_cell_bytes(const_h)`, not
+    `HISTOGRAM_BYTES_PER_CELL`. It was the latter, hard-coded through
+    `feature_slice_bytes`, and that was a defect rather than a conservative
+    choice: at 255 bins on the 64 KiB assumed L1 the budget is 32,768 bytes,
+    and 32,768 / (255 * 24) is 5 which floors to rung **4**, where
+    32,768 / (255 * 16) is 8 which floors to rung **8**. So every constant
+    hessian fit -- which is every squared-error fit, the default objective --
+    ran an interleave one rung narrower than its own working set allows, and
+    the width is the divisor on the number of times the accumulate re-walks
+    the node's row-id list and its gathered derivatives. One rung narrower is
+    twice the re-walks.
+
+    This does not touch `ASSUMED_L1D_BYTES`, which is a separate question and
+    is a deliberate portable floor; the module docstring's argument for
+    leaving it alone stands and is untouched by this. The clamp was wrong
+    about the cell, not about the cache.
+    """
+    var slice_bytes = feature_slice_bytes_at(n_bins, cell_bytes)
     if slice_bytes <= 0:
         return 1
     var budget = l1d_bytes // L1_GROUP_DIVISOR
@@ -1272,6 +1332,7 @@ def _plan_group(
     n_bins: Int,
     n_active: Int,
     row_blocks: Int = 1,
+    const_h: Bool = False,
 ) raises -> Int:
     """The one copy of the width rule, with every input already read.
 
@@ -1281,11 +1342,26 @@ def _plan_group(
     the live path would refuse, or refused one the live path would answer,
     would put the accumulation kernel and the plan that sized its buffers at
     different widths, and the two are not separately checked anywhere.
+
+    `const_h` reaches only the cache clamp, through `private_cell_bytes`; see
+    `_cache_group` for what it corrects. It defaults to `False`, the
+    three-plane cell, so that every caller which has no objective to hand --
+    the reporting helpers, and the tests that predate the distinction -- gets
+    the answer it always got. **The default is not the production path.**
+    `_derive_plan` passes the fit's real value, which is what the accumulate
+    kernels then run at, and `tests/test_cpu_feature_group.mojo` asserts both
+    arms by literal rung. A default that every call site took would be the
+    same defect this fix is closing, wearing a different hat.
+
+    It is bit-neutral for the reason every other input here is: the width
+    changes how many features share one walk of the rows, never the order in
+    which any one feature's bins are summed. It is also machine-independent
+    and worker-independent, since `const_h` is a property of the objective.
     """
     if requested > 0:
         return requested
     var group = DEFAULT_FEATURE_GROUP
-    var by_cache = _cache_group(l1d_bytes, n_bins)
+    var by_cache = _cache_group(l1d_bytes, n_bins, private_cell_bytes(const_h))
     if by_cache < group:
         group = by_cache
     var by_schedule = _schedule_group(cores, n_active, row_blocks)
@@ -1297,7 +1373,9 @@ def _plan_group(
     return group if group >= 1 else 1
 
 
-def cache_feature_group(profile: CpuProfile, n_bins: Int) -> Int:
+def cache_feature_group(
+    profile: CpuProfile, n_bins: Int, const_h: Bool = False
+) -> Int:
     """The widest rung whose group of histogram slices fits the L1 budget.
 
     Interleaving is only useful while every slice in the group stays in L1:
@@ -1306,14 +1384,22 @@ def cache_feature_group(profile: CpuProfile, n_bins: Int) -> Int:
     row index stream, the gradient pairs, and the N binned columns the loop
     walks, all of which stream through the same cache.
 
-    At the default shape this is the arithmetic that decides everything:
-    `feature_slice_bytes(255)` is 6120, the budget is `65536 / 2 = 32768`,
-    32768 / 6120 = 5 slices fit, and `feature_group_floor(5)` is 4. Every one
-    of those numbers is an assumption or a floor, none is measured, and
-    `ASSUMED_L1D_BYTES` in particular is a portable floor rather than this
-    machine's cache; the module docstring says why it stays that way.
+    At the default shape this is the arithmetic that decides everything, and
+    it now has two answers because the cell has two sizes:
+
+    - three-plane cell, `const_h` false: slice is `255 * 24 = 6120`, budget is
+      `65536 / 2 = 32768`, `32768 / 6120 = 5` slices fit, and
+      `feature_group_floor(5)` is **4**.
+    - two-plane cell, `const_h` true: slice is `255 * 16 = 4080`,
+      `32768 / 4080 = 8`, and the rung is **8**.
+
+    The second is what a squared-error fit actually runs and it was getting
+    the first. Every one of those numbers is still an assumption or a floor,
+    none is measured, and `ASSUMED_L1D_BYTES` in particular is still a
+    portable floor rather than this machine's cache; the module docstring
+    says why it stays that way and this change does not disturb it.
     """
-    return _cache_group(profile.l1d_bytes, n_bins)
+    return _cache_group(profile.l1d_bytes, n_bins, private_cell_bytes(const_h))
 
 
 def dispatch_rounds(n_tasks: Int, cores: Int) -> Int:
@@ -1393,7 +1479,11 @@ def schedule_feature_group(
 
 
 def plan_feature_group(
-    profile: CpuProfile, n_bins: Int, n_active: Int, row_blocks: Int = 1
+    profile: CpuProfile,
+    n_bins: Int,
+    n_active: Int,
+    row_blocks: Int = 1,
+    const_h: Bool = False,
 ) raises -> Int:
     """How many features one accumulation inner loop interleaves.
 
@@ -1429,6 +1519,7 @@ def plan_feature_group(
         n_bins,
         n_active,
         row_blocks,
+        const_h,
     )
 
 
@@ -1573,6 +1664,7 @@ def derive_accumulation_plan(
     n_bins: Int,
     n_rows_touched: Int,
     rows_are_indirect: Bool,
+    const_h: Bool = False,
 ) raises -> AccumulationPlan:
     """Plan one histogram build.
 
@@ -1602,6 +1694,7 @@ def derive_accumulation_plan(
         n_bins,
         n_rows_touched,
         rows_are_indirect,
+        const_h,
     )
 
 
@@ -1612,6 +1705,7 @@ def derive_accumulation_plan_with(
     n_bins: Int,
     n_rows_touched: Int,
     rows_are_indirect: Bool,
+    const_h: Bool = False,
 ) raises -> AccumulationPlan:
     """`derive_accumulation_plan` against an already-resolved policy.
 
@@ -1631,6 +1725,7 @@ def derive_accumulation_plan_with(
             n_bins,
             n_rows_touched,
             rows_are_indirect,
+            const_h,
         )
     return _derive_plan(
         policy.profile.l1d_bytes,
@@ -1644,6 +1739,7 @@ def derive_accumulation_plan_with(
         n_bins,
         n_rows_touched,
         rows_are_indirect,
+        const_h,
     )
 
 
@@ -1659,6 +1755,7 @@ def _derive_plan(
     n_bins: Int,
     n_rows_touched: Int,
     rows_are_indirect: Bool,
+    const_h: Bool = False,
 ) raises -> AccumulationPlan:
     """The one copy of the plan arithmetic, with every variable already
     read. `dispatch_cores` is here because the width now depends on how many
@@ -1712,7 +1809,8 @@ def _derive_plan(
         cells = 0
 
     var group = _plan_group(
-        l1d_bytes, dispatch_cores, feature_group, bins, active, blocks
+        l1d_bytes, dispatch_cores, feature_group, bins, active, blocks,
+        const_h,
     )
 
     return AccumulationPlan(

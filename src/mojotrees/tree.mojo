@@ -65,11 +65,14 @@ from a grown tree, because an internal node keeps the value it had when it was
 created.
 """
 
+from std.os import getenv
+
 from .apple_cpu_policy import (
     BIN_LAYOUT_AUTO,
     BIN_LAYOUT_FEATURE_MAJOR,
     BIN_LAYOUT_ROW_MAJOR,
     env_bin_layout,
+    plan_row_block_count,
 )
 from .binning import BinnedMatrix
 from .cegb import (
@@ -96,6 +99,7 @@ from .histogram import (
     Histogram,
     build_histogram_into_scratch,
     build_histogram_subset_by_layout_into_scratch,
+    choose_bin_layout_timed,
     subtract_histogram_into,
 )
 from .parallel import (
@@ -1390,6 +1394,34 @@ struct _HistPool(Movable):
             self.free.append(hist^)
 
 
+def _env_layout_probe() -> Bool:
+    """`MOJOTREES_CPU_BIN_LAYOUT_PROBE=1`: run the timed layout probe.
+
+    Off by default, and it is a separate variable from
+    `MOJOTREES_CPU_BIN_LAYOUT` rather than a fourth word on it, because the
+    two answer different questions. That variable names a layout and its
+    `auto` means "I have not named one"; this one asks for a *measurement* to
+    be taken, which is a thing a fit does rather than a value it holds. It
+    also keeps the layout vocabulary in `apple_cpu_policy` where the rest of
+    the layout policy lives, and this switch in the grower that runs it.
+
+    **Why it exists at all, given the probe currently loses.** Row-major
+    measured 1.15x slower than feature-major at 799,110 x 100 in this lane's
+    window and 1.35x slower in another lane's, so the rule this probe
+    implements is not one anybody should be running by default today. What it
+    fixes is that `histogram.choose_bin_layout_timed` had **no caller** -- it
+    was written, tested, documented as LightGBM's auto rule, and unreachable,
+    which is this repository's most repeated defect and is worth closing on
+    its own terms. Behind a named switch it is reachable, it is measurable by
+    anyone who wants to re-ask the question on a different machine or a
+    different shape, and it cannot change what a fit does unless asked.
+    """
+    var s = getenv("MOJOTREES_CPU_BIN_LAYOUT_PROBE")
+    if s.byte_length() == 0:
+        return False
+    return s != "0"
+
+
 struct GrowScratch(Movable):
     """The working memory one grower call reuses across every node, and one
     booster reuses across every tree.
@@ -1440,6 +1472,21 @@ struct GrowScratch(Movable):
     var pairs: List[Float64]
     var settings: DispatchSettings
     var bin_layout: Int
+    var layout_pending: Bool
+    """Whether `bin_layout` is still the placeholder rather than an answer.
+
+    True exactly when the fit asked for `auto` and the timed probe has not
+    run yet. It is the difference between "feature-major, because that is
+    what was asked for" and "feature-major, because nobody has asked the
+    question yet", and conflating the two is what left AUTO meaning
+    feature-major for a whole round: `bin_layout` alone cannot tell them
+    apart, so a probe keyed off it would either never fire or fire on an
+    explicit `MOJOTREES_CPU_BIN_LAYOUT=feature`, which is an instruction and
+    not a hint.
+
+    It clears on the first node that is offered the probe, taken or declined,
+    so a fit asks once and then never again.
+    """
 
     def __init__(out self, n_features: Int, n_bins: Int) raises:
         self.pool = _HistPool(n_features, n_bins)
@@ -1475,13 +1522,33 @@ struct GrowScratch(Movable):
         #
         # **AUTO is not a layout. It means nobody has chosen yet**, and until
         # the timed probe runs the layout that shipped is the one that runs.
-        # `scratch.resolve_layout_timed` is the missing half; it lands with
-        # `lane/interleave-finish`, which owns the histogram file the probe
-        # lives in. Until then this is deliberately conservative.
+        # `resolve_layout_timed` below is that probe: it is the missing half
+        # this comment described, and it now exists. What survives from the
+        # paragraph above is the placeholder -- a scratch whose probe has not
+        # run, or which is never offered one, still runs the layout that
+        # shipped, so nothing changes for the growers that do not call it.
         self.bin_layout = (
             BIN_LAYOUT_FEATURE_MAJOR
             if requested == BIN_LAYOUT_AUTO
             else requested
+        )
+        # **AUTO still resolves to feature-major, and the probe is opt-in.**
+        # The probe exists because `choose_bin_layout_timed` had no caller at
+        # all, which was a real reachability defect and is what this closes.
+        # It does NOT exist because row-major should be the default: measured
+        # 2026-08-16 at 799,110 x 100, forced row-major is **1.15x slower**
+        # than forced feature-major (medians 16.081 s against 13.990 s, delta
+        # 2.091 s against a widest plateau spread of 1.346 s, resolved), and
+        # a second lane measured the same direction at 1.35x on the same
+        # shape. A probe wired to AUTO would have made that the default for
+        # every fit with a row-major view.
+        #
+        # So the gate is `MOJOTREES_CPU_BIN_LAYOUT_PROBE=1` and nothing else
+        # turns it on. Unset -- which is every fit that does not ask -- and
+        # this is `False`, `bin_layout` stays feature-major, and the grower
+        # runs exactly the accumulation that shipped.
+        self.layout_pending = (
+            requested == BIN_LAYOUT_AUTO and _env_layout_probe()
         )
         # The scheduling environment, read once here and then never again for
         # the life of this scratch. Every dispatch the grower makes -- the
@@ -1505,6 +1572,92 @@ struct GrowScratch(Movable):
         of any other shape."""
         if self.pool.n_features != n_features or self.pool.n_bins != n_bins:
             self.pool = _HistPool(n_features, n_bins)
+
+    def resolve_layout_timed(
+        mut self,
+        data: BinnedMatrix,
+        grad: List[Float64],
+        hess: List[Float64],
+        rows: List[Int],
+        start: Int,
+        count: Int,
+        features: List[Int],
+        const_hessian: Bool,
+        const_hessian_env: ConstHessianSettings,
+    ) raises:
+        """Settle `bin_layout` once per fit, by building this node both ways
+        and keeping the faster. LightGBM's `force_row_wise` / `force_col_wise`
+        auto rule, on this machine, on this dataset.
+
+        **Once per fit, not once per tree.** A `GrowScratch` is constructed
+        by the booster and lives across every tree, so this runs on one node
+        of the first tree and the answer is then read from a field 6,100
+        times a tree after that. `grow_tree` builds its own scratch and
+        therefore probes on its own single tree, which is the correct answer
+        for a caller who asked for exactly one tree.
+
+        **It declines rather than guessing**, on any of three grounds, and
+        clears `layout_pending` on every one of them so the question is asked
+        once:
+
+        - the matrix has no row-major view, so there is nothing to compare;
+        - the node does not block, in which case both arms run their
+          unblocked variants over a node small enough that the two timings
+          are dispatch noise, and a wrong answer would then be pinned for the
+          whole fit;
+        - `MOJOTREES_CPU_BIN_LAYOUT` named a layout, which is an instruction
+          and not a hint. That case never reaches here, because
+          `layout_pending` is false unless the request was `auto`, and it is
+          restated in `choose_bin_layout_timed` as well.
+
+        **Cost, stated because it is not zero.** The probed node is built
+        three times rather than once -- twice by the probe and once for
+        real -- and that happens on one node of one tree of the fit. It is
+        deliberately not the root: the root has the identity row list, where
+        both layouts read sequentially and the question hardly arises, while
+        the thousands of child builds that dominate a fit read scattered
+        rows, which is where the layouts actually differ. Probing the root
+        would time the one node least like the population it is deciding for.
+
+        **It cannot move a cell.** Both builders take the same plan, visit
+        the same rows in the same order and add the same Float64 into the
+        same cell; only the address the bin id is loaded from differs. The
+        probe's own output goes into a pooled buffer that is handed straight
+        back, so no node's histogram comes from it.
+        """
+        if not self.layout_pending:
+            return
+        # Cleared on every path out, including the declines. A flag that
+        # survived a decline would re-probe at every node of the fit.
+        self.layout_pending = False
+        if not data.has_row_major():
+            return
+        var n_active = len(features) if len(features) > 0 else data.n_features
+        if n_active <= 0 or count <= 0:
+            return
+        if plan_row_block_count(0, count, data.n_bins, n_active, True) < 2:
+            return
+        # Three statements and not one, so that no two fields of `self` are
+        # borrowed across the same expression: `pool` is borrowed, released,
+        # `pairs` is borrowed, released, and only then is `bin_layout`
+        # written.
+        var probe = self.pool.take()
+        var chosen = choose_bin_layout_timed(
+            probe,
+            self.pairs,
+            data,
+            grad,
+            hess,
+            rows,
+            start,
+            count,
+            features,
+            const_hessian,
+            self.settings,
+            const_hessian_env,
+        )
+        self.pool.give(probe^)
+        self.bin_layout = chosen
 
 
 def _leaf_value(
@@ -3256,6 +3409,38 @@ def grow_tree_leaves_profiled(
         var builds_left = len(left_rows) <= len(right_rows)
         var built_rows = len(left_rows) if builds_left else len(right_rows)
         var derived_rows = len(right_rows) if builds_left else len(left_rows)
+        # The layout probe, offered once per fit on the first child this
+        # grower builds directly. `scratch.resolve_layout_timed` declines and
+        # clears itself when the fit named a layout, when there is no
+        # row-major view, or when the node does not block, so on today's
+        # defaults with no view built this is one Bool test per split.
+        #
+        # Deliberately outside every `profile.clock()` window below: the
+        # probe is not this node's histogram and charging it to PROF_HISTOGRAM
+        # would put a once-per-fit cost inside a per-node rate. It lands in
+        # the profile's unattributed remainder, where it is visible as itself.
+        #
+        # The bundled arm is not offered it. `efb` assembles `bundling.data`
+        # and never builds a row-major view on it, so the probe would time
+        # two arms that are the same arm, and `_hist_subset` sends the
+        # bundled build to `bundling.data` regardless of what was pinned.
+        #
+        # Two statements rather than one conditional expression on the row
+        # list: `left_rows if builds_left else right_rows` in an argument
+        # position materializes a `List[Int]` of the child's rows, which at a
+        # large node is hundreds of thousands of elements copied to choose
+        # between two names.
+        if not bundling.active:
+            if builds_left:
+                scratch.resolve_layout_timed(
+                    data, grad, hess, left_rows, 0, built_rows,
+                    tree_features, const_hessian, const_h_env,
+                )
+            else:
+                scratch.resolve_layout_timed(
+                    data, grad, hess, right_rows, 0, built_rows,
+                    tree_features, const_hessian, const_h_env,
+                )
         var alloc_started = profile.clock()
         var left_hist = scratch.pool.take()
         var right_hist = scratch.pool.take()

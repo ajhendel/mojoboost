@@ -1432,6 +1432,7 @@ def _plan_accumulation(
     n_bins: Int,
     n_rows_touched: Int,
     rows_are_indirect: Bool,
+    const_h: Bool = False,
 ) raises -> AccumulationPlan:
     """The one place a histogram build decides its shape.
 
@@ -1440,6 +1441,19 @@ def _plan_accumulation(
     `CpuProfile.detect()` that used to sit inside the argument list of every
     `derive_accumulation_plan` call is gone with it; with the sentinel it did,
     once, exactly as before.
+
+    `const_h` reaches the width clamp and nothing else. **All three callers
+    pass their real value**, which is the point: the parameter defaults to
+    `False` for the reporting helpers and the tests that have no objective to
+    hand, and a default that every call site took would leave the clamp
+    exactly as wrong as it was. See `apple_cpu_policy._cache_group`.
+
+    It cannot desynchronize the two builders. The width is a schedule; what
+    the two layouts must agree on is the *block count*, and that is derived
+    by `plan_row_block_count_at` from the row count, the bin count, the
+    active feature count and the amortization ratio -- `const_h` reaches none
+    of them, and `ROW_BLOCK_PLANES` stays at 3 unconditionally so the
+    allocation the count is bounded by does not move either.
     """
     return derive_accumulation_plan_with(
         settings.policy,
@@ -1448,6 +1462,7 @@ def _plan_accumulation(
         n_bins,
         n_rows_touched,
         rows_are_indirect,
+        const_h,
     )
 
 
@@ -1470,7 +1485,7 @@ def _accumulate_full[
     var use_all = len(features) == 0
     var n_active = n_features if use_all else len(features)
     var plan = _plan_accumulation(
-        settings, n_features, n_active, n_bins, n_rows, False
+        settings, n_features, n_active, n_bins, n_rows, False, const_h
     )
 
     _zero_excluded(
@@ -2068,7 +2083,7 @@ def _accumulate_subset[
     var use_all = len(features) == 0
     var n_active = n_features if use_all else len(features)
     var plan = _plan_accumulation(
-        settings, n_features, n_active, n_bins, n_sub, True
+        settings, n_features, n_active, n_bins, n_sub, True, const_h
     )
 
     _zero_excluded(
@@ -3586,7 +3601,7 @@ def _accumulate_subset_row_major[
     var use_all = len(features) == 0
     var n_active = n_features if use_all else len(features)
     var plan = _plan_accumulation(
-        settings, n_features, n_active, n_bins, n_sub, True
+        settings, n_features, n_active, n_bins, n_sub, True, const_h
     )
 
     _zero_excluded(
@@ -4334,6 +4349,7 @@ def choose_bin_layout_timed(
     features: List[Int] = [],
     const_hessian: Bool = False,
     settings: DispatchSettings = DispatchSettings.unresolved(),
+    const_hessian_env: ConstHessianSettings = ConstHessianSettings.unresolved(),
 ) raises -> Int:
     """LightGBM's auto rule: build the node once each way, keep the faster.
 
@@ -4359,6 +4375,24 @@ def choose_bin_layout_timed(
     bias. It is still strictly better information than a cost model nobody
     measured, and the arms are exchangeable enough that the bias costs a wrong
     answer only where the two are close, which is where it does not matter.
+
+    `const_hessian_env` is threaded through for the reason `settings` is, and
+    it is not cosmetic: the two constant-hessian variables decide the private
+    cell's stride (two floats or three) and therefore how much traffic each
+    arm streams. A probe that read them live while the fit ran on a snapshot
+    would be timing a configuration the fit is not in, which is the shape of
+    defect this campaign has already shipped four times under the name
+    "accepted and then quietly ignored".
+
+    **The order the two arms run in is a bias, stated rather than corrected.**
+    Feature-major runs first and row-major second, so row-major inherits the
+    caches feature-major warmed -- including the gather buffer, which both
+    arms read and only the first arm pays to fill. LightGBM's own probe
+    carries the same bias in the same direction. What it means for a reader:
+    a row-major win by a small margin is worth less than a feature-major win
+    by the same margin, and this function is a tie-break rather than a
+    measurement. The A/B that decides whether the rule is right at all is
+    `bench/bench_cpu_bin_layout.mojo`, which interleaves whole fits.
     """
     if not data.has_row_major():
         return BIN_LAYOUT_FEATURE_MAJOR
@@ -4369,12 +4403,12 @@ def choose_bin_layout_timed(
     var t0 = perf_counter_ns()
     build_histogram_subset_into_scratch(
         out, pairs, data, grad, hess, rows, row_start, row_count, features,
-        const_hessian, settings,
+        const_hessian, settings, const_hessian_env,
     )
     var t1 = perf_counter_ns()
     build_histogram_subset_row_major_into_scratch(
         out, pairs, data, grad, hess, rows, row_start, row_count, features,
-        const_hessian, settings,
+        const_hessian, settings, const_hessian_env,
     )
     var t2 = perf_counter_ns()
     if (t2 - t1) < (t1 - t0):

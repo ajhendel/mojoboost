@@ -102,6 +102,11 @@ bench-train-gpu = "mojo run -I src bench/bench_train_gpu.mojo"
 bench-train-gpu-sparse = "mojo run -I src bench/bench_train_gpu_sparse.mojo"
 gpu-validate = "mojo run -I src bench/bench_gpu_validation.mojo"
 bench-threshold = "mojo run -I src bench/bench_threshold.mojo"
+# The CPU bin-layout A/B: feature-major against row-major against the timed
+# `auto` rule, with LightGBM as the in-process anchor, arms interleaved.
+# Needs the bench environment for the LightGBM arm; run it as
+# `pixi run -e bench bench-cpu-bin-layout 799110 100 12`.
+bench-cpu-bin-layout = "mojo run -I src bench/bench_cpu_bin_layout.mojo"
 bench-sparse = "mojo run -I src bench/bench_sparse.mojo"
 bench-profile = "mojo run -I src bench/bench_profile.mojo"
 bench-custom = "mojo run -I src bench/bench_custom_objective.mojo"
