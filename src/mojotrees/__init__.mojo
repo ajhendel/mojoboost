@@ -1,5 +1,24 @@
 """mojotrees: gradient boosted decision trees in Mojo."""
 
+# CatBoost's data-dependent `learning_rate`, off by default
+# (auto_learning_rate.mojo, docs/design/CATBOOST_CATALOG.md A9). Exported so
+# a caller can derive the same rate CatBoost would and compare defaults with
+# defaults; importing it changes nothing on its own.
+from .auto_learning_rate import (
+    AUTO_LR_TARGET_LOGLOSS,
+    AUTO_LR_TARGET_MULTICLASS,
+    AUTO_LR_TARGET_RMSE,
+    AUTO_LR_TARGET_UNKNOWN,
+    AUTO_LR_TASK_CPU,
+    AUTO_LR_TASK_GPU,
+    AutoLearningRateCoefficients,
+    AutoLearningRateParams,
+    auto_lr_coefficients,
+    auto_lr_target_type,
+    catboost_auto_learning_rate,
+    catboost_boost_from_average_default,
+    resolve_learning_rate,
+)
 from .bagging import (
     DEFAULT_BAGGING_SEED,
     BaggingParams,

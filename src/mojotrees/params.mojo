@@ -47,7 +47,13 @@ from .boosting import (
     SQUARED_ERROR,
     TWEEDIE,
 )
-from .device import CPU_DEVICE, parse_device
+from .auto_learning_rate import (
+    AUTO_LR_TASK_CPU,
+    AUTO_LR_TASK_GPU,
+    AutoLearningRateParams,
+    resolve_learning_rate,
+)
+from .device import CPU_DEVICE, GPU_DEVICE, parse_device
 from .objective_registry import MULTICLASS as _MULTICLASS
 from .efb import check_bundling_supported
 from .sampling import canonical_data_sample_strategy
@@ -81,7 +87,7 @@ comptime SUPPORTED_KEYS = String(
     " tweedie_variance_power, device, use_missing,"
     " use_quantized_grad, num_grad_quant_bins, quant_train_renew_leaf,"
     " stochastic_rounding, leaf_estimation_iterations,"
-    " derivative_precision"
+    " derivative_precision, auto_learning_rate"
 )
 
 # Parameters that name a real feature this parser does not cover, reported as
@@ -118,6 +124,12 @@ struct TrainConfig(Copyable, Movable):
     `objective` is a boosting.mojo objective code, or `MULTICLASS`, in which
     case `n_classes` is the class count and the caller trains with
     `fit_multiclass`. `n_classes` is 1 for every single-output objective.
+
+    `auto_learning_rate` is CatBoost's data-dependent learning rate
+    (auto_learning_rate.mojo, catalog A9) and is **disabled** unless the
+    parameter string says `auto_learning_rate=true`. When it is disabled,
+    which is the default, `booster.learning_rate` is the whole story and
+    `resolved_learning_rate` returns it unchanged.
     """
 
     var objective: Int
@@ -127,6 +139,7 @@ struct TrainConfig(Copyable, Movable):
     var alpha: Float64
     var device: Int
     var use_missing: Bool
+    var auto_learning_rate: AutoLearningRateParams
 
     def __init__(out self):
         """LightGBM's defaults as mojotrees sets them: squared error on the
@@ -138,9 +151,29 @@ struct TrainConfig(Copyable, Movable):
         self.alpha = 0.9
         self.device = CPU_DEVICE
         self.use_missing = True
+        self.auto_learning_rate = AutoLearningRateParams.disabled()
 
     def is_multiclass(self) -> Bool:
         return self.objective == MULTICLASS
+
+    def resolved_learning_rate(self, n_rows: Int) raises -> Float64:
+        """`booster.learning_rate`, or CatBoost's derived rate in its place.
+
+        Returns `booster.learning_rate` untouched unless the parameter string
+        asked for `auto_learning_rate=true`, so a caller can route every
+        training entry point through this without changing any behavior it
+        already has. `n_rows` is the **train** row count, which is what
+        CatBoost reads (`options_helper.cpp:411`); it is not known at parse
+        time, which is why this is a method rather than something
+        `parse_params` folds into `booster.learning_rate`.
+        """
+        return resolve_learning_rate(
+            self.auto_learning_rate,
+            self.objective,
+            self.booster.n_estimators,
+            n_rows,
+            self.booster.learning_rate,
+        )
 
 
 def objective_from_name(name: String) raises -> Int:
@@ -459,6 +492,17 @@ def parse_params(spec: String) raises -> TrainConfig:
     var config = TrainConfig()
     var saw_num_class = False
     var alpha_key = String("")
+    # CatBoost's auto learning rate fires only if the user set none of
+    # `learning_rate`, `leaf_estimation_method`, `leaf_estimation_iterations`
+    # and `l2_leaf_reg` (`options_helper.cpp:276-281`). A parameter string is
+    # the one surface that can tell "set" from "left at the default", so the
+    # gate is tracked here and handed to `AutoLearningRateParams` at the end.
+    # mojotrees has no `leaf_estimation_method` key at all (Newton only), so
+    # that third gate is permanently open for us.
+    var saw_learning_rate = False
+    var saw_lambda_l2 = False
+    var saw_leaf_estimation_iterations = False
+    var saw_auto_learning_rate = False
 
     for token_slice in spec.split():
         var token = String(token_slice)
@@ -494,6 +538,7 @@ def parse_params(spec: String) raises -> TrainConfig:
             or key == "eta"
         ):
             config.booster.learning_rate = _parse_f64(key, value)
+            saw_learning_rate = True
         elif key == "num_leaves" or key == "num_leaf":
             config.booster.tree.num_leaves = _parse_int(key, value)
         elif (
@@ -512,6 +557,7 @@ def parse_params(spec: String) raises -> TrainConfig:
             config.booster.tree.lambda_l1 = _parse_f64(key, value)
         elif key == "lambda_l2" or key == "reg_lambda" or key == "lambda":
             config.booster.tree.lambda_reg = _parse_f64(key, value)
+            saw_lambda_l2 = True
         elif key == "max_depth":
             config.booster.tree.max_depth = _parse_int(key, value)
         elif key == "grow_policy":
@@ -583,6 +629,7 @@ def parse_params(spec: String) raises -> TrainConfig:
         # than either. The Mojo API route named in the message is exact and is
         # not refused.
         elif key == "leaf_estimation_iterations":
+            saw_leaf_estimation_iterations = True
             var iters = _parse_int(key, value)
             if iters > 1:
                 raise Error(
@@ -726,6 +773,16 @@ def parse_params(spec: String) raises -> TrainConfig:
             config.device = parse_device(value)
         elif key == "use_missing":
             config.use_missing = _parse_bool(key, value)
+        # CatBoost's data-dependent learning rate (auto_learning_rate.mojo,
+        # catalog A9). CatBoost has no such key -- there the derivation is
+        # implied by leaving `learning_rate` unset -- so this is an explicit
+        # opt-in rather than a parity name, because mojotrees' own default of
+        # 0.1 is a real default that a silent override would erase. Off
+        # unless the string says so, and it changes nothing at parse time:
+        # the rate needs the train row count, so `resolved_learning_rate`
+        # applies it.
+        elif key == "auto_learning_rate":
+            saw_auto_learning_rate = _parse_bool(key, value)
         elif _is_mojo_api_only(key):
             raise Error(
                 "parameter '",
@@ -750,4 +807,62 @@ def parse_params(spec: String) raises -> TrainConfig:
     else:
         _check_alpha_key(config, alpha_key)
     _validate(config, saw_num_class)
+    if saw_auto_learning_rate:
+        _enable_auto_learning_rate(
+            config,
+            saw_learning_rate,
+            saw_lambda_l2,
+            saw_leaf_estimation_iterations,
+        )
     return config^
+
+
+def _enable_auto_learning_rate(
+    mut config: TrainConfig,
+    saw_learning_rate: Bool,
+    saw_lambda_l2: Bool,
+    saw_leaf_estimation_iterations: Bool,
+) raises:
+    """Fill in `config.auto_learning_rate` for `auto_learning_rate=true`.
+
+    Two of CatBoost's four gates are reproduced as a refusal rather than as
+    silence. CatBoost, handed `learning_rate=0.05 l2_leaf_reg=5`, quietly
+    drops back to the constant 0.03 and prints nothing; a user reading their
+    own config has no way to see that the rate they thought was derived is
+    not. Since asking for `auto_learning_rate=true` here is an explicit act,
+    contradicting it is an error:
+
+    - with `learning_rate=` it would be honoring neither one;
+    - with `lambda_l2=` or `leaf_estimation_iterations=` it would be a no-op,
+      which is the surprising coupling the catalog entry singles out.
+
+    The remaining CatBoost flags come out as they would for a plain fit with
+    no eval set: `use_best_model` false (`UpdateUseBestModel` forces it false
+    without one, `options_helper.cpp:109-112`) and `boost_from_average`
+    derived from the objective. A parameter string carries no eval set and no
+    baseline, so neither can be anything else here.
+    """
+    if saw_learning_rate:
+        raise Error(
+            "'auto_learning_rate=true' and 'learning_rate=' contradict each"
+            " other: the automatic rate exists to replace an unset one."
+            " CatBoost resolves this by silently keeping the explicit rate;"
+            " give only one"
+        )
+    if saw_lambda_l2:
+        raise Error(
+            "'auto_learning_rate=true' with 'lambda_l2=' would do nothing:"
+            " CatBoost's derivation is gated on l2_leaf_reg being unset"
+            " (options_helper.cpp:280), so setting it pins the rate back to"
+            " the constant. Drop one of the two"
+        )
+    if saw_leaf_estimation_iterations:
+        raise Error(
+            "'auto_learning_rate=true' with 'leaf_estimation_iterations='"
+            " would do nothing: CatBoost's derivation is gated on it being"
+            " unset (options_helper.cpp:279). Drop one of the two"
+        )
+
+    config.auto_learning_rate = AutoLearningRateParams.catboost_defaults(
+        AUTO_LR_TASK_GPU if config.device == GPU_DEVICE else AUTO_LR_TASK_CPU
+    )

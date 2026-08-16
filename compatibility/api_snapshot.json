@@ -272,7 +272,10 @@
     ]
   },
   "meta": {
-    "carried": [],
+    "carried": [
+      "numerical_contracts",
+      "platforms.tiers"
+    ],
     "generated_by": "tools/api_snapshot.py",
     "library_version": "0.1.0",
     "schema_version": 2,
@@ -286,7 +289,7 @@
   },
   "mojo": {
     "abi_promise": "none; Mojo has no stable ABI, so the guarantee is source compatibility only",
-    "export_count": 599,
+    "export_count": 612,
     "export_source": "src/mojotrees/__init__.mojo",
     "exports_by_module": {
       "alternate_boosting": [
@@ -310,6 +313,21 @@
         "batching_declined_reason",
         "derive_histogram_plan",
         "env_specialization_level"
+      ],
+      "auto_learning_rate": [
+        "AUTO_LR_TARGET_LOGLOSS",
+        "AUTO_LR_TARGET_MULTICLASS",
+        "AUTO_LR_TARGET_RMSE",
+        "AUTO_LR_TARGET_UNKNOWN",
+        "AUTO_LR_TASK_CPU",
+        "AUTO_LR_TASK_GPU",
+        "AutoLearningRateCoefficients",
+        "AutoLearningRateParams",
+        "auto_lr_coefficients",
+        "auto_lr_target_type",
+        "catboost_auto_learning_rate",
+        "catboost_boost_from_average_default",
+        "resolve_learning_rate"
       ],
       "bagging": [
         "BaggingParams",
@@ -1014,6 +1032,17 @@
     "objective_codes": {},
     "package": "mojotrees"
   },
+  "numerical_contracts": [
+    "pred_contrib rows sum to the raw score exactly",
+    "predict(num_iteration=k) equals a k-round fit; [0,k) plus [k,n) equals the whole raw score",
+    "save and load round trips bit-exactly",
+    "all-ones sample_weight equals no sample_weight, bit-identically",
+    "no callbacks means no boundary crossing and a bit-identical model",
+    "a sparse fit equals the dense fit with gaps filled with zeros",
+    "a repeat run on the same device is bit-identical",
+    "worker count does not change a CPU result",
+    "CPU and GPU agree within a Float32 tolerance with exact integer counts, and are not bit-identical to each other"
+  ],
   "parameter_string": {
     "parser": "src/mojotrees/params.mojo parse_params",
     "supported_keys": [
@@ -1059,7 +1088,8 @@
       "quant_train_renew_leaf",
       "stochastic_rounding",
       "leaf_estimation_iterations",
-      "derivative_precision"
+      "derivative_precision",
+      "auto_learning_rate"
     ],
     "used_by": [
       "capi",
@@ -1848,16 +1878,5 @@
     "mojo_toolchain": ">=1.0.0,<2",
     "requires_python": ">=3.14",
     "snapshot_schema": 2
-  },
-  "numerical_contracts": [
-    "pred_contrib rows sum to the raw score exactly",
-    "predict(num_iteration=k) equals a k-round fit; [0,k) plus [k,n) equals the whole raw score",
-    "save and load round trips bit-exactly",
-    "all-ones sample_weight equals no sample_weight, bit-identically",
-    "no callbacks means no boundary crossing and a bit-identical model",
-    "a sparse fit equals the dense fit with gaps filled with zeros",
-    "a repeat run on the same device is bit-identical",
-    "worker count does not change a CPU result",
-    "CPU and GPU agree within a Float32 tolerance with exact integer counts, and are not bit-identical to each other"
-  ]
+  }
 }

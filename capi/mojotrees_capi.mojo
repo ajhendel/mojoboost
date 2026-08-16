@@ -414,6 +414,17 @@ def mojotrees_train_dense(
 
     var n = Int(n_rows)
     var f = Int(n_features)
+    # CatBoost's data-dependent learning rate, if the spec asked for it
+    # (`auto_learning_rate=true`, src/mojotrees/auto_learning_rate.mojo,
+    # docs/design/CATBOOST_CATALOG.md A9). It needs the train row count, so
+    # it cannot be resolved inside `parse_params`, and this is the first
+    # point that has one. A no-op for every spec that did not ask: the
+    # method returns `booster.learning_rate` untouched when the derivation
+    # is disabled, which is the default.
+    try:
+        config.booster.learning_rate = config.resolved_learning_rate(n)
+    except e:
+        return _invalid(error, String(e))
     var features = _copy_f64(data, n * f)
     var target = _copy_f64(labels, n)
     var sample_weight = List[Float64]()

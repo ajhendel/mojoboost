@@ -36,6 +36,7 @@ reported beside LightGBM `stock+det`; never instead of it.
 | A6 | `leaf_estimation_iterations` (`gradient_walker.h::FastGradientWalker`; defaults in `catboost_options.cpp::GetEstimationMethodDefaults`) -- **verified from source** | Re-estimate leaf values 1..k times, derivatives recomputed at the current leaf value each pass | Only when > 1 | Built on the CPU, opt-in, default 1. **DEVICE: not cheap, structural** (GPU orchestrator, 2026-08-16): each extra iteration needs per-leaf grad/hess sums after the previous raw-score update, so a second reduction per leaf per iteration inside the tree (more launches, against the oblivious command-buffer budget) or leaf estimation moved out of the device round (more host trips). **Correction:** an earlier version of this row said CatBoost defaults to 10 for logloss AND multiclass. Logloss is 10; **multiclass is 1**. The 10 in that block is the unreachable Gradient slot while the default method is Newton, and CatBoost's own docs agree. | CPU built; device design decision before any device lane | (3) when > 1; see A6 notes |
 | A7 | Ordered boosting (`BodyTailArr`, tail derivatives only) | Derivatives for row i from a model that never saw i | Yes | No for now; large machinery, matters most on small data | — | design note only |
 | A8 | Symmetric (oblivious) trees (`numScoreBlocks = 1` for `SymmetricTree`; leaf index = split-condition bits; depth default 6) | One split per level for all leaves | New mode | Yes, opt-in `grow_policy=oblivious`, both backends | CPU search+schedule; GPU cross-leaf reduce + level partition | Part B. **CPU half BUILT.** Shape/numbering/aggregation **verified from source**; the per-leaf min-child rule is **NOT verified, it is ours** (see below) |
+| A9 | Automatic `learning_rate` (`catboost/libs/train_lib/options_helper.cpp`: `UpdateLearningRate`, `TAutoLRParamsGuesser`) -- **verified from source**, see A9 | The rate is fitted from the train row count and the iteration count off a 20-row coefficient table, not taken from the 0.03 constant, whenever the user set none of `learning_rate`, `leaf_estimation_method`, `leaf_estimation_iterations`, `l2_leaf_reg` | Yes when on | Yes, and it is bucket C as much as B: our harness pins the rate on the CatBoost arm *because* of this, so "defaults vs defaults" is not currently a real comparison | CPU (`auto_learning_rate.mojo`, new file) | (3) when on; **BUILT, off by default**, no existing default changed |
 
 ## A8, verified from source
 
@@ -303,3 +304,261 @@ problem more exactly rather than changing which problem it is. **The
 per-objective CatBoost numbers above are recorded in
 `boosting.catboost_leaf_estimation_iterations` and read by nothing; our
 default stays 1 for every objective, which is LightGBM stock.**
+
+## A9. Automatic `learning_rate` from the data -- verified from source
+
+Status: written before any code by the `auto-learning-rate` lane, from
+CatBoost `master` (Aug 2026). Every claim in this section is **verified from
+source** and cites the file and line it came from; the two places where I am
+inferring rather than reading are marked **not verified** in bold.
+
+Why it is in bucket C as well as B: our benchmark harness pins
+`learning_rate` on the CatBoost arm precisely because CatBoost otherwise
+derives it and ours does not. Until we can derive the same number, a
+"defaults vs defaults" comparison against CatBoost is not a comparison of
+defaults at all -- it is our fixed 0.1 against their fitted value, and any
+accuracy gap it produces is an artifact of the harness.
+
+### Where it lives
+
+**Not in `catboost_options.cpp`.** The brief pointed at
+`catboost/private/libs/options/catboost_options.cpp`
+(`SetNotSpecifiedOptionsToDefaults`); that file contains no automatic
+learning-rate code at all (`grep -i learning` over the whole 1225-line file
+returns only unrelated error strings and the parameter *name* at line 1149).
+The derivation is a **data-dependent** default, not a static one, so it lives
+with the other data-dependent defaults:
+
+- `catboost/libs/train_lib/options_helper.cpp`, `UpdateLearningRate` (lines
+  269-288) -- the gate.
+- Same file, `TAutoLRParamsGuesser` (lines 177-266) -- the coefficient table
+  and the formula.
+- Same file, `SetDataDependentDefaults` (lines 403-435) -- the single call
+  site, line 418.
+- Same file, local `static double Round(double, int)` (lines 15-18).
+
+Static defaults for the same parameters, for contrast:
+`catboost/private/libs/options/boosting_options.cpp` line 10
+(`LearningRate("learning_rate", 0.03)`), line 13
+(`IterationCount("iterations", 1000)`), line 17
+(`BoostFromAverage("boost_from_average", false)`).
+
+### The formula
+
+`TAutoLRParamsGuesser::GetLearningRate` (options_helper.cpp:252-262):
+
+```
+customIterationConstant  = exp(C * log(iterationCount) + D)
+defaultIterationConstant = exp(C * log(1000)           + D)
+defaultLearningRate      = exp(A * log(learnObjectCount) + B)
+return Round(Min(defaultLearningRate * customIterationConstant
+                 / defaultIterationConstant, 0.5), 6)
+```
+
+`A, B, C, D` are `DatasetSizeCoeff, DatasetSizeConst, IterCountCoeff,
+IterCountConst` on `TLearningRateCoefficients` (options_helper.cpp:116-122),
+whose own comment states the closed form:
+
+    learning_rate = exp(B + A log size + C log iter - C log 1000)
+
+**`D` cancels analytically and does not cancel in floating point.** The
+comment above drops it; the code computes two separate `exp`s that both carry
+it and divides. We reproduce the code's ordering, not the comment's algebra,
+so that a value we print can be compared with CatBoost's without a
+"which rounding" argument. Keeping `D` in the table is therefore deliberate
+even though it is algebraically dead.
+
+Inputs, all four of them, and nothing else:
+
+1. `learnObjectCount` -- **train** row count, `trainDataMetaInfo.ObjectCount`
+   (options_helper.cpp:411). Not the test rows, not the feature count.
+2. `iterationCount` -- `BoostingOptions->IterationCount`
+   (options_helper.cpp:272), i.e. `iterations`, default 1000.
+3. The loss function, collapsed to one of four `ETargetType` values by
+   `GetTargetType` (options_helper.cpp:181-194): `Logloss` covers
+   `Logloss`, `MultiLogloss` and `MultiCrossEntropy`; `MultiClass` covers
+   `MultiClass` only; `RMSE` covers `RMSE` only; **everything else is
+   `Unknown`**.
+4. Three flags that select which coefficient row is used: task type
+   (CPU/GPU), `use_best_model`, `boost_from_average`.
+
+`Round` is local (options_helper.cpp:15-18) and is
+`round(x * 10^6) / 10^6` with C's `round`, i.e. **ties away from zero**, not
+banker's rounding. The `Min(..., 0.5)` cap is applied *before* rounding.
+There is no lower cap.
+
+`Min` is applied to the whole product, so a long run with a negative `C`
+shrinks the rate and a short run raises it, capped at 0.5.
+
+### Where the flags come from
+
+`SetDataDependentDefaults` resolves both flags *before* it calls
+`UpdateLearningRate` (options_helper.cpp:415-418), so the auto-LR sees
+resolved values, never "not set":
+
+- `use_best_model`: `UpdateUseBestModel` (options_helper.cpp:100-113) sets it
+  true when it is unset, a test set exists, and the test target is
+  non-constant or there are test pairs; and forces it false with a warning
+  when there is no test set. **So on a plain fit with no eval set,
+  `use_best_model` is false**, which is the row a benchmark arm lands on.
+- `boost_from_average`: `AdjustBoostFromAverageDefaultValue`
+  (options_helper.cpp:353-374). Returns immediately if the user set it.
+  Otherwise sets it **true** for `RMSE`, `MAE`, `Quantile`, `MAPE`,
+  `MultiQuantile`, `MultiRMSE`, `MultiRMSEWithMissingValues` on a single host
+  with no `continueFromModel`; then forces it **false** if either the train or
+  the test pool carries a baseline. `Logloss` and `MultiClass` are not on that
+  list, so their default is the static `false` from
+  `boosting_options.cpp:17`.
+
+Consequence worth stating plainly, because it decides which coefficient rows
+a defaults-vs-defaults benchmark ever touches: with no eval set and no
+user override, **binary lands on `(Logloss, CPU, useBestModel=False,
+boostFromAverage=False)` and regression on `(RMSE, CPU, useBestModel=False,
+boostFromAverage=True)`.**
+
+### When it fires, and when it does not
+
+`UpdateLearningRate` (options_helper.cpp:276-287) requires **all four** of
+these to be unset by the user:
+
+- `learning_rate`
+- `leaf_estimation_method`
+- `leaf_estimation_iterations`
+- `l2_leaf_reg`
+
+Setting *any one of the last three* silently pins `learning_rate` to the
+constant 0.03. That is a genuinely surprising coupling and it is not
+documented anywhere I could find: a user who sets `l2_leaf_reg` also
+un-sets the automatic learning rate. It is presumably there because the
+coefficients were fitted with the other three at their defaults.
+
+Then `NeedToUpdate` (options_helper.cpp:246-249) requires that the
+`(targetType, taskType, useBestModel, boostFromAverage)` key exists in the
+table. It does **not** for:
+
+- Any loss outside `{Logloss, MultiLogloss, MultiCrossEntropy, MultiClass,
+  RMSE}` -- so MAE, Quantile, MAPE, Poisson, Tweedie, LambdaRank, every
+  ranking loss, and every custom loss keep 0.03.
+- `MultiClass` with `boost_from_average = true`. The table has only two
+  MultiClass rows per task type and both are `EBoostFromAverage::False`
+  (options_helper.cpp:207-210 CPU, 230-233 GPU). Reachable only by the user
+  setting `boost_from_average` explicitly, since the adjuster never sets it
+  for MultiClass.
+
+Otherwise it assigns and logs `Learning rate set to <value>`
+(options_helper.cpp:284-285).
+
+### The coefficient table, transcribed
+
+`TAutoLRParamsGuesser::TAutoLRParamsGuesser` (options_helper.cpp:197-244),
+as `{A, B, C, D}`:
+
+| target | task | use_best_model | boost_from_average | A | B | C | D |
+|---|---|---|---|---|---|---|---|
+| Logloss | CPU | true | true | 0.246 | -5.127 | -0.451 | 0.978 |
+| Logloss | CPU | false | true | 0.408 | -7.299 | -0.928 | 2.701 |
+| Logloss | CPU | true | false | 0.247 | -5.158 | -0.435 | 0.934 |
+| Logloss | CPU | false | false | 0.427 | -7.525 | -0.917 | 2.63 |
+| MultiClass | CPU | true | false | 0.02 | -2.364 | -0.382 | 0.924 |
+| MultiClass | CPU | false | false | 0.051 | -2.889 | -0.845 | 2.928 |
+| RMSE | CPU | true | true | 0.157 | -4.062 | -0.61 | 1.557 |
+| RMSE | CPU | false | true | 0.158 | -4.287 | -0.813 | 2.571 |
+| RMSE | CPU | true | false | 0.189 | -4.383 | -0.623 | 1.439 |
+| RMSE | CPU | false | false | 0.178 | -4.473 | -0.76 | 2.133 |
+| Logloss | GPU | true | true | 0.04 | -3.226 | -0.488 | 0.758 |
+| Logloss | GPU | false | true | 0.427 | -7.316 | -0.907 | 2.354 |
+| Logloss | GPU | true | false | -0.085 | -2.055 | -0.414 | 0.427 |
+| Logloss | GPU | false | false | -0.055 | -3.01 | -0.896 | 2.366 |
+| MultiClass | GPU | true | false | 0.101 | -2.95 | -0.437 | 1.136 |
+| MultiClass | GPU | false | false | 0.204 | -4.144 | -0.833 | 2.889 |
+| RMSE | GPU | true | true | 0.108 | -3.525 | -0.285 | 0.058 |
+| RMSE | GPU | false | true | 0.131 | -4.114 | -0.597 | 1.693 |
+| RMSE | GPU | true | false | 0.051 | -3.001 | -0.449 | 0.859 |
+| RMSE | GPU | false | false | 0.047 | -3.034 | -0.591 | 1.554 |
+
+20 rows: 4 Logloss + 2 MultiClass + 4 RMSE per task type. Note the sign of
+`A` for GPU Logloss without `boost_from_average` -- the fitted rate there
+*decreases* with dataset size, unlike every CPU row.
+
+These are **fitted constants** in CatBoost's sense: a regression of a good
+learning rate on `log(rows)` and `log(iterations)`, run offline by the
+CatBoost authors over their benchmark suite. The source carries no derivation
+and no citation for them. **They are numbers we copy, not numbers we can
+re-derive**, and that is the honest description of what this lane ships.
+
+### Float32 narrowing
+
+`BoostingOptions->LearningRate` is `TOption<float>`
+(`catboost/private/libs/options/boosting_options.h:26`), so the `double`
+returned by `GetLearningRate` is narrowed to float32 on assignment at
+options_helper.cpp:284. Everything downstream (`ApplyLearningRate`,
+`algo_train.cpp:59,66,178,187,350`) uses that float. Our implementation
+reproduces the narrowing, behind a field, so a printed value matches
+CatBoost's rather than being right in the 9th decimal and different.
+
+### Two things I did NOT establish
+
+- **Not verified:** whether the CatBoost Python package can reach
+  `SetDataDependentDefaults` on a path that skips this (e.g. `fit` with a
+  pre-quantized pool, or `cv`). I read the C++ default resolution only; I did
+  not trace the Python entry points. If a benchmark harness ever *relies* on
+  auto-LR firing, that trace is required first.
+- **Not verified:** why the last-three-parameters gate exists. The reasoning
+  in this entry ("the coefficients were fitted with them at defaults") is my
+  inference from the shape of the table, not a comment in the source.
+
+### What mojotrees built, and the mapping
+
+`src/mojotrees/auto_learning_rate.mojo`, **off by default**, reachable
+through `AutoLearningRateParams` and the `auto_learning_rate=true` parameter
+key. It changes no existing default: `BoosterParams.default()` is still
+`learning_rate = 0.1` and `parse_params` still returns 0.1 unless the key is
+given.
+
+Reachability, and where it stops. The derivation needs the **train row
+count**, which no parameter parser has, so `parse_params` records the request
+on `TrainConfig.auto_learning_rate` and `TrainConfig.resolved_learning_rate(
+n_rows)` applies it. That method returns `booster.learning_rate` untouched
+whenever the derivation is off, so every caller can route through it
+unconditionally. Two surfaces do: `capi/mojotrees_capi.mojo` (at the point it
+first has `n_rows`) and `cli/mojotrees_cli.mojo` (after the table is read).
+The Python mapping surface does **not** carry the key at all, so it is
+refused there as an unknown parameter rather than accepted and dropped --
+which is the repo's refuse-rather-than-ignore rule, not an oversight. Wiring
+it into `bindings/_mojotrees.mojo` means threading a row count through
+fourteen `_parse_params` call sites and adding the key to the Python default
+mapping; that is a separate change and has not been made.
+
+`parse_params` is stricter than CatBoost on purpose. CatBoost, handed
+`learning_rate=0.05 l2_leaf_reg=5`, silently keeps 0.05 and prints nothing;
+handed `l2_leaf_reg=5` alone with the rate unset, it silently reverts to the
+constant 0.03. Here `auto_learning_rate=true` is an explicit act, so
+combining it with `learning_rate=`, `lambda_l2=` or
+`leaf_estimation_iterations=` is an error naming the gate
+(`_enable_auto_learning_rate`). That is a deliberate divergence from
+CatBoost's behavior and is the only one on this surface.
+
+Target-type mapping from mojotrees objective codes
+(`objective_registry.mojo`), which is **ours, not CatBoost's**, because the
+objective sets do not coincide:
+
+| mojotrees objective | CatBoost target type | why |
+|---|---|---|
+| `SQUARED_ERROR` | RMSE | same loss up to the sqrt, which does not change the minimizer |
+| `BINARY_LOGISTIC` | Logloss | same loss |
+| `CROSS_ENTROPY` | Logloss | CatBoost's `CrossEntropy` is the soft-label Logloss and `GetTargetType` maps `MultiCrossEntropy` to Logloss; the single-output `CrossEntropy` case is **our decision**, CatBoost's `GetTargetType` does not list plain `CrossEntropy` and would return Unknown for it |
+| `MULTICLASS` | MultiClass | same loss |
+| everything else | Unknown -> no change | matches CatBoost, which leaves 0.03 |
+
+The `CROSS_ENTROPY` row is the one deviation and it is marked. If we wanted
+strict parity we would map it to Unknown; mapping it to Logloss is a
+judgement that the fitted coefficients transfer to the soft-label case
+because the derivative is identical.
+
+`boost_from_average` has no mojotrees equivalent as a switch -- our
+`init_score` plays that role -- so
+`catboost_boost_from_average_default(objective)` reproduces
+`AdjustBoostFromAverageDefaultValue` for the objectives we have
+(`SQUARED_ERROR`, `L1`, `QUANTILE`, `MAPE` -> true, everything else false)
+and the caller may override it. `MultiQuantile`, `MultiRMSE` and
+`MultiRMSEWithMissingValues` are on CatBoost's list and we do not have them.
