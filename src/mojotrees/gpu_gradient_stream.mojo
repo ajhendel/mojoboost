@@ -96,6 +96,7 @@ from max.gpu.sync import barrier
 from .binning import MAX_BINS
 from .goss import GossSelection
 from .gpu_active_rows import (
+    HIST_PROBE_OFF,
     GpuActiveRows,
     _range_reduce_kernel,
     _zero_int32_kernel,
@@ -899,6 +900,21 @@ def enqueue_range_histogram_interleaved[
             Int32(tiling.n_tiles),
             Int32(0),
             Int32(0),
+            # `h_scale` and `const_hess`, which this call was missing: the
+            # kernel grew both when the hessian plane became elidable and
+            # this site was not updated with it. The arity error is invisible
+            # to a host build because a kernel body is elaborated when the
+            # device compiles it, not when this file does. `const_hess` is
+            # zero here and not a choice: `n_cells` above counts three
+            # planes, so this path is the three-plane layout by
+            # construction.
+            h_scale,
+            Int32(0),
+            # The histogram decomposition probes. `GpuActiveRows` refuses to
+            # set any of them on a path that grows a tree, and the gradient
+            # stream never sets one, so this is `HIST_PROBE_OFF` and is
+            # spelled out rather than passed as a bare zero.
+            Int32(HIST_PROBE_OFF),
             grid_dim=blocks,
             block_dim=threads,
         )
