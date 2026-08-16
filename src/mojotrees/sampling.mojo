@@ -107,6 +107,29 @@ hessian and must NOT declare `histogram.CONSTANT_HESSIAN`.
 outright, so a caller that wires this into a round loop cannot take the
 two-plane path by omission. See `boosting.round_has_constant_hessian`.
 
+MVS
+---
+CatBoost's `bootstrap_type=MVS` (Minimal Variance Sampling) is the sampler
+CatBoost actually runs on the CPU: `catboost_options.cpp` installs it whenever
+`bootstrap_type` was left alone and the loss is neither multiclass-only nor
+multi-regression, `task_type` is CPU, and `sampling_unit` is `Object` -- which
+covers both objectives this project benchmarks. **The Bayesian bootstrap above
+is CatBoost's fallback, not its default.** MVS keeps a row with probability
+proportional to its gradient magnitude (capped at 1), amplifies a kept row by
+the reciprocal of that probability, and drops the rest outright. See
+`MvsBootstrapParams` for the option semantics, `mvs_bootstrap_weights` for the
+draw, `_mvs_threshold` for the solve, and `docs/design/CATBOOST_CATALOG.md`
+A11 for the source citations.
+
+**Its weights are hessians too**, for exactly the reason the Bayesian
+bootstrap's are, and more strongly: see `mvs_varies_hessian` and
+`check_mvs_hessian_declaration`.
+
+**Read `check_mvs_reg` before touching the regularizer.** MVS's lambda is
+`mvs_reg` and has nothing to do with `lambda_l2`; it is the only floor under a
+bare denominator, its default is derived from the data rather than being a
+number, and setting it to 0 in CatBoost can silently train a tree on no rows.
+
 Row sets and the GPU
 --------------------
 A sampled row set is an ascending, duplicate-free list of row indices, and
@@ -119,7 +142,7 @@ multiplies gradients by it reproduces the sampled histogram without gathering
 rows first.
 """
 
-from std.math import log
+from std.math import log, sqrt, isfinite
 
 from .bagging import DEFAULT_BAGGING_SEED
 from .rng import GOLDEN, splitmix64, uniform
@@ -157,6 +180,34 @@ comptime DEFAULT_BOOTSTRAP_SEED = 0
 # `bootstrap_type` values this module implements.
 comptime BOOTSTRAP_NO = 0
 comptime BOOTSTRAP_BAYESIAN = 1
+comptime BOOTSTRAP_MVS = 2
+
+# CatBoost's `subsample` default *under MVS*, and only under MVS:
+# `catboost_options.cpp` does `if (bootstrapType == EBootstrapType::MVS)
+# subsample.SetDefault(0.8)`. The `TBootstrapConfig` constructor's own default
+# is 0.66, which is what Bernoulli and Poisson get; reading 0.66 out of the
+# header and calling it "CatBoost's subsample" is wrong by a fifth of the rows.
+comptime DEFAULT_MVS_SUBSAMPLE = 0.8
+
+# CatBoost solves the MVS threshold per block of this many rows, not once over
+# the dataset: `TMvsSampler::BlockSize = 8192`, `blockParams.SetBlockSize`, and
+# each block targets `SampleRate * blockSize` of its own rows. It is a
+# CONSTANT there, not a thread count, which is the only reason CatBoost's own
+# MVS does not move with `thread_count` -- and it is the reason ours is a
+# comptime constant here rather than anything derived from
+# `MOJOTREES_NUM_WORKERS`. A block size that follows the worker count would
+# make every weight in the fit follow it too.
+comptime MVS_BLOCK_SIZE = 8192
+
+# `std::numeric_limits<double>::epsilon()`, the literal constant CatBoost tests
+# the keep probability against in `GenSampleWeights`.
+comptime _MVS_PROBABILITY_EPS = 2.220446049250313e-16
+
+# Separates the MVS stream from the Bayesian bootstrap's: both are keyed by
+# (seed, tree index), both default their seed to 0, and a caller may well set
+# `bootstrap_seed` once and try both samplers, so without a second domain
+# constant the two would draw the same uniforms for the same tree.
+comptime _MVS_DOMAIN = UInt64(0x4D56535F5361C71E)
 
 # CatBoost's own guard against log(0), verbatim: `GenerateBayessianWeight`
 # computes `-FastLogf(rand.GenRandReal1() + 1e-100)`. Its `GenRandReal1` is
@@ -920,6 +971,678 @@ def refresh_bayesian_bootstrap(
     if len(base_weight) != 0:
         for r in range(n_rows):
             weights[r] = weights[r] * base_weight[r]
+
+
+@fieldwise_init
+struct MvsBootstrapParams(Copyable, Movable):
+    """CatBoost's `bootstrap_type=MVS`, Minimal Variance Sampling.
+
+    Verified against CatBoost `master` (August 2026):
+    `catboost/private/libs/algo/mvs.cpp` and `mvs.h` for the algorithm,
+    `catboost/private/libs/options/catboost_options.cpp`
+    (`SetNotSpecifiedOptionsToDefaults`) for the defaults,
+    `catboost/private/libs/options/bootstrap_options.{h,cpp}` for the option
+    surface, `catboost/private/libs/algo/tensor_search_helpers.cpp` for the
+    dispatch, and `catboost/private/libs/algo/calc_score_cache.cpp` for what a
+    zero weight does. See `docs/design/CATBOOST_CATALOG.md`, the A11 note.
+
+    **This is CatBoost's actual CPU default**, not the Bayesian bootstrap of
+    `BayesianBootstrapParams`. `SetNotSpecifiedOptionsToDefaults` installs it
+    whenever the user left `bootstrap_type` alone and the loss is neither
+    multiclass-only nor multi-regression and `task_type` is CPU and
+    `sampling_unit` is `Object`. Binary logloss and RMSE, which are the two
+    objectives this project benchmarks, satisfy every one of those, so the
+    CatBoost column beside our numbers has always been an MVS fit.
+
+    What it does, per row `i`, with `lambda` from `resolve_reg`:
+
+        g_i  = sqrt(sum_k grad[i][k]^2 + lambda)
+        p_i  = 1 if g_i > mu else g_i / mu
+        w_i  = 1/p_i if uniform() < p_i else 0
+
+    `mu` is solved so `sum_i p_i` hits `subsample * rows`. Rows above the
+    threshold survive certainly at weight exactly 1; rows below it survive with
+    probability proportional to their gradient magnitude and are amplified by
+    `mu/g` when they do. The `1/p` factor is what makes the sampled gradient
+    sums unbiased, and choosing `p` proportional to `|g|` is what minimizes
+    their variance at a fixed expected sample size -- the name is descriptive.
+
+    It is the same family as GOSS, better calibrated: GOSS keeps a fixed top
+    fraction and amplifies every survivor by one shared constant, where MVS
+    solves for the threshold that hits the requested rate and gives each
+    survivor its own amplification.
+
+    The options, and where ours differ:
+
+    - `subsample` defaults to **0.8** under MVS (`DEFAULT_MVS_SUBSAMPLE`) and
+      must be in `(0, 1]` (`TBootstrapConfig::Validate`: "Subsample should be
+      in (0,1]"). At exactly 1.0 CatBoost fills every weight with 1 and takes
+      no draw, which is the unsampled model; `samples_rows` is that test.
+    - `mvs_reg` is a `TMaybe<float>` defaulting to `Nothing()`, so "unset" is a
+      real state and not a magic number. Unset means the lambda is derived from
+      the data every tree; see `resolve_reg`. `reg_is_set` carries the
+      distinction.
+    - **`bagging_temperature` is refused beside MVS here and is NOT refused by
+      CatBoost.** Their `Validate` rejects it for `No` and for Bernoulli but
+      the `MVS` arm of that switch checks only the sampling unit, so CatBoost
+      accepts the parameter, never reads it (the MVS branch of `Bootstrap`
+      does not pass it to `TMvsSampler` at all), and `Save` drops it. A knob
+      that is accepted and does nothing is a silent wrong answer to the user
+      who set it. `check_mvs_bagging_temperature` is the refusal.
+    - `sampling_unit` must be `Object`; CatBoost's own `Validate` says so
+      ("MVS bootstrap supports per object sampling only") and `Bootstrap`
+      repeats it. Group sampling is not implemented here at all.
+    - `sampling_frequency` defaults to `PerTree`, so the draw is keyed by tree
+      index and not by (tree, level), exactly as the Bayesian bootstrap is.
+
+    Disabled by default, so an untouched bundle draws nothing and leaves every
+    fit byte for byte the fit it is today.
+    """
+
+    var enabled: Bool
+    var subsample: Float64
+    var reg: Float64
+    var reg_is_set: Bool
+    var seed: Int
+
+    @staticmethod
+    def disabled() -> MvsBootstrapParams:
+        """No MVS: every row kept at weight 1 (the library default)."""
+        return MvsBootstrapParams(
+            False, DEFAULT_MVS_SUBSAMPLE, 0.0, False, DEFAULT_BOOTSTRAP_SEED
+        )
+
+    @staticmethod
+    def enable(
+        subsample: Float64 = DEFAULT_MVS_SUBSAMPLE,
+        seed: Int = DEFAULT_BOOTSTRAP_SEED,
+    ) -> MvsBootstrapParams:
+        """MVS at CatBoost's defaults, with `mvs_reg` left unset so the lambda
+        is derived from the data as CatBoost's is."""
+        return MvsBootstrapParams(True, subsample, 0.0, False, seed)
+
+    @staticmethod
+    def enable_with_reg(
+        reg: Float64,
+        subsample: Float64 = DEFAULT_MVS_SUBSAMPLE,
+        seed: Int = DEFAULT_BOOTSTRAP_SEED,
+    ) -> MvsBootstrapParams:
+        """MVS with an explicit `mvs_reg`. `validate` refuses exactly 0; see
+        `check_mvs_reg`."""
+        return MvsBootstrapParams(True, subsample, reg, True, seed)
+
+    def validate(self) raises:
+        """CatBoost's `TBootstrapConfig::Validate` rules for this type, plus
+        one refusal of ours. Comparisons are written so a NaN is rejected."""
+        if not (self.subsample > 0.0 and self.subsample <= 1.0):
+            raise Error("subsample must be in (0, 1]")
+        if self.reg_is_set:
+            check_mvs_reg(self.reg)
+
+    def samples_rows(self) -> Bool:
+        """Whether any row can be dropped or reweighted.
+
+        False at `subsample == 1.0` even when enabled, which is CatBoost's own
+        `if (SampleRate == 1.0f) Fill(SampleWeights, 1.0f)` early return. It is
+        deliberately NOT the test the constant-hessian exclusion uses; see
+        `mvs_varies_hessian`.
+        """
+        return self.enabled and self.subsample != 1.0
+
+    def resolve_reg(self, auto_lambda: Float64) -> Float64:
+        """The lambda a draw actually uses: the explicit `mvs_reg` when the
+        user set one, otherwise the data-derived value.
+
+        This is `TMvsSampler::GetLambda`'s first two lines
+        (`if (Lambda.Defined()) return Lambda.GetRef();`), with the derivation
+        of `auto_lambda` left to `mvs_auto_lambda_from_gradients` and
+        `mvs_auto_lambda_from_leaf_values` because CatBoost picks between those
+        two by whether any tree exists yet.
+        """
+        if self.reg_is_set:
+            return self.reg
+        return auto_lambda
+
+
+def check_mvs_reg(reg: Float64) raises:
+    """Validate an explicit `mvs_reg`, and refuse exactly zero.
+
+    CatBoost requires `mvs_reg >= 0` (`TBootstrapConfig::Validate`: "MVS
+    regularization parameter should be >= 0") and accepts 0. **We refuse 0**,
+    and the reason is a defect in CatBoost worth stating in full because it is
+    not a crash and produces no NaN anybody ever sees:
+
+    lambda is what floors the row statistic `g_i = sqrt(sum_k der^2 + lambda)`.
+    At `lambda == 0`, a block whose every derivative is zero has every `g_i`
+    zero. `CalculateThreshold` then pivots on 0, computes `sumOfSmall / pivot`
+    as `0.0/0.0` = NaN, tests `NaN > sampleSize` which is **false**, falls into
+    the undershoot branch, and returns `0.0 / (0.8*n - n)` = **negative zero**.
+    `GetSingleProbability` then computes `0.0 / -0.0` = NaN, and the next line
+    is `if (probability > std::numeric_limits<double>::epsilon())`, which is
+    **also false for NaN**, so the `else` runs and writes weight 0 for every
+    row. The block is dropped entirely by `SetControlNoZeroWeighted`, the tree
+    trains on nothing, and the user gets a model that learned nothing with no
+    exception, no warning, and no NaN left in the output to notice. The NaN is
+    eaten by a comparison that swallows it.
+
+    There is no configuration in which passing 0 is better than leaving
+    `mvs_reg` unset: unset derives a positive lambda from the data every tree,
+    and 0's only two outcomes are "indistinguishable from a very small lambda"
+    and "silently empty tree". So this raises rather than accepting a setting
+    whose best case is the default.
+    """
+    if not (reg >= 0.0):
+        raise Error("mvs_reg must be >= 0")
+    if reg == 0.0:
+        raise Error(
+            "mvs_reg must not be 0: it is the only floor under the MVS"
+            " threshold, and a zero-derivative block at mvs_reg=0 gives every"
+            " row weight 0 and trains a tree on no rows at all. Leave mvs_reg"
+            " unset to derive it from the data, as CatBoost does by default"
+        )
+
+
+def check_mvs_bagging_temperature(
+    params: MvsBootstrapParams, temperature_is_set: Bool
+) raises:
+    """Refuse `bagging_temperature` beside MVS. A divergence, deliberately.
+
+    `bagging_temperature` is the Bayesian bootstrap's knob and MVS never reads
+    it. CatBoost's `TBootstrapConfig::Validate` refuses it for `No` and for
+    Bernoulli but not for MVS -- the `MVS` arm of that switch tests only the
+    sampling unit -- so CatBoost accepts `bootstrap_type=MVS,
+    bagging_temperature=5`, ignores the temperature, and drops it in `Save`.
+    The user gets no error and no effect.
+
+    `temperature_is_set` is the caller's "the user actually wrote this down"
+    flag, the equivalent of CatBoost's `TOption::IsSet`. A defaulted
+    temperature is not a user setting and is not refused.
+    """
+    if params.enabled and temperature_is_set:
+        raise Error(
+            "bagging_temperature belongs to bootstrap_type 'bayesian' and is"
+            " never read by MVS; remove it or switch bootstrap_type"
+        )
+
+
+def check_bootstrap_type_exclusive(
+    mvs: MvsBootstrapParams, bayesian: BayesianBootstrapParams
+) raises:
+    """One `bootstrap_type` at a time. CatBoost's is a single enum, so the
+    combination cannot be spelled there; ours is two bundles and can be."""
+    if mvs.enabled and bayesian.enabled:
+        raise Error(
+            "bootstrap_type selects one sampler: mvs and bayesian bootstrap"
+            " cannot both be enabled"
+        )
+
+
+def mvs_varies_hessian(params: MvsBootstrapParams) -> Bool:
+    """Whether a fit configured this way has a per-row hessian, so that
+    `histogram.CONSTANT_HESSIAN` must not be declared for it.
+
+    Identical in force and in reason to
+    `bayesian_bootstrap_varies_hessian`, and it is the same line of CatBoost
+    that settles it: `Bootstrap` calls `CalcWeightedData` for MVS on the same
+    line it calls it for Bayesian, and that function does
+    `sampleWeightedDerivativesData[z] = weightedDerivativesData[z] *
+    sampleWeightsData[z]` and then `SampleWeights[i] *= learnWeights[i]`. An
+    MVS weight multiplies the row's derivatives and rides in the leaf
+    denominators exactly as a sample weight does, so under an objective whose
+    unweighted hessian is the literal 1.0 a sampled round stores `1/p` (or 0)
+    into `hess`, and a histogram builder told to rebuild the hessian plane from
+    the count would rebuild the wrong plane, silently.
+
+    MVS is in fact the *stronger* case of the two: its weights are not merely
+    unequal, most of them are exactly 1 and the rest are large, and a zero
+    weight is a dropped row.
+
+    `params.enabled` is the whole test, and `subsample` is deliberately not
+    consulted, for the reason `bayesian_bootstrap_varies_hessian` gives: the
+    declaration is held for a whole fit, on the device it is builder state set
+    once that cannot be withdrawn mid-loop, and a safety predicate that reasons
+    about the value of a `Float64` knob is one edit away from being wrong. A
+    `subsample == 1.0` fit therefore pays for the third plane and gets the same
+    model; that is the cheap side of the trade.
+    """
+    return params.enabled
+
+
+def check_mvs_hessian_declaration(
+    params: MvsBootstrapParams, const_hessian: Bool
+) raises:
+    """Refuse a constant-hessian declaration beside an active MVS bootstrap.
+
+    The twin of `check_bayesian_bootstrap_hessian_declaration`, and it exists
+    for the same structural reason: `boosting.round_has_constant_hessian` is
+    the predicate that makes the declaration and it cannot see a bootstrap
+    configuration -- its three inputs are the objective, the sample weights and
+    the GOSS parameters, and its signature is a GPU-visible contract that no
+    CPU lane may widen. So the guard lives on the sampler's side, costs one
+    branch per fit, and converts the failure mode from a quietly wrong hessian
+    plane into an exception at fit setup.
+    """
+    if mvs_varies_hessian(params) and const_hessian:
+        raise Error(
+            "a fit with mvs bootstrap active must not declare a constant"
+            " hessian: the mvs weight multiplies the row's derivatives, so the"
+            " hessian is the weight and varies per row"
+        )
+
+
+def _mvs_stream(seed: Int, tree_index: Int) -> UInt64:
+    """Start of the counter stream for one tree's keep decisions.
+
+    Same shape as `_stream`, `_level_stream` and `_bootstrap_stream`: mix the
+    seed, spread the tree index by the golden-ratio increment, mix again, and
+    separate the whole space from the other per-tree streams with a domain
+    constant.
+
+    The stream is a *start*, not a running state: row `r` reads `stream + r`
+    and nothing advances, so no row's keep decision depends on how many rows
+    were drawn before it, on which block it landed in, or on how many blocks
+    took the degenerate guard and skipped their draws entirely.
+    """
+    var h = splitmix64(UInt64(seed & 0x7FFFFFFFFFFFFFFF) ^ _MVS_DOMAIN)
+    return splitmix64(h ^ (UInt64(tree_index & 0x7FFFFFFFFFFFFFFF) * GOLDEN))
+
+
+def _row_magnitude_squared(
+    gradients: List[Float64], row: Int, n_outputs: Int
+) -> Float64:
+    """`sum_k der[row][k]^2` over a row-major flattened gradient buffer.
+
+    Row-major with stride `n_outputs` (`gradients[row * n_outputs + k]`) is the
+    layout `boosting` already uses for multiclass raw scores and probabilities.
+    At `n_outputs == 1` this is one load and one multiply.
+    """
+    var acc = 0.0
+    var base = row * n_outputs
+    for k in range(n_outputs):
+        var d = gradients[base + k]
+        acc += d * d
+    return acc
+
+
+def mvs_auto_lambda_from_gradients(
+    gradients: List[Float64], n_rows: Int, n_outputs: Int = 1
+) raises -> Float64:
+    """The derived `mvs_reg` for the FIRST tree of a fit, when no tree exists
+    yet: the squared mean gradient magnitude.
+
+    `TMvsSampler::GetLambda` falls to `CalculateMeanGradValue` when
+    `leafValues` is empty, and returns `mean * mean`. CatBoost accumulates that
+    mean in per-thread blocks and then sums the block totals, so its value
+    moves with `thread_count`; ours accumulates in row order, once, so it does
+    not. That is a determinism divergence in our favor and is recorded as one.
+
+    An empty dataset yields 0, which `check_mvs_reg`'s reasoning says is the
+    dangerous value -- but a zero-row fit has no block to sample and the
+    threshold guard covers it.
+    """
+    if n_rows < 0:
+        raise Error("n_rows must be nonnegative")
+    if n_outputs < 1:
+        raise Error("n_outputs must be positive")
+    if len(gradients) < n_rows * n_outputs:
+        raise Error("gradient buffer is shorter than n_rows * n_outputs")
+    if n_rows == 0:
+        return 0.0
+    var total = 0.0
+    for r in range(n_rows):
+        total += sqrt(_row_magnitude_squared(gradients, r, n_outputs))
+    var mean = total / Float64(n_rows)
+    return mean * mean
+
+
+def mvs_auto_lambda_from_leaf_values(
+    leaf_values: List[Float64], n_leaves: Int, n_outputs: Int = 1
+) raises -> Float64:
+    """The derived `mvs_reg` for every tree AFTER the first: the squared mean
+    L2 norm of the previous tree's leaf-value vectors.
+
+    `TMvsSampler::GetLambda` prefers `CalculateLastIterMeanLeafValue` whenever
+    `leafValues` is non-empty, and what it reads is `leafValues.back()`, the
+    last iteration only -- `DoBootstrap` passes `ctx->LearnProgress->LeafValues`,
+    which is the whole history. So the lambda a tree samples with is a property
+    of the tree before it, which is why this is a separate entry point rather
+    than something `resolve_reg` could compute on its own.
+
+    `leaf_values` is row-major over leaves with stride `n_outputs`
+    (`leaf_values[leaf * n_outputs + dim]`), matching the gradient layout above
+    rather than CatBoost's `[dim][leaf]`; the sum is over the same numbers
+    either way, but the summation ORDER differs from theirs and so may the last
+    bits. Recorded, not hidden.
+    """
+    if n_leaves < 0:
+        raise Error("n_leaves must be nonnegative")
+    if n_outputs < 1:
+        raise Error("n_outputs must be positive")
+    if len(leaf_values) < n_leaves * n_outputs:
+        raise Error("leaf value buffer is shorter than n_leaves * n_outputs")
+    if n_leaves == 0:
+        return 0.0
+    var total = 0.0
+    for leaf in range(n_leaves):
+        total += sqrt(_row_magnitude_squared(leaf_values, leaf, n_outputs))
+    var mean = total / Float64(n_leaves)
+    return mean * mean
+
+
+def _mvs_threshold(
+    mut candidates: List[Float64], begin: Int, end: Int, sample_size: Float64
+) -> Float64:
+    """Solve for the threshold `mu` with `sum_i min(1, g_i/mu) == sample_size`.
+
+    A transcription of `TMvsSampler::CalculateThreshold`, written as a loop
+    rather than a recursion. Pivot on the first candidate, partition three ways,
+    work out the sample size that pivot implies, and move into the large side
+    if it overshoots or the small side if it undershoots; when a side runs out,
+    solve the remaining linear equation exactly. Expected O(end - begin).
+
+    `candidates` is permuted in place, which is what makes it O(n) and is what
+    CatBoost does too (two `std::partition` passes over its own block buffer).
+
+    **One deliberate difference, and it is the determinism one.** CatBoost
+    partitions with `std::partition`, which is not stable, so the order its
+    `Accumulate` sums the small side in is an implementation detail of the
+    standard library, and floating-point addition is not associative. This uses
+    an explicit three-way (Dutch-flag) partition, so the permutation is a fixed
+    function of the input order alone -- and the input order is row order. The
+    sums are therefore reproducible here in a way they are not there. This does
+    NOT preserve relative order; it only has to be deterministic, and it is.
+
+    The two divisions this can return by are the ones the A11 catalog note
+    dissects. Neither is guarded here on purpose: this function transcribes the
+    solve, and the caller guards the result with `_mvs_threshold_is_usable` so
+    there is exactly one place a degenerate threshold is handled.
+    """
+    var lo = begin
+    var hi = end
+    var sum_small = 0.0
+    var n_large = 0
+    while lo < hi:
+        var pivot = candidates[lo]
+        # Three-way partition: [lo, lt) < pivot, [lt, gt) == pivot,
+        # [gt, hi) > pivot. A NaN candidate compares false both ways and lands
+        # in the middle, which carries it into the sums and out through the
+        # caller's guard rather than silently vanishing.
+        var lt = lo
+        var i = lo
+        var gt = hi
+        while i < gt:
+            var v = candidates[i]
+            if v < pivot:
+                candidates[i] = candidates[lt]
+                candidates[lt] = v
+                lt += 1
+                i += 1
+            elif v > pivot:
+                gt -= 1
+                candidates[i] = candidates[gt]
+                candidates[gt] = v
+            else:
+                i += 1
+
+        var sum_small_update = 0.0
+        for j in range(lo, lt):
+            sum_small_update += candidates[j]
+        var n_large_update = hi - gt
+        var n_middle = gt - lt
+        var sum_middle = Float64(n_middle) * pivot
+
+        var estimated = (sum_small + sum_small_update) / pivot + Float64(
+            n_large + n_large_update + n_middle
+        )
+        if estimated > sample_size:
+            # mu must be larger: everything at or below the pivot is "small".
+            if gt != hi:
+                sum_small += sum_middle + sum_small_update
+                lo = gt
+            else:
+                return (
+                    sum_small + sum_small_update + sum_middle
+                ) / (sample_size - Float64(n_large))
+        else:
+            # mu must be smaller: everything at or above the pivot is "large".
+            if lt != lo:
+                n_large += n_large_update + n_middle
+                hi = lt
+            else:
+                return sum_small / (
+                    sample_size
+                    - Float64(n_large + n_middle + n_large_update)
+                )
+    return 0.0
+
+
+def _mvs_threshold_is_usable(threshold: Float64) -> Bool:
+    """Whether a solved threshold can be divided by.
+
+    OURS, and NOT verified from CatBoost source, because there is nothing to
+    verify it against: CatBoost does not guard this. See `check_mvs_reg` for
+    the full chain, and the A11 catalog note for the second shape this catches
+    that refusing `mvs_reg=0` does not -- an exact tie on the boundary can give
+    a `0/0` NaN threshold at a perfectly positive lambda.
+
+    Rejecting non-finite covers NaN and both infinities; rejecting
+    non-positive covers the negative zero CatBoost's undershoot branch returns,
+    since `-0.0 > 0.0` is false.
+    """
+    return isfinite(threshold) and threshold > 0.0
+
+
+@fieldwise_init
+struct MvsAudit(Copyable, Movable):
+    """What one tree's MVS draw actually did, so a test can prove a path was
+    taken rather than assume it.
+
+    `blocks_guarded` is the count of blocks that hit
+    `_mvs_threshold_is_usable` returning False and kept every row at weight 1.
+    It exists because that branch is the one with no CatBoost referent, and a
+    test that claims to exercise it has to be able to show it fired. Under the
+    default (`mvs_reg` unset, so lambda derived and positive) it should be 0 on
+    any dataset with a nonzero gradient, and a nonzero count on a real fit is a
+    signal worth chasing rather than a statistic.
+    """
+
+    var blocks: Int
+    var blocks_guarded: Int
+    var rows_kept: Int
+    var rows_kept_certainly: Int
+
+    @staticmethod
+    def empty() -> MvsAudit:
+        return MvsAudit(0, 0, 0, 0)
+
+
+def mvs_bootstrap_weights(
+    params: MvsBootstrapParams,
+    gradients: List[Float64],
+    n_rows: Int,
+    tree_index: Int,
+    auto_lambda: Float64,
+    mut weights: List[Float64],
+    mut audit: MvsAudit,
+    n_outputs: Int = 1,
+) raises:
+    """Fill `weights` with tree number `tree_index`'s MVS draw, one per row,
+    and fill `audit` with what the draw did.
+
+    `weights` is resized rather than appended to, so a round loop can hand the
+    same buffer back every tree and allocate once for the whole fit.
+
+    A disabled bundle and `subsample == 1.0` both fill exactly 1.0 and take no
+    draw at all, which is CatBoost's `if (SampleRate == 1.0f) Fill(..., 1.0f)`
+    early return.
+
+    `auto_lambda` is what `resolve_reg` uses when the user left `mvs_reg`
+    unset; a caller computes it with `mvs_auto_lambda_from_leaf_values` if any
+    tree exists and `mvs_auto_lambda_from_gradients` otherwise, which is the
+    branch `TMvsSampler::GetLambda` takes. It is a parameter rather than
+    something derived in here because the leaf-value branch needs the previous
+    tree, which this module cannot see.
+
+    **Determinism.** Every row's keep decision is `uniform(stream + row)` for a
+    stream derived from `(seed, tree_index)` alone, so it is independent of
+    worker count, of buffer length, and of how many draws any other row took.
+    The threshold is solved per block of `MVS_BLOCK_SIZE`, a constant, over
+    candidates written in row order, with a partition whose permutation is a
+    fixed function of that order -- so it too is independent of worker count.
+    The blocks may be computed in any order or in parallel and the buffer is
+    identical.
+    """
+    params.validate()
+    if n_rows < 0:
+        raise Error("n_rows must be nonnegative")
+    if tree_index < 0:
+        raise Error("tree_index must be nonnegative")
+    if n_outputs < 1:
+        raise Error("n_outputs must be positive")
+    weights.clear()
+    weights.resize(n_rows, 1.0)
+    audit = MvsAudit.empty()
+    if not params.samples_rows():
+        audit.rows_kept = n_rows
+        audit.rows_kept_certainly = n_rows
+        return
+    if len(gradients) < n_rows * n_outputs:
+        raise Error("gradient buffer is shorter than n_rows * n_outputs")
+
+    var lam = params.resolve_reg(auto_lambda)
+    if not (lam >= 0.0):
+        raise Error("mvs lambda must be nonnegative and not NaN")
+    var stream = _mvs_stream(params.seed, tree_index)
+
+    var block_start = 0
+    while block_start < n_rows:
+        var block_end = block_start + MVS_BLOCK_SIZE
+        if block_end > n_rows:
+            block_end = n_rows
+        var block_size = block_end - block_start
+        audit.blocks += 1
+
+        # `thresholdCandidates[idx] = sqrt(lambda + sum_k der^2)`, in row order.
+        var candidates = List[Float64](capacity=block_size)
+        for r in range(block_start, block_end):
+            candidates.append(
+                sqrt(_row_magnitude_squared(gradients, r, n_outputs) + lam)
+            )
+
+        var target = params.subsample * Float64(block_size)
+        var mu = _mvs_threshold(candidates, 0, block_size, target)
+
+        if not _mvs_threshold_is_usable(mu):
+            # OURS: no information to sample on, so keep the block whole. This
+            # is the limit of the method as mu falls to zero (every p rises to
+            # 1), and it is the only choice that cannot produce a silently
+            # empty tree. CatBoost drops every row here instead.
+            audit.blocks_guarded += 1
+            for r in range(block_start, block_end):
+                weights[r] = 1.0
+            audit.rows_kept += block_size
+            audit.rows_kept_certainly += block_size
+            block_start = block_end
+            continue
+
+        for r in range(block_start, block_end):
+            var g = sqrt(_row_magnitude_squared(gradients, r, n_outputs) + lam)
+            var p: Float64
+            if g > mu:
+                p = 1.0
+            else:
+                p = g / mu
+            if p > _MVS_PROBABILITY_EPS:
+                if p >= 1.0:
+                    # Certain keep. CatBoost still burns a draw here; ours does
+                    # not need to, because the stream is keyed by row and skipping
+                    # a row's draw cannot shift any other row's.
+                    weights[r] = 1.0
+                    audit.rows_kept += 1
+                    audit.rows_kept_certainly += 1
+                elif uniform(stream + UInt64(r)) < p:
+                    weights[r] = 1.0 / p
+                    audit.rows_kept += 1
+                else:
+                    weights[r] = 0.0
+            else:
+                weights[r] = 0.0
+        block_start = block_end
+
+
+def refresh_mvs_bootstrap(
+    mut weights: List[Float64],
+    mut audit: MvsAudit,
+    params: MvsBootstrapParams,
+    gradients: List[Float64],
+    base_weight: List[Float64],
+    n_rows: Int,
+    tree_index: Int,
+    auto_lambda: Float64,
+    n_outputs: Int = 1,
+) raises:
+    """The round's effective per-row weight: the tree's MVS draw times the
+    user's own `sample_weight`.
+
+    This is CatBoost's `CalcWeightedData` tail, `SampleWeights[i] *=
+    learnWeights[i]`, and it is why a sampled fit is a *weighted* fit as far as
+    everything downstream is concerned. An empty `base_weight` is the
+    "unweighted" convention used everywhere else here and leaves the draw
+    alone.
+
+    A disabled bundle leaves `weights` empty rather than filling it with ones,
+    exactly as `refresh_bayesian_bootstrap` does, so a caller can pass it
+    straight through as the fit's `sample_weight` and an unsampled, unweighted
+    fit stays exactly unweighted -- no vector of 1.0s that would make
+    `boosting.round_has_constant_hessian` refuse a fit it should admit, and no
+    bits moved on the default path.
+    """
+    if len(base_weight) != 0 and len(base_weight) != n_rows:
+        raise Error("sample_weight length must match the row count")
+    if not params.enabled:
+        params.validate()
+        audit = MvsAudit.empty()
+        weights.clear()
+        if len(base_weight) != 0:
+            weights.resize(n_rows, 1.0)
+            for r in range(n_rows):
+                weights[r] = base_weight[r]
+        return
+    mvs_bootstrap_weights(
+        params,
+        gradients,
+        n_rows,
+        tree_index,
+        auto_lambda,
+        weights,
+        audit,
+        n_outputs,
+    )
+    if len(base_weight) != 0:
+        for r in range(n_rows):
+            weights[r] = weights[r] * base_weight[r]
+
+
+def mvs_kept_rows(weights: List[Float64]) raises -> List[Int]:
+    """The ascending, duplicate-free row set a set of MVS weights implies.
+
+    A zero weight is a *dropped* row, not merely a down-weighted one: CatBoost
+    sets `performRandomChoice = false` for MVS alone and
+    `TCalcScoreFold::Sample` then calls `SetControlNoZeroWeighted`, which
+    compacts the zero-weight rows out of the score fold so the split search
+    never visits them. This is the mojotrees statement of that, in the ascending
+    row-set form the rest of this module and the device path already take
+    (`check_row_set`, `contiguous_ranges`, `row_mask`).
+
+    **No timing claim attaches to this.** A sampler that visits fewer rows
+    looks faster for reasons that have nothing to do with whether the sampler
+    is any good, and this lane measured nothing.
+    """
+    var rows = List[Int]()
+    for r in range(len(weights)):
+        if weights[r] != 0.0:
+            rows.append(r)
+    return rows^
 
 
 def canonical_bootstrap_type(value: String) raises -> String:
