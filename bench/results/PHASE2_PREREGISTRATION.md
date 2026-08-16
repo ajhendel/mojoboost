@@ -557,3 +557,47 @@ between replays **nothing may vary but device memory**.
   `enqueue_*` calls record into the graph, so existing launch code would migrate
   unmodified -- and host-visible waits raise inside it by design, which is the
   discipline `CLEANSHEET_GPU.md` already imposes.
+
+
+---
+
+## The 458 microsecond constant is superseded by 202, everywhere this file used it
+
+**Measured** 2026-08-16 by the readback probe, arms interleaved in one process: a
+host trip on the shipping transport (`pinned_pair_sync`, four command buffers,
+one wait) costs **202.14 microseconds**. The bare command-buffer completion floor
+is **10.59**.
+
+The 458 figure was **derived** from the depthwise A/B and every estimate in this
+document used it. Rescale as follows, and note they all move the same way -- the
+control plane was worth **less than half** what this file assumed:
+
+| claim as registered | at 458 us | **at 202 us** |
+|---|---|---|
+| 200 trips per fit | 0.092 s | **0.040 s** |
+| the three remaining copies, ~100 per fit | 0.046 s | **0.020 s** |
+| trip-count's target, 200 down to ~10 | 0.087 s | **0.038 s** |
+
+Nothing here reopens: the control-plane chapter closes **harder**, not looser,
+and the 0.016-second collapse null is explained better by the new mechanism than
+by the old one. A pinned `HostBuffer` copy is **asynchronous**, so the thirteen
+copies removed had never waited at all -- which is a proof of zero rather than a
+measurement of nearly-zero.
+
+## Two builds that follow from the probe, both category (1)
+
+**Ship `plain_one` as the readback path.** 202 to 125 microseconds per trip,
+**38 percent**, and it is strictly-less-work-and-exact: the same six words, one
+packed buffer instead of two, a plain heap destination instead of two pinned
+ones, two command buffers instead of four. Gated on node identity and on the
+pinned-copy trap check -- the destination must be **provably not pinned** and the
+wait retained, because a pinned copy read without a `synchronize` returned 64 of
+64 stale words behind a slow kernel.
+
+**Fuse adjacent launches.** Queue depth is 64, unraisable, and enqueue cost is
+flat at 6-7 microseconds through 64 launches and rises to 14-17 beyond -- a knee
+exactly where a 64-deep queue predicts. The resident plane emits on the order of
+**306 command buffers between waits**, so it is well past the knee for most of
+every tree. That makes **command buffers per round** a measured lever rather than
+a suspected one, and fusing kernels that are already back-to-back with no host
+decision between them removes work without moving any.
