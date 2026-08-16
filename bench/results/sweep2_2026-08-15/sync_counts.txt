@@ -1,0 +1,6 @@
+=== gpu at 1M ===
+phase_profile begin label=train_gpu scope=fit mode=async trees=100 nodes=6100 root_rows=1000000 dataset_rows=1000000
+phase_profile totals attributed_ns=3717470000 wall_ns=3725875000 unattributed_ns=8405000 unattributed_pct=0.226 dispatches=24400 syncs=3100 calls=15400
+=== gpu-depth at 1M ===
+phase_profile begin label=train_gpu scope=fit mode=async trees=100 nodes=6100 root_rows=1000000 dataset_rows=1000000
+phase_profile totals attributed_ns=2573347000 wall_ns=2580556000 unattributed_ns=7209000 unattributed_pct=0.279 dispatches=19400 syncs=600 calls=10400

@@ -176,3 +176,59 @@ plan: the histogram kernel is not a phase two behind the control plane, it is
 **the entire margin**. A GPU whose per-row cost equals a laptop CPU's is leaving
 a large multiple on the table by the layout arithmetic, and closing the control
 plane alone reaches parity and stops.
+
+## Addendum 2: what the intercept is made of, measured rather than assumed
+
+The fitted intercept above (about 1.42 seconds) was attributed to per-split host
+round trips on the strength of the Metal timeline. That was an inference. It has
+now been measured directly, with the phase profile's counters, which are exact
+counts rather than timings and so are unaffected by machine load.
+
+At 1,000,000 rows by 50 features, 100 trees:
+
+| arm | syncs | syncs per tree | dispatches | wall |
+|---|---|---|---|---|
+| GPU leaf-wise | 3,100 | 31 | 24,400 | 3.726 s |
+| GPU depth-wise | 600 | 6 | 19,400 | 2.581 s |
+
+**Depth-wise removes 2,500 synchronizations and buys 1.145 seconds**, which is
+**458 microseconds per synchronization**. That is independently close to the
+606 microsecond median blocking readback the Metal System Trace measured by a
+completely different method.
+
+It also removes 5,000 dispatches, but at the measured 12.62 microseconds per
+enqueue those are worth about 63 milliseconds, roughly five percent of the
+saving. **The synchronizations are the cost; the dispatches are not.**
+
+The arithmetic then closes from both ends. 3,100 synchronizations at 458
+microseconds is **1.42 seconds**, which is the intercept fitted from three
+wall-clock points in the table at the top of this file. A curve fit over
+wall clocks and a counter multiplied by a per-event cost agree to two decimal
+places, having shared no inputs.
+
+### One consequence, and it is more optimistic than the earlier reading
+
+An earlier analysis held that removing the excess fixed cost lands one million
+rows at parity, on the reasoning that ours is 1.42 seconds against LightGBM's
+0.44 and the difference is about one second. That treats LightGBM's intercept as
+a floor for ours, and nothing makes it one.
+
+A control plane at one synchronization per tree would pay 100 of them, or about
+0.046 seconds, rather than 1.42. That is an **estimate** built on a measured
+per-sync cost and a design's static count: 3.756 minus 1.374 is roughly **2.38
+seconds against LightGBM's 2.767**, which is a win of about 1.16x rather than
+parity.
+
+Two things temper it, and both are real. `docs/GPU_PORTABILITY.md` section 6
+establishes that `enqueue_copy` drains the queue in **both** directions on Metal,
+so the per-round gradient upload is itself a synchronization that a
+"one wait per tree" design does not count. And the resident plane does not
+currently run at all. So the honest statement is that the target is a win rather
+than parity, and that nobody has yet paid for it.
+
+### What this does not change
+
+The slope finding stands untouched, and it is still the larger problem. Our
+marginal cost per row equals LightGBM's on ten CPU cores whatever happens to the
+intercept. Removing every synchronization leaves that entirely intact, so the
+histogram kernel remains where the multiple has to come from.
