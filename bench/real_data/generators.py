@@ -243,6 +243,119 @@ def categorical_missing(
     }
 
 
+def high_cardinality_categorical(
+    n_rows=1_000_000,
+    n_numeric=10,
+    seed=1907,
+    cardinalities=(8, 64, 1_000, 20_000, 200_000),
+    positive_rate=0.10,
+    zipf_exponent=3.0,
+    combination=(0, 1),
+):
+    """Binary labels over a ladder of categorical cardinalities, plus a
+    two-column interaction no single-column split can see.
+
+    This is the shape an ordered target statistic exists for, and every
+    number in `cardinalities` is chosen against a named rule rather than
+    picked for size. `scenarios.HIGH_CARDINALITY_LEVELS` carries the
+    argument per tier; the short form is that the five columns sit at, in
+    order, 8 levels (above `max_cat_to_onehot`, below everything else, the
+    control), 64 (the first cardinality at which `max_cat_threshold`'s
+    32-category prefix cap binds), and then three columns pinned at 800, 40
+    and 4 **rows per level** rather than at a level count, because rows per
+    level is the quantity every rule in this area is written against:
+    `min_data_per_group` is 100, `cat_smooth` is a count-weighted prior, and
+    a target statistic is only a statistic while a level has rows.
+
+    The last column is drawn from a power law rather than uniformly, and
+    that is not decoration. A uniform column with one level per four rows is
+    the case the reviewer's objection is about: it costs memory and
+    exercises nothing, because no level is ever estimable. A power-law
+    column has an estimable head and a singleton tail at the same time,
+    which is what a user id, a URL hash or an advertiser key actually looks
+    like, and it is the only draw under which "the unordered target
+    statistic on this level IS the label" and "this level has enough rows to
+    mean something" are both true somewhere in one column. Same inverse
+    transform `sparse_highdim` uses on its column index, for the same
+    reason.
+
+    The interaction is the second half. `combination` names two columns
+    whose joint effect is drawn once and then DOUBLE-CENTERED, so both
+    marginals are exactly zero and neither column carries any of it on its
+    own. A tree reaches it by stacking two set splits; a CTR feature
+    combination reaches it in one feature. Without a term of this shape a
+    combination feature has nothing to find and measuring one would be
+    measuring nothing.
+
+    No missing values, on purpose. `categorical_missing` owns that axis, and
+    two scenarios that differ in two ways cannot attribute a difference to
+    either.
+    """
+    cards = [int(c) for c in cardinalities]
+    n_categorical = len(cards)
+
+    numeric = _stream(seed, 1, n_rows * n_numeric).reshape(n_numeric, n_rows).T.copy()
+    codes = np.empty((n_rows, n_categorical), dtype=np.float64)
+    raw_codes = []
+    effect = np.zeros(n_rows)
+    # Signal share per column, descending with rarity. The two rarest
+    # columns are held down deliberately: their per-level effects are
+    # unlearnable in the tail BY CONSTRUCTION, so a large weight there does
+    # not make the scenario harder in an interesting way, it just adds
+    # irreducible noise and depresses every engine's metric equally.
+    weights = (1.0, 1.0, 0.9, 0.6, 0.35)
+    for j, card in enumerate(cards):
+        u = _stream(seed, 100 + j, n_rows)
+        if j == n_categorical - 1:
+            raw = (np.power(u, zipf_exponent) * card).astype(np.int64)
+        else:
+            raw = (u * card).astype(np.int64)
+        np.clip(raw, 0, card - 1, out=raw)
+        codes[:, j] = raw.astype(np.float64)
+        raw_codes.append(raw)
+        levels = _normal(seed, 200 + 2 * j, card)
+        effect += levels[raw] * (weights[j] if j < len(weights) else 0.35)
+
+    a, b = int(combination[0]), int(combination[1])
+    joint = _normal(seed, 400, cards[a] * cards[b]).reshape(cards[a], cards[b])
+    # Double-centering, written out rather than done in two steps: this is
+    # the form that leaves BOTH marginals exactly zero. Subtracting row
+    # means and then column means leaves the row means nonzero again.
+    joint = (
+        joint
+        - joint.mean(axis=1, keepdims=True)
+        - joint.mean(axis=0, keepdims=True)
+        + joint.mean()
+    )
+    effect += 0.8 * joint[raw_codes[a], raw_codes[b]]
+
+    latent = (
+        2.0 * numeric[:, 0]
+        + 1.5 * numeric[:, 1] * numeric[:, 2]
+        + effect
+    )
+    latent = latent - latent.mean()
+    # The intercept is solved for the requested rate rather than guessed,
+    # exactly as in `imbalanced_binary`, so the positive rate is a property
+    # of the scenario and not of the cardinality ladder above it.
+    lo, hi = -30.0, 30.0
+    for _ in range(60):
+        mid = 0.5 * (lo + hi)
+        if _logistic(latent + mid).mean() < positive_rate:
+            lo = mid
+        else:
+            hi = mid
+    p = _logistic(latent + 0.5 * (lo + hi))
+    y = (_stream(seed, 21, n_rows) < p).astype(np.float64)
+
+    x = np.hstack([numeric, codes])
+    return {
+        "X": np.ascontiguousarray(x),
+        "y": y,
+        "categorical_feature": list(range(n_numeric, n_numeric + n_categorical)),
+    }
+
+
 def sparse_highdim(
     n_rows=100_000, n_features=50_000, seed=1906, nnz_per_row=60
 ):
@@ -331,4 +444,11 @@ GENERATORS = {
     "ranking": ranking,
     "categorical_missing": categorical_missing,
     "sparse_highdim": sparse_highdim,
+    "high_cardinality_categorical": high_cardinality_categorical,
 }
+# `ordered_boosting_small` has no entry and needs none: it names
+# `dense_regression` as its generator on purpose. The axis under test there
+# is CatBoost's boosting SCHEME at a chosen row count, not the data, so the
+# data should be the one already understood rather than a seventh recipe
+# nobody has read. It passes its own `seed` so the two scenarios are not the
+# same rows at a shared size.

@@ -822,6 +822,62 @@ def check_generators_are_pure():
             )
 
 
+def check_pending_scenarios():
+    """A scenario that is specified and not built must stay both.
+
+    `scenarios.TEXT_SCENARIO_PENDING` is a written design for a shape whose
+    input contract does not exist: the harness hands every engine one
+    float64 matrix and a text column is not one, nobody has decided who
+    tokenizes, and `worker.py`'s data digest cannot hash a numpy object
+    array of strings. The design is in the tree so the lane that lands the
+    contract has a target rather than a blank page.
+
+    Two ways that goes wrong and both are checked here rather than left to
+    review. It gets merged into `SCENARIOS` while the blockers are open, and
+    then either fails `check_registry` on a missing generator, or -- if
+    somebody adds a stub generator to make the self-check green -- runs and
+    measures something nobody specified. Or it quietly loses the fields that
+    say it is pending, and a reader six weeks from now cannot tell a design
+    from a scenario. So: it must not be registered, it must name what it
+    waits on, and it must not name a generator that exists, because the day
+    one does exist is the day this dict is supposed to become a real entry
+    through a commit that also writes its thresholds and its support
+    decisions.
+    """
+    import generators
+    import scenarios
+
+    pending = scenarios.TEXT_SCENARIO_PENDING
+    scenario_id = pending["spec"].get("id", pending["id"])
+    check(
+        pending["id"] not in scenarios.SCENARIOS
+        and scenario_id not in scenarios.SCENARIOS,
+        f"{pending['id']} is registered in SCENARIOS while it is still "
+        f"marked {pending['status']!r}. Registering it is a commit that also "
+        "writes its generator, its thresholds.json entry and its per-engine "
+        "support decision; it is not a one-line move",
+    )
+    check(
+        bool(pending.get("blocked_on")),
+        f"{pending['id']} is pending and does not say what it waits on",
+    )
+    check(
+        pending["spec"].get("generator") not in generators.GENERATORS,
+        f"{pending['id']} names a generator that now EXISTS. That is good "
+        "news and it is not a self-check failure to leave alone: the "
+        "scenario is ready to be registered, with a thresholds.json entry "
+        "and a support decision per engine, and this check is the reminder",
+    )
+    check(
+        pending["id"] not in json.load(
+            open(os.path.join(HERE, "thresholds.json"))
+        )["scenarios"],
+        f"{pending['id']} has a thresholds.json entry and is not a scenario. "
+        "A gate written before anybody knows what the implementations "
+        "differ by is a number chosen to pass",
+    )
+
+
 def check_outputs():
     """The CSV projection must not name a field the flattener cannot fill."""
     import run
@@ -846,6 +902,7 @@ def main():
         check_no_row_count_injection()
         check_metrics()
         check_generators_are_pure()
+        check_pending_scenarios()
         check_outputs()
 
     if FAILURES:

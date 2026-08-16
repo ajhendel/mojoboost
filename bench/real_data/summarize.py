@@ -455,6 +455,11 @@ def build_datasets(ok_records):
             "categorical_feature",
             "category_vocab_sha256",
             "positive_rate",
+            # Set by worker.py for a scenario that declares no real dataset
+            # at all, which is a different thing from one whose real dataset
+            # was missing. `fallback_reason` is null in that case on purpose;
+            # this is what says why.
+            "no_real_variant",
         ):
             if optional in data:
                 entry[optional] = data[optional]

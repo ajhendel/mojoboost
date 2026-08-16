@@ -95,7 +95,7 @@ def build_data(spec, variant, allow_unpinned):
                 raise
             fallback = str(exc)
     else:
-        fallback = None if variant == "synthetic" else "no real dataset for this scenario"
+        fallback = None
 
     generator = generators.GENERATORS[spec["generator"]]
     data = generator(**spec["generator_kwargs"])
@@ -108,8 +108,23 @@ def build_data(spec, variant, allow_unpinned):
         "generator_kwargs": spec["generator_kwargs"],
         "task": spec["task"],
         "split": {"kind": "hash", "train_fraction": 0.8, "seed": 1900},
+        # A fallback is a real dataset that was WANTED and was not there, and
+        # `summarize.py` raises a `generator_fallback` flag on it reading "a
+        # scenario that names a real dataset ran on the generator instead".
+        # A scenario with `dataset=None` never wanted one, so filling this in
+        # for it would put a true-sounding and false sentence in every
+        # summary. Until 2026-08-16 every scenario named a dataset and the
+        # two cases could not be told apart; `high_cardinality_categorical`
+        # and `ordered_boosting_small` are the first that have none, so the
+        # distinction is recorded in its own field instead.
         "fallback_reason": fallback,
     }
+    if not dataset_id:
+        meta["no_real_variant"] = (
+            "this scenario declares no real dataset, so the generator is not "
+            "a fallback, it is the only variant. A record from it is a "
+            "synthetic-data result and must not be quoted as a real-data one"
+        )
     for key in ("categorical_feature", "n_classes", "sparse"):
         if key in train:
             meta[key] = train[key] if key != "sparse" else True
