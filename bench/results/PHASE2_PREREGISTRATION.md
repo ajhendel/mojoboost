@@ -233,8 +233,18 @@ assumption.
 
 **The conditions under which it is re-tested, both required:**
 
-1. the device-owned tree plane is the default GPU plane, and
-2. the CPU backend's **serial** performance is within 1.2x of LightGBM's
+1. the device-owned tree plane is the default GPU plane,
+2. the CPU backend's **serial** performance is within 1.2x of LightGBM's, and
+3. a CPU fixed-point option exists at all -- **deferred, and not this round**
+
+Condition 3 was added on 2026-08-16 when the numeric policy settled: the CPU
+default precision is now LightGBM's (Float32 per-row gradients, Float64 histogram
+sums, no count plane), and Int32 fixed-point cells on the CPU are **opt-in and
+deferred**. A hybrid scheduler hands leaves between two backends, so it needs the
+two to agree numerically or to have a stated conversion; with the CPU on Float64
+sums and the GPU on Int32 fixed point, "the same leaf either way" is a claim
+neither backend currently supports. Until the CPU option exists, the hybrid
+cannot be re-tested honestly whatever the timings say.
 
 The second is the one that matters. The scheduler was built when our CPU was far
 enough behind that a CPU-assisted leaf was nearly always a bad trade. If the
@@ -317,3 +327,36 @@ none of these fields -- so the **existing** `row-unroll-on` / `row-unroll-off`
 pair was two identical runs there. The unroll result reported above was not taken
 in that mode, so it stands; but the pair is now refused in it rather than
 silently degenerate.
+
+
+---
+
+## Every published number names its comparator configuration
+
+Settled 2026-08-16 and applied retroactively. A figure quoted without the
+configuration it was taken under is the error this project made four separate
+times in two days, so the rule is now explicit rather than implied by the
+protocol.
+
+**Two configurations exist and they are not comparable:**
+
+- **pinned / aligned** -- `scenarios.LIGHTGBM_ALIGNMENT` forces LightGBM to
+  `bin_construct_sample_cnt` = the full row count, `min_data_in_bin = 1`,
+  `feature_pre_filter = False`, `enable_bundle = False`, `force_row_wise = True`.
+  Every number this repository has recorded to date is in this configuration.
+- **stock** -- LightGBM's own defaults, which is what an outside reader gets.
+
+**The specific figures that must carry the label**, because they change most:
+
+- the binning advantage, **6.3x at 1M, 5.8x at 250k, a dead heat at 50k**, is a
+  **pinned-configuration** figure. LightGBM at stock bins from a fixed 200,000
+  row subsample however large the data is, so its binning cost stops growing
+  above that; the pinned run forced it to bin every row. The stock figure is
+  expected near parity and has not been taken.
+- every **training** margin against LightGBM is `force_row_wise`, which is
+  LightGBM's *faster* builder at 1M x 50 by a consistent 6.9 percent, so that pin
+  is conservative with respect to our margin rather than flattering.
+
+Two baselines get recorded rather than one: **pre-stock**, which is the reference
+for "did a precision change cost anything", and **post-stock**, which is the
+user-facing number.
