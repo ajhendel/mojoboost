@@ -156,6 +156,31 @@ it is to Float32 precision on the float planes and exact on the integer planes,
 and `thresholds.json` prices that separately under `defaults.device_agreement`
 rather than folding it into the determinism gate.
 
+### 1.5 Per-row derivatives are Float32, and two consequences follow
+
+The CPU path stores per-row gradients and hessians at **Float32** precision,
+matching LightGBM's `score_t`. Scores, leaf values, gains and histogram cells
+stay Float64. The narrowing is applied at the objective and **again at every
+read site**, which makes it idempotent and is what keeps the gathered and
+ungathered accumulation paths adding identical Float64s.
+
+Two properties follow that a reader should not have to discover from a test.
+
+**Sample-weight scaling is exact only to Float32 precision.** The code forms
+`score_t(g * w)`; anything computing `score_t(g) * w` instead gets a different
+number, by up to two Float32 ulps. So doubling a sample weight does not
+exactly double its gradient. This is a property of the product and not a
+loosened test: `tests/test_objectives.mojo` asserts the identity to about ten
+Float32 ulps because that is the bound the arithmetic actually supports.
+
+**Any path that reads a derivative must narrow it too, or it stops agreeing
+with the others.** This is not redundant with narrowing at the source: GOSS
+reweighting and sample weights multiply a stored derivative, and the product
+is a Float64 that generally is not Float32-representable. `histogram_sparse`
+and the row-major kernels both had to be corrected for exactly this, and both
+failures presented as a builder disagreeing with the dense reference rather
+than as anything that looked like a precision problem.
+
 ## 2. What contraction is, and why it is the hazard
 
 An optimizer is allowed, under a relaxed floating point model, to replace
