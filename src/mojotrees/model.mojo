@@ -386,14 +386,23 @@ def fit[
     categories route right (see categorical.mojo).
 
     `bootstrap` is CatBoost's `bootstrap_type` (see sampling.mojo): MVS, which
-    is CatBoost's real CPU default, or the Bayesian bootstrap. It is the one
-    argument here that is honored on ONE backend only. `boosting.train` draws
-    it once per round; `train_gpu` takes no bundle at all and its round loop
-    never calls `sampling.bootstrap_round`, so an enabled bootstrap that
-    resolves to the GPU raises rather than training an unsampled model and
-    reporting a sampled one. `device` is resolved before the refusal fires, so
-    `device='auto'` on a shape the policy sends to the accelerator raises too;
-    that is the honest answer, not an oversight."""
+    is CatBoost's real CPU default, or the Bayesian bootstrap. **It is honored
+    on both backends**, which it was not until 2026-08-16: `train_gpu` took no
+    bundle at all and this function refused an enabled bootstrap that resolved
+    to the GPU, rather than training an unsampled model and reporting a
+    sampled one. It now takes one and its round loop draws it.
+
+    The two samplers reach the device by different routes and it is worth
+    knowing which, because one of them costs a stage. The Bayesian bootstrap
+    reads no gradient and drops no row, so its per-tree draw goes straight
+    into the device objective state's weight plane and the device round is
+    unaffected. MVS solves its keep threshold from the round's per-row
+    gradient magnitudes and then drops rows, and the device round holds
+    neither, so an MVS fit resolves to the host-gradient arm -- the
+    derivatives are computed and sampled on the host and every tree is still
+    grown on the device. That is a resolution and not a downgrade of the
+    sampler: the draw is the same draw, at the same seed, on the same rows the
+    CPU trainer would have used."""
     if params.linear.is_active():
         # The binned-only trainers under this entry point do not carry the
         # raw matrix; the metric path does. Refusing is the rule for a
@@ -441,19 +450,13 @@ def fit[
     var data = mapper.transform(features, n_rows)
     var booster: Booster
     if backend == GPU_DEVICE:
-        # `train_gpu` has no `bootstrap` argument and its round loop does not
-        # call `sampling.bootstrap_round`, so the draw would never be taken.
-        # Naming the GPU beats `check_bootstrap_honored`'s generic message
-        # here, because the caller may not have chosen the GPU at all --
-        # `resolve_device` may have chosen it for them from `AUTO_DEVICE`.
-        if bootstrap.enabled():
-            raise Error(
-                "bootstrap_type is not implemented on the GPU: train_gpu"
-                " takes no bootstrap bundle and its round loop never draws"
-                " one, so the fit would be unsampled. This fit resolved to"
-                " the GPU (device='gpu', or device='auto' on a shape the"
-                " policy sends there); set device='cpu' or drop bootstrap_type"
-            )
+        # The bundle now crosses instead of being refused here. `train_gpu`
+        # draws it per round through `sampling.bootstrap_round` (host
+        # gradients) or through the device weight plane (Bayesian), and
+        # refuses by name the one combination it cannot draw -- an explicit
+        # `objective_source=OBJECTIVE_SOURCE_DEVICE` beside MVS. Passed by
+        # keyword because it is appended last on that signature, so every
+        # positional caller of `train_gpu` keeps working.
         booster = train_gpu(
             data,
             target,
@@ -463,6 +466,7 @@ def fit[
             alpha,
             bagging,
             goss,
+            bootstrap=bootstrap,
         )
     else:
         booster = train(

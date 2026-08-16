@@ -310,6 +310,8 @@ from .boosting import (
     _refuse_leaf_estimation,
     _renew_leaf_values,
     _round_random_score_scale,
+    _tree_leaf_values,
+    _check_bootstrap,
     _check_goss,
     _fill_softmax_grad_hess,
     _multiclass_goss_select,
@@ -323,6 +325,7 @@ from .efb import check_bundling_honored
 from .goss import GossParams, GossSelection, apply_goss_scaling, goss_round
 from .gpu_frontier import subtraction_builds_left
 from .gpu_fused_round import (
+    ROUND_MVS_HOST_MAGNITUDES,
     ROUND_OK,
     GpuTreeRouter,
     round_eligibility,
@@ -413,7 +416,14 @@ from .monotone import (
     monotone_sign,
 )
 from .sampling import (
+    BootstrapParams,
+    ClassBaggingParams,
+    MvsAudit,
+    bootstrap_round,
     check_feature_fractions,
+    mvs_auto_lambda_from_gradients,
+    mvs_auto_lambda_from_leaf_values,
+    refresh_bayesian_bootstrap,
     select_node_features,
     select_split_features,
     select_tree_features,
@@ -740,6 +750,7 @@ def device_gradients(
     bagging: BaggingParams,
     goss: GossParams,
     routes_all_rows: Bool = False,
+    bootstrap: BootstrapParams = BootstrapParams.disabled(),
 ) raises -> Bool:
     """Whether this run generates its gradients on the device.
 
@@ -763,6 +774,18 @@ def device_gradients(
     `|grad * hess|`, and ranking Float32 device scores can put a different
     row across the threshold, so `allow_device_ranking` is left False and
     both backends keep sampling identically.
+
+    `bootstrap` is CatBoost's `bootstrap_type`, and only its MVS arm reaches
+    the answer. MVS solves its keep threshold from this round's per-row
+    gradient magnitudes and then drops rows, which the device round has
+    neither the magnitudes nor a compaction step for, so it is
+    `ROUND_MVS_HOST_MAGNITUDES` there -- and under AUTO that resolves to the
+    host-gradient arm, where `sampling.bootstrap_round` draws it exactly and
+    the trees are still grown on the device. **So MVS is honored on a GPU fit
+    rather than dropped or refused**; what it costs is the device derivative
+    kernel, not the sampler. The Bayesian bootstrap is not consulted here at
+    all: it reads no gradient, drops no row, and the device round serves it
+    through `GpuObjectiveState`'s weight plane.
     """
     var s = resolve_objective_source(source)
     if s == OBJECTIVE_SOURCE_HOST:
@@ -774,6 +797,7 @@ def device_gradients(
         goss.enabled,
         False,
         routes_all_rows,
+        bootstrap.mvs.enabled,
     )
     if code == ROUND_OK:
         return True
@@ -785,6 +809,88 @@ def device_gradients(
             " gradients and grows the trees on the device exactly as before",
         )
     return False
+
+
+def gpu_bootstrap_resolution(
+    objective: Int,
+    objective_source: Int,
+    bagging: BaggingParams,
+    goss: GossParams,
+    bootstrap: BootstrapParams,
+    routes_all_rows: Bool = False,
+) raises -> String:
+    """One `key=value` line saying what `bootstrap_type` resolved to on this
+    backend and which round arm carries it. The `describe_scan` /
+    `DeviceDecision.serialize` shape, and here for the same reason: a fit whose
+    resolution cannot be read off a record is a fit nobody can compare.
+
+    **Why this exists as a function rather than as a comment.** A GPU fit that
+    drew MVS and a GPU fit that did not are different models, and until
+    2026-08-16 the second was the only kind there was -- `train_gpu` took no
+    bundle and `model.fit` refused the combination outright. That is now fixed,
+    so the thing left to record is narrower and still real: **an MVS fit
+    computes its derivatives on the host in Float64 and a Bayesian or
+    unbootstrapped fit may compute them on the device in Float32**, and those
+    two are not bit-identical fits. A reader holding two result rows has to be
+    able to see which one they are looking at, and this is the string that
+    tells them.
+
+    **It is not a per-fit record, because this repository does not have one.**
+    Nothing a fit returns or serializes carries what the fit resolved to:
+    `Booster` holds the trees, the base score, the learning rate, the objective
+    and the monotone constraints, and `serialize.mojo` holds the ensemble and
+    not the run that made it. `PhaseProfile` is fit-scoped but is timing, and
+    `device_policy.DeviceDecision` is built per fit inside `resolve_device` and
+    discarded except for the one integer. So this is written to be usable from
+    either side of that gap: it takes configuration and no fitted object, so a
+    wire that builds a comparison row can call it without running anything, and
+    `_train_gpu_rounds` prints it once per fit on the trainer's existing
+    `MOJOTREES_GPU_SPLIT_TRACE` channel. **Building the record the line belongs
+    in is not this lane's, and is worth doing.**
+
+    The answer is derived from `device_gradients` rather than restated, so it
+    cannot drift from what the trainer actually did: same call, same arguments,
+    same blockers.
+    """
+    return gpu_bootstrap_resolution(
+        bootstrap,
+        device_gradients(
+            objective,
+            1,
+            objective_source,
+            bagging,
+            goss,
+            routes_all_rows,
+            bootstrap,
+        ),
+    )
+
+
+def gpu_bootstrap_resolution(
+    bootstrap: BootstrapParams, device_grads: Bool
+) raises -> String:
+    """The same line, for a caller that has already resolved which arm it is
+    on. `_train_gpu_rounds` takes this one: it is handed `device_grads` and
+    never sees `objective_source`, and re-deriving the answer from a second
+    set of arguments is how the record and the run come to disagree."""
+    if not bootstrap.enabled():
+        return String("bootstrap_type=no honored=yes plane=none")
+    var kind = String("mvs") if bootstrap.mvs.enabled else String("bayesian")
+    var plane = String("host-gradients")
+    if device_grads:
+        plane = String("device-weight-plane")
+    if bootstrap.mvs.enabled:
+        # The one resolution a reader must be able to see, spelled out rather
+        # than left to be inferred from `plane`.
+        return String(
+            "bootstrap_type=",
+            kind,
+            " honored=yes plane=",
+            plane,
+            " derivatives=host-float64 reason=",
+            round_eligibility_reason(ROUND_MVS_HOST_MAGNITUDES),
+        )
+    return String("bootstrap_type=", kind, " honored=yes plane=", plane)
 
 
 struct _GpuRecordLeafState(Movable):
@@ -1590,6 +1696,51 @@ def _grow_tree_gpu_device_search(
     # Hoisted out of the per-tree loop: see `GpuSplitSearcherCache` for why
     # a searcher may be reused and what the reset restores.
     cache.reset_for_tree(builder, params, tree_features, signs)
+    # ---- CatBoost's `random_strength` on the device searcher --------------
+    #
+    # The one call site. Everything under it already exists and is tested:
+    # `set_random_score` sizes the plane and invalidates every staged record,
+    # `stage_random_score` draws one node's plane host-side in Float64 (the
+    # draw is Marsaglia polar and stays on the host deliberately -- Apple GPUs
+    # have no Float64 and an ulp-level rejection difference would put the two
+    # backends on different draws), `_copy_noise` uploads exactly the records a
+    # launch searches, and the scan kernels add the plane's cell to the
+    # candidate's gain. What was missing was this line and the node ids the
+    # resident loop supplies (`gpu_resident_round.resident_child_node_base`).
+    #
+    # Per tree, not per fit: the standard deviation is CatBoost's `scoreStDev`,
+    # whose last two factors are properties of the ensemble at this iteration,
+    # and the draw is keyed by the tree index. `random_score_stdev()` is
+    # `random_strength * random_score_scale`, and the second factor is written
+    # onto the round loop's own copy of the bundle before growth.
+    #
+    # **Guarded rather than called unconditionally.** At the shipped default
+    # of `random_strength = 0` the product is 0.0, the searcher stays in the
+    # state its constructor left it in, no plane is allocated, and this grower
+    # issues exactly the launches it issued before this line existed. That is
+    # the property to preserve: `set_random_score(0.0, ...)` would also be
+    # correct but would walk `max_records` slots per tree for nothing.
+    #
+    # **NOT REACHED BY ANY FIT TODAY, AND THAT IS DELIBERATE.**
+    # `_check_device_search_supported` above refuses `params.extra.is_active()`
+    # and `random_strength > 0.0` is one of its arms, so this line is dead
+    # until that gate is split into "needs a gain adjustment" and "the device
+    # search cannot express this", which is another session's edit. The order
+    # is not negotiable: the plane is wired first so the gate's removal is
+    # earnable, because a gate that stops declining before the plane is staged
+    # trains every default GPU fit with no split noise while the CPU trains
+    # with it -- no error, no record, two different models under one default.
+    # There is a second link still missing, and it is named here so the gate is
+    # not removed against a half-wired path: no GPU round loop computes
+    # `ExtraTreeParams.random_score_scale`, and `check_scalars` says in so many
+    # words that "the device loops do not compute it and this refusal is
+    # correct for them". Until one does, this product is zero on every fit.
+    if params.extra.random_score_stdev() > 0.0:
+        cache.searchers[0].set_random_score(
+            params.extra.random_score_stdev(),
+            params.extra.random_strength_seed,
+            tree_index,
+        )
     var split_params = GpuSplitParams(
         params.lambda_reg,
         params.lambda_l1,
@@ -3139,6 +3290,7 @@ def _check_train_gpu(
     alpha: Float64,
     bagging: BaggingParams,
     goss: GossParams,
+    bootstrap: BootstrapParams = BootstrapParams.disabled(),
 ) raises:
     """Everything the trainer refuses before a byte reaches the device: the
     same checks, in the same order, that `train` makes. Shared by both
@@ -3150,6 +3302,15 @@ def _check_train_gpu(
     _check_sample_weight(sample_weight, data.n_rows)
     check_bagging(bagging)
     _check_goss(goss, bagging)
+    # The bootstrap's own ranges, the one exclusion between its two samplers,
+    # and the exclusion against the three row samplers mojotrees already had.
+    # `boosting._check_bootstrap` itself rather than a device copy of it: the
+    # rules are properties of the configuration and not of the backend, and a
+    # second list here is a second thing to keep in step. `class_bagging` is
+    # disabled because this trainer has no such parameter to be handed one.
+    _check_bootstrap(
+        bootstrap, bagging, goss, ClassBaggingParams.disabled(), objective
+    )
     params.tree.monotone.check_features(data.n_features)
     _check_gpu_booster_params(params, String("train_gpu"))
 
@@ -3170,9 +3331,47 @@ def _train_gpu_rounds[
     device_grads: Bool,
     split_search: Int,
     route_all_rows: Bool = False,
+    bootstrap: BootstrapParams = BootstrapParams.disabled(),
 ) raises -> Booster:
     """The boosting loop both `train_gpu` entry points run, over a builder
     the caller already constructed and a lifecycle it already chose.
+
+    `bootstrap` is CatBoost's `bootstrap_type`, and it is drawn here rather
+    than dropped. **Both arms of this loop honor it and they honor it by
+    different mechanisms, because the two samplers need different things.**
+
+    On the host-gradient arm the round already holds `grad`, `hess` and a row
+    list, so `sampling.bootstrap_round` goes in exactly where
+    `boosting._boost_rounds` puts it -- after the gradient fill and after
+    `goss_round`, before growth -- and does exactly what it does there: MVS
+    scales the derivatives and writes its kept rows into `bag`, the Bayesian
+    bootstrap scales the derivatives and leaves `bag` alone. The trees are
+    still grown on the device. This is the arm an MVS fit lands on, because
+    `device_gradients` reports `ROUND_MVS_HOST_MAGNITUDES` for it and AUTO
+    resolves that by taking the arm that works.
+
+    On the device-gradient arm there is no host gradient vector to scale, and
+    there does not need to be one for the Bayesian bootstrap: its draw is a
+    function of `(seed, tree, row)` alone, and the round's effective weight is
+    that draw times the user's `sample_weight` -- which is precisely what
+    `GpuObjectiveState.weight_dev` holds and what the derivative kernel
+    multiplies both planes by, per row, before quantization. So the draw is
+    taken on the host and uploaded into the plane that already exists
+    (`GpuHistogramBuilder.refresh_objective_weights`); no second plane is
+    built, and the arithmetic reaching the histogram is the same arithmetic
+    `sampling.apply_bootstrap_weights` performs on the host.
+
+    That refresh is upstream of every grower, so it reaches the leaf-wise
+    resident plane and the oblivious level schedule alike: both accumulate
+    from the builder's gradient and hessian planes, and those are what the
+    derivative kernel wrote with this tree's weights applied. Neither grower
+    is edited for it and neither can bypass it.
+
+    **The constant-hessian exclusion is the caller's**, made where the
+    declaration is made (`train_gpu`), because a declaration once set on the
+    builder is held for the whole fit and cannot be withdrawn from inside this
+    loop. `refresh_objective_weights` refuses a refresh into a builder that
+    still holds one, which is the third side of the same rule.
 
     `route_all_rows` is the bagged device round: the bag comes from the same
     sampler and the same schedule as on the host, and the tree's contribution
@@ -3229,6 +3428,26 @@ def _train_gpu_rounds[
         # allocates nothing, on the host-search path.
         var searcher_cache = GpuSplitSearcherCache()
 
+        # ---- what `bootstrap_type` resolved to, once per fit --------------
+        #
+        # On the trainer's existing "why is this fit taking this path" channel
+        # (`MOJOTREES_GPU_SPLIT_TRACE`), beside the split-search decision it
+        # already prints, and silent on a fit that configured no bootstrap so
+        # that an existing trace's output is byte for byte what it was.
+        #
+        # This is a trace line and not a per-fit record, because this
+        # repository has no per-fit record; `gpu_bootstrap_resolution` says so
+        # in full and says what would have to exist. It is here anyway,
+        # because an MVS fit and a Bayesian fit take different arms of this
+        # loop and therefore compute their derivatives at different
+        # precisions, and a reader comparing two results has to be able to
+        # tell which one they are holding.
+        if bootstrap.enabled() and split_trace_enabled():
+            print(
+                "split_trace fit",
+                gpu_bootstrap_resolution(bootstrap, device_grads),
+            )
+
         # Built-in objectives without row sampling generate their gradients
         # on the device and advance the raw scores there too, so a round
         # uploads nothing per row: labels and weights cross once at state
@@ -3275,12 +3494,55 @@ def _train_gpu_rounds[
                     )
                 )
             var dev_bag = List[Int]()
+            # ---- CatBoost's `bootstrap_type` on the device round ----
+            #
+            # MVS cannot be here and is not silently dropped: `device_gradients`
+            # returns False for it (`ROUND_MVS_HOST_MAGNITUDES`), so an MVS fit
+            # took the host-gradient arm below and drew the sampler exactly. If
+            # it ever arrives anyway -- a caller reaching this loop directly,
+            # or that blocker being loosened without this arm being taught the
+            # draw -- it is refused by name rather than trained unsampled,
+            # because an unsampled fit reporting a sampled one is the failure
+            # `sampling.check_bootstrap_honored` exists for.
+            if bootstrap.mvs.enabled:
+                raise Error(
+                    "bootstrap_type=mvs cannot be drawn on the device"
+                    " gradient round: the keep threshold is solved from this"
+                    " round's per-row gradient magnitudes and the rows it"
+                    " does not keep are dropped, and neither the magnitudes"
+                    " nor a row compaction exists here. Use"
+                    " objective_source=OBJECTIVE_SOURCE_HOST (or"
+                    " MOJOTREES_GPU_OBJECTIVE=host), which draws it exactly"
+                    " and still grows the trees on the device"
+                )
+            # One buffer for the whole fit, as the gradient buffers are, and
+            # EMPTY on every fit that configured no bootstrap -- the plane is
+            # never touched and no bits move on the default path.
+            var boot_w = List[Float64]()
             for i in range(params.n_estimators):
                 life.begin_round()
                 # Same sampler, same schedule, same seed as the host path
                 # and as the CPU trainer, so round i grows on identical
                 # rows whichever path produced its gradients.
                 refresh_bag(dev_bag, bagging, n, i)
+                # The Bayesian bootstrap's per-tree draw, into the weight
+                # plane the objective state already owns. Before the gradient
+                # fill, because the fill is what reads it.
+                #
+                # `refresh_bayesian_bootstrap` returns the DRAW TIMES the
+                # user's `sample_weight`, which is CatBoost's
+                # `SampleWeights[i] *= learnWeights[i]` and is exactly what
+                # `weight_dev` is defined to hold. Passing the draw alone
+                # would drop the user's weights for the whole fit; passing
+                # the product into a host `apply_bootstrap_weights` would
+                # square them. The two sites differ because the host arm's
+                # derivatives already carry `sample_weight` and this arm's
+                # do not until the kernel applies the plane.
+                if bootstrap.bayesian.enabled:
+                    refresh_bayesian_bootstrap(
+                        boot_w, bootstrap.bayesian, sample_weight, n, i
+                    )
+                    builder.refresh_objective_weights(state, boot_w)
                 var dev_grad_started = profile.clock()
                 var scale_reads_before = builder.scale_readback_count()
                 builder.fill_gradients_device(state, objective, alpha)
@@ -3459,6 +3721,17 @@ def _train_gpu_rounds[
         # exactly what it read before.
         var tree_params = params.tree.copy()
         var noisy = params.tree.extra.random_strength > 0.0
+        # ---- CatBoost's `bootstrap_type`, drawn exactly as the CPU draws it --
+        #
+        # Both buffers stay EMPTY on the default arm: `bootstrap_round` clears
+        # rather than fills, so an unbootstrapped fit moves no bits here.
+        var boot_w = List[Float64]()
+        var boot_audit = MvsAudit.empty()
+        # The previous tree's leaf values, for MVS's derived lambda. Empty on
+        # the first round, which is the branch `TMvsSampler::GetLambda` takes
+        # when `leafValues` is empty.
+        var last_leaf_values = List[Float64]()
+        var n_last_leaves = 0
         for i in range(params.n_estimators):
             life.begin_round()
             var pre_started = profile.clock()
@@ -3484,6 +3757,53 @@ def _train_gpu_rounds[
             # uploaded, so the device histograms already carry the
             # compensation multiplier.
             goss_round(bag, grad, hess, goss, i, params.learning_rate)
+            # ---- the bootstrap, in `goss_round`'s place and by its shape ----
+            #
+            # Line for line what `boosting._boost_rounds` does, and it has to
+            # be: the two backends must draw the same rows and the same
+            # weights for round `i`, and every input to that draw is host
+            # state that both loops hold identically. Nothing here reads a
+            # worker count or a device answer.
+            #
+            # `bag.clear()` is not tidiness. MVS writes its kept rows INTO
+            # `bag`, so from round 1 on the list arriving here is the previous
+            # round's draw rather than a bag, and `bootstrap_round` refuses a
+            # non-empty row list beside MVS -- correctly, because a real bag
+            # would be silently intersected with a draw that never saw it.
+            # Without the clear every MVS fit stops after one tree. A real bag
+            # cannot reach here: `boosting._check_bootstrap` refuses
+            # `bootstrap_type` beside bagging, GOSS and balanced bagging at fit
+            # setup.
+            #
+            # The lambda argument is `TMvsSampler::GetLambda`'s branch made
+            # explicit: the squared mean gradient magnitude while no tree
+            # exists, the squared mean leaf-value norm of the previous tree
+            # afterwards. It is computed here because the second branch reads
+            # the ensemble, which sampling.mojo cannot see.
+            if bootstrap.enabled():
+                bag.clear()
+                var auto_lambda = 0.0
+                if bootstrap.mvs.enabled and not bootstrap.mvs.reg_is_set:
+                    if n_last_leaves > 0:
+                        auto_lambda = mvs_auto_lambda_from_leaf_values(
+                            last_leaf_values, n_last_leaves, 1
+                        )
+                    else:
+                        auto_lambda = mvs_auto_lambda_from_gradients(
+                            grad, n, 1
+                        )
+                bootstrap_round(
+                    bag,
+                    grad,
+                    hess,
+                    boot_w,
+                    boot_audit,
+                    bootstrap,
+                    n,
+                    i,
+                    auto_lambda,
+                    1,
+                )
             profile.charge(PROF_GRAD_FILL, n, grad_started)
             # The round's one per-row upload, which the device-objective path
             # above does not pay at all. Its own charge so the two paths can
@@ -3544,6 +3864,18 @@ def _train_gpu_rounds[
             for r in range(n):
                 raw[r] += params.learning_rate * tree.predict_row(data, r)
             profile.charge(PROF_SCORE_UPDATE, n, update_started)
+            # MVS's derived lambda for the NEXT round, read off the tree the
+            # ensemble just kept -- `leafValues.back()` in
+            # `TMvsSampler::GetLambda`. After the degenerate-tree test above,
+            # so a dropped round does not leave its leaf values as the next
+            # round's lambda, which is what never reaching
+            # `LearnProgress->LeafValues` means in CatBoost. Walked only when
+            # the derivation is actually used: an explicit `mvs_reg`, the
+            # Bayesian bootstrap and the default arm all skip it.
+            if bootstrap.mvs.enabled and not bootstrap.mvs.reg_is_set:
+                n_last_leaves = _tree_leaf_values(
+                    tree, params.learning_rate, last_leaf_values
+                )
             trees.append(tree^)
             life.end_round()
             profile.note_wall(post_started)
@@ -3577,6 +3909,7 @@ def train_gpu(
     rows_per_tile: Int = 0,
     scale_refresh: Int = 1,
     scale_headroom: Int = 0,
+    bootstrap: BootstrapParams = BootstrapParams.disabled(),
 ) raises -> Booster:
     """Train a boosted ensemble with tree growth on the GPU. Same contract
     as `train` (objectives, sample_weight, alpha, bagging, and GOSS
@@ -3591,6 +3924,18 @@ def train_gpu(
     switches (see the OBJECTIVE_SOURCE_* and SPLIT_SEARCH_* constants);
     both default to the behavior this trainer already shipped. The overload
     below takes a `GpuSession` and is otherwise identical.
+
+    `bootstrap` is CatBoost's `bootstrap_type` and is drawn here, per round,
+    from `sampling`'s own samplers -- there is no second sampler in this file.
+    Which of this loop's two arms runs it depends on which sampler it is:
+    the Bayesian draw reads no gradient and is served by the device round
+    through `GpuObjectiveState`'s weight plane, while MVS solves its keep
+    threshold from the round's gradient magnitudes and drops rows, so it
+    resolves to the host-gradient arm, where `sampling.bootstrap_round` runs
+    exactly as it does in `boosting.train` and the trees are still grown on
+    the device. See `_train_gpu_rounds` for both, and
+    `gpu_fused_round.ROUND_MVS_HOST_MAGNITUDES` for why the second is not a
+    permanent property of MVS on this backend.
 
     `row_unroll` is a launch shape rather than a numeric option and defaults
     to the shape this trainer ships. It is an argument at all so that a
@@ -3661,6 +4006,7 @@ def train_gpu(
             alpha,
             bagging,
             goss,
+            bootstrap,
         )
         # Only an explicit device request routes every row through
         # `GpuTreeRouter`; AUTO keeps a bagged run on the host path and its
@@ -3669,8 +4015,17 @@ def train_gpu(
             resolve_objective_source(objective_source)
             == OBJECTIVE_SOURCE_DEVICE
         )
+        # `bootstrap` reaches this decision because MVS cannot be drawn on
+        # the device round (`gpu_fused_round.ROUND_MVS_HOST_MAGNITUDES`), and
+        # the resolution AUTO makes is the arm that CAN draw it rather than a
+        # dropped sampler: the host-gradient arm of `_train_gpu_rounds` runs
+        # `sampling.bootstrap_round` exactly as `boosting.train` does and
+        # still grows every tree on the device. An explicit
+        # `objective_source=OBJECTIVE_SOURCE_DEVICE` raises there instead,
+        # with that module's own reason.
         var device_grads = device_gradients(
-            objective, 1, objective_source, bagging, goss, routes_all
+            objective, 1, objective_source, bagging, goss, routes_all,
+            bootstrap,
         )
         var builder = GpuHistogramBuilder(data)
         # This fit's constant-hessian declaration, made once, next to where
@@ -3689,9 +4044,36 @@ def train_gpu(
         # not touch a hessian, so it is not an exclusion; GOSS is, and
         # `round_has_constant_hessian` refuses it whether or not this run
         # would have reached the device round.
-        builder.set_constant_hessian(
-            round_has_constant_hessian(objective, sample_weight, goss)
+        # ---- the bootstrap's constant-hessian exclusion ----
+        #
+        # The fourth exclusion, the one `round_has_constant_hessian`
+        # documents and cannot test for, and it is made HERE rather than
+        # inside the round loop because a declaration set on a builder is
+        # held for the whole fit and cannot be withdrawn mid-loop.
+        #
+        # Both samplers multiply the round's derivatives by a per-row weight,
+        # so under an objective whose unweighted hessian is the literal 1.0 a
+        # bootstrapped round stores the DRAW into `hess` -- on the host arm
+        # through `sampling.apply_bootstrap_weights`, on the device arm
+        # through the derivative kernel's `w`, which is the weight plane the
+        # Bayesian draw was just written into. A builder told to rebuild the
+        # hessian plane from the row count would rebuild a plane of ones over
+        # a plane of draws, silently, in the histogram, and every split of
+        # the fit would be chosen from it.
+        #
+        # The second line is not belt and braces. It is the assertion that
+        # the first one ran: `round_has_constant_hessian` grows arms, this
+        # function grows lines, and an edit that re-enables the declaration
+        # after this point turns a silently wrong hessian plane into an
+        # exception at fit setup. `GpuHistogramBuilder.refresh_objective_weights`
+        # refuses from the third side, at the upload itself.
+        var const_hessian = round_has_constant_hessian(
+            objective, sample_weight, goss
         )
+        if bootstrap.varies_hessian():
+            const_hessian = False
+        bootstrap.check_hessian_declaration(const_hessian)
+        builder.set_constant_hessian(const_hessian)
         builder.set_row_unroll(row_unroll)
         # A trade, not a strictly-less-work change, so it defaults
         # OFF and the window decides: compaction adds 4*L*(nf+8)
@@ -3737,6 +4119,7 @@ def train_gpu(
             device_grads,
             split_search,
             routes_all,
+            bootstrap,
         )
 
 
@@ -3760,6 +4143,7 @@ def train_gpu(
     rows_per_tile: Int = 0,
     scale_refresh: Int = 1,
     scale_headroom: Int = 0,
+    bootstrap: BootstrapParams = BootstrapParams.disabled(),
 ) raises -> Booster:
     """`train_gpu` on a caller-owned session: the builder borrows the
     session's context and its ledgers record the construction, and every
@@ -3768,7 +4152,20 @@ def train_gpu(
     The device work is identical to the session-free form. What a session
     adds is an owner: it outlives this call, so a later fit or a validation
     matrix can share the context, and `session.trace()` reports the phases
-    under `MOJOTREES_GPU_TRACE=1`. The trainer never closes it."""
+    under `MOJOTREES_GPU_TRACE=1`. The trainer never closes it.
+
+    `bootstrap` is CatBoost's `bootstrap_type` and is drawn here, per round,
+    from `sampling`'s own samplers -- there is no second sampler in this file.
+    Which of this loop's two arms runs it depends on which sampler it is:
+    the Bayesian draw reads no gradient and is served by the device round
+    through `GpuObjectiveState`'s weight plane, while MVS solves its keep
+    threshold from the round's gradient magnitudes and drops rows, so it
+    resolves to the host-gradient arm, where `sampling.bootstrap_round` runs
+    exactly as it does in `boosting.train` and the trees are still grown on
+    the device. See `_train_gpu_rounds` for both, and
+    `gpu_fused_round.ROUND_MVS_HOST_MAGNITUDES` for why the second is not a
+    permanent property of MVS on this backend.
+"""
     comptime if not has_accelerator():
         raise Error("GPU training requires an accelerator")
     else:
@@ -3781,13 +4178,23 @@ def train_gpu(
             alpha,
             bagging,
             goss,
+            bootstrap,
         )
         var routes_all = (
             resolve_objective_source(objective_source)
             == OBJECTIVE_SOURCE_DEVICE
         )
+        # `bootstrap` reaches this decision because MVS cannot be drawn on
+        # the device round (`gpu_fused_round.ROUND_MVS_HOST_MAGNITUDES`), and
+        # the resolution AUTO makes is the arm that CAN draw it rather than a
+        # dropped sampler: the host-gradient arm of `_train_gpu_rounds` runs
+        # `sampling.bootstrap_round` exactly as `boosting.train` does and
+        # still grows every tree on the device. An explicit
+        # `objective_source=OBJECTIVE_SOURCE_DEVICE` raises there instead,
+        # with that module's own reason.
         var device_grads = device_gradients(
-            objective, 1, objective_source, bagging, goss, routes_all
+            objective, 1, objective_source, bagging, goss, routes_all,
+            bootstrap,
         )
         # The session's own fit latency: the first fit through a session
         # pays the one-time costs and every later one does not.
@@ -3796,9 +4203,36 @@ def train_gpu(
         # The same declaration the session-free overload makes, from the same
         # predicate over the same three arguments. A session owns the context
         # and not the round's numbers, so it cannot change the answer.
-        builder.set_constant_hessian(
-            round_has_constant_hessian(objective, sample_weight, goss)
+        # ---- the bootstrap's constant-hessian exclusion ----
+        #
+        # The fourth exclusion, the one `round_has_constant_hessian`
+        # documents and cannot test for, and it is made HERE rather than
+        # inside the round loop because a declaration set on a builder is
+        # held for the whole fit and cannot be withdrawn mid-loop.
+        #
+        # Both samplers multiply the round's derivatives by a per-row weight,
+        # so under an objective whose unweighted hessian is the literal 1.0 a
+        # bootstrapped round stores the DRAW into `hess` -- on the host arm
+        # through `sampling.apply_bootstrap_weights`, on the device arm
+        # through the derivative kernel's `w`, which is the weight plane the
+        # Bayesian draw was just written into. A builder told to rebuild the
+        # hessian plane from the row count would rebuild a plane of ones over
+        # a plane of draws, silently, in the histogram, and every split of
+        # the fit would be chosen from it.
+        #
+        # The second line is not belt and braces. It is the assertion that
+        # the first one ran: `round_has_constant_hessian` grows arms, this
+        # function grows lines, and an edit that re-enables the declaration
+        # after this point turns a silently wrong hessian plane into an
+        # exception at fit setup. `GpuHistogramBuilder.refresh_objective_weights`
+        # refuses from the third side, at the upload itself.
+        var const_hessian = round_has_constant_hessian(
+            objective, sample_weight, goss
         )
+        if bootstrap.varies_hessian():
+            const_hessian = False
+        bootstrap.check_hessian_declaration(const_hessian)
+        builder.set_constant_hessian(const_hessian)
         # A launch shape, not a number: see the session-free overload. A
         # session owns the context, so it cannot change this answer either.
         builder.set_row_unroll(row_unroll)
@@ -3841,6 +4275,7 @@ def train_gpu(
             device_grads,
             split_search,
             routes_all,
+            bootstrap,
         )
         session.end_fit(fit)
         return booster^
