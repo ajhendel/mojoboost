@@ -41,3 +41,6 @@ python/LICENSE
 bench/apple/metal_traces/
 *.trace/
 *.trace.export/
+
+# Agent worktrees: real git worktrees, never repo content.
+.claude/worktrees/
