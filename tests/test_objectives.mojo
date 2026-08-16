@@ -227,14 +227,21 @@ def test_new_objective_gradients_scale_with_sample_weight() raises:
             weighted_g,
             weighted_h,
         )
+        # Sample-weight scaling is exact in the objective's arithmetic and
+        # then NARROWED: the code stores score_t(g * w), while this test can
+        # only form score_t(g) * w. Those differ by up to two Float32 ulps,
+        # so the identity now holds to Float32 precision rather than Float64.
+        # 1e-12 was right when the derivative arrays were Float64 and is not
+        # a bound anything can meet now. 1e-6 relative is roughly ten
+        # Float32 ulps, tight enough that a real scaling bug still fails.
         for r in range(3):
             assert_true(
                 abs(weighted_g[r] - weights[r] * plain_g[r])
-                < 1e-12 * (1.0 + abs(plain_g[r]))
+                < 1e-6 * (1.0 + abs(plain_g[r]))
             )
             assert_true(
                 abs(weighted_h[r] - weights[r] * plain_h[r])
-                < 1e-12 * (1.0 + abs(plain_h[r]))
+                < 1e-6 * (1.0 + abs(plain_h[r]))
             )
 
 

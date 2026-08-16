@@ -9,6 +9,7 @@ from std.testing import assert_equal, assert_true, TestSuite
 
 from mojotrees.binning import BinnedMatrix
 from mojotrees.histogram import (
+    score_t,
     Histogram,
     build_histogram,
     build_histogram_subset,
@@ -44,8 +45,12 @@ def _reference_histogram(
     for f in range(data.n_features):
         for r in range(data.n_rows):
             var b = f * data.n_bins + data.bin_at(r, f)
-            g[b] += grad[r]
-            h[b] += hess[r]
+            # The builder narrows every derivative to Float32 (LightGBM's
+            # score_t) before accumulating, so a Float64 reference is no
+            # longer the same sum. Narrow here too and the comparison is
+            # exact again rather than approximately right.
+            g[b] += score_t(grad[r])
+            h[b] += score_t(hess[r])
             c[b] += 1
     return Histogram.from_planes(g^, h^, c^, data.n_features, data.n_bins)
 

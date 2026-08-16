@@ -51,6 +51,7 @@ from mojotrees.boosting import (
     fill_grad_hess,
 )
 from mojotrees.histogram import (
+    score_t,
     Histogram,
     SIMD_LANES,
     build_histogram,
@@ -309,7 +310,9 @@ def test_grad_hess_matches_serial_across_objectives() raises:
     assert_equal(len(g), n)
     assert_equal(len(h), n)
     for r in range(n):
-        assert_equal(g[r], raw[r] - target[r])
+        # Narrowed, because fill_grad_hess stores score_t(g). Exact, not
+        # a tolerance: the test computes the same Float32 the code does.
+        assert_equal(g[r], score_t(raw[r] - target[r]))
 
 
 def test_into_builders_match_allocating_and_survive_reuse() raises:
