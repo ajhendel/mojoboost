@@ -72,7 +72,7 @@ comptime SUPPORTED_KEYS = String(
     " min_data_in_leaf, min_sum_hessian_in_leaf, lambda_l1, lambda_l2,"
     " max_depth, grow_policy, feature_fraction, feature_fraction_bynode,"
     " feature_fraction_bylevel, feature_fraction_seed, min_gain_to_split,"
-    " max_delta_step, path_smooth, extra_trees, extra_seed,"
+    " max_delta_step, path_smooth, extra_trees, extra_seed, random_strength,"
     " monotone_penalty, monotone_constraints_method, cegb_tradeoff,"
     " cegb_penalty_split, linear_tree, linear_lambda, enable_bundle,"
     " max_conflict_rate, feature_pre_filter,"
@@ -548,6 +548,16 @@ def parse_params(spec: String) raises -> TrainConfig:
             config.booster.tree.extra.extra_trees = _parse_bool(key, value)
         elif key == "extra_seed":
             config.booster.tree.extra.extra_seed = _parse_int(key, value)
+        # CatBoost's `random_strength`, the only name on this surface that is
+        # not LightGBM's. 0.0, the default, is LightGBM's behavior exactly. A
+        # positive value parses and then fails validation with a sentence
+        # naming what is missing (`ExtraTreeParams.check_random_strength`),
+        # which is the same refuse-rather-than-ignore path
+        # `use_quantized_grad` takes below: the noise needs a per-tree scale
+        # off the ensemble's gradients that no trainer computes in this
+        # build, and a split search cannot reconstruct it from a histogram.
+        elif key == "random_strength":
+            config.booster.tree.extra.random_strength = _parse_f64(key, value)
         # LightGBM's quantized-training family. The four names and no others:
         # LightGBM has no scale-rule, seed, or accumulator-width parameter,
         # and this surface is exactly LightGBM's, so mojotrees's three extra
