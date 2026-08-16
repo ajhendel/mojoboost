@@ -742,6 +742,522 @@ def partition_rows_into(
     run_row_blocks(blocks, scatter_block)
 
 
+def fill_identity_rows(
+    mut rows: List[Int],
+    n: Int,
+    settings: DispatchSettings = DispatchSettings.unresolved(),
+) raises:
+    """`rows` becomes `[0, 1, ..., n)`, filled over row blocks.
+
+    The grower's root row list, and the one row list in a tree that no
+    partition produces. It was also the last per-row pass in the partition
+    phase still running on one core: `n` stores per tree, 8 MB of them at a
+    million rows, and a hundred rounds of that in a fit.
+
+    Elementwise over disjoint ascending blocks, so `rows[i] == i` whatever the
+    block count and whatever `MOJOTREES_NUM_WORKERS` says. Nothing is
+    accumulated and nothing is reassociated: the list is identical index for
+    index to the one the serial loop wrote, at every worker count and on every
+    machine.
+
+    The block plan is charged one op per row. A fill is one store per row with
+    no indirection, which is the cheapest per-row work in this file, so it
+    reaches the parallel path later than the partition does on the same `n` --
+    deliberately, since a fill that fits in the dispatch overhead should stay
+    on one core.
+
+    The length is taken without initializing the new elements, which is what
+    the caller's next act -- writing every one of them -- makes safe, and it
+    is worth a pass: `resize(n, 0)` writes `8 * n` bytes of zeros that the
+    fill then immediately overwrites, so the root list cost `16 MB` of stores
+    at a million rows where it needs `8 MB`. `Int` is trivially destructible,
+    so shrinking this way cannot leak, and no element is readable before the
+    fill covers it.
+    """
+    if n < 0:
+        raise Error("row count must be nonnegative")
+    rows.resize(unsafe_uninit_length=n)
+    if n == 0:
+        return
+    var p = rows.unsafe_ptr()
+    var blocks = plan_row_blocks_with(settings, n, n)
+
+    def fill_block(b: Int) {imm}:
+        for i in range(blocks.start(b), blocks.end(b)):
+            p.unsafe_store(i, i)
+
+    run_row_blocks(blocks, fill_block)
+
+
+def _fill_identity_i32(
+    mut buf: List[Int32],
+    n: Int,
+    settings: DispatchSettings = DispatchSettings.unresolved(),
+) raises:
+    """`buf[0 : n) = [0, n)`, over row blocks. `RowArena.root_identity`'s
+    body, split out so the closure captures a pointer into a plain list
+    argument rather than into a field of `self`."""
+    if n <= 0:
+        return
+    var p = buf.unsafe_ptr()
+    var blocks = plan_row_blocks_with(settings, n, n)
+
+    def fill_block(b: Int) {imm}:
+        for i in range(blocks.start(b), blocks.end(b)):
+            p.unsafe_store(i, Int32(i))
+
+    run_row_blocks(blocks, fill_block)
+
+
+def _fill_from_i32(
+    mut buf: List[Int32],
+    src_rows: List[Int],
+    settings: DispatchSettings = DispatchSettings.unresolved(),
+) raises:
+    """`buf[0 : len(src_rows)) = src_rows`, narrowed to `Int32`, over row
+    blocks. `RowArena.root_from_bag`'s body, split out for the same reason."""
+    var n = len(src_rows)
+    if n <= 0:
+        return
+    var p = buf.unsafe_ptr()
+    var s = src_rows.unsafe_ptr()
+    var blocks = plan_row_blocks_with(settings, n, n)
+
+    def fill_block(b: Int) {imm}:
+        for i in range(blocks.start(b), blocks.end(b)):
+            p.unsafe_store(i, Int32(s.unsafe_load(i)))
+
+    run_row_blocks(blocks, fill_block)
+
+
+@fieldwise_init
+struct LeafSpan(Copyable, Movable):
+    """One node's rows, as a window into a `RowArena` rather than a list.
+
+    `side` names which of the arena's two buffers holds them: 0 for `a`, 1 for
+    `b`. A span is meaningless without it, which is why the three travel
+    together and why a leaf state carries a `LeafSpan` and not a bare pair of
+    integers.
+    """
+
+    var begin: Int
+    var count: Int
+    var side: Int
+
+    @always_inline
+    def end(self) -> Int:
+        return self.begin + self.count
+
+
+@fieldwise_init
+struct ArenaPartition(Copyable, Movable):
+    """The two child spans `partition_arena_span` produced. Both name the
+    buffer the parent's did not, and together they cover the parent's window
+    exactly: `left.begin == parent.begin`, `right.begin == left.end()`, and
+    `right.end() == parent.end()`."""
+
+    var left: LeafSpan
+    var right: LeafSpan
+
+
+struct RowArena(Movable):
+    """A row-id permutation and its double buffer, owned once and reused.
+
+    Growth today allocates two fresh `List[Int]` per split and one fresh
+    `List[Int]` of every row per tree. At a million rows that is 8 MB for the
+    root plus, over a 31-leaf tree, one write of every internal node's rows
+    into a freshly faulted page -- around 48 MB of first-touch traffic and 61
+    allocations per tree, times a hundred rounds.
+
+    An arena replaces all of it with two `Int32` arrays of `n_rows`, allocated
+    once and never freed until the arena is. Each leaf owns a disjoint window
+    of one of them, and a split rewrites the parent's window into *the same
+    window of the other buffer*, left side first. Nothing is allocated, and
+    the children's spans are `(begin, n_left)` and `(begin + n_left, n -
+    n_left)` on the opposite side.
+
+    Two buffers rather than one, which is the whole reason this is not
+    `gpu_active_rows.partition_range_host` with the types changed. That
+    function scatters into a scratch and then copies the window back so the
+    result lands in the buffer it started in, which is what a device-resident
+    permutation with one canonical address needs. On the host nothing needs a
+    canonical address -- a leaf state can carry which buffer it is in -- so the
+    copy-back pass is pure loss: one extra read and one extra write of every
+    row at every split, which over a balanced 31-leaf tree at a million rows
+    is 40 MB per tree of traffic that buys nothing. Ping-pong deletes it. The
+    partition itself is the same algorithm, and both produce the same bytes.
+
+    **Element type.** `Int32` halves every row-id load and store against the
+    `List[Int]` lists it replaces, and a bin matrix is indexed by an `Int`
+    row anyway so nothing downstream widens. It bounds a dataset at 2^31 rows,
+    which is the same bound `gpu_active_rows` already imposes on any fit that
+    reaches the device.
+
+    **Order.** The partition is stable and order-preserving: each side comes
+    out in ascending position order, exactly the order `partition_rows_into`
+    leaves its two lists in. That is not a nicety. Histogram accumulation
+    visits a node's rows in the order the row list gives them and sums
+    `Float64` in that order, so a partition that permuted a side would move
+    every histogram cell below it. The equality is checked element for element
+    in `tests/test_cpu_partition.mojo`.
+    """
+
+    var a: List[Int32]
+    var b: List[Int32]
+    var n: Int
+    """Rows the arena is currently sized for. The buffers are never shrunk, so
+    `len(a)` can exceed this after a smaller dataset."""
+
+    def __init__(out self):
+        self.a = List[Int32]()
+        self.b = List[Int32]()
+        self.n = 0
+
+    def ensure(mut self, n: Int) raises:
+        """Size both buffers for `n` rows, growing only.
+
+        A booster holding one arena across a fit allocates here on the first
+        tree and never again, which is the point of the type. `n` above 2^31
+        is refused rather than truncated into an `Int32`.
+        """
+        if n < 0:
+            raise Error("row count must be nonnegative")
+        if n > 2147483647:
+            raise Error(
+                "row arena holds Int32 row ids and cannot address ",
+                n,
+                " rows",
+            )
+        if len(self.a) < n:
+            self.a.resize(n, Int32(0))
+        if len(self.b) < n:
+            self.b.resize(n, Int32(0))
+        self.n = n
+
+    def root_identity(
+        mut self,
+        n: Int,
+        settings: DispatchSettings = DispatchSettings.unresolved(),
+    ) raises -> LeafSpan:
+        """Fill buffer `a` with `[0, n)` and return the root's span.
+
+        The arena form of `fill_identity_rows`, and the same argument: it is
+        elementwise over disjoint ascending blocks, so the buffer is identical
+        at every worker count. Half the stores of the `List[Int]` form,
+        because the ids are `Int32`.
+        """
+        self.ensure(n)
+        _fill_identity_i32(self.a, n, settings)
+        return LeafSpan(0, n, 0)
+
+    def root_from_bag(
+        mut self,
+        bag: List[Int],
+        settings: DispatchSettings = DispatchSettings.unresolved(),
+    ) raises -> LeafSpan:
+        """Fill buffer `a` with `bag` and return the root's span.
+
+        The bagged root. `bag` is ascending and duplicate-free by
+        `sampling.check_row_set`, which the grower has already enforced, and
+        this copies it position for position, so the arena root is the bag in
+        the bag's own order.
+        """
+        var n = len(bag)
+        self.ensure(n)
+        _fill_from_i32(self.a, bag, settings)
+        return LeafSpan(0, n, 0)
+
+    def row_at(self, span: LeafSpan, i: Int) raises -> Int:
+        """The `i`-th row id of `span`. For tests and for the few per-node
+        consumers that read a handful of rows; a bulk consumer takes the
+        window."""
+        if i < 0 or i >= span.count:
+            raise Error("row index escapes the span")
+        var j = span.begin + i
+        return Int(self.a[j]) if span.side == 0 else Int(self.b[j])
+
+    def span_rows(self, span: LeafSpan) raises -> List[Int]:
+        """`span` materialized as the `List[Int]` the rest of the package
+        still speaks.
+
+        A bridge, and it is worth being exact about what it costs and who
+        needs it. Two consumers on the CPU path take a whole node's row ids as
+        a `List[Int]` and cannot take a window of `Int32`:
+
+        - `histogram.build_histogram_subset_into_scratch`, which already takes
+          a `(rows, row_start, row_count)` window and so needs only an
+          `Int32` overload of that window, not a new calling convention;
+        - `cegb.prepare_cegb_node` and `cegb.cegb_commit_split`, which read
+          rows only when a lazy penalty is configured and return immediately
+          otherwise.
+
+        Until those exist, a caller that wants the arena and one of them pays
+        `8 * count` bytes and one allocation here, which is exactly the cost
+        the arena removed. That is why the grower does not call this on its
+        hot path and why this function is not the integration: it is what a
+        test uses to compare the arena against the shipped partition, and what
+        a CEGB-configured node can use without a new histogram signature.
+        """
+        if span.begin < 0 or span.count < 0 or span.end() > self.n:
+            raise Error("span escapes the arena")
+        var out = List[Int](capacity=span.count)
+        out.resize(span.count, 0)
+        if span.side == 0:
+            for i in range(span.count):
+                out[i] = Int(self.a[span.begin + i])
+        else:
+            for i in range(span.count):
+                out[i] = Int(self.b[span.begin + i])
+        return out^
+
+
+def _partition_span_into(
+    src: List[Int32],
+    mut dst: List[Int32],
+    begin: Int,
+    n: Int,
+    data: BinnedMatrix,
+    split: SplitInfo,
+    missing_bin: Int,
+    settings: DispatchSettings,
+) raises -> Int:
+    """`src[begin : begin + n)` routed into `dst[begin : begin + n)`, left side
+    first, returning the left count.
+
+    `partition_arena_span`'s body, with the two buffers named rather than
+    selected out of the arena. Split out for two reasons: the closures capture
+    pointers into plain list arguments instead of into fields of a struct,
+    which is what the origin checker will carry into a parallel closure; and
+    the source is `read` while only the destination is `mut`, which states in
+    the signature that ping-pong never writes the window it is reading.
+    """
+    var blocks = plan_row_blocks_with(settings, n, 3 * n)
+    var src_p = src.unsafe_ptr()
+    var dst_p = dst.unsafe_ptr()
+    var bins_p = data.bins.unsafe_ptr().unsafe_offset(
+        split.feature * data.n_rows
+    )
+    var is_cat = split.is_categorical
+    var default_left = split.default_left
+    var threshold = split.bin
+
+    @always_inline
+    def goes_left(bin: Int) {imm} -> Bool:
+        if is_cat:
+            return split.goes_left(bin)
+        if bin == missing_bin:
+            return default_left
+        return bin <= threshold
+
+    var left_counts = List[Int](capacity=blocks.n_blocks)
+    left_counts.resize(blocks.n_blocks, 0)
+    var counts_p = left_counts.unsafe_ptr()
+
+    def count_block(b: Int) {imm}:
+        var c = 0
+        for i in range(blocks.start(b), blocks.end(b)):
+            var r = Int(src_p.unsafe_load(begin + i))
+            if goes_left(Int(bins_p.unsafe_load(r))):
+                c += 1
+        counts_p.unsafe_store(b, c)
+
+    run_row_blocks(blocks, count_block)
+
+    # Exclusive prefix sum over the per-block left counts, in place.
+    var total_left = 0
+    for b in range(blocks.n_blocks):
+        var c = left_counts[b]
+        left_counts[b] = total_left
+        total_left += c
+
+    def scatter_block(b: Int) {imm}:
+        var start = blocks.start(b)
+        var li = begin + counts_p.unsafe_load(b)
+        var ri = begin + total_left + (start - counts_p.unsafe_load(b))
+        for i in range(start, blocks.end(b)):
+            var r = src_p.unsafe_load(begin + i)
+            if goes_left(Int(bins_p.unsafe_load(Int(r)))):
+                dst_p.unsafe_store(li, r)
+                li += 1
+            else:
+                dst_p.unsafe_store(ri, r)
+                ri += 1
+
+    run_row_blocks(blocks, scatter_block)
+    return total_left
+
+
+def partition_arena_span(
+    mut arena: RowArena,
+    span: LeafSpan,
+    data: BinnedMatrix,
+    split: SplitInfo,
+    missing_bin: Int,
+    settings: DispatchSettings = DispatchSettings.unresolved(),
+) raises -> ArenaPartition:
+    """Route `span`'s rows to the left or right child of `split`, in place.
+
+    `partition_rows_into` with the two freshly allocated `List[Int]` sides
+    replaced by one window of the arena's *other* buffer: the left side lands
+    at `span.begin` and the right at `span.begin + n_left`, so the two
+    children partition the parent's window with no gap and no allocation. The
+    parent's own window is left untouched, which is what lets a caller that
+    has not finished with it -- a CEGB commit, a diagnostic -- still read it.
+
+    Routing is the same rule, and it is the rule and not a copy of it: a
+    categorical split routes by set membership; otherwise rows in the
+    feature's missing bin follow the split's default direction instead of the
+    threshold, and a feature with no missing bin (-1) has none of them.
+
+    Two passes, same as `partition_rows_into`: count per block, exclusive
+    prefix-sum the per-block left counts, then scatter. Block b's rows land at
+    `begin + prefix_left[b]` on the left and at `begin + n_left + (local_start
+    - prefix_left[b])` on the right. Both sides therefore come out in
+    ascending position order whatever the block count -- the result is
+    identical to the serial single-pass partition, index for index, and
+    identical to `partition_rows_into`'s `left` followed by its `right`, also
+    index for index. `tests/test_cpu_partition.mojo` asserts exactly that,
+    with integer equality and no tolerance, because it is the property the
+    whole design rests on: histogram accumulation sums `Float64` in row-list
+    order, so a side that came out permuted would move every histogram cell
+    beneath this node and every leaf value under it.
+
+    **Against LightGBM's `DataPartition::Split`.** LightGBM keeps one global
+    `indices_` array with a `(leaf_begin_, leaf_count_)` per leaf, which is
+    the same structure as one `RowArena` buffer and a `LeafSpan` per leaf.
+    Its runner differs from this one in two places, and both differences are
+    deliberate here:
+
+    - *Per-thread temporary buffers.* LightGBM's threads each append their
+      left and right rows into thread-local arrays, because a thread does not
+      know where its rows belong until every earlier thread has finished. This
+      partition counts first and prefix-sums the per-block counts, so each
+      block knows its exact destination offsets before it writes a single row
+      and scatters straight into disjoint ranges of the destination. That
+      removes the temporaries rather than reorganizing them: it changes
+      neither the block plan (`plan_row_blocks_with`, unchanged, on the
+      unchanged three-ops-per-row estimate) nor who owns a buffer, because
+      there is no buffer to own. The trade is one extra read of the split
+      feature's bins -- one `UInt8` per row -- against one fewer write of
+      every row id, which is four bytes.
+    - *The final ordered copy-back.* In LightGBM that pass is what reassembles
+      the thread-local arrays into `indices_` in block order, and it is what
+      makes their partition stable. Here the prefix-summed scatter is already
+      the ordered write, so a copy-back would only move the result back to the
+      address it started at. `partition_arena_span_inplace` is that variant,
+      for a caller that needs the single-array invariant; this one ping-pongs
+      instead and hands the children the other buffer, which is one read and
+      one write of every row per split cheaper. See that function for the
+      arithmetic.
+
+    `settings` is the fit's dispatch snapshot and is threaded to the one
+    `plan_row_blocks_with` below, exactly as `partition_rows_into` threads it.
+    A partition that dropped it would put a `getenv` sweep and a core
+    detection back on the per-split path.
+    """
+    if span.side != 0 and span.side != 1:
+        raise Error("span side must be 0 or 1")
+    if span.begin < 0 or span.count < 0 or span.end() > arena.n:
+        raise Error("span escapes the arena")
+    if split.feature < 0 or split.feature >= data.n_features:
+        raise Error("split feature out of range")
+
+    var begin = span.begin
+    var n = span.count
+    var dst_side = 1 - span.side
+    if n == 0:
+        return ArenaPartition(
+            LeafSpan(begin, 0, dst_side), LeafSpan(begin, 0, dst_side)
+        )
+
+    # The two buffers are named by the branch rather than selected into a
+    # variable, because `a` and `b` are distinct fields and one of them has to
+    # be the mutable argument while the other stays a read-only one.
+    var total_left: Int
+    if span.side == 0:
+        total_left = _partition_span_into(
+            arena.a, arena.b, begin, n, data, split, missing_bin, settings
+        )
+    else:
+        total_left = _partition_span_into(
+            arena.b, arena.a, begin, n, data, split, missing_bin, settings
+        )
+
+    return ArenaPartition(
+        LeafSpan(begin, total_left, dst_side),
+        LeafSpan(begin + total_left, n - total_left, dst_side),
+    )
+
+
+def _copy_span(
+    src: List[Int32],
+    mut dst: List[Int32],
+    begin: Int,
+    n: Int,
+    settings: DispatchSettings,
+) raises:
+    """`dst[begin : begin + n) = src[begin : begin + n)`, over row blocks.
+    Elementwise over disjoint ascending blocks, so the window is identical at
+    every block count."""
+    if n <= 0:
+        return
+    var src_p = src.unsafe_ptr()
+    var dst_p = dst.unsafe_ptr()
+    var blocks = plan_row_blocks_with(settings, n, n)
+
+    def copy_block(b: Int) {imm}:
+        for i in range(blocks.start(b), blocks.end(b)):
+            dst_p.unsafe_store(begin + i, src_p.unsafe_load(begin + i))
+
+    run_row_blocks(blocks, copy_block)
+
+
+def partition_arena_span_inplace(
+    mut arena: RowArena,
+    span: LeafSpan,
+    data: BinnedMatrix,
+    split: SplitInfo,
+    missing_bin: Int,
+    settings: DispatchSettings = DispatchSettings.unresolved(),
+) raises -> ArenaPartition:
+    """`partition_arena_span` with LightGBM's ordered copy-back, so both
+    children come out on the side their parent was on.
+
+    LightGBM's `DataPartition::Split` finishes by copying the partitioned
+    range back into the global `indices_` array, and `gpu_active_rows.
+    partition_range_host` does the same for the device's single resident
+    permutation. This is that contract: one array is canonical, a leaf's rows
+    are always at `indices[begin : begin + count)` of it, and a caller never
+    has to track which buffer a span is in. The result is byte for byte what
+    `partition_arena_span` produces -- same routing, same stable order, same
+    left count -- landed at the same addresses instead of the mirrored ones.
+
+    **It costs a full extra pass over the window**: one read and one write of
+    every row id per split. Over a 31-leaf tree at a million rows the sum of
+    internal node sizes is around 5 million rows, so at four bytes a row that
+    is a **derived bound** of 5e6 x 8 = 40 MB of extra traffic per tree, and
+    4 GB over a 100-round fit, buying only that the result lands at the
+    address it started at. Nothing on the CPU path needs that: a `_LeafState`
+    can carry its span's side in the same word it carries its depth. So
+    `partition_arena_span` is the one a grower should call, and this exists
+    for a caller that has to hold the single-array invariant -- a diagnostic
+    comparing against the device, or a consumer that indexes one canonical
+    buffer.
+    """
+    var got = partition_arena_span(
+        arena, span, data, split, missing_bin, settings
+    )
+    if span.count > 0:
+        if span.side == 0:
+            _copy_span(arena.b, arena.a, span.begin, span.count, settings)
+        else:
+            _copy_span(arena.a, arena.b, span.begin, span.count, settings)
+    return ArenaPartition(
+        LeafSpan(got.left.begin, got.left.count, span.side),
+        LeafSpan(got.right.begin, got.right.count, span.side),
+    )
+
+
 struct _HistPool(Movable):
     """Free-list of histogram buffers of one shape.
 
@@ -1544,10 +2060,8 @@ def grow_tree_leaves_profiled(
     )
     if len(bag) == 0:
         var root_list_started = profile.clock()
-        root_rows = List[Int](capacity=data.n_rows)
-        root_rows.resize(data.n_rows, 0)
-        for r in range(data.n_rows):
-            root_rows[r] = r
+        root_rows = List[Int]()
+        fill_identity_rows(root_rows, data.n_rows, scratch.settings)
         # The identity permutation is row-list construction, which is the same
         # kind of work a split's two child lists are, so it goes to the same
         # phase rather than disappearing into the unattributed remainder.
