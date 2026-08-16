@@ -434,10 +434,20 @@ def main():
     loss_name, loss = train_loss(booster, X, y, args.objective)
 
     print(f"binning_s: {binning_s:.6f}")
+    # The repeats again, on one line, in the order they ran. The `run N`
+    # lines above already carry them, and this one exists so that a single
+    # copied line still carries the dispersion; the Mojo harness prints the
+    # same `_train_s_samples` line per arm for the same reason.
+    print("train_s_samples: " + " ".join(f"{s:.6f}" for s in samples))
     print(f"train_s: {lo:.6f}")
     print(f"train_s_median: {med:.6f}")
     print(f"train_s_max: {hi:.6f}")
     print(f"spread_pct: {round(spread * 100.0, 1)}")
+    # (max - min) / median rather than / min: the arm's dispersion rather
+    # than its excursion above its own best sample, and the one to quote
+    # beside a median. `spread_pct` above is unchanged so that figures
+    # recorded before this line still mean what they meant.
+    print(f"spread_pct_of_median: {round((hi - lo) / med * 100.0, 1)}")
     print(f"total_s: {binning_s + lo:.6f}")
     print(f"n_trees: {booster.num_trees()}")
     print(f"{loss_name}: {loss}")
