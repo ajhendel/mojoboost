@@ -788,8 +788,11 @@ def find_best_split(
         )
 
     comptime W = SIMD_LANES
-    var grad_p = hist._grad.unsafe_ptr()
-    var hess_p = hist._hess.unsafe_ptr()
+    # `Histogram` storage is LightGBM's interleaved `hist_t`: cell `i` is the
+    # Float64 pair at `_gh[2 * i]` and `_gh[2 * i + 1]`. Two pointers where
+    # there were three, and a feature's slice is two sequential streams rather
+    # than three.
+    var gh_p = hist._gh.unsafe_ptr()
     var count_p = hist._count.unsafe_ptr()
 
     # One slot per scanned feature. A feature that yields no candidate leaves
@@ -846,21 +849,27 @@ def find_best_split(
             if missing_bin >= hist.n_bins:
                 raise Error("missing bin index out of range")
         var base = f * hist.n_bins
-        var vg = SIMD[DType.float64, W](0.0)
-        var vh = SIMD[DType.float64, W](0.0)
+        # One 2W-wide pair accumulator where there were two W-wide ones.
+        # Lane `2k` of `vp` receives the gradients of bins `base + k`,
+        # `base + k + W`, ... in ascending order, which is exactly the
+        # sequence lane `k` of the old `vg` received; `deinterleave` is a lane
+        # permutation with no arithmetic and `reduce_add` folds the same tree.
+        # The scan's totals are therefore the same Float64 they were.
+        var vp = SIMD[DType.float64, 2 * W](0.0)
         var vc = SIMD[DType.int, W](0)
         var b = 0
         while b + W <= hist.n_bins:
-            vg += grad_p.unsafe_load[width=W](base + b)
-            vh += hess_p.unsafe_load[width=W](base + b)
+            vp += gh_p.unsafe_load[width = 2 * W](2 * (base + b))
             vc += count_p.unsafe_load[width=W](base + b)
             b += W
-        var total_g = vg.reduce_add()
-        var total_h = vh.reduce_add()
+        var halves = vp.deinterleave()
+        var total_g = halves[0].reduce_add()
+        var total_h = halves[1].reduce_add()
         var total_c = Int(vc.reduce_add())
         while b < hist.n_bins:
-            total_g += grad_p.unsafe_load(base + b)
-            total_h += hess_p.unsafe_load(base + b)
+            var cell = gh_p.unsafe_load[width=2](2 * (base + b))
+            total_g += cell[0]
+            total_h += cell[1]
             total_c += count_p.unsafe_load(base + b)
             b += 1
         # This feature's own best candidate, held apart from `best` so a
@@ -889,8 +898,7 @@ def find_best_split(
                     "categorical feature has more categories than bins"
                 )
             var cs = find_best_categorical_split(
-                hist._grad,
-                hist._hess,
+                hist._gh,
                 hist._count,
                 base,
                 n_cat,
@@ -1518,23 +1526,22 @@ def find_best_split_shared(
         var level_c = 0
         for l in range(n_leaves):
             var b0 = 0
-            var vg = SIMD[DType.float64, SIMD_LANES](0.0)
-            var vh = SIMD[DType.float64, SIMD_LANES](0.0)
+            var vp = SIMD[DType.float64, 2 * SIMD_LANES](0.0)
             var vc = SIMD[DType.int, SIMD_LANES](0)
-            var gp = hists[l]._grad.unsafe_ptr()
-            var hp = hists[l]._hess.unsafe_ptr()
+            var ghp = hists[l]._gh.unsafe_ptr()
             var cp = hists[l]._count.unsafe_ptr()
             while b0 + SIMD_LANES <= n_bins:
-                vg += gp.unsafe_load[width=SIMD_LANES](base + b0)
-                vh += hp.unsafe_load[width=SIMD_LANES](base + b0)
+                vp += ghp.unsafe_load[width = 2 * SIMD_LANES](2 * (base + b0))
                 vc += cp.unsafe_load[width=SIMD_LANES](base + b0)
                 b0 += SIMD_LANES
-            var total_g = vg.reduce_add()
-            var total_h = vh.reduce_add()
+            var halves = vp.deinterleave()
+            var total_g = halves[0].reduce_add()
+            var total_h = halves[1].reduce_add()
             var total_c = Int(vc.reduce_add())
             while b0 < n_bins:
-                total_g += gp.unsafe_load(base + b0)
-                total_h += hp.unsafe_load(base + b0)
+                var cell = ghp.unsafe_load[width=2](2 * (base + b0))
+                total_g += cell[0]
+                total_h += cell[1]
                 total_c += cp.unsafe_load(base + b0)
                 b0 += 1
             level_c += total_c
@@ -1557,16 +1564,19 @@ def find_best_split_shared(
             var miss_h = 0.0
             var miss_c = 0
             if missing_bin >= 0:
-                miss_g = gp.unsafe_load(base + missing_bin)
-                miss_h = hp.unsafe_load(base + missing_bin)
+                # One line for the pair, where two planes cost two.
+                var mcell = ghp.unsafe_load[width=2](2 * (base + missing_bin))
+                miss_g = mcell[0]
+                miss_h = mcell[1]
                 miss_c = cp.unsafe_load(base + missing_bin)
 
             var left_g = 0.0
             var left_h = 0.0
             var left_c = 0
             for b in range(n_top):
-                left_g += gp.unsafe_load(base + b)
-                left_h += hp.unsafe_load(base + b)
+                var lcell = ghp.unsafe_load[width=2](2 * (base + b))
+                left_g += lcell[0]
+                left_h += lcell[1]
                 left_c += cp.unsafe_load(base + b)
 
                 if score_left:

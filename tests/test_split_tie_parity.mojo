@@ -119,7 +119,7 @@ def _as_histogram(
         grad.append(Float64(words[i]))
         hess.append(Float64(words[size + i]))
         count.append(Int(words[2 * size + i]))
-    return Histogram(grad^, hess^, count^, n_features, n_bins)
+    return Histogram.from_planes(grad^, hess^, count^, n_features, n_bins)
 
 
 def _params() -> GpuSplitParams:

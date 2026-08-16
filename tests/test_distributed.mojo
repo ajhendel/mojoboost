@@ -239,7 +239,11 @@ def test_repeat_growth_is_bit_identical() raises:
 def test_allreduce_schedule_is_one_per_node() raises:
     """The communication schedule is the cost model in docs/distributed.md:
     two reductions to agree on statuses and configuration, then one histogram
-    per tree node, which this prototype sends as three typed buffers."""
+    per tree node, which this prototype sends as TWO typed buffers: the
+    interleaved `(gradient, hessian)` pair plane in one Float64 reduction and
+    the counts in one integer reduction. It was three when the gradient and
+    the hessian were separate planes; the same elements move, in one fewer
+    collective."""
     var n_rows = 200
     var data = _dataset(n_rows, 4, 10, 33)
     var grad = _exact_gradients(n_rows)
@@ -258,7 +262,9 @@ def test_allreduce_schedule_is_one_per_node() raises:
         params,
         comm,
     )
-    assert_equal(comm.calls, 2 + 3 * tree.n_leaves)
+    assert_equal(comm.calls, 2 + 2 * tree.n_leaves)
+    # Unchanged: the pair plane carries two elements per cell and the count
+    # plane one, which is the three per cell the three buffers carried.
     assert_equal(
         comm.elements,
         4 + 2 * 4 + 3 * tree.n_leaves * data.n_features * data.n_bins,

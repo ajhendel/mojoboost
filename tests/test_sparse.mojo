@@ -633,8 +633,9 @@ def test_sparse_histogram_matches_dense() raises:
     _assert_counts_equal(want._count, got._count)
     # Gradient and hessian sums differ only by the rounding of one
     # subtraction per (feature, default bin).
-    assert_true(_max_abs_diff(want._grad, got._grad) < 1e-9)
-    assert_true(_max_abs_diff(want._hess, got._hess) < 1e-9)
+    # One comparison over the interleaved pair plane covers both, since a
+    # cell's gradient and hessian are adjacent in it.
+    assert_true(_max_abs_diff(want._gh, got._gh) < 1e-9)
 
     var rows = List[Int]()
     for r in range(0, n_rows, 3):
@@ -642,8 +643,7 @@ def test_sparse_histogram_matches_dense() raises:
     var want_sub = build_histogram_subset(binned, grad, hess, rows)
     var got_sub = build_histogram_sparse_subset(sparse, grad, hess, rows)
     _assert_counts_equal(want_sub._count, got_sub._count)
-    assert_true(_max_abs_diff(want_sub._grad, got_sub._grad) < 1e-9)
-    assert_true(_max_abs_diff(want_sub._hess, got_sub._hess) < 1e-9)
+    assert_true(_max_abs_diff(want_sub._gh, got_sub._gh) < 1e-9)
 
 
 def test_sparse_histogram_grouped_matches_masked() raises:
