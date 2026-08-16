@@ -607,7 +607,50 @@ def _publish_row_ranges(
 
     This is host bookkeeping only. It enqueues nothing, transfers nothing and
     waits for nothing, and it costs one list write per node.
+
+    **It is also the only thing that lifts the table's staleness refusal, and
+    it lifts it only after proving the replay was complete.**
+    `GpuActiveRows.enqueue_partition_desc` poisons the table on every step, so
+    between the first split of a resident tree and this function every window
+    accessor raises rather than returning a stale window. The
+    `end_descriptor_partition` call below is what ends that, and it checks two
+    things before it does: that the replay wrote a window for every node the
+    tree ended with (`snap.next_node` of them), and that those windows tile
+    the active prefix. See `LeafRangeTable.end_descriptor_partition` for why
+    both are needed and what each one catches.
+
+    Does the replay in fact cover every node? Yes, and the argument is short
+    enough to state. `_pick_and_commit_kernel` advances `CTR_NEXT_NODE` by
+    exactly two per commit and hands the two new ids to the parent it logged,
+    so the finished tree's node ids are `0` (the root, whose window
+    `reset_root` wrote) together with the two children of each logged commit,
+    and there are `1 + 2 * commits` of them. The loop below visits every
+    logged commit and `LeafRangeTable.split` writes both children of each, so
+    the replay covers the tree exactly when the log holds every commit.
+
+    That last clause is the check immediately below, and it is the one that
+    has to be made here rather than in the table. The kernel stops appending
+    to the log once it is full, and a *missing* commit is invisible to the
+    table: `_grow_to` back-fills the gap with empty ranges, and the parent
+    whose commit went missing stays a live leaf owning the rows its children
+    should have, so the node count and the tiling both come out right on a
+    table that is wrong. The identity `2 * len(commit_order) + 1 ==
+    next_node` is what sees it, because every commit creates exactly two
+    nodes; nothing downstream can reconstruct it once the log has been
+    replayed and thrown away.
     """
+    if 2 * len(snap.commit_order) + 1 != snap.next_node:
+        raise Error(
+            "the device commit log holds ",
+            len(snap.commit_order),
+            " commits, which account for ",
+            2 * len(snap.commit_order) + 1,
+            " nodes, but the tree ended with ",
+            snap.next_node,
+            "; replaying a log that does not account for the whole tree"
+            " would leave the host row-range table describing a different"
+            " tree from the one the device grew",
+        )
     for k in range(len(snap.commit_order)):
         var parent = snap.commit_order[k]
         if parent < 0 or parent >= len(snap.nodes):
@@ -619,6 +662,7 @@ def _publish_row_ranges(
         _ = builder.rows.ranges.split(
             parent, left, right, snap.nodes[left].count
         )
+    builder.rows.ranges.end_descriptor_partition(snap.next_node)
 
 
 def grow_tree_device_resident(
