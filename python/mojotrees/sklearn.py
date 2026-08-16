@@ -79,6 +79,45 @@ from ._fit_args import (
 )
 from ._ranking import _check_relevance, _group_buffer, ndcg_score
 
+#: `grow_policy` spellings this estimator accepts and the canonical value
+#: each resolves to.
+#:
+#: The canonical values are XGBoost's and CatBoost's words for the three
+#: growths, per the `grow_policy` row of docs/PARAMETER_NAMING.md:
+#: `lossguide` (best gain anywhere, LightGBM's growth and the default),
+#: `depthwise` (a level at a time), and `symmetrictree` (one split per
+#: level, shared by every node at that level). `leafwise`, `oblivious` and
+#: `symmetric` are accepted aliases, and "oblivious" stays the word for the
+#: *shape* in prose.
+#:
+#: **Why this table exists rather than `_fit_args._GROW_POLICIES`.** That
+#: one carries the two frontier orders and nothing else, so
+#: `growth_policy.GROW_OBLIVIOUS` -- which shipped in the Mojo package and
+#: which `src/mojotrees/tree.mojo` grows -- could not be asked for through
+#: the estimator at all. Every `bench/real_data` arm and every
+#: scikit-learn user goes through this validator, so a policy that was
+#: built, tested and merged was absent from the API.
+#:
+#: The value here is what `_params` sends to the native layer.
+#: `growth_policy.parse_grow_policy` accepts all three words and is the one
+#: resolver every fit entry point reaches, through `_parse_params` in
+#: `bindings/_mojotrees.mojo`; `lossguide` reaches `GROW_LEAFWISE`,
+#: `depthwise` reaches `GROW_DEPTHWISE`, and `symmetrictree` reaches
+#: `GROW_OBLIVIOUS`. The dense CPU grower honors the last of those and the
+#: sparse and GPU growers refuse it by name from `GrowthSchedule.__init__`,
+#: so there is no path on which it is accepted and dropped.
+_CANONICAL_GROW_POLICIES = {
+    "lossguide": "lossguide",
+    "leafwise": "lossguide",
+    "leaf_wise": "lossguide",
+    "depthwise": "depthwise",
+    "depth_wise": "depthwise",
+    "symmetrictree": "symmetrictree",
+    "symmetric_tree": "symmetrictree",
+    "symmetric": "symmetrictree",
+    "oblivious": "symmetrictree",
+}
+
 
 class _Base(_ParamsMixin):
     """Shared hyperparameters, mojotrees defaults (LightGBM-matched).
@@ -101,18 +140,31 @@ class _Base(_ParamsMixin):
     unlimited. Under the default growth a depth-bounded tree is still
     unbalanced and usually has fewer than `2**max_depth` leaves.
 
-    `grow_policy` is XGBoost's parameter of that name (LightGBM has no
-    equivalent). "leafwise", the default and LightGBM's growth, splits the
-    leaf with the largest gain anywhere in the tree next; "depthwise" splits
-    every leaf at one depth before any deeper one, so a tree fills level by
-    level and is balanced. `num_leaves` stays a hard bound in both: a
-    depth-wise level that would overrun it is admitted as its highest-gain
-    prefix, so at the default `num_leaves=31` and unlimited `max_depth` a
-    depth-wise tree fills four levels (16 leaves) and half of a fifth. Set
-    `max_depth` deliberately for depth-wise runs; a leaf-wise configuration
-    is not a sensible one to inherit. "lossguide" is accepted as XGBoost's
-    alias for "leafwise". Depth-wise growth is honored on the CPU and GPU
-    trainers alike (dense and sparse); the distributed prototype rejects it.
+    `grow_policy` is XGBoost's and CatBoost's parameter of that name
+    (LightGBM has no equivalent) and takes three values, case insensitively:
+
+    - `"lossguide"`, the default, splits the leaf with the largest gain
+      anywhere in the tree next. This is LightGBM's growth, and `leafwise`
+      is accepted as an alias.
+    - `"depthwise"` splits every leaf at one depth before any deeper one, so
+      a tree fills level by level and is balanced. `num_leaves` stays a hard
+      bound: a level that would overrun it is admitted as its highest-gain
+      prefix, so at the default `num_leaves=31` and unlimited `max_depth` a
+      depth-wise tree fills four levels (16 leaves) and half of a fifth. Set
+      `max_depth` deliberately for depth-wise runs; a leaf-wise
+      configuration is not a sensible one to inherit.
+    - `"symmetrictree"` grows oblivious trees, CatBoost's default and its
+      word for them: one split is chosen per level and every node at that
+      level uses it, so the tree is symmetric by construction. `max_depth`
+      is REQUIRED there and is the only bound on the tree's size --
+      `num_leaves` does not bind, because a level splits entirely or not at
+      all. `oblivious` and `symmetric` are accepted as aliases, and
+      "oblivious" stays the word for the shape in prose.
+
+    Depth-wise growth is honored on the CPU and GPU trainers alike (dense
+    and sparse); the distributed prototype rejects it. Symmetric growth is
+    honored by the dense CPU grower; the sparse and GPU growers refuse it by
+    name rather than growing a tree that is not symmetric.
 
     `bagging_fraction` and `bagging_freq` are LightGBM's row bagging: every
     `bagging_freq` rounds, each row is kept independently with probability
@@ -288,7 +340,7 @@ class _Base(_ParamsMixin):
         self,
         num_leaves=31,
         max_depth=-1,
-        grow_policy="leafwise",
+        grow_policy="lossguide",
         learning_rate=0.1,
         n_estimators=100,
         min_data_in_leaf=20,
@@ -885,6 +937,26 @@ class _Base(_ParamsMixin):
             )
         return alias_value
 
+    def _resolve_grow_policy(self):
+        """The canonical `grow_policy` value a fit runs under.
+
+        One of `lossguide`, `depthwise`, `symmetrictree`
+        (docs/PARAMETER_NAMING.md), resolved case insensitively from any of
+        the spellings in `_CANONICAL_GROW_POLICIES`. That is the string
+        `_params` sends, and `growth_policy.parse_grow_policy` on the other
+        side accepts all three.
+        """
+        value = self.grow_policy
+        if isinstance(value, str):
+            resolved = _CANONICAL_GROW_POLICIES.get(value.strip().lower())
+            if resolved is not None:
+                return resolved
+        raise ValueError(
+            "grow_policy must be 'lossguide' (alias 'leafwise'), "
+            "'depthwise', or 'symmetrictree' (aliases 'oblivious', "
+            f"'symmetric'), got {self.grow_policy!r}"
+        )
+
     def _params(
         self,
         sample_weight_addr,
@@ -982,12 +1054,7 @@ class _Base(_ParamsMixin):
             raise ValueError("feature_fraction must be in (0, 1]")
         if not 0.0 < float(feature_fraction_bynode) <= 1.0:
             raise ValueError("feature_fraction_bynode must be in (0, 1]")
-        grow_policy = str(self.grow_policy)
-        if grow_policy not in _GROW_POLICIES:
-            raise ValueError(
-                "grow_policy must be 'leafwise' (alias 'lossguide') or "
-                f"'depthwise', got {self.grow_policy!r}"
-            )
+        grow_policy = self._resolve_grow_policy()
         if int(self.max_cat_to_onehot) < 0:
             raise ValueError("max_cat_to_onehot must be nonnegative")
         if int(self.max_cat_threshold) < 1:
@@ -1003,9 +1070,11 @@ class _Base(_ParamsMixin):
         return {
             "num_leaves": int(self.num_leaves),
             "max_depth": int(self.max_depth),
-            # Sent as its canonical name; the binding parses it with the same
-            # function the parameter string goes through.
-            "grow_policy": _GROW_POLICIES[grow_policy],
+            # Sent as its canonical value; the binding parses it with the
+            # same `growth_policy.parse_grow_policy` the parameter string
+            # goes through, which is the one resolver every fit entry point
+            # reaches.
+            "grow_policy": grow_policy,
             "learning_rate": learning_rate,
             "n_estimators": int(self.n_estimators),
             "min_data_in_leaf": int(min_data_in_leaf),
