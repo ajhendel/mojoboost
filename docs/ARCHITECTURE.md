@@ -161,8 +161,8 @@ to LightGBM by 1.30x, resolved. Both figures, and the caveats that qualify them
 
 | Owner | What | Why it lives there |
 |---|---|---|
-| GPU | binned matrix, gradients and hessians, active-row permutation and leaf ranges, histogram accumulation, stable row partitioning, native objective evaluation and score advancement, device split search when selected | every one of these scales with `n_rows`, and none of it crosses the boundary during a fit (`train_gpu.mojo`, `gpu_active_rows.mojo`, `gpu_objectives_native.mojo`, `gpu_frontier.mojo`) |
-| CPU | boosting coordination, split selection over histograms of `n_features x n_bins` cells, the tree model, leaf-value renewal, prediction, host row sampling for bagging and GOSS | latency-bound scalar work over data that does not scale with `n_rows`; the host scan of a 50 x 255 histogram costs microseconds and a device scan of it costs a launch and a synchronization |
+| GPU | binned matrix, gradients and hessians, active-row permutation and leaf ranges, histogram accumulation, split search, stable row partitioning, native objective evaluation and score advancement | every one of these scales with `n_rows`, and none of it crosses the boundary during a fit (`train_gpu.mojo`, `gpu_active_rows.mojo`, `gpu_objectives_native.mojo`, `gpu_frontier.mojo`) |
+| CPU | boosting coordination, the tree model, leaf-value renewal, prediction, host row sampling for bagging and GOSS | latency-bound scalar work over data that does not scale with `n_rows` |
 | CPU | the entire fit below the launch-cost crossover (`device_policy.mojo`) | a kernel launch plus a synchronization is a fixed cost per node, and below the crossover the whole fit is cheaper where no launch is paid. Per-leaf hybrid placement above the crossover was tried and deleted on 2026-08-16; see the note below |
 | CPU | the reference implementation the GPU path is verified against | the host fixed-point replica (`histogram.build_histogram_subset_replica_into`) has been shown bit-identical to the device build, and the CPU trainer is the oracle every GPU test compares to |
 
@@ -170,11 +170,9 @@ to LightGBM by 1.30x, resolved. Both figures, and the caveats that qualify them
 CPU/GPU leaf scheduler (`hybrid_leaf_scheduler.mojo`, double opt-in behind
 `MOJOTREES_HYBRID_LEAVES` and `MOJOTREES_HYBRID_COSTS=apple-m4`) elected
 individual small leaves onto the host, on the premise that the host could
-usefully take the leaves the device was slow at. It measured 1.20x on a
-bagged 20,000-row fit, and it only ever reached host-gradient runs. The
-premise is gone: the device-resident tree plane now beats the host path at
-every shape measured, all resolved under rule M0 — 2.2x at 50,000 rows, 44
-percent at 250,000, 24 percent at 1,000,000
+usefully take the leaves the device was slow at. It only ever reached
+host-gradient runs, and its premise is gone: the device-resident tree plane
+beats the host path at every shape measured, all resolved under rule M0
 (`bench/results/session3_2026-08-16/RESULTS.md`). What survives the deletion
 is the host replica builder itself, which was never the scheduler's: it is
 the oracle in the row above. The design record is
@@ -191,37 +189,16 @@ validation scoring, which walks the tree on the host; and the binning pass
 itself. Each is named in `train_gpu.mojo`'s module docstring with the switch
 that selects it.
 
-The end-to-end measurement of the split as it stands is
-`bench/results/profile_2026-08-15/RESULTS.md`. On an Apple M4 at 100 rounds,
-31 leaves, 255 bins, squared error, the GPU is **1.85x** the CPU trainer at
-1,000,000 x 50 (3.58s against 6.98s), loses to it at 250,000 (1.89 against
-1.66) and at 50,000 (1.63 against 0.564), and wins multiclass by 1.63x
-(15.30 against 25.47 at 465,000 x 54 over 7 classes).
-`bench/results/apple_m4_large_scaling_2026-08-14.md` recorded 2.6x at one
-million and 3.3x at five million at half the resident memory; that ratio has
-since fallen to 1.85x because the CPU trainer got 1.63x faster in the round
-that followed, not because the device got slower.
-
-`bench/results/sweep2_2026-08-15/RESULTS.md` extends that to 2,000,000 rows
-and fits the two libraries' cost per row against each other. The finding that
-bears on this division of labor is that our GPU's marginal cost per row and
-LightGBM's on ten CPU cores are even, 2.33 to 2.46 microseconds across four
-fitted segments, and the remaining deficit is roughly one second of fixed
-cost derived from the intercepts. A GPU whose per-row cost equals a laptop
-CPU's is not yet earning its data plane, so the control plane is a necessary
-fix and not a sufficient one: removing all of the fixed cost is **estimated**
-to reach parity at 1,000,000 rows and stop there.
-
-Where the device's time goes is measured too, and it is the mechanism behind
-the third row of the table above. The Metal timeline in
-`docs/METAL_TIMELINE.md` finds the GPU idle for 76.5% of a training span at
-200,000 rows at the device's Maximum clock, with the host blocking on 94.1%
-of blits and on 2 of 18,701 compute kernels. That is 32.1 serialization
-points per round at 606 microseconds each, and compute of every kind is
-22.9% of a round. The control plane's per-split host round trip is therefore
-the dominant cost of a GPU fit today, which is a cost of this division of
-labor rather than an argument against it, and it is what a device-owned tree
-would remove.
+The end-to-end measurement of the split as it stands is the recorded
+comparison quoted at the top of this section, and it is the only one. The
+earlier records under `bench/results/` are provenance rather than current
+description, for two reasons that apply to all of them at once: they were
+taken before `lambda_l2` moved to LightGBM's stock 0.0 on 2026-08-16, so
+both engines grew different trees than they grow today, and their GPU arms
+ran a host split scan that has since been deleted. That includes the Metal
+timeline in `docs/METAL_TIMELINE.md`, whose per-split host round trip was a
+property of that scan: the recorded comparison counts roughly two host
+synchronizations per tree, not one per split.
 
 ## Where each policy lives
 
