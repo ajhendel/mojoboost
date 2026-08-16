@@ -59,12 +59,43 @@ changes a record. Every record therefore carries
 winner, over every scanned feature, so the margin the decision was made by
 is a number the host can see. `GpuSplitRecord.is_near_tie` tests the margin
 against a relative tolerance (`SPLIT_TIE_RELATIVE`, deliberately several
-ulps wide), and `host_rescan_recommended` is the policy: a run that needs
-CPU/GPU agreement redoes exactly those nodes with the host scan, one node
-at a time, and keeps the device decision everywhere else. Tracking the
-runner-up costs one compare per candidate and cannot change which candidate
-wins. `frontier_margin` reports the same quantity one level up, where it
-decides which leaf splits next.
+ulps wide) *and* against `GpuSplitRecord.resolution_floor`, the absolute
+width the scan's own arithmetic could not see past on that node.
+`host_rescan_recommended` is the policy: a run that needs CPU/GPU agreement
+redoes exactly those nodes with the host scan, one node at a time, and keeps
+the device decision everywhere else. Tracking the runner-up costs one
+compare per candidate and cannot change which candidate wins.
+`frontier_margin` reports the same quantity one level up, where it decides
+which leaf splits next.
+
+Note the shape of the two widths, because a relative one alone is the wrong
+test and was the only test here until this file's own account of its
+resolution was read back against it. That resolution is set by
+`parent_score / gain`, not by the gain, so at a nearly pure leaf the margin
+below which two candidates are indistinguishable is a large multiple of
+`SPLIT_TIE_RELATIVE * gain`. A parity run gated on the relative width alone
+would report no near ties on exactly the nodes where a decision flips.
+
+**Where the CPU/GPU disagreement is not.** It is not the tie-break. The
+host's rule is "highest gain; among equal gains, the first in scan order",
+reached by a strict `>` over an ascending walk, and every arm here
+reproduces it: the serial scan and the wide scan by the same strict `>` over
+an ascending candidate ordinal, the serial fold over ascending slots, and
+the threadgroup fold by `block.max` on the gain then `block.min` on the slot
+of the threads holding it, which is that rule split in two.
+`tests/test_split_tie_parity.mojo` constructs exact ties in all three shapes
+a tie can take -- two bins of one feature, two features whose winners sit at
+different bins, and the two missing directions of one bin -- under both gain
+forms, and `tests/test_gpu_split_tie_parity.mojo` holds the kernels to the
+same answers, including a node with more feature slots than one reduce
+thread owns. On identical histograms the replica and `find_best_split` also
+chose the identical split on every one of twelve hundred pseudo-random nodes
+across three gradient regimes and both gain forms. What is left to explain a
+prediction gap is the two documented numeric differences below plus the fact
+that the two backends do not read the same histogram at all: the device
+reads fixed-point sums of quantized gradients, the host reads Float64 sums.
+Both push near ties over, and `host_rescan_recommended` is the answer to
+both; it is built and tested here and, as of this writing, has no caller.
 
 Semantics
 ---------
@@ -215,7 +246,7 @@ an interleaved benchmark resolves it and not before.
 """
 
 from std.gpu import block_idx, thread_idx
-from std.math import fma
+from std.math import fma, sqrt
 from std.memory import stack_allocation
 from std.os import getenv
 from std.sys import has_accelerator
@@ -318,6 +349,19 @@ comptime NODE_WORDS = 2
 # one node and being too lax silently accepts a split the host would not
 # have chosen.
 comptime SPLIT_TIE_RELATIVE = Float64(1e-6)
+
+# Float32's unit roundoff, 2^-23. Named because the near-tie test below
+# derives an absolute floor from it and a relative constant cannot stand in
+# for that floor; see `GpuSplitRecord.resolution_floor`.
+comptime SPLIT_F32_EPS = Float64(1.1920928955078125e-7)
+
+# How many roundings the near-tie floor allows for. A gain is a difference of
+# quotients over dequantized sums, so a computed gain sits a small multiple of
+# the unit roundoff away from the exact one rather than exactly one. Eight is
+# the same allowance `SPLIT_TIE_RELATIVE` above already makes (1e-6 is about
+# eight times 1.2e-7), kept the same here so the two halves of the test are
+# conservative by the same amount.
+comptime SPLIT_TIE_ROUNDINGS = Float64(8.0)
 
 # --- Per-node float parameter block --------------------------------------
 #
@@ -2612,8 +2656,58 @@ struct GpuSplitRecord(Copyable, Movable, Writable):
         var m = self.gain - self.runner_gain
         return m if m > 0.0 else 0.0
 
+    def parent_score_bound(self) -> Float64:
+        """An upper bound on this node's parent score, from the record.
+
+        The parent score is `T(G)^2 / (H + lambda_l2)` and the parent leaf
+        value is `-T(G) / (H + lambda_l2)`, so the score is
+        `-parent_value * T(G)`. The record carries `parent_value` and the
+        node's `total.grad`, but not `lambda_l1` and therefore not `T(G)`.
+        Soft-thresholding shrinks toward zero without crossing it, so
+        `|T(G)| <= |G|` with the same sign, which makes `-parent_value * G`
+        the score itself when `lambda_l1` is zero and an upper bound on it
+        otherwise. A bound is the right side to err on: this feeds a floor
+        below which a decision is declared unresolvable, and overstating the
+        floor costs a host rescan of one node while understating it silently
+        keeps a split the host would not have chosen.
+        """
+        var bound = -self.parent_value * self.total.grad
+        return bound if bound > 0.0 else 0.0
+
+    def resolution_floor(self) -> Float64:
+        """The absolute gain difference the device scan could not have
+        resolved on this node, whichever gain form produced the record.
+
+        This is the number `SPLIT_TIE_RELATIVE` cannot express, and leaving
+        it out is what makes a purely relative near-tie test miss the regime
+        it exists for. The module docstring states the two resolutions: the
+        subtractive form cancels against the parent score and resolves to
+        about `eps * parent_score`, an absolute floor that does not shrink
+        as the gain does; `GAIN_FORM_CROSS` never forms that sum and
+        resolves to about `eps * sqrt(parent_score * gain)`. A record does
+        not say which form scored it, so this takes the larger of the two:
+        the subtractive floor at a nearly pure leaf (`parent_score > gain`,
+        the hard case) and the cross floor when the gain is the larger
+        quantity.
+
+        Written as a floor on the *margin* rather than as a relative width,
+        because that is what it is. At `parent_score / gain` in the
+        thousands -- the range `gpu_right_sum`'s own measured table covers,
+        and where a boosted ensemble spends its late rounds -- this floor is
+        orders of magnitude wider than `SPLIT_TIE_RELATIVE * gain`, so a
+        parity run gated on the relative test alone would keep flipped
+        splits and report no near ties at all.
+        """
+        var parent = self.parent_score_bound()
+        var gain = abs(self.gain)
+        var cross = sqrt(parent * gain)
+        var scale = parent if parent > cross else cross
+        return SPLIT_TIE_ROUNDINGS * SPLIT_F32_EPS * scale
+
     def is_near_tie(
-        self, relative: Float64 = SPLIT_TIE_RELATIVE
+        self,
+        relative: Float64 = SPLIT_TIE_RELATIVE,
+        resolution_aware: Bool = True,
     ) -> Bool:
         """Whether this node's decision is inside Float32's resolution.
 
@@ -2628,13 +2722,33 @@ struct GpuSplitRecord(Copyable, Movable, Writable):
         scan when the caller needs CPU/GPU agreement. A node with no
         runner-up (one candidate, or one feature with one admissible bin)
         is never near a tie whatever the margin.
+
+        Two widths, and a margin inside either one answers True. `relative`
+        is a fraction of the gain itself and is what this test has always
+        applied. `resolution_aware` adds `resolution_floor`, the absolute
+        width the scan's arithmetic could not see past on this node, which
+        the relative width cannot stand in for: the two differ by orders of
+        magnitude in exactly the regime where a flip happens, and a node
+        whose margin is a millionth of its gain but a thousandth of its
+        parent score is a coin flip that the relative test alone calls
+        resolved.
+
+        Passing `resolution_aware=False` restores the earlier test exactly,
+        which is what a caller comparing the two policies wants. It is not
+        the cheaper answer: both widths are a few arithmetic operations on a
+        record the caller already holds, and neither reads the device.
         """
         if not self.found or self.runner_gain <= 0.0:
             return False
         var scale = abs(self.gain)
         if scale < abs(self.runner_gain):
             scale = abs(self.runner_gain)
-        return self.margin() <= relative * scale
+        var width = relative * scale
+        if resolution_aware:
+            var floor = self.resolution_floor()
+            if floor > width:
+                width = floor
+        return self.margin() <= width
 
     def to_split_info(self) -> SplitInfo:
         """The `SplitInfo` the existing growers consume, so the device path
@@ -2681,6 +2795,7 @@ def host_rescan_recommended(
     record: GpuSplitRecord,
     tie_relative: Float64 = SPLIT_TIE_RELATIVE,
     enabled: Bool = True,
+    resolution_aware: Bool = True,
 ) raises -> Bool:
     """The conservative fallback contract, in one place.
 
@@ -2705,6 +2820,12 @@ def host_rescan_recommended(
     from the environment here, because the trainer already owns the split
     strategy resolution and one place should decide it.
 
+    `resolution_aware` is passed straight to `is_near_tie` and defaults the
+    same way, so this policy sees the absolute Float32 resolution floor as
+    well as the relative width. False is the pre-floor policy, kept reachable
+    because it is the arm a comparison of the two needs; it is strictly
+    narrower, so it recommends a subset of the rescans.
+
     Raises for a nonpositive tolerance, which would silently disable the
     check.
     """
@@ -2712,7 +2833,7 @@ def host_rescan_recommended(
         raise Error("the near-tie tolerance must be positive")
     if not enabled:
         return False
-    return record.is_near_tie(tie_relative)
+    return record.is_near_tie(tie_relative, resolution_aware)
 
 
 def frontier_margin(records: List[GpuSplitRecord]) raises -> Float64:
