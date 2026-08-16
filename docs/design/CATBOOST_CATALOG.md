@@ -358,3 +358,108 @@ including trees this round has not grown yet -- and CatBoost defaults
 once per round over the whole row set; there is no per-leaf, shifted-score
 call shape to ask it for). The renewing objectives and GOSS are refused by
 the same `boosting._check_leaf_estimation_config` the CPU trainer calls.
+
+## A9, MultiRMSE (multi-target regression), device derivative plane
+
+Status, 2026-08-16 (`lane/multitarget-device`): the **device derivative plane
+and its per-output fixed-point scales are built and tested**; nothing above
+them exists on either backend, and the path is **unreachable from any
+user-facing API by construction**. Read the reachability paragraph at the
+bottom of this section before quoting the first sentence.
+
+**Tree shape, and why it is not CatBoost's.** CatBoost's MultiRMSE grows one
+tree whose leaves hold a vector of `ApproxDimension` values and whose split is
+scored against a gain summed over dimensions. mojotrees grows **K trees per
+round, one scalar-leaf tree per output**, and this lane implements that shape.
+It is the only shape the rest of the codebase can express: `tree.Tree.value`
+is a `List[Float64]` indexed by node id and `Tree.predict_row` returns one
+`Float64`, so a leaf cannot hold a vector without a new field on `Tree` and a
+second dimension through every serializer, dumper and predictor that reads it.
+It is also the shape mojotrees already uses for its one existing multi-output
+trainer: `objective_is_multi_output` *defines* multi-output as "whether one
+boosting iteration grows more than one tree", and
+`boosting._boost_rounds_multiclass` grows `trees[round * n_classes + k]`. A
+device path emitting vector-leaf trees would have no host model to put them
+in. **This is a divergence from CatBoost and is recorded as one**, not a
+parity claim.
+
+**What the other shape would cost, since it was not built.** Two things, in
+two files this lane does not own. (1) A gain summed over outputs in
+`gpu_split_search.mojo`: a candidate would score `sum_j gain(G_j, H_j)` across
+`n_outputs` histogram planes at one split point instead of one plane, which
+changes the reduction the split kernel performs and the argmax it feeds. The
+histogram *accumulation* needs nothing -- it already builds one plane per
+slot. (2) A vector leaf value in `tree.mojo` and `model.mojo`. Neither is
+refused as a runtime error, because neither is reachable: no type here can
+hold a vector leaf, so no caller can ask for one.
+
+**Derivatives.** Uncoupled, and that is the whole reason this was cheap.
+Softmax couples its outputs -- class `k`'s gradient reads a denominator summed
+over every class, so a round needs a probability pass before any class's
+gradient exists. MultiRMSE does not: output `j`'s gradient is
+`w * (raw[r, j] - y[r, j])` and reads nothing of output `j'`. So `prob_dev`,
+`refresh_softmax` and the probability pass all disappear, and
+`_multi_grad_hess_kernel` is a pure per-(row, output) map that writes the same
+class-major plane `grad[slot * n_rows + r]` the batched softmax kernel writes.
+Everything downstream is the multiclass machinery **unchanged**:
+`GpuClassBatch.magnitude_sums`, `set_scales`, `scatter_slot` and every batched
+histogram kernel take a multi-target round without one line changed, and
+`update_raw(k=j)` advances output `j`'s slot exactly as it advances class
+`k`'s. The one new method in `gpu_multiclass_batch.mojo` is
+`fill_multi_output_gradients`, which is the launch and nothing else.
+
+**One scale per output, never one shared.** The fixed-point scale is per round
+and derived from gradient magnitudes, and with K outputs there are K magnitude
+profiles. `GpuClassBatch.set_scales` already answers this per slot and the
+multi-target path inherits the answer unchanged. This hazard is *sharper* here
+than under softmax: softmax classes share a probability simplex and so cannot
+differ by orders of magnitude, while a vector target routinely puts one output
+in units of 1 beside another in units of 1000. A shared scale would size the
+small output's lattice by the large output's magnitudes and quantize its
+gradients toward zero, silently -- the fit would converge on the large output
+and barely move on the small one.
+`tests/test_gpu_multitarget.mojo` fixes three outputs three orders of
+magnitude apart for exactly this, and asserts each slot's scale **equals**
+what the scalar device path derives for that output alone. Equal-scale outputs
+would pass a shared-scale implementation and would also hide an output-index
+error entirely, since swapping two identically-scaled planes changes nothing
+observable.
+
+**Weights.** Per-row, not per (row, output): a sample weight weights the
+observation and every output of it, which is what lets one weight plane serve
+every output slot of a launch. A weighted multi-target round therefore stages
+both derivative planes per output rather than the gradient alone, 9 bytes per
+(row, feature) visit at the default feature group where an unweighted one is
+on 7. That is the A4 arithmetic applied per output, by construction, and not a
+regression.
+
+**Bits do not move for a single-output fit.** The `multi_output` constructor
+parameter defaults False and every scalar statement computes what it computed
+before it existed. `git diff -U0` on `gpu_objectives_native.mojo` deletes
+exactly twelve lines: one import, four docstring lines, one error *message*,
+and six constructor statements, each of the six replaced by an expression
+equal to it at `multi_output == False` --
+`_check_weight_vector(..., n_rows)` for `(..., len(target))`,
+`self.n_rows = n_rows` for `= len(target)`, `target_dev` sized `len(target)`
+for `self.n_rows`, the upload loop over `range(len(target))` for
+`range(self.n_rows)`, and `and not multi_output` appended to the two
+`n_classes > 1` tests. **No kernel body is touched at all** -- not
+`_grad_hess_kernel`, not `_abs_sum_kernel`, not the softmax or raw-update
+kernels. Empirically, `tests/test_gpu_objectives_native.mojo` passes 16/16
+unchanged.
+
+**REACHABILITY: none, and this is the entry that says so.** Walked end to end
+rather than checked at its entry point. `python/mojotrees/sklearn.py` has no
+multi-target objective name and no estimator that accepts a 2-D `y` -- not an
+allow-list gap, a missing estimator class. `params.mojo` has no `num_targets`
+key and `_validate` refuses `num_class` for every objective but `multiclass`,
+so a multi-target fit cannot be spelled in a parameter string.
+`trainset.Dataset` holds one `List[Float64]` label column, so a target matrix
+cannot be expressed at the dataset level. No multi-target objective code
+exists in `objective_registry`. Nothing calls `fill_multi_grad_hess` but the
+test. Making it reachable is four further pieces of work, none of them in
+these files: a label matrix on `Dataset`, a `num_targets` parameter, a
+`train_multi_target` round loop shaped like `_boost_rounds_multiclass`, and a
+multi-output estimator on the Python side. Until then a user asking for
+MultiRMSE gets a name error from sklearn.py, which is a refusal; the failure
+mode to avoid is the opposite one, an accepted parameter with no reader.

@@ -127,6 +127,7 @@ from max.gpu.host import DeviceBuffer, DeviceContext, HostBuffer
 from max.gpu.memory import AddressSpace
 from max.gpu.sync import barrier
 
+from .boosting import SQUARED_ERROR
 from .gpu_active_rows import MAX_ROWS
 from .gpu_objectives_native import (
     HESS_FLOOR,
@@ -1092,6 +1093,60 @@ struct GpuClassBatch(Movable):
             Int32(1) if state.weighted else Int32(0),
             grid_dim=(self._row_blocks(), k_count),
             block_dim=self.block_threads,
+        )
+        self.has_gradients = True
+        self.has_scales = False
+
+    def fill_multi_output_gradients(
+        mut self,
+        mut state: GpuObjectiveState,
+        j_begin: Int,
+        j_count: Int,
+        objective: Int = SQUARED_ERROR,
+    ) raises:
+        """Fill slots `0 .. j_count-1` with the MultiRMSE derivatives of
+        outputs `j_begin .. j_begin+j_count-1`.
+
+        The multi-target twin of `fill_gradients`, and the only new code a
+        multi-target round needs from this file. Everything after it is this
+        struct unchanged: `refresh_scales(j_count)` gives each output its own
+        fixed-point scale from its own magnitude reduction (see `set_scales`
+        -- the hazard it exists for, one slot's lattice sized by another
+        slot's magnitudes, is *sharper* under a vector target than under
+        softmax, whose classes share a probability simplex and so cannot
+        differ by orders of magnitude), `scatter_slot` hands one output's
+        plane to a grower, and every batched histogram enqueue takes the
+        plane without knowing what filled it.
+
+        There is no probability precondition, which is the one line of
+        `fill_gradients`'s contract that does not carry over:
+        `state.refresh_softmax` must run before a softmax batch because
+        class `k`'s gradient reads a denominator summed over every class,
+        and a MultiRMSE output's gradient reads nothing but its own column.
+        A caller that calls `refresh_softmax` on a multi-target state is
+        refused there by name rather than quietly given a stale plane.
+
+        Slot `c` always carries output `j_begin + c`, the same
+        slot-to-output contract `fill_gradients` holds for classes, so
+        results collected by ascending slot are in ascending output order.
+        """
+        if not state.multi_output:
+            raise Error(
+                "fill_multi_output_gradients requires a multi-output"
+                " objective state (multi_output=True); a softmax state"
+                " belongs on fill_gradients"
+            )
+        if state.n_rows != self.n_rows:
+            raise Error("objective state and class batch disagree on n_rows")
+        if j_count < 1 or j_count > self.cap:
+            raise Error("output batch size out of range")
+        state.fill_multi_grad_hess(
+            self.ctx,
+            objective,
+            j_begin,
+            j_count,
+            self.grad_dev,
+            self.hess_dev,
         )
         self.has_gradients = True
         self.has_scales = False
