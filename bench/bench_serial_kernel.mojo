@@ -15,6 +15,23 @@ scatter, selected by `MOJOTREES_CPU_SERIAL_KERNEL`, plus LightGBM. They are
 round and is kept in the source for exactly this reason: a decomposition that
 cannot be re-taken is a decomposition nobody can check.
 
+**What it measured the first time it ran**, 2026-08-16, at the default shape,
+raw transcripts in `bench/results/serial_kernel_2026-08-16/`: `base -> stride`
+1.035x at one thread and 1.030x at ten, consistent in sign but inside the
+noise; `stride -> packed` 1.213x and 1.120x, faster in **twelve of twelve**
+paired repeats at both thread counts; `packed -> full` 1.000x and 1.001x, a
+null. All four arms produced digest 222091343700048511 at both thread counts.
+
+**Read the verdict lines with the plateau in mind.** The `_plateau` reduction
+assumes the engines climb and then level. In that run they climbed and kept
+climbing -- at one thread `full` ran 14.44 s on repeat 1 and 16.17 s on repeat
+12, and LightGBM moved with it -- so the plateau straddles two thermal
+regimes, its spread is the drift rather than the noise, and the printed
+verdict says `indistinguishable` for differences that do not overlap inside
+either regime. The interleaving is what makes the comparison survive that.
+The per-repeat paired ratio is the reduction to compute from `*_samples:` when
+it happens, and it is the one the numbers above are quoted from.
+
 **Why this is a file and not four commits measured one at a time.** This
 machine drifts by factors of two and three across time windows, and this
 repository has a recorded case of one command on one revision measuring

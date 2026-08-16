@@ -2449,6 +2449,31 @@ def _accumulate_subset_at[
 # without it.
 #
 # `full` is the default. The others exist so the decomposition can be re-taken.
+#
+# **Measured, 2026-08-16, 799,110 x 100, twelve repeats, arms interleaved in
+# one process with LightGBM 4.7.0 as the in-window anchor.** The ratios below
+# are medians of the *per-repeat paired* ratio, which is the form that is
+# immune to the thermal ramp this box has: both arms of a pair are measured
+# seconds apart under the same heat.
+#
+# | step             | 1 thread | 10 threads | verdict                     |
+# |------------------|----------|------------|-----------------------------|
+# | base -> stride   | 1.035x   | 1.030x     | consistent, not resolved    |
+# | stride -> packed | 1.213x   | 1.120x     | **resolved**, 12/12 repeats |
+# | packed -> full   | 1.000x   | 1.001x     | **null**                    |
+# | base -> full     | 1.259x   | 1.152x     | resolved                    |
+#
+# Against LightGBM in the same process: at one thread we went from 1.331x
+# behind to 1.050x behind, and in the run's hot regime 1.022x, which is a
+# tie. At ten threads, 1.600x behind to 1.380x.
+#
+# **The one-write cell is the whole of it, and the branch removal is a null.**
+# `packed -> full` deletes eight tests per row on twelve of thirteen groups
+# and measured 1.000x at one thread and 1.001x at ten, with the sign flipping
+# between the run's cool and hot regimes. It is kept as the default because it
+# is the shape LightGBM's templates have and it costs nothing, but nobody
+# should expect a number from it. The prediction that it would matter was
+# wrong, and it is recorded here rather than quietly dropped.
 comptime SERIAL_KERNEL_BASE = 0
 comptime SERIAL_KERNEL_STRIDE = 1
 comptime SERIAL_KERNEL_PACKED = 2

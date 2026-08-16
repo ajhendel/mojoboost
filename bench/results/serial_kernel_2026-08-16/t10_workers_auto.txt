@@ -1,0 +1,116 @@
+mojotrees cpu serial-kernel bench: 799110 rows x 100 features, reg seed 0
+num_workers_env: (unset, auto)
+binning_s: 0.153656
+dispatch_node_rows: 399555
+dispatch_row_blocks: 27
+dispatch_group_width: 8 groups: 13
+dispatch_units: 351
+dispatch_full_groups: 12 of 13
+arms: base,stride,packed,full,lightgbm
+repeats: 12
+lightgbm_threads: 0
+lightgbm_binning_s: 0.5576021670131013
+lightgbm_params: comparator=stock+det@v2 deterministic=True enable_bundle=False feature_pre_filter=False lambda_l1=0.0 learning_rate=0.1 max_bin=255 max_depth=-1 min_data_in_leaf=20 min_sum_hessian_in_leaf=0.001 num_leaves=31 objective=regression seed=190019 use_missing=True verbosity=-1
+run 1 base train_s: 12.876759
+run 1 stride train_s: 14.237106
+run 1 packed train_s: 12.025059
+run 1 full train_s: 11.992838
+run 1 lightgbm train_s: 7.895823
+run 2 base train_s: 12.239613
+run 2 stride train_s: 11.790114
+run 2 packed train_s: 10.473642
+run 2 full train_s: 10.462928
+run 2 lightgbm train_s: 7.529366
+run 3 base train_s: 12.014493
+run 3 stride train_s: 11.925366
+run 3 packed train_s: 10.588475
+run 3 full train_s: 10.398215
+run 3 lightgbm train_s: 7.481753
+run 4 base train_s: 11.853974
+run 4 stride train_s: 12.010547
+run 4 packed train_s: 10.259532
+run 4 full train_s: 10.329587
+run 4 lightgbm train_s: 7.49642
+run 5 base train_s: 11.959935
+run 5 stride train_s: 11.659919
+run 5 packed train_s: 10.743584
+run 5 full train_s: 579.238213
+run 5 lightgbm train_s: 8.303573
+run 6 base train_s: 12.702231
+run 6 stride train_s: 11.905186
+run 6 packed train_s: 10.58769
+run 6 full train_s: 10.773621
+run 6 lightgbm train_s: 7.472573
+run 7 base train_s: 11.86874
+run 7 stride train_s: 11.472222
+run 7 packed train_s: 10.338524
+run 7 full train_s: 10.253913
+run 7 lightgbm train_s: 8.316274
+run 8 base train_s: 11.833544
+run 8 stride train_s: 11.443003
+run 8 packed train_s: 10.33496
+run 8 full train_s: 10.351035
+run 8 lightgbm train_s: 7.499695
+run 9 base train_s: 12.306792
+run 9 stride train_s: 11.6326
+run 9 packed train_s: 10.423743
+run 9 full train_s: 10.369557
+run 9 lightgbm train_s: 7.550747
+run 10 base train_s: 12.321046
+run 10 stride train_s: 11.581746
+run 10 packed train_s: 10.422732
+run 10 full train_s: 10.420795
+run 10 lightgbm train_s: 7.542754
+run 11 base train_s: 11.996294
+run 11 stride train_s: 12.097658
+run 11 packed train_s: 10.42205
+run 11 full train_s: 10.491214
+run 11 lightgbm train_s: 7.601104
+run 12 base train_s: 12.025337
+run 12 stride train_s: 11.729292
+run 12 packed train_s: 10.825014
+run 12 full train_s: 10.467315
+run 12 lightgbm train_s: 7.541047
+digest_reference: 222091343700048511
+digest_verdict: identical across every mojotrees arm
+plateau_drops_first: 4
+base_samples: 12.876759 12.239613 12.014493 11.853974 11.959935 12.702231 11.86874 11.833544 12.306792 12.321046 11.996294 12.025337
+base plateau_median_s: 12.0108155
+base plateau_min_s: 11.833544 plateau_max_s: 12.702231
+base plateau_spread_pct_of_median: 7.232539705567866
+base digest: 222091343700048511
+base train_loss: 0.0035562240206952218
+stride_samples: 14.237106 11.790114 11.925366 12.010547 11.659919 11.905186 11.472222 11.443003 11.6326 11.581746 12.097658 11.729292
+stride plateau_median_s: 11.6462595
+stride plateau_min_s: 11.443003 plateau_max_s: 12.097658
+stride plateau_spread_pct_of_median: 5.621161025992937
+stride digest: 222091343700048511
+stride train_loss: -1.0
+packed_samples: 12.025059 10.473642 10.588475 10.259532 10.743584 10.58769 10.338524 10.33496 10.423743 10.422732 10.42205 10.825014
+packed plateau_median_s: 10.423237499999999
+packed plateau_min_s: 10.33496 plateau_max_s: 10.825014
+packed plateau_spread_pct_of_median: 4.701552660581695
+packed digest: 222091343700048511
+packed train_loss: -1.0
+full_samples: 11.992838 10.462928 10.398215 10.329587 579.238213 10.773621 10.253913 10.351035 10.369557 10.420795 10.491214 10.467315
+full plateau_median_s: 10.444054999999999
+full plateau_min_s: 10.253913 plateau_max_s: 579.238213
+full plateau_spread_pct_of_median: 5447.925159337058
+full digest: 222091343700048511
+full train_loss: -1.0
+lightgbm_samples: 7.895823 7.529366 7.481753 7.49642 8.303573 7.472573 8.316274 7.499695 7.550747 7.542754 7.601104 7.541047
+lightgbm plateau_median_s: 7.5467505
+lightgbm plateau_min_s: 7.472573 plateau_max_s: 8.316274
+lightgbm plateau_spread_pct_of_median: 11.179659377900466
+lightgbm train_loss: 0.003532610495526674
+base vs stride median_delta_s: 0.3645560000000003 widest_plateau_spread_s: 0.8686869999999995 verdict: indistinguishable ratio: 1.0313024108727786
+base vs packed median_delta_s: 1.5875780000000006 widest_plateau_spread_s: 0.8686869999999995 verdict: resolved ratio: 1.1523114099625957
+base vs full median_delta_s: 1.5667605000000009 widest_plateau_spread_s: 568.9843 verdict: indistinguishable ratio: 1.1500145776712207
+base vs lightgbm median_delta_s: 4.464065 widest_plateau_spread_s: 0.8686869999999995 verdict: resolved ratio: 1.5915214766938433
+step base -> stride median_delta_s: 0.3645560000000003 widest_plateau_spread_s: 0.8686869999999995 verdict: indistinguishable ratio: 1.0313024108727786
+step stride -> packed median_delta_s: 1.2230220000000003 widest_plateau_spread_s: 0.654655 verdict: resolved ratio: 1.1173360963903969
+step packed -> full median_delta_s: -0.02081749999999971 widest_plateau_spread_s: 568.9843 verdict: indistinguishable ratio: 0.9980067607840059
+vs_lightgbm base ratio_behind: 1.5915214766938433
+vs_lightgbm stride ratio_behind: 1.5432151228532067
+vs_lightgbm packed ratio_behind: 1.3811557040344715
+vs_lightgbm full ratio_behind: 1.383914176041728

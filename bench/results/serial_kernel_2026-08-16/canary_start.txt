@@ -1,0 +1,52 @@
+mojotrees regime canary
+canary_probe_version: 1
+cpu_probe_rounds: 67108864
+gpu_probe_threads: 262144
+gpu_probe_iters_per_thread: 32768
+gpu_probe_launches: 4
+repeats: 5
+accelerator: present
+canary_probe_version: 1
+canary_baseline_path: bench/canary_baseline.json
+canary_baseline_status: none-recorded
+canary_baseline_machine: unrecorded
+canary_baseline_measured_on: unrecorded
+canary_baseline_cpu_ms: none-recorded
+canary_baseline_gpu_ms: none-recorded
+canary_baseline_note: at least one engine has no recorded baseline; its reading is reported raw and its ratio is unavailable. Establish it with bench/bench_canary.mojo in a quiet window -- do not fill in a number that was not measured.
+run 1 cpu_ms: 222.063 gpu_ms: 237.032 gpu_open_ms: 25.374
+run 2 cpu_ms: 199.195 gpu_ms: 232.313 gpu_open_ms: 0.251
+run 3 cpu_ms: 198.523 gpu_ms: 232.325 gpu_open_ms: 0.198
+run 4 cpu_ms: 204.879 gpu_ms: 234.743 gpu_open_ms: 0.247
+run 5 cpu_ms: 198.364 gpu_ms: 238.24 gpu_open_ms: 0.172
+cpu_ms_samples: 222.063 199.195 198.523 204.879 198.364
+cpu_ms: 198.364
+cpu_ms_median: 199.195
+cpu_spread_pct: 11.9
+cpu_checksum: 17239411273770110280
+gpu_ms_samples: 237.032 232.313 232.325 234.743 238.24
+gpu_ms: 232.313
+gpu_ms_median: 234.743
+gpu_spread_pct: 2.6
+gpu_open_ms_samples_excluded: 25.374 0.251 0.198 0.247 0.172
+calibration_warning: the repeats disagree by more than 3 percent, so this window is not the quiet one a baseline has to come from. Do not record these numbers. Find out what else is running and take it again.
+
+--- paste into bench/canary_baseline.json ---
+{
+  "schema": "mojotrees-canary-baseline/1",
+  "probe_version": 1,
+  "machine": "FILL-IN e.g. Apple M4 MacBook, 10 cores",
+  "toolchain": "FILL-IN output of `mojo --version`",
+  "measured_on": "FILL-IN YYYY-MM-DD",
+  "provenance": "measured",
+  "quiet_window_evidence": "FILL-IN what was checked, e.g. uptime load and the top processes, no lane or build or agent running",
+  "repeats": 5,
+  "cpu_ms": 198.364,
+  "cpu_spread_pct": 11.9,
+  "cpu_checksum": "17239411273770110280",
+  "gpu_ms": 232.313,
+  "gpu_spread_pct": 2.6,
+  "drift_threshold_pct": 5.0,
+  "note": "Minimum of the repeats above. Reading over baseline is the regime ratio; 1.0 is this window and larger is slower."
+}
+--- end ---
