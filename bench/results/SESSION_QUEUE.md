@@ -512,3 +512,61 @@ error in the other direction, when an orphan-module claim was accurate for
 int64 quantiser is precedent for **determinism**, not validation of cost. Cite it
 as precedent only. The one thing measured here is that the power-of-two scale
 made dequantization exact and *tightened* the overflow bound by 64 units.
+
+---
+
+# Decision shape, and the reporting trigger
+
+**Every default and every merge decision is made at 1,000,000 x 50, end-to-end
+against LightGBM stock+det.** `row-compaction`'s ship gate is therefore "wins
+end-to-end at 1M", not "wins at 250k and 1M".
+
+250,000 and 50,000 stay in every window as **reported rows only**. No lane
+targets them and nothing is blocked on them. If a change that wins at 1M loses at
+50k by more than the 50k arm's own spread, **it still merges** -- the pair is
+reported and the default is Andrew's call, not the lane's.
+
+The 250k/50k decomposition retake is still wanted as information, not as a gate.
+
+**Reporting trigger, added to merged / moved / blocked:** when a lane refutes its
+own brief, kills its own headline, or finds a defect outside its scope, that is
+reported **immediately in one paragraph** rather than batched. Everything else
+stays batched. This wave produced five such: K3 revising its own estimate below
+its refutation threshold, K2 finding its census overcounted by an order of
+magnitude, `trip-count` proving its own target unreachable, the bin-layout lane
+closing itself, and `cheap-sync` refuting a documented fact in the unsafe
+direction.
+
+# Oblivious launch-count precondition: computed, and it fails at depth 6 by 4
+
+Registered ahead of accuracy in the design's B5. Computed statically from the
+**measured** shape rather than the design's estimate -- 7 fixed per tree, 9 per
+step after the partition fusion, 1 tail:
+
+| schedule | command buffers per tree | against the 64 knee |
+|---|---|---|
+| leaf-wise, 31 leaves (today) | **278** | far over |
+| oblivious d=4, reduce fused | 44 | under |
+| oblivious d=5, reduce fused | 53 | under |
+| oblivious d=5, reduce as its own launch | 58 | under |
+| **oblivious d=6, reduce FUSED** | **62** | **under, by 2** |
+| **oblivious d=6, reduce as its own launch** | **68** | **OVER, by 4** |
+| oblivious d=7, either | 71 / 78 | over |
+
+**The precondition straddles the knee on exactly one design choice: whether the
+cross-leaf gain reduction is a separate launch or is folded into an existing
+one.** At CatBoost's default depth of 6 -- the depth the design proposes to
+match -- a standalone reduce kernel puts the tree at 68 and **the queue-depth
+argument evaporates**, while a fused one lands at 62 and it holds by two command
+buffers.
+
+That is not a comfortable margin either way, and it is knowable now: **the
+cross-leaf reduction must be fused into an existing launch, not added beside
+one**, or the primary GPU argument for oblivious does not survive its own default
+depth. Registered before any code, which is the point of computing it first.
+
+Two honest caveats. The 9-per-step figure is leaf-wise; an oblivious level may not
+cost exactly the same nine, and if it costs more the margin at d=6 goes negative
+even fused. And the 64-deep queue is **measured** as a knee in enqueue cost, not
+as a cliff -- 68 buffers is not a catastrophe, it is the far side of a knee where
+per-launch enqueue roughly doubles.
