@@ -19,6 +19,26 @@ repeats, arms round-interleaved. Rules registered in advance in
 4. Accuracy sits beside every speed number, as required. Two accuracy gates
    failed and both are named.
 
+**SUPERSEDED, in part.** Every CatBoost figure here was taken against the
+arm identified as `cb-default`, a hand-written dict of what someone believed
+CatBoost's defaults to be. That arm has since been rebuilt as `cb-shipped`,
+taking its values from CatBoost's own `get_all_params()` read-back, and
+`check_catboost_arm` now diffs the two resolved dicts key by key and fails on
+any matchable difference. **Read a CatBoost number here as `cb-default` and do
+not compare it with a `cb-shipped` number.** The CatBoost-mode arm is separately
+superseded twice over: it gained `random_strength` after this run, and lost the
+`max_bin` and (temporarily) `random_strength` keys during it -- see the block
+notes.
+
+For the record, the read-back for `dense_regression/catboost/cpu` in this run's
+own artifact confirms the parameters were what the harness intended:
+`learning_rate 0.10000000149011612` (0.1 in float32, so CatBoost's automatic
+learning rate never fired), `iterations 100`, `depth 6`, `l2_leaf_reg 3`,
+`bootstrap_type MVS`, `subsample 0.8`, `random_strength 1`, `score_function
+Cosine`, `boosting_type Plain`, `border_count 254`. The last two independently
+confirm two things read from CatBoost's source earlier the same day: Plain at
+our tier, and 254 thresholds against our 255 bins being the same granularity.
+
 Provenance: `stale_sources` 0, extension sha256
 `028670ccea6426e9b05fe11060d78099b4416e5ccdc914d52ec73573c34d4aec`, package
 precompile exit 0 with zero errors, `mojo 1.0.0 (ed45d567)`, `lightgbm 4.7.0`,
@@ -188,6 +208,25 @@ overlap against either, so both are resolved.
 2.49 percent gap against a 5 percent limit. **The two metrics disagree about
 whether this row is acceptable, and the stricter one is the one that fails**, so
 this row is a speed win bought with accuracy and must be published as one.
+
+**CAUSE FOUND, 2026-08-16, from LightGBM's source: we are not running the same
+number of categorical bins, and `max_bin` is not the limit it looks like.**
+`LightGBM/src/io/bin.cpp:461` reads `while (used_cnt < cut_cnt || num_bin_ <
+max_bin)` -- a **disjunction**, with `cut_cnt` set at 99 percent row coverage.
+So `max_bin` is a **lower** bound on categorical bins, not an upper one, and
+LightGBM keeps taking categories until coverage is satisfied however many that
+is. On this scenario it runs roughly **991 and 19,801 categorical bins against
+our 254.** LightGBM's own loader documentation concedes the point in passing:
+`max_bin` "may be ignored with a large number of categories".
+
+**That changes what this row means.** It is not "our categorical accuracy is
+worse"; it is "we resolved 254 categories where the comparator resolved
+thousands, and lost 12 percent of average precision doing it". A named,
+measured, and fixable cause, with a second contributing defect already
+identified beside it: CTRs computed from the binned bucket rather than from raw
+category codes, which is why a lane measured our CTRs as null in both
+directions. The speed win in this row was partly bought with resolution, and the
+next measurement of it should not be read against this one.
 
 The CatBoost-mode arm has **no row here**: `grow_policy=oblivious` is
 implemented for numerical thresholds only, and a level of an oblivious tree
