@@ -1,0 +1,40 @@
+==================================================================
+ARM: C5 CPU stage profile, 1000000 x 50, serial vs auto per stage, 3 reps
+CMD: pixi run -e bench mojo run -I src bench/bench_profile.mojo 1000000 50 3
+cwd: /private/tmp/claude-501/-Users-andrewhendel-CascadeProjects/f0668d2e-b05a-470c-b0f5-bcf213520919/scratchpad/cpu-round-1
+started: 2026-08-16 03:00:09 EDT
+--- box state BEFORE ---
+ 3:00  up 5 days, 17:49, 1 user, load averages: 2.91 3.02 2.67
+top processes by cpu:
+  9.7 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  5.9 /usr/libexec/PerfPowerServices
+  1.5 claude
+other mojo/pixi builds running:
+--- output ---
+isa: arm64 neon
+cores: physical 10 logical 10 performance 4
+simd: float64 width 2 kernel lanes 8
+scheduler: tasks_per_core 4 parallel_min_ops 65536 (default 65536 )
+shape: 1000000 rows x 50 features, reps 3
+auto-mode task counts: features 40 rows 15
+
+stage | serial_s | auto_s | speedup
+bin_fit | 0.20093433333333333 | 0.08413566666666666 | 2.3882182348350085
+bin_transform | 0.18365233333333333 | 0.07635666666666667 | 2.4051905531060376
+grad_hess | 0.0010863333333333335 | 0.00042899999999999997 | 2.5322455322455326
+hist_full | 0.04998366666666667 | 0.015382 | 3.2494907467602827
+hist_subset50 | 0.028199000000000002 | 0.008297333333333334 | 3.398561786919492
+hist_subset10 | 0.006089 | 0.0018583333333333334 | 3.276591928251121
+hist_subtract | 1.6943333333333334e-05 | 1.5215e-05 | 1.1135940409683427
+split_scan | 3.822666666666667e-05 | 2.672e-05 | 1.4306387225548902
+partition | 0.0040928 | 0.0010938999999999999 | 3.741475454794771
+grow_tree | 0.21001366666666665 | 0.08502933333333333 | 2.469896663112338
+predict | 0.03328266666666667 | 0.032333266666666666 | 1.0293629471400974
+--- box state AFTER ---
+ 3:00  up 5 days, 17:49, 1 user, load averages: 3.00 3.04 2.68
+top processes by cpu:
+  8.0 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+  2.2 claude
+other mojo/pixi builds running:
+finished: 2026-08-16 03:00:19 EDT  exit=0
+
