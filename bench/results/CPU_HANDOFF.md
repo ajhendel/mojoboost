@@ -1,7 +1,9 @@
 # CPU orchestrator handoff
 
-Written 2026-08-16. Branch `cpu-round-1`, head `b69caf2`, suite green at 72/72
-test files. Read `LANE_RULES.md` and `PROFILE_PROTOCOL.md` (sections C0 through
+Written 2026-08-16, updated after the window. Branch `cpu-round-2`, based on
+`perf-round-2` at `901e31d` where wave 4 is merged. Suite was green at 72/72
+on the wave-4 base; it has NOT been re-run since the merge into
+`perf-round-2`, which brought in the GPU campaign's work. Read `LANE_RULES.md` and `PROFILE_PROTOCOL.md` (sections C0 through
 C9) first; this file is only state, not policy.
 
 ## Merged into cpu-round-1
@@ -26,9 +28,28 @@ const-hessian, interleaved cells, stock defaults, harness comparator.
 and **reverted**. It is back with its lane with a four-cause diagnosis. It is
 not in the tree.
 
+## Done since this file was first written
+
+- Float32 re-taken under lambda = 0. **The decision closes and the default
+  stands**; see `bench/results/cpu_float32_lambda0_2026-08-16/RESULTS.md`.
+- The window. End-to-end headline, task floor resolved at 50k, and four
+  discarded runs listed by name; see `bench/results/cpu_window_2026-08-16/`.
+- CatBoost reachable through `run.py`, `sparse_highdim` capped at smoke.
+- Both catalog corrections were already in the file when I checked: multiclass
+  `leaf_estimation_iterations` is 1, and the min-child rule is marked ours.
+- `cpu-round-1` merged into `perf-round-2` at `901e31d`.
+- `_multiclass_rf_gradients` needed nothing: it is a `def`, which raises in
+  Mojo 1.0. That glue item was a non-issue and is struck.
+
 ## Owed, in order
 
-1. **Float32 under lambda = 0.** The 39/44 accuracy run that the Float32
+0. **Head against `e8c0877` needs a lambda-matched form, not a caveat.**
+   `lambda_l2` moved 1.0 to 0.0 this round and lambda sits in the split gain,
+   so the two builds grow different trees and a wall clock would confound
+   speed with tree shape. Run **head at `lambda_l2 = 1.0`** instead. The bench
+   harness has no flag for it, so this needs one line of glue first.
+
+1. **Float32 under lambda = 0. DONE, see above. Kept for the reasoning:** The 39/44 accuracy run that the Float32
    default rests on was taken under `lambda_l2 = 1`, and `H + lambda` is
    exactly the damping term that hid the Float32 loss. Re-take
    `imbalanced_binary` and `multiclass` under the now-stock lambda = 0 before
