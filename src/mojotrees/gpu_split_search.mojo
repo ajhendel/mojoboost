@@ -2460,11 +2460,23 @@ def _scan_slot_oblivious_kernel(
     leaf's own sums, because that is where they mean anything: an oblivious
     split is one split but it makes 2^d children and each has to be a legal
     leaf on its own. A leaf that fails adds `0.0` and the candidate stays
-    available to the rest of the level. That is CatBoost's rule as
-    `docs/design/OBLIVIOUS.md` B2 records it, and B2 marks it **verify**: it
-    has not been checked against CatBoost's source here. It is written down in
-    one place so that the CPU grower can be made to match it rather than
-    guessed at twice.
+    available to the rest of the level.
+
+    **This is OUR rule, not CatBoost's, and the distinction was established
+    2026-08-16 rather than assumed.** An earlier draft of this docstring called
+    it "CatBoost's rule ... marked verify". It was then checked: **CatBoost
+    applies `min_data_in_leaf` only to `Depthwise` and `Lossguide`, and
+    `SymmetricTree` carries no such constraint at all.** So there is no
+    CatBoost rule here to match, and the zero-contribution treatment is a
+    decision this project is making because our own `min_data_in_leaf` and
+    `min_child_hess` exist and have to mean something under a shared split.
+
+    That matters for how it may be defended. It cannot be justified by "it is
+    what CatBoost does"; it has to be justified on its own terms, which are:
+    an oblivious split makes 2^d children, each has to be a legal leaf, and
+    refusing the whole candidate because one leaf of sixty-four fails would let
+    a single small leaf veto the level. It is written down in one place so the
+    CPU grower matches it rather than guessing twice.
 
     Note what the zero does *not* do: it does not make an illegal candidate
     win. A candidate every leaf refuses scores exactly `0.0`, and `0.0` never
