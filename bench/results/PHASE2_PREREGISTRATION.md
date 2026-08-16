@@ -169,3 +169,53 @@ as a projection.** It is written down so that failing to reach it is visible.
   regenerated **once, after it**, since exports move. Not per lane: four lanes
   each regenerating one generated file is four conflicts on it, which is what
   happened last round and why it is written down here.
+
+
+---
+
+## K1's estimate, revised DOWN by its own author before any measurement
+
+Registered above: 10-25 percent on the histogram phase. **K1's own report puts it
+at 0-10 percent**, and the revision is recorded here, before the arms have been
+run, so the eventual measurement is compared against the honest prediction rather
+than the flattering one.
+
+Its reasoning, and it is a structural claim rather than a hedge:
+
+- **Item 2, the vectorized `gq` load, was already there.** It landed with the row
+  unroll. What K1 found is that `unsafe_load[width=2]` with no explicit alignment
+  emits `align 4`, and the explicit spelling emits `align 8` -- **observed from
+  emitted LLVM IR**, by compiling both spellings and diffing, not measured on a
+  device. An under-aligned vector load is one a backend may split back into the
+  two scalar loads the width-2 spelling existed to replace. So this item is not a
+  new optimization; it is a check on whether last round's change bought anything
+  at all. Largest of the three if Metal was in fact splitting it, zero if not.
+- **Item 1, Int32 index math, is registered as an expected null by its own
+  author.** Of the two narrowable quantities, one is a loop-invariant base a
+  compiler should already hoist, and the other is the induction variable where
+  narrowing trades a 64-bit add for a 32-bit add plus a widening at every use.
+  Against three shared atomics and a scattered gather per (row, feature), one
+  index add either way is noise.
+- **Item 3, row tiles, is expected to fail in the direction registered.** But it
+  found something the earlier experiment missed: **the earlier run only ever
+  tested tiles going UP** -- 80 tiles, a device-wide floor -- and lost 22 and 36
+  percent. **Downward has never been tested.** At 50 features the default is only
+  2 tiles, so if per-tile zero-and-flush traffic is what dominates, which is what
+  the earlier loss argues, then **1 tile is the untested arm most likely to win**
+  and 4 and 8 are most likely to lose again.
+
+### The observation that matters more than the lane
+
+> the inner loop's cost is the scattered `bins[feature * n_rows + row]` gather
+> and the three shared atomics per (row, feature), not index arithmetic and not
+> the gradient read
+
+Index-width and load-width work **cannot reach either of those**. That is K3's
+`[group][row][G bytes]` re-layout, and this lane's audit is indirect evidence
+that K3 is where the remaining margin actually lives. K1 is a check on an
+existing change and a first honest test of the tile direction nobody tried.
+
+One consequence for the shipping configuration specifically: the gradient-pair
+load is amortized over `GROUP` features, and the default `feature_group` is 1 at
+256 bins, so **item 2's share is largest exactly at the default and shrinks if
+anyone widens the group**.
