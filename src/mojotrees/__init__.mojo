@@ -63,6 +63,25 @@ from .monotone import (
     MonotoneConstraints,
     OutputBounds,
 )
+from .ordered_boosting import (
+    DEFAULT_FOLD_LEN_MULTIPLIER,
+    DEFAULT_ORDERED_PERMUTATION_COUNT,
+    OrderedBoostingParams,
+    catboost_auto_is_ordered,
+    check_ordered_hessian_declaration,
+    check_ordered_honored,
+    default_permutation_block_size,
+    fold_bounds,
+    fold_ids,
+    fold_ladder,
+    min_batch_size,
+    n_rungs,
+    ordered_permutation,
+    ordered_plane_entries,
+    ordered_varies_hessian,
+    permutation_choice,
+    plane_offsets,
+)
 from .sampling import (
     DEFAULT_FEATURE_FRACTION_SEED,
     check_feature_fraction,
