@@ -405,7 +405,30 @@ def fit[
     # The objective is part of every crossover rule in `device_policy`, and
     # this entry point holds it and used to drop it, so `device='auto'` could
     # never select the accelerator from here.
-    var backend = resolve_device(device, n_rows, n_features, 1, objective)
+    #
+    # `ordered_boosting` and `score_function` are threaded for the same reason
+    # and were dropped the same way. `device_policy` carries a block for each,
+    # both reading a `DeviceRequest` field, and both fields have defaults --
+    # so an entry point that does not pass them hands the policy `False` and
+    # `SCORE_L2` whatever the caller asked for, and the blocks cannot fire.
+    # Only the Python query surface passed them, which made two gates real on
+    # one entry surface and decoration on this one. The consequence was not a
+    # missing refusal but a misrouted one: `device='auto'` selected the
+    # accelerator on shape and then raised inside the grower, where the whole
+    # point of `auto` is to choose a backend that can run the fit.
+    #
+    # By keyword, because `objective` is the fifth positional and these are the
+    # sixth and seventh; a positional pair here binds correctly today and
+    # silently rebinds the moment anyone inserts a parameter.
+    var backend = resolve_device(
+        device,
+        n_rows,
+        n_features,
+        1,
+        objective,
+        ordered_boosting=params.ordered.enabled,
+        score_function=params.tree.extra.score_function,
+    )
     var mapper = fit_bins(
         features,
         n_rows,
@@ -510,7 +533,20 @@ def fit_multiclass[
     # carries a single-output objective this entry point does not know. If
     # the crossover rules should gate on multiclass as such, that is a case
     # `device_policy` needs to add, not a sentinel this caller can smuggle in.
-    var backend = resolve_device(device, n_rows, n_features, n_classes)
+    # `ordered_boosting` and `score_function` threaded for the reason given at
+    # the single-output `fit` above: their `DeviceRequest` fields default, so
+    # an entry point that drops them tells the policy the fit is plain and L2
+    # whatever the caller asked, and `device='auto'` then picks the accelerator
+    # on shape and raises inside the grower instead of routing to the CPU.
+    # `objective` stays unpassed here, deliberately, for the reason above it.
+    var backend = resolve_device(
+        device,
+        n_rows,
+        n_features,
+        n_classes,
+        ordered_boosting=params.ordered.enabled,
+        score_function=params.tree.extra.score_function,
+    )
     var mapper = fit_bins(
         features,
         n_rows,
