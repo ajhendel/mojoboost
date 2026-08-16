@@ -357,9 +357,20 @@ of 2.584 is still ahead, by 2 percent.
 
 Our arm did not degrade across five back-to-back runs; LightGBM went 2.80 to
 3.50 over the same sequence as load accumulated. The GPU arm is thermally stable
-under repetition and the ten-core CPU arm is not. That is a real property and it
-is why any single head-to-head number depends on how long the machine has been
-working.
+under repetition and the ten-core CPU arm is not.
+
+**Read that as a property of the engine, not of the comparator**, and the
+distinction is not pedantic. The CPU campaign measured the mirror image the same
+night: at 1,000,000 x 50 *their* CPU arm rose 18 percent across five repeats
+while LightGBM rose only 10 percent. So "LightGBM degrades harder under
+repetition" is false as a general claim. It held here because the GPU is
+thermally stable, not because LightGBM is fragile; against another ten-core CPU
+arm, LightGBM is the *steadier* side.
+
+Anyone quoting this asymmetry must say which engines were on which side. It is
+why a head-to-head number depends on how long the machine has been working, and
+it is why the canary reports the CPU and GPU probes separately and never
+averages them.
 
 ### A caveat on every LightGBM number in this repository, found the same night
 
