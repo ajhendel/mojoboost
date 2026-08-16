@@ -305,8 +305,29 @@ def _catboost_bin_profile(model, n_features):
     return profile
 
 
+#: The arm's overrides, held as class defaults so that an engine constructed
+#: directly -- selfcheck does, and so does anybody debugging one cell -- reads
+#: the same empty dicts `build` would have given it. `None` rather than `{}`
+#: because a shared mutable class attribute is one `.update()` away from
+#: leaking one arm into every later engine in the process.
+#:
+#: `arm_params` are TRAINING parameters and `arm_dataset_params` are BINNING
+#: ones. The split is not cosmetic: both libraries reject `max_bin` on
+#: `train`, which is why `scenarios.dataset_params` exists at all, and a
+#: max_bin override folded into the training dict kills the cell.
+ARM_OVERRIDE_ATTRIBUTES = ("arm_params", "arm_dataset_params")
+
+
+def _arm(engine, which):
+    """One of an engine's arm override dicts, as a fresh dict, never None."""
+    return dict(getattr(engine, which, None) or {})
+
+
 class MojoTreesEngine:
     name = "mojotrees"
+
+    arm_params = None
+    arm_dataset_params = None
 
     #: The translator this arm's parameters go through. The CatBoost-mode
     #: arm below overrides exactly this and nothing else, so the two arms
@@ -325,6 +346,53 @@ class MojoTreesEngine:
         # measured, or None. Unused by this arm and read by the CatBoost-mode
         # subclass, which cannot be built without it.
         self.catboost_readback = catboost_readback
+
+    def _arm_extra(self, extra=None):
+        """`extra` with the arm's TRAINING overrides folded in.
+
+        `scenarios.mojotrees_params` copies every `extra` key onto the
+        translated dict and `scenarios.shared_params` merges the same dict
+        over `BASE_PARAMS`, so this is the hook the arm dimension was designed
+        around rather than a new one.
+
+        `n_estimators` is excluded here and set explicitly by `_n_estimators`,
+        because the tree count is also the `num_boost_round` argument and the
+        record's `num_boost_round` field, and one value reaching three places
+        by three routes is how the three come apart.
+        """
+        merged = dict(extra or {})
+        for key, value in _arm(self, "arm_params").items():
+            if key == "n_estimators":
+                continue
+            merged[key] = value
+        return merged or None
+
+    def _n_estimators(self):
+        """The arm's tree count, or the base one.
+
+        **This is the only place the tree count is decided on this arm.** It
+        used to read `scenarios.BASE_PARAMS["n_estimators"]` directly at two
+        call sites, which is why a sweep over tree counts could not be
+        scheduled at all: the one parameter a frontier moves first was the one
+        parameter no caller could override.
+        """
+        return int(
+            _arm(self, "arm_params").get(
+                "n_estimators", scenarios.BASE_PARAMS["n_estimators"]
+            )
+        )
+
+    def _dataset_params(self, spec):
+        """The binning parameters, with the arm's overrides.
+
+        The `max_bin` axis moves the BINNING and not the data, so the
+        canonical data digest is unaffected and `verify.check_data_agreement`
+        stays meaningful across arms at different bin budgets. That property
+        is what makes this override safe to have at all.
+        """
+        params = scenarios.dataset_params(spec)
+        params.update(_arm(self, "arm_dataset_params"))
+        return params
 
     def _params(self, spec, extra=None, device=None):
         """The translated parameter dict for this arm.
@@ -376,14 +444,29 @@ class MojoTreesEngine:
         return self
 
     def warmup(self, spec):
+        """One round on a tiny matrix, through the arm's own shape.
+
+        The arm's training and binning overrides are applied, so that what is
+        warmed is the code path about to be measured: an arm at
+        `grow_policy='symmetrictree'` warmed through the leaf-wise grower
+        would leave the measured fit paying first-call costs that the record
+        then attributes to training.
+
+        `auto_learning_rate` is the one override dropped, and it is dropped
+        rather than passed because CatBoost's derivation reads `log` of the
+        iteration count and this call runs ONE round. A rate derived at one
+        round is not this arm's rate, and the same code is warmed either way.
+        """
         x, y, group, n_classes = _tiny_like(spec)
         extra = {"num_class": n_classes} if n_classes else None
-        params = self._params(spec, extra)
+        extra = self._arm_extra(extra) or {}
+        extra.pop("auto_learning_rate", None)
+        params = self._params(spec, extra or None)
         params["n_estimators"] = 1
 
         def _fit():
             data = self.module.Dataset(
-                x, label=y, group=group, params=scenarios.dataset_params(spec)
+                x, label=y, group=group, params=self._dataset_params(spec)
             )
             return self.module.train(params, data, num_boost_round=1)
 
@@ -408,10 +491,10 @@ class MojoTreesEngine:
         extra = None
         if spec["task"] == "multiclass":
             extra = {"num_class": int(train.get("n_classes") or (train["y"].max() + 1))}
-        params = self._params(spec, extra)
-        params["n_estimators"] = scenarios.BASE_PARAMS["n_estimators"]
+        params = self._params(spec, self._arm_extra(extra))
+        params["n_estimators"] = self._n_estimators()
 
-        dataset_params = scenarios.dataset_params(spec)
+        dataset_params = self._dataset_params(spec)
         dataset = self._dataset(spec, train, dataset_params)
         _, binning = measure.timed(dataset.construct)
 
@@ -478,7 +561,7 @@ class MojoTreesEngine:
                 f"the sparse path here covers binary classification, not "
                 f"{spec['task']}"
             )
-        params = self._params(spec, device="cpu")
+        params = self._params(spec, self._arm_extra(), device="cpu")
         params.pop("device", None)
         # Built once and both passed and recorded, so the record is the
         # call rather than a reconstruction of it. `objective` is dropped
@@ -486,7 +569,7 @@ class MojoTreesEngine:
         # still carries it. A collision raises rather than resolving
         # itself, which is what the keyword form this replaced did.
         estimator_params = {
-            "n_estimators": scenarios.BASE_PARAMS["n_estimators"],
+            "n_estimators": self._n_estimators(),
             "max_bin": scenarios.BASE_PARAMS["max_bin"],
             "use_missing": scenarios.BASE_PARAMS["use_missing"],
         }
@@ -499,6 +582,13 @@ class MojoTreesEngine:
                     f"both set {key!r}, so one of them would silently win"
                 )
             estimator_params[key] = value
+        # The arm's BINNING overrides, applied last. There is no second dict
+        # on this path: the estimator takes the binning settings as keywords,
+        # so `max_bin` lands here beside the training ones instead of on a
+        # Dataset, and `dataset_params_used` stays None with the reason it
+        # already carried. The arm's TRAINING overrides are already in
+        # `params` above, through `_arm_extra`.
+        estimator_params.update(_arm(self, "arm_dataset_params"))
         estimator = self.module.MojoTreesClassifier(**estimator_params)
         _, training = measure.timed(lambda: estimator.fit(train["X"], train["y"]))
 
@@ -566,6 +656,9 @@ class MojoTreesEngine:
 class LightGBMEngine:
     name = "lightgbm"
 
+    arm_params = None
+    arm_dataset_params = None
+
     def __init__(self, threads, device="cpu"):
         self.threads = int(threads)
         self.device = device
@@ -630,8 +723,21 @@ class LightGBMEngine:
             extra["num_class"] = int(
                 train.get("n_classes") or (np.max(train["y"]) + 1)
             )
+        # The arm's overrides. LightGBM takes the binning settings in the same
+        # dict as the training ones, so both override dicts land here and
+        # `dataset_params_used` stays None with the reason it always carried.
+        extra.update(_arm(self, "arm_params"))
+        extra.update(_arm(self, "arm_dataset_params"))
         params = scenarios.lightgbm_params(spec, self.threads, extra)
-        rounds = scenarios.BASE_PARAMS["n_estimators"]
+        # The comparator's tree count, which used to be read straight off
+        # `BASE_PARAMS` here and so could not be moved by anything. `extra`
+        # reaches `scenarios.shared_params`, which merges it over
+        # `BASE_PARAMS`, so the count inside `params` and the count passed as
+        # `num_boost_round` are one value read once rather than two constants
+        # that happen to agree.
+        rounds = int(
+            params.get("n_estimators", scenarios.BASE_PARAMS["n_estimators"])
+        )
 
         dataset = self.module.Dataset(
             train["X"],
@@ -1022,6 +1128,9 @@ class CatBoostEngine:
         merged.update(self.variant_params)
         return merged
 
+    arm_params = None
+    arm_dataset_params = None
+
     def __init__(self, threads, device="cpu"):
         self.threads = int(threads)
         self.device = device
@@ -1169,6 +1278,38 @@ class CatBoostEngine:
                     train.get("n_classes") or (np.max(train["y"]) + 1)
                 )
             }
+        # The arm's TRAINING overrides. `n_estimators` is the one the frontier
+        # moves: `scenarios.catboost_params` reads
+        # `shared[CATBOOST_MATCHED["iterations"]]`, which is `n_estimators`
+        # merged over `BASE_PARAMS` by `shared_params`, so an override here
+        # moves CatBoost's `iterations` and the record's `num_boost_round`
+        # together. Every other key goes through
+        # `scenarios.CATBOOST_REFUSED_PARAMS`, which refuses by name anything
+        # that would make this arm stop being CatBoost at stock.
+        #
+        # The arm's BINNING overrides are REFUSED rather than translated.
+        # CatBoost's counterpart of `max_bin` is `border_count`, its default
+        # is 65535 against LightGBM's 255, and the two are not a rename of
+        # each other: a max_bin axis measured by moving one library's budget
+        # and leaving the other's at a different stock number is a comparison
+        # of two different sweeps. `scenarios.CATBOOST_REFUSED_PARAMS` refuses
+        # `max_bin` at the call below anyway; the message here says why rather
+        # than leaving a reader with a KeyError-shaped one.
+        arm_binning = _arm(self, "arm_dataset_params")
+        if arm_binning:
+            raise EngineError(
+                "the CatBoost arm takes no per-arm binning overrides "
+                f"({', '.join(sorted(arm_binning))}). CatBoost's bin budget "
+                "is border_count, whose default is 65535 against LightGBM's "
+                "255, so moving max_bin on one arm and not the other is two "
+                "sweeps rather than one axis. See "
+                "scenarios.CATBOOST_REFUSED_PARAMS and "
+                "scenarios.CATBOOST_LEFT_AT_STOCK"
+            )
+        arm_training = _arm(self, "arm_params")
+        if arm_training:
+            extra = dict(extra or {})
+            extra.update(arm_training)
         params = scenarios.catboost_params(
             spec, self.threads, self._extra_with_variant(extra)
         )
@@ -1467,8 +1608,17 @@ ENGINE_ARM = {
 }
 
 
-def build(name, threads, device, catboost_readback=None):
-    """An engine by name.
+def build(
+    name, threads, device, catboost_readback=None,
+    arm_params=None, arm_dataset_params=None,
+):
+    """An engine by name, carrying its arm's parameter overrides.
+
+    `arm_params` and `arm_dataset_params` are the arm dimension reaching the
+    engine: the first folds into the TRAINING parameters and the second into
+    the BINNING ones. Both default to empty, which is the cell every matrix
+    without `--arms` runs and is byte-for-byte the call this function made
+    before the dimension existed.
 
     `catboost_readback` is the run's collected `CatBoost.get_all_params()`,
     keyed by cell, or None. Only `mojotrees_catboost_mode` reads it, and it
@@ -1481,5 +1631,14 @@ def build(name, threads, device, catboost_readback=None):
         raise KeyError(f"unknown engine {name!r}; known: {', '.join(sorted(ENGINES))}")
     engine = ENGINES[name]
     if issubclass(engine, MojoTreesEngine):
-        return engine(threads, device, catboost_readback)
-    return engine(threads, device)
+        built = engine(threads, device, catboost_readback)
+    else:
+        built = engine(threads, device)
+    # Set after construction rather than threaded through three constructor
+    # signatures, because the three engine families do not share one and an
+    # override dict is read, never validated, by any of them. The class
+    # defaults are None, so an engine built any other way reads empty dicts
+    # through `_arm` rather than raising an AttributeError.
+    built.arm_params = dict(arm_params or {})
+    built.arm_dataset_params = dict(arm_dataset_params or {})
+    return built

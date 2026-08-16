@@ -314,6 +314,8 @@ from mojotrees.tree import Tree, TreeParams
 from mojotrees.tree_parameters_extra import (
     CATBOOST_RANDOM_STRENGTH,
     SCORE_L2,
+    derivative_precision_name,
+    parse_derivative_precision,
     parse_score_function,
     score_function_name,
 )
@@ -742,6 +744,7 @@ def _parse_params(
     boost_from_average_ok: Bool = False,
     score_function_ok: Bool = False,
     random_strength_ok: Bool = False,
+    derivative_precision_ok: Bool = False,
     auto_lr_ok: Bool = False,
     auto_lr_reason: String = "",
     auto_lr_rows: Int = 0,
@@ -905,6 +908,48 @@ def _parse_params(
       construction and routes to `boosting.train_more`. Multiclass, sparse,
       ranking, custom-objective, custom-metric, distributed and every device
       loop compute no scale and keep the refusal.
+    - `derivative_precision_ok`: the precision a per-row gradient and hessian
+      is CARRIED at (`src/mojotrees/histogram.mojo`,
+      `DERIVATIVE_PRECISION_FLOAT32` / `_FLOAT64`). Only `float64` is
+      refusable, for the reason only `boost_from_average=false` is: `float32`
+      is what every trainer in this package does by default, so this flag
+      decides who may ask for the WIDE derivative rather than who may ask for
+      anything at all.
+
+      The honoring trainers are the ones that thread
+      `ExtraTreeParams.wants_float64_derivatives()` into
+      `boosting._fill_grad_hess` or `boosting._fill_softmax_grad_hess`, and
+      that is nearly all of them: `boosting` (`_boost_rounds`,
+      `train_with_valid`, `_boost_rounds_multiclass`,
+      `train_multiclass_with_valid`), `boosting_sparse` (all four loops),
+      `boosting_rf`, `alternate_boosting` (dart and rf, single and
+      multiclass), `custom_metric.train_with_callbacks` and
+      `custom_metric.train_multiclass_with_metrics`, and
+      `distributed.train_distributed_run`, which additionally folds the
+      resolved value into its schema marker
+      (`distributed._push_derivative_precision`). The two device growers
+      refuse `float64` themselves, by name and at every shape, through
+      `histogram.check_device_derivative_precision`: gradients reach an
+      accelerator as Float32 and there is no Float64 there, so a GPU fork of
+      an entry point that passes True here still raises rather than training
+      the narrow answer under the wide label.
+
+      **The four call sites that pass False are the ranking ones and the
+      custom-objective one, and neither is a gap with a scheduled exit.**
+      `ranking.train_ranker` computes its lambdas in Float64 and forwards no
+      `float64_derivatives` to anything, so the value the caller typed
+      selects nothing there; `custom_metric.train_ranker_with_metrics` is the
+      same loop with a metric set around it. `fit_custom`'s derivatives are
+      the caller's own buffers, and there is no narrowing site under this
+      parameter's control between them and the histogram. Accepting `float64`
+      at any of the four would be accepted-and-ignored, which is the defect
+      the whole of this docstring exists to prevent.
+
+      **There is no reachability question in the other direction and there
+      cannot be**, because `float32` is the default: a caller who wants the
+      narrow derivative on a ranking fit has no way to ask for it and no way
+      to be told. That asymmetry is a property of the ranking loops and not of
+      this flag.
     - `auto_lr_ok`: CatBoost's automatic `learning_rate`
       (src/mojotrees/auto_learning_rate.mojo, catalog A12/A38). Unlike the
       four above, this one needs **data** and not just a declaration: the
@@ -1221,6 +1266,48 @@ def _parse_params(
             " (distributed_strategies calls split.find_best_split at its"
             " SCORE_L2 default). 'L2' is what mojotrees has always scored"
             " with -- G^2/(H+lambda) -- and is the default",
+        )
+
+    # The precision a per-row derivative is carried at, folded onto the same
+    # bundle for the same reason the two above it are. The wrapper sends the
+    # name lowercased, which is the contract `parse_derivative_precision`
+    # states and `parse_score_function` and `parse_device` already keep, so
+    # the parameter string and the estimator resolve one spelling to one code.
+    #
+    # **Until this line the parameter had no Python door at all.** The field
+    # existed, `params.parse_params` accepted the key on the string surface,
+    # and every CPU round loop honored it, so a Python caller who wanted wide
+    # derivatives had exactly one entry: exporting
+    # MOJOTREES_DERIVATIVE_PRECISION. That is a process-wide switch that a
+    # child process inherits without asking, and it does not travel in the
+    # record that quotes the timing it changed -- which is how an A/B comes to
+    # run one arm under the other's label. The parameter is the door;
+    # docs/COMPATIBILITY_POLICY.md section 9.5.1 is the rule that says a
+    # capability which ships becomes a named parameter.
+    extra.derivative_precision = parse_derivative_precision(
+        String(py=params["derivative_precision"])
+    )
+    if extra.wants_float64_derivatives() and not derivative_precision_ok:
+        raise Error(
+            "derivative_precision='",
+            derivative_precision_name(extra.derivative_precision),
+            "' is not honored by ",
+            who,
+            ": the wide derivative is carried by the round loops that thread"
+            " ExtraTreeParams.wants_float64_derivatives() into"
+            " boosting._fill_grad_hess or boosting._fill_softmax_grad_hess,"
+            " which is every dense, sparse, multiclass, dart, rf,"
+            " custom-metric and distributed loop in this package. The ranking"
+            " loops (ranking.train_ranker,"
+            " custom_metric.train_ranker_with_metrics) compute their lambdas"
+            " in Float64 and forward no such flag, and a custom objective is"
+            " the caller's own pair of derivative buffers, so at those entry"
+            " points this value would select nothing and be silently dropped."
+            " 'float32' is LightGBM's precision profile and mojotrees's, and"
+            " is the default. Note that the accelerator refuses 'float64' at"
+            " EVERY entry point and at every shape"
+            " (histogram.check_device_derivative_precision): gradients are"
+            " carried as Float32 on the device and there is no Float64 there",
         )
     var tree = TreeParams(
         Int(py=params["num_leaves"]),
@@ -1811,6 +1898,12 @@ def fit(
         # `custom_metric.fit_with_metrics` take raw matrices and bin them
         # themselves, with no place to put a bundle.
         ctr_ok=True,
+        # Every fork of this entry point either honors the wide derivative or
+        # refuses it by name: the plain CPU fork is boosting.train, the dart and
+        # rf forks are alternate_boosting, the linear_tree fork is
+        # custom_metric.train_with_callbacks, and the GPU fork raises in
+        # histogram.check_device_derivative_precision.
+        derivative_precision_ok=True,
     )
     var weights = _parse_weights(params, nr)
     # CatBoost's `bootstrap_type`, with the flag that says whether the user
@@ -2155,6 +2248,11 @@ def distributed_train_local(
         auto_lr_ok=True,
         auto_lr_rows=nr,
         auto_lr_objective=Int(py=objective),
+        # distributed.train_distributed_run threads the flag into _fill_grad_hess
+        # and folds the resolved value into its schema marker
+        # (distributed._push_derivative_precision), so two workers at different
+        # precisions cannot agree on a histogram schema by accident.
+        derivative_precision_ok=True,
     )
     _ = _parse_bootstrap_request(params).resolve(
         False,
@@ -2323,6 +2421,9 @@ def fit_with_metrics(
         unbundled="fit_with_metrics",
         score_function_ok=True,
         auto_lr_reason=String(_AUTO_LR_EVAL_SET_REASON),
+        # custom_metric.train_with_callbacks passes the flag at its one
+        # derivative site.
+        derivative_precision_ok=True,
     )
     # An eval_set, a callback, or linear_tree routes here rather than to
     # `boosting.train_with_valid`, and `custom_metric`'s round loop does not
@@ -2571,6 +2672,9 @@ def fit_multiclass_with_metrics(
         unbundled="fit_multiclass_with_metrics",
         score_function_ok=True,
         auto_lr_reason=String(_AUTO_LR_EVAL_SET_REASON),
+        # custom_metric.train_multiclass_with_metrics passes it at both of its
+        # derivative sites.
+        derivative_precision_ok=True,
     )
     _ = _parse_bootstrap_request(params).resolve(
         False,
@@ -2848,6 +2952,10 @@ def fit_multiclass(
         auto_lr_ok=True,
         auto_lr_rows=nr,
         auto_lr_objective=_MULTICLASS_OBJECTIVE,
+        # boosting._boost_rounds_multiclass and
+        # boosting_sparse.train_multiclass_sparse both pass the flag; the GPU
+        # multiclass trainer refuses float64 by name.
+        derivative_precision_ok=True,
     )
     # CatBoost's `bootstrap_type`, HONORED on the CPU arm since
     # `boosting._boost_rounds_multiclass` took a bundle: one draw per round,
@@ -2902,6 +3010,8 @@ def fit_csc(
         auto_lr_ok=True,
         auto_lr_rows=nr,
         auto_lr_objective=Int(py=objective),
+        # boosting_sparse.train_sparse passes the flag.
+        derivative_precision_ok=True,
     )
     # HONORED on the CPU arm since `boosting_sparse.train_sparse`'s round loop
     # took a bundle and began calling `sampling.bootstrap_round`.
@@ -2949,6 +3059,8 @@ def fit_multiclass_csc(
         auto_lr_ok=True,
         auto_lr_rows=nr,
         auto_lr_objective=_MULTICLASS_OBJECTIVE,
+        # boosting_sparse.train_multiclass_sparse passes the flag.
+        derivative_precision_ok=True,
     )
     # HONORED on the CPU arm since `boosting_sparse.train_multiclass_sparse`
     # took a bundle; the sparse device trainer is refused inside
@@ -4535,6 +4647,16 @@ def train_dataset(
             auto_lr_ok=True,
             auto_lr_rows=d[].num_data(),
             auto_lr_objective=Int(py=params["objective"]),
+            # UNCONDITIONAL, and WIDER than either flag beside it. Every fork of
+            # trainset.train_dataset honors the wide derivative or refuses it: the
+            # dense CPU arm is boosting.train, the sparse arm is
+            # boosting_sparse.train_sparse -- which DOES pass the flag, unlike
+            # leaf_estimation_iterations -- and the GPU arm raises in
+            # histogram.check_device_derivative_precision. This is the entry point
+            # bench/real_data trains through, and a flag that was True at `fit`
+            # alone would lose the parameter here, which is the defect
+            # random_strength_ok and leaf_estimation_ok have each been once.
+            derivative_precision_ok=True,
         ),
         Float64(py=params["alpha"]),
         device,
@@ -4584,6 +4706,9 @@ def train_dataset_multiclass(
             auto_lr_ok=True,
             auto_lr_rows=d[].num_data(),
             auto_lr_objective=_MULTICLASS_OBJECTIVE,
+            # boosting._boost_rounds_multiclass passes the flag; the GPU multiclass
+            # trainer refuses float64 by name.
+            derivative_precision_ok=True,
         ),
         device,
         _parse_bagging(params),
@@ -4692,6 +4817,12 @@ def booster_update(
             # ignored. Left at its refusing default, so a continued fit that
             # names the parameter hears that the original fit decided it.
             auto_lr_reason=String(_AUTO_LR_CONTINUED_REASON),
+            # boosting.train_more is boosting._boost_rounds with a round offset, and
+            # that loop passes the flag. A top-up at a different precision from the
+            # original fit is a caveat about the ensemble and not an ignored
+            # parameter: the rounds this call adds really are computed at the
+            # precision named here.
+            derivative_precision_ok=True,
         ),
         Float64(py=params["alpha"]),
         _parse_bagging(params),
@@ -4724,6 +4855,10 @@ def booster_update_multiclass(
             entry=String("a Dataset fit"),
             score_function_ok=True,
             auto_lr_reason=String(_AUTO_LR_CONTINUED_REASON),
+            # trainset.update_dataset_multiclass reaches
+            # boosting.train_multiclass_more, i.e. _boost_rounds_multiclass, which
+            # passes the flag.
+            derivative_precision_ok=True,
         ),
         _parse_bagging(params),
         _parse_goss(params),

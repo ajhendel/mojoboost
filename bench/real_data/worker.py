@@ -1,9 +1,18 @@
 """One measured run, in its own process.
 
 The runner never trains anything itself. It spawns this module once per
-(scenario, engine, device, repeat), and this module builds the data, runs
-one engine, scores the predictions, and writes one JSON record plus the
+(scenario, ARM, device, threads, repeat), and this module builds the data,
+runs one engine, scores the predictions, and writes one JSON record plus the
 predictions to disk.
+
+`arm` is the cell's identity within an engine and defaults to the engine
+name, so a job from a matrix built without `--arms` carries `arm == engine`
+and this module behaves exactly as it did before the dimension existed. A job
+from an arm additionally carries `arm_params` and `arm_dataset_params`, which
+`engines.build` folds into the training and the binning parameters
+respectively, and `axis`, which says which axis of a sweep the arm moves. All
+of it is written onto the record, because a timing that cannot say which arm
+produced it is a timing of an unknown model.
 
 A separate process per run is not tidiness. It is what makes three of the
 measurements mean anything:
@@ -307,8 +316,16 @@ def run_job(job):
         with open(readback_path) as handle:
             catboost_readback = json.load(handle)
 
+    # The arm's parameter overrides, carried from the matrix into the engine.
+    # `arm_params` folds into the engine's TRAINING parameters and
+    # `arm_dataset_params` into the BINNING ones, which is the same split
+    # `scenarios.dataset_params` already draws: both libraries reject max_bin
+    # on `train`. A job with no arm carries two empty dicts and the engine
+    # makes the call it made before this existed.
     engine = engines.build(
-        job["engine"], job["threads"], job["device"], catboost_readback
+        job["engine"], job["threads"], job["device"], catboost_readback,
+        arm_params=job.get("arm_params"),
+        arm_dataset_params=job.get("arm_dataset_params"),
     )
     engine.load()
     warmup = engine.warmup(spec)
@@ -369,6 +386,23 @@ def run_job(job):
         "run_id": job["run_id"],
         "job_index": job["job_index"],
         "repeat": job["repeat"],
+        # The arm dimension, on the record rather than only in the filename.
+        # `arm` defaults to the engine name in `run.py`, so a record from a
+        # matrix with no arms carries arm == engine and a reader who groups on
+        # `arm` gets the same groups they got from `engine`. A reader of an
+        # OLDER record should take `record.get("arm") or record["engine"]`.
+        "arm": job.get("arm") or job["engine"],
+        "axis": job.get("axis"),
+        "axis_value": job.get("axis_value"),
+        "arm_block": job.get("arm_block"),
+        # What the arm actually asked to move, beside the resolved dicts
+        # below. A record that carried only the resolved parameters could not
+        # say which of them the arm CHOSE and which the translator supplied.
+        "arm_overrides": {
+            "params": dict(job.get("arm_params") or {}),
+            "dataset_params": dict(job.get("arm_dataset_params") or {}),
+            "env": dict(job.get("arm_env") or {}),
+        },
         "scenario": spec["id"],
         "scenario_title": spec["title"],
         "tier": spec["tier"],
@@ -437,6 +471,8 @@ def main(argv=None):
             "scenario": job.get("scenario"),
             "tier": job.get("tier"),
             "engine": job.get("engine"),
+            "arm": job.get("arm") or job.get("engine"),
+            "axis": job.get("axis"),
             "device_requested": job.get("device"),
             "threads": job.get("threads"),
             "error": {

@@ -1367,11 +1367,22 @@ def parse_params(spec: String) raises -> TrainConfig:
         # LightGBM fixes the same choice at compile time with
         # `SCORE_T_USE_DOUBLE`. It is a key rather than a `MOJOTREES_*`
         # override because it changes a fit's numbers, which is where this
-        # package draws that line. `float32` is the default and is LightGBM's
-        # profile; `float64` parses and then fails validation with a sentence
-        # naming the environment variable that does reach the trainer
-        # (`ExtraTreeParams.check_derivative_precision`), which is the same
-        # refuse-rather-than-ignore path `use_quantized_grad` takes above.
+        # package draws that line, and because
+        # docs/COMPATIBILITY_POLICY.md section 9.5.1 makes a named parameter
+        # the shape a capability takes once it ships. `float32` is the default
+        # and is LightGBM's profile.
+        #
+        # **The comment that used to sit here said `float64` "parses and then
+        # fails validation", and it had gone stale.**
+        # `ExtraTreeParams.check_derivative_precision` range-checks the code
+        # and nothing else; the value is honored end to end by every CPU round
+        # loop that threads `wants_float64_derivatives()` into
+        # `boosting._fill_grad_hess`, and refused by name on the accelerator
+        # by `histogram.check_device_derivative_precision`. As of the
+        # 2026-08-16 wiring lane the estimator carries the same keyword
+        # (`sklearn.py`), so this key, the C ABI, the CLI and the Python
+        # surface are one door rather than a string surface plus an exported
+        # variable.
         elif key == "derivative_precision":
             config.booster.tree.extra.derivative_precision = (
                 parse_derivative_precision(value)

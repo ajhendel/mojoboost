@@ -522,6 +522,36 @@ class _Base(_ParamsMixin):
     reaches the numerical scan, so the two functionals would end up inside
     one argmax.
 
+    `derivative_precision` selects the precision a per-row gradient and
+    hessian is CARRIED at between the objective and the histogram cell:
+    `"float32"` (the default) is LightGBM's own profile, and `"float64"`
+    keeps every derivative at full width end to end. Both names are case
+    insensitive. It reaches the trainers through
+    `ExtraTreeParams.derivative_precision`, which
+    `boosting.fill_grad_hess` and `boosting._fill_softmax_grad_hess` read as
+    `float64_derivatives`.
+
+    **It moves bits by design and it is slower**, which is why it is a
+    parameter and not a default: under `"float64"` the gathered `(gradient,
+    hessian)` pair buffer does not run and the row-blocked private histograms
+    are off in both builders, so a node pays two indirect loads per row
+    instead of one sequential one. `histogram.DERIVATIVE_PRECISION_FLOAT64`
+    states the three things it gives up and the one it does not
+    (determinism across `MOJOTREES_NUM_WORKERS`). A timing taken under it is
+    not a timing of this package's CPU path.
+
+    **It is a keyword rather than an environment variable, and that is the
+    point of it being here.** An A/B driven by an exported variable is one
+    that a later process inherits without saying so, and this repository has
+    already run one arm under another's label that way. A parameter travels
+    in the params dict, is recorded in the record that quotes the timing, and
+    is refused by name at the four entry points that cannot honor it
+    (`fit_custom`, `fit_ranker`, `train_dataset_ranker`,
+    `fit_ranker_with_metrics`) instead of being accepted and dropped. The
+    accelerator refuses `"float64"` outright, at every shape, because
+    gradients reach a device as Float32 and there is no Float64 there; see
+    `histogram.check_device_derivative_precision`.
+
     `ctr` is CatBoost's ordered target statistics (catalog A19/A36):
     `'off'`, `'auto'` or `'on'`. A categorical column that overflows its
     category table loses levels into one unreachable bin, which is the one
@@ -816,6 +846,15 @@ class _Base(_ParamsMixin):
         # CatBoost-mode fit pins its own rate without leaving CatBoost mode.
         auto_learning_rate=None,
         score_function=None,
+        # The precision a per-row derivative is CARRIED at, `'float32'` or
+        # `'float64'`. `None` means the package default, which is
+        # `'float32'`, LightGBM's own profile
+        # (`histogram.DERIVATIVE_PRECISION_FLOAT32`). It is a keyword here
+        # rather than the `MOJOTREES_DERIVATIVE_PRECISION` variable it used
+        # to be reachable through only, because an A/B driven by an exported
+        # variable is inherited by processes that never asked for it and does
+        # not travel in the record that quotes the timing.
+        derivative_precision=None,
         # Ordered target statistics, catalog A19/A36: `'auto'`, `'off'` or
         # `'on'`. `None` means the grow policy's default, which is `'auto'`
         # under `symmetrictree` and `'off'` under every other policy, because
@@ -959,6 +998,7 @@ class _Base(_ParamsMixin):
         self.boost_from_average = boost_from_average
         self.auto_learning_rate = auto_learning_rate
         self.score_function = score_function
+        self.derivative_precision = derivative_precision
         self.ctr = ctr
         self.max_ctr_complexity = max_ctr_complexity
         self.device = device
@@ -2878,6 +2918,31 @@ class _Base(_ParamsMixin):
                 "l2"
                 if self.score_function is None
                 else str(self.score_function).lower()
+            ),
+            # The precision a per-row derivative is carried at
+            # (`histogram.DERIVATIVE_PRECISION_FLOAT32` /
+            # `_FLOAT64`). Lowercased here and nowhere else, the same
+            # contract `score_function`, `device_type` and `bootstrap_type`
+            # keep, so one spelling of a value resolves to one code at every
+            # surface. `"float32"` is the default and is the native default,
+            # so a fit that leaves the parameter None makes the call it made
+            # before this key existed and no bit of any existing result
+            # moves.
+            #
+            # An unknown name raises in `parse_derivative_precision`, and
+            # `"float64"` raises by entry point in `_parse_params` for the
+            # four trainers that cannot honor it -- the ranking loops, which
+            # compute their lambdas at a precision no parameter here selects,
+            # and the custom-objective fit, whose derivatives are the
+            # caller's buffers. Neither is accepted and dropped.
+            #
+            # Sent on every fit, like everything else in this mapping,
+            # because the native parser subscripts it rather than testing
+            # for a key.
+            "derivative_precision": (
+                "float32"
+                if self.derivative_precision is None
+                else str(self.derivative_precision).lower()
             ),
             # CatBoost's per-split score noise. Emitted here rather than
             # left out: the noise and its per-tree scale are both implemented
