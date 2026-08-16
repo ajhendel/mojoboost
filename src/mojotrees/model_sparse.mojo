@@ -43,7 +43,7 @@ from .boosting_sparse import (
 )
 from .device import CPU_DEVICE, GPU_DEVICE, resolve_device_full
 from .goss import GossParams
-from .sampling import ClassBaggingParams
+from .sampling import BootstrapParams, ClassBaggingParams
 from .model import Model, MulticlassModel
 from .sparse import (
     CscMatrix,
@@ -71,10 +71,17 @@ def fit_csc(
     init_score: List[Float64] = [],
     class_bagging: ClassBaggingParams = ClassBaggingParams.disabled(),
     device: Int = CPU_DEVICE,
+    bootstrap: BootstrapParams = BootstrapParams.disabled(),
 ) raises -> Model:
     """Fit on a sparse matrix without densifying it. Same arguments and
     semantics as `fit`; the implicit zeros are numerical zeros (see
     sparse.mojo).
+
+    `bootstrap` is CatBoost's `bootstrap_type` and is honored on the CPU arm,
+    which is `boosting_sparse.train_sparse` and whose round loop now calls
+    `sampling.bootstrap_round`. `train_gpu_sparse` takes no bundle and never
+    draws one, so a fit the policy sends to the device is refused by name
+    rather than trained unsampled and reported sampled.
 
     `device` follows the training-time vocabulary in device.mojo. The
     whole workload is described to the policy (`resolve_device_full`, with
@@ -117,6 +124,15 @@ def fit_csc(
     )
     var booster: Booster
     if backend == GPU_DEVICE:
+        if bootstrap.enabled():
+            raise Error(
+                "bootstrap_type is not implemented on the GPU:"
+                " train_gpu_sparse takes no bootstrap bundle and its round"
+                " loop never draws one, so the fit would be unsampled. This"
+                " fit resolved to the GPU (device='gpu', or device='auto' on a"
+                " shape the policy sends there); set device='cpu' or drop"
+                " bootstrap_type"
+            )
         booster = train_gpu_sparse(
             prepared.data,
             target,
@@ -143,6 +159,7 @@ def fit_csc(
             init_score,
             class_bagging,
             prepared.bundling,
+            bootstrap,
         )
     return Model(mapper^, booster^)
 
@@ -159,13 +176,19 @@ def fit_multiclass_csc(
     categorical_features: List[Int] = [],
     goss: GossParams = GossParams.disabled(),
     device: Int = CPU_DEVICE,
+    bootstrap: BootstrapParams = BootstrapParams.disabled(),
 ) raises -> MulticlassModel:
     """Fit a softmax multiclass model on a sparse matrix, labels in
     0..n_classes-1. `goss` draws one gradient-based sample per round, shared
     by every class's tree in that round, as in `fit_multiclass`.
     `params.bundling` carries its `fit_csc` meaning, and the one plan fitted
     here is shared by every class's tree. `device` carries its `fit_csc`
-    meaning, with `n_classes` trees per round declared to the policy."""
+    meaning, with `n_classes` trees per round declared to the policy.
+
+    `bootstrap` carries its `fit_csc` meaning and is honored on the CPU arm
+    (`boosting_sparse.train_multiclass_sparse`, one draw per round shared by
+    every class's tree); the sparse GPU multiclass trainer takes no bundle and
+    is refused by name."""
     var backend = resolve_device_full(
         device,
         csc.n_rows,
@@ -184,6 +207,15 @@ def fit_multiclass_csc(
     )
     var booster: MulticlassBooster
     if backend == GPU_DEVICE:
+        if bootstrap.enabled():
+            raise Error(
+                "bootstrap_type is not implemented on the GPU:"
+                " train_multiclass_gpu_sparse takes no bootstrap bundle and"
+                " its round loop never draws one, so the fit would be"
+                " unsampled. This fit resolved to the GPU (device='gpu', or"
+                " device='auto' on a shape the policy sends there); set"
+                " device='cpu' or drop bootstrap_type"
+            )
         booster = train_multiclass_gpu_sparse(
             prepared.data,
             labels,
@@ -204,6 +236,7 @@ def fit_multiclass_csc(
             bagging,
             goss,
             prepared.bundling,
+            bootstrap,
         )
     return MulticlassModel(mapper^, booster^)
 

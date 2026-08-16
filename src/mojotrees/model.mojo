@@ -506,16 +506,20 @@ def fit_multiclass[
     `use_missing` and `categorical_features` carry the same meaning as in
     `fit`.
 
-    `bootstrap` is accepted and REFUSED when enabled, on either backend:
-    neither `boosting.train_multiclass` nor `train_multiclass_gpu` takes the
-    bundle and neither round loop calls `sampling.bootstrap_round`, so a
-    softmax fit would silently be unsampled. The argument exists so that the
-    refusal is by name at the entry point a caller actually reaches, rather
-    than a parameter this signature quietly has no slot for. CatBoost agrees
-    about the shape of this hole: `SetNotSpecifiedOptionsToDefaults` excludes
-    the multiclass-only losses from the MVS default and falls back to the
-    Bayesian bootstrap for them (catalog A11, section 1)."""
-    check_bootstrap_honored(bootstrap, String("model.fit_multiclass"))
+    `bootstrap` is CatBoost's `bootstrap_type` and is **honored on the CPU**:
+    `boosting.train_multiclass` threads it into
+    `boosting._boost_rounds_multiclass`, which draws once per round and shares
+    the draw across every class's tree. It was refused outright here until
+    that loop existed. `train_multiclass_gpu` still takes no bundle and its
+    round loop never calls `sampling.bootstrap_round`, so a GPU fit is refused
+    by name below rather than silently unsampled.
+
+    The type CatBoost defaults a multiclass loss to is the **Bayesian**
+    bootstrap, not MVS: `SetNotSpecifiedOptionsToDefaults` excludes the
+    multiclass-only losses from the MVS default and the option keeps its
+    declared Bayesian default (catalog A11 section 1, and
+    `sampling.catboost_default_bootstrap_type` for the lines). MVS is accepted
+    but needs an explicit `mvs_reg` (`sampling.check_mvs_reg_is_set`)."""
     if params.linear.is_active():
         check_linear_tree_unconnected(
             "model.fit_multiclass (use custom_metric.fit_multiclass_with_metrics)"
@@ -558,12 +562,31 @@ def fit_multiclass[
     var data = mapper.transform(features, n_rows)
     var booster: MulticlassBooster
     if backend == GPU_DEVICE:
+        # Named rather than left to `check_bootstrap_honored`, whose message
+        # points at the single-output trainers; this is the same sentence
+        # `fit` and `trainset.train_dataset_multiclass` use on their GPU arms.
+        if bootstrap.enabled():
+            raise Error(
+                "bootstrap_type is not implemented on the GPU:"
+                " train_multiclass_gpu takes no bootstrap bundle and its round"
+                " loop never draws one, so the fit would be unsampled. This"
+                " fit resolved to the GPU (device='gpu', or device='auto' on a"
+                " shape the policy sends there); set device='cpu' or drop"
+                " bootstrap_type"
+            )
         booster = train_multiclass_gpu(
             data, labels, n_classes, params, sample_weight, bagging, goss
         )
     else:
         booster = train_multiclass(
-            data, labels, n_classes, params, sample_weight, bagging, goss
+            data,
+            labels,
+            n_classes,
+            params,
+            sample_weight,
+            bagging,
+            goss,
+            bootstrap,
         )
     return MulticlassModel(mapper^, booster^)
 

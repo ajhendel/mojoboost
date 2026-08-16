@@ -72,7 +72,9 @@ from .sampling import (
     BootstrapParams,
     ClassBaggingParams,
     MvsAudit,
+    apply_bootstrap_weights,
     bootstrap_round,
+    check_mvs_reg_is_set,
     has_positive_rows,
     mvs_auto_lambda_from_gradients,
     mvs_auto_lambda_from_leaf_values,
@@ -91,6 +93,7 @@ from .objective_registry import (
     LINK_EXP,
     LINK_SIGMOID,
     MAPE as _MAPE,
+    MULTICLASS as _MULTICLASS,
     POISSON as _POISSON,
     QUANTILE as _QUANTILE,
     SQUARED_ERROR as _SQUARED_ERROR,
@@ -451,6 +454,37 @@ def _check_bootstrap(
 # `RenewTreeOutput`), imported above and re-exported from here under the
 # name the boosting loop and its callers have always used; the leaf renewal
 # it decides is `_renew_leaf_values` below.
+
+
+def _check_bootstrap_multiclass(
+    bootstrap: BootstrapParams,
+    bagging: BaggingParams,
+    goss: GossParams,
+    where: String,
+) raises:
+    """`_check_bootstrap` for the softmax loops, plus the one refusal that is
+    theirs alone.
+
+    The three row-sampler exclusions are exactly `_check_bootstrap`'s and are
+    delegated to it rather than restated, so the messages a multiclass user
+    reads are the messages a single-output user reads. `ClassBaggingParams` is
+    passed disabled because balanced bagging is binary-only
+    (`_check_class_bagging` restricts it) and a softmax loop never builds one,
+    and the objective is passed as `MULTICLASS` -- honest, and not `CUSTOM`,
+    which is the only code `_check_bootstrap` tests for.
+
+    What is added is `check_mvs_reg_is_set`: MVS with a **derived** lambda
+    reads the previous iteration's `[dim][leaf]` table, which a round of `K`
+    structurally different trees does not have. See that function for the
+    CatBoost lines. It is the reason `catboost_default_bootstrap_type` exists at
+    all -- CatBoost defaults these losses to the Bayesian bootstrap, which
+    needs no lambda, so the DEFAULT never reaches this refusal and only an
+    explicit `bootstrap_type='mvs'` without `mvs_reg` does.
+    """
+    _check_bootstrap(
+        bootstrap, bagging, goss, ClassBaggingParams.disabled(), _MULTICLASS
+    )
+    check_mvs_reg_is_set(bootstrap, where)
 
 
 def renewal_alpha(objective: Int, alpha: Float64) -> Float64:
@@ -3626,6 +3660,7 @@ def _boost_rounds_multiclass(
     round_offset: Int,
     mut raw: List[Float64],
     mut trees: List[Tree],
+    bootstrap: BootstrapParams = BootstrapParams.disabled(),
 ) raises -> Int:
     """Grow `params.n_estimators` softmax rounds, appending one tree per
     class per round to `trees` and keeping the row-major `raw` scores
@@ -3641,6 +3676,35 @@ def _boost_rounds_multiclass(
     `params.bundling` is fitted once here and shared by every class's tree in
     every round, which is what makes it worth fitting at all: the plan depends
     on the matrix, not on the gradients.
+
+    `bootstrap` is CatBoost's `bootstrap_type` (see sampling.mojo), and this
+    loop now runs it. **One draw per ROUND, shared by every class's tree**,
+    which is the rule `goss` already keeps here and for the same reason: the
+    classes' trees have to be grown on the same rows or their leaf counts stop
+    being comparable, and CatBoost calls `Bootstrap` once per iteration, not
+    once per approx dimension. The draw is taken from the round's derivatives
+    laid out row-major over classes (`[r * n_classes + k]`), which is exactly
+    the `n_outputs` layout `sampling.bootstrap_round`,
+    `sampling._row_magnitude_squared` and CatBoost's own
+    `sum_k der[dim][idx]^2` already take, so a row's keep probability is a
+    function of its whole `K`-vector of gradients and not of one class's.
+
+    Then each class's own `grad`/`hess` are multiplied by that one per-row
+    weight (`sampling.apply_bootstrap_weights`, CatBoost's `CalcWeightedData`),
+    which is what makes a bootstrapped softmax fit a weighted fit everywhere
+    downstream -- leaf denominators, `min_child_hess`, and the renewal all see
+    the drawn weight without a second vector being carried.
+
+    **Determinism.** The draw is keyed on `(seed, round, row)` through
+    `sampling._mvs_stream` / `_bootstrap_stream` and their domain constants,
+    with `round` the absolute round index, so it is identical at any
+    `MOJOTREES_NUM_WORKERS` and on any machine, and a continued run draws what
+    an uninterrupted one would have. **No new domain constant is needed and
+    none is added**: the key is `(seed, tree_index)` with `tree_index = round`,
+    the same shape the dense single-output loop uses, because the draw is
+    per-round there too. The per-class tree seed stays `round * n_classes + k`
+    and is a different stream (`sampling._stream`, feature sampling) that this
+    does not touch.
     """
     # Multiclass does not take extra Newton steps, and refuses rather than
     # ignoring the setting. The single-output form recomputes one row's
@@ -3660,6 +3724,31 @@ def _boost_rounds_multiclass(
     # also the case CatBoost itself excludes from its Ordered default
     # (`catboost_options.cpp:802-806`, `ordered_boosting.catboost_auto_is_ordered`).
     check_ordered_honored(params.ordered, String("the multiclass trainers"))
+    # CatBoost's `bootstrap_type`: the three row-sampler exclusions, and the
+    # derived-lambda refusal that is the softmax loop's own.
+    _check_bootstrap_multiclass(
+        bootstrap, bagging, goss, String("the multiclass trainers")
+    )
+    # ---- the bootstrap's constant-hessian exclusion, stated rather than
+    # assumed ----
+    #
+    # This loop declares NO constant hessian and never has -- the softmax
+    # hessian `(K/(K-1)) * p * (1-p)` varies per row at every class count, as
+    # the comment beside `grow_tree_leaves` below says at length -- so the
+    # literal `False` here is the declaration this fit trains under, and the
+    # call is trivially satisfied today.
+    #
+    # It is made anyway, and that is the point of it. `check_hessian_declaration`
+    # is an ASSERTION that the declaration and the sampler were reconciled, and
+    # the failure it guards against is a future edit: a lane that gives this
+    # loop a constant-hessian fast path (the softmax hessian on round 1 is
+    # equal across rows, which is a tempting special case) would otherwise
+    # rebuild a plane of ones over a plane of MVS draws and choose every split
+    # of the fit from it, silently. With this line, that edit raises at fit
+    # setup instead. `boosting.round_has_constant_hessian` cannot carry the
+    # exclusion for the reason its own docstring gives: it cannot see a
+    # sampler that has not run yet.
+    bootstrap.check_hessian_declaration(False)
     var bundling = prepare_bundling(data, params.bundling)
     # ONE ledger across every class, not one per class. A feature computed
     # for class 0's tree is computed for the row, so charging it again for
@@ -3679,6 +3768,26 @@ def _boost_rounds_multiclass(
     var hess = List[Float64](capacity=n)
     var bag = List[Int]()
     var grown = 0
+    # ---- the bootstrap's buffers, all empty and untouched when it is off ----
+    #
+    # `mgrad`/`mhess` are the round's derivatives ROW-MAJOR over classes,
+    # `[r * n_classes + k]`, which is the only layout the draw can read: MVS's
+    # keep probability is a function of `sqrt(sum_k der_k^2 + lambda)`, so it
+    # needs a row's whole vector at once, and the class loop below builds one
+    # class at a time. They are scratch for the draw alone -- `bootstrap_round`
+    # scales them by the weights it just drew and this loop then discards them,
+    # because the numbers the trees are grown on are refilled per class from
+    # `prob` and scaled by the same weights there.
+    #
+    # Allocated once for the whole fit and only when a bootstrap is configured,
+    # so the default arm allocates nothing and moves no bits.
+    var mgrad = List[Float64]()
+    var mhess = List[Float64]()
+    var boot_w = List[Float64]()
+    var boot_audit = MvsAudit.empty()
+    if bootstrap.enabled():
+        mgrad.resize(n * n_classes, 0.0)
+        mhess.resize(n * n_classes, 0.0)
     # Shared by every class's tree in every round: the histogram shape is the
     # dataset's, not the class's, so one pool serves them all.
     # The fit's one reading of the dispatch environment and of the machine's
@@ -3713,6 +3822,51 @@ def _boost_rounds_multiclass(
             )
             bag = selection.rows.copy()
 
+        # ---- CatBoost's `bootstrap_type`, ONE draw for the whole round ----
+        #
+        # In `goss_round`'s place in the single-output loop and for the same
+        # reason: a row sampler that reads this round's derivatives, rewrites
+        # them, and may replace the row list. The two are mutually exclusive
+        # (`_check_bootstrap_multiclass`), as are the bags, so nothing here
+        # composes with anything above it.
+        #
+        # The `auto_lambda` argument is 0.0 and is never read: MVS with a
+        # derived lambda is refused for this loop at setup
+        # (`check_mvs_reg_is_set`), so `MvsBootstrapParams.resolve_reg` always
+        # takes its explicit branch, and the Bayesian bootstrap has no lambda
+        # at all. Passing a real derivation here would be inventing CatBoost's
+        # number rather than computing it.
+        if bootstrap.enabled():
+            # MVS writes its kept rows into `bag`, so what arrives here from
+            # round 1 onward is the PREVIOUS round's draw and not a bag.
+            # `bootstrap_round` refuses a non-empty row list beside MVS --
+            # correctly, since a real bag would be silently intersected with a
+            # draw that never saw it -- and without this clear that refusal
+            # fires on the sampler's own output and every MVS fit stops after
+            # one round. A real bag cannot reach here: bagging and GOSS are
+            # both refused beside a bootstrap at setup.
+            bag.clear()
+            for k in range(n_classes):
+                _fill_softmax_grad_hess(
+                    prob, labels, k, n_classes, sample_weight, grad, hess,
+                    float64_derivatives=params.tree.extra.wants_float64_derivatives(),
+                )
+                for r in range(n):
+                    mgrad[r * n_classes + k] = grad[r]
+                    mhess[r * n_classes + k] = hess[r]
+            bootstrap_round(
+                bag,
+                mgrad,
+                mhess,
+                boot_w,
+                boot_audit,
+                bootstrap,
+                n,
+                round,
+                0.0,
+                n_classes,
+            )
+
         var made_progress = False
         for k in range(n_classes):
             _fill_softmax_grad_hess(
@@ -3720,6 +3874,13 @@ def _boost_rounds_multiclass(
                 float64_derivatives=params.tree.extra.wants_float64_derivatives(),
             )
             apply_goss_scaling(selection, grad, hess)
+            # The round's one draw, applied to this class's derivatives. The
+            # weight vector is the same for every class, which is what makes
+            # the `K` trees of a round comparable, and it is empty on the
+            # default arm (`bootstrap_round` clears rather than fills), so an
+            # unbootstrapped fit does not even test a row.
+            if len(boot_w) != 0:
+                apply_bootstrap_weights(grad, hess, boot_w, n, 1)
             # Feature subsampling draws once per tree, so each class's tree
             # in a round gets its own feature set.
             #
@@ -3729,8 +3890,10 @@ def _boost_rounds_multiclass(
             # per row with that row's class probability, so a softmax
             # hessian is not constant at any class count and is not
             # constant on the first round either, where every probability
-            # is equal but the value is not 1.0. The GOSS rescale on the
-            # line above would break the guarantee a second time.
+            # is equal but the value is not 1.0. The GOSS rescale and the
+            # bootstrap draw on the lines above would each break the
+            # guarantee a second time; `bootstrap.check_hessian_declaration`
+            # at fit setup is where that is stated in code.
             var tree = grow_tree_leaves(
                 leaves,
                 ledger,
@@ -3756,13 +3919,17 @@ def _boost_rounds_multiclass(
             )
             trees.append(tree^)
 
-        # No class made progress: with bagging or GOSS that is a statement
-        # about this sample, so the round is dropped and the next sample
-        # gets its turn.
+        # No class made progress: with bagging, GOSS or a bootstrap that is a
+        # statement about this sample, so the round is dropped and the next
+        # sample gets its turn.
         if not made_progress:
             for _ in range(n_classes):
                 _ = trees.pop()
-            if bagging_enabled(bagging) or goss.enabled:
+            if (
+                bagging_enabled(bagging)
+                or goss.enabled
+                or bootstrap.enabled()
+            ):
                 continue
             break
         grown += 1
@@ -3777,6 +3944,7 @@ def train_multiclass(
     sample_weight: List[Float64] = [],
     bagging: BaggingParams = BaggingParams.disabled(),
     goss: GossParams = GossParams.disabled(),
+    bootstrap: BootstrapParams = BootstrapParams.disabled(),
 ) raises -> MulticlassBooster:
     """Train a softmax multiclass ensemble on labels in 0..n_classes-1.
     A non-empty sample_weight scales each row's gradient and hessian and
@@ -3784,7 +3952,17 @@ def train_multiclass(
     draws one bag per round and every class's tree in that round is grown
     on it, so the per-class trees stay comparable. `goss` samples the round's
     rows by summed per-class gradient magnitude instead (see goss.mojo), one
-    sample per round for the same reason."""
+    sample per round for the same reason.
+
+    `bootstrap` is CatBoost's `bootstrap_type` and is drawn once per round on
+    the same schedule and for the same reason (see `_boost_rounds_multiclass`).
+    It is exclusive with `bagging` and `goss`. **The Bayesian bootstrap is what
+    CatBoost itself defaults a multiclass loss to** -- its MVS default excludes
+    the multiclass-only losses, `sampling.catboost_default_bootstrap_type` cites
+    the lines -- and MVS here needs an explicit `mvs_reg`, because the derived
+    lambda reads a `[dim][leaf]` table that a round of `K` separate trees does
+    not have. Disabled by default, so an untouched bundle takes no draw and
+    every existing fit is byte for byte what it was."""
     if params.linear.is_active():
         check_linear_tree_unconnected("train_multiclass")
     if len(labels) != data.n_rows:
@@ -3831,6 +4009,7 @@ def train_multiclass(
         0,
         raw,
         trees,
+        bootstrap,
     )
 
     return MulticlassBooster(
@@ -3850,6 +4029,7 @@ def train_multiclass_more(
     sample_weight: List[Float64] = [],
     bagging: BaggingParams = BaggingParams.disabled(),
     goss: GossParams = GossParams.disabled(),
+    bootstrap: BootstrapParams = BootstrapParams.disabled(),
 ) raises -> Int:
     """Append `params.n_estimators` more softmax rounds to a fitted
     multiclass ensemble and return how many rounds were actually added.
@@ -3932,6 +4112,13 @@ def train_multiclass_more(
         n_rounds,
         raw,
         grown,
+        # No `round_offset` refusal of its own, unlike the single-output loop:
+        # the derived MVS lambda that refusal protects is already refused
+        # outright for every softmax round (`check_mvs_reg_is_set`), so an
+        # explicit `mvs_reg` -- the only MVS that reaches here -- continues
+        # exactly as the Bayesian bootstrap does, and both key their draw on
+        # the ABSOLUTE round index, which is what `n_rounds` above passes.
+        bootstrap,
     )
     for i in range(len(grown)):
         booster.trees.append(grown[i].copy())

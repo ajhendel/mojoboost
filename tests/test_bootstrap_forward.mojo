@@ -21,9 +21,15 @@ it where a trainer cannot draw:
    stream is counter-based on `(seed, tree, row)` with its own domain
    constant, so this must hold at every `MOJOTREES_NUM_WORKERS` too; this
    file can only assert the same-process half of that.
-4. **Every entry point that cannot draw refuses by name.** `fit_multiclass`
-   and `fit_custom` take the bundle and raise on an enabled one rather than
-   training an unsampled model and reporting a sampled one.
+4. **The softmax and sparse loops draw it too.** `fit_multiclass` and the
+   sparse arm of `trainset.train_dataset` used to refuse an enabled bundle;
+   both now thread it into a round loop that calls
+   `sampling.bootstrap_round`, so the assertion here is that the model MOVES,
+   which a forwarding that validated and dropped the bundle would fail.
+5. **What still cannot draw refuses by name.** `fit_custom` raises on any
+   enabled bundle, and MVS with a DERIVED `mvs_reg` raises on a softmax fit,
+   because CatBoost's derivation reads a previous-iteration `[dim][leaf]`
+   leaf-value table that `K` structurally unrelated trees do not have.
 
 Float comparisons are exact, as they are in the wire file: both arms of every
 same-model assertion are deterministic by contract, so a tolerance would only
@@ -49,6 +55,7 @@ from mojotrees import (
     train_dataset,
 )
 from mojotrees.sampling import BootstrapParams
+from mojotrees.sparse import CscMatrix
 from support import _make_features as _features
 
 
@@ -218,26 +225,162 @@ def test_train_dataset_forwards_the_bundle() raises:
     assert_true(moved)
 
 
-def test_multiclass_refuses_an_enabled_bootstrap() raises:
-    """Neither `boosting.train_multiclass` nor `train_multiclass_gpu` takes
-    the bundle, so a softmax fit under one would be unsampled. CatBoost
-    agrees about the shape of this hole: its own defaulting block excludes
-    the multiclass-only losses from the MVS default."""
+def _multiclass_moved(
+    features: List[Float64],
+    labels: List[Int],
+    bootstrap: BootstrapParams,
+) raises -> Bool:
+    """Whether a softmax fit under `bootstrap` differs from the unsampled
+    one. A bundle that was validated and then dropped would return False,
+    which is the only failure worth writing this test for."""
+    var plain = fit_multiclass(
+        features, N_ROWS, N_FEATURES, labels, 3, _params(), MAX_BINS,
+    )
+    var sampled = fit_multiclass(
+        features, N_ROWS, N_FEATURES, labels, 3, _params(), MAX_BINS,
+        bootstrap=bootstrap,
+    )
+    for r in range(N_ROWS):
+        var row = _row(features, N_ROWS, N_FEATURES, r)
+        var a = plain.predict_proba(row)
+        var b = sampled.predict_proba(row)
+        for k in range(len(a)):
+            if a[k] != b[k]:
+                return True
+    return False
+
+
+def test_multiclass_draws_the_bundle_it_is_handed() raises:
+    """The softmax loop RUNS a bootstrap now, and this test used to assert
+    that it refused one.
+
+    `boosting._boost_rounds_multiclass` takes a `BootstrapParams` and calls
+    `sampling.bootstrap_round` once per round, sharing the draw across every
+    class's tree the way it already shares a GOSS sample -- so the `K` trees
+    of a round stay grown on one row set. Two of the three arms below are the
+    substance:
+
+    - **The Bayesian bootstrap is honored**, and it is the type CatBoost's own
+      defaulting block installs for a multiclass-only loss
+      (`sampling.catboost_default_bootstrap_type` cites the lines). This is
+      the arm a shipped CatBoost default would take.
+    - **MVS with an explicit `mvs_reg` is honored.**
+    - **MVS with a DERIVED `mvs_reg` still refuses, by name.** CatBoost's
+      derivation reads the previous iteration's `[dim][leaf]` leaf-value
+      table (`mvs.cpp:21-34`); a mojotrees round is `K` structurally
+      unrelated trees and has no such table, so there is no number to compute
+      and inventing one would set the floor that decides which rows survive
+      to something no CatBoost run produces.
+
+    A disabled bundle is still accepted and still trains, so the refusal that
+    remains is about the value and not about the argument existing.
+    """
     var features = _features(N_ROWS, N_FEATURES)
     var target = _target(features, N_ROWS)
     var labels = _labels(target, N_ROWS)
-    with assert_raises(contains="bootstrap_type"):
+
+    with assert_raises(contains="mvs_reg"):
         _ = fit_multiclass(
             features, N_ROWS, N_FEATURES, labels, 3, _params(), MAX_BINS,
             bootstrap=BootstrapParams.mvs_at(0.8, 7),
         )
-    # And a disabled bundle is accepted, so the refusal is about the value
-    # and not about the argument existing.
+
+    assert_true(
+        _multiclass_moved(
+            features, labels, BootstrapParams.bayesian_at(1.0, 7)
+        )
+    )
+    assert_true(
+        _multiclass_moved(
+            features, labels, BootstrapParams.mvs_with_reg(0.1, 0.8, 7)
+        )
+    )
+
     var model = fit_multiclass(
         features, N_ROWS, N_FEATURES, labels, 3, _params(), MAX_BINS,
         bootstrap=BootstrapParams.disabled(),
     )
     assert_true(len(model.booster.trees) > 0)
+
+
+def test_multiclass_bootstrap_repeats_at_one_seed() raises:
+    """One seed, one model. The draw is `uniform(stream + row)` for a stream
+    derived from `(seed, round)` alone, so two fits of the same data at the
+    same seed are the same ensemble bit for bit. This is the same-process half
+    of the determinism claim; the cross-worker half is a digest run at two
+    `MOJOTREES_NUM_WORKERS` values and cannot be asserted from inside one
+    process."""
+    var features = _features(N_ROWS, N_FEATURES)
+    var target = _target(features, N_ROWS)
+    var labels = _labels(target, N_ROWS)
+    var a = fit_multiclass(
+        features, N_ROWS, N_FEATURES, labels, 3, _params(), MAX_BINS,
+        bootstrap=BootstrapParams.bayesian_at(1.0, 11),
+    )
+    var b = fit_multiclass(
+        features, N_ROWS, N_FEATURES, labels, 3, _params(), MAX_BINS,
+        bootstrap=BootstrapParams.bayesian_at(1.0, 11),
+    )
+    assert_equal(len(a.booster.trees), len(b.booster.trees))
+    for r in range(N_ROWS):
+        var row = _row(features, N_ROWS, N_FEATURES, r)
+        var pa = a.predict_proba(row)
+        var pb = b.predict_proba(row)
+        for k in range(len(pa)):
+            assert_equal(pa[k], pb[k])
+
+
+def test_sparse_draws_the_bundle_it_is_handed() raises:
+    """`boosting_sparse.train_sparse`'s round loop calls
+    `sampling.bootstrap_round` in the place the dense loop calls it, so a
+    sparse fit under MVS is a sampled fit and not the unsampled one.
+
+    `trainset.train_dataset` used to refuse the bundle on this arm through
+    `sampling.check_bootstrap_honored`. That refusal is gone because the loop
+    behind it exists, not because the rule was relaxed: the GPU arm still
+    raises, by name.
+    """
+    var features = _features(N_ROWS, N_FEATURES)
+    var target = _target(features, N_ROWS)
+    # Sparsify: a zero is an implicit entry, which is what the CSC path is
+    # for. Two of the four columns keep every value so the trees have
+    # something to split on.
+    var sparse_features = features.copy()
+    for f in range(2, N_FEATURES):
+        for r in range(N_ROWS):
+            if r % 3 != 0:
+                sparse_features[f * N_ROWS + r] = 0.0
+    var rows = List[Int]()
+    var vals = List[Float64]()
+    var offs = List[Int]()
+    offs.append(0)
+    for f in range(N_FEATURES):
+        for r in range(N_ROWS):
+            var v = sparse_features[f * N_ROWS + r]
+            if v != 0.0:
+                rows.append(r)
+                vals.append(v)
+        offs.append(len(rows))
+    var ds = Dataset.from_csc(
+        CscMatrix(rows^, vals^, offs^, N_ROWS, N_FEATURES),
+        target.copy(),
+        max_bin=MAX_BINS,
+    )
+    assert_true(ds.is_sparse)
+    var plain = train_dataset(ds, SQUARED_ERROR, _params())
+    var sampled = train_dataset(
+        ds,
+        SQUARED_ERROR,
+        _params(),
+        bootstrap=BootstrapParams.mvs_at(0.8, 7),
+    )
+    var moved = False
+    for r in range(N_ROWS):
+        var row = _row(sparse_features, N_ROWS, N_FEATURES, r)
+        if plain.predict(row) != sampled.predict(row):
+            moved = True
+            break
+    assert_true(moved)
 
 
 def main() raises:

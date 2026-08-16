@@ -30,6 +30,14 @@ feature penalties all reach `grow_tree_sparse`, which opts into
 `grower_applies_extra` and applies the leaf-finishing half itself, renewal
 included.
 
+CatBoost's `bootstrap_type` is available too, on `train_sparse` and
+`train_multiclass_sparse`: both loops call `sampling.bootstrap_round` in the
+place the dense loops call it, so a sparse MVS or Bayesian fit takes the same
+draw a dense one takes on the same data. `train_sparse_with_valid` takes no
+bundle and so refuses one by construction -- there is no argument to pass --
+which is deliberate rather than pending: nothing routes to it with a
+bootstrap, and adding a second unexercised round loop is how the two drift.
+
 Exclusive feature bundling is available too, through
 `prepare_bundling_csc`: it fits a plan with `efb.fit_bundles`, applies it
 with `efb.bundle_csc`, and hands back the bundled matrix under the
@@ -66,6 +74,8 @@ from .boosting import (
     BoosterParams,
     MulticlassBooster,
     _base_score,
+    _check_bootstrap,
+    _check_bootstrap_multiclass,
     _check_class_bagging,
     _check_goss,
     _check_objective,
@@ -77,6 +87,7 @@ from .boosting import (
     _multiclass_goss_select,
     _percentile,
     _softmax_inplace,
+    _tree_leaf_values,
     _weighted_percentile,
     objective_renews_leaves,
     renewal_alpha,
@@ -92,8 +103,14 @@ from .efb import (
 )
 from .goss import GossParams, GossSelection, apply_goss_scaling, goss_round
 from .sampling import (
+    BootstrapParams,
     ClassBaggingParams,
+    MvsAudit,
+    apply_bootstrap_weights,
+    bootstrap_round,
     has_positive_rows,
+    mvs_auto_lambda_from_gradients,
+    mvs_auto_lambda_from_leaf_values,
     refresh_class_bag,
 )
 from .sparse import SparseBinnedMatrix
@@ -326,6 +343,7 @@ def train_sparse(
     init_score: List[Float64] = [],
     class_bagging: ClassBaggingParams = ClassBaggingParams.disabled(),
     bundling: SparseBundling = SparseBundling.none(),
+    bootstrap: BootstrapParams = BootstrapParams.disabled(),
 ) raises -> Booster:
     """Sparse counterpart of `train`, with identical arguments and
     semantics. The returned `Booster` is an ordinary one: it serializes,
@@ -349,7 +367,25 @@ def train_sparse(
     stays in the original feature space, so a bundled fit differs from an
     unbundled one only in how histograms are laid out. Leaving it at
     `none()` while `params.bundling.enabled` is set is an error rather than
-    a silent unbundled fit -- see `_resolve_bundling`."""
+    a silent unbundled fit -- see `_resolve_bundling`.
+
+    `bootstrap` is CatBoost's `bootstrap_type` (see sampling.mojo), and this
+    loop runs it exactly as the dense single-output loop does: the draw sits
+    where `goss_round` sits, immediately after the gradient fill, reads that
+    round's derivatives, rewrites them, and hands back the row set the split
+    search should see. MVS's derived `mvs_reg` is read off the previous tree's
+    leaf values here as it is there (`boosting._tree_leaf_values`,
+    `TMvsSampler::GetLambda`), so a sparse MVS fit and a dense one on the same
+    data draw the same lambda every round. It is exclusive with `bagging`,
+    `goss` and `class_bagging` (`boosting._check_bootstrap`) and disabled by
+    default.
+
+    **Determinism.** Every weight is a function of `(seed, tree_index, row)`
+    alone, keyed through `sampling._mvs_stream` / `_bootstrap_stream` with
+    `tree_index` the round index, so the buffers are identical at any
+    `MOJOTREES_NUM_WORKERS` and on any machine. Nothing about sparsity enters
+    the draw: it reads the derivative buffers, which are dense per row, and
+    not the matrix."""
     if len(target) != data.n_rows:
         raise Error("target length must equal n_rows")
     data.validate()
@@ -362,6 +398,17 @@ def train_sparse(
     check_bagging(bagging)
     _check_goss(goss, bagging)
     _check_class_bagging(class_bagging, bagging, goss, objective)
+    _check_bootstrap(bootstrap, bagging, goss, class_bagging, objective)
+    # The sparse grower makes no constant-hessian declaration of its own --
+    # `grow_tree_sparse` takes no `const_hessian` flag from this loop and
+    # resolves only the environment snapshot -- so the declaration this fit
+    # trains under is `False`. Stated in code rather than left implicit, for
+    # the reason `_boost_rounds_multiclass` gives at length: a future lane that
+    # gives the sparse grower the two-plane specialization would otherwise
+    # rebuild a plane of ones over a plane of draws and pick every split from
+    # it. `boosting.round_has_constant_hessian` cannot carry this; its own
+    # docstring says why.
+    bootstrap.check_hessian_declaration(False)
     params.tree.monotone.check_features(n_features)
     if len(init_score) != 0 and len(init_score) != data.n_rows:
         raise Error("init_score length must equal n_rows")
@@ -390,6 +437,18 @@ def train_sparse(
     # not. One label sweep, hoisted out of the round loop, exactly as in
     # `boosting._boost_rounds`.
     var balanced = class_bagging.enabled() and has_positive_rows(target)
+    # ---- the bootstrap's buffers, all empty and untouched when it is off ----
+    # One buffer for the whole fit, rewritten in place every round, exactly as
+    # `boosting._boost_rounds` keeps them. `bootstrap_round` CLEARS rather than
+    # fills on the default arm, so an unbootstrapped sparse fit allocates
+    # nothing here and moves no bits.
+    var boot_w = List[Float64]()
+    var boot_audit = MvsAudit.empty()
+    # The previous tree's leaf values, for MVS's derived lambda. Empty on the
+    # first round, which is the branch `TMvsSampler::GetLambda` takes when
+    # `leafValues` is empty.
+    var last_leaf_values = List[Float64]()
+    var n_last_leaves = 0
     for i in range(params.n_estimators):
         if balanced:
             refresh_class_bag(bag, class_bagging, target, i)
@@ -400,6 +459,40 @@ def train_sparse(
             float64_derivatives=params.tree.extra.wants_float64_derivatives(),
         )
         goss_round(bag, grad, hess, goss, i, params.learning_rate)
+        # ---- CatBoost's `bootstrap_type` ----
+        #
+        # `goss_round`'s twin, in `goss_round`'s place, as on the dense path.
+        # The lambda argument is `TMvsSampler::GetLambda`'s branch made
+        # explicit: the squared mean gradient magnitude while no tree exists,
+        # the squared mean leaf-value norm of the previous tree afterwards.
+        if bootstrap.enabled():
+            # MVS writes its kept rows into `bag`, so from round 1 on what
+            # arrives here is the previous round's draw and not a bag;
+            # `bootstrap_round` refuses a non-empty row list beside MVS and
+            # without this clear every MVS fit would stop after one tree. A
+            # real bag cannot reach here -- `_check_bootstrap` refused all
+            # three of the other samplers at setup.
+            bag.clear()
+            var auto_lambda = 0.0
+            if bootstrap.mvs.enabled and not bootstrap.mvs.reg_is_set:
+                if n_last_leaves > 0:
+                    auto_lambda = mvs_auto_lambda_from_leaf_values(
+                        last_leaf_values, n_last_leaves, 1
+                    )
+                else:
+                    auto_lambda = mvs_auto_lambda_from_gradients(grad, n, 1)
+            bootstrap_round(
+                bag,
+                grad,
+                hess,
+                boot_w,
+                boot_audit,
+                bootstrap,
+                n,
+                i,
+                auto_lambda,
+                1,
+            )
         var grown = grow_tree_sparse(
             data, grad, hess, params.tree, bag, i, bundles
         )
@@ -416,7 +509,12 @@ def train_sparse(
             )
 
         if grown.tree.n_leaves == 1 and abs(grown.tree.value[0]) < 1e-12:
-            if bagging_enabled(bagging) or goss.enabled or balanced:
+            if (
+                bagging_enabled(bagging)
+                or goss.enabled
+                or balanced
+                or bootstrap.enabled()
+            ):
                 continue
             break
 
@@ -424,6 +522,17 @@ def train_sparse(
             raw, params.learning_rate, grown.tree, grown.row_leaf, data,
             bundles,
         )
+        # MVS's derived lambda for the NEXT round, read off the tree the
+        # ensemble just kept -- `leafValues.back()` in `TMvsSampler::GetLambda`.
+        # After the degenerate-tree test, so a dropped round does not leave its
+        # leaf values as the next round's lambda, which is what
+        # `LearnProgress->LeafValues` never receiving them means in CatBoost.
+        # Only when the derivation is actually used: an explicit `mvs_reg`, the
+        # Bayesian bootstrap and the default arm all skip the walk.
+        if bootstrap.mvs.enabled and not bootstrap.mvs.reg_is_set:
+            n_last_leaves = _tree_leaf_values(
+                grown.tree, params.learning_rate, last_leaf_values
+            )
         trees.append(grown.tree.copy())
 
     return Booster(
@@ -577,6 +686,7 @@ def train_multiclass_sparse(
     bagging: BaggingParams = BaggingParams.disabled(),
     goss: GossParams = GossParams.disabled(),
     bundling: SparseBundling = SparseBundling.none(),
+    bootstrap: BootstrapParams = BootstrapParams.disabled(),
 ) raises -> MulticlassBooster:
     """Sparse counterpart of `train_multiclass`, with identical arguments
     and semantics.
@@ -587,7 +697,15 @@ def train_multiclass_sparse(
     scaling, and the round-skipping rule are one implementation, not two.
 
     `bundling` carries its `train_sparse` meaning, and one plan is shared by
-    every class's tree in every round, as on the dense multiclass path."""
+    every class's tree in every round, as on the dense multiclass path.
+
+    `bootstrap` carries its `boosting._boost_rounds_multiclass` meaning and is
+    drawn on the same schedule: **one draw per round**, taken from the round's
+    derivatives laid out row-major over classes, then applied to every class's
+    own derivatives, so the `K` trees of a round are grown on one row set. MVS
+    here needs an explicit `mvs_reg` for the reason
+    `sampling.check_mvs_reg_is_set` gives, and the Bayesian bootstrap is what
+    CatBoost defaults a multiclass loss to."""
     if len(labels) != data.n_rows:
         raise Error("labels length must equal n_rows")
     if n_classes < 2:
@@ -599,6 +717,13 @@ def train_multiclass_sparse(
     _check_sample_weight(sample_weight, data.n_rows)
     check_bagging(bagging)
     _check_goss(goss, bagging)
+    _check_bootstrap_multiclass(
+        bootstrap, bagging, goss, String("train_multiclass_sparse")
+    )
+    # No constant-hessian declaration is made by this loop, for both the
+    # softmax reason and the sparse-grower reason; see `train_sparse` and
+    # `boosting._boost_rounds_multiclass`.
+    bootstrap.check_hessian_declaration(False)
     params.tree.monotone.check_features(bundles.n_features)
     var n = data.n_rows
 
@@ -630,6 +755,17 @@ def train_multiclass_sparse(
     var grad = List[Float64](capacity=n)
     var hess = List[Float64](capacity=n)
     var bag = List[Int]()
+    # The round's derivatives row-major over classes, and the round's one draw.
+    # See `boosting._boost_rounds_multiclass` for why the layout has to be
+    # row-major and why the buffers are scratch for the draw alone. Allocated
+    # only when a bootstrap is configured.
+    var mgrad = List[Float64]()
+    var mhess = List[Float64]()
+    var boot_w = List[Float64]()
+    var boot_audit = MvsAudit.empty()
+    if bootstrap.enabled():
+        mgrad.resize(n * n_classes, 0.0)
+        mhess.resize(n * n_classes, 0.0)
     for i in range(params.n_estimators):
         refresh_bag(bag, bagging, n, i)
         for r in range(n):
@@ -647,6 +783,33 @@ def train_multiclass_sparse(
             )
             bag = selection.rows.copy()
 
+        # ---- CatBoost's `bootstrap_type`, ONE draw for the whole round ----
+        # The dense softmax loop's block verbatim in shape; the `auto_lambda`
+        # of 0.0 is never read, because a derived `mvs_reg` is refused for
+        # every softmax round at setup (`check_mvs_reg_is_set`).
+        if bootstrap.enabled():
+            bag.clear()
+            for k in range(n_classes):
+                _fill_softmax_grad_hess(
+                    prob, labels, k, n_classes, sample_weight, grad, hess,
+                    float64_derivatives=params.tree.extra.wants_float64_derivatives(),
+                )
+                for r in range(n):
+                    mgrad[r * n_classes + k] = grad[r]
+                    mhess[r * n_classes + k] = hess[r]
+            bootstrap_round(
+                bag,
+                mgrad,
+                mhess,
+                boot_w,
+                boot_audit,
+                bootstrap,
+                n,
+                i,
+                0.0,
+                n_classes,
+            )
+
         var made_progress = False
         for k in range(n_classes):
             _fill_softmax_grad_hess(
@@ -654,6 +817,9 @@ def train_multiclass_sparse(
                 float64_derivatives=params.tree.extra.wants_float64_derivatives(),
             )
             apply_goss_scaling(selection, grad, hess)
+            # The round's one draw, applied to this class's derivatives.
+            if len(boot_w) != 0:
+                apply_bootstrap_weights(grad, hess, boot_w, n, 1)
             var grown = grow_tree_sparse(
                 data,
                 grad,
@@ -680,7 +846,11 @@ def train_multiclass_sparse(
         if not made_progress:
             for _ in range(n_classes):
                 _ = trees.pop()
-            if bagging_enabled(bagging) or goss.enabled:
+            if (
+                bagging_enabled(bagging)
+                or goss.enabled
+                or bootstrap.enabled()
+            ):
                 continue
             break
 
