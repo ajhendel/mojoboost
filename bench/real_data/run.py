@@ -595,13 +595,35 @@ def main(argv=None):
         "environment": envinfo.collect(),
         "jobs": jobs,
         "sequential": True,
+        "arm_order": "round-interleaved",
         "note": (
             "Runs are sequential. Timings from a run whose manifest says "
-            "otherwise are timings of a contended machine."
+            "otherwise are timings of a contended machine. `jobs` is the "
+            "matrix in build order; execution is round-interleaved (all arms "
+            "at repeat 0, then all arms at repeat 1, ...), so read the "
+            "executed order off the records' repeat field, not off this list."
         ),
     }
 
     runnable = [job for job in jobs if "skip" not in job]
+    # Interleave the arms. `build_matrix` nests repeat inside engine, so the
+    # natural order runs every repeat of one arm and then every repeat of the
+    # next, which puts the arms in different thermal windows: at this tier the
+    # last arm of a five-arm block starts an hour after the first, and this
+    # machine has been measured drifting two to three times across windows that
+    # size. The arm-blocked order therefore reports drift as if it were a
+    # difference between engines, and it does so silently, because each arm's
+    # own spread stays tight inside its own window.
+    #
+    # A stable sort by repeat turns the matrix into rounds: every arm takes one
+    # measurement, then every arm takes the next. Drift then lands on all arms
+    # at once and shows up as spread across repeats, which is where it can be
+    # read. Arm order inside a round is left fixed, matching the Mojo harness's
+    # `for rep: for arm:` at bench/bench_train_gpu.mojo:1772.
+    #
+    # Ordering only; the set of jobs, their job_index, and their filenames are
+    # exactly what build_matrix assigned.
+    runnable.sort(key=lambda job: job["repeat"])
     skipped = [job for job in jobs if "skip" in job]
     print(f"run {run_id}: {len(runnable)} runs, {len(skipped)} skipped")
     print(comparator_banner())
