@@ -713,8 +713,16 @@ def _engine_params(wl, engine_name, threads):
 #: them is reading a comparison that has been laundered.
 COMPARABILITY = {
     "lightgbm_cpu": [
-        "min_data_in_bin=3 has no mojotrees equivalent, so bin edges can differ",
-        "enable_bundle is forced off because mojotrees has no exclusive feature bundling",
+        # Both of these were true and are not any more. Corrected rather than
+        # deleted, because a comparability note that silently becomes false is
+        # how a caveat outlives the thing it described.
+        "min_data_in_bin=3 IS now the mojotrees default, so this is no longer a"
+        " source of bin-edge divergence",
+        "enable_bundle is forced off, not because mojotrees lacks exclusive"
+        " feature bundling -- it has efb.mojo and the parameter parses -- but"
+        " because the ranking trainer refuses an active bundling switch by"
+        " name, so turning it on for both engines would raise on one scenario"
+        " rather than compare it",
     ],
     "xgboost_cpu": [
         "leaf-wise growth is approximated with grow_policy=lossguide and max_depth=0",
