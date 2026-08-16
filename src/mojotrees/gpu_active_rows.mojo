@@ -236,6 +236,14 @@ from max.gpu.sync import barrier
 from .binning import BinnedMatrix
 from .categorical import CatBitset, cat_empty
 from .gpu_frontier import CommitPlan, LeafFrontier
+from .gpu_binned_layout import BLOCK_ALIGN_BYTES
+from .gpu_blocked_bins import (
+    BLOCKED_STRIDE_NONE,
+    blocked_bytes,
+    blocked_is_identity,
+    check_blocked_group_matches,
+    enqueue_blocked_relayout,
+)
 from .gpu_histogram_specializations import MAX_BINS
 from .gpu_tiling import (
     HIST_FEATURE_GROUP_LADDER,
@@ -1494,6 +1502,7 @@ def _hist_rows_step[
     h_scale: Float32,
     narrow: Bool,
     aligned: Bool,
+    rstride: Int,
 ):
     """Accumulate `U` rows of one thread's stride into the shared planes.
 
@@ -1628,6 +1637,44 @@ def _hist_rows_step[
     2.1 GB, which is past the memory of the device this backend is developed
     on. `2 * n_rows` binds only when `n_features` is 1, and is the reason it
     is checked separately rather than inferred.
+
+    **The layout arm, `rstride`.** How many bytes one row advances inside a
+    bin column: 1 for the feature-major matrix this backend uploads, `G` for
+    the `[block][row][G]` layout of `gpu_blocked_bins.mojo`. One value
+    selects the whole reader, because the two layouts differ in exactly two
+    places and both are captured by it -- the per-slot base, which
+    `_hist_accumulate_rows` computes, and the per-row term, which is
+    `r * rstride` here.
+
+    It is a runtime value rather than a comptime parameter for the reason
+    `narrow` and `aligned` are: this family is forty instantiations, each
+    inlining this body twice, and the arm is one block-uniform test against
+    `U * GROUP * 3` shared atomics. It is also what makes the layout
+    selectable **in one binary**, which is what the interleaved-arms protocol
+    on this machine requires and what a comptime variant could not have
+    given: `GpuActiveRows.set_blocked_layout` moves it between repeats in one
+    process.
+
+    **Why this cannot change a histogram, and it is the strongest of the
+    exactness arguments in this file.** `U` and `GROUP` reorder integer adds
+    and lean on addition being associative and commutative. This arm does not
+    even reorder them. The relayout writes
+    `blocked[offset(f, r)] = bins[f * n_rows + r]` for every cell, so the
+    byte this loop reads at `base + r * rstride` is the same byte it read at
+    `feature * n_rows + row`; the same bin then selects the same shared cell,
+    the same three quantized values are added to it, and the set of
+    `(row, feature)` visits, the tiling, the slot assignment and the flush
+    are all untouched. Nothing about the arithmetic moves, only the address
+    the identical byte is fetched from. `gpu_blocked_bins.blocked_roundtrips`
+    is that statement as an executable check, and
+    `gpu_blocked_bins.check_blocked_matches_plan` proves the address this
+    loop forms is the one the priced `BinLayoutPlan` publishes.
+
+    The blocked arm carries no `narrow` twin. Its base already folds a
+    16-byte-aligned block stride and a lane into one Int, and `narrow` is
+    registered by its own author as an expected null against three shared
+    atomics and a scattered gather. A fourth address arm to measure a null
+    inside an arm is not a trade worth the code.
     """
     # Stage one: the row indices, in the width the permutation holds them.
     # Int32 on both arms: `rows` is an Int32 buffer and `MAX_ROWS` is
@@ -1721,7 +1768,26 @@ def _hist_rows_step[
         if k < owned:
             var base = col[unsafe_offset=k]
             var lift = Int32(k * nb)
-            if narrow:
+            if rstride != BLOCKED_STRIDE_NONE:
+                # The blocked layout. `base` is the feature's block base plus
+                # its lane, computed once per slot in `_hist_accumulate_rows`;
+                # a row advances `rstride` bytes because the block is
+                # row-major. The multiply replaces nothing -- the
+                # feature-major arm's implicit stride is one -- so it is one
+                # extra integer multiply per (row, feature) against the
+                # sectors the arrangement is meant to save. If the layout ever
+                # loses, that multiply is the first thing to suspect and
+                # `rstride` being a power of two is what makes it a shift.
+                comptime for u in range(U):
+                    bv[unsafe_offset=u] = Int32(
+                        Int(
+                            bins[
+                                unsafe_offset = base
+                                + Int(rr[unsafe_offset=u][0]) * rstride
+                            ]
+                        )
+                    )
+            elif narrow:
                 # Exact under the precondition: `base` is
                 # `feature * n_rows`, which the host proved below
                 # `Int32.MAX`, so this truncation loses nothing.
@@ -1783,6 +1849,7 @@ def _hist_accumulate_rows[
     unrolled: Bool,
     narrow: Bool,
     aligned: Bool,
+    rstride: Int,
 ):
     """One thread's whole walk over its share of one tile.
 
@@ -1847,13 +1914,34 @@ def _hist_accumulate_rows[
     # a comptime-unrolled body which computes an address it never uses --
     # which is what `if k < owned` leaves the compiler free to do -- cannot
     # form one out of stack garbage.
+    #
+    # Under the blocked layout the base is the feature's block base plus its
+    # lane, `(f / G) * block_stride + (f mod G)`, which is
+    # `gpu_blocked_bins.blocked_column_base` written out. The block stride is
+    # derived here rather than passed in so the launch keeps one new argument
+    # instead of two; `BLOCK_ALIGN_BYTES` is imported rather than spelled 16,
+    # so the alignment has one definition and it is `BinLayoutPlan`'s.
+    #
+    # The division and the remainder are per owned slot -- at most `GROUP`,
+    # so at most sixteen per threadgroup -- and never per row. That is the
+    # same footing the feature-major multiply is on and is why the blocked
+    # arm adds nothing to the row walk except the `r * rstride` term.
     var col = stack_allocation[GROUP, Int]()
+    var bstride = 0
+    if rstride != BLOCKED_STRIDE_NONE:
+        bstride = (
+            (nr * rstride + BLOCK_ALIGN_BYTES - 1) // BLOCK_ALIGN_BYTES
+        ) * BLOCK_ALIGN_BYTES
     comptime for k in range(GROUP):
         col[unsafe_offset=k] = 0
         if k < owned:
-            col[unsafe_offset=k] = (
-                Int(feat_ids[unsafe_offset = slot0 + k][0]) * nr
-            )
+            var fid_k = Int(feat_ids[unsafe_offset = slot0 + k][0])
+            if rstride != BLOCKED_STRIDE_NONE:
+                col[unsafe_offset=k] = (fid_k // rstride) * bstride + (
+                    fid_k % rstride
+                )
+            else:
+                col[unsafe_offset=k] = fid_k * nr
 
     # The rows in flight and what was gathered for them. Allocated once,
     # outside both loops, so there is one alloca per thread and not one per
@@ -1902,6 +1990,7 @@ def _hist_accumulate_rows[
             h_scale,
             narrow,
             aligned,
+            rstride,
         )
         j += UNROLL * stride
     while j < tile_end:
@@ -1928,6 +2017,7 @@ def _hist_accumulate_rows[
             h_scale,
             narrow,
             aligned,
+            rstride,
         )
         j += stride
 
@@ -1959,6 +2049,7 @@ def _hist_accumulate_dispatch[
     unrolled: Bool,
     narrow: Bool,
     aligned: Bool,
+    rstride: Int,
 ):
     """Resolve the two comptime-worthy runtime flags into one of four arms,
     once, above the row loop.
@@ -1998,6 +2089,7 @@ def _hist_accumulate_dispatch[
                 unrolled,
                 narrow,
                 aligned,
+                rstride,
             )
         else:
             _hist_accumulate_rows[GROUP, UNROLL, True, False](
@@ -2022,6 +2114,7 @@ def _hist_accumulate_dispatch[
                 unrolled,
                 narrow,
                 aligned,
+                rstride,
             )
     elif quant:
         _hist_accumulate_rows[GROUP, UNROLL, False, True](
@@ -2046,6 +2139,7 @@ def _hist_accumulate_dispatch[
             unrolled,
             narrow,
             aligned,
+            rstride,
         )
     else:
         _hist_accumulate_rows[GROUP, UNROLL, False, False](
@@ -2070,6 +2164,7 @@ def _hist_accumulate_dispatch[
             unrolled,
             narrow,
             aligned,
+            rstride,
         )
 
 
@@ -2101,6 +2196,8 @@ def _range_hist_atomic_kernel[
     row_unroll: Int32,
     narrow_index: Int32,
     pair_align: Int32,
+    bins_blocked: MutPointer[UInt8, MutAnyOrigin],
+    bin_row_stride: Int32,
 ):
     """One node's histogram over a compacted row range, accumulated in
     threadgroup memory and folded into the output with global atomics.
@@ -2350,8 +2447,23 @@ def _range_hist_atomic_kernel[
     # hessian is neither read nor accumulated: it is the same Int32 for every
     # row, so the count plane already carries everything the hessian plane
     # would have.
+    # The bin matrix this launch reads, and how many bytes one row advances
+    # inside a column. `bin_row_stride` of one is the feature-major buffer the
+    # backend uploads, which every other reader of `bins` in this package
+    # still indexes; anything else is the `[block][row][G]` relayout of
+    # `gpu_blocked_bins.mojo`, which `GpuActiveRows` owns and built once per
+    # fit. Two pointers rather than one because a launch may not be handed the
+    # same buffer twice, and the unselected one is simply never dereferenced.
+    #
+    # Resolved here, once per threadgroup, so the row loop below sees one
+    # pointer and one stride and never asks which layout it is on.
+    var bsrc = bins
+    var rstride = Int(bin_row_stride)
+    if rstride != BLOCKED_STRIDE_NONE:
+        bsrc = bins_blocked
+
     _hist_accumulate_dispatch[GROUP, HIST_ROW_UNROLL](
-        bins,
+        bsrc,
         rows,
         grad,
         hess,
@@ -2374,6 +2486,7 @@ def _range_hist_atomic_kernel[
         Int(row_unroll) != 0,
         Int(narrow_index) != 0,
         Int(pair_align) != 0,
+        rstride,
     )
     barrier()
 
@@ -2437,6 +2550,8 @@ def _range_hist_partial_kernel[
     row_unroll: Int32,
     narrow_index: Int32,
     pair_align: Int32,
+    bins_blocked: MutPointer[UInt8, MutAnyOrigin],
+    bin_row_stride: Int32,
 ):
     """The tiled twin of `_range_hist_atomic_kernel`: the same threadgroup
     accumulation, written to a per-(tile, slot) partial slot instead of folded
@@ -2539,8 +2654,23 @@ def _range_hist_partial_kernel[
     if tile_end > n:
         tile_end = n
 
+    # The bin matrix this launch reads, and how many bytes one row advances
+    # inside a column. `bin_row_stride` of one is the feature-major buffer the
+    # backend uploads, which every other reader of `bins` in this package
+    # still indexes; anything else is the `[block][row][G]` relayout of
+    # `gpu_blocked_bins.mojo`, which `GpuActiveRows` owns and built once per
+    # fit. Two pointers rather than one because a launch may not be handed the
+    # same buffer twice, and the unselected one is simply never dereferenced.
+    #
+    # Resolved here, once per threadgroup, so the row loop below sees one
+    # pointer and one stride and never asks which layout it is on.
+    var bsrc = bins
+    var rstride = Int(bin_row_stride)
+    if rstride != BLOCKED_STRIDE_NONE:
+        bsrc = bins_blocked
+
     _hist_accumulate_dispatch[GROUP, HIST_ROW_UNROLL](
-        bins,
+        bsrc,
         rows,
         grad,
         hess,
@@ -2563,6 +2693,7 @@ def _range_hist_partial_kernel[
         Int(row_unroll) != 0,
         Int(narrow_index) != 0,
         Int(pair_align) != 0,
+        rstride,
     )
     barrier()
 
@@ -3413,6 +3544,31 @@ struct GpuActiveRows(Movable):
     # label that way. See `gpu_tiling.row_tile_floor`.
     var min_tiles_request: Int
     var rows_per_tile_request: Int
+    # --- blocked bin layout lane ---
+    # The `[block][row][G]` re-layout of the binned matrix
+    # (`gpu_blocked_bins.mojo`), and the `G` it was built at. `blocked_group`
+    # is zero when no layout has been requested, in which case `blocked_dev`
+    # is a one-byte placeholder that exists only so that every histogram
+    # launch has a real pointer to pass.
+    #
+    # It does not replace `bins`. `_flag_scan_kernel` and `_scatter_kernel` in
+    # this file, `gpu_predict`, `gpu_sparse`, `gpu_categorical` and the CPU
+    # builder all still index `bins[f * n_rows + r]`, and a half-converted
+    # matrix -- some kernels reading the blocked copy and some the
+    # feature-major one -- is a much worse state than either layout, because
+    # the two agree until a lane forgets one of them and then a histogram is
+    # wrong on some shapes and not others. So both are resident and the
+    # device pays for both; see `set_blocked_layout` for what that costs.
+    #
+    # `blocked_valid` says whether the buffer holds this fit's matrix. It is
+    # set by `_ensure_blocked` on the first histogram launch after a layout is
+    # requested and never cleared, because the binned matrix is uploaded once
+    # per fit and no path in this backend mutates it: unlike `quant_valid`,
+    # which tracks a per-tree quantity, there is nothing for this one to go
+    # stale against.
+    var blocked_dev: DeviceBuffer[DType.uint8]
+    var blocked_group: Int
+    var blocked_valid: Bool
 
     def __init__(
         out self,
@@ -3554,6 +3710,15 @@ struct GpuActiveRows(Movable):
         self.pair_alignment = True
         self.min_tiles_request = 0
         self.rows_per_tile_request = 0
+        # No bin re-layout until one is asked for. The placeholder is one
+        # byte, not `n_rows * n_features`: a layout that is never requested
+        # must cost nothing, and the reference shape's blocked buffer is 52 MB
+        # of device memory to allocate on the chance somebody wants it.
+        # `set_blocked_layout` is where the real allocation happens, and it is
+        # also where the residency cost is stated to the caller.
+        self.blocked_dev = self.ctx.enqueue_create_buffer[DType.uint8](1)
+        self.blocked_group = 0
+        self.blocked_valid = False
 
         # A bagged tree stages only its bag's slots, and the copy that
         # follows takes the whole buffer, so the tail is zeroed once here
@@ -3778,6 +3943,106 @@ struct GpuActiveRows(Movable):
             raise Error("a row tile is zero (no request) or positive")
         self.min_tiles_request = min_tiles
         self.rows_per_tile_request = rows_per_tile
+
+    def blocked_row_stride(self) -> Int:
+        """`G` when a blocked bin layout is in force and built, else 1.
+
+        The one value that selects the histogram reader's layout, and the
+        only thing about the layout the launch sites read. It stays 1 until
+        `_ensure_blocked` has actually filled the buffer, so a requested but
+        unbuilt layout reads the feature-major matrix rather than an
+        uninitialized one -- which is the failure this returns a number
+        rather than a flag to prevent: an unbuilt blocked buffer would decode
+        to legal bin ids belonging to no row and would be caught by nothing.
+        """
+        if self.blocked_group > 1 and self.blocked_valid:
+            return self.blocked_group
+        return BLOCKED_STRIDE_NONE
+
+    def set_blocked_layout(mut self, group: Int) raises:
+        """Ask the histogram kernels to read a `[block][row][G]` bin matrix.
+
+        `group` of zero turns the layout off and frees the buffer. Otherwise
+        it must equal `feature_group`, and the refusal is the point of the
+        method rather than a guard on it: the whole mechanism is that a
+        threadgroup consumes every one of the `G` adjacent bytes it pulls for
+        a row, and a threadgroup consumes `feature_group` slots. A mismatch
+        produces a **correct** histogram at a different cost, so it is not
+        something a measurement would find; see
+        `gpu_blocked_bins.check_blocked_group_matches` for the two directions
+        it can be wrong in and what each would look like.
+
+        `G = 1` is refused for a different reason: a one-feature block is a
+        feature's column, so the arrangement is the one already on the device
+        and a second copy of it can only cost residency. Since
+        `free_feature_group` returns 1 at `bin_cap = 256`, **the shipping
+        default at every headline shape this project benchmarks cannot use
+        this layout at all** without `set_feature_group(2)` or wider first,
+        which is a residency trade `gpu_tiling.free_feature_group` says in as
+        many words is unmeasured. That is a finding about the layout and not
+        an obstacle to it, and it belongs where a caller reads it.
+
+        **What it costs.** One `n_rows * padded_features` byte allocation, on
+        top of the feature-major matrix, which stays because every other
+        reader of `bins` in this package still indexes it. At 1,000,000 x 50
+        with `G = 4` that is 52 MB on top of 50 MB. The transform itself is
+        one streamed kernel launch per fit, deferred to the first histogram
+        (`_ensure_blocked`) so that requesting a layout and never building a
+        tree costs an allocation and no device work.
+
+        No environment variable, for the reason `partition_block_cap` gives:
+        the arm belongs in the call, because an A/B that reads its arm from
+        the environment has already once in this repository run one arm under
+        the other's label.
+        """
+        if group == 0:
+            self.blocked_dev = self.ctx.enqueue_create_buffer[DType.uint8](1)
+            self.blocked_group = 0
+            self.blocked_valid = False
+            return
+        check_blocked_group_matches(group, self.feature_group)
+        if blocked_is_identity(group):
+            raise Error(
+                "a blocked bin layout at G = 1 is the feature-major layout"
+                " already on the device; widen the feature group first"
+            )
+        if group == self.blocked_group:
+            return
+        var total = blocked_bytes(self.n_rows, self.n_features, group)
+        self.blocked_dev = self.ctx.enqueue_create_buffer[DType.uint8](total)
+        self.blocked_group = group
+        self.blocked_valid = False
+
+    def _ensure_blocked[
+        bins_origin: MutOrigin, //
+    ](mut self, bins: MutPointer[UInt8, bins_origin]) raises:
+        """Build the blocked buffer from the feature-major one, once.
+
+        Deferred to the first histogram launch rather than done in
+        `set_blocked_layout` because that is where the `bins` pointer is: this
+        struct owns the index machinery and the binned matrix arrives as an
+        argument (see the struct docstring). Enqueued, not synchronized, so it
+        is ordered before the histogram that reads it by the queue, exactly as
+        `_ensure_quantized`'s pass is.
+
+        Never rebuilt. The binned matrix is uploaded once per fit and nothing
+        in this backend mutates it, so unlike the quantized gradients there is
+        no per-tree quantity for this to go stale against. A caller that
+        changes the matrix under a live `GpuActiveRows` is already outside
+        what every other buffer here assumes.
+        """
+        if self.blocked_group < 2 or self.blocked_valid:
+            return
+        enqueue_blocked_relayout(
+            self.ctx,
+            bins,
+            self.blocked_dev.unsafe_ptr(),
+            self.n_rows,
+            self.n_features,
+            self.blocked_group,
+            self.block_threads,
+        )
+        self.blocked_valid = True
 
     def set_constant_hessian(mut self, on: Bool):
         """Declare that every row's hessian this round is exactly
@@ -4404,6 +4669,12 @@ struct GpuActiveRows(Movable):
         if self.quantized_gradients:
             self._ensure_quantized(grad, hess, g_scale, h_scale)
             use_quant = Int32(1)
+        # The device-owned growth plane builds every non-root histogram
+        # through this entry point, so the re-layout has to be reachable from
+        # here as well as from the host-driven one; omitting it would leave
+        # the layout arm reaching the root and nothing else, which is the
+        # exact shape the row-tile arms were found in.
+        self._ensure_blocked(bins)
         var const_hess = Int32(1) if self.constant_hessian else Int32(0)
 
         self._enqueue_atomic_family(
@@ -4760,6 +5031,13 @@ struct GpuActiveRows(Movable):
             self._ensure_quantized(grad, hess, g_scale, h_scale)
             use_quant = Int32(1)
 
+        # The bin re-layout, if one was asked for, on the same footing and in
+        # the same place: one enqueued pass ordered before the histogram that
+        # reads it, above the strategy branch because both strategies read the
+        # same buffer. It runs once per fit rather than once per tree, which
+        # is the whole reason it can be afforded at all.
+        self._ensure_blocked(bins)
+
         var const_hess = Int32(1) if self.constant_hessian else Int32(0)
         var hist_planes = 2 if self.constant_hessian else 3
 
@@ -5011,6 +5289,21 @@ struct GpuActiveRows(Movable):
             else Int32(0)
         )
         var palign = Int32(1) if self.pair_alignment else Int32(0)
+        # The bin layout arm. `blocked_row_stride` is 1 unless
+        # `set_blocked_layout` put the `[block][row][G]` buffer on the device
+        # and `_ensure_blocked` filled it, and the second pointer is the
+        # buffer itself. Both are read from the fields here rather than
+        # threaded through the family dispatch above, for the same reason
+        # `unroll`, `narrow` and `palign` are: the arm changes no grid, no
+        # threadgroup footprint, and no histogram.
+        #
+        # The blocked buffer is passed at every launch whether or not it is
+        # selected, because a kernel argument must be a real pointer and must
+        # not be a buffer this launch already passes. It is a one-byte
+        # placeholder until a layout is requested, and the kernel never
+        # dereferences it at stride one.
+        var rstride = Int32(self.blocked_row_stride())
+        var blocked_ptr = self.blocked_dev.unsafe_ptr()
         if self.bin_cap <= 32:
             self.ctx.enqueue_function[_range_hist_partial_kernel[GROUP, 32]](
                 bins,
@@ -5033,6 +5326,8 @@ struct GpuActiveRows(Movable):
                 unroll,
                 narrow,
                 palign,
+                blocked_ptr,
+                rstride,
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
@@ -5058,6 +5353,8 @@ struct GpuActiveRows(Movable):
                 unroll,
                 narrow,
                 palign,
+                blocked_ptr,
+                rstride,
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
@@ -5083,6 +5380,8 @@ struct GpuActiveRows(Movable):
                 unroll,
                 narrow,
                 palign,
+                blocked_ptr,
+                rstride,
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
@@ -5108,6 +5407,8 @@ struct GpuActiveRows(Movable):
                 unroll,
                 narrow,
                 palign,
+                blocked_ptr,
+                rstride,
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
@@ -5300,6 +5601,21 @@ struct GpuActiveRows(Movable):
             else Int32(0)
         )
         var palign = Int32(1) if self.pair_alignment else Int32(0)
+        # The bin layout arm. `blocked_row_stride` is 1 unless
+        # `set_blocked_layout` put the `[block][row][G]` buffer on the device
+        # and `_ensure_blocked` filled it, and the second pointer is the
+        # buffer itself. Both are read from the fields here rather than
+        # threaded through the family dispatch above, for the same reason
+        # `unroll`, `narrow` and `palign` are: the arm changes no grid, no
+        # threadgroup footprint, and no histogram.
+        #
+        # The blocked buffer is passed at every launch whether or not it is
+        # selected, because a kernel argument must be a real pointer and must
+        # not be a buffer this launch already passes. It is a one-byte
+        # placeholder until a layout is requested, and the kernel never
+        # dereferences it at stride one.
+        var rstride = Int32(self.blocked_row_stride())
+        var blocked_ptr = self.blocked_dev.unsafe_ptr()
         if self.bin_cap <= 32:
             self.ctx.enqueue_function[_range_hist_atomic_kernel[GROUP, 32]](
                 bins,
@@ -5327,6 +5643,8 @@ struct GpuActiveRows(Movable):
                 unroll,
                 narrow,
                 palign,
+                blocked_ptr,
+                rstride,
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
@@ -5357,6 +5675,8 @@ struct GpuActiveRows(Movable):
                 unroll,
                 narrow,
                 palign,
+                blocked_ptr,
+                rstride,
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
@@ -5387,6 +5707,8 @@ struct GpuActiveRows(Movable):
                 unroll,
                 narrow,
                 palign,
+                blocked_ptr,
+                rstride,
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
@@ -5417,6 +5739,8 @@ struct GpuActiveRows(Movable):
                 unroll,
                 narrow,
                 palign,
+                blocked_ptr,
+                rstride,
                 grid_dim=(blocks, n_tiles),
                 block_dim=threads,
             )
