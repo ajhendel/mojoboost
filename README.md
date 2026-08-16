@@ -49,7 +49,7 @@ The first public alpha is on PyPI:
 pip install --pre mojotrees
 ```
 
-The current `0.1.0a2` wheel supports **CPython 3.14 on Apple Silicon running
+The current `0.1.0a3` wheel supports **CPython 3.14 on Apple Silicon running
 macOS 26 or newer**. It is self-contained: using the wheel does not require
 Mojo, MAX, Pixi, or a compiler. Other interpreter and platform combinations
 will correctly receive `No matching distribution found` until matching
@@ -57,7 +57,7 @@ wheels have been built and validated.
 
 | State | What you type | Status today |
 |---|---|---|
-| Published alpha | `pip install --pre mojotrees` | **Available:** `0.1.0a2`, CPython 3.14, Apple Silicon, macOS 26+ |
+| Published alpha | `pip install --pre mojotrees` | **Available:** `0.1.0a3`, CPython 3.14, Apple Silicon, macOS 26+ |
 | Release wheel file | `pip install ./mojotrees-<version>-<tags>.whl` | **Available** from the release workflow |
 | Source checkout with Pixi | the four commands below | **Available** for contributors and development |
 
@@ -177,16 +177,26 @@ indistinguishable rather than a win. Because the tree lives on the GPU,
 training leaves the other CPU cores free; LightGBM and CatBoost use all of
 them.
 
-The GPU-resident path is the GPU path at every size measured. From 100k to
-700k rows it is **1.29x to 1.85x** over the older host-scan loop, which is
-being removed; the margin is widest at the smallest shape, which is the
-opposite of what the profitability gate that used to guard it assumed.
+The GPU-resident path is now the only GPU path. There is no host-scan
+alternative and no switch that chooses between them: the older loop and the
+profitability gate that guarded it were **deleted** (`b8d3b74`, `56dff16`)
+after a sweep found the device plane faster at every shape measured, from 100k
+to 700k rows, by **1.29x to 1.85x**, with the margin **widest at the smallest
+shape**. That is the opposite of what the gate assumed, so the gate was removed
+rather than re-tuned. Those figures are the justification for the deletion,
+not a current comparison: the arm they were measured against no longer exists.
 
 The CPU backend uses all cores and is the path for machines without an
-accelerator, for configurations the device refuses (categorical set-splits,
-sparse input, a few extra tree parameters, routed automatically under
-`device='auto'`), and for small data. At the shape above it currently trains
-about **2x slower than LightGBM**, and that gap is being worked.
+accelerator, for configurations the device refuses (sparse input, a custom
+objective, a ranking objective, an eval set, and a few extra tree parameters,
+routed automatically under `device='auto'`), and for small data. At the shape
+above it currently trains about **2x slower than LightGBM**, and that gap is
+being worked.
+
+**Categorical features are not on that list.** The GPU grower routes them
+(`split.is_categorical` in `train_gpu.mojo`), and `device_policy` reports the
+declaration rather than blocking on it. An earlier draft of this section said
+otherwise and was wrong.
 
 On the real **YearPredictionMSD** set (463,715 x 90) **we lose: LightGBM is
 1.30x faster than our best backend, resolved, with ranges disjoint.** Accuracy
@@ -748,10 +758,12 @@ links (delocate-style, with an `@loader_path` rpath), so installing it
 requires no Mojo or MAX toolchain.
 
 That wheel carries whatever platform tag your build machine produced, and it
-is for you rather than for redistribution. No wheel has been published
-anywhere, on any index or any release page. What a published one would be
-called, which platforms are targeted, and what evidence stands behind each
-row is in [docs/PLATFORM_MATRIX.md](docs/PLATFORM_MATRIX.md); what installing
+is for you rather than for redistribution, and it is not the published wheel:
+`0.1.0a3` is on PyPI, which the installation section above covers. This
+paragraph used to say no wheel had been published anywhere, which contradicted
+the top of this same file for as long as both sentences existed. What the
+published one is called, which platforms are targeted, and what evidence stands
+behind each row is in [docs/PLATFORM_MATRIX.md](docs/PLATFORM_MATRIX.md); what installing
 one will look like is in [docs/INSTALLATION.md](docs/INSTALLATION.md).
 
 ## Device selection
