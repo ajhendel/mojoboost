@@ -1068,20 +1068,36 @@ MOJOTREES_CATBOOST_MODE = {
     "lambda_l1": 0.0,
     "lambda_l2": 3.0,
     "score_function": "cosine",
-    # No `random_strength` row, and this one is a reachability fact, not a
-    # routing one. The noise itself exists -- `split.find_best_split` adds
-    # it and `GpuSplitSearcher` stages it -- but its **per-tree scale** is
-    # computed only by the dense `fit` entry point. This harness trains
-    # through `train(params, Dataset)`, and `_parse_params` in
-    # bindings/_mojotrees.mojo passes `random_strength_ok` True at exactly
-    # one call site (`fit`, and only on the CPU); every other entry point
-    # inherits the False default and refuses by name. So a Dataset fit
-    # raises rather than growing trees with unscaled noise, which is the
-    # refusal working.
+    # CatBoost's default, and it reaches the trainer this harness uses as of
+    # 2026-08-16. It was removed earlier the same day because the smoke pass
+    # raised on it: the noise and its per-tree scale were both implemented,
+    # but `_parse_params` in bindings/_mojotrees.mojo declared the scale
+    # honored at exactly ONE call site (`fit`, CPU only) and this harness
+    # trains through `mojotrees.train(params, Dataset)` -> `train_dataset`,
+    # which inherited the False default and refused by name.
     #
-    # Found by the smoke pass on 2026-08-16, as the second of two failures
-    # in this arm. Restoring the key needs the scale computed for the
-    # Dataset path, not a change here.
+    # The refusal was right and the declaration was too narrow. Two round
+    # loops in the whole package compute the scale, both through
+    # `boosting._round_random_score_scale`: `_boost_rounds` and
+    # `train_with_valid`'s own loop. `trainset.train_dataset`'s DENSE CPU arm
+    # reaches the first of them, so that arm now declares it -- as the
+    # conjunction `device == CPU and not is_sparse`, because a sparse dataset
+    # resolves its device to the CPU too and routes to `boosting_sparse`,
+    # which computes no scale. `booster_update` declares it as well. Every
+    # other entry point still refuses by name.
+    #
+    # It is honored on the three scenarios this arm actually runs and on no
+    # others, which is what makes restoring it safe rather than hopeful:
+    # MOJOTREES_CATBOOST_MODE_SCENARIO_SUPPORT already skips multiclass,
+    # sparse, ranking and both categorical scenarios, so no cell reaches a
+    # loop without a scale. The categorical skips matter twice over here --
+    # `split.find_best_split` refuses `random_strength` beside a categorical
+    # feature outright, because a category set is scored inside
+    # `find_best_categorical_split` and only its winner reaches the numerical
+    # scan, so one candidate per categorical feature would be noised while
+    # every numerical feature had every candidate noised. Turning either
+    # categorical scenario back on for this arm needs that resolved first.
+    "random_strength": 1.0,
     "leaf_estimation_iterations": 1,
     # No `max_bin` row, and the reason is a routing fact rather than a
     # parity one. `dataset_params` exists because `max_bin` belongs to the
@@ -2769,7 +2785,24 @@ MOJOTREES_CATBOOST_MODE_SCENARIO_SUPPORT = {
         "CatBoost does not hit this because a CTR turns the categorical "
         "into a numeric column before its split search ever sees it, which "
         "is the gap CATBOOST_UNMATCHABLE['ctr'] names: this is that gap "
-        "surfacing as a scheduling decision rather than as a quality one"
+        "surfacing as a scheduling decision rather than as a quality one. "
+        "STILL SKIPPED after the 2026-08-16 attempt to close it by building "
+        "CatBoost's CTR REPLACEMENT (catalog A36), which stopped on four "
+        "traced blockers and not on effort: (1) a CTR bundle is a property "
+        "of Dataset CONSTRUCTION, and this harness hands every mojotrees arm "
+        "the same dataset_params(spec), which takes no engine, so the "
+        "CatBoost-mode arm cannot ask for CTRs while the plain arm does not; "
+        "(2) python/mojotrees/basic.py's Dataset has no ctr argument and "
+        "bindings/_mojotrees.mojo parses no ctr key, so the bundle is "
+        "unreachable from Python at all; (3) replacement means the raw "
+        "column stops being a split feature, and BinnedMatrix.usable -- the "
+        "field built for exactly that -- is read by no grower "
+        "(tree.grow_tree calls sampling.select_tree_features(data.n_features, "
+        "...) and never passes the pool), so there is no mechanism that "
+        "removes a column from the search; (4) a second refusal sits behind "
+        "the first, since this arm also carries random_strength and "
+        "split.find_best_split refuses that beside any categorical feature. "
+        "Re-enabling this cell needs all four closed, not the first one"
     ),
     # Both of these are already skipped for the CatBoost arm itself by
     # CATBOOST_SCENARIO_SUPPORT, so the loop below never consults these two

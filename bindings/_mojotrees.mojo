@@ -704,15 +704,23 @@ def _parse_params(
     both alone (the sparse fits and continued training) is CPU-only by
     construction.
 
-    **`ordered_ok`, `leaf_estimation_ok` and `score_function_ok` are the same
-    declaration for three CatBoost mechanisms, and they default to `False` on
-    purpose.** The
+    **`ordered_ok`, `leaf_estimation_ok`, `score_function_ok` and
+    `random_strength_ok` are the same declaration for four CatBoost
+    mechanisms, and they default to `False` on purpose.** The
     default of a reachability flag is the direction a forgotten call site
     fails in, and this repository has now shipped five mechanisms that were
     built and never reached because the default was "accept". A new entry
     point added below inherits the refusal and says so by name; it does not
     inherit a silent drop. `entry` is the name those refusals use, and falls
     back to `unbundled` when an entry point already declared one there.
+
+    **A flag set at the one call site somebody looked at is the same defect
+    wearing a different name**, and `random_strength_ok` has already been
+    that once: it was True at `fit` alone while `bench/real_data` trains
+    through `train_dataset`, so the benchmark arm lost the parameter. The
+    rule for every flag here is that the verdict is a property of the
+    ROUTING, not of the entry point's name, and an entry point whose routing
+    forks (`fit` forks three ways on the CPU) needs the fork settled too.
 
     - `ordered_ok`: CatBoost's `boosting_type=Ordered`
       (src/mojotrees/ordered_boosting.mojo). Only `boosting.train` runs the
@@ -740,6 +748,20 @@ def _parse_params(
       `distributed_strategies` calls `split.find_best_split` itself, at its
       `SCORE_L2` default, so a Cosine fit there would be an L2 tree under a
       Cosine label.
+    - `random_strength_ok`: CatBoost's `random_strength`
+      (src/mojotrees/tree_parameters_extra.mojo). The per-split draw is
+      implemented on both backends; what is scarce is the **per-tree scale**,
+      `random_score_scale_from_gradients`, and exactly two round loops in the
+      whole package compute it: `boosting._boost_rounds` (boosting.mojo:2593)
+      and `boosting.train_with_valid`'s own loop (boosting.mojo:3196), both
+      through `boosting._round_random_score_scale`. Every entry point that
+      may pass True has to reach one of those two. That is `model.fit` on the
+      CPU with plain gbdt and no `linear_tree` (the dart/rf and linear forks
+      are refused below by name), `trainset.train_dataset` on its dense CPU
+      arm, and `trainset.update_dataset`, which is CPU-and-dense by
+      construction and routes to `boosting.train_more`. Multiclass, sparse,
+      ranking, custom-objective, custom-metric, distributed and every device
+      loop compute no scale and keep the refusal.
     """
     var who = entry.copy()
     if who.byte_length() == 0:
@@ -1121,9 +1143,15 @@ def fit(
         ordered_ok=device == CPU_DEVICE,
         # Same condition and the same reason: `model.fit` routes a CPU
         # run to `boosting.train`, whose round loop is the one that
-        # computes `random_score_scale` per tree. Every other entry
-        # point in this file leaves the flag False and refuses a
-        # positive strength by name rather than dropping it.
+        # computes `random_score_scale` per tree.
+        #
+        # It is the condition for the PLAIN CPU fork only, and the other two
+        # CPU forks are refused a few statements below rather than here,
+        # because they are selected by `boosting` and `bp.linear`, which are
+        # not known until this call has returned. That is the same shape
+        # `ordered_ok` already takes: a flag wide enough for the entry point
+        # and two named refusals for the branches that leave the honoring
+        # trainer.
         random_strength_ok=device == CPU_DEVICE,
         leaf_estimation_ok=True,
         score_function_ok=True,
@@ -1155,6 +1183,34 @@ def fit(
             "boosting_type='ordered' cannot be combined with linear_tree:"
             " linear leaves are fitted by the metric-path trainer, which"
             " does not grow the fold ladder"
+        )
+    # `random_strength`'s two CPU forks, exactly beside `ordered`'s and for
+    # the same reason. `random_strength_ok` above is True for every CPU fit,
+    # because the plain fork reaches `boosting.train` and that is the common
+    # case; these two branches leave it. Neither would train an unnoised
+    # model in silence -- `split.find_best_split` refuses a positive strength
+    # beside a zero scale -- but the message it raises tells a Mojo-API
+    # caller to compute the scale themselves, which is not an answer a Python
+    # caller can act on. Naming the combination here is.
+    if bp.tree.extra.random_strength > 0.0 and (
+        boosting.mode == BOOSTING_DART or boosting.mode == BOOSTING_RF
+    ):
+        raise Error(
+            "random_strength cannot be combined with boosting='dart' or"
+            " boosting='rf': those run alternate_boosting's own round loops,"
+            " which never call boosting._round_random_score_scale, so the"
+            " per-tree scale CatBoost's noise is drawn at would be zero."
+            " Only the plain gbdt fork of this entry point reaches"
+            " boosting.train, which computes it. Set random_strength=0, or"
+            " train boosting='gbdt'"
+        )
+    if bp.tree.extra.random_strength > 0.0 and bp.linear.is_active():
+        raise Error(
+            "random_strength cannot be combined with linear_tree: linear"
+            " leaves are fitted by custom_metric.fit_with_metrics, whose"
+            " round loop never calls boosting._round_random_score_scale, so"
+            " the per-tree scale CatBoost's noise is drawn at would be zero."
+            " Set random_strength=0, or drop linear_tree"
         )
     if boosting.mode == BOOSTING_DART or boosting.mode == BOOSTING_RF:
         # dart and rf run through alternate_boosting's dispatcher, which
@@ -3514,6 +3570,19 @@ def train_dataset(
     var d = dataset.downcast_value_ptr[Dataset]()
     # Read the device first, for the reason `fit` does.
     var device = _parse_device(params)
+    # CatBoost's `random_strength`, and this is the entry point the benchmark
+    # arm actually trains through: `mojotrees.train(params, Dataset)` never
+    # touches `model.fit`. `trainset.train_dataset` forks three ways and only
+    # one of them computes the per-tree noise scale --
+    #
+    #   sparse            -> boosting_sparse.train_sparse, no scale
+    #   dense + GPU       -> train_gpu.train_gpu, no scale
+    #   dense + CPU       -> boosting.train -> _boost_rounds, WHICH COMPUTES IT
+    #
+    # so the declaration is the conjunction rather than the device test alone.
+    # A sparse dataset resolves its device to the CPU like any other, so
+    # testing the device by itself would have declared the sparse arm honored.
+    var scale_is_computed = device == CPU_DEVICE and not d[].is_sparse
     var model = mojo_train_dataset(
         d[],
         Int(py=params["objective"]),
@@ -3523,6 +3592,7 @@ def train_dataset(
             cpu=device == CPU_DEVICE,
             entry=String("a Dataset fit"),
             score_function_ok=True,
+            random_strength_ok=scale_is_computed,
         ),
         Float64(py=params["alpha"]),
         device,
@@ -3612,6 +3682,18 @@ def booster_update(
             d[].num_feature(),
             entry=String("a Dataset fit"),
             score_function_ok=True,
+            # `trainset.update_dataset` has no fork to settle: it refuses a
+            # sparse dataset by name ("continued training has no sparse
+            # path"), takes no device argument at all, and calls
+            # `boosting.train_more`, which is `_boost_rounds` with a
+            # `round_offset`. So the scale IS computed, once per tree, at the
+            # absolute round index -- which is the reason `_boost_rounds`
+            # takes the offset: a continued run computes the model length an
+            # uninterrupted run would have had. Unconditional True rather
+            # than a sparse test, so a sparse continued fit gets
+            # `update_dataset`'s own message about continued training instead
+            # of a message about random_strength, which is not its problem.
+            random_strength_ok=True,
         ),
         Float64(py=params["alpha"]),
         _parse_bagging(params),
