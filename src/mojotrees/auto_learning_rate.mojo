@@ -90,6 +90,37 @@ The table has no `MultiClass` row with `boost_from_average = true`, and no
 row at all for any loss outside `{Logloss, MultiLogloss, MultiCrossEntropy,
 MultiClass, RMSE}`. Both cases leave the rate alone.
 
+Why a CatBoost-mode default does not close the gate
+---------------------------------------------------
+
+CatBoost supplies `l2_leaf_reg = 3` and a per-objective
+`leaf_estimation_iterations` to every run, and its own gate stays open under
+both. That is not an exemption written into `UpdateLearningRate`; it falls out
+of how the values are supplied. `TOption::SetDefault` (`option.h:27-33`)
+assigns `DefaultValue`, mirrors it into `Value` only when the option is not
+already user-set, and **never touches `IsSetFlag`**, while `Set`
+(`option.h:39-43`) and `operator=` (`option.h:118-121`) both raise it. The
+per-loss resolution at `catboost_options.cpp:302`, `:305` and `:319` uses
+`SetDefault` for exactly `L2Reg`, `LeavesEstimationMethod` and
+`LeavesEstimationIterations`, so all three stay `NotSet()` and the gate stays
+open. A user's `l2_leaf_reg=3` goes through `operator=`, raises the flag, and
+closes it -- at the same numeric value.
+
+`AutoLearningRateParams` reproduces that split by carrying provenance rather
+than values: `l2_leaf_reg_set` and friends mean "a caller named this", never
+"this differs from the default". A mode-defaults layer therefore supplies
+CatBoost's own numbers with those flags left false, and `closed_by` names the
+key when a caller really did type one.
+
+**The fallback when the gate is closed is 0.03**, verified rather than
+assumed: `LearningRate("learning_rate", 0.03)` at `boosting_options.cpp:10` is
+the only initializer, no other code path calls `LearningRate.SetDefault`, and
+it is not conditional on task type, objective or iteration count. The single
+clamp is the `Min(..., 0.5)` inside the derivation itself
+(`options_helper.cpp:261`); the non-zero check at `boosting_options.cpp:78-84`
+is itself gated on `IsSet()` and runs before the derivation, so it never sees
+a derived value.
+
 Determinism
 -----------
 
@@ -140,6 +171,60 @@ comptime CATBOOST_DEFAULT_ITERATIONS = 1000
 # `Min(..., 0.5)` and `Round(..., /*precision=*/6)`, `options_helper.cpp:261`.
 comptime AUTO_LR_CAP = 0.5
 comptime AUTO_LR_ROUND_PRECISION = 6
+
+
+# CatBoost's four gate keys, numbered in the order `UpdateLearningRate` tests
+# them (`options_helper.cpp:277-280`). A code rather than a bare Bool because
+# the whole point of this vocabulary is that a caller which stops deriving has
+# to say WHICH key stopped it; "the gate was closed" is the silence this
+# replaces.
+comptime AUTO_LR_GATE_OPEN = 0
+comptime AUTO_LR_GATE_LEARNING_RATE = 1
+comptime AUTO_LR_GATE_LEAF_ESTIMATION_METHOD = 2
+comptime AUTO_LR_GATE_LEAF_ESTIMATION_ITERATIONS = 3
+comptime AUTO_LR_GATE_L2_LEAF_REG = 4
+
+# The note a resolved-parameter record carries when the derivation was asked
+# for and did not happen. `<prefix><key>`, so a reader greps one string and
+# gets the reason and the key in one token.
+comptime AUTO_LR_SKIPPED_PREFIX = "auto_lr_skipped:"
+
+# The note when the gate is open. It is NOT a promise that a rate was derived:
+# `NeedToUpdate` (`options_helper.cpp:246-249`) may still find no coefficient
+# row, and CatBoost keeps its constant in silence when it does. The two are
+# distinguishable because only this side of the wire knows the gate and only
+# the resolver knows the table, so the record says which question it answered.
+comptime AUTO_LR_GATE_OPEN_NOTE = "auto_lr_gate_open"
+
+
+def auto_lr_gate_key_name(code: Int) -> String:
+    """CatBoost's own JSON spelling of a gate key.
+
+    The names are `boosting_options.cpp:10` (`learning_rate`) and
+    `oblivious_tree_options.cpp:13-15` (the other three), which are the names a
+    user typed if they closed the gate, so they are the names the record uses.
+    """
+    if code == AUTO_LR_GATE_LEARNING_RATE:
+        return String("learning_rate")
+    if code == AUTO_LR_GATE_LEAF_ESTIMATION_METHOD:
+        return String("leaf_estimation_method")
+    if code == AUTO_LR_GATE_LEAF_ESTIMATION_ITERATIONS:
+        return String("leaf_estimation_iterations")
+    if code == AUTO_LR_GATE_L2_LEAF_REG:
+        return String("l2_leaf_reg")
+    return String("")
+
+
+def auto_lr_skipped_note(code: Int) -> String:
+    """The resolved-record note for a gate code.
+
+    `auto_lr_skipped:l2_leaf_reg` when a key closed the gate,
+    `auto_lr_gate_open` when none did. There is no third answer and no empty
+    one: a record that says nothing is the defect this exists to end.
+    """
+    if code == AUTO_LR_GATE_OPEN:
+        return String(AUTO_LR_GATE_OPEN_NOTE)
+    return String(AUTO_LR_SKIPPED_PREFIX, auto_lr_gate_key_name(code))
 
 
 @fieldwise_init
@@ -538,6 +623,28 @@ struct AutoLearningRateParams(Copyable, Movable):
             return self.boost_from_average
         return catboost_boost_from_average_default(objective)
 
+    def closed_by(self) -> Int:
+        """Which gate key stops the derivation, or `AUTO_LR_GATE_OPEN`.
+
+        The three `*_set` flags in the order `UpdateLearningRate` tests them
+        (`options_helper.cpp:278-280`), so a caller that closed two keys is
+        told the same one CatBoost's short-circuit would have stopped at.
+        `learning_rate` itself is not tested here: on every surface in this
+        package a named rate means the derivation was never requested, and
+        `AUTO_LR_GATE_LEARNING_RATE` is the code that side reports.
+
+        Answers `AUTO_LR_GATE_OPEN` on a disabled bundle. Disabled is not
+        "closed by a key" -- nothing asked -- and a record that named a key
+        there would be naming one the caller never typed.
+        """
+        if self.leaf_estimation_method_set:
+            return AUTO_LR_GATE_LEAF_ESTIMATION_METHOD
+        if self.leaf_estimation_iterations_set:
+            return AUTO_LR_GATE_LEAF_ESTIMATION_ITERATIONS
+        if self.l2_leaf_reg_set:
+            return AUTO_LR_GATE_L2_LEAF_REG
+        return AUTO_LR_GATE_OPEN
+
     def fires(self, objective: Int) -> Bool:
         """Whether the derivation would replace the rate for this objective.
 
@@ -548,11 +655,7 @@ struct AutoLearningRateParams(Copyable, Movable):
         """
         if not self.enabled:
             return False
-        if self.leaf_estimation_method_set:
-            return False
-        if self.leaf_estimation_iterations_set:
-            return False
-        if self.l2_leaf_reg_set:
+        if self.closed_by() != AUTO_LR_GATE_OPEN:
             return False
         var lookup = auto_lr_coefficients(
             auto_lr_target_type(objective),

@@ -568,6 +568,7 @@ configuration `sampling.check_mvs_reg` argues is the only sensible one.
 | A36 | **CTR REPLACEMENT of a raw categorical column, and `random_strength` at the trainer the benchmark uses.** Two reachability edges, not two new mechanisms: A19/A30 own the CTR arithmetic and A3 owns the noise. CatBoost's own fork is `one_hot_max_size` (A16): a column at or under the cutoff becomes one-hot and every wider column is REPLACED by its CTR columns, so its split search never meets a category. **CatBoost's behavior here is RELAYED from the A16, A19 and A30 notes, not independently re-verified: there is no CatBoost checkout in this worktree** | Replacement is what the word says. A CTR that is *added* beside the raw column leaves the categorical in the matrix, so `tree._check_oblivious` still refuses the level and nothing has been built. The noise edge is narrower: the per-split draw exists on both backends, and what is scarce is the per-tree scale, which exactly two round loops compute | Yes for the CTR half (new columns, and one column removed). No for the noise half beyond what A3 already moves | The noise half YES and **BUILT**. The CTR half **BUILT 2026-08-16** by `lane/ctr-replacement`; of the four traced blockers, 3 and 4 are gone and 1 and 2 (harness, Python surface) stand. See A36 note sections 5 and 6 -- and note that the noise half turned out to be already correct except for one hash component | `bindings/_mojotrees.mojo` (both), `bench/real_data/scenarios.py`; the CTR half landed in `binning.mojo`, `trainset.mojo`, `categorical.mojo`, `tree.mojo`, `split.mojo` | A36 note. (3) when set. `random_strength` is deterministic across `MOJOTREES_NUM_WORKERS` and across machines, established by reading the code and written out in the note |
 | A37 | **The RESOLVED parameter list as the source of truth for the comparison arm**, and the removal of the CatBoost learning-rate pin. `CatBoost.get_all_params()` on the fitted model, which is CatBoost's own answer rather than a transcription of its documentation. **Nothing about CatBoost was verified from source in this lane and nothing was run: no CatBoost checkout, no fit, no `selfcheck`.** Every CatBoost claim is RELAYED from `CATBOOST_DEFAULTS_SOURCE`, the A16/A19/A30/A31 notes, and the measured learning-rate figures already recorded at `scenarios.py:355-362` | Not a CatBoost mechanism. It is the difference between what a library RESOLVES and what a harness BELIEVES it resolves. `MOJOTREES_CATBOOST_MODE` was a hand-written dict of somebody's belief about CatBoost's defaults, and `selfcheck.check_catboost_arm` checked it against a dict built from itself, so no wrong value in it could ever fail a gate | Yes, and by a lot on one key. The CatBoost arm no longer passes `learning_rate`, so CatBoost resolves its own -- about 0.4273 at 100 iterations on a 20,000 by 20 shape against the 0.1 it used to be pinned to | The arm identity moves from `cb-default@v1` to `cb-shipped@v1` and every published CatBoost number is SUPERSEDED. The `mojotrees_catboost_mode` arm is PARKED pending the read-back wiring, which is four call-site edits in three files this lane did not own | `bench/real_data/scenarios.py`, `bench/real_data/selfcheck.py`; the wiring is in `WIRE_NOTE_resolved_param_parity.md` for `engines.py`, `worker.py` and `run.py` | A37 note. (2) bit-moving on the CatBoost arm, deliberately. Gate: `selfcheck.check_catboost_arm`'s new key-by-key diff, which has never been watched fail and whose failing edit is written out in the note |
 | A38 | **The automatic `learning_rate` made reachable from Python, and turned ON by default in CatBoost mode** (`catboost/libs/train_lib/options_helper.cpp:276-281`, `UpdateLearningRate`; `catboost/private/libs/options/option.h:80-85`, `TOption::NotSet()`) -- **verified from source**, see the A38 note | Not a new mechanism. A11/A12 built the formula and verified it; this is the reachability edge and the default. The derivation was honored from the CLI and the C ABI and from nowhere else, so no benchmark and no pip user could reach it; and it was opt-in everywhere, so CatBoost mode did not behave as CatBoost | Yes when it fires, and it fires by default under `grow_policy=oblivious`: every leaf value moves with the rate | Yes. It is the first item landed under the standing rule -- `grow_policy=oblivious` mirrors CatBoost exactly, `lossguide` mirrors LightGBM, anything of ours is opt-in | `bindings/_mojotrees.mojo`, `python/mojotrees/sklearn.py`, `src/mojotrees/params.mojo` | A38 note. (3) when on, and ON is now a default in CatBoost mode. Gate: the harness compares our fitted model's read-back rate against CatBoost's `engine_resolved_params` at record time |
+| A39 | **The MODE-DEFAULTS LAYER: CatBoost's own defaults supplied with `SetDefault` semantics, so supplying them does not close the gates they are keys of** (`catboost/private/libs/options/option.h:27-33` `SetDefault`, `:39-43` `Set`, `:118-121` `operator=`, `:80-86` `IsSet`/`NotSet`; `catboost_options.cpp:302,305,319` supplying `L2Reg`, `LeavesEstimationMethod`, `LeavesEstimationIterations` through `SetDefault`; `boosting_options.cpp:10` the 0.03 fallback) -- **verified from source**, see the A39 note | Not a new mechanism and not a config change. It is the distinction between a default the LIBRARY supplied and a value the USER passed, which CatBoost keeps as a flag and which this package had no way to express. Without it, CatBoost mode supplying `l2_leaf_reg=3` -- CatBoost's own number -- closed A38's derivation gate, so the mode advertised an automatic learning rate and shipped the constant, silently | Yes. Under `grow_policy=symmetrictree` the mode now supplies `learning_rate` 0.03 (as the base the derivation replaces), `l2_leaf_reg` 3.0, `random_strength` 1.0, `depth` 6 and a per-objective `leaf_estimation_iterations`, none of which it supplied before. Nothing moves under `lossguide` or `depthwise` | Yes, and it is the gate on the whole CatBoost-mode default set: **before this, `MojoTreesRegressor(grow_policy='symmetrictree')` with nothing else set could not fit at all**, because a symmetric tree needs a depth bound and our stock `max_depth` is -1 | `python/mojotrees/sklearn.py`, `src/mojotrees/params.mojo`, `src/mojotrees/tree_parameters_extra.mojo`, `src/mojotrees/auto_learning_rate.mojo`, `bindings/_mojotrees.mojo` | A39 note. (3) in CatBoost mode, (1) inert under every other grow policy. **No silent stop-deriving**: `auto_lr_note` / `auto_learning_rate_note_` records `auto_lr_gate_open` or `auto_lr_skipped:<key>` naming the key, on both surfaces. Digests bit-identical at `MOJOTREES_NUM_WORKERS` 1 and 8 |
 
 ### A4 note: Bayesian bootstrap, verified from source
 
@@ -6279,3 +6280,121 @@ than failed, so nothing is gated on them today.
 5,000-row shapes and CatBoost's rate moves with the shape, so the standard-tier
 rates are still unknown. The accuracy column is one repeat at a smoke size and
 is not a quality claim about anything.
+
+### A39 note: the mode-defaults layer, verified from source
+
+Status: **verified from CatBoost source**, `master`, 2026-08-16, from the clone
+under `scratchpad/cb`. Nothing here is relayed.
+
+#### 1. The problem, stated exactly
+
+CatBoost derives its automatic learning rate only when the user has named none
+of four parameters. CatBoost mode wants to supply two of those four --
+`l2_leaf_reg` and a per-objective `leaf_estimation_iterations` -- because they
+are CatBoost's own defaults. If supplying them counts as naming them, the gate
+closes and the rate is never derived, so the mode advertises an automatic rate
+and quietly ships a constant.
+
+CatBoost does not have this problem because it distinguishes a default it
+supplied from a value the user passed.
+
+#### 2. The three citations
+
+**The gate.** `catboost/libs/train_lib/options_helper.cpp`, `UpdateLearningRate`,
+lines 276-281:
+
+```cpp
+    if (learningRate.NotSet() &&
+        catBoostOptions->ObliviousTreeOptions->LeavesEstimationMethod.NotSet() &&
+        catBoostOptions->ObliviousTreeOptions->LeavesEstimationIterations.NotSet() &&
+        catBoostOptions->ObliviousTreeOptions->L2Reg.NotSet())
+```
+
+Four keys, exactly as briefed, tested in that order with `&&` short-circuit.
+`NotSet()` is `!IsSetFlag` (`option.h:80-86`) -- provenance, never a comparison
+against a default.
+
+**`SetDefault`'s semantics.** `catboost/private/libs/options/option.h:27-33`:
+
+```cpp
+    void SetDefault(const T& value) {
+        DefaultValue = value;
+        if (!IsSetFlag) {
+            Value = value;
+        }
+    }
+```
+
+It assigns and it does **not** raise `IsSetFlag`. `Set` (`:39-43`) and
+`operator=` (`:118-121`) both do. And CatBoost's own per-loss resolution uses
+`SetDefault` for exactly the gate keys it supplies -- `catboost_options.cpp:302`
+(`L2Reg`), `:305` (`LeavesEstimationMethod`), `:319`
+(`LeavesEstimationIterations`) -- which is why CatBoost's own `l2_leaf_reg = 3`
+leaves the gate open while a user's `l2_leaf_reg=3` closes it, at the same
+number.
+
+**The fallback constant.** `catboost/private/libs/options/boosting_options.cpp:10`:
+
+```cpp
+    , LearningRate("learning_rate", 0.03)
+```
+
+**0.03 is correct and it is not conditional.** It is the only initializer for
+the option; no other code path calls `LearningRate.SetDefault`; it does not
+branch on task type, objective or iteration count. The only clamp anywhere near
+it is the `Min(..., 0.5)` inside the derivation itself
+(`options_helper.cpp:261`), and the non-zero check at
+`boosting_options.cpp:78-84` is gated on `IsSet()` and runs before the
+derivation, so it never sees a derived value.
+
+#### 3. What was built
+
+A CatBoost-mode default is applied with **`IsSet=false` semantics**: it supplies
+the value and does not count as the user naming the key. The provenance flags
+every gate reads are written from `is not None` tests on what the CALLER passed,
+and no mode default writes one.
+
+| supplied under `symmetrictree` | value | citation | declines where |
+| --- | --- | --- | --- |
+| `learning_rate` (base) | 0.03 | `boosting_options.cpp:10` | never; every trainer shrinks by it |
+| `l2_leaf_reg` | 3.0 | `oblivious_tree_options.cpp:15`, re-supplied per loss at `catboost_options.cpp:302` | never |
+| `leaf_estimation_iterations` | per objective, with the small-run stomp | `catboost_options.cpp:106-112`, stomp at `options_helper.cpp:290-303` | multiclass, sparse, ranking, custom |
+| `random_strength` | 1.0 | `oblivious_tree_options.cpp:17`; A3 owns the mechanism | every loop that computes no per-tree scale |
+| `depth` | 6 | `oblivious_tree_options.cpp:12` | never |
+| `ctr` | `auto` | A19/A36 | every entry point that bins without a bundle |
+
+**`depth` is the one that was load-bearing rather than merely faithful.** A
+symmetric tree is bounded by its depth alone and our stock `max_depth` is -1, so
+before this the default CatBoost-mode configuration raised on every fit, on both
+surfaces.
+
+#### 4. No silent stop-deriving
+
+When the estimator resolves to skipping, the record says why and names the key.
+`TrainConfig.auto_lr_note` on the string surface and
+`_Base.auto_learning_rate_note_` on the Python one, one vocabulary:
+
+- `auto_lr_gate_open` -- the gate is open, the derivation was handed to the
+  resolver. Deliberately not a promise that a rate was derived: `NeedToUpdate`
+  (`options_helper.cpp:246-249`) may still find no coefficient row, and CatBoost
+  keeps its constant in silence when it does.
+- `auto_lr_skipped:<key>` -- wanted, and a NAMED key stopped it. The keys are
+  CatBoost's own spellings, tested in the order `UpdateLearningRate` tests them,
+  so a caller who closed two is told the one CatBoost's short-circuit would have
+  stopped at.
+- `auto_lr_off:<policy>` -- the grow policy never wanted one.
+
+The policy half echoes each surface's own vocabulary (`leafwise` natively,
+`lossguide` canonically); the `auto_lr_skipped:<key>` half is identical across
+both surfaces, which is the half a reader greps for.
+
+#### 5. The residual this lane did not close
+
+`_catboost_leaf_iterations_for` applies CatBoost's small-run stomp
+(`options_helper.cpp:290-303`: reset to 1 when the user set nothing AND the run
+is under 200 iterations AND the pool has under 20 features) with only the half a
+parameter string can see. It knows the iteration count and not the feature
+count, and the two are ANDed, so it returns the option value for a
+wide-and-short run CatBoost would stomp. One direction only -- it can return 10
+where CatBoost returns 1, never the reverse -- and the fix is a feature count,
+which the binding has and the string surface does not.

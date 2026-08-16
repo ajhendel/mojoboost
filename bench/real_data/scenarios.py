@@ -1514,6 +1514,24 @@ MOJOTREES_CATBOOST_MODE_FROM_READBACK = {
 #: are mutually exclusive by construction and `selfcheck` fails if a key is in
 #: both tables. Read `CATBOOST_LEARNING_RATE_TRANSITION` for which one should
 #: be live when.
+#:
+#: **Update, 2026-08-16: the half of the transition that was ours has landed
+#: and this tuple is still empty, on purpose.** `lane/mode-defaults-layer`
+#: built the mode-defaults layer, so `grow_policy='symmetrictree'` now supplies
+#: CatBoost's `l2_leaf_reg` 3.0, its per-objective `leaf_estimation_iterations`
+#: and its `random_strength` 1.0 with `SetDefault` semantics -- assigned, and
+#: NOT recorded as the caller naming the key. That removes the trap the wire
+#: note described: an arm that stops naming `lambda_l2` no longer falls back to
+#: our stock 0.0, it gets CatBoost's 3.0 from the mode, and CatBoost's gate
+#: stays open.
+#:
+#: What has not moved is the `learning_rate` row, and the reason is a file
+#: boundary rather than a design one. `selfcheck.py:650` asserts
+#: `"learning_rate" in MOJOTREES_CATBOOST_MODE_FROM_READBACK`, so taking it out
+#: of that dict fails the self check, and `selfcheck.py` belongs to the harness
+#: lane. Moving both rows in one commit is a one-line change on each side; it
+#: is not two changes that can be sequenced from here, because the assertion
+#: and the tuple would disagree in between.
 MOJOTREES_CATBOOST_MODE_UNSET = ()
 
 #: How this arm gets CatBoost's learning rate, now and next, in one place.

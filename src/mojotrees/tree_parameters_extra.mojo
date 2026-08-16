@@ -622,6 +622,47 @@ def extra_threshold_index(
 # and `random_strength` is the only name added to it.
 comptime DEFAULT_RANDOM_STRENGTH_SEED = 0
 
+# CatBoost's own `random_strength` default, and this struct's is 0.0.
+#
+# Two numbers, and which one a fit takes is the standing mode rule rather
+# than a preference: `grow_policy=oblivious` is CatBoost mode and mirrors
+# CatBoost, so an unnamed `random_strength` resolves to this; every other
+# grow policy mirrors LightGBM, which has no such parameter at all, so an
+# unnamed one stays at `ExtraTreeParams.random_strength`'s 0.0 and the fit is
+# bit-identical to one made before the parameter existed.
+#
+# **Supplied with `SetDefault` semantics wherever it is supplied.** CatBoost's
+# `TOption::SetDefault` (`option.h:27-33`) assigns a value without raising
+# `IsSetFlag`, which is what lets CatBoost's own defaults coexist with gates
+# that read provenance. The two places that apply this constant --
+# `params.parse_params` on the string surface and `_parse_params` in
+# bindings/_mojotrees.mojo on the Python one -- both apply it only when the
+# caller named nothing, and neither records the result as a caller's value.
+#
+# It is applied only where the per-tree scale it multiplies is computed
+# (`boosting._round_random_score_scale`, two round loops). An inherited
+# default an entry point cannot honor declines and keeps 0.0; a value the
+# caller typed is refused by name. That is the same line every other
+# CatBoost-mode default draws.
+comptime CATBOOST_RANDOM_STRENGTH = 1.0
+
+# CatBoost's `l2_leaf_reg` default, `oblivious_tree_options.cpp:15`, and this
+# package's is 0.0 (LightGBM's `lambda_l2`, `config.h`).
+#
+# It lives beside `CATBOOST_RANDOM_STRENGTH` rather than on `TreeParams`
+# because the two are one decision: they are the CatBoost-mode values, and the
+# rule they are supplied under is the same rule. CatBoost supplies this one
+# through `SetDefault` at `catboost_options.cpp:302`, which is precisely why
+# CatBoost's own 3 leaves the automatic-learning-rate gate open
+# (`options_helper.cpp:280`) while a user's 3 closes it. Anything applying this
+# constant must not record the result as a caller's value.
+#
+# `python/mojotrees/sklearn.py` carries the same number as
+# `_CATBOOST_L2_LEAF_REG`, because a Python fit resolves its own defaults and
+# cannot import this; `tools/check_parity.py` is where the two are held
+# together, the same way it already holds the stock `lambda_l2`.
+comptime CATBOOST_L2_LEAF_REG = 3.0
+
 # Domain separator folded into the seed so this stream can never coincide
 # with `extra_split_stream`'s even when both seeds are equal. ASCII
 # "RANDSCOR".

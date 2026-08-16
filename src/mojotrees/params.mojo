@@ -57,6 +57,7 @@ Intentional differences from LightGBM
 from .boosting import (
     BINARY_LOGISTIC,
     BoosterParams,
+    catboost_leaf_estimation_iterations,
     CROSS_ENTROPY,
     DEFAULT_FAIR_C,
     DEFAULT_TWEEDIE_VARIANCE_POWER,
@@ -71,9 +72,16 @@ from .boosting import (
     TWEEDIE,
 )
 from .auto_learning_rate import (
+    AUTO_LR_GATE_L2_LEAF_REG,
+    AUTO_LR_GATE_LEAF_ESTIMATION_ITERATIONS,
+    AUTO_LR_GATE_LEARNING_RATE,
+    AUTO_LR_GATE_OPEN,
+    AUTO_LR_GATE_OPEN_NOTE,
     AUTO_LR_TASK_CPU,
     AUTO_LR_TASK_GPU,
     AutoLearningRateParams,
+    CATBOOST_CONSTANT_LEARNING_RATE,
+    auto_lr_skipped_note,
     resolve_learning_rate,
 )
 from .device import CPU_DEVICE, GPU_DEVICE, parse_device
@@ -85,8 +93,10 @@ from .objective_registry import (
 from .efb import check_bundling_supported
 from .sampling import canonical_data_sample_strategy
 from .validation import check_booster_ranges, check_max_bin
-from .growth_policy import GROW_OBLIVIOUS, parse_grow_policy
+from .growth_policy import GROW_OBLIVIOUS, grow_policy_name, parse_grow_policy
 from .tree_parameters_extra import (
+    CATBOOST_L2_LEAF_REG,
+    CATBOOST_RANDOM_STRENGTH,
     check_extra_option_supported,
     check_feature_pre_filter,
     parse_derivative_precision,
@@ -100,6 +110,18 @@ from .tree_parameters_extra import (
 # the single-output space forever) and bound here under the name this
 # module's callers import.
 comptime MULTICLASS = _MULTICLASS
+
+# CatBoost's `IsSmallIterationCount` bound (`catboost_options.h:88-90`), read
+# by `UpdateLeavesEstimationIterations` (`options_helper.cpp:290-303`) to stomp
+# an unset `leaf_estimation_iterations` back to 1 on a short run. Recorded here
+# because this is the only surface that applies the stomp; see
+# `_catboost_leaf_iterations_for` for the half of the condition it cannot see.
+comptime CATBOOST_SMALL_ITERATION_COUNT = 200
+
+# CatBoost's `depth` default (`oblivious_tree_options.cpp:12`), supplied by CatBoost
+# mode because a symmetric tree cannot be grown without a depth bound and this
+# surface's stock `max_depth` is -1. See `_apply_catboost_mode_defaults`.
+comptime CATBOOST_DEPTH = 6
 
 # Every key `parse_params` accepts, canonical names only, for error
 # messages. An alias is deliberately absent here: a user who misspelled
@@ -120,7 +142,7 @@ comptime SUPPORTED_KEYS = String(
     " use_missing,"
     " use_quantized_grad, num_grad_quant_bins, quant_train_renew_leaf,"
     " stochastic_rounding, leaf_estimation_iterations,"
-    " boost_from_average,"
+    " boost_from_average, ctr,"
     " derivative_precision, auto_learning_rate,"
     " permutation_count, fold_len_multiplier, fold_permutation_block,"
     " ordered_seed"
@@ -181,6 +203,15 @@ struct TrainConfig(Copyable, Movable):
     and our own default mirrors LightGBM. `auto_learning_rate=true|false` in
     the string overrides both. When it is disabled, `booster.learning_rate`
     is the whole story and `resolved_learning_rate` returns it unchanged.
+
+    **`grow_policy=oblivious` also changes four stock defaults**, because a
+    mode that mirrors CatBoost mirrors its defaults too
+    (`_apply_catboost_mode_defaults`): `learning_rate` 0.03, `reg_lambda` 3.0,
+    a per-objective `leaf_estimation_iterations`, and `random_strength` 1.0.
+    Every one of them is supplied the way CatBoost supplies its own -- assign
+    the value, do not record it as the user's -- so they do not close the
+    automatic-learning-rate gate that two of them are keys of. Under every
+    other grow policy the values are LightGBM's and nothing here changed.
     """
 
     var objective: Int
@@ -191,6 +222,25 @@ struct TrainConfig(Copyable, Movable):
     var device: Int
     var use_missing: Bool
     var auto_learning_rate: AutoLearningRateParams
+
+    var auto_lr_note: String
+    """The resolved record for the automatic learning rate: why this config
+    does or does not derive one, and which key decided it.
+
+    `auto_learning_rate.auto_lr_skipped_note`'s vocabulary --
+    `auto_lr_gate_open`, or `auto_lr_skipped:<key>` naming one of CatBoost's
+    four gate keys -- plus `auto_lr_off:<policy>` when the grow policy never
+    wanted a derivation and nothing was asked.
+
+    **It exists because a silent stop-deriving is worse than a loud one.**
+    Under `grow_policy=oblivious` this config advertises CatBoost's derived
+    rate; when a gate key is named the derivation does not happen, CatBoost
+    itself prints nothing, and a caller reading their own parameter string has
+    no way to see that the rate they thought was derived is the constant 0.03.
+    This field is what they read instead. It is a record and never a decision:
+    nothing branches on it, and `resolved_learning_rate` would return the same
+    number if it were deleted.
+    """
 
     def __init__(out self):
         """LightGBM's defaults as mojotrees sets them: squared error on the
@@ -203,6 +253,20 @@ struct TrainConfig(Copyable, Movable):
         self.device = CPU_DEVICE
         self.use_missing = True
         self.auto_learning_rate = AutoLearningRateParams.disabled()
+        # Leaf-wise growth is the default and mirrors LightGBM, which has no
+        # automatic learning rate, so a default-constructed config has not
+        # skipped anything: it never wanted one.
+        #
+        # Spelled through `grow_policy_name` rather than written out, because
+        # `parse_params` fills this field the same way and two literals for one
+        # state is how a record starts disagreeing with itself. That function
+        # returns the NATIVE vocabulary (`leafwise`, `depthwise`, `oblivious`),
+        # not the canonical user-facing one (`lossguide`, `depthwise`,
+        # `symmetrictree`); which of the two this note carries matters less
+        # than its carrying one of them everywhere.
+        self.auto_lr_note = String(
+            "auto_lr_off:", grow_policy_name(self.booster.tree.grow_policy)
+        )
 
     def is_multiclass(self) -> Bool:
         return self.objective == MULTICLASS
@@ -774,6 +838,13 @@ def parse_params(spec: String) raises -> TrainConfig:
     var saw_learning_rate = False
     var saw_lambda_l2 = False
     var saw_leaf_estimation_iterations = False
+    # The same provenance question for the two remaining CatBoost-mode
+    # defaults. `random_strength` is not one of CatBoost's gate keys, so it
+    # does not touch the derivation; it is tracked for the other half of the
+    # rule, that a mode default must never overwrite a value a caller typed.
+    # 0.0 is both our stock value and a legitimate thing to ask for, so
+    # "unset" cannot be recovered from the number.
+    var saw_random_strength = False
     # Two flags, not one, because "absent" and "auto_learning_rate=false" are
     # different answers under `grow_policy=oblivious`: absent takes CatBoost's
     # own default, which is ON, and an explicit false turns it off. A single
@@ -1131,7 +1202,56 @@ def parse_params(spec: String) raises -> TrainConfig:
         # off the ensemble's gradients that no trainer computes in this
         # build, and a split search cannot reconstruct it from a histogram.
         elif key == "random_strength":
+            saw_random_strength = True
             config.booster.tree.extra.random_strength = _parse_f64(key, value)
+        # CatBoost's ordered target statistics, catalog A19/A36. Accepted here
+        # so a ported CatBoost configuration is answered rather than told its
+        # key is unknown, and refused above `off` because a parameter string
+        # cannot carry the mechanism.
+        #
+        # The reason is structural rather than a missing branch. A CTR column
+        # is built while the matrix is BINNED, from the label and a fixed
+        # permutation, and the type that binds a `ctr_columns.SimpleCtrConfig`
+        # to a matrix is `trainset.Dataset`. A `TrainConfig` is handed to
+        # `model.fit` and `model.fit_multiclass`, both of which bin a raw
+        # matrix through `binning.fit_bins` and take no bundle, so a rule
+        # accepted here would be parsed, stored and never read -- which is the
+        # accept-and-drop this surface exists to prevent.
+        #
+        # `off` is accepted and is a no-op, the property every value on this
+        # surface has when it names what mojotrees already does.
+        elif key == "ctr":
+            if lowered != "off":
+                raise Error(
+                    "ctr='",
+                    lowered,
+                    "' cannot be set from a parameter string: ordered target"
+                    " statistics are built while the dataset is binned, and a"
+                    " TrainConfig is handed to model.fit and"
+                    " model.fit_multiclass, which bin a raw matrix through"
+                    " binning.fit_bins and take no"
+                    " ctr_columns.SimpleCtrConfig. Reach it from Python with"
+                    " mojotrees.Dataset(params={'ctr': ...}) followed by"
+                    " mojotrees.train(params, dataset), or from the"
+                    " scikit-learn estimator's ctr= parameter, or from the"
+                    " Mojo API by passing the bundle to trainset.Dataset."
+                    " 'off' is accepted and is the default",
+                )
+        # CatBoost's `one_hot_max_size`, the cutoff between a one-hot split and
+        # a CTR replacement. Refused for the same reason `ctr` is above it, and
+        # named separately because the two are separate keys in a ported
+        # configuration and a user who typed only this one should be told about
+        # this one.
+        elif key == "one_hot_max_size":
+            raise Error(
+                "one_hot_max_size is supported by the Mojo API and by the"
+                " scikit-learn estimator only, not by parameter strings: it is"
+                " the cutoff both LightGBM's one-hot categorical split"
+                " (CategoricalParams.max_cat_to_onehot) and CatBoost's CTR"
+                " replacement (ctr_columns.SimpleCtrConfig.one_hot_max_size)"
+                " read, and this surface carries neither the categorical"
+                " declaration nor a CTR bundle"
+            )
         # LightGBM's `boost_from_average`, which unlike the two CatBoost names
         # around it really is a name off this surface's own vocabulary
         # (`include/LightGBM/config.h:948`, default `true`).
@@ -1192,29 +1312,33 @@ def parse_params(spec: String) raises -> TrainConfig:
         # 2026-08-16: `train_gpu` and `train_gpu_with_valid` honor the setting
         # now, through `gpu_objectives_native.GpuLeafEstimator` on the
         # device-objective arm and `boosting._estimate_leaf_values` on the
-        # host-objective one. That does not reopen this key, because the
-        # refusal is about the *set* a string reaches and not about any one
-        # member of it: the sparse, custom-objective, multiclass and ranking
-        # trainers still refuse, so a string is still honored by some fits and
-        # dropped by others.
+        # host-objective one.
+        #
+        # **The blanket refusal left on the same day, and the reason is that a
+        # shipped default has to hold on every surface.** CatBoost mode
+        # resolves this parameter per objective, so `grow_policy=oblivious
+        # objective=binary` is a configuration whose CatBoost value is 10; a
+        # string that could not express 10 could not express the default it is
+        # asked to port. What replaced the refusal is not permission: it is
+        # `_check_leaf_estimation_routing` at the end of this function, which
+        # takes the same verdict `_parse_params` in bindings/_mojotrees.mojo
+        # takes, from the same question -- which trainer is this configuration
+        # about to reach -- and refuses BY NAME when the answer is one that
+        # does not implement the extra steps. A parameter string reaches
+        # exactly two trainers, `model.fit` and `model.fit_multiclass`, and
+        # only the second of those is such a trainer.
+        #
+        # The order matters and is why the check is deferred: `objective` and
+        # `num_class` may appear after this key in the string, so the routing
+        # is not known here.
         elif key == "leaf_estimation_iterations":
             saw_leaf_estimation_iterations = True
-            var iters = _parse_int(key, value)
-            if iters > 1:
-                raise Error(
-                    "leaf_estimation_iterations > 1 cannot be set from a"
-                    " parameter string: this string reaches the sparse,"
-                    " custom-objective, multiclass and ranking trainers, none"
-                    " of which implement extra Newton steps, so it would be"
-                    " honored by some fits and dropped by others. Set it from"
-                    " the Mojo API instead, on"
-                    " TreeParams.extra.leaf_estimation_iterations, which"
-                    " boosting.train, boosting.train_more,"
-                    " boosting.train_with_valid, train_gpu.train_gpu and"
-                    " train_gpu.train_gpu_with_valid honor and every other"
-                    " trainer refuses by name"
-                )
-            config.booster.tree.extra.leaf_estimation_iterations = iters
+            # Range-checked by `ExtraTreeParams.check_leaf_estimation` through
+            # `_validate` below, not here: one rule, one place, and that one
+            # also refuses the `path_smooth` combination this cannot see.
+            config.booster.tree.extra.leaf_estimation_iterations = _parse_int(
+                key, value
+            )
         # LightGBM's quantized-training family. The four names and no others:
         # LightGBM has no scale-rule, seed, or accumulator-width parameter,
         # and this surface is exactly LightGBM's, so mojotrees's three extra
@@ -1427,6 +1551,22 @@ def parse_params(spec: String) raises -> TrainConfig:
             config.booster.tree.feature_fraction_seed = random_state
         if not saw_extra_seed:
             config.booster.tree.extra.extra_seed = random_state
+    # CatBoost mode's defaults, applied before validation so a defaulted value
+    # is range-checked exactly as a typed one is, and after the whole string is
+    # read because the mode, the objective and the provenance flags are all
+    # decided by keys that may appear in any order.
+    _apply_catboost_mode_defaults(
+        config,
+        saw_learning_rate,
+        saw_lambda_l2,
+        saw_leaf_estimation_iterations,
+        saw_random_strength,
+    )
+    # Item 6's deferred verdict: which trainer this configuration is about to
+    # reach, and whether that trainer implements the extra Newton steps. After
+    # the mode defaults, so a CatBoost-mode multiclass string is judged on the
+    # count it will actually run.
+    _check_leaf_estimation_routing(config)
     _validate(config, saw_num_class, saw_ordered_knob)
     if saw_auto_learning_rate:
         if auto_learning_rate_asked:
@@ -1436,6 +1576,11 @@ def parse_params(spec: String) raises -> TrainConfig:
                 saw_lambda_l2,
                 saw_leaf_estimation_iterations,
             )
+        else:
+            # `auto_learning_rate=false` is a statement and not an omission,
+            # so the record says the derivation was turned off by name rather
+            # than by the grow policy.
+            config.auto_lr_note = String("auto_lr_off:auto_learning_rate=false")
     elif config.booster.tree.grow_policy == GROW_OBLIVIOUS:
         _default_auto_learning_rate(
             config,
@@ -1443,7 +1588,193 @@ def parse_params(spec: String) raises -> TrainConfig:
             saw_lambda_l2,
             saw_leaf_estimation_iterations,
         )
+    else:
+        config.auto_lr_note = String(
+            "auto_lr_off:", grow_policy_name(config.booster.tree.grow_policy)
+        )
     return config^
+
+
+def _apply_catboost_mode_defaults(
+    mut config: TrainConfig,
+    saw_learning_rate: Bool,
+    saw_lambda_l2: Bool,
+    saw_leaf_estimation_iterations: Bool,
+    saw_random_strength: Bool,
+) raises:
+    """CatBoost's own defaults, under `grow_policy=oblivious` and nowhere else.
+
+    The standing rule: `grow_policy=oblivious` is CatBoost's symmetric tree and
+    mirrors CatBoost exactly, `lossguide` mirrors LightGBM, and anything of our
+    own is opt-in and named as ours. Under any other policy this function
+    returns having touched nothing, so every configuration that does not ask
+    for CatBoost mode is the configuration it was.
+
+    **Every value here is supplied with `TOption::SetDefault` semantics**
+    (`option.h:27-33`): the value is assigned and the `IsSetFlag` is NOT
+    raised. That is not a convenience -- it is the only shape in which this
+    function and the automatic learning rate can both exist. Two of the four
+    keys CatBoost's derivation is gated on (`options_helper.cpp:276-281`) are
+    `l2_leaf_reg` and `leaf_estimation_iterations`, which are also two of the
+    values supplied here; if supplying them counted as the user naming them,
+    turning CatBoost mode on would close the gate that CatBoost mode exists to
+    open, and the mode would advertise a derived learning rate while shipping
+    the constant 0.03.
+
+    So the `saw_*` arguments are the caller's provenance and this function
+    writes none of them. `_default_auto_learning_rate`, which runs after this
+    one, reads exactly those flags and never the values below. CatBoost keeps
+    the same separation in the same place: `catboost_options.cpp:302`, `:305`
+    and `:319` supply `L2Reg`, `LeavesEstimationMethod` and
+    `LeavesEstimationIterations` through `SetDefault`, while a user's value
+    arrives through `operator=` (`option.h:118-121`) and raises the flag.
+
+    What is supplied, and what each one declines on:
+
+    - `learning_rate` -> **0.03**, CatBoost's constant
+      (`boosting_options.cpp:10`), replacing our 0.1. It is the value the run
+      trains at whenever the derivation does not fire, which is exactly the
+      case this whole layer is about. Never declines: every trainer shrinks by
+      it.
+    - `reg_lambda` -> **3.0**, CatBoost's `l2_leaf_reg`
+      (`oblivious_tree_options.cpp:15`). Never declines either.
+    - `leaf_estimation_iterations` -> CatBoost's per-objective count, WITH the
+      small-run stomp applied; see `_catboost_leaf_iterations_for`. Declines to
+      1 for a multiclass configuration, because `model.fit_multiclass` is the
+      trainer that string reaches and it implements no extra step. An
+      inherited default an entry point cannot honor declines in silence, which
+      is what CatBoost does when its own table has no row; a value the caller
+      typed is refused by `_check_leaf_estimation_routing`.
+    - `random_strength` -> **1.0**
+      (`tree_parameters_extra.CATBOOST_RANDOM_STRENGTH`), replacing our 0.0.
+      Declines on the GPU and on multiclass, because the per-tree scale it
+      multiplies is computed by `boosting._boost_rounds` and by
+      `train_with_valid`'s loop and by nothing else, and `check_scalars` would
+      refuse an inherited value those loops cannot serve.
+
+    `boost_from_average` is deliberately absent. CatBoost resolves it per loss
+    and mojotrees's `false` is honored by the dense single-output round loops
+    only, which is the identical routing question the two keys above answer --
+    but `false` is also the value the string surface refuses outright today,
+    and moving that refusal is a separate change to a separate key. Recorded
+    here so the omission is a decision and not an oversight.
+    """
+    if config.booster.tree.grow_policy != GROW_OBLIVIOUS:
+        return
+    # `max_depth` first, because it is the one that decides whether this mode
+    # can fit at all. A symmetric tree is bounded by its depth and by nothing
+    # else, so `GrowthSchedule` refuses an unbounded one, and this surface's
+    # stock `max_depth` is -1. `grow_policy=oblivious` with no `max_depth`
+    # raised on every run before this line, which is not a default that ships.
+    #
+    # Read from the value rather than from provenance, unlike everything below
+    # it, and the asymmetry is deliberate: -1 is not a depth, it is the absence
+    # of a bound, and both "nobody said" and "somebody asked for unbounded"
+    # want the same answer here, which is CatBoost's `depth` default of 6
+    # (`oblivious_tree_options.cpp:12`). `max_depth` is not one of CatBoost's four
+    # gate keys, so supplying it cannot close the derivation gate under either
+    # reading.
+    if config.booster.tree.max_depth < 0:
+        config.booster.tree.max_depth = CATBOOST_DEPTH
+    if not saw_learning_rate:
+        config.booster.learning_rate = CATBOOST_CONSTANT_LEARNING_RATE
+    if not saw_lambda_l2:
+        config.booster.tree.lambda_reg = CATBOOST_L2_LEAF_REG
+    if not saw_leaf_estimation_iterations and not config.is_multiclass():
+        config.booster.tree.extra.leaf_estimation_iterations = (
+            _catboost_leaf_iterations_for(config)
+        )
+    if (
+        not saw_random_strength
+        and config.device == CPU_DEVICE
+        and not config.is_multiclass()
+    ):
+        config.booster.tree.extra.random_strength = CATBOOST_RANDOM_STRENGTH
+
+
+def _catboost_leaf_iterations_for(config: TrainConfig) -> Int:
+    """CatBoost's resolved `leaf_estimation_iterations` for this run.
+
+    The option default from `boosting.catboost_leaf_estimation_iterations`,
+    and then the stomp that function documents and deliberately does not
+    apply: `UpdateLeavesEstimationIterations` (`options_helper.cpp:290-303`,
+    called at `:429`) resets the count to **1**, for every loss, when the user
+    set nothing AND the run has fewer than 200 iterations AND the pool has
+    fewer than 20 features.
+
+    That function is keyed on an objective and knows neither number. This one
+    knows the iteration count; it does **not** know the feature count, because
+    a parameter string carries no data. The two conditions are ANDed in
+    CatBoost, so a run that fails the iteration test is stomped whatever its
+    width, and applying only the half that is knowable is correct rather than
+    approximate: `n_estimators < 200` alone is a sufficient condition for the
+    stomp only when the pool is also narrow, so this returns the OPTION value
+    for a wide-and-short run that CatBoost would stomp.
+
+    That residual is named rather than hidden. It is one direction only -- this
+    can return 10 where CatBoost returns 1, never the reverse -- and the fix is
+    a feature count, which the binding has (`_parse_params(n_features)`) and
+    this surface does not.
+    """
+    var option_value = catboost_leaf_estimation_iterations(config.objective)
+    if config.booster.n_estimators < CATBOOST_SMALL_ITERATION_COUNT:
+        return 1
+    return option_value
+
+
+def _check_leaf_estimation_routing(config: TrainConfig) raises:
+    """Refuse `leaf_estimation_iterations > 1` on the trainer that drops it.
+
+    Item 6's verdict, and the same shape `_parse_params` in
+    `bindings/_mojotrees.mojo` already uses: the question is not "is this a
+    parameter string" but "which trainer is this configuration about to
+    reach", and the answer is refused by name when it is one that reads the
+    field nowhere.
+
+    A `TrainConfig` reaches exactly two trainers. `cli/mojotrees_cli.mojo` and
+    `capi/mojotrees_capi.mojo` both branch on `is_multiclass()` and call
+    `model.fit` or `model.fit_multiclass`; there is no third call site, and a
+    Mojo-API caller who parses a string gets the same two names in the message
+    below.
+
+    - `model.fit` HONORS it. Its CPU arm is `boosting.train` and its GPU arm is
+      `train_gpu.train_gpu`, and both run the extra Newton steps --
+      `boosting._estimate_leaf_values` on the host-objective arm and
+      `gpu_objectives_native.GpuLeafEstimator` on the device one.
+    - `model.fit_multiclass` does NOT. `boosting.train_multiclass`,
+      `train_gpu.train_multiclass_gpu` and
+      `boosting_sparse.train_multiclass_sparse` read the field nowhere.
+
+    Nothing is lost by the refusal: CatBoost resolves `MultiClass` to 1 as
+    well (`catboost_options.cpp:106-112`; the 10 in that block is the Gradient
+    slot and is not the default), so it fires only on a value CatBoost would
+    not have chosen either. The CatBoost-mode default declines to 1 for the
+    same configuration rather than resolving a value this would then refuse,
+    which is the difference between a default and a request.
+
+    **A parsed config handed to some OTHER trainer is still not covered here,
+    and cannot be.** `boosting_sparse.train_sparse`, `ranking.train_ranker` and
+    `custom_objective`'s loops all read the field nowhere and none of them
+    refuses it; a Mojo-API caller who takes `config.booster` there gets the
+    drop this function prevents on the two routes a string actually has. That
+    is a gap in those trainers and is named in the message so the caller can
+    see the boundary.
+    """
+    if not config.booster.tree.extra.leaf_estimation_active():
+        return
+    if not config.is_multiclass():
+        return
+    raise Error(
+        "leaf_estimation_iterations > 1 is not implemented by"
+        " model.fit_multiclass, which is the trainer objective=multiclass"
+        " routes a parameter string to: boosting.train_multiclass,"
+        " train_gpu.train_multiclass_gpu and"
+        " boosting_sparse.train_multiclass_sparse read the field nowhere."
+        " CatBoost resolves MultiClass to 1 as well"
+        " (catboost_options.cpp:106-112), so 1 -- the default -- is also"
+        " CatBoost's answer for this loss. A single-output objective routes to"
+        " model.fit, which honors the setting on both backends"
+    )
 
 
 def _default_auto_learning_rate(
@@ -1471,19 +1802,39 @@ def _default_auto_learning_rate(
     default). mojotrees has no `leaf_estimation_method` key at all, so that
     one of the four is permanently open here.
 
-    **Silent when the gate is closed, and that is deliberate.** A user who
-    writes `grow_policy=oblivious l2_leaf_reg=5` asked for nothing about the
-    learning rate, so there is nothing to refuse; CatBoost quietly keeps its
-    constant in the same situation and this keeps ours. An *explicit*
-    `auto_learning_rate=true` beside the same `l2_leaf_reg=5` is a different
-    act and `_enable_auto_learning_rate` refuses it by name.
+    **Silent to the CALLER when the gate is closed, and never silent in the
+    record.** A user who writes `grow_policy=oblivious l2_leaf_reg=5` asked for
+    nothing about the learning rate, so there is nothing to refuse, and
+    CatBoost quietly keeps its constant in the same situation. What this does
+    NOT do any more is leave the config unable to say so: `auto_lr_note` comes
+    out as `auto_lr_skipped:l2_leaf_reg`, naming the key, so a run that
+    resolved to 0.03 under a mode that advertises a derived rate can be seen
+    to have done that. An *explicit* `auto_learning_rate=true` beside the same
+    `l2_leaf_reg=5` is a different act and `_enable_auto_learning_rate`
+    refuses it by name.
+
+    The gate keys are tested in the order `UpdateLearningRate` tests them
+    (`options_helper.cpp:277-280`), so a string that closed two is recorded
+    against the one CatBoost's own short-circuit would have stopped at.
     """
     if saw_learning_rate:
+        config.auto_lr_note = auto_lr_skipped_note(
+            AUTO_LR_GATE_LEARNING_RATE
+        )
+        return
+    # `leaf_estimation_method` is CatBoost's second gate key and has no
+    # mojotrees spelling at all (Newton only, catalog A6), so it cannot be
+    # named here and is absent from this chain rather than tested and always
+    # open.
+    if saw_leaf_estimation_iterations:
+        config.auto_lr_note = auto_lr_skipped_note(
+            AUTO_LR_GATE_LEAF_ESTIMATION_ITERATIONS
+        )
         return
     if saw_lambda_l2:
+        config.auto_lr_note = auto_lr_skipped_note(AUTO_LR_GATE_L2_LEAF_REG)
         return
-    if saw_leaf_estimation_iterations:
-        return
+    config.auto_lr_note = auto_lr_skipped_note(AUTO_LR_GATE_OPEN)
     config.auto_learning_rate = AutoLearningRateParams.catboost_defaults(
         AUTO_LR_TASK_GPU if config.device == GPU_DEVICE else AUTO_LR_TASK_CPU
     )
@@ -1535,6 +1886,9 @@ def _enable_auto_learning_rate(
             " unset (options_helper.cpp:279). Drop one of the two"
         )
 
+    # Every way of closing the gate raised above, so reaching here means it is
+    # open. The record says so rather than saying nothing.
+    config.auto_lr_note = String(AUTO_LR_GATE_OPEN_NOTE)
     config.auto_learning_rate = AutoLearningRateParams.catboost_defaults(
         AUTO_LR_TASK_GPU if config.device == GPU_DEVICE else AUTO_LR_TASK_CPU
     )
