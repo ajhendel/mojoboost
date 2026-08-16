@@ -402,8 +402,14 @@ slow and the two sets are not interchangeable to better than about a percent.
 the model serialize-and-reload round trip it otherwise performs inside the
 timed call and which mojotrees pays no counterpart to. And the parameters now
 come from `real_data/scenarios.py`, which adds the binning alignment the
-standalone script was missing (`min_data_in_bin=1`, `feature_pre_filter=false`
-and `bin_construct_sample_cnt` at the row count); `deterministic` is the one
+standalone script was missing. That alignment was three settings when this
+paragraph was written (`min_data_in_bin=1`, `feature_pre_filter=false` and
+`bin_construct_sample_cnt` at the row count) and is one setting now
+(`feature_pre_filter=false`): mojotrees's binner defaults to LightGBM's own
+`min_data_in_bin=3` and 200000-row sample, so pinning either would make the
+comparator bin differently from the subject rather than the same. Numbers
+recorded under the old pins were measured against a constraint this
+repository imposed. `deterministic` is the one
 entry deliberately not inherited, because it is a reproducibility setting
 whose documented cost would land entirely on the comparator's side of a speed
 comparison.
@@ -1019,8 +1025,11 @@ exist.
 
 ## Caveats
 
-- LightGBM's `min_data_in_bin=3` (its default) has no mojotrees equivalent;
-  both still fit 255-bin quantile histograms.
+- `min_data_in_bin=3` is now the default on **both** sides, so it is no
+  longer a difference. It was one when this table was measured, and the
+  numbers above were taken with mojotrees at no minimum population, so they
+  describe a mojotrees that kept low-cardinality levels LightGBM merged.
+  Both still fit 255-bin quantile histograms.
 - Losses differ slightly because tree growth diverges after the first
   floating-point tie; the ~4% MSE gap in mojotrees's favor is within
   seed-to-seed variation, not a quality claim.

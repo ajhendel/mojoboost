@@ -241,8 +241,20 @@ def test_boosting_validates_objective() raises:
 def test_quantile_binning_identity() raises:
     # 8 distinct values into 8 quantile bins: edges land between each pair,
     # so binning is the identity, same as the equal-width toy.
+    #
+    # `min_data_in_bin=1` is pinned, and the pin is the point rather than a
+    # workaround. What this test protects is the *edge rule* -- where a
+    # boundary lands between two distinct values, and how an unseen value
+    # then falls on one side of it -- which is a statement about one bin per
+    # level and says nothing about how many rows a bin must hold. At the
+    # stock default of 3 these eight rows are eight bins' worth of levels
+    # holding one row each, so the population rule merges them and there is
+    # no identity left to check. The default's own behavior on this column is
+    # asserted below rather than left untested.
     var features: List[Float64] = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
-    var mapper = fit_bins(features, n_rows=8, n_features=1, max_bins=8)
+    var mapper = fit_bins(
+        features, n_rows=8, n_features=1, max_bins=8, min_data_in_bin=1
+    )
     var data = mapper.transform(features, 8)
     for r in range(8):
         assert_equal(data.bin_at(r, 0), r)
@@ -250,6 +262,18 @@ def test_quantile_binning_identity() raises:
     assert_equal(mapper.bin_value(0, -100.0), 0)
     assert_equal(mapper.bin_value(0, 2.4), 2)
     assert_equal(mapper.bin_value(0, 100.0), 7)
+
+    # And what the stock default does to the same column: eight singleton
+    # levels merged three at a time, so the cuts fall after 2.0 and after
+    # 5.0 and the identity becomes three bins. Stated exactly, because a
+    # default nobody asserts is a default nobody notices changing.
+    var stock = fit_bins(features, n_rows=8, n_features=1, max_bins=8)
+    assert_equal(stock.edge_offsets[1] - stock.edge_offsets[0], 2)
+    assert_equal(stock.edges[0], 2.5)
+    assert_equal(stock.edges[1], 5.5)
+    var stock_bins: List[Int] = [0, 0, 0, 1, 1, 1, 2, 2]
+    for r in range(8):
+        assert_equal(stock.bin_value(0, features[r]), stock_bins[r])
 
 
 def test_quantile_binning_duplicates() raises:
@@ -267,10 +291,20 @@ def test_quantile_binning_duplicates() raises:
 def test_quantile_binning_skewed() raises:
     # Equal-frequency binning must separate a dense cluster that
     # equal-width binning would collapse into one bin.
+    #
+    # `min_data_in_bin=1` is pinned because the claim under test is about
+    # *where* the boundaries go on a skewed column, not about how populous a
+    # bin has to be. Eight rows cannot fill four bins of three at the stock
+    # default -- the budget shrinks to `8 / 3 = 2` bins and the column comes
+    # back with a single edge -- so at the default this fixture stops being a
+    # skew test and becomes a restatement of the population rule, which
+    # `test_quantile_binning_identity` already asserts directly.
     var features: List[Float64] = [
         1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 1000000.0,
     ]
-    var mapper = fit_bins(features, n_rows=8, n_features=1, max_bins=4)
+    var mapper = fit_bins(
+        features, n_rows=8, n_features=1, max_bins=4, min_data_in_bin=1
+    )
     var bins_seen = List[Int]()
     for r in range(8):
         var b = mapper.bin_value(0, features[r])

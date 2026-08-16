@@ -58,9 +58,13 @@ check with its findings returned instead of discarded.
 from std.math import isnan
 
 from .binning import (
+    DEFAULT_BIN_CONSTRUCT_SAMPLE_CNT,
+    DEFAULT_DATA_RANDOM_SEED,
+    DEFAULT_MIN_DATA_IN_BIN,
     BinMapper,
     BinnedMatrix,
     _sized_missing_bins,
+    bin_construct_sample_rows,
     distinct_levels_sorted,
     emit_quantile_edges,
     no_missing_bins,
@@ -457,19 +461,91 @@ def fit_categorical_spec_csc(
     return CategoricalSpec(flags^, codes^, offsets^)
 
 
+def _level_counts_sorted(
+    stored: List[Float64],
+    levels: List[Float64],
+    n_implicit: Int,
+    mut counts: List[Int],
+):
+    """How many rows of the implied dense column each level holds.
+
+    `stored` is the column's stored values, ascending and NaN-free; `levels`
+    is what `binning.distinct_levels_sorted` reported for it, with the
+    implicit-zero level already spliced in when the caller had to add one.
+    Both ascend, so this is one merge walk rather than a search per row.
+
+    Why the counts are computed here and the levels are not. The levels are
+    `binning.mojo`'s answer and stay `binning.mojo`'s answer, because the
+    dense and sparse fits are required to agree on which levels exist. The
+    counts are the one extra fact `min_data_in_bin` needs, and the dense side
+    gets them fused into its distinct-value scan (`binning.collect_distinct`)
+    where no sorted order exists to exploit. Here the values are already
+    sorted, so counting is a walk of `len(stored)` comparisons and no table.
+
+    The `n_implicit` absent rows are the value 0.0 and are added to whichever
+    level holds zero. The caller guarantees that level exists whenever
+    `n_implicit > 0`: it is the zero it splices in above, and the one case
+    where it could not splice one in (the level table was already full)
+    is exactly the case that gives up on levels altogether.
+
+    Non-raising, because the sparse fitter calls this from inside a worker
+    closure that cannot raise. The walk advances on `<` rather than on `!=`
+    so that it lands on the right level for every value it is given and stays
+    inside the array for any value it is not. `-0.0` and `0.0` compare equal
+    under both, which is the normalization `distinct_levels_sorted` applies.
+    """
+    counts.clear()
+    counts.resize(len(levels), 0)
+    if len(levels) == 0:
+        return
+    var li = 0
+    for i in range(len(stored)):
+        var v = stored[i]
+        while li + 1 < len(levels) and levels[li] < v:
+            li += 1
+        counts[li] += 1
+    if n_implicit > 0:
+        for j in range(len(levels)):
+            if levels[j] == 0.0:
+                counts[j] += n_implicit
+                break
+
+
+def _sample_membership(sample: List[Int], n_rows: Int) -> List[UInt64]:
+    """A bitmap of the rows a sampled fit reads, one bit per row.
+
+    Drawn once per fit and shared by every feature, so a column asks "is this
+    stored row in the sample" in one load and one shift instead of merging
+    against the ascending sample array. At 1,000,000 rows that is 125 KB read
+    by every column, against 1.6 MB for the index array, and it is the whole
+    reason a sampled sparse fit stays O(nnz) rather than
+    O(n_features * sample_cnt).
+    """
+    var words = (n_rows + 63) // 64
+    var bits = List[UInt64](capacity=words)
+    bits.resize(words, UInt64(0))
+    for i in range(len(sample)):
+        var r = sample[i]
+        bits[r >> 6] |= UInt64(1) << UInt64(r & 63)
+    return bits^
+
+
 def fit_bins_csc(
     csc: CscMatrix,
     max_bins: Int = 255,
     categorical_features: List[Int] = [],
     use_missing: Bool = True,
+    min_data_in_bin: Int = DEFAULT_MIN_DATA_IN_BIN,
+    bin_construct_sample_cnt: Int = DEFAULT_BIN_CONSTRUCT_SAMPLE_CNT,
+    data_random_seed: Int = DEFAULT_DATA_RANDOM_SEED,
 ) raises -> BinMapper:
     """Fit quantile bin edges on a sparse matrix, without densifying.
 
     Produces bit-identical edges, category tables, and missing-bin
-    reservations to `binning.fit_bins` on the densified matrix. Per feature it
-    sorts only the stored values (O(nnz_f log nnz_f)) and indexes the implied
-    dense sorted column through `_sorted_column_at` instead of materializing
-    n_rows values.
+    reservations to `binning.fit_bins` on the densified matrix, **at the same
+    arguments and therefore at the default**. Per feature it sorts only the
+    stored values (O(nnz_f log nnz_f)) and indexes the implied dense sorted
+    column through `_sorted_column_at` instead of materializing n_rows values.
 
     `categorical_features` and `use_missing` mean exactly what they mean on
     the dense path (see binning.mojo): named features get a category table
@@ -477,9 +553,33 @@ def fit_bins_csc(
     bin for missing values, fitting its edges over the remaining
     `max_bins - 1` bins. Absent entries are the value 0.0 throughout, so they
     enter the quantiles and never the missing bin.
+
+    `min_data_in_bin` and `bin_construct_sample_cnt` also mean what they mean
+    there, and default to LightGBM's 3 and 200,000 as `fit_bins` does. Neither
+    reached this function when they landed, which broke the equivalence stated
+    at the top of this module -- the dense side merged rare levels and drew a
+    sample and this one did neither -- so both are honored here:
+
+    - `min_data_in_bin` counts the rows behind each level of the implied dense
+      column, absent rows included, and merges levels in ascending order until
+      each bin holds the minimum; past the bin budget it shrinks the budget to
+      `max(1, min(max_bins, n_valid / min_data_in_bin))`, which is the same
+      pair of `GreedyFindBin` branches `fit_bins` runs.
+    - `bin_construct_sample_cnt` draws the same rows `fit_bins` draws, from
+      `binning.bin_construct_sample_rows` on the same `n_rows` and seed, so a
+      sampled sparse fit reads the same rows of the same matrix. Sampling
+      changes how many rows of a column are absent, so `n_implicit` becomes
+      "sampled rows with no stored entry" rather than "rows with no stored
+      entry", and every count, rank and missingness test below is against the
+      sample rather than against the matrix. A matrix of fewer rows than the
+      count is not sampled at all, which is the common case and costs nothing.
     """
     if max_bins < 2 or max_bins > 256:
         raise Error("max_bins must be in [2, 256]")
+    if min_data_in_bin < 1:
+        raise Error("min_data_in_bin must be positive")
+    if bin_construct_sample_cnt < 0:
+        raise Error("bin_construct_sample_cnt must be non-negative")
     csc.validate()
 
     var cats = fit_categorical_spec_csc(csc, categorical_features, max_bins)
@@ -498,7 +598,23 @@ def fit_bins_csc(
     var missing_p = missing_bin.unsafe_ptr()
     var val_p = csc.values.unsafe_ptr()
     var off_p = csc.col_offsets.unsafe_ptr()
+    var row_p = csc.row_index.unsafe_ptr()
     ref spec = cats
+
+    # Drawn once, before any feature is dispatched, exactly as `fit_bins`
+    # draws it and from the same function on the same `n_rows` and seed, so
+    # the dense and sparse fits of one matrix read the same rows. Empty means
+    # every row, which is the default below 200,000 rows and keeps the column
+    # loop the loop it has always been.
+    var sample = bin_construct_sample_rows(
+        n_rows, bin_construct_sample_cnt, data_random_seed
+    )
+    var sampled = len(sample) > 0
+    var n_sample = len(sample) if sampled else n_rows
+    var sample_bits = _sample_membership(sample, n_rows) if sampled else List[
+        UInt64
+    ]()
+    var bits_p = sample_bits.unsafe_ptr()
 
     def do_feature(f: Int) {imm}:
         # Categorical columns never enter quantile binning.
@@ -510,16 +626,33 @@ def fit_bins_csc(
         var n_stored = hi - lo
         # NaN is dropped before the sort, so it never takes part in a
         # quantile comparison, exactly as on the dense path.
+        #
+        # Under a sample, a stored entry counts only when its row was drawn,
+        # and `n_stored_seen` counts the drawn entries whether or not they
+        # were NaN -- it is what the sampled rows of this column store, and
+        # the rest of the drawn rows are the absent ones.
         var stored = List[Float64](capacity=n_stored)
-        for i in range(lo, hi):
-            var v = val_p.unsafe_load(i)
-            if not isnan(v):
-                stored.append(v)
+        var n_stored_seen = n_stored
+        if sampled:
+            n_stored_seen = 0
+            for i in range(lo, hi):
+                var r = row_p.unsafe_load(i)
+                if (bits_p.unsafe_load(r >> 6) >> UInt64(r & 63)) & 1 == 0:
+                    continue
+                n_stored_seen += 1
+                var v = val_p.unsafe_load(i)
+                if not isnan(v):
+                    stored.append(v)
+        else:
+            for i in range(lo, hi):
+                var v = val_p.unsafe_load(i)
+                if not isnan(v):
+                    stored.append(v)
         sort(stored)
 
-        var n_implicit = n_rows - n_stored
+        var n_implicit = n_sample - n_stored_seen
         var n_valid = len(stored) + n_implicit
-        var reserve = use_missing and n_valid < n_rows
+        var reserve = use_missing and n_valid < n_sample
         var n_ordinary = max_bins - 1 if reserve else max_bins
         var n_neg = 0
         while n_neg < len(stored) and stored[n_neg] < 0.0:
@@ -571,12 +704,40 @@ def fit_bins_csc(
             levels_fit = True
 
         if levels_fit:
-            for j in range(len(levels) - 1):
-                below.append(levels[j])
-                above.append(levels[j + 1])
+            if min_data_in_bin <= 1:
+                for j in range(len(levels) - 1):
+                    below.append(levels[j])
+                    above.append(levels[j + 1])
+            else:
+                # `fit_bins`'s levels branch, over the same levels: walk them
+                # accumulating their row counts and cut only once the
+                # accumulator has reached the minimum, resetting it at each
+                # cut. The absent rows are counted into the zero level by
+                # `_level_counts_sorted`, which is the whole difference
+                # between this and the dense loop.
+                var level_counts = List[Int]()
+                _level_counts_sorted(stored, levels, n_implicit, level_counts)
+                var acc = 0
+                for j in range(len(levels) - 1):
+                    acc += level_counts[j]
+                    if acc >= min_data_in_bin:
+                        below.append(levels[j])
+                        above.append(levels[j + 1])
+                        acc = 0
         else:
+            # `fit_bins`'s other branch shrinks the bin budget before it cuts:
+            # `max_bin = max(1, min(max_bin, total_cnt / min_data_in_bin))`.
+            # `total_cnt` is the implied dense column's row count, absent rows
+            # included, which is `n_valid`.
+            var n_ord = n_ordinary
+            if min_data_in_bin > 1:
+                var cap = n_valid // min_data_in_bin
+                if cap < 1:
+                    cap = 1
+                if cap < n_ord:
+                    n_ord = cap
             var idxs = List[Int]()
-            quantile_boundary_indices(n_valid, n_ordinary, idxs)
+            quantile_boundary_indices(n_valid, n_ord, idxs)
             for j in range(len(idxs)):
                 var idx = idxs[j]
                 var w = _sorted_column_at(

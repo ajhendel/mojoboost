@@ -5,6 +5,15 @@ node for node and bit for bit, the tree grown on a dataset physically
 holding only those rows. Everything else here (fraction = 1, reproducibility,
 seed sensitivity, zero-weight rows, tiny datasets) rests on that.
 
+One qualification, and it is about the histogram builders rather than about
+bagging. "Bit for bit" holds against the *subset* builder, which is the one a
+bag goes through, and it is asserted at full strength. Against the
+whole-dataset builder only the structure is bit-equal, because the subset
+builder now folds contiguous row blocks and the whole-dataset builder still
+sums flat, so the two reassociate a node's rows differently and its leaf
+value can move in its last bits. See `test_bagged_tree_equals_tree_on_subset_dataset`
+and the "row blocks" section of `src/mojotrees/histogram.mojo`.
+
 CPU/GPU equivalence lives in tests/test_gpu_training.mojo, which needs an
 accelerator.
 """
@@ -58,8 +67,9 @@ def _gather(values: List[Float64], rows: List[Int]) -> List[Float64]:
     return out^
 
 
-def _assert_same_tree(a: Tree, b: Tree) raises:
-    """Identical structure and bit-identical leaf values."""
+def _assert_same_structure(a: Tree, b: Tree) raises:
+    """Identical structure: the same splits on the same features in the same
+    places. Says nothing about the leaf values."""
     assert_equal(a.n_leaves, b.n_leaves)
     assert_equal(len(a.feature), len(b.feature))
     for i in range(len(a.feature)):
@@ -67,7 +77,13 @@ def _assert_same_tree(a: Tree, b: Tree) raises:
         assert_equal(a.threshold_bin[i], b.threshold_bin[i])
         assert_equal(a.left[i], b.left[i])
         assert_equal(a.right[i], b.right[i])
-        assert_equal(a.value[i], b.value[i])
+
+
+def _assert_same_tree(a: Tree, b: Tree) raises:
+    """Identical structure and bit-identical leaf values."""
+    _assert_same_structure(a, b)
+    for i in range(len(a.feature)):
+        assert_equal(a.value[i].to_bits(), b.value[i].to_bits())
 
 
 def _grad_hess(
@@ -250,8 +266,8 @@ def test_train_rejects_invalid_bagging() raises:
 
 def test_bagged_tree_equals_tree_on_subset_dataset() raises:
     # The equivalence that defines bagging: growing on a bag is growing on
-    # the dataset of those rows. Histogram accumulation visits bag rows in
-    # the same order either way, so leaf values agree bit for bit.
+    # the dataset of those rows. It is asserted here against both builders,
+    # and it is *not* the same assertion against each -- see below.
     var n_rows = 2_000
     var n_features = 4
     var features = _make_features(n_rows, n_features)
@@ -264,10 +280,33 @@ def test_bagged_tree_equals_tree_on_subset_dataset() raises:
 
     var bagged = grow_tree(data, gh[0], gh[1], params, bag)
     var subset = _subset_matrix(data, bag)
-    var reference = grow_tree(
-        subset, _gather(gh[0], bag), _gather(gh[1], bag), params
+    var sub_grad = _gather(gh[0], bag)
+    var sub_hess = _gather(gh[1], bag)
+
+    # Bit for bit, against the same rows of the same size of matrix grown
+    # through the same builder. This is the part that is about bagging: it
+    # says the bag indirection gathers the right rows in the right order and
+    # adds them in the right order, and nothing else here would catch a bag
+    # that was off by a row.
+    var all_rows = List[Int](capacity=len(bag))
+    for i in range(len(bag)):
+        all_rows.append(i)
+    var reference_bagged = grow_tree(
+        subset, sub_grad, sub_hess, params, all_rows
     )
-    _assert_same_tree(bagged, reference)
+    _assert_same_tree(bagged, reference_bagged)
+
+    # Structure only, against the whole-dataset builder. The two builders no
+    # longer produce the same doubles and are not required to: the subset
+    # builder accumulates a node's rows in contiguous row blocks with a
+    # private histogram each and folds the partials, and the whole-dataset
+    # builder sums flat in ascending row order (see the "row blocks" section
+    # of histogram.mojo, which states the reassociation and the bound it
+    # buys). The observed spread on this fixture is a few ulp on a leaf
+    # value, which moves no split -- and *that* is the claim worth keeping,
+    # so it is what is asserted rather than a tolerance on the value.
+    var reference_full = grow_tree(subset, sub_grad, sub_hess, params)
+    _assert_same_structure(bagged, reference_full)
     assert_true(bagged.n_leaves > 1)
 
 
