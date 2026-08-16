@@ -116,9 +116,116 @@ an unweighted one is on 7**. Every fit under a per-row weight -- a user's
 `sample_weight`, a class weight folded into it, or a Bayesian bootstrap draw
 -- is on the 9-byte width by construction. That is the arithmetic of the
 declaration and not a regression in anything measured here.
+
+That arithmetic is not special to the single-output case and is *not*
+relaxed by a multi-target fit. A weighted multi-target round stages both
+derivative planes per output for the same reason a weighted scalar round
+stages both: under squared error the CPU stores the bare weight as the
+hessian, so the hessian is the weight and cannot be rebuilt from a row count.
+Nine bytes per (row, feature) visit at the default feature group, per output,
+by construction.
+
+Multi-target fits (CatBoost's MultiRMSE), and the tree shape they take
+---------------------------------------------------------------------
+A multi-target fit predicts a vector rather than a scalar. Two tree shapes
+can carry that, and they are different trees, not different derivative
+formulas:
+
+  K trees per round   one scalar-leaf tree per output, each grown on its own
+                      output's derivatives, the vector assembled by summing
+                      K independent traversals. `objective_is_multi_output`
+                      in objective_registry.mojo already *defines*
+                      multi-output this way ("whether one boosting iteration
+                      grows more than one tree").
+  one vector tree     one tree whose split is scored against a gain summed
+                      over outputs and whose leaf holds one value per output.
+                      This is CatBoost's shape for MultiRMSE.
+
+**mojotrees takes the first, and this module implements the first.** That is
+not a preference; it is the only shape the rest of the codebase can express.
+`tree.Tree.value` is a `List[Float64]` indexed by node id and
+`Tree.predict_row` returns one `Float64`, so a leaf cannot hold a vector
+without a new field on `Tree`; and softmax multiclass, the one multi-output
+trainer that exists, already grows K trees per round
+(`boosting._boost_rounds_multiclass`, `trees[round * n_classes + k]`). A
+device path that grew vector-leaf trees would have no host model to put them
+in. What is NOT here, and what the other shape would cost, is written out
+under `fill_multi_grad_hess`.
+
+Given that shape, MultiRMSE is the *easier* of the two multi-output
+derivative problems, and deliberately so. Softmax couples the outputs: a
+round needs a probability pass over the whole row before any class's gradient
+exists, because class `k`'s gradient reads a denominator summed over every
+class. MultiRMSE does not couple them at all -- output `j`'s gradient is
+`w * (raw[r, j] - y[r, j])` and reads nothing of output `j'` -- so the
+probability pass, `prob_dev`, and `refresh_softmax` all disappear and the
+derivative kernel is a pure per-(row, output) map. Everything downstream is
+the multiclass machinery unchanged: `_multi_grad_hess_kernel` writes the same
+class-major plane `grad[slot * n_rows + r]` that `_batch_softmax_grad_kernel`
+writes, so `GpuClassBatch.magnitude_sums`, `set_scales`, `scatter_slot` and
+every batched histogram kernel take a multi-target round without one line
+changed, and `update_raw(k=j)` advances output `j`'s slot of the row-major
+raw scores exactly as it advances class `k`'s.
+
+One fixed-point scale per output, never one shared
+--------------------------------------------------
+With K outputs there are K gradient-magnitude profiles, and a multi-target
+fit is the case where they genuinely differ: an output in units of 1 beside
+an output in units of 1000 produces magnitude sums three orders of magnitude
+apart on the very first round. `GpuClassBatch.set_scales` already answers
+this per slot -- `device_fixed_scale(mags[c].grad)` for each `c`, from that
+slot's own reduction -- and the multi-target path inherits that answer
+unchanged, which is the whole reason the derivative kernel writes into the
+batch's plane layout rather than a layout of its own. A shared scale would
+size the small output's lattice by the large output's magnitudes and quantize
+every one of its gradients toward zero, and it would do so silently: the fit
+would converge on the large output and barely move on the small one.
+`tests/test_gpu_multitarget.mojo` fixes outputs three orders of magnitude
+apart for exactly this reason. Equal-scale outputs would pass a shared-scale
+implementation, and they would hide an output-index error entirely, because
+swapping two identically-scaled planes changes nothing observable.
+
+REACHABILITY: the multi-target path is UNREACHABLE from any user-facing API
+---------------------------------------------------------------------------
+Stated here rather than left to be discovered, because this project has
+already shipped two features that were complete, correct, tested and not
+callable (CatBoost mode and `grow_policy=oblivious`, both invisible until
+somebody walked a path end to end instead of checking its entry point). A
+feature nobody can call is as absent as one nobody wrote, and it passes every
+Mojo test either way. So, walked end to end as of this lane:
+
+  `python/mojotrees/sklearn.py`   `MTRegressor._OBJECTIVES` has no
+                                  multi-target name and no estimator accepts
+                                  a 2-D `y`. Not an allow-list gap: a
+                                  multi-target estimator is a new class, not
+                                  a new dictionary entry.
+  `params.mojo`                   No `num_targets` key. `num_class` parses,
+                                  and `_validate` **refuses** it for every
+                                  objective but `multiclass`, so a
+                                  multi-target fit cannot even be spelled in
+                                  a parameter string.
+  `trainset.Dataset`              One `List[Float64]` label column. A target
+                                  matrix cannot be expressed at the dataset
+                                  level at all.
+  `objective_registry`            No multi-target objective code exists.
+                                  `objective_is_multi_output` is True for
+                                  `MULTICLASS` alone.
+  trainers                        Nothing calls `fill_multi_grad_hess`. It is
+                                  reached only by
+                                  `tests/test_gpu_multitarget.mojo`.
+
+What is built here is therefore the **device derivative plane and its
+per-output scale**, tested against the scalar device path bit for bit, and
+nothing above it. Making it reachable is four further pieces of work, none of
+them in this file and none of them this lane's: a label matrix on `Dataset`,
+a `num_targets` parameter, a `train_multi_target` round loop shaped like
+`_boost_rounds_multiclass`, and a `MTMultiOutputRegressor` on the Python
+side. Until all four land, a user asking for MultiRMSE gets a name error from
+sklearn.py, which is a refusal -- the failure mode to avoid is the opposite
+one, an accepted parameter with no reader.
 """
 
-from std.gpu import block_idx, global_idx, thread_idx
+from std.gpu import block_dim, block_idx, global_idx, thread_idx
 from std.math import exp, isfinite
 from std.memory import bitcast, stack_allocation
 from max.gpu.host import DeviceBuffer, DeviceContext, HostBuffer
@@ -136,6 +243,7 @@ from .boosting import (
     MAPE,
     POISSON,
     QUANTILE,
+    SQUARED_ERROR,
     TWEEDIE,
     _POISSON_MAX_DELTA_STEP,
 )
@@ -210,6 +318,36 @@ def supports_device_objective(objective: Int) -> Bool:
     `fill_softmax_grad_hess` rather than by `_grad_hess_kernel`.
     """
     return objective_gradients_on_device(objective)
+
+
+def supports_multi_output_objective(objective: Int) -> Bool:
+    """Whether `objective` has a per-output device kernel for a multi-target
+    fit.
+
+    True for `SQUARED_ERROR` alone, which under a vector target is CatBoost's
+    MultiRMSE: the loss is separable over outputs and each output's
+    derivative is the scalar squared-error derivative at that output's raw
+    score. Every other code is False, and `fill_multi_grad_hess` **refuses**
+    it by name rather than falling through to a per-output squared error,
+    which is the failure mode this predicate exists to make impossible.
+
+    Deliberately not routed through `objective_gradients_on_device` the way
+    `supports_device_objective` is. That table answers "does this objective
+    have a closed-form per-row derivative these kernels implement", and every
+    one of its eleven codes does; the question here is the different one of
+    "is this objective *separable over a vector target*", which poisson,
+    gamma, tweedie and the rest are not -- not because their derivative is
+    hard, but because CatBoost defines no multi-target form of them and
+    mojotrees has no multi-target label to feed one. Answering the second
+    question out of the first table would silently accept ten codes nothing
+    has defined.
+
+    CatBoost's other multi-target losses (MultiLogloss, MultiCrossEntropy,
+    MultiQuantile) are absent from **both** backends, so a refusal here has
+    no `device='cpu'` fallback to point at and the error message does not
+    pretend otherwise.
+    """
+    return objective == SQUARED_ERROR
 
 
 def device_fixed_scale(total: Float64) raises -> Float32:
@@ -352,6 +490,62 @@ def _grad_hess_kernel(
         # rejects before the launch, so nothing else arrives here.
         grad[unsafe_offset=r] = w * (raw_r - y)
         hess[unsafe_offset=r] = w
+
+
+def _multi_grad_hess_kernel(
+    raw: MutPointer[Float32, MutAnyOrigin],
+    target: MutPointer[Float32, MutAnyOrigin],
+    weight: MutPointer[Float32, MutAnyOrigin],
+    grad: MutPointer[Float32, MutAnyOrigin],
+    hess: MutPointer[Float32, MutAnyOrigin],
+    n_rows: Int32,
+    n_outputs: Int32,
+    j_begin: Int32,
+    j_count: Int32,
+    weighted: Int32,
+):
+    """MultiRMSE derivatives for a contiguous run of outputs, in one launch.
+    `grid.x` tiles the rows and `grid.y` indexes the output slot, so the whole
+    (row, output-in-batch) plane is one launch.
+
+    The arithmetic per (row, output) is character for character the squared
+    error arm of `_grad_hess_kernel` -- `grad = w * (raw_r - y)`, `hess = w`,
+    in that operand order -- and there is no second definition of it: a
+    multi-target fit's `j`-th output is a scalar squared-error fit against
+    `y[:, j]`, and the only thing that differs is where the two operands live.
+
+    Only the addressing differs, and it differs on both sides, exactly as
+    `gpu_multiclass_batch._batch_softmax_grad_kernel`'s does. The reads are
+    row-major (`raw[r * n_outputs + j]`, `target[r * n_outputs + j]`, the
+    layout every consumer of a score reduces over outputs within a row in,
+    and the layout `update_raw` and `gpu_predict` already contract for) and
+    the write is class-major (`grad[slot * n_rows + r]`, the layout the
+    histogram kernels and the magnitude reduction need). This kernel is the
+    transpose, and it is the only one in a multi-target round.
+
+    No coupling term appears anywhere: output `j` reads index
+    `r * n_outputs + j` of two planes and nothing else. That is the whole
+    difference from the softmax kernel, which reads a probability whose
+    denominator summed over every class.
+    """
+    var r = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var nr = Int(n_rows)
+    if r >= nr:
+        return
+    var slot = Int(block_idx.y)
+    if slot >= Int(j_count):
+        return
+    var j = Int(j_begin) + slot
+
+    var w = Float32(1.0)
+    if weighted != 0:
+        w = weight[unsafe_offset=r][0]
+    var i = r * Int(n_outputs) + j
+    var raw_r = raw[unsafe_offset=i][0]
+    var y = target[unsafe_offset=i][0]
+    var out = slot * nr + r
+    grad[unsafe_offset=out] = w * (raw_r - y)
+    hess[unsafe_offset=out] = w
 
 
 def _softmax_prob_kernel(
@@ -820,7 +1014,14 @@ struct GpuObjectiveState(Movable):
     """
 
     var target_dev: DeviceBuffer[DType.float32]
-    """The regression target, or the integer class label for softmax."""
+    """The regression target, or the integer class label for softmax, or --
+    under `multi_output` -- the row-major target matrix
+    `y[r * n_outputs + j]`.
+
+    The one field whose length is not always `n_rows`: it is
+    `n_rows * n_classes` on a multi-target state and `n_rows` everywhere
+    else, which is why the constructor sizes it from `len(target)` rather
+    than from `self.n_rows`."""
     var weight_dev: DeviceBuffer[DType.float32]
     """Sample weights, or a one-element placeholder when unweighted:
     zero-length device buffers are not portable.
@@ -835,7 +1036,8 @@ struct GpuObjectiveState(Movable):
     """Row-major raw scores, `raw[r * n_classes + k]`."""
     var prob_dev: DeviceBuffer[DType.float32]
     """Softmax probabilities in the same layout, or a placeholder when
-    `n_classes == 1`."""
+    `n_classes == 1` and on a `multi_output` state, whose outputs are
+    uncoupled and so have nothing to normalize over."""
     var value_dev: DeviceBuffer[DType.float32]
     """The current tree's node values, the lookup table the per-leaf range
     kernel reads. It is the only kernel that still applies the learning rate
@@ -919,6 +1121,19 @@ struct GpuObjectiveState(Movable):
     var weighted: Bool
     var block_threads: Int
     var has_raw: Bool
+    var multi_output: Bool
+    """Whether this state carries a vector target (MultiRMSE) rather than a
+    scalar target or a class label.
+
+    A separate flag from `n_classes > 1` and not derivable from it, because
+    the two multi-output states have the *same* `n_classes` shape and
+    opposite meanings: on a softmax state `n_classes` counts coupled classes,
+    `target` is one label column, and `prob_dev` is live; on a multi-target
+    state `n_classes` counts uncoupled outputs, `target` is an
+    `n_rows * n_classes` matrix, and there is no probability plane at all.
+    Every method that can only serve one of the two tests this flag and
+    raises, rather than inferring an answer from the class count and
+    computing the wrong thing."""
 
     def __init__(
         out self,
@@ -927,13 +1142,28 @@ struct GpuObjectiveState(Movable):
         sample_weight: List[Float64] = [],
         n_classes: Int = 1,
         max_nodes: Int = DEFAULT_MAX_NODES,
+        multi_output: Bool = False,
     ) raises:
         """Upload the labels and weights, which never change again, and
         allocate the raw-score and scratch buffers.
 
         For softmax, `target` holds the class labels as whole numbers and
-        `n_classes` is the class count; for every other objective
-        `n_classes` is 1 and `target` is the regression target.
+        `n_classes` is the class count; for every other single-output
+        objective `n_classes` is 1 and `target` is the regression target.
+
+        Under `multi_output` (MultiRMSE), `n_classes` is the output count and
+        `target` is the row-major target matrix, `n_rows * n_classes` long,
+        with row `r`'s output `j` at `target[r * n_classes + j]` -- the same
+        layout `raw_dev` already carries, so the derivative kernel reads both
+        planes at one index. `n_rows` is then derived from the two rather
+        than being `len(target)`.
+
+        **The default is `False` and the `False` path is unchanged.** Every
+        statement below that a single-output or softmax state executes
+        computes what it computed before this parameter existed: `n_rows` is
+        `len(target)`, `target_dev` is `len(target)` == `n_rows` long,
+        `prob_dev` is live exactly when `n_classes > 1`, and the class-label
+        validation runs on exactly the states it ran on.
         """
         if len(target) < 1:
             raise Error("device objectives require at least one row")
@@ -941,12 +1171,28 @@ struct GpuObjectiveState(Movable):
             raise Error("n_classes must be positive")
         if max_nodes < 1:
             raise Error("max_nodes must be positive")
+        if multi_output:
+            if n_classes < 2:
+                raise Error(
+                    "a multi-output state needs at least two outputs; a"
+                    " one-output fit is a scalar fit and belongs on the"
+                    " ordinary single-output state"
+                )
+            if len(target) % n_classes != 0:
+                raise Error(
+                    "multi-output target length must be n_rows * n_outputs"
+                )
+        var n_rows = len(target) // n_classes if multi_output else len(target)
         if len(sample_weight) > 0:
-            _check_weight_vector(sample_weight, len(target))
+            # One weight per ROW, not per (row, output): a sample weight
+            # weights the observation, and every one of its outputs with it,
+            # which is what lets the one weight plane serve every output slot
+            # of a launch.
+            _check_weight_vector(sample_weight, n_rows)
         for r in range(len(target)):
             if not isfinite(target[r]):
                 raise Error("target must be finite")
-        if n_classes > 1:
+        if n_classes > 1 and not multi_output:
             for r in range(len(target)):
                 var label = Int(target[r])
                 if Float64(label) != target[r] or label < 0 or (
@@ -957,21 +1203,26 @@ struct GpuObjectiveState(Movable):
                         " 0..n_classes-1"
                     )
 
-        self.n_rows = len(target)
+        self.n_rows = n_rows
         self.n_classes = n_classes
         self.max_nodes = max_nodes
         self.weighted = len(sample_weight) > 0
         self.has_raw = False
+        self.multi_output = multi_output
         self.block_threads = derive_block_threads(query_device_caps(ctx))
 
         var n_scores = self.n_rows * n_classes
-        self.target_dev = ctx.enqueue_create_buffer[DType.float32](self.n_rows)
+        self.target_dev = ctx.enqueue_create_buffer[DType.float32](len(target))
         self.weight_dev = ctx.enqueue_create_buffer[DType.float32](
             self.n_rows if self.weighted else 1
         )
         self.raw_dev = ctx.enqueue_create_buffer[DType.float32](n_scores)
+        # No probability plane on a multi-target state: MultiRMSE outputs are
+        # uncoupled, so nothing ever reduces over them and the
+        # `4 * n_rows * n_outputs` a softmax state spends here would be a
+        # buffer with no reader.
         self.prob_dev = ctx.enqueue_create_buffer[DType.float32](
-            n_scores if n_classes > 1 else 1
+            n_scores if (n_classes > 1 and not multi_output) else 1
         )
         self.value_dev = ctx.enqueue_create_buffer[DType.float32](max_nodes)
         self.seg_dev = ctx.enqueue_create_buffer[DType.int32](
@@ -1009,7 +1260,7 @@ struct GpuObjectiveState(Movable):
         # ones that had to be cheap.
         with self.target_dev.map_to_host() as host:
             var dst = host.unsafe_ptr()
-            for r in range(self.n_rows):
+            for r in range(len(target)):
                 dst.unsafe_store(r, Float32(target[r]))
         if self.weighted:
             with self.weight_dev.map_to_host() as host:
@@ -1182,6 +1433,12 @@ struct GpuObjectiveState(Movable):
             )
         if not supports_device_objective(objective):
             raise Error("unknown objective code ", objective)
+        if self.multi_output:
+            raise Error(
+                "multi-output state: use fill_multi_grad_hess, which reads"
+                " one output's column of the target matrix; this call would"
+                " read the matrix as if it were a scalar target"
+            )
         if self.n_classes != 1:
             raise Error(
                 "multiclass state: use refresh_softmax and"
@@ -1211,6 +1468,12 @@ struct GpuObjectiveState(Movable):
         is where the host trainer computes them too."""
         if self.n_classes < 2:
             raise Error("refresh_softmax requires n_classes >= 2")
+        if self.multi_output:
+            raise Error(
+                "a multi-output state has no softmax coupling: MultiRMSE"
+                " outputs are independent and there is no probability plane"
+                " to refresh; use fill_multi_grad_hess"
+            )
         if not self.has_raw:
             raise Error("call init_raw before computing probabilities")
         ctx.enqueue_function[_softmax_prob_kernel](
@@ -1234,6 +1497,11 @@ struct GpuObjectiveState(Movable):
         of the round, exactly as on the host."""
         if self.n_classes < 2:
             raise Error("fill_softmax_grad_hess requires n_classes >= 2")
+        if self.multi_output:
+            raise Error(
+                "a multi-output state carries a vector target, not class"
+                " labels; use fill_multi_grad_hess"
+            )
         if k < 0 or k >= self.n_classes:
             raise Error("class index out of range")
         if not self.has_raw:
@@ -1249,6 +1517,100 @@ struct GpuObjectiveState(Movable):
             Int32(k),
             Int32(1) if self.weighted else Int32(0),
             grid_dim=self._row_blocks(),
+            block_dim=self.block_threads,
+        )
+
+    def fill_multi_grad_hess(
+        mut self,
+        ctx: DeviceContext,
+        objective: Int,
+        j_begin: Int,
+        j_count: Int,
+        mut grad_dev: DeviceBuffer[DType.float32],
+        mut hess_dev: DeviceBuffer[DType.float32],
+    ) raises:
+        """Write outputs `j_begin .. j_begin+j_count-1` of a MultiRMSE round
+        into `grad_dev` and `hess_dev`, class-major, in one launch.
+
+        Slot `c` of the destination carries output `j_begin + c` at
+        `[c * n_rows .. (c+1) * n_rows)`, so the buffers must hold at least
+        `j_count * n_rows` Float32 each. That is exactly
+        `GpuClassBatch.grad_dev`'s layout and exactly what
+        `GpuClassBatch.magnitude_sums`, `set_scales` and `scatter_slot`
+        consume, which is why a multi-target round gets its per-output
+        fixed-point scales out of the multiclass batch machinery without a
+        line of new reduction or scaling code.
+
+        Slot-to-output is `j_begin + c` and nothing reorders it, the same
+        contract `gpu_output_planes` fixes for classes, so results collected
+        by ascending slot are results in ascending output order.
+
+        What this does not do, and what the other tree shape would cost
+        ------------------------------------------------------------------
+        This serves the **K-trees-per-round** shape: output `j`'s plane is a
+        scalar gradient/hessian pair per row, and a grower consumes it as an
+        ordinary single-output tree, exactly as a class tree is grown. It
+        does not serve the vector-leaf shape, and it cannot be made to from
+        here. That shape needs two things this lane did not write and does
+        not own:
+
+        1. **A gain summed over outputs**, in `gpu_split_search.mojo`. A
+           candidate would have to score `sum_j gain(G_j, H_j)` over
+           `n_outputs` histogram planes at one split point instead of over
+           one, which changes the reduction the split kernel performs and
+           the argmax it feeds -- not the histogram accumulation, which
+           already builds one plane per slot. A concurrent lane owns that
+           expression.
+        2. **A vector leaf value**, in `tree.mojo` and `model.mojo`.
+           `Tree.value` is `List[Float64]` indexed by node id and
+           `Tree.predict_row` returns one `Float64`; a vector leaf needs a
+           second dimension on both, and every serializer, dumper and
+           predictor that reads them. The CPU campaign owns those files.
+
+        Neither is refused here as a runtime error, because neither is
+        reachable: no caller can ask for a vector leaf, since no type in
+        this codebase can hold one.
+        """
+        if not self.multi_output:
+            raise Error(
+                "fill_multi_grad_hess requires a multi-output state"
+                " (GpuObjectiveState(..., multi_output=True)); this state"
+                " carries a scalar target or class labels"
+            )
+        if objective == CUSTOM:
+            raise Error(
+                "custom objectives have no device kernel, multi-target or"
+                " otherwise; the callback is host code over host lists"
+            )
+        if not supports_multi_output_objective(objective):
+            raise Error(
+                "objective code ",
+                objective,
+                " has no multi-target device kernel; only squared error"
+                " (CatBoost MultiRMSE) is separable over a vector target"
+                " here. The other CatBoost multi-target losses"
+                " (MultiLogloss, MultiCrossEntropy, MultiQuantile) are"
+                " implemented on neither backend, so there is no"
+                " device='cpu' fallback for them to fall back to",
+            )
+        if not self.has_raw:
+            raise Error("call init_raw before filling gradients")
+        if j_count < 1:
+            raise Error("output batch size must be positive")
+        if j_begin < 0 or j_begin + j_count > self.n_classes:
+            raise Error("output batch is outside the output range")
+        ctx.enqueue_function[_multi_grad_hess_kernel](
+            self.raw_dev.unsafe_ptr(),
+            self.target_dev.unsafe_ptr(),
+            self.weight_dev.unsafe_ptr(),
+            grad_dev.unsafe_ptr(),
+            hess_dev.unsafe_ptr(),
+            Int32(self.n_rows),
+            Int32(self.n_classes),
+            Int32(j_begin),
+            Int32(j_count),
+            Int32(1) if self.weighted else Int32(0),
+            grid_dim=(self._row_blocks(), j_count),
             block_dim=self.block_threads,
         )
 
@@ -2186,7 +2548,10 @@ struct GpuLeafEstimator(Movable):
         if state.n_classes != 1:
             raise Error(
                 "leaf estimation iterations are single-output only; the"
-                " multiclass trainers refuse the setting by name"
+                " multiclass trainers refuse the setting by name, and a"
+                " multi-target state reaches this refusal through the same"
+                " test because its outputs are separate trees with separate"
+                " leaf values"
             )
         if state.n_rows != self.n_rows:
             raise Error(
