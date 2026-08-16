@@ -65,6 +65,12 @@ from a grown tree, because an internal node keeps the value it had when it was
 created.
 """
 
+from .apple_cpu_policy import (
+    BIN_LAYOUT_AUTO,
+    BIN_LAYOUT_FEATURE_MAJOR,
+    BIN_LAYOUT_ROW_MAJOR,
+    env_bin_layout,
+)
 from .binning import BinnedMatrix
 from .cegb import (
     CegbLedger,
@@ -88,8 +94,8 @@ from .efb import (
 from .histogram import (
     ConstHessianSettings,
     Histogram,
-    build_histogram_into,
-    build_histogram_subset_into_scratch,
+    build_histogram_into_scratch,
+    build_histogram_subset_by_layout_into_scratch,
     subtract_histogram_into,
 )
 from .parallel import (
@@ -1398,9 +1404,15 @@ struct GrowScratch(Movable):
       times and paid the first-few-nodes cost 100 times. Held here, one pool
       serves a whole fit.
     - `pairs`, the gradient/hessian gather buffer
-      `histogram.build_histogram_subset_into_scratch` fills. The non-scratch
-      form allocates and frees it per node, which its own docstring says a
-      grower should not do.
+      `histogram.build_histogram_subset_into_scratch` fills, and behind it
+      the row-blocked kernel's private histograms. The non-scratch form
+      allocates and frees it per node, which its own docstring says a grower
+      should not do. `_hist_full` takes the same list for the root build,
+      where there is no gather and the partials sit at offset 0; that build
+      is reached once per tree and its share of this buffer is the whole
+      `apple_cpu_policy.MAX_ROW_BLOCK_SCRATCH_BYTES` budget at a large fit,
+      so holding it here is one allocation and one page-fault pass per fit
+      instead of one per tree.
 
     Neither buffer carries meaning between uses. A pooled histogram's
     contents are undefined on `take` and every `_into` builder writes every
@@ -1411,19 +1423,49 @@ struct GrowScratch(Movable):
     fit that shares one scratch produces the tree a fit that allocated a
     fresh one produces, cell for cell.
 
+    Two snapshots live here beside them, `settings` and `bin_layout`. Both
+    are environment reads hoisted out of the per-node path: without them a
+    grower re-reads `getenv` and re-derives the same answer once per node for
+    a decision the fit made before its first tree. Neither can move a cell --
+    one is a task count, the other is which array a bin id is loaded from.
+
     `prepare` makes a scratch safe to hand to a different matrix. It rebuilds
     the pool when the histogram shape changes, so the free list can never
     hold buffers of a shape the new data would misread. `pairs` needs no such
-    check: it is sized by row count alone and only grows.
+    check: it is sized by row count alone and only grows, and neither snapshot
+    depends on the shape.
     """
 
     var pool: _HistPool
     var pairs: List[Float64]
     var settings: DispatchSettings
+    var bin_layout: Int
 
     def __init__(out self, n_features: Int, n_bins: Int) raises:
         self.pool = _HistPool(n_features, n_bins)
         self.pairs = List[Float64]()
+        # Which copy of the bin ids the node builds read, resolved here for
+        # the same reason `settings` is: `MOJOTREES_CPU_BIN_LAYOUT` is read
+        # once per scratch instead of once per node, and the per-node call
+        # then compares two Ints.
+        #
+        # `auto` becomes row-major rather than feature-major, and that is the
+        # grower's decision to make rather than `resolve_bin_layout`'s: the
+        # policy function answers "which layouts are available", and AUTO is
+        # its way of saying "the caller has not chosen", which is exactly the
+        # question this line answers. It costs nothing when the view does not
+        # exist -- `build_histogram_subset_by_layout_into_scratch` degrades to
+        # feature-major and reports it -- so on today's default
+        # (`binning.env_row_major_bins` off) this line changes nothing at all
+        # and the whole row-major path turns on with one environment
+        # variable instead of with a code change.
+        #
+        # `MOJOTREES_CPU_BIN_LAYOUT=feature` is the off switch and reproduces
+        # the accumulation that shipped, which is what a bisection wants.
+        var requested = env_bin_layout()
+        self.bin_layout = (
+            BIN_LAYOUT_ROW_MAJOR if requested == BIN_LAYOUT_AUTO else requested
+        )
         # The scheduling environment, read once here and then never again for
         # the life of this scratch. Every dispatch the grower makes -- the
         # histogram builds, the sibling subtractions, the split scans -- takes
@@ -1621,6 +1663,7 @@ def _expand_bundled(
 def _hist_full(
     mut hist: Histogram,
     mut scratch: Histogram,
+    mut pairs: List[Float64],
     data: BinnedMatrix,
     bundled: BundledMatrix,
     grad: List[Float64],
@@ -1655,16 +1698,36 @@ def _hist_full(
     the count before the builder returns, so `scratch` holds three complete
     planes by the time `_expand_bundled` reads it and the expansion sees
     exactly what it would have seen on the three-plane path.
+
+    `pairs` is the grower's scratch list, the same one `_hist_subset` hands
+    to the subset builder, and here it carries only the row-blocked kernel's
+    private histograms -- the whole-dataset builder reads its derivatives
+    sequentially and never gathers, so the `[0, n_sub)` prefix that
+    `_hist_subset` reserves for the gather has no counterpart on this path
+    and the partials start at offset 0. `build_histogram_into` is this call
+    with a fresh empty list in its place: it allocated
+    `plan.block_scratch_floats()` Float64 -- the whole
+    `MAX_ROW_BLOCK_SCRATCH_BYTES` budget at the root of a large fit -- and
+    zero-filled it once per tree, then freed it.
+
+    Nothing reads the zero fill. `_accumulate_blocked_at` zeroes each
+    `(block, group)` unit's private slice as the first thing that unit does,
+    and the fold reads only slices that pass zeroed, so the buffer's contents
+    on entry are irrelevant exactly as they are for `_hist_subset`. That is
+    the same contract `build_histogram_into_scratch` documents and the same
+    one the subset builder has relied on since the grower started holding
+    this list across nodes; the histogram that comes out is the one the
+    allocating form produced, cell for cell.
     """
     if not bundled.active:
-        build_histogram_into(
-            hist, data, grad, hess, features, const_hessian, settings,
+        build_histogram_into_scratch(
+            hist, pairs, data, grad, hess, features, const_hessian, settings,
             const_hessian_env,
         )
         return
-    build_histogram_into(
-        scratch, bundled.data, grad, hess, columns, const_hessian, settings,
-        const_hessian_env,
+    build_histogram_into_scratch(
+        scratch, pairs, bundled.data, grad, hess, columns, const_hessian,
+        settings, const_hessian_env,
     )
     _expand_bundled(hist, scratch, bundled, features)
 
@@ -1685,6 +1748,7 @@ def _hist_subset(
     const_hessian: Bool = False,
     settings: DispatchSettings = DispatchSettings.unresolved(),
     const_hessian_env: ConstHessianSettings = ConstHessianSettings.unresolved(),
+    layout: Int = BIN_LAYOUT_FEATURE_MAJOR,
 ) raises:
     """`_hist_full` for a row subset. Row ids index the original matrix and the
     bundled one identically, because bundling rearranges columns and never
@@ -1704,16 +1768,35 @@ def _hist_subset(
     it is set or not, and setting it wrongly produces a wrong hessian plane, so
     it has to come from the objective at the trainer rather than be guessed
     anywhere on this path.
+
+    `layout` is which copy of the bin ids the inner loop loads from --
+    `apple_cpu_policy.BIN_LAYOUT_FEATURE_MAJOR` is the column-wise matrix that
+    has always been there, `BIN_LAYOUT_ROW_MAJOR` is
+    `BinnedMatrix.build_row_major`'s record array. It is a **scheduling**
+    argument and cannot change a cell: both kernels take the same plan from
+    `_plan_accumulation`, visit the same rows in the same order, and add the
+    same Float64 into the same cell. Only the address the bin id comes from
+    differs, which is what `tests/test_row_major_bins.mojo` asserts to the bit
+    and `tests/test_grow_bin_layout.mojo` asserts again through a whole grown
+    tree.
+
+    A request for the row-major layout on a matrix that has no view degrades
+    to feature-major inside `build_histogram_subset_by_layout_into_scratch`
+    and says so in its return value, which is why this can be the grower's
+    default while `binning.env_row_major_bins` decides separately whether the
+    view is worth its memory. The bundled arm degrades for exactly that
+    reason: `efb` assembles `bundled.data` itself and never builds a view on
+    it, so bundling stays on the layout it always ran.
     """
     if not bundled.active:
-        build_histogram_subset_into_scratch(
-            hist, pairs, data, grad, hess, rows, start, count, features,
-            const_hessian, settings, const_hessian_env,
+        _ = build_histogram_subset_by_layout_into_scratch(
+            hist, pairs, data, grad, hess, rows, start, count, layout,
+            features, const_hessian, settings, const_hessian_env,
         )
         return
-    build_histogram_subset_into_scratch(
-        scratch, pairs, bundled.data, grad, hess, rows, start, count, columns,
-        const_hessian, settings, const_hessian_env,
+    _ = build_histogram_subset_by_layout_into_scratch(
+        scratch, pairs, bundled.data, grad, hess, rows, start, count, layout,
+        columns, const_hessian, settings, const_hessian_env,
     )
     _expand_bundled(hist, scratch, bundled, features)
 
@@ -2104,7 +2187,7 @@ def _grow_oblivious_levels(
                         left_hist, bundle_scratch, scratch.pairs, data,
                         bundling, grad, hess, left_rows, 0, len(left_rows),
                         tree_features, tree_columns, const_hessian,
-                        scratch.settings, const_h_env,
+                        scratch.settings, const_h_env, scratch.bin_layout,
                     )
                     profile.note_node()
                     profile.charge(
@@ -2135,6 +2218,7 @@ def _grow_oblivious_levels(
                     right_hist, bundle_scratch, scratch.pairs, data, bundling,
                     grad, hess, right_rows, 0, len(right_rows), tree_features,
                     tree_columns, const_hessian, scratch.settings, const_h_env,
+                    scratch.bin_layout,
                 )
                 profile.note_node()
                 profile.charge(
@@ -2812,9 +2896,9 @@ def grow_tree_leaves_profiled(
         )
         var root_hist_started = profile.clock()
         _hist_full(
-            root_hist, bundle_scratch, data, bundling, grad, hess,
-            tree_features, tree_columns, const_hessian, scratch.settings,
-            const_h_env,
+            root_hist, bundle_scratch, scratch.pairs, data, bundling, grad,
+            hess, tree_features, tree_columns, const_hessian,
+            scratch.settings, const_h_env,
         )
         profile.note_node()
         profile.charge(
@@ -2842,7 +2926,7 @@ def grow_tree_leaves_profiled(
         _hist_subset(
             root_hist, bundle_scratch, scratch.pairs, data, bundling, grad,
             hess, bag, 0, len(bag), tree_features, tree_columns,
-            const_hessian, scratch.settings, const_h_env,
+            const_hessian, scratch.settings, const_h_env, scratch.bin_layout,
         )
         profile.note_node()
         profile.charge(
@@ -3149,7 +3233,7 @@ def grow_tree_leaves_profiled(
                 left_hist, bundle_scratch, scratch.pairs, data, bundling,
                 grad, hess, left_rows, 0, len(left_rows), tree_features,
                 tree_columns, const_hessian, scratch.settings,
-                const_h_env,
+                const_h_env, scratch.bin_layout,
             )
             profile.note_node()
             profile.charge(
@@ -3183,7 +3267,7 @@ def grow_tree_leaves_profiled(
                 right_hist, bundle_scratch, scratch.pairs, data, bundling,
                 grad, hess, right_rows, 0, len(right_rows), tree_features,
                 tree_columns, const_hessian, scratch.settings,
-                const_h_env,
+                const_h_env, scratch.bin_layout,
             )
             profile.note_node()
             profile.charge(
