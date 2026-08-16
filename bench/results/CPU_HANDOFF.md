@@ -291,6 +291,34 @@ there is a defect we are not copying.
   numerical configuration, which is worse than either arm. No bits moved:
   `widened(False)` is asserted identity on all four fields.
 
+## The unreachable list, as the tool prints it today
+
+`tools/connectivity_audit.py` at `7e41e16` prints **eleven**, and a second
+session's independent walk produced the same eleven with no differences. The
+"13 of 107" this file used to carry was stale. Any count written into a
+document goes stale fast: `INTEGRATION_INVENTORY.md` records this list climbing
+from two orphans to five and then to eleven inside about half an hour. **Quote
+the tool, not a document, and re-run it after the last edit.**
+
+Two are EXPERIMENTAL and unwired on purpose: `backend` (a dispatch shim the
+CPU/GPU equivalence test compares against) and `gpu_vendor_policy` (CUDA/HIP
+occupancy, waiting on a discrete-GPU trainer).
+
+Nine are PENDING, and they are **not nine independent jobs**:
+
+- `target_matrix` is the head of a chain, and **one edge closes three**. Its
+  own docstring says it is the finding rather than the fix: every training
+  entry point takes a single target column, and both `multi_target`
+  (MultiRMSE) and `survival` (Cox, SurvivalAft) are blocked on exactly that.
+  So the 2-D `y` job is not a MultiRMSE job, it is the label contract.
+- `text_processing` is the tail of `text_features`, not a separate decision:
+  one edge for two modules.
+- `embedding` needs the ingestion path to accept a raw embedding column.
+- `langevin` needs the boosting loop to draw the noise and apply the shrinkage.
+- `onnx_export` needs a binding registered, and is the cheapest of these.
+- `catboost_ranking` is a trainer-selection question, routed with the
+  objective codes.
+
 ## THE STANDING RULE OF THIS ROUND: BUILT IS NOT REACHED
 
 Measured on `perf-round-2`, 2026-08-16, by counting importers in `src/` and

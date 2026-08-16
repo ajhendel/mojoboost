@@ -172,7 +172,12 @@ def test_plane_entries_stay_under_the_derived_bound() raises:
 def test_plane_entries_are_logarithmic_in_rung_count() raises:
     """`K` grows like `log_m(n / b_0)`; the entry count does not grow like
     `K * n`. At 1e6 with the defaults there are 14 rungs and 2 638 200
-    entries, which is 2.64n and not 14n."""
+    entries, which is 2.64n and not 14n.
+
+    **A point value, not the rule.** The ratio sawtooths toward `3n` just
+    before each rung; `test_plane_entries_stay_under_the_derived_bound` is the
+    test that carries the actual bound. Do not size a buffer from the 2.64
+    here: at `n = 204 801` the count is `614 201`, or `2.9990n`."""
     var ladder = fold_ladder(1000000, MULT)
     assert_equal(n_rungs(ladder), 14)
     assert_equal(ordered_plane_entries(1000000, MULT, 1), 2638200)

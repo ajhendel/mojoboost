@@ -70,6 +70,18 @@ its own line is the top rung, whose plane covers every row; the geometric tail
 below it is what would be `2n` if `n` landed exactly on the ladder, and the
 truncated top step is why the honest bound is 3 and not 2. At `n = 1e6` with
 the defaults the exact count is `2 638 200`, or `2.64n`.
+
+**`2.64n` IS THE VALUE AT ONE MILLION AND IS NOT A SIZING RULE.** The ratio
+sawtooths: it is lowest just after `n` crosses a rung and climbs back toward
+`3n` just before the next one. Checked by enumeration over `n` in
+`[600, 400000]`, the worst case in that range is `n = 204 801`, where the
+count is `614 201`, or `2.9990n`; the values one past the neighbouring rungs
+are `2.998` at `102 401` and `2.9995` at `409 601`. Row counts one past a rung
+are dense in `n`, so a buffer sized at `2.64n` is not conservative anywhere
+except near one million and **overruns by 13.6 percent at `n = 204 801`**. Any
+consumer sizing a buffer takes `n * (2m - 1) / (m - 1)`, or calls
+`ordered_plane_entries` for the exact count. This paragraph exists because a
+device-side sizing boundary read the worked example as the rule.
 `ordered_plane_entries` computes it; the closed form above is the bound. Both
 are derived, neither is measured. `K` itself is logarithmic:
 

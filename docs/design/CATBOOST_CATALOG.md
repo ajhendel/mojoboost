@@ -3315,6 +3315,19 @@ A strict `3n`, independent of `K`. The exact count at `n = 1e6` with the
 defaults is **2 638 200 entries, or 2.64n** -- not 14n.
 `ordered_boosting.ordered_plane_entries` computes it. Derived, not measured.
 
+**`2.64n` is the value at one million and is not a sizing rule**, and a
+device-side sizing boundary read it as one, which is how this warning got
+written. The ratio sawtooths: lowest just after `n` crosses a rung, climbing
+back toward `3n` just before the next. Checked by enumeration over `n` in
+`[600, 400000]`, the worst case there is `n = 204 801` at `614 201` entries,
+or **`2.9990n`**, with `2.998` at `102 401` and `2.9995` at `409 601`. Row
+counts one past a rung are dense in `n`, so `2.64n` is conservative nowhere
+except near one million and overruns by **13.6 percent at `n = 204 801`**.
+Size from `n * (2m - 1) / (m - 1)` or from `ordered_plane_entries`. The strict
+bound was always what `ordered_boosting.mojo` derived and what
+`test_plane_entries_stay_under_the_derived_bound` asserted; the worked example
+sitting beside it is what got quoted.
+
 In bytes, per permutation, at `n = 1e6`: 21.1 MB of `Float64` on the host;
 10.6 MB on a device staging derivatives at Int16 and 21.1 MB at Int32. At
 CatBoost's three learning permutations that is 31.7 MB / 63.3 MB.
@@ -3323,7 +3336,7 @@ CatBoost is worse than this by a factor of three, because `BuildDynamicFold`
 allocates `Approx`, `WeightedDerivatives` **and** `SampleWeightedDerivatives`
 at `TailFinish` per rung per dimension. Ours keeps one plane per rung (the raw
 score) and recomputes derivatives into a shared scratch buffer, because a
-derivative is cheaper to recompute than to store `2.64n` of.
+derivative is cheaper to recompute than to store up to `3n` of.
 
 #### 4. What we built, and the three places it diverges
 
