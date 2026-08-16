@@ -485,7 +485,7 @@ def _cpu_level(
 
 
 def test_the_level_still_costs_two_launches_and_the_census_is_unmoved() raises:
-    # 500 trees of 6 levels is the shape the shipped default will run, so the
+    # 360 trees of 6 levels is the shape the shipped default will run, so the
     # cross-leaf accumulation had to fit inside the launch the scan already
     # makes. It does: a second accumulator beside the first, in the same leaf
     # loop of the same kernel. Depth 6 is 62 command buffers per tree fused
