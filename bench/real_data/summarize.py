@@ -54,6 +54,7 @@ clean. The timestamp that matters is the run's own.
 import argparse
 import glob
 import json
+import re
 import math
 import os
 import sys
@@ -644,6 +645,33 @@ def build_device_agreement(ok_records, project_engine):
     return out
 
 
+_LOCAL_PATH = re.compile(r"/(?:Users|home)/[^\"\s,\]]+")
+
+
+def redact_local(value):
+    """Strip machine-local paths and the hostname from anything committed.
+
+    These summaries go into version control in a public repository, and the
+    provenance they carry is the run's identity rather than the operator's
+    filesystem. A home directory path and a hostname identify a person and a
+    machine and settle nothing a reader of this file needs settled, so they
+    are replaced rather than kept.
+
+    Redaction happens here rather than as a pass over the written file so that
+    it cannot be forgotten. A summary is a pure function of its run directory,
+    and that has to stay true of the redacted form too, or regenerating a
+    committed summary would produce a diff.
+    """
+    if isinstance(value, str):
+        out = _LOCAL_PATH.sub("<redacted-local-path>", value)
+        return "<redacted-hostname>" if out == "Mac" else out
+    if isinstance(value, list):
+        return [redact_local(v) for v in value]
+    if isinstance(value, dict):
+        return {k: redact_local(v) for k, v in value.items()}
+    return value
+
+
 def build_environment(manifest, records):
     """The machine, the toolchain, and whether every record agrees on them.
 
@@ -752,7 +780,9 @@ def summarize(run_dir, allow_incomplete=False):
     }
     payload["flags"] = build_flags(payload)
     payload["notes"] = _referenced_notes(payload)
-    return payload
+    # Redacted at the boundary, so nothing machine-local can reach a
+    # committed file however the blocks above are later extended.
+    return redact_local(payload)
 
 
 def build_flags(payload):

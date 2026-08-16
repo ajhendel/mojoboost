@@ -38,7 +38,7 @@
       "repeats": 3,
       "predict_repeats": 3,
       "timeout": 7200,
-      "out": "/Users/andrewhendel/CascadeProjects/mojoboost/bench/real_data/results",
+      "out": "<redacted-local-path>",
       "tag": "",
       "allow_unpinned": false,
       "no_data_digest": false,
@@ -66,7 +66,7 @@
   "environment": {
     "run": {
       "collected_at_utc": "2026-08-15T01:48:42Z",
-      "hostname": "Mac",
+      "hostname": "<redacted-hostname>",
       "platform": "macOS-26.5.2-arm64-arm-64bit-Mach-O",
       "cpu": {
         "arch": "arm64",
@@ -126,7 +126,7 @@
     },
     "comparable_keys_across_records": [
       {
-        "hostname": "Mac",
+        "hostname": "<redacted-hostname>",
         "arch": "arm64",
         "cpu_model": "Apple M4",
         "mojo": "Mojo 1.0.0 (ed45d567)",
@@ -134,7 +134,7 @@
         "git_commit": "280f68e5c7fdf97bfcb1d32edbbb5a7d34ffdaa9"
       },
       {
-        "hostname": "Mac",
+        "hostname": "<redacted-hostname>",
         "arch": "arm64",
         "cpu_model": "Apple M4",
         "mojo": "Mojo 1.0.0 (ed45d567)",
@@ -142,7 +142,7 @@
         "git_commit": "6a957f957757e5156ba0582cb105a335965da2df"
       },
       {
-        "hostname": "Mac",
+        "hostname": "<redacted-hostname>",
         "arch": "arm64",
         "cpu_model": "Apple M4",
         "mojo": "Mojo 1.0.0 (ed45d567)",
@@ -150,7 +150,7 @@
         "git_commit": "3f9fbbf2b5197b67e64065c5e8a91977cf315f0e"
       },
       {
-        "hostname": "Mac",
+        "hostname": "<redacted-hostname>",
         "arch": "arm64",
         "cpu_model": "Apple M4",
         "mojo": "Mojo 1.0.0 (ed45d567)",
@@ -158,7 +158,7 @@
         "git_commit": "8edf9a819330f22c8c94d94be672211cf485251c"
       },
       {
-        "hostname": "Mac",
+        "hostname": "<redacted-hostname>",
         "arch": "arm64",
         "cpu_model": "Apple M4",
         "mojo": "Mojo 1.0.0 (ed45d567)",

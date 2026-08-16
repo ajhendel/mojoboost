@@ -38,7 +38,7 @@
       "repeats": 3,
       "predict_repeats": 3,
       "timeout": 7200,
-      "out": "/Users/andrewhendel/CascadeProjects/mojoboost/bench/real_data/results",
+      "out": "<redacted-local-path>",
       "tag": "",
       "allow_unpinned": false,
       "no_data_digest": false,
@@ -66,7 +66,7 @@
   "environment": {
     "run": {
       "collected_at_utc": "2026-08-15T02:31:23Z",
-      "hostname": "Mac",
+      "hostname": "<redacted-hostname>",
       "platform": "macOS-26.5.2-arm64-arm-64bit-Mach-O",
       "cpu": {
         "arch": "arm64",
@@ -126,7 +126,7 @@
     },
     "comparable_keys_across_records": [
       {
-        "hostname": "Mac",
+        "hostname": "<redacted-hostname>",
         "arch": "arm64",
         "cpu_model": "Apple M4",
         "mojo": "Mojo 1.0.0 (ed45d567)",
