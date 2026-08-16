@@ -977,3 +977,72 @@ mislabels every session afterwards in a form that reads as data.
 And per A4: **this has never been run in anger.** The probe constants were
 sized from an estimate, no baseline exists, and no session has yet carried a
 canary line. Treat it as suspect until someone does.
+
+---
+
+# The build/gate rule, 2026-08-16. Supersedes every size threshold in every brief.
+
+This replaces the ~2 percent floor, every "small, not worth it" verdict, and
+every estimate-based decision not to build. **Nothing is dropped for being
+small.**
+
+1. **Strictly-less-work-and-exact changes get BUILT with no measurement gate**,
+   largest first. Fewer bytes, trips, launches, atomics, allocations; same
+   result. **The wave window measures them; it does not gate them.**
+2. **Trades ship behind a switch and are A/B'd before becoming default.** Task
+   and tile counts, floors, group widths, layouts -- anything that *moves* work
+   rather than removing it.
+3. **Bit-moving changes take the real-data gate** against stock+det.
+4. **Items close ONLY when proven zero or impossible**, with the evidence
+   recorded. An estimate is not a proof and an author's own expectation is not a
+   proof.
+
+## What this reopens on the GPU side, and what stays shut
+
+Reopened, with the category:
+
+- **trip-count** (1) -- running now. Note the target rescaled: a trip is
+  **measured** at 202 us, not the 458 us derived, so 200 trips to ~10 is worth
+  about **0.038 seconds**, not 0.09.
+- **atomic-halving** (1 where the per-node bound holds) -- after the
+  decomposition probe, only because it shares kernel bodies with whatever that
+  probe selects. **See the correction below: half of it already exists.**
+- **ellpack-bins** (1) -- after the CPU per-feature-width spec, regardless of the
+  gather fraction.
+- **row-tiles DOWN, the 1-tile arm** (2) -- never tested in that direction; in
+  the window.
+- **feature_group 4** (2) -- group 2 over 1 measured at 1.17x, group 4 unmeasured;
+  switch exists; in the window.
+- **K1 item 1, index-width narrowing** (1) -- its author called it an expected
+  null *on reasoning*, which rule 4 says is not proof. Already built as
+  `set_narrow_index` and already an arm, so it is in the window with no new work.
+
+Still closed **with evidence**: `DeviceGraph` on Metal; device row-major bins at
+256 bins (reopens only if the decomposition shows the gather under ~10 percent);
+K >= 2 speculation; feature-blocked layout at group 1; CPU fallback for wide
+features; and the thirteen async pinned copies, which are **proven zero** -- they
+never waited, so removing them could not have bought anything.
+
+## Correction: half of atomic-halving is already built and shipping
+
+`_hist_rows_step` carries a comptime `CELIDE` parameter, and under it **the
+hessian atomic is already skipped**: the inner loop issues `sg` and `sc` and not
+`sh`, and `hist_planes` is 2 rather than 3.
+
+So on any round with a constant hessian -- which includes **unweighted non-GOSS
+squared error, the objective every headline figure here uses** -- the kernel
+already pays **two shared atomics per (row, feature), not three.**
+
+Two consequences that must travel with the atomic-fraction number:
+
+- **The measured 9.8 percent is the cost of TWO atomics, not three.** Every
+  statement of the form "the three shared atomics" in this campaign's lane
+  reports, including K3's and the bin-layout lane's, is describing the
+  weighted/logistic path rather than the measured one.
+- **What is left of atomic-halving is the packed grad+hess variant only**, taking
+  two atomics to one. Against a measured 9.8 percent for two, the remaining prize
+  is bounded near **5 percent** of the histogram phase, and it is bounded by
+  whether the per-node bound holds often enough to select the narrow variant.
+
+That does not close it -- rule 1 says build it -- but it prices it honestly
+before anyone builds, which is the point of writing the bound down first.
