@@ -737,6 +737,191 @@ class MojoTreesCatBoostModeEngine(MojoTreesEngine):
         return self
 
 
+#: The name a re-encoded part carries in `worker.describe`'s `encoding`
+#: block. One constant, so a reader grepping for it finds the encoder, the
+#: record field and the scenario table entry that argues for it.
+CATBOOST_CATEGORICAL_FORM = "mixed_frame_int64_categorical"
+
+
+def _catboost_categorical_frame(part, cat_indices, form=CATBOOST_CATEGORICAL_FORM):
+    """(frame, report). The canonical float64 matrix re-encoded so that
+    CatBoost will accept `cat_features` over it, plus the proof that the
+    re-encoding did not change a value.
+
+    **Why this exists at all.** `catboost/core.py` refuses `cat_features`
+    on a floating-point array by dtype and not by content:
+
+        if (data.dtype.kind == 'f') and (cat_features is not None) \\
+                and (len(cat_features) > 0):
+            raise CatBoostError("'data' is numpy array of floating point
+            numerical type, it means no categorical features, ...")
+
+    read at catboost 1.2.10, core.py:804. The check is on `dtype.kind`, so
+    it is not a check about the values and no value the harness could put in
+    a float64 array passes it. The array has to change type, and only the
+    categorical block can: the numeric columns are genuinely real-valued.
+    That forces a MIXED container, which numpy does not have and pandas
+    does, which is why this returns a DataFrame.
+
+    **What is checked before anything is built.** Every declared categorical
+    column must be finite and integral and inside int64, and the round trip
+    `float64 -> int64 -> float64` must be BITWISE equal to the column it
+    started from. All four hold for every categorical column any generator
+    or loader in this harness produces, because they are integer codes; none
+    of them is assumed. A column that fails any of them raises, and the
+    important case is the first: a NaN fails `isfinite`, so
+    `categorical_missing` cannot reach CatBoost through this function even
+    if somebody flips its entry in `CATBOOST_SCENARIO_SUPPORT`. That is
+    deliberate and `scenarios.CATBOOST_CATEGORICAL_ENCODING` carries the
+    argument for why a missing category is not re-encodable rather than
+    merely inconvenient.
+
+    **What the report proves.** Column checks establish that each column
+    survived. They do not establish that the FRAME holds the canonical
+    matrix, which is a different claim and the one that matters: a mistake
+    in column order, in a name, in a dtype or in the numeric passthrough
+    would pass every column check. So the report also carries
+    `canonical_digest_recomputed`: the canonical form reassembled out of the
+    finished frame and hashed by `measure.canonical_digest`, which is the
+    same function `worker.data_digest` calls and not a second one that
+    looks like it. `worker.apply_encoding_report` compares it with the
+    canonical digest and writes the verdict into the record. That is the
+    whole digest argument, run per record instead of asserted here.
+
+    Column names are `f{index}`, derived from `range(n_features)`. They are
+    positional on purpose: `cat_features` stays a list of indices, the
+    frame's column order IS the feature order, and nothing about the layout
+    depends on a dict's iteration order or on a thread count.
+    """
+    x = part["X"]
+    if hasattr(x, "tocsc"):
+        raise EngineError(
+            "the CatBoost arm cannot take categorical features on a sparse "
+            "matrix. catboost/core.py refuses cat_features on a "
+            "floating-point scipy.sparse.spmatrix by the same dtype rule it "
+            "refuses a float ndarray by, and no scenario in this suite is "
+            "both sparse and categorical"
+        )
+    try:
+        import pandas as pd
+    except ImportError as exc:
+        raise EngineError(
+            "the CatBoost arm needs pandas to hand CatBoost a mixed "
+            "float-and-integer frame, because numpy has no mixed dtype and "
+            "an object array of one million rows is not a container this "
+            "harness will build. Install pandas in the bench environment or "
+            "this scenario has no CatBoost row: " + str(exc)
+        ) from exc
+
+    n_rows, n_features = int(x.shape[0]), int(x.shape[1])
+    cat = sorted({int(j) for j in cat_indices})
+    for j in cat:
+        if not 0 <= j < n_features:
+            raise EngineError(
+                f"categorical feature index {j} is outside the matrix's "
+                f"{n_features} columns"
+            )
+
+    columns, checked = {}, []
+    for j in range(n_features):
+        column = np.ascontiguousarray(x[:, j], dtype=np.float64)
+        if j not in cat:
+            columns[f"f{j}"] = column
+            continue
+        finite = bool(np.isfinite(column).all())
+        if not finite:
+            n_missing = int((~np.isfinite(column)).sum())
+            raise EngineError(
+                f"declared categorical column {j} holds {n_missing} value(s) "
+                "that are not finite, and CatBoost has no representation for "
+                "a missing category. Its own message is \"cat_features must "
+                "be integer or string, real number values and NaN values "
+                "should be converted to string\", and converting one is a "
+                "modelling decision the harness is not allowed to make "
+                "silently: see scenarios.CATBOOST_CATEGORICAL_ENCODING"
+                "['missing_categories']"
+            )
+        if not bool(np.array_equal(column, np.floor(column))):
+            raise EngineError(
+                f"declared categorical column {j} holds non-integral values, "
+                "so it is not an integer-coded category column and CatBoost "
+                "would be handed a rounded copy of it"
+            )
+        lo, hi = float(column.min()), float(column.max())
+        if lo < np.iinfo(np.int64).min or hi > np.iinfo(np.int64).max:
+            raise EngineError(
+                f"declared categorical column {j} does not fit in int64 "
+                f"({lo} .. {hi})"
+            )
+        codes = column.astype(np.int64)
+        # The round trip, bitwise. `array_equal` on two float64 arrays with
+        # no NaN in either is bit equality, and the `isfinite` gate above is
+        # what makes that true rather than nearly true.
+        if not bool(np.array_equal(codes.astype(np.float64), column)):
+            raise EngineError(
+                f"declared categorical column {j} does not survive "
+                "float64 -> int64 -> float64, so the integer encoding is "
+                "not the same data"
+            )
+        columns[f"f{j}"] = codes
+        checked.append(j)
+
+    frame = pd.DataFrame(columns, columns=[f"f{j}" for j in range(n_features)])
+    # The canonical form REASSEMBLED from what CatBoost is about to be
+    # handed: the matrix read back out of the finished frame, and the label
+    # exactly as it goes to `Pool(label=...)`, which is not re-encoded at
+    # all. Read out of the frame rather than out of the arrays that built it
+    # so the digest is evidence about the container, which is where a
+    # mistake in column order, in a name or in a dtype would live and where
+    # a per-column check cannot see one.
+    rebuilt = np.ascontiguousarray(frame.to_numpy(dtype=np.float64))
+    recomputed = measure.canonical_digest(
+        rebuilt, part["y"], part.get("group")
+    )
+    del rebuilt
+
+    report = {
+        "form": form,
+        "container": "pandas.DataFrame",
+        "pandas_version": pd.__version__,
+        "categorical_columns": list(checked),
+        "categorical_dtype": "int64",
+        "numeric_dtype": "float64",
+        "canonical_digest_recomputed": recomputed,
+        "proof": {
+            "rows": n_rows,
+            "features": n_features,
+            "columns_round_tripped": len(checked),
+            "round_trip_bitwise_equal": True,
+            "finite": True,
+            "integral": True,
+            "checked": (
+                "per column, in this run, before the frame was built: "
+                "finite, integral, inside int64, and bitwise equal after "
+                "float64 -> int64 -> float64. Then the whole frame was read "
+                "back as float64, put beside the label exactly as Pool takes "
+                "it, and hashed by measure.canonical_digest -- the same "
+                "function worker.data_digest calls"
+            ),
+        },
+        "why": (
+            "catboost/core.py:804 refuses cat_features on a floating-point "
+            "ndarray by dtype.kind, so no float64 array carries a "
+            "categorical block however its values are coded. The numeric "
+            "columns are real-valued and cannot become integers, so the "
+            "container has to be mixed and numpy has no mixed dtype"
+        ),
+        "cost": (
+            "a full extra copy of the matrix in the frame, plus a second "
+            "transient copy for the reconstruction that is freed before the "
+            "fit. peak_rss_bytes on a categorical CatBoost row therefore "
+            "includes work the other two arms do not do, and it is a "
+            "harness-conversion cost rather than a property of CatBoost"
+        ),
+    }
+    return frame, report
+
+
 class CatBoostEngine:
     """The CatBoost peer arm, reported beside the comparator.
 
@@ -884,19 +1069,54 @@ class CatBoostEngine:
             raise EngineError(
                 f"the CatBoost peer arm does not run {spec['id']}: {reason}"
             )
-        if train.get("categorical_feature"):
-            # Never reached from the scenario table, and refused anyway. The
-            # harness hands every engine one float64 matrix, and CatBoost
-            # rejects cat_features on a floating-point array; converting a
-            # copy for CatBoost alone would break the data digest that makes
-            # the three records comparable in the first place.
-            raise EngineError(
-                "this scenario declares categorical features and the "
-                "CatBoost arm cannot take them from the harness's float64 "
-                "matrix: "
-                + str(scenarios.CATBOOST_SCENARIO_SUPPORT.get(
-                    "categorical_missing"
-                ))
+        # The categorical block, if the scenario declares one.
+        #
+        # This used to be a blanket refusal, on the grounds that converting a
+        # copy for CatBoost alone would break the data digest. That was the
+        # right instinct and the wrong conclusion. The digest's job is to
+        # prove the arms saw the same PROBLEM, and a re-encoding that is a
+        # verified bijection on the values leaves the problem alone; what it
+        # changes is the container. So the canonical digest is untouched and
+        # unexempted, the re-encoding proves itself by reconstructing the
+        # canonical matrix and hashing it back, and the record carries both
+        # numbers. `_catboost_categorical_frame` is the encoder and
+        # `scenarios.CATBOOST_CATEGORICAL_ENCODING` is the argument.
+        #
+        # The encoder refuses a column it cannot re-encode rather than
+        # coercing it, which is what keeps `categorical_missing` out: a
+        # missing category has no integer and no string that means absence
+        # to CatBoost the way bin 0 means it to the other two.
+        cat_indices = list(train.get("categorical_feature") or ())
+        encoding_report = None
+        encode = None
+        train_matrix, test_matrix = train["X"], test["X"]
+        if cat_indices:
+            def _encode():
+                tr, tr_report = _catboost_categorical_frame(train, cat_indices)
+                te, te_report = _catboost_categorical_frame(test, cat_indices)
+                return tr, te, tr_report, te_report
+
+            # Timed, because it is real work CatBoost's row would not exist
+            # without, and named separately because the other two arms do not
+            # do it. `scenarios.PHASE_SHAPE` says where it sits in e2e and
+            # that it is a harness-conversion cost rather than a CatBoost one,
+            # so a reader can subtract it. The reconstruction digest is
+            # computed inside it and is bookkeeping rather than work; it is
+            # inside the timing anyway rather than being carved out, because
+            # a phase that excludes part of what it did is worse than one
+            # that overstates by a hash.
+            (train_matrix, test_matrix, tr_report, te_report), encode = \
+                measure.timed(_encode)
+            encoding_report = {"train": tr_report, "test": te_report}
+            self.notes.append(
+                "this scenario declares categorical features and this arm "
+                f"took them: {len(cat_indices)} column(s) re-encoded as "
+                "int64 in a mixed pandas frame, and CatBoost given "
+                "cat_features over them, so its ordered target statistic is "
+                "what ran. The canonical float64 digest is unchanged and "
+                "unexempted; data.train.encoding carries the reconstruction "
+                "digest and the verdict. See "
+                "scenarios.CATBOOST_CATEGORICAL_ENCODING."
             )
 
         extra = None
@@ -912,19 +1132,32 @@ class CatBoostEngine:
 
         # Ingestion, and only ingestion. See the class docstring and
         # scenarios.PHASE_SHAPE for why there is no binning phase beside it.
+        # `cat_features` is passed as indices, which is why the encoder names
+        # the frame's columns positionally.
         pool, ingest = measure.timed(
-            lambda: self.module.Pool(train["X"], label=train["y"])
+            lambda: self.module.Pool(
+                train_matrix,
+                label=train["y"],
+                cat_features=(cat_indices or None),
+            )
         )
         model = self._model(params)
         _, training = measure.timed(lambda: model.fit(pool))
 
         task = spec["task"]
         predictions, predict_batch = measure.repeat(
-            lambda: self._predict(model, task, test["X"]), repeats
+            lambda: self._predict(model, task, test_matrix), repeats
         )
-        row = test["X"][:1]
-        if not train.get("sparse"):
-            row = np.ascontiguousarray(row)
+        # One row, in whatever container the batch was predicted from. A
+        # model fitted with cat_features must be predicted from a frame with
+        # the same columns and the same dtypes, so slicing the float64 matrix
+        # here would measure a call that raises rather than a prediction.
+        if cat_indices:
+            row = test_matrix.iloc[:1]
+        else:
+            row = test_matrix[:1]
+            if not train.get("sparse"):
+                row = np.ascontiguousarray(row)
         _, predict_row = measure.repeat(
             lambda: self._predict(model, task, row), 20, warmup=2
         )
@@ -968,6 +1201,22 @@ class CatBoostEngine:
             model_block["num_trees_note"] = (
                 scenarios.CATBOOST_UNMATCHABLE["multiclass_tree_count"]
             )
+        if cat_indices:
+            model_block["bins_note"] = (
+                "read this per-feature profile against the other two "
+                "engines' with care on a categorical scenario, and probably "
+                "not at all. CatBoost.get_borders() returns borders for "
+                "CatBoost's FLOAT features, and a model fitted with "
+                "cat_features has float features this harness never handed "
+                "it: the CTR columns it derives from the categorical block. "
+                "Whether get_borders' keys index the original columns, "
+                "CatBoost's internal float-feature order, or the CTR "
+                "features as well is NOT established here, so the vector "
+                "above is recorded as read and is not claimed to be one "
+                "entry per input column. The numeric columns of both "
+                "categorical scenarios happen to come first, which makes a "
+                "coincidental alignment likely and does not make it a fact"
+            )
 
         return {
             "engine": self.name,
@@ -983,6 +1232,22 @@ class CatBoostEngine:
                 # inside Dataset.construct() and mojotrees's is its
                 # transpose, which bench_train.mojo times as ingest_s.
                 "ingest": ingest.as_dict(),
+                # Present only on a categorical scenario, and null with a
+                # reason on every other, so a reader never has to read an
+                # absent field as a zero. It is the harness re-encoding the
+                # canonical float64 matrix into the mixed frame CatBoost
+                # will take cat_features over, plus the reconstruction hash
+                # that proves it. Counted in e2e, because it is work this
+                # row does not exist without; labelled a conversion cost,
+                # because a CatBoost user whose categories already live in
+                # an integer column pays none of it.
+                "encode": encode.as_dict() if encode is not None else None,
+                "encode_unavailable_reason": (
+                    None if encode is not None else
+                    "this scenario declares no categorical features, so "
+                    "there is nothing to re-encode and the canonical "
+                    "float64 matrix goes straight into the Pool"
+                ),
                 "binning": None,
                 "binning_unavailable_reason": (
                     scenarios.PHASE_SHAPE["catboost"]["binning"]
@@ -1008,6 +1273,13 @@ class CatBoostEngine:
             "num_boost_round": int(params["iterations"]),
             "histogram_builder": dict(CATBOOST_HISTOGRAM_BUILDER),
             "model": model_block,
+            # Popped by worker.run_job and folded into data.train / data.test
+            # beside the canonical digest, because the two fields only mean
+            # anything read together. None on a numeric scenario, where the
+            # engine took the canonical form and the default block
+            # worker.describe writes is already correct.
+            "data_encoding": encoding_report,
+            "categorical_features": list(cat_indices) or None,
             "transfers": measure.unavailable("cpu-only path"),
             "peak_rss_bytes": measure.peak_rss_bytes(),
             "notes": list(self.notes),

@@ -282,17 +282,28 @@ def test_grow_policy_takes_all_three_canonical_values() raises:
 
 
 def test_boosting_type_is_one_key_with_six_values() raises:
-    """`plain` is `gbdt`; `ordered` is accepted and then refused by name,
-    which is what tells the user the truth; the three that need a parameter
-    bundle say so; and an unknown value is still unknown."""
+    """`plain` is `gbdt`; `ordered` sets the bundle it names; the three that
+    need a parameter bundle a string cannot carry say so; and an unknown
+    value is still unknown."""
     # `plain` and `gbdt` both describe what a parameter string already
     # configures, so both parse and change nothing.
     _ = parse_params(String("boosting_type=gbdt"))
     _ = parse_params(String("boosting_type=Plain"))
     _ = parse_params(String("boosting=plain"))
     _ = parse_params(String("booster=gbtree"))
-    with assert_raises(contains="ordered boosting"):
-        _ = parse_params(String("boosting_type=Ordered"))
+    assert_true(
+        not parse_params(String("boosting_type=gbdt")).booster.ordered.enabled
+    )
+    # `ordered` stopped being a refusal on 2026-08-16. The value is the one
+    # thing a caller can check that distinguishes "parsed" from "honored":
+    # `_check_boosting_type` accepted it before this change too, and the
+    # difference is that `BoosterParams.ordered` is now set from it.
+    assert_true(
+        parse_params(
+            String("boosting_type=Ordered")
+        ).booster.ordered.enabled,
+        "boosting_type=Ordered must set BoosterParams.ordered.enabled",
+    )
     for value in [String("dart"), String("goss"), String("rf")]:
         with assert_raises(contains="Mojo API only"):
             _ = parse_params(String("boosting_type=", value))
@@ -300,13 +311,53 @@ def test_boosting_type_is_one_key_with_six_values() raises:
             params_names_mojo_api_only(String("boosting_type=", value)),
             String("boosting_type=", value, " should read as Mojo-API-only"),
         )
-    # `ordered` is not a feature reached the wrong way, it is a feature that
-    # does not exist, so it must NOT read as Mojo-API-only.
+    # `ordered` must still NOT read as Mojo-API-only, and the reason inverted:
+    # it is not a feature reached the wrong way because this surface reaches
+    # it the right way.
     assert_true(
         not params_names_mojo_api_only(String("boosting_type=ordered"))
     )
     with assert_raises(contains="unknown boosting_type"):
         _ = parse_params(String("boosting_type=gblinear"))
+
+
+def test_ordered_boosting_knobs_reach_the_bundle() raises:
+    """The four scalars ordered boosting takes, each read onto
+    `BoosterParams.ordered`, and each refused when it would never be read.
+
+    The refusals are the half that matters. A knob parsed onto a disabled
+    bundle is a number the user set and the trainer never looks at, which is
+    the failure this whole surface's refuse-rather-than-ignore rule exists
+    for; and the GPU refusal is there because `train_gpu` reads
+    `BoosterParams.ordered` nowhere at all.
+    """
+    var config = parse_params(
+        String(
+            "boosting_type=ordered permutation_count=3"
+            " fold_len_multiplier=4.0 fold_permutation_block=64"
+            " ordered_seed=7"
+        )
+    )
+    assert_true(config.booster.ordered.enabled)
+    assert_equal(config.booster.ordered.permutation_count, 3)
+    assert_equal(config.booster.ordered.fold_len_multiplier, 4.0)
+    assert_equal(config.booster.ordered.permutation_block_size, 64)
+    assert_equal(config.booster.ordered.seed, 7)
+    # Order does not matter: the knobs set fields and the type flips `enabled`.
+    assert_equal(
+        parse_params(
+            String("fold_len_multiplier=3.0 boosting_type=ordered")
+        ).booster.ordered.fold_len_multiplier,
+        3.0,
+    )
+    with assert_raises(contains="read only when boosting_type=ordered"):
+        _ = parse_params(String("permutation_count=3"))
+    with assert_raises(contains="trains on the CPU only"):
+        _ = parse_params(String("boosting_type=ordered device=gpu"))
+    with assert_raises(contains="fold_len_multiplier"):
+        _ = parse_params(
+            String("boosting_type=ordered fold_len_multiplier=1.0")
+        )
 
 
 def test_device_takes_every_vendor_spelling() raises:

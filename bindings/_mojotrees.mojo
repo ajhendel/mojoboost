@@ -193,6 +193,7 @@ from mojotrees.trainset import (
 )
 from mojotrees.binning import BinnedMatrix
 from mojotrees.linear_tree import LinearParams
+from mojotrees.ordered_boosting import OrderedBoostingParams
 from mojotrees.device import (
     CPU_DEVICE,
     GPU_DEVICE,
@@ -632,6 +633,9 @@ def _parse_params(
     n_features: Int,
     unbundled: String = "",
     cpu: Bool = True,
+    entry: String = "",
+    ordered_ok: Bool = False,
+    leaf_estimation_ok: Bool = False,
 ) raises -> BoosterParams:
     """The `BoosterParams` a fit runs under, from the params mapping.
 
@@ -647,7 +651,58 @@ def _parse_params(
     default is the CPU-honoring case because every entry point that leaves
     both alone (the sparse fits and continued training) is CPU-only by
     construction.
+
+    **`ordered_ok` and `leaf_estimation_ok` are the same declaration for the
+    two CatBoost mechanisms, and they default to `False` on purpose.** The
+    default of a reachability flag is the direction a forgotten call site
+    fails in, and this repository has now shipped five mechanisms that were
+    built and never reached because the default was "accept". A new entry
+    point added below inherits the refusal and says so by name; it does not
+    inherit a silent drop. `entry` is the name those refusals use, and falls
+    back to `unbundled` when an entry point already declared one there.
+
+    - `ordered_ok`: CatBoost's `boosting_type=Ordered`
+      (src/mojotrees/ordered_boosting.mojo). Only `boosting.train` runs the
+      fold ladder, so only `fit` on the CPU may pass True.
+      `boosting.train_with_valid` and the multiclass trainers refuse it
+      themselves with `check_ordered_honored`; the sparse, custom-objective,
+      ranking and GPU trainers do not, which is why the refusal is here.
+    - `leaf_estimation_ok`: CatBoost's `leaf_estimation_iterations`. Honored
+      by `boosting.train`, `boosting.train_more`, `boosting.train_with_valid`,
+      `train_gpu.train_gpu` and `train_gpu.train_gpu_with_valid`, and by
+      nothing else, so **`fit` alone** passes True. `fit_with_metrics` does
+      not, and the near miss is worth recording: it routes to
+      `custom_metric.fit_with_metrics`, which is a different round loop from
+      `boosting.train_with_valid` and reads the field nowhere.
     """
+    var who = entry.copy()
+    if who.byte_length() == 0:
+        who = unbundled.copy()
+    if who.byte_length() == 0:
+        who = String("this entry point")
+    # CatBoost's `leaf_estimation_iterations`, folded onto the bundle
+    # `extra_params_from_mapping` parsed rather than parsed there, because
+    # that function is also `extra_params_check`'s and this refusal needs the
+    # entry point, which only this function knows. Until this was passed the
+    # field took its default of 1 on every fit that came through Python, so
+    # `boosting._estimate_leaf_values` was reachable from the Mojo API and
+    # from nowhere else -- `params.mojo` refuses the key on the string
+    # surface for exactly the reason handled here, that a string reaches
+    # trainers that do not implement it.
+    var extra = extra_params_from_mapping(params, n_features)
+    extra.leaf_estimation_iterations = Int(
+        py=params["leaf_estimation_iterations"]
+    )
+    if extra.leaf_estimation_active() and not leaf_estimation_ok:
+        raise Error(
+            "leaf_estimation_iterations > 1 is not implemented by ",
+            who,
+            "; it is implemented by boosting.train, boosting.train_more,"
+            " boosting.train_with_valid, train_gpu.train_gpu and"
+            " train_gpu.train_gpu_with_valid, which this estimator reaches"
+            " through a dense, single-output fit without a custom objective."
+            " 1 is LightGBM's behavior and mojotrees's, and is the default",
+        )
     var tree = TreeParams(
         Int(py=params["num_leaves"]),
         Int(py=params["min_data_in_leaf"]),
@@ -673,7 +728,7 @@ def _parse_params(
         # nowhere else. `extra_params_from_mapping` is the same parser
         # `extra_params_check` validates with, so what is checked and what is
         # trained cannot come apart.
-        extra=extra_params_from_mapping(params, n_features),
+        extra=extra^,
         # XGBoost's grow_policy (src/mojotrees/growth_policy.mojo); the
         # wrapper sends the name, and the same parser the parameter string
         # goes through resolves it, so the two front doors cannot disagree.
@@ -701,12 +756,42 @@ def _parse_params(
         enabled=Int(py=params["linear_tree"]) != 0,
         linear_lambda=Float64(py=params["linear_lambda"]),
     )
+    # CatBoost's `boosting_type=Ordered` (src/mojotrees/ordered_boosting.mojo).
+    # Until this was passed, `BoosterParams.ordered` took its disabled default
+    # on every fit that came through Python AND on every parameter string, so
+    # the fold ladder `boosting.train` grows was reachable from the Mojo API
+    # and from nowhere else: the mechanism was merged, tested, and set by no
+    # binding.
+    #
+    # `enable` rather than a field-by-field build, so the four knobs take the
+    # module's defaults where the estimator sends nothing, and `validate` is
+    # the module's own range check rather than a copy of it here.
+    var ordered = OrderedBoostingParams.disabled()
+    if Int(py=params["ordered"]) != 0:
+        ordered = OrderedBoostingParams.enable(
+            permutation_count=Int(py=params["permutation_count"]),
+            fold_len_multiplier=Float64(py=params["fold_len_multiplier"]),
+            permutation_block_size=Int(py=params["fold_permutation_block"]),
+            seed=Int(py=params["ordered_seed"]),
+        )
+    ordered.validate()
+    if ordered.enabled and not ordered_ok:
+        raise Error(
+            "boosting_type='ordered' is not implemented by ",
+            who,
+            "; only boosting.train honors the fold ladder, which this"
+            " estimator reaches through a dense, single-output CPU fit"
+            " without eval_set, without a custom objective, and without row"
+            " sampling. 'plain' (an alias of 'gbdt') is the scheme every"
+            " other path trains",
+        )
     return BoosterParams(
         Int(py=params["n_estimators"]),
         Float64(py=params["learning_rate"]),
         tree^,
         bundling^,
         linear^,
+        ordered^,
     )
 
 
@@ -820,9 +905,41 @@ def fit(
     # has to know which of the two `mojo_fit` will dispatch to. The wrapper
     # sends a device it has already resolved, so this is the backend.
     var device = _parse_device(params)
-    var bp = _parse_params(params, nf, cpu=device == CPU_DEVICE)
+    # `ordered_ok` is the CPU test and nothing else: `model.fit` routes a CPU
+    # run to `boosting.train`, which is the one trainer that grows the fold
+    # ladder, and a GPU run to `train_gpu`, which reads `BoosterParams.ordered`
+    # nowhere. `leaf_estimation_ok` is unconditional here because both of those
+    # trainers implement the extra Newton steps.
+    var bp = _parse_params(
+        params,
+        nf,
+        cpu=device == CPU_DEVICE,
+        entry=String("fit"),
+        ordered_ok=device == CPU_DEVICE,
+        leaf_estimation_ok=True,
+    )
     var weights = _parse_weights(params, nr)
     var boosting = _parse_boosting(params)
+    if bp.ordered.enabled and (
+        boosting.mode == BOOSTING_DART or boosting.mode == BOOSTING_RF
+    ):
+        # `alternate_boosting.fit_boosting` runs its own round loop and takes
+        # no `ordered` bundle, so the pair would train a plain dart or forest
+        # and report an ordered fit.
+        raise Error(
+            "boosting_type='ordered' cannot be combined with dart or rf:"
+            " those run alternate_boosting's own round loop, which does not"
+            " grow the fold ladder"
+        )
+    if bp.ordered.enabled and bp.linear.is_active():
+        # linear_tree routes through `custom_metric.fit_with_metrics` below,
+        # and that trainer refuses an ordered bundle itself; refusing here
+        # names the combination rather than the entry point it landed on.
+        raise Error(
+            "boosting_type='ordered' cannot be combined with linear_tree:"
+            " linear leaves are fitted by the metric-path trainer, which"
+            " does not grow the fold ladder"
+        )
     if boosting.mode == BOOSTING_DART or boosting.mode == BOOSTING_RF:
         # dart and rf run through alternate_boosting's dispatcher, which
         # bins with the same fit_bins and returns the same Model; it is CPU
@@ -930,7 +1047,9 @@ def distributed_train_local(
     var nf = Int(py=n_features)
     var features = f64_view(Int(py=x_addr), nr * nf)
     var target = f64_buffer(Int(py=y_addr), nr)
-    var bp = _parse_params(params, nf, cpu=True)
+    var bp = _parse_params(
+        params, nf, cpu=True, entry=String("distributed_train_local")
+    )
     var weights = _parse_weights(params, nr)
     var model = train_local_world(
         features,
@@ -973,7 +1092,9 @@ def fit_custom(
     var nf = Int(py=n_features)
     var features = f64_view(Int(py=x_addr), nr * nf)
     var target = f64_buffer(Int(py=y_addr), nr)
-    var bp = _parse_params(params, nf, unbundled="fit_custom")
+    var bp = _parse_params(
+        params, nf, unbundled="fit_custom", entry=String("fit_custom")
+    )
     var weights = _parse_weights(params, nr)
 
     var raw_addr = Int(py=params["raw_addr"])
@@ -1061,7 +1182,17 @@ def fit_with_metrics(
     var nf = Int(py=n_features)
     var features = f64_view(Int(py=x_addr), nr * nf)
     var target = f64_buffer(Int(py=y_addr), nr)
-    var bp = _parse_params(params, nf, unbundled="fit_with_metrics")
+    # Neither opt-in, and `leaf_estimation_ok` in particular is a correction:
+    # this routes to `custom_metric.fit_with_metrics`, NOT to
+    # `boosting.train_with_valid`. `train_with_valid` does implement the extra
+    # Newton steps; that round loop does not read
+    # `TreeParams.extra.leaf_estimation_iterations` at all. The two share a
+    # name and not a body, and opting in on the strength of the name produced
+    # bit-identical arms until `test_catboost_reachability` demanded they
+    # differ.
+    var bp = _parse_params(
+        params, nf, unbundled="fit_with_metrics"
+    )
     var weights = _parse_weights(params, nr)
 
     var pred_p = _pred_pointer(params)
@@ -1546,7 +1677,12 @@ def fit_multiclass(
     var labels = int_buffer_from_f64(Int(py=y_addr), nr)
     # Read the device first, for the reason `fit` does.
     var device = _parse_device(params)
-    var bp = _parse_params(params, nf, cpu=device == CPU_DEVICE)
+    var bp = _parse_params(
+        params,
+        nf,
+        cpu=device == CPU_DEVICE,
+        entry=String("the multiclass trainers"),
+    )
     var weights = _parse_weights(params, nr)
     var model = mojo_fit_multiclass(
         features,
@@ -1579,7 +1715,9 @@ def fit_csc(
     var csc = csc_from_params(params)
     var nr = csc.n_rows
     var target = f64_buffer(Int(py=y_addr), nr)
-    var bp = _parse_params(params, csc.n_features)
+    var bp = _parse_params(
+        params, csc.n_features, entry=String("a sparse (CSC) fit")
+    )
     var weights = _parse_weights(params, nr)
     var model = mojo_fit_csc(
         csc,
@@ -1608,7 +1746,9 @@ def fit_multiclass_csc(
     var csc = csc_from_params(params)
     var nr = csc.n_rows
     var labels = int_buffer_from_f64(Int(py=y_addr), nr)
-    var bp = _parse_params(params, csc.n_features)
+    var bp = _parse_params(
+        params, csc.n_features, entry=String("a sparse (CSC) fit")
+    )
     var weights = _parse_weights(params, nr)
     var model = mojo_fit_multiclass_csc(
         csc,
@@ -1765,7 +1905,9 @@ def fit_ranker(
     var nf = Int(py=n_features)
     var features = f64_view(Int(py=x_addr), nr * nf)
     var labels = int_buffer_from_f64(Int(py=y_addr), nr)
-    var bp = _parse_params(params, nf, unbundled="fit_ranker")
+    var bp = _parse_params(
+        params, nf, unbundled="fit_ranker", entry=String("fit_ranker")
+    )
     var weights = _parse_weights(params, nr)
     var advanced = _parse_advanced_rank_params(params)
     var positions = _parse_positions(params, nr)
@@ -3066,7 +3208,12 @@ def train_dataset(
     var model = mojo_train_dataset(
         d[],
         Int(py=params["objective"]),
-        _parse_params(params, d[].num_feature(), cpu=device == CPU_DEVICE),
+        _parse_params(
+            params,
+            d[].num_feature(),
+            cpu=device == CPU_DEVICE,
+            entry=String("a Dataset fit"),
+        ),
         Float64(py=params["alpha"]),
         device,
         _parse_bagging(params),
@@ -3086,7 +3233,12 @@ def train_dataset_multiclass(
     var model = mojo_train_dataset_multiclass(
         d[],
         Int(py=params["n_classes"]),
-        _parse_params(params, d[].num_feature(), cpu=device == CPU_DEVICE),
+        _parse_params(
+            params,
+            d[].num_feature(),
+            cpu=device == CPU_DEVICE,
+            entry=String("a Dataset fit"),
+        ),
         device,
         _parse_bagging(params),
         _parse_goss(params),
@@ -3126,7 +3278,9 @@ def booster_update(
     var added = mojo_update_dataset(
         m[],
         d[],
-        _parse_params(params, d[].num_feature()),
+        _parse_params(
+            params, d[].num_feature(), entry=String("a Dataset fit")
+        ),
         Float64(py=params["alpha"]),
         _parse_bagging(params),
         _parse_goss(params),
@@ -3145,7 +3299,9 @@ def booster_update_multiclass(
     var added = mojo_update_dataset_multiclass(
         m[],
         d[],
-        _parse_params(params, d[].num_feature()),
+        _parse_params(
+            params, d[].num_feature(), entry=String("a Dataset fit")
+        ),
         _parse_bagging(params),
         _parse_goss(params),
     )
