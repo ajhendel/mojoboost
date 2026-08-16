@@ -537,7 +537,6 @@ paths = [
     "src/mojotrees/gpu_leaf_batching.mojo",
     "src/mojotrees/gpu_multiclass_batch.mojo",
     "src/mojotrees/growth_policy.mojo",
-    "src/mojotrees/hybrid_leaf_scheduler.mojo",
     "src/mojotrees/histogram_cache_policy.mojo",
 ]
 fallback = ["native:compile-package"]

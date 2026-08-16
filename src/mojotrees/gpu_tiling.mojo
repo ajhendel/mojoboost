@@ -69,8 +69,8 @@ down:
                                 the specialization ladder and the multiclass
                                 schedule
         ^                                   ^
-    gpu_multiclass_batch.mojo       hybrid_leaf_scheduler.mojo
-    (per-round class batching)      (per-leaf placement; charges a node the
+    gpu_multiclass_batch.mojo       phase_profile.mojo
+    (per-round class batching)      (dispatch accounting; charges a node the
                                      launches `launches_for_strategy` says
                                      its resolved strategy costs)
 
@@ -166,10 +166,11 @@ comptime LAUNCHES_TILED = 2
 def launches_for_strategy(strategy: Int) raises -> Int:
     """Kernel launches one node's histogram costs under this strategy.
 
-    The one place that number is written down. `hybrid_leaf_scheduler.mojo`
-    charges a node `launch_nanos * gpu_launches`, and deriving that count
-    from the resolved strategy rather than defaulting it keeps the cost model
-    and the launch it models from drifting apart.
+    The one place that number is written down. The phase profile charges a
+    node its dispatches from it, and deriving that count from the resolved
+    strategy rather than defaulting it keeps the accounting and the launch it
+    accounts for from drifting apart. The hybrid leaf scheduler was its other
+    consumer until 2026-08-16, when that module was deleted.
 
     `STRATEGY_AUTO` has no launch count: it is a request, not a resolution,
     and a caller holding one has not yet planned a launch.

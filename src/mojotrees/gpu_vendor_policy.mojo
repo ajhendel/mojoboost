@@ -717,7 +717,8 @@ struct BackendLaunchPlan(Copyable, Movable):
 
     def gpu_launches(self) raises -> Int:
         """Kernel launches this node costs, from the resolved strategy. The
-        number `hybrid_leaf_scheduler.LeafWork` needs and must not guess."""
+        number the phase profile's dispatch count needs and must not
+        guess."""
         return self.tiling.launches()
 
 

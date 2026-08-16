@@ -11,10 +11,15 @@ rule, gives every cached histogram a key that says exactly which
 (dataset, gradients, feature set, tree, node) it describes, and bounds the
 bytes the live set can reach.
 
-It is the bookkeeping half of the hybrid scheduler in
-`hybrid_leaf_scheduler.mojo`: once a histogram may be produced by either
-device, "is this buffer still the right answer?" stops being obvious from
-the call site and has to be a checkable property of a key.
+It was the bookkeeping half of the hybrid leaf scheduler, which was deleted
+on 2026-08-16: once a histogram may be produced by either device, "is this
+buffer still the right answer?" stops being obvious from the call site and
+has to be a checkable property of a key.
+
+**Nothing imports this module any more.** The scheduler was its only caller,
+so it is a delete candidate in its own right; it is left standing here only
+because removing it reaches into `quantized_gradient.mojo` and
+`apple_cpu_policy.mojo`, which belong to other lanes.
 
 **This module holds no histogram buffers.** It holds keys, sizes, origins,
 and counters, the way `PoolLedger` and `ResidencyLedger` in gpu_runtime.mojo

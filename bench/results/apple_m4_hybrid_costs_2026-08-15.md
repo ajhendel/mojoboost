@@ -1,5 +1,18 @@
 # Hybrid cost calibration, Apple M4, 2026-08-15
 
+> **Status note, 2026-08-16.** This is a measured result and it stands as
+> measured. The code it calibrated is gone: the hybrid CPU/GPU leaf
+> scheduler (`src/mojotrees/hybrid_leaf_scheduler.mojo`), its `HybridCosts`
+> model, `bench/bench_hybrid_costs.mojo`, and the `MOJOTREES_HYBRID_*`
+> variables were deleted on 2026-08-16, because the device-resident tree
+> plane now beats the host path at every shape measured, all resolved under
+> rule M0 (2.2x at 50,000 rows, 44 percent at 250,000, 24 percent at
+> 1,000,000: `bench/results/session3_2026-08-16/RESULTS.md`). The
+> coefficients below remain the only recorded per-launch, per-cell and
+> per-row-slot cost model for this machine, and `phase_profile.mojo` still
+> reports in the units they are stated in.
+
+
 Experiment E1 of `docs/design/HYBRID_TRAINING.md` §9, re-run with the two
 coefficients the 2026-08-14 calibration did not have: the host's
 *scattered* accumulation rate and the *fixed* price of a host build. All

@@ -1,10 +1,43 @@
 # Hybrid CPU/GPU leaf scheduling and histogram reuse
 
-Design note for `src/mojotrees/hybrid_leaf_scheduler.mojo` and
-`src/mojotrees/histogram_cache_policy.mojo`. Nothing described here is
-enabled, and nothing described here has been measured. The modules are
-policy and bookkeeping only: they accumulate no histogram, own no buffer,
-open no device, and are not called from any trainer.
+> **This design was built, measured, and removed. Read it as a record.**
+>
+> `src/mojotrees/hybrid_leaf_scheduler.mojo` was deleted on 2026-08-16,
+> together with its `train_gpu` wiring, its `GpuSession.note_hybrid` report,
+> `bench/bench_hybrid_costs.mojo`, and the `MOJOTREES_HYBRID_LEAVES`,
+> `MOJOTREES_HYBRID_COSTS`, `MOJOTREES_HYBRID_TRACE` and
+> `MOJOTREES_HYBRID_GUARD_TRANSFER` variables.
+>
+> It shipped and it worked: 1.20x on a bagged 20,000-row fit, host replica
+> verified bit-identical in-run, double opt-in behind
+> `MOJOTREES_HYBRID_LEAVES` plus `MOJOTREES_HYBRID_COSTS=apple-m4`, and it
+> only ever reached host-gradient runs (bagging, GOSS, custom objectives,
+> host multiclass). What killed it is not a defect in any of that. It is the
+> premise. The design below rests on the host being able to usefully take the
+> leaves the device is slow at. The device-resident tree plane now beats the
+> host path at **every shape measured**, all resolved under rule M0: 2.2x at
+> 50,000 rows, 44 percent at 250,000, 24 percent at 1,000,000
+> (`bench/results/session3_2026-08-16/RESULTS.md`). There is no such leaf
+> left, so there is nothing for the placement rule in §5 to elect.
+>
+> Three things outlive it and are not to be confused with it. The host
+> fixed-point replica builder §8.2 specifies,
+> `histogram.build_histogram_subset_replica_into`, is the project's CPU/GPU
+> oracle and is still called by `tests/test_host_replica.mojo` and by
+> `GpuHistogramBuilder.build_leaf_host_replica`; it was never the scheduler's.
+> The per-range readback §3 assumed was not expressible (`readback_range`)
+> exists and stays. And the calibration in
+> `bench/results/apple_m4_hybrid_costs_2026-08-15.md` is a measured artifact
+> about this machine, kept as such.
+>
+> `src/mojotrees/histogram_cache_policy.mojo`, the bookkeeping half described
+> below, still compiles but now has no importer at all.
+
+Design note for the deleted `src/mojotrees/hybrid_leaf_scheduler.mojo` and
+`src/mojotrees/histogram_cache_policy.mojo`. When it was written, nothing
+described here was enabled and nothing had been measured; the modules were
+policy and bookkeeping only, accumulating no histogram, owning no buffer,
+opening no device, and called from no trainer.
 
 ## 1. The observation
 
@@ -546,7 +579,7 @@ Wired, default off, and off unless *two* switches opt in.
   a mirror, and the bitwise comparison sets
   `GpuHistogramBuilder.replica_state`. Verified, later accepted leaves
   substitute; refuted, hybrid scheduling retires for the fit and the
-  pure-device path continues. `tests/test_hybrid_replica.mojo`
+  pure-device path continues. `tests/test_host_replica.mojo`
   makes the same comparison over adversarial gradients and holds a hybrid
   fit bit-identical to the pure-device fit.
 - **The §8.3 integration uses the per-range readback, not the snapshot.**

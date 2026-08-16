@@ -1238,7 +1238,7 @@ def _copy_back_kernel(
       the *whole* permutation in one transfer. This one is not a pointer
       swap: under per-range ping-pong there is no single buffer that holds
       the whole permutation, so a snapshot becomes a gather across both
-      buffers driven by the range table, or a merge pass, and the hybrid
+      buffers driven by the range table, or a merge pass, and the host
       replica path that consumes it is exactly the path whose bit-for-bit
       agreement with the device is load-bearing.
     - `download_rows` and `download_range` in this module, which have the
@@ -1366,7 +1366,7 @@ comptime HIST_ROW_UNROLL = 4
 # in this module, the whole of `gpu_binned_layout.mojo`, the leaf-id scan in
 # `histogram_gpu.mojo`, `gpu_split_search.mojo`, `gpu_sparse.mojo`,
 # `gpu_categorical.mojo`, `gpu_leaf_batching.mojo`, `gpu_multiclass_batch.mojo`,
-# and the CPU builder in `histogram.mojo` that the hybrid replica has to stay
+# and the CPU builder in `histogram.mojo` that the host replica has to stay
 # bit-identical to. A half-applied stripe layout, where some kernels read the
 # striped copy and others read the column-major one, is a much worse state
 # than none: the two agree until a lane forgets to convert one of them, and

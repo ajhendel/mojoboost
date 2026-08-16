@@ -1105,9 +1105,12 @@ tile size are runtime values here rather than compile-time ones.
 1. Connect what is already written. The repository has grown faster than
    its call graph: several capability families are implemented, compile,
    and are reached by no entry point at all, including packed-bin GPU
-   layout, hybrid CPU and GPU leaf
-   placement, the sparse and categorical GPU kernels,
+   layout, the sparse and categorical GPU kernels,
    DART and random forest, CEGB, and LightGBM model file interop.
+   Hybrid CPU and GPU leaf placement left this list by deletion rather than
+   by connection on 2026-08-16: the device-resident tree plane beats the
+   host path at every measured shape, so there is no leaf left for the host
+   to usefully take.
    Class-batched multiclass rounds have since gained a call site behind
    `MOJOTREES_GPU_CLASS_BATCH`, and batching seven classes measured
    indistinguishable from the sequential schedule (15.45 against 15.30

@@ -233,15 +233,11 @@ CLASSIFICATION = {
         "connect_04",
         "Class-batched GPU rounds; multiclass GPU training is per-class.",
     ),
-    "hybrid_leaf_scheduler": (
-        PENDING,
-        "connect_04",
-        "CPU/GPU per-leaf placement; no trainer consults it.",
-    ),
     "histogram_cache_policy": (
         PENDING,
         "connect_04",
-        "Reached only from hybrid_leaf_scheduler, itself unreachable.",
+        "Was reached only from hybrid_leaf_scheduler, which was deleted "
+        "2026-08-16; now has no importer at all. Delete candidate.",
     ),
     "backend": (
         EXPERIMENTAL,

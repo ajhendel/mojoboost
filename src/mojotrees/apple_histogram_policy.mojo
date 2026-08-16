@@ -81,8 +81,8 @@ and must not re-derive it:
 
 `HistogramPlan.tiling()` projects a plan back to the `HistogramTiling` every
 launch site already accepts, and `HistogramPlan.gpu_launches()` reports what
-`hybrid_leaf_scheduler.mojo` must charge a node for the launches this plan
-will actually issue. Between them a caller can adopt a plan without learning
+the phase profile must charge a node for the launches this plan will
+actually issue. Between them a caller can adopt a plan without learning
 the ladder, and a caller that does not want one never sees it.
 
 What this module will not decide
@@ -355,8 +355,8 @@ struct HistogramPlan(Copyable, Movable):
 
     def gpu_launches(self) raises -> Int:
         """Kernel launches this plan's node costs on the device, from the
-        resolved strategy. The number `hybrid_leaf_scheduler.LeafWork` needs
-        and must not guess."""
+        resolved strategy. The number the phase profile's dispatch count
+        needs and must not guess."""
         return launches_for_strategy(self.strategy)
 
 

@@ -18,9 +18,9 @@ range is `P(j)` if it goes left and `T + (j - P(j))` if it goes right, where
 of them; neither depends on how the range was cut into chunks, how many
 chunks there were, how many tiles each walked, or which scan arm computed
 the prefix. So the permutation must be identical element for element, and
-not merely equivalent, across every cap. It has to be identical because the
-hybrid leaf scheduler verifies a host replica bit for bit against the device
-and `readback_range` hands a node's compacted rows straight to a host
+not merely equivalent, across every cap. It has to be identical because
+`tests/test_host_replica.mojo` verifies a host replica bit for bit against the
+device and `readback_range` hands a node's compacted rows straight to a host
 histogram build: an equivalent permutation would silently fail both.
 
 What is asserted, in order:

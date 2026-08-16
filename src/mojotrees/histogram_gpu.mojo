@@ -103,7 +103,7 @@ round pays two waits instead of three; `grad_dev` and `hess_dev` are
 `create_sub_buffer` windows onto that allocation, so nothing that consumes
 them -- kernels, the device objectives, the multiclass scatter -- sees a
 change. The remaining `synchronize` stays on purpose and `stage_gradients`
-says why. `stage_from_device`, which only hybrid leaf scheduling reaches,
+says why. `stage_from_device`, which only the replica tests reach,
 still costs two copies and a synchronize of its own on top.
 
 Which transfer route the binned matrix takes is resolved once per builder
@@ -410,11 +410,6 @@ struct GpuHistogramBuilder(Movable):
     # device fill until one of those runs. A host replica build
     # (`build_leaf_host_replica`) is only possible when this is True.
     var gradients_host: Bool
-    # Whether the host fixed-point replica has been shown to reproduce this
-    # device's histograms bit for bit: 0 untested, 1 verified, 2 refuted.
-    # Set by the grower's mirror comparison (see hybrid_leaf_scheduler.mojo)
-    # and kept on the builder so one fit verifies once, not once per tree.
-    var replica_state: Int
     # The batched multi-leaf launcher, held as a zero-or-one list so a
     # builder that never batches allocates none of its buffers. `List` is
     # what holds a move-only value here; there is no second batcher and no
@@ -640,7 +635,6 @@ struct GpuHistogramBuilder(Movable):
         self.h_scale = 1.0
         self.has_gradients = False
         self.gradients_host = False
-        self.replica_state = 0
         self.round_epoch = 0
         self.feat_epoch = 0
         self.batch_feat_stamp = -1
@@ -1004,12 +998,10 @@ struct GpuHistogramBuilder(Movable):
         The values that land are the exact Float32 the kernels read (a copy,
         no arithmetic), and `g_scale`/`h_scale` were already set by the
         device fill, so `build_leaf_host_replica` afterwards accumulates
-        exactly what `build_leaf` does — the same replica claim
-        `replica_state` records, no new one. Costs `2 * 4 * n_rows` bytes
-        and one synchronize per round (per class, on a softmax round), which
-        is the price of reaching the built-in-objective path with hybrid
-        leaf scheduling at all; the grower pays it only when that scheduling
-        is switched on and measured.
+        exactly what `build_leaf` does — the same replica claim, no new one.
+        Costs `2 * 4 * n_rows` bytes and one synchronize per round (per
+        class, on a softmax round). No grower calls this: it is how the
+        equivalence tests reach a device-objective round from the host.
 
         A no-op when the gradients are already host-side. Refused before any
         gradients exist.
@@ -1022,7 +1014,7 @@ struct GpuHistogramBuilder(Movable):
         # planes are now adjacent in both directions, so this is one
         # `dst_ptr=stage_gh, src_buf=gh_dev` away from costing one wait
         # instead of two, exactly as `upload_staged` is; it is not fused here
-        # because this path is hybrid-leaf-scheduling only and no arm of it
+        # because this path is verification-only and no arm of it
         # has been measured, and a second unmeasured arm in the same commit
         # would make the first one harder to attribute.
         var stage = self.stage_gh.unsafe_ptr()
@@ -1389,10 +1381,11 @@ struct GpuHistogramBuilder(Movable):
         shapes either side of the edge.
 
         On the host-scan path the cost is real. It covers
-        `3 * n_features * n_bins` cells, and the hybrid scheduler's
-        calibrated cost model prices the conversion at
+        `3 * n_features * n_bins` cells, and the (now deleted) hybrid
+        scheduler's calibrated cost model priced the conversion at
         `convert_nanos_per_kcell = 10024`, about 10 ns per cell, against a
-        modeled device fixed cost per node of roughly 263 microseconds.
+        modeled device fixed cost per node of roughly 263 microseconds
+        (bench/results/apple_m4_hybrid_costs_2026-08-15.md).
         Nothing here has been measured by this lane, and no speedup is
         claimed on either path; what changed is only the shape of the loop.
 
@@ -1510,8 +1503,9 @@ struct GpuHistogramBuilder(Movable):
         rather than accumulating a stale round.
 
         Whether the result is bit-identical to `build_leaf`'s is a claim
-        about this device's multiply-and-round, established by the grower's
-        mirror comparison and recorded in `replica_state`, never assumed.
+        about this device's multiply-and-round, never assumed. It is what
+        `tests/test_host_replica.mojo` asserts, and this builder is the
+        oracle side of the CPU/GPU equivalence docs/ARCHITECTURE.md names.
         """
         if not self.has_gradients or not self.gradients_host:
             raise Error(
