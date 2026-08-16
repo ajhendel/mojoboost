@@ -42,6 +42,16 @@ _MAPE = 10
 _FAIR = 11
 _CROSS_ENTROPY = 12
 
+#: `objective_registry.MULTICLASS`. Softmax is negative on purpose, to stay
+#: out of the single-output code space forever, and it is a *code*, not an
+#: absence: `objective_code_of_name("multiclass")` returns it and
+#: `_normalized_objective` in src/mojotrees/device_policy.mojo preserves it
+#: while folding everything below it into `OBJECTIVE_UNSPECIFIED` (-2). The
+#: two negatives are one apart and mean opposite things, so nothing in this
+#: package may test an objective code for negativity, for truthiness, or
+#: for `None`-ness and expect to have distinguished them.
+_MULTICLASS = -1
+
 # Defaults of the two regularization parameters, named so the constructor
 # signature and the alias resolution in `_params` cannot drift apart.
 _LAMBDA_L1 = 0.0
@@ -3739,16 +3749,24 @@ class MojoTreesClassifier(_Base):
         )
 
     def _objective_code(self, n_classes=None):
-        """The native objective code this classifier trains, or None when
-        the class count is the answer instead of a code.
+        """The native objective code this classifier trains, or None before
+        there is a class count to decide it.
 
         Two classes is `binary_logistic`, a built-in single-output
-        objective the device vocabulary routes. Softmax is not one: it is
-        its own trainer growing one tree per class per round, and what the
-        native policy gates on there is `n_outputs`, which the caller
-        passes. Naming a code for it would assert something the request is
-        not, so it stays undeclared, which the native decision reports as
-        an incomplete request rather than assuming either way.
+        objective the device vocabulary routes. More than two is
+        `_MULTICLASS`, which is a code and not an absence: the registry
+        resolves the name `"multiclass"` to it, `_normalized_objective` in
+        device_policy.mojo preserves it, and the objective gate now
+        recognizes it as an objective both backends train (softmax reaches
+        the device through `train_multiclass_gpu`).
+
+        It returned None here, meaning "undeclared", which is a different
+        claim and a weaker one: an undeclared request skips the objective
+        gate entirely, carries `WARN_INCOMPLETE_REQUEST`, and can never
+        match a crossover rule, so a multiclass fit could not be routed on
+        evidence even once evidence exists. None now means only "this
+        estimator has not been fitted and was not told the class count",
+        which is the one case where there genuinely is no answer.
 
         `n_classes` is the count the current fit has just encoded, for the
         callers that ask before `n_classes_` exists; without it the fitted
@@ -3759,7 +3777,7 @@ class MojoTreesClassifier(_Base):
             n_classes = getattr(self, "n_classes_", None)
         if n_classes is None:
             return None
-        return _BINARY_LOGISTIC if int(n_classes) == 2 else None
+        return _BINARY_LOGISTIC if int(n_classes) == 2 else _MULTICLASS
 
     def _class_weight_rows(self, codes, n_rows, classes, sample_weight):
         """`sample_weight` with `class_weight` folded in, or it unchanged

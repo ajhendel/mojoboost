@@ -32,7 +32,6 @@ from std.python import Python, PythonObject
 from binding_support import f64_buffer, flag, py_dict
 
 from mojotrees.device import decide_device_report
-from mojotrees.device_policy import BINS_UNSPECIFIED, OBJECTIVE_UNSPECIFIED
 from mojotrees.efb import (
     EfbParams,
     EfbSettings,
@@ -85,8 +84,8 @@ def decide_device_workload(
     | --- | --- |
     | `n_rows`, `n_features` | the training matrix's shape |
     | `n_outputs` | trees per boosting round: 1, or the class count |
-    | `n_bins` | the estimator's `max_bin`, or a negative for undeclared |
-    | `objective` | a trainer objective code, or a negative for undeclared |
+    | `n_bins` | the estimator's `max_bin`, or a nonpositive for undeclared |
+    | `objective` | a trainer objective code; `-1` is the multiclass marker and IS a declaration, `-2` or below is undeclared |
     | `sparse` | the input is a sparse matrix (0/1) |
     | `categorical` | the run declares categorical features (0/1) |
     | `has_missing` | the run uses missing handling (0/1) |
@@ -103,34 +102,38 @@ def decide_device_workload(
     for a shape with no rows or no features, which are caller errors
     rather than policy outcomes.
 
-    Two sentinel foldings happen here, and nowhere else:
+    NO SENTINEL FOLDING HAPPENS HERE. It used to, and that was the bug.
+    This function folded `n_bins < 0` and `objective < 0` into the
+    undeclared sentinels itself, one statement before calling
+    `decide_device_report`, which folds them again through
+    `_normalized_bins` and `_normalized_objective` in device_policy.mojo.
+    Two marshallers over one wire, and they did not agree: the native one
+    folds `objective < -1` and deliberately preserves `-1`, because `-1` is
+    `objective_registry.MULTICLASS`, a real code and not an absent one;
+    this one folded `objective < 0`, so `-1` and `-2` arrived at the engine
+    as the same value and `_normalized_objective`'s documented `-1` branch
+    was unreachable from Python. A Python caller could not say "this fit is
+    softmax" at all: `Workload(objective="multiclass")` resolves to `-1`
+    through the registry and lost it here.
 
-    - a negative `n_bins` becomes `BINS_UNSPECIFIED`, because the native
-      sentinel for "no bin count" is 0 and a Python caller that means
-      "undeclared" sends -1. Sending 0 would otherwise read as a bin count
-      of zero.
-    - a negative `objective` becomes `OBJECTIVE_UNSPECIFIED`. Both the
-      undeclared sentinel and the multiclass marker (-1) land there:
-      multiclass is a tree count, and `n_outputs` already carries it.
+    So the folding is the engine's, in one place, and this function carries
+    the ints across unchanged. `-1` (multiclass) and `-2` (undeclared) are
+    now distinguishable at this boundary, which is the whole point of there
+    being two of them. Do not reintroduce a fold here: a second normalizer
+    is how the two came to disagree.
 
     No device selection happens in this module. `decide_device_report` in
     device.mojo forwards to the one policy engine in device_policy.mojo,
     which detects capabilities itself.
     """
-    var n_bins = Int(py=workload["n_bins"])
-    if n_bins < 0:
-        n_bins = BINS_UNSPECIFIED
-    var objective = Int(py=workload["objective"])
-    if objective < 0:
-        objective = OBJECTIVE_UNSPECIFIED
     return PythonObject(
         decide_device_report(
             String(py=device),
             Int(py=workload["n_rows"]),
             Int(py=workload["n_features"]),
             Int(py=workload["n_outputs"]),
-            n_bins,
-            objective,
+            Int(py=workload["n_bins"]),
+            Int(py=workload["objective"]),
             flag(workload["sparse"], "sparse"),
             flag(workload["categorical"], "categorical"),
             flag(workload["has_missing"], "has_missing"),
