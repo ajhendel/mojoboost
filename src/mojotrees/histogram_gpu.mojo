@@ -217,11 +217,13 @@ from .gpu_portability import (
 )
 from .gpu_objectives_native import (
     DEFAULT_MAX_NODES,
+    SCALE_WINDOW_MAX,
     GpuObjectiveState,
 )
 from .parallel import _env_int, dispatch_rows
 from .quantized_gradient import (
     DEFAULT_SCALE_SHAPE,
+    FIXED_ONE,
     SCALE_SHAPE_ARBITRARY,
     SCALE_SHAPE_POW2,
     describe_scale_shape,
@@ -350,6 +352,74 @@ def _fixed_scale(
     return fixed_point_scale_shaped(magnitude_sum(values), shape)
 
 
+def _check_window_bound(total: Float64, scale: Float64, plane: String) raises:
+    """The fixed-point overflow inequality, applied to a round that has
+    already run.
+
+    `sum_i |v_i| * s <= 2^30` is the whole of the argument in
+    `quantized_gradient.fixed_point_scale_pow2`: the exact scaled sum of every
+    row's magnitude is at most 2^30, any node holds a subset of the rows, and
+    deterministic rounding adds at most 1/2 per row, so no Int32 cell exceeds
+    `2^30 + n/2`. A round that derives its own scale satisfies it by
+    construction. A round that reuses an earlier round's scale
+    (`GpuHistogramBuilder.set_scale_refresh`) satisfies it only if its
+    magnitudes did not outgrow the ones the scale came from, and this is where
+    that is established rather than assumed.
+
+    Raising is the right answer and a quiet clamp is not: by the time this
+    runs the histograms of the offending round have already been accumulated,
+    so there is nothing left to fix and the only choice is between saying so
+    and not saying so. The message carries both numbers so the caller can see
+    how far past the bound it went and pick a `headroom_bits` that prevents
+    it next time.
+
+    The comparison is `>` and not `>=` because the bound is inclusive: a
+    freshly derived power-of-two scale can land exactly on `2^30` and does so
+    whenever `2^30 / T` is itself a power of two.
+
+    THE SLACK, AND WHY IT IS NOT A FUDGE
+    ------------------------------------
+    The comparison is against `2^30 (1 + 2^-24)` rather than `2^30`, and
+    without that this check would fire on rounds that are perfectly safe.
+    `fixed_point_scale_pow2` derives `s` as the largest power of two at most
+    `fl(2^30 / T)`, and `fl` rounds to nearest, so the *derivation itself*
+    admits an exact scaled total of `2^30 (1 + 2^-53)` -- one ulp of the
+    quotient above the round number. `total * scale` is an exact product here
+    (a Float64 times a power of two is exact), so that ulp survives into this
+    comparison rather than being rounded away by it, and a round that derived
+    its own scale would be reported as having outgrown it.
+
+    `2^-24` and not `2^-53` because `2^-24` is the slack the *previously
+    shipped* scale rule admitted: `SCALE_SHAPE_ARBITRARY` narrows through
+    Float32 and rounds to nearest, so it admits `2^30 (1 + 2^-24)`, and the
+    repository's overflow proof (`docs/GPU_PORTABILITY.md`,
+    `test_gpu_portability.test_fixed_point_accumulation_cannot_overflow_int32`)
+    is stated to survive it. So this tolerance is not a number chosen to make
+    a test pass; it is the bound the package already lives with, and it
+    covers both scale shapes with one constant. In units it is 64 lattice
+    units above 2^30 against an Int32 headroom of about 2^31 - 2^30, which no
+    accumulation can see. **Derived bound**, not measured.
+    """
+    var scaled = total * scale
+    if scaled > FIXED_ONE * (1.0 + 1.0 / Float64(1 << 24)):
+        raise Error(
+            String(
+                "a round reusing an earlier fixed-point scale outgrew it: the",
+                " ",
+                plane,
+                " magnitude sum ",
+                String(total),
+                " times the scale in force ",
+                String(scale),
+                " is ",
+                String(scaled),
+                ", past the 2^30 bound the Int32 histogram rests on."
+                " Lower the scale refresh cadence or raise the headroom"
+                " (GpuHistogramBuilder.set_scale_refresh).",
+            )
+        )
+
+
 struct GpuHistogramBuilder(Movable):
     """Device-resident histogram builder and row partitioner for one binned
     dataset. Construct once per training session, `upload_gradients` once per
@@ -445,6 +515,31 @@ struct GpuHistogramBuilder(Movable):
     # every other arm on this builder, so it is the one that changes
     # histogram bits; `set_scale_shape` says what that means for a fixture.
     var fixed_scale_shape: Int
+    # --- The scale window: how often the host waits for a magnitude sum ----
+    #
+    # `set_scale_refresh` is the whole argument. In one line: the round's
+    # fixed-point scale comes from a device reduction whose answer the host
+    # has to hold before it can enqueue a single histogram, so it is a round
+    # trip and not a drain, and it is one of exactly two per round on the
+    # default arm. These four fields are what let a fit pay it every `N`
+    # rounds instead of every round.
+    var scale_refresh: Int
+    """`N`. 1 is the shipped cadence (fold every round). 0 selects the
+    unwindowed `magnitude_sums` call, expression for expression, which is the
+    reference arm the identity test compares against."""
+    var scale_headroom: Int
+    """`H`, in bits. The derived scale is divided by `2^H`, which buys the
+    reused rounds room to grow their magnitudes by `2^H` before the Int32
+    overflow bound is at risk, and costs `H` bits of lattice resolution."""
+    var scale_ref_total_g: Float64
+    var scale_ref_total_h: Float64
+    """The magnitude sums the scale currently in force was derived from, kept
+    so a closed window can be checked against the scale that was actually
+    applied to it rather than against the one that replaced it."""
+    var scale_readbacks: Int
+    """How many times this builder has folded a magnitude window. The fit's
+    scale round-trip count, exactly: one fold is one `synchronize` on one
+    device answer the host could not proceed without."""
     var has_gradients: Bool
     # Whether the Float32 gradients the kernels read this round are also
     # sitting in the `stage_gh` arena on the host: True after
@@ -677,6 +772,14 @@ struct GpuHistogramBuilder(Movable):
         self.g_scale = 1.0
         self.h_scale = 1.0
         self.fixed_scale_shape = DEFAULT_SCALE_SHAPE
+        # The shipped cadence, and the shipped arithmetic: one fold per
+        # round, no headroom. `set_scale_refresh` is what moves it, and its
+        # docstring is where the case for moving it is made and bounded.
+        self.scale_refresh = 1
+        self.scale_headroom = 0
+        self.scale_ref_total_g = 0.0
+        self.scale_ref_total_h = 0.0
+        self.scale_readbacks = 0
         self.has_gradients = False
         self.gradients_host = False
         self.round_epoch = 0
@@ -849,6 +952,291 @@ struct GpuHistogramBuilder(Movable):
     def scale_shape(self) -> Int:
         """The scale arm `set_scale_shape` last chose."""
         return self.fixed_scale_shape
+
+    def set_scale_refresh(mut self, rounds: Int, headroom_bits: Int = 0
+    ) raises:
+        """How often the host waits for a magnitude sum, and how much room it
+        leaves the rounds that do not.
+
+        `rounds = 1, headroom_bits = 0` is the shipped cadence and the shipped
+        arithmetic. `rounds = 0` selects the unwindowed `magnitude_sums` call
+        instead of the split enqueue/read pair, expression for expression, and
+        exists so a test can compare the two rather than trust that a window
+        of one is the same thing.
+
+        WHAT THIS ARM IS FOR
+        --------------------
+        `train_gpu.mojo`'s census counts two round trips per round on the
+        default arm, where a round trip is host code blocking on a device
+        answer it needs before it can enqueue anything else. One of them is
+        this: `fill_gradients_device` reduces `|grad|` and `|hess|` on the
+        device, the host folds the partials in Float64, and every histogram
+        launch of the round takes the resulting scale as a launch argument, so
+        **nothing can be enqueued until it lands.** At `R = 100` that is 100
+        of the fit's 200 round trips, **estimated** at 0.046 seconds against a
+        fit **measured** at about 2.58 seconds, which is below what this
+        machine can resolve in one window.
+
+        The obvious removal is not available here and it is worth saying why,
+        because it is the first thing a reader will ask. Making the scale
+        device-resident means the *host* never needs its value, and the host
+        needs its value in three places outside this file: as a `Float32`
+        launch argument to nine kernels across `gpu_active_rows.mojo`,
+        `gpu_gradient_stream.mojo`, `gpu_categorical.mojo` and
+        `gpu_sparse.mojo`; as a staged `Float32` table in
+        `gpu_leaf_batching.mojo` and `gpu_multiclass_batch.mojo`; and as
+        `Float32(1.0 / g_scale)` written into the split searcher's parameter
+        block at `gpu_split_search._stage_params`. The last one is decisive
+        and is not a plumbing problem: the gain and the leaf value are not
+        homogeneous in the scale (the regularizer `lambda` is not scaled), so
+        a kernel handed pre-scaled gradients and told the scale is 1.0 does
+        not compute the same gain. The host has to know the number. This arm
+        therefore changes **how often the host waits for it**, which is the
+        part that is reachable, and not **whether it needs it**, which is not.
+
+        WHAT A WINDOW COSTS, AND WHY IT IS SAFE
+        ---------------------------------------
+        With `rounds = N`, the host folds once every `N` rounds and the
+        rounds in between quantize on the scale the last fold produced. Three
+        separate claims hold that up, and none of them is an assumption about
+        how gradients behave.
+
+        1. **Every round's magnitudes are still measured exactly.** The
+           reduction runs every round; only the *readback* is deferred, into
+           its own slot of a pinned window
+           (`GpuObjectiveState.enqueue_magnitudes`). When the window closes,
+           the host has round `j`'s totals bit for bit as it would have had
+           them at round `j`. Nothing is estimated and nothing is skipped.
+
+        2. **A closed window is checked against the scale that was applied to
+           it.** The overflow argument the whole fixed-point path rests on is
+           `sum_i |g_i| * s <= 2^30` (`quantized_gradient.fixed_point_scale_pow2`).
+           On a fold, every round in the window that ran under the previous
+           scale is tested against exactly that inequality, and a violation
+           **raises**. So a stale scale cannot silently overflow an Int32
+           cell; it can only end the fit with a message naming the round. The
+           detection is one window late by construction, which is why 3 exists
+           to make it not fire.
+
+        3. **`headroom_bits` prevents rather than detects.** The scale is
+           derived from `T * 2^H` instead of `T`, so it is smaller by exactly
+           `2^H` -- exactly, because `T * 2^H` is an exact Float64 product and
+           the power-of-two rule commutes with a power-of-two rescaling of its
+           input. The window is then safe as long as no round in it exceeds
+           `2^H` times the largest magnitude sum the previous window saw. At
+           `H = 1` that is a doubling, which a boosting round whose residuals
+           are shrinking does not do. **Derived bound**, not measured.
+
+        The reference the next window is derived from is the **maximum** over
+        the closing window, not its last round, which is the conservative
+        choice: a window is sized against the worst round it has seen rather
+        than the most recent one.
+
+        WHAT IT COSTS IN ACCURACY, STATED PLAINLY
+        -----------------------------------------
+        **This arm moves histogram bits at any setting other than
+        `rounds <= 1, headroom_bits = 0`, and therefore moves trees.** Two
+        separate mechanisms, and they are different in kind:
+
+        - `headroom_bits = H` gives up exactly `H` bits of lattice
+          resolution on every round, always. The exact scaled total moves
+          from `(2^29, 2^30]` to `(2^(29-H), 2^(30-H)]`. That is on top of
+          the up-to-one bit the power-of-two rule already gives up, so `H = 1`
+          means a lattice holding between 28 and 30 bits below the total
+          where the arbitrary rule held 30.
+        - `rounds = N > 1` gives up whatever `log2(T_ref / T_j)` is on each
+          reused round, which is zero whenever the magnitudes stay inside one
+          binade of the reference and is otherwise unbounded below. Because
+          the rule is a *step function*, most reused rounds land on the same
+          power of two the fresh derivation would have chosen and are
+          bit-identical to it. That is a property of a step function and not a
+          guarantee: a round whose magnitude sum crosses a binade boundary
+          gets a scale a factor of two from the one it would have had, and the
+          histogram, the split, and the tree can all differ. Which rounds
+          those are is a property of the data.
+
+        So the default stays 1 and 0, and this is an arm rather than a
+        change. It is a runtime argument and not an environment variable for
+        the reason `set_row_unroll` gives: this machine's device timings drift
+        several-fold between time windows, so only two arms interleaved inside
+        one process compare.
+
+        Refuses out-of-range values rather than clamping, on the same grounds
+        `set_scale_shape` refuses an unknown shape: quantizing on a lattice
+        the caller did not ask for is the failure this file is arranged to
+        prevent.
+        """
+        if rounds < 0 or rounds > SCALE_WINDOW_MAX:
+            raise Error(
+                String(
+                    "scale refresh cadence must be 0 (the unwindowed call) or",
+                    " 1..",
+                    String(SCALE_WINDOW_MAX),
+                    "; got ",
+                    String(rounds),
+                )
+            )
+        # A headroom past 30 bits would leave no lattice at all: the exact
+        # scaled total would sit at or below 1, so every gradient in the
+        # round would quantize to zero or one unit and no split could be
+        # told from any other.
+        if headroom_bits < 0 or headroom_bits > 30:
+            raise Error(
+                String(
+                    "scale headroom must be 0..30 bits; got ",
+                    String(headroom_bits),
+                )
+            )
+        self.scale_refresh = rounds
+        self.scale_headroom = headroom_bits
+
+    def scale_refresh_rounds(self) -> Int:
+        """The cadence `set_scale_refresh` last chose."""
+        return self.scale_refresh
+
+    def scale_readback_count(self) -> Int:
+        """How many magnitude windows this builder has folded.
+
+        The fit's scale round-trip count, as a number rather than as an
+        argument: one fold is one `synchronize` on one device answer the host
+        could not proceed without. A caller charging a phase profile reads it
+        before and after a fill and charges `syncs=1` only when it moved,
+        which is what keeps a census taken off a profile honest when the
+        cadence is not one.
+        """
+        return self.scale_readbacks
+
+    def _scale_from_total(self, total: Float64) raises -> Float64:
+        """This builder's scale for a magnitude sum, with the window's
+        headroom applied.
+
+        `total * 2^H` rather than `scale / 2^H`, because the first is exact
+        in Float64 for every `H` this setter admits and the second would
+        narrow through Float32 twice. Under `SCALE_SHAPE_POW2` the two agree
+        anyway -- the power-of-two rule commutes with a power-of-two
+        rescaling of its input -- and under `SCALE_SHAPE_ARBITRARY` the first
+        is the one that keeps a single rounding.
+
+        At `H = 0` the multiplier is exactly 1.0 and this is
+        `fixed_point_scale_shaped(total, shape)`, which is what makes the
+        default arm's arithmetic the shipped arithmetic and not a
+        reconstruction of it.
+        """
+        var t = total
+        if self.scale_headroom > 0:
+            t = total * Float64(1 << self.scale_headroom)
+        return Float64(fixed_point_scale_shaped(t, self.fixed_scale_shape))
+
+    def _close_scale_window(
+        mut self, mut state: GpuObjectiveState, quantized_all: Bool = False
+    ) raises:
+        """Fold every pending magnitude slot, check the window that is
+        closing against the scale it ran under, and derive the scale for the
+        window that opens.
+
+        The one wait, and the one place `scale_readbacks` moves. Order
+        matters and is the order below: check first, then derive, so a
+        violation is reported against the scale that caused it rather than
+        against its replacement.
+
+        `quantized_all` says whether the newest slot is a round that has
+        already built histograms. It is False on the round path, where the
+        newest slot is the round whose gradients were just filled and which
+        is about to run under the scale this call derives -- the derivation is
+        what makes that round safe, so testing it against the outgoing scale
+        would be testing the wrong inequality. It is True on the end-of-fit
+        flush, where every pending slot is a round that has finished, and
+        leaving the last one out there would be the one round the check never
+        covered.
+        """
+        var window = state.read_magnitudes(self.ctx)
+        self.scale_readbacks += 1
+        var max_g = 0.0
+        var max_h = 0.0
+        for i in range(len(window)):
+            if window[i].grad > max_g:
+                max_g = window[i].grad
+            if window[i].hess > max_h:
+                max_h = window[i].hess
+        # The rounds that already quantized under the scale in force. See the
+        # docstring for why the newest is normally not one of them.
+        var quantized = len(window) if quantized_all else len(window) - 1
+        if quantized > 0:
+            var ran_g = 0.0
+            var ran_h = 0.0
+            for i in range(quantized):
+                if window[i].grad > ran_g:
+                    ran_g = window[i].grad
+                if window[i].hess > ran_h:
+                    ran_h = window[i].hess
+            # Guarded per plane and on the *reference* rather than on the
+            # readback count, because the two planes can differ: a round
+            # whose hessians are all zero has no hessian lattice to outgrow
+            # and its scale came off the magnitude floor rather than off a
+            # measurement, so the inequality has nothing to say about it. A
+            # zero reference is also what the very first fold of a fit
+            # leaves, which is the case where `g_scale` is still the
+            # constructor's 1.0 and checking against it would be checking
+            # against a number no round ever quantized with.
+            if self.scale_ref_total_g > 0.0:
+                _check_window_bound(ran_g, self.g_scale, "gradient")
+            if self.scale_ref_total_h > 0.0:
+                _check_window_bound(ran_h, self.h_scale, "hessian")
+        self.scale_ref_total_g = max_g
+        self.scale_ref_total_h = max_h
+        self.g_scale = self._scale_from_total(max_g)
+        self.h_scale = self._scale_from_total(max_h)
+
+    def _refresh_scales(mut self, mut state: GpuObjectiveState) raises:
+        """This round's scales, at whatever cadence `set_scale_refresh`
+        chose. Shared by the plain and the softmax device fills so the two
+        cannot drift apart on when the host waits.
+
+        Three arms, and the first two are the same arithmetic:
+
+        - `scale_refresh == 0`: the unwindowed `magnitude_sums` call, which
+          enqueues, copies, synchronizes and folds in one go. The reference
+          arm.
+        - `scale_refresh == 1`: the split pair with a window of one, which is
+          that call in two halves. One wait per round, same scale.
+        - `scale_refresh > 1`: one wait per `N` rounds. The first round of a
+          fit always folds, because there is no scale to reuse yet.
+        """
+        if self.scale_refresh == 0:
+            var sums = state.magnitude_sums(
+                self.ctx, self.grad_dev, self.hess_dev
+            )
+            self.scale_readbacks += 1
+            self.scale_ref_total_g = sums.grad
+            self.scale_ref_total_h = sums.hess
+            self.g_scale = self._scale_from_total(sums.grad)
+            self.h_scale = self._scale_from_total(sums.hess)
+            return
+        var pending = state.enqueue_magnitudes(
+            self.ctx, self.grad_dev, self.hess_dev
+        )
+        # `scale_readbacks == 0` is the first fill of the fit: there is no
+        # scale to reuse, so the window closes immediately whatever the
+        # cadence says.
+        if pending >= self.scale_refresh or self.scale_readbacks == 0:
+            self._close_scale_window(state)
+
+    def flush_scale_window(mut self, mut state: GpuObjectiveState) raises:
+        """Fold and check any magnitude slots the fit left pending.
+
+        Called once at the end of a fit. A window wider than one leaves the
+        last few rounds unread when the loop stops, and those rounds are
+        exactly the ones the overflow check in `_close_scale_window` has not
+        run against yet. Flushing costs one round trip per fit and is what
+        makes the check cover **every** round rather than every round but the
+        last few, which is the difference between a guarantee and a habit.
+
+        A no-op when nothing is pending, so the default cadence pays nothing
+        for it: at `scale_refresh <= 1` the window is always empty here.
+        """
+        if state.magnitudes_pending() < 1:
+            return
+        self._close_scale_window(state, quantized_all=True)
 
     def describe_scale(self) -> String:
         """One phrase naming the scale arm, for a trace line."""
@@ -1256,19 +1644,19 @@ struct GpuHistogramBuilder(Movable):
         Only where the magnitude sum comes from differs between this path and
         the host one, and that difference is the point of the device
         reduction, not of the scale.
+
+        **Whether this call waits is `set_scale_refresh`'s answer, not
+        this method's.** At the shipped cadence it does, once, and that wait
+        is one of the two round trips `train_gpu.mojo`'s census counts per
+        round. A caller that needs to know whether a particular call waited
+        reads `scale_readback_count` before and after; the count is what a
+        phase profile's `syncs` column should be charged from, because at any
+        cadence but the default a fixed `syncs=1` would be a fiction.
         """
         state.fill_grad_hess(
             self.ctx, objective, alpha, self.grad_dev, self.hess_dev
         )
-        var sums = state.magnitude_sums(
-            self.ctx, self.grad_dev, self.hess_dev
-        )
-        self.g_scale = Float64(
-            fixed_point_scale_shaped(sums.grad, self.fixed_scale_shape)
-        )
-        self.h_scale = Float64(
-            fixed_point_scale_shaped(sums.hess, self.fixed_scale_shape)
-        )
+        self._refresh_scales(state)
         self.has_gradients = True
         self.gradients_host = False
         self.round_epoch += 1
@@ -1277,13 +1665,27 @@ struct GpuHistogramBuilder(Movable):
         mut self, mut state: GpuObjectiveState, k: Int
     ) raises:
         """Class `k`'s softmax gradients into the histogram buffers; call
-        `state.refresh_softmax` once per round first."""
+        `state.refresh_softmax` once per round first.
+
+        **The scale window is not used here and `set_scale_refresh` does not
+        reach this path**, which is deliberate rather than an omission. A
+        softmax round fills, reduces and grows once per class, so the window's
+        slots would hold a mixture of classes and the maximum taken over them
+        would size one class's lattice by another class's magnitudes. Classes
+        do not share a scale anywhere else in this package
+        (`gpu_multiclass_batch` keeps one per class) and they must not start
+        here. The multiclass mitigation that does exist is
+        `_train_multiclass_gpu_batched`, which reduces a batch of classes
+        together and so pays one readback per batch instead of one per class;
+        it is opt-in and nothing has measured it.
+        """
         state.fill_softmax_grad_hess(
             self.ctx, k, self.grad_dev, self.hess_dev
         )
         var sums = state.magnitude_sums(
             self.ctx, self.grad_dev, self.hess_dev
         )
+        self.scale_readbacks += 1
         self.g_scale = Float64(
             fixed_point_scale_shaped(sums.grad, self.fixed_scale_shape)
         )
