@@ -49,45 +49,48 @@ not in the tree.
    speed with tree shape. Run **head at `lambda_l2 = 1.0`** instead. The bench
    harness has no flag for it, so this needs one line of glue first.
 
-1. **Float32 under lambda = 0. DONE, see above. Kept for the reasoning:** The 39/44 accuracy run that the Float32
-   default rests on was taken under `lambda_l2 = 1`, and `H + lambda` is
-   exactly the damping term that hid the Float32 loss. Re-take
-   `imbalanced_binary` and `multiclass` under the now-stock lambda = 0 before
-   anyone treats that decision as closed. Under lambda = 1 the CPU AP fell
-   9.4 percent and AUC 0.006 on `imbalanced_binary`.
-2. **The window.** End to end, ingestion plus binning plus training, 1M x 50
-   against LightGBM stock + `deterministic=true` (label `stock+det`), five
-   repeats, medians, verdict on medians. Arms in this order:
-   `MOJOTREES_CPU_TASK_FLOOR` on/off FIRST, then row-major on/off, then head
-   against `e8c0877`. 250k and 50k are reported rows, not decision rows. The
-   lambda change is a caveat on any comparison against `e8c0877` and must be
-   stated in the results file. Quiet box only: hold all compiles, both
-   sessions.
-3. **CatBoost harness glue.** Reachable through `bench/real_data/run.py`
-   (widen the engine choices). Cap the `sparse_highdim` cell, smoke tier or
-   bounded iterations, so a timeout cannot take the run's exit code. Add a
-   CatBoost Lossguide row, their leaf-wise, `max_leaves` 31, beside
-   SymmetricTree. State iterations and learning rate on every CatBoost row,
-   since their auto lr depends on the budget.
-4. **Catalog corrections** in `docs/design/CATBOOST_CATALOG.md`: multiclass
-   `leaf_estimation_iterations` default is 1, not 10 (10 is Logloss); and the
-   zero-contribution min-child rule is OURS, not CatBoost's, and is already
-   marked not-verified-from-source in the oblivious entry.
-5. **Merge `cpu-round-1` into `perf-round-2`** so the GPU session can rebase.
-   Send them the SHA, plus the 12 moved `fit_bins_csc` sites in
-   `tests/test_gpu_sparse.mojo` for their Metal check.
-6. `lane/ordered-ts` merges when it reports.
-7. Launch `wide-categorical-bins`, but only after the `max_cat_to_onehot`
-   off-by-one lands as its own commit. Launch `score-function` now that
-   `oblivious-cpu` has released `split.mojo`.
+1. **Re-run the suite on the merged base.** It was green at 72/72 on the
+   wave-4 base, before the merge into `perf-round-2` brought the GPU
+   campaign's work in. Nobody has run it since.
+
+2. **A CatBoost Lossguide row** (their leaf-wise, `max_leaves` 31) beside
+   SymmetricTree, in `bench/real_data`. This is the one part of the CatBoost
+   harness item still outstanding; reachability and the `sparse_highdim` cap
+   landed in `9cc45e7`. Iterations and learning rate were already structural
+   through `CATBOOST_MATCHED` and already on every row, so that half needed
+   nothing.
+
+3. **`lane/ordered-ts` merges when it reports.** As of the merge its branch
+   head was still an old base commit with none of its own work on it, so it
+   has not reported yet. CTR feature combinations under `max_ctr_complexity`
+   go to the same owner once it lands.
+
+4. **`wide-categorical-bins`**, but only after the `max_cat_to_onehot`
+   off-by-one lands as its own commit.
+
+5. **Queued and not launched**: Langevin plus `model_shrink_rate`. Ordered
+   boosting stays a design note, since CatBoost itself defaults to Plain
+   above about 50k rows.
+
+## Out with lanes right now
+
+`canonical-naming`, `score-function`, `derivative-precision-wiring`,
+`mvs-bootstrap`. All four branched off `perf-round-2` at `901e31d`.
 
 ## Glue the lanes cannot reach
 
-- `tree.mojo` around line 2098 and `boosting.mojo:1593` — put
-  `params.extra.derivative_precision` onto the resolved `ConstHessianSettings`.
-- `boosting_rf.mojo:1448` — `_multiclass_rf_gradients` needs `raises`.
-- `src/mojotrees/__init__.mojo` — `GROW_OBLIVIOUS` export. DONE, in this
-  commit.
+- `src/mojotrees/__init__.mojo` — `GROW_OBLIVIOUS` export. **DONE.**
+- `boosting_rf.mojo:1448` — **struck, non-issue.** `_multiclass_rf_gradients`
+  is a `def`, which raises in Mojo 1.0.
+- `derivative_precision` onto the resolved `ConstHessianSettings` — **this is
+  not glue and I did not write it.** `ConstHessianSettings.resolve()` has
+  exactly two call sites in the package, `boosting.mojo:1985` and
+  `tree.mojo:2676`, and every other signature takes the `unresolved()`
+  sentinel. Wiring those two and lifting the parameter's refusal would make it
+  work there and **silently ignore it on any fit path that does not resolve a
+  snapshot**, which is the identical silent-downgrade defect the refusal
+  exists to prevent, merely relocated. It needs an audit of every fit path
+  first, so it went to `lane/derivative-precision-wiring` with that analysis.
 
 ## Standing traps, learned the hard way this round
 
@@ -102,4 +105,19 @@ not in the tree.
   field names on more than one struct; a blanket pass converted
   `LocalHistogram` and `Tree.count` as collateral, twice.
 - Lanes report merges as done that are not committed on their branch. Check
-  `git status` in the worktree before believing "Already up to date".
+  `git status` in the worktree before believing "Already up to date". This
+  happened twice in wave 4, on `oblivious-cpu` and on the categorical lane.
+- **Never regenerate a generate-from-current artifact while a file still holds
+  conflict markers.** `tools/api_snapshot.py --write` run mid-merge could not
+  parse its own previous value, so it silently DROPPED `numerical_contracts`
+  and `platforms.tiers` and reported it only as a note reading "no previous
+  value to carry". It does not fail, it narrows. Resolve first, regenerate
+  second, then diff the result against both parents.
+- `pgrep -fl mojo` **reports a busy box when the box is idle**: it matches
+  every Chromium `mojom` helper in VS Code, Chrome and Docker. Use the
+  anchored form `ps -Ao comm | grep "mojo$"`. Do not use `-x` on the
+  basename; the pixi env path means the binary is not always plain `mojo`.
+- A five-repeat median measures the warm-up transient, not steady state. Both
+  engines climb about 8 repeats before plateauing. Use twelve and compare the
+  plateau, and normalize cross-invocation comparisons by the LightGBM arm
+  measured in the same process.
