@@ -164,6 +164,52 @@ compile-time specialization of the training loop for bin count and dtype
 for cache tiling, and structured parallelism, all in one language that also
 targets GPUs from the same source.
 
+## How it performs
+
+mojotrees is **GPU-first**. On Apple silicon the GPU owns the data plane
+(histograms, split search, partition, and the tree itself stays resident on
+the device); the CPU owns the control plane, one core, roughly two host waits
+per tree.
+
+In the recorded comparison (Apple M4, 100 trees, 799,110 x 100 synthetic
+regression, five interleaved repeats, **on battery**, **canary uncalibrated**)
+the GPU backend trained in **3.62 s** against LightGBM's **4.75 s**, faster and
+more accurate with ranges disjoint, and against CatBoost's **3.76 s**, which is
+indistinguishable rather than a win. Because the tree lives on the GPU,
+training leaves the other CPU cores free; LightGBM and CatBoost use all of
+them.
+
+The GPU-resident path is the GPU path at every size measured. From 100k to
+700k rows it is **1.29x to 1.85x** over the older host-scan loop, which is
+being removed; the margin is widest at the smallest shape, which is the
+opposite of what the profitability gate that used to guard it assumed.
+
+The CPU backend uses all cores and is the path for machines without an
+accelerator, for configurations the device refuses (categorical set-splits,
+sparse input, a few extra tree parameters, routed automatically under
+`device='auto'`), and for small data. At the shape above it currently trains
+about **2x slower than LightGBM**, and that gap is being worked.
+
+On the real **YearPredictionMSD** set (463,715 x 90) **we lose: LightGBM is
+1.30x faster than our best backend, resolved, with ranges disjoint.** Accuracy
+is a tie, 9.10607 against 9.10086, a gap of 0.03 percent. A later measurement
+of the forced device plane suggested parity or better, but its canary
+straddled and it is not claimed.
+
+On a high-cardinality categorical set the CPU backend was **2.3x faster than
+LightGBM and 1.5x faster than CatBoost**, and **lost the accuracy gate**:
+average precision 0.4219 against 0.4796, 12 percent behind, where the limit is
+10. It is published as a speed win bought with accuracy. The fix is in
+progress.
+
+Every figure here, with its caveats and the exact commands, is in
+[bench/results/COMPARISON_RUN_2026-08-16.md](bench/results/COMPARISON_RUN_2026-08-16.md).
+Read the caveats: that run was taken on battery, its canary never calibrated,
+and it used five repeats rather than the protocol's twelve because the canary
+refused the window. The CatBoost figures are **superseded**: that arm has since
+been changed to run CatBoost's own shipped defaults rather than a matched
+learning rate, which is a materially different model.
+
 ## Status
 
 Experimental public alpha. Training works end to end and the repository has

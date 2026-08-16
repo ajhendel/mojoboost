@@ -149,6 +149,16 @@ The division of labor across this seam is fixed, and it is not "GPU first,
 CPU as a fallback." **The GPU owns the data plane. The CPU owns the control
 plane, small data, and verification.**
 
+In one line, with the measured consequence: **the GPU owns histograms, split
+search, partition and the resident tree; the CPU owns the control plane at one
+core and roughly two host waits per tree, which leaves the other cores free
+while LightGBM and CatBoost use all of them.** In the recorded comparison the
+GPU backend trained 799,110 x 100 in 3.62 s against LightGBM's 4.75 s, faster
+and more accurate with ranges disjoint; on real data at 463,715 x 90 it loses
+to LightGBM by 1.30x, resolved. Both figures, and the caveats that qualify them
+(on battery, canary uncalibrated, five repeats rather than twelve), are in
+[../bench/results/COMPARISON_RUN_2026-08-16.md](../bench/results/COMPARISON_RUN_2026-08-16.md).
+
 | Owner | What | Why it lives there |
 |---|---|---|
 | GPU | binned matrix, gradients and hessians, active-row permutation and leaf ranges, histogram accumulation, stable row partitioning, native objective evaluation and score advancement, device split search when selected | every one of these scales with `n_rows`, and none of it crosses the boundary during a fit (`train_gpu.mojo`, `gpu_active_rows.mojo`, `gpu_objectives_native.mojo`, `gpu_frontier.mojo`) |
