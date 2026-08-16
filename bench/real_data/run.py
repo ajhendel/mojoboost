@@ -102,6 +102,23 @@ def default_threads():
     return cpu.get("physical_cores") or cpu.get("logical_cores") or 1
 
 
+#: Arm rank INSIDE a round, for arms one of which must run before another.
+#:
+#: One dependency today. `mojotrees_catboost_mode` cannot be built until the
+#: `catboost` cell for the same scenario, tier and variant has written its
+#: resolved parameters into the run's sidecar, because CatBoost derives its own
+#: learning rate and this arm takes that value rather than a constant. Every
+#: other arm is rank 0 and keeps build order.
+#:
+#: This is composed UNDER the repeat sort, never in place of it. See the
+#: comment at the sort itself.
+CELL_ORDER = {
+    "catboost": 0,
+    "catboost_lossguide": 0,
+    "mojotrees_catboost_mode": 1,
+}
+
+
 def build_matrix(args):
     jobs = []
     for scenario_id in args.scenario:
@@ -109,6 +126,31 @@ def build_matrix(args):
         for device in args.device:
             for engine in args.engine:
                 if engine not in spec["engines"]:
+                    continue
+                # The CatBoost-mode arm has a DEPENDENCY on the CatBoost arm
+                # that no other pair in this matrix has: it takes CatBoost's
+                # resolved learning rate for the same cell, so without a
+                # CatBoost cell in the same run it raises rather than trains.
+                # Declared as a skip here because a raising cell is an
+                # infrastructure failure and this harness answers one by
+                # withholding the quality verdict for the whole matrix -- so
+                # `--engine mojotrees_catboost_mode` on its own would suppress
+                # the verdict rather than report a scheduling mistake.
+                if engine == "mojotrees_catboost_mode" and (
+                    "catboost" not in args.engine
+                ):
+                    jobs.append(
+                        _skip(
+                            scenario_id, engine, device, args,
+                            "the CatBoost-mode arm takes CatBoost's RESOLVED "
+                            "learning rate for this same cell, which cb-shipped "
+                            "no longer pins, so the catboost arm has to run in "
+                            "the same run and write it. Add catboost to "
+                            "--engine, or read "
+                            "scenarios.CATBOOST_LEARNING_RATE_TRANSITION for "
+                            "why there is no fallback",
+                        )
+                    )
                     continue
                 if engine in scenarios.CATBOOST_ENGINES:
                     ok, reason = scenarios.catboost_tier_ok(spec, args.tier)
@@ -199,6 +241,12 @@ def build_matrix(args):
                                 "allow_unpinned": args.allow_unpinned,
                                 "data_digest": not args.no_data_digest,
                                 "backend_proof": not args.no_backend_proof,
+                                # Filled in by `main`, which knows the run
+                                # directory and this function does not. The
+                                # run's collected CatBoost.get_all_params(),
+                                # which the CatBoost-mode arm cannot build
+                                # without.
+                                "catboost_readback_path": None,
                             }
                         )
     for index, job in enumerate(jobs):
@@ -594,6 +642,17 @@ def main(argv=None):
     for sub in ("jobs", "records", "predictions"):
         os.makedirs(os.path.join(run_dir, sub), exist_ok=True)
 
+    # Where CatBoost cells leave their resolved parameters for the
+    # CatBoost-mode cells to read. One file per run and not per matrix: the
+    # rate CatBoost derives depends on the shape, so a read-back from another
+    # run's tier is a wrong number rather than a stale one, and a per-run file
+    # cannot be mistaken for one. Set here rather than in `build_matrix`,
+    # which does not know the run directory.
+    readback_path = os.path.join(run_dir, scenarios.CATBOOST_READBACK_FILE)
+    for job in jobs:
+        if "skip" not in job:
+            job["catboost_readback_path"] = readback_path
+
     manifest = {
         "run_id": run_id,
         "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -612,7 +671,11 @@ def main(argv=None):
             "otherwise are timings of a contended machine. `jobs` is the "
             "matrix in build order; execution is round-interleaved (all arms "
             "at repeat 0, then all arms at repeat 1, ...), so read the "
-            "executed order off the records' repeat field, not off this list."
+            "executed order off the records' repeat field, not off this list. "
+            "Inside a round, arms keep build order except that catboost runs "
+            "before mojotrees_catboost_mode, which cannot be built until "
+            "catboost has written its resolved learning rate into "
+            "catboost_readback.json: see run.CELL_ORDER."
         ),
     }
 
@@ -634,7 +697,20 @@ def main(argv=None):
     #
     # Ordering only; the set of jobs, their job_index, and their filenames are
     # exactly what build_matrix assigned.
-    runnable.sort(key=lambda job: job["repeat"])
+    #
+    # The second element of the key is a DEPENDENCY and not a preference, and
+    # it is second rather than first on purpose. `repeat` stays the primary
+    # key, so the rounds above are unchanged; within one round the CatBoost
+    # cell for a scenario runs before the CatBoost-mode cell for it, because
+    # `scenarios.mojotrees_catboost_mode_params` takes CatBoost's RESOLVED
+    # learning rate for that cell out of the run's catboost_readback.json and
+    # refuses by name without it. Putting the arm rank first would silently
+    # restore the arm-blocked order this sort exists to remove, which is the
+    # defect that cost a real result.
+    #
+    # Every other arm shares rank 0 and Python's sort is stable, so they keep
+    # build order exactly as before.
+    runnable.sort(key=lambda job: (job["repeat"], CELL_ORDER.get(job["engine"], 0)))
     skipped = [job for job in jobs if "skip" in job]
     print(f"run {run_id}: {len(runnable)} runs, {len(skipped)} skipped")
     print(comparator_banner())

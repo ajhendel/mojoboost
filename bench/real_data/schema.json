@@ -96,7 +96,11 @@
     },
     "engine_resolved_params": {
       "type": ["object", "null"],
-      "description": "The parameter list the library itself resolved, read back from the fitted model, as distinct from `params.engine`, which is what was passed in. Present on the CatBoost rows and null elsewhere. It is there because CatBoost derives several defaults from the data: `learning_rate` is chosen from the iteration count and the dataset when it is not given one (0.5 at 2 iterations, 0.4273 at 100, 0.0657 at 1000 on one 20,000-row shape), and `boosting_type` is chosen from the dataset size. This harness pins the first and records the second per run. CatBoost.get_all_params() omits thread_count, so the adapter puts it back."
+      "description": "The parameter list the library itself resolved, read back from the fitted model, as distinct from `params.engine`, which is what was passed in. Present on the CatBoost rows and null elsewhere. It is there because CatBoost derives several defaults from the data: `learning_rate` is chosen from the iteration count and the dataset when it is not given one (0.5 at 2 iterations, 0.4273 at 100, 0.0657 at 1000 on one 20,000-row shape), and `boosting_type` is chosen from the dataset size. This harness pins NEITHER as of 2026-08-16: cb-shipped lets CatBoost resolve its own learning rate, so this field is the only place a record says what rate the CatBoost row actually trained at. See scenarios.CATBOOST_DELIBERATE_DIVERGENCE. CatBoost.get_all_params() omits thread_count, so the adapter puts it back."
+    },
+    "engine_resolved_params_drift": {
+      "type": ["array", "null"],
+      "description": "Where this fit's get_all_params() disagrees with scenarios.CATBOOST_LEFT_AT_STOCK, one message per key. An empty list means a live fit agreed with this harness's transcription of CatBoost's defaults; a non-empty one means the transcription is wrong or CatBoost has moved a default, and the resolved-parity table beside it is reasoning from a stale premise. Present on the CatBoost rows and null elsewhere. Recorded rather than raised: a CatBoost upgrade is a thing to find out about from a record, not a reason to lose a cell."
     },
     "engine_resolved_params_source": {
       "type": ["string", "null"],

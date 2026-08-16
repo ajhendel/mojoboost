@@ -314,13 +314,27 @@ class MojoTreesEngine:
     #: `scenarios.MOJOTREES_CATBOOST_MODE` and nothing else.
     params_fn = staticmethod(scenarios.mojotrees_params)
 
-    def __init__(self, threads, device="cpu"):
+    def __init__(self, threads, device="cpu", catboost_readback=None):
         self.threads = int(threads)
         self.device = device
         self.module = None
         self.version = None
         self.import_phase = None
         self.notes = []
+        # CatBoost's resolved parameters for the cells this run has already
+        # measured, or None. Unused by this arm and read by the CatBoost-mode
+        # subclass, which cannot be built without it.
+        self.catboost_readback = catboost_readback
+
+    def _params(self, spec, extra=None, device=None):
+        """The translated parameter dict for this arm.
+
+        A method rather than the `type(self).params_fn(...)` call it replaces,
+        because the CatBoost-mode subclass needs instance state -- CatBoost's
+        read-back for this cell -- and a `staticmethod` cannot see it. Every
+        call site goes through here so that the subclass overrides one thing.
+        """
+        return type(self).params_fn(spec, device or self.device, extra)
 
     def load(self):
         """Import the extension, having already set the thread count.
@@ -364,7 +378,7 @@ class MojoTreesEngine:
     def warmup(self, spec):
         x, y, group, n_classes = _tiny_like(spec)
         extra = {"num_class": n_classes} if n_classes else None
-        params = type(self).params_fn(spec, self.device, extra)
+        params = self._params(spec, extra)
         params["n_estimators"] = 1
 
         def _fit():
@@ -394,7 +408,7 @@ class MojoTreesEngine:
         extra = None
         if spec["task"] == "multiclass":
             extra = {"num_class": int(train.get("n_classes") or (train["y"].max() + 1))}
-        params = type(self).params_fn(spec, self.device, extra)
+        params = self._params(spec, extra)
         params["n_estimators"] = scenarios.BASE_PARAMS["n_estimators"]
 
         dataset_params = scenarios.dataset_params(spec)
@@ -464,7 +478,7 @@ class MojoTreesEngine:
                 f"the sparse path here covers binary classification, not "
                 f"{spec['task']}"
             )
-        params = type(self).params_fn(spec, "cpu")
+        params = self._params(spec, device="cpu")
         params.pop("device", None)
         # Built once and both passed and recorded, so the record is the
         # call rather than a reconstruction of it. `objective` is dropped
@@ -717,6 +731,31 @@ class MojoTreesCatBoostModeEngine(MojoTreesEngine):
 
     name = "mojotrees_catboost_mode"
     params_fn = staticmethod(scenarios.mojotrees_catboost_mode_params)
+
+    def _params(self, spec, extra=None, device=None):
+        """The one override, and the reason this class needs a method at all.
+
+        This arm's `learning_rate` is not a constant. CatBoost derives its own
+        from the iteration count and the dataset, `cb-shipped` stopped pinning
+        it, and "us in CatBoost's shape" is false if this side runs 0.1 while
+        CatBoost runs the rate it chose. So the value comes from CatBoost's
+        `get_all_params()` for the SAME cell, handed over through the run's
+        `catboost_readback.json`.
+
+        There is no fallback and there must not be one.
+        `scenarios.mojotrees_catboost_mode_params` raises
+        `CatBoostReadbackMissing` by name when the read-back is absent or is
+        for another cell, and that exception is allowed out of here: a cell
+        that trained on a guessed rate under this heading is the defect the
+        whole arm was rebuilt to remove, and it would be invisible in the
+        record.
+        """
+        return scenarios.mojotrees_catboost_mode_params(
+            spec,
+            device or self.device,
+            extra,
+            catboost_readback=self.catboost_readback,
+        )
 
     def load(self):
         super().load()
@@ -1186,6 +1225,37 @@ class CatBoostEngine:
                 f"get_all_params() failed: {type(exc).__name__}: {exc}"
             )
 
+        # Where a LIVE fit disagrees with scenarios.CATBOOST_LEFT_AT_STOCK,
+        # which is a transcription somebody made on 2026-08-16 and which
+        # nothing had ever contradicted because nothing had ever read it back.
+        # Recorded rather than raised: a CatBoost upgrade moving a default is
+        # a thing to find out about from a record, not a reason to lose a
+        # cell.
+        readback_drift = (
+            scenarios.check_catboost_readback(resolved, spec, self.threads)
+            if resolved
+            else ["get_all_params() produced nothing: " + str(resolved_note)]
+        )
+        # The handover. Popped by worker.run_job into the run's
+        # catboost_readback.json so that the mojotrees_catboost_mode cell for
+        # this same cell can take CatBoost's resolved learning rate. Not a
+        # report field.
+        #
+        # SUPPRESSED ON A VARIANT ROW, and this is the collision the sidecar
+        # made reachable. `catboost_lossguide` inherits this whole method and
+        # would write under the same cell key, because the key is
+        # (scenario, tier, variant) and not the engine. Its resolved dict is
+        # NOT the one the CatBoost-mode arm is shaped after: it pins
+        # grow_policy=Lossguide and max_leaves=31 over CatBoost's defaults, so
+        # whichever of the two rows happened to run last would decide what "us
+        # in CatBoost's shape" meant. The default row is the only one that
+        # answers that question, so the variant row does not answer it at all.
+        readback_entry = None
+        if not self.variant_params:
+            readback_entry = scenarios.catboost_readback_entry(
+                spec, resolved or {}, self.version
+            )
+
         bins = _catboost_bin_profile(model, train["X"].shape[1])
         num_bin = bins["max"] if isinstance(bins, dict) and "max" in bins else None
         model_block = {
@@ -1274,6 +1344,13 @@ class CatBoostEngine:
             ),
             "engine_resolved_params": resolved,
             "engine_resolved_params_source": resolved_note,
+            # Empty list means a live fit agreed with this harness's
+            # transcription of CatBoost's defaults. A non-empty one means the
+            # transcription is wrong or CatBoost has moved, and either way the
+            # parity table beside it is reasoning from a stale premise.
+            "engine_resolved_params_drift": readback_drift,
+            # Popped by worker.run_job. See the comment where it is built.
+            "catboost_readback": readback_entry,
             "num_boost_round": int(params["iterations"]),
             "histogram_builder": dict(CATBOOST_HISTOGRAM_BUILDER),
             "model": model_block,
@@ -1390,7 +1467,19 @@ ENGINE_ARM = {
 }
 
 
-def build(name, threads, device):
+def build(name, threads, device, catboost_readback=None):
+    """An engine by name.
+
+    `catboost_readback` is the run's collected `CatBoost.get_all_params()`,
+    keyed by cell, or None. Only `mojotrees_catboost_mode` reads it, and it
+    refuses to build without it, so passing None here is how a caller says "no
+    CatBoost cell has run in this run yet" rather than a way to opt out.
+    Handed to every mojotrees-family engine because they share a constructor;
+    the plain arm stores it and never looks at it.
+    """
     if name not in ENGINES:
         raise KeyError(f"unknown engine {name!r}; known: {', '.join(sorted(ENGINES))}")
-    return ENGINES[name](threads, device)
+    engine = ENGINES[name]
+    if issubclass(engine, MojoTreesEngine):
+        return engine(threads, device, catboost_readback)
+    return engine(threads, device)

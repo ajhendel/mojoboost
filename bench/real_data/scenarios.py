@@ -177,6 +177,35 @@ import struct
 #: and must not come back: mojotrees defaults it to LightGBM's 0.0 now, so
 #: a value here would be a pin rather than a restatement. See the module
 #: docstring for what that pin was for and why its premise is gone.
+#: The one seed constant every arm runs from.
+#:
+#: It was 190019 on the LightGBM arm and 190019 on the CatBoost arm and
+#: NOTHING on the two mojotrees arms, written out twice as a literal, until
+#: 2026-08-16. `mojotrees_params` passed no seed at all, on the argument in its
+#: own docstring that mojotrees is reproducible across thread counts with no
+#: parameter. That argument is about REPEATABILITY and it was never an argument
+#: for the three arms sharing a stream.
+#:
+#: It cost nothing while our arms were deterministic and it started costing
+#: something the day `MOJOTREES_CATBOOST_MODE` gained `bootstrap_type=MVS`,
+#: whose draw is keyed on a seed (`sampling._mvs_stream`). So the constant is
+#: named once here and referenced by all three translators.
+#:
+#: **What this does NOT align, stated because the obvious reading is wrong.**
+#: `random_state` sets every seed in `sklearn.py`'s `_SEEDS` plus
+#: `bootstrap_seed`, and on the scenarios this suite runs only `bootstrap_seed`
+#: is live: no arm bags rows, subsamples features, runs GOSS, drops trees or
+#: grows extra trees. It also does not touch the split-score noise. That stream
+#: is keyed on `ExtraTreeParams.random_strength_seed`, which
+#: `tree_parameters_extra.mojo:1612` sets to `DEFAULT_RANDOM_STRENGTH_SEED` and
+#: which no Python surface can set: `bindings/_mojotrees.mojo` parses
+#: `random_strength` and no seed beside it. So the CatBoost-mode arm's noise
+#: runs from a native constant whatever this value is, and
+#: `CATBOOST_UNMATCHABLE['split_scoring']` remains true for a second reason now:
+#: not only are the two streams different by construction, ours is not even
+#: reachable from the harness.
+SHARED_SEED = 190019
+
 BASE_PARAMS = {
     "num_leaves": 31,
     "max_depth": -1,
@@ -239,7 +268,7 @@ LIGHTGBM_ALIGNMENT = {
     "feature_pre_filter": False,
     "enable_bundle": False,
     "verbosity": -1,
-    "seed": 190019,
+    "seed": SHARED_SEED,
 }
 
 #: The three entries above that differ from LightGBM's stock default, each
@@ -467,7 +496,7 @@ CATBOOST_MIN_VERSION = (1, 2)
 CATBOOST_ALIGNMENT = {
     "allow_writing_files": False,
     "logging_level": "Silent",
-    "random_seed": 190019,
+    "random_seed": SHARED_SEED,
 }
 
 #: The ONE shared parameter that is forced onto the CatBoost arm, and the
@@ -1265,6 +1294,24 @@ MOJOTREES_CATBOOST_MODE = {
     # carried is true and is kept in MOJOTREES_CATBOOST_MODE_REASONS, which
     # is where a claim about granularity belongs; it just was not a key this
     # dict could carry.
+    # CatBoost's one_hot_max_size under our name. CatBoost resolves 2 and our
+    # default is 4, so this arm and the CatBoost arm differed on the cutoff
+    # that decides whether a categorical column is one-hot encoded or handed
+    # to the split search. It is INERT on every scenario this arm runs, all
+    # three of which are numeric, and it is set anyway: a not_reached key is a
+    # divergence waiting for a scenario, and the alternative was leaving it
+    # unset with a comment promising somebody would notice.
+    #
+    # Reachability checked rather than assumed, because the last key added to
+    # this dict without a run behind it was `max_bin` and it killed a smoke
+    # pass. The route is `mojotrees.train(params, Dataset)` ->
+    # `basic._Config.__init__`, which forwards every remaining key as a keyword
+    # into `MojoTreesRegressor.__init__`; `max_cat_to_onehot` is a declared
+    # constructor argument there (python/mojotrees/sklearn.py:610) with default
+    # 4, is validated as nonnegative, and reaches the wire at
+    # `bindings/_mojotrees.mojo:1093`. It is NOT in `basic._DATASET_PARAMS`,
+    # which is what `max_bin` was and why that one raised.
+    "max_cat_to_onehot": 2,
     "bootstrap_type": "MVS",
     # NOT row bagging. Under `bootstrap_type="MVS"` this key is the MVS rate
     # and row bagging is off, which is CatBoost's own contract for the
@@ -1342,6 +1389,17 @@ MOJOTREES_CATBOOST_MODE_REASONS = {
         "GreedyLogSum yields exactly min(border_count, distinct - 1), which "
         "is LightGBM's rule too. Only the placement differs"
     ),
+    "max_cat_to_onehot": (
+        "CatBoost's one_hot_max_size default of 2, which is the cardinality "
+        "at or below which a categorical column is one-hot encoded instead of "
+        "becoming a CTR. Ours defaults to 4, so the two arms crossed that "
+        "boundary at different cardinalities. Inert on all three scenarios "
+        "this arm runs, none of which has a categorical column; set anyway, "
+        "because the alternative is a divergence that goes live the day a "
+        "categorical scenario unparks and that nothing would have caught. "
+        "CATBOOST_PARAM_MAP's required_when_scenarios is the check that this "
+        "stays set once one does"
+    ),
     "max_depth": "CatBoost's depth default",
     "num_leaves": (
         "CatBoost's resolved max_leaves, which is 2**depth. Set so the leaf "
@@ -1389,6 +1447,85 @@ MOJOTREES_CATBOOST_MODE_REASONS = {
 #: is exactly the hand-written belief the whole change removes.
 MOJOTREES_CATBOOST_MODE_FROM_READBACK = {
     "learning_rate": "learning_rate",
+}
+
+#: Keys the CatBoost-mode arm REMOVES from the shared parameters, so that
+#: mojotrees's own defaulting fires instead of receiving a value.
+#:
+#: **Empty today, and the reason it exists is a transition that is already
+#: scheduled.** A lane is making `auto_learning_rate.mojo` reachable and ON by
+#: default in CatBoost mode, with CatBoost's own gate: the automatic rate fires
+#: only when `learning_rate`, `leaf_estimation_method`,
+#: `leaf_estimation_iterations` and `l2_leaf_reg` are ALL unset. The moment
+#: that lands, this arm has a problem that `MOJOTREES_CATBOOST_MODE` cannot
+#: express, because that dict is applied with `dict.update` and update can
+#: override a key but cannot delete one.
+#:
+#: `mojotrees_params` sets `learning_rate` unconditionally from `BASE_PARAMS`.
+#: So on the day the automatic rate exists, this arm would still arrive at the
+#: trainer with `learning_rate=0.1` set, CatBoost's gate would not fire, and
+#: the arm would run a pinned rate under a heading that says it derives one.
+#: That failure is silent: the fit succeeds and the number looks fine.
+#:
+#: The handover this arm uses today has the same shape from the other side --
+#: it SETS `learning_rate` from CatBoost's read-back -- so the two mechanisms
+#: are mutually exclusive by construction and `selfcheck` fails if a key is in
+#: both tables. Read `CATBOOST_LEARNING_RATE_TRANSITION` for which one should
+#: be live when.
+MOJOTREES_CATBOOST_MODE_UNSET = ()
+
+#: How this arm gets CatBoost's learning rate, now and next, in one place.
+#:
+#: Written down because two mechanisms are in flight for one value and the
+#: failure mode of having both half-wired is an arm that looks right and runs
+#: a rate neither engine chose.
+CATBOOST_LEARNING_RATE_TRANSITION = {
+    "today": (
+        "HANDOVER. The CatBoost cell for a scenario runs first and writes its "
+        "CatBoost.get_all_params() into the run's catboost_readback.json; the "
+        "CatBoost-mode cell reads that file and takes the resolved rate. "
+        "MOJOTREES_CATBOOST_MODE_FROM_READBACK is the wiring and "
+        "CatBoostReadbackMissing is what happens without it. The value our arm "
+        "trains at is CatBoost's own number, not a number computed from a "
+        "reimplementation of CatBoost's formula"
+    ),
+    "next": (
+        "DERIVATION, once auto_learning_rate.mojo is reachable and on by "
+        "default in CatBoost mode. Our arm computes the rate from the same "
+        "inputs, so it no longer needs a CatBoost fit to have happened first, "
+        "and the scheduling constraint between the two cells goes away"
+    ),
+    "the_handover_does_not_go_away_when_the_derivation_lands": (
+        "and this is the whole argument for keeping it. A derived rate is our "
+        "formula's output. Nothing in a record would say whether it agrees "
+        "with CatBoost's, and 'CatBoost mode mirrors CatBoost exactly' is a "
+        "claim that has to be measured rather than asserted. The read-back is "
+        "the only artifact that carries CatBoost's actual number, so it stops "
+        "being an INPUT and becomes a CHECK: catboost_parity_from_records "
+        "compares our resolved learning_rate against the CatBoost row's "
+        "engine_resolved_params for the same cell and fails on a mismatch. "
+        "That function is already written and already called at record time"
+    ),
+    "how_to_switch": (
+        "one dict entry moves and nothing else. Take `learning_rate` out of "
+        "MOJOTREES_CATBOOST_MODE_FROM_READBACK, which makes "
+        "catboost_readback_values return {} and the arm buildable without a "
+        "read-back, and put it into MOJOTREES_CATBOOST_MODE_UNSET so the "
+        "shared 0.1 is REMOVED rather than passed and CatBoost's gate can "
+        "fire. Do not add it to MOJOTREES_CATBOOST_MODE: a value there is a "
+        "pin, which is what turns the automatic rate off"
+    ),
+    "where_the_comparison_lives": (
+        "at RECORD time, in worker.run_job, through "
+        "scenarios.record_parity_block. Deliberately not in selfcheck.py, "
+        "which trains nothing and downloads nothing by design and must keep "
+        "running in under a second anywhere: a get_all_params() call needs a "
+        "fitted model and there is no fit in that process. Deliberately not "
+        "against a read-back recorded by an earlier run either, because a "
+        "stale read-back from another shape is exactly the wrong-number-that-"
+        "looks-right this whole entry is about. selfcheck checks the WIRING "
+        "statically; the run checks the VALUE"
+    ),
 }
 
 # ---------------------------------------------------------------------------
@@ -1600,52 +1737,28 @@ CATBOOST_PARAM_MAP = {
         "note": "CPU against cpu, folded case. The CatBoost adapter refuses "
                 "any other device outright (engines.CatBoostEngine.load)",
     },
-    # --- we have the knob and this arm does not reach it -------------------
     "random_seed": {
-        "ours": "seed",
-        "verdict": "not_reached",
-        "our_default": None,
-        "reason": (
-            "CatBoost and LightGBM are both pinned to 190019 and the "
-            "mojotrees arms are pinned to nothing: mojotrees_params passes no "
-            "seed, on the argument in its own docstring that mojotrees is "
-            "reproducible across thread counts with no parameter. That "
-            "argument is about REPEATABILITY and it does not make two arms "
-            "share a random stream. It cost nothing while this arm was "
-            "deterministic; it costs something now, because "
-            "random_strength=1.0 makes the arm's split scores depend on a "
-            "seed (the draw is keyed on (seed, tree, row), "
-            "python/mojotrees/sklearn.py _resolve_bootstrap and "
-            "CATBOOST_UNMATCHABLE['split_scoring']). Matching the NUMBER "
-            "would not match the DRAWS, which is why this is left unset "
-            "rather than set to 190019 and called matched. It is recorded "
-            "here so that a reader knows the three arms are seeded from two "
-            "different constants"
-        ),
-        "required_when_scenarios": (),
+        "ours": "random_state",
+        "verdict": "matched",
+        "translate": "identity",
+        "note": "SHARED_SEED, referenced by all three translators as of "
+                "2026-08-16. It was 190019 on two arms and absent on the "
+                "other two until then. Read SHARED_SEED's own comment for "
+                "which draws this actually reaches: on these scenarios only "
+                "the MVS bootstrap, and NOT the split-score noise, whose seed "
+                "has no Python edge at all",
     },
     "one_hot_max_size": {
         "ours": "max_cat_to_onehot",
-        "verdict": "not_reached",
-        "our_default": 4,
-        "our_default_source": (
-            "CATEGORICAL_PARAMS['max_cat_to_onehot'] = 4, and "
-            "python/mojotrees/sklearn.py resolves the alias with the same "
-            "default"
-        ),
-        "reason": (
-            "CatBoost resolves 2 and our default is 4, so this arm and the "
-            "CatBoost arm WOULD differ on a categorical scenario. Neither "
-            "categorical scenario runs this arm "
-            "(MOJOTREES_CATBOOST_MODE_SCENARIO_SUPPORT skips both), so today "
-            "the key reaches no cell and setting it would be a value nothing "
-            "reads. It is deliberately NOT added to MOJOTREES_CATBOOST_MODE "
-            "for that reason and for one more: the last key added to that "
-            "dict without a run behind it was max_bin, which killed the smoke "
-            "pass, and this lane could not run one. `required_when_scenarios` "
-            "makes the omission fail loudly the moment either categorical "
-            "scenario is turned on for this arm"
-        ),
+        "verdict": "matched",
+        "translate": "identity",
+        "note": "CatBoost resolves 2 and our default is 4. Set explicitly in "
+                "MOJOTREES_CATBOOST_MODE rather than left to the default, "
+                "even though it is inert on all three scenarios this arm "
+                "runs. required_when_scenarios below is what keeps it set: "
+                "once a categorical scenario unparks for this arm, the check "
+                "demands the key be named in MOJOTREES_CATBOOST_MODE rather "
+                "than agreeing by coincidence",
         "required_when_scenarios": (
             "high_cardinality_categorical",
             "categorical_missing",
@@ -3158,6 +3271,16 @@ def mojotrees_params(spec, device, extra=None):
     that is the point of the setting rather than an omission: mojotrees is
     reproducible across thread counts with no parameter and no cost, so
     there is nothing here to turn on.
+
+    **`random_state` is here as of 2026-08-16 and it used to be absent.** The
+    paragraph above was read for longer than it should have been as an
+    argument that this arm needed no seed at all, and it is not one: it says a
+    fit REPEATS without a seed, not that three arms share a stream without one.
+    They did not. LightGBM and CatBoost were both pinned to 190019 and this
+    translator passed nothing, so the mojotrees arms ran from the estimator's
+    own per-component defaults. `SHARED_SEED` is the one constant all three now
+    reference, and its docstring records exactly which draws that does and does
+    not reach.
     """
     shared = shared_params(spec, extra)
     params = {
@@ -3167,6 +3290,12 @@ def mojotrees_params(spec, device, extra=None):
         "learning_rate": shared["learning_rate"],
         "min_data_in_leaf": shared["min_data_in_leaf"],
         "min_child_hess": shared["min_child_hess"],
+        # scikit-learn's spelling and this library's canonical one
+        # (docs/PARAMETER_NAMING.md). `MojoTreesRegressor.__init__` takes it,
+        # `_resolve_seeds` fans it out to every per-component seed, and
+        # `_resolve_bootstrap` reads it for `bootstrap_seed`, which is the one
+        # that is live on the CatBoost-mode arm.
+        "random_state": SHARED_SEED,
         # No `lambda_l2`, for the same reason as on the LightGBM side: the
         # estimator's own default is LightGBM's 0.0 now, so passing it
         # would restate a default rather than align anything.
@@ -3463,6 +3592,13 @@ def mojotrees_catboost_mode_params(
     """
     params = mojotrees_params(spec, device, extra)
     params.update(MOJOTREES_CATBOOST_MODE)
+    # Removals before additions, and removals at all, because `update` can
+    # override a key and cannot delete one. Empty today; the key this exists
+    # for is `learning_rate`, on the day mojotrees derives CatBoost's automatic
+    # rate itself and needs the parameter UNSET for its own gate to fire. See
+    # MOJOTREES_CATBOOST_MODE_UNSET and CATBOOST_LEARNING_RATE_TRANSITION.
+    for key in MOJOTREES_CATBOOST_MODE_UNSET:
+        params.pop(key, None)
     params.update(catboost_readback_values(spec, catboost_readback))
     return params
 
@@ -4089,33 +4225,38 @@ def _READBACK_STANDIN(spec):
 #: run MVS for multiclass either: its own defaulting block excludes
 #: multiclass-only losses and falls back to the Bayesian bootstrap. So the
 #: skip is what CatBoost does, not merely what we cannot do.
-#: The three cells this arm ran until 2026-08-16 are PARKED, not deleted. The
-#: reason is one sentence and the rest of this string is what to do about it.
+#: UNPARKED 2026-08-16, same day. The three cells below were parked for the
+#: few hours between `cb-shipped` landing in this file and the read-back
+#: reaching them, and the history is kept because the shape of the dependency
+#: is now a permanent property of this arm rather than a transitional state.
+#:
+#: **The CatBoost cell for a scenario must run before the CatBoost-mode cell
+#: for the same scenario.** The CatBoost arm no longer passes a learning rate,
+#: CatBoost resolves its own from the budget and the dataset, and this arm
+#: takes that resolved value. There is no constant that could stand in: the
+#: rate moves with the row count and the feature count, so the 0.4273 measured
+#: on 20,000 by 20 is not the rate for any scenario in this suite.
+#:
+#: `run.py` enforces the order with a sort key composed under the repeat sort,
+#: and `worker.py` carries the value between the two processes through the
+#: run's `catboost_readback.json`. A mode cell scheduled without its CatBoost
+#: partner raises `CatBoostReadbackMissing` by name and does not fall back.
 MOJOTREES_CATBOOST_MODE_PARKED = (
-    "PARKED 2026-08-16 by the cb-shipped change, and this is a WIRING gap "
-    "rather than a capability one. The CatBoost arm no longer passes a "
-    "learning rate, so CatBoost resolves its own -- roughly 0.4273 at 100 "
-    "iterations against the 0.1 the other two arms run -- and this arm's "
-    "whole claim is that it is us in CatBoost's shape. Taking that value "
-    "needs the CatBoost cell for the same scenario, tier and variant to run "
-    "FIRST and to hand this cell its engine_resolved_params; nothing in "
-    "run.py or worker.py does that yet. The mechanism is built and unrun: "
-    "catboost_readback_key, catboost_readback_entry, load_catboost_readback "
-    "and mojotrees_catboost_mode_params(catboost_readback=...). Parked rather "
-    "than left to raise, because a raising cell is an infrastructure failure "
-    "and this harness withholds the quality verdict for the whole matrix on "
-    "one of those, so three unbuildable cells would suppress the verdict on "
-    "every cell that did run. Parked rather than given a fallback, because a "
-    "fallback to BASE_PARAMS['learning_rate'] is a hand-written belief about "
-    "CatBoost's resolution that is wrong by a factor of four, which is the "
-    "defect this arm was rebuilt to remove. Unpark by applying "
-    "WIRE_NOTE_resolved_param_parity.md and setting these three back to None"
+    "kept as a named constant because the reason it existed can recur: this "
+    "arm cannot be built without CatBoost's read-back for the same cell, so "
+    "any change that breaks the ordering in run.py or the sidecar in "
+    "worker.py takes these three cells down again. If that happens, park them "
+    "here rather than letting them raise -- a raising cell is an "
+    "infrastructure failure and this harness withholds the quality verdict "
+    "for the whole matrix on one of those -- and never give the arm a "
+    "fallback, because a static learning rate is the defect it was rebuilt to "
+    "remove"
 )
 
 MOJOTREES_CATBOOST_MODE_SCENARIO_SUPPORT = {
-    "dense_regression": MOJOTREES_CATBOOST_MODE_PARKED,
-    "imbalanced_binary": MOJOTREES_CATBOOST_MODE_PARKED,
-    "ordered_boosting_small": MOJOTREES_CATBOOST_MODE_PARKED,
+    "dense_regression": None,
+    "imbalanced_binary": None,
+    "ordered_boosting_small": None,
     "high_cardinality_categorical": (
         "grow_policy=oblivious is implemented for numerical thresholds "
         "only, and this arm asks for symmetric trees. A level of an "

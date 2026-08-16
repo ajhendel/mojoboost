@@ -295,7 +295,21 @@ def run_job(job):
         train_desc["digest"] = data_digest(train)
         test_desc["digest"] = data_digest(test)
 
-    engine = engines.build(job["engine"], job["threads"], job["device"])
+    # CatBoost's resolved parameters for the cells this run has already
+    # measured. Only `mojotrees_catboost_mode` reads it, and it refuses to
+    # build without the entry for its own cell rather than guessing a learning
+    # rate: see scenarios.MOJOTREES_CATBOOST_MODE_FROM_READBACK. The file is
+    # written below by whichever CatBoost cell ran first, and `run.py` orders
+    # the CatBoost cell ahead of the CatBoost-mode cell inside each round.
+    catboost_readback = None
+    readback_path = job.get("catboost_readback_path")
+    if readback_path and os.path.exists(readback_path):
+        with open(readback_path) as handle:
+            catboost_readback = json.load(handle)
+
+    engine = engines.build(
+        job["engine"], job["threads"], job["device"], catboost_readback
+    )
     engine.load()
     warmup = engine.warmup(spec)
     # The trainer's own instrument, on for the measured fit and off for
@@ -322,6 +336,15 @@ def run_job(job):
     # mojotrees record was missing n_estimators. Both are alignment
     # settings, and the records were being read as evidence of alignment.
     params_used = result.pop("params_used")
+    # The other half of the handover. A CatBoost cell writes its own resolved
+    # parameters into the run's sidecar, keyed by (scenario, tier, variant), so
+    # the CatBoost-mode cell for that same cell can read them in a later
+    # process. Popped rather than left in `result` because it is a channel
+    # between two cells and not a field of this record; what the record carries
+    # is `engine_resolved_params`, which was already there.
+    readback_entry = result.pop("catboost_readback", None)
+    if readback_entry and readback_path:
+        scenarios.append_catboost_readback(readback_path, readback_entry)
     dataset_params_used = result.pop("dataset_params_used", None)
     dataset_params_reason = result.pop("dataset_params_unavailable_reason", None)
     num_boost_round = result.pop("num_boost_round", None)
@@ -359,6 +382,19 @@ def run_job(job):
             "dataset": dataset_params_used,
             "dataset_unavailable_reason": dataset_params_reason,
             "num_boost_round": num_boost_round,
+            # Both engines' resolved dicts and the key-by-key verdict, on
+            # EVERY row rather than only in the manifest. A record used to
+            # carry what its own engine was passed and nothing about what the
+            # engine it is compared against resolved, so a published ratio was
+            # readable only by somebody who also held the other row and knew
+            # which parameters each library derives for itself.
+            "resolved_parity": scenarios.record_parity_block(
+                spec,
+                job["engine"],
+                params_used,
+                dataset_params_used,
+                catboost_readback,
+            ),
         },
         "caveats": list(spec.get("caveats", [])) + list(result.get("notes", [])),
         "quality": scores,
