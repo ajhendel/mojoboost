@@ -1405,7 +1405,7 @@ def build_histogram_into_scratch(
     if const_h and _resolve_const_hessian_verify(const_hessian_env):
         _check_constant_hessian(hess, data.n_rows)
 
-    # The three output buffers are passed as separate `mut` lists rather than
+    # The two output buffers are passed as separate `mut` lists rather than
     # reached through `out`: a pointer taken from a struct field carries that
     # field's origin, which a worker closure cannot capture.
     #
@@ -2755,11 +2755,13 @@ def _accumulate_blocked_at[
     # It runs in two passes over one slot. The first sums blocks 1..n-1 into
     # block 0's slots *in place*, which is elementwise over a contiguous run
     # of `n_bins * stride` floats and therefore vectorizes at full width; the
-    # interleaved cell is what makes that run contiguous, where the three
-    # separate planes it replaced forced three strided streams. The second
-    # walks the folded cells once per bin and writes the three output planes.
-    # The addition order per slot is block 0, then block 1, and so on, which
-    # is the order the previous per-cell fold used.
+    # interleaved cell is what makes that run contiguous, where the separate
+    # planes it replaced forced strided streams. The second walks the folded
+    # cells once per bin and copies each cell's pair into the output's own
+    # interleaved plane -- a 16-byte move on the general arm, not a scatter --
+    # alongside the one count store. The addition order per slot is block 0,
+    # then block 1, and so on, which is the order the previous per-cell fold
+    # used.
     def fold_slots(s_start: Int, s_end: Int) {imm}:
         for j in range(s_start, s_end):
             var f = j if use_all else feat_p.unsafe_load(j)
@@ -2907,7 +2909,7 @@ def build_histogram_subset_replica_into[
         (n_features - n_active) * n_bins,
     )
 
-    # The three output buffers are passed as separate `mut` lists rather than
+    # The two output buffers are passed as separate `mut` lists rather than
     # reached through `out`, exactly as `build_histogram_into` explains: a
     # pointer taken from a struct field carries that field's origin, which a
     # worker closure cannot capture.
@@ -4210,7 +4212,8 @@ def _accumulate_subset_row_major_blocked(
     # block 0's cells *in place*, which is elementwise over a contiguous run
     # of `(lim - lo) * stride` floats and therefore vectorizes at full width;
     # the interleaved cell is what makes that run contiguous. Pass two walks
-    # the folded cells once per bin and writes the three output planes. The
+    # the folded cells once per bin and copies each cell's pair into the
+    # output's own interleaved plane, alongside the one count store. The
     # addition order per cell is block 0, then block 1, and so on, which is
     # the order the feature-major fold uses and the reason the two agree.
     def fold_units(u_start: Int, u_end: Int) {imm}:
