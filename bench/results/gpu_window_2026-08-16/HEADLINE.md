@@ -22,6 +22,13 @@ sit on opposite sides of the comparator, and which number is "mojotrees against
 LightGBM" depends entirely on which backend a user gets -- which is why
 `device='auto'` reaching the GPU above the crossover was worth a lane.
 
+> **WITHDRAWN FROM USE 2026-08-16, by direction.** The twelve-repeat figures
+> below, the 1.49x, and the thermal-fate rule they suggested are **suspect and
+> are not to be quoted, cited, or built on.** They came from a run the canary
+> discarded, and no window is being spent to redo them. The section stays as a
+> record of what was seen and why it was thrown away, not as a result. **The
+> 1.18x above is the only speed figure from this window that may be used.**
+
 ## Both engines throttle, ours less, and that inflates our margin
 
 The first attempt at this ran **twelve** repeats, on the CPU campaign's advice
