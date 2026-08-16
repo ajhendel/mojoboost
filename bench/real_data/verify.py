@@ -9,9 +9,14 @@ after it:
 1. Completeness. A run that errored or timed out is a failure, not an
    absence. Silently comparing the cells that happened to finish is how a
    suite reports green on a broken build.
-2. Data agreement. Both engines rebuilt the data in their own processes;
-   their digests must match. If they do not, nothing downstream means
-   anything and the rest of the checks are skipped for that scenario.
+2. Data agreement. Every engine rebuilt the data in its own process; their
+   canonical digests must match. If they do not, nothing downstream means
+   anything and the rest of the checks are skipped for that scenario. An
+   engine that could not take the canonical container -- CatBoost with a
+   categorical block, which its API refuses on a float array -- also has to
+   show that its re-encoding reconstructs the canonical form byte for byte.
+   The canonical digest cannot see that on its own, which is why it is a
+   second question here rather than a footnote.
 3. Pinning. A real-data row whose bytes were never verified against the
    lock is not a real-data result.
 4. Determinism. mojotrees trains bit-identically on a repeat, on the CPU
@@ -131,9 +136,52 @@ def check_completeness(records, verdict):
 
 
 def check_data_agreement(ok, config, verdict):
-    """Digests of the training and test matrices, per scenario."""
+    """Digests of the training and test matrices, per scenario.
+
+    Two questions, and the second one was added on 2026-08-16 because the
+    first stopped covering it. The digest comparison asks whether the arms
+    were given the same PROBLEM, and it is computed from the canonical data
+    before any engine sees it, so it is equal across arms whatever an
+    adapter subsequently does with its copy. That is exactly what makes it
+    trustworthy and exactly what makes it blind to the new failure: an
+    engine that cannot take the canonical container re-encodes it, and a
+    bug in that re-encoding leaves the canonical digest untouched. The
+    re-encoding therefore proves itself per record -- reconstruct the
+    canonical form out of what the engine was handed and hash it back --
+    and `agrees_with_canonical` carries the verdict. Reading it here is
+    what makes it a gate rather than a field.
+    """
     require = config["defaults"]["data_agreement"]["require_identical_digests"]
     broken = set()
+    for record in ok:
+        for part in ("train", "test"):
+            encoding = ((record["data"] or {}).get(part) or {}).get("encoding")
+            if not encoding or encoding.get("is_canonical", True):
+                continue
+            scope = f"{record['scenario']}/{record['engine']}/{part}"
+            agrees = encoding.get("agrees_with_canonical")
+            if agrees is True:
+                verdict.add(
+                    PASS, "data_agreement", scope,
+                    f"re-encoded as {encoding.get('form')} and the "
+                    "reconstruction hashes back to the canonical digest",
+                )
+            elif agrees is None:
+                verdict.add(
+                    WARN, "data_agreement", scope,
+                    f"re-encoded as {encoding.get('form')} with no canonical "
+                    "digest to check it against: "
+                    + str(encoding.get("agrees_unavailable_reason")),
+                )
+            else:
+                broken.add(record["scenario"])
+                verdict.add(
+                    FAIL if require else WARN, "data_agreement", scope,
+                    f"re-encoded as {encoding.get('form')} and the "
+                    "reconstruction does NOT hash back to the canonical "
+                    "digest. This engine trained on different data from the "
+                    "others and every number in this record is void",
+                )
     by_scenario = {}
     for record in ok:
         by_scenario.setdefault(record["scenario"], []).append(record)

@@ -398,7 +398,13 @@ CATBOOST_DEFAULTS_SOURCE = (
     "after a two-iteration RMSE fit on 20,000 rows by 20 features, "
     "task_type CPU. Cross-read against catboost/core.py's Pool.quantize "
     "docstring for border_count, feature_border_type, nan_mode and "
-    "sparse_features_conflict_fraction"
+    "sparse_features_conflict_fraction. The categorical entries -- "
+    "one_hot_max_size, max_ctr_complexity, counter_calc_method, "
+    "ctr_target_border_count, store_all_simple_ctr and has_time -- were "
+    "read separately on 2026-08-16 off two-iteration fits that HAD "
+    "cat_features, because a fit with no categorical column is not evidence "
+    "about what CatBoost resolves for one. Three shapes and two losses, "
+    "agreeing on every value"
 )
 
 #: The minimum CatBoost this harness will run as the peer arm.
@@ -533,6 +539,25 @@ CATBOOST_LEFT_AT_STOCK = {
     "posterior_sampling": False,
     "random_score_type": "NormalWithModelSizeDecrease",
     "task_type": "CPU",
+    # The categorical block, added 2026-08-16 when the arm gained a
+    # categorical path and these stopped being settings nothing reached.
+    # Read the same way as everything above -- get_all_params() after a
+    # two-iteration fit -- but on a fit that actually HAD cat_features, at
+    # 500 rows with two and with five categorical columns and at 5,000 rows
+    # with five, on both Logloss and RMSE. Every value below was the same in
+    # all of them.
+    #
+    # `max_ctr_complexity` is the entry to look at twice. CatBoost's
+    # documentation gives its CPU default as 4; the library resolved 1. The
+    # reading is the one recorded, and CATBOOST_UNMATCHABLE
+    # ['ctr_combinations'] carries what follows from it, which is that this
+    # arm builds no CTR feature combinations at its own defaults.
+    "one_hot_max_size": 2,
+    "max_ctr_complexity": 1,
+    "counter_calc_method": "SkipTest",
+    "ctr_target_border_count": 1,
+    "store_all_simple_ctr": False,
+    "has_time": False,
 }
 
 #: The differences between CatBoost's defaults and this harness's shared
@@ -592,10 +617,18 @@ CATBOOST_UNMATCHABLE = {
     ),
     "missing_values": (
         "CatBoost's nan_mode default is Min, which sends every missing "
-        "numeric value to the low side. LightGBM and mojotrees learn a "
-        "default direction per split. The categorical_missing scenario is "
-        "where this would show, and that scenario does not run CatBoost for "
-        "a separate reason: see CATBOOST_SCENARIO_SUPPORT"
+        "NUMERIC value to the low side; LightGBM and mojotrees learn a "
+        "default direction per split. On a CATEGORICAL column nan_mode does "
+        "not apply at all and CatBoost has no rule to compare: it refuses "
+        "the value rather than routing it. That asymmetry is why the "
+        "categorical_missing scenario still has no CatBoost row, and the "
+        "reason is now stated in full in "
+        "CATBOOST_SCENARIO_SUPPORT['categorical_missing'] and "
+        "CATBOOST_CATEGORICAL_ENCODING['missing_categories'] rather than "
+        "deferred to 'a separate reason'. No scenario in this suite "
+        "currently reads nan_mode against a learned direction: "
+        "categorical_missing is the one that would and it does not run this "
+        "arm"
     ),
     "binning_budget": (
         "CatBoost's border_count is a count of thresholds and LightGBM's "
@@ -632,31 +665,186 @@ CATBOOST_UNMATCHABLE = {
         "CatBoost splits categorical features on ordered target statistics "
         "(CTR), which is a different algorithm from LightGBM's and "
         "mojotrees's category-set split and uses the label to build the "
-        "feature. STILL TRUE, and still the reason: no scenario in this "
-        "suite runs CatBoost with categorical features. What changed on "
-        "2026-08-16 is that the absence is now a BLOCKED comparison rather "
-        "than an unattempted one, and the two halves have to be read apart. "
-        "WHAT IS NOW COMPARED: high_cardinality_categorical puts mojotrees's "
-        "category-set split against LightGBM's at five cardinalities chosen "
-        "to cross both engines' capacity rules -- max_cat_to_onehot at 4, "
+        "feature. That difference is permanent and no parameter closes it. "
+        "What changed on 2026-08-16 is that it is now MEASURED rather than "
+        "absent: high_cardinality_categorical runs all three arms with the "
+        "same five columns declared categorical, on one canonical dataset "
+        "with one digest, so the CTR and the category-set split are read "
+        "against each other at five cardinalities chosen to cross both of "
+        "the other engines' capacity rules -- max_cat_to_onehot at 4, "
         "max_cat_threshold's 32-category prefix cap, min_data_per_group's "
         "100-row floor, and the 254-category ceiling that "
-        "src/mojotrees/categorical.mojo has and LightGBM does not -- plus a "
-        "double-centered two-column interaction that no single-column split "
-        "carries. That is a real reading of the category-set algorithm at "
-        "scale and it did not exist before. WHAT IS STILL NOT COMPARED: "
-        "anything CatBoost does. The CTR itself, the ordered permutation it "
-        "is computed over, and CTR feature COMBINATIONS -- which is the "
-        "mechanism the interaction column was built for -- have no CatBoost "
-        "row on that scenario or on any other, and the blocker is not this "
-        "table's subject at all. It is the harness's float64 matrix: see "
-        "CATBOOST_SCENARIO_SUPPORT['high_cardinality_categorical'], which is "
-        "word for word the categorical_missing blocker. So the honest "
-        "statement is that the scenario CatBoost's categorical algorithm "
-        "would be read on now EXISTS and is unreachable, where before there "
-        "was nothing to reach. This entry closes when the loader can hand "
-        "every engine an integer-typed categorical block whose digest all "
-        "three agree on, and not before"
+        "src/mojotrees/categorical.mojo has and LightGBM does not. This "
+        "entry stays in the unmatchable table because that is what it is: "
+        "the three arms are answering the same question with three "
+        "different features, and a gap between them is the algorithms and "
+        "not a tuning difference. It is no longer a MISSING row, which is "
+        "what it used to be. Read it with 'ctr_combinations' below, which "
+        "is the half of CatBoost's categorical machinery this scenario "
+        "still does not reach, and with CATBOOST_CATEGORICAL_ENCODING, "
+        "which is why one digest covers two containers"
+    ),
+    "ctr_combinations": (
+        "CatBoost's CTR feature COMBINATIONS -- a target statistic over a "
+        "TUPLE of categorical values rather than over one column -- are the "
+        "mechanism the double-centered two-column interaction in "
+        "high_cardinality_categorical was drawn for, and at CatBoost's own "
+        "defaults they DO NOT RUN. Measured, not read off the docs, and the "
+        "two disagree. CatBoost documents max_ctr_complexity's default as 4 "
+        "on CPU; catboost 1.2.10 resolves it to 1. Read back through "
+        "get_all_params() after two-iteration fits on 2026-08-16 at 500 "
+        "rows with 2 categorical columns, 500 rows with 5, and 5,000 rows "
+        "with 5, on both Logloss and RMSE: 1 in every case. The readback is "
+        "faithful rather than a display artifact -- passing "
+        "max_ctr_complexity 2 and 4 explicitly reads back 2 and 4 -- so 1 "
+        "is what CatBoost resolved, and complexity 1 means single-column "
+        "CTRs only. The consequence for the record is exact: the "
+        "interaction term is reachable on this arm only by stacking two "
+        "splits, which is the same way LightGBM and mojotrees have to reach "
+        "it, so on that term the three arms are on equal footing and the "
+        "scenario's claim to read a combination feature is NOT met. Setting "
+        "max_ctr_complexity would meet it and would make the column "
+        "something other than CatBoost's defaults, so it is in "
+        "CATBOOST_REFUSED_PARAMS instead. A combinations row is worth "
+        "having and it is a differently labelled one"
+    ),
+}
+
+#: How the CatBoost arm is handed a categorical column, and the argument for
+#: why that is still one dataset rather than two.
+#:
+#: This is the field to read before quoting any CatBoost number on
+#: `high_cardinality_categorical`, and it is long because the digest question
+#: is the whole of whether that row means anything.
+#:
+#: **The problem.** `catboost/core.py:804` refuses `cat_features` on a
+#: floating-point array by `dtype.kind`, not by content: "'data' is numpy
+#: array of floating point numerical type, it means no categorical features,
+#: but 'cat_features' parameter specifies nonzero number of categorical
+#: features". No value the harness could write into a float64 array passes
+#: that check, so the array has to change type. Only the categorical block
+#: can -- the numeric columns are genuinely real-valued -- so the container
+#: has to be mixed, and numpy has no mixed dtype. Hence a pandas frame with
+#: float64 numeric columns and int64 categorical ones, columns named `f{i}`
+#: positionally so `cat_features` stays a list of indices.
+#:
+#: **The digest decision, and it is a decision.** It is ONE dataset in two
+#: encodings, and the record says which encoding each engine got. Not two
+#: datasets, and not one dataset with the check quietly waived for CatBoost.
+#: The argument has three steps and the third is the one that does the work:
+#:
+#:   1. The values are identical. Category codes are integers in
+#:      `0 .. cardinality - 1`, every one of them exactly representable in
+#:      float64 (the ceiling is 2**53 and the largest cardinality in this
+#:      suite is 400,000), so `float64 -> int64 -> float64` is the identity
+#:      on them. Checked per column per run, not argued: see
+#:      `engines._catboost_categorical_frame`.
+#:   2. The problem statement is identical. "These five columns are
+#:      categorical" is not something CatBoost is told and the other two are
+#:      not. LightGBM gets it as `categorical_feature` and mojotrees gets it
+#:      as `categorical_feature` (its Python surface also accepts
+#:      `categorical_features`), from the same `train["categorical_feature"]`
+#:      list, on the same columns. What differs is what each engine DOES with
+#:      that statement, and that difference is the comparison rather than a
+#:      confound in it.
+#:   3. The canonical digest is untouched and unexempted.
+#:      `worker.data_digest` still hashes the float64 matrix and nothing
+#:      else, every arm's record still carries the same value, and
+#:      `verify.check_data_agreement` still fails the scenario if they
+#:      differ. On top of that the adapter reconstructs the canonical matrix
+#:      OUT of the finished frame, hashes it with the same function, and
+#:      `worker.apply_encoding_report` compares the two and writes
+#:      `agrees_with_canonical` into the record. So "same data in two
+#:      encodings" is a per-record measurement and not a claim in a comment.
+#:
+#: The alternative -- a second digest for CatBoost, with a caveat -- was
+#: rejected. Two digests make the check unable to fail: any bug in the
+#: re-encoding produces a second digest, which is exactly what a second
+#: digest is supposed to look like, and nothing distinguishes "re-encoded
+#: correctly" from "corrupted". One digest plus a reconstruction that has to
+#: hash back to it can fail, and a check that cannot fail is not a check.
+CATBOOST_CATEGORICAL_ENCODING = {
+    "form": "mixed_frame_int64_categorical",
+    "container": "pandas.DataFrame, float64 numeric and int64 categorical",
+    "why_not_float64": (
+        "catboost/core.py:804 refuses cat_features on a floating-point "
+        "ndarray by dtype.kind. Verified on catboost 1.2.10 on 2026-08-16 "
+        "by a 200-row Pool construction, which raised exactly that message"
+    ),
+    "why_not_object_array": (
+        "an object ndarray IS accepted -- dtype.kind 'O' passes the check, "
+        "verified on the same 200 rows -- and is one Python object per cell. "
+        "At the standard tier's 1,000,000 by 15 that is fifteen million "
+        "boxed objects, which is a container this harness will not build to "
+        "avoid a pandas dependency it already has"
+    ),
+    "digest_decision": (
+        "one dataset, two encodings, one canonical digest. The float64 "
+        "digest is unchanged, unexempted and still compared across all "
+        "arms; the adapter additionally reconstructs the canonical matrix "
+        "from the frame and hashes it with the same function, and the "
+        "record carries agrees_with_canonical per part per run"
+    ),
+    "verified_per_run": (
+        "every declared categorical column is checked finite, integral and "
+        "inside int64, and bitwise equal after float64 -> int64 -> float64, "
+        "before the frame is built. Then the whole frame is read back as "
+        "float64 and hashed. A column that fails any check raises and the "
+        "run is recorded as an error"
+    ),
+    "missing_categories": (
+        "THE ONE THING THIS DOES NOT SOLVE, and the reason "
+        "`categorical_missing` still has no CatBoost row. CatBoost has no "
+        "representation for a missing category and says so: \"Invalid type "
+        "for cat_feature[...]=nan : cat_features must be integer or string, "
+        "real number values and NaN values should be converted to string\" "
+        "(catboost 1.2.10, read 2026-08-16 off a 200-row Pool with one NaN "
+        "in a declared categorical column, in both a float64 column and an "
+        "object column holding np.nan). Converting it to a string or to a "
+        "negative integer IS accepted -- both verified on the same 200 rows "
+        "-- and both are a modelling decision, not an encoding. They are "
+        "also not a NEUTRAL one, which is the part that settles it: "
+        "LightGBM treats a negative or NaN category as missing and mojotrees "
+        "sends it to bin 0, which `src/mojotrees/categorical.mojo` documents "
+        "is never a member of a split set, so on both of those engines a "
+        "missing category is structurally unsplittable. A CatBoost sentinel "
+        "level is an ordinary level with an ordinary target statistic. In "
+        "`categorical_missing` the missingness is drawn against the TARGET's "
+        "upper tail, so that statistic is a target-correlated feature that "
+        "the other two engines cannot use by construction. A row produced "
+        "that way would look like a comparison and would be a handicap "
+        "match, which is worse than the skip it replaced"
+    ),
+    "cost": (
+        "a full extra copy of the matrix in the frame plus a transient copy "
+        "for the reconstruction, timed as the `encode` phase and counted in "
+        "e2e. It is a HARNESS-CONVERSION cost: a CatBoost user whose "
+        "categories already live in an integer column pays none of it, and "
+        "peak_rss_bytes on a categorical CatBoost row includes work neither "
+        "of the other two arms does. Subtract it before quoting a per-"
+        "iteration figure; do not subtract it before quoting an end-to-end "
+        "one, because the harness really did have to do it"
+    ),
+    "real_variants": (
+        "the two REAL datasets that carry categorical columns go through "
+        "this encoder too, and one of them may be refused by it. "
+        "`loaders._encode_categories` writes NaN into a categorical column "
+        "for an empty or missing field, so an adult or bank_marketing "
+        "column with any blank in it fails the finite check and the "
+        "CatBoost run is recorded as an error naming the column. That is "
+        "the intended outcome and not a defect: a blank category on a real "
+        "dataset is the same problem `missing_categories` describes and it "
+        "does not become a different one for being real. Neither real "
+        "variant has been fetched or run, so which of them actually "
+        "contains a blank is UNVERIFIED here"
+    ),
+    "not_warmed": (
+        "the warm-up fits one round on `_tiny_like`'s purely numeric matrix "
+        "and therefore never touches the categorical path, so the first "
+        "cat_features Pool of a run is inside the timed `ingest` phase. "
+        "Stated rather than fixed: making the warm-up categorical would need "
+        "`_tiny_like` to know which columns a scenario's DATA declares, "
+        "which is not something a spec carries"
     ),
 }
 
@@ -673,27 +861,18 @@ CATBOOST_SCENARIO_SUPPORT = {
     # for how little of that is verified, and CATBOOST_TIER_CAP for why the
     # arm stops at the standard tier.
     "ordered_boosting_small": None,
-    "high_cardinality_categorical": (
-        "the same blocker as categorical_missing, on the scenario that was "
-        "built for this arm's algorithm. The harness hands every engine one "
-        "float64 matrix with the categorical columns integer-coded into it, "
-        "and CatBoost refuses cat_features on a floating-point array "
-        "outright: \"'data' is numpy array of floating point numerical "
-        "type, it means no categorical features\". Handing CatBoost a "
-        "converted copy would give it different bytes from the other two "
-        "engines, which is the one thing worker.py's data digest exists to "
-        "prevent. Running it WITHOUT cat_features is worse than skipping "
-        "it: CatBoost would then split five integer-coded columns as "
-        "ordinal numbers, which is the exact error native categorical "
-        "handling exists to avoid, and the row would sit in a column headed "
-        "by two engines doing set splits. So this scenario has no CatBoost "
-        "row, and the cost of that is higher here than anywhere else in the "
-        "suite, because ordered target statistics and CTR combinations are "
-        "what this shape was drawn for. It clears the day the loader can "
-        "produce an integer-typed categorical block whose digest all three "
-        "engines agree on -- the same day categorical_missing clears, by "
-        "the same change"
-    ),
+    # Runs as of 2026-08-16, with cat_features. This entry was a skip whose
+    # stated exit condition was "the day the loader can produce an
+    # integer-typed categorical block whose digest all three engines agree
+    # on", and that is the change that landed: the adapter re-encodes the
+    # canonical float64 matrix into a mixed frame, the canonical digest is
+    # unchanged and unexempted, and the re-encoding proves itself per run by
+    # reconstructing the canonical matrix and hashing it back. The argument
+    # is CATBOOST_CATEGORICAL_ENCODING. The old skip predicted the wrong
+    # half: it said the two categorical scenarios would clear together by
+    # one change, and only this one did. categorical_missing's blocker was
+    # never the float64 matrix, which is why it is still below.
+    "high_cardinality_categorical": None,
     "ranking": (
         "CatBoost has no lambdarank. Its ranking losses are YetiRank, "
         "YetiRankPairwise, QueryRMSE and PairLogit, and none of them is the "
@@ -702,18 +881,31 @@ CATBOOST_SCENARIO_SUPPORT = {
         "two's, so this scenario has no CatBoost row"
     ),
     "categorical_missing": (
-        "the harness hands every engine one float64 matrix with the "
-        "categorical columns integer-coded into it, and CatBoost refuses "
-        "cat_features on a floating-point array outright: \"'data' is numpy "
-        "array of floating point numerical type, it means no categorical "
-        "features\". Handing CatBoost a converted copy would give it "
-        "different bytes from the other two engines, which is the one thing "
-        "worker.py's data digest exists to prevent. The generator also "
-        "drops values inside two categorical columns, and CatBoost has no "
-        "representation for a missing category: it would have to be encoded "
-        "as a level, which is a modelling decision made by the harness. So "
-        "this scenario has no CatBoost row until the loader can produce an "
-        "integer-typed categorical block whose digest both sides agree on"
+        "a missing category has no encoding that is the same data, and this "
+        "is now the WHOLE reason rather than half of it. The float64-matrix "
+        "half is gone: the CatBoost adapter re-encodes a categorical block "
+        "into int64 columns and proves the re-encoding per run, which is "
+        "what let high_cardinality_categorical start running on 2026-08-16. "
+        "It does not let this one. This generator drops values inside two "
+        "categorical columns, and CatBoost refuses a NaN there outright -- "
+        "\"cat_features must be integer or string, real number values and "
+        "NaN values should be converted to string\" -- so the harness would "
+        "have to choose a level to mean absence. A string sentinel and a "
+        "negative integer are both accepted by CatBoost, and both are the "
+        "same trap: LightGBM treats a negative or NaN category as missing "
+        "and mojotrees routes it to bin 0, which never joins a split set, "
+        "so on those two engines a missing category is structurally "
+        "unsplittable, while on CatBoost a sentinel level gets an ordinary "
+        "target statistic. This generator drops values as a function of the "
+        "TARGET's upper tail, so that statistic would be a target-"
+        "correlated feature available to exactly one arm. That is not a "
+        "caveat on a comparison, it is the absence of one. So this scenario "
+        "has no CatBoost row and the exit condition is a real one rather "
+        "than a harness change: it clears if CatBoost grows a missing-"
+        "category concept, or if a variant of this scenario is drawn with "
+        "missingness only in the numeric columns, which would be a "
+        "different scenario and should be named as one. See "
+        "CATBOOST_CATEGORICAL_ENCODING['missing_categories']"
     ),
 }
 
@@ -724,6 +916,26 @@ CATBOOST_SCENARIO_SUPPORT = {
 #: schedules the run, and it is here rather than in a lane report so that
 #: the manifest carries it.
 CATBOOST_SCENARIO_COST = {
+    "high_cardinality_categorical": (
+        "the newest CatBoost cell and the least characterized, so schedule "
+        "it before you commit a matrix to it. Three separate costs, and not "
+        "one of them is measured. (1) The `encode` phase is a full extra "
+        "copy of the matrix plus a transient second one for the "
+        "reconstruction hash: at the standard tier's 1,000,000 by 15 that "
+        "is roughly 120 MB each, a DERIVED BOUND from the shape and not a "
+        "timing. (2) CatBoost builds an ordered target statistic per "
+        "categorical column per permutation, and the standard tier's fifth "
+        "column realizes about 175,000 distinct levels. Whether that is "
+        "cheaper or dearer than LightGBM's 100,000-entry bin table is "
+        "exactly the question the scenario exists to answer and is "
+        "therefore unknown before it runs. (3) The CTR store is capped by "
+        "ctr_leaf_count_limit, which is in CATBOOST_REFUSED_PARAMS and "
+        "resolves to 2**64-1, i.e. uncapped. Nobody has timed any of this. "
+        "run.py's per-run timeout is 7200 seconds and this cell is not "
+        "established to fit inside it at the standard tier, let alone the "
+        "large one; a timed-out cell is an infrastructure failure and takes "
+        "the whole run's exit code. Run the smoke tier first"
+    ),
     "sparse_highdim": (
         "expected to be the expensive cell by a wide margin. CatBoost's rsm "
         "default is 1, so it considers every feature at every split, and it "
@@ -883,6 +1095,50 @@ CATBOOST_REFUSED_PARAMS = {
         "for it is how one arm ends up on a different core count from the "
         "other two"
     ),
+    # The categorical knobs, refused from the day the arm gained a
+    # categorical path. The temptation here is specific and worth naming:
+    # CATBOOST_UNMATCHABLE['ctr_combinations'] records that CatBoost
+    # resolves max_ctr_complexity to 1 at its defaults, so the interaction
+    # column in high_cardinality_categorical is not read by a combination
+    # feature. Setting it to 4 would make the scenario's claim true and the
+    # column's heading false, which is the same defect
+    # bin_construct_sample_cnt was: one arm doing more work than the label
+    # says, in the direction that makes the story better.
+    "max_ctr_complexity": (
+        "how many categorical features a CTR may combine. Stock, and stock "
+        "resolves to 1 on CPU whatever the documentation says, so this arm "
+        "builds single-column CTRs only. Raising it is a differently "
+        "labelled row and not this one"
+    ),
+    "one_hot_max_size": (
+        "the cardinality below which CatBoost one-hots instead of building "
+        "a CTR. Stock is 2. It is the direct counterpart of "
+        "max_cat_to_onehot on the other two sides, which are also at their "
+        "own defaults, and pinning it to theirs would be aligning one of "
+        "the three capacity rules the scenario exists to cross"
+    ),
+    "simple_ctr": "the CTR definition itself. The column is CatBoost's own",
+    "combinations_ctr": "a synonym problem: see max_ctr_complexity",
+    "ctr_target_border_count": (
+        "how finely the target is discretized before a CTR is taken. Stock "
+        "is 1 and it is part of what the CTR IS"
+    ),
+    "counter_calc_method": (
+        "whether the Counter CTR counts the test pool. Stock is SkipTest "
+        "and changing it changes what the feature means"
+    ),
+    "ctr_leaf_count_limit": (
+        "a memory cap on stored CTR values. CatBoost changes what it keeps "
+        "under it, so a limit derived from the data size makes the engine "
+        "do different work at different scales -- used_ram_limit's defect "
+        "in the categorical vocabulary"
+    ),
+    "has_time": (
+        "whether CatBoost treats the row order as a time order instead of "
+        "permuting it. Stock is False, so it permutes, and the ordered "
+        "permutation is the whole of what 'ordered target statistic' means. "
+        "Pinning it True would turn the arm's headline algorithm off"
+    ),
 }
 
 #: What each engine's timed phases actually contain, so that three engines'
@@ -932,17 +1188,38 @@ PHASE_SHAPE = {
         "e2e": "binning + train",
     },
     "catboost": {
+        "encode": (
+            "categorical scenarios only, null everywhere else. The harness "
+            "re-encoding its canonical float64 matrix into the mixed "
+            "float-and-int frame CatBoost will accept cat_features over, "
+            "plus the hash that proves the re-encoding is lossless. A phase "
+            "neither other arm has, because neither other arm needs a "
+            "different container: see CATBOOST_CATEGORICAL_ENCODING. It is "
+            "a HARNESS-CONVERSION cost and not a CatBoost one -- a user "
+            "whose categories already live in an integer column pays none "
+            "of it -- so it is counted in e2e and named separately so it "
+            "can be subtracted from a per-iteration reading"
+        ),
         "ingest": (
-            "Pool(X, label=y): conversion of the caller's array into "
-            "CatBoost's own object layout, and nothing else. The pool is "
-            "not quantized when it returns"
+            "Pool(X, label=y, cat_features=...): conversion of the caller's "
+            "array or frame into CatBoost's own object layout, and nothing "
+            "else. The pool is not quantized when it returns. On a "
+            "categorical scenario this is also where CatBoost first builds "
+            "its categorical hash, and the warm-up did not cover that path"
         ),
         "binning": (
             "null. CatBoost bins inside fit, and pre-quantizing to separate "
             "it changes the model above a few hundred thousand rows"
         ),
-        "train": "fit(), which contains CatBoost's quantization",
-        "e2e": "ingest + train",
+        "train": (
+            "fit(), which contains CatBoost's quantization and, on a "
+            "categorical scenario, the ordered target statistics it derives "
+            "from the categorical block"
+        ),
+        "e2e": "encode + ingest + train, and encode is null on every "
+               "scenario whose data declares no categorical features, "
+               "which today is every one this arm runs except "
+               "high_cardinality_categorical",
     },
 }
 
@@ -1295,6 +1572,13 @@ def catboost_arm_block():
         "catboost_min_version": ".".join(str(p) for p in CATBOOST_MIN_VERSION),
         "catboost_refused_params": dict(CATBOOST_REFUSED_PARAMS),
         "determinism": copy.deepcopy(CATBOOST_DETERMINISM),
+        # How a categorical column reaches this arm, and the argument for
+        # why the canonical digest still means what it says once it does.
+        # In the block rather than only in the module because a published
+        # table that carries a CatBoost categorical number and not this is
+        # a table whose reader cannot check the one thing that makes the
+        # number comparable.
+        "categorical_encoding": dict(CATBOOST_CATEGORICAL_ENCODING),
         "unmatchable": dict(CATBOOST_UNMATCHABLE),
         "scenarios_not_run": {
             name: reason
@@ -1473,7 +1757,17 @@ SCENARIOS = {
             "The real variant, bank_marketing, has ten categorical columns. "
             "They are passed as categorical to both engines, so this "
             "scenario overlaps with categorical_missing on real data. The "
-            "synthetic variant is purely numeric and does not."
+            "synthetic variant is purely numeric and does not.",
+            "That real variant is also the one place the CatBoost arm can "
+            "meet a categorical column on a scenario nobody chose it for. "
+            "It takes it through the same encoder "
+            "high_cardinality_categorical uses, with the same per-run "
+            "proof, and it is REFUSED with a named column if any of the ten "
+            "holds a blank -- loaders._encode_categories writes NaN for "
+            "one. Which of the ten does is unverified: bank_marketing has "
+            "never been fetched here. The synthetic variant, which is what "
+            "every run of this scenario so far has used, is purely numeric "
+            "and reaches none of this.",
         ],
     ),
     "multiclass": _scenario(
@@ -1551,6 +1845,18 @@ SCENARIOS = {
             "Category codes come from the same encoding on both sides, "
             "produced once by the loader. Letting each library encode the "
             "strings itself would compare two encodings, not two trainers.",
+            "There is no CatBoost row and the reason is PERMANENT, not a "
+            "harness limitation waiting on a change. The float64-matrix "
+            "blocker that used to be quoted here is gone -- "
+            "high_cardinality_categorical runs CatBoost with cat_features "
+            "as of 2026-08-16 -- and what is left is that this generator "
+            "drops values inside two categorical columns as a function of "
+            "the target's upper tail. CatBoost has no missing-category "
+            "concept, so the harness would have to invent a level, and that "
+            "level would carry a target-correlated statistic that LightGBM "
+            "and mojotrees cannot use: both treat a missing category as "
+            "structurally unsplittable. See "
+            "CATBOOST_SCENARIO_SUPPORT['categorical_missing'].",
         ],
     ),
     "high_cardinality_categorical": _scenario(
@@ -1602,9 +1908,14 @@ SCENARIOS = {
             "combinations exist for, and until 2026-08-16 no scenario in "
             "this suite had it, so none of that machinery could appear in a "
             "published number however well it worked. The two-column "
-            "interaction is double-centered so neither marginal carries it: "
-            "a tree needs two stacked set splits to reach it and a "
-            "combination feature reaches it in one."
+            "interaction is double-centered so neither marginal carries it, "
+            "and a tree needs two stacked set splits to reach it. A CTR "
+            "COMBINATION would reach it in one -- and CatBoost at its own "
+            "defaults does not build one, because it resolves "
+            "max_ctr_complexity to 1. So the interaction makes the problem "
+            "harder for all three arms equally and does not, on this "
+            "scenario, separate a combination feature from a stack of "
+            "splits. See CATBOOST_UNMATCHABLE['ctr_combinations']."
         ),
         caveats=[
             "This scenario is expected to be WORSE for mojotrees than any "
@@ -1637,11 +1948,35 @@ SCENARIOS = {
             "CPU only, for categorical_missing's reason and not a new one: "
             "there is no accelerator path for categorical splits this "
             "harness is willing to compare.",
-            "There is no CatBoost row and the cost of that is higher here "
-            "than anywhere else in the suite, because CatBoost's ordered "
-            "target statistic is the algorithm this shape was drawn for. "
-            "See CATBOOST_SCENARIO_SUPPORT and "
-            "CATBOOST_UNMATCHABLE['categorical_encoding'].",
+            "There IS a CatBoost row as of 2026-08-16, and this is the only "
+            "scenario in the suite where CatBoost's ordered target "
+            "statistic is read against a category-set split. The arm is "
+            "handed the same five columns as categorical, on the same "
+            "canonical dataset with the same digest, in a different "
+            "container: CATBOOST_CATEGORICAL_ENCODING carries the encoding "
+            "and the per-run proof that the container did not change a "
+            "value. The comparison is three-way -- mojotrees, LightGBM and "
+            "CatBoost -- plus mojotrees_catboost_mode and "
+            "catboost_lossguide beside them, and none of the five is the "
+            "headline row, which is still mojotrees against LightGBM "
+            "stock+det.",
+            "The two-column interaction is NOT read by a CTR combination on "
+            "the CatBoost row, and the scenario's own note above overstates "
+            "this until it is corrected. CatBoost resolves "
+            "max_ctr_complexity to 1 at its defaults -- measured, against a "
+            "documented default of 4 -- so it builds single-column CTRs "
+            "only and reaches the interaction the same way the other two "
+            "do, by stacking two splits. See "
+            "CATBOOST_UNMATCHABLE['ctr_combinations']. The interaction term "
+            "is still doing its job, which is to make the scenario harder "
+            "than five marginals; what it is not doing is separating a "
+            "combination feature from a stack of splits.",
+            "The CatBoost row pays an `encode` phase the other two arms do "
+            "not: a full extra copy of the matrix, timed and counted in "
+            "e2e and labelled a harness-conversion cost. peak_rss_bytes on "
+            "that row is not comparable with the other two without "
+            "subtracting it. CATBOOST_SCENARIO_COST warns about the rest "
+            "and none of it has been timed.",
         ],
     ),
     "ordered_boosting_small": _scenario(
@@ -2031,6 +2366,20 @@ CATBOOST_TIER_CAP = {
         "where it runs. This is a declared bound, not an observed limit: "
         "nobody has timed CatBoost at the standard tier to find out how far "
         "over it goes",
+    ),
+    "high_cardinality_categorical": (
+        "standard",
+        "the standard tier is 1,000,000 rows with a 200,000-level column "
+        "and the large tier doubles both. Nothing on this cell has been "
+        "timed on any engine -- the scenario's own caveats say the large "
+        "tier is not established to fit run.py's 7200-second timeout for "
+        "LightGBM either -- and the CatBoost arm additionally pays an "
+        "`encode` phase and builds an ordered target statistic per level "
+        "per permutation. Capping at standard is a bound on an UNMEASURED "
+        "cost, which is the weakest kind: it is not an observed limit and "
+        "it should come off the moment somebody has a large-tier timing "
+        "rather than an argument. The standard tier is the one the headline "
+        "table reads and it is not capped",
     ),
     "ordered_boosting_small": (
         "standard",

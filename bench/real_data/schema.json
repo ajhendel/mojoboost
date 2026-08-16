@@ -145,6 +145,11 @@
           "description": "Null on a path that bins inside fit, with binning_unavailable_reason alongside. That is every CatBoost row: pre-quantizing the Pool to expose the number changes the model above a few hundred thousand rows, because CatBoost draws its border-construction sample under a quantization seed the fit path does not share."
         },
         "binning_unavailable_reason": {"type": "string"},
+        "encode": {
+          "oneOf": [{"$ref": "#/$defs/phase"}, {"type": "null"}],
+          "description": "The harness re-encoding its canonical float64 matrix into a container the engine will accept, plus the hash that proves the re-encoding lossless. Present only on a CatBoost row whose scenario declares categorical features, and null with encode_unavailable_reason everywhere else. It exists because catboost/core.py refuses cat_features on a floating-point array by dtype, so the categorical block has to become int64 and the container has to become mixed. Counted in e2e, because the row does not exist without it, and named separately because it is a HARNESS-CONVERSION cost rather than a property of CatBoost: a user whose categories already live in an integer column pays none of it. Subtract it before quoting a per-iteration figure. peak_rss_bytes on such a row also includes a full extra copy of the matrix. See scenarios.CATBOOST_CATEGORICAL_ENCODING."
+        },
+        "encode_unavailable_reason": {"type": ["string", "null"]},
         "train": {"$ref": "#/$defs/phase"},
         "predict_batch": {"$ref": "#/$defs/samples"},
         "predict_row": {"$ref": "#/$defs/samples"}
@@ -273,7 +278,23 @@
         "label_distinct": {"type": "integer"},
         "digest": {
           "type": ["string", "null"],
-          "description": "sha256 of the exact bytes handed to the engine. Both engines build their data independently; equal digests are what makes the pair comparable, and verify.py checks it."
+          "description": "sha256 of the CANONICAL form: the float64 feature matrix, then the float64 label, then the int64 group vector, fed to one running hash by measure.canonical_digest. Every engine builds its data independently and equal digests are what makes the arms comparable; verify.py fails a scenario whose arms disagree, with no per-engine exemption. It is NOT necessarily a digest of the bytes an engine physically received -- read `encoding` beside it for that -- and since 2026-08-16 it does not claim to be."
+        },
+        "encoding": {
+          "type": "object",
+          "description": "Which physical container this engine was handed, and the in-run proof that the container did not change a value. Two questions that used to be one field: `digest` says the arms were given the same problem, and this says what shape each of them got it in. The canonical form is `float64_matrix` and most rows carry exactly that with is_canonical true. A CatBoost row on a categorical scenario carries `mixed_frame_int64_categorical`, because catboost/core.py refuses cat_features on a floating-point array by dtype and the numeric columns cannot become integers. THE FIELD TO READ IS agrees_with_canonical: true means the adapter reconstructed the canonical form out of the container it built, hashed it with the same function, and got the same digest, so the engine was given the same values in a different container. false means it was given different data and nothing on that scenario is comparable. null means the run computed no canonical digest (--no-data-digest) and there was nothing to compare against; the per-column losslessness checks in `proof` still ran. See scenarios.CATBOOST_CATEGORICAL_ENCODING for the argument and worker.CANONICAL_ENCODING for the rule.",
+          "properties": {
+            "form": {"type": "string"},
+            "is_canonical": {"type": "boolean"},
+            "agrees_with_canonical": {"type": ["boolean", "null"]},
+            "contract": {"type": "string"},
+            "container": {"type": "string"},
+            "categorical_columns": {"type": "array", "items": {"type": "integer"}},
+            "categorical_dtype": {"type": "string"},
+            "numeric_dtype": {"type": "string"},
+            "canonical_digest_recomputed": {"type": ["string", "null"]},
+            "proof": {"type": "object"}
+          }
         }
       }
     }

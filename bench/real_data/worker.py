@@ -62,22 +62,71 @@ import quality  # noqa: E402
 import scenarios  # noqa: E402
 
 
-def data_digest(part):
-    """A digest of exactly the bytes an engine will be given."""
-    x = part["X"]
-    if hasattr(x, "tocsc"):
-        pieces = [x.data, x.indices, x.indptr]
-    else:
-        pieces = [np.ascontiguousarray(x)]
-    pieces.append(np.asarray(part["y"], dtype=np.float64))
-    if part.get("group") is not None:
-        pieces.append(np.asarray(part["group"], dtype=np.int64))
-    import hashlib
+#: The one canonical form of a scenario's data: a float64 feature matrix (or
+#: a CSC one), a float64 label, and an int64 group vector where there is one.
+#: `data_digest` is a digest of exactly that, and it is what
+#: `verify.check_data_agreement` compares across engines.
+#:
+#: **It is not a digest of what every engine physically receives, and since
+#: 2026-08-16 it does not claim to be.** CatBoost refuses `cat_features` on a
+#: floating-point array outright, so on a categorical scenario its adapter
+#: re-encodes the declared categorical columns into integer columns and hands
+#: CatBoost a mixed-dtype frame. That is a second ENCODING of the canonical
+#: form and not a second dataset, and the distinction is the whole reason
+#: this constant and `ENCODING_CONTRACT` below exist rather than the harness
+#: quietly exempting one engine from the digest check.
+#:
+#: The rule, stated once here and enforced in two places:
+#:
+#:   1. The canonical digest is computed from the canonical form and from
+#:      nothing else. Every engine's record carries the same one on a given
+#:      scenario or `verify.py` fails the scenario. There is no per-engine
+#:      exemption, because an exemption would turn the one check that proves
+#:      the arms saw the same problem into a check that proves nothing.
+#:   2. An engine that cannot take the canonical form re-encodes it, and the
+#:      re-encoding must be a BIJECTION on the values -- reconstruct the
+#:      canonical matrix from the re-encoding, hash it with the same
+#:      function, and the two digests must agree. The adapter reports the
+#:      reconstruction digest, this module compares it, and the record
+#:      carries the verdict per run. A re-encoding that cannot pass that
+#:      test is not an encoding of the same data and the adapter refuses it.
+#:
+#: So a reader of a record sees: one `digest` field, equal across engines,
+#: which says they were given the same problem; and one `encoding` block,
+#: which says what container each engine was handed and carries the in-run
+#: proof that the container did not change the values. Those are two
+#: different questions and they now have two different fields.
+CANONICAL_ENCODING = "float64_matrix"
 
-    h = hashlib.sha256()
-    for piece in pieces:
-        h.update(np.ascontiguousarray(piece).tobytes())
-    return h.hexdigest()
+ENCODING_CONTRACT = (
+    "the canonical form is a float64 feature matrix, a float64 label and an "
+    "int64 group vector, and `digest` is over exactly that. An engine that "
+    "cannot take it re-encodes it and reports a digest of the canonical "
+    "matrix RECONSTRUCTED from the re-encoding; `agrees_with_canonical` is "
+    "this module comparing the two. true means the engine was given the "
+    "same values in a different container. false means it was given "
+    "different data and nothing on that scenario is comparable"
+)
+
+
+def data_digest(part):
+    """A digest of exactly the bytes the CANONICAL form holds.
+
+    Not necessarily the bytes an engine physically received: see
+    `CANONICAL_ENCODING` for why those are two questions and where the
+    second one is answered.
+
+    The byte stream is UNCHANGED from the version that wrote every record in
+    bench/results: the matrix's pieces, then the label, then the group, fed
+    to one running sha256. The body moved to `measure.canonical_digest` so
+    that the CatBoost adapter's reconstruction check hashes the identical
+    way rather than a way that looks identical. A digest whose definition
+    moves silently makes old records and new ones incomparable, which is the
+    failure this note exists to prevent.
+    """
+    return measure.canonical_digest(
+        part["X"], part["y"], part.get("group")
+    )
 
 
 def build_data(spec, variant, allow_unpinned):
@@ -138,6 +187,18 @@ def describe(part, name):
         "features": int(x.shape[1]),
         "sparse": bool(hasattr(x, "tocsc")),
         "digest": None,
+        # Overwritten by `apply_encoding_report` for an engine that could
+        # not take the canonical form. Filled in here rather than left
+        # absent so that a record from an engine that took it says so,
+        # instead of a reader having to infer "no encoding block" as "the
+        # canonical one" -- which is exactly the inference that would go
+        # wrong the first time a block failed to be written.
+        "encoding": {
+            "form": CANONICAL_ENCODING,
+            "is_canonical": True,
+            "agrees_with_canonical": True,
+            "contract": ENCODING_CONTRACT,
+        },
     }
     if out["sparse"]:
         out["nnz"] = int(x.nnz)
@@ -151,6 +212,52 @@ def describe(part, name):
         out["label_mean"] = float(y.mean())
         out["label_distinct"] = int(min(len(np.unique(y)), 1000))
     return out
+
+
+def apply_encoding_report(desc, report):
+    """Fold an adapter's re-encoding report into a part's description, and
+    decide the one question the report cannot decide for itself.
+
+    The adapter knows what it built and can hash the canonical matrix it
+    reconstructed from what it built. It does NOT know the canonical digest
+    -- that is computed here, from the canonical data, before any engine
+    sees it -- so it cannot be the thing that says the two agree. Comparing
+    them is this module's job, for the same reason the digest is: a check
+    that the object being checked gets to run on itself is not a check.
+
+    `agrees_with_canonical` is therefore one of three values and every one
+    of them is a different statement:
+
+      true   the reconstruction hashed to the canonical digest. The engine
+             was given the same values in a different container.
+      false  it did not. The engine was given different data, the scenario's
+             rows are not comparable, and `verify.py` should be reading this
+             field. This is a bug in the adapter, not a caveat.
+      null   there is nothing to compare against, because the run was asked
+             for no data digest (`--no-data-digest`). The re-encoding was
+             still checked for losslessness column by column inside the
+             adapter, which is a weaker statement, and `proof` carries it.
+    """
+    if not report:
+        return
+    canonical = desc.get("digest")
+    rebuilt = report.get("canonical_digest_recomputed")
+    if canonical is None or rebuilt is None:
+        agrees = None
+    else:
+        agrees = bool(canonical == rebuilt)
+    desc["encoding"] = {
+        "contract": ENCODING_CONTRACT,
+        "is_canonical": report.get("form") == CANONICAL_ENCODING,
+        "agrees_with_canonical": agrees,
+        **report,
+    }
+    if agrees is None and canonical is None:
+        desc["encoding"]["agrees_unavailable_reason"] = (
+            "no canonical digest was computed for this run, so the "
+            "reconstruction has nothing to be compared against. The "
+            "per-column losslessness proof in `proof` still ran"
+        )
 
 
 def _record_extra(task, train):
@@ -218,6 +325,13 @@ def run_job(job):
     dataset_params_used = result.pop("dataset_params_used", None)
     dataset_params_reason = result.pop("dataset_params_unavailable_reason", None)
     num_boost_round = result.pop("num_boost_round", None)
+    # What the engine was PHYSICALLY handed, against what the canonical form
+    # holds. Popped rather than left in `result` so it lands inside
+    # `data.train` and `data.test` beside the digest it has to be read with,
+    # rather than in a top-level field a reader could look at on its own.
+    encoding_report = result.pop("data_encoding", None) or {}
+    apply_encoding_report(train_desc, encoding_report.get("train"))
+    apply_encoding_report(test_desc, encoding_report.get("test"))
 
     scores = quality.score(
         task, test["y"], predictions, group=test.get("group")
