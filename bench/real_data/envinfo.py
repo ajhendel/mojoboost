@@ -15,10 +15,13 @@ the reason.
 """
 
 import json
+import hashlib
 import os
 import platform
 import subprocess
 import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
 import time
 
 REPO_ROOT = os.path.abspath(
@@ -120,6 +123,77 @@ def _versions():
     return out
 
 
+def _built_extension():
+    """Whether the compiled extension is actually newer than its sources.
+
+    **This exists because a run once came within one command of comparing
+    yesterday's binary under today's labels.** `python/mojotrees/_mojotrees.so`
+    was 22 hours old with 76 `.mojo` files newer than it, and nothing in a
+    record would have said so: `_versions()` captures `mojotrees.__version__`,
+    a package version string that does not move between two builds of the same
+    working tree. The environment block would have looked clean and the table
+    would have been fully plausible and entirely invalid.
+
+    So this is a provenance field that MOVES. It reports the extension's
+    mtime, the newest source mtime, and -- the field to actually read --
+    `stale_sources`, the count of `src/**.mojo` files newer than the binary.
+    Any number above zero means the run did not execute the code the commit
+    says it did.
+
+    `sha256` is the binary's own hash, so two records can be proven to have
+    run the same build rather than merely the same source commit. It is the
+    stronger claim of the two: a git SHA says what was written, this says what
+    ran.
+    """
+    root = os.path.dirname(os.path.dirname(HERE))
+    so = os.path.join(root, "python", "mojotrees", "_mojotrees.so")
+    src = os.path.join(root, "src")
+    out = {"path": "python/mojotrees/_mojotrees.so"}
+    if not os.path.isfile(so):
+        out["built"] = False
+        out["reason"] = (
+            "the extension is not built, so any Python-surface arm in this "
+            "record ran against nothing or against an install elsewhere"
+        )
+        return out
+    so_mtime = os.path.getmtime(so)
+    out["built"] = True
+    out["mtime"] = so_mtime
+    try:
+        with open(so, "rb") as handle:
+            out["sha256"] = hashlib.sha256(handle.read()).hexdigest()
+    except OSError as exc:
+        out["sha256"] = f"unreadable: {exc}"
+    newest = 0.0
+    stale = []
+    for base, _dirs, names in os.walk(src):
+        for name in names:
+            if not name.endswith(".mojo"):
+                continue
+            path = os.path.join(base, name)
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                continue
+            newest = max(newest, mtime)
+            if mtime > so_mtime:
+                stale.append(os.path.relpath(path, root))
+    out["newest_source_mtime"] = newest
+    out["stale_sources"] = len(stale)
+    # Named, not just counted: a reader who sees a nonzero count needs to know
+    # whether it is a doc comment or the split search. Capped so a wholly
+    # unbuilt tree does not put a thousand paths in every record.
+    out["stale_sources_sample"] = sorted(stale)[:20]
+    if stale:
+        out["reason"] = (
+            f"{len(stale)} source files are newer than the built extension, "
+            "so every arm that goes through the Python surface in this "
+            "record ran code older than this commit. The measurement is not "
+            "about the tree it claims to be about"
+        )
+    return out
+
+
 def _git():
     return {
         "commit": _run(["git", "rev-parse", "HEAD"]),
@@ -173,6 +247,10 @@ def collect(extra=None):
         "cpu": _cpu(),
         "versions": _versions(),
         "git": _git(),
+        # What actually RAN, as distinct from what was written. See
+        # `_built_extension`: read `stale_sources` before any number
+        # in this record.
+        "built_extension": _built_extension(),
         "accelerator": _accelerator(),
         "machine_state": _machine_state(),
         "env": {name: os.environ.get(name) for name in WATCHED_ENV},
