@@ -20,15 +20,17 @@ an edge.
 """
 
 from std.os import setenv
-from std.testing import TestSuite, assert_equal, assert_true
+from std.testing import TestSuite, assert_equal, assert_raises, assert_true
 from std.utils.numerics import inf, nan
 
 from mojotrees.binning import (
     SELECT_MIN_ROWS,
     value_from_key,
     BinMapper,
+    bin_construct_sample_rows,
     bin_equal_width,
     collect_distinct,
+    count_levels,
     distinct_levels_sorted,
     emit_quantile_edges,
     fit_bins,
@@ -885,6 +887,358 @@ def test_the_two_level_counters_agree() raises:
             assert_equal(len(a), len(b), String(what, ": same level count"))
             for i in range(len(a)):
                 assert_equal(a[i], b[i], String(what, ": level ", i))
+
+
+# ---------------------------------------------------------------------------
+# min_data_in_bin and bin_construct_sample_cnt
+#
+# Both options change which bins exist, so every test here is written to fail
+# if the option were silently ignored: each one asserts an edge *count* (and
+# where it is knowable, each edge's bits) against a fixture built so that the
+# option must move it. A fixture on which the option happens to change nothing
+# would pass whatever the binner did, which is the one thing these must not be.
+# ---------------------------------------------------------------------------
+
+
+def _edge_count(mapper: BinMapper, f: Int) -> Int:
+    return mapper.edge_offsets[f + 1] - mapper.edge_offsets[f]
+
+
+def _assert_edges_are(
+    mapper: BinMapper, expected: List[Float64], what: String
+) raises:
+    assert_equal(
+        _edge_count(mapper, 0), len(expected), String(what, ": edge count")
+    )
+    for i in range(len(expected)):
+        assert_equal(
+            mapper.edges[i].to_bits().cast[DType.uint64](),
+            expected[i].to_bits().cast[DType.uint64](),
+            String(what, ": edge ", i),
+        )
+
+
+def _eight_levels_column() -> List[Float64]:
+    """Levels 0..7 with populations 1,1,1,1,4,4,4,4 (twenty rows).
+
+    Chosen so that `min_data_in_bin = 3` demonstrably merges: the four rare
+    levels cannot each hold three rows, so three of the seven cuts between
+    adjacent levels have to disappear. On a column where every level already
+    held three rows the option would change nothing and the test would prove
+    nothing.
+    """
+    var col = List[Float64]()
+    for v in range(4):
+        col.append(Float64(v))
+    for v in range(4, 8):
+        for _ in range(4):
+            col.append(Float64(v))
+    return col^
+
+
+def test_min_data_in_bin_merges_levels() raises:
+    _serial()
+    var col = _eight_levels_column()
+    assert_equal(len(col), 20, "twenty rows")
+
+    # Eight levels inside a 255-bin budget, so this is the levels path.
+    var loose = fit_bins(col, len(col), 1, 255)
+    _assert_edges_are(
+        loose,
+        [0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5],
+        "min_data_in_bin=1 cuts between every adjacent level",
+    )
+
+    # Spelling the default out has to be the default.
+    var one = fit_bins(col, len(col), 1, 255, min_data_in_bin=1)
+    _assert_same_binning(loose, one, "min_data_in_bin=1 is the default")
+
+    # LightGBM's GreedyFindBin walks the levels accumulating counts and cuts
+    # only when the accumulator reaches the minimum, resetting it there:
+    # counts 1,1,1 reach 3 at level 2, then 4 at each of levels 4, 5 and 6.
+    var three = fit_bins(col, len(col), 1, 255, min_data_in_bin=3)
+    _assert_edges_are(
+        three,
+        [2.5, 4.5, 5.5, 6.5],
+        "min_data_in_bin=3 merges the four rare levels into one bin",
+    )
+    # The gate, stated as a count as well as as values: seven cuts became
+    # four, so an ignored option cannot pass this.
+    assert_equal(_edge_count(loose, 0), 7, "seven edges at the default")
+    assert_equal(_edge_count(three, 0), 4, "four edges at three")
+
+    # Levels 0, 1 and 2 are now one bin, and level 3 -- which is still too
+    # rare to earn a cut of its own -- shares the next one with level 4. Both
+    # of those pairings are impossible at the default, where every level has
+    # its own bin, so this is the merge asserted through the bins rather than
+    # through the edges.
+    var data = three.transform(col, len(col))
+    for r in range(3):
+        assert_equal(data.bin_at(r, 0), 0, String("rare level ", r, " merged"))
+    assert_equal(data.bin_at(3, 0), 1, "level 3 leaves the first bin")
+    assert_equal(data.bin_at(4, 0), 1, "and shares the second with level 4")
+    assert_equal(data.bin_at(8, 0), 2, "level 5 keeps a bin of its own")
+    _assert_transform_matches_bin_value(three, col, len(col), "merged levels")
+
+    var loose_data = loose.transform(col, len(col))
+    assert_equal(
+        loose_data.bin_at(3, 0), 3, "at the default level 3 is its own bin"
+    )
+    assert_true(
+        loose_data.bin_at(3, 0) != loose_data.bin_at(4, 0),
+        "and does not share one with level 4",
+    )
+
+    # A minimum no level can reach leaves one bin and no edge at all.
+    var huge = fit_bins(col, len(col), 1, 255, min_data_in_bin=20)
+    assert_equal(_edge_count(huge, 0), 0, "no cut survives a minimum of 20")
+    _auto()
+
+
+def test_min_data_in_bin_caps_the_quantile_budget() raises:
+    """The other branch of `GreedyFindBin`: more distinct values than bins, so
+    LightGBM shrinks the budget to `total_cnt / min_data_in_bin` before it
+    cuts. A hundred distinct values in an eight-bin budget takes that branch.
+    """
+    _serial()
+    var col = List[Float64]()
+    for r in range(100):
+        col.append(Float64(r))
+
+    var loose = fit_bins(col, len(col), 1, 8)
+    _assert_edges_are(
+        loose,
+        [11.5, 24.5, 36.5, 49.5, 61.5, 74.5, 86.5],
+        "seven quantile boundaries in an eight-bin budget",
+    )
+
+    # 100 // 30 = 3 ordinary bins, so two boundaries at ranks 33 and 66.
+    var capped = fit_bins(col, len(col), 1, 8, min_data_in_bin=30)
+    _assert_edges_are(
+        capped, [32.5, 65.5], "the budget shrinks to three bins"
+    )
+    assert_equal(_edge_count(loose, 0), 7, "seven edges at the default")
+    assert_equal(_edge_count(capped, 0), 2, "two edges at thirty")
+
+    # The same, through the rank-selection path rather than the sort, because
+    # the two are required to resolve the same order statistics.
+    _ = setenv("MOJOTREES_BINNING_SELECT_MIN_ROWS", "1")
+    var selected = fit_bins(col, len(col), 1, 8, min_data_in_bin=30)
+    _restore_paths()
+    _assert_same_binning(capped, selected, "selection agrees with the sort")
+
+    # A minimum larger than the column leaves one bin: `max(1, 100 // 200)`.
+    var one_bin = fit_bins(col, len(col), 1, 8, min_data_in_bin=200)
+    assert_equal(_edge_count(one_bin, 0), 0, "one bin, no edges")
+    _auto()
+
+
+def test_count_levels_counts_what_the_levels_hold() raises:
+    """`min_data_in_bin`'s merge rule is only as good as its counts, and the
+    two zeros are the case that could silently split one level in two."""
+    var col = List[Float64]()
+    for i in range(30):
+        col.append(-0.0 if i % 3 == 0 else (0.0 if i % 3 == 1 else 5.0))
+    var table = List[UInt64]()
+    var slots = List[Int]()
+    var levels = List[Float64]()
+    assert_true(
+        collect_distinct(col, len(col), 8, table, slots, levels),
+        "two levels",
+    )
+    assert_equal(len(levels), 2, "the two zeros are one level")
+    var counts = List[Int]()
+    count_levels(col, len(col), levels, counts)
+    assert_equal(len(counts), 2, "one count per level")
+    assert_equal(counts[0], 20, "both signs of zero counted together")
+    assert_equal(counts[1], 10, "and the rest")
+    assert_equal(counts[0] + counts[1], len(col), "the counts are the column")
+
+
+def test_bin_construct_sample_rows_is_exact_and_deterministic() raises:
+    """Exactly k rows, ascending, in range, and the same k rows at every
+    worker count. The sample is drawn once per fit and every feature is fit
+    from it, so a sample that moved with the schedule would move the model."""
+    var ns = [1000, 1000, 1000, 64, 5]
+    var ks = [20, 999, 1, 32, 5]
+    for i in range(len(ns)):
+        var n = ns[i]
+        var k = ks[i]
+        var rows = bin_construct_sample_rows(n, k, 1)
+        var what = String("n ", n, ", k ", k)
+        if k >= n:
+            assert_equal(len(rows), 0, String(what, ": empty means all rows"))
+            continue
+        assert_equal(len(rows), k, String(what, ": exactly k rows"))
+        for j in range(len(rows)):
+            assert_true(
+                rows[j] >= 0 and rows[j] < n, String(what, ": in range")
+            )
+            if j > 0:
+                assert_true(
+                    rows[j - 1] < rows[j], String(what, ": ascending")
+                )
+
+    # 0 and a count covering the matrix both mean every row.
+    assert_equal(len(bin_construct_sample_rows(1000, 0, 1)), 0, "0 is all")
+    assert_equal(
+        len(bin_construct_sample_rows(1000, 5000, 1)), 0, "over n is all"
+    )
+
+    # Different seeds are different samples, or the seed is not being read.
+    var a = bin_construct_sample_rows(1000, 20, 1)
+    var b = bin_construct_sample_rows(1000, 20, 7)
+    var same = len(a) == len(b)
+    if same:
+        for j in range(len(a)):
+            if a[j] != b[j]:
+                same = False
+                break
+    assert_true(not same, "a different seed draws a different sample")
+
+    # The draw depends on the row index alone, so the schedule cannot reach
+    # it; asserted rather than assumed.
+    var workers = [1, 3, 8]
+    for w in range(len(workers)):
+        _workers(workers[w])
+        var again = bin_construct_sample_rows(1000, 20, 1)
+        assert_equal(len(again), len(a), "same length at every worker count")
+        for j in range(len(a)):
+            assert_equal(again[j], a[j], "same row at every worker count")
+    _auto()
+
+
+def test_bin_construct_sample_cnt_fits_from_the_sample() raises:
+    """A thousand distinct values fit from twenty of them, with the edges
+    recomputed independently from the sample the module reports.
+
+    The full fit takes the quantile branch (a thousand values against 255
+    bins) and the sampled one takes the levels branch (twenty against 255), so
+    an ignored `bin_construct_sample_cnt` cannot produce these nineteen edges
+    by any other route.
+    """
+    _serial()
+    var n_rows = 1000
+    var col = List[Float64]()
+    for r in range(n_rows):
+        col.append(Float64(r))
+
+    var full = fit_bins(col, n_rows, 1, 255)
+    var sampled = fit_bins(
+        col, n_rows, 1, 255, bin_construct_sample_cnt=20, data_random_seed=1
+    )
+
+    var rows = bin_construct_sample_rows(n_rows, 20, 1)
+    assert_equal(len(rows), 20, "twenty sampled rows")
+    var expected = List[Float64]()
+    for j in range(len(rows) - 1):
+        # col[r] == r, and the sampled rows are already ascending and
+        # distinct, so the levels path cuts at each adjacent midpoint. Both
+        # operands are integers below 2048, so the midpoint is exact.
+        expected.append((Float64(rows[j]) + Float64(rows[j + 1])) / 2.0)
+    _assert_edges_are(sampled, expected, "edges come off the sample")
+
+    assert_true(
+        _edge_count(full, 0) > 19,
+        "the full fit spends far more of the budget",
+    )
+    # Every row is still binned, sample or no sample.
+    _assert_transform_matches_bin_value(sampled, col, n_rows, "sampled fit")
+    var data = sampled.transform(col, n_rows)
+    assert_equal(data.n_rows, n_rows, "every row is binned")
+
+    # 0 and a count at or above the row count are the full fit.
+    var zero = fit_bins(col, n_rows, 1, 255, bin_construct_sample_cnt=0)
+    _assert_same_binning(full, zero, "0 means every row")
+    var over = fit_bins(col, n_rows, 1, 255, bin_construct_sample_cnt=n_rows)
+    _assert_same_binning(full, over, "a sample of every row is every row")
+    _auto()
+
+
+def test_the_new_options_are_worker_independent() raises:
+    """Both new paths, fit at one, three, and eight workers, compared exactly.
+
+    Four features rather than one, because the fit is feature-parallel: a
+    single feature is one task at any worker count and would prove nothing.
+    """
+    var n_rows = 800
+    var n_features = 4
+    var feats = List[Float64]()
+    for f in range(n_features):
+        for r in range(n_rows):
+            if f == 0:
+                feats.append(Float64(r % 11))
+            elif f == 1:
+                feats.append(Float64(r))
+            elif f == 2:
+                feats.append(NAN if r % 97 == 0 else _uniform(UInt64(r) * 31))
+            else:
+                feats.append(Float64((r * 7) % 200))
+
+    _serial()
+    var base = fit_bins(
+        feats,
+        n_rows,
+        n_features,
+        64,
+        min_data_in_bin=20,
+        bin_construct_sample_cnt=300,
+        data_random_seed=1,
+    )
+    var workers = [3, 8]
+    for w in range(len(workers)):
+        _workers(workers[w])
+        var other = fit_bins(
+            feats,
+            n_rows,
+            n_features,
+            64,
+            min_data_in_bin=20,
+            bin_construct_sample_cnt=300,
+            data_random_seed=1,
+        )
+        _assert_same_binning(
+            base, other, String("workers ", workers[w])
+        )
+    _auto()
+
+    # And the two options together are not the same fit as either alone,
+    # which is what says both are still being read when both are set.
+    _serial()
+    var neither = fit_bins(feats, n_rows, n_features, 64)
+    var only_min = fit_bins(feats, n_rows, n_features, 64, min_data_in_bin=20)
+    var only_sample = fit_bins(
+        feats,
+        n_rows,
+        n_features,
+        64,
+        bin_construct_sample_cnt=300,
+        data_random_seed=1,
+    )
+    assert_true(
+        not neither.matches(only_min), "min_data_in_bin moved the binning"
+    )
+    assert_true(
+        not neither.matches(only_sample),
+        "bin_construct_sample_cnt moved the binning",
+    )
+    assert_true(
+        not only_min.matches(base) and not only_sample.matches(base),
+        "both options are read when both are set",
+    )
+    _auto()
+
+
+def test_the_new_options_are_range_checked() raises:
+    var col = List[Float64]()
+    for r in range(50):
+        col.append(Float64(r))
+    with assert_raises():
+        _ = fit_bins(col, len(col), 1, 255, min_data_in_bin=0)
+    with assert_raises():
+        _ = fit_bins(col, len(col), 1, 255, min_data_in_bin=-3)
+    with assert_raises():
+        _ = fit_bins(col, len(col), 1, 255, bin_construct_sample_cnt=-1)
 
 
 def main() raises:

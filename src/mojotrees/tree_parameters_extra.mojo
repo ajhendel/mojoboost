@@ -36,10 +36,13 @@ tier is a property of what the rule needs rather than of the backend:
   `boosting.fit` owns, and refused per grower rather than by name:
   `cegb_penalty_feature_coupled` and `cegb_penalty_feature_lazy`. See
   `cegb.check_cegb_grower_support`.
-- Refused by name, and the only such option left: `feature_pre_filter`. It
-  names what it would take; see `check_extra_option_supported`. Every other
-  name that checker knows is refused for how it is spelled rather than for
-  being missing, which is the `forcedsplits_filename` case above.
+- Refused by *value* rather than by name: `feature_pre_filter`.
+  `check_feature_pre_filter` accepts `false`, which is the behavior mojotrees
+  has, and refuses `true`, which would change the pool `feature_fraction`
+  samples from. `check_extra_option_supported` no longer knows the name at
+  all, so every name that checker still refuses is refused for how it is
+  spelled rather than for being missing, which is the
+  `forcedsplits_filename` case above.
   `linear_tree` and `linear_lambda` are `BoosterParams.linear`
   (linear_tree.mojo), not tree controls, and are live on the metric-path
   trainers.
@@ -997,18 +1000,6 @@ def check_extra_option_supported(name: String) raises:
     would take, never an "unknown parameter" message and never silence.
     Names this module *does* implement are not listed here.
     """
-    if name == "feature_pre_filter":
-        raise Error(
-            "'feature_pre_filter' is not implemented. It is a Dataset"
-            " construction step: LightGBM drops, before training, the"
-            " features whose every bin boundary would leave a child under"
-            " 'min_data_in_leaf'. mojotrees's split search rejects those"
-            " candidates as it scans (split.find_best_split), so the fitted"
-            " model is already the one LightGBM produces with"
-            " feature_pre_filter=false; what is missing is the speed-up, and"
-            " with it LightGBM's rule that a prefiltered Dataset cannot be"
-            " reused with a larger min_data_in_leaf"
-        )
     if (
         name == "forcedsplits_filename"
         or name == "forced_splits_filename"
@@ -1024,6 +1015,45 @@ def check_extra_option_supported(name: String) raises:
             " `binning.map_forced_splits(mapper, forced)`, and set the result"
             " on `TreeParams.extra.forced`. `tree.grow_tree` applies it"
         )
+
+
+def check_feature_pre_filter(enabled: Bool) raises:
+    """Accept `feature_pre_filter=false`, which is the behavior mojotrees has.
+
+    LightGBM's prefilter is a Dataset construction step: before training it
+    drops the features whose every bin boundary would leave a child under
+    `min_data_in_leaf`. mojotrees's split search rejects those candidates as
+    it scans (`split.find_best_split`), so **`false` is not an unimplemented
+    option, it is the option mojotrees implements**, and it used to be refused
+    by name for any value at all. A LightGBM configuration that spells out
+    the setting mojotrees matches now ports across unchanged.
+
+    `true` is still refused, and not only for the missing speed-up. Dropping a
+    feature from the Dataset also drops it from the pool `feature_fraction`
+    samples, so a prefiltered fit can grow different trees rather than the
+    same trees faster; and LightGBM additionally forbids reusing a prefiltered
+    Dataset with a larger `min_data_in_leaf`. Neither is something a silently
+    ignored setting would report.
+
+    Takes the parsed value rather than the key, because the two values mean
+    different things here -- which is exactly what a name-only check could not
+    express. `check_extra_option_supported` therefore lets the name through.
+    """
+    if not enabled:
+        return
+    raise Error(
+        "'feature_pre_filter=true' is not implemented. It is a Dataset"
+        " construction step: LightGBM drops, before training, the features"
+        " whose every bin boundary would leave a child under"
+        " 'min_data_in_leaf'. mojotrees's split search rejects those"
+        " candidates as it scans (split.find_best_split), so"
+        " feature_pre_filter=false is accepted and is the behavior mojotrees"
+        " already has. What is missing at true is the speed-up, LightGBM's"
+        " rule that a prefiltered Dataset cannot be reused with a larger"
+        " min_data_in_leaf, and the narrowing of the pool feature_fraction"
+        " samples from, which can change the trees rather than only their"
+        " cost"
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -61,18 +61,29 @@ def test_forced_splits_check_reports_shape_and_refuses_bad_features():
 
 
 def test_unimplemented_option_gets_the_native_message():
-    message = preflight.unimplemented_option_message("feature_pre_filter")
+    # `forcedsplits_filename` is the probe now. It names a real LightGBM
+    # feature reachable from the Mojo API but not carryable in a parameter
+    # string, which is what "unimplemented option" is for.
+    message = preflight.unimplemented_option_message("forcedsplits_filename")
     assert message is not None and "not implemented" in message
     assert preflight.unimplemented_option_message("num_leaves") is None
+    # `feature_pre_filter` is no longer one of them. `false` is the behavior
+    # mojotrees has, so it is accepted rather than refused; `true` is still
+    # refused because prefiltering can change the trees and not only their
+    # cost.
+    assert preflight.unimplemented_option_message("feature_pre_filter") is None
     X, y = _data()
+    mojotrees.train(
+        {"feature_pre_filter": False}, Dataset(X, label=y), num_boost_round=1
+    )
     try:
         mojotrees.train(
-            {"feature_pre_filter": False}, Dataset(X, label=y), num_boost_round=1
+            {"feature_pre_filter": True}, Dataset(X, label=y), num_boost_round=1
         )
     except ValueError as exc:
-        assert "feature_pre_filter" in str(exc) and "not implemented" in str(exc)
+        assert "feature_pre_filter" in str(exc)
     else:
-        raise AssertionError("feature_pre_filter was accepted")
+        raise AssertionError("feature_pre_filter=true was accepted")
 
 
 def test_explain_predict_device_reads_the_capability_record():

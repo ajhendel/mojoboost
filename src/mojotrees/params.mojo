@@ -55,6 +55,7 @@ from .validation import check_booster_ranges, check_max_bin
 from .growth_policy import parse_grow_policy
 from .tree_parameters_extra import (
     check_extra_option_supported,
+    check_feature_pre_filter,
     parse_monotone_method,
 )
 
@@ -74,7 +75,7 @@ comptime SUPPORTED_KEYS = String(
     " max_delta_step, path_smooth, extra_trees, extra_seed,"
     " monotone_penalty, monotone_constraints_method, cegb_tradeoff,"
     " cegb_penalty_split, linear_tree, linear_lambda, enable_bundle,"
-    " max_conflict_rate,"
+    " max_conflict_rate, feature_pre_filter,"
     " data_sample_strategy, max_bin, alpha, fair_c,"
     " tweedie_variance_power, device, use_missing"
 )
@@ -585,6 +586,19 @@ def parse_params(spec: String) raises -> TrainConfig:
             # waits for `_validate`, because `device=` may be named after this
             # key in the same string.
             config.booster.bundling.enabled = _parse_bool(key, value)
+        elif key == "feature_pre_filter":
+            # `false` is not an unimplemented option, it is the option
+            # mojotrees implements: LightGBM prefilters at Dataset
+            # construction, and our split search rejects the same candidates
+            # as it scans. `true` is still refused, because prefiltering also
+            # removes features from the pool `feature_fraction` samples and so
+            # can change the trees rather than only their cost.
+            #
+            # This branch exists so the name reaches its own checker. Without
+            # it the key falls through to the unknown-key path and reports
+            # `unknown parameter 'feature_pre_filter'`, which is a worse
+            # message than the explicit refusal it replaced.
+            check_feature_pre_filter(_parse_bool(key, value))
         elif key == "max_conflict_rate":
             config.booster.bundling.params.max_conflict_rate = _parse_f64(
                 key, value
