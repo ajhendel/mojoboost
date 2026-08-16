@@ -65,6 +65,8 @@ from a grown tree, because an internal node keeps the value it had when it was
 created.
 """
 
+from std.os import getenv
+
 from .apple_cpu_policy import (
     BIN_LAYOUT_AUTO,
     BIN_LAYOUT_FEATURE_MAJOR,
@@ -1392,6 +1394,34 @@ struct _HistPool(Movable):
             self.free.append(hist^)
 
 
+def _env_layout_probe() -> Bool:
+    """`MOJOTREES_CPU_BIN_LAYOUT_PROBE=1`: run the timed layout probe.
+
+    Off by default, and it is a separate variable from
+    `MOJOTREES_CPU_BIN_LAYOUT` rather than a fourth word on it, because the
+    two answer different questions. That variable names a layout and its
+    `auto` means "I have not named one"; this one asks for a *measurement* to
+    be taken, which is a thing a fit does rather than a value it holds. It
+    also keeps the layout vocabulary in `apple_cpu_policy` where the rest of
+    the layout policy lives, and this switch in the grower that runs it.
+
+    **Why it exists at all, given the probe currently loses.** Row-major
+    measured 1.15x slower than feature-major at 799,110 x 100 in this lane's
+    window and 1.35x slower in another lane's, so the rule this probe
+    implements is not one anybody should be running by default today. What it
+    fixes is that `histogram.choose_bin_layout_timed` had **no caller** -- it
+    was written, tested, documented as LightGBM's auto rule, and unreachable,
+    which is this repository's most repeated defect and is worth closing on
+    its own terms. Behind a named switch it is reachable, it is measurable by
+    anyone who wants to re-ask the question on a different machine or a
+    different shape, and it cannot change what a fit does unless asked.
+    """
+    var s = getenv("MOJOTREES_CPU_BIN_LAYOUT_PROBE")
+    if s.byte_length() == 0:
+        return False
+    return s != "0"
+
+
 struct GrowScratch(Movable):
     """The working memory one grower call reuses across every node, and one
     booster reuses across every tree.
@@ -1502,7 +1532,24 @@ struct GrowScratch(Movable):
             if requested == BIN_LAYOUT_AUTO
             else requested
         )
-        self.layout_pending = requested == BIN_LAYOUT_AUTO
+        # **AUTO still resolves to feature-major, and the probe is opt-in.**
+        # The probe exists because `choose_bin_layout_timed` had no caller at
+        # all, which was a real reachability defect and is what this closes.
+        # It does NOT exist because row-major should be the default: measured
+        # 2026-08-16 at 799,110 x 100, forced row-major is **1.15x slower**
+        # than forced feature-major (medians 16.081 s against 13.990 s, delta
+        # 2.091 s against a widest plateau spread of 1.346 s, resolved), and
+        # a second lane measured the same direction at 1.35x on the same
+        # shape. A probe wired to AUTO would have made that the default for
+        # every fit with a row-major view.
+        #
+        # So the gate is `MOJOTREES_CPU_BIN_LAYOUT_PROBE=1` and nothing else
+        # turns it on. Unset -- which is every fit that does not ask -- and
+        # this is `False`, `bin_layout` stays feature-major, and the grower
+        # runs exactly the accumulation that shipped.
+        self.layout_pending = (
+            requested == BIN_LAYOUT_AUTO and _env_layout_probe()
+        )
         # The scheduling environment, read once here and then never again for
         # the life of this scratch. Every dispatch the grower makes -- the
         # histogram builds, the sibling subtractions, the split scans -- takes
