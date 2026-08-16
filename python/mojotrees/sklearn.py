@@ -53,6 +53,18 @@ _CROSS_ENTROPY = 12
 #: for `None`-ness and expect to have distinguished them.
 _MULTICLASS = -1
 
+#: LightGBM's stock `learning_rate`, and the value an unset one resolves to.
+#:
+#: A named constant rather than four repeated literals because the
+#: constructor no longer carries it: `learning_rate` defaults to `None` so
+#: that "the user did not name it" survives all the way to CatBoost's gate,
+#: which fires only on an UNSET rate (`options_helper.cpp:277`). A signature
+#: default of 0.1 cannot say that -- `0.1` typed by a user and `0.1` supplied
+#: by the signature are the same float by the time anything can look -- and
+#: `tools/check_parity.py` reads this constant instead, the way it already
+#: reads `_LAMBDA_L2`.
+_LEARNING_RATE = 0.1
+
 # Defaults of the two regularization parameters, named so the constructor
 # signature and the alias resolution in `_params` cannot drift apart.
 _LAMBDA_L1 = 0.0
@@ -381,6 +393,19 @@ class _Base(_ParamsMixin):
     fit, and refuse by entry point everywhere else. See the `bootstrap_type`
     paragraph above.
 
+    `auto_learning_rate` (CatBoost's data-dependent rate, catalog A12/A38)
+    never joined that list, because until 2026-08-16 the estimator had no
+    such keyword at all and asking for it was a `TypeError`. It is a
+    parameter now, and it is the first thing landed under the standing rule:
+    **`grow_policy='symmetrictree'` mirrors CatBoost and turns it ON by
+    default; `lossguide`, our default, mirrors LightGBM, which has no such
+    feature, and leaves it off.** Nine of the fifteen `_parse_params` call
+    sites derive the rate and the other six refuse an explicit request by
+    name with the input they cannot supply. `learning_rate` and `lambda_l2`
+    default to `None` for this: CatBoost's gate fires only on an UNSET rate
+    and an unset `l2_leaf_reg`, and "unset" there is provenance rather than
+    a value, so a float equal to the default cannot stand in for it.
+
     `use_missing` is LightGBM's parameter of the same name. With it (the
     default), `NaN` is a missing value: a feature that has any in training
     reserves a bin for them, the split search picks a default direction per
@@ -517,7 +542,18 @@ class _Base(_ParamsMixin):
         max_depth=-1,
         depth=None,
         grow_policy="lossguide",
-        learning_rate=0.1,
+        # `None`, not 0.1, and the value has not changed: an unset rate
+        # resolves to `_LEARNING_RATE` at fit time. What `None` adds is the
+        # one fact a float cannot carry, which is whether anybody typed it.
+        # CatBoost's automatic learning rate fires only when the rate is
+        # UNSET (`options_helper.cpp:277`, `TOption::NotSet()` in
+        # `option.h:80-85`, an `IsSetFlag` written on assignment and never a
+        # comparison against a default), and `grow_policy='symmetrictree'`
+        # turns that derivation on by default. With a signature default of
+        # 0.1 the gate could only have been reproduced as "the rate equals
+        # the default", which would silently override a user who typed 0.1
+        # and would fire for a benchmark arm that pinned it.
+        learning_rate=None,
         eta=None,
         shrinkage_rate=None,
         n_estimators=100,
@@ -528,7 +564,17 @@ class _Base(_ParamsMixin):
         min_data_in_leaf=20,
         min_child_samples=None,
         min_samples_leaf=None,
-        lambda_l2=_LAMBDA_L2,
+        # `None` for the same reason `learning_rate` is, and for one more:
+        # `l2_leaf_reg` is the second of CatBoost's four gate keys
+        # (`options_helper.cpp:280`) and it is the one whose CatBoost default
+        # is not zero. A CatBoost-mode arm that names `lambda_l2=3.0` to
+        # match CatBoost's default would, under a value test, close the gate
+        # it was built to open, while CatBoost's own 3 does not close it
+        # because CatBoost put it there rather than the user. `None` is the
+        # only reading that gets both cases right: 3.0 supplied by a mode
+        # default leaves the gate open, 3.0 typed by a caller closes it.
+        # An unset value resolves to `_LAMBDA_L2` at fit time, unchanged.
+        lambda_l2=None,
         lambda_l1=_LAMBDA_L1,
         reg_lambda=None,
         reg_alpha=None,
@@ -557,6 +603,14 @@ class _Base(_ParamsMixin):
         bootstrap_type=None,
         bagging_temperature=None,
         leaf_estimation_iterations=None,
+        # CatBoost's automatic learning rate (catalog A12/A38). Three states,
+        # and `None` is not "off": it is "whatever the grow policy implies",
+        # which is ON under `grow_policy='symmetrictree'` and OFF under every
+        # other policy. CatBoost has no such key -- there the derivation is
+        # implied by leaving the rate unset -- so naming it is an override of
+        # the mode default in either direction, and `False` is how a
+        # CatBoost-mode fit pins its own rate without leaving CatBoost mode.
+        auto_learning_rate=None,
         score_function=None,
         max_ctr_complexity=None,
         device="cpu",
@@ -691,6 +745,7 @@ class _Base(_ParamsMixin):
         self.bootstrap_type = bootstrap_type
         self.bagging_temperature = bagging_temperature
         self.leaf_estimation_iterations = leaf_estimation_iterations
+        self.auto_learning_rate = auto_learning_rate
         self.score_function = score_function
         self.max_ctr_complexity = max_ctr_complexity
         self.device = device
@@ -1295,6 +1350,17 @@ class _Base(_ParamsMixin):
         primary_value = (
             getattr(self, primary) if folded is _UNSET else folded
         )
+        # A primary that is `None` is one whose signature default is `None`
+        # rather than the stock value, which two of them now are:
+        # `learning_rate` and `lambda_l2`. They carry `None` so that "the
+        # user did not name this" is still knowable at fit time, which is
+        # what CatBoost's `TOption::NotSet()` means and what its automatic
+        # learning rate is gated on. Everywhere else the pair is exactly the
+        # value it was before, because the fold happens here rather than at
+        # every reader: `_multi_target.wire_params` and `_callback_params`
+        # call this function too and neither had to learn about it.
+        if primary_value is None:
+            primary_value = default
         if alias_value is None:
             return primary_value
         if primary_value != default and primary_value != alias_value:
@@ -1819,6 +1885,133 @@ class _Base(_ParamsMixin):
             f"'symmetric'), got {self.grow_policy!r}"
         )
 
+    def _auto_learning_rate_knobs(self, grow_policy, boosting):
+        """The four `auto_learning_rate_*` keys a fit goes out with.
+
+        CatBoost's automatic learning rate (catalog A12/A38,
+        `src/mojotrees/auto_learning_rate.mojo`). The formula, the
+        coefficient table and the half of the gate that reads the
+        coefficient table all live there and none of it is copied here. What
+        this method decides is the half that cannot cross the wire, which is
+        **provenance**: whether the caller named a parameter, as against
+        what its value came out as.
+
+        CatBoost's gate, `UpdateLearningRate` in
+        `catboost/libs/train_lib/options_helper.cpp:276-281`, is
+
+            learningRate.NotSet() &&
+            ObliviousTreeOptions->LeavesEstimationMethod.NotSet() &&
+            ObliviousTreeOptions->LeavesEstimationIterations.NotSet() &&
+            ObliviousTreeOptions->L2Reg.NotSet()
+
+        and `NotSet()` is `!IsSetFlag` (`option.h:80-85`), a flag written
+        when the option is assigned from the user's JSON and never a
+        comparison against a default. That distinction is the whole
+        difficulty of reproducing this from Python, and it is why
+        `learning_rate` and `lambda_l2` default to `None` in the constructor
+        rather than to their stock values: a float that equals the default
+        cannot say who put it there. Two cases the value reading would get
+        wrong, both of which are live in this repository today:
+
+        - a benchmark arm that pins `learning_rate=0.1` for reproducibility
+          would have the pin silently replaced under CatBoost mode, and the
+          run would report a derived rate it did not use;
+        - a CatBoost-mode arm that sets `lambda_l2=3.0` to match CatBoost's
+          own default would close the gate that CatBoost's own 3 leaves
+          open, so the derivation would never fire on the arm built to show
+          it. Under `None` the two are distinguishable: 3.0 arriving from a
+          mode default leaves the gate open, 3.0 named by a caller closes
+          it.
+
+        `leaf_estimation_method` has no mojotrees spelling at all (Newton
+        only, catalog A6), so that third gate is permanently open for us and
+        is not sent.
+
+        The mode default. `auto_learning_rate=None` means "what the grow
+        policy implies": ON under `symmetrictree`, which is CatBoost's, and
+        OFF under `lossguide` and `depthwise`, which mirror LightGBM and
+        LightGBM has no such feature. `True` and `False` override it either
+        way. That split is the standing rule -- CatBoost mode mirrors
+        CatBoost, our default mirrors LightGBM -- and this is its first
+        instance.
+
+        `required` is the difference between an explicit `True` and an
+        inherited mode default, and the native side spends it on refuse
+        versus decline. An explicit request an entry point cannot honor is
+        refused by name, because a parameter accepted and dropped is the
+        defect this whole sequence exists to remove. An inherited default it
+        cannot honor falls back to the given rate in silence, because that
+        is precisely what CatBoost does when its own table has no row.
+        """
+        asked = self.auto_learning_rate
+        if asked is None:
+            wanted = grow_policy == "symmetrictree"
+            required = False
+        else:
+            wanted = bool(asked)
+            required = wanted
+        # Provenance, one name at a time. Each of these is `None` in the
+        # constructor when it is not named, so "named" is exactly "not None"
+        # and no value is compared with anything.
+        rate_named = (
+            self.learning_rate is not None
+            or self.eta is not None
+            or self.shrinkage_rate is not None
+        )
+        l2_named = (
+            self.lambda_l2 is not None
+            or self.reg_lambda is not None
+            or self.l2_leaf_reg is not None
+            or self.l2_regularization is not None
+        )
+        leaf_iters_named = self.leaf_estimation_iterations is not None
+        if required:
+            # The same three contradictions `params.mojo` refuses on the
+            # parameter-string surface (`_enable_auto_learning_rate`), with
+            # the same reasoning: CatBoost resolves each of them by silently
+            # keeping its constant, and a user who asked for the derivation
+            # in so many words has no way to see that they did not get it.
+            # Silent under the mode default, refused under an explicit ask.
+            if rate_named:
+                raise ValueError(
+                    "auto_learning_rate=True and an explicit learning_rate "
+                    "contradict each other: the automatic rate exists to "
+                    "replace an unset one. CatBoost resolves this by "
+                    "silently keeping the explicit rate; give only one"
+                )
+            if l2_named:
+                raise ValueError(
+                    "auto_learning_rate=True with an explicit l2_leaf_reg "
+                    "(lambda_l2, reg_lambda, l2_regularization) would do "
+                    "nothing: CatBoost's derivation is gated on l2_leaf_reg "
+                    "being unset (options_helper.cpp:280), so naming it "
+                    "pins the rate back to the constant. Drop one of the two"
+                )
+            if leaf_iters_named:
+                raise ValueError(
+                    "auto_learning_rate=True with an explicit "
+                    "leaf_estimation_iterations would do nothing: CatBoost's "
+                    "derivation is gated on it being unset "
+                    "(options_helper.cpp:279). Drop one of the two"
+                )
+            if boosting == "rf":
+                raise ValueError(
+                    "auto_learning_rate=True and boosting_type='rf' "
+                    "contradict each other: a random forest averages its "
+                    "trees and trains at a rate of 1.0 whatever it was "
+                    "given, so a derived rate would be computed and thrown "
+                    "away"
+                )
+        # A forest discards the rate, so there is nothing to derive for one
+        # even when the request was only the mode default.
+        enabled = wanted and not rate_named and boosting != "rf"
+        return {
+            "auto_learning_rate": int(enabled),
+            "auto_learning_rate_required": int(enabled and required),
+            "auto_learning_rate_l2_set": int(l2_named),
+            "auto_learning_rate_leaf_iters_set": int(leaf_iters_named),
+        }
+
     def _params(
         self,
         sample_weight_addr,
@@ -1845,9 +2038,12 @@ class _Base(_ParamsMixin):
         n_estimators = self._resolve_alias(
             "n_estimators", "max_iter", 100, n_estimators
         )
-        learning_rate_set = self._resolve_alias("learning_rate", "eta", 0.1)
         learning_rate_set = self._resolve_alias(
-            "learning_rate", "shrinkage_rate", 0.1, learning_rate_set
+            "learning_rate", "eta", _LEARNING_RATE
+        )
+        learning_rate_set = self._resolve_alias(
+            "learning_rate", "shrinkage_rate", _LEARNING_RATE,
+            learning_rate_set,
         )
         num_leaves = self._resolve_alias("num_leaves", "max_leaves", 31)
         num_leaves = self._resolve_alias(
@@ -2030,6 +2226,13 @@ class _Base(_ParamsMixin):
         if not 0.0 < float(feature_fraction_bynode) <= 1.0:
             raise ValueError("colsample_bynode must be in (0, 1]")
         grow_policy = self._resolve_grow_policy()
+        # After `boosting` and `grow_policy` are both resolved, because the
+        # mode default reads the grow policy and the forest refusal reads
+        # the boosting strategy. Before the dict is built, so that a
+        # contradiction raises rather than travelling.
+        auto_learning_rate_knobs = self._auto_learning_rate_knobs(
+            grow_policy, boosting
+        )
         if int(max_cat_to_onehot) < 0:
             raise ValueError("max_cat_to_onehot must be nonnegative")
         if int(self.max_cat_threshold) < 1:
@@ -2189,6 +2392,21 @@ class _Base(_ParamsMixin):
             # dropped -- the defect this whole sequence exists to remove. The
             # binding refuses it by entry point for the loops that do not
             # compute a scale.
+            # CatBoost's automatic learning rate (catalog A12/A38). Four ints,
+            # sent on every fit like everything else here, because the native
+            # parser subscripts the mapping rather than testing for a key.
+            #
+            # The rate itself is NOT derived here: the formula and the
+            # coefficient table live in src/mojotrees/auto_learning_rate.mojo
+            # and the derivation needs the train row count, which `_params`
+            # does not have and each fit entry point does. What crosses here
+            # is the request plus the provenance the native side cannot
+            # recover from a resolved float. `_parse_params` in
+            # bindings/_mojotrees.mojo turns it into an
+            # `AutoLearningRateParams` and calls `resolve_learning_rate`; the
+            # entry points that cannot supply a row count, an iteration count
+            # and a loss function refuse it by name there.
+            **auto_learning_rate_knobs,
             "random_strength": float(self.random_strength or 0.0),
             "max_delta_step": float(self.max_delta_step),
             "path_smooth": float(self.path_smooth),
@@ -2582,9 +2800,11 @@ class _Base(_ParamsMixin):
         # `callback.RESETTABLE` is a native vocabulary and keeps LightGBM's
         # names, as every wire does; the values are resolved from the
         # canonical user-facing names the same way `_params` resolves them.
-        learning_rate = self._resolve_alias("learning_rate", "eta", 0.1)
         learning_rate = self._resolve_alias(
-            "learning_rate", "shrinkage_rate", 0.1, learning_rate
+            "learning_rate", "eta", _LEARNING_RATE
+        )
+        learning_rate = self._resolve_alias(
+            "learning_rate", "shrinkage_rate", _LEARNING_RATE, learning_rate
         )
         num_leaves = self._resolve_alias("num_leaves", "max_leaves", 31)
         num_leaves = self._resolve_alias(

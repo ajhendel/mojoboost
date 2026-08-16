@@ -1655,6 +1655,19 @@ STOCK_STRUCT_DEFAULTS = (
 STOCK_PYTHON_CONSTANTS = {
     "_LAMBDA_L1": "lambda_l1",
     "_LAMBDA_L2": "lambda_l2",
+    # `learning_rate` moved here from `STOCK_PYTHON_SIGNATURE` on 2026-08-16,
+    # and the fact it guards is unchanged: LightGBM's stock rate is still
+    # read out of `python/mojotrees/sklearn.py` and still compared against
+    # the same table. What moved is where the literal sits. The constructor
+    # now defaults `learning_rate` to `None`, because CatBoost's automatic
+    # learning rate fires only on an UNSET rate (`options_helper.cpp:277`)
+    # and a signature default of 0.1 cannot tell an unset rate from a rate a
+    # caller typed as 0.1 -- which is exactly the distinction a CatBoost-mode
+    # benchmark arm turns on. `_LEARNING_RATE` is the value an unset rate
+    # resolves to at fit time, so it is the Python default this gate exists
+    # to check. `_LAMBDA_L2` was already read this way for the same shape of
+    # reason.
+    "_LEARNING_RATE": "learning_rate",
 }
 
 #: The THIRD copy of the stock leaf-regularization defaults, in
@@ -1681,7 +1694,11 @@ STOCK_BASIC_LEAF_DEFAULTS = {
 STOCK_PYTHON_SIGNATURE = {
     "num_leaves": "num_leaves",
     "max_depth": "max_depth",
-    "learning_rate": "learning_rate",
+    # `learning_rate` is checked as `_LEARNING_RATE` in
+    # STOCK_PYTHON_CONSTANTS above, not here: its signature default is now
+    # `None` so that "unset" survives to CatBoost's gate. Removing it from
+    # this table without adding it there would have unchecked LightGBM's
+    # stock rate on the surface bench/real_data fits.
     "n_estimators": "num_iterations",
     "min_data_in_leaf": "min_data_in_leaf",
     "min_child_hess": "min_sum_hessian_in_leaf",

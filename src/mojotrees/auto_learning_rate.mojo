@@ -8,10 +8,28 @@ CatBoost arm to get a reproducible number, and it is why "our default 0.1
 against CatBoost's default" is not a comparison of defaults at all. This
 module reproduces the derivation so the comparison can be made honestly.
 
-Everything here is **off by default**. No existing default changes:
-`BoosterParams.default()` is still `learning_rate = 0.1`, and `parse_params`
-still returns 0.1 unless `auto_learning_rate=true` is given. Nothing in this
-module is called unless a caller asks for it.
+Everything in this module is inert until a caller enables it, and nothing
+here decides when that is. `AutoLearningRateParams` defaults to disabled and
+`BoosterParams.default()` is still `learning_rate = 0.1`.
+
+**Who enables it, as of 2026-08-16.** Under `grow_policy=oblivious`,
+CatBoost's symmetric tree, this is ON by default, because the standing rule
+is that CatBoost mode mirrors CatBoost exactly and CatBoost derives the rate
+whenever the user set none of the four gated parameters. Under `lossguide`
+and `depthwise` it is OFF by default, because those mirror LightGBM and
+LightGBM has no automatic learning rate. `auto_learning_rate=true|false`
+overrides the mode default in either direction. The decision is made where
+the parameters are parsed and their provenance is still visible --
+`params.parse_params` for the string, CLI and C ABI surfaces, and
+`_Base._auto_learning_rate_knobs` in python/mojotrees/sklearn.py for the
+Python one -- never here.
+
+**Reachability.** All four surfaces reach it. The CLI and the C ABI go
+through `TrainConfig.resolved_learning_rate`; the Python extension calls the
+free function `resolve_learning_rate` below from `_apply_auto_learning_rate`
+in bindings/_mojotrees.mojo, which nine of the fifteen `_parse_params` call
+sites hand a row count, an iteration count and an objective, and the other
+six refuse by name.
 
 Source, verified
 ----------------

@@ -448,6 +448,7 @@ configuration `sampling.check_mvs_reg` argues is the only sensible one.
 | A35 | Persisting the fitted CTR tables in the model file (`catboost/libs/model/model_export/model_exporter.cpp`, `catboost/libs/model/ctr_data.h`, `catboost/libs/model/online_ctr.h::TModelCtr`; `CalcFinalCtrsAndSaveToModel` in `catboost/private/libs/algo/full_model_saver.cpp`) -- **CatBoost's behavior verified from source only to the extent A19 already verified it**: that `.cbm` carries `TCtrValueTable` per `TModelCtrBase` and that inference reads it through `TModelCtr::Calc`. The `.cbm` binary layout itself was NOT read, and nothing here imitates it | The model format's section for A19's model state. A fitted `CtrTables` is read off the target, so it is model state and not configuration; a file without it loads a model that keeps every tree referencing a CTR column and bins that column from different numbers | No. A reloaded model must score **bit-identically**, which is the whole test | Yes, and it is the gate on A19 being reachable at all: an arm that cannot be saved is an arm nobody can ship, and A19's own trainer refusal named this as the blocker | `serialize.mojo` (v5 `ctr` section), `ctr_columns.mojo` (the guards), `model_dump.mojo` (the remaining refusal) | A35 note. **BUILT and REACHED.** Format **v5**, conditional: a model with no ctr tables and no linear leaves still writes v4. Floats round-trip exactly because the whole format stores IEEE-754 bit patterns. Prepared tables, the model dump and every Python entry point still REFUSE, each by its own reason |
 | A36 | **CTR REPLACEMENT of a raw categorical column, and `random_strength` at the trainer the benchmark uses.** Two reachability edges, not two new mechanisms: A19/A30 own the CTR arithmetic and A3 owns the noise. CatBoost's own fork is `one_hot_max_size` (A16): a column at or under the cutoff becomes one-hot and every wider column is REPLACED by its CTR columns, so its split search never meets a category. **CatBoost's behavior here is RELAYED from the A16, A19 and A30 notes, not independently re-verified: there is no CatBoost checkout in this worktree** | Replacement is what the word says. A CTR that is *added* beside the raw column leaves the categorical in the matrix, so `tree._check_oblivious` still refuses the level and nothing has been built. The noise edge is narrower: the per-split draw exists on both backends, and what is scarce is the per-tree scale, which exactly two round loops compute | Yes for the CTR half (new columns, and one column removed). No for the noise half beyond what A3 already moves | The noise half YES and **BUILT**. The CTR half **BLOCKED**, four traced reasons, see the A36 note | `bindings/_mojotrees.mojo` (both), `bench/real_data/scenarios.py`; the CTR half would need `ctr_columns.mojo`, `binning.mojo`, `trainset.mojo` plus two files this lane does not own | A36 note. (3) when set. `random_strength` is deterministic across `MOJOTREES_NUM_WORKERS` and across machines, established by reading the code and written out in the note |
 | A37 | **The RESOLVED parameter list as the source of truth for the comparison arm**, and the removal of the CatBoost learning-rate pin. `CatBoost.get_all_params()` on the fitted model, which is CatBoost's own answer rather than a transcription of its documentation. **Nothing about CatBoost was verified from source in this lane and nothing was run: no CatBoost checkout, no fit, no `selfcheck`.** Every CatBoost claim is RELAYED from `CATBOOST_DEFAULTS_SOURCE`, the A16/A19/A30/A31 notes, and the measured learning-rate figures already recorded at `scenarios.py:355-362` | Not a CatBoost mechanism. It is the difference between what a library RESOLVES and what a harness BELIEVES it resolves. `MOJOTREES_CATBOOST_MODE` was a hand-written dict of somebody's belief about CatBoost's defaults, and `selfcheck.check_catboost_arm` checked it against a dict built from itself, so no wrong value in it could ever fail a gate | Yes, and by a lot on one key. The CatBoost arm no longer passes `learning_rate`, so CatBoost resolves its own -- about 0.4273 at 100 iterations on a 20,000 by 20 shape against the 0.1 it used to be pinned to | The arm identity moves from `cb-default@v1` to `cb-shipped@v1` and every published CatBoost number is SUPERSEDED. The `mojotrees_catboost_mode` arm is PARKED pending the read-back wiring, which is four call-site edits in three files this lane did not own | `bench/real_data/scenarios.py`, `bench/real_data/selfcheck.py`; the wiring is in `WIRE_NOTE_resolved_param_parity.md` for `engines.py`, `worker.py` and `run.py` | A37 note. (2) bit-moving on the CatBoost arm, deliberately. Gate: `selfcheck.check_catboost_arm`'s new key-by-key diff, which has never been watched fail and whose failing edit is written out in the note |
+| A38 | **The automatic `learning_rate` made reachable from Python, and turned ON by default in CatBoost mode** (`catboost/libs/train_lib/options_helper.cpp:276-281`, `UpdateLearningRate`; `catboost/private/libs/options/option.h:80-85`, `TOption::NotSet()`) -- **verified from source**, see the A38 note | Not a new mechanism. A11/A12 built the formula and verified it; this is the reachability edge and the default. The derivation was honored from the CLI and the C ABI and from nowhere else, so no benchmark and no pip user could reach it; and it was opt-in everywhere, so CatBoost mode did not behave as CatBoost | Yes when it fires, and it fires by default under `grow_policy=oblivious`: every leaf value moves with the rate | Yes. It is the first item landed under the standing rule -- `grow_policy=oblivious` mirrors CatBoost exactly, `lossguide` mirrors LightGBM, anything of ours is opt-in | `bindings/_mojotrees.mojo`, `python/mojotrees/sklearn.py`, `src/mojotrees/params.mojo` | A38 note. (3) when on, and ON is now a default in CatBoost mode. Gate: the harness compares our fitted model's read-back rate against CatBoost's `engine_resolved_params` at record time |
 
 ### A4 note: Bayesian bootstrap, verified from source
 
@@ -968,12 +969,16 @@ n_rows)` applies it. That method returns `booster.learning_rate` untouched
 whenever the derivation is off, so every caller can route through it
 unconditionally. Two surfaces do: `capi/mojotrees_capi.mojo` (at the point it
 first has `n_rows`) and `cli/mojotrees_cli.mojo` (after the table is read).
-The Python mapping surface does **not** carry the key at all, so it is
-refused there as an unknown parameter rather than accepted and dropped --
-which is the repo's refuse-rather-than-ignore rule, not an oversight. Wiring
-it into `bindings/_mojotrees.mojo` means threading a row count through
-fourteen `_parse_params` call sites and adding the key to the Python default
-mapping; that is a separate change and has not been made.
+**SUPERSEDED, 2026-08-16, see the A38 note.** This paragraph used to read
+that the Python mapping surface does not carry the key at all and that
+wiring it into `bindings/_mojotrees.mojo` "is a separate change and has not
+been made". It has been made: the estimator takes `auto_learning_rate`, the
+row count and the objective are threaded through all fifteen `_parse_params`
+call sites, nine of them derive the rate and six refuse an explicit request
+by name. The derivation is also now ON by default under
+`grow_policy=oblivious` and OFF under every other grow policy, which is the
+standing rule that CatBoost mode mirrors CatBoost and our default mirrors
+LightGBM. A38 has the per-entry-point verdicts and the provenance rules.
 
 `parse_params` is stricter than CatBoost on purpose. CatBoost, handed
 `learning_rate=0.05 l2_leaf_reg=5`, silently keeps 0.05 and prints nothing;
@@ -5808,3 +5813,176 @@ FAIL the CatBoost-mode arm BUILT without CatBoost's read-back. It must refuse by
 ```
 
 Revert Edit D. All four are one-line edits and none of them needs a fit.
+
+### A38 note: the automatic rate reaches Python, and CatBoost mode turns it on
+
+Status: **built**, 2026-08-16, lane `lane/auto-lr-reachable`. CatBoost's gate
+condition is **verified from source**, read in this repository's own CatBoost
+checkout; the mojotrees side is **written and not compiled**, because a
+timing window was open on the box for the whole of the lane's build and no
+Mojo was allowed to run. Nothing was measured and nothing was fitted.
+
+Supersedes the reachability paragraph in the A12 note, which said the Python
+wiring "is a separate change and has not been made". It has been made.
+
+#### The gate, verified from source
+
+`catboost/libs/train_lib/options_helper.cpp`, `UpdateLearningRate`, lines
+276 to 281:
+
+```cpp
+if (
+    learningRate.NotSet() &&
+    catBoostOptions->ObliviousTreeOptions->LeavesEstimationMethod.NotSet() &&
+    catBoostOptions->ObliviousTreeOptions->LeavesEstimationIterations.NotSet() &&
+    catBoostOptions->ObliviousTreeOptions->L2Reg.NotSet()
+) {
+    TAutoLRParamsGuesser lrGuesser;
+    if (lrGuesser.NeedToUpdate(taskType, lossFunction, useBestModel, boostFromAverage)) {
+        learningRate = lrGuesser.GetLearningRate(...);
+```
+
+**`NotSet()` is provenance, not a value comparison.** It is `!IsSetFlag`
+(`catboost/private/libs/options/option.h:84-85`), and `IsSetFlag` starts
+`false` (`option.h:136`) and is written `true` on assignment (`option.h:42`),
+which happens when the option is loaded from the user's JSON. `SetDefault`
+(`option.h:28-31`) writes the value and deliberately does **not** set the
+flag. So `l2_leaf_reg = 3` supplied by CatBoost's own default leaves the gate
+OPEN, and `l2_leaf_reg = 3` typed by a user closes it, with the same value in
+the option either way. Any reproduction that tests the value instead of the
+provenance gets both of those backwards.
+
+That distinction is not academic here. Two live cases in this repository
+turn on it:
+
+- a benchmark arm that pins `learning_rate=0.1` for reproducibility. Under a
+  value test our stock 0.1 and the pinned 0.1 are the same float, so the pin
+  would be silently replaced and the run would report a derived rate it did
+  not use.
+- the CatBoost-mode arm sets `lambda_l2=3.0` to match CatBoost's default
+  value. Under a value test that closes the gate, and the derivation would
+  never fire on the arm built to show it -- while CatBoost's own 3 leaves its
+  gate open, because CatBoost put it there.
+
+#### How "unset" is reproduced, per surface
+
+| surface | how "unset" is known |
+|---|---|
+| parameter string, CLI, C ABI | `parse_params` sees the KEYS. `saw_learning_rate`, `saw_lambda_l2`, `saw_leaf_estimation_iterations` are set when the key is named, at any value |
+| Python estimator and `mojotrees.train` | `learning_rate` and `lambda_l2` now default to `None` in `_Base.__init__`, joining `l2_leaf_reg`, `l2_regularization`, `reg_lambda`, `eta`, `shrinkage_rate` and `leaf_estimation_iterations`, which already did. "Named" is `is not None`, and no value is compared with anything. An unset one resolves to `_LEARNING_RATE` / `_LAMBDA_L2` inside `_resolve_alias`, so the resolved value is exactly what it was before |
+
+`leaf_estimation_method` has no mojotrees spelling at all (Newton only,
+catalog A6), so the third of CatBoost's four gates is permanently open for
+us. That is a stated divergence and not a silent one.
+
+The `None` defaults change what `get_params()` reports for two parameters
+and are recorded as three `compatibility/api_snapshot.json` rows
+(`learning_rate` 0.1 to None, `lambda_l2` 0.0 to None, `auto_learning_rate`
+added). `tools/check_parity.py` still checks both stock values, reading
+`_LEARNING_RATE` and `_LAMBDA_L2` as module constants; `learning_rate` moved
+from `STOCK_PYTHON_SIGNATURE` to `STOCK_PYTHON_CONSTANTS` for that, which is
+how `lambda_l2` was already read.
+
+#### The default, and the standing rule
+
+`grow_policy=oblivious` (CatBoost's symmetric tree) turns the derivation ON
+by default; `lossguide` and `depthwise` leave it OFF. LightGBM has no
+automatic learning rate, so the flat 0.1 remains our default under our own
+grow policy, and CatBoost mode behaves as CatBoost. `auto_learning_rate` is
+a three-state parameter: `None` takes the mode default, `True` and `False`
+override it.
+
+`True` and the mode default are **not** the same request, and the difference
+is spent on refuse versus decline:
+
+- an explicit `True` that an entry point cannot honor is **refused by name**
+  with the real reason. A parameter accepted and dropped is the defect this
+  campaign exists to remove.
+- a mode default that cannot be honored **declines in silence** and the given
+  rate stands. That is CatBoost's own behavior: handed a loss whose target
+  type has no row in the coefficient table it keeps its constant 0.03 and
+  prints nothing.
+
+An explicit `True` beside a named `learning_rate`, `l2_leaf_reg` or
+`leaf_estimation_iterations` raises, on both surfaces, naming the gate. The
+mode default beside the same key is silent, because nothing was asked for.
+
+#### Reachability, entry point by entry point
+
+`_parse_params` in `bindings/_mojotrees.mojo` has **fifteen** call sites. Nine
+may derive the rate; six refuse an explicit request by name. The verdict is
+not "which round loop honors the rate" -- every trainer in this package
+shrinks by `BoosterParams.learning_rate` -- but "can this entry point supply
+the three inputs CatBoost's derivation reads, meaning the same things
+CatBoost means by them".
+
+| entry point | verdict | why |
+|---|---|---|
+| `fit` | derives | objective, `n_rows` and `n_estimators` all present. `boosting='rf'` is refused one layer up, because a forest trains at 1.0 and would discard the rate |
+| `distributed_train_local` | derives | the world is hosted in this process, so `n_rows` is the whole training set and not a shard |
+| `fit_custom` | refuses | a callback objective is a pair of derivative buffers, not a loss function; there is no `ETargetType` to key the table with |
+| `fit_with_metrics` | refuses | an eval set is what makes `use_best_model` resolvable, and `use_best_model` is one of the four table keys. mojotrees has no `use_best_model` to resolve |
+| `fit_multiclass_with_metrics` | refuses | same |
+| `fit_ranker_with_metrics` | refuses | same |
+| `fit_multiclass` | derives | MultiClass rows exist for `boost_from_average = false`, which is what CatBoost resolves for MultiClass |
+| `fit_csc` | derives | `csc.n_rows` is the object count; storage layout is not an input |
+| `fit_multiclass_csc` | derives | as above |
+| `fit_ranker` | derives, then the module declines | the inputs are all here; `GetTargetType` maps LambdaRank to Unknown and the table has no row, so `AutoLearningRateParams.fires` says so. Keeping that judgement in the module rather than copying "ranking has no row" into the binding |
+| `train_dataset` | derives | **the entry point `bench/real_data` trains through.** `mojotrees.train(params, Dataset)` never touches `model.fit` |
+| `train_dataset_multiclass` | derives | the objective key is not read by this trainer, so the code is named at the call site |
+| `train_dataset_ranker` | derives, then the module declines | as `fit_ranker` |
+| `booster_update` | refuses | `n_estimators` here is the increment; the formula reads the iteration count of the whole run. The trees already in the model were grown at their own rate |
+| `booster_update_multiclass` | refuses | same |
+
+Two more surfaces, outside `_parse_params`:
+
+- `_multi_target.wire_params` reaches `multi_rmse_fit`, a different binding.
+  An explicit request is refused by name there; the mode default declines in
+  silence, which is parity: CatBoost's table has no MultiRMSE row either.
+- a fit at zero rounds (a Booster constructed on a training set before
+  anything is boosted) skips the derivation, because the formula takes
+  `log(iterationCount)`.
+
+#### Determinism
+
+Read off the code rather than assumed. `resolve_learning_rate` is scalar
+`Float64` on one thread: no reduction, no `parallelize`, no device work, no
+row-order dependence. Its inputs are three integers -- objective code,
+iteration count, train row count -- and four table constants. Nothing it
+reads depends on `MOJOTREES_NUM_WORKERS`. Two `log` and three `exp` calls go
+to the platform libm and may differ by an ulp between machines; the round to
+six decimals absorbs that except for a value sitting exactly on a 5 in the
+seventh decimal, and the result is then narrowed to float32, which absorbs it
+further. The rate does depend on the resolved **device**, because CatBoost's
+table is keyed by task type and genuinely gives a GPU run a different rate;
+that is CatBoost's design and is reproduced rather than smoothed over.
+
+#### One number, checked on paper
+
+A37 records CatBoost's own resolved rate, read back from a fitted model, as
+"about 0.4273 at 100 iterations on a 20,000 by 20 shape". The coefficients
+here for CPU / RMSE / `use_best_model=false` / `boost_from_average=true`
+(`options_helper.cpp:216-217`) give **0.427309** for 20,000 train rows and
+100 iterations. That is CatBoost's number, from our transcription, without a
+fit. It is not a substitute for the harness comparison; it is a reason to
+expect that comparison to pass.
+
+#### What this lane could not verify
+
+- **Nothing was compiled or run.** A timing window held the box. Every Mojo
+  and Python change here is written and unexecuted, except the gate scripts
+  and an isolated exercise of `_auto_learning_rate_knobs` extracted by AST,
+  which does not need the extension.
+- **The rate our fits actually run at has not been observed.** The argument
+  that it is CatBoost's rate is a source reading plus the paper check above.
+- **`use_best_model` is always false on our side**, which is right for every
+  entry point that derives (none of them has an eval set) and is the reason
+  the three that do have one refuse. If mojotrees ever grows a
+  `use_best_model`, those three refusals become derivations and the
+  coefficient row changes.
+- **`boost_from_average` is CatBoost's resolution, not ours.** For Logloss
+  CatBoost resolves it false while mojotrees does start from the optimal
+  constant. The coefficient row has to be the row CatBoost would pick for the
+  same run or the two rates are not comparable, so CatBoost's answer is used.
+  This is a deliberate divergence between what the flag says and what our
+  trainer does, and it is here so it is not silent.

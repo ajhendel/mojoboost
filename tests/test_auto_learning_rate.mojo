@@ -374,5 +374,68 @@ def test_parameter_string_refuses_the_contradictions() raises:
         _ = parse_params("auto_learning_rate=true leaf_estimation_iterations=1")
 
 
+def test_catboost_mode_turns_it_on_and_lossguide_does_not() raises:
+    """The standing rule, as one test.
+
+    `grow_policy=oblivious` is CatBoost's symmetric tree and mirrors
+    CatBoost, which derives the rate whenever the user set none of the four
+    gated parameters. Every other grow policy mirrors LightGBM, which has no
+    such feature, so the default there is a flat rate.
+    """
+    var catboost_mode = parse_params("grow_policy=oblivious num_iterations=1000")
+    assert_true(catboost_mode.auto_learning_rate.enabled)
+    assert_true(
+        close(
+            catboost_mode.resolved_learning_rate(100000),
+            narrow_to_float32(0.084758),
+        )
+    )
+
+    # Our default. LightGBM has no automatic rate, so neither do we.
+    var lossguide = parse_params("num_iterations=1000")
+    assert_false(lossguide.auto_learning_rate.enabled)
+    assert_true(close(lossguide.resolved_learning_rate(100000), 0.1))
+
+    var depthwise = parse_params("grow_policy=depthwise num_iterations=1000")
+    assert_false(depthwise.auto_learning_rate.enabled)
+
+
+def test_catboost_mode_default_is_silent_on_a_closed_gate() raises:
+    """Unset means the key was not named, and a closed gate is not an error.
+
+    The three parameters CatBoost's gate reads close it when the string
+    names them (`options_helper.cpp:277-280`), and CatBoost keeps its
+    constant without saying so. The default here does the same: nothing was
+    asked for, so there is nothing to refuse. An explicit
+    `auto_learning_rate=true` beside the same key still raises, which is
+    `test_parameter_string_refuses_the_contradictions` above.
+    """
+    var pinned = parse_params("grow_policy=oblivious learning_rate=0.03")
+    assert_false(pinned.auto_learning_rate.enabled)
+    assert_true(close(pinned.resolved_learning_rate(100000), 0.03))
+
+    # Naming the rate closes the gate even at the value the parser would
+    # have produced anyway. This is the whole difference between "unset" and
+    # "equal to the default", and it is the reading CatBoost's
+    # `TOption::NotSet()` has (`option.h:80-85`).
+    var named_default = parse_params("grow_policy=oblivious learning_rate=0.1")
+    assert_false(named_default.auto_learning_rate.enabled)
+    assert_true(close(named_default.resolved_learning_rate(100000), 0.1))
+
+    var l2 = parse_params("grow_policy=oblivious lambda_l2=3")
+    assert_false(l2.auto_learning_rate.enabled)
+
+    var leaves = parse_params(
+        "grow_policy=oblivious leaf_estimation_iterations=2"
+    )
+    assert_false(leaves.auto_learning_rate.enabled)
+
+    # And an explicit false turns the mode default off, which is why
+    # "absent" and "auto_learning_rate=false" are tracked separately.
+    var off = parse_params("grow_policy=oblivious auto_learning_rate=false")
+    assert_false(off.auto_learning_rate.enabled)
+    assert_true(close(off.resolved_learning_rate(100000), 0.1))
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()
