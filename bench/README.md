@@ -85,13 +85,20 @@ a large shape, and four conditions travel with it: it grows a **different
 tree** than LightGBM's leaf-wise growth, **no training loss was recorded for
 any arm of this sweep** so its accuracy against that leaf-wise model is
 unmeasured, it is one machine and one generator, and **the spreads quoted
-above are ours alone**. `bench_lightgbm.py` trains once in a separate process
-with no repeat loop and no median, so every LightGBM cell in this file is a
-single sample whose noise floor is unknown, on a machine this file elsewhere
-documents as drifting by a factor of two to three across time windows. A
-LightGBM arm inside the interleaved loop is what would settle any margin
-narrower than that. Our own leaf-wise arm is still behind LightGBM
+above are ours alone**. At the time of the sweep, `bench_lightgbm.py` trained
+once in a separate process with no repeat loop and no median, so every
+LightGBM cell in this table is a single sample whose noise floor is unknown,
+on a machine this file elsewhere documents as drifting by a factor of two to
+three across time windows. Our own leaf-wise arm is still behind LightGBM
 everywhere: 1.92x, 1.36x, 1.17x.
+
+**That last condition now has a fix and the table has not yet been retaken
+under it.** `bench_train_gpu.mojo` has a `lightgbm` arm that runs inside the
+interleaved loop, so the comparator gets the same repeat count, the same
+minimum-with-spread reduction, and the same resolved-versus-indistinguishable
+verdict as every other arm; see "Interleaved LightGBM arm" below. Until the
+1,000,000-row row is retaken that way, the 6.5 percent margin is a comparison
+against an unrepeated single sample and should be quoted as one.
 
 **Our marginal cost per row now equals LightGBM's on ten CPU cores.**
 **Fitted** from the measured points, ours is 2.385 then 2.337 microseconds
@@ -194,6 +201,79 @@ Record physical core count with the result, and set the LightGBM thread count
 to that same number rather than to the logical count. **No post-optimization
 numbers are recorded here yet**, for the load reason above; the table under
 Results is the pre-multicore single-threaded baseline and is labelled as such.
+
+Those four runs put the two engines in four separate processes at four
+different moments, which is exactly the protocol this file forbids everywhere
+else. They remain useful for a factor-of-two question and are useless for a
+few-percent one. Use the interleaved arm below for anything narrower than the
+machine's drift.
+
+## Interleaved LightGBM arm
+
+`lightgbm` is an arm of `bench_train_gpu.mojo` like `cpu` and `gpu-device`
+are. It reaches LightGBM through Mojo's Python interop, so the comparator is
+measured in the same process, in the same time window, alternating with the
+mojotrees arms, under the same repeat count and the same reduction and the
+same verdict rule. It needs the `bench` environment, which is where LightGBM
+lives, and it is the same task with the environment named:
+
+```sh
+pixi run -e bench bench-train-gpu 1000000 50 reg 5 gpu-device-depth,lightgbm
+MOJOTREES_LGBM_THREADS=10 pixi run -e bench bench-train-gpu 1000000 50 reg 5 cpu,lightgbm
+```
+
+The arm prints `lightgbm_train_s`, `lightgbm_train_s_median`,
+`lightgbm_train_s_max`, `lightgbm_spread_pct`, `lightgbm_n_trees` and
+`lightgbm_train_loss` under the same names every other arm uses, plus
+`lightgbm_threads`, `lightgbm_binning_s` and `lightgbm_params` once before
+the loop. The loss is the mean squared residual for `reg` and the mean log
+loss for `binary`, in the same definition `_train_loss` uses in the harness,
+so the two sit in one column and are read against each other. Record the
+`lightgbm_params` line with any result: it is the resolved parameter set the
+run actually used rather than the one a second file says it should have.
+
+What this makes comparable is the time window, which was the hole. What it
+does not:
+
+- The two engines generate the dataset separately. Same counter-based
+  splitmix64 sequence, bit-identical values, different code.
+- Only the boosting run is inside the clock on either side. Our arms are
+  handed an already binned matrix and LightGBM trains on an already
+  constructed Dataset, with both binning times reported separately.
+- Thread counts are matched by number, not by meaning.
+  `MOJOTREES_LGBM_THREADS`, or `MOJOTREES_NUM_WORKERS` when it is unset,
+  pins LightGBM's; nothing checks that the number buys the same amount of
+  machine on both sides, which is why it is printed.
+- Loading LightGBM changes the process it is loaded into, through the memory
+  its regenerated feature matrix holds and the thread pool it parks between
+  repeats. An arm timing from a run containing a `lightgbm` arm is not
+  interchangeable with the same arm's timing from a run without one. Compare
+  inside a run.
+- The arm is single output, `reg` or `binary`. Multiclass would need the
+  harness's quantile bucketing replicated on the Python side, and
+  `lightgbm-depth` is refused because LightGBM has no depth-wise grow policy
+  to select.
+
+Two measurement changes ride along with the arm and both make LightGBM's
+number smaller, so every LightGBM figure recorded before them reads slightly
+slow and the two sets are not interchangeable to better than about a percent.
+`lgb.train` is now called with `keep_training_booster=True`, which removes
+the model serialize-and-reload round trip it otherwise performs inside the
+timed call and which mojotrees pays no counterpart to. And the parameters now
+come from `real_data/scenarios.py`, which adds the binning alignment the
+standalone script was missing (`min_data_in_bin=1`, `feature_pre_filter=false`
+and `bin_construct_sample_cnt` at the row count); `deterministic` is the one
+entry deliberately not inherited, because it is a reproducibility setting
+whose documented cost would land entirely on the comparator's side of a speed
+comparison.
+
+`bench-lgbm` itself now takes `--repeats` and reports minimum, median,
+maximum and spread under the same reduction, so even the separate-process
+form has a measured noise floor:
+
+```sh
+pixi run -e bench bench-lgbm --rows 1000000 --features 50 --threads 10 --repeats 5
+```
 
 ## CPU/GPU histogram microbenchmark
 

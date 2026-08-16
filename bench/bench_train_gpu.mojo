@@ -16,6 +16,47 @@ separate invocations cannot settle a few-percent question no matter how many
 decimal places they print, so the summary reports each arm's own spread and
 refuses to call a gap smaller than that spread a result.
 
+LightGBM is one of those arms. It used to be the one comparison in this
+repository that broke the rule the rest of the file is built on: every
+LightGBM number recorded under bench/results was a single sample taken by
+`bench/bench_lightgbm.py` in a separate process at a different moment, so
+the headline margin against it was quoted with our spread beside it and the
+comparator's spread not measured at all. A single sample has a spread of
+zero by construction rather than a noise floor of zero, and this machine's
+*measured* drift across time windows runs to factors of two and three, which
+is two orders of magnitude above the margin being claimed. The `lightgbm`
+arm closes that: it reaches LightGBM through Python interop, in this
+process, in this loop, alternating with the mojotrees arms, under the same
+repeat count, the same minimum-with-spread reduction, and the same
+resolved-versus-indistinguishable verdict. It needs the bench environment,
+which is where LightGBM lives, and it is the same task with the environment
+named:
+
+    pixi run -e bench bench-train-gpu 1000000 50 reg 5 \\
+        gpu-device-depth,lightgbm
+
+What that makes comparable is the time window, which was the hole. What it
+does not make comparable is worth stating in the same breath. The two
+engines still generate the dataset separately, from the same counter-based
+splitmix64 sequence and to bit-identical values, but through different code.
+Only the boosting run is inside the clock on both sides: our arms are handed
+an already binned matrix and LightGBM trains on an already constructed
+Dataset, with both binning times reported separately and neither folded in.
+LightGBM's thread count is pinned by MOJOTREES_LGBM_THREADS or, failing
+that, MOJOTREES_NUM_WORKERS, and nothing here can check that a given number
+buys the same amount of machine on both sides, so the resolved value is
+printed rather than assumed. Loading LightGBM into this process also changes
+this process, by the memory its regenerated feature matrix holds and by the
+thread pool it parks between repeats, so an arm timing from a run containing
+a `lightgbm` arm is a *derived* quantity of that run and is not
+interchangeable with the same arm's timing from a run without one. Compare
+inside a run, which is what this file has always asked for.
+
+The arm is single output. `reg` and `binary` are what it takes, because the
+multiclass arms bucket the signal with a rule that exists only here, and
+`lightgbm-depth` is refused because LightGBM has no depth-wise grow policy
+to select.
+
 Each arm names its split-search strategy as an argument to `train_gpu`, not
 through MOJOTREES_GPU_SPLIT_STRATEGY, so a mistyped or word-split shell
 export cannot leave one arm running the other arm's code path under the
@@ -62,10 +103,11 @@ an async number are not comparable and no arm timing should be quoted from a
 fenced run. Both are off by default, and an off run reads no clock, writes no
 counter, and prints nothing.
 
-`arms` is a comma-separated list of cpu, gpu, gpu-host, gpu-device, in the
-order they should run; the first is the baseline every other arm is compared
-against. Any arm takes a `-depth` suffix (`cpu-depth`, `gpu-device-depth`,
-...) to train the same configuration under `grow_policy=depthwise`; the
+`arms` is a comma-separated list of cpu, gpu, gpu-host, gpu-device,
+lightgbm, in the order they should run; the first is the baseline every
+other arm is compared against. Any arm but lightgbm takes a `-depth` suffix
+(`cpu-depth`, `gpu-device-depth`, ...) to train the same configuration under
+`grow_policy=depthwise`; the
 leaf budget is unchanged, so a depth-wise arm commits the same number of
 splits and issues the same number of GPU launch groups as its leaf-wise
 twin, and the pair measures the per-split cost of the order alone. That is
@@ -79,9 +121,13 @@ attack. Defaults: 100000 rows, 100 features, reg, 1 repeat, `cpu,gpu`.
     pixi run bench-train-gpu 50000 100 reg 5 gpu-host,gpu-device
     pixi run bench-train-gpu 250000 50 reg 5 gpu-device,gpu-device-depth
     pixi run bench-train-gpu 100000 54 multi:7 5 cpu,gpu
+    pixi run -e bench bench-train-gpu 1000000 50 reg 5 lightgbm,gpu-device
 """
 
+from std.collections import Optional
 from std.math import exp, log
+from std.os import getenv
+from std.python import Python, PythonObject
 from std.sys import argv, has_accelerator
 from std.time import perf_counter_ns
 
@@ -233,8 +279,14 @@ comptime ARM_CPU = 0
 comptime ARM_GPU = 1
 comptime ARM_GPU_HOST = 2
 comptime ARM_GPU_DEVICE = 3
+# LightGBM, in this process, in this loop. Not a mojotrees trainer at all:
+# it reaches `bench/bench_lightgbm.py` through Python interop and trains on
+# a Dataset built once before the loop, so what it contributes per repeat is
+# one boosting run and nothing else. See `_run_lgbm` and the module
+# docstring for what this does and does not make comparable.
+comptime ARM_LGBM = 4
 # Added to any of the above: the same arm under `grow_policy=depthwise`.
-comptime ARM_DEPTHWISE = 4
+comptime ARM_DEPTHWISE = 8
 
 
 struct ArmRun(Copyable, Movable):
@@ -267,6 +319,8 @@ def _arm_name(arm: Int) -> String:
         name = String("gpu-host")
     elif base == ARM_GPU_DEVICE:
         name = String("gpu-device")
+    elif base == ARM_LGBM:
+        name = String("lightgbm")
     if _arm_depthwise(arm):
         name += "-depth"
     return name
@@ -297,18 +351,142 @@ def _parse_arms(spec: String) raises -> List[Int]:
             arms.append(ARM_GPU_HOST | flags)
         elif name == "gpu-device":
             arms.append(ARM_GPU_DEVICE | flags)
+        elif name == "lightgbm":
+            if flags != 0:
+                # `grow_policy` is a mojotrees and XGBoost switch. LightGBM
+                # grows leaf-wise and has no depth-wise mode to ask for, so
+                # `lightgbm-depth` would silently be plain `lightgbm` under a
+                # label claiming otherwise. Compare a depth-wise mojotrees arm
+                # against `lightgbm` and read the label as what it says.
+                raise Error(
+                    "lightgbm has no depth-wise grow policy to select, so"
+                    " 'lightgbm-depth' would be plain lightgbm under a"
+                    " misleading label; use 'lightgbm'"
+                )
+            arms.append(ARM_LGBM)
         else:
             raise Error(
                 String(
                     "unknown arm '",
                     name,
-                    "'; use cpu, gpu, gpu-host, or gpu-device, each with an"
-                    " optional -depth suffix",
+                    "'; use cpu, gpu, gpu-host, gpu-device, or lightgbm, and"
+                    " any but lightgbm with an optional -depth suffix",
                 )
             )
     if len(arms) == 0:
         raise Error("no arms selected")
     return arms^
+
+
+def _lgbm_threads() -> Int:
+    """The thread count the LightGBM arm pins, or 0 for LightGBM's own default.
+
+    MOJOTREES_LGBM_THREADS if set, otherwise MOJOTREES_NUM_WORKERS, which is
+    what the CPU arm is already pinned by. The two variables mean the same
+    thing here by coincidence of their zero cases rather than by design: 0 or
+    unset is auto on both sides, one thread per core on LightGBM's and a
+    core-count-derived task count on ours. Nothing in this file can verify
+    that a pinned number means the same amount of machine on both sides, so
+    the resolved value is printed and the reader is owed that check.
+
+    The separate MOJOTREES_LGBM_THREADS exists for the case the comparison
+    actually wants: the GPU arms do not read MOJOTREES_NUM_WORKERS in any way
+    that makes it the right number for LightGBM, so a GPU-versus-LightGBM run
+    has to say what LightGBM got rather than inherit it.
+    """
+    var s = getenv("MOJOTREES_LGBM_THREADS")
+    if s.byte_length() == 0:
+        s = getenv("MOJOTREES_NUM_WORKERS")
+    if s.byte_length() == 0:
+        return 0
+    try:
+        var n = Int(s)
+        return n if n > 0 else 0
+    except:
+        return 0
+
+
+def _lgbm_arm(
+    n_rows: Int,
+    n_features: Int,
+    obj_name: String,
+    seed: Int,
+    params: BoosterParams,
+    max_bin: Int,
+) raises -> PythonObject:
+    """Build the LightGBM arm's state: import, generate, bin, all untimed.
+
+    Everything expensive that is not a boosting run happens here, before the
+    interleaved loop starts, so that the arm's per-repeat call contains only
+    the work the mojotrees arms are also timing. LightGBM's own binning is
+    reported separately for the same reason ours is.
+
+    The mojotrees defaults are handed over so the Python side can refuse to
+    run when they have drifted off `bench/real_data/scenarios.py`. They are a
+    cross-check and not a configuration: LightGBM is configured from that
+    file, and this call is what proves the two descriptions still agree.
+
+    Resolved from MOJOTREES_BENCH_DIR, defaulting to `bench`, because the
+    module is found relative to the working directory and the pixi task runs
+    from the repository root.
+    """
+    var bench_dir = getenv("MOJOTREES_BENCH_DIR")
+    if bench_dir.byte_length() == 0:
+        bench_dir = String("bench")
+    Python.add_to_path(bench_dir)
+    var module: PythonObject
+    try:
+        module = Python.import_module("bench_lightgbm")
+    except e:
+        raise Error(
+            String(
+                "the lightgbm arm needs bench/bench_lightgbm.py and the bench"
+                " environment's LightGBM; run under `pixi run -e bench` from"
+                " the repository root, or point MOJOTREES_BENCH_DIR at the"
+                " bench directory. Underlying error: ",
+                String(e),
+            )
+        )
+    return module.InterleavedArm(
+        n_rows,
+        n_features,
+        obj_name,
+        _lgbm_threads(),
+        seed,
+        rounds=params.n_estimators,
+        learning_rate=params.learning_rate,
+        num_leaves=params.tree.num_leaves,
+        min_data_in_leaf=params.tree.min_data_in_leaf,
+        lambda_l2=params.tree.lambda_reg,
+        lambda_l1=params.tree.lambda_l1,
+        min_child_hess=params.tree.min_child_hess,
+        max_depth=params.tree.max_depth,
+        max_bin=max_bin,
+    )
+
+
+def _run_lgbm(state: PythonObject, want_loss: Bool) raises -> ArmRun:
+    """One LightGBM boosting run, timed by this process's clock.
+
+    The clock is Mojo's `perf_counter_ns`, the same one every other arm is
+    timed by, rather than Python's, so no arm's number carries a different
+    clock's offset. What sits inside it is one `lgb.train` call plus a couple
+    of attribute lookups, which is microseconds against a run measured in
+    seconds.
+
+    The loss is read afterwards, outside the timed region, on the first
+    repeat only, exactly as the mojotrees arms do it. It is the mean squared
+    residual for `reg` and the mean log loss with the same 1e-15 clip for
+    `binary`, so it is read directly against `_train_loss` above rather than
+    merely alongside it.
+    """
+    var t0 = perf_counter_ns()
+    var n_trees = Int(py=state.train())
+    var seconds = Float64(perf_counter_ns() - t0) / 1e9
+    var loss = -1.0
+    if want_loss:
+        loss = Float64(py=state.loss())
+    return ArmRun(seconds, loss, n_trees)
 
 
 def _run_arm(
@@ -319,6 +497,7 @@ def _run_arm(
     n_classes: Int,
     objective: Int,
     want_loss: Bool,
+    lgbm: Optional[PythonObject],
 ) raises -> ArmRun:
     """Time one complete training run on one arm.
 
@@ -332,7 +511,15 @@ def _run_arm(
     single-output objective code for softmax to pass. `labels` is empty in
     the first case and `target` is the bucketed signal in the second, and
     each is ignored on the arm that does not use it.
+
+    `lgbm` holds the LightGBM arm's state and is empty unless a `lightgbm`
+    arm was selected. It is an `Optional` rather than a `PythonObject`
+    standing in for absence, because constructing any `PythonObject` starts
+    the interpreter, and a `cpu,gpu` run must not require a Python at all.
     """
+    if _arm_base(arm) == ARM_LGBM:
+        return _run_lgbm(lgbm.value(), want_loss)
+
     var params = BoosterParams.default()
     if _arm_depthwise(arm):
         params.tree.grow_policy = GROW_DEPTHWISE
@@ -490,6 +677,22 @@ def main() raises:
         if n_features < 4:
             raise Error("need at least 4 features")
 
+        var want_lgbm = False
+        for a in range(len(arms)):
+            if _arm_base(arms[a]) == ARM_LGBM:
+                want_lgbm = True
+        if want_lgbm and n_classes > 0:
+            # The multiclass arms bucket the signal with `_class_labels`, a
+            # stride-sampled quantile rule that exists only here. LightGBM
+            # would have to be handed the same labels to be training on the
+            # same problem, and it is not, so the arm refuses rather than
+            # comparing two different problems.
+            raise Error(
+                "the lightgbm arm is single output only; multiclass would"
+                " need `_class_labels` replicated on the Python side and it"
+                " has not been"
+            )
+
         # Same data as bench_train.mojo: column-major features, target from
         # features 0..3 plus a noise stream at counters >= n_rows * n_features.
         var features = List[Float64](capacity=n_rows * n_features)
@@ -560,6 +763,25 @@ def main() raises:
                 " more before reporting a delta"
             )
 
+        # Built before the loop and outside every clock: the import, the
+        # numpy regeneration of the same splitmix64 dataset, and LightGBM's
+        # Dataset construction. Its binning time is printed beside ours
+        # rather than folded into either arm's training number.
+        var lgbm = Optional[PythonObject]()
+        if want_lgbm:
+            var state = _lgbm_arm(
+                n_rows,
+                n_features,
+                obj_name,
+                seed,
+                BoosterParams.default(),
+                255,
+            )
+            print("lightgbm_threads:", Int(py=state.resolved_threads()))
+            print("lightgbm_binning_s:", Float64(py=state.binning_s))
+            print("lightgbm_params:", String(py=state.summary()))
+            lgbm = Optional[PythonObject](state)
+
         # Interleaved, not blocked: one repeat runs every arm before the next
         # repeat starts, so the samples being compared sit next to each other
         # in time. Running all of one arm and then all of the other puts the
@@ -581,6 +803,7 @@ def main() raises:
                     n_classes,
                     objective,
                     rep == 0,
+                    lgbm,
                 )
                 samples.append(run.seconds)
                 if rep == 0:
