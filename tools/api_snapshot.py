@@ -548,9 +548,10 @@ def eval_block(d: Deriver) -> dict:
     text = read(MOJO_REGISTRY, d)
     out = {"source": rel(MOJO_REGISTRY)}
 
+    # One body parser for this file, shared with `mojo_objective_names`:
+    # two regexes over one source is the drift this tool exists to catch.
     def body_of(fn):
-        m = re.search(rf"^def {fn}\(.*?\n(?=^def |^comptime |\Z)", text, re.S | re.M)
-        return m.group(0) if m else ""
+        return registry_body(text, fn)
 
     canonical_of = {}
     for m in re.finditer(
@@ -711,17 +712,113 @@ def mojo_objective_codes(d: Deriver) -> dict:
     Found the expensive way: two lanes in one round independently assigned
     codes 13 and 14 to different objectives, and what caught it was a lane's
     own unit test pinning its values, not this gate.
+
+    **Second blind spot, found by the lane that added the reserved names.**
+    The pattern used to end in `\\b`, which matches between the `1` and the
+    `.` of `1.0`. So `comptime DEFAULT_FAIR_C = 1.0` was frozen as `1` and
+    `comptime DEFAULT_TWEEDIE_VARIANCE_POWER = 1.5` was frozen as `1` too:
+    two float defaults recorded in an integer map, one of them under a value
+    it has never had. A wrong frozen value is worse than an absent one,
+    because a check that compares against it passes while the tree and the
+    snapshot disagree. `(?![\\d.])` is the fix; both keys leave the block,
+    which is correct -- they are not objective codes and never were.
     """
     out = {}
     for path in (MOJO_REGISTRY, MOJO_BOOSTING, MOJO_PARAMS):
         text = read(path, d)
         for name, value in re.findall(
-            r"comptime\s+([A-Z][A-Z0-9_]*)\s*=\s*(-?\d+)\b", text
+            r"comptime\s+([A-Z][A-Z0-9_]*)\s*=\s*(-?\d+)(?![\d.])", text
         ):
             out.setdefault(name, int(value))
     if not out:
         d.gap("mojo.objective_codes", "no comptime integer constants matched")
     return dict(sorted(out.items()))
+
+
+def registry_body(text: str, fn: str) -> str:
+    """The source text of one top-level `def` in the registry, from its
+    header to the next top-level `def` or `comptime`. Shared by the metric
+    block and the objective block, which parse the same file the same way."""
+    m = re.search(
+        rf"^def {fn}\(.*?\n(?=^def |^comptime |\Z)", text, re.S | re.M
+    )
+    return m.group(0) if m else ""
+
+
+#: One `if name == "a" or name == "b": return X` arm of a resolver chain in
+#: objective_registry.mojo, in either the one-line or the parenthesized
+#: multi-line spelling. Group 1 is the alias run, group 2 the returned
+#: symbol; the caller decides what a returned symbol may look like.
+_NAME_ARM = (
+    r"if\s*\(?((?:\s*(?:or\s+)?name == \"[^\"]+\"\s*)+)\)?:\s*\n\s*return "
+)
+
+
+def mojo_objective_names(d: Deriver) -> dict:
+    """The objective *names*, derived from `src/mojotrees/
+    objective_registry.mojo` the way `eval_block` derives the metric names.
+
+    **This block did not exist, and its absence was the second thing wrong
+    with this tool.** `objective_codes` froze the integers and nothing froze
+    the name each integer round-trips under, so a rename of
+    `objective_canonical_name(COX)` from `"cox"` to anything else produced no
+    diff here at all. The name is as much of the format as the number is:
+    `lgbm_model_io` writes and reads the objective by name, `inspection.
+    objective_of` reports it by name, and a saved model whose loss field
+    cannot be read back by name is the same defect as one whose code means
+    two things.
+
+    Four keys, and the shape says which resolver answers which question:
+
+    - `canonical`: code constant -> the name `objective_canonical_name`
+      reports. Keyed by the constant, not the integer, so it composes with
+      `objective_codes` by key rather than by a lookup that could be wrong.
+    - `aliases`: spelling -> code constant, from `objective_code_from_name`,
+      which is the *fit gate*. A name here is a name a trainer can be handed.
+    - `reserved_aliases`: spelling -> code constant, from
+      `_reserved_objective_code`, which is *identity only*. A name here has a
+      code and no trainer, and moving a name between these two keys is the
+      breaking change the split exists to make visible.
+    - `unimplemented`: spelling -> primary spelling, from
+      `objective_unimplemented_canonical`, the names that refuse a fit with a
+      reason. A superset of `reserved_aliases`.
+    """
+    text = read(MOJO_REGISTRY, d)
+    out = {"source": rel(MOJO_REGISTRY)}
+
+    canonical = {}
+    for m in re.finditer(
+        r'if objective == ([A-Z][A-Z0-9_]*):\s*\n\s*return String\("([^"]+)"\)',
+        registry_body(text, "objective_canonical_name"),
+    ):
+        canonical[m.group(1)] = m.group(2)
+    if not canonical:
+        d.gap(
+            "mojo.objective_names.canonical",
+            "objective_canonical_name not parsed",
+        )
+    out["canonical"] = dict(sorted(canonical.items()))
+
+    for key, fn, pattern in (
+        ("aliases", "objective_code_from_name", r"([A-Z][A-Z0-9_]*)"),
+        ("reserved_aliases", "_reserved_objective_code", r"([A-Z][A-Z0-9_]*)"),
+        (
+            "unimplemented",
+            "objective_unimplemented_canonical",
+            r'String\("([^"]+)"\)',
+        ),
+    ):
+        found = {}
+        for m in re.finditer(_NAME_ARM + pattern, registry_body(text, fn)):
+            target = m.group(2)
+            if target == "NO_OBJECTIVE_CODE":
+                continue
+            for name in re.findall(r'name == "([^"]+)"', m.group(1)):
+                found[name] = target
+        if not found:
+            d.gap(f"mojo.objective_names.{key}", f"{fn} not parsed")
+        out[key] = dict(sorted(found.items()))
+    return out
 
 
 def mojo_reset_slot_order(d: Deriver) -> list:
@@ -1083,6 +1180,80 @@ def check_invariants(snap: dict, d: Deriver) -> None:
 
     check_register(snap, d)
     check_mojo_export_agreement(snap, d)
+    check_objective_identity(snap, d)
+
+
+def check_objective_identity(snap: dict, d: Deriver) -> None:
+    """I12 and I13, the two statements about the objective code space that
+    nothing checked when 13 and 14 were assigned twice.
+
+    I13 is the collision gate itself, and it is narrower than "no two
+    constants in `objective_codes` share a value" on purpose: that map also
+    carries `TASK_*`, `LINK_*`, `GRAD_*` and the rest, which legitimately
+    share values with each other and with `SQUARED_ERROR = 0`. The set of
+    constants that are *objectives* is derived, not typed out here: it is
+    exactly the keys of `objective_names.canonical`, because an objective is
+    a code `objective_canonical_name` reports a name for.
+    """
+    codes = snap.get("mojo", {}).get("objective_codes") or {}
+    names = snap.get("mojo", {}).get("objective_names") or {}
+    canonical = names.get("canonical") or {}
+    if not codes or not canonical:
+        return
+
+    resolves = {}
+    for key in ("aliases", "reserved_aliases"):
+        for alias, const in (names.get(key) or {}).items():
+            resolves[alias] = const
+    for const, name in sorted(canonical.items()):
+        if resolves.get(name) != const:
+            d.problem(
+                f"I12: objective {const} reports the canonical name {name!r} "
+                f"and that name resolves to {resolves.get(name)!r}; a code "
+                "whose own name does not resolve back to it is a saved "
+                "model whose loss field cannot be read by name"
+            )
+
+    # I14. `python/mojotrees/inspection.py` is the pure-Python model parser
+    # and it carries its own code -> name table, which is a second semantic
+    # copy in a second language. Existence only, not spelling: code 5 is
+    # `mae` in the registry and `regression_l1` there on purpose, because
+    # that table is read next to a LightGBM model file. What may not happen
+    # is a code the parser cannot name at all, which is what it did for
+    # MULTICLASS and all seven reserved codes.
+    py_names = (
+        snap.get("python", {}).get("inspection", {}).get("objective_names")
+    )
+    if isinstance(py_names, dict):
+        for const, value in sorted(codes.items()):
+            if const not in canonical:
+                continue
+            if str(value) not in py_names:
+                d.problem(
+                    f"I14: objective code {value} ({const}) has no name in "
+                    "python/mojotrees/inspection.py OBJECTIVE_NAMES; the "
+                    "pure-Python parser reports a model carrying it as "
+                    f"'objective_{value}'"
+                )
+
+    by_value: dict = {}
+    for const in sorted(canonical):
+        if const not in codes:
+            d.problem(
+                f"I13: objective {const} has a canonical name and no "
+                "comptime integer; the snapshot cannot freeze what it is"
+            )
+            continue
+        by_value.setdefault(codes[const], []).append(const)
+    for value, constants in sorted(by_value.items()):
+        if len(constants) > 1:
+            d.problem(
+                f"I13: objective code {value} is assigned to "
+                + " and ".join(constants)
+                + "; a code is a number in a serialized model, so two "
+                "objectives sharing one is a model that loads as the wrong "
+                "loss and raises nothing"
+            )
 
 
 def _version_tuple(text):
@@ -1316,6 +1487,7 @@ def build(commit: str | None) -> tuple:
         ),
         "exports_by_module": mojo_exports_by_module(d),
         "objective_codes": mojo_objective_codes(d),
+        "objective_names": mojo_objective_names(d),
     }
     snap["mojo"]["export_count"] = sum(
         len(v) for v in snap["mojo"]["exports_by_module"].values()

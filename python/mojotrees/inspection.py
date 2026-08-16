@@ -113,15 +113,23 @@ SUPPORTED_MODEL_FORMAT_VERSIONS = (1, 2, 3, 4)
 MODEL_EDITING_SUPPORTED = True
 
 #: Objective code to LightGBM's canonical name for it. The codes are the
-#: trainer's, declared in src/mojotrees/boosting.mojo and mirrored by the
-#: estimators' objective tables; `test_inspection.py` checks this table
-#: against those tables so the two cannot drift apart silently.
+#: trainer's, declared in src/mojotrees/objective_registry.mojo and mirrored
+#: by the estimators' objective tables; `test_inspection.py` checks this
+#: table against those tables so the two cannot drift apart silently.
 #:
 #: The name and not the code is what LightGBM's `objective_` attribute
 #: reports, and spelling a LightGBM parameter is this layer's job: the model
 #: holds the code, and `src/mojotrees/lgbm_model_io.mojo` spells the same
 #: codes for a LightGBM *file*, which needs different decorations (see the
 #: handoff).
+#:
+#: This is the pure-Python side of `model_dump`, so it must name every code a
+#: model file can carry, not every code this build can fit. It listed
+#: thirteen of the twenty-one assigned codes: `MULTICLASS` and the seven
+#: reserved ones were absent, and `_objective_name` reported them as
+#: `objective_16`. `5` stays `regression_l1` rather than the registry's `mae`
+#: on purpose, because that is the spelling a LightGBM file uses and this
+#: table is read next to one.
 OBJECTIVE_NAMES = {
     0: "regression",
     1: "binary",
@@ -136,6 +144,20 @@ OBJECTIVE_NAMES = {
     10: "mape",
     11: "fair",
     12: "cross_entropy",
+    # CatBoost's three ranking losses, its two survival losses, and
+    # multi-target regression. Reserved: registered, serializable, and
+    # reachable by no trainer this build connects, which is why naming them
+    # here is a read path only and routes nothing. See `objective_reserved`
+    # and `objective_reserved_trainer` in the registry.
+    13: "query_rmse",
+    14: "pair_logit",
+    15: "yeti_rank",
+    16: "cox",
+    17: "survival_aft",
+    # Negative because one iteration grows more than one tree.
+    -1: "multiclass",
+    -2: "multi_rmse",
+    -3: "multi_rmse_with_missing",
 }
 
 

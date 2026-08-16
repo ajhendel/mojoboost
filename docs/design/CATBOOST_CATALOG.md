@@ -191,6 +191,80 @@ chosen. Building it would be building a gate that cannot open.
 | A28 | `MultiRMSE` (`error_functions.h:191-218` `TMultiRMSEError`; `approx_dimension.cpp`; `online_predictor.cpp` `CalcDeltaNewtonMulti`; `hessian.cpp` `TDiagonalHessian::SolveNewtonEquation`; multi-dim score accumulation `catboost/private/libs/algo/scoring.cpp:741-767`; metric `metric.cpp:474-515`) -- **verified from source**, see the A28 note | Multi-target regression. **T label columns per row**, approx dimension T, diagonal hessian, `der[i] = w*(y[i] - p[i])`, `der2[i] = -w`. **One tree per iteration with a vector leaf value** (`model.h:118`, `LeafValues[leafId * ApproxDimension + dim]`), and the split score is the **sum over dimensions into one accumulator** | New objective **and a new tree shape** | The derivatives and the metric yes. The tree shape is `multiclass_tree_count` again, and this time it is not a cosmetic difference: see the A28 note | CPU (`multi_target.mojo`), tree shape unowned (`tree.mojo`, `histogram.mojo`) | (3) when selected. **The shared tree structure is the entire modeling content of MultiRMSE**; without it the objective degenerates into T independent RMSE fits |
 | A29 | Model save/load and interchange export (`catboost/libs/model/model_export/`: `cbm`, `json`, `onnx`, `coreml`, `python`, `cpp`) | CatBoost saves every fitted artifact the model needs to score, CTR tables and text dictionaries included, and can additionally emit an ONNX `ai.onnx.ml` tree ensemble | No. Nothing here changes a trained model; the whole rule is that a reloaded model scores **bit-identically** | Yes, and it is bucket C: an arm we cannot save is an arm nobody can ship, and an export that silently drops fitted state is a wrong comparison that looks fine | `serialize.mojo` (mine), `onnx_export.mojo` (new, mine) | A29 note. **Enumeration is the deliverable.** Format: NO version bump needed for A8/A11-A16; ONNX exporter BUILT for the numerical/expressible subset and REFUSES the rest by name |
 | A30 | CTR feature combinations: `max_ctr_complexity`, `ctr_leaf_count_limit`, `TreeCtrs` (`greedy_tensor_search.cpp::AddTreeCtrs`, `index_hash_calcer.cpp::CalcHashes` and `ComputeReindexHash`, `ctr_helper.h::GetCtrInfo`) -- **verified from source**, see the A30 note | A projection of several categorical columns plus float and one-hot splits, hashed to one bucket per row and fed to A19's ordered machinery. Candidates are **grown from the splits already in the tree**, one feature at a time -- NOT exhaustive to depth 4 -- and `max_ctr_complexity` silently resolves to **1**, not 4, whenever the iteration count is under 200 | Yes when on | Built, off by default, reached by nothing. **CatBoost's default of 4 is not affordable at 1M rows** (about 1.6e9 element ops and 1.1 GB of CTR columns per tree, against 3e8 for a 50-feature histogram build), so record the 4 and wire 1 | CPU (`ctr_combinations.mojo`, beside `ctr.mojo`) | (3) when on |
+| A31 | The objective code space itself: `objective_registry.mojo`'s `comptime` block, `objective_canonical_name`, `objective_code_from_name`, `all_objective_codes`, and the freeze in `compatibility/api_snapshot.json` | Not a CatBoost mechanism. It is the integer every A22 through A28 objective is written into a model file as, and the two functions that turn that integer back into a name. CatBoost's counterpart is `ELossFunction` plus `loss_description.cpp`'s parser, which is an enum the compiler owns; ours is a hand-assigned integer that two lanes assigned twice in one round | No. Nothing here computes a derivative | Mandatory, and it is the reason this is a lane rather than a step inside another one. A code that changes meaning between two builds silently reinterprets every saved model: `serialize.save_model` writes `objective <code>` and `load_model` reads it, so a collision is a Poisson model that loads as a Huber one, applies the wrong inverse link, and raises nothing | `src/mojotrees/objective_registry.mojo`, `tools/api_snapshot.py`, `compatibility/api_snapshot.json` | A31 note. **BUILT.** (1) strictly-less-work does not apply: it moves no bits and adds no work to any round. The gate is `tests/test_objective_code_space.mojo` plus invariants I12 and I13 |
+
+### A31 note: the objective code space, and the two gates it did not have
+
+Status: **built**, 2026-08-16, lane `lane/objective-codes`. Nothing measured
+and nothing to measure: this entry moves no bits and runs in no loop.
+
+**What the starting state actually was.** The seven reserved codes had
+already been landed in `objective_registry.mojo` by an earlier lane, and
+landed well: `QUERY_RMSE=13`, `PAIR_LOGIT=14`, `YETI_RANK=15`, `COX=16`,
+`SURVIVAL_AFT=17`, `MULTI_RMSE=-2`, `MULTI_RMSE_WITH_MISSING=-3`, each with a
+canonical name, a task, an inverse link, an init rule, a `needs_groups`
+answer and a named trainer. `SURVIVAL_AFT`'s `LINK_EXP` in particular was
+registered rather than left to fall through to `LINK_IDENTITY`, which would
+have been a prediction wrong by an exponential with nothing raised. Two
+things were missing and both were in the *identity* half.
+
+**1. One code's own name did not resolve.**
+`objective_canonical_name(MULTI_RMSE_WITH_MISSING)` reported
+`multi_rmse_with_missing` and no name function accepted that string, so
+`objective_name_status` called it unknown. A code with a name that names
+nothing is the round trip broken in the direction nothing was checking.
+
+**2. There was no name -> code direction at all for the reserved seven, and
+that is deliberate in one sense and a hole in another.**
+`objective_code_from_name` refuses all seven on purpose: it is the *fit
+gate*, and a name it resolves is a name a trainer will be handed. That
+refusal is right and this lane did not touch it. But a code in a model file
+needs a name that maps back to it, or the number and the name are two facts
+nothing reconciles. So the identity direction is a second function,
+`any_objective_code_from_name` (over `reserved_objective_code_from_name`),
+and the split is stated in the module docstring: never call the identity
+resolver where the question is whether a fit may proceed.
+
+**The gate that was missing, and what it now is.** The 13/14 collision was
+caught by one lane's own unit test pinning its own values. A per-lane test
+cannot catch a collision between lanes, by construction: it only knows its
+own numbers. Two checks replace it, and neither writes a number down:
+
+- `tests/test_objective_code_space.mojo` walks
+  `all_assigned_objective_codes()` -- the fourteen connected codes plus the
+  seven reserved -- pairwise for duplicates, and closes the round trip in
+  both directions for every code and every spelling.
+- Invariant I13 in `tools/api_snapshot.py` does the same from the source
+  text, with no build. The set of constants it compares is *derived*: it is
+  exactly the keys of `objective_names.canonical`, because an objective is a
+  code `objective_canonical_name` reports a name for. A hand-typed list there
+  would have been the third place, and the third place is where the drift
+  lives.
+
+A compile-time `constrained[...]` would be better than a runtime check and
+is not available: the assigned space is a runtime `List[Int]`, and the only
+`comptime` formulation is a pairwise chain typed out by hand, which is the
+hand-typed list the check exists to avoid.
+
+**`tools/api_snapshot.py` had a second blind spot, and a third.** The known
+one was that it read `boosting.mojo` and `params.mojo` and not the registry,
+so it froze zero objective codes; adding the registry took it to 53. Beyond
+that:
+
+- Its integer pattern ended in `\b`, which matches between the `1` and the
+  `.` of `1.0`. `DEFAULT_FAIR_C = 1.0` was frozen as `1` and
+  `DEFAULT_TWEEDIE_VARIANCE_POWER = 1.5` was frozen as `1`. A wrong frozen
+  value is worse than an absent one: a check compares against it and passes
+  while the tree and the snapshot disagree. Both keys now leave the block,
+  which is correct, since neither is an objective code.
+- It froze the integers and **no name**. There was no objective counterpart
+  to `eval_block`, which derives the metric names from this same file, so a
+  rename of `objective_canonical_name(COX)` produced no diff at all. The
+  only code-to-name freeze in the snapshot was the hand-typed Python mirror
+  `inspection.OBJECTIVE_NAMES`, which lists thirteen of the twenty-one
+  assigned codes and omits `MULTICLASS` and all seven reserved ones. The new
+  `mojo.objective_names` block closes that; the Python mirror is left to its
+  owner and is recorded here as the remaining duplicate.
 
 ### A4 note: Bayesian bootstrap, verified from source
 
