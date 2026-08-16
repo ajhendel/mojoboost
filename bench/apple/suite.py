@@ -92,7 +92,7 @@ def _workload(**kw):
         "max_bin": 255,
         "learning_rate": 0.1,
         "min_data_in_leaf": 20,
-        "lambda_l2": 1.0,
+        "lambda_l2": 0.0,
         "n_classes": None,
         "nonzeros_per_row": None,
         "missing_fraction": None,

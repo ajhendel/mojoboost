@@ -15,7 +15,7 @@ noise; the remaining features are pure noise.
 
 Parameters match on both sides (mojotrees defaults): 100 boosting rounds,
 `num_leaves=31`, `learning_rate=0.1`, `min_data_in_leaf=20`,
-`min_sum_hessian_in_leaf=1e-3`, `lambda_l2=1.0`, `max_bin=255`.
+`min_sum_hessian_in_leaf=1e-3`, `lambda_l2=0.0`, `max_bin=255`.
 
 **There is exactly one comparator: `stock+det`, LightGBM at its own
 defaults plus `deterministic=true`.** It is registered as section C9 of

@@ -218,10 +218,10 @@ def main():
 
     print(
         "\nNote. The two leaf-value rows are reported for context, not as a"
-        "\ncontract. mojotrees's lambda_l2 defaults to 1.0 where LightGBM's"
-        "\ndefaults to 0.0, and the Newton step -G/(H+lambda_l2) shrinks by"
+        "\ncontract. mojotrees's lambda_l2 matched LightGBM's 0.0 from"
+        "\n2026-08-16; before that it was 1.0 and the Newton step"
         "\nexactly that much: with 100 missing rows the step is 666.7/101"
-        "\nrather than 666.7/100. Pass lambda_l2=0 on both sides to close it."
+        "\n-G/(H+lambda_l2) shrank accordingly. No longer a divergence."
         "\nWhat must match, and does, is every routing decision above."
     )
 

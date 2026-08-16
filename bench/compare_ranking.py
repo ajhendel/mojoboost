@@ -147,7 +147,7 @@ def main():
         "learning_rate": shared["learning_rate"],
         "min_data_in_leaf": shared["min_data_in_leaf"],
         "min_sum_hessian_in_leaf": 1e-3,
-        "lambda_l2": 1.0,
+        "lambda_l2": 0.0,
         "max_bin": shared["max_bin"],
         "lambdarank_truncation_level": TRUNCATION_LEVEL,
         "sigmoid": SIGMOID,
@@ -198,7 +198,7 @@ def main():
         sigmoid=SIGMOID,
         lambdarank_norm=True,
         min_child_hess=1e-3,
-        lambda_l2=1.0,
+        lambda_l2=0.0,
         **shared,
     ).fit(Xt, yt, group=gt)
     our_pred = model.predict(Xv)

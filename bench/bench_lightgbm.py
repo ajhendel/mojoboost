@@ -201,7 +201,6 @@ def lgbm_params(objective: str, threads: int, n_rows: int) -> dict:
         "min_data_in_leaf": base["min_data_in_leaf"],
         "min_sum_hessian_in_leaf": base["min_child_hess"],
         "lambda_l1": base["lambda_l1"],
-        "lambda_l2": base["lambda_l2"],
         "max_bin": base["max_bin"],
         "use_missing": base["use_missing"],
     }
@@ -244,7 +243,19 @@ def check_alignment(mojo_defaults: dict) -> None:
         if canonical is None:
             problems.append(f"{name}: no canonical counterpart in BASE_PARAMS")
             continue
-        want = scenarios.BASE_PARAMS[canonical]
+        # `lambda_l2` left BASE_PARAMS when our default became LightGBM's
+        # stock 0.0, so a canonical name may now live only in the stock
+        # table. Falling back keeps the guard alive instead of trading a
+        # KeyError for a deleted check.
+        want = scenarios.BASE_PARAMS.get(
+            canonical, scenarios.LIGHTGBM_STOCK_DEFAULTS.get(canonical)
+        )
+        if want is None:
+            problems.append(
+                f"{name}: {canonical} is in neither BASE_PARAMS nor"
+                " LIGHTGBM_STOCK_DEFAULTS"
+            )
+            continue
         if isinstance(want, bool) or isinstance(value, bool):
             same = bool(value) == bool(want)
         else:

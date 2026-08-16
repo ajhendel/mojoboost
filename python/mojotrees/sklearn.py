@@ -45,7 +45,16 @@ _CROSS_ENTROPY = 12
 # Defaults of the two regularization parameters, named so the constructor
 # signature and the alias resolution in `_params` cannot drift apart.
 _LAMBDA_L1 = 0.0
-_LAMBDA_L2 = 1.0
+_LAMBDA_L2 = 0.0
+"""LightGBM's stock `lambda_l2`.
+
+This literal, not `TreeParams.default()`, is what a Python fit resolves an
+unset `lambda_l2` from, and it is therefore what `bench/real_data` fits.
+It read 1.0 until 2026-08-16, so the arm labelled `stock+det` was running a
+non-stock regularizer on our side while the comparator ran LightGBM's 0.0.
+Three independent literals carried the old value; `tools/check_parity.py`
+now asserts every stock default across all of them.
+"""
 
 from ._fit_args import (
     _BOOSTING_TYPES,

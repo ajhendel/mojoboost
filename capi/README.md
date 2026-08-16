@@ -96,7 +96,7 @@ Supported keys, with LightGBM's common aliases accepted for each:
 | `min_data_in_leaf` | `min_data`, `min_child_samples` | 20 |
 | `min_sum_hessian_in_leaf` | `min_child_weight`, `min_sum_hessian` | 1e-3 |
 | `lambda_l1` | `reg_alpha` | 0 |
-| `lambda_l2` | `reg_lambda`, `lambda` | 1.0 |
+| `lambda_l2` | `reg_lambda`, `lambda` | 0.0 |
 | `max_depth` | | -1 (unlimited) |
 | `feature_fraction` | `sub_feature`, `colsample_bytree` | 1.0 |
 | `feature_fraction_bynode` | `colsample_bynode` | 1.0 |
@@ -114,7 +114,8 @@ Intentional differences from LightGBM:
 
 - An unknown key is an error. LightGBM warns and ignores it, which silently
   drops typos.
-- `lambda_l2` defaults to 1.0, matching the rest of mojotrees rather than
+- `lambda_l2` defaulted to 1.0 until 2026-08-16, matching the rest of
+  mojotrees rather than
   LightGBM's 0.
 - `num_class` without `objective=multiclass` is an error rather than being
   ignored.

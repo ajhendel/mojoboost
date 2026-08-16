@@ -1721,7 +1721,7 @@
       },
       "reg_lambda": {
         "canonical": "lambda_l2",
-        "fallback_default": 1.0,
+        "fallback_default": 0.0,
         "sites": 2
       },
       "subsample": {
@@ -1768,7 +1768,7 @@
       "importance_type": "split",
       "interaction_constraints": null,
       "lambda_l1": 0.0,
-      "lambda_l2": 1.0,
+      "lambda_l2": 0.0,
       "learning_rate": 0.1,
       "linear_lambda": 0.0,
       "linear_tree": false,

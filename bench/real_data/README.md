@@ -151,10 +151,10 @@ neither, because choosing the comparator's algorithm for it is the larger
 distortion, and the repeats that disagreed above were taken with
 `force_row_wise` set anyway.
 
-Beyond that, `scenarios.py` sets `lambda_l2` explicitly because the two
-defaults differ, disables exclusive feature bundling, disables LightGBM's
-feature pre-filter because it deletes columns at Dataset build time, and
-leaves the two binning population settings alone.
+Superseded 2026-08-16. `scenarios.py` used to set `lambda_l2`
+explicitly because the two defaults differed. mojotrees now defaults
+to LightGBM's stock 0.0, so the pin is gone and both engines take
+the same value by default rather than by agreement.
 
 The two disabled switches are both feature-space pins and neither is a
 leftover. `feature_pre_filter` deletes features that cannot satisfy
