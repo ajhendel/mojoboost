@@ -677,3 +677,61 @@ The wiring. The growth loop still calls `GpuHistogramBuilder.enqueue_desc_child`
 and pointing it at the batcher is an edit in `histogram_gpu.mojo`, which that lane
 did not own. `OBLIVIOUS_LEVEL_HISTOGRAM` stands as a refusal whose docstring now
 says the primitive exists and names the one file that must change.
+
+# The 2x2, half resolved: derivative precision is NOT the cause
+
+Run as local accuracy checks on the merged tree (`lambda_l2 = 0`),
+`imbalanced_binary`, CPU and GPU in one records file, verified with `verify.py`.
+
+| | result |
+|---|---|
+| f32 derivatives, lambda 0 | `max abs(gpu-cpu) = 0.327`, AP gap 0.007273 -- **FAIL** |
+| f64 derivatives, lambda 0 | `max abs(gpu-cpu) = 0.327`, AP gap 0.007273 -- **FAIL** |
+
+**Identical to six significant figures, including the CPU's own average precision
+(0.672844 in both).** So the derivative-precision axis moves nothing on this
+scenario and **the CPU's move to Float32 derivatives is refuted as the cause.**
+
+**The flag did take effect** -- checked rather than assumed, because this is the
+sixth place in this campaign where a measurement could have failed to reach the
+code it was about. `bench/real_data/run.py:193` builds the child environment as
+`dict(os.environ)`, so `MOJOTREES_DERIVATIVE_PRECISION` propagates into the
+subprocess. (The CPU campaign separately found the flag *was* a silent no-op on
+sparse and distributed fits, and fixed it; dense is the path here.)
+
+## What is left, and it is untested rather than unresolved
+
+The remaining candidate is `lambda_l2 = 0` -- the Float32 gain near the
+admission boundary. At `lambda_l2 = 1.0` the divisor `H + lambda_l2` could never
+fall below 1; at 0.0 it is floored only by `min_sum_hessian_in_leaf = 1e-3`, so a
+gain bounded by `G^2` becomes bounded by `1000*G^2` and a leaf value by
+`1000*abs(G)`, and on the device both are Float32.
+
+**`bench/real_data/run.py` has no hook to vary `lambda_l2`**, so the other half of
+the 2x2 cannot be run through the harness as it stands. That is a harness gap,
+not a finding, and it is the one thing standing between this and a closed
+diagnosis.
+
+## Registered reading, applied
+
+Of the four outcomes registered before the data, this is **"A ~ C"**: the two
+precision cells agree, so the cause is not precision. It does not yet
+discriminate between the lambda hypothesis and "neither change caused it", and
+the honest statement is that one axis is refuted and the other is unmeasured.
+
+# The oblivious / leaf-estimation knee: no crossing on the built schedule
+
+The leaf-estimation lane reported that `k=3` takes an oblivious tree from 62 to
+68 command buffers, crossing the measured 64 knee. **That is against the census
+model. The schedule as built is 56**, because a level does not need the
+record-filing phase.
+
+| k | as built | against the model |
+|---|---|---|
+| 1 | 56 | 62 |
+| 2 | 59 | **65, over** |
+| 3 | **62, under** | **68, over** |
+
+So `leaf_estimation_iterations = 3` under oblivious lands at **62, still under
+the knee**, and the interaction that looked like it needed a lane does not exist.
+Recorded rather than opened.
