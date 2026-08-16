@@ -112,14 +112,26 @@ DEFAULT_SETS = {
     # with a grep, in ninety seconds, which is the cheap part; the expensive
     # part is that nothing would ever have told either of us to look.
     #
-    # **And the count is NOT inert here, which was the real question.**
-    # CatBoost's UpdateBoostingTypeOption hard-sets Plain when the option is
-    # unset and `(learnSampleCount >= 50000 || IterationCount < 500)`. At
-    # T=500 that iteration clause is FALSE, so a scenario under 50,000 rows
-    # falls through both halves and CatBoost's own default becomes **Ordered**.
-    # At T=360 the clause is TRUE and it is Plain everywhere. So the tree
-    # count silently decided what the CatBoost-as-shipped arm computes on
-    # every small-row scenario, and 500 was the value that made it Ordered.
+    # **RETRACTED. An earlier version of this comment claimed the tree count
+    # was silently a mode switch. It is not, on CPU, and the error is worth
+    # keeping because it is a clean one.**
+    #
+    # `defaults_helper.h:33-42` hard-sets Plain when the option is unset and
+    # `(learnSampleCount >= 50000 || IterationCount < 500)`. At T=500 that
+    # iteration clause is false, so a scenario under 50,000 rows does not get
+    # the hard-set. I read that as "therefore Ordered". **It only means the
+    # option is left NotSet**, and NotSet is not Ordered: the constructed
+    # default is `EBoostingType::Plain` (`boosting_options.cpp:16`), and the
+    # only site that installs Ordered as a default is
+    # `catboost_options.cpp:806`, guarded by `TaskType == ETaskType::GPU`.
+    # **On CPU that site cannot fire, so the resolved value is Plain whether
+    # or not the hard-set runs.**
+    #
+    # The mistake was treating a disjunction's failure as implying the
+    # opposite assignment, when it implies only the absence of one particular
+    # assignment. Verified at all three sites rather than reasoned from one.
+    # The count is inert here after all; the 500-to-360 correction below still
+    # matters because this table is DATA that `--check` reasons about.
     "catboost_defaults": {
         "grow_policy": "symmetrictree",
         "max_depth": 6,
