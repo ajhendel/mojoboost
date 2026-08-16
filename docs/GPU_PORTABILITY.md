@@ -509,3 +509,40 @@ path is an optimization that has to reproduce it.
 check first on each. `docs/GPU_VALIDATION.md` carries the procedure that
 turns either from `portable-untested` into `exercised`, and the empty record
 sections that procedure fills in.
+
+### 6.4 A tension with the timeline that is not yet resolved
+
+Recorded because it is unresolved, and because resolving it by picking the more
+convenient half would be the wrong move.
+
+Section 6.1 establishes by disassembly that every `enqueue_copy` drains the
+queue. Section 6.2's audit found that `gpu_split_search._launch` calls
+`_copy_tables`, which issues **four** copies, on every launch. Taken together
+those say a per-split search costs four upload drains plus one download drain,
+so a thirty-one leaf tree should show on the order of **155 serialization
+points**.
+
+The Metal System Trace measured **32.1 per round** (`docs/METAL_TIMELINE.md`),
+which is almost exactly one per split, and it measured that by counting where
+the host actually blocked rather than by reading source.
+
+Both are measurements and they disagree by a factor of five. Possible
+resolutions, none of them established:
+
+- The measured path was `_device_search_resident`, which searches a whole
+  frontier through `enqueue_frontier` rather than a node at a time, so
+  `_copy_tables` may run far less often than once per split on that path while
+  running once per launch on the node-at-a-time `enqueue` path that section
+  6.2's audit read.
+- A drain on an already-empty queue may be cheap enough that the trace's
+  blocking-blit criterion does not count it, in which case the count is right
+  and the cost is not five times larger.
+- The disassembled path may not be the one MAX takes for small buffers.
+
+What follows from the tension regardless of how it resolves: **the wait count
+of any path must be measured rather than derived from the source**, because
+this project has now produced a source-derived count and an instrument-derived
+count for the same code that differ five-fold. The instrument is the one to
+believe about what the machine did. The disassembly is the one to believe about
+what the API guarantees. They answer different questions and the gap between
+them is exactly where a design assumption hides.
