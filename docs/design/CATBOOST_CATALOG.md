@@ -5998,3 +5998,76 @@ expect that comparison to pass.
   same run or the two rates are not comparable, so CatBoost's answer is used.
   This is a deliberate divergence between what the flag says and what our
   trainer does, and it is here so it is not silent.
+- **`one_hot_max_size`, CLOSED.** CatBoost resolves 2 and our
+  `max_cat_to_onehot` default is 4, so the two arms crossed the one-hot cutoff
+  at different cardinalities. Now set in `MOJOTREES_CATBOOST_MODE`. It is inert
+  on all three scenarios this arm runs, which is why nothing had noticed, and
+  is why `required_when_scenarios` now demands that a MATCHED key with that
+  field be NAMED in the mode dict rather than agreeing by default: a match by
+  coincidence is one default change away from a silent divergence.
+- **The seed, CLOSED for the draws that are reachable and OPEN for one that is
+  not.** CatBoost and LightGBM were both pinned to 190019 and
+  `mojotrees_params` passed no seed at all, so the three arms ran from two
+  different constants. `SHARED_SEED` is now referenced by all three
+  translators. What that does NOT reach is the split-score noise: it is keyed
+  on `ExtraTreeParams.random_strength_seed`, which
+  `tree_parameters_extra.mojo:1612` sets to `DEFAULT_RANDOM_STRENGTH_SEED` and
+  which `bindings/_mojotrees.mojo` never parses, so no Python surface can set
+  it. The CatBoost-mode arm's noise therefore runs from a native constant
+  whatever the harness passes.
+  `CATBOOST_UNMATCHABLE["split_scoring"]` was already true because the two
+  engines draw from different streams by construction; it is now true for a
+  second and more embarrassing reason, which is that ours is not reachable.
+  **Closing that is a `bindings/` change and this lane did not make it.**
+#### 9. What the first real run said, 2026-08-16
+Twelve smoke cells, 5,000 rows, three scenarios by four arms, one repeat, in a
+window taken under `/tmp/mojotrees-bench.lock` in **correctness** mode. **No
+wall time from it is quoted anywhere, by anyone.** Canary bracketing the window
+was cpu_ms 206.2 (spread 2.7 percent) before and 202.2 to 232.0 across five
+repeats after, with the calibration warning firing on the GPU probe both times.
+That is a fine box for reading parameters back and not one to time on.
+**The handover works.** All three CatBoost-mode cells built, trained and
+produced rows, and each took CatBoost's own resolved rate to the bit:
+| scenario | CatBoost resolved | our arm ran | LightGBM and plain mojotrees |
+| --- | --- | --- | --- |
+| `dense_regression` | 0.33114099502563477 | same | 0.1 |
+| `imbalanced_binary` | 0.27771899104118347 | same | 0.1 |
+| `ordered_boosting_small` | 0.33114099502563477 | same | 0.1 |
+**Note that none of those is 0.4273.** That number was measured on 20,000 by 20
+and is the figure this entry has been quoting all day as an illustration. The
+smoke tier is 5,000 by 20, and CatBoost resolved 0.331 there. Which is the
+point: there is no constant, and an arm built from one would have been wrong on
+every cell. `ordered_boosting_small` matches `dense_regression` because it is
+deliberately the same generator recipe at a size that rounds to the same shape
+at this tier.
+**The parity table was wrong and the run is what found it.** Details in section
+8's list and in the commit, but the shape of it belongs here: CatBoost resolves
+`leaf_estimation_iterations` and `boost_from_average` PER OBJECTIVE, the
+transcription in `CATBOOST_LEFT_AT_STOCK` was taken on an RMSE fit, and
+`catboost_resolved_declared` was built from the transcription alone. So on the
+Logloss scenario the table compared this arm against CatBoost-on-a-different-
+loss and printed `agree` for a key where the two engines were running 1 against
+10. **A gate that reports agreement on a real disagreement is worse than no
+gate.** The fix is a third layer: the live `get_all_params()` for that cell
+wins, and every row now records `catboost_value_source`. Twenty-five of
+thirty-one keys per scenario now come from a live fit rather than from a
+transcription.
+**Two divergences it exposed, neither reconciled by editing a value.**
+- `leaf_estimation_iterations`: CatBoost 10 under Logloss, this arm 1.
+  `trainset.train_dataset` refuses above 1 **by name**, verified by calling it.
+  Unmatchable, with the refusal message quoted in the entry.
+- `boost_from_average`: CatBoost False under Logloss, and mojotrees has no such
+  parameter on any surface this harness reaches, verified by calling it.
+  Unmatchable.
+**The read-back drift check earned its place immediately.** It is the thing
+that caught both, and on the Logloss cell it reported ten keys, two of them
+real contradictions of the transcription and eight of them keys
+`get_all_params()` simply does not return on a fit with no categorical column
+(the CTR block) or does not echo back (`allow_writing_files`,
+`logging_level`, which the harness passes). The eight are noise in the current
+message and should be split into their own category; they are reported rather
+than failed, so nothing is gated on them today.
+**Not established by this run.** Everything at the standard tier: these are
+5,000-row shapes and CatBoost's rate moves with the shape, so the standard-tier
+rates are still unknown. The accuracy column is one repeat at a smoke size and
+is not a quality claim about anything.
