@@ -177,6 +177,8 @@ chosen. Building it would be building a gate that cannot open.
 | A14 | Model shrinkage: `model_shrink_rate`, `model_shrink_mode` (**verified from source**, see the A13/A14 note) | At the top of every iteration after the first, every accumulated raw score is multiplied by `1 - rate * learning_rate` (Constant) or `1 - rate / iteration` (Decreasing); the products are folded back into the leaf values of the already-grown trees at the end of the fit | Only when on | Yes, `langevin.mojo`, off by default. Built as a deferred fold (strictly less work than CatBoost's per-round rescale of the model, and exact) | CPU (`langevin.mojo`) | (1) as built, off; (3) when on. Refused beside continued training and beside `init_score`, both of which CatBoost also refuses |
 | A15 | `feature_border_type` / `border_count` (`library/cpp/grid_creator/binarization.cpp`, `catboost/libs/data/quantization.cpp`) | CatBoost's float quantization: seven border-selection algorithms, `GreedyLogSum` by default, bounded by `border_count` thresholds | New mode; bit-moving on the arm that selects it, exact on the arm that does not | Yes, opt-in `border_type`, default stays the LightGBM/mojotrees quantile fit | CPU (`binning.mojo`) | A15 note. **BUILT**, five of seven types, `binning.fit_bins(border_type=...)` |
 | A16 | `one_hot_max_size` (`catboost/private/libs/options/cat_feature_options.cpp`, `catboost/private/libs/algo/greedy_tensor_search.cpp`) | CatBoost's categorical one-hot threshold, default 2, `<=` on the count of real categories seen on learn | New mode; bit-moving only when set | Yes, opt-in `CategoricalParams.one_hot_max_size`, default off | CPU (`categorical.mojo`) | A16 note. **BUILT**. It also settles the owed `max_cat_to_onehot` off-by-one, see A12 |
+| A17 | `text_processing`: the tokenizer and the dictionaries (`library/cpp/text_processing/tokenizer/tokenizer.cpp` + `options.h`, `library/cpp/text_processing/dictionary/dictionary_builder.cpp` + `options.h`, `catboost/private/libs/options/text_processing_options.cpp`/`.h`, `catboost/libs/data/quantization.cpp::CreateDictionaries`, `catboost/private/libs/text_processing/dictionary.h::CreateDictionary`, `catboost/private/libs/data_types/text.h`) -- **verified from source**, see the A17 note | Turns a raw text column into a bag of dictionary token ids with counts. Default tokenizer splits on the literal string `" "` and does nothing else; default dictionaries are a unigram and a bigram over words, `occurrence_lower_bound=3`, `max_dictionary_size=50000` | No: pure host-side feature GENERATION feeding the existing binning path. Nothing in the trainer changes | Yes. It is the only way a text column becomes comparable at all; without it there is a whole class of dataset on which no CatBoost comparison exists | CPU (`text_processing.mojo`, NEW, imports nothing from the package) | (1) strictly-less-work does not apply -- it is new work that did not exist. Default OFF: no existing entry point calls it. A17 note |
+| A18 | `text_features`: the `BoW` / `NaiveBayes` / `BM25` estimators (`catboost/private/libs/text_features/bow.cpp`, `naive_bayesian.cpp`, `bm25.cpp`, `feature_calcer.h`, `helpers.h`; `catboost/private/libs/feature_estimator/base_text_feature_estimator.h`, `text_feature_estimators.cpp`; `catboost/private/libs/algo/estimated_features.cpp`, `fold.cpp`, `data.cpp`, `full_model_saver.cpp`) -- **verified from source**, see the A18 note | Three numeric features off a token bag. `BoW` is target-free. **`NaiveBayes` and `BM25` are target-aware and ARE computed on the ordered permutation prefix, the same machinery the CTRs use** | Feature values only; they are handed to `binning.fit_bins` like any other numeric column | Yes, opt-in. `BoW` and the calcers are ours today; the ordered pass CONSUMES `lane/ordered-ts-2`'s permutation and must never build its own | CPU (`text_features.mojo`, NEW, imports only `text_processing`) | (3) bit-moving when on, inert when off. A18 note, and read the leakage section of it before writing any caller |
 
 ### A4 note: Bayesian bootstrap, verified from source
 
@@ -1792,3 +1794,337 @@ CatBoost's *boundary* and not CatBoost's *other side*. A fit with
 `one_hot_max_size = 2` is CatBoost-shaped in which features get one-hot and
 LightGBM-shaped in what the rest get. Anyone reading a comparison against
 CatBoost has to hold both halves.
+
+### A17 note: the tokenizer and the dictionaries, verified from source
+
+Read 2026-08-16 from `github.com/catboost/catboost` at `master`. Numbering:
+A16 was the highest row in the catalog at `bfd6187` when this was written, so
+this lane took A17 and A18. Files:
+
+- `library/cpp/text_processing/tokenizer/options.h` -- `TTokenizerOptions`
+  and every field default.
+- `library/cpp/text_processing/tokenizer/tokenizer.cpp` --
+  `SplitByDelimiter` (both overloads), `FilterNumbers`, `ProcessWordToken`,
+  `TTokenizer::Tokenize`, `TokenizeWithoutCopy`.
+- `library/cpp/text_processing/dictionary/options.h` --
+  `TDictionaryOptions`, `TDictionaryBuilderOptions`.
+- `library/cpp/text_processing/dictionary/dictionary_builder.cpp` --
+  `TUnigramDictionaryBuilderImpl::AddImpl` / `FinishBuilding`,
+  `TMultigramDictionaryBuilderImpl::AddImpl` / `Filter` / `CompareNGram`.
+- `library/cpp/text_processing/dictionary/util.h` -- `GetMaxDictionarySize`.
+- `library/cpp/text_processing/dictionary/frequency_based_dictionary_impl.cpp`
+  -- `TUnigramDictionaryImpl::GetTopTokens`, `GetUnknownTokenId`.
+- `library/cpp/text_processing/dictionary/types.h` -- `EUnknownTokenPolicy`.
+- `catboost/private/libs/options/text_processing_options.h` --
+  `DEFAULT_DICTIONARY_OPTIONS`, `DEFAULT_DICTIONARY_BUILDER_OPTIONS`.
+- `catboost/private/libs/options/text_processing_options.cpp` --
+  `TTextProcessingOptions::SetDefault`, `SetNotSpecifiedOptionsToDefaults`.
+- `catboost/libs/data/quantization.cpp` -- `CreateDictionaries`.
+- `catboost/private/libs/text_processing/dictionary.h` -- `CreateDictionary`.
+- `catboost/private/libs/text_processing/dictionary.cpp` --
+  `TDictionaryProxy::Apply`, `GetTopTokens`.
+- `catboost/private/libs/text_processing/text_column_builder.cpp` --
+  `TTextColumnBuilder::AddText`.
+- `catboost/private/libs/data_types/text.h` -- `TText`.
+
+**The default tokenizer is almost nothing, and that is the finding.**
+`TTextProcessingOptions::SetDefault` installs one tokenizer named `"Space"`
+constructed from a default `TTokenizerOptions()`, which is
+`Lowercasing=false`, `Lemmatizing=false`,
+`NumberProcessPolicy=LeaveAsIs`, `SeparatorType=ByDelimiter`,
+`Delimiter=" "`, `SplitBySet=false`, `SkipEmpty=true`. `SplitByDelimiter`
+then reduces to `StringSplitter(s).SplitByString(" ").SkipEmpty()`. So the
+default tokenizer splits the raw UTF-8 bytes on the literal one-character
+string `" "`, drops empty pieces, and **does not** lowercase, strip
+punctuation, strip numbers, lemmatize, or normalize Unicode. `"Cat,"` and
+`"cat"` are two different tokens at CatBoost's defaults. The `BySense`
+separator, the lemmatizer and the token-type filter exist but are not
+reachable from any default and the open-source lemmer is a `Y_ENSURE(false)`
+stub (`TTokenizer::Initialize`).
+
+**The default dictionaries are two, not one.** `SetDefault` installs
+`"BiGram"` (`{ETokenLevelType::Word, GramOrder=2}`) and `"Word"`
+(`{Word, GramOrder=1}`), in that order, and the default `BoW` processing
+consumes both. So a text column at CatBoost's defaults produces `BoW` over a
+bigram dictionary AND `BoW` over a unigram dictionary. The
+`SetNotSpecifiedOptionsToDefaults` path, taken when the user supplied a
+partial `text_processing` block, falls back to `"Word"` alone -- a different
+default from the one an untouched fit gets, which is a trap for anyone
+comparing configurations.
+
+**The bounds are CatBoost's, not the library's.** The dictionary library
+defaults `OccurrenceLowerBound=50` and `MaxDictionarySize=-1` (unbounded);
+CatBoost overrides both in `DEFAULT_DICTIONARY_BUILDER_OPTIONS` to **3** and
+**50000**. Quoting the library's 50 would be wrong for CatBoost.
+`GetMaxDictionarySize(-1)` is `Max<ui32>()`, so -1 means unbounded and any
+other non-positive value is refused.
+
+**How the two bounds compose, which is the part that matters.**
+`FinishBuilding` first DROPS every token whose corpus occurrence count is
+`< OccurrenceLowerBound`, then sorts the survivors by **count descending,
+token ascending**, then keeps the first `min(survivors, MaxDictionarySize)`
+and assigns ids `StartTokenId, StartTokenId+1, ...` in that order. Three
+consequences: the occurrence bound is a filter and the size bound is a
+truncation, applied in that order and never interchangeable; **token id
+order IS frequency order**, which is what makes `GetTopTokens(n)` on the
+CatBoost side a bare `xrange(n)` (`TDictionaryProxy::GetTopTokens`); and the
+count is total occurrences over the learn corpus, not document frequency
+(`TokenToCount[token] += weight` per occurrence, `weight=1` per document).
+
+**The dictionary is fitted on the learn pool only.** `CreateDictionaries`
+runs inside learn quantization; test pools are quantized against an already
+built `TQuantizedFeaturesInfo` and reuse the same digitizer. Unknown tokens
+at apply time are dropped, not mapped to a sentinel:
+`EUnknownTokenPolicy` defaults to `Skip` at every `Apply` overload.
+
+**A document is a bag, and the bag is sorted.** `TText(TVector<ui32>&&)`
+sorts the applied token ids ascending and run-length-encodes them into
+`(tokenId, count)` pairs. Every estimator below iterates a document in
+ascending token id. That is not incidental; it is what makes the Float64
+accumulations in A18 order-fixed without anyone arranging for it.
+
+**Verified but not implemented here**, each refused by name rather than
+silently ignored: `ETokenLevelType::Letter`, `SkipStep > 0` (skip-grams),
+`EEndOfWordTokenPolicy`, a non-`Skip` `EEndOfSentenceTokenPolicy`,
+`SubTokensPolicy`, `BySense` separation, lemmatization, BPE dictionaries,
+and `StartTokenId != 0`.
+
+### A18 note: the three estimators, and the leakage answer
+
+Read 2026-08-16 from `master`. Files:
+
+- `catboost/private/libs/text_features/bow.cpp` / `.h`,
+  `naive_bayesian.cpp` / `.h`, `bm25.cpp` / `.h`.
+- `catboost/private/libs/text_features/feature_calcer.h` / `.cpp` --
+  `ActiveFeatureIndices`, `ForEachActiveFeature`, `TrimFeatures`,
+  `FeatureCount`.
+- `catboost/private/libs/text_features/helpers.h` -- `Softmax`.
+- `catboost/private/libs/feature_estimator/base_text_feature_estimator.h` --
+  `TTextBaseEstimator::ComputeFeatures`, **`ComputeOnlineFeatures`**,
+  `EstimateFeatureCalcer`, `MakeFinalFeatureCalcer`, `Calc`.
+- `catboost/private/libs/feature_estimator/feature_estimator.h` --
+  `IFeatureEstimator` vs `IOnlineFeatureEstimator`.
+- `catboost/private/libs/feature_estimator/text_feature_estimators.cpp` --
+  `TNaiveBayesEstimator`, `TBM25Estimator`, `TBagOfWordsEstimator`, and the
+  two `CreateTextEstimators` overloads.
+- `catboost/private/libs/algo/estimated_features.cpp` --
+  `CreateEstimatedFeaturesData`, `const bool isOnline = learnPermutation.Defined()`.
+- `catboost/private/libs/algo/fold.cpp` -- `TFold::InitOnlineEstimatedFeatures`
+  and its two call sites in the dynamic and plain fold builders.
+- `catboost/private/libs/algo/data.cpp` -- `CreateEstimators`, and the
+  offline `CreateEstimatedFeaturesData` call with `/*learnPermutation*/ Nothing()`.
+- `catboost/private/libs/algo/full_model_saver.cpp` -- `MakeFinalFeatureCalcer`.
+
+#### The leakage answer
+
+**`NaiveBayes` and `BM25` are target-aware, and CatBoost prevents the leak
+exactly the way it prevents the CTR leak: an ordered prefix over the fold's
+learn permutation. They do not merely resemble the CTR machinery; they are
+driven by the same permutation array.**
+
+The split is structural, not conditional. `IFeatureEstimator` has one
+`ComputeFeatures`; `IOnlineFeatureEstimator` adds `ComputeOnlineFeatures`.
+`TFeatureEstimators` holds two disjoint vectors and
+`CreateEstimatedFeaturesData` picks one by
+`const bool isOnline = learnPermutation.Defined()`. `CreateTextEstimators`
+has two overloads: the one that takes a `TClassificationTargetPtr` returns
+`NaiveBayes` and `BM25` as online estimators, the one that does not returns
+`BoW` as an offline estimator. `BoW` never sees a target and is never online.
+
+The ordered pass, verbatim in shape:
+
+```
+for (ui64 line : learnPermutation) {
+    const TText& text = ds.GetText(line);
+    Compute(featureCalcer, text, line, samplesCount, learnFeatures);   // read
+    calcerVisitor.Update(target.Classes[line], text, &featureCalcer);  // then write
+}
+```
+
+Read strictly before write. Row `i`'s feature is computed from a calcer
+holding the statistics of exactly the rows that precede `i` in that
+permutation, and row `i`'s own target enters the calcer only afterwards. The
+first row of the permutation is scored against an empty calcer. That is the
+ordered-target-statistic contract, spelled with a different accumulator.
+
+The permutation is the FOLD's: `TFold::InitOnlineEstimatedFeatures` passes
+`GetLearnPermutationArray()`, and it is called from both fold builders
+immediately before `InitOnlineCtrs`. So with `k` CTR permutations there are
+`k` independently ordered copies of every online text feature, one per fold,
+and they are the same permutations the CTRs use. **A second permutation
+implementation for text would be a bug, not a duplication.**
+
+#### The train-versus-predict asymmetry
+
+Three different calcer states exist, and confusing any two of them is where
+implementations of this go wrong.
+
+1. **Learn rows during training.** Prefix state, per fold, as above.
+   Different in every fold; different for the same row in different folds.
+2. **Test/eval rows during training.** `ComputeOnlineFeatures` finishes the
+   permutation loop and then calls `Calc(featureCalcer, GetTestDataSets(), ...)`
+   with the calcer in its FINAL state -- every learn row folded in. Not a
+   prefix. A test row is not part of the learn ordering and has no position
+   in it.
+3. **Predict time, from a saved model.** `full_model_saver.cpp` calls
+   `estimator->MakeFinalFeatureCalcer(...)`, which calls
+   `EstimateFeatureCalcer()` -- a fresh calcer walked over the learn set in
+   **natural row order**, no permutation -- then `TrimFeatures` to the
+   features the model actually used. That frozen calcer is serialized into
+   the model.
+
+**So the answer to "what is a text feature's value at predict time when
+there is no target" is: the target is not needed, because it was consumed at
+fit time into the frozen frequency tables.** At predict time
+`TMultinomialNaiveBayes::Compute` / `TBM25::Compute` are pure functions of
+(the document's token bag, the frozen per-class tables). No target is read,
+and none exists. The asymmetry is not "features are unavailable at predict"
+-- it is that the training-time value is a prefix statistic and the
+predict-time value is a full-corpus statistic, and they are systematically
+different numbers for the same document. That is deliberate and is the same
+asymmetry ordered CTRs have.
+
+One further consequence worth stating because it is easy to get backwards:
+**the ordered pass is a training-input construction, not a model.** The
+model ships state 3 only. Nothing in a saved model can reproduce state 1.
+
+#### The formulas, exactly
+
+**`BoW`** (`TBagOfWordsEstimator`, `TBagOfWordsCalcer`). Target-free,
+offline. `top_tokens_count` defaults to **2000**, clamped to the dictionary
+size, and refused at zero. The features are the dictionary's top
+`top_tokens_count` tokens -- which, because ids are assigned in descending
+count order (A17), is `GetTopTokens(n) == xrange(n)`. Feature `t` of
+document `d` is **1 if token id `t` occurs in `d`, else 0**: a binary
+indicator, not a count and not a TF-IDF. `UniqueValuesUpperBoundHint = 2`
+per feature, and CatBoost packs them 32 to a `ui32`.
+
+**`NaiveBayes`** (`TMultinomialNaiveBayes`). `ClassPrior = TokenPrior =
+DEFAULT_PRIOR = 0.5`; `SEEN_TOKENS_PRIOR = 1`. Per class `c`, with `text`
+iterated in ascending token id:
+
+```
+value  = log(ClassDocs[c] + ClassPrior)
+denom  = ClassTotalTokens[c] + TokenPrior * (NumSeenTokens + 1)
+textLen = 0
+for (token, count) in text:
+    textLen += count
+    num = TokenPrior + (Frequencies[c][token] if present else 0)
+    if token not present in Frequencies[c]:  denom += TokenPrior
+    value += count * log(num)
+value -= textLen * log(denom)
+```
+
+then `Softmax` (max-shifted) over the `NumClasses` values, and the emitted
+features are the active indices, which default to `[0, BaseFeatureCount)`
+with `BaseFeatureCount = NumClasses > 2 ? NumClasses : 1`. **So binary
+classification emits ONE feature**, the softmax probability of class 0, not
+two.
+
+Two things in that block are easy to mis-transcribe and are not typos in
+CatBoost. `classTokensCount` is a **by-value** parameter, so the
+`denom += TokenPrior` for an unseen token is local to the class currently
+being scored: the denominator grows by the number of the document's tokens
+this class has never seen, and therefore differs per class for the same
+document. And `NumSeenTokens` is the count of DISTINCT token ids seen across
+ALL classes so far (`TNaiveBayesVisitor::SeenTokens`, `Insert` then
+`NumSeenTokens = SeenTokens.Size()`), so in the ordered pass it grows as the
+prefix grows.
+
+**`BM25`** (`TBM25`). `k = 1.5`, `b = 0.75`, `truncateBorder = 1e-3`, and
+`TBM25Estimator` constructs with all three defaulted. `BaseFeatureCount =
+NumClasses`, so binary emits two. `TotalTokens` is initialized to **1**, not
+0. The class, not the document, plays the role of the BM25 document:
+
+```
+meanClassLength = TotalTokens / NumClasses
+for (token, count) in text:                    # `count` is NOT used
+    nz = number of classes whose table contains `token`
+    for c in classes:
+        tf = Frequencies[c][token] or 0
+        s  = 0 if tf == 0 else tf*(k+1) / (tf + k*(1 - b + b*meanClassLength/ClassTotalTokens[c]))
+        scores[c] += TruncatedInvClassFreq[nz] * s
+TruncatedInvClassFreq[j] = max(log((NumClasses - j + 0.5) / (j + 0.5)), truncateBorder)
+```
+
+Three divergences from textbook BM25, all deliberate on CatBoost's side and
+all reproduced rather than corrected. The length normalization is
+**inverted**: textbook BM25 has `b * docLen / avgDocLen`, which penalizes
+long documents; CatBoost has `b * meanClassLength / classLength`, which
+REWARDS long classes. The in-document term frequency is discarded -- the
+loop reads `tokenToCount.Token()` and never `Count()`, so a token occurring
+five times in a document contributes exactly as much as one occurring once.
+And the IDF is over CLASSES, a number in `[0, NumClasses]`, floored at
+`truncateBorder` rather than at zero, so a term present in every class still
+contributes `1e-3` times its score instead of nothing. The `tf == 0` early
+return is also the only thing standing between the formula and a divide by
+`ClassTotalTokens[c] == 0` on the first rows of an ordered pass, so it must
+stay ahead of the division.
+
+**Which estimators are on by default.** `SetDefault` installs `BoW` for
+every objective and `NaiveBayes` additionally when the objective is a
+classification one. **`BM25` is NOT a CatBoost default** -- it exists, it is
+documented, and nothing turns it on unless the user names it.
+`CreateEstimators` says so in a comment as well: "There're no online text
+estimators for regression for now", and `TTextProcessingOptions::Validate`
+refuses a classification-only calcer on a regression objective by name.
+
+#### What mojotrees built
+
+`src/mojotrees/text_processing.mojo` (tokenizer, dictionary, digitizer) and
+`src/mojotrees/text_features.mojo` (the three estimators). Both are new
+files, both are OFF by default in the only sense available to them: no
+existing entry point calls either, no existing default changed, and no
+existing module imports them. `text_processing` imports nothing from the
+package and `text_features` imports only `text_processing`, so the pair is a
+leaf of the import graph and cannot participate in the
+`efb -> binning -> tree_parameters_extra` cycle.
+
+**They generate numeric columns and stop.** The output of every feature
+function is a column-major `List[Float64]` laid out `out[f * n_rows + r]`,
+which is exactly what `binning.fit_bins` and `RawData.dense` already read.
+There is no new trainer, no new binner, and no new split rule. A caller
+concatenates these columns onto its numeric matrix and the existing pipeline
+takes it from there.
+
+**The ordered pass consumes a permutation; it does not make one.**
+`naive_bayes_online_features` and `bm25_online_features` take
+`permutation: List[Int]` and validate that it is a permutation of
+`0 .. n_rows - 1`. Building that permutation is `lane/ordered-ts-2`'s job and
+must stay there; see the lane report for the two functions this needs from
+it. Until that lane lands, the only callers are tests passing the identity
+permutation, which is the honest statement that the ordered path is built
+and unreached.
+
+**Determinism.** No random draw anywhere in either module, so there is no
+domain constant and no `sampling.mojo` pattern to follow. The one real
+hazard is dictionary construction, and it is handled the way CatBoost
+handles it: counts accumulate in a hash map, but the map is never iterated
+into the result. `_dictionary_order` sorts by **(count descending, key
+ascending)**, a strict total order on distinct keys, so the id assignment is
+independent of hash order, insertion order, allocation addresses, and
+`MOJOTREES_NUM_WORKERS`. Everything else is sequential over ascending row
+index or over the caller's permutation. Nothing in either module reads a
+worker count or spawns a task.
+
+**Bounds, derived.** For a dictionary of `D` entries whose keys have mean
+byte length `L`: the fitted dictionary holds the key strings twice, once in
+the `id -> key` list and once in the `key -> id` map, so
+`2 * D * (L + 16)` bytes plus `8 * D` for the counts. At CatBoost's default
+`max_dictionary_size = 50000` and an English unigram mean of about 8 bytes,
+that is a derived bound of roughly 2.5 MB per dictionary per text column --
+small, and the reason the size bound exists at all is the *pre-filter*
+count, which is unbounded and is what `occurrence_lower_bound = 3` cuts
+first. `BoW` at the default `top_tokens_count = 2000` costs `2000 * n_rows *
+8` bytes of Float64 columns before binning, which is **16 KB per row** and
+is the actual memory statement anyone enabling this needs: at a million rows
+that is 16 GB, which is not a bound, it is a refusal. `BoW` is therefore
+built but is the one estimator whose default this lane would not ship
+without a packed representation; `NaiveBayes` costs `max(1, num_classes)`
+columns and `BM25` costs `num_classes`, both of which are free.
+
+**What is deliberately not built**, each refused by name: `SkipStep > 0`,
+`ETokenLevelType::Letter`, BPE, lemmatization, `BySense` separation, the
+end-of-word / end-of-sentence token policies, `StartTokenId != 0`,
+per-feature `text_processing` blocks, the embedding estimators, and the
+packed-binary `BoW` representation.
