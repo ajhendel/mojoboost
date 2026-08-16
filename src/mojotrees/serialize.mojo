@@ -537,7 +537,21 @@ def _write_categorical(mut out: String, cats: CategoricalSpec):
 # bump, and a reader that meets a revision it does not know refuses by number
 # instead of reading the wrong fields.
 comptime _CTR_SECTION_TAG = "ctr"
-comptime CTR_SECTION_REVISION = 1
+comptime CTR_SECTION_REVISION = 2
+"""Revision 2 adds `slot_codes` / `slot_code_offsets`, 2026-08-16.
+
+**Why this had to be a revision and not an addition.** A CTR bucket used to be
+a binned category id, which the reader could recover from the mapper's own
+`categorical` section. It is now an index into the source column's COMPLETE,
+un-truncated code table, and nothing else in the file carries that table: a
+reader that skipped it would map every raw value to bucket 0 and score every
+row from the pure prior. That is the failure mode this project cares about
+most, wrong rather than failed, so `_read_ctr` refuses a revision it does not
+recognize by number instead of parsing on.
+
+No file in the wild carries revision 1 with an active section: the bundle that
+produces one was unreachable from every Python entry point until 2026-08-16
+(catalog A36 blocker 2), so there is nothing to migrate."""
 
 
 def _write_ctr(mut out: String, tables: CtrTables) raises:
@@ -592,6 +606,12 @@ def _write_ctr(mut out: String, tables: CtrTables) raises:
     )
     _write_int_list(out, tables.source_features)
     _write_int_list(out, tables.slot_buckets)
+    # The bucket tables. Revision 2, and the section is unreadable without
+    # them: inference maps a raw category code to a bucket through exactly
+    # these lists (`CtrTables.bucket_of`), and a model that lost them would
+    # score every row from bucket 0.
+    _write_int_list(out, tables.slot_code_offsets)
+    _write_int_list(out, tables.slot_codes)
     _write_int_list(out, tables.counter_denominator)
     for c in range(n_columns):
         ref col = tables.columns[c]
@@ -698,6 +718,48 @@ def _read_ctr(mut r: _TokenReader, version: Int) raises -> CtrTables:
     for s in range(n_slots):
         if tables.slot_buckets[s] < 1:
             raise Error("corrupt ctr section: nonpositive bucket count")
+
+    # The bucket tables, revision 2. Checked against `slot_buckets` rather
+    # than trusted: the two say the same thing twice, and a file where they
+    # disagree would map raw values through one and size the statistics with
+    # the other, which scores wrong instead of failing.
+    tables.slot_code_offsets = _read_int_list(r, n_slots + 1)
+    if tables.slot_code_offsets[0] != 0:
+        raise Error("corrupt ctr section: code offsets must start at 0")
+    for s in range(n_slots):
+        var lo = tables.slot_code_offsets[s]
+        var hi = tables.slot_code_offsets[s + 1]
+        if hi < lo:
+            raise Error("corrupt ctr section: code offsets are not ascending")
+        if hi - lo + 1 != tables.slot_buckets[s]:
+            raise Error(
+                "corrupt ctr section: slot ",
+                s,
+                " carries ",
+                hi - lo,
+                " category codes but claims ",
+                tables.slot_buckets[s],
+                " buckets; a bucket is one code plus the reserved bucket 0",
+            )
+    tables.slot_codes = _read_int_list(
+        r, tables.slot_code_offsets[n_slots]
+    )
+    for s in range(n_slots):
+        # `CtrTables.bucket_of` binary searches these, so an unsorted or
+        # duplicated table would silently resolve a raw value to the wrong
+        # statistic rather than fail.
+        for i in range(
+            tables.slot_code_offsets[s] + 1, tables.slot_code_offsets[s + 1]
+        ):
+            if tables.slot_codes[i] <= tables.slot_codes[i - 1]:
+                raise Error(
+                    "corrupt ctr section: category codes are not strictly"
+                    " ascending"
+                )
+        if tables.slot_code_offsets[s] < tables.slot_code_offsets[s + 1]:
+            if tables.slot_codes[tables.slot_code_offsets[s]] < 0:
+                raise Error("corrupt ctr section: negative category code")
+
     tables.counter_denominator = _read_int_list(r, n_slots)
 
     for _ in range(n_columns):

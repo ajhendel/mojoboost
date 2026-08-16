@@ -89,6 +89,7 @@ from .binning import (
     ctr_slot_columns,
     fit_bins,
 )
+from .categorical import distinct_category_codes
 from .ctr_columns import (
     SimpleCtrConfig,
     build_ctr_train_columns,
@@ -436,22 +437,6 @@ def _subset_group(
     return counts^
 
 
-def _feature_category_counts(mapper: BinMapper) -> List[Int]:
-    """`n_categories` per base feature, 0 for a numerical one.
-
-    The two plain lists `ctr_columns.plan_ctr_columns` takes come from here and
-    from `mapper.cats.is_categorical`. They are lists rather than the
-    `CategoricalSpec` itself so that `ctr_columns.mojo` never has to import
-    `.categorical`, which imports `.tree_parameters_extra`; keeping that module
-    at `.ctr`'s depth is what keeps it importable from `binning.mojo` without
-    touching the `efb -> binning -> tree_parameters_extra` cycle.
-    """
-    var out = List[Int](capacity=mapper.n_features)
-    for f in range(mapper.n_features):
-        out.append(mapper.cats.n_categories(f))
-    return out^
-
-
 def _is_categorical_flags(mapper: BinMapper) -> List[Bool]:
     """`is_cat` per base feature, normalized to the full width. A spec built by
     `CategoricalSpec.none()` is empty, and `is_cat` already answers False past
@@ -463,7 +448,10 @@ def _is_categorical_flags(mapper: BinMapper) -> List[Bool]:
     return out^
 
 
-def _build_ctr(
+def _build_ctr[
+    features_origin: ImmOrigin, //
+](
+    features: Span[Float64, features_origin],
     mut mapper: BinMapper,
     mut data: BinnedMatrix,
     label: List[Float64],
@@ -481,8 +469,14 @@ def _build_ctr(
        one-hot cutoff, and which `(type, target border, prior)` column each one
        produces, in `AllocateCtrData` order. Four per column at CatBoost's CPU
        defaults with a binary target.
-    3. **Category buckets** (`binning.ctr_slot_columns`). Read out of the binned
-       matrix **once**, and handed to both halves unchanged.
+    3. **Category buckets** (`binning.ctr_slot_columns`). Read out of the RAW
+       matrix **once**, and handed to both halves unchanged. Raw and not
+       binned, which is the correction of 2026-08-16: the bins have already
+       collapsed every level past `max_bin - 1` into one bucket, so a CTR keyed
+       on them is keyed on the very truncation it exists to undo, and measured
+       as a null twice. `categorical.distinct_category_codes` is the
+       un-truncated table and `CtrTables.slot_codes` carries it into the model
+       so inference keys the same way.
     4. **Permutation** (`ctr_train_permutation`). One, for the dataset, computed
        once and in full before any column is built. A keyed block sort, so it is
        the same permutation at every `MOJOTREES_NUM_WORKERS` and on every
@@ -525,33 +519,68 @@ def _build_ctr(
     config.resolve_descriptions()
     config.resolve_target_borders(label)
     config.validate()
-    # `mapper.n_bins` is the binning budget, the same `max_bins`
-    # `categorical.fit_categorical_spec` capped its tables with, so it is
-    # exactly the quantity `CTR_SOURCE_BIN_OVERFLOW` compares a kept-category
-    # count against. The mapper is still bare here, so this is the base
-    # feature width and no CTR column can be its own source.
-    var tables = plan_ctr_columns(
-        config,
-        _is_categorical_flags(mapper),
-        _feature_category_counts(mapper),
-        mapper.n_bins,
-    )
-    if not tables.is_active():
-        # No categorical column earned CTRs under this config's source rule:
-        # none was wide enough to escape the one-hot cutoff, or under
-        # `CTR_SOURCE_BIN_OVERFLOW` none filled its category table. Nothing is
-        # attached and the dataset is the one it would have been -- which is
-        # what makes the overflow rule affordable as a default.
-        return
-    var borders = config.target_borders.copy()
     var n_rows = data.n_rows
+    var flags = _is_categorical_flags(mapper)
+
+    # The UN-TRUNCATED category tables, one scan per categorical column, kept
+    # flat rather than nested so no per-feature list is allocated. Feature f's
+    # codes are `cat_flat[cat_off[f] : cat_off[f + 1]]` and its true distinct
+    # count is that slice's length -- which is the count the source rule must
+    # see. `mapper.cats.n_categories(f)` would have been the KEPT count,
+    # saturating at `max_bin - 1`, so a 200,000-level column and a 254-level
+    # one would look identical to the rule meant to tell them apart.
+    var cat_flat = List[Int]()
+    var cat_off = List[Int](capacity=mapper.n_features + 1)
+    cat_off.append(0)
+    for f in range(mapper.n_features):
+        if flags[f]:
+            var codes = distinct_category_codes(features, n_rows, f)
+            for i in range(len(codes)):
+                cat_flat.append(codes[i])
+        cat_off.append(len(cat_flat))
+    var n_distinct = List[Int](capacity=mapper.n_features)
+    for f in range(mapper.n_features):
+        n_distinct.append(cat_off[f + 1] - cat_off[f])
+
+    # `mapper.n_bins` is the binning budget and is the ONLY place the bin cap
+    # is read: the source rule compares against it and, below, the CTR's own
+    # quantization is set from it. The mapper is still bare here, so this is
+    # the base feature width and no CTR column can be its own source.
+    # The CTR's own quantization, from the same budget and nowhere else. Our
+    # opt-in rule treats a CTR column as the ordinary numeric feature it is and
+    # gives it the numeric budget; CatBoost mode keeps CatBoost's 15 borders,
+    # because in CatBoost mode we mirror CatBoost.
+    if config.is_policy():
+        config.set_ctr_border_count(mapper.n_bins - 1)
+
+    var tables = plan_ctr_columns(config, flags, n_distinct, mapper.n_bins)
+    if not tables.is_active():
+        # No categorical column earned CTRs under this config's source rule.
+        # Nothing is attached and the dataset is the one it would have been.
+        return
+
+    # The bucket tables the model will carry. Slot `s` takes its source
+    # column's whole code list, so `slot_buckets[s]` (which `plan_ctr_columns`
+    # set to `n_distinct + 1`) and this list agree by construction.
+    var slot_flat = List[Int]()
+    var slot_off = List[Int](capacity=tables.n_slots() + 1)
+    slot_off.append(0)
+    for s in range(tables.n_slots()):
+        var f = tables.source_features[s]
+        for i in range(cat_off[f], cat_off[f + 1]):
+            slot_flat.append(cat_flat[i])
+        slot_off.append(len(slot_flat))
+    tables.slot_codes = slot_flat^
+    tables.slot_code_offsets = slot_off^
+
+    var borders = config.target_borders.copy()
     var classes = target_classes(label, borders)
 
-    # Read once, used by both halves, and this is the clearest statement of the
-    # asymmetry the wiring exists to get right: the ordered build and the static
-    # fit are handed the SAME slot-major array of category buckets and differ in
-    # nothing but which function runs over it.
-    var cat = ctr_slot_columns(data.bins, n_rows, tables)
+    # Read once from the RAW matrix, used by both halves, and this is the
+    # clearest statement of the asymmetry the wiring exists to get right: the
+    # ordered build and the static fit are handed the SAME slot-major array of
+    # category buckets and differ in nothing but which function runs over it.
+    var cat = ctr_slot_columns(features, n_rows, tables)
 
     var permutation = ctr_train_permutation(config, n_rows)
     var ctr_bins = build_ctr_train_columns(
@@ -682,7 +711,7 @@ struct Dataset(Copyable, Movable, Writable):
                 ctr = SimpleCtrConfig.disabled()
             else:
                 _check_ctr_label(label, n_rows)
-                _build_ctr(mapper, data, label, ctr)
+                _build_ctr(features, mapper, data, label, ctr)
                 if ctr.is_policy() and not mapper.ctr.is_active():
                     # No column overflowed its table, so nothing was planned,
                     # nothing was appended and nothing was attached. Record the
@@ -851,7 +880,10 @@ struct Dataset(Copyable, Movable, Writable):
                     ctr = SimpleCtrConfig.disabled()
                 else:
                     _check_ctr_label(label, n_rows)
-                    _build_ctr(mapper, data, label, ctr)
+                    # `raw.values` is the dense column-major matrix this
+                    # constructor just binned; the sparse arm never reaches
+                    # here, and a CTR is refused or declined there anyway.
+                    _build_ctr(Span(raw.values), mapper, data, label, ctr)
                     if ctr.is_policy() and not mapper.ctr.is_active():
                         ctr = SimpleCtrConfig.disabled()
         var kept: RawData

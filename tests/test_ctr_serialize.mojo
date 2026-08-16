@@ -255,7 +255,14 @@ def test_an_unknown_version_token_is_refused() raises:
 
 def test_the_version_constants_say_what_the_writer_writes() raises:
     assert_equal(CURRENT_FORMAT_VERSION, 5)
-    assert_equal(CTR_SECTION_REVISION, 1)
+    # Revision 2 since 2026-08-16: the section carries `slot_codes` /
+    # `slot_code_offsets`, because a CTR bucket became an index into the
+    # source column's complete category table rather than a binned category
+    # id. Nothing else in the file carries that table, so a reader that
+    # skipped it would map every raw value to bucket 0 and score every row
+    # from the pure prior. `_read_ctr` refuses an unrecognized revision by
+    # number, which is the next test.
+    assert_equal(CTR_SECTION_REVISION, 2)
 
 
 # ---------------------------------------------------------------------------

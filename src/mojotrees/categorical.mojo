@@ -346,6 +346,46 @@ def _distinct_codes_and_counts[
         i = j + 1
 
 
+def distinct_category_codes[
+    features_origin: ImmOrigin, //
+](
+    features: Span[Float64, features_origin],
+    n_rows: Int,
+    feature: Int,
+) raises -> List[Int]:
+    """EVERY distinct non-missing category code of one column, ascending, with
+    nothing evicted.
+
+    `fit_categorical_spec` keeps `max_bins - 1` of these and drops the rest
+    into `UNKNOWN_BIN`, which is the ceiling this module documents under
+    "Capacity". This function is the un-truncated view of the same scan, and
+    it exists for the one consumer that must not inherit that ceiling:
+    an ordered target statistic (`ctr_columns.mojo`, catalog A19).
+
+    **Why a CTR needs this and cannot use the bins.** A target statistic is
+    the mechanism for a column too wide to bin, so computing it from the bins
+    would be circular: `binning.ctr_slot_columns` used to do exactly that, and
+    because every evicted level shares bin 0 it shares one statistic, the CTR
+    carried no information the truncated column did not, and it measured as
+    two nulls on 2026-08-16. Sourced from here instead, a 200,000-level column
+    yields 200,000 distinguishable statistics, which then bin as one ORDINARY
+    NUMERIC column. That is the whole point: the cardinality moves out of the
+    bin id, where a byte caps it, and into a real value, where it is not
+    capped at all.
+
+    The returned list is the bucket table: code `codes[i]` is bucket `i + 1`,
+    and bucket 0 is reserved for missing and for a code unseen at fit time,
+    exactly as `bin_of` reserves bin 0. `ctr_columns.CtrTables.bucket_of` is
+    the lookup, and is deliberately the only one: a second copy of that binary
+    search is a second chance for train and predict to disagree about which
+    bucket a raw value belongs to.
+    """
+    var codes = List[Int]()
+    var counts = List[Int]()
+    _distinct_codes_and_counts(features, n_rows, feature, codes, counts)
+    return codes^
+
+
 def _keep_most_frequent(
     codes: List[Int], counts: List[Int], keep: Int
 ) raises -> List[Int]:

@@ -202,8 +202,26 @@ comptime DEFAULT_CTR_PERMUTATION_INDEX = 1
 
 # Which categorical columns earn CTR columns. The two rules answer different
 # questions and are deliberately not one comparison.
+# THE STANDING RULE these two constants sit either side of, stated once here
+# because both of them are only meaningful against it:
+#
+#   `grow_policy=symmetrictree` (CatBoost mode) mirrors CatBoost exactly.
+#   `grow_policy=lossguide`, the default, mirrors LightGBM exactly.
+#   Where mojotrees has its own idea it is opt-in and never the default.
+#
+# So `CTR_SOURCE_ONE_HOT_MAX_SIZE` is what a CatBoost-mode fit wants and is
+# CatBoost's own boundary, unmodified. `CTR_SOURCE_BIN_OVERFLOW` is our own
+# idea; LightGBM has no target statistic at all, so under lossguide there is
+# nothing to mirror and the rule is therefore OPT-IN and not a default.
+#
+# Neither is the `Dataset` default, which is `SimpleCtrConfig.disabled()`. A
+# `Dataset` is constructed before training and cannot see `grow_policy`, so
+# "on by default in CatBoost mode" is not something this type can decide for
+# itself: a CatBoost-mode caller passes `ctr="catboost"` and that is the whole
+# of the wiring.
+
 comptime CTR_SOURCE_ONE_HOT_MAX_SIZE = 0
-"""CatBoost's rule: a column earns CTRs when it is too wide to one-hot,
+"""CatBoost's rule, and what CatBoost mode wants: a column earns CTRs when it is too wide to one-hot,
 `uniqueValues > one_hot_max_size` (`greedy_tensor_search.cpp:469`). At
 CatBoost's default of 2 that is almost every categorical column in a dataset,
 which is why CatBoost pays for a permutation whenever one exists."""
@@ -252,29 +270,6 @@ columns per source column and buys nothing measurable."""
 
 comptime CTR_SOURCE_RULES = 2
 """One past the last rule code, for the range check in `validate`."""
-
-
-comptime CTR_OVERFLOW_MIN_CATEGORIES = 32
-"""The absolute floor `CTR_SOURCE_BIN_OVERFLOW` applies beside the table test,
-and it is LightGBM's `max_cat_threshold` default rather than a tuned number.
-
-`max_cat_threshold` caps the number of categories on ONE SIDE of a
-many-versus-many categorical split (`CategoricalParams.max_cat_threshold`,
-`categorical._sorted_search`). Below that many categories a set split can name
-every category it wants on a side, so the partition search is not capacity
-limited and a target statistic offers it a representation it already has.
-Above it, both the split cap and the bin table start to bind and the CTR is
-buying something.
-
-**The hole this leaves, stated rather than discovered.** The count being
-tested is `CategoricalSpec.n_categories`, the KEPT count, which saturates at
-`bin_budget - 1`. At `max_bin = 16` a column of 200 levels and a column of 15
-levels both report 15, so this floor makes the overflow rule unable to fire at
-all below `max_bin = 33` -- including on a column that really did lose 185
-levels. Distinguishing those two needs the pre-truncation distinct count,
-which `CategoricalSpec` does not store and cannot be given without widening
-the model format. At the default `max_bin = 255` the floor is inert, because
-`bin_budget - 1` is 254 and already far above it."""
 
 
 # ---------------------------------------------------------------------------
@@ -454,6 +449,31 @@ struct SimpleCtrConfig(Copyable, Movable):
         out.max_ctr_complexity = 1
         out.source_rule = CTR_SOURCE_BIN_OVERFLOW
         return out^
+
+    def set_ctr_border_count(mut self, count: Int) raises:
+        """Give every description the same CTR quantization.
+
+        **Whose number this is depends on which side of the policy line the
+        bundle sits, and that is the standing rule rather than a preference.**
+        `CTR_SOURCE_ONE_HOT_MAX_SIZE` is CatBoost mode and mirrors CatBoost, so
+        it keeps `DEFAULT_CTR_BORDER_COUNT` (15) and this is never called on
+        it. `CTR_SOURCE_BIN_OVERFLOW` is our own opt-in rule under lossguide,
+        where there is no LightGBM behavior to mirror because LightGBM has no
+        CTR at all, and there the CTR column is an ORDINARY NUMERIC feature and
+        takes the numeric bin budget.
+
+        The caller reads that budget from `BinMapper.n_bins`, which is the one
+        place the cap is known, so the number is not written down twice.
+        """
+        if count < 1:
+            raise Error("ctr_border_count must be positive")
+        if count > 255:
+            raise Error(
+                "ctr_border_count must fit a UInt8 bin id: CtrTables.predict_lut"
+                " and ctr.ctr_train_bin both hand back a byte"
+            )
+        for i in range(len(self.descriptions)):
+            self.descriptions[i].ctr_border_count = count
 
     def resolve_descriptions(mut self) raises:
         """Fill `descriptions` from `catboost_simple_ctr_defaults` if the
@@ -857,6 +877,32 @@ struct CtrTables(Copyable, Movable):
     var counter_offsets: List[Int]
     var counter_denominator: List[Int]
 
+    var slot_codes: List[Int]
+    """Slot `s`'s source category codes, ascending and COMPLETE, at
+    `slot_codes[slot_code_offsets[s] : slot_code_offsets[s + 1]]`.
+
+    **The bucket table, and the reason this mechanism works at all.** Code
+    `slot_codes[o + i]` is bucket `i + 1`; bucket 0 is missing or a code
+    unseen at fit time. `slot_buckets[s]` is therefore
+    `slot_code_offsets[s + 1] - slot_code_offsets[s] + 1`.
+
+    This list comes from `categorical.distinct_category_codes`, which
+    truncates NOTHING, and deliberately not from `CategoricalSpec`, which
+    keeps `max_bin - 1` codes and drops the rest into one bin. Until
+    2026-08-16 a CTR was computed from the binned bucket, so every evicted
+    level shared bucket 0 and shared one statistic; the columns then carried
+    no information the truncated categorical column did not, and measured as
+    two nulls. Sourcing the buckets from here is what makes a 200,000-level
+    column produce 200,000 distinguishable statistics.
+
+    It is MODEL STATE: inference maps a raw code to a bucket through this
+    exact list, so a model that lost it would score every row from bucket 0.
+    Written by `serialize._write_ctr`; it is what took the format to v6.
+    """
+
+    var slot_code_offsets: List[Int]
+    """Start of slot `s`'s codes in `slot_codes`, length `n_slots + 1`."""
+
     var predict_lut: List[UInt8]
     """Column `c`'s bucket -> inference bin id, at
     `predict_lut[predict_lut_offsets[c] + bucket]`.
@@ -889,6 +935,8 @@ struct CtrTables(Copyable, Movable):
         self.counter_counts = List[Int]()
         self.counter_offsets = List[Int]()
         self.counter_denominator = List[Int]()
+        self.slot_codes = List[Int]()
+        self.slot_code_offsets = List[Int]()
         self.predict_lut = List[UInt8]()
         self.predict_lut_offsets = List[Int]()
 
@@ -910,6 +958,39 @@ struct CtrTables(Copyable, Movable):
 
     def n_slots(self) -> Int:
         return len(self.source_features)
+
+    def bucket_of(self, slot: Int, value: Float64) -> Int:
+        """Raw category `value`'s bucket in `slot`: 0 for missing or for a code
+        unseen at fit time, `i + 1` for the i-th code of `slot_codes`.
+
+        The ONE place a raw value becomes a CTR bucket, so the ordered build,
+        the static fit and every scored row go through the same comparison and
+        cannot disagree. Binary search over an ascending list; `not (v >= 0.0)`
+        is the missing test, which catches NaN as well as negatives and is the
+        one `categorical.bin_of` uses.
+        """
+        # `not (v >= 0.0)` rejects NaN as well as negatives, and the upper
+        # bound is `categorical._MAX_CATEGORY`: a value past it was refused at
+        # fit time by `_distinct_codes_and_counts`, so at predict time it is
+        # unseen by definition and `Int(value)` must not be asked for it.
+        if not (value >= 0.0) or value >= 2147483648.0:
+            return 0
+        if slot < 0 or slot + 1 >= len(self.slot_code_offsets):
+            return 0
+        var target = Int(value)
+        var lo = self.slot_code_offsets[slot]
+        var hi = self.slot_code_offsets[slot + 1] - 1
+        var base = lo
+        while lo <= hi:
+            var mid = (lo + hi) // 2
+            var c = self.slot_codes[mid]
+            if c == target:
+                return mid - base + 1
+            if c < target:
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return 0
 
     def total_features(self) -> Int:
         """Base features plus CTR columns: the width of the design matrix and of
@@ -936,6 +1017,20 @@ struct CtrTables(Copyable, Movable):
             return False
         if self.prior_denom != other.prior_denom:
             return False
+        # The bucket table. Two fits whose source columns held different
+        # category codes map the same raw value to different buckets and so
+        # score it from a different statistic, which is exactly the silent
+        # disagreement this function exists to catch.
+        if len(self.slot_codes) != len(other.slot_codes):
+            return False
+        for i in range(len(self.slot_codes)):
+            if self.slot_codes[i] != other.slot_codes[i]:
+                return False
+        if len(self.slot_code_offsets) != len(other.slot_code_offsets):
+            return False
+        for i in range(len(self.slot_code_offsets)):
+            if self.slot_code_offsets[i] != other.slot_code_offsets[i]:
+                return False
         if len(self.columns) != len(other.columns):
             return False
         for i in range(len(self.columns)):
@@ -1039,6 +1134,30 @@ def check_ctr_serializable(tables: CtrTables) raises:
             " than an active empty one, so this is a hand-built state the"
             " model format cannot describe"
         )
+    # The bucket tables must be present and must agree with `slot_buckets`.
+    # A section written without them reloads into a model that maps every raw
+    # category to bucket 0 and scores every row from the pure prior -- wrong
+    # rather than failed, so it is refused at the writer.
+    if len(tables.slot_code_offsets) != tables.n_slots() + 1:
+        raise Error(
+            "these ctr tables carry no category code table: a bucket is an"
+            " index into `slot_codes`, so a model without it cannot map a raw"
+            " value to a statistic. `trainset._build_ctr` fills both"
+        )
+    for s in range(tables.n_slots()):
+        var span = (
+            tables.slot_code_offsets[s + 1] - tables.slot_code_offsets[s]
+        )
+        if span + 1 != tables.slot_buckets[s]:
+            raise Error(
+                "ctr slot ",
+                s,
+                " has ",
+                span,
+                " category codes but ",
+                tables.slot_buckets[s],
+                " buckets; a bucket is one code plus the reserved bucket 0",
+            )
     var probe = tables.copy()
     rebuild_ctr_predict_lut(probe)
     var same = len(probe.predict_lut) == len(tables.predict_lut) and len(
@@ -1116,18 +1235,16 @@ def ctr_source_features(
     `CTR_SOURCE_BIN_OVERFLOW`; the CatBoost rule ignores it.
 
     **Under `CTR_SOURCE_BIN_OVERFLOW`** a column earns CTRs when
-    `n_categories[f] >= bin_budget - 1` and it holds at least
-    `CTR_OVERFLOW_MIN_CATEGORIES` of them. The first test is
-    `fit_categorical_spec`'s
-    `_keep_most_frequent(codes, counts, max_bins - 1)` having run out of
-    budget. The test is `>=` and not `>` because a truncated table is
-    indistinguishable from a full one here: `CategoricalSpec` stores the kept
-    codes and not the distinct count it started from, so a column holding
-    exactly `bin_budget - 1` distinct categories -- which lost nothing -- is
-    treated as an overflow. That is a false positive costing four columns on a
-    column of exactly 254 levels, and it is preferred to widening
-    `CategoricalSpec` and with it the model format, which is a change no
-    accuracy this buys would pay for.
+    `n_categories[f] > bin_budget - 1`: strictly more levels than the category
+    table can represent, so at least one level would otherwise be lost to
+    `categorical.UNKNOWN_BIN` where no split set can reach it.
+
+    The test is strict and needs no fudge factor, because `n_categories` here
+    is the TRUE distinct count from `categorical.distinct_category_codes` and
+    not the kept count from `CategoricalSpec`. That distinction is the whole
+    correctness of the rule: the kept count saturates at `bin_budget - 1`, so
+    read from there a 200,000-level column and a 254-level column are the same
+    number, and a rule meant to tell them apart cannot.
 
     **Under `CTR_SOURCE_ONE_HOT_MAX_SIZE`** a column earns them when it is
     **too wide to one-hot**:
@@ -1163,10 +1280,7 @@ def ctr_source_features(
         if not is_categorical[f]:
             continue
         if config.source_rule == CTR_SOURCE_BIN_OVERFLOW:
-            if (
-                n_categories[f] >= bin_budget - 1
-                and n_categories[f] >= CTR_OVERFLOW_MIN_CATEGORIES
-            ):
+            if n_categories[f] > bin_budget - 1:
                 out.append(f)
         elif n_categories[f] > config.one_hot_max_size:
             out.append(f)
@@ -1438,12 +1552,98 @@ def rebuild_ctr_predict_lut(mut tables: CtrTables) raises:
     var lut_offsets = List[Int]()
     lut_offsets.append(0)
     for c in range(tables.n_columns()):
-        var n_buckets = tables.slot_buckets[tables.columns[c].slot]
-        for b in range(n_buckets):
-            lut.append(UInt8(ctr_predict_bin(tables, c, b)))
+        _ctr_column_lut(tables, c, lut)
         lut_offsets.append(len(lut))
     tables.predict_lut = lut^
     tables.predict_lut_offsets = lut_offsets^
+
+
+def _ctr_column_lut(
+    tables: CtrTables, column_index: Int, mut lut: List[UInt8]
+) raises:
+    """Append column `column_index`'s whole bucket -> bin lookup to `lut`.
+
+    `ctr_predict_bin` remains THE definition and this is its hoisted form:
+    identical arithmetic, with the one difference that the slot's table slice
+    is copied once for the column instead of once per bucket.
+
+    **That difference is the whole reason this function exists, and it is a
+    complexity bug rather than a tuning one.** `ctr_predict_bin` copies
+    `class_offsets[s : s + 2]` (or the mean or counter slice) on every call, so
+    driving it once per bucket cost `O(n_buckets^2)`. That was invisible while
+    a bucket was a BINNED category and `n_buckets <= max_bin`, at most 256 and
+    typically far less. Sourcing buckets from raw category codes makes
+    `n_buckets` the true distinct count, and on this repository's own
+    `high_cardinality_categorical` that is 200,000: the old loop is 4e10
+    element copies per column, which does not finish. Hoisted, it is 200,000.
+
+    The result must stay equal to `ctr_predict_bin(tables, c, b)` for every
+    `b`; that equality is what `tests/test_ctr_columns.mojo` pins, and it is
+    the only thing keeping the two in step.
+    """
+    if not tables.is_active():
+        raise Error("this mapper carries no ctr tables")
+    if column_index < 0 or column_index >= tables.n_columns():
+        raise Error("ctr column index out of range")
+    ref spec = tables.columns[column_index]
+    var s = spec.slot
+    var n_buckets = tables.slot_buckets[s]
+    if spec.ctr_type == CTR_COUNTER:
+        var lo = tables.counter_offsets[s]
+        var hi = tables.counter_offsets[s + 1]
+        var counts = List[Int](capacity=hi - lo)
+        for i in range(lo, hi):
+            counts.append(tables.counter_counts[i])
+        var denom = tables.counter_denominator[s]
+        for b in range(n_buckets):
+            var value = predict_ctr_counter(
+                counts,
+                denom,
+                b,
+                spec.prior,
+                tables.prior_denom,
+                spec.shift,
+                spec.scale,
+            )
+            lut.append(UInt8(ctr_predict_bucket(value, spec.ctr_border_count)))
+    elif spec.ctr_type == CTR_BINARIZED_TARGET_MEAN:
+        var lo = tables.mean_offsets[s]
+        var hi = tables.mean_offsets[s + 1]
+        var sums = List[Float64](capacity=hi - lo)
+        var counts = List[Int](capacity=hi - lo)
+        for i in range(lo, hi):
+            sums.append(tables.mean_sums[i])
+            counts.append(tables.mean_counts[i])
+        for b in range(n_buckets):
+            var value = predict_ctr_mean(
+                sums,
+                counts,
+                b,
+                spec.prior,
+                tables.prior_denom,
+                spec.shift,
+                spec.scale,
+            )
+            lut.append(UInt8(ctr_predict_bucket(value, spec.ctr_border_count)))
+    else:
+        var lo = tables.class_offsets[s]
+        var hi = tables.class_offsets[s + 1]
+        var table = List[Int](capacity=hi - lo)
+        for i in range(lo, hi):
+            table.append(tables.class_table[i])
+        for b in range(n_buckets):
+            var value = predict_ctr_class(
+                table,
+                tables.n_classes,
+                b,
+                spec.ctr_type,
+                spec.target_border_idx,
+                spec.prior,
+                tables.prior_denom,
+                spec.shift,
+                spec.scale,
+            )
+            lut.append(UInt8(ctr_predict_bucket(value, spec.ctr_border_count)))
 
 
 # ---------------------------------------------------------------------------
@@ -1712,22 +1912,29 @@ def ctr_predict_bin(
 
 
 def ctr_predict_row(
-    tables: CtrTables, base_bins: List[Int]
+    tables: CtrTables, raw_row: List[Float64]
 ) raises -> List[Int]:
-    """The CTR bins for one scored row, given its base feature bins.
+    """The CTR bins for one scored row, given its RAW feature values.
 
-    `base_bins` is what `BinMapper.bin_row` produced for the raw features; a CTR
-    column reads `base_bins[source_feature]`, which is a category bucket in
-    `[0, n_categories]` with 0 meaning missing, unknown or evicted. The result is
-    appended to `base_bins` by the caller, so a scored row's bin vector is
+    `raw_row` is the caller's own row, `n_base_features` long. A CTR column
+    reads `raw_row[source_feature]` and maps it through `CtrTables.bucket_of`,
+    the same lookup `binning.ctr_slot_columns` uses in bulk, so a row scored
+    singly and the same row scored in a batch get the same bucket and the same
+    bin. The result is appended by the caller, so a scored row's bin vector is
     `n_base_features + n_columns` long while its raw row stays
     `n_base_features` long.
+
+    **It used to take the BINNED row and that was the inert path.** A binned
+    categorical value is truncated to `max_bin - 1` levels with everything
+    else collapsed into bin 0, so keying a CTR on it gave every evicted level
+    one shared statistic. The bucket must come from the un-truncated code, and
+    the raw row is where that still exists.
     """
     var out = List[Int]()
     if not tables.is_active():
         return out^
-    if len(base_bins) < tables.n_base_features:
-        raise Error("base bins must cover every base feature")
+    if len(raw_row) < tables.n_base_features:
+        raise Error("raw row must cover every base feature")
     if len(tables.predict_lut_offsets) != tables.n_columns() + 1:
         raise Error(
             "these ctr tables were never fitted: call fit_ctr_tables before"
@@ -1736,7 +1943,7 @@ def ctr_predict_row(
     out.reserve(tables.n_columns())
     for c in range(tables.n_columns()):
         ref spec = tables.columns[c]
-        var bucket = base_bins[spec.source_feature]
+        var bucket = tables.bucket_of(spec.slot, raw_row[spec.source_feature])
         var lo = tables.predict_lut_offsets[c]
         var hi = tables.predict_lut_offsets[c + 1]
         if bucket < 0 or bucket >= hi - lo:
