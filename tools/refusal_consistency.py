@@ -166,7 +166,14 @@ FEATURES = (
         note=(
             "the per-split noise is staged on the device by GpuSplitSearcher "
             "but its per-tree scale is computed only by the dense CPU round "
-            "loops (boosting._round_random_score_scale)"
+            "loops (boosting._round_random_score_scale). Three _parse_params "
+            "call sites declare random_strength_ok as of 2026-08-16 (fit, "
+            "train_dataset, booster_update), each chosen by which round loop "
+            "it reaches; the rest inherit the False default and refuse by "
+            "name. This tool reports what a layer SAYS, and the ok_flag layer "
+            "now says three different things at three call sites for good "
+            "reason, which is a case it does not model: it reads the flag, "
+            "not the routing behind it"
         ),
     ),
     Feature(
@@ -396,6 +403,44 @@ def _kwarg(args, name):
     return match.group(1).strip() if match else None
 
 
+def _resolve_local_bool(code, call_line, value):
+    """One level of `var NAME = <expr>` substitution, looking backwards from a
+    call site.
+
+    Why this exists, stated because it is a limit and not a feature. A call
+    site is allowed to pass a named local rather than an inline expression,
+    and one did: `train_dataset` computes
+
+        var scale_is_computed = device == CPU_DEVICE and not d[].is_sparse
+
+    and passes `random_strength_ok=scale_is_computed`, deliberately, so the
+    conjunction is readable and easy to correct. Before this function, the
+    reader saw a bare identifier, could not match `CPU_DEVICE` in it, and
+    reported `unrecognized value` -- which is to say **it went blind at
+    exactly the call site somebody had just thought hardest about**. A tool
+    whose coverage drops when the code gets clearer is worse than no tool,
+    because the gap moves with the attention.
+
+    Deliberately shallow: one hop, same file, nearest preceding assignment,
+    no chains and no control flow. A value it cannot resolve is returned
+    unchanged and still reported as unrecognized, which is the loud failure
+    and is the correct outcome for anything more complicated than this.
+    """
+    if value is None or "CPU_DEVICE" in value or value in ("True", "False"):
+        return value
+    name = value.strip()
+    if not name.isidentifier():
+        return value
+    pattern = re.compile(
+        r"^\s*var\s+" + re.escape(name) + r"\s*=\s*(.+?)\s*$", re.M
+    )
+    best = None
+    for match in pattern.finditer(code):
+        if code.count("\n", 0, match.start()) + 1 < call_line:
+            best = match.group(1)
+    return best if best is not None else value
+
+
 def binding_claims(code, features):
     """What the `*_ok` flags say, at the call sites that can reach the GPU.
 
@@ -415,6 +460,7 @@ def binding_claims(code, features):
         verdicts = []
         for entry, line, args in gpu_sites:
             value = _kwarg(args, feature.ok_flag)
+            value = _resolve_local_bool(code, line, value)
             if value is None:
                 verdicts.append((REFUSES, entry, line, "flag omitted, defaults False"))
             elif value == "True":

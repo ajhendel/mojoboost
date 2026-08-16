@@ -361,12 +361,22 @@ class _Base(_ParamsMixin):
     one argmax.
 
     **Not wired, and refused by name with the missing piece.**
-    `random_strength` (the noise is implemented; its per-tree scale is
-    computed by a function with no callers) and
-    `max_ctr_complexity` (the CTR modules are implemented; nothing imports
-    them, so no fit builds a CTR column). Neither is accepted and ignored.
+    `max_ctr_complexity`: the CTR modules are implemented and the model file
+    now carries a `ctr` section, but no binding entry point enables a CTR
+    bundle, so no fit reachable from Python builds a CTR column. Not
+    accepted and ignored.
 
-    `bootstrap_type` and `bagging_temperature` left that list: both now reach
+    `random_strength` left that list. The claim above used to be that its
+    per-tree scale "is computed by a function with no callers", and that was
+    false in a way worth recording: the scale had callers, in
+    `boosting._boost_rounds` and in `train_with_valid`'s own loop. What it
+    lacked was a route from Python, because `_parse_params` declared
+    `random_strength_ok` at exactly one call site. Three call sites declare
+    it now, chosen by which round loop they reach, and every other entry
+    refuses by name. See `docs/design/CATBOOST_CATALOG.md` A36 for the full
+    enumeration.
+
+    `bootstrap_type` and `bagging_temperature` left that list too: both reach
     `boosting.train`'s `bootstrap` argument on the dense single-output CPU
     fit, and refuse by entry point everywhere else. See the `bootstrap_type`
     paragraph above.
