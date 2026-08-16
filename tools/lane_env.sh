@@ -87,8 +87,30 @@ _lane_env_main() {
 
   # The manifest guard.  Compared by content rather than mtime, since a
   # worktree checkout rewrites mtimes without changing anything.
+  # Compare only the DEPENDENCY-BEARING tables, not the whole manifest.
+  #
+  # This used to be `cmp -s` over the entire file, and it cost a lane its
+  # shared environment for adding one `[tasks]` line: a task entry with no
+  # dependency change is byte-different and looks exactly like a different
+  # solve. That lane exported the three variables by hand instead, which is
+  # the right call and should not have been necessary, and a neighbouring
+  # lane installed its own 1.1 GB copy rather than work around it, which is
+  # the exact duplication this file exists to prevent. A guard that fires on
+  # changes it does not care about teaches people to bypass it.
+  #
+  # What actually invalidates a shared solve is a dependency table. Tasks,
+  # comments and metadata do not. `[*dependencies]` catches `dependencies`,
+  # `pypi-dependencies`, `host-dependencies`, `build-dependencies` and every
+  # `[feature.X.*dependencies]`, which is the whole set pixi solves from.
+  _lane_env_deps() {
+    awk '
+      /^\[/ { keep = ($0 ~ /dependencies\]$/) }
+      keep { print }
+    ' "$1"
+  }
   if [ -r "$here/pixi.toml" ] && [ -r "$main/pixi.toml" ] &&
-     ! cmp -s "$here/pixi.toml" "$main/pixi.toml"; then
+     ! diff -q <(_lane_env_deps "$here/pixi.toml") \
+               <(_lane_env_deps "$main/pixi.toml") >/dev/null 2>&1; then
     _lane_env_warn "pixi.toml differs between this worktree and $main."
     _lane_env_warn "DECLINING to share its environment: it was solved for a"
     _lane_env_warn "different manifest. Use 'pixi run' and take your own."
