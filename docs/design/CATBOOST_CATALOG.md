@@ -446,7 +446,7 @@ honors it, so the Mojo API and a future estimator parameter both reach it, but
 from Python it is always "unset", which is CatBoost's own default and the
 configuration `sampling.check_mvs_reg` argues is the only sensible one.
 | A35 | Persisting the fitted CTR tables in the model file (`catboost/libs/model/model_export/model_exporter.cpp`, `catboost/libs/model/ctr_data.h`, `catboost/libs/model/online_ctr.h::TModelCtr`; `CalcFinalCtrsAndSaveToModel` in `catboost/private/libs/algo/full_model_saver.cpp`) -- **CatBoost's behavior verified from source only to the extent A19 already verified it**: that `.cbm` carries `TCtrValueTable` per `TModelCtrBase` and that inference reads it through `TModelCtr::Calc`. The `.cbm` binary layout itself was NOT read, and nothing here imitates it | The model format's section for A19's model state. A fitted `CtrTables` is read off the target, so it is model state and not configuration; a file without it loads a model that keeps every tree referencing a CTR column and bins that column from different numbers | No. A reloaded model must score **bit-identically**, which is the whole test | Yes, and it is the gate on A19 being reachable at all: an arm that cannot be saved is an arm nobody can ship, and A19's own trainer refusal named this as the blocker | `serialize.mojo` (v5 `ctr` section), `ctr_columns.mojo` (the guards), `model_dump.mojo` (the remaining refusal) | A35 note. **BUILT and REACHED.** Format **v5**, conditional: a model with no ctr tables and no linear leaves still writes v4. Floats round-trip exactly because the whole format stores IEEE-754 bit patterns. Prepared tables, the model dump and every Python entry point still REFUSE, each by its own reason |
-| A36 | **CTR REPLACEMENT of a raw categorical column, and `random_strength` at the trainer the benchmark uses.** Two reachability edges, not two new mechanisms: A19/A30 own the CTR arithmetic and A3 owns the noise. CatBoost's own fork is `one_hot_max_size` (A16): a column at or under the cutoff becomes one-hot and every wider column is REPLACED by its CTR columns, so its split search never meets a category. **CatBoost's behavior here is RELAYED from the A16, A19 and A30 notes, not independently re-verified: there is no CatBoost checkout in this worktree** | Replacement is what the word says. A CTR that is *added* beside the raw column leaves the categorical in the matrix, so `tree._check_oblivious` still refuses the level and nothing has been built. The noise edge is narrower: the per-split draw exists on both backends, and what is scarce is the per-tree scale, which exactly two round loops compute | Yes for the CTR half (new columns, and one column removed). No for the noise half beyond what A3 already moves | The noise half YES and **BUILT**. The CTR half **BLOCKED**, four traced reasons, see the A36 note | `bindings/_mojotrees.mojo` (both), `bench/real_data/scenarios.py`; the CTR half would need `ctr_columns.mojo`, `binning.mojo`, `trainset.mojo` plus two files this lane does not own | A36 note. (3) when set. `random_strength` is deterministic across `MOJOTREES_NUM_WORKERS` and across machines, established by reading the code and written out in the note |
+| A36 | **CTR REPLACEMENT of a raw categorical column, and `random_strength` at the trainer the benchmark uses.** Two reachability edges, not two new mechanisms: A19/A30 own the CTR arithmetic and A3 owns the noise. CatBoost's own fork is `one_hot_max_size` (A16): a column at or under the cutoff becomes one-hot and every wider column is REPLACED by its CTR columns, so its split search never meets a category. **CatBoost's behavior here is RELAYED from the A16, A19 and A30 notes, not independently re-verified: there is no CatBoost checkout in this worktree** | Replacement is what the word says. A CTR that is *added* beside the raw column leaves the categorical in the matrix, so `tree._check_oblivious` still refuses the level and nothing has been built. The noise edge is narrower: the per-split draw exists on both backends, and what is scarce is the per-tree scale, which exactly two round loops compute | Yes for the CTR half (new columns, and one column removed). No for the noise half beyond what A3 already moves | The noise half YES and **BUILT**. The CTR half **BUILT 2026-08-16** by `lane/ctr-replacement`; of the four traced blockers, 3 and 4 are gone and 1 and 2 (harness, Python surface) stand. See A36 note sections 5 and 6 -- and note that the noise half turned out to be already correct except for one hash component | `bindings/_mojotrees.mojo` (both), `bench/real_data/scenarios.py`; the CTR half landed in `binning.mojo`, `trainset.mojo`, `categorical.mojo`, `tree.mojo`, `split.mojo` | A36 note. (3) when set. `random_strength` is deterministic across `MOJOTREES_NUM_WORKERS` and across machines, established by reading the code and written out in the note |
 | A37 | **The RESOLVED parameter list as the source of truth for the comparison arm**, and the removal of the CatBoost learning-rate pin. `CatBoost.get_all_params()` on the fitted model, which is CatBoost's own answer rather than a transcription of its documentation. **Nothing about CatBoost was verified from source in this lane and nothing was run: no CatBoost checkout, no fit, no `selfcheck`.** Every CatBoost claim is RELAYED from `CATBOOST_DEFAULTS_SOURCE`, the A16/A19/A30/A31 notes, and the measured learning-rate figures already recorded at `scenarios.py:355-362` | Not a CatBoost mechanism. It is the difference between what a library RESOLVES and what a harness BELIEVES it resolves. `MOJOTREES_CATBOOST_MODE` was a hand-written dict of somebody's belief about CatBoost's defaults, and `selfcheck.check_catboost_arm` checked it against a dict built from itself, so no wrong value in it could ever fail a gate | Yes, and by a lot on one key. The CatBoost arm no longer passes `learning_rate`, so CatBoost resolves its own -- about 0.4273 at 100 iterations on a 20,000 by 20 shape against the 0.1 it used to be pinned to | The arm identity moves from `cb-default@v1` to `cb-shipped@v1` and every published CatBoost number is SUPERSEDED. The `mojotrees_catboost_mode` arm is PARKED pending the read-back wiring, which is four call-site edits in three files this lane did not own | `bench/real_data/scenarios.py`, `bench/real_data/selfcheck.py`; the wiring is in `WIRE_NOTE_resolved_param_parity.md` for `engines.py`, `worker.py` and `run.py` | A37 note. (2) bit-moving on the CatBoost arm, deliberately. Gate: `selfcheck.check_catboost_arm`'s new key-by-key diff, which has never been watched fail and whose failing edit is written out in the note |
 | A38 | **The automatic `learning_rate` made reachable from Python, and turned ON by default in CatBoost mode** (`catboost/libs/train_lib/options_helper.cpp:276-281`, `UpdateLearningRate`; `catboost/private/libs/options/option.h:80-85`, `TOption::NotSet()`) -- **verified from source**, see the A38 note | Not a new mechanism. A11/A12 built the formula and verified it; this is the reachability edge and the default. The derivation was honored from the CLI and the C ABI and from nowhere else, so no benchmark and no pip user could reach it; and it was opt-in everywhere, so CatBoost mode did not behave as CatBoost | Yes when it fires, and it fires by default under `grow_policy=oblivious`: every leaf value moves with the rate | Yes. It is the first item landed under the standing rule -- `grow_policy=oblivious` mirrors CatBoost exactly, `lossguide` mirrors LightGBM, anything of ours is opt-in | `bindings/_mojotrees.mojo`, `python/mojotrees/sklearn.py`, `src/mojotrees/params.mojo` | A38 note. (3) when on, and ON is now a default in CatBoost mode. Gate: the harness compares our fitted model's read-back rate against CatBoost's `engine_resolved_params` at record time |
 
@@ -5534,6 +5534,95 @@ no categorical column, so all three reach `boosting.train` and none can meet
 key is safe rather than hopeful, and it is a property of the support table: if
 a categorical scenario is ever re-enabled for this arm, this key has to be
 re-examined at the same time.
+
+#### 5. RESOLVED, 2026-08-16, lane `lane/ctr-replacement`
+
+Compiled and run, one test file, unlike the lane that wrote sections 1 to 4.
+Blockers 3 and 4 above are gone and the categorical half is BUILT.
+
+**Blocker 3 was fixed by somebody else first.** `tree.grow_tree` now passes
+`data.usable_features()` into `sampling.select_tree_features` (as of `bcf8248`).
+That edge being dead is what made the section above call replacement
+unbuildable, and it was the only thing that did; with it live, removing a
+column from `usable` removes it from every split search, which is exactly what
+"nothing can remove a column from the split search" said did not exist.
+
+**Replacement, built.** `binning.ctr_extend_usable` and
+`binning.append_ctr_columns` take a `replaced` list; `trainset._build_ctr`
+passes the plan's distinct source features when the bundle is CatBoost mode
+(`CTR_SOURCE_ONE_HOT_MAX_SIZE`) and passes nothing under
+`CTR_SOURCE_BIN_OVERFLOW`, which is our own opt-in lossguide rule and keeps
+accompanying because that is the configuration its measured result came from.
+Neither hack section 1 rejected was used: the column is not demoted in `cats`,
+not blanked to one bin, and its `missing_bin` is not abused. It keeps its id,
+stays binned, stays predicted through, and is simply not offered.
+
+**Blocker 4 dissolved rather than being worked around, and so did the first
+refusal.** Both guards asked whether a categorical column was DECLARED. Both
+now ask whether one is SEARCHABLE: `tree._check_oblivious_supported` asks
+`BinnedMatrix.any_usable_categorical`, and `split.find_best_split` asks
+`categorical.any_searchable_categorical` over the feature list and mask the
+scan will actually use. A replaced column reaches neither. **Note for anyone
+re-reading section 1's trace: the second refusal was never on the oblivious
+path at all.** A level's search is `split.find_best_split_shared`, which takes
+no `CategoricalSpec` and has no such guard; the fix to `find_best_split` is for
+the leaf-wise path carrying a CatBoost-mode bundle.
+
+Measured: symmetric trees plus a 40-level categorical column plus
+`random_strength=1` trains, 24 trees. Mean train log loss 0.0357886890070197
+with the column replaced against 0.5240273901778411 with the column dropped
+entirely, on a label that is a non-monotone function of the category alone --
+so the CTR columns carry the signal rather than occupy a slot. Prediction
+digest `3018192674720616661` at `MOJOTREES_NUM_WORKERS` 1 and 8, compared as
+`uint64` equality.
+
+Blockers 1 and 2 STAND: the benchmark harness still cannot vary a CTR bundle
+per arm, and no Python entry point can turn CTRs on. The mechanism is reachable
+from the Mojo API and from `tests/test_ctr_replacement.mojo` and from nowhere
+else, so `high_cardinality_categorical` stays a skip for the harness reason and
+no longer for the grower reason.
+
+#### 6. The noise half was ALREADY CORRECT, and only one hash component was wrong
+
+Recorded explicitly because it is the kind of fact that gets re-derived. A lane
+was dispatched to *build* level-aggregate noise for the oblivious path. On
+reading `split.find_best_split_shared` it was already there and already right,
+in every respect that the three CatBoost citations govern:
+
+- **Drawn once per (feature, bin) candidate**, not once per leaf, and added to
+  the level's AGGREGATE score after the cross-leaf fold and before the argmax.
+  That is `SetBestScore` (`tensor_search_helpers.cpp:716-757`), which noises
+  `scores[binFeatureIdx]` -- already the level-summed score out of
+  `CalculateNonPairwiseScore` -- with a normal from `rand_score.h:42-49`.
+  Noising each leaf's contribution instead would be a different random variable
+  with a different variance under the same parameter name.
+- **Scale computed once per tree**, before the depth loop
+  (`greedy_tensor_search.cpp:851-868`, `:1186`), reaching the search through
+  `ExtraTreeParams.random_score_scale`, which `boosting._round_random_score_scale`
+  writes per round.
+
+**The single defect was the key.** The draw was keyed on `node`, the level's
+lowest node id. It is now keyed on `depth`. CatBoost carries a per-depth term
+too -- `CalcScores` takes a fresh `LearnProgress->Rand.GenRand()` per iteration
+of the depth loop (`greedy_tensor_search.cpp:1189`, `:1199`, `:884`), so the
+same (feature, border) candidate draws different noise at depth 0 and at depth
+5.
+
+**We take that property and not that mechanism, deliberately, and this is the
+line for a future lane to not "fix".** CatBoost gets per-depth independence
+from a RUNNING generator, whose value depends on how many times it has been
+called. Reproducing that would make the draw depend on the order depths are
+visited in and on how many calls a worker count produced. A counter keyed on
+the depth VALUE has the same distribution, is worker-independent by
+construction, and is what lets a CPU draw and a device draw be compared as
+equal values for the same candidate at the same level. Section 3's determinism
+argument is unchanged by the substitution: `depth` is as fixed a quantity as
+`level_node` was, and the reduction it does not touch is still the serial one.
+
+Section 3's last bullet said `find_best_split_shared` "uses the same key with
+the level's `level_node`". That sentence is now stale by exactly this
+substitution and is left in place rather than edited, so the change is visible
+as a change.
 
 ### A37 note: the resolved parameter list, and the pin that came out with it
 

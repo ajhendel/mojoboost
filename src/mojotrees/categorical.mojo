@@ -646,6 +646,23 @@ def any_searchable_categorical(
     columns and dropped from `BinnedMatrix.usable`, so it is never in
     `features` and its partition search never runs, and refusing on it refuses
     a fit for a search that does not happen.
+
+    **The one consequence, stated rather than discovered.** `features` is the
+    per-NODE draw, so under `feature_fraction < 1` a categorical column can be
+    absent from the root's draw and present at a later node's. A refusal that
+    used to arrive before any tree was grown can therefore now arrive part way
+    into a fit. That is a change in WHEN the message arrives and not in
+    whether it is right: each of these refusals is a statement about the scan
+    it guards, and a scan that is not offered a categorical feature computes a
+    correct answer. The alternative -- refusing up front on `usable`, which is
+    per tree -- would re-introduce the over-refusal for any fit whose draws
+    happen never to include the column, which is the defect being removed.
+
+    Callers wanting the early message have the per-tree question available as
+    `BinnedMatrix.any_usable_categorical`, which is what
+    `tree._check_oblivious_supported` asks; it is a strictly larger set than
+    this one and is right there because the oblivious grower cannot search a
+    categorical column at ANY node.
     """
     if len(features) == 0:
         for f in range(n_features):

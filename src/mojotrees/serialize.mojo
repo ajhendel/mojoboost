@@ -111,6 +111,30 @@ it. Monotonic constraints are the exception because they are a property the
 trees satisfy, which a consumer may need to know and cannot recover; so, as
 of v4, are split gains, which are a property of how the tree was grown that
 nothing downstream can rederive.
+
+**`BinMapper.usable` is in that absent set, and it is the one absence that
+does not announce itself.** Every other one shows up as a value a consumer can
+test for -- no gains, no covers, no names, no CTR tables. `usable` instead
+comes back FULL: `BinMapper.__init__` treats an empty list as "nothing was
+prefiltered" and fills in every feature, so a mapper whose pool had columns
+removed loads with a pool that silently has them back. Two things remove
+columns from it today: `feature_pre_filter`, and CatBoost-mode CTR replacement
+through `BinMapper.drop_usable`, which drops a categorical column whose CTR
+columns stand in for it.
+
+This is INERT as the code stands, and the reason is worth stating so the next
+person can check whether it still holds rather than trust this sentence.
+`usable` is read at fit time only -- it is the pool
+`sampling.select_tree_features` draws a tree's features from, reached through
+`BinnedMatrix.usable_features` -- and a loaded model never grows a tree. So no
+prediction, dump, or contribution path can observe the reset.
+
+**It stops being inert the moment anything on the load path reads `usable`,
+and that is the note this paragraph exists for.** A model whose feature pool
+silently resets on load is harmless until one caller reads it, and the caller
+who adds that read is the one who needs to know. If you are adding it: write
+the section, do not work around the reset. `is_usable` and `usable_features`
+are the two accessors to grep for.
 """
 
 from std.memory import bitcast

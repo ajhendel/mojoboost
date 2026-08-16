@@ -65,8 +65,9 @@ from mojotrees.categorical import (
 )
 from mojotrees.ctr_columns import SimpleCtrConfig
 from mojotrees.growth_policy import GROW_LEAFWISE, GROW_OBLIVIOUS
+from mojotrees.monotone import MonotoneConstraints
 from mojotrees.trainset import Dataset
-from mojotrees.tree_parameters_extra import ExtraTreeParams
+from mojotrees.tree_parameters_extra import SCORE_COSINE, ExtraTreeParams
 
 # ------------------------------------------------------------------ fixtures
 
@@ -184,6 +185,26 @@ def _oblivious_noisy_params() -> BoosterParams:
             max_depth=4,
             extra=ex^,
             grow_policy=GROW_OBLIVIOUS,
+        ),
+    )
+
+
+def _monotone_on_feature_1(n_features: Int) raises -> BoosterParams:
+    """Leaf-wise params carrying an increasing constraint on feature 1, the
+    categorical column, and nothing on any other feature."""
+    var signs = List[Int](capacity=n_features)
+    for f in range(n_features):
+        signs.append(1 if f == 1 else 0)
+    return BoosterParams(
+        8,
+        0.2,
+        TreeParams(
+            15,
+            1,
+            1.0,
+            1e-3,
+            monotone=MonotoneConstraints.from_signs(signs, n_features),
+            grow_policy=GROW_LEAFWISE,
         ),
     )
 
@@ -348,6 +369,96 @@ def test_lossguide_ctr_still_accompanies() raises:
     )
     var booster = train(ds.data, ds.label, BINARY_LOGISTIC, params)
     assert_equal(len(booster.trees), 12)
+
+
+def test_cosine_lossguide_trains_on_a_replaced_column() raises:
+    """`score_function=cosine` is CatBoost's CPU default, so this is the guard
+    that would have tripped the defaults track.
+
+    Leaf-wise, so the scan really is `split.find_best_split` and the refusal at
+    stake really is the one being asked. Asked as a declaration it refused this
+    fit for holding a column no scan visits; asked as searchability it does not
+    fire, and the same fit with the CTR bundle off still refuses, which is what
+    keeps this a narrowing rather than a deletion.
+    """
+    var ex = ExtraTreeParams()
+    ex.score_function = SCORE_COSINE
+    var params = BoosterParams(
+        12, 0.2, TreeParams(15, 1, 1.0, 1e-3, extra=ex^, grow_policy=GROW_LEAFWISE)
+    )
+
+    var replaced = _catboost_dataset()
+    var booster = train(
+        replaced.data, replaced.label, BINARY_LOGISTIC, params
+    )
+    assert_equal(len(booster.trees), 12)
+
+    var cats: List[Int] = [1]
+    var searchable = Dataset.from_raw(
+        RawData.dense(_values(), _N_ROWS, 3),
+        label=_labels(),
+        categorical_features=cats^,
+        max_bin=_MAX_BIN,
+        ctr=SimpleCtrConfig.disabled(),
+    )
+    with assert_raises(contains="score_function=cosine"):
+        _ = train(
+            searchable.data, searchable.label, BINARY_LOGISTIC, params
+        )
+
+
+def test_extra_trees_and_monotone_ask_searchability_too() raises:
+    """The other two converted guards, on the same pair of datasets.
+
+    `extra_trees` is refused under the oblivious policy for its own reason, so
+    both arms here are leaf-wise. A monotone constraint on the CATEGORICAL
+    column is the case the monotone loop is about; it must refuse when the
+    column is searched and pass when the column is replaced, and a constraint
+    on a numeric column must be unaffected by either.
+    """
+    var ex = ExtraTreeParams()
+    ex.extra_trees = True
+    var draw_params = BoosterParams(
+        8, 0.2, TreeParams(15, 1, 1.0, 1e-3, extra=ex^, grow_policy=GROW_LEAFWISE)
+    )
+
+    var replaced = _catboost_dataset()
+    var drawn = train(
+        replaced.data, replaced.label, BINARY_LOGISTIC, draw_params
+    )
+    assert_equal(len(drawn.trees), 8)
+
+    var cats: List[Int] = [1]
+    var searchable = Dataset.from_raw(
+        RawData.dense(_values(), _N_ROWS, 3),
+        label=_labels(),
+        categorical_features=cats^,
+        max_bin=_MAX_BIN,
+        ctr=SimpleCtrConfig.disabled(),
+    )
+    with assert_raises(contains="extra_trees is implemented"):
+        _ = train(
+            searchable.data, searchable.label, BINARY_LOGISTIC, draw_params
+        )
+
+    # The monotone loop. The constraint is on feature 1, the categorical one,
+    # which is the only column it can be about. The vector is one entry per
+    # feature, so the two datasets need their own: the replaced one is wider
+    # by its CTR columns.
+    var mono_kept = train(
+        replaced.data,
+        replaced.label,
+        BINARY_LOGISTIC,
+        _monotone_on_feature_1(replaced.data.n_features),
+    )
+    assert_equal(len(mono_kept.trees), 8)
+    with assert_raises(contains="monotonic constraints"):
+        _ = train(
+            searchable.data,
+            searchable.label,
+            BINARY_LOGISTIC,
+            _monotone_on_feature_1(searchable.data.n_features),
+        )
 
 
 def test_ctr_extend_usable_replaces_and_accompanies() raises:
