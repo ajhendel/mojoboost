@@ -1,0 +1,2471 @@
+{
+  "artifact": "mojotrees real-data run summary",
+  "summary_version": 1,
+  "written_by": "bench/real_data/summarize.py",
+  "about": [
+    "One committed summary of one real-data differential run. The metrics, the digests, the parameters and the environment; not the predictions, not the timings, not a verdict.",
+    "Evidence that this run happened and what it produced. Not a reproduction: every number was measured once, on the machine and at the commit named in `environment`. Two summaries from two machines will differ in ways that are legitimate, and a diff between them is a question rather than an answer.",
+    "Timings are deliberately absent. results/README.md gives the reason: a timing on a laptop with a thermal budget is a fact about an afternoon, and report.py exists to show its distribution to a person who will then write the sentence. A committed number would travel without the distribution.",
+    "Fields carry a `provenance`: `measured` is copied from a record as the harness wrote it, `derived` is arithmetic over measured values with no new observation, and a value the run did not record appears as null with an `unavailable_reason` rather than being omitted or estimated.",
+    "Regenerate with `python bench/real_data/summarize.py results/<run_id>`. The output is a pure function of the run directory, so regenerating a committed summary from the same run rewrites the same bytes."
+  ],
+  "run": {
+    "run_id": "20260815T023123Z",
+    "directory": "20260815T023123Z",
+    "created_utc": "2026-08-15T02:31:23Z",
+    "arguments": {
+      "scenario": [
+        "categorical_missing",
+        "dense_regression",
+        "imbalanced_binary",
+        "multiclass",
+        "ranking",
+        "sparse_highdim"
+      ],
+      "tier": "standard",
+      "variant": "auto",
+      "engine": [
+        "mojoboost",
+        "lightgbm"
+      ],
+      "device": [
+        "cpu",
+        "gpu"
+      ],
+      "threads": [
+        10
+      ],
+      "repeats": 3,
+      "predict_repeats": 3,
+      "timeout": 7200,
+      "out": "/Users/andrewhendel/CascadeProjects/mojoboost/bench/real_data/results",
+      "tag": "",
+      "allow_unpinned": false,
+      "no_data_digest": false,
+      "dry_run": false
+    },
+    "completeness": {
+      "state": "complete",
+      "reason": "45 records, all ok, 0 declared skips",
+      "counts": {
+        "ok": 45,
+        "error": 0,
+        "timeout": 0,
+        "skipped": 0,
+        "other": 0
+      }
+    },
+    "record_schema_version": 1,
+    "thresholds_version": 1
+  },
+  "engines": {
+    "project": "mojoboost",
+    "reference": "lightgbm",
+    "naming_note": "this project's engine is named `mojotrees` today. Runs taken before the 2026-08-15 rename carry `mojoboost` in every record and in every key derived from one. The summarizer reports the name the run used and never rewrites it"
+  },
+  "environment": {
+    "run": {
+      "collected_at_utc": "2026-08-15T02:31:23Z",
+      "hostname": "Mac",
+      "platform": "macOS-26.5.2-arm64-arm-64bit-Mach-O",
+      "cpu": {
+        "arch": "arm64",
+        "system": "Darwin",
+        "release": "25.5.0",
+        "model": "Apple M4",
+        "physical_cores": 10,
+        "logical_cores": 10,
+        "memory_bytes": 17179869184,
+        "performance_cores": 4,
+        "efficiency_cores": 6
+      },
+      "versions": {
+        "python": "3.14.6",
+        "numpy": "2.5.2",
+        "scipy": "1.18.0",
+        "lightgbm": "4.7.0",
+        "mojo": "Mojo 1.0.0 (ed45d567)",
+        "max": null
+      },
+      "git": {
+        "commit": "44edb08165507505ace6617f0dc6039a9ca95852",
+        "branch": "main",
+        "dirty": false,
+        "describe": "v0.1.0.dev1-18-g44edb08"
+      },
+      "accelerator": {
+        "gpu_available": null,
+        "probe_error": "ModuleNotFoundError: No module named 'mojoboost'",
+        "backend": "metal"
+      },
+      "machine_state": {
+        "load_average_1m": 2.41748046875,
+        "on_battery": false,
+        "thermal_pressure": "Note: No CPU power status has been recorded"
+      },
+      "env": {
+        "MOJOBOOST_NUM_WORKERS": null,
+        "MOJOBOOST_PARALLEL_MIN_OPS": null,
+        "MOJOBOOST_DISABLE_GPU": null,
+        "MOJOBOOST_BENCH_DATA": null,
+        "OMP_NUM_THREADS": null,
+        "OPENBLAS_NUM_THREADS": null,
+        "MKL_NUM_THREADS": null,
+        "VECLIB_MAXIMUM_THREADS": null,
+        "NUMEXPR_NUM_THREADS": null
+      },
+      "argv": [
+        "bench/real_data/run.py",
+        "--tier",
+        "standard",
+        "--device",
+        "cpu",
+        "--device",
+        "gpu"
+      ]
+    },
+    "comparable_keys_across_records": [
+      {
+        "hostname": "Mac",
+        "arch": "arm64",
+        "cpu_model": "Apple M4",
+        "mojo": "Mojo 1.0.0 (ed45d567)",
+        "lightgbm": "4.7.0",
+        "git_commit": "44edb08165507505ace6617f0dc6039a9ca95852"
+      }
+    ],
+    "single_environment": true,
+    "provenance": "measured"
+  },
+  "datasets": {
+    "adult": {
+      "data_kind": "real",
+      "pinned": true,
+      "pin_reason": null,
+      "fallback_reason": null,
+      "split": {
+        "kind": "files",
+        "train_member": "adult.data",
+        "test_member": "adult.test",
+        "note": "The split the dataset ships with, 32561 train and 16281 test. The first line of adult.test is a comment and its labels carry a trailing period."
+      },
+      "source": {
+        "url": "https://archive.ics.uci.edu/static/public/2/adult.zip",
+        "version": "UCI ML Repository id 2, static export endpoint",
+        "license": "See the UCI page for id 2. Extracted from the 1994 US Census bureau database.",
+        "citation": "Becker, B., Kohavi, R. Adult. UCI Machine Learning Repository, 1996."
+      },
+      "categorical_feature": [
+        1,
+        3,
+        5,
+        6,
+        7,
+        8,
+        9,
+        13
+      ],
+      "category_vocab_sha256": "b25129e6fcc1637d66ecc3a95024c48fbb3c12a8691a8e5e4f4d69c204156720",
+      "positive_rate": 0.23928176569346055
+    },
+    "year_prediction_msd": {
+      "data_kind": "real",
+      "pinned": true,
+      "pin_reason": null,
+      "fallback_reason": null,
+      "split": {
+        "kind": "prefix",
+        "train_rows": 463715,
+        "note": "The split the dataset ships with. The last 51630 rows are held out so that no song by an artist in the test set appears in training."
+      },
+      "source": {
+        "url": "https://archive.ics.uci.edu/static/public/203/yearpredictionmsd.zip",
+        "version": "UCI ML Repository id 203, static export endpoint",
+        "license": "See the UCI page for id 203. Derived from the Million Song Dataset (Bertin-Mahieux et al., 2011).",
+        "citation": "Bertin-Mahieux, T., Ellis, D., Whitman, B., Lamere, P. The Million Song Dataset. ISMIR 2011."
+      }
+    },
+    "bank_marketing": {
+      "data_kind": "real",
+      "pinned": true,
+      "pin_reason": null,
+      "fallback_reason": null,
+      "split": {
+        "kind": "hash",
+        "train_fraction": 0.8,
+        "seed": 190001
+      },
+      "source": {
+        "url": "https://archive.ics.uci.edu/static/public/222/bank+marketing.zip",
+        "version": "UCI ML Repository id 222, static export endpoint",
+        "license": "See the UCI page for id 222.",
+        "citation": "Moro, S., Rita, P., Cortez, P. Bank Marketing. UCI Machine Learning Repository, 2014."
+      },
+      "categorical_feature": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        14
+      ],
+      "category_vocab_sha256": "a8e6adcb385f4e87d5ae937a500713df97e6b7f714b85aa23b38843e93cc1c7f",
+      "positive_rate": 0.11265417111780131
+    },
+    "covertype": {
+      "data_kind": "real",
+      "pinned": true,
+      "pin_reason": null,
+      "fallback_reason": null,
+      "split": {
+        "kind": "hash",
+        "train_fraction": 0.8,
+        "seed": 190002
+      },
+      "source": {
+        "url": "https://archive.ics.uci.edu/static/public/31/covertype.zip",
+        "version": "UCI ML Repository id 31, static export endpoint",
+        "license": "See the UCI page for id 31. Copyright Jock A. Blackard and Colorado State University.",
+        "citation": "Blackard, J. Covertype. UCI Machine Learning Repository, 1998."
+      }
+    },
+    "generated:ranking": {
+      "data_kind": "synthetic",
+      "pinned": true,
+      "pin_reason": null,
+      "fallback_reason": "mslr_web10k has no entry in checksums.lock.json; run `python bench/real_data/fetch.py --pin mslr_web10k` once and commit the lock",
+      "split": {
+        "kind": "hash",
+        "train_fraction": 0.8,
+        "seed": 1900
+      },
+      "source": null,
+      "generator": "ranking",
+      "generator_kwargs": {
+        "n_queries": 20000,
+        "n_features": 30
+      }
+    },
+    "rcv1_train_binary": {
+      "data_kind": "real",
+      "pinned": true,
+      "pin_reason": null,
+      "fallback_reason": null,
+      "split": {
+        "kind": "hash",
+        "train_fraction": 0.8,
+        "seed": 190003
+      },
+      "source": {
+        "url": "https://www.csie.ntu.edu.tw/~cjlin/libsvmtools/datasets/binary/rcv1_train.binary.bz2",
+        "version": "LIBSVM dataset page, binary section, rcv1_train.binary",
+        "license": "Derived from Reuters Corpus Volume 1. See the LIBSVM dataset page and the RCV1 terms.",
+        "citation": "Lewis, D., Yang, Y., Rose, T., Li, F. RCV1: A New Benchmark Collection for Text Categorization Research. JMLR 5, 2004."
+      },
+      "positive_rate": 0.5182788262029444
+    }
+  },
+  "differential": [
+    {
+      "scenario": "categorical_missing",
+      "threads": 10,
+      "device": "cpu",
+      "dataset": "adult",
+      "data_kind": "real",
+      "primary_metric": "auc",
+      "metrics": [
+        {
+          "metric": "auc",
+          "role": "primary",
+          "value": {
+            "mojoboost": 0.9278989486881446,
+            "lightgbm": 0.9274033293458799
+          },
+          "relative_difference": 0.000534416177494523,
+          "provenance": "derived",
+          "gate": {
+            "kind": "absolute",
+            "worse_by": -0.0004956193422647193,
+            "max_worse": 0.01,
+            "within_limit": true,
+            "provenance": "derived"
+          }
+        },
+        {
+          "metric": "average_precision",
+          "role": "scored_not_gated",
+          "value": {
+            "mojoboost": 0.8264354497929378,
+            "lightgbm": 0.8252197140958074
+          },
+          "relative_difference": 0.001473226676925048,
+          "provenance": "derived"
+        },
+        {
+          "metric": "logloss",
+          "role": "scored_not_gated",
+          "value": {
+            "mojoboost": 0.27578805593211253,
+            "lightgbm": 0.2768092179965719
+          },
+          "relative_difference": 0.003689046455353207,
+          "provenance": "derived"
+        }
+      ]
+    },
+    {
+      "scenario": "dense_regression",
+      "threads": 10,
+      "device": "cpu",
+      "dataset": "year_prediction_msd",
+      "data_kind": "real",
+      "primary_metric": "rmse",
+      "metrics": [
+        {
+          "metric": "mae",
+          "role": "secondary_gated",
+          "value": {
+            "mojoboost": 6.376742893231031,
+            "lightgbm": 6.373556521277784
+          },
+          "relative_difference": 0.0004999362510725056,
+          "provenance": "derived",
+          "gate": {
+            "kind": "relative",
+            "worse_by": 0.0004999362510725056,
+            "max_worse": 0.05,
+            "within_limit": true,
+            "provenance": "derived"
+          }
+        },
+        {
+          "metric": "r2",
+          "role": "scored_not_gated",
+          "value": {
+            "mojoboost": 0.2964342867059666,
+            "lightgbm": 0.29715430009531574
+          },
+          "relative_difference": 0.002423028672706991,
+          "provenance": "derived"
+        },
+        {
+          "metric": "rmse",
+          "role": "primary",
+          "value": {
+            "mojoboost": 9.102454350360757,
+            "lightgbm": 9.097795534191446
+          },
+          "relative_difference": 0.0005120818721196836,
+          "provenance": "derived",
+          "gate": {
+            "kind": "relative",
+            "worse_by": 0.0005120818721196836,
+            "max_worse": 0.03,
+            "within_limit": true,
+            "provenance": "derived",
+            "implausible_better": 0.1,
+            "implausibly_better": false
+          }
+        }
+      ]
+    },
+    {
+      "scenario": "imbalanced_binary",
+      "threads": 10,
+      "device": "cpu",
+      "dataset": "bank_marketing",
+      "data_kind": "real",
+      "primary_metric": "average_precision",
+      "metrics": [
+        {
+          "metric": "auc",
+          "role": "secondary_gated",
+          "value": {
+            "mojoboost": 0.9505271656630406,
+            "lightgbm": 0.950983254906656
+          },
+          "relative_difference": 0.0004795975547015978,
+          "provenance": "derived",
+          "gate": {
+            "kind": "absolute",
+            "worse_by": 0.0004560892436153985,
+            "max_worse": 0.005,
+            "within_limit": true,
+            "provenance": "derived"
+          }
+        },
+        {
+          "metric": "average_precision",
+          "role": "primary",
+          "value": {
+            "mojoboost": 0.679223545635618,
+            "lightgbm": 0.6813928102081009
+          },
+          "relative_difference": 0.0031835742026987248,
+          "provenance": "derived",
+          "gate": {
+            "kind": "absolute",
+            "worse_by": 0.0021692645724828985,
+            "max_worse": 0.02,
+            "within_limit": true,
+            "provenance": "derived",
+            "implausible_better": 0.05,
+            "implausibly_better": false
+          }
+        },
+        {
+          "metric": "logloss",
+          "role": "secondary_gated",
+          "value": {
+            "mojoboost": 0.16881242516861503,
+            "lightgbm": 0.16799240774287125
+          },
+          "relative_difference": 0.004881276700307173,
+          "provenance": "derived",
+          "gate": {
+            "kind": "relative",
+            "worse_by": 0.004881276700307173,
+            "max_worse": 0.03,
+            "within_limit": true,
+            "provenance": "derived"
+          }
+        }
+      ]
+    },
+    {
+      "scenario": "multiclass",
+      "threads": 10,
+      "device": "cpu",
+      "dataset": "covertype",
+      "data_kind": "real",
+      "primary_metric": "multi_logloss",
+      "metrics": [
+        {
+          "metric": "accuracy",
+          "role": "secondary_gated",
+          "value": {
+            "mojoboost": 0.8556620194047598,
+            "lightgbm": 0.8572302548813483
+          },
+          "relative_difference": 0.0018294215208322626,
+          "provenance": "derived",
+          "gate": {
+            "kind": "absolute",
+            "worse_by": 0.0015682354765884643,
+            "max_worse": 0.01,
+            "within_limit": true,
+            "provenance": "derived"
+          }
+        },
+        {
+          "metric": "multi_logloss",
+          "role": "primary",
+          "value": {
+            "mojoboost": 0.3562343261121841,
+            "lightgbm": 0.35608894884338094
+          },
+          "relative_difference": 0.0004082611080050394,
+          "provenance": "derived",
+          "gate": {
+            "kind": "relative",
+            "worse_by": 0.0004082611080050394,
+            "max_worse": 0.05,
+            "within_limit": true,
+            "provenance": "derived",
+            "implausible_better": 0.15,
+            "implausibly_better": false
+          }
+        }
+      ]
+    },
+    {
+      "scenario": "ranking",
+      "threads": 10,
+      "device": "cpu",
+      "dataset": "generated:ranking",
+      "data_kind": "synthetic",
+      "primary_metric": "ndcg@10",
+      "metrics": [
+        {
+          "metric": "ndcg@1",
+          "role": "scored_not_gated",
+          "value": {
+            "mojoboost": 0.9922150750453576,
+            "lightgbm": 0.992281048985651
+          },
+          "relative_difference": 6.64871513578102e-05,
+          "provenance": "derived"
+        },
+        {
+          "metric": "ndcg@10",
+          "role": "primary",
+          "value": {
+            "mojoboost": 0.991240397824286,
+            "lightgbm": 0.991400099520406
+          },
+          "relative_difference": 0.00016108702853395257,
+          "provenance": "derived",
+          "gate": {
+            "kind": "absolute",
+            "worse_by": 0.00015970169612000706,
+            "max_worse": 0.02,
+            "within_limit": true,
+            "provenance": "derived",
+            "implausible_better": 0.05,
+            "implausibly_better": false
+          }
+        },
+        {
+          "metric": "ndcg@5",
+          "role": "secondary_gated",
+          "value": {
+            "mojoboost": 0.9822516160428566,
+            "lightgbm": 0.9824310546916056
+          },
+          "relative_difference": 0.00018264757398712134,
+          "provenance": "derived",
+          "gate": {
+            "kind": "absolute",
+            "worse_by": 0.0001794386487490307,
+            "max_worse": 0.025,
+            "within_limit": true,
+            "provenance": "derived"
+          }
+        }
+      ]
+    },
+    {
+      "scenario": "sparse_highdim",
+      "threads": 10,
+      "device": "cpu",
+      "dataset": "rcv1_train_binary",
+      "data_kind": "real",
+      "primary_metric": "auc",
+      "metrics": [
+        {
+          "metric": "auc",
+          "role": "primary",
+          "value": {
+            "mojoboost": 0.9938269473029319,
+            "lightgbm": 0.9938326229514531
+          },
+          "relative_difference": 5.710869607419041e-06,
+          "provenance": "derived",
+          "gate": {
+            "kind": "absolute",
+            "worse_by": 5.675648521275001e-06,
+            "max_worse": 0.01,
+            "within_limit": true,
+            "provenance": "derived",
+            "implausible_better": 0.03,
+            "implausibly_better": false
+          }
+        },
+        {
+          "metric": "average_precision",
+          "role": "secondary_gated",
+          "value": {
+            "mojoboost": 0.9937154735313559,
+            "lightgbm": 0.9936839847537665
+          },
+          "relative_difference": 3.1688925324894506e-05,
+          "provenance": "derived",
+          "gate": {
+            "kind": "absolute",
+            "worse_by": -3.1488777589405714e-05,
+            "max_worse": 0.03,
+            "within_limit": true,
+            "provenance": "derived"
+          }
+        },
+        {
+          "metric": "logloss",
+          "role": "scored_not_gated",
+          "value": {
+            "mojoboost": 0.10078849428531887,
+            "lightgbm": 0.10029337276975105
+          },
+          "relative_difference": 0.004936732127899448,
+          "provenance": "derived"
+        }
+      ]
+    }
+  ],
+  "device_agreement": [
+    {
+      "scenario": "dense_regression",
+      "threads": 10,
+      "device": "gpu",
+      "primary_metric": "rmse",
+      "value": {
+        "gpu": 9.102108215917088,
+        "cpu": 9.102454350360757
+      },
+      "relative_difference": 3.802649596977386e-05,
+      "predictions_sha256": {
+        "gpu": "7cda701d0c717c6d908bb24d86a56d9f3bed3104002a143120c84fd2a28f5b65",
+        "cpu": "fb600c0b9ffb8ae1ae13d8a58ac387d1bf90d98051e2dd64b0fe96e5dcdb82dc",
+        "identical": false
+      },
+      "row_level_agreement": {
+        "value": null,
+        "unavailable_reason": "max |device - cpu| over the rows needs both prediction vectors, which are not committed. verify.py computes it on the machine that holds them"
+      },
+      "provenance": "derived"
+    },
+    {
+      "scenario": "imbalanced_binary",
+      "threads": 10,
+      "device": "gpu",
+      "primary_metric": "average_precision",
+      "value": {
+        "gpu": 0.6792220203858419,
+        "cpu": 0.679223545635618
+      },
+      "relative_difference": 2.2455784784655854e-06,
+      "predictions_sha256": {
+        "gpu": "53ca199a051012503368ed9c3f32b6aef4aaf2f5b280638f71edfd1fe3f18429",
+        "cpu": "911d3e000f90d8c827f9defda990e75a35e88c74240696d12a64e1b0b784b171",
+        "identical": false
+      },
+      "row_level_agreement": {
+        "value": null,
+        "unavailable_reason": "max |device - cpu| over the rows needs both prediction vectors, which are not committed. verify.py computes it on the machine that holds them"
+      },
+      "provenance": "derived"
+    },
+    {
+      "scenario": "multiclass",
+      "threads": 10,
+      "device": "gpu",
+      "primary_metric": "multi_logloss",
+      "value": {
+        "gpu": 0.3562343261121841,
+        "cpu": 0.3562343261121841
+      },
+      "relative_difference": 0.0,
+      "predictions_sha256": {
+        "gpu": "2d80c1b3e9c8e126879918fad64d252d2bf1cdedfaea5351d368b1dc7383c5cb",
+        "cpu": "2d80c1b3e9c8e126879918fad64d252d2bf1cdedfaea5351d368b1dc7383c5cb",
+        "identical": true
+      },
+      "row_level_agreement": {
+        "value": null,
+        "unavailable_reason": "max |device - cpu| over the rows needs both prediction vectors, which are not committed. verify.py computes it on the machine that holds them"
+      },
+      "provenance": "derived"
+    }
+  ],
+  "cells": [
+    {
+      "scenario": "categorical_missing",
+      "scenario_title": "Categorical and missing data",
+      "task": "binary",
+      "tier": "standard",
+      "engine": "lightgbm",
+      "engine_version": "4.7.0",
+      "device_requested": "cpu",
+      "device_used": "cpu",
+      "threads": 10,
+      "path": "dataset",
+      "repeats": 3,
+      "primary_metric": "auc",
+      "quality": {
+        "auc": 0.9274033293458799,
+        "average_precision": 0.8252197140958074,
+        "logloss": 0.2768092179965719
+      },
+      "baseline_quality": {
+        "auc": 0.5,
+        "average_precision": 0.2369857156200305,
+        "logloss": 0.5467485574653357
+      },
+      "quality_identical_across_repeats": true,
+      "predictions": {
+        "sha256_distinct": [
+          "2982959585cf010d0dda99c1cbbc79f0459de0eadf62430781e9b6b09ef74702"
+        ],
+        "shape": [
+          16281
+        ],
+        "provenance": "measured"
+      },
+      "backend_proof": {
+        "value": null,
+        "unavailable_reason": "no backend_proof field on any record in this cell",
+        "see": "notes.backend_proof_absent",
+        "provenance": "unavailable"
+      },
+      "histogram_builder": null,
+      "params": {
+        "shared": {
+          "num_leaves": 31,
+          "max_depth": -1,
+          "learning_rate": 0.1,
+          "n_estimators": 100,
+          "min_data_in_leaf": 20,
+          "min_child_hess": 0.001,
+          "lambda_l1": 0.0,
+          "lambda_l2": 1.0,
+          "max_bin": 255,
+          "use_missing": true,
+          "max_cat_to_onehot": 4,
+          "max_cat_threshold": 32,
+          "cat_smooth": 10.0,
+          "cat_l2": 10.0,
+          "min_data_per_group": 100,
+          "objective": "binary"
+        },
+        "engine": {
+          "objective": "binary",
+          "num_leaves": 31,
+          "max_depth": -1,
+          "learning_rate": 0.1,
+          "min_data_in_leaf": 20,
+          "min_sum_hessian_in_leaf": 0.001,
+          "lambda_l1": 0.0,
+          "lambda_l2": 1.0,
+          "max_bin": 255,
+          "use_missing": true,
+          "num_threads": 10,
+          "enable_bundle": false,
+          "feature_pre_filter": false,
+          "zero_as_missing": false,
+          "force_row_wise": true,
+          "deterministic": true,
+          "verbosity": -1,
+          "seed": 190019,
+          "min_gain_to_split": 0.0,
+          "min_data_in_bin": 3,
+          "boost_from_average": true,
+          "max_cat_to_onehot": 4,
+          "max_cat_threshold": 32,
+          "cat_smooth": 10.0,
+          "cat_l2": 10.0,
+          "min_data_per_group": 100
+        },
+        "dataset": null,
+        "dataset_unavailable_reason": null,
+        "num_boost_round": null,
+        "identical_across_repeats": true,
+        "provenance": "measured",
+        "engine_dict_source": "translated, not captured from the adapter",
+        "see": "notes.params_predate_adapter_capture"
+      },
+      "data": {
+        "dataset": "adult",
+        "train": {
+          "rows": 32561,
+          "features": 14,
+          "sparse": false,
+          "digest": "fdd9a64f8ffb55fd880be8ec9833ccc2b3d3fa1f02566466c7c9c585e4d9c32a",
+          "missing_fraction": 0.009349484703435749,
+          "label_mean": 0.2408095574460244,
+          "label_distinct": 2
+        },
+        "test": {
+          "rows": 16281,
+          "features": 14,
+          "sparse": false,
+          "digest": "1974f8bc25445c82dc5197ad8039107e55d81157f84db93a32f526c1376e6798",
+          "missing_fraction": 0.009665078487632385
+        },
+        "provenance": "measured"
+      },
+      "model": {
+        "num_trees": 100,
+        "num_bin": null,
+        "serialized_bytes": 342229,
+        "serialized_sha256": "17b3c22e85290acc75a00ba6e25ab81ecb0980d919619f037de031744875aa7e",
+        "provenance": "measured",
+        "bins": {
+          "value": null,
+          "unavailable_reason": "this run recorded no per-feature bin counts, so the two binnings cannot be compared from this file"
+        }
+      },
+      "peak_rss_bytes": 137789440
+    },
+    {
+      "scenario": "categorical_missing",
+      "scenario_title": "Categorical and missing data",
+      "task": "binary",
+      "tier": "standard",
+      "engine": "mojoboost",
+      "engine_version": "0.1.0",
+      "device_requested": "cpu",
+      "device_used": "cpu",
+      "threads": 10,
+      "path": "dataset",
+      "repeats": 3,
+      "primary_metric": "auc",
+      "quality": {
+        "auc": 0.9278989486881446,
+        "average_precision": 0.8264354497929378,
+        "logloss": 0.27578805593211253
+      },
+      "baseline_quality": {
+        "auc": 0.5,
+        "average_precision": 0.2369857156200305,
+        "logloss": 0.5467485574653357
+      },
+      "quality_identical_across_repeats": true,
+      "predictions": {
+        "sha256_distinct": [
+          "ff4d9ce5f60a0638797ba0f38601a849f14dce3d88c91e897f4c9f084300bbf1"
+        ],
+        "shape": [
+          16281
+        ],
+        "provenance": "measured"
+      },
+      "backend_proof": {
+        "value": null,
+        "unavailable_reason": "no backend_proof field on any record in this cell",
+        "see": "notes.backend_proof_absent",
+        "provenance": "unavailable"
+      },
+      "histogram_builder": null,
+      "params": {
+        "shared": {
+          "num_leaves": 31,
+          "max_depth": -1,
+          "learning_rate": 0.1,
+          "n_estimators": 100,
+          "min_data_in_leaf": 20,
+          "min_child_hess": 0.001,
+          "lambda_l1": 0.0,
+          "lambda_l2": 1.0,
+          "max_bin": 255,
+          "use_missing": true,
+          "max_cat_to_onehot": 4,
+          "max_cat_threshold": 32,
+          "cat_smooth": 10.0,
+          "cat_l2": 10.0,
+          "min_data_per_group": 100,
+          "objective": "binary"
+        },
+        "engine": {
+          "objective": "binary",
+          "num_leaves": 31,
+          "max_depth": -1,
+          "learning_rate": 0.1,
+          "min_data_in_leaf": 20,
+          "min_child_hess": 0.001,
+          "lambda_l1": 0.0,
+          "lambda_l2": 1.0,
+          "device": "cpu",
+          "max_cat_to_onehot": 4,
+          "max_cat_threshold": 32,
+          "cat_smooth": 10.0,
+          "cat_l2": 10.0,
+          "min_data_per_group": 100
+        },
+        "dataset": null,
+        "dataset_unavailable_reason": null,
+        "num_boost_round": null,
+        "identical_across_repeats": true,
+        "provenance": "measured",
+        "engine_dict_source": "translated, not captured from the adapter",
+        "see": "notes.params_predate_adapter_capture"
+      },
+      "data": {
+        "dataset": "adult",
+        "train": {
+          "rows": 32561,
+          "features": 14,
+          "sparse": false,
+          "digest": "fdd9a64f8ffb55fd880be8ec9833ccc2b3d3fa1f02566466c7c9c585e4d9c32a",
+          "missing_fraction": 0.009349484703435749,
+          "label_mean": 0.2408095574460244,
+          "label_distinct": 2
+        },
+        "test": {
+          "rows": 16281,
+          "features": 14,
+          "sparse": false,
+          "digest": "1974f8bc25445c82dc5197ad8039107e55d81157f84db93a32f526c1376e6798",
+          "missing_fraction": 0.009665078487632385
+        },
+        "provenance": "measured"
+      },
+      "model": {
+        "num_trees": 100,
+        "num_bin": 255,
+        "serialized_bytes": 458138,
+        "serialized_sha256": "1484a42f7ba49e5cf786e37fd5529cf0d623458d1b494733add3f00b2e7d9c9c",
+        "provenance": "measured",
+        "bins": {
+          "value": null,
+          "unavailable_reason": "this run recorded no per-feature bin counts, so the two binnings cannot be compared from this file"
+        }
+      },
+      "peak_rss_bytes": 142589952
+    },
+    {
+      "scenario": "dense_regression",
+      "scenario_title": "Dense regression",
+      "task": "regression",
+      "tier": "standard",
+      "engine": "lightgbm",
+      "engine_version": "4.7.0",
+      "device_requested": "cpu",
+      "device_used": "cpu",
+      "threads": 10,
+      "path": "dataset",
+      "repeats": 3,
+      "primary_metric": "rmse",
+      "quality": {
+        "mae": 6.373556521277784,
+        "r2": 0.29715430009531574,
+        "rmse": 9.097795534191446
+      },
+      "baseline_quality": {
+        "mae": 8.11306989197752,
+        "r2": -0.00010212000896148155,
+        "rmse": 10.852463905136338
+      },
+      "quality_identical_across_repeats": true,
+      "predictions": {
+        "sha256_distinct": [
+          "f1d734ae0d1a48b5184b4c4d61126f63491032faa4dc20f5d994d8e3766018aa"
+        ],
+        "shape": [
+          51630
+        ],
+        "provenance": "measured"
+      },
+      "backend_proof": {
+        "value": null,
+        "unavailable_reason": "no backend_proof field on any record in this cell",
+        "see": "notes.backend_proof_absent",
+        "provenance": "unavailable"
+      },
+      "histogram_builder": null,
+      "params": {
+        "shared": {
+          "num_leaves": 31,
+          "max_depth": -1,
+          "learning_rate": 0.1,
+          "n_estimators": 100,
+          "min_data_in_leaf": 20,
+          "min_child_hess": 0.001,
+          "lambda_l1": 0.0,
+          "lambda_l2": 1.0,
+          "max_bin": 255,
+          "use_missing": true,
+          "objective": "regression"
+        },
+        "engine": {
+          "objective": "regression",
+          "num_leaves": 31,
+          "max_depth": -1,
+          "learning_rate": 0.1,
+          "min_data_in_leaf": 20,
+          "min_sum_hessian_in_leaf": 0.001,
+          "lambda_l1": 0.0,
+          "lambda_l2": 1.0,
+          "max_bin": 255,
+          "use_missing": true,
+          "num_threads": 10,
+          "enable_bundle": false,
+          "feature_pre_filter": false,
+          "zero_as_missing": false,
+          "force_row_wise": true,
+          "deterministic": true,
+          "verbosity": -1,
+          "seed": 190019,
+          "min_gain_to_split": 0.0,
+          "min_data_in_bin": 3,
+          "boost_from_average": true
+        },
+        "dataset": null,
+        "dataset_unavailable_reason": null,
+        "num_boost_round": null,
+        "identical_across_repeats": true,
+        "provenance": "measured",
+        "engine_dict_source": "translated, not captured from the adapter",
+        "see": "notes.params_predate_adapter_capture"
+      },
+      "data": {
+        "dataset": "year_prediction_msd",
+        "train": {
+          "rows": 463715,
+          "features": 90,
+          "sparse": false,
+          "digest": "abdc63912be59ab5482a70fe489631c882a97a33f63ee3aed007dc644c85418d",
+          "missing_fraction": 0.0,
+          "label_mean": 1998.3860949074324,
+          "label_distinct": 89
+        },
+        "test": {
+          "rows": 51630,
+          "features": 90,
+          "sparse": false,
+          "digest": "dce03bab121ad4eb979911017b5a516418156f2c1f7face4dad857446268daeb",
+          "missing_fraction": 0.0
+        },
+        "provenance": "measured"
+      },
+      "model": {
+        "num_trees": 100,
+        "num_bin": null,
+        "serialized_bytes": 310378,
+        "serialized_sha256": "6d34b82a9559cccb867e5792264810ef60532dbaca56ec685ff40463b7b0325f",
+        "provenance": "measured",
+        "bins": {
+          "value": null,
+          "unavailable_reason": "this run recorded no per-feature bin counts, so the two binnings cannot be compared from this file"
+        }
+      },
+      "peak_rss_bytes": 4814913536
+    },
+    {
+      "scenario": "dense_regression",
+      "scenario_title": "Dense regression",
+      "task": "regression",
+      "tier": "standard",
+      "engine": "mojoboost",
+      "engine_version": "0.1.0",
+      "device_requested": "cpu",
+      "device_used": "cpu",
+      "threads": 10,
+      "path": "dataset",
+      "repeats": 3,
+      "primary_metric": "rmse",
+      "quality": {
+        "mae": 6.376742893231031,
+        "r2": 0.2964342867059666,
+        "rmse": 9.102454350360757
+      },
+      "baseline_quality": {
+        "mae": 8.11306989197752,
+        "r2": -0.00010212000896148155,
+        "rmse": 10.852463905136338
+      },
+      "quality_identical_across_repeats": true,
+      "predictions": {
+        "sha256_distinct": [
+          "fb600c0b9ffb8ae1ae13d8a58ac387d1bf90d98051e2dd64b0fe96e5dcdb82dc"
+        ],
+        "shape": [
+          51630
+        ],
+        "provenance": "measured"
+      },
+      "backend_proof": {
+        "value": null,
+        "unavailable_reason": "no backend_proof field on any record in this cell",
+        "see": "notes.backend_proof_absent",
+        "provenance": "unavailable"
+      },
+      "histogram_builder": null,
+      "params": {
+        "shared": {
+          "num_leaves": 31,
+          "max_depth": -1,
+          "learning_rate": 0.1,
+          "n_estimators": 100,
+          "min_data_in_leaf": 20,
+          "min_child_hess": 0.001,
+          "lambda_l1": 0.0,
+          "lambda_l2": 1.0,
+          "max_bin": 255,
+          "use_missing": true,
+          "objective": "regression"
+        },
+        "engine": {
+          "objective": "regression",
+          "num_leaves": 31,
+          "max_depth": -1,
+          "learning_rate": 0.1,
+          "min_data_in_leaf": 20,
+          "min_child_hess": 0.001,
+          "lambda_l1": 0.0,
+          "lambda_l2": 1.0,
+          "device": "cpu"
+        },
+        "dataset": null,
+        "dataset_unavailable_reason": null,
+        "num_boost_round": null,
+        "identical_across_repeats": true,
+        "provenance": "measured",
+        "engine_dict_source": "translated, not captured from the adapter",
+        "see": "notes.params_predate_adapter_capture"
+      },
+      "data": {
+        "dataset": "year_prediction_msd",
+        "train": {
+          "rows": 463715,
+          "features": 90,
+          "sparse": false,
+          "digest": "abdc63912be59ab5482a70fe489631c882a97a33f63ee3aed007dc644c85418d",
+          "missing_fraction": 0.0,
+          "label_mean": 1998.3860949074324,
+          "label_distinct": 89
+        },
+        "test": {
+          "rows": 51630,
+          "features": 90,
+          "sparse": false,
+          "digest": "dce03bab121ad4eb979911017b5a516418156f2c1f7face4dad857446268daeb",
+          "missing_fraction": 0.0
+        },
+        "provenance": "measured"
+      },
+      "model": {
+        "num_trees": 100,
+        "num_bin": 255,
+        "serialized_bytes": 889382,
+        "serialized_sha256": "f6a1fd6abaef9f320cca847bed124e478fa5ea69e5ed9fa982458522888bee21",
+        "provenance": "measured",
+        "bins": {
+          "value": null,
+          "unavailable_reason": "this run recorded no per-feature bin counts, so the two binnings cannot be compared from this file"
+        }
+      },
+      "peak_rss_bytes": 4620730368
+    },
+    {
+      "scenario": "dense_regression",
+      "scenario_title": "Dense regression",
+      "task": "regression",
+      "tier": "standard",
+      "engine": "mojoboost",
+      "engine_version": "0.1.0",
+      "device_requested": "gpu",
+      "device_used": "gpu",
+      "threads": 10,
+      "path": "dataset",
+      "repeats": 3,
+      "primary_metric": "rmse",
+      "quality": {
+        "mae": 6.376664904843068,
+        "r2": 0.29648779396612257,
+        "rmse": 9.102108215917088
+      },
+      "baseline_quality": {
+        "mae": 8.11306989197752,
+        "r2": -0.00010212000896148155,
+        "rmse": 10.852463905136338
+      },
+      "quality_identical_across_repeats": true,
+      "predictions": {
+        "sha256_distinct": [
+          "7cda701d0c717c6d908bb24d86a56d9f3bed3104002a143120c84fd2a28f5b65"
+        ],
+        "shape": [
+          51630
+        ],
+        "provenance": "measured"
+      },
+      "backend_proof": {
+        "value": null,
+        "unavailable_reason": "no backend_proof field on any record in this cell",
+        "see": "notes.backend_proof_absent",
+        "provenance": "unavailable"
+      },
+      "histogram_builder": null,
+      "params": {
+        "shared": {
+          "num_leaves": 31,
+          "max_depth": -1,
+          "learning_rate": 0.1,
+          "n_estimators": 100,
+          "min_data_in_leaf": 20,
+          "min_child_hess": 0.001,
+          "lambda_l1": 0.0,
+          "lambda_l2": 1.0,
+          "max_bin": 255,
+          "use_missing": true,
+          "objective": "regression"
+        },
+        "engine": {
+          "objective": "regression",
+          "num_leaves": 31,
+          "max_depth": -1,
+          "learning_rate": 0.1,
+          "min_data_in_leaf": 20,
+          "min_child_hess": 0.001,
+          "lambda_l1": 0.0,
+          "lambda_l2": 1.0,
+          "device": "gpu"
+        },
+        "dataset": null,
+        "dataset_unavailable_reason": null,
+        "num_boost_round": null,
+        "identical_across_repeats": true,
+        "provenance": "measured",
+        "engine_dict_source": "translated, not captured from the adapter",
+        "see": "notes.params_predate_adapter_capture"
+      },
+      "data": {
+        "dataset": "year_prediction_msd",
+        "train": {
+          "rows": 463715,
+          "features": 90,
+          "sparse": false,
+          "digest": "abdc63912be59ab5482a70fe489631c882a97a33f63ee3aed007dc644c85418d",
+          "missing_fraction": 0.0,
+          "label_mean": 1998.3860949074324,
+          "label_distinct": 89
+        },
+        "test": {
+          "rows": 51630,
+          "features": 90,
+          "sparse": false,
+          "digest": "dce03bab121ad4eb979911017b5a516418156f2c1f7face4dad857446268daeb",
+          "missing_fraction": 0.0
+        },
+        "provenance": "measured"
+      },
+      "model": {
+        "num_trees": 100,
+        "num_bin": 255,
+        "serialized_bytes": 889381,
+        "serialized_sha256": "dbb6e89bce4734a4b075844273077f9a6d84e8954002e7bfe93fd78ff84ba365",
+        "provenance": "measured",
+        "bins": {
+          "value": null,
+          "unavailable_reason": "this run recorded no per-feature bin counts, so the two binnings cannot be compared from this file"
+        }
+      },
+      "peak_rss_bytes": 5307318272
+    },
+    {
+      "scenario": "imbalanced_binary",
+      "scenario_title": "Imbalanced binary classification",
+      "task": "binary",
+      "tier": "standard",
+      "engine": "lightgbm",
+      "engine_version": "4.7.0",
+      "device_requested": "cpu",
+      "device_used": "cpu",
+      "threads": 10,
+      "path": "dataset",
+      "repeats": 3,
+      "primary_metric": "average_precision",
+      "quality": {
+        "auc": 0.950983254906656,
+        "average_precision": 0.6813928102081009,
+        "logloss": 0.16799240774287125
+      },
+      "baseline_quality": {
+        "auc": 0.5,
+        "average_precision": 0.06654365798467574,
+        "logloss": 0.3479287477611854
+      },
+      "quality_identical_across_repeats": true,
+      "predictions": {
+        "sha256_distinct": [
+          "9fd50ffef3a9e98ba73c226d7607f6e95f5bb9efb91d46a1bbc085a2c6a641b6"
+        ],
+        "shape": [
+          8413
+        ],
+        "provenance": "measured"
+      },
+      "backend_proof": {
+        "value": null,
+        "unavailable_reason": "no backend_proof field on any record in this cell",
+        "see": "notes.backend_proof_absent",
+        "provenance": "unavailable"
+      },
+      "histogram_builder": null,
+      "params": {
+        "shared": {
+          "num_leaves": 31,
+          "max_depth": -1,
+          "learning_rate": 0.1,
+          "n_estimators": 100,
+          "min_data_in_leaf": 20,
+          "min_child_hess": 0.001,
+          "lambda_l1": 0.0,
+          "lambda_l2": 1.0,
+          "max_bin": 255,
+          "use_missing": true,
+          "objective": "binary"
+        },
+        "engine": {
+          "objective": "binary",
+          "num_leaves": 31,
+          "max_depth": -1,
+          "learning_rate": 0.1,
+          "min_data_in_leaf": 20,
+          "min_sum_hessian_in_leaf": 0.001,
+          "lambda_l1": 0.0,
+          "lambda_l2": 1.0,
+          "max_bin": 255,
+          "use_missing": true,
+          "num_threads": 10,
+          "enable_bundle": false,
+          "feature_pre_filter": false,
+          "zero_as_missing": false,
+          "force_row_wise": true,
+          "deterministic": true,
+          "verbosity": -1,
+          "seed": 190019,
+          "min_gain_to_split": 0.0,
+          "min_data_in_bin": 3,
+          "boost_from_average": true
+        },
+        "dataset": null,
+        "dataset_unavailable_reason": null,
+        "num_boost_round": null,
+        "identical_across_repeats": true,
+        "provenance": "measured",
+        "engine_dict_source": "translated, not captured from the adapter",
+        "see": "notes.params_predate_adapter_capture"
+      },
+      "data": {
+        "dataset": "bank_marketing",
+        "train": {
+          "rows": 32775,
+          "features": 20,
+          "sparse": false,
+          "digest": "99ea412c7099e7fa4c61b3523528d6840b5a55c22c3bbfbbe8c779cc4d84c63b",
+          "missing_fraction": 0.0,
+          "label_mean": 0.11316552250190694,
+          "label_distinct": 2
+        },
+        "test": {
+          "rows": 8413,
+          "features": 20,
+          "sparse": false,
+          "digest": "885754970756e436332a78a00d60109748ce4a2ddaa96e80b04d32c0089e8f39",
+          "missing_fraction": 0.0
+        },
+        "provenance": "measured"
+      },
+      "model": {
+        "num_trees": 100,
+        "num_bin": null,
+        "serialized_bytes": 341051,
+        "serialized_sha256": "9cf0df4043209d9a4a1b3ea13fb554bc3cf4e8ab5775d78490893330bc039858",
+        "provenance": "measured",
+        "bins": {
+          "value": null,
+          "unavailable_reason": "this run recorded no per-feature bin counts, so the two binnings cannot be compared from this file"
+        }
+      },
+      "peak_rss_bytes": 143409152
+    },
+    {
+      "scenario": "imbalanced_binary",
+      "scenario_title": "Imbalanced binary classification",
+      "task": "binary",
+      "tier": "standard",
+      "engine": "mojoboost",
+      "engine_version": "0.1.0",
+      "device_requested": "cpu",
+      "device_used": "cpu",
+      "threads": 10,
+      "path": "dataset",
+      "repeats": 3,
+      "primary_metric": "average_precision",
+      "quality": {
+        "auc": 0.9505271656630406,
+        "average_precision": 0.679223545635618,
+        "logloss": 0.16881242516861503
+      },
+      "baseline_quality": {
+        "auc": 0.5,
+        "average_precision": 0.06654365798467574,
+        "logloss": 0.3479287477611854
+      },
+      "quality_identical_across_repeats": true,
+      "predictions": {
+        "sha256_distinct": [
+          "911d3e000f90d8c827f9defda990e75a35e88c74240696d12a64e1b0b784b171"
+        ],
+        "shape": [
+          8413
+        ],
+        "provenance": "measured"
+      },
+      "backend_proof": {
+        "value": null,
+        "unavailable_reason": "no backend_proof field on any record in this cell",
+        "see": "notes.backend_proof_absent",
+        "provenance": "unavailable"
+      },
+      "histogram_builder": null,
+      "params": {
+        "shared": {
+          "num_leaves": 31,
+          "max_depth": -1,
+          "learning_rate": 0.1,
+          "n_estimators": 100,
+          "min_data_in_leaf": 20,
+          "min_child_hess": 0.001,
+          "lambda_l1": 0.0,
+          "lambda_l2": 1.0,
+          "max_bin": 255,
+          "use_missing": true,
+          "objective": "binary"
+        },
+        "engine": {
+          "objective": "binary",
+          "num_leaves": 31,
+          "max_depth": -1,
+          "learning_rate": 0.1,
+          "min_data_in_leaf": 20,
+          "min_child_hess": 0.001,
+          "lambda_l1": 0.0,
+          "lambda_l2": 1.0,
+          "device": "cpu"
+        },
+        "dataset": null,
+        "dataset_unavailable_reason": null,
+        "num_boost_round": null,
+        "identical_across_repeats": true,
+        "provenance": "measured",
+        "engine_dict_source": "translated, not captured from the adapter",
+        "see": "notes.params_predate_adapter_capture"
+      },
+      "data": {
+        "dataset": "bank_marketing",
+        "train": {
+          "rows": 32775,
+          "features": 20,
+          "sparse": false,
+          "digest": "99ea412c7099e7fa4c61b3523528d6840b5a55c22c3bbfbbe8c779cc4d84c63b",
+          "missing_fraction": 0.0,
+          "label_mean": 0.11316552250190694,
+          "label_distinct": 2
+        },
+        "test": {
+          "rows": 8413,
+          "features": 20,
+          "sparse": false,
+          "digest": "885754970756e436332a78a00d60109748ce4a2ddaa96e80b04d32c0089e8f39",
+          "missing_fraction": 0.0
+        },
+        "provenance": "measured"
+      },
+      "model": {
+        "num_trees": 100,
+        "num_bin": 255,
+        "serialized_bytes": 455761,
+        "serialized_sha256": "c38493e5fc594d4072b266f898671fd45bc9adee0691d6b4bca8f7035e7cb83a",
+        "provenance": "measured",
+        "bins": {
+          "value": null,
+          "unavailable_reason": "this run recorded no per-feature bin counts, so the two binnings cannot be compared from this file"
+        }
+      },
+      "peak_rss_bytes": 145178624
+    },
+    {
+      "scenario": "imbalanced_binary",
+      "scenario_title": "Imbalanced binary classification",
+      "task": "binary",
+      "tier": "standard",
+      "engine": "mojoboost",
+      "engine_version": "0.1.0",
+      "device_requested": "gpu",
+      "device_used": "gpu",
+      "threads": 10,
+      "path": "dataset",
+      "repeats": 3,
+      "primary_metric": "average_precision",
+      "quality": {
+        "auc": 0.9505260171852474,
+        "average_precision": 0.6792220203858419,
+        "logloss": 0.16881389595018226
+      },
+      "baseline_quality": {
+        "auc": 0.5,
+        "average_precision": 0.06654365798467574,
+        "logloss": 0.3479287477611854
+      },
+      "quality_identical_across_repeats": true,
+      "predictions": {
+        "sha256_distinct": [
+          "53ca199a051012503368ed9c3f32b6aef4aaf2f5b280638f71edfd1fe3f18429"
+        ],
+        "shape": [
+          8413
+        ],
+        "provenance": "measured"
+      },
+      "backend_proof": {
+        "value": null,
+        "unavailable_reason": "no backend_proof field on any record in this cell",
+        "see": "notes.backend_proof_absent",
+        "provenance": "unavailable"
+      },
+      "histogram_builder": null,
+      "params": {
+        "shared": {
+          "num_leaves": 31,
+          "max_depth": -1,
+          "learning_rate": 0.1,
+          "n_estimators": 100,
+          "min_data_in_leaf": 20,
+          "min_child_hess": 0.001,
+          "lambda_l1": 0.0,
+          "lambda_l2": 1.0,
+          "max_bin": 255,
+          "use_missing": true,
+          "objective": "binary"
+        },
+        "engine": {
+          "objective": "binary",
+          "num_leaves": 31,
+          "max_depth": -1,
+          "learning_rate": 0.1,
+          "min_data_in_leaf": 20,
+          "min_child_hess": 0.001,
+          "lambda_l1": 0.0,
+          "lambda_l2": 1.0,
+          "device": "gpu"
+        },
+        "dataset": null,
+        "dataset_unavailable_reason": null,
+        "num_boost_round": null,
+        "identical_across_repeats": true,
+        "provenance": "measured",
+        "engine_dict_source": "translated, not captured from the adapter",
+        "see": "notes.params_predate_adapter_capture"
+      },
+      "data": {
+        "dataset": "bank_marketing",
+        "train": {
+          "rows": 32775,
+          "features": 20,
+          "sparse": false,
+          "digest": "99ea412c7099e7fa4c61b3523528d6840b5a55c22c3bbfbbe8c779cc4d84c63b",
+          "missing_fraction": 0.0,
+          "label_mean": 0.11316552250190694,
+          "label_distinct": 2
+        },
+        "test": {
+          "rows": 8413,
+          "features": 20,
+          "sparse": false,
+          "digest": "885754970756e436332a78a00d60109748ce4a2ddaa96e80b04d32c0089e8f39",
+          "missing_fraction": 0.0
+        },
+        "provenance": "measured"
+      },
+      "model": {
+        "num_trees": 100,
+        "num_bin": 255,
+        "serialized_bytes": 455709,
+        "serialized_sha256": "9a6de85aa19a7c2bddfb59c13f456feb2c9670ba9a0365fcf033e82bcaf541e1",
+        "provenance": "measured",
+        "bins": {
+          "value": null,
+          "unavailable_reason": "this run recorded no per-feature bin counts, so the two binnings cannot be compared from this file"
+        }
+      },
+      "peak_rss_bytes": 148455424
+    },
+    {
+      "scenario": "multiclass",
+      "scenario_title": "Multiclass classification",
+      "task": "multiclass",
+      "tier": "standard",
+      "engine": "lightgbm",
+      "engine_version": "4.7.0",
+      "device_requested": "cpu",
+      "device_used": "cpu",
+      "threads": 10,
+      "path": "dataset",
+      "repeats": 3,
+      "primary_metric": "multi_logloss",
+      "quality": {
+        "accuracy": 0.8572302548813483,
+        "multi_logloss": 0.35608894884338094
+      },
+      "baseline_quality": {
+        "accuracy": 0.48525686318437966,
+        "multi_logloss": 1.2063500896348722
+      },
+      "quality_identical_across_repeats": true,
+      "predictions": {
+        "sha256_distinct": [
+          "330932eab0269fa913728eb73e7a0cb5e5eb8a8e8543ec7370ccddb4d8f45d6c"
+        ],
+        "shape": [
+          116054,
+          7
+        ],
+        "provenance": "measured"
+      },
+      "backend_proof": {
+        "value": null,
+        "unavailable_reason": "no backend_proof field on any record in this cell",
+        "see": "notes.backend_proof_absent",
+        "provenance": "unavailable"
+      },
+      "histogram_builder": null,
+      "params": {
+        "shared": {
+          "num_leaves": 31,
+          "max_depth": -1,
+          "learning_rate": 0.1,
+          "n_estimators": 100,
+          "min_data_in_leaf": 20,
+          "min_child_hess": 0.001,
+          "lambda_l1": 0.0,
+          "lambda_l2": 1.0,
+          "max_bin": 255,
+          "use_missing": true,
+          "objective": "multiclass",
+          "num_class": 7
+        },
+        "engine": {
+          "objective": "multiclass",
+          "num_leaves": 31,
+          "max_depth": -1,
+          "learning_rate": 0.1,
+          "min_data_in_leaf": 20,
+          "min_sum_hessian_in_leaf": 0.001,
+          "lambda_l1": 0.0,
+          "lambda_l2": 1.0,
+          "max_bin": 255,
+          "use_missing": true,
+          "num_threads": 10,
+          "enable_bundle": false,
+          "feature_pre_filter": false,
+          "zero_as_missing": false,
+          "force_row_wise": true,
+          "deterministic": true,
+          "verbosity": -1,
+          "seed": 190019,
+          "min_gain_to_split": 0.0,
+          "min_data_in_bin": 3,
+          "boost_from_average": true,
+          "num_class": 7
+        },
+        "dataset": null,
+        "dataset_unavailable_reason": null,
+        "num_boost_round": null,
+        "identical_across_repeats": true,
+        "provenance": "measured",
+        "engine_dict_source": "translated, not captured from the adapter",
+        "see": "notes.params_predate_adapter_capture"
+      },
+      "data": {
+        "dataset": "covertype",
+        "train": {
+          "rows": 464958,
+          "features": 54,
+          "sparse": false,
+          "digest": "e0eede2d2d2f27389145c7919adaacbc71677d821f3e0c37fab7497c3c68c2ef",
+          "missing_fraction": 0.0,
+          "label_mean": 1.0512799005501572,
+          "label_distinct": 7
+        },
+        "test": {
+          "rows": 116054,
+          "features": 54,
+          "sparse": false,
+          "digest": "23dadeb2aa298e7b33bb6ea3b477f6e963c5930022b21f75ec789c62055f7b86",
+          "missing_fraction": 0.0
+        },
+        "provenance": "measured"
+      },
+      "model": {
+        "num_trees": 700,
+        "num_bin": null,
+        "serialized_bytes": 2430007,
+        "serialized_sha256": "5fa1891e57b2b0ef6092a3611286b9fa72e6da9cefb5e676f96e6e5797429ef1",
+        "provenance": "measured",
+        "bins": {
+          "value": null,
+          "unavailable_reason": "this run recorded no per-feature bin counts, so the two binnings cannot be compared from this file"
+        }
+      },
+      "peak_rss_bytes": 1873231872
+    },
+    {
+      "scenario": "multiclass",
+      "scenario_title": "Multiclass classification",
+      "task": "multiclass",
+      "tier": "standard",
+      "engine": "mojoboost",
+      "engine_version": "0.1.0",
+      "device_requested": "cpu",
+      "device_used": "cpu",
+      "threads": 10,
+      "path": "dataset",
+      "repeats": 3,
+      "primary_metric": "multi_logloss",
+      "quality": {
+        "accuracy": 0.8556620194047598,
+        "multi_logloss": 0.3562343261121841
+      },
+      "baseline_quality": {
+        "accuracy": 0.48525686318437966,
+        "multi_logloss": 1.2063500896348722
+      },
+      "quality_identical_across_repeats": true,
+      "predictions": {
+        "sha256_distinct": [
+          "2d80c1b3e9c8e126879918fad64d252d2bf1cdedfaea5351d368b1dc7383c5cb"
+        ],
+        "shape": [
+          116054,
+          7
+        ],
+        "provenance": "measured"
+      },
+      "backend_proof": {
+        "value": null,
+        "unavailable_reason": "no backend_proof field on any record in this cell",
+        "see": "notes.backend_proof_absent",
+        "provenance": "unavailable"
+      },
+      "histogram_builder": null,
+      "params": {
+        "shared": {
+          "num_leaves": 31,
+          "max_depth": -1,
+          "learning_rate": 0.1,
+          "n_estimators": 100,
+          "min_data_in_leaf": 20,
+          "min_child_hess": 0.001,
+          "lambda_l1": 0.0,
+          "lambda_l2": 1.0,
+          "max_bin": 255,
+          "use_missing": true,
+          "objective": "multiclass",
+          "num_class": 7
+        },
+        "engine": {
+          "objective": "multiclass",
+          "num_leaves": 31,
+          "max_depth": -1,
+          "learning_rate": 0.1,
+          "min_data_in_leaf": 20,
+          "min_child_hess": 0.001,
+          "lambda_l1": 0.0,
+          "lambda_l2": 1.0,
+          "device": "cpu",
+          "num_class": 7
+        },
+        "dataset": null,
+        "dataset_unavailable_reason": null,
+        "num_boost_round": null,
+        "identical_across_repeats": true,
+        "provenance": "measured",
+        "engine_dict_source": "translated, not captured from the adapter",
+        "see": "notes.params_predate_adapter_capture"
+      },
+      "data": {
+        "dataset": "covertype",
+        "train": {
+          "rows": 464958,
+          "features": 54,
+          "sparse": false,
+          "digest": "e0eede2d2d2f27389145c7919adaacbc71677d821f3e0c37fab7497c3c68c2ef",
+          "missing_fraction": 0.0,
+          "label_mean": 1.0512799005501572,
+          "label_distinct": 7
+        },
+        "test": {
+          "rows": 116054,
+          "features": 54,
+          "sparse": false,
+          "digest": "23dadeb2aa298e7b33bb6ea3b477f6e963c5930022b21f75ec789c62055f7b86",
+          "missing_fraction": 0.0
+        },
+        "provenance": "measured"
+      },
+      "model": {
+        "num_trees": 700,
+        "num_bin": 255,
+        "serialized_bytes": 2963080,
+        "serialized_sha256": "9aa4bb754477c5765309cad0be344eafa457c9949f10dc4f8eb75708f9551c96",
+        "provenance": "measured",
+        "bins": {
+          "value": null,
+          "unavailable_reason": "this run recorded no per-feature bin counts, so the two binnings cannot be compared from this file"
+        }
+      },
+      "peak_rss_bytes": 1887977472
+    },
+    {
+      "scenario": "multiclass",
+      "scenario_title": "Multiclass classification",
+      "task": "multiclass",
+      "tier": "standard",
+      "engine": "mojoboost",
+      "engine_version": "0.1.0",
+      "device_requested": "gpu",
+      "device_used": "gpu",
+      "threads": 10,
+      "path": "dataset",
+      "repeats": 3,
+      "primary_metric": "multi_logloss",
+      "quality": {
+        "accuracy": 0.8556620194047598,
+        "multi_logloss": 0.3562343261121841
+      },
+      "baseline_quality": {
+        "accuracy": 0.48525686318437966,
+        "multi_logloss": 1.2063500896348722
+      },
+      "quality_identical_across_repeats": true,
+      "predictions": {
+        "sha256_distinct": [
+          "2d80c1b3e9c8e126879918fad64d252d2bf1cdedfaea5351d368b1dc7383c5cb"
+        ],
+        "shape": [
+          116054,
+          7
+        ],
+        "provenance": "measured"
+      },
+      "backend_proof": {
+        "value": null,
+        "unavailable_reason": "no backend_proof field on any record in this cell",
+        "see": "notes.backend_proof_absent",
+        "provenance": "unavailable"
+      },
+      "histogram_builder": null,
+      "params": {
+        "shared": {
+          "num_leaves": 31,
+          "max_depth": -1,
+          "learning_rate": 0.1,
+          "n_estimators": 100,
+          "min_data_in_leaf": 20,
+          "min_child_hess": 0.001,
+          "lambda_l1": 0.0,
+          "lambda_l2": 1.0,
+          "max_bin": 255,
+          "use_missing": true,
+          "objective": "multiclass",
+          "num_class": 7
+        },
+        "engine": {
+          "objective": "multiclass",
+          "num_leaves": 31,
+          "max_depth": -1,
+          "learning_rate": 0.1,
+          "min_data_in_leaf": 20,
+          "min_child_hess": 0.001,
+          "lambda_l1": 0.0,
+          "lambda_l2": 1.0,
+          "device": "gpu",
+          "num_class": 7
+        },
+        "dataset": null,
+        "dataset_unavailable_reason": null,
+        "num_boost_round": null,
+        "identical_across_repeats": true,
+        "provenance": "measured",
+        "engine_dict_source": "translated, not captured from the adapter",
+        "see": "notes.params_predate_adapter_capture"
+      },
+      "data": {
+        "dataset": "covertype",
+        "train": {
+          "rows": 464958,
+          "features": 54,
+          "sparse": false,
+          "digest": "e0eede2d2d2f27389145c7919adaacbc71677d821f3e0c37fab7497c3c68c2ef",
+          "missing_fraction": 0.0,
+          "label_mean": 1.0512799005501572,
+          "label_distinct": 7
+        },
+        "test": {
+          "rows": 116054,
+          "features": 54,
+          "sparse": false,
+          "digest": "23dadeb2aa298e7b33bb6ea3b477f6e963c5930022b21f75ec789c62055f7b86",
+          "missing_fraction": 0.0
+        },
+        "provenance": "measured"
+      },
+      "model": {
+        "num_trees": 700,
+        "num_bin": 255,
+        "serialized_bytes": 2963080,
+        "serialized_sha256": "9aa4bb754477c5765309cad0be344eafa457c9949f10dc4f8eb75708f9551c96",
+        "provenance": "measured",
+        "bins": {
+          "value": null,
+          "unavailable_reason": "this run recorded no per-feature bin counts, so the two binnings cannot be compared from this file"
+        }
+      },
+      "peak_rss_bytes": 1883717632
+    },
+    {
+      "scenario": "ranking",
+      "scenario_title": "Ranking",
+      "task": "ranking",
+      "tier": "standard",
+      "engine": "lightgbm",
+      "engine_version": "4.7.0",
+      "device_requested": "cpu",
+      "device_used": "cpu",
+      "threads": 10,
+      "path": "dataset",
+      "repeats": 3,
+      "primary_metric": "ndcg@10",
+      "quality": {
+        "ndcg@1": 0.992281048985651,
+        "ndcg@10": 0.991400099520406,
+        "ndcg@5": 0.9824310546916056
+      },
+      "baseline_quality": {
+        "ndcg@1": 0.32421243608775574,
+        "ndcg@10": 0.4951358413015633,
+        "ndcg@5": 0.388696872496536
+      },
+      "quality_identical_across_repeats": true,
+      "predictions": {
+        "sha256_distinct": [
+          "5ab916135287807dfbf9cb8a1c0a7e8e473d9d12c1323ace05c43cd1a9af0796"
+        ],
+        "shape": [
+          91674
+        ],
+        "provenance": "measured"
+      },
+      "backend_proof": {
+        "value": null,
+        "unavailable_reason": "no backend_proof field on any record in this cell",
+        "see": "notes.backend_proof_absent",
+        "provenance": "unavailable"
+      },
+      "histogram_builder": null,
+      "params": {
+        "shared": {
+          "num_leaves": 31,
+          "max_depth": -1,
+          "learning_rate": 0.1,
+          "n_estimators": 100,
+          "min_data_in_leaf": 20,
+          "min_child_hess": 0.001,
+          "lambda_l1": 0.0,
+          "lambda_l2": 1.0,
+          "max_bin": 255,
+          "use_missing": true,
+          "lambdarank_truncation_level": 30,
+          "sigmoid": 1.0,
+          "lambdarank_norm": true,
+          "ndcg_eval_at": 10,
+          "objective": "lambdarank"
+        },
+        "engine": {
+          "objective": "lambdarank",
+          "num_leaves": 31,
+          "max_depth": -1,
+          "learning_rate": 0.1,
+          "min_data_in_leaf": 20,
+          "min_sum_hessian_in_leaf": 0.001,
+          "lambda_l1": 0.0,
+          "lambda_l2": 1.0,
+          "max_bin": 255,
+          "use_missing": true,
+          "num_threads": 10,
+          "enable_bundle": false,
+          "feature_pre_filter": false,
+          "zero_as_missing": false,
+          "force_row_wise": true,
+          "deterministic": true,
+          "verbosity": -1,
+          "seed": 190019,
+          "min_gain_to_split": 0.0,
+          "min_data_in_bin": 3,
+          "boost_from_average": true,
+          "lambdarank_truncation_level": 30,
+          "sigmoid": 1.0,
+          "lambdarank_norm": true,
+          "eval_at": [
+            10
+          ]
+        },
+        "dataset": null,
+        "dataset_unavailable_reason": null,
+        "num_boost_round": null,
+        "identical_across_repeats": true,
+        "provenance": "measured",
+        "engine_dict_source": "translated, not captured from the adapter",
+        "see": "notes.params_predate_adapter_capture"
+      },
+      "data": {
+        "dataset": "generated:ranking",
+        "train": {
+          "rows": 368759,
+          "features": 30,
+          "sparse": false,
+          "digest": "cb93698234dbd00c55ac21cb451aae390398a1c87c4dcfcb9337454bdd6a15f7",
+          "missing_fraction": 0.0,
+          "queries": 15958,
+          "label_mean": 2.0,
+          "label_distinct": 5
+        },
+        "test": {
+          "rows": 91674,
+          "features": 30,
+          "sparse": false,
+          "digest": "fb882cc6fed3ae6637cbc4e3ba7769869d3dcbb8a76adf3fce475706c5738557",
+          "missing_fraction": 0.0,
+          "queries": 4042
+        },
+        "provenance": "measured"
+      },
+      "model": {
+        "num_trees": 100,
+        "num_bin": null,
+        "serialized_bytes": 356867,
+        "serialized_sha256": "b77e7a251e2f58f13c4b790dfa5174d5adf5a3bb217029b3edfec63b0db7b771",
+        "provenance": "measured",
+        "bins": {
+          "value": null,
+          "unavailable_reason": "this run recorded no per-feature bin counts, so the two binnings cannot be compared from this file"
+        }
+      },
+      "peak_rss_bytes": 878608384
+    },
+    {
+      "scenario": "ranking",
+      "scenario_title": "Ranking",
+      "task": "ranking",
+      "tier": "standard",
+      "engine": "mojoboost",
+      "engine_version": "0.1.0",
+      "device_requested": "cpu",
+      "device_used": "cpu",
+      "threads": 10,
+      "path": "dataset",
+      "repeats": 3,
+      "primary_metric": "ndcg@10",
+      "quality": {
+        "ndcg@1": 0.9922150750453576,
+        "ndcg@10": 0.991240397824286,
+        "ndcg@5": 0.9822516160428566
+      },
+      "baseline_quality": {
+        "ndcg@1": 0.32421243608775574,
+        "ndcg@10": 0.4951358413015633,
+        "ndcg@5": 0.388696872496536
+      },
+      "quality_identical_across_repeats": true,
+      "predictions": {
+        "sha256_distinct": [
+          "c10935db512f1c1df57e31b6aff2a3c3b91d4e072d62a3b78d7e113f3176e10b"
+        ],
+        "shape": [
+          91674
+        ],
+        "provenance": "measured"
+      },
+      "backend_proof": {
+        "value": null,
+        "unavailable_reason": "no backend_proof field on any record in this cell",
+        "see": "notes.backend_proof_absent",
+        "provenance": "unavailable"
+      },
+      "histogram_builder": null,
+      "params": {
+        "shared": {
+          "num_leaves": 31,
+          "max_depth": -1,
+          "learning_rate": 0.1,
+          "n_estimators": 100,
+          "min_data_in_leaf": 20,
+          "min_child_hess": 0.001,
+          "lambda_l1": 0.0,
+          "lambda_l2": 1.0,
+          "max_bin": 255,
+          "use_missing": true,
+          "lambdarank_truncation_level": 30,
+          "sigmoid": 1.0,
+          "lambdarank_norm": true,
+          "ndcg_eval_at": 10,
+          "objective": "lambdarank"
+        },
+        "engine": {
+          "objective": "lambdarank",
+          "num_leaves": 31,
+          "max_depth": -1,
+          "learning_rate": 0.1,
+          "min_data_in_leaf": 20,
+          "min_child_hess": 0.001,
+          "lambda_l1": 0.0,
+          "lambda_l2": 1.0,
+          "device": "cpu",
+          "lambdarank_truncation_level": 30,
+          "sigmoid": 1.0,
+          "lambdarank_norm": true,
+          "ndcg_eval_at": 10
+        },
+        "dataset": null,
+        "dataset_unavailable_reason": null,
+        "num_boost_round": null,
+        "identical_across_repeats": true,
+        "provenance": "measured",
+        "engine_dict_source": "translated, not captured from the adapter",
+        "see": "notes.params_predate_adapter_capture"
+      },
+      "data": {
+        "dataset": "generated:ranking",
+        "train": {
+          "rows": 368759,
+          "features": 30,
+          "sparse": false,
+          "digest": "cb93698234dbd00c55ac21cb451aae390398a1c87c4dcfcb9337454bdd6a15f7",
+          "missing_fraction": 0.0,
+          "queries": 15958,
+          "label_mean": 2.0,
+          "label_distinct": 5
+        },
+        "test": {
+          "rows": 91674,
+          "features": 30,
+          "sparse": false,
+          "digest": "fb882cc6fed3ae6637cbc4e3ba7769869d3dcbb8a76adf3fce475706c5738557",
+          "missing_fraction": 0.0,
+          "queries": 4042
+        },
+        "provenance": "measured"
+      },
+      "model": {
+        "num_trees": 100,
+        "num_bin": 255,
+        "serialized_bytes": 571502,
+        "serialized_sha256": "ac1f1b634f03bddc477dc249bd1dc91e4c77a8bfd540862a4fbc090f2bd109e5",
+        "provenance": "measured",
+        "bins": {
+          "value": null,
+          "unavailable_reason": "this run recorded no per-feature bin counts, so the two binnings cannot be compared from this file"
+        }
+      },
+      "peak_rss_bytes": 707493888
+    },
+    {
+      "scenario": "sparse_highdim",
+      "scenario_title": "High-dimensional sparse",
+      "task": "binary",
+      "tier": "standard",
+      "engine": "lightgbm",
+      "engine_version": "4.7.0",
+      "device_requested": "cpu",
+      "device_used": "cpu",
+      "threads": 10,
+      "path": "dataset",
+      "repeats": 3,
+      "primary_metric": "auc",
+      "quality": {
+        "auc": 0.9938326229514531,
+        "average_precision": 0.9936839847537665,
+        "logloss": 0.10029337276975105
+      },
+      "baseline_quality": {
+        "auc": 0.5,
+        "average_precision": 0.5297290245650104,
+        "logloss": 0.6934845313220007
+      },
+      "quality_identical_across_repeats": true,
+      "predictions": {
+        "sha256_distinct": [
+          "82145a2927bed122278559ab2819a463ae2cfbeab84c968e76cdc92492a04c4c"
+        ],
+        "shape": [
+          4070
+        ],
+        "provenance": "measured"
+      },
+      "backend_proof": {
+        "value": null,
+        "unavailable_reason": "no backend_proof field on any record in this cell",
+        "see": "notes.backend_proof_absent",
+        "provenance": "unavailable"
+      },
+      "histogram_builder": null,
+      "params": {
+        "shared": {
+          "num_leaves": 31,
+          "max_depth": -1,
+          "learning_rate": 0.1,
+          "n_estimators": 100,
+          "min_data_in_leaf": 20,
+          "min_child_hess": 0.001,
+          "lambda_l1": 0.0,
+          "lambda_l2": 1.0,
+          "max_bin": 255,
+          "use_missing": true,
+          "objective": "binary"
+        },
+        "engine": {
+          "objective": "binary",
+          "num_leaves": 31,
+          "max_depth": -1,
+          "learning_rate": 0.1,
+          "min_data_in_leaf": 20,
+          "min_sum_hessian_in_leaf": 0.001,
+          "lambda_l1": 0.0,
+          "lambda_l2": 1.0,
+          "max_bin": 255,
+          "use_missing": true,
+          "num_threads": 10,
+          "enable_bundle": false,
+          "feature_pre_filter": false,
+          "zero_as_missing": false,
+          "force_row_wise": true,
+          "deterministic": true,
+          "verbosity": -1,
+          "seed": 190019,
+          "min_gain_to_split": 0.0,
+          "min_data_in_bin": 3,
+          "boost_from_average": true
+        },
+        "dataset": null,
+        "dataset_unavailable_reason": null,
+        "num_boost_round": null,
+        "identical_across_repeats": true,
+        "provenance": "measured",
+        "engine_dict_source": "translated, not captured from the adapter",
+        "see": "notes.params_predate_adapter_capture"
+      },
+      "data": {
+        "dataset": "rcv1_train_binary",
+        "train": {
+          "rows": 16172,
+          "features": 47236,
+          "sparse": true,
+          "digest": "4da1156f4d7052bd25c70ed04ef56f3049f8a81d17685d69c409c1e2236ede4b",
+          "nnz": 1198223,
+          "density": 0.0015685588053582762,
+          "label_mean": 0.5212094978976007,
+          "label_distinct": 2
+        },
+        "test": {
+          "rows": 4070,
+          "features": 47236,
+          "sparse": true,
+          "digest": "a5861d54c719df11434ecc4c130028b0d3e5fa20f8b7ad1e48d15c7fac7fe736",
+          "nnz": 300729,
+          "density": 0.0015642558470062916
+        },
+        "provenance": "measured"
+      },
+      "model": {
+        "num_trees": 100,
+        "num_bin": null,
+        "serialized_bytes": 1959444,
+        "serialized_sha256": "d1f0c794c767082482d281ff40fcf5837b49cfb475556a7d419becc9a40d9cb8",
+        "provenance": "measured",
+        "bins": {
+          "value": null,
+          "unavailable_reason": "this run recorded no per-feature bin counts, so the two binnings cannot be compared from this file"
+        }
+      },
+      "peak_rss_bytes": 1360560128
+    },
+    {
+      "scenario": "sparse_highdim",
+      "scenario_title": "High-dimensional sparse",
+      "task": "binary",
+      "tier": "standard",
+      "engine": "mojoboost",
+      "engine_version": "0.1.0",
+      "device_requested": "cpu",
+      "device_used": "cpu",
+      "threads": 10,
+      "path": "estimator_csc",
+      "repeats": 3,
+      "primary_metric": "auc",
+      "quality": {
+        "auc": 0.9938269473029319,
+        "average_precision": 0.9937154735313559,
+        "logloss": 0.10078849428531887
+      },
+      "baseline_quality": {
+        "auc": 0.5,
+        "average_precision": 0.5297290245650104,
+        "logloss": 0.6934845313220007
+      },
+      "quality_identical_across_repeats": true,
+      "predictions": {
+        "sha256_distinct": [
+          "069a3c6c91a23d5c4ce8b772a2fe945c15d168cdf31970e2b06dc702bf26b38c"
+        ],
+        "shape": [
+          4070
+        ],
+        "provenance": "measured"
+      },
+      "backend_proof": {
+        "value": null,
+        "unavailable_reason": "no backend_proof field on any record in this cell",
+        "see": "notes.backend_proof_absent",
+        "provenance": "unavailable"
+      },
+      "histogram_builder": null,
+      "params": {
+        "shared": {
+          "num_leaves": 31,
+          "max_depth": -1,
+          "learning_rate": 0.1,
+          "n_estimators": 100,
+          "min_data_in_leaf": 20,
+          "min_child_hess": 0.001,
+          "lambda_l1": 0.0,
+          "lambda_l2": 1.0,
+          "max_bin": 255,
+          "use_missing": true,
+          "objective": "binary"
+        },
+        "engine": {
+          "objective": "binary",
+          "num_leaves": 31,
+          "max_depth": -1,
+          "learning_rate": 0.1,
+          "min_data_in_leaf": 20,
+          "min_child_hess": 0.001,
+          "lambda_l1": 0.0,
+          "lambda_l2": 1.0,
+          "device": "cpu"
+        },
+        "dataset": null,
+        "dataset_unavailable_reason": null,
+        "num_boost_round": null,
+        "identical_across_repeats": true,
+        "provenance": "measured",
+        "engine_dict_source": "translated, not captured from the adapter",
+        "see": "notes.params_predate_adapter_capture"
+      },
+      "data": {
+        "dataset": "rcv1_train_binary",
+        "train": {
+          "rows": 16172,
+          "features": 47236,
+          "sparse": true,
+          "digest": "4da1156f4d7052bd25c70ed04ef56f3049f8a81d17685d69c409c1e2236ede4b",
+          "nnz": 1198223,
+          "density": 0.0015685588053582762,
+          "label_mean": 0.5212094978976007,
+          "label_distinct": 2
+        },
+        "test": {
+          "rows": 4070,
+          "features": 47236,
+          "sparse": true,
+          "digest": "a5861d54c719df11434ecc4c130028b0d3e5fa20f8b7ad1e48d15c7fac7fe736",
+          "nnz": 300729,
+          "density": 0.0015642558470062916
+        },
+        "provenance": "measured"
+      },
+      "model": {
+        "num_trees": 100,
+        "num_bin": null,
+        "serialized_bytes": 9415314,
+        "serialized_sha256": "2788ba65951330f556bfe3c0a4437b9e8941e802c180dfb7d97ff6dc1bf6ff78",
+        "provenance": "measured",
+        "bins": {
+          "value": null,
+          "unavailable_reason": "this run recorded no per-feature bin counts, so the two binnings cannot be compared from this file"
+        }
+      },
+      "peak_rss_bytes": 5252907008
+    }
+  ],
+  "caveats": {
+    "categorical_missing": [
+      "Category codes come from the same encoding on both sides, produced once by the loader. Letting each library encode the strings itself would compare two encodings, not two trainers.",
+      "The real variant, adult, is a binary classification problem, so when it is selected the task becomes binary and the primary metric becomes auc. loaders.py sets both; the record carries whichever ran."
+    ],
+    "imbalanced_binary": [
+      "The real variant, bank_marketing, has ten categorical columns. They are passed as categorical to both engines, so this scenario overlaps with categorical_missing on real data. The synthetic variant is purely numeric and does not."
+    ],
+    "ranking": [
+      "Ranking models are the least likely to match closely. LightGBM reads its pairwise sigmoid from a lookup table where mojoboost evaluates it, so the two diverge at the first tie and the thresholds for this scenario are correspondingly loose.",
+      "The real dataset is acquired manually, so a run without it falls back to the generator and says so in the record."
+    ],
+    "sparse_highdim": [
+      "The estimator bins inside fit on this path, so binning time cannot be separated from training time for mojoboost here. The record carries binning_s = null with that reason, rather than an estimate.",
+      "mojoboost trains on sparse input through the estimator's CSC path, which does not take an eval_set and reports device 'cpu' whatever the device parameter says. So this scenario is CPU only on both sides and has no early stopping.",
+      "sparse path: fit bins internally, so binning time is inside train and device is cpu whatever was requested"
+    ]
+  },
+  "skipped": [
+    {
+      "scenario": "categorical_missing",
+      "engine": "mojoboost",
+      "device": "gpu",
+      "reason": "categorical_missing declares no gpu support"
+    },
+    {
+      "scenario": "categorical_missing",
+      "engine": "lightgbm",
+      "device": "gpu",
+      "reason": "categorical_missing declares no gpu support"
+    },
+    {
+      "scenario": "dense_regression",
+      "engine": "lightgbm",
+      "device": "gpu",
+      "reason": "LightGBM runs on the CPU in this harness; a cpu-vs-gpu row is a mojoboost-internal comparison and is labelled as one"
+    },
+    {
+      "scenario": "imbalanced_binary",
+      "engine": "lightgbm",
+      "device": "gpu",
+      "reason": "LightGBM runs on the CPU in this harness; a cpu-vs-gpu row is a mojoboost-internal comparison and is labelled as one"
+    },
+    {
+      "scenario": "multiclass",
+      "engine": "lightgbm",
+      "device": "gpu",
+      "reason": "LightGBM runs on the CPU in this harness; a cpu-vs-gpu row is a mojoboost-internal comparison and is labelled as one"
+    },
+    {
+      "scenario": "ranking",
+      "engine": "mojoboost",
+      "device": "gpu",
+      "reason": "ranking declares no gpu support"
+    },
+    {
+      "scenario": "ranking",
+      "engine": "lightgbm",
+      "device": "gpu",
+      "reason": "ranking declares no gpu support"
+    },
+    {
+      "scenario": "sparse_highdim",
+      "engine": "mojoboost",
+      "device": "gpu",
+      "reason": "sparse_highdim declares no gpu support"
+    },
+    {
+      "scenario": "sparse_highdim",
+      "engine": "lightgbm",
+      "device": "gpu",
+      "reason": "sparse_highdim declares no gpu support"
+    }
+  ],
+  "not_decided_here": [
+    "Pass or fail. verify.py applies thresholds.json and exits non-zero; this file carries the inputs to that decision.",
+    "Row-level agreement between the accelerator and the CPU, which needs the prediction vectors.",
+    "Anything about speed."
+  ],
+  "flags": [
+    {
+      "flag": "device_digest_equals_cpu",
+      "scope": "multiclass/gpu",
+      "detail": "the gpu arm and the cpu arm produced the same prediction digest. Nothing in this run proves a device backend ran, and those two facts together are what a CPU fit wearing a device label looks like from the outside. It is also what two backends agreeing bit for bit looks like, which is a property the fixed-point device reduction is built to have. This file cannot tell them apart"
+    },
+    {
+      "flag": "generator_fallback",
+      "scope": "generated:ranking",
+      "detail": "a scenario that names a real dataset ran on the generator instead: mslr_web10k has no entry in checksums.lock.json; run `python bench/real_data/fetch.py --pin mslr_web10k` once and commit the lock. Its numbers are not a real-data result"
+    }
+  ],
+  "notes": {
+    "backend_proof_absent": "No record in this run carries a `backend_proof` field, so nothing in it looked for evidence of which backend ran. run.py writes the field onto every ok record from the trainer's own phase profile; a record with no field at all predates the field. This is a different state from a proof that was sought and came back empty, and the distinction matters: every device label in this run is a label the Python side resolved and nothing corroborates it. backend_proof.py says what would count as corroboration.",
+    "params_predate_adapter_capture": "`params.engine` in this run is the dict the translator produced, not the dict the adapter passed. worker.py was later fixed to take the dicts back from the adapters, because each adapter adds parameters the scenario module cannot know: bin_construct_sample_cnt on the LightGBM side, n_estimators on this project's, both of them alignment settings. `num_boost_round` was added by the same change, so its absence is the marker for the older shape. Read these dicts as the alignment that was intended rather than the alignment that was applied."
+  }
+}

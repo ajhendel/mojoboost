@@ -5,13 +5,20 @@ shapes, on pinned public datasets or deterministic generators, measuring
 quality, time, memory, and model size, and separating the numbers that can
 fail a build from the numbers that cannot.
 
-**It has been run once, on 2026-08-15, and the run is not committed.** The
-sentence here used to read "Nothing in this directory has been run", and that
-stopped being true when `results/20260815T023123Z` was produced. Results are
-gitignored by design (`results/README.md` explains why), so the run is
-readable only on the machine that took it, and nothing from it is quoted as a
-result anywhere in this repository. There are still no numbers in this
-README.
+**It has been run, on 2026-08-15, and one file from each complete run is
+committed.** The sentence here used to read "Nothing in this directory has
+been run", and that stopped being true when `results/20260815T014842Z` and
+`results/20260815T023123Z` were produced. The bulk of a run is still
+gitignored by design and `results/README.md` explains which parts and why.
+What is committed is `results/<run_id>/summary.json`, written by
+`summarize.py`: the metrics, the data and prediction digests, the parameters
+each engine was passed, and the environment, with no prediction vectors and
+no timings in it. It exists because a run readable only on the machine that
+took it cannot support a claim made in the repository, which stopped being a
+hypothesis when a reviewer read the empty results directory in a fresh
+worktree and retracted an accuracy claim that was true. There are still no
+numbers in this README; `results/README.md` has them, as a range rather than
+a best case.
 
 That run is nonetheless cited twice in the source tree, and for one reason
 worth knowing about before reading any record from this harness. It is the
@@ -73,7 +80,12 @@ python bench/real_data/run.py --dry-run
 python bench/real_data/run.py --tier standard --device cpu gpu
 python bench/real_data/verify.py results/<run_id>
 python bench/real_data/report.py results/<run_id>
+python bench/real_data/summarize.py results/<run_id>
 ```
+
+The last of those is the one that leaves something behind in the
+repository. Run it after `verify.py`, commit the `summary.json` it writes,
+and the run stops being readable only on the machine that took it.
 
 ## How it is put together
 
@@ -94,6 +106,7 @@ run.py                builds the matrix and runs it sequentially
 thresholds.json       the correctness tolerances, with the reasoning for each
 verify.py             the gate: applies thresholds, exits non-zero on a failure
 report.py             the timings: prints distributions, decides nothing
+summarize.py          one run reduced to the one file that is committed
 schema.json           JSON Schema for a result record
 ```
 

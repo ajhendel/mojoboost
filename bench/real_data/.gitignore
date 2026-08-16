@@ -2,9 +2,27 @@
 # the bytes themselves are not, and some of them run to gigabytes.
 data/
 
-# Run output. results/README.md says why none of it is committed.
+# Run output. The bulk of it stays out of the repository and
+# results/README.md says why: manifests, per-job records, the concatenated
+# records.json and records.csv, and the prediction vectors, which are large
+# and reproducible from the record.
+#
+# One file per run is tracked. `summary.json` is the reduction summarize.py
+# writes: metrics, digests, parameters, environment, no predictions and no
+# timings. It is committed because a claim about accuracy with no evidence
+# in the tree is indistinguishable from an invented one, which is not a
+# hypothetical: a reviewer read the empty directory in a fresh worktree and
+# retracted a claim that was true.
+#
+# The four lines below are the git incantation for "keep one file inside an
+# ignored directory". A path cannot be re-included once a parent directory
+# is excluded, so the run directories have to be un-excluded first and their
+# contents excluded separately.
 results/*
 !results/README.md
+!results/*/
+results/*/*
+!results/*/summary.json
 
 __pycache__/
 *.pyc
