@@ -547,6 +547,24 @@ REFUSAL_WORDS = (
     "cannot",
     "refus",
     "does not",
+    # Added 2026-08-16 after two real blockers went INVISIBLE to --check.
+    # `params.mojo` refuses auto_learning_rate beside an explicit lambda_l2
+    # with "contradict each other", and beside leaf_estimation_iterations
+    # with "would do nothing". Both raises were still there; both stopped
+    # being COUNTED, because this list decides what looks like a refusal and
+    # neither phrasing was in it.
+    #
+    # **A shrinking blocking count is not evidence of progress when the
+    # filter that produces it can lose rows to a rephrasing.** That is the
+    # third time today a filter here reported its own blind spot as a result,
+    # and the only reason this one surfaced is that a lane read every entry
+    # by hand and noticed two it expected were missing. Nobody can run that
+    # check against a list of things they do not already know.
+    "contradict",
+    "would do nothing",
+    "would be ignored",
+    "has no effect",
+    "is inert",
 )
 
 
