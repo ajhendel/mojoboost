@@ -1914,16 +1914,52 @@ def ctr_extend_missing(missing_bin: List[Int], n_extra: Int) -> List[Int]:
 
 
 def ctr_extend_usable(
-    usable: List[Int], n_base: Int, n_extra: Int
+    usable: List[Int],
+    n_base: Int,
+    n_extra: Int,
+    replaced: List[Int] = [],
 ) -> List[Int]:
-    """`usable` widened with the CTR column ids, still ascending.
+    """`usable` widened with the CTR column ids, still ascending, with the
+    columns in `replaced` taken out of it first.
 
     CTR columns are always usable: they exist to be split on, and a prefilter
     that dropped one would be dropping the mechanism rather than a trivial
     column. Every base id is below `n_base` and the new ids start at `n_base`,
     so appending keeps the list ascending, which `usable_features` requires.
+
+    **`replaced` is the difference between a CTR that ACCOMPANIES its source
+    column and one that REPLACES it, and the two are the two policy halves.**
+
+    - Empty (the default) is ACCOMPANIMENT, which is the opt-in rule under
+      `lossguide`: `CTR_SOURCE_BIN_OVERFLOW` adds statistics to a column whose
+      category table overflowed and leaves the raw column searchable beside
+      them. That is a measured configuration and it works, so nothing here
+      moves it.
+    - Non-empty is REPLACEMENT, which is CatBoost mode
+      (`CTR_SOURCE_ONE_HOT_MAX_SIZE`). CatBoost has **no raw categorical split
+      at all** above `one_hot_max_size`: `AddSimpleCtrs` sends the column to
+      CTRs (`greedy_tensor_search.cpp:469`) and the one-hot candidate
+      generator has already returned for it (`:182`), so the raw column is
+      never a candidate. Dropping it from `usable` is how that is said here,
+      because `usable` is the pool `sampling.select_tree_features` draws a
+      tree's features from and a column outside it is offered to no split
+      search.
+
+    Ids in `replaced` that are not in `usable` are ignored rather than
+    refused: a prefilter may already have removed one, and "remove it" is
+    satisfied either way. The result stays ascending because removal preserves
+    order and every appended id is at or above `n_base`.
     """
-    var out = usable.copy()
+    var out = List[Int](capacity=len(usable) + n_extra)
+    for i in range(len(usable)):
+        var f = usable[i]
+        var drop = False
+        for k in range(len(replaced)):
+            if replaced[k] == f:
+                drop = True
+                break
+        if not drop:
+            out.append(f)
     for i in range(n_extra):
         out.append(n_base + i)
     return out^
@@ -2312,6 +2348,34 @@ struct BinnedMatrix(Copyable, Movable):
         prefiltered, and passing every feature is the same draw as passing
         nothing."""
         return self.usable.copy()
+
+    def any_usable_categorical(self) -> Bool:
+        """Whether any column a split search can be OFFERED is categorical.
+
+        The searchability question, which is not the declaration question
+        `CategoricalSpec.any_categorical` answers. A column can be declared
+        categorical and be outside `usable`, in which case
+        `sampling.select_tree_features` never draws it, no `features` list ever
+        names it and no scan ever reaches it. That is exactly the state
+        `binning.append_ctr_columns` leaves a CatBoost-mode source column in:
+        its CTR columns REPLACE it, so it is binned and predicted through and
+        never searched.
+
+        Every guard that refuses a shape because a *category-partition search*
+        would be reached must ask this and not the other one. Asking
+        `any_categorical` refuses on the declaration, which is a refusal for a
+        search that will not happen.
+
+        Linear in the usable count, called once per tree at most, and the
+        matrix owns both halves of the question, which is why it lives here
+        rather than on `CategoricalSpec` -- the spec knows the flags and knows
+        nothing about the pool.
+        """
+        for i in range(len(self.usable)):
+            if self.cats.is_cat(self.usable[i]):
+                return True
+        return False
+
     def has_row_major(self) -> Bool:
         """Whether the row-major view is built and the right size.
 
@@ -2508,6 +2572,7 @@ def append_ctr_columns(
     ctr_bins: List[UInt8],
     n_ctr_columns: Int,
     build_view: Bool = True,
+    replaced: List[Int] = [],
 ) raises:
     """Append CTR columns to a binned matrix, in place, whichever half made them.
 
@@ -2516,6 +2581,14 @@ def append_ctr_columns(
     needs no edit: `histogram.build_histogram_into_scratch` reads
     `data.bins[f * n_rows + r]`, which is where these bytes now are, and
     `data.usable` now offers the new ids to a split search.
+
+    `replaced` names base columns these CTR columns stand IN PLACE OF rather
+    than beside; they are dropped from `matrix.usable` and no split search is
+    offered them again. See `ctr_extend_usable` for which policy passes what
+    and why the two halves differ. The columns themselves stay in `bins` and
+    keep their ids: `usable` is a search pool and not a renumbering, so a
+    replaced column is still binned, still predicted through and still occupies
+    its own slot in an importance vector, exactly as a prefiltered one is.
 
     `ctr_bins` is column-major, `ctr_bins[c * n_rows + r]`, and every byte in it
     is already a bucket index -- the training half because `ctr.ctr_train_bin`
@@ -2553,7 +2626,9 @@ def append_ctr_columns(
     matrix.n_features = n_base + n_ctr_columns
     matrix.cats = ctr_extend_cats(matrix.cats, n_ctr_columns)
     matrix.missing_bin = ctr_extend_missing(matrix.missing_bin, n_ctr_columns)
-    matrix.usable = ctr_extend_usable(matrix.usable, n_base, n_ctr_columns)
+    matrix.usable = ctr_extend_usable(
+        matrix.usable, n_base, n_ctr_columns, replaced
+    )
     _rebuild_row_major(matrix, build_view)
 
 
@@ -2714,6 +2789,36 @@ struct BinMapper(Copyable, Movable):
         """The pool `feature_fraction` draws from, ascending. Every feature
         unless the fit prefiltered."""
         return self.usable.copy()
+
+    def drop_usable(mut self, features: List[Int]):
+        """Take `features` out of the search pool, keeping it ascending.
+
+        Called once, by `trainset._build_ctr`, for the CatBoost-mode source
+        columns whose CTR columns REPLACE them. It is recorded on the MAPPER
+        and not only on the training matrix so that the two agree: a matrix
+        this mapper transforms later -- a validation set through
+        `Dataset.from_reference`, a batch through `Model.predict_batch` --
+        copies `self.usable` and then has its CTR ids appended, and without
+        this it would offer a column the training matrix did not.
+
+        `usable` is not written by `serialize`, so a mapper read back from a
+        file has the default pool again. That is inert rather than wrong:
+        nothing on the inference path consults `usable`, which is the pool
+        `sampling.select_tree_features` draws from and is read at fit time
+        only. Stated here rather than discovered, because the natural reading
+        of "model state" would have expected it to survive.
+        """
+        var out = List[Int](capacity=len(self.usable))
+        for i in range(len(self.usable)):
+            var f = self.usable[i]
+            var drop = False
+            for k in range(len(features)):
+                if features[k] == f:
+                    drop = True
+                    break
+            if not drop:
+                out.append(f)
+        self.usable = out^
 
     def is_usable(self, feature: Int) -> Bool:
         """Whether `feature` survived the prefilter. Linear in the usable

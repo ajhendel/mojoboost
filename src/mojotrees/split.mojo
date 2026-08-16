@@ -164,6 +164,7 @@ from .categorical import (
     CategoricalParams,
     CategoricalSpec,
     cat_contains,
+    any_searchable_categorical,
     cat_empty,
     find_best_categorical_split,
 )
@@ -656,9 +657,12 @@ def find_best_split(
       `tree_index`, `node`, feature, bin). Its standard deviation is
       `random_strength * random_score_scale`, and a positive strength with no
       scale is refused rather than silently scaled to nothing. It is refused
-      on a matrix with a categorical feature, for the reason `extra_trees`
-      is. At the default of 0 not a single instruction of arithmetic is
-      added, which is what makes it a no-op rather than a small one.
+      when THIS SCAN is offered a categorical feature
+      (`categorical.any_searchable_categorical`), for the reason `extra_trees`
+      is; a categorical column that CTR columns replaced is not offered and
+      does not trigger it. At the default of 0 not a single instruction of
+      arithmetic is added, which is what makes it a no-op rather than a small
+      one.
 
     `n_rows` is the node's row count, used by the per-split CEGB cost and, at
     0, taken from the histogram's own totals. `depth` is the node's depth in
@@ -702,17 +706,36 @@ def find_best_split(
         raise Error("missing_bins length must equal n_features")
     if len(monotone) > 0 and len(monotone) != hist.n_features:
         raise Error("monotone length must equal n_features")
-    var constrained = len(monotone) > 0
-    if constrained and cats.any_categorical():
-        for f in range(hist.n_features):
-            if cats.is_cat(f) and monotone_sign(monotone, f) != MONOTONE_FREE:
-                raise Error(
-                    "monotonic constraints are not supported on categorical"
-                    " features"
-                )
+    # Hoisted above the monotone check, which now walks the SCANNED features
+    # rather than every feature of the histogram and needs these three to say
+    # which those are. Pure reordering: none of the three reads anything the
+    # two length checks above could have changed.
     var masked = len(allowed) > 0
     var use_all = len(features) == 0
     var n_active = hist.n_features if use_all else len(features)
+
+    var constrained = len(monotone) > 0
+    if constrained:
+        # The `cats.any_categorical()` fast path this used to open with is
+        # gone rather than converted. It was there to skip the loop on a
+        # wholly numerical matrix, and on exactly that matrix it was already a
+        # full pass that found nothing, so it never skipped the case it was
+        # for; the loop below now answers the whole question in one pass.
+        # `constrained` is itself the rare gate -- an empty `monotone` is the
+        # default -- so this block is entered almost never either way.
+        for i_feature in range(n_active):
+            var f = i_feature if use_all else features[i_feature]
+            if f < 0 or f >= hist.n_features:
+                continue
+            if masked and (f >= len(allowed) or not allowed[f]):
+                continue
+            if cats.is_cat(f) and monotone_sign(monotone, f) != MONOTONE_FREE:
+                raise Error(
+                    "monotonic constraints are not supported on categorical"
+                    " features, and this scan is offered one. A categorical"
+                    " column that CTR columns replaced is not offered and"
+                    " does not reach this"
+                )
 
     # Tested once per node, not once per candidate: an inactive bundle must
     # leave the scan on exactly the path it took before the bundle existed.
@@ -736,16 +759,20 @@ def find_best_split(
         )
     var finish = extra.needs_leaf_finish()
     var draw_one = extra.extra_trees
-    if draw_one and cats.any_categorical():
+    if draw_one and any_searchable_categorical(
+        cats, hist.n_features, features, allowed
+    ):
         # LightGBM randomizes the categorical set search too, over partition
         # positions rather than over thresholds. That is a different draw
         # from this one and is not implemented, so the combination is refused
         # rather than silently scoring categoricals exhaustively while every
         # numerical feature gets a single draw.
         raise Error(
-            "extra_trees is implemented for numerical thresholds only; a"
-            " categorical feature is searched as category partitions, whose"
-            " random draw is a separate rule"
+            "extra_trees is implemented for numerical thresholds only, and"
+            " this scan is offered a categorical feature; it is searched as"
+            " category partitions, whose random draw is a separate rule. A"
+            " categorical column that CTR columns replaced is not offered and"
+            " does not reach this"
         )
 
     # `random_strength`: CatBoost's seeded noise on a candidate's gain. The
@@ -766,7 +793,9 @@ def find_best_split(
             " tree_parameters_extra.random_score_scale_from_gradients(grad,"
             " n_rows, iteration * learning_rate)"
         )
-    if noisy and cats.any_categorical():
+    if noisy and any_searchable_categorical(
+        cats, hist.n_features, features, allowed
+    ):
         # A categorical feature's candidates are category *sets*, searched
         # inside `find_best_categorical_split`, and only that search's winner
         # reaches this function. Noising the winner would noise one candidate
@@ -775,11 +804,22 @@ def find_best_split(
         # combination is refused rather than half-applied; making it work
         # means the draw moving into the partition search, which is
         # categorical.mojo's.
+        #
+        # The test is over the features THIS SCAN WILL VISIT and not over the
+        # spec's flags. In CatBoost mode a wide categorical column is replaced
+        # by its CTR columns and dropped from `BinnedMatrix.usable`, so it is
+        # not in `features` and no partition search runs; refusing on the
+        # declaration would refuse that fit for a search it does not perform.
+        # The refusal itself is unchanged for a scan that really does reach
+        # one.
         raise Error(
-            "random_strength is implemented for numerical thresholds only; a"
-            " categorical feature is searched as category partitions, and"
-            " only that search's winner reaches here, so its candidates"
-            " cannot each be noised from this function"
+            "random_strength is implemented for numerical thresholds only,"
+            " and this scan is offered a categorical feature; it is searched"
+            " as category partitions, and only that search's winner reaches"
+            " here, so its candidates cannot each be noised from this"
+            " function. A categorical column replaced by CTR columns"
+            " (CatBoost mode) is not offered to this scan and does not reach"
+            " this refusal"
         )
     var noise_seed = extra.random_strength_seed
 
@@ -789,13 +829,24 @@ def find_best_split(
     # hoist out of the bin loop.
     check_score_function(score_function)
     var cosine = score_function == SCORE_COSINE
-    if cosine and cats.any_categorical():
+    if cosine and any_searchable_categorical(
+        cats, hist.n_features, features, allowed
+    ):
+        # **The one of these four that was actively costing us a shipped
+        # default.** Cosine is CatBoost's CPU default score function, so a
+        # CatBoost-mode fit takes this branch as a matter of course; asked as
+        # a declaration it refused every such fit whose matrix merely
+        # CONTAINED a categorical column, including one whose CTR columns had
+        # already replaced it and which no scan would visit. That is a fit
+        # refused for holding a column it does not search.
         raise Error(
             "score_function=cosine is implemented for numerical thresholds"
-            " only; a categorical feature is searched as category partitions"
-            " scored with the L2 gain, and only that search's winner reaches"
-            " this function, so the two score functions would end up inside"
-            " one argmax"
+            " only, and this scan is offered a categorical feature; it is"
+            " searched as category partitions scored with the L2 gain, and"
+            " only that search's winner reaches this function, so the two"
+            " score functions would end up inside one argmax. A categorical"
+            " column that CTR columns replaced is not offered and does not"
+            " reach this"
         )
 
     comptime W = SIMD_LANES
@@ -821,10 +872,35 @@ def find_best_split(
     res_bin.resize(n_active, -1)
     var res_flag = List[Int](capacity=n_active)
     res_flag.resize(n_active, 0)
-    # A categorical winner also carries its bitset. Allocated only when the
-    # matrix has a categorical feature at all, because the common case is a
-    # wholly numerical matrix and this runs once per node.
-    var any_cat = cats.any_categorical()
+    # A categorical winner also carries its bitset, allocated only when one
+    # can arise, because the common case is a wholly numerical matrix and this
+    # runs once per node.
+    #
+    # **This one is an allocation and not a refusal, and it was worth asking
+    # whether declaration is therefore the right question for it. It is not,
+    # and the reason is that the two questions are not equally right here --
+    # one is exact and the other is a safe over-approximation of it.** The
+    # array is written at exactly one place, the categorical branch of
+    # `scan_feature`, which is reached only for a feature that scan VISITS and
+    # that `cats.is_cat` is true for; and it is read at exactly one place, the
+    # fold, only under a `_FLAG_CATEGORICAL` that only that write sets. So the
+    # condition under which a byte of it is ever touched is precisely
+    # "a scanned feature is categorical", which is this predicate.
+    # `any_categorical` answers a strictly larger question and so allocated on
+    # CatBoost-mode matrices whose categorical column had been replaced and
+    # would never be scanned -- correct, and per node, and for nothing.
+    #
+    # **The asymmetry to know before editing `scan_feature`'s admission
+    # test.** For the three refusals above, a predicate that disagreed with
+    # the scan costs a spurious error message. Here it would cost an
+    # `unsafe_store` through the pointer of an empty `List`. The predicate
+    # copies that admission test line for line and its docstring names the
+    # scan as the definition; if the two are ever allowed to drift, this is
+    # the site that turns the drift into memory corruption rather than a bad
+    # message, and it is the reason the copy is exact rather than approximate.
+    var any_cat = any_searchable_categorical(
+        cats, hist.n_features, features, allowed
+    )
     var res_bits = List[UInt64]()
     if any_cat:
         res_bits.resize(CAT_BITSET_WORDS * n_active, UInt64(0))
@@ -1358,8 +1434,19 @@ def find_best_split_shared(
     apply to the level: the first three are charged once per feature against
     the summed gain (`_feature_gain`, LightGBM's placement), and
     `random_strength` draws once per (feature, bin) candidate keyed by
-    `node`, which the grower passes as the level's lowest node id, so the
-    level gets one draw per candidate rather than one per leaf.
+    `depth`, so the level gets one draw per candidate rather than one per
+    leaf, and the draw lands on the level's AGGREGATE score after the
+    cross-leaf sum and before the argmax. That placement is CatBoost's:
+    `SetBestScore` (`tensor_search_helpers.cpp:716-757`) noises
+    `scores[binFeatureIdx]`, which is already the level-summed score out of
+    `CalculateNonPairwiseScore`, with a normal from `rand_score.h:42-49`.
+    Noising each leaf's contribution instead would be a different random
+    variable with a different variance wearing the same parameter name. The
+    scale is the ensemble's, computed once per tree before the depth loop
+    (`greedy_tensor_search.cpp:851-868`, `:1186`) and reaching here through
+    `ExtraTreeParams.random_score_scale`, which `boosting` writes per round.
+    `node` is accepted and unread on this path; see the draw below for why
+    depth is the term a level has.
 
     `bounds` and `parent_outputs`, when non-empty, are per leaf and parallel
     to `hists`: the monotone interval a leaf's output must lie in, and the
@@ -1761,8 +1848,31 @@ def find_best_split_shared(
             # inside the fold so it is added once and not `n_leaves` times.
             var noise = 0.0
             if noisy:
+                # Keyed on DEPTH where `find_best_split` keys on `node`, and
+                # the substitution is the whole difference between the
+                # leaf-wise draw and the level draw. A level has no node to
+                # key on -- that objection is what refused this combination
+                # once -- but it has a depth, and depth is the term CatBoost
+                # carries too: `CalcScores` takes a fresh
+                # `LearnProgress->Rand.GenRand()` per iteration of the depth
+                # loop (`greedy_tensor_search.cpp:1189`, `:1199`, `:884`), so
+                # the same (feature, border) candidate draws different noise
+                # at depth 0 and at depth 5.
+                #
+                # **We take the property and not the mechanism, deliberately.**
+                # CatBoost gets per-depth independence from a RUNNING
+                # generator, whose value depends on how many times it has been
+                # called; reproducing that would make the draw depend on the
+                # order depths are visited in and on how many calls a worker
+                # count produced, and the two backends would then diverge on a
+                # path whose output is noise and therefore looks like noise
+                # either way. A counter keyed on the depth VALUE has the same
+                # distribution, is worker-independent by construction, and is
+                # what lets a CPU draw and a device draw be compared as equal
+                # values for the same candidate at the same level. Do not
+                # "improve" this back into a running generator.
                 noise = random_score_noise(
-                    noise_stdev, noise_seed, tree_index, node, f, b
+                    noise_stdev, noise_seed, tree_index, depth, f, b
                 )
             if score_left:
                 var g = accl_out.unsafe_load(off + b)

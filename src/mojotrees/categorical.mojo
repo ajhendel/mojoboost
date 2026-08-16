@@ -280,6 +280,17 @@ struct CategoricalSpec(Copyable, Movable):
         return self.offsets[feature + 1] - self.offsets[feature]
 
     def any_categorical(self) -> Bool:
+        """Whether any feature is DECLARED categorical.
+
+        Declaration and not searchability. A column can carry this flag and be
+        outside the pool a split search is offered -- that is exactly what
+        `binning.append_ctr_columns` leaves a CatBoost-mode source column in
+        once its CTR columns have replaced it. A guard that refuses a shape
+        because a *category-partition search* would be reached wants
+        `any_searchable_categorical` or `BinnedMatrix.any_usable_categorical`
+        instead; this one is right for questions about the DATA, such as
+        whether a serialized model needs a category table.
+        """
         for f in range(len(self.is_categorical)):
             if self.is_categorical[f]:
                 return True
@@ -610,6 +621,65 @@ def _sorted_search(
                     p += dir
                 best = CatSplit(gain, bitset, True)
     return best^
+
+
+def any_searchable_categorical(
+    cats: CategoricalSpec,
+    n_features: Int,
+    features: List[Int],
+    allowed: List[Bool],
+) -> Bool:
+    """Whether a scan over `features` under `allowed` would reach a
+    categorical feature, and so reach `find_best_categorical_split`.
+
+    The admission test is `split.find_best_split`'s own, copied rather than
+    approximated: an empty `features` means every feature of the histogram, an
+    id outside `[0, n_features)` is skipped, and a non-empty `allowed` admits
+    only `allowed[f]`. If the two ever diverge this predicate is the one that
+    is wrong, because the scan is the definition.
+
+    **Why a guard wants this and not `CategoricalSpec.any_categorical`.** A
+    refusal whose reason is "a category partition search would be reached"
+    must fire when that search will be reached. `any_categorical` fires when a
+    column was DECLARED categorical, which is a strictly larger set: in
+    CatBoost mode a column above `one_hot_max_size` is replaced by its CTR
+    columns and dropped from `BinnedMatrix.usable`, so it is never in
+    `features` and its partition search never runs, and refusing on it refuses
+    a fit for a search that does not happen.
+
+    **The one consequence, stated rather than discovered.** `features` is the
+    per-NODE draw, so under `feature_fraction < 1` a categorical column can be
+    absent from the root's draw and present at a later node's. A refusal that
+    used to arrive before any tree was grown can therefore now arrive part way
+    into a fit. That is a change in WHEN the message arrives and not in
+    whether it is right: each of these refusals is a statement about the scan
+    it guards, and a scan that is not offered a categorical feature computes a
+    correct answer. The alternative -- refusing up front on `usable`, which is
+    per tree -- would re-introduce the over-refusal for any fit whose draws
+    happen never to include the column, which is the defect being removed.
+
+    Callers wanting the early message have the per-tree question available as
+    `BinnedMatrix.any_usable_categorical`, which is what
+    `tree._check_oblivious_supported` asks; it is a strictly larger set than
+    this one and is right there because the oblivious grower cannot search a
+    categorical column at ANY node.
+    """
+    if len(features) == 0:
+        for f in range(n_features):
+            if len(allowed) > 0 and (f >= len(allowed) or not allowed[f]):
+                continue
+            if cats.is_cat(f):
+                return True
+        return False
+    for i in range(len(features)):
+        var f = features[i]
+        if f < 0 or f >= n_features:
+            continue
+        if len(allowed) > 0 and (f >= len(allowed) or not allowed[f]):
+            continue
+        if cats.is_cat(f):
+            return True
+    return False
 
 
 def find_best_categorical_split(

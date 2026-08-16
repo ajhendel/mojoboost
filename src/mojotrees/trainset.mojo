@@ -590,7 +590,51 @@ def _build_ctr[
     var ctr_bins = build_ctr_train_columns(
         tables, cat, n_rows, classes, permutation
     )
-    append_ctr_columns(data, ctr_bins, tables.n_columns())
+    # REPLACE or ACCOMPANY, and this one line is the whole of the difference.
+    #
+    # **CatBoost mode (`CTR_SOURCE_ONE_HOT_MAX_SIZE`) replaces.** In CatBoost
+    # there is no raw categorical split above `one_hot_max_size` at all: the
+    # one-hot candidate generator returns for such a column
+    # (`greedy_tensor_search.cpp:182`) and `AddSimpleCtrs` sends it to CTRs
+    # instead (`:469`), so what a tree searches is the CTR columns and never
+    # the column they came from. Dropping the source ids from `usable` is that
+    # statement in this codebase's terms, and it is what makes symmetric trees
+    # reachable on a categorical dataset: `tree._check_oblivious_supported`
+    # refuses a categorical column a split search can be OFFERED, and after
+    # this it is offered none. A column AT or BELOW `one_hot_max_size` never
+    # reaches this list -- `ctr_source_features` selects on
+    # `n_categories > one_hot_max_size` -- so it stays usable and is searched
+    # as one-hot by `categorical.find_best_categorical_split`, which is again
+    # what CatBoost does.
+    #
+    # **Our opt-in rule (`CTR_SOURCE_BIN_OVERFLOW`, `is_policy()`) accompanies
+    # and must keep accompanying.** It fires where the category table
+    # overflowed, under `lossguide`, where the standing rule is to mirror
+    # LightGBM and LightGBM keeps the raw column and has no CTR at all. That
+    # configuration was measured: `ctr="auto"` took average precision from
+    # 12.02 percent worse than LightGBM to 3.63 percent better, with the raw
+    # set-split still in the pool. Passing a non-empty list here would remove
+    # the column that result was measured with.
+    var replaced = List[Int]()
+    if not config.is_policy():
+        # `tables.source_features` is per SLOT and slots are ordered by source
+        # feature ascending (`AllocateCtrData`'s order, `plan_ctr_columns`), so
+        # a run-length dedupe gives the ascending distinct source columns and
+        # agrees with the plan that was actually built rather than with a
+        # second evaluation of the source rule.
+        for s in range(tables.n_slots()):
+            var f = tables.source_features[s]
+            if len(replaced) == 0 or replaced[len(replaced) - 1] != f:
+                replaced.append(f)
+    append_ctr_columns(
+        data, ctr_bins, tables.n_columns(), replaced=replaced
+    )
+    # The same removal on the mapper, so a validation set or a prediction
+    # batch transformed later is offered the same pool the trees were grown
+    # on. See `BinMapper.drop_usable` for what a serialize round trip does
+    # with it and why that is inert.
+    if len(replaced) > 0:
+        mapper.drop_usable(replaced)
 
     fit_ctr_tables(tables, cat, n_rows, classes)
     mapper.attach_ctr(tables^)
