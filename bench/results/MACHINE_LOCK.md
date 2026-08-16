@@ -13,6 +13,35 @@ coordination rule.
 Separate branches, separate worktrees, agreed file ownership. Nothing about it
 needs a lock.
 
+**With one exception, found on 2026-08-16 by losing a merge to it. Announce any
+`checkout`, `reset` or `merge` in the MAIN tree before running it.** Separate
+worktrees protect the files two sessions are writing. They do not protect the
+**index**, and a merge in progress lives entirely in `.git/MERGE_HEAD` plus an
+uncommitted working tree -- so any peer operation that touches the index
+destroys it, silently, and leaves a clean `git status` behind. **A clean status
+is not evidence that nothing was lost.** All day the hazard we guarded against
+was `git add -A` *sweeping up* another session's uncommitted work; this is its
+mirror, a peer operation *discarding* it.
+
+**`git merge --abort` is never the right response to an unexpected merge state.**
+The command that produced this was a merge that printed
+
+    fatal: Exiting because of an unresolved conflict.
+
+which is git **refusing to begin** a merge because one is already in progress. It
+is not a report that the merge you asked for conflicted -- that one names the
+conflicted paths and says `Automatic merge failed`. Read the verb. Then find out
+whose merge it is before touching it, which costs one command:
+
+    git rev-parse -q --verify MERGE_HEAD && git log -1 --oneline MERGE_HEAD
+
+**And re-running the merge after an abort "succeeding cleanly" is not evidence
+the abort was harmless.** It succeeds because the thing it was colliding with has
+been destroyed. Every check that follows -- no markers, both sides present,
+compiles, gates green -- passes on a tree that is intact and simply missing
+somebody else's work. Verifying the result cannot detect this; only asking about
+the cause can.
+
 **Timing in parallel is a machine problem, and it cannot be solved by any of
 that.** A Mojo compile running *anywhere* on this box makes a benchmark number
 garbage. So does accumulated heat. Neither is affected by which directory the
