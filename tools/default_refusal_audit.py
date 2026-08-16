@@ -179,6 +179,17 @@ ACKNOWLEDGED = {
         "RESOLVED",
         "refuses boosting_type='ordered'; the default is 'plain'",
     ),
+    ("max_depth", "src/mojotrees/train_gpu.mojo"): (
+        "DIVERGENCE",
+        "the oblivious device path refuses max_depth above 6 by name, and the "
+        "proposed default is exactly 6. So the default works and depth 7 "
+        "SILENTLY LOSES THE ACCELERATOR: the fit succeeds on the CPU and "
+        "nothing says the GPU declined. This is not a refusal the default "
+        "trips, it is a cliff the default is standing on, and the two are "
+        "different: a refusal is loud once, a cliff is quiet forever. "
+        "Recorded here because this audit is the only thing that would catch "
+        "a future default change walking off it",
+    ),
     ("boosting_type", "src/mojotrees/boosting.mojo"): (
         "RESOLVED",
         "refuses boosting_type='ordered'; the default is 'plain'",
