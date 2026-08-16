@@ -82,8 +82,12 @@ comptime SUPPORTED_KEYS = String(
     " stochastic_rounding"
 )
 
-# Parameters that name a real LightGBM feature this parser does not cover,
-# reported as unsupported instead of as unknown so the message can say why.
+# Parameters that name a real feature this parser does not cover, reported as
+# unsupported instead of as unknown so the message can say why. Almost all of
+# them are LightGBM's; `bootstrap_type`, `bagging_temperature` and
+# `bootstrap_seed` are CatBoost's Bayesian bootstrap (`sampling.mojo`), which
+# needs a `BayesianBootstrapParams` handed to a trainer exactly as GOSS needs a
+# `GossParams`, so a parameter string cannot select it either.
 #
 # `feature_contri`, `cegb_penalty_feature_coupled`, and
 # `cegb_penalty_feature_lazy` are per-feature vectors, which a
@@ -101,7 +105,8 @@ comptime _MOJO_API_ONLY = String(
     " label_gain sigmoid eval_at ndcg_eval_at class_weight is_unbalance"
     " unbalance unbalanced_sets scale_pos_weight feature_contri"
     " feature_contrib fc fp feature_penalty cegb_penalty_feature_coupled"
-    " cegb_penalty_feature_lazy"
+    " cegb_penalty_feature_lazy bootstrap_type bagging_temperature"
+    " bootstrap_seed"
 )
 
 

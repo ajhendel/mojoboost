@@ -33,6 +33,12 @@ from std.testing import assert_equal, assert_false, assert_true, TestSuite
 from mojotrees.boosting import round_has_constant_hessian
 from mojotrees.goss import GossParams
 from mojotrees.histogram import objective_has_constant_hessian
+from mojotrees.sampling import (
+    BayesianBootstrapParams,
+    bayesian_bootstrap_varies_hessian,
+    check_bayesian_bootstrap_hessian_declaration,
+    refresh_bayesian_bootstrap,
+)
 from mojotrees.objective_registry import (
     BINARY_LOGISTIC,
     CROSS_ENTROPY,
@@ -230,6 +236,89 @@ def test_bagging_is_deliberately_not_an_exclusion() raises:
     for objective in _constant_hessian_objectives():
         assert_true(
             round_has_constant_hessian(objective, _unweighted(), goss)
+        )
+
+
+def test_bayesian_bootstrap_is_an_exclusion() raises:
+    """The case `test_bagging_is_deliberately_not_an_exclusion` predicted.
+
+    That test's docstring says: "If a future sampler introduces a per-row
+    weight rather than a per-row selection, this is the assertion that should
+    be made to fail on purpose." CatBoost's Bayesian bootstrap is that sampler.
+    It keeps every row and gives each a random weight per tree, and the weight
+    multiplies the row's derivatives exactly as a `sample_weight` does
+    (CatBoost `CalcWeightedData`), so a bootstrapped fit has a per-row hessian
+    under every objective including the four constant ones.
+
+    `round_has_constant_hessian` cannot be handed the bootstrap configuration:
+    its three inputs are fixed by a contract the device trainers bind to. So
+    the exclusion is asserted here in the two forms a caller can actually
+    reach it in, and both are checked because a caller that reaches neither is
+    the silent-wrong-hessian failure this file exists to prevent.
+    """
+    var goss = GossParams.disabled()
+    var params = BayesianBootstrapParams.enable()
+
+    # Form one: the effective weights reach the predicate as `sample_weight`,
+    # which is what they are. The first exclusion in the predicate's own
+    # docstring then refuses every objective, constant ones included.
+    var weights = List[Float64]()
+    refresh_bayesian_bootstrap(weights, params, _unweighted(), 48, 0)
+    assert_equal(len(weights), 48)
+    for objective in _all_objectives():
+        assert_false(round_has_constant_hessian(objective, weights, goss))
+
+    # Form two: the sampler's own predicate, which is what a caller consults
+    # when it has the configuration but not yet the vector. Fit-scoped like
+    # `goss.enabled`, so a zero temperature -- CatBoost's early return to
+    # all-ones -- is refused too rather than being reasoned about.
+    assert_true(bayesian_bootstrap_varies_hessian(params))
+    assert_true(
+        bayesian_bootstrap_varies_hessian(
+            BayesianBootstrapParams.enable(temperature=0.0)
+        )
+    )
+    assert_false(
+        bayesian_bootstrap_varies_hessian(BayesianBootstrapParams.disabled())
+    )
+
+    # And the guard that makes the exclusion impossible to omit: declaring a
+    # constant hessian beside an active bootstrap raises instead of quietly
+    # writing the wrong plane.
+    var raised = False
+    try:
+        check_bayesian_bootstrap_hessian_declaration(params, True)
+    except:
+        raised = True
+    assert_true(raised)
+    # ... and the same call is silent when the declaration is False, and when
+    # the bootstrap is off whatever was declared, so the guard is a refusal of
+    # one combination rather than a blanket one.
+    check_bayesian_bootstrap_hessian_declaration(params, False)
+    check_bayesian_bootstrap_hessian_declaration(
+        BayesianBootstrapParams.disabled(), True
+    )
+
+
+def test_a_disabled_bootstrap_changes_nothing_the_predicate_answers() raises:
+    """The default bundle must leave every answer in this file alone.
+
+    `refresh_bayesian_bootstrap` with a disabled bundle and no user weights
+    produces an *empty* vector rather than a vector of 1.0s, deliberately: a
+    vector of ones would be refused by the weights exclusion and would cost an
+    unbootstrapped, unweighted fit its specialization for nothing. This is the
+    assertion that pins that choice, because it is the one place the default
+    path could have been moved by accident.
+    """
+    var goss = GossParams.disabled()
+    var off = BayesianBootstrapParams.disabled()
+    var weights = List[Float64]()
+    refresh_bayesian_bootstrap(weights, off, _unweighted(), 48, 0)
+    assert_equal(len(weights), 0)
+    for objective in _all_objectives():
+        assert_equal(
+            round_has_constant_hessian(objective, weights, goss),
+            _is_constant(objective),
         )
 
 

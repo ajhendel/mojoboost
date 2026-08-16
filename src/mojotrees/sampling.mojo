@@ -89,6 +89,24 @@ The one condition that cannot live in `ClassBaggingParams` is LightGBM's
 requirement that the dataset hold a positive row at all, since that needs the
 labels; see `has_positive_rows`.
 
+Bayesian bootstrap
+------------------
+CatBoost's `bootstrap_type=Bayesian` is the one row sampler here that does
+not select rows at all: every row is kept and every row is given a random
+weight, redrawn once per tree, controlled by `bagging_temperature`. The draw
+is transcribed from `catboost/private/libs/algo/tensor_search_helpers.cpp`
+(`GenerateBayessianWeight`, `GenerateRandomWeights`, `CalcWeightedData`,
+`Bootstrap`); see `bayesian_bootstrap_weight` for the formula and
+`BayesianBootstrapParams` for the option semantics.
+
+**Its weights are hessians.** Because a bootstrap weight multiplies the row's
+derivatives exactly as a sample weight does, a fit with this on has a per-row
+hessian and must NOT declare `histogram.CONSTANT_HESSIAN`.
+`bayesian_bootstrap_varies_hessian` states that, and
+`check_bayesian_bootstrap_hessian_declaration` refuses the combination
+outright, so a caller that wires this into a round loop cannot take the
+two-plane path by omission. See `boosting.round_has_constant_hessian`.
+
 Row sets and the GPU
 --------------------
 A sampled row set is an ascending, duplicate-free list of row indices, and
@@ -100,6 +118,8 @@ dense per-row multiplier that is zero off the sample, so a kernel that
 multiplies gradients by it reproduces the sampled histogram without gathering
 rows first.
 """
+
+from std.math import log
 
 from .bagging import DEFAULT_BAGGING_SEED
 from .rng import GOLDEN, splitmix64, uniform
@@ -122,6 +142,35 @@ comptime _TREE_TAG = 0
 # Separates the per-depth streams from the per-tree and per-node ones, so a
 # depth can never inherit the stream a node id already owns.
 comptime _LEVEL_DOMAIN = UInt64(0xA5A55A5AC3C33C3C)
+
+# CatBoost's `bagging_temperature` default: `bootstrap_options.cpp` constructs
+# `BaggingTemperature("bagging_temperature", 1.0)`. At 1.0 the weights are
+# standard exponentials, mean 1.
+comptime DEFAULT_BAGGING_TEMPERATURE = 1.0
+
+# CatBoost draws the bootstrap from the fit's global `random_seed`, whose
+# default is 0. mojotrees gives the bootstrap its own seed so it composes with
+# the feature and bagging seeds instead of sharing one counter, and 0 is kept
+# as the value so a port of a default CatBoost configuration reads the same.
+comptime DEFAULT_BOOTSTRAP_SEED = 0
+
+# `bootstrap_type` values this module implements.
+comptime BOOTSTRAP_NO = 0
+comptime BOOTSTRAP_BAYESIAN = 1
+
+# CatBoost's own guard against log(0), verbatim: `GenerateBayessianWeight`
+# computes `-FastLogf(rand.GenRandReal1() + 1e-100)`. Its `GenRandReal1` is
+# closed on both ends, so a draw of exactly 0 is possible there; `rng.uniform`
+# is half-open [0, 1) and can also return 0. The epsilon is carried across
+# rather than dropped so the largest weight either library can produce is the
+# same finite number, `(-log(1e-100)) ** t`, instead of an infinity here.
+comptime _BAYESIAN_LOG_EPS = 1e-100
+
+# Keeps the per-tree bootstrap stream clear of the per-tree feature stream:
+# both are keyed by (seed, tree index) and a caller is free to give both
+# samplers the same seed, so without a domain constant a tree's feature subset
+# and its row weights would be drawn from one shared counter run.
+comptime _BOOTSTRAP_DOMAIN = UInt64(0xBA9E51A4B007574B)
 
 
 def _stream(seed: Int, tree_index: Int, tag: Int) -> UInt64:
@@ -372,6 +421,9 @@ def sampling_param_names() -> List[String]:
         String("top_rate"),
         String("other_rate"),
         String("data_sample_strategy"),
+        String("bootstrap_type"),
+        String("bagging_temperature"),
+        String("bootstrap_seed"),
     ]
 
 
@@ -432,6 +484,15 @@ def canonical_sampling_param(name: String) raises -> String:
         return "other_rate"
     if name == "data_sample_strategy":
         return "data_sample_strategy"
+    # CatBoost's names; LightGBM has no weighting bootstrap at all. `subsample`
+    # is deliberately absent: CatBoost spells row bagging that way, and it
+    # already resolves to `bagging_fraction` above, which is the sampler it is.
+    if name == "bootstrap_type":
+        return "bootstrap_type"
+    if name == "bagging_temperature":
+        return "bagging_temperature"
+    if name == "bootstrap_seed":
+        return "bootstrap_seed"
     raise Error(String("unknown sampling parameter ", name))
 
 
@@ -613,6 +674,279 @@ def refresh_class_bag(
     if iteration % params.freq != 0:
         return
     sample_rows_by_class(params, labels, iteration // params.freq, bag)
+
+
+@fieldwise_init
+struct BayesianBootstrapParams(Copyable, Movable):
+    """CatBoost's `bootstrap_type=Bayesian`: per-row weights drawn per tree.
+
+    Verified against CatBoost `master` (August 2026):
+    `catboost/private/libs/options/bootstrap_options.h` and `.cpp` for the
+    option surface, `catboost/private/libs/algo/tensor_search_helpers.cpp` for
+    the draw, and `catboost/private/libs/algo/greedy_tensor_search.cpp` for how
+    often it is taken.
+
+    What the options mean there, and here:
+
+    - `bagging_temperature` defaults to **1.0** and must be `>= 0`
+      (`TBootstrapConfig::Validate`: "Bagging temperature should be >= 0").
+      Zero is not "off": it is CatBoost's early return that fills every weight
+      with exactly 1, which is the same model an unbootstrapped fit builds.
+      Larger temperatures stretch the weight distribution, so the sampler
+      becomes a stronger regularizer as it rises.
+    - `subsample` is **refused** beside Bayesian bootstrap, in CatBoost and
+      here: "bayesian bootstrap doesn't support 'subsample' option". Bayesian
+      bootstrap keeps every row, so there is no fraction to set. mojotrees's
+      `bagging_fraction` is the row-dropping sampler (CatBoost's Bernoulli),
+      and the two do not compose.
+    - `sampling_frequency` defaults to `PerTree`
+      (`oblivious_tree_options.cpp`), and `greedy_tensor_search.cpp` calls
+      `DoBootstrap` once per tree under that default and once per level under
+      `PerTreeLevel`. Only the per-tree schedule is implemented here, which is
+      why the draw is keyed by tree index and not by (tree, depth).
+    - `sampling_unit` defaults to `Object` (per row). CatBoost's `Group` unit
+      gives every row of a query group one shared weight; that belongs with
+      the ranker, which samples whole queries already, and is not implemented
+      here.
+
+    Disabled by default, so an untouched bundle draws nothing and leaves every
+    fit byte for byte the fit it is today.
+    """
+
+    var enabled: Bool
+    var temperature: Float64
+    var seed: Int
+
+    @staticmethod
+    def disabled() -> BayesianBootstrapParams:
+        """No bootstrap: every row keeps weight 1 (the library default)."""
+        return BayesianBootstrapParams(
+            False, DEFAULT_BAGGING_TEMPERATURE, DEFAULT_BOOTSTRAP_SEED
+        )
+
+    @staticmethod
+    def enable(
+        temperature: Float64 = DEFAULT_BAGGING_TEMPERATURE,
+        seed: Int = DEFAULT_BOOTSTRAP_SEED,
+    ) -> BayesianBootstrapParams:
+        """Bayesian bootstrap at CatBoost's defaults."""
+        return BayesianBootstrapParams(True, temperature, seed)
+
+    def validate(self) raises:
+        """CatBoost's `TBootstrapConfig::Validate` rule for this type. The
+        comparison is written so that a NaN temperature is rejected too."""
+        if not (self.temperature >= 0.0):
+            raise Error("bagging_temperature must be >= 0")
+
+    def draws_weights(self) -> Bool:
+        """Whether a caller has to materialize a per-row weight buffer.
+
+        False at `temperature == 0` even when enabled, because that is
+        CatBoost's own early return to all-ones and no draw is taken; the
+        weights would be a vector of exactly 1.0. It is deliberately NOT the
+        test the constant-hessian exclusion uses -- see
+        `bayesian_bootstrap_varies_hessian`, which is coarser on purpose.
+        """
+        return self.enabled and self.temperature != 0.0
+
+
+def bayesian_bootstrap_varies_hessian(
+    params: BayesianBootstrapParams,
+) -> Bool:
+    """Whether a fit configured this way has a per-row hessian, so that
+    `histogram.CONSTANT_HESSIAN` must not be declared for it.
+
+    A bootstrap weight multiplies the row's derivatives exactly as a sample
+    weight does (CatBoost `CalcWeightedData`:
+    `sampleWeightedDerivativesData[z] = weightedDerivativesData[z] *
+    sampleWeightsData[z]`, and then `SampleWeights[i] *= learnWeights[i]` so
+    the leaf denominators carry the product). Under an objective whose
+    unweighted hessian is the literal 1.0, a bootstrapped round stores the
+    drawn weight into `hess` instead, so a histogram builder told to rebuild
+    the hessian plane from the count would rebuild the wrong plane, silently.
+
+    `params.enabled` is the whole test, and `temperature` is deliberately not
+    consulted, for the same reason `boosting.round_has_constant_hessian` tests
+    `goss.enabled` rather than `goss.active`: the declaration is held for a
+    whole fit (on the device it is builder state set once and cannot be
+    withdrawn mid-loop), and a safety predicate that reasons about the value of
+    a `Float64` knob is one edit away from being wrong. A `temperature == 0`
+    fit therefore pays for the third plane and gets the same model; that is the
+    cheap side of the trade.
+    """
+    return params.enabled
+
+
+def check_bayesian_bootstrap_hessian_declaration(
+    params: BayesianBootstrapParams, const_hessian: Bool
+) raises:
+    """Refuse a constant-hessian declaration beside an active bootstrap.
+
+    `boosting.round_has_constant_hessian` is the predicate that makes the
+    declaration, and it cannot see a bootstrap configuration: its three inputs
+    are the objective, the sample weights, and the GOSS parameters, and its
+    signature is a GPU-visible contract that no CPU lane may widen. So the
+    guard lives here instead, on the sampler's own side, and a caller that
+    wires this into a round loop calls it once per fit with whatever it
+    decided. It costs one branch per fit and converts the failure mode from a
+    quietly wrong hessian plane into an exception at fit setup.
+    """
+    if bayesian_bootstrap_varies_hessian(params) and const_hessian:
+        raise Error(
+            "a fit with bayesian bootstrap active must not declare a"
+            " constant hessian: the bootstrap weight multiplies the row's"
+            " derivatives, so the hessian is the weight and varies per row"
+        )
+
+
+def _bootstrap_stream(seed: Int, tree_index: Int) -> UInt64:
+    """Start of the counter stream for one tree's weights.
+
+    Same shape as `_stream` and `_level_stream`: mix the seed, spread the tree
+    index by the golden-ratio increment, mix again, and separate the whole
+    space from the feature sampler's with a domain constant. Sign bits are
+    masked off so negative seeds are accepted without relying on
+    signed-to-unsigned conversion.
+
+    The stream is a *start*, not a running state: row r reads
+    `stream + r` and nothing advances, so no row's weight depends on how many
+    rows were drawn before it.
+    """
+    var h = splitmix64(UInt64(seed & 0x7FFFFFFFFFFFFFFF) ^ _BOOTSTRAP_DOMAIN)
+    return splitmix64(h ^ (UInt64(tree_index & 0x7FFFFFFFFFFFFFFF) * GOLDEN))
+
+
+def bayesian_bootstrap_weight(
+    temperature: Float64, stream: UInt64, row: Int
+) -> Float64:
+    """One row's weight, a transcription of CatBoost's
+    `GenerateBayessianWeight`.
+
+        const float w = -FastLogf(rand.GenRandReal1() + 1e-100);
+        return powf(w, baggingTemperature);
+
+    So the weight is an exponential(1) draw raised to the temperature. At
+    `temperature == 1` it is exactly the exponential, mean 1, which is what
+    makes the bootstrap a reweighting rather than a rescaling: the weights
+    average to 1 and the round's total hessian mass is preserved in
+    expectation.
+
+    Two deliberate differences from CatBoost, both of them the difference the
+    rest of this module already makes:
+
+    - **The stream.** CatBoost splits the rows into blocks of 1000, gives each
+      block a `TRestorableFastRng64(randSeed + blockIdx)`, advances it 10
+      steps "to reduce correlation between RNGs in different threads", and
+      then draws sequentially within the block, so a row's weight depends on
+      its position inside its block and on the block size. mojotrees derives a
+      counter-based splitmix64 stream from (seed, tree index) and indexes it by
+      the row, so a row's weight depends on (seed, tree, row) and on nothing
+      else: not on a block layout, not on a thread count, not on how many rows
+      or trees came before. The distribution and the per-row transform are the
+      same; the individual weights for a given seed are not.
+    - **The width.** CatBoost's log, power, and weight are `float`; this is
+      `Float64` throughout, as every other draw here is.
+    """
+    var u = uniform(stream + UInt64(row))
+    return (-log(u + _BAYESIAN_LOG_EPS)) ** temperature
+
+
+def bayesian_bootstrap_weights(
+    params: BayesianBootstrapParams,
+    n_rows: Int,
+    tree_index: Int,
+    mut weights: List[Float64],
+) raises:
+    """Fill `weights` with tree number `tree_index`'s draw, one entry per row.
+
+    `weights` is resized rather than appended to, so a round loop can hand the
+    same buffer back every tree and allocate once for the whole fit.
+
+    A disabled bundle and a zero temperature both fill exactly 1.0 and take no
+    draw at all, which is CatBoost's early return
+    (`if (baggingTemperature == 0) { Fill(..., 1); return; }`). The rows are
+    walked in order only because the buffer is; every entry is computed from
+    its own row index, so any order, and any partition across workers,
+    produces the identical buffer.
+    """
+    params.validate()
+    if n_rows < 0:
+        raise Error("n_rows must be nonnegative")
+    if tree_index < 0:
+        raise Error("tree_index must be nonnegative")
+    weights.clear()
+    weights.resize(n_rows, 1.0)
+    if not params.draws_weights():
+        return
+    var stream = _bootstrap_stream(params.seed, tree_index)
+    for r in range(n_rows):
+        weights[r] = bayesian_bootstrap_weight(params.temperature, stream, r)
+
+
+def refresh_bayesian_bootstrap(
+    mut weights: List[Float64],
+    params: BayesianBootstrapParams,
+    base_weight: List[Float64],
+    n_rows: Int,
+    tree_index: Int,
+) raises:
+    """The round's effective per-row weight: the tree's bootstrap draw times
+    the user's own `sample_weight`.
+
+    This is CatBoost's `CalcWeightedData` tail, `SampleWeights[i] *=
+    learnWeights[i]`, and it is the reason a bootstrapped fit is a *weighted*
+    fit as far as everything downstream is concerned: the product is what
+    multiplies the derivatives and what the leaf denominators sum. An empty
+    `base_weight` is the "unweighted" convention used everywhere else here and
+    leaves the draw alone.
+
+    A disabled bundle leaves `weights` empty rather than filling it with ones,
+    so a caller can pass it straight through as the fit's `sample_weight` and
+    an unbootstrapped, unweighted fit stays exactly unweighted -- no vector of
+    1.0s that would make `boosting.round_has_constant_hessian` refuse a fit it
+    should admit, and no bits moved on the default path.
+    """
+    if len(base_weight) != 0 and len(base_weight) != n_rows:
+        raise Error("sample_weight length must match the row count")
+    if not params.enabled:
+        params.validate()
+        weights.clear()
+        if len(base_weight) != 0:
+            weights.resize(n_rows, 1.0)
+            for r in range(n_rows):
+                weights[r] = base_weight[r]
+        return
+    bayesian_bootstrap_weights(params, n_rows, tree_index, weights)
+    if len(base_weight) != 0:
+        for r in range(n_rows):
+            weights[r] = weights[r] * base_weight[r]
+
+
+def canonical_bootstrap_type(value: String) raises -> String:
+    """The `bootstrap_type` value one spelling selects.
+
+    Only CatBoost's `No` and `Bayesian` are implemented. `Bernoulli` is
+    refused by name rather than as an unknown value because mojotrees already
+    has it under another name -- it is row bagging, `bagging_fraction` with
+    `bagging_freq`, which is the same draw CatBoost's `subsample` makes -- and
+    telling a user that a real bootstrap type is unknown would be misleading.
+    `MVS` and `Poisson` are refused the same way; CatBoost itself refuses
+    Poisson on the CPU.
+    """
+    if value == "no" or value == "none":
+        return "no"
+    if value == "bayesian":
+        return "bayesian"
+    if value == "bernoulli":
+        raise Error(
+            "bootstrap_type 'bernoulli' is row bagging under another name;"
+            " use bagging_fraction with bagging_freq"
+        )
+    if value == "mvs" or value == "poisson":
+        raise Error(
+            String("bootstrap_type '", value, "' is not implemented")
+        )
+    raise Error(String("unknown bootstrap_type ", value))
 
 
 def check_row_set(rows: List[Int], n_rows: Int) raises:
