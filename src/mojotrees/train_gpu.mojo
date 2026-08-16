@@ -411,6 +411,7 @@ def split_search_decision_for(
         params.num_leaves,
         _device_search_semantics_supported(params),
         builder.resident_frontier_fits(params.num_leaves),
+        params.grow_policy,
     )
 
 

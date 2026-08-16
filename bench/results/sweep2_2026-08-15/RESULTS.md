@@ -232,3 +232,44 @@ The slope finding stands untouched, and it is still the larger problem. Our
 marginal cost per row equals LightGBM's on ten CPU cores whatever happens to the
 intercept. Removing every synchronization leaves that entirely intact, so the
 histogram kernel remains where the multiple has to come from.
+
+## Addendum 3: why the gate moved one arm and not the other
+
+Asked as "are we fixated on depth-wise". The counters answer it without
+argument. At 250,000 rows by 50 features with the policy-aware gate live:
+
+| arm | syncs | per tree | wall |
+|---|---|---|---|
+| GPU leaf-wise | 3,100 | 31 | 1.956 s |
+| GPU depth-wise | 600 | 6 | 1.207 s |
+
+**The gate changes depth-wise's synchronization count and does not change
+leaf-wise's at all**, which is why it moved one arm 0.70 seconds and the other
+by nothing.
+
+The mechanism is the growth policy, not the scan. Leaf-wise needs an answer
+after every split before it can enqueue the next, so it makes 31 round trips per
+tree whether the scan runs on the host or on the device. Moving the scan changes
+only *what* comes back, a 136-byte record instead of a 153 KB histogram, and on
+Metal that is irrelevant: a blocking readback costs about 450 microseconds
+regardless of its size, of which under four microseconds is moving bytes.
+Depth-wise commits a whole level per step, so a level's answers batch into one
+wait and 31 becomes 6.
+
+So the scan location was never a lever for leaf-wise, and the earlier finding
+that the device search merely ties the host scan for leaf-wise at 250,000 was
+the same fact seen from the other side.
+
+**Depth-wise is a control arm, not a direction.** It is the only working way to
+measure what removing per-split waits is worth, because the leaf-wise resident
+plane crashes whenever it executes. Every depth-wise number is a preview of
+where leaf-wise lands once that plane runs, and the plane removes *more* waits
+than depth-wise does, one per tree against six, while growing the same tree the
+project grows today.
+
+The one thing depth-wise genuinely teaches leaf-wise is separate from the waits:
+building a level's histograms in one launch fills the GPU better than building
+one small leaf at a time. Leaf-wise can have that without changing its tree, by
+building the frontier's pending histograms speculatively, since a child
+histogram is valid whenever it is computed. That is an exact transformation, not
+an approximation, and it is where this result should feed back in.

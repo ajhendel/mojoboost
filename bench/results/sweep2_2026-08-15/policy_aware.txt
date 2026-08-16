@@ -1,0 +1,4 @@
+gpu_depth_train_s_median: 1.207202
+gpu_depth_spread_pct: 7.2
+gpu_train_s_median: 1.956486
+gpu_spread_pct: 3.7
