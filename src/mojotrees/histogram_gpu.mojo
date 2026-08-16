@@ -665,6 +665,36 @@ struct GpuHistogramBuilder(Movable):
         """The launch shape `set_feature_group` last chose."""
         return self.rows.feature_group
 
+    def set_row_unroll(mut self, on: Bool):
+        """Whether the histogram row loop keeps `HIST_ROW_UNROLL` rows in
+        flight or walks one row per iteration.
+
+        The forwarder exists for the same reason `set_feature_group`'s does:
+        `train_gpu` constructs its own builder, so a benchmark that wants both
+        arms end to end has no other way to reach the setting, and the knob is
+        deliberately a runtime argument rather than an environment variable
+        because this machine's device timings drift several-fold between time
+        windows and only interleaved arms compare.
+
+        Like the feature group this is a launch shape and not a numeric
+        option. Both arms visit the same rows of the same range and add the
+        same fixed-point integers into the same bins, and integer addition is
+        associative and commutative, so the histogram is identical either way.
+        The argument is written out at `GpuActiveRows.set_row_unroll`, which
+        this forwards to unchanged.
+
+        Why it is worth reaching end to end rather than trusting the isolated
+        histogram benchmark: the row-tile floor measured well in isolation and
+        was a 22 to 36 percent regression in a whole fit, because the isolated
+        shape did not carry the partial traffic the real round does. A kernel
+        arm that does not show up in a fit is not a win in a fit.
+        """
+        self.rows.set_row_unroll(on)
+
+    def row_unroll(self) -> Bool:
+        """The row-walk arm `set_row_unroll` last chose."""
+        return self.rows.row_unroll
+
     def set_constant_hessian(mut self, on: Bool):
         """Declare that this round's objective guarantees a per-row hessian
         of exactly `histogram.CONSTANT_HESSIAN`, so the histogram kernels may

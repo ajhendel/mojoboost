@@ -2938,6 +2938,7 @@ def train_gpu(
     goss: GossParams = GossParams.disabled(),
     objective_source: Int = OBJECTIVE_SOURCE_AUTO,
     split_search: Int = SPLIT_SEARCH_AUTO,
+    row_unroll: Bool = True,
 ) raises -> Booster:
     """Train a boosted ensemble with tree growth on the GPU. Same contract
     as `train` (objectives, sample_weight, alpha, bagging, and GOSS
@@ -2951,7 +2952,17 @@ def train_gpu(
     `objective_source` and `split_search` are the two device stages'
     switches (see the OBJECTIVE_SOURCE_* and SPLIT_SEARCH_* constants);
     both default to the behavior this trainer already shipped. The overload
-    below takes a `GpuSession` and is otherwise identical."""
+    below takes a `GpuSession` and is otherwise identical.
+
+    `row_unroll` is a launch shape rather than a numeric option and defaults
+    to the shape this trainer ships. It is an argument at all so that a
+    benchmark can hold both arms in one process: this machine's device
+    timings drift several-fold between time windows, so only interleaved arms
+    compare, and an environment variable would force a two-build comparison.
+    It cannot change a model. Both arms visit the same rows and add the same
+    fixed-point integers into the same bins, and integer addition is
+    associative, so the histograms are identical and therefore so is every
+    split chosen from them. See `GpuActiveRows.set_row_unroll`."""
     comptime if not has_accelerator():
         raise Error("GPU training requires an accelerator")
     else:
@@ -2995,6 +3006,7 @@ def train_gpu(
         builder.set_constant_hessian(
             round_has_constant_hessian(objective, sample_weight, goss)
         )
+        builder.set_row_unroll(row_unroll)
         var life = NoLifecycle()
         return _train_gpu_rounds(
             builder,
@@ -3025,6 +3037,7 @@ def train_gpu(
     goss: GossParams = GossParams.disabled(),
     objective_source: Int = OBJECTIVE_SOURCE_AUTO,
     split_search: Int = SPLIT_SEARCH_AUTO,
+    row_unroll: Bool = True,
 ) raises -> Booster:
     """`train_gpu` on a caller-owned session: the builder borrows the
     session's context and its ledgers record the construction, and every
@@ -3064,6 +3077,9 @@ def train_gpu(
         builder.set_constant_hessian(
             round_has_constant_hessian(objective, sample_weight, goss)
         )
+        # A launch shape, not a number: see the session-free overload. A
+        # session owns the context, so it cannot change this answer either.
+        builder.set_row_unroll(row_unroll)
         # `MOJOTREES_HYBRID_LEAVES` against this run's real facts. Reports
         # the workload-aware split resolution rather than treating AUTO as
         # the historical host default.
