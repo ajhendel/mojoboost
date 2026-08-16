@@ -492,3 +492,68 @@ non-shipping arm. It decides both this lane's ceiling and whether the next lane
 should attack atomics rather than addresses. Nobody has measured it, and every
 estimate in this batch has been bounded above by it without anyone knowing by how
 much.
+
+
+---
+
+## DeviceGraph on Metal: answered, and the answer is no
+
+**Verified by execution** on Apple M4, MAX 26.5.0 / Mojo 1.0.0 (ed45d567):
+
+    DeviceGraph.create raised: createGraphBuilder() not supported on this
+    device context
+
+`max.gpu.host.device_graph` compiles, `DeviceGraph` constructs from its fieldwise
+init, and `DeviceGraph.create(ctx, build)` type-checks and elaborates against real
+kernels. **It fails at builder creation, before any node is added**, so
+`add_function`, `add_copy`, `add_memset`, `region`, `recording_context` and
+`replay` are all unreachable. Nothing captures.
+
+The missing piece is not a Mojo symbol: it is
+`MLRT/lib/Driver/DeviceContext/Metal/MetalDeviceGraphBuilder.cpp`, a file that
+does not exist in this build. The driver source set in the binary's string table
+is CPU, CUDA + `CUDADeviceGraphBuilder.cpp`, HIP + `HIPDeviceGraphBuilder.cpp`,
+`MetalDeviceContext.cpp` **with no graph builder**, and Virtual. No environment
+gate exists.
+
+### Why this is an upgrade rather than a restatement
+
+`docs/GPU_PORTABILITY.md` already said "no `MetalDeviceGraphBuilder`", derived
+from the same symbol table. **What was never established is the thing that
+matters**: a missing implementation file is equally consistent with a silent
+no-op, a submission-batching fallback, and a hard raise -- three different design
+consequences.
+
+**It raises loudly at the first call, which is the best of the three**, because
+nothing can build on it by accident and no benchmark can measure a graph that
+captured nothing. That is a fact about what we are safe from, not just about what
+we do not have.
+
+### Consequence for the campaign
+
+**The `last-waits` brief does not change.** It was to become "capture once,
+replay per tree, one readback at the end" if this came back yes. It came back no,
+so the resident plane's design -- enqueue a tree ahead, one round trip at the end
+-- **is the best this platform offers**, and it is already built and measured at
+0.75 seconds.
+
+### And the answer for a future CUDA or HIP port, recovered from the compiled package
+
+`DeviceGraph` exposes only `replay()`, `copy` and `take_handle`. **There is no
+node-update call**; CUDA's `cudaGraphExecKernelNodeSetParams` is not surfaced. So
+between replays **nothing may vary but device memory**.
+
+- **The half that fits.** The resident plane's kernels read decisions from a
+  device-side step descriptor rather than taking them as launch arguments, so
+  every kernel *argument* is a session-stable pointer that survives capture
+  unchanged. **That is a real unplanned dividend** from work done for an
+  unrelated reason.
+- **The half that does not.** `grid_dim` freezes at capture, and our launches
+  size grids to the live frontier. A captured per-tree graph would launch
+  max-sized grids that early-out on the descriptor, paying for the largest
+  frontier every round. Whether that trade wins is unmeasurable here and the lane
+  did not guess.
+- `builder.recording_context()` returns a `DeviceContext` view on which ordinary
+  `enqueue_*` calls record into the graph, so existing launch code would migrate
+  unmodified -- and host-visible waits raise inside it by design, which is the
+  discipline `CLEANSHEET_GPU.md` already imposes.
