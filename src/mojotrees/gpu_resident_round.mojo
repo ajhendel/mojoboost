@@ -1789,6 +1789,47 @@ def _growth_finished_normally(status: Int) -> Bool:
     return status == TREE_BUDGET_SPENT or status == TREE_NO_CANDIDATE
 
 
+def resident_child_node_base(step: Int) -> Int:
+    """The node id of the LEFT child committed by growth step `step`, derived
+    on the host with no device readback.
+
+    `random_strength` keys its draw by node id
+    (`gpu_split_search.random_score_stream`), and the whole claim of the
+    resident plane is that the host does not learn which leaf the device
+    picked. Those two look irreconcilable and are not, because the node ids a
+    step hands its two children are a function of the *step index* and of
+    nothing the pick decides:
+
+    - `enqueue_desc_begin_tree` writes `CTR_NEXT_NODE = 1`
+      (`gpu_tree_tables.mojo:2379`); node 0 is the root.
+    - a committing `_pick_and_commit_kernel` reads `next_node`, assigns
+      `left_node = next_node` and `right_node = next_node + 1`
+      (`gpu_tree_tables.mojo:1198-1200`), and stores `next_node + 2`
+      (`:1449`).
+    - steps commit consecutively from step 0 until the first terminal one,
+      and a terminal status is sticky: every kernel after it reads
+      `STEP_LIVE = 0` and returns, so the tables the next step reduces over
+      are unchanged and it reaches the same terminal answer. That argument is
+      written out in `grow_tree_device_resident` under "the step that ends
+      growth".
+
+    So step `s` commits nodes `2s + 1` and `2s + 2` whenever it commits at
+    all, and when it does not commit its two searches are dead records that
+    nothing reads. **This is a derivation, not a guess**, and it is the reason
+    this plane does not have to invent a synthetic node id -- which would
+    produce noise that is deterministic and keyed to the wrong thing, and
+    would therefore look correct while putting the two backends on different
+    draws.
+
+    It also agrees with the host grower's numbering, which is what makes the
+    noise the *same* noise: `tree._set_split` appends the two children in
+    commit order too, so the k-th split of a CPU tree creates nodes `2k + 1`
+    and `2k + 2` as well, and claim 1 of `grow_tree_device_resident` is that
+    the device picks the same leaf at every step.
+    """
+    return 2 * step + 1
+
+
 def _launch_child_search(
     mut searcher: GpuSplitSearcher,
     mut hist: DeviceBuffer[DType.int32],
@@ -1796,9 +1837,25 @@ def _launch_child_search(
     record_base: Int,
     n_records: Int,
     widest_slots: Int,
+    node_base: Int,
 ) raises:
     """One search launch pair over `n_records` consecutive record slots,
     without restaging or recopying any per-record table.
+
+    `node_base` is the node id record `record_base` is searching, and record
+    `record_base + i` searches node `node_base + i`; `resident_child_node_base`
+    derives it from the step index. It is read by `random_strength` and by
+    nothing else, exactly as `SplitNodeRequest.node` is on the batched entry
+    point, and it is ignored when the noise is off.
+
+    **The noise plane crosses here and the tables do not**, which is the whole
+    reason this can stage anything at all. `_copy_noise` copies a
+    `create_sub_buffer` window over exactly the records this launch searches
+    and touches no other device buffer, so the staleness hazard the paragraph
+    below describes -- the host's stale mirror of a device-written histogram
+    base -- is not reintroduced by it. `_check_noise_staged` runs first for
+    the same reason `enqueue` runs it: a record searched against another
+    node's plane, or against zeros, announces itself nowhere.
 
     `GpuSplitSearcher.enqueue_frontier` is the ordinary way in and it cannot
     be used here, for a reason that is easy to miss and would have been
@@ -1822,6 +1879,12 @@ def _launch_child_search(
     staged once. That is holdout three from `gpu_tree_tables`, and it is what
     makes this loop reachable at all.
     """
+    var noisy = searcher.noise_stdev > 0.0
+    if noisy:
+        for i in range(n_records):
+            searcher.stage_random_score(record_base + i, node_base + i)
+    searcher._check_noise_staged(record_base, n_records)
+    searcher._copy_noise(record_base, n_records)
     _launch_search(
         searcher.ctx,
         hist,
@@ -1832,6 +1895,7 @@ def _launch_child_search(
         searcher.catn_dev,
         searcher.mono_dev,
         searcher.fparam_dev,
+        searcher.noise_dev,
         searcher.slot_i_dev,
         searcher.slot_f_dev,
         searcher.rec_i_dev,
@@ -1849,6 +1913,7 @@ def _launch_child_search(
         split_params.cat.min_data_per_group,
         searcher.wide_scan,
         searcher.use_primitives,
+        noisy=noisy,
     )
 
 
@@ -2313,7 +2378,18 @@ def grow_tree_device_resident(
     var root_batch = List[SplitNodeRequest]()
     root_batch.append(
         SplitNodeRequest(
-            0, List[Int](), List[Bool](), OutputBounds.unbounded()
+            0,
+            List[Int](),
+            List[Bool](),
+            OutputBounds.unbounded(),
+            # The root's node id, and the first `0` is its histogram slot.
+            # `SplitNodeRequest.node` defaults to -1 for "not supplied", and
+            # `enqueue_frontier` refuses -1 once `random_strength` is on --
+            # correctly, since a batch of -1s would draw every node of the
+            # tree from one stream. The root is node 0 by construction
+            # (`enqueue_desc_begin_tree` writes `CTR_NEXT_NODE = 1`), so it
+            # is supplied here rather than left to be refused.
+            0,
         )
     )
     searcher.enqueue_frontier(
@@ -2408,6 +2484,10 @@ def grow_tree_device_resident(
             # this launch reads one word and returns.
             builder.rows.enqueue_spec_subtract(pool_handle, slot_cells)
         # Search both children in one launch pair, into the scratch records.
+        # `resident_child_node_base(step)` is the left child's node id, which
+        # `random_strength` keys its draw by and which is derivable on the
+        # host without learning anything the device decided; see there. At the
+        # default of `random_strength = 0` it is read by nothing.
         _launch_child_search(
             searcher,
             builder.batcher[0].out_dev,
@@ -2415,6 +2495,7 @@ def grow_tree_device_resident(
             scratch_l,
             RESIDENT_SCRATCH_RECORDS,
             widest,
+            resident_child_node_base(step),
         )
         # File the two answers in the frontier slots that own them.
         builder.enqueue_desc_copy_records(
@@ -2946,6 +3027,48 @@ def grow_tree_device_oblivious(
             " live, and a plan that builds both of its children overwrites the"
             " histogram the next pick reads on a miss. See"
             " OBLIVIOUS_SPECULATION"
+        )
+    # ---- random_strength, refused here and wired on the leaf-wise plane ----
+    #
+    # Refused by name rather than dropped, and refused for a reason that is
+    # about the *rule* and not about wiring, which is why it is here and not on
+    # a list of things a later lane connects.
+    #
+    # `random_strength` draws one normal per (seed, tree, **node**, feature,
+    # bin) and adds it to that candidate's gain. An oblivious level does not
+    # have a node. `_scan_slot_oblivious_kernel` scores one candidate by
+    # summing its gain over every leaf of the level, and the single answer that
+    # comes back is the level's split; the leaf records it reads carry a
+    # histogram base and nothing else. So there is no node id to key the draw
+    # by, and every id the level *does* hold -- the lowest node of the level,
+    # the leaf ordinal, the level index -- would be a synthetic key: the draw
+    # would be deterministic and reproducible and keyed to the wrong thing,
+    # which is worse than no noise because it would look correct and would put
+    # the two backends on different numbers.
+    #
+    # There is also nothing to add it to. `_launch_oblivious_search` takes no
+    # noise plane at all (`gpu_split_search.mojo`), and adding one means adding
+    # a term inside the cross-leaf sum, which is that kernel's gain arithmetic
+    # and belongs to whoever owns it -- and the placement question there is a
+    # real one, since noising per (leaf, candidate) and noising per candidate
+    # once are different regularizers with the same name.
+    #
+    # And the refusal is the whole answer for this configuration, not a slower
+    # path: `train_gpu._grow_tree_gpu_device_search` routes `grow_policy =
+    # oblivious` here unconditionally, without consulting the AUTO split-search
+    # decision, because no other grower on this backend builds a symmetric
+    # tree. So this names the CPU backend, as the other oblivious refusals do.
+    if searcher.random_score_stdev() > 0.0:
+        raise Error(
+            "random_strength cannot be honored by the device oblivious"
+            " grower: its draw is keyed by node id and a symmetric level has"
+            " no node -- one candidate is scored by summing its gain over"
+            " every leaf of the level, and the level's split is one answer."
+            " Any id this loop could supply (the level's lowest node, a leaf"
+            " ordinal, the level index) would be a synthetic key and would"
+            " put the two backends on different draws while looking correct."
+            " Use grow_policy=leafwise, which honors it, or device='cpu',"
+            " whose oblivious grower is the comparator"
         )
     var budget = oblivious_leaf_budget(params)
     # The level record sits outside the leaf records it reads, because the scan

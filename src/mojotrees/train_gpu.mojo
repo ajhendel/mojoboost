@@ -1536,6 +1536,51 @@ def _grow_tree_gpu_device_search(
     # Hoisted out of the per-tree loop: see `GpuSplitSearcherCache` for why
     # a searcher may be reused and what the reset restores.
     cache.reset_for_tree(builder, params, tree_features, signs)
+    # ---- CatBoost's `random_strength` on the device searcher --------------
+    #
+    # The one call site. Everything under it already exists and is tested:
+    # `set_random_score` sizes the plane and invalidates every staged record,
+    # `stage_random_score` draws one node's plane host-side in Float64 (the
+    # draw is Marsaglia polar and stays on the host deliberately -- Apple GPUs
+    # have no Float64 and an ulp-level rejection difference would put the two
+    # backends on different draws), `_copy_noise` uploads exactly the records a
+    # launch searches, and the scan kernels add the plane's cell to the
+    # candidate's gain. What was missing was this line and the node ids the
+    # resident loop supplies (`gpu_resident_round.resident_child_node_base`).
+    #
+    # Per tree, not per fit: the standard deviation is CatBoost's `scoreStDev`,
+    # whose last two factors are properties of the ensemble at this iteration,
+    # and the draw is keyed by the tree index. `random_score_stdev()` is
+    # `random_strength * random_score_scale`, and the second factor is written
+    # onto the round loop's own copy of the bundle before growth.
+    #
+    # **Guarded rather than called unconditionally.** At the shipped default
+    # of `random_strength = 0` the product is 0.0, the searcher stays in the
+    # state its constructor left it in, no plane is allocated, and this grower
+    # issues exactly the launches it issued before this line existed. That is
+    # the property to preserve: `set_random_score(0.0, ...)` would also be
+    # correct but would walk `max_records` slots per tree for nothing.
+    #
+    # **NOT REACHED BY ANY FIT TODAY, AND THAT IS DELIBERATE.**
+    # `_check_device_search_supported` above refuses `params.extra.is_active()`
+    # and `random_strength > 0.0` is one of its arms, so this line is dead
+    # until that gate is split into "needs a gain adjustment" and "the device
+    # search cannot express this", which is another session's edit. The order
+    # is not negotiable: the plane is wired first so the gate's removal is
+    # earnable, because a gate that stops declining before the plane is staged
+    # trains every default GPU fit with no split noise while the CPU trains
+    # with it -- no error, no record, two different models under one default.
+    # There is a second link still missing, and it is named here so the gate is
+    # not removed against a half-wired path: no GPU round loop computes
+    # `ExtraTreeParams.random_score_scale`, and `check_scalars` says in so many
+    # words that "the device loops do not compute it and this refusal is
+    # correct for them". Until one does, this product is zero on every fit.
+    if params.extra.random_score_stdev() > 0.0:
+        cache.searchers[0].set_random_score(
+            params.extra.random_score_stdev(),
+            params.extra.random_strength_seed,
+            tree_index,
+        )
     var split_params = GpuSplitParams(
         params.lambda_reg,
         params.lambda_l1,
