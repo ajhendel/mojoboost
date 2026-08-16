@@ -90,7 +90,13 @@ def _one_wide_column() raises -> CtrTables:
     var counts = List[Int]()
     counts.append(0)
     counts.append(4)
-    return plan_ctr_columns(_binary_config(), flags, counts, 255)
+    var tables = plan_ctr_columns(_binary_config(), flags, counts, 255)
+    # The bucket table. Codes are 1..4 so that a raw value equals its bucket,
+    # which keeps every assertion below readable; the mapping itself is
+    # `CtrTables.bucket_of` and is exercised by the unseen-code test.
+    tables.slot_codes = [1, 2, 3, 4]
+    tables.slot_code_offsets = [0, 4]
+    return tables^
 
 
 # ---------------------------------------------------------------------------
@@ -398,10 +404,13 @@ def test_a_row_and_a_batch_score_the_same_bin() raises:
     for r in range(4):
         # Base bins for a two-feature row: feature 0 numerical, feature 1 the
         # categorical column whose bucket this row holds.
-        var base = List[Int]()
-        base.append(0)
-        base.append(cat[r])
-        var single = ctr_predict_row(tables, base)
+        # A RAW row now: feature 0 numerical, feature 1 the categorical
+        # column's raw code. `ctr_predict_row` maps it through the same
+        # `bucket_of` the batch path uses, which is what makes the two agree.
+        var raw = List[Float64]()
+        raw.append(0.0)
+        raw.append(Float64(cat[r]))
+        var single = ctr_predict_row(tables, raw)
         assert_equal(len(single), tables.n_columns())
         for c in range(tables.n_columns()):
             assert_equal(single[c], Int(batch[c * 4 + r]))
@@ -422,10 +431,10 @@ def test_an_unseen_category_lands_in_bucket_zero_and_gets_the_prior() raises:
     classes.append(1)
     fit_ctr_tables(tables, cat, 4, classes)
 
-    var base = List[Int]()
-    base.append(0)
-    base.append(0)  # bucket 0: never seen in training
-    var bins = ctr_predict_row(tables, base)
+    var raw = List[Float64]()
+    raw.append(0.0)
+    raw.append(99.0)  # a code absent from slot_codes, so bucket 0
+    var bins = ctr_predict_row(tables, raw)
     # Column 0 is prior 0: `(0 + 0) / (0 + 1) * 15 = 0`.
     assert_equal(bins[0], 0)
     # Column 2 is prior 1: `(0 + 1) / (0 + 1) * 15 = 15`, the top bucket.

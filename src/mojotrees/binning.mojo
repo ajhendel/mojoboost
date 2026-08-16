@@ -1809,70 +1809,68 @@ def all_features(n_features: Int) -> List[Int]:
 # ---------------------------------------------------------------------------
 
 
-def ctr_slot_columns(
-    bins: List[UInt8], n_rows: Int, tables: CtrTables
+def ctr_slot_columns[
+    features_origin: ImmOrigin, //
+](
+    features: Span[Float64, features_origin],
+    n_rows: Int,
+    tables: CtrTables,
 ) raises -> List[Int]:
-    """The category bucket of every CTR source column, slot-major.
+    """The category bucket of every CTR source column, slot-major, read from
+    the RAW category codes.
 
-    `out[s * n_rows + r]` is row `r`'s bin of the categorical feature at slot
-    `s`, which is `tables.source_features[s]`. This is the one place a
-    categorical column is read out of the binned matrix, and it is the input
-    both halves take: `ctr_columns.build_ctr_train_columns` runs the ordered
-    prefix over it and `ctr_columns.ctr_predict_columns` runs the static table
-    over it, so the *only* difference between train and predict is which
-    function is handed this array.
+    `out[s * n_rows + r]` is row `r`'s bucket for the categorical feature at
+    slot `s`, which is `tables.source_features[s]`. Bucket 0 is missing or a
+    code unseen at fit time; code `i` of `tables.slot_codes` for that slot is
+    bucket `i + 1`. `CtrTables.bucket_of` is the lookup and is the only one,
+    so the ordered build, the static fit and every scored row cannot disagree.
 
-    A bin here is `categorical.CategoricalSpec.bin_of`'s answer: 0 for missing,
-    unknown or table-evicted, and `i + 1` for the i-th kept category. Bucket 0
-    is a real bucket with real statistics, which is why CatBoost's
-    absent-category arm is unreachable from this wiring.
+    This is the input both halves take: `ctr_columns.build_ctr_train_columns`
+    runs the ordered prefix over it and `ctr_columns.ctr_predict_columns` runs
+    the static table over it, so the *only* difference between train and
+    predict is which function is handed this array.
 
-    **THE CONSEQUENCE, MEASURED 2026-08-16, AND IT BOUNDS WHAT A CTR CAN DO
-    HERE.** The line below is `out[dst + r] = Int(bins[src + r])`: the source
-    is the BINNED bucket, not the raw category code. So a CTR column is a
-    deterministic function of the bucket, and every level the category table
-    evicted shares bucket 0 and therefore shares one statistic. A CTR built
-    this way carries **no information the truncated categorical column does
-    not already carry**; it re-expresses it as an ordinal, which is a real
-    thing to be able to do, but it cannot recover a single evicted level.
+    **This function used to read the BINNED matrix and that made the whole
+    mechanism inert.** Its body was `out[dst + r] = Int(bins[src + r])`. A
+    categorical column is truncated to `max_bin - 1` levels at fit time and
+    every evicted level shares bin 0, so a CTR built from bins gave all of
+    them one shared statistic: the columns carried no information the
+    truncated column did not already carry. Measured 2026-08-16 on exactly the
+    shape they are meant for, 400 near-uniform levels against a 254-entry
+    table with roughly a third of rows in bin 0, 256,000 training rows:
+    `auc 0.891191 -> 0.891210`, `ap 0.837608 -> 0.837575`. Two nulls, in
+    opposite directions. At 3,000 levels with 15 rows each,
+    `auc 0.681706 -> 0.681534` and `ap 0.576727 -> 0.577537`. Nulls again.
 
-    That matters because recovering evicted levels is the reason
-    `bench/real_data/thresholds.json` names an ordered target statistic as
-    `high_cardinality_categorical`'s exit condition. It cannot be, as wired.
-    Two measurements on the shape that gate is about, 400 near-uniform levels
-    against a 254-entry table so roughly a third of the rows fall into bucket
-    0, 256,000 training rows, 100 rounds:
+    That was circular and this is the fix: a target statistic is the mechanism
+    for a column too wide to bin, so it must be computed BEFORE the binning
+    that loses the levels. Sourced here from `categorical.distinct_category_codes`,
+    which truncates nothing, a 200,000-level column produces 200,000
+    distinguishable statistics, and the resulting CTR is a real value that
+    then quantizes as an ORDINARY NUMERIC column. The cardinality moves out of
+    the bin id, where one byte caps it, and into a value, where nothing does.
 
-        ctr=off   auc 0.891191   ap 0.837608
-        ctr=auto  auc 0.891210   ap 0.837575
-
-    and at 3,000 levels with 15 rows each, `auc 0.681706 -> 0.681534` and
-    `ap 0.576727 -> 0.577537`. Both nulls, in both directions, which is what
-    "adds no information" looks like from the outside. The `ctr` section does
-    reach the saved model in both runs, so this is the mechanism working and
-    not the mechanism being unreached.
-
-    Making the CTR recover evicted levels means sourcing it from the raw
-    category code instead, which is a change to this function, to
-    `plan_ctr_columns`' bucket counts, to `fit_ctr_tables`, to
-    `ctr_predict_columns`, and to what `CategoricalSpec` stores, since it
-    keeps the kept codes and not the distinct count it started from. That is
-    a design change and not an edit, and it is why `Dataset`'s `ctr` default
-    is `disabled()` rather than the overflow policy it briefly was.
-
-    Cost: `n_slots * n_rows` `Int`s, `8 * C * n` bytes, transient.
+    Cost: `n_slots * n_rows` `Int`s, transient, plus one binary search per
+    entry over the slot's code table.
     """
     var out = List[Int]()
     if not tables.is_active():
         return out^
     var n_slots = tables.n_slots()
+    if len(features) < n_rows * tables.n_base_features:
+        raise Error(
+            "ctr_slot_columns needs the raw feature matrix, n_rows *"
+            " n_base_features wide; a shorter span means a caller is still"
+            " passing binned values, which is the defect this signature"
+            " exists to make impossible"
+        )
     out.resize(n_slots * n_rows, 0)
     for s in range(n_slots):
         var f = tables.source_features[s]
         var src = f * n_rows
         var dst = s * n_rows
         for r in range(n_rows):
-            out[dst + r] = Int(bins[src + r])
+            out[dst + r] = tables.bucket_of(s, features[src + r])
     return out^
 
 
@@ -2968,7 +2966,10 @@ struct BinMapper(Copyable, Movable):
         # allocation, no pass, and the matrix is byte-identical to the one this
         # function returned before CTRs existed.
         if self.ctr.is_active():
-            var cat = ctr_slot_columns(out.bins, n_rows, self.ctr)
+            # RAW values, not `out.bins`. The buckets a CTR is keyed on are
+            # the un-truncated category codes, so the source here is the same
+            # matrix `transform` was handed and never the one it just wrote.
+            var cat = ctr_slot_columns(features, n_rows, self.ctr)
             var extra = ctr_predict_columns(self.ctr, cat, n_rows)
             append_ctr_columns(
                 out, extra, self.ctr.n_columns(), build_view=False
@@ -3014,11 +3015,12 @@ struct BinMapper(Copyable, Movable):
         for f in range(self.n_features):
             out.append(self.bin_value(f, row[f]))
         if self.ctr.is_active():
-            # The static-table half again, one row at a time. Same tables, same
-            # formula and same truncation as `ctr_predict_columns` takes in
-            # bulk, so a row scored singly and the same row scored in a batch
-            # get the same bin.
-            var extra = ctr_predict_row(self.ctr, out)
+            # The static-table half again, one row at a time, keyed on the RAW
+            # row rather than on the bins just written: the bucket a CTR needs
+            # is the un-truncated category code. Same tables, same formula and
+            # same truncation as `ctr_predict_columns` takes in bulk, so a row
+            # scored singly and the same row scored in a batch get the same bin.
+            var extra = ctr_predict_row(self.ctr, row)
             for i in range(len(extra)):
                 out.append(extra[i])
         return out^
