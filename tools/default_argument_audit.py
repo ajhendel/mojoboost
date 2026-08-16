@@ -264,7 +264,8 @@ def _producers(param):
        `MOJOTREES_GPU_ROW_COMPACTION` against `row_compaction`. Handling the
        infix took its count from 2 to 11.
 
-    2. **The struct-field declaration form, and this one is mine.** The pass
+    2. **The struct-field declaration form, one of TWO reasons my own table is
+       short.** The pass
        that produced the seventeen-variable table in
        `docs/COMPATIBILITY_POLICY.md` section 9.5.1 collected parameters with
        `^\s*(\w+)\s*:\s*\w`. That matches a function parameter,
@@ -276,11 +277,26 @@ def _producers(param):
        seventeen was a lower bound and the section already said it was an
        upper one.**
 
-    3. **A comment line counted as a Python door.** A pass asking whether a
-       knob is reachable from Python matched the name anywhere in
-       `python/mojotrees/`, so a knob mentioned only in a docstring or a
-       comment read as exposed. That direction is the dangerous one: it
-       reports a gap as closed.
+    3. **Prose counted as surface, and this is the OTHER reason my table is
+       short.** A pass asking whether a knob is reachable from Python matched
+       the name anywhere under `python/` and `bindings/`, comments included.
+       `MOJOTREES_DERIVATIVE_PRECISION`'s only three hits there are
+       `python/README.md:475`, `python/mojotrees/sklearn.py:853` and
+       `bindings/_mojotrees.mojo:1281`, and **all three are prose**. The last
+       one says, in words, that the knob is *a process-wide switch a caller
+       cannot set*.
+
+       **So the filter read a comment documenting the absence of a door as
+       evidence of a door.** The consequence generalizes and it is ugly: **a
+       well-documented gap hides better than an undocumented one.** The more
+       carefully somebody writes down that a knob has no Python surface, the
+       more likely a text-matching filter concludes it has one.
+
+       This is also the over-reporting direction, which says a gap is closed
+       and sends the reader away. **Both mechanisms hit the same row**: (2)
+       excluded `derivative_precision` from the candidate side and (3) would
+       have excluded it from the no-door side, so the table was wrong twice
+       over about one entry, for independent reasons.
 
     **All three are name-matching failures and all three under-report except
     the third**, which over-reports. None was detectable from its own output:

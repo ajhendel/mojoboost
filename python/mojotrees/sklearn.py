@@ -241,6 +241,31 @@ _CANONICAL_GROW_POLICIES = {
 }
 
 
+def _derivative_precision_code(value):
+    """`derivative_precision` as the integer the device policy gates on.
+
+    Same shape and same reason as `_score_function_code` above: this answers,
+    before a backend has been chosen, "is this the precision the accelerator
+    can produce", and the grower takes the name through its own path.
+
+    **It fails closed.** Anything not recognizably `float32` maps to the code
+    the policy BLOCKS rather than to float32, which it waves through.
+
+    That is belt and braces today and deliberately so. An unrecognized
+    spelling never reaches here, because `parse_derivative_precision`
+    (`src/mojotrees/tree_parameters_extra.mojo:1155`) refuses an unknown name
+    natively before any code exists. **So the fail-closed property currently
+    holds because of parse ORDER rather than because this conversion is
+    careful, and it must survive that order changing.** Written this way so
+    that if the parse ever moves after the gate, the gate is still right.
+    """
+    if value is None:
+        return 0  # DERIV_PRECISION_FLOAT32
+    if str(value).strip().lower() == "float32":
+        return 0
+    return 1  # anything else, including float64: the policy blocks it
+
+
 def _score_function_code(value):
     """`score_function` as the integer the device policy gates on.
 
@@ -3171,6 +3196,9 @@ class _Base(_ParamsMixin):
                 # to SCORE_L2, which it waves through.
                 score_function=_score_function_code(
                     getattr(self, "score_function", None)
+                ),
+                derivative_precision=_derivative_precision_code(
+                    getattr(self, "derivative_precision", None)
                 ),
                 # `or 0.0` because the estimator's default is None, and the
                 # same expression already builds the params dict below, so the
